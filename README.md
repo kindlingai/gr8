@@ -170,9 +170,15 @@ pack format, serve loop, front end shape). Use it as the map for porting another
 
 ## Credits
 
+- [exllamav3](https://github.com/turboderp-org/exllamav3) by turboderp and its contributors: the EXL3 format and its
+  trellis quantizer, a streamlined variant of Cornell RelaxML's [QTIP](https://github.com/Cornell-RelaxML/qtip). This
+  engine would not exist without their quantization work. The TR3 decoder in `engine/kernels/tr3*.cuh` was written
+  from the EXL3 format, `exl3rate/exl3rate.cu` follows exllamav3's decode and numerics (MIT, see
+  `exl3rate/LICENSE-exllamav3`), and the exlr8 expert weights were encoded with exllamav3's quantizer.
 - The routed-expert weights are the [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw)
-  EXL3 quantization of GLM 5.3. The TR3 decoder in `engine/kernels/tr3*.cuh` was written from the
-  [exllamav3](https://github.com/turboderp-org/exllamav3) format.
+  EXL3 quantization of GLM 5.3, including its per-expert bit distribution: in each layer the 64 experts with the
+  highest K3 round-trip error are encoded at K4 and the other 192 at K3, 3.25 bpw on average. The exlr8 re-encode keeps
+  that distribution expert for expert.
 - The tool-call cases in `frontend/tests/test_parser.py` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
 
 ## License
