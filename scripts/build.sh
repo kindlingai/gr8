@@ -21,3 +21,6 @@ if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
 fi
 strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
 md5sum "$OUT/g6m4" "$OUT/m4sim"
+export PATH=/usr/local/cuda/bin:$PATH
+# gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py); stage.sh copies it to every node
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"

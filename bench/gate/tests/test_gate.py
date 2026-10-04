@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -155,12 +156,18 @@ class Measurements(Base):
 
 
 SETTINGS = {k: 1 for k in record.MEASURE_KEYS}
+HEALTHY = {'format': 1, 'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'admitted': True, 'elapsed_s': 31.2, 'refusals': [], 'ranks': [{'rank': 0}]}
+SICK = {'format': 1, 'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'admitted': False, 'elapsed_s': 30.0, 'ranks': [{'rank': 3}],
+        'refusals': [{'rank': 3, 'host': 'n3', 'code': 'LINK_SLOW', 'detail': 'RDMA write rail 0: 13 Gb/s'}]}
 
 
-def rec(boot, metrics, topo='tp6', session=None, commit='c1', flags='G6_NR=6', kl_ref=None, settings=None, env=''):
+
+
+def rec(boot, metrics, topo='tp6', session=None, commit='c1', flags='G6_NR=6', kl_ref=None, settings=None, env='',
+        health=HEALTHY):
     results = {'kl': {'reference_commit': kl_ref[0], 'reference_topology': kl_ref[1]}} if kl_ref else {}
     return {'session': session or boot, 'boot': boot, 'topology': topo, 'commit': commit, 'build_flags': flags, 'engine_env': env,
-            'settings': settings or SETTINGS, 'results': results,
+            'settings': settings or SETTINGS, 'results': results, 'rank_health': health,
             'metrics': {k: {'value': v, 'better': record.LOWER if k.endswith(('ttft_s', 'kl.mean', 'kl.p95'))
                             else record.INFO if k.startswith('long.') and k.endswith('decode_tok_s')
                             else record.HIGHER} for k, v in metrics.items()}}
@@ -302,9 +309,50 @@ class Records(unittest.TestCase):
         self.assertEqual(st, 'PASS')  # 42 median, -8.3% is inside the 9.5% spread
 
 
+class RankHealthRecords(unittest.TestCase):
+    def test_baseline_refuses_boots_the_probe_refused(self):
+        runs = [rec('b1', {'m': 10.0}), rec('b2', {'m': 11.0}, health=SICK)]
+        with self.assertRaises(ValueError) as cm:
+            baseline(runs)
+        self.assertIn("'b2'", str(cm.exception))
+        self.assertIn('rank 3 LINK_SLOW', str(cm.exception))
+
+    def test_baseline_refuses_an_unprobed_boot(self):
+        runs = [rec('b1', {'m': 10.0}), rec('b2', {'m': 11.0}, health=None)]
+        with self.assertRaises(ValueError) as cm:
+            baseline(runs)
+        self.assertIn('no rank health probe', str(cm.exception))
+        r = rec('b3', {'m': 1.0})
+        del r['rank_health']                              # a record written before the probe existed
+        with self.assertRaises(ValueError):
+            baseline([r])
+
+    def test_baseline_records_the_probe_time_per_boot(self):
+        b = baseline([rec('b1', {'m': 10.0}), rec('b2', {'m': 11.0})])
+        self.assertEqual(b['rank_health'], {'b1': HEALTHY['ts'], 'b2': HEALTHY['ts']})
+
+    def test_check_refuses_unhealthy_and_unprobed_runs(self):
+        base = baseline([rec('b1', {'m': 10.0})])
+        record.check([rec('n', {'m': 10.0})], base, required=None)
+        with self.assertRaises(ValueError) as cm:
+            record.check([rec('n', {'m': 10.0}, health=SICK)], base, required=None)
+        self.assertIn('rank 3 LINK_SLOW', str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            record.check([rec('n', {'m': 10.0}, health=None)], base, required=None)
+        self.assertIn('no rank health probe', str(cm.exception))
+
+
 class CLI(Base):
     def run_gate(self, *args):
+        if args[0] == 'run' and '--health' not in args and '--no-health' not in args:
+            args = args + ('--health', self.health_file())
         return subprocess.run([sys.executable, str(GATE), *args], capture_output=True, text=True)
+
+    def health_file(self, doc=None):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(['rm', '-rf', d]))
+        Path(f'{d}/rank_health.json').write_text(json.dumps(doc or HEALTHY))
+        return f'{d}/rank_health.json'
 
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as d:
@@ -375,6 +423,89 @@ class CLI(Base):
             p = self.run_gate('check', '--baseline', base, '--runs', runs)  # last session is the tp4 run
             self.assertNotEqual(p.returncode, 0)
             self.assertIn('check refused: run is tp4, baseline is tp6', p.stderr)
+
+    def test_health_result_goes_into_every_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs, hf = f'{d}/r.jsonl', f'{d}/rank_health.json'
+            Path(hf).write_text(json.dumps(HEALTHY))
+            p = self.run_gate('run', '--url', self.url, '--topology', 'tp6', '--commit', 'c', '--runs', runs, '--repeat', '2',
+                              '--only', 'needle', '--needle-sizes', '2000', '--health', hf)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            lines = [json.loads(ln) for ln in Path(runs).read_text().splitlines()]
+            self.assertEqual(len(lines), 2)
+            for r in lines:
+                self.assertTrue(r['rank_health']['admitted'])
+                self.assertEqual(r['rank_health']['file'], 'rank_health.json')
+                self.assertNotIn('health', r['settings'])
+
+    def test_refused_boot_is_not_measured_unless_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs, hf, base = f'{d}/r.jsonl', f'{d}/h.json', f'{d}/b.json'
+            Path(hf).write_text(json.dumps(SICK))
+            args = ['run', '--url', self.url, '--topology', 'tp6', '--commit', 'c', '--runs', runs, '--repeat', '1',
+                    '--only', 'needle', '--needle-sizes', '2000', '--health', hf]
+            p = self.run_gate(*args)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('LINK_SLOW', p.stderr)
+            self.assertFalse(Path(runs).exists())
+            p = self.run_gate(*args, '--allow-unhealthy')
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertFalse(json.loads(Path(runs).read_text().splitlines()[0])['rank_health']['admitted'])
+            p = self.run_gate('baseline', '--topology', 'tp6', '--commit', 'c', '--runs', runs, '--out', base)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('rank health probe refused', p.stderr)
+
+    def test_health_file_must_be_a_probe_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(f'{d}/h.json').write_text('{"nope": 1}')
+            p = self.run_gate('run', '--url', self.url, '--topology', 'tp6', '--commit', 'c', '--runs', f'{d}/r.jsonl',
+                              '--only', 'needle', '--health', f'{d}/h.json')
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('not a rank health result', p.stderr)
+
+    def test_run_without_health_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs = f'{d}/r.jsonl'
+            p = subprocess.run([sys.executable, str(GATE), 'run', '--url', self.url, '--topology', 'tp6', '--commit', 'c',
+                                '--runs', runs, '--only', 'needle'], capture_output=True, text=True)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('--health', p.stderr)
+            self.assertFalse(Path(runs).exists())
+
+    def test_no_health_runs_cannot_make_a_baseline_or_a_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs, base = f'{d}/r.jsonl', f'{d}/b.json'
+            args = ['--url', self.url, '--topology', 'tp6', '--commit', 'c', '--runs', runs, '--repeat', '1', '--only', 'needle',
+                    '--needle-sizes', '2000']
+            p = self.run_gate('run', *args, '--no-health')
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIsNone(json.loads(Path(runs).read_text().splitlines()[0])['rank_health'])
+            p = self.run_gate('baseline', '--topology', 'tp6', '--commit', 'c', '--runs', runs, '--out', base)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('no rank health probe', p.stderr)
+            self.assertEqual(self.run_gate('run', *args).returncode, 0)          # a probed run: baseline works
+            os.truncate(runs, 0)
+            self.assertEqual(self.run_gate('run', *args).returncode, 0)
+            self.assertEqual(self.run_gate('baseline', '--topology', 'tp6', '--commit', 'c', '--runs', runs,
+                                           '--out', base).returncode, 0)
+            self.assertEqual(self.run_gate('run', *args, '--no-health', '--boot', 'x').returncode, 0)
+            p = self.run_gate('check', '--baseline', base, '--runs', runs, '--allow-partial')
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('check refused', p.stderr)
+            self.assertIn('no rank health probe', p.stderr)
+
+    def test_stale_health_result_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = dict(HEALTHY, ts=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3 * 86400)))
+            p = self.run_gate('run', '--url', self.url, '--topology', 'tp6', '--commit', 'c', '--runs', f'{d}/r.jsonl',
+                              '--only', 'needle', '--health', self.health_file(old))
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('min old', p.stderr)
+            self.assertFalse(Path(f'{d}/r.jsonl').exists())
+            p = self.run_gate('run', '--url', self.url, '--topology', 'tp6', '--commit', 'c', '--runs', f'{d}/r.jsonl',
+                              '--only', 'needle', '--needle-sizes', '2000', '--repeat', '1', '--health-max-age-min', '100000',
+                              '--health', self.health_file(old))
+            self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_unknown_part_is_rejected(self):
         p = self.run_gate('run', '--url', self.url, '--topology', 'tp6', '--commit', 'x', '--only', 'bogus')

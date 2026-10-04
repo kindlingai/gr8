@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copy the engine binary and the packs to every node (run on the head).
-#   scripts/stage.sh <BIN_DIR> <PACK_DIR>    BIN_DIR has g6m4 (and lib/, if built with BUNDLE_LIBS=1);
+#   scripts/stage.sh <BIN_DIR> <PACK_DIR>    BIN_DIR has g6m4 (and lib/, if built with BUNDLE_LIBS=1; and gpuprobe, for the rank health probe);
 #                                            PACK_DIR has rank{0..NR-1}.* and qo.*
 # Rank r gets ONLY its own rank pack (~62 GB, ~90 GB at TP4) plus the shared qo pack (~13 GB). Packs must sit on each node's
 # own disk: the launcher loads them locally (streaming a pack over ssh at boot was 2-3x slower for us).
@@ -13,6 +13,7 @@ for ((r = 0; r < NRANK; r++)); do
   h=${HOST[$r]}
   on $r "mkdir -p $G6_HOME/bin $G6_HOME/packs $G6_HOME/serve $G6_HOME/out"
   rsync -a "$BIN/g6m4" "$h:$G6_HOME/bin/" &
+  [ -f "$BIN/gpuprobe" ] && rsync -a "$BIN/gpuprobe" "$h:$G6_HOME/bin/" &
   if [ -d "$BIN/lib" ]; then rsync -a "$BIN/lib" "$h:$G6_HOME/bin/" & fi
   if [ "${SHARED:-0}" = 1 ]; then
     on $r "rsync -a --partial $P/rank$r.pack $P/rank$r.manifest.json $P/qo.pack $P/qo.manifest.json $G6_HOME/packs/" &

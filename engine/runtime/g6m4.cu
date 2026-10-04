@@ -30,6 +30,7 @@
 #include "prefill.cuh"
 #include "serve.h"
 #include "../comms/fabric.h"
+#include "../comms/progress_cpus.h"
 #ifdef DEC_S2
 #include "s2/native.cuh"
 #include "s2/pool.h"
@@ -50,6 +51,9 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+    std::string progress_err;          // G6_PROGRESS_ISOLATE: other threads stay off the proxy CPUs (progress_cpus.h)
+    const int progress_isolate = env_choice("G6_PROGRESS_ISOLATE", 1, 1, &progress_err);
+    if (progress_isolate < 0) die(progress_err);
     g6::FabricConfig cfg;
     std::string manifest, packfile, layers_s = "0,3,40,77";
     std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
@@ -491,6 +495,16 @@ int main(int argc, char** argv)
     }
     if (MP && pf_rs) fprintf(stderr, "# rank %d: prefill reduce-scatter form (5 collectives, slice %zu B)%s\n", R, pf_ss(fp),
                              pf_own >= 4 ? ", pair-owner QO attention (G6_PF_OWN=4)" : pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
+    {   // every proxy thread is running: keep all other threads of this process off their CPUs (G6_PROGRESS_ISOLATE=0 turns it off)
+        const std::vector<int> pc = g6::progress_cpus();
+        if (progress_isolate && !pc.empty())
+        {
+            const int moved = g6::isolate_progress_cpus(pc, g6::progress_tids());
+            std::string list;
+            for (int c : pc) list += (list.empty() ? "" : ",") + std::to_string(c);
+            fprintf(stderr, "# rank %d: progress CPUs %s reserved for the proxy threads; %d other thread(s) moved off them\n", R, list.c_str(), moved);
+        }
+    }
     fab.barrier();
     if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed);
 

@@ -11,10 +11,21 @@
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   READY_TMO=900     seconds to wait for all six ranks to load
+#   RANK_HEALTH=0     skip the rank health probe (default: probe every rank first and refuse to boot, exit 3, with a named
+#                     reason per refused rank; see tools/health/README.md). G6_PROGRESS_ISOLATE=0 in G6ENV_X turns off the
+#                     engine's move of other threads off the proxy CPUs.
 set -eu
 . "$(dirname "$0")/common.sh"
 [ "$NRANK" = 6 ] || { echo "launch_tp6.sh needs 6 HOSTS, config has $NRANK"; exit 2; }
 CAP=${CAP:-614400}; MTP=${MTP:-2}; READY_TMO=${READY_TMO:-900}
+
+# Boot admission: probe every rank (link rate per rail, GPU clock and throttle, wedge, memory rates, proxy CPUs) while no
+# model is booted, and stop here when a rank fails. No engine has started yet, so nothing needs cleaning up.
+if [ "${RANK_HEALTH:-1}" != 0 ]; then
+  "$(dirname "$0")/rank_health.sh" || { rc=$?; echo "boot refused (rank health, exit $rc); fix the named rank, or RANK_HEALTH=0 to skip" >&2; exit "$rc"; }
+else
+  rm -f "$G6_HOME/out/rank_health.json"      # a result left from an earlier boot must not stand for this one (gate.py run --health)
+fi
 
 # K1H2 = the served prefill/decode env + OWN=3 (QO attention) + context parallel KV (CP) past R=32768 tokens
 # with the HASH2 staged-page check. Every variable is explained in docs/SETTINGS.md.
@@ -27,10 +38,10 @@ SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --m
 
 for ((r = NRANK - 1; r >= 0; r--)); do
   # each process writes its own pid (setsid may fork, so $! is not always the engine's pid)
-  on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && \
+  on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
       --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all \
-      --serve $G6_HOME/serve $SERVE_ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null &" &
+      --serve $G6_HOME/serve $SERVE_ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait
 echo "engines started; waiting for six ready files (up to ${READY_TMO}s)"
@@ -49,13 +60,15 @@ echo "all ranks ready after $(( $(date +%s) - t0 ))s"
 # shim + front end on the head (rank 0). The head's own serve dir is local; the others are host:path over ssh.
 DIRS="$G6_HOME/serve"; for ((r = 1; r < NRANK; r++)); do DIRS="$DIRS ${HOST[$r]}:$G6_HOME/serve"; done
 PY=${PY:-$G6_HOME/venv/bin/python}
+# shim and front end stay off the proxy CPUs (the engine pins its proxy threads to PROXY_CPU-4..PROXY_CPU on each node)
+PIN=""; if [ "$PROXY_CPU" -ge 5 ] && command -v taskset > /dev/null; then PIN="taskset -c 0-$((PROXY_CPU - 5))"; fi
 mkdir -p "$G6_HOME/run" "$G6_HOME/out"; SOCK=$G6_HOME/run/engine.sock; rm -f "$SOCK"
 PYTHONPATH="$REPO/frontend" nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/shim.pid" \
-  "$PY" "$REPO/frontend/g6shim.py" --rank-dirs $DIRS --sock "$SOCK" --max-model-len "$CAP" --stall-timeout 2400 \
+  $PIN "$PY" "$REPO/frontend/g6shim.py" --rank-dirs $DIRS --sock "$SOCK" --max-model-len "$CAP" --stall-timeout 2400 \
   > "$G6_HOME/out/shim.log" 2>&1 < /dev/null &
 for i in $(seq 1 30); do [ -S "$SOCK" ] && break; sleep 1; done
 [ -S "$SOCK" ] || { echo "shim did not open $SOCK"; tail -20 "$G6_HOME/out/shim.log"; exit 1; }
 (cd "$REPO/frontend" && nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
-  "$PY" -m g6front --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null &)
+  $PIN "$PY" -m g6front --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null &)
 for i in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break; sleep 1; done
 echo "front end /health: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")  ->  http://<head>:$PORT/v1"

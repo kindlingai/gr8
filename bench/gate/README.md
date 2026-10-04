@@ -15,6 +15,13 @@ python3 bench/gate/gate.py baseline --topology tp6 --commit <main sha> --out ben
 python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp6.json
 ```
 
+`run` needs `--health FILE`, the rank health probe result of the boot (`scripts/rank_health.sh`, which `launch_tp6.sh` runs and
+writes to `$G6_HOME/out/rank_health.json`). It is stored in every record of the run as `rank_health`. A result older than
+`--health-max-age-min` (default 360) is refused, and `launch_tp6.sh` deletes the file when `RANK_HEALTH=0`, so a result
+from an earlier boot is not reused. A boot the probe refused is not measured unless `--allow-unhealthy`. `--no-health` measures
+without a result. `baseline` and `check` refuse any record that has no admitted probe result (`--no-health`,
+`--allow-unhealthy` records, or records without the field). See `tools/health/README.md`.
+
 `--only` / `--skip` pick parts: `kl needle long pbench workloads mixed4` (skip `mixed4` on a build without
 multi-session). Run records go to `bench/gate/runs.jsonl` (git-ignored; `--runs` changes it).
 

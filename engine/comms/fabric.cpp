@@ -1,6 +1,7 @@
 // g6 fabric implementation — see fabric.h and RUNTIME.md §3.
 #include "fabric.h"
 #include "bulk_proxy.h"
+#include "progress_cpus.h"
 
 #include <cuda_runtime.h>
 #include <infiniband/verbs.h>
@@ -12,6 +13,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -120,6 +122,9 @@ struct Fabric::Impl {
   std::atomic<bool> stop{false};
   std::mutex mu; std::condition_variable cv; std::deque<Job> q; std::atomic<long> pending{0};
   std::atomic<bool> exited{false};                   // the proxy thread has returned (failure or stop)
+  int pinned_cpu = -1;                               // CPU registered with progress_cpus.h (-1 = none)
+  std::atomic<int> proxy_tid{0};                     // thread id of the running proxy, registered with progress_cpus.h (0 = none)
+  std::atomic<bool> proxy_started{false};            // the proxy thread has pinned itself and registered its tid
   int rail_of(int p, int me) const { return nrails == 1 ? 0 : (p + me) % 2; }
 };
 
@@ -276,11 +281,19 @@ bool Fabric::wait_proxy_idle(double stall_s) {
 
 void Fabric::start_proxy() {
   Impl& I = *impl_;
-  I.stop = false; I.exited = false;
+  I.stop = false; I.exited = false; I.proxy_started = false;
+  if (cfg_.proxy_cpu >= 0 && I.pinned_cpu < 0) { I.pinned_cpu = cfg_.proxy_cpu; progress_cpu_add(I.pinned_cpu); }
   I.th = std::thread([this]() {
     Impl& I = *impl_;
-    struct Exit { std::atomic<bool>& f; ~Exit() { f.store(true, std::memory_order_release); } } on_exit{I.exited};
-    if (cfg_.proxy_cpu >= 0) { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cfg_.proxy_cpu, &cs); pthread_setaffinity_np(pthread_self(), sizeof cs, &cs); }
+    struct Exit { Impl& I; ~Exit() { if (int t = I.proxy_tid.exchange(0)) progress_tid_remove(t); I.exited.store(true, std::memory_order_release); } } on_exit{I};
+    if (cfg_.proxy_cpu >= 0) {
+      cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cfg_.proxy_cpu, &cs);
+      const int rc = pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+      if (rc != 0) fprintf(stderr, "[fabric r%d] WARNING: proxy thread not pinned to CPU %d (%s); the progress thread can be starved\n", cfg_.rank, cfg_.proxy_cpu, strerror(rc));
+      const int tid = (int)syscall(SYS_gettid);
+      I.proxy_tid = tid; progress_tid_add(tid);        // the isolation exempts exactly this thread
+    }
+    I.proxy_started.store(true, std::memory_order_release);
     const int me = cfg_.rank, nr = I.nr;
     // bulk mode: drain completions until peer p has room for one more WR (signaled every 64 WRs, wr_id = peer);
     // CQ error / bad completion / 60 s without a completion -> error word (bulk_proxy.h)
@@ -431,12 +444,16 @@ void Fabric::start_proxy() {
       I.pending.fetch_sub(1, std::memory_order_release);
     }
   });
+  // the isolation needs the proxy's tid: wait until the thread has pinned itself and registered
+  for (int i = 0; i < 5000 && !I.proxy_started.load(std::memory_order_acquire); i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  if (!I.proxy_started.load(std::memory_order_acquire)) fprintf(stderr, "[fabric r%d] WARNING: proxy thread did not start within 5 s\n", cfg_.rank);
 }
 
 void Fabric::stop_proxy() {
   if (!impl_) return;
   impl_->stop = true; impl_->cv.notify_all();
   if (impl_->th.joinable()) impl_->th.join();
+  if (impl_->pinned_cpu >= 0) { progress_cpu_remove(impl_->pinned_cpu); impl_->pinned_cpu = -1; }
 }
 
 }  // namespace g6

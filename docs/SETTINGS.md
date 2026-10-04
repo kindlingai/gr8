@@ -57,9 +57,19 @@ the short version.
 | `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
 | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
 | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
+| `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (`--proxy-cpu` and the four below it) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
 
 `G6ENV_X="NAME=value ..."` adds more variables on every rank. The engine rejects bad `G6_PF_*` values at startup
 (`engine/runtime/envparse.h`).
+
+## Launch knobs (`scripts/launch_tp6.sh`)
+
+| variable | default | meaning |
+|---|---|---|
+| `RANK_HEALTH` | 1 | probe every rank before any engine starts (`scripts/rank_health.sh`, `tools/health/`) and refuse to boot, exit 3, with one named reason per refused rank. 0 = skip. The result is written to `$G6_HOME/out/rank_health.json` |
+| `PROBE_ARGS` | empty | thresholds for the probe, e.g. `--min-clock-mhz 1800 --min-link-gbps 90` (list in `tools/health/README.md`) |
+
+The shim and the front end run under `taskset` on CPUs `0..PROXY_CPU-5`, away from the proxy CPUs.
 
 ## Build flags (`scripts/build.sh`)
 

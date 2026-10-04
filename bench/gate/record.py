@@ -102,6 +102,23 @@ def _same(runs, key, what):
     return json.loads(vals.pop())
 
 
+def ineligible(rec):
+    """Why a run record cannot count for a baseline or a check, or None. A run needs the rank health probe result of its boot,
+    admitted: a run without one, or on ranks the probe refused (`run --allow-unhealthy`), says nothing about the build."""
+    h = rec.get('rank_health')
+    if not h:
+        return 'it carries no rank health probe result (run with --health FILE, from scripts/rank_health.sh)'
+    if not h.get('admitted', False):
+        why = '; '.join('rank {} {}'.format(b['rank'], b['code']) for b in h.get('refusals', [])) or 'no reason recorded'
+        return f'its rank health probe refused a rank ({why})'
+    return None
+
+
+def health_summary(runs):
+    """Per boot, the time of the admitted rank health probe its runs carry (the baseline records it)."""
+    return {r['boot']: r['rank_health'].get('ts') for r in runs}
+
+
 def build_baseline(runs, topology, commit, kl_margin=2.0):
     """Baseline for a topology from the run records of several boots of one commit (records carry a `boot` label;
     the repeats of one boot are reduced to their median). Only runs of `commit` and `topology` are used. They must
@@ -111,6 +128,10 @@ def build_baseline(runs, topology, commit, kl_margin=2.0):
     runs = [r for r in runs if r['topology'] == topology and r['commit'] == commit]
     if not runs:
         raise ValueError(f'no runs of commit {commit} on {topology}')
+    for r in runs:
+        why = ineligible(r)
+        if why:
+            raise ValueError(f'boot {r["boot"]!r} cannot go into a baseline: {why}')
     flags = _same(runs, lambda r: r['build_flags'], 'build flags')
     env = _same(runs, lambda r: norm_env(r.get('engine_env')), 'engine environment')
     settings = _same(runs, lambda r: {k: r['settings'].get(k) for k in MEASURE_KEYS}, 'measurement settings')
@@ -142,6 +163,7 @@ def build_baseline(runs, topology, commit, kl_margin=2.0):
     return {'format': 1, 'topology': topology, 'commit': commit, 'build_flags': flags, 'engine_env': env, 'settings': settings,
             'kl_reference': kl_ref if kl_ref['commit'] else None,
             'missing_from_gate_set': [k for k in REQUIRED if k not in metrics],
+            'rank_health': health_summary(runs),
             'boots': {b: {'runs': len(rs), 'metrics': per_boot[b]} for b, rs in boots.items()},
             'metrics': metrics,
             'thresholds': {'kl_mean': kl_thr, 'kl_margin': kl_margin,
@@ -151,6 +173,9 @@ def build_baseline(runs, topology, commit, kl_margin=2.0):
 def validate(records, baseline):
     """Refuse to compare runs with a baseline they do not belong to."""
     for r in records:
+        why = ineligible(r)
+        if why:
+            raise ValueError(f'boot {r["boot"]!r} cannot be checked: {why}')
         if r['topology'] != baseline['topology']:
             raise ValueError(f'run is {r["topology"]}, baseline is {baseline["topology"]}')
         if norm_env(r.get('engine_env')) != baseline.get('engine_env', ''):

@@ -3,12 +3,14 @@
 
   gate.py kl-ref   --url U --topology tp6 --commit SHA --out refs/tp6.json   # reference outputs of a recorded build
   gate.py run      --url U --topology tp6 --commit SHA [--kl-ref refs/tp6.json] [--repeat 2] [--boot ID]
+                   --health FILE [--allow-unhealthy]   # FILE = the rank health probe of this boot (scripts/rank_health.sh)
   gate.py spread   [--runs runs.jsonl] [--session S]                         # spread between runs of one boot
   gate.py baseline --topology tp6 --commit SHA --out baselines/tp6.json [--runs runs.jsonl]  # runs of SHA, several boots
   gate.py check    --baseline baselines/tp6.json [--runs runs.jsonl] [--session S]   # gates table, exit 1 on FAIL
 
 Each run appends one JSON line to --runs (default runs.jsonl next to this file). Stdlib only."""
 import argparse
+import calendar
 import json
 import random
 import subprocess
@@ -73,7 +75,38 @@ def one_run(cl, a, parts, seed):
     return res
 
 
+def load_health(a):
+    """The rank health probe result of this boot (scripts/rank_health.sh writes it). Required: without --health the run is
+    refused, unless --no-health, and then its records can not go into a baseline or a check. A result older than
+    --health-max-age-min is refused (a file left from an earlier boot). A boot the probe refused is not measured unless
+    --allow-unhealthy; its records then carry the refusal and no baseline or check takes them."""
+    if not a.health:
+        if a.no_health:
+            return None
+        sys.exit('run needs --health FILE (the rank health probe of this boot: scripts/rank_health.sh), or --no-health '
+                 '(then no baseline or check accepts the records)')
+    try:
+        h = json.loads(Path(a.health).read_text())
+        h['admitted'] = bool(h['admitted'])
+        ts = calendar.timegm(time.strptime(h['ts'], '%Y-%m-%dT%H:%M:%SZ'))
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        sys.exit(f'--health {a.health}: not a rank health result ({e!r})')
+    age_min = (time.time() - ts) / 60
+    if age_min > a.health_max_age_min:
+        sys.exit(f'--health {a.health}: the probe is {age_min:.0f} min old (limit {a.health_max_age_min:g}); it may belong to an '
+                 'earlier boot. Probe again before this boot (scripts/launch_tp6.sh does)')
+    h['file'] = Path(a.health).name
+    if not h['admitted']:
+        why = '; '.join(f'rank {b["rank"]} {b["code"]}' for b in h.get('refusals', [])) or 'no reason recorded'
+        if not a.allow_unhealthy:
+            sys.exit(f'rank health probe refused this boot ({why}); fix the node, or --allow-unhealthy to measure anyway '
+                     '(the record is then marked and no baseline or check accepts it)')
+        print(f'warning: measuring a boot the rank health probe refused ({why})', file=sys.stderr)
+    return h
+
+
 def cmd_run(a):
+    health = load_health(a)
     cl = C.Client(a.url, a.model)
     parts = parts_to_run(a)
     if a.kl_ref and 'kl' in parts:
@@ -89,9 +122,11 @@ def cmd_run(a):
         rec = {'format': 1, 'session': session, 'repeat': i + 1, 'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                'commit': a.commit, 'harness_commit': git_rev(), 'topology': a.topology, 'boot': a.boot or session,
                'build_flags': a.build_flags, 'engine_env': a.engine_env,
-               'settings': {k: v for k, v in vars(a).items() if k not in ('func', 'cmd')} | {'seed': seed},
+               'settings': {k: v for k, v in vars(a).items() if k not in ('func', 'cmd', 'health', 'no_health', 'health_max_age_min', 'allow_unhealthy')}
+               | {'seed': seed},
                'results': res,
                'metrics': {k: {'value': v, 'better': d} for k, (v, d) in record.flatten(res).items()}}
+        rec['rank_health'] = health
         record.append_run(a.runs, rec)
         recs.append(rec)
         print(f'run {i + 1}/{a.repeat} appended to {a.runs}', flush=True)
@@ -176,6 +211,14 @@ def main():
     p.add_argument('--skip', help='comma list, e.g. mixed4 when the build has no multi-session')
     p.add_argument('--runs', default=runs_default)
     p.add_argument('--seed', type=int)
+    p.add_argument('--health', help='rank health probe result of this boot (JSON from scripts/rank_health.sh); '
+                                    'it is stored in every record of the run. Required unless --no-health')
+    p.add_argument('--no-health', action='store_true',
+                   help='measure without a probe result; the records are marked and no baseline or check accepts them')
+    p.add_argument('--health-max-age-min', type=float, default=360,
+                   help='refuse a probe result older than this (a file left from an earlier boot)')
+    p.add_argument('--allow-unhealthy', action='store_true',
+                   help='measure a boot whose probe refused a rank (the record is marked; baseline and check refuse it)')
     p.add_argument('--effort', default='nothink', help='nothink|low|high|max')
     p.add_argument('--temp', type=float, default=0.7)
     p.add_argument('--needle-sizes', default='87000,437000')
