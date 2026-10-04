@@ -38,6 +38,9 @@ the full-index layers; vocab 154,880.
 - `tools/convert/plan.py`: `set_nr(n)` picks the widths; they split n units the way `g6nr.h` does (larger chunks first).
 - `tools/convert/convert.py --d8`: one GPTQ dir per rank (six for TP6, four for TP4), because the GPTQ codes are solved
   per rank slice. The count of dirs sets the rank count of the packs. TP4 needs the TP4 codes.
+- `G6_PF_OWN=4` (`engine/runtime/qp.cuh`, `qp_wire.h`, the pair code in `qo_weights.cuh`, `tools/convert/pairpack.py`):
+  TP4 only. It assumes four ranks in two head pairs of 16 heads each (64 heads, head group of rank m in layer l =
+  (m - l) mod 4) and the q_b / o_proj / kv_b shapes of GLM 5.3.
 - `scripts/launch_tp6.sh` / `scripts/launch_tp4.sh`: the rank count and the KV pool. `stage.sh` and `stop.sh` work
   for any number of `HOSTS`.
 

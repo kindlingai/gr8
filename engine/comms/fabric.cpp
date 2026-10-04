@@ -102,7 +102,7 @@ std::vector<char> allgather(int rank, int nr, const std::string& ip0, int port, 
 struct QPInfo { uint32_t qpn, psn, rkey; uint64_t addr; uint8_t gid[16]; };
 struct Rail { DevInfo di; ibv_context* ctx = nullptr; ibv_pd* pd = nullptr; ibv_cq* cq = nullptr; ibv_mr* mr = nullptr; ibv_gid gid{}; };
 struct Job { unsigned long long step; std::vector<uint32_t> sizes; unsigned rs_mask = 0; size_t rs_ss = 0; std::vector<uint32_t> rs_bytes; unsigned skip = 0;
-             bool bulk = false; Fabric::BulkJob b; };
+             unsigned p2p = 0; int peer = -1; bool bulk = false; Fabric::BulkJob b; };
 }  // namespace
 
 struct Fabric::Impl {
@@ -244,7 +244,8 @@ void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& 
     FCHECK((int)rs.bytes.size() == nranks() && rs.ss % 8 == 0);
     for (uint32_t b : rs.bytes) FCHECK(b % 8 == 0 && b + 8 <= rs.ss && rs.ss * nranks() <= dev_.stride);
   }
-  { std::lock_guard<std::mutex> lk(impl_->mu); impl_->q.push_back(Job{step, sizes, rs.mask, rs.ss, rs.bytes, rs.skip}); impl_->pending++; }
+  FCHECK((rs.p2p & ~rs.mask) == 0 && (!rs.p2p || (rs.peer >= 0 && rs.peer < nranks() && rs.peer != cfg_.rank)));
+  { std::lock_guard<std::mutex> lk(impl_->mu); impl_->q.push_back(Job{step, sizes, rs.mask, rs.ss, rs.bytes, rs.skip, rs.p2p, rs.peer}); impl_->pending++; }
   impl_->cv.notify_one();
 }
 
@@ -252,6 +253,7 @@ void Fabric::enqueue_bulk(BulkJob job) {
   Impl& I = *impl_;
   FCHECK(I.bulk && job.db < I.bd.nflags && job.wait_flag < I.bd.nflags && job.post_flag < I.bd.nflags);
   for (const auto& r : job.ranges) FCHECK(r.first % 8 == 0 && r.second % 8 == 0 && r.second > 0 && r.first + r.second <= cfg_.bulk_bytes);
+  FCHECK(job.peer == -1 || (job.peer >= 0 && job.peer < I.bd.nr && job.peer != I.bd.rank));
   Job j{}; j.bulk = true; j.b = std::move(job);
   { std::lock_guard<std::mutex> lk(I.mu); I.q.push_back(std::move(j)); I.pending++; }
   I.cv.notify_one();
@@ -333,11 +335,12 @@ void Fabric::start_proxy() {
       if (b.db >= 0 && !spin(I.bd.doorbell + b.db, b.seq, 0x72000000u | (unsigned)b.db)) return false;
       if (b.wait_flag >= 0)
         for (int p = 0; p < nr; p++)
-          if (p != me && !spin(I.bd.flags + ((size_t)b.wait_flag * nr + p) * 2, b.wait_min, 0x73000000u | (unsigned)(b.wait_flag << 8) | (unsigned)p)) return false;
+          if (p != me && bulk_to(b.peer, p) && !spin(I.bd.flags + ((size_t)b.wait_flag * nr + p) * 2, b.wait_min, 0x73000000u | (unsigned)(b.wait_flag << 8) | (unsigned)p)) return false;
       FlagWrite fw[2];
       flag_writes(b.post_val, b.post_flag >= 0 ? *(volatile unsigned long long*)(I.bd.aux_out + b.post_flag) : 0ull, fw);
       for (int k = 1; k < nr; k++) {
         const int p = (me + k) % nr;                    // stagger the peer order across ranks
+        if (!bulk_to(b.peer, p)) continue;              // one-peer job (BulkJob::peer)
         Rail& R = I.rails[I.rail_of(p, me)];
         for (const auto& rg : b.ranges) {
           ibv_sge sge{(uint64_t)(I.bd.bulk + rg.first), rg.second, R.mr->lkey};
@@ -404,7 +407,7 @@ void Fabric::start_proxy() {
         char* src = dev_.send + ((size_t)par * cfg_.ncoll + c) * dev_.stride;
         if (!rs) *(volatile unsigned long long*)(src + bytes) = seq;  // tail travels with the payload in one write
         for (int p = 0; p < nr; p++) {
-          if (p == me) continue;
+          if (p == me || (rs && bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
           Rail& R = I.rails[I.rail_of(p, me)];
           char* sp = rs ? src + p * job.rs_ss : src;             // reduce-scatter: peer p gets slice p only
           const uint32_t nb = rs ? job.rs_bytes[p] : bytes;

@@ -22,6 +22,8 @@
 //                     base 0 of the pool (s2/pool.h); requests over the control sockets (s2/service.h, head = rank 0 on
 //                     --ips[0]:N); DIR is this rank's fresh S2 directory (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2).
 //                     Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3; no --serve; --prompt is ignored.
+//      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident from tools/convert/pairpack.py; or
+//                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
@@ -51,6 +53,7 @@ int main(int argc, char** argv)
     g6::FabricConfig cfg;
     std::string manifest, packfile, layers_s = "0,3,40,77";
     std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
+    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
     std::vector<std::string> prompts;
     Plan plan;
     int cap = 64;
@@ -76,6 +79,8 @@ int main(int argc, char** argv)
         else if (a == "--pack") packfile = next();
         else if (a == "--qo-manifest") qo_man = next();
         else if (a == "--qo-pack") qo_file = next();
+        else if (a == "--qp-manifest") qp_man = next();
+        else if (a == "--qp-pack") qp_file = next();
         else if (a == "--layers") layers_s = next();
         else if (a == "--prompt") prompts.push_back(next());
         else if (a == "--gen") plan.n_gen = atoi(next().c_str());
@@ -103,7 +108,7 @@ int main(int argc, char** argv)
         else die("unknown argument " + a);
     }
     if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || manifest.empty() || packfile.empty())
-        die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--layers ..] [--gen N] [--temp T]");
+        die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
     if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
@@ -143,6 +148,21 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
     }
     const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
+    // G6_PF_OWN=4 (TP4) env refusals before any CUDA / fabric work (qp_wire.h roll_env_refusal)
+    const bool own4 = MP && getenv("G6_PF_OWN") && atoi(getenv("G6_PF_OWN")) == 4;
+    std::string qre;
+    const int qp_roll_s = env_choice("G6_PF_QP_ROLL", 4, 0, &qre);       // rolling pack (pf_env_check made it 0 or 2..4)
+    const bool qp_roll_ser = env_choice("G6_PF_QP_ROLL_SER", 1, 0, &qre) == 1;
+    const int qp_wire_e = env_choice("G6_PF_QP_WIRE_E", qw::max_entries(), 1, &qre);   // wire ring entries (qp_wire.h)
+    {
+        if (qp_wire_e < 0) die(qre);
+        const std::string why = qw::roll_env_refusal(own4, qp_roll_s, getenv("G6_PF_QP_WIRE_E") != nullptr, qp_wire_e, getenv("G6_PF_QP_CTX"), !qp_file.empty());
+        if (!why.empty()) die(why);
+        if (own4 && g6nr::NR != 4) die("G6_PF_OWN=4 is TP4 only (G6_NR=4)");
+        if (own4 && !qp_roll_s && (qp_man.empty() || qp_file.empty())) die("G6_PF_OWN=4 needs --qp-manifest and --qp-pack (or G6_PF_QP_ROLL)");
+        if (own4 && s2mode) die("G6_PF_OWN=4 is not wired into --s2");
+        if (!own4 && (!qp_man.empty() || !qp_file.empty())) die("--qp-manifest / --qp-pack need G6_PF_OWN=4 and --prefill");
+    }
 
     G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
     cfg.slot_bytes = (size_t)MX * HID * 2;
@@ -155,6 +175,7 @@ int main(int argc, char** argv)
     const bool pf_rs = getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) == 1;     // reduce-scatter form (prefill.cuh)
     const int pf_own = getenv("G6_PF_OWN") ? atoi(getenv("G6_PF_OWN")) : 0;   // 1: row-owner projections, 2: + index (prefill.cuh)
     const bool pf_qo = MP && pf_own == 3;                                        // 3: row-owner QO attention (QO-INTEGRATION.md)
+    const bool pf_qp = own4;                                                     // 4: pair-owner QO attention (TP4, qp.cuh)
     if (pf_qo && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
     if (MP)
     {
@@ -189,6 +210,28 @@ int main(int argc, char** argv)
         fabd.init(cd);
         fabd.start_proxy();
     }
+#if G6_NR == 4
+    g6::Fabric fabq;                    // G6_PF_QP_ROLL: ring of [lo | hi] pair half images, one-peer jobs (qp_wire.h)
+    QpWire qp_wire;
+    if (qp_roll_s)
+    {
+        g6::FabricConfig qc = cfg;
+        qc.vcap.clear(); qc.vdst_k.clear();
+        qc.bulk_bytes = qw::bulk_bytes(qp_wire_e);
+        qc.bulk_flags = qw::bulk_flags(qp_wire_e);
+        qc.port = cfg.port + 56;
+        qc.proxy_cpu = cfg.proxy_cpu > 4 ? cfg.proxy_cpu - 5 : -1;
+        fabq.init(qc);
+        fabq.start_proxy();
+        qp_wire.bd = fabq.bulk_dev(); qp_wire.E = qp_wire_e; qp_wire.peer = qw::partner(cfg.rank);
+        qp_wire.enqueue = [&fabq](g6::Fabric::BulkJob j) { fabq.enqueue_bulk(std::move(j)); };
+        fprintf(stderr, "# rank %d: G6_PF_QP_ROLL=%d wire fabric: %d entr%s x [lo | hi] %.2f MB = %.3f GB pinned + registered, partner rank %d\n",
+                cfg.rank, qp_roll_s, qp_wire_e, qp_wire_e == 1 ? "y" : "ies", qw::HALF / 1e6, qw::bulk_bytes(qp_wire_e) / 1e9, qp_wire.peer);
+    }
+    auto qp_err = [&]() -> unsigned { return qp_roll_s ? *fabq.bulk_dev().error : 0u; };
+#else
+    auto qp_err = [&]() -> unsigned { return 0u; };
+#endif
 #if defined(G6_CP) && G6_CP
     // J4 CP (BUILD-CPE): env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
@@ -259,6 +302,34 @@ int main(int argc, char** argv)
         }
         fprintf(stderr, "# rank %d: G6_PF_OWN=3 full-head q_b / o_proj / UK / UV for %zu layers\n", R, qow.size());
     }
+#if G6_NR == 4
+    g6::Pack qp_pack;
+    g6::DevImage qp_img;                // --image: the qp pack streamed into one device allocation (no host copy)
+    std::vector<QpW> qpw(layers.size());   // pf_qp: pair weights per model layer (empty outside G6_PF_QP_LAYERS)
+    const std::vector<char> qpl = pf_qp ? pf_qp_mask(layers) : std::vector<char>(layers.size(), 0);
+    QpRoll* qp_roll = nullptr;
+    if (qp_roll_s)                      // S slots, own half from this rank's pack, partner half over fabq (no --qp-pack)
+    {
+        qp_roll = qp_roll_new(qp_roll_s, qp_roll_ser, std::vector<Find>{find}, R, layers, qpl, qpw, &qp_wire);
+        int n = 0;
+        for (char c : qpl) n += c != 0;
+        fprintf(stderr, "# rank %d: G6_PF_OWN=4 pair q_b / o_proj / UK / UV for %d of %zu layers (G6_PF_QP_LAYERS), rolling: own pack + partner by RDMA\n", R, n, layers.size());
+    }
+    else if (pf_qp)
+    {
+        if (image) load_image(qp_pack, qp_img, qp_man, qp_file, R, hash);
+        else load_pack(qp_pack, qp_man, qp_file, R);
+        const Find pfind = image ? image_find(qp_pack, qp_img) : pack_find(qp_pack, store);
+        int n = 0;
+        for (size_t k = 0; k < layers.size(); ++k)
+        {
+            if (!qpl[k]) continue;
+            if (!qp_from_pack(pfind, find, R, layers[k], qpw[k])) die("--qp-pack has no pair tensors for layer " + std::to_string(layers[k]));
+            ++n;
+        }
+        fprintf(stderr, "# rank %d: G6_PF_OWN=4 pair q_b / o_proj / UK / UV for %d of %zu layers (G6_PF_QP_LAYERS)\n", R, n, layers.size());
+    }
+#endif
     m.wide = wide;
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
@@ -289,11 +360,11 @@ int main(int argc, char** argv)
     }
     auto cp_pf_in = [&]() { if (cp_pf) cp_pf_enter(m); };
     auto cp_pf_out = [&]() { if (cp_pf) cp_pf_exit(m); };
-    auto cp_pf_err = [&]() -> unsigned { return cp_pf ? *fabs.bulk_dev().error : 0u; };
+    auto cp_pf_err = [&]() -> unsigned { const unsigned e = cp_pf ? *fabs.bulk_dev().error : 0u; return e ? e : qp_err(); };   // + the qp wire
 #else
     auto cp_pf_in = [&]() {};
     auto cp_pf_out = [&]() {};
-    auto cp_pf_err = [&]() -> unsigned { return 0u; };
+    auto cp_pf_err = [&]() -> unsigned { return qp_err(); };   // the qp wire's error word (G6_PF_QP_ROLL)
 #endif
     FILE* rlf = R == 0 ? route_log_open(m) : nullptr;     // G6_ROUTE_LOG=<file> (measurement, MTP main steps)
     m.graph = graph; m.in = in; m.out = out;
@@ -303,8 +374,11 @@ int main(int argc, char** argv)
     {
         fp = fabp.dev();
         P.v2 = pfv2;
-        P.own = pf_own >= 1; P.ownix = pf_own == 2;
+        P.own = pf_own >= 1; P.ownix = pf_own == 2 || pf_qp;
         P.qo = pf_qo; P.qow = &qow;
+#if G6_NR == 4
+        P.qp = pf_qp; P.qpw = &qpw; P.qpl = qpl; P.roll = qp_roll;
+#endif
         P.attn_rows = pf_attn_rows(MP);
         build_prefill(P, m, find, MP, fp, dmalloc<u64>(1), st);
     }
@@ -314,8 +388,11 @@ int main(int argc, char** argv)
     {
         fp2 = fabp2.dev();
         P2.attn_rows = pf_attn_rows(MP);
-        P2.own = pf_own >= 1; P2.ownix = pf_own == 2;
+        P2.own = pf_own >= 1; P2.ownix = pf_own == 2 || pf_qp;
         P2.qo = pf_qo; P2.qow = &qow;
+#if G6_NR == 4
+        P2.qp = pf_qp; P2.qpw = &qpw; P2.qpl = qpl; P2.roll = qp_roll;
+#endif
         build_prefill(P2, m, find, MP, fp2, dmalloc<u64>(1), st, &P);
     }
     u64 ls0b = 1;
@@ -413,7 +490,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "# rank %d: prefill lanes on two streams\n", R);
     }
     if (MP && pf_rs) fprintf(stderr, "# rank %d: prefill reduce-scatter form (5 collectives, slice %zu B)%s\n", R, pf_ss(fp),
-                             pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
+                             pf_own >= 4 ? ", pair-owner QO attention (G6_PF_OWN=4)" : pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
     fab.barrier();
     if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed);
 
@@ -547,6 +624,13 @@ int main(int argc, char** argv)
             if (MP) sp.first = (int)sp.prompt.size() - 1;
         }
         const Plan& p = sp;
+        if (pf_qp)                      // OWN=4 iff prompt + gen fits the QO table (G6_PF_QP_CTX), else OWN=2 for this request
+        {
+            const int ctx = (int)p.prompt.size() + p.n_gen;
+            const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx);
+            fprintf(stderr, "# rank %d: seq %zu ctx %d (prompt + gen) -> %s (QP_CTX %d)\n", R, q, ctx,
+                    on ? "OWN=4 pair-owner" : "OWN=2 (ctx > QP_CTX)", P.qp_ctx);
+        }
         const int PS = prompt_steps(p), NS = total_steps(p);
         if (serve.empty()) pt.start("");
         else pt.lap("open");
@@ -588,7 +672,7 @@ int main(int argc, char** argv)
                     if (const unsigned ae = attn_errors(D.d)) { fprintf(stderr, "g6m4: rank %d MTP layer attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
                 }
                 pt.lap("draft_prefill");
-                if (*fp.error || *fp2.error || cp_pf_err()) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x / %08x (CP staging %08x), seq %zu rows %d..\n", R, *fp.error, *fp2.error, cp_pf_err(), q, a); return 3; }
+                if (*fp.error || *fp2.error || cp_pf_err()) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x / %08x (CP staging / qp wire %08x), seq %zu rows %d..\n", R, *fp.error, *fp2.error, cp_pf_err(), q, a); return 3; }
                 if (const unsigned ae = attn_errors(m)) { fprintf(stderr, "g6m4: rank %d attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
                 printf("prefill rows %d..%d resid %016llx\n", a, a + MA - 1, (unsigned long long)pf_hash(P, MA));
                 printf("prefill rows %d..%d resid %016llx\n", a + MA, a + MA + MB - 1, (unsigned long long)pf_hash(P2, MB));
@@ -617,7 +701,7 @@ int main(int argc, char** argv)
                 G6RT_CK(cudaStreamSynchronize(st));
                 if (const unsigned ae = attn_errors(D.d)) { fprintf(stderr, "g6m4: rank %d MTP layer attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
             }
-            if (*fp.error || cp_pf_err()) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x (CP staging %08x), seq %zu rows %d..\n", R, *fp.error, cp_pf_err(), q, a); return 3; }
+            if (*fp.error || cp_pf_err()) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x (CP staging / qp wire %08x), seq %zu rows %d..\n", R, *fp.error, cp_pf_err(), q, a); return 3; }
             if (const unsigned ae = attn_errors(m)) { fprintf(stderr, "g6m4: rank %d attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
             printf("prefill rows %d..%d resid %016llx\n", a, a + M - 1, (unsigned long long)pf_hash(P, M));
             fprintf(stderr, "# seq %zu prefill %d rows: %.3f ms (%.0f tok/s)\n", q, M, ms, M * 1000.0 / ms);
@@ -743,10 +827,20 @@ int main(int argc, char** argv)
     if (nc && !mtp) fprintf(stderr, "# rank %d: top_p misses %u\n", R, topp_misses(m));
     if (two) { fabp2.wait_proxy_idle(); fabp2.stop_proxy(); }
     if (MP) { fabp.wait_proxy_idle(); fabp.stop_proxy(); }
+#if G6_NR == 4
+    if (qp_roll)
+    {
+        qp_roll_print(*qp_roll, R);
+        if (!fabq.wait_proxy_idle()) { fprintf(stderr, "g6m4: rank %d qp wire proxy drain failed (error word %08x)\n", R, qp_err()); fabq.stop_proxy(); return 3; }
+        fabq.stop_proxy();
+        if (qp_err()) { fprintf(stderr, "g6m4: rank %d qp wire error word %08x\n", R, qp_err()); return 3; }
+        fprintf(stderr, "# rank %d: qp wire clean, %ld builds over the wire\n", R, qp_wire.n);
+    }
+#endif
 #if defined(G6_CP) && G6_CP
     if (cp_pf)
     {
-        if (!fabs.wait_proxy_idle()) { fprintf(stderr, "g6m4: rank %d CP staging proxy drain failed (error word %08x)\n", R, cp_pf_err()); fabs.stop_proxy(); return 3; }
+        if (!fabs.wait_proxy_idle()) { fprintf(stderr, "g6m4: rank %d CP staging proxy drain failed (error word %08x)\n", R, *fabs.bulk_dev().error); fabs.stop_proxy(); return 3; }
         fabs.stop_proxy();
         if (cp_pf_net(m).verify) printf("# rank %d: G6_CP_PF_VERIFY staged-page hash mismatches %llu\n", R, cp_pf_mismatches(m));
     }

@@ -16,6 +16,7 @@ the short version.
 | `--image` | on | load the whole pack into one device image (required for full packs) |
 | `--layers all` | all | all 78 layers + the MTP layer |
 | `--qo-manifest` / `--qo-pack` | `packs/qo.*` | full-head attention weights for `G6_PF_OWN=3` (identical file on every node) |
+| `--qp-manifest` / `--qp-pack` | (TP4, not used) | resident pair weights for `G6_PF_OWN=4` (`tools/convert/pairpack.py`, one file per rank); the TP4 launcher uses `G6_PF_QP_ROLL` instead |
 | `--serve DIR` | `$G6_HOME/serve` | serve loop: requests arrive as `DIR/req.<n>`, rank 0 writes `DIR/resp.<n>`, `DIR/quit` ends it, `DIR/ready` appears once loaded |
 | `--cap N` | 614400 | KV pool in tokens (the longest context) |
 | `--mtp K` | 2 | MTP speculative draft length |
@@ -37,7 +38,14 @@ the short version.
 | `G6_PF_RS` | 1 | prefill uses reduce-scatter + all-gather instead of all-reduce |
 | `G6_PF_STREAMS` | 2 | the two prefill lanes run on two CUDA streams |
 | `G6_PF_ATTN_ROWS` | 1024 | prefill attention runs in chunks of this many rows inside a sub-batch |
-| `G6_PF_OWN` | 3 | row-owner prefill. 1 = the owner computes the next layer's projections. 2 = also the indexer. 3 = the owner runs the whole attention block for all 64 heads of its rows (QO; needs the QO pack, `G6_PF_RS=1`, `--pfv2`) |
+| `G6_PF_OWN` | 3 | row-owner prefill. 1 = the owner computes the next layer's projections. 2 = also the indexer. 3 = the owner runs the whole attention block for all 64 heads of its rows (QO; needs the QO pack, `G6_PF_RS=1`, `--pfv2`). 4 = TP4 only: pair-owner QO, OWN=3's attention block split over two head pairs ([DESIGN-QO-PAIR.md](DESIGN-QO-PAIR.md)); TP4 launcher default |
+| `G6_PF_QP_ROLL` | TP4: 2 | `G6_PF_OWN=4`: pair weights in this many rolling slots (2..4), built per layer from the rank pack and the pair partner's slice over RDMA; 0 = resident `--qp-pack` |
+| `G6_PF_QP_CTX` | TP4: the cap | `G6_PF_OWN=4` with `G6_PF_QP_ROLL`: QO key-table size in positions (required); a request whose prompt + gen is longer runs OWN=2 |
+| `G6_PF_QP_LAYERS` | all | `G6_PF_OWN=4`: model layers (0-77, list and ranges) that run pair-owner attention; the others run OWN=2 |
+| `G6_PF_QP_EARLY` | TP4: 1 | `G6_PF_OWN=4`: 1 = send the counterpart's partial before the own rows' o_proj; 2 = also split the QO call in two |
+| `G6_PF_QP_WARM` | 0 | `G6_PF_OWN=4`: warm the pair cuBLAS and MXFP8 GEMM shapes at load |
+| `G6_PF_QP_WIRE_E` | 1 | `G6_PF_OWN=4` with `G6_PF_QP_ROLL`: entries (1..4) in the RDMA ring of half images |
+| `G6_PF_QP_ROLL_SER` | 0 | measurement: 1 = build rolling slots on the prefill stream (fully exposed) |
 | `G6_PF_BLAS_ROWS` | 1024 | prefill cuBLAS calls in chunks of this many rows (multiple of 16) |
 | `G6_PF_TIMES` | 1 | per-request prefill timing lines in rank 0's log |
 | `G6_PF_HASH_GPU` | 1 | the per-sub-batch residual hash (rank agreement check) is computed on the GPU |

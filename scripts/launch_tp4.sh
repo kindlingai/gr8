@@ -10,10 +10,18 @@
 #
 # Knobs (environment):
 #   CAP=393216        KV pool / max context in tokens. A TP4 rank holds ~90 GB of weights against ~62 GB at TP6, so
-#                     the pool is smaller than TP6's 614400. At 393216 (PF_OWN=1) the lowest MemAvailable we saw while
-#                     serving, a 256K prompt included, was 6.6 GiB; lower it if a node runs short of memory
+#                     the pool is smaller than TP6's 614400. At 393216 the lowest MemAvailable we saw while serving, a
+#                     250K prompt included, was 5.2 GiB with PF_OWN=4 (6.6 GiB with PF_OWN=1); lower it if a node runs
+#                     short of memory
 #   MTP=2             speculative draft length k (2 = our prose/served default; 4-6 helped code/structured)
-#   PF_OWN=1          G6_PF_OWN (see below; 3 = QO attention, needs the qo pack and more memory than a TP4 rank has)
+#   PF_OWN=4          G6_PF_OWN (see below): 4 = pair-owner QO attention (docs/DESIGN-QO-PAIR.md); 1 = no QO attention
+#                     (the first TP4 baseline); 3 = full-head QO, needs the qo pack and more memory than a TP4 rank has
+#   QP_ROLL=2         PF_OWN=4: G6_PF_QP_ROLL, rolling pair slots built from the rank pack + the pair partner over RDMA
+#   QP_CTX=$CAP       PF_OWN=4: G6_PF_QP_CTX, the QO key table size; a longer request (prompt + gen) runs OWN=2
+#   QP_EARLY=1        PF_OWN=4: G6_PF_QP_EARLY, the counterpart's partial goes out before the own rows' o_proj (+4-5%
+#                     prefill over 0 at 8K/32K, two boots each)
+#   QP_PACK=1         PF_OWN=4 with resident pair packs (packs/qp.rank<r>.*, tools/convert/pairpack.py) instead of
+#                     QP_ROLL; about 6 GB more per rank, which does not fit next to a TP4 rank pack at CAP=393216
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   READY_TMO=900     seconds to wait for all four ranks to load
@@ -23,24 +31,30 @@ set -eu
 CAP=${CAP:-393216}; MTP=${MTP:-2}; READY_TMO=${READY_TMO:-900}
 
 # K1H2 = the served prefill/decode env + context parallel KV (CP) past R=32768 tokens with the HASH2 staged-page
-# check. Every variable is explained in docs/SETTINGS.md. One difference from TP6: G6_PF_OWN defaults to 1, not 3.
-# OWN=3 needs the 13 GB full-head QO pack on every rank, and with a 90 GB TP4 rank pack that no longer fits a GB10
-# (the ranks ran out of memory in graph capture even at a 64K pool). PF_OWN=3 brings it back if memory is freed.
-PF_OWN=${PF_OWN:-1}
+# check. Every variable is explained in docs/SETTINGS.md. One difference from TP6: G6_PF_OWN defaults to 4, not 3.
+# OWN=3 needs the 13 GB full-head QO pack on every rank, and with a 90 GB TP4 rank pack that does not fit a GB10
+# (the ranks ran out of memory in graph capture even at a 64K pool). OWN=4 runs the same attention block split over
+# two head pairs, with the pair weights rolled in per layer: about 1.3-1.4 GB of device memory plus 84 MB pinned per
+# rank instead of 13 GB. About 1.4 KB per position of it scales with QP_CTX; lower QP_CTX if a node runs short.
+PF_OWN=${PF_OWN:-4}
 ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
 G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
 G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
+if [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" != 1 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G6_PF_QP_CTX=${QP_CTX:-$CAP}"; fi
+[ "$PF_OWN" = 4 ] && ENGINE_ENV="$ENGINE_ENV G6_PF_QP_EARLY=${QP_EARLY:-1}"
 SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 --pf-lanes 2 --pfv2"
 [ "$PF_OWN" = 3 ] && SERVE_ARGS="$SERVE_ARGS --qo-manifest packs/qo.manifest.json --qo-pack packs/qo.pack"
 [ "${NOHASH:-0}" = 1 ] && SERVE_ARGS="$SERVE_ARGS --no-hash"
 
 for ((r = NRANK - 1; r >= 0; r--)); do
+  QPARGS=""
+  [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" = 1 ] && QPARGS="--qp-manifest packs/qp.rank$r.manifest.json --qp-pack packs/qp.rank$r.pack"
   # each process writes its own pid (setsid may fork, so $! is not always the engine's pid). The braces background only
   # the engine: backgrounding the whole && list left a shell holding the ssh session open until the engine exited
   on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
       --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all \
-      --serve $G6_HOME/serve $SERVE_ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
+      --serve $G6_HOME/serve $SERVE_ARGS $QPARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait
 echo "engines started; waiting for four ready files (up to ${READY_TMO}s)"

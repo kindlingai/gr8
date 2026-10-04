@@ -17,7 +17,7 @@
 >   - one request at a time (multi-session is in progress)
 >   - decode slows past the replicated context window (being worked on)
 >   - launch scripts not yet run outside our own setup
->   - the 4-Spark (TP4) version runs without the QO prefill path, so its prefill is slower (see Known limits)
+>   - the 4-Spark (TP4) version runs a split form of the QO prefill path (`G6_PF_OWN=4`, see Known limits)
 > - **Where help would be great:**
 >   - multi-session at long context
 >   - decode cost with context split across nodes
@@ -113,7 +113,8 @@ Every engine setting is an environment variable or a flag in `scripts/launch_tp6
 - **`--mtp`** (`MTP=`) is the MTP draft length. K1H2 was measured at k=2. Larger k is supported but was not measured on
   this build.
 - **`G6_PF_OWN=3` + the QO pack** is row-owner attention in prefill. It is the biggest prefill lever and needs `qo.pack` on
-  every node.
+  every node. TP4 runs `G6_PF_OWN=4` instead, the same attention block split over two head pairs, which needs no QO
+  pack ([docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
 - **`G6_CP=1 G6_CP_R=32768`** is context-parallel KV. The first 32,768 tokens are replicated on every rank and later pages
   are spread across ranks, which is what makes the 614K pool fit. `G6_CP_PF_VERIFY=1` and `G6_CP_PF_HASH2=1` check every
   staged KV page against a hash. HASH2 makes that check cheap (254K TTFT -34% vs the old hash, same output tokens).
@@ -156,8 +157,10 @@ pack format, serve loop, front end shape). Use it as the map for porting another
 - **One request at a time.** The shim queues the rest. There is no batching across requests.
 - Six ranks (TP6) or four (TP4). TP4: `G6_NR=4 scripts/build.sh`, `scripts/build_packs.sh` with the TP4 GPTQ codes
   (`tp4/r0..r3`), `scripts/stage.sh`, `scripts/launch_tp4.sh`. A TP4 rank pack is about 90 GB, so the 13 GB QO pack
-  does not fit next to it: TP4 runs `G6_PF_OWN=1` (row-owner projections, no QO attention) with a 393,216-token pool.
-  First TP4 numbers (one boot, 2200 MHz cap): 8K prefill 816 tok/s, 32K 654 tok/s, prose decode 29.0 tok/s, 87K needle found.
+  does not fit next to it. TP4 runs pair-owner QO attention instead (`G6_PF_OWN=4`, about 1.3-1.4 GB of device memory plus 84 MB pinned per rank) with a
+  393,216-token pool. TP4 numbers (2200 MHz cap, launcher defaults): 8K prefill 1,318 tok/s, 32K 1,288 tok/s, 18K TTFT
+  14.5 s, 87K TTFT 73.3 s, decode code/prose/structured 34.8/31.5/37.0 tok/s, 87K and 250K needles found (#39).
+  With `G6_PF_OWN=1` (no QO attention): 8K 816 tok/s, 32K 654 tok/s.
 - `logprobs` are refused. `top_k`/`min_p` are ignored with a warning. The full list is in `frontend/README.md`.
 - Requests are passed to the ranks other than 0 as files over ssh (one persistent connection per node), which adds a little TTFT.
 - With hashing on, boot takes a few minutes. It is mostly pack read speed: local packs loaded at about 1.8 GB/s per node

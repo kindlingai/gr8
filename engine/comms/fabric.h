@@ -83,7 +83,9 @@ class Fabric {
   // to peer p only, into p's recv slot [c][me] at offset 0, tail right after it; sizes[c] is ignored for them.
   // skip: collectives the proxy neither waits for nor sends this step (G6_PF_OWN=3 has no collective 0)
   // mask / skip bits address collectives 0..31 only; bit c >= 32 reads as 0 (fabric.cpp bit()).
-  struct Rs { unsigned mask = 0; size_t ss = 0; std::vector<uint32_t> bytes; unsigned skip = 0; };
+  // p2p: reduce-scatter collectives (bits also set in mask) whose slice goes to `peer` only; the other peers get no
+  // write (G6_PF_OWN=4: the attention partial of the counterpart's rows, collective 0)
+  struct Rs { unsigned mask = 0; size_t ss = 0; std::vector<uint32_t> bytes; unsigned skip = 0; unsigned p2p = 0; int peer = -1; };
   void enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes, const Rs& rs);
   // bulk mode: one proxy job, in enqueue order: wait doorbell[db] >= seq; if wait_flag >= 0 wait flags[wait_flag][p] >=
   // wait_min for every peer p; RDMA-write every (offset, bytes) range of my bulk area to every peer at the same offset;
@@ -92,8 +94,11 @@ class Fabric {
   // A CQ error, a bad completion, or 60 s without a completion while a send queue is full sets the error word
   // (bulk_proxy.h codes) and stops the proxy.
   // wait_flag compares the val word. Ranges: offset and bytes multiples of 8.
+  // peer: -1 = every peer (as above); k = peer k only: the wait_flag spin reads only flags[wait_flag][k], and the ranges
+  // and the post_flag writes go to k only (G6_PF_QP_ROLL: the pair partner's half image, qp_wire.h)
   struct BulkJob { int db = -1; unsigned long long seq = 0; int wait_flag = -1; unsigned long long wait_min = 0;
-                   std::vector<std::pair<uint64_t, uint32_t>> ranges; int post_flag = -1; unsigned long long post_val = 0; };
+                   std::vector<std::pair<uint64_t, uint32_t>> ranges; int post_flag = -1; unsigned long long post_val = 0;
+                   int peer = -1; };
   void enqueue_bulk(BulkJob job);
   BulkDev bulk_dev() const;
   // wait until the proxy has posted every job enqueued so far. false (message printed) = the proxy exited with work

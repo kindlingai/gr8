@@ -26,8 +26,9 @@ struct G6AttnQoWork {
 struct G6AttnQo {
     int kernel = 0;                         // 0 = B, 1 = v1, 2 = R1
     int cap = 0, max_rows = 0;
+    int heads = 64;                         // 64 (G6_PF_OWN=3), or 32 (G6_PF_OWN=4 pair-owner, TP4 builds only): uk->shape[0]
     void* storage = nullptr; size_t weight_bytes = 0, bytes = 0;
-    __half *uk = nullptr, *uv = nullptr;    // [64][512][192], [64][256][512] FP16
+    __half *uk = nullptr, *uv = nullptr;    // [heads][512][192], [heads][256][512] FP16
     G6AttnQoWork* w = nullptr;
     __half *table = nullptr, *q = nullptr, *ctxh = nullptr; uint8_t* bad = nullptr; float* ctx = nullptr;
 #if PF_QOROPE
@@ -40,8 +41,11 @@ __global__ void uk_half_t(const void* src, __half* dst, int n) {      // [h][192
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { int h = i / (512 * 192), k = (i / 192) % 512, d = i % 192; dst[i] = __float2half_rn(ga::bfloat(src, ((int64_t)h * 192 + d) * 512 + k)); }
 }
+// The pack kernels take the head count as a template parameter of an inlined body: the 64-head kernels keep their names
+// and code, and a TP4 build adds the 32-head ones (G6_PF_OWN=4) that a TP6 build never compiles.
 // q[row][h][576] from qf[row][h][512] FP32 and the RoPE half of q_b (same equations as gp::pack_q)
-__global__ void pack_q_rows(G6AttnQoStep s, const float* qf, __half* q, unsigned* error) {
+template <int H>
+__device__ __forceinline__ void pack_q_rows_body(const G6AttnQoStep& s, const float* qf, __half* q, unsigned* error) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t)s.rows * H * 576) return;
     int d = i % 576, h = (i / 576) % H, row = i / (576 * H);
@@ -57,6 +61,10 @@ __global__ void pack_q_rows(G6AttnQoStep s, const float* qf, __half* q, unsigned
     if (!isfinite(__half2float(z))) atomicOr(error, 4u);
     q[i] = z;
 }
+__global__ void pack_q_rows(G6AttnQoStep s, const float* qf, __half* q, unsigned* error) { pack_q_rows_body<H>(s, qf, q, error); }
+#if G6_NR == 4
+__global__ void pack_q_rows32(G6AttnQoStep s, const float* qf, __half* q, unsigned* error) { pack_q_rows_body<32>(s, qf, q, error); }
+#endif
 #if PF_QOABS16
 // PF_QOABS16: the absorb GEMM writes q[row][h][0..511] in FP16 directly; this fills d 512..575 (pack_q_rows' RoPE branch)
 #if PF_QOROPE
@@ -66,7 +74,8 @@ __global__ void rope_table(float2* t, int n) {
     if (i < n) { float c, sn; ga::cs(i / 32, i % 32, c, sn); t[i] = make_float2(c, sn); }
 }
 #endif
-__global__ void pack_q_rope(G6AttnQoStep s, __half* q, unsigned* error
+template <int H>
+__device__ __forceinline__ void pack_q_rope_body(const G6AttnQoStep& s, __half* q, unsigned* error
 #if PF_QOROPE
                             , const float2* rope, int cap
 #endif
@@ -88,6 +97,23 @@ __global__ void pack_q_rope(G6AttnQoStep s, __half* q, unsigned* error
     if (!isfinite(__half2float(z))) atomicOr(error, 4u);
     q[((int64_t)row * H + h) * 576 + d] = z;
 }
+#if PF_QOROPE
+#define G6_QO_ROPE_PARAMS , const float2* rope, int cap
+#define G6_QO_ROPE_ARGS , rope, cap
+#else
+#define G6_QO_ROPE_PARAMS
+#define G6_QO_ROPE_ARGS
+#endif
+__global__ void pack_q_rope(G6AttnQoStep s, __half* q, unsigned* error G6_QO_ROPE_PARAMS) {
+    pack_q_rope_body<H>(s, q, error G6_QO_ROPE_ARGS);
+}
+#if G6_NR == 4
+__global__ void pack_q_rope32(G6AttnQoStep s, __half* q, unsigned* error G6_QO_ROPE_PARAMS) {
+    pack_q_rope_body<32>(s, q, error G6_QO_ROPE_ARGS);
+}
+#endif
+#undef G6_QO_ROPE_PARAMS
+#undef G6_QO_ROPE_ARGS
 #endif
 #if defined(PF_QODUMP) && PF_QOROPE
 __global__ void rope_check_k(const float2* t, int n, unsigned* bad) {
@@ -106,7 +132,7 @@ inline void rope_check(const float2* t, int cap, cudaStream_t st) {
 #endif
 #ifdef PF_QODUMP
 // screen hooks: G6_QO_DUMP=1 prints an FNV64 of q per call; G6_QO_NANINJ=1 writes FP16 NaN into q[0] on every call
-inline void qo_dump(const __half* q, int rows, int context, cudaStream_t st) {
+inline void qo_dump(const __half* q, int rows, int H, int context, cudaStream_t st) {
     static const bool dump = std::getenv("G6_QO_DUMP") != nullptr, inj = std::getenv("G6_QO_NANINJ") != nullptr;
     static std::atomic<int> injected{0};
     if (inj) {
@@ -128,7 +154,7 @@ inline void qo_dump(const __half* q, int rows, int context, cudaStream_t st) {
 #endif
 static size_t layout(G6AttnQo& p, void* base) {
     size_t used = 0; auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return (void*)((uintptr_t)base + at); };
-    size_t C = (size_t)p.cap, R = (size_t)p.max_rows;
+    size_t C = (size_t)p.cap, R = (size_t)p.max_rows, H = (size_t)p.heads;
 #if PF_QOROPE
     p.rope = (float2*)take(C * 32 * sizeof(float2));   // first, so a non-owner (cap <= owner cap) sees the owner's table
 #endif
@@ -140,20 +166,25 @@ static cudaError_t release_work(G6AttnQoWork* w) {
     if (!w || w->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) return cudaSuccess;
     cublasDestroy(w->blas); auto e = cudaFree(w->data); delete w; return e;
 }
+inline int cap_limit = 0;   // g6_attn_qo_cap
+// heads a state may hold in this build: 64, and 32 (pair-owner) in a TP4 build
+inline bool heads_ok(int h) { return h == 64 || (G6_NR == 4 && h == 32); }
 }   // namespace gqi
 
 extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
                                  int max_rows, void* s, G6AttnQo* owner) {
     if (!out || *out || !b || !b->storage || !uk || !uv || max_rows <= 0) return int(cudaErrorInvalidValue);
     auto shape = [](const G6AttnTensor* t, int64_t a, int64_t c, int64_t d) { return t->data && t->ndim == 3 && t->shape[0] == a && t->shape[1] == c && t->shape[2] == d; };
-    if (!shape(uk, 64, 192, 512) || !shape(uv, 64, 256, 512)) return int(cudaErrorInvalidValue);
+    const int heads = uk->ndim == 3 ? (int)uk->shape[0] : 0;
+    if (!gqi::heads_ok(heads) || !shape(uk, heads, 192, 512) || !shape(uv, heads, 256, 512)) return int(cudaErrorInvalidValue);
     const char* k = std::getenv("G6_PF_QO");
     int kernel = (!k || !*k || !strcmp(k, "b")) ? 0 : !strcmp(k, "v1") ? 1 : !strcmp(k, "r1") ? 2 : -1;
 #ifndef G6_QO_HAVE_R1
     if (kernel == 2) kernel = -1;
 #endif
     if (kernel < 0) return int(cudaErrorInvalidValue);
-    auto p = new G6AttnQo; p->kernel = kernel; p->cap = (b->capacity + 31) & ~31; p->max_rows = max_rows;
+    auto p = new G6AttnQo; p->kernel = kernel; p->cap = (b->capacity + 31) & ~31; p->max_rows = max_rows; p->heads = heads;
+    if (gqi::cap_limit > 0 && p->cap > ((gqi::cap_limit + 31) & ~31)) p->cap = (gqi::cap_limit + 31) & ~31;
     int device = 0; cudaError_t e = cudaGetDevice(&device);
     if (e != cudaSuccess) { delete p; return int(e); }
     const size_t need = gqi::layout(*p, nullptr);
@@ -171,14 +202,14 @@ extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G
         p->w = w;
     }
     gqi::layout(*p, p->w->data);
-    p->weight_bytes = (size_t)64 * (512 * 192 + 256 * 512) * 2;
+    p->weight_bytes = (size_t)heads * (512 * 192 + 256 * 512) * 2;
     p->bytes = p->weight_bytes + (owner ? 0 : p->w->bytes);
     e = cudaMalloc(&p->storage, p->weight_bytes);
     if (e != cudaSuccess) { gqi::release_work(p->w); delete p; return int(e); }
-    p->uk = (__half*)p->storage; p->uv = p->uk + (size_t)64 * 512 * 192;
+    p->uk = (__half*)p->storage; p->uv = p->uk + (size_t)heads * 512 * 192;
     cudaStream_t st = (cudaStream_t)s;
-    gqi::uk_half_t<<<(64 * 512 * 192 + 255) / 256, 256, 0, st>>>(uk->data, p->uk, 64 * 512 * 192);
-    gp::weight_half<<<(64 * 256 * 512 + 255) / 256, 256, 0, st>>>(uv->data, p->uv, 64 * 256 * 512);
+    gqi::uk_half_t<<<(heads * 512 * 192 + 255) / 256, 256, 0, st>>>(uk->data, p->uk, heads * 512 * 192);
+    gp::weight_half<<<(heads * 256 * 512 + 255) / 256, 256, 0, st>>>(uv->data, p->uv, heads * 256 * 512);
 #if PF_QOROPE
     if (!owner) gqi::rope_table<<<(p->cap * 32 + 255) / 256, 256, 0, st>>>(p->rope, p->cap * 32);
 #if PF_ROPE2
@@ -230,11 +261,12 @@ extern "C" void g6_attn_qo_prof(int on, double* ms) { gqi::prof_ms = on ? ms : n
 extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep* s, void* stream) {
     if (!p || !b || !b->storage || !s) return int(cudaErrorInvalidValue);
     if (s->rows == 0) return 0;
-    if (s->rows < 0 || s->rows > p->max_rows || s->context <= 0 || s->context > b->capacity || !s->q_b || s->ld_qb < 64 * 256 ||
+    if (s->rows < 0 || s->rows > p->max_rows || s->context <= 0 || s->context > b->capacity || s->context > p->cap || !s->q_b ||
+        s->ld_qb < p->heads * 256 ||
         !s->positions || !s->ids || !s->out) return int(cudaErrorInvalidValue);
     if ((uintptr_t)b->args.mla_cache % 16) return int(cudaErrorInvalidValue);   // 656-B records, 16-B cp.async gathers (B, R1)
     cudaStream_t st = (cudaStream_t)stream;
-    const int R = s->rows, H = gqi::H;
+    const int R = s->rows, H = p->heads;
     int rc = gp::blas_status(cublasSetStream(p->w->blas, st));
     if (rc) return rc;
     const float one = 1.f, zero = 0.f;
@@ -246,6 +278,15 @@ extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep*
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     if (rc) return rc;
     unsigned* err = b->args.error;
+#if G6_NR == 4
+    if (H == 32)
+        gqi::pack_q_rope32<<<(unsigned)(((int64_t)R * H * 64 + 255) / 256), 256, 0, st>>>(*s, p->q, err
+#if PF_QOROPE
+            , p->rope, p->cap
+#endif
+            );
+    else
+#endif
     gqi::pack_q_rope<<<(unsigned)(((int64_t)R * H * 64 + 255) / 256), 256, 0, st>>>(*s, p->q, err
 #if PF_QOROPE
         , p->rope, p->cap
@@ -258,10 +299,14 @@ extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep*
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     if (rc) return rc;
     unsigned* err = b->args.error;
+#if G6_NR == 4
+    if (H == 32) gqi::pack_q_rows32<<<(unsigned)(((int64_t)R * H * 576 + 255) / 256), 256, 0, st>>>(*s, p->ctx, p->q, err);
+    else
+#endif
     gqi::pack_q_rows<<<(unsigned)(((int64_t)R * H * 576 + 255) / 256), 256, 0, st>>>(*s, p->ctx, p->q, err);
 #endif
 #ifdef PF_QODUMP
-    gqi::qo_dump(p->q, R, s->context, st);
+    gqi::qo_dump(p->q, R, H, s->context, st);
 #endif
     cudaError_t e;
     gqi::prof_tick(st, 0);
@@ -301,7 +346,7 @@ extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep*
 extern "C" int g6_attn_qo_warm(G6AttnQo* p, int rows, void* stream) {
     if (!p || rows <= 0 || rows > p->max_rows) return int(cudaErrorInvalidValue);
     cudaStream_t st = (cudaStream_t)stream;
-    const int R = rows, H = gqi::H;
+    const int R = rows, H = p->heads;
     int rc = gp::blas_status(cublasSetStream(p->w->blas, st));
     if (rc) return rc;
     const float one = 1.f, zero = 0.f;
@@ -323,6 +368,18 @@ extern "C" int g6_attn_qo_warm(G6AttnQo* p, int rows, void* stream) {
     return int(cudaStreamSynchronize(st));
 }
 extern "C" size_t g6_attn_qo_bytes(const G6AttnQo* p) { return p ? p->bytes : 0; }
+extern "C" void g6_attn_qo_cap(int cap) { gqi::cap_limit = cap > 0 ? cap : 0; }
+extern "C" int g6_attn_qo_load(G6AttnQo* p, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream) {
+    if (!p || !p->storage || !uk || !uv) return int(cudaErrorInvalidValue);
+    auto shape = [](const G6AttnTensor* t, int64_t a, int64_t c, int64_t d) { return t->data && t->ndim == 3 && t->shape[0] == a && t->shape[1] == c && t->shape[2] == d; };
+    const int heads = p->heads;
+    if (!shape(uk, heads, 192, 512) || !shape(uv, heads, 256, 512)) return int(cudaErrorInvalidValue);
+    cudaStream_t st = (cudaStream_t)stream;
+    // create's two conversions, so the FP16 bytes equal a state created from these tensors
+    gqi::uk_half_t<<<(heads * 512 * 192 + 255) / 256, 256, 0, st>>>(uk->data, p->uk, heads * 512 * 192);
+    gp::weight_half<<<(heads * 256 * 512 + 255) / 256, 256, 0, st>>>(uv->data, p->uv, heads * 256 * 512);
+    return int(cudaGetLastError());
+}
 extern "C" int g6_attn_qo_release(G6AttnQo* p) {
     if (!p) return 0;
     auto e = cudaFree(p->storage); auto w = gqi::release_work(p->w); delete p;

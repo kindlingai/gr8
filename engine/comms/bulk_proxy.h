@@ -20,6 +20,9 @@ constexpr unsigned kBulkStopped = 1u;
 
 struct BulkCompl { uint64_t wr_id; bool ok; };
 
+// fabric.h BulkJob::peer: does a job with this peer field address peer p? (-1 = every peer)
+inline bool bulk_to(int job_peer, int p) { return job_peer < 0 || job_peer == p; }
+
 // Reap every completion available now (non-blocking): each signaled completion with wr_id q retires the oldest batch of q.
 // Returns kBulkCqError (poll < 0), kBulkWcError (bad status; *bad_peer = its wr_id), else 0; *got = completions reaped.
 template <class Poll>

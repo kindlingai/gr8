@@ -38,6 +38,9 @@
 // c0 is never used; c3 carries only kv_a | idx_k (QO_REC); full-index layers append the index keys of every row and
 // score the owner rows inside the attention block (no per-layer c4). Every rank still appends every row's latent KV
 // and index keys, so the caches stay replicated for decode.
+//
+// Pair-owner QO attention (G6_PF_OWN=4, TP4 builds only, needs G6_PF_RS=1 and --pfv2; docs/DESIGN-QO-PAIR.md, qp.cuh):
+// OWN=2 with, on the layers of G6_PF_QP_LAYERS, OWN=3's attention block split over the head pairs {0,1} and {2,3}.
 #pragma once
 #include <algorithm>
 #include "envparse.h"
@@ -79,6 +82,12 @@ inline void pf_env_check()
 {
     std::string e;
     if (env_choice("G6_PF_DRAFT_SHARE", 1, 0, &e) < 0) die(e);
+    if (env_choice("G6_PF_QP_EARLY", 2, 0, &e) < 0) die(e);          // G6_PF_OWN=4 (qp.cuh)
+    if (env_choice("G6_PF_QP_WARM", 1, 0, &e) < 0) die(e);
+    const int roll = env_choice("G6_PF_QP_ROLL", 4, 0, &e);       // 0 = resident pair pack, 2..4 = rolling slots
+    if (roll < 0) die(e);
+    if (roll == 1) die("G6_PF_QP_ROLL='1': a rolling pack needs 2..4 slots (0 = resident)");
+    if (env_choice("G6_PF_QP_ROLL_SER", 1, 0, &e) < 0) die(e);    // measurement: builds on the lane stream (fully exposed)
 #if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
     if (env_choice("G6_CP_PF_HASH2", 1, 1, &e) < 0) die(e);   // HASH2 build: unset / 1 = hash2, 0 = k_cp_pf_hash, else exit
 #endif
@@ -414,6 +423,23 @@ struct Prefill
     float* perm_tmp = nullptr;        // perm: [Mmax][6144] scratch for putting resid / x back in input order
     std::map<int, std::pair<bindp::Gemm, bindp::Gemm>> qg;   // by sub-batch M: full q_b, full o_proj
     std::vector<char> ixl;            // per layer: full-index layer
+    bool qp = false;                  // G6_PF_OWN=4 pair-owner QO (with own + ownix, needs v2, NR = 4; qp.cuh), this request
+    std::vector<QpW>* qpw = nullptr;  //   set before build_prefill: pair weights per model layer (empty outside qpl)
+    std::vector<char> qpl;            //   set before build_prefill: per model layer, 1 = pair-owner (G6_PF_QP_LAYERS), 0 = OWN=2
+    QpRoll* roll = nullptr;           //   set before build_prefill (both lanes, one object): G6_PF_QP_ROLL, *qpw names its slots
+    int qp_rows = 0;                  //   W rows per call, upper bound: 2 x (ceil(Mmax / nr) + 16)
+    int qp_early = 0;                 //   G6_PF_QP_EARLY: 0 = O_c's partial sent after W's o_proj; 1 = after O_c's own xq +
+                                      //   o_proj (overlaps O_r's o_proj); 2 = O_c's QO call, o_proj, send, then O_r's QO call
+    __half *qp_qb = nullptr, *qp_out = nullptr;   // [qp_rows][8192]: q_b of W (+ alignment rows), attention output of W
+    uint8_t* qp_x8 = nullptr;         //   MXFP8 records of qp_out (K = 8192)
+    __nv_bfloat16* qp_part = nullptr; //   [qp_rows][6144] o_proj partials of W: O_c rows (sent to c), then O_r rows
+    int* qp_pos = nullptr;            //   [qp_rows] positions of W
+    int* qp_ids = nullptr;            //   [qp_rows][2048] selected IDs of W
+    int qp_pend = -1;                 //   model layer whose pair norm the next c0 consume runs (pf_attn_block_qp sets it)
+    const __nv_bfloat16* qp_mine = nullptr;       // its own-pair partial of O_r
+    int lane = 0;                     //   0 = lane A (built first), 1 = lane B (built with share): its roll `used` events
+    bool qp_built = false;            //   built with G6_PF_OWN=4 (qp is then chosen per request, pf_qp_select)
+    int qp_ctx = 0;                   //   largest prompt + gen that may run OWN=4: the QO key / RoPE table size
     uint16_t* part[2] = {nullptr, nullptr};
     int *tok = nullptr, *pos = nullptr;
     void* scratch = nullptr;
@@ -470,6 +496,10 @@ inline void pf_qo_warm(Model& m, Prefill& P, cudaStream_t st)
     G6RT_CK(cudaStreamSynchronize(st));
     if (m.rank == 0) fprintf(stderr, "# rank %d: G6_PF_OWN=3 warm-up: absorb + UV at %d..%d owner rows, q_b at %d rows\n", m.rank, lo, hi, r1 - a0);
 }
+// G6_PF_OWN=4 (qp.cuh in a TP4 build; a TP6 build exits)
+inline void pf_qp_alloc(Prefill& P, Model& m, int Mmax, const g6::FabricDev& f, Prefill* share);
+inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share);
+inline void pf_qp_warm(Model& m, Prefill& P, cudaStream_t st);
 inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, const g6::FabricDev& f, u64* stepp,
                           cudaStream_t st = nullptr, Prefill* share = nullptr, G6AttnPrefill* tc_root = nullptr)
 {
@@ -521,6 +551,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
     if (!chunked) P.attn_rows = Mmax;
     else P.attn_out = dmalloc<__half>(n * g6nr::QBW);
     if (chunked || P.ownix || P.qo) P.idx_all = dmalloc<int>(n * 2048);
+    if (P.qp) pf_qp_alloc(P, m, Mmax, f, share);
     if (P.qo)
     {
         P.qo_rows = (Mmax + f.nr - 1) / f.nr + 16;
@@ -573,6 +604,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.back().fc1_wide = y.T.fc1_wide;      // decode widened tr3.fc1 in place: prefill must read the same order
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
     }
+    if (P.qp) pf_qp_states(P, m, st, share);
     if (P.qo && share) P.qa = share->qa;
     else if (P.qo)
     {
@@ -612,6 +644,13 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         fprintf(stderr, "# rank %d: tensor-core prefill attention states for %d layers: %.3f GB\n", m.rank, m.nl, b / 1e9);
     }
     if (P.qo && !share) pf_qo_warm(m, P, st);   // lanes that share the states share the cuBLAS handle
+    if (P.qp && !share)
+    {
+        std::string ee;
+        const int warm = env_choice("G6_PF_QP_WARM", 1, 0, &ee);
+        if (warm < 0) die(ee);
+        if (warm) pf_qp_warm(m, P, st);
+    }
 }
 
 // G6_PF_ATTN_ROWS=<r>: attention runs in chunks of r rows inside a prefill sub-batch of MP rows (the rest of the layer,
@@ -963,6 +1002,16 @@ inline void pf_adump(const Prefill& P, int i, const char* what, const void* dev,
     if (!o || fwrite(h.data(), 1, h.size(), o) != h.size()) die("G6_PF_ADUMP: cannot write " + f);
     fclose(o);
 }
+#if G6_NR == 4
+#include "qp.cuh"
+#else
+inline void pf_qp_alloc(Prefill&, Model&, int, const g6::FabricDev&, Prefill*) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
+inline void pf_qp_states(Prefill&, Model&, cudaStream_t, Prefill*) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
+inline void pf_qp_warm(Model&, Prefill&, cudaStream_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
+inline void pf_attn_block_qp(Model&, Prefill&, int, int, int, cudaStream_t, cudaEvent_t, cudaEvent_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
+inline void pf_qp_norm(Prefill&, int, const __nv_bfloat16*, __half*, cudaStream_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
+inline bool pf_qp_select(Prefill&, Prefill*, int) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); return false; }
+#endif
 // G6_PF_OWN=3: layer i's attention block, owner rows r0..r1 (QO-INTEGRATION.md section 1). Ends with the owner's
 // residual + norm and the c1 publish (no c0). wait_attn / used_attn as in pf_attn_block.
 inline void pf_attn_block_qo(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, cudaEvent_t wait_attn,
@@ -1078,6 +1127,7 @@ inline void pf_attn_block(Model& m, Prefill& P, int i, int M, int context, cudaS
                           cudaEvent_t wait_attn = nullptr, cudaEvent_t used_attn = nullptr)
 {
     if (P.qo && !cache_only) { pf_attn_block_qo(m, P, i, M, context, st, wait_attn, used_attn); return; }
+    if (P.qp && P.qpl[i] && !cache_only) { pf_attn_block_qp(m, P, i, M, context, st, wait_attn, used_attn); return; }
     Layer& y = m.layers[i];
     const bindp::Layer& b = pf_layer(m, P, i, M);
     pf_mark(7, st);
@@ -1152,6 +1202,7 @@ inline void pf_attn_block(Model& m, Prefill& P, int i, int M, int context, cudaS
 // RS form in two halves (a loopback driver delivers collective 2c + 1 between them): owner rows, then the gather
 inline void pf_consume_rs(Prefill& P, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st, bool ag = true)
 {
+    if (c == 0 && P.qp_pend >= 0) { pf_qp_norm(P, M, w, out, st); return; }   // G6_PF_OWN=4: the pair norm (qp.cuh)
     const int cr = 2 * c, rows = pf_rows(M, P.f.rank, P.f.nr);
     k_wait_rs<<<1, 32, 0, st>>>(P.f, P.stepp, cr, M, P.loop);
     RsNormArgs a{P.f, P.stepp, cr, M, P.loop, P.resid, w, out, glue::RMS_EPS, P.tickets + cr + 1};
@@ -1324,7 +1375,9 @@ inline void pf_enqueue(Fab& fab, const Prefill& P, u64 ls0, int nl, int M)
         std::vector<uint32_t> sizes{0, mine, 0, c3};
         if (i == nl - 1) sizes.push_back(2 * mine);                  // c4: FP32 residual rows
         else if (P.ownix && P.ixl[i + 1]) sizes.push_back((uint32_t)(pf_rows(M, me, nr) * IX_ROW));   // c4: owner IDs
-        fab.enqueue_step(ls0 + i, sizes, rs);
+        typename Fab::Rs ri = rs;
+        if (P.qp && P.qpl[i]) { ri.p2p = 0x1; ri.peer = me ^ 2; }   // G6_PF_OWN=4: c0 = O_c's partial, to c only
+        fab.enqueue_step(ls0 + i, sizes, ri);
     }
 }
 // G6_PF_RCDUMP (measurement only, synchronizes the stream): after a MoE layer's routing, one line

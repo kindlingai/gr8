@@ -262,6 +262,17 @@ int main(int argc, char** argv)
     const bool pf_rs = getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) == 1;     // reduce-scatter form (prefill.cuh)
     const int pf_own = getenv("G6_PF_OWN") ? atoi(getenv("G6_PF_OWN")) : 0;   // 1: row-owner projections, 2: + index (prefill.cuh)
     const bool pf_qo = MP && pf_own == 3;                                        // 3: row-owner QO attention (QO-INTEGRATION.md)
+    const bool pf_qp = MP && pf_own == 4;                                        // 4: pair-owner QO attention (TP4, qp.cuh)
+    if (pf_qp && NR != 4) die("G6_PF_OWN=4 is TP4 only (G6_NR=4)");
+#if G6_NR == 4
+    std::vector<std::vector<QpW>> qpw(NR, std::vector<QpW>(layers.size()));   // pf_qp: per rank, assembled from the packs
+    const std::vector<char> qpl = pf_qp ? pf_qp_mask(layers) : std::vector<char>(layers.size(), 0);
+    std::string qre;
+    const int qp_roll_s = env_choice("G6_PF_QP_ROLL", 4, 0, &qre);       // rolling pack (pf_env_check made it 0 or 2..4)
+    const bool qp_roll_ser = env_choice("G6_PF_QP_ROLL_SER", 1, 0, &qre) == 1;
+    if (qp_roll_s && !pf_qp) die("G6_PF_QP_ROLL needs G6_PF_OWN=4 and --prefill");
+    std::vector<QpRoll*> qp_roll(NR, nullptr);
+#endif
     std::vector<QoW> qow;                                                       // pf_qo: full-head weights per model layer
     g6::Pack qo_pack;                                                           // --qo-pack (else assembled from the six packs)
     if ((qo_man.empty()) != (qo_file.empty())) die("--qo-manifest and --qo-pack go together");
@@ -302,10 +313,29 @@ int main(int argc, char** argv)
         }
         fprintf(stderr, "# G6_PF_OWN=3: full-head q_b / o_proj / UK / UV for %zu layers\n", qow.size());
     }
+#if G6_NR == 4
+    if (pf_qp)                          // the pair weights need both pair members' slices: load the four packs first
+    {
+        for (int r = 0; r < NR; ++r) load_pack(pack[r], packs + "/rank" + std::to_string(r) + ".manifest.json", packs + "/rank" + std::to_string(r) + ".pack", r);
+        std::vector<Find> finds;
+        for (int r = 0; r < NR; ++r) finds.push_back(pack_find(pack[r], store));
+        int n = 0;
+        for (size_t k = 0; k < layers.size(); ++k)
+        {
+            if (!qpl[k]) continue;
+            if (!qp_roll_s) for (int r = 0; r < NR; ++r) qpw[r][k] = qp_from_ranks(finds, r, layers[k]);
+            ++n;
+        }
+        if (qp_roll_s)                  // S slots per rank, built from the pair members' slices during the prefill
+            for (int r = 0; r < NR; ++r) qp_roll[r] = qp_roll_new(qp_roll_s, qp_roll_ser, finds, r, layers, qpl, qpw[r]);
+        fprintf(stderr, "# G6_PF_OWN=4: pair q_b / o_proj / UK / UV for %d of %zu layers (G6_PF_QP_LAYERS), assembled from the packs%s\n",
+                n, layers.size(), qp_roll_s ? " (rolling)" : "");
+    }
+#endif
     for (int r = 0; r < NR; ++r)
     {
         const std::string base = packs + "/rank" + std::to_string(r);
-        if (!pf_qo) load_pack(pack[r], base + ".manifest.json", base + ".pack", r);
+        if (!pf_qo && !pf_qp) load_pack(pack[r], base + ".manifest.json", base + ".pack", r);
         g6::FabricDev f{};
         f.send = dmalloc<char>(2 * (size_t)NC * stride);
         f.recv = recv; f.doorbell = doorbell; f.error = err;
@@ -335,9 +365,15 @@ int main(int argc, char** argv)
             PF[r].v2 = pfv2;
             PF[r].loop = PF2[r].loop = true;
             PF[r].own = PF2[r].own = pf_own >= 1;
-            PF[r].ownix = PF2[r].ownix = pf_own == 2;
+            PF[r].ownix = PF2[r].ownix = pf_own == 2 || pf_qp;
             PF[r].qo = PF2[r].qo = pf_qo;
             PF[r].qow = PF2[r].qow = &qow;
+#if G6_NR == 4
+            PF[r].qp = PF2[r].qp = pf_qp;
+            PF[r].qpw = PF2[r].qpw = &qpw[r];
+            PF[r].qpl = PF2[r].qpl = qpl;
+            PF[r].roll = PF2[r].roll = qp_roll[r];
+#endif
             PF[r].attn_rows = pf_attn_rows(MP);
             build_prefill(PF[r], R[r], pack_find(pack[r], store), MP, fp, stepp_pf, st);
             loop_pf.send[r] = fp.send;
@@ -446,7 +482,7 @@ int main(int argc, char** argv)
     loop_pf.recv = recv_pf; loop_pf.stepp = stepp_pf; loop_pf.ncoll = NCP; loop_pf.stride = stride_pf;
     loop_pf2.recv = recv_pf2; loop_pf2.stepp = stepp_pf2; loop_pf2.ncoll = NCP; loop_pf2.stride = stride_pf;
     if (MP && pf_rs) fprintf(stderr, "# prefill reduce-scatter form (5 collectives, slice %zu B)%s\n", pf_ss(PF[0].f),
-                             pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
+                             pf_own >= 4 ? ", pair-owner QO attention (G6_PF_OWN=4)" : pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
     fprintf(stderr, "# device tensors: %.2f GB held, %.2f GB shared between ranks\n", store.bytes / 1e9, store.shared_bytes / 1e9);
     printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed);
 
@@ -1367,6 +1403,9 @@ int main(int argc, char** argv)
     if (rdf) fclose(rdf);
     if (idf) fclose(idf);
     if (nc) fprintf(stderr, "# top_p misses %u (target, rank 0) %u (draft, rank 0)\n", topp_misses(R[0]), mtp ? topp_misses(DR[0].d) : 0u);
+#if G6_NR == 4
+    for (int r = 0; r < NR; ++r) if (qp_roll[r]) qp_roll_print(*qp_roll[r], r);
+#endif
     printf("# m4sim: %d steps, %d rank lines differ from rank 0\n", steps, bad);
     return bad ? 1 : 0;
 }
