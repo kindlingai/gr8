@@ -61,7 +61,7 @@ public:
     void fail() override {EventEndpoint::fail();io_.shutdown();}
     void receive_events() { // background control thread, one persistent connection
         try {
-            for(;;){auto b=io_.receive();Decoder d(b);
+            for(;;){auto b=io_.receive(true);Decoder d(b); // idle between events: no timeout (#26)
                 if(d.tag==Tag::Notice)install(decode_notice(b));
                 else if(d.tag==Tag::Commit)deliver(decode_commit(b));
                 else throw std::runtime_error("worker received non-event frame");}

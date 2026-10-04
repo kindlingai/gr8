@@ -60,7 +60,7 @@ inline std::unique_ptr<ControlIO> accept_control(int listener, unsigned timeout)
         Socket fd(::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC));
         if (fd.get() < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         require(fd.get() >= 0, "control accept failed");
-        auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); return io;
+        auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); return io; // dead peer seen in <= 30 s (#26)
     }
 }
 inline std::unique_ptr<ControlIO> connect_control(const std::string& ip, uint16_t port, unsigned timeout) {
@@ -75,7 +75,7 @@ inline std::unique_ptr<ControlIO> connect_control(const std::string& ip, uint16_
         } else if (rc) error = errno;
         if (!error) {
             require(!fcntl(fd.get(), F_SETFL, 0), "control blocking mode failed");
-            auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); return io;
+            auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); return io; // dead peer seen in <= 30 s (#26)
         }
         require(error == ECONNREFUSED || error == EINTR, "control connect failed");
         // Worker may finish loading before rank0. Bootstrap only, never decode.

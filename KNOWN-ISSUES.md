@@ -3,21 +3,19 @@
 Status of the crashes and bugs we are still working out in the multi-session (S2) build (`EXTRA=-DDEC_S2`).
 All runs: six DGX Sparks, GPU clock capped at 2200 MHz. "S" = concurrent sessions.
 
-## 1. Multi-session decode fault ("FABRIC" error word) - Open
+## 1. Multi-session decode fault ("FABRIC" error word) - Fixed (#26)
 
-- **Symptom:** the engine stops (all ranks exit rc=3). Ranks print the error word `fabric 1627389953`
-  (`1627389957` in the latest run), `attn 0 cp 0`. Attention and CP report no error.
-- **Reproduced 7 times.** It is **not** specific to S=8. Two decoding chats alone (8K prompts, gen 4096, no
-  long prefill) trigger it after about 4,300-8,300 main steps (ctx 942-11,527).
-- Every crash happens on a **main step with rows 6**.
-- With the new control-path logging, ranks 1-5 print the same line:
-  `control recv failed: ret=-1 errno=11 (Resource temporarily unavailable) remaining=4 of 4 bytes, frames sent=50 recv=97`.
-  That is a receive timeout (EAGAIN) while waiting for the next frame header: 0 of 4 bytes arrived and the link did not break.
-  Rank 0 (the sender) logs no control failure.
-- In the step-timer trace, the last completed main step took about 9.3 s on the ranks that completed it. Normal steps take milliseconds.
-- **Working theory (unconfirmed):** rank 0 stalls first, in the step or the fabric wait, and the other ranks time
-  out on the control channel. We are checking what rank 0 is doing during the stall.
-- Short S2 screens pass in the same boots: exact-output checks at S=2/3/4 (gen 256/1024).
+- **Symptom:** the engine stopped (all ranks rc=3) with `fabric 1627389953` (or `...57`), `attn 0 cp 0`, on a main step
+  with 6 rows, after minutes of steady decode with two or more chats. Ranks 1-5 logged
+  `control recv failed: ret=-1 errno=11 ... remaining=4 of 4 bytes`.
+- **Cause:** each worker's control thread waited for the next ADMIT/CANCEL frame with the socket receive timeout
+  (`G6_S2_TIMEOUT`, default 120 s). In steady decode no frames are sent, so after 120 s the first worker to time out
+  left the epoch before its next main step. The other ranks then hit the fabric wait timeout (~9.3 s) and raised the
+  error word naming that worker (p in the low byte). Rank 0 is the leader and never waits idle, so it logged nothing.
+- **Fix:** the event reader waits without a timeout until a frame starts (a partial frame still times out); TCP
+  keepalive (10 s + 4 x 5 s) and `TCP_USER_TIMEOUT` 30 s detect a lost peer instead.
+- **Checked:** main with `G6_S2_TIMEOUT=20` failed the same way at main step 161; the fix ran 9 waves of S = 2/3/4
+  chats (8K prompts, gen 4096) for 50 min, 29,997 main steps, at the default timeout with no fault.
 
 ## 2. S=3/4 descriptor race - Fixed
 

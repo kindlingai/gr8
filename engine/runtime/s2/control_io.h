@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include "posix_socket.h"
+#include <netinet/tcp.h>
 #include <unistd.h>
 
 namespace g6s2 {
@@ -24,18 +25,23 @@ class ControlIO {
                      (unsigned long long)sent, (unsigned long long)received);
     }
     void send_all(const uint8_t* p, size_t n) {
+        const size_t total = n;
         while (n) {
             ssize_t k = ::send(fd_, p, n, MSG_NOSIGNAL);
             if (k < 0 && errno == EINTR) continue;
-            if (k <= 0) log_disconnect("send", k, n, n);
+            if (k <= 0) log_disconnect("send", k, n, total);
             require(k > 0, "control send failed"); p += k; n -= size_t(k);
         }
     }
-    void read_all(uint8_t* p, size_t n) {
+    // idle: the link may stay silent indefinitely before the first byte (a worker's event reader between
+    // admit/cancel events, #26), so a receive timeout (EAGAIN) with nothing read yet is retried. Once a frame has
+    // started, the timeout applies again. A peer close or shutdown() still ends the wait (recv returns 0).
+    void read_all(uint8_t* p, size_t n, bool idle = false) {
         const size_t total = n;
         while (n) {
             ssize_t k = ::recv(fd_, p, n, 0);
             if (k < 0 && errno == EINTR) continue;
+            if (k < 0 && idle && n == total && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             if (k <= 0) log_disconnect("recv", k, n, total);
             require(k > 0, "control disconnected/truncated"); p += k; n -= size_t(k);
         }
@@ -54,14 +60,28 @@ public:
         require(!setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) &&
                 !setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv), "control timeout setup failed");
     }
+    // TCP peer liveness for the idle event wait (#26): the idle read has no timeout, so a peer that is lost without a
+    // FIN/RST (power loss, cable pull) must be detected by the kernel. Keepalive probes after idle_s of silence, every
+    // intvl_s, cnt times; TCP_USER_TIMEOUT bounds unacknowledged sends the same way. A dead peer then fails recv/send
+    // with ETIMEDOUT, which ends the idle wait. TCP sockets only.
+    void keepalive(int idle_s, int intvl_s, int cnt) {
+        require(idle_s > 0 && intvl_s > 0 && cnt > 0, "invalid keepalive");
+        const int on = 1; const unsigned user_ms = unsigned(idle_s + intvl_s * cnt) * 1000u;
+        require(!setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on) &&
+                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof idle_s) &&
+                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_s, sizeof intvl_s) &&
+                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt) &&
+                !setsockopt(fd_, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_ms, sizeof user_ms), "control keepalive setup failed");
+    }
     void send(const std::vector<uint8_t>& body) {
         require(!body.empty() && body.size() <= MAX_BYTES, "control frame size invalid");
         const uint32_t n = uint32_t(body.size());
         const uint8_t head[4] = {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)};
         send_all(head, 4); send_all(body.data(), body.size()); ++sent;
     }
-    std::vector<uint8_t> receive() {
-        uint8_t h[4]; read_all(h, 4);
+    // idle = true: wait for the next frame header with no timeout (event readers only; see read_all)
+    std::vector<uint8_t> receive(bool idle = false) {
+        uint8_t h[4]; read_all(h, 4, idle);
         const uint32_t n = uint32_t(h[0]) << 24 | uint32_t(h[1]) << 16 | uint32_t(h[2]) << 8 | h[3];
         require(n && n <= MAX_BYTES, "control frame size invalid");
         std::vector<uint8_t> body(n); read_all(body.data(), n); ++received; return body;
