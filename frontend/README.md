@@ -55,7 +55,7 @@ Engine `metrics` frame → Prometheus names (the same names vLLM uses, so the ex
 
 ## Real engine through files: g6shim.py
 
-`g6shim.py` listens on the engine socket and drives `g6m4`/`m4sim --serve DIR` through `req.<n>` / `resp.<n>` files (format in its docstring). One request at a time; `--rank-dirs` takes rank 0's local DIR first, then the other ranks as `host:/path` (written over one persistent ssh connection per host). `cancel` answers `abort` at once and swallows the rest of that request. SIGTERM writes `DIR/quit` to every rank. Logprobs are refused; top_p/top_k/min_p are ignored with a warning. Tests: `tests/fake_serve_engine.py` (a fake `--serve` engine) and `tests/test_shim.py SOCK`.
+`g6shim.py` listens on the engine socket and drives `g6m4`/`m4sim --serve DIR` through `req.<n>` / `resp.<n>` files (format in its docstring). One request at a time; `--rank-dirs` takes rank 0's local DIR first, then the other ranks as `host:/path` (written over one persistent ssh connection per host). `cancel` answers `abort` at once and swallows the rest of that request. SIGTERM writes `DIR/quit` to every rank. `logprobs` / `prompt_logprobs` (k = 0..`--max-logprobs`, default 20) go to the engine as `lp <k>` / `plp <k>` request keys; the engine answers with `l` / `p` lines (serve.h). `--max-plp-prompt` (default 4096) bounds the prompt length of a `prompt_logprobs` request. The rank of a token beyond the engine's top 20 (and every rank at k = 0) is `null`. top_p is passed; top_k/min_p are ignored with a warning. Tests: `tests/fake_serve_engine.py` (a fake `--serve` engine) and `tests/test_shim.py SOCK`.
 
 ## Mock engine and tests
 

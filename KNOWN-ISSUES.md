@@ -1,6 +1,6 @@
 # Known issues
 
-Status of the crashes and bugs we are still working out in the multi-session (S2) build (`EXTRA=-DDEC_S2`).
+Status of the crashes and bugs we are still working out (items 1-6: the multi-session (S2) build, `EXTRA=-DDEC_S2`; item 7: the TP6 first boot).
 All runs: six DGX Sparks, GPU clock capped at 2200 MHz. "S" = concurrent sessions.
 
 ## 1. Multi-session decode fault ("FABRIC" error word) - Fixed (#26)
@@ -41,3 +41,20 @@ All runs: six DGX Sparks, GPU clock capped at 2200 MHz. "S" = concurrent session
 
 - We measured it. The first decode step after the prompt runs at 0.989x the steady step time (median over 35 requests, min 0.66, max 1.13).
 - The first step stays on the CUDA-graph path. No non-graph path appears in the trace.
+
+## 7. One first-request output mismatch after a boot - Open (not reproduced)
+
+- **Symptom:** once, on a fresh TP6 boot (engine started with `--top 20`), the first-request check did not repeat itself.
+  The check sends the same 8,203-row prompt twice and decodes 32 tokens greedily (A1, A2). A1 and A2 differed (text hash
+  53b2416a vs 4e66e099), and the first prefill sub-batch already had a different residual hash (d54af8d1; every passing
+  boot has 17435a0d, ffa6889a, 663a65a8 for the first three).
+- **Build:** the #23 logprobs branch, with logprobs off. The same branch's binary run with the same arguments, and main's binary, both
+  passed afterwards.
+- **Not reproduced:** 24 fresh boots in one run (12 of this branch, 12 of main, alternating, `--top 20`) and 5 more before it
+  (4 bisect boots without `--top`, 1 clean rerun with 3 checks): every one gave A1 == A2, text hash 8b23c109, prefill
+  hashes 17435a0d ffa6889a 663a65a8 and step-0 hash 129e55007adcb4ea, identical between the two binaries. With logprobs off, the
+  branch's code is equal to main in every one of these.
+- **Cause:** unknown. Suspected: a rare race on the first prefill after boot that also exists in main (the first
+  sub-batch was already wrong, which points at something before or during the first prefill, not at decode). Not proven.
+- **If it happens again:** keep the rank logs of that boot (each rank's first three `prefill rows` residual lines), note which binary and
+  arguments ran, and repeat the check on a fresh boot of main.

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-04: logprobs and prompt_logprobs (issue #23)
+
+- The head returns the top 20 tokens of a row on request (`SampleRow::topk`): each rank selects its slice's best 20 and
+  sends them after the normal head record; rank 0's merge turns them into ids, logprobs (log-sum-exp over the full
+  vocabulary) and the ranks of the sampled and teacher-forced tokens. `engine/kernels/topk.cuh` holds the order, merge
+  and rank rule. A step with no asking row sends the same fabric payload as before (boot gate: pbench with logprobs off vs main).
+- `--serve` requests take `lp <k>` / `plp <k>`; `resp.<n>` gets `l` lines (before the `t` line) and `p` lines.
+- `prompt_logprobs` runs the prompt through decode steps (teacher forced, 8 rows per step), not the prefill kernels, so
+  the numbers are decode numerics and the prompt is limited to 4096 tokens by default. S2 sessions reject both keys.
+- `frontend/g6shim.py` accepts `logprobs` / `prompt_logprobs` (max 20) and reports `max_logprobs: 20`.
+- `engine/tests/test_topk.cpp`: CPU checks of the log-sum-exp, the merge and the ranks.
+
 ## 2026-10-04: rank health probe, boot admission, progress-thread isolation (#29)
 
 - New `tools/health/`: `rank_probe.py` probes every rank before a boot (RDMA write rate per rail around a ring of the ranks, GPU clock and throttle reasons under load, a driver wedge check, device-memory read and host-to-device copy rates compared between ranks, proxy CPU state) and names the reason for each refusal. `gpuprobe.cu` is its GPU part (built by `scripts/build.sh`, copied by `scripts/stage.sh`). The probe only reads and measures, and refuses a node where a model is booted.

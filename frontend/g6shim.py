@@ -4,13 +4,16 @@ through files. Stdlib only (plus g6front.wire).
 
 File protocol, per request n = 0, 1, 2, ... (one request at a time, the rest queue):
   shim -> every rank DIR/req.<n> (written as req.<n>.tmp then renamed; "host:/path" entries over ssh):
-      n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float>
+      n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
       <prompt id,id,...>
   rank 0 -> DIR/resp.<n> (the first --rank-dirs entry, local), one line per event:
-      t <id> <id> ...                                   newly committed tokens -> tokens frame
+      l <lp> <rank> <n> <id>:<lp> ...                   (request with lp) one per token of the next t line, before it
+      p <j> <lp> <rank> <n> <id>:<lp> ...               (request with plp) prompt token j, before the first t line
+      t <id> <id> ...                                   newly committed tokens -> tokens frame (+ logprobs entries)
       m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  cumulative spec counters -> metrics frame
       end <stop|length|error> <stop_id or -1> <completion_tokens>  -> finish frame
 cancel: the engine cannot stop mid-request, so the shim answers finish/abort at once and swallows the rest.
+A request with prompt_logprobs runs its whole prompt as decode steps (no prefill path): --max-plp-prompt bounds it.
 SIGTERM/SIGINT: writes DIR/quit to every rank dir, then exits.
 
 usage: g6shim.py --rank-dirs /run/g6/r0 node2:/run/g6/r1 ... [--sock /run/g6/engine.sock] [--max-model-len 2048]
@@ -19,6 +22,7 @@ import argparse
 import asyncio
 import collections
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -35,6 +39,8 @@ EOS_IDS = [154820, 154827, 154829]
 # (masters are opened at start with stdio closed; a master forked from a request would hold its stderr pipe open)
 SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ControlPath=/tmp/g6shim-ssh-%C', '-o', 'ControlMaster=no']
 VOCAB = 154880
+ENGINE_MAX_LP = 20  # the engine's top lists hold 20 (serve.h LP_MAX = glue::LP_K); it clamps silently above
+FLOOR = -9999.0  # logprob sent for -inf / nan (the front end clamps at the same value)
 
 
 class Req:
@@ -43,6 +49,9 @@ class Req:
         self.rid = f['id']
         self.cancelled = False  # finish/abort already sent; swallow the rest
         self.done = False       # a finish frame went out
+        self.lps = []           # engine "l" entries not yet sent (logprobs)
+        self.plps = {}          # engine "p" entries by prompt position
+        self.plp_sent = False
 
 
 class Shim:
@@ -91,7 +100,7 @@ class Shim:
     async def serve(self, reader, writer):
         wire.write_frame(writer, {'type': 'hello', 'version': 1, 'model': 'glm-5.3-g6',
                                   'max_model_len': self.a.max_model_len, 'vocab_size': VOCAB,
-                                  'eos_ids': EOS_IDS, 'max_logprobs': 0})
+                                  'eos_ids': EOS_IDS, 'max_logprobs': self.a.max_logprobs})
         mine: set[str] = set()
         try:
             while True:
@@ -120,8 +129,12 @@ class Shim:
             return self.send(r, {'type': 'finish', 'id': r.rid, 'reason': 'error', 'stop_id': None,
                                  'prompt_tokens': len(prompt), 'cached_tokens': 0, 'completion_tokens': 0,
                                  'message': 'duplicate id'})
-        if f.get('logprobs') is not None or f.get('prompt_logprobs') is not None:
-            return self.finish(r, 'error', message='not supported: logprobs / prompt_logprobs')
+        for k in ('logprobs', 'prompt_logprobs'):
+            v = f.get(k)
+            if v is not None and not (isinstance(v, int) and 0 <= v <= self.a.max_logprobs):
+                return self.finish(r, 'error', message=f'{k} must be 0..{self.a.max_logprobs}')
+        if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
+            return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not prompt or mt < 1 or len(prompt) + mt > self.a.max_model_len:
             return self.finish(r, 'error', message='bad prompt/max_tokens')
         for k, off in (('top_k', 0), ('min_p', 0.0)):   # top_p goes to the engine (--top-p-cands)
@@ -189,8 +202,10 @@ class Shim:
         seed = (1234 + n) if seed is None else int(seed) & 0xFFFFFFFF
         stop = ','.join(str(i) for i in (f.get('stop_ids') or [])) or '-'
         body = (f"n_gen {f['max_tokens']} temp {float(f.get('temperature') or 0.0)} seed {seed} "
-                f"min {int(f.get('min_tokens') or 0)} stop {stop} top_p {float(f.get('top_p') or 1.0)}\n"
-                + ','.join(str(i) for i in f['prompt']) + '\n').encode()
+                f"min {int(f.get('min_tokens') or 0)} stop {stop} top_p {float(f.get('top_p') or 1.0)}"
+                + (f" lp {int(f['logprobs'])}" if f.get('logprobs') is not None else '')
+                + (f" plp {int(f['prompt_logprobs'])}" if f.get('prompt_logprobs') is not None else '')
+                + '\n' + ','.join(str(i) for i in f['prompt']) + '\n').encode()
         resp = f'{self.a.rank_dirs[0]}/resp.{n}'
         if os.path.exists(resp):
             log.warning('stale %s removed', resp)
@@ -227,16 +242,58 @@ class Shim:
             if fh:
                 fh.close()
 
+    @staticmethod
+    def entry(w):
+        """engine logprob fields <lp> <rank> <n> <id>:<lp> ... -> a PROTOCOL.md entry {lp, rank, top}"""
+        def num(x):
+            x = float(x)
+            return x if math.isfinite(x) else FLOOR
+        rank, k = int(w[1]), int(w[2])
+        top = []
+        for tok in w[3:3 + k]:
+            i, v = tok.split(':')
+            top.append([int(i), num(v)])
+        return {'lp': num(w[0]), 'rank': rank if rank > 0 else None, 'top': top}
+
+    def prompt_frame(self, r: Req):
+        """the prompt_logprobs frame, once, before the first tokens; None if some position is missing"""
+        n = len(r.f['prompt'])
+        if any(j not in r.plps for j in range(1, n)):
+            return None
+        return {'type': 'prompt_logprobs', 'id': r.rid, 'lps': [None] + [r.plps[j] for j in range(1, n)]}
+
     def line(self, r: Req, n, w) -> bool:
         """Handle one resp line; True when the request ended."""
         if not w:
+            return False
+        if w[0] == 'l':
+            r.lps.append(self.entry(w[1:]))
+            return False
+        if w[0] == 'p':
+            r.plps[int(w[1])] = self.entry(w[2:])
             return False
         if w[0] == 't':
             ids = [int(x) for x in w[1:]]
             r.emitted += len(ids)
             self.c['gen'] += len(ids)
             if not r.cancelled and ids:
-                self.send(r, {'type': 'tokens', 'id': r.rid, 'ids': ids})
+                if r.f.get('prompt_logprobs') is not None and not r.plp_sent:
+                    r.plp_sent = True
+                    pf = self.prompt_frame(r)
+                    if pf is None:
+                        log.error('req.%d: engine sent %d of %d prompt logprobs', n, len(r.plps), len(r.f['prompt']) - 1)
+                        self.finish(r, 'error', ct=r.emitted, message='engine returned incomplete prompt logprobs')
+                        return True
+                    self.send(r, pf)
+                fr = {'type': 'tokens', 'id': r.rid, 'ids': ids}
+                if r.f.get('logprobs') is not None:
+                    if len(r.lps) != len(ids):
+                        log.error('req.%d: %d tokens with %d logprob entries', n, len(ids), len(r.lps))
+                        self.finish(r, 'error', ct=r.emitted, message='engine returned mismatched logprobs')
+                        return True
+                    fr['logprobs'] = r.lps
+                self.send(r, fr)
+            r.lps = []
             return False
         if w[0] == 'm':
             v = [int(x) for x in w[1:]]
@@ -285,9 +342,14 @@ async def main():
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=2048)
     ap.add_argument('--first-n', type=int, default=0, help='request number to start at (engine restart = 0)')
+    ap.add_argument('--max-logprobs', type=int, default=20, help=f'largest k of logprobs / prompt_logprobs, 0..{ENGINE_MAX_LP} (the engine top lists hold {ENGINE_MAX_LP})')
+    ap.add_argument('--max-plp-prompt', type=int, default=4096,
+                    help='longest prompt of a request with prompt_logprobs (it runs as decode steps, 8 rows each)')
     ap.add_argument('--poll', type=float, default=0.001, help='resp poll interval, s')
     ap.add_argument('--stall-timeout', type=float, default=900.0, help='error a request after this long with no resp')
     a = ap.parse_args()
+    if not 0 <= a.max_logprobs <= ENGINE_MAX_LP:
+        ap.error(f'--max-logprobs must be 0..{ENGINE_MAX_LP} (the engine returns at most {ENGINE_MAX_LP} top entries)')
     logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     if ':' in a.rank_dirs[0]:
         ap.error('the first --rank-dirs entry (rank 0) must be a local path')

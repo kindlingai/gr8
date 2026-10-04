@@ -14,6 +14,7 @@
 #include <cooperative_groups.h>
 #include "common.cuh"
 #include "k1args.cuh"
+#include "topk.cuh"
 #include "../comms/fabric.h"
 
 #ifndef G6_SPIN_TIMEOUT_CYC
@@ -477,7 +478,9 @@ struct SampleRow
     int pos;                      // absolute position of the token being sampled
     int draw;                     // stream index (0 = main sample; MTP rejection draws use others)
     float top_p;                  // (0,1): sample from the nucleus of softmax(logit / T) (needs HeadArgs::nc > 0);
-};                                // else the full vocabulary. Greedy rows ignore it.
+                                  // else the full vocabulary. Greedy rows ignore it.
+    int topk;                     // > 0: the row also returns its top LP_K tokens and the ranks (HeadArgs::tk; topk.cuh)
+};
 __host__ __device__ __forceinline__ bool topp_on(const SampleRow& s) { return s.inv_temp > 0.f && s.top_p > 0.f && s.top_p < 1.f; }
 
 // Gumbel noise for vocab id v: u in (0,1) from the top 24 bits; g = -log(-log(u)).
@@ -533,7 +536,28 @@ struct HeadArgs
     float* lpt_out = nullptr;     // optional [M] logprob of the target id under the raw distribution (-inf if none)
     int nc = 0;                   // top_p candidates per rank per row (0 = top_p off; merge with k_head_merge_tp)
     unsigned* topp_miss = nullptr;// optional device counter: top_p rows whose nucleus reached past the candidates
+    TkRes* tk = nullptr;          // optional: top lists of the rows with SampleRow::topk > 0 (the slot then carries them, see below)
 };
+// Rows with SampleRow::topk > 0 (and HeadArgs::tk set): every rank also sends, after the top_p candidates, M lists of
+// LP_K TkEnt (its slice's best, sorted by tk_before); the slot payload grows by M * LP_K * 8 bytes whenever any row of
+// the step asks (head_bytes_tk), which the host passes to the fabric and the merge kernels re-derive from the rows.
+__host__ __device__ __forceinline__ size_t head_bytes_tk(int M, int nc, bool any_tk)
+{
+    return head_bytes(M, nc) + (any_tk ? (size_t)M * LP_K * sizeof(TkEnt) : 0);
+}
+__device__ __forceinline__ size_t head_wait_bytes(const HeadArgs& a)
+{
+    bool any = false;
+    if (a.tk)
+        for (int i = 0; i < a.M; ++i) any |= a.rows[i].topk > 0;
+    return head_bytes_tk(a.M, a.nc, any);
+}
+// peer p's list of row m: entry i
+__device__ __forceinline__ TkEnt head_tk_peer(const HeadArgs& a, u64 step, int p, int m, int i)
+{
+    const float2 v = __ldcv(reinterpret_cast<const float2*>(peer_slot(a.f, step, a.c, p) + head_bytes(a.M, a.nc)) + (size_t)m * LP_K + i);
+    return TkEnt{v.x, __float_as_int(v.y)};
+}
 
 // top_p part of k_head_local (block 1024, after the record is stored; s_mx = the 32 warp maxima): the slice's
 // highest raw logits (at most nc, whole histogram bins of lmax - logit) -> candidates, pad_[1] / pad_[2] of the record.
@@ -611,6 +635,59 @@ __device__ __forceinline__ void head_local_topp(const HeadArgs& a, int m, const 
     }
 }
 
+// k_head_local for rows with topk (block 1024, uniform per block): the slice's LP_K best (logit, id) in tk_before order,
+// by LP_K rounds of "best entry strictly after the previous pick" (exact, ties by id), into the send slot.
+__device__ __forceinline__ void head_local_topk(const HeadArgs& a, int m, const float* row)
+{
+    __shared__ float s_bl[32], s_ol[LP_K];
+    __shared__ int s_bi[32], s_oi[LP_K];
+    __shared__ float s_pl;
+    __shared__ int s_pi;
+    const int t = threadIdx.x, w = t >> 5, l = t & 31;
+    float pl = INFINITY;
+    int pi = -1;
+    for (int k = 0; k < LP_K; ++k)
+    {
+        float bl = -INFINITY;
+        int bi = TK_PAD_ID;
+        for (int i = t; i < a.vn; i += 1024)
+        {
+            const float lg = row[i];
+            const int v = a.vlo + i;
+            if (tk_before(pl, pi, lg, v) && tk_before(lg, v, bl, bi)) { bl = lg; bi = v; }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            const float ol = __shfl_xor_sync(0xffffffffu, bl, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (tk_before(ol, oi, bl, bi)) { bl = ol; bi = oi; }
+        }
+        if (l == 0) { s_bl[w] = bl; s_bi[w] = bi; }
+        __syncthreads();
+        if (w == 0)
+        {
+            bl = s_bl[l]; bi = s_bi[l];
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+            {
+                const float ol = __shfl_xor_sync(0xffffffffu, bl, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (tk_before(ol, oi, bl, bi)) { bl = ol; bi = oi; }
+            }
+            if (l == 0) { s_ol[k] = bl; s_oi[k] = bi; s_pl = bl; s_pi = bi; }
+        }
+        __syncthreads();
+        pl = s_pl; pi = s_pi;
+    }
+    if (t < LP_K)
+    {
+        float2 v;
+        v.x = s_ol[t]; v.y = __int_as_float(s_oi[t]);
+        reinterpret_cast<float2*>(send_slot(a.f, *a.stepp, a.c) + head_bytes(a.M, a.nc))[(size_t)m * LP_K + t] = v;
+    }
+}
+
 // grid M, block 1024: local record -> send slot c, then publish.
 __global__ void __launch_bounds__(1024) k_head_local(HeadArgs a)
 {
@@ -664,36 +741,60 @@ __global__ void __launch_bounds__(1024) k_head_local(HeadArgs a)
         reinterpret_cast<HeadRec*>(send_slot(a.f, *a.stepp, a.c))[m] = r;
     }
     if (a.nc > 0 && topp_on(sr)) head_local_topp(a, m, row, sr, s_mx);
+    if (a.tk && sr.topk > 0) head_local_topk(a, m, row);
     const u64 step = *a.stepp;
     publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
 }
 
 // grid 1, block 32: wait for the 5 peer records, merge in rank order, write the sampled token + logprob.
+// Rows with SampleRow::topk > 0 (HeadArgs::tk): then the ranks' top lists -> the row's TkRes.
 __global__ void __launch_bounds__(32) k_head_merge(HeadArgs a)
 {
     const u64 step = *a.stepp;
     const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
-    wait_peers(a.f, step, a.c, seq, head_bytes(a.M, a.nc), ERR_HEAD);
+    wait_peers(a.f, step, a.c, seq, head_wait_bytes(a), ERR_HEAD);
     const int m = threadIdx.x;
-    if (m >= a.M) return;
     float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f, tl = -INFINITY;
     int bid = 0x7fffffff;
-    for (int p = 0; p < a.f.nr; ++p)
+    if (m < a.M)
     {
-        const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
-        const float4 v = __ldcv(q);
-        const float4 u = __ldcv(q + 1);
-        HeadRec r;
-        r.score = v.x; r.id = __float_as_int(v.y); r.logit = v.z; r.lmax = v.w; r.lsum = u.x;
-        tl = fmaxf(tl, u.y);
-        if (r.score > bs || (r.score == bs && r.id < bid)) { bs = r.score; bid = r.id; blg = r.logit; }
-        const float nmx = fmaxf(mx, r.lmax);
-        sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx));
-        mx = nmx;
+        for (int p = 0; p < a.f.nr; ++p)
+        {
+            const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
+            const float4 v = __ldcv(q);
+            const float4 u = __ldcv(q + 1);
+            HeadRec r;
+            r.score = v.x; r.id = __float_as_int(v.y); r.logit = v.z; r.lmax = v.w; r.lsum = u.x;
+            tl = fmaxf(tl, u.y);
+            if (r.score > bs || (r.score == bs && r.id < bid)) { bs = r.score; bid = r.id; blg = r.logit; }
+            const float nmx = fmaxf(mx, r.lmax);
+            sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx));
+            mx = nmx;
+        }
+        a.tok_out[m] = bid;
+        a.lp_out[m] = blg - mx - logf(sm);
+        if (a.lpt_out) a.lpt_out[m] = tl - mx - logf(sm);
     }
-    a.tok_out[m] = bid;
-    a.lp_out[m] = blg - mx - logf(sm);
-    if (a.lpt_out) a.lpt_out[m] = tl - mx - logf(sm);
+    if (a.tk)
+    {
+        bool any = false;
+        for (int i = 0; i < a.M; ++i) any |= a.rows[i].topk > 0;
+        if (!any) return;
+        __shared__ TkEnt s_te[TK_ROWS][8 * LP_K];
+        const int nl = a.f.nr * LP_K;
+        for (int x = m; x < a.M * nl; x += 32)       // the lists of every asking row, loaded by the whole warp
+        {
+            const int r = x / nl, p = (x - r * nl) / LP_K;
+            if (a.rows[r].topk > 0) s_te[r][x - r * nl] = head_tk_peer(a, step, p, r, x - r * nl - p * LP_K);
+        }
+        __syncwarp();
+        if (m < a.M && a.rows[m].topk > 0)
+        {
+            TkEnt top[LP_K];
+            tk_merge(a.f.nr, [&](int p, int i) { return s_te[m][p * LP_K + i]; }, top);
+            tk_result(a.tk, m, top, mx, sm, blg, tl);
+        }
+    }
 }
 
 // k_head_merge with top_p candidates (HeadArgs::nc > 0). grid M, block 1024: one row per CTA. Rows without top_p
@@ -709,7 +810,7 @@ __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
     __shared__ int s_bid, s_bi[32], s_keep;
     const u64 step = *a.stepp;
     const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
-    wait_peers(a.f, step, a.c, seq, head_bytes(a.M, a.nc), ERR_HEAD);
+    wait_peers(a.f, step, a.c, seq, head_wait_bytes(a), ERR_HEAD);
     const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
     const SampleRow sr = a.rows[m];
     const bool on = topp_on(sr);
@@ -828,6 +929,19 @@ __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
         a.tok_out[m] = s_bid;
         a.lp_out[m] = s_blg - s_mx - logf(s_sm);
         if (a.lpt_out) a.lpt_out[m] = s_tl - s_mx - logf(s_sm);
+    }
+    if (a.tk && sr.topk > 0)                  // top list: loaded by the block, merged by thread 0
+    {
+        __shared__ TkEnt s_te[8 * LP_K];
+        __syncthreads();
+        if (t < a.f.nr * LP_K) s_te[t] = head_tk_peer(a, step, t / LP_K, m, t % LP_K);
+        __syncthreads();
+        if (t == 0)
+        {
+            TkEnt top[LP_K];
+            tk_merge(a.f.nr, [&](int p, int i) { return s_te[p * LP_K + i]; }, top);
+            tk_result(a.tk, m, top, s_mx, s_sm, s_blg, s_tl);
+        }
     }
 }
 

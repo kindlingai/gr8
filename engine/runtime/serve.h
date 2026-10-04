@@ -2,11 +2,17 @@
 // shim (frontend/g6shim.py) turns that into PROTOCOL.md frames. Every rank reads the same request file and runs the
 // same steps; only rank 0 writes.
 //   DIR/req.<n>  (written atomically: req.<n>.tmp then rename), two lines:
-//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>]
+//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>] [lp <k>] [plp <k>]
+//       (lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
+//        A request with plp is run as decode steps from its first token, no prefill path: the shim limits its length.)
 //       <prompt ids, comma-separated>
 //   DIR/quit     ends the loop
 //   DIR/ready    (every rank) written once the model is loaded, before the first request is read
 //   DIR/resp.<n> (rank 0, one flushed line per event):
+//       l <lp> <rank> <n> <id>:<lp> ..                   with lp: one line per token of the next t line, before it
+//                                                        (lp: logprob of the token; rank: 1 = best, -1 = beyond the top 20;
+//                                                        then n top entries, best first)
+//       p <j> <lp> <rank> <n> <id>:<lp> ..               with plp: prompt token j (1 <= j < prompt length), before the first t
 //       t <id> <id> ..                                   newly committed tokens
 //       m <rounds> <draft_tokens> <accepted> <acc_pos0> ..   cumulative MTP counters since start
 //       end <stop|length|error> <stop_id|-1> <completion_tokens>
@@ -29,6 +35,18 @@ struct ServeReq
     int n_gen = 0, min_tokens = 0;
     float temp = 0.f, top_p = 0.f;
     uint32_t seed = 1234u;
+    int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
+};
+
+constexpr int LP_MAX = 20;       // = glue::LP_K (rank.cuh checks)
+// one logprob entry of the response: the token's logprob and rank, then its position's top list
+struct LpRow
+{
+    float lp = 0.f;
+    int rank = -1;               // -1 = not within the top LP_MAX
+    int n = 0;                   // entries of the top list (0 = none asked)
+    int id[LP_MAX];
+    float tlp[LP_MAX];
 };
 
 inline bool serve_exists(const std::string& p) { struct stat s; return stat(p.c_str(), &s) == 0; }
@@ -54,7 +72,16 @@ inline bool serve_next(const std::string& dir, size_t n, ServeReq& r)
     r = ServeReq();
     char stop[65536] = {0};
     if (fscanf(fp, "n_gen %d temp %f seed %u min %d stop %65535s", &r.n_gen, &r.temp, &r.seed, &r.min_tokens, stop) != 5) r.n_gen = 0;
-    if (fscanf(fp, " top_p %f", &r.top_p) != 1) r.top_p = 0.f;    // optional, same line (older shims: absent)
+    for (char key[8]; fscanf(fp, " %7[a-z_]", key) == 1;)           // optional, same line (older shims: absent)
+    {
+        if (!strcmp(key, "top_p")) { if (fscanf(fp, "%f", &r.top_p) != 1) r.top_p = 0.f; }
+        else if (!strcmp(key, "lp")) { if (fscanf(fp, "%d", &r.lp) != 1) r.lp = -1; }
+        else if (!strcmp(key, "plp")) { if (fscanf(fp, "%d", &r.plp) != 1) r.plp = -1; }
+        else break;
+    }
+    // the shim never sends k > LP_MAX (g6shim.py ENGINE_MAX_LP, checked at its startup and per request); this is a backstop
+    if (r.lp > LP_MAX) r.lp = LP_MAX;
+    if (r.plp > LP_MAX) r.plp = LP_MAX;
     std::string ids;
     int c;
     while ((c = fgetc(fp)) != EOF) ids.push_back((char)c);
@@ -131,21 +158,43 @@ struct Emitter
         on = true; n_gen = r.n_gen; min_tokens = r.min_tokens; stop = r.stop; emitted = 0; stop_id = -1; done = false;
         f = rank0 ? fopen((dir + "/resp." + std::to_string(n)).c_str(), "w") : nullptr;
     }
-    // returns true when the request is finished (a stop id was emitted or n_gen reached)
-    bool push(const int* t, int k)
+    static void lp_text(std::string& s, const LpRow& r)
+    {
+        char b[64];
+        snprintf(b, sizeof b, " %.9g %d %d", r.lp, r.rank, r.n);
+        s += b;
+        for (int i = 0; i < r.n; ++i)
+        {
+            snprintf(b, sizeof b, " %d:%.9g", r.id[i], r.tlp[i]);
+            s += b;
+        }
+    }
+    // prompt token j's logprob entry (--serve request with plp)
+    void push_prompt(int j, const LpRow& r)
+    {
+        if (!on || !f) return;
+        std::string line = "p " + std::to_string(j);
+        lp_text(line, r);
+        fprintf(f, "%s\n", line.c_str());
+        fflush(f);
+    }
+    // returns true when the request is finished (a stop id was emitted or n_gen reached). lps: k entries (the logprobs
+    // of the tokens, request with lp) or null
+    bool push(const int* t, int k, const LpRow* lps = nullptr)
     {
         if (!on) return false;
         if (done) return true;
-        std::string line = "t";
+        std::string line = "t", lpl;
         for (int i = 0; i < k && !done; ++i)
         {
             line += " " + std::to_string(t[i]);
+            if (lps) { lpl += "l"; lp_text(lpl, lps[i]); lpl += "\n"; }
             ++emitted;
             for (int s : stop)
                 if (t[i] == s && emitted > min_tokens) { stop_id = s; done = true; }
             if (emitted >= n_gen) done = true;
         }
-        if (f) { fprintf(f, "%s\n", line.c_str()); fflush(f); }
+        if (f) { fprintf(f, "%s%s\n", lpl.c_str(), line.c_str()); fflush(f); }
         return done;
     }
     void end(const char* reason_if_error, long rounds, int K, long tokens, const long* acc)

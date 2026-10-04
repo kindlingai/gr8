@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 #include "draft_shape.h"
+#include "serve.h"
 #include "../h2d.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
@@ -75,7 +76,7 @@ __global__ void __launch_bounds__(128) k_put_publish(const uint4* src, g6::Fabri
     glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);
 }
 
-// host -> GPU, once per step. 240 bytes, read as 32-bit words by one CTA.
+// host -> GPU, once per step. 336 bytes (<= 512), read as 32-bit words by one CTA.
 struct StepIn
 {
     u64 step;
@@ -234,6 +235,7 @@ struct Model
     glue::RoutePlan* plan = nullptr;
     int* rlog = nullptr;              // G6_ROUTE_LOG (measurement): pinned [nl][RLOG] copies of plan n_slots / pad / slot_expert
     glue::SampleRow* srow = nullptr;
+    glue::TkRes* tk = nullptr;        // top lists of the step's rows with SampleRow::topk > 0 (main model only; null = none)
     int *tok = nullptr, *pos = nullptr, *tok_out = nullptr, *tgt = nullptr;
     void* scratch = nullptr;
     bind::Scratch sc;
@@ -339,6 +341,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.logits = dmalloc<float>((size_t)MX * glue::NEXP);
     m.plan = dmalloc<glue::RoutePlan>(1);
     m.srow = dmalloc<glue::SampleRow>(MX);
+    m.tk = dmalloc<glue::TkRes>(1);
     m.topp_miss = dmalloc<unsigned>(1);
     m.tok = dmalloc<int>(MX);
     m.pos = dmalloc<int>(MX);
@@ -799,7 +802,7 @@ inline const __nv_bfloat16* norm_after(const Model& m, int i) { return i + 1 < m
 inline glue::HeadArgs head_args(Model& m, int M)
 {
     return glue::HeadArgs{m.f, m.stepp, 2 * m.nl, M, m.hlog, m.vn, m.vlo, m.vn, m.srow, m.tickets + 2 * m.nl, m.tok_out, m.lp,
-                          m.tgt, m.lpt, m.nc, m.topp_miss};
+                          m.tgt, m.lpt, m.nc, m.topp_miss, m.tk};
 }
 inline const bind::Head& head_for(Model& m, int M)
 {
@@ -1090,7 +1093,8 @@ struct Plan
     float inv_temp = 0.f;             // 0 = greedy
     uint32_t seed = 1234u;
     float top_p = 0.f;                // (0,1) = nucleus sampling (needs Model::nc > 0); else off
-};
+    int lp = -1, plp = -1;            // --serve: top-k logprobs of the generated / the prompt tokens (k > 0 = top lists; 0 = only
+};                                    // the token's own logprob; -1 = off). Rows of a step with k > 0 carry SampleRow::topk.
 inline int prompt_steps(const Plan& p) { return ((int)p.prompt.size() - p.first + p.chunk - 1) / p.chunk; }
 inline int total_steps(const Plan& p) { return prompt_steps(p) + p.n_gen; }
 inline int step_rows(const Plan& p, int s)
@@ -1123,11 +1127,51 @@ inline StepIn step_inputs(const Plan& p, int s, int last_tok, u64 step0 = 0)
     {
         in.tok[r] = s < ps ? p.prompt[p.first + s * p.chunk + r] : last_tok;
         in.pos[r] = s < ps ? p.first + s * p.chunk + r : n + s - ps;
-        in.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, in.pos[r] + 1, 0, p.top_p};
         in.tgt[r] = in.pos[r] + 1 < n ? p.prompt[in.pos[r] + 1] : -1;
+        in.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, in.pos[r] + 1, 0, p.top_p, (in.tgt[r] >= 0 ? p.plp : p.lp) > 0 ? 1 : 0};
     }
     in.context = in.pos[M - 1] + 1;
     return in;
+}
+// payload bytes of the head collective of a step (the rows with a top list make every rank send it)
+inline uint32_t head_size(const StepIn& si, int nc)
+{
+    bool any = false;
+    for (int r = 0; r < si.M; ++r) any |= si.srow[r].topk > 0;
+    return (uint32_t)glue::head_bytes_tk(si.M, nc, any);
+}
+
+// Host copy of what a step returned for logprobs (after the step's stream is synchronized): the rows' logprobs, and for
+// rows with SampleRow::topk > 0 the top lists and ranks. Only fetched for --serve requests that ask.
+static_assert(glue::LP_K == LP_MAX && glue::TK_ROWS == MX, "serve.h LP_MAX / rank.cuh MX follow glue::LP_K / TK_ROWS");
+struct LpStep
+{
+    float lp[MX], lpt[MX];
+    bool row_tk[MX];
+    glue::TkRes tk;
+};
+inline void lp_fetch(Model& m, const StepOut& so, const StepIn& si, LpStep& L)
+{
+    bool any = false;
+    for (int r = 0; r < MX; ++r) { L.lp[r] = so.lp[r]; L.lpt[r] = so.lpt[r]; L.row_tk[r] = r < si.M && si.srow[r].topk > 0; any |= L.row_tk[r]; }
+    if (any) G6RT_CK(cudaMemcpy(&L.tk, m.tk, sizeof L.tk, cudaMemcpyDeviceToHost));
+}
+// row r of the fetched step as a response entry: its sampled token (target = false) or its teacher-forced target; k = entries wanted
+inline LpRow lp_row(const LpStep& L, int r, bool target, int k)
+{
+    LpRow o;
+    o.lp = target ? L.lpt[r] : L.lp[r];
+    if (k > 0 && L.row_tk[r])
+    {
+        o.rank = target ? L.tk.rank_t[r] : L.tk.rank[r];
+        for (int i = 0; i < k; ++i)
+        {
+            if (L.tk.id[r][i] < 0) break;
+            o.id[o.n] = L.tk.id[r][i];
+            o.tlp[o.n++] = L.tk.lp[r][i];
+        }
+    }
+    return o;
 }
 inline uint64_t fnv(uint64_t h, const void* p, size_t n)
 {
@@ -1226,9 +1270,10 @@ struct MtpStats
 };
 template <class RunMain, class RunDraft>
 inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& draft_step, RunMain&& run_main, RunDraft&& run_draft,
-                                     MtpStats& S, int& steps, const std::function<bool(const int*, int)>& emit = {})
+                                     MtpStats& S, int& steps, const std::function<bool(const int*, int, int)>& emit = {})
 {
-    // emit (--serve): gets every batch of committed tokens; true = the request is finished (stop id or max tokens)
+    // emit (--serve): gets every batch of committed tokens and the row of the last run_main step each came from (the
+    // rows are consecutive); true = the request is finished (stop id or max tokens)
     const int n = (int)p.prompt.size(), PS = prompt_steps(p);
     const u64 step0 = main_step;
     std::vector<int> tokens = p.prompt;          // committed tokens by position
@@ -1253,7 +1298,7 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
         if (s == PS - 1)
         {
             tokens.push_back(so.tok[si.M - 1]);
-            if (emit) fin = emit(&so.tok[si.M - 1], 1);
+            if (emit) fin = emit(&so.tok[si.M - 1], 1, si.M - 1);
         }
         if (fin) { steps += s + 1; return std::vector<int>(tokens.begin() + n, tokens.end()); }
         int next[MX];
@@ -1272,7 +1317,7 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
         {
             si.tok[r] = r ? d[r] : tokens[base];
             si.pos[r] = base + r;
-            si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p};
+            si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
         }
         si.context = base + K + 1;
@@ -1282,7 +1327,7 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
         while (a < K && d[a + 1] == so.tok[a]) ++a;
         for (int r = 0; r <= a; ++r) tokens.push_back(so.tok[r]);
         printf("round %ld base %d accepted %d of %d\n", S.rounds, base, a, K);
-        if (emit && emit(so.tok, a + 1))
+        if (emit && emit(so.tok, a + 1, 0))
         {
             ++S.rounds; S.tokens += a + 1; ++S.acc[a];
             S.t_verify.push_back(tv); S.t_first.push_back(0); S.t_chain.push_back(0);

@@ -1313,8 +1313,8 @@ int main(int argc, char** argv)
                 }
                 return t;
             };
-            std::function<bool(const int*, int)> emit;
-            if (em.on) emit = [&](const int* t, int k) { pt.first_token(q); return em.push(t, k); };
+            std::function<bool(const int*, int, int)> emit;
+            if (em.on) emit = [&](const int* t, int k, int) { pt.first_token(q); return em.push(t, k); };
             pt.lap("pre_decode");
             const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, steps, emit);
             hist = p.prompt; hist.insert(hist.end(), gen.begin(), gen.end());

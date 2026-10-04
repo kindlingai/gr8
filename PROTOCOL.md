@@ -96,7 +96,7 @@ Ask for a counters snapshot; the engine replies with a `metrics` frame carrying 
 
 - `ids`: one or more newly generated ids (MTP accepts arrive together), in order.
 - `logprobs`: present only if the request asked for `logprobs`; one entry per id. `lp` and `rank` are for the
-  emitted id; `top` is the top-k `[id, logprob]` pairs sorted by logprob descending (k entries; the emitted id may or
+  emitted id (`rank` is null when the engine does not know it: the id is below the engine's top 20, or k = 0); `top` is the top-k `[id, logprob]` pairs sorted by logprob descending (k entries; the emitted id may or
   may not be among them).
 - The id that triggers a stop (a member of `stop_ids`) **is included** in `ids` and counts in `completion_tokens`
   (vLLM does the same); the front end drops its text.
@@ -109,7 +109,8 @@ Ask for a counters snapshot; the engine replies with a `metrics` frame carrying 
 ```
 
 Sent once, before the first `tokens` frame, only if requested. `lps` has exactly `len(prompt)` entries;
-entry 0 is `null`. Entry j describes `prompt[j]`, same fields as a `tokens` logprob entry.
+entry 0 is `null`. Entry j describes `prompt[j]`, same fields as a `tokens` logprob entry (`rank` may be null, see above;
+the `top` list always carries ranks 1..k by its order).
 Prefix-cache hits must not drop positions: if the engine cannot produce prompt logprobs for cached positions it
 must recompute them (or not use the cache for this request).
 

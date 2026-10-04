@@ -629,13 +629,14 @@ int main(int argc, char** argv)
             sp.prompt = rq.prompt; sp.n_gen = rq.n_gen; sp.seed = rq.seed;
             sp.inv_temp = rq.temp > 0.f ? 1.f / rq.temp : 0.f;
             sp.top_p = rq.top_p;
+            sp.lp = rq.lp; sp.plp = rq.plp;
             em.open(serve, q, R == 0, rq);
             if (sp.prompt.empty() || sp.n_gen < 1 || (int)sp.prompt.size() + sp.n_gen + 2 * mtp > cap)
             {
                 em.end("error", 0, 0, 0, nullptr);
                 continue;
             }
-            if (MP) sp.first = (int)sp.prompt.size() - 1;
+            if (MP) sp.first = sp.plp >= 0 ? 0 : (int)sp.prompt.size() - 1;   // prompt logprobs: every prompt row is a decode-step row
         }
         const Plan& p = sp;
         if (pf_qp)                      // OWN=4 iff prompt + gen fits the QO table (G6_PF_QP_CTX), else OWN=2 for this request
@@ -724,11 +725,12 @@ int main(int argc, char** argv)
         // MTP after the prefill loop (as in m4sim): prompt rows past p.first go through mtp_sequence's prompt steps
         if (mtp)
         {
+            LpStep lpm;                          // logprobs of the last target step (--serve with lp / plp)
             auto rm = [&](const StepIn& si, int s, double& ms) {
                 const int M = si.M;
                 *in = si;
                 std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
-                sizes[2 * NL] = (uint32_t)glue::head_bytes(M, nc);
+                sizes[2 * NL] = head_size(si, nc);
                 fab.enqueue_step(si.step, sizes);
                 cp_enqueue(si.step, M, si.context);
                 const auto t0 = std::chrono::steady_clock::now();
@@ -744,7 +746,13 @@ int main(int argc, char** argv)
                 std::string line;
                 step_line(m, so, s, M, line);
                 printf("%s\n", line.c_str());
-                if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
+                if (top > 0 && (!em.on || p.lp >= 0 || p.plp >= 0)) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
+                if (em.on && (p.lp >= 0 || p.plp >= 0))
+                {
+                    lp_fetch(m, so, si, lpm);
+                    for (int r = 0; r < M && p.plp >= 0; ++r)
+                        if (si.tgt[r] >= 0) em.push_prompt(si.pos[r] + 1, lp_row(lpm, r, true, p.plp));
+                }
                 fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, dt);
                 return so;
             };
@@ -769,8 +777,13 @@ int main(int argc, char** argv)
                 fprintf(stderr, "# seq %zu %s %d M %d: %.3f ms\n", q, chain ? "chain" : "draft", s, M, dt);
                 return t;
             };
-            std::function<bool(const int*, int)> emit;
-            if (em.on) emit = [&](const int* t, int k) { pt.first_token(q); return em.push(t, k); };
+            std::function<bool(const int*, int, int)> emit;
+            if (em.on) emit = [&](const int* t, int k, int row0) {
+                pt.first_token(q);
+                LpRow rows[MX];
+                for (int i = 0; p.lp >= 0 && i < k; ++i) rows[i] = lp_row(lpm, row0 + i, false, p.lp);
+                return em.push(t, k, p.lp >= 0 ? rows : nullptr);
+            };
             pt.lap("pre_decode");
             const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, mtp_steps, emit);
             printf("generated");
@@ -786,7 +799,7 @@ int main(int argc, char** argv)
             const int M = step_rows(p, s);
             *in = step_inputs(p, s, last_tok, step0);
             std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
-            sizes[2 * NL] = (uint32_t)glue::head_bytes(M, nc);
+            sizes[2 * NL] = head_size(*in, nc);
             fab.enqueue_step(in->step, sizes);
             cp_enqueue(in->step, M, in->context);
             dec_prof().on = getenv("G6_DEC_PROF") != nullptr && s > 0;      // the first step of a sequence carries first-launch costs
@@ -804,10 +817,18 @@ int main(int argc, char** argv)
             std::string line;
             last_tok = step_line(m, so, s, M, line);
             printf("%s\n", line.c_str());
-            if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
+            if (top > 0 && (!em.on || p.lp >= 0 || p.plp >= 0)) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
+            LpStep lps;
+            if (em.on && (p.lp >= 0 || p.plp >= 0))
+            {
+                lp_fetch(m, so, *in, lps);
+                for (int r = 0; r < M && p.plp >= 0; ++r)
+                    if (in->tgt[r] >= 0) em.push_prompt(in->pos[r] + 1, lp_row(lps, r, true, p.plp));
+            }
+            const LpRow lrow = p.lp >= 0 && s >= PS - 1 ? lp_row(lps, M - 1, false, p.lp) : LpRow();
             if (s >= PS - 1) gen.push_back(last_tok);
             if (s >= PS - 1 && em.on) pt.first_token(q);
-            if (s >= PS - 1 && em.on && em.push(&last_tok, 1))
+            if (s >= PS - 1 && em.on && em.push(&last_tok, 1, p.lp >= 0 ? &lrow : nullptr))
             {
                 fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, ms);
                 ns_run = s + 1;

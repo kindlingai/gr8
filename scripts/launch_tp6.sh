@@ -10,6 +10,7 @@
 #   MTP=2             speculative draft length k (2 = our prose/served default; 4-6 helped code/structured)
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
+#   G6ARGS_X="--top 20" extra engine arguments for every rank (--top K prints the per-slice top-K lines for requests with logprobs)
 #   READY_TMO=900     seconds to wait for all six ranks to load
 #   RANK_HEALTH=0     skip the rank health probe (default: probe every rank first and refuse to boot, exit 3, with a named
 #                     reason per refused rank; see tools/health/README.md). G6_PROGRESS_ISOLATE=0 in G6ENV_X turns off the
@@ -35,6 +36,7 @@ G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}
 SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 --pf-lanes 2 --pfv2 \
 --qo-manifest packs/qo.manifest.json --qo-pack packs/qo.pack"
 [ "${NOHASH:-0}" = 1 ] && SERVE_ARGS="$SERVE_ARGS --no-hash"
+SERVE_ARGS="$SERVE_ARGS ${G6ARGS_X:-}"
 
 for ((r = NRANK - 1; r >= 0; r--)); do
   # each process writes its own pid (setsid may fork, so $! is not always the engine's pid)
