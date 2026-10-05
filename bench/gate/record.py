@@ -45,6 +45,11 @@ def flatten(results):
     if mx:
         put('work.mixed4.agg_tok_s', mx['agg_tok_s'], HIGHER)
         put('work.mixed4.stream_tok_s', mx['stream_tok_s'], HIGHER)
+    ps = results.get('prompt_set')
+    if ps:  # another bench's prompts: the set name is in every metric name
+        for kind, r in ps['kinds'].items():
+            put(f'set.{ps["name"]}.{kind}.decode_tok_s', r['decode_tok_s'], HIGHER)
+            put(f'set.{ps["name"]}.{kind}.tokens_per_step', (r['spec'] or {}).get('tokens_per_step'), HIGHER)
     sp = results.get('spec')
     if sp:
         put('spec.acceptance', sp['acceptance'], HIGHER)

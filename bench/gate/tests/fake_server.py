@@ -36,6 +36,7 @@ class State:
         self.counters = {'drafts': 0, 'draft': 0, 'acc': 0, 'hits': 0, 'queries': 0}
         self.lock = threading.Lock()
         self.chat_prompts = []
+        self.completion_prompts = []
         self.fail_nth = 0         # the Nth chat request from now (1-based) ends with finish_reason 'error'
         self.chat_calls = 0
 
@@ -89,6 +90,8 @@ class Handler(BaseHTTPRequestHandler):
     def _completions(self, st, body):
         p = body['prompt']
         n = body.get('max_tokens', 16)
+        if body.get('stream'):
+            return self._stream_completions(st, p, n)
         gen = []
         for _ in range(n):
             lp = dist(p + gen, 0.0)
@@ -107,6 +110,26 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(ent)
             choice['prompt_logprobs'] = out
         self._json({'choices': [choice], 'usage': {'prompt_tokens': len(p), 'completion_tokens': n}})
+
+    def _stream_completions(self, st, p, n):
+        """Streamed completions on token ids: n tokens, one text chunk per 4, drafter counters like chat."""
+        with st.lock:
+            st.completion_prompts.append(list(p))
+            c = st.counters
+            c['drafts'] += n // 4
+            c['draft'] += n
+            c['acc'] += n // 2
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.end_headers()
+        for i in range(0, n, 4):
+            chunk = {'choices': [{'index': 0, 'text': 'tok ' * min(4, n - i)}]}
+            self.wfile.write(b'data: ' + json.dumps(chunk).encode() + b'\n\n')
+            time.sleep(0.002)
+        self.wfile.write(b'data: ' + json.dumps({'choices': [{'index': 0, 'text': '', 'finish_reason': 'length'}]}).encode()
+                         + b'\n\n')
+        usage = {'prompt_tokens': len(p), 'completion_tokens': n, 'total_tokens': len(p) + n}
+        self.wfile.write(b'data: ' + json.dumps({'choices': [], 'usage': usage}).encode() + b'\n\ndata: [DONE]\n\n')
 
     def _chat(self, st, body):
         text = body['messages'][-1]['content']

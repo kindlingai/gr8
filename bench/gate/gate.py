@@ -71,6 +71,9 @@ def one_run(cl, a, parts, seed):
         res['mixed4'] = measure.mixed4(cl, a.runs_per_workload, a.workload_tokens, a.temp, a.effort)
     if 'workloads' in parts or 'mixed4' in parts:
         res['spec'] = C.spec_delta(s_work, C.spec_snapshot(cl.metrics()))
+    if a.prompt_set:  # after the spec window above, so spec.* stays the workloads' own
+        ps, sha = measure.load_prompt_set(a.prompt_set)
+        res['prompt_set'] = measure.prompt_set(cl, ps, sha, a.prompt_set_tokens, a.prompt_set_temp)
     res['notes'] = notes
     return res
 
@@ -229,6 +232,10 @@ def main():
     p.add_argument('--pbench-args', default='', help='extra arguments for bench/pbench.py')
     p.add_argument('--runs-per-workload', type=int, default=3)
     p.add_argument('--workload-tokens', type=int, default=300)
+    p.add_argument('--prompt-set', help='JSON prompt set of another bench as token ids (see README); its numbers are '
+                   'named set.<name>.<kind>.*')
+    p.add_argument('--prompt-set-tokens', type=int, default=512)
+    p.add_argument('--prompt-set-temp', type=float, default=0.0)
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser('spread', help='spread between the runs of a session')

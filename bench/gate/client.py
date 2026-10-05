@@ -48,12 +48,21 @@ class Client:
         body = {'model': self.model, 'messages': messages, 'max_tokens': max_tokens, 'stream': True,
                 'temperature': temperature, 'min_p': min_p, 'stream_options': {'include_usage': True},
                 'chat_template_kwargs': kwargs}
+        return self._stream('/v1/chat/completions', body)
+
+    def complete_stream(self, prompt_ids, max_tokens, temperature=0.0):
+        """Streamed /v1/completions on exact prompt token ids (no chat template). Same fields as chat()."""
+        body = {'model': self.model, 'prompt': prompt_ids, 'max_tokens': max_tokens, 'stream': True,
+                'temperature': temperature, 'stream_options': {'include_usage': True}}
+        return self._stream('/v1/completions', body)
+
+    def _stream(self, path, body):
         t0 = time.time()
         tfirst = None
         usage = None
         content, reasoning = [], []
         finish = None
-        with self._post('/v1/chat/completions', body) as r:
+        with self._post(path, body) as r:
             for line in r:
                 line = line.strip()
                 if not line.startswith(b'data: ') or line == b'data: [DONE]':
@@ -65,7 +74,7 @@ class Client:
                 if not ch:
                     continue
                 dl = ch[0].get('delta') or {}
-                c = dl.get('content') or ''
+                c = dl.get('content') or ch[0].get('text') or ''
                 rs = (dl.get('reasoning') or '') + (dl.get('reasoning_content') or '')
                 if c or rs:
                     if tfirst is None:

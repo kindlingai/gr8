@@ -1,4 +1,5 @@
 """The measurements: needle, long prompt, pbench, workloads, mixed streams. Each returns a plain dict."""
+import hashlib
 import json
 import statistics
 import subprocess
@@ -121,6 +122,40 @@ def workloads(cl, runs=3, tokens=300, temp=0.7, effort='nothink', kinds=('code',
         out[kind] = {'runs': rows, 'failed_runs': failed,
                      'decode_tok_s': None if failed else med([r['tok_s'] for r in rows]),
                      'spec': C.spec_delta(s0, s1)}
+    return out
+
+
+def load_prompt_set(path):
+    """A prompt set from another bench, as exact token ids: {"name": ..., "prompts": [{"id", "kind", "prompt_token_ids"}]}.
+    -> (set, sha256 of the file). The name goes into the metric names, so every number says which set it comes from."""
+    raw = Path(path).read_bytes()
+    ps = json.loads(raw)
+    if not isinstance(ps.get('name'), str) or not ps['name'] or '.' in ps['name']:
+        raise ValueError(f'{path}: "name" must be a non-empty string without dots')
+    for p in ps.get('prompts') or []:
+        if not (p.get('id') and p.get('kind') and isinstance(p.get('prompt_token_ids'), list) and p['prompt_token_ids']):
+            raise ValueError(f'{path}: every prompt needs id, kind and a non-empty prompt_token_ids list')
+    if not ps.get('prompts'):
+        raise ValueError(f'{path}: no prompts')
+    return ps, hashlib.sha256(raw).hexdigest()
+
+
+def prompt_set(cl, ps, sha, tokens=512, temp=0.0):
+    """Decode tok/s and drafter counters per kind on a prompt set given as token ids (sent to /v1/completions as they
+    are, so the other bench's chat template and system message are kept exactly)."""
+    out = {'name': ps['name'], 'sha256': sha, 'kinds': {}}
+    for kind in sorted({p['kind'] for p in ps['prompts']}):
+        s0 = C.spec_snapshot(cl.metrics())
+        rows = []
+        for p in (q for q in ps['prompts'] if q['kind'] == kind):
+            r = cl.complete_stream(p['prompt_token_ids'], tokens, temperature=temp)
+            rows.append({'id': p['id'], 'tokens': r['tokens'], 'tok_s': rate(r), 'ttft_s': round(r['ttft'], 3),
+                         'finish_reason': r['finish_reason'], 'ok': r['finish_reason'] in OK_FINISH})
+        s1 = C.spec_snapshot(cl.metrics())
+        failed = sum(not r['ok'] for r in rows)
+        out['kinds'][kind] = {'runs': rows, 'failed_runs': failed,
+                              'decode_tok_s': None if failed else med([r['tok_s'] for r in rows]),
+                              'spec': C.spec_delta(s0, s1)}
     return out
 
 

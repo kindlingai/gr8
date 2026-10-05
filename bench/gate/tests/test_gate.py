@@ -117,6 +117,33 @@ class Measurements(Base):
         self.assertAlmostEqual(sp['tokens_per_step'], 1 + 50 / 33, places=3)
         self.assertEqual(len(sp['per_pos_survival']), 2)
 
+    def test_prompt_set_sends_exact_ids_and_names_metrics_by_set(self):
+        ps = {'name': 'bench-x', 'prompts': [{'id': 'code0', 'kind': 'code', 'prompt_token_ids': [5, 6, 7]},
+                                             {'id': 'code1', 'kind': 'code', 'prompt_token_ids': [8, 9]},
+                                             {'id': 'prose0', 'kind': 'prose', 'prompt_token_ids': [1, 2]}]}
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            json.dump(ps, f)
+        loaded, sha = measure.load_prompt_set(f.name)
+        os.unlink(f.name)
+        self.srv.st.completion_prompts.clear()
+        r = measure.prompt_set(self.cl, loaded, sha, tokens=100)
+        self.assertEqual(self.srv.st.completion_prompts, [[5, 6, 7], [8, 9], [1, 2]])
+        self.assertEqual(set(r['kinds']), {'code', 'prose'})
+        self.assertEqual(r['kinds']['code']['spec']['drafts'], 2 * 25)
+        self.assertIsNotNone(r['kinds']['code']['decode_tok_s'])
+        m = record.flatten({'prompt_set': r})
+        self.assertIn('set.bench-x.code.decode_tok_s', m)
+        self.assertAlmostEqual(m['set.bench-x.prose.tokens_per_step'][0], 1 + 50 / 25, places=3)
+
+    def test_prompt_set_rejects_bad_files(self):
+        for bad in ({'name': 'a.b', 'prompts': [{'id': 'x', 'kind': 'code', 'prompt_token_ids': [1]}]},
+                    {'name': 'a', 'prompts': []}, {'name': 'a', 'prompts': [{'id': 'x', 'kind': 'code'}]}):
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+                json.dump(bad, f)
+            with self.assertRaises(ValueError):
+                measure.load_prompt_set(f.name)
+            os.unlink(f.name)
+
     def test_mixed4(self):
         m = measure.mixed4(self.cl, runs=2, tokens=100)
         self.assertEqual(len(m['batches']), 2)
