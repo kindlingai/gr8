@@ -7,6 +7,7 @@
 //   bind::LayerTensors T = bind::layer_tensors(l, find); find("L003.q_a.gptq") -> bind::Tensor (p = nullptr: absent)
 //   bind::widen_fc1(T, st);                              optional, once per layer: K3 fc1 into the wide order, in place
 //   bind::widen_fc2(T, st);                              optional, once per layer: K3 fc2 likewise
+//   bind::scan_widths(T);                                once per layer: whether it needs the 2-bit kernels (#65)
 //   bind::Layer L;  const char* err = bind::make_layer(T, M, sc, io, L);      err == nullptr: ready
 //
 // Step order (each call is one kernel launch on the stream; `->` = where the result lands):
@@ -25,7 +26,8 @@
 //   launch_k1(L.k1, st)                     fc1, fc2, finalize (dense layer: fc1, fc2) -> io.mlp_part BF16 [8][6144]
 // A launch of a member with on == 0 (tensor not in this layer) does nothing. Output rows >= M are not written.
 // Tensors read: q_a.gptq, o_proj.gptq (int4 g32 records), kv_a / q_b / idx.wq_b .mx.gv (MXFP8 records), router.w /
-// idx.wk / idx.weights_proj .gv (BF16 records), shared|dense .gptq.fc1/.fc2, tr3.fc1/fc2/v1/v2/v3/table.
+// idx.wk / idx.weights_proj .gv (BF16 records), shared|dense .gptq.fc1/.fc2, tr3.fc1/fc2/v1/v2/v3/table (+ tr3.kmix
+// in exlr8 v2 packs).
 // Draft layer instead of the .gptq records: q_a.mx.gv, o_proj.mx.gv, shared.gate.mx.gv, shared.up.mx.gv, shared.down.mx.gv.
 // BF16-weight GEMVs (router, idx.wk, idx.weights_proj) take the activations rounded to BF16 (the bf16 mma takes
 // both operands as bf16): their reference is bf16(x) @ W^T, fp32 accumulate.
@@ -70,13 +72,15 @@ enum
 {
     T_Q_A, T_KV_A, T_Q_B, T_O_PROJ, T_IDX_WQ_B, T_IDX_WK, T_IDX_WPROJ, T_ROUTER, T_S_FC1, T_S_FC2, T_D_FC1, T_D_FC2,
     T_TR3_FC1, T_TR3_FC2, T_TR3_V1, T_TR3_V2, T_TR3_V3, T_TR3_TAB,
-    T_Q_A_MX, T_O_PROJ_MX, T_S_GATE_MX, T_S_UP_MX, T_S_DOWN_MX, NT      // MXFP8 twins, read only when the int4 record is absent
+    T_Q_A_MX, T_O_PROJ_MX, T_S_GATE_MX, T_S_UP_MX, T_S_DOWN_MX,         // MXFP8 twins, read only when the int4 record is absent
+    T_TR3_KMIX,                                                         // exlr8 v2 packs only (#65): fc1 width per (block, matrix)
+    NT
 };
 static const char* const NAMES[NT] = {
     "q_a.gptq", "kv_a.mx.gv", "q_b.mx.gv", "o_proj.gptq", "idx.wq_b.mx.gv", "idx.wk.gv", "idx.weights_proj.gv", "router.w.gv",
     "shared.gptq.fc1", "shared.gptq.fc2", "dense.gptq.fc1", "dense.gptq.fc2",
     "tr3.fc1", "tr3.fc2", "tr3.v1", "tr3.v2", "tr3.v3", "tr3.table",
-    "q_a.mx.gv", "o_proj.mx.gv", "shared.gate.mx.gv", "shared.up.mx.gv", "shared.down.mx.gv"};
+    "q_a.mx.gv", "o_proj.mx.gv", "shared.gate.mx.gv", "shared.up.mx.gv", "shared.down.mx.gv", "tr3.kmix"};
 
 struct LayerTensors
 {
@@ -84,6 +88,11 @@ struct LayerTensors
     int fc1_wide = 0;                 // tr3.fc1 is in the wide order (widen_fc1 ran)
     int fc2_wide = 0;                 // tr3.fc2 is in the wide order (widen_fc2 ran)
     int e4m3 = 0;                     // routed experts are exlr8-e4m3 (tr3.table's format): K1 decodes with E4M3 rounding
+    int k2 = 1;                       // some routed fc1 / fc2 unit has width 2 (exlr8 v2, #65): the K2 instantiations.
+                                      // 1 until scan_widths ran (correct for any pack); scan_widths sets the real value
+    int k2_pct = 0;                   // share of the rank's routed trellis bytes at width 2, percent (scan_widths)
+    int sh_trellis = 0;               // tr3.table has row 256: the shared expert as trellis (exlr8 v2, #65); scan_widths
+                                      // sets it, a caller may clear it to run the s_* records instead (the A/B)
 #if DEC_I4PAIR
     int i4pair_ks[2] = {0, 0};        // q_a.gptq, o_proj.gptq repacked into pair records for this k-part count (i4pair ran)
 #endif
@@ -110,7 +119,8 @@ inline void widen_fc1(LayerTensors& T, cudaStream_t st)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc1 = T.t[T_TR3_FC1];
     if (!tab.p || !fc1.p || T.fc1_wide) return;
-    launch_tr3_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st);
+    launch_tr3_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<const long long*>(T.t[T_TR3_KMIX].p),
+                     static_cast<int>(tab.shape[0]), g6nr::EB, st);
     T.fc1_wide = 1;
 }
 // The same for tr3.fc2 (k_tr3_widen2: the 8 k-tiles of an n-tile in three 64-bit loads). Same rules, same results bit for bit.
@@ -120,6 +130,44 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
     if (!tab.p || !fc2.p || T.fc2_wide) return;
     launch_tr3_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st);
     T.fc2_wide = 1;
+}
+
+// Once per layer after its tensors are on the device: reads tr3.table (and tr3.kmix) back, checks every width is 2, 3
+// or 4, and sets T.k2 (whether the layer needs the kernels with the 2-bit body). Synchronous; nullptr = ok.
+inline const char* scan_widths(LayerTensors& T)
+{
+    const Tensor &tab = T.t[T_TR3_TAB], &km = T.t[T_TR3_KMIX];
+    T.k2 = 0;
+    T.sh_trellis = 0;
+    if (!tab.p) return nullptr;
+    if (tab.nd != 2 || tab.shape[1] != 6 || (tab.shape[0] != 256 && tab.shape[0] != 257)) return "tr3.table is not [256 or 257][6]";
+    if (tab.shape[0] == 257 && !T.e4m3) return "a trellis shared expert (tr3.table row 256) needs an exlr8-e4m3 layer";
+    T.sh_trellis = tab.shape[0] == 257;
+    const size_t n = static_cast<size_t>(tab.shape[0]);
+    long long* h = new long long[n * 7];
+    long long* k = h + n * 6;
+    cudaError_t e = cudaMemcpy(h, tab.p, n * 6 * 8, cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess && km.p) e = km.shape[0] == tab.shape[0] ? cudaMemcpy(k, km.p, n * 8, cudaMemcpyDeviceToHost) : cudaErrorInvalidValue;
+    if (e != cudaSuccess) { delete[] h; return "scan_widths: cannot read tr3.table / tr3.kmix"; }
+    const char* err = nullptr;
+    double all = 0, two = 0;
+    for (size_t i = 0; i < n && !err; ++i)
+    {
+        const long long* tr = h + i * 6;
+        const long long kmi = km.p ? k[i] : 0;
+        if (tr[3] <= 0) continue;
+        if (tr[3] > g6nr::EB) err = "an expert has more blocks than this build's EB";
+        auto chk = [&](long long w) {
+            if (w < 2 || w > 4) err = "routed expert width outside 2..4";
+            all += w;
+            if (w == 2) { T.k2 = 1; two += w; }
+        };
+        for (long long b = 0; b < tr[3]; ++b) chk(tr[4]);                            // down blocks
+        for (int u = 0; u < 2 * tr[3]; ++u) chk(kmi ? (kmi >> (4 * u)) & 15 : tr[4]);   // gate / up units
+    }
+    T.k2_pct = all > 0 ? static_cast<int>(100 * two / all) : 0;
+    delete[] h;
+    return err;
 }
 
 // exlr8-e4m3 layers share one hidden-side sign vector per layer (input of gate and up, output of down). Each block row of
@@ -360,27 +408,39 @@ struct K1
     int fuse = 0, gf = 0;             // fuse (1 | 2): one persistent fc1+fc2 launch (k1_tr3_fused, gf CTAs of 512) instead of fc1, fc2
     size_t smf = 0;
     int e4 = 0;                       // exlr8-e4m3 layer: the E4 instantiations of fc1, fc2, fused (chosen once, in make_k1)
+    int k2 = 0;                       // layer with 2-bit units (LayerTensors::k2): the K2 instantiations
+    int sh = 0;                       // trellis shared expert (LayerTensors::sh_trellis): the SH instantiations (E4 only)
 };
+
+// the (E4, K2, SH) instantiations of a K1 kernel template; SH implies E4 (make_k1)
+#define K1_PICK(kern, k, ...) \
+    do { if ((k).sh) { if ((k).k2) kern<true, true, true>__VA_ARGS__; else kern<true, false, true>__VA_ARGS__; } \
+         else if ((k).e4) { if ((k).k2) kern<true, true>__VA_ARGS__; else kern<true, false>__VA_ARGS__; } \
+         else { if ((k).k2) kern<false, true>__VA_ARGS__; else kern<false, false>__VA_ARGS__; } } while (0)
+template <bool E4, bool K2, bool SH> inline const void* k1_fn_fc1() { return reinterpret_cast<const void*>(k1_tr3_fc1<E4, K2, SH>); }
+template <bool E4, bool K2, bool SH> inline const void* k1_fn_fused() { return reinterpret_cast<const void*>(k1_tr3_fused<E4, K2, SH>); }
 
 inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
-    if (k.e4) k1_tr3_fc1<true><<<k.g1, k.b1, k.sm1, st>>>(k.a);
-    else k1_tr3_fc1<false><<<k.g1, k.b1, k.sm1, st>>>(k.a);
+    K1_PICK(k1_tr3_fc1, k, <<<k.g1, k.b1, k.sm1, st>>>(k.a));
 }
 inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
-    if (k.e4) k1_tr3_fc2<true><<<k.g2, k.b2, k.sm2, st>>>(k.a);
-    else k1_tr3_fc2<false><<<k.g2, k.b2, k.sm2, st>>>(k.a);
+    K1_PICK(k1_tr3_fc2, k, <<<k.g2, k.b2, k.sm2, st>>>(k.a));
 }
 inline void launch_k1_fused(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
-    if (k.e4) k1_tr3_fused<true><<<k.gf, 512, k.smf, st>>>(k.a);
-    else k1_tr3_fused<false><<<k.gf, 512, k.smf, st>>>(k.a);
+    K1_PICK(k1_tr3_fused, k, <<<k.gf, 512, k.smf, st>>>(k.a));
 }
-inline void launch_k1_fin(const K1& k, cudaStream_t st) { if (k.on && !k.dense) k1_tr3_fin<<<k.g3, k.b3, 0, st>>>(k.a); }
+inline void launch_k1_fin(const K1& k, cudaStream_t st)
+{
+    if (!k.on || k.dense) return;
+    if (k.sh) k1_tr3_fin<true><<<k.g3, k.b3, 0, st>>>(k.a);
+    else k1_tr3_fin<<<k.g3, k.b3, 0, st>>>(k.a);
+}
 inline void launch_k1(const K1& k, cudaStream_t st)
 {
     if (k.fuse) launch_k1_fused(k, st);
@@ -392,14 +452,16 @@ inline void launch_k1(const K1& k, cudaStream_t st)
     launch_k1_fin(k, st);
 }
 // persistent grid of the fused launch: min(items, resident CTAs of the device at its smem size)
-inline int k1_fused_grid(int items, size_t smem, int e4 = 0)
+inline int k1_fused_grid(int items, size_t smem, int e4 = 0, int k2 = 0, int sh = 0)
 {
     int dev = 0, nsm = 0, nb = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
     // the attribute is per function (process-wide): set the maximum as init() does, never a layer's own smem, or a later
     // make_layer with a smaller split lowers it below an earlier layer's launch size (invalid argument at launch)
     if (smem > static_cast<size_t>(KSH) * 256) return 0;
-    const void* fn = e4 ? reinterpret_cast<const void*>(k1_tr3_fused<true>) : reinterpret_cast<const void*>(k1_tr3_fused<false>);
+    const void* fn = sh ? (k2 ? k1_fn_fused<true, true, true>() : k1_fn_fused<true, false, true>())
+                   : e4 ? (k2 ? k1_fn_fused<true, true, false>() : k1_fn_fused<true, false, false>())
+                        : (k2 ? k1_fn_fused<false, true, false>() : k1_fn_fused<false, false, false>());
     if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256) != cudaSuccess) return 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, fn, 512, smem) != cudaSuccess || nb < 1) return 0;
     const int g = nsm * nb;
@@ -440,16 +502,20 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
 {
     k = K1();
     const bool moe = T.t[T_TR3_TAB].p != nullptr;
-    const bool mx = moe && !T.t[T_S_FC1].p && T.t[T_S_GATE_MX].p;      // shared expert in MXFP8 records (draft layer)
-    const Tensor& f1 = T.t[mx ? T_S_GATE_MX : moe ? T_S_FC1 : T_D_FC1];
-    const Tensor& f2 = T.t[mx ? T_S_DOWN_MX : moe ? T_S_FC2 : T_D_FC2];
+    const bool sh = moe && T.sh_trellis;                                 // shared expert = trellis row 256 (#65)
+    const bool mx = moe && !sh && !T.t[T_S_FC1].p && T.t[T_S_GATE_MX].p; // shared expert in MXFP8 records (draft layer)
+    static const Tensor none;
+    const Tensor& f1 = sh ? none : T.t[mx ? T_S_GATE_MX : moe ? T_S_FC1 : T_D_FC1];
+    const Tensor& f2 = sh ? none : T.t[mx ? T_S_DOWN_MX : moe ? T_S_FC2 : T_D_FC2];
     const Tensor& fu = T.t[T_S_UP_MX];
-    if (!f1.p || !f2.p || (mx && !fu.p))
+    if (sh) { sh_out[0] = sh_out[1] = sh_out[2] = none; }
+    else if (!f1.p || !f2.p || (mx && !fu.p))
         return mx ? "MoE layer with shared.gate.mx.gv but without shared.up.mx.gv / shared.down.mx.gv"
              : moe ? "MoE layer with neither shared.gptq.fc1/fc2 nor shared.gate/up/down.mx.gv" : "layer has neither tr3.table nor dense.gptq.fc1/fc2";
-    sh_out[0] = f1; sh_out[1] = fu; sh_out[2] = f2;
-    const int s_nch = static_cast<int>(f1.shape[0]);
-    if (mx)
+    if (!sh) { sh_out[0] = f1; sh_out[1] = fu; sh_out[2] = f2; }
+    const int s_nch = sh ? 0 : static_cast<int>(f1.shape[0]);
+    if (sh) {}
+    else if (mx)
     {
         if (f1.nd != 3 || f1.shape[1] != 192 || f1.shape[2] != 528 || fu.nd != 3 || fu.shape[0] != s_nch || fu.shape[1] != 192 ||
             fu.shape[2] != 528 || f2.nd != 3 || f2.shape[0] != KSH || f2.shape[1] * 2 != s_nch || f2.shape[2] != 528 || s_nch * 16 > SACTW)
@@ -461,6 +527,11 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     if (M < 1 || M > 8) return "M must be 1..8";
     // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
     K1Split s = moe ? k1_split(split_m ? split_m : M) : K1_DENSE_SPLIT;
+    // Layers whose routed bytes are mostly 2-bit run fc1 and fc2 as separate launches at 3 or more rows (G6_FUSE=1 only):
+    // the 1024-thread fc1 keeps more warps decoding, and 2-bit decode spends more issue slots per byte. Measured on GB10
+    // at TP4 (#65): K2 layer at M = 5 459 us against 507 fused, a K3/K2 "down1" layer 500 against 531; fused stays ahead
+    // at M = 1 and for layers with a minority of 2-bit units. Layers without 2-bit units are not affected.
+    if (fuse == 1 && moe && T.k2 && T.k2_pct >= 50 && (split_m ? split_m : M) >= 3) fuse = 0;
     if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently (RESULTS-M1 item 1f).
@@ -486,13 +557,22 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
             return "tr3 table / v1 / v2 / v3 shapes do not match the pack layout";
         for (int i = T_TR3_FC1; i <= T_TR3_V3; ++i)
             if (T.t[i].fmt != tab.fmt) return "tr3.* tensors of one layer carry different expert formats";
+        const Tensor& km = T.t[T_TR3_KMIX];
+        if (km.p && (km.nd != 1 || km.shape[0] != tab.shape[0])) return "tr3.kmix is not one entry per tr3.table row";
         k.e4 = T.e4m3;
+        k.k2 = T.k2;
+        k.sh = sh;
+        if (sh && !k.e4) return "trellis shared expert in a layer that is not exlr8-e4m3";
+        if (sh && T.t[T_TR3_TAB].shape[0] != 257) return "trellis shared expert without tr3.table row 256";
+        a.sh_e = 256;
+        a.sh_mask = (1 << M) - 1;
         if (!plan.n_slots || !plan.slot_expert || !plan.slot_mask || !plan.slot_w || !plan.tok_slot || !plan.tok_w) return "MoE layer needs the route plan";
         a.n_slots = M * 8;
         a.n_slots_dev = plan.n_slots;
         a.slot_expert = plan.slot_expert; a.slot_mask = plan.slot_mask; a.slot_w = plan.slot_w;
         a.tok_slot = plan.tok_slot; a.tok_w = plan.tok_w;
         a.t_tab = static_cast<const long long*>(tab.p);
+        a.t_kmix = static_cast<const long long*>(km.p);
         a.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); a.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p);
         a.t_wide = T.fc1_wide; a.t_wide2 = T.fc2_wide;
         a.t_v1 = static_cast<const __half*>(v1.p); a.t_v2 = static_cast<const __half*>(v2.p); a.t_v3 = static_cast<const __half*>(v3.p);
@@ -504,18 +584,18 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         a.s_direct = 1;
         k.dense = 1;
     }
-    const int sh1 = (s_nch + a.s_cw - 1) / a.s_cw;
-    k.g1 = a.n_slots * a.B * 2 * a.KS1 + sh1; k.b1 = 256 * s.WG;
+    const int sh1 = sh ? 0 : (s_nch + a.s_cw - 1) / a.s_cw;
+    k.g1 = (a.n_slots + (sh ? 1 : 0)) * a.B * 2 * a.KS1 + sh1; k.b1 = 256 * s.WG;
     k.sm1 = static_cast<size_t>(KSH / a.KS1) * 256;
     if (k.sm1 < static_cast<size_t>(w1) * 1024) k.sm1 = static_cast<size_t>(w1) * 1024;
-    k.g2 = a.n_slots * a.B * a.NS2 + a.s_ns2; k.b2 = 512;
+    k.g2 = (a.n_slots + (sh ? 1 : 0)) * a.B * a.NS2 + (sh ? 0 : a.s_ns2); k.b2 = 512;
     k.sm2 = static_cast<size_t>(s_nch < 8 ? 8 : s_nch) * 256;
-    k.g3 = M * 48; k.b3 = 128;
+    k.g3 = M * 48; k.b3 = sh ? 160 : 128;            // SH: a fifth finalize warp sums the trellis shared expert
     if (fuse)
     {
         k.fuse = fuse;
         k.smf = k.sm1 > k.sm2 ? k.sm1 : k.sm2;
-        k.gf = k1_fused_grid(k.g1 + k.g2, k.smf, k.e4);
+        k.gf = k1_fused_grid(k.g1 + k.g2, k.smf, k.e4, k.k2, k.sh);
         if (!k.gf) return "fused K1 launch: no resident CTA at its shared memory size";
     }
     k.on = 1;
@@ -725,8 +805,12 @@ template <class A> inline void head_args(const Head& H, A& a)
 // once per process, before the first launch or graph capture
 inline cudaError_t init()
 {
-    const void* fn[4] = {reinterpret_cast<const void*>(k1_tr3_fc1<false>), reinterpret_cast<const void*>(k1_tr3_fused<false>),
-                         reinterpret_cast<const void*>(k1_tr3_fc1<true>), reinterpret_cast<const void*>(k1_tr3_fused<true>)};
+    const void* fn[12] = {k1_fn_fc1<false, false, false>(), k1_fn_fused<false, false, false>(),
+                          k1_fn_fc1<true, false, false>(), k1_fn_fused<true, false, false>(),
+                          k1_fn_fc1<false, true, false>(), k1_fn_fused<false, true, false>(),
+                          k1_fn_fc1<true, true, false>(), k1_fn_fused<true, true, false>(),
+                          k1_fn_fc1<true, false, true>(), k1_fn_fused<true, false, true>(),
+                          k1_fn_fc1<true, true, true>(), k1_fn_fused<true, true, true>()};
     for (const void* f : fn)
     {
         const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);

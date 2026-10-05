@@ -605,6 +605,8 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.push_back(bindp::layer_tensors(y.l, [&](const char* name) { return as_bind(find(name)); }));
         P.T.back().fc1_wide = y.T.fc1_wide;      // decode widened tr3.fc1 in place: prefill must read the same order
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
+        P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths, #65)
+        P.T.back().sh_trellis = y.T.sh_trellis;  // the shared expert as trellis row 256 (#65)
     }
     if (P.qp) pf_qp_states(P, m, st, share);
     if (P.qo && share) P.qa = share->qa;
@@ -1408,6 +1410,7 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
     bindp::launch(b.down, st, b.rs_down);
     pf_mark(5, st);
     pf_blas_x2(m, P, i, M, st);
+    bindp::launch_shared(b.exs, st);             // exlr8 v2 trellis shared expert (#65); no-op otherwise
     bindp::launch_experts(b.ex, st);
     if (!P.rc_file.empty() && b.ex.on) pf_rcdump(m, P, i, M, b.ex.cnt, st);
     pf_mark(6, st);

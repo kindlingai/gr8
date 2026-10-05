@@ -25,9 +25,10 @@ struct K1Args
     int n_slots, M;            // n_slots = slots the grids are launched for (>= n_slots_dev of every plan)
     const int* n_slots_dev;    // [NP] distinct routed experts of the plan (RoutePlan::n_slots); CTAs of slots beyond it exit
 
-    // routed experts, TR3 block records (converter pack layout); an expert has 2 or 3 blocks (TP6) or 4 (TP4) of K3 or K4
-    // on a rank
+    // routed experts, TR3 block records (converter pack layout); an expert has 2 or 3 blocks (TP6) or 4 (TP4) of K2, K3
+    // or K4 on a rank
     const long long* t_tab;    // [E][6] fc1 byte offset, fc2 byte offset, first block row (v1/v2/v3), n blocks, bits, first block
+    const long long* t_kmix;   // [E] fc1 width per (block, matrix) (tr3.kmix, exlr8 v2 packs, #65), nullptr = all at bits
     const uint8_t* t_fc1;      // at tab[0]: [n blocks][2][384][8][TB], TB = 32*bits
     int t_wide;                // K3 experts of t_fc1 are in the wide order (tr3_wide.cuh, k_tr3_widen ran on it)
     const uint8_t* t_fc2;      // at tab[1]: [n blocks][384][8][TB]
@@ -36,6 +37,8 @@ struct K1Args
     const __half* t_v2;        // [block row][3][128]   svh gate, svh up, suh down
     const __half* t_v3;        // [block row][6144]     svh down
     int B, KS1, WG, NS2;       // max 128-blocks per expert (grid and scratch stride), fc1 k-splits per CTA grid, warp groups, fc2 n-splits
+    int sh_e, sh_mask;         // trellis shared expert (exlr8 v2, #65; the SH kernels): its tr3.table row (256) and the
+                               // token mask (all M); it runs as slot n_slots with weight 1, in place of the s_* records
     float* gpart;              // [SMAX][B][2][GPMAX][8][128]
     __half* z;                 // [SMAX][B][8][6144]
 
