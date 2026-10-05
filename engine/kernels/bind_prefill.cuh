@@ -1542,6 +1542,8 @@ __device__ unsigned g_pf_done;
 #define PF_CK(i)
 #endif
 
+// PF_SKIPPRO and PF_HOIST read table[5] as the first of a contiguous run of blocks, which holds for TR3 and v1 packs
+// only. In an exlr8 v2 pack table[5] is the first owned half and the halves are not contiguous.
 // PF_SKIPPRO (timing-only build, wrong values, not a production path): a block-CTA runs the x stage and the prologue
 // (x * suh, had128, MXFP8 into sA) only if it is the first block of its 4-block suh fragment on this rank (b == 0 or
 // global block tr[5] + b a multiple of 4); the others run the MMA on whatever sA holds. Upper bound of hoisting the
@@ -1877,7 +1879,6 @@ __global__ void __launch_bounds__(512, 1) k_pf_fc1h(Expert A)
         else c -= k;
     }
     if (bs < 0) return;
-    if ((A.t_kmix && A.t_kmix[sg[0]]) || A.k2) __trap();      // measurement build: one K3 / K4 width per expert only
     if (threadIdx.x < rows) sRow[threadIdx.x] = A.rr_row[r0 + threadIdx.x];
     __syncthreads();
     if (rows <= 32)
@@ -2572,6 +2573,9 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         if (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p || !v1.p || !v2.p || !v3.p || !bias.p) return "MoE layer without tr3.fc1/fc2/v1/v2/v3 or router.bias";
         const Tensor& km = T.t[T_TR3_KMIX];
         if (km.p && (km.nd != 1 || km.shape[0] != tab.shape[0])) return "tr3.kmix is not one entry per tr3.table row";
+#ifdef PF_HOIST
+        if (km.p || T.k2) return "PF_HOIST (k_pf_fc1h) takes one K3 / K4 width per expert: no tr3.kmix or 2-bit layers";
+#endif
         // 257 rows: an exlr8 v2 pack with the shared expert as trellis row 256 (#65)
         if (tab.nd != 2 || (tab.shape[0] != NEXP && tab.shape[0] != NEXP + 1) || tab.shape[1] != 6 || v1.nd != 3 || v1.shape[1] != 2 || v1.shape[2] != HID || v2.nd != 3 ||
             v2.shape[1] != 3 || v2.shape[2] != 128 || v3.nd != 2 || v3.shape[1] != HID || v2.shape[0] != v1.shape[0] || v3.shape[0] != v1.shape[0] ||

@@ -134,7 +134,9 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
 
 // Once per layer after its tensors are on the device: reads tr3.table (and tr3.kmix) back, checks every width is 2, 3
 // or 4, and sets T.k2 (whether the layer needs the kernels with the 2-bit body). Synchronous. nullptr = ok.
-inline const char* scan_widths(LayerTensors& T)
+// Every routed expert has at least two halves on every rank at TP3-7, so an expert with no blocks means a partial test
+// pack (tools/convert/v2.py --routed): refused unless allow_empty (test programs).
+inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &km = T.t[T_TR3_KMIX];
     T.k2 = 0;
@@ -155,7 +157,11 @@ inline const char* scan_widths(LayerTensors& T)
     {
         const long long* tr = h + i * 6;
         const long long kmi = km.p ? k[i] : 0;
-        if (tr[3] <= 0) continue;
+        if (tr[3] <= 0)
+        {
+            if (!allow_empty && i < 256) err = "a routed expert has no blocks on this rank (a partial test pack)";
+            continue;
+        }
         if (tr[3] > g6nr::EB) err = "an expert has more blocks than this build's EB";
         auto chk = [&](long long w) {
             if (w < 2 || w > 4) err = "routed expert width outside 2..4";

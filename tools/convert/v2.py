@@ -159,7 +159,9 @@ class V2Layer:
         sign = self._get(SIGNS[p])
         if sc.shape != (H // 128,) or sc.dtype != np.float16 or sign.shape != (H,):
             raise ValueError(f'L{self.l} k{k} {p}: block scales {sc.shape} {sc.dtype} / signs {sign.shape}')
-        v = np.where(sign < 0, -1.0, 1.0).astype(np.float32) * np.repeat(sc.astype(np.float32), 128)
+        if not np.isin(sign, (-1, 1)).all():
+            raise ValueError(f'L{self.l}: {SIGNS[p]} holds values other than +1 and -1')
+        v = sign.astype(np.float32) * np.repeat(sc.astype(np.float32), 128)
         return v.astype(np.float16), sc
 
     def inter(self, e, p, k):

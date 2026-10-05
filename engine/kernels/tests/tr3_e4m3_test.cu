@@ -20,6 +20,7 @@
 #include <vector>
 #include <cuda_fp8.h>
 #include "../bind_prefill.cuh"
+#include "../../h2d.h"
 
 // per (tile pair, lane): the decode fragments of tiles p and q, then the prefill E4M3 bytes of both
 struct Out { u32 tr3[2][4], e4[2][4], pf[4]; };
@@ -87,7 +88,7 @@ static int run(const std::vector<uint8_t>& tiles, const char* what)
     Out* dout;
     cudaMalloc(&dt, static_cast<size_t>(ntiles) * TB);
     cudaMalloc(&dout, static_cast<size_t>(npairs) * 32 * sizeof(Out));
-    cudaMemcpy(dt, tiles.data(), static_cast<size_t>(ntiles) * TB, cudaMemcpyHostToDevice);
+    g6h2d::copy(dt, tiles.data(), static_cast<size_t>(ntiles) * TB);     // pageable source: pinned staging
     k_decode<BITS><<<(npairs + 7) / 8, 256>>>(dt, npairs, dout);
     std::vector<Out> out(static_cast<size_t>(npairs) * 32);
     cudaMemcpy(out.data(), dout, out.size() * sizeof(Out), cudaMemcpyDeviceToHost);

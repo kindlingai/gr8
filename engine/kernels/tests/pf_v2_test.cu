@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include "../bind_prefill.cuh"
+#include "../../h2d.h"
 #include "../../loader/devimage.h"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -26,7 +27,7 @@ template <class T> static T* dev(const std::vector<T>& v)
 {
     T* p;
     CK(cudaMalloc(&p, v.size() * sizeof(T)));
-    CK(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+    CK(g6h2d::copy(p, v.data(), v.size() * sizeof(T)));     // pageable source: pinned staging (64 KiB-page kernels)
     return p;
 }
 
@@ -76,7 +77,7 @@ int main(int argc, char** argv)
     if (!D.t[bind::T_TR3_TAB].p) die("pack has no tr3.table for the layer");
     if (wide) { bind::widen_fc1(D, st); bind::widen_fc2(D, st); CK(cudaStreamSynchronize(st)); }
 #ifndef K1V2_MAIN   // -DK1V2_MAIN: build against a tree before #65, for the one-width A/B
-    if (const char* e = bind::scan_widths(D)) die(e);
+    if (const char* e = bind::scan_widths(D, true)) die(e);
 #endif
     bindp::Tensors T = bindp::layer_tensors(layer, find);
 

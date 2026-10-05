@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include "../bind.cuh"
+#include "../../h2d.h"
 #include "../../loader/devimage.h"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -85,7 +86,7 @@ template <class T> static T* dev(const std::vector<T>& v)
 {
     T* p;
     CK(cudaMalloc(&p, v.size() * sizeof(T)));
-    CK(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+    CK(g6h2d::copy(p, v.data(), v.size() * sizeof(T)));     // pageable source: pinned staging (64 KiB-page kernels)
     return p;
 }
 
@@ -146,7 +147,7 @@ int main(int argc, char** argv)
     if (wide) { bind::widen_fc1(T, st); bind::widen_fc2(T, st); CK(cudaStreamSynchronize(st)); }
     if (const char* e = bind::check_shared_signs(T, st)) die(e);
 #ifndef K1V2_MAIN
-    if (const char* e = bind::scan_widths(T)) die(e);
+    if (const char* e = bind::scan_widths(T, true)) die(e);
     if (int4sh) T.sh_trellis = 0;          // --int4-shared: run the s_* records (zeros here)
 #endif
 

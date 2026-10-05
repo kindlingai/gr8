@@ -15,6 +15,7 @@
 #include <vector>
 #include <cuda_fp8.h>
 #include "../bind.cuh"
+#include "../../h2d.h"
 #include "../tr3_dense.cuh"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -23,7 +24,7 @@ template <class T> static T* dev(const std::vector<T>& v)
 {
     T* p;
     CK(cudaMalloc(&p, v.size() * sizeof(T)));
-    CK(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+    CK(g6h2d::copy(p, v.data(), v.size() * sizeof(T)));     // pageable source: pinned staging (64 KiB-page kernels)
     return p;
 }
 
