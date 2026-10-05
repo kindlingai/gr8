@@ -241,7 +241,7 @@ int main(int argc, char** argv)
                     bind::launch(gm, st);
                 }
             });
-            // one launch, input rotated by the producer (not timed): best of ks in {1, 2, 4, 8} x sub in {1, 2}
+            // single-launch kernel on input the producer rotated (not timed): best of ks in {1, 2, 4, 8} x sub in {1, 2}
             double t1 = 1e30;
             int bk = 0, bs = 0;
             for (int sub = 1; sub <= 2; ++sub)

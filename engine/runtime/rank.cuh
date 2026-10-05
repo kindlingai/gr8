@@ -392,7 +392,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         y.T = bind::layer_tensors(y.l, [&](const char* n) { return as_bind(find(n)); });
         if (const char* e = bind::scan_widths(y.T)) die("layer " + std::to_string(y.l) + ": " + e);
         // G6_V2_SHARED=int4: run an exlr8 v2 layer's shared expert from its int4 / MXFP8 records (the A/B against row 256).
-        // G6_V2_SHARED=trellis: prefill runs it as a trellis pass instead of on its FP8 copy.
+        // G6_V2_SHARED=trellis: prefill runs it as a trellis pass (no FP8 copy).
         const char* v2s = getenv("G6_V2_SHARED");
         if (y.T.sh_trellis && v2s && !strcmp(v2s, "int4")) y.T.sh_trellis = 0;
         if (y.T.sh_trellis && !(v2s && !strcmp(v2s, "trellis")))

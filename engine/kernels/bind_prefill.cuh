@@ -2447,8 +2447,8 @@ inline void launch_fin(const Expert& A, cudaStream_t st)
 // ------------------------------------------------------------------------------------------ trellis shared expert
 // With its FP8 copy (bind::make_shared_fp8: the decoded tiles, still rotated), the shared expert runs on the MXFP8 GEMMs
 // of the dense shared path, wrapped in its rotations. k_shx_rotq writes the records of H128(x * suh_gate) and
-// H128(x * suh_up) in one pass; the gate and up GEMMs run as one pair; k_shx_mid (the arithmetic of k_pf_mid) writes the
-// down input records; the down GEMM writes ysh; k_pf_fin adds f16(H128(ysh) * svh_down).
+// H128(x * suh_up) in one pass. The gate and up GEMMs run as one pair. k_shx_mid (the arithmetic of k_pf_mid) writes
+// the down input records, the down GEMM writes ysh, and k_pf_fin adds f16(H128(ysh) * svh_down).
 struct ShX
 {
     int on = 0, M = 0, I = 0;
@@ -2672,8 +2672,8 @@ struct Layer
     ShX shx;                          // the same from its FP8 copy on the MXFP8 GEMMs (gate, up, down above); on = 0 otherwise
 };
 
-// the shared expert of an exlr8 v2 layer (#65): FP8 copy on the GEMMs, or the trellis pass. No-op for other layers,
-// whose shared / dense MLP runs from the five launches of the step order above.
+// the shared expert of an exlr8 v2 layer (#65): FP8 copy on the GEMMs, or the trellis pass. No-op for other layers.
+// Their shared / dense MLP runs from the five launches of the step order above.
 template <int EB = g6nr::EB> inline void launch_shared(const Layer& L, cudaStream_t st)
 {
     if (L.shx.on)
@@ -2683,7 +2683,7 @@ template <int EB = g6nr::EB> inline void launch_shared(const Layer& L, cudaStrea
         k_shx_rotq<<<(rows * 48 + 7) / 8, 256, 0, st>>>(a);
         launch_pair(L.gate, L.up, st);    // up reads its own records (Gemm::x8_2)
         k_shx_mid<<<(rows * (a.I / 128) + 7) / 8, 256, 0, st>>>(a);
-        launch(L.down, st);           // -> ysh; k_pf_fin applies H128 x svh_down (Expert::sh_svh)
+        launch(L.down, st);           // -> ysh, which k_pf_fin rotates and scales (Expert::sh_svh)
     }
     else launch_shared<EB>(L.exs, st);
 }

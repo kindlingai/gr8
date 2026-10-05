@@ -111,8 +111,8 @@ __global__ void __launch_bounds__(32) k_tr3d_fin(const float* part, int ks, int 
     o[1] = __floats2half2_rn(v[2] * s23.x, v[3] * s23.y);
 }
 
-// One launch, no epilogue kernel: CTA = (128-column block nb, k part p) of 256 * SUB threads; warp = (sub-part q, tile
-// column j). The SUB sub-parts of a CTA reduce through shared memory, each CTA writes its fp32 partial [M][128] to
+// Single launch with no epilogue kernel. CTA = (128-column block nb, k part p) of 256 * SUB threads, warp = (sub-part q,
+// tile column j). The SUB sub-parts of a CTA reduce through shared memory, each CTA writes its fp32 partial [M][128] to
 // part[nb][p], and the last CTA of block nb (a counter, as k1_tr3_fused) sums the ks partials in order, rounds to fp16,
 // applies H128 and svh and writes y. The counters return to zero. xa = the input already rotated (the producer's job;
 // k_tr3d_rot stands in for it). UNR = tiles in flight per warp.

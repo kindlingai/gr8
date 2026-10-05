@@ -214,7 +214,7 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
 }
 
 // The same with the trellis shared expert. Under __launch_bounds__(512) alone nvcc gives the no-K2 instantiation 64
-// registers and spills (104 B stores, 132 B loads; the others get 101-128 and no spills), so this entry sets the cap.
+// registers and spills (104 B stores, 132 B loads). The others get 101-128 and no spills. This entry sets the cap.
 template <bool E4 = true, bool K2 = false>
 __global__ __maxnreg__(128) void k1_tr3_fused_sh(K1Args A)
 {
