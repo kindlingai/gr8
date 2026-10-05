@@ -165,6 +165,9 @@ pack format, serve loop, front end shape). Use it as the map for porting another
   (`engine/runtime/dflash.cuh`, packs from `tools/convert/dflash2.py`). It is lossless and leaves more memory free than
   MTP, because the MTP layer is not built. With GLM 5.3's template the gate workloads are reasoning text, and there it
   does not beat MTP k=2. The drafter wins on JSON answers. MTP stays the default. Numbers in the PR.
+- At temperature > 0, drafts are accepted when they equal the target's own sample (shared noise), so a seed gives the
+  same text with or without speculation. `SPEC_ACCEPT=rejection` switches to rejection sampling with greedy drafts: the
+  same output distribution, other text for a seed.
 - `logprobs` and `prompt_logprobs` work up to k = 20 (ranks beyond the top 20 are null). `top_k`/`min_p` are ignored with a warning. The full list is in `frontend/README.md`.
 - Requests are passed to the ranks other than 0 as files over ssh (one persistent connection per node), which adds a little TTFT.
 - With hashing on, boot takes a few minutes. It is mostly pack read speed: local packs loaded at about 1.8 GB/s per node

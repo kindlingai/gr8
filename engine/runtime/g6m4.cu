@@ -28,6 +28,12 @@
 //                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from tools/convert/dflash2.py. --dflash-sel 1 =
 //                     the DFlash2 selector walk (default when the pack has it), 0 = argmax drafts; --dflash-k K = verify
 //                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, no --s2.
+//      [--spec-accept coupled|rejection]  how a verify step accepts drafts at temperature > 0. coupled (default): drafts are
+//                     sampled with the target's position-keyed noise and accepted when they equal the target's sample, so
+//                     a seed gives the same text with and without speculation. rejection: greedy drafts, each accepted with
+//                     probability p(draft) under the request's temperature / top_p, else replaced by a sample of p without
+//                     it (glue.cuh rs_accept). Same output distribution, other text for a seed.
+//                     Temperature 0 is the same in both. Needs --mtp or --dflash-manifest; no --s2.
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
@@ -117,6 +123,13 @@ int main(int argc, char** argv)
         else if (a == "--serve") serve = next();
         else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
         else if (a == "--top-p-cands") nc = atoi(next().c_str());
+        else if (a == "--spec-accept")
+        {
+            const std::string v = next();
+            if (v == "coupled") plan.rs = false;
+            else if (v == "rejection") plan.rs = true;
+            else die("--spec-accept must be coupled or rejection");
+        }
         else if (a == "--s2") s2dir = next();
         else if (a == "--s2-port") s2port = atoi(next().c_str());
         else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
@@ -137,6 +150,7 @@ int main(int argc, char** argv)
     if (dfl && (dfl_file.empty() || mtp || s2mode || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
         die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round); not with --s2; --dflash-sel 0|1; --dflash-k 1..7");
     if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
+    if (plan.rs && (s2mode || (!mtp && !dfl))) die("--spec-accept rejection needs --mtp or --dflash-manifest, and not --s2");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
 #ifndef DEC_S2
     if (s2mode) die("--s2 needs a DEC_S2 build");
@@ -486,6 +500,7 @@ int main(int argc, char** argv)
     double pf_ms = 0;
     long pf_rows = 0;
     m.nc = nc; D.d.nc = nc;             // before any capture: the head kernels take it by value
+    m.rs = plan.rs;                     // the target's verify steps only; the MTP layer's head stays as it is
     for (int M : row_counts) prepare(m, M, st);
     for (int M : draft_rows) prepare(D.d, M, st);
     G6RT_CK(cudaStreamSynchronize(st));
@@ -562,7 +577,8 @@ int main(int argc, char** argv)
         }
     }
     fab.barrier();
-    if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed);
+    if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u%s\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed,
+                      plan.rs ? ", spec-accept rejection" : "");
 
 #ifdef DEC_S2
     if (s2mode)

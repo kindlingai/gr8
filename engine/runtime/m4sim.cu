@@ -26,6 +26,7 @@
 // [--s2] (DEC_S2 build, needs --mtp, no --prefill / --serve): every --prompt is a session (<= 8) and their rows share
 //        steps (s2_batch.h mtp_batch, s2.cuh). Lines per session: "q<j> " + the solo line (step / draft / chain /
 //        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped
+// [--spec-accept coupled|rejection]  as g6m4 (needs --mtp, no --s2): rejection = greedy drafts, accepted by rejection sampling
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
@@ -168,6 +169,13 @@ int main(int argc, char** argv)
         else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
         else if (a == "--top-p-cands") nc = atoi(next().c_str());
         else if (a == "--s2") s2mode = true;
+        else if (a == "--spec-accept")
+        {
+            const std::string v = next();
+            if (v == "coupled") plan.rs = false;
+            else if (v == "rejection") plan.rs = true;
+            else die("--spec-accept must be coupled or rejection");
+        }
         else die("unknown argument " + a);
     }
     if (packs.empty()) die("usage: m4sim --packs DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
@@ -177,6 +185,7 @@ int main(int argc, char** argv)
     plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
     if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
+    if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
     if (nc < 0 || nc * NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / NR));
 #ifdef DEC_S2
     if (s2mode && (!mtp || MP || !serve.empty() || prompts.size() > (size_t)S2N)) die("--s2 needs --mtp, no --prefill / --serve, at most 8 --prompt");
@@ -405,7 +414,7 @@ int main(int argc, char** argv)
         }
         G6RT_CK(cudaStreamSynchronize(st));
     }
-    for (Model& m : R) m.nc = nc;       // before any capture: the head kernels take it by value
+    for (Model& m : R) { m.nc = nc; m.rs = plan.rs; }   // before any capture: the head kernels take them by value
     for (Draft& D : DR) D.d.nc = nc;
 #ifdef DEC_S2
     S2In* in_s2 = dmalloc<S2In>(1);     // --s2: the step's session layout, target and draft steps

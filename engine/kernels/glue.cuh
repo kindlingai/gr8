@@ -494,6 +494,13 @@ __host__ __device__ __forceinline__ float sample_score(const SampleRow& s, float
 {
     return s.inv_temp == 0.f ? logit : logit * s.inv_temp + gumbel(s, v);
 }
+// Rejection sampling (--spec-accept rejection): the uniform draw that accepts a draft at the row's position, from a Philox
+// stream of its own (another counter word than gumbel), so it is independent of the Gumbel noise of every token.
+__host__ __device__ __forceinline__ float uniform01(const SampleRow& s)
+{
+    const uint32_t x = philox_x(0u, (uint32_t)s.pos, (uint32_t)s.draw, 0x3c6ef372u, s.seed_lo, s.seed_hi);
+    return ((float)(x >> 8) + 0.5f) * (1.f / 16777216.f);
+}
 
 // Per-row record each rank contributes to the head all-gather (32 bytes).
 struct HeadRec
@@ -688,6 +695,14 @@ __device__ __forceinline__ void head_local_topk(const HeadArgs& a, int m, const 
     }
 }
 
+// Rejection sampling (RS, --spec-accept rejection; MTP and DFlash2 verify steps): row m's draft is the step's input token
+// of row m + 1 (the draft of the position row m samples), or -1 for the last row, greedy rows and RS off. The RS kernels
+// are k_head_local_rs, k_head_merge_rs and k_head_merge_tp_rs; with RS off the head runs today's kernels, unchanged.
+template <bool RS> __device__ __forceinline__ int rs_draft(const HeadArgs& a, const int* tok, int m)
+{
+    return RS && m + 1 < a.M && a.rows[m].inv_temp > 0.f ? tok[m + 1] : -1;
+}
+
 // grid M, block 1024: local record -> send slot c, then publish.
 __global__ void __launch_bounds__(1024) k_head_local(HeadArgs a)
 {
@@ -746,9 +761,85 @@ __global__ void __launch_bounds__(1024) k_head_local(HeadArgs a)
     publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
 }
 
+// k_head_local for rejection sampling (launch_head_local with Model::rs). tok: the step's input tokens, device memory.
+// Its own kernel, so that k_head_local stays as it is. Row m with a draft d (rs_draft): the record's best score skips d (the
+// replacement when d is rejected), pad_[0] holds d's raw logit and pad_[1] the slice's sum of exp((logit - lmax) / T),
+// the normalizer of p(d). Rows without a draft get k_head_local's record.
+__global__ void __launch_bounds__(1024) k_head_local_rs(HeadArgs a, const int* tok)
+{
+    __shared__ float s_sc[32], s_lg[32], s_mx[32], s_sm[32], s_zt[32];
+    __shared__ int s_id[32];
+    const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+    const SampleRow sr = a.rows[m];
+    const float* row = a.logits + (size_t)m * a.ldl;
+    const int d = rs_draft<true>(a, tok, m);
+    float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f, zt = 0.f;
+    int bid = 0x7fffffff;
+    for (int i = t; i < a.vn; i += 1024)
+    {
+        const float lg = row[i];
+        const int v = a.vlo + i;
+        const float sc = sample_score(sr, lg, v);
+        if (sc > bs && v != d) { bs = sc; bid = v; blg = lg; }   // i ascending per thread -> lowest id on ties
+        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; zt = zt * expf((mx - lg) * sr.inv_temp) + 1.f; mx = lg; }
+        else { sm += expf(lg - mx); zt += expf((lg - mx) * sr.inv_temp); }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        const float os = __shfl_xor_sync(0xffffffffu, bs, o), ol = __shfl_xor_sync(0xffffffffu, blg, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bid, o);
+        if (os > bs || (os == bs && oi < bid)) { bs = os; bid = oi; blg = ol; }
+        const float omx = __shfl_xor_sync(0xffffffffu, mx, o), osm = __shfl_xor_sync(0xffffffffu, sm, o);
+        const float ozt = __shfl_xor_sync(0xffffffffu, zt, o);
+        const float nmx = fmaxf(mx, omx);
+        sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (omx == -INFINITY ? 0.f : osm * expf(omx - nmx));
+        zt = (mx == -INFINITY ? 0.f : zt * expf((mx - nmx) * sr.inv_temp)) + (omx == -INFINITY ? 0.f : ozt * expf((omx - nmx) * sr.inv_temp));
+        mx = nmx;
+    }
+    if (l == 0) { s_sc[w] = bs; s_id[w] = bid; s_lg[w] = blg; s_mx[w] = mx; s_sm[w] = sm; s_zt[w] = zt; }
+    __syncthreads();
+    if (t == 0)
+    {
+        HeadRec r;
+        r.score = s_sc[0]; r.id = s_id[0]; r.logit = s_lg[0]; r.lmax = s_mx[0]; r.lsum = s_sm[0];
+        float rz = s_zt[0];
+        for (int i = 1; i < 32; ++i)
+        {
+            if (s_sc[i] > r.score || (s_sc[i] == r.score && s_id[i] < r.id)) { r.score = s_sc[i]; r.id = s_id[i]; r.logit = s_lg[i]; }
+            const float nmx = fmaxf(r.lmax, s_mx[i]);
+            r.lsum = (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx)) +
+                     (s_mx[i] == -INFINITY ? 0.f : s_sm[i] * expf(s_mx[i] - nmx));
+            rz = (r.lmax == -INFINITY ? 0.f : rz * expf((r.lmax - nmx) * sr.inv_temp)) +
+                 (s_mx[i] == -INFINITY ? 0.f : s_zt[i] * expf((s_mx[i] - nmx) * sr.inv_temp));
+            r.lmax = nmx;
+        }
+        r.pad_[0] = r.pad_[1] = r.pad_[2] = 0.f;
+        if (a.tgt || d >= 0)              // a row with a draft carries d's logit, also when it has a target (then the
+        {                                 // target logprob of that row is d's; prompt rows' targets are d anyway)
+            const int i = (d >= 0 ? d : a.tgt[m]) - a.vlo;
+            r.pad_[0] = i >= 0 && i < a.vn ? row[i] : -INFINITY;
+        }
+        if (d >= 0) r.pad_[1] = rz;
+        reinterpret_cast<HeadRec*>(send_slot(a.f, *a.stepp, a.c))[m] = r;
+    }
+    if (a.nc > 0 && topp_on(sr)) head_local_topp(a, m, row, sr, s_mx);
+    if (a.tk && sr.topk > 0) head_local_topk(a, m, row);
+    const u64 step = *a.stepp;
+    publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
+}
+
+// RS, row m with draft d (rs_draft): accept d with probability p(d) = exp((l_d - mx) / T) / z under the request's
+// distribution (z over the nucleus for top_p rows), with the row's uniform draw; else the record's best, which skipped d.
+// tok / logit: the row's output token and its raw logit, set to d and ld when d is kept.
+__device__ __forceinline__ void rs_accept(const SampleRow& sr, int d, float pd, int& tok, float& logit, float ld)
+{
+    if (uniform01(sr) < pd) { tok = d; logit = ld; }
+}
+
 // grid 1, block 32: wait for the 5 peer records, merge in rank order, write the sampled token + logprob.
 // Rows with SampleRow::topk > 0 (HeadArgs::tk): then the ranks' top lists -> the row's TkRes.
-__global__ void __launch_bounds__(32) k_head_merge(HeadArgs a)
+template <bool RS> __device__ __forceinline__ void head_merge(const HeadArgs& a, const int* tok)
 {
     const u64 step = *a.stepp;
     const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
@@ -771,6 +862,18 @@ __global__ void __launch_bounds__(32) k_head_merge(HeadArgs a)
             sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx));
             mx = nmx;
         }
+        if constexpr (RS)
+            if (const int d = rs_draft<RS>(a, tok, m); d >= 0)
+            {
+                const SampleRow sr = a.rows[m];
+                float z = 0.f;
+                for (int p = 0; p < a.f.nr; ++p)
+                {
+                    const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
+                    z += __ldcv(q + 1).z * expf((__ldcv(q).w - mx) * sr.inv_temp);
+                }
+                rs_accept(sr, d, expf((tl - mx) * sr.inv_temp) / z, bid, blg, tl);
+            }
         a.tok_out[m] = bid;
         a.lp_out[m] = blg - mx - logf(sm);
         if (a.lpt_out) a.lpt_out[m] = tl - mx - logf(sm);
@@ -797,23 +900,29 @@ __global__ void __launch_bounds__(32) k_head_merge(HeadArgs a)
     }
 }
 
+__global__ void __launch_bounds__(32) k_head_merge(HeadArgs a) { head_merge<false>(a, nullptr); }
+__global__ void __launch_bounds__(32) k_head_merge_rs(HeadArgs a, const int* tok) { head_merge<true>(a, tok); }
+
 // k_head_merge with top_p candidates (HeadArgs::nc > 0). grid M, block 1024: one row per CTA. Rows without top_p
 // give k_head_merge's result. top_p rows: the candidates above every rank's unsent maximum, sorted (logit desc, id
 // asc); keep while the mass before a token is < top_p (softmax at T over the whole vocabulary: the ranks' pad_[1]);
 // sample = argmax over the kept of logit / T + gumbel. If the kept candidates never reach top_p, all of them are
 // kept and topp_miss counts the row. Same bytes on every rank -> same token.
-__global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
+// RS rows with a draft d: the replacement sample skips d among the kept, and p(d) is d's share of the kept mass (0 when d
+// is not kept); a row that keeps nothing falls back to the full-vocabulary p(d), as its sample does.
+template <bool RS> __device__ __forceinline__ void head_merge_tp(const HeadArgs& a, const int* tok)
 {
     __shared__ float s_l[TP_SORT], s_ws[32];
     __shared__ int s_id[TP_SORT];
-    __shared__ float s_mx, s_sm, s_tl, s_blg, s_z, s_cut, s_best[32], s_bl[32];
-    __shared__ int s_bid, s_bi[32], s_keep;
+    __shared__ float s_mx, s_sm, s_tl, s_blg, s_z, s_cut, s_best[32], s_bl[32], s_kz[32], s_ld;
+    __shared__ int s_bid, s_bi[32], s_keep, s_in;
     const u64 step = *a.stepp;
     const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
     wait_peers(a.f, step, a.c, seq, head_wait_bytes(a), ERR_HEAD);
     const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
     const SampleRow sr = a.rows[m];
     const bool on = topp_on(sr);
+    const int d = rs_draft<RS>(a, tok, m);
     if (t == 0)
     {
         float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f, tl = -INFINITY, cut = -INFINITY;
@@ -832,7 +941,7 @@ __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
             mx = nmx;
         }
         float z = 0.f;                   // sum exp((logit - mx) / T) over the whole vocabulary
-        if (on)
+        if (on || (RS && d >= 0))
             for (int p = 0; p < a.f.nr; ++p)
             {
                 const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
@@ -891,8 +1000,19 @@ __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
         const float e0 = base + inc - (w0 + w1), e1 = e0 + w0;       // mass before entries 2t, 2t+1
         const int k0 = s_l[2 * t] != -INFINITY && e0 < pz, k1 = s_l[2 * t + 1] != -INFINITY && e1 < pz;
         if (k0 + k1) atomicAdd(&s_keep, k0 + k1);
+        if (RS && t == 0) s_in = 0;
         __syncthreads();
         const int keep = s_keep;
+        if (RS && d >= 0)                // the kept mass and d's logit if d is kept
+        {
+            float kz = (2 * t < keep ? w0 : 0.f) + (2 * t + 1 < keep ? w1 : 0.f);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) kz += __shfl_xor_sync(0xffffffffu, kz, o);
+            if (l == 0) s_kz[w] = kz;
+            for (int i = 2 * t; i < 2 * t + 2 && i < keep; ++i)
+                if (s_id[i] == d) { s_in = 1; s_ld = s_l[i]; }
+            __syncthreads();
+        }
         float total = 0.f;
         for (int i = 0; i < 32; ++i) total += s_ws[i];
         if (keep > 0)
@@ -902,6 +1022,7 @@ __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
             int bi = 0x7fffffff;
             for (int i = t; i < keep; i += 1024)
             {
+                if (RS && s_id[i] == d) continue;
                 const float sc = s_l[i] * sr.inv_temp + gumbel(sr, s_id[i]);
                 if (sc > bs || (sc == bs && s_id[i] < bi)) { bs = sc; bi = s_id[i]; bl = s_l[i]; }
             }
@@ -918,11 +1039,27 @@ __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
             {
                 for (int i = 1; i < 32; ++i)
                     if (s_best[i] > s_best[0] || (s_best[i] == s_best[0] && s_bi[i] < s_bi[0])) { s_best[0] = s_best[i]; s_bi[0] = s_bi[i]; s_bl[0] = s_bl[i]; }
-                s_bid = s_bi[0]; s_blg = s_bl[0];
+                if (!RS || s_bi[0] != 0x7fffffff) { s_bid = s_bi[0]; s_blg = s_bl[0]; }   // RS: d was the only kept entry
+                if (RS && d >= 0)
+                {
+                    float kz = 0.f;
+                    for (int i = 0; i < 32; ++i) kz += s_kz[i];
+                    int bt = s_bid;
+                    float bg = s_blg;
+                    rs_accept(sr, d, s_in ? expf((s_ld - mx) * sr.inv_temp) / kz : 0.f, bt, bg, s_in ? s_ld : 0.f);
+                    s_bid = bt; s_blg = bg;
+                }
             }
         }
         else if (t == 0 && a.topp_miss) atomicAdd(a.topp_miss, 1u);   // no candidate above the cut: full-vocab sample
         __syncthreads();
+    }
+    if (RS && d >= 0 && t == 0 && !(on && s_keep > 0))
+    {
+        int bt = s_bid;
+        float bg = s_blg;
+        rs_accept(sr, d, expf((s_tl - s_mx) * sr.inv_temp) / s_z, bt, bg, s_tl);
+        s_bid = bt; s_blg = bg;
     }
     if (t == 0)
     {
@@ -944,6 +1081,9 @@ __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a)
         }
     }
 }
+
+__global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a) { head_merge_tp<false>(a, nullptr); }
+__global__ void __launch_bounds__(1024) k_head_merge_tp_rs(HeadArgs a, const int* tok) { head_merge_tp<true>(a, tok); }
 
 // ---------------------------------------------------------------- RoPE (interleaved pairs, FACTS-M0 2(c))
 

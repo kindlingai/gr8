@@ -1,7 +1,8 @@
 #!/bin/bash
-# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl]
+# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs]
 # m4sim: one GPU, six simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
 # dfl: dfltest only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py).
+# rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution (#55).
 set -e
 cd "$(dirname "$0")"
 export PATH=/usr/local/cuda/bin:$PATH
@@ -13,6 +14,11 @@ CPU=""
 OUT=${OUT:-../../bin}
 O=$OUT/obj                 # one object dir per variant (OUT): concurrent flag / NR builds never share objects
 mkdir -p $OUT $O
+if [ "$WHAT" = rs ]; then
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/rstest rstest.cu
+  ls -la $OUT/rstest
+  exit 0
+fi
 nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack.o
 nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
 nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/attn.cu -o $O/attn.o

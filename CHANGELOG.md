@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-05: rejection sampling for drafts (opt-in, `SPEC_ACCEPT=rejection`)
+
+- `--spec-accept rejection` makes verify steps accept drafts by rejection sampling at temperature > 0, for MTP and the
+  DFlash2 drafter. Drafts are greedy. The target keeps a draft d with probability p(d) under the request's temperature
+  and top_p (its own uniform draw, keyed by seed and position), else it samples p without d. The output distribution is
+  still the target's, but a seed no longer gives the same text as without speculation. The default stays `coupled`.
+- New head kernels `k_head_local_rs`, `k_head_merge_rs` and `k_head_merge_tp_rs` (`engine/kernels/glue.cuh`), chosen by
+  `Model::rs`. With the flag off the head runs the same kernels as before. Temperature 0 gives the same bits in both modes.
+  `k_head_local`'s source and PTX are unchanged, but its SASS is not: the shared arrays of `head_local_topp` and
+  `head_local_topk`, which now have two calling kernels, move to module scope, so its shared-memory offsets and schedule
+  differ from before. A SASS diff against an older build shows this function even with the flag off.
+- `engine/runtime/rstest.cu` (build_m4.sh `rs`): the head kernels of all ranks on one GPU, token frequencies against the
+  target distribution by chi-square for both modes.
+
 ## 2026-10-05: DFlash2 block drafter (opt-in, `DFLASH=1`, TP4)
 
 - `--dflash-manifest/--dflash-pack` (`engine/runtime/dflash.cuh`) replace MTP with the DFlash2 drafter of GLM 5.3. It

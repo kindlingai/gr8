@@ -952,12 +952,13 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
     const u64 step0 = main_step;
     std::vector<int> tokens = p.prompt;
     int d[B] = {};
+    const float dtemp = p.rs ? 0.f : p.inv_temp;   // rejection sampling: greedy drafts (they must not use the target's noise)
     auto draft = [&](int rows, int pos0, int bonus, bool query, int s, double& ms) {
         DflIn di;
         memset(&di, 0, sizeof di);
         di.step = ++draft_step;
         di.ctx_rows = rows; di.ctx_pos0 = pos0; di.q0 = pos0 + rows; di.lo = lo; di.tok0 = bonus; di.query = query;
-        for (int r = 0; r < B; ++r) di.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, di.q0 + r, 0, p.top_p};
+        for (int r = 0; r < B; ++r) di.srow[r] = glue::SampleRow{dtemp, p.seed, 0u, di.q0 + r, 0, p.top_p};
         const DflOut o = run_draft(di, s, ms);
         if (query) for (int r = 1; r < B; ++r) d[r] = o.tok[r];
     };

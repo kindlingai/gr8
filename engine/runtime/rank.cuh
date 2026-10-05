@@ -248,6 +248,8 @@ struct Model
     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
+    bool rs = false;                  // --spec-accept rejection (set before capture): the head accepts each row's draft by
+                                      // rejection sampling (the glue.cuh _rs head kernels)
     int ncoll() const { return 2 * nl + 1; }
 #if defined(G6_CP) && G6_CP
     CpState cp;
@@ -879,11 +881,14 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
     const bind::Head& H = head_for(m, M);
     bind::launch(H.xf_h, st);
     bind::launch(H.lm_head, st);
-    glue::k_head_local<<<M, 1024, 0, st>>>(head_args(m, M));
+    if (m.rs) glue::k_head_local_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
+    else glue::k_head_local<<<M, 1024, 0, st>>>(head_args(m, M));
 }
 inline void launch_head_merge(Model& m, int M, cudaStream_t st)
 {
-    if (m.nc > 0) glue::k_head_merge_tp<<<M, 1024, 0, st>>>(head_args(m, M));
+    if (m.rs && m.nc > 0) glue::k_head_merge_tp_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
+    else if (m.rs) glue::k_head_merge_rs<<<1, 32, 0, st>>>(head_args(m, M), m.tok);
+    else if (m.nc > 0) glue::k_head_merge_tp<<<M, 1024, 0, st>>>(head_args(m, M));
     else glue::k_head_merge<<<1, 32, 0, st>>>(head_args(m, M));
     dmark(5, st);
 }
@@ -1096,7 +1101,9 @@ struct Plan
     uint32_t seed = 1234u;
     float top_p = 0.f;                // (0,1) = nucleus sampling (needs Model::nc > 0); else off
     int lp = -1, plp = -1;            // --serve: top-k logprobs of the generated / the prompt tokens (k > 0 = top lists; 0 = only
-};                                    // the token's own logprob; -1 = off). Rows of a step with k > 0 carry SampleRow::topk.
+                                      // the token's own logprob; -1 = off). Rows of a step with k > 0 carry SampleRow::topk.
+    bool rs = false;                  // --spec-accept rejection: drafts are greedy, the target accepts them by rejection sampling
+};
 inline int prompt_steps(const Plan& p) { return ((int)p.prompt.size() - p.first + p.chunk - 1) / p.chunk; }
 inline int total_steps(const Plan& p) { return prompt_steps(p) + p.n_gen; }
 inline int step_rows(const Plan& p, int s)
@@ -1245,7 +1252,9 @@ inline void top_lines(Model& m, int s, int M, int K, std::string& out)
 // every row). Then rounds until n_gen tokens are committed:
 //   verify   one target step over [last committed token, d1..dK] at positions base..base+K
 //   accept   a = the number of leading drafts that equal what the target sampled (exact: sampling is keyed by
-//            position, and the drafts were sampled with the same keys); the a + 1 sampled tokens are committed
+//            position, and the drafts were sampled with the same keys); the a + 1 sampled tokens are committed.
+//            With Plan::rs (--spec-accept rejection) the drafts are greedy and the target's head keeps a draft with
+//            probability p(draft), else samples p without it (glue.cuh k_head_local_rs), so the same compare applies
 //   draft    a first-form pass over the accepted rows 0..a (-> d1), then K - 1 chain steps (-> d2..dK)
 // The rows of rejected drafts, and the chain steps' rows in layer 78, are overwritten by the next round.
 // run_main(si, s, ms) runs a target step, prints its line(s) and returns the rank's StepOut; run_draft(di, chain, s, ms)
@@ -1280,11 +1289,12 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
     const u64 step0 = main_step;
     std::vector<int> tokens = p.prompt;          // committed tokens by position
     std::vector<int> d(K + 1, 0);                // d[j]: draft of position base + j
+    const float dtemp = p.rs ? 0.f : p.inv_temp; // rejection sampling: greedy drafts (they must not use the target's noise)
     auto chain_steps = [&](int base) {           // d[1] is set; fills d[2..K]
         double ms = 0;
         for (int j = 1; j < K; ++j)
         {
-            const StepIn ci = draft_inputs(++draft_step, 1, base - 1 + j, &d[j], p.inv_temp, p.seed, p.top_p);
+            const StepIn ci = draft_inputs(++draft_step, 1, base - 1 + j, &d[j], dtemp, p.seed, p.top_p);
             d[j + 1] = run_draft(ci, true, j, ms);
         }
         return ms;
@@ -1305,7 +1315,7 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
         if (fin) { steps += s + 1; return std::vector<int>(tokens.begin() + n, tokens.end()); }
         int next[MX];
         for (int r = 0; r < si.M; ++r) next[r] = tokens[si.pos[r] + 1];
-        const StepIn di = draft_inputs(++draft_step, si.M, si.pos[0], next, p.inv_temp, p.seed, p.top_p);
+        const StepIn di = draft_inputs(++draft_step, si.M, si.pos[0], next, dtemp, p.seed, p.top_p);
         d[1] = run_draft(di, false, s, ms);
     }
     chain_steps((int)tokens.size() - 1);
@@ -1338,7 +1348,7 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
             const size_t end = std::min(tokens.size(), (size_t)n + p.n_gen);
             return std::vector<int>(tokens.begin() + n, tokens.begin() + end);
         }
-        const StepIn di = draft_inputs(++draft_step, a + 1, base, so.tok, p.inv_temp, p.seed, p.top_p);
+        const StepIn di = draft_inputs(++draft_step, a + 1, base, so.tok, dtemp, p.seed, p.top_p);
         d[1] = run_draft(di, false, s, tf);
         const double tc = chain_steps((int)tokens.size() - 1);
         ++S.rounds; S.tokens += a + 1; ++S.acc[a];

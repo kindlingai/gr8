@@ -18,6 +18,8 @@
 #                     Needs packs/dflash.r<r>.{manifest.json,pack} on every node (tools/convert/dflash2.py, ~0.86 GB
 #                     per rank). DFLASH_SEL=0 drafts the drafter's argmax, 1 (default) the DFlash2 selector walk.
 #                     DFLASH_K=k verifies only the first k of the 7 drafts (verify steps of k + 1 rows)
+#   SPEC_ACCEPT=rejection  accept drafts by rejection sampling at temperature > 0 (issue #55; MTP and DFLASH). Default
+#                     coupled: drafts share the target's noise, so a seed gives the same text with or without speculation
 #   PF_OWN=4          G6_PF_OWN (see below): 4 = pair-owner QO attention (docs/DESIGN-QO-PAIR.md); 1 = no QO attention
 #                     (the first TP4 baseline); 3 = full-head QO, needs the qo pack and more memory than a TP4 rank has
 #   QP_ROLL=2         PF_OWN=4: G6_PF_QP_ROLL, rolling pair slots built from the rank pack + the pair partner over RDMA
@@ -48,6 +50,7 @@ if [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" != 1 ]; then ENGINE_ENV="$ENGINE_ENV G
 [ "$PF_OWN" = 4 ] && ENGINE_ENV="$ENGINE_ENV G6_PF_QP_EARLY=${QP_EARLY:-1}"
 SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2"
 [ "${DFLASH:-0}" = 1 ] || SERVE_ARGS="$SERVE_ARGS --mtp $MTP"
+[ -n "${SPEC_ACCEPT:-}" ] && SERVE_ARGS="$SERVE_ARGS --spec-accept $SPEC_ACCEPT"
 [ "$PF_OWN" = 3 ] && SERVE_ARGS="$SERVE_ARGS --qo-manifest packs/qo.manifest.json --qo-pack packs/qo.pack"
 [ "${NOHASH:-0}" = 1 ] && SERVE_ARGS="$SERVE_ARGS --no-hash"
 
