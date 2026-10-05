@@ -3,3 +3,4 @@ __pycache__/
 /assets/
 /tests/tools/results.jsonl
 /tests/work/
+/g6front-rs/target/

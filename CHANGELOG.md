@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-05: Rust front end, g6front-rs (#15)
+
+- New `frontend/g6front-rs/`: the OpenAI/vLLM front end in Rust (hyper, HF `tokenizers` 0.23.2 as the Python
+  front end uses, minijinja). It takes the same flags and gives byte-identical responses to `g6front`.
+  `frontend/tests/diff_fronts.py` checks 127 cases, then replays the successful ones concurrently. Opt-in with
+  `FRONT=rs` in `launch_tp6.sh`/`launch_tp4.sh` after `scripts/build_front.sh`; Python stays the default until the
+  cluster gates run.
+- In a linux/aarch64 container, against the Python front end: 64 vs 211 MB resident idle and 95 vs 362 MB under 16
+  streams. TTFT added at a 225K-token prompt is 38 vs 316 ms (parallel encode at safe pre-tokenizer cut points). It
+  carries about 3.4x the stream chunks per second at less than half the CPU per chunk. Details in
+  `frontend/README.md`.
+- `mock_engine.py --plain`: no per-request work that grows with the prompt, for front-end benchmarks.
+
 ## 2026-10-05: adaptive draft length (#12); TP4 drafts with DFlash2 by default
 
 - `scripts/launch_tp4.sh` now boots the DFlash2 drafter with an adaptive draft count of 1..7 by default. Against MTP k=2

@@ -2,7 +2,7 @@
 # ONE command: boot the K1H2 engine on six Sparks and serve an OpenAI-compatible API on the head (rank 0).
 #   scripts/launch_tp6.sh            (after scripts/stage.sh; reads config/cluster.env)
 # Starts, in order: g6m4 on every node (ranks 5..0, detached) -> waits for all six serve/ready files ->
-# g6shim.py (engine socket, drives the six ranks through serve/ files) -> g6front on :$PORT.
+# g6shim.py (engine socket, drives the six ranks through serve/ files) -> the front end on :$PORT.
 # Stop with scripts/stop.sh. Logs: $G6_HOME/out/ on each node (engine), $G6_HOME/out/{shim,front}.log on the head.
 #
 # Knobs (environment):
@@ -12,6 +12,8 @@
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   G6ARGS_X="--top 20" extra engine arguments for every rank (--top K prints the per-slice top-K lines for requests with logprobs)
 #   READY_TMO=900     seconds to wait for all six ranks to load
+#   FRONT=py          front end: py = frontend/g6front (Python), rs = g6front-rs (Rust, issue #15; build it with
+#                     scripts/build_front.sh). Same flags, same API; FRONT_BIN=path overrides $REPO/bin/g6front-rs
 #   RANK_HEALTH=0     skip the rank health probe (default: probe every rank first and refuse to boot, exit 3, with a named
 #                     reason per refused rank; see tools/health/README.md). G6_PROGRESS_ISOLATE=0 in G6ENV_X turns off the
 #                     engine's move of other threads off the proxy CPUs.
@@ -70,7 +72,13 @@ PYTHONPATH="$REPO/frontend" nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G
   > "$G6_HOME/out/shim.log" 2>&1 < /dev/null &
 for i in $(seq 1 30); do [ -S "$SOCK" ] && break; sleep 1; done
 [ -S "$SOCK" ] || { echo "shim did not open $SOCK"; tail -20 "$G6_HOME/out/shim.log"; exit 1; }
-(cd "$REPO/frontend" && nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
-  $PIN "$PY" -m g6front --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null &)
+if [ "${FRONT:-py}" = rs ]; then
+  FRONT_CMD="${FRONT_BIN:-$REPO/bin/g6front-rs}"
+  [ -x "$FRONT_CMD" ] || { echo "FRONT=rs: $FRONT_CMD missing (scripts/build_front.sh)"; exit 1; }
+else
+  FRONT_CMD="$PY -m g6front"
+fi
+(cd "$REPO/frontend" && { nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
+  $PIN $FRONT_CMD --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
 for i in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break; sleep 1; done
 echo "front end /health: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")  ->  http://<head>:$PORT/v1"

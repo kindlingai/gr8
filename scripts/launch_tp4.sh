@@ -4,7 +4,7 @@
 #                                     reads config/cluster.env with four HOSTS)
 # The same engine settings as launch_tp6.sh; only the rank count, the KV pool and the library path differ.
 # Starts, in order: g6m4 on every node (ranks 3..0, detached) -> waits for all four serve/ready files ->
-# g6shim.py (engine socket, drives the four ranks through serve/ files) -> g6front on :$PORT.
+# g6shim.py (engine socket, drives the four ranks through serve/ files) -> the front end on :$PORT.
 # Stop with scripts/stop.sh. Logs: $G6_HOME/out/ on each node (engine), $G6_HOME/out/{shim,front}.log on the head.
 # If $G6_HOME/bin/lib exists (build.sh BUNDLE_LIBS=1), the engine finds cuBLAS there.
 #
@@ -35,6 +35,8 @@
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   READY_TMO=900     seconds to wait for all four ranks to load
+#   FRONT=py          front end: py = frontend/g6front (Python), rs = g6front-rs (Rust, issue #15; build it with
+#                     scripts/build_front.sh). Same flags, same API; FRONT_BIN=path overrides $REPO/bin/g6front-rs
 set -eu
 . "$(dirname "$0")/common.sh"
 [ "$NRANK" = 4 ] || { echo "launch_tp4.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
@@ -103,7 +105,13 @@ PYTHONPATH="$REPO/frontend" nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G
   > "$G6_HOME/out/shim.log" 2>&1 < /dev/null &
 for i in $(seq 1 30); do [ -S "$SOCK" ] && break; sleep 1; done
 [ -S "$SOCK" ] || { echo "shim did not open $SOCK"; tail -20 "$G6_HOME/out/shim.log"; exit 1; }
+if [ "${FRONT:-py}" = rs ]; then
+  FRONT_CMD="${FRONT_BIN:-$REPO/bin/g6front-rs}"
+  [ -x "$FRONT_CMD" ] || { echo "FRONT=rs: $FRONT_CMD missing (scripts/build_front.sh)"; exit 1; }
+else
+  FRONT_CMD="$PY -m g6front"
+fi
 (cd "$REPO/frontend" && { nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
-  "$PY" -m g6front --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
+  $FRONT_CMD --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
 for i in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break; sleep 1; done
 echo "front end /health: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")  ->  http://<head>:$PORT/v1"

@@ -1,0 +1,36 @@
+[package]
+name = "g6front-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "OpenAI/vLLM-compatible HTTP front end for the g6 engine (PROTOCOL.md)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "g6front-rs"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+minijinja = { version = "2", features = ["loop_controls", "preserve_order", "json", "serde"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+itoa = "1"
+getrandom = "0.2"
+log = { version = "0.4", features = ["std"] }
+libc = "0.2"
+mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

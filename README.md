@@ -138,7 +138,7 @@ Every engine setting is an environment variable or a flag in `scripts/launch_tp6
 | `engine/loader/` | pack reader and the device image loader |
 | `engine/ref/g6ref.py` | NumPy reference of the record layouts (the converter uses it) |
 | `tools/convert/` | public weights -> per-rank packs (`convert.py`), QO pack (`qopack.py`), checker (`checkpack.py`) |
-| `frontend/` | OpenAI/vLLM-compatible HTTP server (`g6front`) + the shim that drives the six ranks (`g6shim.py`) |
+| `frontend/` | OpenAI/vLLM-compatible HTTP server (`g6front`, and the Rust `g6front-rs`) + the shim that drives the six ranks (`g6shim.py`) |
 | `PROTOCOL.md` | the front end <-> engine socket protocol |
 | `scripts/` | build, pack build, stage, launch, stop |
 | `docs/` | settings, model-specific parts (porting to other models) |

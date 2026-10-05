@@ -58,6 +58,8 @@ class Mock:
     # ---- scripted output ----------------------------------------------------------------------------------------
     def script(self, prompt: list[int]):
         """-> (ids to emit, stop id or None = cycle prose forever)"""
+        if self.a.plain:  # front-end benchmarks: no per-request work proportional to the prompt
+            return self.reasoning_ids + self.think_end, None
         text = self.t.decode(prompt, skip_special_tokens=False)
         last_user = text.rsplit(USER, 1)[-1]
         head = self.reasoning_ids + self.think_end
@@ -110,6 +112,8 @@ class Mock:
 
     # ---- prefix cache -------------------------------------------------------------------------------------------
     def cached(self, prompt):
+        if self.a.plain:
+            return 0
         best = 0
         for p in self.recent:
             n = min(len(p), len(prompt) - 1)
@@ -235,6 +239,8 @@ async def main():
     ap.add_argument('--max-model-len', type=int, default=200000)
     ap.add_argument('--prefill-tps', type=float, default=50000.0, help='simulated prefill tokens/s')
     ap.add_argument('--rounds-per-s', type=float, default=100.0, help='simulated verify rounds/s (0 = no delay)')
+    ap.add_argument('--plain', action='store_true',
+                    help='skip prompt-dependent scripting and the prefix cache (front-end overhead benchmarks)')
     a = ap.parse_args()
     logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     mock = Mock(a)
