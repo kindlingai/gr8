@@ -93,7 +93,7 @@ template <class T> static T* dev(const std::vector<T>& v)
 int main(int argc, char** argv)
 {
     std::string pack_base, dump;
-    int layer = 40, nr = g6nr::NR, M = 5, iters = 0, NP = 32, fuse = 1, wide = 1, hot = 256, nokmix = 0, int4sh = 0, flush = 0, warmsh = 0, split = 0, bs = 0;
+    int layer = 40, nr = g6nr::NR, M = 5, iters = 0, NP = 32, fuse = 1, wide = 1, hot = 256, nokmix = 0, int4sh = 0, flush = 0, warmsh = 0, split = 0;
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i)
     {
@@ -115,7 +115,6 @@ int main(int argc, char** argv)
         else if (a == "--flush") flush = 1;
         else if (a == "--warm") warmsh = 1;
         else if (a == "--split") split = 1;
-        else if (a == "--bs") bs = 1;
         else die("unknown arg " + a);
     }
     if (pack_base.empty() || M < 1 || M > 8 || hot < 8 || hot > 256 || NP < 1) die("usage: see the file header");
@@ -194,27 +193,6 @@ int main(int argc, char** argv)
     bind::Tensor shrec[3];
     if (const char* e = bind::make_k1(T, M, sc, x, sc.xf_x2, pp, out, 0, k, shrec, fuse)) die(e);
     k.a.n_plans = NP;
-#ifndef K1V2_MAIN
-    // --bs (#65 prototype, trellis shared expert layers): the hidden-side vectors as layer signs x per-block scales,
-    // built here from tr3.v1 / tr3.v3 (exact for v2 packs)
-    if (bs && k.sh)
-    {
-        const size_t rows = static_cast<size_t>(T.t[bind::T_TR3_V1].shape[0]);
-        std::vector<__half> v1h(rows * 2 * HID), v3h(rows * HID), sg(2 * HID), b1(rows * 2 * 48), b3(rows * 48);
-        CK(cudaMemcpy(v1h.data(), T.t[bind::T_TR3_V1].p, v1h.size() * 2, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(v3h.data(), T.t[bind::T_TR3_V3].p, v3h.size() * 2, cudaMemcpyDeviceToHost));
-        for (int i = 0; i < HID; ++i)
-        {
-            sg[i] = __float2half(__half2float(v1h[i]) < 0 ? -1.f : 1.f);
-            sg[HID + i] = __float2half(__half2float(v3h[i]) < 0 ? -1.f : 1.f);
-        }
-        for (size_t r = 0; r < rows * 2; ++r)
-            for (int b = 0; b < 48; ++b) b1[r * 48 + b] = __float2half(std::fabs(__half2float(v1h[r * HID + b * 128])));
-        for (size_t r = 0; r < rows; ++r)
-            for (int b = 0; b < 48; ++b) b3[r * 48 + b] = __float2half(std::fabs(__half2float(v3h[r * HID + b * 128])));
-        k.a.t_sg = dev(sg); k.a.t_v1b = dev(b1); k.a.t_v3b = dev(b3);
-    }
-#endif
 
     // bytes per step on this rank
     double tre = 0, side = 0;

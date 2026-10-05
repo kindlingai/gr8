@@ -112,6 +112,10 @@ int main(int argc, char** argv)
 #ifndef K1V2_MAIN
     A.t_kmix = static_cast<const long long*>(T.t[bindp::T_TR3_KMIX].p);
     A.k2 = D.k2;
+    A.bs = T.t[bindp::T_TR3_V1B].p != nullptr;      // block-scale hidden-side vectors (v2 layers with the trellis shared expert)
+    A.t_sg = static_cast<const __half*>(T.t[bindp::T_TR3_SG].p);
+    A.t_v1b = static_cast<const __half*>(T.t[bindp::T_TR3_V1B].p);
+    A.t_v3b = static_cast<const __half*>(T.t[bindp::T_TR3_V3B].p);
 #endif
     A.t_fc1 = static_cast<const uint8_t*>(T.t[bindp::T_TR3_FC1].p); A.t_wide = D.fc1_wide;
     A.t_fc2 = static_cast<const uint8_t*>(T.t[bindp::T_TR3_FC2].p); A.t_wide2 = D.fc2_wide;
@@ -144,10 +148,19 @@ int main(int argc, char** argv)
         bindp::ShX& X = Lf.shx;
         X.on = 1; X.M = M; X.I = I; X.x = x; X.x8g = sc.x8_big; X.x8u = sc.x8_up; X.x8a = sc.x8_small;
         const size_t row = static_cast<size_t>(D.sh_tr[2]);
-        X.suh_g = A.t_v1 + row * 2 * HID; X.suh_u = X.suh_g + HID; X.v2 = A.t_v2 + row * 3 * 128;
+        if (A.bs)
+        {
+            X.suh_g = X.suh_u = A.t_sg; X.sc_g = A.t_v1b + row * 2 * (HID / 128); X.sc_u = X.sc_g + HID / 128;
+            A.sh_svh = A.t_sg + HID; A.sh_sc = A.t_v3b + row * (HID / 128);
+        }
+        else
+        {
+            X.suh_g = A.t_v1 + row * 2 * HID; X.suh_u = X.suh_g + HID;
+            A.sh_svh = A.t_v3 + row * HID;
+        }
+        X.v2 = A.t_v2 + row * 3 * 128;
         X.g = sc.g; X.u = sc.u;
         Lf.up.x8 = sc.x8_up;
-        A.sh_svh = A.t_v3 + row * HID;
     }
 #endif
     auto step = [&]() {

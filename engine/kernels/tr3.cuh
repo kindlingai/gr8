@@ -96,9 +96,9 @@ __device__ __forceinline__ int tr3_unit(const long long* kmix, int e, const long
 // Reads 8 tiles (128 output cols) x its k range; writes partial fp32 sums gpart[..][h*WG+q][m][128].
 // tr: the slot's expert row of t_tab. mw: the first tile of the unit's matrix (block b, gate|up). BITS: its width
 // (tr3_unit); units of blocks the expert does not have exit.
-// The 4 hidden-side values at k of block row `row`: the stored vector, or BS (block-scale form, exlr8 v2 prototype,
-// #65): the layer sign times the row's scale of k's 128-block. v2 vectors are exactly sign x block scale, so both give
-// the same bits.
+// The 4 hidden-side values at k of block row `row`: the stored vector, or BS (block-scale form, exlr8 v2, #65): the
+// layer sign times the row's scale of k's 128-block. v2 vectors are exactly sign x block scale, so both give the same
+// bits.
 template <bool BS>
 __device__ __forceinline__ uint2 tr3_hid4(const __half* vec, const __half* sg, const __half* blk, size_t row, int k)
 {
@@ -438,7 +438,7 @@ template <bool SH = false>
 __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
 {
     constexpr int NW = SH ? 5 : 4;
-    const bool BSF = SH && A.t_v3b;   // block-scale form (prototype, v2 layers only)
+    constexpr bool BSF = SH;          // v2 layers: block-scale hidden-side vectors (tr3.sg, tr3.v3b)
     __shared__ float4 red[NW][32];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int m = blockIdx.x / 48;

@@ -8,9 +8,13 @@ tensors convert.py writes for TR3 / exlr8 v1 layers:
 
   tr3.fc1    [blocks][2][384][8][TB]  gate then up of each owned half; TB = 32 * the width of that (half, matrix)
   tr3.fc2    [blocks][384][8][TB]     down of each owned half, item128 order permuted to g6's [col16][k16]
-  tr3.v1     [blk][2][6144]           gate / up input-side vector of the encode each half came from (signs.in x su_block)
   tr3.v2     [blk][3][128]            gate / up output-side (svh) and down input-side (suh) channels of the half
+  tr3.v1     [blk][2][6144]           gate / up input-side vector of the encode each half came from (signs.in x su_block)
   tr3.v3     [blk][6144]              down output-side vector (signs.out x sv_block, the expert's down width)
+  or, with the trellis shared expert, the same vectors as signs and block scales (the kernels form sign x scale):
+  tr3.sg     [2][6144]                signs.in, signs.out as fp16 +-1
+  tr3.v1b    [blk][2][48]             gate / up su_block of each half's encode
+  tr3.v3b    [blk][48]                down sv_block
   tr3.table  [E][6]                   fc1 offset, fc2 offset, first block row, block count, down width, first half
   tr3.kmix   [E]                      0: every fc1 (block, matrix) has width table[4]. Else 4 bits per (block b,
                                       matrix m) at bit 4 * (2b + m): that unit's width (the kernels then take fc1
@@ -288,9 +292,12 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
     table = {r: np.zeros((E, 6), np.int64) for r in writers}
     kmix = {r: np.zeros(E, np.int64) for r in writers}
     nblk = {r: sum(len(own[r][e]) for e in experts) for r in writers}
-    v1 = {r: np.empty((nblk[r], 2, H), np.float16) for r in writers}
+    bs = SHARED in experts                 # block-scale hidden-side vectors go with the trellis shared expert
+    NB = H // 128
+    v1 = {r: np.empty((nblk[r], 2, NB if bs else H), np.float16) for r in writers}
     v2v = {r: np.empty((nblk[r], 3, 128), np.float16) for r in writers}
-    v3 = {r: np.empty((nblk[r], H), np.float16) for r in writers}
+    v3 = {r: np.empty((nblk[r], NB if bs else H), np.float16) for r in writers}
+    hid = (lambda e, p, k: v2.hidden(e, p, k)[1]) if bs else (lambda e, p, k: v2.hidden(e, p, k)[0])
     fc1_bytes = {r: sum(half_bytes(W[e][0][h]) + half_bytes(W[e][1][h]) for e in experts for h in own[r][e]) for r in writers}
     fc2_bytes = {r: sum(half_bytes(W[e][2]) * len(own[r][e]) for e in experts) for r in writers}
 
@@ -311,8 +318,8 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
             for h in hs:
                 w.write(gu[h][0])
                 w.write(gu[h][1])
-                v1[r][row[r], 0] = v2.hidden(e, 'gate', gw[h])[0]
-                v1[r][row[r], 1] = v2.hidden(e, 'up', uw[h])[0]
+                v1[r][row[r], 0] = hid(e, 'gate', gw[h])
+                v1[r][row[r], 1] = hid(e, 'up', uw[h])
                 v2v[r][row[r], 0] = v2.inter(e, 'gate', gw[h])[h * 128:(h + 1) * 128]
                 v2v[r][row[r], 1] = v2.inter(e, 'up', uw[h])[h * 128:(h + 1) * 128]
                 off[r] += half_bytes(gw[h]) + half_bytes(uw[h])
@@ -329,7 +336,7 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
         dk = W[e][2]
         need = sorted(set().union(*(own[r][e] for r in writers)))
         dn = {h: v2.half(e, 'down', h, dk) for h in need}
-        svd = v2.hidden(e, 'down', dk)[0] if need else None
+        svd = hid(e, 'down', dk) if need else None
         sud = v2.inter(e, 'down', dk) if need else None
         for r, w in writers.items():
             table[r][i][1] = off[r]
@@ -341,9 +348,17 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
                 row[r] += 1
     for r, w in writers.items():
         w.end()
-        w.put(f'{P}.tr3.v1', v1[r], 'f16', layout='[blk][2][6144] suh gate, suh up (encode of the half)', **xf)
+        if bs:
+            sg = np.stack([v2._get('signs.in'), v2._get('signs.out')]).astype(np.float16)
+            w.put(f'{P}.tr3.sg', sg, 'f16', layout='[2][6144] signs.in, signs.out (+-1)', **xf)
+            w.put(f'{P}.tr3.v1b', v1[r], 'f16', layout='[blk][2][48] su_block gate, up (encode of the half)', **xf)
+        else:
+            w.put(f'{P}.tr3.v1', v1[r], 'f16', layout='[blk][2][6144] suh gate, suh up (encode of the half)', **xf)
         w.put(f'{P}.tr3.v2', v2v[r], 'f16', layout='[blk][3][128] svh gate, svh up, suh down (half slice)', **xf)
-        w.put(f'{P}.tr3.v3', v3[r], 'f16', layout='[blk][6144] svh down (expert)', **xf)
+        if bs:
+            w.put(f'{P}.tr3.v3b', v3[r], 'f16', layout='[blk][48] sv_block down (expert)', **xf)
+        else:
+            w.put(f'{P}.tr3.v3', v3[r], 'f16', layout='[blk][6144] svh down (expert)', **xf)
         w.put(f'{P}.tr3.table', table[r], 'i64',
               layout=f'[{E}][6] fc1_byte_off, fc2_byte_off, first_blk_row, n_blocks, bits (down), first half', **xf)
         w.put(f'{P}.tr3.kmix', kmix[r], 'i64', layout=f'[{E}] fc1 width per (block b, matrix m) at bit 8b + 4m; 0 = all bits', **xf)

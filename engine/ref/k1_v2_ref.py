@@ -72,7 +72,8 @@ def expert_partial(T, e, x, e4):
             k = (km >> (4 * (2 * b + mat))) & 15 if km else dk
             w = unpack(T['fc1'][off:off + k * TB1].reshape(384, 8, 32 * k), k, e4)      # [6144][128]
             off += k * TB1
-            suh = T['v1'][r, mat].astype(np.float32)
+            suh = (T['sg'][0].astype(np.float32) * np.repeat(T['v1b'][r, mat].astype(np.float32), 128) if 'v1b' in T
+                   else T['v1'][r, mat].astype(np.float32))
             xr = g6ref.f16(g6ref.had128(x.astype(np.float32) * suh)).astype(np.float32)
             acc = g6ref.f16(xr @ w).astype(np.float32)
             gu.append(g6ref.f16(g6ref.had128(acc) * T['v2'][r, mat].astype(np.float32)).astype(np.float32))
@@ -81,7 +82,9 @@ def expert_partial(T, e, x, e4):
         d = T['fc2'][o2 + b * dk * TB1:o2 + (b + 1) * dk * TB1].reshape(384, 8, 32 * dk).transpose(1, 0, 2)
         wd = unpack(d, dk, e4)                                                              # [128][6144]
         z = g6ref.f16(h2 @ wd).astype(np.float32)
-        y += g6ref.had128(z) * T['v3'][r].astype(np.float32)
+        svd = (T['sg'][1].astype(np.float32) * np.repeat(T['v3b'][r].astype(np.float32), 128) if 'v3b' in T
+               else T['v3'][r].astype(np.float32))
+        y += g6ref.had128(z) * svd
     return y
 
 

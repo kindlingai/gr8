@@ -70,7 +70,8 @@ __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int
 }
 
 // E4 = the layer's routed experts are exlr8-e4m3 (codebook rounded to E4M3, tr3.cuh tr3_cb2); K2 = it has 2-bit units;
-// SH = its shared expert is trellis row 256, run as one more slot (exlr8 v2, #65). The binder picks the instantiation
+// SH = its shared expert is trellis row 256, run as one more slot, and its hidden-side vectors are in block-scale form
+// (tr3.sg, tr3.v1b, tr3.v3b; exlr8 v2, #65). The binder picks the instantiation
 // per layer (bind::make_k1); E4 = K2 = SH = false is the TR3 kernel.
 template <bool E4 = false, bool K2 = false, bool SH = false>
 __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
@@ -82,7 +83,7 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
     {
         int e, mask, ss;
         const int slot = blockIdx.x / ups;
-        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) { if (SH && A.t_v1b) tr3_fc1_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem); else tr3_fc1_any<E4, K2>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem); }
+        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem);
     }
     else if (!SH) k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
@@ -158,7 +159,7 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
         {
             const int slot = item / u1, b = (item / (A.KS1 * 2)) % A.B;
             int e, mask, ss = slot;
-            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) { if (SH && A.t_v1b) tr3_fc1_any<E4, K2, SH>(A, plan, item + (ss - slot) * u1, e, mask, smem); else tr3_fc1_any<E4, K2>(A, plan, item + (ss - slot) * u1, e, mask, smem); }
+            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, item + (ss - slot) * u1, e, mask, smem);
             __threadfence();
             __syncthreads();
             if (t == 0) atomicAdd(done + ss * A.B + b, 1);
@@ -214,7 +215,7 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
 }
 
 // The same with the trellis shared expert. Under __launch_bounds__(512) alone nvcc gives the no-K2 instantiation 64
-// registers and spills (104 B stores, 132 B loads; the others get 101-128 and no spills), so this entry sets the cap.
+// registers and spills (104 B stores, 132 B loads). The others get 101-128 and no spills. This entry sets the cap.
 template <bool E4 = true, bool K2 = false>
 __global__ __maxnreg__(128) void k1_tr3_fused_sh(K1Args A)
 {

@@ -74,13 +74,16 @@ enum
     T_TR3_FC1, T_TR3_FC2, T_TR3_V1, T_TR3_V2, T_TR3_V3, T_TR3_TAB,
     T_Q_A_MX, T_O_PROJ_MX, T_S_GATE_MX, T_S_UP_MX, T_S_DOWN_MX,         // MXFP8 twins, read only when the int4 record is absent
     T_TR3_KMIX,                                                         // exlr8 v2 packs only (#65): fc1 width per (block, matrix)
+    T_TR3_SG, T_TR3_V1B, T_TR3_V3B,                                     // exlr8 v2 layers with the trellis shared expert: hidden-
+                                                                        // side vectors as signs + block scales (no tr3.v1 / v3)
     NT
 };
 static const char* const NAMES[NT] = {
     "q_a.gptq", "kv_a.mx.gv", "q_b.mx.gv", "o_proj.gptq", "idx.wq_b.mx.gv", "idx.wk.gv", "idx.weights_proj.gv", "router.w.gv",
     "shared.gptq.fc1", "shared.gptq.fc2", "dense.gptq.fc1", "dense.gptq.fc2",
     "tr3.fc1", "tr3.fc2", "tr3.v1", "tr3.v2", "tr3.v3", "tr3.table",
-    "q_a.mx.gv", "o_proj.mx.gv", "shared.gate.mx.gv", "shared.up.mx.gv", "shared.down.mx.gv", "tr3.kmix"};
+    "q_a.mx.gv", "o_proj.mx.gv", "shared.gate.mx.gv", "shared.up.mx.gv", "shared.down.mx.gv", "tr3.kmix", "tr3.sg", "tr3.v1b",
+    "tr3.v3b"};
 
 struct LayerTensors
 {
@@ -289,6 +292,7 @@ __global__ void __launch_bounds__(256) k_shared_signs(const uint16_t* v1, const 
 // the hidden-side signs (a mislabelled or edited pack). Synchronizes the stream.
 inline const char* check_shared_signs(const LayerTensors& T, cudaStream_t st)
 {
+    // (a block-scale layer has no tr3.v1 / v3: its signs are one vector, tr3.sg, by construction)
     const Tensor &v1 = T.t[T_TR3_V1], &v3 = T.t[T_TR3_V3];
     if (!T.e4m3 || !v1.p || !v3.p || v1.shape[0] < 2) return nullptr;
     unsigned *d = nullptr, *h = nullptr;
@@ -662,12 +666,20 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     if (moe)
     {
         const Tensor &tab = T.t[T_TR3_TAB], &v1 = T.t[T_TR3_V1], &v2 = T.t[T_TR3_V2], &v3 = T.t[T_TR3_V3];
-        if (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p || !v1.p || !v2.p || !v3.p) return "MoE layer without tr3.fc1/fc2/v1/v2/v3";
-        if (tab.nd != 2 || tab.shape[1] != 6 || v1.nd != 3 || v1.shape[1] != 2 || v1.shape[2] != HID || v2.nd != 3 || v2.shape[1] != 3 ||
-            v2.shape[2] != 128 || v3.nd != 2 || v3.shape[1] != HID || v2.shape[0] != v1.shape[0] || v3.shape[0] != v1.shape[0])
-            return "tr3 table / v1 / v2 / v3 shapes do not match the pack layout";
+        const Tensor &sg = T.t[T_TR3_SG], &v1b = T.t[T_TR3_V1B], &v3b = T.t[T_TR3_V3B];
+        const bool bsf = v1b.p != nullptr;           // block-scale hidden-side vectors (exlr8 v2 with the trellis shared expert)
+        if (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p || !v2.p || (bsf ? !sg.p || !v3b.p : !v1.p || !v3.p))
+            return "MoE layer without tr3.fc1/fc2/v2 and v1/v3 (or sg/v1b/v3b)";
+        const long long rows = v2.shape[0];
+        if (tab.nd != 2 || tab.shape[1] != 6 || v2.nd != 3 || v2.shape[1] != 3 || v2.shape[2] != 128 ||
+            (bsf ? sg.nd != 2 || sg.shape[0] != 2 || sg.shape[1] != HID || v1b.nd != 3 || v1b.shape[0] != rows || v1b.shape[1] != 2 ||
+                       v1b.shape[2] != HID / 128 || v3b.nd != 2 || v3b.shape[0] != rows || v3b.shape[1] != HID / 128
+                 : v1.nd != 3 || v1.shape[1] != 2 || v1.shape[2] != HID || v3.nd != 2 || v3.shape[1] != HID || v1.shape[0] != rows ||
+                       v3.shape[0] != rows))
+            return "tr3 table / v1 / v2 / v3 (or sg / v1b / v3b) shapes do not match the pack layout";
         for (int i = T_TR3_FC1; i <= T_TR3_V3; ++i)
-            if (T.t[i].fmt != tab.fmt) return "tr3.* tensors of one layer carry different expert formats";
+            if (T.t[i].p && T.t[i].fmt != tab.fmt) return "tr3.* tensors of one layer carry different expert formats";
+        if (bsf != sh) return "block-scale hidden-side vectors (tr3.sg / v1b / v3b) go with the trellis shared expert, and only with it";
         const Tensor& km = T.t[T_TR3_KMIX];
         if (km.p && (km.nd != 1 || km.shape[0] != tab.shape[0])) return "tr3.kmix is not one entry per tr3.table row";
         k.e4 = T.e4m3;
@@ -684,6 +696,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         a.tok_slot = plan.tok_slot; a.tok_w = plan.tok_w;
         a.t_tab = static_cast<const long long*>(tab.p);
         a.t_kmix = static_cast<const long long*>(km.p);
+        a.t_sg = static_cast<const __half*>(sg.p); a.t_v1b = static_cast<const __half*>(v1b.p); a.t_v3b = static_cast<const __half*>(v3b.p);
         a.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); a.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p);
         a.t_wide = T.fc1_wide; a.t_wide2 = T.fc2_wide;
         a.t_v1 = static_cast<const __half*>(v1.p); a.t_v2 = static_cast<const __half*>(v2.p); a.t_v3 = static_cast<const __half*>(v3.p);

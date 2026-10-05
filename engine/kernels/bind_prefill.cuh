@@ -55,13 +55,14 @@ enum
     T_Q_A, T_KV_A, T_Q_B, T_O_PROJ, T_IDX_WQ_B, T_S_GATE, T_S_UP, T_S_DOWN, T_D_GATE, T_D_UP, T_D_DOWN, NMX,    // .mx.codes + .mx.scales
     T_IDX_WK = NMX, T_IDX_WPROJ, T_ROUTER, T_ROUTER_BIAS, T_TR3_FC1, T_TR3_FC2, T_TR3_V1, T_TR3_V2, T_TR3_V3, T_TR3_TAB,
     T_TR3_KMIX,                       // exlr8 v2 packs only (#65)
+    T_TR3_SG, T_TR3_V1B, T_TR3_V3B,   // v2 layers with the trellis shared expert: hidden-side signs + block scales
     NT
 };
 static const char* const NAMES[NT] = {
     "q_a.mx", "kv_a.mx", "q_b.mx", "o_proj.mx", "idx.wq_b.mx", "shared.gate.mx", "shared.up.mx", "shared.down.mx",
     "dense.gate.mx", "dense.up.mx", "dense.down.mx",
     "idx.wk", "idx.weights_proj", "router.w", "router.bias", "tr3.fc1", "tr3.fc2", "tr3.v1", "tr3.v2", "tr3.v3", "tr3.table",
-    "tr3.kmix"};
+    "tr3.kmix", "tr3.sg", "tr3.v1b", "tr3.v3b"};
 
 struct Tensors
 {
@@ -1236,6 +1237,7 @@ struct Expert
     int nroutes = 0;                  // routes of the pass: 0 = M * TOPK; the trellis shared pass (#65) has M (one per row)
     const __half* sh_svh = nullptr;   // set: ysh holds the trellis shared expert's down output before its output rotation;
                                       // k_pf_fin adds f16(H128(ysh) x sh_svh) (bindp::ShX, #65)
+    const __half* sh_sc = nullptr;    // block-scale form: sh_svh holds the output signs and these the 48 scales
     // routing
     const float* logits = nullptr;    // [M][256] fp32
     const float* bias = nullptr;      // [256] fp32 (router.bias)
@@ -1255,6 +1257,8 @@ struct Expert
     const long long* t_kmix = nullptr;    // tr3.kmix (exlr8 v2 packs): fc1 width per (block, matrix); nullptr = all at bits
     const uint8_t* t_fc1 = nullptr;
     int k2 = 0;                       // the layer has 2-bit units: the K2 instantiations of fc1 / fc2 (#65)
+    int bs = 0;                       // hidden-side vectors as signs x block scales (t_sg, t_v1b, t_v3b): the BS instantiations
+    const __half *t_sg = nullptr, *t_v1b = nullptr, *t_v3b = nullptr;   // [2][6144] signs (in, out), [blk][2][48], [blk][48]
     int t_wide = 0;                   // K3 experts of t_fc1 are in the wide order
     const uint8_t* t_fc2 = nullptr;
     int t_wide2 = 0;                  // K3 experts of t_fc2 are in the wide order
@@ -1594,7 +1598,7 @@ __device__ unsigned g_pf_done;
 // would, so z1 is byte-equal. sW: TR3W_GROUP bytes per group.
 // mw = the first tile of the unit's matrix (tr3_unit) when NBL == 1; NBL > 1 computes it from the table width (one
 // width per expert: k_pf_fc1h refuses tr3.kmix experts).
-template <int BITS, int G, int EB, int NBL = 1>
+template <int BITS, int G, int EB, int NBL = 1, bool BS = false>
 __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, int b, int mat, int r0, int rows, unsigned char* sA,
                                          unsigned char* sX, unsigned char* sW, const int* sRow PF_PRO_ARG, const uint8_t* mw, int nbg = 1)
 {
@@ -1689,13 +1693,19 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
         {
             const int R = (pg << rsh) + pr;
             const unsigned char* xs = sX + (hg & 1) * FC1_XS + R * 256;
-            const __half* sp = suh + (hg * G + pg) * 128 + q * 32;
+            const __half* sp = (BS ? A.t_sg : suh) + (hg * G + pg) * 128 + q * 32;
+            const __half2 scl = BS ? __half2half2(A.t_v1b[(brow * 2 + mat) * (HID / 128) + hg * G + pg]) : __half2half2(__float2half(1.f));
             float v[32];
             #pragma unroll
             for (int j = 0; j < 4; ++j)
             {
                 const uint4 xr = pact ? *reinterpret_cast<const uint4*>(xs + swz16(q * 4 + j, R) * 16) : make_uint4(0u, 0u, 0u, 0u);
-                const uint4 sr = *reinterpret_cast<const uint4*>(sp + j * 8);
+                uint4 sr = *reinterpret_cast<const uint4*>(sp + j * 8);
+                if (BS)       // sign x block scale: the same fp16 values as the stored vector (#65)
+                {
+                    sr.x = as_u32(__hmul2(as_h2(sr.x), scl)); sr.y = as_u32(__hmul2(as_h2(sr.y), scl));
+                    sr.z = as_u32(__hmul2(as_h2(sr.z), scl)); sr.w = as_u32(__hmul2(as_h2(sr.w), scl));
+                }
                 const u32 xw[4] = {xr.x, xr.y, xr.z, xr.w}, sw[4] = {sr.x, sr.y, sr.z, sr.w};
                 #pragma unroll
                 for (int e = 0; e < 4; ++e)
@@ -1805,7 +1815,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
 
 // grid (2 EB = block * 2 + matrix, maxseg), block 256. EB = blocks per expert the scratch and grid are laid out for
 // (g6nr::EB: 3 = the TP6 packs, 4 = TP4; every expert of the table must have tr[3] <= EB).
-template <int EB = g6nr::EB, bool K2 = false>
+template <int EB = g6nr::EB, bool K2 = false, bool BS = false>
 __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[4 * MB * REC];
@@ -1865,15 +1875,15 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
     const uint8_t* mw = A.t_fc1 + off;
     if (rows <= 32)                       // G = 2: two 128-k blocks per group
     {
-        if (k == 3) fc1_body<3, 2, EB>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else if (!K2 || k == 4) fc1_body<4, 2, EB>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else fc1_body<K2 ? 2 : 4, 2, EB>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        if (k == 3) fc1_body<3, 2, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else if (!K2 || k == 4) fc1_body<4, 2, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else fc1_body<K2 ? 2 : 4, 2, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
     }
     else
     {
-        if (k == 3) fc1_body<3, 1, EB>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else if (!K2 || k == 4) fc1_body<4, 1, EB>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else fc1_body<K2 ? 2 : 4, 1, EB>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        if (k == 3) fc1_body<3, 1, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else if (!K2 || k == 4) fc1_body<4, 1, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else fc1_body<K2 ? 2 : 4, 1, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
     }
 #ifdef PF_CLK
     pf_clk_end(true);
@@ -1968,7 +1978,7 @@ __global__ void __launch_bounds__(256) k_pf_mid(Expert A)
 // epilogue. In the epilogue warp w takes rows 4w..4w+3 (and 4w+32.. when rows > 32), a lane one row's 16 columns of one
 // eighth (had128_l16), so all 8 warps rotate when rows >= 29; sZ rows are chunk-swizzled (swz16) so the tile writes and
 // the row reads are bank-conflict free. Two barriers per block.
-template <int BITS, int EB>
+template <int BITS, int EB, bool BS = false>
 __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, int seg, int r0, int rows, unsigned char* sA, __half* sZ,
                                          unsigned char* sV)
 {
@@ -1999,7 +2009,7 @@ __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, i
             const int mb = ch / (4 * 33), rem = ch % (4 * 33);
             pf::cp16(sA + (b & 1) * SA + ch * 16, A.x2 + ((static_cast<size_t>(seg) * MB + mb) * EB + b) * 4 * REC + rem * 16);
         }
-        if (t < 16) pf::cp16(sV + (b & 1) * 256 + t * 16, A.t_v3 + (static_cast<size_t>(tr[2]) + b) * HID + G * 128 + t * 8);
+        if (t < 16) pf::cp16(sV + (b & 1) * 256 + t * 16, BS ? A.t_sg + HID + G * 128 + t * 8 : A.t_v3 + (static_cast<size_t>(tr[2]) + b) * HID + G * 128 + t * 8);
         pf::cp_commit();
     };
     stage(0);
@@ -2072,6 +2082,7 @@ __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, i
             }
         __syncthreads();
         const __half* svp = reinterpret_cast<const __half*>(sV + (b & 1) * 256) + q * 16;
+        const float scl = BS ? __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]) : 1.f;   // BS: sV holds signs
         float sv[16];
         #pragma unroll
         for (int j = 0; j < 2; ++j)
@@ -2082,7 +2093,8 @@ __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, i
             for (int e = 0; e < 4; ++e)
             {
                 const float2 s2 = __half22float2(as_h2(sw[e]));
-                sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y;
+                if (BS) { sv[j * 8 + e * 2] = s2.x * scl; sv[j * 8 + e * 2 + 1] = s2.y * scl; }
+                else { sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y; }
             }
         }
         #pragma unroll
@@ -2134,7 +2146,7 @@ __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, i
 }
 
 // grid (48, maxseg), block 256
-template <int EB = g6nr::EB, bool K2 = false>
+template <int EB = g6nr::EB, bool K2 = false, bool BS = false>
 __global__ void __launch_bounds__(256, 2) k_pf_fc2(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[2 * MB * 4 * REC];
@@ -2144,9 +2156,9 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2(Expert A)
     if (seg >= *A.n_seg) return;
     const int* sg = A.segs + static_cast<size_t>(seg) * 3;
     const long long* tr = A.t_tab + static_cast<size_t>(sg[0]) * 6;
-    if (tr[4] == 3) fc2_body<3, EB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
-    else if (!K2 || tr[4] == 4) fc2_body<4, EB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
-    else fc2_body<K2 ? 2 : 4, EB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    if (tr[4] == 3) fc2_body<3, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    else if (!K2 || tr[4] == 4) fc2_body<4, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    else fc2_body<K2 ? 2 : 4, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
 }
 
 #ifdef PF_FC2GL
@@ -2157,7 +2169,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2(Expert A)
 // of fc2_body (byte-equal yw). Measurement build; the default build does not compile this.
 constexpr int FC2GL = PF_FC2GL;
 static_assert(HID / 128 % FC2GL == 0, "PF_FC2GL must divide 48");
-template <int BITS, int EB>
+template <int BITS, int EB, bool BS = false>
 __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr, int seg, int r0, int rows, unsigned char* sA, __half* sZ,
                                             unsigned char* sV)
 {
@@ -2187,7 +2199,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
             const int mb = ch / (4 * 33), rem = ch % (4 * 33);
             pf::cp16(sA + (it & 1) * SA + ch * 16, A.x2 + ((static_cast<size_t>(seg) * MB + mb) * EB + b) * 4 * REC + rem * 16);
         }
-        if (t < 16) pf::cp16(sV + (it & 1) * 256 + t * 16, A.t_v3 + (static_cast<size_t>(tr[2]) + b) * HID + G * 128 + t * 8);
+        if (t < 16) pf::cp16(sV + (it & 1) * 256 + t * 16, BS ? A.t_sg + HID + G * 128 + t * 8 : A.t_v3 + (static_cast<size_t>(tr[2]) + b) * HID + G * 128 + t * 8);
         pf::cp_commit();
     };
     stage(0, G0, 0);
@@ -2262,6 +2274,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
             }
         __syncthreads();
         const __half* svp = reinterpret_cast<const __half*>(sV + (it & 1) * 256) + q * 16;
+        const float scl = BS ? __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]) : 1.f;   // BS: sV holds signs
         float sv[16];
         #pragma unroll
         for (int j = 0; j < 2; ++j)
@@ -2272,7 +2285,8 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
             for (int e = 0; e < 4; ++e)
             {
                 const float2 s2 = __half22float2(as_h2(sw[e]));
-                sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y;
+                if (BS) { sv[j * 8 + e * 2] = s2.x * scl; sv[j * 8 + e * 2 + 1] = s2.y * scl; }
+                else { sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y; }
             }
         }
         #pragma unroll
@@ -2330,7 +2344,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
 }
 
 // grid (48 / GL, maxseg), block 256
-template <int EB = g6nr::EB, bool K2 = false>
+template <int EB = g6nr::EB, bool K2 = false, bool BS = false>
 __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[2 * MB * 4 * REC];
@@ -2340,9 +2354,9 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
     if (seg >= *A.n_seg) return;
     const int* sg = A.segs + static_cast<size_t>(seg) * 3;
     const long long* tr = A.t_tab + static_cast<size_t>(sg[0]) * 6;
-    if (tr[4] == 3) fc2_body_gl<3, EB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
-    else if (!K2 || tr[4] == 4) fc2_body_gl<4, EB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
-    else fc2_body_gl<K2 ? 2 : 4, EB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    if (tr[4] == 3) fc2_body_gl<3, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    else if (!K2 || tr[4] == 4) fc2_body_gl<4, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    else fc2_body_gl<K2 ? 2 : 4, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
 }
 #endif
 
@@ -2379,6 +2393,12 @@ template <bool RS = false, bool SHX = false> __global__ void __launch_bounds__(2
                 const float2 f = __half22float2(as_h2(qw[j])), g = __half22float2(as_h2(sw[j]));
                 v[2 * j] = f.x; v[2 * j + 1] = f.y; sv[2 * j] = g.x; sv[2 * j + 1] = g.y;
             }
+            if (A.sh_sc)              // sh_svh = the output signs: times the block's scale
+            {
+                const float c = __half2float(A.sh_sc[(i * 8) / 128]);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) sv[j] *= c;
+            }
             had128_l8(v, threadIdx.x & 31);            // 16 lanes x 8 columns = one 128-block (i = threadIdx.x + 256 n)
             #pragma unroll
             for (int j = 0; j < 8; ++j) a[j] += rnd_h(v[j] * sv[j]);
@@ -2410,8 +2430,10 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
 template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
-    if (A.k2) k_pf_fc1<EB, true><<<dim3(2 * EB, A.maxseg), 256, 0, st>>>(A);
-    else k_pf_fc1<EB><<<dim3(2 * EB, A.maxseg), 256, 0, st>>>(A);
+    const dim3 g(2 * EB, A.maxseg);
+    if (A.bs) { if (A.k2) k_pf_fc1<EB, true, true><<<g, 256, 0, st>>>(A); else k_pf_fc1<EB, false, true><<<g, 256, 0, st>>>(A); }
+    else if (A.k2) k_pf_fc1<EB, true><<<g, 256, 0, st>>>(A);
+    else k_pf_fc1<EB><<<g, 256, 0, st>>>(A);
 }
 #endif
 template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_t st)
@@ -2422,15 +2444,19 @@ template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_
 template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
-    if (A.k2) k_pf_fc2g<EB, true><<<dim3(HID / 128 / FC2GL, A.maxseg), 256, 0, st>>>(A);
-    else k_pf_fc2g<EB><<<dim3(HID / 128 / FC2GL, A.maxseg), 256, 0, st>>>(A);
+    const dim3 g(HID / 128 / FC2GL, A.maxseg);
+    if (A.bs) { if (A.k2) k_pf_fc2g<EB, true, true><<<g, 256, 0, st>>>(A); else k_pf_fc2g<EB, false, true><<<g, 256, 0, st>>>(A); }
+    else if (A.k2) k_pf_fc2g<EB, true><<<g, 256, 0, st>>>(A);
+    else k_pf_fc2g<EB><<<g, 256, 0, st>>>(A);
 }
 #else
 template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
-    if (A.k2) k_pf_fc2<EB, true><<<dim3(HID / 128, A.maxseg), 256, 0, st>>>(A);
-    else k_pf_fc2<EB><<<dim3(HID / 128, A.maxseg), 256, 0, st>>>(A);
+    const dim3 g(HID / 128, A.maxseg);
+    if (A.bs) { if (A.k2) k_pf_fc2<EB, true, true><<<g, 256, 0, st>>>(A); else k_pf_fc2<EB, false, true><<<g, 256, 0, st>>>(A); }
+    else if (A.k2) k_pf_fc2<EB, true><<<g, 256, 0, st>>>(A);
+    else k_pf_fc2<EB><<<g, 256, 0, st>>>(A);
 }
 #endif
 inline void launch_fin(const Expert& A, cudaStream_t st)
@@ -2455,7 +2481,8 @@ struct ShX
     const __half* x = nullptr;        // [M][6144] mlp_norm output
     uint8_t *x8g = nullptr, *x8u = nullptr;   // MXFP8 records of the rotated gate and up inputs (gate's: the GEMMs' x8_big)
     uint8_t* x8a = nullptr;           // MXFP8 records of the down input (x8_small)
-    const __half *suh_g = nullptr, *suh_u = nullptr;    // [6144] input-side vectors (block row 0 of row 256)
+    const __half *suh_g = nullptr, *suh_u = nullptr;    // [6144] input-side vectors (block row 0 of row 256), or with sc_g:
+    const __half *sc_g = nullptr, *sc_u = nullptr;      // the signs (suh_g = suh_u) and the 48 block scales of gate and up
     const __half* v2 = nullptr;       // [I / 128][3][128] svh gate, svh up, suh down of row 256's blocks
     const __half *g = nullptr, *u = nullptr;            // gate, up GEMM outputs [M][I]
 };
@@ -2498,7 +2525,12 @@ __global__ void __launch_bounds__(256) k_shx_rotq(ShX a)
     #pragma unroll
     for (int j = 0; j < 2; ++j)
     {
-        const uint2 sr = *reinterpret_cast<const uint2*>((j ? a.suh_u : a.suh_g) + k0);
+        uint2 sr = *reinterpret_cast<const uint2*>((j ? a.suh_u : a.suh_g) + k0);
+        if (a.sc_g)                   // signs x block scale: the stored vector's fp16 values
+        {
+            const __half2 c = __half2half2((j ? a.sc_u : a.sc_g)[blk]);
+            sr.x = as_u32(__hmul2(as_h2(sr.x), c)); sr.y = as_u32(__hmul2(as_h2(sr.y), c));
+        }
         const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
         float v[4] = {__fmul_rn(x[0], s01.x), __fmul_rn(x[1], s01.y), __fmul_rn(x[2], s23.x), __fmul_rn(x[3], s23.y)};
         had128(v, lane);
@@ -2740,17 +2772,25 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if (L.moe)
     {
         const Tensor &tab = T.t[T_TR3_TAB], &v1 = T.t[T_TR3_V1], &v2 = T.t[T_TR3_V2], &v3 = T.t[T_TR3_V3], &bias = T.t[T_ROUTER_BIAS];
-        if (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p || !v1.p || !v2.p || !v3.p || !bias.p) return "MoE layer without tr3.fc1/fc2/v1/v2/v3 or router.bias";
+        const Tensor &sgn = T.t[T_TR3_SG], &v1b = T.t[T_TR3_V1B], &v3b = T.t[T_TR3_V3B];
+        const bool bsf = v1b.p != nullptr;           // block-scale hidden-side vectors (exlr8 v2, with the trellis shared expert)
+        if (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p || !v2.p || !bias.p || (bsf ? !sgn.p || !v3b.p : !v1.p || !v3.p))
+            return "MoE layer without tr3.fc1/fc2/v2, v1/v3 (or sg/v1b/v3b) or router.bias";
+        if (bsf != (T.sh_trellis != 0)) return "block-scale hidden-side vectors go with the trellis shared expert, and only with it";
+        const long long nrow = v2.shape[0];
         const Tensor& km = T.t[T_TR3_KMIX];
         if (km.p && (km.nd != 1 || km.shape[0] != tab.shape[0])) return "tr3.kmix is not one entry per tr3.table row";
 #ifdef PF_HOIST
-        if (km.p || T.k2) return "PF_HOIST (k_pf_fc1h) takes one K3 / K4 width per expert: no tr3.kmix or 2-bit layers";
+        if (km.p || T.k2 || T.t[T_TR3_V1B].p) return "PF_HOIST (k_pf_fc1h) takes TR3 / v1 layers only (no tr3.kmix, 2-bit or block-scale layers)";
 #endif
         // 257 rows: an exlr8 v2 pack with the shared expert as trellis row 256 (#65)
-        if (tab.nd != 2 || (tab.shape[0] != NEXP && tab.shape[0] != NEXP + 1) || tab.shape[1] != 6 || v1.nd != 3 || v1.shape[1] != 2 || v1.shape[2] != HID || v2.nd != 3 ||
-            v2.shape[1] != 3 || v2.shape[2] != 128 || v3.nd != 2 || v3.shape[1] != HID || v2.shape[0] != v1.shape[0] || v3.shape[0] != v1.shape[0] ||
-            bias.shape[0] != NEXP)
-            return "tr3 table / v1 / v2 / v3 / router.bias shapes do not match the pack layout";
+        if (tab.nd != 2 || (tab.shape[0] != NEXP && tab.shape[0] != NEXP + 1) || tab.shape[1] != 6 || v2.nd != 3 || v2.shape[1] != 3 ||
+            v2.shape[2] != 128 || bias.shape[0] != NEXP ||
+            (bsf ? sgn.nd != 2 || sgn.shape[0] != 2 || sgn.shape[1] != HID || v1b.nd != 3 || v1b.shape[0] != nrow || v1b.shape[1] != 2 ||
+                       v1b.shape[2] != HID / 128 || v3b.nd != 2 || v3b.shape[0] != nrow || v3b.shape[1] != HID / 128
+                 : v1.nd != 3 || v1.shape[1] != 2 || v1.shape[2] != HID || v3.nd != 2 || v3.shape[1] != HID || v1.shape[0] != nrow ||
+                       v3.shape[0] != nrow))
+            return "tr3 table / v1 / v2 / v3 (or sg / v1b / v3b) / router.bias shapes do not match the pack layout";
         Expert& A = L.ex;
         A.on = 1; A.M = M; A.maxseg = max_segments(M);
         A.logits = io.logits; A.bias = static_cast<const float*>(bias.p);
@@ -2761,6 +2801,8 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.k2 = T.k2;
         A.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); A.t_wide = T.fc1_wide; A.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p); A.t_wide2 = T.fc2_wide;
         A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
+        A.bs = bsf;
+        A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);
         A.x = io.x2; A.ldx = HID;
         A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.ysh = sc.ysh; A.out = io.mlp_part;
         if (T.sh_trellis && T.sh_fp8)
@@ -2771,10 +2813,19 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             X.on = 1; X.M = M; X.I = L.inter;
             X.x = io.x2; X.x8g = sc.x8_big; X.x8u = sc.x8_up; X.x8a = sc.x8_small;
             const size_t row = static_cast<size_t>(T.sh_tr[2]);
-            X.suh_g = A.t_v1 + row * 2 * HID; X.suh_u = X.suh_g + HID; X.v2 = A.t_v2 + row * 3 * 128;
+            if (bsf)
+            {
+                X.suh_g = X.suh_u = A.t_sg; X.sc_g = A.t_v1b + row * 2 * (HID / 128); X.sc_u = X.sc_g + HID / 128;
+                A.sh_svh = A.t_sg + HID; A.sh_sc = A.t_v3b + row * (HID / 128);
+            }
+            else
+            {
+                X.suh_g = A.t_v1 + row * 2 * HID; X.suh_u = X.suh_g + HID;
+                A.sh_svh = A.t_v3 + row * HID;    // k_pf_fin: ysh = f16(H128(down output) x svh_down)
+            }
+            X.v2 = A.t_v2 + row * 3 * 128;
             X.g = sc.g; X.u = sc.u;
             L.up.x8 = sc.x8_up;
-            A.sh_svh = A.t_v3 + row * HID;    // k_pf_fin: ysh = f16(H128(down output) x svh_down)
             L.xq_x2.on = 0; L.act.on = 0; L.xq_act.on = 0;
         }
         else if (T.sh_trellis)

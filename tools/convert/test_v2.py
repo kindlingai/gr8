@@ -141,12 +141,21 @@ class V2(unittest.TestCase):
                     self.assertTrue(np.array_equal(u, lay.half(e, 'up', h, uw[h])))
                     d = fc2[o2 + b * v2.half_bytes(dk):o2 + (b + 1) * v2.half_bytes(dk)]
                     self.assertTrue(np.array_equal(v2.down_from_g6(d.reshape(384, 8, -1), dk), lay.half(e, 'down', h, dk)))
-                    self.assertTrue(np.array_equal(p['tr3.v1'][row + b, 0], lay.hidden(e, 'gate', gw[h])[0]))
-                    self.assertTrue(np.array_equal(p['tr3.v1'][row + b, 1], lay.hidden(e, 'up', uw[h])[0]))
+                    if 'tr3.v1b' in p:     # block-scale form: sign x scale must give the full vector exactly
+                        for mat, (pp, w_) in enumerate((('gate', gw[h]), ('up', uw[h]))):
+                            full = (p['tr3.sg'][0].astype(np.float32) * np.repeat(p['tr3.v1b'][row + b, mat].astype(np.float32), 128))
+                            self.assertTrue(np.array_equal(full.astype(np.float16), lay.hidden(e, pp, w_)[0]))
+                    else:
+                        self.assertTrue(np.array_equal(p['tr3.v1'][row + b, 0], lay.hidden(e, 'gate', gw[h])[0]))
+                        self.assertTrue(np.array_equal(p['tr3.v1'][row + b, 1], lay.hidden(e, 'up', uw[h])[0]))
                     self.assertTrue(np.array_equal(p['tr3.v2'][row + b, 0], lay.inter(e, 'gate', gw[h])[h * 128:h * 128 + 128]))
                     self.assertTrue(np.array_equal(p['tr3.v2'][row + b, 1], lay.inter(e, 'up', uw[h])[h * 128:h * 128 + 128]))
                     self.assertTrue(np.array_equal(p['tr3.v2'][row + b, 2], lay.inter(e, 'down', dk)[h * 128:h * 128 + 128]))
-                    self.assertTrue(np.array_equal(p['tr3.v3'][row + b], lay.hidden(e, 'down', dk)[0]))
+                    if 'tr3.v3b' in p:
+                        full = p['tr3.sg'][1].astype(np.float32) * np.repeat(p['tr3.v3b'][row + b].astype(np.float32), 128)
+                        self.assertTrue(np.array_equal(full.astype(np.float16), lay.hidden(e, 'down', dk)[0]))
+                    else:
+                        self.assertTrue(np.array_equal(p['tr3.v3'][row + b], lay.hidden(e, 'down', dk)[0]))
                     seen.add((e, h))
                 self.assertEqual(o1 - int(tab[i][0]), sum(v2.half_bytes(gw[h]) + v2.half_bytes(uw[h]) for h in hs))
         self.assertEqual(seen, {(e, h) for e in ex for h in range(16)})
