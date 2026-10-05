@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-05: adaptive draft length (#12); TP4 drafts with DFlash2 by default
+
+- `scripts/launch_tp4.sh` now boots the DFlash2 drafter with an adaptive draft count of 1..7 by default. Against MTP k=2
+  at 2200 MHz: on answer text code +21%, prose level, structured +46%; on reasoning text about level (code -2.6%,
+  within boot noise). It uses less memory, because the MTP layer is not built. `DFLASH=0` brings back MTP k=2 with a
+  fixed draft count (setting `MTP=k` does the same). The launcher stops with instructions when a node has no drafter
+  pack. TP6 (`launch_tp6.sh`) and multi-session (`--s2`) stay on MTP.
+- `--spec-adaptive` chooses each round's draft count for MTP and DFlash2 (`engine/runtime/spec_len.h`, one host
+  function per round). Expected tokens come from per-position acceptance, kept per bucket of the drafter's own
+  probability of the draft, and shrunk toward the position's recent rate. Cost comes from the verify step time by row
+  count at 2200 MHz. The decision reads only inputs that are the same bytes on every rank. MTP also stops its chain when
+  one more draft does not pay. The engine flag is off unless given, and fixed k is unchanged. The TP4 launcher gives it
+  with DFlash2.
+- The DFlash2 selector walk reports each draft's probability among its 16 candidates (`DflOut::lp`, softmax of the walk
+  scores). The drafts do not change.
+- `engine/tests/test_spec_len.cpp` (CPU) and `engine/ref/dflash2_ab.py` (two feature sets for one token sequence
+  through the reference drafter: feature distance and teacher-forced acceptance).
+
 ## 2026-10-05: exlr8-e4m3 expert packs, chosen per layer (#19)
 
 - The converter reads TR3 and exlr8-e4m3 checkpoints. Both have the same tensor names and layout. The layer file's

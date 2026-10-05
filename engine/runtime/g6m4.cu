@@ -34,6 +34,10 @@
 //                     probability p(draft) under the request's temperature / top_p, else replaced by a sample of p without
 //                     it (glue.cuh rs_accept). Same output distribution, other text for a seed.
 //                     Temperature 0 is the same in both. Needs --mtp or --dflash-manifest; no --s2.
+//      [--spec-adaptive [--spec-levels 7,5,3,2]]  each round verifies the level with the most expected tokens per ms
+//                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
+//                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
+//                     Needs --mtp or --dflash-manifest. Refused with --s2.
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
@@ -72,6 +76,8 @@ int main(int argc, char** argv)
     std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
     int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
     int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
+    bool adapt = false;                 // --spec-adaptive
+    std::string levels_s;               // --spec-levels
     std::vector<std::string> prompts;
     Plan plan;
     int cap = 64;
@@ -103,6 +109,8 @@ int main(int argc, char** argv)
         else if (a == "--dflash-pack") dfl_file = next();
         else if (a == "--dflash-sel") dfl_sel = atoi(next().c_str());
         else if (a == "--dflash-k") dfl_k = atoi(next().c_str());
+        else if (a == "--spec-adaptive") adapt = true;
+        else if (a == "--spec-levels") levels_s = next();
         else if (a == "--layers") layers_s = next();
         else if (a == "--prompt") prompts.push_back(next());
         else if (a == "--gen") plan.n_gen = atoi(next().c_str());
@@ -152,6 +160,21 @@ int main(int argc, char** argv)
     if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
     if (plan.rs && (s2mode || (!mtp && !dfl))) die("--spec-accept rejection needs --mtp or --dflash-manifest, and not --s2");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
+    if ((adapt || !levels_s.empty()) && (s2mode || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest, and not --s2");
+    if (!levels_s.empty() && !adapt) die("--spec-levels needs --spec-adaptive");
+    SpecLen spec;                       // --spec-adaptive. Its estimates persist across requests
+    if (adapt)
+    {
+        const int kmax = dfl ? dfl_k : mtp;
+        std::vector<int> lv;
+        if (levels_s.empty()) for (int k = 1; k <= kmax; ++k) lv.push_back(k);
+        else lv = parse_ints(levels_s);
+        for (int k : lv) if (k < 1 || k > kmax) die("--spec-levels: each level must be 1.." + std::to_string(kmax));
+        spec.on = true;
+        if (!spec.set_levels(lv)) die("--spec-levels: no level");
+        spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz (#11): the DFlash2 step, the MTP first-form pass
+        spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
+    }
 #ifndef DEC_S2
     if (s2mode) die("--s2 needs a DEC_S2 build");
 #endif
@@ -183,6 +206,8 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
     }
     if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
+    for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
+        if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
     const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
     // G6_PF_OWN=4 (TP4) env refusals before any CUDA / fabric work (qp_wire.h roll_env_refusal)
     const bool own4 = MP && getenv("G6_PF_OWN") && atoi(getenv("G6_PF_OWN")) == 4;
@@ -886,12 +911,12 @@ int main(int argc, char** argv)
                 return so;
             };
             pt.lap("pre_decode");
-            const std::vector<int> gen = dflash_sequence(p, step0, dstep, rm, rf, mtp_stats, mtp_steps, dfl_lo, emit, dfl_k);
+            const std::vector<int> gen = dflash_sequence(p, step0, dstep, rm, rf, mtp_stats, mtp_steps, dfl_lo, emit, dfl_k, &spec);
             if (dfl_dump) { std::vector<int> all = p.prompt; all.insert(all.end(), gen.begin(), gen.end()); dfl_dump_tokens(dfl_dump, all); }
             printf("generated");
             for (int t : gen) printf(" %d", t);
             printf("\n");
-            em.end(nullptr, mtp_stats.rounds, dfl_k, mtp_stats.tokens, mtp_stats.acc);
+            em.end(nullptr, mtp_stats.rounds, dfl_k, mtp_stats.tokens, mtp_stats.acc, mtp_stats.drafted);
             continue;
         }
         if (mtp)
@@ -915,14 +940,14 @@ int main(int argc, char** argv)
                 const int t = step_line(D.d, so, s, M, line);
                 printf("%s%s\n", chain ? "chain" : "draft", line.c_str() + 4);
                 fprintf(stderr, "# seq %zu %s %d M %d: %.3f ms\n", q, chain ? "chain" : "draft", s, M, dt);
-                return t;
+                return DraftOut{t, so.lp[M - 1]};
             };
             pt.lap("pre_decode");
-            const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, mtp_steps, emit);
+            const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, mtp_steps, emit, &spec);
             printf("generated");
             for (int t : gen) printf(" %d", t);
             printf("\n");
-            em.end(nullptr, mtp_stats.rounds, mtp, mtp_stats.tokens, mtp_stats.acc);
+            em.end(nullptr, mtp_stats.rounds, mtp, mtp_stats.tokens, mtp_stats.acc, mtp_stats.drafted);
             continue;
         }
         int last_tok = 0, ns_run = NS;
@@ -989,6 +1014,7 @@ int main(int argc, char** argv)
         char tag[32];
         snprintf(tag, sizeof tag, "rank %d", R);
         mtp_stats.print(dfl ? dfl_k : K, tag);
+        if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
         if (nc && mtp) fprintf(stderr, "# rank %d: top_p misses %u (target) %u (draft)\n", R, topp_misses(m), topp_misses(D.d));
         if (mtp) { fabd.wait_proxy_idle(); fabd.stop_proxy(); }
         if (dfl) { fabf.wait_proxy_idle(); fabf.stop_proxy(); }

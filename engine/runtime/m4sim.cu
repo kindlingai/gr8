@@ -27,6 +27,7 @@
 //        steps (s2_batch.h mtp_batch, s2.cuh). Lines per session: "q<j> " + the solo line (step / draft / chain /
 //        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped
 // [--spec-accept coupled|rejection]  as g6m4 (needs --mtp, no --s2): rejection = greedy drafts, accepted by rejection sampling
+// [--spec-adaptive [--spec-levels 1,2,4]]  as g6m4 (needs --mtp, no --s2): the drafts each round verifies (spec_len.h)
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
@@ -141,6 +142,8 @@ int main(int argc, char** argv)
     std::string qo_man, qo_file;       // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py) for G6_PF_OWN=3
     std::string mtp_dump;               // --mtp-dump PREFIX: rank 0 draft buffers of seq 0 (tools/m6/check_draft.py)
     bool s2mode = false;                // --s2: the prompts as sessions of one batched decode (DEC_S2)
+    bool adapt = false;                 // --spec-adaptive
+    std::string levels_s;               // --spec-levels
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -169,6 +172,8 @@ int main(int argc, char** argv)
         else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
         else if (a == "--top-p-cands") nc = atoi(next().c_str());
         else if (a == "--s2") s2mode = true;
+        else if (a == "--spec-adaptive") adapt = true;
+        else if (a == "--spec-levels") levels_s = next();
         else if (a == "--spec-accept")
         {
             const std::string v = next();
@@ -186,6 +191,19 @@ int main(int argc, char** argv)
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
     if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
+    if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
+    SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
+    if (adapt)
+    {
+        std::vector<int> lv;
+        if (levels_s.empty()) for (int k = 1; k <= mtp; ++k) lv.push_back(k);
+        else lv = parse_ints(levels_s);
+        for (int k : lv) if (k < 1 || k > mtp) die("--spec-levels: each level must be 1.." + std::to_string(mtp));
+        spec.on = true;
+        if (!spec.set_levels(lv)) die("--spec-levels: no level");
+        spec.draft_round = 2.5;
+        spec.draft_each = 2.1;
+    }
     if (nc < 0 || nc * NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / NR));
 #ifdef DEC_S2
     if (s2mode && (!mtp || MP || !serve.empty() || prompts.size() > (size_t)S2N)) die("--s2 needs --mtp, no --prefill / --serve, at most 8 --prompt");
@@ -1320,17 +1338,17 @@ int main(int argc, char** argv)
                     dumpf("b.tok.i32", DR[0].d.tok, 4); dumpf("b.pos.i32", DR[0].d.pos, 4);
                     dumpf("b.eh_in.f16", DR[0].d.eh_in, 2 * HID * 2); dumpf("b.eh_out.f16", DR[0].d.eh_out, HID * 2);
                 }
-                return t;
+                return DraftOut{t, sd[0].lp[di.M - 1]};
             };
             std::function<bool(const int*, int, int)> emit;
             if (em.on) emit = [&](const int* t, int k, int) { pt.first_token(q); return em.push(t, k); };
             pt.lap("pre_decode");
-            const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, steps, emit);
+            const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, steps, emit, &spec);
             hist = p.prompt; hist.insert(hist.end(), gen.begin(), gen.end());
             printf("generated");
             for (int t : gen) printf(" %d", t);
             printf("\n");
-            em.end(nullptr, mtp_stats.rounds, mtp, mtp_stats.tokens, mtp_stats.acc);
+            em.end(nullptr, mtp_stats.rounds, mtp, mtp_stats.tokens, mtp_stats.acc, mtp_stats.drafted);
             continue;
         }
         const int PS = prompt_steps(p), NS = total_steps(p);
@@ -1407,6 +1425,7 @@ int main(int argc, char** argv)
                 graph ? "one graph" : "plain launches", t1[t1.size() / 2], t1[0], t1[t1.size() / 2] * 1000 / NR / NL, NL);
     }
     if (mtp) mtp_stats.print(mtp, "six ranks in turn");
+    if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);
     if (rdf) fclose(rdf);

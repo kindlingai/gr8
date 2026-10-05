@@ -30,6 +30,7 @@
 #include <vector>
 #include "draft_shape.h"
 #include "serve.h"
+#include "spec_len.h"
 #include "../h2d.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
@@ -1275,11 +1276,12 @@ inline void top_lines(Model& m, int s, int M, int K, std::string& out)
 //   draft    a first-form pass over the accepted rows 0..a (-> d1), then K - 1 chain steps (-> d2..dK)
 // The rows of rejected drafts, and the chain steps' rows in layer 78, are overwritten by the next round.
 // run_main(si, s, ms) runs a target step, prints its line(s) and returns the rank's StepOut; run_draft(di, chain, s, ms)
-// runs a draft step, prints its line and returns the last row's token; both add their wall time to ms.
+// runs a draft step, prints its line and returns the last row's token and log-probability (DraftOut); both add their
+// wall time to ms.
 // main_step / draft_step: the fabric step counters (never repeat within a process), updated.
 struct MtpStats
 {
-    long rounds = 0, tokens = 0, acc[MX] = {};
+    long rounds = 0, tokens = 0, drafted = 0, acc[MX] = {};   // drafted: drafts verified, summed over the rounds
     std::vector<double> t_verify, t_first, t_chain;
     void print(int K, const char* tag) const
     {
@@ -1296,23 +1298,38 @@ struct MtpStats
                 tokens * 1000.0 / sum);
     }
 };
+// MTP draft step result: the last row's token and its log-probability under the raw distribution
+struct DraftOut
+{
+    int tok;
+    float lp;
+};
 template <class RunMain, class RunDraft>
 inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& draft_step, RunMain&& run_main, RunDraft&& run_draft,
-                                     MtpStats& S, int& steps, const std::function<bool(const int*, int, int)>& emit = {})
+                                     MtpStats& S, int& steps, const std::function<bool(const int*, int, int)>& emit = {},
+                                     SpecLen* sl = nullptr)
 {
     // emit (--serve): gets every batch of committed tokens and the row of the last run_main step each came from (the
     // rows are consecutive); true = the request is finished (stop id or max tokens)
+    // sl (--spec-adaptive): K is the most drafts. The chain stops when sl->more() says so, and each round verifies the
+    // sl->choose() of the drafts it has
     const int n = (int)p.prompt.size(), PS = prompt_steps(p);
     const u64 step0 = main_step;
+    const bool ad = sl && sl->on;
     std::vector<int> tokens = p.prompt;          // committed tokens by position
     std::vector<int> d(K + 1, 0);                // d[j]: draft of position base + j
+    std::vector<float> dl(K + 1, NAN);           // dl[j]: d[j]'s log-probability under the MTP head
+    int nd = K;                                  // drafts made this round
     const float dtemp = p.rs ? 0.f : p.inv_temp; // rejection sampling: greedy drafts (they must not use the target's noise)
-    auto chain_steps = [&](int base) {           // d[1] is set; fills d[2..K]
+    auto chain_steps = [&](int base) {           // fills d[2..nd] from d[1]
         double ms = 0;
+        nd = 1;
         for (int j = 1; j < K; ++j)
         {
+            if (ad && !sl->more(dl.data(), j)) break;
             const StepIn ci = draft_inputs(++draft_step, 1, base - 1 + j, &d[j], dtemp, p.seed, p.top_p);
-            d[j + 1] = run_draft(ci, true, j, ms);
+            const DraftOut o = run_draft(ci, true, j, ms);
+            d[j + 1] = o.tok; dl[j + 1] = o.lp; nd = j + 1;
         }
         return ms;
     };
@@ -1333,29 +1350,36 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
         int next[MX];
         for (int r = 0; r < si.M; ++r) next[r] = tokens[si.pos[r] + 1];
         const StepIn di = draft_inputs(++draft_step, si.M, si.pos[0], next, dtemp, p.seed, p.top_p);
-        d[1] = run_draft(di, false, s, ms);
+        const DraftOut o = run_draft(di, false, s, ms);
+        d[1] = o.tok; dl[1] = o.lp;
     }
     chain_steps((int)tokens.size() - 1);
     while ((int)tokens.size() - n < p.n_gen)
     {
         const int base = (int)tokens.size() - 1;
+        double pe = 0;                           // the decision's expected tokens (log line)
+        const int k = ad ? sl->choose(dl.data(), nd, nd, &pe) : K;
         StepIn si;
         memset(&si, 0, sizeof si);
-        si.step = ++main_step; si.M = K + 1;
-        for (int r = 0; r <= K; ++r)
+        si.step = ++main_step; si.M = k + 1;
+        for (int r = 0; r <= k; ++r)
         {
             si.tok[r] = r ? d[r] : tokens[base];
             si.pos[r] = base + r;
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
         }
-        si.context = base + K + 1;
+        si.context = base + k + 1;
         double tv = 0, tf = 0;
         const StepOut so = run_main(si, s, tv);
         int a = 0;
-        while (a < K && d[a + 1] == so.tok[a]) ++a;
+        while (a < k && d[a + 1] == so.tok[a]) ++a;
         for (int r = 0; r <= a; ++r) tokens.push_back(so.tok[r]);
-        printf("round %ld base %d accepted %d of %d\n", S.rounds, base, a, K);
+        if (ad) sl->observe(k, a, dl.data(), pe);
+        if (ad) printf("round %ld base %d accepted %d of %d (drafted %d, expected %.2f tokens, hash %08x)\n", S.rounds, base, a, k, nd, pe,
+                       SpecLen::hash(dl.data(), nd, k));
+        else printf("round %ld base %d accepted %d of %d\n", S.rounds, base, a, K);
+        S.drafted += k;
         if (emit && emit(so.tok, a + 1, 0))
         {
             ++S.rounds; S.tokens += a + 1; ++S.acc[a];
@@ -1366,7 +1390,8 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
             return std::vector<int>(tokens.begin() + n, tokens.begin() + end);
         }
         const StepIn di = draft_inputs(++draft_step, a + 1, base, so.tok, dtemp, p.seed, p.top_p);
-        d[1] = run_draft(di, false, s, tf);
+        const DraftOut o = run_draft(di, false, s, tf);
+        d[1] = o.tok; dl[1] = o.lp;
         const double tc = chain_steps((int)tokens.size() - 1);
         ++S.rounds; S.tokens += a + 1; ++S.acc[a];
         S.t_verify.push_back(tv); S.t_first.push_back(tf); S.t_chain.push_back(tc);

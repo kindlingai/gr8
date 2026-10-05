@@ -47,34 +47,12 @@ def accept(d, actual):
     return a
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('dump')
-    ap.add_argument('--src', required=True)
-    ap.add_argument('--glm', required=True)
-    ap.add_argument('--quant', default='mxfp8')
-    ap.add_argument('--rounds', type=int, default=0)
-    ap.add_argument('--out', default=None)
-    ap.add_argument('--noise', type=float, default=0.0)
-    ap.add_argument('--feats', default=None, help='take the context features from this dump instead (e.g. the same text '
-                                                  'sent again as a prompt, so its features come from the prefill path)')
-    a = ap.parse_args()
-    steps, feats, tokens = load_dump(a.dump)
-    if a.feats:
-        _, f2, _ = load_dump(a.feats)
-        missing = [p for p in feats if p not in f2]
-        print(f'features from {a.feats}: {len(f2)} positions, {len(missing)} of the original missing (kept)')
-        feats = {p: f2.get(p, v) for p, v in feats.items()}
-    if a.rounds:
-        steps = steps[:a.rounds]
-    D = R.Drafter(a.src, None if a.quant == 'bf16' else a.quant)
-    pos = np.array(sorted(feats))
-    F = np.stack([feats[p] for p in pos]).astype(np.float32) * 64          # the engine stores residual / 64
-    if a.noise:                       # sensitivity: Gaussian noise, std = noise x the RMS of each row's tap layer
-        Fl = F.reshape(len(F), NT, HID)
-        Fl += np.random.default_rng(0).standard_normal(Fl.shape).astype(np.float32) * a.noise * np.sqrt((Fl ** 2).mean(-1, keepdims=True))
+def ref_drafts(D, glm, pos, F, steps):
+    """Reference drafts of every step at once. pos [P] positions with context features F [P, 6 x 6144] (float32, the
+    residual itself); steps: dicts with q0 (block start = the bonus position) and tok0 (the bonus token).
+    -> (walk drafts [n, 7], argmax drafts [n, 7])"""
     kv, _ = D.context_kv(F, pos)
-    emb_st = R.ST(os.path.join(a.glm, 'model-embed.safetensors'))
+    emb_st = R.ST(os.path.join(glm, 'model-embed.safetensors'))
     mask = D.d['mask_token_id']
     erow = lambda t: R.bf(emb_st.get('model.embed_tokens.weight', rows=(t, t + 1))[0])
     me = erow(mask)
@@ -123,17 +101,48 @@ def main():
         h = h + fin(m, f2)
         print(f'layer {j} done', flush=True)
     x = R.rms(h, D.w('norm.weight'), D.eps)
-    head = R.ST(os.path.join(a.glm, 'model-head.safetensors'))
+    head = R.ST(os.path.join(glm, 'model-head.safetensors'))
     cand, logit = D.top(x[:, 1:].reshape(-1, HID), head)
     cand, logit = cand.reshape(n, B - 1, -1), logit.reshape(n, B - 1, -1)
+    walks = [D.select(x[i, 1:], cand[i], logit[i], s['tok0'])[0].tolist() for i, s in enumerate(steps)]
+    return walks, [cand[i][:, 0].tolist() for i in range(len(steps))]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('dump')
+    ap.add_argument('--src', required=True)
+    ap.add_argument('--glm', required=True)
+    ap.add_argument('--quant', default='mxfp8')
+    ap.add_argument('--rounds', type=int, default=0)
+    ap.add_argument('--out', default=None)
+    ap.add_argument('--noise', type=float, default=0.0)
+    ap.add_argument('--feats', default=None, help='take the context features from this dump instead (e.g. the same text '
+                                                  'sent again as a prompt, so its features come from the prefill path)')
+    a = ap.parse_args()
+    steps, feats, tokens = load_dump(a.dump)
+    if a.feats:
+        _, f2, _ = load_dump(a.feats)
+        missing = [p for p in feats if p not in f2]
+        print(f'features from {a.feats}: {len(f2)} positions, {len(missing)} of the original missing (kept)')
+        feats = {p: f2.get(p, v) for p, v in feats.items()}
+    if a.rounds:
+        steps = steps[:a.rounds]
+    D = R.Drafter(a.src, None if a.quant == 'bf16' else a.quant)
+    pos = np.array(sorted(feats))
+    F = np.stack([feats[p] for p in pos]).astype(np.float32) * 64          # the engine stores residual / 64
+    if a.noise:                       # sensitivity: Gaussian noise, std = noise x the RMS of each row's tap layer
+        Fl = F.reshape(len(F), NT, HID)
+        Fl += np.random.default_rng(0).standard_normal(Fl.shape).astype(np.float32) * a.noise * np.sqrt((Fl ** 2).mean(-1, keepdims=True))
+    walks, argmaxes = ref_drafts(D, a.glm, pos, F, steps)
     rows = []
     for i, s in enumerate(steps):
-        walk, _ = D.select(x[i, 1:], cand[i], logit[i], s['tok0'])
+        walk, argmax = walks[i], argmaxes[i]
         actual = tokens[s['q0'] + 1:s['q0'] + B] if tokens is not None else []
-        rows.append(dict(q0=s['q0'], eng=s['drafts'], ref_walk=walk.tolist(), ref_argmax=cand[i][:, 0].tolist(),
+        rows.append(dict(q0=s['q0'], eng=s['drafts'], ref_walk=walk, ref_argmax=argmax,
                          actual=[int(t) for t in actual], acc_eng=accept(s['drafts'], actual),
-                         acc_walk=accept(walk.tolist(), actual), acc_argmax=accept(cand[i][:, 0].tolist(), actual),
-                         same_walk=int(sum(x_ == y_ for x_, y_ in zip(s['drafts'], walk.tolist())))))
+                         acc_walk=accept(walk, actual), acc_argmax=accept(argmax, actual),
+                         same_walk=int(sum(x_ == y_ for x_, y_ in zip(s['drafts'], walk)))))
     tot = lambda k: sum(r[k] for r in rows) / max(len(rows), 1) + 1
     print(json.dumps(dict(rounds=len(rows), tokens_per_step_engine=tot('acc_eng'), tokens_per_step_ref_walk=tot('acc_walk'),
                           tokens_per_step_ref_argmax=tot('acc_argmax'),

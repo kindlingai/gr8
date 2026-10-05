@@ -65,7 +65,7 @@ struct DflIn
 struct DflOut
 {
     int tok[dfl::B];                  // tok[r] = draft for position q0 + r (r = 1..7)
-    float lp[dfl::B];                 // lp[r]: the draft's log-probability; with the selector, the walk score instead
+    float lp[dfl::B];                 // lp[r]: the draft's log-probability (with the selector: among the walk's top 16)
 };
 
 struct DLayer
@@ -418,7 +418,7 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
 // merge every rank's candidates -> global top-16 per row, then the walk, with prev = the bonus token at s = 1:
 //   score(c) = logit(c) + sum_i pred[prev][i] hp[s][i] succ[c][i]
 //   pick = argmax of score * inv_temp + gumbel(row s's key, c), or of score when greedy
-//   prev = pick, s = s + 1, up to s = 7
+//   prev = pick, s = s + 1, up to s = 7. lp_out = log-probability of the pick in softmax(score) over the 16 (#12)
 // grid 1, block 256. Warp w < 7 merges row w + 1, then warp w scores candidates w and w + 8.
 struct WalkArgs
 {
@@ -485,9 +485,12 @@ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
                 const float v = sr.inv_temp == 0.f ? s_sc[k] : s_sc[k] * sr.inv_temp + glue::gumbel(sr, s_i[s][k]);
                 if (v > best) { best = v; bk = k; }
             }
+            float mx = -INFINITY, z = 0.f;
+            for (int k = 0; k < TOPK; ++k) mx = fmaxf(mx, s_sc[k]);
+            for (int k = 0; k < TOPK; ++k) z += expf(s_sc[k] - mx);
             s_prev = s_i[s][bk];
             a.tok_out[s + 1] = s_i[s][bk];
-            a.lp_out[s + 1] = s_sc[bk];
+            a.lp_out[s + 1] = s_sc[bk] - mx - logf(z);   // log-probability of the pick among the TOPK (scores at T = 1)
         }
         __syncthreads();
     }
@@ -941,13 +944,17 @@ inline void dfl_attach(Model& m, Dfl& D)
 //   draft    context = verify rows 0..a (positions base..base+a), block at base + a + 1 (bonus = the last sample)
 // run_main(si, s, ms) -> StepOut and emit(tokens, count, first row in the last run_main step), as in mtp_sequence.
 // run_draft(di, s, ms) -> DflOut. kv = the drafts a round verifies (1..K): a verify step carries kv + 1 rows, and the
-// drafter still drafts all 7.
+// drafter still drafts all 7. sl (--spec-adaptive): each round verifies sl->choose() of the drafts (at most kv), from
+// the drafter's own probabilities (DflOut::lp).
 template <class RunMain, class RunDraft>
 inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draft_step, RunMain&& run_main, RunDraft&& run_draft,
                                         MtpStats& S, int& steps, int lo, const std::function<bool(const int*, int, int)>& emit = {},
-                                        int kv = dfl::K)
+                                        int kv = dfl::K, SpecLen* sl = nullptr)
 {
     using namespace dfl;
+    const bool ad = sl && sl->on;
+    float dl[B];                      // dl[r]: draft r's log-probability under the drafter (DflOut::lp)
+    for (float& x : dl) x = NAN;
     const int n = (int)p.prompt.size(), PS = prompt_steps(p);
     const u64 step0 = main_step;
     std::vector<int> tokens = p.prompt;
@@ -960,7 +967,7 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
         di.ctx_rows = rows; di.ctx_pos0 = pos0; di.q0 = pos0 + rows; di.lo = lo; di.tok0 = bonus; di.query = query;
         for (int r = 0; r < B; ++r) di.srow[r] = glue::SampleRow{dtemp, p.seed, 0u, di.q0 + r, 0, p.top_p};
         const DflOut o = run_draft(di, s, ms);
-        if (query) for (int r = 1; r < B; ++r) d[r] = o.tok[r];
+        if (query) for (int r = 1; r < B; ++r) { d[r] = o.tok[r]; dl[r] = o.lp[r]; }
     };
     int s = 0;
     for (; s < PS; ++s)
@@ -980,24 +987,33 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
     while ((int)tokens.size() - n < p.n_gen)
     {
         const int base = (int)tokens.size() - 1;
+        double pe = 0;                // the decision's expected tokens (log line)
+        const int k = ad ? sl->choose(dl, kv, kv, &pe) : kv;
         StepIn si;
         memset(&si, 0, sizeof si);
-        si.step = ++main_step; si.M = kv + 1;
-        for (int r = 0; r <= kv; ++r)
+        si.step = ++main_step; si.M = k + 1;
+        for (int r = 0; r <= k; ++r)
         {
             si.tok[r] = r ? d[r] : tokens[base];
             si.pos[r] = base + r;
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
         }
-        si.context = base + kv + 1;
+        si.context = base + k + 1;
         double tv = 0, tf = 0;
         const StepOut so = run_main(si, s, tv);
         int a = 0;
-        while (a < kv && d[a + 1] == so.tok[a]) ++a;
+        while (a < k && d[a + 1] == so.tok[a]) ++a;
         for (int r = 0; r <= a; ++r) tokens.push_back(so.tok[r]);
-        printf("round %ld base %d accepted %d of %d\n", S.rounds, base, a, kv);
-        ++S.rounds; S.tokens += a + 1; ++S.acc[a];
+        if (ad)
+        {
+            sl->observe(k, a, dl, pe);
+            printf("round %ld base %d accepted %d of %d (expected %.2f tokens, hash %08x; p", S.rounds, base, a, k, pe, SpecLen::hash(dl, kv, k));
+            for (int r = 1; r <= kv; ++r) printf(" %.3f", std::exp(dl[r]));
+            printf(")\n");
+        }
+        else printf("round %ld base %d accepted %d of %d\n", S.rounds, base, a, kv);
+        ++S.rounds; S.tokens += a + 1; ++S.acc[a]; S.drafted += k;
         if (emit && emit(so.tok, a + 1, 0))
         {
             S.t_verify.push_back(tv); S.t_first.push_back(0); S.t_chain.push_back(0);

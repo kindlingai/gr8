@@ -197,14 +197,15 @@ struct Emitter
         if (f) { fprintf(f, "%s%s\n", lpl.c_str(), line.c_str()); fflush(f); }
         return done;
     }
-    void end(const char* reason_if_error, long rounds, int K, long tokens, const long* acc)
+    // drafted: drafts verified in all rounds (-1: rounds * K, a fixed draft length)
+    void end(const char* reason_if_error, long rounds, int K, long tokens, const long* acc, long drafted = -1)
     {
         if (!on) return;
         if (f)
         {
             if (K > 0)
             {
-                fprintf(f, "m %ld %ld %ld", rounds, rounds * K, tokens - rounds);
+                fprintf(f, "m %ld %ld %ld", rounds, drafted < 0 ? rounds * K : drafted, tokens - rounds);
                 for (int i = 0; i < K; ++i)
                 {
                     long c = 0;

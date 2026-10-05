@@ -166,12 +166,17 @@ pack format, serve loop, front end shape). Use it as the map for porting another
   (`tp4/r0..r3`), `scripts/stage.sh`, `scripts/launch_tp4.sh`. A TP4 rank pack is about 90 GB, so the 13 GB QO pack
   does not fit next to it. TP4 runs pair-owner QO attention instead (`G6_PF_OWN=4`, about 1.3-1.4 GB of device memory plus 84 MB pinned per rank) with a
   393,216-token pool. TP4 numbers (2200 MHz cap, launcher defaults): 8K prefill 1,318 tok/s, 32K 1,288 tok/s, 18K TTFT
-  14.5 s, 87K TTFT 73.3 s, decode code/prose/structured 34.8/31.5/37.0 tok/s, 87K and 250K needles found (#39).
+  14.5 s, 87K TTFT 73.3 s, decode code/prose/structured 34.8/31.5/37.0 tok/s with MTP k=2 (the default then), 87K and
+  250K needles found (#39).
   With `G6_PF_OWN=1` (no QO attention): 8K 816 tok/s, 32K 654 tok/s.
-- DFlash2 drafter, opt-in at TP4: `DFLASH=1 scripts/launch_tp4.sh` replaces MTP with the DFlash2 block drafter
-  (`engine/runtime/dflash.cuh`, packs from `tools/convert/dflash2.py`). It is lossless and leaves more memory free than
-  MTP, because the MTP layer is not built. With GLM 5.3's template the gate workloads are reasoning text, and there it
-  does not beat MTP k=2. The drafter wins on JSON answers. MTP stays the default. Numbers in the PR.
+- TP4 drafts with DFlash2 by default (`engine/runtime/dflash.cuh`, #11), and each round picks its draft count, 1 to 7
+  (`engine/runtime/spec_len.h`, #12). The drafter needs `packs/dflash.r<r>.*` on every node (`tools/convert/dflash2.py`,
+  0.86 GB per rank), and the launcher stops with instructions when they are missing. Against MTP k=2 at 2200 MHz, on
+  answers (vLLM's bench prompts) it gives code 48.0 / prose 34.8 / structured 60.3 tok/s against 39.8 / 34.4 / 41.3
+  (+21% / level / +46%). On reasoning text (the gate workloads) it is about level: code 34.0 against 34.9 (-2.6%, within
+  boot noise), prose 32.3 against 32.5, structured 38.8 against 37.3. It uses less memory, because the MTP layer is not
+  built. `DFLASH=0 scripts/launch_tp4.sh` brings back MTP k=2 with a fixed draft count, the previous default. Multi-session
+  (`--s2`) and TP6 run MTP: TP6 cannot split the drafter's 8 KV heads six ways.
 - At temperature > 0, drafts are accepted when they equal the target's own sample (shared noise), so a seed gives the
   same text with or without speculation. `SPEC_ACCEPT=rejection` switches to rejection sampling with greedy drafts: the
   same output distribution, other text for a seed.
