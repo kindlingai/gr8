@@ -71,6 +71,8 @@ struct Tensors
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
     int k2 = 1;                       // 2-bit units in the layer (bind::LayerTensors::k2 after bind::scan_widths, #65)
     int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis, #65)
+    int sh_fp8 = 0;                   // t/s[T_S_GATE, T_S_UP, T_S_DOWN] hold its FP8 copy (bind::make_shared_fp8)
+    long long sh_tr[6] = {};          // tr3.table row 256
 };
 
 template <class F> inline Tensors layer_tensors(int layer, F find)
@@ -278,6 +280,8 @@ struct Gemm
     const uint8_t *w2 = nullptr, *ws2 = nullptr;
     int N2 = 0, ldy2 = 0, bf162 = 0;
     void* y2 = nullptr;
+    const uint8_t* x8_2 = nullptr;    // the second tensor's records when they differ from x8 (the trellis shared expert's
+                                      // gate and up inputs, #65); nullptr = x8
 };
 
 constexpr int G_STAGES = 4, G_KS = 2, G_STAGE = G_KS * MB * REC;
@@ -419,7 +423,7 @@ template <int BM, bool RS = false, bool F32 = false> __global__ void __launch_bo
     if (g0.w2)
     {
         const int nb1 = (g0.N + 127) / 128;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2<BM>;
     constexpr int NT = C::NT;
@@ -573,7 +577,7 @@ template <int BM> __global__ void __launch_bounds__(G2W<BM>::NTH) k_gemm_mx8w(Ge
     if (g0.w2)
     {
         const int nb1 = (g0.N + GW_CW - 1) / GW_CW;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2W<BM>;
     constexpr int NT = C::NT;
@@ -701,7 +705,7 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8p(Gemm g0)
     if (g0.w2)
     {
         const int nb1 = (g0.N + 127) / 128;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2<BM>;
     constexpr int NT = C::NT;
@@ -879,7 +883,7 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
     if (g0.w2)
     {
         const int nb1 = (g0.N + 127) / 128;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2<BM>;
     constexpr int NT = C::NT;
@@ -1122,7 +1126,7 @@ inline void launch(const Gemm& g, cudaStream_t st, const RsOut& rs = RsOut()) { 
 // same mma calls as in its own launch, so the bits do not change
 inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
 {
-    if (mode == 1 || !a.on || !b.on || a.x8 != b.x8 || a.K != b.K || a.M != b.M || a.w2 || b.w2 || a.bf16 != b.bf16 && (a.bf16 == 2 || b.bf16 == 2))
+    if (mode == 1 || !a.on || !b.on || a.K != b.K || a.M != b.M || a.w2 || b.w2 || a.bf16 != b.bf16 && (a.bf16 == 2 || b.bf16 == 2))
     {
         launch(a, st, mode);
         launch(b, st, mode);
@@ -1130,6 +1134,7 @@ inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
     }
     Gemm p = a;
     p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16;
+    p.x8_2 = b.x8 != a.x8 ? b.x8 : nullptr;
     launch(p, st, mode);
 }
 inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st) { launch_pair(a, b, st, gemm_mode()); }
@@ -1229,6 +1234,8 @@ struct Expert
 {
     int on = 0, M = 0, maxseg = 0;
     int nroutes = 0;                  // routes of the pass: 0 = M * TOPK; the trellis shared pass (#65) has M (one per row)
+    const __half* sh_svh = nullptr;   // set: ysh holds the trellis shared expert's down output before its output rotation;
+                                      // k_pf_fin adds f16(H128(ysh) x sh_svh) (bindp::ShX, #65)
     // routing
     const float* logits = nullptr;    // [M][256] fp32
     const float* bias = nullptr;      // [256] fp32 (router.bias)
@@ -1406,6 +1413,30 @@ __device__ __forceinline__ void had128_l32(float (&v)[32], int lane)
     }
     #pragma unroll
     for (int j = 0; j < 32; ++j) v[j] *= SQ128;
+}
+
+// 128-point Hadamard of a row held by 16 lanes, 8 consecutive values each (element 8 (lane % 16) + j), 1/sqrt(128):
+// strides 1-4 in registers, 8-64 by xor-shuffle over lane bits 0-3
+__device__ __forceinline__ void had128_l8(float (&v)[8], int lane)
+{
+    #pragma unroll
+    for (int h = 1; h < 8; h <<= 1)
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (!(j & h)) { const float a = v[j], b = v[j + h]; v[j] = a + b; v[j + h] = a - b; }
+    #pragma unroll
+    for (int q = 1; q < 16; q <<= 1)
+    {
+        const bool hi = lane & q;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+        {
+            const float o = __shfl_xor_sync(0xffffffffu, v[j], q);
+            v[j] = hi ? o - v[j] : v[j] + o;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] *= SQ128;
 }
 
 // The same as had128_l32 for a row held by 8 lanes (q = lane & 7: elements q*16 + j) as 16 consecutive floats per lane:
@@ -2316,7 +2347,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
 #endif
 
 // out[m] = bf16(sum_k yw[pos[m][k]] (k = 0..7 in order) + ysh[m]), fp32 sum. grid M, block 256.
-template <bool RS = false> __global__ void __launch_bounds__(256) k_pf_fin(Expert A)
+template <bool RS = false, bool SHX = false> __global__ void __launch_bounds__(256) k_pf_fin(Expert A)
 {
     const int m = blockIdx.x;
     int p[TOPK];
@@ -2336,7 +2367,23 @@ template <bool RS = false> __global__ void __launch_bounds__(256) k_pf_fin(Exper
             if (p[k] >= 0)        // measurement build: an expert-parallel rank sums only its own routes (pos < 0 = not here)
 #endif
             add(A.yw + static_cast<size_t>(p[k]) * HID);
-        add(A.ysh + static_cast<size_t>(m) * HID);
+        if constexpr (SHX)
+        {
+            const uint4 q = *reinterpret_cast<const uint4*>(A.ysh + static_cast<size_t>(m) * HID + i * 8);
+            const uint4 sq = *reinterpret_cast<const uint4*>(A.sh_svh + i * 8);
+            const u32 qw[4] = {q.x, q.y, q.z, q.w}, sw[4] = {sq.x, sq.y, sq.z, sq.w};
+            float v[8], sv[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                const float2 f = __half22float2(as_h2(qw[j])), g = __half22float2(as_h2(sw[j]));
+                v[2 * j] = f.x; v[2 * j + 1] = f.y; sv[2 * j] = g.x; sv[2 * j + 1] = g.y;
+            }
+            had128_l8(v, threadIdx.x & 31);            // 16 lanes x 8 columns = one 128-block (i = threadIdx.x + 256 n)
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) a[j] += rnd_h(v[j] * sv[j]);
+        }
+        else add(A.ysh + static_cast<size_t>(m) * HID);
         uint4 o;
         o.x = pack_bf2(a[0], a[1]); o.y = pack_bf2(a[2], a[3]); o.z = pack_bf2(a[4], a[5]); o.w = pack_bf2(a[6], a[7]);
         if constexpr (RS) *reinterpret_cast<uint4*>(rs_row(A.rs, m, HID) + i * 8) = o;
@@ -2389,10 +2436,111 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
 inline void launch_fin(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
-    if (A.rs.base) k_pf_fin<true><<<A.M, 256, 0, st>>>(A);
+    if (A.sh_svh)
+    {
+        if (A.rs.base) k_pf_fin<true, true><<<A.M, 256, 0, st>>>(A);
+        else k_pf_fin<false, true><<<A.M, 256, 0, st>>>(A);
+    }
+    else if (A.rs.base) k_pf_fin<true><<<A.M, 256, 0, st>>>(A);
     else k_pf_fin<<<A.M, 256, 0, st>>>(A);
 }
-// The trellis shared expert (exlr8 v2 tr3.table row 256, #65) runs as its own pass of the routed kernels. Every row is
+// ------------------------------------------------------------------------------------------ trellis shared expert
+// With its FP8 copy (bind::make_shared_fp8: the decoded tiles, still rotated), the shared expert runs on the MXFP8 GEMMs
+// of the dense shared path, wrapped in its rotations. k_shx_rotq writes the records of H128(x * suh_gate) and
+// H128(x * suh_up) in one pass; the gate and up GEMMs run as one pair; k_shx_mid (the arithmetic of k_pf_mid) writes the
+// down input records; the down GEMM writes ysh; k_pf_fin adds f16(H128(ysh) * svh_down).
+struct ShX
+{
+    int on = 0, M = 0, I = 0;
+    const __half* x = nullptr;        // [M][6144] mlp_norm output
+    uint8_t *x8g = nullptr, *x8u = nullptr;   // MXFP8 records of the rotated gate and up inputs (gate's: the GEMMs' x8_big)
+    uint8_t* x8a = nullptr;           // MXFP8 records of the down input (x8_small)
+    const __half *suh_g = nullptr, *suh_u = nullptr;    // [6144] input-side vectors (block row 0 of row 256)
+    const __half* v2 = nullptr;       // [I / 128][3][128] svh gate, svh up, suh down of row 256's blocks
+    const __half *g = nullptr, *u = nullptr;            // gate, up GEMM outputs [M][I]
+};
+
+// One warp's 4 values (k = 32 s + 4 (lane % 8) + i of a 32-k group, s = the warp's group lane / 8) of row `row` ->
+// MXFP8 records [16-row block][K/32][REC] (the k_xq8 layout: u32 of lane (row % 8) * 4 + c, register half * 2 + (row % 16
+// >= 8); scale byte 512 + row % 16). Rows >= M write zero codes (the GEMMs read the whole last block).
+__device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int row, int M, int S, int s, uint8_t* x8)
+{
+    float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
+    float inv;
+    u32 code = mx_scale(am, inv), c = f2_e4m3x2(v[0] * inv, v[1] * inv) | (f2_e4m3x2(v[2] * inv, v[3] * inv) << 16);
+    if (row >= M) { c = 0u; code = 127u; }
+    const int j = lane & 7, rr = row & 15;
+    uint8_t* rec = x8 + (static_cast<size_t>(row >> 4) * S + s) * REC;
+    *reinterpret_cast<u32*>(rec + ((rr & 7) * 4 + (j & 3)) * 16 + ((j >> 2) * 2 + (rr >> 3)) * 4) = c;
+    if (j == 0) rec[512 + rr] = static_cast<uint8_t>(code);
+}
+
+// x -> MXFP8 records of H128(x * suh_g) and H128(x * suh_u), quantized from fp32 with k_xq8's scale rule. The trellis
+// fc1 prologue quantizes from fp16 values with its own rule, so the two paths differ by FP8 activation rounding
+// (cos 0.99976 at M = 20). Against the fp16-activation reference this one is as close or closer (#65).
+// grid ceil(ceil(M/16)*16 * 48 / 8), block 256: warp = (row, 128-block)
+__global__ void __launch_bounds__(256) k_shx_rotq(ShX a)
+{
+    const int lane = threadIdx.x & 31;
+    const int w = blockIdx.x * 8 + (threadIdx.x >> 5), row = w / 48, blk = w % 48;
+    if (row >= (a.M + 15) / 16 * 16) return;
+    const int k0 = blk * 128 + lane * 4;
+    float x[4] = {0.f, 0.f, 0.f, 0.f};
+    if (row < a.M)
+    {
+        const uint2 xr = *reinterpret_cast<const uint2*>(a.x + static_cast<size_t>(row) * HID + k0);
+        const float2 x01 = __half22float2(as_h2(xr.x)), x23 = __half22float2(as_h2(xr.y));
+        x[0] = x01.x; x[1] = x01.y; x[2] = x23.x; x[3] = x23.y;
+    }
+    #pragma unroll
+    for (int j = 0; j < 2; ++j)
+    {
+        const uint2 sr = *reinterpret_cast<const uint2*>((j ? a.suh_u : a.suh_g) + k0);
+        const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+        float v[4] = {__fmul_rn(x[0], s01.x), __fmul_rn(x[1], s01.y), __fmul_rn(x[2], s23.x), __fmul_rn(x[3], s23.y)};
+        had128(v, lane);
+        shx_store_mx8(v, lane, row, a.M, HID / 32, blk * 4 + (lane >> 3), j ? a.x8u : a.x8g);
+    }
+}
+
+// g, u [M][I] -> the down input records: the arithmetic of k_pf_mid, quantized from its fp16-rounded values.
+// grid ceil(ceil(M/16)*16 * I/128 / 8), block 256: warp = (row, 128-block)
+__global__ void __launch_bounds__(256) k_shx_mid(ShX a)
+{
+    const int lane = threadIdx.x & 31, nb = a.I / 128;
+    const int w = blockIdx.x * 8 + (threadIdx.x >> 5), row = w / nb, b = w % nb;
+    if (row >= (a.M + 15) / 16 * 16) return;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    if (row < a.M)
+    {
+        const size_t o = static_cast<size_t>(row) * a.I + b * 128 + lane * 4;
+        const __half* v2 = a.v2 + static_cast<size_t>(b) * 3 * 128 + lane * 4;
+        auto f4 = [](const void* p, float (&r)[4]) {
+            const uint2 q = *reinterpret_cast<const uint2*>(p);
+            const float2 x = __half22float2(as_h2(q.x)), y = __half22float2(as_h2(q.y));
+            r[0] = x.x; r[1] = x.y; r[2] = y.x; r[3] = y.y;
+        };
+        float gv[4], uv[4], svg[4], svu[4], sud[4];
+        f4(a.g + o, gv); f4(a.u + o, uv); f4(v2, svg); f4(v2 + 128, svu); f4(v2 + 256, sud);
+        had128(gv, lane);
+        had128(uv, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float gg = rnd_h(__fmul_rn(gv[e], svg[e])), uu = rnd_h(__fmul_rn(uv[e], svu[e]));
+            v[e] = __fmul_rn(rnd_h(silu_f(gg) * uu), sud[e]);
+        }
+        had128(v, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) v[e] = rnd_h(v[e]);
+    }
+    shx_store_mx8(v, lane, row, a.M, a.I / 32, b * 4 + (lane >> 3), a.x8a);
+}
+
+// The trellis shared expert (exlr8 v2 tr3.table row 256, #65) without an FP8 copy runs as its own pass of the routed kernels. Every row is
 // one route of expert 256 with weight 1, in segments of RS rows. fc2 writes the rows straight into ysh (S.yw = ysh).
 // k_pf_fin adds ysh as it adds the MXFP8 shared output. grid ceil(M / 256), block 256.
 __global__ void __launch_bounds__(256) k_pf_sh_routes(Expert S)
@@ -2430,6 +2578,7 @@ struct Scratch
 {
     int Mmax = 0;
     uint8_t* x8_big;                  // MXFP8 records of a 6144-wide input (x, then x2)
+    uint8_t* x8_up;                   // the same size: the trellis shared expert's rotated up input (#65)
     uint8_t* x8_small;                // same, up to SMALLW wide (q_a_norm output, attention output, MLP activation; 2816 / 4096)
     uint16_t* xb;                     // [M][6144] BF16 copy of x / x2
     float* y32;                       // [M][256] fp32 staging of idx.wk / idx.weights_proj
@@ -2452,6 +2601,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
     Scratch t;
     t.Mmax = M;
     t.x8_big = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * REC));
+    t.x8_up = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * REC));
     t.x8_small = reinterpret_cast<uint8_t*>(take(RB * (g6nr::SMALLW / 32) * REC));
     t.xb = reinterpret_cast<uint16_t*>(take(m * HID * 2));
     t.y32 = reinterpret_cast<float*>(take(m * 256 * 4));
@@ -2519,7 +2669,24 @@ struct Layer
     Act act;
     Expert ex;
     Expert exs;                       // trellis shared expert pass (launch_shared, #65); on = 0 otherwise
+    ShX shx;                          // the same from its FP8 copy on the MXFP8 GEMMs (gate, up, down above); on = 0 otherwise
 };
+
+// the shared expert of an exlr8 v2 layer (#65): FP8 copy on the GEMMs, or the trellis pass. No-op for other layers,
+// whose shared / dense MLP runs from the five launches of the step order above.
+template <int EB = g6nr::EB> inline void launch_shared(const Layer& L, cudaStream_t st)
+{
+    if (L.shx.on)
+    {
+        const ShX& a = L.shx;
+        const int rows = (a.M + 15) / 16 * 16;
+        k_shx_rotq<<<(rows * 48 + 7) / 8, 256, 0, st>>>(a);
+        launch_pair(L.gate, L.up, st);    // up reads its own records (Gemm::x8_2)
+        k_shx_mid<<<(rows * (a.I / 128) + 7) / 8, 256, 0, st>>>(a);
+        launch(L.down, st);           // -> ysh; k_pf_fin applies H128 x svh_down (Expert::sh_svh)
+    }
+    else launch_shared<EB>(L.exs, st);
+}
 
 inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const Io& io, cublasHandle_t blas, Layer& L)
 {
@@ -2540,14 +2707,17 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if ((e = make_gemm(T.t[UT],         T.s[UT],         M, sc.x8_big,   sc.u,                               0, L.up))) return e;
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
     if (!L.q_a.on || !L.kv_a.on || !L.q_b.on || !L.o_proj.on) return "layer without q_a / kv_a / q_b / o_proj .mx.codes";
-    if (!L.gate.on || !L.up.on || !L.down.on) return L.moe ? "MoE layer without shared.gate/up/down.mx" : "layer has neither tr3.table nor dense.gate/up/down.mx";
+    const bool shtr = L.moe && T.sh_trellis;          // shared expert as trellis row 256: gate / up / down may be absent
+    if ((!L.gate.on || !L.up.on || !L.down.on) && !shtr)
+        return L.moe ? "MoE layer without shared.gate/up/down.mx" : "layer has neither tr3.table nor dense.gate/up/down.mx";
     if (L.q_a.K != HID || L.kv_a.K != HID || L.q_a.N > g6nr::SMALLW || L.q_b.K != L.q_a.N || L.o_proj.N != HID || L.o_proj.K != L.q_b.N || L.q_b.N % 256 ||
         L.q_b.N > g6nr::QBW)
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
     if (L.indexer && L.idx_q.K != L.q_a.N) return "idx.wq_b input width is not the q_a width";
     L.heads = L.q_b.N / 256;
     L.inter = L.gate.N;
-    if (L.gate.K != HID || L.up.K != HID || L.up.N != L.inter || L.down.K != L.inter || L.down.N != HID || L.inter > SACTW || L.inter % 32)
+    if (L.gate.on && (L.gate.K != HID || L.up.K != HID || L.up.N != L.inter || L.down.K != L.inter || L.down.N != HID || L.inter > SACTW ||
+                      L.inter % 32))
         return "shared / dense MLP shapes are not gate, up [I][6144] + down [6144][I] with I <= SACTW";
 
     auto xq = [&](Xq& q, const __half* src, int K, uint8_t* dst) { q.on = 1; q.src = src; q.ld = K; q.K = K; q.M = M; q.dst = dst; };
@@ -2593,7 +2763,21 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
         A.x = io.x2; A.ldx = HID;
         A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.ysh = sc.ysh; A.out = io.mlp_part;
-        if (T.sh_trellis)
+        if (T.sh_trellis && T.sh_fp8)
+        {
+            if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row 256";
+            if (!L.gate.on || L.inter != static_cast<int>(T.sh_tr[3]) * 128) return "shared FP8 copy does not match tr3.table row 256";
+            ShX& X = L.shx;
+            X.on = 1; X.M = M; X.I = L.inter;
+            X.x = io.x2; X.x8g = sc.x8_big; X.x8u = sc.x8_up; X.x8a = sc.x8_small;
+            const size_t row = static_cast<size_t>(T.sh_tr[2]);
+            X.suh_g = A.t_v1 + row * 2 * HID; X.suh_u = X.suh_g + HID; X.v2 = A.t_v2 + row * 3 * 128;
+            X.g = sc.g; X.u = sc.u;
+            L.up.x8 = sc.x8_up;
+            A.sh_svh = A.t_v3 + row * HID;    // k_pf_fin: ysh = f16(H128(down output) x svh_down)
+            L.xq_x2.on = 0; L.act.on = 0; L.xq_act.on = 0;
+        }
+        else if (T.sh_trellis)
         {
             if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row 256";
             Expert& S = L.exs;

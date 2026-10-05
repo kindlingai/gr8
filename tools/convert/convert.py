@@ -20,7 +20,7 @@ manifest are the same as before #19.
 exlr8 v2 expert files (#65, tools/convert/v2.py): --v2 DIR takes the routed experts of every layer that has v2 files in
 DIR (or of --v2-layers) from them instead of from --tr3, at the widths --v2-widths picks, and stores the shared expert
 as trellis row 256 of tr3.table (--v2-shared). Everything else in those layers still comes from --tr3 and --d8, and the
-shared expert's int4 / MXFP8 records are still written, so the engine can run either shared path. Such a layer's tr3.*
+shared expert's int4 / MXFP8 records are left out (--v2-shared-records keeps them for an A/B against them). Such a layer's tr3.*
 entries carry `"expert_source": "exlr8-v2"` and add tr3.kmix; the manifest's `v2_layers` maps them to their widths.
 """
 import argparse
@@ -206,12 +206,17 @@ def convert_layer(l, src, d8, writers):
     tag = 'shared' if moe else 'dense'
     if moe:
         router_w, router_b = g('mlp.gate.weight'), g('mlp.gate.e_score_correction_bias')
+    # exlr8 v2 layer with the shared expert as trellis row 256: the engine runs it from there (prefill from an FP8 copy it
+    # decodes at load), so its int4 / MXFP8 records are left out unless --v2-shared-records keeps them for the A/B
+    records = not (moe and V2 and l in V2['layers'] and V2['shared'] == 'trellis' and not V2['records'])
     for r, w in writers.items():
         a, b = groups[r][0] * 32, (groups[r][0] + groups[r][1]) * 32
         gi = dict(channels=[a, b])
         if moe:
             put_bf16(w, f'{P}.router.w', router_w, 'bf16_rowmajor')
             w.put(f'{P}.router.bias', router_b, 'f32', layout='f32_vector')
+        if not records:
+            continue
         if not mtp:
             put_rt_expert(w, f'{P}.{tag}', (gq[0][a:b], gq[1][a:b]), (uq[0][a:b], uq[1][a:b]),
                           cut_in(dq[0], dq[1], a, b), f'{P} {tag}', **gi)
@@ -410,6 +415,8 @@ def main(argv=None):
     ap.add_argument('--v2-widths', default='home', help='home | down1 | up1 | k2 | k3 | k4 | a width manifest file')
     ap.add_argument('--v2-shared', default='trellis', choices=('trellis', 'off'),
                     help='store the shared expert as trellis row 256 (the int4 / MXFP8 records are written either way)')
+    ap.add_argument('--v2-shared-records', action='store_true',
+                    help="also write the shared expert's int4 / MXFP8 records in v2 layers (G6_V2_SHARED=int4 A/B)")
     ap.add_argument('--v2-shared-width', type=int, default=None, choices=(3, 4),
                     help="the shared expert's width (default: the manifest's; K4 for home and up1, K3 for down1)")
     a = ap.parse_args(argv)
@@ -424,7 +431,8 @@ def main(argv=None):
         vl = have if a.v2_layers == 'auto' else [int(x) for x in a.v2_layers.split(',')]
         if not set(vl) <= set(have) or not vl:
             ap.error(f'--v2: layers {sorted(set(vl) - set(have)) or vl} have no v2 files in {a.v2}')
-        V2 = dict(dir=a.v2, layers=set(vl), widths=a.v2_widths, shared=a.v2_shared, shared_width=a.v2_shared_width)
+        V2 = dict(dir=a.v2, layers=set(vl), widths=a.v2_widths, shared=a.v2_shared, shared_width=a.v2_shared_width,
+                  records=a.v2_shared_records)
     ranks = list(range(plan.NR)) if a.ranks == 'all' else [int(x) for x in a.ranks.split(',')]
     if any(r < 0 or r >= plan.NR for r in ranks):
         ap.error(f'--ranks must be 0..{plan.NR - 1}')

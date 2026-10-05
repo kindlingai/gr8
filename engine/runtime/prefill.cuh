@@ -607,6 +607,20 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
         P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths, #65)
         P.T.back().sh_trellis = y.T.sh_trellis;  // the shared expert as trellis row 256 (#65)
+        if (y.T.shfp8.codes[0])                  // ... and its FP8 copy for the prefill GEMMs (bind::make_shared_fp8)
+        {
+            bindp::Tensors& t = P.T.back();
+            const bind::LayerTensors::ShFp8& F = y.T.shfp8;
+            const int id[3] = {bindp::T_S_GATE, bindp::T_S_UP, bindp::T_S_DOWN};
+            for (int j = 0; j < 3; ++j)
+            {
+                const long long n = j < 2 ? F.I : HID, k = j < 2 ? HID : F.I;
+                t.t[id[j]] = bind::Tensor(); t.t[id[j]].p = F.codes[j]; t.t[id[j]].nd = 2; t.t[id[j]].shape[0] = n; t.t[id[j]].shape[1] = k;
+                t.s[id[j]] = bind::Tensor(); t.s[id[j]].p = F.scales[j]; t.s[id[j]].nd = 2; t.s[id[j]].shape[0] = n; t.s[id[j]].shape[1] = k / 32;
+            }
+            t.sh_fp8 = 1;
+            for (int i = 0; i < 6; ++i) t.sh_tr[i] = y.T.sh_tr[i];
+        }
     }
     if (P.qp) pf_qp_states(P, m, st, share);
     if (P.qo && share) P.qa = share->qa;
@@ -1410,7 +1424,7 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
     bindp::launch(b.down, st, b.rs_down);
     pf_mark(5, st);
     pf_blas_x2(m, P, i, M, st);
-    bindp::launch_shared(b.exs, st);             // exlr8 v2 trellis shared expert (#65); no-op otherwise
+    bindp::launch_shared(b, st);                 // exlr8 v2 trellis shared expert (#65); no-op otherwise
     bindp::launch_experts(b.ex, st);
     if (!P.rc_file.empty() && b.ex.on) pf_rcdump(m, P, i, M, b.ex.cnt, st);
     pf_mark(6, st);

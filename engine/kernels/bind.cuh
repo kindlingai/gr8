@@ -93,6 +93,13 @@ struct LayerTensors
     int k2_pct = 0;                   // share of the rank's routed trellis bytes at width 2, percent (scan_widths)
     int sh_trellis = 0;               // tr3.table has row 256: the shared expert as trellis (exlr8 v2, #65); scan_widths
                                       // sets it, a caller may clear it to run the s_* records instead (the A/B)
+    long long sh_tr[6] = {};          // tr3.table row 256 (scan_widths)
+    int sh_uniform = 0;               // every fc1 unit of row 256 has the table width (its tr3.kmix entry is 0)
+    struct ShFp8                      // the shared expert's decoded tiles as MXFP8 GEMM operands (make_shared_fp8)
+    {
+        uint8_t *codes[3] = {}, *scales[3] = {};    // gate, up [I][6144]; down [6144][I]; E8M0 scales all 127
+        int I = 0;                    // owned intermediate channels (row 256's blocks x 128)
+    } shfp8;
 #if DEC_I4PAIR
     int i4pair_ks[2] = {0, 0};        // q_a.gptq, o_proj.gptq repacked into pair records for this k-part count (i4pair ran)
 #endif
@@ -172,8 +179,85 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
         for (int u = 0; u < 2 * tr[3]; ++u) chk(kmi ? (kmi >> (4 * u)) & 15 : tr[4]);   // gate / up units
     }
     T.k2_pct = all > 0 ? static_cast<int>(100 * two / all) : 0;
+    if (T.sh_trellis)
+    {
+        for (int i = 0; i < 6; ++i) T.sh_tr[i] = h[256 * 6 + i];
+        T.sh_uniform = !km.p || k[256] == 0;
+    }
     delete[] h;
     return err;
+}
+
+// The trellis shared expert's tiles decoded once into E4M3 bytes in the MXFP8 GEMM layout, codes[n][k] with k the
+// input side, both sides still rotated (the prefill binder applies the rotations around the GEMMs). The codebook values
+// are E4M3 already, so the copy is exact. Reads tr3.fc1 / fc2 in pack order: run it before widen_fc1 / widen_fc2.
+// grid ceil(I * 6144 * 3 / 256), block 256: one thread per weight.
+__global__ void __launch_bounds__(256) k_shared_fp8(const uint8_t* fc1, const uint8_t* fc2, long long o1, long long o2, int bits, int I,
+                                                    uint8_t* cg, uint8_t* cu, uint8_t* cd)
+{
+    const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x, per = static_cast<long long>(I) * HID;
+    if (i >= 3 * per) return;
+    const int mat = static_cast<int>(i / per);
+    const long long w = i % per;
+    const size_t TB = 32 * bits, MBY = static_cast<size_t>(KSH) * 8 * TB;
+    const int t = static_cast<int>(w & 255);
+    const long long tile = w >> 8;
+    const uint8_t* p;
+    int k, n;
+    const int lane = t >> 3, j = t & 7;
+    const int kk = 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1), nn = (lane >> 2) + 8 * (j >> 2);
+    if (mat < 2)          // gate / up: block b, tile (k16, c) at fc1 + o1 + (2b + mat) MBY + (8 k16 + c) TB
+    {
+        const int b = static_cast<int>(tile / (KSH * 8)), r = static_cast<int>(tile % (KSH * 8)), k16 = r >> 3, c = r & 7;
+        p = fc1 + o1 + (2 * b + mat) * MBY + static_cast<size_t>(r) * TB;
+        k = k16 * 16 + kk;
+        n = b * 128 + c * 16 + nn;
+    }
+    else                  // down: block b, tile (n-tile nt, k-tile kt) at fc2 + o2 + b MBY + (8 nt + kt) TB
+    {
+        const int b = static_cast<int>(tile / (KSH * 8)), r = static_cast<int>(tile % (KSH * 8)), nt = r >> 3, kt = r & 7;
+        p = fc2 + o2 + b * MBY + static_cast<size_t>(r) * TB;
+        k = b * 128 + kt * 16 + kk;
+        n = nt * 16 + nn;
+    }
+    // state of weight t: the 16 stream bits ending at bit (t + 1) bits, MSB first over LE u32 words, tail-biting
+    const int nb = 256 * bits;
+    u32 st = 0;
+    for (int q = 0; q < 16; ++q)
+    {
+        const int bit = (((t + 1) * bits - 16 + q) % nb + nb) % nb;
+        const u32 word = *reinterpret_cast<const u32*>(p + (bit >> 5) * 4);
+        st = (st << 1) | ((word >> (31 - (bit & 31))) & 1u);
+    }
+    const u32 h2 = tr3_cb2<true>(st, 0u);                         // low half = weight t, E4M3-rounded
+    unsigned short e;
+    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e) : "r"(h2));
+    const uint8_t q8 = static_cast<uint8_t>(e & 0xff);
+    if (mat == 0) cg[static_cast<size_t>(n) * HID + k] = q8;
+    else if (mat == 1) cu[static_cast<size_t>(n) * HID + k] = q8;
+    else cd[static_cast<size_t>(n) * I + k] = q8;
+}
+
+// After scan_widths, before widen_fc1 / widen_fc2: the shared expert's FP8 copy for the prefill GEMMs, when row 256 has
+// one width for all its fc1 units (otherwise prefill runs it as a trellis pass). Allocates T.shfp8; synchronous.
+// Device memory: 3 x I x 6144 bytes + scales, 9.7 MB per layer at TP4.
+inline const char* make_shared_fp8(LayerTensors& T, cudaStream_t st)
+{
+    if (!T.sh_trellis || !T.sh_uniform) return nullptr;
+    if (T.fc1_wide || T.fc2_wide) return "make_shared_fp8 after widen: run it before widen_fc1 / widen_fc2";
+    LayerTensors::ShFp8& F = T.shfp8;
+    F.I = static_cast<int>(T.sh_tr[3]) * 128;
+    const size_t nc = static_cast<size_t>(F.I) * HID;
+    for (int m = 0; m < 3; ++m)
+    {
+        if (cudaMalloc(&F.codes[m], nc) != cudaSuccess || cudaMalloc(&F.scales[m], nc / 32) != cudaSuccess)
+            return "make_shared_fp8: cudaMalloc failed";
+        cudaMemsetAsync(F.scales[m], 127, nc / 32, st);
+    }
+    k_shared_fp8<<<static_cast<unsigned>((3 * nc + 255) / 256), 256, 0, st>>>(
+        static_cast<const uint8_t*>(T.t[T_TR3_FC1].p), static_cast<const uint8_t*>(T.t[T_TR3_FC2].p), T.sh_tr[0], T.sh_tr[1],
+        static_cast<int>(T.sh_tr[4]), F.I, F.codes[0], F.codes[1], F.codes[2]);
+    return cudaStreamSynchronize(st) == cudaSuccess ? nullptr : "make_shared_fp8: decode failed";
 }
 
 // exlr8-e4m3 layers share one hidden-side sign vector per layer (input of gate and up, output of down). Each block row of
