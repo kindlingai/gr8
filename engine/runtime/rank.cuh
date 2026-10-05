@@ -402,7 +402,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
 #endif
         if (const char* e = bind::check_shared_signs(y.T, st)) die("layer " + std::to_string(y.l) + ": " + e);
         if (const char* e = bind::scan_widths(y.T)) die("layer " + std::to_string(y.l) + ": " + e);
-        // G6_V2_SHARED=int4: run an exlr8 v2 layer's shared expert from its int4 / MXFP8 records, not trellis row 256 (A/B)
+        // G6_V2_SHARED=int4: run an exlr8 v2 layer's shared expert from its int4 / MXFP8 records (the A/B against row 256)
         if (y.T.sh_trellis && getenv("G6_V2_SHARED") && !strcmp(getenv("G6_V2_SHARED"), "int4")) y.T.sh_trellis = 0;
         y.moe = y.T.t[bind::T_TR3_TAB].p != nullptr;
         y.indexer = y.T.t[bind::T_IDX_WQ_B].p != nullptr;

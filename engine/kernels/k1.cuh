@@ -27,8 +27,8 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
 
 // ------------------------------------------------------------------ TR3 build
 // one fc1 unit of the slot's expert e at its width (tr3_unit). K2 = the layer has 2-bit units (bind::scan_widths):
-// only then is the K2 body compiled in. Without it the kernels are the K3 / K4 ones as before #65; with it K3 units run
-// about 3.5% slower at M = 5 (measured on GB10, #65), so layers without 2-bit units never take that instantiation.
+// only then is the K2 body compiled in. The K2 body makes K3 units about 3.5% slower at M = 5 (GB10, #65). Layers
+// without 2-bit units therefore take the K3 / K4 kernels.
 template <bool E4, bool K2>
 __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit, int e, int mask, u32* smem)
 {
@@ -43,7 +43,7 @@ __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit,
     else tr3_fc1_body<K2 ? 2 : 4, E4>(A, plan, unit, tr, mw, mask, smem);
 }
 
-// one fc2 unit; down has one width per expert (tr[4])
+// one fc2 unit. Down has one width per expert (tr[4]).
 template <bool E4, bool K2>
 __device__ __forceinline__ void tr3_fc2_any(const K1Args& A, int plan, int unit, const long long* tr, int mask, u32* smem)
 {
@@ -52,10 +52,9 @@ __device__ __forceinline__ void tr3_fc2_any(const K1Args& A, int plan, int unit,
     else tr3_fc2_body<K2 ? 2 : 4, E4>(A, plan, unit, tr, mask, smem);
 }
 
-// Work item slot -> expert, token mask and scratch slot. false = no work. SH: item slot 0 is the trellis shared expert
-// (all tokens; scratch slot n_slots, where the finalize reads it) and item slot i > 0 is routed slot i - 1, so the
-// shared expert, which every step has, is handed out first and its fc2 does not wait behind every routed fc1 (with it
-// last, decode at M = 1 / 5 / 8 was 8 / 4.5 / 4% slower than the int4 shared path, #65). Without SH: the identity.
+// Work item slot -> expert, token mask and scratch slot. false = no work. Without SH the scratch slot is the item slot.
+// SH: item slot 0 is the trellis shared expert with every token, and its scratch slot is n_slots (the finalize reads it
+// there). Item slot i > 0 is routed slot i - 1. Every step has the shared expert, so it is handed out first.
 template <bool SH>
 __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int& e, int& mask, int& ss)
 {

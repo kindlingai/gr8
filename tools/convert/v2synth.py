@@ -26,7 +26,7 @@ NP2ST = {np.dtype(np.uint8): 'U8', np.dtype(np.float16): 'F16', np.dtype(np.int6
 
 def write_st(path, tensors, meta):
     """tensors: list of (name, array) in file order. Every tensor starts on a 64 KiB offset of the file."""
-    # the header size depends on the pad tensors, which depend on the header size: iterate to a fixed point
+    # the header size and the pad tensors depend on each other: iterate to a fixed point
     hsize = ALIGN
     while True:
         h, items, off = {'__metadata__': meta}, [], 0

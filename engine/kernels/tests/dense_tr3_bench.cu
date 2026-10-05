@@ -1,6 +1,6 @@
 // #65 dense trellis GEMV (tr3_dense.cuh) against g6's int4 g32 and MXFP8 decode GEMVs (densev.cuh gv_gemv, as
-// bind::make_layer splits them), on one rank's slice of q_b and o_proj. Random weights (decode cost does not depend on
-// them), a pool of copies so the matrix is read from DRAM each step, M = 1..24 (the gv kernels take 8 rows per launch,
+// bind::make_layer splits them), on one rank's slice of q_b and o_proj. Weights are random: decode cost does not depend
+// on them. A pool of copies makes each step read the matrix from DRAM. Rows M = 1..24 (the gv kernels take 8 rows per launch,
 // so M > 8 runs them once per group of 8, as the engine would have to). The trellis kernel is checked against a host
 // decode first (E4M3-rounded codebook, the rounding points of tr3_dense.cuh).
 //
@@ -108,7 +108,7 @@ int main(int argc, char** argv)
             CK(cudaGetLastError());
             std::vector<__half> yh(static_cast<size_t>(M) * N);
             CK(cudaMemcpy(yh.data(), dy, yh.size() * 2, cudaMemcpyDeviceToHost));
-            // W (k, n): tile (k16, nb, j) at ((nb * K16 + k16) * 8 + j) * tb; weight t at (k16*16 + kk, (nb*8 + j)*16 + nn)
+            // W (k, n): tile (k16, nb, j) starts at ((nb * K16 + k16) * 8 + j) * tb, and its weight t is W(k16*16 + kk, (nb*8 + j)*16 + nn)
             std::vector<float> W(static_cast<size_t>(K) * N);
             for (int nb = 0; nb < N / 128; ++nb)
                 for (int k16 = 0; k16 < K16; ++k16)

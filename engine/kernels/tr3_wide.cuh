@@ -82,7 +82,7 @@ __host__ __device__ __forceinline__ void trw_pack(u64 (&v)[3], int p, u32 chunk)
     if (CB > 16 && sh > 64 - CB) v[n + 1] |= static_cast<u64>(chunk) >> (64 - sh);
 }
 
-// one fc1 group (8 k-steps x 8 tiles, 2048 * BITS bytes) of warp j in place; every thread of the CTA calls it
+// one fc1 group (8 k-steps x 8 tiles, 2048 * BITS bytes) of warp j in place. Every thread of the CTA calls it.
 template <int BITS>
 __device__ __forceinline__ void trw_widen_group(uint8_t* grp, int j, int lane)
 {
@@ -94,7 +94,7 @@ __device__ __forceinline__ void trw_widen_group(uint8_t* grp, int j, int lane)
     for (int n = 0; n < BITS; ++n) *reinterpret_cast<u64*>(grp + (n * 8 + j) * 256 + lane * 8) = v[n];
 }
 
-// one fc2 n-tile (8 k-tiles, 256 * BITS bytes) of lane `lane` in place; the warp calls it
+// one fc2 n-tile (8 k-tiles, 256 * BITS bytes) of lane `lane` in place. The whole warp calls it.
 template <int BITS>
 __device__ __forceinline__ void trw_widen_ntile(uint8_t* nt, int lane)
 {
@@ -110,7 +110,7 @@ __device__ __forceinline__ void trw_widen_ntile(uint8_t* nt, int lane)
 // offset, -, -, n blocks, bits, -); kmix = tr3.kmix [E] or nullptr (exlr8 v2 packs, #65: the width of each (block,
 // matrix), 4 bits at bit 4 * (2b + m); 0 = all at bits, as without kmix). grid = E * nb * 2 * (KSH / 8), nb = max
 // blocks per expert (g6nr::EB: 3 at TP6, 4 at TP4), block = 256.
-// Run it exactly once per tensor: a second run would scramble the bits.
+// Run k_tr3_widen exactly once per tensor: a second run would scramble the bits.
 __global__ void __launch_bounds__(256) k_tr3_widen(uint8_t* fc1, const long long* tab, const long long* kmix, int nb)
 {
     const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
@@ -141,7 +141,7 @@ inline void launch_tr3_widen(void* fc1, const long long* tab, const long long* k
 // decode fc2 reads the 8 k-tiles of one n-tile (768 B, contiguous) with eight 32-bit tile loads.
 // Wide order: [KSH n-tiles][3 loads n][32 lanes][8 B]: the 768 B of an n-tile stay where they are, the lane's chunk of
 // k-tile p sits at bits 24p .. 24p+23 of its three u64. grid = E * nb * (KSH / 8), block = 256 (warp j = n-tile
-// 8 * group + j). tab [E][6]: fc2 byte offset at [1]. Run it exactly once per tensor.
+// 8 * group + j). tab [E][6]: fc2 byte offset at [1]. Run k_tr3_widen2 exactly once per tensor.
 constexpr int TR3W_NT = 8 * 96;                 // bytes of one n-tile of a K3 fc2 block
 __global__ void __launch_bounds__(256) k_tr3_widen2(uint8_t* fc2, const long long* tab, int nb)
 {

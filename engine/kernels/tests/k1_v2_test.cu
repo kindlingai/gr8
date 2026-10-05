@@ -1,13 +1,13 @@
 // #65 decode MoE (K1) on one rank's expert pack: output dump for the NumPy reference (engine/ref/k1_v2_ref.py) and
 // step timing against the GB10 read floor. The pack needs a layer's tr3.* tensors only (tools/convert/v2.py writes
-// expert-only packs; a full rank pack works too). The shared expert is a zero int4 record of the TP size's width
+// expert-only packs, and a full rank pack works too). The shared expert is a zero int4 record of the TP size's width
 // (its bytes are read, its output is zero), so the dumped output is the routed experts' rank partial.
 //
 //   nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -I.. -o k1_v2_test k1_v2_test.cu \
 //        ../../loader/g6pack.cpp ../../loader/devimage.cpp -lcublas -lpthread           (add -DG6_NR=4 for TP4)
 //   k1_v2_test --pack DIR/rank0 --layer 40 [--nr 4] [--M 5] [--dump FILE] [--bench ITERS] [--plans 32] [--seed 1]
 //              [--fuse 1] [--wide 1] [--hot N] [--nokmix] [--int4-shared] [--flush]
-// --pack DIR/rank0 reads DIR/rank0.manifest.json + DIR/rank0.pack. --nr = the TP size the pack was cut for (sets the
+// --pack DIR/rank0 reads DIR/rank0.manifest.json + DIR/rank0.pack. --nr = the pack's TP size (sets the
 // shared expert's width: 64 g32 groups split as g6nr::width). Routing: each token picks 8 distinct experts uniformly
 // (--hot N: from experts 0..N-1 only), weights random and summing to 2.5, one plan per step from --plans rotating
 // plans (so the weights do not stay in the 24 MB L2 across steps). --wide 1 reorders K3 fc1/fc2 into the wide order as
@@ -147,7 +147,7 @@ int main(int argc, char** argv)
     if (const char* e = bind::check_shared_signs(T, st)) die(e);
 #ifndef K1V2_MAIN
     if (const char* e = bind::scan_widths(T)) die(e);
-    if (int4sh) T.sh_trellis = 0;          // --int4-shared: the s_* records (zeros here) instead of trellis row 256
+    if (int4sh) T.sh_trellis = 0;          // --int4-shared: run the s_* records (zeros here)
 #endif
 
     // zero shared expert records at the TP size's widest rank width (64 g32 groups over nr ranks)
@@ -238,7 +238,7 @@ int main(int argc, char** argv)
     }
     if (iters > 0)
     {
-        for (int i = 0; i < 2 * NP; ++i) bind::launch_k1(k, st);      // warm-up; plans rotate through ctl
+        for (int i = 0; i < 2 * NP; ++i) bind::launch_k1(k, st);      // warm-up (plans rotate through ctl)
         CK(cudaStreamSynchronize(st));
         // --flush: before each step, read 64 MB of another buffer through L2 (launch_warm), so nothing of the last step
         // stays there (in the engine, a layer's own shared expert never does); the flush alone is timed and subtracted

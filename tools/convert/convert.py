@@ -420,8 +420,7 @@ def main(argv=None):
     GV = a.gv_records
     layers = list(range(plan.L_MTP + 1)) if a.layers == 'all' else [int(x) for x in a.layers.split(',')]
     if a.v2:
-        have = [l for l in range(plan.L_MTP + 1)
-                if any(os.path.exists(os.path.join(a.v2, v2.LAYOUT['width_file'].format(l=l, k=k))) for k in v2.WIDTHS)]
+        have = [l for l in range(plan.L_MTP + 1) if os.path.exists(os.path.join(a.v2, v2.INDEX_FILE.format(l=l)))]
         vl = have if a.v2_layers == 'auto' else [int(x) for x in a.v2_layers.split(',')]
         if not set(vl) <= set(have) or not vl:
             ap.error(f'--v2: layers {sorted(set(vl) - set(have)) or vl} have no v2 files in {a.v2}')

@@ -94,7 +94,7 @@ __device__ __forceinline__ int tr3_unit(const long long* kmix, int e, const long
 // ---------------------------------------------------------------------------------------------
 // FC1 unit = (slot, block b, matrix gate|up, k-split h). 8*WG warps: warp = (group q, tile j).
 // Reads 8 tiles (128 output cols) x its k range; writes partial fp32 sums gpart[..][h*WG+q][m][128].
-// tr = the slot's expert row of t_tab; mw = the first tile of the unit's matrix (block b, gate|up), BITS = its width
+// tr: the slot's expert row of t_tab. mw: the first tile of the unit's matrix (block b, gate|up). BITS: its width
 // (tr3_unit); units of blocks the expert does not have exit.
 // mask = the slot's tokens (A.slot_mask, or A.sh_mask for the trellis shared expert)
 template <int BITS, bool E4 = false>
@@ -416,8 +416,8 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
 // ---------------------------------------------------------------------------------------------
 // Finalize: out[m] = f16 or bf16( sum_k w[m][k] * sum_b svh_d[e][b] * H128(z[slot][b][m]) + shared[m] ),
 // fixed k, b order. One CTA = (token, one 128-col block), 4 warps x 2 routes each, summed through smem.
-// SH (exlr8 v2 trellis shared expert, #65): shared[m] is the trellis expert of scratch slot n_slots, weight 1, summed
-// by a fifth warp (the CTA has 160 threads) in place of the s_* records' fp16 ypart row.
+// SH (exlr8 v2 trellis shared expert, #65): shared[m] is the trellis expert of scratch slot n_slots with weight 1. A fifth
+// warp sums it (the CTA has 160 threads), and the s_* records' fp16 ypart row is not read.
 template <bool SH = false>
 __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
 {

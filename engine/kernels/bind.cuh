@@ -133,7 +133,7 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
 }
 
 // Once per layer after its tensors are on the device: reads tr3.table (and tr3.kmix) back, checks every width is 2, 3
-// or 4, and sets T.k2 (whether the layer needs the kernels with the 2-bit body). Synchronous; nullptr = ok.
+// or 4, and sets T.k2 (whether the layer needs the kernels with the 2-bit body). Synchronous. nullptr = ok.
 inline const char* scan_widths(LayerTensors& T)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &km = T.t[T_TR3_KMIX];
@@ -528,7 +528,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
     K1Split s = moe ? k1_split(split_m ? split_m : M) : K1_DENSE_SPLIT;
     // Layers whose routed bytes are mostly 2-bit run fc1 and fc2 as separate launches at 3 or more rows (G6_FUSE=1 only):
-    // the 1024-thread fc1 keeps more warps decoding, and 2-bit decode spends more issue slots per byte. Measured on GB10
+    // the 1024-thread fc1 keeps more warps decoding, and 2-bit decode uses more issue slots per byte. On GB10
     // at TP4 (#65): K2 layer at M = 5 459 us against 507 fused, a K3/K2 "down1" layer 500 against 531; fused stays ahead
     // at M = 1 and for layers with a minority of 2-bit units. Layers without 2-bit units are not affected.
     if (fuse == 1 && moe && T.k2 && T.k2_pct >= 50 && (split_m ? split_m : M) >= 3) fuse = 0;

@@ -79,7 +79,7 @@ class V2(unittest.TestCase):
             s.close()
         lay = v2.V2Layer(self.src, L)
         self.assertEqual((lay.widths, lay.shared_widths), ([2, 3, 4], [3, 4]))
-        # fragments (even halves) start on 64 KiB without pad_halves; every half does with it
+        # without pad_halves only fragments (even halves) start on 64 KiB. With it every half does.
         self.assertEqual(int(lay._t(3, 3, 'index')[1, 2, 0]) % (64 << 10), 0)
         self.assertNotEqual(int(lay._t(3, 3, 'index')[1, 3, 0]) % (64 << 10), 0)
         lay.close()
@@ -223,6 +223,10 @@ class V2(unittest.TestCase):
         self.assertEqual(wd.of(256), ([3] * 16, [4] * 8 + [3] * 8, 4))
         self.assertTrue(prov.startswith('pilot sha256:'))
         self.assertEqual(v2.load_widths('down1', L, v1_bits=[3, 4] * (NE // 2))[0].of(256), ([3] * 16, [3] * 16, 3))
+
+    def test_parse_experts(self):
+        self.assertEqual(v2.parse_experts('0-63 (partial: a test set, not a whole layer)'), list(range(64)))
+        self.assertEqual(v2.parse_experts('0-2,7,9-10'), [0, 1, 2, 7, 9, 10])
 
 
 if __name__ == '__main__':

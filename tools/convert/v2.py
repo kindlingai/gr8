@@ -21,8 +21,10 @@ A rank's halves of one expert are not contiguous under the half rule (at TP4 the
 kernels index blocks by row only, so they do not care; table[5] (the first half) is informational.
 
 python3 -m tools.convert.v2 --v2 DIR --layer 40 --nr 5 --out DIR [--widths home|down1|up1|k2|k3|k4|MANIFEST]
-        [--v1 DIR] [--ranks 0,1] [--shared trellis|off]
+        [--v1 DIR] [--ranks 0,1] [--shared trellis|off] [--routed all|files|0-63]
     writes expert-only rank packs (rank<r>.pack + manifest: the layer's tr3.* tensors) for kernel and TP tests.
+python3 -m tools.convert.v2 --v2 DIR --layer 40 --check
+    reads and verifies every half the layer's files hold.
 """
 import argparse
 import hashlib
@@ -67,6 +69,16 @@ def owned_halves(e, l, n, r):
     return [h for h in range(NH) if owner(e, h, l, n) == r]
 
 
+def parse_experts(spec):
+    """'0-255' or '0-63,128' -> sorted list of expert ids (index metadata `experts`; text after the first space, such as
+    the writer's "(partial: a test set ...)" note, is ignored)."""
+    out = set()
+    for part in filter(None, spec.split(' ')[0].split(',')):
+        a, _, b = part.partition('-')
+        out.update(range(int(a), int(b or a) + 1))
+    return sorted(out)
+
+
 def half_digest(trellis, chan, block):
     """SPEC.md 6.4: xxhash64 (seed 0) of the half's B trellis bytes, its 128 per-channel fp16 values, then the
     projection's 48 fp16 hidden-side block scales."""
@@ -99,6 +111,8 @@ class V2Layer:
         if m.get('gate_up_order', GATE_UP_ORDER) != GATE_UP_ORDER or m.get('down_order', DOWN_ORDER) != DOWN_ORDER:
             raise ValueError(f'L{l}: tile orders {m.get("gate_up_order")}/{m.get("down_order")}, want '
                              f'{GATE_UP_ORDER}/{DOWN_ORDER}')
+        self.experts = parse_experts(m.get('experts', f'0-{N_EXP - 1}'))      # routed experts the files hold
+        self.row = {e: i for i, e in enumerate(self.experts)}                 # their rows in the routed index tensors
         self.widths = [k for k in WIDTHS if f'k{k}.index' in self.idx]
         self.shared_widths = [k for k in WIDTHS if f'shared.k{k}.index' in self.idx]
         for key, have in (('widths', self.widths), ('shared_widths', self.shared_widths)):
@@ -134,7 +148,9 @@ class V2Layer:
             return self._get(f'shared.k{k}.{what}')[0]
         if k not in self.widths:
             raise FileNotFoundError(f'L{self.l}: no routed experts at k{k}')
-        return self._get(f'k{k}.{what}')[e]
+        if e not in self.row:
+            raise KeyError(f'L{self.l}: expert {e} is not in the v2 files (they hold {len(self.experts)})')
+        return self._get(f'k{k}.{what}')[self.row[e]]
 
     def hidden(self, e, p, k):
         """(fp16 [6144] hidden-side vector the kernel applies, the 48 block scales the checksum covers):
@@ -247,11 +263,17 @@ def kmix_word(gw, uw, dk, hs):
     return v
 
 
-def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=True):
+def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=True, routed=None):
     """Write layer l's tr3.* tensors from v2 files to every writer (rank r -> PackWriter). nr = the TP size.
-    shared: also store the shared expert as trellis row 256 when widths.shared and the files have it."""
+    shared: also store the shared expert as trellis row 256 when widths.shared and the files have it.
+    routed: the routed experts to take (tests on a partial layer); the others get empty table rows (no blocks), which
+    the kernels skip. Default: all 256, which the files must hold."""
     P = P or f'L{l:03d}'
     xf = dict(info or {})
+    routed = set(range(N_EXP) if routed is None else routed)
+    if not routed <= set(v2.experts):
+        raise ValueError(f'{P}: the v2 files hold experts {v2.experts[0]}..{v2.experts[-1]} ({len(v2.experts)}), '
+                         f'not all {len(routed)} requested')
     experts = list(range(N_EXP))
     if shared and widths.shared:
         need = set(widths.of(SHARED)[0]) | set(widths.of(SHARED)[1]) | {widths.shared}
@@ -259,7 +281,7 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
             raise ValueError(f'{P}: shared expert at widths {sorted(need)} requested, the v2 files have {v2.shared_widths}')
         experts.append(SHARED)
     E = len(experts)
-    own = {r: {e: owned_halves(e, l, nr, r) for e in experts} for r in writers}
+    own = {r: {e: owned_halves(e, l, nr, r) if e == SHARED or e in routed else [] for e in experts} for r in writers}
     W = {e: widths.of(e) for e in experts}
     table = {r: np.zeros((E, 6), np.int64) for r in writers}
     kmix = {r: np.zeros(E, np.int64) for r in writers}
@@ -270,7 +292,7 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
     fc1_bytes = {r: sum(half_bytes(W[e][0][h]) + half_bytes(W[e][1][h]) for e in experts for h in own[r][e]) for r in writers}
     fc2_bytes = {r: sum(half_bytes(W[e][2]) * len(own[r][e]) for e in experts) for r in writers}
 
-    # pass 1: fc1 (gate, up halves; grouped order = g6's fc1 block order), v1, v2[0:2]
+    # pass 1: fc1 (gate and up halves, whose grouped order is g6's fc1 block order), v1, v2[0:2]
     for r, w in writers.items():
         w.begin(f'{P}.tr3.fc1', 'u8', (fc1_bytes[r],),
                 layout='tr3_fc1 per expert per block [2][384][8][TB], TB = 32 * width of (block, matrix) (tr3.kmix)', **xf)
@@ -305,8 +327,8 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
         dk = W[e][2]
         need = sorted(set().union(*(own[r][e] for r in writers)))
         dn = {h: v2.half(e, 'down', h, dk) for h in need}
-        svd = v2.hidden(e, 'down', dk)[0]
-        sud = v2.inter(e, 'down', dk)
+        svd = v2.hidden(e, 'down', dk)[0] if need else None
+        sud = v2.inter(e, 'down', dk) if need else None
         for r, w in writers.items():
             table[r][i][1] = off[r]
             for h in own[r][e]:
@@ -326,20 +348,47 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
     return experts
 
 
+def check_layer(v2):
+    """Read and verify every half of every expert and width the layer's files hold. Returns a summary dict."""
+    n = 0
+    for k in v2.widths:
+        for e in v2.experts:
+            for p in PROJ:
+                for h in range(NH):
+                    v2.half(e, p, h, k)
+                    n += 1
+    for k in v2.shared_widths:
+        for p in PROJ:
+            for h in range(NH):
+                v2.half(SHARED, p, h, k)
+                n += 1
+    return dict(layer=v2.l, widths=v2.widths, shared_widths=v2.shared_widths, experts=len(v2.experts), halves_verified=n)
+
+
 # ---------------------------------------------------------------------------------------------- CLI: expert-only packs
 def main(argv=None):
     from tools.convert.pack import PackWriter
     ap = argparse.ArgumentParser()
     ap.add_argument('--v2', required=True)
     ap.add_argument('--layer', type=int, required=True)
-    ap.add_argument('--nr', type=int, required=True, help='TP size (3..7)')
-    ap.add_argument('--out', required=True)
+    ap.add_argument('--check', action='store_true', help='verify every half the files hold, write nothing')
+    ap.add_argument('--nr', type=int, help='TP size (3..7)')
+    ap.add_argument('--out')
     ap.add_argument('--widths', default='home')
     ap.add_argument('--v1', help='TR3 / exlr8 v1 checkpoint dir, for the home / down1 / up1 widths')
     ap.add_argument('--ranks', default='all')
     ap.add_argument('--shared', default='trellis', choices=('trellis', 'off'))
     ap.add_argument('--shared-width', type=int, default=None, help='override the manifest\'s shared expert width')
+    ap.add_argument('--routed', default='all', help="routed experts to take, e.g. 0-63 (tests on a partial layer); "
+                    "'files' = the experts the index file holds")
     a = ap.parse_args(argv)
+    if a.check:
+        lay = V2Layer(a.v2, a.layer)
+        print(json.dumps(check_layer(lay)))
+        lay.close()
+        return
+    if not a.nr or not a.out:
+        ap.error('--nr and --out are required unless --check')
     bits = None
     if a.v1:
         s = ST(os.path.join(a.v1, f'model-layer-{a.layer:03d}.safetensors'))
@@ -352,8 +401,9 @@ def main(argv=None):
                 expert_formats={str(a.layer): 'exlr8-e4m3'})
     writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, False, meta) for r in ranks}
     v2 = V2Layer(a.v2, a.layer)
+    routed = None if a.routed == 'all' else v2.experts if a.routed == 'files' else parse_experts(a.routed)
     ex = convert_experts_v2(a.layer, v2, wd, writers, a.nr, info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'),
-                            shared=a.shared == 'trellis')
+                            shared=a.shared == 'trellis', routed=routed)
     v2.close()
     for r, w in writers.items():
         m = w.close()

@@ -2391,9 +2391,9 @@ inline void launch_fin(const Expert& A, cudaStream_t st)
     if (A.rs.base) k_pf_fin<true><<<A.M, 256, 0, st>>>(A);
     else k_pf_fin<<<A.M, 256, 0, st>>>(A);
 }
-// The trellis shared expert (exlr8 v2 tr3.table row 256, #65) as its own pass of the routed kernels: every row is one
-// route of expert 256 with weight 1, in segments of RS rows; fc2 writes the rows straight into ysh (S.yw = ysh), which
-// k_pf_fin adds as it adds the MXFP8 shared output otherwise. grid ceil(M / 256), block 256.
+// The trellis shared expert (exlr8 v2 tr3.table row 256, #65) runs as its own pass of the routed kernels. Every row is
+// one route of expert 256 with weight 1, in segments of RS rows. fc2 writes the rows straight into ysh (S.yw = ysh).
+// k_pf_fin adds ysh as it adds the MXFP8 shared output. grid ceil(M / 256), block 256.
 __global__ void __launch_bounds__(256) k_pf_sh_routes(Expert S)
 {
     const int i = blockIdx.x * 256 + threadIdx.x;
@@ -2597,8 +2597,8 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             S.nroutes = M; S.maxseg = (M + RS - 1) / RS;
             S.rr_row = sc.sh_rr_row; S.rr_e = sc.sh_rr_e; S.rr_sp = sc.sh_rr_sp; S.rr_w = sc.sh_rr_w;
             S.segs = sc.sh_segs; S.n_seg = sc.sh_n_seg; S.pos = nullptr;
-            S.yw = sc.ysh;                // weight 1: the expert's rows are the shared output
-            // the MXFP8 shared GEMMs are not run; ysh comes from the pass above
+            S.yw = sc.ysh;                // weight 1: the pass writes the shared output rows
+            // ysh comes from the pass above, so the MXFP8 shared GEMMs stay off
             L.xq_x2.on = 0; L.gate.on = 0; L.up.on = 0; L.act.on = 0; L.xq_act.on = 0; L.down.on = 0;
         }
     }

@@ -1,10 +1,10 @@
-// #65 prefill MoE (bindp::launch_experts: route, fc1, mid, fc2, final sum) on one rank's expert pack: output dump for
-// the NumPy reference (engine/ref/k1_v2_ref.py; prefill quantizes activations to MXFP8, so compare error levels across
-// widths, not to zero) and timing against the GB10 read floor. Same pack and flags as k1_v2_test.cu, plus:
+// #65 prefill MoE (bindp::launch_experts: route, fc1, mid, fc2, final sum) on one rank's expert pack. The test dumps output for
+// the NumPy reference (engine/ref/k1_v2_ref.py) and times against the GB10 read floor. Prefill quantizes activations to
+// MXFP8, so compare the error level across widths. Same pack and flags as k1_v2_test.cu, plus:
 //   pf_v2_test --pack DIR/rank0 --layer 40 [--nr 4] [--M 20] [--dump FILE] [--bench ITERS] [--wide 1] [--seed 1]
 //              [--int4-shared] [--shared-ab]
 // Routing: random router logits (bias 0), the prefill path's own top-8. A pack with tr3.table row 256 also runs the
-// trellis shared expert pass (bindp::launch_shared) unless --int4-shared (then ysh is zero: this harness has no MXFP8
+// trellis shared expert pass (bindp::launch_shared) unless --int4-shared (then ysh is zero: this test has no MXFP8
 // shared weights). --shared-ab: time today's MXFP8 shared GEMMs (random weights at the TP size's width: xq, gate + up,
 // act, xq, down) against the trellis shared pass, both alone.
 // Dump: as k1_v2_test (out converted from BF16 to fp16; flags bit 1 = trellis shared expert in out).
