@@ -94,6 +94,7 @@ struct LayerTensors
     int sh_trellis = 0;               // tr3.table has row 256: the shared expert as trellis (exlr8 v2, #65); scan_widths
                                       // sets it, a caller may clear it to run the s_* records instead (the A/B)
     long long sh_tr[6] = {};          // tr3.table row 256 (scan_widths)
+    long long sh_kmix = 0;            // its tr3.kmix entry
     int sh_uniform = 0;               // every fc1 unit of row 256 has the table width (its tr3.kmix entry is 0)
     struct ShFp8                      // the shared expert's decoded tiles as MXFP8 GEMM operands (make_shared_fp8)
     {
@@ -139,6 +140,14 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
     T.fc2_wide = 1;
 }
 
+// Host twin of tr3_unit for tr3.table row 256 (LayerTensors::sh_tr, sh_kmix): byte offset of its fc1 unit u in tr3.fc1
+inline void sh_unit_off(const LayerTensors& T, int u, size_t& off)
+{
+    constexpr size_t MB = static_cast<size_t>(KSH) * 8 * 32;
+    off = static_cast<size_t>(T.sh_tr[0]);
+    for (int i = 0; i < u; ++i) off += static_cast<size_t>(T.sh_kmix ? (T.sh_kmix >> (4 * i)) & 15 : T.sh_tr[4]) * MB;
+}
+
 // Once per layer after its tensors are on the device: reads tr3.table (and tr3.kmix) back, checks every width is 2, 3
 // or 4, and sets T.k2 (whether the layer needs the kernels with the 2-bit body). Synchronous. nullptr = ok.
 // Every routed expert has at least two halves on every rank at TP3-7, so an expert with no blocks means a partial test
@@ -182,7 +191,8 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
     if (T.sh_trellis)
     {
         for (int i = 0; i < 6; ++i) T.sh_tr[i] = h[256 * 6 + i];
-        T.sh_uniform = !km.p || k[256] == 0;
+        T.sh_kmix = km.p ? k[256] : 0;
+        T.sh_uniform = T.sh_kmix == 0;
     }
     delete[] h;
     return err;
@@ -508,7 +518,11 @@ struct K1
          else if ((k).e4) { if ((k).k2) kern<true, true>__VA_ARGS__; else kern<true, false>__VA_ARGS__; } \
          else { if ((k).k2) kern<false, true>__VA_ARGS__; else kern<false, false>__VA_ARGS__; } } while (0)
 template <bool E4, bool K2, bool SH> inline const void* k1_fn_fc1() { return reinterpret_cast<const void*>(k1_tr3_fc1<E4, K2, SH>); }
-template <bool E4, bool K2, bool SH> inline const void* k1_fn_fused() { return reinterpret_cast<const void*>(k1_tr3_fused<E4, K2, SH>); }
+template <bool E4, bool K2, bool SH> inline const void* k1_fn_fused()
+{
+    if constexpr (SH) return reinterpret_cast<const void*>(k1_tr3_fused_sh<E4, K2>);
+    else return reinterpret_cast<const void*>(k1_tr3_fused<E4, K2, false>);
+}
 
 inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 {
@@ -523,7 +537,12 @@ inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 inline void launch_k1_fused(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
-    K1_PICK(k1_tr3_fused, k, <<<k.gf, 512, k.smf, st>>>(k.a));
+    if (k.sh)
+    {
+        if (k.k2) k1_tr3_fused_sh<true, true><<<k.gf, 512, k.smf, st>>>(k.a);
+        else k1_tr3_fused_sh<true, false><<<k.gf, 512, k.smf, st>>>(k.a);
+    }
+    else K1_PICK(k1_tr3_fused, k, <<<k.gf, 512, k.smf, st>>>(k.a));
 }
 inline void launch_k1_fin(const K1& k, cudaStream_t st)
 {
@@ -617,11 +636,13 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     if (M < 1 || M > 8) return "M must be 1..8";
     // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
     K1Split s = moe ? k1_split(split_m ? split_m : M) : K1_DENSE_SPLIT;
-    // Layers whose routed bytes are mostly 2-bit run fc1 and fc2 as separate launches at 3 or more rows (G6_FUSE=1 only):
-    // the 1024-thread fc1 keeps more warps decoding, and 2-bit decode uses more issue slots per byte. On GB10
-    // at TP4 (#65): K2 layer at M = 5 459 us against 507 fused, a K3/K2 "down1" layer 500 against 531; fused stays ahead
-    // at M = 1 and for layers with a minority of 2-bit units. Layers without 2-bit units are not affected.
-    if (fuse == 1 && moe && T.k2 && T.k2_pct >= 50 && (split_m ? split_m : M) >= 3) fuse = 0;
+    // exlr8 v2 layers (2-bit units or the trellis shared expert, #65) choose fused or separate fc1 / fc2 launches from a
+    // measured table (GB10, TP4 rank 0, MoE step, G6_FUSE=1 only). Separate wins at 2 rows for every layer (3-7.5%), and
+    // at 3+ rows when 2-bit units are at least half the bytes (5-11%). Fused wins at 1 row (1-3%) and for mostly 3/4-bit
+    // layers at 5-8 rows (3-5%). TR3 and v1 layers keep G6_FUSE as given (that choice is #8's).
+    static const bool policy = !getenv("G6_K1_FUSE_POLICY") || atoi(getenv("G6_K1_FUSE_POLICY"));   // 0: A/B runs only
+    const int rows = split_m ? split_m : M;
+    if (policy && fuse == 1 && moe && (T.k2 || T.sh_trellis) && (rows == 2 || (rows >= 3 && T.k2 && T.k2_pct >= 50))) fuse = 0;
     if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently (RESULTS-M1 item 1f).
@@ -735,6 +756,8 @@ struct Layer
     Gv q_a, kv_a, q_b, idx_q, idx_k, idx_w, o_proj, router;
     K1 k1;
     Tensor sh[3];                     // the K1's shared / dense MLP records (fc1 or gate, up, fc2 or down), for warm_mlp
+    const void* shw = nullptr;        // trellis shared expert (#65): its fc1 tiles (tr3.table row 256) and their bytes,
+    size_t shw_bytes = 0;             // for warm_mlp in place of sh[]
 };
 
 // ---------------------------------------------------------------------------------------------- L2 warm-up
@@ -765,6 +788,7 @@ inline void warm_mlp(const Layer& L, cudaStream_t st)
     warm(L.router, st);
     launch_warm(L.sh[0].p, rec_bytes(L.sh[0]), st);
     launch_warm(L.sh[1].p, rec_bytes(L.sh[1]), st);
+    launch_warm(L.shw, L.shw_bytes, st);
 }
 // before the wait for the MLP partials (collective 2i+1): the NEXT layer's q_a (7.1 MB). kv_a and q_b (9.6 MB more)
 // only on a side stream or after the GB10 numbers say the wait is long enough.
@@ -822,6 +846,14 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
 
     if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse, split_m))) return e;
     L.w8 = (qmx ? 1 : 0) | (omx ? 2 : 0) | (L.k1.a.s_mx ? 4 : 0);
+    if (L.k1.sh)                      // row 256's fc1 bytes: 2 matrices per block at each unit's width
+    {
+        size_t o0 = 0, o1 = 0;
+        sh_unit_off(T, 0, o0);
+        sh_unit_off(T, 2 * static_cast<int>(T.sh_tr[3]), o1);
+        L.shw = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p) + o0;
+        L.shw_bytes = o1 - o0;
+    }
     return nullptr;
 }
 

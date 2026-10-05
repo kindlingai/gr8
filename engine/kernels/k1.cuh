@@ -134,8 +134,8 @@ __device__ __forceinline__ int ld_acquire(const int* p)
     return v;
 }
 
-template <bool E4 = false, bool K2 = false, bool SH = false>
-__global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
+template <bool E4, bool K2, bool SH>
+__device__ __forceinline__ void k1_fused_body(const K1Args& A)
 {
     extern __shared__ __align__(16) u32 smem[];
     __shared__ int s_item;
@@ -205,6 +205,20 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
 #if DEC_SLOT >= 2
     if (A.slot.send && A.s_direct) dslot::publish(A.slot, true);
 #endif
+}
+
+template <bool E4 = false, bool K2 = false, bool SH = false>
+__global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
+{
+    k1_fused_body<E4, K2, SH>(A);
+}
+
+// The same with the trellis shared expert. Under __launch_bounds__(512) alone nvcc gives the no-K2 instantiation 64
+// registers and spills (104 B stores, 132 B loads; the others get 101-128 and no spills), so this entry sets the cap.
+template <bool E4 = true, bool K2 = false>
+__global__ __maxnreg__(128) void k1_tr3_fused_sh(K1Args A)
+{
+    k1_fused_body<E4, K2, true>(A);
 }
 
 // ------------------------------------------------------------------ NVFP4 build

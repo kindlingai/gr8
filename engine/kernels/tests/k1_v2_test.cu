@@ -6,7 +6,7 @@
 //   nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -I.. -o k1_v2_test k1_v2_test.cu \
 //        ../../loader/g6pack.cpp ../../loader/devimage.cpp -lcublas -lpthread           (add -DG6_NR=4 for TP4)
 //   k1_v2_test --pack DIR/rank0 --layer 40 [--nr 4] [--M 5] [--dump FILE] [--bench ITERS] [--plans 32] [--seed 1]
-//              [--fuse 1] [--wide 1] [--hot N] [--nokmix] [--int4-shared] [--flush]
+//              [--fuse 1] [--wide 1] [--hot N] [--nokmix] [--int4-shared] [--flush] [--warm] [--split]
 // --pack DIR/rank0 reads DIR/rank0.manifest.json + DIR/rank0.pack. --nr = the pack's TP size (sets the
 // shared expert's width: 64 g32 groups split as g6nr::width). Routing: each token picks 8 distinct experts uniformly
 // (--hot N: from experts 0..N-1 only), weights random and summing to 2.5, one plan per step from --plans rotating
@@ -93,7 +93,7 @@ template <class T> static T* dev(const std::vector<T>& v)
 int main(int argc, char** argv)
 {
     std::string pack_base, dump;
-    int layer = 40, nr = g6nr::NR, M = 5, iters = 0, NP = 32, fuse = 1, wide = 1, hot = 256, nokmix = 0, int4sh = 0, flush = 0;
+    int layer = 40, nr = g6nr::NR, M = 5, iters = 0, NP = 32, fuse = 1, wide = 1, hot = 256, nokmix = 0, int4sh = 0, flush = 0, warmsh = 0, split = 0;
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i)
     {
@@ -113,6 +113,8 @@ int main(int argc, char** argv)
         else if (a == "--nokmix") nokmix = 1;
         else if (a == "--int4-shared") int4sh = 1;
         else if (a == "--flush") flush = 1;
+        else if (a == "--warm") warmsh = 1;
+        else if (a == "--split") split = 1;
         else die("unknown arg " + a);
     }
     if (pack_base.empty() || M < 1 || M > 8 || hot < 8 || hot > 256 || NP < 1) die("usage: see the file header");
@@ -245,14 +247,33 @@ int main(int argc, char** argv)
         // stays there (in the engine, a layer's own shared expert never does); the flush alone is timed and subtracted
         uint8_t* fb = nullptr;
         if (flush) CK(cudaMalloc(&fb, 64u << 20));
-        auto graph = [&](bool k1) {
+        // --warm: after the flush, warm the shared expert as bind::warm_mlp does in the collective wait (trellis row 256's
+        // fc1 bytes, or the s_* fc1 records); timed with the flush and subtracted
+        bind::Layer wl;
+        wl.sh[0] = shrec[0]; wl.sh[1] = shrec[1];
+#ifndef K1V2_MAIN
+        if (k.sh)
+        {
+            size_t o0 = 0, o1 = 0;
+            bind::sh_unit_off(T, 0, o0);
+            bind::sh_unit_off(T, 2 * static_cast<int>(T.sh_tr[3]), o1);
+            wl.sh[0] = wl.sh[1] = bind::Tensor();
+            wl.shw = static_cast<const uint8_t*>(T.t[bind::T_TR3_FC1].p) + o0; wl.shw_bytes = o1 - o0;
+        }
+#endif
+        // what: 0 = the K1 launches, 1 = fc1 only, 2 = fc2 only, 3 = finalize only, -1 = none (flush / warm alone)
+        auto graph = [&](int what) {
             cudaGraph_t g;
             cudaGraphExec_t ge;
             CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
             for (int i = 0; i < NP; ++i)
             {
                 if (flush) launch_warm(fb, 64u << 20, st);
-                if (k1) bind::launch_k1(k, st);
+                if (warmsh) bind::warm_mlp(wl, st);
+                if (what == 0) bind::launch_k1(k, st);
+                else if (what == 1) bind::launch_k1_fc1(k, st);
+                else if (what == 2) bind::launch_k1_fc2(k, st);
+                else if (what == 3) bind::launch_k1_fin(k, st);
             }
             CK(cudaStreamEndCapture(st, &g));
             CK(cudaGraphInstantiate(&ge, g, 0));
@@ -278,11 +299,19 @@ int main(int argc, char** argv)
             std::sort(ms.begin(), ms.end());
             return std::make_pair(1e3 * ms[reps / 2] / NP, 1e3 * ms[0] / NP);
         };
-        auto [us, best] = run(graph(true));
-        if (flush)
+        auto [us, best] = run(graph(0));
+        double base = 0;
+        if (flush || warmsh)
         {
-            const auto [fu, fbest] = run(graph(false));
+            const auto [fu, fbest] = run(graph(-1));
+            base = fu;
             us -= fu; best -= fbest;
+        }
+        if (split)
+        {
+            if (k.fuse) die("--split needs --fuse 0");
+            const double a1 = run(graph(1)).first - base, a2 = run(graph(2)).first - base, a3 = run(graph(3)).first - base;
+            printf("split M=%d: fc1 %.1f us, fc2 %.1f us, finalize %.1f us (each alone)\n", M, a1, a2, a3);
         }
         printf("bench M=%d fuse=%d wide=%d sh=%d flush=%d plans=%d: median %.1f us/step (best %.1f), trellis %.2f MB/step -> %.1f GB/s = %.1f%% "
                "of 220; all bytes %.2f MB -> %.1f GB/s = %.1f%%; slots/step %.1f\n",
