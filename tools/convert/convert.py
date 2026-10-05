@@ -16,6 +16,12 @@ use the same tensor names and layout and convert the same way. An exlr8-e4m3 lay
 `"expert_format": "exlr8-e4m3"` in the manifest (the engine then decodes its codebook with E4M3 rounding), and the
 manifest's top-level `expert_formats` maps those layers to their format. TR3 layers get neither, so a TR3 pack and its
 manifest are the same as before #19.
+
+exlr8 v2 expert files (#65, tools/convert/v2.py): --v2 DIR takes the routed experts of every layer that has v2 files in
+DIR (or of --v2-layers) from them instead of from --tr3, at the widths --v2-widths picks, and stores the shared expert
+as trellis row 256 of tr3.table (--v2-shared). Everything else in those layers still comes from --tr3 and --d8, and the
+shared expert's int4 / MXFP8 records are still written, so the engine can run either shared path. Such a layer's tr3.*
+entries carry `"expert_source": "exlr8-v2"` and add tr3.kmix; the manifest's `v2_layers` maps them to their widths.
 """
 import argparse
 import os
@@ -28,7 +34,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(ROOT, 'engine', 'ref'))
 import g6ref  # noqa: E402  (record layouts: rt_record / rt_expert_record)
 
-from tools.convert import mxfp8, plan  # noqa: E402
+from tools.convert import mxfp8, plan, v2  # noqa: E402
 from tools.convert.pack import PackWriter  # noqa: E402
 from tools.convert.st import ST  # noqa: E402
 
@@ -39,6 +45,7 @@ VERSION = 'g6convert-v1'
 # safetensors metadata `exlr8` of a layer file -> expert format (no key: TR3)
 EXPERT_FORMATS = {None: 'tr3', 'exlr8-e4m3-v1': 'exlr8-e4m3'}
 GV = False  # --gv-records: also write the decode GEMV record streams (g6ref.mxfp8_record / bf16_record)
+V2 = None   # --v2: dict(dir, layers, widths, shared, shared_width)
 
 
 # ---------------------------------------------------------------------------------------------- D8 GPTQ
@@ -213,8 +220,10 @@ def convert_layer(l, src, d8, writers):
         put_mx(w, f'{P}.{tag}.down', np.ascontiguousarray(down_b[:, a:b]), gv=mtp and moe, **gi)
     del gate_b, up_b, down_b
 
-    # ---- routed experts (TR3)
-    if moe:
+    # ---- routed experts (TR3 / exlr8 v1, or exlr8 v2)
+    if moe and V2 and l in V2['layers']:
+        convert_experts_v2(l, src, writers)
+    elif moe:
         convert_experts(l, src, writers)
 
     # ---- MTP extras
@@ -342,6 +351,20 @@ def convert_experts(l, src, writers):
               layout='[256][6] fc1_byte_off, fc2_byte_off, first_blk_row, n_blocks, bits, first_block(0..15)', **xf)
 
 
+def convert_experts_v2(l, src, writers):
+    """Routed (and shared) experts of layer l from the v2 files; the v1 layer file only gives the home split."""
+    bits = v2.v1_bits_of(src, l)
+    sw = V2['shared_width'] if V2['shared'] == 'trellis' else 0
+    wd, prov = v2.load_widths(V2['widths'], l, bits, sw)
+    lay = v2.V2Layer(V2['dir'], l)
+    for w in writers.values():
+        w.meta.setdefault('expert_formats', {})[str(l)] = 'exlr8-e4m3'
+        w.meta.setdefault('v2_layers', {})[str(l)] = prov
+    v2.convert_experts_v2(l, lay, wd, writers, plan.NR, P=f'L{l:03d}',
+                          info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'), shared=V2['shared'] == 'trellis')
+    lay.close()
+
+
 def _frags(owned):
     b0, n = owned
     return {b // 4 for b in range(b0, b0 + n)}
@@ -382,13 +405,27 @@ def main(argv=None):
     ap.add_argument('--skip', default='', help='comma list of globals to leave out: embed, head')
     ap.add_argument('--drop-cache', action='store_true', help='fdatasync + FADV_DONTNEED written and read pages')
     ap.add_argument('--gv-records', action='store_true', help='add .mx.gv / .gv GEMV record tensors (densev.cuh)')
+    ap.add_argument('--v2', help='exlr8 v2 expert files dir (#65): routed + shared experts of its layers come from it')
+    ap.add_argument('--v2-layers', default='auto', help='comma list, or auto = every layer with v2 files in --v2')
+    ap.add_argument('--v2-widths', default='home', help='home | down1 | up1 | k2 | k3 | k4 | a width manifest file')
+    ap.add_argument('--v2-shared', default='trellis', choices=('trellis', 'off'),
+                    help='store the shared expert as trellis row 256 (the int4 / MXFP8 records are written either way)')
+    ap.add_argument('--v2-shared-width', type=int, default=None, choices=(3, 4),
+                    help="the shared expert's width (default: the manifest's; K4 for home and up1, K3 for down1)")
     a = ap.parse_args(argv)
     if len(a.d8) not in (4, 6):
         ap.error(f'--d8 takes six dirs (TP6) or four (TP4), got {len(a.d8)}')
     plan.set_nr(len(a.d8))
-    global GV
+    global GV, V2
     GV = a.gv_records
     layers = list(range(plan.L_MTP + 1)) if a.layers == 'all' else [int(x) for x in a.layers.split(',')]
+    if a.v2:
+        have = [l for l in range(plan.L_MTP + 1)
+                if any(os.path.exists(os.path.join(a.v2, v2.LAYOUT['width_file'].format(l=l, k=k))) for k in v2.WIDTHS)]
+        vl = have if a.v2_layers == 'auto' else [int(x) for x in a.v2_layers.split(',')]
+        if not set(vl) <= set(have) or not vl:
+            ap.error(f'--v2: layers {sorted(set(vl) - set(have)) or vl} have no v2 files in {a.v2}')
+        V2 = dict(dir=a.v2, layers=set(vl), widths=a.v2_widths, shared=a.v2_shared, shared_width=a.v2_shared_width)
     ranks = list(range(plan.NR)) if a.ranks == 'all' else [int(x) for x in a.ranks.split(',')]
     if any(r < 0 or r >= plan.NR for r in ranks):
         ap.error(f'--ranks must be 0..{plan.NR - 1}')
