@@ -29,7 +29,7 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
 // one fc1 unit of the slot's expert e at its width (tr3_unit). K2 = the layer has 2-bit units (bind::scan_widths):
 // only then is the K2 body compiled in. The K2 body makes K3 units about 3.5% slower at M = 5 (GB10, #65). Layers
 // without 2-bit units therefore take the K3 / K4 kernels.
-template <bool E4, bool K2>
+template <bool E4, bool K2, bool BS = false>
 __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit, int e, int mask, u32* smem)
 {
     const long long* tr = A.t_tab + 6 * e;
@@ -38,9 +38,9 @@ __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit,
     size_t off;
     const int k = tr3_unit(A.t_kmix, e, tr, b * 2 + mat, off);
     const uint8_t* mw = A.t_fc1 + off;
-    if (k == 3) tr3_fc1_body<3, E4>(A, plan, unit, tr, mw, mask, smem);
-    else if (!K2 || k == 4) tr3_fc1_body<4, E4>(A, plan, unit, tr, mw, mask, smem);
-    else tr3_fc1_body<K2 ? 2 : 4, E4>(A, plan, unit, tr, mw, mask, smem);
+    if (k == 3) tr3_fc1_body<3, E4, BS>(A, plan, unit, tr, mw, mask, smem);
+    else if (!K2 || k == 4) tr3_fc1_body<4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
+    else tr3_fc1_body<K2 ? 2 : 4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
 }
 
 // one fc2 unit. Down has one width per expert (tr[4]).
@@ -82,7 +82,7 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
     {
         int e, mask, ss;
         const int slot = blockIdx.x / ups;
-        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem);
+        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) { if (SH && A.t_v1b) tr3_fc1_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem); else tr3_fc1_any<E4, K2>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem); }
     }
     else if (!SH) k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
@@ -158,7 +158,7 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
         {
             const int slot = item / u1, b = (item / (A.KS1 * 2)) % A.B;
             int e, mask, ss = slot;
-            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2>(A, plan, item + (ss - slot) * u1, e, mask, smem);
+            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) { if (SH && A.t_v1b) tr3_fc1_any<E4, K2, SH>(A, plan, item + (ss - slot) * u1, e, mask, smem); else tr3_fc1_any<E4, K2>(A, plan, item + (ss - slot) * u1, e, mask, smem); }
             __threadfence();
             __syncthreads();
             if (t == 0) atomicAdd(done + ss * A.B + b, 1);
@@ -214,7 +214,7 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
 }
 
 // The same with the trellis shared expert. Under __launch_bounds__(512) alone nvcc gives the no-K2 instantiation 64
-// registers and spills (104 B stores, 132 B loads). The others get 101-128 and no spills. This entry sets the cap.
+// registers and spills (104 B stores, 132 B loads; the others get 101-128 and no spills), so this entry sets the cap.
 template <bool E4 = true, bool K2 = false>
 __global__ __maxnreg__(128) void k1_tr3_fused_sh(K1Args A)
 {

@@ -1,13 +1,15 @@
 """Teacher-forced scoring of token rows on a running g6 (the student side of a KL against a teacher, #65 / SPEC A3).
 
 python3 bench/score_rows.py ROWS OUT.jsonl [--url http://127.0.0.1:8100] [--k 20] [--rows 977:1041] [--timeout 300]
-        [--label L --note TEXT]
+        [--label L --note TEXT] [--raw]
 
 ROWS: a .npy integer array [rows][len], a .json list of token-id lists, or a raw little-endian int32 file with
 --len L. Each row is sent as a token-id prompt with max_tokens=1, temperature 0 and prompt_logprobs=k (the gate
 harness's KL path, bench/gate/kl.py). OUT gets one JSON line per row: {"row", "n", "lp": [logprob of the actual token
 at positions 1..n-1], "top": [[[id, logprob] x k] per position 1..n-1]}. The actual token's logprob is exact even
-outside the top k. A request that takes longer than --timeout fails the run. With --label, OUT.json next to OUT.jsonl
+outside the top k. --raw writes {"row", "prompt_logprobs": the server's list unchanged} instead (entry 0 null, entry j
+keyed by token id: the actual token plus ranks 1..k). OUT is written as OUT.tmp and renamed when every row is in. A
+request that takes longer than --timeout fails the run. With --label, OUT.json next to OUT.jsonl
 records the label, the note (commit, flags, packs), the rows file and its sha256, the selection and the server URL.
 Stdlib only (the .npy reader handles little-endian integer arrays).
 """
@@ -66,6 +68,7 @@ def main():
     ap.add_argument('--timeout', type=float, default=300)
     ap.add_argument('--label', default='')
     ap.add_argument('--note', default='')
+    ap.add_argument('--raw', action='store_true', help="write the server's prompt_logprobs list unchanged")
     a = ap.parse_args()
     rows = load_rows(a.rows, a.len)
     if a.sel:
@@ -84,13 +87,20 @@ def main():
         with open(os.path.splitext(a.out)[0] + '.json', 'w') as f:
             json.dump(side, f, indent=1)
     t0 = time.time()
-    with open(a.out, 'w') as f:
+    with open(a.out + '.tmp', 'w') as f:
         for n, i in enumerate(idx):
             ids = [int(x) for x in rows[i]]
             r = c.complete(ids, max_tokens=1, temperature=0, prompt_logprobs=a.k)
             plp = r['choices'][0]['prompt_logprobs']
             if plp is None or len(plp) != len(ids):
                 sys.exit(f'row {i}: {None if plp is None else len(plp)} prompt_logprobs for {len(ids)} tokens')
+            if any(str(ids[j]) not in plp[j] for j in range(1, len(ids))):
+                sys.exit(f'row {i}: a position lacks its actual token')
+            if a.raw:
+                f.write(json.dumps({'row': i, 'prompt_logprobs': plp}) + '\n')
+                f.flush()
+                print(f'row {i} ({n + 1}/{len(idx)}): {len(ids)} tokens, {time.time() - t0:.0f} s', flush=True)
+                continue
             lp, top = [], []
             for j in range(1, len(ids)):
                 e = plp[j]
@@ -101,6 +111,7 @@ def main():
             f.write(json.dumps({'row': i, 'n': len(ids), 'lp': lp, 'top': top}) + '\n')
             f.flush()
             print(f'row {i} ({n + 1}/{len(idx)}): {len(ids)} tokens, {time.time() - t0:.0f} s', flush=True)
+    os.replace(a.out + '.tmp', a.out)
 
 
 if __name__ == '__main__':

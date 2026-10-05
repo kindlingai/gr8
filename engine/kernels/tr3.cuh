@@ -96,8 +96,23 @@ __device__ __forceinline__ int tr3_unit(const long long* kmix, int e, const long
 // Reads 8 tiles (128 output cols) x its k range; writes partial fp32 sums gpart[..][h*WG+q][m][128].
 // tr: the slot's expert row of t_tab. mw: the first tile of the unit's matrix (block b, gate|up). BITS: its width
 // (tr3_unit); units of blocks the expert does not have exit.
+// The 4 hidden-side values at k of block row `row`: the stored vector, or BS (block-scale form, exlr8 v2 prototype,
+// #65): the layer sign times the row's scale of k's 128-block. v2 vectors are exactly sign x block scale, so both give
+// the same bits.
+template <bool BS>
+__device__ __forceinline__ uint2 tr3_hid4(const __half* vec, const __half* sg, const __half* blk, size_t row, int k)
+{
+    if (!BS) return *reinterpret_cast<const uint2*>(vec + row * HID + k);
+    const uint2 s = *reinterpret_cast<const uint2*>(sg + k);
+    const __half2 c = __half2half2(blk[row * (HID / 128) + k / 128]);
+    uint2 r;
+    r.x = as_u32(__hmul2(as_h2(s.x), c));
+    r.y = as_u32(__hmul2(as_h2(s.y), c));
+    return r;
+}
+
 // mask = the slot's tokens (A.slot_mask, or A.sh_mask for the trellis shared expert)
-template <int BITS, bool E4 = false>
+template <int BITS, bool E4 = false, bool BS = false>
 __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit, const long long* tr, const uint8_t* mw, int mask, u32* smem)
 {
     constexpr int TB = 32 * BITS;
@@ -145,7 +160,8 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                 blk[u] = tk / nact;
                 const int k = ks0 * 16 + blk[u] * 128 + lane * 4;
                 xr[u] = *reinterpret_cast<const uint2*>(A.x + m[u] * HID + k);
-                sr[u] = *reinterpret_cast<const uint2*>(suh + k);
+                if (BS) sr[u] = tr3_hid4<true>(nullptr, A.t_sg, A.t_v1b, row * 2 + mat, k);
+                else sr[u] = *reinterpret_cast<const uint2*>(suh + k);
             }
             #pragma unroll
             for (int u = 0; u < 2; ++u)
@@ -422,6 +438,7 @@ template <bool SH = false>
 __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
 {
     constexpr int NW = SH ? 5 : 4;
+    const bool BSF = SH && A.t_v3b;   // block-scale form (prototype, v2 layers only)
     __shared__ float4 red[NW][32];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int m = blockIdx.x / 48;
@@ -449,7 +466,8 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
                 if (b < nb[u])
                 {
                     zr[u][b] = *reinterpret_cast<const uint2*>(A.z + ((static_cast<size_t>(sl) * A.B + b) * 8 + m) * HID + n0);
-                    sr[u][b] = *reinterpret_cast<const uint2*>(A.t_v3 + (row + b) * HID + n0);
+                    sr[u][b] = BSF ? tr3_hid4<true>(nullptr, A.t_sg + HID, A.t_v3b, row + b, n0)
+                                   : *reinterpret_cast<const uint2*>(A.t_v3 + (row + b) * HID + n0);
                 }
         }
         #pragma unroll
@@ -477,7 +495,8 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
             if (b < nb)
             {
                 zr[b] = *reinterpret_cast<const uint2*>(A.z + ((static_cast<size_t>(A.n_slots) * A.B + b) * 8 + m) * HID + n0);
-                sr[b] = *reinterpret_cast<const uint2*>(A.t_v3 + (row + b) * HID + n0);
+                sr[b] = BSF ? tr3_hid4<true>(nullptr, A.t_sg + HID, A.t_v3b, row + b, n0)
+                            : *reinterpret_cast<const uint2*>(A.t_v3 + (row + b) * HID + n0);
             }
         #pragma unroll
         for (int b = 0; b < g6nr::EB; ++b)

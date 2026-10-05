@@ -37,6 +37,8 @@ struct K1Args
     const __half* t_v2;        // [block row][3][128]   svh gate, svh up, suh down
     const __half* t_v3;        // [block row][6144]     svh down
     int B, KS1, WG, NS2;       // max 128-blocks per expert (grid and scratch stride), fc1 k-splits per CTA grid, warp groups, fc2 n-splits
+    const __half *t_sg, *t_v1b, *t_v3b;   // block-scale form (#65 prototype, SH layers): layer signs [2][6144] (in, out) as
+                               // fp16 +-1, v1 as [block row][2][48], v3 as [block row][48]; nullptr = t_v1 / t_v3
     int sh_e, sh_mask;         // trellis shared expert (exlr8 v2, #65; the SH kernels): its tr3.table row (256) and the
                                // token mask (all M); it runs as slot n_slots with weight 1, in place of the s_* records
     float* gpart;              // [SMAX][B][2][GPMAX][8][128]
