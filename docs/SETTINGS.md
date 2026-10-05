@@ -99,6 +99,7 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `DEC_AVP=1` | decode absorb / value-project for small row counts in one launch |
 | `DEC_I4PAIR=1` | decode int4 records (q_a, o_proj) repacked once at load into a paired layout |
 | `SEL32` | the exact top-k selector is used past 32,768 tokens of context too |
+| `DEC_IDX31=1` | decode index scorer reads each key once for all query rows and skips tiles another CP rank owns; select stops at the live end of the bucket (exact, #31; needs `SEL32`) |
 | `G6_CP=1`, `G6_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
 
 ## Front end and shim
