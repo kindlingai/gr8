@@ -98,7 +98,9 @@ int main(int argc, char** argv)
         while (D.ks > 1 && K16 % D.ks) D.ks >>= 1;
         CK(cudaMalloc(&D.xa, static_cast<size_t>(3) * K16 * 64 * 4));
         CK(cudaMemset(D.xa, 0, static_cast<size_t>(3) * K16 * 64 * 4));
-        CK(cudaMalloc(&D.part, static_cast<size_t>(D.ks) * 24 * N * 4));
+        CK(cudaMalloc(&D.part, static_cast<size_t>(16) * 24 * N * 4));
+        CK(cudaMalloc(&D.cnt, (N / 128) * sizeof(int)));
+        CK(cudaMemset(D.cnt, 0, (N / 128) * sizeof(int)));
 
         // correctness at M = 5 and 20 on copy 0, against the host decode
         for (int M : {5, 20})
@@ -144,6 +146,29 @@ int main(int argc, char** argv)
                 maxrel = std::max(maxrel, err / mx);
             }
             printf("%s TP%d K%d: M=%d trellis GEMV vs host decode: max rel err %.2e %s\n", S.name, tp, bits, M, maxrel, maxrel < 5e-3 ? "ok" : "FAIL");
+            // the one-launch kernel on the same rotated input (xa from the launch above) against the three-launch one
+            for (int sub = 1; sub <= 2; ++sub)
+                for (int k2s : {2, 4})
+                {
+                    tr3d::Dense d1 = D;
+                    d1.ks = k2s; d1.sub = sub;
+                    if (K16 % (d1.ks * sub)) continue;
+                    __half* dy1;
+                    CK(cudaMalloc(&dy1, static_cast<size_t>(M) * N * 2));
+                    tr3d::launch1(d1, M, dy1, st);
+                    CK(cudaStreamSynchronize(st));
+                    CK(cudaGetLastError());
+                    std::vector<__half> y1(static_cast<size_t>(M) * N);
+                    CK(cudaMemcpy(y1.data(), dy1, y1.size() * 2, cudaMemcpyDeviceToHost));
+                    double e = 0, mx = 0;
+                    for (size_t i = 0; i < y1.size(); ++i)
+                    {
+                        mx = std::max(mx, (double)std::fabs(__half2float(yh[i])));
+                        e = std::max(e, (double)std::fabs(__half2float(y1[i]) - __half2float(yh[i])));
+                    }
+                    printf("  one-launch ks=%d sub=%d vs three-launch: max rel %.2e %s\n", k2s, sub, e / mx, e / mx < 2e-3 ? "ok" : "FAIL");
+                    CK(cudaFree(dy1));
+                }
         }
 
         // int4 g32 and MXFP8 records of the same shape (bind::make_gv splits of today's paths)
@@ -216,8 +241,20 @@ int main(int argc, char** argv)
                     bind::launch(gm, st);
                 }
             });
-            printf("  M=%2d: trellis K%d %7.1f us (%5.1f GB/s) | int4 g32 %7.1f us (%5.1f GB/s) | MXFP8 %7.1f us | trellis/int4 %.2f\n", M, bits, tt,
-                   mat / tt / 1e3, ti, mi4 / ti / 1e3, tm, tt / ti);
+            // one launch, input rotated by the producer (not timed): best of ks in {1, 2, 4, 8} x sub in {1, 2}
+            double t1 = 1e30;
+            int bk = 0, bs = 0;
+            for (int sub = 1; sub <= 2; ++sub)
+                for (int k2s : {1, 2, 4, 8})
+                {
+                    if (K16 % (k2s * sub) || (K16 / (k2s * sub)) % 8) continue;
+                    tr3d::Dense d1 = D;
+                    d1.ks = k2s; d1.sub = sub;
+                    const double t = time([&](int i) { tr3d::Dense d = d1; d.w = dw + (i % P) * mat; tr3d::launch1(d, M, dy, st); });
+                    if (t < t1) { t1 = t; bk = k2s; bs = sub; }
+                }
+            printf("  M=%2d: trellis K%d %7.1f us | one launch %7.1f us (ks %d, sub %d) | int4 g32 %7.1f us | MXFP8 %7.1f us | "
+                   "trellis/int4 %.2f, one launch/int4 %.2f\n", M, bits, tt, t1, bk, bs, ti, tm, tt / ti, t1 / ti);
         }
         CK(cudaFree(dw)); CK(cudaFree(di4)); CK(cudaFree(dmx)); CK(cudaFree(xf)); CK(cudaFree(D.xa)); CK(cudaFree(D.part));
     }
