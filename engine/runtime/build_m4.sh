@@ -1,6 +1,7 @@
 #!/bin/bash
-# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all]
+# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl]
 # m4sim: one GPU, six simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
+# dfl: dfltest only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py).
 set -e
 cd "$(dirname "$0")"
 export PATH=/usr/local/cuda/bin:$PATH
@@ -16,6 +17,11 @@ nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack
 nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
 nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/attn.cu -o $O/attn.o
 nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/bind.cu -o $O/attn_bind.o
+if [ "$WHAT" = dfl ]; then
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  ls -la $OUT/dfltest
+  exit 0
+fi
 if [ "$WHAT" != g6 ]; then
   nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/m4sim m4sim.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
   ls -la $OUT/m4sim

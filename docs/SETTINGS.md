@@ -17,6 +17,9 @@ the short version.
 | `--layers all` | all | all 78 layers + the MTP layer |
 | `--qo-manifest` / `--qo-pack` | `packs/qo.*` | full-head attention weights for `G6_PF_OWN=3` (identical file on every node) |
 | `--qp-manifest` / `--qp-pack` | (TP4, not used) | resident pair weights for `G6_PF_OWN=4` (`tools/convert/pairpack.py`, one file per rank); the TP4 launcher uses `G6_PF_QP_ROLL` instead |
+| `--dflash-manifest` / `--dflash-pack` | off (TP4: `DFLASH=1`) | replaces MTP with the DFlash2 block drafter (`engine/runtime/dflash.cuh`), packs from `tools/convert/dflash2.py` (one per rank, about 0.86 GB). It drafts 7 tokens per round in one forward. Refused with `--mtp` or `--s2`. TP4 builds (the rank count must divide the drafter's 8 KV heads) |
+| `--dflash-sel 0\|1` | 1 (`DFLASH_SEL`) | 1 = the DFlash2 selector walk over the top-16 candidates of each position, 0 = the drafter's argmax (sampled with the target's position keys) |
+| `--dflash-k K` | 7 (`DFLASH_K`) | the drafts a round verifies (1..7); a verify step carries K + 1 rows. The drafter always drafts the whole block |
 | `--serve DIR` | `$G6_HOME/serve` | serve loop: requests arrive as `DIR/req.<n>`, rank 0 writes `DIR/resp.<n>`, `DIR/quit` ends it, `DIR/ready` appears once loaded |
 | `--cap N` | 614400 | KV pool in tokens (the longest context) |
 | `--mtp K` | 2 | MTP speculative draft length |
@@ -58,6 +61,8 @@ the short version.
 | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
 | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
 | `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (`--proxy-cpu` and the four below it) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
+| `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |
+| `G6_DFL_DUMP` | unset | `--dflash` measurement, rank 0: a file that gets every draft step's context features, drafts and the committed tokens (`engine/ref/dflash2_replay.py` replays it through the reference drafter) |
 
 `G6ENV_X="NAME=value ..."` adds more variables on every rank. The engine rejects bad `G6_PF_*` values at startup
 (`engine/runtime/envparse.h`).

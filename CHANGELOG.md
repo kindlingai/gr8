@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-05: DFlash2 block drafter (opt-in, `DFLASH=1`, TP4)
+
+- `--dflash-manifest/--dflash-pack` (`engine/runtime/dflash.cuh`) replace MTP with the DFlash2 drafter of GLM 5.3. It
+  drafts 7 tokens per round in one forward of its 6 layers, from the target's residual after layers 5, 19, 33, 47, 61
+  and 75. Each TP4 rank holds 16 query heads, 2 KV heads and 3,072 MLP channels as MXFP8 records (0.70 GB). BF16
+  records gave the same acceptance. The drafter runs on its own fabric region (14 collectives) as one captured graph,
+  5.6 ms per step at 2200 MHz. Its KV is a 4,096-position ring per layer (25 MB per rank), and taps in the prefill give
+  it the prompt's last 2,048 positions.
+- `--dflash-sel 1` (default) runs the DFlash2 selector walk over each position's top 16. `--dflash-k K` verifies only
+  the first K drafts. Committed tokens are always the target's own samples. At `--dflash-k 2` the output equals MTP
+  k=2's byte for byte.
+- Target taps: `Model::dfl_tap` and `Prefill::dfl_tap` hooks in host code, null without `--dflash`. The MTP path and the
+  TP6 build stay as they were.
+- Tools: `tools/convert/dflash2.py` (drafter safetensors -> rank packs, `--head` for lm_head test packs),
+  `engine/ref/dflash2_ref.py` (NumPy reference), `engine/ref/dflash2_check.py` with `engine/runtime/dfltest.cu` (the
+  step of all ranks on one GPU against the reference), `engine/ref/dflash2_replay.py` (replays a `G6_DFL_DUMP`).
+
 ## 2026-10-04: logprobs and prompt_logprobs (issue #23)
 
 - The head returns the top 20 tokens of a row on request (`SampleRow::topk`): each rank selects its slice's best 20 and

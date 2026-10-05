@@ -247,6 +247,7 @@ struct Model
     int vlo = 0, vn = 0;
     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
+    void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
     int ncoll() const { return 2 * nl + 1; }
 #if defined(G6_CP) && G6_CP
     CpState cp;
@@ -913,6 +914,7 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
         launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st);
         launch_mlp_block(m, i, M, st);
         launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st);
+        if (m.dfl_tap) m.dfl_tap(m, i, M, st);
     }
     if (part == 0) return;
     launch_head_local(m, M, st);

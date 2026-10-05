@@ -161,6 +161,10 @@ pack format, serve loop, front end shape). Use it as the map for porting another
   393,216-token pool. TP4 numbers (2200 MHz cap, launcher defaults): 8K prefill 1,318 tok/s, 32K 1,288 tok/s, 18K TTFT
   14.5 s, 87K TTFT 73.3 s, decode code/prose/structured 34.8/31.5/37.0 tok/s, 87K and 250K needles found (#39).
   With `G6_PF_OWN=1` (no QO attention): 8K 816 tok/s, 32K 654 tok/s.
+- DFlash2 drafter, opt-in at TP4: `DFLASH=1 scripts/launch_tp4.sh` replaces MTP with the DFlash2 block drafter
+  (`engine/runtime/dflash.cuh`, packs from `tools/convert/dflash2.py`). It is lossless and leaves more memory free than
+  MTP, because the MTP layer is not built. With GLM 5.3's template the gate workloads are reasoning text, and there it
+  does not beat MTP k=2. The drafter wins on JSON answers. MTP stays the default. Numbers in the PR.
 - `logprobs` and `prompt_logprobs` work up to k = 20 (ranks beyond the top 20 are null). `top_k`/`min_p` are ignored with a warning. The full list is in `frontend/README.md`.
 - Requests are passed to the ranks other than 0 as files over ssh (one persistent connection per node), which adds a little TTFT.
 - With hashing on, boot takes a few minutes. It is mostly pack read speed: local packs loaded at about 1.8 GB/s per node

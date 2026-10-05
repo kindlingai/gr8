@@ -25,6 +25,7 @@ the full-index layers; vocab 154,880.
 | attention | `engine/attn/` | MLA latent attention (kv_a 576 = 512 + 64 rope, UK/UV absorb), the DSA-style sparse indexer and its exact top-2048 selector (`select.cuh`), value head dim 256 in decode (`decode-small.cuh`) |
 | | `engine/runtime/rank.cuh` | `QA = 2048`, `KVA = 576`, `IDXQ = 4096`, `IDXK = 128`, `IDXW = 32`; the layer sequence (dense / MoE / MTP) |
 | | `engine/runtime/qo_weights.cuh`, `attn/prefill-qo-*` | full-head QO attention shapes |
+| drafter | `engine/runtime/dflash.cuh`, `tools/convert/dflash2.py` | the GLM 5.3 DFlash2 drafter: 6 layers, 64 q / 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), target layers 5..75 (from the pack), selector rank 256 / top 16; TP must divide the 8 KV heads |
 | front end | `frontend/g6shim.py` | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
 | | `frontend/g6front/glm_parser.py` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format |
 | | `frontend/g6front/template.py`, `tokenizer.py` | read `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so these follow the model directory |

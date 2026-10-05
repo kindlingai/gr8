@@ -24,10 +24,15 @@
 //                     Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3; no --serve; --prompt is ignored.
 //      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident from tools/convert/pairpack.py; or
 //                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
+//      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
+//                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from tools/convert/dflash2.py. --dflash-sel 1 =
+//                     the DFlash2 selector walk (default when the pack has it), 0 = argmax drafts; --dflash-k K = verify
+//                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, no --s2.
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
 #include "prefill.cuh"
+#include "dflash.cuh"
 #include "serve.h"
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
@@ -58,6 +63,9 @@ int main(int argc, char** argv)
     std::string manifest, packfile, layers_s = "0,3,40,77";
     std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
     std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
+    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
+    int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
+    int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
     std::vector<std::string> prompts;
     Plan plan;
     int cap = 64;
@@ -85,6 +93,10 @@ int main(int argc, char** argv)
         else if (a == "--qo-pack") qo_file = next();
         else if (a == "--qp-manifest") qp_man = next();
         else if (a == "--qp-pack") qp_file = next();
+        else if (a == "--dflash-manifest") dfl_man = next();
+        else if (a == "--dflash-pack") dfl_file = next();
+        else if (a == "--dflash-sel") dfl_sel = atoi(next().c_str());
+        else if (a == "--dflash-k") dfl_k = atoi(next().c_str());
         else if (a == "--layers") layers_s = next();
         else if (a == "--prompt") prompts.push_back(next());
         else if (a == "--gen") plan.n_gen = atoi(next().c_str());
@@ -121,6 +133,11 @@ int main(int argc, char** argv)
     if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
     if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
     const bool s2mode = !s2dir.empty();
+    const bool dfl = !dfl_man.empty();
+    if (dfl && (dfl_file.empty() || mtp || s2mode || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
+        die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round); not with --s2; --dflash-sel 0|1; --dflash-k 1..7");
+    if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
+    const int K = dfl ? dfl::K : mtp;   // drafts per round
 #ifndef DEC_S2
     if (s2mode) die("--s2 needs a DEC_S2 build");
 #endif
@@ -133,7 +150,7 @@ int main(int argc, char** argv)
         Plan p = plan;
         p.prompt = parse_ints(ps);
         if (p.prompt.empty()) die("empty prompt");
-        if ((int)p.prompt.size() + p.n_gen + 2 * mtp > cap) die("prompt + gen (+ 2 x drafts) exceeds --cap");
+        if ((int)p.prompt.size() + p.n_gen + 2 * K > cap) die("prompt + gen (+ 2 x drafts) exceeds --cap");
         if (MP) { const int pr = pfrows < 0 ? (int)p.prompt.size() + pfrows : pfrows;   // --pf-rows -N: all rows but the last N
                   p.first = pr > 0 && pr < (int)p.prompt.size() - 1 ? pr : (int)p.prompt.size() - 1; }   // --pf-rows: the rest is teacher-forced through decode steps
         for (int M : plan_rows(p))
@@ -151,6 +168,7 @@ int main(int argc, char** argv)
             if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
     }
+    if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
     const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
     // G6_PF_OWN=4 (TP4) env refusals before any CUDA / fabric work (qp_wire.h roll_env_refusal)
     const bool own4 = MP && getenv("G6_PF_OWN") && atoi(getenv("G6_PF_OWN")) == 4;
@@ -214,6 +232,16 @@ int main(int argc, char** argv)
         fabd.init(cd);
         fabd.start_proxy();
     }
+    g6::Fabric fabf;                    // --dflash: the drafter's region, dfl::NC collectives, decode-sized slots
+    if (dfl)
+    {
+        g6::FabricConfig cd = cfg;
+        cd.ncoll = dfl::NC;
+        cd.port = cfg.port + 40;
+        cd.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
+        fabf.init(cd);
+        fabf.start_proxy();
+    }
 #if G6_NR == 4
     g6::Fabric fabq;                    // G6_PF_QP_ROLL: ring of [lo | hi] pair half images, one-peer jobs (qp_wire.h)
     QpWire qp_wire;
@@ -242,7 +270,7 @@ int main(int argc, char** argv)
     const bool cp_on = !getenv("G6_CP") || atoi(getenv("G6_CP")) != 0;
     const int cp_R = getenv("G6_CP_R") ? atoi(getenv("G6_CP_R")) : 0;
     const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
-    int cp_mmax = mtp + 1;
+    int cp_mmax = K + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
     if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
     if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
@@ -415,6 +443,26 @@ int main(int argc, char** argv)
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
     }
+    Dfl DF;                             // --dflash
+    g6::Pack dpack;
+    g6::DevImage dimg;
+    DflIn* in_f = nullptr;
+    DflOut* out_f = nullptr;
+    if (dfl)
+    {
+        load_image(dpack, dimg, dfl_man, dfl_file, R, hash);
+        const Find dfind = image_find(dpack, dimg);
+        const DflMeta meta = dfl_read_meta(dfind);
+        if (dfl_sel == 1 && !meta.sel) die("--dflash-sel 1: the drafter pack has no selector");
+        G6RT_CK(cudaHostAlloc((void**)&in_f, sizeof(DflIn), cudaHostAllocMapped));
+        G6RT_CK(cudaHostAlloc((void**)&out_f, sizeof(DflOut), cudaHostAllocMapped));
+        DF.in = in_f; DF.out = out_f; DF.nc = nc;
+        // G6_DFL_PFCTX=0 (measurement): the drafter gets no prompt context from the prefill and starts at the last prompt token
+        const bool pfctx = MP && !(getenv("G6_DFL_PFCTX") && atoi(getenv("G6_DFL_PFCTX")) == 0);
+        dfl_build(DF, m, dfind, meta, fabf.dev(), dmalloc<u64>(1), dfl_sel < 0 ? meta.sel : dfl_sel == 1, st, pfctx);
+        dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
+        if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
+    }
 #ifdef DEC_S2
     // --s2: S2 below R on the CP binding (S2-STATE.md v1). Session views on the pool, main and draft; today's graphs below
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
@@ -483,6 +531,14 @@ int main(int argc, char** argv)
             for (int M : draft_rows) capture([&] { launch_draft_step(D, M, 0, false, st); }, &exec_d[k][0][M], "first draft ", M);
             if (mtp > 1) capture([&] { launch_draft_step(D, 1, 0, true, st); }, &exec_d[k][1][1], "chain draft ", 1);
         }
+    }
+    FILE* dfl_dump = dfl && R == 0 && getenv("G6_DFL_DUMP") ? fopen(getenv("G6_DFL_DUMP"), "wb") : nullptr;   // dflash.cuh dfl_dump_step
+    cudaGraphExec_t exec_f[3] = {};     // --dflash: [0] the context part only, [1] the whole draft step, [2] a fill step
+    if (graph && dfl)
+    {
+        capture([&] { dfl_step(DF, st, false); }, &exec_f[0], "dflash context ", dfl::B);
+        capture([&] { dfl_step(DF, st, true); }, &exec_f[1], "dflash draft ", dfl::B);
+        if (DF.pf_feat) capture([&] { dfl_fill_step(DF, st); }, &exec_f[2], "dflash fill ", dfl::B);
     }
     fprintf(stderr, "# rank %d: device tensors %.2f GB\n", R, (image ? img.bytes() : store.bytes) / 1e9);
     const bool pf_streams = two && getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2;   // pf_step2s
@@ -631,7 +687,7 @@ int main(int argc, char** argv)
             sp.top_p = rq.top_p;
             sp.lp = rq.lp; sp.plp = rq.plp;
             em.open(serve, q, R == 0, rq);
-            if (sp.prompt.empty() || sp.n_gen < 1 || (int)sp.prompt.size() + sp.n_gen + 2 * mtp > cap)
+            if (sp.prompt.empty() || sp.n_gen < 1 || (int)sp.prompt.size() + sp.n_gen + 2 * K > cap)
             {
                 em.end("error", 0, 0, 0, nullptr);
                 continue;
@@ -651,6 +707,11 @@ int main(int argc, char** argv)
         else pt.lap("open");
         reset(m, st);
         if (mtp) reset(D.d, st);
+        if (dfl && DF.pf_feat)          // prefill taps keep rows at these positions. Each rank fills its owner rows, the rest stay zero
+        {
+            DF.pf_hi = p.first; DF.pf_lo = std::max(0, p.first - dfl::WIN);
+            if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
+        }
         G6RT_CK(cudaStreamSynchronize(st));
         pt.lap("reset");
         printf("seq %zu prompt %zu tokens\n", q, p.prompt.size());
@@ -722,40 +783,103 @@ int main(int argc, char** argv)
             fprintf(stderr, "# seq %zu prefill %d rows: %.3f ms (%.0f tok/s)\n", q, M, ms, M * 1000.0 / ms);
             if (q > 0 || a > 0) { pf_ms += ms; pf_rows += M; }      // the very first sub-batch carries first-launch costs
         }
-        // MTP after the prefill loop (as in m4sim): prompt rows past p.first go through mtp_sequence's prompt steps
-        if (mtp)
+        int dfl_lo = p.first;           // --dflash: the lowest position the drafter holds context for
+        if (dfl && DF.pf_feat && DF.pf_hi > DF.pf_lo)
         {
-            LpStep lpm;                          // logprobs of the last target step (--serve with lp / plp)
-            auto rm = [&](const StepIn& si, int s, double& ms) {
-                const int M = si.M;
-                *in = si;
-                std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
-                sizes[2 * NL] = head_size(si, nc);
-                fab.enqueue_step(si.step, sizes);
-                cp_enqueue(si.step, M, si.context);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int c0 = DF.pf_lo; c0 < DF.pf_hi; c0 += dfl::B)
+            {
+                DflIn di;
+                memset(&di, 0, sizeof di);
+                di.step = ++dstep;
+                di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
+                *in_f = di;
+                fabf.enqueue_step(di.step, dfl_fill_sizes());
+                if (graph) G6RT_CK(cudaGraphLaunch(exec_f[2], st));
+                else dfl_fill_step(DF, st);
+                G6RT_CK(cudaStreamSynchronize(st));
+                if (*fabf.dev().error) { fprintf(stderr, "g6m4: rank %d dflash fabric error word %08x at seq %zu prompt context %d\n", R, *fabf.dev().error, q, c0); exit(3); }
+                dfl_dump_step(dfl_dump, DF, di, nullptr);
+            }
+            fprintf(stderr, "# seq %zu dflash prompt context %d..%d: %.1f ms\n", q, DF.pf_lo, DF.pf_hi - 1,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            dfl_lo = DF.pf_lo;
+            pt.lap("dflash_context");
+        }
+        // MTP / DFlash after the prefill loop (as in m4sim): prompt rows past p.first go through their sequence's prompt steps
+        LpStep lpm;                     // logprobs of the last target step (--serve with lp / plp)
+        auto rm = [&](const StepIn& si, int s, double& ms) {
+            const int M = si.M;
+            *in = si;
+            std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
+            sizes[2 * NL] = head_size(si, nc);
+            fab.enqueue_step(si.step, sizes);
+            cp_enqueue(si.step, M, si.context);
+            const auto t0 = std::chrono::steady_clock::now();
+            if (graph) launch_main(bucket_of(m, si.context), M);
+            else launch_step(m, M, si.context, st);
+            G6RT_CK(cudaStreamSynchronize(st));
+            const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            ms += dt;
+            if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); exit(3); }
+            const StepOut so = *out;
+            if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
+            if (rlf) route_log_line(rlf, m, layers, q, s, M, si.pos[0], p.prompt.size());
+            std::string line;
+            step_line(m, so, s, M, line);
+            printf("%s\n", line.c_str());
+            if (top > 0 && (!em.on || p.lp >= 0 || p.plp >= 0)) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
+            if (em.on && (p.lp >= 0 || p.plp >= 0))
+            {
+                lp_fetch(m, so, si, lpm);
+                for (int r = 0; r < M && p.plp >= 0; ++r)
+                    if (si.tgt[r] >= 0) em.push_prompt(si.pos[r] + 1, lp_row(lpm, r, true, p.plp));
+            }
+            fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, dt);
+            return so;
+        };
+        // emit (--serve): k committed tokens from rows row0.. of the last target step, with their logprobs when asked
+        std::function<bool(const int*, int, int)> emit;
+        if (em.on) emit = [&](const int* t, int k, int row0) {
+            pt.first_token(q);
+            LpRow rows[MX];
+            for (int i = 0; p.lp >= 0 && i < k; ++i) rows[i] = lp_row(lpm, row0 + i, false, p.lp);
+            return em.push(t, k, p.lp >= 0 ? rows : nullptr);
+        };
+        if (dfl)
+        {
+            auto rf = [&](const DflIn& di, int s, double& ms) {
+                *in_f = di;
+                fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
                 const auto t0 = std::chrono::steady_clock::now();
-                if (graph) launch_main(bucket_of(m, si.context), M);
-                else launch_step(m, M, si.context, st);
+                if (graph) G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));
+                else dfl_step(DF, st, di.query);
                 G6RT_CK(cudaStreamSynchronize(st));
                 const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 ms += dt;
-                if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); exit(3); }
-                const StepOut so = *out;
-                if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
-                if (rlf) route_log_line(rlf, m, layers, q, s, M, si.pos[0], p.prompt.size());
-                std::string line;
-                step_line(m, so, s, M, line);
-                printf("%s\n", line.c_str());
-                if (top > 0 && (!em.on || p.lp >= 0 || p.plp >= 0)) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
-                if (em.on && (p.lp >= 0 || p.plp >= 0))
+                if (*fabf.dev().error) { fprintf(stderr, "g6m4: rank %d dflash fabric error word %08x at seq %zu step %d\n", R, *fabf.dev().error, q, s); exit(3); }
+                const DflOut so = *out_f;
+                dfl_dump_step(dfl_dump, DF, di, di.query ? &so : nullptr);
+                if (di.query)
                 {
-                    lp_fetch(m, so, si, lpm);
-                    for (int r = 0; r < M && p.plp >= 0; ++r)
-                        if (si.tgt[r] >= 0) em.push_prompt(si.pos[r] + 1, lp_row(lpm, r, true, p.plp));
+                    printf("dflash %d ctx %d @%d q0 %d drafts", s, di.ctx_rows, di.ctx_pos0, di.q0);
+                    for (int r = 1; r < dfl::B; ++r) printf(" %d", so.tok[r]);
+                    printf("\n");
                 }
-                fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, dt);
+                fprintf(stderr, "# seq %zu dflash %s %d: %.3f ms\n", q, di.query ? "draft" : "context", s, dt);
                 return so;
             };
+            pt.lap("pre_decode");
+            const std::vector<int> gen = dflash_sequence(p, step0, dstep, rm, rf, mtp_stats, mtp_steps, dfl_lo, emit, dfl_k);
+            if (dfl_dump) { std::vector<int> all = p.prompt; all.insert(all.end(), gen.begin(), gen.end()); dfl_dump_tokens(dfl_dump, all); }
+            printf("generated");
+            for (int t : gen) printf(" %d", t);
+            printf("\n");
+            em.end(nullptr, mtp_stats.rounds, dfl_k, mtp_stats.tokens, mtp_stats.acc);
+            continue;
+        }
+        if (mtp)
+        {
             auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
                 const int M = di.M;
                 *in_d = di;
@@ -776,13 +900,6 @@ int main(int argc, char** argv)
                 printf("%s%s\n", chain ? "chain" : "draft", line.c_str() + 4);
                 fprintf(stderr, "# seq %zu %s %d M %d: %.3f ms\n", q, chain ? "chain" : "draft", s, M, dt);
                 return t;
-            };
-            std::function<bool(const int*, int, int)> emit;
-            if (em.on) emit = [&](const int* t, int k, int row0) {
-                pt.first_token(q);
-                LpRow rows[MX];
-                for (int i = 0; p.lp >= 0 && i < k; ++i) rows[i] = lp_row(lpm, row0 + i, false, p.lp);
-                return em.push(t, k, p.lp >= 0 ? rows : nullptr);
             };
             pt.lap("pre_decode");
             const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, mtp_steps, emit);
@@ -851,13 +968,14 @@ int main(int argc, char** argv)
     }
     if (pf_rows) fprintf(stderr, "# rank %d: prefill %ld rows in %.1f ms = %.0f tok/s (sub-batches of %d, first one excluded), %d layers\n", R,
                          pf_rows, pf_ms, pf_rows * 1000.0 / pf_ms, MP, NL);
-    if (mtp)
+    if (mtp || dfl)
     {
         char tag[32];
         snprintf(tag, sizeof tag, "rank %d", R);
-        mtp_stats.print(mtp, tag);
-        if (nc) fprintf(stderr, "# rank %d: top_p misses %u (target) %u (draft)\n", R, topp_misses(m), topp_misses(D.d));
-        fabd.wait_proxy_idle(); fabd.stop_proxy();
+        mtp_stats.print(dfl ? dfl_k : K, tag);
+        if (nc && mtp) fprintf(stderr, "# rank %d: top_p misses %u (target) %u (draft)\n", R, topp_misses(m), topp_misses(D.d));
+        if (mtp) { fabd.wait_proxy_idle(); fabd.stop_proxy(); }
+        if (dfl) { fabf.wait_proxy_idle(); fabf.stop_proxy(); }
     }
     if (nc && !mtp) fprintf(stderr, "# rank %d: top_p misses %u\n", R, topp_misses(m));
     if (two) { fabp2.wait_proxy_idle(); fabp2.stop_proxy(); }

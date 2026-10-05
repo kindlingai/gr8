@@ -469,6 +469,8 @@ struct Prefill
     float *pd_probs = nullptr, *pd_isc = nullptr;        // [attn_rows][HMAX][2048], [attn_rows][capacity]
     std::string rc_file;                                 // G6_PF_RCDUMP=<dir> (read at build, every rank; measurement
                                                          //   only): <dir>/routes.r<rank>.jsonl, see pf_rcdump
+    void (*dfl_tap)(Model&, Prefill&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, keep the prompt rows the
+                                                                            //   drafter reads (dflash.cuh dfl_pf_tap_launch)
 };
 
 // m: a built Model whose attention bindings were created with max_rows >= Mmax (build(..., max_rows)).
@@ -1436,6 +1438,7 @@ inline void pf_step(Model& m, Prefill& P, int M, int context, u64 ls0, cudaStrea
         pf_consume(P, 0, M, m.layers[i].mlp_norm, P.x2, st);
         pf_mlp_block(m, P, i, M, st);
         pf_consume_x(m, P, i, M, st);
+        if (P.dfl_tap) P.dfl_tap(m, P, i, M, st);
         pf_ix(m, P, i, M, context, st);
     }
     pf_finish(P, M, st);
@@ -1454,7 +1457,7 @@ inline void pf_step2(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA,
         cp_pf_pre(m, i, ctxA - MA, st);
         pf_attn_block(m, A, i, MA, ctxA, st);
         cp_pf_prefetch(m, i, ctxA - MA, st);
-        if (i > 0) { pf_consume_x(m, B, i - 1, MB, st); pf_ix(m, B, i - 1, MB, ctxB, st); }
+        if (i > 0) { pf_consume_x(m, B, i - 1, MB, st); if (B.dfl_tap) B.dfl_tap(m, B, i - 1, MB, st); pf_ix(m, B, i - 1, MB, ctxB, st); }
         pf_set_step(B, lsB + i, st);
         pf_attn_block(m, B, i, MB, ctxB, st);
         cp_pf_post(m, i, ctxA - MA, MA, ctxB - MB, MB, st);
@@ -1463,10 +1466,12 @@ inline void pf_step2(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA,
         pf_consume(B, 0, MB, m.layers[i].mlp_norm, B.x2, st);
         pf_mlp_block(m, B, i, MB, st);
         pf_consume_x(m, A, i, MA, st);
+        if (A.dfl_tap) A.dfl_tap(m, A, i, MA, st);
         pf_ix(m, A, i, MA, ctxA, st);
     }
     pf_finish_put(A, MA, st);
     pf_consume_x(m, B, m.nl - 1, MB, st);
+    if (B.dfl_tap) B.dfl_tap(m, B, m.nl - 1, MB, st);
     pf_finish(B, MB, st);
     pf_finish_gather(A, MA, st);
 }
@@ -1527,6 +1532,7 @@ inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA
         pf_consume(A, 0, MA, m.layers[i].mlp_norm, A.x2, sa);
         pf_mlp_block(m, A, i, MA, sa);
         pf_consume_x(m, A, i, MA, sa);
+        if (A.dfl_tap) A.dfl_tap(m, A, i, MA, sa);
         if (i > 0) pf_ix(m, B, i - 1, MB, ctxB, sb, L.ea[i]);
         pf_set_step(B, lsB + i, sb);
         pf_attn_block(m, B, i, MB, ctxB, sb, false, L.ea[i], L.eb[i]);
@@ -1534,6 +1540,7 @@ inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA
         pf_consume(B, 0, MB, m.layers[i].mlp_norm, B.x2, sb);
         pf_mlp_block(m, B, i, MB, sb);
         pf_consume_x(m, B, i, MB, sb);
+        if (B.dfl_tap) B.dfl_tap(m, B, i, MB, sb);
     }
     pf_finish(A, MA, sa);
     pf_finish(B, MB, sb);

@@ -14,6 +14,10 @@
 #                     250K prompt included, was 5.2 GiB with PF_OWN=4 (6.6 GiB with PF_OWN=1); lower it if a node runs
 #                     short of memory
 #   MTP=2             speculative draft length k (2 = our prose/served default; 4-6 helped code/structured)
+#   DFLASH=1          replaces MTP with the DFlash2 block drafter (issue #11): 7 drafts per round, verify steps of 8 rows.
+#                     Needs packs/dflash.r<r>.{manifest.json,pack} on every node (tools/convert/dflash2.py, ~0.86 GB
+#                     per rank). DFLASH_SEL=0 drafts the drafter's argmax, 1 (default) the DFlash2 selector walk.
+#                     DFLASH_K=k verifies only the first k of the 7 drafts (verify steps of k + 1 rows)
 #   PF_OWN=4          G6_PF_OWN (see below): 4 = pair-owner QO attention (docs/DESIGN-QO-PAIR.md); 1 = no QO attention
 #                     (the first TP4 baseline); 3 = full-head QO, needs the qo pack and more memory than a TP4 rank has
 #   QP_ROLL=2         PF_OWN=4: G6_PF_QP_ROLL, rolling pair slots built from the rank pack + the pair partner over RDMA
@@ -42,13 +46,15 @@ G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLI
 G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
 if [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" != 1 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G6_PF_QP_CTX=${QP_CTX:-$CAP}"; fi
 [ "$PF_OWN" = 4 ] && ENGINE_ENV="$ENGINE_ENV G6_PF_QP_EARLY=${QP_EARLY:-1}"
-SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 --pf-lanes 2 --pfv2"
+SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2"
+[ "${DFLASH:-0}" = 1 ] || SERVE_ARGS="$SERVE_ARGS --mtp $MTP"
 [ "$PF_OWN" = 3 ] && SERVE_ARGS="$SERVE_ARGS --qo-manifest packs/qo.manifest.json --qo-pack packs/qo.pack"
 [ "${NOHASH:-0}" = 1 ] && SERVE_ARGS="$SERVE_ARGS --no-hash"
 
 for ((r = NRANK - 1; r >= 0; r--)); do
   QPARGS=""
   [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" = 1 ] && QPARGS="--qp-manifest packs/qp.rank$r.manifest.json --qp-pack packs/qp.rank$r.pack"
+  [ "${DFLASH:-0}" = 1 ] && QPARGS="$QPARGS --dflash-manifest packs/dflash.r$r.manifest.json --dflash-pack packs/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
   # each process writes its own pid (setsid may fork, so $! is not always the engine's pid). The braces background only
   # the engine: backgrounding the whole && list left a shell holding the ssh session open until the engine exited
   on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && { \
