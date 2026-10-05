@@ -7,7 +7,9 @@
 #include "k1args.cuh"
 #include "tr3_wide.cuh"
 
-// two 16-bit states -> half2
+// two 16-bit states -> half2. E4 (exlr8-e4m3 packs): each value rounded to FP8 E4M3 and back (RN-even, saturating to
+// finite), as the encoder rounded its codebook and as the prefill path rounds every tile (bind_prefill.cuh tr3_b8).
+template <bool E4 = false>
 __device__ __forceinline__ u32 tr3_cb2(u32 w0, u32 w1)
 {
     u32 x0 = w0 * 0xCBAC1FEDu, x1 = w1 * 0xCBAC1FEDu;
@@ -15,10 +17,13 @@ __device__ __forceinline__ u32 tr3_cb2(u32 w0, u32 w1)
     x1 = (x1 & 0x8fff8fffu) ^ 0x3b603b60u;
     const u32 lo = __byte_perm(x0, x1, 0x5410);
     const u32 hi = __byte_perm(x0, x1, 0x7632);
-    return as_u32(__hadd2(as_h2(lo), as_h2(hi)));
+    u32 r = as_u32(__hadd2(as_h2(lo), as_h2(hi)));
+    if constexpr (E4)
+        asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(r));
+    return r;
 }
 
-template <int BITS>
+template <int BITS, bool E4 = false>
 struct Tr3Lane
 {
     int i0, i1, sh;   // word indices (bytes offsets /4) and base shift
@@ -53,10 +58,10 @@ struct Tr3Lane
         u32 w[8];
         #pragma unroll
         for (int j = 0; j < 8; ++j) w[j] = static_cast<u32>(m >> (s - BITS * j)) & 0xffffu;
-        f0[0] = tr3_cb2(w[0], w[1]);
-        f0[1] = tr3_cb2(w[2], w[3]);
-        f1[0] = tr3_cb2(w[4], w[5]);
-        f1[1] = tr3_cb2(w[6], w[7]);
+        f0[0] = tr3_cb2<E4>(w[0], w[1]);
+        f0[1] = tr3_cb2<E4>(w[2], w[3]);
+        f1[0] = tr3_cb2<E4>(w[4], w[5]);
+        f1[1] = tr3_cb2<E4>(w[6], w[7]);
     }
 };
 
@@ -71,7 +76,7 @@ struct Tr3Lane
 // FC1 unit = (slot, block b, matrix gate|up, k-split h). 8*WG warps: warp = (group q, tile j).
 // Reads 8 tiles (128 output cols) x its k range; writes partial fp32 sums gpart[..][h*WG+q][m][128].
 // tr = the slot's expert row of t_tab (BITS == tr[4]); units of blocks the expert does not have exit.
-template <int BITS>
+template <int BITS, bool E4 = false>
 __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit, const long long* tr, u32* smem)
 {
     constexpr int TB = 32 * BITS;
@@ -138,7 +143,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     __syncthreads();
 
     const u32* xa = smem + (ksq * 32 + lane) * 2;
-    Tr3Lane<BITS> ld;
+    Tr3Lane<BITS, E4> ld;
     ld.init(lane);
 
     // One mma per tile: the tile is the A operand (16 output cols x 16 k, exactly the trellis lane order),
@@ -191,7 +196,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                 const u32 c = tr3w_chunk(w, p);
                 const u32 pc = __shfl_sync(0xffffffffu, c, (lane + 31) & 31);
                 u32 f0[2], f1[2];
-                Tr3Lane<3>::decode_m((static_cast<u64>(pc) << 24) | c, 21, f0, f1);
+                Tr3Lane<3, E4>::decode_m((static_cast<u64>(pc) << 24) | c, 21, f0, f1);
                 mma16816(acc, f0[0], f1[0], f0[1], f1[1], xa[(s + p) * 64], xa[(s + p) * 64 + 1]);
             }
         }
@@ -245,7 +250,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 // FC2 unit = (slot, block b, n-split). Prologue: g,u partial sums -> H*svh -> silu(g)*u -> H(act*suh_d)
 // for the block's 128 intermediate columns; then streams the block's down tiles for its n range.
 // Writes z[slot][b][m][n] fp16 (before the output Hadamard; finalize applies H*svh per block).
-template <int BITS>
+template <int BITS, bool E4 = false>
 __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit, const long long* tr, u32* smem)
 {
     constexpr int TB = 32 * BITS;
@@ -312,7 +317,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     __syncthreads();
 
     const u32* ha = smem + lane * 2;
-    Tr3Lane<BITS> ld;
+    Tr3Lane<BITS, E4> ld;
     ld.init(lane);
     const int nl = lane >> 2, c = lane & 3;
     const bool wr0 = (mask >> (2 * c)) & 1, wr1 = (mask >> (2 * c + 1)) & 1;
@@ -343,7 +348,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
                 const u32 ch = tr3w_chunk(w, p);
                 const u32 pc = __shfl_sync(0xffffffffu, ch, (lane + 31) & 31);
                 u32 f0[2], f1[2];
-                Tr3Lane<3>::decode_m((static_cast<u64>(pc) << 24) | ch, 21, f0, f1);
+                Tr3Lane<3, E4>::decode_m((static_cast<u64>(pc) << 24) | ch, 21, f0, f1);
                 mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[p * 64], ha[p * 64 + 1]);
             }
             __half* zp = zb + (nt0 + i * nwarps) * 16;

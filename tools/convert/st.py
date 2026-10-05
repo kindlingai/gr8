@@ -15,7 +15,7 @@ class ST:
         self.fd = os.open(self.path, os.O_RDONLY)
         n, = struct.unpack('<Q', os.pread(self.fd, 8, 0))
         h = json.loads(os.pread(self.fd, n, 8))
-        h.pop('__metadata__', None)
+        self.meta = h.pop('__metadata__', None) or {}
         self.h, self.base = h, 8 + n
 
     def __contains__(self, name):

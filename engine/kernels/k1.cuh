@@ -26,6 +26,9 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
 }
 
 // ------------------------------------------------------------------ TR3 build
+// E4 = the layer's routed experts are exlr8-e4m3 (codebook rounded to E4M3, tr3.cuh tr3_cb2). The binder picks the
+// instantiation per layer (bind::make_k1); E4 = false is the TR3 kernel.
+template <bool E4 = false>
 __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -37,14 +40,15 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
         if (slot < A.n_slots_dev[plan])
         {
             const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + slot];
-            if (tr[4] == 3) tr3_fc1_body<3>(A, plan, blockIdx.x, tr, smem);
-            else tr3_fc1_body<4>(A, plan, blockIdx.x, tr, smem);
+            if (tr[4] == 3) tr3_fc1_body<3, E4>(A, plan, blockIdx.x, tr, smem);
+            else tr3_fc1_body<4, E4>(A, plan, blockIdx.x, tr, smem);
         }
     }
     else k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
 }
 
+template <bool E4 = false>
 __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 regs: 2 CTAs per SM (item 1h L1)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -56,8 +60,8 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 reg
         if (slot < A.n_slots_dev[plan])
         {
             const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + slot];
-            if (tr[4] == 3) tr3_fc2_body<3>(A, plan, blockIdx.x, tr, smem);
-            else tr3_fc2_body<4>(A, plan, blockIdx.x, tr, smem);
+            if (tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, blockIdx.x, tr, smem);
+            else tr3_fc2_body<4, E4>(A, plan, blockIdx.x, tr, smem);
         }
     }
     else k1_shared_fc2(A, blockIdx.x - nr, smem);
@@ -93,6 +97,7 @@ __device__ __forceinline__ int ld_acquire(const int* p)
     return v;
 }
 
+template <bool E4 = false>
 __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -118,8 +123,8 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
             if (slot < A.n_slots_dev[plan])
             {
                 const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + slot];
-                if (tr[4] == 3) tr3_fc1_body<3>(A, plan, item, tr, smem);
-                else tr3_fc1_body<4>(A, plan, item, tr, smem);
+                if (tr[4] == 3) tr3_fc1_body<3, E4>(A, plan, item, tr, smem);
+                else tr3_fc1_body<4, E4>(A, plan, item, tr, smem);
             }
             __threadfence();
             __syncthreads();
@@ -142,8 +147,8 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
                 {
                     if (t == 0) while (ld_acquire(done + slot * A.B + b) < 2 * A.KS1) {}
                     __syncthreads();
-                    if (tr[4] == 3) tr3_fc2_body<3>(A, plan, unit, tr, smem);
-                    else tr3_fc2_body<4>(A, plan, unit, tr, smem);
+                    if (tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, unit, tr, smem);
+                    else tr3_fc2_body<4, E4>(A, plan, unit, tr, smem);
                 }
             }
         }

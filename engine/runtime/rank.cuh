@@ -53,6 +53,7 @@ struct TensorRef
     int nd = 0;
     long long shape[4] = {0, 0, 0, 0};
     bool bf16 = false;
+    int fmt = 0;                      // routed-expert format of the manifest entry (g6::Entry::expert_format = bind::FMT_*)
 };
 using Find = std::function<TensorRef(const std::string&)>;
 
@@ -300,7 +301,7 @@ inline const void* need(const Find& find, const std::string& name)
 inline bind::Tensor as_bind(const TensorRef& r)
 {
     bind::Tensor b;
-    b.p = r.p; b.nd = r.nd;
+    b.p = r.p; b.nd = r.nd; b.fmt = r.fmt;
     for (int i = 0; i < 4; ++i) b.shape[i] = r.shape[i];
     return b;
 }
@@ -398,6 +399,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         bind::i4pair(y.T, st);
         G6RT_CK(cudaStreamSynchronize(st));
 #endif
+        if (const char* e = bind::check_shared_signs(y.T, st)) die("layer " + std::to_string(y.l) + ": " + e);
         y.moe = y.T.t[bind::T_TR3_TAB].p != nullptr;
         y.indexer = y.T.t[bind::T_IDX_WQ_B].p != nullptr;
         if (y.indexer) last_index = i;
@@ -461,6 +463,21 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         for (const Layer& y : m.layers) real += y.ab.storage_bytes;
         fprintf(stderr, "# rank %d: shared decode scratch %.3f GB; attention allocated (caches + one scratch) %.3f GB\n", rank,
                 m.dscratch_bytes / 1e9, real / 1e9);
+    }
+    {
+        // per-layer expert format: a count on every rank, the layer list on rank 0. Ranks do not compare formats, so a
+        // mixed set of packs shows only as different counts in the rank logs.
+        int ne4 = 0, nmoe = 0;
+        std::string e4, tr3;
+        for (const Layer& y : m.layers)
+        {
+            if (!y.moe) continue;
+            ++nmoe;
+            ne4 += y.T.e4m3;
+            (y.T.e4m3 ? e4 : tr3) += " " + std::to_string(y.l);
+        }
+        if (ne4) fprintf(stderr, "# rank %d: routed experts exlr8-e4m3 in %d of %d MoE layers\n", rank, ne4, nmoe);
+        if (ne4 && rank == 0) fprintf(stderr, "# rank 0: exlr8-e4m3 layers:%s; TR3 layers:%s\n", e4.c_str(), tr3.empty() ? " none" : tr3.c_str());
     }
     m.emb = (const __nv_bfloat16*)need(find, "G.embed");
     m.final_norm = (const __nv_bfloat16*)need(find, "G.final_norm");

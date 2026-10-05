@@ -10,6 +10,12 @@ Nothing is re-quantized except the D2 MXFP8 copies, which are produced from the 
 same deterministic equation D2 runs at boot (tools/convert/mxfp8.py). TR3 trellis/suh/svh bytes and D8 q4 codes
 are copied; D8 BF16 scales are converted to the FP16 the row-tile records carry, and every one is checked exact.
 One pass over the sources writes all requested ranks; per-rank packs are sequential files (tools/convert/pack.py).
+
+Routed experts are TR3 or exlr8-e4m3 (#19), read per layer from the layer file's safetensors metadata (`exlr8`). Both
+use the same tensor names and layout and convert the same way. An exlr8-e4m3 layer's tr3.* entries carry
+`"expert_format": "exlr8-e4m3"` in the manifest (the engine then decodes its codebook with E4M3 rounding), and the
+manifest's top-level `expert_formats` maps those layers to their format. TR3 layers get neither, so a TR3 pack and its
+manifest are the same as before #19.
 """
 import argparse
 import os
@@ -30,6 +36,8 @@ H = plan.H
 MCG = 0xCBAC1FED
 RT_INT4 = g6ref.RT('int4')
 VERSION = 'g6convert-v1'
+# safetensors metadata `exlr8` of a layer file -> expert format (no key: TR3)
+EXPERT_FORMATS = {None: 'tr3', 'exlr8-e4m3-v1': 'exlr8-e4m3'}
 GV = False  # --gv-records: also write the decode GEMV record streams (g6ref.mxfp8_record / bf16_record)
 
 
@@ -220,10 +228,37 @@ def convert_layer(l, src, d8, writers):
             w.put(f'{P}.shared_head_norm', sh, 'bf16', layout='bf16_vector')
 
 
+def expert_format(l, src):
+    """'tr3' or 'exlr8-e4m3' from the layer file's metadata. A sanity check on the label, not a proof of the format:
+    exlr8-e4m3 uses one hidden-side sign vector per layer, the same in every expert and rank slice, and TR3 draws them
+    per expert. Probed on experts 0-3: gate input signs of the first and last slice, down output signs of the first.
+    It cannot see whether an encode rounded its codebook to E4M3. A file whose signs disagree with its label is refused."""
+    tag = src.meta.get('exlr8')
+    if tag not in EXPERT_FORMATS:
+        raise ValueError(f'L{l}: unknown exlr8 metadata {tag!r}')
+    fmt = EXPERT_FORMATS[tag]
+    p = f'model.layers.{l}.mlp.experts.'
+    last = sum(1 for k in src.h if k.startswith(f'{p}0.gate_proj.rank') and k.endswith('.suh')) - 1
+    groups = [[('gate', r, 'suh') for r in (0, last)], [('down', 0, 'svh')]]
+    shared = True
+    for g in groups:
+        signs = [np.signbit(src.get(f'{p}{e}.{m}_proj.rank{r}.{v}')) for m, r, v in g for e in range(4)]
+        shared &= all(np.array_equal(signs[0], x) for x in signs[1:])
+    if shared != (fmt == 'exlr8-e4m3'):
+        raise ValueError(f'L{l}: metadata says {fmt}, but the hidden-side signs of experts 0-3 are '
+                         f'{"shared" if shared else "not shared"}')
+    return fmt
+
+
 def convert_experts(l, src, writers):
     """Pass 1 streams fc1 (gate/up tiles), pass 2 streams fc2 (down tiles); vectors are buffered (<= 20 MB/rank)."""
     P = f'L{l:03d}'
     p = f'model.layers.{l}.mlp.experts.'
+    fmt = expert_format(l, src)
+    xf = {} if fmt == 'tr3' else dict(expert_format=fmt)   # TR3 entries stay as before #19
+    if xf:
+        for w in writers.values():
+            w.meta.setdefault('expert_formats', {})[str(l)] = fmt
     bits = []
     for e in range(plan.N_EXP):
         k = src.shape(f'{p}{e}.gate_proj.rank0.trellis')[-1] // 16
@@ -251,7 +286,7 @@ def convert_experts(l, src, writers):
 
     # pass 1: fc1 = gate/up tiles, v1 (suh gate/up), v2[0:2] (svh gate/up slices)
     for r, w in writers.items():
-        w.begin(f'{P}.tr3.fc1', 'u8', (fc1_bytes[r],), layout='tr3_fc1 per expert per block [2][384][8][TB], TB=32*bits')
+        w.begin(f'{P}.tr3.fc1', 'u8', (fc1_bytes[r],), layout='tr3_fc1 per expert per block [2][384][8][TB], TB=32*bits', **xf)
     fc1_off = {r: 0 for r in writers}
     row = {r: 0 for r in writers}
     for e in range(plan.N_EXP):
@@ -278,7 +313,7 @@ def convert_experts(l, src, writers):
 
     # pass 2: fc2 = down tiles transposed to [n-tile][k-tile], v2[2] (suh down slice), v3 (svh down)
     for r, w in writers.items():
-        w.begin(f'{P}.tr3.fc2', 'u8', (fc2_bytes[r],), layout='tr3_fc2 per expert per block [384][8][TB]')
+        w.begin(f'{P}.tr3.fc2', 'u8', (fc2_bytes[r],), layout='tr3_fc2 per expert per block [384][8][TB]', **xf)
     fc2_off = {r: 0 for r in writers}
     row = {r: 0 for r in writers}
     for e in range(plan.N_EXP):
@@ -300,11 +335,11 @@ def convert_experts(l, src, writers):
             fc2_off[r] += n * 384 * 8 * TB
     for r, w in writers.items():
         w.end()
-        w.put(f'{P}.tr3.v1', v1[r], 'f16', layout='[blk][2][6144] suh gate, suh up (block fragment)')
-        w.put(f'{P}.tr3.v2', v2[r], 'f16', layout='[blk][3][128] svh gate, svh up, suh down (block slice)')
-        w.put(f'{P}.tr3.v3', v3[r], 'f16', layout='[blk][6144] svh down (block fragment)')
+        w.put(f'{P}.tr3.v1', v1[r], 'f16', layout='[blk][2][6144] suh gate, suh up (block fragment)', **xf)
+        w.put(f'{P}.tr3.v2', v2[r], 'f16', layout='[blk][3][128] svh gate, svh up, suh down (block slice)', **xf)
+        w.put(f'{P}.tr3.v3', v3[r], 'f16', layout='[blk][6144] svh down (block fragment)', **xf)
         w.put(f'{P}.tr3.table', table[r], 'i64',
-              layout='[256][6] fc1_byte_off, fc2_byte_off, first_blk_row, n_blocks, bits, first_block(0..15)')
+              layout='[256][6] fc1_byte_off, fc2_byte_off, first_blk_row, n_blocks, bits, first_block(0..15)', **xf)
 
 
 def _frags(owned):
@@ -338,7 +373,7 @@ def convert_head(src_head, writers):
 # ---------------------------------------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument('--tr3', required=True, help='TR3 checkpoint dir (model-layer-NNN / model-embed / model-head)')
+    ap.add_argument('--tr3', required=True, help='TR3 or exlr8-e4m3 checkpoint dir (model-layer-NNN / model-embed / model-head)')
     ap.add_argument('--d8', nargs='+', required=True,
                     help='old D8 gptq-w32 dirs in old-rank order: six (r0..r5, TP6) or four (r0..r3, TP4)')
     ap.add_argument('--out', required=True)

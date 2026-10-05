@@ -37,6 +37,13 @@ The weights are the community EXL3 "TR3" 3.25 bpw quantization for the routed ex
 codes and prefill uses MXFP8 copies of the original BF16 weights. These are the same weights an EXL3/vLLM build serves,
 re-packed into one file per rank.
 
+The engine also runs the exlr8-e4m3 re-encode of the same experts
+([mmastrac/glm-5.3-exl3-copy](https://huggingface.co/mmastrac/glm-5.3-exl3-copy)). That checkpoint has TR3's tensor
+names, layout and per-expert bit widths, with every codebook value rounded to FP8 E4M3. Build packs from the checkpoint
+with the same `build_packs.sh` command: the converter reads each layer's format from the layer file and records it in the pack
+manifest, and the engine decodes those layers with the same E4M3 rounding (#19). TR3 packs are unchanged. exlr8-e4m3
+packs need an engine built at or after #19: an older engine runs them without the rounding and does not warn.
+
 This snapshot is the **K1H2** build: our current best six-node configuration, with context-parallel KV past 32K
 tokens and a 614,400-token KV pool.
 

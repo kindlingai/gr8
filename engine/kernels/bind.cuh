@@ -55,11 +55,15 @@
 namespace bind
 {
 
+// routed-expert format of a tr3.* tensor: the manifest entry's "expert_format" (absent = TR3, every pack before #19)
+enum { FMT_TR3 = 0, FMT_EXLR8_E4M3 = 1 };
+
 struct Tensor
 {
     const void* p = nullptr;          // device pointer (nullptr: the pack has no such tensor)
     long long shape[4] = {0, 0, 0, 0};    // manifest shape
     int nd = 0;
+    int fmt = FMT_TR3;                // routed-expert format (tr3.* tensors)
 };
 
 enum
@@ -79,6 +83,7 @@ struct LayerTensors
     Tensor t[NT];
     int fc1_wide = 0;                 // tr3.fc1 is in the wide order (widen_fc1 ran)
     int fc2_wide = 0;                 // tr3.fc2 is in the wide order (widen_fc2 ran)
+    int e4m3 = 0;                     // routed experts are exlr8-e4m3 (tr3.table's format): K1 decodes with E4M3 rounding
 #if DEC_I4PAIR
     int i4pair_ks[2] = {0, 0};        // q_a.gptq, o_proj.gptq repacked into pair records for this k-part count (i4pair ran)
 #endif
@@ -94,6 +99,7 @@ template <class F> inline LayerTensors layer_tensors(int layer, F find)
         snprintf(n, sizeof n, "L%03d.%s", layer, NAMES[i]);
         T.t[i] = find(n);
     }
+    T.e4m3 = T.t[T_TR3_TAB].fmt == FMT_EXLR8_E4M3;
     return T;
 }
 
@@ -114,6 +120,42 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
     if (!tab.p || !fc2.p || T.fc2_wide) return;
     launch_tr3_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st);
     T.fc2_wide = 1;
+}
+
+// exlr8-e4m3 layers share one hidden-side sign vector per layer (input of gate and up, output of down). Each block row of
+// v1 and v3 must carry block row 0's signs. One CTA per row after row 0, counted into *bad.
+__global__ void __launch_bounds__(256) k_shared_signs(const uint16_t* v1, const uint16_t* v3, unsigned* bad)
+{
+    const size_t row = blockIdx.x + 1;
+    bool diff = false;
+    for (int i = threadIdx.x; i < HID; i += 256)
+    {
+        diff |= ((v1[row * 2 * HID + i] ^ v1[i]) & 0x8000) != 0;
+        diff |= ((v1[row * 2 * HID + HID + i] ^ v1[HID + i]) & 0x8000) != 0;
+        diff |= ((v3[row * HID + i] ^ v3[i]) & 0x8000) != 0;
+    }
+    if (__syncthreads_or(diff) && threadIdx.x == 0) atomicAdd(bad, 1u);
+}
+
+// Optional, once per exlr8-e4m3 layer after its tensors are on the device: refuses a layer whose block rows disagree on
+// the hidden-side signs (a mislabelled or edited pack). Synchronizes the stream.
+inline const char* check_shared_signs(const LayerTensors& T, cudaStream_t st)
+{
+    const Tensor &v1 = T.t[T_TR3_V1], &v3 = T.t[T_TR3_V3];
+    if (!T.e4m3 || !v1.p || !v3.p || v1.shape[0] < 2) return nullptr;
+    unsigned *d = nullptr, *h = nullptr;
+    if (cudaMalloc(&d, sizeof(unsigned)) != cudaSuccess) return "check_shared_signs: cudaMalloc failed";
+    if (cudaMallocHost(&h, sizeof(unsigned)) != cudaSuccess) { cudaFree(d); return "check_shared_signs: cudaMallocHost failed"; }
+    cudaMemsetAsync(d, 0, sizeof(unsigned), st);
+    k_shared_signs<<<static_cast<unsigned>(v1.shape[0] - 1), 256, 0, st>>>(static_cast<const uint16_t*>(v1.p),
+                                                                        static_cast<const uint16_t*>(v3.p), d);
+    cudaMemcpyAsync(h, d, sizeof(unsigned), cudaMemcpyDeviceToHost, st);
+    const cudaError_t e = cudaStreamSynchronize(st);
+    const unsigned bad = *h;
+    cudaFree(d);
+    cudaFreeHost(h);
+    if (e != cudaSuccess) return "check_shared_signs: CUDA error";
+    return bad ? "exlr8-e4m3 layer whose tr3.v1 / tr3.v3 block rows do not share one sign vector" : nullptr;
 }
 
 #if DEC_I4PAIR
@@ -317,11 +359,27 @@ struct K1
     size_t sm1 = 0, sm2 = 0;
     int fuse = 0, gf = 0;             // fuse (1 | 2): one persistent fc1+fc2 launch (k1_tr3_fused, gf CTAs of 512) instead of fc1, fc2
     size_t smf = 0;
+    int e4 = 0;                       // exlr8-e4m3 layer: the E4 instantiations of fc1, fc2, fused (chosen once, in make_k1)
 };
 
-inline void launch_k1_fc1(const K1& k, cudaStream_t st) { if (k.on) k1_tr3_fc1<<<k.g1, k.b1, k.sm1, st>>>(k.a); }
-inline void launch_k1_fc2(const K1& k, cudaStream_t st) { if (k.on) k1_tr3_fc2<<<k.g2, k.b2, k.sm2, st>>>(k.a); }
-inline void launch_k1_fused(const K1& k, cudaStream_t st) { if (k.on) k1_tr3_fused<<<k.gf, 512, k.smf, st>>>(k.a); }
+inline void launch_k1_fc1(const K1& k, cudaStream_t st)
+{
+    if (!k.on) return;
+    if (k.e4) k1_tr3_fc1<true><<<k.g1, k.b1, k.sm1, st>>>(k.a);
+    else k1_tr3_fc1<false><<<k.g1, k.b1, k.sm1, st>>>(k.a);
+}
+inline void launch_k1_fc2(const K1& k, cudaStream_t st)
+{
+    if (!k.on) return;
+    if (k.e4) k1_tr3_fc2<true><<<k.g2, k.b2, k.sm2, st>>>(k.a);
+    else k1_tr3_fc2<false><<<k.g2, k.b2, k.sm2, st>>>(k.a);
+}
+inline void launch_k1_fused(const K1& k, cudaStream_t st)
+{
+    if (!k.on) return;
+    if (k.e4) k1_tr3_fused<true><<<k.gf, 512, k.smf, st>>>(k.a);
+    else k1_tr3_fused<false><<<k.gf, 512, k.smf, st>>>(k.a);
+}
 inline void launch_k1_fin(const K1& k, cudaStream_t st) { if (k.on && !k.dense) k1_tr3_fin<<<k.g3, k.b3, 0, st>>>(k.a); }
 inline void launch_k1(const K1& k, cudaStream_t st)
 {
@@ -334,15 +392,16 @@ inline void launch_k1(const K1& k, cudaStream_t st)
     launch_k1_fin(k, st);
 }
 // persistent grid of the fused launch: min(items, resident CTAs of the device at its smem size)
-inline int k1_fused_grid(int items, size_t smem)
+inline int k1_fused_grid(int items, size_t smem, int e4 = 0)
 {
     int dev = 0, nsm = 0, nb = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
     // the attribute is per function (process-wide): set the maximum as init() does, never a layer's own smem, or a later
     // make_layer with a smaller split lowers it below an earlier layer's launch size (invalid argument at launch)
     if (smem > static_cast<size_t>(KSH) * 256) return 0;
-    if (cudaFuncSetAttribute(reinterpret_cast<const void*>(k1_tr3_fused), cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256) != cudaSuccess) return 0;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k1_tr3_fused, 512, smem) != cudaSuccess || nb < 1) return 0;
+    const void* fn = e4 ? reinterpret_cast<const void*>(k1_tr3_fused<true>) : reinterpret_cast<const void*>(k1_tr3_fused<false>);
+    if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256) != cudaSuccess) return 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, fn, 512, smem) != cudaSuccess || nb < 1) return 0;
     const int g = nsm * nb;
     return items < g ? items : g;
 }
@@ -425,6 +484,9 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         if (tab.nd != 2 || tab.shape[1] != 6 || v1.nd != 3 || v1.shape[1] != 2 || v1.shape[2] != HID || v2.nd != 3 || v2.shape[1] != 3 ||
             v2.shape[2] != 128 || v3.nd != 2 || v3.shape[1] != HID || v2.shape[0] != v1.shape[0] || v3.shape[0] != v1.shape[0])
             return "tr3 table / v1 / v2 / v3 shapes do not match the pack layout";
+        for (int i = T_TR3_FC1; i <= T_TR3_V3; ++i)
+            if (T.t[i].fmt != tab.fmt) return "tr3.* tensors of one layer carry different expert formats";
+        k.e4 = T.e4m3;
         if (!plan.n_slots || !plan.slot_expert || !plan.slot_mask || !plan.slot_w || !plan.tok_slot || !plan.tok_w) return "MoE layer needs the route plan";
         a.n_slots = M * 8;
         a.n_slots_dev = plan.n_slots;
@@ -453,7 +515,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     {
         k.fuse = fuse;
         k.smf = k.sm1 > k.sm2 ? k.sm1 : k.sm2;
-        k.gf = k1_fused_grid(k.g1 + k.g2, k.smf);
+        k.gf = k1_fused_grid(k.g1 + k.g2, k.smf, k.e4);
         if (!k.gf) return "fused K1 launch: no resident CTA at its shared memory size";
     }
     k.on = 1;
@@ -663,9 +725,14 @@ template <class A> inline void head_args(const Head& H, A& a)
 // once per process, before the first launch or graph capture
 inline cudaError_t init()
 {
-    const cudaError_t e = cudaFuncSetAttribute(reinterpret_cast<const void*>(k1_tr3_fc1), cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
-    if (e != cudaSuccess) return e;
-    return cudaFuncSetAttribute(reinterpret_cast<const void*>(k1_tr3_fused), cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
+    const void* fn[4] = {reinterpret_cast<const void*>(k1_tr3_fc1<false>), reinterpret_cast<const void*>(k1_tr3_fused<false>),
+                         reinterpret_cast<const void*>(k1_tr3_fc1<true>), reinterpret_cast<const void*>(k1_tr3_fused<true>)};
+    for (const void* f : fn)
+    {
+        const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
 }
 
 }   // namespace bind

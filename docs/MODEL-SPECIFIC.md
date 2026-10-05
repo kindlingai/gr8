@@ -13,7 +13,7 @@ the full-index layers; vocab 154,880.
 
 | layer | where | what is fixed |
 |---|---|---|
-| weight format | `engine/kernels/tr3.cuh`, `tr3_gemm.cuh`, `tr3_wide.cuh` | routed experts are EXL3 "TR3" trellis codes (3.25 bpw, Hadamard-128 rotations, K3/K4 per-expert bit widths), decoded inside the expert kernels |
+| weight format | `engine/kernels/tr3.cuh`, `tr3_gemm.cuh`, `tr3_wide.cuh` | routed experts are EXL3 trellis codes (3.25 bpw, Hadamard-128 rotations, K3/K4 per-expert bit widths), decoded inside the expert kernels. Two encodes with one layout: TR3, and exlr8-e4m3, whose codebook values are rounded to FP8 E4M3 (decode rounds them too, chosen per layer from the pack manifest) |
 | | `engine/kernels/densev.cuh`, `gemm_x.cuh`, `rowtile.cuh` | dense weights: MXFP8 for prefill + lm_head, GPTQ int4 g32 for decode |
 | converter | `tools/convert/plan.py` | `H = 6144`, 78 + 1 layers, 256 experts, the rank map: TP6 head groups `(11,11,11,11,10,10)`, expert 128-column blocks `(3,3,3,3,2,2)`, vocab tiles, rotated per layer (TP4: 16 heads, 4 blocks, dense 3072 channels, vocab tiles `(303,303,302,302)`) |
 | | `tools/convert/convert.py` | checkpoint tensor names (`model.layers.N.self_attn.q_a_proj.weight`, ...), MLA reshapes (`q_b` -> 64 x 256 x 2048, `kv_b` -> 64 x 448 x 512), dense layers 0-2, the MTP layer's extra tensors (`eh`) |

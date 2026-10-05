@@ -24,3 +24,12 @@ md5sum "$OUT/g6m4" "$OUT/m4sim"
 export PATH=/usr/local/cuda/bin:$PATH
 # gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py); stage.sh copies it to every node
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
+# TR3 / exlr8-e4m3 decode unit test (#19); runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
+  "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" -lcublas
+if nvidia-smi -L > /dev/null 2>&1; then
+  t=$("$OUT/tr3_e4m3_test") || { echo "$t"; echo "tr3_e4m3_test FAILED"; exit 1; }
+  echo "tr3_e4m3_test: $(echo "$t" | tail -1)"
+else
+  echo "tr3_e4m3_test: no GPU visible, not run"
+fi

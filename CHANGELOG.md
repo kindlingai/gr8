@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-05: exlr8-e4m3 expert packs, chosen per layer (#19)
+
+- The converter reads TR3 and exlr8-e4m3 checkpoints. Both have the same tensor names and layout. The layer file's
+  safetensors metadata `exlr8` tells the two formats apart, and the converter checks it against exlr8's shared input
+  signs. An exlr8-e4m3 layer's `tr3.*` manifest entries carry `"expert_format": "exlr8-e4m3"`, and the manifest's top
+  level maps those layers to their format (`expert_formats`). The converter writes TR3 packs and manifests byte-identical to before, so existing TP4 and
+  TP6 packs stay valid. TP6 works from the same checkpoint: the per-128-block vectors take exlr8's 512-channel scale
+  groups as they are.
+- Decode rounds each codebook value to FP8 E4M3 (RN-even, saturating) on exlr8-e4m3 layers, as the encoder did and as
+  prefill already does: `k1_tr3_fc1/fc2/fused<true>`, picked per layer at bind time. The TR3 kernels' SASS is unchanged
+  (`G6_NR=6` and `G6_NR=4`). Unit test: `engine/kernels/tests/tr3_e4m3_test.cu`, built by `scripts/build.sh` and run
+  there when a GPU is visible.
+- exlr8-e4m3 packs need an engine at or after this change. An older engine ignores `expert_format` and runs them
+  without the rounding, with no warning. At TP4 that raised KL against the TR3 reference from 0.049 to 0.053.
+- At bind time each exlr8-e4m3 layer must have one hidden-side sign vector across its block rows (`tr3.v1`,
+  `tr3.v3`), or the rank stops. Rank 0 logs which layers are exlr8-e4m3.
+- TP4 at 2200 MHz, exlr8-e4m3 against TR3 on the same build: prefill, TTFT and decode within boot noise, 87K needle
+  found, KL against the TR3 reference 0.049 (0.053 without the rounding), top-1 agreement 93.9%. Details on #19 / the PR.
+- `tools/convert/experr.py`: one layer's routed-expert error against BF16 for TR3 and exlr8 checkpoints (CPU).
+
 ## 2026-10-05: rejection sampling for drafts (opt-in, `SPEC_ACCEPT=rejection`)
 
 - `--spec-accept rejection` makes verify steps accept drafts by rejection sampling at temperature > 0, for MTP and the

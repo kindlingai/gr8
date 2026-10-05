@@ -43,6 +43,7 @@ inline Find pack_find(const g6::Pack& pack, DevStore& store)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fmt = e->expert_format;
         return t;
     };
 }
@@ -59,6 +60,7 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fmt = e->expert_format;
         return t;
     };
 }

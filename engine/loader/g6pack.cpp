@@ -331,10 +331,16 @@ bool Pack::open_manifest(const std::string& path, std::string& err)
     {
         Entry e;
         const J *n = t.get("name"), *dt = t.get("dtype"), *sh = t.get("shape"), *of = t.get("offset"), *nb = t.get("nbytes"),
-                *h = t.get("sha256"), *lay = t.get("layout");
+                *h = t.get("sha256"), *lay = t.get("layout"), *xf = t.get("expert_format");
         if (!n || !dt || !sh || !of || !nb || !h) { err = "tensor entry missing a field"; return false; }
         e.name = n->s;
         if (lay) e.layout = lay->s;
+        if (xf)
+        {
+            if (xf->s == "tr3") e.expert_format = 0;
+            else if (xf->s == "exlr8-e4m3") e.expert_format = 1;
+            else { err = e.name + ": unknown expert_format " + xf->s; return false; }
+        }
         if (!dtype_of(dt->s, e.dtype)) { err = e.name + ": unknown dtype " + dt->s; return false; }
         uint64_t count = 1;
         for (const J& d : sh->a) { e.shape.push_back(d.i); count *= (uint64_t)d.i; }
