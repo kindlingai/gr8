@@ -5,7 +5,8 @@
 //   nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -o tr3_e4m3_test tr3_e4m3_test.cu -lcublas
 //   ./tr3_e4m3_test [K3_TILES_FILE K4_TILES_FILE]
 //
-// Without files the test decodes 65,536 random tiles per bit width (any bit pattern is a valid tail-biting stream).
+// Without files the test decodes 65,536 random tiles per bit width, K2 to K4 (any bit pattern is a valid tail-biting
+// stream).
 // A tiles file holds raw trellis bytes, 32*K bytes per tile: one trellis tensor of a layer file, written with
 // ST(path).get(name).tofile(out) (tools/convert/st.py).
 // Host reference per weight t of a tile: state = the 16 stream bits ending at bit (t+1)*K (MSB first over LE u32 words,
@@ -146,6 +147,7 @@ static std::vector<uint8_t> read_file(const char* path)
 int main(int argc, char** argv)
 {
     int rc = 0;
+    rc |= run<2>(random_tiles(65536, 2, 0x2545F4914F6CDD1Dull), "random K2");     // exlr8 v2 K2 (#65)
     rc |= run<3>(random_tiles(65536, 3, 0x9E3779B97F4A7C15ull), "random K3");
     rc |= run<4>(random_tiles(65536, 4, 0xD1B54A32D192ED03ull), "random K4");
     if (argc >= 3)
