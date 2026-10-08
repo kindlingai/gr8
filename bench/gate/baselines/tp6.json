@@ -1,0 +1,265 @@
+{
+ "format": 1,
+ "topology": "tp6",
+ "commit": "afca111",
+ "build_flags": "G6_NR=6 K1H2 flags from scripts/build.sh (-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1  -DG6_CP=1 -DG6_CP_PF_HASH2=1)",
+ "engine_env": "(clk2200); 2200 CAP=614400 ENGINE_ENV GPU K1H2 MHz MTP=2 NOHASH=1, afca111: at cap clock defaults scripts/launch_tp6.sh",
+ "settings": {
+  "effort": "nothink",
+  "long_sizes": "18000,87000",
+  "needle_depth": 0.15,
+  "needle_max_tokens": 400,
+  "needle_sizes": "87000,437000",
+  "pbench_args": "",
+  "pbench_reps": 3,
+  "runs_per_workload": 3,
+  "temp": 0.7,
+  "workload_tokens": 300
+ },
+ "kl_reference": {
+  "commit": "afca111",
+  "topology": "tp6"
+ },
+ "missing_from_gate_set": [
+  "work.mixed4.agg_tok_s",
+  "work.mixed4.stream_tok_s"
+ ],
+ "rank_health": {
+  "b1": "2026-10-05T03:52:59Z",
+  "b2": "2026-10-05T04:22:55Z",
+  "b3": "2026-10-05T04:50:39Z"
+ },
+ "boots": {
+  "b1": {
+   "runs": 2,
+   "metrics": {
+    "kl.mean": 0.0,
+    "kl.p95": 0.0,
+    "kl.top1": 1.0,
+    "needle.87k.pass": 1.0,
+    "needle.437k.pass": 1.0,
+    "long.18k.ttft_s": 10.2295,
+    "long.18k.prefill_tok_s": 1761.1,
+    "long.18k.decode_tok_s": 35.17,
+    "long.87k.ttft_s": 52.063,
+    "long.87k.prefill_tok_s": 1670.9,
+    "long.87k.decode_tok_s": 19.935000000000002,
+    "pbench.prefill_8192": 1812.35,
+    "pbench.prefill_32768": 1800.8,
+    "pbench.prose_decode": 35.565,
+    "work.code.decode_tok_s": 44.255,
+    "work.prose.decode_tok_s": 40.225,
+    "work.structured.decode_tok_s": 44.05,
+    "spec.acceptance": 0.6853,
+    "spec.tokens_per_step": 2.3705
+   }
+  },
+  "b2": {
+   "runs": 2,
+   "metrics": {
+    "kl.mean": 0.0,
+    "kl.p95": 0.0,
+    "kl.top1": 1.0,
+    "needle.87k.pass": 1.0,
+    "needle.437k.pass": 1.0,
+    "long.18k.ttft_s": 10.242999999999999,
+    "long.18k.prefill_tok_s": 1756.6,
+    "long.18k.decode_tok_s": 34.315,
+    "long.87k.ttft_s": 52.7495,
+    "long.87k.prefill_tok_s": 1647.7,
+    "long.87k.decode_tok_s": 19.435000000000002,
+    "pbench.prefill_8192": 1749.5500000000002,
+    "pbench.prefill_32768": 1779.0,
+    "pbench.prose_decode": 35.66,
+    "work.code.decode_tok_s": 42.16,
+    "work.prose.decode_tok_s": 39.235,
+    "work.structured.decode_tok_s": 44.879999999999995,
+    "spec.acceptance": 0.66825,
+    "spec.tokens_per_step": 2.3365
+   }
+  },
+  "b3": {
+   "runs": 2,
+   "metrics": {
+    "kl.mean": 0.0,
+    "kl.p95": 0.0,
+    "kl.top1": 1.0,
+    "needle.87k.pass": 1.0,
+    "needle.437k.pass": 1.0,
+    "long.18k.ttft_s": 10.395499999999998,
+    "long.18k.prefill_tok_s": 1728.25,
+    "long.18k.decode_tok_s": 33.875,
+    "long.87k.ttft_s": 52.9625,
+    "long.87k.prefill_tok_s": 1642.45,
+    "long.87k.decode_tok_s": 20.765,
+    "pbench.prefill_8192": 1778.0,
+    "pbench.prefill_32768": 1769.75,
+    "pbench.prose_decode": 35.265,
+    "work.code.decode_tok_s": 42.24,
+    "work.prose.decode_tok_s": 38.985,
+    "work.structured.decode_tok_s": 44.545,
+    "spec.acceptance": 0.66825,
+    "spec.tokens_per_step": 2.3365
+   }
+  }
+ },
+ "metrics": {
+  "kl.mean": {
+   "better": "lower",
+   "median": 0.0,
+   "min": 0.0,
+   "max": 0.0,
+   "spread_pct": 0.0,
+   "boots": 3
+  },
+  "kl.p95": {
+   "better": "lower",
+   "median": 0.0,
+   "min": 0.0,
+   "max": 0.0,
+   "spread_pct": 0.0,
+   "boots": 3
+  },
+  "kl.top1": {
+   "better": "higher",
+   "median": 1.0,
+   "min": 1.0,
+   "max": 1.0,
+   "spread_pct": 0.0,
+   "boots": 3
+  },
+  "long.18k.decode_tok_s": {
+   "better": "info",
+   "median": 34.315,
+   "min": 33.875,
+   "max": 35.17,
+   "spread_pct": 3.76,
+   "boots": 3
+  },
+  "long.18k.prefill_tok_s": {
+   "better": "higher",
+   "median": 1756.6,
+   "min": 1728.25,
+   "max": 1761.1,
+   "spread_pct": 1.88,
+   "boots": 3
+  },
+  "long.18k.ttft_s": {
+   "better": "lower",
+   "median": 10.242999999999999,
+   "min": 10.2295,
+   "max": 10.395499999999998,
+   "spread_pct": 1.61,
+   "boots": 3
+  },
+  "long.87k.decode_tok_s": {
+   "better": "info",
+   "median": 19.935000000000002,
+   "min": 19.435000000000002,
+   "max": 20.765,
+   "spread_pct": 6.64,
+   "boots": 3
+  },
+  "long.87k.prefill_tok_s": {
+   "better": "higher",
+   "median": 1647.7,
+   "min": 1642.45,
+   "max": 1670.9,
+   "spread_pct": 1.72,
+   "boots": 3
+  },
+  "long.87k.ttft_s": {
+   "better": "lower",
+   "median": 52.7495,
+   "min": 52.063,
+   "max": 52.9625,
+   "spread_pct": 1.71,
+   "boots": 3
+  },
+  "needle.437k.pass": {
+   "better": "higher",
+   "median": 1.0,
+   "min": 1.0,
+   "max": 1.0,
+   "spread_pct": 0.0,
+   "boots": 3
+  },
+  "needle.87k.pass": {
+   "better": "higher",
+   "median": 1.0,
+   "min": 1.0,
+   "max": 1.0,
+   "spread_pct": 0.0,
+   "boots": 3
+  },
+  "pbench.prefill_32768": {
+   "better": "higher",
+   "median": 1779.0,
+   "min": 1769.75,
+   "max": 1800.8,
+   "spread_pct": 1.74,
+   "boots": 3
+  },
+  "pbench.prefill_8192": {
+   "better": "higher",
+   "median": 1778.0,
+   "min": 1749.5500000000002,
+   "max": 1812.35,
+   "spread_pct": 3.53,
+   "boots": 3
+  },
+  "pbench.prose_decode": {
+   "better": "higher",
+   "median": 35.565,
+   "min": 35.265,
+   "max": 35.66,
+   "spread_pct": 1.11,
+   "boots": 3
+  },
+  "spec.acceptance": {
+   "better": "higher",
+   "median": 0.66825,
+   "min": 0.66825,
+   "max": 0.6853,
+   "spread_pct": 2.53,
+   "boots": 3
+  },
+  "spec.tokens_per_step": {
+   "better": "higher",
+   "median": 2.3365,
+   "min": 2.3365,
+   "max": 2.3705,
+   "spread_pct": 1.45,
+   "boots": 3
+  },
+  "work.code.decode_tok_s": {
+   "better": "higher",
+   "median": 42.24,
+   "min": 42.16,
+   "max": 44.255,
+   "spread_pct": 4.89,
+   "boots": 3
+  },
+  "work.prose.decode_tok_s": {
+   "better": "higher",
+   "median": 39.235,
+   "min": 38.985,
+   "max": 40.225,
+   "spread_pct": 3.14,
+   "boots": 3
+  },
+  "work.structured.decode_tok_s": {
+   "better": "higher",
+   "median": 44.545,
+   "min": 44.05,
+   "max": 44.879999999999995,
+   "spread_pct": 1.87,
+   "boots": 3
+  }
+ },
+ "thresholds": {
+  "kl_mean": 1e-06,
+  "kl_margin": 2.0,
+  "note": "kl_mean is null until three boots are measured"
+ }
+}
