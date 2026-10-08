@@ -29,7 +29,7 @@ def widths(n, nr):
 def set_nr(nr):
     """Pick the rank count. The engine build must match (-DG6_NR=nr)."""
     global NR, W_HEADS, WB, VOCAB_TILES, W_DENSE
-    if nr != 6 and (nr <= 0 or 64 % nr):
+    if nr not in (3, 6) and (nr <= 0 or 64 % nr):
         raise ValueError(f'rank count {nr}: 6 or a divisor of 64 (engine/g6nr.h)')
     NR = nr
     W_HEADS = widths(N_HEADS, nr)        # heads / shared-expert groups
