@@ -26,6 +26,10 @@ export PATH=/usr/local/cuda/bin:$PATH
 g++ -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
 t=$("$OUT/test_spec_len") || { echo "$t"; echo "test_spec_len FAILED"; exit 1; }
 echo "test_spec_len: $(echo "$t" | tail -1)"
+# the prefix-reuse state machine (--reuse-prefix, W44 / RGRID grid rules), CPU
+g++ -O2 -std=c++17 -I "$REPO/engine/runtime" -o "$OUT/test_prefix_reuse" "$REPO/engine/tests/test_prefix_reuse.cpp"
+t=$("$OUT/test_prefix_reuse") || { echo "$t"; echo "test_prefix_reuse FAILED"; exit 1; }
+echo "test_prefix_reuse: $(echo "$t" | tail -1)"
 # gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py); stage.sh copies it to every node
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
 # TR3 / exlr8-e4m3 decode unit test (#19); runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test

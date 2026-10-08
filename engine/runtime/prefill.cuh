@@ -605,6 +605,22 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.push_back(bindp::layer_tensors(y.l, [&](const char* name) { return as_bind(find(name)); }));
         P.T.back().fc1_wide = y.T.fc1_wide;      // decode widened tr3.fc1 in place: prefill must read the same order
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
+        P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths, #65)
+        P.T.back().sh_trellis = y.T.sh_trellis;  // the shared expert as trellis row 256 (#65)
+        if (y.T.shfp8.codes[0])                  // ... and its FP8 copy for the prefill GEMMs (bind::make_shared_fp8)
+        {
+            bindp::Tensors& t = P.T.back();
+            const bind::LayerTensors::ShFp8& F = y.T.shfp8;
+            const int id[3] = {bindp::T_S_GATE, bindp::T_S_UP, bindp::T_S_DOWN};
+            for (int j = 0; j < 3; ++j)
+            {
+                const long long n = j < 2 ? F.I : HID, k = j < 2 ? HID : F.I;
+                t.t[id[j]] = bind::Tensor(); t.t[id[j]].p = F.codes[j]; t.t[id[j]].nd = 2; t.t[id[j]].shape[0] = n; t.t[id[j]].shape[1] = k;
+                t.s[id[j]] = bind::Tensor(); t.s[id[j]].p = F.scales[j]; t.s[id[j]].nd = 2; t.s[id[j]].shape[0] = n; t.s[id[j]].shape[1] = k / 32;
+            }
+            t.sh_fp8 = 1;
+            for (int i = 0; i < 6; ++i) t.sh_tr[i] = y.T.sh_tr[i];
+        }
     }
     if (P.qp) pf_qp_states(P, m, st, share);
     if (P.qo && share) P.qa = share->qa;
@@ -1401,13 +1417,21 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
     const bindp::Layer& b = pf_layer(m, P, i, M);
     pf_mark(7, st);
-    bindp::launch(b.xq_x2, st);
-    bindp::launch_pair(b.gate, b.up, st);
-    bindp::launch(b.act, st);
-    bindp::launch(b.xq_act, st);
-    bindp::launch(b.down, st, b.rs_down);
+    // An exlr8 v2 layer whose shared expert runs from its FP8 copy (Layer::shx) launches these five itself,
+    // inside launch_shared, after k_shx_rotq has written the rotated gate / up records. Running them here as
+    // well read sc.x8_big / sc.x8_small as the previous stage left them and was overwritten by that pass:
+    // same output, one shared gate + up + down GEMM per MoE layer of pure waste.
+    if (!b.shx.on)
+    {
+        bindp::launch(b.xq_x2, st);
+        bindp::launch_pair(b.gate, b.up, st);
+        bindp::launch(b.act, st);
+        bindp::launch(b.xq_act, st);
+        bindp::launch(b.down, st, b.rs_down);
+    }
     pf_mark(5, st);
     pf_blas_x2(m, P, i, M, st);
+    bindp::launch_shared(b, st);                 // exlr8 v2 trellis shared expert (#65); no-op otherwise
     bindp::launch_experts(b.ex, st);
     if (!P.rc_file.empty() && b.ex.on) pf_rcdump(m, P, i, M, b.ex.cnt, st);
     pf_mark(6, st);

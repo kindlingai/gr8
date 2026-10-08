@@ -6,7 +6,7 @@ import struct
 import numpy as np
 
 DT = {'BF16': np.uint16, 'F16': np.float16, 'F32': np.float32, 'I16': np.int16, 'I32': np.int32,
-      'U8': np.uint8, 'I8': np.int8, 'U16': np.uint16}
+      'U8': np.uint8, 'I8': np.int8, 'U16': np.uint16, 'I64': np.int64, 'U64': np.uint64}
 
 
 class ST:
@@ -45,6 +45,31 @@ class ST:
                 raise IOError(f'short read {self.path}:{name}')
             off += k
         return np.frombuffer(buf, dtype=dt).reshape(shape)
+
+    def read(self, name, lo, n):
+        """Bytes lo..lo+n-1 of a tensor's data as uint8 (one half of a v2 trellis tensor, #65)."""
+        a, b = self.h[name]['data_offsets']
+        if lo < 0 or lo + n > b - a:
+            raise ValueError(f'{self.path}:{name}: range {lo}+{n} outside {b - a} bytes')
+        buf = bytearray(n)
+        mv, off = memoryview(buf), 0
+        while off < n:
+            k = os.preadv(self.fd, [mv[off:]], self.base + a + lo + off)
+            if k <= 0:
+                raise IOError(f'short read {self.path}:{name}')
+            off += k
+        return np.frombuffer(buf, np.uint8)
+
+    def read_abs(self, off, n):
+        """Bytes off..off+n-1 of the file as uint8 (absolute file offsets, as the v2 index gives them, #65)."""
+        buf = bytearray(n)
+        mv, o = memoryview(buf), 0
+        while o < n:
+            k = os.preadv(self.fd, [mv[o:]], off + o)
+            if k <= 0:
+                raise IOError(f'short read {self.path} at {off + o}')
+            o += k
+        return np.frombuffer(buf, np.uint8)
 
     def drop_cache(self):
         os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_DONTNEED)

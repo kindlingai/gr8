@@ -96,7 +96,7 @@ class Agreement { // rank0's per-event ACK set; never used in steady-state round
     unsigned nr_; Notice n_; std::vector<bool> seen_; std::optional<uint64_t> hash_;
 public:
     Agreement(unsigned nr, Notice n) : nr_(nr), n_(n), seen_(nr, false) {
-        require(nr == 4 || nr == 6, "expected TP4 or TP6 ranks");
+        require(nr == 3 || nr == 4 || nr == 6, "expected TP3, TP4 or TP6 ranks");
     }
     void ack(const Ack& a) {
         require(a.rank < nr_ && a.notice == n_, "ACK rank/event mismatch");

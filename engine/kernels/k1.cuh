@@ -26,55 +26,93 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
 }
 
 // ------------------------------------------------------------------ TR3 build
-// E4 = the layer's routed experts are exlr8-e4m3 (codebook rounded to E4M3, tr3.cuh tr3_cb2). The binder picks the
-// instantiation per layer (bind::make_k1); E4 = false is the TR3 kernel.
-template <bool E4 = false>
+// one fc1 unit of the slot's expert e at its width (tr3_unit). K2 = the layer has 2-bit units (bind::scan_widths):
+// only then is the K2 body compiled in. The K2 body makes K3 units about 3.5% slower at M = 5 (GB10, #65). Layers
+// without 2-bit units therefore take the K3 / K4 kernels.
+template <bool E4, bool K2, bool BS = false>
+__device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit, int e, int mask, u32* smem)
+{
+    const long long* tr = A.t_tab + 6 * e;
+    const int mat = (unit / A.KS1) & 1, b = (unit / (A.KS1 * 2)) % A.B;
+    if (b >= static_cast<int>(tr[3])) return;
+    size_t off;
+    const int k = tr3_unit(A.t_kmix, e, tr, b * 2 + mat, off);
+    const uint8_t* mw = A.t_fc1 + off;
+    if (k == 3) tr3_fc1_body<3, E4, BS>(A, plan, unit, tr, mw, mask, smem);
+    else if (!K2 || k == 4) tr3_fc1_body<4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
+    else tr3_fc1_body<K2 ? 2 : 4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
+}
+
+// one fc2 unit. Down has one width per expert (tr[4]).
+template <bool E4, bool K2>
+__device__ __forceinline__ void tr3_fc2_any(const K1Args& A, int plan, int unit, const long long* tr, int mask, u32* smem)
+{
+    if (tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, unit, tr, mask, smem);
+    else if (!K2 || tr[4] == 4) tr3_fc2_body<4, E4>(A, plan, unit, tr, mask, smem);
+    else tr3_fc2_body<K2 ? 2 : 4, E4>(A, plan, unit, tr, mask, smem);
+}
+
+// Work item slot -> expert, token mask and scratch slot. false = no work. Without SH the scratch slot is the item slot.
+// SH: item slot 0 is the trellis shared expert with every token, and its scratch slot is n_slots (the finalize reads it
+// there). Item slot i > 0 is routed slot i - 1. Every step has the shared expert, so it is handed out first.
+template <bool SH>
+__device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int& e, int& mask, int& ss)
+{
+    if (SH && slot == 0) { e = A.sh_e; mask = A.sh_mask; ss = A.n_slots; return true; }
+    ss = slot - (SH ? 1 : 0);
+    if (ss < A.n_slots_dev[plan])
+    {
+        e = A.slot_expert[plan * SMAX + ss];
+        mask = A.slot_mask[plan * SMAX + ss];
+        return true;
+    }
+    return false;
+}
+
+// E4 = the layer's routed experts are exlr8-e4m3 (codebook rounded to E4M3, tr3.cuh tr3_cb2); K2 = it has 2-bit units;
+// SH = its shared expert is trellis row 256, run as one more slot, and its hidden-side vectors are in block-scale form
+// (tr3.sg, tr3.v1b, tr3.v3b; exlr8 v2, #65). The binder picks the instantiation
+// per layer (bind::make_k1); E4 = K2 = SH = false is the TR3 kernel.
+template <bool E4 = false, bool K2 = false, bool SH = false>
 __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
     const int plan = A.ctl[0];
-    const int ups = A.B * 2 * A.KS1, nr = A.n_slots * ups;
+    const int ups = A.B * 2 * A.KS1, nr = (A.n_slots + SH) * ups;
     if (static_cast<int>(blockIdx.x) < nr)
     {
+        int e, mask, ss;
         const int slot = blockIdx.x / ups;
-        if (slot < A.n_slots_dev[plan])
-        {
-            const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + slot];
-            if (tr[4] == 3) tr3_fc1_body<3, E4>(A, plan, blockIdx.x, tr, smem);
-            else tr3_fc1_body<4, E4>(A, plan, blockIdx.x, tr, smem);
-        }
+        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem);
     }
-    else k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
+    else if (!SH) k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
 }
 
-template <bool E4 = false>
+template <bool E4 = false, bool K2 = false, bool SH = false>
 __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 regs: 2 CTAs per SM (item 1h L1)
 {
     extern __shared__ __align__(16) u32 smem[];
     const int plan = A.ctl[1];
-    const int ups = A.B * A.NS2, nr = A.n_slots * ups;
+    const int ups = A.B * A.NS2, nr = (A.n_slots + SH) * ups;
     if (static_cast<int>(blockIdx.x) < nr)
     {
+        int e, mask, ss;
         const int slot = blockIdx.x / ups;
-        if (slot < A.n_slots_dev[plan])
-        {
-            const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + slot];
-            if (tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, blockIdx.x, tr, smem);
-            else tr3_fc2_body<4, E4>(A, plan, blockIdx.x, tr, smem);
-        }
+        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
     }
-    else k1_shared_fc2(A, blockIdx.x - nr, smem);
+    else if (!SH) k1_shared_fc2(A, blockIdx.x - nr, smem);
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
 #if DEC_SLOT >= 2
     if (A.slot.send && A.s_direct) dslot::publish(A.slot, true);
 #endif
 }
 
+template <bool SH = false>
 __global__ void k1_tr3_fin(K1Args A)
 {
     const int plan = A.ctl[2];
-    tr3_fin_body(A, plan);
+    tr3_fin_body<SH>(A, plan);
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[0] = (plan + 1) % A.n_plans;
 #if DEC_SLOT >= 2
     if (A.slot.send) dslot::publish(A.slot, threadIdx.x < 32);      // warp 0 stored (tr3_fin_body)
@@ -97,17 +135,17 @@ __device__ __forceinline__ int ld_acquire(const int* p)
     return v;
 }
 
-template <bool E4 = false>
-__global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
+template <bool E4, bool K2, bool SH>
+__device__ __forceinline__ void k1_fused_body(const K1Args& A)
 {
     extern __shared__ __align__(16) u32 smem[];
     __shared__ int s_item;
     const int t = threadIdx.x;
     const int plan = A.ctl[0];
-    const int u1 = A.B * 2 * A.KS1, n1 = A.n_slots * u1;                // fc1 units per slot, routed fc1 items
-    const int sh1 = (A.s_nch + A.s_cw - 1) / A.s_cw;                    // shared fc1 CTAs
-    const int u2 = A.B * A.NS2, n2 = A.n_slots * u2;                    // fc2 units per slot, routed fc2 items
-    const int total = n1 + sh1 + n2 + A.s_ns2;
+    const int u1 = A.B * 2 * A.KS1, n1 = (A.n_slots + SH) * u1;         // fc1 units per slot, routed (+ SH shared) fc1 items
+    const int sh1 = SH ? 0 : (A.s_nch + A.s_cw - 1) / A.s_cw;           // shared fc1 CTAs (s_* records)
+    const int u2 = A.B * A.NS2, n2 = (A.n_slots + SH) * u2;             // fc2 units per slot, routed (+ SH shared) fc2 items
+    const int total = n1 + sh1 + n2 + (SH ? 0 : A.s_ns2);
     int* done = A.fctl + 1;
     int* sdone = A.fctl + 1 + SMAX * g6nr::EB;
     if (blockIdx.x == 0 && t == 0) A.ctl[2] = plan;
@@ -120,15 +158,11 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
         if (item < n1)
         {
             const int slot = item / u1, b = (item / (A.KS1 * 2)) % A.B;
-            if (slot < A.n_slots_dev[plan])
-            {
-                const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + slot];
-                if (tr[4] == 3) tr3_fc1_body<3, E4>(A, plan, item, tr, smem);
-                else tr3_fc1_body<4, E4>(A, plan, item, tr, smem);
-            }
+            int e, mask, ss = slot;
+            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, item + (ss - slot) * u1, e, mask, smem);
             __threadfence();
             __syncthreads();
-            if (t == 0) atomicAdd(done + slot * A.B + b, 1);
+            if (t == 0) atomicAdd(done + ss * A.B + b, 1);
         }
         else if (item < n1 + sh1)
         {
@@ -140,15 +174,15 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
         else if (item < n1 + sh1 + n2)
         {
             const int unit = item - n1 - sh1, slot = unit / u2, b = (unit / A.NS2) % A.B;
-            if (slot < A.n_slots_dev[plan])
+            int e, mask, ss;
+            if (k1_slot<SH>(A, plan, slot, e, mask, ss))
             {
-                const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + slot];
+                const long long* tr = A.t_tab + 6 * e;
                 if (b < static_cast<int>(tr[3]))
                 {
-                    if (t == 0) while (ld_acquire(done + slot * A.B + b) < 2 * A.KS1) {}
+                    if (t == 0) while (ld_acquire(done + ss * A.B + b) < 2 * A.KS1) {}
                     __syncthreads();
-                    if (tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, unit, tr, smem);
-                    else tr3_fc2_body<4, E4>(A, plan, unit, tr, smem);
+                    tr3_fc2_any<E4, K2>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
                 }
             }
         }
@@ -172,6 +206,20 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
 #if DEC_SLOT >= 2
     if (A.slot.send && A.s_direct) dslot::publish(A.slot, true);
 #endif
+}
+
+template <bool E4 = false, bool K2 = false, bool SH = false>
+__global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
+{
+    k1_fused_body<E4, K2, SH>(A);
+}
+
+// The same with the trellis shared expert. Under __launch_bounds__(512) alone nvcc gives the no-K2 instantiation 64
+// registers and spills (104 B stores, 132 B loads). The others get 101-128 and no spills. This entry sets the cap.
+template <bool E4 = true, bool K2 = false>
+__global__ __maxnreg__(128) void k1_tr3_fused_sh(K1Args A)
+{
+    k1_fused_body<E4, K2, true>(A);
 }
 
 // ------------------------------------------------------------------ NVFP4 build

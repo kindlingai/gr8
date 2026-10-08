@@ -14,6 +14,12 @@
 //      [--prefill MP] every prompt token but the last goes through the prefill path in sub-batches of up to MP rows,
 //                     on a second fabric region (two collectives of MP rows, the layer as its step; prefill.cuh)
 //      --prompt may be repeated: each is its own sequence (attention caches reset in between); "@file" reads ids
+//      [--reuse-prefix] keep the caches of the longest common prefix of the previous prompt + emitted ids (prefix_reuse.h;
+//                     G6_REUSE_STRICT=1: strict append only, G6_REUSE_NOEND=1: no prompt >= written_end rule; default off;
+//                     gate arm G6_REUSE_POISON=1: a hit first sets the old sequence's stale rows to NaN, reuse_poison.cuh;
+//                     W44 G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
+//                     No --s2 (sessions share the pool) and no --dflash-manifest (the drafter's prompt-context taps are
+//                     written by the prefill a hit skips)
 //      [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)
@@ -44,6 +50,9 @@
 #include "prefill.cuh"
 #include "dflash.cuh"
 #include "serve.h"
+#include "prefix_reuse.h"
+#include "reuse_poison.cuh"
+#include "reuse_hdump.cuh"
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
 #ifdef DEC_S2
@@ -82,7 +91,7 @@ int main(int argc, char** argv)
     Plan plan;
     int cap = 64;
     float temp = 0.f;
-    bool graph = false, image = false, hash = true;
+    bool graph = false, image = false, hash = true, reuse_prefix = false;
     int MP = 0, top = 0;
     bool wide = false, pfv2 = false;
     int pfrows = 0, mtp = 0, lanes = 1;
@@ -121,6 +130,7 @@ int main(int argc, char** argv)
         else if (a == "--graph") graph = true;
         else if (a == "--image") image = true;
         else if (a == "--no-hash") hash = false;
+        else if (a == "--reuse-prefix") reuse_prefix = true;
         else if (a == "--prefill") MP = atoi(next().c_str());
         else if (a == "--top") top = atoi(next().c_str());
         else if (a == "--wide") wide = true;
@@ -180,6 +190,10 @@ int main(int argc, char** argv)
 #endif
     if (s2mode && (!serve.empty() || !graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
         die("--s2 needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8, --s2-epoch > 0 and no --serve");
+    // --reuse-prefix holds the cache state of ONE conversation. --s2 sessions share the pool (s2/pool.h) and the DFlash2
+    // drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips: both would read stale rows.
+    if (reuse_prefix && s2mode) die("--reuse-prefix is not supported with --s2 (sessions share the cache pool)");
+    if (reuse_prefix && dfl) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
     for (const std::string& ps : prompts)
@@ -194,7 +208,7 @@ int main(int argc, char** argv)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
         plans.push_back(p);
     }
-    if (!serve.empty() || s2mode)       // any prompt: every prompt-step row count 1..chunk
+    if (!serve.empty() || s2mode || reuse_prefix)   // any prompt (reuse changes the offline prompt-step row counts too): 1..chunk
         for (int M = 1; M <= plan.chunk; ++M)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     std::vector<int> draft_rows;        // row counts of first-form draft passes: the prompt steps' and 1..K+1
@@ -706,6 +720,31 @@ int main(int argc, char** argv)
     MtpStats mtp_stats;
     int mtp_steps = 0;
     std::vector<double> t1;             // single-row step times
+    PrefixReuse reuse;
+    bool reuse_poison_on = false;
+    if (reuse_prefix)
+    {
+        std::string err;
+        const int st_ = env_choice("G6_REUSE_STRICT", 1, 0, &err), ne_ = env_choice("G6_REUSE_NOEND", 1, 0, &err),
+                  po_ = env_choice("G6_REUSE_POISON", 1, 0, &err);
+        if (st_ < 0 || ne_ < 0 || po_ < 0) die(err);
+        reuse.strict = st_ == 1; reuse.noend = ne_ == 1; reuse_poison_on = po_ == 1;
+        const int al_ = env_choice("G6_REUSE_ALIGN", 1, 0, &err);   // W44: retain only whole cold prefill grid cells (prefix_reuse.h)
+        if (al_ < 0) die(err);
+        if (al_ == 1 && !MP) die("G6_REUSE_ALIGN=1 needs tensor prefill (--prefill N)");
+        reuse.grid = al_ == 1 ? MP : 0;   // RGRID: one sub-batch (W44 CL1 [M]: the lane pairing does not change a row; W44 itself was 2 x MP with two lanes)
+        if (R == 0 && reuse.grid) fprintf(stderr, "# reuse grid %d rows (--prefill %d, lanes %d)\n", reuse.grid, MP, two ? 2 : 1);
+    }
+    HDump hd = hdump_env();             // W38b diag (reuse_hdump.cuh): default off
+    {
+        std::string err;
+        const int zs_ = env_choice("G6_REUSE_ZSCRATCH", 1, 0, &err);
+        if (zs_ < 0) die(err);
+        if (zs_ == 1 && !reuse_prefix) die("G6_REUSE_ZSCRATCH=1 needs --reuse-prefix");
+        hd.zscratch = zs_ == 1;
+    }
+    if (R == 0 && (!hd.dir.empty() || hd.zscratch))
+        fprintf(stderr, "# W38b diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
     Emitter em;
     PfTimes pt;                         // G6_PF_TIMES=1 (serve.h)
     if (!serve.empty()) serve_ready(serve);
@@ -735,6 +774,11 @@ int main(int argc, char** argv)
             }
             if (MP) sp.first = sp.plp >= 0 ? 0 : (int)sp.prompt.size() - 1;   // prompt logprobs: every prompt row is a decode-step row
         }
+        // Never skip into a teacher-forced scoring tail (--pf-rows, prompt logprobs). Without tensor prefill, the
+        // decode prompt steps start directly at skip.
+        const int old_end = reuse.written_end, old_dirty = reuse.dirty_end;   // dirty: every row written since the last reset
+        const int skip = reuse_prefix ? reuse.begin(sp.prompt, MP ? sp.first : (int)sp.prompt.size() - 1, mtp > 0) : 0;
+        if (skip > sp.first) sp.first = skip;
         const Plan& p = sp;
         if (pf_qp)                      // OWN=4 iff prompt + gen fits the QO table (G6_PF_QP_CTX), else OWN=2 for this request
         {
@@ -746,8 +790,23 @@ int main(int argc, char** argv)
         const int PS = prompt_steps(p), NS = total_steps(p);
         if (serve.empty()) pt.start("");
         else pt.lap("open");
-        reset(m, st);
-        if (mtp) reset(D.d, st);
+        if (!skip)
+        {
+            reset(m, st);
+            if (mtp) reset(D.d, st);
+        }
+        else if (reuse_poison_on && old_dirty > skip)   // gate arm: every stale row since the last reset := NaN (2b G2)
+        {
+            reuse_poison(m, skip, old_dirty, st);
+            if (mtp) reuse_poison(D.d, skip, old_dirty, st);
+            if (R == 0) fprintf(stderr, "# reuse seq %zu poisoned rows %d..%d\n", q, skip, old_dirty - 1);
+        }
+        if (skip && hd.zscratch)            // W38b diag arm: a hit starts from cleared per-seq attention scratch
+        {
+            zscratch(m, st);
+            if (mtp) zscratch(D.d, st);
+            if (R == 0) fprintf(stderr, "# reuse seq %zu zscratch layers %zu + %zu\n", q, m.layers.size(), mtp ? D.d.layers.size() : (size_t)0);
+        }
         if (dfl && DF.pf_feat)          // prefill taps keep rows at these positions. Each rank fills its owner rows, the rest stay zero
         {
             DF.pf_hi = p.first; DF.pf_lo = std::max(0, p.first - dfl::WIN);
@@ -756,7 +815,13 @@ int main(int argc, char** argv)
         G6RT_CK(cudaStreamSynchronize(st));
         pt.lap("reset");
         printf("seq %zu prompt %zu tokens\n", q, p.prompt.size());
-        for (int a = 0; a < p.first; a += MP)
+        if (reuse_prefix && R == 0)         // every miss with its reason (first / strict / no-lcp / short), counted by the gate
+            fprintf(stderr, "# reuse seq %zu %s retained %d lcp %d history %zu prompt %zu written_end %d dirty_end %d\n", q, reuse.why, skip,
+                    reuse.lcp, reuse.history.size(), p.prompt.size(), old_end, old_dirty);
+        if (reuse_prefix && R == 0 && reuse.grid)   // W44: the skip before the grid rule (TTFT cost of the exact rule)
+            fprintf(stderr, "# reuse seq %zu grid %d raw %d retained %d\n", q, reuse.grid, reuse.raw, skip);
+        if (skip) printf("reuse rows 0..%d\n", skip - 1);  // real hit evidence (every rank), NOT a freshly computed hash
+        for (int a = skip; a < p.first; a += MP)
         {
             if (two && p.first - a > MP)         // two sub-batches as two lanes (prefill.cuh pf_step2)
             {
@@ -794,6 +859,7 @@ int main(int argc, char** argv)
                 printf("prefill rows %d..%d resid %016llx\n", a, a + MA - 1, (unsigned long long)pf_hash(P, MA));
                 printf("prefill rows %d..%d resid %016llx\n", a + MA, a + MA + MB - 1, (unsigned long long)pf_hash(P2, MB));
                 fprintf(stderr, "# seq %zu prefill %d + %d rows (two lanes): %.3f ms (%.0f tok/s)\n", q, MA, MB, ms, (MA + MB) * 1000.0 / ms);
+                if (reuse_prefix) reuse.prefill_rows(a, MA + MB, mtp > 0);
                 pt.lap("checks_hash");
                 if (q > 0 || a > 0) { pf_ms += ms; pf_rows += MA + MB; }
                 a += MP;
@@ -822,8 +888,10 @@ int main(int argc, char** argv)
             if (const unsigned ae = attn_errors(m)) { fprintf(stderr, "g6m4: rank %d attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
             printf("prefill rows %d..%d resid %016llx\n", a, a + M - 1, (unsigned long long)pf_hash(P, M));
             fprintf(stderr, "# seq %zu prefill %d rows: %.3f ms (%.0f tok/s)\n", q, M, ms, M * 1000.0 / ms);
+            if (reuse_prefix) reuse.prefill_rows(a, M, mtp > 0);
             if (q > 0 || a > 0) { pf_ms += ms; pf_rows += M; }      // the very first sub-batch carries first-launch costs
         }
+        if (hd.listed(q)) hdump_seq(hd, m, mtp ? &D.d : nullptr, q, R, p.first, st);   // W38b diag: rows [0, p.first)
         int dfl_lo = p.first;           // --dflash: the lowest position the drafter holds context for
         if (dfl && DF.pf_feat && DF.pf_hi > DF.pf_lo)
         {
@@ -865,6 +933,7 @@ int main(int argc, char** argv)
             if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); exit(3); }
             const StepOut so = *out;
             if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
+            if (reuse_prefix) reuse.main_rows(si.pos[0], M);
             if (rlf) route_log_line(rlf, m, layers, q, s, M, si.pos[0], p.prompt.size());
             std::string line;
             step_line(m, so, s, M, line);
@@ -937,6 +1006,7 @@ int main(int argc, char** argv)
                 const StepOut so = *out_d;
                 if (so.attn_err) { fprintf(stderr, "g6m4: rank %d draft attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
                 std::string line;
+                if (reuse_prefix) reuse.draft_rows(di.pos[0], M, chain);
                 const int t = step_line(D.d, so, s, M, line);
                 printf("%s%s\n", chain ? "chain" : "draft", line.c_str() + 4);
                 fprintf(stderr, "# seq %zu %s %d M %d: %.3f ms\n", q, chain ? "chain" : "draft", s, M, dt);
@@ -947,6 +1017,7 @@ int main(int argc, char** argv)
             printf("generated");
             for (int t : gen) printf(" %d", t);
             printf("\n");
+            if (reuse_prefix) reuse.finish(p.prompt, gen, em.on ? em.emitted : (int)gen.size(), true);
             em.end(nullptr, mtp_stats.rounds, mtp, mtp_stats.tokens, mtp_stats.acc, mtp_stats.drafted);
             continue;
         }
@@ -973,6 +1044,7 @@ int main(int argc, char** argv)
             const StepOut so = *out;
             if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); return 3; }
             std::string line;
+            if (reuse_prefix) reuse.main_rows(in->pos[0], M);
             last_tok = step_line(m, so, s, M, line);
             printf("%s\n", line.c_str());
             if (top > 0 && (!em.on || p.lp >= 0 || p.plp >= 0)) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
@@ -996,6 +1068,7 @@ int main(int argc, char** argv)
             if (s >= PS + 2) t1.push_back(ms);
         }
         step0 += ns_run;
+        if (reuse_prefix) reuse.finish(p.prompt, gen, em.on ? em.emitted : (int)gen.size(), false);
         em.end(nullptr, 0, 0, 0, nullptr);
         printf("generated");
         for (int t : gen) printf(" %d", t);

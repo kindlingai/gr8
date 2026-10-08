@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-08: prompt-prefix reuse, `--reuse-prefix` (ported from the K1/CP serve line)
+
+- `g6m4 --reuse-prefix` keeps the attention caches of the longest common prefix of the new prompt and the previous
+  sequence (its prompt + the ids it actually emitted) instead of resetting them, so an agentic conversation re-prefills
+  only its suffix. `engine/runtime/prefix_reuse.h` holds the CPU state; the engine's cache path is unchanged.
+- `G6_REUSE_ALIGN=1` makes a hit exact: it retains only whole cold prefill grid cells,
+  `[0, floor(min(lcp, pf_end) / grid) * grid)` with `grid = --prefill MP`, and re-prefills from that grid point. Every
+  retained cell was then computed with the cold chunk shape, so a hit's cache rows and output tokens are the cold run's
+  bit for bit. A retained prefix below one grid cell is a miss (`why` = `grid`).
+- Off unless given. Env arms: `G6_REUSE_STRICT=1` (strict append only), `G6_REUSE_NOEND=1` (drop the
+  `prompt >= written_end` rule), and the gate/diag arms `G6_REUSE_POISON=1` (`reuse_poison.cuh`: a hit NaNs the stale
+  rows first, so a read of one shows up), `G6_REUSE_HDUMP=<dir>` + `G6_REUSE_HDUMP_SEQ=<q,..>` and
+  `G6_REUSE_ZSCRATCH=1` (`reuse_hdump.cuh`).
+- Refused with `--s2` (sessions share the cache pool) and with `--dflash-manifest` (the drafter's prompt-context taps
+  are written by the prefill rows a hit skips).
+- `engine/tests/test_prefix_reuse.cpp` (CPU, in `scripts/build.sh`) and `engine/tests/test_prefix_reuse.py` (the same
+  under ASan/UBSan, plus the `g6m4.cu` hook order) cover the state machine. Measured on the old line at `--prefill 4096
+  --pf-lanes 2`: hit TTFT 53.8 s vs cold 155.6 s over 14 requests (-65%), hit output identical to cold. Not yet measured
+  here.
+
 ## 2026-10-05: Rust front end, g6front-rs (#15)
 
 - New `frontend/g6front-rs/`: the OpenAI/vLLM front end in Rust (hyper, HF `tokenizers` 0.23.2 as the Python

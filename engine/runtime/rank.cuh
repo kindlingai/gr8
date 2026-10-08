@@ -390,6 +390,13 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         Layer& y = m.layers[i];
         y.l = ids[i];
         y.T = bind::layer_tensors(y.l, [&](const char* n) { return as_bind(find(n)); });
+        if (const char* e = bind::scan_widths(y.T)) die("layer " + std::to_string(y.l) + ": " + e);
+        // G6_V2_SHARED=int4: run an exlr8 v2 layer's shared expert from its int4 / MXFP8 records (the A/B against row 256).
+        // G6_V2_SHARED=trellis: prefill runs it as a trellis pass (no FP8 copy).
+        const char* v2s = getenv("G6_V2_SHARED");
+        if (y.T.sh_trellis && v2s && !strcmp(v2s, "int4")) y.T.sh_trellis = 0;
+        if (y.T.sh_trellis && !(v2s && !strcmp(v2s, "trellis")))
+            if (const char* e = bind::make_shared_fp8(y.T, st)) die("layer " + std::to_string(y.l) + ": " + e);
         if (m.wide)           // G6_NOWIDE2=1 keeps fc2 in the old order (A/B; outputs are bit-identical either way)
         {
             bind::widen_fc1(y.T, st);
@@ -401,6 +408,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         G6RT_CK(cudaStreamSynchronize(st));
 #endif
         if (const char* e = bind::check_shared_signs(y.T, st)) die("layer " + std::to_string(y.l) + ": " + e);
+
         y.moe = y.T.t[bind::T_TR3_TAB].p != nullptr;
         y.indexer = y.T.t[bind::T_IDX_WQ_B].p != nullptr;
         if (y.indexer) last_index = i;
