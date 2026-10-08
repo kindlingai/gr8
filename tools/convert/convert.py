@@ -405,6 +405,7 @@ def main(argv=None):
     ap.add_argument('--d8', nargs='+', required=True,
                     help='old D8 gptq-w32 dirs in old-rank order: six (r0..r5, TP6) or four (r0..r3, TP4)')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--nr', type=int, default=0, help='rank count of the new packs (default: the number of --d8 dirs); 3 = TP3')
     ap.add_argument('--layers', default='all')
     ap.add_argument('--ranks', default='all')
     ap.add_argument('--skip', default='', help='comma list of globals to leave out: embed, head')
@@ -422,7 +423,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if len(a.d8) not in (4, 6):
         ap.error(f'--d8 takes six dirs (TP6) or four (TP4), got {len(a.d8)}')
-    plan.set_nr(len(a.d8))
+    # d8_global rebuilds each dense matrix from all old ranks, so the new rank count need not match the old one
+    plan.set_nr(a.nr or len(a.d8))
     global GV, V2
     GV = a.gv_records
     layers = list(range(plan.L_MTP + 1)) if a.layers == 'all' else [int(x) for x in a.layers.split(',')]

@@ -5,7 +5,7 @@
 #ifndef G6_NR
 #define G6_NR 6
 #endif
-static_assert(G6_NR == 6 || (G6_NR > 0 && 64 % G6_NR == 0), "G6_NR: 6 or a divisor of 64");
+static_assert(G6_NR == 6 || G6_NR == 3 || (G6_NR > 0 && 64 % G6_NR == 0), "G6_NR: 3, 6 or a divisor of 64");
 
 namespace g6nr
 {

@@ -30,7 +30,7 @@ inline Command parse_command(const std::string& text, uint64_t epoch) {
     require(c.epoch==epoch && (c.admit || c.hash==0), "ingress epoch/cancel mismatch"); return c;
 }
 inline std::string capability(Config c, unsigned ranks) {
-    c.validate(); require(ranks==4 || ranks==6, "invalid rank count");
+    c.validate(); require(ranks==3 || ranks==4 || ranks==6, "invalid rank count");
     return "G6S2 1 "+std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
         std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+"\n";
 }

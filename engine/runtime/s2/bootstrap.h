@@ -90,7 +90,7 @@ struct BootstrapConfig {
     uint16_t port = 0;
     void validate() const {
         scheduler.validate();
-        require((ranks == 4 || ranks == 6) && rank < ranks, "invalid control rank count");
+        require((ranks == 3 || ranks == 4 || ranks == 6) && rank < ranks, "invalid control rank count");
         (void)address(head_ip, port); (void)deadline(timeout);
         require(!directory.empty() && !runtime_signature.empty(), "missing bootstrap directory/runtime signature");
     }
