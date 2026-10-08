@@ -379,12 +379,33 @@ static cudaError_t select_index(const G6Attn& a,Input input,Work& w,int start,in
     if(e!=cudaSuccess)return e;top_from_sort<<<count,256,0,stream>>>(input,start,w.so,w.io);return cudaGetLastError();
 }
 static cudaError_t select_index(const G6Attn& a,Work& w,int start,int count,cudaStream_t stream){return select_index(a,a,w,start,count,stream);}
+#include "idx31.cuh"
+#if defined(DEC_IDX31) && DEC_IDX31
+#ifndef SEL32
+#error "DEC_IDX31 needs SEL32 (index_scores_m writes no ids; only the full sort reads them)"
+#endif
+// #31: decode-sized query tiles (<= IDX31_ROWS rows) score with shared keys and select with the live-context bound
+constexpr int IDX31_ROWS=8;
+template<class Input>
+static void launch_index_scores31(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+    if(n<=IDX31_ROWS)launch_index_scores_m(a,input,w,start,n,st);else launch_index_scores(a,input,w,start,n,st);
+}
+template<class Input>
+static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+    return n<=IDX31_ROWS?select_index31(a,input,w,start,n,st):select_index(a,input,w,start,n,st);
+}
+#define LAUNCH_INDEX_SCORES launch_index_scores31
+#define SELECT_INDEX select_index_dec
+#else
+#define LAUNCH_INDEX_SCORES launch_index_scores
+#define SELECT_INDEX select_index
+#endif
 template<class Input>
 static cudaError_t make_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,float* diagnostic){
     prep_index<<<dim3(count,32),128,0,stream>>>(input,start,w.iq,w.weights);
-    launch_index_scores(a,input,w,start,count,stream);
+    LAUNCH_INDEX_SCORES(a,input,w,start,count,stream);
     if(diagnostic)return cudaMemcpyAsync(diagnostic+(int64_t)start*a.context,w.si,(size_t)count*a.context*4,cudaMemcpyDeviceToDevice,stream);
-    return select_index(a,input,w,start,count,stream);
+    return SELECT_INDEX(a,input,w,start,count,stream);
 }
 static cudaError_t make_index(const G6Attn& a,Work& w,int start,int count,cudaStream_t stream,float* diagnostic){return make_index(a,a,w,start,count,stream,diagnostic);}
 template<class Input>   // DEC_AVP launches (tests call these regardless of the build flag)
@@ -489,8 +510,8 @@ static cudaError_t cp_index_body(const G6Attn& a,Input input,Work& w,uint64_t* c
     cp_cand_pack<<<n,256,0,stream>>>(input,0,a.context>32768?w.s1:w.si,mine);
 #else
     prep_index<<<dim3(n,32),128,0,stream>>>(input,0,w.iq,w.weights);
-    launch_index_scores(a,input,w,0,n,stream);
-    cudaError_t e=select_index(a,input,w,0,n,stream);if(e!=cudaSuccess)return e;
+    LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
+    cudaError_t e=SELECT_INDEX(a,input,w,0,n,stream);if(e!=cudaSuccess)return e;
     cp_cand_pack<<<n,256,0,stream>>>(input,0,w.si,mine);
 #endif
     return cudaGetLastError();
