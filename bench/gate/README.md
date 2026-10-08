@@ -40,6 +40,22 @@ multi-session). Run records go to `bench/gate/runs.jsonl` (git-ignored; `--runs`
 A run record holds the build commit, topology, build flags, engine environment, all settings (including the seed),
 every detailed result, and the flat `metrics` the gates compare.
 
+## Prompt sets of another bench (cross-stack comparisons)
+
+`run --prompt-set FILE` also runs another bench's prompts, given as exact token ids, so g6 and another stack can be
+compared on the same text (the harness's own `workloads` use different prompts, and drafter acceptance depends on the
+text). The ids go to `/v1/completions` as they are: the other bench's chat template, system message and thinking
+setting are kept. One request per prompt, `--prompt-set-tokens` (default 512) at `--prompt-set-temp` (default 0).
+
+```json
+{"name": "glm53-bench-1", "prompts": [{"id": "code0", "kind": "code", "prompt_token_ids": [151331, ...]}, ...]}
+```
+
+Numbers are named `set.<name>.<kind>.decode_tok_s` and `set.<name>.<kind>.tokens_per_step` (drafter counters over that
+kind only), so every number says which set it comes from; `work.*` and `spec.*` are always the harness's own workloads.
+The record keeps the file's sha256. The part is off unless `--prompt-set` is given, and it is not in the gate set of
+issue #1; a baseline built from runs with it gates these metrics like any other.
+
 ## Gates
 
 - **Spread:** `run --repeat 2` (default) runs the suite twice against one boot and prints the spread per metric.
