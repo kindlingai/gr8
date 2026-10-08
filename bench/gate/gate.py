@@ -187,7 +187,7 @@ def main():
     def common(p, build=True):
         p.add_argument('--url', default='http://127.0.0.1:8100')
         p.add_argument('--model', default=C.MODEL)
-        p.add_argument('--topology', required=True, choices=['tp6', 'tp4'])
+        p.add_argument('--topology', required=True, choices=['tp6', 'tp4', 'tp3'])
         if build:
             p.add_argument('--commit', required=True, help='gr8 commit of the build under test')
 
@@ -237,7 +237,7 @@ def main():
     p.set_defaults(func=cmd_spread)
 
     p = sub.add_parser('baseline', help='baseline file from the run records of several boots')
-    p.add_argument('--topology', required=True, choices=['tp6', 'tp4'])
+    p.add_argument('--topology', required=True, choices=['tp6', 'tp4', 'tp3'])
     p.add_argument('--runs', default=runs_default)
     p.add_argument('--out', required=True)
     p.add_argument('--commit', required=True, help='only runs of this build commit go into the baseline')
