@@ -11,6 +11,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -46,6 +47,41 @@ struct LoadStats
     bool used_direct_io = false;
 };
 
+// Pack bytes kept in other files: exlr8 v2 slices (#65, tools/convert/convert.py --v2-refs). The pack is sparse there,
+// and rank<r>.sources lists where each range lives. The loaders call fill() on every chunk as it arrives, before
+// hashing, so the image and every sha256 check are exactly those of the full pack (tools/convert/sources.py is the
+// reference implementation). Chunks must arrive in increasing pack order.
+//   text format: a header "g6sources-v1 <root>", then one range per line, sorted by pack offset:
+//   <pack_offset> <nbytes> <op> <file_offset> <file_nbytes> <path relative to root>
+//   op copy:    pack bytes = file bytes file_offset.. (nbytes == file_nbytes)
+//   op item128: one whole v2 down half, file order [col16 / 8][k16][col16 % 8][tile] -> g6 fc2 order
+//               [col16][k16][tile] (tools/convert/v2.py down_to_g6), nbytes == file_nbytes == 98304 * width
+class Sources
+{
+public:
+    Sources() = default;
+    Sources(const Sources&) = delete;
+    Sources& operator=(const Sources&) = delete;
+    ~Sources();
+
+    // root: where the relative paths live ("" = the root the file names). Checks order, overlap, the pack size
+    // and that every source file is long enough.
+    bool open(const std::string& path, const std::string& root, uint64_t pack_bytes, std::string& err);
+    bool fill(uint8_t* buf, uint64_t pos, size_t n, std::string& err);
+    size_t ranges() const { return seg_.size(); }
+    uint64_t bytes() const { return bytes_; }
+    const std::string& root() const { return root_; }
+
+private:
+    struct Seg { uint64_t pack_off, nbytes, file_off, file_nbytes; int op, file; };
+    std::vector<Seg> seg_;
+    std::vector<int> fds_;
+    std::string root_;
+    size_t cur_ = 0, half_seg_ = SIZE_MAX;
+    uint64_t bytes_ = 0;
+    std::vector<uint8_t> raw_, half_;
+};
+
 class Pack
 {
 public:
@@ -57,7 +93,9 @@ public:
     // Parses the manifest only (no allocation). Returns false + err on any schema/layout problem.
     bool open_manifest(const std::string& manifest_path, std::string& err);
     // Streams the pack ("-" = stdin) into a fresh allocation and checks every sha256. Requires open_manifest.
-    bool load(const std::string& pack_path, const LoadOpts& opts, LoadStats& stats, std::string& err);
+    // src: fill its ranges from their files (a sparse pack, see Sources).
+    bool load(const std::string& pack_path, const LoadOpts& opts, LoadStats& stats, std::string& err,
+              Sources* src = nullptr);
 
     int rank() const { return rank_; }
     uint64_t bytes() const { return pack_bytes_; }

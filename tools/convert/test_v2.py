@@ -11,7 +11,7 @@ import unittest
 
 import numpy as np
 
-from tools.convert import v2, v2synth
+from tools.convert import sources, v2, v2synth
 from tools.convert.pack import PackWriter
 from tools.convert.st import ST
 
@@ -58,11 +58,12 @@ class V2(unittest.TestCase):
         sh = dict(gate=rng.integers(3, 5, 16).tolist(), up=[4] * 16, down=4)   # shared: per-half gate widths too
         return v2.Widths(down, gate, up, shared=sh, name='mixed')
 
-    def convert(self, src, wd, nr, ranks=None, shared=True):
+    def convert(self, src, wd, nr, ranks=None, shared=True, refs=False):
         out = tempfile.mkdtemp(dir=self.tmp.name)
-        ws = {r: PackWriter(os.path.join(out, f'rank{r}.pack'), r, False, {}) for r in (ranks or range(nr))}
+        rf = (src, src) if refs else None
+        ws = {r: PackWriter(os.path.join(out, f'rank{r}.pack'), r, False, {}, refs=rf) for r in (ranks or range(nr))}
         lay = v2.V2Layer(src, L)
-        ex = v2.convert_experts_v2(L, lay, wd, ws, nr, shared=shared)
+        ex = v2.convert_experts_v2(L, lay, wd, ws, nr, shared=shared, refs=refs)
         lay.close()
         for w in ws.values():
             w.close()
@@ -232,6 +233,78 @@ class V2(unittest.TestCase):
         self.assertEqual(wd.of(256), ([3] * 16, [4] * 8 + [3] * 8, 4))
         self.assertTrue(prov.startswith('pilot sha256:'))
         self.assertEqual(v2.load_widths('down1', L, v1_bits=[3, 4] * (NE // 2))[0].of(256), ([3] * 16, [3] * 16, 3))
+
+    def test_refs_rebuild_the_full_pack(self):
+        # sparse pack + rank<r>.sources must give the full pack byte for byte, with the same manifest
+        for nr, wd in ((4, self.mixed_widths(1)), (5, v2.Widths([2] * NE, [3] * NE, [4] * NE, 4, 'k'))):
+            full, _ = self.convert(self.src, wd, nr)
+            sparse, _ = self.convert(self.src, wd, nr, refs=True)
+            for r in range(nr):
+                a, b = (read_pack(d, r)[1] for d in (full, sparse))
+                self.assertEqual(a['tensors'], b['tensors'])
+                self.assertEqual(b['sources'], f'rank{r}.sources')
+                st = os.stat(os.path.join(sparse, f'rank{r}.pack'))
+                self.assertEqual(st.st_size, a['pack_bytes'])
+                got = sources.check(sparse, r, ref=os.path.join(full, f'rank{r}.pack'), log=lambda *_: None)
+                fc = sum(t['nbytes'] for t in a['tensors'] if t['name'].split('.', 1)[1] in ('tr3.fc1', 'tr3.fc2'))
+                self.assertEqual(got['filled'], fc)
+
+    def test_refs_corrupt_source_caught(self):
+        wd = v2.Widths([3] * NE, [3] * NE, [3] * NE, 3, 'k3')
+        sparse, _ = self.convert(self.src, wd, 4, refs=True)
+        _, segs = sources.read_sources(os.path.join(sparse, 'rank0.sources'))
+        bad = os.path.join(self.tmp.name, 'v2bad')
+        import shutil
+        shutil.copytree(self.src, bad)
+        p = os.path.join(bad, os.path.relpath(segs[3][5], self.src))
+        with open(p, 'r+b') as f:
+            f.seek(segs[3][3] + 7)
+            c = f.read(1)
+            f.seek(segs[3][3] + 7)
+            f.write(bytes([c[0] ^ 1]))
+        with self.assertRaises(ValueError):
+            sources.check(sparse, 0, root=bad, log=lambda *_: None)
+
+    def test_v2pack_from_a_base_pack(self):
+        # base pack: non-expert tensors, shared-expert records and old experts of layer L; v2pack must keep the first,
+        # drop the records, swap the experts for v2 refs, and rebuild byte for byte what writing them directly gives
+        from tools.convert import v2pack
+        nr, wd = 4, self.mixed_widths(2)
+        rng = np.random.default_rng(7)
+        glob = rng.integers(0, 255, 70000, dtype=np.uint8)
+        norm = rng.standard_normal(6144).astype(np.float16)
+        rec = rng.integers(0, 255, 9000, dtype=np.uint8)
+        old = rng.integers(0, 255, 12345, dtype=np.uint8)
+        P = f'L{L:03d}'
+        base, want = (tempfile.mkdtemp(dir=self.tmp.name) for _ in range(2))
+        mpath = os.path.join(self.tmp.name, 'm.json')
+        with open(mpath, 'w') as f:
+            json.dump({'format': 'exlr8-v2-manifest', 'name': 'mixed', 'layers': {str(L): {
+                'down': wd.down.tolist(), 'gate': wd.gate.tolist(), 'up': wd.up.tolist(),
+                'shared': {'gate': wd.sgate.tolist(), 'up': wd.sup.tolist(), 'down': wd.sdown}}}}, f)
+        for d, new in ((base, False), (want, True)):
+            for r in range(nr):
+                w = PackWriter(os.path.join(d, f'rank{r}.pack'), r, False, {'nr': nr})
+                w.put('G.embed', glob, 'u8')
+                w.put(f'{P}.attn_norm', norm, 'f16')
+                if new:
+                    lay = v2.V2Layer(self.src, L)
+                    v2.convert_experts_v2(L, lay, v2.load_widths(mpath, L)[0], {r: w}, nr, P=P,
+                                          info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'))
+                    lay.close()
+                else:
+                    w.put(f'{P}.shared.gptq.fc1', rec, 'u8')
+                    w.put(f'{P}.tr3.fc1', old, 'u8')
+                w.put('G.final_norm', norm, 'f16')
+                w.close()
+        out = tempfile.mkdtemp(dir=self.tmp.name)
+        v2pack.main(['--base', base, '--v2', self.src, '--widths', mpath, '--out', out, '--ranks', '0,1,2,3',
+                     '--src', self.tmp.name])
+        for r in range(nr):
+            got, wantm = read_pack(out, r)[1], read_pack(want, r)[1]
+            self.assertEqual(got['tensors'], wantm['tensors'])
+            self.assertEqual(got['v2_layers'][str(L)].split(' ')[0], 'mixed')
+            sources.check(out, r, ref=os.path.join(want, f'rank{r}.pack'), log=lambda *_: None)
 
     def test_parse_experts(self):
         self.assertEqual(v2.parse_experts('0-63 (partial: a test set, not a whole layer)'), list(range(64)))

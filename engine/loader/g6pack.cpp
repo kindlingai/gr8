@@ -292,6 +292,132 @@ size_t dtype_size(DType d)
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------ Sources
+namespace
+{
+enum { OP_COPY = 0, OP_ITEM128 = 1 };
+constexpr uint64_t kHalfPerBit = 98304;   // bytes of one v2 down half per bit of width: 48 x 8 x 8 tiles of 32 bytes
+
+bool pread_all(int fd, uint8_t* p, uint64_t n, uint64_t off, const std::string& what, std::string& err)
+{
+    while (n)
+    {
+        const ssize_t k = pread(fd, p, (size_t)std::min<uint64_t>(n, 1ull << 30), (off_t)off);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0)
+        {
+            err = what + ": " + (k == 0 ? std::string("short read") : strerror(errno)) + " at " + std::to_string(off);
+            return false;
+        }
+        p += k, n -= (uint64_t)k, off += (uint64_t)k;
+    }
+    return true;
+}
+
+// v2 item128 down half -> g6 fc2 order: out[a][c][b] = in[a][b][c], a < 48, b, c < 8, tiles of n / 3072 bytes
+void item128_to_g6(const uint8_t* in, uint8_t* out, uint64_t n)
+{
+    const uint64_t tb = n / 3072;
+    for (uint64_t a = 0; a < 48; ++a)
+        for (uint64_t b = 0; b < 8; ++b)
+            for (uint64_t c = 0; c < 8; ++c)
+                memcpy(out + ((a * 8 + c) * 8 + b) * tb, in + ((a * 8 + b) * 8 + c) * tb, tb);
+}
+}  // namespace
+
+Sources::~Sources()
+{
+    for (int fd : fds_) close(fd);
+}
+
+bool Sources::open(const std::string& path, const std::string& root, uint64_t pack_bytes, std::string& err)
+{
+    std::ifstream f(path);
+    if (!f) { err = "cannot open sources " + path; return false; }
+    std::string line, tag;
+    std::getline(f, line);
+    {
+        std::istringstream h(line);
+        h >> tag >> root_;
+    }
+    if (tag != "g6sources-v1") { err = path + ": not a g6sources-v1 file"; return false; }
+    if (!root.empty()) root_ = root;
+    std::unordered_map<std::string, int> file_of;
+    std::vector<uint64_t> need;           // per file: the end of the furthest range read from it
+    std::vector<std::string> names;
+    uint64_t end = 0;
+    for (size_t ln = 2; std::getline(f, line); ++ln)
+    {
+        if (line.empty()) continue;
+        std::istringstream s(line);
+        Seg g{};
+        std::string op, rel;
+        if (!(s >> g.pack_off >> g.nbytes >> op >> g.file_off >> g.file_nbytes >> rel))
+        { err = path + ":" + std::to_string(ln) + ": bad line"; return false; }
+        if (op == "copy") g.op = OP_COPY;
+        else if (op == "item128") g.op = OP_ITEM128;
+        else { err = path + ":" + std::to_string(ln) + ": unknown op " + op; return false; }
+        if (g.nbytes == 0 || g.nbytes != g.file_nbytes ||
+            (g.op == OP_ITEM128 && g.nbytes % kHalfPerBit))
+        { err = path + ":" + std::to_string(ln) + ": bad range size"; return false; }
+        if (g.pack_off < end || g.pack_off + g.nbytes > pack_bytes)
+        { err = path + ":" + std::to_string(ln) + ": range overlaps or runs past pack_bytes"; return false; }
+        end = g.pack_off + g.nbytes;
+        auto it = file_of.find(rel);
+        if (it == file_of.end())
+        {
+            const std::string full = root_ + "/" + rel;
+            const int fd = ::open(full.c_str(), O_RDONLY);
+            if (fd < 0) { err = "cannot open source " + full + ": " + strerror(errno); return false; }
+            it = file_of.emplace(rel, (int)fds_.size()).first;
+            fds_.push_back(fd);
+            need.push_back(0);
+            names.push_back(full);
+        }
+        g.file = it->second;
+        need[g.file] = std::max(need[g.file], g.file_off + g.file_nbytes);
+        bytes_ += g.nbytes;
+        seg_.push_back(g);
+    }
+    for (size_t i = 0; i < fds_.size(); ++i)
+    {
+        struct stat sb;
+        if (fstat(fds_[i], &sb) || (uint64_t)sb.st_size < need[i])
+        { err = names[i] + " is shorter than its ranges need (" + std::to_string(need[i]) + " bytes)"; return false; }
+    }
+    return true;
+}
+
+bool Sources::fill(uint8_t* buf, uint64_t pos, size_t n, std::string& err)
+{
+    const uint64_t end = pos + n;
+    while (cur_ < seg_.size() && seg_[cur_].pack_off + seg_[cur_].nbytes <= pos) ++cur_;
+    for (size_t i = cur_; i < seg_.size() && seg_[i].pack_off < end; ++i)
+    {
+        const Seg& g = seg_[i];
+        const uint64_t a = std::max(pos, g.pack_off), b = std::min(end, g.pack_off + g.nbytes);
+        const std::string what = "source range at pack byte " + std::to_string(g.pack_off);
+        if (g.op == OP_COPY)
+        {
+            const uint64_t off = g.file_off + (a - g.pack_off);
+            if (!pread_all(fds_[g.file], buf + (a - pos), b - a, off, what, err)) return false;
+            posix_fadvise(fds_[g.file], (off_t)off, (off_t)(b - a), POSIX_FADV_DONTNEED);
+            continue;
+        }
+        if (half_seg_ != i)                // a half can span two chunks: keep the last one permuted
+        {
+            raw_.resize(g.file_nbytes);
+            half_.resize(g.nbytes);
+            if (!pread_all(fds_[g.file], raw_.data(), g.file_nbytes, g.file_off, what, err)) return false;
+            posix_fadvise(fds_[g.file], (off_t)g.file_off, (off_t)g.file_nbytes, POSIX_FADV_DONTNEED);
+            item128_to_g6(raw_.data(), half_.data(), g.nbytes);
+            half_seg_ = i;
+        }
+        memcpy(buf + (a - pos), half_.data() + (a - g.pack_off), b - a);
+    }
+    return true;
+}
+
 // ------------------------------------------------------------------------------------------------ Pack
 Pack::~Pack()
 {
@@ -364,7 +490,7 @@ bool Pack::open_manifest(const std::string& path, std::string& err)
     return true;
 }
 
-bool Pack::load(const std::string& path, const LoadOpts& opt, LoadStats& st, std::string& err)
+bool Pack::load(const std::string& path, const LoadOpts& opt, LoadStats& st, std::string& err, Sources* src)
 {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
@@ -470,6 +596,7 @@ bool Pack::load(const std::string& path, const LoadOpts& opt, LoadStats& st, std
                          : std::string("read error: ") + strerror(errno);
             break;
         }
+        if (src && !src->fill(base_ + pos, pos, (size_t)n, err)) { read_ok = false; break; }   // before the hashers see it
         pos += (uint64_t)n;
         since_drop += (uint64_t)n;
         since_note += (uint64_t)n;

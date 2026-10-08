@@ -65,28 +65,43 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
     };
 }
 // manifest + pack stream ("-" = stdin) -> device image
+// sources: a rank<r>.sources file for a sparse pack (g6::Sources, "" = none), resolved against sources_root ("" = the
+// root the file names)
+inline void open_sources(g6::Sources& src, const g6::Pack& pack, const std::string& sources, const std::string& root,
+                         int rank)
+{
+    std::string err;
+    if (!src.open(sources, root, pack.bytes(), err)) die(err);
+    fprintf(stderr, "# rank %d: %zu source ranges, %.2f GB, from %s\n", rank, src.ranges(), src.bytes() / 1e9, src.root().c_str());
+}
+
 inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& manifest, const std::string& file, int rank,
-                       bool hash = true)
+                       bool hash = true, const std::string& sources = "", const std::string& sources_root = "")
 {
     std::string err;
     if (!pack.open_manifest(manifest, err)) die(err);
     if (pack.rank() != rank) die(manifest + ": manifest says rank " + std::to_string(pack.rank()));
+    g6::Sources src;
+    if (!sources.empty()) open_sources(src, pack, sources, sources_root, rank);
     g6::LoadOpts lo;
     g6::LoadStats st;
     if (!hash) lo.hash_threads = 0;
-    if (!img.load(pack, file, lo, st, err)) die(err);
+    if (!img.load(pack, file, lo, st, err, sources.empty() ? nullptr : &src)) die(err);
     fprintf(stderr, "# rank %d: pack %.2f GB -> device image%s in", rank, st.bytes / 1e9, hash ? ", sha256-checked," : " (NO checksum)");
     fprintf(stderr, " %.1f s (%.2f GB/s; copy %.1f s, stall %.1f s)\n", st.seconds, st.gb_per_s, st.copy_seconds, st.stall_seconds);
 }
 
-inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::string& file, int rank)
+inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::string& file, int rank,
+                      const std::string& sources = "", const std::string& sources_root = "")
 {
     std::string err;
     if (!pack.open_manifest(manifest, err)) die(err);
     if (pack.rank() != rank) die(manifest + ": manifest says rank " + std::to_string(pack.rank()));
+    g6::Sources src;
+    if (!sources.empty()) open_sources(src, pack, sources, sources_root, rank);
     g6::LoadOpts lo;
     g6::LoadStats st;
-    if (!pack.load(file, lo, st, err)) die(err);
+    if (!pack.load(file, lo, st, err, sources.empty() ? nullptr : &src)) die(err);
     fprintf(stderr, "# rank %d: pack %.2f GB loaded + sha256-checked in %.1f s (%.2f GB/s)\n", rank, st.bytes / 1e9, st.seconds,
             st.gb_per_s);
 }

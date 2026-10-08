@@ -33,6 +33,8 @@
 #   QP_PACK=1         PF_OWN=4 with resident pair packs (packs/qp.rank<r>.*, tools/convert/pairpack.py) instead of
 #                     QP_ROLL; about 6 GB more per rank, which does not fit next to a TP4 rank pack at CAP=393216
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
+#   SOURCES_ROOT=DIR  sparse packs (packs/rank<r>.sources, convert.py --v2-refs): where the v2 files are on the
+#                     nodes (default: the root rank<r>.sources names)
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   READY_TMO=900     seconds to wait for all four ranks to load
 #   FRONT=py          front end: py = frontend/g6front (Python), rs = g6front-rs (Rust, issue #15; build it with
@@ -72,6 +74,9 @@ SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --p
 [ "${NOHASH:-0}" = 1 ] && SERVE_ARGS="$SERVE_ARGS --no-hash"
 
 for ((r = NRANK - 1; r >= 0; r--)); do
+  # a sparse pack (convert.py --v2-refs) reads its exlr8 v2 expert bytes from the v2 files at load
+  SRCARGS=""
+  on $r "test -e $G6_HOME/packs/rank$r.sources" && SRCARGS="--sources packs/rank$r.sources ${SOURCES_ROOT:+--sources-root $SOURCES_ROOT}"
   QPARGS=""
   [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" = 1 ] && QPARGS="--qp-manifest packs/qp.rank$r.manifest.json --qp-pack packs/qp.rank$r.pack"
   [ "$DFLASH" = 1 ] && QPARGS="$QPARGS --dflash-manifest packs/dflash.r$r.manifest.json --dflash-pack packs/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
@@ -79,7 +84,7 @@ for ((r = NRANK - 1; r >= 0; r--)); do
   # the engine: backgrounding the whole && list left a shell holding the ssh session open until the engine exited
   on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
-      --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all \
+      --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all $SRCARGS \
       --serve $G6_HOME/serve $SERVE_ARGS $QPARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait

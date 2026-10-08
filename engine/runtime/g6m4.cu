@@ -9,6 +9,8 @@
 //
 // g6m4 --rank R --ips a,b,.. [--ips2 a,b,..] [--proxy-cpu N] --manifest rankR.manifest.json --pack rankR.pack|-
 //      [--image]      stream the pack straight into one device image (g6::DevImage; needed for a full 60 GB pack)
+//      [--sources rankR.sources [--sources-root DIR]]  the pack is sparse (convert.py --v2-refs): fill its exlr8 v2
+//                     expert ranges from the v2 files at load (g6::Sources). DIR overrides the root the file names
 //      [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234] [--cap 64] [--chunk 4]
 //      [--graph]      one captured graph per row count instead of plain launches (same lines)
 //      [--prefill MP] every prompt token but the last goes through the prefill path in sub-batches of up to MP rows,
@@ -79,7 +81,7 @@ int main(int argc, char** argv)
     const int progress_isolate = env_choice("G6_PROGRESS_ISOLATE", 1, 1, &progress_err);
     if (progress_isolate < 0) die(progress_err);
     g6::FabricConfig cfg;
-    std::string manifest, packfile, layers_s = "0,3,40,77";
+    std::string manifest, packfile, sources, sources_root, layers_s = "0,3,40,77";
     std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
     std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
     std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
@@ -110,6 +112,8 @@ int main(int argc, char** argv)
         else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
         else if (a == "--manifest") manifest = next();
         else if (a == "--pack") packfile = next();
+        else if (a == "--sources") sources = next();
+        else if (a == "--sources-root") sources_root = next();
         else if (a == "--qo-manifest") qo_man = next();
         else if (a == "--qo-pack") qo_file = next();
         else if (a == "--qp-manifest") qp_man = next();
@@ -363,8 +367,8 @@ int main(int argc, char** argv)
     DevStore store;
     Model m;
     g6::DevImage img;
-    if (image) load_image(pack, img, manifest, packfile, R, hash);
-    else load_pack(pack, manifest, packfile, R);
+    if (image) load_image(pack, img, manifest, packfile, R, hash, sources, sources_root);
+    else load_pack(pack, manifest, packfile, R, sources, sources_root);
     u64* stepp = dmalloc<u64>(1);
     StepIn* in;
     StepOut* out;
