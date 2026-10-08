@@ -1417,11 +1417,18 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
     const bindp::Layer& b = pf_layer(m, P, i, M);
     pf_mark(7, st);
-    bindp::launch(b.xq_x2, st);
-    bindp::launch_pair(b.gate, b.up, st);
-    bindp::launch(b.act, st);
-    bindp::launch(b.xq_act, st);
-    bindp::launch(b.down, st, b.rs_down);
+    // An exlr8 v2 layer whose shared expert runs from its FP8 copy (Layer::shx) launches these five itself,
+    // inside launch_shared, after k_shx_rotq has written the rotated gate / up records. Running them here as
+    // well read sc.x8_big / sc.x8_small as the previous stage left them and was overwritten by that pass:
+    // same output, one shared gate + up + down GEMM per MoE layer of pure waste.
+    if (!b.shx.on)
+    {
+        bindp::launch(b.xq_x2, st);
+        bindp::launch_pair(b.gate, b.up, st);
+        bindp::launch(b.act, st);
+        bindp::launch(b.xq_act, st);
+        bindp::launch(b.down, st, b.rs_down);
+    }
     pf_mark(5, st);
     pf_blas_x2(m, P, i, M, st);
     bindp::launch_shared(b, st);                 // exlr8 v2 trellis shared expert (#65); no-op otherwise
