@@ -1,0 +1,58 @@
+#!/bin/bash
+# Multi-session (S2) boot of the TP4 engine on four Sparks: launch_tp4.sh's engine settings, but g6m4 --s2 (a DEC_S2
+# build: EXTRA=-DDEC_S2 scripts/build.sh) serving up to SESS concurrent sessions, driven by frontend/g6s2shim.py instead
+# of --serve / g6shim.py. Stop with scripts/stop.sh.
+#   SESS=8 scripts/launch_s2.sh
+# Knobs (environment), as launch_tp4.sh unless noted:
+#   SESS=8            most concurrent sessions (1..8); every reachable step graph is captured at boot (~2.5 GiB at 8)
+#   MTP=2             MTP draft count (S2 runs MTP; DFlash2 is not wired into --s2)
+#   CAP, PACKS, PF_OWN (default 4; short prompts take OWN=2, G6_PF_QP_MIN), QP_ROLL, QP_CTX, QP_EARLY,
+#   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end; S2 has no Python front end path here)
+#   S2PORT=7341       the S2 control port on the head
+set -eu
+. "$(dirname "$0")/common.sh"
+[ "$NRANK" = 4 ] || { echo "launch_s2.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
+CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-1800}; PACKS=${PACKS:-packs}; MTP=${MTP:-2}; SESS=${SESS:-8}
+S2PORT=${S2PORT:-7341}; EPOCH=$(date +%s)
+# keep in step with launch_tp4.sh
+PF_OWN=${PF_OWN:-4}
+ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
+G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
+G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
+if [ "$PF_OWN" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G6_PF_QP_CTX=${QP_CTX:-$CAP} G6_PF_QP_EARLY=${QP_EARLY:-1}"; fi
+ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 --mtp $MTP \
+--s2 $G6_HOME/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $EPOCH"
+[ "${NOHASH:-0}" = 1 ] && ARGS="$ARGS --no-hash"
+SRCARGS=""
+[ -n "${V2:-}" ] && SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
+for ((r = NRANK - 1; r >= 0; r--)); do
+  on $r "cd $G6_HOME && rm -rf s2 serve && mkdir -p s2 out && { \
+    nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
+      --proxy-cpu $PROXY_CPU --manifest $PACKS/rank$r.manifest.json --pack $PACKS/rank$r.pack --image --layers all $SRCARGS \
+      $ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
+done
+wait
+PY=${PY:-$G6_HOME/venv/bin/python}
+mkdir -p "$G6_HOME/run" "$G6_HOME/out"; SOCK=$G6_HOME/run/engine.sock; rm -f "$SOCK"
+FRONT_RS="${FRONT_BIN:-$REPO/bin/g6front-rs}"
+[ -x "$FRONT_RS" ] || { echo "$FRONT_RS missing (scripts/build_front.sh)"; exit 1; }
+(cd "$REPO/frontend" && { nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
+  "$FRONT_RS" --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
+echo "engines started (epoch $EPOCH); waiting for ready.s2 (up to ${READY_TMO}s)"
+t0=$(date +%s)
+while :; do
+  on 0 "test -e $G6_HOME/s2/ready.s2" && break
+  for ((r = 0; r < NRANK; r++)); do
+    on $r "p=\$(cat $G6_HOME/out/g6m4.pid 2>/dev/null); [ -z \"\$p\" ] || kill -0 \$p 2>/dev/null" || { echo "rank $r exited; tail of its log:"; on $r "tail -20 $G6_HOME/out/g6m4.r$r.err"; exit 1; }
+  done
+  [ $(( $(date +%s) - t0 )) -lt "$READY_TMO" ] || { echo "timeout waiting for ready.s2"; exit 1; }
+  sleep 2
+done
+echo "ready.s2 after $(( $(date +%s) - t0 ))s: $(on 0 "cat $G6_HOME/s2/ready.s2")"
+DIRS="$G6_HOME/s2"; for ((r = 1; r < NRANK; r++)); do DIRS="$DIRS ${HOST[$r]}:$G6_HOME/s2"; done
+PYTHONPATH="$REPO/frontend" nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/shim.pid" \
+  "$PY" "$REPO/frontend/g6s2shim.py" --rank-dirs $DIRS --sock "$SOCK" > "$G6_HOME/out/shim.log" 2>&1 < /dev/null &
+for i in $(seq 1 150); do [ -S "$SOCK" ] && break; sleep 0.2; done
+[ -S "$SOCK" ] || { echo "shim did not open $SOCK"; tail -20 "$G6_HOME/out/shim.log"; exit 1; }
+for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break; sleep 0.2; done
+echo "front end /health: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")"
