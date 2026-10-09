@@ -87,6 +87,12 @@ __device__ __forceinline__ int tr3_unit(const long long* kmix, int e, const long
 #ifndef TR3_UNR
 #define TR3_UNR 8    // tiles loaded ahead per warp (bytes in flight per warp = TR3_UNR * tile bytes)
 #endif
+#ifndef TR3_XCOMP
+#define TR3_XCOMP 0   // fc1 x table compact [M][KSU*16+8] halfs instead of the 8-column fragment table (window1)
+#endif
+#ifndef TR3_PU
+#define TR3_PU 2      // window2: fc1 prologue tasks in flight per warp (W2 build: 4)
+#endif
 #ifndef TR3_EARLY
 #define TR3_EARLY 1  // wide order: request a CTA's first weight bytes before its prologue (0 = after it; A/B builds)
 #endif
@@ -151,12 +157,12 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     {
         const __half* suh = A.t_v1 + (row * 2 + mat) * HID;
         const int nact = __popc(mask & 0xff), ntask = nact * (KSU / 8);
-        for (int task = warp; task < ntask; task += 2 * nwarps)
+        for (int task = warp; task < ntask; task += TR3_PU * nwarps)
         {
-            uint2 xr[2], sr[2];
-            int m[2], blk[2], tok[2];
+            uint2 xr[TR3_PU], sr[TR3_PU];
+            int m[TR3_PU], blk[TR3_PU], tok[TR3_PU];
             #pragma unroll
-            for (int u = 0; u < 2; ++u)
+            for (int u = 0; u < TR3_PU; ++u)
             {
                 const int tk = min(task + u * nwarps, ntask - 1);
                 m[u] = __fns(mask, 0, tk % nact + 1);      // column
@@ -168,20 +174,30 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                 else sr[u] = *reinterpret_cast<const uint2*>(suh + k);
             }
             #pragma unroll
-            for (int u = 0; u < 2; ++u)
+            for (int u = 0; u < TR3_PU; ++u)
             {
                 if (task + u * nwarps >= ntask) break;
                 const float2 x01 = __half22float2(as_h2(xr[u].x)), x23 = __half22float2(as_h2(xr[u].y));
                 const float2 s01 = __half22float2(as_h2(sr[u].x)), s23 = __half22float2(as_h2(sr[u].y));
                 float v[4] = {x01.x * s01.x, x01.y * s01.y, x23.x * s23.x, x23.y * s23.y};
                 had128(v, lane);
-                store_frag_row(smem, blk[u] * 8, m[u], lane, v);
+                if (TR3_XCOMP && A.xc)
+                {
+                    u32* xp = smem + (m[u] * (KSU * 16 + 8) + blk[u] * 128 + lane * 4) / 2;
+                    xp[0] = pack_h2(v[0], v[1]);
+                    xp[1] = pack_h2(v[2], v[3]);
+                }
+                else store_frag_row(smem, blk[u] * 8, m[u], lane, v);
             }
         }
     }
     __syncthreads();
 
-    const u32* xa = smem + (ksq * 32 + lane) * 2;
+    const bool xcmp = TR3_XCOMP && A.xc;
+    const u32* xa = xcmp ? smem + min(lane >> 2, A.M - 1) * (KSU * 8 + 4) + ksq * 8 + (lane & 3) : smem + (ksq * 32 + lane) * 2;
+    const int xs = xcmp ? 8 : 64, xo = xcmp ? 4 : 1;
+#define XA0(ks) xa[(ks) * xs]
+#define XA1(ks) xa[(ks) * xs + xo]
     Tr3Lane<BITS, E4> ld;
     ld.init(lane);
 
@@ -207,7 +223,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                 for (int p = 0; p < BITS; ++p) nw[p] = ld_nc64(g0 + static_cast<size_t>(s + 8) * 8 * TB + static_cast<size_t>(p * 8 + j) * 256 + lane * 8);
             }
             #pragma unroll
-            for (int p = 0; p < 8; ++p) acc[0] += __int_as_float((r ^ xa[(s + p) * 64] ^ xa[(s + p) * 64 + 1]) & 0x3fffffff);
+            for (int p = 0; p < 8; ++p) acc[0] += __int_as_float((r ^ XA0(s + p) ^ XA1(s + p)) & 0x3fffffff);
         }
     }
 #else
@@ -236,7 +252,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                 const u32 pc = __shfl_sync(0xffffffffu, c, (lane + 31) & 31);
                 u32 f0[2], f1[2];
                 Tr3Lane<BITS, E4>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | c, 7 * BITS, f0, f1);
-                mma16816(acc, f0[0], f1[0], f0[1], f1[1], xa[(s + p) * 64], xa[(s + p) * 64 + 1]);
+                mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + p), XA1(s + p));
             }
         }
     }
@@ -263,7 +279,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 #if !defined(TR3_PROBE) || TR3_PROBE == 1
             ld.decodew(wa[p], f0, f1);
 #endif
-            const u32 x0 = xa[(s + p) * 64], x1 = xa[(s + p) * 64 + 1];
+            const u32 x0 = XA0(s + p), x1 = XA1(s + p);
 #if !defined(TR3_PROBE)
             mma16816(acc, f0[0], f1[0], f0[1], f1[1], x0, x1);
 #elif TR3_PROBE == 1   // cost probe: decode, no mma
@@ -278,6 +294,8 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 #endif
 #endif
 
+#undef XA0
+#undef XA1
     // epilogue: cols j*16 + l/4 (+8), tokens 2c and 2c+1
     const int nl = lane >> 2, c = lane & 3;
     float* gp = A.gpart + (((static_cast<size_t>(slot) * A.B + b) * 2 + mat) * GPMAX + h * A.WG + q) * 8 * 128 + j * 16 + nl;

@@ -642,10 +642,21 @@ inline int k1_fused_grid(int items, size_t smem, int e4 = 0, int k2 = 0, int sh 
 // fc1 k-splits per CTA grid, fc1 warp groups, fc2 n-splits, shared-expert fc1 k parts and fc2 out splits.
 // Best of the GB10 tune at M = 1, 3, 5 (engine/results/item1-tune.jsonl, the buckets of run_m1.split_for);
 // M = 2 uses the M = 3 split, M = 4 and M >= 6 the M = 5 split (not tuned separately).
+#ifndef TR3_W2SPLIT
+#define TR3_W2SPLIT 0
+#endif
 struct K1Split { int KS1, WG, NS2, s_ks, s_ns2; };
-inline K1Split k1_split(int M)
+// W1b (TR3_XCOMP builds): NS2 = 2 at 2-3 rows only for layers with 2-bit routed units (k2); every other layer, and
+// every layer of a default build, keeps the release split (NS2 = 8). TP3-specific tuning (window1 microbench, K2).
+inline K1Split k1_split(int M, int k2 = 0)
 {
-    return M == 1 ? K1Split{4, 1, 2, 8, 24} : M <= 3 ? K1Split{1, 2, 8, 8, 16} : K1Split{4, 2, 2, 8, 24};
+    K1Split s = M == 1 ? K1Split{4, 1, 2, 8, 24} : M <= 3 ? K1Split{1, 2, TR3_XCOMP && k2 ? 2 : 8, 8, 16} : K1Split{4, 2, 2, 8, 24};
+#if TR3_W2SPLIT
+    // Window2 winner (single-GB10 harness, K2 layers): 256-thread fc1 CTAs with the same k ranges (KS1 x2, WG 1) at M > 1.
+    // Baked, no env (harness K1_KW). NS2 = 2 at M 2..3 is the W1b rule above (k2 layers). Non-k2 layers keep release.
+    if (k2 && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
+#endif
+    return s;
 }
 constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: only WG, s_ks, s_ns2 matter. Not tuned.
 
@@ -699,7 +710,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         return "shared / dense MLP records are not [I/16][192][576] + [384][I/32][288] with I <= SACTW";
     if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
     // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
-    K1Split s = moe ? k1_split(split_m ? split_m : M) : K1_DENSE_SPLIT;
+    K1Split s = moe ? k1_split(split_m ? split_m : M, T.k2) : K1_DENSE_SPLIT;
     // exlr8 v2 layers (2-bit units or the trellis shared expert, #65) choose fused or separate fc1 / fc2 launches from a
     // table timed on GB10 (TP4 rank 0, MoE step, G6_FUSE=1 only). Separate wins at 2 rows for every layer (3-7.5%), and
     // at 3+ rows when 2-bit units are at least half the bytes (5-11%). Fused wins at 1 row (1-3%) and for mostly 3/4-bit
@@ -777,7 +788,12 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     const int sh1 = sh ? 0 : (s_nch + a.s_cw - 1) / a.s_cw;
     const int nsh = sh ? g6mx::tiles(M) : 0;        // trellis shared-expert slots (k1.cuh k1_nsh)
     k.g1 = (a.n_slots + nsh) * a.B * 2 * a.KS1 + sh1; k.b1 = 256 * s.WG;
-    k.sm1 = static_cast<size_t>(KSH / a.KS1) * 256;
+    // TR3_XCOMP (W1b): compact x table only for separate fc1 launches at M <= 3 (the step M, not split_m: an S2
+    // step of 8 rows in the 2-3 row class has KS1 = 1 and 8 * (384 * 16 + 8) * 2 = 98432 B > the KSH * 256 = 98304 B
+    // attribute -> invalid argument at launch, the bin-w1 crash). The fused kernels keep the fragment table.
+    // M <= 3 is one row tile, and column c of a slot is token c there (glue.cuh RoutePlan), so the table's rows are columns.
+    a.xc = (TR3_XCOMP && !fuse && M <= 3) ? 1 : 0;
+    k.sm1 = a.xc ? static_cast<size_t>(M) * (KSH / a.KS1 * 16 + 8) * 2 : static_cast<size_t>(KSH / a.KS1) * 256;
     if (k.sm1 < static_cast<size_t>(w1) * 1024 * g6mx::tiles(M)) k.sm1 = static_cast<size_t>(w1) * 1024 * g6mx::tiles(M);   // fc1 k-part sums, one 1 KB slab per warp and row tile
     k.g2 = (a.n_slots + nsh) * a.B * a.NS2 + (sh ? 0 : a.s_ns2); k.b2 = 512;
     // shared fc2: B tables of s_ntp row tiles in smem per pass over the weight stream (1 at M <= 8: sm2 as before)

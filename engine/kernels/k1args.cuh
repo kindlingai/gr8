@@ -41,6 +41,7 @@ struct K1Args
     const __half* t_v1;        // [block row][2][6144]  suh gate, suh up
     const __half* t_v2;        // [block row][3][128]   svh gate, svh up, suh down
     const __half* t_v3;        // [block row][6144]     svh down
+    int xc;                    // TR3_XCOMP builds: fc1 x table compact (separate fc1 only, M <= 3; bind.cuh make_k1)
     int B, KS1, WG, NS2;       // max 128-blocks per expert (grid and scratch stride), fc1 k-splits per CTA grid, warp groups, fc2 n-splits
     const __half *t_sg, *t_v1b, *t_v3b;   // block-scale form (exlr8 v2 layers, the SH kernels, #65): layer signs [2][6144]
                                // (in, out) as fp16 +-1, tr3.v1 as [block row][2][48] scales, tr3.v3 as [block row][48]
