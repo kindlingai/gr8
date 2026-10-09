@@ -24,7 +24,9 @@
 set -eu
 . "$(dirname "$0")/common.sh"
 [ "$NRANK" = 3 ] || { echo "launch_tp3.sh needs 3 HOSTS, config has $NRANK"; exit 2; }
-CAP=${CAP:-307200}; MTP=${MTP:-2}; READY_TMO=${READY_TMO:-900}
+TP=3
+. "$(dirname "$0")/engine_args.sh"
+engine_defaults
 
 # Boot admission: probe every rank (link rate per rail, GPU clock and throttle, wedge, memory rates, proxy CPUs) while no
 # model is booted, and stop here when a rank fails. No engine has started yet, so nothing needs cleaning up.
@@ -34,22 +36,16 @@ else
   rm -f "$G6_HOME/out/rank_health.json"      # a result left from an earlier boot must not stand for this one (gate.py run --health)
 fi
 
-# K1H2 = the served prefill/decode env + OWN=3 (QO attention) + context parallel KV (CP) past R=32768 tokens
-# with the HASH2 staged-page check. Every variable is explained in docs/SETTINGS.md.
-ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=${PF_OWN:-1} \
-G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
-G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
-SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 --pf-lanes 2 --pfv2"
-[ "${PF_OWN:-1}" = 3 ] && SERVE_ARGS="$SERVE_ARGS --qo-manifest packs/qo.manifest.json --qo-pack packs/qo.pack"
-[ "${NOHASH:-0}" = 1 ] && SERVE_ARGS="$SERVE_ARGS --no-hash"
-SERVE_ARGS="$SERVE_ARGS ${G6ARGS_X:-}"
+# The engine environment and arguments are in scripts/engine_args.sh, shared with ./gr8 glm53 up. Every variable is
+# explained in docs/SETTINGS.md.
+engine_env
 
 for ((r = NRANK - 1; r >= 0; r--)); do
+  ARGS=$(engine_args $r packs packs "$G6_HOME")
   # each process writes its own pid (setsid may fork, so $! is not always the engine's pid)
   on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
-      --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all \
-      --serve $G6_HOME/serve $SERVE_ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
+      --proxy-cpu $PROXY_CPU $ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait
 echo "engines started; waiting for three ready files (up to ${READY_TMO}s)"

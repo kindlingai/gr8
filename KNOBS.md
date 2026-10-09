@@ -1,11 +1,33 @@
 # Knobs
 
-Environment variables the launch path reads: `./gr8 glm53`, the launchers in `scripts/` and the build. Set one on the
-command line (`CAP=262144 ./gr8 glm53 up`) or in `config/cluster.env`; every script sources that file, so a value there
-wins over the same variable on the command line. The engine's own environment (`G6_*`) and flags are in
-[docs/SETTINGS.md](docs/SETTINGS.md), and each launcher's header comment is the full reference for its knobs.
+The options of `./gr8 glm53`, the launchers in `scripts/` and the build. Each knob has a name
+(`CAP`) and a flag (`--cap`): the flag is the name in lower case with `-` for `_`, except `--s2-port` for `S2PORT` and
+`--g6-home` for `G6_HOME`. The engine's own environment (`G6_*`) and flags are in [docs/SETTINGS.md](docs/SETTINGS.md).
 
-"TP=4" is the served engine, `launch_tp4.sh` running `launch_s2.sh`. A dash means the launcher does not read it.
+Where a value comes from, strongest first:
+
+1. the command line: `./gr8 glm53 up --cap 262144`;
+2. one config file: `@FILE` on the command line, else `$G6_CLUSTER`, else `./cluster.env`, else `config/cluster.env`
+   (`--no-config` reads none). `./gr8 glm53` parses the file and does not source it: `KEY=value` lines, `#` comments, optional `export`, quotes
+   stripped, and no `$` expansion;
+3. the environment: `CAP=262144 ./gr8 glm53 up`;
+4. the default.
+
+This is the other way round from the ssh launchers (`./gr8 glm53 --ssh up`, deprecated), where every script sources the
+config file, so a value there wins over the environment. `./gr8 glm53 up` prints every value and where it came from,
+and `./gr8 glm53 show-config` prints them without booting.
+
+The handshake before the engines start compares the cluster options on every box: the TP, the shape, the peer list or
+mentat group, the ports, every knob in the launch table below that reaches the engine, and the engine environment and
+arguments they produce. Per-box values, such as paths and the proxy CPU, do not count. Any difference stops every
+box, with the option and each box's value.
+
+The engine does not inherit `G6_*` variables from the environment, and `./gr8 glm53 up` refuses to start while one is
+set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box compares them.
+
+The defaults in the launch table come from `scripts/engine_args.sh`. The supervisor and the ssh launchers both read
+it. "TP=4" is the multi-session engine (`--s2`). A dash means that TP does not read the knob. `V2`, `V2_SLICES` and
+`V2_WIDTHS` are paths, so each box may have its own. The handshake compares the sha256 of the `V2_WIDTHS` file instead.
 
 ## Launch
 
@@ -13,7 +35,7 @@ wins over the same variable on the command line. The engine's own environment (`
 |---|---|---|---|---|
 | `CAP` | 393216 | 614400 | 307200 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory |
 | `SESS` | 8 | – | – | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
-| `REUSE` | 0 | – | – | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part |
+| `REUSE` | 1 | – | – | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
 | `DFLASH` | 1 | – | – | 1 = the DFlash2 drafter (needs `packs/dflash.r<r>.*` on every box); 0 = MTP only |
 | `DFLASH_SEL` | engine default (1) | – | – | 1 = the DFlash2 selector walk, 0 = the drafter's argmax |
 | `DFLASH_K` | engine default (7) | – | – | verify at most the first k of the 7 drafts |
@@ -40,13 +62,31 @@ wins over the same variable on the command line. The engine's own environment (`
 
 ## `./gr8 glm53`
 
-| variable | default | meaning |
-|---|---|---|
-| `G6_CLUSTER` | `config/cluster.env` | the cluster file, for every script |
-| `TP` | the number of `HOSTS` | must agree with `HOSTS`; picks the launcher and the build |
-| `CHECK` | 1 | 0 = `up` and `restart` skip `./gr8 glm53 check` (same as `--no-check`) |
-| `PACK_DIR` | none | `./gr8 glm53 stage` with no argument copies from here |
-| `BIN_DIR` | `bin` | what `./gr8 glm53 stage` copies the engine from |
+| name | flag | default | scope | meaning |
+|---|---|---|---|---|
+| `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3; needed with mentat |
+| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch). `ring` is refused: the engine has no ring fabric yet |
+| `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
+| `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
+| `GROUP` | `--group` | `gr8-glm53` | cluster | the mentat group the boxes join |
+| `HEAD` | `--head` | the lowest address | cluster | mentat mode: the head's LAN address |
+| `IPS`, `IPS2` | `--ips`, `--ips2` | discovered | cluster | each rank's rail-0 and rail-1 fabric address. Without them each box finds its own two RoCE v2 addresses |
+| `MODEL` | `--model` | none | box | a prepared pack directory with every rank's manifest. Without `MODEL_CACHE` the engine loads from it in place |
+| `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
+| `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |
+| `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `serve/`, `run/` |
+| `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread |
+| `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
+| `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
+| `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |
+| `JOIN_TIMEOUT` | `--join-timeout` | 600 | run | seconds for the mentat group to fill, for a worker to reach the head, and on the head from the first hello to the last (0 = forever) |
+| `CHECK` | `--no-check` | 1 | run | 0 = skip this box's checks (the model files are checked anyway) |
+| `G6_CLUSTER` | | none | | the config file when there is no `@FILE` |
+| `PACK_DIR` | | none | | `./gr8 glm53 stage` with no argument copies from here |
+| `BIN_DIR` | | `bin` | | what `./gr8 glm53 stage` copies the engine from |
+
+`PACKS`, `RANK_HEALTH` and `PROBE_ARGS` work with `--ssh` only. The symmetric launch takes the packs from `MODEL`, and it
+does not run the rank health probe yet: run `scripts/rank_health.sh` first if you want it.
 
 ## Build and stage
 

@@ -14,7 +14,7 @@ fabric, and an OpenAI-compatible front end runs on rank 0. What makes it fast:
 - exlr8 experts: the routed experts at 3.25 bpw, trellis-decoded inside the expert kernels, loaded straight from their
   width files.
 - Context-parallel KV past 32,768 tokens, so a 393K (TP=4) or 614K (TP=6) pool fits.
-- Prefix reuse across sessions (`REUSE=1`): a request that continues an earlier conversation re-prefills only the new
+- Prefix reuse across sessions (on by default at TP=4, `--reuse 0` turns it off): a request that continues an earlier conversation re-prefills only the new
   part, with the same output as a cold run.
 
 | | TP=4 (S2, DFlash2) | TP=6 (K1H2, one request at a time) |
@@ -31,8 +31,7 @@ fabric, and an OpenAI-compatible front end runs on rank 0. What makes it fast:
 2200 MHz. TP=6: one test window on one cluster; two arms with identical decode code differed by about 3% on prose, so
 read small differences as noise.
 
-TP=4 is the default: `./gr8 glm53 up` boots the multi-session engine (`scripts/launch_tp4.sh`, which runs
-`scripts/launch_s2.sh`). TP=6 serves one request at a time through `scripts/launch_tp6.sh`.
+TP=4 is the default and boots the multi-session engine. TP=6 serves one request at a time.
 [KNOBS.md](KNOBS.md) lists every launch knob and [docs/SETTINGS.md](docs/SETTINGS.md) every engine setting,
 [model.yaml](model.yaml) has the checkpoints and the memory footprint, [CHANGELOG.md](CHANGELOG.md) has what changed
 and the measurements behind it, and [KNOWN-ISSUES.md](KNOWN-ISSUES.md) has the open bugs.
@@ -41,42 +40,47 @@ it too.
 
 ## Quick start
 
-On the head (rank 0), with the boxes, the fabric and passwordless ssh from the head to the others
-([What you need](#what-you-need)):
+On every box, with the boxes, the fabric and the packs ready ([What you need](#what-you-need)):
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
-    cp config/cluster.env.tp4.example config/cluster.env    # then set HOSTS, IPS, IPS2, G6_HOME, MODEL_DIR
-    ./gr8 glm53 build                  # the engine for this TP and the Rust front end, into bin/
-    ./gr8 glm53 packs /data/tr3 /data/gptq/tp4 /data/packs /data/dflash2    # once, where the disk is (step 3)
-    ./gr8 glm53 stage /data/packs      # the binary and each box's packs onto every box, and the head's venv
-    ./gr8 glm53 up                     # checks every box, then boots
-    ./gr8 glm53 status                 # every rank, the front end, /health
+    ./gr8 glm53 build                  # the engine for this TP and the Rust front end, into bin/ (or copy bin/)
+    ./gr8 glm53 packs /data/tr3 /data/gptq/tp4 /data/packs /data/dflash2    # once, on one machine (step 3)
+    ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
+        --model /data/packs --model-cache /opt/g6/cache
+    ./gr8 glm53 status                 # every box, the front end, /health
     ./gr8 glm53 smoke                  # questions with answers that can be checked
 
-For six boxes, start from `config/cluster.env.example` and the GPTQ `tp6/` codes; `./gr8 glm53` takes the TP from the
-number of `HOSTS`. Every launcher knob still works (`SESS=4 ./gr8 glm53 up`, `REUSE=1 ./gr8 glm53 up`;
-[KNOBS.md](KNOBS.md)), and so do the scripts `./gr8 glm53` calls. `./gr8 glm53 down` stops it, `./gr8 glm53 restart`
-stops and boots again, and `./gr8 glm53 logs [rank]` shows a rank's engine log.
+Every box runs the same `up`. The first address in `--peers` is the head. The head runs the API. The boxes compare their
+options, model set and engine build before any engine starts, and all of them stop, naming the difference, if one box
+disagrees. The same options can sit in `cluster.env` on each box (`config/cluster.env.tp4.example`), so `./gr8 glm53
+up` alone is enough. Without `--peers`, the boxes find each other through the local mentat daemon (`--mentat
+localhost`, the default).
 
-TP=3 has a launcher (`scripts/launch_tp3.sh`, which `./gr8 glm53 up` runs for three `HOSTS`) and a `G6_NR=3` build, but
-no measurements yet, and `scripts/build_packs.sh` builds TP=4 and TP=6 packs only (`tools/convert/convert.py --nr 3` for
-the rest).
+For six boxes, use six peers and the GPTQ `tp6/` codes. Every launch knob is a flag, such as `--sess 4` or `--reuse 0`
+([KNOBS.md](KNOBS.md)). `./gr8 glm53 down` on any box stops every box, `./gr8 glm53 restart` stops and boots again, and
+`./gr8 glm53 logs [rank]` shows a rank's engine log from any box.
+
+TP=3 has a `G6_NR=3` build and engine settings, but no measurements yet, and `scripts/build_packs.sh` builds TP=4 and TP=6
+packs only (`tools/convert/convert.py --nr 3` for the rest).
 
 ## What you need
 
-- **Four or six DGX Spark or other GB10 boxes** (sm_121a, 128 GB unified memory). One rank per box, and nothing else
+- Four or six DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory). One rank per box, and nothing else
   holding GPU memory: a TP=4 rank holds about 90 GB of weights.
-- **A RoCE v2 fabric with two rails.** Each box's ConnectX-7 has two addresses (`IPS` and `IPS2` in the config), one
+- A RoCE v2 fabric with two rails. Each box's ConnectX-7 has two addresses (`IPS` and `IPS2` in the config), one
   per PCIe root. We used one 200G switch. The engine finds the RDMA device for each address itself.
-- **Passwordless ssh from the head (rank 0) to the other boxes.** The launcher, the shim and the front end run on the
-  head.
-- **Disk per box:** the box's rank pack (about 90 GB at TP=4, 62 GB at TP=6), the drafter pack at TP=4 (0.86 GB) or
+- A LAN between the boxes, with TCP port 7340 open on it and on both fabric rails (the supervisors' handshake and
+  control port).
+- Non-interactive ssh from the head (rank 0) to every other box's LAN address, with each address already in the head's
+  `known_hosts`. The shim writes each request into every rank's directory over ssh. That is the one ssh use left.
+- Python 3 on every box (the supervisor uses the standard library only), and the venv for the shim on the head.
+- Disk per box: the box's rank pack (about 90 GB at TP=4, 62 GB at TP=6), the drafter pack at TP=4 (0.86 GB) or
   the shared QO pack at TP=6 (13 GB), and the binary.
-- **Disk for the pack build** (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for
+- Disk for the pack build (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for
   the GPTQ codes and about 390 GB for the packs it writes.
-- **Toolchain:** CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev (the stock DGX OS,
+- Toolchain: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev (the stock DGX OS,
   Ubuntu 24.04), and cargo for the Rust pack loader and front end.
-- **The weights**, public on Hugging Face:
+- The weights, public on Hugging Face:
   [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw) (the routed
   experts, plus the tokenizer files the front end reads) and
   [adapt-ai-systems/glm-5.3-full-exl3-gptq-dense](https://huggingface.co/adapt-ai-systems/glm-5.3-full-exl3-gptq-dense)
@@ -87,6 +91,7 @@ the rest).
 | port | what | where |
 |---|---|---|
 | 8100 | the OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`) | head (`PORT`) |
+| 7340 | the supervisors: the handshake before boot, then status, logs and down | every box, LAN (`CONTROL_PORT`) |
 | 7341 | the multi-session control channel between the ranks | head (`S2PORT`) |
 | 18600-18659 | fabric bootstrap and the per-collective regions | head |
 
@@ -94,7 +99,8 @@ the rest).
 
 | path | what |
 |---|---|
-| `gr8` | the entry point (`./gr8 glm53 <command>`): `check`, `up`, `down`, `restart`, `status`, `logs`, `smoke`, `bench`, `build`, `stage`, `packs` |
+| `gr8` | the entry point (`./gr8 glm53 <command>`): `up`, `down`, `restart`, `status`, `logs`, `check`, `show-config`, `prepare`, `smoke`, `bench`, `build`, `stage`, `packs` |
+| `tools/launch/` | the per-box supervisor behind `up`: options, the model set and its cache, the handshake, mentat |
 | `config/` | `cluster.env` examples for TP=4 and TP=6 |
 | `engine/runtime/` | `g6m4.cu` (one rank on the fabric), `m4sim.cu` (one GPU simulating all the ranks), the rank step, prefill, the serve loops, `build_m4.sh` |
 | `engine/runtime/s2/` | the multi-session scheduler, pool, dispatch and control channel |
@@ -106,7 +112,7 @@ the rest).
 | `tools/tune/` | fetching the exlr8 v2 expert files |
 | `frontend/` | the HTTP front end (`g6front-rs`, Rust, and `g6front`, Python) and the shims that drive the ranks (`g6s2shim.py`, `g6shim.py`) |
 | `PROTOCOL.md` | the front end to engine socket protocol |
-| `scripts/` | build, pack build, stage, launch, stop, tests; `./gr8 glm53` calls them |
+| `scripts/` | build, pack build, stage, tests, `engine_args.sh` (the engine command line), and the deprecated ssh launchers |
 | `smoketest/` | `run.sh <base> [served-name]`, or `./gr8 glm53 smoke` |
 | `bench/` | benchmarks and the quality gate |
 | `docs/` | settings, the QO pair design, the model-specific parts |
@@ -117,23 +123,32 @@ the rest).
 
 ## 1. Describe the cluster
 
-    cp config/cluster.env.tp4.example config/cluster.env     # or cluster.env.example for TP=6
-    $EDITOR config/cluster.env
+Either on the command line of every box, or in a file on every box:
 
-It names the boxes (`HOSTS`, rank order), their fabric addresses (`IPS`, `IPS2`), the working directory on every box
-(`G6_HOME`, the same path everywhere), the tokenizer directory on the head (`MODEL_DIR`) and the API port (`PORT`).
-The number of `HOSTS` is the TP size. Every script reads it; `G6_CLUSTER=<file>` points them at another one. A knob
-set here ([KNOBS.md](KNOBS.md)) applies to every boot, and wins over the same variable on the command line.
+    cp config/cluster.env.tp4.example cluster.env     # or cluster.env.example for TP=6
+    $EDITOR cluster.env
+
+It names the boxes (`PEERS`, LAN addresses in rank order with the head first, or `MENTAT=localhost` and `TP`), the model
+(`MODEL`, a pack directory, and `MODEL_CACHE`, this box's local disk), the working directory (`G6_HOME`, by default the
+checkout) and the API port (`PORT`). `./gr8 glm53` reads `@FILE` from the command line, else `$G6_CLUSTER`, else
+`./cluster.env`, else `config/cluster.env`. `./gr8 glm53` parses the file and does not source it. The command line wins over the file, the
+file over the environment, the environment over the defaults. `./gr8 glm53 show-config` prints the result and where each
+value came from. An old file still works: `HOSTS` is read as `PEERS` (then every box must resolve its entries: use
+addresses or DNS names, and no ssh aliases), and `IPS`/`IPS2` pin the fabric addresses.
+
+Each box finds its own fabric addresses: the two IPv4 addresses with a RoCE v2 GID on an active port, the lower one rail
+0. Set `IPS` and `IPS2` (every rank's addresses) to pin them.
 
 ## 2. Build the engine
 
-On the head (a few minutes, CPU only; the launchers run the front end from the head's `bin/`):
+On one box (a few minutes, CPU only), then copy `bin/` to the same place on the others, or build on each box. Every
+box must run the same `bin/g6m4`: the handshake compares its sha256.
 
     ./gr8 glm53 build
 
 It runs `G6_NR=4 scripts/build.sh bin/` at TP=4 (with the multi-session path), `scripts/build.sh bin/` at TP=6 and
 `G6_NR=3 scripts/build.sh bin/` at TP=3, then `scripts/build_front.sh bin/` (the Rust front end). On a box with no
-cluster file, name the TP: `TP=4 ./gr8 glm53 build`. The scripts still work on their own.
+cluster file or `--tp`, name the TP: `TP=4 ./gr8 glm53 build`. The scripts still work on their own.
 
 `BUNDLE_LIBS=1` also copies cuBLAS next to the binary, for boxes without the CUDA toolkit. The `-D` flags in
 `scripts/build.sh` pick kernel variants; each one won an A/B test on our cluster.
@@ -149,40 +164,84 @@ On the machine with the disk (CPU only, about 15-25 minutes):
 
 `./gr8 glm53 packs` runs `scripts/build_packs.sh` (the rank count follows the GPTQ dir: `tp4/` or `tp6/`) and, at TP=4
 with a drafter dir (a `config.json` and `model.safetensors`), the DFlash2 drafter packs, `dflash.r<r>.*` (`python3 -m
-tools.convert.dflash2 --src <drafter dir> --out /data/packs --nr 4`). Without them, boot with `DFLASH=0` for MTP only;
-`./gr8 glm53 check` says which.
+tools.convert.dflash2 --src <drafter dir> --out /data/packs --nr 4`), and copies the four tokenizer files into
+`/data/packs/tokenizer/`. Without the drafter packs, boot with `--dflash 0` for MTP only. `./gr8 glm53 check` says which.
+
+The pack directory is the model set. `--model` needs every rank's manifest, every rank's drafter manifest at TP=4
+(`dflash.r<r>.manifest.json`) and the tokenizer files in it, even though each box loads only its own rank. A per-box
+`packs/` from `./gr8 glm53 stage` holds one rank's files only, so it cannot serve as `--model`: point every box at the
+whole pack directory, on a shared mount or a copy. `set.json` describes it (every rank's manifest hash and pack size, the drafter and
+QO packs, the tokenizer files) and its sha256 is the set id the boxes compare. The boxes need not see it at the same
+path. Downloading from Hugging Face and preparing from a raw checkpoint inside `up` are not in this version.
 
 The exlr8 experts come from their own width files: fetch them with `tools/tune/fetch_ranks.py`, then boot with
-`V2=<dir> V2_SLICES=<dir> V2_WIDTHS=<manifest>` (`tools/tune/README.md`).
+`--v2 <dir> --v2-slices <dir> --v2-widths <manifest>` (`tools/tune/README.md`). The cache holds the base packs only.
+The width files stay where they are.
 
-## 4. Stage
+## 4. The model cache
 
-    ./gr8 glm53 stage /data/packs  # or PACK_DIR=/data/packs in the config, and ./gr8 glm53 stage
+`--model-cache DIR` is a directory on this box's own disk. At boot, once a box knows its rank, it copies only its own
+files from `--model` into it: its rank pack and manifest, its drafter pack at TP=4, the QO pack where `PF_OWN=3`, and the
+tokenizer files:
 
-This runs `scripts/stage.sh bin/ /data/packs`, which copies the binary and each box's packs (the drafter packs too,
-when `/data/packs` has them) onto that box, and creates the front end's venv on the head when it is missing
-(`python3 -m venv $G6_HOME/venv && $G6_HOME/venv/bin/pip install -r frontend/requirements.txt`).
+    DIR/sets/<set id>/set.json, tokenizer/, rank<r>/{rank<r>.*, dflash.r<r>.*, qo.*, COMPLETE}
+
+A copy goes through `DIR/tmp/` and a rename, and `COMPLETE` is written last, so an interrupted copy is never used. Every
+boot checks `COMPLETE`, each file's size and the manifests' sha256 against `set.json`. The engine checks every tensor's
+sha256 at load unless `NOHASH=1`. A later boot with `--model-cache DIR` alone (no `--model`) uses the one set the cache
+holds for this TP. Copying a 90 GB rank pack from a shared mount can take an hour. Run `./gr8 glm53 prepare --model ... --model-cache ...`
+on each box before the first `up`, so the boot finds the cache filled. Without `--model-cache`, the engine loads from `--model` in place.
+
+`./gr8 glm53 stage` (ssh, from the head) still copies `bin/` and each box's packs into `$G6_HOME`, for the `--ssh`
+launchers, and creates the front end's venv on the head when it is missing (`python3 -m venv $G6_HOME/venv &&
+$G6_HOME/venv/bin/pip install -r frontend/requirements.txt`).
 
 ## 5. Start it
 
-From the head (an `ssh -A` session works if the head has no key of its own for the others):
+On every box:
 
-    ./gr8 glm53 up
+    ./gr8 glm53 up [OPTIONS]
     ./gr8 glm53 down
 
-`./gr8 glm53 up` runs `./gr8 glm53 check` first: one ssh call per box, and it stops on what a boot cannot survive (a box
-it cannot reach, a missing binary or pack, tokenizer files missing from `MODEL_DIR`, no front end or no venv on the
-head, no `/dev/infiniband`, an engine still running, a TP that does not match `HOSTS`). `./gr8 glm53 check` runs it
-alone, and `./gr8 glm53 --no-check up` skips it. Then it runs the launcher for the TP: `scripts/launch_tp4.sh` (the
-multi-session engine, `scripts/launch_s2.sh`), `scripts/launch_tp6.sh` or `scripts/launch_tp3.sh`. Those, and
-`scripts/stop.sh` for `./gr8 glm53 down`, still work on their own.
+`up` starts this box's supervisor in the background (`$G6_HOME/out/supervisor.log`) and follows it until the cluster
+serves. The supervisor:
 
-The first boot checks the sha256 of every pack tensor; later boots can skip that with `NOHASH=1`. Useful knobs, all
-environment variables of the launcher: `SESS` (concurrent sessions, default 8), `REUSE=1` (prefix reuse), `DFLASH=0`
-(MTP only), `CAP` (the KV pool). [KNOBS.md](KNOBS.md) has the rest.
+1. reads the options and the model set, and finds the boxes. A model set offers the ranks whose files it holds: one
+   rank for a box that holds one rank's packs, any rank for a whole pack directory or a cache with `--model`. With
+   `--peers`, this box's rank is the index of its own address, and a box listed at a rank it does not hold fails its
+   checks, with the position it belongs at. With `--mentat`, each box registers in the mentat group `gr8-glm53` and
+   publishes its offer. Once the group has `--tp` live members on two reads 5 s apart, the boxes that offer particular
+   ranks take them, and the rest take the free ranks in address order (`--head` pins rank 0). When no assignment fits,
+   every box stops and prints each box's offer.
+2. runs this box's checks (the binary, `/dev/infiniband`, an engine still running, the front end and the venv on the
+   head) and copies its shard into the cache.
+3. handshakes with the head on port 7340. Each box sends its options, model set id, engine build and failed checks, then
+   asks for the verdict about once a second. The head compares each hello with its own, checks that it reaches every box
+   on both rails, and answers with the boot epoch and every rank's fabric addresses. On any difference every box prints
+   the field and each box's value, and exits 4. A worker waits for a slow head as long as the head answers. The head
+   refuses the boot when a worker stops asking for 30 s, and it answers only the members' addresses.
+4. starts its own `g6m4` with the command line from `scripts/engine_args.sh`. The head also starts the front end, waits
+   for the engines, starts the shim, and in mentat mode announces the API to mentat (agent `gr8-glm53@gr8-api@<head>`).
+   The engine gets its own variables plus `PATH`, `HOME`, `USER`, `LANG`, `LD_LIBRARY_PATH`, `CUDA_*` and `NVIDIA_*`
+   from the environment. A `G6_*` variable in the environment stops the boot: pass it with `--g6env-x` so every box
+   compares it.
+5. stays: `status`, `logs` and `down` reach every box through the supervisors. When a rank's engine exits, its
+   supervisor tells the head, and the head stops every box.
 
-Logs are in `$G6_HOME/out/` on each box (`g6m4.r<r>.err`), plus `shim.log` and `front.log` on the head:
-`./gr8 glm53 logs [rank|shim|front|all] [-f]`.
+`--shape ring` is refused: the engine has no ring fabric yet. In mentat mode the supervisor also publishes its state in
+mentat (`gr8.state`, `gr8.rank`, `gr8.set`, `gr8.opts`), so `mentatd status` shows it.
+
+The first boot checks the sha256 of every pack tensor. Later boots can skip that with `--nohash 1`. Useful knobs:
+`--sess` (concurrent sessions, default 8), `--reuse 0` (prefix reuse off, it is on by default), `--dflash 0` (MTP only), `--cap` (the KV pool).
+[KNOBS.md](KNOBS.md) has the rest.
+
+Logs are in `$G6_HOME/out/` on each box (`supervisor.log`, `g6m4.r<r>.err`), plus `shim.log` and `front.log` on the
+head: `./gr8 glm53 logs [rank|shim|front|supervisor|all] [-f]`, from any box.
+
+The ssh launchers still work for one release: `./gr8 glm53 --ssh up` runs the old checks and `scripts/launch_tp4.sh`
+(which runs `scripts/launch_s2.sh`), `launch_tp6.sh` or `launch_tp3.sh` from the head, and `--ssh down`, `--ssh status`
+and `--ssh logs` work as before. The ssh launchers read `HOSTS`, `IPS`, `IPS2` and `MODEL_DIR`, and the config file wins over the
+environment there. They build the engine command line from the same `scripts/engine_args.sh`.
 
 ## 6. Check it
 
@@ -190,8 +249,8 @@ Logs are in `$G6_HOME/out/` on each box (`g6m4.r<r>.err`), plus `shim.log` and `
     ./gr8 glm53 smoke
     ./gr8 glm53 bench --tag mine
 
-`status` shows every rank (engine running, ready, MemAvailable, the last log line of a stopped rank), the shim, the
-front end and `/health`. `smoke` runs `smoketest/run.sh` against the head's API: cases with answers that can be
+`status` asks every box's supervisor (its state, engine, MemAvailable, the last log line of a stopped engine), and shows
+the head's shim, front end and `/health`. `smoke` runs `smoketest/run.sh` against the head's API: cases with answers that can be
 checked (a fact, arithmetic with thinking on and off, streaming, a tool call, logprobs, the context limit), because a
 wrong pack can load cleanly and serve fluent nonsense. Its exit status is the number of failures. `bench` runs
 `bench/pbench.py`, which reports 8K and 32K cold prefill and prose decode, and appends one JSON line to
@@ -215,16 +274,21 @@ Every engine setting is an environment variable or a launcher flag, each explain
 
 ## Troubleshooting
 
-- **Decode slows past the replicated window.** Past `G6_CP_R` tokens the KV is split across ranks and every step
+- Decode slows past the replicated window. Past `G6_CP_R` tokens the KV is split across ranks and every step
   gathers from all of them.
-- **A request past 32,768 tokens waits for an empty pool.** It runs alone at the start of the pool, so it waits for
+- A request past 32,768 tokens waits for an empty pool. It runs alone at the start of the pool, so it waits for
   every resident session to finish, and nothing else is admitted while it runs.
-- **A request with `prompt_logprobs` holds the others.** Its whole prompt runs as decode steps (about 13 ms per prompt
+- A request with `prompt_logprobs` holds the others. Its whole prompt runs as decode steps (about 13 ms per prompt
   token at TP=4) before anyone else's next step; the shim caps such prompts at 1,024 tokens.
-- **If a rank dies, the whole engine stops.** `./gr8 glm53 status` names it and shows its last log line; `./gr8 glm53
+- If a rank dies, the whole engine stops. `./gr8 glm53 status` names it and shows its last log line; `./gr8 glm53
   restart` boots again.
-- **Requests reach the other ranks as files over ssh** (one persistent connection per box), which adds a little TTFT.
-- **Boot takes a few minutes with hashing on.** It is mostly pack read speed: about 1.8 GB/s per box for us.
+- The boot stops with "handshake refused". Every box prints the field that differs and each box's value: an
+  option, the model set id (the packs, drafter or tokenizer differ), the engine build (`bin/g6m4` differs), a box whose
+  checks failed, or a box that does not answer on a fabric rail.
+- A box waits for the others. With mentat it says "waiting for 4 members in group gr8-glm53, have 3" every minute:
+  check that every box's mentat daemon sees the others (`mentatd status`). With peers the workers wait for the head.
+- Requests reach the other ranks as files over ssh (one persistent connection per box), which adds a little TTFT.
+- Boot takes a few minutes with hashing on. It is mostly pack read speed: about 1.8 GB/s per box for us.
 - `top_k` and `min_p` are ignored with a warning; `logprobs` and `prompt_logprobs` work up to k = 20.
   `frontend/README.md` has the full list.
 - Code comments refer to internal design notes and test-window names that are not in this repository.
@@ -234,7 +298,8 @@ Every engine setting is an environment variable or a launcher flag, each explain
 | item | status |
 |---|---|
 | TP=4 launch | `launch_tp4.sh` / `launch_s2.sh` / `stop.sh` run against the real engine on four Sparks. |
-| `./gr8 glm53` | `check`, `status`, `logs`, `smoke`, `build`, `stage` and `packs` exercised against stub ssh, rsync and a fake API on one machine, and `up` / `down` against stub ranks. **Not yet run on the Sparks.** It calls the launchers above unchanged. |
+| `./gr8 glm53` (symmetric) | Four supervisors on one Linux machine (127.0.0.1-4, with stub engines that play the S2 file protocol, the real shim, a stub ssh and a stub front end): boot, a request through the shim to every rank's directory, `status`, `logs`, `down` from a worker, an option mismatch, a missing shard, a rank that dies, and mentat mode against fake daemons. The agent link was also run against a real mentatd. **Not yet run on the Sparks.** |
+| `./gr8 glm53 --ssh` | `check`, `status`, `logs`, `smoke`, `build`, `stage` and `packs` exercised against stub ssh, rsync and a fake API on one machine. The launchers' engine command lines are unchanged by the move into `scripts/engine_args.sh` (compared word for word under a stub ssh, for each TP and a range of knobs). |
 | TP=6 launch | `launch_tp6.sh` / `stop.sh` / `stage.sh` run end to end with a fake engine (`frontend/tests/fake_serve_engine.py`) standing in for six ranks on one host. **Not yet run against the real engine on six Sparks**; our own TP=6 boots used an older harness with the same env and args. |
 | `build_packs.sh` | The GPTQ input dirs on Hugging Face match the layer-000 hashes our converter expects. The full conversion was **not** re-run from these scripts, and we did not record which revision of the TR3 repo we downloaded. Run `checkpack.py` (the script does). |
 | exactness | Multi-session output equals each request run alone, byte for byte (logprobs included); DFlash2 under `--s2` equals the one-request loop's; a prefix-reuse hit equals a cold run. A full KL / GSM8K / HumanEval gate is not reported here. |

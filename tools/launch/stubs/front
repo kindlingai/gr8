@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Stub front end for the supervisor tests: /health is 200 once the engine socket accepts a connection, else 503."""
+import argparse
+import http.server
+import socket
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--model-dir')
+ap.add_argument('--engine-sock')
+ap.add_argument('--port', type=int)
+a = ap.parse_args()
+
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = False
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(a.engine_sock)
+                ok = True
+        except OSError:
+            pass
+        self.send_response(200 if ok and self.path == '/health' else 503)
+        self.end_headers()
+
+    def log_message(self, *_):
+        pass
+
+
+http.server.HTTPServer(('127.0.0.1', a.port), H).serve_forever()

@@ -42,16 +42,19 @@ visible. A PR builds both topologies.
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |
 | the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
 | the rank health probe | anywhere | `python3 -m unittest discover tools/health` |
+| the launch: options, model sets, handshake, mentat | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
+| the launch end to end (four supervisors, stub engines) | Linux (it needs 127.0.0.2-4) | the line above runs it, and skips it elsewhere |
 
 A kernel or anything else that changes numerics gets an exactness or tolerance test against the path it replaces, and
 the PR says which and why a tolerance is safe.
 
 ## Launch
 
-`./gr8 glm53` is how the cluster starts, from the head. `./gr8 glm53 up` runs `./gr8 glm53 check` and then the launcher
-for the TP; `./gr8 glm53 status`, `./gr8 glm53 logs`, `./gr8 glm53 smoke` and `./gr8 glm53 down` cover the rest (README,
-steps 5 and 6). The scripts it calls in `scripts/` still work on their own, and every knob in [KNOBS.md](KNOBS.md)
-passes through.
+`./gr8 glm53 up` is how the cluster starts: the same command on every box, which starts that box's supervisor
+(`tools/launch/`). The supervisors find each other (`--peers`, or the mentat group), compare their options, model set
+and engine build, and each starts its own rank; `status`, `logs` and `down` work from any box (README, steps 5 and 6).
+The engine command line lives in `scripts/engine_args.sh`. The supervisor and the deprecated ssh launchers
+(`./gr8 glm53 --ssh up`) both build it from there, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
 
 S2 is the served path. At TP=4, `scripts/launch_tp4.sh` runs `scripts/launch_s2.sh` (`g6m4 --s2`, up to `SESS`
 requests at once, DFlash2 for a request that runs alone). A change to decode, prefill or the scheduler is measured
@@ -63,8 +66,9 @@ Book the nodes on #13 before you boot, and do not boot during someone else's boo
 
 A change to the packs, the loader or the converter needs a boot with the pack hash check on (no `NOHASH=1`).
 
-A change to `./gr8 glm53` or a launcher keeps every existing script path and knob working, and keeps `./gr8 glm53 check`
-to FAIL rows for things a boot cannot survive.
+A change to `./gr8 glm53`, the supervisor or a launcher keeps every knob working, and keeps the checks to failures a
+boot cannot survive. A new knob that reaches the engine goes in `scripts/engine_args.sh` and `tools/launch/options.py`
+(scope `cluster`), so the handshake compares it.
 
 ## The gate
 
@@ -81,8 +85,8 @@ The light gates from GRAFT-PLAN.md, on the target topology:
         --kl-ref bench/gate/refs/tp4.json --health $G6_HOME/out/rank_health.json
     python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp4.json
 
-`--health` wants the rank health probe's result for this boot. `launch_tp6.sh` writes it; at TP=4 run
-`scripts/rank_health.sh` before `./gr8 glm53 up` (the probe refuses a box with a model booted).
+`--health` wants the rank health probe's result for this boot. `./gr8 glm53 --ssh up` at TP=6 writes it. Otherwise
+run `scripts/rank_health.sh` before `./gr8 glm53 up` (the probe refuses a box with a model booted).
 
 `./gr8 glm53 bench --tag <name>` runs pbench alone. Numbers for the README come from RigMark 1.0.0 at `reasoning_effort`
 low, GPU clocks capped at 2200 MHz.

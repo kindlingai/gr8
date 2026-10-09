@@ -3,3 +3,9 @@ __pycache__/
 /bin/
 /config/cluster.env
 bench/results.jsonl
+/cluster.env
+# ./gr8 glm53 up with G6_HOME left at the checkout
+/out/
+/run/
+/s2/
+/serve/

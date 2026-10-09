@@ -1,30 +1,41 @@
 #!/bin/bash
-# The one entry point: ./gr8 <model> <command>; the only model is glm53. Run it on the head (rank 0), from the repo
-# root or anywhere: it calls the scripts in scripts/, which read config/cluster.env (G6_CLUSTER=<file> for another).
+# The one entry point: ./gr8 <model> <command>; the only model is glm53. Run the same command on every box, from the
+# repo checkout on that box. Each box's supervisor (tools/launch) finds the others, checks that every box has the same
+# options, model set and engine, and starts its own rank. The head (rank 0) also runs the front end and the shim.
 #
-#   ./gr8 glm53 check                 what would stop a boot, per box, with the fix
-#   ./gr8 glm53 up                    check, then boot (TP=4: scripts/launch_tp4.sh, the S2 engine; TP=6:
-#                                     launch_tp6.sh; TP=3: launch_tp3.sh)
-#   ./gr8 glm53 down                  scripts/stop.sh
-#   ./gr8 glm53 restart               down, then up
-#   ./gr8 glm53 status                every rank: engine running, ready, MemAvailable; the shim, the front end, /health
-#   ./gr8 glm53 logs [r|shim|front|all] [-f]   a rank's engine log (default rank 0), the shim's or the front end's
+#   ./gr8 glm53 up [OPTIONS] [@FILE]  start this box's supervisor and follow it until the cluster serves
+#        --tp 4|6|3 --peers A,B,C,D   the boxes' LAN addresses, the same list on every box, head first
+#        --mentat localhost           or: find the other boxes through the local mentat daemon (the default)
+#        --model DIR                  a prepared pack directory (every rank's manifests)
+#        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
+#        --cap 262144, --sess 4, ...  every knob in KNOBS.md, as --<knob> VALUE
+#   ./gr8 glm53 down                  stop every box of the last boot
+#   ./gr8 glm53 restart [OPTIONS]     down, then up
+#   ./gr8 glm53 status                every box's state, engine and MemAvailable, and the head's shim, front end, /health
+#   ./gr8 glm53 logs [r|shim|front|supervisor] [-f]   a log from any box (default this box's engine)
+#   ./gr8 glm53 check [OPTIONS]       what would stop this box's boot
+#   ./gr8 glm53 show-config [OPTIONS] the effective options, the cluster options the boxes compare, the model set id
+#   ./gr8 glm53 prepare [RANK] [OPTIONS]   copy this box's shard into --model-cache without booting
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh for this TP (G6_NR=4 at TP=4) and scripts/build_front.sh
 #   ./gr8 glm53 stage [PACK_DIR]      scripts/stage.sh bin/ PACK_DIR, and the head's front end venv if it is missing
-#   ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]   scripts/build_packs.sh, and at TP=4 the drafter packs
+#   ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]   scripts/build_packs.sh, at TP=4 the drafter packs, and
+#                                     the tokenizer files in OUT_DIR/tokenizer
 #
-# TP is the number of HOSTS in the config. TP= in the config, optional, must agree with it.
-# Every knob of the launchers (CAP, SESS, REUSE, DFLASH, MTP, NOHASH, PF_OWN, G6ENV_X, ...) works as before: set it in
-# the environment (CAP=262144 ./gr8 glm53 up) or in the config file, which wins because every script sources it. KNOBS.md
-# lists them.
+# Options come from the command line, then one config file (@FILE, else ./cluster.env, else config/cluster.env, which
+# ./gr8 parses and does not source), then the environment, then the defaults. An old config file works: HOSTS is read as PEERS. KNOBS.md
+# lists every option.
+#
+# --ssh (deprecated): check, up, down, restart, status and logs from the head over ssh, through scripts/launch_*.sh and
+# scripts/stop.sh, as before. There the config file wins over the environment, because every script sources it.
 # --no-check (or CHECK=0) boots without the checks.
 set -eu
 REPO=$(cd "$(dirname "$0")" && pwd)
 SCRIPTS=$REPO/scripts
 check=1
 [ "${CHECK:-1}" = 0 ] && check=0
+ssh=0
 
 usage() { sed -n '2,/^set -eu$/{/^set -eu$/d;s/^# \{0,1\}//;p;}' "$0"; }
 
@@ -32,6 +43,7 @@ options() {
   while [ $# -gt 0 ]; do
     case $1 in
       --no-check) check=0; shift ;;
+      --ssh) ssh=1; shift ;;
       -h|--help|help) usage; exit 0 ;;
       *) break ;;
     esac
@@ -47,6 +59,24 @@ esac
 options "$@"; set -- ${rest[@]+"${rest[@]}"}
 [ $# -gt 0 ] || { usage; exit 0; }
 cmd=$1; shift
+args=()
+for a in "$@"; do
+  case $a in
+    --ssh) ssh=1 ;;
+    --no-check) check=0 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+case $cmd in
+  up|down|restart|status|logs|check|show-config|prepare)
+    if [ $ssh = 0 ]; then
+      [ $check = 0 ] && set -- "$@" --no-check
+      exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@"
+    fi
+    echo "gr8: --ssh is deprecated; the ssh launchers stay for one release. Without --ssh, ./gr8 glm53 $cmd runs on" >&2
+    echo "     every box instead (README, step 5)." >&2 ;;
+esac
 
 # config: the cluster file, through common.sh, so every value means what it means to the launchers.
 config() {
@@ -239,17 +269,19 @@ case $cmd in
   status) config; do_status ;;
   logs) config; do_logs "$@" ;;
   smoke)
-    config
+    if [ -f "${G6_CLUSTER:-$REPO/config/cluster.env}" ]; then config; fi
+    PORT=${PORT:-8100}
     url=${1:-$(api)}; [ $# -gt 0 ] && shift
     exec bash "$REPO/smoketest/run.sh" "$url" "$@" ;;
   bench)
-    config
+    if [ -f "${G6_CLUSTER:-$REPO/config/cluster.env}" ]; then config; fi
+    PORT=${PORT:-8100}
     exec python3 "$REPO/bench/pbench.py" --url "$(api)" "$@" ;;
   build)
-    # The TP comes from the config when there is one (the build box may have none: TP=4 ./gr8 glm53 build).
+    # The TP comes from the options when they name one (--tp, TP=, or the peer count); the build box may have none.
     if [ -z "${TP:-}" ]; then
-      [ -f "${G6_CLUSTER:-$REPO/config/cluster.env}" ] || { echo "build: no config; say which build: TP=4 ./gr8 glm53 build (or 6, 3)" >&2; exit 2; }
-      config
+      TP=$(python3 "$REPO/tools/launch/launch.py" get TP 2> /dev/null) || TP=""
+      [ -n "$TP" ] || { echo "build: say which build: TP=4 ./gr8 glm53 build (or 6, 3)" >&2; exit 2; }
     fi
     out=${1:-$REPO/bin}
     case $TP in
@@ -272,6 +304,9 @@ case $cmd in
   packs)
     [ $# -ge 3 ] || { echo "usage: ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]" >&2; exit 2; }
     "$SCRIPTS/build_packs.sh" "$1" "$2" "$3"
+    # The tokenizer files go next to the packs, so the pack directory holds a whole model set (tools/launch/modelset.py).
+    mkdir -p "$3/tokenizer"
+    for f in tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do cp "$1/$f" "$3/tokenizer/"; done
     if [ -n "${4:-}" ]; then
       if [ -d "$2/r4" ]; then echo "DRAFTER_DIR: the DFlash2 drafter runs at TP=4 only; not built for these TP=6 packs"
       else (cd "$REPO" && python3 -m tools.convert.dflash2 --src "$4" --out "$3" --nr 4); fi

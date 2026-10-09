@@ -48,6 +48,8 @@
 //                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
 //                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
 //                     Needs --mtp or --dflash-manifest. With --s2: the DFlash2 sessions' policy (needs --dflash-manifest).
+//      [--set-id HEX]  the model set id from ./gr8 glm53 up (tools/launch/modelset.py). With --s2 it joins the bootstrap
+//                     agreement, so ranks loaded from different model sets refuse to start. Otherwise unused.
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
@@ -109,6 +111,7 @@ int main(int argc, char** argv)
     std::string serve;
     int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
     std::string s2dir;                  // --s2 DIR: S2 below R served (DEC_S2)
+    std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
     int s2port = 0, s2sess = 8;
     unsigned long long s2epoch = 1;
     for (int i = 1; i < argc; ++i)
@@ -166,6 +169,12 @@ int main(int argc, char** argv)
         else if (a == "--s2-port") s2port = atoi(next().c_str());
         else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
         else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
+        else if (a == "--set-id")
+        {
+            set_id = next();
+            if (set_id.empty() || set_id.size() > 64 || set_id.find_first_not_of("0123456789abcdef") != std::string::npos)
+                die("--set-id must be 1..64 lowercase hex digits");
+        }
         else die("unknown argument " + a);
     }
     if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || manifest.empty() || packfile.empty())
@@ -822,7 +831,8 @@ int main(int argc, char** argv)
             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
-                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0);
+                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
+                (set_id.empty() ? "" : " set " + set_id);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);

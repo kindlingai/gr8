@@ -11,14 +11,16 @@
 #   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end; S2 has no Python front end path here)
 #   S2PORT=7341       the S2 control port on the head
 #   SPEC_ACCEPT=rejection  drafts are greedy and accepted by rejection sampling at temperature > 0
-#   REUSE=1           --reuse-prefix: a retired session's caches stay in the pool, and a request that continues its
-#                     prompt + output re-prefills only the rest (exact: whole 4,096-row prefill cells, s2/pool.h)
+#   REUSE=1           --reuse-prefix, the default (REUSE=0 turns it off): a retired session's caches stay in the pool,
+#                     and a request that continues its prompt + output re-prefills only the rest (exact: whole 4,096-row
+#                     prefill cells, s2/pool.h)
 set -eu
 . "$(dirname "$0")/common.sh"
 [ "$NRANK" = 4 ] || { echo "launch_s2.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
-CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-1800}; PACKS=${PACKS:-packs}; MTP=${MTP:-2}; SESS=${SESS:-8}
-S2PORT=${S2PORT:-7341}; EPOCH=$(date +%s)
-DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}
+TP=4
+. "$(dirname "$0")/engine_args.sh"
+engine_defaults
+EPOCH=$(date +%s)
 if [ "$DFLASH" = 1 ]; then
   for ((r = 0; r < NRANK; r++)); do
     on $r "test -e $G6_HOME/packs/dflash.r$r.manifest.json -a -e $G6_HOME/packs/dflash.r$r.pack" || {
@@ -26,27 +28,12 @@ if [ "$DFLASH" = 1 ]; then
       exit 2; }
   done
 fi
-# keep in step with launch_tp4.sh
-PF_OWN=${PF_OWN:-4}
-ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
-G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
-G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
-if [ "$PF_OWN" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G6_PF_QP_CTX=${QP_CTX:-$CAP} G6_PF_QP_EARLY=${QP_EARLY:-1}"; fi
-ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 --mtp $MTP \
---s2 $G6_HOME/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $EPOCH"
-[ "${NOHASH:-0}" = 1 ] && ARGS="$ARGS --no-hash"
-[ "${REUSE:-0}" = 1 ] && ARGS="$ARGS --reuse-prefix"
-[ "$SPEC_ADAPT" = 1 ] && ARGS="$ARGS --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
-[ -n "${SPEC_ACCEPT:-}" ] && ARGS="$ARGS --spec-accept $SPEC_ACCEPT"
-SRCARGS=""
-[ -n "${V2:-}" ] && SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
+engine_env   # scripts/engine_args.sh has the engine environment and arguments, shared with ./gr8 glm53 up
 for ((r = NRANK - 1; r >= 0; r--)); do
-  DFARGS=""
-  [ "$DFLASH" = 1 ] && DFARGS="--dflash-manifest packs/dflash.r$r.manifest.json --dflash-pack packs/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
+  ARGS=$(engine_args $r "$PACKS" packs "$G6_HOME" "$EPOCH")
   on $r "cd $G6_HOME && rm -rf s2 serve && mkdir -p s2 out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
-      --proxy-cpu $PROXY_CPU --manifest $PACKS/rank$r.manifest.json --pack $PACKS/rank$r.pack --image --layers all $SRCARGS \
-      $ARGS $DFARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
+      --proxy-cpu $PROXY_CPU $ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait
 PY=${PY:-$G6_HOME/venv/bin/python}
