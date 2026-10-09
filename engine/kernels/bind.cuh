@@ -684,6 +684,9 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     static const bool policy = !getenv("G6_K1_FUSE_POLICY") || atoi(getenv("G6_K1_FUSE_POLICY"));   // 0: A/B runs only
     const int rows = split_m ? split_m : M;
     if (policy && fuse == 1 && moe && (T.k2 || T.sh_trellis) && (rows == 2 || (rows >= 3 && T.k2 && T.k2_pct >= 50))) fuse = 0;
+    // 16+ rows in the step (S2 batches; split_m keeps rows at the session's class): separate launches, 2-3.5% faster at
+    // 24-32 rows (row_budget_test --time-v2, GB10 2200 MHz: M=24 1551 vs 1577 us, M=32 1752 vs 1812 us)
+    if (policy && fuse == 1 && moe && T.sh_trellis && M >= 16) fuse = 0;
     if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently (RESULTS-M1 item 1f).

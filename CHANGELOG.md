@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-09: separate K1 launches at 16+ rows (#8)
+
+- `row_budget_test --time-v2`: K1 on an exlr8 v2 layer per row count, with the bytes read and GB/s (fresh routing and
+  six layer copies per run, so every byte comes from DRAM). On GB10 at 2200 MHz the fused launch reaches 220-225 GB/s
+  at 3-12 rows and falls to 203 at 24 and 193 at 32, where the separate fc1 / fc2 launches are 2-3.5% faster.
+- v2 layers now take the separate launches when the step has 16+ rows (S2 batches; the fused / separate choice keeps
+  every partial and its order). S2 at 8 sessions: 73.5 -> 76.5 tok/s (code); 4 sessions unchanged.
+
+
 ## 2026-10-09: short prompts skip OWN=4 (`G6_PF_QP_MIN`, default 768)
 
 - OWN=4 pays a fixed ~0.13-0.35 s per request (the pair weights rolled through every layer), so it lost on short prompts:

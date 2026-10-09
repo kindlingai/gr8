@@ -1,5 +1,5 @@
 // Row-budget unit test (gr8 #28): one GB10, no fabric, no pack files, synthetic weights.
-//   row_budget_test [--only gv|k1] [--time [reps]]
+//   row_budget_test [--only gv|k1] [--time [reps]] [--time-v2 [reps]]
 // Claim under test: for every M <= G6_MX, the dense GEMVs (bind::make_gv / launch) and the K1 expert stream (router plan with
 // slots of <= 8 tokens, make_k1 / launch_k1) give, for each row, the same bits as the same rows run in chunks of 8 (the M <= 8
 // path). Weights are synthetic (records of the pack formats, hash-filled), so the claim is bit equality against the 8-row path,
@@ -8,6 +8,7 @@
 // shared expert as tr3.table row 256 in one slot per 8 rows, block-scale hidden-side vectors).
 // Default build (G6_MX = 8): the M list stops at 8 and each case compares a run with itself (smoke + plan check).
 // --time: times launch_k1 over M = 6..24 and the K1 split tables (for tuning k1_split; prints one line per point).
+// --time-v2: launch_k1 on the exlr8 v2 layer per M, bytes read and GB/s (K1 against the memory floor).
 // Build: scripts/c1_tests.sh <bin_dir>      Exit code: 0 all PASS, 1 any FAIL, 2 CUDA error.
 #include <algorithm>
 #include <cstdarg>
@@ -737,6 +738,83 @@ static int time_mode(int reps)
     return 0;
 }
 
+// --time-v2 [reps]: launch_k1 on the exlr8 v2 layer (E4M3 experts at widths 3 / 4, the trellis shared expert, the wide fc
+// layout the engine binds), per M: mean distinct routed experts, the bytes of their units on this rank plus the shared
+// expert's, time per call and GB/s (bytes / time). Each call routes a new set of tokens (as each layer reads other experts
+// in the engine; the same experts back to back would be served partly from L2); the routing's own time is subtracted.
+static int time_v2(int reps)
+{
+    Arena A;
+    MoeV2 m;
+    build_moe_v2(A, m, false);
+    // layers with their own (wide) weights, used in turn, so no call finds the previous one's experts in L2
+    constexpr int NLAY = 6;
+    std::vector<bind::LayerTensors> Ts;
+    for (int l = 0; l < NLAY; ++l) Ts.push_back(make_T_v2(A, m, true));
+    const int nlay = NLAY;
+    Env E = make_env(A, false);
+    std::vector<long long> tab(257 * 6);
+    CK(cudaMemcpy(tab.data(), m.tab, tab.size() * sizeof(long long), cudaMemcpyDeviceToHost));
+    auto ebytes = [&](int e) { const long long* r = &tab[static_cast<size_t>(e) * 6]; return 3.0 * r[3] * KSH * 8 * 32 * r[4]; };
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    printf("K1 v2 time per launch_k1 (fc1 + fc2 + finalize), natural routing\n");
+    constexpr int NSET = 64;                     // token sets, each its own random logits
+    float* lg = A.alloc<float>(static_cast<size_t>(NSET) * G6_MX * 256);
+    fill_f32(lg, static_cast<size_t>(NSET) * G6_MX * 256, 0.5f, 77u);
+    for (int M : {1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32})
+    {
+        if (M > G6_MX) break;
+        double bytes = 0, nex = 0;
+        for (int j = 0; j < NSET; ++j)
+        {
+            glue::k_router_plan<<<1, 256>>>(lg + static_cast<size_t>(j) * G6_MX * 256, E.bias, M, E.dplan);
+            glue::RoutePlan P;
+            CK(cudaMemcpy(&P, E.dplan, sizeof P, cudaMemcpyDeviceToHost));
+            std::vector<int> ex(P.slot_expert, P.slot_expert + P.n_slots);
+            std::sort(ex.begin(), ex.end());
+            ex.erase(std::unique(ex.begin(), ex.end()), ex.end());
+            bytes += ebytes(256);
+            for (int e : ex) bytes += ebytes(e);
+            nex += ex.size();
+        }
+        bytes /= NSET; nex /= NSET;
+        auto plan = [&](int i) { glue::k_router_plan<<<1, 256>>>(lg + static_cast<size_t>(i % NSET) * G6_MX * 256, E.bias, M, E.dplan); };
+        CK(cudaEventRecord(e0, ST));
+        for (int i = 0; i < reps; ++i) plan(i);
+        CK(cudaEventRecord(e1, ST));
+        CK(cudaEventSynchronize(e1));
+        float pms = 0.f;
+        CK(cudaEventElapsedTime(&pms, e0, e1));
+        bind::Xfrag xf;
+        xf.on = 1; xf.src = E.x2; xf.ld = HID; xf.K = HID; xf.M = M; xf.f16 = E.sc.xf_x2;
+        bind::launch(xf, ST);
+        for (int fuse = 0; fuse < 2; ++fuse)
+        {
+            std::vector<bind::K1> ks(nlay);
+            bind::Tensor sh[3];
+            const char* err = nullptr;
+            for (int l = 0; l < nlay && !err; ++l) err = bind::make_k1(Ts[l], M, E.sc, E.x2, E.sc.xf_x2, bind::plan_ptrs(E.dplan), E.of, 1, ks[l], sh, fuse);
+            if (err) { printf("M=%d fuse=%d: %s\n", M, fuse, err); continue; }
+            const bind::K1& k = ks[0];
+            for (int i = 0; i < 3; ++i) { plan(i); bind::launch_k1(ks[i % nlay], ST); }
+            CK(cudaEventRecord(e0, ST));
+            for (int i = 0; i < reps; ++i) { plan(i); bind::launch_k1(ks[i % nlay], ST); }
+            CK(cudaEventRecord(e1, ST));
+            CK(cudaEventSynchronize(e1));
+            CK(cudaGetLastError());
+            float ms = 0.f;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            const double us = 1000.0 * (ms - pms) / reps;
+            printf("M=%2d experts=%5.1f MB=%6.2f fuse=%d us=%7.1f GB/s=%6.1f grid=%d\n", M, nex, bytes / 1e6, fuse, us, bytes / us / 1e3,
+                   fuse ? k.gf : 0);
+        }
+        fflush(stdout);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     CK(cudaSetDevice(0));
@@ -749,6 +827,7 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i)
     {
         if (!strcmp(argv[i], "--time")) return time_mode(i + 1 < argc ? std::max(1, atoi(argv[i + 1])) : 50);
+        if (!strcmp(argv[i], "--time-v2")) return time_v2(i + 1 < argc ? std::max(1, atoi(argv[i + 1])) : 50);
         if (!strcmp(argv[i], "--only") && i + 1 < argc)
         {
             do_gv = !strcmp(argv[i + 1], "gv");
