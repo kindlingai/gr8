@@ -1,6 +1,8 @@
-// Dense small-M GEMV for 8-bit and 16-bit weights, y[M][O] = x[M][K] @ W^T, M <= 8. Our own code.
+// Dense small-M GEMV for 8-bit and 16-bit weights, y[M][O] = x[M][K] @ W^T, M <= 8 (M <= G6_MX under DEC_S2: ceil(M/8)
+// n=8 tiles on the weights already loaded, every row bit-identical to the M <= 8 path). Our own code.
 // Same shape as K2 (rowtile.cuh): weights are the mma A operand, a tile = 16 output rows x 16 inputs,
-// activations are the B operand (global fragment table [K/16][32][2]), fp32 accumulate.
+// activations are the B operand (global fragment table [K/16][32][2], one table per n=8 row tile, tiles K*4 u32 apart),
+// fp32 accumulate.
 //   Mxfp8  E4M3FN codes, one E8M0 scale per (row, 32 inputs). Group = 2 tiles of 256 B + 16 scale bytes
 //          (8 pairs {s[i], s[i+8]}) = 528 B. Lane l (r = l/4, c = l%4) reads 2 u32 per tile:
 //          {row r k 2c,2c+1 | row r+8 k 2c,2c+1}, {row r k 2c+8,2c+9 | row r+8 k 2c+8,2c+9}.
@@ -52,9 +54,13 @@ struct Mxfp8
     static constexpr int G = 2, TW = 2, GR = 528, PFB = 2;
     static constexpr bool SCALED = true;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v2(tile + lane * 8, w); }
+    static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { a[0] = e4m3x2(w[0]); a[1] = e4m3x2(w[0] >> 16); a[2] = e4m3x2(w[1]); a[3] = e4m3x2(w[1] >> 16); }
+    static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { mma16816(g, a[0], a[1], a[2], a[3], b0, b1); }
     static __device__ __forceinline__ void mma(float (&g)[4], const u32* w, u32 b0, u32 b1)
     {
-        mma16816(g, e4m3x2(w[0]), e4m3x2(w[0] >> 16), e4m3x2(w[1]), e4m3x2(w[1] >> 16), b0, b1);
+        u32 a[4];
+        dec(w, a);
+        mma_a(g, a, b0, b1);
     }
     static __device__ __forceinline__ u32 ld_scale(const uint8_t* grp, int lane) { return ld_nc16(grp + 512 + (lane >> 2) * 2); }
     static __device__ __forceinline__ float e8m0(u32 code) { return __uint_as_float(code ? code << 23 : 0x00400000u); }   // 2^(code-127)
@@ -66,6 +72,8 @@ struct Bf16w
     static constexpr int G = 1, TW = 4, GR = 512, PFB = 4;
     static constexpr bool SCALED = false;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v4(tile + lane * 16, w); }
+    static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { a[0] = w[0]; a[1] = w[1]; a[2] = w[2]; a[3] = w[3]; }
+    static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { gv::mma_bf16(g, a[0], a[1], a[2], a[3], b0, b1); }
     static __device__ __forceinline__ void mma(float (&g)[4], const u32* w, u32 b0, u32 b1) { gv::mma_bf16(g, w[0], w[1], w[2], w[3], b0, b1); }
     static __device__ __forceinline__ u32 ld_scale(const uint8_t*, int) { return 0; }
     static __device__ __forceinline__ float2 scale(u32) { return make_float2(1.f, 1.f); }
@@ -78,9 +86,16 @@ struct Int4v
     static constexpr int G = 2, TW = 1, GR = 288, PFB = 2;
     static constexpr bool SCALED = true;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { w[0] = ld_nc(tile + lane * 4); }
+    static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4])
+    {
+        a[0] = Int4::dec(w[0] & 0xffu); a[1] = Int4::dec((w[0] >> 8) & 0xffu); a[2] = Int4::dec((w[0] >> 16) & 0xffu); a[3] = Int4::dec(w[0] >> 24);
+    }
+    static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { mma16816(g, a[0], a[1], a[2], a[3], b0, b1); }
     static __device__ __forceinline__ void mma(float (&g)[4], const u32* w, u32 b0, u32 b1)
     {
-        mma16816(g, Int4::dec(w[0] & 0xffu), Int4::dec((w[0] >> 8) & 0xffu), Int4::dec((w[0] >> 16) & 0xffu), Int4::dec(w[0] >> 24), b0, b1);
+        u32 a[4];
+        dec(w, a);
+        mma_a(g, a, b0, b1);
     }
     static __device__ __forceinline__ u32 ld_scale(const uint8_t* grp, int lane) { return Int4::ld_scale(grp, lane); }
     static __device__ __forceinline__ float2 scale(u32 raw) { return Int4::scale(raw); }
@@ -115,11 +130,50 @@ struct GvGroup
             for (int i = 0; i < C::G; ++i) C::mma(acc, c + i * C::TW, bf[(ks + i) * 64], bf[(ks + i) * 64 + 1]);
         }
     }
+    // NT n=8 tiles: tile t's fragment table is ts u32 after tile t - 1's. The weights are decoded once per k16 step; each
+    // tile then runs the stock mma / scale / accumulate sequence on its own columns (a column's result depends only on
+    // its own token), so a row's bits do not depend on NT.
+    template <int NT>
+    __device__ __forceinline__ void run(const u32* bf, int ks, float (&acc)[NT][4], int ts) const
+    {
+        if (C::SCALED)
+        {
+            float g[NT][4];
+            #pragma unroll
+            for (int t = 0; t < NT; ++t) g[t][0] = g[t][1] = g[t][2] = g[t][3] = 0.f;
+            #pragma unroll
+            for (int i = 0; i < C::G; ++i)
+            {
+                u32 a[4];
+                C::dec(c + i * C::TW, a);
+                #pragma unroll
+                for (int t = 0; t < NT; ++t) C::mma_a(g[t], a, bf[t * ts + (ks + i) * 64], bf[t * ts + (ks + i) * 64 + 1]);
+            }
+            const float2 sc = C::scale(s);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                acc[t][0] = fmaf(sc.x, g[t][0], acc[t][0]); acc[t][1] = fmaf(sc.x, g[t][1], acc[t][1]);
+                acc[t][2] = fmaf(sc.y, g[t][2], acc[t][2]); acc[t][3] = fmaf(sc.y, g[t][3], acc[t][3]);
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int i = 0; i < C::G; ++i)
+            {
+                u32 a[4];
+                C::dec(c + i * C::TW, a);
+                #pragma unroll
+                for (int t = 0; t < NT; ++t) C::mma_a(acc[t], a, bf[t * ts + (ks + i) * 64], bf[t * ts + (ks + i) * 64 + 1]);
+            }
+        }
+    }
 };
 
 // one warp: groups g0..g1-1 of one output tile, C::PFB groups read ahead
-template <class C>
-__device__ __forceinline__ void gv_tile_part(const uint8_t* tile, const u32* bf, int g0, int g1, float (&acc)[4])
+template <class C, int NT = 1>
+__device__ __forceinline__ void gv_tile_part(const uint8_t* tile, const u32* bf, int ts, int g0, int g1, float (&acc)[NT][4])
 {
     constexpr int PFB = C::PFB;
     const int lane = threadIdx.x & 31;
@@ -138,7 +192,7 @@ __device__ __forceinline__ void gv_tile_part(const uint8_t* tile, const u32* bf,
             if (q + PFB + p < Q) nx[p].load(tile + static_cast<size_t>(g0 + q + PFB + p) * C::GR, lane);
         #pragma unroll
         for (int p = 0; p < PFB; ++p)
-            if (q + p < Q) cur[p].run(bf, (g0 + q + p) * C::G, acc);
+            if (q + p < Q) cur[p].template run<NT>(bf, (g0 + q + p) * C::G, acc, ts);
     }
 }
 
@@ -149,7 +203,8 @@ __device__ __forceinline__ void gv_tile_part(const uint8_t* tile, const u32* bf,
 //   [64 B:  r = 0..7: {g2j scale word r, g2j+1 scale word r}]
 // An odd last group of a range keeps the 288-B layout. One v4 weight load + one v2 scale load per lane per pair instead
 // of 2 x (2 x 4 B + 4 B); the mma / scale / accumulate sequence is the stock one (same operands, same order) -> same bits.
-__device__ __forceinline__ void gv_i4pair_part(const uint8_t* tile, const u32* bf, int g0, int g1, float (&acc)[4])
+template <int NT = 1>
+__device__ __forceinline__ void gv_i4pair_part(const uint8_t* tile, const u32* bf, int ts, int g0, int g1, float (&acc)[NT][4])
 {
     const int lane = threadIdx.x & 31;
     const int NP = (g1 - g0) / 2;
@@ -183,16 +238,28 @@ __device__ __forceinline__ void gv_i4pair_part(const uint8_t* tile, const u32* b
                 for (int h = 0; h < 2; ++h)   // = GvGroup<Int4v>::run of group g0 + 2 (q + p) + h
                 {
                     const int ks = (g0 + 2 * (q + p) + h) * Int4v::G;
-                    float g[4] = {0.f, 0.f, 0.f, 0.f};
+                    float g[NT][4];
                     #pragma unroll
-                    for (int i = 0; i < Int4v::G; ++i) Int4v::mma(g, &cw[p][2 * h + i], bf[(ks + i) * 64], bf[(ks + i) * 64 + 1]);
+                    for (int t = 0; t < NT; ++t) g[t][0] = g[t][1] = g[t][2] = g[t][3] = 0.f;
+                    #pragma unroll
+                    for (int i = 0; i < Int4v::G; ++i)
+                    {
+                        u32 a[4];
+                        Int4v::dec(&cw[p][2 * h + i], a);
+                        #pragma unroll
+                        for (int t = 0; t < NT; ++t) Int4v::mma_a(g[t], a, bf[t * ts + (ks + i) * 64], bf[t * ts + (ks + i) * 64 + 1]);
+                    }
                     const float2 sc = Int4v::scale(cs[p][h]);
-                    acc[0] = fmaf(sc.x, g[0], acc[0]); acc[1] = fmaf(sc.x, g[1], acc[1]);
-                    acc[2] = fmaf(sc.y, g[2], acc[2]); acc[3] = fmaf(sc.y, g[3], acc[3]);
+                    #pragma unroll
+                    for (int t = 0; t < NT; ++t)
+                    {
+                        acc[t][0] = fmaf(sc.x, g[t][0], acc[t][0]); acc[t][1] = fmaf(sc.x, g[t][1], acc[t][1]);
+                        acc[t][2] = fmaf(sc.y, g[t][2], acc[t][2]); acc[t][3] = fmaf(sc.y, g[t][3], acc[t][3]);
+                    }
                 }
             }
     }
-    if ((g1 - g0) & 1) gv_tile_part<Int4v>(tile, bf, g1 - 1, g1, acc);
+    if ((g1 - g0) & 1) gv_tile_part<Int4v, NT>(tile, bf, ts, g1 - 1, g1, acc);
 }
 
 // in-place repack of an Int4 record tensor [OT][NG2][288] for k-part count ks (must equal the launch's ks).
@@ -219,11 +286,46 @@ inline void launch_i4pair(void* w, int OT, int NG2, int ks, cudaStream_t st)
 }
 #endif
 
+// The k-part reduction of one tile's accumulators: part 0 of each output tile sums its warps' partials through smem in
+// fixed order. Tile after tile through the same 16 KB (a barrier in between), so the shared memory does not grow with NT.
+template <int NT>
+__device__ __forceinline__ void gv_reduce(float4 (&red)[32][32], float (&acc)[NT][4], bool on, int part, int warp, int lane, int ks)
+{
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        if (on) red[warp][lane] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);
+        __syncthreads();
+        if (on && part == 0)
+            for (int q = 1; q < ks; ++q)
+            {
+                const float4 v = red[warp + q][lane];
+                acc[t][0] += v.x; acc[t][1] += v.y; acc[t][2] += v.z; acc[t][3] += v.w;
+            }
+        if (t + 1 < NT) __syncthreads();
+    }
+}
+
+// one warp's k range of one output tile -> acc (NT row tiles; DEC_I4PAIR: the pair-record path for int4 records)
+template <class C, int NT>
+__device__ __forceinline__ void gv_warp_part(const uint8_t* stream, const u32* xfrag, int K, int ot, int NG2, int NGP, int part, float (&acc)[NT][4])
+{
+    const int lane = threadIdx.x & 31;
+    const int ts = K * 4;   // u32 between two row tiles' fragment tables: K/16 steps x 32 lanes x 2
+#if DEC_I4PAIR
+    if constexpr (C::GR == Int4v::GR)
+        gv_i4pair_part<NT>(stream + static_cast<size_t>(ot) * NG2 * C::GR, xfrag + lane * 2, ts, part * NGP, (part + 1) * NGP, acc);
+    else
+#endif
+    gv_tile_part<C, NT>(stream + static_cast<size_t>(ot) * NG2 * C::GR, xfrag + lane * 2, ts, part * NGP, (part + 1) * NGP, acc);
+}
+
 // stream: [out-tile][NG2 = K / (16 G)][GR].  CTA = tiles_per_cta output tiles x ks k-parts, one warp each
 // (warp = tile * ks + part); parts are summed through smem in fixed order.  y[tok][ystride] of dtype odt.
-template <class C>
-__global__ void gv_gemv(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
-                        int M, void* y, int ystride, int odt)
+// NT = ceil(M / 8) row tiles (xfrag holds NT tables, tile t = rows 8t..8t+7); NT = 1 is the M <= 8 kernel.
+template <class C, int NT>
+__device__ __forceinline__ void gv_gemv_body(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                                             int M, void* y, int ystride, int odt)
 {
     __shared__ float4 red[32][32];   // [warp][lane]
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -231,48 +333,51 @@ __global__ void gv_gemv(const uint8_t* stream, const u32* xfrag, int K, int out_
     const int ot = blockIdx.x * tiles_per_cta + tl;
     const int NG2 = K / (16 * C::G), NGP = NG2 / ks;
     const bool on = tl < tiles_per_cta && ot < out_tiles;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-#if DEC_I4PAIR
-    if constexpr (C::GR == Int4v::GR)
-    {
-        if (on) gv_i4pair_part(stream + static_cast<size_t>(ot) * NG2 * C::GR, xfrag + lane * 2, part * NGP, (part + 1) * NGP, acc);
-    }
-    else
-#endif
-    if (on) gv_tile_part<C>(stream + static_cast<size_t>(ot) * NG2 * C::GR, xfrag + lane * 2, part * NGP, (part + 1) * NGP, acc);
-    if (ks > 1)
-    {
-        if (on) red[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
-        __syncthreads();
-        if (on && part == 0)
-            for (int q = 1; q < ks; ++q)
-            {
-                const float4 v = red[warp + q][lane];
-                acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
-            }
-    }
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    if (on) gv_warp_part<C, NT>(stream, xfrag, K, ot, NG2, NGP, part, acc);
+    if (ks > 1) gv_reduce<NT>(red, acc, on, part, warp, lane, ks);
     if (!on || part) return;
-    // C regs: (row r, tok 2c), (row r, tok 2c+1), (row r+8, tok 2c), (row r+8, tok 2c+1)
+    // C regs: (row r, tok 2c), (row r, tok 2c+1), (row r+8, tok 2c), (row r+8, tok 2c+1); tile t: tokens 8t + ...
     const int r = lane >> 2, c = lane & 3;
     const size_t o = static_cast<size_t>(ot) * 16 + r;
-    if (2 * c < M)
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
     {
-        gv::put(y, static_cast<size_t>(2 * c) * ystride + o, acc[0], odt);
-        gv::put(y, static_cast<size_t>(2 * c) * ystride + o + 8, acc[2], odt);
+        const int m0 = 8 * t + 2 * c;
+        if (m0 < M)
+        {
+            gv::put(y, static_cast<size_t>(m0) * ystride + o, acc[t][0], odt);
+            gv::put(y, static_cast<size_t>(m0) * ystride + o + 8, acc[t][2], odt);
+        }
+        if (m0 + 1 < M)
+        {
+            gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o, acc[t][1], odt);
+            gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o + 8, acc[t][3], odt);
+        }
     }
-    if (2 * c + 1 < M)
-    {
-        gv::put(y, static_cast<size_t>(2 * c + 1) * ystride + o, acc[1], odt);
-        gv::put(y, static_cast<size_t>(2 * c + 1) * ystride + o + 8, acc[3], odt);
-    }
+}
+template <class C, int NT = 1>
+__global__ void gv_gemv(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                        int M, void* y, int ystride, int odt)
+{
+    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
+}
+// NT > 1: capped at 64 registers so a 1024-thread CTA (tpc x ks warps) launches; NT = 1 keeps the uncapped kernel above
+template <class C, int NT>
+__global__ void __launch_bounds__(1024) gv_gemv_lb(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
+                                                    int ks, int M, void* y, int ystride, int odt)
+{
+    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
 }
 
 #ifdef DEC_SLOT
 // gv_gemv with the BF16 output in this rank's send slot of collective s.c (row stride ystride), published by the
 // last CTA when DEC_SLOT >= 2 (decslot.cuh). Same arithmetic and store order as gv_gemv with odt = O_BF16.
-template <class C>
-__global__ void gv_gemv_slot(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
-                             int M, int ystride, dslot::Slot s)
+template <class C, int NT>
+__device__ __forceinline__ void gv_gemv_slot_body(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
+                                                  int ks, int M, int ystride, dslot::Slot s)
 {
     __shared__ float4 red[32][32];   // [warp][lane]
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -280,46 +385,48 @@ __global__ void gv_gemv_slot(const uint8_t* stream, const u32* xfrag, int K, int
     const int ot = blockIdx.x * tiles_per_cta + tl;
     const int NG2 = K / (16 * C::G), NGP = NG2 / ks;
     const bool on = tl < tiles_per_cta && ot < out_tiles;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-#if DEC_I4PAIR
-    if constexpr (C::GR == Int4v::GR)
-    {
-        if (on) gv_i4pair_part(stream + static_cast<size_t>(ot) * NG2 * C::GR, xfrag + lane * 2, part * NGP, (part + 1) * NGP, acc);
-    }
-    else
-#endif
-    if (on) gv_tile_part<C>(stream + static_cast<size_t>(ot) * NG2 * C::GR, xfrag + lane * 2, part * NGP, (part + 1) * NGP, acc);
-    if (ks > 1)
-    {
-        if (on) red[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
-        __syncthreads();
-        if (on && part == 0)
-            for (int q = 1; q < ks; ++q)
-            {
-                const float4 v = red[warp + q][lane];
-                acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
-            }
-    }
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    if (on) gv_warp_part<C, NT>(stream, xfrag, K, ot, NG2, NGP, part, acc);
+    if (ks > 1) gv_reduce<NT>(red, acc, on, part, warp, lane, ks);
     const bool st = on && !part;
     if (st)
     {
         void* y = dslot::ptr(s);
         const int r = lane >> 2, c = lane & 3;
         const size_t o = static_cast<size_t>(ot) * 16 + r;
-        if (2 * c < M)
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
         {
-            gv::put(y, static_cast<size_t>(2 * c) * ystride + o, acc[0], gv::O_BF16);
-            gv::put(y, static_cast<size_t>(2 * c) * ystride + o + 8, acc[2], gv::O_BF16);
-        }
-        if (2 * c + 1 < M)
-        {
-            gv::put(y, static_cast<size_t>(2 * c + 1) * ystride + o, acc[1], gv::O_BF16);
-            gv::put(y, static_cast<size_t>(2 * c + 1) * ystride + o + 8, acc[3], gv::O_BF16);
+            const int m0 = 8 * t + 2 * c;
+            if (m0 < M)
+            {
+                gv::put(y, static_cast<size_t>(m0) * ystride + o, acc[t][0], gv::O_BF16);
+                gv::put(y, static_cast<size_t>(m0) * ystride + o + 8, acc[t][2], gv::O_BF16);
+            }
+            if (m0 + 1 < M)
+            {
+                gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o, acc[t][1], gv::O_BF16);
+                gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o + 8, acc[t][3], gv::O_BF16);
+            }
         }
     }
 #if DEC_SLOT >= 2
     dslot::publish(s, st);
 #endif
+}
+template <class C, int NT = 1>
+__global__ void gv_gemv_slot(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                             int M, int ystride, dslot::Slot s)
+{
+    gv_gemv_slot_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s);
+}
+template <class C, int NT>
+__global__ void __launch_bounds__(1024) gv_gemv_slot_lb(const uint8_t* stream, const u32* xfrag, int K, int out_tiles,
+                                                         int tiles_per_cta, int ks, int M, int ystride, dslot::Slot s)
+{
+    gv_gemv_slot_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s);
 }
 #endif
 

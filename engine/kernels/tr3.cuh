@@ -111,7 +111,7 @@ __device__ __forceinline__ uint2 tr3_hid4(const __half* vec, const __half* sg, c
     return r;
 }
 
-// mask = the slot's tokens (A.slot_mask, or A.sh_mask for the trellis shared expert)
+// mask = the slot's columns (A.slot_mask, or the rows of a trellis shared-expert tile, k1.cuh k1_slot)
 template <int BITS, bool E4 = false, bool BS = false>
 __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit, const long long* tr, const uint8_t* mw, int mask, u32* smem)
 {
@@ -144,22 +144,26 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 
     // prologue: xa = f16(H128(x * suh)) for the unit's k range, as token fragments [ks][lane][2].
     // Tasks = (active token, 128 block), spread over all warps, two per iteration so the cold suh loads overlap.
-    // Rows of inactive tokens stay unwritten: an mma output column depends only on its own token column.
+    // Rows of inactive columns stay unwritten: an mma output column depends only on its own token column. A slot holds at
+    // most 8 tokens in columns 0..7 (the router splits an expert with more tokens into several slots); slot_tok = the token of
+    // a column (M <= 8: column c = token c). The trellis shared expert's scratch slots n_slots + t (SH, one per 8 rows) are
+    // not in the route plan: column c of tile t is token 8 t + c.
     {
         const __half* suh = A.t_v1 + (row * 2 + mat) * HID;
         const int nact = __popc(mask & 0xff), ntask = nact * (KSU / 8);
         for (int task = warp; task < ntask; task += 2 * nwarps)
         {
             uint2 xr[2], sr[2];
-            int m[2], blk[2];
+            int m[2], blk[2], tok[2];
             #pragma unroll
             for (int u = 0; u < 2; ++u)
             {
                 const int tk = min(task + u * nwarps, ntask - 1);
-                m[u] = __fns(mask, 0, tk % nact + 1);
+                m[u] = __fns(mask, 0, tk % nact + 1);      // column
+                tok[u] = slot < A.n_slots ? A.slot_tok[(plan * SMAX + slot) * 8 + m[u]] : (slot - A.n_slots) * 8 + m[u];
                 blk[u] = tk / nact;
                 const int k = ks0 * 16 + blk[u] * 128 + lane * 4;
-                xr[u] = *reinterpret_cast<const uint2*>(A.x + m[u] * HID + k);
+                xr[u] = *reinterpret_cast<const uint2*>(A.x + tok[u] * HID + k);
                 if (BS) sr[u] = tr3_hid4<true>(nullptr, A.t_sg, A.t_v1b, row * 2 + mat, k);
                 else sr[u] = *reinterpret_cast<const uint2*>(suh + k);
             }
@@ -432,7 +436,8 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
 // ---------------------------------------------------------------------------------------------
 // Finalize: out[m] = f16 or bf16( sum_k w[m][k] * sum_b svh_d[e][b] * H128(z[slot][b][m]) + shared[m] ),
 // fixed k, b order. One CTA = (token, one 128-col block), 4 warps x 2 routes each, summed through smem.
-// SH (exlr8 v2 trellis shared expert, #65): shared[m] is the trellis expert of scratch slot n_slots with weight 1. A fifth
+// SH (exlr8 v2 trellis shared expert, #65): shared[m] is the trellis expert of scratch slot n_slots + m / 8 (column m % 8;
+// one slot per 8 rows, so one slot at M <= 8) with weight 1. A fifth
 // warp sums it (the CTA has 160 threads), and the s_* records' fp16 ypart row is not read.
 template <bool SH = false>
 __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
@@ -454,9 +459,10 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
         #pragma unroll
         for (int u = 0; u < 2; ++u)
         {
-            const int slot = A.tok_slot[(plan * 8 + m) * 8 + k + u];
+            const int slot = A.tok_slot[(plan * G6_MX + m) * 8 + k + u];
             on[u] = slot >= 0;
-            w[u] = A.tok_w[(plan * 8 + m) * 8 + k + u];
+            w[u] = A.tok_w[(plan * G6_MX + m) * 8 + k + u];
+            const int col = on[u] ? A.tok_col[(plan * G6_MX + m) * 8 + k + u] : 0;      // the token's column in its slot
             const int sl = on[u] ? slot : 0;
             const long long* tr = A.t_tab + 6 * A.slot_expert[plan * SMAX + sl];
             nb[u] = on[u] ? static_cast<int>(tr[3]) : 0;
@@ -465,7 +471,7 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
             for (int b = 0; b < g6nr::EB; ++b)
                 if (b < nb[u])
                 {
-                    zr[u][b] = *reinterpret_cast<const uint2*>(A.z + ((static_cast<size_t>(sl) * A.B + b) * 8 + m) * HID + n0);
+                    zr[u][b] = *reinterpret_cast<const uint2*>(A.z + ((static_cast<size_t>(sl) * A.B + b) * 8 + col) * HID + n0);
                     sr[u][b] = BSF ? tr3_hid4<true>(nullptr, A.t_sg + HID, A.t_v3b, row + b, n0)
                                    : *reinterpret_cast<const uint2*>(A.t_v3 + (row + b) * HID + n0);
                 }
@@ -494,7 +500,7 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
         for (int b = 0; b < g6nr::EB; ++b)
             if (b < nb)
             {
-                zr[b] = *reinterpret_cast<const uint2*>(A.z + ((static_cast<size_t>(A.n_slots) * A.B + b) * 8 + m) * HID + n0);
+                zr[b] = *reinterpret_cast<const uint2*>(A.z + ((static_cast<size_t>(A.n_slots + (m >> 3)) * A.B + b) * 8 + (m & 7)) * HID + n0);
                 sr[b] = BSF ? tr3_hid4<true>(nullptr, A.t_sg + HID, A.t_v3b, row + b, n0)
                             : *reinterpret_cast<const uint2*>(A.t_v3 + (row + b) * HID + n0);
             }
@@ -520,7 +526,7 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
         const float4 v = red[q][lane];
         acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
     }
-    const uint2 yr = SH ? make_uint2(0u, 0u) : *reinterpret_cast<const uint2*>(A.ypart + (static_cast<size_t>(SMAX) * 8 + m) * HID + n0);
+    const uint2 yr = SH ? make_uint2(0u, 0u) : *reinterpret_cast<const uint2*>(A.ypart + (static_cast<size_t>(A.ysh) + m) * HID + n0);
     const float2 y01 = __half22float2(as_h2(yr.x)), y23 = __half22float2(as_h2(yr.y));
     uint2 o;
     o.x = pack_o2(acc[0] + y01.x, acc[1] + y01.y, A.out_bf16);

@@ -20,11 +20,9 @@ struct Config {
     uint32_t pool_rows = 614400, max_rows = 24, max_sessions = 8, mtp = 2;
     uint32_t guard_tokens = UINT32_MAX, prefill_rows = 4096;
     bool two_lanes = true;
-    // group_rows (S2-STATE.md): max_rows bounds ONE step; a round runs ceil(sessions / (max_rows / (mtp + 1))) groups
-    // (s2_batch.h Batch::round), so the session limit is max_sessions alone
-    bool group_rows = false;
+    // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
-    unsigned limit() const { return group_rows ? (max_rows >= mtp + 1 ? max_sessions : 0) : std::min(max_sessions, max_rows / (mtp + 1)); }
+    unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
     void validate() const {
         require(epoch && pool_rows >= PAGE && pool_rows % PAGE == 0, "bad epoch/pool");
         require(mtp > 0 && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");

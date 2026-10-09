@@ -2,6 +2,7 @@
 #include "attn.h"
 #include "replay.h"
 #include "../g6nr.h"
+#include "../g6mx.h"
 #include "../h2d.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -23,10 +24,18 @@ using half=__half; using bf16=__nv_bfloat16;
 // The old C ABI remains unchanged. Static launches fold this resolver away;
 // replay launches retain capacity strides but read live bounds from device RAM.
 struct ReplayInput { G6Attn fixed; const G6AttnStepCell* cell; };
+#ifdef DEC_S2
+struct DeviceAttn : G6Attn { int live_context; bool active; int ibase; };
+#else
 struct DeviceAttn : G6Attn { int live_context; bool active; };
+#endif
 __device__ __forceinline__ DeviceAttn resolve(G6Attn fixed) {
     DeviceAttn a; static_cast<G6Attn&>(a)=fixed;
-    a.live_context=fixed.context; a.active=true; return a;
+    a.live_context=fixed.context; a.active=true;
+#ifdef DEC_S2
+    a.ibase=0;
+#endif
+    return a;
 }
 __device__ __forceinline__ DeviceAttn resolve(ReplayInput input) {
     DeviceAttn a=resolve(input.fixed);
@@ -38,6 +47,25 @@ __device__ __forceinline__ DeviceAttn resolve(ReplayInput input) {
     a.table_size=input.cell->table_size; a.reuse_rows=input.cell->reuse_rows;
     a.active=input.cell->valid!=0; return a;
 }
+#ifdef DEC_S2
+// Batched step (cell->rows): the row's own session table / bounds. Every KV access of a row (append, indexer keys, scores,
+// context) calls this once r is known, so one launch serves rows of different sessions. CP: page_count is the rank's
+// physical page count (fixed), ibase offsets the session's run in the logical-page addressed index cache.
+__device__ __forceinline__ void for_row(DeviceAttn&,const G6Attn&,int){}
+__device__ __forceinline__ void for_row(DeviceAttn& a,const ReplayInput& in,int r){
+    const G6AttnRow* rows=in.cell->rows;if(!rows)return;
+    const G6AttnRow x=rows[r];
+    a.block_table=x.table;a.live_context=x.context;a.table_size=x.table_size;a.ibase=x.ibase;
+#if defined(G6_CP) && G6_CP
+    if(!a.cp_nr)a.page_count=x.page_count;
+#else
+    a.page_count=x.page_count;
+#endif
+}
+#define FOR_ROW(a,in,r) ga::for_row(a,in,r)
+#else
+#define FOR_ROW(a,in,r)
+#endif
 __global__ void validate_replay(G6Attn fixed,G6AttnStepCell* cell) {
     const int t=threadIdx.x;
     if(t==0)*fixed.error=0;
@@ -56,15 +84,34 @@ __global__ void validate_replay(G6Attn fixed,G6AttnStepCell* cell) {
     if(!bounds){if(t==0)*fixed.error=32;}
     else for(int row=t;row<fixed.rows;row+=blockDim.x){
         const int pos=fixed.positions[row];
-        if(pos<0||pos>=cell->context)atomicOr(fixed.error,1u);
-        else{
-            const int pg=fixed.block_table[pos/fixed.page_size];
+        int ctx=cell->context,pages=cell->page_count,sess=0;const int* table=fixed.block_table;
+#ifdef DEC_S2
+        if(cell->rows){   // batched step: this row's session (bounds as the cell's, per row; positions distinct within a session)
+            const G6AttnRow x=cell->rows[row];
+            const bool ok=x.table&&x.context>0&&x.context<=fixed.context&&
 #if defined(G6_CP) && G6_CP
-            if(!(fixed.cp_nr&&pg==G6_CP_REMOTE)&&(pg<0||pg>=(fixed.cp_nr?fixed.page_count:cell->page_count)))atomicOr(fixed.error,2u);   // CP: physical bound
+                (fixed.cp_nr||(x.page_count>0&&x.page_count<=fixed.page_count))&&
 #else
-            if(pg<0||pg>=cell->page_count)atomicOr(fixed.error,2u);
+                x.page_count>0&&x.page_count<=fixed.page_count&&
+#endif
+                x.table_size>0&&x.table_size<=fixed.table_size&&((int64_t)x.context+fixed.page_size-1)/fixed.page_size<=x.table_size;
+            if(!ok){atomicOr(fixed.error,32u);continue;}
+            ctx=x.context;pages=x.page_count;sess=x.sess;table=x.table;
+        }
+#endif
+        if(pos<0||pos>=ctx)atomicOr(fixed.error,1u);
+        else{
+            const int pg=table[pos/fixed.page_size];
+#if defined(G6_CP) && G6_CP
+            if(!(fixed.cp_nr&&pg==G6_CP_REMOTE)&&(pg<0||pg>=(fixed.cp_nr?fixed.page_count:pages)))atomicOr(fixed.error,2u);   // CP: physical bound
+#else
+            if(pg<0||pg>=pages)atomicOr(fixed.error,2u);
 #endif
         }
+#ifdef DEC_S2
+        if(cell->rows){for(int j=0;j<row;j++)if(pos==fixed.positions[j]&&cell->rows[j].sess==sess)atomicOr(fixed.error,1u);}
+        else
+#endif
         for(int j=0;j<row;j++)if(pos==fixed.positions[j])atomicOr(fixed.error,1u);
         if(fixed.reuse_indices&&fixed.reuse_row_map){
             const int src=fixed.reuse_row_map[row];
@@ -116,7 +163,11 @@ __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
 // CP: index keys are REPLICATED (BUILD-CPE step 3b): the index cache is logical-page addressed (table_size pages) on every
 // rank; below R the replicated path's identity prefix of the block table gives the same address
 __device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){
+#ifdef DEC_S2
+    if(a.cp_nr){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}return a.ibase+pos/a.page_size;}
+#else
     if(a.cp_nr){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}return pos/a.page_size;}
+#endif
     return page(a,pos);
 }
 #else
@@ -132,7 +183,7 @@ __device__ float latent(const uint8_t* v,int d){return e4(v[d])*((const float*)(
 template<class Input>
 __global__ void append_kv(Input input){
     auto a=resolve(input);if(!a.active)return;
-    int row=blockIdx.x,t=threadIdx.x,pos=a.positions[row];CP_REMOTE_ROW(a,pos)int pg=page(a,pos);if(pg<0)return;
+    int row=blockIdx.x,t=threadIdx.x,pos=a.positions[row];FOR_ROW(a,input,row);CP_REMOTE_ROW(a,pos)int pg=page(a,pos);if(pg<0)return;
     __shared__ float v[512],sums[8],sc[4];
     float ss=0;
     for(int d=t;d<512;d+=256){float x=hfloat(a.kv_a,(int64_t)row*576+d);v[d]=x;ss=fmaf(x,x,ss);}
@@ -150,7 +201,7 @@ __global__ void append_kv(Input input){
 template<class Input>
 __global__ void append_index(Input input){
     auto a=resolve(input);if(!a.active)return;
-    int r=blockIdx.x,t=threadIdx.x,pos=a.positions[r];int pg=ipage(a,pos);if(pg<0)return;   // CP: every rank appends every key
+    int r=blockIdx.x,t=threadIdx.x,pos=a.positions[r];FOR_ROW(a,input,r);int pg=ipage(a,pos);if(pg<0)return;   // CP: every rank appends every key
     __shared__ float v[128],sum[4],scale;
     float x=hfloat(a.index_k,(int64_t)r*128+t),s=warp_sum(x);if((t&31)==0)sum[t/32]=s;__syncthreads();
     float mean=(sum[0]+sum[1]+sum[2]+sum[3])/128;
@@ -179,7 +230,7 @@ template<class Input>
 __global__ void index_scores(Input input,int start,const half* q,const float* weights,float* scores,int* ids){
     auto a=resolve(input);if(!a.active)return;
     using namespace nvcuda;
-    int row=blockIdx.y,r=start+row,t0=blockIdx.x*32,t=threadIdx.x,warp=t/32;
+    int row=blockIdx.y,r=start+row,t0=blockIdx.x*32,t=threadIdx.x,warp=t/32;FOR_ROW(a,input,r);
     __shared__ __align__(32) half key[32*128];
     __shared__ __align__(32) float products[32*32];
     __shared__ float scales[32];
@@ -225,7 +276,7 @@ __global__ void absorb(Input input,int start,float* q,float* rope){
 template<class Input>
 __global__ void mla_scores(Input input,int start,const float* q,const float* rope,float* score){
     auto a=resolve(input);if(!a.active)return;
-    int row=blockIdx.z,r=start+row,h=blockIdx.y,j=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;
+    int row=blockIdx.z,r=start+row,h=blockIdx.y,j=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;FOR_ROW(a,input,r);
     __shared__ float qr[512],rp[64];for(int d=t;d<512;d+=256)qr[d]=q[((int64_t)row*a.heads+h)*512+d];if(t<64)rp[t]=rope[((int64_t)row*a.heads+h)*64+t];__syncthreads();
     int id=a.indices[(int64_t)r*TOP+j];const uint8_t* v=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?kv_at(a,id):nullptr;float sum=0;
     if(v){for(int d=lane;d<512;d+=32)sum=fmaf(qr[d],latent(v,d),sum);for(int d=lane;d<64;d+=32)sum=fmaf(rp[d],__bfloat162float(((const bf16*)(v+528))[d]),sum);}
@@ -244,7 +295,7 @@ __global__ void normalize(Input input,float* scores){
 template<class Input>
 __global__ void context_parts(Input input,int start,const float* probs,float* parts){
     auto a=resolve(input);if(!a.active)return;
-    int row=blockIdx.z,r=start+row,h=blockIdx.y,part=blockIdx.x,t=threadIdx.x;float lo=0,hi=0;
+    int row=blockIdx.z,r=start+row,h=blockIdx.y,part=blockIdx.x,t=threadIdx.x;float lo=0,hi=0;FOR_ROW(a,input,r);
     const float* p=probs+((int64_t)row*a.heads+h)*TOP;
     // One lookup per selected position/CTA instead of per output thread/position.
     // Keep the original 8 partials and each partial's 256-FMA order unchanged.
@@ -281,7 +332,11 @@ __global__ void value_project(Input input,int start,const float* context){
 // each warp loads its whole lane-strided weight row (k = lane + 32m) into registers once, then per row runs the same
 // fmaf chain over the same k order, the same warp_sum, and lane 0 stores, so every q / rope / output byte matches the
 // per-row kernels. The inputs of the rows (q_b, context) are staged in shared memory as bit copies.
+#ifdef DEC_S2
+constexpr int AVP_ROWS=8;   // S2 batched steps: up to G6_MX rows in chunks of 8 (smem 16 KB value_project); per-row bytes as with 3
+#else
 constexpr int AVP_ROWS=3;
+#endif
 template<class Input>
 __global__ void absorb_m(Input input,int start,int n,float* q,float* rope){
     auto a=resolve(input);if(!a.active)return;
@@ -384,15 +439,23 @@ static cudaError_t select_index(const G6Attn& a,Work& w,int start,int count,cuda
 #ifndef SEL32
 #error "DEC_IDX31 needs SEL32 (index_scores_m writes no ids; only the full sort reads them)"
 #endif
-// #31: decode-sized query tiles (<= IDX31_ROWS rows) score with shared keys and select with the live-context bound
+// #31: decode-sized query tiles (<= IDX31_ROWS rows) score with shared keys and select with the live-context bound.
+// Both assume one sequence: one key table and one live context for every row. An S2 batched step (rows of several
+// sessions, each with its own table and bounds, FOR_ROW) takes the per-row kernels instead.
 constexpr int IDX31_ROWS=8;
+static bool idx31_ok(const G6Attn& a,int n){
+#ifdef DEC_S2
+    if(a.s2_batched)return false;
+#endif
+    return n<=IDX31_ROWS;
+}
 template<class Input>
 static void launch_index_scores31(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-    if(n<=IDX31_ROWS)launch_index_scores_m(a,input,w,start,n,st);else launch_index_scores(a,input,w,start,n,st);
+    if(idx31_ok(a,n))launch_index_scores_m(a,input,w,start,n,st);else launch_index_scores(a,input,w,start,n,st);
 }
 template<class Input>
 static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-    return n<=IDX31_ROWS?select_index31(a,input,w,start,n,st):select_index(a,input,w,start,n,st);
+    return idx31_ok(a,n)?select_index31(a,input,w,start,n,st):select_index(a,input,w,start,n,st);
 }
 #define LAUNCH_INDEX_SCORES launch_index_scores31
 #define SELECT_INDEX select_index_dec
@@ -412,13 +475,34 @@ template<class Input>   // DEC_AVP launches (tests call these regardless of the 
 static void launch_absorb_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){absorb_m<<<dim3(64,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);}
 template<class Input>
 static void launch_value_project_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){value_project_m<<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);}
+#if defined(DEC_AVP) && DEC_AVP
+// absorb / value_project of n rows from row `start`: one _m launch for n <= AVP_ROWS; under DEC_S2 (up to G6_MX rows per step) chunks of
+// AVP_ROWS rows, each chunk on its own slice of the row-relative buffers (q, rope, context), so every row's bytes are the _m kernels'.
+// Otherwise (n > AVP_ROWS, no DEC_S2) false: the caller runs the per-row kernel.
+template<class Input>
+static bool launch_absorb_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+#ifndef DEC_S2
+    if(n>AVP_ROWS)return false;
+#endif
+    for(int c=0;c<n;c+=AVP_ROWS){Work x=w;x.q+=(int64_t)c*a.heads*512;x.rope+=(int64_t)c*a.heads*64;launch_absorb_m(a,input,x,start+c,std::min(n-c,AVP_ROWS),st);}
+    return true;
+}
+template<class Input>
+static bool launch_value_project_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+#ifndef DEC_S2
+    if(n>AVP_ROWS)return false;
+#endif
+    for(int c=0;c<n;c+=AVP_ROWS){Work x=w;x.context+=(int64_t)c*a.heads*512;launch_value_project_m(a,input,x,start+c,std::min(n-c,AVP_ROWS),st);}
+    return true;
+}
+#endif
 template<class Input>
 static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream){
     cudaError_t e;
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);
         if(a.reuse_indices)ga::reuse<<<n,256,0,stream>>>(input,start);else{e=ga::make_index(a,input,w,start,n,stream,nullptr);if(e!=cudaSuccess)return e;}
 #if defined(DEC_AVP) && DEC_AVP
-        if(n<=AVP_ROWS)launch_absorb_m(a,input,w,start,n,stream);else
+        if(launch_absorb_rows(a,input,w,start,n,stream)){}else
 #endif
         ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,start,w.q,w.rope);
         ga::launch_mla_scores(a,input,w,start,n,stream);
@@ -426,7 +510,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         ga::launch_context_parts(a,input,w,start,n,stream);
         ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
 #if defined(DEC_AVP) && DEC_AVP
-        if(n<=AVP_ROWS)launch_value_project_m(a,input,w,start,n,stream);else
+        if(launch_value_project_rows(a,input,w,start,n,stream)){}else
 #endif
         ga::value_project<<<dim3(32,a.heads,n),256,0,stream>>>(input,start,w.context);
     }return cudaGetLastError();
@@ -492,7 +576,7 @@ template<class Input>
 static cudaError_t cp_front_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream){
     const int n=a.rows;
 #if defined(DEC_AVP) && DEC_AVP
-    if(n<=AVP_ROWS)launch_absorb_m(a,input,w,0,n,stream);else
+    if(launch_absorb_rows(a,input,w,0,n,stream)){}else
 #endif
     ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,0,w.q,w.rope);
     return cudaGetLastError();
@@ -531,7 +615,7 @@ static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const floa
     const int n=a.rows;
     cp_lse<<<n*a.heads,256,0,stream>>>(input,part_all,w.context);
 #if defined(DEC_AVP) && DEC_AVP
-    if(n<=AVP_ROWS)launch_value_project_m(a,input,w,0,n,stream);else
+    if(launch_value_project_rows(a,input,w,0,n,stream)){}else
 #endif
     ga::value_project<<<dim3(32,a.heads,n),256,0,stream>>>(input,0,w.context);
     return cudaGetLastError();

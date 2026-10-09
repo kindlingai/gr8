@@ -11,7 +11,7 @@
 //                 launch_consume(2i+1, next norm)
 //   launch_head_local (lm_head slice, local argmax / LSE / Gumbel record -> send slot, doorbell), launch_head_merge
 // Everything a kernel reads is device memory; the two partials are staged in device memory and copied into the
-// (pinned) send slot by one CTA (k_put_publish), which also rings the doorbell.
+// (pinned) send slot by one CTA (k_put_publish; 16 CTAs above 8 rows), which also rings the doorbell.
 // Step inputs come from one StepIn block (pinned host memory on the real fabric, device memory in the simulation),
 // copied to device cells by k_step_in, the first kernel of the step; k_step_out, the last, writes the sampled ids,
 // logprobs and the OR of the attention error words to a StepOut block. Nothing else crosses the host boundary, so
@@ -46,7 +46,9 @@ namespace g6rt
 [[noreturn]] inline void die(const std::string& m) { fprintf(stderr, "g6: %s\n", m.c_str()); exit(2); }
 
 constexpr int NBK = 8;              // decode context buckets (graph form), at most
-constexpr int MX = 8, QA = 2048, KVA = 576, IDXQ = 4096, IDXK = 128, IDXW = 32;
+constexpr int MX = G6_MX, QA = 2048, KVA = 576, IDXQ = 4096, IDXK = 128, IDXW = 32;
+static_assert(MX <= 32, "k_head_merge: one warp, one row per lane");
+constexpr int ATT_QT = MX > 8 ? 32 : 16;    // decode attention query tile (CP decode needs rows <= tile; attn allows <= 64); 16 = today's
 
 struct TensorRef
 {
@@ -68,13 +70,13 @@ template <typename T> inline T* dmalloc(size_t n)
 inline std::string lname(int l, const char* t) { char b[96]; snprintf(b, sizeof b, "L%03d.%s", l, t); return b; }
 
 // device staging [M][6144] BF16 -> this rank's send slot of collective c (16-byte stores), then the doorbell.
-// grid 1, block 128.
+// grid 1 (M <= 8) or 16, block 128: glue::publish rings the doorbell from the last CTA to arrive.
 __global__ void __launch_bounds__(128) k_put_publish(const uint4* src, g6::FabricDev f, const u64* stepp, int c, int n16,
                                                      unsigned* ticket)
 {
     const u64 step = *stepp;
     uint4* dst = reinterpret_cast<uint4*>(glue::send_slot(f, step, c));
-    for (int i = threadIdx.x; i < n16; i += 128) dst[i] = src[i];
+    for (int i = blockIdx.x * 128 + threadIdx.x; i < n16; i += gridDim.x * 128) dst[i] = src[i];
     glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);
 }
 
@@ -112,10 +114,10 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
 {
     __shared__ StepIn sh;
     const int t = threadIdx.x;
-    if (t < (int)(sizeof(StepIn) / 4)) reinterpret_cast<uint32_t*>(&sh)[t] = __ldcv(c.in + t);
+    for (int i = t; i < (int)(sizeof(StepIn) / 4); i += 128) reinterpret_cast<uint32_t*>(&sh)[i] = __ldcv(c.in + i);
     __syncthreads();
     if (t == 0) *c.stepp = sh.step;
-    if (t < MX) { c.tok[t] = sh.tok[t]; c.pos[t] = sh.pos[t]; c.srow[t] = sh.srow[t]; c.tgt[t] = sh.tgt[t]; }
+    for (int i = t; i < MX; i += 128) { c.tok[i] = sh.tok[i]; c.pos[i] = sh.pos[i]; c.srow[i] = sh.srow[i]; c.tgt[i] = sh.tgt[i]; }
     const int pages = (sh.context + 63) / 64;
     for (int l = t; l < c.nl; l += 128)
     {
@@ -378,8 +380,8 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         const char* e = getenv("G6_DEC_SHARED_SCRATCH");
         if (e && atoi(e) == 1 && !(m.nl == 1 && ids[0] == 78))
         {
-            m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap_ab, attn_rows, 16),
-                                        g6_attn_bind_scratch_need(g6nr::HMAX, cap_ab, attn_rows, 16));
+            m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap_ab, attn_rows, ATT_QT),
+                                        g6_attn_bind_scratch_need(g6nr::HMAX, cap_ab, attn_rows, ATT_QT));
             if (!m.dscratch_bytes) die("G6_DEC_SHARED_SCRATCH: bad attention shape");
             m.dscratch = dmalloc<char>(m.dscratch_bytes);     // zeroed
         }
@@ -430,11 +432,11 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         {
             if (y.indexer != cp_full_index(y.l)) die("G6_CP: layer " + std::to_string(y.l) + " indexer flag disagrees with the binder rule");
             if (m.cp.colls.q.size() != (size_t)m.nl || (m.cp.colls.cand[i] >= 0) != y.indexer) die("G6_CP: colls do not match the layer list");
-            G6RT_CK(g6_attn_bind_create_cp(&y.ab, &y.ap, rank, y.l, capacity, attn_rows, 16, m.cp.R, g6nr::NR, st, m.dscratch, m.dscratch_bytes));
+            G6RT_CK(g6_attn_bind_create_cp(&y.ab, &y.ap, rank, y.l, capacity, attn_rows, ATT_QT, m.cp.R, g6nr::NR, st, m.dscratch, m.dscratch_bytes));
         }
         else
 #endif
-        G6RT_CK(g6_attn_bind_create_ext(&y.ab, &y.ap, rank, y.l, cap_ab, attn_rows, 16, st, m.dscratch, m.dscratch_bytes));
+        G6RT_CK(g6_attn_bind_create_ext(&y.ab, &y.ap, rank, y.l, cap_ab, attn_rows, ATT_QT, st, m.dscratch, m.dscratch_bytes));
         y.attn_norm = (const __nv_bfloat16*)need(find, lname(y.l, "attn_norm"));
         y.mlp_norm = (const __nv_bfloat16*)need(find, lname(y.l, "mlp_norm"));
         y.q_a_norm = (const __nv_bfloat16*)need(find, lname(y.l, "q_a_norm"));
@@ -554,7 +556,7 @@ inline void slot_publish(Model& m, int c, cudaStream_t st)
 #endif
 inline void put_publish(Model& m, const uint16_t* staging, int c, int M, cudaStream_t st)
 {
-    k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(staging), m.f, m.stepp, c, M * (HID * 2 / 16), m.tickets + c);
+    k_put_publish<<<M <= 8 ? 1 : 16, 128, 0, st>>>(reinterpret_cast<const uint4*>(staging), m.f, m.stepp, c, M * (HID * 2 / 16), m.tickets + c);
 }
 
 #ifdef DEC_S2
@@ -776,7 +778,7 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     dmark(3, st);
 }
 
-constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots, pad_[3], slot_expert[SMAX]
+constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots (slots, an expert can take several), pad_[3], slot_expert[SMAX]
 inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 {
     Layer& y = m.layers[i];
@@ -801,14 +803,34 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 
 // G6_ROUTE_LOG=<file> (measurement only; set before prepare/capture so the graphs carry the copies): one JSON line per
 // MTP main step, {"q","s","M","pos0","n","L":{"<layer>":[distinct routed expert ids ascending]}} over the MoE layers
+inline void route_log_alloc(Model& m)
+{
+    if (!m.rlog) G6RT_CK(cudaHostAlloc((void**)&m.rlog, (size_t)m.nl * RLOG * sizeof(int), cudaHostAllocDefault));
+}
 inline FILE* route_log_open(Model& m)
 {
     const char* e = getenv("G6_ROUTE_LOG");
     if (!e) return nullptr;
     FILE* f = fopen(e, "w");
     if (!f) die(std::string("G6_ROUTE_LOG: cannot open ") + e);
-    G6RT_CK(cudaHostAlloc((void**)&m.rlog, (size_t)m.nl * RLOG * sizeof(int), cudaHostAllocDefault));
+    route_log_alloc(m);
     return f;
+}
+// n_slots counts slots, and an expert split over several slots repeats its id in consecutive slots: the distinct ids
+// of one logged plan head r (RLOG ints) are the slot ids that differ from the one before
+inline int route_distinct(const int* r)
+{
+    const int n = r[0] < SMAX ? r[0] : SMAX;
+    int d = 0;
+    for (int k = 0; k < n; ++k) d += k == 0 || r[4 + k] != r[4 + k - 1];
+    return d;
+}
+// distinct routed experts per MoE layer (layer order) of the last step whose graph carries the rlog copies; host, after the step's fence
+inline void route_counts(const Model& m, std::vector<int>& out)
+{
+    out.clear();
+    for (int i = 0; i < m.nl; ++i)
+        if (m.layers[i].moe) out.push_back(route_distinct(m.rlog + (size_t)i * RLOG));
 }
 inline void route_log_line(FILE* f, const Model& m, const std::vector<int>& ids, size_t q, int s, int M, int pos0, size_t n)
 {
@@ -819,7 +841,9 @@ inline void route_log_line(FILE* f, const Model& m, const std::vector<int>& ids,
         if (!m.layers[i].moe) continue;
         const int* r = m.rlog + (size_t)i * RLOG;
         fprintf(f, "%s\"%d\":[", first ? "" : ",", ids[i]);
-        for (int k = 0; k < r[0] && k < SMAX; ++k) fprintf(f, "%s%d", k ? "," : "", r[4 + k]);
+        int nd = 0;     // an expert with more than 8 tokens takes consecutive slots (same id): log it once
+        for (int k = 0; k < r[0] && k < SMAX; ++k)
+            if (k == 0 || r[4 + k] != r[3 + k]) fprintf(f, "%s%d", nd++ ? "," : "", r[4 + k]);
         fputc(']', f);
         first = false;
     }

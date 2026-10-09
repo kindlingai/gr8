@@ -147,6 +147,20 @@ inline ControlLinks bootstrap(const BootstrapConfig& c) {
         return out;
     } catch (...) { out.shutdown(); throw; }
 }
+// All-rank barrier after the boot graph capture (native.cuh capture_all, which runs after bootstrap): every worker reports
+// "captured" to the head and the head waits for all of them before it publishes ready.s2 (Service::run). The wait is
+// idle (no receive timeout, as the event reader, #26): the capture time of the ranks may differ by more than the bootstrap
+// timeout, and a rank that dies mid-capture closes its link (recv 0) or fails the TCP keepalive.
+inline void capture_barrier(const BootstrapConfig& c, ControlLinks& links) {
+    const auto done = frame("G6S2 CAPTURED\n" + c.agreement());
+    if (c.rank) {
+        require(links.links.size() == 1 && links.links[0], "capture barrier without head link");
+        links.links[0]->send(done);
+    } else {
+        require(links.links.size() == c.ranks - 1, "capture barrier before all-rank bootstrap");
+        for (auto& io : links.links) { require(bool(io), "capture barrier with missing rank"); require(io->receive(true) == done, "worker capture barrier mismatch"); }
+    }
+}
 inline void publish_ready(const BootstrapConfig& c, const ControlLinks& links) {
     require(c.rank == 0 && links.links.size() == c.ranks - 1, "ready before all-rank bootstrap");
     for (auto& p : links.links) require(bool(p), "ready with missing rank");

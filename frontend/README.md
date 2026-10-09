@@ -120,6 +120,41 @@ then the successful ones replayed concurrently); `tests/bench_fronts.py` (the nu
 
 `g6shim.py` listens on the engine socket and drives `g6m4`/`m4sim --serve DIR` through `req.<n>` / `resp.<n>` files (format in its docstring). One request at a time; `--rank-dirs` takes rank 0's local DIR first, then the other ranks as `host:/path` (written over one persistent ssh connection per host). `cancel` answers `abort` at once and swallows the rest of that request. SIGTERM writes `DIR/quit` to every rank. `logprobs` / `prompt_logprobs` (k = 0..`--max-logprobs`, default 20) go to the engine as `lp <k>` / `plp <k>` request keys; the engine answers with `l` / `p` lines (serve.h). `--max-plp-prompt` (default 4096) bounds the prompt length of a `prompt_logprobs` request. The rank of a token beyond the engine's top 20 (and every rank at k = 0) is `null`. top_p is passed; top_k/min_p are ignored with a warning. Tests: `tests/fake_serve_engine.py` (a fake `--serve` engine) and `tests/test_shim.py SOCK`.
 
+## Several requests at once: g6s2shim.py (DEC_S2 build)
+
+`g6s2shim.py` is the engine-side shim for `g6m4 --s2 DIR`: same PROTOCOL.md socket as `g6shim.py`, but up to `--s2-sessions` requests decode in one step. Stdlib only. The engine side of the file protocol is `engine/runtime/s2/{ingress.h,sessions.h,service.h,scheduler.h}`; the shim docstring has the summary:
+
+- The engine writes `DIR/ready.s2` (`G6S2 1 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows>`) when every rank has booted. The shim sends `hello` only after that, with `max_model_len = pool_rows - guard` (lower it with `--max-model-len`). `DIR/status.s2` (queue, free pages) goes into the `metrics` frame as an extra `s2` field.
+- A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p ..`, then the prompt ids) to EVERY rank dir, then rank 0 gets `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The engine queues a request FIFO until a session slot and a KV run are free.
+- Rank 0 answers in `resp.<id>`: `a` (admitted), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics`), `end <reason> <stop_id> <n>` (finish frame).
+- `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice.
+- The engine ends the whole epoch on a request it cannot parse or fit, so the shim checks prompt, ids (0 to 154879: the engine does not bound-check the embedding index), `max_tokens`, `top_p` (must be in (0, 1]; 0 is an error, not off), and the length first and answers `error` itself. Logprobs are refused; `top_k`/`min_p` are ignored with a warning (`top_p` and `min_tokens` go to the engine).
+- `DIR/abort.s2` (epoch lost) turns every open request into `error` and every later request too; restart the engine and the shim. SIGTERM writes `DIR/quit` to every rank dir. A restarted shim continues the `req`/`cmd` numbers from the files in the rank-0 dir. Rank dirs for a new engine start must be fresh.
+
+```bash
+# engine (every rank; fresh DIR each start): DEC_S2 build, --graph --mtp --prefill, G6_DEC_SPLIT=3, a G6_CP build
+g6m4 ... --s2 /run/g6/s0 --s2-port N --s2-sessions 4 --s2-epoch 7
+python3 g6s2shim.py --rank-dirs /run/g6/s0 node2:/run/g6/s1 ... --sock /run/g6/engine.sock
+python -m g6front --engine-sock /run/g6/engine.sock ...
+```
+
+Tests, no GPU (`tests/fake_s2_engine.py` is the file side of `g6m4 --s2`: FIFO admit up to `--sessions`, one round time for any number of sessions, per-request `resp`, the engine's strict parsing; tokens depend on prompt and position only, so streams are checked for cross-talk):
+
+```bash
+cd frontend && python3 -m unittest tests.test_s2shim -v
+```
+
+It covers 4 concurrent streams (exact tokens, wall clock under 2x one stream, 4 resident), resident and queued cancel, a dropped connection, validation errors that must not kill the engine, stop/`min_tokens`, metrics, two rank dirs, a duplicate id, `abort.s2`, SIGTERM, and a shim restart.
+
+### Round log and cost fit
+
+`G6_S2_ROUNDLOG=1 g6m4 ... --s2 ...` makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
+
+```bash
+tools/s2_costfit.py engine_rank0.log [--residuals] [--json]   # also ms per whole round by active sessions; step_ms = base + per_expert * experts(d*rows) + per_token * rows
+tools/s2_costfit.py --selftest
+```
+
 ## Mock engine and tests
 
 `mock_engine.py` speaks PROTOCOL.md with no model, so the front end and the old benchmark tools can run anywhere:

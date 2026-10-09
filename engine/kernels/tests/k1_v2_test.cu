@@ -33,9 +33,9 @@
 
 static void die(const std::string& s) { fprintf(stderr, "error: %s\n", s.c_str()); exit(1); }
 
-struct Plans                          // [NP] plans in the K1Args array layout
+struct Plans                          // [NP] plans in the K1Args array layout (M <= 8: column c of a slot = token c)
 {
-    std::vector<int> n_slots, slot_expert, slot_mask, tok_slot, tok_e;
+    std::vector<int> n_slots, slot_expert, slot_mask, slot_tok, tok_slot, tok_col, tok_e;
     std::vector<float> slot_w, tok_w;
 };
 
@@ -46,9 +46,11 @@ static Plans make_plans(int NP, int M, int hot, uint64_t seed)
     P.slot_expert.assign(NP * SMAX, 0);
     P.slot_mask.assign(NP * SMAX, 0);
     P.slot_w.assign(NP * SMAX * 8, 0.f);
-    P.tok_slot.assign(NP * 64, -1);
-    P.tok_w.assign(NP * 64, 0.f);
-    P.tok_e.assign(NP * 64, -1);
+    P.slot_tok.assign(NP * SMAX * 8, -1);
+    P.tok_slot.assign(NP * G6_MX * 8, -1);
+    P.tok_col.assign(NP * G6_MX * 8, 0);
+    P.tok_w.assign(NP * G6_MX * 8, 0.f);
+    P.tok_e.assign(NP * G6_MX * 8, -1);
     std::mt19937_64 rng(seed);
     for (int p = 0; p < NP; ++p)
     {
@@ -74,9 +76,11 @@ static Plans make_plans(int NP, int M, int hot, uint64_t seed)
                 const int s = static_cast<int>(std::lower_bound(ex.begin(), ex.end(), te[m * 8 + k]) - ex.begin());
                 P.slot_mask[p * SMAX + s] |= 1 << m;
                 P.slot_w[(p * SMAX + s) * 8 + m] = tw[m * 8 + k];
-                P.tok_slot[(p * 8 + m) * 8 + k] = s;
-                P.tok_w[(p * 8 + m) * 8 + k] = tw[m * 8 + k];
-                P.tok_e[(p * 8 + m) * 8 + k] = te[m * 8 + k];
+                P.slot_tok[(p * SMAX + s) * 8 + m] = m;
+                P.tok_slot[(p * G6_MX + m) * 8 + k] = s;
+                P.tok_col[(p * G6_MX + m) * 8 + k] = m;
+                P.tok_w[(p * G6_MX + m) * 8 + k] = tw[m * 8 + k];
+                P.tok_e[(p * G6_MX + m) * 8 + k] = te[m * 8 + k];
             }
     }
     return P;
@@ -185,7 +189,7 @@ int main(int argc, char** argv)
     Plans P = make_plans(NP, M, hot, seed);
     bind::PlanPtrs pp;
     pp.n_slots = dev(P.n_slots); pp.slot_expert = dev(P.slot_expert); pp.slot_mask = dev(P.slot_mask);
-    pp.slot_w = dev(P.slot_w); pp.tok_slot = dev(P.tok_slot); pp.tok_w = dev(P.tok_w);
+    pp.slot_w = dev(P.slot_w); pp.slot_tok = dev(P.slot_tok); pp.tok_slot = dev(P.tok_slot); pp.tok_col = dev(P.tok_col); pp.tok_w = dev(P.tok_w);
     bind::Xfrag xf;
     xf.on = 1; xf.src = x; xf.ld = HID; xf.K = HID; xf.M = M; xf.f16 = sc.xf_x2;
     bind::launch(xf, st);

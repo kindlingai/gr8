@@ -2,11 +2,12 @@
 // Service or CUDA. TP4 still owns allocation; callbacks still own real KV/hprev.
 #pragma once
 #include "scheduler.h"
+#include "../../g6mx.h"
 #include <set>
 #include <tuple>
 
 namespace g6s2::v1 {
-constexpr unsigned MX = 8, RESIDENT = 4;
+constexpr unsigned MX = G6_MX, RESIDENT = 4;
 inline unsigned request_k(std::optional<int> k, unsigned ceiling) {
     require(ceiling >= 1 && ceiling <= 7, "bad loaded k ceiling");
     const int v = k.value_or(int(ceiling));

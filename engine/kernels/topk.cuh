@@ -10,6 +10,8 @@
 #include <climits>
 #include <cmath>
 
+#include "../g6mx.h"
+
 #ifdef __CUDACC__
 #define TK_HD __host__ __device__ __forceinline__
 #else
@@ -19,7 +21,7 @@
 namespace glue {
 
 constexpr int LP_K = 20;                  // largest k of logprobs / prompt_logprobs (PROTOCOL.md max_logprobs)
-constexpr int TK_ROWS = 8;                // rows of a decode step (rank.cuh MX)
+constexpr int TK_ROWS = G6_MX;            // rows of a decode step (rank.cuh MX)
 constexpr int TK_PAD_ID = INT_MAX;
 
 struct TkEnt

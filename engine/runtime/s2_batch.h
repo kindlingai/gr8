@@ -3,10 +3,11 @@
 // rank.cuh mtp_sequence runs for that session alone (same rows, positions, sample keys, contexts, in the same order):
 //   prompt   each session's prompt steps run as that session's own step (one session per step, scheduler rule ii),
 //            each followed by its first-form draft step, as in mtp_sequence
-//   chain    K-1 chain steps, all sessions' rows in one step each (one row per session, class c1)
-//   rounds   verify: one step, every active session's K+1 rows (class of K+1); accept per session; emit per session
-//            first-form draft: one step per row class of a+1 (A1 on drafts: c1 = sessions with a = 0, c3 = a = 1..2,
-//            c5 = a >= 3), then the K-1 chain steps (all those sessions, class c1)
+//   chain    K-1 chain steps, all sessions' rows in one step each (one row per session)
+//   rounds   verify: ONE step, every active session's K+1 rows (M = S * (K+1) <= max rows); accept per session; emit
+//            per session. First-form draft: ONE step, every surviving session's a+1 rows. Then the K-1 chain steps (all
+//            survivors, one row each). No groups: the step count of a round does not depend on S or on the accepts.
+//            The k1 split class of a main step is the class of a session's K+1 rows (as its solo step), not of M.
 // A session leaves when its emit says finished (right after the verify, as mtp_sequence returns there) or at the start
 // of the first round after it holds n_gen tokens (mtp_sequence runs that round's draft steps first, so this does too).
 // Sessions join at round boundaries (Batch::admit) and may be cancelled there (Batch::cancel); see class Batch.
@@ -23,7 +24,7 @@
 namespace s2
 {
 
-// the k1 split classes of bind::k1_split: 1 row / 2-3 rows / 4+ rows (A1: chosen by a session's own row count)
+// the k1 split classes of bind::k1_split: 1 row / 2-3 rows / 4+ rows (chosen by the step's row count M)
 inline int row_class(int rows) { return rows == 1 ? 1 : rows <= 3 ? 3 : 5; }
 
 struct Row
@@ -43,16 +44,18 @@ struct Step
     // A steady session in a mixed step keeps its own class; `event` = the strongest class in the step.
     std::vector<int> ev;
     int cls = 1;
+    // G6_S2_ROUNDLOG: the Batch::round this step belongs to (-1 = not in a round, e.g. admit tail chains) and how many
+    // sessions were active in that round (a draft or chain step holds only the survivors)
+    long round = -1;
+    int round_active = 0;
     std::vector<int> sess, row0, rows, ctx;
     std::vector<Row> r;
     int M() const { return (int)r.size(); }
-    // per-session tag of the step: kind, then (session, rows) pairs, used as the graph / binding key
+    // the step's shape: kind and row count (the class follows M). The graph key adds the context bucket; the session
+    // layout is data (S2In), not part of the key
     std::string key() const
     {
-        std::string k = kind == MAIN ? "m" : kind == DRAFT ? "d" : "c";
-        k += std::to_string(cls);
-        for (size_t i = 0; i < sess.size(); ++i) k += ":" + std::to_string(sess[i]) + "x" + std::to_string(rows[i]);
-        return k;
+        return std::string(kind == MAIN ? "m" : kind == DRAFT ? "d" : "c") + std::to_string(M());
     }
 };
 
@@ -122,26 +125,27 @@ public:
     // the slot can be admitted again (after finished(q) or cancel(q))
     void release(int q) { st_[q].on = false; }
 
-    // one decode round of every active session. Sessions are grouped, in order, so a main step holds at most max_rows rows
-    // (S2-STATE.md: S = 3, 4 at mtp 2 with MX = 8 run two groups per round); a group runs its main step, its first-form
-    // drafts and its chain like a whole round. A session's rows and steps do not depend on the grouping (row invariance, A1).
+    // one decode round of every active session: one main step (all rows), one first-form draft step, K-1 chain steps.
+    // A session's rows and steps do not depend on which other sessions are in the round (row invariance, A1).
     bool round(const std::vector<int>& order)
     {
         std::vector<int> act;
         for (int q : order) if (active(q)) act.push_back(q);
         if (act.empty()) return false;
-        const int per = max_rows_ / (K_ + 1);
-        if (per < 1) throw std::runtime_error("s2: max rows < one session's verify rows");
-        for (size_t g = 0; g < act.size(); g += per)
-            round_group(std::vector<int>(act.begin() + g, act.begin() + std::min(act.size(), g + per)));
+        if (act.size() * (K_ + 1) > (size_t)max_rows_)
+            throw std::runtime_error("s2: " + std::to_string(act.size()) + " sessions x " + std::to_string(K_ + 1) + " rows > max rows " + std::to_string(max_rows_));
+        cur_round_ = round_no_++; cur_active_ = (int)act.size();
+        round_all(act);
+        cur_round_ = -1; cur_active_ = 0;
         return true;
     }
 
 private:
-    void round_group(const std::vector<int>& act)
+    void round_all(const std::vector<int>& act)
     {
         Step v;
-        v.kind = Step::MAIN; v.cls = row_class(K_ + 1);
+        v.kind = Step::MAIN;
+        v.round = cur_round_; v.round_active = cur_active_;
         // first-step timer: E1/E2 grouping. The first decode-round MAIN of a
         // session is DECODE1 (design E2); every later round MAIN is ROUND. A step's label is the
         // LOWEST class among its sessions (an unlabeled steady session never masks another's E2).
@@ -157,6 +161,7 @@ private:
                 rows.push_back(Row{q, r ? x.d[r] : x.tokens[base[q]], base[q] + r, base[q] + r + 1, -1});
             add_rows(v, q, rows, x.rounds == 0 ? Step::DECODE1 : Step::ROUND); // first-step timer: per-session E2
         }
+        v.cls = row_class(K_ + 1);    // a session's own rows (K+1), as its solo step: the k1 split, so a row's bits do not depend on the batch
         check(v);
         const std::vector<int> t = h_.run(v);
         std::vector<int> on, acc(S2N_SLOTS, 0);
@@ -175,20 +180,23 @@ private:
             if (h_.emit && h_.emit(q, so, a + 1)) { x.done = true; continue; }
             on.push_back(q);
         }
-        for (int c : {1, 3, 5})                                   // first-form draft, one step per row class (A1)
-        {
+        {                                                         // first-form draft: one step, rows a+1 of each survivor
             Step d;
-            d.kind = Step::DRAFT; d.cls = c; d.event = v.event;
+            d.kind = Step::DRAFT; d.event = v.event;
+            d.round = cur_round_; d.round_active = cur_active_;
             for (size_t i = 0; i < v.sess.size(); ++i)
             {
                 const int q = v.sess[i];
-                if (st_[q].done || row_class(acc[q] + 1) != c) continue;
+                if (st_[q].done) continue;
                 add_rows(d, q, draft_rows(q, acc[q] + 1, base[q], &t[v.row0[i]]), v.ev[i]);
             }
-            if (d.sess.empty()) continue;
-            check(d);
-            const std::vector<int> u = h_.run(d);
-            for (size_t i = 0; i < d.sess.size(); ++i) st_[d.sess[i]].d[1] = u[d.row0[i] + d.rows[i] - 1];
+            if (!d.sess.empty())
+            {
+                d.cls = row_class(d.M());
+                check(d);
+                const std::vector<int> u = h_.run(d);
+                for (size_t i = 0; i < d.sess.size(); ++i) st_[d.sess[i]].d[1] = u[d.row0[i] + d.rows[i] - 1];
+            }
         }
         { // first-step timer: chain carries each survivor's own round class
             std::vector<int> evs;
@@ -207,6 +215,8 @@ private:
         int rounds = 0; // first-step timer: per-session decode rounds; round 1 MAIN = DECODE1 (design E2)
     };
     int K_, max_rows_;
+    long round_no_ = 0, cur_round_ = -1; // G6_S2_ROUNDLOG: id of the round in progress and its active-session count
+    int cur_active_ = 0;
     Hooks h_;
     std::vector<St> st_;
     std::vector<Stats> stats_;
@@ -238,13 +248,15 @@ private:
         for (int j = 1; j < K_ && !qs.empty(); ++j)
         {
             Step s;
-            s.kind = Step::CHAIN; s.cls = 1;
+            s.kind = Step::CHAIN;
+            s.round = cur_round_; s.round_active = cur_active_;
             for (size_t k = 0; k < qs.size(); ++k)
             {
                 const int q = qs[k];
                 const int base = (int)st_[q].tokens.size() - 1;
                 add_rows(s, q, draft_rows(q, 1, base - 1 + j, &st_[q].d[j]), evs[k]);
             }
+            s.cls = row_class(s.M());
             check(s);
             const std::vector<int> t = h_.run(s);
             for (size_t i = 0; i < s.sess.size(); ++i) st_[s.sess[i]].d[j + 1] = t[s.row0[i]];

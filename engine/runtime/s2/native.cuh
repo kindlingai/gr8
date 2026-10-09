@@ -6,7 +6,9 @@
 #include "service.h"
 #include "../prefill.cuh"
 #include "../../comms/fabric.h"
+#include <chrono>
 #include <map>
+#include <set>
 
 namespace g6s2 {
 // Use g6m4's EXISTING capture arrays/main_enqueue. In particular solo_main must
@@ -43,6 +45,8 @@ class NativeDispatch {
     NativeContext c_;
     // first-step timer: off-by-default per-step timer (design r3/r4); set from G6_STEP_TMR=1 at construction
     const bool tmr_ = ::getenv("G6_STEP_TMR") && *::getenv("G6_STEP_TMR") == '1';
+    // G6_S2_ROUNDLOG=1 (rank 0; g6m4 allocates the main model's route copies): one "# s2_round" line per decode step
+    const bool rlog_ = c_.main.rank == 0 && c_.main.rlog && ::getenv("G6_S2_ROUNDLOG") && *::getenv("G6_S2_ROUNDLOG") == '1';
     static const char* step_kind(const Launch& l) {
         return l.step.kind == s2::Step::MAIN ? "main" : (l.step.kind == s2::Step::CHAIN ? "chain" : "draft");
     }
@@ -67,7 +71,7 @@ class NativeDispatch {
     g6rt::S2In *layout_ = nullptr, *draft_layout_ = nullptr;
     const g6rt::S2In *previous_layout_ = nullptr, *previous_draft_layout_ = nullptr;
     uint64_t prefill_sequence_ = 1, prefill_sequence2_ = 1;
-    struct Graphs { cudaGraphExec_t a = nullptr, b = nullptr; std::vector<int> slots; };
+    struct Graphs { cudaGraphExec_t a = nullptr, b = nullptr; };
     std::map<std::string, Graphs> graphs_;
     static void destroy(Graphs& g) {
         if (g.a) G6RT_CK(cudaGraphExecDestroy(g.a));
@@ -108,6 +112,22 @@ class NativeDispatch {
         fprintf(stderr,"# s2 mode rank %d solo %d -> %d: %.3f ms (tables + hprev; no KV relocation)\n",c_.main.rank,old,next,
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count());
     }
+    // G6_S2_ROUNDLOG: kind, round id and active sessions of the whole round (-1 / 0 outside a round), sessions in this step
+    // (a round is one main step, one draft step and the chain steps, each over all its sessions), rows, launch+fence ms (as G6_STEP_TMR), path, and for main steps the
+    // distinct routed experts per MoE layer (mean, sum, list; the G6_ROUTE_LOG data)
+    void round_line(const Launch& l, int rows, std::chrono::steady_clock::time_point t0) {
+        const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+        std::string ex;
+        if (l.step.kind == s2::Step::MAIN) {
+            std::vector<int> n; g6rt::route_counts(c_.main,n);
+            long sum = 0; std::string list;
+            for (size_t i = 0; i < n.size(); ++i) { sum += n[i]; list += (i ? "," : "") + std::to_string(n[i]); }
+            char b[64]; snprintf(b,sizeof b," ex_mean %.3f ex_sum %ld ex ",n.empty() ? 0.0 : double(sum)/n.size(),sum);
+            ex = b + list;
+        }
+        fprintf(stderr,"# s2_round step %llu %s round %ld active %d S %zu M %d ms %.3f path %s%s\n",(unsigned long long)l.sequence,
+            step_kind(l),l.step.round,l.step.round_active,l.step.sess.size(),rows,ms,l.solo >= 0 ? "solo" : "reuse",ex.c_str());
+    }
     std::vector<int> launch(const Launch& l) {
         const bool draft = l.step.kind != s2::Step::MAIN, chain = l.step.kind == s2::Step::CHAIN;
         auto& model = draft ? c_.draft.d : c_.main;
@@ -116,48 +136,33 @@ class NativeDispatch {
         g6rt::StepIn input{}; g6rt::S2In layout{}; native_inputs(l,input,layout);
         require(model.s2on == (l.solo < 0), "native solo mode differs from host");
         model.s2->h = layout;
-        for (int j = 0; j < layout.ns; ++j) {
-            model.s2->bk[layout.sess[j]] = l.buckets[j]; model.s2->src0[j] = l.source_rows[j];
-        }
-        const bool captured = l.solo < 0 && !graphs_.count(l.graph_key); // first-step timer: pre-insertion path decision
-        if (captured) {
-            const auto tc0 = tmr_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            g6rt::s2_prepare(model,rows,c_.stream); fence(); // always outside capture
-            Graphs g; g.slots = l.step.sess;
-            if (draft) g.a = capture([&]{g6rt::launch_draft_step(c_.draft,rows,l.context,chain,c_.stream);});
-            else {
-                // Conservative production split3, including S>=2. Never silently
-                // opt into unsplit without the separate IDs AND accepts gate.
-                g.a = capture([&]{g6rt::launch_step(c_.main,rows,l.context,c_.stream,0,c_.split);});
-                g.b = capture([&]{g6rt::launch_step(c_.main,rows,l.context,c_.stream,1,c_.split);});
-            }
-            graphs_.emplace(l.graph_key,std::move(g));
-            if (tmr_) // first-step timer: capture time separate from launch+fence (design r4); actual key, not a literal
-                fprintf(stderr,"# step_tmr rank %d step %llu %s %s cap %lld us (graph_key %s reqs %s)\n",c_.main.rank,
-                    (unsigned long long)input.step,step_kind(l),step_event(l),
-                    (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-tc0).count(),
-                    l.graph_key.c_str(),req_list(l).c_str());
-        }
+        model.s2->bucket = l.bucket;
+        for (int j = 0; j < g6rt::S2N; ++j) model.s2->bk[j] = l.bucket;   // until the attention reads its contexts from the cells (S2_ATTN_LAYOUT_FREE)
+        // every reachable key is captured at boot (capture_all); an S2 launch never captures
+        if (l.solo < 0 && !graphs_.count(l.graph_key))
+            throw std::runtime_error("S2 launch of an uncaptured graph key " + l.graph_key + " (" + step_kind(l) + " M " + std::to_string(rows) +
+                 " bucket " + std::to_string(l.bucket) + "): not in the boot capture set");
         *(draft ? c_.draft_input : c_.input) = input;
         *(draft ? draft_layout_ : layout_) = layout;
         if (draft) {
             std::vector<uint32_t> sizes(3,uint32_t(rows*::HID*2));
             sizes[2] = uint32_t(glue::head_bytes(rows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
         } else c_.enqueue_main(input.step,rows,input.context); // preserves existing RS order/fabric layout
-        const auto tl0 = tmr_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
+        const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
         if (l.solo >= 0) {
             if (draft) c_.solo_draft(l.buckets[0],chain,rows); else c_.solo_main(l.buckets[0],rows);
         } else {
-            auto& g = graphs_.at(l.graph_key); G6RT_CK(cudaGraphLaunch(g.a,c_.stream));
+            const auto& g = graphs_.at(l.graph_key); G6RT_CK(cudaGraphLaunch(g.a,c_.stream));
             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
         }
         fence(); const auto out = *(draft ? c_.draft_output : c_.output);
         if (tmr_) // first-step timer: launch+fence span (design r4); labels per r3, from the PRE-insertion decision, never graphs_.count
             fprintf(stderr,"# step_tmr rank %d step %llu %s %s %s %lld us (graph_key %s rows %d ctx %d reqs %s)\n",c_.main.rank,
                 (unsigned long long)input.step,step_kind(l),step_event(l),
-                l.solo >= 0 ? "SOLO_PRECAPTURED" : (captured ? "S2_CAPTURE" : "S2_REUSE"),
+                l.solo >= 0 ? "SOLO_PRECAPTURED" : "S2_REUSE",
                 (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-tl0).count(),
                 l.graph_key.c_str(),rows,int(l.context),req_list(l).c_str());
+        if (rlog_) round_line(l, rows, tl0);
         const unsigned fe = *fabric.dev().error, ae = out.attn_err, ce = c_.extra_error ? c_.extra_error() : 0u;
         if (fe || ae || ce) // S2 error words: name the error word before the fail-closed require
             fprintf(stderr,"# S2 step error words: fabric %u attn %u cp %u (%s step %llu rows %d solo %d ctx %d)\n",fe,ae,ce,
@@ -222,11 +227,65 @@ public:
         cudaFreeHost(layout_); cudaFreeHost(draft_layout_);
     }
     NativeDispatch(const NativeDispatch&) = delete; NativeDispatch& operator=(const NativeDispatch&) = delete;
-    void retire(const Slot& old) {
-        for (auto it=graphs_.begin();it!=graphs_.end();) {
-            if (std::find(it->second.slots.begin(),it->second.slots.end(),int(old.key.slot)) == it->second.slots.end()) ++it;
-            else { destroy(it->second); it=graphs_.erase(it); }
+    // graphs are keyed by (kind, M, bucket), not by session: a retired session leaves them valid
+    void retire(const Slot&) {}
+    // Boot capture of every graph key a decode step can reach, before serving (a launch of any other key fails):
+    //   main : M in 1..chunk (prompt tails) U S*(K+1), S = 1..sessions     -> two graphs (split A / B)
+    //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
+    //   chain: M in 1..sessions (one row per session; only if K >= 2)
+    // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
+    // contexts, bases and source rows are read from S2In at launch. Call before the first launch / before connecting.
+    void capture_all(unsigned sessions, int mtp, int chunk) {
+        require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention (graft/28-s2-attn): the graphs would bake the session layout");
+        require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
+        const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
+        require(nbk >= 1 && nbk == c_.draft.d.nbk && nbk <= g6rt::NBK, "main/draft context buckets differ");
+        std::set<int> mains, drafts, chains;
+        for (int M = 1; M <= chunk; ++M) { mains.insert(M); drafts.insert(M); }
+        for (int S = 1; S <= N; ++S) mains.insert(S * (K + 1));
+        for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
+        if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
+        for (int M : mains) require(M <= g6rt::MX, "main step rows exceed G6_MX");
+        for (int M : drafts) require(M <= g6rt::MX, "draft step rows exceed G6_MX");
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0,&total));
+        const bool on_main = c_.main.s2on, on_draft = c_.draft.d.s2on;
+        c_.main.s2on = c_.draft.d.s2on = true; fence();
+        size_t keys = 0, graphs = 0;
+        // one synthetic step: ns sessions of rows each (first form: one session of M rows; chain: M sessions of one row)
+        auto one = [&](bool draft, bool chain, int M, int k) {
+            auto& model = draft ? c_.draft.d : c_.main;
+            g6rt::S2In h{};
+            h.ns = chain ? M : 1; h.cls = s2::row_class(M);
+            if (!draft && M > K + 1 && M % (K + 1) == 0) h.cls = s2::row_class(K + 1);   // round main step: a session's K+1 rows (s2_batch.h)
+            for (int j = 0; j < h.ns; ++j) {
+                h.sess[j] = j; h.row0[j] = chain ? j : 0; h.rows[j] = chain ? 1 : M; h.ctx[j] = model.bk[k]; h.base[j] = 0; h.src0[j] = 0;
+            }
+            model.s2->h = h; model.s2->bucket = k;
+            for (int j = 0; j < g6rt::S2N; ++j) model.s2->bk[j] = k;
+            g6rt::s2_prepare(model,M,c_.stream); fence();
+            Graphs g;
+            if (draft) g.a = capture([&]{g6rt::launch_draft_step(c_.draft,M,model.bk[k],chain,c_.stream);});
+            else {
+                g.a = capture([&]{g6rt::launch_step(c_.main,M,model.bk[k],c_.stream,0,c_.split);});
+                g.b = capture([&]{g6rt::launch_step(c_.main,M,model.bk[k],c_.stream,1,c_.split);});
+            }
+            const std::string key = launch_key(std::string(draft ? (chain ? "c" : "d") : "m") + std::to_string(M), k);   // = Dispatch graph_key
+            graphs += g.b ? 2 : 1; ++keys;
+            graphs_.emplace(key,std::move(g));
+        };
+        for (int k = 0; k < nbk; ++k) {
+            for (int M : mains) one(false,false,M,k);
+            for (int M : drafts) one(true,false,M,k);
+            for (int M : chains) one(true,true,M,k);
         }
+        c_.main.s2on = on_main; c_.draft.d.s2on = on_draft; fence();
+        G6RT_CK(cudaMemGetInfo(&free1,&total));
+        if (c_.main.rank == 0)
+            fprintf(stderr,"# s2 boot capture: %zu keys, %zu graphs (%d buckets; main %zu draft %zu chain %zu shapes; N %d K %d chunk %d) in %.2f s, graph memory %.1f MiB\n",
+                keys,graphs,nbk,mains.size(),drafts.size(),chains.size(),N,K,chunk,
+                std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(),
+                (double(free0)-double(free1))/(1024.0*1024.0));
     }
     DispatchHooks hooks() {
         return {

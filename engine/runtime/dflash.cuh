@@ -47,7 +47,7 @@ constexpr int SPLIT = 16;                     // attention key splits per head
 constexpr float FEAT_SCALE = 1.f / 64.f;      // target residual -> fp16 features. fc is linear, and k_ctx_norm undoes it
 constexpr unsigned ERR = 0x64000000u;         // drafter fabric wait error word
 enum { C_ROWS, C_POS0, C_Q0, C_LO, C_N };     // device cells
-static_assert(B == MX, "the verify step of a block carries MX rows");
+static_assert(B <= MX, "the verify step of a block carries B rows, within the row budget (MX = 8, or 32 under DEC_S2)");
 }
 
 // host -> GPU once per draft step (pinned)

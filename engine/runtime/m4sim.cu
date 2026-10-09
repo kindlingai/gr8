@@ -188,8 +188,8 @@ int main(int argc, char** argv)
     const std::vector<int> layers = parse_ints(layers_s);
     if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
     plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
-    if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
-    if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
+    if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1.." + std::to_string(MX));
+    if (mtp < 0 || mtp > std::min<int>(MX - 1, 7)) die("--mtp must be 1..7 drafts");   // the scheduler caps k at 7 whatever MX is
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
@@ -924,17 +924,18 @@ int main(int argc, char** argv)
             {
                 const S2Model& s2m = *(draft ? DR[0].d : R[0]).s2;
                 h.base[j] = s2m.base[h.sess[j]];
+                h.src0[j] = mrow0[h.sess[j]];
                 if (h.ctx[j] > s2m.pages[h.sess[j]] * 64) die("s2: session context past its run (G6_S2_RUNS grant)");   // caller's grant check
             }
-            std::string key = sp.key();
+            std::string key = sp.key();   // kind + M; until attention is layout-free (graft/28-s2-attn) the per-session layout stays in this driver's key
+            for (int j = 0; j < h.ns; ++j) key += ":" + std::to_string(h.sess[j]) + "x" + std::to_string(h.rows[j]);
             auto set = [&](Model& m, bool first) {
                 m.s2->h = h;
                 for (int j = 0; j < h.ns; ++j)
                 {
                     m.s2->bk[h.sess[j]] = bucket_of(m, h.ctx[j]);
-                    m.s2->src0[j] = mrow0[h.sess[j]];
                     if (first) key += ":b" + std::to_string(m.s2->bk[h.sess[j]]) + "p" + std::to_string(h.base[j]) +
-                                      (draft && !chain ? "s" + std::to_string(m.s2->src0[j]) : "");
+                                      (draft && !chain ? "s" + std::to_string(h.src0[j]) : "");
                 }
             };
             if (draft) for (Draft& D : DR) set(D.d, D.d.rank == 0);

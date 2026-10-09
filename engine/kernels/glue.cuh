@@ -26,7 +26,7 @@ namespace glue {
 namespace cg = cooperative_groups;
 
 constexpr int VOCAB = 154880;
-constexpr int NEXP = 256, TOPK = 8, MMAX = 8;
+constexpr int NEXP = 256, TOPK = 8, MMAX = G6_MX;   // MMAX: decode rows per step at most (8, or 32 under DEC_S2)
 constexpr float RMS_EPS = 1e-5f;
 constexpr float ROUTE_SCALE = 2.5f;
 constexpr double ROPE_THETA = 8000000.0;
@@ -255,20 +255,22 @@ __device__ __forceinline__ u32 h2w_to_bf2(u32 w)
 }
 // This thread's 8 normed halves o (columns col0..col0+7, col0 % 8 == 0) of row m -> fragment table words
 // [((ks * 32 + m * 4 + c) * 2 + r)], ks = col0 / 16, r = col0 / 8 % 2: threads 2j (r = 0) and 2j+1 (r = 1) hold the two
-// halves of one k16 step and swap words, then store the two 16-byte quads k_xfrag stores. The CTAs of row M-1 also
-// write rows M..7 as zero. All threads of the warp call it.
+// halves of one k16 step and swap words, then store the two 16-byte quads k_xfrag stores. Rows 8 t .. 8 t + 7 are the
+// tile t table (KSH * 16 uint4 after tile t - 1's). The CTAs of row M-1 also write the rest of its tile (rows M..8 t + 7)
+// as zero. All threads of the warp call it.
 __device__ __forceinline__ void frag_store(const uint4& o, int col0, int m, int M, u32* f16, u32* bf16)
 {
     const bool odd = threadIdx.x & 1;
     const u32 pa = __shfl_xor_sync(0xffffffffu, odd ? o.x : o.z, 1);
     const u32 pb = __shfl_xor_sync(0xffffffffu, odd ? o.y : o.w, 1);
     const uint4 q = odd ? make_uint4(pa, o.z, pb, o.w) : make_uint4(o.x, pa, o.y, pb);
-    const size_t i = (size_t)(col0 >> 4) * 16 + odd;          // uint4 index of (ks, row 0, this half)
-    reinterpret_cast<uint4*>(f16)[i + m * 2] = q;
+    const int tile = m >> 3, mr = m & 7;
+    const size_t i = (size_t)tile * KSH * 16 + (size_t)(col0 >> 4) * 16 + odd;   // uint4 index of (tile, ks, row 0, this half)
+    reinterpret_cast<uint4*>(f16)[i + mr * 2] = q;
     if (bf16)
-        reinterpret_cast<uint4*>(bf16)[i + m * 2] = make_uint4(h2w_to_bf2(q.x), h2w_to_bf2(q.y), h2w_to_bf2(q.z), h2w_to_bf2(q.w));
+        reinterpret_cast<uint4*>(bf16)[i + mr * 2] = make_uint4(h2w_to_bf2(q.x), h2w_to_bf2(q.y), h2w_to_bf2(q.z), h2w_to_bf2(q.w));
     if (m == M - 1)
-        for (int z = M; z < MMAX; ++z)
+        for (int z = mr + 1; z < 8; ++z)
         {
             reinterpret_cast<uint4*>(f16)[i + z * 2] = make_uint4(0u, 0u, 0u, 0u);
             if (bf16) reinterpret_cast<uint4*>(bf16)[i + z * 2] = make_uint4(0u, 0u, 0u, 0u);
@@ -337,40 +339,51 @@ __global__ void __launch_bounds__(256) k_rmsnorm_rows(const TIn* in, int ld_in, 
 // ---------------------------------------------------------------- router: sigmoid top-8 -> K1 plan
 
 // One plan per MoE layer call; K1Args points into it with n_plans = 1 (ctl stays 0).
+// A slot is one expert's n=8 tile: at most 8 tokens, one per column. M <= 8: one slot per selected expert, column c = token c
+// (slot_mask = the token mask). M > 8: an expert with more than 8 tokens takes ceil(n/8) consecutive slots, its tokens in
+// ascending order packed 8 per slot, columns 0.. in that order (slot_tok maps column -> token). An mma column depends only
+// on its own token, so where a token sits in a slot does not change its bits.
 struct RoutePlan
 {
-    int n_slots;                  // distinct routed experts this step (<= M*8)
+    int n_slots;                  // slots this step (<= M*8; M <= 8: = distinct experts; above: an expert with >8 tokens counts ceil(n/8) times)
     int pad_[3];
-    int slot_expert[SMAX];        // ascending expert id
-    int slot_mask[SMAX];          // bit m = token m routed to this slot
-    float slot_w[SMAX][8];        // routing weight of token m for the slot (0 if not routed)
-    int tok_slot[8][8];           // slot of route k of token m, -1 for m >= M
-    float tok_w[8][8];
-    int tok_expert[8][8];         // selected expert ids in selection order (checks / debug)
+    int slot_expert[SMAX];        // ascending expert id (an expert with several slots: consecutive)
+    int slot_mask[SMAX];          // bit c = column c of the slot is used (M <= 8: bit m = token m routed to this slot)
+    float slot_w[SMAX][8];        // routing weight of the token in column c of the slot (0 if unused)
+    int slot_tok[SMAX][8];        // token in column c of the slot, -1 = unused
+    int tok_slot[MMAX][8];        // slot of route k of token m, -1 for m >= M
+    int tok_col[MMAX][8];         // column of token m in that slot
+    float tok_w[MMAX][8];
+    int tok_expert[MMAX][8];      // selected expert ids in selection order (checks / debug)
 };
 
-// grid 1, block 256 (warp m = token m). logits [M][256] fp32, bias [256] fp32 (e_score_correction_bias).
+// grid 1, block 256 (warp w = tokens w, w + 8, ...; M <= MMAX). logits [M][256] fp32, bias [256] fp32 (e_score_correction_bias).
 // Selection key = sigmoid(logit) + bias, ties -> lowest expert id. Weights = unbiased sigmoid of the
 // selected experts / their sum * 2.5 (FACTS-M0 2(c)).
 __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P)
 {
-    __shared__ int emask[NEXP];
+    __shared__ unsigned emask[NEXP];              // bit m = token m selected the expert
     __shared__ int sel_e[MMAX][TOPK];
     __shared__ float sel_w[MMAX][TOPK];
-    __shared__ int slot_of[NEXP];
+    __shared__ int slot_of[NEXP];                 // first slot of the expert
     __shared__ int wcount[8];
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
-    emask[t] = 0;
-    for (int i = t; i < SMAX * 8; i += 256) (&P->slot_w[0][0])[i] = 0.f;
+    const bool dense = M > 8;
+    emask[t] = 0u;
+    for (int i = t; i < SMAX * 8; i += 256)
+    {
+        (&P->slot_w[0][0])[i] = 0.f;
+        (&P->slot_tok[0][0])[i] = -1;
+    }
     __syncthreads();
-    if (w < M)
+    for (int m = w; m < M; m += 8)
     {
         float s[8], key[8];
         #pragma unroll
         for (int i = 0; i < 8; ++i)
         {
             const int e = l + 32 * i;
-            s[i] = 1.f / (1.f + expf(-logits[w * NEXP + e]));
+            s[i] = 1.f / (1.f + expf(-logits[m * NEXP + e]));
             key[i] = s[i] + bias[e];
         }
         unsigned taken = 0;
@@ -391,32 +404,43 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const 
             float sv = 0.f;
             if ((be & 31) == l) { taken |= 1u << (be >> 5); sv = s[be >> 5]; }
             sv = __shfl_sync(0xffffffffu, sv, be & 31);
-            if (l == 0) { sel_e[w][k] = be; sel_w[w][k] = sv; }
+            if (l == 0) { sel_e[m][k] = be; sel_w[m][k] = sv; }
         }
         __syncwarp();
         float sum = 0.f;
         #pragma unroll
-        for (int k = 0; k < TOPK; ++k) sum += sel_w[w][k];
+        for (int k = 0; k < TOPK; ++k) sum += sel_w[m][k];
         __syncwarp();
         if (l < TOPK)
         {
-            sel_w[w][l] = sel_w[w][l] / sum * ROUTE_SCALE;
-            atomicOr(&emask[sel_e[w][l]], 1 << w);
+            sel_w[m][l] = sel_w[m][l] / sum * ROUTE_SCALE;
+            atomicOr(&emask[sel_e[m][l]], 1u << m);
         }
+        __syncwarp();
     }
     __syncthreads();
-    const bool used = emask[t] != 0;
-    const unsigned bal = __ballot_sync(0xffffffffu, used);
-    if (l == 0) wcount[w] = __popc(bal);
+    // thread t = expert t: cnt tokens -> ceil(cnt / 8) slots (one when M <= 8); first slot = exclusive prefix over experts
+    const int cnt = __popc(emask[t]), nsl = (cnt + 7) >> 3;
+    int scan = nsl;
+    #pragma unroll
+    for (int o = 1; o < 32; o <<= 1)
+    {
+        const int v = __shfl_up_sync(0xffffffffu, scan, o);
+        if (l >= o) scan += v;
+    }
+    if (l == 31) wcount[w] = scan;
     __syncthreads();
     int base = 0;
     for (int i = 0; i < w; ++i) base += wcount[i];
-    const int slot = base + __popc(bal & ((1u << l) - 1));
-    if (used)
+    const int slot0 = base + scan - nsl;
+    if (nsl)
     {
-        slot_of[t] = slot;
-        P->slot_expert[slot] = t;
-        P->slot_mask[slot] = emask[t];
+        slot_of[t] = slot0;
+        for (int j = 0; j < nsl; ++j)
+        {
+            P->slot_expert[slot0 + j] = t;
+            P->slot_mask[slot0 + j] = dense ? static_cast<int>((1u << (cnt - 8 * j < 8 ? cnt - 8 * j : 8)) - 1u) : static_cast<int>(emask[t]);
+        }
     }
     if (t == 0)
     {
@@ -425,20 +449,25 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const 
         P->n_slots = n;
     }
     __syncthreads();
-    if (t < MMAX * TOPK)
+    for (int i = t; i < MMAX * TOPK; i += 256)
     {
-        const int m = t >> 3, k = t & 7;
+        const int m = i >> 3, k = i & 7;
         if (m < M)
         {
-            const int e = sel_e[m][k], s2 = slot_of[e];
+            const int e = sel_e[m][k];
+            const int r = __popc(emask[e] & ((1u << m) - 1u));      // rank of token m among the expert's tokens
+            const int s2 = slot_of[e] + (dense ? r >> 3 : 0), col = dense ? (r & 7) : m;
             P->tok_slot[m][k] = s2;
+            P->tok_col[m][k] = col;
             P->tok_w[m][k] = sel_w[m][k];
             P->tok_expert[m][k] = e;
-            P->slot_w[s2][m] = sel_w[m][k];
+            P->slot_w[s2][col] = sel_w[m][k];
+            P->slot_tok[s2][col] = m;
         }
         else
         {
             P->tok_slot[m][k] = -1;
+            P->tok_col[m][k] = 0;
             P->tok_w[m][k] = 0.f;
             P->tok_expert[m][k] = -1;
         }

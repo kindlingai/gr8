@@ -165,6 +165,9 @@ extern "C" int g6_attn_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, vo
     a.index_q = step->index_q; a.index_k = step->index_k; a.index_weight = step->index_weight;
     a.reuse_indices = step->reuse_indices; a.reuse_row_map = step->reuse_row_map;
     a.reuse_rows = step->reuse_rows;
+#ifdef DEC_S2
+    a.s2_batched = step->s2_batched;
+#endif
     return (int)cudaMemsetAsync(a.error, 0, sizeof(unsigned), (cudaStream_t)s);
 }
 extern "C" int g6_attn_bind_run(G6AttnBinding* b, const G6AttnStep* step, void* s) {

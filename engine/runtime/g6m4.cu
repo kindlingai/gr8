@@ -177,8 +177,8 @@ int main(int argc, char** argv)
     const std::vector<int> layers = parse_ints(layers_s);
     if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
     plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
-    if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
-    if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
+    if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1.." + std::to_string(MX));
+    if (mtp < 0 || mtp > std::min<int>(MX - 1, 7)) die("--mtp must be 1..7 drafts");   // the scheduler caps k at 7 whatever MX is
     if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
     const bool s2mode = !s2dir.empty();
     const bool dfl = !dfl_man.empty();
@@ -476,6 +476,9 @@ int main(int argc, char** argv)
     auto cp_pf_err = [&]() -> unsigned { return qp_err(); };   // the qp wire's error word (G6_PF_QP_ROLL)
 #endif
     FILE* rlf = R == 0 ? route_log_open(m) : nullptr;     // G6_ROUTE_LOG=<file> (measurement, MTP main steps)
+#ifdef DEC_S2
+    if (s2mode && R == 0 && getenv("G6_S2_ROUNDLOG") && *getenv("G6_S2_ROUNDLOG") == '1') route_log_alloc(m);   // route copies for the "# s2_round" lines (s2/native.cuh)
+#endif
     m.graph = graph; m.in = in; m.out = out;
     Prefill P;
     g6::FabricDev fp{};
@@ -653,12 +656,12 @@ int main(int argc, char** argv)
         g6s2::Config sc;
         sc.epoch = s2epoch;
         sc.pool_rows = (uint32_t)(cap / 64 * 64);
-        sc.max_rows = MX;
+        // one step bounds: a round (every session's mtp + 1 rows) and a prompt chunk (sessions.h: chunk <= max_rows)
+        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>((uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk));
         sc.max_sessions = (uint32_t)s2sess;
         sc.mtp = (uint32_t)mtp;
         sc.prefill_rows = (uint32_t)MP;
         sc.two_lanes = two;
-        sc.group_rows = true;            // S = 3, 4 run as row groups ("grouped, 2 steps/round"; S2-STATE.md)
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
@@ -731,6 +734,10 @@ int main(int argc, char** argv)
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
+            // every reachable S2 graph key, captured after the bootstrap (its timeout does not cover the capture) and before
+            // the head publishes ready.s2 (Service::run): the all-rank barrier, with no receive timeout, replaces the skew limit
+            try { nd.capture_all(sc.limit(), mtp, plan.chunk); g6s2::capture_barrier(bc, links); }
+            catch (...) { links.shutdown(); throw; }
             g6s2::Service service(bc, links, std::move(h), plan.chunk);
             service.run();               // returns on DIR/quit
             links.shutdown();

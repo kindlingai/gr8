@@ -1,5 +1,6 @@
 #!/bin/bash
-# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs]
+# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs|tests]
+# tests: only the unit tests (tests/row_budget_test.cu, tests/s2_attn_test.cu) into $OUT; scripts/c1_tests.sh builds and runs them.
 # m4sim: one GPU, six simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
 # dfl: dfltest only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py).
 # rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution (#55).
@@ -14,6 +15,12 @@ CPU=""
 OUT=${OUT:-../../bin}
 O=$OUT/obj                 # one object dir per variant (OUT): concurrent flag / NR builds never share objects
 mkdir -p $OUT $O
+if [ "$WHAT" = tests ]; then
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/row_budget_test tests/row_budget_test.cu
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/s2_attn_test tests/s2_attn_test.cu ../attn/attn.cu ../attn/bind.cu -lcublas
+  ls -la $OUT/row_budget_test $OUT/s2_attn_test
+  exit 0
+fi
 if [ "$WHAT" = rs ]; then
   nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/rstest rstest.cu
   ls -la $OUT/rstest

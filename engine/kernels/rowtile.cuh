@@ -4,6 +4,8 @@
 //   byte c of a row = inputs 2c (low nibble), 2c+1.  Activations (<= 8 tokens) are the B operand.
 //   A scale group = G tiles + 16 row scales stored as 8 pairs {s[i], s[i+8]}; the scale is applied to the
 //   group's fp32 partial sum (exact codes in the mma, no per-weight multiply).
+//   More than 8 tokens (DEC_S2): ceil(M/8) n=8 tiles on the weights already loaded; a token's column is computed alone, so
+//   its bits do not depend on the tile count. Fragment tables of the tiles follow each other (ts u32 apart).
 #pragma once
 #include "k1args.cuh"
 
@@ -61,6 +63,29 @@ struct RtGroup
         acc[0] = fmaf(sc.x, g[0], acc[0]); acc[1] = fmaf(sc.x, g[1], acc[1]);
         acc[2] = fmaf(sc.y, g[2], acc[2]); acc[3] = fmaf(sc.y, g[3], acc[3]);
     }
+    // NT n=8 tiles, tile t's fragment table ts u32 after tile t - 1's: the codes are decoded once per k16 step
+    template <int NT>
+    __device__ __forceinline__ void run(const u32* bf, int ks, float (&acc)[NT][4], int ts) const
+    {
+        float g[NT][4];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) g[t][0] = g[t][1] = g[t][2] = g[t][3] = 0.f;
+        #pragma unroll
+        for (int i = 0; i < C::G; ++i)
+        {
+            const u32 w = c[i];
+            const u32 a0 = C::dec(w & 0xffu), a1 = C::dec((w >> 8) & 0xffu), a2 = C::dec((w >> 16) & 0xffu), a3 = C::dec(w >> 24);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t) mma16816(g[t], a0, a1, a2, a3, bf[t * ts + (ks + i) * 64], bf[t * ts + (ks + i) * 64 + 1]);
+        }
+        const float2 sc = C::scale(s);
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            acc[t][0] = fmaf(sc.x, g[t][0], acc[t][0]); acc[t][1] = fmaf(sc.x, g[t][1], acc[t][1]);
+            acc[t][2] = fmaf(sc.y, g[t][2], acc[t][2]); acc[t][3] = fmaf(sc.y, g[t][3], acc[t][3]);
+        }
+    }
 };
 
 
@@ -70,11 +95,12 @@ struct RtGroup
 // gate / up: [chunk][NG = 384/G groups], group records `stride` bytes apart. One interleaved stream
 // [chunk][NG][gate GR | up GR] is (stream, stream + GR, 2 * GR); two separate [chunk][NG][GR] streams are (gate, up, GR).
 // Grp = the group loader (RtGroup: 4-bit codes; GvGroup<Mxfp8> of densev.cuh: 8-bit codes).
-template <class C, class Grp = RtGroup<C>>
+template <class C, class Grp = RtGroup<C>, int NT = 1>
 __device__ __forceinline__ void rt_fc1_part(const uint8_t* gate, const uint8_t* up, int stride, const u32* xfrag, int chunk, int part,
-                                            int nparts, float (&ag)[4], float (&au)[4])
+                                            int nparts, float (&ag)[NT][4], float (&au)[NT][4])
 {
     constexpr int PFB = 4 / C::G;
+    constexpr int TS = KSH * 64;            // u32 between two row tiles' x fragment tables (K = HID)
     constexpr int NG = KSH / C::G;
     const int lane = threadIdx.x & 31;
     const int NGP = NG / nparts, g0 = part * NGP;
@@ -106,62 +132,84 @@ __device__ __forceinline__ void rt_fc1_part(const uint8_t* gate, const uint8_t* 
         #pragma unroll
         for (int p = 0; p < PFB; ++p)
         {
-            cg[p].run(bf, (g0 + g + p) * C::G, ag);
-            cu[p].run(bf, (g0 + g + p) * C::G, au);
+            cg[p].template run<NT>(bf, (g0 + g + p) * C::G, ag, TS);
+            cu[p].template run<NT>(bf, (g0 + g + p) * C::G, au, TS);
         }
     }
 }
 
 // Whole-CTA fc1: warp = (chunk cl = warp / ks, k part = warp % ks), chunks chunk0 .. chunk0+cw-1 (< nch).
-// Writes act[tok][chunk*16 + row] fp16, rows `aw` apart.  Every thread of the CTA must call this (it has a barrier when ks > 1).
-template <class C, class Grp = RtGroup<C>>
+// Writes act[tok][chunk*16 + row] fp16, rows `aw` apart (NT tiles: 8 NT rows).  Every thread of the CTA must call this
+// (it has a barrier when ks > 1). smem with ks > 1: 1024 B per warp and tile.
+template <class C, class Grp = RtGroup<C>, int NT = 1>
 __device__ __forceinline__ void rt_fc1_cta(const uint8_t* gate, const uint8_t* up, int stride, const u32* xfrag, int chunk0, int cw, int nch,
-                                           int ks, float alpha_g, float alpha_u, __half* act /* [8][aw] */, int aw, float* smem)
+                                           int ks, float alpha_g, float alpha_u, __half* act /* [8 NT][aw] */, int aw, float* smem)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int cl = warp / ks, part = warp % ks, chunk = chunk0 + cl;
     const bool on = cl < cw && chunk < nch;
-    float ag[4] = {0.f, 0.f, 0.f, 0.f}, au[4] = {0.f, 0.f, 0.f, 0.f};
-    if (on) rt_fc1_part<C, Grp>(gate, up, stride, xfrag, chunk, part, ks, ag, au);
+    float ag[NT][4], au[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) ag[t][0] = ag[t][1] = ag[t][2] = ag[t][3] = au[t][0] = au[t][1] = au[t][2] = au[t][3] = 0.f;
+    if (on) rt_fc1_part<C, Grp, NT>(gate, up, stride, xfrag, chunk, part, ks, ag, au);
     if (ks > 1)
     {
-        float4* ps = reinterpret_cast<float4*>(smem) + (warp * 32 + lane) * 2;
-        if (on) { ps[0] = make_float4(ag[0], ag[1], ag[2], ag[3]); ps[1] = make_float4(au[0], au[1], au[2], au[3]); }
+        float4* ps = reinterpret_cast<float4*>(smem) + (warp * 32 + lane) * 2 * NT;
+        if (on)
+        {
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                ps[2 * t] = make_float4(ag[t][0], ag[t][1], ag[t][2], ag[t][3]);
+                ps[2 * t + 1] = make_float4(au[t][0], au[t][1], au[t][2], au[t][3]);
+            }
+        }
         __syncthreads();
         if (on && part == 0)
             for (int q = 1; q < ks; ++q)     // fixed order
             {
-                const float4 g = ps[q * 64], u = ps[q * 64 + 1];
-                ag[0] += g.x; ag[1] += g.y; ag[2] += g.z; ag[3] += g.w;
-                au[0] += u.x; au[1] += u.y; au[2] += u.z; au[3] += u.w;
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    const float4 g = ps[q * 64 * NT + 2 * t], u = ps[q * 64 * NT + 2 * t + 1];
+                    ag[t][0] += g.x; ag[t][1] += g.y; ag[t][2] += g.z; ag[t][3] += g.w;
+                    au[t][0] += u.x; au[t][1] += u.y; au[t][2] += u.z; au[t][3] += u.w;
+                }
             }
     }
     if (!on || part) return;
-    // C regs: (row r, tok 2c), (row r, tok 2c+1), (row r+8, tok 2c), (row r+8, tok 2c+1)
+    // C regs: (row r, tok 2c), (row r, tok 2c+1), (row r+8, tok 2c), (row r+8, tok 2c+1); tile t: tokens 8t + ...
     const int r = lane >> 2, c = lane & 3;
-    __half* a0 = act + (2 * c) * aw + chunk * 16 + r;
-    a0[0] = __float2half_rn(silu_f(alpha_g * ag[0]) * (alpha_u * au[0]));
-    a0[aw] = __float2half_rn(silu_f(alpha_g * ag[1]) * (alpha_u * au[1]));
-    a0[8] = __float2half_rn(silu_f(alpha_g * ag[2]) * (alpha_u * au[2]));
-    a0[aw + 8] = __float2half_rn(silu_f(alpha_g * ag[3]) * (alpha_u * au[3]));
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        __half* a0 = act + (8 * t + 2 * c) * aw + chunk * 16 + r;
+        a0[0] = __float2half_rn(silu_f(alpha_g * ag[t][0]) * (alpha_u * au[t][0]));
+        a0[aw] = __float2half_rn(silu_f(alpha_g * ag[t][1]) * (alpha_u * au[t][1]));
+        a0[8] = __float2half_rn(silu_f(alpha_g * ag[t][2]) * (alpha_u * au[t][2]));
+        a0[aw + 8] = __float2half_rn(silu_f(alpha_g * ag[t][3]) * (alpha_u * au[t][3]));
+    }
 }
 
-// build a B fragment table [nks][32][2] in smem from row-major fp16 rows src[8][stride]
-__device__ __forceinline__ void rt_build_bfrag(u32* smem, const __half* src, int stride, int nks)
+// build B fragment tables [nt][nks][32][2] in smem from row-major fp16 rows src[8 nt][stride] (tile t = rows 8t..8t+7)
+__device__ __forceinline__ void rt_build_bfrag(u32* smem, const __half* src, int stride, int nks, int nt = 1)
 {
-    for (int i = threadIdx.x; i < nks * 64; i += blockDim.x)
+    for (int i = threadIdx.x; i < nt * nks * 64; i += blockDim.x)
     {
-        const int ks = i >> 6, l = (i >> 1) & 31, reg = i & 1;
-        smem[i] = __ldcg(reinterpret_cast<const u32*>(src + (l >> 2) * stride + ks * 16 + reg * 8 + 2 * (l & 3)));
+        const int tile = i / (nks * 64), j = i - tile * nks * 64;
+        const int ks = j >> 6, l = (j >> 1) & 31, reg = j & 1;
+        smem[i] = __ldcg(reinterpret_cast<const u32*>(src + (tile * 8 + (l >> 2)) * stride + ks * 16 + reg * 8 + 2 * (l & 3)));
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // GEMV body: warps take output tiles ot0+warp, +nwarps, ... < ot_end; per tile NG2 groups (all k).
 // stream: [out-tile][NG2][GR].  y[tok][out] = f16(scale_tok[tok] * acc) for tokens in mask (BF16 bits if bf16).
-template <class C, class Grp = RtGroup<C>>
+// NT row tiles (tokens 0 .. 8 NT - 1 of this call; bfrag = NT tables of NG2 * G k16 steps): token bit m of mask, tok_scale[m],
+// y row m; the caller offsets y, mask and tok_scale to the first token of a pass.
+template <class C, class Grp = RtGroup<C>, int NT = 1>
 __device__ __forceinline__ void rt_gemv_body(const uint8_t* stream, const u32* bfrag, int NG2, int ot0, int ot_end,
-                                             const float* tok_scale /* [8] */, float alpha, int mask,
+                                             const float* tok_scale /* [8 NT] */, float alpha, u32 mask,
                                              __half* y, int ystride, int bf16 = 0)
 {
     constexpr int PFB = 4 / C::G;
@@ -172,13 +220,14 @@ __device__ __forceinline__ void rt_gemv_body(const uint8_t* stream, const u32* b
     if (first >= ot_end) return;
     const size_t tile_bytes = static_cast<size_t>(NG2) * C::GR;
     const u32* bf = bfrag + lane * 2;
+    const int ts = NG2 * C::G * 64;         // u32 between two row tiles' B tables
     const int r = lane >> 2, c = lane & 3;
-    const bool w0 = (mask >> (2 * c)) & 1, w1 = (mask >> (2 * c + 1)) & 1;
-    const float s0 = alpha * (tok_scale ? tok_scale[2 * c] : 1.f), s1 = alpha * (tok_scale ? tok_scale[2 * c + 1] : 1.f);
 
     auto grp_ptr = [&](int q) { return stream + static_cast<size_t>(first + (q / NG2) * nwarps) * tile_bytes + static_cast<size_t>(q % NG2) * C::GR; };
     const int Q = ntiles * NG2;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
     Grp nx[PFB];
     #pragma unroll
     for (int p = 0; p < PFB; ++p)
@@ -197,21 +246,28 @@ __device__ __forceinline__ void rt_gemv_body(const uint8_t* stream, const u32* b
             if (q + p < Q)
             {
                 const int g = (q + p) % NG2;
-                cur[p].run(bf, g * C::G, acc);
+                cur[p].template run<NT>(bf, g * C::G, acc, ts);
                 if (g == NG2 - 1)
                 {
                     const int o = (first + ((q + p) / NG2) * nwarps) * 16 + r;
-                    if (w0)
+                    #pragma unroll
+                    for (int t = 0; t < NT; ++t)
                     {
-                        put16(y + (2 * c) * ystride + o, s0 * acc[0], bf16);
-                        put16(y + (2 * c) * ystride + o + 8, s0 * acc[2], bf16);
+                        const int m0 = 8 * t + 2 * c;
+                        const bool w0 = (mask >> m0) & 1, w1 = (mask >> (m0 + 1)) & 1;
+                        const float s0 = alpha * (tok_scale ? tok_scale[m0] : 1.f), s1 = alpha * (tok_scale ? tok_scale[m0 + 1] : 1.f);
+                        if (w0)
+                        {
+                            put16(y + m0 * ystride + o, s0 * acc[t][0], bf16);
+                            put16(y + m0 * ystride + o + 8, s0 * acc[t][2], bf16);
+                        }
+                        if (w1)
+                        {
+                            put16(y + (m0 + 1) * ystride + o, s1 * acc[t][1], bf16);
+                            put16(y + (m0 + 1) * ystride + o + 8, s1 * acc[t][3], bf16);
+                        }
+                        acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
                     }
-                    if (w1)
-                    {
-                        put16(y + (2 * c + 1) * ystride + o, s1 * acc[1], bf16);
-                        put16(y + (2 * c + 1) * ystride + o + 8, s1 * acc[3], bf16);
-                    }
-                    acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
                 }
             }
         }
@@ -271,7 +327,7 @@ __global__ void k2_gemv(const uint8_t* stream, const u32* xfrag, int K, int out_
     }
     if (!on || part) return;
     const int r = lane >> 2, c = lane & 3, o = ot * 16 + r;
-    const int mask = (1 << M) - 1;
+    const u32 mask = (1u << (M < 8 ? M : 8)) - 1u;   // one n=8 tile (this kernel is not launched; M <= 8)
     if ((mask >> (2 * c)) & 1)
     {
         y[(2 * c) * ystride + o] = __float2half_rn(acc[0]);

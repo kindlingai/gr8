@@ -6,23 +6,40 @@
 #include "densev.cuh"
 
 // shared expert / dense MLP: int4 g32 records (one interleaved fc1 stream), or MXFP8 W8A16 records when A.s_mx
-// (the MTP draft layer: gate and up are two streams, s_fc1 and s_up)
+// (the MTP draft layer: gate and up are two streams, s_fc1 and s_up). M > 8: NT = ceil(M / 8) row tiles on the weights
+// of each group (x fragment tables from A.xfrag, act rows [8 NT][SACTW]).
 __device__ __forceinline__ void k1_shared_fc1(const K1Args& A, int cta, float* smem)
 {
-    __half* act = A.act + static_cast<size_t>(SMAX) * 8 * ACTW;
-    if (A.s_mx) rt_fc1_cta<Mxfp8, GvGroup<Mxfp8>>(A.s_fc1, A.s_up, Mxfp8::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
-    else rt_fc1_cta<Int4>(A.s_fc1, A.s_fc1 + Int4::GR, 2 * Int4::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+    __half* act = A.act + static_cast<size_t>(A.smax) * 8 * ACTW;
+    g6mx::nt_dispatch_dev(g6mx::tiles(A.M), [&](auto N) {
+        constexpr int NTv = decltype(N)::value;
+        if (A.s_mx) rt_fc1_cta<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc1, A.s_up, Mxfp8::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+        else rt_fc1_cta<Int4, RtGroup<Int4>, NTv>(A.s_fc1, A.s_fc1 + Int4::GR, 2 * Int4::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+    });
 }
 
+// fc2 of the shared expert / dense MLP. The B tables of s_ntp row tiles sit in smem at once; more row tiles than that
+// (the dense layers, I = 2048: 32 KB per tile against 96 KB) take another pass over the weight stream per group of
+// s_ntp tiles. Every pass is the same arithmetic on its own columns, so a row's bits do not depend on the grouping.
 __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem)
 {
-    rt_build_bfrag(smem, A.act + static_cast<size_t>(SMAX) * 8 * ACTW, SACTW, A.s_nch);
-    __syncthreads();
     const int OTU = KSH / A.s_ns2;
-    __half* y = A.s_direct ? K1_OUT(A) : A.ypart + static_cast<size_t>(SMAX) * 8 * HID;
-    const int bf = A.s_direct && A.out_bf16, mask = (1 << A.M) - 1;
-    if (A.s_mx) rt_gemv_body<Mxfp8, GvGroup<Mxfp8>>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask, y, HID, bf);
-    else rt_gemv_body<Int4>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask, y, HID, bf);
+    __half* y = A.s_direct ? K1_OUT(A) : A.ypart + static_cast<size_t>(A.ysh) * HID;
+    const int bf = A.s_direct && A.out_bf16;
+    const u32 mask = A.M >= 32 ? 0xffffffffu : (1u << A.M) - 1u;
+    const int ntot = g6mx::tiles(A.M);
+    for (int t0 = 0; t0 < ntot; t0 += A.s_ntp)
+    {
+        const int n = ntot - t0 < A.s_ntp ? ntot - t0 : A.s_ntp;
+        if (t0) __syncthreads();                       // the previous pass is done with the tables
+        rt_build_bfrag(smem, A.act + static_cast<size_t>(A.smax) * 8 * ACTW + static_cast<size_t>(8 * t0) * SACTW, SACTW, A.s_nch, n);
+        __syncthreads();
+        g6mx::nt_dispatch_dev(n, [&](auto N) {
+            constexpr int NTv = decltype(N)::value;
+            if (A.s_mx) rt_gemv_body<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+            else rt_gemv_body<Int4, RtGroup<Int4>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+        });
+    }
 }
 
 // ------------------------------------------------------------------ TR3 build
@@ -52,14 +69,30 @@ __device__ __forceinline__ void tr3_fc2_any(const K1Args& A, int plan, int unit,
     else tr3_fc2_body<K2 ? 2 : 4, E4>(A, plan, unit, tr, mask, smem);
 }
 
+// Trellis shared-expert slots of a step (SH): one per 8 rows (an n=8 tile each), so 1 at M <= 8; 0 without SH.
+template <bool SH>
+__device__ __forceinline__ int k1_nsh(const K1Args& A)
+{
+    if constexpr (!SH) return 0;
+    else if constexpr (g6mx::NT == 1) return 1;
+    else return g6mx::tiles(A.M);
+}
+
 // Work item slot -> expert, token mask and scratch slot. false = no work. Without SH the scratch slot is the item slot.
-// SH: item slot 0 is the trellis shared expert with every token, and its scratch slot is n_slots (the finalize reads it
-// there). Item slot i > 0 is routed slot i - 1. Every step has the shared expert, so it is handed out first.
+// SH: item slots 0 .. nsh-1 are the trellis shared expert, tile t with rows 8 t .. 8 t + 7 (every row at M <= 8), and
+// its scratch slot is n_slots + t (the finalize reads it there). Item slot i >= nsh is routed slot i - nsh. Every step
+// has the shared expert, so it is handed out first.
 template <bool SH>
 __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int& e, int& mask, int& ss)
 {
-    if (SH && slot == 0) { e = A.sh_e; mask = A.sh_mask; ss = A.n_slots; return true; }
-    ss = slot - (SH ? 1 : 0);
+    const int nsh = k1_nsh<SH>(A);
+    if (SH && slot < nsh)
+    {
+        const int r = A.M - 8 * slot;
+        e = A.sh_e; mask = r >= 8 ? 0xff : (1 << r) - 1; ss = A.n_slots + slot;
+        return true;
+    }
+    ss = slot - nsh;
     if (ss < A.n_slots_dev[plan])
     {
         e = A.slot_expert[plan * SMAX + ss];
@@ -78,7 +111,7 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
     const int plan = A.ctl[0];
-    const int ups = A.B * 2 * A.KS1, nr = (A.n_slots + SH) * ups;
+    const int ups = A.B * 2 * A.KS1, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
     if (static_cast<int>(blockIdx.x) < nr)
     {
         int e, mask, ss;
@@ -94,7 +127,7 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 reg
 {
     extern __shared__ __align__(16) u32 smem[];
     const int plan = A.ctl[1];
-    const int ups = A.B * A.NS2, nr = (A.n_slots + SH) * ups;
+    const int ups = A.B * A.NS2, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
     if (static_cast<int>(blockIdx.x) < nr)
     {
         int e, mask, ss;
@@ -142,9 +175,9 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
     __shared__ int s_item;
     const int t = threadIdx.x;
     const int plan = A.ctl[0];
-    const int u1 = A.B * 2 * A.KS1, n1 = (A.n_slots + SH) * u1;         // fc1 units per slot, routed (+ SH shared) fc1 items
+    const int u1 = A.B * 2 * A.KS1, n1 = (A.n_slots + k1_nsh<SH>(A)) * u1;         // fc1 units per slot, routed (+ SH shared) fc1 items
     const int sh1 = SH ? 0 : (A.s_nch + A.s_cw - 1) / A.s_cw;           // shared fc1 CTAs (s_* records)
-    const int u2 = A.B * A.NS2, n2 = (A.n_slots + SH) * u2;             // fc2 units per slot, routed (+ SH shared) fc2 items
+    const int u2 = A.B * A.NS2, n2 = (A.n_slots + k1_nsh<SH>(A)) * u2;             // fc2 units per slot, routed (+ SH shared) fc2 items
     const int total = n1 + sh1 + n2 + (SH ? 0 : A.s_ns2);
     int* done = A.fctl + 1;
     int* sdone = A.fctl + 1 + SMAX * g6nr::EB;
@@ -267,7 +300,7 @@ __global__ void k1_nv_fc2(K1Args A)
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
 }
 
-// out[m] = f16 or bf16( sum_k ypart[slot(m,k)][m] + ypart[shared][m] ), fp32 sum, fixed k order. grid = M*6, 128 threads.
+// (M <= 8 only, never launched) out[m] = f16 or bf16( sum_k ypart[slot(m,k)][m] + ypart[shared][m] ), fp32 sum, fixed k order. grid = M*6, 128 threads.
 __global__ void k1_nv_fin(K1Args A)
 {
     const int plan = A.ctl[2];
@@ -276,7 +309,7 @@ __global__ void k1_nv_fin(K1Args A)
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int k = 0; k <= 8; ++k)
     {
-        const int slot = k < 8 ? A.tok_slot[(plan * 8 + m) * 8 + k] : SMAX;
+        const int slot = k < 8 ? A.tok_slot[(plan * G6_MX + m) * 8 + k] : SMAX;
         if (slot < 0) continue;
         const uint4 v = *reinterpret_cast<const uint4*>(A.ypart + (static_cast<size_t>(slot) * 8 + m) * HID + n0);
         const u32 w[4] = {v.x, v.y, v.z, v.w};

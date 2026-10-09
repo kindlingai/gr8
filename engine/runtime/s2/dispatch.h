@@ -15,8 +15,10 @@ struct Launch {
     std::vector<int> req_slots;     // raw slot ids, for join with request ids
     std::vector<int> events;        // per-session E1/E2 class (s2::Step::Event), parallel to step.sess
     s2::Step::Event event = s2::Step::ROUND; // strongest (lowest ordinal) class among the sessions
-    std::vector<int> bases, buckets, source_rows;
+    std::vector<int> bases, buckets, source_rows;   // per session: run base page, context bucket, first row in the last main step
+    int bucket = 0;                                  // the step's bucket: the largest of its sessions'
     std::vector<Sampling> samples;
+    // the graph key: kind, M and the step's bucket. Not the sessions, bases or source rows: those are data (S2In)
     std::string graph_key;
 };
 struct DispatchHooks {
@@ -30,6 +32,8 @@ struct DispatchHooks {
     // Complete prefill including both lanes AND draft, no late closure.
     std::function<void(const Slot&, const Payload&, uint32_t, uint32_t)> prefill;
 };
+// the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
+inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
 class Dispatch {
     const Sessions& sessions_; DispatchHooks hooks_; uint32_t max_rows_;
     uint64_t main_sequence_ = 0, draft_sequence_ = 0;
@@ -56,11 +60,11 @@ public:
         if (int(slot) == solo_) mode_dirty_ = true;
     }
     std::vector<int> run(const s2::Step& sp) {
-        const bool draft = sp.kind != s2::Step::MAIN, chain = sp.kind == s2::Step::CHAIN;
+        const bool draft = sp.kind != s2::Step::MAIN;
         require(sp.M() > 0 && unsigned(sp.M()) <= max_rows_ && !sp.sess.empty() && sp.sess.size() <= MAX_SESSIONS &&
                 sp.row0.size() == sp.sess.size() && sp.rows.size() == sp.sess.size() && sp.ctx.size() == sp.sess.size(), "invalid native step layout");
         require(solo_ < 0 || (sp.sess.size() == 1 && sp.sess[0] == solo_), "solo launch contains another session");
-        Launch l; l.step = sp; l.solo = solo_; l.graph_key = sp.key(); l.event = sp.event;
+        Launch l; l.step = sp; l.solo = solo_; l.event = sp.event;
         std::array<bool, MAX_SESSIONS> seen{};
         int next_row = 0;
         for (size_t j = 0; j < sp.sess.size(); ++j) {
@@ -75,8 +79,7 @@ public:
             // per-session event; hand-built Steps may predate the field (default ROUND)
             l.requests.push_back(s.request); l.req_slots.push_back(q);
             l.events.push_back(j < sp.ev.size() ? sp.ev[j] : int(sp.event));
-            l.graph_key += ":b" + std::to_string(bucket) + "p" + std::to_string(base);
-            if (draft && !chain) l.graph_key += "s" + std::to_string(source_[q]);
+            l.bucket = std::max(l.bucket, bucket);
             for (int r = next_row; r < next_row + sp.rows[j]; ++r) {
                 require(sp.r[r].sess == q && sp.r[r].pos >= 0 && sp.r[r].pos < sp.ctx[j] &&
                         (r == next_row || sp.r[r].pos == sp.r[r-1].pos + 1), "row/session position mismatch");
@@ -86,6 +89,7 @@ public:
             next_row += sp.rows[j]; l.context = std::max(l.context, sp.ctx[j]);
         }
         require(next_row == sp.M(), "unmapped native rows");
+        l.graph_key = launch_key(sp.key(), l.bucket);
         auto& seq = draft ? draft_sequence_ : main_sequence_;
         require(seq != UINT64_MAX, "fabric sequence exhausted"); l.sequence = ++seq;
         if (solo_ >= 0) l.base_page = l.bases[0];
@@ -117,7 +121,7 @@ void native_inputs(const Launch& l, StepIn& si, S2In& h) {
     h.ns = int(l.step.sess.size()); h.cls = l.step.cls;
     for (int j = 0; j < h.ns; ++j) {
         h.sess[j] = l.step.sess[j]; h.row0[j] = l.step.row0[j]; h.rows[j] = l.step.rows[j];
-        h.ctx[j] = l.step.ctx[j]; h.base[j] = l.bases[j];
+        h.ctx[j] = l.step.ctx[j]; h.base[j] = l.bases[j]; h.src0[j] = l.source_rows[j];
     }
 }
 } // namespace g6s2

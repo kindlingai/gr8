@@ -23,6 +23,9 @@ struct G6AttnStep {
     const int *positions;    // device int32 [rows], absolute positions
     const int *reuse_indices, *reuse_row_map; // device [reuse_rows,2048], [rows]
     int reuse_rows;
+#ifdef DEC_S2
+    int s2_batched;           // the step is replayed with a batched cell (G6AttnStepCell::rows): rows of several sessions
+#endif
 };
 struct G6AttnBinding {
     G6Attn args;              // populated ABI; output/indices/error owned below

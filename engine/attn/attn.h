@@ -21,6 +21,11 @@ struct G6Attn {
     // page_count = physical pages of this rank (the replay cell's page_count is then ignored).
     int cp_nr, cp_rank;
 #endif
+#ifdef DEC_S2
+    // S2 batched step (the replay cell carries per-row sessions, replay.h G6AttnRow): set by g6_attn_bind_prepare from
+    // G6AttnStep::s2_batched. Host-side dispatch only (the cell is device data): picks the fixed-K decode kernels.
+    int s2_batched;
+#endif
 };
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
 extern "C" int g6_attn_run(const G6Attn*,void* scratch,size_t bytes,void* stream);

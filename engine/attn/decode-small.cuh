@@ -8,7 +8,7 @@ __device__ __forceinline__ float2 fp8_pair(uint16_t u){__half2_raw raw=__nv_cvt_
 // lane-strided accumulation retain the old 16 latent +2 RoPE FMA order.
 template<class Input>
 __global__ void scores_direct(Input input,int start,const float* q,const float* rope,float* out){
- auto a=ga::resolve(input);if(!a.active)return;constexpr int WARPS=8;int row=blockIdx.z,r=start+row,h=blockIdx.y,j=blockIdx.x*WARPS+threadIdx.x/32,lane=threadIdx.x&31;
+ auto a=ga::resolve(input);if(!a.active)return;constexpr int WARPS=8;int row=blockIdx.z,r=start+row,h=blockIdx.y,j=blockIdx.x*WARPS+threadIdx.x/32,lane=threadIdx.x&31;FOR_ROW(a,input,r);
  int id=a.indices[(int64_t)r*ga::TOP+j];const uint8_t* v=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?ga::kv_at(a,id):nullptr;float sum=0;
  if(v){float scale[4];
  #pragma unroll
@@ -22,7 +22,7 @@ __global__ void scores_direct(Input input,int start,const float* q,const float* 
 template<class Input>
 __global__ void context_parts(Input input,int start,const float* probs,float* parts){
  auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2,GROUPS=(D+127)/128;
- int row=blockIdx.z,r=start+row,h=blockIdx.y,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x;
+ int row=blockIdx.z,r=start+row,h=blockIdx.y,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x;FOR_ROW(a,input,r);
  __shared__ uintptr_t rows[256];__shared__ float probability[256],scale[256*GROUPS];bool active=false;
  for(int j=t;j<256;j+=THREADS){int slot=part*256+j,id=a.indices[(int64_t)r*ga::TOP+slot];float p=probs[((int64_t)row*a.heads+h)*ga::TOP+slot];const uint8_t* src=nullptr;if(id>=0&&id<=a.positions[r]&&p!=0)src=ga::kv_at(a,id);
   rows[j]=(uintptr_t)src;probability[j]=p;active|=src!=nullptr;if(src)for(int g=0;g<GROUPS;g++)scale[j*GROUPS+g]=((const float*)(src+512))[d0/128+g];}
@@ -42,7 +42,7 @@ constexpr int CPB=DEC_CPB2;
 template<class Input>
 __global__ void context_parts_cpb(Input input,int start,const float* probs,float* parts){
  auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2,GROUPS=(D+127)/128;
- int row=blockIdx.z,r=start+row,h=blockIdx.y,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x;
+ int row=blockIdx.z,r=start+row,h=blockIdx.y,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x;FOR_ROW(a,input,r);
  __shared__ uintptr_t rows[256];__shared__ float probability[256],scale[256*GROUPS];bool active=false;
  for(int j=t;j<256;j+=THREADS){int slot=part*256+j,id=a.indices[(int64_t)r*ga::TOP+slot];float p=probs[((int64_t)row*a.heads+h)*ga::TOP+slot];const uint8_t* src=nullptr;if(id>=0&&id<=a.positions[r]&&p!=0)src=ga::kv_at(a,id);
   rows[j]=(uintptr_t)src;probability[j]=p;active|=src!=nullptr;if(src)for(int g=0;g<GROUPS;g++)scale[j*GROUPS+g]=((const float*)(src+512))[d0/128+g];}
@@ -57,7 +57,7 @@ __global__ void context_parts_cpb(Input input,int start,const float* probs,float
 }
 template<class Input>
 __global__ void index_scores(Input input,int start,const half* q,const float* weights,float* scores,int* ids){
- auto a=ga::resolve(input);if(!a.active)return;using namespace nvcuda;int row=blockIdx.y,r=start+row,t0=blockIdx.x*32,t=threadIdx.x,warp=t/32;
+ auto a=ga::resolve(input);if(!a.active)return;using namespace nvcuda;int row=blockIdx.y,r=start+row,t0=blockIdx.x*32,t=threadIdx.x,warp=t/32;FOR_ROW(a,input,r);
  __shared__ __align__(32) half key[32*128];__shared__ __align__(32) float products[32*32];__shared__ float scales[32];__shared__ uintptr_t pointers[32];
  if(t0>a.positions[r]){if(t<32&&t0+t<a.context){scores[(int64_t)row*a.context+t0+t]=-INFINITY;ids[(int64_t)row*a.context+t0+t]=t0+t;}return;}
  if(t<32){float scale=0;const uint8_t* p=t0+t<a.live_context&&CP_MINE(a,t0+t)?ga::ik_at(a,t0+t,scale):nullptr;pointers[t]=(uintptr_t)p;scales[t]=scale;}__syncthreads();
@@ -73,6 +73,9 @@ static bool use_small_decode(const G6Attn& a){return a.rows<=3&&a.context<=2048;
 // Sparse MLA consumes exactly TOP selected logical IDs, not a.context keys.
 // Keep fresh-index dispatch unchanged; widen only decode/verify reuse rows.
 static bool use_fixed_k_decode(const G6Attn& a){
+ #ifdef DEC_S2
+ if(a.s2_batched&&a.rows<=G6_MX)return true;   // batched S2 step: rows of several sessions, up to the row budget
+ #endif
  return use_small_decode(a)||(a.reuse_indices&&a.rows<=8);
 }
 template<class Input>

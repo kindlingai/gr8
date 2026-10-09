@@ -1,5 +1,5 @@
 // g6 binder: one rank's pack tensors of one layer -> ready kernel arguments + launch helpers (M3-PLAN §4).
-// Decode path, M <= 8 rows. Everything a kernel reads per thread (control words, plan, scratch, fragment tables)
+// Decode path, M <= 8 rows (M <= G6_MX under DEC_S2, g6mx.h). Everything a kernel reads per thread (control words, plan, scratch, fragment tables)
 // must be DEVICE memory; only the two partial outputs may point into a fabric send slot (see put_partial below).
 //
 //   bind::init();                                        once per process (shared-memory attribute of K1 fc1)
@@ -357,13 +357,29 @@ struct Scratch
     uint16_t* part[2];                // [8][6144] BF16 staging for the two fabric partials (put_partial)
     u32* xf_head;                     // fragment table of the lm_head input, K = 6144
     u32* xf_eh;                       //   of the MTP eh input, K = 12288
+    int rows = G6_MX;                 // row limit the block was laid out for (scratch_layout): sizes below follow it
+    int smax = SMAX;                  // K1 slot capacity: SMAX at <= 8 rows, min(SMAX, 8 rows + ceil(rows / 8)) above
+    int ysh = SMAX * 8;               // ypart rows ahead of the shared expert's: SMAX * 8 at <= 8 rows, 0 above
 };
 
-inline size_t scratch_layout(Scratch* s, char* base)
+// row limit -> scratch geometry. rows <= 8 is the layout of the 8-row build, byte for byte.
+// Above 8 rows: 8 routed slots per row, plus one trellis shared-expert slot per 8 rows (exlr8 v2 layers, k1.cuh k1_nsh).
+constexpr int SMAX8 = SMAX < 72 ? SMAX : 72;      // routed slots at <= 8 rows (SMAX itself in the default build)
+inline int scratch_smax(int rows)
+{
+    const int n = 8 * rows + g6mx::tiles(rows);
+    return rows <= 8 ? SMAX8 : (n < SMAX ? n : SMAX);
+}
+inline int scratch_ysh(int rows) { return rows <= 8 ? SMAX8 * 8 : 0; }
+
+inline size_t scratch_layout(Scratch* s, char* base, int rows = G6_MX)
 {
     size_t o = 0;
     auto take = [&](size_t bytes) { char* p = base ? base + o : nullptr; o += (bytes + 255) / 256 * 256; return p; };
-    const size_t xf = static_cast<size_t>(KSH) * 64 * 4;
+    if (rows < 1) rows = 1;
+    if (rows > G6_MX) rows = G6_MX;
+    const int NT = g6mx::tiles(rows), smax = scratch_smax(rows), ysh = scratch_ysh(rows);
+    const size_t xf = static_cast<size_t>(KSH) * 64 * 4 * NT;     // NT row tiles of 8, each a [K/16][32][2] table
     Scratch t;
     t.ctl = reinterpret_cast<int*>(take(4 * sizeof(int)));
     t.fctl = reinterpret_cast<int*>(take(FCTL_N * sizeof(int)));
@@ -373,31 +389,32 @@ inline size_t scratch_layout(Scratch* s, char* base)
     t.xf_attn = reinterpret_cast<u32*>(take(xf));
     t.xf_x2 = reinterpret_cast<u32*>(take(xf));
     t.xb_x2 = reinterpret_cast<u32*>(take(xf));
-    t.gpart = reinterpret_cast<float*>(take(static_cast<size_t>(SMAX) * g6nr::EB * 2 * GPMAX * 8 * 128 * sizeof(float)));
-    t.z = reinterpret_cast<__half*>(take(static_cast<size_t>(SMAX) * g6nr::EB * 8 * HID * 2));
-    t.act = reinterpret_cast<__half*>(take((static_cast<size_t>(SMAX) * 8 * ACTW + static_cast<size_t>(8) * SACTW) * 2));
-    t.ypart = reinterpret_cast<__half*>(take(static_cast<size_t>(SMAX + 1) * 8 * HID * 2));
-    t.part[0] = reinterpret_cast<uint16_t*>(take(static_cast<size_t>(8) * HID * 2));
-    t.part[1] = reinterpret_cast<uint16_t*>(take(static_cast<size_t>(8) * HID * 2));
+    t.gpart = reinterpret_cast<float*>(take(static_cast<size_t>(smax) * g6nr::EB * 2 * GPMAX * 8 * 128 * sizeof(float)));
+    t.z = reinterpret_cast<__half*>(take(static_cast<size_t>(smax) * g6nr::EB * 8 * HID * 2));
+    t.act = reinterpret_cast<__half*>(take((static_cast<size_t>(smax) * 8 * ACTW + static_cast<size_t>(8 * NT) * SACTW) * 2));
+    t.ypart = reinterpret_cast<__half*>(take((static_cast<size_t>(ysh) + 8 * NT) * HID * 2));
+    t.part[0] = reinterpret_cast<uint16_t*>(take(static_cast<size_t>(rows < 8 ? 8 : rows) * HID * 2));
+    t.part[1] = reinterpret_cast<uint16_t*>(take(static_cast<size_t>(rows < 8 ? 8 : rows) * HID * 2));
     t.xf_head = reinterpret_cast<u32*>(take(xf));
     t.xf_eh = reinterpret_cast<u32*>(take(2 * xf));
+    t.rows = rows; t.smax = smax; t.ysh = ysh;
     if (s) *s = t;
     return o;
 }
 // One block per rank (58.3 MB at TP6). Simulated ranks that run one after another on one stream may share a block.
 // Zero it once after allocation (the control cells must start at 0).
-inline size_t scratch_bytes() { return scratch_layout(nullptr, nullptr); }
-inline Scratch scratch_at(void* block)
+inline size_t scratch_bytes(int rows = G6_MX) { return scratch_layout(nullptr, nullptr, rows); }
+inline Scratch scratch_at(void* block, int rows = G6_MX)
 {
     Scratch s;
-    scratch_layout(&s, static_cast<char*>(block));
+    scratch_layout(&s, static_cast<char*>(block), rows);
     return s;
 }
 
 // ------------------------------------------------------------------------------------------ fragment tables
 // src fp16 rows [M][ld] (16-byte aligned, ld % 8 == 0) -> mma B fragment table [K/16][32][2] (layout of
 // make_xfrag, engine/bench/host.h): fp16 bits into `f16`, the same values rounded to BF16 into `bf16` (either may be
-// null). Rows >= M are written as zero. One thread per (k16 step, row): two 16-byte loads, two 16-byte stores per table.
+// null). M > 8: ceil(M / 8) tables of 8 rows each, K / 16 * 64 u32 apart (tile t = rows 8 t .. 8 t + 7). Rows >= M are written as zero. One thread per (k16 step, row): two 16-byte loads, two 16-byte stores per table.
 // Index formula (to fold the table write into another kernel): for k16 step ks, row m (0..7), c = 0..3, r = 0..1
 //   table[((ks * 32 + m * 4 + c) * 2 + r)] = the two halfs x[m][16 * ks + 8 * r + 2 * c], x[..+ 1] (low half first).
 // Lane = m * 4 + c (32 lanes per k16 step); the lanes of rows >= M hold zero.
@@ -421,14 +438,15 @@ __global__ void __launch_bounds__(256) k_xfrag(Xfrag a)
     const int i = blockIdx.x * 256 + threadIdx.x;
     const int ks = i >> 3, row = i & 7;
     if (ks >= a.K / 16) return;
+    const int tile = blockIdx.y, grow = tile * 8 + row;     // grid.y = row tile: rows 8 tile .. 8 tile + 7
     uint4 lo = make_uint4(0u, 0u, 0u, 0u), hi = lo;
-    if (row < a.M)
+    if (grow < a.M)
     {
-        const uint4* s = reinterpret_cast<const uint4*>(a.src + static_cast<size_t>(row) * a.ld + ks * 16);
+        const uint4* s = reinterpret_cast<const uint4*>(a.src + static_cast<size_t>(grow) * a.ld + ks * 16);
         lo = s[0]; hi = s[1];
     }
-    // lane row*4 + c: reg 0 = halfs 2c, 2c+1 (word c of lo), reg 1 = halfs 8+2c, 9+2c (word c of hi)
-    const size_t o = (static_cast<size_t>(ks) * 32 + row * 4) * 2;
+    // lane row*4 + c: reg 0 = halfs 2c, 2c+1 (word c of lo), reg 1 = halfs 8+2c, 9+2c (word c of hi); tile t's table follows tile t - 1's
+    const size_t o = static_cast<size_t>(tile) * (a.K / 16) * 64 + (static_cast<size_t>(ks) * 32 + row * 4) * 2;
     if (a.f16)
     {
         uint4* d = reinterpret_cast<uint4*>(a.f16 + o);
@@ -445,7 +463,7 @@ __global__ void __launch_bounds__(256) k_xfrag(Xfrag a)
 
 inline void launch(const Xfrag& a, cudaStream_t st)
 {
-    if (a.on) k_xfrag<<<(a.K / 16 * 8 + 255) / 256, 256, 0, st>>>(a);
+    if (a.on) k_xfrag<<<dim3((a.K / 16 * 8 + 255) / 256, g6mx::tiles(a.M)), 256, 0, st>>>(a);
 }
 
 // ------------------------------------------------------------------------------------------ K2 + dense GEMVs
@@ -465,21 +483,37 @@ struct Gv
 #endif
 };
 
+// largest tiles-per-CTA <= tpc whose CTA (tpc x ks warps) fits the kernel's register budget; the output tiles of a CTA are
+// independent, so fewer per CTA (more CTAs) gives the same bits. NT = 1 kernels always fit (the M <= 8 launch is today's).
+template <class K> inline int gv_fit_tpc(K* kern, int tpc, int ks)
+{
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(kern)) != cudaSuccess) return tpc;
+    const int t = fa.maxThreadsPerBlock / (ks * 32);
+    return t < 1 ? 1 : (t < tpc ? t : tpc);
+}
 inline void launch(const Gv& g, cudaStream_t st)
 {
     if (!g.on) return;
-    const int ot = g.O / 16, grid = (ot + g.tpc - 1) / g.tpc, block = g.tpc * g.ks * 32;
+    const int ot = g.O / 16;
+    g6mx::nt_dispatch(g6mx::tiles(g.M), [&](auto N) {
+        constexpr int NTv = decltype(N)::value;     // row tiles of 8: M <= 8 launches the NT = 1 kernel
+        auto go = [&](auto* kern, auto&&... tail) {
+            const int tpc = NTv == 1 ? g.tpc : gv_fit_tpc(kern, g.tpc, g.ks);
+            kern<<<(ot + tpc - 1) / tpc, tpc * g.ks * 32, 0, st>>>(g.w, g.xfrag, g.K, ot, tpc, g.ks, g.M, tail...);
+        };
 #ifdef DEC_SLOT
-    if (g.slot.send)
-    {
-        if (g.codec == INT4) gv_gemv_slot<Int4v><<<grid, block, 0, st>>>(g.w, g.xfrag, g.K, ot, g.tpc, g.ks, g.M, g.ld, g.slot);
-        else gv_gemv_slot<Mxfp8><<<grid, block, 0, st>>>(g.w, g.xfrag, g.K, ot, g.tpc, g.ks, g.M, g.ld, g.slot);
-        return;
-    }
+        if (g.slot.send)
+        {
+            if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
+            else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
+            return;
+        }
 #endif
-    if (g.codec == INT4) gv_gemv<Int4v><<<grid, block, 0, st>>>(g.w, g.xfrag, g.K, ot, g.tpc, g.ks, g.M, g.y, g.ld, g.odt);
-    else if (g.codec == MXFP8) gv_gemv<Mxfp8><<<grid, block, 0, st>>>(g.w, g.xfrag, g.K, ot, g.tpc, g.ks, g.M, g.y, g.ld, g.odt);
-    else gv_gemv<Bf16w><<<grid, block, 0, st>>>(g.w, g.xfrag, g.K, ot, g.tpc, g.ks, g.M, g.y, g.ld, g.odt);
+        if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt); }
+        else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt); }
+        else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt); }
+    });
 }
 
 // tpc (output tiles per CTA) and ks (k parts per tile, one warp each): best split per shape on the GB10
@@ -522,6 +556,7 @@ struct K1
          else if ((k).e4) { if ((k).k2) kern<true, true>__VA_ARGS__; else kern<true, false>__VA_ARGS__; } \
          else { if ((k).k2) kern<false, true>__VA_ARGS__; else kern<false, false>__VA_ARGS__; } } while (0)
 template <bool E4, bool K2, bool SH> inline const void* k1_fn_fc1() { return reinterpret_cast<const void*>(k1_tr3_fc1<E4, K2, SH>); }
+template <bool E4, bool K2, bool SH> inline const void* k1_fn_fc2() { return reinterpret_cast<const void*>(k1_tr3_fc2<E4, K2, SH>); }
 template <bool E4, bool K2, bool SH> inline const void* k1_fn_fused()
 {
     if constexpr (SH) return reinterpret_cast<const void*>(k1_tr3_fused_sh<E4, K2>);
@@ -598,14 +633,16 @@ struct PlanPtrs
     const int* slot_expert = nullptr;
     const int* slot_mask = nullptr;
     const float* slot_w = nullptr;
+    const int* slot_tok = nullptr;
     const int* tok_slot = nullptr;
+    const int* tok_col = nullptr;
     const float* tok_w = nullptr;
 };
 template <class P> inline PlanPtrs plan_ptrs(const P* p)
 {
     PlanPtrs q;
     q.n_slots = &p->n_slots; q.slot_expert = p->slot_expert; q.slot_mask = p->slot_mask;
-    q.slot_w = &p->slot_w[0][0]; q.tok_slot = &p->tok_slot[0][0]; q.tok_w = &p->tok_w[0][0];
+    q.slot_w = &p->slot_w[0][0]; q.slot_tok = &p->slot_tok[0][0]; q.tok_slot = &p->tok_slot[0][0]; q.tok_col = &p->tok_col[0][0]; q.tok_w = &p->tok_w[0][0];
     return q;
 }
 
@@ -637,7 +674,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     else if (f1.nd != 3 || f1.shape[1] != 192 || f1.shape[2] != 576 || f2.nd != 3 || f2.shape[0] != KSH || f2.shape[1] * 2 != s_nch ||
              f2.shape[2] != 288 || s_nch * 16 > SACTW)
         return "shared / dense MLP records are not [I/16][192][576] + [384][I/32][288] with I <= SACTW";
-    if (M < 1 || M > 8) return "M must be 1..8";
+    if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
     // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
     K1Split s = moe ? k1_split(split_m ? split_m : M) : K1_DENSE_SPLIT;
     // exlr8 v2 layers (2-bit units or the trellis shared expert, #65) choose fused or separate fc1 / fc2 launches from a
@@ -662,6 +699,8 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     a.s_up = mx ? static_cast<const uint8_t*>(fu.p) : nullptr; a.s_mx = mx;
     a.s_nch = s_nch; a.s_ks = s.s_ks; a.s_cw = w1 / s.s_ks; a.s_ns2 = s.s_ns2;
     a.gpart = sc.gpart; a.z = sc.z; a.act = sc.act; a.ypart = sc.ypart; a.fctl = sc.fctl;
+    a.smax = sc.smax; a.ysh = sc.ysh;
+    if (M > sc.rows) return "M exceeds the row limit the scratch block was laid out for";
     a.out = static_cast<__half*>(out); a.out_bf16 = out_bf16;
     if (moe)
     {
@@ -688,12 +727,13 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         if (sh && !k.e4) return "trellis shared expert in a layer that is not exlr8-e4m3";
         if (sh && T.t[T_TR3_TAB].shape[0] != 257) return "trellis shared expert without tr3.table row 256";
         a.sh_e = 256;
-        a.sh_mask = (1 << M) - 1;
-        if (!plan.n_slots || !plan.slot_expert || !plan.slot_mask || !plan.slot_w || !plan.tok_slot || !plan.tok_w) return "MoE layer needs the route plan";
+        if (!plan.n_slots || !plan.slot_expert || !plan.slot_mask || !plan.slot_w || !plan.slot_tok || !plan.tok_slot || !plan.tok_col || !plan.tok_w) return "MoE layer needs the route plan";
         a.n_slots = M * 8;
+        // routed slots, then the trellis shared expert's (one per 8 rows): scratch_smax leaves room for both
+        if (a.n_slots + (sh ? g6mx::tiles(M) : 0) > sc.smax) return "the scratch block has too few K1 slots for M rows";
         a.n_slots_dev = plan.n_slots;
-        a.slot_expert = plan.slot_expert; a.slot_mask = plan.slot_mask; a.slot_w = plan.slot_w;
-        a.tok_slot = plan.tok_slot; a.tok_w = plan.tok_w;
+        a.slot_expert = plan.slot_expert; a.slot_mask = plan.slot_mask; a.slot_w = plan.slot_w; a.slot_tok = plan.slot_tok;
+        a.tok_slot = plan.tok_slot; a.tok_col = plan.tok_col; a.tok_w = plan.tok_w;
         a.t_tab = static_cast<const long long*>(tab.p);
         a.t_kmix = static_cast<const long long*>(km.p);
         a.t_sg = static_cast<const __half*>(sg.p); a.t_v1b = static_cast<const __half*>(v1b.p); a.t_v3b = static_cast<const __half*>(v3b.p);
@@ -709,11 +749,16 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         k.dense = 1;
     }
     const int sh1 = sh ? 0 : (s_nch + a.s_cw - 1) / a.s_cw;
-    k.g1 = (a.n_slots + (sh ? 1 : 0)) * a.B * 2 * a.KS1 + sh1; k.b1 = 256 * s.WG;
+    const int nsh = sh ? g6mx::tiles(M) : 0;        // trellis shared-expert slots (k1.cuh k1_nsh)
+    k.g1 = (a.n_slots + nsh) * a.B * 2 * a.KS1 + sh1; k.b1 = 256 * s.WG;
     k.sm1 = static_cast<size_t>(KSH / a.KS1) * 256;
-    if (k.sm1 < static_cast<size_t>(w1) * 1024) k.sm1 = static_cast<size_t>(w1) * 1024;
-    k.g2 = (a.n_slots + (sh ? 1 : 0)) * a.B * a.NS2 + (sh ? 0 : a.s_ns2); k.b2 = 512;
-    k.sm2 = static_cast<size_t>(s_nch < 8 ? 8 : s_nch) * 256;
+    if (k.sm1 < static_cast<size_t>(w1) * 1024 * g6mx::tiles(M)) k.sm1 = static_cast<size_t>(w1) * 1024 * g6mx::tiles(M);   // fc1 k-part sums, one 1 KB slab per warp and row tile
+    k.g2 = (a.n_slots + nsh) * a.B * a.NS2 + (sh ? 0 : a.s_ns2); k.b2 = 512;
+    // shared fc2: B tables of s_ntp row tiles in smem per pass over the weight stream (1 at M <= 8: sm2 as before)
+    const int s_tab = (s_nch < 8 ? 8 : s_nch) * 256, ntot = g6mx::tiles(M);
+    const int fit = KSH * 256 / s_tab;
+    a.s_ntp = ntot < fit ? ntot : (fit < 1 ? 1 : fit);
+    k.sm2 = static_cast<size_t>(s_tab) * a.s_ntp;
     k.g3 = M * 48; k.b3 = sh ? 160 : 128;            // SH: a fifth finalize warp sums the trellis shared expert
     if (fuse)
     {
@@ -730,16 +775,16 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
 // Device staging [M][6144] BF16 -> fabric send slot (pinned host memory) with 16-byte stores from one CTA:
 // the producers (K1 finalize, dense fc2, o_proj) store 2 or 8 bytes per thread from thousands of threads, which is
 // the access pattern measured as slow on pinned memory. Point io.attn_part / io.mlp_part at
-// Scratch::part[0] / part[1] and copy with this; or point them at the send slot and skip it. grid 1, block 128.
+// Scratch::part[0] / part[1] and copy with this; or point them at the send slot and skip it. grid 1 (M <= 8) or 16 CTAs, block 128.
 struct Put { const uint4* src; uint4* dst; int n16; };      // n16 = M * 6144 * 2 / 16
 __global__ void __launch_bounds__(128) k_put_partial(Put a)
 {
-    for (int i = threadIdx.x; i < a.n16; i += 128) a.dst[i] = a.src[i];
+    for (int i = blockIdx.x * 128 + threadIdx.x; i < a.n16; i += gridDim.x * 128) a.dst[i] = a.src[i];
 }
 inline void put_partial(const uint16_t* staging, void* send_slot, int M, cudaStream_t st)
 {
     const Put a = {reinterpret_cast<const uint4*>(staging), static_cast<uint4*>(send_slot), M * (HID * 2 / 16)};
-    k_put_partial<<<1, 128, 0, st>>>(a);
+    k_put_partial<<<M <= 8 ? 1 : 16, 128, 0, st>>>(a);
 }
 
 // ------------------------------------------------------------------------------------------ one layer of one rank
@@ -817,7 +862,7 @@ inline void warm_proj(const Layer& next, cudaStream_t st, int more = 0)
 inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, const Io& io, Layer& L, int fuse = 0, int split_m = 0)
 {
     L = Layer();
-    if (M < 1 || M > 8) return "M must be 1..8";
+    if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
     L.M = M;
     L.moe = T.t[T_TR3_TAB].p != nullptr;
     L.indexer = T.t[T_IDX_WQ_B].p != nullptr;
@@ -914,7 +959,7 @@ struct Head
 inline const char* make_head(const HeadTensors& T, int rank, int M, const Scratch& sc, const HeadIo& io, Head& H)
 {
     H = Head();
-    if (M < 1 || M > 8) return "M must be 1..8";
+    if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
     if (!vocab_slice(rank, H.vlo, H.vn)) return "rank must be 0..NR-1";
     H.M = M;
     const char* e = nullptr;
@@ -940,12 +985,13 @@ template <class A> inline void head_args(const Head& H, A& a)
 // once per process, before the first launch or graph capture
 inline cudaError_t init()
 {
-    const void* fn[12] = {k1_fn_fc1<false, false, false>(), k1_fn_fused<false, false, false>(),
-                          k1_fn_fc1<true, false, false>(), k1_fn_fused<true, false, false>(),
-                          k1_fn_fc1<false, true, false>(), k1_fn_fused<false, true, false>(),
-                          k1_fn_fc1<true, true, false>(), k1_fn_fused<true, true, false>(),
-                          k1_fn_fc1<true, false, true>(), k1_fn_fused<true, false, true>(),
-                          k1_fn_fc1<true, true, true>(), k1_fn_fused<true, true, true>()};
+    // fc2 too: above 8 rows the shared fc2's s_ntp B tables exceed 48 KB
+    const void* fn[18] = {k1_fn_fc1<false, false, false>(), k1_fn_fused<false, false, false>(), k1_fn_fc2<false, false, false>(),
+                          k1_fn_fc1<true, false, false>(), k1_fn_fused<true, false, false>(), k1_fn_fc2<true, false, false>(),
+                          k1_fn_fc1<false, true, false>(), k1_fn_fused<false, true, false>(), k1_fn_fc2<false, true, false>(),
+                          k1_fn_fc1<true, true, false>(), k1_fn_fused<true, true, false>(), k1_fn_fc2<true, true, false>(),
+                          k1_fn_fc1<true, false, true>(), k1_fn_fused<true, false, true>(), k1_fn_fc2<true, false, true>(),
+                          k1_fn_fc1<true, true, true>(), k1_fn_fused<true, true, true>(), k1_fn_fc2<true, true, true>()};
     for (const void* f : fn)
     {
         const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
