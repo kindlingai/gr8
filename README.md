@@ -179,8 +179,7 @@ multi-session engine, `scripts/launch_s2.sh`), `scripts/launch_tp6.sh` or `scrip
 
 The first boot checks the sha256 of every pack tensor; later boots can skip that with `NOHASH=1`. Useful knobs, all
 environment variables of the launcher: `SESS` (concurrent sessions, default 8), `REUSE=1` (prefix reuse), `DFLASH=0`
-(MTP only), `CAP` (the KV pool). [KNOBS.md](KNOBS.md) has the rest. `PLAIN=1 ./gr8 glm53 up` boots the older one-request
-loop, from a `PLAIN=1 G6_NR=4 scripts/build.sh` build; it is being retired.
+(MTP only), `CAP` (the KV pool). [KNOBS.md](KNOBS.md) has the rest.
 
 Logs are in `$G6_HOME/out/` on each box (`g6m4.r<r>.err`), plus `shim.log` and `front.log` on the head:
 `./gr8 glm53 logs [rank|shim|front|all] [-f]`.

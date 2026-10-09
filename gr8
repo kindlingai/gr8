@@ -65,14 +65,13 @@ launcher() {
     *) return 1 ;;
   esac
 }
-# s2: whether this boot is the multi-session engine (TP=4 without PLAIN=1).
-s2() { [ "$TP" = 4 ] && [ "${PLAIN:-0}" != 1 ]; }
+# s2: whether this boot is the multi-session engine (every TP=4 boot).
+s2() { [ "$TP" = 4 ]; }
 api() { echo "http://127.0.0.1:$PORT"; }
-# dflash: whether the TP=4 launchers load the DFlash2 drafter (their own defaults: launch_s2.sh 1; the plain loop 1
-# unless MTP is set).
+# dflash: whether the TP=4 launcher loads the DFlash2 drafter (DFLASH, default 1).
 dflash() {
   [ "$TP" = 4 ] || return 1
-  if s2; then [ "${DFLASH:-1}" = 1 ]; else [ "${DFLASH:-$([ -n "${MTP:-}" ] && echo 0 || echo 1)}" = 1 ]; fi
+  [ "${DFLASH:-1}" = 1 ]
 }
 
 # --- check: what would stop a boot, before any engine starts -------------------------------------------------------

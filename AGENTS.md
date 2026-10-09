@@ -55,9 +55,9 @@ passes through.
 
 S2 is the served path. At TP=4, `scripts/launch_tp4.sh` runs `scripts/launch_s2.sh` (`g6m4 --s2`, up to `SESS`
 requests at once, DFlash2 for a request that runs alone). A change to decode, prefill or the scheduler is measured
-under S2, and multi-session output must stay byte-identical to each request run alone. `PLAIN=1` (the one-request
-loop) is being retired: do not build new work on it. TP=6 serves one request at a time through
-`scripts/launch_tp6.sh`.
+under S2, and multi-session output must stay byte-identical to each request run alone. The one-request loop is
+retired at TP=4. TP=6 and TP=3 still serve one request at a time through `scripts/launch_tp6.sh` and
+`scripts/launch_tp3.sh`.
 
 Book the nodes on #13 before you boot, and do not boot during someone else's booking.
 

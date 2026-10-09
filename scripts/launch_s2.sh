@@ -1,9 +1,8 @@
 #!/bin/bash
-# Multi-session (S2) boot of the TP4 engine on four Sparks: launch_tp4.sh's engine settings, but g6m4 --s2 (a DEC_S2
-# build: G6_NR=4 scripts/build.sh) serving up to SESS concurrent sessions, driven by frontend/g6s2shim.py instead
-# of --serve / g6shim.py. Stop with scripts/stop.sh.
+# Multi-session (S2) boot of the TP4 engine on four Sparks: g6m4 --s2 (G6_NR=4 scripts/build.sh) serving up to SESS
+# concurrent sessions, driven by frontend/g6s2shim.py. Stop with scripts/stop.sh.
 #   SESS=8 scripts/launch_s2.sh        (scripts/launch_tp4.sh runs this)
-# Knobs (environment), as launch_tp4.sh unless noted:
+# Knobs (environment; KNOBS.md has all of them):
 #   SESS=8            most concurrent sessions (1..8); every reachable step graph is captured at boot (~2.5 GiB at 8)
 #   MTP=2             MTP draft count for sessions that share steps
 #   DFLASH=1          also load the DFlash2 drafter: a session alone at its prompt tail drafts with it (adaptive draft
@@ -11,7 +10,7 @@
 #   CAP, PACKS, PF_OWN (default 4; short prompts take OWN=2, G6_PF_QP_MIN), QP_ROLL, QP_CTX, QP_EARLY,
 #   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end; S2 has no Python front end path here)
 #   S2PORT=7341       the S2 control port on the head
-#   SPEC_ACCEPT=rejection  as launch_tp4.sh: drafts are greedy and accepted by rejection sampling at temperature > 0
+#   SPEC_ACCEPT=rejection  drafts are greedy and accepted by rejection sampling at temperature > 0
 #   REUSE=1           --reuse-prefix: a retired session's caches stay in the pool, and a request that continues its
 #                     prompt + output re-prefills only the rest (exact: whole 4,096-row prefill cells, s2/pool.h)
 set -eu
