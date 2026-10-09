@@ -183,7 +183,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--s2 @HOME/s2', text)
         self.assertIn('--manifest @RANKDIR/rank@R.manifest.json', text)
         self.assertIn('--v2 @V2', text)
-        self.assertIn('V2_WIDTHS.sha256=missing', text)
+        self.assertIn('--v2-widths @V2_WIDTHS', text)
 
     def test_tp6_and_tp3(self):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})

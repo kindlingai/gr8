@@ -55,7 +55,7 @@ engine_args() {
       [ -n "${SPEC_ACCEPT:-}" ] && a="$a --spec-accept $SPEC_ACCEPT"
       a="$a $df" ;;
     *)
-      a="$a --serve $home/serve --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 \
+      a="$a $src --serve $home/serve --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 \
 --pf-lanes 2 --pfv2 $qo"
       [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
       a="$a ${G6ARGS_X:-}" ;;

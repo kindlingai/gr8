@@ -27,7 +27,8 @@ set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box c
 
 The defaults in the launch table come from `scripts/engine_args.sh`. The supervisor and the ssh launchers both read
 it. "TP=4" is the multi-session engine (`--s2`). A dash means that TP does not read the knob. `V2`, `V2_SLICES` and
-`V2_WIDTHS` are paths, so each box may have its own. The handshake compares the sha256 of the `V2_WIDTHS` file instead.
+`V2_WIDTHS` are paths, so each box may have its own. The handshake compares the variant's name and the sha256 of its
+manifest instead.
 
 ## Launch
 
@@ -48,7 +49,9 @@ it. "TP=4" is the multi-session engine (`--s2`). A dash means that TP does not r
 | `QP_CTX` | `CAP` | – | – | `PF_OWN=4`: QO key-table size; a longer request runs OWN=2 |
 | `QP_EARLY` | 1 | – | – | `PF_OWN=4`: send the counterpart's partial before the own rows' o_proj |
 | `PACKS` | `packs` | – | – | where the rank packs are, relative to `G6_HOME` or absolute |
-| `V2`, `V2_SLICES`, `V2_WIDTHS` | unset | – | – | exlr8 v2 experts from their raw width files (`tools/tune/README.md`) |
+| `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
+| `VARIANT` (`--variant`) | `home` | `home` | `home` | the exlr8 v2 width manifest: `home` (3.25 bpw routed experts), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). Without `V2`, only `home` |
+| `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

@@ -201,6 +201,76 @@ def offers(ms, plan):
     return None if len(ok) == tp else ok
 
 
+# The exlr8 v2 variants a release ships, and their mean routed-expert bits per weight.
+VARIANTS = {'home': 3.25, 'down1': 2.25, 'up1': 4.0}
+HALF_BYTES = {k: 384 * 8 * 32 * k for k in (2, 3, 4)}     # one 128-channel half of one projection (tools/convert/v2.py)
+
+
+class Variant:
+    """The exlr8 v2 width manifest a boot loads. path and sha256 are None for packs without v2 widths."""
+
+    def __init__(self, name, path=None):
+        self.name, self.path = name, path
+        self.sha256 = sha256_file(path) if path else None
+
+    def __str__(self):
+        return self.name + (f' ({self.path}, sha256 {self.sha256[:16]})' if self.path else '')
+
+
+def resolve_variant(spec, v2_dir, search):
+    """spec: home, down1, up1 or a manifest path (None: home). v2_dir: the V2 width files, or None for packs without
+    them. search: the directories that hold the model set; exlr8-manifest-<name>.json is looked for in each of them,
+    then in v2_dir, directly or under manifests/."""
+    name = spec or 'home'
+    if not v2_dir:
+        if name == 'home':
+            return Variant('home')
+        raise ModelError(f'--variant {name} needs the exlr8 v2 width files (--v2 DIR --v2-slices DIR): these packs '
+                         'carry one set of expert widths, home')
+    if name not in VARIANTS:
+        if not os.path.isfile(name):
+            raise ModelError(f'--variant {name}: not home, down1 or up1, and no such manifest file')
+        with open(name) as f:
+            label = json.load(f).get('name') or os.path.basename(name)
+        return Variant(label, name)
+    file = f'exlr8-manifest-{name}.json'
+    tried = []
+    for d in [*search, v2_dir]:
+        for p in (os.path.join(d, file), os.path.join(d, 'manifests', file)):
+            tried.append(p)
+            if os.path.isfile(p):
+                return Variant(name, p)
+    raise ModelError(f'--variant {name}: no {file} in ' + ', '.join(dict.fromkeys(os.path.dirname(t) for t in tried)))
+
+
+def model_id(ms, variant):
+    """The id the boxes compare and the engine checks: the set id, joined with the variant's manifest when there is one,
+    so two variants of one set never share an id. The cache keeps the set id: the base packs are the same."""
+    if not variant.sha256:
+        return ms.id
+    return hashlib.sha256(f'{ms.id} {variant.name} {variant.sha256}'.encode()).hexdigest()
+
+
+def expert_gb(path, tp):
+    """GB of routed and shared expert weights on the busiest rank at this TP, under the manifest's widths (half h of
+    expert e in layer l belongs to rank (16e + h + l) mod tp)."""
+    with open(path) as f:
+        layers = json.load(f)['layers']
+    per = [0] * tp
+    for key, e in layers.items():
+        l = int(key)
+        sh = e.get('shared') or 0
+        if isinstance(sh, int):
+            sh = {'gate': [sh] * 16, 'up': [sh] * 16, 'down': sh}
+        rows = [(x, e['gate'][x], e['up'][x], e['down'][x]) for x in range(len(e['down']))]
+        if sh['down']:
+            rows.append((256, sh['gate'], sh['up'], sh['down']))      # the shared expert is e = 256 in the half rule
+        for x, g, u, d in rows:
+            for h in range(16):
+                per[(16 * x + h + l) % tp] += HALF_BYTES[g[h]] + HALF_BYTES[u[h]] + HALF_BYTES[d]
+    return max(per) / 1e9
+
+
 def read_complete(d):
     try:
         with open(os.path.join(d, 'COMPLETE')) as f:

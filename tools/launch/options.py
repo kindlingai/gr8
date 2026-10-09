@@ -62,7 +62,8 @@ KEYS = {
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
     'V2': ('box', None, 'exlr8 v2 width files directory'),
     'V2_SLICES': ('box', None, 'exlr8 v2 index slices'),
-    'V2_WIDTHS': ('box', None, 'exlr8 v2 width manifest (its sha256 is compared)'),
+    'V2_WIDTHS': ('box', None, 'exlr8 v2 width manifest; --variant names one instead'),
+    'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default), down1, up1, or a width manifest path'),
 }
 FLAGS = {'S2PORT': '--s2-port', 'G6_HOME': '--g6-home'}
 # Read from old config files and ignored here, so they do not draw a warning.
@@ -211,9 +212,11 @@ def parse(argv, environ=None):
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
-    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS'):
-        if values.get(k) and not (k == 'MODEL' and looks_remote(values[k])):   # the engine runs in G6_HOME
-            values[k] = os.path.abspath(values[k])
+    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT'):
+        if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or (k == 'VARIANT' and '/' not in values[k]
+                                                                               and not values[k].endswith('.json')):
+            continue
+        values[k] = os.path.abspath(values[k])   # the engine runs in G6_HOME
     return opts
 
 
@@ -239,6 +242,10 @@ def validate(o):
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
                           'them with --g6env-x "NAME=value ..." so every box compares them')
+    if o.get('VARIANT') and o.get('V2_WIDTHS'):
+        raise OptionError('--variant and --v2-widths both name the width manifest: give one')
+    if o.get('V2') and not o.get('V2_SLICES'):
+        raise OptionError('--v2 needs --v2-slices')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at TP=4, and TP=6 and TP=3 never used it: unset it')
     if tp not in ('3', '4', '6'):
@@ -323,8 +330,9 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def canonical(o, plan, members):
-    """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None."""
+def canonical(o, plan, members, variant=None):
+    """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None.
+    variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
     if members:
         c['peers'] = ','.join(members)
@@ -337,8 +345,9 @@ def canonical(o, plan, members):
     # reads itself: the shim's context limit, and which pack files a rank needs.
     for k in ('CAP', 'DFLASH', 'PF_OWN'):
         c[k] = plan['knobs'].get(k, '')
-    if o.get('V2_WIDTHS'):
-        c['V2_WIDTHS.sha256'] = file_sha256(o.get('V2_WIDTHS')) if os.path.isfile(o.get('V2_WIDTHS')) else 'missing'
+    if variant:
+        c['variant'] = variant.name
+        c['variant.sha256'] = variant.sha256 or ''
     c['engine.env'] = ' '.join(sorted(plan['env']))
     c['engine.args'] = ' '.join(plan['args'])
     text = ''.join(f'{k}={c[k]}\n' for k in sorted(c))

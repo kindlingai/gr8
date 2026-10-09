@@ -184,7 +184,8 @@ def cmd_status(argv):
             print(f'rank {r}  {addr}: no supervisor answers ({e})')
             continue
         eng = f'engine running (pid {s["engine_pid"]})' if s.get('engine') else 'engine stopped'
-        line = f'rank {r}  {addr}: {s.get("state")}, {eng}, MemAvailable {s.get("mem_gib")} GiB'
+        line = f'rank {r}  {addr}: {s.get("state")}, {eng}, MemAvailable {s.get("mem_gib")} GiB, ' \
+               f'variant {s.get("variant")}'
         if s.get('last_line'):
             line += f'\n        last log line: {s["last_line"]}'
         if r == 0:
@@ -257,9 +258,10 @@ def local_rank(o):
 
 def cmd_show_config(argv):
     o = parse(argv)
+    ms, variant, err = sv.resolve_model(o)
     plan = opt.engine_plan(o)
     members = opt.resolve_peers(o) if opt.mode(o) == 'peers' else None
-    c, text, digest = opt.canonical(o, plan, members)
+    c, text, digest = opt.canonical(o, plan, members, variant)
     print(f'options ({o.file or "no config file"}; command line > file > environment > default):')
     print(opt.summary(o))
     for w in o.warnings:
@@ -267,11 +269,15 @@ def cmd_show_config(argv):
     print('\ncluster options (the handshake compares these):')
     sys.stdout.write(''.join(f'  {line}\n' for line in text.splitlines()))
     print(f'digest    {digest}')
-    try:
-        ms = modelset.resolve(o.get('MODEL'), o.get('MODEL_CACHE'), int(o.get('TP')), o.get('MODEL_DIR'))
+    if err:
+        print(f'model set none: {err}')
+    else:
         print(f'model set {ms.id} ({ms.source})')
-    except (modelset.ModelError, OSError) as e:
-        print(f'model set none: {e}')
+        print(f'variant   {variant}')
+        if variant.path:
+            print(f'          about {modelset.expert_gb(variant.path, int(o.get("TP"))):.1f} GB of experts on the busiest '
+                  f'rank at TP={o.get("TP")}')
+        print(f'model id  {modelset.model_id(ms, variant)} (the handshake and the engine compare this)')
     print(f'engine    {sv.engine_build(os.path.abspath(o.get("G6_HOME")))} (bin/g6m4 and bin/lib)')
     if members:
         try:
@@ -287,15 +293,17 @@ def cmd_show_config(argv):
 def cmd_check(argv):
     o = parse(argv)
     s = sv.Supervisor(o)
+    s.ms, s.variant, err = sv.resolve_model(o)
     s.tmpl = opt.engine_plan(o)
     try:
-        s.ms = modelset.resolve(o.get('MODEL'), o.get('MODEL_CACHE'), int(o.get('TP')), o.get('MODEL_DIR'))
+        if err:
+            raise RuntimeError(err)
         s.rank = local_rank(o)
-    except (modelset.ModelError, RuntimeError) as e:
+    except RuntimeError as e:
         print(f'FAIL  {e}')
         return 1
     s.build = sv.engine_build(s.home)
-    print(f'model set {s.ms.id[:16]} from {s.ms.source}; ' +
+    print(f'model set {s.ms.id[:16]} from {s.ms.source}, variant {s.variant}; ' +
           (f'rank {s.rank}' if s.rank is not None else 'rank unknown until the mentat election: rank files not checked'))
     fails = s.checks(copy=False)
     for f in fails:

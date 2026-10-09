@@ -64,7 +64,7 @@ def compare(ref, h, peer, have):
                        'build the engine once and copy bin/ to every box')
     if h['set_id'] != ref['set_id']:
         return refusal('model set id', both, lambda x: f'{x["set_id"][:16]} ({x["set_source"]})',
-                       'the boxes hold different models (pack manifests, drafter or tokenizer differ)')
+                       'the boxes hold different models (pack manifests, drafter, tokenizer or variant differ)')
     if h['opts_digest'] != ref['opts_digest']:
         keys = sorted(set(h['opts']) | set(ref['opts']))
         k = next(k for k in keys if h['opts'].get(k) != ref['opts'].get(k))

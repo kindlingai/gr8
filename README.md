@@ -175,8 +175,21 @@ QO packs, the tokenizer files) and its sha256 is the set id the boxes compare. T
 path. Downloading from Hugging Face and preparing from a raw checkpoint inside `up` are not in this version.
 
 The exlr8 experts come from their own width files: fetch them with `tools/tune/fetch_ranks.py`, then boot with
-`--v2 <dir> --v2-slices <dir> --v2-widths <manifest>` (`tools/tune/README.md`). The cache holds the base packs only.
-The width files stay where they are.
+`--v2 <dir> --v2-slices <dir>` (`tools/tune/README.md`). The cache holds the base packs only. The width files stay
+where they are. `--variant` picks the width manifest:
+
+| variant | routed experts |
+|---|---|
+| `home` (the default) | 3.25 bpw, the TR3 checkpoint's widths |
+| `down1` | about 2.25 bpw |
+| `up1` | about 4.0 bpw |
+
+A name means `exlr8-manifest-<name>.json` in the model set, or in the `--v2` directory (directly or under
+`manifests/`). A path is used as it is (`--v2-widths` is the older spelling). The variant's name and manifest hash go
+into the id the boxes compare, so two boxes with different variants refuse to boot together, while the cache keeps one
+copy of the base packs for all variants. Without `--v2`, only `home` is accepted. `up` and `show-config` print the
+expert GB on the busiest rank under the variant's widths. Whether that fits next to the KV pool is up to you: lower
+`--cap` for `up1`.
 
 ## 4. The model cache
 
@@ -249,7 +262,7 @@ environment there. They build the engine command line from the same `scripts/eng
     ./gr8 glm53 smoke
     ./gr8 glm53 bench --tag mine
 
-`status` asks every box's supervisor (its state, engine, MemAvailable, the last log line of a stopped engine), and shows
+`status` asks every box's supervisor (its state, engine, MemAvailable, variant, the last log line of a stopped engine), and shows
 the head's shim, front end and `/health`. `smoke` runs `smoketest/run.sh` against the head's API: cases with answers that can be
 checked (a fact, arithmetic with thinking on and off, streaming, a tool call, logprobs, the context limit), because a
 wrong pack can load cleanly and serve fluent nonsense. Its exit status is the number of failures. `bench` runs

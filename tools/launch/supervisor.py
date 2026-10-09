@@ -90,6 +90,23 @@ def version(home):
     return v
 
 
+def resolve_model(o):
+    """(model set, variant, error): the model set and its exlr8 v2 variant, either None with the reason in error. The
+    variant's manifest becomes V2_WIDTHS, which the engine arguments take."""
+    ms = variant = None
+    try:
+        ms = modelset.resolve(o.get('MODEL'), o.get('MODEL_CACHE'), int(o.get('TP')), o.get('MODEL_DIR'))
+        search = [d for d in (o.get('MODEL'), os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None)
+                  if d and os.path.isdir(d)]
+        spec = o.get('VARIANT') or o.get('V2_WIDTHS')
+        variant = modelset.resolve_variant(spec, o.get('V2'), search)
+        if variant.path:
+            o.values['V2_WIDTHS'] = variant.path
+        return ms, variant, ''
+    except modelset.ModelError as e:
+        return ms, variant, f'model: {e}'
+
+
 def running_engines(proc='/proc'):
     """[(pid, cwd)] of every `g6m4 --rank` process on this box, wherever it was started from."""
     out = []
@@ -144,7 +161,7 @@ class Supervisor:
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
-        self.offers = None
+        self.offers = self.variant = self.model_id = None
         self.lingered = False
 
     # ---- state ----------------------------------------------------------------------------------------------------
@@ -222,7 +239,8 @@ class Supervisor:
     def status(self):
         pid = read_pid(os.path.join(self.out, 'g6m4.pid'))
         s = {'t': 'status', 'rank': self.rank, 'lan': self.lan, 'state': self.state, 'engine_pid': pid,
-             'engine': bool(pid and alive(pid)), 'mem_gib': mem_available_gib(), 'home': self.home}
+             'engine': bool(pid and alive(pid)), 'mem_gib': mem_available_gib(), 'home': self.home,
+             'variant': self.variant.name if self.variant else None, 'model_id': self.model_id}
         if s['engine'] is False:
             err = os.path.join(self.out, f'g6m4.r{self.rank}.err')
             s['last_line'] = tail(err, 1).strip()
@@ -269,23 +287,29 @@ class Supervisor:
         log(f'gr8 {version(self.home)}, options ({o.file or "no config file"}; command line > file > environment > default):')
         log(opt.summary(o))
         tp = int(o.get('TP'))
-        self.tmpl = opt.engine_plan(o)
-        try:   # a box that cannot resolve its model still joins, so every box hears why the boot stops
-            self.ms = modelset.resolve(o.get('MODEL'), o.get('MODEL_CACHE'), tp, o.get('MODEL_DIR'))
-            log(f'model set {self.ms.id[:16]} from {self.ms.source}')
-        except modelset.ModelError as e:
-            self.model_error = f'model: {e}'
+        # a box that cannot resolve its model still joins, so every box hears why the boot stops
+        self.ms, self.variant, self.model_error = resolve_model(o)
+        if self.model_error:
+            self.ms = None
             log(self.model_error)
+        else:
+            self.model_id = modelset.model_id(self.ms, self.variant)
+            log(f'model set {self.ms.id[:16]} from {self.ms.source}, variant {self.variant}, id {self.model_id[:16]}')
+            if self.variant.path:
+                log(f'variant {self.variant.name}: about {modelset.expert_gb(self.variant.path, tp):.1f} GB of experts '
+                    f'on the busiest rank at TP={tp}')
+        self.tmpl = opt.engine_plan(o)
         self.build = engine_build(self.home)
         self.offers = modelset.offers(self.ms, self.tmpl) if self.ms else []
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
-        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None)
+        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant)
         self.opts, self.digest = c, digest
         log(f'rank {self.rank} of {tp} ({self.lan}, rails {self.rails[0]} {self.rails[1]}), cluster options '
             f'{digest[:16]}, engine {self.build[:16]}')
         if self.agent:
-            self.agent.set_meta(**{'gr8.set': self.ms.id if self.ms else 'none', 'gr8.opts': digest,
+            self.agent.set_meta(**{'gr8.set': self.model_id or 'none', 'gr8.variant': str(self.variant or ''),
+                                   'gr8.opts': digest,
                                    'gr8.ips': ','.join(self.rails)})
         self.serve([a for a in (self.lan, *self.rails) if a])
         self.set_state('preparing')
@@ -294,7 +318,8 @@ class Supervisor:
             log(f'check failed: {f}')
         hello = {'t': 'hello', 'proto': handshake.PROTO, 'rank': self.rank, 'lan': self.lan, 'members': self.members,
                  'rails': list(self.rails), 'home': self.home, 'opts': c, 'opts_digest': digest,
-                 'set_id': self.ms.id if self.ms else 'none', 'set_source': self.ms.source if self.ms else self.model_error,
+                 'set_id': self.model_id or 'none',
+                 'set_source': f'{self.ms.source}, variant {self.variant}' if self.ms else self.model_error,
                  'engine_build': self.build, 'fails': fails, 'version': version(self.home),
                  'offers': mentat.format_offers(self.offers)}
         self.set_state('handshake')
@@ -384,8 +409,6 @@ class Supervisor:
         for pid, cwd in running_engines():
             if pid != p:
                 fails.append(f'a g6m4 --rank process is running (pid {pid}, cwd {cwd}): stop it first')
-        if o.get('V2_WIDTHS') and not os.path.isfile(o.get('V2_WIDTHS')):
-            fails.append(f'V2_WIDTHS {o.get("V2_WIDTHS")} is missing')
         if o.get('CHECK') == '0':
             return fails
         if self.build == 'missing':
@@ -419,7 +442,8 @@ class Supervisor:
                 self.head.decide({'t': 'ok', 'epoch': int(time.time()), 'members': self.members,
                                   'ips': [have[r]['rails'][0] for r in range(tp)],
                                   'ips2': [have[r]['rails'][1] for r in range(tp)],
-                                  'homes': {str(r): have[r]['home'] for r in range(tp)}, 'set_id': self.ms.id,
+                                  'homes': {str(r): have[r]['home'] for r in range(tp)}, 'set_id': self.model_id,
+                                  'variant': self.variant.name,
                                   'opts_digest': self.digest, 's2port': self.tmpl['knobs'].get('S2PORT'),
                                   'fabric_port': opt.FABRIC_PORT, 'tp': tp, 'port': self.o.get('PORT')})
         elif self.stop_ev.is_set():
@@ -480,7 +504,7 @@ class Supervisor:
     def boot(self):
         o, hs, r, tp = self.o, self.hs, self.rank, int(self.o.get('TP'))
         plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.rank_dir(r), aux_dir=self.ms.rank_dir(r), home=self.home,
-                               epoch=hs['epoch'], set_id=self.ms.id)
+                               epoch=hs['epoch'], set_id=self.model_id)
         work = 's2' if plan['s2'] else 'serve'
         for d in ('s2', 'serve'):
             shutil.rmtree(os.path.join(self.home, d), ignore_errors=True)

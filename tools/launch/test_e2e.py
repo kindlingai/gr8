@@ -198,6 +198,34 @@ class EndToEnd(unittest.TestCase):
         for h in self.homes:
             self.assertFalse(os.path.exists(os.path.join(h, 'out', 'stub.json')))   # no engine started
 
+    def v2(self):
+        """A stand-in exlr8 v2 directory: the stub engine never reads it, so the manifests are enough."""
+        from test_variant import manifest
+        d = os.path.join(self.t, 'v2')
+        for name, w in (('home', 3), ('down1', 2), ('up1', 4)):
+            manifest(os.path.join(d, 'manifests', f'exlr8-manifest-{name}.json'), name, w)
+        return ['--v2', d, '--v2-slices', d]
+
+    def test_a_variant_mismatch_stops_every_box(self):
+        v2 = self.v2()
+        res = self.up_all(extra={i: v2 + (['--variant', 'down1'] if i == 2 else []) for i in range(TP)})
+        for i, (rc, out) in enumerate(res):
+            self.assertEqual(rc, 4, f'box {i}:\n{out}')
+            self.assertIn('handshake refused: model set id', out)
+            self.assertIn('variant down1 (', out)
+            self.assertIn('variant home (', out)
+        self.assertIn('about 0.6 GB of experts on the busiest rank at TP=4', res[2][1])
+
+    def test_a_variant_boots_with_its_widths(self):
+        v2 = self.v2()
+        res = self.up_all(extra={i: v2 + ['--variant', 'up1'] for i in range(TP)})
+        for i, (rc, out) in enumerate(res):
+            self.assertEqual(rc, 0, f'box {i}:\n{out}')
+        a = self.stub(3)['argv']
+        self.assertEqual(a[a.index('--v2-widths') + 1], os.path.join(self.t, 'v2', 'manifests', 'exlr8-manifest-up1.json'))
+        st = self.gr8(1, 'status')
+        self.assertEqual(st.stdout.count('variant up1'), TP, st.stdout)
+
     def test_a_missing_shard_fails_the_handshake(self):
         os.unlink(os.path.join(self.packs, 'dflash.r3.pack'))
         res = self.up_all()
