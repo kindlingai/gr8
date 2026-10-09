@@ -175,9 +175,11 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
     __shared__ int s_item;
     const int t = threadIdx.x;
     const int plan = A.ctl[0];
-    const int u1 = A.B * 2 * A.KS1, n1 = (A.n_slots + k1_nsh<SH>(A)) * u1;         // fc1 units per slot, routed (+ SH shared) fc1 items
+    // items for the plan's own slots only (A.n_slots is the capacity, M x 8): the slots past them were empty items
+    const int nsl = A.n_slots_dev[plan] + k1_nsh<SH>(A);
+    const int u1 = A.B * 2 * A.KS1, n1 = nsl * u1;                     // fc1 units per slot, routed (+ SH shared) fc1 items
     const int sh1 = SH ? 0 : (A.s_nch + A.s_cw - 1) / A.s_cw;           // shared fc1 CTAs (s_* records)
-    const int u2 = A.B * A.NS2, n2 = (A.n_slots + k1_nsh<SH>(A)) * u2;             // fc2 units per slot, routed (+ SH shared) fc2 items
+    const int u2 = A.B * A.NS2, n2 = nsl * u2;                          // fc2 units per slot, routed (+ SH shared) fc2 items
     const int total = n1 + sh1 + n2 + (SH ? 0 : A.s_ns2);
     int* done = A.fctl + 1;
     int* sdone = A.fctl + 1 + SMAX * g6nr::EB;
@@ -227,14 +229,17 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
         }
         __syncthreads();                                                // smem and s_item are reused
     }
+    __shared__ int s_last;
     if (t == 0)
     {
         __threadfence();
-        if (atomicAdd(A.fctl + FCTL_N - 1, 1) == static_cast<int>(gridDim.x) - 1)
-        {
-            for (int i = 0; i < FCTL_N; ++i) A.fctl[i] = 0;
-            __threadfence();
-        }
+        s_last = atomicAdd(A.fctl + FCTL_N - 1, 1) == static_cast<int>(gridDim.x) - 1;
+    }
+    __syncthreads();
+    if (s_last)                                                          // the last CTA zeroes the counters, all its threads
+    {
+        for (int i = t; i < FCTL_N; i += blockDim.x) A.fctl[i] = 0;
+        __threadfence();
     }
 #if DEC_SLOT >= 2
     if (A.slot.send && A.s_direct) dslot::publish(A.slot, true);

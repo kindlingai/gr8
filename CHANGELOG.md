@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-09: fused K1 schedules only the plan's slots (#8)
+
+- The fused K1 kernel handed out items for M x 8 slots (the capacity) and ran the empty ones (fence, barrier, counter)
+  for slots past the plan's experts; it now hands out the plan's own slots (`n_slots_dev`). The last CTA zeroes the
+  counters with all its threads instead of one. Same work per real item. Experts per step at one session: 14.49 ->
+  14.21 ms at 1 row, 29.55 -> 29.22 ms at 3 rows; isolated K1 at 4-8 rows 220 -> 227 GB/s.
+
+
 ## 2026-10-09: multi-tile GEMVs at up to 128 registers (#75)
 
 - The dense GEMVs above 8 rows (S2 batches) ran a 1024-thread-bound kernel, capped at 64 registers: the INT4 o_proj and
