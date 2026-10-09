@@ -374,6 +374,66 @@ __global__ void value_project_m(Input input,int start,int n,const float* context
             for(int m=0;m<16;m++)sum=fmaf(ctx[row][lane+32*m],u[m],sum);
             sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)(start+c+row)*a.heads+h)*256+d]=__float2half_rn(sum);}}
 }
+// G6_AVP1=1 (default off; tp3-avp-onelaunch): one launch for any n, weights in registers, rows staged AVP_STAGE at a time.
+constexpr int AVP_STAGE=8;
+template<class Input>
+__global__ void absorb_m1(Input input,int start,int n,float* q,float* rope){
+    auto a=resolve(input);if(!a.active)return;
+    const int h=blockIdx.y,d=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;
+    __shared__ float qb[AVP_STAGE][192];
+    {const int m=min(AVP_STAGE,n);
+     for(int i=t;i<m*192;i+=256){int row=i/192,k=i%192;qb[row][k]=hfloat(a.q_b,((int64_t)(start+row)*a.heads+h)*256+k);}}
+    float u[6];
+    #pragma unroll
+    for(int m=0;m<6;m++)u[m]=bfloat(a.uk,((int64_t)h*512+d)*192+lane+32*m);
+    for(int r0=0;r0<n;r0+=AVP_STAGE){const int m=min(AVP_STAGE,n-r0);
+        if(r0){__syncthreads();
+            for(int i=t;i<m*192;i+=256){int row=i/192,k=i%192;qb[row][k]=hfloat(a.q_b,((int64_t)(start+r0+row)*a.heads+h)*256+k);}}
+        __syncthreads();
+        for(int row=0;row<m;row++){float sum=0;
+            #pragma unroll
+            for(int k=0;k<6;k++)sum=fmaf(qb[row][lane+32*k],u[k],sum);
+            sum=warp_sum(sum);if(lane==0)q[((int64_t)(r0+row)*a.heads+h)*512+d]=sum;}
+    }
+    if(threadIdx.x<32)for(int row=blockIdx.x;row<n;row+=gridDim.x){int r=start+row;float c,s;RCS(a.positions[r],threadIdx.x,c,s);int j=threadIdx.x;
+        float x=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+192+2*j),y=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+193+2*j);
+        rope[((int64_t)row*a.heads+h)*64+2*j]=x*c-y*s;rope[((int64_t)row*a.heads+h)*64+2*j+1]=y*c+x*s;}
+}
+template<class Input>
+__global__ void value_project_m1(Input input,int start,int n,const float* context){
+    auto a=resolve(input);if(!a.active)return;
+    const int h=blockIdx.y,d=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;
+    __shared__ __align__(16) float ctx[AVP_STAGE][512];
+    {const int m=min(AVP_STAGE,n);
+     for(int i=t;i<m*128;i+=256){int row=i/128,k=(i%128)*4;*(float4*)&ctx[row][k]=*(const float4*)&context[((int64_t)row*a.heads+h)*512+k];}}
+    float u[16];
+    #pragma unroll
+    for(int m=0;m<16;m++)u[m]=bfloat(a.uv,((int64_t)h*256+d)*512+lane+32*m);
+    for(int r0=0;r0<n;r0+=AVP_STAGE){const int m=min(AVP_STAGE,n-r0);
+        if(r0){__syncthreads();
+            for(int i=t;i<m*128;i+=256){int row=i/128,k=(i%128)*4;*(float4*)&ctx[row][k]=*(const float4*)&context[((int64_t)(r0+row)*a.heads+h)*512+k];}}
+        __syncthreads();
+        float out[AVP_STAGE];
+        if(m==AVP_STAGE){
+            #pragma unroll
+            for(int row=0;row<AVP_STAGE;row++){float sum=0;
+                #pragma unroll
+                for(int k=0;k<16;k++)sum=fmaf(ctx[row][lane+32*k],u[k],sum);out[row]=sum;}
+            #pragma unroll
+            for(int row=0;row<AVP_STAGE;row++)out[row]=warp_sum(out[row]);
+        }else{
+            #pragma unroll
+            for(int row=0;row<AVP_STAGE;row++)if(row<m){float sum=0;
+                #pragma unroll
+                for(int k=0;k<16;k++)sum=fmaf(ctx[row][lane+32*k],u[k],sum);out[row]=warp_sum(sum);}
+        }
+        if(lane==0){
+            #pragma unroll
+            for(int row=0;row<AVP_STAGE;row++)if(row<m)((half*)a.output)[((int64_t)(start+r0+row)*a.heads+h)*256+d]=__float2half_rn(out[row]);}
+    }
+}
+// Host-side, read once (first decode call precedes graph capture). Tests may assign it.
+static int& avp1_on(){static int v=[]{const char* e=getenv("G6_AVP1");return e&&atoi(e)?1:0;}();return v;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
     half* iq;int *ii,*io,*offsets;uint64_t* selected;SelectionState* selection;int* histogram;void* temp;size_t temp_bytes,total;
@@ -495,6 +555,10 @@ static bool launch_value_project_rows(const G6Attn& a,Input input,Work& w,int st
 }
 #endif
 template<class Input>
+static void launch_absorb_m1(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){absorb_m1<<<dim3(64,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);}
+template<class Input>
+static void launch_value_project_m1(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){value_project_m1<<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);}
+template<class Input>
 static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream){
     cudaError_t e;
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);
@@ -503,7 +567,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
             e=SELECT_INDEX(a,input,w,start,n,stream);if(e!=cudaSuccess)return e;}
         AMARK(2);
 #if defined(DEC_AVP) && DEC_AVP
-        if(launch_absorb_rows(a,input,w,start,n,stream)){}else
+        if(avp1_on())launch_absorb_m1(a,input,w,start,n,stream);else if(launch_absorb_rows(a,input,w,start,n,stream)){}else
 #endif
         ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,start,w.q,w.rope);
         AMARK(3);
@@ -516,7 +580,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
         AMARK(7);
 #if defined(DEC_AVP) && DEC_AVP
-        if(launch_value_project_rows(a,input,w,start,n,stream)){}else
+        if(avp1_on())launch_value_project_m1(a,input,w,start,n,stream);else if(launch_value_project_rows(a,input,w,start,n,stream)){}else
 #endif
         ga::value_project<<<dim3(32,a.heads,n),256,0,stream>>>(input,start,w.context);
         AMARK(8);
@@ -583,7 +647,7 @@ template<class Input>
 static cudaError_t cp_front_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream){
     const int n=a.rows;
 #if defined(DEC_AVP) && DEC_AVP
-    if(launch_absorb_rows(a,input,w,0,n,stream)){}else
+    if(avp1_on())launch_absorb_m1(a,input,w,0,n,stream);else if(launch_absorb_rows(a,input,w,0,n,stream)){}else
 #endif
     ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,0,w.q,w.rope);
     return cudaGetLastError();
@@ -622,7 +686,7 @@ static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const floa
     const int n=a.rows;
     cp_lse<<<n*a.heads,256,0,stream>>>(input,part_all,w.context);
 #if defined(DEC_AVP) && DEC_AVP
-    if(launch_value_project_rows(a,input,w,0,n,stream)){}else
+    if(avp1_on())launch_value_project_m1(a,input,w,0,n,stream);else if(launch_value_project_rows(a,input,w,0,n,stream)){}else
 #endif
     ga::value_project<<<dim3(32,a.heads,n),256,0,stream>>>(input,0,w.context);
     return cudaGetLastError();

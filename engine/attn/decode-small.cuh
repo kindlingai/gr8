@@ -120,6 +120,7 @@ __global__ void index_scores(Input input,int start,const half* q,const float* we
  if(t<32&&t0+t<a.context){float score=0;for(int h=0;h<32;h++)score+=fmaxf(products[h*32+t],0.f)*weights[row*32+h];score*=scales[t];if(t0+t>a.positions[r]||!CP_MINE(a,t0+t))score=-INFINITY;else if(!isfinite(score)){ga::error(a,4);score=-INFINITY;}scores[(int64_t)row*a.context+t0+t]=score;ids[(int64_t)row*a.context+t0+t]=t0+t;}
 }
 }
+#include "decode-flip.cuh"
 static bool use_small_decode(const G6Attn& a){return a.rows<=3&&a.context<=2048;}
 // Sparse MLA consumes exactly TOP selected logical IDs, not a.context keys.
 // Keep fresh-index dispatch unchanged; widen only decode/verify reuse rows.
@@ -129,6 +130,25 @@ static bool use_fixed_k_decode(const G6Attn& a){
  #endif
  return use_small_decode(a)||(a.reuse_indices&&a.rows<=8);
 }
+// G6_ATTN_FLIP=1 (default off; design-review delta). Attention-only dispatch, launch_index_scores is untouched.
+// Eligible = n 1..8, heads 1..22, and either the release fixed-K request (small decode or reuse rows <= 8, or a batched
+// S2 step) or a genuine fresh decode request (a.rows <= 3). Eligible at context >= G6_ATTN_FLIP_MIN (default 2048, the
+// GB10 sweep: byte-identical and <= 0.9x cold+hot for M=1..3 from 2048 up): scores_flip<11>, context_flip M=1 HG=4 D=128
+// CB=32 / M>=2 HG=11 D=128 CB=16. The flip is chosen before the head-batched kernels (attn_heads), which stay the default
+// and serve every call the flip does not take. Under G6_ATTN_HEADS=0, a fresh decode request below the minimum runs the
+// fixed-K HG=1 forms, and requests whose reference is the generic context_parts keep scalar e4() (GENERIC_E4); with the
+// head-batched kernels as the reference every request uses fp8_pair. Scores need no mode: latent(v,d) is literally
+// e4(v[d])*scale[d/128]. Off = the dispatch below, unchanged.
+// Host-side, read once (set before graph capture); attn_flip_min() < 0 = off. Tests may assign it.
+static int& attn_flip_min(){static int v=[]{const char* e=getenv("G6_ATTN_FLIP");if(!e||!atoi(e))return -1;
+ const char* m=getenv("G6_ATTN_FLIP_MIN");return m&&*m?atoi(m):2048;}();return v;}
+// G6_ATTN_D256=1 (default off; only with G6_ATTN_FLIP): context M=1 HG4 D256 CB16, M>=2 HG8 D256 CB16 + idok dead-slot skip.
+// Host-side, read once (set before graph capture). Tests may assign it.
+static int& attn_flip_d256(){static int v=[]{const char* e=getenv("G6_ATTN_D256");return e&&atoi(e)?1:0;}();return v;}
+static bool attn_flip_eligible(const G6Attn& a,int n){
+ return attn_flip_min()>=0&&n>=1&&n<=8&&a.heads>=1&&a.heads<=22&&(use_fixed_k_decode(a)||(a.rows>0&&a.rows<=3));}
+static bool use_attn_flip(const G6Attn& a,int n){return attn_flip_eligible(a,n)&&a.context>=attn_flip_min();}
+static bool use_long_fixed_k(const G6Attn& a,int n){return attn_flip_eligible(a,n)&&!use_fixed_k_decode(a);}
 template<class Input>
 static void launch_index_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
  if(use_small_decode(a))small_decode::index_scores<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,w.iq,w.weights,w.si,w.ii);
@@ -141,17 +161,34 @@ static bool attn_heads(){static const bool on=!getenv("G6_ATTN_HEADS")||atoi(get
 // index and contexts past 2048 included.
 template<class Input>
 static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
- if(attn_heads()){constexpr int HG=16;small_decode::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
+ if(use_attn_flip(a,n))small_decode::scores_flip<Input,11><<<dim3(TOP/8,(a.heads+10)/11,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else if(attn_heads()){constexpr int HG=16;small_decode::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
+ else if(use_long_fixed_k(a,n))small_decode::scores_flip<Input,1><<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else if(use_fixed_k_decode(a))small_decode::scores_direct<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
 }
 template<class Input>
 static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ if(use_attn_flip(a,n)){const bool fk=use_fixed_k_decode(a),ge4=!fk&&!attn_heads();   // ge4: the reference is the generic context_parts
+  if(attn_flip_d256()){
+   if(n==1){if(!ge4)small_decode::context_flip<Input,4,256,16,false,false><<<dim3(PART*2,(a.heads+3)/4,n),128,0,st>>>(input,start,w.prob,w.parts);
+    else small_decode::context_flip<Input,4,256,16,true,false><<<dim3(PART*2,(a.heads+3)/4,n),128,0,st>>>(input,start,w.prob,w.parts);}
+   else{if(!ge4)small_decode::context_flip<Input,8,256,16,false,true><<<dim3(PART*2,(a.heads+7)/8,n),128,0,st>>>(input,start,w.prob,w.parts);
+    else small_decode::context_flip<Input,8,256,16,true,true><<<dim3(PART*2,(a.heads+7)/8,n),128,0,st>>>(input,start,w.prob,w.parts);}
+  }else if(!ge4){
+   if(n==1)small_decode::context_flip<Input,4,128,32,false><<<dim3(PART*4,(a.heads+3)/4,n),64,0,st>>>(input,start,w.prob,w.parts);
+   else small_decode::context_flip<Input,11,128,16,false><<<dim3(PART*4,(a.heads+10)/11,n),64,0,st>>>(input,start,w.prob,w.parts);
+  }else{
+   if(n==1)small_decode::context_flip<Input,4,128,32,true><<<dim3(PART*4,(a.heads+3)/4,n),64,0,st>>>(input,start,w.prob,w.parts);
+   else small_decode::context_flip<Input,11,128,16,true><<<dim3(PART*4,(a.heads+10)/11,n),64,0,st>>>(input,start,w.prob,w.parts);
+  }
+  return;}
  if(attn_heads()){
   // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
   else{constexpr int HG=4;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
   return;}
+ if(use_long_fixed_k(a,n)){small_decode::context_flip<Input,1,256,8,true><<<dim3(PART*2,a.heads,n),128,0,st>>>(input,start,w.prob,w.parts);return;}
  #if defined(DEC_CPB) && DEC_CPB
  if(use_fixed_k_decode(a))small_decode::context_parts_cpb<<<dim3(PART*2,a.heads,n),128,0,st>>>(input,start,w.prob,w.parts);
  #else

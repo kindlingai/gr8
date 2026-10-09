@@ -23,7 +23,9 @@ template<class F> static float timed(cudaStream_t st,int reps,F body){
 }
 int main(int argc,char** argv){
     if(argc<5){fprintf(stderr,"usage: idxbench T L M cp_nr [reps]\n");return 2;}
-    const int T=atoi(argv[1]),L=atoi(argv[2]),M=atoi(argv[3]),cp=atoi(argv[4]),reps=argc>5?atoi(argv[5]):50,ties=argc>6?atoi(argv[6]):0;
+    const int T=atoi(argv[1]),L=atoi(argv[2]),M=atoi(argv[3]),cp=atoi(argv[4]),reps=argc>5?atoi(argv[5]):50,ties=argc>6?atoi(argv[6]):0,HH=argc>7?atoi(argv[7]):0,REUSE=argc>8?atoi(argv[8]):0,ADV=argc>9?atoi(argv[9]):0,TILE=argc>10?atoi(argv[10]):0;
+    // FLIPCHK extras: HH heads (0 = g6nr::HMAX), REUSE=1 marks the request as index reuse (fixed-K up to 8 rows),
+    // ADV=1 adversarial (dead/future IDs, all-dead row 0 when M>1, signed-zero probs), TILE=k launches in k-row tiles (start>0)
     if(L>T||M<1||M>8){fprintf(stderr,"bad sizes\n");return 2;}
     std::mt19937 rng(31);
     const int pages=(T+63)/64;
@@ -42,7 +44,7 @@ int main(int argc,char** argv){
     CK(cudaMalloc(&dpos,M*4));CK(cudaMemcpy(dpos,pos.data(),M*4,cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dtab,pages*4));CK(cudaMemcpy(dtab,table.data(),pages*4,cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dind,(size_t)M*ga::TOP*4));CK(cudaMalloc(&derr,4));CK(cudaMemset(derr,0,4));
-    G6Attn a{};a.rows=M;a.heads=g6nr::HMAX;a.context=T;a.page_size=64;a.page_count=a.table_size=pages;a.query_tile=M;
+    G6Attn a{};a.rows=M;a.heads=HH?HH:g6nr::HMAX;a.context=T;a.page_size=64;a.page_count=a.table_size=pages;a.query_tile=M;
     a.index_q=dq;a.index_weight=dw;a.index_cache=dcache;a.positions=dpos;a.block_table=dtab;a.indices=dind;a.error=derr;
 #if defined(G6_CP) && G6_CP
     a.cp_nr=cp;a.cp_rank=0;
@@ -105,13 +107,52 @@ int main(int argc,char** argv){
         float *dqa,*part;CK(cudaMalloc(&dqa,qh.size()*4));CK(cudaMemcpy(dqa,qh.data(),qh.size()*4,cudaMemcpyHostToDevice));
         CK(cudaMalloc(&part,((size_t)M*H*514+4)*4));
         G6Attn b=a;b.mla_cache=mla;
-        ga::ReplayInput in2{b,dcell};auto W2=W;W2.q=dqa;W2.rope=dqa+(size_t)M*H*512;
+        ga::ReplayInput in2{b,dcell};(void)0;auto W2=W;W2.q=dqa;W2.rope=dqa+(size_t)M*H*512;
         float t_rep=timed(st,reps,[&]{ga::launch_mla_scores(b,in2,W2,0,M,st);ga::normalize<<<M*H,256,0,st>>>(in2,W2.prob);
             ga::launch_context_parts(b,in2,W2,0,M,st);ga::merge_parts<<<M*H,256,0,st>>>(in2,W2.parts,W2.context);});
         float t_cp=0;
 #if defined(G6_CP) && G6_CP
         if(cp)t_cp=timed(st,reps,[&]{for(int g=0;g<cp;g++)CK(ga::cp_group_body(b,in2,W2,W2.q,W2.rope,part,st));});
 #endif
+        {   // FLIPCHK (release gate): G6_ATTN_FLIP off vs on through the engine dispatch. Per mode: re-run the
+            // index select (IDs in order), then launch_mla_scores (raw QK) -> normalize (probs) -> launch_context_parts
+            // (all 8 partials) -> merge_parts (context). Every byte must match. Exit 4 on any difference.
+            if(REUSE){b.reuse_indices=dind;b.reuse_rows=M;}
+            in2=ga::ReplayInput{b,dcell};
+            const size_t ns=(size_t)M*H*ga::TOP,np=(size_t)M*H*ga::PART*512,nc=(size_t)M*H*512,ni=(size_t)M*ga::TOP;
+            std::vector<int> adv_ids;
+            if(ADV){   // derived once from the OFF selection, applied identically in both modes
+                CK(cudaStreamSynchronize(st));timed(st,1,[&]{ga::prep_index<<<dim3(M,32),128,0,st>>>(in,0,W.iq,W.weights);ga::launch_index_scores(a,in,W,0,M,st);});
+                CK(ga::select_index(a,in,W,0,M,st));CK(cudaStreamSynchronize(st));adv_ids.resize(ni);CK(cudaMemcpy(adv_ids.data(),dind,ni*4,cudaMemcpyDeviceToHost));
+                std::mt19937 r2(7);for(int r=0;r<M;r++)for(int j=0;j<ga::TOP;j++){int& v=adv_ids[(size_t)r*ga::TOP+j];unsigned u=r2()%100;
+                    if(M>1&&r==0)v=-1;else if(u<5)v=-1;else if(u<8)v=pos[r]+1+(int)(r2()%7);}}
+            auto zap=[&]{if(!ADV)return;std::vector<float> pr(ns);CK(cudaStreamSynchronize(st));CK(cudaMemcpy(pr.data(),W2.prob,ns*4,cudaMemcpyDeviceToHost));
+                for(size_t i=0;i<ns;i++)if(i%29==3)pr[i]=-0.0f;CK(cudaMemcpy(W2.prob,pr.data(),ns*4,cudaMemcpyHostToDevice));};
+            auto chain=[&](bool z){const int tl=TILE?TILE:M;for(int s0_=0;s0_<M;s0_+=tl){int n=std::min(tl,M-s0_);ga::launch_mla_scores(b,in2,W2,s0_,n,st);}
+                ga::normalize<<<M*H,256,0,st>>>(in2,W2.prob);if(z)zap();
+                for(int s0_=0;s0_<M;s0_+=tl){int n=std::min(tl,M-s0_);ga::launch_context_parts(b,in2,W2,s0_,n,st);}
+                ga::merge_parts<<<M*H,256,0,st>>>(in2,W2.parts,W2.context);};
+            auto run=[&](int mode,std::vector<int>& id,std::vector<float>& sc,std::vector<float>& pb,std::vector<float>& pa,std::vector<float>& cx){ga::attn_flip_min()=mode;
+                CK(cudaMemset(dind,0xff,ni*4));CK(cudaMemset(W2.prob,0xab,ns*4));CK(cudaMemset(W2.parts,0xab,np*4));CK(cudaMemset(W2.context,0xab,nc*4));
+                ga::prep_index<<<dim3(M,32),128,0,st>>>(in,0,W.iq,W.weights);ga::launch_index_scores(a,in,W,0,M,st);CK(ga::select_index(a,in,W,0,M,st));
+                CK(cudaStreamSynchronize(st));id.resize(ni);CK(cudaMemcpy(id.data(),dind,ni*4,cudaMemcpyDeviceToHost));
+                if(ADV)CK(cudaMemcpy(dind,adv_ids.data(),ni*4,cudaMemcpyHostToDevice));
+                const int tl=TILE?TILE:M;for(int s0_=0;s0_<M;s0_+=tl){int n=std::min(tl,M-s0_);ga::launch_mla_scores(b,in2,W2,s0_,n,st);}
+                CK(cudaStreamSynchronize(st));sc.resize(ns);CK(cudaMemcpy(sc.data(),W2.prob,ns*4,cudaMemcpyDeviceToHost));
+                ga::normalize<<<M*H,256,0,st>>>(in2,W2.prob);zap();CK(cudaStreamSynchronize(st));pb.resize(ns);CK(cudaMemcpy(pb.data(),W2.prob,ns*4,cudaMemcpyDeviceToHost));
+                for(int s0_=0;s0_<M;s0_+=tl){int n=std::min(tl,M-s0_);ga::launch_context_parts(b,in2,W2,s0_,n,st);}
+                ga::merge_parts<<<M*H,256,0,st>>>(in2,W2.parts,W2.context);
+                CK(cudaStreamSynchronize(st));pa.resize(np);cx.resize(nc);CK(cudaMemcpy(pa.data(),W2.parts,np*4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(cx.data(),W2.context,nc*4,cudaMemcpyDeviceToHost));};
+            const int saved=ga::attn_flip_min();std::vector<int> i0f,i1f;std::vector<float> s0f,b0f,p0f,c0f,s1f,b1f,p1f,c1f;
+            run(-1,i0f,s0f,b0f,p0f,c0f);run(0,i1f,s1f,b1f,p1f,c1f);
+            auto nd_=[](const auto& x,const auto& y){size_t k=0;for(size_t i=0;i<x.size();i++)k+=memcmp(&x[i],&y[i],4)!=0;return k;};
+            size_t di=nd_(i0f,i1f),ds=nd_(s0f,s1f),dq=nd_(b0f,b1f),dp=nd_(p0f,p1f),dc=nd_(c0f,c1f),nz=0;for(float v:b0f)nz+=(v==0&&std::signbit(v));
+            ga::attn_flip_min()=-1;float toff=timed(st,reps,[&]{chain(false);});ga::attn_flip_min()=0;const int elig=(int)ga::attn_flip_eligible(b,TILE?TILE:M);float ton=timed(st,reps,[&]{chain(false);});ga::attn_flip_min()=saved;
+            const bool bad_=di||ds||dq||dp||dc;
+            printf("FLIPCHK T=%d L=%d M=%d heads=%d reuse=%d adv=%d tile=%d relFixedK=%d flipEligible=%d | ids=%zu qk=%zu probs=%zu parts=%zu ctx=%zu (negzero probs %zu) | %s | off %.1f us on %.1f us\n",
+                T,L,M,H,REUSE,ADV,TILE,(int)ga::use_fixed_k_decode(b),elig,di,ds,dq,dp,dc,nz,bad_?"DIFFER":"IDENTICAL",toff,ton);
+            if(bad_)return 4;
+        }
         printf("ATTN T=%d L=%d M=%d cp=%d heads=%d | replicated attention %.1f us | cp groups x%d %.1f us\n",T,L,M,cp,H,t_rep,cp,t_cp);
     }
     return err?1:0;
