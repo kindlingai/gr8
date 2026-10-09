@@ -1,203 +1,209 @@
-> ## Welcome
->
-> **Custom GLM 5.3 engine for 6× DGX Spark. Private preview.**
->
-> - **What it is:** an inference engine for GLM 5.3 full written from scratch. No vLLM; our own CUDA kernels plus a small server. It runs across 6 Sparks.
-> - **Where it's at (6 Sparks, one session):**
->   - ~1,950 tok/s prefill at 8K (TTFT ~4.2 s)
->   - ~37 tok/s prose decode
->   - 614K context; a 254K prompt prefills in ~176 s
-> - **What's in the repo:**
->   - engine source
->   - a converter that builds the weight packs from public HF weights
->   - one-command launch/stop scripts
->   - docs on every setting
->   - a map of what's GLM-specific vs reusable (for other models)
-> - **Known limits:**
->   - one request at a time (multi-session is in progress)
->   - decode slows past the replicated context window (being worked on)
->   - launch scripts not yet run outside our own setup
->   - the 4-Spark (TP4) version runs a split form of the QO prefill path (`G6_PF_OWN=4`, see Known limits)
-> - **Where help would be great:**
->   - multi-session at long context
->   - decode cost with context split across nodes
->   - trying it on other models
-> - Feedback, issues and PRs all welcome. If you run it, tell us what breaks.
+# GLM-5.3 (full) on DGX Spark (GB10): TP=4 or 6
 
-See [CHANGELOG.md](CHANGELOG.md) for what changed since the K1H2 snapshot and [KNOWN-ISSUES.md](KNOWN-ISSUES.md) for open bugs.
-
-# g6: a custom GLM 5.3 (full) engine for six DGX Sparks
+Private preview. Feedback, issues and PRs are welcome; if you run it, tell us what breaks.
 
 g6 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE, 256 experts, MLA attention with the sparse
-indexer, one MTP layer) on six NVIDIA DGX Spark (GB10) nodes, tensor-parallel 6 ways (TP6). It does not use vLLM,
-PyTorch or NCCL at serve time. Each node runs one `g6m4` process. The ranks talk to each other over RoCE v2 through our
-own verbs fabric. An OpenAI-compatible HTTP front end runs on rank 0.
+indexer, one MTP layer) on four or six NVIDIA DGX Spark (GB10) boxes, tensor-parallel 4 or 6 ways. It uses no vLLM,
+PyTorch or NCCL at serve time: each box runs one `g6m4` process, the ranks talk over RoCE v2 through our own verbs
+fabric, and an OpenAI-compatible front end runs on rank 0. What makes it fast:
 
-The weights are the community EXL3 "TR3" 3.25 bpw quantization for the routed experts. Dense decode uses GPTQ int4 g32
-codes and prefill uses MXFP8 copies of the original BF16 weights. These are the same weights an EXL3/vLLM build serves,
-re-packed into one file per rank.
+- Several requests at once (`--s2`): up to 8 sessions share each decode step, with exact per-session output.
+- DFlash2 speculative decoding for a request that runs alone, with the draft count chosen each round from a live model
+  of step cost and acceptance. Sessions that share steps use the MTP layer.
+- Pair-owner QO attention in prefill at TP=4 (`G6_PF_OWN=4`, [docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
+- exlr8 experts: the routed experts at 3.25 bpw, trellis-decoded inside the expert kernels, loaded straight from their
+  width files.
+- Context-parallel KV past 32,768 tokens, so a 393K (TP=4) or 614K (TP=6) pool fits.
+- Prefix reuse across sessions (`REUSE=1`): a request that continues an earlier conversation re-prefills only the new
+  part, with the same output as a cold run.
 
-The engine also runs the exlr8-e4m3 re-encode of the same experts
-([mmastrac/glm-5.3-exl3-copy](https://huggingface.co/mmastrac/glm-5.3-exl3-copy)). That checkpoint has TR3's tensor
-names, layout and per-expert bit widths, with every codebook value rounded to FP8 E4M3. Build packs from the checkpoint
-with the same `build_packs.sh` command: the converter reads each layer's format from the layer file and records it in the pack
-manifest, and the engine decodes those layers with the same E4M3 rounding (#19). TR3 packs are unchanged. exlr8-e4m3
-packs need an engine built at or after #19: an older engine runs them without the rounding and does not warn.
+| | TP=4 (S2, DFlash2) | TP=6 (K1H2, one request at a time) |
+|---|---|---|
+| prefill, 8K prompt, cold | 1,293 tok/s | 1,942 tok/s |
+| decode\*, code / prose / structured | 49.5 / 28.4 / 68.4 tok/s | prose 36.9 tok/s (MTP k=2, temp 0.7) |
+| aggregate\*, 2 / 4 streams | 50.6 / 63.6 tok/s | – |
+| TTFT, long prompts | 18K: 14.5 s, 87K: 73.3 s | 131K: 79.1 s, 254K: 176.1 s |
+| KV pool | 393,216 tokens | 614,400 tokens |
+| requests decoding at once | 8 | 1 |
+| prefix reuse, a continued 20K conversation | 7.1 s vs 17.3 s cold | – |
 
-This snapshot is the **K1H2** build: our current best six-node configuration, with context-parallel KV past 32K
-tokens and a 614,400-token KV pool.
+\* TP=4: [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks capped at
+2200 MHz. TP=6: one test window on one cluster; two arms with identical decode code differed by about 3% on prose, so
+read small differences as noise.
 
-**Status: research code, private preview.** It runs on our cluster. The scripts here are new; see
-[What has and has not been verified](#what-has-and-has-not-been-verified) before you plan around it.
+TP=4 is the default: `scripts/launch_tp4.sh` boots the multi-session engine (`scripts/launch_s2.sh`). TP=6 serves one
+request at a time through `scripts/launch_tp6.sh`. [docs/SETTINGS.md](docs/SETTINGS.md) explains every setting,
+[CHANGELOG.md](CHANGELOG.md) has what changed and the measurements behind it, and
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) has the open bugs.
 
-## Measured numbers (our cluster, K1H2, one boot, single request)
+## What you need
 
-| metric | K1H2 |
-|---|---|
-| prefill, 8K prompt (`bench/pbench.py`) | 1,942 tok/s |
-| prose decode, single stream, MTP k=2, temp 0.7 | 36.9 tok/s |
-| TTFT at 131,072 prompt tokens | 79.1 s |
-| TTFT at 253,952 prompt tokens | 176.1 s |
-| KV pool (`--cap`) | 614,400 tokens |
-| lowest MemAvailable on any node, while serving | 13.7 GB |
+- **Four or six DGX Spark or other GB10 boxes** (sm_121a, 128 GB unified memory). One rank per box, and nothing else
+  holding GPU memory: a TP=4 rank holds about 90 GB of weights.
+- **A RoCE v2 fabric with two rails.** Each box's ConnectX-7 has two addresses (`IPS` and `IPS2` in the config), one
+  per PCIe root. We used one 200G switch. The engine finds the RDMA device for each address itself.
+- **Passwordless ssh from the head (rank 0) to the other boxes.** The launcher, the shim and the front end run on the
+  head.
+- **Disk per box:** the box's rank pack (about 90 GB at TP=4, 62 GB at TP=6), the drafter pack at TP=4 (0.86 GB) or
+  the shared QO pack at TP=6 (13 GB), and the binary.
+- **Disk for the pack build** (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for
+  the GPTQ codes and about 390 GB for the packs it writes.
+- **Toolchain:** CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev (the stock DGX OS,
+  Ubuntu 24.04), and cargo for the Rust pack loader and front end.
+- **The weights**, public on Hugging Face:
+  [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw) (the routed
+  experts, plus the tokenizer files the front end reads) and
+  [adapt-ai-systems/glm-5.3-full-exl3-gptq-dense](https://huggingface.co/adapt-ai-systems/glm-5.3-full-exl3-gptq-dense)
+  (the dense GPTQ codes, `tp4/` or `tp6/`).
 
-All numbers come from one test window on one cluster. In that window, two arms with identical decode code differed by
-about 3% on prose decode, so read small differences as noise. These are not controlled comparisons with other stacks.
+## Ports
 
-## Hardware
+| port | what | where |
+|---|---|---|
+| 8100 | the OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`) | head (`PORT`) |
+| 7341 | the multi-session control channel between the ranks | head (`S2PORT`) |
+| 18600-18659 | fabric bootstrap and the per-collective regions | head |
 
-- **6 × DGX Spark** (GB10, 128 GB unified memory). One rank per node, and nothing else holding GPU memory.
-- **RoCE v2 fabric with two rails.** Each node's ConnectX-7 has two addresses (`IPS` and `IPS2` in the config), one per
-  port/HCA. We used one 200G switch at MTU 1500. The engine finds the RDMA device for each address itself.
-- **Disk per node:** about 62 GB for the node's rank pack, 13 GB for the shared QO pack, and the binary.
-- **Disk for the pack build (one machine, any Linux box or one Spark):** about 340 GB for the TR3 download, 10 GB for
-  the GPTQ codes, and about 390 GB for the packs it writes.
-- **The head (rank 0)** needs passwordless ssh to the other five nodes. The front end and shim run there.
-- **Toolchain we built with:** CUDA 13.0.88 (`nvcc` with `sm_121a`), g++ 13.3, rdma-core / libibverbs-dev 50 (the stock
-  DGX OS, Ubuntu 24.04).
-
-## Quick start
-
-```bash
-# 0. config: node names + fabric addresses + working dir (same path on every node)
-cp config/cluster.env.example config/cluster.env && $EDITOR config/cluster.env
-
-# 1. build the engine on one Spark (CUDA 13 with sm_121a, libibverbs-dev; a few minutes, CPU only)
-scripts/build.sh bin/
-
-# 2. download the two public inputs and build the packs (CPU + disk, no GPU; ~15-25 min for us)
-huggingface-cli download davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw --local-dir /data/tr3
-huggingface-cli download adapt-ai-systems/glm-5.3-full-exl3-gptq-dense --include 'tp6/*' --local-dir /data/gptq
-pip install numpy
-scripts/build_packs.sh /data/tr3 /data/gptq/tp6 /data/packs
-
-# 3. copy the binary and each node's packs onto that node
-scripts/stage.sh bin/ /data/packs
-
-# 4. front end venv on the head (once)
-python3 -m venv $G6_HOME/venv && $G6_HOME/venv/bin/pip install -r frontend/requirements.txt
-
-# 5. ONE command: boot all six ranks, then the shim and the HTTP server
-scripts/launch_tp6.sh
-curl http://<head>:8100/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"glm-5.3","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
-
-scripts/stop.sh
-```
-
-The first boot checks the sha256 of every pack tensor at load. Later boots can skip that with `NOHASH=1 scripts/launch_tp6.sh`.
-
-Benchmark: `python3 bench/pbench.py --url http://<head>:8100 --tag mine`. It reports 8K/32K cold prefill and prose
-decode, and appends one JSON line to `bench/results.jsonl`.
-
-## The settings that matter
-
-Every engine setting is an environment variable or a flag in `scripts/launch_tp6.sh`. Each one is explained in
-[docs/SETTINGS.md](docs/SETTINGS.md). In short:
-
-- **`--cap`** (`CAP=`) is the KV pool in tokens, and so the longest context. 614,400 is what K1H2 was tested at. Lower it
-  first if a node runs short of memory.
-- **`--mtp`** (`MTP=`) is the MTP draft length. K1H2 was measured at k=2. Larger k is supported but was not measured on
-  this build.
-- **`G6_PF_OWN=3` + the QO pack** is row-owner attention in prefill. It is the biggest prefill lever and needs `qo.pack` on
-  every node. TP4 runs `G6_PF_OWN=4` instead, the same attention block split over two head pairs, which needs no QO
-  pack ([docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
-- **`G6_CP=1 G6_CP_R=32768`** is context-parallel KV. The first 32,768 tokens are replicated on every rank and later pages
-  are spread across ranks, which is what makes the 614K pool fit. `G6_CP_PF_VERIFY=1` and `G6_CP_PF_HASH2=1` check every
-  staged KV page against a hash. HASH2 makes that check cheap (254K TTFT -34% vs the old hash, same output tokens).
-- **The compile flags in `scripts/build.sh`** pick kernel variants. Each one won an A/B test on our cluster.
-
-## Repository map
+## Layout
 
 | path | what |
 |---|---|
-| `engine/runtime/` | `g6m4.cu` (one rank on the fabric), `m4sim.cu` (one GPU simulating all six ranks), the rank step, prefill, serve loop, `build_m4.sh` |
-| `engine/kernels/` | expert (TR3 trellis), dense GEMV/GEMM (MXFP8, int4), glue (router, norms, sampling) |
-| `engine/attn/` | MLA decode + prefill attention and the sparse indexer |
-| `engine/comms/` | RoCE v2 verbs fabric: collectives, bulk proxy, CP layout |
-| `engine/loader/` | pack reader and the device image loader |
-| `engine/ref/g6ref.py` | NumPy reference of the record layouts (the converter uses it) |
-| `tools/convert/` | public weights -> per-rank packs (`convert.py`), QO pack (`qopack.py`), checker (`checkpack.py`) |
-| `frontend/` | OpenAI/vLLM-compatible HTTP server (`g6front`, and the Rust `g6front-rs`) + the shim that drives the six ranks (`g6shim.py`) |
-| `PROTOCOL.md` | the front end <-> engine socket protocol |
-| `scripts/` | build, pack build, stage, launch, stop |
-| `docs/` | settings, model-specific parts (porting to other models) |
+| `engine/runtime/` | `g6m4.cu` (one rank on the fabric), `m4sim.cu` (one GPU simulating all the ranks), the rank step, prefill, the serve loops, `build_m4.sh` |
+| `engine/runtime/s2/` | the multi-session scheduler, pool, dispatch and control channel |
+| `engine/kernels/` | experts (TR3 / exlr8 trellis), dense GEMV/GEMM (MXFP8, int4), glue (router, norms, sampling) |
+| `engine/attn/` | MLA decode and prefill attention and the sparse indexer |
+| `engine/comms/` | the RoCE v2 verbs fabric: collectives, bulk proxy, CP layout |
+| `engine/loader/`, `engine/loader-rs/` | the pack reader, and the Rust loader that fills the device image |
+| `tools/convert/` | public weights to per-rank packs (`convert.py`), the QO pack (`qopack.py`), the drafter pack (`dflash2.py`), the checker (`checkpack.py`) |
+| `tools/tune/` | fetching the exlr8 v2 expert files |
+| `frontend/` | the HTTP front end (`g6front-rs`, Rust, and `g6front`, Python) and the shims that drive the ranks (`g6s2shim.py`, `g6shim.py`) |
+| `PROTOCOL.md` | the front end to engine socket protocol |
+| `scripts/` | build, pack build, stage, launch, stop, tests |
+| `bench/` | benchmarks and the quality gate |
+| `docs/` | settings, the QO pair design, the model-specific parts |
 
-## Other models
+## 1. Describe the cluster
 
-g6 is written for GLM 5.3's shapes, not as a general engine. [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every
-place the model is baked in: the converter's dims and rank map, the kernels' fixed sizes, attention (MLA + indexer),
-the layer sequence, and the front end's tokens and parser. It also says what carries over unchanged (fabric, loader,
-pack format, serve loop, front end shape). Use it as the map for porting another model.
+    cp config/cluster.env.tp4.example config/cluster.env     # or cluster.env.example for TP=6
+    $EDITOR config/cluster.env
+
+It names the boxes (`HOSTS`, rank order), their fabric addresses (`IPS`, `IPS2`), the working directory on every box
+(`G6_HOME`, the same path everywhere), the tokenizer directory on the head (`MODEL_DIR`) and the API port (`PORT`).
+Every script reads it; `G6_CLUSTER=<file>` points them at another one.
+
+## 2. Build the engine
+
+On one Spark (a few minutes, CPU only):
+
+    G6_NR=4 scripts/build.sh bin/        # TP=4, with the multi-session path
+    scripts/build.sh bin6/               # TP=6
+    scripts/build_front.sh bin/          # the Rust front end
+
+`BUNDLE_LIBS=1` also copies cuBLAS next to the binary, for boxes without the CUDA toolkit. The `-D` flags in
+`scripts/build.sh` pick kernel variants; each one won an A/B test on our cluster.
+
+## 3. Build the packs
+
+On the machine with the disk (CPU only, about 15-25 minutes):
+
+    hf download davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw --local-dir /data/tr3
+    hf download adapt-ai-systems/glm-5.3-full-exl3-gptq-dense --include 'tp4/*' --local-dir /data/gptq
+    pip install numpy
+    scripts/build_packs.sh /data/tr3 /data/gptq/tp4 /data/packs
+
+At TP=4, also build the DFlash2 drafter packs, `packs/dflash.r<r>.*` on every box
+(`python3 -m tools.convert.dflash2 --src <drafter dir> --out /data/packs --nr 4`). The launcher stops with instructions
+when they are missing; `DFLASH=0` runs MTP only.
+
+The exlr8 experts come from their own width files: fetch them with `tools/tune/fetch_ranks.py`, then boot with
+`V2=<dir> V2_SLICES=<dir> V2_WIDTHS=<manifest>` (`tools/tune/README.md`).
+
+## 4. Stage
+
+    scripts/stage.sh bin/ /data/packs
+
+This copies the binary and each box's packs onto that box. On the head, also create the front end's venv once:
+
+    python3 -m venv $G6_HOME/venv && $G6_HOME/venv/bin/pip install -r frontend/requirements.txt
+
+## 5. Start it
+
+From the head (an `ssh -A` session works if the head has no key of its own for the others):
+
+    scripts/launch_tp4.sh                # or scripts/launch_tp6.sh
+    scripts/stop.sh
+
+The first boot checks the sha256 of every pack tensor; later boots can skip that with `NOHASH=1`. Useful knobs, all
+environment variables of the launcher: `SESS` (concurrent sessions, default 8), `REUSE=1` (prefix reuse), `DFLASH=0`
+(MTP only), `SPEC_ACCEPT=rejection`, `CAP` (the KV pool). `PLAIN=1 scripts/launch_tp4.sh` boots the older
+one-request loop, from a `PLAIN=1 G6_NR=4 scripts/build.sh` build; it is being retired.
+
+Logs are in `$G6_HOME/out/` on each box (`g6m4.r<r>.err`), plus `shim.log` and `front.log` on the head.
+
+## 6. Check it
+
+    curl http://<head>:8100/v1/chat/completions -H 'Content-Type: application/json' \
+      -d '{"model":"glm-5.3","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
+
+    python3 bench/pbench.py --url http://<head>:8100 --tag mine
+
+`pbench.py` reports 8K and 32K cold prefill and prose decode, and appends one JSON line to `bench/results.jsonl`.
+
+## Tuning
+
+Every engine setting is an environment variable or a launcher flag, each explained in
+[docs/SETTINGS.md](docs/SETTINGS.md). The ones that matter most:
+
+- **`CAP`** is the KV pool in tokens, and so the longest context. Lower it first if a box runs short of memory.
+- **`SESS`** is how many requests decode at once (1-8). More sessions capture more step graphs (about 2.5 GiB at 8).
+- **`G6_PF_OWN`** picks the prefill attention: 4 at TP=4 (pair-owner QO), 3 at TP=6 with the QO pack (row-owner QO).
+  Prompts shorter than `G6_PF_QP_MIN` (768) take the cheaper OWN=2 path.
+- **`G6_CP=1 G6_CP_R=32768`** is context-parallel KV: the first 32,768 tokens are replicated on every rank, later pages
+  are spread across ranks. `G6_CP_PF_VERIFY=1` and `G6_CP_PF_HASH2=1` check every staged KV page against a hash.
+- **`MTP`** is the MTP draft count for sessions that share steps; DFlash2's count is chosen per round.
+
+## Troubleshooting
+
+- **Decode slows past the replicated window.** Past `G6_CP_R` tokens the KV is split across ranks and every step
+  gathers from all of them.
+- **A request past 32,768 tokens waits for an empty pool.** It runs alone at the start of the pool, so it waits for
+  every resident session to finish, and nothing else is admitted while it runs.
+- **A request with `prompt_logprobs` holds the others.** Its whole prompt runs as decode steps (about 13 ms per prompt
+  token at TP=4) before anyone else's next step; the shim caps such prompts at 1,024 tokens.
+- **If a rank dies, the whole engine stops.** Restart with `scripts/stop.sh && scripts/launch_tp4.sh`.
+- **Requests reach the other ranks as files over ssh** (one persistent connection per box), which adds a little TTFT.
+- **Boot takes a few minutes with hashing on.** It is mostly pack read speed: about 1.8 GB/s per box for us.
+- `top_k` and `min_p` are ignored with a warning; `logprobs` and `prompt_logprobs` work up to k = 20.
+  `frontend/README.md` has the full list.
+- Code comments refer to internal design notes and test-window names that are not in this repository.
 
 ## What has and has not been verified
 
 | item | status |
 |---|---|
-| engine source = what we serve | The tree is our K1H2 source with only comments edited. `scripts/build.sh`'s flags built on a GB10 (exit 0, no errors) and gave SASS identical to our served binary, except two compiler-generated anonymous-namespace names. |
-| `launch_tp6.sh` / `stop.sh` / `stage.sh` | Run end to end with a fake engine (`frontend/tests/fake_serve_engine.py`) standing in for six ranks on one host: all ranks ready, a chat request streamed, stop left no processes. **Not yet run against the real engine on six Sparks.** Our own boots use an older harness with the same env and args. `launch_tp4.sh` / `stop.sh` were run against the real engine on four Sparks (#2). |
-| `build_packs.sh` | The six GPTQ input dirs on Hugging Face match the layer-000 hashes our converter expects. The full conversion was **not** re-run from these scripts. Our packs came from the same `convert.py` + `qopack.py` with the same inputs, but we did not record which revision of the TR3 repo we downloaded. Run `checkpack.py` (the script does) and, if you can, compare outputs against ours. |
-| quality | Each boot checks that all six ranks produce identical tokens. K1H2's output was token-identical to the same build with the old page hash, at 131K and 254K prompts. A full KL / GSM8K / HumanEval gate on K1H2 is not reported here. |
+| TP=4 launch | `launch_tp4.sh` / `launch_s2.sh` / `stop.sh` run against the real engine on four Sparks. |
+| TP=6 launch | `launch_tp6.sh` / `stop.sh` / `stage.sh` run end to end with a fake engine (`frontend/tests/fake_serve_engine.py`) standing in for six ranks on one host. **Not yet run against the real engine on six Sparks**; our own TP=6 boots used an older harness with the same env and args. |
+| `build_packs.sh` | The GPTQ input dirs on Hugging Face match the layer-000 hashes our converter expects. The full conversion was **not** re-run from these scripts, and we did not record which revision of the TR3 repo we downloaded. Run `checkpack.py` (the script does). |
+| exactness | Multi-session output equals each request run alone, byte for byte (logprobs included); DFlash2 under `--s2` equals the one-request loop's; a prefix-reuse hit equals a cold run. A full KL / GSM8K / HumanEval gate is not reported here. |
 
-## Known limits
+## Other models
 
-- **One request at a time.** The shim queues the rest. There is no batching across requests.
-- Six ranks (TP6) or four (TP4). TP4: `G6_NR=4 scripts/build.sh`, `scripts/build_packs.sh` with the TP4 GPTQ codes
-  (`tp4/r0..r3`), `scripts/stage.sh`, `scripts/launch_tp4.sh`. A TP4 rank pack is about 90 GB, so the 13 GB QO pack
-  does not fit next to it. TP4 runs pair-owner QO attention instead (`G6_PF_OWN=4`, about 1.3-1.4 GB of device memory plus 84 MB pinned per rank) with a
-  393,216-token pool. TP4 numbers (2200 MHz cap, launcher defaults): 8K prefill 1,318 tok/s, 32K 1,288 tok/s, 18K TTFT
-  14.5 s, 87K TTFT 73.3 s, decode code/prose/structured 34.8/31.5/37.0 tok/s with MTP k=2 (the default then), 87K and
-  250K needles found (#39).
-  With `G6_PF_OWN=1` (no QO attention): 8K 816 tok/s, 32K 654 tok/s.
-- TP4 drafts with DFlash2 by default (`engine/runtime/dflash.cuh`, #11), and each round picks its draft count, 1 to 7
-  (`engine/runtime/spec_len.h`, #12). The drafter needs `packs/dflash.r<r>.*` on every node (`tools/convert/dflash2.py`,
-  0.86 GB per rank), and the launcher stops with instructions when they are missing. Against MTP k=2 at 2200 MHz, on
-  answers (vLLM's bench prompts) it gives code 48.0 / prose 34.8 / structured 60.3 tok/s against 39.8 / 34.4 / 41.3
-  (+21% / level / +46%). On reasoning text (the gate workloads) it is about level: code 34.0 against 34.9 (-2.6%, within
-  boot noise), prose 32.3 against 32.5, structured 38.8 against 37.3. It uses less memory, because the MTP layer is not
-  built. `DFLASH=0 scripts/launch_tp4.sh` brings back MTP k=2 with a fixed draft count, the previous default. Multi-session
-  (`--s2`) and TP6 run MTP: TP6 cannot split the drafter's 8 KV heads six ways.
-- At temperature > 0, drafts are accepted when they equal the target's own sample (shared noise), so a seed gives the
-  same text with or without speculation. `SPEC_ACCEPT=rejection` switches to rejection sampling with greedy drafts: the
-  same output distribution, other text for a seed.
-- `logprobs` and `prompt_logprobs` work up to k = 20 (ranks beyond the top 20 are null). `top_k`/`min_p` are ignored with a warning. The full list is in `frontend/README.md`.
-- Requests are passed to the ranks other than 0 as files over ssh (one persistent connection per node), which adds a little TTFT.
-- With hashing on, boot takes a few minutes. It is mostly pack read speed: local packs loaded at about 1.8 GB/s per node
-  for us.
-- If a rank dies, the whole engine stops. Restart with `scripts/stop.sh && scripts/launch_tp6.sh`.
-- Code comments refer to internal design notes and test-window names that are not in this repository.
+g6 is written for GLM 5.3's shapes, not as a general engine. [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists
+every place the model is baked in (the converter's dims and rank map, the kernels' fixed sizes, attention, the layer
+sequence, the front end's tokens and parser) and what carries over unchanged (fabric, loader, pack format, serve loop,
+front end). Use it as the map for porting another model.
 
 ## Credits
 
 - [exllamav3](https://github.com/turboderp-org/exllamav3) by turboderp and its contributors: the EXL3 format and its
   trellis quantizer, a streamlined variant of Cornell RelaxML's [QTIP](https://github.com/Cornell-RelaxML/qtip). This
   engine would not exist without their quantization work. The TR3 decoder in `engine/kernels/tr3*.cuh` was written
-  from the EXL3 format, `exl3rate/exl3rate.cu` follows exllamav3's decode and numerics (MIT, see
-  `exl3rate/LICENSE-exllamav3`), and the exlr8 expert weights were encoded with exllamav3's quantizer.
+  from the EXL3 format, and the exlr8 expert weights were encoded with exllamav3's quantizer.
 - The routed-expert weights are the [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw)
   EXL3 quantization of GLM 5.3, including its per-expert bit distribution: in each layer the 64 experts with the
   highest K3 round-trip error are encoded at K4 and the other 192 at K3, 3.25 bpw on average. The exlr8 re-encode keeps
   that distribution expert for expert.
+- [RigMark](https://github.com/alexellis/rigmark) by alexellis, for the decode and concurrency numbers above.
 - The tool-call cases in `frontend/tests/test_parser.py` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
 
 ## License

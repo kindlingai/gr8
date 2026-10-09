@@ -1028,7 +1028,8 @@ inline void pf_qp_states(Prefill&, Model&, cudaStream_t, Prefill*) { die("G6_PF_
 inline void pf_qp_warm(Model&, Prefill&, cudaStream_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
 inline void pf_attn_block_qp(Model&, Prefill&, int, int, int, cudaStream_t, cudaEvent_t, cudaEvent_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
 inline void pf_qp_norm(Prefill&, int, const __nv_bfloat16*, __half*, cudaStream_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
-inline bool pf_qp_select(Prefill&, Prefill*, int) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); return false; }
+inline bool pf_qp_select(Prefill&, Prefill*, int, int) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); return false; }
+inline int pf_qp_min() { return 0; }
 #endif
 // G6_PF_OWN=3: layer i's attention block, owner rows r0..r1 (QO-INTEGRATION.md section 1). Ends with the owner's
 // residual + norm and the c1 publish (no c0). wait_attn / used_attn as in pf_attn_block.

@@ -55,9 +55,10 @@ class PrefixReuseTests(unittest.TestCase):
             call = 'reuse.finish(p.prompt, gen, em.on ? em.emitted : (int)gen.size(), ' + str(mtp).lower() + ');'
             pos = s.index(call)
             self.assertLess(pos, s.index('em.end(', pos))
-        # the paths whose cache state PrefixReuse does not model are refused, not silently wrong
-        self.assertIn('if (reuse_prefix && s2mode) die(', s)
-        self.assertIn('if (reuse_prefix && dfl) die(', s)
+        # the one-request loop refuses DFlash2 with reuse (the drafter's prompt taps come from the prefill a hit
+        # skips); --s2 keeps retired runs in its pool (s2/pool.h) and gives DFlash2 only to a session that owns them
+        self.assertIn('if (reuse_prefix && dfl && !s2mode) die(', s)
+        self.assertNotIn('if (reuse_prefix && s2mode) die(', s)
 
 
 if __name__ == '__main__':

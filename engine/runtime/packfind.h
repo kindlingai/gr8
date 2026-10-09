@@ -64,16 +64,6 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
         return t;
     };
 }
-// sources: a rank<r>.sources file for a sparse pack (g6::Sources, "" = none), resolved against sources_root ("" = the
-// root the file names)
-inline void open_sources(g6::Sources& src, const g6::Pack& pack, const std::string& sources, const std::string& root,
-                         int rank)
-{
-    std::string err;
-    if (!src.open(sources, root, pack.bytes(), err)) die(err);
-    fprintf(stderr, "# rank %d: %zu source ranges, %.2f GB, from %s\n", rank, src.ranges(), src.bytes() / 1e9, src.root().c_str());
-}
-
 // exlr8 v2 experts from the raw width files (--v2 DIR --v2-slices DIR --v2-widths FILE)
 struct V2Src
 {
@@ -134,18 +124,16 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
             (unsigned long long)st.ranges, st.read_bytes / 1e9, st.seconds, st.image_bytes / 1e9 / st.seconds);
 }
 
-// The pack (and its sources) -> one device image with the Rust loader: parallel reads, no checksum (the files are
-// checked offline). G6_LOADER=cpp, or a pack streamed on stdin, takes the C++ path instead.
-inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& file, int rank, const std::string& sources,
-                          const std::string& sources_root)
+// The pack -> one device image with the Rust loader: parallel reads, no checksum (the files are checked offline).
+// G6_LOADER=cpp, or a pack streamed on stdin, takes the C++ path instead.
+inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& file, int rank)
 {
     const char* sel = getenv("G6_LOADER");
     if ((sel && std::string(sel) == "cpp") || file == "-") return false;
     std::vector<g6l_extent> ext;
     for (const g6::Entry& e : pack.entries()) ext.push_back({e.offset, e.nbytes});
     rs_fill(pack, img, rank, "pack", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
-        return g6l_load(file.c_str(), pack.bytes(), ext.data(), ext.size(), sources.c_str(), sources_root.c_str(), s, st,
-                        err, n);
+        return g6l_load(file.c_str(), pack.bytes(), ext.data(), ext.size(), "", "", s, st, err, n);
     });
     return true;
 }
@@ -174,13 +162,11 @@ inline void rs_load_v2(g6::Pack& pack, g6::DevImage& img, const std::string& man
 
 // manifest + pack stream ("-" = stdin) -> device image
 inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& manifest, const std::string& file, int rank,
-                       bool hash = true, const std::string& sources = "", const std::string& sources_root = "",
-                       const V2Src& v2 = {})
+                       bool hash = true, const V2Src& v2 = {})
 {
     if (!v2.dir.empty())
     {
 #ifdef G6_RS_LOADER
-        if (!sources.empty()) die("--v2 replaces --sources");
         return rs_load_v2(pack, img, manifest, file, rank, v2);
 #else
         die("--v2 needs the Rust loader (scripts/build.sh links it when cargo is installed)");
@@ -190,29 +176,24 @@ inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& man
     if (!pack.open_manifest(manifest, err)) die(err);
     if (pack.rank() != rank) die(manifest + ": manifest says rank " + std::to_string(pack.rank()));
 #ifdef G6_RS_LOADER
-    if (rs_load_image(pack, img, file, rank, sources, sources_root)) return;
+    if (rs_load_image(pack, img, file, rank)) return;
 #endif
-    g6::Sources src;
-    if (!sources.empty()) open_sources(src, pack, sources, sources_root, rank);
     g6::LoadOpts lo;
     g6::LoadStats st;
     if (!hash) lo.hash_threads = 0;
-    if (!img.load(pack, file, lo, st, err, sources.empty() ? nullptr : &src)) die(err);
+    if (!img.load(pack, file, lo, st, err)) die(err);
     fprintf(stderr, "# rank %d: pack %.2f GB -> device image%s in", rank, st.bytes / 1e9, hash ? ", sha256-checked," : " (NO checksum)");
     fprintf(stderr, " %.1f s (%.2f GB/s; copy %.1f s, stall %.1f s)\n", st.seconds, st.gb_per_s, st.copy_seconds, st.stall_seconds);
 }
 
-inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::string& file, int rank,
-                      const std::string& sources = "", const std::string& sources_root = "")
+inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::string& file, int rank)
 {
     std::string err;
     if (!pack.open_manifest(manifest, err)) die(err);
     if (pack.rank() != rank) die(manifest + ": manifest says rank " + std::to_string(pack.rank()));
-    g6::Sources src;
-    if (!sources.empty()) open_sources(src, pack, sources, sources_root, rank);
     g6::LoadOpts lo;
     g6::LoadStats st;
-    if (!pack.load(file, lo, st, err, sources.empty() ? nullptr : &src)) die(err);
+    if (!pack.load(file, lo, st, err)) die(err);
     fprintf(stderr, "# rank %d: pack %.2f GB loaded + sha256-checked in %.1f s (%.2f GB/s)\n", rank, st.bytes / 1e9, st.seconds,
             st.gb_per_s);
 }

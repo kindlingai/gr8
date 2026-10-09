@@ -12,8 +12,6 @@
 #   PF_OWN=1          G6_PF_OWN; 3 also loads packs/qo.pack
 #   MTP=2             speculative draft length k (2 = our prose/served default; 4-6 helped code/structured)
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
-#   SOURCES_ROOT=DIR  sparse packs (packs/rank<r>.sources, convert.py --v2-refs): where the v2 files are on the
-#                     nodes (default: the root rank<r>.sources names)
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   G6ARGS_X="--top 20" extra engine arguments for every rank (--top K prints the per-slice top-K lines for requests with logprobs)
 #   READY_TMO=900     seconds to wait for all six ranks to load
@@ -47,13 +45,10 @@ SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --m
 SERVE_ARGS="$SERVE_ARGS ${G6ARGS_X:-}"
 
 for ((r = NRANK - 1; r >= 0; r--)); do
-  # a sparse pack (convert.py --v2-refs) reads its exlr8 v2 expert bytes from the v2 files at load
-  SRCARGS=""
-  on $r "test -e $G6_HOME/packs/rank$r.sources" && SRCARGS="--sources packs/rank$r.sources ${SOURCES_ROOT:+--sources-root $SOURCES_ROOT}"
   # each process writes its own pid (setsid may fork, so $! is not always the engine's pid)
   on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
-      --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all $SRCARGS \
+      --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all \
       --serve $G6_HOME/serve $SERVE_ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait

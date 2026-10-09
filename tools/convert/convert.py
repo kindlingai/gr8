@@ -20,10 +20,8 @@ manifest are the same as before #19.
 exlr8 v2 expert files (#65, tools/convert/v2.py): --v2 DIR takes the routed experts of every layer that has v2 files in
 DIR (or of --v2-layers) from them instead of from --tr3, at the widths --v2-widths picks, and stores the shared expert
 as trellis row 256 of tr3.table (--v2-shared). Everything else in those layers still comes from --tr3 and --d8, and the
-shared expert's int4 / MXFP8 records are left out (--v2-shared-records keeps them for an A/B against them). Such a layer's tr3.*
-entries carry `"expert_source": "exlr8-v2"` and add tr3.kmix; the manifest's `v2_layers` maps them to their widths.
---v2-refs leaves those layers' tr3.fc1 / tr3.fc2 bytes in the v2 files: each pack is sparse there, rank<r>.sources says
-where the bytes are, and g6m4 --sources fills them at load. The manifests are the same as without --v2-refs.
+shared expert's int4 / MXFP8 records are left out. Such a layer's tr3.* entries carry `"expert_source": "exlr8-v2"` and
+add tr3.kmix; the manifest's `v2_layers` maps them to their widths.
 """
 import argparse
 import os
@@ -47,7 +45,7 @@ VERSION = 'g6convert-v1'
 # safetensors metadata `exlr8` of a layer file -> expert format (no key: TR3)
 EXPERT_FORMATS = {None: 'tr3', 'exlr8-e4m3-v1': 'exlr8-e4m3'}
 GV = False  # --gv-records: also write the decode GEMV record streams (g6ref.mxfp8_record / bf16_record)
-V2 = None   # --v2: dict(dir, layers, widths, shared, shared_width, records, refs)
+V2 = None   # --v2: dict(dir, layers, widths, shared, shared_width)
 
 
 # ---------------------------------------------------------------------------------------------- D8 GPTQ
@@ -209,8 +207,8 @@ def convert_layer(l, src, d8, writers):
     if moe:
         router_w, router_b = g('mlp.gate.weight'), g('mlp.gate.e_score_correction_bias')
     # exlr8 v2 layer with the shared expert as trellis row 256: the engine runs it from there (prefill from an FP8 copy it
-    # decodes at load), so its int4 / MXFP8 records are left out unless --v2-shared-records keeps them for the A/B
-    records = not (moe and V2 and l in V2['layers'] and V2['shared'] == 'trellis' and not V2['records'])
+    # decodes at load), so its int4 / MXFP8 records are left out
+    records = not (moe and V2 and l in V2['layers'] and V2['shared'] == 'trellis')
     for r, w in writers.items():
         a, b = groups[r][0] * 32, (groups[r][0] + groups[r][1]) * 32
         gi = dict(channels=[a, b])
@@ -368,8 +366,7 @@ def convert_experts_v2(l, src, writers):
         w.meta.setdefault('expert_formats', {})[str(l)] = 'exlr8-e4m3'
         w.meta.setdefault('v2_layers', {})[str(l)] = prov
     v2.convert_experts_v2(l, lay, wd, writers, plan.NR, P=f'L{l:03d}',
-                          info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'), shared=V2['shared'] == 'trellis',
-                          refs=V2['refs'] is not None)
+                          info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'), shared=V2['shared'] == 'trellis')
     lay.close()
 
 
@@ -418,14 +415,9 @@ def main(argv=None):
     ap.add_argument('--v2-layers', default='auto', help='comma list, or auto = every layer with v2 files in --v2')
     ap.add_argument('--v2-widths', default='home', help='home | down1 | up1 | k2 | k3 | k4 | a width manifest file')
     ap.add_argument('--v2-shared', default='trellis', choices=('trellis', 'off'),
-                    help='store the shared expert as trellis row 256 (the int4 / MXFP8 records are written either way)')
-    ap.add_argument('--v2-shared-records', action='store_true',
-                    help="also write the shared expert's int4 / MXFP8 records in v2 layers (G6_V2_SHARED=int4 A/B)")
+                    help='store the shared expert as trellis row 256 (then its int4 / MXFP8 records are left out)')
     ap.add_argument('--v2-shared-width', type=int, default=None, choices=(3, 4),
                     help="the shared expert's width (default: the manifest's; K4 for home and up1, K3 for down1)")
-    ap.add_argument('--v2-refs', nargs='?', const='', default=None, metavar='ROOT',
-                    help='leave the v2 trellis bytes in the --v2 files: sparse packs + rank<r>.sources, read by g6m4 '
-                    '--sources at load. ROOT = the --v2 dir as the engine host sees it (default: --v2)')
     a = ap.parse_args(argv)
     if len(a.d8) not in (4, 6):
         ap.error(f'--d8 takes six dirs (TP6) or four (TP4), got {len(a.d8)}')
@@ -439,10 +431,7 @@ def main(argv=None):
         vl = have if a.v2_layers == 'auto' else [int(x) for x in a.v2_layers.split(',')]
         if not set(vl) <= set(have) or not vl:
             ap.error(f'--v2: layers {sorted(set(vl) - set(have)) or vl} have no v2 files in {a.v2}')
-        V2 = dict(dir=a.v2, layers=set(vl), widths=a.v2_widths, shared=a.v2_shared, shared_width=a.v2_shared_width,
-                  records=a.v2_shared_records, refs=None if a.v2_refs is None else a.v2_refs or os.path.abspath(a.v2))
-    elif a.v2_refs is not None:
-        ap.error('--v2-refs needs --v2')
+        V2 = dict(dir=a.v2, layers=set(vl), widths=a.v2_widths, shared=a.v2_shared, shared_width=a.v2_shared_width)
     ranks = list(range(plan.NR)) if a.ranks == 'all' else [int(x) for x in a.ranks.split(',')]
     if any(r < 0 or r >= plan.NR for r in ranks):
         ap.error(f'--ranks must be 0..{plan.NR - 1}')
@@ -453,8 +442,7 @@ def main(argv=None):
         meta['nr'] = plan.NR   # TP6 manifests stay as they were
     if GV:
         meta['gv_records'] = True
-    refs = (os.path.abspath(a.v2), V2['refs']) if V2 and V2['refs'] is not None else None
-    writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, a.drop_cache, meta, refs=refs) for r in ranks}
+    writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, a.drop_cache, meta) for r in ranks}
     if 'embed' not in skip:
         e = ST(os.path.join(a.tr3, 'model-embed.safetensors'))
         convert_embed(e, writers)

@@ -274,18 +274,11 @@ def kmix_word(gw, uw, dk, hs):
     return v
 
 
-def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=True, routed=None, refs=False):
+def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=True, routed=None):
     """Write layer l's tr3.* tensors from v2 files to every writer (rank r -> PackWriter). nr = the TP size.
     shared: also store the shared expert as trellis row 256 when widths.shared and the files have it.
     routed: the routed experts to take (tests on a partial layer); the others get empty table rows (no blocks), which
-    the kernels skip. Default: all 256, which the files must hold.
-    refs: tr3.fc1 / tr3.fc2 bytes stay in the v2 files (PackWriter.ref; the writers need refs=...); the engine reads
-    them from there at load. The halves are still read and verified here: their bytes give the manifest's sha256."""
-    def put(w, b, e, p, h, k, op):
-        if refs:
-            w.ref(b, *v2.loc(e, p, h, k), op=op)
-        else:
-            w.write(b)
+    the kernels skip. Default: all 256, which the files must hold."""
     P = P or f'L{l:03d}'
     xf = dict(info or {})
     routed = set(range(N_EXP) if routed is None else routed)
@@ -328,8 +321,8 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
             table[r][i] = (off[r], 0, row[r], len(hs), dk, hs[0] if hs else 0)
             kmix[r][i] = kmix_word(gw, uw, dk, hs)
             for h in hs:
-                put(w, gu[h][0], e, 'gate', h, gw[h], 'copy')
-                put(w, gu[h][1], e, 'up', h, uw[h], 'copy')
+                w.write(gu[h][0])
+                w.write(gu[h][1])
                 v1[r][row[r], 0] = hid(e, 'gate', gw[h])
                 v1[r][row[r], 1] = hid(e, 'up', uw[h])
                 v2v[r][row[r], 0] = v2.inter(e, 'gate', gw[h])[h * 128:(h + 1) * 128]
@@ -353,7 +346,7 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
         for r, w in writers.items():
             table[r][i][1] = off[r]
             for h in own[r][e]:
-                put(w, down_to_g6(dn[h], dk), e, 'down', h, dk, 'item128')
+                w.write(down_to_g6(dn[h], dk))
                 v2v[r][row[r], 2] = sud[h * 128:(h + 1) * 128]
                 v3[r][row[r]] = svd
                 off[r] += half_bytes(dk)
@@ -410,9 +403,6 @@ def main(argv=None):
     ap.add_argument('--shared-width', type=int, default=None, help='override the manifest\'s shared expert width')
     ap.add_argument('--routed', default='all', help="routed experts to take, e.g. 0-63 (tests on a partial layer); "
                     "'files' = the experts the index file holds")
-    ap.add_argument('--refs', nargs='?', const='', default=None, metavar='ROOT',
-                    help='leave fc1 / fc2 in the v2 files (rank<r>.sources); ROOT = --v2 as the engine sees it '
-                    '(default: --v2)')
     a = ap.parse_args(argv)
     if a.check:
         lay = V2Layer(a.v2, a.layer)
@@ -431,12 +421,11 @@ def main(argv=None):
     os.makedirs(a.out, exist_ok=True)
     meta = dict(converter='g6convert-v2experts', layers=[a.layer], nr=a.nr, v2_widths=prov,
                 expert_formats={str(a.layer): 'exlr8-e4m3'})
-    refs = None if a.refs is None else (os.path.abspath(a.v2), a.refs or os.path.abspath(a.v2))
-    writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, False, meta, refs=refs) for r in ranks}
+    writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, False, meta) for r in ranks}
     v2 = V2Layer(a.v2, a.layer)
     routed = None if a.routed == 'all' else v2.experts if a.routed == 'files' else parse_experts(a.routed)
     ex = convert_experts_v2(a.layer, v2, wd, writers, a.nr, info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'),
-                            shared=a.shared == 'trellis', routed=routed, refs=refs is not None)
+                            shared=a.shared == 'trellis', routed=routed)
     v2.close()
     for r, w in writers.items():
         m = w.close()

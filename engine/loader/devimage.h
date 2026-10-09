@@ -28,9 +28,7 @@ public:
     // `pack` needs open_manifest() only (Pack::load is not called) and must outlive this image.
     // `path` is the pack file, or "-" for stdin. opts: chunk = staging buffer size (capped so the ring stays
     // <= 256 MB), hash_threads = 0 skips the sha256 and padding checks (not recommended), direct_io as in Pack::load.
-    // src: fill its ranges into each staged chunk before the copy and the hash (a sparse pack, see g6::Sources).
-    bool load(const Pack& pack, const std::string& path, const LoadOpts& opts, LoadStats& stats, std::string& err,
-              Sources* src = nullptr);
+    bool load(const Pack& pack, const std::string& path, const LoadOpts& opts, LoadStats& stats, std::string& err);
     void reset();   // frees the device memory
     // Takes ownership of a device image of pack's bytes that another loader filled (the Rust loader, G6_RS_LOADER).
     void adopt(const Pack& pack, uint8_t* dev, uint64_t bytes);

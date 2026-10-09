@@ -88,8 +88,7 @@ void DevImage::reset()
     pack_ = nullptr;
 }
 
-bool DevImage::load(const Pack& pack, const std::string& path, const LoadOpts& opt, LoadStats& st, std::string& err,
-                    Sources* src)
+bool DevImage::load(const Pack& pack, const std::string& path, const LoadOpts& opt, LoadStats& st, std::string& err)
 {
     using clk = std::chrono::steady_clock;
     auto since = [](clk::time_point t) { return std::chrono::duration<double>(clk::now() - t).count(); };
@@ -208,7 +207,6 @@ bool DevImage::load(const Pack& pack, const std::string& path, const LoadOpts& o
             got += (size_t)n;
         }
         if (!ok) break;
-        if (src && !src->fill(buf, pos, want, err)) { ok = false; break; }
         const auto tc = clk::now();
         ce = cudaMemcpy((uint8_t*)dev + pos, buf, want, cudaMemcpyHostToDevice);
         st.copy_seconds += since(tc);

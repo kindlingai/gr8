@@ -9,8 +9,6 @@
 //
 // g6m4 --rank R --ips a,b,.. [--ips2 a,b,..] [--proxy-cpu N] --manifest rankR.manifest.json --pack rankR.pack|-
 //      [--image]      stream the pack straight into one device image (g6::DevImage; needed for a full 60 GB pack)
-//      [--sources rankR.sources [--sources-root DIR]]  the pack is sparse (convert.py --v2-refs): fill its exlr8 v2
-//                     expert ranges from the v2 files at load (g6::Sources). DIR overrides the root the file names
 //      [--v2 DIR --v2-slices DIR --v2-widths FILE]  with --image and the Rust loader: --manifest/--pack is a base pack
 //                     whose routed experts the exlr8 v2 experts replace, read from the raw width files in DIR at the
 //                     offsets of the index slices (tp<N>/k<K>/rank<r>.safetensors) and the widths FILE picks
@@ -91,7 +89,7 @@ int main(int argc, char** argv)
     const int progress_isolate = env_choice("G6_PROGRESS_ISOLATE", 1, 1, &progress_err);
     if (progress_isolate < 0) die(progress_err);
     g6::FabricConfig cfg;
-    std::string manifest, packfile, sources, sources_root, layers_s = "0,3,40,77";
+    std::string manifest, packfile, layers_s = "0,3,40,77";
     V2Src v2src;
     std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
     std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
@@ -123,8 +121,6 @@ int main(int argc, char** argv)
         else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
         else if (a == "--manifest") manifest = next();
         else if (a == "--pack") packfile = next();
-        else if (a == "--sources") sources = next();
-        else if (a == "--sources-root") sources_root = next();
         else if (a == "--v2") v2src.dir = next();
         else if (a == "--v2-slices") v2src.slices = next();
         else if (a == "--v2-widths") v2src.widths = next();
@@ -385,8 +381,8 @@ int main(int argc, char** argv)
     boot("fabric up");
     if (!v2src.dir.empty() && (!image || v2src.slices.empty() || v2src.widths.empty()))
         die("--v2 needs --image, --v2-slices and --v2-widths");
-    if (image) load_image(pack, img, manifest, packfile, R, hash, sources, sources_root, v2src);
-    else load_pack(pack, manifest, packfile, R, sources, sources_root);
+    if (image) load_image(pack, img, manifest, packfile, R, hash, v2src);
+    else load_pack(pack, manifest, packfile, R);
     u64* stepp = dmalloc<u64>(1);
     StepIn* in;
     StepOut* out;

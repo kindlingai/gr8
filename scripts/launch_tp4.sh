@@ -1,5 +1,8 @@
 #!/bin/bash
 # ONE command: boot the K1H2 engine on FOUR Sparks (TP4) and serve an OpenAI-compatible API on the head (rank 0).
+# This runs scripts/launch_s2.sh: up to SESS requests at once, DFlash2 for a request that runs alone (the same tokens as
+# the one-request loop below), prefix reuse with REUSE=1. PLAIN=1 boots the one-request --serve loop described here
+# instead (a build without DEC_S2: PLAIN=1 G6_NR=4 scripts/build.sh); it is being retired.
 #   scripts/launch_tp4.sh            (after G6_NR=4 scripts/build.sh, build_packs.sh with the TP4 codes, stage.sh;
 #                                     reads config/cluster.env with four HOSTS)
 # The same engine settings as launch_tp6.sh; only the rank count, the KV pool and the library path differ.
@@ -33,8 +36,6 @@
 #   QP_PACK=1         PF_OWN=4 with resident pair packs (packs/qp.rank<r>.*, tools/convert/pairpack.py) instead of
 #                     QP_ROLL; about 6 GB more per rank, which does not fit next to a TP4 rank pack at CAP=393216
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
-#   SOURCES_ROOT=DIR  sparse packs (packs/rank<r>.sources, convert.py --v2-refs): where the v2 files are on the
-#                     nodes (default: the root rank<r>.sources names)
 #   PACKS=packs       where the rank packs are (relative to G6_HOME, or absolute)
 #   V2=DIR V2_SLICES=DIR V2_WIDTHS=FILE  exlr8 v2 experts straight from the raw width files in DIR (g6m4 --v2): the
 #                     rank packs are base packs (TR3), V2_SLICES holds the index slices (tp4/k<K>/rank<r>.safetensors)
@@ -45,6 +46,7 @@
 #                     it the launcher falls back to py), py = frontend/g6front (Python). Same flags, same API;
 #                     FRONT_BIN=path overrides $REPO/bin/g6front-rs
 set -eu
+[ "${PLAIN:-0}" = 1 ] || exec bash "$(dirname "$0")/launch_s2.sh"
 . "$(dirname "$0")/common.sh"
 [ "$NRANK" = 4 ] || { echo "launch_tp4.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
 CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-900}; PACKS=${PACKS:-packs}
@@ -79,13 +81,8 @@ SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --p
 [ "${NOHASH:-0}" = 1 ] && SERVE_ARGS="$SERVE_ARGS --no-hash"
 
 for ((r = NRANK - 1; r >= 0; r--)); do
-  # a sparse pack (convert.py --v2-refs) reads its exlr8 v2 expert bytes from the v2 files at load
   SRCARGS=""
-  if [ -n "${V2:-}" ]; then
-    SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
-  else
-    on $r "cd $G6_HOME && test -e $PACKS/rank$r.sources" && SRCARGS="--sources $PACKS/rank$r.sources ${SOURCES_ROOT:+--sources-root $SOURCES_ROOT}"
-  fi
+  [ -n "${V2:-}" ] && SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
   QPARGS=""
   [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" = 1 ] && QPARGS="--qp-manifest packs/qp.rank$r.manifest.json --qp-pack packs/qp.rank$r.pack"
   [ "$DFLASH" = 1 ] && QPARGS="$QPARGS --dflash-manifest packs/dflash.r$r.manifest.json --dflash-pack packs/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"

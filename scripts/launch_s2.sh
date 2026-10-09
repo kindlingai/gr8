@@ -1,8 +1,8 @@
 #!/bin/bash
 # Multi-session (S2) boot of the TP4 engine on four Sparks: launch_tp4.sh's engine settings, but g6m4 --s2 (a DEC_S2
-# build: EXTRA=-DDEC_S2 scripts/build.sh) serving up to SESS concurrent sessions, driven by frontend/g6s2shim.py instead
+# build: G6_NR=4 scripts/build.sh) serving up to SESS concurrent sessions, driven by frontend/g6s2shim.py instead
 # of --serve / g6shim.py. Stop with scripts/stop.sh.
-#   SESS=8 scripts/launch_s2.sh
+#   SESS=8 scripts/launch_s2.sh        (scripts/launch_tp4.sh runs this)
 # Knobs (environment), as launch_tp4.sh unless noted:
 #   SESS=8            most concurrent sessions (1..8); every reachable step graph is captured at boot (~2.5 GiB at 8)
 #   MTP=2             MTP draft count for sessions that share steps
