@@ -47,16 +47,18 @@ On every box, with the boxes, the fabric and the packs ready ([What you need](#w
     git clone https://github.com/kindlingai/gr8 && cd gr8
     ./gr8 glm53 build                  # the engine for this TP and the Rust front end, into bin/ (or copy bin/)
     ./gr8 glm53 packs /data/tr3 /data/gptq/tp4 /data/packs /data/dflash2    # once, on one machine (step 3)
+    # this box's exlr8 expert halves into /data/exlr8 and the TP=4 index slices into /data/slices (step 3)
     ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
-        --model /data/packs --model-cache /opt/g6/cache
+        --model /data/packs --model-cache /opt/g6/cache --v2 /data/exlr8 --v2-slices /data/slices
     ./gr8 glm53 status                 # every box, the front end, /health
     ./gr8 glm53 smoke                  # questions with answers that can be checked
 
 Every box runs the same `up`. The first address in `--peers` is the head. The head runs the API. The boxes compare their
 options, model set and engine build before any engine starts, and all of them stop, naming the difference, if one box
-disagrees. The same options can sit in `cluster.env` on each box (`config/cluster.env.tp4.example`), so `./gr8 glm53
-up` alone is enough. Without `--peers`, the boxes find each other through the local mentat daemon (`--mentat
-localhost`, the default).
+disagrees. `--variant` picks the expert widths (`home`, the default, is 3.25 bpw). Without `--v2` the experts come from
+the TR3 rank packs instead, at the same widths but without exlr8's decode path. The same options can sit in
+`cluster.env` on each box (`config/cluster.env.tp4.example`), so `./gr8 glm53 up` alone is enough. Without `--peers`,
+the boxes find each other through the local mentat daemon (`--mentat localhost`, the default).
 
 For six boxes, use six peers and the GPTQ `tp6/` codes. Every launch knob is a flag, such as `--sess 4` or `--reuse 0`
 ([KNOBS.md](KNOBS.md)). `./gr8 glm53 down` on any box stops every box, `./gr8 glm53 restart` stops and boots again, and
