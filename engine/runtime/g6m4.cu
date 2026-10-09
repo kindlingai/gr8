@@ -567,6 +567,8 @@ int main(int argc, char** argv)
     long pf_rows = 0;
     m.nc = nc; D.d.nc = nc;             // before any capture: the head kernels take it by value
     m.rs = plan.rs;                     // the target's verify steps only; the MTP layer's head stays as it is
+    if (!pf_qo && !pf_qp)               // QO attention builds the decode RoPE table; without it absorb would take FP64 sincos
+        if (int e = g6_attn_rope_init(cap, st)) die("g6_attn_rope_init failed (" + std::to_string(e) + ")");
     boot("prefill and draft built");
     for (int M : row_counts) prepare(m, M, st);
     for (int M : draft_rows) prepare(D.d, M, st);
@@ -963,6 +965,7 @@ int main(int argc, char** argv)
             else launch_step(m, M, si.context, st);
             G6RT_CK(cudaStreamSynchronize(st));
             const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            evprof_read(M, st, R);
             ms += dt;
             if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); exit(3); }
             const StepOut so = *out;
@@ -1072,6 +1075,7 @@ int main(int argc, char** argv)
             else launch_step(m, M, in->context, st);
             G6RT_CK(cudaStreamSynchronize(st));
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            evprof_read(M, st, R);
             if (dec_prof().on) ++dec_prof().steps[M];
             dec_prof().on = false;
             if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); return 3; }
@@ -1149,7 +1153,7 @@ int main(int argc, char** argv)
 #endif
     if (pf_prof().on) pf_prof().print("this rank,");
     if (rlf) fclose(rlf);
-    if (getenv("G6_DEC_PROF")) { char tag[32]; snprintf(tag, sizeof tag, "rank %d", R); dec_prof().print(tag, NL); }
+    if (getenv("G6_DEC_PROF")) { char tag[32]; snprintf(tag, sizeof tag, "rank %d", R); dp_print(tag, "synchronized", dec_prof().t, dec_prof().steps); }
     fab.wait_proxy_idle();
     fab.barrier();
     fab.stop_proxy();

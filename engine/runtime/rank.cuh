@@ -260,39 +260,114 @@ struct Model
 #endif
 };
 
-// optional decode stage profile (G6_DEC_PROF=1 in g6m4, plain launches only): synchronizes the stream at every mark, so
-// it is a breakdown of where a step's time goes, never a speed number. Totals per row count M (set by the driver).
+// Decode stage profile marks. A mark ends a stage: the time since the previous mark goes to its stage.
+// DP_A_*: inside the attention call (attn.cu g6_attn_mark), stages 0..8 of its replay form.
+enum DecStage { DP_OTHER, DP_QA, DP_IDXKW, DP_QB, DP_ATTN, DP_OPROJ, DP_WAIT_A, DP_NORM_A, DP_ROUTER, DP_EXPERTS, DP_PUT_M,
+                DP_WAIT_M, DP_NORM_M, DP_HEAD_L, DP_HEAD_M, DP_STEP, DP_A_APPEND, DP_A_INDEX, DP_A_SELECT, DP_A_ABSORB,
+                DP_A_SCORES, DP_A_NORMALIZE, DP_A_CONTEXT, DP_A_MERGE, DP_A_VPROJ, DP_GAP, NDP };
+inline const char* dp_name(int k)
+{
+    static const char* n[NDP] = {"other", "q_a+kv_a", "idx_k+idx_w", "q_b+idx_q", "attention", "o_proj+put", "wait(attn)",
+                                 "reduce+norm(attn)", "router+plan", "experts", "put(mlp)", "wait(mlp)", "reduce+norm(mlp)",
+                                 "head local", "head merge", "step in/out+embed", "attn append", "attn index scores",
+                                 "attn select/reuse", "attn absorb", "attn mla scores", "attn normalize", "attn context",
+                                 "attn merge", "attn value project", "gap between main steps"};
+    return n[k];
+}
+inline void dp_print(const char* tag, const char* how, const double (*t)[NDP], const long* steps)
+{
+    for (int M = 1; M <= MX; ++M)
+    {
+        if (!steps[M]) continue;
+        double tot = 0;
+        for (int k = 0; k < DP_GAP; ++k) tot += t[M][k];
+        fprintf(stderr, "# %s decode stage profile (%s), M=%d, %ld steps, ms per step:", tag, how, M, steps[M]);
+        for (int k = 0; k < NDP; ++k)
+            if (t[M][k] > 0) fprintf(stderr, " %s %.3f (%.1f%%),", dp_name(k), t[M][k] / steps[M], 100 * t[M][k] / (tot > 0 ? tot : 1));
+        fprintf(stderr, " step %.3f\n", tot / steps[M]);
+    }
+}
+
+// G6_DEC_PROF=1 (g6m4, plain launches only): synchronizes the stream at every mark, so it is a breakdown of where a
+// step's time goes, never a speed number. Totals per row count M (set by the driver).
 struct DecProf
 {
     bool on = false;
     int M = 1;
-    double t[MX + 1][8] = {}, last = 0;
+    double t[MX + 1][NDP] = {}, last = 0;
     long steps[MX + 1] = {};
     static double now() { timespec s; clock_gettime(CLOCK_MONOTONIC, &s); return s.tv_sec * 1e3 + s.tv_nsec * 1e-6; }
-    void print(const char* tag, int nl) const
-    {
-        static const char* n[8] = {"projections", "attention", "o_proj+put", "wait+reduce+norm", "router+experts+put", "head", "step in/out+embed", "other"};
-        for (int M = 1; M <= MX; ++M)
-        {
-            if (!steps[M]) continue;
-            double tot = 0;
-            for (double v : t[M]) tot += v;
-            fprintf(stderr, "# %s decode stage profile, M=%d, %ld steps (ms per step, synchronized):", tag, M, steps[M]);
-            for (int i = 0; i < 8; ++i) fprintf(stderr, " %s %.3f (%.0f%%),", n[i], t[M][i] / steps[M], 100 * t[M][i] / (tot > 0 ? tot : 1));
-            fprintf(stderr, " total %.3f; per layer us: attention %.1f, wait+reduce+norm %.1f (two collectives)\n", tot / steps[M],
-                    t[M][1] * 1000 / steps[M] / nl, t[M][3] * 1000 / steps[M] / nl);
-        }
-    }
 };
 inline DecProf& dec_prof() { static DecProf p; return p; }
+
+// G6_DEC_EVPROF=N (graph form): the same marks as event record nodes in the captured main-step graphs, read by the host
+// after each main step, so stages are timed as the graph runs. Every main-step graph carries the same mark sequence
+// (checked at capture). Prints the totals every N main steps. DP_GAP is GPU time from the end of one main step to the
+// start of the next: draft steps plus host work.
+struct EvProf
+{
+    int every = 0;
+    bool rec = false;                 // inside a main-step capture
+    int n = 0;                        // marks so far in the capture
+    std::vector<cudaEvent_t> ev;
+    std::vector<int> stage;
+    cudaEvent_t after = nullptr;      // recorded by the host when it has read a step (start of the next gap)
+    bool have_after = false;
+    double t[MX + 1][NDP] = {};
+    long steps[MX + 1] = {}, total = 0;
+};
+inline EvProf& ev_prof()
+{
+    static EvProf p = [] {
+        EvProf e;
+        const char* v = getenv("G6_DEC_EVPROF");
+        e.every = v ? atoi(v) : 0;
+        if (e.every > 0) G6RT_CK(cudaEventCreate(&e.after));
+        return e;
+    }();
+    return p;
+}
 inline void dmark(int k, cudaStream_t st)
 {
+    EvProf& e = ev_prof();
+    if (e.rec)
+    {
+        if (e.n == (int)e.ev.size())
+        {
+            cudaEvent_t x;
+            G6RT_CK(cudaEventCreate(&x));
+            e.ev.push_back(x);
+            e.stage.push_back(k);
+        }
+        else if (e.stage[e.n] != k) die("G6_DEC_EVPROF: main-step graphs carry different mark sequences");
+        G6RT_CK(cudaEventRecordWithFlags(e.ev[e.n++], st, cudaEventRecordExternal));
+    }
     DecProf& p = dec_prof();
     if (!p.on) return;
     G6RT_CK(cudaStreamSynchronize(st));
     const double n = DecProf::now();
     if (p.last > 0) p.t[p.M][k] += n - p.last;
     p.last = n;
+}
+inline void attn_mark(int k, void* st) { dmark(DP_A_APPEND + k, (cudaStream_t)st); }
+// host, after a main step of M rows has finished (stream synchronized)
+inline void evprof_read(int M, cudaStream_t st, int rank)
+{
+    EvProf& e = ev_prof();
+    if (e.every <= 0 || e.ev.empty()) return;
+    float ms = 0;
+    if (e.have_after && cudaEventElapsedTime(&ms, e.after, e.ev[0]) == cudaSuccess && ms > 0) e.t[M][DP_GAP] += ms;
+    for (size_t j = 1; j < e.ev.size(); ++j)
+        if (cudaEventElapsedTime(&ms, e.ev[j - 1], e.ev[j]) == cudaSuccess) e.t[M][e.stage[j]] += ms;
+    ++e.steps[M];
+    G6RT_CK(cudaEventRecord(e.after, st));
+    e.have_after = true;
+    if (++e.total % e.every == 0)
+    {
+        char tag[32];
+        snprintf(tag, sizeof tag, "rank %d", rank);
+        dp_print(tag, "graph events", e.t, e.steps);
+    }
 }
 
 inline const void* need(const Find& find, const std::string& name)
@@ -608,7 +683,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     if (phase <= 0)
     {
         if (m.graph && !y.rp_on[m.cur][M]) die("prepare(m, M) was not called before a graph step");
-        dmark(7, st);
+        dmark(DP_OTHER, st);
 #ifdef DEC_SLOT
         if (i == 0) bind::launch(b.xf_x, st);
 #else
@@ -617,12 +692,15 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         bind::launch(b.q_a, st);
         glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
         bind::launch(b.kv_a, st);
+        dmark(DP_QA, st);
         bind::launch(b.idx_k, st);
         bind::launch(b.idx_w, st);
+        dmark(DP_IDXKW, st);
         bind::launch(b.xf_qa, st);
         bind::launch(b.q_b, st);
         bind::launch(b.idx_q, st);
-        dmark(0, st);
+        dmark(DP_QB, st);
+        for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
         if (!m.graph)
         {
             const G6AttnStep s = attn_step(m, i, M, context);
@@ -689,7 +767,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     }
 #endif
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
-    dmark(1, st);
+    dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
     bind::launch(b.o_proj, st);
 #ifdef DEC_SLOT
@@ -697,7 +775,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 #else
     put_publish(m, m.sc.part[0], 2 * i, M, st);
 #endif
-    dmark(2, st);
+    dmark(DP_OPROJ, st);
 }
 #endif
 
@@ -714,7 +792,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 #endif
     Layer& y = m.layers[i];
     const bind::Layer& b = layer_for(m, i, M);
-    dmark(7, st);
+    dmark(DP_OTHER, st);
 #ifdef DEC_SLOT
     if (i == 0) bind::launch(b.xf_x, st);      // later layers: the fragment tables come from launch_consume(2i-1)
 #else
@@ -723,12 +801,14 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     bind::launch(b.q_a, st);
     glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
     bind::launch(b.kv_a, st);
+    dmark(DP_QA, st);
     bind::launch(b.idx_k, st);
     bind::launch(b.idx_w, st);
+    dmark(DP_IDXKW, st);
     bind::launch(b.xf_qa, st);
     bind::launch(b.q_b, st);
     bind::launch(b.idx_q, st);
-    dmark(0, st);
+    dmark(DP_QB, st);
 #ifdef DEC_S2
     if (m.s2on) s2_attention(m, i, M, st);
     else
@@ -743,7 +823,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
         const G6AttnStep s = attn_step(m, i, M, context);
         G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
     }
-    dmark(1, st);
+    dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
     bind::launch(b.o_proj, st);
 #ifdef DEC_SLOT
@@ -751,7 +831,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 #else
     put_publish(m, m.sc.part[0], 2 * i, M, st);
 #endif
-    dmark(2, st);
+    dmark(DP_OPROJ, st);
 }
 
 inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
@@ -764,7 +844,7 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     a.xf16 = xf ? xf->f16 : nullptr;
     a.xbf16 = xf ? xf->bf16 : nullptr;
 #endif
-    dmark(7, st);
+    dmark(DP_OTHER, st);
     // G6_WARM=1|2 (read at launch / graph capture): L2 warm-up of the next weights while the wait runs (bind.cuh warm_*,
     // loads only, no output change). 2i: this layer's router + shared fc1; 2i+1: the next layer's q_a (2: + kv_a, q_b)
     static const int warm = getenv("G6_WARM") ? atoi(getenv("G6_WARM")) : 0;
@@ -774,8 +854,9 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
         else if (c / 2 + 1 < m.nl) bind::warm_proj(layer_for(m, c / 2 + 1, M), st, warm >= 2);
     }
     glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
+    dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
-    dmark(3, st);
+    dmark(c % 2 == 0 ? DP_NORM_A : DP_NORM_M, st);
 }
 
 constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots (slots, an expert can take several), pad_[3], slot_expert[SMAX]
@@ -792,13 +873,15 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
         glue::k_router_plan<<<1, 256, 0, st>>>(m.logits, y.router_bias, M, m.plan);
         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
     }
+    dmark(DP_ROUTER, st);
     bind::launch_k1(b.k1, st);
+    dmark(DP_EXPERTS, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i + 1, st);
 #else
     put_publish(m, m.sc.part[1], 2 * i + 1, M, st);
 #endif
-    dmark(4, st);
+    dmark(DP_PUT_M, st);
 }
 
 // G6_ROUTE_LOG=<file> (measurement only; set before prepare/capture so the graphs carry the copies): one JSON line per
@@ -933,6 +1016,7 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
     bind::launch(H.lm_head, st);
     if (m.rs) glue::k_head_local_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
     else glue::k_head_local<<<M, 1024, 0, st>>>(head_args(m, M));
+    dmark(DP_HEAD_L, st);
 }
 inline void launch_head_merge(Model& m, int M, cudaStream_t st)
 {
@@ -940,7 +1024,7 @@ inline void launch_head_merge(Model& m, int M, cudaStream_t st)
     else if (m.rs) glue::k_head_merge_rs<<<1, 32, 0, st>>>(head_args(m, M), m.tok);
     else if (m.nc > 0) glue::k_head_merge_tp<<<M, 1024, 0, st>>>(head_args(m, M));
     else glue::k_head_merge<<<1, 32, 0, st>>>(head_args(m, M));
-    dmark(5, st);
+    dmark(DP_HEAD_M, st);
 }
 // host: top_p misses so far (rows whose nucleus reached past the candidates)
 inline unsigned topp_misses(const Model& m)
@@ -955,12 +1039,16 @@ inline unsigned topp_misses(const Model& m)
 // parts are captured as two graphs and launched back to back on one stream (part -1 = the whole step, as before)
 inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part = -1, int ls = 0)
 {
+    EvProf& ep = ev_prof();
+    if (part != 1) ep.n = 0;
+    ep.rec = ep.every > 0;
+    if (ep.rec || getenv("G6_DEC_PROF")) g6_attn_mark = attn_mark;
     if (part != 1)
     {
-        dmark(7, st);
+        dmark(DP_OTHER, st);
         launch_step_in(m, st);
         launch_embed(m, M, st);
-        dmark(6, st);
+        dmark(DP_STEP, st);
     }
     const int l0 = part == 1 ? ls : 0, l1 = part == 0 ? ls : m.nl;
     for (int i = l0; i < l1; ++i)
@@ -971,11 +1059,14 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
         launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st);
         if (m.dfl_tap) m.dfl_tap(m, i, M, st);
     }
-    if (part == 0) return;
-    launch_head_local(m, M, st);
-    launch_head_merge(m, M, st);
-    launch_step_out(m, M, st);
-    dmark(6, st);
+    if (part != 0)
+    {
+        launch_head_local(m, M, st);
+        launch_head_merge(m, M, st);
+        launch_step_out(m, M, st);
+        dmark(DP_STEP, st);
+    }
+    ep.rec = false;
 }
 
 // ---------------------------------------------------------------- MTP draft pass (M6): layer 78 as a one-layer Model

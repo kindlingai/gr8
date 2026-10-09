@@ -17,6 +17,9 @@
 #include <limits.h>
 #include <algorithm>
 #include <cmath>
+// profile hook (g6m4 G6_DEC_EVPROF / G6_DEC_PROF): called between the decode attention kernels with the stage just ended
+extern "C" { void (*g6_attn_mark)(int stage,void* stream)=nullptr; }
+#define AMARK(k) do{if(g6_attn_mark)g6_attn_mark((k),(void*)stream);}while(0)
 namespace ga {
 constexpr int TOP=2048, PART=8;
 constexpr int KV_BYTES=656, IDX_BYTES=132;
@@ -337,20 +340,23 @@ constexpr int AVP_ROWS=8;   // S2 batched steps: up to G6_MX rows in chunks of 8
 #else
 constexpr int AVP_ROWS=3;
 #endif
+// n may exceed AVP_ROWS: the rows are staged AVP_ROWS at a time and the weight row stays in registers (gr8 #75)
 template<class Input>
 __global__ void absorb_m(Input input,int start,int n,float* q,float* rope){
     auto a=resolve(input);if(!a.active)return;
     int h=blockIdx.y,d=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;
     __shared__ float qb[AVP_ROWS][192];
-    for(int i=t;i<n*192;i+=256){int row=i/192,k=i%192;qb[row][k]=hfloat(a.q_b,((int64_t)(start+row)*a.heads+h)*256+k);}
     float u[6];
     #pragma unroll
     for(int m=0;m<6;m++)u[m]=bfloat(a.uk,((int64_t)h*512+d)*192+lane+32*m);
-    __syncthreads();
-    for(int row=0;row<n;row++){float sum=0;
-        #pragma unroll
-        for(int m=0;m<6;m++)sum=fmaf(qb[row][lane+32*m],u[m],sum);
-        sum=warp_sum(sum);if(lane==0)q[((int64_t)row*a.heads+h)*512+d]=sum;}
+    for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
+        if(c)__syncthreads();
+        for(int i=t;i<nc*192;i+=256){int row=i/192,k=i%192;qb[row][k]=hfloat(a.q_b,((int64_t)(start+c+row)*a.heads+h)*256+k);}
+        __syncthreads();
+        for(int row=0;row<nc;row++){float sum=0;
+            #pragma unroll
+            for(int m=0;m<6;m++)sum=fmaf(qb[row][lane+32*m],u[m],sum);
+            sum=warp_sum(sum);if(lane==0)q[((int64_t)(c+row)*a.heads+h)*512+d]=sum;}}
     if(blockIdx.x==0&&threadIdx.x<32)for(int row=0;row<n;row++){int r=start+row;float c,s;RCS(a.positions[r],threadIdx.x,c,s);int j=threadIdx.x;
         float x=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+192+2*j),y=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+193+2*j);
         rope[((int64_t)row*a.heads+h)*64+2*j]=x*c-y*s;rope[((int64_t)row*a.heads+h)*64+2*j+1]=y*c+x*s;}
@@ -360,15 +366,17 @@ __global__ void value_project_m(Input input,int start,int n,const float* context
     auto a=resolve(input);if(!a.active)return;
     int h=blockIdx.y,d=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;
     __shared__ float ctx[AVP_ROWS][512];
-    for(int i=t;i<n*512;i+=256){int row=i/512,k=i%512;ctx[row][k]=context[((int64_t)row*a.heads+h)*512+k];}
     float u[16];
     #pragma unroll
     for(int m=0;m<16;m++)u[m]=bfloat(a.uv,((int64_t)h*256+d)*512+lane+32*m);
-    __syncthreads();
-    for(int row=0;row<n;row++){float sum=0;
-        #pragma unroll
-        for(int m=0;m<16;m++)sum=fmaf(ctx[row][lane+32*m],u[m],sum);
-        sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)(start+row)*a.heads+h)*256+d]=__float2half_rn(sum);}
+    for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
+        if(c)__syncthreads();
+        for(int i=t;i<nc*512;i+=256){int row=i/512,k=i%512;ctx[row][k]=context[((int64_t)(c+row)*a.heads+h)*512+k];}
+        __syncthreads();
+        for(int row=0;row<nc;row++){float sum=0;
+            #pragma unroll
+            for(int m=0;m<16;m++)sum=fmaf(ctx[row][lane+32*m],u[m],sum);
+            sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)(start+c+row)*a.heads+h)*256+d]=__float2half_rn(sum);}}
 }
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
@@ -484,7 +492,7 @@ static bool launch_absorb_rows(const G6Attn& a,Input input,Work& w,int start,int
 #ifndef DEC_S2
     if(n>AVP_ROWS)return false;
 #endif
-    for(int c=0;c<n;c+=AVP_ROWS){Work x=w;x.q+=(int64_t)c*a.heads*512;x.rope+=(int64_t)c*a.heads*64;launch_absorb_m(a,input,x,start+c,std::min(n-c,AVP_ROWS),st);}
+    launch_absorb_m(a,input,w,start,n,st);
     return true;
 }
 template<class Input>
@@ -492,7 +500,7 @@ static bool launch_value_project_rows(const G6Attn& a,Input input,Work& w,int st
 #ifndef DEC_S2
     if(n>AVP_ROWS)return false;
 #endif
-    for(int c=0;c<n;c+=AVP_ROWS){Work x=w;x.context+=(int64_t)c*a.heads*512;launch_value_project_m(a,input,x,start+c,std::min(n-c,AVP_ROWS),st);}
+    launch_value_project_m(a,input,w,start,n,st);
     return true;
 }
 #endif
@@ -500,19 +508,28 @@ template<class Input>
 static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream){
     cudaError_t e;
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);
-        if(a.reuse_indices)ga::reuse<<<n,256,0,stream>>>(input,start);else{e=ga::make_index(a,input,w,start,n,stream,nullptr);if(e!=cudaSuccess)return e;}
+        if(a.reuse_indices){AMARK(1);ga::reuse<<<n,256,0,stream>>>(input,start);}
+        else{prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);AMARK(1);
+            e=SELECT_INDEX(a,input,w,start,n,stream);if(e!=cudaSuccess)return e;}
+        AMARK(2);
 #if defined(DEC_AVP) && DEC_AVP
         if(launch_absorb_rows(a,input,w,start,n,stream)){}else
 #endif
         ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,start,w.q,w.rope);
+        AMARK(3);
         ga::launch_mla_scores(a,input,w,start,n,stream);
+        AMARK(4);
         ga::normalize<<<n*a.heads,256,0,stream>>>(input,w.prob);
+        AMARK(5);
         ga::launch_context_parts(a,input,w,start,n,stream);
+        AMARK(6);
         ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        AMARK(7);
 #if defined(DEC_AVP) && DEC_AVP
         if(launch_value_project_rows(a,input,w,start,n,stream)){}else
 #endif
         ga::value_project<<<dim3(32,a.heads,n),256,0,stream>>>(input,start,w.context);
+        AMARK(8);
     }return cudaGetLastError();
 }
 #if defined(G6_CP) && G6_CP
@@ -666,11 +683,28 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
     ga::ReplayInput input{a,r->cell};
     ga::append_kv<<<a.rows,256,0,stream>>>(input);
     if(!a.reuse_indices)ga::append_index<<<a.rows,128,0,stream>>>(input);
+    AMARK(0);
     return (int)ga::run_body(a,input,w,stream);
 }
 
 #include "prefill.cuh"
 #include "prefill-qo-bind.cuh"
+
+// The decode RoPE table (ga::cs_t) for boots without QO attention, where g6_attn_qo_create never builds it: the same
+// {cos, sin} per (pos, j) from ga::cs (rope_table), so decode output is unchanged and absorb skips the FP64 sincos.
+extern "C" int g6_attn_rope_init(int cap,void* s){
+#if PF_QOROPE && PF_ROPE2
+    cudaStream_t st=(cudaStream_t)s;float2* t=nullptr;
+    cudaError_t e=cudaMalloc(&t,(size_t)cap*32*sizeof(float2));if(e!=cudaSuccess)return (int)e;
+    gqi::rope_table<<<(cap*32+255)/256,256,0,st>>>(t,cap*32);
+    const float2* tc=t;void *at=nullptr,*ac=nullptr;
+    e=cudaGetSymbolAddress(&at,ga::g_rope);if(e==cudaSuccess)e=cudaGetSymbolAddress(&ac,ga::g_rope_cap);
+    if(e==cudaSuccess)e=g6h2d::copy(at,&tc,sizeof tc,st);if(e==cudaSuccess)e=g6h2d::copy(ac,&cap,sizeof cap,st);
+    return (int)(e!=cudaSuccess?e:cudaGetLastError());
+#else
+    (void)cap;(void)s;return 0;
+#endif
+}
 
 #if defined(G6_CP) && G6_CP
 // ---- J4 CP entry points (attn.h). Graph form (cell) mirrors g6_attn_replay_run: validation + appends in the front stage.

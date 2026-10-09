@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-09: decode step profile and attention kernels (#75, #76)
+
+- `G6_DEC_EVPROF=N`: per-stage decode step times from event-record nodes in the captured main-step graphs (attention
+  split into its kernels), printed every N main steps in each rank's log.
+- Decode attention scores and context load each key once for a group of heads; absorb and value project run all rows of
+  an S2 step in one launch with the weights loaded once; `k_ar_add_norm` loads all peers before adding. Bit-identical
+  (`dec_heads_test` in `scripts/c1_tests.sh`). S2 at 24 rows: attention 51 -> 28 ms per step.
+- Boots without QO attention (every `--s2` boot) now build the decode RoPE table; absorb computed RoPE in FP64 before.
+- S2 aggregate decode (code, TP4, 2200 MHz): S4 55.6 -> 60.3 tok/s, S8 67.8 -> 74.0. One session and prefill
+  unchanged.
+- `--s2` + `G6_S2_ADAPT=1` (opt-in): each round's MTP draft count from the sessions' accept counts and the S2 step costs.
+
 ## 2026-10-08: prompt-prefix reuse, `--reuse-prefix` (ported from the K1/CP serve line)
 
 - `g6m4 --reuse-prefix` keeps the attention caches of the longest common prefix of the new prompt and the previous

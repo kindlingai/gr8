@@ -10,6 +10,11 @@
 //            The k1 split class of a main step is the class of a session's K+1 rows (as its solo step), not of M.
 // A session leaves when its emit says finished (right after the verify, as mtp_sequence returns there) or at the start
 // of the first round after it holds n_gen tokens (mtp_sequence runs that round's draft steps first, so this does too).
+// Adaptive draft count (gr8 #76, Batch::adapt): every session in a round verifies the same k <= K drafts. At the end of a
+// round, before the chain steps, k for the next round is chosen from each session's accept rates (SpecLen, accept counts
+// only, so every rank chooses the same k) and the S2 step costs (S2Cost): a verify row costs ~7 ms in a shared step, so
+// at many sessions the K-th draft no longer pays. The main step's k1 class stays row_class(K+1), so a row's bits do not
+// depend on k; only which drafts are verified changes.
 // Sessions join at round boundaries (Batch::admit) and may be cancelled there (Batch::cancel); see class Batch.
 // Within a step the sessions are in ascending index and each session's rows are contiguous, in position order.
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
@@ -20,6 +25,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "spec_len.h"
 
 namespace s2
 {
@@ -54,8 +60,9 @@ struct Step
     // the step's shape: kind and row count (the class follows M). The graph key adds the context bucket; the session
     // layout is data (S2In), not part of the key
     std::string key() const
-    {
-        return std::string(kind == MAIN ? "m" : kind == DRAFT ? "d" : "c") + std::to_string(M());
+    {   // a main step's k1 class is part of its graph: a 4-row prompt tail (class 5) and a 2-session round of 2 rows (class 3)
+        if (kind == MAIN) return "m" + std::to_string(M()) + "c" + std::to_string(cls);
+        return std::string(kind == DRAFT ? "d" : "c") + std::to_string(M());
     }
 };
 
@@ -94,6 +101,21 @@ struct Hooks
 // Acceptance and draft state stay here; the scheduler keeps generations and pages. mtp_batch below = admit(all) and
 // rounds in slot order until none is active.
 constexpr int S2N_SLOTS = 8;
+// G6_S2_ADAPT=1 (every rank, read at boot): choose each round's draft count. Off by default: on code and prose at 1-8
+// sessions it measured within 0-3% of K drafts every round (the K-th draft is still accepted ~60% of the time), and
+// its extra main-step graphs take ~1 GiB
+inline bool adapt_env() { const char* e = getenv("G6_S2_ADAPT"); return e && atoi(e) != 0; }
+// Step times at TP4, 2200 MHz, contexts < 2K (G6_DEC_EVPROF / G6_S2_ROUNDLOG, gr8 #75), ms
+struct S2Cost
+{
+    double main0 = 44, main_row = 7;            // verify step of M rows: main0 + main_row * M
+    double draft0 = 2.1, draft_sess = 0.25;     // first-form draft step of S sessions' accepted rows
+    double chain0 = 2.0, chain_sess = 0.15;     // chain step, one row per session
+    double round(int S, int k) const
+    {
+        return main0 + main_row * S * (k + 1) + draft0 + draft_sess * S + (k - 1) * (chain0 + chain_sess * S);
+    }
+};
 class Batch
 {
 public:
@@ -109,8 +131,10 @@ public:
             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
             if (prompt(q, ss[k])) live.push_back(q);
         }
+        std::vector<int> all;
+        for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
         { std::vector<int> evs; for (size_t k = 0; k < live.size(); ++k) evs.push_back(Step::TAIL);
-          chain(live, evs); } // first-step timer: post-admit chains follow the tail steps
+          chain(live, evs, choose(all)); } // first-step timer: post-admit chains follow the tail steps
     }
     bool active(int q) const { const St& x = st_[q]; return x.on && !x.done && (int)x.tokens.size() - x.n < x.s.n_gen; }
     bool finished(int q) const { return st_[q].on && !active(q); }
@@ -122,6 +146,8 @@ public:
         return std::vector<int>(x.tokens.begin() + std::min((size_t)x.n, end), x.tokens.begin() + end);
     }
     const Stats& stats(int q) const { return stats_[q]; }
+    // choose each round's draft count (k <= K); off: every round verifies K drafts
+    void adapt(bool on) { adapt_ = on; }
     // the slot can be admitted again (after finished(q) or cancel(q))
     void release(int q) { st_[q].on = false; }
 
@@ -152,12 +178,14 @@ private:
         v.event = Step::ROUND;
         for (int q : act) if (st_[q].rounds == 0) { v.event = Step::DECODE1; break; } // strongest class in the step
         std::vector<int> base(S2N_SLOTS, 0);
+        int k = K_;                                               // drafts verified: the fewest any session holds
+        for (int q : act) k = std::min(k, st_[q].k);
         for (int q : act)
         {
             St& x = st_[q];
             base[q] = (int)x.tokens.size() - 1;
             std::vector<Row> rows;
-            for (int r = 0; r <= K_; ++r)
+            for (int r = 0; r <= k; ++r)
                 rows.push_back(Row{q, r ? x.d[r] : x.tokens[base[q]], base[q] + r, base[q] + r + 1, -1});
             add_rows(v, q, rows, x.rounds == 0 ? Step::DECODE1 : Step::ROUND); // first-step timer: per-session E2
         }
@@ -171,9 +199,10 @@ private:
             St& x = st_[q];
             const int* so = &t[v.row0[i]];
             int a = 0;
-            while (a < K_ && x.d[a + 1] == so[a]) ++a;
+            while (a < k && x.d[a + 1] == so[a]) ++a;
             for (int r = 0; r <= a; ++r) x.tokens.push_back(so[r]);
-            if (h_.round) h_.round(q, stats_[q].rounds, base[q], a, K_);
+            sl_[q].observe(k, a, nullptr, 0);
+            if (h_.round) h_.round(q, stats_[q].rounds, base[q], a, k);
             ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a];
             ++st_[q].rounds;
             acc[q] = a;
@@ -202,7 +231,7 @@ private:
             std::vector<int> evs;
             for (int q : on) { size_t i = 0; while (i < v.sess.size() && v.sess[i] != q) ++i;
                 evs.push_back(i < v.sess.size() ? v.ev[i] : int(v.event)); }
-            chain(on, evs);
+            chain(on, evs, choose(on));
         }
     }
 
@@ -213,8 +242,32 @@ private:
         int n = 0;
         bool on = false, done = false;
         int rounds = 0; // first-step timer: per-session decode rounds; round 1 MAIN = DECODE1 (design E2)
+        int k = 0;      // drafts held for the next verify (d[1..k])
     };
+    // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round
+    int choose(const std::vector<int>& qs) const
+    {
+        if (!adapt_ || qs.empty()) return K_;
+        int best = K_;
+        double br = -1;
+        for (int k = 1; k <= K_; ++k)
+        {
+            double e = 0;
+            for (int q : qs)
+            {
+                double s = 1;
+                e += 1;
+                for (int j = 1; j <= k; ++j) { s *= sl_[q].rate(j); e += s; }
+            }
+            const double r = e / cost_.round((int)qs.size(), k);
+            if (r > br * (1 + 1e-9)) { br = r; best = k; }
+        }
+        return best;
+    }
     int K_, max_rows_;
+    bool adapt_ = false;
+    S2Cost cost_;
+    std::vector<g6rt::SpecLen> sl_ = std::vector<g6rt::SpecLen>(S2N_SLOTS);
     long round_no_ = 0, cur_round_ = -1; // G6_S2_ROUNDLOG: id of the round in progress and its active-session count
     int cur_active_ = 0;
     Hooks h_;
@@ -241,11 +294,12 @@ private:
         for (int r = 0; r < M; ++r) v.push_back(Row{q, next[r], pos0 + r, pos0 + r + 2, -1});
         return v;
     }
-    // chain steps for the sessions in qs (each: base = its tokens.size() - 1; d[1] set; fills d[2..K])
-    void chain(const std::vector<int>& qs, const std::vector<int>& evs)
+    // chain steps for the sessions in qs (each: base = its tokens.size() - 1; d[1] set; fills d[2..k])
+    void chain(const std::vector<int>& qs, const std::vector<int>& evs, int k)
     {
+        for (int q : qs) st_[q].k = k;
         // first-step timer: each session's chain carries THAT session's round class (evs, parallel to qs).
-        for (int j = 1; j < K_ && !qs.empty(); ++j)
+        for (int j = 1; j < k && !qs.empty(); ++j)
         {
             Step s;
             s.kind = Step::CHAIN;
@@ -271,6 +325,7 @@ private:
         x.tokens = p.prompt;
         x.n = (int)p.prompt.size();
         x.d.assign(K_ + 1, 0);
+        sl_[q] = g6rt::SpecLen();
         stats_[q] = Stats();
         stats_[q].acc.assign(K_ + 1, 0);
         const int n = x.n, PS = (n - p.first + p.chunk - 1) / p.chunk;

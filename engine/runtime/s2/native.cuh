@@ -156,6 +156,7 @@ class NativeDispatch {
             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
         }
         fence(); const auto out = *(draft ? c_.draft_output : c_.output);
+        if (!draft) g6rt::evprof_read(rows,c_.stream,c_.main.rank);
         if (tmr_) // first-step timer: launch+fence span (design r4); labels per r3, from the PRE-insertion decision, never graphs_.count
             fprintf(stderr,"# step_tmr rank %d step %llu %s %s %s %lld us (graph_key %s rows %d ctx %d reqs %s)\n",c_.main.rank,
                 (unsigned long long)input.step,step_kind(l),step_event(l),
@@ -230,7 +231,8 @@ public:
     // graphs are keyed by (kind, M, bucket), not by session: a retired session leaves them valid
     void retire(const Slot&) {}
     // Boot capture of every graph key a decode step can reach, before serving (a launch of any other key fails):
-    //   main : M in 1..chunk (prompt tails) U S*(K+1), S = 1..sessions     -> two graphs (split A / B)
+    //   main : M in 1..chunk (prompt tails, class row_class(M)) U S*(k+1), S = 1..sessions, k = 1..K with G6_S2_ADAPT
+    //          (else k = K), class row_class(K+1)                          -> two graphs (split A / B)
     //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
@@ -240,12 +242,14 @@ public:
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
         require(nbk >= 1 && nbk == c_.draft.d.nbk && nbk <= g6rt::NBK, "main/draft context buckets differ");
-        std::set<int> mains, drafts, chains;
-        for (int M = 1; M <= chunk; ++M) { mains.insert(M); drafts.insert(M); }
-        for (int S = 1; S <= N; ++S) mains.insert(S * (K + 1));
+        std::set<std::pair<int,int>> mains;   // (M, k1 class)
+        std::set<int> drafts, chains;
+        for (int M = 1; M <= chunk; ++M) { mains.insert({M, s2::row_class(M)}); drafts.insert(M); }
+        for (int S = 1; S <= N; ++S)
+            for (int k = s2::adapt_env() ? 1 : K; k <= K; ++k) mains.insert({S * (k + 1), s2::row_class(K + 1)});
         for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
         if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
-        for (int M : mains) require(M <= g6rt::MX, "main step rows exceed G6_MX");
+        for (const auto& mc : mains) require(mc.first <= g6rt::MX, "main step rows exceed G6_MX");
         for (int M : drafts) require(M <= g6rt::MX, "draft step rows exceed G6_MX");
         const auto t0 = std::chrono::steady_clock::now();
         size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0,&total));
@@ -253,11 +257,10 @@ public:
         c_.main.s2on = c_.draft.d.s2on = true; fence();
         size_t keys = 0, graphs = 0;
         // one synthetic step: ns sessions of rows each (first form: one session of M rows; chain: M sessions of one row)
-        auto one = [&](bool draft, bool chain, int M, int k) {
+        auto one = [&](bool draft, bool chain, int M, int k, int cls) {
             auto& model = draft ? c_.draft.d : c_.main;
             g6rt::S2In h{};
-            h.ns = chain ? M : 1; h.cls = s2::row_class(M);
-            if (!draft && M > K + 1 && M % (K + 1) == 0) h.cls = s2::row_class(K + 1);   // round main step: a session's K+1 rows (s2_batch.h)
+            h.ns = chain ? M : 1; h.cls = cls;
             for (int j = 0; j < h.ns; ++j) {
                 h.sess[j] = j; h.row0[j] = chain ? j : 0; h.rows[j] = chain ? 1 : M; h.ctx[j] = model.bk[k]; h.base[j] = 0; h.src0[j] = 0;
             }
@@ -270,14 +273,15 @@ public:
                 g.a = capture([&]{g6rt::launch_step(c_.main,M,model.bk[k],c_.stream,0,c_.split);});
                 g.b = capture([&]{g6rt::launch_step(c_.main,M,model.bk[k],c_.stream,1,c_.split);});
             }
-            const std::string key = launch_key(std::string(draft ? (chain ? "c" : "d") : "m") + std::to_string(M), k);   // = Dispatch graph_key
+            const std::string key = launch_key(draft ? std::string(chain ? "c" : "d") + std::to_string(M)
+                                                     : "m" + std::to_string(M) + "c" + std::to_string(cls), k);   // = Dispatch graph_key (s2::Step::key)
             graphs += g.b ? 2 : 1; ++keys;
             graphs_.emplace(key,std::move(g));
         };
         for (int k = 0; k < nbk; ++k) {
-            for (int M : mains) one(false,false,M,k);
-            for (int M : drafts) one(true,false,M,k);
-            for (int M : chains) one(true,true,M,k);
+            for (const auto& mc : mains) one(false,false,mc.first,k,mc.second);
+            for (int M : drafts) one(true,false,M,k,s2::row_class(M));
+            for (int M : chains) one(true,true,M,k,s2::row_class(M));
         }
         c_.main.s2on = on_main; c_.draft.d.s2on = on_draft; fence();
         G6RT_CK(cudaMemGetInfo(&free1,&total));

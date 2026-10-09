@@ -28,6 +28,8 @@ struct G6Attn {
 #endif
 };
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
+extern "C" void (*g6_attn_mark)(int stage,void* stream);
+extern "C" int g6_attn_rope_init(int cap,void* stream);   // decode RoPE table when no QO attention builds it   // decode profile hook (attn.cu AMARK); null = off
 extern "C" int g6_attn_run(const G6Attn*,void* scratch,size_t bytes,void* stream);
 // Test/loader entrypoint: append only, same equations as the full path.
 extern "C" int g6_attn_append(const G6Attn*,void* stream);

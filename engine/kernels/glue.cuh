@@ -286,15 +286,30 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
     const int col0 = blockIdx.x * RN_COLS + threadIdx.x * 8;
     const size_t off = ((size_t)m * HID + col0) * 2;
     float x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    for (int p = 0; p < a.f.nr; ++p)
-    {
-        const uint4 v = __ldcv(reinterpret_cast<const uint4*>(peer_slot(a.f, step, a.c, p) + off));
-        float b[8];
-        bf16x8_to_f(v, b);
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) x[k] += b[k];
-    }
     float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);
+    if (a.f.nr == g6nr::NR)
+    {   // every peer load in flight before the adds (one pinned-memory latency instead of NR); adds in rank order
+        uint4 v[g6nr::NR];
+        #pragma unroll
+        for (int p = 0; p < g6nr::NR; ++p) v[p] = __ldcv(reinterpret_cast<const uint4*>(peer_slot(a.f, step, a.c, p) + off));
+        #pragma unroll
+        for (int p = 0; p < g6nr::NR; ++p)
+        {
+            float b[8];
+            bf16x8_to_f(v[p], b);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) x[k] += b[k];
+        }
+    }
+    else
+        for (int p = 0; p < a.f.nr; ++p)
+        {
+            const uint4 v = __ldcv(reinterpret_cast<const uint4*>(peer_slot(a.f, step, a.c, p) + off));
+            float b[8];
+            bf16x8_to_f(v, b);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) x[k] += b[k];
+        }
     const float4 r0 = r[0], r1 = r[1];
     x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
     x[4] += r1.x; x[5] += r1.y; x[6] += r1.z; x[7] += r1.w;

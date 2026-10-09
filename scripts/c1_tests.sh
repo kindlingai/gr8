@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build (if needed) and run the unit tests on ONE GPU node (a GB10 Spark with CUDA 13): row_budget_test (dense GEMVs and K1
-# against chunks of 8 rows) and s2_attn_test (batched attention over several sessions against the per-session calls;
-# needs EXTRA=-DDEC_S2, else it only prints SKIP).
+# against chunks of 8 rows), s2_attn_test (batched attention over several sessions against the per-session calls;
+# needs EXTRA=-DDEC_S2, else it only prints SKIP) and dec_heads_test (the decode attention kernels against the ones they
+# replaced).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -56,6 +57,10 @@ if [ "$TEST" = all ] || [ "$TEST" = s2_attn_test ]; then
     *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
     *) build_run s2_attn_test || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
   esac
+fi
+if [ "$TEST" = all ] || [ "$TEST" = dec_heads_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  build_run dec_heads_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"
