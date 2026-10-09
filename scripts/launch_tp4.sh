@@ -35,14 +35,19 @@
 #   NOHASH=1          skip the sha256 check of every pack tensor at load (faster boot; run it once without first)
 #   SOURCES_ROOT=DIR  sparse packs (packs/rank<r>.sources, convert.py --v2-refs): where the v2 files are on the
 #                     nodes (default: the root rank<r>.sources names)
+#   PACKS=packs       where the rank packs are (relative to G6_HOME, or absolute)
+#   V2=DIR V2_SLICES=DIR V2_WIDTHS=FILE  exlr8 v2 experts straight from the raw width files in DIR (g6m4 --v2): the
+#                     rank packs are base packs (TR3), V2_SLICES holds the index slices (tp4/k<K>/rank<r>.safetensors)
+#                     and V2_WIDTHS is the width manifest. Same paths on every node
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   READY_TMO=900     seconds to wait for all four ranks to load
-#   FRONT=py          front end: py = frontend/g6front (Python), rs = g6front-rs (Rust, issue #15; build it with
-#                     scripts/build_front.sh). Same flags, same API; FRONT_BIN=path overrides $REPO/bin/g6front-rs
+#   FRONT=rs          front end: rs = g6front-rs (Rust, issue #15; the default, built by scripts/build_front.sh; without
+#                     it the launcher falls back to py), py = frontend/g6front (Python). Same flags, same API;
+#                     FRONT_BIN=path overrides $REPO/bin/g6front-rs
 set -eu
 . "$(dirname "$0")/common.sh"
 [ "$NRANK" = 4 ] || { echo "launch_tp4.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
-CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-900}
+CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-900}; PACKS=${PACKS:-packs}
 DFLASH=${DFLASH:-$([ -n "${MTP:-}" ] && echo 0 || echo 1)}   # an explicit MTP=k means the MTP layer
 MTP=${MTP:-2}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}
 if [ "$DFLASH" = 1 ]; then
@@ -76,7 +81,11 @@ SERVE_ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --p
 for ((r = NRANK - 1; r >= 0; r--)); do
   # a sparse pack (convert.py --v2-refs) reads its exlr8 v2 expert bytes from the v2 files at load
   SRCARGS=""
-  on $r "test -e $G6_HOME/packs/rank$r.sources" && SRCARGS="--sources packs/rank$r.sources ${SOURCES_ROOT:+--sources-root $SOURCES_ROOT}"
+  if [ -n "${V2:-}" ]; then
+    SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
+  else
+    on $r "cd $G6_HOME && test -e $PACKS/rank$r.sources" && SRCARGS="--sources $PACKS/rank$r.sources ${SOURCES_ROOT:+--sources-root $SOURCES_ROOT}"
+  fi
   QPARGS=""
   [ "$PF_OWN" = 4 ] && [ "${QP_PACK:-0}" = 1 ] && QPARGS="--qp-manifest packs/qp.rank$r.manifest.json --qp-pack packs/qp.rank$r.pack"
   [ "$DFLASH" = 1 ] && QPARGS="$QPARGS --dflash-manifest packs/dflash.r$r.manifest.json --dflash-pack packs/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
@@ -84,10 +93,27 @@ for ((r = NRANK - 1; r >= 0; r--)); do
   # the engine: backgrounding the whole && list left a shell holding the ssh session open until the engine exited
   on $r "cd $G6_HOME && rm -rf serve && mkdir -p serve out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
-      --proxy-cpu $PROXY_CPU --manifest packs/rank$r.manifest.json --pack packs/rank$r.pack --image --layers all $SRCARGS \
+      --proxy-cpu $PROXY_CPU --manifest $PACKS/rank$r.manifest.json --pack $PACKS/rank$r.pack --image --layers all $SRCARGS \
       --serve $G6_HOME/serve $SERVE_ARGS $QPARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait
+# the front end starts while the engines load (Python imports, the tokenizer): it retries the engine socket, and its
+# /health stays 503 until the shim (started once every rank is ready) answers
+PY=${PY:-$G6_HOME/venv/bin/python}
+mkdir -p "$G6_HOME/run" "$G6_HOME/out"; SOCK=$G6_HOME/run/engine.sock; rm -f "$SOCK"
+FRONT_RS="${FRONT_BIN:-$REPO/bin/g6front-rs}"
+if [ "${FRONT:-rs}" = rs ] && [ ! -x "$FRONT_RS" ]; then
+  [ "${FRONT:-}" = rs ] && { echo "FRONT=rs: $FRONT_RS missing (scripts/build_front.sh)"; exit 1; }
+  echo "no $FRONT_RS (scripts/build_front.sh): using the Python front end"
+  FRONT=py
+fi
+if [ "${FRONT:-rs}" = rs ]; then
+  FRONT_CMD="$FRONT_RS"
+else
+  FRONT_CMD="$PY -m g6front"
+fi
+(cd "$REPO/frontend" && { nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
+  $FRONT_CMD --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
 echo "engines started; waiting for four ready files (up to ${READY_TMO}s)"
 t0=$(date +%s)
 while :; do
@@ -97,26 +123,16 @@ while :; do
     on $r "p=\$(cat $G6_HOME/out/g6m4.pid 2>/dev/null); [ -z \"\$p\" ] || kill -0 \$p 2>/dev/null" || { echo "rank $r exited; tail of its log:"; on $r "tail -20 $G6_HOME/out/g6m4.r$r.err"; exit 1; }
   done
   [ $(( $(date +%s) - t0 )) -lt "$READY_TMO" ] || { echo "timeout: $c/$NRANK ranks ready"; exit 1; }
-  sleep 5
+  sleep 1
 done
 echo "all ranks ready after $(( $(date +%s) - t0 ))s"
 
 # shim + front end on the head (rank 0). The head's own serve dir is local; the others are host:path over ssh.
 DIRS="$G6_HOME/serve"; for ((r = 1; r < NRANK; r++)); do DIRS="$DIRS ${HOST[$r]}:$G6_HOME/serve"; done
-PY=${PY:-$G6_HOME/venv/bin/python}
-mkdir -p "$G6_HOME/run" "$G6_HOME/out"; SOCK=$G6_HOME/run/engine.sock; rm -f "$SOCK"
 PYTHONPATH="$REPO/frontend" nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/shim.pid" \
   "$PY" "$REPO/frontend/g6shim.py" --rank-dirs $DIRS --sock "$SOCK" --max-model-len "$CAP" --stall-timeout 2400 \
   > "$G6_HOME/out/shim.log" 2>&1 < /dev/null &
-for i in $(seq 1 30); do [ -S "$SOCK" ] && break; sleep 1; done
+for i in $(seq 1 150); do [ -S "$SOCK" ] && break; sleep 0.2; done
 [ -S "$SOCK" ] || { echo "shim did not open $SOCK"; tail -20 "$G6_HOME/out/shim.log"; exit 1; }
-if [ "${FRONT:-py}" = rs ]; then
-  FRONT_CMD="${FRONT_BIN:-$REPO/bin/g6front-rs}"
-  [ -x "$FRONT_CMD" ] || { echo "FRONT=rs: $FRONT_CMD missing (scripts/build_front.sh)"; exit 1; }
-else
-  FRONT_CMD="$PY -m g6front"
-fi
-(cd "$REPO/frontend" && { nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
-  $FRONT_CMD --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
-for i in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break; sleep 1; done
+for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break; sleep 0.2; done
 echo "front end /health: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")  ->  http://<head>:$PORT/v1"

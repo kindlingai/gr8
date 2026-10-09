@@ -67,7 +67,8 @@ class EngineClient:
                 self._writer = None
                 self._fail_all('engine connection lost')
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 5.0)
+            # until the first connection, the shim is starting (the launcher starts the front end early): retry often
+            backoff = min(backoff * 2, 5.0) if self.hello else 0.25
 
     async def _read_loop(self, reader):
         while True:

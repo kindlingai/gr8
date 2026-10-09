@@ -32,6 +32,8 @@ public:
     bool load(const Pack& pack, const std::string& path, const LoadOpts& opts, LoadStats& stats, std::string& err,
               Sources* src = nullptr);
     void reset();   // frees the device memory
+    // Takes ownership of a device image of pack's bytes that another loader filled (the Rust loader, G6_RS_LOADER).
+    void adopt(const Pack& pack, uint8_t* dev, uint64_t bytes);
 
     const uint8_t* base() const { return base_; }
     uint64_t bytes() const { return bytes_; }

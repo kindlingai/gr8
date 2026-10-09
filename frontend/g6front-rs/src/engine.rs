@@ -68,9 +68,11 @@ impl Engine {
 
     async fn run(self: Arc<Self>) {
         let mut backoff = 0.2f64;
+        let mut ever = false;
         loop {
             let r = self.session(&mut backoff).await;
             let was = self.ready.swap(false, Ordering::AcqRel);
+            ever |= was;
             if let Err(e) = r {
                 if was || backoff >= 5.0 {
                     log::warn!("engine connection: {e}");
@@ -80,7 +82,8 @@ impl Engine {
             }
             self.fail_all("engine connection lost");
             tokio::time::sleep(Duration::from_secs_f64(backoff)).await;
-            backoff = (backoff * 2.0).min(5.0);
+            // until the first connection the shim is starting (the launchers start the front end early): retry often
+            backoff = if ever { (backoff * 2.0).min(5.0) } else { 0.25 };
         }
     }
 

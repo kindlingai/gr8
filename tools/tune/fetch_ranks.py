@@ -5,12 +5,16 @@ The gr8 v2 reader (tools/convert/v2.py) preads each owned half at the absolute o
 that holds only those byte ranges (plus the safetensors header) converts the same as the full file.
 
 python3 fetch_ranks.py --gr8 GR8_DIR --out DIR --nr 6 --ranks 0,1,2 --widths MANIFEST.json|all|k2,k3 \
-        [--layers all|3-40,78] [--workers 16] [--verify]
+        [--layers all|3-40,78] [--workers 16] [--verify] [--repo REPO] [--revision REV]
 
 - Index files, the manifests and the safetensors header of every width file are fetched whole.
 - Progress is kept in DIR/.fetch/<file>.json (done ranges); a rerun skips them. Layers whose files are not on the
   hub yet are skipped and listed.
 - --verify checks the xxhash64 of every wanted half after its layer is fetched (the converter checks them again).
+- Each file's wanted ranges are allocated in offset order before the parallel fetch writes them, so a rank's halves
+  sit on disk in file order. Written in arrival order they scatter, and a loader reading them in order gets about
+  3.3 GB/s from a GB10 node's NVMe instead of about 4.1.
+- HF_TOKEN is sent when set (a private repo needs it); the published repo is public.
 """
 import argparse
 import json
@@ -22,17 +26,14 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-REPO = 'mmastrac/glm-5.3-exlr8-k2-k3-k4'
+REPO = 'kindlingai/glm-5.3-exlr8-k2-k3-k4'
 HUB = 'https://huggingface.co'
 MERGE_GAP = 64 << 10         # fetch the bytes between two wanted ranges when the gap is under 64 KiB
 CHUNK = 64 << 20             # split a merged range into requests of at most 64 MiB
 
 
 def token():
-    t = os.environ.get('HF_TOKEN')
-    if not t:
-        sys.exit('set HF_TOKEN (read access to the exlr8 repo)')
-    return t
+    return os.environ.get('HF_TOKEN') or None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -43,15 +44,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Hub:
     """Resolves a repo file to its CDN URL once (no token sent to the CDN) and refreshes it on 403."""
 
-    def __init__(self, repo):
-        self.repo, self.tok = repo, token()
+    def __init__(self, repo, revision='main'):
+        self.repo, self.rev, self.tok = repo, revision, token()
         self.urls, self.lock = {}, threading.Lock()
         self.noredir = urllib.request.build_opener(NoRedirect)
 
     def tree(self):
-        out, url = {}, f'{HUB}/api/models/{self.repo}/tree/main?recursive=true'
+        out, url = {}, f'{HUB}/api/models/{self.repo}/tree/{self.rev}?recursive=true'
         while url:
-            req = urllib.request.Request(url, headers={'Authorization': f'Bearer {self.tok}'})
+            req = urllib.request.Request(url, headers=self.auth())
             with urllib.request.urlopen(req, timeout=60) as r:
                 for x in json.load(r):
                     if x['type'] == 'file':
@@ -60,14 +61,17 @@ class Hub:
             url = link.split(';')[0].strip('<> ') if 'rel="next"' in link else None
         return out
 
+    def auth(self):
+        return {'Authorization': f'Bearer {self.tok}'} if self.tok else {}
+
     def url(self, path, fresh=False):
         with self.lock:
             if fresh or path not in self.urls:
-                req = urllib.request.Request(f'{HUB}/{self.repo}/resolve/main/{path}', method='HEAD',
-                                             headers={'Authorization': f'Bearer {self.tok}'})
+                req = urllib.request.Request(f'{HUB}/{self.repo}/resolve/{self.rev}/{path}', method='HEAD',
+                                             headers=self.auth())
                 try:
                     self.noredir.open(req, timeout=60)
-                    loc = f'{HUB}/{self.repo}/resolve/main/{path}'      # small non-LFS file: served directly (200)
+                    loc = f'{HUB}/{self.repo}/resolve/{self.rev}/{path}'   # small non-LFS file: served directly (200)
                 except urllib.error.HTTPError as e:
                     if e.code not in (301, 302, 303, 307, 308):
                         raise
@@ -84,7 +88,7 @@ class Hub:
                 u = self.url(path, fresh=attempt > 0)
                 h = {'Range': f'bytes={lo}-{lo + n - 1}'}
                 if u.startswith(HUB):
-                    h['Authorization'] = f'Bearer {self.tok}'       # direct hub URL (non-LFS): needs the token
+                    h.update(self.auth())                          # direct hub URL (non-LFS): the token, if any
                 req = urllib.request.Request(u, headers=h)
                 with urllib.request.urlopen(req, timeout=120) as r:
                     if r.status != 206 and not (lo == 0 and r.status == 200):
@@ -139,6 +143,8 @@ def fetch_ranges(hub, out, path, size, ranges, workers):
     prog = Progress(out, os.path.basename(path))
     todo = [r for r in ranges if tuple(r) not in prog.done]
     got = 0
+    for r in sorted(todo):              # blocks in file order (see the module docstring)
+        os.posix_fallocate(fd, r[0], r[1])
 
     def one(r):
         b = hub.get(path, r[0], r[1])
@@ -175,13 +181,14 @@ def main():
     ap.add_argument('--workers', type=int, default=16)
     ap.add_argument('--verify', action='store_true')
     ap.add_argument('--repo', default=REPO)
+    ap.add_argument('--revision', default='main', help='branch, tag (v0.2) or commit to fetch from')
     a = ap.parse_args()
     sys.path.insert(0, a.gr8)
     from tools.convert import v2  # noqa: E402
 
     ranks = {int(r) for r in a.ranks.split(',')}
     os.makedirs(a.out, exist_ok=True)
-    hub = Hub(a.repo)
+    hub = Hub(a.repo, a.revision)
     tree = hub.tree()
     where = {os.path.basename(p): p for p in tree}     # layer files live under experts/ on the hub
     for p, n in tree.items():                      # manifests: small, whole

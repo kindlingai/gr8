@@ -33,6 +33,11 @@ if [ "$WHAT" != g6 ]; then
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
-  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/g6m4 g6m4.cu ../comms/fabric.cpp $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -libverbs -lpthread
+  # the Rust pack loader (engine/loader-rs, G6_RS_LOADER) when its library is built; scripts/build.sh builds it with cargo
+  RSLIB=../loader-rs/target/release/libg6load.a
+  RS=""
+  [ -f "$RSLIB" ] && RS="-DG6_RS_LOADER $RSLIB -ldl -lm"
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/g6m4 g6m4.cu ../comms/fabric.cpp $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o $RS -lcublas -libverbs -lpthread
+  [ -n "$RS" ] && echo "g6m4: Rust pack loader linked" || echo "g6m4: no $RSLIB, C++ pack loader only"
   ls -la $OUT/g6m4
 fi

@@ -72,6 +72,14 @@ struct Checker
 
 DevImage::~DevImage() { reset(); }
 
+void DevImage::adopt(const Pack& pack, uint8_t* dev, uint64_t bytes)
+{
+    reset();
+    base_ = dev;
+    bytes_ = bytes;
+    pack_ = &pack;
+}
+
 void DevImage::reset()
 {
     if (base_) cudaFree(base_);

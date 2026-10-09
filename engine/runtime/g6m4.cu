@@ -11,6 +11,9 @@
 //      [--image]      stream the pack straight into one device image (g6::DevImage; needed for a full 60 GB pack)
 //      [--sources rankR.sources [--sources-root DIR]]  the pack is sparse (convert.py --v2-refs): fill its exlr8 v2
 //                     expert ranges from the v2 files at load (g6::Sources). DIR overrides the root the file names
+//      [--v2 DIR --v2-slices DIR --v2-widths FILE]  with --image and the Rust loader: --manifest/--pack is a base pack
+//                     whose routed experts the exlr8 v2 experts replace, read from the raw width files in DIR at the
+//                     offsets of the index slices (tp<N>/k<K>/rank<r>.safetensors) and the widths FILE picks
 //      [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234] [--cap 64] [--chunk 4]
 //      [--graph]      one captured graph per row count instead of plain launches (same lines)
 //      [--prefill MP] every prompt token but the last goes through the prefill path in sub-batches of up to MP rows,
@@ -75,6 +78,12 @@ static std::vector<std::string> split(const std::string& s, char c)
 
 int main(int argc, char** argv)
 {
+    const auto boot_t0 = std::chrono::steady_clock::now();
+    int boot_rank = -1;
+    auto boot = [&](const char* phase) {
+        fprintf(stderr, "# rank %d: boot %.1f s %s\n", boot_rank,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_t0).count(), phase);
+    };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
     std::string progress_err;          // G6_PROGRESS_ISOLATE: other threads stay off the proxy CPUs (progress_cpus.h)
@@ -82,6 +91,7 @@ int main(int argc, char** argv)
     if (progress_isolate < 0) die(progress_err);
     g6::FabricConfig cfg;
     std::string manifest, packfile, sources, sources_root, layers_s = "0,3,40,77";
+    V2Src v2src;
     std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
     std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
     std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
@@ -114,6 +124,9 @@ int main(int argc, char** argv)
         else if (a == "--pack") packfile = next();
         else if (a == "--sources") sources = next();
         else if (a == "--sources-root") sources_root = next();
+        else if (a == "--v2") v2src.dir = next();
+        else if (a == "--v2-slices") v2src.slices = next();
+        else if (a == "--v2-widths") v2src.widths = next();
         else if (a == "--qo-manifest") qo_man = next();
         else if (a == "--qo-pack") qo_file = next();
         else if (a == "--qp-manifest") qp_man = next();
@@ -247,6 +260,8 @@ int main(int argc, char** argv)
     cfg.slot_bytes = (size_t)MX * HID * 2;
     cfg.ncoll = NC;
     g6::Fabric fab;
+    boot_rank = cfg.rank;
+    boot("start");
     fab.init(cfg);
     const g6::FabricDev f = fab.dev();
     fab.start_proxy();
@@ -367,7 +382,10 @@ int main(int argc, char** argv)
     DevStore store;
     Model m;
     g6::DevImage img;
-    if (image) load_image(pack, img, manifest, packfile, R, hash, sources, sources_root);
+    boot("fabric up");
+    if (!v2src.dir.empty() && (!image || v2src.slices.empty() || v2src.widths.empty()))
+        die("--v2 needs --image, --v2-slices and --v2-widths");
+    if (image) load_image(pack, img, manifest, packfile, R, hash, sources, sources_root, v2src);
     else load_pack(pack, manifest, packfile, R, sources, sources_root);
     u64* stepp = dmalloc<u64>(1);
     StepIn* in;
@@ -423,7 +441,9 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
 #endif
+    boot("pack loaded");
     build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
+    boot("layers bound");
 #if defined(G6_CP) && G6_CP
     if (cp_on)
         for (int c = 0; c < cp_colls.ncoll(); ++c)
@@ -544,6 +564,7 @@ int main(int argc, char** argv)
     long pf_rows = 0;
     m.nc = nc; D.d.nc = nc;             // before any capture: the head kernels take it by value
     m.rs = plan.rs;                     // the target's verify steps only; the MTP layer's head stays as it is
+    boot("prefill and draft built");
     for (int M : row_counts) prepare(m, M, st);
     for (int M : draft_rows) prepare(D.d, M, st);
     G6RT_CK(cudaStreamSynchronize(st));
@@ -619,6 +640,7 @@ int main(int argc, char** argv)
             fprintf(stderr, "# rank %d: progress CPUs %s reserved for the proxy threads; %d other thread(s) moved off them\n", R, list.c_str(), moved);
         }
     }
+    boot("graphs captured");
     fab.barrier();
     if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u%s\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed,
                       plan.rs ? ", spec-accept rejection" : "");
@@ -751,6 +773,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "# W38b diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
     Emitter em;
     PfTimes pt;                         // G6_PF_TIMES=1 (serve.h)
+    boot("ready");
     if (!serve.empty()) serve_ready(serve);
     for (size_t q = 0; !s2mode; ++q)
     {

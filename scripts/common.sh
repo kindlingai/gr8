@@ -6,5 +6,6 @@ CFG=${G6_CLUSTER:-$REPO/config/cluster.env}
 . "$CFG"
 read -r -a HOST <<< "$HOSTS"
 NRANK=${#HOST[@]}
-S="ssh -o BatchMode=yes"
+# one ssh connection per node, reused by every call (the launcher polls each rank every second)
+S="ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPath=$HOME/.ssh/g6-%C -o ControlPersist=120"
 on() { local r=$1; shift; $S "${HOST[$r]}" "$@"; }   # on <rank> <cmd>: run a command on that rank's node
