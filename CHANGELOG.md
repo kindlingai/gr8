@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-09: head-batched attention for every decode call (#75)
+
+- The head-batched scores and context kernels now serve every decode attention call, not only the fixed-K ones: verify
+  rows of a fresh index and contexts past 2048 take them too (the generic `mla_scores` / `context_parts` do the same
+  arithmetic; `dec_heads_test` checks both). One session, TP4: MTP k=2 34.2 -> 36.3 tok/s after a 13.5K prompt and
+  28.0 -> 32.2 after 57.6K; DFlash2 32.8 -> 35.1 and 23.7 -> 28.0. Short prompts and prefill unchanged.
+
 ## 2026-10-09: decode step profile and attention kernels (#75, #76)
 
 - `G6_DEC_EVPROF=N`: per-stage decode step times from event-record nodes in the captured main-step graphs (attention

@@ -127,6 +127,9 @@ int main(int argc, char** argv)
                     const float c16 = time_ms([&] { ga::small_decode::context_parts_heads<16><<<dim3(PART * 2, 1, rows), 128>>>(a, 0, dp, p1); });
                     const float ab = time_ms([&] { ga::absorb_m<<<dim3(64, H), 256>>>(a, 0, rows, q1, r1); });
                     const float vp = time_ms([&] { ga::value_project_m<<<dim3(32, H), 256>>>(a, 0, rows, dq); });
+                    const float tg = time_ms([&] { ga::mla_scores<<<dim3(TOP / 8, H, rows), 256>>>(a, 0, dq, dr, s0); });
+                    const float cg = time_ms([&] { ga::context_parts<<<dim3(PART, H, rows), 256>>>(a, 0, dp, p0); });
+                    printf("BENCH rows %d ctx %d: generic mla_scores %.1f us, generic context_parts %.1f us\n", rows, ctx, tg, cg);
                     printf("BENCH rows %d ctx %d: scores %.1f -> %.1f us; context %.1f -> HG4 %.1f HG8 %.1f HG16 %.1f us; absorb_m %.1f vproj_m %.1f us\n",
                            rows, ctx, t0, t1, c0, c4, c8, c16, ab, vp);
                 }
@@ -136,6 +139,16 @@ int main(int argc, char** argv)
                 check("scores_heads<16>", S0.data(), S1.data(), ns * 4, H, rows, ctx);
                 check("context_parts_heads<16>", P0.data(), P1.data(), np * 4, H, rows, ctx);
                 check("context_parts_heads<4>", P0.data(), P2.data(), np * 4, H, rows, ctx);
+                {   // the generic kernels (fresh-index verify rows, contexts past 2048) against the same outputs
+                    float *g0, *g1;
+                    CK(cudaMalloc(&g0, ns * 4)); CK(cudaMalloc(&g1, np * 4));
+                    ga::mla_scores<<<dim3(TOP / 8, H, rows), 256>>>(a, 0, dq, dr, g0);
+                    ga::context_parts<<<dim3(PART, H, rows), 256>>>(a, 0, dp, g1);
+                    CK(cudaDeviceSynchronize());
+                    check("scores_heads<16> vs mla_scores", down(g0, ns).data(), down(s1, ns).data(), ns * 4, H, rows, ctx);
+                    check("context_parts_heads<16> vs context_parts", down(g1, np).data(), down(p1, np).data(), np * 4, H, rows, ctx);
+                    CK(cudaFree(g0)); CK(cudaFree(g1));
+                }
                 for (void* p : {(void*)a.positions, (void*)a.block_table, a.mla_cache, (void*)a.indices, (void*)err, (void*)dq, (void*)dr,
                                 (void*)dp, (void*)s0, (void*)s1, (void*)p0, (void*)p1, (void*)p2})
                     CK(cudaFree(p));

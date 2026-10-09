@@ -136,15 +136,18 @@ static void launch_index_scores(const G6Attn& a,Input input,Work& w,int start,in
 }
 // G6_ATTN_HEADS=0 (read at launch / capture): the per-head scores_direct / context_parts kernels (A/B and tests)
 static bool attn_heads(){static const bool on=!getenv("G6_ATTN_HEADS")||atoi(getenv("G6_ATTN_HEADS"))!=0;return on;}
+// The head-batched kernels do the arithmetic of both the fixed-K and the generic kernels (mla_scores, context_parts:
+// the same products, FMA order and skips per (row, head, slot)), so they serve every decode call: verify rows of a fresh
+// index and contexts past 2048 included.
 template<class Input>
 static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
- if(use_fixed_k_decode(a)&&attn_heads()){constexpr int HG=16;small_decode::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
+ if(attn_heads()){constexpr int HG=16;small_decode::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
  else if(use_fixed_k_decode(a))small_decode::scores_direct<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
 }
 template<class Input>
 static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
- if(use_fixed_k_decode(a)&&attn_heads()){
+ if(attn_heads()){
   // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
   else{constexpr int HG=4;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
