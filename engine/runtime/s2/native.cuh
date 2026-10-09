@@ -29,7 +29,7 @@ struct NativeContext {
     g6rt::StepOut *output, *draft_output;
     int prefill_rows = 0, split = 3;
     bool two_lanes = true;
-    std::function<void(uint64_t, int, int)> enqueue_main; // (step, rows, context): main fabric + CP collectives past R
+    std::function<void(const g6rt::StepIn&)> enqueue_main; // main fabric (head payload from the rows' top-list flags) + CP collectives past R
     std::function<void(int bucket, int rows)> solo_main;
     std::function<void(int bucket, bool chain, int rows)> solo_draft;
     // Must select the canonical run in BOTH main and draft prefill bindings,
@@ -71,6 +71,8 @@ class NativeDispatch {
     g6rt::S2In *layout_ = nullptr, *draft_layout_ = nullptr;
     const g6rt::S2In *previous_layout_ = nullptr, *previous_draft_layout_ = nullptr;
     uint64_t prefill_sequence_ = 1, prefill_sequence2_ = 1;
+    g6rt::LpStep lp_{};   // logprobs of the last main step, fetched when a session in it asked (lp_rows_ rows; 0 = none)
+    int lp_rows_ = 0;
     struct Graphs { cudaGraphExec_t a = nullptr, b = nullptr; };
     std::map<std::string, Graphs> graphs_;
     static void destroy(Graphs& g) {
@@ -147,7 +149,7 @@ class NativeDispatch {
         if (draft) {
             std::vector<uint32_t> sizes(3,uint32_t(rows*::HID*2));
             sizes[2] = uint32_t(glue::head_bytes(rows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
-        } else c_.enqueue_main(input.step,rows,input.context); // preserves existing RS order/fabric layout
+        } else c_.enqueue_main(input); // preserves existing RS order/fabric layout
         const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
         if (l.solo >= 0) {
             if (draft) c_.solo_draft(l.buckets[0],chain,rows); else c_.solo_main(l.buckets[0],rows);
@@ -156,7 +158,13 @@ class NativeDispatch {
             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
         }
         fence(); const auto out = *(draft ? c_.draft_output : c_.output);
-        if (!draft) g6rt::evprof_read(rows,c_.stream,c_.main.rank);
+        if (!draft) {
+            g6rt::evprof_read(rows,c_.stream,c_.main.rank);
+            lp_rows_ = 0;
+            if (std::any_of(l.samples.begin(),l.samples.end(),[](const Sampling& s){return s.lp >= 0;})) {
+                g6rt::lp_fetch(c_.main,out,input,lp_); lp_rows_ = rows;
+            }
+        }
         if (tmr_) // first-step timer: launch+fence span (design r4); labels per r3, from the PRE-insertion decision, never graphs_.count
             fprintf(stderr,"# step_tmr rank %d step %llu %s %s %s %lld us (graph_key %s rows %d ctx %d reqs %s)\n",c_.main.rank,
                 (unsigned long long)input.step,step_kind(l),step_event(l),
@@ -297,7 +305,11 @@ public:
             [&](bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);},
             [&](int old,int next){mode(old,next);},
             [&](const Launch& l){return launch(l);},
-            [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows){prefill(s,p,first,rows);}
+            [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows){prefill(s,p,first,rows);},
+            [&](int row,int k){
+                require(row >= 0 && row < lp_rows_, "logprob row outside the last main step");
+                return g6rt::lp_row(lp_,row,false,k);
+            }
         };
     }
     void synchronize() { fence(); }

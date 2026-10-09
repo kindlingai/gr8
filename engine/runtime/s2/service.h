@@ -185,7 +185,7 @@ public:
         };
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) { dispatch_.prefill(s,p,first,rows); };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
-        h.emit = [&](Key k,const int* ids,int n) { return sessions_.emit(k,ids,n); };
+        h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
         h.terminal = [&](Key k,const s2::Stats& stats) { sessions_.terminal(k,stats); };
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
         if (!c_.rank) {

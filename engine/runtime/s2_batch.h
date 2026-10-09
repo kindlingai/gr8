@@ -81,13 +81,13 @@ struct Stats
 
 // run(step) -> the sampled token of every row of the step (step.M() ids), for MAIN, DRAFT and CHAIN steps
 // round(sess, round, base, a, K): per-session round line (mtp_sequence prints "round N base B accepted a of K")
-// emit(sess, toks, k) -> true = the session is finished (stop id or max tokens)
+// emit(sess, toks, k, row) -> true = the session is finished (stop id or max tokens); row: toks[0]'s row in the last MAIN step
 // returns per session the generated tokens (as mtp_sequence returns them)
 struct Hooks
 {
     std::function<std::vector<int>(const Step&)> run;
     std::function<void(int, long, int, int, int)> round;
-    std::function<bool(int, const int*, int)> emit;
+    std::function<bool(int, const int*, int, int)> emit;
 };
 
 // Persistent driver state for the scheduler (component 5): stable slots 0..S2N_SLOTS-1, all calls at round boundaries.
@@ -206,7 +206,7 @@ private:
             ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a];
             ++st_[q].rounds;
             acc[q] = a;
-            if (h_.emit && h_.emit(q, so, a + 1)) { x.done = true; continue; }
+            if (h_.emit && h_.emit(q, so, a + 1, v.row0[i])) { x.done = true; continue; }
             on.push_back(q);
         }
         {                                                         // first-form draft: one step, rows a+1 of each survivor
@@ -346,7 +346,7 @@ private:
             if (s == PS - 1)
             {
                 x.tokens.push_back(t[M - 1]);
-                if (h_.emit && h_.emit(q, &t[M - 1], 1)) { x.done = true; return false; }
+                if (h_.emit && h_.emit(q, &t[M - 1], 1, M - 1)) { x.done = true; return false; }
             }
             std::vector<int> next(M);
             for (int r = 0; r < M; ++r) next[r] = x.tokens[rows[r].pos + 1];

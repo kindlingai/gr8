@@ -668,11 +668,11 @@ int main(int argc, char** argv)
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
         G6RT_CK(cudaStreamSynchronize(st));
         g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
-            [&](unsigned long long step, int M, int context) {
-                std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
-                sizes[2 * NL] = (uint32_t)glue::head_bytes(M, nc);
-                fab.enqueue_step(step, sizes);
-                cp_enqueue(step, M, context);
+            [&](const StepIn& si) {
+                std::vector<uint32_t> sizes(NC, (uint32_t)(si.M * HID * 2));
+                sizes[2 * NL] = head_size(si, nc);
+                fab.enqueue_step(si.step, sizes);
+                cp_enqueue(si.step, si.M, si.context);
             },
             [&](int k, int M) {
                 g6s2::require(k >= 0 && k < m.nbk && M >= 1 && M <= MX && exec[k][M] && exec2[k][M], "S=1 target graph not captured");

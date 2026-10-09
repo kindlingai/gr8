@@ -51,7 +51,7 @@ static Hooks make_hooks(const std::vector<uint32_t>& salt, Trace& tr, int stop_s
         }
         return out;
     };
-    h.emit = [stop_slot_salt, &salt](int q, const int* toks, int k) {
+    h.emit = [stop_slot_salt, &salt](int q, const int* toks, int k, int) {
         if (stop_slot_salt < 0 || salt[q] != (uint32_t)stop_slot_salt) return false;
         for (int i = 0; i < k; ++i) if (toks[i] == 1) return true;
         return false;

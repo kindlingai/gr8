@@ -4,10 +4,11 @@ S2 file protocol, so several requests run at the same time. Stdlib only (plus g6
 
 The engine side is the code, not a document: engine/runtime/s2/{ingress.h,sessions.h,service.h,bootstrap.h,scheduler.h}.
 File protocol, one engine epoch per start of g6m4 --s2 (every rank needs a FRESH DIR):
-  engine rank 0 -> DIR/ready.s2        "G6S2 1 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows>" once all ranks booted
+  engine rank 0 -> DIR/ready.s2        "G6S2 2 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>" once all ranks
+                                       booted (version 1 has no <max_lp>: no logprobs)
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> EVERY rank DIR/req.<id>      written as req.<id>.tmp, then renamed; "host:/path" entries over ssh. Two lines:
-        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float>
+        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>]
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -16,7 +17,8 @@ File protocol, one engine epoch per start of g6m4 --s2 (every rank needs a FRESH
       Requests wait in the engine's FIFO until a session slot and a KV run are free (several decode in one step).
   engine rank 0 -> DIR/resp.<id>       one line per event:
         a <epoch> <slot> <generation> <base_page> <pages>   admitted (the request got a slot and its KV run)
-        t <id> <id> ...                                      newly committed tokens -> tokens frame
+        l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line (as g6shim.py)
+        t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
         m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
         end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame
       A request cancelled while still queued gets only "end abort -1 0".
@@ -41,12 +43,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from g6front import wire  # noqa: E402
-from g6shim import SSH, EOS_IDS, VOCAB  # noqa: E402
+from g6shim import SSH, EOS_IDS, VOCAB, Shim as PlainShim  # noqa: E402
 
 log = logging.getLogger('g6s2shim')
 
 INT32_MAX = 2**31 - 1
-READY_RE = re.compile(r'^G6S2 1 (\d+) (\d+) (\d+) (\d+) (\d+) (\d+)\s*$')
+READY_RE = re.compile(r'^G6S2 (?:1 (\d+) (\d+) (\d+) (\d+) (\d+) (\d+)|2 (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+))\s*$')
 
 
 def payload_hash(data: bytes) -> int:
@@ -61,8 +63,10 @@ def parse_ready(text: str) -> dict:
     m = READY_RE.match(text)
     if not m:
         raise ValueError(f'bad ready.s2: {text!r}')
-    epoch, ranks, pool_rows, mtp, guard, max_rows = (int(x) for x in m.groups())
-    return {'epoch': epoch, 'ranks': ranks, 'pool_rows': pool_rows, 'mtp': mtp, 'guard': guard, 'max_rows': max_rows}
+    v = [int(x) for x in m.groups() if x is not None] + [0]    # version 1: max_lp 0
+    epoch, ranks, pool_rows, mtp, guard, max_rows, max_lp = v[:7]
+    return {'epoch': epoch, 'ranks': ranks, 'pool_rows': pool_rows, 'mtp': mtp, 'guard': guard, 'max_rows': max_rows,
+            'max_lp': max_lp}
 
 
 def build_request(f: dict, ordinal: int):
@@ -92,8 +96,11 @@ def build_request(f: dict, ordinal: int):
         return None, 'bad temperature'
     if not (math.isfinite(top_p) and 0 < top_p <= 1):
         return None, 'top_p must be in (0, 1]'
-    body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}\n"
-            + ','.join(map(str, prompt)) + '\n').encode()
+    lp = f.get('logprobs')
+    if lp is not None and (not isinstance(lp, int) or isinstance(lp, bool) or not 0 <= lp <= 20):
+        return None, 'logprobs must be 0..20'
+    body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
+            + (f' lp {lp}' if lp is not None else '') + '\n' + ','.join(map(str, prompt)) + '\n').encode()
     return body, None
 
 
@@ -121,6 +128,7 @@ class Req:
         self.done = False        # a finish frame went out
         self.emitted = 0
         self.m = None            # this request's last "m" line
+        self.lps = []            # "l" entries for the next "t" line
         self.fh = None
         self.buf = b''
         self.last = time.monotonic()
@@ -193,7 +201,7 @@ class Shim:
         await self.ready.wait()
         wire.write_frame(writer, {'type': 'hello', 'version': 1, 'model': 'glm-5.3-g6',
                                   'max_model_len': self.max_model_len(), 'vocab_size': VOCAB,
-                                  'eos_ids': EOS_IDS, 'max_logprobs': 0})
+                                  'eos_ids': EOS_IDS, 'max_logprobs': self.max_logprobs()})
         mine: set[str] = set()
         try:
             while True:
@@ -215,6 +223,9 @@ class Shim:
                 await self.cancel(rid, notify=False)
             writer.close()
 
+    def max_logprobs(self):
+        return min(self.a.max_logprobs, self.cfg['max_lp'])
+
     def max_model_len(self):
         room = self.cfg['pool_rows'] - self.cfg['guard']
         return min(self.a.max_model_len, room) if self.a.max_model_len else room
@@ -228,8 +239,11 @@ class Shim:
                                  'message': 'duplicate id'})
         if self.dead:
             return self.finish(r, 'error', message=self.dead)
-        if f.get('logprobs') is not None or f.get('prompt_logprobs') is not None:
-            return self.finish(r, 'error', message='not supported: logprobs / prompt_logprobs')
+        if f.get('prompt_logprobs') is not None:
+            return self.finish(r, 'error', message='not supported: prompt_logprobs')
+        lp = f.get('logprobs')
+        if lp is not None and not (isinstance(lp, int) and not isinstance(lp, bool) and 0 <= lp <= self.max_logprobs()):
+            return self.finish(r, 'error', message=f'logprobs must be 0..{self.max_logprobs()}')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
             return self.finish(r, 'error', message='prompt too long' if prompt and isinstance(mt, int) and mt >= 1
                                else 'bad prompt/max_tokens')
@@ -334,12 +348,21 @@ class Shim:
             return
         if w[0] == 'a':
             r.admitted = True
+        elif w[0] == 'l':
+            r.lps.append(PlainShim.entry(w[1:]))
         elif w[0] == 't':
             ids = [int(x) for x in w[1:]]
             r.emitted += len(ids)
             self.c['gen'] += len(ids)
+            lps, r.lps = r.lps, []
             if ids:
-                self.send(r, {'type': 'tokens', 'id': r.rid, 'ids': ids})
+                fr = {'type': 'tokens', 'id': r.rid, 'ids': ids}
+                if r.f.get('logprobs') is not None:
+                    if len(lps) != len(ids):
+                        log.error('req.%s: %d tokens with %d logprob entries', r.ordinal, len(ids), len(lps))
+                        return self.finish(r, 'error', ct=r.emitted, message='engine returned mismatched logprobs')
+                    fr['logprobs'] = lps
+                self.send(r, fr)
         elif w[0] == 'm':
             r.m = [int(x) for x in w[1:]]
         elif w[0] == 'end':
@@ -474,6 +497,7 @@ async def main(argv=None):
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=0,
                     help='cap on prompt + max_tokens (0 = what the KV pool allows: pool_rows - guard, from ready.s2)')
+    ap.add_argument('--max-logprobs', type=int, default=20, help='largest k of logprobs (also capped by the engine ready line)')
     ap.add_argument('--poll', type=float, default=0.002, help='resp poll interval, s')
     ap.add_argument('--ready-timeout', type=float, default=3600.0, help='wait this long for DIR/ready.s2')
     ap.add_argument('--cancel-timeout', type=float, default=60.0, help='answer abort if the engine sends no end line this long after CANCEL')

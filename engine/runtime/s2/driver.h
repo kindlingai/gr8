@@ -16,7 +16,7 @@ struct DriverHooks {
     std::function<void(const Slot&, const Payload&, uint32_t, uint32_t)> prefill;
     std::function<std::vector<int>(const s2::Step&)> run;
     // Exact native Emitter policy (stop/min/max) on EVERY rank, not just rank0.
-    std::function<Emission(Key, const int*, int)> emit;
+    std::function<Emission(Key, const int*, int, int)> emit;   // (key, ids, count, row of ids[0] in the last main step)
     std::function<void(Key, long, int, int, int)> round;
     // One completion notification; physical KV release waits for the event fence.
     std::function<void(Key, const s2::Stats&)> terminal;
@@ -38,9 +38,9 @@ class Driver {
             [this](int q, long round, int base, int accepted, int K) {
                 if (hooks_.round) hooks_.round(scheduler_.slots()[q].key, round, base, accepted, K);
             },
-            [this](int q, const int* ids, int n) {
+            [this](int q, const int* ids, int n, int row) {
                 const auto& s = scheduler_.slots()[q];
-                auto e = hooks_.emit(s.key, ids, n);
+                auto e = hooks_.emit(s.key, ids, n, row);
                 require(e.count <= unsigned(n) && e.count <= s.req.max_tokens - emitted_[q], "bad emitter count");
                 require(e.finished || e.count == unsigned(n), "partial emission without stop");
                 emitted_[q] += e.count;

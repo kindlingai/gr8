@@ -5,6 +5,7 @@
 #include "ingress.h"
 #include "../serve.h"
 #include <cmath>
+#include <functional>
 
 namespace g6s2 {
 inline std::vector<int> request_ids(const std::string& s) {
@@ -24,7 +25,12 @@ inline g6rt::ServeReq parse_request(const std::string& bytes) {
     require(bool(in >> k) && k == "n_gen" && bool(in >> gen >> k) && k == "temp" &&
             bool(in >> r.temp >> k) && k == "seed" && bool(in >> seed >> k) && k == "min" &&
             bool(in >> min >> k) && k == "stop" && bool(in >> stop), "invalid request header");
-    if (in >> k) require(k == "top_p" && bool(in >> r.top_p) && !(in >> extra), "invalid top_p header");
+    // optional, in this order: top_p <float>, lp <k>. plp (prompt logprobs) is refused.
+    auto next = [&] { if (!(in >> k)) k.clear(); };
+    next();
+    if (k == "top_p") { require(bool(in >> r.top_p), "invalid top_p header"); next(); }
+    if (k == "lp") { require(bool(in >> r.lp) && r.lp >= 0 && r.lp <= g6rt::LP_MAX, "invalid lp header"); next(); }
+    require(k.empty(), "invalid request header tail (S2 accepts top_p and lp)");
     auto g = number(gen), sd = number(seed), mn = number(min);
     require(g > 0 && g <= INT32_MAX && sd <= UINT32_MAX && mn <= g &&
             std::isfinite(r.temp) && r.temp >= 0 && std::isfinite(r.top_p) && r.top_p >= 0 && r.top_p <= 1,
@@ -35,7 +41,7 @@ inline g6rt::ServeReq parse_request(const std::string& bytes) {
     require(bool(ids >> prompt) && !(ids >> extra), "invalid prompt line");
     r.prompt = request_ids(prompt); return r;
 }
-struct Sampling { float inv_temp = 0, top_p = 0; uint32_t seed = 1234; };
+struct Sampling { float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1; };   // lp: g6rt::ServeReq::lp
 struct Session {
     Key key; uint64_t request = 0;
     Run run; Payload payload; Sampling sampling; g6rt::Emitter emitter;
@@ -66,7 +72,7 @@ public:
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
                 reserve_pages(config_, req) == g.run.pages, "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
-        s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed};
+        s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp};
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
         require(!head_ || s.emitter.f, "cannot open S2 response");
         if (s.emitter.f) {
@@ -78,10 +84,16 @@ public:
     const Session& at(unsigned slot) const {
         require(slot < MAX_SESSIONS && sessions_[slot].bound, "unbound session"); return sessions_[slot];
     }
-    Emission emit(Key k, const int* ids, int count) {
+    // row: the row of ids[0] in the last main step; logprob(row, k) reads that step's logprobs (sessions with lp only)
+    Emission emit(Key k, const int* ids, int count, int row, const std::function<g6rt::LpRow(int, int)>& logprob) {
         auto& s = get(k); require(!s.ended && count > 0, "emit after terminal/empty emission");
+        std::vector<g6rt::LpRow> lps;
+        if (s.sampling.lp >= 0) {
+            require(bool(logprob), "logprobs requested without a logprob source");
+            for (int i = 0; i < count; ++i) lps.push_back(logprob(row + i, s.sampling.lp));
+        }
         const int before = s.emitter.emitted;
-        const bool done = s.emitter.push(ids, count); output_ok(s.emitter);
+        const bool done = s.emitter.push(ids, count, lps.empty() ? nullptr : lps.data()); output_ok(s.emitter);
         return {uint32_t(s.emitter.emitted - before), done};
     }
     void terminal(Key k, const s2::Stats& stats, const char* reason = nullptr) {

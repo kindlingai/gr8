@@ -1,6 +1,7 @@
 // File ingress for opt-in S2 shim. Control thread only, no per-round file polling.
 #pragma once
 #include "scheduler.h"
+#include "../serve.h"
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
@@ -31,8 +32,8 @@ inline Command parse_command(const std::string& text, uint64_t epoch) {
 }
 inline std::string capability(Config c, unsigned ranks) {
     c.validate(); require(ranks==3 || ranks==4 || ranks==6, "invalid rank count");
-    return "G6S2 1 "+std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
-        std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+"\n";
+    return "G6S2 2 "+std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
+        std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+" "+std::to_string(g6rt::LP_MAX)+"\n";
 }
 class Ingress {
     std::string dir_; uint64_t epoch_, next_=0;
