@@ -74,6 +74,8 @@ struct Tensors
     int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis, #65)
     int sh_fp8 = 0;                   // t/s[T_S_GATE, T_S_UP, T_S_DOWN] hold its FP8 copy (bind::make_shared_fp8)
     long long sh_tr[6] = {};          // tr3.table row 256
+    int qo_cover = 0;                 // G6_PF_OWN=3: q_b / o_proj of this layer are prefilled from the QO pack (never from these tensors)
+    int heads = 0;                    // attention head count, used in place of q_b.N / 256 when the q_b tensor is deduplicated away
 };
 
 template <class F> inline Tensors layer_tensors(int layer, F find)
@@ -2738,15 +2740,27 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if ((e = make_gemm(T.t[GT],         T.s[GT],         M, sc.x8_big,   sc.g,                               0, L.gate))) return e;
     if ((e = make_gemm(T.t[UT],         T.s[UT],         M, sc.x8_big,   sc.u,                               0, L.up))) return e;
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
+#if PF_QO_DEDUP
+    // slim pack (tools/convert/slimpack.py): q_b / o_proj .mx.codes + .scales are left out where the QO pack covers the layer.
+    // Both absent together is fine only then; anything else fails loud.
+    const bool qo_dedup = !L.q_b.on && !L.o_proj.on && T.qo_cover && T.heads > 0;
+    if (!L.q_a.on || !L.kv_a.on || (!qo_dedup && (!L.q_b.on || !L.o_proj.on)))
+        return !L.q_b.on && !L.o_proj.on && !T.qo_cover
+                   ? "layer without q_b / o_proj .mx.codes and no QO pack covers it (slim pack booted without G6_PF_OWN=3 / qo pack?)"
+                   : "layer without q_a / kv_a / q_b / o_proj .mx.codes";
+#else
+    const bool qo_dedup = false;
     if (!L.q_a.on || !L.kv_a.on || !L.q_b.on || !L.o_proj.on) return "layer without q_a / kv_a / q_b / o_proj .mx.codes";
+#endif
     const bool shtr = L.moe && T.sh_trellis;          // shared expert as trellis row 256: gate / up / down may be absent
     if ((!L.gate.on || !L.up.on || !L.down.on) && !shtr)
         return L.moe ? "MoE layer without shared.gate/up/down.mx" : "layer has neither tr3.table nor dense.gate/up/down.mx";
-    if (L.q_a.K != HID || L.kv_a.K != HID || L.q_a.N > g6nr::SMALLW || L.q_b.K != L.q_a.N || L.o_proj.N != HID || L.o_proj.K != L.q_b.N || L.q_b.N % 256 ||
-        L.q_b.N > g6nr::QBW)
+    if (L.q_a.K != HID || L.kv_a.K != HID || L.q_a.N > g6nr::SMALLW)
+        return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
+    if (!qo_dedup && (L.q_b.K != L.q_a.N || L.o_proj.N != HID || L.o_proj.K != L.q_b.N || L.q_b.N % 256 || L.q_b.N > g6nr::QBW))
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
     if (L.indexer && L.idx_q.K != L.q_a.N) return "idx.wq_b input width is not the q_a width";
-    L.heads = L.q_b.N / 256;
+    L.heads = qo_dedup ? T.heads : L.q_b.N / 256;
     L.inter = L.gate.N;
     if (L.gate.on && (L.gate.K != HID || L.up.K != HID || L.up.N != L.inter || L.down.K != L.inter || L.down.N != HID || L.inter > SACTW ||
                       L.inter % 32))
@@ -2755,7 +2769,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     auto xq = [&](Xq& q, const __half* src, int K, uint8_t* dst) { q.on = 1; q.src = src; q.ld = K; q.K = K; q.M = M; q.dst = dst; };
     xq(L.xq_x, io.x, HID, sc.x8_big);
     xq(L.xq_qa, io.q_a_n, L.q_a.N, sc.x8_small);
-    xq(L.xq_attn, io.attn, L.o_proj.K, sc.x8_small);
+    xq(L.xq_attn, io.attn, qo_dedup ? T.heads * 256 : L.o_proj.K, sc.x8_small);   // not launched on the QO path
     xq(L.xq_x2, io.x2, HID, sc.x8_big);
     xq(L.xq_act, sc.act, L.inter, sc.x8_small);
     L.act.on = 1; L.act.g = sc.g; L.act.u = sc.u; L.act.act = sc.act; L.act.I = L.inter; L.act.M = M;

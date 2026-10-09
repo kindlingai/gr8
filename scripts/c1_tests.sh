@@ -23,7 +23,7 @@ A=${ARCH:-121a}
 # keep in step with K1H2_FLAGS in scripts/build.sh (DEC_SLOT=2 and DEC_I4PAIR=1 are the paths the engine ships)
 K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \
 -DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
--DG6_CP=1 -DG6_CP_PF_HASH2=1 -DDEC_IDX31=1"
+-DG6_CP=1 -DG6_CP_PF_HASH2=1 -DDEC_IDX31=1 -DPF_QO_DEDUP=1"
 FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} ${EXTRA:-}"
 build_run() {   # build_run <test> <extra sources...>  (test args in ARGS)
   local name=$1; shift

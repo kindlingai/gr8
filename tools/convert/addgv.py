@@ -46,7 +46,7 @@ def addgv(man_path):
         base = key[:-9] if key.endswith('.mx.codes') else None
         if base in MX or (base in MX_NO_INT4 and f'{layer}.{MX_NO_INT4[base]}' not in t):
             todo.append((e, e['name'][:-6] + '.gv'))
-        elif key in BF:
+        elif key in BF and not (m.get('slim_qo') and key.startswith('kv_b.')):   # slim pack (tools/convert/slim.py): the kv_b .gv stay out
             todo.append((e, e['name'] + '.gv'))
     todo = [(e, g) for e, g in todo if g not in t]
     if not todo:

@@ -34,7 +34,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(ROOT, 'engine', 'ref'))
 import g6ref  # noqa: E402  (record layouts: rt_record / rt_expert_record)
 
-from tools.convert import mxfp8, plan, v2  # noqa: E402
+from tools.convert import mxfp8, plan, slim, v2  # noqa: E402
 from tools.convert.pack import PackWriter  # noqa: E402
 from tools.convert.st import ST  # noqa: E402
 
@@ -410,6 +410,9 @@ def main(argv=None):
     ap.add_argument('--ranks', default='all')
     ap.add_argument('--skip', default='', help='comma list of globals to leave out: embed, head')
     ap.add_argument('--drop-cache', action='store_true', help='fdatasync + FADV_DONTNEED written and read pages')
+    ap.add_argument('--slim-qo', metavar='QO_MANIFEST', help='write slim packs (tools/convert/slim.py): leave out the dead kv_b .gv and, in the layers '
+                    'the QO pack holds, the q_b / o_proj .mx.codes + .scales. The QO pack must exist already (qopack.py reads those tensors from a full pack); '
+                    '`all` = layers 0-77')
     ap.add_argument('--gv-records', action='store_true', help='add .mx.gv / .gv GEMV record tensors (densev.cuh)')
     ap.add_argument('--v2', help='exlr8 v2 expert files dir (#65): routed + shared experts of its layers come from it')
     ap.add_argument('--v2-layers', default='auto', help='comma list, or auto = every layer with v2 files in --v2')
@@ -442,7 +445,13 @@ def main(argv=None):
         meta['nr'] = plan.NR   # TP6 manifests stay as they were
     if GV:
         meta['gv_records'] = True
-    writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, a.drop_cache, meta) for r in ranks}
+    if a.slim_qo:
+        qo = set(range(78)) if a.slim_qo == 'all' else slim.qo_layers(a.slim_qo)
+        if not qo:
+            ap.error(f'--slim-qo {a.slim_qo}: no layer with all of the QO tensors')
+        writers = {r: slim.SlimWriter(os.path.join(a.out, f'rank{r}.pack'), r, a.drop_cache, meta, qo=qo) for r in ranks}
+    else:
+        writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, a.drop_cache, meta) for r in ranks}
     if 'embed' not in skip:
         e = ST(os.path.join(a.tr3, 'model-embed.safetensors'))
         convert_embed(e, writers)
