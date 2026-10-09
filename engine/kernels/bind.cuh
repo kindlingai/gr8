@@ -502,17 +502,18 @@ inline void launch(const Gv& g, cudaStream_t st)
             const int tpc = NTv == 1 ? g.tpc : gv_fit_tpc(kern, g.tpc, g.ks);
             kern<<<(ot + tpc - 1) / tpc, tpc * g.ks * 32, 0, st>>>(g.w, g.xfrag, g.K, ot, tpc, g.ks, g.M, tail...);
         };
+        const bool b512 = g.ks <= 16;      // NT > 1: the 512-thread kernels (more registers) when one tile's ks warps fit
 #ifdef DEC_SLOT
         if (g.slot.send)
         {
-            if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
-            else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
+            if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int4v, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
+            else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Mxfp8, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
             return;
         }
 #endif
-        if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt); }
-        else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt); }
-        else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt); }
+        if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt); else if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt); }
+        else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt); }
+        else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt); }
     });
 }
 

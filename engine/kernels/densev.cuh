@@ -371,6 +371,14 @@ __global__ void __launch_bounds__(1024) gv_gemv_lb(const uint8_t* stream, const 
 {
     gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
 }
+// The same at <= 512 threads (up to 128 registers), for ks <= 16: at the 64-register cap the INT4 GEMVs fell from ~190
+// to ~120 GB/s at 24 rows (gr8 #75). bind.cuh launch picks it; gv_fit_tpc gives fewer tiles per CTA, same bits.
+template <class C, int NT>
+__global__ void __launch_bounds__(512) gv_gemv_lb512(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
+                                                      int ks, int M, void* y, int ystride, int odt)
+{
+    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
+}
 
 #ifdef DEC_SLOT
 // gv_gemv with the BF16 output in this rank's send slot of collective s.c (row stride ystride), published by the
@@ -424,6 +432,12 @@ __global__ void gv_gemv_slot(const uint8_t* stream, const u32* xfrag, int K, int
 }
 template <class C, int NT>
 __global__ void __launch_bounds__(1024) gv_gemv_slot_lb(const uint8_t* stream, const u32* xfrag, int K, int out_tiles,
+                                                         int tiles_per_cta, int ks, int M, int ystride, dslot::Slot s)
+{
+    gv_gemv_slot_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s);
+}
+template <class C, int NT>
+__global__ void __launch_bounds__(512) gv_gemv_slot_lb512(const uint8_t* stream, const u32* xfrag, int K, int out_tiles,
                                                          int tiles_per_cta, int ks, int M, int ystride, dslot::Slot s)
 {
     gv_gemv_slot_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s);
