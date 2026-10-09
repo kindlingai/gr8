@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-09: adaptive k verify costs re-measured (#75)
+
+- `spec_len.h`'s verify-time table (ms by rows 1..8) now holds the current DFlash2 step times
+  (43.0 / 52.4 / 60.4 / 68.4 / 76.1 / 83.7 / 91.1 / 97.4, was 44 ... 111): steps of 4-8 rows got 9-12% cheaper with
+  #78-#80. Adaptive k now picks longer drafts. One session, DFlash2: after a 57.6K prompt 30.3 -> 34.1 tok/s (two
+  runs each); short prompts code / prose / structured 38.9 / 35.0 / 41.3 -> 38.2 / 36.8 / 40.2.
+
 ## 2026-10-09: one-launch absorb / value project at any row count (#75)
 
 - The plain build ran absorb and value project per row (weights reloaded per row) above 3 rows, so DFlash2 verify

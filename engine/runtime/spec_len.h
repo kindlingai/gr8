@@ -9,7 +9,7 @@
 //           shrunk toward the bucket over all positions, then toward the position's recent rate, then toward a seed. The drafter's probability is
 //           exp(DflOut::lp) for DFlash2 (top-16 softmax of the selector scores, or the head's log-probability) and
 //           exp(StepOut::lp) of an MTP draft step.
-//   verify  the measured step times by row count at 2200 MHz (#11), fixed.
+//   verify  the measured step times by row count at 2200 MHz (median launch-to-sync of DFlash2 verify steps), fixed.
 // Every rank runs choose() and more() on its own, and a rank that picks another k waits forever on the others' fabric
 // collectives. So every input must be bit-identical on every rank: the drafts' log-probabilities, the accept counts and
 // the fixed table. This is stricter than for the drafted tokens. A 1-ULP difference in a draft's probability leaves the
@@ -39,7 +39,7 @@ struct SpecLen
     std::vector<int> levels;          // allowed draft counts, ascending, each <= KX
     double draft_round = 0;           // drafting cost paid once per round (DFlash2 step, MTP first-form pass), ms
     double draft_each = 0;            // drafting cost per draft after the first (MTP chain step), ms
-    double table[KX + 2] = {0, 44, 53, 62, 75, 84, 93, 102, 111};   // verify ms by rows 1..8 (#11; 2 and 7 interpolated)
+    double table[KX + 2] = {0, 43.0, 52.4, 60.4, 68.4, 76.1, 83.7, 91.1, 97.4};   // verify ms by rows 1..8 (TP4 v2 home, DFlash2 steps, #80)
     double seed[KX + 1] = {0, 0.75, 0.72, 0.70, 0.70, 0.70, 0.68, 0.68};
     double pn[KX + 1] = {}, pk[KX + 1] = {};             // per position: decayed rounds offered / accepted
     double bn[KX + 1][NB] = {}, bk[KX + 1][NB] = {};     // per (position, bucket)
