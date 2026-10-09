@@ -1,0 +1,48 @@
+# Model descriptor, so a cluster can be planned without reading the launchers. Nothing reads it at run time except
+# smoketest/run.sh, which takes the served name from it. Where it repeats a value (the KV pool, a pack size), the
+# launchers in scripts/ are the ones that take effect, and CHANGELOG.md holds the measurement behind each number.
+# The front end's first --served-model-name; it also answers to glm53.
+name: glm-5.3
+checkpoints:
+  experts: davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw          # routed experts (EXL3, 3.25 bpw) + BF16 non-expert weights + tokenizer files
+  dense: adapt-ai-systems/glm-5.3-full-exl3-gptq-dense   # GPTQ int4 g32 dense decode codes, rank-specific: tp4/ or tp6/
+  drafter: TODO                 # the DFlash2 drafter (TP=4); the docs name no source, tools/convert/dflash2.py --src <dir>
+
+description: >-
+  Full GLM 5.3 (MoE with 256 routed experts, MLA attention with the sparse indexer, one MTP layer) on g6, a
+  from-scratch CUDA engine: one g6m4 process per GB10 box, RoCE v2 between them, an OpenAI-compatible front end on
+  rank 0. TP=4 serves up to 8 requests at once (S2) and drafts with DFlash2 for a request that runs alone.
+
+tp:
+  default: 4
+  measured: [4, 6]
+  launcher_only: [3]            # scripts/launch_tp3.sh exists; no TP=3 numbers yet
+
+per_rank:
+  tp4:
+    rank_pack_gb: 90            # README, build_packs.sh
+    drafter_pack_gb: 0.86       # tools/convert/dflash2.py, one per rank
+    qo_pair_rolling_gb: 1.4     # G6_PF_OWN=4: 1.3-1.4 GB device + 84 MB pinned (CHANGELOG 2026-10-04)
+    s2_step_graphs_gib: 2.5     # SESS=8 (launch_s2.sh)
+    kv_pool_tokens: 393216      # CAP
+    lowest_memavailable_gib: 5.2  # one-request loop, PF_OWN=4, a 250K prompt (CHANGELOG 2026-10-04)
+    free_gb_at_8_sessions: 2.7-3.6  # S2 with DFlash2 (CHANGELOG 2026-10-09)
+  tp6:
+    rank_pack_gb: 62
+    qo_pack_gb: 13              # G6_PF_OWN=3, the same file on every rank
+    kv_pool_tokens: 614400      # CAP
+    lowest_memavailable_gib: TODO   # not recorded in the docs
+  notes: >-
+    One rank per box and nothing else holding GPU memory. CAP is the first thing to lower when a box runs short.
+
+api: openai
+endpoints:
+  - /v1/chat/completions
+  - /v1/completions
+  - /v1/models
+  - /health
+  - /tokenize
+  - /metrics
+port: 8100                      # PORT in config/cluster.env
+
+# Smoketests live in smoketest/run.sh:  ./gr8 glm53 smoke, or smoketest/run.sh <base-url> [served-name]

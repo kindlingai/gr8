@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "title": "GLM-5.3",
+  "variant": "EXL3 3.25 bpw experts",
+  "summary": "Full GLM 5.3 on g6, a from-scratch CUDA engine with no vLLM, PyTorch or NCCL at serve time. Up to 8 requests decode at once at TP=4, with DFlash2 speculative decoding for a request that runs alone, pair-owner QO prefill attention and context-parallel KV.",
+  "model": "davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw",
+  "hardware": "DGX Spark (GB10)",
+  "stack": ["g6", "DFlash2", "RoCE"],
+  "default_config": "tp4",
+  "configs": [
+    {
+      "id": "tp4",
+      "label": "TP=4",
+      "nodes": 4,
+      "decode": { "code": 49.5, "prose": 28.4, "structured": 68.4 },
+      "prefill": [ { "context": 8192, "tps": 1293 } ],
+      "concurrency": [ { "streams": 2, "aggregate_tps": 50.6 }, { "streams": 4, "aggregate_tps": 63.6 } ],
+      "max_context": 393216,
+      "kv_pool_tokens": 393216,
+      "max_concurrent": 8,
+      "quality": [ { "name": "Exactness", "value": "each request byte-identical to running alone" } ],
+      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz."
+    },
+    {
+      "id": "tp6",
+      "label": "TP=6",
+      "nodes": 6,
+      "decode": { "prose": 36.9 },
+      "prefill": [ { "context": 8192, "tps": 1942 } ],
+      "max_context": 614400,
+      "kv_pool_tokens": 614400,
+      "max_concurrent": 1,
+      "notes": "One request at a time. Prose decode with MTP k=2 at temperature 0.7, one test window on one cluster; not RigMark."
+    }
+  ]
+}
