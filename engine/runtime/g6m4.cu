@@ -43,7 +43,7 @@
 //                     a seed gives the same text with and without speculation. rejection: greedy drafts, each accepted with
 //                     probability p(draft) under the request's temperature / top_p, else replaced by a sample of p without
 //                     it (glue.cuh rs_accept). Same output distribution, other text for a seed.
-//                     Temperature 0 is the same in both. Needs --mtp or --dflash-manifest; no --s2.
+//                     Temperature 0 is the same in both. Needs --mtp or --dflash-manifest.
 //      [--spec-adaptive [--spec-levels 7,5,3,2]]  each round verifies the level with the most expected tokens per ms
 //                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
 //                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
@@ -183,7 +183,7 @@ int main(int argc, char** argv)
     if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
         die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except with --s2; --dflash-sel 0|1; --dflash-k 1..7");
     if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
-    if (plan.rs && (s2mode || (!mtp && !dfl))) die("--spec-accept rejection needs --mtp or --dflash-manifest, and not --s2");
+    if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
     if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; with --s2 it is the DFlash2 sessions' policy");
     if (!levels_s.empty() && !adapt) die("--spec-levels needs --spec-adaptive");
@@ -799,7 +799,8 @@ int main(int argc, char** argv)
                     memset(&di, 0, sizeof di);
                     di.step = ++s2_dstep;
                     di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
-                    for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{smp.inv_temp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
+                    const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
+                    for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
                     *in_f = di;
                     fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
                     G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));

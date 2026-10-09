@@ -152,6 +152,7 @@ void native_inputs(const Launch& l, StepIn& si, S2In& h) {
         si.srow[r] = {sample.inv_temp, sample.seed, 0u, x.spos, 0, sample.top_p, topk};
     }
     h.ns = int(l.step.sess.size()); h.cls = l.step.cls;
+    for (int j = 0; j < h.ns; ++j) si.srow[l.step.row0[j] + l.step.rows[j] - 1].nodraft = 1;   // the next row is another session's
     for (int j = 0; j < h.ns; ++j) {
         h.sess[j] = l.step.sess[j]; h.row0[j] = l.step.row0[j]; h.rows[j] = l.step.rows[j];
         h.ctx[j] = l.step.ctx[j]; h.base[j] = l.bases[j]; h.src0[j] = l.source_rows[j];

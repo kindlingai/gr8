@@ -20,7 +20,7 @@ being retired. A dash means the launcher does not read it.
 | `DFLASH_K` | engine default (7) | same | – | – | verify at most the first k of the 7 drafts |
 | `SPEC_ADAPT` | `DFLASH` | `DFLASH` | – | – | 1 = choose each round's draft count from step cost and acceptance |
 | `SPEC_LEVELS` | all | all | – | – | the draft counts `SPEC_ADAPT` may choose, e.g. `7,5,3,2` |
-| `SPEC_ACCEPT` | – | coupled | – | – | `rejection` = rejection sampling of drafts at temperature > 0 |
+| `SPEC_ACCEPT` | coupled | coupled | – | – | `rejection` = rejection sampling of drafts at temperature > 0 |
 | `MTP` | 2 | 2 | 2 | 2 | MTP draft count (TP=4: for sessions that share steps, or with `DFLASH=0`) |
 | `PF_OWN` | 4 | 4 | 3 (fixed) | 1 | prefill attention ownership (`G6_PF_OWN`); 3 also loads `packs/qo.pack` |
 | `QP_ROLL` | 2 | 2 | – | – | `PF_OWN=4`: rolling pair-weight slots (`G6_PF_QP_ROLL`) |

@@ -11,6 +11,7 @@
 #   CAP, PACKS, PF_OWN (default 4; short prompts take OWN=2, G6_PF_QP_MIN), QP_ROLL, QP_CTX, QP_EARLY,
 #   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end; S2 has no Python front end path here)
 #   S2PORT=7341       the S2 control port on the head
+#   SPEC_ACCEPT=rejection  as launch_tp4.sh: drafts are greedy and accepted by rejection sampling at temperature > 0
 #   REUSE=1           --reuse-prefix: a retired session's caches stay in the pool, and a request that continues its
 #                     prompt + output re-prefills only the rest (exact: whole 4,096-row prefill cells, s2/pool.h)
 set -eu
@@ -37,6 +38,7 @@ ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill
 [ "${NOHASH:-0}" = 1 ] && ARGS="$ARGS --no-hash"
 [ "${REUSE:-0}" = 1 ] && ARGS="$ARGS --reuse-prefix"
 [ "$SPEC_ADAPT" = 1 ] && ARGS="$ARGS --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
+[ -n "${SPEC_ACCEPT:-}" ] && ARGS="$ARGS --spec-accept $SPEC_ACCEPT"
 SRCARGS=""
 [ -n "${V2:-}" ] && SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
 for ((r = NRANK - 1; r >= 0; r--)); do

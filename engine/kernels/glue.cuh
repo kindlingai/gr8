@@ -524,6 +524,8 @@ struct SampleRow
     float top_p;                  // (0,1): sample from the nucleus of softmax(logit / T) (needs HeadArgs::nc > 0);
                                   // else the full vocabulary. Greedy rows ignore it.
     int topk;                     // > 0: the row also returns its top LP_K tokens and the ranks (HeadArgs::tk; topk.cuh)
+    int nodraft;                  // rejection sampling: 1 = row m + 1 holds no draft for this row (S2: a session's last row
+                                  // in a step that carries several sessions)
 };
 __host__ __device__ __forceinline__ bool topp_on(const SampleRow& s) { return s.inv_temp > 0.f && s.top_p > 0.f && s.top_p < 1.f; }
 
@@ -744,7 +746,7 @@ __device__ __forceinline__ void head_local_topk(const HeadArgs& a, int m, const 
 // are k_head_local_rs, k_head_merge_rs and k_head_merge_tp_rs; with RS off the head runs today's kernels, unchanged.
 template <bool RS> __device__ __forceinline__ int rs_draft(const HeadArgs& a, const int* tok, int m)
 {
-    return RS && m + 1 < a.M && a.rows[m].inv_temp > 0.f ? tok[m + 1] : -1;
+    return RS && m + 1 < a.M && !a.rows[m].nodraft && a.rows[m].inv_temp > 0.f ? tok[m + 1] : -1;
 }
 
 // grid M, block 1024: local record -> send slot c, then publish.

@@ -136,6 +136,7 @@ class NativeDispatch {
         auto& fabric = draft ? c_.draft_fabric : c_.main_fabric;
         const int rows = l.step.M();
         g6rt::StepIn input{}; g6rt::S2In layout{}; native_inputs(l,input,layout);
+        if (draft && c_.main.rs) for (int r = 0; r < rows; ++r) input.srow[r].inv_temp = 0.f;   // rejection sampling: greedy drafts
         require(model.s2on == (l.solo < 0), "native solo mode differs from host");
         model.s2->h = layout;
         model.s2->bucket = l.bucket;
