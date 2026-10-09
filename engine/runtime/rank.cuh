@@ -650,6 +650,26 @@ inline G6AttnStep attn_step(Model& m, int i, int M, int context)
     return s;
 }
 
+// the GEMVs on the layer input (q_a + its norm, kv_a, the indexer's k and weights): one gv_multi launch when bound
+inline void launch_layer_in(Model& m, const Layer& y, const bind::Layer& b, int M, cudaStream_t st)
+{
+    if (b.x_in.n)
+    {
+        bind::launch(b.x_in, st);
+        glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
+        dmark(DP_QA, st);
+        dmark(DP_IDXKW, st);
+        return;
+    }
+    bind::launch(b.q_a, st);
+    glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
+    bind::launch(b.kv_a, st);
+    dmark(DP_QA, st);
+    bind::launch(b.idx_k, st);
+    bind::launch(b.idx_w, st);
+    dmark(DP_IDXKW, st);
+}
+
 #if defined(G6_CP) && G6_CP
 inline bool cp_active(const Model& m, int context) { return m.cp.on && (m.graph ? m.bk[m.cur] : context) > m.cp.R; }
 // The CP attention block (PLAN-S3 §1), in three phases so the loopback driver can deliver between them (phase -1 = all,
@@ -689,13 +709,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 #else
         bind::launch(b.xf_x, st);
 #endif
-        bind::launch(b.q_a, st);
-        glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
-        bind::launch(b.kv_a, st);
-        dmark(DP_QA, st);
-        bind::launch(b.idx_k, st);
-        bind::launch(b.idx_w, st);
-        dmark(DP_IDXKW, st);
+        launch_layer_in(m, y, b, M, st);
         bind::launch(b.xf_qa, st);
         bind::launch(b.q_b, st);
         bind::launch(b.idx_q, st);
@@ -798,13 +812,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 #else
     bind::launch(b.xf_x, st);
 #endif
-    bind::launch(b.q_a, st);
-    glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
-    bind::launch(b.kv_a, st);
-    dmark(DP_QA, st);
-    bind::launch(b.idx_k, st);
-    bind::launch(b.idx_w, st);
-    dmark(DP_IDXKW, st);
+    launch_layer_in(m, y, b, M, st);
     bind::launch(b.xf_qa, st);
     bind::launch(b.q_b, st);
     bind::launch(b.idx_q, st);

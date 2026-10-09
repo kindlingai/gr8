@@ -323,14 +323,15 @@ __device__ __forceinline__ void gv_warp_part(const uint8_t* stream, const u32* x
 // stream: [out-tile][NG2 = K / (16 G)][GR].  CTA = tiles_per_cta output tiles x ks k-parts, one warp each
 // (warp = tile * ks + part); parts are summed through smem in fixed order.  y[tok][ystride] of dtype odt.
 // NT = ceil(M / 8) row tiles (xfrag holds NT tables, tile t = rows 8t..8t+7); NT = 1 is the M <= 8 kernel.
+// cta: this CTA's index within the GEMV (blockIdx.x, or less in gv_multi).
 template <class C, int NT>
 __device__ __forceinline__ void gv_gemv_body(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
-                                             int M, void* y, int ystride, int odt)
+                                             int M, void* y, int ystride, int odt, int cta = blockIdx.x)
 {
     __shared__ float4 red[32][32];   // [warp][lane]
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int tl = warp / ks, part = warp % ks;
-    const int ot = blockIdx.x * tiles_per_cta + tl;
+    const int ot = cta * tiles_per_cta + tl;
     const int NG2 = K / (16 * C::G), NGP = NG2 / ks;
     const bool on = tl < tiles_per_cta && ot < out_tiles;
     float acc[NT][4];
@@ -378,6 +379,34 @@ __global__ void __launch_bounds__(512) gv_gemv_lb512(const uint8_t* stream, cons
                                                       int ks, int M, void* y, int ystride, int odt)
 {
     gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
+}
+
+// Several GEMVs of up to 8 rows (NT = 1) in one launch of 1024-thread CTAs: CTAs cta0[i] .. cta0[i + 1] - 1 run part i,
+// each as its own gv_gemv would (same tiles, k parts and reduction order, so the same bits). Every part needs
+// tpc x ks <= 32 warps. Used for the GEMVs that read the layer input (q_a, kv_a, idx_k, idx_w), which alone fill
+// 32, 18, 8 and 2 of the 48 SMs.
+struct GvPart
+{
+    const uint8_t* w = nullptr;
+    const u32* xfrag = nullptr;
+    void* y = nullptr;
+    int codec = 0, K = 0, ot = 0, tpc = 1, ks = 1, ld = 0, odt = 0, cta0 = 0;
+};
+struct GvMulti
+{
+    static constexpr int MAXP = 4;
+    int n = 0, M = 0, ctas = 0;
+    GvPart p[MAXP];
+};
+__global__ void __launch_bounds__(1024) gv_multi(GvMulti a)
+{
+    int i = 0;
+    while (i + 1 < a.n && blockIdx.x >= a.p[i + 1].cta0) ++i;
+    const GvPart& p = a.p[i];
+    const int cta = blockIdx.x - p.cta0;
+    if (p.codec == 0) gv_gemv_body<Int4v, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, cta);
+    else if (p.codec == 1) gv_gemv_body<Mxfp8, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, cta);
+    else gv_gemv_body<Bf16w, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, cta);
 }
 
 #ifdef DEC_SLOT

@@ -517,6 +517,28 @@ inline void launch(const Gv& g, cudaStream_t st)
     });
 }
 
+// the GEMVs gs as one gv_multi launch; out.n = 0 (launch them one by one) above 8 rows, where the 1024-thread bound's
+// 64 registers slow the multi-tile kernels (gr8 #86), or when one does not fit a 1024-thread CTA or writes a send slot
+inline void make_gv_multi(std::initializer_list<const Gv*> gs, int M, GvMulti& out)
+{
+    out = GvMulti();
+    if (M > 8) return;
+    for (const Gv* g : gs)
+    {
+        if (!g->on) continue;
+#ifdef DEC_SLOT
+        if (g->slot.send) { out = GvMulti(); return; }
+#endif
+        if (g->tpc * g->ks > 32 || out.n == GvMulti::MAXP) { out = GvMulti(); return; }
+        const int ot = g->O / 16;
+        out.p[out.n++] = GvPart{g->w, g->xfrag, g->y, g->codec, g->K, ot, g->tpc, g->ks, g->ld, g->odt, out.ctas};
+        out.ctas += (ot + g->tpc - 1) / g->tpc;
+    }
+    out.M = M;
+}
+static_assert(INT4 == 0 && MXFP8 == 1 && BF16W == 2, "gv_multi dispatches on these codec numbers");
+inline void launch(const GvMulti& a, cudaStream_t st) { gv_multi<<<a.ctas, 1024, 0, st>>>(a); }
+
 // tpc (output tiles per CTA) and ks (k parts per tile, one warp each): best split per shape on the GB10
 // (RESULTS-M1 items 2, 2b; time is flat in M). ks is halved until it divides the tensor's group count.
 inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, const u32* xfrag, void* y, int odt, Gv& g)
@@ -816,6 +838,7 @@ struct Layer
     int w8 = 0;                       // bit 0: q_a, bit 1: o_proj, bit 2: shared expert run from MXFP8 records (draft layer: 7)
     Xfrag xf_x, xf_qa, xf_attn, xf_x2;
     Gv q_a, kv_a, q_b, idx_q, idx_k, idx_w, o_proj, router;
+    GvMulti x_in;                     // q_a, kv_a, idx_k, idx_w as one launch (n = 0: one launch each)
     K1 k1;
     Tensor sh[3];                     // the K1's shared / dense MLP records (fc1 or gate, up, fc2 or down), for warm_mlp
     const void* shw = nullptr;        // trellis shared expert (#65): its fc1 tiles (tr3.table row 256) and their bytes,
@@ -897,6 +920,8 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     if (L.q_a.K != HID || L.kv_a.K != HID || L.q_b.K != L.q_a.O || L.o_proj.O != HID || L.o_proj.K != L.q_b.O || L.q_b.O % 256)
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K)";
     L.heads = L.q_b.O / 256;
+    static const bool multi = !getenv("G6_GV_MULTI") || atoi(getenv("G6_GV_MULTI"));
+    if (multi) make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w}, M, L.x_in);
 
     L.xf_x.on = 1;    L.xf_x.src = io.x;        L.xf_x.ld = HID;          L.xf_x.K = HID;          L.xf_x.f16 = sc.xf_x;
     L.xf_x.bf16 = L.indexer ? sc.xb_x : nullptr;

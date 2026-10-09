@@ -1,5 +1,5 @@
 // Row-budget unit test (gr8 #28): one GB10, no fabric, no pack files, synthetic weights.
-//   row_budget_test [--only gv|k1] [--time [reps]] [--time-v2 [reps]]
+//   row_budget_test [--only gv|k1] [--time [reps]] [--time-v2 [reps]] [--time-multi [reps]]
 // Claim under test: for every M <= G6_MX, the dense GEMVs (bind::make_gv / launch) and the K1 expert stream (router plan with
 // slots of <= 8 tokens, make_k1 / launch_k1) give, for each row, the same bits as the same rows run in chunks of 8 (the M <= 8
 // path). Weights are synthetic (records of the pack formats, hash-filled), so the claim is bit equality against the 8-row path,
@@ -670,6 +670,89 @@ static void test_k1(const std::vector<int>& Ms)
     }
 }
 
+// the layer-input GEMVs (q_a, kv_a, idx_k, idx_w) as one gv_multi launch against one launch each, M = 1..8: identical
+// bytes. reps > 0: also the time of both forms (cudaEvent, the same weights every call, so partly from L2).
+static void run_gv_multi(int reps)
+{
+    Arena A;
+    const GvCase cs[] = {
+        {"q_a",   bind::INT4,  2048, 6144, 4, 8,  gv::O_F16},
+        {"kv_a",  bind::MXFP8, 576,  6144, 2, 16, gv::O_F16},
+        {"idx_k", bind::BF16W, 128,  6144, 1, 32, gv::O_F16},
+        {"idx_w", bind::BF16W, 32,   6144, 1, 32, gv::O_F16},
+    };
+    const int K = 6144;
+    __half* x = A.alloc<__half>(static_cast<size_t>(8) * K);
+    fill_f16(x, static_cast<size_t>(8) * K, 1.f, 77u);
+    const size_t tbytes = static_cast<size_t>(K / 16) * 64 * 4;
+    u32* tf = A.alloc<u32>(tbytes / 4);
+    u32* tb = A.alloc<u32>(tbytes / 4);
+    bind::Tensor t[4];
+    uint8_t *y1[4], *y2[4];
+    size_t yb[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        const GvCase& c = cs[i];
+        const int GR = c.codec == bind::INT4 ? 288 : c.codec == bind::MXFP8 ? 528 : 512, gk = c.codec == bind::BF16W ? 16 : 32;
+        const size_t bytes = static_cast<size_t>(c.O / 16) * (K / gk) * GR;
+        uint8_t* w = A.alloc<uint8_t>(bytes);
+        fill_rec(w, bytes, c.codec, 2000u + i);
+        t[i] = mk(w, 3, c.O / 16, K / gk, GR);
+#if DEC_I4PAIR
+        if (c.codec == bind::INT4) launch_i4pair(w, c.O / 16, K / gk, c.ks, ST);
+#endif
+        yb[i] = static_cast<size_t>(8) * c.O * 2;
+        y1[i] = A.alloc<uint8_t>(yb[i]);
+        y2[i] = A.alloc<uint8_t>(yb[i]);
+    }
+    std::string fails;
+    for (int M = 1; M <= 8; ++M)
+    {
+        bind::Xfrag xf;
+        xf.on = 1; xf.src = x; xf.ld = K; xf.K = K; xf.M = M; xf.f16 = tf; xf.bf16 = tb;
+        bind::launch(xf, ST);
+        bind::Gv g1[4], g2[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            const GvCase& c = cs[i];
+            const u32* tab = c.codec == bind::BF16W ? tb : tf;
+            bind::make_gv(t[i], c.codec, c.tpc, c.ks, M, tab, y1[i], c.odt, g1[i]);
+            bind::make_gv(t[i], c.codec, c.tpc, c.ks, M, tab, y2[i], c.odt, g2[i]);
+            CK(cudaMemset(y1[i], 0xff, yb[i]));
+            CK(cudaMemset(y2[i], 0xff, yb[i]));
+        }
+        GvMulti mu;
+        bind::make_gv_multi({&g2[0], &g2[1], &g2[2], &g2[3]}, M, mu);
+        if (mu.n != 4) { fails += fmt_s("M=%d make_gv_multi bound %d parts; ", M, mu.n); continue; }
+        for (int i = 0; i < 4; ++i) bind::launch(g1[i], ST);
+        bind::launch(mu, ST);
+        CK(cudaDeviceSynchronize());
+        CK(cudaGetLastError());
+        for (int i = 0; i < 4; ++i)
+        {
+            std::vector<uint8_t> h1(yb[i]), h2(yb[i]);
+            CK(cudaMemcpy(h1.data(), y1[i], yb[i], cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(h2.data(), y2[i], yb[i], cudaMemcpyDeviceToHost));
+            if (h1 != h2) fails += fmt_s("M=%d %s differs; ", M, cs[i].name);
+        }
+        if (reps > 0 && (M == 1 || M == 3 || M == 6 || M == 8))
+        {
+            cudaEvent_t e0, e1, e2;
+            CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaEventCreate(&e2));
+            CK(cudaEventRecord(e0, ST));
+            for (int r = 0; r < reps; ++r) for (int i = 0; i < 4; ++i) bind::launch(g1[i], ST);
+            CK(cudaEventRecord(e1, ST));
+            for (int r = 0; r < reps; ++r) bind::launch(mu, ST);
+            CK(cudaEventRecord(e2, ST));
+            CK(cudaEventSynchronize(e2));
+            float a = 0, b = 0;
+            CK(cudaEventElapsedTime(&a, e0, e1)); CK(cudaEventElapsedTime(&b, e1, e2));
+            printf("  gv_multi M=%d: four launches %.1f us, one launch %.1f us (%d CTAs)\n", M, 1e3 * a / reps, 1e3 * b / reps, mu.ctas);
+        }
+    }
+    report(fails.empty(), "gv_multi q_a+kv_a+idx_k+idx_w vs one launch each, M = 1..8%s%s", fails.empty() ? "" : " | ", fails.c_str());
+}
+
 static void test_gv(const std::vector<int>& Ms)
 {
     const int QBW = g6nr::QBW;
@@ -683,6 +766,7 @@ static void test_gv(const std::vector<int>& Ms)
         {"eh",      bind::MXFP8, 6144, 12288, 2, 16, gv::O_F16},
     };
     for (const GvCase& c : cases) run_gv(c, Ms);
+    run_gv_multi(0);
     // S2 sessions: the rows of several sessions in one GEMV vs each session of 3 / 1 rows alone
     for (int sr : {3, 1})
     {
@@ -828,6 +912,11 @@ int main(int argc, char** argv)
     {
         if (!strcmp(argv[i], "--time")) return time_mode(i + 1 < argc ? std::max(1, atoi(argv[i + 1])) : 50);
         if (!strcmp(argv[i], "--time-v2")) return time_v2(i + 1 < argc ? std::max(1, atoi(argv[i + 1])) : 50);
+        if (!strcmp(argv[i], "--time-multi"))
+        {
+            run_gv_multi(i + 1 < argc ? std::max(1, atoi(argv[i + 1])) : 200);
+            return g_fail ? 1 : 0;
+        }
         if (!strcmp(argv[i], "--only") && i + 1 < argc)
         {
             do_gv = !strcmp(argv[i + 1], "gv");
