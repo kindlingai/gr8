@@ -29,7 +29,7 @@ inline void match(const EventCommit& e){
 inline std::vector<uint8_t> encode(const EventCommit& x){
     match(x);Encoder e(Tag::Commit);e.notice(x.notice);const auto& c=x.commit;
     e.u64(c.before_hash);e.u64(c.cancel.has_value());if(c.cancel)e.key(*c.cancel);
-    e.u64(c.admit.has_value());if(c.admit){const auto&g=*c.admit;e.key(g.key);e.u64(g.req.id);e.u64(g.req.prompt_tokens);e.u64(g.req.max_tokens);e.u64(g.run.base_page);e.u64(g.run.pages);e.u64(g.run.table_version);}
+    e.u64(c.admit.has_value());if(c.admit){const auto&g=*c.admit;e.key(g.key);e.u64(g.req.id);e.u64(g.req.prompt_tokens);e.u64(g.req.max_tokens);e.u64(g.run.base_page);e.u64(g.run.pages);e.u64(g.run.table_version);e.u64(g.reuse);}
     return e.b;
 }
 inline Notice decode_notice(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Notice,"expected notice");auto n=d.notice();d.end();return n;}
@@ -38,7 +38,7 @@ inline EventCommit decode_commit(const std::vector<uint8_t>& b){
     Decoder d(b);require(d.tag==Tag::Commit,"expected commit");EventCommit e;e.notice=d.notice();auto&c=e.commit;
     c.epoch=e.notice.epoch;c.event=e.notice.event;c.boundary=e.notice.boundary;c.before_hash=d.u64();
     auto has=d.u64();require(has<=1,"invalid optional cancel");if(has)c.cancel=d.key();
-    has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.run.base_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();c.admit=g;}
+    has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.run.base_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();g.reuse=d.u32();c.admit=g;}
     d.end();return e;
 }
 } // namespace g6s2

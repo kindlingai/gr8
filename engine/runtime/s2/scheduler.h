@@ -57,7 +57,8 @@ struct Slot {
     Phase phase = Phase::Free;
     uint32_t prefilled = 0, emitted = 0;
 };
-struct Grant { Key key; Request req; Run run; };
+// reuse: prompt rows the run already holds from a retained session (pool.h match), so prefill starts there
+struct Grant { Key key; Request req; Run run; uint32_t reuse = 0; };
 struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;
     std::optional<Key> cancel;
@@ -170,8 +171,8 @@ public:
                 require(uint64_t(g.run.base_page) + g.run.pages <= s.run.base_page || uint64_t(s.run.base_page) + s.run.pages <= g.run.base_page, "overlapping runs");
             }
             require(live < c_.limit(), "active session/row limit");
-            require(live || g.run.identity(), "empty pool admission must start at zero");
-            target = Slot{g.key, g.req, g.run, Phase::Prefill, 0, 0}; d.admitted = g;
+            require(g.reuse < g.req.prompt_tokens, "reused rows past the prompt");
+            target = Slot{g.key, g.req, g.run, Phase::Prefill, g.reuse, 0}; d.admitted = g;
         }
         if (e.admit) { last_id_ = e.admit->req.id; have_id_ = true; }
         s_ = after; event_ = e.event; ++revision_;

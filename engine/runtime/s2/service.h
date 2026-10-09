@@ -4,6 +4,7 @@
 #include "bootstrap.h"
 #include "control_channel.h"
 #include "dispatch.h"
+#include "pool.h"
 #include <map>
 #include <thread>
 
@@ -16,6 +17,11 @@ struct PoolHooks {
     // optional (S2 below R, pool.h): false = the FIFO head may not take a run yet even though one fits (a past-R
     // request waits for an empty pool); counted as an admission stall
     std::function<bool(uint64_t rows)> admissible;
+    // optional, prefix reuse (pool.h keep): every rank retires a run with its session's reuse state; the head matches a
+    // new prompt against the retained runs (rows: the request's reservation; limit: rows its prefill may skip) and takes a hit
+    std::function<void(const Run&, const g6rt::PrefixReuse&)> retain;
+    std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, int limit)> match;
+    std::function<Run(const PoolHit&, uint64_t rows)> take;
 };
 struct NativeHooks {
     PoolHooks pool;
@@ -40,6 +46,8 @@ class Service {
     EventEndpoint* endpoint_ = nullptr;
     Ingress ingress_; AdmissionQueue queue_;
     std::map<uint64_t, Command> commands_;
+    std::map<uint64_t, std::vector<int>> prompts_;   // head, prefix reuse: queued requests' prompts (none for prompt logprobs)
+    bool reuse() const { return bool(native_.pool.match); }
     std::optional<g6rt::ServeReq> staged_; // COMPUTE thread only, parsed before event ACK
     Progress progress_;
     std::atomic<bool> stopping_{false};
@@ -52,6 +60,15 @@ class Service {
         stopping_.store(true); endpoint_->fail();
     }
     void shutdown() { stopping_.store(true); endpoint_->fail(); }
+    // a slot leaves: its run back to the pool, retained with the session's reuse state when prefix reuse is on.
+    // Head at the event, workers at apply: the same point of the same commit, so every rank keeps the same runs.
+    void retire_run(const Slot& s) {
+        if (!reuse()) { native_.pool.release(s.run); return; }
+        g6rt::PrefixReuse st = dispatch_.rows(s.key.slot);
+        const auto gen = driver_->emitted(s.key.slot);
+        st.finish(driver_->prompt(s.key.slot), gen, int(gen.size()), true);
+        native_.pool.retain(s.run, st);
+    }
     void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
         const auto free = native_.pool.free_pages(), largest = native_.pool.largest_run();
         require(largest <= free && free <= c_.scheduler.pool_rows / PAGE, "invalid pool status");
@@ -73,7 +90,8 @@ class Service {
             Commit cm{n.epoch, n.event, n.boundary, hash, {}, {}};
             if (!command.admit) cm.cancel = s.find(command.request);
             // Head owns the real pool delta once; Driver callbacks skip it here.
-            for (const auto& run : s.reclaimable(cm.cancel)) native_.pool.release(run);
+            for (const auto& sl : s.slots())
+                if (sl.phase == Phase::Retiring || (cm.cancel && sl.phase != Phase::Free && sl.key == *cm.cancel)) retire_run(sl);
             if (command.admit) {
                 const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
                 unsigned live = s.resident();
@@ -83,11 +101,19 @@ class Service {
                 const bool ok = fit->why == Stall::None && (!native_.pool.admissible || native_.pool.admissible(rows));
                 if (fit->why == Stall::None && !ok) ++queue_.stalls;
                 if (ok) {
-                    Run run = native_.pool.reserve(rows);
-                    cm.admit = Grant{s.next_key(), *request, run};
+                    Run run{}; uint32_t skip = 0;
+                    const auto pr = prompts_.find(request->id);
+                    if (reuse() && pr != prompts_.end()) {
+                        const PoolHit h = native_.pool.match(pr->second, rows, int(request->prompt_tokens) - 1);
+                        if (h.skip > 0) { run = native_.pool.take(h, rows); skip = uint32_t(h.skip); }
+                        fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u base %u\n", (unsigned long long)request->id,
+                                h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.base_page : 0u);
+                    }
+                    if (!skip) run = native_.pool.reserve(rows);
+                    cm.admit = Grant{s.next_key(), *request, run, skip};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
-                if (cm.admit) { queue_.admitted(request->id); commands_.erase(command.request); }
+                if (cm.admit) { queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request); }
             }
             return cm;
         });
@@ -102,8 +128,9 @@ class Service {
                 if (command->admit) {
                     auto request = parse_request(ingress_.request(*command));
                     queue_.push(Sessions::request(command->request, request)); commands_.emplace(command->request, *command);
+                    if (reuse() && request.plp < 0) prompts_.emplace(command->request, std::move(request.prompt));
                 } else if (queue_.cancel(command->request)) {
-                    commands_.erase(command->request);
+                    commands_.erase(command->request); prompts_.erase(command->request);
                     atomic_file(c_.directory + "/resp." + std::to_string(command->request), "end abort -1 0\n");
                 } else event(*command); // resident/retiring lookup only at the fence
                 if (stopping_.load()) return;
@@ -176,12 +203,21 @@ public:
         DriverHooks h;
         h.bind = [&](const Grant& g) {
             require(staged_.has_value(), "binding without verified payload");
-            if (c_.rank) native_.pool.claim(g.run, reserve_rows(c_.scheduler,g.req));
+            require(!g.reuse || reuse(), "reused rows without prefix reuse");
+            if (c_.rank) {
+                const auto rows = reserve_rows(c_.scheduler,g.req);
+                if (g.reuse) {   // the head's decision, from the same retained runs on this rank
+                    const PoolHit h = native_.pool.match(staged_->prompt, rows, int(g.req.prompt_tokens) - 1);
+                    require(h.skip == int(g.reuse) && h.run.base_page == g.run.base_page && h.run.pages == g.run.pages, "worker prefix reuse differs from the head");
+                }
+                native_.pool.claim(g.run, rows);
+            }
+            dispatch_.begin(g.key.slot, int(g.reuse));
             native_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {
+            if (c_.rank) retire_run(old);
             native_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
-            if (c_.rank) native_.pool.release(old.run);
         };
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) { dispatch_.prefill(s,p,first,rows); };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
@@ -189,6 +225,10 @@ public:
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
         h.terminal = [&](Key k,const s2::Stats& stats) { sessions_.terminal(k,stats); };
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
+        if (reuse()) {
+            require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
+            dispatch_.track_rows();
+        }
         if (!c_.rank) {
             leader_ = std::make_unique<LeaderChannel>(c_.scheduler.epoch,links_.peers()); endpoint_ = leader_.get();
         } else {

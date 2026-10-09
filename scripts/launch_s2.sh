@@ -9,6 +9,8 @@
 #   CAP, PACKS, PF_OWN (default 4; short prompts take OWN=2, G6_PF_QP_MIN), QP_ROLL, QP_CTX, QP_EARLY,
 #   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end; S2 has no Python front end path here)
 #   S2PORT=7341       the S2 control port on the head
+#   REUSE=1           --reuse-prefix: a retired session's caches stay in the pool, and a request that continues its
+#                     prompt + output re-prefills only the rest (exact: whole 4,096-row prefill cells, s2/pool.h)
 set -eu
 . "$(dirname "$0")/common.sh"
 [ "$NRANK" = 4 ] || { echo "launch_s2.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
@@ -23,6 +25,7 @@ if [ "$PF_OWN" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G
 ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 --mtp $MTP \
 --s2 $G6_HOME/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $EPOCH"
 [ "${NOHASH:-0}" = 1 ] && ARGS="$ARGS --no-hash"
+[ "${REUSE:-0}" = 1 ] && ARGS="$ARGS --reuse-prefix"
 SRCARGS=""
 [ -n "${V2:-}" ] && SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
 for ((r = NRANK - 1; r >= 0; r--)); do

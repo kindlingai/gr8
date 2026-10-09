@@ -73,6 +73,15 @@ public:
         require(k.slot < MAX_SESSIONS && scheduler_.slots()[k.slot].key == k, "stats for stale slot");
         return initialized_[k.slot] ? &batch_.stats(int(k.slot)) : nullptr;
     }
+    // a live or retiring slot's prompt and the tokens it emitted (prefix reuse history)
+    const std::vector<int>& prompt(unsigned slot) const { require(slot < MAX_SESSIONS, "invalid slot"); return payload_[slot].prompt; }
+    std::vector<int> emitted(unsigned slot) const {
+        require(slot < MAX_SESSIONS, "invalid slot");
+        if (!initialized_[slot]) return {};
+        auto t = batch_.result(int(slot));
+        t.resize(std::min<size_t>(t.size(), emitted_[slot]));
+        return t;
+    }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
     Changes apply(const Commit& c, const Payload* p = nullptr) {
@@ -86,9 +95,9 @@ public:
             for (const auto& old : before) {
                 const auto& now = scheduler_.slots()[old.key.slot];
                 if (old.phase == Phase::Free || (now.phase != Phase::Free && old.key == now.key)) continue;
+                hooks_.retire(old); // individual run only; NEVER reset the whole cache. Reads the session's tokens (prefix reuse)
                 if (initialized_[old.key.slot]) batch_.release(int(old.key.slot));
                 initialized_[old.key.slot] = false;
-                hooks_.retire(old); // individual run only; NEVER reset the whole cache
                 payload_[old.key.slot] = Payload{}; emitted_[old.key.slot] = 0;
             }
             if (c.admit) {

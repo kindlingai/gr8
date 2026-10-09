@@ -2,6 +2,7 @@
 // CUDA layout/graphs/fabric; this layer never recreates Batch accept decisions.
 #pragma once
 #include "sessions.h"
+#include "../prefix_reuse.h"
 #include <functional>
 
 namespace g6s2 {
@@ -44,6 +45,8 @@ class Dispatch {
     bool mode_dirty_ = false;
     std::array<int, MAX_SESSIONS> source_{};
     std::array<bool, MAX_SESSIONS> have_main_{};
+    std::array<g6rt::PrefixReuse, MAX_SESSIONS> rows_;   // prefix reuse: each session's written rows (main, draft, prefill)
+    bool track_ = false;
 public:
     Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h) : sessions_(sessions), hooks_(std::move(h)), max_rows_(rows) {
         require(rows && bool(hooks_.base) && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && bool(hooks_.prefill), "incomplete dispatch hooks");
@@ -57,9 +60,16 @@ public:
         const int next = live == 1 ? q : -1;
         if (next != solo_ || mode_dirty_) { hooks_.mode(solo_, next); solo_ = next; mode_dirty_ = false; }
     }
+    void track_rows() { track_ = true; }
+    // a new session on `slot`; skip: rows its run already holds (Grant::reuse)
+    void begin(unsigned slot, int skip) {
+        require(slot < MAX_SESSIONS, "invalid dispatch slot");
+        rows_[slot].resume(skip);
+    }
+    const g6rt::PrefixReuse& rows(unsigned slot) const { require(slot < MAX_SESSIONS, "invalid dispatch slot"); return rows_[slot]; }
     void release(unsigned slot) {
         require(slot < MAX_SESSIONS, "invalid dispatch slot");
-        have_main_[slot] = false; source_[slot] = 0;
+        have_main_[slot] = false; source_[slot] = 0; rows_[slot].clear();
         if (int(slot) == solo_) mode_dirty_ = true;
     }
     std::vector<int> run(const s2::Step& sp) {
@@ -100,12 +110,19 @@ public:
         if (!draft) for (size_t j = 0; j < sp.sess.size(); ++j) {
             source_[sp.sess[j]] = sp.row0[j]; have_main_[sp.sess[j]] = true;
         }
+        for (size_t j = 0; track_ && j < sp.sess.size(); ++j) {
+            auto& w = rows_[sp.sess[j]];
+            const int first = sp.r[sp.row0[j]].pos, n = sp.rows[j];
+            if (!draft) w.main_rows(first, n);
+            else w.draft_rows(first, n, sp.kind == s2::Step::CHAIN);
+        }
         return ids;
     }
     void prefill(const Slot& s, const Payload& p, uint32_t first, uint32_t rows) {
         require(rows && first <= p.prompt.size() && uint64_t(first) + rows < p.prompt.size() &&
                 uint64_t(first) + rows <= uint64_t(s.run.pages) * PAGE, "invalid prefill quantum");
         hooks_.prefill(s, p, first, rows);
+        if (track_) rows_[s.key.slot].prefill_rows(int(first), int(rows), true);
     }
 };
 // Direct mapping to fc2's native structs. Instantiate ONLY in DEC_S2 builds,

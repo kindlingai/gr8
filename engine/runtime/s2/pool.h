@@ -5,17 +5,39 @@
 // Two sizes on the CP binding: `pages` = the logical capacity (Config::pool_rows / 64; a past-R session at base 0 reads
 // the table as built, CP map included), `place` = the physical pages every rank has for runs at base B (S2Model::
 // pool_pages, the fewest of main and draft). Runs at or below R are placed inside [0, place) only.
+// Prefix reuse (keep()): a retired run's pages stay as they are, with the session's PrefixReuse state, until a claim
+// overlaps them. match() finds the retained run whose cached prefix a new prompt can continue; the grant then takes that
+// run's base (pages extended as needed) and starts its prefill at the retained row. Retained pages count as free.
 #pragma once
 #include "scheduler.h"
+#include "../prefix_reuse.h"
 #include <vector>
 
 namespace g6s2 {
+// match(): the retained run a prompt continues (skip = its retained rows; 0 = none)
+struct PoolHit { Run run; int skip = 0, lcp = 0; const char* why = "none"; };
 class RunPool {
     uint32_t pages_, place_, below_rows_, version_ = 0;
     std::vector<bool> used_;
     bool exclusive_ = false;
     Run held_{};                               // the exclusive run, while resident
+    struct Kept { Run run; g6rt::PrefixReuse st; uint64_t age = 0; };
+    bool keep_ = false;
+    g6rt::PrefixReuse proto_;                  // the reuse rules (strict, noend, grid) every retained state follows
+    std::vector<Kept> kept_;
+    uint64_t age_ = 0;
     uint32_t used_pages() const { uint32_t n = 0; for (bool u : used_) n += u; return n; }
+    bool kept_at(uint32_t i) const {
+        for (const auto& k : kept_) if (i >= k.run.base_page && i < k.run.base_page + k.run.pages) return true;
+        return false;
+    }
+    // drop the retained runs that overlap [base, base + pages); all = every retained run
+    void evict(uint32_t base, uint32_t pages, bool all) {
+        std::vector<Kept> left;
+        for (auto& k : kept_)
+            if (!all && (k.run.base_page + k.run.pages <= base || base + pages <= k.run.base_page)) left.push_back(std::move(k));
+        kept_ = std::move(left);
+    }
     void mark(const Run& r, bool on) {
         require(r.pages && uint64_t(r.base_page) + r.pages <= pages_, "pool run outside the pool");
         for (uint32_t i = r.base_page; i < r.base_page + r.pages; ++i) {
@@ -40,15 +62,37 @@ public:
     }
     // head, before reserve: a past-R request waits for an empty pool (FIFO head blocks, as a capacity stall)
     bool admissible(uint64_t rows) const { return !exclusive_ && (!exclusive(rows) || !used_pages()); }
+    // First fit, lowest base. With prefix reuse on: the largest gap free of live and retained runs, at its start when it
+    // starts at page 0, else centred, so the run before it and this one both have room to grow into for a later turn
+    // (a hit extends its run in place); without such a gap, first fit over retained pages (claim evicts them).
+    // An exclusive run always takes base 0 (it holds the whole pool).
     Run reserve(uint64_t rows) {
         const uint32_t n = uint32_t((rows + PAGE - 1) / PAGE);
         require(rows && n <= pages_ && admissible(rows) && !exclusive_, "pool reserve without a fit");
-        uint32_t base = 0, run = 0;
         const uint32_t end = exclusive(rows) ? pages_ : place_;
-        for (uint32_t i = 0; i < end && run < n; ++i) {
-            if (used_[i]) { run = 0; base = i + 1; } else ++run;
-        }
-        require(run == n, "pool reserve: no contiguous run");
+        auto gap = [&](uint32_t& base) {
+            uint32_t best = 0, bs = 0;
+            for (uint32_t i = 0; i < end;) {
+                if (used_[i] || kept_at(i)) { ++i; continue; }
+                uint32_t j = i;
+                while (j < end && !used_[j] && !kept_at(j)) ++j;
+                if (j - i > best) { best = j - i; bs = i; }
+                i = j;
+            }
+            if (best < n) return false;
+            base = bs == 0 ? 0 : bs + (best - n) / 2;
+            return true;
+        };
+        auto fit = [&](bool spare_kept, uint32_t& base) {
+            uint32_t run = 0; base = 0;
+            for (uint32_t i = 0; i < end && run < n; ++i) {
+                if (used_[i] || (spare_kept && kept_at(i))) { run = 0; base = i + 1; } else ++run;
+            }
+            return run == n;
+        };
+        uint32_t base = 0;
+        const bool ok = (keep_ && !exclusive(rows) && gap(base)) || fit(false, base);
+        require(ok, "pool reserve: no contiguous run");
         require(version_ != UINT32_MAX, "pool table version exhausted");
         Run r{base, n, ++version_};
         claim(r, rows);
@@ -59,6 +103,7 @@ public:
         require(!exclusive_, "pool claim while an exclusive run is resident");
         if (exclusive(rows)) require(r.base_page == 0 && !used_pages(), "exclusive run not at base 0 of an empty pool");
         else require(uint64_t(r.base_page) + r.pages <= place_, "run below R outside the physical pages");
+        evict(r.base_page, r.pages, exclusive(rows));   // an exclusive run holds the whole pool
         mark(r, true);
         version_ = r.table_version;
         if (exclusive(rows)) { exclusive_ = true; held_ = r; }
@@ -69,5 +114,47 @@ public:
             exclusive_ = false; held_ = {};
         }
     }
+    // prefix reuse on, with these rules (PrefixReuse strict / noend / grid)
+    void keep(const g6rt::PrefixReuse& rules) { keep_ = true; proto_ = rules; proto_.clear(); }
+    bool keeping() const { return keep_; }
+    // a retiring session's run: retained with its finished reuse state (st.valid rows), or released when nothing is valid
+    void retain(const Run& r, const g6rt::PrefixReuse& st) {
+        release(r);
+        if (!keep_ || st.valid <= 0) return;
+        Kept k{r, proto_, ++age_};
+        k.st.history = st.history; k.st.valid = st.valid; k.st.main_end = st.main_end; k.st.draft_end = st.draft_end;
+        k.st.written_end = st.written_end; k.st.dirty_end = st.dirty_end; k.st.pf_end = st.pf_end;
+        kept_.push_back(std::move(k));
+    }
+    // head, at admission: the retained run with the longest reusable prefix for `prompt` (limit: rows the prefill may skip)
+    // whose base can hold the request's `rows` without touching a live run; ties go to the most recent
+    PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit) const {
+        PoolHit best;
+        if (!keep_ || exclusive_) return best;
+        const uint32_t n = uint32_t((rows + PAGE - 1) / PAGE);
+        uint64_t best_age = 0;
+        for (const auto& k : kept_) {
+            g6rt::PrefixReuse t = k.st;
+            const int skip = t.begin(prompt, limit, true);
+            if (skip <= 0) { if (!best.skip && t.lcp >= best.lcp) { best.lcp = t.lcp; best.why = t.why; } continue; }
+            const uint32_t b = k.run.base_page;
+            bool room = exclusive(rows) ? b == 0 && !used_pages() && n <= pages_ : uint64_t(b) + n <= place_;
+            for (uint32_t i = b; room && i < b + n && i < pages_; ++i) room = !used_[i];
+            if (!room) { if (!best.skip) best.why = "room"; continue; }
+            if (skip > best.skip || (skip == best.skip && k.age > best_age)) {
+                best = PoolHit{Run{b, n, 0}, skip, t.lcp, "hit"}; best_age = k.age;
+            }
+        }
+        return best;
+    }
+    // head: claim a match() hit as a new grant (a fresh table version, as reserve)
+    Run take(const PoolHit& h, uint64_t rows) {
+        require(h.skip > 0 && admissible(rows), "pool take without a hit");
+        require(version_ != UINT32_MAX, "pool table version exhausted");
+        Run r{h.run.base_page, h.run.pages, ++version_};
+        claim(r, rows);
+        return r;
+    }
+    uint32_t kept_runs() const { return uint32_t(kept_.size()); }
 };
 } // namespace g6s2

@@ -23,8 +23,8 @@
 //                     G6_REUSE_STRICT=1: strict append only, G6_REUSE_NOEND=1: no prompt >= written_end rule; default off;
 //                     gate arm G6_REUSE_POISON=1: a hit first sets the old sequence's stale rows to NaN, reuse_poison.cuh;
 //                     W44 G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
-//                     No --s2 (sessions share the pool) and no --dflash-manifest (the drafter's prompt-context taps are
-//                     written by the prefill a hit skips)
+//                     With --s2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
+//                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
 //      [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)
@@ -207,9 +207,8 @@ int main(int argc, char** argv)
 #endif
     if (s2mode && (!serve.empty() || !graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
         die("--s2 needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8, --s2-epoch > 0 and no --serve");
-    // --reuse-prefix holds the cache state of ONE conversation. --s2 sessions share the pool (s2/pool.h) and the DFlash2
-    // drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips: both would read stale rows.
-    if (reuse_prefix && s2mode) die("--reuse-prefix is not supported with --s2 (sessions share the cache pool)");
+    // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under --s2 every retired session's run (s2/pool.h).
+    // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (reuse_prefix && dfl) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
@@ -665,6 +664,20 @@ int main(int argc, char** argv)
         sc.two_lanes = two;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+        // the plain build's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
+        // and NOEND (G6_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
+        if (reuse_prefix)
+        {
+            std::string err;
+            const int st_ = env_choice("G6_REUSE_STRICT", 1, 0, &err), ne_ = env_choice("G6_REUSE_NOEND", 1, 1, &err),
+                      al_ = env_choice("G6_REUSE_ALIGN", 1, 1, &err);
+            if (st_ < 0 || ne_ < 0 || al_ < 0) die(err);
+            if (al_ == 1 && !MP) die("G6_REUSE_ALIGN=1 needs tensor prefill (--prefill N)");
+            PrefixReuse rules;
+            rules.strict = st_ == 1; rules.noend = ne_ == 1; rules.grid = al_ == 1 ? MP : 0;
+            pool.keep(rules);
+            if (R == 0) fprintf(stderr, "# s2 reuse on: retired runs kept until a claim overlaps them; grid %d rows\n", rules.grid);
+        }
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
         G6RT_CK(cudaStreamSynchronize(st));
         g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
@@ -710,13 +723,25 @@ int main(int argc, char** argv)
             h.pool.claim = [&](const g6s2::Run& r, uint64_t rows) { pool.claim(r, rows); };
             h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
             h.pool.admissible = [&](uint64_t rows) { return pool.admissible(rows); };
+            if (pool.keeping())
+            {
+                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s) { pool.retain(r, s); };
+                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, int limit) { return pool.match(p, rows, limit); };
+                h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows) { return pool.take(x, rows); };
+            }
             h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
                 const int q = (int)g.key.slot;
                 const bool ex = pool.exclusive(g6s2::reserve_rows(sc, g.req));
+                // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
+                // past them is written by this request before any step reads it (prefix_reuse.h)
                 for (Model* x : {&m, &D.d})
                 {
-                    if (ex) { s2_set_run(*x, q, 0, x->s2->run_pages); reset(*x, st); }   // alone: the whole pool, today's reset
-                    else { s2_set_run(*x, q, (int)g.run.base_page, (int)g.run.pages); s2_reset_run(*x, (int)g.run.base_page, (int)g.run.pages, st); }
+                    if (ex) { s2_set_run(*x, q, 0, x->s2->run_pages); if (!g.reuse) reset(*x, st); }   // alone: the whole pool, today's reset
+                    else
+                    {
+                        s2_set_run(*x, q, (int)g.run.base_page, (int)g.run.pages);
+                        if (!g.reuse) s2_reset_run(*x, (int)g.run.base_page, (int)g.run.pages, st);
+                    }
                     for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)
                     {
                         const G6AttnBinding* v = x->s2->sab[l][q];

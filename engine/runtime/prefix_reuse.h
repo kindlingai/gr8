@@ -63,6 +63,12 @@ struct PrefixReuse
         return skip;
     }
     void clear() { history.clear(); valid = main_end = draft_end = written_end = dirty_end = pf_end = raw = 0; }
+    // S2: a session that continues a retained run whose begin() gave `skip` (the run's other state stays with the pool)
+    void resume(int skip)
+    {
+        clear();
+        main_end = draft_end = written_end = dirty_end = pf_end = skip;
+    }
     static void written(int& end, int first, int count)
     {
         assert(first >= 0 && first <= end && count > 0);   // no holes in the retained prefix

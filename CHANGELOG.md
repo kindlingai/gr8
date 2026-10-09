@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-09: prefix reuse under `--s2` (`REUSE=1 scripts/launch_s2.sh`)
+
+- `--s2 --reuse-prefix`: a retired session's run stays in the pool with its prompt + emitted ids (`s2/pool.h`). At
+  admission the head matches the new prompt against every retained run with the plain build's rules
+  (`prefix_reuse.h`); a hit takes that run's base, extended in place, and its prefill starts at the retained row
+  (`Grant::reuse`, sent to every rank, which re-derives it before claiming). Retained pages count as free: a claim
+  that overlaps one evicts it, and a past-R run evicts all of them.
+- On by default under `--s2`: the grid rule (`G6_REUSE_ALIGN`, whole 4,096-row prefill cells, so a hit is exact) and
+  `G6_REUSE_NOEND` (the `prompt >= written_end` rule refused replaying a prompt as it was; attention reads only
+  positions at or below a row's own).
+- New runs go in the middle of the largest gap free of live and retained runs, so the conversation before it and this
+  one both have room to grow on their next turn.
+- Gate (TP4, 20,001-token prompts, temp 0, logprobs 5): every output identical to a cold boot of the same binary; a
+  continued conversation 7.1 s vs 17.3 s cold, the same prompt again 4.6 s vs 17.3 s, two conversations continued at
+  once next to a decoding session 16.1 / 15.4 s vs 28.8 / 28.1 s.
+
 ## 2026-10-09: fused K1 schedules only the plan's slots (#8)
 
 - The fused K1 kernel handed out items for M x 8 slots (the capacity) and ran the empty ones (fence, barrier, counter)
@@ -85,7 +101,7 @@
   `prompt >= written_end` rule), and the gate/diag arms `G6_REUSE_POISON=1` (`reuse_poison.cuh`: a hit NaNs the stale
   rows first, so a read of one shows up), `G6_REUSE_HDUMP=<dir>` + `G6_REUSE_HDUMP_SEQ=<q,..>` and
   `G6_REUSE_ZSCRATCH=1` (`reuse_hdump.cuh`).
-- Refused with `--s2` (sessions share the cache pool) and with `--dflash-manifest` (the drafter's prompt-context taps
+- Refused with `--dflash-manifest` (the drafter's prompt-context taps
   are written by the prefill rows a hit skips).
 - `engine/tests/test_prefix_reuse.cpp` (CPU, in `scripts/build.sh`) and `engine/tests/test_prefix_reuse.py` (the same
   under ASan/UBSan, plus the `g6m4.cu` hook order) cover the state machine. Measured on the old line at `--prefill 4096
