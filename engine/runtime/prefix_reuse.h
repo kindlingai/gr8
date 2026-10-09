@@ -13,7 +13,9 @@
 // only [0, floor(min(skip, pf_end) / grid) * grid), pf_end = the rows prefilled contiguously from 0 in the current sequence
 // (decode-written rows never count). The re-prefill then starts on a cold grid point, and every retained grid cell was one
 // complete cold-shaped prefill cell of an earlier request, so a hit computes every row with the cold chunk shape (W38b: the
-// hit's own suffix chunk shape was the only difference). Retained < grid -> miss 'grid'.
+// hit's own suffix chunk shape was the only difference). Retained < grid -> miss 'grid'. One exception: when the new
+// prompt's prefill ends exactly where the retained one did (limit == pf_end, the same prompt sent again), its last cell
+// [floor(pf_end / grid) * grid, pf_end) has the retained cell's rows and shape, so all pf_end rows are kept.
 #include <algorithm>
 #include <cassert>
 #include <vector>
@@ -55,7 +57,7 @@ struct PrefixReuse
         raw = skip;
         if (skip && grid > 0)
         {
-            skip = std::min(skip, pf_end) / grid * grid;
+            skip = skip >= pf_end && limit == pf_end ? pf_end : std::min(skip, pf_end) / grid * grid;
             if (!skip) why = "grid";
         }
         if (!skip) dirty_end = 0;       // a miss resets every cache (g6m4: reset(m) + reset(D.d))

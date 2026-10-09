@@ -270,6 +270,19 @@ int main()
         CHECK(request(o, cat(o.history, toks(4517, 57)), toks(64, 58), 64, K) == o.raw && o.raw > 15086);
         PrefixReuse z = q; z.clear(); CHECK(z.pf_end == 0 && z.raw == 0);
     }
+    // the same prompt again (NOEND): its prefill would end where the retained one did, so the partial last cell is kept
+    for (int K : {0, 4})
+    {
+        PrefixReuse q; q.grid = 4096; q.noend = true;
+        const std::vector<int> p = toks(8192, 70);
+        request(q, p, toks(64, 71), 64, K);
+        CHECK(q.pf_end == 8191);
+        CHECK(request(q, p, toks(64, 71), 64, K) == 8191 && !strcmp(q.why, "hit"));    // not floor(8191 / 4096) * 4096
+        CHECK(request(q, head(p, 8000), toks(8, 72), 8, K) == 4096);                   // a shorter prompt: whole cells only
+        PrefixReuse s; s.grid = 4096;                                                   // without NOEND the replay is 'short'
+        request(s, p, toks(64, 71), 64, K);
+        CHECK(request(s, p, toks(64, 71), 64, K) == 0 && !strcmp(s.why, "short"));
+    }
     // RGRID: g6m4.cu grid = MP = 4096 (W44 CL1 [M]: the lane pairing does not change a row). Retained = floor(min(skip,
     // pf_end) / 4096) * 4096, so a hit can now keep an odd multiple of 4096 (retained mod 8192 = 4096)
     for (int K : {0, 4})
