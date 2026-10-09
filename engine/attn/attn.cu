@@ -331,15 +331,11 @@ __global__ void value_project(Input input,int start,const float* context){
     for(int k=lane;k<512;k+=32)sum=fmaf(context[((int64_t)row*a.heads+h)*512+k],bfloat(a.uv,((int64_t)h*256+d)*512+k),sum);
     sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)r*a.heads+h)*256+d]=__float2half_rn(sum);
 }
-// DEC_AVP (bar RESULTS-M20 "DEC_AVP"): absorb / value_project for n <= AVP_ROWS rows in one launch. Grid has no row axis:
+// DEC_AVP (bar RESULTS-M20 "DEC_AVP"): absorb / value_project for all rows of a call in one launch. Grid has no row axis:
 // each warp loads its whole lane-strided weight row (k = lane + 32m) into registers once, then per row runs the same
 // fmaf chain over the same k order, the same warp_sum, and lane 0 stores, so every q / rope / output byte matches the
 // per-row kernels. The inputs of the rows (q_b, context) are staged in shared memory as bit copies.
-#ifdef DEC_S2
-constexpr int AVP_ROWS=8;   // S2 batched steps: up to G6_MX rows in chunks of 8 (smem 16 KB value_project); per-row bytes as with 3
-#else
-constexpr int AVP_ROWS=3;
-#endif
+constexpr int AVP_ROWS=8;   // rows staged at a time (smem 16 KB in value_project_m); a launch takes any row count
 // n may exceed AVP_ROWS: the rows are staged AVP_ROWS at a time and the weight row stays in registers (gr8 #75)
 template<class Input>
 __global__ void absorb_m(Input input,int start,int n,float* q,float* rope){
@@ -489,17 +485,11 @@ static void launch_value_project_m(const G6Attn& a,Input input,Work& w,int start
 // Otherwise (n > AVP_ROWS, no DEC_S2) false: the caller runs the per-row kernel.
 template<class Input>
 static bool launch_absorb_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-#ifndef DEC_S2
-    if(n>AVP_ROWS)return false;
-#endif
     launch_absorb_m(a,input,w,start,n,st);
     return true;
 }
 template<class Input>
 static bool launch_value_project_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-#ifndef DEC_S2
-    if(n>AVP_ROWS)return false;
-#endif
     launch_value_project_m(a,input,w,start,n,st);
     return true;
 }

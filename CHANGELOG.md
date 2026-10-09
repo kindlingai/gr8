@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-09: one-launch absorb / value project at any row count (#75)
+
+- The plain build ran absorb and value project per row (weights reloaded per row) above 3 rows, so DFlash2 verify
+  steps of 4-8 rows paid it. They now take the one-launch kernels at any row count. One session, DFlash2 (default):
+  short prompts +2% (38.1 / 33.6 / 40.5 -> 38.7 / 34.5 / 41.3 code / prose / structured), 31.9 vs 28.0 tok/s after a
+  57.6K prompt. MTP k=2 and prefill unchanged.
+
 ## 2026-10-09: head-batched attention for every decode call (#75)
 
 - The head-batched scores and context kernels now serve every decode attention call, not only the fixed-K ones: verify
