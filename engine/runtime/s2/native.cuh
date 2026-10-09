@@ -161,7 +161,7 @@ class NativeDispatch {
         if (!draft) {
             g6rt::evprof_read(rows,c_.stream,c_.main.rank);
             lp_rows_ = 0;
-            if (std::any_of(l.samples.begin(),l.samples.end(),[](const Sampling& s){return s.lp >= 0;})) {
+            if (std::any_of(l.samples.begin(),l.samples.end(),[](const Sampling& s){return s.lp >= 0 || s.plp >= 0;})) {
                 g6rt::lp_fetch(c_.main,out,input,lp_); lp_rows_ = rows;
             }
         }
@@ -306,9 +306,9 @@ public:
             [&](int old,int next){mode(old,next);},
             [&](const Launch& l){return launch(l);},
             [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows){prefill(s,p,first,rows);},
-            [&](int row,int k){
+            [&](int row,bool target,int k){
                 require(row >= 0 && row < lp_rows_, "logprob row outside the last main step");
-                return g6rt::lp_row(lp_,row,false,k);
+                return g6rt::lp_row(lp_,row,target,k);
             }
         };
     }

@@ -81,12 +81,14 @@ struct Stats
 
 // run(step) -> the sampled token of every row of the step (step.M() ids), for MAIN, DRAFT and CHAIN steps
 // round(sess, round, base, a, K): per-session round line (mtp_sequence prints "round N base B accepted a of K")
+// prompt(sess, M, pos0): after each prompt MAIN step of a session (rows pos0 .. pos0 + M - 1, row r at pos0 + r)
 // emit(sess, toks, k, row) -> true = the session is finished (stop id or max tokens); row: toks[0]'s row in the last MAIN step
 // returns per session the generated tokens (as mtp_sequence returns them)
 struct Hooks
 {
     std::function<std::vector<int>(const Step&)> run;
     std::function<void(int, long, int, int, int)> round;
+    std::function<void(int, int, int)> prompt;
     std::function<bool(int, const int*, int, int)> emit;
 };
 
@@ -343,6 +345,7 @@ private:
             add_rows(m, q, rows, s == PS - 1 ? Step::TAIL : Step::ROUND);
             check(m);
             const std::vector<int> t = h_.run(m);
+            if (h_.prompt) h_.prompt(q, M, rows[0].pos);
             if (s == PS - 1)
             {
                 x.tokens.push_back(t[M - 1]);

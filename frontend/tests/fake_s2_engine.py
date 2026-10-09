@@ -40,9 +40,10 @@ def token_at(prompt, made):
     return 1000 + (sum(prompt) * 7 + made * 13) % 5000
 
 
-def lp_line(t, k):
-    """the engine's "l" line for sampled token t with k top entries (deterministic stand-in values)"""
-    return f'l -0.25 1 {k}' + ''.join(f' {t + i}:{-0.25 - i}' for i in range(k)) + '\n'
+def lp_line(t, k, tag='l'):
+    """the engine's "l" line for sampled token t with k top entries (deterministic stand-in values); tag 'p <j>' for
+    prompt token j"""
+    return f'{tag} -0.25 1 {k}' + ''.join(f' {t + i}:{-0.25 - i}' for i in range(k)) + '\n'
 
 
 def number(s):
@@ -56,18 +57,19 @@ def parse_request(data: bytes):
     if not _:
         raise ValueError('request missing prompt line')
     w = line.decode().split()
-    if len(w) not in (10, 12, 14) or w[0] != 'n_gen' or w[2] != 'temp' or w[4] != 'seed' or w[6] != 'min' or w[8] != 'stop':
+    if len(w) not in (10, 12, 14, 16) or w[0] != 'n_gen' or w[2] != 'temp' or w[4] != 'seed' or w[6] != 'min' or w[8] != 'stop':
         raise ValueError(f'invalid request header {line!r}')
     r = {'n_gen': number(w[1]), 'temp': float(w[3]), 'seed': number(w[5]), 'min': number(w[7]),
-         'stop': [] if w[9] == '-' else [number(x) for x in w[9].split(',')], 'top_p': 1.0, 'lp': None}
+         'stop': [] if w[9] == '-' else [number(x) for x in w[9].split(',')], 'top_p': 1.0, 'lp': None, 'plp': None}
     if len(w) >= 12:
         if w[10] != 'top_p':
             raise ValueError('invalid top_p header')
         r['top_p'] = float(w[11])
-    if len(w) == 14:
-        if w[12] != 'lp' or not 0 <= number(w[13]) <= 20:
-            raise ValueError('invalid lp header')
-        r['lp'] = number(w[13])
+    for i in range(12, len(w), 2):     # lp then plp, each optional
+        if w[i] not in ('lp', 'plp') or r[w[i]] is not None or (w[i] == 'lp' and r['plp'] is not None) \
+                or not 0 <= number(w[i + 1]) <= 20:
+            raise ValueError('invalid lp/plp header')
+        r[w[i]] = number(w[i + 1])
     return r, rest
 
 
@@ -209,6 +211,8 @@ class Fake:
             s['emitted'] += len(ids)
             s['rounds'] += 1
             s['acc'][len(ids) - 1] += 1
+            if req['plp'] is not None and s['rounds'] == 1:     # the first round (counted above)
+                s['f'].write(''.join(lp_line(t, req['plp'], f'p {j}') for j, t in enumerate(s['prompt'][1:], 1)))
             if req['lp'] is not None:
                 s['f'].write(''.join(lp_line(t, req['lp']) for t in ids))
             s['f'].write('t ' + ' '.join(map(str, ids)) + '\n')

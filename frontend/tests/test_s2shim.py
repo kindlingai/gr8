@@ -80,7 +80,7 @@ class UnitTests(unittest.TestCase):
 
     def test_parse_ready(self):
         c = g6s2shim.parse_ready('G6S2 1 7 6 20000 2 4 8\n')
-        self.assertEqual(c, {'epoch': 7, 'ranks': 6, 'pool_rows': 20000, 'mtp': 2, 'guard': 4, 'max_rows': 8, 'max_lp': 0})
+        self.assertEqual(c, {'max_lp': 0, 'epoch': 7, 'ranks': 6, 'pool_rows': 20000, 'mtp': 2, 'guard': 4, 'max_rows': 8})
         self.assertEqual(g6s2shim.parse_ready('G6S2 2 7 6 20000 2 4 8 20\n')['max_lp'], 20)
         for bad in ('G6S2 2 7 6 20000 2 4 8\n', 'G6S2 1 7 6 20000 2 4 8 20\n', 'G6S2 3 7 6 20000 2 4 8 20\n',
                     'G6S2 1 7 6\n', 'ready\n', 'G6S2 1 7 6 20000 2 4 x\n'):
@@ -108,8 +108,11 @@ class UnitTests(unittest.TestCase):
             self.assertIsNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'top_p': tp}, 0)[1], tp)
         self.assertIn(b' top_p 1.0\n', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4}, 0)[0])
         self.assertIn(b' top_p 1.0 lp 0\n', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'logprobs': 0}, 0)[0])
+        self.assertIn(b' top_p 1.0 lp 2 plp 3\n',
+                      g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'logprobs': 2, 'prompt_logprobs': 3}, 0)[0])
         for lp in (-1, 21, 1.5, True, '3'):
-            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'logprobs': lp}, 0)[1], lp)
+            for key in ('logprobs', 'prompt_logprobs'):
+                self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, key: lp}, 0)[1], (key, lp))
         for kw in ({'temperature': 'hot'}, {'temperature': -1}, {'seed': 'x'}, {'min_tokens': 'x'}):
             self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[1], kw)
         for bad in ({'prompt': [], 'max_tokens': 4}, {'prompt': [1], 'max_tokens': 0}, {'prompt': [-1], 'max_tokens': 4},
@@ -271,7 +274,7 @@ class ConcurrentStreams(S2Base):
     async def test_validation_errors_keep_engine_alive(self):
         c = await self.client()
         bad = [gen('big', max_tokens=30000), gen('empty', prompt=[1], max_tokens=0), gen('lp', logprobs=21),
-               gen('plp', prompt_logprobs=1)]
+               gen('plp', prompt_logprobs=21), gen('plplong', list(range(1, 1100)), prompt_logprobs=1)]
         for f in bad:
             c.send(f)
         for f in bad:
@@ -306,6 +309,16 @@ class ConcurrentStreams(S2Base):
         ids, _, fs = await c.wait('plain')
         self.assertEqual(ids, self.expect([7, 8], 30))
         self.assertFalse(any('logprobs' in f for f in fs if f['type'] == 'tokens'))
+
+    async def test_prompt_logprobs(self):
+        c = await self.client()
+        prompt = [7, 8, 9, 10, 11]
+        c.send(gen('plp', prompt, max_tokens=6, prompt_logprobs=2, logprobs=1))
+        ids, fin, fs = await c.wait('plp')
+        self.assertEqual((fin['reason'], ids), ('length', self.expect(prompt, 6)), fin)
+        self.assertEqual([f['type'] for f in fs][0], 'prompt_logprobs')
+        self.assertEqual(fs[0]['lps'], [None] + [{'lp': -0.25, 'rank': 1, 'top': [[t, -0.25], [t + 1, -1.25]]} for t in prompt[1:]])
+        self.assertEqual(sum(f['type'] == 'prompt_logprobs' for f in fs), 1)
 
     async def test_duplicate_id(self):
         c = await self.client()

@@ -6,7 +6,8 @@
 #include "../s2_batch.h"
 
 namespace g6s2 {
-struct Payload { std::vector<int> prompt; int chunk = 4; };
+// decode_prompt: the whole prompt runs as decode steps from position 0, no tensor prefill (prompt logprobs)
+struct Payload { std::vector<int> prompt; int chunk = 4; bool decode_prompt = false; };
 struct Emission { uint32_t count = 0; bool finished = false; };
 struct DriverHooks {
     // Real TP4 pool/binding adapter: canonical base, never a per-rank first-fit.
@@ -17,6 +18,8 @@ struct DriverHooks {
     std::function<std::vector<int>(const s2::Step&)> run;
     // Exact native Emitter policy (stop/min/max) on EVERY rank, not just rank0.
     std::function<Emission(Key, const int*, int, int)> emit;   // (key, ids, count, row of ids[0] in the last main step)
+    // optional: after each prompt main step of a session, (key, rows, position of row 0)
+    std::function<void(Key, int, int)> prompt;
     std::function<void(Key, long, int, int, int)> round;
     // One completion notification; physical KV release waits for the event fence.
     std::function<void(Key, const s2::Stats&)> terminal;
@@ -37,6 +40,9 @@ class Driver {
             },
             [this](int q, long round, int base, int accepted, int K) {
                 if (hooks_.round) hooks_.round(scheduler_.slots()[q].key, round, base, accepted, K);
+            },
+            [this](int q, int M, int pos0) {
+                if (hooks_.prompt) hooks_.prompt(scheduler_.slots()[q].key, M, pos0);
             },
             [this](int q, const int* ids, int n, int row) {
                 const auto& s = scheduler_.slots()[q];
@@ -88,6 +94,7 @@ public:
             if (c.admit) {
                 payload_[c.admit->key.slot] = *p;
                 hooks_.bind(*c.admit);
+                if (p->decode_prompt) scheduler_.skip_prefill(c.admit->key);
             }
         } catch (...) { scheduler_.fail(); throw; }
         return changes;
@@ -103,7 +110,7 @@ public:
                 auto k = q.keys[0]; const auto& s = scheduler_.slots()[k.slot];
                 const auto& p = payload_[k.slot];
                 require(!initialized_[k.slot], "duplicate prompt tail");
-                batch_.admit({int(k.slot)}, {{p.prompt, int(q.first), p.chunk, int(s.req.max_tokens)}});
+                batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens)}});
                 initialized_[k.slot] = true;
                 scheduler_.complete_tail(completion(k));
             } else if (q.kind == Kind::Decode) {

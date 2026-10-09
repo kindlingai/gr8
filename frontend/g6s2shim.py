@@ -8,7 +8,7 @@ File protocol, one engine epoch per start of g6m4 --s2 (every rank needs a FRESH
                                        booted (version 1 has no <max_lp>: no logprobs)
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> EVERY rank DIR/req.<id>      written as req.<id>.tmp, then renamed; "host:/path" entries over ssh. Two lines:
-        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>]
+        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -17,6 +17,8 @@ File protocol, one engine epoch per start of g6m4 --s2 (every rank needs a FRESH
       Requests wait in the engine's FIFO until a session slot and a KV run are free (several decode in one step).
   engine rank 0 -> DIR/resp.<id>       one line per event:
         a <epoch> <slot> <generation> <base_page> <pages>   admitted (the request got a slot and its KV run)
+        p <j> <lp> <rank> <n> <id>:<lp> ...                  with plp: prompt token j (1 <= j < prompt length), before the
+                                                             first t line; the shim sends one prompt_logprobs frame then
         l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line (as g6shim.py)
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
         m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
@@ -48,7 +50,8 @@ from g6shim import SSH, EOS_IDS, VOCAB, Shim as PlainShim  # noqa: E402
 log = logging.getLogger('g6s2shim')
 
 INT32_MAX = 2**31 - 1
-READY_RE = re.compile(r'^G6S2 (?:1 (\d+) (\d+) (\d+) (\d+) (\d+) (\d+)|2 (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+))\s*$')
+READY_FIELDS = {'1': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows'),
+                '2': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
 
 
 def payload_hash(data: bytes) -> int:
@@ -60,13 +63,11 @@ def payload_hash(data: bytes) -> int:
 
 
 def parse_ready(text: str) -> dict:
-    m = READY_RE.match(text)
-    if not m:
+    w = text.split()
+    names = READY_FIELDS.get(w[1]) if len(w) > 1 and w[0] == 'G6S2' else None
+    if not names or len(w) != 2 + len(names) or not all(x.isdigit() for x in w[2:]):
         raise ValueError(f'bad ready.s2: {text!r}')
-    v = [int(x) for x in m.groups() if x is not None] + [0]    # version 1: max_lp 0
-    epoch, ranks, pool_rows, mtp, guard, max_rows, max_lp = v[:7]
-    return {'epoch': epoch, 'ranks': ranks, 'pool_rows': pool_rows, 'mtp': mtp, 'guard': guard, 'max_rows': max_rows,
-            'max_lp': max_lp}
+    return {'max_lp': 0, **dict(zip(names, map(int, w[2:])))}    # version 1: no logprobs
 
 
 def build_request(f: dict, ordinal: int):
@@ -96,11 +97,15 @@ def build_request(f: dict, ordinal: int):
         return None, 'bad temperature'
     if not (math.isfinite(top_p) and 0 < top_p <= 1):
         return None, 'top_p must be in (0, 1]'
-    lp = f.get('logprobs')
-    if lp is not None and (not isinstance(lp, int) or isinstance(lp, bool) or not 0 <= lp <= 20):
-        return None, 'logprobs must be 0..20'
+    lps = {}
+    for key, word in (('logprobs', 'lp'), ('prompt_logprobs', 'plp')):
+        v = f.get(key)
+        if v is not None and (not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 20):
+            return None, f'{key} must be 0..20'
+        if v is not None:
+            lps[word] = v
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + (f' lp {lp}' if lp is not None else '') + '\n' + ','.join(map(str, prompt)) + '\n').encode()
+            + ''.join(f' {w} {v}' for w, v in lps.items()) + '\n' + ','.join(map(str, prompt)) + '\n').encode()
     return body, None
 
 
@@ -129,6 +134,8 @@ class Req:
         self.emitted = 0
         self.m = None            # this request's last "m" line
         self.lps = []            # "l" entries for the next "t" line
+        self.plps = {}           # "p" entries by prompt position
+        self.plp_sent = False    # the prompt_logprobs frame went out
         self.fh = None
         self.buf = b''
         self.last = time.monotonic()
@@ -239,11 +246,16 @@ class Shim:
                                  'message': 'duplicate id'})
         if self.dead:
             return self.finish(r, 'error', message=self.dead)
-        if f.get('prompt_logprobs') is not None:
-            return self.finish(r, 'error', message='not supported: prompt_logprobs')
-        lp = f.get('logprobs')
-        if lp is not None and not (isinstance(lp, int) and not isinstance(lp, bool) and 0 <= lp <= self.max_logprobs()):
-            return self.finish(r, 'error', message=f'logprobs must be 0..{self.max_logprobs()}')
+        for k in ('logprobs', 'prompt_logprobs'):
+            v = f.get(k)
+            if v is None:
+                continue
+            if not self.cfg['max_lp']:      # a version-1 engine refuses any lp key and would end the epoch
+                return self.finish(r, 'error', message=f'not supported by this engine: {k}')
+            if not (isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= self.max_logprobs()):
+                return self.finish(r, 'error', message=f'{k} must be 0..{self.max_logprobs()}')
+        if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
+            return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
             return self.finish(r, 'error', message='prompt too long' if prompt and isinstance(mt, int) and mt >= 1
                                else 'bad prompt/max_tokens')
@@ -350,11 +362,20 @@ class Shim:
             r.admitted = True
         elif w[0] == 'l':
             r.lps.append(PlainShim.entry(w[1:]))
+        elif w[0] == 'p':
+            r.plps[int(w[1])] = PlainShim.entry(w[2:])
         elif w[0] == 't':
             ids = [int(x) for x in w[1:]]
             r.emitted += len(ids)
             self.c['gen'] += len(ids)
             lps, r.lps = r.lps, []
+            if ids and r.f.get('prompt_logprobs') is not None and not r.plp_sent:
+                r.plp_sent = True
+                n = len(r.f['prompt'])
+                if any(j not in r.plps for j in range(1, n)):
+                    log.error('req.%s: engine sent %d of %d prompt logprobs', r.ordinal, len(r.plps), n - 1)
+                    return self.finish(r, 'error', ct=r.emitted, message='engine returned incomplete prompt logprobs')
+                self.send(r, {'type': 'prompt_logprobs', 'id': r.rid, 'lps': [None] + [r.plps[j] for j in range(1, n)]})
             if ids:
                 fr = {'type': 'tokens', 'id': r.rid, 'ids': ids}
                 if r.f.get('logprobs') is not None:
@@ -498,6 +519,9 @@ async def main(argv=None):
     ap.add_argument('--max-model-len', type=int, default=0,
                     help='cap on prompt + max_tokens (0 = what the KV pool allows: pool_rows - guard, from ready.s2)')
     ap.add_argument('--max-logprobs', type=int, default=20, help='largest k of logprobs (also capped by the engine ready line)')
+    ap.add_argument('--max-plp-prompt', type=int, default=1024,
+                    help='longest prompt of a request with prompt_logprobs: it runs as decode steps (~13 ms per token at '
+                         'chunk 8, TP4) and every other session waits until it is done')
     ap.add_argument('--poll', type=float, default=0.002, help='resp poll interval, s')
     ap.add_argument('--ready-timeout', type=float, default=3600.0, help='wait this long for DIR/ready.s2')
     ap.add_argument('--cancel-timeout', type=float, default=60.0, help='answer abort if the engine sends no end line this long after CANCEL')

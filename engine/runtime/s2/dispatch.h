@@ -31,8 +31,9 @@ struct DispatchHooks {
     std::function<std::vector<int>(const Launch&)> launch;
     // Complete prefill including both lanes AND draft, no late closure.
     std::function<void(const Slot&, const Payload&, uint32_t, uint32_t)> prefill;
-    // optional: (row, k) -> row's logprob entry in the last main step, k top entries (requests with lp)
-    std::function<g6rt::LpRow(int, int)> logprob;
+    // optional: (row, target, k) -> row's logprob entry in the last main step: its sampled token, or (target) the
+    // teacher-forced next prompt token; k top entries (requests with lp / plp)
+    std::function<g6rt::LpRow(int, bool, int)> logprob;
 };
 // the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
 inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
@@ -118,8 +119,8 @@ void native_inputs(const Launch& l, StepIn& si, S2In& h) {
     for (int r = 0; r < si.M; ++r) {
         const auto& x = l.step.r[r]; const auto& sample = l.samples[r];
         si.tok[r] = x.tok; si.pos[r] = x.pos; si.tgt[r] = x.tgt;
-        // top list: the sampled row of a main step of a request with lp > 0 (rank.cuh step_inputs)
-        const int topk = l.step.kind == s2::Step::MAIN && x.tgt < 0 && sample.lp > 0;
+        // top list: main-step rows of a request with lp > 0 (sampled rows) or plp > 0 (prompt rows; rank.cuh step_inputs)
+        const int topk = l.step.kind == s2::Step::MAIN && (x.tgt >= 0 ? sample.plp : sample.lp) > 0;
         si.srow[r] = {sample.inv_temp, sample.seed, 0u, x.spos, 0, sample.top_p, topk};
     }
     h.ns = int(l.step.sess.size()); h.cls = l.step.cls;

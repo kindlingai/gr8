@@ -205,6 +205,11 @@ public:
         if (q.kind != Kind::Idle) { work_ = q; busy_ = true; }
         return q;
     }
+    // a just-admitted session that runs its whole prompt as decode steps (prompt logprobs): straight to PromptTail
+    void skip_prefill(const Key& k) {
+        auto& s = slot(k); require(!busy_ && s.phase == Phase::Prefill && !s.prefilled, "skip_prefill outside admission");
+        s.prefilled = s.req.prompt_tokens - 1;
+    }
     void complete_prefill() { // full quantum incl. both lanes and draft prefill; caller already synchronized
         require(busy_ && work_.kind == Kind::Prefill, "not a prefill quantum");
         slot(work_.keys[0]).prefilled += work_.rows; completed();
