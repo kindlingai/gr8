@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-09: `G6_PF_OWN=4` prefill under `--s2`
+
+- S2 prefill can run pair-owner QO attention (`G6_PF_OWN=4` with `G6_PF_QP_ROLL` / `G6_PF_QP_CTX`, as the TP4 launcher
+  sets them); S2 prefill runs on the CP staging pool, indexed by position, so a session's base page never reaches the
+  QO prepass. Each request takes OWN=4 or OWN=2 by the plain build's rule (prompt + gen against `G6_PF_QP_CTX`). Solo
+  output equals the plain build's OWN=4 output byte for byte; 8K prefill 818 -> 1,260 tok/s. Decode at 4-8 sessions
+  measured 5-8% lower than with OWN=1 (the plain build shows 2-4% at one session), not yet explained.
+
 ## 2026-10-09: adaptive k verify costs re-measured (#75)
 
 - `spec_len.h`'s verify-time table (ms by rows 1..8) now holds the current DFlash2 step times

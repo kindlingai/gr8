@@ -252,7 +252,6 @@ int main(int argc, char** argv)
         if (!why.empty()) die(why);
         if (own4 && g6nr::NR != 4) die("G6_PF_OWN=4 is TP4 only (G6_NR=4)");
         if (own4 && !qp_roll_s && (qp_man.empty() || qp_file.empty())) die("G6_PF_OWN=4 needs --qp-manifest and --qp-pack (or G6_PF_QP_ROLL)");
-        if (own4 && s2mode) die("G6_PF_OWN=4 is not wired into --s2");
         if (!own4 && (!qp_man.empty() || !qp_file.empty())) die("--qp-manifest / --qp-pack need G6_PF_OWN=4 and --prefill");
     }
 
@@ -688,6 +687,15 @@ int main(int argc, char** argv)
                 const int B = ex ? 0 : (int)sl.run.base_page, pg = ex ? m.s2->run_pages : (int)sl.run.pages;
                 s2_solo_run(m, B, pg); s2_solo_run(D.d, B, pg);
                 m.s2_pf_base = D.d.s2_pf_base = B;
+                // OWN=4: the serve loop's per-request rule (prompt + gen against the QO key table). S2 prefill runs on the CP
+                // staging pool, indexed by position, so the run's base page never reaches the QO prepass
+                if (pf_qp)
+                {
+                    const int ctx = (int)(sl.req.prompt_tokens + sl.req.max_tokens);
+                    const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx);
+                    fprintf(stderr, "# rank %d: s2 request %llu ctx %d (prompt + gen) -> %s (QP_CTX %d)\n", R, (unsigned long long)sl.req.id,
+                            ctx, on ? "OWN=4 pair-owner" : "OWN=2 (ctx > QP_CTX)", P.qp_ctx);
+                }
             },
             [&]() { m.s2_pf_base = D.d.s2_pf_base = 0; },
             [&]() { cp_pf_in(); }, [&]() { cp_pf_out(); },
@@ -732,7 +740,8 @@ int main(int argc, char** argv)
             bc.port = (uint16_t)s2port;
             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
-                std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3";
+                std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
+                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
