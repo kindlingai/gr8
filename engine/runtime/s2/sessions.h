@@ -111,14 +111,16 @@ public:
     void terminal(Key k, const s2::Stats& stats, const char* reason = nullptr) {
         auto& s = get(k); if (s.ended) return;
         // Emitter::end uses per-request counters here, never process-wide totals.
-        require(stats.acc.empty() || stats.acc.size() == config_.mtp + 1, "bad per-request acceptance histogram");
+        // K + 1 bins: K = the MTP draft count, or 7 for a session that started on DFlash2 (s2_batch.h)
+        require(stats.acc.empty() || (stats.acc.size() >= config_.mtp + 1 && stats.acc.size() <= 8), "bad per-request acceptance histogram");
         std::array<long, 8> zero{};
         auto& em = s.emitter;
         if (em.f) {
             const long* acc = stats.acc.empty() ? zero.data() : stats.acc.data();
-            fprintf(em.f, "m %ld %ld %ld", stats.rounds, stats.rounds * config_.mtp, stats.tokens - stats.rounds);
-            for (unsigned i = 0; i < config_.mtp; ++i) {
-                long accepted = 0; for (unsigned a = i + 1; a <= config_.mtp; ++a) accepted += acc[a];
+            const unsigned K = stats.acc.empty() ? config_.mtp : unsigned(stats.acc.size() - 1);
+            fprintf(em.f, "m %ld %ld %ld", stats.rounds, stats.drafted, stats.tokens - stats.rounds);
+            for (unsigned i = 0; i < K; ++i) {
+                long accepted = 0; for (unsigned a = i + 1; a <= K; ++a) accepted += acc[a];
                 fprintf(em.f, " %ld", accepted);
             }
             fprintf(em.f, "\nend %s %d %d\n", reason ? reason : em.stop_id >= 0 ? "stop" : "length", em.stop_id, em.emitted);

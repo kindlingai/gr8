@@ -38,7 +38,8 @@
 //      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
 //                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from tools/convert/dflash2.py. --dflash-sel 1 =
 //                     the DFlash2 selector walk (default when the pack has it), 0 = argmax drafts; --dflash-k K = verify
-//                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, no --s2.
+//                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, except with --s2: there a
+//                     session alone at its prompt tail drafts with DFlash2 and goes to MTP when a second one arrives (s2_batch.h).
 //      [--spec-accept coupled|rejection]  how a verify step accepts drafts at temperature > 0. coupled (default): drafts are
 //                     sampled with the target's position-keyed noise and accepted when they equal the target's sample, so
 //                     a seed gives the same text with and without speculation. rejection: greedy drafts, each accepted with
@@ -48,7 +49,7 @@
 //      [--spec-adaptive [--spec-levels 7,5,3,2]]  each round verifies the level with the most expected tokens per ms
 //                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
 //                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
-//                     Needs --mtp or --dflash-manifest. Refused with --s2.
+//                     Needs --mtp or --dflash-manifest. With --s2: the DFlash2 sessions' policy (needs --dflash-manifest).
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
@@ -182,12 +183,13 @@ int main(int argc, char** argv)
     if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
     const bool s2mode = !s2dir.empty();
     const bool dfl = !dfl_man.empty();
-    if (dfl && (dfl_file.empty() || mtp || s2mode || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
-        die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round); not with --s2; --dflash-sel 0|1; --dflash-k 1..7");
+    // --s2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
+    if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
+        die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except with --s2; --dflash-sel 0|1; --dflash-k 1..7");
     if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
     if (plan.rs && (s2mode || (!mtp && !dfl))) die("--spec-accept rejection needs --mtp or --dflash-manifest, and not --s2");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
-    if ((adapt || !levels_s.empty()) && (s2mode || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest, and not --s2");
+    if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; with --s2 it is the DFlash2 sessions' policy");
     if (!levels_s.empty() && !adapt) die("--spec-levels needs --spec-adaptive");
     SpecLen spec;                       // --spec-adaptive. Its estimates persist across requests
     if (adapt)
@@ -209,7 +211,7 @@ int main(int argc, char** argv)
         die("--s2 needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8, --s2-epoch > 0 and no --serve");
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under --s2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
-    if (reuse_prefix && dfl) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
+    if (reuse_prefix && dfl && !s2mode) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
     for (const std::string& ps : prompts)
@@ -660,6 +662,7 @@ int main(int argc, char** argv)
         sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>((uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk));
         sc.max_sessions = (uint32_t)s2sess;
         sc.mtp = (uint32_t)mtp;
+        if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the plain build's cap rule
         sc.prefill_rows = (uint32_t)MP;
         sc.two_lanes = two;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
@@ -680,6 +683,13 @@ int main(int argc, char** argv)
         }
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
         G6RT_CK(cudaStreamSynchronize(st));
+        // DFlash2: Dfl::pf_feat holds one request's prefill taps, the last WIN prompt positions of the session whose
+        // prefill started last (dfl_owner; -1 = none, or a prefix-reuse hit that skipped part of the window)
+        static_assert(s2::DFL_B == dfl::B, "s2_batch.h DFL_B follows dfl::B");
+        int dfl_owner = -1;
+        uint64_t dfl_req = UINT64_MAX;
+        std::array<uint32_t, g6s2::MAX_SESSIONS> slot_prompt{};
+        u64 s2_dstep = 0;                // the drafter fabric's steps
         g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
             [&](const StepIn& si) {
                 std::vector<uint32_t> sizes(NC, (uint32_t)(si.M * HID * 2));
@@ -709,6 +719,13 @@ int main(int argc, char** argv)
                     fprintf(stderr, "# rank %d: s2 request %llu prompt %u ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d)\n", R,
                             (unsigned long long)sl.req.id, sl.req.prompt_tokens, ctx, on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx);
                 }
+                if (dfl && DF.pf_feat && sl.req.id != dfl_req)   // a request's first prefill quantum: as the plain build per request
+                {
+                    dfl_req = sl.req.id;
+                    DF.pf_hi = (int)sl.req.prompt_tokens - 1; DF.pf_lo = std::max(0, DF.pf_hi - dfl::WIN);
+                    if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
+                    dfl_owner = (int)sl.prefilled <= DF.pf_lo ? (int)sl.key.slot : -1;
+                }
             },
             [&]() { m.s2_pf_base = D.d.s2_pf_base = 0; },
             [&]() { cp_pf_in(); }, [&]() { cp_pf_out(); },
@@ -731,6 +748,8 @@ int main(int argc, char** argv)
             }
             h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
                 const int q = (int)g.key.slot;
+                slot_prompt[q] = g.req.prompt_tokens;
+                if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
                 const bool ex = pool.exclusive(g6s2::reserve_rows(sc, g.req));
                 // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
                 // past them is written by this request before any step reads it (prefix_reuse.h)
@@ -755,6 +774,46 @@ int main(int argc, char** argv)
             h.retire = [&](const g6s2::Slot& old) { nd.retire(old); };
             h.fence = [&] { nd.synchronize(); };
             h.dispatch = nd.hooks();
+            if (dfl)
+            {
+                h.dfl_kv = dfl_k; h.dfl_spec = spec;
+                // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
+                h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
+                h.dispatch.dfl_start = [&](int q) {    // the fill steps of g6m4's serve loop: Dfl::pf_feat -> the ring
+                    if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int c0 = DF.pf_lo; c0 < DF.pf_hi; c0 += dfl::B)
+                    {
+                        DflIn di;
+                        memset(&di, 0, sizeof di);
+                        di.step = ++s2_dstep;
+                        di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
+                        *in_f = di;
+                        fabf.enqueue_step(di.step, dfl_fill_sizes());
+                        G6RT_CK(cudaGraphLaunch(exec_f[2], st));
+                        G6RT_CK(cudaStreamSynchronize(st));
+                        g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
+                    }
+                    if (R == 0) fprintf(stderr, "# s2 dflash slot %d prompt context %d..%d: %.1f ms\n", q, DF.pf_lo, DF.pf_hi - 1,
+                                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                    return DF.pf_lo;
+                };
+                h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
+                    DflIn di;
+                    memset(&di, 0, sizeof di);
+                    di.step = ++s2_dstep;
+                    di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
+                    for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{smp.inv_temp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
+                    *in_f = di;
+                    fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                    G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error");
+                    s2::DflDrafts o;
+                    for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
+                    return o;
+                };
+            }
             g6s2::BootstrapConfig bc;
             bc.scheduler = sc;
             bc.rank = (unsigned)R;
@@ -772,7 +831,10 @@ int main(int argc, char** argv)
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
             // every reachable S2 graph key, captured after the bootstrap (its timeout does not cover the capture) and before
             // the head publishes ready.s2 (Service::run): the all-rank barrier, with no receive timeout, replaces the skew limit
-            try { nd.capture_all(sc.limit(), mtp, plan.chunk); g6s2::capture_barrier(bc, links); }
+            // the batched graphs carry no DFlash2 taps (their rows outnumber Dfl::feat's 8); the solo graphs keep them
+            auto* const tap = m.dfl_tap;
+            m.dfl_tap = nullptr;
+            try { nd.capture_all(sc.limit(), mtp, plan.chunk); m.dfl_tap = tap; g6s2::capture_barrier(bc, links); }
             catch (...) { links.shutdown(); throw; }
             g6s2::Service service(bc, links, std::move(h), plan.chunk);
             service.run();               // returns on DIR/quit

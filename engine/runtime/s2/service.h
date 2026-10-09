@@ -29,6 +29,9 @@ struct NativeHooks {
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK
     DispatchHooks dispatch;
+    // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
+    int dfl_kv = 7;
+    g6rt::SpecLen dfl_spec;
 };
 // Only atomic scalar stores/loads on the compute hot path. No request-file
 // checks, digest, allocation, or lock in an event-free boundary.
@@ -224,7 +227,14 @@ public:
         h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
         h.terminal = [&](Key k,const s2::Stats& stats) { sessions_.terminal(k,stats); };
+        if (native_.dispatch.dfl) {
+            require(bool(native_.dispatch.dfl_ok) && bool(native_.dispatch.dfl_start), "DFlash2 needs dfl_ok, dfl_start and dfl");
+            h.dfl_ok = [&](Key k) { return dispatch_.dfl_ok(k.slot); };
+            h.dfl_start = [&](Key k) { return dispatch_.dfl_start(k.slot); };
+            h.dfl = [&](Key, const s2::DflReq& r) { return dispatch_.dfl(r); };
+        }
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
+        if (native_.dispatch.dfl) driver_->dflash(native_.dfl_kv, native_.dfl_spec);
         if (reuse()) {
             require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
             dispatch_.track_rows();

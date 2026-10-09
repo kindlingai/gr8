@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-09: DFlash2 under `--s2` (the S2 launcher default, `DFLASH=1`)
+
+- `--s2 --dflash-manifest .. --spec-adaptive` (with `--mtp`): a session alone at its prompt tail drafts with DFlash2
+  as the plain build's `dflash_sequence` does (prompt context from the prefill's taps, adaptive 1..7, one SpecLen per
+  process). Each DFlash2 round also runs the MTP first-form pass over the accepted rows, so when a second session
+  arrives the K-1 chain steps hand the session to the shared MTP rounds (`Batch::demote`). A demoted session stays on
+  MTP. The batched graphs are captured without the drafter's residual taps; the solo graphs keep them. Guard rows are
+  14 with the drafter loaded (a verify writes 7 rows past the last token).
+- A prefix-reuse hit drafts with DFlash2 only when its re-prefill covers the drafter's 2,048-row window.
+- Gate (TP4): 10 requests at temp 0 with logprobs, adaptive k, byte-identical to the plain build's DFlash2; 8 concurrent
+  requests (the first starts on DFlash2 and demotes) byte-identical to MTP-only S2. RigMark 1.0.0 (knapcio's
+  comparison id, `reasoning_effort` low): code 49.5, prose 28.4, structured 68.4 tok/s (plain DFlash2 49.2 / 29.1 /
+  67.0; S2 MTP 40.9 / 31.3 / 43.2), C2 50.6, C4 63.6. Free memory at 8 sessions: 2.7-3.6 GB per node.
+
 ## 2026-10-09: prefix reuse under `--s2` (`REUSE=1 scripts/launch_s2.sh`)
 
 - `--s2 --reuse-prefix`: a retired session's run stays in the pool with its prompt + emitted ids (`s2/pool.h`). At

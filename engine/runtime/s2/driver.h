@@ -21,6 +21,11 @@ struct DriverHooks {
     // optional: after each prompt main step of a session, (key, rows, position of row 0)
     std::function<void(Key, int, int)> prompt;
     std::function<void(Key, long, int, int, int)> round;
+    // optional, DFlash2: may a session alone at its prompt tail use the drafter (it owns the prefill's taps); the
+    // drafter's prompt context (returns the lowest position it holds); one drafter step
+    std::function<bool(Key)> dfl_ok;
+    std::function<int(Key)> dfl_start;
+    std::function<s2::DflDrafts(Key, const s2::DflReq&)> dfl;
     // One completion notification; physical KV release waits for the event fence.
     std::function<void(Key, const s2::Stats&)> terminal;
 };
@@ -51,8 +56,18 @@ class Driver {
                 require(e.finished || e.count == unsigned(n), "partial emission without stop");
                 emitted_[q] += e.count;
                 return e.finished || emitted_[q] == s.req.max_tokens;
-            }
+            },
+            hooks_.dfl ? std::function<s2::DflDrafts(const s2::DflReq&)>([this](const s2::DflReq& r) {
+                return hooks_.dfl(scheduler_.slots()[r.sess].key, r);
+            }) : nullptr,
+            hooks_.dfl_start ? std::function<int(int)>([this](int q) { return hooks_.dfl_start(scheduler_.slots()[q].key); }) : nullptr
         };
+    }
+    // sessions in Prefill or Decode (Dispatch::synchronize_mode's count: 1 = the solo path)
+    unsigned live() const {
+        unsigned n = 0;
+        for (const auto& s : scheduler_.slots()) n += s.phase == Phase::Prefill || s.phase == Phase::Decode;
+        return n;
     }
     Completion completion(Key k) const {
         const auto& s = scheduler_.slots()[k.slot];
@@ -82,6 +97,8 @@ public:
         t.resize(std::min<size_t>(t.size(), emitted_[slot]));
         return t;
     }
+    // DFlash2 sessions verify up to kv drafts with the --spec-adaptive policy sl (s2_batch.h Batch::dflash)
+    void dflash(int kv, const g6rt::SpecLen& sl) { batch_.dflash(kv, sl); }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
     Changes apply(const Commit& c, const Payload* p = nullptr) {
@@ -119,7 +136,8 @@ public:
                 auto k = q.keys[0]; const auto& s = scheduler_.slots()[k.slot];
                 const auto& p = payload_[k.slot];
                 require(!initialized_[k.slot], "duplicate prompt tail");
-                batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens)}});
+                const bool dfl = hooks_.dfl_ok && live() == 1 && !p.decode_prompt && hooks_.dfl_ok(k);
+                batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens), dfl}});
                 initialized_[k.slot] = true;
                 scheduler_.complete_tail(completion(k));
             } else if (q.kind == Kind::Decode) {
@@ -128,6 +146,7 @@ public:
                     require(initialized_[q.keys[i].slot] && batch_.active(int(q.keys[i].slot)), "scheduler/Batch active mismatch");
                     order.push_back(int(q.keys[i].slot));
                 }
+                if (live() > 1) batch_.demote();   // another session is resident (perhaps still prefilling): the shared path
                 require(batch_.round(order), "empty scheduled decode round");
                 std::vector<Completion> results;
                 for (unsigned i = 0; i < q.count; ++i) results.push_back(completion(q.keys[i]));

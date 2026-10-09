@@ -16,10 +16,16 @@
 // at many sessions the K-th draft no longer pays. The main step's k1 class stays row_class(K+1), so a row's bits do not
 // depend on k; only which drafts are verified changes.
 // Sessions join at round boundaries (Batch::admit) and may be cancelled there (Batch::cancel); see class Batch.
+// DFlash2 (Batch::dflash, Session::dflash): a session admitted while it is the only one runs the plain build's
+// dflash_sequence (dflash.cuh) instead: each prompt step and each round feeds the drafter its target rows as context, a
+// round verifies k <= 7 drafts (one SpecLen for every DFlash2 session, as the plain build keeps one per process). It also
+// runs the MTP first-form draft over the same rows, so the MTP layer's cache and d[1] stay complete: when a second
+// session arrives (demote) the K-1 chain steps hand it to the MTP rounds above. A demoted session stays on MTP.
 // Within a step the sessions are in ascending index and each session's rows are contiguous, in position order.
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -72,12 +78,18 @@ struct Session
     int first = 0;                    // prompt tokens before this index were taken by a prefill path
     int chunk = 4;                    // rows per prompt step
     int n_gen = 16;
+    bool dflash = false;              // the DFlash2 drafter while the session is alone (Batch::dflash)
 };
 struct Stats
 {
-    long rounds = 0, tokens = 0;
-    std::vector<long> acc;            // [K+1] rounds by accepted drafts
+    long rounds = 0, tokens = 0, drafted = 0;
+    std::vector<long> acc;            // [K+1] rounds by accepted drafts (K = 7 for a DFlash2 session)
 };
+// one DFlash2 drafter step of session sess (dflash.cuh DflIn): context = its target rows at positions pos0 .. pos0 + rows - 1,
+// lo = the lowest position the drafter holds; query: also draft the block after them, bonus token tok0
+constexpr int DFL_B = 8;              // = dfl::B: the bonus row and 7 drafts
+struct DflReq { int sess, rows, pos0, tok0, lo; bool query; };
+struct DflDrafts { int tok[DFL_B]; float lp[DFL_B]; };
 
 // run(step) -> the sampled token of every row of the step (step.M() ids), for MAIN, DRAFT and CHAIN steps
 // round(sess, round, base, a, K): per-session round line (mtp_sequence prints "round N base B accepted a of K")
@@ -90,6 +102,10 @@ struct Hooks
     std::function<void(int, long, int, int, int)> round;
     std::function<void(int, int, int)> prompt;
     std::function<bool(int, const int*, int, int)> emit;
+    // DFlash2 (optional): one drafter step; and before a DFlash2 session's prompt steps, the drafter's prompt context
+    // (the prefill's taps), returning the lowest position it holds
+    std::function<DflDrafts(const DflReq&)> dfl;
+    std::function<int(int)> dfl_start;
 };
 
 // Persistent driver state for the scheduler (component 5): stable slots 0..S2N_SLOTS-1, all calls at round boundaries.
@@ -131,7 +147,7 @@ public:
         {
             const int q = qs[k];
             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
-            if (prompt(q, ss[k])) live.push_back(q);
+            if (prompt(q, ss[k]) && !st_[q].dfl) live.push_back(q);
         }
         std::vector<int> all;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
@@ -150,6 +166,18 @@ public:
     const Stats& stats(int q) const { return stats_[q]; }
     // choose each round's draft count (k <= K); off: every round verifies K drafts
     void adapt(bool on) { adapt_ = on; }
+    // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
+    void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
+    // a second session is resident: every DFlash2 session goes to MTP (the K-1 chain steps), before the next round
+    void demote()
+    {
+        for (int q = 0; q < S2N_SLOTS; ++q)
+            if (st_[q].dfl && active(q))
+            {
+                st_[q].dfl = false;
+                chain({q}, {int(Step::ROUND)}, K_);
+            }
+    }
     // the slot can be admitted again (after finished(q) or cancel(q))
     void release(int q) { st_[q].on = false; }
 
@@ -163,7 +191,8 @@ public:
         if (act.size() * (K_ + 1) > (size_t)max_rows_)
             throw std::runtime_error("s2: " + std::to_string(act.size()) + " sessions x " + std::to_string(K_ + 1) + " rows > max rows " + std::to_string(max_rows_));
         cur_round_ = round_no_++; cur_active_ = (int)act.size();
-        round_all(act);
+        if (act.size() == 1 && st_[act[0]].dfl) round_dfl(act[0]);
+        else { demote(); round_all(act); }
         cur_round_ = -1; cur_active_ = 0;
         return true;
     }
@@ -205,7 +234,7 @@ private:
             for (int r = 0; r <= a; ++r) x.tokens.push_back(so[r]);
             sl_[q].observe(k, a, nullptr, 0);
             if (h_.round) h_.round(q, stats_[q].rounds, base[q], a, k);
-            ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a];
+            ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
             ++st_[q].rounds;
             acc[q] = a;
             if (h_.emit && h_.emit(q, so, a + 1, v.row0[i])) { x.done = true; continue; }
@@ -237,6 +266,48 @@ private:
         }
     }
 
+    // one DFlash2 round of solo session q (dflash.cuh dflash_sequence's round): verify k + 1 rows, accept, emit; then
+    // the MTP first-form pass and the drafter step over the a + 1 accepted rows
+    void round_dfl(int q)
+    {
+        St& x = st_[q];
+        const int base = (int)x.tokens.size() - 1;
+        double pe = 0;
+        const int k = dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
+        Step v;
+        v.kind = Step::MAIN;
+        v.round = cur_round_; v.round_active = cur_active_;
+        v.event = x.rounds == 0 ? Step::DECODE1 : Step::ROUND;
+        std::vector<Row> rows;
+        for (int r = 0; r <= k; ++r) rows.push_back(Row{q, r ? x.dd[r] : x.tokens[base], base + r, base + r + 1, -1});
+        add_rows(v, q, rows, v.event);
+        v.cls = row_class(k + 1);
+        check(v);
+        const std::vector<int> t = h_.run(v);
+        int a = 0;
+        while (a < k && x.dd[a + 1] == t[a]) ++a;
+        for (int r = 0; r <= a; ++r) x.tokens.push_back(t[r]);
+        if (dsl_.on) dsl_.observe(k, a, x.dl, pe);
+        if (h_.round) h_.round(q, stats_[q].rounds, base, a, k);
+        ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
+        ++x.rounds;
+        if (h_.emit && h_.emit(q, t.data(), a + 1, 0)) { x.done = true; return; }
+        Step d;
+        d.kind = Step::DRAFT; d.event = v.event;
+        d.round = cur_round_; d.round_active = cur_active_;
+        add_rows(d, q, draft_rows(q, a + 1, base, t.data()), v.event);
+        d.cls = row_class(d.M());
+        check(d);
+        x.d[1] = h_.run(d)[a];
+        drafts(q, DflReq{q, a + 1, base, t[a], x.lo, true});
+    }
+    void drafts(int q, const DflReq& r)
+    {
+        const DflDrafts o = h_.dfl(r);
+        if (!r.query) return;
+        for (int i = 1; i < DFL_B; ++i) { st_[q].dd[i] = o.tok[i]; st_[q].dl[i] = o.lp[i]; }
+    }
+
     struct St
     {
         Session s;
@@ -245,6 +316,10 @@ private:
         bool on = false, done = false;
         int rounds = 0; // first-step timer: per-session decode rounds; round 1 MAIN = DECODE1 (design E2)
         int k = 0;      // drafts held for the next verify (d[1..k])
+        bool dfl = false;                 // on the DFlash2 drafter (Session::dflash, until demote)
+        int lo = 0;                       // DFlash2: the lowest position the drafter holds context for
+        int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
+        float dl[DFL_B] = {};
     };
     // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round
     int choose(const std::vector<int>& qs) const
@@ -268,6 +343,8 @@ private:
     }
     int K_, max_rows_;
     bool adapt_ = false;
+    int dkv_ = DFL_B - 1;
+    g6rt::SpecLen dsl_;
     S2Cost cost_;
     std::vector<g6rt::SpecLen> sl_ = std::vector<g6rt::SpecLen>(S2N_SLOTS);
     long round_no_ = 0, cur_round_ = -1; // G6_S2_ROUNDLOG: id of the round in progress and its active-session count
@@ -329,7 +406,11 @@ private:
         x.d.assign(K_ + 1, 0);
         sl_[q] = g6rt::SpecLen();
         stats_[q] = Stats();
-        stats_[q].acc.assign(K_ + 1, 0);
+        x.dfl = p.dflash;
+        if (x.dfl && !(h_.dfl && h_.dfl_start)) throw std::runtime_error("s2: DFlash2 session without drafter hooks");
+        stats_[q].acc.assign(std::max(K_, x.dfl ? DFL_B - 1 : 0) + 1, 0);
+        for (float& v : x.dl) v = NAN;
+        x.lo = x.dfl ? h_.dfl_start(q) : 0;
         const int n = x.n, PS = (n - p.first + p.chunk - 1) / p.chunk;
         for (int s = 0; s < PS; ++s)
         {
@@ -359,6 +440,7 @@ private:
             check(d);
             const std::vector<int> u = h_.run(d);
             x.d[1] = u[M - 1];
+            if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, s == PS - 1 ? t[M - 1] : 0, x.lo, s == PS - 1});
         }
         return true;
     }

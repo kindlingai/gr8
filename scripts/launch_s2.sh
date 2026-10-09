@@ -5,7 +5,9 @@
 #   SESS=8 scripts/launch_s2.sh
 # Knobs (environment), as launch_tp4.sh unless noted:
 #   SESS=8            most concurrent sessions (1..8); every reachable step graph is captured at boot (~2.5 GiB at 8)
-#   MTP=2             MTP draft count (S2 runs MTP; DFlash2 is not wired into --s2)
+#   MTP=2             MTP draft count for sessions that share steps
+#   DFLASH=1          also load the DFlash2 drafter: a session alone at its prompt tail drafts with it (adaptive draft
+#                     count, SPEC_ADAPT=1) and goes to MTP when a second session arrives. DFLASH=0: MTP only
 #   CAP, PACKS, PF_OWN (default 4; short prompts take OWN=2, G6_PF_QP_MIN), QP_ROLL, QP_CTX, QP_EARLY,
 #   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end; S2 has no Python front end path here)
 #   S2PORT=7341       the S2 control port on the head
@@ -16,6 +18,14 @@ set -eu
 [ "$NRANK" = 4 ] || { echo "launch_s2.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
 CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-1800}; PACKS=${PACKS:-packs}; MTP=${MTP:-2}; SESS=${SESS:-8}
 S2PORT=${S2PORT:-7341}; EPOCH=$(date +%s)
+DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}
+if [ "$DFLASH" = 1 ]; then
+  for ((r = 0; r < NRANK; r++)); do
+    on $r "test -e $G6_HOME/packs/dflash.r$r.manifest.json -a -e $G6_HOME/packs/dflash.r$r.pack" || {
+      echo "rank $r has no DFlash2 drafter pack ($G6_HOME/packs/dflash.r$r.{manifest.json,pack}); stage it or run with DFLASH=0"
+      exit 2; }
+  done
+fi
 # keep in step with launch_tp4.sh
 PF_OWN=${PF_OWN:-4}
 ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
@@ -26,13 +36,16 @@ ARGS="--top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill
 --s2 $G6_HOME/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $EPOCH"
 [ "${NOHASH:-0}" = 1 ] && ARGS="$ARGS --no-hash"
 [ "${REUSE:-0}" = 1 ] && ARGS="$ARGS --reuse-prefix"
+[ "$SPEC_ADAPT" = 1 ] && ARGS="$ARGS --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
 SRCARGS=""
 [ -n "${V2:-}" ] && SRCARGS="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
 for ((r = NRANK - 1; r >= 0; r--)); do
+  DFARGS=""
+  [ "$DFLASH" = 1 ] && DFARGS="--dflash-manifest packs/dflash.r$r.manifest.json --dflash-pack packs/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
   on $r "cd $G6_HOME && rm -rf s2 serve && mkdir -p s2 out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
       --proxy-cpu $PROXY_CPU --manifest $PACKS/rank$r.manifest.json --pack $PACKS/rank$r.pack --image --layers all $SRCARGS \
-      $ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
+      $ARGS $DFARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait
 PY=${PY:-$G6_HOME/venv/bin/python}

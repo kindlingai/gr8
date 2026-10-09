@@ -35,6 +35,11 @@ struct DispatchHooks {
     // optional: (row, target, k) -> row's logprob entry in the last main step: its sampled token, or (target) the
     // teacher-forced next prompt token; k top entries (requests with lp / plp)
     std::function<g6rt::LpRow(int, bool, int)> logprob;
+    // optional, DFlash2 (s2_batch.h): does slot's session own the prefill's drafter taps; its drafter prompt context
+    // (lowest position held); one drafter step with the session's sampling. Solo path only.
+    std::function<bool(int slot)> dfl_ok;
+    std::function<int(int slot)> dfl_start;
+    std::function<s2::DflDrafts(const s2::DflReq&, const Sampling&)> dfl;
 };
 // the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
 inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
@@ -117,6 +122,12 @@ public:
             else w.draft_rows(first, n, sp.kind == s2::Step::CHAIN);
         }
         return ids;
+    }
+    bool dfl_ok(unsigned slot) const { return hooks_.dfl_ok && hooks_.dfl_ok(int(slot)); }
+    int dfl_start(unsigned slot) { require(int(slot) == solo_, "DFlash2 outside the solo path"); return hooks_.dfl_start(int(slot)); }
+    s2::DflDrafts dfl(const s2::DflReq& r) {
+        require(r.sess == solo_ && have_main_[r.sess], "DFlash2 step outside the solo path or before a target step");
+        return hooks_.dfl(r, sessions_.at(unsigned(r.sess)).sampling);
     }
     void prefill(const Slot& s, const Payload& p, uint32_t first, uint32_t rows) {
         require(rows && first <= p.prompt.size() && uint64_t(first) + rows < p.prompt.size() &&
