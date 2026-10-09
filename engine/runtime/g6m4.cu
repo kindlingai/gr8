@@ -692,9 +692,9 @@ int main(int argc, char** argv)
                 if (pf_qp)
                 {
                     const int ctx = (int)(sl.req.prompt_tokens + sl.req.max_tokens);
-                    const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx);
-                    fprintf(stderr, "# rank %d: s2 request %llu ctx %d (prompt + gen) -> %s (QP_CTX %d)\n", R, (unsigned long long)sl.req.id,
-                            ctx, on ? "OWN=4 pair-owner" : "OWN=2 (ctx > QP_CTX)", P.qp_ctx);
+                    const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx, (int)sl.req.prompt_tokens);
+                    fprintf(stderr, "# rank %d: s2 request %llu prompt %u ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d)\n", R,
+                            (unsigned long long)sl.req.id, sl.req.prompt_tokens, ctx, on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx);
                 }
             },
             [&]() { m.s2_pf_base = D.d.s2_pf_base = 0; },
@@ -741,7 +741,7 @@ int main(int argc, char** argv)
             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
-                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0);
+                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -828,9 +828,9 @@ int main(int argc, char** argv)
         if (pf_qp)                      // OWN=4 iff prompt + gen fits the QO table (G6_PF_QP_CTX), else OWN=2 for this request
         {
             const int ctx = (int)p.prompt.size() + p.n_gen;
-            const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx);
-            fprintf(stderr, "# rank %d: seq %zu ctx %d (prompt + gen) -> %s (QP_CTX %d)\n", R, q, ctx,
-                    on ? "OWN=4 pair-owner" : "OWN=2 (ctx > QP_CTX)", P.qp_ctx);
+            const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx, (int)p.prompt.size());
+            fprintf(stderr, "# rank %d: seq %zu prompt %zu ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d)\n", R, q, p.prompt.size(), ctx,
+                    on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx);
         }
         const int PS = prompt_steps(p), NS = total_steps(p);
         if (serve.empty()) pt.start("");

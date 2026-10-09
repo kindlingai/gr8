@@ -1,12 +1,19 @@
 # Changelog
 
+## 2026-10-09: short prompts skip OWN=4 (`G6_PF_QP_MIN`, default 768)
+
+- OWN=4 pays a fixed ~0.13-0.35 s per request (the pair weights rolled through every layer), so it lost on short prompts:
+  a ~50-token prompt's TTFT was ~0.69 s against ~0.34 s with OWN=2 (TP4 prefill tok/s OWN=4 / OWN=2: 256 tokens
+  401 / 506, 1024 tokens 846 / 809, 8192 tokens 1,254 / 809). A prompt shorter than `G6_PF_QP_MIN` now runs OWN=2 in
+  both the plain build and S2; 0 restores OWN=4 for every request that fits `G6_PF_QP_CTX`. Short prompts' output then
+  equals an OWN=2 (and OWN=1) boot's. S2 with OWN=4 at 4 / 8 sessions back to OWN=1's decode aggregate (code 61.6 / 73.8).
+
 ## 2026-10-09: `G6_PF_OWN=4` prefill under `--s2`
 
 - S2 prefill can run pair-owner QO attention (`G6_PF_OWN=4` with `G6_PF_QP_ROLL` / `G6_PF_QP_CTX`, as the TP4 launcher
   sets them); S2 prefill runs on the CP staging pool, indexed by position, so a session's base page never reaches the
   QO prepass. Each request takes OWN=4 or OWN=2 by the plain build's rule (prompt + gen against `G6_PF_QP_CTX`). Solo
-  output equals the plain build's OWN=4 output byte for byte; 8K prefill 818 -> 1,260 tok/s. Decode at 4-8 sessions
-  measured 5-8% lower than with OWN=1 (the plain build shows 2-4% at one session), not yet explained.
+  output equals the plain build's OWN=4 output byte for byte; 8K prefill 818 -> 1,260 tok/s.
 
 ## 2026-10-09: adaptive k verify costs re-measured (#75)
 

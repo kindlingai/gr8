@@ -229,13 +229,21 @@ inline void pf_qp_warm(Model& m, Prefill& P, cudaStream_t st)
     if (m.rank == 0) fprintf(stderr, "# rank %d: G6_PF_OWN=4 warm-up (G6_PF_QP_WARM=1): absorb + UV at %zu row counts (%d..%d), q_b + o_proj\n",
                              m.rank, rows.size(), rows.front(), rows.back());
 }
-// per request: a request whose prompt + gen fits the QO key / RoPE table (P.qp_ctx: G6_PF_QP_CTX with G6_PF_QP_ROLL, else
-// the cap) runs ALL pair layers OWN=4, else ALL layers OWN=2. No per-layer mix; both lanes the same. Call before the
-// request's first pf_inputs / pf_enqueue (pf_enqueue and pf_attn_block read P.qp). Returns the mode (true = OWN=4).
-inline bool pf_qp_select(Prefill& P, Prefill* P2, int ctx)
+// G6_PF_QP_MIN (default 768): OWN=4 pays a fixed ~0.13-0.35 s per request (the pair weights rolled through every layer),
+// so below ~770 prompt tokens OWN=2 prefills faster (TP4: 256 tokens 506 vs 401 tok/s, 1024 tokens 809 vs 846)
+inline int pf_qp_min()
+{
+    static const int v = getenv("G6_PF_QP_MIN") ? atoi(getenv("G6_PF_QP_MIN")) : 768;
+    return v;
+}
+// per request: a request whose prompt has at least pf_qp_min() tokens and whose prompt + gen fits the QO key / RoPE table
+// (P.qp_ctx: G6_PF_QP_CTX with G6_PF_QP_ROLL, else the cap) runs ALL pair layers OWN=4, else ALL layers OWN=2. No
+// per-layer mix; both lanes the same. Call before the request's first pf_inputs / pf_enqueue (pf_enqueue and pf_attn_block
+// read P.qp). Returns the mode (true = OWN=4).
+inline bool pf_qp_select(Prefill& P, Prefill* P2, int ctx, int prompt)
 {
     if (P2 && P2->qp_built != P.qp_built) die("pf_qp_select: the two lanes were built with different G6_PF_OWN");
-    const bool on = P.qp_built && ctx <= P.qp_ctx;
+    const bool on = P.qp_built && ctx <= P.qp_ctx && prompt >= pf_qp_min();
     P.qp = on;
     if (P2) P2->qp = on;
     return on;

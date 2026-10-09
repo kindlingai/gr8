@@ -48,6 +48,7 @@ the short version.
 | `G6_PF_QP_ROLL` | TP4: 2 | `G6_PF_OWN=4`: pair weights in this many rolling slots (2..4), built per layer from the rank pack and the pair partner's slice over RDMA; 0 = resident `--qp-pack` |
 | `G6_PF_QP_CTX` | TP4: the cap | `G6_PF_OWN=4` with `G6_PF_QP_ROLL`: QO key-table size in positions (required); a request whose prompt + gen is longer runs OWN=2 |
 | `G6_PF_QP_LAYERS` | all | `G6_PF_OWN=4`: model layers (0-77, list and ranges) that run pair-owner attention; the others run OWN=2 |
+| `G6_PF_QP_MIN` | 768 | `G6_PF_OWN=4`: a prompt shorter than this many tokens runs OWN=2 (OWN=4's fixed per-request cost loses below ~770 tokens); 0 = every request that fits `G6_PF_QP_CTX` runs OWN=4 |
 | `G6_PF_QP_EARLY` | TP4: 1 | `G6_PF_OWN=4`: 1 = send the counterpart's partial before the own rows' o_proj; 2 = also split the QO call in two |
 | `G6_PF_QP_WARM` | 0 | `G6_PF_OWN=4`: warm the pair cuBLAS and MXFP8 GEMM shapes at load |
 | `G6_PF_QP_WIRE_E` | 1 | `G6_PF_OWN=4` with `G6_PF_QP_ROLL`: entries (1..4) in the RDMA ring of half images |
