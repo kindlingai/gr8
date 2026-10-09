@@ -8,8 +8,9 @@ PyTorch or NCCL at serve time: each box runs one `g6m4` process, the ranks talk 
 fabric, and an OpenAI-compatible front end runs on rank 0. What makes it fast:
 
 - Several requests at once (`--s2`): up to 8 sessions share each decode step, with exact per-session output.
-- DFlash2 speculative decoding for a request that runs alone, with the draft count chosen each round from a live model
-  of step cost and acceptance. Sessions that share steps use the MTP layer.
+- Speculative decoding chosen per round: a request that runs alone drafts with DFlash2 or the MTP layer, whichever is
+  expected to commit more tokens per ms (DFlash2 wins on code, MTP on prose), with the draft count chosen from a live
+  model of step cost and acceptance. Sessions that share steps use the MTP layer.
 - Pair-owner QO attention in prefill at TP=4 (`G6_PF_OWN=4`, [docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
 - exlr8 experts: the routed experts at 3.25 bpw, trellis-decoded inside the expert kernels, loaded straight from their
   width files.
@@ -19,16 +20,17 @@ fabric, and an OpenAI-compatible front end runs on rank 0. What makes it fast:
 
 | | TP=4 (S2, DFlash2) | TP=6 (K1H2, one request at a time) |
 |---|---|---|
-| prefill, 8K prompt, cold | 1,293 tok/s | 1,942 tok/s |
-| decode\*, code / prose / structured | 49.5 / 28.4 / 68.4 tok/s | prose 36.9 tok/s (MTP k=2, temp 0.7) |
-| aggregate\*, 2 / 4 streams | 50.6 / 63.6 tok/s | – |
+| prefill, 8K prompt, cold | 1,278 tok/s | 1,942 tok/s |
+| decode\*, code / prose | 49.4 / 30.1 tok/s | prose 36.9 tok/s (MTP k=2, temp 0.7) |
+| aggregate\*, 2 / 4 streams | 50.6 / 62.7 tok/s | – |
 | TTFT, long prompts | 18K: 14.5 s, 87K: 73.3 s | 131K: 79.1 s, 254K: 176.1 s |
 | KV pool | 393,216 tokens | 614,400 tokens |
 | requests decoding at once | 8 | 1 |
 | prefix reuse, a continued 20K conversation | 7.1 s vs 17.3 s cold | – |
 
-\* TP=4: [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks capped at
-2200 MHz. TP=6: one test window on one cluster; two arms with identical decode code differed by about 3% on prose, so
+\* TP=4: [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks capped at 2200 MHz,
+main at 4964737 booted with `./gr8 glm53 up`. RigMark's structured row is left out: it measures predictable output, not
+agent speed. TP=6: one test window on one cluster; two arms with identical decode code differed by about 3% on prose, so
 read small differences as noise.
 
 TP=4 is the default and boots the multi-session engine. TP=6 serves one request at a time.
@@ -311,7 +313,7 @@ Every engine setting is an environment variable or a launcher flag, each explain
 | item | status |
 |---|---|
 | TP=4 launch | `launch_tp4.sh` / `launch_s2.sh` / `stop.sh` run against the real engine on four Sparks. |
-| `./gr8 glm53` (symmetric) | Four supervisors on one Linux machine (127.0.0.1-4, with stub engines that play the S2 file protocol, the real shim, a stub ssh and a stub front end): boot, a request through the shim to every rank's directory, `status`, `logs`, `down` from a worker, an option mismatch, a missing shard, a rank that dies, and mentat mode against fake daemons. The agent link was also run against a real mentatd. **Not yet run on the Sparks.** |
+| `./gr8 glm53` (symmetric) | Four supervisors on one Linux machine (127.0.0.1-4, with stub engines that play the S2 file protocol, the real shim, a stub ssh and a stub front end): boot, a request through the shim to every rank's directory, `status`, `logs`, `down` from a worker, an option mismatch, a missing shard, a rank that dies, and mentat mode against fake daemons. The agent link was also run against a real mentatd. On four Sparks: peers and mentat mode both boot and serve (31-43 s from `up` to the API with a warm page cache), smoke passes, `down` and `logs` work from a worker, and an option mismatch stops every box. This is how our cluster runs. |
 | `./gr8 glm53 --ssh` | `check`, `status`, `logs`, `smoke`, `build`, `stage` and `packs` exercised against stub ssh, rsync and a fake API on one machine. The launchers' engine command lines are unchanged by the move into `scripts/engine_args.sh` (compared word for word under a stub ssh, for each TP and a range of knobs). |
 | TP=6 launch | `launch_tp6.sh` / `stop.sh` / `stage.sh` run end to end with a fake engine (`frontend/tests/fake_serve_engine.py`) standing in for six ranks on one host. **Not yet run against the real engine on six Sparks**; our own TP=6 boots used an older harness with the same env and args. |
 | `build_packs.sh` | The GPTQ input dirs on Hugging Face match the layer-000 hashes our converter expects. The full conversion was **not** re-run from these scripts, and we did not record which revision of the TR3 repo we downloaded. Run `checkpack.py` (the script does). |
