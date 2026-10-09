@@ -99,6 +99,7 @@ public:
     }
     // DFlash2 sessions verify up to kv drafts with the --spec-adaptive policy sl (s2_batch.h Batch::dflash)
     void dflash(int kv, const g6rt::SpecLen& sl) { batch_.dflash(kv, sl); }
+    void dsel(const s2::DSel& d) { batch_.dsel(d); }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
     Changes apply(const Commit& c, const Payload* p = nullptr) {

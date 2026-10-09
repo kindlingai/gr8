@@ -782,6 +782,18 @@ int main(int argc, char** argv)
             if (dfl)
             {
                 h.dfl_kv = dfl_k; h.dfl_spec = spec;
+                // drafter choice: drafting ms per round at 2200 MHz. DFlash2: the drafter step and the MTP first form;
+                // MTP: the first form, the drafter's context-only step, a chain step per draft after the first
+                h.dsel.on = s2::dsel_env();
+                // tuning (every rank must see the same values; the launcher's env reaches all of them)
+                if (const char* e = getenv("G6_S2_DSEL_MARGIN")) h.dsel.margin = atof(e);
+                if (const char* e = getenv("G6_S2_DSEL_DWELL")) h.dsel.dwell = std::max(1, atoi(e));
+                if (const char* e = getenv("G6_S2_DSEL_PROBE")) h.dsel.probe = std::max(1, atoi(e));
+                h.dsel.d.draft_round = 5.6 + 2.5;
+                h.dsel.m.draft_round = 2.5 + 3.0;
+                h.dsel.m.draft_each = 2.1;
+                if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
+                                                    h.dsel.dwell, h.dsel.margin, h.dsel.probe);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
                 h.dispatch.dfl_start = [&](int q) {    // the fill steps of g6m4's serve loop: Dfl::pf_feat -> the ring

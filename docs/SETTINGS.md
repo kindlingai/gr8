@@ -68,6 +68,7 @@ the short version.
 | `G6_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
 | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
 | `G6_S2_ADAPT` | 0 | `--s2`: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+| `G6_S2_DSEL` | 1 | `--s2` with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
 | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
 | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |
