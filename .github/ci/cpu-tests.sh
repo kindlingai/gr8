@@ -26,6 +26,7 @@ g++ -std=c++20 -O1 -pthread -I engine/comms tools/health/test_progress_cpus.cpp 
 
 step "Python tests"
 python3 -m unittest tools.convert.test_v2
+python3 -m unittest tools.convert.test_slim
 python3 -m unittest discover -s tools/health
 python3 -m unittest discover -s bench/gate/tests
 python3 tools/s2_costfit.py --selftest
