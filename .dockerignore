@@ -1,0 +1,17 @@
+# Keep the build context to tracked source. Build outputs, local configs and internal coordination files stay out of
+# both the builder and the runtime image.
+.git
+.github
+bin*
+**/target
+**/__pycache__
+**/*.pyc
+**/*.log
+bench/results*.jsonl
+config/cluster.env
+frontend/assets
+frontend/tests/work
+frontend/tests/tools/results.jsonl
+GRAFT-PLAN.md
+claims
+exl3rate

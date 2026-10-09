@@ -1,0 +1,165 @@
+# CPU tests, the arm64 engine build, the tester zip and the container image. The outputs are workflow artifacts only
+# (the binaries and the zip). The container image stays on the runner.
+#
+# The engine and container jobs run on a native arm64 runner, GR8_ARM_RUNNER (a repository variable) or
+# ubuntu-24.04-arm. On an x86 runner they fall back to QEMU emulation. QEMU works but is many times slower.
+# GR8_NATIVE=1 (a repository variable) builds the engine on the runner itself, for a self-hosted runner that has the
+# CUDA 13 toolchain and no Docker daemon; the container job then does not run. Pull requests run the CPU tests only.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cpu:
+    name: CPU tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: python -m pip install numpy xxhash
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            engine/loader-rs/target
+            frontend/g6front-rs/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Tests
+        run: .github/ci/cpu-tests.sh
+
+  engine:
+    name: Engine build (arm64, CUDA 13, sm_121a)
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ vars.GR8_ARM_RUNNER || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the binaries on the runner (GR8_NATIVE)
+        if: vars.GR8_NATIVE == '1'
+        # the Dockerfile's dist stage, without Docker: loader, front end, then the TP=4 (S2) and TP=6 engines
+        run: |
+          set -eux
+          cargo build --release --quiet --manifest-path engine/loader-rs/Cargo.toml
+          scripts/build_front.sh "$PWD/build-front"
+          G6_NR=4 scripts/build.sh "$PWD/build-tp4"
+          scripts/build.sh "$PWD/build-tp6"
+          mkdir -p dist/bin dist/bin6
+          cp build-tp4/g6m4 build-tp4/m4sim build-tp4/gpuprobe build-tp4/tr3_e4m3_test build-front/g6front-rs dist/bin/
+          cp build-tp6/g6m4 build-tp6/m4sim build-tp6/gpuprobe build-tp6/tr3_e4m3_test dist/bin6/
+      - name: Free disk space
+        if: vars.GR8_NATIVE != '1'
+        # the CUDA devel image is about 10 GB unpacked
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - name: QEMU (x86 runner only)
+        if: runner.arch != 'ARM64' && vars.GR8_NATIVE != '1'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+        if: vars.GR8_NATIVE != '1'
+      - name: Build the binaries (Dockerfile target dist)
+        if: vars.GR8_NATIVE != '1'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dist
+          platforms: linux/arm64
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=gr8
+          cache-to: type=gha,scope=gr8,mode=max
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-bin-arm64
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  zip:
+    name: Tester zip
+    if: github.event_name != 'pull_request'
+    needs: [cpu, engine]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-bin-arm64
+          path: dist
+      - name: Assemble
+        id: zip
+        run: |
+          python3 scripts/make_zip.py --bin dist --out out
+          echo "name=gr8-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          { echo '### Tester zip'; echo; echo '```'; cat out/*.sha256; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip.outputs.name }}
+          path: |
+            out/*.zip
+            out/*.zip.sha256
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+
+  container:
+    name: Container build (linux/arm64, not pushed)
+    # runs after the engine job and reads the builder stages from its cache
+    needs: engine
+    if: github.event_name != 'pull_request' && vars.GR8_NATIVE != '1'
+    runs-on: ${{ vars.GR8_ARM_RUNNER || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - name: QEMU (x86 runner only)
+        if: runner.arch != 'ARM64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/arm64
+          tags: gr8:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=gr8
+      - name: Smoke test (no GPU)
+        run: |
+          docker image ls gr8:ci
+          docker run --rm --entrypoint bash gr8:ci -c '
+            set -eu
+            for b in bin/g6m4 bin/m4sim bin/gpuprobe bin/g6front-rs bin6/g6m4 bin6/m4sim; do
+              if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
+            done
+            python3 -c "import g6s2shim, g6shim"
+            python3 -c "import tools.convert.convert, tools.convert.dflash2"
+            bin/g6front-rs --help > /dev/null
+            echo smoke OK'
