@@ -4,7 +4,9 @@
 # The engine and container jobs run on a native arm64 runner, GR8_ARM_RUNNER (a repository variable) or
 # ubuntu-24.04-arm. On an x86 runner they fall back to QEMU emulation. QEMU works but is many times slower.
 # GR8_NATIVE=1 (a repository variable) builds the engine on the runner itself, for a self-hosted runner that has the
-# CUDA 13 toolchain and no Docker daemon; the container job then does not run. Pull requests run the CPU tests only.
+# CUDA 13 toolchain and no Docker daemon; the container job then does not run. A pull request from a branch in this
+# repository also builds the engine, for every TP. One from a fork runs the CPU tests only, so its code never runs on
+# the self-hosted runner.
 name: ci
 
 on:
@@ -47,25 +49,27 @@ jobs:
 
   engine:
     name: Engine build (arm64, CUDA 13, sm_121a)
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ vars.GR8_ARM_RUNNER || 'ubuntu-24.04-arm' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Build the binaries on the runner (GR8_NATIVE)
         if: vars.GR8_NATIVE == '1'
-        # the Dockerfile's dist stage, without Docker: loader, front end, then the TP=4 (S2) and TP=6 engines
+        # the Dockerfile's dist stage, without Docker: loader, front end, then the TP=4, TP=6 and TP=3 engines
         run: |
           set -eux
           cargo build --release --quiet --manifest-path engine/loader-rs/Cargo.toml
           scripts/build_front.sh "$PWD/build-front"
           G6_NR=4 scripts/build.sh "$PWD/build-tp4"
           scripts/build.sh "$PWD/build-tp6"
-          mkdir -p dist/bin dist/bin6
+          G6_NR=3 scripts/build.sh "$PWD/build-tp3"
+          mkdir -p dist/bin dist/bin6 dist/bin3
           cp build-tp4/g6m4 build-tp4/m4sim build-tp4/gpuprobe build-tp4/tr3_e4m3_test build-front/g6front-rs dist/bin/
           cp build-tp6/g6m4 build-tp6/m4sim build-tp6/gpuprobe build-tp6/tr3_e4m3_test dist/bin6/
           cp engine/loader-rs/target/release/g6load dist/bin/
           cp engine/loader-rs/target/release/g6load dist/bin6/
+          cp build-tp3/g6m4 build-tp3/m4sim build-tp3/gpuprobe build-tp3/tr3_e4m3_test engine/loader-rs/target/release/g6load dist/bin3/
       - name: Free disk space
         if: vars.GR8_NATIVE != '1'
         # the CUDA devel image is about 10 GB unpacked

@@ -61,7 +61,10 @@ RUN G6_NR=4 scripts/build.sh /out/bin
 FROM engine-src AS engine-tp6
 RUN scripts/build.sh /out/bin6
 
-# dist holds the shipped binaries: bin/ is TP=4 and bin6/ is TP=6, as in the scripts. g6load (the Hugging Face fetch's
+FROM engine-src AS engine-tp3
+RUN G6_NR=3 scripts/build.sh /out/bin3
+
+# dist holds the shipped binaries: bin/ is TP=4, bin6/ is TP=6 and bin3/ is TP=3. g6load (the Hugging Face fetch's
 # planner and checker) goes in both. build.sh's CPU test binaries
 # and objects stay behind. tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
 FROM scratch AS dist
@@ -70,6 +73,8 @@ COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
 COPY --from=loader /out/g6load /bin6/
 COPY --from=engine-tp6 /out/bin6/g6m4 /out/bin6/m4sim /out/bin6/gpuprobe /out/bin6/tr3_e4m3_test /bin6/
+COPY --from=loader /out/g6load /bin3/
+COPY --from=engine-tp3 /out/bin3/g6m4 /out/bin3/m4sim /out/bin3/gpuprobe /out/bin3/tr3_e4m3_test /bin3/
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
 # libibverbs1 + ibverbs-providers (mlx5) for the fabric, ibverbs-utils for ibv_devinfo, python3 for the shims,
