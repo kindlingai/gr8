@@ -217,9 +217,14 @@ static bool attn_flip_eligible(const G6Attn& a,int n){
  return attn_flip_min()>=0&&n>=1&&n<=8&&a.heads>=1&&a.heads<=22&&(use_fixed_k_decode(a)||(a.rows>0&&a.rows<=3));}
 static bool use_attn_flip(const G6Attn& a,int n){return attn_flip_eligible(a,n)&&a.context>=attn_flip_min();}
 static bool use_long_fixed_k(const G6Attn& a,int n){return attn_flip_eligible(a,n)&&!use_fixed_k_decode(a);}
+// G6_IDX_VEC=1 (default 0 = off): the per-row index_scores loads its key tile with 16 B
+// vector loads (page_size >= 32). Byte-exact; -7.65 ms/step index_scores @S4 L32K. Host-side, read once (set
+// before graph capture). Short decode (use_small_decode) and the #31 shared-key kernel are not affected.
+static bool idx_vec(){static const bool on=getenv("G6_IDX_VEC")&&atoi(getenv("G6_IDX_VEC"))!=0;return on;}
 template<class Input>
 static void launch_index_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
  if(use_small_decode(a))small_decode::index_scores<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,w.iq,w.weights,w.si,w.ii);
+ else if(idx_vec())index_scores<1><<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,w.iq,w.weights,w.si,w.ii);
  else index_scores<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,w.iq,w.weights,w.si,w.ii);
 }
 // G6_ATTN_HEADS=0 (read at launch / capture): the per-head scores_direct / context_parts kernels (A/B and tests)

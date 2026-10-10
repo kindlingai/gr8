@@ -229,7 +229,10 @@ __global__ void prep_index(Input input,int start,half* q,float* w){
     __syncthreads();q[((int64_t)row*32+h)*128+t]=__float2half_rn(e4(q4(v[t]/scale)));
 }
 // Four warps: two 16-head tiles x two 16-key tiles; no approximate candidate reduction.
-template<class Input>
+// VEC=1 (G6_IDX_VEC=1): when page_size >= 32 and the tile is this CP rank's, the tile's
+// 32 keys are one contiguous 4 KB run of one page -> 16 B vector loads + fp8x2 -> half2 (index_scores_m's load). Same fp16
+// key values (every e4m3 value is exact in fp16), same scales, same arithmetic below -> scores/ids/selection bit-identical (diff 0 every row). Otherwise (VEC=0, small pages, foreign tile) the scalar byte loop, unchanged.
+template<int VEC=0,class Input>
 __global__ void index_scores(Input input,int start,const half* q,const float* weights,float* scores,int* ids){
     auto a=resolve(input);if(!a.active)return;
     using namespace nvcuda;
@@ -238,6 +241,16 @@ __global__ void index_scores(Input input,int start,const half* q,const float* we
     __shared__ __align__(32) float products[32*32];
     __shared__ float scales[32];
     if(t0>a.positions[r]){if(t<32&&t0+t<a.context){scores[(int64_t)row*a.context+t0+t]=-INFINITY;ids[(int64_t)row*a.context+t0+t]=t0+t;}return;}
+    if(VEC&&a.page_size>=32&&CP_MINE(a,t0)){
+        const int live=min(32,a.live_context-t0);float scale=0;const uint8_t* src=live>0?ik_at(a,t0,scale):nullptr;
+        if(t<32)scales[t]=src&&t<live?((const float*)(src-(t0%a.page_size)*128+a.page_size*128))[t0%a.page_size+t]:0.f;
+        #pragma unroll
+        for(int u=0;u<2;u++){const int i=t+u*128,col=i/8;   // 256 x 16 B
+            uint4 v=src&&col<live?((const uint4*)src)[i]:make_uint4(0,0,0,0);const uint16_t* c=(const uint16_t*)&v;
+            __half2* dst=(__half2*)key+i*8;
+            #pragma unroll
+            for(int k=0;k<8;k++)dst[k]=__half2(__nv_cvt_fp8x2_to_halfraw2(c[k],__NV_E4M3));}
+    }else
     for(int i=t;i<32*128;i+=128){int col=i/128,dim=i%128,pos=t0+col;float scale=0;const uint8_t* src=pos<a.live_context&&CP_MINE(a,pos)?ik_at(a,pos,scale):nullptr;
         key[i]=__float2half_rn(src?e4(src[dim]):0);if(dim==0)scales[col]=scale;}
     __syncthreads();
