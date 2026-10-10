@@ -646,10 +646,10 @@ class Supervisor:
                                                   '--port', o.get('PORT')], os.path.join(REPO, 'frontend'))
 
     def pin(self):
-        """At TP=6 and TP=3 the shim and front end stay off the proxy CPUs, as the launchers do."""
+        """At TP=6 and TP=3 the shim and front end stay off the proxy CPUs (PROXY_CPU-7..PROXY_CPU), as the launchers do."""
         cpu = int(self.o.get('PROXY_CPU'))
-        if self.o.get('TP') in ('6', '3') and cpu >= 5 and shutil.which('taskset'):
-            return ['taskset', '-c', f'0-{cpu - 5}']
+        if self.o.get('TP') in ('6', '3') and cpu >= 8 and shutil.which('taskset'):
+            return ['taskset', '-c', f'0-{cpu - 8}']
         return []
 
     def start_shim(self, plan, work):
@@ -657,7 +657,9 @@ class Supervisor:
         if plan['s2']:   # the head engine passes requests to the other ranks itself, over its control links
             argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', os.path.join(self.home, work),
                     '--sock', sock]
-        else:            # TP=6's one-request loop: every rank's serve dir, the others over ssh
+            if self.o.get('TP') == '6':
+                argv += ['--stall-timeout', '2400']
+        else:            # a build without DEC_S2: every rank's serve dir, the others over ssh
             dirs = [os.path.join(self.home, work)]
             dirs += [f'{self.members[r]}:{os.path.join(self.hs["homes"][str(r)], work)}' for r in range(1, len(self.members))]
             argv = [self.py(), os.path.join(REPO, 'frontend', 'g6shim.py'), '--rank-dirs', *dirs, '--sock', sock,

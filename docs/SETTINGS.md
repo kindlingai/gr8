@@ -27,7 +27,7 @@ the short version.
 | `--spec-accept coupled\|rejection` | coupled (`SPEC_ACCEPT`) | how verify steps accept drafts at temperature > 0, for MTP and the DFlash2 drafter. coupled: drafts are sampled with the target's position-keyed noise and kept when they equal the target's sample, so a seed gives the same text with or without speculation. rejection: greedy drafts, each kept with probability p(draft) under the request's temperature and top_p (the engine has no top_k or min_p), else replaced by a sample of p without it. The output distribution is the target's in both modes, but rejection gives other text for a seed. Which mode keeps more drafts depends on how close the drafter's distribution is to the target's. Temperature 0 is the same in both. Needs a drafter |
 | `--spec-adaptive` | TP4 launcher default with DFlash2 (`SPEC_ADAPT`, default 1 with DFlash2, 0 with MTP) | each round verifies the draft count with the most expected tokens per ms (`engine/runtime/spec_len.h`), from the drafter's own probability of each draft, recent acceptance per position and the verify cost by row count at 2200 MHz. MTP (`--mtp K`: up to K drafts) also stops its chain when one more draft does not pay. DFlash2 chooses among 1..`--dflash-k`. Every level gets a verify graph. Under S2 it is the policy of the DFlash2 sessions |
 | `--spec-levels 7,5,3,2` | all of 1..K (`SPEC_LEVELS`) | `--spec-adaptive`: the draft counts it may choose, for example 7,5,3,2 with the drafter or 1,2,4 with `--mtp 4`. The MTP chain drafts up to the next allowed count, so gaps are fine |
-| `--serve DIR` | `$G6_HOME/s2` (TP4, TP3), `$G6_HOME/serve` (TP6) | serve requests. A DEC_S2 build (TP4, TP3) always serves through S2: the shim drives DIR (`cmd.<n>` / `req.<n>` / `resp.<n>`), `DIR/ready.s2` appears once loaded. The TP6 build serves one request at a time: `DIR/req.<n>` in, rank 0 writes `DIR/resp.<n>`, `DIR/quit` ends it, `DIR/ready` appears once loaded |
+| `--serve DIR` | `$G6_HOME/s2` | serve requests. A DEC_S2 build (every TP) always serves through S2: the shim drives DIR (`cmd.<n>` / `req.<n>` / `resp.<n>`), `DIR/ready.s2` appears once loaded. A build without DEC_S2 serves one request at a time: `DIR/req.<n>` in, rank 0 writes `DIR/resp.<n>`, `DIR/quit` ends it, `DIR/ready` appears once loaded |
 | `--s2-port N` / `--s2-sessions S` / `--s2-epoch E` | 7341 (`S2PORT`) / 8 (`SESS`) / the boot epoch | S2: the head's control port, the sessions that decode at once (1-8), and the epoch every rank must share |
 | `--cap N` | 614400 | KV pool in tokens (the longest context) |
 | `--mtp K` | 2 | MTP speculative draft length |
@@ -99,7 +99,8 @@ the short version.
 | `RANK_HEALTH` | 1 | probe every rank before any engine starts (`scripts/rank_health.sh`, `tools/health/`) and refuse to boot, exit 3, with one named reason per refused rank. 0 = skip. The result is written to `$G6_HOME/out/rank_health.json` |
 | `PROBE_ARGS` | empty | thresholds for the probe, e.g. `--min-clock-mhz 1800 --min-link-gbps 90` (list in `tools/health/README.md`) |
 
-The shim and the front end run under `taskset` on CPUs `0..PROXY_CPU-5`, away from the proxy CPUs.
+The shim and the front end run under `taskset` on CPUs `0..PROXY_CPU-8`, away from the proxy CPUs. At TP=6 the shim is
+`g6s2shim.py` with `--stall-timeout $STALL_TMO` (default 2400 s).
 
 ## Build flags (`scripts/build.sh`)
 

@@ -221,12 +221,26 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--reuse-prefix', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
 
-    def test_tp6_serves_one_request(self):
-        o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7))], {})
+    def test_tp6_is_s2_without_drafter(self):
+        peers = ','.join(f'10.0.0.{i}' for i in range(1, 7))
+        o = opt.parse(['--no-config', '--peers', peers], {})
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
-        self.assertFalse(p['s2'])
-        self.assertIn('/h/serve', p['args'])
+        self.assertTrue(p['s2'])
+        self.assertIn('G6_PF_OWN=3', p['env'])
+        self.assertIn('/a/qo.pack', p['args'])
+        self.assertIn('/h/s2', p['args'])
+        self.assertIn('--reuse-prefix', p['args'])
+        self.assertIn('--s2-sessions', p['args'])
+        self.assertNotIn('--spec-adaptive', p['args'])
+        self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
+        self.assertNotIn('/h/serve', p['args'])
+        # PF_OWN=1 is the fallback: no QO pack
+        o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], {})
+        opt.validate(o)
+        p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
+        self.assertIn('G6_PF_OWN=1', p['env'])
+        self.assertNotIn('/a/qo.pack', p['args'])
 
 
 if __name__ == '__main__':

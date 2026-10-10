@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-10: TP=6 serves through S2
+
+- `scripts/launch_tp6.sh` runs `scripts/launch_s2.sh` at TP=6: up to `SESS=8` requests at once, prefix reuse, MTP only
+  (`DFLASH=0`: the DFlash2 drafter's 8 KV heads do not split six ways; `SPEC_ADAPT=0`). `PF_OWN` defaults to 3 (full-head
+  attention weights from `packs/qo.pack`; `PF_OWN=1` needs no QO pack), `READY_TMO` to 1800.
+- `scripts/build.sh` builds `-DDEC_S2` at `G6_NR=6` (the default), 4 and 3; `-DPF_F12` stays TP=4 only.
+- The rank-health probe runs before the boot at TP=6; the shim and the front end run on CPUs `0..PROXY_CPU-8`; the
+  shim gets `--stall-timeout 2400`.
+- `PLAIN=1` (the one-request loop) is refused at TP=6.
+
 ## 2026-10-10: Docker: one compose file for every box
 
 - `docker/compose.yaml` runs the launcher in the image on every box (`docker compose -f docker/compose.yaml up -d`),
@@ -19,8 +29,8 @@
   before every ADMIT notice for it, and the workers take them from there instead of their own `req.<id>`. The hash in the
   notice still checks them. The head also passes its orderly quit on (`Quit` frame), and each worker quits through its
   own `DIR/quit` as before. Control frames may be 16 MiB (was 1 MiB), so a 393K-token prompt fits.
-- `g6s2shim.py --dir DIR` (the head's own directory) replaces `--rank-dirs`; it no longer uses ssh. TP=6's one-request
-  shim (`g6shim.py`) still reaches the other ranks over ssh.
+- `g6s2shim.py --dir DIR` (the head's own directory) replaces `--rank-dirs`; it no longer uses ssh. The one-request shim
+  (`g6shim.py`) still reaches the other ranks over ssh.
 
 ## 2026-10-10: `--shape ring`: TP=3 and TP=4 without a switch
 

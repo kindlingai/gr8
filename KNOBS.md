@@ -26,7 +26,7 @@ The engine does not inherit `G6_*` variables from the environment, and `./gr8 gl
 set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box compares them.
 
 The defaults in the launch table come from `scripts/engine_args.sh`. The supervisor and the ssh launchers both read
-it. TP=4 and TP=3 serve through the multi-session engine (S2). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
+it. Every TP runs the multi-session engine (`--serve`). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
 `V2_WIDTHS` are paths, so each box may have its own. The handshake compares the variant's name and the sha256 of its
 manifest instead.
 
@@ -35,33 +35,33 @@ manifest instead.
 | variable | TP=4 | TP=6 | TP=3 | meaning |
 |---|---|---|---|---|
 | `CAP` | 393216 | 614400 | 307200 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory |
-| `SESS` | 8 | – | 8 | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
-| `REUSE` | 1 | – | 1 | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
-| `DFLASH` | 1 with a drafter, else 0 | – | 0 (fixed) | 1 = the DFlash2 drafter (`--drafter`, or `dflash.r<r>.*` in the model set); 0 = MTP only. TP=3 refuses 1: the drafter's 8 KV heads do not split three ways |
+| `SESS` | 8 | 8 | 8 | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
+| `REUSE` | 1 | 1 | 1 | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
+| `DFLASH` | 1 with a drafter, else 0 | 0 (fixed) | 0 (fixed) | 1 = the DFlash2 drafter (`--drafter`, or `dflash.r<r>.*` in the model set); 0 = MTP only. TP=3 and TP=6 refuse 1: the drafter's 8 KV heads do not split three or six ways |
 | `DFLASH_SEL` | engine default (1) | – | – | 1 = the DFlash2 selector walk, 0 = the drafter's argmax |
 | `DFLASH_K` | engine default (7) | – | – | verify at most the first k of the 7 drafts |
 | `SPEC_ADAPT` | `DFLASH` | – | – | 1 = choose each round's draft count from step cost and acceptance |
 | `SPEC_LEVELS` | all | – | – | the draft counts `SPEC_ADAPT` may choose, e.g. `7,5,3,2` |
-| `SPEC_ACCEPT` | coupled | – | coupled | `rejection` = rejection sampling of drafts at temperature > 0 |
-| `MTP` | 2 | 2 | 2 | MTP draft count (TP=4: for sessions that share steps, or with `DFLASH=0`; TP=3: every round) |
-| `PF_OWN` | 4 | 3 (fixed) | 1 | prefill attention ownership (`G6_PF_OWN`); 3 also loads `packs/qo.pack` |
+| `SPEC_ACCEPT` | coupled | coupled | coupled | `rejection` = rejection sampling of drafts at temperature > 0 |
+| `MTP` | 2 | 2 | 2 | MTP draft count (TP=4: for sessions that share steps, or with `DFLASH=0`; TP=6 and TP=3: every round) |
+| `PF_OWN` | 4 | 3 | 1 | prefill attention ownership (`G6_PF_OWN`); 3 also loads `packs/qo.pack`. TP=6 with `PF_OWN=1` needs no QO pack |
 | `QP_ROLL` | 2 | – | – | `PF_OWN=4`: rolling pair-weight slots (`G6_PF_QP_ROLL`) |
 | `QP_CTX` | `CAP` | – | – | `PF_OWN=4`: QO key-table size; a longer request runs OWN=2 |
 | `QP_EARLY` | 1 | – | – | `PF_OWN=4`: send the counterpart's partial before the own rows' o_proj |
-| `PACKS` | `packs` | – | – | where the rank packs are, relative to `G6_HOME` or absolute |
+| `PACKS` | `packs` | `packs` | `packs` | where the rank packs are, relative to `G6_HOME` or absolute |
 | `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
 | `VARIANT` (`--variant`) | `home` | `home` | `down1` | the exlr8 v2 width manifest: `home` (3.25 bpw routed experts), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). Without `V2`, only `home` |
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
-| `G6ARGS_X` | – | empty | – | more engine arguments for every rank |
-| `READY_TMO` | 1800 | 900 | 1800 | seconds to wait for the ranks to load |
-| `FRONT` | rs only | rs, else py | rs only | front end: `rs` = `bin/g6front-rs`, `py` = `frontend/g6front` |
+| `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
+| `READY_TMO` | 1800 | 1800 | 1800 | seconds to wait for the ranks to load |
+| `FRONT` | rs only | rs only | rs only | front end: `rs` = `bin/g6front-rs`. The Python front end serves no S2 boot |
 | `FRONT_BIN` | `bin/g6front-rs` | same | same | the Rust front end binary |
 | `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim (and the Python front end) |
-| `S2PORT` | 7341 | – | 7341 | the multi-session control port on the head |
-| `RANK_HEALTH` | – | 1 | – | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
-| `PROBE_ARGS` | – | empty | – | thresholds for that probe (`tools/health/README.md`) |
+| `S2PORT` | 7341 | 7341 | 7341 | the multi-session control port on the head |
+| `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
+| `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
 
 ## `./gr8 glm53`
 

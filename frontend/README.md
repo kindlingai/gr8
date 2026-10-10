@@ -4,7 +4,7 @@ An OpenAI/vLLM-compatible HTTP server in front of the g6 engine. It talks to the
 the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
 streaming and `/metrics`. It comes in two implementations with the same flags and byte-identical responses
 (`tests/diff_fronts.py`): `g6front-rs/`, one static Rust binary, which `./gr8 glm53 up` runs; and `g6front/`, pure
-Python asyncio, the reference the tests compare against, which can still serve TP=6's one-request loop.
+Python asyncio, the reference the tests compare against, which can still serve a build without DEC_S2 (the one-request loop).
 
 ## Endpoints
 

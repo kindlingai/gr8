@@ -13,19 +13,21 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 |---|---|---|---|
 | experts | `home`, 3.25 bpw | `down1`, 2.25 bpw | `home`, 3.25 bpw |
 | drafting | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 49.3 / 30.0 tok/s | 36.9 / 28.4 tok/s | prose 36.9 tok/s† |
-| aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.1 / 58.3 tok/s | – |
-| prefill, 8K prompt, cold | 1,374 tok/s | 648 tok/s | 1,942 tok/s† |
+| decode\*, code / prose | 49.3 / 30.0 tok/s | 36.9 / 28.4 tok/s | 38.2 / –‡ tok/s |
+| aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.1 / 58.3 tok/s | 57.6 / 79.0 tok/s‡ |
+| prefill, 8K prompt, cold | 1,374 tok/s | 648 tok/s | 1,953 tok/s‡ |
 | prefill, 8K prompt, cached | 54,867 tok/s | 53,747 tok/s | – |
 | KV pool (longest context) | 393,216 tokens | 307,200 tokens | 614,400 tokens |
-| requests decoding at once | 8 | 8 | 1† |
+| requests decoding at once | 8 | 8 | 8 |
 
 \* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks capped at 2200 MHz,
 booted from the Hugging Face release with `./gr8 glm53 up`. RigMark's structured row is left out: it measures
 predictable output, not agent speed. TP=4 code varies between boots (41.5 to 49.3 on one build), because which requests
 get DFlash2 depends on timing.
-† TP=6 still serves one request at a time; it moves to the multi-session path next. Its numbers are from that loop,
-MTP k=2 at temperature 0.7, one test window on one cluster.
+‡ TP=6, served through S2 (MTP only: the DFlash2 drafter's 8 KV heads do not split six ways), GPU clocks uncapped (about
+2450 to 2550 MHz), not the 2200 MHz cap of the other columns, so do not compare the columns row by row. Decode is a
+concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; it is not
+RigMark. One test window on one cluster.
 
 [kindling.json](kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
 

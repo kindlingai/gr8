@@ -87,18 +87,28 @@
       "label": "TP=6",
       "nodes": 6,
       "decode": {
-        "prose": 36.9
+        "code": 38.2
       },
       "prefill": [
         {
           "context": 8192,
-          "tps": 1942
+          "tps": 1953
+        }
+      ],
+      "concurrency": [
+        {
+          "streams": 2,
+          "aggregate_tps": 57.6
+        },
+        {
+          "streams": 4,
+          "aggregate_tps": 79.0
         }
       ],
       "max_context": 614400,
       "kv_pool_tokens": 614400,
-      "max_concurrent": 1,
-      "notes": "One request at a time; TP=6 moves to the multi-session path next. Prefill and prose decode on that loop: MTP k=2 at temperature 0.7, one test window on one cluster; not RigMark."
+      "max_concurrent": 8,
+      "notes": "Served through S2, MTP only. GPU clocks uncapped (about 2450 to 2550 MHz), not the 2200 MHz cap of the other configs. Decode is a concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; not RigMark. One test window on one cluster."
     }
   ]
 }

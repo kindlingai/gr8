@@ -1,9 +1,9 @@
-# The engine command line. scripts/launch_s2.sh (TP=4 and TP=3), launch_tp6.sh and the per-box supervisor
-# (tools/launch) all source this file, so the ssh launchers and `./gr8 glm53 up` start the same engine. KNOBS.md lists
+# The engine command line. scripts/launch_s2.sh (every TP: launch_tp4.sh, launch_tp6.sh and launch_tp3.sh run it) and
+# the per-box supervisor (tools/launch) source this file, so the ssh launchers and `./gr8 glm53 up` start the same engine. KNOBS.md lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 #   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP, and S2=1
-#                            for the multi-session engine (TP=4 and TP=3), else S2=0 (TP=6 serves one request at a time)
+#                            (every TP serves through the multi-session engine)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words)
 #   engine_args R RANK_PACKS AUX_PACKS HOME [EPOCH]
 #                            prints the arguments that follow `--proxy-cpu N` for rank R. RANK_PACKS holds
@@ -15,7 +15,9 @@ engine_defaults() {
   case $TP in
     4) S2=1; CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
-    6) S2=0; CAP=${CAP:-614400}; MTP=${MTP:-2}; READY_TMO=${READY_TMO:-900}; PF_OWN=3 ;;
+    6) S2=1; CAP=${CAP:-614400}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+       [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=6: the drafter's 8 KV heads do not split six ways" >&2; return 2; }
+       DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
     3) S2=1; CAP=${CAP:-307200}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
@@ -54,14 +56,16 @@ engine_args() {
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
   case $TP in
-    4|3)
+    4|3|6)
       a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
       [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
       [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
       [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
       [ -n "${SPEC_ACCEPT:-}" ] && a="$a --spec-accept $SPEC_ACCEPT"
-      a="$a $df $qo" ;;
+      a="$a $df $qo"
+      [ "$TP" = 6 ] && a="$a ${G6ARGS_X:-}"   # TP=6 kept this knob from the one-request launcher
+      ;;
     *)
       a="$a $src --serve $home/serve --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 \
 --pf-lanes 2 --pfv2 $qo"

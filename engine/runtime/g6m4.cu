@@ -33,7 +33,7 @@
 //                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
 //                     Under S2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
-//      [--serve DIR]  serve requests; --prompt is ignored. A DEC_S2 build (TP4, TP3) always serves through S2 (below); any
+//      [--serve DIR]  serve requests; --prompt is ignored. A DEC_S2 build (every TP) always serves through S2 (below); any
 //                     other build one request at a time: DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h)
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)

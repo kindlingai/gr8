@@ -98,8 +98,8 @@ launcher() {
     *) return 1 ;;
   esac
 }
-# s2: whether this boot is the multi-session engine (every TP=4 boot).
-s2() { [ "$TP" = 4 ] || [ "$TP" = 3 ]; }
+# s2: whether this boot is the multi-session engine (every boot: TP=4, 6 and 3).
+s2() { [ "$TP" = 4 ] || [ "$TP" = 6 ] || [ "$TP" = 3 ]; }
 api() { echo "http://127.0.0.1:$PORT"; }
 # dflash: whether the TP=4 launcher loads the DFlash2 drafter (DFLASH, default 1).
 dflash() {
@@ -145,12 +145,12 @@ do_check() {
   done
 
   # every box, one ssh call each: reachable, binary, packs, RDMA devices, an engine left running, memory
-  # PACKS moves the rank packs at TP=4 and TP=3 (launch_s2.sh); launch_tp6.sh reads packs/.
-  packs=packs; [ "$TP" = 4 ] && packs=${PACKS:-packs}
+  # PACKS moves the rank packs (launch_s2.sh: every TP).
+  packs=${PACKS:-packs}
   case $packs in /*) ;; *) packs=$G6_HOME/$packs ;; esac
   for ((r = 0; r < NRANK; r++)); do
     want="$packs/rank$r.pack $packs/rank$r.manifest.json"
-    [ "$TP" = 6 ] && want="$want $G6_HOME/packs/qo.pack $G6_HOME/packs/qo.manifest.json"
+    [ "$TP" = 6 ] && [ "${PF_OWN:-3}" = 3 ] && want="$want $G6_HOME/packs/qo.pack $G6_HOME/packs/qo.manifest.json"
     [ "$TP" = 3 ] && [ "${PF_OWN:-1}" = 3 ] && want="$want $G6_HOME/packs/qo.pack $G6_HOME/packs/qo.manifest.json"
     [ "$TP" = 4 ] && [ "${PF_OWN:-4}" = 3 ] && want="$want $G6_HOME/packs/qo.pack $G6_HOME/packs/qo.manifest.json"
     if dflash; then
