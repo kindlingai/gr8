@@ -1,6 +1,6 @@
 // Host control transport primitive. Owns an ALREADY CONNECTED stream socket
 // (TCP in a native adapter, socketpair in CPU tests). Only event/control threads use it.
-// Persistent fd; no per-request ssh or per-round connect. No CUDA dependency.
+// Persistent fd; no per-request or per-round connect. No CUDA dependency.
 #pragma once
 #include "scheduler.h"
 #include <cerrno>
@@ -13,7 +13,7 @@
 namespace g6s2 {
 class ControlIO {
     int fd_;
-    static constexpr uint32_t MAX_BYTES = 1u << 20; // control/event metadata, never model tensors
+    static constexpr uint32_t MAX_BYTES = 16u << 20; // event metadata and request payloads (a 393K-token prompt), never model tensors
     // disconnect logging (root-cause follow-up: r1 died with only 'control disconnected/truncated' across 5 crashes):
     // before the epoch-fatal require, print ONE greppable reason line to stderr (rN.err) so the
     // next FABRIC capture shows WHY the control link dropped: recv/send return code, errno text,

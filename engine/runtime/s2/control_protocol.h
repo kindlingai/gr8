@@ -1,8 +1,9 @@
-// Versioned big-endian event metadata; control frames never contain model tensors.
+// Versioned big-endian event metadata, and the head's request payloads; control frames never contain model tensors.
 #pragma once
 #include "event_gate.h"
+#include <string>
 namespace g6s2 {
-enum class Tag : uint64_t { Notice=1, Ack=2, Commit=3 };
+enum class Tag : uint64_t { Notice=1, Ack=2, Commit=3, Request=4, Quit=5 };
 struct Encoder {
     std::vector<uint8_t> b;
     void u64(uint64_t x){for(int i=7;i>=0;--i)b.push_back(uint8_t(x>>(i*8)));}
@@ -14,7 +15,7 @@ struct Decoder {
     const std::vector<uint8_t>& b;size_t i=0;Tag tag;
     uint64_t u64(){require(b.size()-i>=8,"truncated control metadata");uint64_t x=0;for(unsigned n=0;n<8;++n)x=x*256+b[i++];return x;}
     uint32_t u32(){auto x=u64();require(x<=UINT32_MAX,"control integer overflow");return uint32_t(x);}
-    explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324531ull,"control version mismatch");auto t=u64();require(t>=1&&t<=3,"unknown control tag");tag=Tag(t);}
+    explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324531ull,"control version mismatch");auto t=u64();require(t>=1&&t<=5,"unknown control tag");tag=Tag(t);}
     Notice notice(){Notice n;n.epoch=u64();n.event=u64();n.boundary=u64();n.request=u64();n.payload_hash=u64();auto k=u64();require(k==1||k==2,"unknown event kind");n.kind=EventKind(k);return n;}
     Key key(){Key k;k.epoch=u64();k.slot=u32();k.generation=u32();return k;}
     void end(){require(i==b.size(),"trailing control metadata");}
@@ -41,4 +42,17 @@ inline EventCommit decode_commit(const std::vector<uint8_t>& b){
     has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.run.base_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();g.reuse=d.u32();c.admit=g;}
     d.end();return e;
 }
+// The head sends a request's bytes (the shim's req.<id>) to every worker just before each ADMIT notice for it, on
+// the same link, so the workers need no copy of the head's files.
+struct RequestBytes { uint64_t epoch=0, request=0; std::string bytes; };
+inline std::vector<uint8_t> encode(const RequestBytes& r){
+    Encoder e(Tag::Request);e.u64(r.epoch);e.u64(r.request);e.u64(r.bytes.size());e.b.insert(e.b.end(),r.bytes.begin(),r.bytes.end());return e.b;
+}
+inline RequestBytes decode_request(const std::vector<uint8_t>& b){
+    Decoder d(b);require(d.tag==Tag::Request,"expected request");RequestBytes r;r.epoch=d.u64();r.request=d.u64();
+    const auto n=d.u64();require(n==b.size()-d.i,"request length mismatch");r.bytes.assign(b.begin()+long(d.i),b.end());d.i=b.size();d.end();return r;
+}
+// The head's orderly quit (its DIR/quit), passed on so every worker quits the same way
+inline std::vector<uint8_t> encode_quit(uint64_t epoch){Encoder e(Tag::Quit);e.u64(epoch);return e.b;}
+inline uint64_t decode_quit(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Quit,"expected quit");auto e=d.u64();d.end();return e;}
 } // namespace g6s2

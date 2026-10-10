@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-10: TP=4 and TP=3 need no ssh between the boxes
+
+- The head engine sends each request's bytes to the other ranks over its S2 control links, in a `Request` frame just
+  before every ADMIT notice for it, and the workers take them from there instead of their own `req.<id>`. The hash in the
+  notice still checks them. The head also passes its orderly quit on (`Quit` frame), and each worker quits through its
+  own `DIR/quit` as before. Control frames may be 16 MiB (was 1 MiB), so a 393K-token prompt fits.
+- `g6s2shim.py --dir DIR` (the head's own directory) replaces `--rank-dirs`; it no longer uses ssh. TP=6's one-request
+  shim (`g6shim.py`) still reaches the other ranks over ssh.
+
 ## 2026-10-10: `--shape ring`: TP=3 and TP=4 without a switch
 
 - Each box's f0 port is cabled to the f1 port of the next box in `--peers` order. Every port shows up as two RDMA

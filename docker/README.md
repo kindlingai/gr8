@@ -38,16 +38,13 @@ TP=3 runs `/opt/gr8/bin3/g6m4`. TP=6 runs `/opt/gr8/bin6/g6m4`, and its head run
 
 ## The head: shim and front end
 
-The shim writes requests into the other ranks' `s2/` directories over ssh, so the head container needs the host
-user's ssh keys and passwd entry:
+The shim writes requests into the head's own `s2/` directory, and the head engine passes them to the other ranks:
 
-    docker run -d --name gr8-head --network host --user $(id -u):$(id -g) -e HOME=$HOME \
-      -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -v $HOME/.ssh:$HOME/.ssh:ro \
+    docker run -d --name gr8-head --network host --user $(id -u):$(id -g) \
       -v $G6_HOME:$G6_HOME -v $MODEL_CACHE:$MODEL_CACHE:ro gr8 bash -c "
         mkdir -p $G6_HOME/run
         g6front-rs --model-dir $TOKENIZER_DIR --engine-sock $G6_HOME/run/engine.sock --port 8100 &
-        exec python3 frontend/g6s2shim.py --sock $G6_HOME/run/engine.sock \
-          --rank-dirs $G6_HOME/s2 node2:$G6_HOME/s2 node3:$G6_HOME/s2 node4:$G6_HOME/s2"
+        exec python3 frontend/g6s2shim.py --sock $G6_HOME/run/engine.sock --dir $G6_HOME/s2"
 
 `TOKENIZER_DIR` is the release's `tokenizer/` directory in the cache (the `--model-dir` of the front end's line in
 `out/supervisor.log`). Start it after `ready.s2` exists. Then `curl http://<head>:8100/health`.

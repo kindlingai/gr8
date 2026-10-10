@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Engine-side S2 shim: speaks PROTOCOL.md v1 on the Unix socket and drives g6m4 --serve DIR (a DEC_S2 build) over the
-S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire, and SSH from g6shim).
+S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire, and EOS_IDS from g6shim).
 
 The engine side is the code, not a document: engine/runtime/s2/{ingress.h,sessions.h,service.h,bootstrap.h,scheduler.h}.
-File protocol, one engine epoch per start of g6m4 --serve (every rank needs a FRESH DIR):
+File protocol, in the head rank's DIR (the shim runs on the head), one engine epoch per start of g6m4 --serve (every
+rank needs a FRESH DIR). The head passes each request's bytes and the quit to the other ranks over its control links.
   engine rank 0 -> DIR/ready.s2        "G6S2 2 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>" once all ranks
                                        booted (version 1 has no <max_lp>: no logprobs)
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
-  shim -> EVERY rank DIR/req.<id>      written as req.<id>.tmp, then renamed; "host:/path" entries over ssh. Two lines:
+  shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
         n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
-        ADMIT <epoch> <id> <fnv1a64 of the req.<id> bytes>      (req.<id> is already on every rank)
+        ADMIT <epoch> <id> <fnv1a64 of the req.<id> bytes>      (req.<id> is already written)
         CANCEL <epoch> <id> 0                                   (a real cancel: queued, prefilling or decoding)
       Requests wait in the engine's FIFO until a session slot and a KV run are free (several decode in one step).
   engine rank 0 -> DIR/resp.<id>       one line per event:
@@ -25,10 +26,10 @@ File protocol, one engine epoch per start of g6m4 --serve (every rank needs a FR
         end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame
       A request cancelled while still queued gets only "end abort -1 0".
 A request the engine cannot parse or fit ends the whole epoch (the engine writes DIR/abort.s2 and exits), so the shim
-checks every field before it writes a file. SIGTERM/SIGINT writes DIR/quit to every rank dir (quit an idle engine).
-If the shim restarts against a running engine it continues the cmd/req numbering from the files in the rank-0 dir.
+checks every field before it writes a file. SIGTERM/SIGINT writes DIR/quit (quit an idle engine).
+If the shim restarts against a running engine it continues the cmd/req numbering from the files in DIR.
 
-usage: g6s2shim.py --rank-dirs /run/g6/s0 node2:/run/g6/s1 ... [--sock /run/g6/engine.sock] [--max-model-len N]
+usage: g6s2shim.py --dir /run/g6/s2 [--sock /run/g6/engine.sock] [--max-model-len N]
 """
 import argparse
 import asyncio
@@ -39,13 +40,12 @@ import math
 import os
 import re
 import signal
-import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from g6front import wire  # noqa: E402
-from g6shim import SSH, EOS_IDS, VOCAB, Shim as PlainShim, check_rank_dirs, remote_quit_cmd, remote_write_cmd  # noqa: E402
+from g6shim import EOS_IDS, VOCAB, Shim as PlainShim  # noqa: E402
 
 log = logging.getLogger('g6s2shim')
 
@@ -150,8 +150,8 @@ class Shim:
         self.live: dict[str, Req] = {}       # every unfinished request, by front-end id
         self.active: dict[int, Req] = {}     # ADMIT written, no "end" yet, by engine ordinal
         self.wlock = asyncio.Lock()          # serializes ordinal + cmd number allocation with the file writes
-        self.next_id = scan_numbers(a.rank_dirs[0], 'req')
-        self.next_cmd = scan_numbers(a.rank_dirs[0], 'cmd')
+        self.next_id = scan_numbers(a.dir, 'req')
+        self.next_cmd = scan_numbers(a.dir, 'cmd')
         self.wake = asyncio.Event()
         self.c = {'rounds': 0, 'draft_tokens': 0, 'accepted': 0, 'per_pos': [], 'prompt': 0, 'gen': 0,
                   'fin': collections.Counter(), 'max_active': 0}
@@ -184,7 +184,7 @@ class Shim:
 
     def status(self):
         try:
-            with open(f'{self.a.rank_dirs[0]}/status.s2') as fh:
+            with open(f'{self.a.dir}/status.s2') as fh:
                 return json.load(fh)
         except (OSError, ValueError):
             return None
@@ -289,26 +289,17 @@ class Shim:
 
     # ---- engine side: files ---------------------------------------------------------------------------------------
     async def write_all(self, name: str, body: bytes):
-        """req.<id> on every rank dir (atomic). -> list of error strings."""
-        async def one(d):
-            if ':' in d:
-                host, path = d.split(':', 1)
-                p = await asyncio.create_subprocess_exec(
-                    *SSH, host, remote_write_cmd(path, name),
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-                _, err = await p.communicate(body)
-                return f'{d}: rc {p.returncode} {err.decode(errors="replace").strip()}' if p.returncode else None
-            try:
-                await asyncio.to_thread(write_atomic, f'{d}/{name}', body)
-            except OSError as e:
-                return f'{d}: {e!r}'
-            return None
-        return [e for e in await asyncio.gather(*(one(d) for d in self.a.rank_dirs)) if e]
+        """req.<id> in DIR (atomic). -> list of error strings."""
+        try:
+            await asyncio.to_thread(write_atomic, f'{self.a.dir}/{name}', body)
+        except OSError as e:
+            return [f'{self.a.dir}: {e!r}']
+        return []
 
     async def command(self, text: str):
         """Next cmd.<k> on rank 0. Caller holds wlock."""
         k = self.next_cmd
-        await asyncio.to_thread(write_atomic, f'{self.a.rank_dirs[0]}/cmd.{k}', text.encode())
+        await asyncio.to_thread(write_atomic, f'{self.a.dir}/cmd.{k}', text.encode())
         self.next_cmd += 1
 
     async def admit(self, r: Req):
@@ -407,7 +398,7 @@ class Shim:
             log.warning('req.%s: unknown resp line %r', r.ordinal, ' '.join(w))
 
     def pump(self, r: Req):
-        path = f'{self.a.rank_dirs[0]}/resp.{r.ordinal}'
+        path = f'{self.a.dir}/resp.{r.ordinal}'
         if r.fh is None:
             if not os.path.exists(path):
                 return
@@ -448,12 +439,12 @@ class Shim:
                     self.finish(r, 'error', ct=r.emitted, message=f'engine silent {self.a.stall_timeout:.0f}s on req.{r.ordinal}')
             if now >= next_abort_check:
                 next_abort_check = now + 0.1
-                if os.path.exists(f'{self.a.rank_dirs[0]}/abort.s2'):
+                if os.path.exists(f'{self.a.dir}/abort.s2'):
                     self.fatal('engine S2 epoch aborted (abort.s2)')
             await asyncio.sleep(self.a.poll)
 
     async def wait_ready(self):
-        path = f'{self.a.rank_dirs[0]}/ready.s2'
+        path = f'{self.a.dir}/ready.s2'
         t0 = time.monotonic()
         while True:
             if os.path.exists(path):
@@ -466,37 +457,23 @@ class Shim:
                 except ValueError as e:
                     log.error('%s', e)
                     raise
-            if os.path.exists(f'{self.a.rank_dirs[0]}/abort.s2'):
+            if os.path.exists(f'{self.a.dir}/abort.s2'):
                 raise RuntimeError('engine aborted before ready')
             if time.monotonic() - t0 > self.a.ready_timeout:
-                raise RuntimeError(f'no ready.s2 in {self.a.rank_dirs[0]} after {self.a.ready_timeout:.0f}s')
+                raise RuntimeError(f'no ready.s2 in {self.a.dir} after {self.a.ready_timeout:.0f}s')
             await asyncio.sleep(0.05)
         c = self.cfg
-        if len(self.a.rank_dirs) != c['ranks']:
-            log.warning('engine has %d ranks, %d --rank-dirs given', c['ranks'], len(self.a.rank_dirs))
         log.info('engine ready: epoch %d, %d ranks, pool %d rows, mtp %d, guard %d, max rows %d; next req %d, next cmd %d',
                  c['epoch'], c['ranks'], c['pool_rows'], c['mtp'], c['guard'], c['max_rows'], self.next_id, self.next_cmd)
         self.ready.set()
 
-    def open_masters(self):
-        for host in sorted({d.split(':', 1)[0] for d in self.a.rank_dirs if ':' in d}):
-            rc = subprocess.call(SSH[:-1] + ['ControlMaster=yes', '-o', 'ControlPersist=yes', '-fN', host],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            log.info('ssh master to %s: rc %d', host, rc)
-
     def quit(self):
-        for d in self.a.rank_dirs:
-            try:
-                if ':' in d:
-                    host, path = d.split(':', 1)
-                    os.spawnvp(os.P_WAIT, 'ssh', SSH + [host, remote_quit_cmd(path)])
-                else:
-                    open(f'{d}/quit', 'w').close()
-            except Exception as e:
-                log.error('quit to %s failed: %r', d, e)
-        log.info('quit written to %d rank dirs', len(self.a.rank_dirs))
-        for host in {d.split(':', 1)[0] for d in self.a.rank_dirs if ':' in d}:
-            subprocess.call(SSH + ['-O', 'exit', host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        """DIR/quit: the head engine passes it to the other ranks."""
+        try:
+            open(f'{self.a.dir}/quit', 'w').close()
+            log.info('quit written to %s', self.a.dir)
+        except Exception as e:
+            log.error('quit to %s failed: %r', self.a.dir, e)
 
 
 class _Closed:
@@ -513,8 +490,7 @@ def write_atomic(path: str, body: bytes):
 
 async def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument('--rank-dirs', nargs='+', required=True,
-                    help='engine --serve DIR per rank, rank 0 first (local); "host:/path" goes over ssh')
+    ap.add_argument('--dir', required=True, help="the head rank's engine --serve DIR (local)")
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=0,
                     help='cap on prompt + max_tokens (0 = what the KV pool allows: pool_rows - guard, from ready.s2)')
@@ -528,11 +504,9 @@ async def main(argv=None):
     ap.add_argument('--stall-timeout', type=float, default=900.0, help='error an admitted request after this long with no resp')
     a = ap.parse_args(argv)
     logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-    err = check_rank_dirs(a.rank_dirs)
-    if err:
-        ap.error(err)
+    if ':' in a.dir:
+        ap.error('--dir is the head rank\'s local directory')
     shim = Shim(a)
-    shim.open_masters()
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for s in (signal.SIGTERM, signal.SIGINT):
@@ -541,7 +515,7 @@ async def main(argv=None):
         os.unlink(a.sock)
     os.makedirs(os.path.dirname(a.sock) or '.', exist_ok=True)
     server = await asyncio.start_unix_server(shim.serve, a.sock, limit=wire.MAX_FRAME)
-    log.info('g6s2shim on %s -> %s, waiting for ready.s2', a.sock, ' '.join(a.rank_dirs))
+    log.info('g6s2shim on %s -> %s, waiting for ready.s2', a.sock, a.dir)
     ready = asyncio.create_task(shim.wait_ready())
     worker = asyncio.create_task(shim.run())
     waiter = asyncio.create_task(stop.wait())

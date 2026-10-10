@@ -54,9 +54,8 @@ while :; do
   sleep 2
 done
 echo "ready.s2 after $(( $(date +%s) - t0 ))s: $(on 0 "cat $G6_HOME/s2/ready.s2")"
-DIRS="$G6_HOME/s2"; for ((r = 1; r < NRANK; r++)); do DIRS="$DIRS ${HOST[$r]}:$G6_HOME/s2"; done
 PYTHONPATH="$REPO/frontend" nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/shim.pid" \
-  "$PY" "$REPO/frontend/g6s2shim.py" --rank-dirs $DIRS --sock "$SOCK" > "$G6_HOME/out/shim.log" 2>&1 < /dev/null &
+  "$PY" "$REPO/frontend/g6s2shim.py" --dir "$G6_HOME/s2" --sock "$SOCK" > "$G6_HOME/out/shim.log" 2>&1 < /dev/null &
 for i in $(seq 1 150); do [ -S "$SOCK" ] && break; sleep 0.2; done
 [ -S "$SOCK" ] || { echo "shim did not open $SOCK"; tail -20 "$G6_HOME/out/shim.log"; exit 1; }
 for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break; sleep 0.2; done

@@ -4,14 +4,15 @@
 It follows the engine code (engine/runtime/s2/ingress.h, sessions.h, service.h, scheduler.h):
   - writes DIR/ready.s2 (after --ready-delay), publishes DIR/status.s2
   - rank 0 reads DIR/cmd.0, cmd.1, ... in order (ADMIT <epoch> <id> <hash> | CANCEL <epoch> <id> 0); the request ids must
-    increase; req.<id> must exist on EVERY rank dir with the announced FNV-1a hash when the request is admitted
+    increase; req.<id> must exist in DIR with the announced FNV-1a hash when the request is admitted (the real head
+    sends the bytes to the other ranks itself)
   - a request waits in a FIFO until a session slot (--sessions) and a KV run (--pool-rows) are free, then gets
     an "a" line, then decodes together with the other sessions: every round (--round-ms, the same for any number of
     sessions) each session commits 1 + accepted tokens ("t" lines); at the end an "m" line and "end"
   - CANCEL: queued -> only "end abort -1 0"; resident -> "m ..." + "end abort -1 <emitted>", slot and run freed;
     unknown (already ended) -> nothing
   - anything the real engine would reject (bad header, epoch, duplicate/decreasing id, hash mismatch, request over the
-    pool) ends the epoch: DIR/abort.s2 on every rank dir, exit 3. DIR/quit (any rank dir) = clean exit 0.
+    pool) ends the epoch: DIR/abort.s2, exit 3. DIR/quit = clean exit 0.
 Output tokens are a pure function of the prompt and the position, so a stream can be checked for cross-talk.
 
 usage: fake_s2_engine.py DIR0 [DIR1 ...] [--epoch 7] [--sessions 4] [--pool-rows 20000] [--mtp 2] [--round-ms 20]

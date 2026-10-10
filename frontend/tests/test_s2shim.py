@@ -19,6 +19,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 from g6front import wire  # noqa: E402
 import g6s2shim  # noqa: E402
+import g6shim  # noqa: E402
 from fake_s2_engine import token_at, payload_hash as fake_hash  # noqa: E402
 
 
@@ -131,22 +132,22 @@ class UnitTests(unittest.TestCase):
 
     def test_rank_dirs(self):
         ok = ['/g6/s2', '/g6/s2b', 'box2:/home/g6/s2', 'user@192.0.2.3:/srv/g6.d/s2', 'box3:/home/jos\u00e9/my g6/s2']
-        self.assertIsNone(g6s2shim.check_rank_dirs(ok))
-        self.assertIn('rank 0', g6s2shim.check_rank_dirs(['box1:/g6/s2']))
+        self.assertIsNone(g6shim.check_rank_dirs(ok))
+        self.assertIn('rank 0', g6shim.check_rank_dirs(['box1:/g6/s2']))
         for bad in ('-oProxyCommand=x:/g6', ':/g6', 'box2:g6/s2', 'box2:/g6/s2\nid', 'box 2:/g6'):
-            self.assertIsNotNone(g6s2shim.check_rank_dirs(['/g6/s2', bad]), repr(bad))
+            self.assertIsNotNone(g6shim.check_rank_dirs(['/g6/s2', bad]), repr(bad))
 
     def test_remote_commands(self):
         # a plain path goes out exactly as before
-        self.assertEqual(g6s2shim.remote_write_cmd('/g6/s2', 'req.7'),
+        self.assertEqual(g6shim.remote_write_cmd('/g6/s2', 'req.7'),
                          'cat > /g6/s2/req.7.tmp && mv /g6/s2/req.7.tmp /g6/s2/req.7')
-        self.assertEqual(g6s2shim.remote_quit_cmd('/g6/s2'), 'touch /g6/s2/quit')
+        self.assertEqual(g6shim.remote_quit_cmd('/g6/s2'), 'touch /g6/s2/quit')
         # anything else reaches the remote shell as one word: run the commands through sh, as sshd does
         with tempfile.TemporaryDirectory() as t:
             d = os.path.join(t, "s2; touch canary; $(touch canary) `touch canary` 'q\" *")
             os.mkdir(d)
-            subprocess.run(['sh', '-c', g6s2shim.remote_write_cmd(d, 'req.1')], cwd=t, input=b'hello\n', check=True)
-            subprocess.run(['sh', '-c', g6s2shim.remote_quit_cmd(d)], cwd=t, check=True)
+            subprocess.run(['sh', '-c', g6shim.remote_write_cmd(d, 'req.1')], cwd=t, input=b'hello\n', check=True)
+            subprocess.run(['sh', '-c', g6shim.remote_quit_cmd(d)], cwd=t, check=True)
             self.assertEqual(sorted(os.listdir(d)), ['quit', 'req.1'])
             with open(os.path.join(d, 'req.1'), 'rb') as f:
                 self.assertEqual(f.read(), b'hello\n')
@@ -178,7 +179,7 @@ class S2Base(unittest.IsolatedAsyncioTestCase):
         if os.path.exists(self.sock):
             os.unlink(self.sock)
         with open(os.path.join(self.tmp, 'shim.log'), 'a') as logf:
-            self.shim = subprocess.Popen([sys.executable, os.path.join(ROOT, 'g6s2shim.py'), '--rank-dirs', *self.dirs,
+            self.shim = subprocess.Popen([sys.executable, os.path.join(ROOT, 'g6s2shim.py'), '--dir', self.dirs[0],
                                           '--sock', self.sock, '--poll', '0.002', *self.SHIM, *extra], stderr=logf)
         self.procs.append(self.shim)
         return self.shim
@@ -455,30 +456,22 @@ class MaxLenTests(S2Base):
         self.assertEqual((await c.wait('fit'))[1]['reason'], 'length')
 
 
-class TwoRanks(S2Base):
-    RANKS = 2
-
-    async def test_request_lands_on_every_rank_before_admit(self):
+class OneDir(S2Base):
+    async def test_requests_commands_and_quit_stay_in_dir(self):
         c = await self.client()
         c.send(gen('t', [4, 5, 6], max_tokens=12))
-        c.send(gen('u', [7, 8], max_tokens=12))
-        for rid, p in (('t', [4, 5, 6]), ('u', [7, 8])):
-            ids, fin, _ = await c.wait(rid)
-            self.assertEqual((fin['reason'], ids), ('length', self.expect(p, 12)))
-        for n in (0, 1):
-            with open(os.path.join(self.dirs[0], f'req.{n}'), 'rb') as fa, open(os.path.join(self.dirs[1], f'req.{n}'), 'rb') as fb:
-                self.assertEqual(fa.read(), fb.read())
-        self.assertEqual(sorted(f for f in os.listdir(self.dirs[0]) if f.startswith('cmd.')), ['cmd.0', 'cmd.1'])
-        self.assertEqual([f for f in os.listdir(self.dirs[1]) if f.startswith('cmd.')], [])   # commands go to rank 0 only
-        self.assertIsNone(self.fake.poll())
-        self.assertNotIn('EPOCH FAILED', self.fake_log())
-
-    async def test_quit_goes_to_all_rank_dirs(self):
-        await self.client()
+        ids, fin, _ = await c.wait('t')
+        self.assertEqual((fin['reason'], ids), ('length', self.expect([4, 5, 6], 12)))
+        names = sorted(f for f in os.listdir(self.dirs[0]) if f.startswith(('req.', 'cmd.')))
+        self.assertEqual(names, ['cmd.0', 'req.0'])
         self.shim.send_signal(signal.SIGTERM)
         self.assertEqual(self.shim.wait(timeout=10), 0)
-        for d in self.dirs:
-            self.assertTrue(os.path.exists(os.path.join(d, 'quit')))
+        self.assertTrue(os.path.exists(os.path.join(self.dirs[0], 'quit')))
+
+    def test_dir_must_be_local(self):
+        r = subprocess.run([sys.executable, os.path.join(ROOT, 'g6s2shim.py'), '--dir', 'box2:/g6/s2'], capture_output=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(b'local directory', r.stderr)
 
 
 class SlowBoot(S2Base):

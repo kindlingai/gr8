@@ -50,6 +50,7 @@ class Service {
     EventEndpoint* endpoint_ = nullptr;
     Ingress ingress_; AdmissionQueue queue_;
     std::map<uint64_t, Command> commands_;
+    std::map<uint64_t, std::string> payloads_;   // head: queued requests' bytes, sent to the workers with each ADMIT notice
     std::map<uint64_t, std::vector<int>> prompts_;   // head, prefix reuse: queued requests' prompts (none for prompt logprobs)
     bool reuse() const { return bool(native_.pool.match); }
     std::optional<g6rt::ServeReq> staged_; // COMPUTE thread only, parsed before event ACK
@@ -117,10 +118,10 @@ class Service {
                     cm.admit = Grant{s.next_key(), *request, run, skip};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
-                if (cm.admit) { queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request); }
+                if (cm.admit) { queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request); payloads_.erase(command.request); }
             }
             return cm;
-        });
+        }, command.admit ? &payloads_.at(command.request) : nullptr);
         require(event_ != UINT64_MAX, "event sequence exhausted"); ++event_; publish_status();
     }
     void controller() {
@@ -130,11 +131,13 @@ class Service {
             while (auto command = ingress_.next()) {
                 changed = true;
                 if (command->admit) {
-                    auto request = parse_request(ingress_.request(*command));
+                    auto bytes = ingress_.request(*command);
+                    auto request = parse_request(bytes);
                     queue_.push(Sessions::request(command->request, request)); commands_.emplace(command->request, *command);
+                    payloads_.emplace(command->request, std::move(bytes));
                     if (reuse() && request.plp < 0) prompts_.emplace(command->request, std::move(request.prompt));
                 } else if (queue_.cancel(command->request)) {
-                    commands_.erase(command->request); prompts_.erase(command->request);
+                    commands_.erase(command->request); prompts_.erase(command->request); payloads_.erase(command->request);
                     atomic_file(c_.directory + "/resp." + std::to_string(command->request), "end abort -1 0\n");
                 } else event(*command); // resident/retiring lookup only at the fence
                 if (stopping_.load()) return;
@@ -155,10 +158,12 @@ class Service {
             require(!exists(c_.directory + "/abort.s2"), "shim aborted S2 epoch");
             if (exists(c_.directory + "/quit")) {
                 // Orderly quit: stop at once (controller/compute loops end, later control errors are ignored) but keep
-                // this rank's control sockets open for quit_linger_ms before closing them, so a peer whose DIR/quit lands
-                // later (sequential ssh touches) reads EOF only after it is stopping too. Closing at once made the
-                // other ranks fail with 'control disconnected' -> g6m4 exit 3 on a clean quit (P5 CPU repro).
+                // this rank's control sockets open for quit_linger_ms before closing them, so a worker reads EOF only
+                // after it is stopping too. The head passes its quit to the workers over the control links, and each
+                // worker writes its own DIR/quit. Closing at once made the workers fail with 'control disconnected'
+                // (g6m4 exit 3) on a clean quit.
                 // Quit is for an idle engine (no resident session): a rank stopping mid-round leaves its peers' step.
+                if (leader_) leader_->quit();
                 stopping_.store(true);
                 const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(quit_linger_ms);
                 while (std::chrono::steady_clock::now() < end && !exists(c_.directory + "/abort.s2"))
@@ -175,7 +180,11 @@ class Service {
             }
             auto cm = endpoint_->boundary(driver_->state().boundary(), [&] {
                 native_.fence(); const auto n = endpoint_->wait_notice(); staged_.reset();
-                if (n.kind == EventKind::Admit) staged_ = parse_request(ingress_.request({true,n.epoch,n.request,n.payload_hash}));
+                if (n.kind == EventKind::Admit) {   // the head reads its own req.<id>; a worker has the bytes from the head
+                    const auto bytes = worker_ ? worker_->request(n.request) : ingress_.request({true,n.epoch,n.request,n.payload_hash});
+                    require(payload_hash(bytes) == n.payload_hash, "request bytes do not match the ADMIT notice");
+                    staged_ = parse_request(bytes);
+                }
                 return driver_->state().digest(); // once per event, NEVER per round
             });
             if (cm) {
@@ -189,6 +198,7 @@ class Service {
                 std::optional<Payload> payload;
                 if (cm->admit) { require(staged_.has_value(), "commit without verified request"); payload = sessions_.payload(*staged_); }
                 driver_->apply(*cm, payload ? &*payload : nullptr);
+                if (worker_ && cm->admit) worker_->admitted(cm->admit->req.id);
                 dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
                 staged_.reset(); endpoint_->applied(); continue;
             }
@@ -197,7 +207,7 @@ class Service {
         }
     }
 public:
-    unsigned quit_linger_ms = 15000; // orderly-quit linger (monitor); > the spread of the quit touches over all ranks
+    unsigned quit_linger_ms = 15000; // orderly-quit linger (monitor); > the time the workers take to see the head's quit
     Service(BootstrapConfig c, ControlLinks& links, NativeHooks hooks, int chunk)
         : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk),
           dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
@@ -250,6 +260,7 @@ public:
         } else {
             require(links_.links.size() == 1, "worker needs one head link");
             worker_ = std::make_unique<WorkerChannel>(c_.scheduler.epoch,c_.rank,*links_.links[0]); endpoint_ = worker_.get();
+            worker_->on_quit = [this] { atomic_file(c_.directory + "/quit", ""); };
         }
     }
     // Blocking compute loop, with persistent control + abort/quit monitor threads.

@@ -54,8 +54,9 @@ MTP k=2 at temperature 0.7, one test window on one cluster.
   At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and at TP=4
   the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned per
   rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited.
-- A LAN between the boxes with TCP port 7340 open, and non-interactive ssh from the first box to the others (with
-  their addresses in its `known_hosts`): the shim on the head hands each request to the other ranks over ssh.
+- A LAN between the boxes with TCP ports 7340 and 7341 open. TP=4 and TP=3 need no ssh between the boxes: the head
+  engine passes each request to the other ranks over its control links. TP=6's one-request loop still writes each
+  request to the other ranks over non-interactive ssh from the first box (their addresses in its `known_hosts`).
 - Disk per box: about 90 GB at TP=4 (its experts, the 11 GB of dense and vocab files, the drafter) and about 85 GB at
   TP=3. One cache holds both, because their parts share the sparse expert files.
 - Proactive memory compaction off on every box. A rank fills the box to about 2 GB under its limit, and at that level

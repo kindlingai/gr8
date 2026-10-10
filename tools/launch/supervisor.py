@@ -647,11 +647,12 @@ class Supervisor:
 
     def start_shim(self, plan, work):
         sock = os.path.join(self.home, 'run', 'engine.sock')
-        dirs = [os.path.join(self.home, work)]
-        dirs += [f'{self.members[r]}:{os.path.join(self.hs["homes"][str(r)], work)}' for r in range(1, len(self.members))]
-        if plan['s2']:
-            argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--rank-dirs', *dirs, '--sock', sock]
-        else:
+        if plan['s2']:   # the head engine passes requests to the other ranks itself, over its control links
+            argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', os.path.join(self.home, work),
+                    '--sock', sock]
+        else:            # TP=6's one-request loop: every rank's serve dir, the others over ssh
+            dirs = [os.path.join(self.home, work)]
+            dirs += [f'{self.members[r]}:{os.path.join(self.hs["homes"][str(r)], work)}' for r in range(1, len(self.members))]
             argv = [self.py(), os.path.join(REPO, 'frontend', 'g6shim.py'), '--rank-dirs', *dirs, '--sock', sock,
                     '--max-model-len', plan['knobs']['CAP'], '--stall-timeout', '2400']
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
