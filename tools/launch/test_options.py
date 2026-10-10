@@ -183,7 +183,7 @@ class CanonicalTests(unittest.TestCase):
     def test_template_has_no_paths(self):
         _, text, _ = self.digest('--g6-home', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
         self.assertNotIn('/very/own/home', text)
-        self.assertIn('--s2 @HOME/s2', text)
+        self.assertIn('--serve @HOME/s2', text)
         self.assertIn('--manifest @RANKDIR/rank@R.manifest.json', text)
         self.assertIn('--v2 @V2', text)
         self.assertIn('--v2-widths @V2_WIDTHS', text)

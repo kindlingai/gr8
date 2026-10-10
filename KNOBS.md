@@ -26,7 +26,7 @@ The engine does not inherit `G6_*` variables from the environment, and `./gr8 gl
 set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box compares them.
 
 The defaults in the launch table come from `scripts/engine_args.sh`. The supervisor and the ssh launchers both read
-it. "TP=4" is the multi-session engine (`--s2`). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
+it. TP=4 and TP=3 serve through the multi-session engine (S2). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
 `V2_WIDTHS` are paths, so each box may have its own. The handshake compares the variant's name and the sha256 of its
 manifest instead.
 

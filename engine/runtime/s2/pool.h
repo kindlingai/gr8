@@ -1,4 +1,4 @@
-// S2 below R v1 (S2-STATE.md) run allocator over the native pool pages. Host only, no CUDA. One instance per rank;
+// S2 below R run allocator over the native pool pages. Host only, no CUDA. One instance per rank;
 // every call is at an all-rank event fence (service.h). Head: reserve (first-fit, lowest base). Workers: claim the
 // head's exact grant. A reservation of more than `below` rows (a session past R, CP decode) runs solo at base 0: it
 // is admitted only into an EMPTY pool and, while resident, holds the whole pool (free 0, nothing else admits).

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-10: serving is S2 in every build that has it; no `--s2` flag
+
+- A DEC_S2 build (TP=4, TP=3) always serves through S2: `g6m4 --serve DIR --s2-port N ...`. `--s2 DIR` is gone, so a
+  served TP=4 or TP=3 rank cannot fall back to the one-request loop. The TP=6 build has no S2 yet, and its `--serve`
+  stays the one-request loop. Without `--serve`, any build runs its offline test prompts as before.
+- The launcher passes `--serve $G6_HOME/s2`; the cluster options digest changes with it, so every box upgrades together.
+
 ## 2026-10-10: `G6_PF_GEMMF32=1`: the QO o_proj uses the full-tile GEMM (opt-in)
 
 - The row-owner QO o_proj (`G6_PF_OWN=3`) writes FP32, which kept it on the guarded `k_gemm_mx8b` while the BF16 / FP16

@@ -274,7 +274,7 @@ int main(int argc, char** argv)
     if (cp_on) fprintf(stderr, "# G6_CP loopback: %d collectives, mmax %d, %.3f GB per rank\n", cp_colls.ncoll(), cp_mmax,
                        (cp_L.send_bytes() + cp_L.recv_bytes()) / 1e9);
 #endif
-    // --s2 on a CP build (G6_CP on): S2 below R (S2-STATE.md). Every session's run <= G6_S2_BELOW rows (default G6_CP_R,
+    // --s2 on a CP build (G6_CP on): S2 below R. Every session's run <= G6_S2_BELOW rows (default G6_CP_R,
     // multiple of 64, <= G6_CP_R), on the CP binding as built; runs are granted by G6_S2_RUNS or the default layout
     int s2_below = 0;
 #if defined(G6_CP) && G6_CP
@@ -501,7 +501,7 @@ int main(int argc, char** argv)
         }
     }
 #endif
-    // P3 gate (S2-STATE.md), DEC_S2 CP build, --prefill, no --s2: G6_S2_PFBASE=B[,pages] runs every sequence as one session
+    // Gate: DEC_S2 CP build, --prefill, no --s2: G6_S2_PFBASE=B[,pages] runs every sequence as one session
     // at base page B below R: tables B + i (s2_solo_run, main and draft), staged prefill index keys from page B
     // (Model::s2_pf_base), StepIn::base_page = B, s2_reset_run instead of reset(). Stdout must equal the run at B = 0.
     // G6_S2_PFPOISON=1: fill every cache with 0x3c bytes first, so a read outside the run changes the output.
@@ -537,7 +537,7 @@ int main(int argc, char** argv)
         for (Model& m : R) { s2_solo_run(m, pf_base, pf_pages); m.s2on = false; m.s2_pf_base = ixb; }
         for (Draft& D : DR) { s2_solo_run(D.d, pf_base, pf_pages); D.d.s2on = false; D.d.s2_pf_base = ixb; }
         G6RT_CK(cudaStreamSynchronize(st));
-        fprintf(stderr, "# s2 P3 gate: every sequence at base page %d, run of %d pages (main pool %d pages)%s%s\n", pf_base, pf_pages,
+        fprintf(stderr, "# s2 base-page gate: every sequence at base page %d, run of %d pages (main pool %d pages)%s%s\n", pf_base, pf_pages,
                 R[0].s2->pool_pages, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "", ixb != pf_base ? ", NOFIX" : "");
     }
 #endif
@@ -1184,7 +1184,7 @@ int main(int argc, char** argv)
         if (!skip)
         {
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
-            if (getenv("G6_S2_PFBASE"))         // P3 gate: clear the run only (s2_reset_run)
+            if (getenv("G6_S2_PFBASE"))         // base-page gate: clear the run only (s2_reset_run)
             {
                 for (Model& m : R) s2_reset_run(m, pf_base, pf_pages, st);
                 for (Draft& D : DR) s2_reset_run(D.d, pf_base, pf_pages, st);

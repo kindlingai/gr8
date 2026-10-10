@@ -139,7 +139,7 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual((val('--rank'), val('--s2-epoch'), val('--set-id')), (str(i), str(hs[0]['epoch']), set_id))
             self.assertEqual(val('--manifest'), os.path.join(rank_dir, f'rank{i}.manifest.json'))
             self.assertEqual(val('--dflash-pack'), os.path.join(rank_dir, f'dflash.r{i}.pack'))
-            self.assertEqual(val('--s2'), os.path.join(self.homes[i], 's2'))
+            self.assertEqual(val('--serve'), os.path.join(self.homes[i], 's2'))
             self.assertEqual(self.stub(i)['env']['G6_PF_OWN'], '4')
             self.assertEqual(os.listdir(os.path.join(self.homes[i], 'cache', 'sets', set_id)).count(f'rank{i}'), 1)
             self.assertEqual(sorted(n for n in os.listdir(os.path.join(self.homes[i], 'cache', 'sets', set_id))

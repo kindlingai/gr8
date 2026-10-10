@@ -28,22 +28,23 @@
 //                     G6_REUSE_STRICT=1: strict append only, G6_REUSE_NOEND=1: no prompt >= written_end rule; default off;
 //                     gate arm G6_REUSE_POISON=1: a hit first sets the old sequence's stale rows to NaN, reuse_poison.cuh;
 //                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
-//                     With --s2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
+//                     Under S2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
-//      [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
+//      [--serve DIR]  serve requests; --prompt is ignored. A DEC_S2 build (TP4, TP3) always serves through S2 (below); any
+//                     other build one request at a time: DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h)
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)
-//      [--s2 DIR --s2-port N [--s2-sessions S] [--s2-epoch E]]  (DEC_S2 + G6_CP build) S2 below R served: up to S sessions
+//      [--s2-port N [--s2-sessions S] [--s2-epoch E]]  S2 serving (DEC_S2 + G6_CP build, with --serve DIR): up to S sessions
 //                     share decode steps (runs of at most G6_S2_BELOW rows, default G6_CP_R), a longer request runs alone at
-//                     base 0 of the pool (s2/pool.h); requests over the control sockets (s2/service.h, head = rank 0 on
-//                     --ips[0]:N); DIR is this rank's fresh S2 directory (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2).
-//                     Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3; no --serve; --prompt is ignored.
+//                     base 0 of the pool (s2/pool.h); requests over the control sockets (s2/service.h, head = rank 0 on the
+//                     bootstrap address, port N); DIR is this rank's fresh S2 directory (cmd.<n> / req.<n> / resp.<n>,
+//                     ready.s2, status.s2). Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3.
 //      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident from tools/convert/pairpack.py; or
 //                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
 //      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
 //                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from tools/convert/dflash2.py. --dflash-sel 1 =
 //                     the DFlash2 selector walk (default when the pack has it), 0 = argmax drafts; --dflash-k K = verify
-//                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, except with --s2: there a
+//                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, except under S2: there a
 //                     session alone at its prompt tail drafts with DFlash2 and goes to MTP when a second one arrives (s2_batch.h).
 //      [--spec-accept coupled|rejection]  how a verify step accepts drafts at temperature > 0. coupled (default): drafts are
 //                     sampled with the target's position-keyed noise and accepted when they equal the target's sample, so
@@ -54,8 +55,8 @@
 //      [--spec-adaptive [--spec-levels 7,5,3,2]]  each round verifies the level with the most expected tokens per ms
 //                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
 //                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
-//                     Needs --mtp or --dflash-manifest. With --s2: the DFlash2 sessions' policy (needs --dflash-manifest).
-//      [--set-id HEX]  the model set id from ./gr8 glm53 up (tools/launch/modelset.py). With --s2 it joins the bootstrap
+//                     Needs --mtp or --dflash-manifest. Under S2: the DFlash2 sessions' policy (needs --dflash-manifest).
+//      [--set-id HEX]  the model set id from ./gr8 glm53 up (tools/launch/modelset.py). Under S2 it joins the bootstrap
 //                     agreement, so ranks loaded from different model sets refuse to start. Otherwise unused.
 #include <algorithm>
 #include <chrono>
@@ -117,7 +118,7 @@ int main(int argc, char** argv)
     int pfrows = 0, mtp = 0, lanes = 1;
     std::string serve;
     int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
-    std::string s2dir;                  // --s2 DIR: S2 below R served (DEC_S2)
+    std::string s2dir;                  // a DEC_S2 build serves --serve DIR through S2 (below R)
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
     int s2port = 0, s2sess = 8;
     unsigned long long s2epoch = 1;
@@ -179,7 +180,6 @@ int main(int argc, char** argv)
             else if (v == "rejection") plan.rs = true;
             else die("--spec-accept must be coupled or rejection");
         }
-        else if (a == "--s2") s2dir = next();
         else if (a == "--s2-port") s2port = atoi(next().c_str());
         else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
         else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
@@ -203,15 +203,18 @@ int main(int argc, char** argv)
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1.." + std::to_string(MX));
     if (mtp < 0 || mtp > std::min<int>(MX - 1, 7)) die("--mtp must be 1..7 drafts");   // the scheduler caps k at 7 whatever MX is
     if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
+#ifdef DEC_S2
+    s2dir.swap(serve);                  // a DEC_S2 build always serves through S2; serve stays the one-request loop's
+#endif
     const bool s2mode = !s2dir.empty();
     const bool dfl = !dfl_man.empty();
-    // --s2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
+    // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
     if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
-        die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except with --s2; --dflash-sel 0|1; --dflash-k 1..7");
+        die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except under S2; --dflash-sel 0|1; --dflash-k 1..7");
     if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
     if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
-    if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; with --s2 it is the DFlash2 sessions' policy");
+    if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; under S2 it is the DFlash2 sessions' policy");
     if (!levels_s.empty() && !adapt) die("--spec-levels needs --spec-adaptive");
     SpecLen spec;                       // --spec-adaptive. Its estimates persist across requests
     if (adapt)
@@ -226,12 +229,9 @@ int main(int argc, char** argv)
         spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
         spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
     }
-#ifndef DEC_S2
-    if (s2mode) die("--s2 needs a DEC_S2 build");
-#endif
-    if (s2mode && (!serve.empty() || !graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
-        die("--s2 needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8, --s2-epoch > 0 and no --serve");
-    // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under --s2 every retired session's run (s2/pool.h).
+    if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
+        die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (reuse_prefix && dfl && !s2mode) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
     std::vector<Plan> plans;            // one sequence per --prompt
@@ -572,17 +572,17 @@ int main(int argc, char** argv)
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
     }
 #ifdef DEC_S2
-    // --s2: S2 below R on the CP binding (S2-STATE.md v1). Session views on the pool, main and draft; today's graphs below
+    // S2: below R on the CP binding. Session views on the pool, main and draft; today's graphs below
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
     int s2_below = 0;
     if (s2mode)
     {
 #if defined(G6_CP) && G6_CP
-        if (!cp_on || !cp_R) die("--s2: S2 below R needs G6_CP on and G6_CP_R");
+        if (!cp_on || !cp_R) die("S2: serving below R needs G6_CP on and G6_CP_R");
         s2_below = getenv("G6_S2_BELOW") ? atoi(getenv("G6_S2_BELOW")) : cp_R;
-        if (s2_below < 64 || s2_below % 64 || s2_below > cp_R) die("--s2: G6_S2_BELOW (default G6_CP_R) must be 64..G6_CP_R, a multiple of 64");
+        if (s2_below < 64 || s2_below % 64 || s2_below > cp_R) die("S2: G6_S2_BELOW (default G6_CP_R) must be 64..G6_CP_R, a multiple of 64");
 #else
-        die("--s2: v1 is S2 below R on the CP binding (a G6_CP build)");
+        die("S2: serving needs the CP binding (a G6_CP build)");
 #endif
         m.s2_below = D.d.s2_below = s2_below;
         s2_init(m, s2sess, st);
@@ -606,7 +606,7 @@ int main(int argc, char** argv)
     // exec2 = the rest; launched back to back, the second graph's submission overlaps the first one's GPU time (0 = one graph)
     const int gsplit = getenv("G6_DEC_SPLIT") ? atoi(getenv("G6_DEC_SPLIT")) : 0;
     if (gsplit < 0 || gsplit >= NL || (gsplit && !graph)) die("G6_DEC_SPLIT must be 0..layers-1 and needs --graph");
-    if (s2mode && gsplit != 3) die("--s2 needs G6_DEC_SPLIT=3 (the production split3 graphs)");
+    if (s2mode && gsplit != 3) die("serving needs G6_DEC_SPLIT=3 (the production split3 graphs)");
     cudaGraphExec_t exec2[NBK][MX + 1] = {};
     auto launch_main = [&](int k, int M) {
         G6RT_CK(cudaGraphLaunch(exec[k][M], st));

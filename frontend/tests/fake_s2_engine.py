@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake engine for g6s2shim tests: the file side of `g6m4 --s2 DIR` (a DEC_S2 build), no model, no GPU.
+"""Fake engine for g6s2shim tests: the file side of `g6m4 --serve DIR` (a DEC_S2 build), no model, no GPU.
 
 It follows the engine code (engine/runtime/s2/ingress.h, sessions.h, service.h, scheduler.h):
   - writes DIR/ready.s2 (after --ready-delay), publishes DIR/status.s2

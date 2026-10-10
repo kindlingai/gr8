@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Engine-side S2 shim: speaks PROTOCOL.md v1 on the Unix socket and drives g6m4 --s2 DIR (a DEC_S2 build) over the
+"""Engine-side S2 shim: speaks PROTOCOL.md v1 on the Unix socket and drives g6m4 --serve DIR (a DEC_S2 build) over the
 S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire, and SSH from g6shim).
 
 The engine side is the code, not a document: engine/runtime/s2/{ingress.h,sessions.h,service.h,bootstrap.h,scheduler.h}.
-File protocol, one engine epoch per start of g6m4 --s2 (every rank needs a FRESH DIR):
+File protocol, one engine epoch per start of g6m4 --serve (every rank needs a FRESH DIR):
   engine rank 0 -> DIR/ready.s2        "G6S2 2 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>" once all ranks
                                        booted (version 1 has no <max_lp>: no logprobs)
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
@@ -514,7 +514,7 @@ def write_atomic(path: str, body: bytes):
 async def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--rank-dirs', nargs='+', required=True,
-                    help='engine --s2 DIR per rank, rank 0 first (local); "host:/path" goes over ssh')
+                    help='engine --serve DIR per rank, rank 0 first (local); "host:/path" goes over ssh')
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=0,
                     help='cap on prompt + max_tokens (0 = what the KV pool allows: pool_rows - guard, from ready.s2)')

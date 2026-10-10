@@ -138,7 +138,7 @@ python3 g6s2shim.py --rank-dirs /run/g6/s0 node2:/run/g6/s1 ... --sock /run/g6/e
 python -m g6front --engine-sock /run/g6/engine.sock ...
 ```
 
-Tests, no GPU (`tests/fake_s2_engine.py` is the file side of `g6m4 --s2`: FIFO admit up to `--sessions`, one round time for any number of sessions, per-request `resp`, the engine's strict parsing; tokens depend on prompt and position only, so streams are checked for cross-talk):
+Tests, no GPU (`tests/fake_s2_engine.py` is the file side of `g6m4 --serve` in a DEC_S2 build: FIFO admit up to `--sessions`, one round time for any number of sessions, per-request `resp`, the engine's strict parsing; tokens depend on prompt and position only, so streams are checked for cross-talk):
 
 ```bash
 cd frontend && python3 -m unittest tests.test_s2shim -v
@@ -148,7 +148,7 @@ It covers 4 concurrent streams (exact tokens, wall clock under 2x one stream, 4 
 
 ### Round log and cost fit
 
-`G6_S2_ROUNDLOG=1 g6m4 ... --s2 ...` makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
+`G6_S2_ROUNDLOG=1 g6m4 ... --serve ...` (a DEC_S2 build) makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
 
 ```bash
 tools/s2_costfit.py engine_rank0.log [--residuals] [--json]   # also ms per whole round by active sessions; step_ms = base + per_expert * experts(d*rows) + per_token * rows

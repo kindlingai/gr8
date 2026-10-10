@@ -1,5 +1,5 @@
 #!/bin/bash
-# Multi-session (S2) boot over ssh from the head (deprecated: ./gr8 glm53 up is the launcher): g6m4 --s2 on four or
+# Multi-session (S2) boot over ssh from the head (deprecated: ./gr8 glm53 up is the launcher): g6m4 --serve on four or
 # three Sparks (G6_NR=4 or 3 scripts/build.sh) serving up to SESS concurrent sessions, driven by frontend/g6s2shim.py.
 # Stop with scripts/stop.sh.
 #   SESS=8 scripts/launch_s2.sh        (scripts/launch_tp4.sh and launch_tp3.sh run this)

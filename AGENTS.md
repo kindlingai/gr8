@@ -58,7 +58,7 @@ and engine build, and each starts its own rank; `status`, `logs` and `down` work
 The engine command line lives in `scripts/engine_args.sh`. The supervisor and the deprecated ssh launchers
 (`./gr8 glm53 --ssh up`) both build it from there, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
 
-S2 is the served path. At TP=4 and TP=3 the engine runs `g6m4 --s2`: up to `SESS` requests at once, and at TP=4 the
+S2 is the served path. At TP=4 and TP=3 the engine always serves through S2 (`g6m4 --serve`, a DEC_S2 build): up to `SESS` requests at once, and at TP=4 the
 DFlash2 drafter for a request that runs alone (TP=3 is MTP only). A change to decode, prefill or the scheduler is
 measured under S2, and multi-session output must stay byte-identical to each request run alone. TP=6 still serves one
 request at a time, until it moves to S2.

@@ -56,7 +56,7 @@ engine_args() {
   case $TP in
     4|3)
       a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 \
---mtp $MTP --s2 $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
+--mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
       [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
       [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
       [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"

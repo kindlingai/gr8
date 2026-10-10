@@ -22,8 +22,8 @@ with open('out/stub.json', 'w') as f:
     json.dump({'argv': argv, 'env': {k: v for k, v in os.environ.items() if k.startswith('G6_')},
                'ld': os.environ.get('LD_LIBRARY_PATH'), 'cwd': os.getcwd()}, f)
 fakes = os.path.join(REPO, 'frontend', 'tests')
-if val('--s2'):
-    d = val('--s2')
+if val('--s2-port'):                  # a DEC_S2 build serves --serve DIR through S2
+    d = val('--serve')
     if rank == 0:
         os.execv(sys.executable, [sys.executable, os.path.join(fakes, 'fake_s2_engine.py'), d,
                                   '--epoch', val('--s2-epoch'), '--mtp', val('--mtp', '2'), '--ready-delay', '0.5'])

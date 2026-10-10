@@ -56,7 +56,7 @@ class PrefixReuseTests(unittest.TestCase):
             pos = s.index(call)
             self.assertLess(pos, s.index('em.end(', pos))
         # the one-request loop refuses DFlash2 with reuse (the drafter's prompt taps come from the prefill a hit
-        # skips); --s2 keeps retired runs in its pool (s2/pool.h) and gives DFlash2 only to a session that owns them
+        # skips); S2 keeps retired runs in its pool (s2/pool.h) and gives DFlash2 only to a session that owns them
         self.assertIn('if (reuse_prefix && dfl && !s2mode) die(', s)
         self.assertNotIn('if (reuse_prefix && s2mode) die(', s)
 

@@ -114,7 +114,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     std::vector<unsigned*> er((size_t)S2N * m.nl, s->zero);
     if (m.s2_below)
     {
-        // S2 below R (S2-STATE.md, CP builds): the pool is each layer's own binding as built. A run holds at most
+        // S2 below R (CP builds): the pool is each layer's own binding as built. A run holds at most
         // s2_below rows, all on the replicated path (pages < R/64 of the CP map are replicated; the views clear cp_nr), so
         // runs may sit on any physical page. Pool pages = the FEWEST physical pages of any rank (the CP tail split
         // differs by one page across ranks), so every rank grants the same runs.
