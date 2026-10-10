@@ -9,3 +9,4 @@ bench/results.jsonl
 /run/
 /s2/
 /serve/
+/docker/.env

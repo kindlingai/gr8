@@ -10,3 +10,4 @@ bin*
 bench/results*.jsonl
 config/cluster.env
 frontend/tests/work
+docker/.env

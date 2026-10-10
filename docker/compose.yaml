@@ -1,0 +1,86 @@
+# gr8 on GB10 boxes: one container per box, one tensor-parallel rank in each. The head (rank 0) also runs the shim and
+# the OpenAI front end.
+#
+# Run the SAME file on every box:
+#   docker compose -f docker/compose.yaml run --rm gr8 prepare     # once per box: this box's part of the model
+#   docker compose -f docker/compose.yaml up -d
+# docker/.env says which boxes and which model (.env.example lists the settings). Compose reads .env from this file's
+# directory, whatever the working directory, and passes every line of it into the container, where the launcher reads
+# its options (KNOBS.md). docker/README.md has the rest.
+#
+# RULE: no option default lives here. The launcher in the image owns every default, and a second copy here would be
+# a second place to change, with one of them silently winning. The only values set below are the container's own
+# paths.
+#
+# Pinned so the project is not named after this directory ("docker").
+name: gr8
+services:
+  gr8:
+    image: ${GR8_IMAGE:-ghcr.io/kindlingai/gr8:latest}
+    container_name: gr8
+    # The launcher's options, from docker/.env. Optional: options can also come on the command line of `run`.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # The container's own paths (the volumes below). Set here so a MODEL_CACHE or G6_HOME line in .env, meant for a
+      # bare-metal box, cannot point the launcher at a path that does not exist in the container.
+      - G6_HOME=/var/lib/gr8/home
+      - MODEL_CACHE=/var/lib/gr8/cache
+    # The RoCE fabric and the front end need the box's real interfaces. The fabric bootstrap, the supervisors' control
+    # port (7340), the S2 control port (7341) and the API (8100) are host ports.
+    network_mode: host
+    # The launcher refuses to start next to another g6m4 on the box, and sees one started outside the container only
+    # in the host's process list.
+    pid: host
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ulimits:
+      # The fabric registers its pinned buffers with the NIC.
+      memlock: -1
+      # A crash must not dump core. A rank maps ~90 GB, and the dumping thread holds the NVIDIA driver's lock the
+      # whole time it writes, which can leave the box unreachable until a power cycle.
+      core: 0
+    # The engine runs with no more rights than it needs: the image's uid 1000, no capabilities but IPC_LOCK (pinned
+    # memory), no privilege escalation, a read-only image with a private /tmp.
+    cap_drop: [ALL]
+    cap_add: [IPC_LOCK]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    # Under memory pressure the kernel ends the engine before sshd or the rest of the box.
+    oom_score_adj: 1000
+    # tini as PID 1: it forwards docker's SIGTERM to the launcher and reaps the engine and the shims.
+    init: true
+    # SIGTERM makes the supervisor quit its engine (10 s), then signal it (5 s more).
+    stop_grace_period: 30s
+    volumes:
+      # This box's part of the model (prepare fills it, ~90 GB at TP=4). Unset, a named volume. Set GR8_CACHE to a
+      # host directory, owned by uid 1000, to keep it outside docker.
+      - ${GR8_CACHE:-cache}:/var/lib/gr8/cache
+      # Logs and state: out/ (supervisor.log, g6m4.r<N>.err, shim.log, front.log, gr8.state), and the S2 request
+      # directory. Unset, a named volume.
+      - ${GR8_HOME:-home}:/var/lib/gr8/home
+    healthcheck:
+      # Healthy once this box's supervisor reports the cluster serving. A boot reads ~80 GB, so allow it time.
+      test: ["CMD", "python3", "-c", "import json,sys; sys.exit(json.load(open('/var/lib/gr8/home/out/gr8.state'))['state'] != 'serving')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30m
+    # `gr8 glm53 down` exits 0 on every box, and the cluster stays down. Any other exit restarts the container: a failed
+    # rank (1) rejoins, and a refused handshake (4) or bad options (2) retry, with docker's delay doubling up to a
+    # minute, until the boxes agree.
+    restart: on-failure
+
+volumes:
+  cache:
+  home:

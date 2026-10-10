@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-10: Docker: one compose file for every box
+
+- `docker/compose.yaml` runs the launcher in the image on every box (`docker compose -f docker/compose.yaml up -d`),
+  with its options from `docker/.env`. The image's entrypoint is `./gr8 glm53`, so `prepare`, `status`, `smoke` and
+  `down` are `docker compose run` or `exec` away. The launcher in the image owns every default.
+- The container runs as uid 1000 on a read-only image with a private `/tmp`, every capability dropped but `IPC_LOCK`,
+  no new privileges, no core dumps and `oom_score_adj 1000`. Its state is two volumes: the model cache and `G6_HOME`.
+  With no ssh at TP=4 and TP=3, it needs no ssh keys and no host paths.
+- `restart: on-failure`: a cluster-wide `down` exits 0 everywhere and stays down. When a rank fails, every box now
+  exits 1 (the head's `down` says it is a failure), so every container restarts and the boxes boot again together.
+  Before, the workers the head stopped exited 0.
+- The runtime image has `jq`, which `./gr8 glm53 smoke` needs. Based on OsakaTX's `docker/gr8` (#10).
+
 ## 2026-10-10: TP=4 and TP=3 need no ssh between the boxes
 
 - The head engine sends each request's bytes to the other ranks over its S2 control links, in a `Request` frame just

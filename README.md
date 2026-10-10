@@ -67,7 +67,8 @@ MTP k=2 at temperature 0.7, one test window on one cluster.
       sysctl -w vm.compaction_proactiveness=0
 
 - To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev, cargo, and Python 3. The
-  stock DGX OS (Ubuntu 24.04) has all of them except cargo.
+  stock DGX OS (Ubuntu 24.04) has all of them except cargo. Or, in place of all of these, Docker with the NVIDIA
+  container toolkit (DGX OS has both): see [In Docker](#in-docker).
 
 ## Quick start
 
@@ -94,6 +95,18 @@ on each.
 The first `up` downloads this box's part: about 35 minutes at 40 MB/s. To download ahead of time, run `./gr8 glm53
 prepare` with the same options. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
 downloads the drafter and converts its own rank.
+
+### In Docker
+
+Nothing to build: CI publishes the image, `ghcr.io/kindlingai/gr8`. On every box, with the NVIDIA container toolkit:
+
+    git clone https://github.com/kindlingai/gr8 && cd gr8
+    cp docker/.env.example docker/.env        # set MODEL, DRAFTER and PEERS: the same file on every box
+    docker compose -f docker/compose.yaml run --rm gr8 prepare
+    docker compose -f docker/compose.yaml up -d
+
+Then `docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 status` (or `smoke`, or `down` to stop every
+box). [docker/README.md](docker/README.md) has the settings and what the container gets.
 
 ## Running it
 

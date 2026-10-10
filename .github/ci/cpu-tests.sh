@@ -42,6 +42,10 @@ python3 tools/s2_costfit.py --selftest
 (cd frontend && python3 -m unittest tests.test_s2shim tests.test_parser)
 # the launch: options, model sets, the handshake, mentat, and four supervisors end to end on 127.0.0.1-4
 python3 -m unittest discover -s tools/launch
+# the container's compose file and entrypoint
+if docker compose version > /dev/null 2>&1; then docker compose -f docker/compose.yaml config -q
+else echo "(no docker compose here: compose.yaml not checked)"; fi
+bash -n docker/entrypoint.sh
 
 step "Rust: engine/loader-rs"
 cargo test --locked --manifest-path engine/loader-rs/Cargo.toml
