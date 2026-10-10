@@ -94,9 +94,16 @@ class EngineTests(unittest.TestCase):
                                           'PYTHONPATH': '/p', 'LD_LIBRARY_PATH': '/usr/lib'}):
             env = s.engine_env(plan)
         self.assertEqual((env['G6_PF_TILE'], env['G6_X'], env['CUDA_VISIBLE_DEVICES']), ('64', 'a=b', '0'))
-        self.assertEqual(env['LD_LIBRARY_PATH'], os.path.join(s.home, 'bin', 'lib'))      # TP=4, as launch_s2.sh
+        self.assertEqual(env['LD_LIBRARY_PATH'], '/usr/lib')                               # no bin/lib: the box's own
         self.assertNotIn('SECRET_TOKEN', env)
         self.assertNotIn('PYTHONPATH', env)
+
+    def test_a_bundled_cublas_is_used_at_every_tp(self):
+        for tp in (3, 4):
+            s = supervisor('--tp', str(tp), members=MEMBERS[:tp])
+            os.makedirs(os.path.join(s.home, 'bin', 'lib'))
+            with mock.patch.dict(os.environ, {'LD_LIBRARY_PATH': '/usr/lib'}):
+                self.assertEqual(s.engine_env({'env': [], 'args': []})['LD_LIBRARY_PATH'], os.path.join(s.home, 'bin', 'lib'))
 
     def test_g6_variables_in_the_environment_are_refused_by_name(self):
         o = opt.parse(['--no-config', '--peers', ','.join(MEMBERS)], {'G6_S2_TIMEOUT': '300', 'G6_HOME': '/h',

@@ -548,8 +548,9 @@ class Supervisor:
         """The plan's variables over an allowlist of this process's environment."""
         env = {k: v for k, v in os.environ.items() if k in ENGINE_ENV_KEEP or k.startswith(ENGINE_ENV_PREFIXES)}
         env.update(kv.split('=', 1) for kv in plan['env'] if '=' in kv)
-        if self.o.get('TP') == '4':   # as launch_s2.sh: cuBLAS from build.sh BUNDLE_LIBS=1
-            env['LD_LIBRARY_PATH'] = os.path.join(self.home, 'bin', 'lib')
+        lib = os.path.join(self.home, 'bin', 'lib')
+        if os.path.isdir(lib):        # cuBLAS from build.sh BUNDLE_LIBS=1, at any TP
+            env['LD_LIBRARY_PATH'] = lib
         return env
 
     # ---- after the handshake --------------------------------------------------------------------------------------
