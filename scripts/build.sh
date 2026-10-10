@@ -46,6 +46,9 @@ nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o
 # TR3 / exlr8-e4m3 decode unit test (#19); runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
   "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" -lcublas
+# dense trellis matrices (#116): build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG \
+  -I "$REPO/engine/kernels" -o "$OUT/dtr_test" "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas
 if nvidia-smi -L > /dev/null 2>&1; then
   t=$("$OUT/tr3_e4m3_test") || { echo "$t"; echo "tr3_e4m3_test FAILED"; exit 1; }
   echo "tr3_e4m3_test: $(echo "$t" | tail -1)"

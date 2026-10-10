@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-10: dense trellis kernels for the exlr8 dense weights (#116, not wired)
+
+- `engine/kernels/dtr.cuh`: decode GEMV for the release's trellis K4 dense matrices (q_b, o_proj, the dense MLP of
+  layers 0-2) on the release's entries as stored. One launch per matrix rotates its input in a prologue and reduces
+  in fp32. The MLP's gate and up run as one launch whose epilogue writes down's rotated input. `dtr_prefill.cuh` runs
+  prefill on an FP8 copy of the tiles (exact: the codebook is E4M3) with today's MXFP8 GEMMs inside the rotations.
+- `engine/kernels/tests/dtr_test.cu` + `engine/ref/dtr_ref.py`: checks against `loader/exlr8.py` on the release's
+  files and times decode against today's GEMVs. On one GB10 at 2200 MHz, TP4 rank shapes, M = 1/3/8: q_b 0.53-0.57x
+  of today's MXFP8 time, o_proj 0.90-0.95x of int4 g32, the dense MLP 0.62-0.68x of the int4 K1 path.
+- The engine does not call them yet: the loader's tensors (`LLLL.NAME.trellis/.suh/.svh`, `dtr::layer_mats`) come next.
+
 ## 2026-10-10: a decoder for the exlr8 dense and vocabulary files (#116, step 1, part 1)
 
 - `engine/loader-rs/src/exlr8.rs` decodes the exlr8 v2 release's `dense/exlr8-dense-LLL` and `dense/exlr8-vocab`
