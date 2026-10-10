@@ -50,7 +50,7 @@ manifest instead.
 | `QP_EARLY` | 1 | – | – | `PF_OWN=4`: send the counterpart's partial before the own rows' o_proj |
 | `PACKS` | `packs` | – | – | where the rank packs are, relative to `G6_HOME` or absolute |
 | `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
-| `VARIANT` (`--variant`) | `home` | `home` | `home` | the exlr8 v2 width manifest: `home` (3.25 bpw routed experts), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). Without `V2`, only `home` |
+| `VARIANT` (`--variant`) | `home` | `home` | `down1` | the exlr8 v2 width manifest: `home` (3.25 bpw routed experts), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). Without `V2`, only `home` |
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |

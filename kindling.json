@@ -1,36 +1,104 @@
 {
   "version": 1,
   "title": "GLM-5.3",
-  "variant": "EXL3 3.25 bpw experts",
-  "summary": "Full GLM 5.3 on g6, a from-scratch CUDA engine with no vLLM, PyTorch or NCCL at serve time. Up to 8 requests decode at once at TP=4, with DFlash2 or MTP drafting chosen each round for a request that runs alone, pair-owner QO prefill attention and context-parallel KV.",
-  "model": "davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw",
+  "variant": "exlr8 experts: home (3.25 bpw) at TP=4 and TP=6, down1 (2.25 bpw) at TP=3",
+  "summary": "Full GLM 5.3 on g6, a from-scratch CUDA engine with no vLLM, PyTorch or NCCL at serve time. Up to 8 requests decode at once, with DFlash2 or MTP drafting chosen each round at TP=4, prefix reuse, and context-parallel KV. Boots from one Hugging Face release.",
+  "model": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
   "hardware": "DGX Spark (GB10)",
-  "stack": ["g6", "DFlash2", "RoCE"],
+  "stack": [
+    "g6",
+    "DFlash2",
+    "RoCE"
+  ],
   "default_config": "tp4",
   "configs": [
     {
       "id": "tp4",
       "label": "TP=4",
       "nodes": 4,
-      "decode": { "code": 49.4, "prose": 30.1 },
-      "prefill": [ { "context": 8192, "tps": 1278 } ],
-      "concurrency": [ { "streams": 2, "aggregate_tps": 50.6 }, { "streams": 4, "aggregate_tps": 62.7 } ],
+      "decode": {
+        "code": 49.3,
+        "prose": 30.0
+      },
+      "prefill": [
+        {
+          "context": 8192,
+          "tps": 1374
+        }
+      ],
+      "concurrency": [
+        {
+          "streams": 2,
+          "aggregate_tps": 50.8
+        },
+        {
+          "streams": 4,
+          "aggregate_tps": 64.0
+        }
+      ],
       "max_context": 393216,
       "kv_pool_tokens": 393216,
       "max_concurrent": 8,
-      "quality": [ { "name": "Exactness", "value": "each request byte-identical to running alone" } ],
-      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz. Structured output is not reported: it measures predictable output, not agent speed."
+      "quality": [
+        {
+          "name": "Exactness",
+          "value": "each request byte-identical to running alone"
+        }
+      ],
+      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. Code varies between boots (41.5 to 49.3 on one build). Structured output is not reported: it measures predictable output, not agent speed."
+    },
+    {
+      "id": "tp3",
+      "label": "TP=3",
+      "nodes": 3,
+      "decode": {
+        "code": 36.9,
+        "prose": 28.4
+      },
+      "prefill": [
+        {
+          "context": 8192,
+          "tps": 648
+        }
+      ],
+      "concurrency": [
+        {
+          "streams": 2,
+          "aggregate_tps": 46.1
+        },
+        {
+          "streams": 4,
+          "aggregate_tps": 58.3
+        }
+      ],
+      "max_context": 307200,
+      "kv_pool_tokens": 307200,
+      "max_concurrent": 8,
+      "quality": [
+        {
+          "name": "Exactness",
+          "value": "each request byte-identical to running alone"
+        }
+      ],
+      "notes": "down1 experts (about 2.25 bpw), MTP only. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release."
     },
     {
       "id": "tp6",
       "label": "TP=6",
       "nodes": 6,
-      "decode": { "prose": 36.9 },
-      "prefill": [ { "context": 8192, "tps": 1942 } ],
+      "decode": {
+        "prose": 36.9
+      },
+      "prefill": [
+        {
+          "context": 8192,
+          "tps": 1942
+        }
+      ],
       "max_context": 614400,
       "kv_pool_tokens": 614400,
-      "max_concurrent": 1,
-      "notes": "One request at a time. Prose decode with MTP k=2 at temperature 0.7, one test window on one cluster; not RigMark."
+      "max_concurrent": 8,
+      "notes": "Prefill and prose decode measured on the one-request loop before TP=6 moved to S2: MTP k=2 at temperature 0.7, one test window on one cluster; not RigMark."
     }
   ]
 }
