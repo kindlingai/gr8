@@ -27,9 +27,14 @@ __device__ __forceinline__ u64 ld_nc64(const void* p)
     return v;
 }
 
-// L2 warm-up: one 4-byte load per 64 B line of [p, p + 64 * nlines), results dropped. For weights whose kernel runs
-// after a wait (a collective): launched before the wait, the read moves into the idle time and the kernel then finds
-// the bytes in the GPU L2 (24 MB on the GB10) instead of DRAM. Changes no result. grid = ceil(nlines / 2048), block 256.
+// L2 warm-up: one prefetch.global.L2 per 64 B line of [p, p + 64 * nlines). grid = ceil(nlines / 2048), block 256.
+// The old body (ld_nc, result unused) compiled to LDC + EXIT,
+// 0 loads, so G6_WARM was a no-op. prefetch.global.L2 is asm volatile with a memory side effect, so it is kept from DCE
+// (SASS: 8x CCTL.E.PF2); it moves whole 64 B lines (both sectors) into the GPU L2 and writes no register or memory.
+// Changes no result. Measured: -9.6..-9.9 us/layer router window = 0.73-0.75 ms/step @M12 true-cold, ONLY when hidden.
+// Use: issue the warm about ONE LAYER AHEAD of the kernel that reads the bytes, so it completes before that
+// window. Not in the same window (in-stream unhidden: +5 us/layer hot, fresh 52.7 vs 45 us = loss) and not merely
+// concurrent on a side stream with the collective wait (only -3.4 us fresh, +2.7 us every hot step = net ~0).
 __global__ void __launch_bounds__(256) k_warm(const uint8_t* p, long long nlines)
 {
     const long long t = blockIdx.x * 256ll + threadIdx.x;
@@ -37,7 +42,7 @@ __global__ void __launch_bounds__(256) k_warm(const uint8_t* p, long long nlines
     for (int u = 0; u < 8; ++u)
     {
         const long long i = t * 8 + u;
-        if (i < nlines) ld_nc(p + i * 64);
+        if (i < nlines) asm volatile("prefetch.global.L2 [%0];" :: "l"(p + i * 64) : "memory");
     }
 }
 inline void launch_warm(const void* p, size_t bytes, cudaStream_t st)
