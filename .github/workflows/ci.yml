@@ -1,17 +1,19 @@
-# CPU tests, the arm64 engine build, the tester zip and the container image. The outputs are workflow artifacts only
-# (the binaries and the zip). The container image stays on the runner.
+# CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
+# ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# The engine and container jobs run on a native arm64 runner, GR8_ARM_RUNNER (a repository variable) or
-# ubuntu-24.04-arm. On an x86 runner they fall back to QEMU emulation. QEMU works but is many times slower.
-# GR8_NATIVE=1 (a repository variable) builds the engine on the runner itself, for a self-hosted runner that has the
-# CUDA 13 toolchain and no Docker daemon; the container job then does not run. A pull request from a branch in this
-# repository also builds the engine, for every TP. One from a fork runs the CPU tests only, so its code never runs on
-# the self-hosted runner.
+# The Rust binaries (the loader and the front end) build on GitHub's hosted arm64 runner, for every pull request,
+# forks included. The engine job runs on GR8_ARM_RUNNER (a repository variable, default ubuntu-24.04-arm). GR8_NATIVE=1
+# (a repository variable) builds the engines on the runner itself, for a self-hosted runner with the CUDA 13 toolchain
+# and no Docker daemon, linking the Rust job's loader. A pull request from a branch in this repository also builds the
+# engines and the image. One from a fork runs the CPU tests and the Rust build only, so its code never runs on the
+# self-hosted runner. The image job assembles the runtime image from the engine job's binaries on a hosted runner, and
+# only it can write packages.
 name: ci
 
 on:
   push:
     branches: [main]
+    tags: ['v*', 'beta-*']
   pull_request:
   workflow_dispatch:
 
@@ -47,20 +49,54 @@ jobs:
       - name: Tests
         run: .github/ci/cpu-tests.sh
 
+  rust:
+    name: Rust binaries (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - name: Build the loader and the front end (Dockerfile target rust-dist)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          target: rust-dist
+          platforms: linux/arm64
+          outputs: type=local,dest=rust-dist
+          cache-from: type=gha,scope=rust
+          cache-to: type=gha,scope=rust,mode=max
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: rust-bin-arm64
+          path: rust-dist/
+          retention-days: 7
+          if-no-files-found: error
+
   engine:
     name: Engine build (arm64, CUDA 13, sm_121a)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: rust
     runs-on: ${{ vars.GR8_ARM_RUNNER || 'ubuntu-24.04-arm' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        if: vars.GR8_NATIVE == '1'
+        with:
+          name: rust-bin-arm64
+          path: rust-dist
       - name: Build the binaries on the runner (GR8_NATIVE)
         if: vars.GR8_NATIVE == '1'
-        # the Dockerfile's dist stage, without Docker: loader, front end, then the TP=4, TP=6 and TP=3 engines
+        # the Dockerfile's dist stage, without Docker: the TP=4, TP=6 and TP=3 engines, linking the Rust job's loader.
+        # build.sh runs cargo whenever it finds it, which would rebuild the loader, so cargo is off the PATH here.
         run: |
           set -eux
-          cargo build --release --quiet --manifest-path engine/loader-rs/Cargo.toml
-          scripts/build_front.sh "$PWD/build-front"
+          mkdir -p engine/loader-rs/target/release
+          cp rust-dist/libg6load.a engine/loader-rs/target/release/
+          install -m 755 rust-dist/g6load engine/loader-rs/target/release/
+          PATH=$(printf %s "$PATH" | tr ':' '\n' | grep -v cargo | paste -sd: -)
+          if command -v cargo; then echo "cargo is still on the PATH"; exit 1; fi
+          mkdir -p build-front && install -m 755 rust-dist/g6front-rs build-front/
           G6_NR=4 scripts/build.sh "$PWD/build-tp4"
           scripts/build.sh "$PWD/build-tp6"
           G6_NR=3 scripts/build.sh "$PWD/build-tp3"
@@ -128,44 +164,86 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-  container:
-    name: Container build (linux/arm64, not pushed)
-    # runs after the engine job and reads the builder stages from its cache
-    needs: engine
-    if: github.event_name != 'pull_request' && vars.GR8_NATIVE != '1'
-    runs-on: ${{ vars.GR8_ARM_RUNNER || 'ubuntu-24.04-arm' }}
-    timeout-minutes: 120
+  image:
+    name: Container image (linux/arm64)
+    # The runtime image around the engine job's binaries: the Dockerfile's dist stage is replaced by them (a named build
+    # context), so nothing is compiled here. Pushed to ghcr.io from main and from tags, never from a pull request.
+    needs: [cpu, engine]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      PUSH: ${{ github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: engine-bin-arm64
+          path: ${{ runner.temp }}/dist
+      - name: Restore the executable bits (artifacts drop them)
+        run: find "$RUNNER_TEMP/dist" -type f ! -name '*.a' -exec chmod 755 {} +
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
-      - name: QEMU (x86 runner only)
-        if: runner.arch != 'ARM64'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3.7.0
-        with:
-          platforms: arm64
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # latest and main follow main; a tag gets its own name; every image also gets sha-<commit>
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
       - name: Build the runtime image
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
           target: runtime
           platforms: linux/arm64
-          tags: gr8:ci
-          push: false
+          build-contexts: dist=${{ runner.temp }}/dist
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           load: true
-          cache-from: type=gha,scope=gr8
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,scope=runtime,mode=max
       - name: Smoke test (no GPU)
         run: |
-          docker image ls gr8:ci
-          docker run --rm --entrypoint bash gr8:ci -c '
+          img=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          docker image ls "$img"
+          docker run --rm --entrypoint bash "$img" -c '
             set -eu
-            for b in bin/g6m4 bin/m4sim bin/gpuprobe bin/g6front-rs bin/g6load bin6/g6m4 bin6/m4sim; do
+            for b in bin/g6m4 bin/m4sim bin/gpuprobe bin/g6front-rs bin/g6load bin3/g6m4 bin6/g6m4 bin6/m4sim; do
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
             done
             python3 -c "import g6s2shim, g6shim"
             python3 -c "import tools.convert.convert, tools.convert.dflash2"
             bin/g6front-rs --help > /dev/null
             echo smoke OK'
+          docker run --rm "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4 \
+            --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
+      - name: Push
+        id: push
+        if: env.PUSH == 'true'
+        run: |
+          for t in ${{ steps.meta.outputs.tags }}; do docker push "$t"; done
+          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$(echo "${{ steps.meta.outputs.tags }}" | head -1)" | cut -d@ -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: env.PUSH == 'true'
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

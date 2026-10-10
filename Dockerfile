@@ -64,6 +64,11 @@ RUN scripts/build.sh /out/bin6
 FROM engine-src AS engine-tp3
 RUN G6_NR=3 scripts/build.sh /out/bin3
 
+# rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a
+FROM scratch AS rust-dist
+COPY --from=loader /out/libg6load.a /out/g6load /
+COPY --from=front /out/g6front-rs /
+
 # dist holds the shipped binaries: bin/ is TP=4, bin6/ is TP=6 and bin3/ is TP=3. g6load (the Hugging Face fetch's
 # planner and checker) goes in both. build.sh's CPU test binaries
 # and objects stay behind. tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
