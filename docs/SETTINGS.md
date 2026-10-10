@@ -71,6 +71,7 @@ the short version.
 | `G6_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
 | `G6_DTR` | 1 | the dense trellis matrices of the exlr8 release form (q_b, o_proj, the dense MLP of layers 0-2; `engine/kernels/dtr.cuh`) where a layer has them: decode on the trellis tiles, prefill on the o_proj tiles and on exact FP8 copies of q_b and the dense MLP (made at load). 0 = the int4 / MXFP8 records, which the layer must then have (A/B) |
 | `G6_DTR_PF_COPY` | 0 | 1 = o_proj prefill on an FP8 copy of its tiles too, as q_b and the MLP (about 25 MB more per layer at TP4; A/B, same bits) |
+| `G6_MEM_MIN` | 8 | GiB of MemAvailable the boot must keep after the weights and each layer of the KV pool; under it the engine stops with a message instead of meeting the OOM killer |
 | `G6_PF_TR_BM` | 16 | row blocks per CTA of the prefill GEMM on trellis tiles (`k_gemm_tr`) for large launches: 16 (256 rows, 512 threads) or 8. Small launches take 4 |
 | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
 | `G6_S2_ADAPT` | 0 | `--s2`: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |

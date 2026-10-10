@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-10: TP=3 boots down1 by default; the engine stops short of the OOM killer
+
+- `--tp 3` with the exlr8 release picks `--variant down1` unless one is given. `home` puts 108.7 GB of weights on a
+  TP=3 rank, which leaves no room for the KV pool. `down1` at TP=3: 78.4 GB per rank, 15.6-17 GiB free at the default
+  CAP of 307200.
+- The engine reads MemAvailable after each layer of the KV pool and stops under `G6_MEM_MIN` (8 GiB) with a message
+  naming `--cap` and `--variant`. Before, the kernel's OOM killer ended the boot and took sshd and agents on the box
+  with it.
+
 ## 2026-10-10: o_proj prefill reads its trellis tiles (#116)
 
 - `bindp::k_gemm_tr` loads the raw K4 tiles of a dense trellis matrix (half the bytes of its FP8 copy) and decodes each

@@ -45,6 +45,32 @@ namespace g6rt
 #define G6RT_CK(x) do { cudaError_t e_ = (cudaError_t)(x); if (e_ != cudaSuccess) { fprintf(stderr, "CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(99); } } while (0)
 [[noreturn]] inline void die(const std::string& m) { fprintf(stderr, "g6: %s\n", m.c_str()); exit(2); }
 
+// GB10 memory is the host's: a boot that runs it out is killed by the OOM killer, along with whatever else it picks.
+// After the weights and the KV pool, the rest of the boot (CUDA graphs, prefill staging, the drafter) took 4-5 GiB at
+// TP=3 and 6-7.6 GiB at TP=4 with DFlash2; G6_MEM_MIN (GiB, default 8) is the floor. The KV pool is checked layer by
+// layer as it is allocated, so a box under the floor stops before the OOM killer acts, and says why.
+inline void check_headroom(int rank, int capacity, bool log)
+{
+    double gib = -1;
+    if (FILE* f = fopen("/proc/meminfo", "r"))
+    {
+        char line[128];
+        long kb;
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gib = kb / 1048576.0; break; }
+        fclose(f);
+    }
+    static const double need = getenv("G6_MEM_MIN") ? atof(getenv("G6_MEM_MIN")) : 8.0;
+    if (log) fprintf(stderr, "# rank %d: MemAvailable %.1f GiB after the weights and the KV pool\n", rank, gib);
+    if (gib >= 0 && gib < need)
+    {
+        char b[256];
+        snprintf(b, sizeof b, "rank %d: %.2f GiB left after the weights and part of a KV pool of %d tokens; the rest of the "
+                 "boot needs %.1f: lower --cap or use a smaller --variant", rank, gib, capacity, need);
+        die(b);
+    }
+}
+
 constexpr int NBK = 8;              // decode context buckets (graph form), at most
 constexpr int MX = G6_MX, QA = 2048, KVA = 576, IDXQ = 4096, IDXK = 128, IDXW = 32;
 static_assert(MX <= 32, "k_head_merge: one warp, one row per lane");
@@ -510,6 +536,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         else
 #endif
         G6RT_CK(g6_attn_bind_create_ext(&y.ab, &y.ap, rank, y.l, cap_ab, attn_rows, ATT_QT, st, m.dscratch, m.dscratch_bytes));
+        check_headroom(rank, capacity, false);
         y.attn_norm = (const __nv_bfloat16*)need(find, lname(y.l, "attn_norm"));
         y.mlp_norm = (const __nv_bfloat16*)need(find, lname(y.l, "mlp_norm"));
         y.q_a_norm = (const __nv_bfloat16*)need(find, lname(y.l, "q_a_norm"));
@@ -541,6 +568,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     size_t ab = 0;
     for (const Layer& y : m.layers) ab += y.ab.storage_bytes + y.ab.scratch_bytes;
     fprintf(stderr, "# rank %d: attention caches + scratch for %d layers at capacity %d: %.3f GB\n", rank, m.nl, capacity, ab / 1e9);
+    check_headroom(rank, capacity, true);
     if (m.dscratch)
     {
         size_t real = m.dscratch_bytes;

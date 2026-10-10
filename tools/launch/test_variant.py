@@ -42,6 +42,8 @@ class ResolveTests(unittest.TestCase):
             self.assertEqual((v.name, v.path), (name, os.path.join(where, f'exlr8-manifest-{name}.json')))
             self.assertEqual(len(v.sha256), 64)
         self.assertEqual(M.resolve_variant(None, self.v2, []).name, 'home')
+        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4)], ['down1', 'home'])
+        self.assertEqual(M.resolve_variant(None, None, [], 3).name, 'home')      # packs carry home only
         p = manifest(os.path.join(self.t, 'mine.json'), 'route-budget-80', 3)
         v = M.resolve_variant(p, self.v2, [])
         self.assertEqual((v.name, v.path), ('route-budget-80', p))

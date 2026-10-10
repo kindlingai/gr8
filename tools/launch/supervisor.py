@@ -134,7 +134,7 @@ def resolve_model(o, refresh=False, log=log):
         search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
                               release.dir if release else None) if d and os.path.isdir(d)]
         spec = o.get('VARIANT') or o.get('V2_WIDTHS')
-        variant = modelset.resolve_variant(spec, o.get('V2'), search)
+        variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
         return ms, variant, ''

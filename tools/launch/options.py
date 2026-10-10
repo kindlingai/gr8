@@ -67,7 +67,7 @@ KEYS = {
     'V2': ('box', None, 'exlr8 v2 width files directory'),
     'V2_SLICES': ('box', None, 'exlr8 v2 index slices'),
     'V2_WIDTHS': ('box', None, 'exlr8 v2 width manifest; --variant names one instead'),
-    'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default), down1, up1, or a width manifest path'),
+    'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default; down1 at TP=3), down1, up1, or a width manifest path'),
     'V2_DENSE': ('box', None, 'the exlr8 release directory whose dense/ files give every non-expert weight (no rank packs)'),
     'V2_DENSE_FORM': ('cluster', None, 'with V2_DENSE: trellis (the release\'s entries, the default) or rounded (MXFP8 / '
                                        'int4, the fallback)'),

@@ -234,6 +234,8 @@ def offers(ms, plan):
 
 # The exlr8 v2 variants a release ships, and their mean routed-expert bits per weight.
 VARIANTS = {'home': 3.25, 'down1': 2.25, 'up1': 4.0}
+# home's experts take 99.8 GB of a rank at TP=3, which leaves no room for the KV pool on a 128 GB box
+DEFAULT_VARIANT = {3: 'down1'}
 HALF_BYTES = {k: 384 * 8 * 32 * k for k in (2, 3, 4)}     # one 128-channel half of one projection (tools/convert/v2.py)
 
 
@@ -248,11 +250,11 @@ class Variant:
         return self.name + (f' ({self.path}, sha256 {self.sha256[:16]})' if self.path else '')
 
 
-def resolve_variant(spec, v2_dir, search):
-    """spec: home, down1, up1 or a manifest path (None: home). v2_dir: the V2 width files, or None for packs without
-    them. search: the directories that hold the model set; exlr8-manifest-<name>.json is looked for in each of them,
-    then in v2_dir, directly or under manifests/."""
-    name = spec or 'home'
+def resolve_variant(spec, v2_dir, search, tp=None):
+    """spec: home, down1, up1 or a manifest path (None: DEFAULT_VARIANT for tp when there are v2 widths, else home).
+    v2_dir: the V2 width files, or None for packs without them. search: the directories that hold the model set;
+    exlr8-manifest-<name>.json is looked for in each of them, then in v2_dir, directly or under manifests/."""
+    name = spec or (v2_dir and DEFAULT_VARIANT.get(tp)) or 'home'
     if not v2_dir:
         if name == 'home':
             return Variant('home')
