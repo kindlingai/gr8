@@ -1,4 +1,4 @@
-// #19 unit test of the trellis codebook decode. The decode path's exlr8-e4m3 decode (Tr3Lane<BITS, true>) is checked
+// Unit test of the trellis codebook decode. The decode path's exlr8-e4m3 decode (Tr3Lane<BITS, true>) is checked
 // against the prefill path's E4M3 rounding (bindp::tr3_b8) and a host reference. The TR3 decode (Tr3Lane<BITS, false>)
 // is checked against the same reference.
 //
@@ -148,7 +148,7 @@ static std::vector<uint8_t> read_file(const char* path)
 int main(int argc, char** argv)
 {
     int rc = 0;
-    rc |= run<2>(random_tiles(65536, 2, 0x2545F4914F6CDD1Dull), "random K2");     // exlr8 v2 K2 (#65)
+    rc |= run<2>(random_tiles(65536, 2, 0x2545F4914F6CDD1Dull), "random K2");     // exlr8 v2 K2
     rc |= run<3>(random_tiles(65536, 3, 0x9E3779B97F4A7C15ull), "random K3");
     rc |= run<4>(random_tiles(65536, 4, 0xD1B54A32D192ED03ull), "random K4");
     if (argc >= 3)

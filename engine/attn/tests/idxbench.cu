@@ -1,8 +1,8 @@
-// #31 decode indexer microbenchmark, one GPU. Times the decode index stages of one full-index layer (prep_index,
+// DEC_IDX31 decode indexer microbenchmark, one GPU. Times the decode index stages of one full-index layer (prep_index,
 // index_scores, the exact top-2048 select) for M rows at a live context L inside a graph bucket T, replicated (cp 0) or
 // as CP rank 0 of cp_nr, each stage captured in its own CUDA graph and replayed. Random index cache and queries.
 //   build (from engine/attn/tests): nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o idxbench idxbench.cu
-//   run: idxbench T L M cp_nr [reps] [ties]   one line: stage times in us per call (CP rank 0), exactness of the #31 path
+//   run: idxbench T L M cp_nr [reps] [ties]   one line: stage times in us per call (CP rank 0), exactness of the DEC_IDX31 path
 //        checked on every CP rank (one EXACT line per rank; exit 3 if any rank differs)
 //   ties = k > 0: index keys from k code values with one scale (many equal scores: the id tie-break is exercised)
 #include "../attn.cu"
@@ -73,7 +73,7 @@ int main(int argc,char** argv){
         CK(cudaStreamSynchronize(st));CK(cudaMemcpy(s0.data(),W.si,s0.size()*4,cudaMemcpyDeviceToHost));
         float tl=timed(st,R,[&]{CK(ga::select_index(a,in,W,0,M,st));});
         uint64_t h0=hash(i0);
-        // #31 path (index_scores_m + select_index31)
+        // DEC_IDX31 path (index_scores_m + select_index31)
         poison();timed(st,1,[&]{ga::prep_index<<<dim3(M,32),128,0,st>>>(in,0,W.iq,W.weights);});
         float ns=timed(st,R,[&]{ga::launch_index_scores_m(a,in,W,0,M,st);});
         CK(cudaStreamSynchronize(st));CK(cudaMemcpy(s1.data(),W.si,s1.size()*4,cudaMemcpyDeviceToHost));

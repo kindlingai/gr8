@@ -423,7 +423,7 @@ class SyntheticTest(unittest.TestCase):
         self.assertAlmostEqual(experts(0), 0.0)
         self.assertAlmostEqual(experts(1), 8.0)
         self.assertAlmostEqual(experts(6), 256 * (1 - (248 / 256) ** 6))
-        self.assertEqual(round(experts(12)), 81)   # about 81 distinct experts at 12 rows, 44-45 at 6 rows (issue #28)
+        self.assertEqual(round(experts(12)), 81)   # about 81 distinct experts at 12 rows, 44-45 at 6 rows
         self.assertIn(round(experts(6)), (44, 45))
 
 

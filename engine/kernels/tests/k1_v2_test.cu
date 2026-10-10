@@ -1,4 +1,4 @@
-// #65 decode MoE (K1) on one rank's expert pack: output dump for the NumPy reference (engine/ref/k1_v2_ref.py) and
+// exlr8 v2 decode MoE (K1) on one rank's expert pack: output dump for the NumPy reference (engine/ref/k1_v2_ref.py) and
 // step timing against the GB10 read floor. The pack needs a layer's tr3.* tensors only (tools/convert/v2.py writes
 // expert-only packs, and a full rank pack works too). The shared expert is a zero int4 record of the TP size's width
 // (its bytes are read, its output is zero), so the dumped output is the routed experts' rank partial.

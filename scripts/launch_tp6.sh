@@ -12,7 +12,7 @@
 #   G6ENV_X="A=1 B=2" extra engine env for every rank (see docs/SETTINGS.md)
 #   G6ARGS_X="--top 20" extra engine arguments for every rank (--top K prints the per-slice top-K lines for requests with logprobs)
 #   READY_TMO=900     seconds to wait for all six ranks to load
-#   FRONT=rs          front end: rs = g6front-rs (Rust, issue #15; the default, built by scripts/build_front.sh; without
+#   FRONT=rs          front end: rs = g6front-rs (Rust; the default, built by scripts/build_front.sh; without
 #                     it the launcher falls back to py), py = frontend/g6front (Python). Same flags, same API;
 #                     FRONT_BIN=path overrides $REPO/bin/g6front-rs
 #   RANK_HEALTH=0     skip the rank health probe (default: probe every rank first and refuse to boot, exit 3, with a named

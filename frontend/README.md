@@ -1,6 +1,10 @@
 # g6 front end
 
-This is an OpenAI/vLLM-compatible HTTP server that sits in front of the g6 engine. It talks to the engine over a Unix socket using the protocol in `../PROTOCOL.md`. It is pure asyncio and needs no torch or vLLM. It handles tokenization, the chat template, the GLM reasoning/tool parser, streaming and `/metrics`.
+An OpenAI/vLLM-compatible HTTP server in front of the g6 engine. It talks to the engine's shim over a Unix socket using
+the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
+streaming and `/metrics`. It comes in two implementations with the same flags and byte-identical responses
+(`tests/diff_fronts.py`): `g6front-rs/`, one static Rust binary, which `./gr8 glm53 up` runs; and `g6front/`, pure
+Python asyncio, the reference the tests compare against, which can still serve TP=6's one-request loop.
 
 ## Endpoints
 
@@ -12,17 +16,21 @@ This is an OpenAI/vLLM-compatible HTTP server that sits in front of the g6 engin
 - `GET /health`
 - `GET /metrics`
 
-## Install and run (on the rank-0 node)
+## Build and run (on the head)
+
+`./gr8 glm53 up` starts it. By hand, with the shim already listening on `--engine-sock`:
 
 ```bash
-# once: venv (~73 MB, no torch)
-python3 -m venv $G6_HOME/venv
-$G6_HOME/venv/bin/pip install --no-cache-dir -r frontend/requirements.txt
-
-# run (the shim must already be listening on --engine-sock; scripts/launch_tp6.sh does all of this)
-cd frontend && $G6_HOME/venv/bin/python -m g6front \
-  --model-dir <dir with tokenizer.json, tokenizer_config.json, chat_template.jinja, generation_config.json> \
+scripts/build_front.sh                 # -> bin/g6front-rs (rustup fetches the pinned toolchain on first build)
+bin/g6front-rs --model-dir <dir with tokenizer.json, tokenizer_config.json, chat_template.jinja, generation_config.json> \
   --engine-sock $G6_HOME/run/engine.sock --port 8100
+```
+
+The Python implementation instead:
+
+```bash
+python3 -m venv $G6_HOME/venv && $G6_HOME/venv/bin/pip install --no-cache-dir -r frontend/requirements.txt
+cd frontend && $G6_HOME/venv/bin/python -m g6front --model-dir <dir> --engine-sock $G6_HOME/run/engine.sock --port 8100
 ```
 
 On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 ms at 32K tokens.
@@ -53,17 +61,9 @@ Engine `metrics` frame → Prometheus names (the same names vLLM uses, so the ex
 | `spec.drafts` / `.draft_tokens` / `.accepted` | `vllm:spec_decode_num_drafts_total` / `_num_draft_tokens_total` / `_num_accepted_tokens_total` |
 | `spec.accepted_per_pos[i]` | `vllm:spec_decode_num_accepted_tokens_per_pos_total{position="i"}` |
 
-## Rust front end: g6front-rs (#15)
+## Rust front end: g6front-rs
 
-`g6front-rs/` is the same front end in Rust, one static binary. It takes the same flags and gives byte-identical
-responses (`tests/diff_fronts.py`). It uses less head-node memory and adds less time to TTFT. It speaks PROTOCOL.md
-to the same shim. Run it with `FRONT=rs scripts/launch_tp6.sh` (or `launch_tp4.sh`) after `scripts/build_front.sh`;
-the Python front end stays the default until the cluster gates of #15 have run.
-
-```bash
-scripts/build_front.sh                 # -> bin/g6front-rs (rustup fetches the pinned toolchain on first build)
-bin/g6front-rs --model-dir <dir> --engine-sock $G6_HOME/run/engine.sock --port 8100
-```
+It uses less head-node memory and adds less time to TTFT than the Python one.
 
 Extra flags (the rest are the Python ones):
 

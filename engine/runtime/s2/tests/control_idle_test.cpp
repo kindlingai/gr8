@@ -1,4 +1,4 @@
-// #26: a worker's event reader must survive a silent control link longer than the socket timeout,
+// A worker's event reader must survive a silent control link longer than the socket timeout,
 // while a frame that stalls mid-way still times out and a closed link still ends the reader.
 // Build: g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_idle_test.cpp -o /tmp/control_idle_test
 // Run:   /tmp/control_idle_test                      (socketpair cases; the silent-peer case is skipped)

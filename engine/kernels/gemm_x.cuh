@@ -1,4 +1,4 @@
-// Item 3c (SPEC §6 addendum): prefill GEMM with real memory traffic, one kernel per operand type.
+// Prefill GEMM with real memory traffic, one kernel per operand type.
 //   f16 / bf16  m16n8k16      fp8 e4m3  m16n8k32      nvfp4 (e2m1 + ue4m3 scale per 16 k)  m16n8k64
 //   tr3fp8: B decoded from TR3 tiles and rounded to e4m3 in registers, A = FP8 activations, m16n8k32.
 // Y[rows, N] (fp16) = X[rows, K] @ W[K, N] * alpha.  CTA = (128 output cols, <= MB*16 rows of one pool entry),

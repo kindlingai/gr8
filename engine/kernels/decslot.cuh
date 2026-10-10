@@ -1,4 +1,4 @@
-// DEC_SLOT (results/peak/decode/slot/PROPOSAL.md): a decode partial producer (o_proj gv_gemv, K1 finalize, dense fc2)
+// DEC_SLOT: a decode partial producer (o_proj gv_gemv, K1 finalize, dense fc2)
 // writes its BF16 partial straight into this rank's send slot of collective c and (DEC_SLOT >= 2) rings the doorbell
 // from its own epilogue, so k_put_publish (copy + publish) is not launched. The slot address comes from the device step
 // cell at run time, so one captured graph serves both slot parities. Only included under -DDEC_SLOT.

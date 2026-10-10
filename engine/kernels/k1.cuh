@@ -44,7 +44,7 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
 
 // ------------------------------------------------------------------ TR3 build
 // one fc1 unit of the slot's expert e at its width (tr3_unit). K2 = the layer has 2-bit units (bind::scan_widths):
-// only then is the K2 body compiled in. The K2 body makes K3 units about 3.5% slower at M = 5 (GB10, #65). Layers
+// only then is the K2 body compiled in. The K2 body makes K3 units about 3.5% slower at M = 5 (GB10). Layers
 // without 2-bit units therefore take the K3 / K4 kernels.
 template <bool E4, bool K2, bool BS = false>
 __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit, int e, int mask, u32* smem)
@@ -104,7 +104,7 @@ __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int
 
 // E4 = the layer's routed experts are exlr8-e4m3 (codebook rounded to E4M3, tr3.cuh tr3_cb2); K2 = it has 2-bit units;
 // SH = its shared expert is trellis row 256, run as one more slot, and its hidden-side vectors are in block-scale form
-// (tr3.sg, tr3.v1b, tr3.v3b; exlr8 v2, #65). The binder picks the instantiation
+// (tr3.sg, tr3.v1b, tr3.v3b; exlr8 v2). The binder picks the instantiation
 // per layer (bind::make_k1); E4 = K2 = SH = false is the TR3 kernel.
 template <bool E4 = false, bool K2 = false, bool SH = false>
 __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)

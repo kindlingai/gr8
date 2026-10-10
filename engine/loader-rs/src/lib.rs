@@ -331,7 +331,7 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
         if rank == 0 {
-            eprintln!("# rank 0: weights from the exlr8 release, by matrix (rounded = not the release's weights, #116):");
+            eprintln!("# rank 0: weights from the exlr8 release, by matrix (rounded = not the release's weights):");
             for line in table.lines() {
                 eprintln!("#   {line}");
             }

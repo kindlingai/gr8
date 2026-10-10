@@ -1,7 +1,8 @@
 #!/bin/bash
-# Multi-session (S2) boot of the TP4 engine on four Sparks: g6m4 --s2 (G6_NR=4 scripts/build.sh) serving up to SESS
-# concurrent sessions, driven by frontend/g6s2shim.py. Stop with scripts/stop.sh.
-#   SESS=8 scripts/launch_s2.sh        (scripts/launch_tp4.sh runs this)
+# Multi-session (S2) boot over ssh from the head (deprecated: ./gr8 glm53 up is the launcher): g6m4 --s2 on four or
+# three Sparks (G6_NR=4 or 3 scripts/build.sh) serving up to SESS concurrent sessions, driven by frontend/g6s2shim.py.
+# Stop with scripts/stop.sh.
+#   SESS=8 scripts/launch_s2.sh        (scripts/launch_tp4.sh and launch_tp3.sh run this)
 # Knobs (environment; KNOBS.md has all of them):
 #   SESS=8            most concurrent sessions (1..8); every reachable step graph is captured at boot (~2.5 GiB at 8)
 #   MTP=2             MTP draft count for sessions that share steps

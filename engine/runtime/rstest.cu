@@ -1,5 +1,5 @@
 // rstest: the vocab-split head kernels (glue.cuh) of all NR ranks on ONE GPU with a loopback fabric, for rejection
-// sampling (--spec-accept rejection, issue #55). Synthetic logits, 8 rows: row m (m < 7) carries a draft, the step's
+// sampling (--spec-accept rejection). Synthetic logits, 8 rows: row m (m < 7) carries a draft, the step's
 // input token of row m + 1 (as in a verify step); row 7 has none. Each seed is one step. Per mode:
 //   - the output token frequencies of every row against p (softmax of logit / T, the top_p nucleus with --top-p-cands)
 //     by chi-square, for the coupled kernels (today's) and the rejection kernels

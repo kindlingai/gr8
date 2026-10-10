@@ -1,4 +1,4 @@
-//! A rank's image straight from an existing pack and the exlr8 v2 files, planned at boot (#65): every base tensor is
+//! A rank's image straight from an existing pack and the exlr8 v2 files, planned at boot: every base tensor is
 //! read from the base pack, and each v2 layer's tr3.* tensors are built from the published per-rank index slices
 //! (tools/convert/v2slices.py) and the raw width files, at the widths a manifest picks. The tensors, their order and
 //! their bytes are those tools/convert/v2pack.py writes (and tools/convert/v2.py convert_experts_v2 for one rank).

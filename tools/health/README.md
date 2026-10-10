@@ -1,4 +1,4 @@
-# Rank health probe and boot admission (#29)
+# Rank health probe and boot admission
 
 A rank that is slow or broken makes the whole TP6 engine slow or wrong, and the cause is hard to see after the boot.
 The probe checks every rank **before** a boot and refuses it with a named reason. It only reads and measures: it changes
@@ -7,7 +7,7 @@ recovery is out of scope: the probe says what is wrong, a person fixes it.
 
 ```bash
 scripts/rank_health.sh [OUT_JSON]      # on the head, no model booted; exit 0 admitted, 3 refused
-scripts/launch_tp6.sh                  # runs the probe first; RANK_HEALTH=0 skips it
+./gr8 glm53 up                         # after the probe; the TP=6 ssh launcher runs it itself (RANK_HEALTH=0 skips it)
 python3 bench/gate/gate.py run ... --health $G6_HOME/out/rank_health.json     # stores the result in the run records
 python3 tools/health/rank_probe.py local --proxy-cpu 19 --rail-ips 10.0.1.1,10.0.2.1    # one node, JSON
 ```

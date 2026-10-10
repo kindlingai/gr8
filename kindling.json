@@ -97,8 +97,8 @@
       ],
       "max_context": 614400,
       "kv_pool_tokens": 614400,
-      "max_concurrent": 8,
-      "notes": "Prefill and prose decode measured on the one-request loop before TP=6 moved to S2: MTP k=2 at temperature 0.7, one test window on one cluster; not RigMark."
+      "max_concurrent": 1,
+      "notes": "One request at a time; TP=6 moves to the multi-session path next. Prefill and prose decode on that loop: MTP k=2 at temperature 0.7, one test window on one cluster; not RigMark."
     }
   ]
 }

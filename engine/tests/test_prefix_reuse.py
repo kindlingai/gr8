@@ -1,7 +1,7 @@
-"""K1REUSE CPU gate (port of the old-line tools/reuse/test_prefix.py, without its reuse_sim.cpp simulator).
+"""Prefix-reuse CPU gate.
 
-test_unit: engine/tests/test_prefix_reuse.cpp under ASan/UBSan (LCP / strict / NOEND / miss reasons / the W44 and
-  RGRID grid rules / prefill_rows replay).
+test_unit: engine/tests/test_prefix_reuse.cpp under ASan/UBSan (LCP / strict / NOEND / miss reasons / the grid rules /
+  prefill_rows replay).
 test_integration_order: the g6m4.cu hooks are where prefix_reuse.h's contract needs them (the simulator in the old
   line assumed this order; here it is asserted directly).
 """
@@ -32,7 +32,7 @@ class PrefixReuseTests(unittest.TestCase):
         self.assertIn('reuse.begin(sp.prompt, MP ? sp.first : (int)sp.prompt.size() - 1, mtp > 0)', s)
         self.assertIn('if (!serve.empty() || s2mode || reuse_prefix)', s)   # prompt-step row counts 1..chunk
         self.assertIn('for (int a = skip; a < p.first; a += MP)', s)
-        # RGRID: the reuse grid is ONE sub-batch (MP = --prefill = 4096 served), not 2 * MP (W44)
+        # the reuse grid is ONE sub-batch (MP = --prefill = 4096 served), not 2 * MP
         self.assertIn('reuse.grid = al_ == 1 ? MP : 0;', s)
         self.assertNotIn('2 * MP : MP', s)
         self.assertEqual(s.count('reuse.prefill_rows('), 2)       # both prefill branches (two lanes, one sub-batch)

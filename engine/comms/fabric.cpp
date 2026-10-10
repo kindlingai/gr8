@@ -1,4 +1,4 @@
-// g6 fabric implementation — see fabric.h and RUNTIME.md §3.
+// g6 fabric implementation (fabric.h).
 #include "fabric.h"
 #include "bulk_proxy.h"
 #include "progress_cpus.h"

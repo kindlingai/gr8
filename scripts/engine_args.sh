@@ -3,7 +3,7 @@
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 #   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP, and S2=1
-#                            for the multi-session engine (TP=4), else S2=0 (TP=6 and TP=3 serve one request at a time)
+#                            for the multi-session engine (TP=4 and TP=3), else S2=0 (TP=6 serves one request at a time)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words)
 #   engine_args R RANK_PACKS AUX_PACKS HOME [EPOCH]
 #                            prints the arguments that follow `--proxy-cpu N` for rank R. RANK_PACKS holds
@@ -45,7 +45,7 @@ G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}
 engine_args() {
   local r=$1 rp=$2 ap=$3 home=$4 epoch=${5:-0} a src="" df="" qo=""
   [ -n "${V2:-}" ] && src="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
-  # V2_DENSE: the image comes from the release alone (#116). It holds PF_OWN=3's full-head weights too, so the QO pack is
+  # V2_DENSE: the image comes from the release alone. It holds PF_OWN=3's full-head weights too, so the QO pack is
   # left out.
   [ -n "${V2_DENSE:-}" ] && src="$src --v2-dense $V2_DENSE ${V2_DENSE_FORM:+--v2-dense-form $V2_DENSE_FORM}"
   local dd=${DFLASH_DIR:-$ap}   # the drafter packs: with the other packs, or where the supervisor converted them

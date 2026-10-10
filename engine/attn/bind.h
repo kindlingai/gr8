@@ -47,7 +47,7 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding*, const G6AttnPack*, int ra
 // Decode scratch bytes a binding with these heads / capacity / max_rows / query_tile needs (0: invalid).
 extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile);
 #if defined(G6_CP) && G6_CP
-// J4 CP binding: storage for the replicated prefix (< cp_R tokens, multiple of 64) + this rank's tail pages
+// CP binding: storage for the replicated prefix (< cp_R tokens, multiple of 64) + this rank's tail pages
 // (page % cp_nr == rank); args.cp_nr / cp_rank set. rank = this rank (its head group per layer, as above).
 // ext_scratch / ext_bytes as g6_attn_bind_create_ext (nullptr, 0 = own scratch).
 extern "C" int g6_attn_bind_create_cp(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,

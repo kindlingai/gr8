@@ -2,9 +2,9 @@
 #
 #   docker buildx build --platform linux/arm64 -t gr8 .                         the runtime image
 #   docker buildx build --platform linux/arm64 --target dist -o type=local,dest=out .
-#                                                                              only the binaries, into out/bin and out/bin6
+#                                                                              only the binaries, into out/bin, bin3 and bin6
 #
-# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust pack loader) -> engine-tp4 and engine-tp6, with
+# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) -> engine-tp4, engine-tp6, engine-tp3, with
 # front (the Rust front end) beside them -> dist (the binaries only) -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU=ubuntu24.04

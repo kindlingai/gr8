@@ -1,4 +1,4 @@
-"""Routed-expert error of an EXL3 checkpoint (TR3 or exlr8-e4m3) against the BF16 originals, one layer, CPU only (#19).
+"""Routed-expert error of an EXL3 checkpoint (TR3 or exlr8-e4m3) against the BF16 originals, one layer, CPU only.
 
 python3 -m tools.convert.experr --bf16 DIR --ckpt NAME=DIR [--ckpt NAME=DIR ...] [--layer 40] [--experts 0,17,...]
         [--rows 64] [--seed 0]

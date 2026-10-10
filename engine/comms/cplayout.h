@@ -1,4 +1,4 @@
-// Variable slot layout for a fabric whose collectives differ in size and fan-out (J4 CP fabric `fabc`, BUILD-CPE.md).
+// Variable slot layout for a fabric whose collectives differ in size and fan-out (CP fabric `fabc`).
 // Shared by the RDMA proxy (fabric.cpp) and the one-GPU loopback (m4sim.cu), so both address the same bytes.
 //
 // Per collective c: cap[c] = max payload bytes; dst_k[c] = 0 -> every peer gets the payload (all-gather form),
@@ -78,7 +78,7 @@ struct VLayout
     }
 };
 
-// J4 CP decode collectives (DESIGN-CP §3, PLAN-S3 §1), numbered in GPU publish order (the proxy posts strictly in c
+// CP decode collectives, numbered in GPU publish order (the proxy posts strictly in c
 // order): per CP layer i, q(i) = q_abs all-gather, cand(i) = (score, pos) candidates all-gather (full-index layers only),
 // part(i, k) for k = 1..nr-1 = the partial (m, l, c) of head group (rank + k) % nr, single destination.
 // Capacities scale with mmax (the most verify rows a step may carry); a step with M rows sends M x row bytes.
@@ -94,7 +94,7 @@ struct CpColls
     void make(const std::vector<bool>& full, int nr_, int mmax_)
     {
         nr = nr_; nl = (int)full.size(); mmax = mmax_;
-        // rows sized for the WIDEST head group (NR=6: 11 of 11/11/11/11/10/10, SPEC §9; NR=4: 16), rounded to 16 B so
+        // rows sized for the WIDEST head group (NR=6: 11 of 11/11/11/11/10/10; NR=4: 16), rounded to 16 B so
         // every M x row is a whole number of uint4 (k_vdeliver / k_vput); a group with fewer heads sends fewer bytes,
         // the tail stays at M x row (the wire size)
         const int hpr = (HEADS + nr - 1) / nr;

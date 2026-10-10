@@ -2,10 +2,10 @@
 # Build the K1H2 engine (g6m4 = one rank on the real fabric, m4sim = one GPU simulating all NR ranks) on ONE Spark.
 # Needs CUDA 13 (nvcc with sm_121a), g++ with C++20, libibverbs-dev, cuBLAS. A few minutes on a GB10, CPU only.
 #   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin
-#   G6_NR=4 scripts/build.sh bin4         the TP4 engine (four Sparks, packs from build_packs.sh with the TP4 codes), with
-#                                         DEC_S2 (the multi-session path launch_tp4.sh runs) and PF_F12 (the fat-CTA prefill fc1)
+#   G6_NR=4 scripts/build.sh bin4         the TP4 engine, with DEC_S2 (the multi-session path) and PF_F12 (the fat-CTA
+#                                         prefill fc1); G6_NR=3 the TP3 engine, with DEC_S2; no G6_NR the TP6 engine
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
-#                                         without the CUDA toolkit (stage.sh copies it, launch_tp4.sh uses it)
+#                                         without the CUDA toolkit (the engine finds it there at any TP)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
 # (see docs/SETTINGS.md). Dropping one builds an older, slower or less-checked path, not a broken one.
 set -eu
@@ -38,20 +38,20 @@ fi
 strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
 md5sum "$OUT/g6m4" "$OUT/m4sim"
 export PATH=/usr/local/cuda/bin:$PATH
-# the adaptive draft length decision (#12), CPU
+# the adaptive draft length decision, CPU
 g++ -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
 t=$("$OUT/test_spec_len") || { echo "$t"; echo "test_spec_len FAILED"; exit 1; }
 echo "test_spec_len: $(echo "$t" | tail -1)"
-# the prefix-reuse state machine (--reuse-prefix, W44 / RGRID grid rules), CPU
+# the prefix-reuse state machine (--reuse-prefix and its grid rules), CPU
 g++ -O2 -std=c++17 -I "$REPO/engine/runtime" -o "$OUT/test_prefix_reuse" "$REPO/engine/tests/test_prefix_reuse.cpp"
 t=$("$OUT/test_prefix_reuse") || { echo "$t"; echo "test_prefix_reuse FAILED"; exit 1; }
 echo "test_prefix_reuse: $(echo "$t" | tail -1)"
 # gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py); stage.sh copies it to every node
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
-# TR3 / exlr8-e4m3 decode unit test (#19); runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
+# TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
   "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" -lcublas
-# dense trellis matrices (#116): build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
+# dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG \
   -I "$REPO/engine/kernels" -o "$OUT/dtr_test" "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas
 if nvidia-smi -L > /dev/null 2>&1; then

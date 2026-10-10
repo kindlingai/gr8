@@ -15,8 +15,8 @@ python3 bench/gate/gate.py baseline --topology tp6 --commit <main sha> --out ben
 python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp6.json
 ```
 
-`run` needs `--health FILE`, the rank health probe result of the boot (`scripts/rank_health.sh`, which `launch_tp6.sh` runs and
-writes to `$G6_HOME/out/rank_health.json`). It is stored in every record of the run as `rank_health`. A result older than
+`run` needs `--health FILE`, the rank health probe result of the boot (`scripts/rank_health.sh`, run it on the head before
+`./gr8 glm53 up`; it writes `$G6_HOME/out/rank_health.json`). It is stored in every record of the run as `rank_health`. A result older than
 `--health-max-age-min` (default 360) is refused, and `launch_tp6.sh` deletes the file when `RANK_HEALTH=0`, so a result
 from an earlier boot is not reused. A boot the probe refused is not measured unless `--allow-unhealthy`. `--no-health` measures
 without a result. `baseline` and `check` refuse any record that has no admitted probe result (`--no-health`,
@@ -54,7 +54,7 @@ setting are kept. One request per prompt, `--prompt-set-tokens` (default 512) at
 Numbers are named `set.<name>.<kind>.decode_tok_s` and `set.<name>.<kind>.tokens_per_step` (drafter counters over that
 kind only), so every number says which set it comes from; `work.*` and `spec.*` are always the harness's own workloads.
 The record keeps the file's sha256. The part is off unless `--prompt-set` is given, and it is not in the gate set of
-issue #1; a baseline built from runs with it gates these metrics like any other.
+the gate set; a baseline built from runs with it gates these metrics like any other.
 
 ## Gates
 
@@ -68,7 +68,7 @@ issue #1; a baseline built from runs with it gates these metrics like any other.
   baseline median by more than `max(--noise, the baseline's boot-to-boot spread)` (`--noise` defaults to 3%, g6's own
   single-boot decode noise). Shown, not gated: KL p95 and top-1, and the long-prompt decode tok/s (one request's decode
   varies with its text; the workloads gate decode).
-- **Result line:** `RESULT: PASS` only when the whole gate set of issue #1 (default sizes) is in the baseline and in the run, nothing
+- **Result line:** `RESULT: PASS` only when the whole gate set (default sizes) is in the baseline and in the run, nothing
   failed, and `kl.mean` had a threshold. Otherwise `FAIL` (a gate failed, or a metric is missing from the run) or
   `PARTIAL` (nothing failed, but part of the set is not in the baseline, or no KL threshold yet). `PARTIAL` exits 1
   unless `--allow-partial`; the table still says PARTIAL.

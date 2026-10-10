@@ -85,7 +85,7 @@ __global__ void __launch_bounds__(128) k_deliver(Loop a)
     else copy(0, a.n16);
 }
 
-// gate B noise floor (G6_PERTURB): resid[row][j] *= 1 + eps * u(pos, j), u uniform in [-1, 1) from an integer hash
+// noise floor (G6_PERTURB): resid[row][j] *= 1 + eps * u(pos, j), u uniform in [-1, 1) from an integer hash
 __global__ void k_perturb(float* resid, const int* pos, float eps)
 {
     const int row = blockIdx.x;
@@ -245,7 +245,7 @@ int main(int argc, char** argv)
     }
     const int NL = (int)layers.size(), NC = 2 * NL + 1;
 #if defined(G6_CP) && G6_CP
-    // J4 CP (BUILD-CPE): G6_CP=0|1 (default 1 in a CP build), G6_CP_R (replicated prefix tokens, multiple of 64, default 0),
+    // CP: G6_CP=0|1 (default 1 in a CP build), G6_CP_R (replicated prefix tokens, multiple of 64, default 0),
     // G6_CP_S3=0|1 (default 1), G6_CP_MMAX (CP fabric rows, default = the most rows of any step)
     const bool cp_on = !getenv("G6_CP") || atoi(getenv("G6_CP")) != 0;
     const int cp_R = getenv("G6_CP_R") ? atoi(getenv("G6_CP_R")) : 0;
@@ -596,7 +596,7 @@ int main(int argc, char** argv)
 #else
     auto attn_all = [&](int i, int M, int context) { for (Model& m : R) launch_attn_block(m, i, M, context, st); };
 #endif
-    // gate B triage: G6_RESID_DUMP=FILE — rank 0's residual stream after the embedding and after every consume c
+    // triage: G6_RESID_DUMP=FILE — rank 0's residual stream after the embedding and after every consume c
     // (slot c + 1: 2i = after layer i's attention, 2i + 1 = after its MLP), per main step: int32 s, M, slots, HID, then
     // slots x M x HID float32. tools/cp/gateB_layers.py compares two dumps per sublayer.
     const bool rd_on = getenv("G6_RESID_DUMP") != nullptr;
@@ -605,7 +605,7 @@ int main(int argc, char** argv)
     auto rd_copy = [&](int slot, int M) {
         if (rdump) G6RT_CK(cudaMemcpyAsync(rdump + (size_t)slot * MX * HID, R[0].resid, (size_t)M * HID * 4, cudaMemcpyDeviceToDevice, st));
     };
-    // gate B noise floor: G6_PERTURB=eps (replicated runs): after layer 0's attention consume, every rank's residual
+    // noise floor: G6_PERTURB=eps (replicated runs): after layer 0's attention consume, every rank's residual
     // x *= 1 + eps * u, u in [-1, 1) from a hash of (position row, element) — the same on every rank, deterministic.
     const float perturb = getenv("G6_PERTURB") ? (float)atof(getenv("G6_PERTURB")) : 0.f;
     // one step of the six ranks, M rows, in stream order
@@ -859,7 +859,7 @@ int main(int argc, char** argv)
         return ms;
     };
     // prints rank 0's line of a step (prefix replaces "step"), counts ranks that differ; returns the last row's token
-    // gate B (BUILD-CPE): G6_LOGIT_DUMP=FILE appends, per main step s >= G6_LOGIT_DUMP_FROM (default 0): int32 s, int32 M,
+    // G6_LOGIT_DUMP=FILE appends, per main step s >= G6_LOGIT_DUMP_FROM (default 0): int32 s, int32 M,
     // then per rank int32 vn + M x vn float32 head logits (its vocab slice). tools/cp/gateB.py compares two dumps.
     FILE* ldump = getenv("G6_LOGIT_DUMP") ? fopen(getenv("G6_LOGIT_DUMP"), "wb") : nullptr;
     if (getenv("G6_LOGIT_DUMP") && !ldump) die("G6_LOGIT_DUMP: cannot open the file");
@@ -975,7 +975,7 @@ int main(int argc, char** argv)
                 h.src0[j] = mrow0[h.sess[j]];
                 if (h.ctx[j] > s2m.pages[h.sess[j]] * 64) die("s2: session context past its run (G6_S2_RUNS grant)");   // caller's grant check
             }
-            std::string key = sp.key();   // kind + M; until attention is layout-free (graft/28-s2-attn) the per-session layout stays in this driver's key
+            std::string key = sp.key();   // kind + M; until attention is layout-free the per-session layout stays in this driver's key
             for (int j = 0; j < h.ns; ++j) key += ":" + std::to_string(h.sess[j]) + "x" + std::to_string(h.rows[j]);
             auto set = [&](Model& m, bool first) {
                 m.s2->h = h;
@@ -1319,7 +1319,7 @@ int main(int argc, char** argv)
             pf_resdump(PF[0], M, q, a);
             fprintf(stderr, "# seq %zu prefill %d rows: %.3f ms for the six ranks in turn\n", q, M, ms);
         }
-        // G6_KV_HASH=1 (measurement, after the prefill; BUILD-CPE step 4 gate): per layer, FNV of the stored latent record of
+        // G6_KV_HASH=1 (measurement, after the prefill): per layer, FNV of the stored latent record of
         // every prompt position < npf in logical order, read from every rank that stores it (all ranks in a replicated
         // build; the owner, plus every rank below R, under CP); holders must agree byte for byte
         if (getenv("G6_KV_HASH") && npf > 0)

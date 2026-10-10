@@ -1,4 +1,4 @@
-"""NumPy reference of one rank's routed-expert partial (#65), against a k1_v2_test --dump.
+"""NumPy reference of one rank's routed-expert partial, against a k1_v2_test --dump.
 
 python3 engine/ref/k1_v2_ref.py PACKDIR/rank0 LAYER DUMP [--tol 0.02]
 

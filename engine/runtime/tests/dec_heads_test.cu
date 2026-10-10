@@ -1,4 +1,4 @@
-// Decode attention kernels of gr8 #75 against the ones they replace: head-batched scores and context against the per-head
+// The head-batched decode attention kernels against the ones they replace: head-batched scores and context against the per-head
 // kernels, absorb_m / value_project_m over all rows (and merging the context parts) against the per-row kernels. Random
 // KV pages, index lists with dead slots and dead tails, slots past the row's position, repeated keys, random q / rope /
 // probabilities (some exactly 0). Every output byte must match. One GPU, no pack files.

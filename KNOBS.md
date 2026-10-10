@@ -54,14 +54,14 @@ manifest instead.
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
-| `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
+| `G6ARGS_X` | – | empty | – | more engine arguments for every rank |
 | `READY_TMO` | 1800 | 900 | 1800 | seconds to wait for the ranks to load |
-| `FRONT` | rs only | rs, else py | rs, else py | front end: `rs` = `bin/g6front-rs`, `py` = `frontend/g6front` |
+| `FRONT` | rs only | rs, else py | rs only | front end: `rs` = `bin/g6front-rs`, `py` = `frontend/g6front` |
 | `FRONT_BIN` | `bin/g6front-rs` | same | same | the Rust front end binary |
 | `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim (and the Python front end) |
 | `S2PORT` | 7341 | – | 7341 | the multi-session control port on the head |
-| `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
-| `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
+| `RANK_HEALTH` | – | 1 | – | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
+| `PROBE_ARGS` | – | empty | – | thresholds for that probe (`tools/health/README.md`) |
 
 ## `./gr8 glm53`
 

@@ -1,4 +1,4 @@
-"""Synthetic exlr8 v2 layer files for tests (#65), in the layout of exlr8quant SPEC.md 6.3-6.4: one index file
+"""Synthetic exlr8 v2 layer files for tests, in the layout of exlr8quant SPEC.md 6.3-6.4: one index file
 (layer signs; per width index, checksums, block scales, per-channel vectors, error tables; heldout_tokens) and one
 trellis file per width. Random trellis bytes (every bit pattern is a valid tail-biting stream), random signs, positive
 block scales, random per-channel vectors. 64 KiB layout: header padded with spaces, every tensor on a 64 KiB offset,

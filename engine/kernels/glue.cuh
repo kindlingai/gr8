@@ -1,8 +1,8 @@
 // g6 glue kernels: embedding, all-reduce consume + residual + RMSNorm, router top-8 -> K1 plan,
 // vocab-split head (local argmax / LSE / Gumbel sample + merge), RoPE, fabric publish/wait helpers.
-// Conventions (RUNTIME.md, SPEC §9): partials BF16 in fabric slots, residual FP32, activations FP16.
+// Conventions: partials BF16 in fabric slots, residual FP32, activations FP16.
 // Every rank runs these on identical bits with fixed reduction orders, so all decisions are bit-identical.
-// GB10 rule (measured, results/m2/RESULTS-M2b.md): host-pinned memory is slow to touch from the GPU. Control words
+// GB10 rule (measured): host-pinned memory is slow to touch from the GPU. Control words
 // (step counter, tokens, sampling rows) live in DEVICE memory; only fabric slots, tails, doorbells and the error
 // word are pinned. k_step_begin copies the host step counter once per graph launch; k_wait_peers (one CTA) is the
 // only spinner on tails.

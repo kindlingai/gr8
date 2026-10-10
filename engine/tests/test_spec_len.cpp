@@ -1,4 +1,4 @@
-// CPU checks of engine/runtime/spec_len.h (issue #12), no GPU:
+// CPU checks of engine/runtime/spec_len.h, no GPU:
 //   1. choose(): every draft certain -> the largest level, every draft unlikely -> the smallest
 //   2. a simulated drafter whose probability is calibrated (a draft with probability q is accepted with chance q):
 //      DFlash2-like rounds (7 drafts, the drafting cost fixed) on reasoning-like text (q around 0.6), JSON-like text

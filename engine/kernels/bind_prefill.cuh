@@ -30,7 +30,7 @@
 //   launch(L.xq_x2, st), launch(L.gate, st), launch(L.up, st), launch(L.act, st), launch(L.xq_act, st), launch(L.down, st)
 //                                             shared expert (-> fp16 scratch) or dense MLP (-> io.mlp_part BF16 [M][6144])
 //   launch(L.xb_x2, st), launch(L.router, st) MoE -> io.logits fp32 [M][256]
-//   launch_shared(L.exs, st)                  exlr8 v2 trellis shared expert (#65; then the five shared launches above are off)
+//   launch_shared(L.exs, st)                  exlr8 v2 trellis shared expert (then the five shared launches above are off)
 //   launch_experts(L.ex, st)                  MoE: route, group, fc1, mid, fc2, final sum -> io.mlp_part BF16 [M][6144]
 // A launch of a member with on == 0 does nothing. launch() of a Blas member returns the cuBLAS status.
 // tr3.fc1 may be in the wide order (bind::widen_fc1 on the decode tensors of the same device memory): set
@@ -54,7 +54,7 @@ enum
 {
     T_Q_A, T_KV_A, T_Q_B, T_O_PROJ, T_IDX_WQ_B, T_S_GATE, T_S_UP, T_S_DOWN, T_D_GATE, T_D_UP, T_D_DOWN, NMX,    // .mx.codes + .mx.scales
     T_IDX_WK = NMX, T_IDX_WPROJ, T_ROUTER, T_ROUTER_BIAS, T_TR3_FC1, T_TR3_FC2, T_TR3_V1, T_TR3_V2, T_TR3_V3, T_TR3_TAB,
-    T_TR3_KMIX,                       // exlr8 v2 packs only (#65)
+    T_TR3_KMIX,                       // exlr8 v2 packs only
     T_TR3_SG, T_TR3_V1B, T_TR3_V3B,   // v2 layers with the trellis shared expert: hidden-side signs + block scales
     NT
 };
@@ -70,8 +70,8 @@ struct Tensors
     Tensor s[NMX];                    //                the .scales tensor [N][K/32]
     int fc1_wide = 0;                 // set if bind::widen_fc1 ran on this tr3.fc1 (K3 experts in the wide order, tr3_wide.cuh)
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
-    int k2 = 1;                       // 2-bit units in the layer (bind::LayerTensors::k2 after bind::scan_widths, #65)
-    int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis, #65)
+    int k2 = 1;                       // 2-bit units in the layer (bind::LayerTensors::k2 after bind::scan_widths)
+    int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis)
     int sh_fp8 = 0;                   // t/s[T_S_GATE, T_S_UP, T_S_DOWN] hold its FP8 copy (bind::make_shared_fp8)
     long long sh_tr[6] = {};          // tr3.table row 256
     int qo_cover = 0;                 // G6_PF_OWN=3: q_b / o_proj of this layer are prefilled from the QO pack (never from these tensors)
@@ -329,7 +329,7 @@ struct Gemm
     int N2 = 0, ldy2 = 0, bf162 = 0;
     void* y2 = nullptr;
     const uint8_t* x8_2 = nullptr;    // the second tensor's records when they differ from x8 (the trellis shared expert's
-                                      // gate and up inputs, #65); nullptr = x8
+                                      // gate and up inputs); nullptr = x8
     // dense trellis matrices (dtr.cuh): pre writes x8 (rotated, Xq::suh) right before the GEMM; osvh (osvh2: the second
     // tensor's) applies H128 and svh to every row's 128 columns of a CTA in its epilogue (gemm_rot_store), N % 128 == 0
     Xq pre;
@@ -1593,9 +1593,9 @@ inline const char* make_blas(const Tensor& w, int K, int M, cublasHandle_t h, co
 struct Expert
 {
     int on = 0, M = 0, maxseg = 0;
-    int nroutes = 0;                  // routes of the pass: 0 = M * TOPK; the trellis shared pass (#65) has M (one per row)
+    int nroutes = 0;                  // routes of the pass: 0 = M * TOPK; the trellis shared pass has M (one per row)
     const __half* sh_svh = nullptr;   // set: ysh holds the trellis shared expert's down output before its output rotation;
-                                      // k_pf_fin adds f16(H128(ysh) x sh_svh) (bindp::ShX, #65)
+                                      // k_pf_fin adds f16(H128(ysh) x sh_svh) (bindp::ShX)
     const __half* sh_sc = nullptr;    // block-scale form: sh_svh holds the output signs and these the 48 scales
     // routing
     const float* logits = nullptr;    // [M][256] fp32
@@ -1615,7 +1615,7 @@ struct Expert
     const long long* t_tab = nullptr;
     const long long* t_kmix = nullptr;    // tr3.kmix (exlr8 v2 packs): fc1 width per (block, matrix); nullptr = all at bits
     const uint8_t* t_fc1 = nullptr;
-    int k2 = 0;                       // the layer has 2-bit units: the K2 instantiations of fc1 / fc2 (#65)
+    int k2 = 0;                       // the layer has 2-bit units: the K2 instantiations of fc1 / fc2
     int bs = 0;                       // hidden-side vectors as signs x block scales (t_sg, t_v1b, t_v3b): the BS instantiations
     const __half *t_sg = nullptr, *t_v1b = nullptr, *t_v3b = nullptr;   // [2][6144] signs (in, out), [blk][2][48], [blk][48]
     int t_wide = 0;                   // K3 experts of t_fc1 are in the wide order
@@ -2021,7 +2021,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
         for (int h = 0; h < 2; ++h)
             #pragma unroll
             for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
-    const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2 (#65)
+    const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2
     constexpr size_t WG = static_cast<size_t>(2048) * BITS;         // bytes of one wide group (TR3W_GROUP at K3)
     const uint8_t* wg = wb - static_cast<size_t>(warp) * TB + warp * 256 + lane * 8;      // the lane's first u64 of group 0
     u32 nv[8][2];
@@ -2099,7 +2099,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
             {
                 const uint4 xr = pact ? *reinterpret_cast<const uint4*>(xs + swz16(q * 4 + j, R) * 16) : make_uint4(0u, 0u, 0u, 0u);
                 uint4 sr = *reinterpret_cast<const uint4*>(sp + j * 8);
-                if (BS)       // sign x block scale: the same fp16 values as the stored vector (#65)
+                if (BS)       // sign x block scale: the same fp16 values as the stored vector
                 {
                     sr.x = as_u32(__hmul2(as_h2(sr.x), scl)); sr.y = as_u32(__hmul2(as_h2(sr.y), scl));
                     sr.z = as_u32(__hmul2(as_h2(sr.z), scl)); sr.w = as_u32(__hmul2(as_h2(sr.w), scl));
@@ -2745,7 +2745,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1f(Expert A)
 }
 #endif
 #ifdef PF_HOIST
-// fc1 with the prologue hoisted (frontier-2 #1, measurement build): CTA = (segment, pair of local blocks inside one
+// fc1 with the prologue hoisted (measurement build): CTA = (segment, pair of local blocks inside one
 // 4-block suh fragment, matrix), 512 threads = 2 groups of 8 warps (fc1_body NBL = 2). The x stage and prologue run
 // once per pair instead of once per block; same z1 bytes. A fragment's local blocks [a, e) give ceil((e - a) / 2)
 // pairs, fragments in order; grid x = 2 * FC1H_PAIRS(EB). (4 blocks per CTA would need 1024 threads = 64 registers;
@@ -2844,7 +2844,7 @@ __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, i
     Tr3Lane<BITS> ld;
     ld.init(lane);
     // K3 (or K2) expert in the wide order (A.t_wide2, tr3_wide.cuh): the n-tile's 8 k-tiles in three (two) 64-bit loads
-    const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2 (#65)
+    const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2
     unsigned char* sZb = reinterpret_cast<unsigned char*>(sZ);
     const int pr = warp * 4 + (lane >> 3), q = lane & 7;     // epilogue: this lane's rows pr, pr + 32 of the segment and column eighth
     const int np = rows > 32 ? 2 : 1;                         // row passes (warp-uniform)
@@ -3034,7 +3034,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
     const int srow = (lane >> 2) + ((lane & 1) ? 8 : 0), c = lane & 3, r = lane >> 2;
     Tr3Lane<BITS> ld;
     ld.init(lane);
-    const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2 (#65)
+    const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2
     unsigned char* sZb = reinterpret_cast<unsigned char*>(sZ);
     const int pr = warp * 4 + (lane >> 3), q = lane & 7;
     const int np = rows > 32 ? 2 : 1;
@@ -3396,7 +3396,7 @@ __device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int
 
 // x -> MXFP8 records of H128(x * suh_g) and H128(x * suh_u), quantized from fp32 with k_xq8's scale rule. The trellis
 // fc1 prologue quantizes from fp16 values with its own rule, so the two paths differ by FP8 activation rounding
-// (cos 0.99976 at M = 20). Against the fp16-activation reference this one is as close or closer (#65).
+// (cos 0.99976 at M = 20). Against the fp16-activation reference this one is as close or closer.
 // grid ceil(ceil(M/16)*16 * 48 / 8), block 256: warp = (row, 128-block)
 __global__ void __launch_bounds__(256) k_shx_rotq(ShX a)
 {
@@ -3461,7 +3461,7 @@ __global__ void __launch_bounds__(256) k_shx_mid(ShX a)
     shx_store_mx8(v, lane, row, a.M, a.I / 32, b * 4 + (lane >> 3), a.x8a);
 }
 
-// The trellis shared expert (exlr8 v2 tr3.table row 256, #65) without an FP8 copy runs as its own pass of the routed kernels. Every row is
+// The trellis shared expert (exlr8 v2 tr3.table row 256) without an FP8 copy runs as its own pass of the routed kernels. Every row is
 // one route of expert 256 with weight 1, in segments of RS rows. fc2 writes the rows straight into ysh (S.yw = ysh).
 // k_pf_fin adds ysh as it adds the MXFP8 shared output. grid ceil(M / 256), block 256.
 __global__ void __launch_bounds__(256) k_pf_sh_routes(Expert S)
@@ -3499,7 +3499,7 @@ struct Scratch
 {
     int Mmax = 0;
     uint8_t* x8_big;                  // MXFP8 records of a 6144-wide input (x, then x2)
-    uint8_t* x8_up;                   // the same size: the trellis shared expert's rotated up input (#65)
+    uint8_t* x8_up;                   // the same size: the trellis shared expert's rotated up input
     uint8_t* x8_small;                // same, up to SMALLW wide (q_a_norm output, attention output, MLP activation; 2816 / 4096)
     uint16_t* xb;                     // [M][6144] BF16 copy of x / x2
     float* y32;                       // [M][256] fp32 staging of idx.wk / idx.weights_proj
@@ -3507,7 +3507,7 @@ struct Scratch
     __half* ysh;                      // [M][6144] shared expert output
     int *tok_e, *cnt, *rr_row, *rr_e, *rr_sp, *pos, *segs, *n_seg;
     float *tok_w, *rr_w;
-    int *sh_rr_row, *sh_rr_e, *sh_rr_sp, *sh_segs, *sh_n_seg;      // the trellis shared pass's routes (#65)
+    int *sh_rr_row, *sh_rr_e, *sh_rr_sp, *sh_segs, *sh_n_seg;      // the trellis shared pass's routes
     float* sh_rr_w;
     __half* z1;
     uint8_t* x2;
@@ -3595,11 +3595,11 @@ struct Layer
     Blas idx_k, idx_w, router;
     Act act;
     Expert ex;
-    Expert exs;                       // trellis shared expert pass (launch_shared, #65); on = 0 otherwise
+    Expert exs;                       // trellis shared expert pass (launch_shared); on = 0 otherwise
     ShX shx;                          // the same from its FP8 copy on the MXFP8 GEMMs (gate, up, down above); on = 0 otherwise
 };
 
-// the shared expert of an exlr8 v2 layer (#65): FP8 copy on the GEMMs, or the trellis pass. No-op for other layers.
+// the shared expert of an exlr8 v2 layer: FP8 copy on the GEMMs, or the trellis pass. No-op for other layers.
 // Their shared / dense MLP runs from the five launches of the step order above.
 template <int EB = g6nr::EB> inline void launch_shared(const Layer& L, cudaStream_t st)
 {
@@ -3734,7 +3734,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #ifdef PF_HOIST
         if (km.p || T.k2 || T.t[T_TR3_V1B].p) return "PF_HOIST (k_pf_fc1h) takes TR3 / v1 layers only (no tr3.kmix, 2-bit or block-scale layers)";
 #endif
-        // 257 rows: an exlr8 v2 pack with the shared expert as trellis row 256 (#65)
+        // 257 rows: an exlr8 v2 pack with the shared expert as trellis row 256
         if (tab.nd != 2 || (tab.shape[0] != NEXP && tab.shape[0] != NEXP + 1) || tab.shape[1] != 6 || v2.nd != 3 || v2.shape[1] != 3 ||
             v2.shape[2] != 128 || bias.shape[0] != NEXP ||
             (bsf ? sgn.nd != 2 || sgn.shape[0] != 2 || sgn.shape[1] != HID || v1b.nd != 3 || v1b.shape[0] != nrow || v1b.shape[1] != 2 ||

@@ -60,7 +60,7 @@ inline std::unique_ptr<ControlIO> accept_control(int listener, unsigned timeout)
         Socket fd(::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC));
         if (fd.get() < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         require(fd.get() >= 0, "control accept failed");
-        auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); return io; // dead peer seen in <= 30 s (#26)
+        auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); return io; // dead peer seen in <= 30 s
     }
 }
 inline std::unique_ptr<ControlIO> connect_control(const std::string& ip, uint16_t port, unsigned timeout) {
@@ -75,7 +75,7 @@ inline std::unique_ptr<ControlIO> connect_control(const std::string& ip, uint16_
         } else if (rc) error = errno;
         if (!error) {
             require(!fcntl(fd.get(), F_SETFL, 0), "control blocking mode failed");
-            auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); return io; // dead peer seen in <= 30 s (#26)
+            auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); return io; // dead peer seen in <= 30 s
         }
         require(error == ECONNREFUSED || error == EINTR, "control connect failed");
         // Worker may finish loading before rank0. Bootstrap only, never decode.
@@ -149,7 +149,7 @@ inline ControlLinks bootstrap(const BootstrapConfig& c) {
 }
 // All-rank barrier after the boot graph capture (native.cuh capture_all, which runs after bootstrap): every worker reports
 // "captured" to the head and the head waits for all of them before it publishes ready.s2 (Service::run). The wait is
-// idle (no receive timeout, as the event reader, #26): the capture time of the ranks may differ by more than the bootstrap
+// idle (no receive timeout, as the event reader): the capture time of the ranks may differ by more than the bootstrap
 // timeout, and a rank that dies mid-capture closes its link (recv 0) or fails the TCP keepalive.
 inline void capture_barrier(const BootstrapConfig& c, ControlLinks& links) {
     const auto done = frame("G6S2 CAPTURED\n" + c.agreement());

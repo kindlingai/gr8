@@ -94,7 +94,7 @@ __global__ void sort_selected(Input input,int start,const float* scores,const ui
     for(int j=0;j<ITEMS;j++)a.indices[(int64_t)(start+row)*TOP+t*ITEMS+j]=keys[j]?int(0xffffu-uint32_t(keys[j]&0xffffu)):-1;
 }
 #ifdef SEL32
-// SEL32 (results/peak/kv/PROPOSAL-longctx.md §7): the same exact selector past context 32768, so no context size runs
+// SEL32: the same exact selector past context 32768, so no context size runs
 // the full CUB sort. 64-bit key = ordered_score (CUB's float order, both zeros equal as CUB treats them) in the high
 // word, 32 ID bits (0xffffffff - id) in the low word -> the order of the stable descending full sort: score desc, then
 // id asc. Nonfinite (masked) scores get key 0 and are never selected, as top_from_sort maps them to -1.

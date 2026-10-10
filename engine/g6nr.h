@@ -1,4 +1,4 @@
-// SPEC §9 rank count, the one compile-time definition the engine shares. Default 6 (TP6); -DG6_NR=4 builds TP4.
+// The rank count, the one compile-time definition the engine shares. Default 6 (TP6); -DG6_NR=4 builds TP4.
 // Widths split n units as evenly as possible, the larger chunks first: n / NR + (j < n % NR) (tools/convert/plan.py).
 // The NR=6 values equal the TP6 literals they replace, so the default build is SASS-identical to the TP6 tree.
 #pragma once

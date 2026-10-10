@@ -1,4 +1,4 @@
-"""Expert bytes per decode step from a G6_ROUTE_LOG file, under exlr8 v2 width manifests and the half rule (#65).
+"""Expert bytes per decode step from a G6_ROUTE_LOG file, under exlr8 v2 width manifests and the half rule.
 
 python3 bench/route_bytes.py LOG.jsonl --manifest home=DIR/exlr8-manifest-home.json --manifest down1=... \
         [--cold-k2 0.5] [--tp 3,4,5,6,7] [--side full|block] [--drive DRIVE.json] [--per-m]

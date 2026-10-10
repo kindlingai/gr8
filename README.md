@@ -1,6 +1,6 @@
 # GLM-5.3 (full) on DGX Spark (GB10)
 
-Private preview. If you run it, tell us what breaks: issues and PRs are welcome.
+Early release. If you run it, tell us what breaks: issues and PRs are welcome.
 
 g6 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
 sparse indexer, one MTP layer) on three, four or six DGX Spark (GB10) boxes, tensor-parallel across all of them. It
@@ -18,13 +18,14 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 | prefill, 8K prompt, cold | 1,374 tok/s | 648 tok/s | 1,942 tok/s† |
 | prefill, 8K prompt, cached | 54,867 tok/s | 53,747 tok/s | – |
 | KV pool (longest context) | 393,216 tokens | 307,200 tokens | 614,400 tokens |
-| requests decoding at once | 8 | 8 | 8 |
+| requests decoding at once | 8 | 8 | 1† |
 
 \* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks capped at 2200 MHz,
 booted from the Hugging Face release with `./gr8 glm53 up`. RigMark's structured row is left out: it measures
 predictable output, not agent speed. TP=4 code varies between boots (41.5 to 49.3 on one build), because which requests
 get DFlash2 depends on timing.
-† Measured on the one-request loop that TP=6 ran before it moved to S2, MTP k=2 at temperature 0.7.
+† TP=6 still serves one request at a time; it moves to the multi-session path next. Its numbers are from that loop,
+MTP k=2 at temperature 0.7, one test window on one cluster.
 
 [kindling.json](kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
 
@@ -33,7 +34,7 @@ get DFlash2 depends on timing.
 - One model: the [exlr8 release](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) on Hugging Face. Each box
   fetches only its own part, once, and boots from its cache in about 40 s. Each rank plans its weights from the
   release's files at load. The routed experts and the dense trellis matrices are decoded inside the kernels.
-- Several requests at once: up to 8 sessions share each decode step. Each request's output is byte for byte what it
+- Several requests at once (TP=4 and TP=3): up to 8 sessions share each decode step. Each request's output is byte for byte what it
   would be alone, logprobs included.
 - Speculative decoding: every round drafts with the MTP layer, or at TP=4, for a request that runs alone, with the
   DFlash2 drafter when that is expected to commit more tokens per ms (DFlash2 wins on code, MTP on prose). The draft
@@ -109,8 +110,8 @@ mentat daemon (`--mentat localhost`, the default).
 | `build` | the engine and the Rust front end, into `bin/` |
 
 Options come from the command line, then a config file (`@FILE`, else `./cluster.env`; see
-`config/cluster.env.tp4.example`), then the environment. With the options in `cluster.env`, `./gr8 glm53 up` alone is
-enough. [KNOBS.md](KNOBS.md) lists every option.
+`config/cluster.env.tp4.example`, `.tp3.example`, or `cluster.env.example` for TP=6), then the environment. With the
+options in `cluster.env`, `./gr8 glm53 up` alone is enough. [KNOBS.md](KNOBS.md) lists every option.
 
 When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line. Logs are in
 `out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and `shim.log` and `front.log` on the head).

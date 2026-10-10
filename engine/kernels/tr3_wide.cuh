@@ -1,4 +1,4 @@
-// TR3 K3 fc1 in the "wide" order (RESULTS-M1 item 1c): the same bytes regrouped so that a warp reads its 8 k-steps
+// TR3 K3 fc1 in the "wide" order: the same bytes regrouped so that a warp reads its 8 k-steps
 // of tiles with three 64-bit loads (256 B per instruction, contiguous per warp) instead of eight 32-bit tile loads
 // (96 B each; every load touches two 64 B lines and half of them are shared with the neighbour tile).
 //
@@ -44,7 +44,7 @@ __host__ __device__ __forceinline__ void tr3w_pack(u64 (&v)[3], int p, u32 chunk
     if (sh > 40) v[n + 1] |= static_cast<u64>(chunk) >> (64 - sh);
 }
 
-// ---------------------------------------------------------------------------------------------- K2 and K3 (#65)
+// ---------------------------------------------------------------------------------------------- K2 and K3
 // The 2-bit width (exlr8 v2) uses the same order with BITS = 2: a lane's chunk of a tile is the new stream bits of its
 // 8 weights, 8 * BITS of them (24 at K3, 16 at K2), and a group of 8 tiles is BITS u64 per lane (three at K3, two at
 // K2; 256 B per load instruction either way). The 16 - BITS bits before a chunk are the low bits of lane l - 1's:
@@ -107,7 +107,7 @@ __device__ __forceinline__ void trw_widen_ntile(uint8_t* nt, int lane)
 }
 
 // In-place pack order -> wide order for every K3 (and K2) fc1 matrix of the rank's tr3.fc1. tab = tr3.table [E][6] (fc1 byte
-// offset, -, -, n blocks, bits, -); kmix = tr3.kmix [E] or nullptr (exlr8 v2 packs, #65: the width of each (block,
+// offset, -, -, n blocks, bits, -); kmix = tr3.kmix [E] or nullptr (exlr8 v2 packs: the width of each (block,
 // matrix), 4 bits at bit 4 * (2b + m); 0 = all at bits, as without kmix). grid = E * nb * 2 * (KSH / 8), nb = max
 // blocks per expert (g6nr::EB: 3 at TP6, 4 at TP4), block = 256.
 // Run k_tr3_widen exactly once per tensor: a second run would scramble the bits.

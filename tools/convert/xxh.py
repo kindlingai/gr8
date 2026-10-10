@@ -1,4 +1,4 @@
-"""xxhash64 (seed 0 by default) for the exlr8 v2 half checksums (#65).
+"""xxhash64 (seed 0 by default) for the exlr8 v2 half checksums.
 
 Uses the system libxxhash (Ubuntu's libxxhash0, which rsync depends on, so it is on DGX OS and in the CUDA images),
 else the `xxhash` Python package. Raises if neither is present.

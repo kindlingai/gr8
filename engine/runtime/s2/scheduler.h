@@ -1,6 +1,6 @@
-// S2 component 5, host-only state. No CUDA, allocator implementation, sampler, or transport.
+// The S2 scheduler, host-only state. No CUDA, allocator implementation, sampler, or transport.
 // A caller may apply Commit ONLY after event-boundary all-rank quiescence (event_gate.h).
-// TP4 owns run allocation/claim/release; component 6 owns tokens, MTP and hidden state.
+// TP4 owns run allocation/claim/release; the batch driver owns tokens, MTP and hidden state.
 #pragma once
 #include <algorithm>
 #include <array>

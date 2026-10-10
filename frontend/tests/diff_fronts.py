@@ -182,7 +182,7 @@ CASES = {
     'models': ('GET', '/v1/models', None),
     'health': ('GET', '/health', None),
     'metrics': ('GET', '/metrics', None),
-    # ---- review regressions (#15 review): each of these once differed or crashed
+    # ---- review regressions (review): each of these once differed or crashed
     'rv_stop_behind_released': cmpl('hello there', max_tokens=30, min_tokens=8, stop=['e', 'q' * 20],
                                     include_stop_str_in_output=True),
     'rv_stop_behind_released_chat': chat([U('hi')], max_tokens=30, min_tokens=8, stop=['e', 'q' * 20],

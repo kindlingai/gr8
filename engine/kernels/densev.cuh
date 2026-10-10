@@ -197,7 +197,7 @@ __device__ __forceinline__ void gv_tile_part(const uint8_t* tile, const u32* bf,
 }
 
 #if DEC_I4PAIR
-// DEC_I4PAIR (results/peak/decode/PROPOSAL-gemv.md): the decode Int4 records (q_a, o_proj) are repacked once at load
+// DEC_I4PAIR: the decode Int4 records (q_a, o_proj) are repacked once at load
 // (k_i4pair) so that inside every warp's k-range [g0, g1) groups 2j, 2j+1 form one 576-B pair record:
 //   [512 B: lane l's 16 B = {g2j tile0 word l, g2j tile1 word l, g2j+1 tile0 word l, g2j+1 tile1 word l}]
 //   [64 B:  r = 0..7: {g2j scale word r, g2j+1 scale word r}]
@@ -373,7 +373,7 @@ __global__ void __launch_bounds__(1024) gv_gemv_lb(const uint8_t* stream, const 
     gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
 }
 // The same at <= 512 threads (up to 128 registers), for ks <= 16: at the 64-register cap the INT4 GEMVs fell from ~190
-// to ~120 GB/s at 24 rows (gr8 #75). bind.cuh launch picks it; gv_fit_tpc gives fewer tiles per CTA, same bits.
+// to ~120 GB/s at 24 rows. bind.cuh launch picks it; gv_fit_tpc gives fewer tiles per CTA, same bits.
 template <class C, int NT>
 __global__ void __launch_bounds__(512) gv_gemv_lb512(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
                                                       int ks, int M, void* y, int ystride, int odt)

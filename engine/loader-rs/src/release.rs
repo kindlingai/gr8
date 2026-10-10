@@ -178,7 +178,7 @@ impl Planner {
     fn mxfp8(&mut self, l: usize, what: &'static str, p: &str, f: &Arc<StFile>, m: &str, decode_only: bool) -> Result<(), String> {
         let mx = Matrix::open(f, m)?;
         if mx.rec.fmt != MXFP8 {
-            return Err(format!("{}: {m} is {}, g6 reads it as MXFP8 (#116 step 2)", f.path, fmt_name(&mx)));
+            return Err(format!("{}: {m} is {}, g6 reads it as MXFP8", f.path, fmt_name(&mx)));
         }
         let (o, k) = (mx.rec.out, mx.rec.inp);
         if !decode_only {

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Build an exlr8 v2 width manifest from OUR routing (G6_ROUTE_LOG) + Matt's per-unit error tables, at a byte budget.
+"""Build an exlr8 v2 width manifest from our routing (G6_ROUTE_LOG) + the release's per-unit error tables, at a byte budget.
 
 python3 route_manifest.py --v2 DIR --base MANIFEST.json --route LOG[,LOG..] [--reqs REQS.json --split hist]
-        [--freq route|matt] [--budget base|BYTES] [--alpha 200] --out OUT.json [--report REPORT.json]
+        [--freq route|prior] [--budget base|BYTES] [--alpha 200] --out OUT.json [--report REPORT.json]
 
 Objective: minimise sum over layers l, experts e, units u of f[l][e] * err_u(width), subject to the routed bytes of
 layers 3-77 <= budget. err_u is the index's err_gate[e][h] / err_up[e][h] / err_down[e] for the width: held-out error
 vs BF16 with one unit swapped in, averaged over the tokens routed to that expert (a per-use error, so it is weighted
-by OUR use frequency f here, not by Matt's). Units: gate half, up half (128 channels each, 16 per expert), down
+by our use frequency f here, not by the release's). Units: gate half, up half (128 channels each, 16 per expert), down
 (whole expert, 16 halves of bytes). Widths 2/3/4; bytes per half 384*8*32*k.
 f[l][e]: share of decode steps whose routed set in layer l holds e (route-log lines with M <= --max-rows), smoothed
-toward Matt's held-out token counts with --alpha pseudo-steps. --freq matt uses Matt's counts only (control arm).
+toward the release's held-out token counts with --alpha pseudo-steps. --freq prior uses those counts only (control arm).
 Layer 78 (MTP, K3 only) and every layer's shared expert are copied from --base unchanged.
 Greedy: start at K2, take the upgrade (k -> k+1 of one unit) with the best error drop per byte until the budget.
 Ranks (--nr 6): half h of expert e in layer l lives on rank (16e + h + l) mod nr (v2 sharding rule; down halves too).
@@ -92,7 +92,7 @@ def main():
     ap.add_argument('--route', default='')
     ap.add_argument('--reqs', default=None, help='JSON list of {"q":..,"split":..}; keep only --split q values')
     ap.add_argument('--split', default='hist')
-    ap.add_argument('--freq', choices=('route', 'matt'), default='route')
+    ap.add_argument('--freq', choices=('route', 'prior'), default='route')
     ap.add_argument('--budget', default='base')
     ap.add_argument('--alpha', type=float, default=200.0)
     ap.add_argument('--max-rows', type=int, default=16)
@@ -117,9 +117,9 @@ def main():
     for l in LAYERS:
         eg, eu, ed, ht = load_errs(a.v2, l)
         E[l] = (eg, eu, ed)
-        prior = ht / ht.sum() * 8.0                      # Matt's routing share per step (top-8)
+        prior = ht / ht.sum() * 8.0                      # the release's routing share per step (top-8)
         HT[l] = ht
-        F[l] = prior if a.freq == 'matt' else (cnt[l] + a.alpha * prior) / (steps + a.alpha)
+        F[l] = prior if a.freq == 'prior' else (cnt[l] + a.alpha * prior) / (steps + a.alpha)
 
     RK = {l: (16 * np.arange(NE)[:, None] + np.arange(NH)[None, :] + l) % a.nr for l in LAYERS}   # [e][h] -> rank
 
@@ -206,11 +206,11 @@ def main():
                                              + np.take_along_axis(eu.transpose(1, 2, 0), ui[..., None], 2)[..., 0])).sum()
                               + (f * ed[di, ee]).sum())
         hot = set(np.argsort(-f)[:64].tolist())
-        matt_hot = set(np.argsort(-HT[l])[:64].tolist())
+        prior_hot = set(np.argsort(-HT[l])[:64].tolist())
         base_k4 = {e for e in range(NE) if b['down'][e] == 4}
         cust_k4 = {e for e in range(NE) if down[e] == 4}
         rep['layers'][l] = {
-            'hot64_vs_matt_hot64': len(hot & matt_hot), 'hot64_vs_base_k4': len(hot & base_k4),
+            'hot64_vs_prior_hot64': len(hot & prior_hot), 'hot64_vs_base_k4': len(hot & base_k4),
             'hot64_vs_custom_k4': len(hot & cust_k4), 'mass_top64': float(np.sort(f)[::-1][:64].sum() / f.sum()),
             'mass_on_base_k4': float(f[list(base_k4)].sum() / f.sum()) if base_k4 else 0.0,
             'mass_on_custom_k4': float(f[list(cust_k4)].sum() / f.sum()) if cust_k4 else 0.0,

@@ -1,5 +1,5 @@
-// spec_len.h: the draft length of each speculative round (issue #12, --spec-adaptive). Host code only: g++ builds its
-// test, engine/tests/test_spec_len.cpp. It makes one decision per round, which #49 can extend to choose the drafter.
+// spec_len.h: the draft length of each speculative round (--spec-adaptive). Host code only: g++ builds its
+// test, engine/tests/test_spec_len.cpp. It makes one decision per round; s2_batch.h's drafter choice builds on it.
 //
 // A round with k drafts costs verify(k + 1 rows) plus the drafting, and is expected to commit
 //   E(k) = 1 + sum over j = 1..k of c_1 * ... * c_j
@@ -39,7 +39,7 @@ struct SpecLen
     std::vector<int> levels;          // allowed draft counts, ascending, each <= KX
     double draft_round = 0;           // drafting cost paid once per round (DFlash2 step, MTP first-form pass), ms
     double draft_each = 0;            // drafting cost per draft after the first (MTP chain step), ms
-    double table[KX + 2] = {0, 43.0, 52.4, 60.4, 68.4, 76.1, 83.7, 91.1, 97.4};   // verify ms by rows 1..8 (TP4 v2 home, DFlash2 steps, #80)
+    double table[KX + 2] = {0, 43.0, 52.4, 60.4, 68.4, 76.1, 83.7, 91.1, 97.4};   // verify ms by rows 1..8 (TP4 v2 home, DFlash2 steps)
     double seed[KX + 1] = {0, 0.75, 0.72, 0.70, 0.70, 0.70, 0.68, 0.68};
     double pn[KX + 1] = {}, pk[KX + 1] = {};             // per position: decayed rounds offered / accepted
     double bn[KX + 1][NB] = {}, bk[KX + 1][NB] = {};     // per (position, bucket)

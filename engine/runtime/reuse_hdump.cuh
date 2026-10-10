@@ -1,4 +1,4 @@
-// K1REUSE diag arms (W38b, test only, default off; no new kernel, the default path is unchanged):
+// Prefix-reuse diagnostics (test only, default off; no new kernel, the default path is unchanged):
 // G6_REUSE_HDUMP=<dir> + G6_REUSE_HDUMP_SEQ=<q[,q..]>: after the prefill loop of a listed seq (before any decode step),
 //   every layer's cache bytes for rows [0, n) (n = the prefill end, p.first) -> <dir>/hd.<q>.r<rank>.bin, raw, page by
 //   page: the target model (tag 'm') then the MTP draft model (tag 'd'). tools/reuse/hdump.py hashes the rows and

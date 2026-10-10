@@ -1,4 +1,4 @@
-// CPU checks of engine/kernels/topk.cuh (issue #23), no GPU:
+// CPU checks of engine/kernels/topk.cuh, no GPU:
 //   1. log-sum-exp: the per-slice (max, sum) pairs combined as k_head_merge does vs a float64 reference, for the TP4 and
 //      TP6 vocabulary splits (unequal slice widths); logprob of every top-20 token vs the float64 value
 //   2. top list: per-slice select (LP_K rounds of "best entry strictly after the previous pick", as head_local_topk)

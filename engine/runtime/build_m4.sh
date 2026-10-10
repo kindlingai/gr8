@@ -3,7 +3,7 @@
 # tests: only the unit tests (tests/row_budget_test.cu, tests/s2_attn_test.cu) into $OUT; scripts/c1_tests.sh builds and runs them.
 # m4sim: one GPU, six simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
 # dfl: dfltest only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py).
-# rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution (#55).
+# rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution.
 set -e
 cd "$(dirname "$0")"
 export PATH=/usr/local/cuda/bin:$PATH

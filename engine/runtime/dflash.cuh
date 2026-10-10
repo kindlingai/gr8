@@ -1,4 +1,4 @@
-// DFlash2 block drafter (issue #11): one rank's draft step, as launch helpers in fabric phases.
+// DFlash2 block drafter: one rank's draft step, as launch helpers in fabric phases.
 //
 // The drafter (a separate pack per rank, tools/convert/dflash2.py) drafts a block of K = 7 tokens in one forward:
 //   context  for every accepted row of the last target step: the target residual after the layers in
@@ -418,7 +418,7 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
 // merge every rank's candidates -> global top-16 per row, then the walk, with prev = the bonus token at s = 1:
 //   score(c) = logit(c) + sum_i pred[prev][i] hp[s][i] succ[c][i]
 //   pick = argmax of score * inv_temp + gumbel(row s's key, c), or of score when greedy
-//   prev = pick, s = s + 1, up to s = 7. lp_out = log-probability of the pick in softmax(score) over the 16 (#12)
+//   prev = pick, s = s + 1, up to s = 7. lp_out = log-probability of the pick in softmax(score) over the 16
 // grid 1, block 256. Warp w < 7 merges row w + 1, then warp w scores candidates w and w + 8.
 struct WalkArgs
 {

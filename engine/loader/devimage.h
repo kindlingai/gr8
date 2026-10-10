@@ -7,7 +7,7 @@
 // reader only waits for the worker when all staging buffers are still being hashed. The stream must end exactly at
 // pack_bytes. A failed load frees the device memory.
 //
-// Why device memory: on GB10, GPU reads of host-pinned memory are slow (results/m2/RESULTS-M2b.md), and a host image
+// Why device memory: on GB10, GPU reads of host-pinned memory are slow, and a host image
 // plus a device copy of a 62 GB pack do not fit in 128 GB of unified memory.
 //
 // Only the thread that calls load() touches CUDA; it must have (or be allowed to create) the context the kernels use.

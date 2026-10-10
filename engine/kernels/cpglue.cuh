@@ -1,4 +1,4 @@
-// J4 CP fabric (fabc) device helpers: publish / wait on a variable-layout collective (comms/cplayout.h VSlotDev).
+// CP fabric (fabc) device helpers: publish / wait on a variable-layout collective (comms/cplayout.h VSlotDev).
 // Same protocol as glue::publish / glue::wait_peers (seq tail after the payload, doorbell rung by the last CTA),
 // with the slot addresses resolved on the host for both parities. Included only by CP builds (G6_CP).
 #pragma once

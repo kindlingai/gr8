@@ -163,7 +163,7 @@ __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
     int p=page(a,pos);return p<0?nullptr:(const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*KV_BYTES;
 }
 #if defined(G6_CP) && G6_CP
-// CP: index keys are REPLICATED (BUILD-CPE step 3b): the index cache is logical-page addressed (table_size pages) on every
+// CP: index keys are REPLICATED: the index cache is logical-page addressed (table_size pages) on every
 // rank; below R the replicated path's identity prefix of the block table gives the same address
 __device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){
 #ifdef DEC_S2
@@ -344,12 +344,12 @@ __global__ void value_project(Input input,int start,const float* context){
     for(int k=lane;k<512;k+=32)sum=fmaf(context[((int64_t)row*a.heads+h)*512+k],bfloat(a.uv,((int64_t)h*256+d)*512+k),sum);
     sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)r*a.heads+h)*256+d]=__float2half_rn(sum);
 }
-// DEC_AVP (bar RESULTS-M20 "DEC_AVP"): absorb / value_project for all rows of a call in one launch. Grid has no row axis:
+// DEC_AVP: absorb / value_project for all rows of a call in one launch. Grid has no row axis:
 // each warp loads its whole lane-strided weight row (k = lane + 32m) into registers once, then per row runs the same
 // fmaf chain over the same k order, the same warp_sum, and lane 0 stores, so every q / rope / output byte matches the
 // per-row kernels. The inputs of the rows (q_b, context) are staged in shared memory as bit copies.
 constexpr int AVP_ROWS=8;   // rows staged at a time (smem 16 KB in value_project_m); a launch takes any row count
-// n may exceed AVP_ROWS: the rows are staged AVP_ROWS at a time and the weight row stays in registers (gr8 #75)
+// n may exceed AVP_ROWS: the rows are staged AVP_ROWS at a time and the weight row stays in registers
 template<class Input>
 __global__ void absorb_m(Input input,int start,int n,float* q,float* rope){
     auto a=resolve(input);if(!a.active)return;
@@ -516,7 +516,7 @@ static cudaError_t select_index(const G6Attn& a,Work& w,int start,int count,cuda
 #ifndef SEL32
 #error "DEC_IDX31 needs SEL32 (index_scores_m writes no ids; only the full sort reads them)"
 #endif
-// #31: decode-sized query tiles (<= IDX31_ROWS rows) score with shared keys and select with the live-context bound.
+// DEC_IDX31: decode-sized query tiles (<= IDX31_ROWS rows) score with shared keys and select with the live-context bound.
 // Both assume one sequence: one key table and one live context for every row. An S2 batched step (rows of several
 // sessions, each with its own table and bounds, FOR_ROW) takes the per-row kernels instead.
 constexpr int IDX31_ROWS=8;
@@ -600,7 +600,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
     }return cudaGetLastError();
 }
 #if defined(G6_CP) && G6_CP
-// ---- J4 context-parallel decode (BUILD-CPE.md, DESIGN-CP §2-3). Candidate key = the selector's own order:
+// ---- context-parallel decode. Candidate key = the selector's own order:
 // ordered_score (select.cuh: CUB float order, -0 == +0, nonfinite -> 0) << 32 | (0xffffffff - pos); 0 = no candidate.
 // Keys are unique (every key is scored by exactly one rank), so descending key order is a total order.
 __device__ __forceinline__ uint64_t cp_key(float score,int pos){
@@ -774,7 +774,7 @@ extern "C" int g6_attn_rope_init(int cap,void* s){
 }
 
 #if defined(G6_CP) && G6_CP
-// ---- J4 CP entry points (attn.h). Graph form (cell) mirrors g6_attn_replay_run: validation + appends in the front stage.
+// ---- CP entry points (attn.h). Graph form (cell) mirrors g6_attn_replay_run: validation + appends in the front stage.
 template<class F>
 static int cp_call(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,F body){
     if(!ga::cp_ok(a)||!scratch)return (int)cudaErrorInvalidValue;

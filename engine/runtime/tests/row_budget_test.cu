@@ -1,10 +1,10 @@
-// Row-budget unit test (gr8 #28): one GB10, no fabric, no pack files, synthetic weights.
+// Row-budget unit test: one GB10, no fabric, no pack files, synthetic weights.
 //   row_budget_test [--only gv|k1] [--time [reps]] [--time-v2 [reps]] [--time-multi [reps]]
 // Claim under test: for every M <= G6_MX, the dense GEMVs (bind::make_gv / launch) and the K1 expert stream (router plan with
 // slots of <= 8 tokens, make_k1 / launch_k1) give, for each row, the same bits as the same rows run in chunks of 8 (the M <= 8
 // path). Weights are synthetic (records of the pack formats, hash-filled), so the claim is bit equality against the 8-row path,
 // not agreement with a model. Also checked: outputs finite and not all zero, rows >= M not written, the route plan itself.
-// K1 runs in the TR3 form (int4 / MXFP8 shared expert records) and the exlr8 v2 form (#65: E4M3 experts, the trellis
+// K1 runs in the TR3 form (int4 / MXFP8 shared expert records) and the exlr8 v2 form (E4M3 experts, the trellis
 // shared expert as tr3.table row 256 in one slot per 8 rows, block-scale hidden-side vectors).
 // Default build (G6_MX = 8): the M list stops at 8 and each case compares a run with itself (smoke + plan check).
 // --time: times launch_k1 over M = 6..24 and the K1 split tables (for tuning k1_split; prints one line per point).
@@ -358,7 +358,7 @@ static bind::LayerTensors make_T_wide(Arena& A, const MoeW& moe, const ShW& s)
     return T;
 }
 
-// exlr8 v2 layer (#65): exlr8-e4m3 experts, tr3.table row 256 = the trellis shared expert (one slot per 8 rows, k1.cuh
+// exlr8 v2 layer: exlr8-e4m3 experts, tr3.table row 256 = the trellis shared expert (one slot per 8 rows, k1.cuh
 // k1_slot), hidden-side vectors in block-scale form (tr3.sg / v1b / v3b, no tr3.v1 / v3). k2: every fourth expert has 2-bit
 // units (the K2 kernels); otherwise widths 3 and 4 only (the K2 = false SH kernels, k1_tr3_fused_sh's other instantiation).
 struct MoeV2

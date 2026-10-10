@@ -1,7 +1,7 @@
 {
  "topology": "tp4",
  "commit": "f3edae5",
- "note": "TP4 outputs on five fixed prompts, kept as the TP4 reference until a KL reference can be taken. This is NOT a gate.py kl-ref (it has no prompt_logprobs; gate.py --kl-ref refuses it): the shim cannot return logprobs yet (#23), and TP4 needs its own kl-ref once they land. Greedy (temperature 0), max_tokens 200, chat_template_kwargs enable_thinking=false; text = reasoning + content as streamed.",
+ "note": "TP4 outputs on five fixed prompts, kept as the TP4 reference until a KL reference can be taken. This is NOT a gate.py kl-ref (it has no prompt_logprobs; gate.py --kl-ref refuses it): the shim cannot return logprobs yet, and TP4 needs its own kl-ref once they land. Greedy (temperature 0), max_tokens 200, chat_template_kwargs enable_thinking=false; text = reasoning + content as streamed.",
  "engine": "launch_tp4.sh defaults at f3edae5: G6_PF_OWN=1, CAP=393216, MTP=2, NOHASH=1; GPU clock cap 2200 MHz (the engine binary was built at 6591c35; engine/ is unchanged since)",
  "recorded": "2026-10-04",
  "outputs": [

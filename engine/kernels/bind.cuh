@@ -1,4 +1,4 @@
-// g6 binder: one rank's pack tensors of one layer -> ready kernel arguments + launch helpers (M3-PLAN §4).
+// g6 binder: one rank's pack tensors of one layer -> ready kernel arguments + launch helpers.
 // Decode path, M <= 8 rows (M <= G6_MX under DEC_S2, g6mx.h). Everything a kernel reads per thread (control words, plan, scratch, fragment tables)
 // must be DEVICE memory; only the two partial outputs may point into a fabric send slot (see put_partial below).
 //
@@ -7,7 +7,7 @@
 //   bind::LayerTensors T = bind::layer_tensors(l, find); find("L003.q_a.gptq") -> bind::Tensor (p = nullptr: absent)
 //   bind::widen_fc1(T, st);                              optional, once per layer: K3 fc1 into the wide order, in place
 //   bind::widen_fc2(T, st);                              optional, once per layer: K3 fc2 likewise
-//   bind::scan_widths(T);                                once per layer: whether it needs the 2-bit kernels (#65)
+//   bind::scan_widths(T);                                once per layer: whether it needs the 2-bit kernels
 //   bind::Layer L;  const char* err = bind::make_layer(T, M, sc, io, L);      err == nullptr: ready
 //
 // Step order (each call is one kernel launch on the stream; `->` = where the result lands):
@@ -58,7 +58,7 @@
 namespace bind
 {
 
-// routed-expert format of a tr3.* tensor: the manifest entry's "expert_format" (absent = TR3, every pack before #19)
+// routed-expert format of a tr3.* tensor: the manifest entry's "expert_format" (absent = TR3, every pack before exlr8-e4m3)
 enum { FMT_TR3 = 0, FMT_EXLR8_E4M3 = 1 };
 
 struct Tensor
@@ -74,7 +74,7 @@ enum
     T_Q_A, T_KV_A, T_Q_B, T_O_PROJ, T_IDX_WQ_B, T_IDX_WK, T_IDX_WPROJ, T_ROUTER, T_S_FC1, T_S_FC2, T_D_FC1, T_D_FC2,
     T_TR3_FC1, T_TR3_FC2, T_TR3_V1, T_TR3_V2, T_TR3_V3, T_TR3_TAB,
     T_Q_A_MX, T_O_PROJ_MX, T_S_GATE_MX, T_S_UP_MX, T_S_DOWN_MX,         // MXFP8 twins, read only when the int4 record is absent
-    T_TR3_KMIX,                                                         // exlr8 v2 packs only (#65): fc1 width per (block, matrix)
+    T_TR3_KMIX,                                                         // exlr8 v2 packs only: fc1 width per (block, matrix)
     T_TR3_SG, T_TR3_V1B, T_TR3_V3B,                                     // exlr8 v2 layers with the trellis shared expert: hidden-
                                                                         // side vectors as signs + block scales (no tr3.v1 / v3)
     T_Q_B_I4,                                                           // exlr8 int4 g32 q_b (layers where int4 won the encode)
@@ -93,10 +93,10 @@ struct LayerTensors
     int fc1_wide = 0;                 // tr3.fc1 is in the wide order (widen_fc1 ran)
     int fc2_wide = 0;                 // tr3.fc2 is in the wide order (widen_fc2 ran)
     int e4m3 = 0;                     // routed experts are exlr8-e4m3 (tr3.table's format): K1 decodes with E4M3 rounding
-    int k2 = 1;                       // some routed fc1 / fc2 unit has width 2 (exlr8 v2, #65): the K2 instantiations.
+    int k2 = 1;                       // some routed fc1 / fc2 unit has width 2 (exlr8 v2): the K2 instantiations.
                                       // 1 until scan_widths ran (correct for any pack); scan_widths sets the real value
     int k2_pct = 0;                   // share of the rank's routed trellis bytes at width 2, percent (scan_widths)
-    int sh_trellis = 0;               // tr3.table has row 256: the shared expert as trellis (exlr8 v2, #65); scan_widths
+    int sh_trellis = 0;               // tr3.table has row 256: the shared expert as trellis (exlr8 v2); scan_widths
                                       // sets it, a caller may clear it to run the s_* records instead (the A/B)
     long long sh_tr[6] = {};          // tr3.table row 256 (scan_widths)
     long long sh_kmix = 0;            // its tr3.kmix entry
@@ -129,7 +129,7 @@ template <class F> inline LayerTensors layer_tensors(int layer, F find)
 }
 
 // Optional, once per layer after its tensors are on the device and before make_layer: reorder the K3 records of
-// tr3.fc1 in place into the wide order (tr3_wide.cuh; fc1 then reads 256 B per load instruction, RESULTS-M1 item 1c).
+// tr3.fc1 in place into the wide order (tr3_wide.cuh; fc1 then reads 256 B per load instruction).
 // The tensor memory must be writable device memory. Same results bit for bit. Wait for the stream before using T.
 inline void widen_fc1(LayerTensors& T, cudaStream_t st)
 {
@@ -550,7 +550,7 @@ inline void launch(const Gv& g, cudaStream_t st)
 }
 
 // the GEMVs gs as one gv_multi launch; out.n = 0 (launch them one by one) above 8 rows, where the 1024-thread bound's
-// 64 registers slow the multi-tile kernels (gr8 #86), or when one does not fit a 1024-thread CTA or writes a send slot
+// 64 registers slow the multi-tile kernels, or when one does not fit a 1024-thread CTA or writes a send slot
 inline void make_gv_multi(std::initializer_list<const Gv*> gs, int M, GvMulti& out)
 {
     out = GvMulti();
@@ -572,7 +572,7 @@ static_assert(INT4 == 0 && MXFP8 == 1 && BF16W == 2, "gv_multi dispatches on the
 inline void launch(const GvMulti& a, cudaStream_t st) { gv_multi<<<a.ctas, 1024, 0, st>>>(a); }
 
 // tpc (output tiles per CTA) and ks (k parts per tile, one warp each): best split per shape on the GB10
-// (RESULTS-M1 items 2, 2b; time is flat in M). ks is halved until it divides the tensor's group count.
+// (time is flat in M). ks is halved until it divides the tensor's group count.
 inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, const u32* xfrag, void* y, int odt, Gv& g)
 {
     g = Gv();
@@ -718,7 +718,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
 {
     k = K1();
     const bool moe = T.t[T_TR3_TAB].p != nullptr;
-    const bool sh = moe && T.sh_trellis;                                 // shared expert = trellis row 256 (#65)
+    const bool sh = moe && T.sh_trellis;                                 // shared expert = trellis row 256
     const bool mx = moe && !sh && !T.t[T_S_FC1].p && T.t[T_S_GATE_MX].p; // shared expert in MXFP8 records (draft layer)
     static const Tensor none;
     const Tensor& f1 = sh ? none : T.t[mx ? T_S_GATE_MX : moe ? T_S_FC1 : T_D_FC1];
@@ -743,10 +743,10 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
     // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
     K1Split s = moe ? k1_split(split_m ? split_m : M, T.k2) : K1_DENSE_SPLIT;
-    // exlr8 v2 layers (2-bit units or the trellis shared expert, #65) choose fused or separate fc1 / fc2 launches from a
+    // exlr8 v2 layers (2-bit units or the trellis shared expert) choose fused or separate fc1 / fc2 launches from a
     // table timed on GB10 (TP4 rank 0, MoE step, G6_FUSE=1 only). Separate wins at 2 rows for every layer (3-7.5%), and
     // at 3+ rows when 2-bit units are at least half the bytes (5-11%). Fused wins at 1 row (1-3%) and for mostly 3/4-bit
-    // layers at 5-8 rows (3-5%). TR3 and v1 layers keep G6_FUSE as given (that choice is #8's).
+    // layers at 5-8 rows (3-5%). TR3 and v1 layers keep G6_FUSE as given.
     static const bool policy = !getenv("G6_K1_FUSE_POLICY") || atoi(getenv("G6_K1_FUSE_POLICY"));   // 0: A/B runs only
     const int rows = split_m ? split_m : M;
     if (policy && fuse == 1 && moe && (T.k2 || T.sh_trellis) && (rows == 2 || (rows >= 3 && T.k2 && T.k2_pct >= 50))) fuse = 0;
@@ -755,7 +755,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     if (policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
     if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
-    // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently (RESULTS-M1 item 1f).
+    // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently.
     if (fuse == 2 && s.KS1 == 1) s.KS1 = 2;
     const int w1 = 8 * s.WG;
 
@@ -889,7 +889,7 @@ struct Layer
     GvMulti x_in;                     // q_a, kv_a, idx_k, idx_w as one launch (n = 0: one launch each)
     K1 k1;
     Tensor sh[3];                     // the K1's shared / dense MLP records (fc1 or gate, up, fc2 or down), for warm_mlp
-    const void* shw = nullptr;        // trellis shared expert (#65): its fc1 tiles (tr3.table row 256) and their bytes,
+    const void* shw = nullptr;        // trellis shared expert: its fc1 tiles (tr3.table row 256) and their bytes,
     size_t shw_bytes = 0;             // for warm_mlp in place of sh[]
     // dense trellis matrices (dtr.cuh). make_layer binds them where the layer has them, and leaves q_b, o_proj and the
     // dense MLP's K1 off there. launch_q_b / launch_o_proj / launch_mlp run whichever is on.
@@ -917,7 +917,7 @@ inline void set_slots(Layer& L, const dslot::Slot& attn, const dslot::Slot& mlp)
 // launch_warm (common.cuh) on a binding's weights: loads only, results dropped, no output changes. Launched on the
 // step's stream just before a k_wait_peers, the read runs while the rank waits for its peers (DRAM idle), and the
 // kernel after the wait finds the bytes in the GB10 L2 (24 MB; re-reads run about 385 GB/s against about 190 from
-// DRAM, RESULTS-M1 item 1b). Sizing: a warm-up that is longer than the wait it hides in runs serially and costs
+// DRAM). Sizing: a warm-up that is longer than the wait it hides in runs serially and costs
 // its DRAM time, so each set is kept near one wait (about 30 us = 6 MB per the window 3 profile). On a side stream
 // (event fork before the wait, join after the add+norm) the serial risk is gone and the sets may grow.
 // Untested on a GB10: measure per shape with `m1 gv ... warm=0|1|2` (slot_win3.sh section 3) before wiring.
@@ -1050,7 +1050,7 @@ template <class F> inline HeadTensors head_tensors(F find)
     return T;
 }
 
-// Vocab slice of rank r (SPEC §9): 154880 rows = 1210 tiles of 128 in rank order, not rotated, the larger slices first
+// Vocab slice of rank r: 154880 rows = 1210 tiles of 128 in rank order, not rotated, the larger slices first
 // (g6nr.h): TP6 [202,202,202,202,201,201] tiles, TP4 [303,303,302,302]. Returns false if r is not 0..NR-1.
 inline bool vocab_slice(int rank, int& vlo, int& vn)
 {

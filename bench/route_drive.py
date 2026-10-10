@@ -1,4 +1,4 @@
-"""Item 7 (#65): drive the gate's code / prose / structured workloads against a G6_ROUTE_LOG boot and record which
+"""Item 7: drive the gate's code / prose / structured workloads against a G6_ROUTE_LOG boot and record which
 engine request each one was, so route_bytes.py can split the log by workload.
 
 python3 bench/route_drive.py REPO OUT.json [--runs 6] [--tokens 300]

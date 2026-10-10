@@ -247,7 +247,7 @@ public:
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
     // contexts, bases and source rows are read from S2In at launch. Call before the first launch / before connecting.
     void capture_all(unsigned sessions, int mtp, int chunk) {
-        require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention (graft/28-s2-attn): the graphs would bake the session layout");
+        require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
         require(nbk >= 1 && nbk == c_.draft.d.nbk && nbk <= g6rt::NBK, "main/draft context buckets differ");

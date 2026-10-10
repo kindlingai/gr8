@@ -9,7 +9,7 @@
   naming `--cap` and `--variant`. Before, the kernel's OOM killer ended the boot and took sshd and agents on the box
   with it.
 
-## 2026-10-10: o_proj prefill reads its trellis tiles (#116)
+## 2026-10-10: o_proj prefill reads its trellis tiles
 
 - `bindp::k_gemm_tr` loads the raw K4 tiles of a dense trellis matrix (half the bytes of its FP8 copy) and decodes each
   stage into the bytes the copy would hold, so its output equals the copy path's to the bit. The decode of the next
@@ -20,7 +20,7 @@
   4096 (the copy path's time varies between runs); the pair o_proj 0.69-0.95. q_b and the dense MLP keep their copies:
   on the tiles they measured 1.07-1.33.
 
-## 2026-10-10: boot from the exlr8 release alone (#116, step 1, part 2)
+## 2026-10-10: boot from the exlr8 release alone (step 1, part 2)
 
 - `g6m4 --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR`, with no `--manifest` / `--pack`: the Rust loader
   plans each rank's whole image from the release (`engine/loader-rs/src/release.rs`). The experts come from the width
@@ -44,7 +44,7 @@
   trellis form, logits KL 1.5e-5 nats per position, where a BF16 copy of that forward gives 9.3e-5. TP=3 and TP=4
   generate the same tokens. Prefill and decode-only runs generate the same tokens.
 
-## 2026-10-10: the engine serves the dense trellis matrices (#116)
+## 2026-10-10: the engine serves the dense trellis matrices
 
 - Decode: `bind::make_layer` binds q_b, o_proj and the dense MLP of layers 0-2 from the release's trellis tensors
   (`LLLL.NAME.trellis / .suh / .svh`, `dtr::layer_mats`) when a layer has them: one launch each for q_b and o_proj,
@@ -69,7 +69,7 @@
 - `cargo test` compares both on a small synthetic drafter (`tests/data/dflash2`, from `tests/make_dflash2_fixture.py`)
   with zero groups, -0.0, BF16 subnormals and rounding ties.
 
-## 2026-10-10: dense trellis kernels for the exlr8 dense weights (#116, not wired)
+## 2026-10-10: dense trellis kernels for the exlr8 dense weights (not wired)
 
 - `engine/kernels/dtr.cuh`: decode GEMV for the release's trellis K4 dense matrices (q_b, o_proj, the dense MLP of
   layers 0-2) on the release's entries as stored. One launch per matrix rotates its input in a prologue and reduces
@@ -80,7 +80,7 @@
   of today's MXFP8 time, o_proj 0.90-0.95x of int4 g32, the dense MLP 0.62-0.68x of the int4 K1 path.
 - The engine does not call them yet: the loader's tensors (`LLLL.NAME.trellis/.suh/.svh`, `dtr::layer_mats`) come next.
 
-## 2026-10-10: a decoder for the exlr8 dense and vocabulary files (#116, step 1, part 1)
+## 2026-10-10: a decoder for the exlr8 dense and vocabulary files (step 1, part 1)
 
 - `engine/loader-rs/src/exlr8.rs` decodes the exlr8 v2 release's `dense/exlr8-dense-LLL` and `dense/exlr8-vocab`
   matrices in every format they use (trellis K4, int4 g32, MXFP8, FP8 block, FP8 row, BF16, FP32). The values equal the
@@ -124,7 +124,7 @@
   continued conversation 7.1 s vs 17.3 s cold, the same prompt again 4.6 s vs 17.3 s, two conversations continued at
   once next to a decoding session 16.1 / 15.4 s vs 28.8 / 28.1 s.
 
-## 2026-10-09: fused K1 schedules only the plan's slots (#8)
+## 2026-10-09: fused K1 schedules only the plan's slots
 
 - The fused K1 kernel handed out items for M x 8 slots (the capacity) and ran the empty ones (fence, barrier, counter)
   for slots past the plan's experts; it now hands out the plan's own slots (`n_slots_dev`). The last CTA zeroes the
@@ -132,14 +132,14 @@
   14.21 ms at 1 row, 29.55 -> 29.22 ms at 3 rows; isolated K1 at 4-8 rows 220 -> 227 GB/s.
 
 
-## 2026-10-09: multi-tile GEMVs at up to 128 registers (#75)
+## 2026-10-09: multi-tile GEMVs at up to 128 registers
 
 - The dense GEMVs above 8 rows (S2 batches) ran a 1024-thread-bound kernel, capped at 64 registers: the INT4 o_proj and
   q_a fell from ~190 to ~120 GB/s at 24 rows. Bindings with ks <= 16 now take a 512-thread-bound copy (fewer tiles per
   CTA, same bits). S2 at 24 rows: o_proj 9.2 -> 7.5 ms, q_a + kv_a 6.75 -> 6.3 ms per step; 8 sessions 75.5 -> 77.0 tok/s.
 
 
-## 2026-10-09: separate K1 launches at 16+ rows (#8)
+## 2026-10-09: separate K1 launches at 16+ rows
 
 - `row_budget_test --time-v2`: K1 on an exlr8 v2 layer per row count, with the bytes read and GB/s (fresh routing and
   six layer copies per run, so every byte comes from DRAM). On GB10 at 2200 MHz the fused launch reaches 220-225 GB/s
@@ -163,28 +163,28 @@
   QO prepass. Each request takes OWN=4 or OWN=2 by the plain build's rule (prompt + gen against `G6_PF_QP_CTX`). Solo
   output equals the plain build's OWN=4 output byte for byte; 8K prefill 818 -> 1,260 tok/s.
 
-## 2026-10-09: adaptive k verify costs re-measured (#75)
+## 2026-10-09: adaptive k verify costs re-measured
 
 - `spec_len.h`'s verify-time table (ms by rows 1..8) now holds the current DFlash2 step times
   (43.0 / 52.4 / 60.4 / 68.4 / 76.1 / 83.7 / 91.1 / 97.4, was 44 ... 111): steps of 4-8 rows got 9-12% cheaper with
-  #78-#80. Adaptive k now picks longer drafts. One session, DFlash2: after a 57.6K prompt 30.3 -> 34.1 tok/s (two
+  Adaptive k now picks longer drafts. One session, DFlash2: after a 57.6K prompt 30.3 -> 34.1 tok/s (two
   runs each); short prompts code / prose / structured 38.9 / 35.0 / 41.3 -> 38.2 / 36.8 / 40.2.
 
-## 2026-10-09: one-launch absorb / value project at any row count (#75)
+## 2026-10-09: one-launch absorb / value project at any row count
 
 - The plain build ran absorb and value project per row (weights reloaded per row) above 3 rows, so DFlash2 verify
   steps of 4-8 rows paid it. They now take the one-launch kernels at any row count. One session, DFlash2 (default):
   short prompts +2% (38.1 / 33.6 / 40.5 -> 38.7 / 34.5 / 41.3 code / prose / structured), 31.9 vs 28.0 tok/s after a
   57.6K prompt. MTP k=2 and prefill unchanged.
 
-## 2026-10-09: head-batched attention for every decode call (#75)
+## 2026-10-09: head-batched attention for every decode call
 
 - The head-batched scores and context kernels now serve every decode attention call, not only the fixed-K ones: verify
   rows of a fresh index and contexts past 2048 take them too (the generic `mla_scores` / `context_parts` do the same
   arithmetic; `dec_heads_test` checks both). One session, TP4: MTP k=2 34.2 -> 36.3 tok/s after a 13.5K prompt and
   28.0 -> 32.2 after 57.6K; DFlash2 32.8 -> 35.1 and 23.7 -> 28.0. Short prompts and prefill unchanged.
 
-## 2026-10-09: decode step profile and attention kernels (#75, #76)
+## 2026-10-09: decode step profile and attention kernels
 
 - `G6_DEC_EVPROF=N`: per-stage decode step times from event-record nodes in the captured main-step graphs (attention
   split into its kernels), printed every N main steps in each rank's log.
@@ -212,11 +212,11 @@
 - Refused with `--dflash-manifest` (the drafter's prompt-context taps
   are written by the prefill rows a hit skips).
 - `engine/tests/test_prefix_reuse.cpp` (CPU, in `scripts/build.sh`) and `engine/tests/test_prefix_reuse.py` (the same
-  under ASan/UBSan, plus the `g6m4.cu` hook order) cover the state machine. Measured on the old line at `--prefill 4096
+  under ASan/UBSan, plus the `g6m4.cu` hook order) cover the state machine. Measured on an earlier build at `--prefill 4096
   --pf-lanes 2`: hit TTFT 53.8 s vs cold 155.6 s over 14 requests (-65%), hit output identical to cold. Not yet measured
   here.
 
-## 2026-10-05: Rust front end, g6front-rs (#15)
+## 2026-10-05: Rust front end, g6front-rs
 
 - New `frontend/g6front-rs/`: the OpenAI/vLLM front end in Rust (hyper, HF `tokenizers` 0.23.2 as the Python
   front end uses, minijinja). It takes the same flags and gives byte-identical responses to `g6front`.
@@ -229,7 +229,7 @@
   `frontend/README.md`.
 - `mock_engine.py --plain`: no per-request work that grows with the prompt, for front-end benchmarks.
 
-## 2026-10-05: adaptive draft length (#12); TP4 drafts with DFlash2 by default
+## 2026-10-05: adaptive draft length; TP4 drafts with DFlash2 by default
 
 - `scripts/launch_tp4.sh` now boots the DFlash2 drafter with an adaptive draft count of 1..7 by default. Against MTP k=2
   at 2200 MHz: on answer text code +21%, prose level, structured +46%; on reasoning text about level (code -2.6%,
@@ -247,7 +247,7 @@
 - `engine/tests/test_spec_len.cpp` (CPU) and `engine/ref/dflash2_ab.py` (two feature sets for one token sequence
   through the reference drafter: feature distance and teacher-forced acceptance).
 
-## 2026-10-05: exlr8-e4m3 expert packs, chosen per layer (#19)
+## 2026-10-05: exlr8-e4m3 expert packs, chosen per layer
 
 - The converter reads TR3 and exlr8-e4m3 checkpoints. Both have the same tensor names and layout. The layer file's
   safetensors metadata `exlr8` tells the two formats apart, and the converter checks it against exlr8's shared input
@@ -264,7 +264,7 @@
 - At bind time each exlr8-e4m3 layer must have one hidden-side sign vector across its block rows (`tr3.v1`,
   `tr3.v3`), or the rank stops. Rank 0 logs which layers are exlr8-e4m3.
 - TP4 at 2200 MHz, exlr8-e4m3 against TR3 on the same build: prefill, TTFT and decode within boot noise, 87K needle
-  found, KL against the TR3 reference 0.049 (0.053 without the rounding), top-1 agreement 93.9%. Details on #19 / the PR.
+  found, KL against the TR3 reference 0.049 (0.053 without the rounding), top-1 agreement 93.9%.
 - `tools/convert/experr.py`: one layer's routed-expert error against BF16 for TR3 and exlr8 checkpoints (CPU).
 
 ## 2026-10-05: rejection sampling for drafts (opt-in, `SPEC_ACCEPT=rejection`)
@@ -298,12 +298,12 @@
   `engine/ref/dflash2_ref.py` (NumPy reference), `engine/ref/dflash2_check.py` with `engine/runtime/dfltest.cu` (the
   step of all ranks on one GPU against the reference), `engine/ref/dflash2_replay.py` (replays a `G6_DFL_DUMP`).
 
-## 2026-10-04: S2 round counters and the S2 shim (#28)
+## 2026-10-04: S2 round counters and the S2 shim
 
 - **Round log.** `G6_S2_ROUNDLOG=1` (DEC_S2 build, rank 0) prints one `# s2_round` line per decode step: kind, round id, active sessions of the round, sessions and rows of the step, launch+fence ms, and on main steps the distinct experts per MoE layer. Off by default, no cost. `tools/s2_costfit.py` fits `step_ms = base + per_expert * experts(d*rows) + per_token * rows` per step kind.
 - **`frontend/g6s2shim.py`.** PROTOCOL.md v1 on the engine socket over `g6m4 --s2 DIR`, so several requests run at once, with a real `CANCEL`. `tests/fake_s2_engine.py` and `tests/test_s2shim.py` run it without a GPU. See `frontend/README.md`.
 
-## 2026-10-04: logprobs and prompt_logprobs (issue #23)
+## 2026-10-04: logprobs and prompt_logprobs
 
 - The head returns the top 20 tokens of a row on request (`SampleRow::topk`): each rank selects its slice's best 20 and
   sends them after the normal head record; rank 0's merge turns them into ids, logprobs (log-sum-exp over the full
@@ -315,7 +315,7 @@
 - `frontend/g6shim.py` accepts `logprobs` / `prompt_logprobs` (max 20) and reports `max_logprobs: 20`.
 - `engine/tests/test_topk.cpp`: CPU checks of the log-sum-exp, the merge and the ranks.
 
-## 2026-10-04: rank health probe, boot admission, progress-thread isolation (#29)
+## 2026-10-04: rank health probe, boot admission, progress-thread isolation
 
 - New `tools/health/`: `rank_probe.py` probes every rank before a boot (RDMA write rate per rail around a ring of the ranks, GPU clock and throttle reasons under load, a driver wedge check, device-memory read and host-to-device copy rates compared between ranks, proxy CPU state) and names the reason for each refusal. `gpuprobe.cu` is its GPU part (built by `scripts/build.sh`, copied by `scripts/stage.sh`). The probe only reads and measures, and refuses a node where a model is booted.
 - `scripts/launch_tp6.sh` runs the probe first and refuses to boot (exit 3) when a rank fails; `RANK_HEALTH=0` skips it. The shim and front end now run off the proxy CPUs.
@@ -346,9 +346,9 @@
   manifests); `qopack.py` takes four rank packs; `build_packs.sh` picks TP4 from the GPTQ dir. New `launch_tp4.sh` and
   `config/cluster.env.tp4.example`; `build.sh BUNDLE_LIBS=1` and `stage.sh SHARED=1` for nodes without the CUDA
   toolkit and packs on a shared mount. TP4 runs `G6_PF_OWN=1`: the 13 GB QO pack does not fit next to a 90 GB TP4
-  rank pack. First numbers and the open QO question are on #2.
+  rank pack.
 - **Pinned host-to-device copies** (`engine/h2d.h`, `g6h2d::copy`). Every copy from pageable host memory to the GPU
-  goes through a per-thread pinned buffer, so a 64 KiB-page kernel cannot hang on it (#6). Host code only.
+  goes through a per-thread pinned buffer, so a 64 KiB-page kernel cannot hang on it. Host code only.
 
 ## 2026-10-04: gate harness (`bench/gate/`)
 
@@ -373,3 +373,24 @@ The default build (`scripts/build.sh`) is still K1H2. The new multi-session code
 - SELX (`engine/attn/selx.cuh`): our own exact top-2048 select for prefill index tiles. It runs on tiles with n >= 32 rows and context >= `G6_PF_SELX_CTX`. Its output is identical to SEL32's. Unset = SEL32 (unchanged behaviour).
 - CP decode `-DCP_F1A`: the phase-2 per-partial wait + get is fused into one launch (off by default).
 - The front end metrics have a hook for S2.
+
+## Earlier: multi-session (S2) fixes on six Sparks
+
+### Multi-session decode fault ("FABRIC" error word)
+
+- **Symptom:** the engine stopped (all ranks rc=3) with `fabric 1627389953` (or `...57`), `attn 0 cp 0`, on a main step
+  with 6 rows, after minutes of steady decode with two or more chats. Ranks 1-5 logged
+  `control recv failed: ret=-1 errno=11 ... remaining=4 of 4 bytes`.
+- **Cause:** each worker's control thread waited for the next ADMIT/CANCEL frame with the socket receive timeout
+  (`G6_S2_TIMEOUT`, default 120 s). In steady decode no frames are sent, so after 120 s the first worker to time out
+  left the epoch before its next main step. The other ranks then hit the fabric wait timeout (~9.3 s) and raised the
+  error word naming that worker (p in the low byte). Rank 0 is the leader and never waits idle, so it logged nothing.
+- **Fix:** the event reader waits without a timeout until a frame starts (a partial frame still times out); TCP
+  keepalive (10 s + 4 x 5 s) and `TCP_USER_TIMEOUT` 30 s detect a lost peer instead.
+- **Checked:** main with `G6_S2_TIMEOUT=20` failed the same way at main step 161; the fix ran 9 waves of S = 2/3/4
+  chats (8K prompts, gen 4096) for 50 min, 29,997 main steps, at the default timeout with no fault.
+
+### S=3/4 descriptor race
+
+- A batched KV-append descriptor was read while it was still zero, before its upload finished (the memset and the upload ran on different streams).
+- After the fix: no fault, and exact outputs at S=2/3/4 in 4 of 4 passes, all six ranks rc=0.

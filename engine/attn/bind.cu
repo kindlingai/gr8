@@ -62,7 +62,7 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     if (!out || out->storage || !p || rank < 0 || rank >= g6nr::NR || layer < 0 || layer > 78 ||
         capacity <= 0 || max_rows <= 0 || max_rows > capacity || query_tile <= 0 ||
         query_tile > 64 || capacity > INT_MAX / query_tile) return invalid;
-    // head group of this rank at this layer (SPEC §9): (rank - layer) % NR, the larger groups first (TP6 edges
+    // head group of this rank at this layer: (rank - layer) % NR, the larger groups first (TP6 edges
     // 0,11,22,33,44,54,64; TP4 16 heads each)
     const int group = (rank - layer % g6nr::NR + g6nr::NR) % g6nr::NR;
     const int h = g6nr::width(g6nr::HEADS, group);
@@ -78,9 +78,9 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     a.rows = max_rows; a.context = capacity; a.heads = h; a.page_size = 64;
     a.page_count = a.table_size = (int)(((int64_t)capacity + 63) / 64);
 #if defined(G6_CP) && G6_CP
-    // CP page map (BUILD-CPE, DESIGN-CP §1): logical pages < R/64 replicated, the rest stored by page % cp_nr. Physical
+    // CP page map: logical pages < R/64 replicated, the rest stored by page % cp_nr. Physical
     // pages: the replicated prefix first, then my tail pages in logical order. The table is per binding (one sequence
-    // today); a per-session table (PLAN-S2) is the same map with its own physical pages.
+    // today); a per-session table is the same map with its own physical pages.
     std::vector<int> cp_table;
     a.cp_nr = cp_nr; a.cp_rank = cp_nr ? rank : 0;
     if (cp_nr) {

@@ -1,4 +1,4 @@
-// #31 (L1) decode indexer, exact variants. Included inside ga after select.cuh. Build flag DEC_IDX31=1 routes decode
+// The DEC_IDX31 decode indexer, exact variants. Included inside ga after select.cuh. Build flag DEC_IDX31=1 routes decode
 // make_index through them; tests and tools/idxbench call them regardless of the flag.
 // - index_scores_m: one CTA per 32-key tile scores ALL n rows of the query tile, so each key is read and converted once
 //   per step instead of once per row. Per row the arithmetic is index_scores' (same fp16 key values, same wmma tiles,
@@ -130,7 +130,7 @@ static void threshold_compact32_live(const G6Attn& a,Input input,Work& w,int cou
     }
     radix_compact32_live<<<dim3(chunks,count),256,0,stream>>>(input,w.si,w.selection,w.selected);
 }
-// the #31 select: as select_index, with the live-context chunk bound past 32768
+// the DEC_IDX31 select: as select_index, with the live-context chunk bound past 32768
 template<class Input>
 static cudaError_t select_index31(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream){
     if(a.context<=32768)return select_index(a,input,w,start,count,stream);

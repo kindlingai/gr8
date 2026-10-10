@@ -1,4 +1,4 @@
-//! XXH64, the checksum the exlr8 v2 index files carry for every expert half (SPEC.md 6.4). The reference algorithm,
+//! XXH64, the checksum the exlr8 v2 index files carry for every expert half (exlr8quant SPEC.md 6.4). The reference algorithm,
 //! streaming, so one hash can cover the half's trellis bytes, its per-channel values and the block scales in turn.
 
 const P1: u64 = 11400714785074694791;

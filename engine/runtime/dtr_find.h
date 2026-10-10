@@ -1,4 +1,4 @@
-// Dense trellis matrices (#116, kernels/dtr.cuh) on the prefill path. The prefill binder (bindp::layer_tensors) and the
+// Dense trellis matrices (kernels/dtr.cuh) on the prefill path. The prefill binder (bindp::layer_tensors) and the
 // pair-owner weights (qo_weights.cuh qp_half) read q_b and the dense MLP as MXFP8 codes + scales under
 // L%03d.NAME.mx.codes / .mx.scales. For a matrix in the release's trellis form, dtr_overlay serves its FP8 tile copy
 // (dtr::make_fp8: exact, still rotated, every scale 127) under those names. The binders find the matrix's suh / svh

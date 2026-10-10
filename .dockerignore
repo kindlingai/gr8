@@ -1,5 +1,5 @@
-# Keep the build context to tracked source. Build outputs, local configs and internal coordination files stay out of
-# both the builder and the runtime image.
+# Keep the build context to tracked source. Build outputs and local configs stay out of both the builder and the
+# runtime image.
 .git
 .github
 bin*
@@ -9,8 +9,4 @@ bin*
 **/*.log
 bench/results*.jsonl
 config/cluster.env
-frontend/assets
 frontend/tests/work
-frontend/tests/tools/results.jsonl
-claims
-exl3rate

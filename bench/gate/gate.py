@@ -178,7 +178,7 @@ def cmd_check(a):
     for r in reasons:
         print('  -', r)
     if status == 'PARTIAL':
-        print('  The full gate set was not checked; this is not a pass of issue #1\'s gates.')
+        print('  The full gate set was not checked; this is not a pass of the gate set.')
     sys.exit(0 if status == 'PASS' or (status == 'PARTIAL' and a.allow_partial) else 1)
 
 

@@ -1,4 +1,4 @@
-// g6 fabric: NR-rank (six or four) one-shot all-reduce over raw ibverbs with the GPU in the loop (RUNTIME.md §3).
+// g6 fabric: NR-rank (six or four) one-shot all-reduce over raw ibverbs with the GPU in the loop.
 // Buffers are cudaHostAlloc'd (pinned, device-mapped) and registered on both rails: the GPU writes partials and
 // reads peers' partials directly; a host proxy thread posts the RDMA writes when the GPU rings a doorbell.
 #pragma once
@@ -19,11 +19,11 @@ struct FabricConfig {
   int ncoll = 0;                  // collectives per step (slot count per parity)
   int port = 18600;               // TCP bootstrap port on rank 0 (uses port..port+3)
   int proxy_cpu = -1;             // pin the proxy thread to this CPU (-1 = no pinning)
-  // variable layout (cplayout.h; J4 CP fabric): non-empty -> ncoll = vcap.size(), slot_bytes ignored, per-collective
+  // variable layout (cplayout.h; CP fabric): non-empty -> ncoll = vcap.size(), slot_bytes ignored, per-collective
   // capacity vcap[c] and destination vdst_k[c] (0 = all peers, k = peer (rank + k) % nr only). Empty = uniform layout.
   std::vector<uint32_t> vcap;
   std::vector<uint8_t> vdst_k;
-  // bulk mode (J4 CP prefill staging, BUILD-CPE step 4d): bulk_bytes > 0 -> no collectives (ncoll / slot_bytes / vcap
+  // bulk mode (CP prefill staging): bulk_bytes > 0 -> no collectives (ncoll / slot_bytes / vcap
   // ignored); the registered region is [bulk | flags [bulk_flags][nr] x {val, aux} u64 | doorbell [bulk_flags] u64 |
   // aux_out [bulk_flags] u64 | error], the same layout on every rank, so a range of my bulk area lands at the same offset
   // of a peer's (identity placement)

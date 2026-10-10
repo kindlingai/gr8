@@ -47,7 +47,7 @@ class ST:
         return np.frombuffer(buf, dtype=dt).reshape(shape)
 
     def read(self, name, lo, n):
-        """Bytes lo..lo+n-1 of a tensor's data as uint8 (one half of a v2 trellis tensor, #65)."""
+        """Bytes lo..lo+n-1 of a tensor's data as uint8 (one half of a v2 trellis tensor)."""
         a, b = self.h[name]['data_offsets']
         if lo < 0 or lo + n > b - a:
             raise ValueError(f'{self.path}:{name}: range {lo}+{n} outside {b - a} bytes')
@@ -61,7 +61,7 @@ class ST:
         return np.frombuffer(buf, np.uint8)
 
     def read_abs(self, off, n):
-        """Bytes off..off+n-1 of the file as uint8 (absolute file offsets, as the v2 index gives them, #65)."""
+        """Bytes off..off+n-1 of the file as uint8 (absolute file offsets, as the v2 index gives them)."""
         buf = bytearray(n)
         mv, o = memoryview(buf), 0
         while o < n:

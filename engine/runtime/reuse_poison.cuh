@@ -1,6 +1,6 @@
-// K1REUSE gate arm (G6_REUSE_POISON=1, g6m4 --reuse-prefix): on a hit, rows [r0, r1) of every layer's latent (MLA)
+// Prefix-reuse gate arm (G6_REUSE_POISON=1, g6m4 --reuse-prefix): on a hit, rows [r0, r1) of every layer's latent (MLA)
 // cache and index (DSA) cache are set to NaN bytes before the suffix prefill. r0 = the retained rows, r1 = the old
-// sequence's written_end: the stale rows past the new prefix. Assumption A1 (prefix_reuse.h): no stale value
+// sequence's written_end: the stale rows past the new prefix. prefix_reuse.h assumes no stale value
 // contributes to a score or an output, so a poisoned run must print the same lines as the same run without poison;
 // a read of a poisoned row gives NaN scores (attention error word 4) or different lines. Gate only (default off).
 #pragma once

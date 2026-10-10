@@ -1,4 +1,4 @@
-// Top-k logprobs of the head (issue #23): the order, the cross-rank merge and the rank rule, as plain functions that
+// Top-k logprobs of the head: the order, the cross-rank merge and the rank rule, as plain functions that
 // compile for the device (glue.cuh k_head_local / k_head_merge / k_head_merge_tp) and for g++ (engine/tests/test_topk.cpp).
 //
 // A token's place in a top list: larger logit first, ties to the lower vocab id. Each rank sends its slice's LP_K best

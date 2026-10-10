@@ -8,12 +8,12 @@
 // Hit = skip > 0 and (noend or prompt.size() >= written_end): every row the old sequence wrote past the new context is
 // rewritten by this request before any step reads it (kernels read only positions <= the row's own position; the rule
 // is redundant under that, G6_REUSE_NOEND=1 drops it). Miss = reset + full prefill (the switch-off path).
-// W44 grid (G6_REUSE_ALIGN=1, g6m4 sets grid = the cold prefill grid: --prefill MP; RGRID: one sub-batch, was x 2 with
-// --pf-lanes 2, W44 CL1 [M]: the lane pairing does not change a row): a hit retains
+// The grid (G6_REUSE_ALIGN=1, g6m4 sets grid = the cold prefill grid: --prefill MP, one sub-batch; the lane pairing does
+// not change a row): a hit retains
 // only [0, floor(min(skip, pf_end) / grid) * grid), pf_end = the rows prefilled contiguously from 0 in the current sequence
 // (decode-written rows never count). The re-prefill then starts on a cold grid point, and every retained grid cell was one
-// complete cold-shaped prefill cell of an earlier request, so a hit computes every row with the cold chunk shape (W38b: the
-// hit's own suffix chunk shape was the only difference). Retained < grid -> miss 'grid'. One exception: when the new
+// complete cold-shaped prefill cell of an earlier request, so a hit computes every row with the cold chunk shape (the
+// hit's own suffix chunk shape was otherwise the only difference). Retained < grid -> miss 'grid'. One exception: when the new
 // prompt's prefill ends exactly where the retained one did (limit == pf_end, the same prompt sent again), its last cell
 // [floor(pf_end / grid) * grid, pf_end) has the retained cell's rows and shape, so all pf_end rows are kept.
 #include <algorithm>
@@ -24,9 +24,9 @@ namespace g6rt {
 struct PrefixReuse
 {
     bool strict = false, noend = false;   // G6_REUSE_STRICT=1 / G6_REUSE_NOEND=1 (g6m4 sets them once)
-    int grid = 0;                       // W44: G6_REUSE_ALIGN=1 -> the cold prefill grid (rows); 0 = off (the old rule)
-    int pf_end = 0;                     // W44: rows [0, pf_end) of the current sequence were written by prefill, contiguously
-    int raw = 0;                        // W44: the last begin()'s skip before the grid rule (log only)
+    int grid = 0;                       // G6_REUSE_ALIGN=1 -> the cold prefill grid (rows); 0 = off (the old rule)
+    int pf_end = 0;                     // rows [0, pf_end) of the current sequence were written by prefill, contiguously
+    int raw = 0;                        // the last begin()'s skip before the grid rule (log only)
     std::vector<int> history;           // previous full prompt + ACTUALLY emitted outputs
     int valid = 0, main_end = 0, draft_end = 0;
     int written_end = 0;                // max row (exclusive) written in any cache of the current sequence, chain rows included

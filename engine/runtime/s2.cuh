@@ -1,5 +1,4 @@
-// S2 batched decode, Stage 1 (component 6; internal design notes,
-// not in this repository). Included by rank.cuh under -DDEC_S2; every hook there is inert unless
+// S2 batched decode. Included by rank.cuh under -DDEC_S2; every hook there is inert unless
 // Model::s2on. Host code plus four new kernels (k_s2_cells in s2_cells.cuh, k_s2_draft_hid, k_s2_draft_keep); the attention
 // kernels read per-row bounds (attn.cu, DEC_S2 only).
 //

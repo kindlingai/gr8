@@ -1,4 +1,4 @@
-// Batched attention unit test (gr8 #28, S2): one GPU, no fabric, no pack files, synthetic weights.
+// Batched attention unit test (S2): one GPU, no fabric, no pack files, synthetic weights.
 //   s2_attn_test [--only rep|cp] [--seeds N] [--no-long]
 // Claim under test: ONE attention call per layer for the rows of several sessions (per-row bounds and block table in device
 // data, written by k_s2_cells from S2In) gives, for every row, the same bits as today's per-session calls (one replay entry

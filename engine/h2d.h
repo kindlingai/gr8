@@ -1,4 +1,4 @@
-// Host-to-device copies from pageable host memory, made safe on 64 KiB-page kernels (issue #6): there a pageable copy
+// Host-to-device copies from pageable host memory, made safe on 64 KiB-page kernels: there a pageable copy
 // whose source is not 64 KiB-aligned can hang (the process spins, the GPU sits idle). The bytes go through a pinned
 // staging buffer instead, in chunks of at most 64 MiB. One buffer per thread, allocated on first use and kept.
 // The copy has finished when the call returns (it waits for `st`), so the source may be reused at once, as with

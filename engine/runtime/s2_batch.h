@@ -1,4 +1,4 @@
-// S2 batched decode driver, host only (component 6).
+// S2 batched decode driver, host only.
 // Runs S sessions' MTP sequences with their rows sharing engine steps. Per session the step sequence is the one
 // rank.cuh mtp_sequence runs for that session alone (same rows, positions, sample keys, contexts, in the same order):
 //   prompt   each session's prompt steps run as that session's own step (one session per step, scheduler rule ii),
@@ -10,7 +10,7 @@
 //            The k1 split class of a main step is the class of a session's K+1 rows (as its solo step), not of M.
 // A session leaves when its emit says finished (right after the verify, as mtp_sequence returns there) or at the start
 // of the first round after it holds n_gen tokens (mtp_sequence runs that round's draft steps first, so this does too).
-// Adaptive draft count (gr8 #76, Batch::adapt): every session in a round verifies the same k <= K drafts. At the end of a
+// Adaptive draft count (Batch::adapt): every session in a round verifies the same k <= K drafts. At the end of a
 // round, before the chain steps, k for the next round is chosen from each session's accept rates (SpecLen, accept counts
 // only, so every rank chooses the same k) and the S2 step costs (S2Cost): a verify row costs ~7 ms in a shared step, so
 // at many sessions the K-th draft no longer pays. The main step's k1 class stays row_class(K+1), so a row's bits do not
@@ -21,7 +21,7 @@
 // round verifies k <= 7 drafts (one SpecLen for every DFlash2 session, as the plain build keeps one per process). It also
 // runs the MTP first-form draft over the same rows, so the MTP layer's cache and d[1] stay complete: when a second
 // session arrives (demote) the K-1 chain steps hand it to the MTP rounds above. A demoted session stays on MTP.
-// Drafter choice (Batch::dsel, gr8 #49): with it on, a DFlash2 session drafts each round with DFlash2 or MTP, whichever is
+// Drafter choice (Batch::dsel): with it on, a DFlash2 session drafts each round with DFlash2 or MTP, whichever is
 // expected to commit more tokens per ms (SpecLen estimates from accept counts and the drafters' log-probabilities only, so
 // every rank chooses the same). On MTP rounds the drafter still takes the accepted rows as context, so a switch back
 // needs no catch-up; every DSel::probe-th of them also drafts, and its 7 drafts are scored against the tokens later
@@ -54,8 +54,8 @@ struct Step
 {
     enum Kind { MAIN, DRAFT, CHAIN } kind = MAIN;
     // first-step timer: what this step is, for E1/E2 grouping.
-    // TAIL = the final PromptTail prompt MAIN (design E1); DECODE1 = the first Decode-kind round MAIN
-    // after the tail (design E2); ROUND = every steady decode-round MAIN. DRAFT/CHAIN steps carry
+    // TAIL = the final PromptTail prompt MAIN; DECODE1 = the first Decode-kind round MAIN
+    // after the tail; ROUND = every steady decode-round MAIN. DRAFT/CHAIN steps carry
     // the class of the MAIN they follow (TAIL/DECODE1/ROUND), so the readout pairs them.
     enum Event { TAIL, DECODE1, ROUND } event = ROUND;
     // first-step timer: per-session event class, parallel to sess.
@@ -115,7 +115,7 @@ struct Hooks
     std::function<int(int)> dfl_start;
 };
 
-// Persistent driver state for the scheduler (component 5): stable slots 0..S2N_SLOTS-1, all calls at round boundaries.
+// Persistent driver state for the scheduler: stable slots 0..S2N_SLOTS-1, all calls at round boundaries.
 //   admit(slots, sessions)  prompt (tail) steps of each new session as its own steps (+ first-form drafts), in the order
 //                           given, then one batched chain over those still live. A session finished by emit during its
 //                           prompt is finished at once (finished(q), result(q)).
@@ -130,7 +130,7 @@ constexpr int S2N_SLOTS = 8;
 // sessions it measured within 0-3% of K drafts every round (the K-th draft is still accepted ~60% of the time), and
 // its extra main-step graphs take ~1 GiB
 inline bool adapt_env() { const char* e = getenv("G6_S2_ADAPT"); return e && atoi(e) != 0; }
-// Step times at TP4, 2200 MHz, contexts < 2K (G6_DEC_EVPROF / G6_S2_ROUNDLOG, gr8 #75), ms
+// Step times at TP4, 2200 MHz, contexts < 2K (G6_DEC_EVPROF / G6_S2_ROUNDLOG), ms
 struct S2Cost
 {
     double main0 = 44, main_row = 7;            // verify step of M rows: main0 + main_row * M
@@ -224,7 +224,7 @@ private:
         v.kind = Step::MAIN;
         v.round = cur_round_; v.round_active = cur_active_;
         // first-step timer: E1/E2 grouping. The first decode-round MAIN of a
-        // session is DECODE1 (design E2); every later round MAIN is ROUND. A step's label is the
+        // session is DECODE1; every later round MAIN is ROUND. A step's label is the
         // LOWEST class among its sessions (an unlabeled steady session never masks another's E2).
         v.event = Step::ROUND;
         for (int q : act) if (st_[q].rounds == 0) { v.event = Step::DECODE1; break; } // strongest class in the step
@@ -347,7 +347,7 @@ private:
         std::vector<int> tokens, d;
         int n = 0;
         bool on = false, done = false;
-        int rounds = 0; // first-step timer: per-session decode rounds; round 1 MAIN = DECODE1 (design E2)
+        int rounds = 0; // first-step timer: per-session decode rounds; round 1 MAIN = DECODE1
         int k = 0;      // drafts held for the next verify (d[1..k])
         bool dfl = false;                 // on the DFlash2 drafter (Session::dflash, until demote)
         bool mtp = false;                 // drafter choice: this round drafts with MTP (d[1..K] held, x.k = K)

@@ -1,4 +1,4 @@
-// #116 dense trellis matrices (dtr.cuh, and the prefill GEMMs of bind_prefill.cuh) on real release entries: output dumps for the reference check
+// Dense trellis matrices (dtr.cuh, and the prefill GEMMs of bind_prefill.cuh) on real release entries: output dumps for the reference check
 // (engine/ref/dtr_ref.py, which also writes the inputs), and decode timing against today's int4 g32 / MXFP8 GEMVs and
 // the int4 dense MLP (K1).
 //

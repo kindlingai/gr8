@@ -1,4 +1,4 @@
-"""Two sets of DFlash2 context features for the same token sequence, side by side (issue #12, the acceptance gap).
+"""Two sets of DFlash2 context features for the same token sequence, side by side (the acceptance gap).
 
 python3 engine/ref/dflash2_ab.py --src DRAFTER --glm GLM_DIR --tokens T --a A [--b B] --start N [--quant bf16] [--out F]
 

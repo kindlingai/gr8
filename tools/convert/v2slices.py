@@ -1,4 +1,4 @@
-"""Per-rank index slices of the exlr8 v2 files (#65): what one TP rank needs to fetch and load its halves at one width,
+"""Per-rank index slices of the exlr8 v2 files: what one TP rank needs to fetch and load its halves at one width,
 without reading the layer index files.
 
 For every TP size N, rank r and width K, one safetensors file tp<N>/k<K>/rank<r>.safetensors holds, per layer L that

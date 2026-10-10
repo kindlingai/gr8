@@ -118,7 +118,7 @@ do_check() {
 
   if [ "$TP" != "$NRANK" ]; then fail TP "TP=$TP but HOSTS names $NRANK boxes"
   elif ! launcher > /dev/null; then fail TP "no launcher for TP=$TP (4, 6 or 3)"
-  else ok TP "$(basename "$(launcher)")$([ "$TP" = 3 ] && echo ', not yet measured on hardware')"; fi
+  else ok TP "$(basename "$(launcher)")"; fi
   for k in IPS IPS2; do
     v=${!k:-}
     if [ -z "$v" ]; then fail "$k" "not set in the config"

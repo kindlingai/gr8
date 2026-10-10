@@ -34,7 +34,7 @@ class ControlIO {
         }
     }
     // idle: the link may stay silent indefinitely before the first byte (a worker's event reader between
-    // admit/cancel events, #26), so a receive timeout (EAGAIN) with nothing read yet is retried. Once a frame has
+    // admit/cancel events), so a receive timeout (EAGAIN) with nothing read yet is retried. Once a frame has
     // started, the timeout applies again. A peer close or shutdown() still ends the wait (recv returns 0).
     void read_all(uint8_t* p, size_t n, bool idle = false) {
         const size_t total = n;
@@ -60,7 +60,7 @@ public:
         require(!setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) &&
                 !setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv), "control timeout setup failed");
     }
-    // TCP peer liveness for the idle event wait (#26): the idle read has no timeout, so a peer that is lost without a
+    // TCP peer liveness for the idle event wait: the idle read has no timeout, so a peer that is lost without a
     // FIN/RST (power loss, cable pull) must be detected by the kernel. Keepalive probes after idle_s of silence, every
     // intvl_s, cnt times; TCP_USER_TIMEOUT bounds unacknowledged sends the same way. A dead peer then fails recv/send
     // with ETIMEDOUT, which ends the idle wait. TCP sockets only.

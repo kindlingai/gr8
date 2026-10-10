@@ -1,6 +1,6 @@
 # Pair-owner QO prefill at TP4 (`G6_PF_OWN=4`)
 
-Design by adapt (branch `tp4-engine-fusedrx`, `engine-tp4/DESIGN-QO-PAIR.md`), ported to `main` in #39. This page
+Design by adapt-ai-systems. This page
 describes what `main` implements. Code: `engine/runtime/qp.cuh`, `engine/runtime/qo_weights.cuh` (pair weights and the
 rolling pack), `engine/runtime/qp_wire.h` (the RDMA protocol), `tools/convert/pairpack.py` (resident pair packs).
 
@@ -8,7 +8,7 @@ rolling pack), `engine/runtime/qp_wire.h` (the RDMA protocol), `tools/convert/pa
 
 `G6_PF_OWN=3` (QO attention) is g6's biggest prefill lever: the owner of a row runs the whole attention block for all
 64 heads of that row. It needs the full-head QO pack (13.1 GB) on every rank. At TP4 a rank pack is 90.3 GB, and the
-two do not fit together on a GB10 (#2). So TP4 ran `G6_PF_OWN=1`.
+two do not fit together on a GB10. So TP4 ran `G6_PF_OWN=1`.
 
 ## The mode
 
@@ -50,7 +50,7 @@ both pair members (the lower head group first).
 - **Resident pair pack (`--qp-manifest` / `--qp-pack`).** `tools/convert/pairpack.py` builds `qp.rank<r>.pack` from the
   four rank packs (5.97 GB per rank). This does not fit next to a TP4 rank pack at the 393,216-token pool, so it is
   only for smaller pools or tests.
-- Dense trellis q_b / o_proj (the exlr8 release form, #116). The q_b half is the member's FP8 tile copy
+- Dense trellis q_b / o_proj (the exlr8 release form). The q_b half is the member's FP8 tile copy
   (`engine/runtime/dtr_find.h`, exact: the codebook is E4M3) with every scale 127, so the slots and the wire carry it
   as they carry MXFP8. The o_proj half travels and sits in the slot as the member's raw trellis tiles (12.6 MB, inside
   the MXFP8 half's code range), and the pair's o_proj GEMM decodes them (`k_gemm_tr`). The half image adds the member's q_b svh and o_proj suh slices (8 KiB each). The shared

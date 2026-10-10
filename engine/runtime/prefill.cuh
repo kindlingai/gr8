@@ -608,8 +608,8 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.back().heads = y.ab.args.heads;
         P.T.back().fc1_wide = y.T.fc1_wide;      // decode widened tr3.fc1 in place: prefill must read the same order
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
-        P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths, #65)
-        P.T.back().sh_trellis = y.T.sh_trellis;  // the shared expert as trellis row 256 (#65)
+        P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths)
+        P.T.back().sh_trellis = y.T.sh_trellis;  // the shared expert as trellis row 256
         if (y.T.shfp8.codes[0])                  // ... and its FP8 copy for the prefill GEMMs (bind::make_shared_fp8)
         {
             bindp::Tensors& t = P.T.back();
@@ -1436,7 +1436,7 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
     }
     pf_mark(5, st);
     pf_blas_x2(m, P, i, M, st);
-    bindp::launch_shared(b, st);                 // exlr8 v2 trellis shared expert (#65); no-op otherwise
+    bindp::launch_shared(b, st);                 // exlr8 v2 trellis shared expert; no-op otherwise
     bindp::launch_experts(b.ex, st);
     if (!P.rc_file.empty() && b.ex.on) pf_rcdump(m, P, i, M, b.ex.cnt, st);
     pf_mark(6, st);
@@ -1445,7 +1445,7 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 }
 // the whole sub-batch of one rank in stream order (real fabric); layer i runs as layer-step ls0 + i
 #if defined(G6_CP) && G6_CP
-// J4 CP prefill staging over the real fabric (defined below, BUILD-CPE step 4d); no-ops unless the model is staged
+// CP prefill staging over the real fabric (defined below); no-ops unless the model is staged
 inline void cp_pf_pre(Model& m, int i, int start, cudaStream_t st);
 inline void cp_pf_prefetch(Model& m, int i, int start, cudaStream_t st);
 inline void cp_pf_post(Model& m, int i, int a0, int n0, int a1, int n1, cudaStream_t st);
@@ -1712,7 +1712,7 @@ inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
     fclose(o);
 }
 #if defined(G6_CP) && G6_CP
-// ---------------------------------------------------------------- J4 CP prefill staging (BUILD-CPE.md step 4)
+// ---------------------------------------------------------------- CP prefill staging
 // A prefill sub-batch runs today's kernels on a staged, identity-mapped copy of each layer's latent KV: cp_pf_enter swaps
 // every layer's binding args (in place: the prefill binder checks the binding's address) to {mla_cache = pool[i % 2],
 // block_table = identity, page_count = table_size, cp_nr = 0}; index keys are replicated and logical-page addressed
@@ -1816,7 +1816,7 @@ inline void cp_pf_back(Model& m, int i, int a0, int n, cudaStream_t st)
     const G6Attn& a = m.cp.pf_saved[i];
     if (n > 0) k_cp_pf_back<<<n, 64, 0, st>>>(m.cp.pf_pool[cp_pf_k(m, i)], (char*)a.mla_cache, a.block_table, a0, a.page_size);
 }
-// ---- real fabric (g6m4, BUILD-CPE step 4d): the pools are the registered area of a bulk-mode Fabric, identical layout on
+// ---- real fabric (g6m4): the pools are the registered area of a bulk-mode Fabric, identical layout on
 // every rank. Use g of pool k = g % 2: begin(g) = local fill of the pages I hold (lp < R/64 or my pages) + doorbell k;
 // the proxy then waits every peer's ack of use g - 2 (flag 2 + k >= g - 1), RDMA-writes my tail pages' positions < start to every
 // peer at the same offsets, and writes {g + 1, aux} to flag k of every peer. wait(g) = GPU spin until flag k of every peer
@@ -1861,7 +1861,7 @@ __global__ void __launch_bounds__(256) k_cp_pf_hash(const char* pool, int nr, in
 }
 __global__ void k_cp_pf_zero(unsigned long long* p, int n) { if (threadIdx.x < n) p[threadIdx.x] = 0; }
 #if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
-// G6_CP_PF_HASH2 (DESIGN cp-regather 5.7, spare S4): k_cp_pf_hash's value with one atomic per page into DEVICE memory. k_cp_pf_hash
+// G6_CP_PF_HASH2: k_cp_pf_hash's value with one atomic per page into DEVICE memory. k_cp_pf_hash
 // adds from every thread (256 per page) into *out; for my own hash out = aux_out (pinned host memory, fabric.cpp:156), ~0.5 us per
 // atomic (S3). Same summands cp_pf_hw(word, idx) over the same words, summed mod 2^64 -> bit-identical; peers check it unchanged.
 // first page >= Rp held by owner o (lp % nr == o), and the number of such pages below np

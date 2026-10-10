@@ -1,4 +1,4 @@
-"""Desk tests for the v2 expert reader and writer (#65). No GPU. Needs numpy and libxxhash (or the xxhash package).
+"""Desk tests for the v2 expert reader and writer. No GPU. Needs numpy and libxxhash (or the xxhash package).
 Run from the repo root: python3 -m unittest tools.convert.test_v2
 
 Synthetic layers are written with 8 routed experts instead of 256 (v2.N_EXP is patched): the same layout per expert,

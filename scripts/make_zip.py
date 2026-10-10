@@ -4,8 +4,9 @@
     scripts/make_zip.py --bin DIR [--ref HEAD] [--out DIR] [--allow-missing]
 
 DIR is the `dist` export of the Dockerfile (docker buildx build --target dist -o type=local,dest=DIR .): DIR/bin holds
-the TP=4 build and the front end, DIR/bin6 the TP=6 build, DIR/bin3 the TP=3 build. The source files come from `git archive <ref>`, not the
-working tree, so untracked or modified files never reach the zip. Writes OUT/gr8-<short sha>.zip and
+the TP=4 build and the front end, DIR/bin6 the TP=6 build, DIR/bin3 the TP=3 build. The source files come from
+`git archive <ref>`, not the working tree, so untracked or modified files never reach the zip. Writes
+OUT/gr8-<short sha>.zip and
 OUT/gr8-<short sha>.zip.sha256. The zip is reproducible: the same commit and the same binaries give the same bytes
 (entries sorted, timestamps set to the commit time, fixed modes).
 
@@ -29,8 +30,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHIP = {'README.md', 'LICENSE', 'CHANGELOG.md', 'KNOWN-ISSUES.md', 'PROTOCOL.md', 'bench', 'config', 'docs', 'engine',
         'frontend', 'scripts', 'tools', 'Dockerfile', '.dockerignore', 'docker', 'gr8', 'KNOBS.md', 'AGENTS.md',
         'model.yaml', 'kindling.json', 'smoketest'}
-# Not shipped: internal coordination between the people and agents working on the repo, and repo plumbing.
-SKIP = {'GRAFT-PLAN.md', 'claims', '.github', '.gitignore'}
+# Not shipped: repo plumbing.
+SKIP = {'.github', '.gitignore'}
 
 
 def skipped_file(path):
@@ -52,8 +53,8 @@ bin/   the TP=4 engine with the multi-session path (G6_NR=4 scripts/build.sh), t
 bin6/  the TP=6 engine (scripts/build.sh)
 bin3/  the TP=3 engine (G6_NR=3 scripts/build.sh)
 Built for GB10 (aarch64, CUDA 13, sm_121a). The binaries link cuBLAS 13 and libibverbs at run time: a node needs the
-CUDA 13 runtime libraries (DGX OS has them) and rdma-core. With the prebuilt bin/, bin6/ and bin3/, skip the engine and front
-end builds in README.md; scripts/stage.sh bin/ <packs> copies the engine to the nodes.
+CUDA 13 runtime libraries (DGX OS has them) and rdma-core. With the prebuilt bin/, bin6/ and bin3/, skip the engine and
+front end builds in README.md: copy the one for your TP to bin/ on every box.
 
 sha256 of every file below:
 """
@@ -65,7 +66,7 @@ def git(*args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--bin', required=True, help='the dist export: DIR/bin and DIR/bin6')
+    ap.add_argument('--bin', required=True, help='the dist export: DIR/bin, DIR/bin6 and DIR/bin3')
     ap.add_argument('--ref', default='HEAD')
     ap.add_argument('--out', default='.')
     ap.add_argument('--allow-missing', action='store_true', help='leave out missing binaries instead of failing')

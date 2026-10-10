@@ -12,8 +12,8 @@ The rules, short:
 
 1. No lost wins: prefill, decode, TTFT, context and memory headroom stay within noise of `main` (about 3% on one boot's
    decode; past that, a second boot).
-2. A change that cannot keep both sides' numbers, or changes a design choice, stops and goes to the people.
-3. Clean room: work from the issue text and this tree only.
+2. A change that cannot keep the numbers, or changes a design choice, stops and goes to the maintainers first.
+3. Keep each change to what its issue or PR describes.
 4. Every topology builds (`G6_NR=4`, `6` and `3`), and the others' behaviour does not change unless the issue says so.
 
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
@@ -25,10 +25,11 @@ On a GB10 with CUDA 13:
 
     ./gr8 glm53 build               # this cluster's TP, and the Rust front end, into bin/
     G6_NR=4 scripts/build.sh bin4   # the TP=4 engine on its own
+    G6_NR=3 scripts/build.sh bin3   # the TP=3 engine
     scripts/build.sh bin6           # the TP=6 engine
 
 `scripts/build.sh` also builds and runs `test_spec_len` and `test_prefix_reuse`, and `tr3_e4m3_test` when a GPU is
-visible. A PR builds both topologies.
+visible. A PR builds every topology (CI's engine build does).
 
 ## Test
 
@@ -53,15 +54,14 @@ the PR says which and why a tolerance is safe.
 
 `./gr8 glm53 up` is how the cluster starts: the same command on every box, which starts that box's supervisor
 (`tools/launch/`). The supervisors find each other (`--peers`, or the mentat group), compare their options, model set
-and engine build, and each starts its own rank; `status`, `logs` and `down` work from any box (README, steps 5 and 6).
+and engine build, and each starts its own rank; `status`, `logs` and `down` work from any box (README, "Running it").
 The engine command line lives in `scripts/engine_args.sh`. The supervisor and the deprecated ssh launchers
 (`./gr8 glm53 --ssh up`) both build it from there, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
 
-S2 is the served path. At TP=4, `scripts/launch_tp4.sh` runs `scripts/launch_s2.sh` (`g6m4 --s2`, up to `SESS`
-requests at once, DFlash2 for a request that runs alone). A change to decode, prefill or the scheduler is measured
-under S2, and multi-session output must stay byte-identical to each request run alone. The one-request loop is
-retired at TP=4 and TP=3 (TP=3 runs `launch_s2.sh` with three ranks and MTP only). TP=6 still serves one request at
-a time through `scripts/launch_tp6.sh`.
+S2 is the served path. At TP=4 and TP=3 the engine runs `g6m4 --s2`: up to `SESS` requests at once, and at TP=4 the
+DFlash2 drafter for a request that runs alone (TP=3 is MTP only). A change to decode, prefill or the scheduler is
+measured under S2, and multi-session output must stay byte-identical to each request run alone. TP=6 still serves one
+request at a time, until it moves to S2.
 
 A change to the packs, the loader or the converter needs a boot with the pack hash check on (no `NOHASH=1`).
 
@@ -99,4 +99,3 @@ write 0 or an estimate. Check it parses: `python3 -m json.tool kindling.json`.
 ## Things worth knowing
 
 - If a rank dies, the whole engine stops. `./gr8 glm53 status` names the rank and its last log line.
-- Code comments refer to internal design notes and test-window names that are not in this repository.

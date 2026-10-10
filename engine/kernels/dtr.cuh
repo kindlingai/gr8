@@ -1,4 +1,4 @@
-// Dense trellis matrices of the exlr8 release (#116): q_b, o_proj and the dense MLP of layers 0-2, stored as trellis K4
+// Dense trellis matrices of the exlr8 release: q_b, o_proj and the dense MLP of layers 0-2, stored as trellis K4
 // with the E4M3 codebook, 128-block Hadamards and per-channel suh / svh. Decode GEMV on the release's own entries.
 // Our own code, written from the release format (HF card, Loader section).
 //

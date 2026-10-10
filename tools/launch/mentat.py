@@ -1,6 +1,6 @@
 """The mentat side of `--mentat localhost`: a native agent link to the local daemon, and the group's membership.
 
-Modelled on mentat's python/ray/register.py (PROTOCOL.md "Agent link", "Client link", "Snapshot"). Each box registers
+Modelled on mentat's python/ray/register.py (mentat's own PROTOCOL.md: "Agent link", "Client link", "Snapshot"). Each box registers
 one agent in the group (`gr8-glm53` by default) with one UMA GPU and its gr8 state in `meta`. The members are the
 group's live agents that report a GPU, one per node_ip; rank r is the r-th address in numeric order, so every box
 computes the same ranks from the same snapshot: each box publishes in `gr8.offers` the ranks its model set can serve

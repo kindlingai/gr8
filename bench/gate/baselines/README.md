@@ -4,15 +4,15 @@
 
 - Build: `main` at afca111, `scripts/build.sh` (K1H2 flags, `G6_NR=6`), the same binary on all six nodes.
 - Launch: `scripts/launch_tp6.sh` defaults (`CAP=614400`, `MTP=2`, `NOHASH=1`, K1H2 engine env), rank health probe admitted
-  on every boot. The rank ssh line was wrapped in `{ ...; }` so the launcher returns (the fix in #40); nothing else changed.
+  on every boot. The rank ssh line was wrapped in `{ ...; }` so the launcher returns; nothing else changed.
 - **GPU clock cap 2200 MHz on all six nodes** (`nvidia-smi -lgc 0,2200`), recorded in every run record. Compare only
   against numbers taken at the same cap.
 - KL reference: `../refs/tp6.json`, `gate.py kl-ref` on boot b1 (16 sequences x 256 tokens, top 20).
 - Three boots (b1, b2, b3), each stopped completely and started again; `gate.py run --repeat 2 --skip mixed4 --kl-ref`.
 - KL: 0.0 on every run of every boot (4096 positions, top-1 agreement 1.0): g6 at a fixed commit gives the same
   top-20 logprobs boot to boot on TP6. The KL threshold is therefore the floor, 1e-6 (2 x worst boot = 0).
-- Not in the baseline: `work.mixed4.*` (needs `-DDEC_S2`, #26/#28), so `check` reports PARTIAL.
-- The `workloads` numbers are reasoning text: `effort=nothink` cannot turn thinking off with the GLM 5.3 template (#1).
+- Not in the baseline: `work.mixed4.*` (needs `-DDEC_S2`), so `check` reports PARTIAL.
+- The `workloads` numbers are reasoning text: `effort=nothink` cannot turn thinking off with the GLM 5.3 template.
 
 ## tp4.json — `main` at 34d0d05, TP4, GPU clock cap 2200 MHz
 
@@ -26,7 +26,7 @@
 - Three boots, each `gate.py run --repeat 2 --skip mixed4 --needle-sizes 87000 --kl-ref`.
 - KL: 0.0 on every run of every boot (4096 positions, top-1 1.0). Threshold: the floor, 1e-6.
 - Not in the baseline: `needle.437k.pass` (437K tokens is over the TP4 pool of 393,216; the request is refused) and
-  `work.mixed4.*` (#26/#28). `check` reports PARTIAL.
+  `work.mixed4.*`. `check` reports PARTIAL.
 - During these boots the rank 0 node was also downloading a large file over its internet link (not the fabric). The
   rows with the widest boot spread, `pbench.prefill_8192` (7.3%) and `long.18k.prefill_tok_s` / `ttft_s` (5.4% / 4.9%),
   may include that load; the 32K and 87K prefill rows (1.5-1.9%) do not show it.

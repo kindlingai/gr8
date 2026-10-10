@@ -1,4 +1,4 @@
-"""SPEC §9 rank ownership map + per-rank pack sizes. The one place the converter reads ownership from.
+"""The rank ownership map + per-rank pack sizes. The one place the converter reads ownership from.
 
 Ranks r = 0..NR-1 are g6 ranks. For each rule "rank order rho_j = (j + off) % NR, widths w_j assigned contiguously
 in that order", rank r = rho_j holds chunk j, with j = (r - off) % NR.

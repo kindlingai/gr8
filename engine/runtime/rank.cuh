@@ -2,7 +2,7 @@
 // Used unchanged by the NR-process runtime (engine/runtime/g6m4.cu, real fabric; NR = G6_NR, six or four) and by the
 // one-process NR-simulated-rank driver (engine/runtime/m4sim.cu, loopback fabric), so their outputs must be bit-identical.
 //
-// Step, M rows of one sequence at consecutive positions (RUNTIME.md §4), collective c = 2*i for layer i's attention
+// Step, M rows of one sequence at consecutive positions, collective c = 2*i for layer i's attention
 // partial, 2*i+1 for its MLP partial, 2*NL for the head all-gather:
 //   launch_embed
 //   per layer i:  launch_attn_block (projections, attention, o_proj, partial -> send slot, doorbell)
@@ -196,7 +196,7 @@ struct Layer
 };
 
 #if defined(G6_CP) && G6_CP
-// J4 context-parallel decode (BUILD-CPE.md step 3). Set on, R, s3, colls BEFORE build (the driver sizes the CP fabric
+// context-parallel decode. Set on, R, s3, colls BEFORE build (the driver sizes the CP fabric
 // from colls); set vs (one kernel view per CP collective, fabc or the loopback) after build. A step runs the CP block
 // when its context > R (plain form) / its bucket capacity > R (graph form; R is a bucket boundary, so the two agree).
 struct CpState
@@ -222,7 +222,7 @@ struct CpState
 inline bool cp_full_index(int l) { return l == 78 || l <= 2 || (l - 2) % 4 == 0; }
 // floats of one partial block (c [M][H][512], m [M][H], l [M][H]), padded to 16 B as cp_lse (attn.cu) indexes it
 inline size_t cp_blk(int M, int H) { return ((size_t)M * H * 514 + 3) & ~(size_t)3; }
-// heads of rank d's group at model layer l (SPEC §9 / bind.cu: group (d - l) % NR, larger groups first)
+// heads of rank d's group at model layer l (bind.cu: group (d - l) % NR, larger groups first)
 inline int cp_heads(int d, int l) { return g6nr::width(g6nr::HEADS, (d - l % g6nr::NR + g6nr::NR) % g6nr::NR); }
 #endif
 
@@ -553,7 +553,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     if (m.cp.on)
     {
         // colls.mmax may exceed MX: it sizes the CP fabric only (A3: M up to 24 for S2); these buffers hold <= MX rows
-        // NR=6: head groups of 10 / 11 heads rotate by layer (SPEC §9) -> size for the widest (HMAX); partial blocks are
+        // NR=6: head groups of 10 / 11 heads rotate by layer -> size for the widest (HMAX); partial blocks are
         // padded to 16 B (cp_blk)
         const int H = g6nr::HMAX, NR = g6nr::NR;
         m.cp.tickets = dmalloc<unsigned>(m.cp.colls.ncoll());
@@ -711,7 +711,7 @@ inline void launch_layer_in(Model& m, const Layer& y, const bind::Layer& b, int 
 
 #if defined(G6_CP) && G6_CP
 inline bool cp_active(const Model& m, int context) { return m.cp.on && (m.graph ? m.bk[m.cur] : context) > m.cp.R; }
-// The CP attention block (PLAN-S3 §1), in three phases so the loopback driver can deliver between them (phase -1 = all,
+// The CP attention block, in three phases so the loopback driver can deliver between them (phase -1 = all,
 // in order, as the real fabric runs it):
 //   0: projections, cp_front (append, absorb) -> q(i) put; cp_index -> cand(i) put (full layers); S3 + shared layer: my
 //      own head group now (its q is local, the q all-gather is on the wire)

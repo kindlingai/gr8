@@ -32,10 +32,10 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
  for(int j=0;j<256;j++){const uint8_t* src=(const uint8_t*)rows[j];if(!src)continue;float2 x=fp8_pair(*(const uint16_t*)(src+d));float s=scale[j*GROUPS+(2*t)/128],p=probability[j];lo=fmaf(p,x.x*s,lo);hi=fmaf(p,x.y*s,hi);}}
  float* dst=parts+(((int64_t)row*a.heads+h)*ga::PART+part)*512;dst[d]=lo;dst[d+1]=hi;
 }
-// DEC_CPB (bar RESULTS-M20 "DEC_CPB"): context_parts with the fp8 pairs of the next CPB slots loaded before their FMAs, so
+// DEC_CPB: context_parts with the fp8 pairs of the next CPB slots loaded before their FMAs, so
 // the gathered loads overlap (ncu: context_parts is long_scoreboard-bound). Same FMAs in the same slot order, same skip
 // of dead / p == 0 slots, so every output byte matches context_parts.
-#ifndef DEC_CPB2   // DEC_CPB2 (bar RESULTS-M20 "DEC_CPB2"): batch 8 -> 64 slots; default 8 = DEC_CPB as before
+#ifndef DEC_CPB2   // DEC_CPB2: batch 8 -> 64 slots; default 8 = DEC_CPB as before
 #define DEC_CPB2 8
 #endif
 constexpr int CPB=DEC_CPB2;
@@ -55,7 +55,7 @@ __global__ void context_parts_cpb(Input input,int start,const float* probs,float
   for(int u=0;u<CPB;u++){const int j=j0+u;if(!rows[j])continue;float2 x=fp8_pair(raw[u]);float s=scale[j*GROUPS+(2*t)/128],p=probability[j];lo=fmaf(p,x.x*s,lo);hi=fmaf(p,x.y*s,hi);}}}
  float* dst=parts+(((int64_t)row*a.heads+h)*ga::PART+part)*512;dst[d]=lo;dst[d+1]=hi;
 }
-// Head-batched forms of scores_direct and context_parts_cpb (gr8 #75): one key's bytes are loaded once for HG heads
+// Head-batched forms of scores_direct and context_parts_cpb: one key's bytes are loaded once for HG heads
 // instead of once per head. Every (row, head, slot) output keeps the per-head kernels' arithmetic: the same products, the
 // same fmaf order, the same warp_sum, the same skip of dead slots and of p == 0, so the outputs are bit-identical.
 // scores_heads: warp per (slot, row), heads [y*HG, y*HG + HG); lane l stores head y*HG + l.
@@ -219,7 +219,7 @@ static bool use_attn_flip(const G6Attn& a,int n){return attn_flip_eligible(a,n)&
 static bool use_long_fixed_k(const G6Attn& a,int n){return attn_flip_eligible(a,n)&&!use_fixed_k_decode(a);}
 // G6_IDX_VEC=1 (default 0 = off): the per-row index_scores loads its key tile with 16 B
 // vector loads (page_size >= 32). Byte-exact; -7.65 ms/step index_scores @S4 L32K. Host-side, read once (set
-// before graph capture). Short decode (use_small_decode) and the #31 shared-key kernel are not affected.
+// before graph capture). Short decode (use_small_decode) and the DEC_IDX31 shared-key kernel are not affected.
 static bool idx_vec(){static const bool on=getenv("G6_IDX_VEC")&&atoi(getenv("G6_IDX_VEC"))!=0;return on;}
 template<class Input>
 static void launch_index_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){

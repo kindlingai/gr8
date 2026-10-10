@@ -1,4 +1,4 @@
-//! The fetch side of the exlr8 v2 release (#117): which byte ranges of the width files one rank loads, and the check
+//! The fetch side of the exlr8 v2 release: which byte ranges of the width files one rank loads, and the check
 //! of each half once it has landed. Both read only the rank's index slices (tools/convert/v2slices.py: per owned unit
 //! its offsets, checksums and per-channel values, and every expert's block scales) and the width manifest, the same
 //! inputs src/v2plan.rs builds the rank's image from.

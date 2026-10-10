@@ -1,4 +1,4 @@
-"""Reference check of the dense trellis kernels (#116, engine/kernels/dtr.cuh) on real exlr8 release matrices.
+"""Reference check of the dense trellis kernels (engine/kernels/dtr.cuh) on real exlr8 release matrices.
 
     python3 engine/ref/dtr_ref.py prepare DENSE_DIR LAYER OUT [--tp 4] [--ranks 0,1,2,3] [--rows 64]
     engine/kernels/tests/dtr_test OUT

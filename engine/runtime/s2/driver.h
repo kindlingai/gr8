@@ -1,4 +1,4 @@
-// Component 5 bridge to component 6's persistent Batch. No CUDA or allocator.
+// Bridge from the scheduler to the persistent Batch. No CUDA or allocator.
 // All calls run on the compute thread at safe boundaries. apply() requires an
 // EventGate all-rank fence; callbacks must fail the whole epoch on any error.
 #pragma once

@@ -1,4 +1,4 @@
-// PrefixReuse unit cases (K1REUSE port of 18318ee's regression test to the K1/CP lineage: g6m4.cu has no PF_TAIL tail
+// PrefixReuse unit cases (port of 18318ee's regression test to the K1/CP lineage: g6m4.cu has no PF_TAIL tail
 // lane, so the replayed prefill loop is two lanes + a single-lane remainder). LCP (default), G6_REUSE_STRICT=1 (K2 rule),
 // G6_REUSE_NOEND=1 (no prompt >= written_end rule), the miss reasons, MTP's one-row margin, chain rows, stops.
 // build and run:  g++ -O2 -std=c++17 -I engine/runtime engine/tests/test_prefix_reuse.cpp -o /tmp/test_prefix_reuse \
@@ -170,7 +170,7 @@ int main()
             CHECK(s.main_end == (int)p.size() - 1);
         }
     }
-    // ---- Astra R1 (REVIEW-K1REUSE-DESIGN.md): draft row t is built from main row t AND token t + 1. Divergence at
+    // ---- draft row t is built from main row t AND token t + 1. Divergence at
     // L = lcp: draft row L - 1 holds the OLD token L. Provenance check of every retained draft row's NEXT token; the
     // design-58b89d01 bound min(valid, lcp, limit) keeps the bad row (must fail), the shipped bound does not.
     for (int L : {1, 2, 5, 21, 22, 23})
@@ -245,7 +245,7 @@ int main()
             prev = p;
         }
     }
-    // W44 grid rule (G6_REUSE_ALIGN=1): served shape MP 4096 x two lanes -> grid 8192; the W38 request shapes
+    // grid rule (G6_REUSE_ALIGN=1): served shape MP 4096 x two lanes -> grid 8192; the request shapes
     for (int K : {0, 4})
     {
         PrefixReuse r; r.grid = 8192;
@@ -283,7 +283,7 @@ int main()
         request(s, p, toks(64, 71), 64, K);
         CHECK(request(s, p, toks(64, 71), 64, K) == 0 && !strcmp(s.why, "short"));
     }
-    // RGRID: g6m4.cu grid = MP = 4096 (W44 CL1 [M]: the lane pairing does not change a row). Retained = floor(min(skip,
+    // g6m4.cu grid = MP = 4096 (the lane pairing does not change a row). Retained = floor(min(skip,
     // pf_end) / 4096) * 4096, so a hit can now keep an odd multiple of 4096 (retained mod 8192 = 4096)
     for (int K : {0, 4})
     {

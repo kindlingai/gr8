@@ -1,4 +1,4 @@
-"""g6 weight converter: TR3 checkpoint + the old-rank D8 GPTQ dirs -> per-rank packs (SPEC §2, §7, §9).
+"""g6 weight converter: TR3 checkpoint + the old-rank D8 GPTQ dirs -> per-rank packs.
 
 python3 -m tools.convert.convert --tr3 DIR --d8 R0 R1 R2 R3 R4 R5 --out DIR [--layers 0,3,40,77,78]
         [--ranks 0,1,2,3,4,5] [--skip embed,head] [--drop-cache]
@@ -11,13 +11,13 @@ same deterministic equation D2 runs at boot (tools/convert/mxfp8.py). TR3 trelli
 are copied; D8 BF16 scales are converted to the FP16 the row-tile records carry, and every one is checked exact.
 One pass over the sources writes all requested ranks; per-rank packs are sequential files (tools/convert/pack.py).
 
-Routed experts are TR3 or exlr8-e4m3 (#19), read per layer from the layer file's safetensors metadata (`exlr8`). Both
+Routed experts are TR3 or exlr8-e4m3, read per layer from the layer file's safetensors metadata (`exlr8`). Both
 use the same tensor names and layout and convert the same way. An exlr8-e4m3 layer's tr3.* entries carry
 `"expert_format": "exlr8-e4m3"` in the manifest (the engine then decodes its codebook with E4M3 rounding), and the
 manifest's top-level `expert_formats` maps those layers to their format. TR3 layers get neither, so a TR3 pack and its
-manifest are the same as before #19.
+manifest are the same as before the exlr8-e4m3 format.
 
-exlr8 v2 expert files (#65, tools/convert/v2.py): --v2 DIR takes the routed experts of every layer that has v2 files in
+exlr8 v2 expert files (tools/convert/v2.py): --v2 DIR takes the routed experts of every layer that has v2 files in
 DIR (or of --v2-layers) from them instead of from --tr3, at the widths --v2-widths picks, and stores the shared expert
 as trellis row 256 of tr3.table (--v2-shared). Everything else in those layers still comes from --tr3 and --d8, and the
 shared expert's int4 / MXFP8 records are left out. Such a layer's tr3.* entries carry `"expert_source": "exlr8-v2"` and
@@ -269,7 +269,7 @@ def convert_experts(l, src, writers):
     P = f'L{l:03d}'
     p = f'model.layers.{l}.mlp.experts.'
     fmt = expert_format(l, src)
-    xf = {} if fmt == 'tr3' else dict(expert_format=fmt)   # TR3 entries stay as before #19
+    xf = {} if fmt == 'tr3' else dict(expert_format=fmt)   # TR3 entries stay as before
     if xf:
         for w in writers.values():
             w.meta.setdefault('expert_formats', {})[str(l)] = fmt
@@ -414,7 +414,7 @@ def main(argv=None):
                     'the QO pack holds, the q_b / o_proj .mx.codes + .scales. The QO pack must exist already (qopack.py reads those tensors from a full pack); '
                     '`all` = layers 0-77')
     ap.add_argument('--gv-records', action='store_true', help='add .mx.gv / .gv GEMV record tensors (densev.cuh)')
-    ap.add_argument('--v2', help='exlr8 v2 expert files dir (#65): routed + shared experts of its layers come from it')
+    ap.add_argument('--v2', help='exlr8 v2 expert files dir: routed + shared experts of its layers come from it')
     ap.add_argument('--v2-layers', default='auto', help='comma list, or auto = every layer with v2 files in --v2')
     ap.add_argument('--v2-widths', default='home', help='home | down1 | up1 | k2 | k3 | k4 | a width manifest file')
     ap.add_argument('--v2-shared', default='trellis', choices=('trellis', 'off'),

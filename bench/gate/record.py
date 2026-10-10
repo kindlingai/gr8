@@ -7,7 +7,7 @@ HIGHER = 'higher'
 LOWER = 'lower'
 INFO = 'info'  # reported, never gated
 
-# The full gate set of issue #1 (default sizes). A check is PASS only when the baseline and the run both have all of it.
+# The full gate set (default sizes). A check is PASS only when the baseline and the run both have all of it.
 REQUIRED = ['kl.mean', 'needle.87k.pass', 'needle.437k.pass',
             'long.18k.ttft_s', 'long.18k.prefill_tok_s', 'long.87k.ttft_s', 'long.87k.prefill_tok_s',
             'pbench.prefill_8192', 'pbench.prefill_32768', 'pbench.prose_decode',

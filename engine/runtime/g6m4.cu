@@ -27,7 +27,7 @@
 //      [--reuse-prefix] keep the caches of the longest common prefix of the previous prompt + emitted ids (prefix_reuse.h;
 //                     G6_REUSE_STRICT=1: strict append only, G6_REUSE_NOEND=1: no prompt >= written_end rule; default off;
 //                     gate arm G6_REUSE_POISON=1: a hit first sets the old sequence's stale rows to NaN, reuse_poison.cuh;
-//                     W44 G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
+//                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
 //                     With --s2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
 //      [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
@@ -223,7 +223,7 @@ int main(int argc, char** argv)
         for (int k : lv) if (k < 1 || k > kmax) die("--spec-levels: each level must be 1.." + std::to_string(kmax));
         spec.on = true;
         if (!spec.set_levels(lv)) die("--spec-levels: no level");
-        spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz (#11): the DFlash2 step, the MTP first-form pass
+        spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
         spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
     }
 #ifndef DEC_S2
@@ -363,7 +363,7 @@ int main(int argc, char** argv)
     auto qp_err = [&]() -> unsigned { return 0u; };
 #endif
 #if defined(G6_CP) && G6_CP
-    // J4 CP (BUILD-CPE): env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
+    // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
     const bool cp_on = !getenv("G6_CP") || atoi(getenv("G6_CP")) != 0;
     const int cp_R = getenv("G6_CP_R") ? atoi(getenv("G6_CP_R")) : 0;
@@ -903,13 +903,13 @@ int main(int argc, char** argv)
                   po_ = env_choice("G6_REUSE_POISON", 1, 0, &err);
         if (st_ < 0 || ne_ < 0 || po_ < 0) die(err);
         reuse.strict = st_ == 1; reuse.noend = ne_ == 1; reuse_poison_on = po_ == 1;
-        const int al_ = env_choice("G6_REUSE_ALIGN", 1, 0, &err);   // W44: retain only whole cold prefill grid cells (prefix_reuse.h)
+        const int al_ = env_choice("G6_REUSE_ALIGN", 1, 0, &err);   // retain only whole cold prefill grid cells (prefix_reuse.h)
         if (al_ < 0) die(err);
         if (al_ == 1 && !MP) die("G6_REUSE_ALIGN=1 needs tensor prefill (--prefill N)");
-        reuse.grid = al_ == 1 ? MP : 0;   // RGRID: one sub-batch (W44 CL1 [M]: the lane pairing does not change a row; W44 itself was 2 x MP with two lanes)
+        reuse.grid = al_ == 1 ? MP : 0;   // one sub-batch (the lane pairing does not change a row)
         if (R == 0 && reuse.grid) fprintf(stderr, "# reuse grid %d rows (--prefill %d, lanes %d)\n", reuse.grid, MP, two ? 2 : 1);
     }
-    HDump hd = hdump_env();             // W38b diag (reuse_hdump.cuh): default off
+    HDump hd = hdump_env();             // reuse diagnostics (reuse_hdump.cuh): default off
     {
         std::string err;
         const int zs_ = env_choice("G6_REUSE_ZSCRATCH", 1, 0, &err);
@@ -918,7 +918,7 @@ int main(int argc, char** argv)
         hd.zscratch = zs_ == 1;
     }
     if (R == 0 && (!hd.dir.empty() || hd.zscratch))
-        fprintf(stderr, "# W38b diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
+        fprintf(stderr, "# reuse diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
     Emitter em;
     PfTimes pt;                         // G6_PF_TIMES=1 (serve.h)
     boot("ready");
@@ -976,7 +976,7 @@ int main(int argc, char** argv)
             if (mtp) reuse_poison(D.d, skip, old_dirty, st);
             if (R == 0) fprintf(stderr, "# reuse seq %zu poisoned rows %d..%d\n", q, skip, old_dirty - 1);
         }
-        if (skip && hd.zscratch)            // W38b diag arm: a hit starts from cleared per-seq attention scratch
+        if (skip && hd.zscratch)            // reuse diag arm: a hit starts from cleared per-seq attention scratch
         {
             zscratch(m, st);
             if (mtp) zscratch(D.d, st);
@@ -993,7 +993,7 @@ int main(int argc, char** argv)
         if (reuse_prefix && R == 0)         // every miss with its reason (first / strict / no-lcp / short), counted by the gate
             fprintf(stderr, "# reuse seq %zu %s retained %d lcp %d history %zu prompt %zu written_end %d dirty_end %d\n", q, reuse.why, skip,
                     reuse.lcp, reuse.history.size(), p.prompt.size(), old_end, old_dirty);
-        if (reuse_prefix && R == 0 && reuse.grid)   // W44: the skip before the grid rule (TTFT cost of the exact rule)
+        if (reuse_prefix && R == 0 && reuse.grid)   // the skip before the grid rule (TTFT cost of the exact rule)
             fprintf(stderr, "# reuse seq %zu grid %d raw %d retained %d\n", q, reuse.grid, reuse.raw, skip);
         if (skip) printf("reuse rows 0..%d\n", skip - 1);  // real hit evidence (every rank), NOT a freshly computed hash
         for (int a = skip; a < p.first; a += MP)
@@ -1066,7 +1066,7 @@ int main(int argc, char** argv)
             if (reuse_prefix) reuse.prefill_rows(a, M, mtp > 0);
             if (q > 0 || a > 0) { pf_ms += ms; pf_rows += M; }      // the very first sub-batch carries first-launch costs
         }
-        if (hd.listed(q)) hdump_seq(hd, m, mtp ? &D.d : nullptr, q, R, p.first, st);   // W38b diag: rows [0, p.first)
+        if (hd.listed(q)) hdump_seq(hd, m, mtp ? &D.d : nullptr, q, R, p.first, st);   // reuse diag: rows [0, p.first)
         int dfl_lo = p.first;           // --dflash: the lowest position the drafter holds context for
         if (dfl && DF.pf_feat && DF.pf_hi > DF.pf_lo)
         {

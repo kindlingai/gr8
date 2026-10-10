@@ -16,7 +16,7 @@ struct G6Attn {
     void *output;                 // fp16 [rows,heads,256]
     unsigned *error;              // initialize to zero before a step; asynchronous device diagnostics
 #if defined(G6_CP) && G6_CP
-    // J4 context-parallel KV (BUILD-CPE.md). cp_nr = 0: replicated (today's semantics). cp_nr > 0: this rank SCORES only
+    // context-parallel KV. cp_nr = 0: replicated (today's semantics). cp_nr > 0: this rank SCORES only
     // keys whose page (pos / page_size) % cp_nr == cp_rank, block_table holds G6_CP_REMOTE for pages stored elsewhere,
     // page_count = physical pages of this rank (the replay cell's page_count is then ignored).
     int cp_nr, cp_rank;

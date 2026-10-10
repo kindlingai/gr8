@@ -1,4 +1,4 @@
-// #65 prefill MoE (bindp::launch_experts: route, fc1, mid, fc2, final sum) on one rank's expert pack. The test dumps output for
+// exlr8 v2 prefill MoE (bindp::launch_experts: route, fc1, mid, fc2, final sum) on one rank's expert pack. The test dumps output for
 // the NumPy reference (engine/ref/k1_v2_ref.py) and times against the GB10 read floor. Prefill quantizes activations to
 // MXFP8, so compare the error level across widths. Same pack and flags as k1_v2_test.cu, plus:
 //   pf_v2_test --pack DIR/rank0 --layer 40 [--nr 4] [--M 20] [--dump FILE] [--bench ITERS] [--wide 1] [--seed 1]

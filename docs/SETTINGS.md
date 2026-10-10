@@ -1,15 +1,16 @@
-# K1H2 settings
+# Engine settings
 
-`scripts/launch_tp6.sh` sets everything below (`scripts/launch_tp4.sh` sets the same, with a smaller `--cap`). Every
-rank gets the same environment and flags, except `--rank`.
+`./gr8 glm53 up` builds every rank's command line from `scripts/engine_args.sh` and sets everything below. Every rank
+gets the same environment and flags, except `--rank`. The values shown are what TP=6 serves with; KNOBS.md has each TP's
+defaults.
 The source comments in `engine/runtime/` (`g6m4.cu`, `prefill.cuh`, `rank.cuh`) are the full reference. This file is
 the short version.
 
 ## Engine flags (`g6m4`)
 
-| flag | K1H2 value | meaning |
+| flag | served value | meaning |
 |---|---|---|
-| `--rank R` | 0..5 (TP4: 0..3) | this process's rank; rank r loads `rank<r>.pack` |
+| `--rank R` | 0..TP-1 | this process's rank; rank r loads `rank<r>.pack` |
 | `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order (exactly `G6_NR` of them) |
 | `--proxy-cpu N` | 19 | CPU core for the decode fabric's proxy thread. Every other fabric's proxy has its own core below it: N-1 and N-2 the two prefill lanes, N-3 the CP fabric, N-4 CP staging, N-5 the QP roll, N-6 the MTP draft, N-7 DFlash |
 | `--manifest` / `--pack` | `packs/rank<r>.*` | this rank's pack; `--pack -` reads it from stdin |
@@ -20,11 +21,11 @@ the short version.
 | `--layers all` | all | all 78 layers + the MTP layer |
 | `--qo-manifest` / `--qo-pack` | `packs/qo.*` | full-head attention weights for `G6_PF_OWN=3` (identical file on every node) |
 | `--qp-manifest` / `--qp-pack` | (TP4, not used) | resident pair weights for `G6_PF_OWN=4` (`tools/convert/pairpack.py`, one file per rank); the TP4 launcher uses `G6_PF_QP_ROLL` instead |
-| `--dflash-manifest` / `--dflash-pack` | TP4 launcher default (`DFLASH=1`; `DFLASH=0` for MTP) | replaces MTP with the DFlash2 block drafter (`engine/runtime/dflash.cuh`), packs from `tools/convert/dflash2.py` (one per rank, about 0.86 GB). It drafts 7 tokens per round in one forward. Refused with `--mtp` or `--s2`. TP4 builds (the rank count must divide the drafter's 8 KV heads) |
+| `--dflash-manifest` / `--dflash-pack` | TP4 launcher default (`DFLASH=1`; `DFLASH=0` for MTP) | replaces MTP with the DFlash2 block drafter (`engine/runtime/dflash.cuh`), packs from `tools/convert/dflash2.py` (one per rank, about 0.86 GB). It drafts 7 tokens per round in one forward. Without `--s2` it replaces `--mtp`; with `--s2`, `--mtp` stays on: a request alone at its prompt tail drafts with DFlash2, the others with MTP. TP4 builds (the rank count must divide the drafter's 8 KV heads) |
 | `--dflash-sel 0\|1` | 1 (`DFLASH_SEL`) | 1 = the DFlash2 selector walk over the top-16 candidates of each position, 0 = the drafter's argmax (sampled with the target's position keys) |
 | `--dflash-k K` | 7 (`DFLASH_K`) | the drafts a round verifies (1..7); a verify step carries K + 1 rows. The drafter always drafts the whole block |
-| `--spec-accept coupled\|rejection` | coupled (`SPEC_ACCEPT`) | how verify steps accept drafts at temperature > 0, for MTP and the DFlash2 drafter. coupled: drafts are sampled with the target's position-keyed noise and kept when they equal the target's sample, so a seed gives the same text with or without speculation. rejection: greedy drafts, each kept with probability p(draft) under the request's temperature and top_p (the engine has no top_k or min_p), else replaced by a sample of p without it. The output distribution is the target's in both modes, but rejection gives other text for a seed. Which mode keeps more drafts depends on how close the drafter's distribution is to the target's (numbers in #58). Temperature 0 is the same in both. Needs a drafter; refused with `--s2` |
-| `--spec-adaptive` | TP4 launcher default with DFlash2 (`SPEC_ADAPT`, default 1 with DFlash2, 0 with MTP) | each round verifies the draft count with the most expected tokens per ms (`engine/runtime/spec_len.h`), from the drafter's own probability of each draft, recent acceptance per position and the verify cost by row count at 2200 MHz. MTP (`--mtp K`: up to K drafts) also stops its chain when one more draft does not pay. DFlash2 chooses among 1..`--dflash-k`. Every level gets a verify graph. Refused with `--s2` |
+| `--spec-accept coupled\|rejection` | coupled (`SPEC_ACCEPT`) | how verify steps accept drafts at temperature > 0, for MTP and the DFlash2 drafter. coupled: drafts are sampled with the target's position-keyed noise and kept when they equal the target's sample, so a seed gives the same text with or without speculation. rejection: greedy drafts, each kept with probability p(draft) under the request's temperature and top_p (the engine has no top_k or min_p), else replaced by a sample of p without it. The output distribution is the target's in both modes, but rejection gives other text for a seed. Which mode keeps more drafts depends on how close the drafter's distribution is to the target's. Temperature 0 is the same in both. Needs a drafter; refused with `--s2` |
+| `--spec-adaptive` | TP4 launcher default with DFlash2 (`SPEC_ADAPT`, default 1 with DFlash2, 0 with MTP) | each round verifies the draft count with the most expected tokens per ms (`engine/runtime/spec_len.h`), from the drafter's own probability of each draft, recent acceptance per position and the verify cost by row count at 2200 MHz. MTP (`--mtp K`: up to K drafts) also stops its chain when one more draft does not pay. DFlash2 chooses among 1..`--dflash-k`. Every level gets a verify graph. With `--s2` it is the policy of the DFlash2 sessions |
 | `--spec-levels 7,5,3,2` | all of 1..K (`SPEC_LEVELS`) | `--spec-adaptive`: the draft counts it may choose, for example 7,5,3,2 with the drafter or 1,2,4 with `--mtp 4`. The MTP chain drafts up to the next allowed count, so gaps are fine |
 | `--serve DIR` | `$G6_HOME/serve` | serve loop: requests arrive as `DIR/req.<n>`, rank 0 writes `DIR/resp.<n>`, `DIR/quit` ends it, `DIR/ready` appears once loaded |
 | `--cap N` | 614400 | KV pool in tokens (the longest context) |
@@ -89,7 +90,7 @@ the short version.
 `G6ENV_X="NAME=value ..."` adds more variables on every rank. The engine rejects bad `G6_PF_*` values at startup
 (`engine/runtime/envparse.h`).
 
-## Launch knobs (`scripts/launch_tp6.sh`)
+## Launch knobs
 
 | variable | default | meaning |
 |---|---|---|
@@ -118,12 +119,12 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `DEC_AVP=1` | decode absorb / value-project for small row counts in one launch |
 | `DEC_I4PAIR=1` | decode int4 records (q_a, o_proj) repacked once at load into a paired layout |
 | `SEL32` | the exact top-k selector is used past 32,768 tokens of context too |
-| `DEC_IDX31=1` | decode index scorer reads each key once for all query rows and skips tiles another CP rank owns; select stops at the live end of the bucket (exact, #31; needs `SEL32`) |
+| `DEC_IDX31=1` | decode index scorer reads each key once for all query rows and skips tiles another CP rank owns; select stops at the live end of the bucket (exact; needs `SEL32`) |
 | `G6_CP=1`, `G6_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
 | `PF_F12` (TP4 build only) | prefill expert fc1: one fat CTA runs `F12_NE` (default 2) adjacent expert blocks on one quantized A record (`kernels/bind_prefill.cuh`, `k_pf_fc1f`). `F12_NE` must divide the expert blocks per rank (4 at TP4, 3 at TP6). `G6_PF_F12=0` turns it off at run time |
 
 ## Front end and shim
 
-`g6shim.py --rank-dirs <rank0 dir> <host:dir> ... --sock <sock> --max-model-len <cap> --stall-timeout 2400`
-(one request at a time). `python -m g6front --model-dir <tokenizer dir> --engine-sock <sock> --port 8100`. All
-front-end flags are in `frontend/README.md`.
+The head runs a shim that hands requests to every rank: `frontend/g6s2shim.py --rank-dirs <rank0 dir> <host:dir> ...
+--sock <sock>` for S2, or `frontend/g6shim.py` for TP=6's one-request loop. The API is the Rust front end,
+`bin/g6front-rs --model-dir <tokenizer dir> --engine-sock <sock> --port 8100`. Its flags are in `frontend/README.md`.

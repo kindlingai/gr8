@@ -1,4 +1,4 @@
-"""exlr8 v2 expert files -> g6 rank pack tensors (#65). Format: exlr8quant SPEC.md sections 5.2, 6.1-6.5, 7.1, 8.
+"""exlr8 v2 expert files -> g6 rank pack tensors. Format: exlr8quant SPEC.md sections 5.2, 6.1-6.5, 7.1, 8.
 
 v2 stores every routed expert of a layer at K2, K3 and K4 (one trellis file per width) and the shared expert at K3 and
 K4. A deployment picks a width per unit from a manifest: gate and up per (expert, 128-channel half), down per expert.

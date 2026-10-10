@@ -66,7 +66,7 @@ struct Tr3Lane
 };
 
 // Width and byte offset in tr3.fc1 of fc1 unit u = 2b + mat (block b, gate | up) of expert e, table row tr.
-// kmix = tr3.kmix (exlr8 v2 packs, #65) or nullptr. kmix[e] == 0 (and no kmix) = every unit has the table width tr[4]
+// kmix = tr3.kmix (exlr8 v2 packs) or nullptr. kmix[e] == 0 (and no kmix) = every unit has the table width tr[4]
 // and the matrices sit back to back at that width (TR3, exlr8 v1); else 4 bits per unit at bit 4u give its width,
 // and the matrices sit back to back at theirs.
 __device__ __forceinline__ int tr3_unit(const long long* kmix, int e, const long long* tr, int u, size_t& off)
@@ -102,7 +102,7 @@ __device__ __forceinline__ int tr3_unit(const long long* kmix, int e, const long
 // Reads 8 tiles (128 output cols) x its k range; writes partial fp32 sums gpart[..][h*WG+q][m][128].
 // tr: the slot's expert row of t_tab. mw: the first tile of the unit's matrix (block b, gate|up). BITS: its width
 // (tr3_unit); units of blocks the expert does not have exit.
-// The 4 hidden-side values at k of block row `row`: the stored vector, or BS (block-scale form, exlr8 v2, #65): the
+// The 4 hidden-side values at k of block row `row`: the stored vector, or BS (block-scale form, exlr8 v2): the
 // layer sign times the row's scale of k's 128-block. v2 vectors are exactly sign x block scale, so both give the same
 // bits.
 template <bool BS>
@@ -138,7 +138,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     const uint8_t* base = mw + (static_cast<size_t>(ks0 + ksq) * 8 + j) * TB;
 #if !defined(TR3_PROBE)
     // wide order: the first group is requested here, before the prologue, so its DRAM latency overlaps the prologue's
-    const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2 (#65)
+    const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2
     const uint8_t* g0 = base - static_cast<size_t>(j) * TB + j * 256 + lane * 8;
     u64 nw[3] = {0, 0, 0};
     if (wide && TR3_EARLY)
@@ -325,7 +325,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     const uint8_t* base = A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB);
     // wide order (tr3_wide.cuh, k_tr3_widen2): the 8 k-tiles of an n-tile in three 64-bit loads. The first n-tile is
     // requested here, before the prologue, so its DRAM latency overlaps the prologue's.
-    const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2 (#65)
+    const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2
     const uint8_t* wg = base + static_cast<size_t>(nt0) * 8 * TB + lane * 8;
     u64 nw[3] = {0, 0, 0};
     if (wide && ntiles > 0 && TR3_EARLY)
@@ -454,7 +454,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
 // ---------------------------------------------------------------------------------------------
 // Finalize: out[m] = f16 or bf16( sum_k w[m][k] * sum_b svh_d[e][b] * H128(z[slot][b][m]) + shared[m] ),
 // fixed k, b order. One CTA = (token, one 128-col block), 4 warps x 2 routes each, summed through smem.
-// SH (exlr8 v2 trellis shared expert, #65): shared[m] is the trellis expert of scratch slot n_slots + m / 8 (column m % 8;
+// SH (exlr8 v2 trellis shared expert): shared[m] is the trellis expert of scratch slot n_slots + m / 8 (column m % 8;
 // one slot per 8 rows, so one slot at M <= 8) with weight 1. A fifth
 // warp sums it (the CTA has 160 threads), and the s_* records' fp16 ypart row is not read.
 template <bool SH = false>
