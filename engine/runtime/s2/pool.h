@@ -8,9 +8,15 @@
 // Prefix reuse (keep()): a retired run's pages stay as they are, with the session's PrefixReuse state, until a claim
 // overlaps them. match() finds the retained run whose cached prefix a new prompt can continue; the grant then takes that
 // run's base (pages extended as needed) and starts its prefill at the retained row. Retained pages count as free.
+// Eviction is placement only (no row of any session changes): a reservation lands in a gap free of retained runs when one
+// is large enough; otherwise on the window of live-free pages whose overlapped retained runs are the least recently
+// retired (lexicographic: newest age among them, then pages overlapped, then lowest base), so a miss destroys the oldest
+// retained run and never a fresh one. Retained runs are never capped or aged out: they stay until their pages are needed.
+// log(true) (g6m4: G6_POOL_LOG=1): one stderr line per claim, with the base, pages, and every retained run it evicted.
 #pragma once
 #include "scheduler.h"
 #include "../prefix_reuse.h"
+#include <cstdio>
 #include <vector>
 
 namespace g6s2 {
@@ -22,7 +28,8 @@ class RunPool {
     bool exclusive_ = false;
     Run held_{};                               // the exclusive run, while resident
     struct Kept { Run run; g6rt::PrefixReuse st; uint64_t age = 0; };
-    bool keep_ = false;
+    bool keep_ = false, log_ = false;
+    const char* how_ = "claim";                // how the next claim was placed (log only): gap / lru / fit / hit / exclusive
     g6rt::PrefixReuse proto_;                  // the reuse rules (strict, noend, grid) every retained state follows
     std::vector<Kept> kept_;
     uint64_t age_ = 0;
@@ -31,12 +38,14 @@ class RunPool {
         for (const auto& k : kept_) if (i >= k.run.base_page && i < k.run.base_page + k.run.pages) return true;
         return false;
     }
-    // drop the retained runs that overlap [base, base + pages); all = every retained run
-    void evict(uint32_t base, uint32_t pages, bool all) {
-        std::vector<Kept> left;
+    // drop the retained runs that overlap [base, base + pages); all = every retained run; returns the dropped ones
+    std::vector<Kept> evict(uint32_t base, uint32_t pages, bool all) {
+        std::vector<Kept> left, gone;
         for (auto& k : kept_)
             if (!all && (k.run.base_page + k.run.pages <= base || base + pages <= k.run.base_page)) left.push_back(std::move(k));
+            else gone.push_back(std::move(k));
         kept_ = std::move(left);
+        return gone;
     }
     void mark(const Run& r, bool on) {
         require(r.pages && uint64_t(r.base_page) + r.pages <= pages_, "pool run outside the pool");
@@ -90,8 +99,25 @@ public:
             }
             return run == n;
         };
+        // no gap free of retained runs: the window of live-free pages that costs the least recently retired runs
+        auto lru = [&](uint32_t& base) {
+            bool found = false; uint64_t best_age = 0; uint32_t best_pages = 0;
+            for (uint32_t b = 0; b + n <= end; ++b) {
+                bool live = false;
+                for (uint32_t i = b; i < b + n && !live; ++i) live = used_[i];
+                if (live) continue;
+                uint64_t newest = 0; uint32_t over = 0;
+                for (const auto& k : kept_)
+                    if (k.run.base_page < b + n && b < k.run.base_page + k.run.pages) { newest = std::max(newest, k.age); over += k.run.pages; }
+                if (!found || newest < best_age || (newest == best_age && over < best_pages)) { found = true; best_age = newest; best_pages = over; base = b; }
+            }
+            return found;
+        };
         uint32_t base = 0;
-        const bool ok = (keep_ && !exclusive(rows) && gap(base)) || fit(false, base);
+        const bool by_gap = keep_ && !exclusive(rows) && gap(base);
+        const bool by_lru = !by_gap && keep_ && !exclusive(rows) && lru(base);
+        const bool ok = by_gap || by_lru || fit(false, base);
+        how_ = by_gap ? "gap" : by_lru ? "lru" : exclusive(rows) ? "exclusive" : "fit";
         require(ok, "pool reserve: no contiguous run");
         require(version_ != UINT32_MAX, "pool table version exhausted");
         Run r{base, n, ++version_};
@@ -103,7 +129,14 @@ public:
         require(!exclusive_, "pool claim while an exclusive run is resident");
         if (exclusive(rows)) require(r.base_page == 0 && !used_pages(), "exclusive run not at base 0 of an empty pool");
         else require(uint64_t(r.base_page) + r.pages <= place_, "run below R outside the physical pages");
-        evict(r.base_page, r.pages, exclusive(rows));   // an exclusive run holds the whole pool
+        const auto gone = evict(r.base_page, r.pages, exclusive(rows));   // an exclusive run holds the whole pool
+        if (log_) {
+            std::fprintf(stderr, "# s2 pool claim %s base %u pages %u rows %llu live %u kept %u evicted %zu", how_, r.base_page, r.pages,
+                         (unsigned long long)rows, used_pages(), (unsigned)kept_.size(), gone.size());
+            for (const auto& k : gone) std::fprintf(stderr, " [%u+%u age %llu valid %d]", k.run.base_page, k.run.pages, (unsigned long long)k.age, k.st.valid);
+            std::fprintf(stderr, "\n");
+        }
+        how_ = "claim";
         mark(r, true);
         version_ = r.table_version;
         if (exclusive(rows)) { exclusive_ = true; held_ = r; }
@@ -152,9 +185,11 @@ public:
         require(h.skip > 0 && admissible(rows), "pool take without a hit");
         require(version_ != UINT32_MAX, "pool table version exhausted");
         Run r{h.run.base_page, h.run.pages, ++version_};
+        how_ = "hit";
         claim(r, rows);
         return r;
     }
+    void log(bool on) { log_ = on; }
     uint32_t kept_runs() const { return uint32_t(kept_.size()); }
 };
 } // namespace g6s2

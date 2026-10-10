@@ -705,6 +705,7 @@ int main(int argc, char** argv)
             PrefixReuse rules;
             rules.strict = st_ == 1; rules.noend = ne_ == 1; rules.grid = al_ == 1 ? MP : 0;
             pool.keep(rules);
+            if (env_choice("G6_POOL_LOG", 1, 0, &err) == 1) pool.log(true);   // one stderr line per pool claim: base, pages, evicted retained runs
             if (R == 0) fprintf(stderr, "# s2 reuse on: retired runs kept until a claim overlaps them; grid %d rows\n", rules.grid);
         }
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)

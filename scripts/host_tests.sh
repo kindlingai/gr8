@@ -15,3 +15,5 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtim
 "$T/capture_barrier_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_reuse_test.cpp" -o "$T/pool_reuse_test"
 "$T/pool_reuse_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_conc_replay_test.cpp" -o "$T/pool_conc_replay_test"
+"$T/pool_conc_replay_test"

@@ -98,6 +98,20 @@ int main()
         CHECK(p3.free_pages() == 600 - 250);
     }
 
+    // no gap fits: the window over the least recently retired run, not the lowest address (PF-C6-CONC)
+    {
+        RunPool p5(600, 600, below); p5.keep(rules);
+        const auto N = seq(9000, 31), O = seq(9000, 32);
+        Run nw{0, 150, 1}, old{150, 150, 2}, lv{300, 300, 3};
+        p5.claim(nw, 150 * 64); p5.claim(old, 150 * 64); p5.claim(lv, 300 * 64);
+        p5.retain(old, finished(O, seq(8, 3)));              // retired first: the older
+        p5.retain(nw, finished(N, seq(8, 4)));               // retired last: the newer, at the lower address
+        Run r = p5.reserve(150 * 64);
+        CHECK(r.base_page == 150 && p5.kept_runs() == 1);
+        std::vector<int> Nq = N; const auto ng = seq(8, 4), nt = seq(100, 40); Nq.insert(Nq.end(), ng.begin(), ng.end()); Nq.insert(Nq.end(), nt.begin(), nt.end());
+        CHECK(p5.match(Nq, Nq.size() + 68, int(Nq.size()) - 1).skip == 8192 && p5.match(O, 9000 + 68, 8999).skip == 0);   // the newer one survives
+    }
+
     // an exclusive (past-R) claim evicts every retained run
     Run g = pool.reserve(rowsA); pool.retain(g, finished(A, Agen));
     CHECK(pool.kept_runs() == 3);                             // B, D and A
