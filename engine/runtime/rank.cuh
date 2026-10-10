@@ -977,6 +977,10 @@ inline void route_log_line(FILE* f, const Model& m, const std::vector<int>& ids,
         fputc(']', f);
         first = false;
     }
+    fputs("},\"S\":{", f);    // routed slots per layer (r[0]); slots - distinct ids = same-id splits
+    first = true;
+    for (int i = 0; i < m.nl; ++i)
+        if (m.layers[i].moe) { fprintf(f, "%s\"%d\":%d", first ? "" : ",", ids[i], m.rlog[(size_t)i * RLOG]); first = false; }
     fputs("}}\n", f);
 }
 
