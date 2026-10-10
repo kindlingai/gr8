@@ -978,8 +978,9 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8p(Gemm g0)
 #ifdef PF_GEMMF
 // PF_GEMMF: k_gemm_mx8b with an unguarded mma loop for full tiles (nb == BM, ncols == 128; a CTA-uniform test): the
 // per-mma guards made nvcc wrap each predicated QMMA in WARPSYNC / BSSY / BSYNC (results/peak/gemmsass). Same mma
-// calls, operands and k order per output, so the bits are those of k_gemm_mx8b.
-template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
+// calls, operands and k order per output, so the bits are those of k_gemm_mx8b. F32 writes the accumulators as float
+// (the o_proj output of the QO path), as k_gemm_mx8b<BM, false, true> does.
+template <int BM, bool F32 = false> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
 {
     Gemm g = g0;
 #ifdef PF_GEMMRF
@@ -1153,7 +1154,8 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
     if (g.osvh)
     {
         gemm_rot_store<BM, NT>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
-            *reinterpret_cast<uint2*>(static_cast<uint16_t*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = pack_o4(v, g.bf16);
+            if constexpr (F32) *reinterpret_cast<float4*>(static_cast<float*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = make_float4(v[0], v[1], v[2], v[3]);
+            else *reinterpret_cast<uint2*>(static_cast<uint16_t*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = pack_o4(v, g.bf16);
         });
         return;
     }
@@ -1168,8 +1170,17 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
             const int m = wm * 4 + mb;
             if (m >= nb || nt >= nvalid) continue;
             const int col = c0 + colw + nt * 8 + 2 * c, row = (rb0 + m) * 16 + r;
-            if (row < g.M) *reinterpret_cast<u32*>(y + static_cast<size_t>(row) * g.ldy + col) = pack_o2(acc[mb][nt][0], acc[mb][nt][1], g.bf16);
-            if (row + 8 < g.M) *reinterpret_cast<u32*>(y + static_cast<size_t>(row + 8) * g.ldy + col) = pack_o2(acc[mb][nt][2], acc[mb][nt][3], g.bf16);
+            if constexpr (F32)
+            {
+                float* yf = static_cast<float*>(g.y);
+                if (row < g.M) *reinterpret_cast<float2*>(yf + static_cast<size_t>(row) * g.ldy + col) = make_float2(acc[mb][nt][0], acc[mb][nt][1]);
+                if (row + 8 < g.M) *reinterpret_cast<float2*>(yf + static_cast<size_t>(row + 8) * g.ldy + col) = make_float2(acc[mb][nt][2], acc[mb][nt][3]);
+            }
+            else
+            {
+                if (row < g.M) *reinterpret_cast<u32*>(y + static_cast<size_t>(row) * g.ldy + col) = pack_o2(acc[mb][nt][0], acc[mb][nt][1], g.bf16);
+                if (row + 8 < g.M) *reinterpret_cast<u32*>(y + static_cast<size_t>(row + 8) * g.ldy + col) = pack_o2(acc[mb][nt][2], acc[mb][nt][3], g.bf16);
+            }
         }
 }
 #endif
@@ -1398,6 +1409,18 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
     }
     if (f32)
     {
+#if defined(PF_GEMMF) && !defined(PF_GEMMW)
+        // G6_PF_GEMMF32=1 (default 0, read once): a big launch takes the unguarded full-tile kernel with the FP32
+        // epilogue, not the guarded k_gemm_mx8b. Same mma calls, operands and k order, so the same bits.
+        static const bool gemmf32 = [] { const char* e = getenv("G6_PF_GEMMF32"); return e && atoi(e) == 1; }();
+        static bool attrf32 = false;
+        if (gemmf32 && big)
+        {
+            if (!attrf32) { cudaFuncSetAttribute(k_gemm_mx8f<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, G2<8>::SMEM); attrf32 = true; }
+            k_gemm_mx8f<8, true><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(g);
+            return;
+        }
+#endif
         if (big) k_gemm_mx8b<8, false, true><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(g);
         else k_gemm_mx8b<4, false, true><<<dim3(NB, (RB + 3) / 4), 256, G2<4>::SMEM, st>>>(g);
         return;

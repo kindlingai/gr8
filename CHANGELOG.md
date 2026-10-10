@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-10: `G6_PF_GEMMF32=1`: the QO o_proj uses the full-tile GEMM (opt-in)
+
+- The row-owner QO o_proj (`G6_PF_OWN=3`) writes FP32, which kept it on the guarded `k_gemm_mx8b` while the BF16 / FP16
+  output GEMMs take the full-tile kernel: the per-mma guards make nvcc wrap each QMMA in WARPSYNC / BSSY / BSYNC.
+  `G6_PF_GEMMF32=1` gives `k_gemm_mx8f` (the unguarded full-tile kernel) an FP32 epilogue and launches it for big
+  o_proj launches. Same mma calls, operands and k order per output, so the bits are the same. Default 0; needs
+  `-DPF_GEMMF`.
+- One GPU, TP=6 shape (M = 682 and 683 rows, N = 6144, K = 16384): 0 differing output bytes over two runs of each M,
+  median 1.546 -> 1.377 ms per layer. TP=6 prefill, 8K prompt: 1953 -> 2004 tok/s (three runs: 2014 / 1979 / 2019),
+  32K prompt: 1952 -> 1980; the canary output is byte-identical with the switch off.
+
 ## 2026-10-10: TP=3 boots down1 by default; the engine stops short of the OOM killer
 
 - `--tp 3` with the exlr8 release picks `--variant down1` unless one is given. `home` puts 108.7 GB of weights on a

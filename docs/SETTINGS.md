@@ -62,6 +62,7 @@ the short version.
 | `G6_PF_RSDIRECT` | 1 | o_proj, dense down and the MoE final sum write straight into the reduce-scatter send slot |
 | `G6_PF_AOP` | 1 (when built with `-DPF_AOP`) | fc1 A-operand share: `k_pf_aop` quantizes the fc1 A operand once per (segment, matrix, distinct prologue input) into global records that the fc1 block-CTAs stage by cp.async. Needs build flag `-DPF_AOP`; 0 disables; `G6_PF_AOP_MMIN` (default 3072) sets the M floor. Byte-exact |
 | `G6_PF_F12` | 1 (when built with `-DPF_F12`) | fc1 runs as the fat-CTA kernel `k_pf_fc1f` (NE=2 expert blocks share one quantized A record). Needs build flag `-DPF_F12`, which `G6_NR=4 scripts/build.sh` sets; 0 = the stock fc1. Byte-exact |
+| `G6_PF_GEMMF32` | 0 | the row-owner QO o_proj (`G6_PF_OWN=3`; its FP32 output kept it on the guarded kernel) runs as `k_gemm_mx8f` with an FP32 epilogue instead of the guarded `k_gemm_mx8b`. Needs build flag `-DPF_GEMMF` (in the stock build); read once at the first launch, so set it for the boot. Byte-exact |
 | `G6_DEC_SPLIT` | 3 | the decode step is captured as two graphs split at layer 3, so the second submission overlaps the first one's GPU time |
 | `G6_DEC_SHARED_SCRATCH` | 1 | one decode attention scratch for all layers (frees memory for the big pool; needs `--pfv2`) |
 | `G6_CP` | 1 | context-parallel KV on (build flag `-DG6_CP=1` too) |
