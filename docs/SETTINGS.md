@@ -11,7 +11,7 @@ the short version.
 |---|---|---|
 | `--rank R` | 0..5 (TP4: 0..3) | this process's rank; rank r loads `rank<r>.pack` |
 | `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order (exactly `G6_NR` of them) |
-| `--proxy-cpu N` | 19 | CPU core for the fabric proxy thread (the CP fabric's proxy uses N-1) |
+| `--proxy-cpu N` | 19 | CPU core for the decode fabric's proxy thread. Every other fabric's proxy has its own core below it: N-1 and N-2 the two prefill lanes, N-3 the CP fabric, N-4 CP staging, N-5 the QP roll, N-6 the MTP draft, N-7 DFlash |
 | `--manifest` / `--pack` | `packs/rank<r>.*` | this rank's pack; `--pack -` reads it from stdin |
 | `--v2 DIR` / `--v2-slices DIR` / `--v2-widths FILE` | the release (`V2`, `V2_SLICES`, `--variant`) | the routed and shared experts from the exlr8 width files at the index slices' offsets, at the manifest's widths, in place of the pack's |
 | `--v2-dense DIR` | the release (`V2_DENSE`) | with `--v2`: no `--manifest` / `--pack`. Every other weight comes from the release's `dense/` files, planned at load (`engine/loader-rs/src/release.rs`); rank 0 prints which form each matrix took. Under `G6_PF_OWN=3` the image also holds the full-head q_b / o_proj / UK / UV, so no QO pack |
@@ -69,7 +69,7 @@ the short version.
 | `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
 | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
 | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
-| `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (`--proxy-cpu` and the four below it) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
+| `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (the cores of the proxies this rank started, see `--proxy-cpu`) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
 | `G6_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
 | `G6_DTR` | 1 | the dense trellis matrices of the exlr8 release form (q_b, o_proj, the dense MLP of layers 0-2; `engine/kernels/dtr.cuh`) where a layer has them: decode on the trellis tiles, prefill on the o_proj tiles and on exact FP8 copies of q_b and the dense MLP (made at load). 0 = the int4 / MXFP8 records, which the layer must then have (A/B) |
 | `G6_DTR_PF_COPY` | 0 | 1 = o_proj prefill on an FP8 copy of its tiles too, as q_b and the MLP (about 25 MB more per layer at TP4; A/B, same bits) |

@@ -24,7 +24,7 @@ python3 tools/health/rank_probe.py local --proxy-cpu 19 --rail-ips 10.0.1.1,10.0
 | GPU clock and throttle reasons | `nvidia-smi` sampled while `gpuprobe` reads device memory (a clock is only meaningful under load) |
 | wedge | `nvidia-smi -L` must answer within 15 s (a held RM lock hangs it). D-state processes and coredump writers are listed as context |
 | device-memory read and host-to-device copy rate | `gpuprobe`; compared with the median of the ranks |
-| proxy CPUs | the CPUs the fabric proxy threads use (`--proxy-cpu` and the four below it) must be online, in the CPU set, and not busy while the node is idle |
+| proxy CPUs | the CPUs the fabric proxy threads use (`--proxy-cpu` and the seven below it) must be online, in the CPU set, and not busy while the node is idle |
 
 ## Reasons
 

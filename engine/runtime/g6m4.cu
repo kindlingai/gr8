@@ -324,7 +324,7 @@ int main(int argc, char** argv)
         g6::FabricConfig cd = cfg;
         cd.ncoll = 3;
         cd.port = cfg.port + 16;
-        cd.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
+        cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;   // own core: fabp2 (prefill lane 2) has N-2
         fabd.init(cd);
         fabd.start_proxy();
     }
@@ -334,7 +334,7 @@ int main(int argc, char** argv)
         g6::FabricConfig cd = cfg;
         cd.ncoll = dfl::NC;
         cd.port = cfg.port + 40;
-        cd.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
+        cd.proxy_cpu = cfg.proxy_cpu > 6 ? cfg.proxy_cpu - 7 : -1;   // own core: not N-2 (fabp2) or N-6 (fabd)
         fabf.init(cd);
         fabf.start_proxy();
     }

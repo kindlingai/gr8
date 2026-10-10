@@ -61,8 +61,8 @@ echo "all ranks ready after $(( $(date +%s) - t0 ))s"
 # shim + front end on the head (rank 0). The head's own serve dir is local; the others are host:path over ssh.
 DIRS="$G6_HOME/serve"; for ((r = 1; r < NRANK; r++)); do DIRS="$DIRS ${HOST[$r]}:$G6_HOME/serve"; done
 PY=${PY:-$G6_HOME/venv/bin/python}
-# shim and front end stay off the proxy CPUs (the engine pins its proxy threads to PROXY_CPU-4..PROXY_CPU on each node)
-PIN=""; if [ "$PROXY_CPU" -ge 5 ] && command -v taskset > /dev/null; then PIN="taskset -c 0-$((PROXY_CPU - 5))"; fi
+# shim and front end stay off the proxy CPUs (the engine pins its proxy threads to PROXY_CPU-7..PROXY_CPU on each node)
+PIN=""; if [ "$PROXY_CPU" -ge 8 ] && command -v taskset > /dev/null; then PIN="taskset -c 0-$((PROXY_CPU - 8))"; fi
 mkdir -p "$G6_HOME/run" "$G6_HOME/out"; SOCK=$G6_HOME/run/engine.sock; rm -f "$SOCK"
 PYTHONPATH="$REPO/frontend" nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/shim.pid" \
   $PIN "$PY" "$REPO/frontend/g6shim.py" --rank-dirs $DIRS --sock "$SOCK" --max-model-len "$CAP" --stall-timeout 2400 \

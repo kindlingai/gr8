@@ -334,7 +334,12 @@ def gpu_load(h, th, tool, taskset_cpus):
             'throttle_mask': mask, 'throttle': [n for b, n in THROTTLE_BITS.items() if mask & b]}
 
 
-def local_probe(h, th, proxy_cpu, gpu_tool, rail_ips, n_proxy=5):
+# g6m4's proxy CPUs below --proxy-cpu N: N (decode), N-1 (prefill lane 1), N-2 (prefill lane 2), N-3 (CP), N-4 (CP
+# staging), N-5 (QP roll), N-6 (MTP draft), N-7 (DFlash). engine/runtime/g6m4.cu is the reference.
+PROXY_OFFSETS = (0, 1, 2, 3, 4, 5, 6, 7)
+
+
+def local_probe(h, th, proxy_cpu, gpu_tool, rail_ips, proxy_offsets=PROXY_OFFSETS):
     """One node. Never raises for a bad node: what is wrong is in the result."""
     t0 = time.time()
     res = {'host': h.read('/proc/sys/kernel/hostname') or '?'}
@@ -344,7 +349,7 @@ def local_probe(h, th, proxy_cpu, gpu_tool, rail_ips, n_proxy=5):
         return res
     res['wedge'] = wedge_check(h, th)
     res['rails'] = rails_state(h, rail_ips)
-    proxy_cpus = [proxy_cpu - k for k in range(n_proxy) if proxy_cpu - k >= 0]
+    proxy_cpus = [proxy_cpu - k for k in proxy_offsets if proxy_cpu - k >= 0]
     res['proxy_cpu'] = proxy_cpu_state(h, proxy_cpus)
     if not res['wedge']['wedged']:
         res['gpu'] = gpu_load(h, th, gpu_tool, res['proxy_cpu']['allowed_other'])
