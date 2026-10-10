@@ -98,6 +98,22 @@ drafter: its 8 KV heads do not split three ways. `scripts/build_packs.sh` builds
   (13 GB).
 - Only to build packs (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for the
   GPTQ codes and about 390 GB for the packs it writes.
+- One kernel setting on every box: proactive memory compaction off. A rank fills the box to about 2 GB under its
+  memory limit, and at that level the kernel's background compaction (kcompactd) migrates pages under the running
+  engine, in bursts of tens of thousands of pages per second. Each burst delays the rank, and the other ranks wait for
+  it at every collective. Set it once, as root; it holds across reboots:
+
+  ```
+  echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-g6-no-proactive-compaction.conf
+  sysctl -w vm.compaction_proactiveness=0
+  ```
+
+  To undo: delete the file and run `sysctl -w vm.compaction_proactiveness=20` (the kernel default). What we measured
+  on TP=4 boots on the same nodes and clock cap: with the setting, kcompactd no longer runs its timer-driven
+  bursts (the largest load-time burst on the worst node fell from 57,000-94,000 pages/s to about 10 pages). It does
+  not stop all compaction: a later boot still showed direct compaction inside timed rows under high-order allocation
+  pressure (under investigation). Output bytes do not change (a host setting, not an engine change). Watch `compact_stall` in
+  `/proc/vmstat`: with proactive compaction off, an allocation that needs large pages compacts directly instead.
 - Toolchain: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev (the stock DGX OS,
   Ubuntu 24.04), and cargo for the Rust pack loader and front end.
 - The weights, public on Hugging Face:
