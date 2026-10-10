@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End to end: four supervisors on this machine, each `./gr8 glm53 up` with its own G6_HOME and model cache, the
-stub engine (stubs/g6m4, which plays each rank with frontend/tests/fake_s2_engine.py), the real shim behind a stub
-ssh, and a stub front end. The boxes are 127.0.0.1-4 on the LAN and 127.0.1.x / 127.0.2.x on the rails, so it needs
+stub engine (stubs/g6m4, which plays each rank with frontend/tests/fake_s2_engine.py), the real shim and a stub front
+end. The boxes are 127.0.0.1-4 on the LAN and 127.0.1.x / 127.0.2.x on the rails, so it needs
 Linux (every 127/8 address is local there).
     python3 -m unittest discover -s tools/launch -p 'test_e2e.py'"""
 import asyncio
@@ -144,10 +144,11 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(self.homes[i], 'cache', 'sets', set_id)).count(f'rank{i}'), 1)
             self.assertEqual(sorted(n for n in os.listdir(os.path.join(self.homes[i], 'cache', 'sets', set_id))
                                     if n.startswith('rank')), [f'rank{i}'])
-        # a request through the shim: req.<id> must reach every rank's directory (over the stub ssh)
+        # a request through the shim: req.<id> lands in the head's directory only (the head engine sends the bytes on)
         self.assertEqual(self.request(), 6)
+        self.assertTrue(any(n.startswith('req.') for n in os.listdir(os.path.join(self.homes[0], 's2'))))
         for i in range(1, TP):
-            self.assertTrue(any(n.startswith('req.') for n in os.listdir(os.path.join(self.homes[i], 's2'))), i)
+            self.assertFalse(any(n.startswith('req.') for n in os.listdir(os.path.join(self.homes[i], 's2'))), i)
         st = self.gr8(2, 'status')
         self.assertEqual(st.stdout.count(': serving, engine running'), TP, st.stdout)
         self.assertIn('answers (/health 200)', st.stdout)
