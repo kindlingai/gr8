@@ -52,6 +52,7 @@
 #include "../attn/prefill.h"
 #include "../attn/prefill-qo-bind.h"
 #include "qo_weights.cuh"
+#include "dtr_find.h"
 #include "cp_pf_tail.h"
 
 namespace g6rt

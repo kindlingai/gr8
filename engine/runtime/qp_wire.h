@@ -4,7 +4,8 @@
 // A bulk-mode g6::Fabric (fabric.h bulk mode) per rank. Its bulk area is a ring of E entries; entry e is
 // [lo half image | hi half image], HALF bytes each. A half image is one pair member's 16-head slice of a layer, contiguous:
 // q_b codes [4096][2048] | q_b scales [4096][64] | o_proj codes [6144][4096] | o_proj scales [6144][128] | UK BF16 [16][192][512]
-// | UV BF16 [16][256][512]. Position h of the entry (0 = lo, 1 = hi) belongs to member qp_order(r, l)[h], the same order as
+// | UV BF16 [16][256][512] | q_b svh f16 [4096] | o_proj suh f16 [4096]. The last two carry the member's slices of a dense
+// trellis q_b / o_proj (kernels/dtr.cuh, whose codes are then its exact FP8 tile copy). MXFP8 layers leave them unused. Position h of the entry (0 = lo, 1 = hi) belongs to member qp_order(r, l)[h], the same order as
 // the slot halves (qo_weights.cuh), so placement is identity: rank r stages ITS half at ITS position and RDMA-writes that
 // range to the partner p = r ^ 1 at the same offset; p's half arrives at the other position. No extra copy on either side.
 //
@@ -34,11 +35,12 @@ namespace g6rt
 namespace qw
 {
 constexpr size_t QC = (size_t)4096 * 2048, QS = (size_t)4096 * 64, OC = (size_t)6144 * 4096, OS = (size_t)6144 * 128,
-                 UK = (size_t)16 * 192 * 512 * 2, UV = (size_t)16 * 256 * 512 * 2;
+                 UK = (size_t)16 * 192 * 512 * 2, UV = (size_t)16 * 256 * 512 * 2, QV = (size_t)4096 * 2, OV = (size_t)4096 * 2;
 constexpr size_t OFF_QC = 0, OFF_QS = OFF_QC + QC, OFF_OC = OFF_QS + QS, OFF_OS = OFF_OC + OC, OFF_UK = OFF_OS + OS,
-                 OFF_UV = OFF_UK + UK, HALF = OFF_UV + UV;
-static_assert(HALF == 41943040, "half image: 40 MiB per pair member and layer");
-static_assert(OFF_QS % 8 == 0 && OFF_OC % 8 == 0 && OFF_OS % 8 == 0 && OFF_UK % 8 == 0 && OFF_UV % 8 == 0, "8-B ranges");
+                 OFF_UV = OFF_UK + UK, OFF_QV = OFF_UV + UV, OFF_OV = OFF_QV + QV, HALF = OFF_OV + OV;
+static_assert(HALF == 41943040 + 16384, "half image: 40 MiB + 16 KiB per pair member and layer");
+static_assert(OFF_QS % 8 == 0 && OFF_OC % 8 == 0 && OFF_OS % 8 == 0 && OFF_UK % 8 == 0 && OFF_UV % 8 == 0 && OFF_QV % 8 == 0 &&
+              OFF_OV % 8 == 0, "8-B ranges");
 // error words of the wire (its fabric's BulkDev::error); the bulk proxy's own codes are bulk_proxy.h 0x71-0x74
 constexpr unsigned ERR_WAIT_CONSUMED = 0x65000100u;  // | entry << 4 | peer: GPU timed out waiting p's consumed flag
 constexpr unsigned ERR_WAIT_READY = 0x65000200u;     // | entry << 4 | peer: GPU timed out waiting p's ready flag
@@ -57,12 +59,13 @@ inline unsigned long long val(long n) { return (unsigned long long)n + 1; }
 inline unsigned long long consumed_min(long n, int E) { return n >= E ? (unsigned long long)(n + 1 - E) : 0ull; }
 inline int partner(int r) { return r ^ 1; }
 // ready aux tag: p posts it with ready(n) (BulkJob post_flag aux = aux_out[ready e]); I compare it to mine for the same
-// build. Equal only if both members build the same model layer with the same S, E and QO table (G6_PF_QP_CTX): a pair
-// whose G6_PF_QP_LAYERS / ROLL / WIRE_E / QP_CTX differ fails closed (ERR_TAG) instead of reading another layer's half.
-inline unsigned long long tag(int layer, int S, int E, int qp_ctx)
+// build. Equal only if both members build the same model layer with the same S, E, QO table (G6_PF_QP_CTX) and weight
+// form (trellis: the layer's q_b / o_proj are dense trellis): a pair whose G6_PF_QP_LAYERS / ROLL / WIRE_E / QP_CTX or
+// weights differ fails closed (ERR_TAG) and reads no other layer's half.
+inline unsigned long long tag(int layer, int S, int E, int qp_ctx, bool trellis = false)
 {
-    return 0x4c32000000000000ull | ((unsigned long long)(layer & 0xff) << 40) | ((unsigned long long)(S & 0xf) << 36) |
-           ((unsigned long long)(E & 0xf) << 32) | (unsigned long long)(unsigned)qp_ctx;
+    return 0x4c32000000000000ull | ((unsigned long long)trellis << 48) | ((unsigned long long)(layer & 0xff) << 40) |
+           ((unsigned long long)(S & 0xf) << 36) | ((unsigned long long)(E & 0xf) << 32) | (unsigned long long)(unsigned)qp_ctx;
 }
 // g6m4 boot refusals of the rolling-pack env, before any fabric / CUDA work. "" = ok, else the die message.
 // pf_qp: G6_PF_OWN=4 with --prefill; roll / wire_e: env_choice results (-1 = bad value, err already set by the caller);

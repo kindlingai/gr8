@@ -5,9 +5,9 @@
     python3 engine/ref/dtr_ref.py check DENSE_DIR LAYER OUT --exlr8 LOADER_DIR [--device cuda]
 
 prepare writes, per trellis matrix of dense/exlr8-dense-LLL.safetensors and rank, what the loader hands g6: the rank's
-entries of M.trellis as stored, its slices of M.suh / M.svh, plus random fp16 input rows. q_b and o_proj take g6's head
-split (64 heads, the larger slices first), the dense MLP 12288 / TP contiguous channels. OUT/meta.txt names them for
-dtr_test.
+entries of M.trellis as stored, its slices of M.suh / M.svh, plus random fp16 input rows. Rank r holds chunk
+(r - layer) mod TP (tools/convert/plan.py): q_b and o_proj g6's head split (64 heads, the larger slices first), the dense
+MLP 12288 / TP contiguous channels. OUT/meta.txt names them for dtr_test.
 
 check compares dtr_test's outputs with loader/exlr8.py of kindlingai/exlr8 (pure PyTorch, value for value equal to
 exllamav3), passed as --exlr8 (the directory holding exlr8.py):
@@ -19,6 +19,8 @@ exllamav3), passed as --exlr8 (the directory holding exlr8.py):
             same data (MXFP8 activations of the unrotated x times the exact W): both are FP8-activation GEMMs
   ranks     the rank partials summed (o_proj, down) or joined (q_b, gate, up) against the whole matrix
   glu       the MLP chain silu(x Wg^T) * (x Wu^T) @ Wd_rank^T against the kernels' gate+up launch and down
+  bind      (dtr_test --bind outputs) rank 0's q_b, o_proj and MLP through bind::make_layer / bindp::make_layer: decode
+            against the same references (BF16 outputs at TOL_BF16), prefill as above
 For context it also prints the error of the routed experts' rounding points (k1_v2_ref.py: f16 sum before the output
 Hadamard) on the same data.
 """
@@ -33,6 +35,7 @@ import numpy as np
 TOL_DECODE = 4e-3        # vs exact W: fp16 rotated activations (rel 2^-11 each) are the only rounding before the output
 TOL_PREFILL = 1.5        # prefill, row rms error: at most this times today's MXFP8 prefill (k_xq8 activations, exact W)
 TOL_PREFILL_GLU = 6e-2   # the MLP chain, whose today-equivalent is not emulated: the class of the single matrices
+TOL_BF16 = 6e-3          # decode with BF16 output (o_proj, MLP partials): the BF16 rounding (rel 2^-9) on top of TOL_DECODE's
 MATS = [("q_b", "self_attn.q_b_proj"), ("o_proj", "self_attn.o_proj"), ("gate", "mlp.gate_proj"), ("up", "mlp.up_proj"),
         ("down", "mlp.down_proj")]
 
@@ -62,20 +65,21 @@ def read_st(path):
     return out, meta
 
 
-def head_split(tp, r):
-    """g6nr::start / width of 64 heads: the larger slices first."""
-    w = 64 // tp + (1 if r < 64 % tp else 0)
-    s = r * (64 // tp) + min(r, 64 % tp)
-    return s, w
+def chunk(n, tp, j):
+    """(start, width) of chunk j of n units over tp ranks, the larger chunks first (g6nr.h)"""
+    w = n // tp + (1 if j < n % tp else 0)
+    return j * (n // tp) + min(j, n % tp), w
 
 
-def rank_channels(short, tp, r):
-    """the rank's channels on the sharded side"""
+def rank_channels(short, tp, r, layer):
+    """the rank's channels on the sharded side: rank r holds chunk (r - layer) mod tp (tools/convert/plan.py heads and
+    dense_groups), heads of 256 channels or the dense MLP's 12288 channels"""
+    j = (r - layer) % tp
     if short in ("q_b", "o_proj"):
-        s, w = head_split(tp, r)
+        s, w = chunk(64, tp, j)
         return 256 * s, 256 * (s + w)
-    ch = 12288 // tp
-    return r * ch, (r + 1) * ch
+    s, w = chunk(96, tp, j)
+    return 128 * s, 128 * (s + w)
 
 
 def trellis_mats(T):
@@ -100,7 +104,7 @@ def prepare(a):
         if space not in xs:
             xs[space] = rng.standard_normal((a.rows, inp)).astype(np.float16)
         for r in ranks:
-            c0, c1 = rank_channels(short, a.tp, r)
+            c0, c1 = rank_channels(short, a.tp, r, a.layer)
             ent = T[name + ".trellis"][c0 // 128:c1 // 128]
             if side == 1:
                 suh, svh, x = T[name + ".suh"], T[name + ".svh"][c0:c1], xs[space]
@@ -160,7 +164,7 @@ def check(a):
         q = (g / sc).clamp(-448, 448).to(torch.float8_e4m3fn).float() * sc
         return q.reshape(v.shape).double()
 
-    full = {}
+    full, refs, today = {}, {}, {}
     for short, name in MATS:
         if not any(k.startswith(short + ".r") for k in mats):
             continue
@@ -175,7 +179,7 @@ def check(a):
         for r in ranks:
             nm = f"{short}.r{r}"
             K, N, _ = mats[nm]
-            c0, c1 = rank_channels(short, P["tp"], r)
+            c0, c1 = rank_channels(short, P["tp"], r, a.layer)
             E = (N if side == 1 else K) // 128
             ent = torch.from_numpy(np.fromfile(os.path.join(a.out, nm + ".codes.bin"), np.uint8).reshape(E, -1)).to(dev)
             suh = torch.from_numpy(np.fromfile(os.path.join(a.out, nm + ".suh.bin"), np.float16)).to(dev)
@@ -192,6 +196,7 @@ def check(a):
             fp8_exact = bool(torch.equal(c8.view(torch.float8_e4m3fn).float(), Tr.T.float()))
             rec_d = float((X.reconstruct(Tr, suh, svh).T.double() - Wr).abs().max())
             ref = x @ Wr.T
+            refs[nm] = ref
             dec = {}
             for fn in sorted(os.listdir(a.out)):
                 if fn.startswith(nm + ".gemv.M"):
@@ -207,6 +212,7 @@ def check(a):
             ours = h128(xa @ Td) * svh.double()
             # today's prefill on the same data: MXFP8 activations of x (unrotated) times exact weights
             today_pf, today_rms = rel(mx8(x) @ Wr.T, ref), rms(mx8(x) @ Wr.T, ref)
+            today[nm] = today_rms
             r_ = dict(fp8_exact=fp8_exact, reconstruct_vs_decode_dense=rec_d, decode_max_rel=max(dec.values()),
                       decode_by_M={str(k): round(v, 6) for k, v in sorted(dec.items())}, prefill_max_rel=pf, today_mxfp8_prefill_max_rel=today_pf,
                       prefill_rms_rel=pf_rms, today_mxfp8_prefill_rms_rel=today_rms,
@@ -217,13 +223,13 @@ def check(a):
             res[nm] = r_
             print(json.dumps({nm: r_}))
             yfull = torch.from_numpy(np.fromfile(os.path.join(a.out, nm + ".gemv.M8.bin"), np.float32).reshape(8, N)).to(dev).double()
-            parts.append(yfull)
+            parts.append((c0, yfull))
         if len(ranks) > 1:
             ref = xfull[:8] @ W.T
-            y = sum(parts) if side == 2 else torch.cat(parts, 1)
+            y = sum(p[1] for p in parts) if side == 2 else torch.cat([p[1] for p in sorted(parts, key=lambda p: p[0])], 1)
             if side == 1:
-                lo = min(rank_channels(short, P["tp"], r)[0] for r in ranks)
-                hi = max(rank_channels(short, P["tp"], r)[1] for r in ranks)
+                lo = min(rank_channels(short, P["tp"], r, a.layer)[0] for r in ranks)
+                hi = max(rank_channels(short, P["tp"], r, a.layer)[1] for r in ranks)
                 ref = ref[:, lo:hi]
             r_ = dict(ranks=ranks, combined_max_rel=rel(y, ref))
             r_["ok"] = r_["combined_max_rel"] < TOL_DECODE
@@ -237,7 +243,7 @@ def check(a):
         Wg, _, xg = full["gate"]
         Wu, _, _ = full["up"]
         Wd, _, _ = full["down"]
-        c0, c1 = rank_channels("gate", P["tp"], r)
+        c0, c1 = rank_channels("gate", P["tp"], r, a.layer)
         hg, hu = xg @ Wg[c0:c1].T, xg @ Wu[c0:c1].T
         act = hg / (1 + torch.exp(-hg)) * hu
         ref = act @ Wd[:, c0:c1].T
@@ -253,7 +259,30 @@ def check(a):
         r_["ok"] = r_["decode_max_rel"] < TOL_DECODE and r_["prefill_max_rel"] < TOL_PREFILL_GLU
         ok &= r_["ok"]
         res["glu"] = r_
+        refs["glu"] = ref
         print(json.dumps({"glu": r_}))
+    if os.path.exists(os.path.join(a.out, "bind.q_b.M1.bin")):
+        def load(fn, rows, dt):
+            v = np.fromfile(os.path.join(a.out, fn), np.uint16 if dt == "bf16" else np.float16)
+            f = (v.astype(np.uint32) << 16).view(np.float32) if dt == "bf16" else v.astype(np.float32)
+            return torch.from_numpy(f).reshape(rows, -1).to(dev).double()
+        r_, good = {}, True
+        for short, ref_name, dt, tol in (("q_b", "q_b.r0", "f16", TOL_DECODE), ("o_proj", "o_proj.r0", "bf16", TOL_BF16),
+                                         ("mlp", "glu", "bf16", TOL_BF16)):
+            ref = refs[ref_name]
+            dec = {}
+            for fn in sorted(os.listdir(a.out)):
+                if fn.startswith(f"bind.{short}.M"):
+                    M = int(fn[len(short) + 7:-4])
+                    dec[M] = rel(load(fn, M, dt), ref[:M])
+            pf = rms(load(f"bind.pf.{short}.bin", R, dt), ref)
+            pf_tol = TOL_PREFILL_GLU if short == "mlp" else TOL_PREFILL * today[ref_name]
+            r_[short] = dict(decode_max_rel=max(dec.values()), prefill_rms_rel=pf, ok=max(dec.values()) < tol and pf < pf_tol)
+            good &= r_[short]["ok"]
+        r_["ok"] = good
+        ok &= good
+        res["bind"] = r_
+        print(json.dumps({"bind": r_}))
     json.dump(res, open(os.path.join(a.out, "check.json"), "w"), indent=1)
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

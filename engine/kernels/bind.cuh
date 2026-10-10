@@ -49,6 +49,7 @@
 #include <cuda_runtime.h>
 #include "k1.cuh"
 #include "densev.cuh"
+#include "dtr.cuh"
 #if DEC_I4PAIR
 #include <mutex>
 #include <unordered_map>
@@ -76,6 +77,7 @@ enum
     T_TR3_KMIX,                                                         // exlr8 v2 packs only (#65): fc1 width per (block, matrix)
     T_TR3_SG, T_TR3_V1B, T_TR3_V3B,                                     // exlr8 v2 layers with the trellis shared expert: hidden-
                                                                         // side vectors as signs + block scales (no tr3.v1 / v3)
+    T_Q_B_I4,                                                           // exlr8 int4 g32 q_b (layers where int4 won the encode)
     NT
 };
 static const char* const NAMES[NT] = {
@@ -83,7 +85,7 @@ static const char* const NAMES[NT] = {
     "shared.gptq.fc1", "shared.gptq.fc2", "dense.gptq.fc1", "dense.gptq.fc2",
     "tr3.fc1", "tr3.fc2", "tr3.v1", "tr3.v2", "tr3.v3", "tr3.table",
     "q_a.mx.gv", "o_proj.mx.gv", "shared.gate.mx.gv", "shared.up.mx.gv", "shared.down.mx.gv", "tr3.kmix", "tr3.sg", "tr3.v1b",
-    "tr3.v3b"};
+    "tr3.v3b", "q_b.gptq"};
 
 struct LayerTensors
 {
@@ -105,8 +107,10 @@ struct LayerTensors
         int I = 0;                    // owned intermediate channels (row 256's blocks x 128)
     } shfp8;
 #if DEC_I4PAIR
-    int i4pair_ks[2] = {0, 0};        // q_a.gptq, o_proj.gptq repacked into pair records for this k-part count (i4pair ran)
+    int i4pair_ks[3] = {0, 0, 0};     // q_a.gptq, o_proj.gptq, q_b.gptq repacked into pair records for this k-part count (i4pair ran)
 #endif
+    dtr::LayerMats mats;              // dense trellis matrices (exlr8 release form, dtr::layer_mats); w = nullptr: absent
+    const char* mats_err = nullptr;   // dtr::layer_mats refused the layer's trellis tensors (make_layer reports it)
 };
 
 // find(const char* name) -> Tensor, name = "L003.q_a.gptq" ...
@@ -120,6 +124,7 @@ template <class F> inline LayerTensors layer_tensors(int layer, F find)
         T.t[i] = find(n);
     }
     T.e4m3 = T.t[T_TR3_TAB].fmt == FMT_EXLR8_E4M3;
+    T.mats_err = dtr::layer_mats(layer, [&](const char* nm) { return find(nm); }, T.mats);
     return T;
 }
 
@@ -321,8 +326,8 @@ inline void i4pair(LayerTensors& T, cudaStream_t st)
     static std::mutex mu;
     static std::unordered_map<const void*, int> packed;   // device pointer -> ks it was repacked for
     std::lock_guard<std::mutex> lk(mu);
-    const int id[2] = {T_Q_A, T_O_PROJ};
-    for (int j = 0; j < 2; ++j)
+    const int id[3] = {T_Q_A, T_O_PROJ, T_Q_B_I4};
+    for (int j = 0; j < 3; ++j)
     {
         const Tensor& t = T.t[id[j]];
         if (!t.p || T.i4pair_ks[j] || t.nd != 3 || t.shape[2] != 288) continue;
@@ -357,6 +362,8 @@ struct Scratch
     uint16_t* part[2];                // [8][6144] BF16 staging for the two fabric partials (put_partial)
     u32* xf_head;                     // fragment table of the lm_head input, K = 6144
     u32* xf_eh;                       //   of the MTP eh input, K = 12288
+    dtr::Scratch dt;                  // dense trellis GEMVs: fp32 partials and block counters (dtr.cuh)
+    u32* dxd;                         //   the dense MLP down's input fragment tables [ceil(rows/8)][DENSE_CH/16][32][2]
     int rows = G6_MX;                 // row limit the block was laid out for (scratch_layout): sizes below follow it
     int smax = SMAX;                  // K1 slot capacity: SMAX at <= 8 rows, min(SMAX, 8 rows + ceil(rows / 8)) above
     int ysh = SMAX * 8;               // ypart rows ahead of the shared expert's: SMAX * 8 at <= 8 rows, 0 above
@@ -371,6 +378,26 @@ inline int scratch_smax(int rows)
     return rows <= 8 ? SMAX8 : (n < SMAX ? n : SMAX);
 }
 inline int scratch_ysh(int rows) { return rows <= 8 ? SMAX8 * 8 : 0; }
+
+// dense trellis partials (floats) for up to `rows` rows: the largest launch of make_layer's matrices at the
+// dtr::split_for splits
+inline size_t dtr_part_floats(int rows)
+{
+    struct S { int K, N, side, epi, rot, nm; };
+    const S sh[4] = {{2048, g6nr::QBW, dtr::SIDE_OUT, dtr::EPI_OUT, 1, 1}, {g6nr::QBW, HID, dtr::SIDE_IN, dtr::EPI_OUT, 1, 1},
+                     {HID, g6nr::DENSE_CH, dtr::SIDE_OUT, dtr::EPI_GLU, 1, 2}, {g6nr::DENSE_CH, HID, dtr::SIDE_IN, dtr::EPI_OUT, 0, 1}};
+    size_t n = 0;
+    for (int M = 1; M <= rows; ++M)
+        for (const S& x : sh)
+        {
+            int ks, sub;
+            dtr::split_for(x.K, x.side, x.epi, x.rot, M, ks, sub);
+            const size_t f = dtr::part_floats(x.N, x.nm, ks, M);
+            if (f > n) n = f;
+        }
+    return n;
+}
+constexpr int DTR_CNT = 256;          // dense trellis block counters: q_b 0, o_proj 64, MLP gate + up 128, down 192
 
 inline size_t scratch_layout(Scratch* s, char* base, int rows = G6_MX)
 {
@@ -397,6 +424,11 @@ inline size_t scratch_layout(Scratch* s, char* base, int rows = G6_MX)
     t.part[1] = reinterpret_cast<uint16_t*>(take(static_cast<size_t>(rows < 8 ? 8 : rows) * HID * 2));
     t.xf_head = reinterpret_cast<u32*>(take(xf));
     t.xf_eh = reinterpret_cast<u32*>(take(2 * xf));
+    t.dt.part_n = dtr_part_floats(rows);
+    t.dt.part = reinterpret_cast<float*>(take(t.dt.part_n * sizeof(float)));
+    t.dt.cnt_n = DTR_CNT;
+    t.dt.cnt = reinterpret_cast<int*>(take(DTR_CNT * sizeof(int)));
+    t.dxd = reinterpret_cast<u32*>(take(static_cast<size_t>(NT) * (g6nr::DENSE_CH / 16) * 64 * 4));
     t.rows = rows; t.smax = smax; t.ysh = ysh;
     if (s) *s = t;
     return o;
@@ -859,7 +891,27 @@ struct Layer
     Tensor sh[3];                     // the K1's shared / dense MLP records (fc1 or gate, up, fc2 or down), for warm_mlp
     const void* shw = nullptr;        // trellis shared expert (#65): its fc1 tiles (tr3.table row 256) and their bytes,
     size_t shw_bytes = 0;             // for warm_mlp in place of sh[]
+    // dense trellis matrices (dtr.cuh). make_layer binds them where the layer has them, and leaves q_b, o_proj and the
+    // dense MLP's K1 off there. launch_q_b / launch_o_proj / launch_mlp run whichever is on.
+    dtr::Gemv q_b_t, o_proj_t, glu_t, down_t;
 };
+
+inline void launch_q_b(const Layer& L, cudaStream_t st) { launch(L.q_b, st); dtr::launch(L.q_b_t, st); }
+inline void launch_o_proj(const Layer& L, cudaStream_t st) { launch(L.o_proj, st); dtr::launch(L.o_proj_t, st); }
+inline void launch_mlp(const Layer& L, cudaStream_t st)
+{
+    launch_k1(L.k1, st);
+    dtr::launch(L.glu_t, st);
+    dtr::launch(L.down_t, st);
+}
+#ifdef DEC_SLOT
+// the send slots of the layer's two partials: attention (o_proj) and MLP (K1 finalize / dense fc2 / trellis down)
+inline void set_slots(Layer& L, const dslot::Slot& attn, const dslot::Slot& mlp)
+{
+    L.o_proj.slot = attn; L.o_proj_t.a.slot = attn;
+    L.k1.a.slot = mlp; L.down_t.a.slot = mlp;
+}
+#endif
 
 // ---------------------------------------------------------------------------------------------- L2 warm-up
 // launch_warm (common.cuh) on a binding's weights: loads only, results dropped, no output changes. Launched on the
@@ -910,44 +962,68 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     L.moe = T.t[T_TR3_TAB].p != nullptr;
     L.indexer = T.t[T_IDX_WQ_B].p != nullptr;
     const char* e = nullptr;
-    // the int4 record wins when a layer has both. MXFP8 q_a / o_proj splits: five splits each swept on the GB10 at M = 1, 3
+    // G6_DTR (default 1): the dense trellis matrices of the exlr8 release form (dtr.cuh) where the layer has them;
+    // 0 binds the int4 / MXFP8 records instead (a layer must then have them). The int4 record wins over MXFP8 when a
+    // layer has both. MXFP8 q_a / o_proj splits: five splits each swept on the GB10 at M = 1, 3
     // (measured on one GB10); all within 3% (best time) and no split wins at both M, so these stay.
+    static const bool dtr_on = !getenv("G6_DTR") || atoi(getenv("G6_DTR"));
+    if (dtr_on && T.mats_err) return T.mats_err;
+    const dtr::LayerMats& D = T.mats;
+    const bool tq = dtr_on && D.q_b.w, to = dtr_on && D.o_proj.w, tm = dtr_on && D.gate.w;
     const bool qmx = !T.t[T_Q_A].p && T.t[T_Q_A_MX].p, omx = !T.t[T_O_PROJ].p && T.t[T_O_PROJ_MX].p;
+    const bool qi4 = !tq && T.t[T_Q_B_I4].p;
     //                 tensor             codec  tpc ks      fragments   output       dtype
     if (qmx) e = make_gv(T.t[T_Q_A_MX], MXFP8, 2,  16, M, sc.xf_x,    io.q_a,       gv::O_F16,  L.q_a);
     else     e = make_gv(T.t[T_Q_A],    INT4,  4,  8,  M, sc.xf_x,    io.q_a,       gv::O_F16,  L.q_a);
     if (e) return e;
     if ((e = make_gv(T.t[T_KV_A],      MXFP8, 2,  16, M, sc.xf_x,    io.kv_a,      gv::O_F16,  L.kv_a))) return e;
-    if ((e = make_gv(T.t[T_Q_B],       MXFP8, 1,  16, M, sc.xf_qa,   io.q_b,       gv::O_F16,  L.q_b))) return e;
+    if (qi4) e = make_gv(T.t[T_Q_B_I4], INT4,  2,  8,  M, sc.xf_qa,   io.q_b,       gv::O_F16,  L.q_b);
+    else if (!tq) e = make_gv(T.t[T_Q_B], MXFP8, 1, 16, M, sc.xf_qa,  io.q_b,       gv::O_F16,  L.q_b);
+    if (e) return e;
     if ((e = make_gv(T.t[T_IDX_WQ_B],  MXFP8, 1,  32, M, sc.xf_qa,   io.idx_q,     gv::O_F16,  L.idx_q))) return e;
     if ((e = make_gv(T.t[T_IDX_WK],    BF16W, 1,  32, M, sc.xb_x,    io.idx_k,     gv::O_F16,  L.idx_k))) return e;
     if ((e = make_gv(T.t[T_IDX_WPROJ], BF16W, 1,  32, M, sc.xb_x,    io.idx_w,     gv::O_F16,  L.idx_w))) return e;
-    if (omx) e = make_gv(T.t[T_O_PROJ_MX], MXFP8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
+    if (to) {}
+    else if (omx) e = make_gv(T.t[T_O_PROJ_MX], MXFP8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     else     e = make_gv(T.t[T_O_PROJ],    INT4,  2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     if (e) return e;
     if ((e = make_gv(T.t[T_ROUTER],    BF16W, 2,  16, M, sc.xb_x2,   io.logits,    gv::O_F32,  L.router))) return e;
-    if (!L.q_a.on || !L.kv_a.on || !L.q_b.on || !L.o_proj.on)
-        return "layer without q_a.gptq (or q_a.mx.gv) / kv_a.mx.gv / q_b.mx.gv / o_proj.gptq (or o_proj.mx.gv)";
+    if (!L.q_a.on || !L.kv_a.on || !(L.q_b.on || tq) || !(L.o_proj.on || to))
+        return "layer without q_a.gptq (or q_a.mx.gv) / kv_a.mx.gv / q_b (trellis, q_b.gptq or q_b.mx.gv) / o_proj (trellis, o_proj.gptq or o_proj.mx.gv)";
     if (L.moe != L.router.on) return "router.w.gv and tr3.table must come together";
 #if DEC_I4PAIR
-    if ((!qmx && L.q_a.ks != T.i4pair_ks[0]) || (!omx && L.o_proj.ks != T.i4pair_ks[1]))
-        return "DEC_I4PAIR: int4 q_a / o_proj not repacked (bind::i4pair) for the launch's k-part count";
+    if ((!qmx && L.q_a.ks != T.i4pair_ks[0]) || (!omx && !to && L.o_proj.ks != T.i4pair_ks[1]) || (qi4 && L.q_b.ks != T.i4pair_ks[2]))
+        return "DEC_I4PAIR: int4 q_a / o_proj / q_b not repacked (bind::i4pair) for the launch's k-part count";
 #endif
-    if (L.q_a.K != HID || L.kv_a.K != HID || L.q_b.K != L.q_a.O || L.o_proj.O != HID || L.o_proj.K != L.q_b.O || L.q_b.O % 256)
+    const int qbK = tq ? D.q_b.K : L.q_b.K, qbO = tq ? D.q_b.N : L.q_b.O, opK = to ? D.o_proj.K : L.o_proj.K, opO = to ? D.o_proj.N : L.o_proj.O;
+    if (L.q_a.K != HID || L.kv_a.K != HID || qbK != L.q_a.O || opO != HID || opK != qbO || qbO % 256)
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K)";
-    L.heads = L.q_b.O / 256;
+    L.heads = qbO / 256;
+    if (tq && (e = dtr::make_out(D.q_b, M, io.q_a_n, qbK, nullptr, io.q_b, qbO, dtr::O_F16, sc.dt, 0, 0, 1, L.q_b_t))) return e;
+    if (to && (e = dtr::make_out(D.o_proj, M, io.attn, opK, nullptr, io.attn_part, HID, dtr::O_BF16, sc.dt, 64, 0, 1, L.o_proj_t)))
+        return e;
     static const bool multi = !getenv("G6_GV_MULTI") || atoi(getenv("G6_GV_MULTI"));
     if (multi) make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w}, M, L.x_in);
 
     L.xf_x.on = 1;    L.xf_x.src = io.x;        L.xf_x.ld = HID;          L.xf_x.K = HID;          L.xf_x.f16 = sc.xf_x;
     L.xf_x.bf16 = L.indexer ? sc.xb_x : nullptr;
-    L.xf_qa.on = 1;   L.xf_qa.src = io.q_a_n;   L.xf_qa.ld = L.q_a.O;     L.xf_qa.K = L.q_a.O;     L.xf_qa.f16 = sc.xf_qa;
-    L.xf_attn.on = 1; L.xf_attn.src = io.attn;  L.xf_attn.ld = L.o_proj.K; L.xf_attn.K = L.o_proj.K; L.xf_attn.f16 = sc.xf_attn;
+    // the fragment tables of q_a_norm (q_b, idx_q) and of the attention output (o_proj): a trellis matrix rotates its
+    // input itself
+    L.xf_qa.on = L.q_b.on || L.idx_q.on; L.xf_qa.src = io.q_a_n; L.xf_qa.ld = L.q_a.O; L.xf_qa.K = L.q_a.O; L.xf_qa.f16 = sc.xf_qa;
+    L.xf_attn.on = L.o_proj.on; L.xf_attn.src = io.attn; L.xf_attn.ld = opK; L.xf_attn.K = opK; L.xf_attn.f16 = sc.xf_attn;
     L.xf_x2.on = 1;   L.xf_x2.src = io.x2;      L.xf_x2.ld = HID;         L.xf_x2.K = HID;         L.xf_x2.f16 = sc.xf_x2;
     L.xf_x2.bf16 = L.moe ? sc.xb_x2 : nullptr;
     L.xf_x.M = L.xf_qa.M = L.xf_attn.M = L.xf_x2.M = M;
 
-    if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse, split_m))) return e;
+    if (tm)
+    {
+        if (L.moe) return "dense trellis MLP tensors in a MoE layer";
+        if (D.gate.N != g6nr::DENSE_CH) return "dense trellis MLP width is not DENSE_CH";
+        if ((e = dtr::make_glu(D.gate, D.up, D.down, M, io.x2, HID, sc.dxd, sc.dt, 128, 0, 1, L.glu_t))) return e;
+        if ((e = dtr::make_out(D.down, M, nullptr, 0, sc.dxd, io.mlp_part, HID, dtr::O_BF16, sc.dt, 192, 0, 1, L.down_t))) return e;
+        L.xf_x2.on = 0;
+    }
+    else if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse, split_m))) return e;
     L.w8 = (qmx ? 1 : 0) | (omx ? 2 : 0) | (L.k1.a.s_mx ? 4 : 0);
     if (L.k1.sh)                      // row 256's fc1 bytes: 2 matrices per block at each unit's width
     {
@@ -1042,7 +1118,7 @@ inline cudaError_t init()
         const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
         if (e != cudaSuccess) return e;
     }
-    return cudaSuccess;
+    return dtr::init();
 }
 
 }   // namespace bind

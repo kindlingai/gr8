@@ -264,6 +264,12 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
     const int r0 = pf_r0(M, me, nr), r1 = pf_r0(M, me + 1, nr), c0r = pf_r0(M, cp, nr), c1r = pf_r0(M, cp + 1, nr);
     const int nc = c1r - c0r, no = r1 - r0, W = nc + no;
     const QpW& w = (*P.qpw)[i];       // G6_PF_QP_ROLL: slot i % S (static pointers), filled by qp_roll_acquire
+    // dense trellis q_b / o_proj (kernels/dtr.cuh): the pair codes are FP8 tile copies. The pair's suh rotates the inputs
+    // (q_b: the shared full-width vector), its svh the outputs (o_proj: the shared full-width vector).
+    const bindp::Tensors& T = P.T[i];
+    const bool tr = T.tsuh[0] != nullptr;
+    if (tr != (T.tsuh[1] != nullptr)) die("G6_PF_OWN=4: layer " + std::to_string(y.l) + " has one of q_b / o_proj in trellis form, not both");
+    if (tr && !w.qb_svh) die("G6_PF_OWN=4: layer " + std::to_string(y.l) + " is dense trellis but its pair weights have no vectors");
     pf_mark(7, st);
     if (P.roll) { qp_roll_acquire(*P.roll, P.qpl, m.nl, i, st); pf_mark(7, st); }   // exposed staging lands in "other"
     if (i == 0)                  // later layers: every row's q_a_n / kv_a / idx_k / idx_w came with c3 (OWN=2 records)
@@ -280,9 +286,12 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
     auto qb = [&](int a0, int e, __half* y0) {
         if (e <= a0) return;
         const bindp::Layer& bq = pf_layer_rows(m, P, i, a0, e - a0);
-        bindp::launch(bq.xq_qa, st);
+        bindp::Xq xq = bq.xq_qa;
+        xq.suh = tr ? T.tsuh[0] : nullptr;
+        bindp::launch(xq, st);
         bindp::Gemm g;
-        if (const char* er = bindp::make_gemm(w.qb_c, w.qb_s, e - a0, P.sc.x8_small, y0, 0, g)) die(std::string("pair q_b: ") + er);
+        if (const char* er = bindp::make_gemm(w.qb_c, w.qb_s, e - a0, xq.dst, y0, 0, g)) die(std::string("pair q_b: ") + er);
+        g.osvh = tr ? w.qb_svh : nullptr;
         bindp::launch(g, st);
     };
     if (no > 0) qb(a0r, r1, P.qp_qb + (size_t)(S - (r0 - a0r)) * 8192);
@@ -340,9 +349,11 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
         uint8_t* x8 = P.qp_x8 + (size_t)t0 * (8192 / 32) * bindp::REC;
         bindp::Xq xq;
         xq.on = 1; xq.src = P.qp_out + (size_t)w0 * 8192; xq.ld = 8192; xq.K = 8192; xq.M = n; xq.dst = x8;
+        xq.suh = tr ? w.o_suh : nullptr;
         bindp::launch(xq, st);
         bindp::Gemm op;
         if (const char* er = bindp::make_gemm(w.o_c, w.o_s, n, x8, P.qp_part + (size_t)w0 * HID, 1, op)) die(std::string("pair o_proj: ") + er);
+        op.osvh = tr ? T.tsvh[1] : nullptr;
         bindp::launch(op, st);
     };
     auto put = [&] { k_put_slice<<<PF_PUT, 128, 0, st>>>(reinterpret_cast<const uint4*>(P.qp_part), P.f, P.stepp, 0, cp, nc, P.tickets + 0); };
@@ -356,6 +367,7 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
         {
             bindp::Xq xq;
             xq.on = 1; xq.src = P.qp_out; xq.ld = 8192; xq.K = 8192; xq.M = W; xq.dst = P.qp_x8;
+            xq.suh = tr ? w.o_suh : nullptr;
             bindp::launch(xq, st);
         }
         if (used_attn) G6RT_CK(cudaEventRecord(used_attn, st));   // after xq read qp_out, as pf_attn_block after xq_attn
@@ -363,6 +375,7 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
         {
             bindp::Gemm op;
             if (const char* er = bindp::make_gemm(w.o_c, w.o_s, W, P.qp_x8, P.qp_part, 1, op)) die(std::string("pair o_proj: ") + er);
+            op.osvh = tr ? T.tsvh[1] : nullptr;
             bindp::launch(op, st);
         }
         pf_adump(P, i, "oproj", P.qp_part, W, HID * 2, st);

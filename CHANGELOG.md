@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-10: the engine serves the dense trellis matrices (#116)
+
+- Decode: `bind::make_layer` binds q_b, o_proj and the dense MLP of layers 0-2 from the release's trellis tensors
+  (`LLLL.NAME.trellis / .suh / .svh`, `dtr::layer_mats`) when a layer has them: one launch each for q_b and o_proj,
+  gate + up and down for the MLP. o_proj and down write the fabric send slot under `DEC_SLOT`. The MTP layer takes the
+  same path. `q_b.gptq` (int4 g32, the layers where int4 won the encode) has a binding too. `G6_DTR=0` binds the int4 /
+  MXFP8 records instead. Each rank logs how many layers run each form.
+- Prefill: the matrices run as exact FP8 copies of their tiles on today's MXFP8 GEMMs. The quantize pass applies the
+  input rotation (`Xq::suh`) and the GEMM epilogue the output rotation (`Gemm::osvh`). Prefill time stays at today's. `G6_PF_OWN=4` carries the copies and the pair's vectors over the wire. OWN=3 needs `--qo-pack`.
+- `dtr_test --bind` runs one dense layer through both binders on one GPU and `engine/ref/dtr_ref.py` checks the results
+  against `loader/exlr8.py` at TP=3, 4 and 6.
+
 ## 2026-10-10: `bin/g6load dflash2` converts the drafter without numpy
 
 - `g6load dflash2 --src DIR --out DIR [--nr 4] [--ranks R] [--bf16 CLASSES]` (`engine/loader-rs/src/dflash2.rs`) writes

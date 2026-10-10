@@ -284,6 +284,12 @@ int main(int argc, char** argv)
     std::vector<g6::Pack> pack(NR);
     std::vector<Model> R(NR);           // sized once: the attention bindings must not move
     DevStore store;
+    // rank r's tensors: its pack, with the FP8 copies of its dense trellis matrices for prefill (dtr_find.h), made once
+    std::vector<Find> rfinds(NR);
+    auto rfind = [&](int r) -> const Find& {
+        if (!rfinds[r]) rfinds[r] = dtr_overlay(pack_find(pack[r], store), MP > 0, st, r);
+        return rfinds[r];
+    };
     Loop loop{}, loop_pf{};
     std::vector<Prefill> PF(NR), PF2(NR);                // PF2: the second lane (--pf-lanes 2), its own loopback region
     const bool pf_rs = getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) == 1;     // reduce-scatter form (prefill.cuh)
@@ -328,7 +334,7 @@ int main(int argc, char** argv)
     {
         for (int r = 0; r < NR; ++r) load_pack(pack[r], packs + "/rank" + std::to_string(r) + ".manifest.json", packs + "/rank" + std::to_string(r) + ".pack", r);
         std::vector<Find> finds;
-        for (int r = 0; r < NR; ++r) finds.push_back(pack_find(pack[r], store));
+        for (int r = 0; r < NR; ++r) finds.push_back(rfind(r));
         if (!qo_man.empty()) load_pack(qo_pack, qo_man, qo_file, 0);
         const Find qfind = pack_find(qo_pack, store);
         for (int l : layers)
@@ -345,7 +351,7 @@ int main(int argc, char** argv)
     {
         for (int r = 0; r < NR; ++r) load_pack(pack[r], packs + "/rank" + std::to_string(r) + ".manifest.json", packs + "/rank" + std::to_string(r) + ".pack", r);
         std::vector<Find> finds;
-        for (int r = 0; r < NR; ++r) finds.push_back(pack_find(pack[r], store));
+        for (int r = 0; r < NR; ++r) finds.push_back(rfind(r));
         int n = 0;
         for (size_t k = 0; k < layers.size(); ++k)
         {
@@ -376,7 +382,7 @@ int main(int argc, char** argv)
         else if (s2mode) R[r].s2_pool_slots = (int)prompts.size();       // the layers' own bindings hold the S2 pool
         if (s2mode && !s2_below && getenv("G6_S2_POOL")) R[r].s2_pool_pages = atoi(getenv("G6_S2_POOL"));   // pool pages (variable runs)
 #endif
-        build(R[r], r, layers, pack_find(pack[r], store), cap, f, stepp, st, pf_attn_rows(MP));
+        build(R[r], r, layers, rfind(r), cap, f, stepp, st, pf_attn_rows(MP));
 #if defined(G6_CP) && G6_CP
         if (cp_on)
             for (int c = 0; c < cp_colls.ncoll(); ++c) R[r].cp.vs.push_back(cp_L.vslot(c, r, cp_send[r], cp_recv[r], cp_bell[r], err));
@@ -402,7 +408,7 @@ int main(int argc, char** argv)
             PF[r].roll = PF2[r].roll = qp_roll[r];
 #endif
             PF[r].attn_rows = pf_attn_rows(MP);
-            build_prefill(PF[r], R[r], pack_find(pack[r], store), MP, fp, stepp_pf, st);
+            build_prefill(PF[r], R[r], rfind(r), MP, fp, stepp_pf, st);
             loop_pf.send[r] = fp.send;
             if (two)
             {
@@ -410,7 +416,7 @@ int main(int argc, char** argv)
                 f2.send = dmalloc<char>(2 * (size_t)NCP * stride_pf);
                 f2.recv = recv_pf2; f2.doorbell = doorbell_pf2;
                 PF2[r].attn_rows = pf_attn_rows(MP);
-                build_prefill(PF2[r], R[r], pack_find(pack[r], store), MP, f2, stepp_pf2, st, &PF[r]);
+                build_prefill(PF2[r], R[r], rfind(r), MP, f2, stepp_pf2, st, &PF[r]);
                 loop_pf2.send[r] = f2.send;
             }
         }
@@ -424,11 +430,11 @@ int main(int argc, char** argv)
             else if (s2mode) DR[r].d.s2_pool_slots = (int)prompts.size();
             if (s2mode && !s2_below && getenv("G6_S2_POOL")) DR[r].d.s2_pool_pages = atoi(getenv("G6_S2_POOL"));
 #endif
-            build_draft(DR[r], R[r], pack_find(pack[r], store), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
+            build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
             loop_d.send[r] = fd.send;
             if (MP) DQ[r].P.attn_rows = pf_attn_rows(MP);   // DQ is empty without --prefill (was an out-of-bounds write)
-            if (MP) build_draft_prefill(DQ[r], DR[r], pack_find(pack[r], store), MP, PF[r].f, pfv2, st, &PF[r]);
+            if (MP) build_draft_prefill(DQ[r], DR[r], rfind(r), MP, PF[r].f, pfv2, st, &PF[r]);
         }
         G6RT_CK(cudaStreamSynchronize(st));
     }

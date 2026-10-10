@@ -1,4 +1,4 @@
-// #116 dense trellis matrices (dtr.cuh, dtr_prefill.cuh) on real release entries: output dumps for the reference check
+// #116 dense trellis matrices (dtr.cuh, and the prefill GEMMs of bind_prefill.cuh) on real release entries: output dumps for the reference check
 // (engine/ref/dtr_ref.py, which also writes the inputs), and decode timing against today's int4 g32 / MXFP8 GEMVs and
 // the int4 dense MLP (K1).
 //
@@ -6,6 +6,7 @@
 //        -o dtr_test dtr_test.cu -lcublas
 //   dtr_test DIR            check: every matrix of DIR/meta.txt through the decode GEMV at M = 1..8 (and 16, 32 under
 //                           DEC_S2), the FP8 copy and the prefill path. Outputs go into DIR
+//   dtr_test DIR --bind     the binders the engine uses on one dense layer (bind_check below)
 //   dtr_test DIR --bench [--iters 640] [--sweep 1]    decode timing at M = 1, 3, 8 (CUDA graphs of 32 steps, a pool of
 //                           copies so every step reads DRAM); --sweep 1 prints every (ks, sub)
 //
@@ -26,7 +27,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "../dtr_prefill.cuh"
+#include "../bind_prefill.cuh"
 #include "../../h2d.h"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -96,6 +97,38 @@ static void load(HostMat& h, const std::string& dir)
     ok(dtr::make_mat(ten(h.dcodes, {h.E, h.eb}), ten(h.dsuh, {h.K}), ten(h.dsvh, {h.N}), h.side, h.m));
 }
 
+static bind::Tensor fp8_codes(const dtr::Fp8& F) { return ten(F.codes, {F.N, F.K}); }
+static bind::Tensor fp8_scales(const dtr::Fp8& F) { return ten(F.scales, {F.N, F.K / 32}); }
+// one matrix on R prefill rows as bindp::make_layer binds it: rotated records (Gemm::pre, Xq::suh), the GEMM on the FP8
+// copy, the output rotation in its epilogue (Gemm::osvh, out = 0: the GEMM's plain fp16 output)
+static bindp::Gemm pf_gemm(const dtr::Mat& m, const dtr::Fp8& F, int R, const __half* x, int ldx, uint8_t* x8, void* y, int bf16, bool out)
+{
+    bindp::Gemm g;
+    ok(bindp::make_gemm(fp8_codes(F), fp8_scales(F), R, x8, y, bf16, g));
+    if (x) { g.pre.on = 1; g.pre.src = x; g.pre.ld = ldx; g.pre.K = m.K; g.pre.M = R; g.pre.dst = x8; g.pre.suh = m.suh; }
+    if (out) g.osvh = m.svh;
+    return g;
+}
+// the dense MLP on R prefill rows: gate and up (one paired launch), the mid pass (Act::svh_g) into down's records, down
+struct PfMlp { bindp::Gemm gate, up, down; bindp::Act act; };
+static PfMlp pf_mlp(const dtr::Mat& G, const dtr::Mat& U, const dtr::Mat& D, const dtr::Fp8& Fg, const dtr::Fp8& Fu, const dtr::Fp8& Fd, int R,
+                    const __half* x, uint8_t* x8, uint8_t* x8u, uint8_t* x8d, __half* g, __half* u, void* y, int bf16)
+{
+    PfMlp P;
+    P.gate = pf_gemm(G, Fg, R, x, G.K, x8, g, 0, false);
+    P.up = pf_gemm(U, Fu, R, x, U.K, x8u, u, 0, false);
+    P.down = pf_gemm(D, Fd, R, nullptr, 0, x8d, y, bf16, true);
+    P.act.on = 1; P.act.g = g; P.act.u = u; P.act.I = G.N; P.act.M = R;
+    P.act.svh_g = G.svh; P.act.svh_u = U.svh; P.act.suh_d = D.suh; P.act.x8 = x8d;
+    return P;
+}
+static void launch(const PfMlp& P, cudaStream_t st)
+{
+    bindp::launch_pair(P.gate, P.up, st);
+    bindp::launch(P.act, st);
+    bindp::launch(P.down, st);
+}
+
 static dtr::Scratch make_scratch()
 {
     dtr::Scratch s;
@@ -127,11 +160,11 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
     for (HostMat& h : mats) { by[h.name] = &h; Rmax = std::max(Rmax, h.R); }
     // prefill scratch
     uint8_t *x8, *x8u, *x8d;
-    __half *g, *u, *yp, *pout;
+    __half *g, *u, *pout;
     const size_t recb = static_cast<size_t>((Rmax + 15) / 16) * (16384 / 32) * bindp::REC;
     CK(cudaMalloc(&x8, recb)); CK(cudaMalloc(&x8u, recb)); CK(cudaMalloc(&x8d, recb));
     CK(cudaMalloc(&g, static_cast<size_t>(Rmax) * 16384 * 2)); CK(cudaMalloc(&u, static_cast<size_t>(Rmax) * 16384 * 2));
-    CK(cudaMalloc(&yp, static_cast<size_t>(Rmax) * 16384 * 2)); CK(cudaMalloc(&pout, static_cast<size_t>(Rmax) * 16384 * 2));
+    CK(cudaMalloc(&pout, static_cast<size_t>(Rmax) * 16384 * 2));
     std::map<std::string, dtr::Fp8> fp8;
 
     for (HostMat& h : mats)
@@ -149,9 +182,7 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
         dtr::Fp8& F = fp8[h.name];
         ok(dtr::make_fp8(h.m, st, F));
         dump_dev(dir + "/" + h.name + ".fp8.bin", F.codes, static_cast<size_t>(h.N) * h.K);
-        dtr::PfMat P;
-        ok(dtr::make_pf(h.m, F, h.R, h.dx, h.K, x8, yp, pout, h.N, 0, P));
-        dtr::launch(P, st);
+        bindp::launch(pf_gemm(h.m, F, h.R, h.dx, h.K, x8, pout, 0, true), st);
         CK(cudaStreamSynchronize(st));
         CK(cudaGetLastError());
         dump_dev(dir + "/" + h.name + ".pf.bin", pout, static_cast<size_t>(h.R) * h.N * 2);
@@ -176,10 +207,7 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
             dump_dev(dir + "/glu.gemv.M" + std::to_string(M) + ".bin", y, static_cast<size_t>(M) * D.N * 4);
         }
         const bool same = G.suh == U.suh;
-        dtr::PfMlp P;
-        ok(dtr::make_pf_mlp(G.m, U.m, D.m, fp8[G.name], fp8[U.name], fp8[D.name], G.R, G.dx, G.K, x8, x8u, x8d, g, u, yp, pout, D.N,
-                            0, same, P));
-        dtr::launch(P, st);
+        launch(pf_mlp(G.m, U.m, D.m, fp8[G.name], fp8[U.name], fp8[D.name], G.R, G.dx, x8, x8u, x8d, g, u, pout, 0), st);
         CK(cudaStreamSynchronize(st));
         CK(cudaGetLastError());
         dump_dev(dir + "/glu.pf.bin", pout, static_cast<size_t>(G.R) * D.N * 2);
@@ -335,14 +363,13 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
         CK(cudaFree(pool)); CK(cudaFree(di)); CK(cudaFree(dm));
     }
 
-    // prefill: the FP8 copy on the MXFP8 GEMM inside its rotations (rotq, GEMM, post) against today's form of the same
-    // GEMM (k_xq8 on unrotated rows, GEMM; MXFP8 weights of the same shape), at 512 and 4096 rows
+    // prefill: the FP8 copy on the MXFP8 GEMM inside its rotations (rotated records, GEMM with the output rotation in its
+    // epilogue) against today's form of the same GEMM (k_xq8 on unrotated rows, GEMM), BF16 out, at 512 and 4096 rows
     {
         const int PR[2] = {512, 4096};
-        __half *px, *pyp, *pout;
+        __half *px, *pout;
         uint8_t* px8;
         CK(cudaMalloc(&px, static_cast<size_t>(4096) * 16384 * 2));
-        CK(cudaMalloc(&pyp, static_cast<size_t>(4096) * 16384 * 2));
         CK(cudaMalloc(&pout, static_cast<size_t>(4096) * 16384 * 2));
         CK(cudaMalloc(&px8, static_cast<size_t>(4096 / 16) * (16384 / 32) * bindp::REC));
         {
@@ -357,19 +384,17 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
             ok(dtr::make_fp8(h.m, st, F));
             for (int R : PR)
             {
-                dtr::PfMat P;
-                ok(dtr::make_pf(h.m, F, R, px, h.K, px8, pyp, pout, h.N, 1, P));
-                bindp::Xq q;
-                q.on = 1; q.src = px; q.ld = h.K; q.K = h.K; q.M = R; q.dst = px8;
-                bindp::Gemm g = P.gemm;
-                g.y = pout; g.bf16 = 1;
-                const double tt = time([&](int) { dtr::launch(P, st); });
-                const double t0 = time([&](int) { bindp::launch(q, st); bindp::launch(g, st); });
+                const bindp::Gemm g = pf_gemm(h.m, F, R, px, h.K, px8, pout, 1, true);
+                bindp::Gemm g0 = g;
+                g0.pre.suh = nullptr;                 // today: k_xq8, no output rotation
+                g0.osvh = nullptr;
+                const double tt = time([&](int) { bindp::launch(g, st); });
+                const double t0 = time([&](int) { bindp::launch(g0, st); });
                 printf("%s prefill %4d rows: trellis FP8 copy %7.1f us | today (xq8 + GEMM) %7.1f us | ratio %.2f\n", h.name.c_str(), R, tt, t0, tt / t0);
             }
             dtr::free_fp8(F);
         }
-        CK(cudaFree(px)); CK(cudaFree(pyp)); CK(cudaFree(pout)); CK(cudaFree(px8));
+        CK(cudaFree(px)); CK(cudaFree(pout)); CK(cudaFree(px8));
     }
 
     // the dense MLP: gate + up (one launch) + down, against today's int4 dense MLP in K1 (fused fc1 + fc2, the default)
@@ -463,16 +488,179 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------ bindings
+// --bind: one dense layer's q_b, o_proj and MLP (DIR's q_b.r0, o_proj.r0, gate.r0, up.r0, down.r0) through the binders the
+// engine uses: bind::make_layer with launch_q_b / launch_o_proj / launch_mlp at every row count (DEC_SLOT: outputs in a
+// send slot, its doorbell checked), and bindp::make_layer's q_b, o_proj and dense MLP GEMMs on R prefill rows. The other
+// tensors make_layer needs (q_a, kv_a) are random. Outputs: bind.q_b.M<m>.bin f16 [m][N], bind.o_proj.M<m>.bin and
+// bind.mlp.M<m>.bin BF16 [m][6144]; bind.pf.q_b.bin f16 [R][N], bind.pf.o_proj.bin, bind.pf.mlp.bin BF16 [R][6144].
+template <class T> static T* dzero(size_t n)
+{
+    T* p;
+    CK(cudaMalloc(&p, n * sizeof(T)));
+    CK(cudaMemset(p, 0, n * sizeof(T)));
+    return p;
+}
+static uint8_t* dev_bytes(const std::vector<uint8_t>& v) { return dev<uint8_t>(v.data(), v.size()); }
+static std::vector<uint8_t> e4m3_codes(size_t n, std::mt19937_64& rng)
+{
+    std::vector<uint8_t> v = rand_bytes(n, rng);
+    for (auto& b : v) if ((b & 0x7f) == 0x7f) b ^= 1;
+    return v;
+}
+static int bind_check(const std::string& dir, std::vector<HostMat>& mats)
+{
+    std::map<std::string, HostMat*> by;
+    for (HostMat& h : mats) by[h.name] = &h;
+    for (const char* n : {"q_b.r0", "o_proj.r0", "gate.r0", "up.r0", "down.r0"})
+        if (!by.count(n)) die(std::string("--bind needs ") + n + " in meta.txt (a dense layer, rank 0)");
+    HostMat &Q = *by["q_b.r0"], &O = *by["o_proj.r0"], &G = *by["gate.r0"], &U = *by["up.r0"], &D = *by["down.r0"];
+    const int R = Q.R;
+    if (O.R != R || G.R != R || D.R != R) die("--bind: every matrix needs the same row count");
+    CK(bind::init());
+    cudaStream_t st;
+    CK(cudaStreamCreate(&st));
+    std::mt19937_64 rng(11);
+
+    // decode: bind::LayerTensors of a dense layer
+    bind::LayerTensors T;
+    T.t[bind::T_Q_A] = ten(dev_bytes(i4_records(2048, HID, rng)), {2048 / 16, HID / 32, 288});
+    T.t[bind::T_KV_A] = ten(dev_bytes(mx_records(576, HID, rng)), {576 / 16, HID / 32, 528});
+    T.mats.q_b = Q.m; T.mats.o_proj = O.m; T.mats.gate = G.m; T.mats.up = U.m; T.mats.down = D.m;
+#if DEC_I4PAIR
+    bind::i4pair(T, st);
+    CK(cudaStreamSynchronize(st));
+#endif
+    void* blk = dzero<char>(bind::scratch_bytes());
+    const bind::Scratch sc = bind::scratch_at(blk);
+    bind::Io io;
+    std::vector<__half> hx(static_cast<size_t>(G6_MX) * HID);
+    for (auto& v : hx) v = __float2half(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 1000.f);
+    io.x = dev<__half>(hx.data(), hx.size() * 2);
+    io.q_a = dzero<__half>(static_cast<size_t>(G6_MX) * 2048);
+    io.q_a_n = Q.dx;
+    io.kv_a = dzero<__half>(static_cast<size_t>(G6_MX) * 576);
+    io.q_b = dzero<__half>(static_cast<size_t>(G6_MX) * Q.N);
+    io.attn = O.dx;
+    io.attn_part = dzero<uint16_t>(static_cast<size_t>(G6_MX) * HID);
+    io.x2 = G.dx;
+    io.mlp_part = dzero<uint16_t>(static_cast<size_t>(G6_MX) * HID);
+#ifdef DEC_SLOT
+    const size_t stride = static_cast<size_t>(G6_MX) * HID * 2 + 256;
+    char* send = dzero<char>(2 * 2 * stride);
+    unsigned long long* bell = dzero<unsigned long long>(2);
+    u64* stepp = dzero<u64>(1);
+    unsigned* ticket = dzero<unsigned>(2);
+    auto slot = [&](int c) {
+        dslot::Slot q;
+        q.send = send; q.bell = bell; q.stepp = stepp; q.stride = stride; q.ncoll = 2; q.c = c; q.ticket = ticket + c;
+        return q;
+    };
+#endif
+    for (int M : rows_list())
+    {
+        if (M > R) continue;
+        bind::Layer L;
+        ok(bind::make_layer(T, M, sc, io, L, 1));
+        if (!L.q_b_t.on || !L.o_proj_t.on || !L.glu_t.on || !L.down_t.on || L.q_b.on || L.o_proj.on || L.k1.on || L.xf_attn.on)
+            die("--bind: make_layer did not bind the trellis matrices");
+#ifdef DEC_SLOT
+        bind::set_slots(L, slot(0), slot(1));
+        CK(cudaMemset(bell, 0, 2 * sizeof(unsigned long long)));
+#endif
+        bind::launch_q_b(L, st);
+        bind::launch_o_proj(L, st);
+        bind::launch_mlp(L, st);
+        CK(cudaStreamSynchronize(st));
+        CK(cudaGetLastError());
+        const std::string m = std::to_string(M);
+        dump_dev(dir + "/bind.q_b.M" + m + ".bin", io.q_b, static_cast<size_t>(M) * Q.N * 2);
+#ifdef DEC_SLOT
+        dump_dev(dir + "/bind.o_proj.M" + m + ".bin", send, static_cast<size_t>(M) * HID * 2);
+        dump_dev(dir + "/bind.mlp.M" + m + ".bin", send + stride, static_cast<size_t>(M) * HID * 2);
+#if DEC_SLOT >= 2
+        unsigned long long hb[2];
+        CK(cudaMemcpy(hb, bell, sizeof hb, cudaMemcpyDeviceToHost));
+        if (hb[0] != 1 || hb[1] != 2) die("--bind: send-slot doorbells " + std::to_string(hb[0]) + ", " + std::to_string(hb[1]) + " (want 1, 2)");
+#endif
+#else
+        dump_dev(dir + "/bind.o_proj.M" + m + ".bin", io.attn_part, static_cast<size_t>(M) * HID * 2);
+        dump_dev(dir + "/bind.mlp.M" + m + ".bin", io.mlp_part, static_cast<size_t>(M) * HID * 2);
+#endif
+    }
+
+    // prefill: bindp::Tensors of the same layer with the FP8 copies and the vectors
+    bindp::Tensors P;
+    auto mx = [&](int id, int N, int K) {
+        P.t[id] = ten(dev_bytes(e4m3_codes(static_cast<size_t>(N) * K, rng)), {N, K});
+        std::vector<uint8_t> sc8(static_cast<size_t>(N) * K / 32);
+        for (auto& b : sc8) b = static_cast<uint8_t>(118 + rng() % 5);
+        P.s[id] = ten(dev_bytes(sc8), {N, K / 32});
+    };
+    mx(bindp::T_Q_A, 2048, HID);
+    mx(bindp::T_KV_A, 576, HID);
+    const HostMat* hm[dtr::NMAT] = {&Q, &O, &G, &U, &D};
+    const int id[dtr::NMAT] = {bindp::T_Q_B, bindp::T_O_PROJ, bindp::T_D_GATE, bindp::T_D_UP, bindp::T_D_DOWN};
+    dtr::Fp8 F[dtr::NMAT];
+    for (int i = 0; i < dtr::NMAT; ++i)
+    {
+        ok(dtr::make_fp8(hm[i]->m, st, F[i]));
+        P.t[id[i]] = fp8_codes(F[i]);
+        P.s[id[i]] = fp8_scales(F[i]);
+        P.tsuh[i] = hm[i]->m.suh;
+        P.tsvh[i] = hm[i]->m.svh;
+    }
+    void* pblk = dzero<char>(bindp::scratch_bytes(R));
+    const bindp::Scratch psc = bindp::scratch_at(pblk, R);
+    bindp::Io pio;
+    pio.x = dzero<__half>(static_cast<size_t>(R) * HID);
+    pio.q_a = dzero<__half>(static_cast<size_t>(R) * 2048);
+    pio.q_a_n = Q.dx;
+    pio.kv_a = dzero<__half>(static_cast<size_t>(R) * 576);
+    pio.q_b = dzero<__half>(static_cast<size_t>(R) * Q.N);
+    pio.attn = O.dx;
+    pio.attn_part = dzero<uint16_t>(static_cast<size_t>(R) * HID);
+    pio.x2 = G.dx;
+    pio.mlp_part = dzero<uint16_t>(static_cast<size_t>(R) * HID);
+    cublasHandle_t blas;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate");
+    bindp::Layer B;
+    ok(bindp::make_layer(P, R, psc, pio, blas, B));
+    if (!B.q_b.osvh || !B.o_proj.osvh || !B.down.osvh || !B.xq_attn.suh || !B.act.svh_g || B.xq_act.on) die("--bind: bindp::make_layer did not wrap the trellis GEMMs");
+    bindp::launch(B.q_b, st);
+    bindp::launch(B.xq_attn, st);
+    bindp::launch(B.o_proj, st);
+    bindp::launch(B.xq_x2, st);
+    bindp::launch_pair(B.gate, B.up, st);
+    bindp::launch(B.act, st);
+    bindp::launch(B.xq_act, st);
+    bindp::launch(B.down, st);
+    CK(cudaStreamSynchronize(st));
+    CK(cudaGetLastError());
+    dump_dev(dir + "/bind.pf.q_b.bin", pio.q_b, static_cast<size_t>(R) * Q.N * 2);
+    dump_dev(dir + "/bind.pf.o_proj.bin", pio.attn_part, static_cast<size_t>(R) * HID * 2);
+    dump_dev(dir + "/bind.pf.mlp.bin", pio.mlp_part, static_cast<size_t>(R) * HID * 2);
+    printf("bind: decode at %zu row counts%s and prefill (%d rows) through make_layer dumped\n", rows_list().size(),
+#if DEC_SLOT >= 2
+           ", send slots and doorbells checked",
+#else
+           "",
+#endif
+           R);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
-    if (argc < 2) die("usage: dtr_test DIR [--bench] [--iters N] [--sweep 1]");
+    if (argc < 2) die("usage: dtr_test DIR [--bind | --bench [--iters N] [--sweep 1]]");
     const std::string dir = argv[1];
-    bool b = false;
+    bool b = false, bnd = false;
     int iters = 640, sweep = 0;
     for (int i = 2; i < argc; ++i)
     {
         const std::string a = argv[i];
         if (a == "--bench") b = true;
+        else if (a == "--bind") bnd = true;
         else if (a == "--iters" && i + 1 < argc) iters = atoi(argv[++i]);
         else if (a == "--sweep" && i + 1 < argc) sweep = atoi(argv[++i]);
         else die("unknown argument " + a);
@@ -502,5 +690,6 @@ int main(int argc, char** argv)
         }
     }
     for (HostMat& h : mats) load(h, dir);
+    if (bnd) return bind_check(dir, mats);
     return b ? bench(mats, glus, iters, sweep) : check(dir, mats, glus);
 }

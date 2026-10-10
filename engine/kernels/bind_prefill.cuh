@@ -76,6 +76,11 @@ struct Tensors
     long long sh_tr[6] = {};          // tr3.table row 256
     int qo_cover = 0;                 // G6_PF_OWN=3: q_b / o_proj of this layer are prefilled from the QO pack (never from these tensors)
     int heads = 0;                    // attention head count, used in place of q_b.N / 256 when the q_b tensor is deduplicated away
+    // dense trellis matrices (dtr.cuh, in dtr::MAT_NAMES order: q_b, o_proj, dense gate, up, down): their input and output
+    // vectors. Set, the matrix's .mx codes are its FP8 tile copy (dtr::make_fp8, still rotated), and make_layer wraps the
+    // GEMM in the rotations. nullptr: plain MXFP8 weights.
+    const __half* tsuh[dtr::NMAT] = {};
+    const __half* tsvh[dtr::NMAT] = {};
 };
 
 template <class F> inline Tensors layer_tensors(int layer, F find)
@@ -91,6 +96,15 @@ template <class F> inline Tensors layer_tensors(int layer, F find)
             snprintf(n, sizeof n, "L%03d.%s.scales", layer, NAMES[i]);
             T.s[i] = find(n);
         }
+    }
+    for (int i = 0; i < dtr::NMAT; ++i)
+    {
+        snprintf(n, sizeof n, "L%03d.%s.trellis", layer, dtr::MAT_NAMES[i]);
+        if (!find(n).p) continue;
+        snprintf(n, sizeof n, "L%03d.%s.suh", layer, dtr::MAT_NAMES[i]);
+        T.tsuh[i] = static_cast<const __half*>(find(n).p);
+        snprintf(n, sizeof n, "L%03d.%s.svh", layer, dtr::MAT_NAMES[i]);
+        T.tsvh[i] = static_cast<const __half*>(find(n).p);
     }
     return T;
 }
@@ -151,6 +165,7 @@ struct Xq
     const __half* src = nullptr;
     int ld = 0, K = 0, M = 0;
     uint8_t* dst = nullptr;
+    const __half* suh = nullptr;      // dense trellis input (dtr.cuh): records of H128(src * suh) per 128 block (k_xq8_rot)
 };
 
 #ifdef PF_XQ8C
@@ -239,9 +254,36 @@ __global__ void __launch_bounds__(256) k_xq8(Xq a)
 }
 #endif
 
+// Xq::suh: x [M][ld] -> the k_xq8 records of H128(x * suh), quantized from fp32 (the rule of k_shx_rotq).
+// grid ceil(ceil(M/16)*16 * K/128 / 8), block 256: warp = (row, 128 block)
+__device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int row, int M, int S, int s, uint8_t* x8);
+__global__ void __launch_bounds__(256) k_xq8_rot(Xq a)
+{
+    const int lane = threadIdx.x & 31, nbk = a.K / 128;
+    const int w = blockIdx.x * 8 + (threadIdx.x >> 5), row = w / nbk, blk = w % nbk;
+    if (row >= (a.M + 15) / 16 * 16) return;
+    const int k0 = blk * 128 + lane * 4;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    if (row < a.M)
+    {
+        const uint2 xr = *reinterpret_cast<const uint2*>(a.src + static_cast<size_t>(row) * a.ld + k0);
+        const uint2 sr = *reinterpret_cast<const uint2*>(a.suh + k0);
+        const float2 x01 = __half22float2(as_h2(xr.x)), x23 = __half22float2(as_h2(xr.y));
+        const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+        v[0] = __fmul_rn(x01.x, s01.x); v[1] = __fmul_rn(x01.y, s01.y); v[2] = __fmul_rn(x23.x, s23.x); v[3] = __fmul_rn(x23.y, s23.y);
+    }
+    had128(v, lane);
+    shx_store_mx8(v, lane, row, a.M, a.K / 32, blk * 4 + (lane >> 3), a.dst);
+}
+
 inline void launch(const Xq& a, cudaStream_t st)
 {
     if (!a.on) return;
+    if (a.suh)
+    {
+        k_xq8_rot<<<static_cast<unsigned>(((a.M + 15) / 16 * 16 * static_cast<long long>(a.K / 128) + 7) / 8), 256, 0, st>>>(a);
+        return;
+    }
 #ifdef PF_XQ8C
     const int S = a.K / 32;
     k_xq8<<<static_cast<unsigned>((a.M + 15) / 16 * ((S + 15) / 16)), 256, 0, st>>>(a);
@@ -285,7 +327,56 @@ struct Gemm
     void* y2 = nullptr;
     const uint8_t* x8_2 = nullptr;    // the second tensor's records when they differ from x8 (the trellis shared expert's
                                       // gate and up inputs, #65); nullptr = x8
+    // dense trellis matrices (dtr.cuh): pre writes x8 (rotated, Xq::suh) right before the GEMM; osvh (osvh2: the second
+    // tensor's) applies H128 and svh to every row's 128 columns of a CTA in its epilogue (gemm_rot_store), N % 128 == 0
+    Xq pre;
+    const __half *osvh = nullptr, *osvh2 = nullptr;
 };
+
+// Gemm::osvh: the CTA's 128 output columns of each row go through H128 and svh before the store. The input is the sums
+// rounded to fp16, as the unrotated fp16 output would be, so the bits are those of an fp16 GEMM output rotated by a
+// separate pass. The fp16 tile [rows][136] reuses the stage buffers (34.8 KB at BM = 8, 17.4 KB at BM = 4).
+// store(row, col, v[4]) writes columns col .. col + 3 of the row.
+template <int BM, int NT, class St>
+__device__ __forceinline__ void gemm_rot_store(const float (&acc)[4][NT][4], unsigned char* sm, const __half* svh, int c0, int rb0,
+                                               int nb, int M, int wm, int colw, St store)
+{
+    constexpr int LD = 136;
+    __half* tile = reinterpret_cast<__half*>(sm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, c = lane & 3, r = lane >> 2;
+    __syncthreads();                                  // every warp is done with the stage buffers
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+    {
+        const int m = wm * 4 + mb;
+        if (m >= nb) continue;
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+        {
+            const int rr = m * 16 + r, col = colw + nt * 8 + 2 * c;
+            *reinterpret_cast<__half2*>(tile + rr * LD + col) = __floats2half2_rn(acc[mb][nt][0], acc[mb][nt][1]);
+            *reinterpret_cast<__half2*>(tile + (rr + 8) * LD + col) = __floats2half2_rn(acc[mb][nt][2], acc[mb][nt][3]);
+        }
+    }
+    __syncthreads();
+    const uint2 sr = *reinterpret_cast<const uint2*>(svh + c0 + lane * 4);
+    const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+    for (int rr = warp; rr < nb * 16; rr += 8)
+    {
+        const int row = rb0 * 16 + rr;
+        if (row >= M) break;
+        const uint2 tr = *reinterpret_cast<const uint2*>(tile + rr * LD + lane * 4);
+        const float2 a = __half22float2(as_h2(tr.x)), b = __half22float2(as_h2(tr.y));
+        float v[4] = {a.x, a.y, b.x, b.y};
+        had128(v, lane);
+        v[0] = __fmul_rn(v[0], s01.x); v[1] = __fmul_rn(v[1], s01.y); v[2] = __fmul_rn(v[2], s23.x); v[3] = __fmul_rn(v[3], s23.y);
+        store(row, c0 + lane * 4, v);
+    }
+}
+__device__ __forceinline__ uint2 pack_o4(const float (&v)[4], int bf16)
+{
+    return make_uint2(pack_o2(v[0], v[1], bf16), pack_o2(v[2], v[3], bf16));
+}
 
 constexpr int G_STAGES = 4, G_KS = 2, G_STAGE = G_KS * MB * REC;
 
@@ -426,7 +517,7 @@ template <int BM, bool RS = false, bool F32 = false> __global__ void __launch_bo
     if (g0.w2)
     {
         const int nb1 = (g0.N + 127) / 128;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; g.osvh = g0.osvh2; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2<BM>;
     constexpr int NT = C::NT;
@@ -529,6 +620,15 @@ template <int BM, bool RS = false, bool F32 = false> __global__ void __launch_bo
         }
     }
     pf::cp_wait<0>();
+    if (g.osvh)
+    {
+        gemm_rot_store<BM, NT>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
+            if constexpr (F32) *reinterpret_cast<float4*>(static_cast<float*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = make_float4(v[0], v[1], v[2], v[3]);
+            else if constexpr (RS) *reinterpret_cast<uint2*>(rs_row(rs, row, g.ldy) + col) = pack_o4(v, g.bf16);
+            else *reinterpret_cast<uint2*>(static_cast<uint16_t*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = pack_o4(v, g.bf16);
+        });
+        return;
+    }
 
     const int c = lane & 3, r = lane >> 2;
     uint16_t* y = static_cast<uint16_t*>(g.y);
@@ -580,7 +680,7 @@ template <int BM> __global__ void __launch_bounds__(G2W<BM>::NTH) k_gemm_mx8w(Ge
     if (g0.w2)
     {
         const int nb1 = (g0.N + GW_CW - 1) / GW_CW;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; g.osvh = g0.osvh2; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2W<BM>;
     constexpr int NT = C::NT;
@@ -708,7 +808,7 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8p(Gemm g0)
     if (g0.w2)
     {
         const int nb1 = (g0.N + 127) / 128;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; g.osvh = g0.osvh2; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2<BM>;
     constexpr int NT = C::NT;
@@ -886,7 +986,7 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
     if (g0.w2)
     {
         const int nb1 = (g0.N + 127) / 128;
-        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; if (g0.x8_2) g.x8 = g0.x8_2; }
+        if (bx >= nb1) { bx -= nb1; g.w = g0.w2; g.ws = g0.ws2; g.N = g0.N2; g.y = g0.y2; g.ldy = g0.ldy2; g.bf16 = g0.bf162; g.osvh = g0.osvh2; if (g0.x8_2) g.x8 = g0.x8_2; }
     }
     using C = G2<BM>;
     constexpr int NT = C::NT;
@@ -1041,6 +1141,13 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
         }
     }
     pf::cp_wait<0>();
+    if (g.osvh)
+    {
+        gemm_rot_store<BM, NT>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
+            *reinterpret_cast<uint2*>(static_cast<uint16_t*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = pack_o4(v, g.bf16);
+        });
+        return;
+    }
 
     const int c = lane & 3, r = lane >> 2;
     uint16_t* y = static_cast<uint16_t*>(g.y);
@@ -1069,6 +1176,11 @@ inline int gemm_mode()
 inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = RsOut())
 {
     if (!g.on) return;
+    launch(g.pre, st);
+#if defined(PF_GEMMW) || defined(PF_GEMMP)
+    if (g.osvh || g.osvh2) { fprintf(stderr, "bindp: Gemm::osvh needs the v2 or PF_GEMMF kernel (not PF_GEMMW / PF_GEMMP)\n"); exit(1); }
+#endif
+    if ((g.osvh || g.osvh2) && mode == 1) { fprintf(stderr, "bindp: Gemm::osvh needs the v2 kernel (G6_GEMM != 1)\n"); exit(1); }
     const int RB = (g.M + 15) / 16, NB = (g.N + 127) / 128 + (g.w2 ? (g.N2 + 127) / 128 : 0);
     if (rs.base && (mode == 1 || g.w2)) { fprintf(stderr, "bindp: an RS-slot Gemm needs the unpaired v2 kernel\n"); exit(1); }
     const bool f32 = g.bf16 == 2;
@@ -1136,8 +1248,9 @@ inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
         return;
     }
     Gemm p = a;
-    p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16;
+    p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16; p.osvh2 = b.osvh;
     p.x8_2 = b.x8 != a.x8 ? b.x8 : nullptr;
+    launch(b.pre, st);
     launch(p, st, mode);
 }
 inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st) { launch_pair(a, b, st, gemm_mode()); }
@@ -1179,8 +1292,19 @@ __global__ void __launch_bounds__(256) k_f32_f16(const float* src, long long n, 
     if (i < n) dst[i] = __float2half_rn(src[i]);
 }
 
-// act = f16(silu(g) * u), rows [M][I]
-struct Act { int on = 0; const __half* g = nullptr; const __half* u = nullptr; __half* act = nullptr; int I = 0, M = 0; };
+// act = f16(silu(g) * u), rows [M][I]. Dense trellis MLP (svh_g set): g, u are the rotated GEMM outputs, and the pass
+// writes the down GEMM's records x8 of H128(f16(silu(g) u) * suh_d), g = f16(H128(g') svh_g), u likewise (k_pf_mid's
+// arithmetic with per-channel vectors) in place of act and xq_act.
+struct Act
+{
+    int on = 0;
+    const __half* g = nullptr;
+    const __half* u = nullptr;
+    __half* act = nullptr;
+    int I = 0, M = 0;
+    const __half *svh_g = nullptr, *svh_u = nullptr, *suh_d = nullptr;
+    uint8_t* x8 = nullptr;
+};
 __global__ void __launch_bounds__(256) k_pf_act(Act a)
 {
     const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
@@ -1189,9 +1313,43 @@ __global__ void __launch_bounds__(256) k_pf_act(Act a)
     const float2 u = __half22float2(*reinterpret_cast<const __half2*>(a.u + 2 * i));
     *reinterpret_cast<u32*>(a.act + 2 * i) = pack_h2(silu_f(g.x) * u.x, silu_f(g.y) * u.y);
 }
+// grid ceil(ceil(M/16)*16 * I/128 / 8), block 256: warp = (row, 128 block)
+__global__ void __launch_bounds__(256) k_pf_dtr_mid(Act a)
+{
+    const int lane = threadIdx.x & 31, nbk = a.I / 128;
+    const int w = blockIdx.x * 8 + (threadIdx.x >> 5), row = w / nbk, b = w % nbk;
+    if (row >= (a.M + 15) / 16 * 16) return;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    if (row < a.M)
+    {
+        const int c0 = b * 128 + lane * 4;
+        const size_t o = static_cast<size_t>(row) * a.I + c0;
+        auto f4 = [](const __half* p, float (&r)[4]) {
+            const uint2 q = *reinterpret_cast<const uint2*>(p);
+            const float2 x = __half22float2(as_h2(q.x)), y = __half22float2(as_h2(q.y));
+            r[0] = x.x; r[1] = x.y; r[2] = y.x; r[3] = y.y;
+        };
+        float gv[4], uv[4], sg[4], su[4], sd[4];
+        f4(a.g + o, gv); f4(a.u + o, uv); f4(a.svh_g + c0, sg); f4(a.svh_u + c0, su); f4(a.suh_d + c0, sd);
+        had128(gv, lane);
+        had128(uv, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float gg = rnd_h(__fmul_rn(gv[e], sg[e])), uu = rnd_h(__fmul_rn(uv[e], su[e]));
+            v[e] = __fmul_rn(rnd_h(silu_f(gg) * uu), sd[e]);
+        }
+        had128(v, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) v[e] = rnd_h(v[e]);
+    }
+    shx_store_mx8(v, lane, row, a.M, a.I / 32, b * 4 + (lane >> 3), a.x8);
+}
 inline void launch(const Act& a, cudaStream_t st)
 {
-    if (a.on) k_pf_act<<<static_cast<unsigned>((static_cast<long long>(a.M) * (a.I / 2) + 255) / 256), 256, 0, st>>>(a);
+    if (!a.on) return;
+    if (a.svh_g) k_pf_dtr_mid<<<static_cast<unsigned>(((a.M + 15) / 16 * 16 * static_cast<long long>(a.I / 128) + 7) / 8), 256, 0, st>>>(a);
+    else k_pf_act<<<static_cast<unsigned>((static_cast<long long>(a.M) * (a.I / 2) + 255) / 256), 256, 0, st>>>(a);
 }
 
 // ------------------------------------------------------------------------------------------ BF16 GEMM (cuBLAS)
@@ -2722,6 +2880,47 @@ template <int EB = g6nr::EB> inline void launch_shared(const Layer& L, cudaStrea
     else launch_shared<EB>(L.exs, st);
 }
 
+// Dense trellis matrices (Tensors::tsuh): the GEMMs on their FP8 tile copies inside the rotations. q_b's rotated input
+// goes to x8_up, and xq_qa stays unrotated for idx_q. xq_attn rotates o_proj's input. Dense MLP: gate on xq_x2's
+// records, up on its own (x8_up), the mid pass writes down's records (Act::svh_g), down rotates its output.
+inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, const Io& io, Layer& L)
+{
+    const bool any = T.tsuh[0] || T.tsuh[1] || T.tsuh[2] || T.tsuh[3] || T.tsuh[4];
+    if (!any) return nullptr;
+    for (int i = 0; i < dtr::NMAT; ++i)
+        if (!T.tsuh[i] != !T.tsvh[i]) return "dense trellis matrix without its suh / svh";
+    auto rot = [&](const __half* src, int ld, int K, uint8_t* dst, const __half* suh) {
+        Xq q; q.on = 1; q.src = src; q.ld = ld; q.K = K; q.M = M; q.dst = dst; q.suh = suh;
+        return q;
+    };
+    if (T.tsuh[0] && L.q_b.on)
+    {
+        if (L.q_b.N % 128 || L.q_b.K % 128) return "dense trellis q_b: widths must be multiples of 128";
+        L.q_b.pre = rot(io.q_a_n, L.q_b.K, L.q_b.K, sc.x8_up, T.tsuh[0]);
+        L.q_b.x8 = sc.x8_up;
+        L.q_b.osvh = T.tsvh[0];
+    }
+    if (T.tsuh[1] && L.o_proj.on)
+    {
+        if (L.o_proj.N % 128 || L.o_proj.K % 128) return "dense trellis o_proj: widths must be multiples of 128";
+        L.xq_attn.suh = T.tsuh[1];
+        L.o_proj.osvh = T.tsvh[1];
+    }
+    if (T.tsuh[2] || T.tsuh[3] || T.tsuh[4])
+    {
+        if (L.moe || !T.tsuh[2] || !T.tsuh[3] || !T.tsuh[4] || !L.gate.on || !L.up.on || !L.down.on)
+            return "dense trellis MLP: gate, up and down together, on a dense layer";
+        if (L.inter % 128) return "dense trellis MLP: width must be a multiple of 128";
+        L.xq_x2.suh = T.tsuh[2];
+        L.up.pre = rot(io.x2, HID, HID, sc.x8_up, T.tsuh[3]);
+        L.up.x8 = sc.x8_up;
+        L.act.svh_g = T.tsvh[2]; L.act.svh_u = T.tsvh[3]; L.act.suh_d = T.tsuh[4]; L.act.x8 = sc.x8_small;
+        L.xq_act.on = 0;
+        L.down.osvh = T.tsvh[4];
+    }
+    return nullptr;
+}
+
 inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const Io& io, cublasHandle_t blas, Layer& L)
 {
     L = Layer();
@@ -2773,6 +2972,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     xq(L.xq_x2, io.x2, HID, sc.x8_big);
     xq(L.xq_act, sc.act, L.inter, sc.x8_small);
     L.act.on = 1; L.act.g = sc.g; L.act.u = sc.u; L.act.act = sc.act; L.act.I = L.inter; L.act.M = M;
+    if (const char* e = dense_trellis(T, M, sc, io, L)) return e;
 
     if ((e = make_blas(T.t[T_IDX_WK],    HID, M, blas, sc.xb, sc.y32,                         io.idx_k, L.idx_k))) return e;
     if ((e = make_blas(T.t[T_IDX_WPROJ], HID, M, blas, sc.xb, sc.y32 + static_cast<size_t>(M) * 128, io.idx_w, L.idx_w))) return e;

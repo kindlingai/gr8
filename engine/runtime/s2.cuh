@@ -375,8 +375,7 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M)
         die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
     if (L->heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
 #ifdef DEC_SLOT
-    L->o_proj.slot = base.o_proj.slot;
-    L->k1.a.slot = base.k1.a.slot;
+    bind::set_slots(*L, base.o_proj.slot, base.k1.a.slot);
 #else
     (void)base;
 #endif

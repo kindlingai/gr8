@@ -563,6 +563,20 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         if (ne4) fprintf(stderr, "# rank %d: routed experts exlr8-e4m3 in %d of %d MoE layers\n", rank, ne4, nmoe);
         if (ne4 && rank == 0) fprintf(stderr, "# rank 0: exlr8-e4m3 layers:%s; TR3 layers:%s\n", e4.c_str(), tr3.empty() ? " none" : tr3.c_str());
     }
+    {
+        // the decode forms of q_b, o_proj and the dense MLP (bind::make_layer's choice; G6_DTR=0 turns trellis off)
+        const bool dt = !getenv("G6_DTR") || atoi(getenv("G6_DTR"));
+        int q[3] = {}, o[3] = {}, d[3] = {};      // trellis, int4 g32, MXFP8
+        for (const Layer& y : m.layers)
+        {
+            const bind::LayerTensors& T = y.T;
+            ++q[dt && T.mats.q_b.w ? 0 : T.t[bind::T_Q_B_I4].p ? 1 : 2];
+            ++o[dt && T.mats.o_proj.w ? 0 : T.t[bind::T_O_PROJ].p ? 1 : 2];
+            if (!y.moe) ++d[dt && T.mats.gate.w ? 0 : T.t[bind::T_D_FC1].p ? 1 : 2];
+        }
+        fprintf(stderr, "# rank %d: dense decode weights (trellis / int4 g32 / MXFP8): q_b %d / %d / %d, o_proj %d / %d / %d, dense MLP %d / %d / %d\n",
+                rank, q[0], q[1], q[2], o[0], o[1], o[2], d[0], d[1], d[2]);
+    }
     m.emb = (const __nv_bfloat16*)need(find, "G.embed");
     m.final_norm = (const __nv_bfloat16*)need(find, "G.final_norm");
     m.head_t = bind::head_tensors([&](const char* n) { return as_bind(find(n)); });
@@ -604,8 +618,7 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
             q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c;
             return q;
         };
-        y.L[M].o_proj.slot = slot(2 * i);
-        y.L[M].k1.a.slot = slot(2 * i + 1);
+        bind::set_slots(y.L[M], slot(2 * i), slot(2 * i + 1));
 #endif
         y.built[M] = true;
     }
@@ -709,7 +722,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 #endif
         launch_layer_in(m, y, b, M, st);
         bind::launch(b.xf_qa, st);
-        bind::launch(b.q_b, st);
+        bind::launch_q_b(b, st);
         bind::launch(b.idx_q, st);
         dmark(DP_QB, st);
         for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
@@ -781,7 +794,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
     dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
-    bind::launch(b.o_proj, st);
+    bind::launch_o_proj(b, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i, st);
 #else
@@ -812,7 +825,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 #endif
     launch_layer_in(m, y, b, M, st);
     bind::launch(b.xf_qa, st);
-    bind::launch(b.q_b, st);
+    bind::launch_q_b(b, st);
     bind::launch(b.idx_q, st);
     dmark(DP_QB, st);
 #ifdef DEC_S2
@@ -831,7 +844,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     }
     dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
-    bind::launch(b.o_proj, st);
+    bind::launch_o_proj(b, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i, st);
 #else
@@ -880,7 +893,7 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
     }
     dmark(DP_ROUTER, st);
-    bind::launch_k1(b.k1, st);
+    bind::launch_mlp(b, st);
     dmark(DP_EXPERTS, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i + 1, st);

@@ -26,10 +26,15 @@
 //             at k16 steps 8 nb .. 8 nb + 7 (the K1 fc2 prologue's arithmetic on fp32 sums)
 // The reduction order is fixed, and the results do not depend on timing. The last CTA zeroes its counter for the next
 // launch.
-// Prefill helpers (FP8 copy for the MXFP8 GEMMs and the rotation passes around them) are in dtr_prefill.cuh.
+// DEC_SLOT: with Args::slot.send set, EPI_OUT writes BF16 into this rank's send slot and (DEC_SLOT >= 2) every CTA
+// takes part in the doorbell (decslot.cuh).
+// Prefill (make_fp8): the tiles decoded once into E4M3 codes for the MXFP8 GEMMs (bind_prefill.cuh). The prefill binder
+// applies the rotations around those GEMMs (Xq::suh, Gemm::osvh).
 #pragma once
 #include "tr3.cuh"
-#include "bind.cuh"
+#ifdef DEC_SLOT
+#include "decslot.cuh"
+#endif
 
 namespace dtr
 {
@@ -58,6 +63,9 @@ struct Args
     int ldy = 0, odt = O_F16;
     const __half* suh_d = nullptr;    // EPI_GLU: down's input-side vector [N]
     u32* xd = nullptr;                // EPI_GLU: down's input fragment tables [ceil(M/8)][N/16][32][2]
+#ifdef DEC_SLOT
+    dslot::Slot slot;                 // EPI_OUT, send != nullptr: the output goes as BF16 to the send slot of slot.c (y unused)
+#endif
 };
 
 __device__ __forceinline__ void ld4h(const __half* p, float (&v)[4])
@@ -172,8 +180,24 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
     __syncthreads();
     if (threadIdx.x == 0) last = arrivals == 1 || atomicAdd(a.cnt + nb, 1) == arrivals - 1;
     __syncthreads();
-    if (!last) return;
+#if DEC_SLOT >= 2
+    const bool pub = EPI == EPI_OUT && a.slot.send;
+#endif
+    if (!last)
+    {
+#if DEC_SLOT >= 2
+        if (pub) dslot::publish(a.slot, false);
+#endif
+        return;
+    }
     if (arrivals > 1) __threadfence();
+#ifdef DEC_SLOT
+    void* const yo = EPI == EPI_OUT && a.slot.send ? dslot::ptr(a.slot) : a.y;
+    const int odt = EPI == EPI_OUT && a.slot.send ? O_BF16 : a.odt;
+#else
+    void* const yo = a.y;
+    const int odt = a.odt;
+#endif
 
     const int n0 = nb * 128 + lane * 4;
     auto sum = [&](int mt, int m, float (&v)[4]) {
@@ -196,9 +220,9 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
             #pragma unroll
             for (int e = 0; e < 4; ++e) v[e] *= s[e];
             const size_t o = static_cast<size_t>(m) * a.ldy + n0;
-            if (a.odt == O_F32) *reinterpret_cast<float4*>(static_cast<float*>(a.y) + o) = make_float4(v[0], v[1], v[2], v[3]);
-            else if (a.odt == O_BF16) *reinterpret_cast<uint2*>(static_cast<uint16_t*>(a.y) + o) = make_uint2(pack_bf2(v[0], v[1]), pack_bf2(v[2], v[3]));
-            else *reinterpret_cast<uint2*>(static_cast<__half*>(a.y) + o) = make_uint2(pack_h2(v[0], v[1]), pack_h2(v[2], v[3]));
+            if (odt == O_F32) *reinterpret_cast<float4*>(static_cast<float*>(yo) + o) = make_float4(v[0], v[1], v[2], v[3]);
+            else if (odt == O_BF16) *reinterpret_cast<uint2*>(static_cast<uint16_t*>(yo) + o) = make_uint2(pack_bf2(v[0], v[1]), pack_bf2(v[2], v[3]));
+            else *reinterpret_cast<uint2*>(static_cast<__half*>(yo) + o) = make_uint2(pack_h2(v[0], v[1]), pack_h2(v[2], v[3]));
         }
         else
         {
@@ -222,10 +246,14 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
         }
     }
     if (arrivals > 1 && threadIdx.x == 0) a.cnt[nb] = 0;
+#if DEC_SLOT >= 2
+    if (pub) dslot::publish(a.slot, true);
+#endif
 }
 
 // ------------------------------------------------------------------------------------------ binding
-// One rank's slice of a dense trellis matrix: entries u8 [E][entry bytes], suh f16 [K], svh f16 [N] (bind::Tensor).
+// One rank's slice of a dense trellis matrix: entries u8 [E][entry bytes], suh f16 [K], svh f16 [N]. T is any tensor
+// view with p, nd and shape (bind::Tensor, g6rt::TensorRef).
 struct Mat
 {
     const uint8_t* w = nullptr;
@@ -235,7 +263,7 @@ struct Mat
     long long bytes() const { return static_cast<long long>(K) * N / 2; }    // K4
 };
 
-inline const char* make_mat(const bind::Tensor& ent, const bind::Tensor& suh, const bind::Tensor& svh, int side, Mat& m)
+template <class T> inline const char* make_mat(const T& ent, const T& suh, const T& svh, int side, Mat& m)
 {
     m = Mat();
     if (!ent.p) return nullptr;
@@ -263,23 +291,25 @@ inline const char* make_mat(const bind::Tensor& ent, const bind::Tensor& suh, co
 //   LLLL.NAME.svh      f16 [N]              M.svh, the rank's slice on side 1 (q_b, gate, up), whole on side 2
 // The rank's channels follow g6's split: q_b / o_proj the rank's heads (g6nr::start / width of 64, 256 channels each),
 // the dense MLP DENSE_CH contiguous channels.
+constexpr int NMAT = 5;
+static const char* const MAT_NAMES[NMAT] = {"q_b", "o_proj", "dense.gate", "dense.up", "dense.down"};
+static const int MAT_SIDE[NMAT] = {SIDE_OUT, SIDE_IN, SIDE_OUT, SIDE_OUT, SIDE_IN};
 struct LayerMats
 {
     Mat q_b, o_proj, gate, up, down;
+    Mat* at(int i) { Mat* m[NMAT] = {&q_b, &o_proj, &gate, &up, &down}; return m[i]; }
+    bool any() const { return q_b.w || o_proj.w || gate.w; }
 };
 template <class F> inline const char* layer_mats(int layer, F find, LayerMats& L)
 {
     L = LayerMats();
-    const char* nm[5] = {"q_b", "o_proj", "dense.gate", "dense.up", "dense.down"};
-    const int side[5] = {SIDE_OUT, SIDE_IN, SIDE_OUT, SIDE_OUT, SIDE_IN};
-    Mat* m[5] = {&L.q_b, &L.o_proj, &L.gate, &L.up, &L.down};
     char n[3][64];
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < NMAT; ++i)
     {
-        snprintf(n[0], 64, "L%03d.%s.trellis", layer, nm[i]);
-        snprintf(n[1], 64, "L%03d.%s.suh", layer, nm[i]);
-        snprintf(n[2], 64, "L%03d.%s.svh", layer, nm[i]);
-        if (const char* e = make_mat(find(n[0]), find(n[1]), find(n[2]), side[i], *m[i])) return e;
+        snprintf(n[0], 64, "L%03d.%s.trellis", layer, MAT_NAMES[i]);
+        snprintf(n[1], 64, "L%03d.%s.suh", layer, MAT_NAMES[i]);
+        snprintf(n[2], 64, "L%03d.%s.svh", layer, MAT_NAMES[i]);
+        if (const char* e = make_mat(find(n[0]), find(n[1]), find(n[2]), MAT_SIDE[i], *L.at(i))) return e;
     }
     if (!L.gate.w != !L.up.w || !L.gate.w != !L.down.w) return "dense trellis MLP needs gate, up and down together";
     if (L.q_b.w && L.o_proj.w && L.o_proj.K != L.q_b.N) return "dense trellis q_b width is not o_proj's input width";
@@ -415,6 +445,59 @@ inline const char* make_glu(const Mat& gate, const Mat& up, const Mat& down, int
     g.epi = EPI_GLU;
     g.side = SIDE_OUT;
     return fill(g, 2, M, ks, sub, 1, sc, cnt_off);
+}
+
+// ------------------------------------------------------------------------------------------ prefill: the FP8 copy
+// grid ceil(N * K / 256), block 256: one thread per weight (n, k), k fastest
+__global__ void __launch_bounds__(256) k_dtr_fp8(const uint8_t* w, long long sB, long long sG, int K, int N, uint8_t* codes)
+{
+    constexpr int TB = 32 * BITS;
+    const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= static_cast<long long>(N) * K) return;
+    const int n = static_cast<int>(i / K), k = static_cast<int>(i % K);
+    const int s = k >> 4, kk = k & 15, c = (n & 127) >> 4, nn = n & 15;
+    const uint8_t* p = w + (n >> 7) * sB + (s >> 3) * sG + ((s & 7) * 8 + c) * TB;
+    // tile element (kk, nn) is stream weight t = lane * 8 + j of the mma A fragment order (tr3.cuh Tr3Lane)
+    const int lane = (nn & 7) * 4 + ((kk & 7) >> 1), jj = (kk & 1) | (((kk >> 3) & 1) << 1) | ((nn >> 3) << 2), t = lane * 8 + jj;
+    // state of weight t: the 16 stream bits ending at bit (t + 1) K, MSB first over LE u32 words, tail-biting
+    constexpr int NB = 256 * BITS;
+    u32 st = 0;
+    for (int b = 0; b < 16; ++b)
+    {
+        const int bit = (((t + 1) * BITS - 16 + b) % NB + NB) % NB;
+        const u32 word = *reinterpret_cast<const u32*>(p + (bit >> 5) * 4);
+        st = (st << 1) | ((word >> (31 - (bit & 31))) & 1u);
+    }
+    const u32 h2 = tr3_cb2<true>(st, 0u);
+    unsigned short e;
+    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e) : "r"(h2));
+    codes[i] = static_cast<uint8_t>(e & 0xff);
+}
+
+// The matrix's tiles T (still rotated) as E4M3 codes [N][K] + E8M0 scales [N][K/32] all 127: the MXFP8 GEMM operands
+// (bindp::Gemm). The codebook values are E4M3 already, so the copy is exact. Allocates N K + N K / 32 bytes. Synchronous.
+struct Fp8
+{
+    uint8_t* codes = nullptr;
+    uint8_t* scales = nullptr;
+    int K = 0, N = 0;
+};
+inline const char* make_fp8(const Mat& m, cudaStream_t st, Fp8& F)
+{
+    F = Fp8();
+    if (!m.w) return nullptr;
+    const size_t nc = static_cast<size_t>(m.N) * m.K;
+    if (cudaMalloc(&F.codes, nc) != cudaSuccess || cudaMalloc(&F.scales, nc / 32) != cudaSuccess) return "dtr make_fp8: cudaMalloc failed";
+    F.K = m.K; F.N = m.N;
+    cudaMemsetAsync(F.scales, 127, nc / 32, st);
+    k_dtr_fp8<<<static_cast<unsigned>((nc + 255) / 256), 256, 0, st>>>(m.w, m.sB, m.sG, m.K, m.N, F.codes);
+    return cudaStreamSynchronize(st) == cudaSuccess ? nullptr : "dtr make_fp8: decode failed";
+}
+inline void free_fp8(Fp8& F)
+{
+    cudaFree(F.codes);
+    cudaFree(F.scales);
+    F = Fp8();
 }
 
 }   // namespace dtr

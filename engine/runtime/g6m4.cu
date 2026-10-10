@@ -397,7 +397,8 @@ int main(int argc, char** argv)
     StepOut* out;
     G6RT_CK(cudaHostAlloc((void**)&in, sizeof(StepIn), cudaHostAllocMapped));
     G6RT_CK(cudaHostAlloc((void**)&out, sizeof(StepOut), cudaHostAllocMapped));
-    const Find find = image ? image_find(pack, img) : pack_find(pack, store);
+    // dense trellis matrices: their FP8 copies for prefill under the MXFP8 names (dtr_find.h)
+    const Find find = dtr_overlay(image ? image_find(pack, img) : pack_find(pack, store), MP > 0, st, R);
     g6::Pack qo_pack;
     g6::DevImage qo_img;                // --image: the qo pack streamed into one device allocation (no host copy)
     std::vector<QoW> qow;               // pf_qo: full-head weights per model layer
