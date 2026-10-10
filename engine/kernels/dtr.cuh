@@ -394,9 +394,13 @@ inline const char* fill(Gemv& g, int nm, int M, int ks, int sub, int rot, const 
     if (M < 1 || M > G6_MX) return "dense trellis GEMV: M must be 1..G6_MX";
     if (sub != 1 && sub != 2) return "dense trellis GEMV: sub must be 1 or 2";
     auto smem = [&](int k) { return static_cast<size_t>(rot ? NT * (K16 / k) * 256 : 0) + static_cast<size_t>(sub - 1) * 8 * NT * 32 * 16; };
+    auto fits = [&](int k) { return K16 % k == 0 && (K16 / k) % 8 == 0 && (K16 / k) % sub == 0 && smem(k) <= SMEM_MAX; };
     while (ks > 1 && (K16 % ks || (K16 / ks) % 8 || (K16 / ks) % sub)) ks >>= 1;
     while (smem(ks) > SMEM_MAX && ks * 2 <= K16 / 8 && K16 % (ks * 2) == 0) ks *= 2;
-    if (K16 % ks || (K16 / ks) % 8 || (K16 / ks) % sub || smem(ks) > SMEM_MAX) return "dense trellis GEMV: no k split fits this shape";
+    // TP3 shapes (K16 = 336 for 21 heads) at S2's rows may have no power-of-two split: take the smallest divisor that fits
+    for (int k = 1; !fits(ks) && k <= K16 / 8; ++k)
+        if (fits(k)) ks = k;
+    if (!fits(ks)) return "dense trellis GEMV: no k split fits this shape";
     const int nblk = g.a.N / 128;
     if (part_floats(g.a.N, nm, ks, M) > sc.part_n) return "dense trellis GEMV: scratch partials too small";
     if (cnt_off + nblk > sc.cnt_n) return "dense trellis GEMV: scratch counters too few";

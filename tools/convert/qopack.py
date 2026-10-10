@@ -108,8 +108,8 @@ def main():
     if '--layers' in args:
         i = args.index('--layers'); lspec = args[i + 1]; del args[i:i + 2]
     out, srcs = args[0], args[1:]
-    if len(srcs) not in (4, 6):
-        sys.exit('need six sources (rank 0 .. 5) or four (TP4, rank 0 .. 3)')
+    if len(srcs) not in (3, 4, 6):
+        sys.exit('need six sources (rank 0 .. 5), four (TP4) or three (TP3)')
     nr = len(srcs)
     edges = qo_edges(nr)
     layers = parse_layers(lspec)

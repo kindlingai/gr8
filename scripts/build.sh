@@ -24,9 +24,11 @@ G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 S2_FLAG=""
-if [ "${G6_NR:-}" = 4 ]; then
-  [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: a TP4 build always has the multi-session path (DEC_S2)"; exit 2; }
-  S2_FLAG="-DDEC_S2 -DPF_F12"   # PF_F12: F12_NE=2 must divide the expert blocks per rank (4 at TP4, 3 at TP6)
+if [ "${G6_NR:-}" = 4 ] || [ "${G6_NR:-}" = 3 ]; then
+  [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: TP4 and TP3 builds always have the multi-session path (DEC_S2)"; exit 2; }
+  S2_FLAG="-DDEC_S2"
+  # PF_F12: F12_NE=2 must divide the expert blocks per rank (4 at TP4, 3 at TP6)
+  [ "$G6_NR" = 4 ] && S2_FLAG="$S2_FLAG -DPF_F12"
 fi
 EXTRA="$K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
 if [ "${BUNDLE_LIBS:-0}" = 1 ]; then

@@ -263,7 +263,7 @@ def validate(o):
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
     if o.plain == '1':
-        raise OptionError('PLAIN=1 (the one-request loop) is retired at TP=4, and TP=6 and TP=3 never used it: unset it')
+        raise OptionError('PLAIN=1 (the one-request loop) is retired at TP=4 and TP=3, and TP=6 never used it: unset it')
     if tp not in ('3', '4', '6'):
         raise OptionError(f'--tp {tp}: want 4, 6 or 3')
     if o.get('SHAPE') == 'ring':

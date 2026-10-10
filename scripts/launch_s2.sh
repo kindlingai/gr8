@@ -16,8 +16,8 @@
 #                     prefill cells, s2/pool.h)
 set -eu
 . "$(dirname "$0")/common.sh"
-[ "$NRANK" = 4 ] || { echo "launch_s2.sh needs 4 HOSTS, config has $NRANK"; exit 2; }
-TP=4
+[ "$NRANK" = 4 ] || [ "$NRANK" = 3 ] || { echo "launch_s2.sh needs 4 or 3 HOSTS, config has $NRANK"; exit 2; }
+TP=$NRANK
 . "$(dirname "$0")/engine_args.sh"
 engine_defaults
 EPOCH=$(date +%s)

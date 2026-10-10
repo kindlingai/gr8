@@ -73,8 +73,8 @@ For six boxes, use six peers and the GPTQ `tp6/` codes. Every launch knob is a f
 ([KNOBS.md](KNOBS.md)). `./gr8 glm53 down` on any box stops every box, `./gr8 glm53 restart` stops and boots again, and
 `./gr8 glm53 logs [rank]` shows a rank's engine log from any box.
 
-TP=3 runs the `down1` variant by default (`home` does not fit next to a KV pool on three boxes) and has no DFlash2
-drafter: its 8 KV heads do not split three ways. `scripts/build_packs.sh` builds TP=4 and TP=6 packs only
+TP=3 serves through S2 like TP=4, with MTP only (the DFlash2 drafter's 8 KV heads do not split three ways), and runs
+the `down1` variant by default (`home` does not fit next to a KV pool on three boxes). `scripts/build_packs.sh` builds TP=4 and TP=6 packs only
 (`tools/convert/convert.py --nr 3` for the rest).
 
 ## What you need
