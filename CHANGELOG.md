@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-10: a decoder for the exlr8 dense and vocabulary files (#116, step 1, part 1)
+
+- `engine/loader-rs/src/exlr8.rs` decodes the exlr8 v2 release's `dense/exlr8-dense-LLL` and `dense/exlr8-vocab`
+  matrices in every format they use (trellis K4, int4 g32, MXFP8, FP8 block, FP8 row, BF16, FP32). The values equal the
+  output of `loader/exlr8.py` bit for bit in fp32. The decoder takes any block of a matrix, so a rank reads only its own
+  trellis entries. The two Hadamard products sum in input order with one fused multiply-add per term. NVPL and cuBLAS
+  use that order for the reference's fp32 matmuls, and any other order changes the last bit of some results.
+- `exlr8dump` writes a layer's decoded tensors under the reference's names. `tests/exlr8_compare.py` compares the dump
+  with `loader/exlr8.py` on the release's files: all 80 files (549 matrices, 16.0 billion elements) are bit-identical in
+  fp32 and in BF16, and so is every rank's block at TP=3, 4 and 6 for layers 0, 2, 3, 4, 6, 78 and the vocabulary.
+- `cargo test` checks the decoder against the reference's output on a synthetic fixture of every format and side
+  (`tests/data/exlr8-fixture.safetensors`, 194 KB), so CI needs neither torch nor the release.
+- Nothing in the engine uses it yet: the boot from the release alone builds on it.
+
 ## 2026-10-09: DFlash2 under `--s2` (the S2 launcher default, `DFLASH=1`)
 
 - `--s2 --dflash-manifest .. --spec-adaptive` (with `--mtp`): a session alone at its prompt tail drafts with DFlash2

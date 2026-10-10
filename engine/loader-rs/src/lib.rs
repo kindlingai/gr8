@@ -14,6 +14,7 @@
 //! g6l_v2_plan plans an image without a v2 pack: the base pack's tensors, with the v2 experts read from the raw width
 //! files at the offsets of the index slices (src/v2plan.rs). g6l_plan_load then loads it like a pack.
 
+pub mod exlr8;
 mod json;
 mod plan;
 mod sys;
@@ -88,7 +89,7 @@ impl Loader<'_> {
         let mut done = 0usize;
         // O_DIRECT for the 4096-aligned head of the range when the destination is aligned too
         if let Some(d) = &s.direct {
-            if off % ALIGN == 0 && (dst.as_ptr() as u64) % ALIGN == 0 {
+            if off.is_multiple_of(ALIGN) && (dst.as_ptr() as u64).is_multiple_of(ALIGN) {
                 let head = dst.len() / ALIGN as usize * ALIGN as usize;
                 if head > 0 {
                     read_exact_at(d, &mut dst[..head], off).map_err(|e| format!("{name}: {e} (O_DIRECT)"))?;
