@@ -126,7 +126,7 @@ int main(int argc, char** argv)
     { const char* ev = getenv("G6_PF_AOP"); A.aop = (ev && atoi(ev) == 0) ? nullptr : sc.aop; }
 #endif
 #ifdef PF_F12
-    { const char* ev = getenv("G6_PF_F12"); A.f12 = ev ? atoi(ev) : 0; }
+    { const char* ev = getenv("G6_PF_F12"); A.f12 = ev ? atoi(ev) : 1; }
 #endif
     CK(cudaMemset(sc.ysh, 0, static_cast<size_t>(M) * HID * 2));
     // the shared expert as bindp::make_layer binds it: Ls.exs = the trellis pass, Lf = the FP8 copy on the GEMMs

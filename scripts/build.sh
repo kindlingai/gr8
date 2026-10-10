@@ -3,7 +3,7 @@
 # Needs CUDA 13 (nvcc with sm_121a), g++ with C++20, libibverbs-dev, cuBLAS. A few minutes on a GB10, CPU only.
 #   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin
 #   G6_NR=4 scripts/build.sh bin4         the TP4 engine (four Sparks, packs from build_packs.sh with the TP4 codes), with
-#                                         DEC_S2 (the multi-session path launch_tp4.sh runs)
+#                                         DEC_S2 (the multi-session path launch_tp4.sh runs) and PF_F12 (the fat-CTA prefill fc1)
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (stage.sh copies it, launch_tp4.sh uses it)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
@@ -26,7 +26,7 @@ cd "$REPO/engine/runtime"
 S2_FLAG=""
 if [ "${G6_NR:-}" = 4 ]; then
   [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: a TP4 build always has the multi-session path (DEC_S2)"; exit 2; }
-  S2_FLAG="-DDEC_S2"
+  S2_FLAG="-DDEC_S2 -DPF_F12"   # PF_F12: F12_NE=2 must divide the expert blocks per rank (4 at TP4, 3 at TP6)
 fi
 EXTRA="$K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
 if [ "${BUNDLE_LIBS:-0}" = 1 ]; then

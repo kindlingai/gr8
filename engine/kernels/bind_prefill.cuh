@@ -1633,11 +1633,11 @@ struct Expert
     const __half* ysh = nullptr;      // [M][6144] fp16 shared expert output
     uint16_t* out = nullptr;          // [M][6144] BF16
     RsOut rs;                         // set: k_pf_fin writes its rows to the RS send slot instead of out
-#ifdef PF_AOP
+#if defined(PF_AOP) || defined(PF_F12)
     uint8_t* aop = nullptr;           // PF_AOP: [maxseg][AOP_NS][gate, up][AOPS] fragment-ready fc1 A records (k_pf_aop); nullptr = off
 #endif
 #ifdef PF_F12
-    int f12 = 0;                      // PF_F12: 1 = fc1 runs as k_pf_fc1f (fat CTA: F12_NE adjacent expert blocks share one quantized A record); default off
+    int f12 = 0;                      // PF_F12: 1 = fc1 runs as k_pf_fc1f (fat CTA: F12_NE adjacent expert blocks share one quantized A record); the host sets it (G6_PF_F12, default 1)
 #endif
 };
 
@@ -3760,7 +3760,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         { const char* ev = getenv("G6_PF_AOP"); A.aop = (ev && atoi(ev) == 0) ? nullptr : sc.aop; }   // compiled in: on unless G6_PF_AOP=0
 #endif
 #ifdef PF_F12
-        { const char* ev = getenv("G6_PF_F12"); A.f12 = ev ? atoi(ev) : 0; }   // default off
+        { const char* ev = getenv("G6_PF_F12"); A.f12 = ev ? atoi(ev) : 1; }   // compiled in: on unless G6_PF_F12=0
 #endif
         if (T.sh_trellis && T.sh_fp8)
         {

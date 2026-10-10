@@ -61,7 +61,7 @@ the short version.
 | `G6_PF_HASH_GPU` | 1 | the per-sub-batch residual hash (rank agreement check) is computed on the GPU |
 | `G6_PF_RSDIRECT` | 1 | o_proj, dense down and the MoE final sum write straight into the reduce-scatter send slot |
 | `G6_PF_AOP` | 1 (when built with `-DPF_AOP`) | fc1 A-operand share: `k_pf_aop` quantizes the fc1 A operand once per (segment, matrix, distinct prologue input) into global records that the fc1 block-CTAs stage by cp.async. Needs build flag `-DPF_AOP`; 0 disables; `G6_PF_AOP_MMIN` (default 3072) sets the M floor. Byte-exact |
-| `G6_PF_F12` | 0 | 1 = fc1 runs as the fat-CTA kernel `k_pf_fc1f` (NE=2 expert blocks share one quantized A record). Needs build flag `-DPF_F12`. Byte-exact |
+| `G6_PF_F12` | 1 (when built with `-DPF_F12`) | fc1 runs as the fat-CTA kernel `k_pf_fc1f` (NE=2 expert blocks share one quantized A record). Needs build flag `-DPF_F12`, which `G6_NR=4 scripts/build.sh` sets; 0 = the stock fc1. Byte-exact |
 | `G6_DEC_SPLIT` | 3 | the decode step is captured as two graphs split at layer 3, so the second submission overlaps the first one's GPU time |
 | `G6_DEC_SHARED_SCRATCH` | 1 | one decode attention scratch for all layers (frees memory for the big pool; needs `--pfv2`) |
 | `G6_CP` | 1 | context-parallel KV on (build flag `-DG6_CP=1` too) |
@@ -117,6 +117,7 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `SEL32` | the exact top-k selector is used past 32,768 tokens of context too |
 | `DEC_IDX31=1` | decode index scorer reads each key once for all query rows and skips tiles another CP rank owns; select stops at the live end of the bucket (exact, #31; needs `SEL32`) |
 | `G6_CP=1`, `G6_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
+| `PF_F12` (TP4 build only) | prefill expert fc1: one fat CTA runs `F12_NE` (default 2) adjacent expert blocks on one quantized A record (`kernels/bind_prefill.cuh`, `k_pf_fc1f`). `F12_NE` must divide the expert blocks per rank (4 at TP4, 3 at TP6). `G6_PF_F12=0` turns it off at run time |
 
 ## Front end and shim
 
