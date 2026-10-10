@@ -45,7 +45,7 @@ def git_blob(b):
 
 
 def manifest(width_of):
-    return {'format': 'exlr8-v2-manifest', 'name': 'x', 'layers': {
+    return {'format': 'exlr8-v2-manifest', 'name': 'x', 'set_id': '5e' * 32, 'layers': {
         str(l): {'gate': [[width_of('gate', e, h) for h in range(16)] for e in range(NE)],
                  'up': [[width_of('up', e, h) for h in range(16)] for e in range(NE)],
                  'down': [width_of('down', e, 0) for e in range(NE)], 'shared': 0} for l in LAYERS}}
@@ -286,6 +286,23 @@ class HFTests(unittest.TestCase):
         r.fetch_rank(4, 2, self.variant(r, 'down1'))
         self.assertTrue(self.hub.requests(r'exlr8-layer-003\.k2'))
         self.assertEqual(r.check(4, 2, self.variant(r)), [])
+
+    def test_the_release_alone_is_the_model(self):
+        import options as opt
+        import supervisor as S
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], {})
+        opt.validate(o)
+        ms, v, err = S.resolve_model(o, log=self.logs.append)
+        self.assertEqual(err, '')
+        self.assertEqual((o.get('V2_DENSE'), o.get('V2')), (ms.release.dir, ms.release.v2))
+        self.assertEqual(ms.set['source'], {'kind': 'exlr8-release', 'weights': '5e' * 32})
+        self.assertEqual(ms.tokenizer, ms.release.tokenizer)
+        plan = opt.engine_plan(o, rank=2, rank_dir=ms.rank_dir(2), aux_dir=ms.rank_dir(2), home='/h')
+        self.assertIn(ms.release.dir, plan['args'][plan['args'].index('--v2-dense') + 1])
+        self.assertNotIn('--manifest', plan['args'])
+        self.assertEqual(modelset.needed(ms.set, 2, plan), {})
+        self.assertEqual(str(ms.release), ms.source)
 
     def test_commit_is_recorded_and_refreshed(self):
         r = self.release()

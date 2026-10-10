@@ -92,6 +92,49 @@ class SetTests(unittest.TestCase):
             M.needed(ms.set, 0, plan(own='3'))     # no qo pack in this set
 
 
+class ReleaseTests(unittest.TestCase):
+    """An exlr8 release as the model set: no rank packs, the id from the release's weights and the tokenizer."""
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp()
+        self.rel = os.path.join(self.t, 'rel')
+        os.makedirs(os.path.join(self.rel, 'dense'))
+        os.makedirs(os.path.join(self.rel, 'manifests'))
+        open(os.path.join(self.rel, 'dense', 'exlr8-vocab.safetensors'), 'w').close()
+        with open(os.path.join(self.rel, 'manifests', 'exlr8-manifest-home.json'), 'w') as f:
+            json.dump({'format': 'exlr8-v2-manifest', 'set_id': 'ab' * 32, 'layers': {}}, f)
+        for n in M.TOKENIZER:
+            with open(os.path.join(self.rel, n), 'w') as f:
+                f.write(n)
+
+    def tearDown(self):
+        shutil.rmtree(self.t)
+
+    def test_release_set(self):
+        self.assertTrue(M.is_release(self.rel))
+        self.assertFalse(M.is_release(make_packs(os.path.join(self.t, 'packs'))))
+        ms = M.release_set(self.rel, 4)
+        self.assertEqual(ms.set['source'], {'kind': 'exlr8-release', 'weights': 'ab' * 32})
+        self.assertEqual(ms.tokenizer, self.rel)
+        # every rank's file list is empty, for PF_OWN=3 too
+        self.assertEqual(M.needed(ms.set, 1, plan(dflash='0', own='3')), {})
+        self.assertEqual(M.validate_rank(ms, 2, plan(dflash='0')), [])
+        self.assertIsNone(M.offers(ms, plan(dflash='0')))
+        self.assertEqual(M.check_tokenizer(ms), [])
+        # the id follows the weights and the TP. A copy elsewhere has the same id
+        other = shutil.copytree(self.rel, os.path.join(self.t, 'copy'))
+        self.assertEqual(M.release_set(other, 4).id, ms.id)
+        self.assertNotEqual(M.release_set(self.rel, 3).id, ms.id)
+        with open(os.path.join(other, 'manifests', 'exlr8-manifest-home.json'), 'w') as f:
+            json.dump({'set_id': 'cd' * 32}, f)
+        self.assertNotEqual(M.release_set(other, 4).id, ms.id)
+
+    def test_release_needs_a_set_id(self):
+        os.unlink(os.path.join(self.rel, 'manifests', 'exlr8-manifest-home.json'))
+        with self.assertRaises(M.ModelError):
+            M.release_set(self.rel, 4)
+
+
 class CacheTests(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp()

@@ -12,16 +12,20 @@
 //!   G6_LOAD_CHUNK_MB=32 bytes of image per chunk (each worker holds one staging buffer of this size)
 //!
 //! g6l_v2_plan plans an image without a v2 pack: the base pack's tensors, with the v2 experts read from the raw width
-//! files at the offsets of the index slices (src/v2plan.rs). g6l_plan_load then loads it like a pack.
+//! files at the offsets of the index slices (src/v2plan.rs). g6l_release_plan plans one from the exlr8 release alone,
+//! no pack at all (src/release.rs): the image's other tensors are copied from the dense files or computed from them
+//! at load (Op::Gen). g6l_plan_load then loads either like a pack.
 
 pub mod dflash2;
 pub mod exlr8;
 pub mod fetch;
 pub mod json;
 mod plan;
+pub mod records;
+pub mod release;
 pub mod sha256;
 mod sys;
-mod v2plan;
+pub mod v2plan;
 pub mod xxh64;
 
 use plan::{Op, Plan};
@@ -130,6 +134,13 @@ impl Loader<'_> {
                     let m = &self.plan.mems[s.file];
                     buf[(x - a) as usize..(y - a) as usize]
                         .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
+                }
+                Op::Gen => {
+                    let g = &self.plan.gens[s.file];
+                    let m = g.get()?;
+                    buf[(x - a) as usize..(y - a) as usize]
+                        .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
+                    g.used(y - x);
                 }
                 Op::Item128 => {
                     let n = s.nbytes as usize;
@@ -298,11 +309,49 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
     }
 }
 
+/// Plans rank `rank`'s image at TP `nr` from the exlr8 v2 release alone (src/release.rs): the dense and vocabulary
+/// files under `dense_dir`, the experts from the width files under `v2_dir` at the offsets of the index slices under
+/// `slices_dir`, at the widths of the width manifest. Writes the image's manifest to `out_manifest`. On rank 0 it also
+/// prints the form of each matrix to stderr. Returns a handle for g6l_plan_load and g6l_plan_free, or
+/// NULL with a message in `err`.
+///
+/// # Safety
+/// The strings must be NUL-terminated, `err` must hold `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *const c_char, slices_dir: *const c_char,
+                                          widths: *const c_char, nr: u32, rank: u32, qo: i32, trellis: i32,
+                                          out_manifest: *const c_char,
+                                          err: *mut c_char, errlen: usize) -> *mut c_void {
+    let t0 = Instant::now();
+    let arg = |p, what| cstr(p).ok_or(format!("g6l_release_plan: no {what}"));
+    let r = (|| {
+        let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
+                                         &arg(widths, "width manifest")?, nr as usize, rank as usize,
+                                         release::Opts { qo: qo != 0, trellis: trellis != 0 })?;
+        let out = arg(out_manifest, "output manifest")?;
+        std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
+        if rank == 0 {
+            eprintln!("# rank 0: weights from the exlr8 release, by matrix (rounded = not the release's weights, #116):");
+            for line in table.lines() {
+                eprintln!("#   {line}");
+            }
+        }
+        Ok::<_, String>(img)
+    })();
+    match r {
+        Ok(img) => Box::into_raw(Box::new((img, t0))) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Loads an image g6l_v2_plan planned. The stats count time from the plan call. Returns 0, or 1 with a message in
 /// `err`.
 ///
 /// # Safety
-/// `h` must come from g6l_v2_plan and be loaded once; `sink`, `stats` and `err` as for g6l_load.
+/// `h` must come from g6l_v2_plan or g6l_release_plan and be loaded once; `sink`, `stats` and `err` as for g6l_load.
 #[no_mangle]
 pub unsafe extern "C" fn g6l_plan_load(h: *mut c_void, sink: *const G6lSink, stats: *mut G6lStats, err: *mut c_char,
                                        errlen: usize) -> i32 {
@@ -317,10 +366,52 @@ pub unsafe extern "C" fn g6l_plan_load(h: *mut c_void, sink: *const G6lSink, sta
     }
 }
 
+/// Image bytes `a..a + buf.len()` of a segment plan (g6l_v2_plan, g6l_release_plan), one range at a time: files opened
+/// per call, computed ranges computed and dropped.
+pub fn read_range(plan: &Plan, a: u64, buf: &mut [u8]) -> Result<(), String> {
+    let b = a + buf.len() as u64;
+    buf.fill(0);
+    for s in plan.sources(a, b) {
+        let (x, y) = (s.pack_off.max(a), (s.pack_off + s.nbytes).min(b));
+        let dst = &mut buf[(x - a) as usize..(y - a) as usize];
+        let (lo, hi) = ((x - s.pack_off) as usize, (y - s.pack_off) as usize);
+        let file = || File::open(&plan.files[s.file]).map_err(|e| format!("{}: {e}", plan.files[s.file]));
+        match s.op {
+            Op::Copy => read_exact_at(&file()?, dst, s.file_off + lo as u64).map_err(|e| format!("{}: {e}", plan.files[s.file]))?,
+            Op::Mem => dst.copy_from_slice(&plan.mems[s.file][lo..hi]),
+            Op::Gen => dst.copy_from_slice(&plan.gens[s.file].compute()?[lo..hi]),
+            Op::Item128 => {
+                let n = s.nbytes as usize;
+                let (mut half, mut perm) = (vec![0u8; n], vec![0u8; n]);
+                read_exact_at(&file()?, &mut half, s.file_off).map_err(|e| format!("{}: {e}", plan.files[s.file]))?;
+                plan::item128_to_g6(&half, &mut perm);
+                dst.copy_from_slice(&perm[lo..hi]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads image bytes `off..off + n` of a planned image into `dst` (m4sim's per-tensor loads). Returns 0, or 1 with a
+/// message in `err`.
+///
+/// # Safety
+/// `h` must come from g6l_v2_plan or g6l_release_plan, before g6l_plan_load. `dst` must hold `n` bytes, `err` `errlen`.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_plan_read(h: *mut c_void, off: u64, n: u64, dst: *mut c_void, err: *mut c_char,
+                                       errlen: usize) -> i32 {
+    let (img, _) = &*(h as *const (v2plan::V2Image, Instant));
+    let buf = std::slice::from_raw_parts_mut(dst as *mut u8, n as usize);
+    match read_range(&img.plan, off, buf) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
 /// Frees a g6l_v2_plan handle.
 ///
 /// # Safety
-/// `h` must come from g6l_v2_plan and must not be used again.
+/// `h` must come from g6l_v2_plan or g6l_release_plan and must not be used again.
 #[no_mangle]
 pub unsafe extern "C" fn g6l_plan_free(h: *mut c_void) {
     if !h.is_null() {

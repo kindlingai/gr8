@@ -13,6 +13,9 @@ the short version.
 | `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order (exactly `G6_NR` of them) |
 | `--proxy-cpu N` | 19 | CPU core for the fabric proxy thread (the CP fabric's proxy uses N-1) |
 | `--manifest` / `--pack` | `packs/rank<r>.*` | this rank's pack; `--pack -` reads it from stdin |
+| `--v2 DIR` / `--v2-slices DIR` / `--v2-widths FILE` | the release (`V2`, `V2_SLICES`, `--variant`) | the routed and shared experts from the exlr8 width files at the index slices' offsets, at the manifest's widths, in place of the pack's |
+| `--v2-dense DIR` | the release (`V2_DENSE`) | with `--v2`: no `--manifest` / `--pack`. Every other weight comes from the release's `dense/` files, planned at load (`engine/loader-rs/src/release.rs`); rank 0 prints which form each matrix took. Under `G6_PF_OWN=3` the image also holds the full-head q_b / o_proj / UK / UV, so no QO pack |
+| `--v2-dense-form trellis\|rounded` | trellis (`V2_DENSE_FORM`) | trellis: q_b, o_proj and the dense MLP stored as trellis stay the release's entries for the dense trellis kernels (`engine/kernels/dtr.cuh`). rounded, the fallback: they are rounded to MXFP8 and int4 at load (not the release's weights) |
 | `--image` | on | load the whole pack into one device image (required for full packs) |
 | `--layers all` | all | all 78 layers + the MTP layer |
 | `--qo-manifest` / `--qo-pack` | `packs/qo.*` | full-head attention weights for `G6_PF_OWN=3` (identical file on every node) |

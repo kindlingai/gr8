@@ -14,12 +14,15 @@
 //
 // Every buffer a kernel touches is device memory; the host uses cudaMemcpy only (WSL: no managed memory).
 //
-// m4sim --packs DIR [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234]
+// m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR   [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234]
 //       [--cap 64] [--chunk 4] [--graph] [--prefill MP]
 // --prefill MP: every prompt token but the last goes through the prefill path in sub-batches of up to MP rows
 // (prefill.cuh; its own loopback fabric with two collectives and the layer as step); the last prompt token and the
 // generated ones go through decode steps as before.
 // --prompt may be repeated: each is its own sequence (attention caches reset in between); "@file" reads ids
+// --v2-dense (Rust loader build): each simulated rank's image is planned from the exlr8 release as g6m4 --v2-dense plans
+//        it, and each tensor is read from the release when a rank first binds it (only the --layers' tensors are read).
+//        --v2-dense-form trellis|rounded as in g6m4
 // [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 // [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                (0 = top_p off; 256 is the served setting; misses printed at the end)
@@ -128,6 +131,7 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
     std::string packs, layers_s = "0,3,40,77";
+    V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
     std::vector<std::string> prompts;
     Plan plan;
     int cap = 64;
@@ -149,6 +153,16 @@ int main(int argc, char** argv)
         const std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) die("missing value for " + a); return std::string(argv[++i]); };
         if (a == "--packs") packs = next();
+        else if (a == "--v2") v2src.dir = next();
+        else if (a == "--v2-slices") v2src.slices = next();
+        else if (a == "--v2-widths") v2src.widths = next();
+        else if (a == "--v2-dense") v2src.dense = next();
+        else if (a == "--v2-dense-form")
+        {
+            const std::string f = next();
+            if (f != "trellis" && f != "rounded") die("--v2-dense-form: trellis or rounded");
+            v2src.trellis = f == "trellis";
+        }
         else if (a == "--qo-manifest") qo_man = next();
         else if (a == "--qo-pack") qo_file = next();
         else if (a == "--layers") layers_s = next();
@@ -183,7 +197,12 @@ int main(int argc, char** argv)
         }
         else die("unknown argument " + a);
     }
-    if (packs.empty()) die("usage: m4sim --packs DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
+    const bool release = !v2src.dense.empty();
+    if (packs.empty() == !release || (release && (v2src.dir.empty() || v2src.slices.empty() || v2src.widths.empty())))
+        die("usage: m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
+#ifndef G6_RS_LOADER
+    if (release) die("--v2-dense needs the Rust loader (scripts/build.sh links it when cargo is installed)");
+#endif
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
     if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
@@ -284,10 +303,26 @@ int main(int argc, char** argv)
     std::vector<g6::Pack> pack(NR);
     std::vector<Model> R(NR);           // sized once: the attention bindings must not move
     DevStore store;
-    // rank r's tensors: its pack, with the FP8 copies of its dense trellis matrices for prefill (dtr_find.h), made once
+#ifdef G6_RS_LOADER
+    PlanStore pstore;
+    pstore.plans.resize(NR);
+#endif
+    // rank r's pack (or, with --v2-dense, its planned image)
+    auto rload = [&](int r) {
+#ifdef G6_RS_LOADER
+        if (release) { pstore.plans[r] = rs_plan_release(pack[r], r, v2src); return; }
+#endif
+        load_pack(pack[r], packs + "/rank" + std::to_string(r) + ".manifest.json", packs + "/rank" + std::to_string(r) + ".pack", r);
+    };
+    // rank r's tensors, with the FP8 copies of its dense trellis matrices for prefill (dtr_find.h), made once
     std::vector<Find> rfinds(NR);
     auto rfind = [&](int r) -> const Find& {
-        if (!rfinds[r]) rfinds[r] = dtr_overlay(pack_find(pack[r], store), MP > 0, st, r);
+        if (rfinds[r]) return rfinds[r];
+        Find base = pack_find(pack[r], store);
+#ifdef G6_RS_LOADER
+        if (release) base = plan_find(pack[r], pstore, r);
+#endif
+        rfinds[r] = dtr_overlay(base, MP > 0, st, r);
         return rfinds[r];
     };
     Loop loop{}, loop_pf{};
@@ -332,7 +367,7 @@ int main(int argc, char** argv)
     Loop loop_d{};
     if (pf_qo)                          // the full-head weights need every rank's slices: load the six packs first
     {
-        for (int r = 0; r < NR; ++r) load_pack(pack[r], packs + "/rank" + std::to_string(r) + ".manifest.json", packs + "/rank" + std::to_string(r) + ".pack", r);
+        for (int r = 0; r < NR; ++r) rload(r);
         std::vector<Find> finds;
         for (int r = 0; r < NR; ++r) finds.push_back(rfind(r));
         if (!qo_man.empty()) load_pack(qo_pack, qo_man, qo_file, 0);
@@ -349,7 +384,7 @@ int main(int argc, char** argv)
 #if G6_NR == 4
     if (pf_qp)                          // the pair weights need both pair members' slices: load the four packs first
     {
-        for (int r = 0; r < NR; ++r) load_pack(pack[r], packs + "/rank" + std::to_string(r) + ".manifest.json", packs + "/rank" + std::to_string(r) + ".pack", r);
+        for (int r = 0; r < NR; ++r) rload(r);
         std::vector<Find> finds;
         for (int r = 0; r < NR; ++r) finds.push_back(rfind(r));
         int n = 0;
@@ -367,8 +402,7 @@ int main(int argc, char** argv)
 #endif
     for (int r = 0; r < NR; ++r)
     {
-        const std::string base = packs + "/rank" + std::to_string(r);
-        if (!pf_qo && !pf_qp) load_pack(pack[r], base + ".manifest.json", base + ".pack", r);
+        if (!pf_qo && !pf_qp) rload(r);
         g6::FabricDev f{};
         f.send = dmalloc<char>(2 * (size_t)NC * stride);
         f.recv = recv; f.doorbell = doorbell; f.error = err;
@@ -516,6 +550,9 @@ int main(int argc, char** argv)
     loop_pf2.recv = recv_pf2; loop_pf2.stepp = stepp_pf2; loop_pf2.ncoll = NCP; loop_pf2.stride = stride_pf;
     if (MP && pf_rs) fprintf(stderr, "# prefill reduce-scatter form (5 collectives, slice %zu B)%s\n", pf_ss(PF[0].f),
                              pf_own >= 4 ? ", pair-owner QO attention (G6_PF_OWN=4)" : pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
+#ifdef G6_RS_LOADER
+    if (release) { store.bytes = pstore.bytes; store.shared_bytes = pstore.shared_bytes; }
+#endif
     fprintf(stderr, "# device tensors: %.2f GB held, %.2f GB shared between ranks\n", store.bytes / 1e9, store.shared_bytes / 1e9);
     printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed);
 

@@ -188,6 +188,23 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--v2 @V2', text)
         self.assertIn('--v2-widths @V2_WIDTHS', text)
 
+    def test_release_alone_has_no_rank_pack(self):
+        _, text, _ = self.digest('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel')
+        self.assertIn('--v2-dense @V2_DENSE', text)
+        self.assertNotIn('--manifest', text)
+        self.assertNotIn('--v2-dense-form', text)
+        _, text, _ = self.digest('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel',
+                                 '--v2-dense-form', 'rounded')
+        self.assertIn('--v2-dense @V2_DENSE --v2-dense-form rounded', text)
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4,10.0.0.5,10.0.0.6', '--v2', '/v2',
+                       '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel'], {})
+        opt.validate(o)
+        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
+        self.assertIn('G6_PF_OWN=3', p['env'])
+        self.assertNotIn('--qo-manifest', p['args'])          # PF_OWN=3's full-head weights come from the release
+        with self.assertRaises(opt.OptionError):
+            self.digest('--v2-dense-form', 'exact')
+
     def test_tp6_and_tp3(self):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})
         opt.validate(o)

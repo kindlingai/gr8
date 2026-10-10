@@ -2,6 +2,8 @@
 //! source ranges of rank<r>.sources (engine/loader/g6pack.h, class Sources, documents the format).
 
 use crate::G6lExtent;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Bytes of one v2 down half per bit of width: 48 x 8 x 8 tiles of 32 bytes.
 const HALF_PER_BIT: u64 = 98304;
@@ -12,6 +14,56 @@ pub enum Op {
     Item128,
     /// bytes from Plan::mems[file]; file_off is unused
     Mem,
+    /// bytes Plan::gens[file] computes at load. file_off is unused
+    Gen,
+}
+
+/// Image bytes computed at load (decoded or re-laid-out weights). `make` returns the whole range. Workers copy the range
+/// out in chunks, and the range is dropped after its last byte is copied. Each image byte is copied once, so a range is
+/// computed once.
+pub struct Gen {
+    pub what: String,
+    nbytes: u64,
+    make: Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>,
+    state: Mutex<Option<Arc<Vec<u8>>>>,
+    left: AtomicU64,
+}
+
+impl Gen {
+    pub fn new(what: String, nbytes: u64, make: Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>) -> Gen {
+        Gen { what, nbytes, make, state: Mutex::new(None), left: AtomicU64::new(nbytes) }
+    }
+
+    /// The bytes, computing them on first use.
+    pub fn get(&self) -> Result<Arc<Vec<u8>>, String> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(a) = &*s {
+            return Ok(a.clone());
+        }
+        if self.left.load(Ordering::Relaxed) < self.nbytes {
+            return Err(format!("{}: computed twice", self.what));
+        }
+        let v = (self.make)().map_err(|e| format!("{}: {e}", self.what))?;
+        if v.len() as u64 != self.nbytes {
+            return Err(format!("{}: {} bytes computed, {} planned", self.what, v.len(), self.nbytes));
+        }
+        let a = Arc::new(v);
+        *s = Some(a.clone());
+        Ok(a)
+    }
+
+    /// The bytes, computed afresh and dropped by the caller. Single-tensor reads call this. They leave the rest of the
+    /// range unread, so the count in `used` would never reach zero.
+    pub fn compute(&self) -> Result<Vec<u8>, String> {
+        (self.make)().map_err(|e| format!("{}: {e}", self.what))
+    }
+
+    /// `n` bytes were copied out. After the last of them the bytes are dropped.
+    pub fn used(&self, n: u64) {
+        if self.left.fetch_sub(n, Ordering::AcqRel) == n {
+            *self.state.lock().unwrap() = None;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -27,6 +79,7 @@ pub struct Plan {
     /// files[0] is the pack itself; the rest are source files in order of first use
     pub files: Vec<String>,
     pub mems: Vec<Vec<u8>>,
+    pub gens: Vec<Gen>,
     data: Vec<(u64, u64)>,
     segs: Vec<Seg>,
 }
@@ -67,16 +120,17 @@ impl Plan {
                 }
             }
         }
-        Ok(Plan { files, mems: Vec::new(), data, segs })
+        Ok(Plan { files, mems: Vec::new(), gens: Vec::new(), data, segs })
     }
 
     pub fn empty() -> Plan {
-        Plan { files: Vec::new(), mems: Vec::new(), data: Vec::new(), segs: Vec::new() }
+        Plan { files: Vec::new(), mems: Vec::new(), gens: Vec::new(), data: Vec::new(), segs: Vec::new() }
     }
 
     /// A plan of segments only (files[0] is read through Copy segments like any other file). `segs` must be sorted
     /// and must not overlap.
-    pub fn from_segs(files: Vec<String>, segs: Vec<Seg>, mems: Vec<Vec<u8>>, bytes: u64) -> Result<Plan, String> {
+    pub fn from_segs(files: Vec<String>, segs: Vec<Seg>, mems: Vec<Vec<u8>>, gens: Vec<Gen>, bytes: u64)
+                     -> Result<Plan, String> {
         let mut end = 0;
         for s in &segs {
             if s.pack_off < end {
@@ -87,7 +141,7 @@ impl Plan {
         if end > bytes {
             return Err("planned ranges run past the image".into());
         }
-        Ok(Plan { files, mems, data: Vec::new(), segs })
+        Ok(Plan { files, mems, gens, data: Vec::new(), segs })
     }
 
     /// Pack-file extents that overlap image bytes a..b.

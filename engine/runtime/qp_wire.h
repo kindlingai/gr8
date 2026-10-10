@@ -62,9 +62,11 @@ inline int partner(int r) { return r ^ 1; }
 // build. Equal only if both members build the same model layer with the same S, E, QO table (G6_PF_QP_CTX) and weight
 // form (trellis: the layer's q_b / o_proj are dense trellis): a pair whose G6_PF_QP_LAYERS / ROLL / WIRE_E / QP_CTX or
 // weights differ fails closed (ERR_TAG) and reads no other layer's half.
-inline unsigned long long tag(int layer, int S, int E, int qp_ctx, bool trellis = false)
+// form: bit 0 = q_b in dense trellis form, bit 1 = o_proj (bits 48 and 50; the constant holds bit 49)
+inline unsigned long long tag(int layer, int S, int E, int qp_ctx, int form = 0)
 {
-    return 0x4c32000000000000ull | ((unsigned long long)trellis << 48) | ((unsigned long long)(layer & 0xff) << 40) |
+    return 0x4c32000000000000ull | ((unsigned long long)(form & 1) << 48) | ((unsigned long long)((form >> 1) & 1) << 50) |
+           ((unsigned long long)(layer & 0xff) << 40) |
            ((unsigned long long)(S & 0xf) << 36) | ((unsigned long long)(E & 0xf) << 32) | (unsigned long long)(unsigned)qp_ctx;
 }
 // g6m4 boot refusals of the rolling-pack env, before any fabric / CUDA work. "" = ok, else the die message.

@@ -4,7 +4,7 @@
 //! their bytes are those tools/convert/v2pack.py writes (and tools/convert/v2.py convert_experts_v2 for one rank).
 
 use crate::json::{self, Json};
-use crate::plan::{Op, Plan, Seg};
+use crate::plan::{Gen, Op, Plan, Seg};
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -164,30 +164,35 @@ pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
     Ok(Some(Widths { gate, up, down, sgate, sup, sdown }))
 }
 
-struct Builder {
-    tensors: Vec<Tensor>,
-    segs: Vec<Seg>,
-    mems: Vec<Vec<u8>>,
-    files: Vec<String>,
+pub(crate) struct Builder {
+    pub tensors: Vec<Tensor>,
+    pub segs: Vec<Seg>,
+    pub mems: Vec<Vec<u8>>,
+    pub gens: Vec<Gen>,
+    pub files: Vec<String>,
     file_ix: HashMap<String, usize>,
-    cur: u64,
+    pub cur: u64,
 }
 
 impl Builder {
-    fn begin(&mut self, name: String, dtype: &str, shape: Vec<i64>, nbytes: u64, xf: Option<&str>) -> u64 {
+    pub fn new() -> Builder {
+        Builder { tensors: Vec::new(), segs: Vec::new(), mems: Vec::new(), gens: Vec::new(), files: Vec::new(),
+                  file_ix: HashMap::new(), cur: 0 }
+    }
+    pub fn begin(&mut self, name: String, dtype: &str, shape: Vec<i64>, nbytes: u64, xf: Option<&str>) -> u64 {
         let off = self.cur.div_ceil(ALIGN) * ALIGN;
         self.tensors.push(Tensor { name, dtype: dtype.into(), shape, offset: off, nbytes, expert_format: xf.map(str::to_string) });
         self.cur = off + nbytes;
         off
     }
-    fn file(&mut self, path: String) -> usize {
+    pub fn file(&mut self, path: String) -> usize {
         let n = self.files.len();
         *self.file_ix.entry(path.clone()).or_insert_with(|| {
             self.files.push(path);
             n
         })
     }
-    fn seg(&mut self, pack_off: u64, nbytes: u64, op: Op, file: usize, file_off: u64) {
+    pub fn seg(&mut self, pack_off: u64, nbytes: u64, op: Op, file: usize, file_off: u64) {
         if let Some(last) = self.segs.last_mut() {
             if op == Op::Copy && last.op == Op::Copy && last.file == file && last.pack_off + last.nbytes == pack_off
                 && last.file_off + last.nbytes == file_off {
@@ -229,25 +234,10 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
     let mut base = bm.get("tensors").and_then(Json::arr).ok_or(format!("{base_manifest}: no tensors"))?
         .iter().map(base_tensor).collect::<Result<Vec<_>, _>>()?;
     base.sort_by_key(|t| t.offset);
-    let man = json::parse(&read(widths_path)?)?;
-    if man.get("format").and_then(Json::str) != Some("exlr8-v2-manifest") {
-        return Err(format!("{widths_path}: not an exlr8-v2-manifest"));
-    }
-    let mut slices: HashMap<u8, Slice> = HashMap::new();
-    for k in [2u8, 3, 4] {
-        let p = format!("{slices_dir}/tp{nr}/k{k}/rank{rank}.safetensors");
-        if std::path::Path::new(&p).exists() {
-            slices.insert(k, Slice::open(&p)?);
-        }
-    }
-    if slices.is_empty() {
-        return Err(format!("no index slices for TP {nr} rank {rank} under {slices_dir}"));
-    }
-    let wfile = |l: usize, k: u8| {
-        let flat = format!("{v2_dir}/exlr8-layer-{l:03}.k{k}.safetensors");
-        if std::path::Path::new(&flat).exists() { flat } else { format!("{v2_dir}/experts/exlr8-layer-{l:03}.k{k}.safetensors") }
-    };
-    let mut b = Builder { tensors: Vec::new(), segs: Vec::new(), mems: Vec::new(), files: Vec::new(), file_ix: HashMap::new(), cur: 0 };
+    let man = width_manifest(widths_path)?;
+    let slices = open_slices(slices_dir, nr, rank)?;
+    let wfile = |l: usize, k: u8| width_file(v2_dir, l, k);
+    let mut b = Builder::new();
     let base_file = b.file(base_pack.to_string());
     let mut done: Vec<usize> = Vec::new();
     for t in &base {
@@ -274,8 +264,41 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
         return Err(format!("the base pack has routed experts for {} of the {listed} layers {widths_path} lists", done.len()));
     }
     let bytes = b.cur.div_ceil(ALIGN) * ALIGN;
-    let plan = Plan::from_segs(b.files, b.segs, b.mems, bytes)?;
+    let plan = Plan::from_segs(b.files, b.segs, b.mems, b.gens, bytes)?;
     Ok(V2Image { rank, tensors: b.tensors, bytes, plan })
+}
+
+/// A width manifest (exlr8-v2-manifest).
+pub(crate) fn width_manifest(path: &str) -> Result<Json, String> {
+    let man = json::parse(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?)?;
+    if man.get("format").and_then(Json::str) != Some("exlr8-v2-manifest") {
+        return Err(format!("{path}: not an exlr8-v2-manifest"));
+    }
+    Ok(man)
+}
+
+/// Rank `rank`'s index slices at TP `nr`, one per width present: SLICES/tp<N>/k<K>/rank<r>.safetensors, SLICES being
+/// the index-slices dir itself or a release dir that holds index-slices/.
+pub(crate) fn open_slices(slices_dir: &str, nr: usize, rank: usize) -> Result<HashMap<u8, Slice>, String> {
+    let mut slices: HashMap<u8, Slice> = HashMap::new();
+    for root in [slices_dir.to_string(), format!("{slices_dir}/index-slices")] {
+        for k in [2u8, 3, 4] {
+            let p = format!("{root}/tp{nr}/k{k}/rank{rank}.safetensors");
+            if !slices.contains_key(&k) && std::path::Path::new(&p).exists() {
+                slices.insert(k, Slice::open(&p)?);
+            }
+        }
+    }
+    if slices.is_empty() {
+        return Err(format!("no index slices for TP {nr} rank {rank} under {slices_dir}"));
+    }
+    Ok(slices)
+}
+
+/// The width file of layer l at width k: DIR/exlr8-layer-LLL.kK.safetensors, or under DIR/experts/.
+pub(crate) fn width_file(dir: &str, l: usize, k: u8) -> String {
+    let flat = format!("{dir}/exlr8-layer-{l:03}.k{k}.safetensors");
+    if std::path::Path::new(&flat).exists() { flat } else { format!("{dir}/experts/exlr8-layer-{l:03}.k{k}.safetensors") }
 }
 
 fn base_tensor(t: &Json) -> Result<Tensor, String> {
@@ -290,7 +313,7 @@ fn base_tensor(t: &Json) -> Result<Tensor, String> {
     })
 }
 
-fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u8, Slice>, wfile: &dyn Fn(usize, u8) -> String,
+pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u8, Slice>, wfile: &dyn Fn(usize, u8) -> String,
             nr: usize, rank: usize) -> Result<(), String> {
     let p = format!("L{l:03}");
     let mut ls: HashMap<u8, LayerSlice> = HashMap::new();

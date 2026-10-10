@@ -12,6 +12,13 @@
 //      [--v2 DIR --v2-slices DIR --v2-widths FILE]  with --image and the Rust loader: --manifest/--pack is a base pack
 //                     whose routed experts the exlr8 v2 experts replace, read from the raw width files in DIR at the
 //                     offsets of the index slices (tp<N>/k<K>/rank<r>.safetensors) and the widths FILE picks
+//      [--v2-dense DIR]  with --v2: no --manifest / --pack. Every other tensor comes from the exlr8 release's dense and
+//                     vocab files in DIR (or DIR/dense), planned at load (engine/loader-rs/src/release.rs). Rank 0
+//                     prints which form each matrix took. G6_PF_OWN=3 takes its full-head tensors from the same image
+//                     (no --qo-manifest / --qo-pack)
+//      [--v2-dense-form trellis|rounded]  trellis (default): q_b, o_proj and the dense MLP stored as trellis stay the
+//                     release's entries for the dense trellis kernels (kernels/dtr.cuh). rounded: the fallback, which
+//                     rounds them to the MXFP8 and int4 forms of a converted pack (not the release's weights)
 //      [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234] [--cap 64] [--chunk 4]
 //      [--graph]      one captured graph per row count instead of plain launches (same lines)
 //      [--prefill MP] every prompt token but the last goes through the prefill path in sub-batches of up to MP rows,
@@ -127,6 +134,13 @@ int main(int argc, char** argv)
         else if (a == "--v2") v2src.dir = next();
         else if (a == "--v2-slices") v2src.slices = next();
         else if (a == "--v2-widths") v2src.widths = next();
+        else if (a == "--v2-dense") v2src.dense = next();
+        else if (a == "--v2-dense-form")
+        {
+            const std::string f = next();
+            if (f != "trellis" && f != "rounded") die("--v2-dense-form: trellis or rounded");
+            v2src.trellis = f == "trellis";
+        }
         else if (a == "--qo-manifest") qo_man = next();
         else if (a == "--qo-pack") qo_file = next();
         else if (a == "--qp-manifest") qp_man = next();
@@ -177,8 +191,11 @@ int main(int argc, char** argv)
         }
         else die("unknown argument " + a);
     }
-    if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || manifest.empty() || packfile.empty())
+    const bool release = !v2src.dense.empty();
+    if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || (!release && (manifest.empty() || packfile.empty())))
         die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
+    if (release && (!manifest.empty() || !packfile.empty() || v2src.dir.empty()))
+        die("--v2-dense replaces --manifest / --pack and needs --v2 (the image comes from the release alone)");
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
     if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
@@ -275,7 +292,9 @@ int main(int argc, char** argv)
     const int pf_own = getenv("G6_PF_OWN") ? atoi(getenv("G6_PF_OWN")) : 0;   // 1: row-owner projections, 2: + index (prefill.cuh)
     const bool pf_qo = MP && pf_own == 3;                                        // 3: row-owner QO attention (QO-INTEGRATION.md)
     const bool pf_qp = own4;                                                     // 4: pair-owner QO attention (TP4, qp.cuh)
-    if (pf_qo && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
+    if (pf_qo && !release && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
+    if (release && (!qo_man.empty() || !qp_man.empty())) die("--v2-dense: the QO weights come from the release (no --qo- / --qp- packs)");
+    v2src.qo = pf_qo;
     if (MP)
     {
         g6::FabricConfig cp = cfg;
@@ -404,9 +423,10 @@ int main(int argc, char** argv)
     std::vector<QoW> qow;               // pf_qo: full-head weights per model layer
     if (pf_qo)
     {
-        if (image) load_image(qo_pack, qo_img, qo_man, qo_file, 0, hash);
+        if (release) {}             // the rank image holds the full-head tensors (L%03d.qo.*)
+        else if (image) load_image(qo_pack, qo_img, qo_man, qo_file, 0, hash);
         else load_pack(qo_pack, qo_man, qo_file, 0);
-        const Find qfind = image ? image_find(qo_pack, qo_img) : pack_find(qo_pack, store);
+        const Find qfind = release ? find : image ? image_find(qo_pack, qo_img) : pack_find(qo_pack, store);
         for (int l : layers)
         {
             QoW w;

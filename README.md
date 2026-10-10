@@ -42,21 +42,23 @@ it too.
 
 ## Quick start
 
-On every box, with the boxes, the fabric and the packs ready ([What you need](#what-you-need)):
+On every box, with the boxes and the fabric ready ([What you need](#what-you-need)):
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
     ./gr8 glm53 build                  # the engine for this TP and the Rust front end, into bin/ (or copy bin/)
-    ./gr8 glm53 packs /data/tr3 /data/gptq/tp4 /data/packs /data/dflash2    # once, on one machine (step 3)
     ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
         --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/g6/cache \
-        --base-packs /data/packs --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
+        --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
     ./gr8 glm53 status                 # every box, the front end, /health
     ./gr8 glm53 smoke                  # questions with answers that can be checked
 
 With `--model https://huggingface.co/...`, each box fetches only its own part of the exlr8 release into
 `--model-cache` (step 4): its expert halves for the variant, its index slices, the manifests, the dense and vocab
-files, and the tokenizer. Until the engine reads the release's dense files (#116), it still takes its non-expert
-weights from base packs (`--base-packs`, step 3). `--drafter` names the DFlash2 drafter's own repo. The drafter's licence
+files, and the tokenizer. The release is the whole model: no packs to build. Each rank plans its weights from the
+release's files at load (`--v2-dense`, engine/loader-rs/src/release.rs), and rank 0 prints which form each matrix took.
+The weights are the release's own, with lm_head rounded to MXFP8: q_b, o_proj and the MLP of layers 0-2 run on the
+dense trellis kernels. `--v2-dense-form rounded` rounds those to MXFP8 and int4 instead, as a fallback. Booting from
+prepared packs (step 3) still works, and `--base-packs DIR` takes only the non-expert weights from packs. `--drafter` names the DFlash2 drafter's own repo. The drafter's licence
 forbids sharing a converted copy, so each box fetches the drafter and converts its rank. Without `--drafter`, TP=4 runs
 MTP only.
 
@@ -77,7 +79,7 @@ packs only (`tools/convert/convert.py --nr 3` for the rest).
 ## What you need
 
 - Four or six DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory). One rank per box, and nothing else
-  holding GPU memory: a TP=4 rank holds about 90 GB of weights.
+  holding GPU memory: a TP=4 rank holds about 86 GB of weights from the release (`home`), 90 GB from packs.
 - A RoCE v2 fabric with two rails. Each box's ConnectX-7 has two addresses (`IPS` and `IPS2` in the config), one
   per PCIe root. We used one 200G switch. The engine finds the RDMA device for each address itself.
 - A LAN between the boxes, with TCP port 7340 open on it and on both fabric rails (the supervisors' handshake and
@@ -89,10 +91,12 @@ packs only (`tools/convert/convert.py --nr 3` for the rest).
   (engine/loader-rs): it plans each rank's ranges from the index slices and checks every half's xxhash64. With
   `--drafter`, `bin/g6load dflash2` also converts this box's rank of the drafter. Nothing on the boot path needs
   numpy.
-- Disk per box: the box's rank pack (about 90 GB at TP=4, 62 GB at TP=6), the drafter pack at TP=4 (0.86 GB) or
-  the shared QO pack at TP=6 (13 GB), and the binary.
-- Disk for the pack build (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for
-  the GPTQ codes and about 390 GB for the packs it writes.
+- Disk per box: its part of the release (about 75 GB of expert halves at TP=4 `home`, the 11 GB of dense and vocab
+  files, the index slices and manifests), the drafter at TP=4, and the binary. Booting from packs instead: the box's
+  rank pack (about 90 GB at TP=4, 62 GB at TP=6), the drafter pack at TP=4 (0.86 GB) or the shared QO pack at TP=6
+  (13 GB).
+- Only to build packs (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for the
+  GPTQ codes and about 390 GB for the packs it writes.
 - Toolchain: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev (the stock DGX OS,
   Ubuntu 24.04), and cargo for the Rust pack loader and front end.
 - The weights, public on Hugging Face:
@@ -168,9 +172,10 @@ cluster file or `--tp`, name the TP: `TP=4 ./gr8 glm53 build`. The scripts still
 `BUNDLE_LIBS=1` also copies cuBLAS next to the binary, for boxes without the CUDA toolkit. The `-D` flags in
 `scripts/build.sh` pick kernel variants; each one won an A/B test on our cluster.
 
-## 3. Build the packs
+## 3. Build the packs (optional)
 
-On the machine with the disk (CPU only, about 15-25 minutes):
+The exlr8 release boots as it is (step 4). Packs are the older model set: the TR3 experts and the GPTQ dense codes,
+converted once. On the machine with the disk (CPU only, about 15-25 minutes):
 
     hf download davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw --local-dir /data/tr3
     hf download adapt-ai-systems/glm-5.3-full-exl3-gptq-dense --include 'tp4/*' --local-dir /data/gptq
@@ -236,6 +241,10 @@ drafter, `up` runs MTP only and prints the flag to add, and `--dflash 1` without
 
 fills the cache ahead of `up`, with a progress line every 30 s (GB done of the total, the rate). With `--peers` the box
 knows its rank. With mentat it does not until the election, so name it with `--rank`.
+
+From a local copy of the release. `--model DIR`, where DIR holds the release's layout (`dense/`, `experts/` or the width
+files themselves, `index-slices/`, `manifests/` and the tokenizer files), boots from it in place. The set id comes from
+the release's weight set id and the tokenizer files.
 
 From a pack directory.
 

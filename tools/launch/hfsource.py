@@ -40,10 +40,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-DFlash2'
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
 CHUNK = 64 << 20
-# Until the engine reads the release's dense and vocab files (#116), it loads every non-expert weight from a base
-# rank pack. This is the one place that says so.
-NEEDS_BASE = ('the engine still loads its non-expert weights from base packs until it reads the release\'s dense '
-              'files (#116): pass --base-packs <prepared pack dir> as well')
 
 
 def endpoint():
@@ -258,8 +254,11 @@ class Release:
                if not os.path.isfile(os.path.join(self.dir, p)) or os.path.getsize(os.path.join(self.dir, p)) != n]
         return bad
 
-    def fetch_rank(self, tp, rank, variant, workers=16):
-        """Fetch and check this rank's part, then write its COMPLETE marker."""
+    def fetch_rank(self, tp, rank, variant, workers=None):
+        """Fetch and check this rank's part, then write its COMPLETE marker. A rank's expert halves are small ranges
+        (0.3-0.8 MB) a few apart, so the fetch is bound by requests in flight: 16 held a box near 10 MB/s from the hub.
+        GR8_FETCH_WORKERS overrides the default 64."""
+        workers = workers or int(os.environ.get('GR8_FETCH_WORKERS', '64'))
         fr = fetch_ranks()
         with open(variant.path) as f:
             layers = sorted(int(x) for x in json.load(f)['layers'])

@@ -171,7 +171,8 @@ inline bool qp_from_pack(const Find& qfind, const Find& find, int r, int l, QpW&
     return qp_check(w);
 }
 // the 16-head slice of pair member m: q_b / o_proj codes and scales, UK / UV (shape-checked); qv / ov: a dense trellis
-// q_b's svh slice and o_proj's suh slice [4096] (p = nullptr: MXFP8 weights)
+// q_b's svh slice and o_proj's suh slice [4096] (p = nullptr: that matrix is MXFP8). The two can differ: the release
+// keeps layer 3's o_proj in int4 next to a trellis q_b.
 struct QpHalf { TensorRef qc, qs, oc, os, uk, uv, qv, ov; };
 inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
 {
@@ -184,16 +185,12 @@ inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
     };
     QpHalf h{get("q_b.mx.codes"), get("q_b.mx.scales"), get("o_proj.mx.codes"), get("o_proj.mx.scales"), get("kv_b.uk"), get("kv_b.uv"), {}, {}};
     snprintf(n, sizeof n, "L%03d.q_b.trellis", l);
-    const bool tq = f(n).p != nullptr;
+    if (f(n).p) h.qv = get("q_b.svh");
     snprintf(n, sizeof n, "L%03d.o_proj.trellis", l);
-    if (tq != (f(n).p != nullptr)) die(std::string(who) + ": layer " + std::to_string(l) + " has one of q_b / o_proj in trellis form, not both");
-    if (tq)
-    {
-        h.qv = get("q_b.svh");
-        h.ov = get("o_proj.suh");
-        if (h.qv.nd != 1 || h.qv.shape[0] != 4096 || h.ov.nd != 1 || h.ov.shape[0] != 4096)
+    if (f(n).p) h.ov = get("o_proj.suh");
+    for (const TensorRef* v : {&h.qv, &h.ov})
+        if (v->p && (v->nd != 1 || v->shape[0] != 4096))
             die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " trellis q_b svh / o_proj suh are not [4096]");
-    }
     if (h.qc.shape[0] != 16 * 256 || h.qc.shape[1] != 2048 || h.qs.shape[1] != 64 || h.oc.shape[0] != HID || h.oc.shape[1] != 16 * 256 ||
         h.os.shape[1] != 16 * 8 || h.uk.nd != 3 || h.uk.shape[0] != 16 || h.uk.shape[1] != 192 || h.uv.nd != 3 ||
         h.uv.shape[0] != 16 || h.uv.shape[1] != 256)
@@ -206,12 +203,9 @@ inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
 inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const void* oc, const void* os, const void* uk, const void* uv,
                         cudaStream_t b, const void* qv = nullptr, const void* ov = nullptr)
 {
-    if (qv && !w.qb_svh) die("qp: a dense trellis half for a slot without vector buffers");
-    if (qv)
-    {
-        G6RT_CK(cudaMemcpyAsync(w.qb_svh + (size_t)k * 4096, qv, (size_t)4096 * 2, cudaMemcpyDefault, b));
-        G6RT_CK(cudaMemcpyAsync(w.o_suh + (size_t)k * 4096, ov, (size_t)4096 * 2, cudaMemcpyDefault, b));
-    }
+    if ((qv || ov) && !w.qb_svh) die("qp: a dense trellis half for a slot without vector buffers");
+    if (qv) G6RT_CK(cudaMemcpyAsync(w.qb_svh + (size_t)k * 4096, qv, (size_t)4096 * 2, cudaMemcpyDefault, b));
+    if (ov) G6RT_CK(cudaMemcpyAsync(w.o_suh + (size_t)k * 4096, ov, (size_t)4096 * 2, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync((char*)w.qb_c.p + (size_t)k * 4096 * 2048, qc, (size_t)4096 * 2048, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync((char*)w.qb_s.p + (size_t)k * 4096 * 64, qs, (size_t)4096 * 64, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpy2DAsync((char*)w.o_c.p + (size_t)k * 4096, 8192, oc, 4096, 4096, HID, cudaMemcpyDefault, b));
@@ -235,7 +229,7 @@ inline QpW qp_from_ranks(const std::vector<Find>& finds, int r, int l)
     {
         const int m = k ? ord.second : ord.first;
         const QpHalf h = qp_half(finds[m], m, l, "qp_from_ranks");
-        if (h.qv.p) qp_alloc_vec(w);
+        if (h.qv.p || h.ov.p) qp_alloc_vec(w);
         qp_put_half(w, k, h.qc.p, h.qs.p, h.oc.p, h.os.p, h.uk.p, h.uv.p, nullptr, h.qv.p, h.ov.p);
     }
     G6RT_CK(cudaDeviceSynchronize());
@@ -254,7 +248,8 @@ inline QpW qp_from_ranks(const std::vector<Find>& finds, int r, int l)
 // Sources: m4sim: the pair members' own head slices in device memory (it holds all four packs). g6m4 (QpWire set): only
 // the own half has device sources (this rank's pack); the partner half arrives by RDMA (qp_wire.h protocol) into the wire
 // fabric's bulk ring and is copied from there into the slot.
-struct QpSrc { QpHalf h[2]; bool have[2] = {false, false}; int partner_half = -1; int layer = -1; bool trellis = false; };
+// form: bit 0 = q_b in dense trellis form, bit 1 = o_proj
+struct QpSrc { QpHalf h[2]; bool have[2] = {false, false}; int partner_half = -1; int layer = -1; int form = 0; };
 // the wire (g6m4): the bulk Fabric's kernel view, its job queue, and the build counter n (qp_wire.h)
 struct QpWire
 {
@@ -312,13 +307,13 @@ inline QpRoll* qp_roll_new(int S, bool ser, const std::vector<Find>& finds, int 
             if (wire && m != r) continue;            // g6m4: the partner's half has no local source
             q.h[h] = qp_half(finds[wire ? 0 : m], m, l, "G6_PF_QP_ROLL");
             q.have[h] = true;
-            q.trellis = q.h[h].qv.p != nullptr;      // the wire tag makes the partner agree (qp_wire_build)
+            q.form = (q.h[h].qv.p ? 1 : 0) | (q.h[h].ov.p ? 2 : 0);   // the wire tag makes the partner agree (qp_wire_build)
         }
         if (q.partner_half < 0) die("G6_PF_QP_ROLL: rank " + std::to_string(r) + " is not in its own pair");
     }
     R->slot.resize(S);
     bool trellis = false;
-    for (const QpSrc& q : R->src) trellis |= q.trellis;
+    for (const QpSrc& q : R->src) trellis |= q.form != 0;
     for (QpW& w : R->slot)
     {
         qp_alloc(w);
@@ -382,7 +377,7 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     const long n = x.n++;
     const int e = qw::entry(n, x.E), ph = q.partner_half, oh = 1 - ph;
     const unsigned pe = (unsigned)(e << 4) | (unsigned)x.peer;
-    const unsigned long long tg = qw::tag(q.layer, x.S, x.E, x.ctx, q.trellis);
+    const unsigned long long tg = qw::tag(q.layer, x.S, x.E, x.ctx, q.form);
     const QpHalf& o = q.h[oh];
     k_qp_wait<<<1, 32, 0, b>>>(x.bd, qw::f_consumed(e), x.peer, qw::consumed_min(n, x.E), qw::ERR_WAIT_CONSUMED | pe, 0ull, 0u);
     G6RT_CK(cudaGetLastError());
@@ -393,11 +388,8 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OS, o.os.p, qw::OS, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UK, o.uk.p, qw::UK, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UV, o.uv.p, qw::UV, cudaMemcpyDefault, b));
-    if (q.trellis)
-    {
-        G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QV, o.qv.p, qw::QV, cudaMemcpyDefault, b));
-        G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OV, o.ov.p, qw::OV, cudaMemcpyDefault, b));
-    }
+    if (q.form & 1) G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QV, o.qv.p, qw::QV, cudaMemcpyDefault, b));
+    if (q.form & 2) G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OV, o.ov.p, qw::OV, cudaMemcpyDefault, b));
     k_qp_bell<<<1, 32, 0, b>>>(x.bd.doorbell + qw::f_ready(e), qw::val(n), x.bd.aux_out + qw::f_ready(e), tg);
     G6RT_CK(cudaGetLastError());
     {
@@ -418,7 +410,7 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     G6RT_CK(cudaGetLastError());
     const char* rx = x.bd.bulk + qw::pos_off(e, ph);
     qp_put_half(w, ph, rx + qw::OFF_QC, rx + qw::OFF_QS, rx + qw::OFF_OC, rx + qw::OFF_OS, rx + qw::OFF_UK, rx + qw::OFF_UV, b,
-                q.trellis ? rx + qw::OFF_QV : nullptr, q.trellis ? rx + qw::OFF_OV : nullptr);
+                q.form & 1 ? rx + qw::OFF_QV : nullptr, q.form & 2 ? rx + qw::OFF_OV : nullptr);
     R.bytes_partner += (double)qw::HALF;
     k_qp_bell<<<1, 32, 0, b>>>(x.bd.doorbell + qw::f_consumed(e), qw::val(n), nullptr, 0ull);
     G6RT_CK(cudaGetLastError());

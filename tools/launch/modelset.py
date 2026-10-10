@@ -14,6 +14,11 @@ that load from it). --model-cache DIR is this box's local directory: a boot copi
 
 through <cache>/tmp/ and a rename, with COMPLETE written last. --model-cache alone boots from the one complete set in
 the cache for this TP.
+
+An exlr8 release (a directory with dense/, the width files and index-slices/, or a Hugging Face release fetched by
+hfsource.py) is a model set too, with no rank packs: every rank plans its image from the release's files
+(g6m4 --v2-dense). Its set.json names the release's weight set id and the tokenizer, and a rank needs only the
+release's files.
 """
 import fcntl
 import hashlib
@@ -94,6 +99,36 @@ def describe(model, tp, model_dir=None):
     return s, tok
 
 
+def is_release(d):
+    """A directory holding the exlr8 release's dense files (dense/ under it)."""
+    return bool(d) and os.path.isfile(os.path.join(d, 'dense', 'exlr8-vocab.safetensors'))
+
+
+def describe_release(d, tp, tok):
+    """set.json for an exlr8 release at this TP: no rank packs. The weights are named by the release's weight set id
+    (every width manifest carries it), else by the sha256 of its dense hashes."""
+    weights = None
+    for p in sorted(os.listdir(os.path.join(d, 'manifests'))) if os.path.isdir(os.path.join(d, 'manifests')) else []:
+        try:
+            with open(os.path.join(d, 'manifests', p)) as f:
+                weights = json.load(f).get('set_id') or weights
+        except (OSError, ValueError):
+            continue
+    if not weights:
+        raise ModelError(f'{d}: no width manifest with a set_id under manifests/ (release v0.3 or later)')
+    s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in TOKENIZER},
+         'source': {'kind': 'exlr8-release', 'weights': weights}}
+    s['set_id'] = compute_id(s)
+    return s
+
+
+def release_set(d, tp, model_dir=None, label=None):
+    """The model set of an exlr8 release directory, used in place."""
+    tok = tokenizer_dir(d, model_dir)
+    return ModelSet(describe_release(d, tp, tok), label or f'{d} (exlr8 release)', tok, lambda r: d)
+
+
 def load_set(path):
     with open(path) as f:
         s = json.load(f)
@@ -107,7 +142,9 @@ def load_set(path):
 def needed(setj, rank, plan):
     """{file name: (kind, record)} this rank loads, from the resolved knobs."""
     k, tp = plan['knobs'], setj['tp']
-    out = {f'rank{rank}.pack': ('pack', setj['ranks'][rank]), f'rank{rank}.manifest.json': ('manifest', setj['ranks'][rank])}
+    release = setj.get('source', {}).get('kind') == 'exlr8-release'     # the image comes from the release's files
+    out = {} if release else {f'rank{rank}.pack': ('pack', setj['ranks'][rank]),
+                              f'rank{rank}.manifest.json': ('manifest', setj['ranks'][rank])}
 
     def add(stem, rec, why):
         if not rec:
@@ -116,7 +153,7 @@ def needed(setj, rank, plan):
         out[f'{stem}.manifest.json'] = ('manifest', rec)
     if tp == 4 and k.get('DFLASH') == '1' and not plan.get('drafter_dir'):
         add(f'dflash.r{rank}', (setj['dflash'] or [None] * tp)[rank], 'DFLASH=1 loads the DFlash2 drafter (DFLASH=0 for MTP only)')
-    if k.get('PF_OWN') == '3':
+    if k.get('PF_OWN') == '3' and not release:
         add('qo', setj['qo'], 'PF_OWN=3 loads the QO pack')
     return out
 

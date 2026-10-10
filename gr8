@@ -6,9 +6,9 @@
 #   ./gr8 glm53 up [OPTIONS] [@FILE]  start this box's supervisor and follow it until the cluster serves
 #        --tp 4|6|3 --peers A,B,C,D   the boxes' LAN addresses, the same list on every box, head first
 #        --mentat localhost           or: find the other boxes through the local mentat daemon (the default)
-#        --model URL|DIR              the release, https://huggingface.co/<org>/<repo>[@rev], or a prepared pack
-#                                     directory (every rank's manifests). A release also needs --base-packs DIR
-#                                     until the engine reads the release's dense files
+#        --model URL|DIR              the release, https://huggingface.co/<org>/<repo>[@rev] or a local copy of it,
+#                                     or a prepared pack directory (every rank's manifests). A release is the whole
+#                                     model: the engine plans every rank's weights from its files
 #        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
 #        --drafter URL                TP=4: the DFlash2 drafter's repo, fetched and converted on each box
 #        --cap 262144, --sess 4, ...  every knob in KNOBS.md, as --<knob> VALUE

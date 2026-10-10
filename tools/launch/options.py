@@ -31,8 +31,10 @@ KEYS = {
     'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
     'PORT': ('cluster', '8100', 'the OpenAI API port on the head'),
     'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
-    'MODEL': ('box', None, 'a prepared pack directory, or the release: https://huggingface.co/<org>/<repo>[@rev]'),
-    'BASE_PACKS': ('box', None, 'with an https:// --model: the prepared pack directory for the non-expert weights'),
+    'MODEL': ('box', None, 'the exlr8 release (https://huggingface.co/<org>/<repo>[@rev], or a local copy), or a '
+                           'prepared pack directory'),
+    'BASE_PACKS': ('box', None, 'with an https:// --model: take the non-expert weights from this prepared pack directory '
+                                'instead of the release'),
     'MODEL_CACHE': ('box', None, "this box's local directory for its shard of the model set"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, serve/, run/'),
@@ -66,6 +68,9 @@ KEYS = {
     'V2_SLICES': ('box', None, 'exlr8 v2 index slices'),
     'V2_WIDTHS': ('box', None, 'exlr8 v2 width manifest; --variant names one instead'),
     'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default), down1, up1, or a width manifest path'),
+    'V2_DENSE': ('box', None, 'the exlr8 release directory whose dense/ files give every non-expert weight (no rank packs)'),
+    'V2_DENSE_FORM': ('cluster', None, 'with V2_DENSE: trellis (the release\'s entries, the default) or rounded (MXFP8 / '
+                                       'int4, the fallback)'),
     'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
@@ -218,7 +223,7 @@ def parse(argv, environ=None):
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT', 'BASE_PACKS',
-              'DFLASH_DIR'):
+              'DFLASH_DIR', 'V2_DENSE'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or (k == 'VARIANT' and '/' not in values[k]
                                                                                and not values[k].endswith('.json')):
             continue
@@ -255,6 +260,8 @@ def validate(o):
         raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
     if o.get('V2') and not o.get('V2_SLICES'):
         raise OptionError('--v2 needs --v2-slices')
+    if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
+        raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at TP=4, and TP=6 and TP=3 never used it: unset it')
     if tp not in ('3', '4', '6'):
@@ -307,7 +314,7 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
         if o.get(k) is not None:
             env[k] = o.get(k)
     if rank == '@R':   # the template: v2 paths are per box
-        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR'):
+        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE'):
             if env.get(k):
                 env[k] = '@' + k
     names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO', 'S2'])

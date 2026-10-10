@@ -64,10 +64,14 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
         return t;
     };
 }
-// exlr8 v2 experts from the raw width files (--v2 DIR --v2-slices DIR --v2-widths FILE)
+// exlr8 v2 experts from the raw width files (--v2 DIR --v2-slices DIR --v2-widths FILE). With dense (--v2-dense DIR),
+// every other tensor comes from the release's dense and vocab files too, with no base pack. trellis keeps the trellis
+// matrices as the release's entries (engine/kernels/dtr.cuh, --v2-dense-form trellis); false rounds them to a
+// converted pack's MXFP8 / int4 forms. qo adds the G6_PF_OWN=3 full-head tensors to the image.
 struct V2Src
 {
-    std::string dir, slices, widths;
+    std::string dir, slices, widths, dense;
+    bool trellis = true, qo = false;
 };
 
 #ifdef G6_RS_LOADER
@@ -138,14 +142,20 @@ inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& 
     return true;
 }
 
+// The planned manifest of a rank image, in $TMPDIR (default /tmp).
+inline std::string planned_manifest(int rank, const char* what)
+{
+    const char* tmp = getenv("TMPDIR");
+    return std::string(tmp && *tmp ? tmp : "/tmp") + "/g6m4-rank" + std::to_string(rank) + "." + what + ".manifest.json";
+}
+
 // The base pack with its routed experts replaced by exlr8 v2 experts read from the raw width files (--v2): the Rust
 // loader plans the image from the base manifest, the index slices and the width manifest, and writes the image's
 // manifest to $TMPDIR (default /tmp) for `pack` to read. Its sha256 fields are zero, so only this loader loads it.
 inline void rs_load_v2(g6::Pack& pack, g6::DevImage& img, const std::string& manifest, const std::string& file, int rank,
                        const V2Src& v2)
 {
-    const char* tmp = getenv("TMPDIR");
-    const std::string planned = std::string(tmp && *tmp ? tmp : "/tmp") + "/g6m4-rank" + std::to_string(rank) + ".v2.manifest.json";
+    const std::string planned = planned_manifest(rank, "v2");
     char err[1024] = "";
     void* h = g6l_v2_plan(manifest.c_str(), file.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(),
                           planned.c_str(), err, sizeof err);
@@ -158,6 +168,77 @@ inline void rs_load_v2(g6::Pack& pack, g6::DevImage& img, const std::string& man
     });
     g6l_plan_free(h);
 }
+
+// Plans rank `rank`'s image from the release alone (--v2-dense) and opens its manifest in pack. Returns the plan handle.
+inline void* rs_plan_release(g6::Pack& pack, int rank, const V2Src& v2)
+{
+    const std::string planned = planned_manifest(rank, "release");
+    char err[1024] = "";
+    void* h = g6l_release_plan(v2.dense.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(), g6nr::NR, rank,
+                               v2.qo, v2.trellis, planned.c_str(), err, sizeof err);
+    if (!h) die(std::string("release plan: ") + err);
+    std::string e;
+    if (!pack.open_manifest(planned, e)) die(planned + ": " + e);
+    return h;
+}
+
+inline void rs_load_release(g6::Pack& pack, g6::DevImage& img, int rank, const V2Src& v2)
+{
+    void* h = rs_plan_release(pack, rank, v2);
+    rs_fill(pack, img, rank, "exlr8 release", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
+        return g6l_plan_load(h, s, st, err, n);
+    });
+    g6l_plan_free(h);
+}
+
+// m4sim: one planned image per simulated rank, its tensors read from the release one at a time on first use. Tensors
+// with the same bytes share one device copy (the replicated ones), as DevStore does for packs.
+struct PlanStore
+{
+    std::vector<void*> plans;
+    std::map<std::string, void*> by_name, by_content;
+    size_t bytes = 0, shared_bytes = 0;
+
+    const void* get(int r, const g6::Entry& e)
+    {
+        void*& got = by_name[std::to_string(r) + ":" + e.name];
+        if (!got) got = read(r, e);
+        return got;
+    }
+    void* read(int r, const g6::Entry& e)
+    {
+        std::vector<uint8_t> h(e.nbytes);
+        char err[1024] = "";
+        if (e.nbytes && g6l_plan_read(plans[r], e.offset, e.nbytes, h.data(), err, sizeof err)) die(e.name + ": " + err);
+        uint64_t x = 0xcbf29ce484222325ull;       // FNV-1a over the bytes, plus the size, as the sharing key
+        for (uint8_t b : h) x = (x ^ b) * 0x100000001b3ull;
+        const std::string key = std::to_string(x) + ":" + std::to_string(e.nbytes);
+        auto it = by_content.find(key);
+        if (it != by_content.end()) { shared_bytes += e.nbytes; return it->second; }
+        void* d;
+        G6RT_CK(cudaMalloc(&d, e.nbytes ? e.nbytes : 1));
+        G6RT_CK(g6h2d::copy(d, h.data(), e.nbytes));
+        by_content[key] = d;
+        bytes += e.nbytes;
+        return d;
+    }
+};
+
+inline Find plan_find(const g6::Pack& pack, PlanStore& store, int r)
+{
+    return [&pack, &store, r](const std::string& name) {
+        TensorRef t;
+        const g6::Entry* e = pack.find(name);
+        if (!e) return t;
+        if (e->shape.size() > 4) die("too many dims: " + name);
+        t.p = store.get(r, *e);
+        t.nd = (int)e->shape.size();
+        for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
+        t.bf16 = e->dtype == g6::DType::BF16;
+        t.fmt = e->expert_format;
+        return t;
+    };
+}
 #endif
 
 // manifest + pack stream ("-" = stdin) -> device image
@@ -167,6 +248,7 @@ inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& man
     if (!v2.dir.empty())
     {
 #ifdef G6_RS_LOADER
+        if (!v2.dense.empty()) return rs_load_release(pack, img, rank, v2);
         return rs_load_v2(pack, img, manifest, file, rank, v2);
 #else
         die("--v2 needs the Rust loader (scripts/build.sh links it when cargo is installed)");

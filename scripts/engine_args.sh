@@ -7,7 +7,8 @@
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words)
 #   engine_args R RANK_PACKS AUX_PACKS HOME [EPOCH]
 #                            prints the arguments that follow `--proxy-cpu N` for rank R. RANK_PACKS holds
-#                            rank<R>.{manifest.json,pack}, AUX_PACKS the drafter and QO packs, HOME is G6_HOME
+#                            rank<R>.{manifest.json,pack} (unused with V2_DENSE: the release is the model), AUX_PACKS
+#                            the drafter and QO packs, HOME is G6_HOME
 #                            (the serve/ and s2/ directories), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
 
 engine_defaults() {
@@ -42,10 +43,14 @@ G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}
 engine_args() {
   local r=$1 rp=$2 ap=$3 home=$4 epoch=${5:-0} a src="" df="" qo=""
   [ -n "${V2:-}" ] && src="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
+  # V2_DENSE: the image comes from the release alone (#116). It holds PF_OWN=3's full-head weights too, so the QO pack is
+  # left out.
+  [ -n "${V2_DENSE:-}" ] && src="$src --v2-dense $V2_DENSE ${V2_DENSE_FORM:+--v2-dense-form $V2_DENSE_FORM}"
   local dd=${DFLASH_DIR:-$ap}   # the drafter packs: with the other packs, or where the supervisor converted them
   [ "${DFLASH:-0}" = 1 ] && df="--dflash-manifest $dd/dflash.r$r.manifest.json --dflash-pack $dd/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
-  [ "$PF_OWN" = 3 ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
+  [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
+  [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
   case $TP in
     4)
       a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 \

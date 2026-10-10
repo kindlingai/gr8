@@ -94,8 +94,10 @@ def version(home):
 def resolve_model(o, refresh=False, log=log):
     """(model set, variant, error): the model set and its exlr8 v2 variant, either None with the reason in error. The
     variant's manifest becomes V2_WIDTHS, which the engine arguments take. With an https:// --model the experts, index
-    slices and manifests come from the release (ms.release), and V2 and V2_SLICES point into the cache. refresh: ask
-    the hub what the revision is now (prepare), instead of the commit recorded at the last resolve."""
+    slices and manifests come from the release (ms.release), and V2 and V2_SLICES point into the cache. The release is
+    the whole model (V2_DENSE: the engine plans every weight from its files), unless --base-packs names packs for the
+    non-expert weights. A local --model that holds the release's dense/ is used the same way. refresh: ask the hub
+    what the revision is now (prepare), instead of the commit recorded at the last resolve."""
     ms = variant = release = None
     g6load = os.path.join(os.path.abspath(o.get('G6_HOME')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
     if os.access(g6load, os.X_OK):
@@ -109,15 +111,25 @@ def resolve_model(o, refresh=False, log=log):
                                           'there')
             release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
             release.fetch_meta()
-            if not o.get('BASE_PACKS'):      # TODO(#116): with the dense loader, the release alone is the model
-                raise modelset.ModelError(hfsource.NEEDS_BASE)
-            model = o.get('BASE_PACKS')
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
-        ms = modelset.resolve(model, o.get('MODEL_CACHE'), int(o.get('TP')),
-                              o.get('MODEL_DIR') or (release.tokenizer if release else None))
+            if o.get('BASE_PACKS'):
+                model = o.get('BASE_PACKS')
+            else:
+                o.values['V2_DENSE'] = release.dir
+                ms = modelset.release_set(release.dir, int(o.get('TP')), o.get('MODEL_DIR') or release.tokenizer,
+                                          str(release))
+        elif modelset.is_release(model):
+            experts = os.path.join(model, 'experts')
+            o.values['V2'] = o.get('V2') or (experts if os.path.isdir(experts) else model)
+            o.values['V2_SLICES'] = o.get('V2_SLICES') or os.path.join(model, 'index-slices')
+            o.values['V2_DENSE'] = model
+            ms = modelset.release_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        if ms is None:
+            ms = modelset.resolve(model, o.get('MODEL_CACHE'), int(o.get('TP')),
+                                  o.get('MODEL_DIR') or (release.tokenizer if release else None))
+            if release:
+                ms.source = f'{release}, base packs {ms.source}'
         ms.release = release
-        if release:
-            ms.source = f'{release}, base packs {ms.source}'
         ms.drafter = drafter_of(o, ms, refresh, log)
         search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
                               release.dir if release else None) if d and os.path.isdir(d)]

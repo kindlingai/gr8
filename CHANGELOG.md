@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-10-10: boot from the exlr8 release alone (#116, step 1, part 2)
+
+- `g6m4 --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR`, with no `--manifest` / `--pack`: the Rust loader
+  plans each rank's whole image from the release (`engine/loader-rs/src/release.rs`). The experts come from the width
+  files as `--v2` reads them. Every other tensor comes from `dense/`, copied as stored or computed at load (`Op::Gen`),
+  under the names a converted pack uses. No TR3 checkpoint, GPTQ codes or packs are needed. Rank 0 prints which form
+  each matrix took.
+- `--v2-dense-form trellis` (the default) keeps q_b, o_proj and the dense MLP of layers 0-2 as the release's trellis
+  entries for the dense trellis kernels, so every weight is the release's own: the MXFP8 matrices as stored, the int4
+  o_proj / q_b records from the release's codes, kv_b and the embedding in BF16. Only lm_head is rounded to MXFP8.
+  `--v2-dense-form rounded` is the fallback: it rounds those matrices to the MXFP8 and int4 forms of a converted pack.
+- Under `G6_PF_OWN=3` the image also holds the full-head q_b / o_proj / UK / UV, so TP=6 needs no QO pack.
+- The launcher: `--model` takes the release (https:// or a local copy) as the whole model, and `V2_DENSE` follows from
+  it. `--base-packs` stays optional. The set id of a release is its weight set id with the tokenizer files.
+- Non-expert weights per rank: TP=4 7.91 GB in the trellis form (11.21 rounded, about 11.6 from packs), TP=3 8.70
+  (13.10, 13.80), TP=6 7.13 (9.33). The prefill FP8 copies of the trellis matrices add 2.81 GB per rank at TP=4.
+- Checks: `tests/release_check.py` compares every planned non-expert tensor with an independent derivation
+  (`loader/exlr8.py`, `g6ref.py` records, `plan.py` ownership), byte for byte: TP=4 trellis on all four ranks (876
+  tensors, 11.85 GB), TP=4 rounded (302, 6.00 GB), TP=3 trellis on all three ranks (348, 8.30 GB), TP=6 rounded with the
+  full-head tensors (72, 2.64 GB). On one GB10, m4sim from the release (layers 0-3, all ranks agree) matches an fp32
+  PyTorch forward of the same weights (`engine/ref/release_forward.py`): per sublayer 1.2e-3 to 9.3e-3 rel L2 in the
+  trellis form, logits KL 1.5e-5 nats per position, where a BF16 copy of that forward gives 9.3e-5. TP=3 and TP=4
+  generate the same tokens. Prefill and decode-only runs generate the same tokens.
+
 ## 2026-10-10: the engine serves the dense trellis matrices (#116)
 
 - Decode: `bind::make_layer` binds q_b, o_proj and the dense MLP of layers 0-2 from the release's trellis tensors
