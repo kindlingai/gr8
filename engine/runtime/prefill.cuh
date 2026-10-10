@@ -1364,16 +1364,17 @@ template <class T> __global__ void k_pf_unperm(const T* src, T* dst, const int* 
 }
 inline void pf_finish_gather(Prefill& P, int M, cudaStream_t st)
 {
-    if (!P.rs) return;
+    if (!P.rs) { pf_mark(7, st); return; }
     pf_ag(P.f, P.stepp, 4, M, HID * 4, reinterpret_cast<char*>(P.resid), st);
-    if (!P.perm) return;     // G6_PF_OWNPERM: resid (hash, dump) and the final-norm x (MTP draft) back in input order
+    if (!P.perm) { pf_mark(7, st); return; }     // G6_PF_OWNPERM: resid (hash, dump) and the final-norm x (MTP draft) back in input order
     G6RT_CK(cudaMemcpyAsync(P.perm_tmp, P.resid, (size_t)M * HID * 4, cudaMemcpyDeviceToDevice, st));
     k_pf_unperm<<<M, 256, 0, st>>>(P.perm_tmp, P.resid, P.ord, HID);
     __half* xt = reinterpret_cast<__half*>(P.perm_tmp);
     G6RT_CK(cudaMemcpyAsync(xt, P.x, (size_t)M * HID * 2, cudaMemcpyDeviceToDevice, st));
     k_pf_unperm<<<M, 256, 0, st>>>(xt, P.x, P.ord, HID);
+    pf_mark(7, st);
 }
-inline void pf_finish(Prefill& P, int M, cudaStream_t st) { pf_finish_put(P, M, st); pf_finish_gather(P, M, st); }
+inline void pf_finish(Prefill& P, int M, cudaStream_t st) { pf_finish_put(P, M, st); pf_finish_gather(P, M, st); pf_mark(7, st); }
 // host: the proxy's jobs of one sub-batch (layer-steps ls0 .. ls0 + nl - 1) on a real fabric
 template <class Fab>
 inline void pf_enqueue(Fab& fab, const Prefill& P, u64 ls0, int nl, int M)
@@ -1455,7 +1456,9 @@ inline void cp_pf_post(Model&, int, int, int, int, int, cudaStream_t) {}
 #endif
 inline void pf_step(Model& m, Prefill& P, int M, int context, u64 ls0, cudaStream_t st)
 {
+    pf_prof().last = 0;
     pf_embed(m, P, M, st);
+    pf_mark(7, st);
     for (int i = 0; i < m.nl; ++i)
     {
         pf_set_step(P, ls0 + i, st);
@@ -1477,8 +1480,11 @@ inline void pf_step(Model& m, Prefill& P, int M, int context, u64 ls0, cudaStrea
 // B); the shared attention bindings see A's rows of a layer before B's.
 inline void pf_step2(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA, int ctxB, u64 lsA, u64 lsB, cudaStream_t st)
 {
+    pf_prof().last = 0;
     pf_embed(m, A, MA, st);
+    pf_mark(7, st);
     pf_embed(m, B, MB, st);
+    pf_mark(7, st);
     for (int i = 0; i < m.nl; ++i)
     {
         pf_set_step(A, lsA + i, st);
@@ -1544,12 +1550,15 @@ inline void pf_stagger(cudaStream_t st)
 inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA, int ctxB, u64 lsA, u64 lsB, cudaStream_t sa,
                       PfLanes& L)
 {
+    pf_prof().last = 0;
     cudaStream_t sb = L.sb;
     G6RT_CK(cudaEventRecord(L.fork, sa));
     G6RT_CK(cudaStreamWaitEvent(sb, L.fork, 0));
     pf_embed(m, A, MA, sa);
+    pf_mark(7, sa);
     pf_stagger(sb);
     pf_embed(m, B, MB, sb);
+    pf_mark(7, sb);
     for (int i = 0; i < m.nl; ++i)
     {
         if (i > 0) pf_ix(m, A, i - 1, MA, ctxA, sa, L.eb[i - 1]);      // G6_PF_OWN=2: layer i's IDs (layer-step i - 1)
