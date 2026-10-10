@@ -6,8 +6,11 @@
 #   ./gr8 glm53 up [OPTIONS] [@FILE]  start this box's supervisor and follow it until the cluster serves
 #        --tp 4|6|3 --peers A,B,C,D   the boxes' LAN addresses, the same list on every box, head first
 #        --mentat localhost           or: find the other boxes through the local mentat daemon (the default)
-#        --model DIR                  a prepared pack directory (every rank's manifests)
+#        --model URL|DIR              the release, https://huggingface.co/<org>/<repo>[@rev], or a prepared pack
+#                                     directory (every rank's manifests). A release also needs --base-packs DIR
+#                                     until the engine reads the release's dense files
 #        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
+#        --drafter URL                TP=4: the DFlash2 drafter's repo, fetched and converted on each box
 #        --cap 262144, --sess 4, ...  every knob in KNOBS.md, as --<knob> VALUE
 #   ./gr8 glm53 down                  stop every box of the last boot
 #   ./gr8 glm53 restart [OPTIONS]     down, then up
@@ -15,7 +18,7 @@
 #   ./gr8 glm53 logs [r|shim|front|supervisor] [-f]   a log from any box (default this box's engine)
 #   ./gr8 glm53 check [OPTIONS]       what would stop this box's boot
 #   ./gr8 glm53 show-config [OPTIONS] the effective options, the cluster options the boxes compare, the model set id
-#   ./gr8 glm53 prepare [RANK] [OPTIONS]   copy this box's shard into --model-cache without booting
+#   ./gr8 glm53 prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part without booting
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh for this TP (G6_NR=4 at TP=4) and scripts/build_front.sh

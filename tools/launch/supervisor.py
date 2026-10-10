@@ -22,6 +22,7 @@ import urllib.request
 
 import fabric
 import handshake
+import hfsource
 import mentat
 import modelset
 import options as opt
@@ -90,14 +91,36 @@ def version(home):
     return v
 
 
-def resolve_model(o):
+def resolve_model(o, refresh=False, log=log):
     """(model set, variant, error): the model set and its exlr8 v2 variant, either None with the reason in error. The
-    variant's manifest becomes V2_WIDTHS, which the engine arguments take."""
-    ms = variant = None
+    variant's manifest becomes V2_WIDTHS, which the engine arguments take. With an https:// --model the experts, index
+    slices and manifests come from the release (ms.release), and V2 and V2_SLICES point into the cache. refresh: ask
+    the hub what the revision is now (prepare), instead of the commit recorded at the last resolve."""
+    ms = variant = release = None
+    g6load = os.path.join(os.path.abspath(o.get('G6_HOME')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
+    if os.access(g6load, os.X_OK):
+        os.environ.setdefault('G6LOAD', g6load)
     try:
-        ms = modelset.resolve(o.get('MODEL'), o.get('MODEL_CACHE'), int(o.get('TP')), o.get('MODEL_DIR'))
-        search = [d for d in (o.get('MODEL'), os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None)
-                  if d and os.path.isdir(d)]
+        model = o.get('MODEL')
+        hf = hfsource.parse_url(model)
+        if hf:
+            if not o.get('MODEL_CACHE'):
+                raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
+                                          'there')
+            release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
+            release.fetch_meta()
+            if not o.get('BASE_PACKS'):      # TODO(#116): with the dense loader, the release alone is the model
+                raise modelset.ModelError(hfsource.NEEDS_BASE)
+            model = o.get('BASE_PACKS')
+            o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
+        ms = modelset.resolve(model, o.get('MODEL_CACHE'), int(o.get('TP')),
+                              o.get('MODEL_DIR') or (release.tokenizer if release else None))
+        ms.release = release
+        if release:
+            ms.source = f'{release}, base packs {ms.source}'
+        ms.drafter = drafter_of(o, ms, refresh, log)
+        search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
+                              release.dir if release else None) if d and os.path.isdir(d)]
         spec = o.get('VARIANT') or o.get('V2_WIDTHS')
         variant = modelset.resolve_variant(spec, o.get('V2'), search)
         if variant.path:
@@ -105,6 +128,29 @@ def resolve_model(o):
         return ms, variant, ''
     except modelset.ModelError as e:
         return ms, variant, f'model: {e}'
+
+
+def drafter_of(o, ms, refresh, log):
+    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter at all
+    (none in the model set either), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused."""
+    if o.get('TP') != '4':
+        return None
+    if o.get('DRAFTER'):
+        if not o.get('MODEL_CACHE'):
+            raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
+        if o.get('DFLASH') == '0':
+            return None
+        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log)
+        o.values['DFLASH_DIR'] = d.out
+        return d
+    if ms.set['dflash'] or o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
+        return None
+    hint = f'--drafter {hfsource.DRAFTER_URL} (CC BY-NC-ND 4.0: each box fetches and converts it)'
+    if o.get('DFLASH') == '1':
+        raise modelset.ModelError(f'--dflash 1, but there is no DFlash2 drafter: add {hint}')
+    log(f'no DFlash2 drafter: MTP only. For DFlash2, add {hint}')
+    o.values['DFLASH'] = '0'
+    return None
 
 
 def running_engines(proc='/proc'):
@@ -397,11 +443,20 @@ class Supervisor:
                 pass
             elif copy:
                 modelset.prepare(self.ms, self.rank, plan, log=log)
+                rel = self.ms.release
+                if rel and rel.check(int(o.get('TP')), self.rank, self.variant):
+                    rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
+                if self.ms.drafter and self.ms.drafter.check(self.rank):
+                    self.ms.drafter.fetch_rank(self.rank)
             if self.ms and self.rank is not None and not held:
                 fails += modelset.validate_rank(self.ms, self.rank, plan)
+                if self.ms.release:
+                    fails += self.ms.release.check(int(o.get('TP')), self.rank, self.variant)
+                if self.ms.drafter:
+                    fails += self.ms.drafter.check(self.rank)
             if self.ms:
                 fails += modelset.check_tokenizer(self.ms)
-        except (modelset.ModelError, OSError) as e:
+        except (modelset.ModelError, OSError, RuntimeError) as e:
             fails.append(f'model: {e}')
         p = read_pid(os.path.join(self.out, 'g6m4.pid'))
         if p and alive(p):

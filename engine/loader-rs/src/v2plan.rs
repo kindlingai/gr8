@@ -10,8 +10,8 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 
 const ALIGN: u64 = 4096;
-const HALF_PER_BIT: u64 = 98304;
-const NH: usize = 16;
+pub(crate) const HALF_PER_BIT: u64 = 98304;
+pub(crate) const NH: usize = 16;
 const SHARED: usize = 256;
 const XF_EXLR8: &str = "exlr8-e4m3";
 
@@ -54,14 +54,14 @@ impl V2Image {
 }
 
 /// One per-rank index slice file at one width (tools/convert/v2slices.py).
-struct Slice {
+pub(crate) struct Slice {
     f: File,
     base: u64,
     head: Json,
 }
 
 impl Slice {
-    fn open(path: &str) -> Result<Slice, String> {
+    pub(crate) fn open(path: &str) -> Result<Slice, String> {
         let f = File::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
         let mut n = [0u8; 8];
         f.read_exact_at(&mut n, 0).map_err(|e| format!("{path}: {e}"))?;
@@ -72,12 +72,12 @@ impl Slice {
         Ok(Slice { f, base: 8 + n, head })
     }
 
-    fn has(&self, name: &str) -> bool {
+    pub(crate) fn has(&self, name: &str) -> bool {
         self.head.get(name).is_some()
     }
 
     /// (raw bytes, shape) of a tensor.
-    fn get(&self, name: &str) -> Result<(Vec<u8>, Vec<usize>), String> {
+    pub(crate) fn get(&self, name: &str) -> Result<(Vec<u8>, Vec<usize>), String> {
         let t = self.head.get(name).ok_or_else(|| format!("index slice has no {name}"))?;
         let off = t.get("data_offsets").and_then(Json::arr).ok_or("bad data_offsets")?;
         let (a, b) = (off[0].int().unwrap_or(0) as u64, off[1].int().unwrap_or(0) as u64);
@@ -117,16 +117,16 @@ fn layer_slice(s: &Slice, l: usize) -> Result<Option<LayerSlice>, String> {
 }
 
 /// Widths of one layer from a width manifest: gate[e][h], up[e][h], down[e], and the shared expert's (down 0: none).
-struct Widths {
-    gate: Vec<[u8; NH]>,
-    up: Vec<[u8; NH]>,
-    down: Vec<u8>,
-    sgate: [u8; NH],
-    sup: [u8; NH],
-    sdown: u8,
+pub(crate) struct Widths {
+    pub(crate) gate: Vec<[u8; NH]>,
+    pub(crate) up: Vec<[u8; NH]>,
+    pub(crate) down: Vec<u8>,
+    pub(crate) sgate: [u8; NH],
+    pub(crate) sup: [u8; NH],
+    pub(crate) sdown: u8,
 }
 
-fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
+pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
     let Some(e) = m.get("layers").and_then(|x| x.get(&l.to_string())) else { return Ok(None) };
     let row16 = |v: &Json| -> Result<[u8; NH], String> {
         let a = v.arr().ok_or("width row is not a list")?;

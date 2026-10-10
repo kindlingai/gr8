@@ -56,8 +56,7 @@ class SetTests(unittest.TestCase):
 
     def test_refusals(self):
         for model, tp, want in ((self.src, 3, 'TP above 3'), (self.src, 6, 'lacks rank4.manifest.json'),
-                                ('https://huggingface.co/org/repo', 4, 'not in this version'),
-                                ('org/repo', 4, 'not in this version'), (None, 4, 'no model')):
+                                ('/no/such/org/repo', 4, 'no such directory'), (None, 4, 'no model')):
             with self.assertRaises(M.ModelError) as e:
                 M.resolve(model, None, tp)
             self.assertIn(want, str(e.exception))

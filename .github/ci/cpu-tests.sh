@@ -24,6 +24,9 @@ g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control
 g++ -std=c++20 -O1 -pthread -I engine/comms tools/health/test_progress_cpus.cpp -o "$T/test_progress_cpus"
 "$T/test_progress_cpus"    # needs 3 or more CPUs
 
+step "bin/g6load (the Hugging Face fetch's planner and checker, for the launch tests)"
+cargo build --release --locked --quiet --manifest-path engine/loader-rs/Cargo.toml
+
 step "Python tests"
 python3 -m unittest tools.convert.test_v2
 python3 -m unittest tools.convert.test_slim

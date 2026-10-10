@@ -64,6 +64,8 @@ jobs:
           mkdir -p dist/bin dist/bin6
           cp build-tp4/g6m4 build-tp4/m4sim build-tp4/gpuprobe build-tp4/tr3_e4m3_test build-front/g6front-rs dist/bin/
           cp build-tp6/g6m4 build-tp6/m4sim build-tp6/gpuprobe build-tp6/tr3_e4m3_test dist/bin6/
+          cp engine/loader-rs/target/release/g6load dist/bin/
+          cp engine/loader-rs/target/release/g6load dist/bin6/
       - name: Free disk space
         if: vars.GR8_NATIVE != '1'
         # the CUDA devel image is about 10 GB unpacked
@@ -156,7 +158,7 @@ jobs:
           docker image ls gr8:ci
           docker run --rm --entrypoint bash gr8:ci -c '
             set -eu
-            for b in bin/g6m4 bin/m4sim bin/gpuprobe bin/g6front-rs bin6/g6m4 bin6/m4sim; do
+            for b in bin/g6m4 bin/m4sim bin/gpuprobe bin/g6front-rs bin/g6load bin6/g6m4 bin6/m4sim; do
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
             done
             python3 -c "import g6s2shim, g6shim"

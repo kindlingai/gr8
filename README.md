@@ -47,11 +47,18 @@ On every box, with the boxes, the fabric and the packs ready ([What you need](#w
     git clone https://github.com/kindlingai/gr8 && cd gr8
     ./gr8 glm53 build                  # the engine for this TP and the Rust front end, into bin/ (or copy bin/)
     ./gr8 glm53 packs /data/tr3 /data/gptq/tp4 /data/packs /data/dflash2    # once, on one machine (step 3)
-    # this box's exlr8 expert halves into /data/exlr8 and the TP=4 index slices into /data/slices (step 3)
     ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
-        --model /data/packs --model-cache /opt/g6/cache --v2 /data/exlr8 --v2-slices /data/slices
+        --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/g6/cache \
+        --base-packs /data/packs --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
     ./gr8 glm53 status                 # every box, the front end, /health
     ./gr8 glm53 smoke                  # questions with answers that can be checked
+
+With `--model https://huggingface.co/...`, each box fetches only its own part of the exlr8 release into
+`--model-cache` (step 4): its expert halves for the variant, its index slices, the manifests, the dense and vocab
+files, and the tokenizer. Until the engine reads the release's dense files (#116), it still takes its non-expert
+weights from base packs (`--base-packs`, step 3). `--drafter` names the DFlash2 drafter's own repo. The drafter's licence
+forbids sharing a converted copy, so each box fetches the drafter and converts its rank. Without `--drafter`, TP=4 runs
+MTP only.
 
 Every box runs the same `up`. The first address in `--peers` is the head. The head runs the API. The boxes compare their
 options, model set and engine build before any engine starts, and all of them stop, naming the difference, if one box
@@ -78,6 +85,9 @@ packs only (`tools/convert/convert.py --nr 3` for the rest).
 - Non-interactive ssh from the head (rank 0) to every other box's LAN address, with each address already in the head's
   `known_hosts`. The shim writes each request into every rank's directory over ssh. That is the one ssh use left.
 - Python 3 on every box (the supervisor uses the standard library only), and the venv for the shim on the head.
+  The fetch from Hugging Face needs nothing more than `bin/g6load`, which `./gr8 glm53 build` builds with the engine
+  (engine/loader-rs): it plans each rank's ranges from the index slices and checks every half's xxhash64. Only
+  `--drafter` needs numpy, to convert the drafter.
 - Disk per box: the box's rank pack (about 90 GB at TP=4, 62 GB at TP=6), the drafter pack at TP=4 (0.86 GB) or
   the shared QO pack at TP=6 (13 GB), and the binary.
 - Disk for the pack build (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for
@@ -196,6 +206,35 @@ expert GB on the busiest rank under the variant's widths. Whether that fits next
 `--cap` for `up1`.
 
 ## 4. The model cache
+
+From Hugging Face. `--model https://huggingface.co/<org>/<repo>` (optionally `@<rev>` or `/tree/<rev>`; anything that
+does not start with `https://` is a local path) fetches into the cache:
+
+    DIR/hf/<org>--<repo>/refs/<rev>             the commit the revision resolved to
+    DIR/hf/<org>--<repo>/<commit>/manifests/, tokenizer/, experts/, index-slices/tp<N>/k<K>/rank<r>.safetensors,
+        dense/, complete/tp<N>.rank<r>.<variant>.json
+
+`experts/` holds this rank's expert halves for the variant at their file offsets (sparse files, about 75 GB at TP=4
+home), fetched with range GETs (`tools/tune/fetch_ranks.py`), with the ranges planned from this rank's index slices
+and every half checked against its xxhash64 by `bin/g6load`. Every whole file
+is checked against the release's `hashes/` before it is renamed into place. The dense and vocab files (about 11 GB) are
+fetched whole for now. A fetch resumes where it stopped, and the `complete/` marker is written last. `up` uses the
+commit recorded at the last resolve, so a boot works offline once the cache holds its part. `prepare` asks the hub
+again. The commit goes into the id the boxes compare, so boxes on different commits refuse to boot together. `HF_TOKEN`
+is sent only when it is set. The published repos are public.
+
+`--drafter https://huggingface.co/<org>/<repo>` (TP=4) fetches the DFlash2 drafter into `DIR/hf/<org>--<repo>/<commit>/`
+and converts this box's rank there with `tools/convert/dflash2.py`. The drafter we use is
+`https://huggingface.co/incoai/GLM-5.3-DFlash2` (CC BY-NC-ND 4.0, so no converted copy is shared). With DFlash2 on and no
+drafter, `up` runs MTP only and prints the flag to add, and `--dflash 1` without one is refused.
+
+    ./gr8 glm53 prepare --tp 4 --peers 10.0.0.1,... --model https://huggingface.co/... --model-cache /opt/g6/cache
+    ./gr8 glm53 prepare --tp 4 --rank 2 --model https://huggingface.co/... --model-cache /opt/g6/cache   # mentat
+
+fills the cache ahead of `up`, with a progress line every 30 s (GB done of the total, the rate). With `--peers` the box
+knows its rank. With mentat it does not until the election, so name it with `--rank`.
+
+From a pack directory.
 
 `--model-cache DIR` is a directory on this box's own disk. At boot, once a box knows its rank, it copies only its own
 files from `--model` into it: its rank pack and manifest, its drafter pack at TP=4, the QO pack where `PF_OWN=3`, and the

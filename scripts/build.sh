@@ -14,11 +14,14 @@ OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)
 K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \
 -DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
 -DG6_CP=1 -DG6_CP_PF_HASH2=1 -DDEC_IDX31=1 -DPF_QO_DEDUP=1"
-# the Rust pack loader (engine/loader-rs). Where cargo is missing (the CUDA image), build it on the host first:
-# cargo build --release --manifest-path engine/loader-rs/Cargo.toml (g6m4 links it when target/release/libg6load.a exists)
+# the Rust pack loader (engine/loader-rs), and bin/g6load, which plans and checks the Hugging Face fetch. Where cargo is
+# missing (the CUDA image), build it on the host first: cargo build --release --manifest-path engine/loader-rs/Cargo.toml
+# (g6m4 links target/release/libg6load.a when it exists, and target/release/g6load is copied next to g6m4)
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
 fi
+G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
+if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 S2_FLAG=""
 if [ "${G6_NR:-}" = 4 ]; then

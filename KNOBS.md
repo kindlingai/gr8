@@ -37,7 +37,7 @@ manifest instead.
 | `CAP` | 393216 | 614400 | 307200 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory |
 | `SESS` | 8 | – | – | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
 | `REUSE` | 1 | – | – | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
-| `DFLASH` | 1 | – | – | 1 = the DFlash2 drafter (needs `packs/dflash.r<r>.*` on every box); 0 = MTP only |
+| `DFLASH` | 1 with a drafter, else 0 | – | – | 1 = the DFlash2 drafter (`--drafter`, or `dflash.r<r>.*` in the model set); 0 = MTP only |
 | `DFLASH_SEL` | engine default (1) | – | – | 1 = the DFlash2 selector walk, 0 = the drafter's argmax |
 | `DFLASH_K` | engine default (7) | – | – | verify at most the first k of the 7 drafts |
 | `SPEC_ADAPT` | `DFLASH` | – | – | 1 = choose each round's draft count from step cost and acceptance |
@@ -74,7 +74,11 @@ manifest instead.
 | `GROUP` | `--group` | `gr8-glm53` | cluster | the mentat group the boxes join |
 | `HEAD` | `--head` | the lowest address | cluster | mentat mode: the head's LAN address |
 | `IPS`, `IPS2` | `--ips`, `--ips2` | discovered | cluster | each rank's rail-0 and rail-1 fabric address. Without them each box finds its own two RoCE v2 addresses |
-| `MODEL` | `--model` | none | box | a prepared pack directory with every rank's manifest. Without `MODEL_CACHE` the engine loads from it in place |
+| `MODEL` | `--model` | none | box | the exlr8 release, `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`), or a prepared pack directory with every rank's manifest. Without `MODEL_CACHE` the engine loads a pack directory in place |
+| `BASE_PACKS` | `--base-packs` | none | box | with an https:// `MODEL`: the prepared pack directory the non-expert weights come from, until the engine reads the release's dense files (#116) |
+| `DRAFTER` | `--drafter` | none | box | TP=4: the DFlash2 drafter's repo, `https://huggingface.co/incoai/GLM-5.3-DFlash2`. Each box fetches it and converts its rank into `MODEL_CACHE`. Its repo and commit go into the id the boxes compare |
+| `DFLASH_DIR` | `--dflash-dir` | none | box | a directory holding `dflash.r<r>.*`, when it is not the model set's |
+| `RANK` | `--rank` | none | run | `prepare`: the rank to fetch, when this box cannot tell (mentat mode) |
 | `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
 | `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |
 | `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `serve/`, `run/` |

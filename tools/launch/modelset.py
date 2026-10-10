@@ -44,12 +44,6 @@ def compute_id(setj):
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def is_remote(model):
-    """An https:// URL, or org/repo with no local path of that name. options.parse makes every local path absolute."""
-    return bool(re.match(r'https?://', model or '')) or bool(re.fullmatch(r'[\w.-]+/[\w.-]+(@[\w.-]+)?', model or '')
-                                                                 and not os.path.exists(model))
-
-
 def _pack(d, stem):
     """{'manifest': sha256, 'pack_bytes': n} for <stem>.manifest.json, or None when the directory has no such pack."""
     man = os.path.join(d, stem + '.manifest.json')
@@ -120,7 +114,7 @@ def needed(setj, rank, plan):
             raise ModelError(f'{why}, and the model set has no {stem}.manifest.json')
         out[f'{stem}.pack'] = ('pack', rec)
         out[f'{stem}.manifest.json'] = ('manifest', rec)
-    if tp == 4 and k.get('DFLASH') == '1':
+    if tp == 4 and k.get('DFLASH') == '1' and not plan.get('drafter_dir'):
         add(f'dflash.r{rank}', (setj['dflash'] or [None] * tp)[rank], 'DFLASH=1 loads the DFlash2 drafter (DFLASH=0 for MTP only)')
     if k.get('PF_OWN') == '3':
         add('qo', setj['qo'], 'PF_OWN=3 loads the QO pack')
@@ -142,7 +136,10 @@ def check_files(d, files):
 
 
 class ModelSet:
-    """A resolved model set: set.json, and where each rank's files and the tokenizer are on this box."""
+    """A resolved model set: set.json, and where each rank's files and the tokenizer are on this box. release: the
+    Hugging Face release the experts come from (hfsource.Release), and drafter the DFlash2 drafter fetched and converted
+    on this box (hfsource.Drafter), or None."""
+    release = drafter = None
 
     def __init__(self, setj, source, tok, rank_dir_fn, cache=None, src_dir=None):
         self.set, self.source, self.tokenizer = setj, source, tok
@@ -155,9 +152,6 @@ class ModelSet:
 
 def resolve(model, cache, tp, model_dir=None):
     """The model set for this boot. Nothing is copied here; prepare() does that once the rank is known."""
-    if model and is_remote(model):
-        raise ModelError(f'--model {model}: downloading from Hugging Face is not in this version. Download it, build the '
-                         'packs (./gr8 glm53 packs), and pass --model <the pack dir>')
     if model:
         if os.path.isfile(os.path.join(model, 'set.json')):
             setj = load_set(os.path.join(model, 'set.json'))
@@ -194,7 +188,7 @@ def resolve(model, cache, tp, model_dir=None):
 def offers(ms, plan):
     """The ranks this box's model set can serve: None for any (every rank's files are here, or a cache can copy them
     from --model), else the ranks whose files are here."""
-    if ms.cache and ms.src_dir:
+    if (ms.cache and ms.src_dir) or getattr(ms, 'release', None):
         return None
     tp = ms.set['tp']
     ok = [r for r in range(tp) if not validate_rank(ms, r, plan)]
@@ -245,10 +239,12 @@ def resolve_variant(spec, v2_dir, search):
 
 def model_id(ms, variant):
     """The id the boxes compare and the engine checks: the set id, joined with the variant's manifest when there is one,
-    so two variants of one set never share an id. The cache keeps the set id: the base packs are the same."""
-    if not variant.sha256:
+    and with the repo and commit of each Hugging Face source (ms.release, ms.drafter). Two variants or two commits of
+    one set never share an id. The cache keeps the set id: the base packs are the same."""
+    src = ''.join(f' {s.id}' for s in (ms.release, ms.drafter) if s)
+    if not variant.sha256 and not src:
         return ms.id
-    return hashlib.sha256(f'{ms.id} {variant.name} {variant.sha256}'.encode()).hexdigest()
+    return hashlib.sha256(f'{ms.id} {variant.name} {variant.sha256}{src}'.encode()).hexdigest()
 
 
 def expert_gb(path, tp):

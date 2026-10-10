@@ -9,7 +9,9 @@
     check [OPTIONS]            this box's checks
     show-config [OPTIONS]      the effective options, the cluster options the handshake compares, their digest, the
                                model set id
-    prepare [RANK] [OPTIONS]   copy this box's shard of the model set into --model-cache, without booting
+    prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part of the model, without booting: the
+                               shard of a pack directory, and with an https:// --model the release's files for
+                               this rank (it asks the hub for the revision's commit again)
 
 OPTIONS are --key value (or KEY=value lines in a config file, or KEY in the environment); options.py lists them.
 --foreground runs the supervisor in this process. Exit status: 0 serving (or done), 1 failed, 2 bad options, 4 the
@@ -273,6 +275,10 @@ def cmd_show_config(argv):
         print(f'model set none: {err}')
     else:
         print(f'model set {ms.id} ({ms.source})')
+        if ms.release:
+            print(f'release   {ms.release.repo.repo} at commit {ms.release.commit}, in {ms.release.dir}')
+        if ms.drafter:
+            print(f'drafter   {ms.drafter.repo.repo} at commit {ms.drafter.commit}, converted in {ms.drafter.out}')
         print(f'variant   {variant}')
         if variant.path:
             print(f'          about {modelset.expert_gb(variant.path, int(o.get("TP"))):.1f} GB of experts on the busiest '
@@ -314,7 +320,7 @@ def cmd_check(argv):
 
 def cmd_prepare(argv):
     o = parse(argv)
-    rank = next((int(a) for a in o.args if a.isdigit()), None)
+    rank = int(o.get('RANK')) if o.get('RANK') else next((int(a) for a in o.args if a.isdigit()), None)
     if rank is None:
         try:
             rank = local_rank(o)
@@ -322,19 +328,33 @@ def cmd_prepare(argv):
             print(f'gr8: {e}', file=sys.stderr)
             return 2
     if rank is None:
-        print('gr8: name the rank (./gr8 glm53 prepare 2 ...): with mentat it is decided at boot', file=sys.stderr)
+        print('gr8: name the rank (./gr8 glm53 prepare --rank 2 ...), or give --peers: with mentat it is decided at '
+              'boot', file=sys.stderr)
         return 2
     if not o.get('MODEL_CACHE'):
         print('gr8: prepare copies into --model-cache; there is none', file=sys.stderr)
         return 2
+    ms, variant, err = sv.resolve_model(o, refresh=True)
+    if err:
+        print(f'gr8: {err}', file=sys.stderr)
+        return 1
+    tp, plan = int(o.get('TP')), opt.engine_plan(o)
     try:
-        ms = modelset.resolve(o.get('MODEL'), o.get('MODEL_CACHE'), int(o.get('TP')), o.get('MODEL_DIR'))
-        modelset.prepare(ms, rank, opt.engine_plan(o), log=sv.log)
-        bad = modelset.validate_rank(ms, rank, opt.engine_plan(o))
-    except modelset.ModelError as e:
+        modelset.prepare(ms, rank, plan, log=sv.log)
+        bad = modelset.validate_rank(ms, rank, plan)
+        if ms.release:
+            if ms.release.check(tp, rank, variant):
+                ms.release.fetch_rank(tp, rank, variant)
+            bad += ms.release.check(tp, rank, variant)
+        if ms.drafter:
+            if ms.drafter.check(rank):
+                ms.drafter.fetch_rank(rank)
+            bad += ms.drafter.check(rank)
+    except (modelset.ModelError, OSError, RuntimeError) as e:
         print(f'gr8: {e}', file=sys.stderr)
         return 1
-    print('\n'.join(bad) or f'rank {rank} of set {ms.id[:16]} is ready in {ms.rank_dir(rank)}')
+    print('\n'.join(bad) or f'rank {rank} of model {modelset.model_id(ms, variant)[:16]} is ready '
+          f'({ms.source}, variant {variant.name})')
     return 1 if bad else 0
 
 

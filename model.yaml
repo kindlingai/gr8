@@ -6,7 +6,7 @@ name: glm-5.3
 checkpoints:
   experts: davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw          # routed experts (EXL3, 3.25 bpw) + BF16 non-expert weights + tokenizer files
   dense: adapt-ai-systems/glm-5.3-full-exl3-gptq-dense   # GPTQ int4 g32 dense decode codes, rank-specific: tp4/ or tp6/
-  drafter: TODO                 # the DFlash2 drafter (TP=4); the docs name no source, tools/convert/dflash2.py --src <dir>
+  drafter: incoai/GLM-5.3-DFlash2                         # DFlash2 (TP=4), CC BY-NC-ND 4.0: --drafter fetches and converts it per box
 
 description: >-
   Full GLM 5.3 (MoE with 256 routed experts, MLA attention with the sparse indexer, one MTP layer) on g6, a

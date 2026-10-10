@@ -15,10 +15,12 @@
 //! files at the offsets of the index slices (src/v2plan.rs). g6l_plan_load then loads it like a pack.
 
 pub mod exlr8;
-mod json;
+pub mod fetch;
+pub mod json;
 mod plan;
 mod sys;
 mod v2plan;
+pub mod xxh64;
 
 use plan::{Op, Plan};
 use std::ffi::{c_char, c_void, CStr};

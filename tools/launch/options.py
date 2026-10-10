@@ -31,7 +31,8 @@ KEYS = {
     'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
     'PORT': ('cluster', '8100', 'the OpenAI API port on the head'),
     'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
-    'MODEL': ('box', None, 'a prepared pack directory'),
+    'MODEL': ('box', None, 'a prepared pack directory, or the release: https://huggingface.co/<org>/<repo>[@rev]'),
+    'BASE_PACKS': ('box', None, 'with an https:// --model: the prepared pack directory for the non-expert weights'),
     'MODEL_CACHE': ('box', None, "this box's local directory for its shard of the model set"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, serve/, run/'),
@@ -40,6 +41,7 @@ KEYS = {
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT': ('box', None, 'front end: rs or py'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
+    'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
     'CHECK': ('run', '1', '0 = skip the local checks'),
@@ -64,6 +66,9 @@ KEYS = {
     'V2_SLICES': ('box', None, 'exlr8 v2 index slices'),
     'V2_WIDTHS': ('box', None, 'exlr8 v2 width manifest; --variant names one instead'),
     'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default), down1, up1, or a width manifest path'),
+    'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
+                             'converted on this box'),
+    'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
 }
 FLAGS = {'S2PORT': '--s2-port', 'G6_HOME': '--g6-home'}
 # Read from old config files and ignored here, so they do not draw a warning.
@@ -212,7 +217,8 @@ def parse(argv, environ=None):
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
-    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT'):
+    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT', 'BASE_PACKS',
+              'DFLASH_DIR'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or (k == 'VARIANT' and '/' not in values[k]
                                                                                and not values[k].endswith('.json')):
             continue
@@ -221,9 +227,8 @@ def parse(argv, environ=None):
 
 
 def looks_remote(model):
-    """A Hugging Face source: an https:// URL, or org/repo when no such local path exists."""
-    return bool(re.match(r'https?://', model)) or bool(re.fullmatch(r'[\w.-]+/[\w.-]+(@[\w.-]+)?', model)
-                                                     and not os.path.exists(model))
+    """A Hugging Face source is an https:// URL. Anything else is a local path."""
+    return model.startswith('https://')
 
 
 def mode(o):
@@ -244,6 +249,10 @@ def validate(o):
                           'them with --g6env-x "NAME=value ..." so every box compares them')
     if o.get('VARIANT') and o.get('V2_WIDTHS'):
         raise OptionError('--variant and --v2-widths both name the width manifest: give one')
+    if o.get('DRAFTER') and not o.get('DRAFTER').startswith('https://'):
+        raise OptionError(f'--drafter {o.get("DRAFTER")}: want https://huggingface.co/<org>/<repo>[@rev]')
+    if o.get('DRAFTER') and tp != '4':
+        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
     if o.get('V2') and not o.get('V2_SLICES'):
         raise OptionError('--v2 needs --v2-slices')
     if o.plain == '1':
@@ -298,7 +307,7 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
         if o.get(k) is not None:
             env[k] = o.get(k)
     if rank == '@R':   # the template: v2 paths are per box
-        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS'):
+        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR'):
             if env.get(k):
                 env[k] = '@' + k
     names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO', 'S2'])
@@ -319,6 +328,7 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
         elif kind == 'args':
             plan['args'] = rest.split()
     plan['s2'] = plan['knobs'].pop('S2') == '1'
+    plan['drafter_dir'] = o.get('DFLASH_DIR')
     return plan
 
 

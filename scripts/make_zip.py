@@ -41,12 +41,13 @@ def skipped_file(path):
 
 
 # Each binary has the same path under --bin and in the zip. stage.sh and the launchers read bin/ and bin6/.
-BINARIES = ['bin/g6m4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs',
-            'bin6/g6m4', 'bin6/m4sim', 'bin6/gpuprobe', 'bin6/tr3_e4m3_test']
+BINARIES = ['bin/g6m4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs', 'bin/g6load',
+            'bin6/g6m4', 'bin6/m4sim', 'bin6/gpuprobe', 'bin6/tr3_e4m3_test', 'bin6/g6load']
 
 HEADER = """gr8 {short} (commit {commit}, {date})
 
-bin/   the TP=4 engine with the multi-session path (G6_NR=4 scripts/build.sh), and the Rust front end g6front-rs
+bin/   the TP=4 engine with the multi-session path (G6_NR=4 scripts/build.sh), the Rust front end g6front-rs, and
+       g6load, which plans and checks the Hugging Face fetch (engine/loader-rs)
 bin6/  the TP=6 engine (scripts/build.sh)
 Built for GB10 (aarch64, CUDA 13, sm_121a). The binaries link cuBLAS 13 and libibverbs at run time: a node needs the
 CUDA 13 runtime libraries (DGX OS has them) and rdma-core. With the prebuilt bin/ and bin6/, skip the engine and front

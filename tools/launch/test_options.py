@@ -141,8 +141,11 @@ class PathTests(unittest.TestCase):
             self.assertEqual(o.get('MODEL'), os.path.join(os.path.realpath(d), 'glm', 'packs'))
             self.assertEqual(o.get('MODEL_CACHE'), os.path.join(os.path.realpath(d), 'cache'))
             self.assertEqual(o.get('G6_HOME'), os.path.realpath(d))
-            for remote in ('zai-org/GLM-5.3', 'https://huggingface.co/org/repo'):
-                self.assertEqual(opt.parse(['--no-config', '--model', remote], {}).get('MODEL'), remote)
+            remote = 'https://huggingface.co/org/repo@main'
+            self.assertEqual(opt.parse(['--no-config', '--model', remote], {}).get('MODEL'), remote)
+            # a bare org/repo is a local path, and only an https:// URL names a hub repo
+            self.assertEqual(opt.parse(['--no-config', '--model', 'zai-org/GLM-5.3'], {}).get('MODEL'),
+                             os.path.join(os.path.realpath(d), 'zai-org', 'GLM-5.3'))
         finally:
             os.chdir(here)
 

@@ -42,7 +42,8 @@ G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}
 engine_args() {
   local r=$1 rp=$2 ap=$3 home=$4 epoch=${5:-0} a src="" df="" qo=""
   [ -n "${V2:-}" ] && src="--v2 $V2 --v2-slices $V2_SLICES --v2-widths $V2_WIDTHS"
-  [ "${DFLASH:-0}" = 1 ] && df="--dflash-manifest $ap/dflash.r$r.manifest.json --dflash-pack $ap/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
+  local dd=${DFLASH_DIR:-$ap}   # the drafter packs: with the other packs, or where the supervisor converted them
+  [ "${DFLASH:-0}" = 1 ] && df="--dflash-manifest $dd/dflash.r$r.manifest.json --dflash-pack $dd/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
   [ "$PF_OWN" = 3 ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   case $TP in

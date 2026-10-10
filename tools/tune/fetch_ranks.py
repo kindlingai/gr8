@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """Fetch only the exlr8 v2 expert halves that some TP ranks own, into sparse files at the original offsets.
 
-The gr8 v2 reader (tools/convert/v2.py) preads each owned half at the absolute offset its index gives, so a file
-that holds only those byte ranges (plus the safetensors header) converts the same as the full file.
+The engine (engine/loader-rs/src/v2plan.rs) and the v2 reader (tools/convert/v2.py) read each owned half at the
+absolute offset the index gives, so a file that holds only those byte ranges (plus the safetensors header) loads the
+same as the full file.
 
-python3 fetch_ranks.py --gr8 GR8_DIR --out DIR --nr 6 --ranks 0,1,2 --widths MANIFEST.json|all|k2,k3 \
+python3 fetch_ranks.py --out DIR --nr 6 --ranks 0,1,2 --widths MANIFEST.json|all|k2,k3 \
         [--layers all|3-40,78] [--workers 16] [--verify] [--repo REPO] [--revision REV]
 
-- Index files, the manifests and the safetensors header of every width file are fetched whole.
-- Progress is kept in DIR/.fetch/<file>.json (done ranges); a rerun skips them. Layers whose files are not on the
-  hub yet are skipped and listed.
-- --verify checks the xxhash64 of every wanted half after its layer is fetched (the converter checks them again).
+- The manifests, this TP's index slices for the ranks (index-slices/tp<N>/k<K>/rank<r>.safetensors) and the
+  safetensors header of every width file are fetched whole. bin/g6load fetch-plan (engine/loader-rs) works out each
+  file's ranges from the slices, so neither numpy nor the layer index files are needed.
+- Progress is kept in DIR/.fetch/<file>.json (done ranges); a rerun skips them.
+- --verify checks the xxhash64 of every wanted half once all are fetched (bin/g6load verify), and fetches the bad ones
+  again once.
 - Each file's wanted ranges are allocated in offset order before the parallel fetch writes them, so a rank's halves
   sit on disk in file order. Written in arrival order they scatter, and a loader reading them in order gets about
   3.3 GB/s from a GB10 node's NVMe instead of about 4.1.
 - HF_TOKEN is sent when set (a private repo needs it); the published repo is public.
+
+fetch_layers() is the same fetch as a function: tools/launch (./gr8 glm53 up --model <hf url>) calls it.
 """
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -44,19 +51,21 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Hub:
     """Resolves a repo file to its CDN URL once (no token sent to the CDN) and refreshes it on 403."""
 
-    def __init__(self, repo, revision='main'):
-        self.repo, self.rev, self.tok = repo, revision, token()
+    def __init__(self, repo, revision='main', base=HUB):
+        self.repo, self.rev, self.tok, self.base = repo, revision, token(), base
         self.urls, self.lock = {}, threading.Lock()
         self.noredir = urllib.request.build_opener(NoRedirect)
+        self.entries = {}                   # path -> the tree entry (size, oid, lfs), filled by tree()
 
     def tree(self):
-        out, url = {}, f'{HUB}/api/models/{self.repo}/tree/{self.rev}?recursive=true'
+        out, url = {}, f'{self.base}/api/models/{self.repo}/tree/{self.rev}?recursive=true'
         while url:
             req = urllib.request.Request(url, headers=self.auth())
             with urllib.request.urlopen(req, timeout=60) as r:
                 for x in json.load(r):
                     if x['type'] == 'file':
                         out[x['path']] = x['size']
+                        self.entries[x['path']] = x
                 link = r.headers.get('Link', '')
             url = link.split(';')[0].strip('<> ') if 'rel="next"' in link else None
         return out
@@ -67,17 +76,17 @@ class Hub:
     def url(self, path, fresh=False):
         with self.lock:
             if fresh or path not in self.urls:
-                req = urllib.request.Request(f'{HUB}/{self.repo}/resolve/{self.rev}/{path}', method='HEAD',
+                req = urllib.request.Request(f'{self.base}/{self.repo}/resolve/{self.rev}/{path}', method='HEAD',
                                              headers=self.auth())
                 try:
                     self.noredir.open(req, timeout=60)
-                    loc = f'{HUB}/{self.repo}/resolve/{self.rev}/{path}'   # small non-LFS file: served directly (200)
+                    loc = f'{self.base}/{self.repo}/resolve/{self.rev}/{path}'   # small non-LFS file: served directly
                 except urllib.error.HTTPError as e:
                     if e.code not in (301, 302, 303, 307, 308):
                         raise
                     loc = e.headers['Location']
                     if loc.startswith('/'):
-                        loc = HUB + loc
+                        loc = self.base + loc
                 self.urls[path] = loc
             return self.urls[path]
 
@@ -87,7 +96,7 @@ class Hub:
             try:
                 u = self.url(path, fresh=attempt > 0)
                 h = {'Range': f'bytes={lo}-{lo + n - 1}'}
-                if u.startswith(HUB):
+                if u.startswith(self.base):
                     h.update(self.auth())                          # direct hub URL (non-LFS): the token, if any
                 req = urllib.request.Request(u, headers=h)
                 with urllib.request.urlopen(req, timeout=120) as r:
@@ -123,19 +132,24 @@ class Progress:
     def __init__(self, out, name):
         self.p = os.path.join(out, '.fetch', name + '.json')
         os.makedirs(os.path.dirname(self.p), exist_ok=True)
-        self.done = set(map(tuple, json.load(open(self.p)))) if os.path.exists(self.p) else set()
+        self.done = set()
+        if os.path.exists(self.p):
+            with open(self.p) as f:
+                self.done = set(map(tuple, json.load(f)))
         self.lock = threading.Lock()
 
     def add(self, r):
         with self.lock:
             self.done.add(tuple(r))
             tmp = self.p + '.tmp'
-            json.dump(sorted(self.done), open(tmp, 'w'))
+            with open(tmp, 'w') as f:
+                json.dump(sorted(self.done), f)
             os.replace(tmp, self.p)
 
 
-def fetch_ranges(hub, out, path, size, ranges, workers):
-    """Write the ranges of repo file `path` into the sparse local file of the same name. Returns bytes fetched."""
+def fetch_ranges(hub, out, path, size, ranges, workers, on_bytes=None):
+    """Write the ranges of repo file `path` into the sparse local file of the same name. Returns bytes fetched.
+    on_bytes(n) is called after each range lands."""
     local = os.path.join(out, os.path.basename(path))
     fd = os.open(local, os.O_RDWR | os.O_CREAT, 0o644)
     if os.fstat(fd).st_size != size:
@@ -150,6 +164,8 @@ def fetch_ranges(hub, out, path, size, ranges, workers):
         b = hub.get(path, r[0], r[1])
         os.pwrite(fd, b, r[0])
         prog.add(r)
+        if on_bytes:
+            on_bytes(len(b))
         return len(b)
 
     with ThreadPoolExecutor(workers) as ex:
@@ -158,6 +174,103 @@ def fetch_ranges(hub, out, path, size, ranges, workers):
     os.fsync(fd)
     os.close(fd)
     return got
+
+
+CHECKOUT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def g6load():
+    """bin/g6load (engine/loader-rs), which plans and checks the fetch: $G6LOAD, else the checkout's bin/, else cargo's
+    target/release/."""
+    for p in (os.environ.get('G6LOAD'), os.path.join(CHECKOUT, 'bin', 'g6load'),
+              os.path.join(CHECKOUT, 'engine', 'loader-rs', 'target', 'release', 'g6load')):
+        if p and os.access(p, os.X_OK):
+            return p
+    raise RuntimeError('no bin/g6load, which plans and checks the fetch: ./gr8 glm53 build, or cargo build --release '
+                       '--manifest-path engine/loader-rs/Cargo.toml')
+
+
+def g6load_run(cmd, slices, nr, rank, man=None, allk=None, layers=None, v2_dir=None):
+    """g6load's JSON for one rank: fetch-plan, or verify of the halves already in v2_dir."""
+    argv = [g6load(), cmd, '--slices', slices, '--tp', str(nr), '--rank', str(rank)]
+    argv += ['--manifest', man] if man else ['--widths', ','.join(map(str, allk))]
+    if layers:
+        argv += ['--layers', ','.join(map(str, layers))]
+    if v2_dir:
+        argv += ['--v2', v2_dir]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode not in (0, 3):
+        raise RuntimeError(f'g6load {cmd}: {r.stderr.strip() or r.returncode}')
+    return json.loads(r.stdout)
+
+
+def plan_files(hub, nr, ranks, slices, man=None, allk=None, layers=None):
+    """[(repo path, size, merged ranges)] of the width files ranks own: each file's safetensors header and the halves
+    g6load fetch-plan names (from the ranks' index slices, at the manifest's widths or every unit at allk)."""
+    tree = hub.tree()
+    where = {os.path.basename(p): p for p in tree}     # layer files live under experts/ on the hub
+    want = {}
+    for r in ranks:
+        for f in g6load_run('fetch-plan', slices, nr, r, man, allk, layers)['files']:
+            want.setdefault(f['name'], []).extend(tuple(x) for x in f['ranges'])
+    jobs = []
+    for name, rng in sorted(want.items()):
+        if name not in where:
+            raise RuntimeError(f'{name}: not in {hub.repo}@{hub.rev}')
+        hn = int.from_bytes(hub.get(where[name], 0, 8), 'little')
+        jobs.append((where[name], tree[where[name]], merge([(0, 8 + hn)] + rng)))
+    return jobs
+
+
+def todo_bytes(out, jobs):
+    """Bytes of the jobs' ranges that are not fetched yet."""
+    n = 0
+    for path, _, ranges in jobs:
+        done = Progress(out, os.path.basename(path)).done
+        n += sum(r[1] for r in ranges if tuple(r) not in done)
+    return n
+
+
+def forget(out, jobs, bad):
+    """Drop the journal entries of the ranges that hold a bad half, so the next fetch_ranges takes them again."""
+    for path, _, ranges in jobs:
+        name = os.path.basename(path)
+        hit = [b for b in bad if b['file'] == name]
+        if not hit:
+            continue
+        prog = Progress(out, name)
+        for r in ranges:
+            if any(r[0] < b['offset'] + b['nbytes'] and b['offset'] < r[0] + r[1] for b in hit):
+                prog.done.discard(tuple(r))
+        with open(prog.p, 'w') as f:
+            json.dump(sorted(prog.done), f)
+
+
+def fetch_layers(hub, out, nr, ranks, slices, man=None, allk=None, layers=None, workers=16, verify=False, log=print,
+                 on_bytes=None, plan_only=False):
+    """Fetch the expert halves `ranks` own (of nr) into out, as sparse files at their offsets. slices: the index slices
+    directory (tp<N>/k<K>/rank<r>.safetensors) for those ranks. man: a width manifest file, or allk: widths to fetch
+    every unit at. verify checks every half's xxhash64 (g6load verify), fetches the bad ones again once, and raises if
+    one is still bad. Returns the bytes fetched, or with plan_only the bytes still to fetch."""
+    jobs = plan_files(hub, nr, ranks, slices, man, allk, layers)
+    if plan_only:
+        return todo_bytes(out, jobs)
+    t0, total = time.time(), 0
+    for attempt in range(2):
+        for wp, size, rng in jobs:
+            total += fetch_ranges(hub, out, wp, size, rng, workers, on_bytes)
+        if not verify:
+            break
+        bad = [b for r in ranks for b in g6load_run('verify', slices, nr, r, man, allk, layers, v2_dir=out)['bad']]
+        if not bad:
+            log(f'verified the halves of rank{"s" if len(ranks) > 1 else ""} {",".join(map(str, sorted(ranks)))}')
+            break
+        if attempt:
+            raise RuntimeError(f'{len(bad)} halves still fail their xxhash64 after a second fetch, e.g. {bad[0]}')
+        log(f'{len(bad)} halves failed their xxhash64: fetching them again')
+        forget(out, jobs, bad)
+    log(f'DONE {total / 1e9:.1f} GB in {time.time() - t0:.0f} s')
+    return total
 
 
 def parse_layers(spec):
@@ -172,7 +285,6 @@ def parse_layers(spec):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--gr8', required=True, help='gr8 checkout on graft/65-v2-loader (for tools.convert.v2)')
     ap.add_argument('--out', required=True)
     ap.add_argument('--nr', type=int, default=6)
     ap.add_argument('--ranks', required=True)
@@ -183,86 +295,23 @@ def main():
     ap.add_argument('--repo', default=REPO)
     ap.add_argument('--revision', default='main', help='branch, tag (v0.2) or commit to fetch from')
     a = ap.parse_args()
-    sys.path.insert(0, a.gr8)
-    from tools.convert import v2  # noqa: E402
-
     ranks = {int(r) for r in a.ranks.split(',')}
     os.makedirs(a.out, exist_ok=True)
     hub = Hub(a.repo, a.revision)
     tree = hub.tree()
-    where = {os.path.basename(p): p for p in tree}     # layer files live under experts/ on the hub
-    for p, n in tree.items():                      # manifests: small, whole
-        if p.startswith('manifests/') and not os.path.exists(os.path.join(a.out, os.path.basename(p))):
-            open(os.path.join(a.out, os.path.basename(p)), 'wb').write(hub.get(p, 0, n))
-    man = None
-    if a.widths.endswith('.json'):
-        man = json.load(open(a.widths))
-        allk = None
-    else:
-        allk = [2, 3, 4] if a.widths == 'all' else [int(x.strip('k')) for x in a.widths.split(',')]
-
-    skipped, total, t0 = [], 0, time.time()
-    for l in parse_layers(a.layers):
-        ip = f'exlr8-layer-{l:03d}.index.safetensors'
-        if ip not in where:
-            skipped.append((l, 'no index file'))
-            continue
-        local_ip = os.path.join(a.out, ip)
-        if not os.path.exists(local_ip) or os.path.getsize(local_ip) != tree[where[ip]]:
-            open(local_ip + '.part', 'wb').write(hub.get(where[ip], 0, tree[where[ip]]))
-            os.replace(local_ip + '.part', local_ip)
-        L = v2.V2Layer(a.out, l, verify=False)
-        want = {}                                   # k -> list of (e, p, h)
-        for e in L.experts + ([v2.SHARED] if L.shared_widths else []):
-            if man is not None:
-                if e == v2.SHARED:
-                    s = man['layers'][str(l)].get('shared') or {}
-                    if not s:
-                        continue
-                    gw, uw, dw = s['gate'], s['up'], s['down']
-                else:
-                    m = man['layers'][str(l)]
-                    gw, uw, dw = m['gate'][e], m['up'][e], m['down'][e]
-            for h in range(v2.NH):
-                if v2.owner(e, h, l, a.nr) not in ranks:
-                    continue
-                for pi, p in enumerate(v2.PROJ):
-                    if man is not None:
-                        ks = [(gw[h] if p == 'gate' else uw[h] if p == 'up' else dw)]
-                    else:
-                        ks = allk
-                    for k in ks:
-                        if (e == v2.SHARED and k in L.shared_widths) or (e != v2.SHARED and k in L.widths):
-                            want.setdefault(k, []).append((e, p, h))
-        layer_bytes = 0
-        for k, units in sorted(want.items()):
-            wp = f'exlr8-layer-{l:03d}.k{k}.safetensors'
-            if wp not in where:
-                skipped.append((l, f'no k{k} file'))
-                continue
-            wp = where[wp]
-            hdr = hub.get(wp, 0, 8)
-            hn = int.from_bytes(hdr, 'little')
-            rng = [(0, 8 + hn)]
-            for e, p, h in units:
-                off, n = (int(x) for x in L._t(e, k, 'index')[v2.PROJ.index(p), h])
-                rng.append((off, n))
-            layer_bytes += fetch_ranges(hub, a.out, wp, tree[wp], merge(rng), a.workers)
-        if a.verify:
-            L2 = v2.V2Layer(a.out, l, verify=True)
-            for k, units in want.items():
-                for e, p, h in units:
-                    L2.half(e, p, h, k)
-            L2.close()
-        L.close()
-        total += layer_bytes
-        dt = time.time() - t0
-        print(f'L{l:03d}: {layer_bytes / 1e9:.2f} GB, widths {sorted(want)}, units '
-              f'{sum(len(u) for u in want.values())}{" verified" if a.verify else ""}; total {total / 1e9:.1f} GB '
-              f'{total / max(dt, 1e-9) / 1e6:.0f} MB/s', flush=True)
-    for l, why in skipped:
-        print(f'SKIPPED L{l:03d}: {why}', flush=True)
-    print(f'DONE {total / 1e9:.1f} GB in {time.time() - t0:.0f} s, {len(skipped)} skipped', flush=True)
+    for p, n in tree.items():                      # manifests and this TP's index slices for the ranks: whole
+        m = re.fullmatch(rf'index-slices/tp{a.nr}/k\d/rank(\d+)\.safetensors', p)
+        if p.startswith('manifests/') or (m and int(m.group(1)) in ranks):
+            local = os.path.join(a.out, p if m else os.path.basename(p))
+            if not os.path.exists(local) or os.path.getsize(local) != n:
+                os.makedirs(os.path.dirname(local), exist_ok=True)
+                with open(local, 'wb') as f:
+                    f.write(hub.get(p, 0, n))
+    man = a.widths if a.widths.endswith('.json') else None
+    allk = None if man else [2, 3, 4] if a.widths == 'all' else [int(x.strip('k')) for x in a.widths.split(',')]
+    fetch_layers(hub, a.out, a.nr, ranks, os.path.join(a.out, 'index-slices'), man=man, allk=allk,
+                 layers=None if a.layers == 'all' else parse_layers(a.layers), workers=a.workers, verify=a.verify,
+                 log=lambda m: print(m, flush=True))
 
 
 if __name__ == '__main__':

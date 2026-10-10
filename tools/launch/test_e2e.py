@@ -226,6 +226,43 @@ class EndToEnd(unittest.TestCase):
         st = self.gr8(1, 'status')
         self.assertEqual(st.stdout.count('variant up1'), TP, st.stdout)
 
+    def release(self):
+        """A fake hub serving a synthetic exlr8 release at two commits (test_hf.py)."""
+        import test_hf
+        if not test_hf.HAVE:
+            self.skipTest('needs numpy')
+        root = os.path.join(self.t, 'release')
+        test_hf.make_release(root)
+        hub = test_hf.FakeHub({test_hf.RELEASE: {test_hf.C1: root, test_hf.C2: root}},
+                              {test_hf.RELEASE: {'main': test_hf.C1, 'v0.4': test_hf.C2}})
+        self.addCleanup(hub.close)
+        env = {**self.env, 'GR8_HF_ENDPOINT': f'http://127.0.0.1:{hub.port}'}
+        return f'https://huggingface.co/{test_hf.RELEASE}', env, test_hf
+
+    def test_boot_from_a_release(self):
+        url, env, T = self.release()
+        res = self.up_all(extra={i: ['--model', url, '--base-packs', self.packs] for i in range(TP)}, env=env)
+        for i, (rc, out) in enumerate(res):
+            self.assertEqual(rc, 0, f'box {i}:\n{out}')
+        rel = os.path.join(self.homes[2], 'cache', 'hf', 'fakeorg--glm-exlr8', T.C1)
+        a = self.stub(2)['argv']
+        val = lambda f: a[a.index(f) + 1]   # noqa: E731
+        self.assertEqual((val('--v2'), val('--v2-slices'), val('--v2-widths')),
+                         (os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'),
+                          os.path.join(rel, 'manifests', 'exlr8-manifest-home.json')))
+        self.assertEqual(os.listdir(os.path.join(rel, 'index-slices', 'tp4', 'k3')), ['rank2.safetensors'])
+        self.assertEqual(len({self.stub(i)['argv'][self.stub(i)['argv'].index('--set-id') + 1] for i in range(TP)}), 1)
+        self.assertIn(f'{T.RELEASE}@{T.C1[:12]}', res[0][1])
+
+    def test_boxes_on_different_commits_refuse(self):
+        url, env, T = self.release()
+        res = self.up_all(extra={i: ['--model', url + ('@v0.4' if i == 2 else ''), '--base-packs', self.packs]
+                                 for i in range(TP)}, env=env)
+        for i, (rc, out) in enumerate(res):
+            self.assertEqual(rc, 4, f'box {i}:\n{out}')
+            self.assertIn('handshake refused: model set id', out)
+            self.assertIn(f'{T.RELEASE}@{T.C2[:12]}', out)
+
     def test_a_missing_shard_fails_the_handshake(self):
         os.unlink(os.path.join(self.packs, 'dflash.r3.pack'))
         res = self.up_all()
