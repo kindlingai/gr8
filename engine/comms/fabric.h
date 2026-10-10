@@ -29,6 +29,7 @@ struct FabricConfig {
   // of a peer's (identity placement)
   size_t bulk_bytes = 0;
   int bulk_flags = 0;
+  int xtrace = 0;                 // 1 = stage-0 trace records on this fabric when env G6_XTRACE=1 (xtrace.h); uniform layout only
 };
 
 // bulk mode kernel view (pinned host, device-mapped). flags[(f * nr + p) * 2 + {0, 1}] = {val, aux} written by peer p as
@@ -52,6 +53,7 @@ struct FabricDev {
   int rank, nr, ncoll;
   size_t stride;               // slot stride = round_up(slot_bytes + 8, 256); tail = u64 seq at [payload_bytes]
                                // (0 for a variable-layout fabric: use Fabric::vslot)
+  unsigned long long* xt = nullptr;   // G6_XTRACE stage-0 GPU records (device memory, xtrace.h); null = off (default)
 };
 
 // seq for collective c of step s (unique, never 0)
@@ -107,6 +109,8 @@ class Fabric {
   bool wait_proxy_idle(double stall_s = 180.0);
   // host-side barrier over TCP (slow; setup/teardown only)
   void barrier();
+  // G6_XTRACE: write the GPU + proxy records and the per-QP WC error counters (stop_proxy calls it; once per fabric)
+  void xtrace_dump(const char* why);
 
   struct Impl;
  private:

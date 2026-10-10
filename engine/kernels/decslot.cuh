@@ -4,6 +4,7 @@
 // cell at run time, so one captured graph serves both slot parities. Only included under -DDEC_SLOT.
 #pragma once
 #include "common.cuh"
+#include "../comms/xtrace.h"
 
 namespace dslot
 {
@@ -16,6 +17,7 @@ struct Slot
     size_t stride = 0;
     int ncoll = 0, c = 0;
     unsigned* ticket = nullptr;           // device, zero; one per collective
+    unsigned long long* xt = nullptr;     // FabricDev::xt (G6_XTRACE records, xtrace.h); nullptr = off (default)
 };
 
 __device__ __forceinline__ char* ptr(const Slot& s)
@@ -34,10 +36,15 @@ __device__ __forceinline__ void publish(const Slot& s, bool stored)
         const unsigned n = gridDim.x * gridDim.y * gridDim.z;
         if (atomicAdd(s.ticket, 1u) == n - 1)
         {
+            const u64 step = *s.stepp;
+            // G6_XTRACE: same stamps as glue::publish ([PUB] before the fence, [DB] + [SEQ] after the doorbell store)
+            u64* xr = s.xt ? reinterpret_cast<u64*>(s.xt) + ((size_t)(step % g6::XT_STEPS) * s.ncoll + s.c) * g6::XT_W : nullptr;
+            if (xr) { u64 t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); xr[g6::XT_PUB] = t; }
             *s.ticket = 0;
             __threadfence_system();
-            const u64 seq = *s.stepp * (u64)s.ncoll + s.c + 1;      // g6::coll_seq
+            const u64 seq = step * (u64)s.ncoll + s.c + 1;          // g6::coll_seq
             asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(s.bell + s.c), "l"(seq) : "memory");
+            if (xr) { u64 t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); xr[g6::XT_DB] = t; xr[g6::XT_SEQ] = seq; }
         }
     }
 }

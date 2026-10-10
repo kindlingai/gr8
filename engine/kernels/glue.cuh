@@ -16,6 +16,7 @@
 #include "k1args.cuh"
 #include "topk.cuh"
 #include "../comms/fabric.h"
+#include "../comms/xtrace.h"
 
 #ifndef G6_SPIN_TIMEOUT_CYC
 #define G6_SPIN_TIMEOUT_CYC 20000000000LL   // ~10 s at GB10 clocks; tests override
@@ -59,6 +60,18 @@ __device__ __forceinline__ const char* peer_slot(const g6::FabricDev& f, u64 ste
                        : f.recv + (((size_t)(step & 1) * f.ncoll + c) * f.nr + p) * f.stride;
 }
 
+// G6_XTRACE (xtrace.h): globaltimer stamps into f.xt (device memory). f.xt == null (default) = no stamp.
+__device__ __forceinline__ u64 xt_now()
+{
+    u64 t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ u64* xt_rec(const g6::FabricDev& f, u64 step, int c)
+{
+    return (u64*)f.xt + ((size_t)(step % g6::XT_STEPS) * f.ncoll + c) * g6::XT_W;
+}
+
 // All threads of every CTA call this after the CTA's last store into the send slot. The last CTA to arrive
 // rings doorbell[c] = seq (release, system scope); the proxy then posts the RDMA writes. ticket: device int, 0.
 __device__ __forceinline__ void publish(const g6::FabricDev& f, int c, u64 seq, unsigned* ticket)
@@ -70,9 +83,12 @@ __device__ __forceinline__ void publish(const g6::FabricDev& f, int c, u64 seq, 
         const unsigned n = gridDim.x * gridDim.y * gridDim.z;
         if (atomicAdd(ticket, 1u) == n - 1)
         {
+            u64* xr = f.xt ? xt_rec(f, (seq - 1) / f.ncoll, c) : nullptr;
+            if (xr) xr[g6::XT_PUB] = xt_now();
             *ticket = 0;
             __threadfence_system();
             st_release_sys(reinterpret_cast<u64*>(f.doorbell) + c, seq);
+            if (xr) { xr[g6::XT_DB] = xt_now(); xr[g6::XT_SEQ] = seq; }
         }
     }
 }
@@ -91,9 +107,12 @@ __device__ __forceinline__ void publish_cluster(const g6::FabricDev& f, int c, u
         const unsigned n = gridDim.x * gridDim.y * gridDim.z / cg::this_cluster().num_blocks();
         if (atomicAdd(ticket, 1u) == n - 1)
         {
+            u64* xr = f.xt ? xt_rec(f, (seq - 1) / f.ncoll, c) : nullptr;
+            if (xr) xr[g6::XT_PUB] = xt_now();
             *ticket = 0;
             __threadfence_system();
             st_release_sys(reinterpret_cast<u64*>(f.doorbell) + c, seq);
+            if (xr) { xr[g6::XT_DB] = xt_now(); xr[g6::XT_SEQ] = seq; }
         }
     }
 }
@@ -119,6 +138,7 @@ __device__ __forceinline__ void wait_peers(const g6::FabricDev& f, u64 step, int
                 break;
             }
         }
+        if (f.xt && p < 8) xt_rec(f, step, c)[g6::XT_TAIL + p] = xt_now();
     }
     __syncthreads();
 }
@@ -322,6 +342,8 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
 #else
     cluster_rms_store(x, a.w, a.eps, a.out + (size_t)m * HID, col0);
 #endif
+    if (a.f.xt && threadIdx.x == 0)
+        atomicMax(reinterpret_cast<unsigned long long*>(xt_rec(a.f, step, a.c) + g6::XT_RED), (unsigned long long)xt_now());
 }
 
 // ---------------------------------------------------------------- small-width RMSNorm (q_a 2048, kv latent 512)

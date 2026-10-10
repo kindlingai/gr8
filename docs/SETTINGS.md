@@ -70,6 +70,9 @@ the short version.
 | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
 | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
 | `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (the cores of the proxies this rank started, see `--proxy-cpu`) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
+| `G6_XTRACE` | 0 | 1 = transport trace (measurement only): GPU globaltimer stamps per collective (publish, doorbell, each peer's tail, reduce end), proxy tick stamps per rail, per-QP WC retry/RNR counters. Dumped outside the timed loop, at proxy stop or when `G6_XTRACE_QUIT` appears. `tools/xtrace_driver.sh` wraps a run and samples the NIC counters per rail |
+| `G6_XTRACE_OUT` | /tmp | directory for the dumps, `g6xtrace.r<rank>.f<n>.txt` |
+| `G6_XTRACE_QUIT` | unset | path of a file; when it appears, each fabric dumps once |
 | `G6_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
 | `G6_DTR` | 1 | the dense trellis matrices of the exlr8 release form (q_b, o_proj, the dense MLP of layers 0-2; `engine/kernels/dtr.cuh`) where a layer has them: decode on the trellis tiles, prefill on the o_proj tiles and on exact FP8 copies of q_b and the dense MLP (made at load). 0 = the int4 / MXFP8 records, which the layer must then have (A/B) |
 | `G6_DTR_PF_COPY` | 0 | 1 = o_proj prefill on an FP8 copy of its tiles too, as q_b and the MLP (about 25 MB more per layer at TP4; A/B, same bits) |

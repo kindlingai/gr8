@@ -2,6 +2,7 @@
 #include "fabric.h"
 #include "bulk_proxy.h"
 #include "progress_cpus.h"
+#include "xtrace.h"
 
 #include <cuda_runtime.h>
 #include <infiniband/verbs.h>
@@ -26,6 +27,9 @@
 #include <fstream>
 #include <mutex>
 #include <thread>
+#if !defined(__aarch64__)
+#include <x86intrin.h>
+#endif
 
 namespace g6 {
 
@@ -101,6 +105,22 @@ std::vector<char> allgather(int rank, int nr, const std::string& ip0, int port, 
   return all;
 }
 
+// G6_XTRACE proxy clock: CNTVCT_EL0 on ARM (GB10), rdtsc elsewhere; read only when the trace is on
+inline uint64_t xt_tick() {
+#if defined(__aarch64__)
+  uint64_t v; asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v) :: "memory"); return v;
+#else
+  return __rdtsc();
+#endif
+}
+inline uint64_t xt_freq() {
+#if defined(__aarch64__)
+  uint64_t v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v;
+#else
+  return 0;   // unknown: ticks only
+#endif
+}
+
 struct QPInfo { uint32_t qpn, psn, rkey; uint64_t addr; uint8_t gid[16]; };
 struct Rail { DevInfo di; ibv_context* ctx = nullptr; ibv_pd* pd = nullptr; ibv_cq* cq = nullptr; ibv_mr* mr = nullptr; ibv_gid gid{}; };
 struct Job { unsigned long long step; std::vector<uint32_t> sizes; unsigned rs_mask = 0; size_t rs_ss = 0; std::vector<uint32_t> rs_bytes; unsigned skip = 0;
@@ -126,6 +146,17 @@ struct Fabric::Impl {
   std::atomic<int> proxy_tid{0};                     // thread id of the running proxy, registered with progress_cpus.h (0 = none)
   std::atomic<bool> proxy_started{false};            // the proxy thread has pinned itself and registered its tid
   int rail_of(int p, int me) const { return nrails == 1 ? 0 : (p + me) % 2; }
+  // G6_XTRACE (xtrace.h). xenv: env on (WC error counters dumped for every fabric); xt: proxy stamps on this fabric
+  bool xenv = false, xt = false, xdumped = false;
+  unsigned long long* xgpu = nullptr;                // device records (dev_.xt), cudaMalloc'd
+  std::vector<uint64_t> xp;                          // [XT_STEPS][ncoll][2 rails][4]: db seen, tail stored, first, last post
+  std::vector<unsigned long long> xpseq;             // [XT_STEPS][ncoll] seq of the proxy record
+  unsigned long long xwc[2][8][3] = {};              // [rail][peer][retry-exceeded, rnr-exceeded, other bad status]
+  std::thread xquit;                                 // G6_XTRACE_QUIT watcher
+  void wc_count(int r, int peer, int st) {
+    if (peer < 0 || peer >= 8 || r < 0 || r > 1) return;
+    xwc[r][peer][st == IBV_WC_RETRY_EXC_ERR ? 0 : st == IBV_WC_RNR_RETRY_EXC_ERR ? 1 : 2]++;
+  }
 };
 
 Fabric::~Fabric() { stop_proxy(); }
@@ -179,7 +210,14 @@ void Fabric::init(const FabricConfig& cfg) {
   dev_.doorbell = (unsigned long long*)(I.region + send_bytes + recv_bytes);
   dev_.error = (unsigned int*)(I.region + send_bytes + recv_bytes + db_bytes);
   dev_.rank = cfg.rank; dev_.nr = nr; dev_.ncoll = cfg_.ncoll; dev_.stride = stride;
+  if (cfg.xtrace && !I.var && xtrace_env()) {        // stage-0 trace (default off)
+    I.xgpu = xt_alloc(cfg_.ncoll); dev_.xt = I.xgpu;
+    I.xt = I.xgpu != nullptr;
+    I.xp.assign((size_t)XT_STEPS * cfg_.ncoll * 2 * 4, 0); I.xpseq.assign((size_t)XT_STEPS * cfg_.ncoll, 0);
+    fprintf(stderr, "[fabric r%d] G6_XTRACE on: %d steps x %d collectives, GPU %s\n", cfg.rank, XT_STEPS, cfg_.ncoll, I.xt ? "ok" : "FAILED");
   }
+  }
+  I.xenv = xtrace_env();
 
   for (int r = 0; r < I.nrails; r++) {
     Rail& R = I.rails[r];
@@ -301,7 +339,7 @@ void Fabric::start_proxy() {
       ibv_wc wc[32]; const int n = ibv_poll_cq(I.rails[r].cq, max < 32 ? max : 32, wc);
       for (int i = 0; i < n; i++) {
         out[i] = BulkCompl{wc[i].wr_id, wc[i].status == IBV_WC_SUCCESS};
-        if (wc[i].status != IBV_WC_SUCCESS) fprintf(stderr, "[fabric r%d] bulk WC error %s (peer %d)\n", me, ibv_wc_status_str(wc[i].status), (int)wc[i].wr_id);
+        if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r, (int)wc[i].wr_id, wc[i].status); fprintf(stderr, "[fabric r%d] bulk WC error %s (peer %d)\n", me, ibv_wc_status_str(wc[i].status), (int)wc[i].wr_id); }
       }
       return n;
     };
@@ -397,6 +435,12 @@ void Fabric::start_proxy() {
           }
         }
         std::atomic_thread_fence(std::memory_order_acquire);
+        uint64_t* xr = nullptr;                         // G6_XTRACE proxy record of (step, c): [rail][4]
+        if (I.xt) {
+          const size_t k = (size_t)(job.step % XT_STEPS) * cfg_.ncoll + c;
+          xr = &I.xp[k * 8]; for (int z = 0; z < 8; z++) xr[z] = 0;
+          xr[0] = xr[4] = xt_tick(); I.xpseq[k] = seq;
+        }
         if (I.var) {  // variable layout: own slot, all peers (compact slots) or one destination
           const VLayout& L = I.L;
           const uint32_t bytes = job.sizes[c];
@@ -419,6 +463,7 @@ void Fabric::start_proxy() {
         const uint32_t bytes = job.sizes[c];
         char* src = dev_.send + ((size_t)par * cfg_.ncoll + c) * dev_.stride;
         if (!rs) *(volatile unsigned long long*)(src + bytes) = seq;  // tail travels with the payload in one write
+        if (xr) xr[1] = xr[5] = xt_tick();
         for (int p = 0; p < nr; p++) {
           if (p == me || (rs && bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
           Rail& R = I.rails[I.rail_of(p, me)];
@@ -431,19 +476,31 @@ void Fabric::start_proxy() {
           wr.wr.rdma.rkey = I.peer[p].rkey;
           bool sig = ++I.unsignaled[p] >= 256; if (sig) I.unsignaled[p] = 0;
           wr.send_flags = sig ? IBV_SEND_SIGNALED : 0;
+          wr.wr_id = (uint64_t)p;                       // peer, for the per-QP WC error counters
+          const int xrl = I.rail_of(p, me);
+          if (xr && !xr[xrl * 4 + 2]) xr[xrl * 4 + 2] = xt_tick();
           FCHECK(ibv_post_send(I.qp[p], &wr, &bad) == 0);
+          if (xr) xr[xrl * 4 + 3] = xt_tick();
         }
         }
         for (int r = 0; r < I.nrails; r++) {
           ibv_wc wc[32]; int n;
           while ((n = ibv_poll_cq(I.rails[r].cq, 32, wc)) > 0)
-            for (int i = 0; i < n; i++) if (wc[i].status != IBV_WC_SUCCESS) { fprintf(stderr, "[fabric r%d] WC error %s\n", me, ibv_wc_status_str(wc[i].status)); *dev_.error = 0x71000000u; return; }
+            for (int i = 0; i < n; i++) if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r, (int)wc[i].wr_id, wc[i].status); fprintf(stderr, "[fabric r%d] WC error %s\n", me, ibv_wc_status_str(wc[i].status)); *dev_.error = 0x71000000u; return; }
           if (n < 0) { fprintf(stderr, "[fabric r%d] ibv_poll_cq failed (%d)\n", me, n); *dev_.error = kBulkCqError; return; }   // fail closed, as the bulk path
         }
       }
       I.pending.fetch_sub(1, std::memory_order_release);
     }
   });
+  if (I.xt && getenv("G6_XTRACE_QUIT") && !I.xquit.joinable())   // dump once when the quit file appears (outside the timed loop)
+    I.xquit = std::thread([this]() {
+      const std::string qf = getenv("G6_XTRACE_QUIT");
+      while (!impl_->stop.load()) {
+        if (access(qf.c_str(), F_OK) == 0) { xtrace_dump("quit-file"); return; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    });
   // the isolation needs the proxy's tid: wait until the thread has pinned itself and registered
   for (int i = 0; i < 5000 && !I.proxy_started.load(std::memory_order_acquire); i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   if (!I.proxy_started.load(std::memory_order_acquire)) fprintf(stderr, "[fabric r%d] WARNING: proxy thread did not start within 5 s\n", cfg_.rank);
@@ -453,7 +510,51 @@ void Fabric::stop_proxy() {
   if (!impl_) return;
   impl_->stop = true; impl_->cv.notify_all();
   if (impl_->th.joinable()) impl_->th.join();
+  if (impl_->xquit.joinable()) impl_->xquit.join();
+  if (impl_->xenv) xtrace_dump("stop");
   if (impl_->pinned_cpu >= 0) { progress_cpu_remove(impl_->pinned_cpu); impl_->pinned_cpu = -1; }
+}
+
+// G6_XTRACE dump: $G6_XTRACE_OUT (default /tmp) / g6xtrace.r<rank>.f<n>.txt, n = fabric instance number on this rank.
+// Lines: "# header", "G ..." (xtrace.h), "P step c rail dbseen tailst first last | tail-db first-db last-db (ns)",
+// "W rail peer retry_exc rnr_exc other" (nonzero rows only; a WC error stops the proxy, so expect 0 or 1 per run).
+void Fabric::xtrace_dump(const char* why) {
+  static std::atomic<int> inst{0};
+  static std::mutex dmu;
+  std::lock_guard<std::mutex> lk(dmu);
+  Impl& I = *impl_;
+  if (!I.xenv || I.xdumped) return;
+  I.xdumped = true;
+  unsigned long long nw = 0;
+  for (auto& a : I.xwc) for (auto& b : a) for (auto v : b) nw += v;
+  if (!I.xt && !nw) return;                          // fabrics without stamps write a file only when a QP error was counted
+  const char* d = getenv("G6_XTRACE_OUT");
+  char path[512]; snprintf(path, sizeof path, "%s/g6xtrace.r%d.f%d.txt", d ? d : "/tmp", cfg_.rank, inst++);
+  FILE* o = fopen(path, "w");
+  if (!o) { fprintf(stderr, "[fabric r%d] G6_XTRACE: cannot open %s\n", cfg_.rank, path); return; }
+  const uint64_t fq = xt_freq();
+  fprintf(o, "# g6xtrace v1 why=%s rank=%d nr=%d ncoll=%d nrails=%d bulk=%d steps=%d cntfrq=%llu stamps=%d\n", why, cfg_.rank, I.nr,
+          cfg_.ncoll, I.nrails, (int)I.bulk, XT_STEPS, (unsigned long long)fq, (int)I.xt);
+  fprintf(o, "# W rail peer retry_exc rnr_exc other\n");
+  for (int r = 0; r < 2; r++) for (int p = 0; p < 8; p++)
+    if (I.xwc[r][p][0] | I.xwc[r][p][1] | I.xwc[r][p][2]) fprintf(o, "W %d %d %llu %llu %llu\n", r, p, I.xwc[r][p][0], I.xwc[r][p][1], I.xwc[r][p][2]);
+  if (I.xt) {
+    auto ns = [&](uint64_t a, uint64_t b) -> long long { return (a && b && fq) ? (long long)((double)(int64_t)(a - b) * 1e9 / (double)fq) : 0LL; };
+    fprintf(o, "# P step c rail dbseen tailst first last | tail-db first-db last-db (ns; raw = proxy ticks)\n");
+    for (size_t k = 0; k < I.xpseq.size(); k++) {
+      if (!I.xpseq[k]) continue;
+      const unsigned long long step = (I.xpseq[k] - 1) / cfg_.ncoll; const int c = (int)((I.xpseq[k] - 1) % cfg_.ncoll);
+      for (int r = 0; r < I.nrails; r++) {
+        const uint64_t* x = &I.xp[k * 8 + r * 4];
+        if (!x[2]) continue;                         // no post on this rail
+        fprintf(o, "P %llu %d %d %llu %llu %llu %llu | %lld %lld %lld\n", step, c, r, (unsigned long long)x[0], (unsigned long long)x[1],
+                (unsigned long long)x[2], (unsigned long long)x[3], ns(x[1], x[0]), ns(x[2], x[0]), ns(x[3], x[0]));
+      }
+    }
+    xt_dump_gpu(o, I.xgpu, cfg_.ncoll, I.nr, cfg_.rank);
+  }
+  fclose(o);
+  fprintf(stderr, "[fabric r%d] G6_XTRACE dump (%s) -> %s\n", cfg_.rank, why, path);
 }
 
 }  // namespace g6

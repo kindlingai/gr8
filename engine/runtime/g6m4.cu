@@ -284,7 +284,9 @@ int main(int argc, char** argv)
     g6::Fabric fab;
     boot_rank = cfg.rank;
     boot("start");
+    cfg.xtrace = 1;                     // G6_XTRACE=1: stage-0 trace on the decode fabric only (xtrace.h); off by default
     fab.init(cfg);
+    cfg.xtrace = 0;
     const g6::FabricDev f = fab.dev();
     fab.start_proxy();
     g6::Fabric fabp;                    // prefill region

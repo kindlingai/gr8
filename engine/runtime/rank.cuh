@@ -643,7 +643,7 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
         auto slot = [&](int c) {
             dslot::Slot q;
             q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.stride = m.f.stride;
-            q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c;
+            q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c; q.xt = m.f.xt;
             return q;
         };
         bind::set_slots(y.L[M], slot(2 * i), slot(2 * i + 1));

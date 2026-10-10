@@ -326,6 +326,7 @@ int main(int argc, char** argv)
         return rfinds[r];
     };
     Loop loop{}, loop_pf{};
+    unsigned long long* xt_dev[NR] = {};   // G6_XTRACE GPU records per simulated rank (null = off)
     std::vector<Prefill> PF(NR), PF2(NR);                // PF2: the second lane (--pf-lanes 2), its own loopback region
     const bool pf_rs = getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) == 1;     // reduce-scatter form (prefill.cuh)
     const int pf_own = getenv("G6_PF_OWN") ? atoi(getenv("G6_PF_OWN")) : 0;   // 1: row-owner projections, 2: + index (prefill.cuh)
@@ -407,6 +408,8 @@ int main(int argc, char** argv)
         f.send = dmalloc<char>(2 * (size_t)NC * stride);
         f.recv = recv; f.doorbell = doorbell; f.error = err;
         f.rank = r; f.nr = NR; f.ncoll = NC; f.stride = stride;
+        f.xt = g6::xt_alloc(NC);        // G6_XTRACE=1: stage-0 GPU stamps on the decode fabric (xtrace.h); null = off
+        xt_dev[r] = f.xt;
         R[r].wide = wide;
 #if defined(G6_CP) && G6_CP
         R[r].cp.on = cp_on; R[r].cp.R = cp_R; R[r].cp.s3 = cp_s3; R[r].cp.colls = cp_colls;
@@ -427,6 +430,7 @@ int main(int argc, char** argv)
         if (MP)
         {
             g6::FabricDev fp = f;
+            fp.xt = nullptr;
             fp.send = dmalloc<char>(2 * (size_t)NCP * stride_pf);
             fp.recv = recv_pf; fp.doorbell = doorbell_pf; fp.ncoll = NCP; fp.stride = stride_pf;
             PF[r].v2 = pfv2;
@@ -457,6 +461,7 @@ int main(int argc, char** argv)
         if (mtp)
         {
             g6::FabricDev fd = f;
+            fd.xt = nullptr;
             fd.send = dmalloc<char>(2 * (size_t)NCD * stride);
             fd.recv = recv_d; fd.doorbell = doorbell_d; fd.ncoll = NCD;
 #ifdef DEC_S2
@@ -1479,5 +1484,18 @@ int main(int argc, char** argv)
     for (int r = 0; r < NR; ++r) if (qp_roll[r]) qp_roll_print(*qp_roll[r], r);
 #endif
     printf("# m4sim: %d steps, %d rank lines differ from rank 0\n", steps, bad);
+    if (xt_dev[0])                      // G6_XTRACE: GPU records of every simulated rank, after the run
+    {
+        G6RT_CK(cudaDeviceSynchronize());
+        const char* d = getenv("G6_XTRACE_OUT");
+        const std::string pth = std::string(d ? d : "/tmp") + "/g6xtrace.m4sim.txt";
+        if (FILE* o = fopen(pth.c_str(), "w"))
+        {
+            fprintf(o, "# g6xtrace v1 m4sim nr=%d ncoll=%d steps=%d (loopback: no proxy records)\n", NR, NC, g6::XT_STEPS);
+            for (int r = 0; r < NR; ++r) g6::xt_dump_gpu(o, xt_dev[r], NC, NR, r);
+            fclose(o);
+            fprintf(stderr, "m4sim: G6_XTRACE dump -> %s\n", pth.c_str());
+        }
+    }
     return bad ? 1 : 0;
 }
