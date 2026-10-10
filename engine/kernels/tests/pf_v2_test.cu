@@ -122,6 +122,12 @@ int main(int argc, char** argv)
     A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
     A.x = x; A.ldx = HID;
     A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.ysh = sc.ysh; A.out = out;
+#ifdef PF_AOP
+    { const char* ev = getenv("G6_PF_AOP"); A.aop = (ev && atoi(ev) == 0) ? nullptr : sc.aop; }
+#endif
+#ifdef PF_F12
+    { const char* ev = getenv("G6_PF_F12"); A.f12 = ev ? atoi(ev) : 0; }
+#endif
     CK(cudaMemset(sc.ysh, 0, static_cast<size_t>(M) * HID * 2));
     // the shared expert as bindp::make_layer binds it: Ls.exs = the trellis pass, Lf = the FP8 copy on the GEMMs
     bindp::Layer Ls, Lf;
@@ -135,6 +141,9 @@ int main(int argc, char** argv)
         S.nroutes = M; S.maxseg = (M + bindp::RS - 1) / bindp::RS;
         S.rr_row = sc.sh_rr_row; S.rr_e = sc.sh_rr_e; S.rr_sp = sc.sh_rr_sp; S.rr_w = sc.sh_rr_w;
         S.segs = sc.sh_segs; S.n_seg = sc.sh_n_seg; S.pos = nullptr; S.yw = sc.ysh;
+#ifdef PF_AOP
+        S.aop = nullptr;
+#endif
     }
     if (sh && D.shfp8.codes[0])
     {
