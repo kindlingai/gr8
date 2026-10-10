@@ -12,6 +12,5 @@ config/cluster.env
 frontend/assets
 frontend/tests/work
 frontend/tests/tools/results.jsonl
-GRAFT-PLAN.md
 claims
 exl3rate

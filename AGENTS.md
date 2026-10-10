@@ -1,22 +1,20 @@
 # Working on this repo
 
-g6 serves the full GLM 5.3 on four or six GB10 boxes, and every change has to keep its numbers. Most of what follows is
+g6 serves the full GLM 5.3 on three, four or six GB10 boxes, and every change has to keep its numbers. Most of what follows is
 about proving a change does, before it lands.
 
-If you're an agent working here, read this whole file and [GRAFT-PLAN.md](GRAFT-PLAN.md) first. If you're a person,
-the same rules apply to you.
+If you're an agent working here, read this whole file first. If you're a person, the same rules apply to you.
 
 ## How changes land
 
-GRAFT-PLAN.md is the process: claim an issue with `claims/<issue>` and confirm it, coordinate and book the cluster on
-issue #13, one change per PR with a gates table (before on `main`, after, same boot conditions), a review, then a
-squash merge by the people named there. Its rules, short:
+One change per PR, with a gates table (before on `main`, after, same boot conditions), a review, then a squash merge.
+The rules, short:
 
 1. No lost wins: prefill, decode, TTFT, context and memory headroom stay within noise of `main` (about 3% on one boot's
    decode; past that, a second boot).
 2. A change that cannot keep both sides' numbers, or changes a design choice, stops and goes to the people.
 3. Clean room: work from the issue text and this tree only.
-4. Both topologies build (`G6_NR=4` and `G6_NR=6`), and TP=6 behaviour does not change unless the issue says so.
+4. Every topology builds (`G6_NR=4`, `6` and `3`), and the others' behaviour does not change unless the issue says so.
 
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
 your own setup. The config examples use placeholders for a reason.
@@ -65,8 +63,6 @@ under S2, and multi-session output must stay byte-identical to each request run 
 retired at TP=4 and TP=3 (TP=3 runs `launch_s2.sh` with three ranks and MTP only). TP=6 still serves one request at
 a time through `scripts/launch_tp6.sh`.
 
-Book the nodes on #13 before you boot, and do not boot during someone else's booking.
-
 A change to the packs, the loader or the converter needs a boot with the pack hash check on (no `NOHASH=1`).
 
 A change to `./gr8 glm53`, the supervisor or a launcher keeps every knob working, and keeps the checks to failures a
@@ -75,7 +71,7 @@ boot cannot survive. A new knob that reaches the engine goes in `scripts/engine_
 
 ## The gate
 
-The light gates from GRAFT-PLAN.md, on the target topology:
+The light gates, on the target topology:
 
 1. both builds compile, and the change's own test passes;
 2. one boot serves: `./gr8 glm53 smoke` passes every case;
@@ -104,4 +100,3 @@ write 0 or an estimate. Check it parses: `python3 -m json.tool kindling.json`.
 
 - If a rank dies, the whole engine stops. `./gr8 glm53 status` names the rank and its last log line.
 - Code comments refer to internal design notes and test-window names that are not in this repository.
-- Memory findings go on issue #14, which tracks where every GPU and CPU byte goes on a node.
