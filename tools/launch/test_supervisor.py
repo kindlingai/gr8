@@ -59,6 +59,24 @@ class ControlPortTests(unittest.TestCase):
         self.assertEqual(s.on_rpc({'t': 'down'}, '192.0.2.4'), {'t': 'ok'})
         self.assertTrue(s.stop_ev.is_set())
 
+    def test_a_stopping_head_asks_a_new_hello_to_wait(self):
+        s = supervisor()
+        s.head = H.Head(hello(0, members=MEMBERS, lan=MEMBERS[0]))
+        s.head.decide({'t': 'ok', 'epoch': 7})
+        s.head_ready.set()
+        h = hello(2, members=MEMBERS, lan=MEMBERS[2])
+        self.assertEqual(s.on_rpc(h, MEMBERS[2])['field'], 'booted')      # serving: refused
+        s.request_stop('rank 1 failed', all_boxes=True)
+        self.assertEqual(s.on_rpc(h, MEMBERS[2])['t'], 'retry')           # stopping: wait for the next boot
+
+    def test_a_down_for_another_boot_is_ignored(self):
+        s = supervisor(rank=1)
+        s.hs = {'epoch': 8}
+        self.assertEqual(s.on_rpc({'t': 'down', 'epoch': 7, 'failed': True}, MEMBERS[0])['detail'], 'not this boot')
+        self.assertFalse(s.stop_ev.is_set())
+        s.on_rpc({'t': 'down', 'epoch': 8, 'failed': True}, MEMBERS[0])
+        self.assertTrue(s.stop_ev.is_set() and s.stop_failed)
+
     def test_a_workers_and_a_heads_own_rails_count(self):
         s = supervisor()
         s.head = H.Head(hello(0, members=MEMBERS, lan=MEMBERS[0]))

@@ -209,6 +209,7 @@ class Supervisor:
         self.stop_ev = threading.Event()
         self.stop_why = ''
         self.stop_all = False         # on the head: stop every box as well
+        self.stop_failed = False      # the stop is a failure (exit 1): a rank failed, here or elsewhere
         self.head = None              # handshake.Head on rank 0
         self.head_ready = threading.Event()
         self.ready_ranks = set()
@@ -267,11 +268,16 @@ class Supervisor:
             if not self.head_ready.is_set():
                 return {'t': 'retry', 'detail': 'the head has not finished its checks' if self.state == 'preparing'
                         else f'the head is {self.state}'}
+            if t == 'hello' and self.stop_ev.is_set() and self.head.verdict and self.head.verdict['t'] == 'ok':
+                # a booted cluster going down: a box that restarted already (a container) waits for the next boot
+                return {'t': 'retry', 'detail': 'the head is stopping its boot'}
             return self.head.rpc(m, peer)
         if t == 'status':
             return self.status()
         if t == 'down':
-            self.request_stop(m.get('why') or f'down from {peer}')
+            if m.get('epoch') and (self.hs or {}).get('epoch') != m['epoch']:
+                return {'t': 'ok', 'detail': 'not this boot'}   # the head ending a boot this supervisor is not in
+            self.request_stop(m.get('why') or f'down from {peer}', failed=bool(m.get('failed')))
             return {'t': 'ok'}
         if t == 'abort':
             self.request_stop(f'rank {m.get("rank")} ({peer}) failed: {m.get("why")}', all_boxes=True)
@@ -288,10 +294,11 @@ class Supervisor:
             return self.read_log(m.get('which', 'engine'), int(m.get('offset', -8192)))
         return {'t': 'error', 'error': f'unknown request {t!r}'}
 
-    def request_stop(self, why, all_boxes=False):
+    def request_stop(self, why, all_boxes=False, failed=False):
         if not self.stop_ev.is_set():
             self.stop_why = why
             self.stop_all = all_boxes
+            self.stop_failed = failed or all_boxes
             self.stop_ev.set()
 
     def status(self):
@@ -713,7 +720,7 @@ class Supervisor:
     def watch(self):
         """Raise Stop when this rank's engine has exited or someone asked to stop."""
         if self.stop_ev.is_set():
-            raise Stop(1 if self.stop_all else 0, self.stop_why)
+            raise Stop(1 if self.stop_failed else 0, self.stop_why)
         if self.engine and self.engine.poll() is not None:
             why = f'engine exited ({self.engine.returncode}); last lines of g6m4.r{self.rank}.err:\n' + \
                   tail(os.path.join(self.out, f'g6m4.r{self.rank}.err'), 20)
@@ -745,9 +752,11 @@ class Supervisor:
             self.stop_ev.clear()
             self.linger()
         if self.hs and self.rank == 0 and (code or self.stop_all):
+            # a failure fails every box (exit 1), so a box that restarts on failure boots again with the others
             for r in range(1, len(self.members)):
-                self.tell(r, {'t': 'down', 'why': f'the head stopped the cluster: {first}'})
-        elif self.hs and self.rank and code:
+                self.tell(r, {'t': 'down', 'why': f'the head stopped the cluster: {first}', 'failed': bool(code),
+                              'epoch': self.hs['epoch']})
+        elif self.hs and self.rank and code and not self.stop_failed:
             self.tell_head({'t': 'abort', 'rank': self.rank, 'why': first})
         if self.started:
             stop_local(self.home, log)

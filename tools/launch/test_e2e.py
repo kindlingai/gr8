@@ -286,14 +286,16 @@ class EndToEnd(unittest.TestCase):
         res = self.up_all()
         self.assertTrue(all(rc == 0 for rc, _ in res), res)
         os.kill(int(read(os.path.join(self.homes[2], 'out', 'g6m4.pid'))), 9)
-        for _ in range(300):
+        pids = [int(read(os.path.join(h, 'out', 'g6m4.pid'))) for h in self.homes]
+        for _ in range(300):   # a failed box says so before it has stopped its engine
             st = [json.loads(read(os.path.join(h, 'out', 'gr8.state')))['state'] for h in self.homes]
-            if all(s == 'stopped' or s.startswith('failed') for s in st):
+            if all(s == 'stopped' or s.startswith('failed') for s in st) and not any(running(p) for p in pids):
                 break
             time.sleep(0.1)
         self.assertTrue(st[2].startswith('failed: engine exited'), st)
         self.assertTrue(st[0].startswith('failed: rank 2 (127.0.0.3) failed'), st)
-        self.assertEqual([st[1], st[3]], ['stopped', 'stopped'])
+        for i in (1, 3):    # the other workers fail too, so a container that restarts on failure rejoins
+            self.assertTrue(st[i].startswith('failed: the head stopped the cluster: rank 2'), st)
         for h in self.homes:
             self.assertFalse(running(int(read(os.path.join(h, 'out', 'g6m4.pid')))), h)
 
