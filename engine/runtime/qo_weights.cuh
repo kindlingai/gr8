@@ -183,23 +183,38 @@ inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
         if (!t.p) die(std::string(who) + ": rank " + std::to_string(m) + " has no " + n);
         return t;
     };
-    QpHalf h{get("q_b.mx.codes"), get("q_b.mx.scales"), get("o_proj.mx.codes"), get("o_proj.mx.scales"), get("kv_b.uk"), get("kv_b.uv"), {}, {}};
     snprintf(n, sizeof n, "L%03d.q_b.trellis", l);
-    if (f(n).p) h.qv = get("q_b.svh");
+    const bool tq = f(n).p != nullptr;
     snprintf(n, sizeof n, "L%03d.o_proj.trellis", l);
-    if (f(n).p) h.ov = get("o_proj.suh");
-    for (const TensorRef* v : {&h.qv, &h.ov})
-        if (v->p && (v->nd != 1 || v->shape[0] != 4096))
-            die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " trellis q_b svh / o_proj suh are not [4096]");
-    if (h.qc.shape[0] != 16 * 256 || h.qc.shape[1] != 2048 || h.qs.shape[1] != 64 || h.oc.shape[0] != HID || h.oc.shape[1] != 16 * 256 ||
-        h.os.shape[1] != 16 * 8 || h.uk.nd != 3 || h.uk.shape[0] != 16 || h.uk.shape[1] != 192 || h.uv.nd != 3 ||
-        h.uv.shape[0] != 16 || h.uv.shape[1] != 256)
+    const bool to = f(n).p != nullptr;
+    // dense trellis: o_proj travels as its raw entries [32][393216] (oc; os unused), q_b as its FP8 copy (dtr_find.h).
+    // The two may differ: the release keeps layer 3's o_proj in int4 next to a trellis q_b.
+    QpHalf h{get("q_b.mx.codes"), get("q_b.mx.scales"), to ? get("o_proj.trellis") : get("o_proj.mx.codes"),
+             to ? TensorRef{} : get("o_proj.mx.scales"), get("kv_b.uk"), get("kv_b.uv"), {}, {}};
+    if (tq)
+    {
+        h.qv = get("q_b.svh");
+        if (h.qv.nd != 1 || h.qv.shape[0] != 4096)
+            die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " trellis q_b svh is not [4096]");
+    }
+    if (to)
+    {
+        h.ov = get("o_proj.suh");
+        if (h.ov.nd != 1 || h.ov.shape[0] != 4096 || h.oc.nd != 2 || h.oc.shape[0] != 32 || h.oc.shape[1] * 32 != (long long)qw::OT)
+            die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) +
+                " trellis o_proj is not [32][393216] with suh [4096]");
+    }
+    else if (h.oc.shape[0] != HID || h.oc.shape[1] != 16 * 256 || h.os.shape[1] != 16 * 8)
+        die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " o_proj slice is not 16 heads");
+    if (h.qc.shape[0] != 16 * 256 || h.qc.shape[1] != 2048 || h.qs.shape[1] != 64 || h.uk.nd != 3 || h.uk.shape[0] != 16 ||
+        h.uk.shape[1] != 192 || h.uv.nd != 3 || h.uv.shape[0] != 16 || h.uv.shape[1] != 256)
         die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " slice shapes are not 16 heads");
     return h;
 }
 // slot half k <- the six tensors at qc .. uv (device or pinned), on stream b. The same bytes and layout as pairpack.py.
-// qv / ov: the dense trellis vectors of the half (nullptr: MXFP8 weights). A rolling slot holds layers of both forms, and
-// the reader picks the vectors by the layer's form (qp.cuh).
+// qv / ov: the dense trellis vectors of q_b / o_proj (nullptr: that matrix is MXFP8). With ov, oc is the half's raw
+// o_proj entries, which go to byte k * OT of o_c (64 entries of the pair back to back, k_gemm_tr's side-2 layout), and os
+// is unused. A rolling slot holds layers of every form, and the reader picks by each matrix's form (qp.cuh).
 inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const void* oc, const void* os, const void* uk, const void* uv,
                         cudaStream_t b, const void* qv = nullptr, const void* ov = nullptr)
 {
@@ -208,8 +223,12 @@ inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const voi
     if (ov) G6RT_CK(cudaMemcpyAsync(w.o_suh + (size_t)k * 4096, ov, (size_t)4096 * 2, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync((char*)w.qb_c.p + (size_t)k * 4096 * 2048, qc, (size_t)4096 * 2048, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync((char*)w.qb_s.p + (size_t)k * 4096 * 64, qs, (size_t)4096 * 64, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpy2DAsync((char*)w.o_c.p + (size_t)k * 4096, 8192, oc, 4096, 4096, HID, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpy2DAsync((char*)w.o_s.p + (size_t)k * 128, 256, os, 128, 128, HID, cudaMemcpyDefault, b));
+    if (ov) G6RT_CK(cudaMemcpyAsync((char*)w.o_c.p + (size_t)k * qw::OT, oc, qw::OT, cudaMemcpyDefault, b));
+    else
+    {
+        G6RT_CK(cudaMemcpy2DAsync((char*)w.o_c.p + (size_t)k * 4096, 8192, oc, 4096, 4096, HID, cudaMemcpyDefault, b));
+        G6RT_CK(cudaMemcpy2DAsync((char*)w.o_s.p + (size_t)k * 128, 256, os, 128, 128, HID, cudaMemcpyDefault, b));
+    }
     G6RT_CK(cudaMemcpyAsync((char*)w.uk.data + (size_t)k * 16 * 192 * 512 * 2, uk, (size_t)16 * 192 * 512 * 2, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync((char*)w.uv.data + (size_t)k * 16 * 256 * 512 * 2, uv, (size_t)16 * 256 * 512 * 2, cudaMemcpyDefault, b));
 }
@@ -384,8 +403,8 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     char* tx = x.bd.bulk + qw::pos_off(e, oh);
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QC, o.qc.p, qw::QC, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QS, o.qs.p, qw::QS, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OC, o.oc.p, qw::OC, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OS, o.os.p, qw::OS, cudaMemcpyDefault, b));
+    G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OC, o.oc.p, q.form & 2 ? qw::OT : qw::OC, cudaMemcpyDefault, b));
+    if (!(q.form & 2)) G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OS, o.os.p, qw::OS, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UK, o.uk.p, qw::UK, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UV, o.uv.p, qw::UV, cudaMemcpyDefault, b));
     if (q.form & 1) G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QV, o.qv.p, qw::QV, cudaMemcpyDefault, b));

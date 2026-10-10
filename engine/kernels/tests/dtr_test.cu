@@ -7,7 +7,7 @@
 //   dtr_test DIR            check: every matrix of DIR/meta.txt through the decode GEMV at M = 1..8 (and 16, 32 under
 //                           DEC_S2), the FP8 copy and the prefill path. Outputs go into DIR
 //   dtr_test DIR --bind     the binders the engine uses on one dense layer (bind_check below)
-//   dtr_test DIR --bench [--iters 640] [--sweep 1]    decode timing at M = 1, 3, 8 (CUDA graphs of 32 steps, a pool of
+//   dtr_test DIR --bench [--iters 640] [--sweep 1] [--pf-only]    decode timing at M = 1, 3, 8 (CUDA graphs of 32 steps, a pool of
 //                           copies so every step reads DRAM); --sweep 1 prints every (ks, sub)
 //
 // DIR/meta.txt, one line each:
@@ -52,6 +52,13 @@ template <class T> static T* dev(const void* h, size_t n)
     CK(cudaMalloc(&p, n));
     CK(g6h2d::copy(p, h, n));
     return p;
+}
+static bool same_dev(const void* a, const void* b, size_t n)
+{
+    std::vector<uint8_t> x(n), y(n);
+    CK(cudaMemcpy(x.data(), a, n, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(y.data(), b, n, cudaMemcpyDeviceToHost));
+    return x == y;
 }
 static void dump_dev(const std::string& p, const void* d, size_t n)
 {
@@ -100,11 +107,13 @@ static void load(HostMat& h, const std::string& dir)
 static bind::Tensor fp8_codes(const dtr::Fp8& F) { return ten(F.codes, {F.N, F.K}); }
 static bind::Tensor fp8_scales(const dtr::Fp8& F) { return ten(F.scales, {F.N, F.K / 32}); }
 // one matrix on R prefill rows as bindp::make_layer binds it: rotated records (Gemm::pre, Xq::suh), the GEMM on the FP8
-// copy, the output rotation in its epilogue (Gemm::osvh, out = 0: the GEMM's plain fp16 output)
-static bindp::Gemm pf_gemm(const dtr::Mat& m, const dtr::Fp8& F, int R, const __half* x, int ldx, uint8_t* x8, void* y, int bf16, bool out)
+// copy or (direct) on the tiles (Gemm::tw), the output rotation in its epilogue (Gemm::osvh; out = 0: plain fp16 output)
+static bindp::Gemm pf_gemm(const dtr::Mat& m, const dtr::Fp8& F, int R, const __half* x, int ldx, uint8_t* x8, void* y, int bf16, bool out,
+                           bool direct = false)
 {
     bindp::Gemm g;
-    ok(bindp::make_gemm(fp8_codes(F), fp8_scales(F), R, x8, y, bf16, g));
+    if (direct) ok(bindp::make_gemm_tr(m, R, x8, y, bf16, g));
+    else ok(bindp::make_gemm(fp8_codes(F), fp8_scales(F), R, x8, y, bf16, g));
     if (x) { g.pre.on = 1; g.pre.src = x; g.pre.ld = ldx; g.pre.K = m.K; g.pre.M = R; g.pre.dst = x8; g.pre.suh = m.suh; }
     if (out) g.osvh = m.svh;
     return g;
@@ -112,12 +121,12 @@ static bindp::Gemm pf_gemm(const dtr::Mat& m, const dtr::Fp8& F, int R, const __
 // the dense MLP on R prefill rows: gate and up (one paired launch), the mid pass (Act::svh_g) into down's records, down
 struct PfMlp { bindp::Gemm gate, up, down; bindp::Act act; };
 static PfMlp pf_mlp(const dtr::Mat& G, const dtr::Mat& U, const dtr::Mat& D, const dtr::Fp8& Fg, const dtr::Fp8& Fu, const dtr::Fp8& Fd, int R,
-                    const __half* x, uint8_t* x8, uint8_t* x8u, uint8_t* x8d, __half* g, __half* u, void* y, int bf16)
+                    const __half* x, uint8_t* x8, uint8_t* x8u, uint8_t* x8d, __half* g, __half* u, void* y, int bf16, bool direct = false)
 {
     PfMlp P;
-    P.gate = pf_gemm(G, Fg, R, x, G.K, x8, g, 0, false);
-    P.up = pf_gemm(U, Fu, R, x, U.K, x8u, u, 0, false);
-    P.down = pf_gemm(D, Fd, R, nullptr, 0, x8d, y, bf16, true);
+    P.gate = pf_gemm(G, Fg, R, x, G.K, x8, g, 0, false, direct);
+    P.up = pf_gemm(U, Fu, R, x, U.K, x8u, u, 0, false, direct);
+    P.down = pf_gemm(D, Fd, R, nullptr, 0, x8d, y, bf16, true, direct);
     P.act.on = 1; P.act.g = g; P.act.u = u; P.act.I = G.N; P.act.M = R;
     P.act.svh_g = G.svh; P.act.svh_u = U.svh; P.act.suh_d = D.suh; P.act.x8 = x8d;
     return P;
@@ -160,11 +169,13 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
     for (HostMat& h : mats) { by[h.name] = &h; Rmax = std::max(Rmax, h.R); }
     // prefill scratch
     uint8_t *x8, *x8u, *x8d;
-    __half *g, *u, *pout;
+    __half *g, *u, *pout, *pout2;
+    int bad = 0;
     const size_t recb = static_cast<size_t>((Rmax + 15) / 16) * (16384 / 32) * bindp::REC;
     CK(cudaMalloc(&x8, recb)); CK(cudaMalloc(&x8u, recb)); CK(cudaMalloc(&x8d, recb));
     CK(cudaMalloc(&g, static_cast<size_t>(Rmax) * 16384 * 2)); CK(cudaMalloc(&u, static_cast<size_t>(Rmax) * 16384 * 2));
     CK(cudaMalloc(&pout, static_cast<size_t>(Rmax) * 16384 * 2));
+    CK(cudaMalloc(&pout2, static_cast<size_t>(Rmax) * 16384 * 2));
     std::map<std::string, dtr::Fp8> fp8;
 
     for (HostMat& h : mats)
@@ -186,8 +197,11 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
         CK(cudaStreamSynchronize(st));
         CK(cudaGetLastError());
         dump_dev(dir + "/" + h.name + ".pf.bin", pout, static_cast<size_t>(h.R) * h.N * 2);
-        printf("%s: side %d K %d N %d entries %d x %lld B: decode, FP8 copy, prefill (%d rows) dumped\n", h.name.c_str(), h.side, h.K,
-               h.N, h.E, h.eb, h.R);
+        bindp::launch(pf_gemm(h.m, F, h.R, h.dx, h.K, x8, pout2, 0, true, true), st);
+        const bool same = same_dev(pout, pout2, static_cast<size_t>(h.R) * h.N * 2);
+        printf("%s: side %d K %d N %d entries %d x %lld B: decode, FP8 copy, prefill (%d rows) dumped; prefill from the tiles %s the copy's\n",
+               h.name.c_str(), h.side, h.K, h.N, h.E, h.eb, h.R, same ? "equals" : "DIFFERS FROM");
+        if (!same) bad = 1;
     }
     for (const auto& gl : glus)
     {
@@ -211,11 +225,14 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
         CK(cudaStreamSynchronize(st));
         CK(cudaGetLastError());
         dump_dev(dir + "/glu.pf.bin", pout, static_cast<size_t>(G.R) * D.N * 2);
-        printf("glu %s %s %s: decode chain and prefill dumped (gate and up share their rotation: %s)\n", gl[0].c_str(), gl[1].c_str(),
-               gl[2].c_str(), same ? "yes" : "no");
+        launch(pf_mlp(G.m, U.m, D.m, fp8[G.name], fp8[U.name], fp8[D.name], G.R, G.dx, x8, x8u, x8d, g, u, pout2, 0, true), st);
+        const bool eq = same_dev(pout, pout2, static_cast<size_t>(G.R) * D.N * 2);
+        if (!eq) bad = 1;
+        printf("glu %s %s %s: decode chain and prefill dumped (gate and up share their rotation: %s); prefill from the tiles %s the copy's\n",
+               gl[0].c_str(), gl[1].c_str(), gl[2].c_str(), same ? "yes" : "no", eq ? "equals" : "DIFFERS FROM");
         CK(cudaFree(xd));
     }
-    return 0;
+    return bad;
 }
 
 // ------------------------------------------------------------------------------------------ timing
@@ -291,7 +308,7 @@ static std::vector<uint8_t> mx_records(int O, int K, std::mt19937_64& rng)
     return v;
 }
 
-static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::string, 3>>& glus, int iters, int sweep)
+static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::string, 3>>& glus, int iters, int sweep, int pfonly)
 {
     CK(bind::init());
     cudaStream_t st;
@@ -331,6 +348,7 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
 
     for (HostMat& h : mats)
     {
+        if (pfonly) break;
         const size_t mb = h.codes.size();
         const int P = pool_n(mb);
         uint8_t* pool = pool_of(h.dcodes, mb, P);
@@ -366,11 +384,12 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
     // prefill: the FP8 copy on the MXFP8 GEMM inside its rotations (rotated records, GEMM with the output rotation in its
     // epilogue) against today's form of the same GEMM (k_xq8 on unrotated rows, GEMM), BF16 out, at 512 and 4096 rows
     {
-        const int PR[2] = {512, 4096};
-        __half *px, *pout;
+        const int PR[3] = {512, 2048, 4096};
+        __half *px, *pout, *pout2;
         uint8_t* px8;
         CK(cudaMalloc(&px, static_cast<size_t>(4096) * 16384 * 2));
         CK(cudaMalloc(&pout, static_cast<size_t>(4096) * 16384 * 2));
+        CK(cudaMalloc(&pout2, static_cast<size_t>(4096) * 16384 * 2));
         CK(cudaMalloc(&px8, static_cast<size_t>(4096 / 16) * (16384 / 32) * bindp::REC));
         {
             std::vector<__half> hx(static_cast<size_t>(4096) * 16384);
@@ -378,28 +397,59 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
             for (auto& v : hx) v = __float2half(nd(rng));
             CK(g6h2d::copy(px, hx.data(), hx.size() * 2));
         }
+        // the pair-owner o_proj shape (G6_PF_OWN=4: two members' entries back to back, K = 2 x 4096), from o_proj.r0 twice
+        std::vector<HostMat> pair;
         for (HostMat& h : mats)
+            if (h.name.rfind("o_proj", 0) == 0 && h.K == 4096)
+            {
+                HostMat p = h;
+                p.name = h.name + ".pairK8192";
+                p.K = 2 * h.K; p.E = 2 * h.E;
+                std::vector<uint8_t> c2(h.codes), s2(h.suh);
+                c2.insert(c2.end(), h.codes.begin(), h.codes.end());
+                s2.insert(s2.end(), h.suh.begin(), h.suh.end());
+                p.dcodes = dev<uint8_t>(c2.data(), c2.size());
+                p.dsuh = dev<__half>(s2.data(), s2.size());
+                ok(dtr::make_mat(ten(p.dcodes, {p.E, h.eb}), ten(p.dsuh, {p.K}), ten(h.dsvh, {h.N}), h.side, p.m));
+                pair.push_back(p);
+                break;
+            }
+        std::vector<HostMat*> pm;
+        for (HostMat& h : mats) pm.push_back(&h);
+        for (HostMat& h : pair) pm.push_back(&h);
+        for (HostMat* hp : pm)
         {
+            HostMat& h = *hp;
             dtr::Fp8 F;
             ok(dtr::make_fp8(h.m, st, F));
             for (int R : PR)
             {
                 const bindp::Gemm g = pf_gemm(h.m, F, R, px, h.K, px8, pout, 1, true);
+                const bindp::Gemm gd = pf_gemm(h.m, F, R, px, h.K, px8, pout, 1, true, true);
                 bindp::Gemm g0 = g;
                 g0.pre.suh = nullptr;                 // today: k_xq8, no output rotation
                 g0.osvh = nullptr;
                 const double tt = time([&](int) { bindp::launch(g, st); });
+                const double td = time([&](int) { bindp::launch(gd, st); });
                 const double t0 = time([&](int) { bindp::launch(g0, st); });
-                printf("%s prefill %4d rows: trellis FP8 copy %7.1f us | today (xq8 + GEMM) %7.1f us | ratio %.2f\n", h.name.c_str(), R, tt, t0, tt / t0);
+                bindp::Gemm gd2 = gd;                 // the tiles' output against the copy's, bit for bit
+                gd2.y = pout2;
+                bindp::launch(g, st);
+                bindp::launch(gd2, st);
+                CK(cudaStreamSynchronize(st));
+                const bool eq = same_dev(pout, pout2, static_cast<size_t>(R) * h.N * 2);
+                printf("%s prefill %4d rows: tiles %7.1f us | FP8 copy %7.1f us | today (xq8 + GEMM) %7.1f us | tiles/copy %.2f, tiles/today %.2f | %s\n",
+                       h.name.c_str(), R, td, tt, t0, td / tt, td / t0, eq ? "bits equal" : "BITS DIFFER");
             }
             dtr::free_fp8(F);
         }
-        CK(cudaFree(px)); CK(cudaFree(pout)); CK(cudaFree(px8));
+        CK(cudaFree(px)); CK(cudaFree(pout)); CK(cudaFree(pout2)); CK(cudaFree(px8));
     }
 
     // the dense MLP: gate + up (one launch) + down, against today's int4 dense MLP in K1 (fused fc1 + fc2, the default)
     for (const auto& gl : glus)
     {
+        if (pfonly) break;
         HostMat &G = *by.at(gl[0]), &U = *by.at(gl[1]), &D = *by.at(gl[2]);
         const size_t mg = G.codes.size(), mu = U.codes.size(), md = D.codes.size(), all = mg + mu + md;
         const int P = pool_n(all);
@@ -639,8 +689,25 @@ static int bind_check(const std::string& dir, std::vector<HostMat>& mats)
     CK(cudaGetLastError());
     dump_dev(dir + "/bind.pf.q_b.bin", pio.q_b, static_cast<size_t>(R) * Q.N * 2);
     dump_dev(dir + "/bind.pf.o_proj.bin", pio.attn_part, static_cast<size_t>(R) * HID * 2);
+    // o_proj as the engine binds it by default: no FP8 copy, the GEMM on the tiles (make_gemm_tr). Bit-equal to the copy.
+    bindp::Tensors P2 = P;
+    P2.t[bindp::T_O_PROJ] = bind::Tensor();
+    P2.s[bindp::T_O_PROJ] = bind::Tensor();
+    P2.tm.o_proj = O.m;
+    std::vector<uint8_t> o1(static_cast<size_t>(R) * HID * 2);
+    CK(cudaMemcpy(o1.data(), pio.attn_part, o1.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemset(pio.attn_part, 0, o1.size()));
+    bindp::Layer B2;
+    ok(bindp::make_layer(P2, R, psc, pio, blas, B2));
+    if (!B2.o_proj.tw || !B2.o_proj.osvh) die("--bind: bindp::make_layer did not bind o_proj on its tiles");
+    bindp::launch(B2.xq_attn, st);
+    bindp::launch(B2.o_proj, st);
+    CK(cudaStreamSynchronize(st));
+    std::vector<uint8_t> o2(o1.size());
+    CK(cudaMemcpy(o2.data(), pio.attn_part, o2.size(), cudaMemcpyDeviceToHost));
+    if (o1 != o2) die("--bind: prefill o_proj on the tiles differs from the FP8 copy's");
     dump_dev(dir + "/bind.pf.mlp.bin", pio.mlp_part, static_cast<size_t>(R) * HID * 2);
-    printf("bind: decode at %zu row counts%s and prefill (%d rows) through make_layer dumped\n", rows_list().size(),
+    printf("bind: decode at %zu row counts%s and prefill (%d rows, o_proj on its tiles bit-equal to the copy) through make_layer dumped\n", rows_list().size(),
 #if DEC_SLOT >= 2
            ", send slots and doorbells checked",
 #else
@@ -655,7 +722,7 @@ int main(int argc, char** argv)
     if (argc < 2) die("usage: dtr_test DIR [--bind | --bench [--iters N] [--sweep 1]]");
     const std::string dir = argv[1];
     bool b = false, bnd = false;
-    int iters = 640, sweep = 0;
+    int iters = 640, sweep = 0, pfonly = 0;
     for (int i = 2; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -663,6 +730,7 @@ int main(int argc, char** argv)
         else if (a == "--bind") bnd = true;
         else if (a == "--iters" && i + 1 < argc) iters = atoi(argv[++i]);
         else if (a == "--sweep" && i + 1 < argc) sweep = atoi(argv[++i]);
+        else if (a == "--pf-only") pfonly = 1;
         else die("unknown argument " + a);
     }
     CK(dtr::init());
@@ -691,5 +759,5 @@ int main(int argc, char** argv)
     }
     for (HostMat& h : mats) load(h, dir);
     if (bnd) return bind_check(dir, mats);
-    return b ? bench(mats, glus, iters, sweep) : check(dir, mats, glus);
+    return b ? bench(mats, glus, iters, sweep, pfonly) : check(dir, mats, glus);
 }

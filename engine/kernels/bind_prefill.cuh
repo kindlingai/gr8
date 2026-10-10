@@ -81,6 +81,8 @@ struct Tensors
     // GEMM in the rotations. nullptr: plain MXFP8 weights.
     const __half* tsuh[dtr::NMAT] = {};
     const __half* tsvh[dtr::NMAT] = {};
+    // the matrices themselves (dtr::layer_mats): o_proj without an FP8 copy runs on its tiles (make_gemm_tr, k_gemm_tr)
+    dtr::LayerMats tm;
 };
 
 template <class F> inline Tensors layer_tensors(int layer, F find)
@@ -106,6 +108,7 @@ template <class F> inline Tensors layer_tensors(int layer, F find)
         snprintf(n, sizeof n, "L%03d.%s.svh", layer, dtr::MAT_NAMES[i]);
         T.tsvh[i] = static_cast<const __half*>(find(n).p);
     }
+    if (dtr::layer_mats(layer, find, T.tm)) T.tm = dtr::LayerMats();   // make_layer reports a bad matrix by its missing codes
     return T;
 }
 
@@ -331,13 +334,19 @@ struct Gemm
     // tensor's) applies H128 and svh to every row's 128 columns of a CTA in its epilogue (gemm_rot_store), N % 128 == 0
     Xq pre;
     const __half *osvh = nullptr, *osvh2 = nullptr;
+    // tw set: the weights are a dense trellis matrix's K4 tiles (dtr.cuh addressing: tile (column block, k16 step s,
+    // col tile c) at tw + block * tsB + (s / 8) * tsG + ((s % 8) * 8 + c) * 128), decoded in the GEMM (k_gemm_tr);
+    // w / ws unused. The bits equal the GEMM on the matrix's FP8 copy (dtr::make_fp8).
+    const uint8_t* tw = nullptr;
+    long long tsB = 0, tsG = 0;
 };
 
 // Gemm::osvh: the CTA's 128 output columns of each row go through H128 and svh before the store. The input is the sums
 // rounded to fp16, as the unrotated fp16 output would be, so the bits are those of an fp16 GEMM output rotated by a
-// separate pass. The fp16 tile [rows][136] reuses the stage buffers (34.8 KB at BM = 8, 17.4 KB at BM = 4).
+// separate pass. The fp16 tile [rows][136] reuses the shared memory (34.8 KB at BM = 8, 17.4 KB at BM = 4, 69.6 KB at
+// BM = 16 in k_gemm_tr). NW = the CTA's warps.
 // store(row, col, v[4]) writes columns col .. col + 3 of the row.
-template <int BM, int NT, class St>
+template <int BM, int NT, int NW = 8, class St>
 __device__ __forceinline__ void gemm_rot_store(const float (&acc)[4][NT][4], unsigned char* sm, const __half* svh, int c0, int rb0,
                                                int nb, int M, int wm, int colw, St store)
 {
@@ -361,7 +370,7 @@ __device__ __forceinline__ void gemm_rot_store(const float (&acc)[4][NT][4], uns
     __syncthreads();
     const uint2 sr = *reinterpret_cast<const uint2*>(svh + c0 + lane * 4);
     const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
-    for (int rr = warp; rr < nb * 16; rr += 8)
+    for (int rr = warp; rr < nb * 16; rr += NW)
     {
         const int row = rb0 * 16 + rr;
         if (row >= M) break;
@@ -1165,6 +1174,175 @@ template <int BM> __global__ void __launch_bounds__(256) k_gemm_mx8f(Gemm g0)
 }
 #endif
 
+// ------------------------------------------------------------------------------------------ dense trellis GEMM
+// k_gemm_tr: k_gemm_mx8b's tiling (CTA = 128 output cols x BM 16-row blocks, A records through a cp.async ring, ldsm B
+// fragments, mma_mx8) with the weights read as a dense trellis matrix's K4 tiles (Gemm::tw): a stage brings the raw
+// tiles of its 128 cols x 64 k (4 KB), and the warps decode them into sdec, the stage's E4M3 bytes at loadAB's
+// swizzled [n][k] places. So the bits equal k_gemm_mx8b on the matrix's FP8 copy (dtr::make_fp8, scales 127).
+// Overlap: stage st + 1 is decoded into the other sdec buffer while stage st's mma runs (one barrier per stage; the
+// loads run ST - 2 stages ahead of the decode). Bigger CTAs decode less per row: BM = 16 (256 rows, 16 warps of 64 x
+// 32, 512 threads) for large launches; BM = 4 and 8 keep k_gemm_mx8b's warp shapes.
+template <int BM> struct GT
+{
+    static constexpr int WM = BM / 4, WN = BM >= 8 ? 4 : 8, NW = WM * WN, NTH = 32 * NW, WC = 128 / WN, NT = WC / 8;
+    static constexpr int A = G2_KS * BM * REC, RAW = 32 * 128, STG = A + RAW, B = 128 * G2_KS * 32;
+    static constexpr int ST = BM == 16 ? 4 : 3, SMEM = ST * STG + 2 * B;     // BM = 16: 98.3 KB, 1 CTA per SM
+};
+template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm_tr(Gemm g, RsOut rs)
+{
+    using T = GT<BM>;
+    constexpr int NT = T::NT, ST = T::ST;
+    extern __shared__ __align__(16) unsigned char sm[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int wm = warp / T::WN, wn = warp % T::WN;
+    const int S = g.K / 32, RB = (g.M + 15) / 16, NST = (S + G2_KS - 1) / G2_KS, K16 = g.K / 16;
+    const int bx = blockIdx.x, c0 = bx * 128, rb0 = blockIdx.y * BM;
+    const int nb = min(BM, RB - rb0);
+    unsigned char* sdec = sm + ST * T::STG;
+
+    auto loadAB = [&](int st)
+    {
+        unsigned char* a = sm + (st % ST) * T::STG;
+        for (int c = t; c < G2_KS * BM * 33; c += T::NTH)
+        {
+            const int j = c / (BM * 33), rem = c % (BM * 33), mb = rem / 33, ch = rem % 33;
+            if (mb < nb && st * G2_KS + j < S)
+                pf::cp16(a + c * 16, g.x8 + (static_cast<size_t>(rb0 + mb) * S + st * G2_KS + j) * REC + ch * 16);
+        }
+        // tile ti = c / 8 of the stage: k16 step 4 st + ti / 8, column tile ti % 8; 16 B a thread
+        for (int c = t; c < 256; c += T::NTH)
+        {
+            const int ti = c >> 3, ks = st * 4 + (ti >> 3);
+            if (ks < K16)
+                pf::cp16(a + T::A + c * 16, g.tw + bx * g.tsB + (ks >> 3) * g.tsG + ((ks & 7) * 8 + (ti & 7)) * 128 + (c & 7) * 16);
+        }
+    };
+    const int r8 = lane >> 2, kc = 2 * (lane & 3);
+    Tr3Lane<4, false> tl;             // fp16 codebook values: the one E4M3 rounding is the store's (h2_e4m3x2_d), same bytes
+    tl.init(lane);
+    auto at = [&](int n, int k) { return n * (G2_KS * 32) + (((k >> 4) ^ ((n >> 1) & 3)) << 4) + (k & 15); };
+    // stage st's raw tiles -> sdec buffer st & 1. Warp w takes tiles w, w + NW, .. (unrolled, so the tiles' dependent
+    // chains interleave); lane holds (col 16 c + l/4 (+8), k 16 j + 2 (l%4) (+8)) pairs.
+    auto decode = [&](int st)
+    {
+        const unsigned char* raw = sm + (st % ST) * T::STG + T::A;
+        unsigned char* d = sdec + (st & 1) * T::B;
+        #pragma unroll
+        for (int u = 0; u < 32 / T::NW; ++u)
+        {
+            const int ti = warp + u * T::NW, j = ti >> 3, c = ti & 7;
+            if (st * 4 + j >= K16) continue;
+            const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
+            u32 f0[2], f1[2];
+            tl.decode(tile[tl.i0], tile[tl.i1], f0, f1);
+            const int n = c * 16 + r8, k = j * 16 + kc;
+            *reinterpret_cast<uint16_t*>(d + at(n, k)) = static_cast<uint16_t>(h2_e4m3x2_d(f0[0]));
+            *reinterpret_cast<uint16_t*>(d + at(n, k + 8)) = static_cast<uint16_t>(h2_e4m3x2_d(f0[1]));
+            *reinterpret_cast<uint16_t*>(d + at(n + 8, k)) = static_cast<uint16_t>(h2_e4m3x2_d(f1[0]));
+            *reinterpret_cast<uint16_t*>(d + at(n + 8, k + 8)) = static_cast<uint16_t>(h2_e4m3x2_d(f1[1]));
+        }
+    };
+    // loads of stages 0 .. ST - 2 (one commit group each), then stage 0 decoded
+    #pragma unroll
+    for (int p = 0; p < ST - 1; ++p)
+    {
+        if (p < NST) loadAB(p);
+        pf::cp_commit();
+    }
+    pf::cp_wait<ST - 2>();
+    __syncthreads();
+    decode(0);
+    float acc[4][NT][4];
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][nt][i] = 0.f;
+    const int colw = wn * T::WC;
+    const int srow = (lane >> 2) + ((lane & 1) ? 8 : 0);
+    const int mat = lane >> 3, lr = lane & 7;
+    const bool full = nb == BM;
+
+    for (int st = 0; st < NST; ++st)
+    {
+        // stage st + 1 landed; sdec[st & 1] decoded; every warp past stage st - 1's mma (its sdec buffer and ring slot free)
+        pf::cp_wait<ST - 3>();
+        __syncthreads();
+        if (st + ST - 1 < NST) loadAB(st + ST - 1);
+        pf::cp_commit();
+        if (st + 1 < NST) decode(st + 1);
+        const unsigned char* a = sm + (st % ST) * T::STG;
+        const unsigned char* b = sdec + (st & 1) * T::B;
+        #pragma unroll
+        for (int j = 0; j < G2_KS; ++j)
+        {
+            if (st * G2_KS + j >= S) continue;
+            u32 bf[NT][2];
+            #pragma unroll
+            for (int pr = 0; pr < NT / 2; ++pr)
+            {
+                const int n = colw + (pr * 2 + (mat >> 1)) * 8 + lr, ch = j * 2 + (mat & 1);
+                ldsm_x4(b + n * (G2_KS * 32) + ((ch ^ ((n >> 1) & 3)) * 16), bf[2 * pr][0], bf[2 * pr][1], bf[2 * pr + 1][0], bf[2 * pr + 1][1]);
+            }
+            #pragma unroll
+            for (int mb = 0; mb < 4; ++mb)
+            {
+                const int m = wm * 4 + mb;
+                if (!full && m >= nb) continue;
+                const unsigned char* rec = a + (j * BM + m) * REC;
+                const uint4 fa = *reinterpret_cast<const uint4*>(rec + lane * 16);
+                const u32 sa = rec[512 + srow];
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) mma_mx8(acc[mb][nt], fa, bf[nt][0], bf[nt][1], sa, 127u);
+            }
+        }
+    }
+    pf::cp_wait<0>();
+    if (g.osvh)
+    {
+        gemm_rot_store<BM, NT, T::NW>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
+            if constexpr (RS) *reinterpret_cast<uint2*>(rs_row(rs, row, g.ldy) + col) = pack_o4(v, g.bf16);
+            else *reinterpret_cast<uint2*>(static_cast<uint16_t*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = pack_o4(v, g.bf16);
+        });
+        return;
+    }
+    const int c = lane & 3, r = lane >> 2;
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+        {
+            const int m = wm * 4 + mb;
+            if (m >= nb) continue;
+            const int col = c0 + colw + nt * 8 + 2 * c, row = (rb0 + m) * 16 + r;
+            auto out = [&](int rw) { return RS ? rs_row(rs, rw, g.ldy) + col : static_cast<uint16_t*>(g.y) + static_cast<size_t>(rw) * g.ldy + col; };
+            if (row < g.M) *reinterpret_cast<u32*>(out(row)) = pack_o2(acc[mb][nt][0], acc[mb][nt][1], g.bf16);
+            if (row + 8 < g.M) *reinterpret_cast<u32*>(out(row + 8)) = pack_o2(acc[mb][nt][2], acc[mb][nt][3], g.bf16);
+        }
+}
+template <int BM, bool RS> inline void launch_tr_bm(const Gemm& g, const RsOut& rs, cudaStream_t st)
+{
+    static bool attr = false;
+    if (!attr)
+    {
+        cudaFuncSetAttribute(k_gemm_tr<BM, RS>, cudaFuncAttributeMaxDynamicSharedMemorySize, GT<BM>::SMEM);
+        attr = true;
+    }
+    const int RB = (g.M + 15) / 16;
+    k_gemm_tr<BM, RS><<<dim3((g.N + 127) / 128, (RB + BM - 1) / BM), GT<BM>::NTH, GT<BM>::SMEM, st>>>(g, rs);
+}
+// G6_PF_TR_BM (default 16): the row blocks of a large launch's CTA (8 or 16); small launches take 4, as k_gemm_mx8b
+inline void launch_tr(const Gemm& g, const RsOut& rs, bool big, cudaStream_t st)
+{
+    static const int bmw = getenv("G6_PF_TR_BM") ? atoi(getenv("G6_PF_TR_BM")) : 16;
+    const int bm = !big ? 4 : bmw == 8 ? 8 : 16;
+    if (rs.base) { if (bm == 16) launch_tr_bm<16, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, true>(g, rs, st); else launch_tr_bm<4, true>(g, rs, st); }
+    else if (bm == 16) launch_tr_bm<16, false>(g, rs, st);
+    else if (bm == 8) launch_tr_bm<8, false>(g, rs, st);
+    else launch_tr_bm<4, false>(g, rs, st);
+}
+
 inline void die_gemm_pair() { fprintf(stderr, "bindp: a paired Gemm needs the v2 kernel\n"); exit(1); }
 // G6_GEMM: 1 = k_gemm_mx8 (v1), 2 = v2 with 128-row CTAs, 3 = v2 with 64-row CTAs, unset/0 = v2, row blocks by grid size
 inline int gemm_mode()
@@ -1180,7 +1358,7 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
 #if defined(PF_GEMMW) || defined(PF_GEMMP)
     if (g.osvh || g.osvh2) { fprintf(stderr, "bindp: Gemm::osvh needs the v2 or PF_GEMMF kernel (not PF_GEMMW / PF_GEMMP)\n"); exit(1); }
 #endif
-    if ((g.osvh || g.osvh2) && mode == 1) { fprintf(stderr, "bindp: Gemm::osvh needs the v2 kernel (G6_GEMM != 1)\n"); exit(1); }
+    if ((g.osvh || g.osvh2 || g.tw) && mode == 1) { fprintf(stderr, "bindp: Gemm::osvh / tw need the v2 kernel (G6_GEMM != 1)\n"); exit(1); }
     const int RB = (g.M + 15) / 16, NB = (g.N + 127) / 128 + (g.w2 ? (g.N2 + 127) / 128 : 0);
     if (rs.base && (mode == 1 || g.w2)) { fprintf(stderr, "bindp: an RS-slot Gemm needs the unpaired v2 kernel\n"); exit(1); }
     const bool f32 = g.bf16 == 2;
@@ -1206,6 +1384,12 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
     static int nsm = 0;
     if (!nsm) { int d = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d); }
     const bool big = mode == 2 || (mode != 3 && NB * ((RB + 7) / 8) >= 2 * nsm);
+    if (g.tw)                         // dense trellis tiles (k_gemm_tr): never paired, fp16 / BF16 out
+    {
+        if (g.w2 || f32) { fprintf(stderr, "bindp: a trellis Gemm is unpaired with fp16 / BF16 output\n"); exit(1); }
+        launch_tr(g, rs, big, st);
+        return;
+    }
     if (rs.base)
     {
         if (big) k_gemm_mx8b<8, true><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(g, rs);
@@ -1241,7 +1425,7 @@ inline void launch(const Gemm& g, cudaStream_t st, const RsOut& rs = RsOut()) { 
 // same mma calls as in its own launch, so the bits do not change
 inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
 {
-    if (mode == 1 || !a.on || !b.on || a.K != b.K || a.M != b.M || a.w2 || b.w2 || a.bf16 != b.bf16 && (a.bf16 == 2 || b.bf16 == 2))
+    if (mode == 1 || !a.on || !b.on || a.K != b.K || a.M != b.M || a.w2 || b.w2 || a.tw || b.tw || a.bf16 != b.bf16 && (a.bf16 == 2 || b.bf16 == 2))
     {
         launch(a, st, mode);
         launch(b, st, mode);
@@ -1267,6 +1451,21 @@ inline const char* make_gemm(const Tensor& codes, const Tensor& scales, int M, c
     g.x8 = x8;
     g.w = static_cast<const uint8_t*>(codes.p); g.ws = static_cast<const uint8_t*>(scales.p);
     g.N = static_cast<int>(codes.shape[0]); g.K = static_cast<int>(codes.shape[1]); g.M = M;
+    g.y = y; g.ldy = g.N; g.bf16 = bf16;
+    return nullptr;
+}
+
+// a dense trellis matrix's tiles (dtr::Mat, K4) -> GEMM of M rows from the records x8 into y [M][N] (Gemm::tw)
+inline const char* make_gemm_tr(const dtr::Mat& m, int M, const uint8_t* x8, void* y, int bf16, Gemm& g)
+{
+    g = Gemm();
+    if (!m.w) return nullptr;
+    if (m.N % 128 || m.K % 64 || reinterpret_cast<uintptr_t>(m.w) % 16 || m.sB % 16 || m.sG % 16)
+        return "trellis Gemm: N % 128, K % 64 and 16-byte aligned tiles";
+    g.on = 1;
+    g.x8 = x8;
+    g.tw = m.w; g.tsB = m.sB; g.tsG = m.sG;
+    g.N = m.N; g.K = m.K; g.M = M;
     g.y = y; g.ldy = g.N; g.bf16 = bf16;
     return nullptr;
 }
@@ -2936,6 +3135,8 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if ((e = make_gemm(T.t[T_Q_B],      T.s[T_Q_B],      M, sc.x8_small, io.q_b,                             0, L.q_b))) return e;
     if ((e = make_gemm(T.t[T_IDX_WQ_B], T.s[T_IDX_WQ_B], M, sc.x8_small, io.idx_q,                           0, L.idx_q))) return e;
     if ((e = make_gemm(T.t[T_O_PROJ],   T.s[T_O_PROJ],   M, sc.x8_small, io.attn_part,                       1, L.o_proj))) return e;
+    // a dense trellis o_proj without an FP8 copy (dtr_find.h): the GEMM decodes its tiles (bit-equal to the copy)
+    if (!L.o_proj.on && T.tm.o_proj.w && (e = make_gemm_tr(T.tm.o_proj, M, sc.x8_small, io.attn_part, 1, L.o_proj))) return e;
     if ((e = make_gemm(T.t[GT],         T.s[GT],         M, sc.x8_big,   sc.g,                               0, L.gate))) return e;
     if ((e = make_gemm(T.t[UT],         T.s[UT],         M, sc.x8_big,   sc.u,                               0, L.up))) return e;
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;

@@ -223,7 +223,8 @@ inline void pf_qp_warm(Model& m, Prefill& P, cudaStream_t st)
     };
     gemm(w.qb_c, w.qb_s, r1 - (r0 & ~15), P.sc.x8_small, P.qp_qb, 0, "q_b (O_r)");
     gemm(w.qb_c, w.qb_s, c1r - (c0r & ~15), P.sc.x8_small, P.qp_qb, 0, "q_b (O_c)");
-    if (P.qp_early) { gemm(w.o_c, w.o_s, nc, P.qp_x8, P.qp_part, 1, "o_proj (O_c)"); gemm(w.o_c, w.o_s, no, P.qp_x8, P.qp_part, 1, "o_proj (O_r)"); }
+    if (P.T[il].tsuh[1]) {}           // a dense trellis o_proj runs k_gemm_tr: no cuBLAS, nothing to warm
+    else if (P.qp_early) { gemm(w.o_c, w.o_s, nc, P.qp_x8, P.qp_part, 1, "o_proj (O_c)"); gemm(w.o_c, w.o_s, no, P.qp_x8, P.qp_part, 1, "o_proj (O_r)"); }
     else gemm(w.o_c, w.o_s, nc + no, P.qp_x8, P.qp_part, 1, "o_proj (W)");
     G6RT_CK(cudaStreamSynchronize(st));
     if (m.rank == 0) fprintf(stderr, "# rank %d: G6_PF_OWN=4 warm-up (G6_PF_QP_WARM=1): absorb + UV at %zu row counts (%d..%d), q_b + o_proj\n",
@@ -247,6 +248,17 @@ inline bool pf_qp_select(Prefill& P, Prefill* P2, int ctx, int prompt)
     P.qp = on;
     if (P2) P2->qp = on;
     return on;
+}
+// the pair o_proj GEMM of n rows from the records x8 into y (BF16): MXFP8 codes, or a dense trellis layer's raw entries
+// (tr: o_c holds the two halves' 32 + 32 entries of 128 input rows back to back, decoded by k_gemm_tr)
+inline const char* qp_oproj_gemm(const QpW& w, bool tr, int n, const uint8_t* x8, void* y, bindp::Gemm& g)
+{
+    if (!tr) return bindp::make_gemm(w.o_c, w.o_s, n, x8, y, 1, g);
+    dtr::Mat m;
+    m.w = static_cast<const uint8_t*>(w.o_c.p);
+    m.K = 8192; m.N = HID; m.side = dtr::SIDE_IN;
+    m.sB = 64 * 128; m.sG = qw::OT / 32;
+    return bindp::make_gemm_tr(m, n, x8, y, 1, g);
 }
 // layer i's pair-owner attention block (DESIGN-QO-PAIR section 2 steps 4-5) on W = O_c then O_r (c = rank ^ 2) for this
 // rank's pair's 32 heads, as ONE QO call (one key-table prepass): q_b of each half (16-row aligned bindings; O_r's GEMM
@@ -351,7 +363,7 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
         xq.suh = tro ? w.o_suh : nullptr;
         bindp::launch(xq, st);
         bindp::Gemm op;
-        if (const char* er = bindp::make_gemm(w.o_c, w.o_s, n, x8, P.qp_part + (size_t)w0 * HID, 1, op)) die(std::string("pair o_proj: ") + er);
+        if (const char* er = qp_oproj_gemm(w, tro, n, x8, P.qp_part + (size_t)w0 * HID, op)) die(std::string("pair o_proj: ") + er);
         op.osvh = tro ? T.tsvh[1] : nullptr;
         bindp::launch(op, st);
     };
@@ -373,7 +385,7 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
         if (W > 0)
         {
             bindp::Gemm op;
-            if (const char* er = bindp::make_gemm(w.o_c, w.o_s, W, P.qp_x8, P.qp_part, 1, op)) die(std::string("pair o_proj: ") + er);
+            if (const char* er = qp_oproj_gemm(w, tro, W, P.qp_x8, P.qp_part, op)) die(std::string("pair o_proj: ") + er);
             op.osvh = tro ? T.tsvh[1] : nullptr;
             bindp::launch(op, st);
         }

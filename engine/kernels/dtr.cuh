@@ -28,8 +28,10 @@
 // launch.
 // DEC_SLOT: with Args::slot.send set, EPI_OUT writes BF16 into this rank's send slot and (DEC_SLOT >= 2) every CTA
 // takes part in the doorbell (decslot.cuh).
-// Prefill (make_fp8): the tiles decoded once into E4M3 codes for the MXFP8 GEMMs (bind_prefill.cuh). The prefill binder
-// applies the rotations around those GEMMs (Xq::suh, Gemm::osvh).
+// Prefill: o_proj runs on its tiles (bind_prefill.cuh k_gemm_tr decodes each stage into the bytes the FP8 copy would
+// hold, so the result is the copy path's to the bit). q_b and the dense MLP run on make_fp8 copies (the tiles decoded
+// once into E4M3 codes for the MXFP8 GEMMs), where reading the tiles measured slower. The prefill binder applies the
+// rotations around the GEMMs (Xq::suh, Gemm::osvh).
 #pragma once
 #include "tr3.cuh"
 #ifdef DEC_SLOT

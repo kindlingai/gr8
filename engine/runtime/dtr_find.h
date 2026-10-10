@@ -1,8 +1,10 @@
 // Dense trellis matrices (#116, kernels/dtr.cuh) on the prefill path. The prefill binder (bindp::layer_tensors) and the
-// pair-owner weights (qo_weights.cuh qp_half) read q_b, o_proj and the dense MLP as MXFP8 codes + scales under
+// pair-owner weights (qo_weights.cuh qp_half) read q_b and the dense MLP as MXFP8 codes + scales under
 // L%03d.NAME.mx.codes / .mx.scales. For a matrix in the release's trellis form, dtr_overlay serves its FP8 tile copy
 // (dtr::make_fp8: exact, still rotated, every scale 127) under those names. The binders find the matrix's suh / svh
 // themselves and wrap the GEMMs in the rotations.
+// o_proj gets no copy: its prefill GEMM decodes the tiles (bindp::make_gemm_tr, k_gemm_tr), bit-equal and at par, which
+// saves its 25.2 MB per layer at TP4. G6_DTR_PF_COPY=1 makes the o_proj copies too (the A/B).
 #pragma once
 #include <map>
 #include <memory>
@@ -16,6 +18,7 @@ namespace g6rt
 inline Find dtr_overlay(const Find& base, bool prefill, cudaStream_t st, int rank)
 {
     if (!prefill) return base;
+    const bool ocopy = getenv("G6_DTR_PF_COPY") && atoi(getenv("G6_DTR_PF_COPY")) == 1;
     auto over = std::make_shared<std::map<std::string, TensorRef>>();
     size_t bytes = 0;
     int n = 0;
@@ -23,6 +26,7 @@ inline Find dtr_overlay(const Find& base, bool prefill, cudaStream_t st, int ran
     for (int l = 0; l <= 78; ++l)
         for (int i = 0; i < dtr::NMAT; ++i)
         {
+            if (i == 1 && !ocopy) continue;                 // o_proj (dtr::MAT_NAMES[1]) reads its tiles
             snprintf(b, sizeof b, "L%03d.%s.", l, dtr::MAT_NAMES[i]);
             const std::string pre = b;
             const TensorRef t = base(pre + "trellis");

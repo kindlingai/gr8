@@ -5,7 +5,9 @@
 // [lo half image | hi half image], HALF bytes each. A half image is one pair member's 16-head slice of a layer, contiguous:
 // q_b codes [4096][2048] | q_b scales [4096][64] | o_proj codes [6144][4096] | o_proj scales [6144][128] | UK BF16 [16][192][512]
 // | UV BF16 [16][256][512] | q_b svh f16 [4096] | o_proj suh f16 [4096]. The last two carry the member's slices of a dense
-// trellis q_b / o_proj (kernels/dtr.cuh, whose codes are then its exact FP8 tile copy). MXFP8 layers leave them unused. Position h of the entry (0 = lo, 1 = hi) belongs to member qp_order(r, l)[h], the same order as
+// trellis q_b / o_proj (kernels/dtr.cuh). A dense trellis layer's q_b codes are its exact FP8 tile copy, and its o_proj
+// range carries the raw K4 entries [32][393216] (OT bytes) with the scales range unused. MXFP8 layers leave the vectors
+// unused. Position h of the entry (0 = lo, 1 = hi) belongs to member qp_order(r, l)[h], the same order as
 // the slot halves (qo_weights.cuh), so placement is identity: rank r stages ITS half at ITS position and RDMA-writes that
 // range to the partner p = r ^ 1 at the same offset; p's half arrives at the other position. No extra copy on either side.
 //
@@ -39,6 +41,8 @@ constexpr size_t QC = (size_t)4096 * 2048, QS = (size_t)4096 * 64, OC = (size_t)
 constexpr size_t OFF_QC = 0, OFF_QS = OFF_QC + QC, OFF_OC = OFF_QS + QS, OFF_OS = OFF_OC + OC, OFF_UK = OFF_OS + OS,
                  OFF_UV = OFF_UK + UK, OFF_QV = OFF_UV + UV, OFF_OV = OFF_QV + QV, HALF = OFF_OV + OV;
 static_assert(HALF == 41943040 + 16384, "half image: 40 MiB + 16 KiB per pair member and layer");
+constexpr size_t OT = (size_t)32 * 393216;          // a dense trellis o_proj half: 32 K4 entries of 128 input rows x 6144
+static_assert(OT <= OC, "the trellis o_proj half fits the o_proj codes range");
 static_assert(OFF_QS % 8 == 0 && OFF_OC % 8 == 0 && OFF_OS % 8 == 0 && OFF_UK % 8 == 0 && OFF_UV % 8 == 0 && OFF_QV % 8 == 0 &&
               OFF_OV % 8 == 0, "8-B ranges");
 // error words of the wire (its fabric's BulkDev::error); the bulk proxy's own codes are bulk_proxy.h 0x71-0x74

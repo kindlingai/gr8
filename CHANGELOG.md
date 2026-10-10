@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-10: o_proj prefill reads its trellis tiles (#116)
+
+- `bindp::k_gemm_tr` loads the raw K4 tiles of a dense trellis matrix (half the bytes of its FP8 copy) and decodes each
+  stage into the bytes the copy would hold, so its output equals the copy path's to the bit. The decode of the next
+  stage overlaps the current stage's mma.
+- o_proj prefill uses it, including the pair-owner path (`G6_PF_OWN=4`), whose o_proj half now travels as raw tiles.
+  The o_proj FP8 copies are gone: about 2.0 GB less per rank at TP4. `G6_DTR_PF_COPY=1` brings them back (A/B).
+- Prefill time, tiles / copy, TP4 rank-0 shapes at 2200 MHz: o_proj 0.97-1.00 at 512 rows, 0.72 at 2048, 0.73-1.00 at
+  4096 (the copy path's time varies between runs); the pair o_proj 0.69-0.95. q_b and the dense MLP keep their copies:
+  on the tiles they measured 1.07-1.33.
+
 ## 2026-10-10: boot from the exlr8 release alone (#116, step 1, part 2)
 
 - `g6m4 --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR`, with no `--manifest` / `--pack`: the Rust loader

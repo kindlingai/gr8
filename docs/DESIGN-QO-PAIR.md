@@ -50,9 +50,10 @@ both pair members (the lower head group first).
 - **Resident pair pack (`--qp-manifest` / `--qp-pack`).** `tools/convert/pairpack.py` builds `qp.rank<r>.pack` from the
   four rank packs (5.97 GB per rank). This does not fit next to a TP4 rank pack at the 393,216-token pool, so it is
   only for smaller pools or tests.
-- Dense trellis q_b / o_proj (the exlr8 release form, #116). The pair codes are the members' FP8 tile copies
-  (`engine/runtime/dtr_find.h`, exact: the codebook is E4M3) with every scale 127, so the slots and the wire carry
-  them as they carry MXFP8. The half image adds the member's q_b svh and o_proj suh slices (8 KiB each). The shared
+- Dense trellis q_b / o_proj (the exlr8 release form, #116). The q_b half is the member's FP8 tile copy
+  (`engine/runtime/dtr_find.h`, exact: the codebook is E4M3) with every scale 127, so the slots and the wire carry it
+  as they carry MXFP8. The o_proj half travels and sits in the slot as the member's raw trellis tiles (12.6 MB, inside
+  the MXFP8 half's code range), and the pair's o_proj GEMM decodes them (`k_gemm_tr`). The half image adds the member's q_b svh and o_proj suh slices (8 KiB each). The shared
   q_b suh rotates the pair's q_b input and the pair's svh its output. The pair's suh rotates the o_proj input and the
   shared svh its output (`Xq::suh`, `Gemm::osvh`). A layer's form is part of the wire's ready tag, so a
   pair that disagrees fails closed. The resident pair pack has no trellis form.
