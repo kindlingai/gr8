@@ -1,5 +1,5 @@
 // Head-group unit test for the sparse prefill attention kernels gp::sparse_qk and gp::sparse_pv (prefill.cuh).
-// The grid z dimension = ceil(heads/16); block z handles heads [16z, 16z+16). TP3 ranks hold 22 or 21 heads,
+// heads > 16 runs the MT=2 kernels (two 16-head tiles share one cache gather); heads <= 16 runs MT=1. TP3 ranks hold 22 or 21 heads,
 // so heads 16..21 live in z = 1 (before 811f6e6 only the first 16 heads were computed). One GPU, random data,
 // with invalid indices (-1, > position, >= context) to exercise masking. Every head is compared against a CPU
 // reference (fp16 inputs, fp32/double accumulate); outputs start as NaN so an unwritten head fails.
@@ -49,8 +49,8 @@ static bool run_case(int H,int n,int R,int start,int ctx,std::mt19937& rng){
     G6Attn a;memset(&a,0,sizeof a);
     a.rows=rows;a.heads=H;a.context=ctx;a.query_tile=R;a.positions=dpos;a.indices=dind;
     // same launch shapes as the engine (prefill.cuh trace loop)
-    gp::sparse_qk<<<dim3(ga::TOP/64,n,(a.heads+15)/16),128>>>(a,start,R,dq,dcache,dscore);CK(cudaGetLastError());
-    gp::sparse_pv<<<dim3(8,n,(a.heads+15)/16),128>>>(a,start,R,dprob,dcache,dctx);CK(cudaGetLastError());
+    if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128>>>(a,start,R,dq,dcache,dscore);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128>>>(a,start,R,dq,dcache,dscore);CK(cudaGetLastError());
+    if(a.heads>16)gp::sparse_pv<2><<<dim3(8,n),128>>>(a,start,R,dprob,dcache,dctx);else gp::sparse_pv<1><<<dim3(8,n),128>>>(a,start,R,dprob,dcache,dctx);CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
     std::vector<float> score((size_t)R*H*TOP),ctxo((size_t)H*R*512);
     CK(cudaMemcpy(score.data(),dscore,score.size()*4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(ctxo.data(),dctx,ctxo.size()*4,cudaMemcpyDeviceToHost));

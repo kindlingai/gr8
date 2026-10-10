@@ -149,38 +149,49 @@ __global__ void pack_q(G6Attn a,int start,int n,int R,const float* qf,half* q){
 // fringe lanes are zero-filled; no padded heads exist in the ABI or output.
 // Copy eight contiguous halves per load; all internal row strides are 16-byte
 // aligned. Reuse operand storage for output only after every warp is finished.
-__global__ void sparse_qk(G6Attn a,int start,int R,const half* q,const half* cache,float* scores){
+template<int MT> __global__ void sparse_qk(G6Attn a,int start,int R,const half* q,const half* cache,float* scores){
+ // MT head tiles of 16 share one gather of the selected cache rows (TP3: 22/21 heads -> MT=2)
  constexpr int N=64,K=64;
  using namespace nvcuda;constexpr int THREADS=N/16*32;int row=blockIdx.y,r=start+row,k0=blockIdx.x*N,t=threadIdx.x,w=t/32;
- const int h0=blockIdx.z*16,hn=min(16,a.heads-h0);   // head group of 16 (TP3: 22/21 heads per rank)
- __shared__ __align__(32) half arena[(16+N)*K];half* A=arena;half* B=A+16*K;float* O=(float*)arena;
+ const int hn=min(16*MT,a.heads);
+ __shared__ __align__(32) half arena[(16*MT+N)*K];half* A=arena;half* B=A+16*MT*K;float* O=(float*)arena;
  wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>aa;
  wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major>bb;
- wmma::fragment<wmma::accumulator,16,16,16,float>cc;wmma::fill_fragment(cc,0.f);
+ wmma::fragment<wmma::accumulator,16,16,16,float>cc[MT];
+#pragma unroll
+ for(int m=0;m<MT;m++)wmma::fill_fragment(cc[m],0.f);
  for(int base=0;base<576;base+=K){
-  for(int i=t;i<16*K/8;i+=THREADS){int h=h0+i/(K/8),d=base+(i%(K/8))*8;((int4*)A)[i]=(h<a.heads&&d<576)?*(const int4*)(q+((int64_t)h*R+row)*576+d):make_int4(0,0,0,0);}
+  for(int i=t;i<16*MT*K/8;i+=THREADS){int h=i/(K/8),d=base+(i%(K/8))*8;((int4*)A)[i]=(h<a.heads&&d<576)?*(const int4*)(q+((int64_t)h*R+row)*576+d):make_int4(0,0,0,0);}
   for(int i=t;i<N*K/8;i+=THREADS){int j=i/(K/8),d=base+(i%(K/8))*8,id=a.indices[(int64_t)r*ga::TOP+k0+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context&&d<576;((int4*)B)[i]=ok?*(const int4*)(cache+(int64_t)id*576+d):make_int4(0,0,0,0);}
-  __syncthreads();for(int k=0;k<K;k+=16){wmma::load_matrix_sync(aa,A+k,K);wmma::load_matrix_sync(bb,B+w*16*K+k,K);wmma::mma_sync(cc,aa,bb,cc);}__syncthreads();
+  __syncthreads();for(int k=0;k<K;k+=16){wmma::load_matrix_sync(bb,B+w*16*K+k,K);
+#pragma unroll
+   for(int m=0;m<MT;m++){wmma::load_matrix_sync(aa,A+m*16*K+k,K);wmma::mma_sync(cc[m],aa,bb,cc[m]);}}__syncthreads();
  }
- wmma::store_matrix_sync(O+w*16,cc,N,wmma::mem_row_major);__syncthreads();
- for(int i=t;i<hn*N;i+=THREADS){int h=h0+i/N,j=i%N,id=a.indices[(int64_t)r*ga::TOP+k0+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context;scores[((int64_t)row*a.heads+h)*ga::TOP+k0+j]=ok?O[i]*(1.f/16):-INFINITY;}
+#pragma unroll
+ for(int m=0;m<MT;m++)wmma::store_matrix_sync(O+m*16*N+w*16,cc[m],N,wmma::mem_row_major);__syncthreads();
+ for(int i=t;i<hn*N;i+=THREADS){int h=i/N,j=i%N,id=a.indices[(int64_t)r*ga::TOP+k0+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context;scores[((int64_t)row*a.heads+h)*ga::TOP+k0+j]=ok?O[i]*(1.f/16):-INFINITY;}
 }
 // K=128 staging amortizes gathers/barriers; MMA accumulation remains K=16
 // in selected-list order, with one RN half conversion per probability.
-__global__ void sparse_pv(G6Attn a,int start,int R,const float* p,const half* cache,float* context){
+template<int MT> __global__ void sparse_pv(G6Attn a,int start,int R,const float* p,const half* cache,float* context){
  constexpr int N=64,K=128;
  using namespace nvcuda;constexpr int THREADS=N/16*32;int row=blockIdx.y,r=start+row,d0=blockIdx.x*N,t=threadIdx.x,w=t/32;
- const int h0=blockIdx.z*16,hn=min(16,a.heads-h0);   // head group of 16 (TP3: 22/21 heads per rank)
- __shared__ __align__(32) half arena[(16+N)*K];half* A=arena;half* B=A+16*K;float* O=(float*)arena;
+ const int hn=min(16*MT,a.heads);
+ __shared__ __align__(32) half arena[(16*MT+N)*K];half* A=arena;half* B=A+16*MT*K;float* O=(float*)arena;
  wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>aa;
  wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major>bb;
- wmma::fragment<wmma::accumulator,16,16,16,float>cc;wmma::fill_fragment(cc,0.f);
+ wmma::fragment<wmma::accumulator,16,16,16,float>cc[MT];
+#pragma unroll
+ for(int m=0;m<MT;m++)wmma::fill_fragment(cc[m],0.f);
  for(int base=0;base<ga::TOP;base+=K){
-  for(int i=t;i<16*K/2;i+=THREADS){int h=h0+i/(K/2),j=base+(i%(K/2))*2;float2 v=h<a.heads?*(const float2*)(p+((int64_t)row*a.heads+h)*ga::TOP+j):make_float2(0,0);((half2*)A)[i]=__floats2half2_rn(v.x,v.y);}
+  for(int i=t;i<16*MT*K/2;i+=THREADS){int h=i/(K/2),j=base+(i%(K/2))*2;float2 v=h<a.heads?*(const float2*)(p+((int64_t)row*a.heads+h)*ga::TOP+j):make_float2(0,0);((half2*)A)[i]=__floats2half2_rn(v.x,v.y);}
   for(int i=t;i<K*N/8;i+=THREADS){int j=base+i/(N/8),d=d0+(i%(N/8))*8,id=a.indices[(int64_t)r*ga::TOP+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context;((int4*)B)[i]=ok?*(const int4*)(cache+(int64_t)id*576+d):make_int4(0,0,0,0);}
-  __syncthreads();for(int k=0;k<K;k+=16){wmma::load_matrix_sync(aa,A+k,K);wmma::load_matrix_sync(bb,B+k*N+w*16,N);wmma::mma_sync(cc,aa,bb,cc);}__syncthreads();
+  __syncthreads();for(int k=0;k<K;k+=16){wmma::load_matrix_sync(bb,B+k*N+w*16,N);
+#pragma unroll
+   for(int m=0;m<MT;m++){wmma::load_matrix_sync(aa,A+m*16*K+k,K);wmma::mma_sync(cc[m],aa,bb,cc[m]);}}__syncthreads();
  }
- wmma::store_matrix_sync(O+w*16,cc,N,wmma::mem_row_major);__syncthreads();for(int i=t;i<hn*N;i+=THREADS){int h=h0+i/N,d=i%N;context[((int64_t)h*R+row)*512+d0+d]=O[i];}
+#pragma unroll
+ for(int m=0;m<MT;m++)wmma::store_matrix_sync(O+m*16*N+w*16,cc[m],N,wmma::mem_row_major);__syncthreads();for(int i=t;i<hn*N;i+=THREADS){int h=i/N,d=i%N;context[((int64_t)h*R+row)*512+d0+d]=O[i];}
 }
 __global__ void dense_gather(G6Attn a,int start,int n,int R,const float* dense,float* score){
     int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n*a.heads*TOP)return;int j=i%TOP,h=(i/TOP)%a.heads,row=i/(TOP*a.heads),r=start+row,id=a.indices[(int64_t)r*TOP+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context;
@@ -337,7 +348,7 @@ extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,cons
         const bool mapped=dense&&a.context>0&&D<=8192&&H*ga::TOP>=a.context;
         if(dense){GP_BLAS(cublasGemmEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,D,H*R,576,&scale,p->cache,CUDA_R_16F,576,p->q,CUDA_R_16F,576,&zero,p->dense,CUDA_R_32F,D,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             if(!mapped)gp::dense_gather<<<(n*H*ga::TOP+255)/256,256,0,st>>>(a,start,n,R,p->dense,p->prob);
-        }else gp::sparse_qk<<<dim3(ga::TOP/64,n,(a.heads+15)/16),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);
+        }else {if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);}
         G6_PF_MARK(7,st);if(mapped){
             cudaMemsetAsync(p->prob,0xff,(size_t)R*a.context*4,st);
             gp::dense_links<<<(n*ga::TOP+255)/256,256,0,st>>>(a,start,n,(int*)p->prob,p->next);
@@ -345,7 +356,7 @@ extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,cons
         }else{gp::trace_copy(tr.scores,p->prob,start,n,H,ga::TOP,st);ga::normalize<<<n*H,256,0,st>>>(a,p->prob);gp::trace_copy(tr.probs,p->prob,start,n,H,ga::TOP,st);}
         G6_PF_MARK(8,st);if(dense){if(!mapped){cudaMemsetAsync(p->dense,0xff,(size_t)R*a.context*4,st);gp::dense_links<<<(n*ga::TOP+255)/256,256,0,st>>>(a,start,n,(int*)p->dense,p->next);gp::dense_probabilities<<<(H*R*D+255)/256,256,0,st>>>(a,n,R,D,p->prob,(const int*)p->dense,p->next,p->densep);}
             GP_BLAS(cublasGemmEx(p->blas,CUBLAS_OP_N,CUBLAS_OP_N,512,H*R,D,&one,p->cache,CUDA_R_16F,576,p->densep,CUDA_R_16F,D,&zero,p->ctx,CUDA_R_32F,512,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }else gp::sparse_pv<<<dim3(8,n,(a.heads+15)/16),128,0,st>>>(a,start,R,p->prob,p->cache,p->ctx);
+        }else {if(a.heads>16)gp::sparse_pv<2><<<dim3(8,n),128,0,st>>>(a,start,R,p->prob,p->cache,p->ctx);else gp::sparse_pv<1><<<dim3(8,n),128,0,st>>>(a,start,R,p->prob,p->cache,p->ctx);}
         GP_PROFILE();G6_PF_MARK(9,st);gp::trace_h(tr.context,p->ctx,start,n,R,H,512,st);gp::cast_half<<<(H*R*512+255)/256,256,0,st>>>(p->ctx,p->ctxh,H*R*512);
         GP_BLAS(cublasGemmStridedBatchedEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,256,R,512,&one,p->uv,CUDA_R_16F,512,256*512,p->ctxh,CUDA_R_16F,512,(long long)R*512,&zero,p->q,CUDA_R_16F,256,(long long)R*256,H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         gp::unpack_uv<<<(n*H*256+255)/256,256,0,st>>>(a,start,n,R,p->q);GP_PROFILE();
