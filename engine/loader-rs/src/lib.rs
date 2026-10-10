@@ -14,10 +14,12 @@
 //! g6l_v2_plan plans an image without a v2 pack: the base pack's tensors, with the v2 experts read from the raw width
 //! files at the offsets of the index slices (src/v2plan.rs). g6l_plan_load then loads it like a pack.
 
+pub mod dflash2;
 pub mod exlr8;
 pub mod fetch;
 pub mod json;
 mod plan;
+pub mod sha256;
 mod sys;
 mod v2plan;
 pub mod xxh64;

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The Hugging Face source against a fake hub on localhost: commit resolution, range GETs of one rank's expert halves,
 the hashes, resume, the token rule. The fake release holds synthetic exlr8 v2 layers (tools/convert/v2synth.py), so
-fetch_ranks.py and the xxhash64 check run for real. Needs numpy and xxhash, as the fetch itself does.
+fetch_ranks.py and bin/g6load run for real. Needs numpy to write the synthetic release (the fetch itself runs
+without it) and bin/g6load (cargo build --release --manifest-path engine/loader-rs/Cargo.toml).
     python3 -m unittest discover -s tools/launch"""
 import contextlib
 import hashlib
@@ -405,8 +406,8 @@ json.dump({'pack_bytes': 1000 + r}, open(os.path.join(out, f'dflash.r{r}.manifes
 
 @unittest.skipUnless(HAVE, 'needs numpy')
 class DrafterTests(unittest.TestCase):
-    """The drafter's own repo on the fake hub, with a stub in place of tools/convert/dflash2.py (the real drafter is
-    4.6 GB, and the converter checks its full dimensions)."""
+    """The drafter's own repo on the fake hub, with a stub in place of bin/g6load dflash2 (the real drafter is 4.9 GB,
+    and the converter checks its full dimensions). engine/loader-rs/tests/dflash2.rs checks the converter itself."""
 
     def setUp(self):
         self.t = tempfile.mkdtemp(prefix='gr8dr-')
@@ -421,7 +422,7 @@ class DrafterTests(unittest.TestCase):
         with open(stub, 'w') as f:
             f.write(STUB_CONVERT)
         self.patches = [mock.patch.dict(os.environ, {'GR8_HF_ENDPOINT': f'http://127.0.0.1:{self.hub.port}'}),
-                        mock.patch.object(hfsource, 'CONVERT', [sys.executable, stub])]
+                        mock.patch.object(hfsource, 'converter', lambda: [sys.executable, stub])]
         for p in self.patches:
             p.start()
         self.cache = os.path.join(self.t, 'cache')
@@ -440,6 +441,26 @@ class DrafterTests(unittest.TestCase):
         self.assertEqual(modelset.sha256_file(os.path.join(d.dir, 'model.safetensors')),
                          modelset.sha256_file(os.path.join(self.t, 'drafter', 'model.safetensors')))
         self.assertFalse([n for n in os.listdir(d.dir) if n.startswith('tmp.')])
+
+    def test_the_real_converter_runs(self):
+        """bin/g6load dflash2 itself, on the small test drafter: it refuses the dimensions, and the error comes back."""
+        src = os.path.join(REPO, 'engine', 'loader-rs', 'tests', 'data', 'dflash2', 'src')
+        hub = FakeHub({'fakeorg/small': {C1: src}}, {'fakeorg/small': {'main': C1}})
+        self.patches[1].stop()
+        try:
+            with mock.patch.dict(os.environ, {'GR8_HF_ENDPOINT': f'http://127.0.0.1:{hub.port}'}):
+                try:
+                    hfsource.converter()
+                except modelset.ModelError:
+                    self.skipTest('no bin/g6load: cargo build --release --manifest-path engine/loader-rs/Cargo.toml')
+                d = hfsource.Drafter(self.cache, 'fakeorg/small', 'main', log=lambda m: None)
+                with self.assertRaises(modelset.ModelError) as e:
+                    d.fetch_rank(3)
+        finally:
+            self.patches[1].start()
+            hub.close()
+        self.assertIn('hidden_size = 64, this converter is written for 6144', str(e.exception))
+        self.assertFalse(os.path.exists(d.out))
 
     def test_a_failed_conversion_leaves_nothing(self):
         d = hfsource.Drafter(self.cache, 'fakeorg/drafter', 'main', log=lambda m: None)

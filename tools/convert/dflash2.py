@@ -20,6 +20,10 @@ The engine reads the codec from the record size.
 BF16 as stored: D.hidden_norm, D.norm [6144]; D<j>.in_norm, D<j>.post_norm [6144]; D<j>.q_norm, D<j>.k_norm [128];
 D<j>.aconv.base, D<j>.mconv.base [2 sides][2 taps][6144]; D.sel.pred, D.sel.succ [154880][256] (codebooks).
 The manifest carries the drafter config (block size, mask id, target layers, window, rope theta, eps, selector).
+
+`bin/g6load dflash2` (engine/loader-rs/src/dflash2.rs) writes the same packs and manifests byte for byte without
+numpy; ./gr8 glm53 up --drafter uses it. Change both together: engine/loader-rs/tests/make_dflash2_fixture.py
+rebuilds the test fixture from this file, and the cargo tests compare.
 """
 import argparse
 import json

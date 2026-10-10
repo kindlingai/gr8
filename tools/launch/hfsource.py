@@ -35,9 +35,9 @@ import modelset
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # The DFlash2 drafter for GLM 5.3. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
-# fetches the drafter from its own repo and converts its rank with tools/convert/dflash2.py.
+# fetches the drafter from its own repo and converts its rank with bin/g6load dflash2 (the same bytes as
+# tools/convert/dflash2.py, without numpy).
 DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-DFlash2'
-CONVERT = [sys.executable, '-m', 'tools.convert.dflash2']
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
 CHUNK = 64 << 20
 # Until the engine reads the release's dense and vocab files (#116), it loads every non-expert weight from a base
@@ -59,6 +59,14 @@ def parse_url(model):
         raise modelset.ModelError(f'--model {model}: want https://huggingface.co/<org>/<repo>, optionally with @<rev> '
                                   'or /tree/<rev>')
     return m.group(1), m.group(2) or m.group(3) or 'main'
+
+
+def converter():
+    """The drafter converter's command: bin/g6load dflash2."""
+    try:
+        return [fetch_ranks().g6load(), 'dflash2']
+    except RuntimeError as e:
+        raise modelset.ModelError(f'converting the DFlash2 drafter: {e}') from None
 
 
 def fetch_ranks():
@@ -331,11 +339,7 @@ class Drafter:
 
     def fetch_rank(self, rank):
         """Fetch the drafter (checked against its hashes), convert this rank, check the pack, then write COMPLETE."""
-        try:
-            import numpy  # noqa: F401  (tools/convert/dflash2.py converts with it)
-        except ImportError:
-            raise modelset.ModelError('converting the DFlash2 drafter needs numpy (apt install python3-numpy). Nothing '
-                                      'else in the boot does: without it, boot with --dflash 0 (MTP only)')
+        convert = converter()                 # before the 4.9 GB download: is there a converter at all
         t = self.repo.tree()
         left = sum(t[n] for n in ('config.json', 'model.safetensors') if not os.path.isfile(os.path.join(self.dir, n)))
         meter = Meter(left, self.log, f'fetching the drafter {self}')
@@ -347,7 +351,7 @@ class Drafter:
         shutil.rmtree(tmp, ignore_errors=True)
         os.makedirs(tmp)
         self.log(f'converting the drafter {self} for rank {rank} of TP=4')
-        r = subprocess.run(CONVERT + ['--src', self.dir, '--out', tmp, '--nr', '4', '--ranks', str(rank)], cwd=REPO,
+        r = subprocess.run(convert + ['--src', self.dir, '--out', tmp, '--nr', '4', '--ranks', str(rank)], cwd=REPO,
                            capture_output=True, text=True)
         names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
         if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):

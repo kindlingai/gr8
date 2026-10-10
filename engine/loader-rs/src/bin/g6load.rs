@@ -8,7 +8,13 @@
 //!       "layer", "expert", "half", "proj"}]}. Exit 0 when every half matches, 3 when one does not, 1 on an error.
 //!
 //! DIR for --slices holds tp<N>/k<K>/rank<R>.safetensors (the release's index-slices/).
+//!
+//!   g6load dflash2 --src DIR --out DIR [--nr 4] [--ranks 0,1,2,3] [--bf16 fc,attn,mlp,conv,sel]
+//!       converts the DFlash2 drafter (config.json + model.safetensors in --src) into dflash.r<r>.pack and
+//!       dflash.r<r>.manifest.json for each rank, byte for byte what tools/convert/dflash2.py writes. One JSON line
+//!       per rank: {"rank", "tensors", "bytes", "seconds"}.
 
+use g6load::dflash2;
 use g6load::fetch::{self, Choice};
 use std::collections::BTreeMap;
 
@@ -34,7 +40,7 @@ fn layers(spec: &str) -> Result<Vec<usize>, String> {
 
 fn run() -> Result<i32, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
+    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify|dflash2 (see the source) --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
     let mut opt: BTreeMap<&str, &str> = BTreeMap::new();
     let mut it = argv[1..].iter();
     while let Some(k) = it.next() {
@@ -43,6 +49,12 @@ fn run() -> Result<i32, String> {
     }
     let need = |k: &str| opt.get(k).copied().ok_or(format!("{cmd}: {k} is required"));
     let num = |k: &str| need(k)?.parse::<usize>().map_err(|_| format!("{k}: not a number"));
+    if cmd == "dflash2" {
+        let nr = opt.get("--nr").map_or(Ok(4), |_| num("--nr"))?;
+        dflash2::main(need("--src")?, need("--out")?, nr, opt.get("--ranks").copied(), opt.get("--bf16").copied().unwrap_or(""),
+                      &dflash2::GLM53)?;
+        return Ok(0);
+    }
     let choice = match (opt.get("--manifest"), opt.get("--widths")) {
         (Some(m), None) => Choice::manifest(m)?,
         (None, Some(w)) => Choice::Widths(w.split(',').map(|k| k.parse::<u8>().map_err(|_| format!("--widths {w}")))
@@ -77,6 +89,6 @@ fn run() -> Result<i32, String> {
             println!("{{\"checked\": {}, \"bad\": [{}]}}", units.len(), rows.join(",\n"));
             Ok(if bad.is_empty() { 0 } else { 3 })
         }
-        _ => Err(format!("unknown command {cmd}: fetch-plan or verify")),
+        _ => Err(format!("unknown command {cmd}: fetch-plan, verify or dflash2")),
     }
 }

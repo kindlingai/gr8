@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-10: `bin/g6load dflash2` converts the drafter without numpy
+
+- `g6load dflash2 --src DIR --out DIR [--nr 4] [--ranks R] [--bf16 CLASSES]` (`engine/loader-rs/src/dflash2.rs`) writes
+  the DFlash2 drafter's `dflash.r<r>.pack` and `.manifest.json`, byte for byte what `tools/convert/dflash2.py` writes:
+  the same row and column slices, MXFP8 quantization (E8M0 scales, E4M3 round to nearest even) and decode record
+  layouts, a sha256 per tensor and the manifest JSON as Python prints it. On `incoai/GLM-5.3-DFlash2` all four TP=4
+  ranks match (pack sha256 and manifest bytes), in 7-9 s a rank against 14 s, and so does rank 1 with every class
+  in BF16.
+- `./gr8 glm53 up --drafter` converts this box's rank with it, so nothing on the boot path needs numpy now.
+  `tools/convert/dflash2.py` stays for `./gr8 glm53 packs` and its `--head` test packs.
+- `cargo test` compares both on a small synthetic drafter (`tests/data/dflash2`, from `tests/make_dflash2_fixture.py`)
+  with zero groups, -0.0, BF16 subnormals and rounding ties.
+
 ## 2026-10-10: dense trellis kernels for the exlr8 dense weights (#116, not wired)
 
 - `engine/kernels/dtr.cuh`: decode GEMV for the release's trellis K4 dense matrices (q_b, o_proj, the dense MLP of

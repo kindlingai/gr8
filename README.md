@@ -86,8 +86,9 @@ packs only (`tools/convert/convert.py --nr 3` for the rest).
   `known_hosts`. The shim writes each request into every rank's directory over ssh. That is the one ssh use left.
 - Python 3 on every box (the supervisor uses the standard library only), and the venv for the shim on the head.
   The fetch from Hugging Face needs nothing more than `bin/g6load`, which `./gr8 glm53 build` builds with the engine
-  (engine/loader-rs): it plans each rank's ranges from the index slices and checks every half's xxhash64. Only
-  `--drafter` needs numpy, to convert the drafter.
+  (engine/loader-rs): it plans each rank's ranges from the index slices and checks every half's xxhash64. With
+  `--drafter`, `bin/g6load dflash2` also converts this box's rank of the drafter. Nothing on the boot path needs
+  numpy.
 - Disk per box: the box's rank pack (about 90 GB at TP=4, 62 GB at TP=6), the drafter pack at TP=4 (0.86 GB) or
   the shared QO pack at TP=6 (13 GB), and the binary.
 - Disk for the pack build (one machine, any Linux box or one Spark): about 340 GB for the TR3 download, 10 GB for
@@ -178,7 +179,8 @@ On the machine with the disk (CPU only, about 15-25 minutes):
 
 `./gr8 glm53 packs` runs `scripts/build_packs.sh` (the rank count follows the GPTQ dir: `tp4/` or `tp6/`) and, at TP=4
 with a drafter dir (a `config.json` and `model.safetensors`), the DFlash2 drafter packs, `dflash.r<r>.*` (`python3 -m
-tools.convert.dflash2 --src <drafter dir> --out /data/packs --nr 4`), and copies the four tokenizer files into
+tools.convert.dflash2 --src <drafter dir> --out /data/packs --nr 4`; `bin/g6load dflash2` with the same arguments
+writes the same bytes without numpy), and copies the four tokenizer files into
 `/data/packs/tokenizer/`. Without the drafter packs, boot with `--dflash 0` for MTP only. `./gr8 glm53 check` says which.
 
 The pack directory is the model set. `--model` needs every rank's manifest, every rank's drafter manifest at TP=4
@@ -224,7 +226,8 @@ again. The commit goes into the id the boxes compare, so boxes on different comm
 is sent only when it is set. The published repos are public.
 
 `--drafter https://huggingface.co/<org>/<repo>` (TP=4) fetches the DFlash2 drafter into `DIR/hf/<org>--<repo>/<commit>/`
-and converts this box's rank there with `tools/convert/dflash2.py`. The drafter we use is
+and converts this box's rank there with `bin/g6load dflash2` (the bytes `tools/convert/dflash2.py` writes). The
+drafter we use is
 `https://huggingface.co/incoai/GLM-5.3-DFlash2` (CC BY-NC-ND 4.0, so no converted copy is shared). With DFlash2 on and no
 drafter, `up` runs MTP only and prints the flag to add, and `--dflash 1` without one is refused.
 
