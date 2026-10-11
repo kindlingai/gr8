@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Engine-side S2 shim: speaks PROTOCOL.md v1 on the Unix socket and drives g6m4 --serve DIR (a DEC_S2 build) over the
-S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire, and EOS_IDS from g6shim).
+S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire).
 
 The engine side is the code, not a document: engine/runtime/s2/{ingress.h,sessions.h,service.h,bootstrap.h,scheduler.h}.
 File protocol, in the head rank's DIR (the shim runs on the head), one engine epoch per start of g6m4 --serve (every
@@ -20,7 +20,7 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
         a <epoch> <slot> <generation> <base_page> <pages>   admitted (the request got a slot and its KV run)
         p <j> <lp> <rank> <n> <id>:<lp> ...                  with plp: prompt token j (1 <= j < prompt length), before the
                                                              first t line; the shim sends one prompt_logprobs frame then
-        l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line (as g6shim.py)
+        l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line, before it
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
         m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
         end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame
@@ -45,10 +45,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from g6front import wire  # noqa: E402
-from g6shim import EOS_IDS, VOCAB, Shim as PlainShim  # noqa: E402
 
 log = logging.getLogger('g6s2shim')
 
+EOS_IDS = [154820, 154827, 154829]
+VOCAB = 154880
+FLOOR = -9999.0   # logprob sent for -inf / nan (the front end clamps at the same value)
 INT32_MAX = 2**31 - 1
 READY_FIELDS = {'1': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows'),
                 '2': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
@@ -68,6 +70,19 @@ def parse_ready(text: str) -> dict:
     if not names or len(w) != 2 + len(names) or not all(x.isdigit() for x in w[2:]):
         raise ValueError(f'bad ready.s2: {text!r}')
     return {'max_lp': 0, **dict(zip(names, map(int, w[2:])))}    # version 1: no logprobs
+
+
+def lp_entry(w):
+    """engine logprob fields <lp> <rank> <n> <id>:<lp> ... -> a PROTOCOL.md entry {lp, rank, top}"""
+    def num(x):
+        x = float(x)
+        return x if math.isfinite(x) else FLOOR
+    rank, k = int(w[1]), int(w[2])
+    top = []
+    for tok in w[3:3 + k]:
+        i, v = tok.split(':')
+        top.append([int(i), num(v)])
+    return {'lp': num(w[0]), 'rank': rank if rank > 0 else None, 'top': top}
 
 
 def build_request(f: dict, ordinal: int):
@@ -352,9 +367,9 @@ class Shim:
         if w[0] == 'a':
             r.admitted = True
         elif w[0] == 'l':
-            r.lps.append(PlainShim.entry(w[1:]))
+            r.lps.append(lp_entry(w[1:]))
         elif w[0] == 'p':
-            r.plps[int(w[1])] = PlainShim.entry(w[2:])
+            r.plps[int(w[1])] = lp_entry(w[2:])
         elif w[0] == 't':
             ids = [int(x) for x in w[1:]]
             r.emitted += len(ids)

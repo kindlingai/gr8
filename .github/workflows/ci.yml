@@ -233,7 +233,7 @@ jobs:
             for b in bin/g6m4 bin/m4sim bin/gpuprobe bin/g6front-rs bin/g6load bin3/g6m4 bin6/g6m4 bin6/m4sim; do
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
             done
-            python3 -c "import g6s2shim, g6shim"
+            python3 -c "import g6s2shim"
             python3 -c "import tools.convert.convert, tools.convert.dflash2"
             bin/g6front-rs --help > /dev/null
             echo smoke OK'

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-11: S2 is the only serving path
+
+- `g6m4` needs a DEC_S2 build and refuses to compile without one. The loop that served one request at a time (`--serve`
+  without S2, `DIR/req.<n>` and `DIR/ready` on every rank) is gone. Without `--serve`, `g6m4` still runs its `--prompt`
+  sequences once and exits: `docs/REUSE-GPU-TEST.md` uses that.
+- `frontend/g6shim.py` is gone, with `tests/test_g6shim.py`, `tests/test_shim.py` and `tests/fake_serve_engine.py`.
+  `g6s2shim.py` now holds `EOS_IDS` and `VOCAB`.
+- The launcher always starts the Rust front end and `g6s2shim.py`. The `FRONT` option is gone, and a `FRONT` line in an
+  old config file is ignored. The Python front end (`frontend/g6front`) stays as the reference the Rust one is tested
+  against.
+
 ## 2026-10-11: S2 sessions hold page lists
 
 - A session's KV is a list of pool pages, the lowest free ones first. A request is admitted whenever enough pages are

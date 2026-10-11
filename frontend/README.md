@@ -4,7 +4,7 @@ An OpenAI/vLLM-compatible HTTP server in front of the g6 engine. It talks to the
 the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
 streaming and `/metrics`. It comes in two implementations with the same flags and byte-identical responses
 (`tests/diff_fronts.py`): `g6front-rs/`, one static Rust binary, which `./gr8 glm53 up` runs; and `g6front/`, pure
-Python asyncio, the reference the tests compare against, which can still serve a build without DEC_S2 (the one-request loop).
+Python asyncio, the reference the tests compare against.
 
 ## Endpoints
 
@@ -119,29 +119,25 @@ Tests: `cargo test --release` (unit tests); `tests/diff_fronts.py` (parity with 
 then the successful ones replayed concurrently); `tests/bench_fronts.py` (the numbers above); and `tests.test_api` and
 `bench/pbench.py` run unchanged against it.
 
-## Real engine through files: g6shim.py
+## Real engine through files: g6s2shim.py
 
-`g6shim.py` listens on the engine socket and drives `g6m4`/`m4sim --serve DIR` through `req.<n>` / `resp.<n>` files (format in its docstring). One request at a time; `--rank-dirs` takes rank 0's local DIR first, then the other ranks as `host:/path` (written over one persistent ssh connection per host). `cancel` answers `abort` at once and swallows the rest of that request. SIGTERM writes `DIR/quit` to every rank. `logprobs` / `prompt_logprobs` (k = 0..`--max-logprobs`, default 20) go to the engine as `lp <k>` / `plp <k>` request keys; the engine answers with `l` / `p` lines (serve.h). `--max-plp-prompt` (default 4096) bounds the prompt length of a `prompt_logprobs` request. The rank of a token beyond the engine's top 20 (and every rank at k = 0) is `null`. top_p is passed; top_k/min_p are ignored with a warning. Tests: `tests/fake_serve_engine.py` (a fake `--serve` engine) and `tests/test_shim.py SOCK`.
-
-## Several requests at once: g6s2shim.py (DEC_S2 build)
-
-`g6s2shim.py` is the engine-side shim for `g6m4 --serve DIR` in a DEC_S2 build, on the head: same PROTOCOL.md socket as `g6shim.py`, but up to `--s2-sessions` requests decode in one step. Stdlib only. The engine side of the file protocol is `engine/runtime/s2/{ingress.h,sessions.h,service.h,scheduler.h}`; the shim docstring has the summary:
+`g6s2shim.py` is the engine-side shim for `g6m4 --serve DIR`, on the head: it listens on the PROTOCOL.md socket, and up to `--s2-sessions` requests decode in one step. Stdlib only. The engine side of the file protocol is `engine/runtime/s2/{ingress.h,sessions.h,service.h,scheduler.h}`; the shim docstring has the summary:
 
 - The engine writes `DIR/ready.s2` (`G6S2 2 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>`) when every rank has booted. Version 1 (no `<max_lp>`) has no logprobs. The shim sends `hello` only after that, with `max_model_len = pool_rows - guard` (lower it with `--max-model-len`). `DIR/status.s2` (queue, free pages) goes into the `metrics` frame as an extra `s2` field.
 - A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [lp <k>] [plp <k>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
-- Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both as `g6shim.py`), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics`), `end <reason> <stop_id> <n>` (finish frame).
+- Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics`), `end <reason> <stop_id> <n>` (finish frame).
 - `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice.
 - The engine ends the whole epoch on a request it cannot parse or fit, so the shim checks prompt, ids (0 to 154879: the engine does not bound-check the embedding index), `max_tokens`, `top_p` (must be in (0, 1]; 0 is an error, not off), and the length first and answers `error` itself. `logprobs` / `prompt_logprobs` (k = 0..min(`--max-logprobs`, the ready line's `<max_lp>`)) go to the engine as `lp <k>` / `plp <k>`. A `prompt_logprobs` request runs its whole prompt as 8-row decode steps, and every other session waits until that is done: an 813-token prompt held a decoding session for 10.9 s (TP4, about 13.4 ms per prompt token). `--max-plp-prompt` defaults to 1,024 tokens here (about 14 s). `top_k`/`min_p` are ignored with a warning (`top_p` and `min_tokens` go to the engine).
 - `DIR/abort.s2` (epoch lost) turns every open request into `error` and every later request too; restart the engine and the shim. SIGTERM writes `DIR/quit`, and the head engine passes it to the other ranks. A restarted shim continues the `req`/`cmd` numbers from the files in DIR. Every rank's DIR must be fresh for a new engine start.
 
 ```bash
-# engine (every rank; fresh DIR each start): DEC_S2 build, --graph --mtp --prefill, G6_DEC_SPLIT=3, a G6_CP build
+# engine (every rank; fresh DIR each start): --graph --mtp --prefill, G6_DEC_SPLIT=3, a G6_CP build
 g6m4 ... --serve /run/g6/s2 --s2-port N --s2-sessions 4 --s2-epoch 7
 python3 g6s2shim.py --dir /run/g6/s2 --sock /run/g6/engine.sock      # on the head only
 bin/g6front-rs --engine-sock /run/g6/engine.sock ...
 ```
 
-Tests, no GPU (`tests/fake_s2_engine.py` is the file side of `g6m4 --serve` in a DEC_S2 build: FIFO admit up to `--sessions`, one round time for any number of sessions, per-request `resp`, the engine's strict parsing; tokens depend on prompt and position only, so streams are checked for cross-talk):
+Tests, no GPU (`tests/fake_s2_engine.py` is the file side of `g6m4 --serve`: FIFO admit up to `--sessions`, one round time for any number of sessions, per-request `resp`, the engine's strict parsing; tokens depend on prompt and position only, so streams are checked for cross-talk):
 
 ```bash
 cd frontend && python3 -m unittest tests.test_s2shim -v
@@ -151,7 +147,7 @@ It covers 4 concurrent streams (exact tokens, wall clock under 2x one stream, 4 
 
 ### Round log and cost fit
 
-`G6_S2_ROUNDLOG=1 g6m4 ... --serve ...` (a DEC_S2 build) makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
+`G6_S2_ROUNDLOG=1 g6m4 ... --serve ...` makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
 
 ```bash
 tools/s2_costfit.py engine_rank0.log [--residuals] [--json]   # also ms per whole round by active sessions; step_ms = base + per_expert * experts(d*rows) + per_token * rows

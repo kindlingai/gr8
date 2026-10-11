@@ -27,7 +27,7 @@ the full-index layers; vocab 154,880.
 | | `engine/runtime/rank.cuh` | `QA = 2048`, `KVA = 576`, `IDXQ = 4096`, `IDXK = 128`, `IDXW = 32`; the layer sequence (dense / MoE / MTP) |
 | | `engine/runtime/qo_weights.cuh`, `attn/prefill-qo-*` | full-head QO attention shapes |
 | drafter | `engine/runtime/dflash.cuh`, `tools/convert/dflash2.py` | the GLM 5.3 DFlash2 drafter: 6 layers, 64 q / 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), target layers 5..75 (from the pack), selector rank 256 / top 16; TP must divide the 8 KV heads |
-| front end | `frontend/g6shim.py` (the S2 shim imports them) | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
+| front end | `frontend/g6s2shim.py` | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
 | | `frontend/g6front/glm_parser.py` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format |
 | | `frontend/g6front/template.py`, `tokenizer.py` | read `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so these follow the model directory |
 | | `frontend/g6front-rs/src/` | the same parser, template and tokenizer handling in the Rust front end that `./gr8 glm53 up` runs |
@@ -54,7 +54,7 @@ the full-index layers; vocab 154,880.
 | RoCE v2 verbs fabric: device discovery by IP, two rails, all-reduce / reduce-scatter / all-gather with device doorbells, bulk proxy | `engine/comms/` |
 | pack format (sequential tensors, 4096-byte alignment, sha256 per tensor in a JSON manifest), writer, checker | `tools/convert/pack.py`, `checkpack.py`, `engine/loader/` |
 | device image loader (whole pack into one allocation, optional hash check) | `engine/loader/devimage.*` |
-| multi-session scheduler (S2), the serve loop (file protocol), step plan, CUDA graph capture per row count, MTP draft/verify loop | `engine/runtime/s2/`, `s2_batch.h`, `serve.h`, `rank.cuh` |
+| multi-session scheduler (S2), the request and response files, step plan, CUDA graph capture per row count, MTP draft/verify loop | `engine/runtime/s2/`, `s2_batch.h`, `serve.h`, `rank.cuh` |
 | context-parallel KV layout and the staged-page hash check | `engine/comms/cplayout.h`, `engine/runtime/prefill.cuh` (CP sections) |
 | OpenAI/vLLM-compatible HTTP server, metrics, streaming, socket protocol | `frontend/g6front-rs/`, `frontend/g6front/`, `PROTOCOL.md` |
 | the per-box launcher: options, handshake, model cache, Hugging Face fetch | `gr8`, `tools/launch/` |

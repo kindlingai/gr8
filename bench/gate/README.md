@@ -82,7 +82,8 @@ the gate set; a baseline built from runs with it gates these metrics like any ot
 ## Notes
 
 - The KL reference must be taken on the same topology, from gr8 `main` at a recorded commit (`--commit` is stored in
-  the file). g6's front end needs an engine that returns `prompt_logprobs`; `frontend/g6shim.py` does not today.
+  the file). g6's front end needs an engine that returns `prompt_logprobs`: `frontend/g6s2shim.py` passes them for
+  prompts up to `--max-plp-prompt` (default 1,024 tokens).
 - KL treatment of tokens missing from the new build's top 20: they take the new build's 20th logprob (an upper bound),
   so KL is a lower bound for those terms. The tail bucket is everything outside the reference's top 20.
 - Tests (no GPU, no model): `python3 -m unittest discover bench/gate/tests`.

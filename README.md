@@ -216,7 +216,7 @@ should use the release.
 | `engine/attn/` | MLA decode and prefill attention and the sparse indexer |
 | `engine/comms/` | the RoCE v2 verbs fabric: collectives, bulk proxy, context-parallel layout |
 | `engine/loader-rs/` | the Rust loader: plans each rank's image from the release, fetches from Hugging Face, converts the drafter |
-| `frontend/` | the HTTP front end (`g6front-rs`) and the shim that drives the ranks |
+| `frontend/` | the HTTP front end (`g6front-rs`) and the shim that drives the engine |
 | `scripts/` | build, tests and `engine_args.sh` (the engine command line) |
 | `tools/convert/` | packs from public checkpoints (optional) |
 | `smoketest/`, `bench/` | the smoke test, benchmarks and the quality gate |
