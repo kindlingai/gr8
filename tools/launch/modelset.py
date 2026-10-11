@@ -232,10 +232,16 @@ def offers(ms, plan):
     return None if len(ok) == tp else ok
 
 
-# The exlr8 v2 variants a release ships, and their mean routed-expert bits per weight.
-VARIANTS = {'home': 3.25, 'down1': 2.25, 'up1': 4.0}
-# home's experts take 99.8 GB of a rank at TP=3, which leaves no room for the KV pool on a 128 GB box
-DEFAULT_VARIANT = {3: 'down1'}
+# The exlr8 v2 variants a release ships, and their mean routed-expert bits per weight. home, down1 and up1 follow
+# the TR3 checkpoint's per-expert widths. The bitNNN profiles spend their bits by tensor type, then by layer, in the
+# order that lowered full-vocabulary KL against bf16 the most per byte.
+VARIANTS = {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
+            'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38}
+# The default for a TP: the first of these the model set has. bit225 is down1's size with 5-10% lower KL against
+# bf16, at par on code and ~2% slower on prose. A release from before it boots down1. home's experts take 99.8 GB of a
+# rank at TP=3, which leaves no room for the KV pool on a 128 GB box. At TP=4 home stays: bit325 lowers KL by 1.5-7%
+# at home's size but decoded ~2.5% slower in three boots each.
+DEFAULT_VARIANT = {3: ('bit225', 'down1')}
 HALF_BYTES = {k: 384 * 8 * 32 * k for k in (2, 3, 4)}     # one 128-channel half of one projection (tools/convert/v2.py)
 
 
@@ -251,10 +257,15 @@ class Variant:
 
 
 def resolve_variant(spec, v2_dir, search, tp=None):
-    """spec: home, down1, up1 or a manifest path (None: DEFAULT_VARIANT for tp when there are v2 widths, else home).
-    v2_dir: the V2 width files, or None for packs without them. search: the directories that hold the model set;
-    exlr8-manifest-<name>.json is looked for in each of them, then in v2_dir, directly or under manifests/."""
-    name = spec or (v2_dir and DEFAULT_VARIANT.get(tp)) or 'home'
+    """spec: a name in VARIANTS or a manifest path (None: the first of DEFAULT_VARIANT[tp] the model set has when there
+    are v2 widths, else home). v2_dir: the V2 width files, or None for packs without them. search: the directories
+    that hold the model set; exlr8-manifest-<name>.json is looked for in each of them, then in v2_dir, directly or
+    under manifests/."""
+    def found(n):
+        return any(os.path.isfile(os.path.join(d, sub, f'exlr8-manifest-{n}.json'))
+                   for d in [*search, v2_dir] for sub in ('', 'manifests'))
+    defaults = DEFAULT_VARIANT.get(tp, ()) if v2_dir else ()
+    name = spec or next((n for n in defaults if found(n)), defaults[-1] if defaults else 'home')
     if not v2_dir:
         if name == 'home':
             return Variant('home')

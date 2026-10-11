@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-11: TP=3 boots bit225 by default; a new release commit reuses the cached files
+
+- The exlr8 release (v0.5) adds five width profiles: `bit225`, `bit243`, `bit260`, `bit325`, `bit338`. They spend
+  bits by tensor type, then by layer, in the order that lowered full-vocabulary KL against bf16 the most per byte.
+  The model card has their sizes and KL.
+- TP=3 boots `bit225` unless `--variant` says otherwise: `down1`'s size with 5-10% lower KL. On three GB10s, two
+  boots each: code 38.6 vs 38.3 tok/s, prose 29.0 vs 29.6, the same memory. A release without `bit225` boots `down1`.
+- TP=4 keeps `home`. `bit325` has its size and 1.5-7% lower KL, but decoded about 2.5% slower in three boots each
+  (code 48.7 vs 49.9 tok/s). `--variant bit325` picks it.
+- `prepare` for a new commit of a release hard-links each file an older commit left in the cache when the hub gives it
+  the same hash and size at both, and copies an expert file's fetch journal with it. A commit that only adds manifests
+  (v0.5) fetches nothing else. Every expert half is still checked against its index file.
+
 ## 2026-10-10: TP=6 serves through S2
 
 - `scripts/launch_tp6.sh` runs `scripts/launch_s2.sh` at TP=6: up to `SESS=8` requests at once, prefix reuse, MTP only

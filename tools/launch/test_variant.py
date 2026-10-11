@@ -48,6 +48,13 @@ class ResolveTests(unittest.TestCase):
         v = M.resolve_variant(p, self.v2, [])
         self.assertEqual((v.name, v.path), ('route-budget-80', p))
 
+    def test_bit225_is_the_tp3_default_where_the_release_has_it(self):
+        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4, 6)], ['down1', 'home', 'home'])
+        for name in ('bit225', 'bit325'):
+            manifest(os.path.join(self.v2, 'manifests', f'exlr8-manifest-{name}.json'), name, 3)
+        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4, 6)], ['bit225', 'home', 'home'])
+        self.assertEqual(M.resolve_variant('bit325', self.v2, [], 4).name, 'bit325')  # a name given wins
+
     def test_refusals(self):
         with self.assertRaises(M.ModelError) as e:
             M.resolve_variant('up1', self.v2, [])

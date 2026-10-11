@@ -1,7 +1,7 @@
 {
   "version": 1,
   "title": "GLM-5.3",
-  "variant": "exlr8 experts: home (3.25 bpw) at TP=4 and TP=6, down1 (2.25 bpw) at TP=3",
+  "variant": "exlr8 experts: home (3.25 bpw) at TP=4 and TP=6, bit225 (2.25 bpw) at TP=3",
   "summary": "Full GLM 5.3 on g6, a from-scratch CUDA engine with no vLLM, PyTorch or NCCL at serve time. Up to 8 requests decode at once, with DFlash2 or MTP drafting chosen each round at TP=4, prefix reuse, and context-parallel KV. Boots from one Hugging Face release.",
   "model": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
   "hardware": "DGX Spark (GB10)",
@@ -52,23 +52,23 @@
       "label": "TP=3",
       "nodes": 3,
       "decode": {
-        "code": 36.9,
-        "prose": 28.4
+        "code": 38.6,
+        "prose": 29.0
       },
       "prefill": [
         {
           "context": 8192,
-          "tps": 648
+          "tps": 628
         }
       ],
       "concurrency": [
         {
           "streams": 2,
-          "aggregate_tps": 46.1
+          "aggregate_tps": 46.6
         },
         {
           "streams": 4,
-          "aggregate_tps": 58.3
+          "aggregate_tps": 60.7
         }
       ],
       "max_context": 307200,
@@ -80,7 +80,7 @@
           "value": "each request byte-identical to running alone"
         }
       ],
-      "notes": "down1 experts (about 2.25 bpw), MTP only. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release."
+      "notes": "bit225 experts (about 2.25 bpw), MTP only. Mean of two boots. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release."
     },
     {
       "id": "tp6",

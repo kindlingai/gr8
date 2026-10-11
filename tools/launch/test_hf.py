@@ -287,6 +287,33 @@ class HFTests(unittest.TestCase):
         self.assertTrue(self.hub.requests(r'exlr8-layer-003\.k2'))
         self.assertEqual(r.check(4, 2, self.variant(r)), [])
 
+    def test_a_new_commit_links_what_it_shares_with_the_last(self):
+        r1 = self.release()
+        r1.fetch_rank(4, 1, self.variant(r1))
+        os.unlink(os.path.join(r1.dir, hfsource.TREE))               # a cache written before the file list existed
+        c3 = 'c' * 40                                                  # main moves to a commit with one dense file changed
+        r3 = shutil.copytree(self.r1, os.path.join(tempfile.mkdtemp(), 'release3'))
+        dense = sorted(os.listdir(os.path.join(r3, 'dense')))[0]
+        with open(os.path.join(r3, 'dense', dense), 'r+b') as f:
+            f.write(b'\xff')
+        for hp in (os.path.join(r3, 'hashes', 'dense', dense + '.sha256'), os.path.join(r3, 'hashes', dense + '.sha256')):
+            if os.path.isfile(hp):                                     # the release's own hash of the new bytes
+                with open(hp, 'w') as f:
+                    f.write(f"{modelset.sha256_file(os.path.join(r3, 'dense', dense))} "
+                            f"{os.path.getsize(os.path.join(r3, 'dense', dense))}\n")
+        self.hub.repos[RELEASE][c3] = r3
+        self.hub.refs[RELEASE]['main'] = c3
+        r = self.release(refresh=True)
+        n = len(self.hub.log)
+        r.fetch_rank(4, 1, self.variant(r))
+        later = [x for x in self.hub.log[n:] if x[2] and not x[2].startswith('bytes=0-7')]
+        self.assertEqual({re.sub(r'.*/', '', x[1]) for x in later}, {dense})      # only the changed file
+        self.assertEqual(r.check(4, 1, self.variant(r)), [])
+        k3 = os.path.join('experts', 'exlr8-layer-003.k3.safetensors')
+        self.assertTrue(os.path.samefile(os.path.join(r.dir, k3), os.path.join(r1.dir, k3)))
+        self.assertFalse(os.path.samefile(os.path.join(r.dir, 'dense', dense), os.path.join(r1.dir, 'dense', dense)))
+        same_halves(r3, r.v2, 3, 4, 1, lambda p: 3)
+
     def test_the_release_alone_is_the_model(self):
         import options as opt
         import supervisor as S

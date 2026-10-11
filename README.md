@@ -11,12 +11,12 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 
 | | TP=4 | TP=3 | TP=6 |
 |---|---|---|---|
-| experts | `home`, 3.25 bpw | `down1`, 2.25 bpw | `home`, 3.25 bpw |
+| experts | `home`, 3.25 bpw | `bit225`, 2.25 bpw | `home`, 3.25 bpw |
 | drafting | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 49.3 / 30.0 tok/s | 36.9 / 28.4 tok/s | 38.2 / –‡ tok/s |
-| aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.1 / 58.3 tok/s | 57.6 / 79.0 tok/s‡ |
-| prefill, 8K prompt, cold | 1,374 tok/s | 648 tok/s | 1,953 tok/s‡ |
-| prefill, 8K prompt, cached | 54,867 tok/s | 53,747 tok/s | – |
+| decode\*, code / prose | 49.3 / 30.0 tok/s | 38.6 / 29.0 tok/s | 38.2 / –‡ tok/s |
+| aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.6 / 60.7 tok/s | 57.6 / 79.0 tok/s‡ |
+| prefill, 8K prompt, cold | 1,374 tok/s | 628 tok/s | 1,953 tok/s‡ |
+| prefill, 8K prompt, cached | 54,867 tok/s | 56,995 tok/s | – |
 | KV pool (longest context) | 393,216 tokens | 307,200 tokens | 614,400 tokens |
 | requests decoding at once | 8 | 8 | 8 |
 
@@ -150,10 +150,15 @@ only when it is set. `--model DIR` boots from a local copy of the release instea
 | variant | routed experts | default at |
 |---|---|---|
 | `home` | 3.25 bpw: in each layer, the 64 experts with the highest K3 error at K4 and the rest at K3 | TP=4, TP=6 |
-| `down1` | about 2.25 bpw | TP=3 |
+| `bit225` | about 2.25 bpw, down1's size: down projections at K3 in the layers where bits lower KL the most, the rest at K2 | TP=3 |
+| `bit325` | 3.25 bpw, home's size: down projections at K4 in the layers where bits lower KL the most, the rest at K3 (KL 1.5-7% lower than home, decode ~2.5% slower) | |
+| `bit243`, `bit260`, `bit338` | about 2.43, 2.60 and 3.38 bpw, built the same way | |
+| `down1` | about 2.25 bpw | |
 | `up1` | about 4.0 bpw (lower `--cap`) | |
 
-`home` does not fit at TP=3: it puts 108.7 GB of weights on each rank. A boot that would run a box out of memory stops
+The release's model card has each variant's size and its KL against bf16. A release from before the `bit` variants
+boots `down1` at TP=3. `home` and `bit325` do not fit at TP=3: they put 108.7 GB of weights on
+each rank. A boot that would run a box out of memory stops
 while it allocates the KV pool, and names `--cap` and `--variant`.
 
 ### Options worth knowing

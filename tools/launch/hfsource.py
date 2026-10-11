@@ -81,6 +81,23 @@ def git_blob_id(path):
     return h.hexdigest()
 
 
+TREE = '.tree.json'        # in a commit's cache directory: {path: [hash, size]} of the commit's files, for reuse()
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_json(path, obj):
+    with open(path + '.tmp', 'w') as f:
+        json.dump(obj, f)
+    os.replace(path + '.tmp', path)
+
+
 class Meter:
     """GB done of the total and the rate, one line every 30 s."""
 
@@ -144,6 +161,11 @@ class Repo:
         if self._tree is None:
             self._tree = self.hub.tree()
         return self._tree
+
+    def ids(self):
+        """{path: [hash, size]} of this commit's files, as the hub lists them: the LFS sha256, else the git blob id."""
+        t = self.tree()
+        return {p: [(e.get('lfs') or {}).get('oid') or e['oid'], e['size']] for p, e in self.hub.entries.items() if p in t}
 
     def expected(self, path):
         """(kind, value, size) a file must match: the release's hashes/<path>.sha256, else the LFS sha256, else the
@@ -240,6 +262,48 @@ class Release:
         dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors'))
         return slices + dense
 
+    def reuse(self):
+        """Hard-link the files an older commit of this release left in the cache, where the hub gives the file the same
+        hash and size at both commits, so a new commit (a manifest added, say) does not fetch the rest again. An
+        expert file takes its fetch journal along, and its halves are still checked against the index file. A cache
+        directory written before this records no file list: it is asked from the hub once."""
+        mine = self.repo.ids()
+        os.makedirs(self.dir, exist_ok=True)
+        save_json(os.path.join(self.dir, TREE), mine)
+        n = 0
+        for c in sorted(os.listdir(self.repo.root)):
+            old_dir = os.path.join(self.repo.root, c)
+            if c == self.commit or not re.fullmatch(r'[0-9a-f]{40}', c) or not os.path.isdir(old_dir):
+                continue
+            old = load_json(os.path.join(old_dir, TREE))
+            if old is None:
+                try:
+                    hub = fetch_ranks().Hub(self.repo.repo, c, base=endpoint())
+                    files = hub.tree()
+                except (OSError, ValueError) as e:
+                    self.log(f'{self}: cannot list commit {c[:12]} on the hub ({e}): none of its files reused')
+                    continue
+                old = {p: [(e.get('lfs') or {}).get('oid') or e['oid'], e['size']] for p, e in hub.entries.items()
+                       if p in files}
+                save_json(os.path.join(old_dir, TREE), old)
+            for p, ident in mine.items():
+                src, dst = os.path.join(old_dir, p), os.path.join(self.dir, p)
+                if old.get(p) != ident or not os.path.isfile(src) or os.path.exists(dst):
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    continue
+                if p.startswith('experts/'):
+                    j = os.path.join('.fetch', os.path.basename(p) + '.json')
+                    if os.path.isfile(os.path.join(old_dir, 'experts', j)):
+                        os.makedirs(os.path.join(self.v2, '.fetch'), exist_ok=True)
+                        shutil.copyfile(os.path.join(old_dir, 'experts', j), os.path.join(self.v2, j))
+                n += 1
+        if n:
+            self.log(f'{self}: {n} files unchanged since an earlier commit, linked from the cache')
+
     def marker(self, tp, rank, variant):
         return os.path.join(self.dir, 'complete', f'tp{tp}.rank{rank}.{variant.name}-{variant.sha256[:12]}.json')
 
@@ -263,6 +327,7 @@ class Release:
         with open(variant.path) as f:
             layers = sorted(int(x) for x in json.load(f)['layers'])
         t = self.repo.tree()
+        self.reuse()
         whole = self.whole_files(tp, rank)
         slices = [p for p in whole if p.startswith('index-slices/')]
         for p in slices:                    # first: bin/g6load plans this rank's halves from them
