@@ -28,7 +28,10 @@
 //                (0 = top_p off; 256 is the served setting; misses printed at the end)
 // [--s2] (DEC_S2 build, needs --mtp, no --prefill / --serve): every --prompt is a session (<= 8) and their rows share
 //        steps (s2_batch.h mtp_batch, s2.cuh). Lines per session: "q<j> " + the solo line (step / draft / chain /
-//        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped
+//        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped.
+//        G6_S2_GROW=P: the runs come from a pool of P pages (s2/pool.h) and grow on demand: each session starts with its
+//        prompt + 1 + guard rows, grows to its length + guard before each round, sits a round out when the pages would
+//        leave the pool unsafe, and gives its pages back when it finishes (cleared when another session takes them)
 // [--spec-accept coupled|rejection]  as g6m4 (needs --mtp, no --s2): rejection = greedy drafts, accepted by rejection sampling
 // [--spec-adaptive [--spec-levels 1,2,4]]  as g6m4 (needs --mtp, no --s2): the drafts each round verifies (spec_len.h)
 #include <algorithm>
@@ -40,6 +43,7 @@
 #include <map>
 #include <set>
 #include "s2_batch.h"
+#include "s2/pool.h"
 #endif
 
 using namespace g6rt;
@@ -525,6 +529,7 @@ int main(int argc, char** argv)
             }
             fprintf(stderr, "# s2: G6_S2_PAGES seed %d: %d shuffled pages per slot of a pool of %d\n", v[0], n, pool);
         }
+        if (getenv("G6_S2_GROW") && (getenv("G6_S2_RUNS") || getenv("G6_S2_PAGES"))) die("G6_S2_GROW takes the runs from its own pool: no G6_S2_RUNS / G6_S2_PAGES");
     }
 #endif
     // Gate: DEC_S2 CP build, --prefill, no --s2: G6_S2_PFBASE=B[,pages] runs every sequence as one session
@@ -1127,6 +1132,36 @@ int main(int argc, char** argv)
                     reloc && B ? "relocated" : "no copy,", pages, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
                     reloc && B ? " + relocation" : "");
         };
+        // G6_S2_GROW=P: the sessions' runs from a pool of P pages, admitted in slot order (each must leave the pool safe)
+        std::unique_ptr<g6s2::RunPool> gpool;
+        std::vector<g6s2::Run> grun(NSS);
+        std::vector<bool> gone(NSS, false);
+        const uint64_t guard = 2 * (uint64_t)mtp;
+        long grows = 0, stalls = 0;
+        // slot q's pages := list on every model; grown: list extends the slot's pages, and the new ones are cleared first
+        auto set_run = [&](int q, const std::vector<int>& list, bool grown) {
+            std::vector<int> fresh;
+            if (grown) fresh.assign(list.begin() + R[0].s2->run[q].size(), list.end());
+            for (Model& m : R) { s2_zero_pages(m, fresh, st); s2_set_pages(m, q, list); if (solo == q) s2_solo_pages(m, list); }
+            for (Draft& D : DR) { s2_zero_pages(D.d, fresh, st); s2_set_pages(D.d, q, list); if (solo == q) s2_solo_pages(D.d, list); }
+            G6RT_CK(cudaStreamSynchronize(st));
+        };
+        if (const char* e = getenv("G6_S2_GROW"))
+        {
+            int pool = R[0].s2->pool_pages;
+            for (const Draft& D : DR) pool = std::min(pool, D.d.s2->pool_pages);
+            const int P = atoi(e);
+            if (P < 1 || P > pool) die("G6_S2_GROW=P: 1..the pool's pages");
+            gpool.reset(new g6s2::RunPool((uint32_t)P, (uint32_t)P, (uint32_t)P * 64));
+            for (int q = 0; q < NSS; ++q)
+            {
+                const uint64_t n = SS[q].prompt.size(), worst = n + SS[q].n_gen + guard, rows = std::min(worst, n + 1 + guard);
+                if (!gpool->fits(rows, worst)) die("G6_S2_GROW: session " + std::to_string(q) + " does not leave the pool safe at admission");
+                grun[q] = gpool->reserve(rows, worst);
+                set_run(q, gpool->list(grun[q]), false);   // the pool is cleared at the start (s2_reset)
+                fprintf(stderr, "# s2 grow: session %d starts with %u pages, worst case %llu\n", q, grun[q].pages, (unsigned long long)((worst + 63) / 64));
+            }
+        }
         std::vector<s2::Stats> sst(NSS);
         std::vector<std::vector<int>> gen(NSS);
         {
@@ -1140,9 +1175,25 @@ int main(int argc, char** argv)
                 std::vector<int> act;
                 for (int q : qs) if (b.active(q)) act.push_back(q);
                 if (act.empty()) break;
+                std::vector<int> order = qs;
+                if (gpool)
+                {
+                    order.clear();
+                    for (int q : act)
+                    {
+                        const auto r = gpool->grow(grun[q], (uint64_t)b.length(q) + guard);
+                        if (!r) { ++stalls; continue; }
+                        if (*r != grun[q]) { grun[q] = *r; set_run(q, gpool->list(*r), true); ++grows; }
+                        order.push_back(q);
+                    }
+                    if (order.empty()) die("G6_S2_GROW: every session sat the round out");
+                }
                 if (solo1 && solo < 0 && act.size() == 1) go_solo(act[0]);
-                b.round(qs);
+                b.round(order);
+                for (int q = 0; gpool && q < NSS; ++q)
+                    if (!gone[q] && !b.active(q)) { gpool->release(grun[q]); gone[q] = true; }
             }
+            if (gpool) fprintf(stderr, "# s2 grow: %ld growths, %ld rounds sat out\n", grows, stalls);
             for (int q = 0; q < NSS; ++q) { gen[q] = b.result(q); sst[q] = b.stats(q); }
         }
         for (int q = 0; q < NSS; ++q)

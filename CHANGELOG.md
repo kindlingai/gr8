@@ -19,6 +19,7 @@
   the cluster): median TTFT 42.6 s -> 4.1 s and wall time -15% on the first. The second gains 6-9% wall time and
   little TTFT, since 25 of its 54 requests are past R with their `max_tokens`. `engine/kvman-rs/SSD-TIER.md` has the
   tables.
+- m4sim: `G6_S2_GROW=P` runs the `--s2` sessions on a pool of P pages that grows on demand.
 
 ## 2026-10-11: README: what concurrent requests produce
 
