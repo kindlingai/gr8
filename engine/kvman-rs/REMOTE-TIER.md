@@ -123,33 +123,104 @@ What the numbers show:
 `kvman-remote` alone: `kvman-remote --gb 8 [--port 7350] [--min-free-gb 10] [--no-rdma]`. For a test outside the
 launcher, `sudo systemd-run --unit=kv-node -p LimitMEMLOCK=infinity -p User=$USER kvman-remote --gb 8` is easy to stop.
 
-## Stage B: the engine spills to a tier (plan)
+## Stage B: tiers below the pool
 
-Off by default, and the same for both stores.
+Built and tested on one box. It has not run on the cluster yet. Off unless `--kv-tier` is given. Without it the pool has
+no store, counts nothing, queues no copies, and its digest is what it was. The control frames move to `G6S2E4` for the
+two new grant fields, so every rank needs this build.
 
-- Switch: `KV_TIER` (`--kv-tier`), a cluster option the handshake compares: `off`, `ssd:PATH:GB`, or
-  `remote[:HOST:PORT]:GB`. Without a host the supervisor takes a node from `mentat.kv_nodes()`. Each rank names its
-  lease `<cluster digest>/<rank>`, so two ranks or two clusters never share one.
-- Pool: the pool keeps the stored runs: each one's kept age, reuse state and slots, lowest free first, from a
-  `SlotAlloc` of the store's size. `fill()` and the exclusive branch of `reserve` / `take` already hold the evicted
-  runs (`gone`). Each one goes to the store when it fits, else the oldest stored run drops. `match` tries the pool's
-  retained runs first, then the stored ones with the same `begin` rule. A hit on a stored run makes `take` return the
-  grant's pages and the slots to read into the first ceil(skip / 64) of them.
-- Lock-step: every decision is a function of pool state alone, the same on every rank whatever the I/O does. The head
-  decides at the event, and the grant carries the restored run (its age and page count). Each worker repeats `match` /
-  `take` at its grant and requires the same run and the same restore, as G6S2E2 and G6S2E3 did for page lists and
-  growth. The pool digest folds in the stored runs' ages, slots and the free count, so a rank whose store differs
-  fails at the next event. The frame version moves to G6S2E4.
-- I/O: each event yields two lists: spills (page to slot) and restores (slot to page). A spill gathers the 101
-  per-layer pieces of a page (79 x 41,984 B and 22 x 8,448 B, `bind.cu create`) device to host into pinned staging,
-  registered with `RemoteStore::register` so RDMA skips the copy. The device copy must finish before the grant's
-  prefill overwrites the page. The store write can trail it. A restore reads into staging and scatters back before the
-  prefill of the rest of the prompt. A hit on a run whose writes have not landed waits for them on that rank, so
-  `match` stays independent of timing. The first version treats a failed store write or read as fatal for the rank.
-  That stops the cluster, as any rank failure does.
-- Open first: whether the ranks' page blocks are byte-identical below R: hash every rank's blocks of one run in m4sim.
-  If the copies are identical, one lease serves every rank and the capacity grows 4x at TP=4. The DFlash2 drafter's KV
-  is not in a page block, so a restored run has to rebuild it or store it too. Exclusive runs past R hold different
-  pages on each rank (the CP map). The switch path with four boxes needs a run once the cluster is free.
-- Tests: pool property tests with stored runs (every slot held once, ranks agree), a `remote` policy in `kvman-sim`
-  with the rates above (14, 3 and 1.1 GB/s), and m4sim with a store on a loopback node.
+### Configuration
+
+    --kv-tier ssd:/nvme/gr8kv,size=200G,keep=shared
+    --kv-tier remote:auto,size=8G,keep=evicted
+    --kv-shared-after 5
+
+`--kv-tier` is given once per tier. The launcher's `KV_TIER` holds the same values separated by `;` (KNOBS.md). A store
+is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or `remote:HOST:PORT`. `remote:auto` is
+the launcher's: each box's supervisor names the KV node mentat announces, with an RDMA address on one of the box's rails
+first. `size` is per rank, binary (G = 2^30, T = 2^40). `keep` is `evicted` (the default), `shared` or `all`.
+
+### What each tier keeps
+
+- `keep=evicted`: a retained run the pool evicts, by its first ceil(valid / 64) pages. A run past R holds the CP map,
+  whose pages below R are the same logical pages on every rank, so only those are kept.
+- `keep=shared`: a prefix that started `--kv-shared-after` conversations (default 3). A request counts at admission.
+  When it continues a live, retained or stored run (its prompt holds all of that run's tokens but the last), it counts
+  toward nothing, so a five-turn chat counts once. Otherwise it counts once toward every grid-cell prefix of its
+  prompt (4,096 rows served). The key of a prefix of S rows is its first S + 1 tokens, since the MTP layer's row S - 1
+  depends on token S. When a run retires, the longest counted prefix it holds that no tier has yet is written once to
+  the first tier that keeps shared prefixes. In practice that prefix is the system prompt and tool definitions. The
+  engine has no idea of chat roles. The count table keeps the 4,096 most recently counted prefixes.
+- Tiers are tried in flag order, for lookups and for placement. A full tier frees its least recently used entries, and
+  each goes on to the next tier that keeps its kind (a block-to-block move), or is dropped.
+- A hit on an evicted run takes it out of its tier, and a hit on a shared prefix leaves it there. A stored hit wins
+  only when it reuses more rows than the pool can. Its blocks go back into the grant's first pages: below R as a
+  reservation takes them, past R into the CP map's start, which is below R.
+
+### Lock-step
+
+Every decision is the pool's, made from calls every rank makes in the same order. The head counts and matches at the
+event. The grant carries `restored` (1 + the tier) and `counted`, and each worker repeats `count`, `match` and `take` at
+its grant and requires the same values and the same pages. The pool digest folds in every tier (free slots, each entry's
+id, key, valid rows and slots) and the count table, so a rank whose tiers differ fails at the next event. I/O results
+and timing never feed back into a decision.
+
+### The copies
+
+Each pool call that can queue copies (reserve, take, grow, retain) leaves a list, in order: spills (page to block) and
+moves (block to block) as placement made them, then restores (block to page). A restore may write a page that a spill of
+the same call still has to read, and a move reads a slot before a later copy in the list reuses it. The engine runs the
+list before anything writes those pages, in `bind` (a grant), `grown` (growth) and `retain` (a promoted prefix), then
+calls `io_done`. Until then the pool refuses reserve, take and grow (`PendingIo`), so no later call can reuse a slot a
+restore still reads.
+
+On the device a page block is one pool page of every layer binding, main model then draft. One kernel copies a batch of
+32 pages between the bindings and mapped pinned host memory, and each block then goes to or from its store
+(`engine/runtime/s2/kv_tier.cuh`). The staging memory is registered with the RDMA device, so a KV node reads and writes
+it directly.
+
+### Persistence (SSD tiers, shared prefixes)
+
+An SSD tier with `--set-id` (the launcher always passes the model id) keeps an index beside its blocks. The header names
+what makes blocks compatible: the model id, TP, R, the pool's placement pages, the grid, the page block's size and
+layout, and the tier's size. Another header starts the index empty. Records are add (an entry: id, key, tokens, valid
+rows, slots) and drop (an id), each with a length and a checksum, synced as they are written. The engine writes an
+entry's blocks before `io_done` appends its add record. A drop record is synced before the entry's slots can be reused.
+A record that fails its checksum ends the log, and the file is cut there, so a torn write never names blocks that hold
+anything else. Entries load in commit order. After boot, every worker sends the head its loaded entries. The head keeps
+those every rank has, in its own order, and every rank keeps exactly that list, so the ranks start in lock-step. The log
+is rewritten from the live entries when it holds four times as many records. Evicted runs are not persisted, and neither
+are KV node leases.
+
+### Tested on d800
+
+| test | what it checks |
+|---|---|
+| `cargo test` (`tests/stash.rs`) | two ranks on 60 random traces with two tiers, growth and runs past R: each grant's reused rows hold its prompt's tokens after the copies (spills, moves, restores), the ranks queue the same copies and agree on the digest, no slot is held twice or lost. A five-turn chat counts once, and the third conversation stores the shared prefix and a fourth reads it back. A full tier moves its oldest entry on. A committed prefix survives a reopen. One whose copies were never reported done does not come back, and a torn record and another model's index are ignored |
+| `pool_stash_test` (host_tests.sh) | the same through the C interface, with the copies run through `mem:`, an `ssd:` file and a loopback KV node over TCP |
+| `control_protocol_test` | the grant's `restored` and `counted` fields round trip in `G6S2E4` |
+| m4sim (`G6_KV_TIER_CHECK`), layers 0 and 3 + MTP, four simulated ranks | a reuse hit's pages sent through `mem:`, `ssd:` and a loopback KV node, poisoned on the device, and read back: the printed lines equal the plain run's |
+| m4sim (`G6_KV_RANKS_CMP=1`) | below R (G6_CP_R covering the context) every simulated rank's page blocks equal rank 0's, byte for byte. Without that setting each rank holds other pages (the CP map), as expected |
+
+TP=4, TP=3 and TP=6 build. The served path (Service with stored hits, counting in the grant, the boot agreement) has not
+run on the cluster: it needs four boxes.
+
+### Byte-identical ranks, and one copy for all
+
+m4sim's ranks hold identical page blocks below R. The cluster check will say whether the real ranks do: the latent comes
+from the all-reduced hidden state, and every rank runs the same kernels on it. If they do, one copy could serve every
+rank: 4x the capacity at TP=4, and a quarter of the writes. It changes one rule. Today a restored slot is free as soon
+as the call that restored it ends, which is safe because each rank reads only its own store. With a shared store, a fast
+rank could reuse a slot (a spill at its next growth) that a slow rank has yet to read in the same event. So freed slots
+would wait one event fence, when the head has every rank's ACK, before reuse. That needs a pool call at each event,
+deterministic like the others. The writes could be split across ranks (page i by rank i mod TP), and every rank would
+read the whole run. Until the cluster check, each rank keeps its own store.
+
+### Still to do
+
+- On the cluster: the byte-identical check above, the four-box measurement through efcd's 100G port, and an end-to-end
+  run with an SSD tier and a KV node (TTFT on agent traces against `main`, output identical to `main` for the same
+  requests, the tiers' counters in `status.s2`).
+- The DFlash2 drafter's prompt-context taps come from the prefill a hit skips, so a restored run drafts like a pool
+  hit does today.
+- `status.s2` carries each tier's counters. The front ends do not export them yet.

@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-11: block stores below the KV pool (`--kv-tier`), off by default
+
+- `--kv-tier STORE,size=N(G|T)[,keep=evicted|shared|all]`, given once per tier (`KV_TIER`, tiers separated by `;`).
+  STORE is `ssd:PATH` (a folder per box), `remote:HOST:PORT` or `remote:auto` (a KV node from the mentat group). A
+  `keep=evicted` tier holds the retained runs the pool evicts. A `keep=shared` tier holds the prefixes that started
+  `--kv-shared-after` conversations (default 3), written once. A request that continues a stored entry reads its pages
+  back and skips their prefill. Tiers are tried in flag order, and a full tier passes its least recently used entries
+  on to the next tier that keeps them.
+- A request that continues a live, retained or stored run counts toward no prefix, so a chat of five turns counts once.
+- An SSD tier's shared prefixes survive restarts: an index beside the blocks, keyed by the model, TP, R and the page
+  block's layout. A record is committed only after its blocks are written, and the ranks keep only the entries every
+  rank loaded.
+- The head counts and matches, and the grant carries the restored tier and the count. The control frames are version
+  `G6S2E4`, so every rank needs this build. Without `--kv-tier` the pool does no extra work and its digest is unchanged.
+- Not yet run on the cluster. `engine/kvman-rs/REMOTE-TIER.md` has the design and the single-box tests.
+
 ## 2026-10-11: a remote KV page store, and `./gr8 kv` to run its node
 
 - `./gr8 kv up --gb N` locks N GiB on a box with spare memory and serves it as KV page blocks (`kvman-remote`). It
