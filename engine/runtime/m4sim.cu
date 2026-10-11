@@ -495,15 +495,16 @@ int main(int argc, char** argv)
             if (v.size() % 2 || (int)v.size() / 2 > (int)plans.size()) die("G6_S2_RUNS: base:pages per slot");
             for (size_t k = 0; k + 1 < v.size(); k += 2)
             {
-                for (Model& m : R) s2_set_run(m, (int)k / 2, v[k], v[k + 1]);
-                for (Draft& D : DR) s2_set_run(D.d, (int)k / 2, v[k], v[k + 1]);
+                for (Model& m : R) s2_set_pages(m, (int)k / 2, s2_run_list(v[k], v[k + 1]));
+                for (Draft& D : DR) s2_set_pages(D.d, (int)k / 2, s2_run_list(v[k], v[k + 1]));
             }
         }
     }
 #endif
     // Gate: DEC_S2 CP build, --prefill, no --s2: G6_S2_PFBASE=B[,pages] runs every sequence as one session
-    // at base page B below R: tables B + i (s2_solo_run, main and draft), staged prefill index keys from page B
-    // (Model::s2_pf_base), StepIn::base_page = B, s2_reset_run instead of reset(). Stdout must equal the run at B = 0.
+    // at base page B below R: tables B + i (s2_solo_pages, main and draft), staged prefill index keys through them
+    // (Model::s2_pf_table), StepIn::page_bound = the pool's pages, and s2_reset_pages clears the run. Stdout must equal
+    // the run at B = 0.
     // G6_S2_PFPOISON=1: fill every cache with 0x3c bytes first, so a read outside the run changes the output.
     int pf_base = 0;
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
@@ -532,20 +533,20 @@ int main(int argc, char** argv)
             for (Model& m : R) poison(m);
             for (Draft& D : DR) poison(D.d);
         }
-        // G6_S2_PFNOFIX=1 (negative control): tables at B but staged index keys from page 0 (before 4c2596b); must differ
-        const int ixb = getenv("G6_S2_PFNOFIX") ? 0 : pf_base;
-        for (Model& m : R) { s2_solo_run(m, pf_base, pf_pages); m.s2on = false; m.s2_pf_base = ixb; }
-        for (Draft& D : DR) { s2_solo_run(D.d, pf_base, pf_pages); D.d.s2on = false; D.d.s2_pf_base = ixb; }
+        // G6_S2_PFNOFIX=1 (negative control): tables at B but staged index keys at logical pages, from page 0; must differ
+        const bool ixt = !getenv("G6_S2_PFNOFIX");
+        for (Model& m : R) { s2_solo_pages(m, s2_run_list(pf_base, pf_pages)); m.s2on = false; m.s2_pf_table = ixt; }
+        for (Draft& D : DR) { s2_solo_pages(D.d, s2_run_list(pf_base, pf_pages)); D.d.s2on = false; D.d.s2_pf_table = ixt; }
         G6RT_CK(cudaStreamSynchronize(st));
         fprintf(stderr, "# s2 base-page gate: every sequence at base page %d, run of %d pages (main pool %d pages)%s%s\n", pf_base, pf_pages,
-                R[0].s2->pool_pages, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "", ixb != pf_base ? ", NOFIX" : "");
+                R[0].s2->pool_pages, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "", ixt ? "" : ", NOFIX");
     }
 #endif
-    // StepIn to the device; G6_S2_PFBASE: the run's base page
+    // StepIn to the device; G6_S2_PFBASE: the pool's page bound
     auto put_in = [&](StepIn* dst, const StepIn& si) {
         StepIn x = si;
 #ifdef DEC_S2
-        if (pf_base) x.base_page = pf_base;
+        if (pf_base) x.page_bound = (dst == in ? R[0] : DR[0].d).s2->pool_pages;
 #endif
         G6RT_CK(g6h2d::copy(dst, &x, sizeof x));
     };
@@ -991,7 +992,7 @@ int main(int argc, char** argv)
             StepOut so[NR];
             if (solo >= 0)                  // S=1: today's path and graphs (run_main / run_draft), the run at solo_base
             {
-                si.base_page = solo_base;
+                si.page_bound = (draft ? DR[0].d : R[0]).s2->pool_pages;
                 const double w = draft ? run_draft(si, chain, so) : run_main(si, so);
                 tk[{(int)sp.kind + 3, M}].push_back(w);
             }
@@ -1069,7 +1070,7 @@ int main(int argc, char** argv)
         hk.round = [&](int q, long rd, int base, int a, int K) { printf("q%d round %ld base %d accepted %d of %d\n", q, rd, base, a, K); };
         // S=1 transition contract (joint TP6 + TP4 ruling, TP4 option (a), provisional): a session alone (fresh, or the
         // survivor of 2 -> 1) runs today's path (s2on off on every model, the layers' own bindings, D.hprev, today's graphs)
-        // with its run where it is: the layers' tables = base + i (s2_solo_base), StepIn::base_page = base.
+        // with its run where it is: the layers' tables = its pages (s2_solo_pages), StepIn::page_bound = the pool's pages.
         // G6_S2_SOLO1=0: stay on the S2 path at S=1 (screen). G6_S2_RELOC=1: the fallback, relocate the survivor to base 0.
         // G6_S2_GEN=a,b,..: per-session --gen (so the sessions finish at different rounds and 2 -> 1 happens).
         const bool solo1 = !getenv("G6_S2_SOLO1") || atoi(getenv("G6_S2_SOLO1")) != 0;
@@ -1093,8 +1094,9 @@ int main(int argc, char** argv)
             }
             solo_base = R[0].s2->base[q];
             const int solo_pages = R[0].s2->pages[q];
-            for (Model& m : R) { s2_solo_run(m, solo_base, solo_pages); m.s2on = false; }
-            for (Draft& D : DR) { s2_solo_run(D.d, solo_base, solo_pages); s2_hprev_to_solo(D, q, st); D.d.s2on = false; }
+            const std::vector<int> run = R[0].s2->run[q];
+            for (Model& m : R) { s2_solo_pages(m, run); m.s2on = false; }
+            for (Draft& D : DR) { s2_solo_pages(D.d, run); s2_hprev_to_solo(D, q, st); D.d.s2on = false; }
             G6RT_CK(cudaStreamSynchronize(st));
             solo = q;
             fprintf(stderr, "# s2 -> S=1: session %d alone, run at base page %d (was %d), %s %d pages; %.3f ms (tables%s, hprev)\n", q, solo_base, B,
@@ -1184,10 +1186,10 @@ int main(int argc, char** argv)
         if (!skip)
         {
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
-            if (getenv("G6_S2_PFBASE"))         // base-page gate: clear the run only (s2_reset_run)
+            if (getenv("G6_S2_PFBASE"))         // base-page gate: clear the run only (s2_reset_pages)
             {
-                for (Model& m : R) s2_reset_run(m, pf_base, pf_pages, st);
-                for (Draft& D : DR) s2_reset_run(D.d, pf_base, pf_pages, st);
+                for (Model& m : R) s2_reset_pages(m, s2_run_list(pf_base, pf_pages), st);
+                for (Draft& D : DR) s2_reset_pages(D.d, s2_run_list(pf_base, pf_pages), st);
             }
             else
 #endif

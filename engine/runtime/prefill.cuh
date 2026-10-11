@@ -1716,7 +1716,8 @@ inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
 // A prefill sub-batch runs today's kernels on a staged, identity-mapped copy of each layer's latent KV: cp_pf_enter swaps
 // every layer's binding args (in place: the prefill binder checks the binding's address) to {mla_cache = pool[i % 2],
 // block_table = identity, page_count = table_size, cp_nr = 0}; index keys are replicated and logical-page addressed
-// (step 3b), so the identity table leaves their addresses unchanged. Before layer i's attention, cp_pf_gather fills
+// (step 3b), so the identity table leaves their addresses unchanged (an S2 run below R: index_table = the run's own table,
+// Model::s2_pf_table). Before layer i's attention, cp_pf_gather fills
 // pool[i % 2] with every page holding positions < start (from its owner); the attention appends the chunk's rows into the
 // pool; cp_pf_back then copies the rows this rank stores into its sharded store (before the pool is reused at i + 2).
 // cp_pf_exit restores the CP args. Plain launches only (the args go by value into every launch). A missing owner page
@@ -1776,9 +1777,8 @@ inline void cp_pf_enter(Model& m)
         m.cp.pf_saved.push_back(a);
         a.mla_cache = m.cp.pf_pool[(m.cp.pf_g0 + i) % 2]; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
 #ifdef DEC_S2
-        // S2 below R, a run at base B: staged prefill addresses index keys by logical page (pos / 64, identity table), the
-        // decode views by B + i, so the staged view's index cache starts at page B (132 B per row, s2_relocate)
-        if (m.s2_pf_base && a.index_cache) a.index_cache = (char*)a.index_cache + (size_t)m.s2_pf_base * 64 * 132;
+        // S2 below R: the decode views read the run's index keys through its table, so the staged view does too
+        a.index_table = m.s2_pf_table ? m.cp.pf_saved.back().block_table : nullptr;
 #endif
     }
     m.cp.pf_staged = true;

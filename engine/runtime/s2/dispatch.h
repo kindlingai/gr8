@@ -9,7 +9,7 @@ namespace g6s2 {
 struct Launch {
     s2::Step step;
     uint64_t sequence = 0;
-    int solo = -1, base_page = 0, context = 0;
+    int solo = -1, context = 0;
     // first-step timer: request ids + E1/E2 event class per session,
     // so repeated requests are grouped by immutable request ordinal, not slot reuse.
     std::vector<uint64_t> requests; // parallel to step.sess
@@ -110,7 +110,6 @@ public:
         l.graph_key = launch_key(sp.key(), l.bucket);
         auto& seq = draft ? draft_sequence_ : main_sequence_;
         require(seq != UINT64_MAX, "fabric sequence exhausted"); l.sequence = ++seq;
-        if (solo_ >= 0) l.base_page = l.bases[0];
         auto ids = hooks_.launch(l); require(ids.size() == sp.r.size(), "native output row mismatch");
         if (!draft) for (size_t j = 0; j < sp.sess.size(); ++j) {
             source_[sp.sess[j]] = sp.row0[j]; have_main_[sp.sess[j]] = true;
@@ -136,14 +135,14 @@ public:
         if (track_) rows_[s.key.slot].prefill_rows(int(first), int(rows), true);
     }
 };
-// Direct mapping to fc2's native structs. Instantiate ONLY in DEC_S2 builds,
-// whose StepIn has base_page. No kernels or sampling arithmetic changed here.
+// Direct mapping to fc2's native structs. Instantiate ONLY in DEC_S2 builds.
+// No kernels or sampling arithmetic changed here.
 template<class StepIn, class S2In>
 void native_inputs(const Launch& l, StepIn& si, S2In& h) {
     si = {}; h = {};
     require(size_t(l.step.M()) <= sizeof(si.tok) / sizeof(si.tok[0]), "native StepIn row capacity too small");
     require(l.step.sess.size() <= sizeof(h.sess) / sizeof(h.sess[0]), "native S2In session capacity too small");
-    si.step = l.sequence; si.M = l.step.M(); si.context = l.context; si.base_page = l.base_page;
+    si.step = l.sequence; si.M = l.step.M(); si.context = l.context;
     for (int r = 0; r < si.M; ++r) {
         const auto& x = l.step.r[r]; const auto& sample = l.samples[r];
         si.tok[r] = x.tok; si.pos[r] = x.pos; si.tgt[r] = x.tgt;

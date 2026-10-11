@@ -171,6 +171,8 @@ __device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){
 #else
     if(a.cp_nr){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}return pos/a.page_size;}
 #endif
+    if(a.index_table){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}
+        const int p=a.index_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;}
     return page(a,pos);
 }
 #else

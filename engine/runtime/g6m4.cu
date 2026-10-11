@@ -741,13 +741,14 @@ int main(int argc, char** argv)
                 g6s2::require(k >= 0 && k < D.d.nbk && M >= 1 && M <= MX && exec_d[k][chain][M], "S=1 draft graph not captured");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][M], st));
             },
-            [&](const g6s2::Slot& sl) {      // the run's tables on the layers' own bindings + staged index keys from its base
+            // the run's pages go into the layers' tables. Staged prefill reads index keys through them too.
+            [&](const g6s2::Slot& sl) {
                 const bool ex = pool.exclusive(g6s2::reserve_rows(sc, sl.req));
-                const int B = ex ? 0 : (int)sl.run.base_page, pg = ex ? m.s2->run_pages : (int)sl.run.pages;
-                s2_solo_run(m, B, pg); s2_solo_run(D.d, B, pg);
-                m.s2_pf_base = D.d.s2_pf_base = B;
-                // OWN=4: the serve loop's per-request rule (prompt + gen against the QO key table). S2 prefill runs on the CP
-                // staging pool, indexed by position, so the run's base page never reaches the QO prepass
+                const std::vector<int> run = ex ? s2_run_list(0, m.s2->run_pages) : s2_run_list((int)sl.run.base_page, (int)sl.run.pages);
+                s2_solo_pages(m, run); s2_solo_pages(D.d, run);
+                m.s2_pf_table = D.d.s2_pf_table = !ex;
+                // OWN=4: the serve loop's per-request rule (prompt + gen against the QO key table). The CP staging pool holds
+                // S2 prefill rows by position, and the run's pages never reach the QO prepass.
                 if (pf_qp)
                 {
                     const int ctx = (int)(sl.req.prompt_tokens + sl.req.max_tokens);
@@ -763,7 +764,7 @@ int main(int argc, char** argv)
                     dfl_owner = (int)sl.prefilled <= DF.pf_lo ? (int)sl.key.slot : -1;
                 }
             },
-            [&]() { m.s2_pf_base = D.d.s2_pf_base = 0; },
+            [&]() { m.s2_pf_table = D.d.s2_pf_table = false; },
             [&]() { cp_pf_in(); }, [&]() { cp_pf_out(); },
             [&]() -> unsigned { return cp_error() | cp_pf_err(); }};
         try
@@ -791,11 +792,11 @@ int main(int argc, char** argv)
                 // past them is written by this request before any step reads it (prefix_reuse.h)
                 for (Model* x : {&m, &D.d})
                 {
-                    if (ex) { s2_set_run(*x, q, 0, x->s2->run_pages); if (!g.reuse) reset(*x, st); }   // alone: the whole pool, today's reset
+                    if (ex) { s2_set_pages(*x, q, s2_run_list(0, x->s2->run_pages)); if (!g.reuse) reset(*x, st); }   // alone: the whole pool, today's reset
                     else
                     {
-                        s2_set_run(*x, q, (int)g.run.base_page, (int)g.run.pages);
-                        if (!g.reuse) s2_reset_run(*x, (int)g.run.base_page, (int)g.run.pages, st);
+                        s2_set_pages(*x, q, s2_run_list((int)g.run.base_page, (int)g.run.pages));
+                        if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st);
                     }
                     for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)
                     {

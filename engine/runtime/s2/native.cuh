@@ -102,12 +102,10 @@ class NativeDispatch {
         const auto t0 = std::chrono::steady_clock::now(); fence();
         if (old >= 0) g6rt::s2_hprev_from_solo(c_.draft,old,c_.stream);
         if (next >= 0) {
-            const int base = c_.main.s2->base[next];
-            require(base == c_.draft.d.s2->base[next], "main/draft survivor bases differ");
-            // the survivor's own run (pages[next], set by bind), not the last solo run's pages
-            const int pages = c_.main.s2->pages[next];
-            require(pages > 0 && pages == c_.draft.d.s2->pages[next], "main/draft survivor runs differ");
-            g6rt::s2_solo_run(c_.main,base,pages); g6rt::s2_solo_run(c_.draft.d,base,pages);
+            // the survivor's own pages (set by bind)
+            const std::vector<int>& run = c_.main.s2->run[next];
+            require(!run.empty() && run == c_.draft.d.s2->run[next], "main/draft survivor runs differ");
+            g6rt::s2_solo_pages(c_.main,run); g6rt::s2_solo_pages(c_.draft.d,run);
             g6rt::s2_hprev_to_solo(c_.draft,next,c_.stream);
         }
         c_.main.s2on = c_.draft.d.s2on = next < 0; fence();
@@ -136,6 +134,7 @@ class NativeDispatch {
         auto& fabric = draft ? c_.draft_fabric : c_.main_fabric;
         const int rows = l.step.M();
         g6rt::StepIn input{}; g6rt::S2In layout{}; native_inputs(l,input,layout);
+        if (l.solo >= 0) input.page_bound = model.s2->pool_pages;   // the solo tables hold -1 past the session's pages
         if (draft && c_.main.rs) for (int r = 0; r < rows; ++r) input.srow[r].inv_temp = 0.f;   // rejection sampling: greedy drafts
         require(model.s2on == (l.solo < 0), "native solo mode differs from host");
         model.s2->h = layout;

@@ -126,7 +126,7 @@ struct StepIn
     glue::SampleRow srow[MX];
     int tgt[MX];                      // teacher forcing: the id each row should predict (< 0 = none)
 #ifdef DEC_S2
-    int base_page, pad_s2;            // S2 (TP4 option (a), provisional): first pool page of the session (0 = today)
+    int page_bound, pad_s2;           // S2 solo run: the pool's pages, the cells' page_count (0 = the context's pages, today)
 #endif
 };
 struct StepOut
@@ -160,7 +160,7 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
     {
         c.cells[l].context = sh.context;
 #ifdef DEC_S2
-        c.cells[l].page_count = sh.base_page + pages;   // the physical page bound of a run at base_page (table B + i)
+        c.cells[l].page_count = sh.page_bound ? sh.page_bound : pages;   // a solo run's table holds -1 past its pages
 #else
         c.cells[l].page_count = pages;
 #endif
@@ -249,7 +249,8 @@ struct Model
     int s2_pool_slots = 1;            // set before build: > 1 = the layers' own attention bindings hold the S2 pool
     int s2_run_pages = 0;             // build: the MOST pages one session's run can hold (the capacity argument; each view's table)
     int s2_pool_pages = 0;            // set before build: pages of the pool (0 = s2_pool_slots x s2_run_pages); >= s2_run_pages
-    int s2_pf_base = 0;               // S2 below R: first page of the run being prefilled (CP staging index offset, prefill.cuh)
+    bool s2_pf_table = false;         // S2 below R: staged prefill reads index keys through the run's table (prefill.cuh
+                                      // cp_pf_enter); false = logical pages, as an exclusive run past R
     int s2_below = 0;                 // set before s2_init: S2 below R (CP builds): every session's run <= s2_below rows on the
                                       // replicated (non-CP) path; the pool is the layer's own binding as built (s2.cuh)
 #endif
