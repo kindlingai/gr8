@@ -941,7 +941,7 @@ int main(int argc, char** argv)
         else
         {
             ServeReq rq;
-            if (!serve_next(serve, q, rq)) break;
+            if (!serve_next(serve, q, glue::VOCAB, rq)) break;
             pt.start(serve + "/req." + std::to_string(q));
             sp = plan;
             sp.prompt = rq.prompt; sp.n_gen = rq.n_gen; sp.seed = rq.seed;

@@ -41,6 +41,7 @@ EOS_IDS = [154820, 154827, 154829]
 # (masters are opened at start with stdio closed; a master forked from a request would hold its stderr pipe open)
 SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ControlPath=/tmp/g6shim-ssh-%C', '-o', 'ControlMaster=no']
 VOCAB = 154880
+MAX_STOP_IDS = 256 + len(EOS_IDS)   # the front end's stop_token_ids limit, plus the eos ids it adds
 ENGINE_MAX_LP = 20  # the engine's top lists hold 20 (serve.h LP_MAX = glue::LP_K); it clamps silently above
 FLOOR = -9999.0  # logprob sent for -inf / nan (the front end clamps at the same value)
 # A rank dir on another box ("host:/path") ends up in ssh's argv and in a remote shell command. The remote commands
@@ -80,6 +81,28 @@ class Req:
         self.lps = []           # engine "l" entries not yet sent (logprobs)
         self.plps = {}          # engine "p" entries by prompt position
         self.plp_sent = False
+
+
+def build_request(f: dict, n: int):
+    """-> (req.<n> bytes, error message or None). serve.h reads the stop field into a fixed buffer, so an overlong one
+    spills into the prompt line, and the engine indexes the embedding table with prompt ids unchecked: both are
+    checked here, before anything is written."""
+    def ok(i):
+        return isinstance(i, int) and not isinstance(i, bool) and 0 <= i < VOCAB
+    stops = f.get('stop_ids') or []
+    if len(stops) > MAX_STOP_IDS or not all(ok(i) for i in stops):
+        return None, f'bad stop ids (at most {MAX_STOP_IDS}, each 0..{VOCAB - 1})'
+    if not all(ok(i) for i in f['prompt']):
+        return None, f'bad prompt token id (must be 0..{VOCAB - 1})'
+    seed = f.get('seed')
+    seed = (1234 + n) if seed is None else int(seed) & 0xFFFFFFFF
+    stop = ','.join(str(i) for i in stops) or '-'
+    body = (f"n_gen {f['max_tokens']} temp {float(f.get('temperature') or 0.0)} seed {seed} "
+            f"min {int(f.get('min_tokens') or 0)} stop {stop} top_p {float(f.get('top_p') or 1.0)}"
+            + (f" lp {int(f['logprobs'])}" if f.get('logprobs') is not None else '')
+            + (f" plp {int(f['prompt_logprobs'])}" if f.get('prompt_logprobs') is not None else '')
+            + '\n' + ','.join(str(i) for i in f['prompt']) + '\n').encode()
+    return body, None
 
 
 class Shim:
@@ -225,15 +248,10 @@ class Shim:
 
     async def one(self, r: Req):
         f, n = r.f, self.n
+        body, err = build_request(f, n)
+        if err:     # refused before it takes a request number: the engine waits for req.<n> in order
+            return self.finish(r, 'error', message=err)
         self.n += 1
-        seed = f.get('seed')
-        seed = (1234 + n) if seed is None else int(seed) & 0xFFFFFFFF
-        stop = ','.join(str(i) for i in (f.get('stop_ids') or [])) or '-'
-        body = (f"n_gen {f['max_tokens']} temp {float(f.get('temperature') or 0.0)} seed {seed} "
-                f"min {int(f.get('min_tokens') or 0)} stop {stop} top_p {float(f.get('top_p') or 1.0)}"
-                + (f" lp {int(f['logprobs'])}" if f.get('logprobs') is not None else '')
-                + (f" plp {int(f['prompt_logprobs'])}" if f.get('prompt_logprobs') is not None else '')
-                + '\n' + ','.join(str(i) for i in f['prompt']) + '\n').encode()
         resp = f'{self.a.rank_dirs[0]}/resp.{n}'
         if os.path.exists(resp):
             log.warning('stale %s removed', resp)

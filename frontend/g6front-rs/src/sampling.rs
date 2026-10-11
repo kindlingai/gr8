@@ -1,11 +1,16 @@
 //! OpenAI/vLLM request fields -> PROTOCOL.md `generate` fields, with vLLM's defaults and validation
 //! (a port of `g6front/sampling.py`; same checks in the same order, same messages).
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value};
 
 use crate::api::ApiError;
 use crate::pyjson;
 use crate::wire::GenParams;
+
+/// The most ids `stop_token_ids` may name.
+pub const MAX_STOP_TOKEN_IDS: usize = 256;
 
 pub struct Params {
     pub gen: GenParams,
@@ -86,6 +91,7 @@ pub fn build(
     prompt_len: usize,
     max_model_len: u64,
     eos_ids: &[i64],
+    vocab_size: usize,
     gen_defaults: &Map<String, Value>,
     default_max_tokens: Option<u64>,
     max_logprobs: i64,
@@ -166,10 +172,25 @@ pub fn build(
         None | Some(Value::Null) => vec![],
         Some(v) if !pyjson::truthy(Some(v)) && !v.is_array() => vec![],
         Some(Value::Array(a)) => {
+            if a.len() > MAX_STOP_TOKEN_IDS {
+                return Err(ApiError::bad(
+                    format!("`stop_token_ids` may name at most {MAX_STOP_TOKEN_IDS} ids"),
+                    Some("stop_token_ids"),
+                ));
+            }
             let mut out = Vec::with_capacity(a.len());
             for x in a {
                 match x {
-                    Value::Number(n) if n.is_i64() => out.push(n.as_i64().unwrap()),
+                    // the engine bounds-checks neither stop ids nor what an overlong stop list spills into
+                    Value::Number(n) if n.as_i64().is_some_and(|i| i >= 0 && (i as u64) < vocab_size as u64) => {
+                        out.push(n.as_i64().unwrap())
+                    }
+                    Value::Number(n) if n.is_i64() => {
+                        return Err(ApiError::bad(
+                            "`stop_token_ids` contains a token id out of vocabulary range",
+                            Some("stop_token_ids"),
+                        ))
+                    }
                     Value::Bool(b) => out.push(*b as i64),
                     _ => {
                         return Err(ApiError::bad(
@@ -184,12 +205,13 @@ pub fn build(
         Some(_) => return Err(ApiError::bad("`stop_token_ids` must be a list of integers", Some("stop_token_ids"))),
     };
     let ignore_eos = pyjson::truthy(body.get("ignore_eos"));
-    let mut stop_ids: Vec<i64> = Vec::with_capacity(eos_ids.len() + stop_token_ids.len());
-    for &i in (if ignore_eos { &[][..] } else { eos_ids }).iter().chain(stop_token_ids.iter()) {
-        if !stop_ids.contains(&i) {
-            stop_ids.push(i);
-        }
-    }
+    let mut seen = HashSet::with_capacity(eos_ids.len() + stop_token_ids.len());
+    let stop_ids: Vec<i64> = (if ignore_eos { &[][..] } else { eos_ids })
+        .iter()
+        .chain(stop_token_ids.iter())
+        .copied()
+        .filter(|i| seen.insert(*i))
+        .collect();
     for k in ["frequency_penalty", "presence_penalty"] {
         if let Some(v) = body.get(k).filter(|v| !v.is_null()) {
             if !pyjson::eq_int(v, 0) {
@@ -253,4 +275,41 @@ pub fn build(
         stop,
         include_stop: pyjson::truthy(body.get("include_stop_str_in_output")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VOCAB: usize = 1000;
+
+    fn stop_ids(stop_token_ids: Value) -> Result<Vec<i64>, ApiError> {
+        let body = serde_json::json!({"stop_token_ids": stop_token_ids});
+        let raw = serde_json::to_vec(&body).unwrap();
+        let p = build(body.as_object().unwrap(), &raw, 10, 4096, &[999], VOCAB, &Map::new(), Some(16), 20, false)?;
+        Ok(p.gen.stop_ids)
+    }
+
+    fn rejected(stop_token_ids: Value) -> String {
+        let e = stop_ids(stop_token_ids).err().expect("a 400");
+        assert_eq!((e.status, e.param.as_deref()), (400, Some("stop_token_ids")));
+        e.message
+    }
+
+    #[test]
+    fn stop_ids_in_range_are_kept_once_after_eos() {
+        assert_eq!(stop_ids(serde_json::json!([5, 999, 5, 0])).unwrap(), vec![999, 5, 0]);
+    }
+
+    #[test]
+    fn a_stop_id_outside_the_vocabulary_is_refused() {
+        assert!(rejected(serde_json::json!([VOCAB])).contains("out of vocabulary range"));
+        assert!(rejected(serde_json::json!([-1])).contains("out of vocabulary range"));
+    }
+
+    #[test]
+    fn too_many_stop_ids_are_refused() {
+        assert!(stop_ids(Value::from(vec![1; MAX_STOP_TOKEN_IDS])).is_ok());
+        assert!(rejected(Value::from(vec![1; MAX_STOP_TOKEN_IDS + 1])).contains("at most"));
+    }
 }

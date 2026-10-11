@@ -21,6 +21,8 @@
 #include <chrono>
 #include <ctime>
 #include <unistd.h>
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,8 +59,67 @@ inline void serve_ready(const std::string& dir)
     if (FILE* f = fopen((dir + "/ready").c_str(), "w")) fclose(f);
 }
 
+// A request file's text -> r. Line 1 holds the parameters, at any length; line 2 the prompt ids. Any malformed field, or
+// a stop or prompt id outside 0..vocab-1 (the kernels index the embedding table with prompt ids unchecked), leaves
+// r.n_gen = 0, which every rank answers with "end error".
+inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
+{
+    r = ServeReq();
+    const size_t nl = text.find('\n');
+    const std::string head = text.substr(0, nl);
+    const std::string ids = nl == std::string::npos ? "" : text.substr(nl + 1, text.find('\n', nl + 1) - nl - 1);
+    std::vector<std::string> w;                                    // the parameter line's words
+    for (size_t i = 0; i < head.size();)
+    {
+        const size_t j = head.find(' ', i);
+        if (j != i) w.push_back(head.substr(i, j - i));
+        if (j == std::string::npos) break;
+        i = j + 1;
+    }
+    auto num = [](const std::string& s, long lo, long hi, long* out) {   // the whole word, in [lo, hi]
+        char* e;
+        errno = 0;
+        const long x = strtol(s.c_str(), &e, 10);
+        if (s.empty() || *e || errno || x < lo || x > hi) return false;
+        *out = x;
+        return true;
+    };
+    auto real = [](const std::string& s, float* out) {
+        char* e;
+        *out = strtof(s.c_str(), &e);
+        return !s.empty() && !*e;
+    };
+    auto list = [&](const std::string& s, std::vector<int>& v) {      // id,id,..: every one in the vocabulary
+        for (size_t i = 0; i <= s.size();)
+        {
+            const size_t j = std::min(s.find(',', i), s.size());
+            long x;
+            if (!num(s.substr(i, j - i), 0, vocab - 1, &x)) return false;
+            v.push_back((int)x);
+            i = j + 1;
+        }
+        return true;
+    };
+    long n_gen, seed, min_tokens;
+    const bool ok = w.size() >= 10 && w[0] == "n_gen" && num(w[1], 1, 1 << 30, &n_gen) && w[2] == "temp" &&
+                    real(w[3], &r.temp) && w[4] == "seed" && num(w[5], 0, 0xFFFFFFFFL, &seed) && w[6] == "min" &&
+                    num(w[7], 0, 1 << 30, &min_tokens) && w[8] == "stop" && (w[9] == "-" || list(w[9], r.stop)) &&
+                    !ids.empty() && list(ids, r.prompt);
+    if (!ok) { r = ServeReq(); return; }
+    r.n_gen = (int)n_gen; r.seed = (uint32_t)seed; r.min_tokens = (int)min_tokens;
+    for (size_t i = 10; i + 1 < w.size(); i += 2)                  // optional (older shims: absent)
+    {
+        long k;
+        if (w[i] == "top_p") { if (!real(w[i + 1], &r.top_p)) r.top_p = 0.f; }
+        // the shim never sends k > LP_MAX (g6shim.py ENGINE_MAX_LP); clamping is a backstop
+        else if (w[i] == "lp") r.lp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
+        else if (w[i] == "plp") r.plp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
+        else break;
+    }
+}
+
 // blocks until DIR/req.<n> or DIR/quit exists; false on quit
-inline bool serve_next(const std::string& dir, size_t n, ServeReq& r)
+inline bool serve_next(const std::string& dir, size_t n, int vocab, ServeReq& r)
 {
     const std::string f = dir + "/req." + std::to_string(n);
     for (;;)
@@ -69,38 +130,11 @@ inline bool serve_next(const std::string& dir, size_t n, ServeReq& r)
     }
     FILE* fp = fopen(f.c_str(), "r");
     if (!fp) return false;
-    r = ServeReq();
-    char stop[65536] = {0};
-    if (fscanf(fp, "n_gen %d temp %f seed %u min %d stop %65535s", &r.n_gen, &r.temp, &r.seed, &r.min_tokens, stop) != 5) r.n_gen = 0;
-    for (char key[8]; fscanf(fp, " %7[a-z_]", key) == 1;)           // optional, same line (older shims: absent)
-    {
-        if (!strcmp(key, "top_p")) { if (fscanf(fp, "%f", &r.top_p) != 1) r.top_p = 0.f; }
-        else if (!strcmp(key, "lp")) { if (fscanf(fp, "%d", &r.lp) != 1) r.lp = -1; }
-        else if (!strcmp(key, "plp")) { if (fscanf(fp, "%d", &r.plp) != 1) r.plp = -1; }
-        else break;
-    }
-    // the shim never sends k > LP_MAX (g6shim.py ENGINE_MAX_LP, checked at its startup and per request); this is a backstop
-    if (r.lp > LP_MAX) r.lp = LP_MAX;
-    if (r.plp > LP_MAX) r.plp = LP_MAX;
-    std::string ids;
+    std::string text;
     int c;
-    while ((c = fgetc(fp)) != EOF) ids.push_back((char)c);
+    while ((c = fgetc(fp)) != EOF) text.push_back((char)c);
     fclose(fp);
-    auto ints = [](const std::string& s) {
-        std::vector<int> v;
-        const char* p = s.c_str();
-        while (*p)
-        {
-            char* e;
-            const long x = strtol(p, &e, 10);
-            if (e == p) { ++p; continue; }
-            v.push_back((int)x);
-            p = e;
-        }
-        return v;
-    };
-    if (strcmp(stop, "-") != 0) r.stop = ints(stop);
-    r.prompt = ints(ids);
+    serve_parse(text, vocab, r);
     return true;
 }
 
