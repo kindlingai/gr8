@@ -17,10 +17,13 @@
 //! them.
 //!
 //! The C interface (g6kvman.h, src/ffi.rs) is what engine/runtime/s2/pool.h wraps for g6m4.
+//!
+//! src/tier.rs is a proof of concept of an SSD store for retained runs (SSD-TIER.md). The engine does not use it.
 
 pub mod ffi;
 pub mod pool;
 pub mod reuse;
+pub mod tier;
 
 pub use pool::{Error, Hit, Kept, Pool, Run, PAGE};
 pub use reuse::{Finished, Rules, Why};
