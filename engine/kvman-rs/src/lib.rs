@@ -16,7 +16,15 @@
 //! the rest go and adds pages as reserve does. Rows skip.. of the last adopted page are written before any step reads
 //! them.
 //!
-//! The C interface (g6kvman.h, src/ffi.rs) is what engine/runtime/s2/pool.h wraps for g6m4.
+//! Growth on demand: a run below R starts with the pages its request needs now (the engine: prompt + 1 + guard rows)
+//! and grows (grow) to at most its worst case (prompt + max_tokens + guard), its new pages at the end of its list. The
+//! pool only admits a request (fits) or grants growth when the state stays safe in the Banker's sense: with the live
+//! runs ordered by remaining need, each can reach its worst case from the free pages plus what the runs before it give
+//! back. Retained runs count as free. A refused growth leaves the session out of a round (Driver::step) instead of
+//! taking pages back, since a re-prefilled session would not emit the same bytes. From a safe state some session can
+//! always go on, so the engine never deadlocks. An exclusive run takes its worst case at once.
+//!
+//! The C interface (g6kvman.h, src/ffi.rs) is what engine/runtime/s2/pool.h wraps for g6m4 and m4sim.
 //!
 //! src/tier.rs is a proof of concept of an SSD store for retained runs (SSD-TIER.md). The engine does not use it.
 

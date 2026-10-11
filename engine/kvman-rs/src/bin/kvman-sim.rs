@@ -4,7 +4,11 @@
 //!   today  retained runs stay until a reservation evicts them, and a request that lost its run prefills again
 //!   ssd    an evicted run is written to an SSD store first, and a request that misses the pool but continues a stored
 //!          run reads its pages back instead of prefilling them
-//!   kvman-sim TRACE.csv [--policies none,today,ssd] [flags]
+//!   grow   today's reuse, but a run holds pages as it needs them (Pool::grow): its prompt + 1 + guard rows at
+//!          admission, a page more whenever its tokens reach the end of its pages, admission and growth only when the
+//!          pool stays safe (every live run can still reach prompt + max_tokens + guard), else the session waits
+//!   grow+ssd  both
+//!   kvman-sim TRACE.csv [--policies none,today,ssd,grow,grow+ssd] [flags]
 //! Time model (the engine at TP=4): one prefill at a time (--prefill-tps, new tokens only), and no decode while a prefill
 //! runs. Decode shares a total rate by how many sessions decode (--decode-tps: 1, 2, 4 sessions, 3 interpolated, more than
 //! 4 as 4). The SSD store moves page blocks (src/tier.rs PAGE_SLOT) at --ssd-write-gbs / --ssd-read-gbs, on the
@@ -53,6 +57,29 @@ enum Policy {
     None,
     Today,
     Ssd,
+    Grow,
+    GrowSsd,
+}
+
+impl Policy {
+    fn name(self) -> &'static str {
+        match self {
+            Policy::None => "none",
+            Policy::Today => "today",
+            Policy::Ssd => "ssd",
+            Policy::Grow => "grow",
+            Policy::GrowSsd => "grow+ssd",
+        }
+    }
+    fn reuse(self) -> bool {
+        self != Policy::None
+    }
+    fn ssd(self) -> bool {
+        matches!(self, Policy::Ssd | Policy::GrowSsd)
+    }
+    fn grow(self) -> bool {
+        matches!(self, Policy::Grow | Policy::GrowSsd)
+    }
 }
 
 fn usage() -> ! {
@@ -86,13 +113,15 @@ fn read_trace(path: &str, max_tokens: Option<usize>) -> Vec<Req> {
     lines
         .map(|l| {
             let f: Vec<f64> = l.split(',').map(|x| x.trim().parse().expect("a number")).collect();
+            let max_tokens = max_tokens.unwrap_or(f[c[5]] as usize).max(1);
             Req {
                 session: f[c[0]] as usize,
                 prompt: f[c[1]] as usize,
                 overlap: f[c[2]] as usize,
-                completion: (f[c[3]] as usize).max(1),
+                // a request stops at its max_tokens (--max-tokens below what it wrote cuts it short)
+                completion: (f[c[3]] as usize).clamp(1, max_tokens),
                 think: f[c[4]],
-                max_tokens: max_tokens.unwrap_or(f[c[5]] as usize),
+                max_tokens,
                 ttft_measured: f[c[6]],
             }
         })
@@ -119,7 +148,7 @@ fn main() {
         row_iops: 832_000.0,
         groups: 21,
     };
-    let mut policies = vec![Policy::None, Policy::Today, Policy::Ssd];
+    let mut policies = vec![Policy::None, Policy::Today, Policy::Ssd, Policy::Grow, Policy::GrowSsd];
     let mut max_tokens = None;
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| usage());
@@ -132,6 +161,8 @@ fn main() {
                         "none" => Policy::None,
                         "today" => Policy::Today,
                         "ssd" => Policy::Ssd,
+                        "grow" => Policy::Grow,
+                        "grow+ssd" => Policy::GrowSsd,
                         _ => usage(),
                     })
                     .collect()
@@ -181,7 +212,7 @@ fn main() {
         quantile(&mut meas, 0.9)
     );
     println!(
-        "{:<6} {:>8} {:>8} {:>9} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9} {:>9}",
+        "{:<8} {:>8} {:>8} {:>9} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9} {:>9} {:>7} {:>8}",
         "policy",
         "TTFT p50",
         "TTFT p90",
@@ -193,18 +224,16 @@ fn main() {
         "lost",
         "evicted",
         "SSD wr GB",
-        "SSD rd GB"
+        "SSD rd GB",
+        "live",
+        "waited s"
     );
     for p in policies {
         let r = simulate(&reqs, &o, p);
         let mut t = r.ttft.clone();
         println!(
-            "{:<6} {:>8.1} {:>8.1} {:>9.0} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9.1} {:>9.1}",
-            match p {
-                Policy::None => "none",
-                Policy::Today => "today",
-                Policy::Ssd => "ssd",
-            },
+            "{:<8} {:>8.1} {:>8.1} {:>9.0} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9.1} {:>9.1} {:>7.2} {:>8.0}",
+            p.name(),
             quantile(&mut t, 0.5),
             quantile(&mut t, 0.9),
             r.wall,
@@ -215,7 +244,9 @@ fn main() {
             r.lost,
             r.evicted,
             r.written as f64 / 1e9,
-            r.read as f64 / 1e9
+            r.read as f64 / 1e9,
+            r.live_s / r.wall.max(1e-9),
+            r.stall_s
         );
     }
     for &w in &o.rowcache {
@@ -265,6 +296,8 @@ struct Result {
     evicted: usize,
     written: u64,
     read: u64,
+    live_s: f64,  // the integral of admitted sessions over time: live_s / wall = sessions resident on average
+    stall_s: f64, // session-seconds a decoding session waited for a page
 }
 
 struct Active {
@@ -273,6 +306,9 @@ struct Active {
     arrival: f64,
     prefill_s: f64,
     decode_left: f64,
+    len: f64, // tokens so far, prompt included, once decoding
+    worst: u64,
+    stalled: bool,
     prompt: Vec<i32>,
     completion: usize,
 }
@@ -282,9 +318,38 @@ struct Stored {
     pages: usize,
 }
 
+// the SSD store: stored runs, oldest first, dropped from the front past its capacity
+struct Store {
+    q: VecDeque<Stored>,
+    pages: usize,
+    cap: usize,
+}
+
+impl Store {
+    fn push(&mut self, s: Stored) {
+        self.pages += s.pages;
+        self.q.push_back(s);
+        while self.pages > self.cap {
+            self.pages -= self.q.pop_front().map(|x| x.pages).unwrap_or(0);
+        }
+    }
+}
+
+fn decode_rate(o: &Opts, n: usize) -> f64 {
+    let d = &o.decode_tps;
+    let total = match n {
+        0 => return 0.0,
+        1 => d[0],
+        2 => d[1],
+        3 => (d[1] + d[2]) / 2.0,
+        _ => d[2],
+    };
+    total / n as f64
+}
+
 fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
     let mut pool = Pool::new(o.pages, o.place, o.below).expect("pool sizes");
-    if policy != Policy::None {
+    if policy.reuse() {
         pool.keep(o.rules);
     }
     let mut res = Result::default();
@@ -303,18 +368,36 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
     };
     let mut fifo: VecDeque<(usize, f64)> = VecDeque::new();
     let mut active: Vec<Active> = Vec::new();
-    let mut store: VecDeque<Stored> = VecDeque::new();
     let page_bytes = PAGE_SLOT as u64;
-    let store_cap = (o.store_gb * 1e9) as u64 / page_bytes;
-    let mut stored_pages = 0usize;
-    // the retained runs' contents by age: what the ssd policy writes out when the pool evicts one
+    let mut store = Store { q: VecDeque::new(), pages: 0, cap: ((o.store_gb * 1e9) as u64 / page_bytes) as usize };
+    let mut io_block = 0.0f64; // SSD writes of runs that growth evicted: they hold up every session, as a prefill does
+                               // the retained runs' contents by age: what the ssd policies write out when the pool evicts one
     let mut retained: BTreeMap<u64, Stored> = BTreeMap::new();
     let mut t = 0.0f64;
-    let store_push = |store: &mut VecDeque<Stored>, stored_pages: &mut usize, s: Stored| {
-        *stored_pages += s.pages;
-        store.push_back(s);
-        while *stored_pages as u64 > store_cap {
-            *stored_pages -= store.pop_front().map(|x| x.pages).unwrap_or(0);
+    let guard = o.guard as f64;
+    // a run grows to `rows`: the retained runs it evicts are counted and, under the ssd policies, written out first
+    let grow = |pool: &mut Pool,
+                x: &mut Active,
+                rows: u64,
+                retained: &mut BTreeMap<u64, Stored>,
+                res: &mut Result,
+                store: &mut Store,
+                io_block: &mut f64| {
+        let before: Vec<u64> = pool.kept().iter().map(|k| k.age).collect();
+        let r = pool.grow(&x.run, rows).expect("live run");
+        evicted(pool, &before, 0, retained, res, |y, res| {
+            if policy.ssd() && !o.spill_retire {
+                res.written += y.pages as u64 * page_bytes;
+                *io_block += (y.pages as u64 * page_bytes) as f64 / (o.write_gbs * 1e9);
+                store.push(y);
+            }
+        });
+        match r {
+            Some(r) => {
+                x.run = r;
+                x.stalled = false;
+            }
+            None => x.stalled = true,
         }
     };
     loop {
@@ -323,11 +406,17 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
                 fifo.push_back((s, a.take().expect("checked")));
             }
         }
-        // admit the FIFO head while it fits: a session slot, and the pool's room
+        // a waiting session takes its page as soon as the pool stays safe with it, oldest admission first
+        for x in active.iter_mut().filter(|x| x.stalled) {
+            let rows = (x.len.ceil() as u64 + o.guard as u64 + 1).min(x.worst);
+            grow(&mut pool, x, rows, &mut retained, &mut res, &mut store, &mut io_block);
+        }
+        // admit the FIFO head while it fits: a session slot, and the pool (room, and a safe state for growth)
         while let Some(&(s, arrival)) = fifo.front() {
             let r = by_session[s].front().expect("a queued session has a request");
-            let rows = (r.prompt + r.max_tokens + o.guard) as u64;
-            if active.len() >= o.sessions || !pool.admissible(rows) || rows.div_ceil(PAGE) > pool.room() as u64 {
+            let worst = (r.prompt + r.max_tokens + o.guard) as u64;
+            let rows = if policy.grow() { worst.min((r.prompt + 1 + o.guard) as u64) } else { worst };
+            if active.len() >= o.sessions || !pool.fits(rows, worst) {
                 break;
             }
             fifo.pop_front();
@@ -335,30 +424,31 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
             prompt.extend((prompt.len()..r.prompt).map(|_| fresh()));
             let before: Vec<u64> = pool.kept().iter().map(|k| k.age).collect();
             let limit = r.prompt as i32 - 1;
-            let h = if policy == Policy::None { Default::default() } else { pool.match_prefix(&prompt, rows, limit) };
+            let h = if policy.reuse() { pool.match_prefix(&prompt, rows, worst, limit) } else { Default::default() };
             let (mut io_s, mut skip) = (0.0, 0usize);
             let run = if h.skip > 0 {
                 res.pool_hits += 1;
                 skip = h.skip as usize;
                 retained.remove(&h.age);
-                pool.take(h.skip, h.age, rows).expect("a hit from match")
+                pool.take(h.skip, h.age, rows, worst).expect("a hit from match")
             } else {
                 // a stored run this prompt continues, the longest first, then the most recent
-                let n = rows.div_ceil(PAGE) as usize;
-                let best = (policy == Policy::Ssd)
+                let best = policy
+                    .ssd()
                     .then(|| {
                         store
+                            .q
                             .iter()
                             .enumerate()
                             .map(|(i, x)| (i, begin(&o.rules, &x.st, &prompt, limit, true).skip))
-                            .filter(|&(i, k)| k > 0 && (k as u64).div_ceil(PAGE) as usize <= store[i].pages.min(n))
+                            .filter(|&(i, k)| k > 0 && (k as u64).div_ceil(PAGE) as usize <= store.q[i].pages)
                             .max_by_key(|&(i, k)| (k, i))
                     })
                     .flatten();
-                let run = pool.reserve(rows).expect("room checked");
+                let run = pool.reserve(rows, worst).expect("fits checked");
                 if let Some((i, k)) = best {
-                    let x = store.remove(i).expect("found");
-                    stored_pages -= x.pages;
+                    let x = store.q.remove(i).expect("found");
+                    store.pages -= x.pages;
                     let pages = (k as u64).div_ceil(PAGE);
                     res.read += pages * page_bytes;
                     io_s += (pages * page_bytes) as f64 / (o.read_gbs * 1e9);
@@ -367,18 +457,14 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
                 }
                 run
             };
-            // retained runs this grant evicted: the ssd policy writes them out first (unless they went at retirement)
-            let after: Vec<u64> = pool.kept().iter().map(|k| k.age).collect();
-            let gone: Vec<u64> = before.into_iter().filter(|a| !after.contains(a) && *a != h.age).collect();
-            res.evicted += gone.len();
-            for age in gone {
-                let Some(x) = retained.remove(&age) else { continue };
-                if policy == Policy::Ssd && !o.spill_retire {
+            // retained runs this grant evicted: the ssd policies write them out first (unless they went at retirement)
+            evicted(&pool, &before, h.age, &mut retained, &mut res, |x, res| {
+                if policy.ssd() && !o.spill_retire {
                     res.written += x.pages as u64 * page_bytes;
                     io_s += (x.pages as u64 * page_bytes) as f64 / (o.write_gbs * 1e9);
-                    store_push(&mut store, &mut stored_pages, x);
+                    store.push(x);
                 }
-            }
+            });
             if r.overlap >= o.rules.grid.max(1) as usize && skip == 0 {
                 res.lost += 1;
             }
@@ -391,47 +477,58 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
                 arrival,
                 prefill_s: io_s + new as f64 / o.prefill_tps,
                 decode_left: (r.completion - 1) as f64,
+                len: (r.prompt + 1) as f64,
+                worst,
+                stalled: false,
                 prompt,
                 completion: r.completion,
             });
         }
-        // the next event: the running prefill ends, a decoding session ends, or a session sends its next request
+        // the next event: the running prefill ends, a decoding session ends or reaches the end of its pages, or a
+        // session sends its next request
         let prefilling = active.iter().position(|x| x.prefill_s > 0.0);
-        let decoding = active.iter().filter(|x| x.prefill_s <= 0.0).count();
-        let rate = if decoding == 0 {
-            0.0
-        } else {
-            let d = &o.decode_tps;
-            let total = match decoding {
-                1 => d[0],
-                2 => d[1],
-                3 => (d[1] + d[2]) / 2.0,
-                _ => d[2],
-            };
-            total / decoding as f64
-        };
+        let decoding = active.iter().filter(|x| x.prefill_s <= 0.0 && !x.stalled).count();
+        let rate = decode_rate(o, decoding);
+        let room = |x: &Active| x.run.pages as f64 * PAGE as f64 - guard - x.len; // tokens before it needs a page
         let mut dt = f64::INFINITY;
-        if let Some(i) = prefilling {
+        if io_block > 0.0 {
+            dt = io_block;
+        } else if let Some(i) = prefilling {
             dt = active[i].prefill_s;
         } else if decoding > 0 {
-            dt = active.iter().map(|x| x.decode_left / rate).fold(f64::INFINITY, f64::min);
+            for x in active.iter().filter(|x| !x.stalled) {
+                dt = dt.min(x.decode_left / rate).min(room(x).max(0.0) / rate);
+            }
         }
         if let Some(a) = next.iter().flatten().copied().reduce(f64::min) {
             dt = dt.min((a - t).max(0.0));
         }
         if !dt.is_finite() {
+            assert!(active.is_empty() && fifo.is_empty(), "{}: sessions left waiting: deadlock", policy.name());
             break;
         }
         t += dt;
-        if let Some(i) = prefilling {
+        res.live_s += dt * active.len() as f64;
+        res.stall_s += dt * active.iter().filter(|x| x.stalled).count() as f64;
+        if io_block > 0.0 {
+            io_block = (io_block - dt).max(0.0);
+        } else if let Some(i) = prefilling {
             active[i].prefill_s -= dt;
             if active[i].prefill_s <= 1e-12 {
                 active[i].prefill_s = 0.0;
                 res.ttft.push(t - active[i].arrival);
             }
         } else {
-            for x in active.iter_mut() {
+            for x in active.iter_mut().filter(|x| !x.stalled) {
                 x.decode_left -= rate * dt;
+                x.len += rate * dt;
+            }
+        }
+        // decoding sessions at the end of their pages grow by a page, or wait
+        for x in active.iter_mut() {
+            if x.prefill_s <= 0.0 && !x.stalled && x.decode_left > 1e-9 && room(x) <= 1e-9 {
+                let rows = (x.len.ceil() as u64 + o.guard as u64 + 1).min(x.worst);
+                grow(&mut pool, x, rows, &mut retained, &mut res, &mut store, &mut io_block);
             }
         }
         // sessions done decoding retire their runs
@@ -453,16 +550,16 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
                 history,
             };
             let pages = x.run.pages as usize;
-            if policy == Policy::None {
+            if !policy.reuse() {
                 pool.release(&x.run).expect("live run");
             } else {
                 let kept = pool.kept_runs();
                 pool.retain(&x.run, st.clone()).expect("live run");
                 if pool.kept_runs() > kept {
                     let age = pool.kept().last().expect("just retained").age;
-                    if policy == Policy::Ssd && o.spill_retire {
+                    if policy.ssd() && o.spill_retire {
                         res.written += pages as u64 * page_bytes;
-                        store_push(&mut store, &mut stored_pages, Stored { st: st.clone(), pages });
+                        store.push(Stored { st: st.clone(), pages });
                     }
                     retained.insert(age, Stored { st, pages });
                 }
@@ -473,4 +570,23 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
         }
     }
     res
+}
+
+// the retained runs a grant evicted (in `before`, not kept now, not the run a hit adopted): counted, and handed to
+// `spill` with their contents
+fn evicted<F: FnMut(Stored, &mut Result)>(
+    pool: &Pool,
+    before: &[u64],
+    taken: u64,
+    retained: &mut BTreeMap<u64, Stored>,
+    res: &mut Result,
+    mut spill: F,
+) {
+    let after: Vec<u64> = pool.kept().iter().map(|k| k.age).collect();
+    for &age in before.iter().filter(|a| !after.contains(a) && **a != taken) {
+        res.evicted += 1;
+        if let Some(x) = retained.remove(&age) {
+            spill(x, res);
+        }
+    }
 }

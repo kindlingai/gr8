@@ -1,7 +1,7 @@
 //! The C entry points (g6kvman.h). Each returns 0 or an error code that g6kv_error names, and an error leaves the pool
 //! unchanged. Release builds abort on a panic, so none unwinds into C++.
 
-use crate::pool::{Error, Pool, Run};
+use crate::pool::{Error, Pool, Run, Stats};
 use crate::reuse::{Finished, Rules};
 use std::ffi::c_char;
 
@@ -92,18 +92,25 @@ pub unsafe extern "C" fn g6kv_room(p: *const Pool) -> u32 {
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_admissible(p: *const Pool, rows: u64) -> i32 {
-    (*p).admissible(rows) as i32
+pub unsafe extern "C" fn g6kv_admissible(p: *const Pool, worst: u64) -> i32 {
+    (*p).admissible(worst) as i32
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_fits(p: *const Pool, rows: u64, worst: u64) -> i32 {
+    (*p).fits(rows, worst) as i32
 }
 
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_reserve(p: *mut Pool, rows: u64, out: *mut Run) -> i32 {
+pub unsafe extern "C" fn g6kv_reserve(p: *mut Pool, rows: u64, worst: u64, out: *mut Run) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).reserve(rows) {
+    match (*p).reserve(rows, worst) {
         Ok(r) => {
             *out = r;
             0
@@ -195,6 +202,7 @@ pub unsafe extern "C" fn g6kv_match(
     prompt: *const i32,
     n: usize,
     rows: u64,
+    worst: u64,
     limit: i32,
     out: *mut G6kvHit,
 ) -> i32 {
@@ -202,7 +210,7 @@ pub unsafe extern "C" fn g6kv_match(
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    let h = (*p).match_prefix(prompt, rows, limit);
+    let h = (*p).match_prefix(prompt, rows, worst, limit);
     *out = G6kvHit { skip: h.skip, lcp: h.lcp, why: h.why.name().as_ptr(), age: h.age };
     0
 }
@@ -212,17 +220,72 @@ pub unsafe extern "C" fn g6kv_match(
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_take(p: *mut Pool, skip: i32, age: u64, rows: u64, out: *mut Run) -> i32 {
+pub unsafe extern "C" fn g6kv_take(p: *mut Pool, skip: i32, age: u64, rows: u64, worst: u64, out: *mut Run) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).take(skip, age, rows) {
+    match (*p).take(skip, age, rows, worst) {
         Ok(r) => {
             *out = r;
             0
         }
         Err(e) => e.code(),
     }
+}
+
+/// Grows a live run to the pages `rows` needs: `*granted` = 1 and the run in `*out`, or 0 when the growth would leave
+/// the pool unsafe (the session sits out the round).
+///
+/// # Safety
+/// As g6kv_exclusive. `r` must be valid for a read, `out` and `granted` for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_grow(p: *mut Pool, r: *const Run, rows: u64, out: *mut Run, granted: *mut i32) -> i32 {
+    if r.is_null() || out.is_null() || granted.is_null() {
+        return Error::BadArgument.code();
+    }
+    match (*p).grow(&*r, rows) {
+        Ok(g) => {
+            *granted = g.is_some() as i32;
+            *out = g.unwrap_or(*r);
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// # Safety
+/// As g6kv_exclusive, and `out` must be valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stats(p: *const Pool, out: *mut Stats) -> i32 {
+    if out.is_null() {
+        return Error::BadArgument.code();
+    }
+    *out = (*p).stats();
+    0
+}
+
+/// g6kv_use: one live run's pages held now and at worst.
+#[repr(C)]
+pub struct G6kvUse {
+    pub table_version: u32,
+    pub held: u32,
+    pub worst: u32,
+}
+
+/// Writes up to `cap` live runs (by table version) into `out` and returns how many there are.
+///
+/// # Safety
+/// As g6kv_exclusive, and `out` must hold `cap` entries (or be NULL with cap 0).
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_runs(p: *const Pool, out: *mut G6kvUse, cap: usize) -> usize {
+    let mut n = 0;
+    for (v, held, worst) in (*p).runs() {
+        if n < cap && !out.is_null() {
+            *out.add(n) = G6kvUse { table_version: v, held, worst };
+        }
+        n += 1;
+    }
+    n
 }
 
 /// # Safety

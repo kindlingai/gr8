@@ -98,18 +98,18 @@ fn random_traces() {
                     prompt.extend((0..extra).map(|_| rng.range(0, 20) as i32));
                     let rows = prompt.len() as u64 + rng.range(1, 80);
                     if !a.admissible(rows) || rows.div_ceil(PAGE) > a.room() as u64 {
-                        assert!(a.reserve(rows).is_err());
+                        assert!(a.reserve(rows, rows).is_err());
                         check(&a, &live);
                         continue;
                     }
                     let kept = a.kept_runs();
-                    let h = a.match_prefix(&prompt, rows, prompt.len() as i32 - 1);
-                    assert_eq!(h, b.match_prefix(&prompt, rows, prompt.len() as i32 - 1));
+                    let h = a.match_prefix(&prompt, rows, rows, prompt.len() as i32 - 1);
+                    assert_eq!(h, b.match_prefix(&prompt, rows, rows, prompt.len() as i32 - 1));
                     let (ra, rb) = if h.skip > 0 {
                         hits += 1;
-                        (a.take(h.skip, h.age, rows).unwrap(), b.take(h.skip, h.age, rows).unwrap())
+                        (a.take(h.skip, h.age, rows, rows).unwrap(), b.take(h.skip, h.age, rows, rows).unwrap())
                     } else {
-                        (a.reserve(rows).unwrap(), b.reserve(rows).unwrap())
+                        (a.reserve(rows, rows).unwrap(), b.reserve(rows, rows).unwrap())
                     };
                     assert_eq!(ra, rb);
                     grants += 1;
@@ -139,7 +139,7 @@ fn random_traces() {
         }
         // a rank that makes one more call than the others has another digest
         if a.room() > 0 && a.admissible(PAGE) {
-            a.reserve(PAGE).unwrap();
+            a.reserve(PAGE, PAGE).unwrap();
             assert_ne!(a.digest(), b.digest());
         }
     }
@@ -149,19 +149,19 @@ fn random_traces() {
 #[test]
 fn lowest_free_first_and_exclusive() {
     let mut p = Pool::new(100, 60, 60 * 64).unwrap();
-    let runs: Vec<Run> = (0..6).map(|_| p.reserve(10 * PAGE).unwrap()).collect();
+    let runs: Vec<Run> = (0..6).map(|_| p.reserve(10 * PAGE, 10 * PAGE).unwrap()).collect();
     assert_eq!(p.room(), 0);
     for r in runs.iter().step_by(2) {
         p.release(r).unwrap();
     }
-    let big = p.reserve(25 * PAGE).unwrap();
+    let big = p.reserve(25 * PAGE, 25 * PAGE).unwrap();
     let want: Vec<u32> = (0..10).chain(20..30).chain(40..45).collect();
     assert_eq!(p.list(&big).unwrap(), &want[..]);
     for r in runs.iter().skip(1).step_by(2).chain([&big]) {
         p.release(r).unwrap();
     }
     assert_eq!(p.free_pages(), 100);
-    let x = p.reserve(90 * PAGE).unwrap();
+    let x = p.reserve(90 * PAGE, 90 * PAGE).unwrap();
     assert!(p.exclusive_run(&x).unwrap() && p.list(&x).unwrap() == (0..90).collect::<Vec<u32>>());
     assert_eq!((p.room(), p.free_pages(), p.admissible(PAGE)), (0, 0, false));
 }

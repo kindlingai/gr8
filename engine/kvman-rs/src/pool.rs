@@ -37,6 +37,7 @@ pub enum Error {
     NotRetained,
     VersionExhausted,
     BadArgument,
+    PastWorst,
 }
 
 impl Error {
@@ -53,6 +54,7 @@ impl Error {
             Error::NotRetained => c"pool take of a run no longer retained",
             Error::VersionExhausted => c"pool table version exhausted",
             Error::BadArgument => c"pool call with a null or invalid argument",
+            Error::PastWorst => c"pool growth past the run's worst case",
         }
     }
     pub fn from_code(code: i32) -> Option<Error> {
@@ -64,6 +66,7 @@ impl Error {
             Error::NotRetained,
             Error::VersionExhausted,
             Error::BadArgument,
+            Error::PastWorst,
         ]
         .into_iter()
         .find(|e| e.code() == code)
@@ -81,6 +84,18 @@ impl std::error::Error for Error {}
 struct Held {
     list: Vec<u32>,
     exclusive: bool,
+    worst: u32, // the most pages the run may grow to
+}
+
+/// Totals for status.s2: live runs, the pages they hold and could grow to, granted and refused growth.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub live_runs: u32,
+    pub held_pages: u32,
+    pub worst_pages: u32,
+    pub grows: u64,
+    pub stalls: u64,
 }
 
 /// A retired run: its pages count as free until a reservation evicts it or a hit adopts its start.
@@ -122,6 +137,8 @@ pub struct Pool {
     rules: Rules,
     kept: Vec<Kept>,
     age: u64,
+    grows: u64,
+    stalls: u64,
 }
 
 impl Pool {
@@ -150,6 +167,8 @@ impl Pool {
             rules: Rules::default(),
             kept: Vec::new(),
             age: 0,
+            grows: 0,
+            stalls: 0,
         })
     }
 
@@ -176,24 +195,71 @@ impl Pool {
         }
     }
 
-    /// Head, before reserve: a past-R request waits for an empty pool.
-    pub fn admissible(&self, rows: u64) -> bool {
-        !self.exclusive && (!self.exclusive(rows) || self.live == 0)
+    /// Head, before reserve: a past-R request (by its worst case) waits for an empty pool.
+    pub fn admissible(&self, worst: u64) -> bool {
+        !self.exclusive && (!self.exclusive(worst) || self.live == 0)
     }
 
-    pub fn reserve(&mut self, rows: u64) -> Result<Run, Error> {
-        let n = pages_for(rows);
-        if rows == 0 || n > self.room() as u64 || !self.admissible(rows) {
+    /// Whether a request that needs `rows` now and at most `worst` rows can be admitted: an exclusive run takes its
+    /// worst case at once from an empty pool, and a run below R takes `rows` and must leave the pool safe (safe()).
+    pub fn fits(&self, rows: u64, worst: u64) -> bool {
+        let (n, w) = (pages_for(rows), pages_for(worst));
+        if rows == 0 || n > w || !self.admissible(worst) {
+            return false;
+        }
+        if self.exclusive(worst) {
+            return w <= self.room() as u64;
+        }
+        n <= self.room() as u64 && w <= self.place as u64 && self.safe(Some((n, w)), None)
+    }
+
+    /// A run of pages for `rows` now that may grow (grow()) to `worst` rows. An exclusive run holds its worst case.
+    pub fn reserve(&mut self, rows: u64, worst: u64) -> Result<Run, Error> {
+        if !self.fits(rows, worst) {
             return Err(Error::NoRoom);
         }
         self.check_version()?;
-        if self.exclusive(rows) {
+        let w = pages_for(worst) as u32;
+        if self.exclusive(worst) {
             let gone = std::mem::take(&mut self.kept);
-            return Ok(self.grant((0..n as u32).collect(), true, rows, "exclusive", &gone));
+            return Ok(self.grant((0..w).collect(), true, w, worst, "exclusive", &gone));
         }
-        let mut list = Vec::with_capacity(n as usize);
-        let gone = self.fill(&mut list, n as usize);
-        Ok(self.grant(list, false, rows, if gone.is_empty() { "free" } else { "lru" }, &gone))
+        let n = pages_for(rows) as usize;
+        let mut list = Vec::with_capacity(n);
+        let gone = self.fill(&mut list, n);
+        Ok(self.grant(list, false, w, rows, if gone.is_empty() { "free" } else { "lru" }, &gone))
+    }
+
+    /// A live run below R grows to the pages `rows` needs, the lowest free ones (evicting retained runs as reserve()
+    /// does). Ok(None) when the pages would leave the pool unsafe: the caller leaves the session out of this round.
+    /// The run keeps its table version, and its list grows at the end.
+    pub fn grow(&mut self, r: &Run, rows: u64) -> Result<Option<Run>, Error> {
+        let h = self.held(r)?;
+        let (n, have) = (pages_for(rows), h.list.len() as u64);
+        if n <= have {
+            return Ok(Some(*r));
+        }
+        if h.exclusive || n > h.worst as u64 {
+            return Err(Error::PastWorst);
+        }
+        let add = n - have;
+        if add > self.place.wrapping_sub(self.live) as u64 || !self.safe(None, Some((r.table_version, add))) {
+            self.stalls += 1;
+            return Ok(None);
+        }
+        let mut h = self.held.remove(&r.table_version).expect("held() found it");
+        let gone = self.fill(&mut h.list, n as usize);
+        self.mark(&h.list[have as usize..], true);
+        self.grows += 1;
+        let g = Run {
+            first_page: h.list[0],
+            pages: n as u32,
+            table_version: r.table_version,
+            list_hash: hash(&h.list, false),
+        };
+        self.log_claim("grow", &g, rows, &gone);
+        self.held.insert(r.table_version, h);
+        Ok(Some(g))
     }
 
     pub fn release(&mut self, r: &Run) -> Result<(), Error> {
@@ -232,13 +298,14 @@ impl Pool {
     }
 
     /// The retained run with the longest reusable prefix for `prompt` (limit: rows the prefill may skip) that a
-    /// reservation of `rows` can grow from. Ties go to the most recent.
-    pub fn match_prefix(&self, prompt: &[i32], rows: u64, limit: i32) -> Hit {
+    /// reservation of `rows` now and `worst` at most can grow from. Ties go to the most recent.
+    pub fn match_prefix(&self, prompt: &[i32], rows: u64, worst: u64, limit: i32) -> Hit {
         let mut best = Hit::default();
         if !self.keep || self.exclusive {
             return best;
         }
-        let n = pages_for(rows);
+        let w = pages_for(worst);
+        let n = if self.exclusive(worst) { w } else { pages_for(rows) };
         for k in &self.kept {
             let t = reuse::begin(&self.rules, &k.st, prompt, limit, true);
             if t.skip <= 0 {
@@ -251,13 +318,13 @@ impl Pool {
             let a = pages_for(t.skip as u64);
             let adopted = &k.list[..(a as usize).min(k.list.len())];
             let mut room = a <= k.list.len() as u64 && a <= n;
-            if self.exclusive(rows) {
+            if self.exclusive(worst) {
                 // an exclusive run is pages 0, 1, ..: the adopted ones must be its start
                 room = room && self.live == 0 && n <= self.pages as u64;
                 room = room && adopted.iter().enumerate().all(|(i, &p)| p as usize == i);
             } else {
-                room = room && n <= (self.place.wrapping_sub(self.live)) as u64;
-                room = room && adopted.iter().all(|&p| p < self.place);
+                room = room && n <= (self.place.wrapping_sub(self.live)) as u64 && n <= w;
+                room = room && adopted.iter().all(|&p| p < self.place) && self.safe(Some((n, w)), None);
             }
             if !room {
                 if best.skip == 0 {
@@ -274,35 +341,40 @@ impl Pool {
 
     /// Claims a match_prefix() hit (skip, age) as a new grant: the retained run's first ceil(skip / 64) pages, then
     /// pages as reserve() takes them.
-    pub fn take(&mut self, skip: i32, age: u64, rows: u64) -> Result<Run, Error> {
-        if skip <= 0 || !self.admissible(rows) {
+    pub fn take(&mut self, skip: i32, age: u64, rows: u64, worst: u64) -> Result<Run, Error> {
+        if skip <= 0 || !self.admissible(worst) {
             return Err(Error::NoHit);
         }
         let i = self.kept.iter().position(|k| k.age == age).ok_or(Error::NotRetained)?;
-        let (a, n) = (pages_for(skip as u64), pages_for(rows));
+        let w = pages_for(worst);
+        let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w } else { pages_for(rows) });
         // checks the C++ pool left to match(): a hit from match() on this state always passes them
         let k = &self.kept[i];
         if a > k.list.len() as u64 || a > n {
             return Err(Error::NoHit);
         }
         let adopted = &k.list[..a as usize];
-        if self.exclusive(rows) {
+        if self.exclusive(worst) {
             if n > self.pages as u64 || adopted.iter().enumerate().any(|(i, &p)| p as usize != i) {
                 return Err(Error::NoRoom);
             }
-        } else if n > (self.place.wrapping_sub(self.live)) as u64 || adopted.iter().any(|&p| p >= self.place) {
+        } else if n > (self.place.wrapping_sub(self.live)) as u64
+            || n > w
+            || adopted.iter().any(|&p| p >= self.place)
+            || !self.safe(Some((n, w)), None)
+        {
             return Err(Error::NoRoom);
         }
         self.check_version()?;
         let mut list = self.kept.remove(i).list;
         list.truncate(a as usize);
-        if self.exclusive(rows) {
+        if self.exclusive(worst) {
             let gone = std::mem::take(&mut self.kept);
             list.extend(a as u32..n as u32);
-            return Ok(self.grant(list, true, rows, "hit", &gone));
+            return Ok(self.grant(list, true, w as u32, worst, "hit", &gone));
         }
         let gone = self.fill(&mut list, n as usize);
-        Ok(self.grant(list, false, rows, "hit", &gone))
+        Ok(self.grant(list, false, w as u32, rows, "hit", &gone))
     }
 
     /// Every rank's pool must agree: folded into Scheduler::digest at each event boundary.
@@ -313,6 +385,11 @@ impl Pool {
         }
         for (v, x) in &self.held {
             h = mix(mix(h, *v as u64), hash(&x.list, x.exclusive));
+            // a run that may still grow: its worst case is state every rank must agree on (a run granted its worst case
+            // at once hashes as it did before growth existed)
+            if x.worst as usize > x.list.len() {
+                h = mix(h, x.worst as u64);
+            }
         }
         for k in &self.kept {
             h = mix(mix(mix(h, k.age), hash(&k.list, false)), k.st.valid as i64 as u64);
@@ -327,6 +404,55 @@ impl Pool {
 
     pub fn kept_runs(&self) -> u32 {
         self.kept.len() as u32
+    }
+
+    pub fn stats(&self) -> Stats {
+        Stats {
+            live_runs: self.held.len() as u32,
+            held_pages: self.live,
+            worst_pages: self.held.values().map(|h| h.worst).sum(),
+            grows: self.grows,
+            stalls: self.stalls,
+        }
+    }
+
+    /// Each live run, by table version: (table_version, pages held, worst-case pages).
+    pub fn runs(&self) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+        self.held.iter().map(|(v, h)| (*v, h.list.len() as u32, h.worst))
+    }
+
+    /// Banker's safety (one resource, no preemption): with `new` = (pages now, worst) admitted and `grow` = (table
+    /// version, pages) added to a live run, can every live run still reach its worst case? Runs finish in order of
+    /// their remaining need, smallest first, each returning what it holds. Retained runs count as free.
+    pub fn safe(&self, new: Option<(u64, u64)>, grow: Option<(u32, u64)>) -> bool {
+        if self.exclusive {
+            return new.is_none() && grow.is_none();
+        }
+        let mut free = self.place as i64 - self.live as i64;
+        let mut runs: Vec<(u64, u64)> = self
+            .held
+            .iter()
+            .map(|(v, h)| {
+                let held = h.list.len() as u64 + grow.filter(|g| g.0 == *v).map_or(0, |g| g.1);
+                ((h.worst as u64).saturating_sub(held), held)
+            })
+            .collect();
+        free -= grow.map_or(0, |g| g.1 as i64);
+        if let Some((n, w)) = new {
+            free -= n as i64;
+            runs.push((w.saturating_sub(n), n));
+        }
+        if free < 0 {
+            return false;
+        }
+        runs.sort_unstable();
+        for (need, held) in runs {
+            if need as i64 > free {
+                return false;
+            }
+            free += held as i64;
+        }
+        true
     }
 
     /// The retained runs, oldest retired first.
@@ -430,7 +556,7 @@ impl Pool {
         gone
     }
 
-    fn grant(&mut self, list: Vec<u32>, exclusive: bool, rows: u64, how: &str, gone: &[Kept]) -> Run {
+    fn grant(&mut self, list: Vec<u32>, exclusive: bool, worst: u32, rows: u64, how: &str, gone: &[Kept]) -> Run {
         self.mark(&list, true);
         self.version += 1;
         let r = Run {
@@ -439,23 +565,28 @@ impl Pool {
             table_version: self.version,
             list_hash: hash(&list, exclusive),
         };
-        if self.log {
-            let mut s = format!(
-                "# s2 pool claim {how} first {} pages {} rows {rows} live {} kept {} evicted {}",
-                r.first_page,
-                r.pages,
-                self.live,
-                self.kept.len(),
-                gone.len()
-            );
-            for k in gone {
-                let _ = write!(s, " [{}+{} age {} valid {}]", k.list[0], k.list.len(), k.age, k.st.valid);
-            }
-            s.push('\n');
-            let _ = std::io::stderr().write_all(s.as_bytes());
-        }
-        self.held.insert(r.table_version, Held { list, exclusive });
+        self.log_claim(how, &r, rows, gone);
+        self.held.insert(r.table_version, Held { list, exclusive, worst });
         self.exclusive = self.exclusive || exclusive;
         r
+    }
+
+    fn log_claim(&self, how: &str, r: &Run, rows: u64, gone: &[Kept]) {
+        if !self.log {
+            return;
+        }
+        let mut s = format!(
+            "# s2 pool claim {how} first {} pages {} rows {rows} live {} kept {} evicted {}",
+            r.first_page,
+            r.pages,
+            self.live,
+            self.kept.len(),
+            gone.len()
+        );
+        for k in gone {
+            let _ = write!(s, " [{}+{} age {} valid {}]", k.list[0], k.list.len(), k.age, k.st.valid);
+        }
+        s.push('\n');
+        let _ = std::io::stderr().write_all(s.as_bytes());
     }
 }

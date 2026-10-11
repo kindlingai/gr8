@@ -95,8 +95,8 @@ Variations (`kvman-sim TRACE --policies ...` with the flag shown):
 | after | writes at 1.1 GB/s | 121.1 / 375.1 / 3,186 | 46.5 / 316.0 / 2,282 | 178.8 |
 | before | `--spill retire` (every retained run written at retirement, off the critical path) | | 14.6 / 77.8 / 2,700 | 170.8 |
 | after | `--spill retire` | | 35.6 / 306.5 / 2,119 | 193.5 |
-| before | `--max-tokens 8192` (no exclusive runs) | 3.8 / 46.6 / 2,816 | 3.8 / 20.9 / 2,657 | 19.5 |
-| after | `--max-tokens 8192` | 84.4 / 188.1 / 2,509 | 28.6 / 108.0 / 1,536 | 104.3 |
+| before | `--max-tokens 8192` (no exclusive runs; a request stops at 8,192 tokens) | 3.8 / 46.6 / 2,416 | 3.8 / 20.9 / 2,257 | 19.5 |
+| after | `--max-tokens 8192` | 66.5 / 141.6 / 2,257 | 21.3 / 92.9 / 1,335 | 103.0 |
 | both | `--ssd-gb 32` | | unchanged | |
 
 A 32 GB store gives the same results because each session only comes back for its latest run.
@@ -118,9 +118,37 @@ window come from SSD, one 4 KiB read each. The estimate assumes the selection is
 Milliseconds at 832,555 IOPS (depth 128). A decode step at 30 tok/s is about 33 ms, so a 16k window would cost most of a
 step on these contexts, a 32k window 7-29% of one, and a 48k window at most 5%.
 
+### Growth on demand next to the SSD tier
+
+Since the pool lets runs grow on demand (`Pool::grow`, `Driver::step`), kvman-sim also models that: a run below R
+holds its prompt + 1 + guard rows at admission and takes a page each time its tokens reach the end of its pages. A
+request is admitted, and a run grows, only while every live run can still reach prompt + `max_tokens` + guard (the
+safe state). Otherwise the request waits in the queue or the session waits for a page. `live` is the sessions resident
+on average, `waited s` the session-seconds spent waiting for a page.
+
+| trace | policy | TTFT p50 s | TTFT p90 s | wall s | prefilled tokens | avoided | pool hits | SSD hits | lost | SSD written GB | SSD read GB | live | waited s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| before | today | 42.6 | 109.0 | 3,138 | 825,680 | 593,920 | 20 | 0 | 29 | 0 | 0 | 1.25 | 0 |
+| before | ssd | 16.9 | 79.2 | 2,741 | 285,008 | 1,134,592 | 21 | 27 | 1 | 92.6 | 28.7 | 1.14 | 0 |
+| before | grow | 4.1 | 25.3 | 2,678 | 285,008 | 1,134,592 | 48 | 0 | 1 | 0 | 0 | 1.34 | 0 |
+| before | grow+ssd | 4.1 | 25.3 | 2,679 | 285,008 | 1,134,592 | 48 | 0 | 1 | 6.4 | 0 | 1.34 | 0 |
+| after | today | 121.1 | 375.1 | 3,186 | 1,691,705 | 110,592 | 2 | 0 | 48 | 0 | 0 | 1.23 | 0 |
+| after | ssd | 38.5 | 308.3 | 2,150 | 290,873 | 1,511,424 | 2 | 48 | 0 | 178.8 | 76.7 | 1.23 | 0 |
+| after | grow | 114.1 | 389.1 | 2,988 | 1,388,601 | 413,696 | 12 | 0 | 38 | 0 | 0 | 1.32 | 0 |
+| after | grow+ssd | 32.5 | 303.3 | 2,208 | 319,545 | 1,482,752 | 11 | 38 | 1 | 107.6 | 61.0 | 1.31 | 0 |
+
+On the first trace growth alone keeps nearly every retained run (48 pool hits against 20): median TTFT 42.6 s ->
+4.1 s, p90 109.0 s -> 25.3 s, wall time -15%. On the second, 25 of the 54 requests are past R with their `max_tokens`
+(9 of 53 in the first). Those still take the whole pool at once and evict every retained run, so growth gains 6% of
+wall time and the SSD tier does most of the work. With `--max-tokens 8192`, growth gives 2.8 / 7.0 s TTFT (p50 / p90)
+and 2,239 s on the first trace against today's 3.8 / 46.6 s and 2,416 s, and 78.7 / 164.9 s and 2,063 s on the second
+against 66.5 / 141.6 s and 2,257 s. No session waited for a page in any of these runs: the safe-state check at
+admission keeps enough pages for every admitted session, so the cost of safety is a later admission, not a stall.
+
 ## What hooking it up would take
 
-- **Where.** `RunPool::fill` and the exclusive branch of `reserve` / `take` already hold the evicted runs (`gone`).
+- **Where.** `RunPool::fill` (from `reserve`, `take` and `grow`) and the exclusive branch of `reserve` / `take` already
+  hold the evicted runs (`gone`).
   The spill goes there, at the event fence, before the new grant's pages are written. The restore goes next to
   `match`: the head in `Service::event` (after a pool miss, match the stored runs with the same `begin` rule) and each
   worker in the bind hook, as it repeats `match` / `take` today.
