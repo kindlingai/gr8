@@ -47,9 +47,15 @@ inline uint32_t reserve_pages(const Config& c, const Request& r) {
     require(rows <= c.pool_rows, "request exceeds pool including guard");
     return uint32_t((rows + PAGE - 1) / PAGE);
 }
+// a session's pages, as the control link carries them. Each rank's pool (pool.h) holds the list and fills it the same
+// way. list_hash names the list, so a rank whose list differs fails at its grant.
 struct Run {
-    uint32_t base_page = 0, pages = 0, table_version = 0;
-    bool identity() const { return base_page == 0; }
+    uint32_t first_page = 0, pages = 0, table_version = 0;
+    uint64_t list_hash = 0;
+    bool operator==(const Run& b) const {
+        return first_page == b.first_page && pages == b.pages && table_version == b.table_version && list_hash == b.list_hash;
+    }
+    bool operator!=(const Run& b) const { return !(*this == b); }
 };
 enum class Phase { Free, Prefill, Decode, Retiring };
 struct Slot {
@@ -82,7 +88,7 @@ struct Completion { Key key; uint32_t emitted = 0; bool finished = false; };
 class Scheduler {
     Config c_;
     std::array<Slot, MAX_SESSIONS> s_{};
-    uint64_t boundary_ = 0, event_ = 0, revision_ = 0, last_id_ = 0;
+    uint64_t boundary_ = 0, event_ = 0, revision_ = 0, last_id_ = 0, pool_ = 0;
     bool have_id_ = false;
     bool want_decode_ = true, busy_ = false, failed_ = false;
     Quantum work_;
@@ -113,6 +119,8 @@ public:
         boundary_ = target;
     }
     void fail() { failed_ = true; }
+    // the pool's digest (pool.h RunPool::digest) at this event boundary, so the ranks also agree on their pages
+    void pool_digest(uint64_t d) { pool_ = d; }
     unsigned resident() const {
         unsigned n = 0; for (const auto& s : s_) n += s.phase != Phase::Free && s.phase != Phase::Retiring; return n;
     }
@@ -140,11 +148,12 @@ public:
         auto add = [&](uint64_t v) { for (unsigned i = 0; i < 8; ++i) { h ^= uint8_t(v >> (8*i)); h *= 1099511628211ull; } };
         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
         add(c_.prefill_rows); add(c_.two_lanes); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
+        add(pool_);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
             if (s.phase == Phase::Free) continue;
             add(s.req.id); add(s.req.prompt_tokens); add(s.req.max_tokens);
-            add(s.run.base_page); add(s.run.pages); add(s.run.table_version); add(s.prefilled); add(s.emitted);
+            add(s.run.first_page); add(s.run.pages); add(s.run.table_version); add(s.run.list_hash); add(s.prefilled); add(s.emitted);
         }
         return h;
     }
@@ -163,12 +172,12 @@ public:
             require(g.key.slot < MAX_SESSIONS && g.key.epoch == c_.epoch, "bad grant key");
             auto& target = after[g.key.slot];
             require(target.phase == Phase::Free && target.key.generation != UINT32_MAX && g.key.generation == target.key.generation + 1, "grant slot generation mismatch");
-            require(g.run.pages == reserve_pages(c_, g.req) && uint64_t(g.run.base_page) + g.run.pages <= c_.pool_rows/PAGE && g.run.table_version, "bad contiguous reservation");
+            // the pool rejects a page two runs hold (RunPool::mark)
+            require(g.run.pages == reserve_pages(c_, g.req) && g.run.first_page < c_.pool_rows/PAGE && g.run.table_version, "bad reservation");
             unsigned live = 0;
             for (const auto& s : after) if (s.phase != Phase::Free) {
                 ++live;
                 require(s.req.id != g.req.id, "duplicate native request id");
-                require(uint64_t(g.run.base_page) + g.run.pages <= s.run.base_page || uint64_t(s.run.base_page) + s.run.pages <= g.run.base_page, "overlapping runs");
             }
             require(live < c_.limit(), "active session/row limit");
             require(g.reuse < g.req.prompt_tokens, "reused rows past the prompt");
@@ -230,15 +239,15 @@ public:
     }
 };
 
-enum class Stall { None, Slots, Capacity, Fragmentation };
-struct AdmissionStatus { Stall why = Stall::None; uint32_t requested = 0, total_free = 0, largest_run = 0; };
-// Rank0 ingress FIFO. reserve/first-fit remains exclusively in the TP4 allocator.
+enum class Stall { None, Slots, Capacity };
+struct AdmissionStatus { Stall why = Stall::None; uint32_t requested = 0, room = 0; };
+// Rank0 ingress FIFO. Page choice stays in the pool (pool.h).
 class AdmissionQueue {
     Config c_; std::deque<Request> q_;
     uint64_t last_revision_ = UINT64_MAX, last_head_ = UINT64_MAX, last_id_ = 0;
     bool have_id_ = false;
 public:
-    uint64_t stalls = 0, fragmentation_stalls = 0;
+    uint64_t stalls = 0;
     explicit AdmissionQueue(Config c) : c_(c) { c_.validate(); }
     void push(Request r) {
         (void)reserve_pages(c_, r);
@@ -254,13 +263,14 @@ public:
     const Request* front() const { return q_.empty() ? nullptr : &q_.front(); }
     size_t size() const { return q_.size(); }
     void admitted(uint64_t id) { require(!q_.empty() && q_.front().id == id, "FIFO admission violated"); q_.pop_front(); }
-    std::optional<AdmissionStatus> check(uint64_t revision, bool slot, uint32_t total, uint32_t largest) {
+    // room: the pages one reservation can take now (RunPool::room)
+    std::optional<AdmissionStatus> check(uint64_t revision, bool slot, uint32_t room) {
         if (q_.empty() || (last_head_ == q_.front().id && last_revision_ == revision)) return {};
-        require(largest <= total && total <= c_.pool_rows/PAGE, "invalid allocator view");
+        require(room <= c_.pool_rows/PAGE, "invalid allocator view");
         last_head_ = q_.front().id; last_revision_ = revision;
-        AdmissionStatus s; s.requested = reserve_pages(c_, q_.front()); s.total_free = total; s.largest_run = largest;
-        s.why = !slot ? Stall::Slots : total < s.requested ? Stall::Capacity : largest < s.requested ? Stall::Fragmentation : Stall::None;
-        if (s.why != Stall::None) { ++stalls; fragmentation_stalls += s.why == Stall::Fragmentation; }
+        AdmissionStatus s; s.requested = reserve_pages(c_, q_.front()); s.room = room;
+        s.why = !slot ? Stall::Slots : room < s.requested ? Stall::Capacity : Stall::None;
+        if (s.why != Stall::None) ++stalls;
         return s;
     }
 };

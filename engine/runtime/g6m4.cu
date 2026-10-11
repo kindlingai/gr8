@@ -714,7 +714,7 @@ int main(int argc, char** argv)
             PrefixReuse rules;
             rules.strict = st_ == 1; rules.noend = ne_ == 1; rules.grid = al_ == 1 ? MP : 0;
             pool.keep(rules);
-            if (env_choice("G6_POOL_LOG", 1, 0, &err) == 1) pool.log(true);   // one stderr line per pool claim: base, pages, evicted retained runs
+            if (env_choice("G6_POOL_LOG", 1, 0, &err) == 1) pool.log(true);   // one stderr line per pool claim: first page, pages, evicted retained runs
             if (R == 0) fprintf(stderr, "# s2 reuse on: retired runs kept until a claim overlaps them; grid %d rows\n", rules.grid);
         }
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
@@ -743,9 +743,9 @@ int main(int argc, char** argv)
             },
             // the run's pages go into the layers' tables. Staged prefill reads index keys through them too.
             [&](const g6s2::Slot& sl) {
-                const bool ex = pool.exclusive(g6s2::reserve_rows(sc, sl.req));
-                const std::vector<int> run = ex ? s2_run_list(0, m.s2->run_pages) : s2_run_list((int)sl.run.base_page, (int)sl.run.pages);
-                s2_solo_pages(m, run); s2_solo_pages(D.d, run);
+                const bool ex = pool.exclusive_run(sl.run);
+                if (ex) { s2_solo_built(m); s2_solo_built(D.d); }
+                else { const std::vector<int> run = pool.list(sl.run); s2_solo_pages(m, run); s2_solo_pages(D.d, run); }
                 m.s2_pf_table = D.d.s2_pf_table = !ex;
                 // OWN=4: the serve loop's per-request rule (prompt + gen against the QO key table). The CP staging pool holds
                 // S2 prefill rows by position, and the run's pages never reach the QO prepass.
@@ -772,9 +772,9 @@ int main(int argc, char** argv)
             g6s2::NativeDispatch nd(nx, sc);
             g6s2::NativeHooks h;
             h.pool.free_pages = [&] { return pool.free_pages(); };
-            h.pool.largest_run = [&] { return pool.largest_run(); };
+            h.pool.room = [&] { return pool.room(); };
             h.pool.reserve = [&](uint64_t rows) { return pool.reserve(rows); };
-            h.pool.claim = [&](const g6s2::Run& r, uint64_t rows) { pool.claim(r, rows); };
+            h.pool.digest = [&] { return pool.digest(); };
             h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
             h.pool.admissible = [&](uint64_t rows) { return pool.admissible(rows); };
             if (pool.keeping())
@@ -787,15 +787,15 @@ int main(int argc, char** argv)
                 const int q = (int)g.key.slot;
                 slot_prompt[q] = g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
-                const bool ex = pool.exclusive(g6s2::reserve_rows(sc, g.req));
+                const bool ex = pool.exclusive_run(g.run);
                 // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
                 // past them is written by this request before any step reads it (prefix_reuse.h)
                 for (Model* x : {&m, &D.d})
                 {
-                    if (ex) { s2_set_pages(*x, q, s2_run_list(0, x->s2->run_pages)); if (!g.reuse) reset(*x, st); }   // alone: the whole pool, today's reset
+                    if (ex) { s2_set_exclusive(*x, q); if (!g.reuse) reset(*x, st); }   // alone: the whole pool, today's reset
                     else
                     {
-                        s2_set_pages(*x, q, s2_run_list((int)g.run.base_page, (int)g.run.pages));
+                        s2_set_pages(*x, q, pool.list(g.run));
                         if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st);
                     }
                     for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)

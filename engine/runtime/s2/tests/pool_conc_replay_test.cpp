@@ -1,6 +1,6 @@
 // PF-C6-CONC replay: the S2 pool under 4 concurrent sessions (pfc6.py S2 rounds, pool of 1920 physical pages, the request
-// sizes of the PFE c6 log). Host only. Without the LRU placement (pool.h lru) the 8192 plusN round loses its probe and two
-// fillers: a miss packed over fresh retained runs. Now every resubmit / plusN-resubmit request of the 8192 phase must hit.
+// sizes of the PFE c6 log). Host only. A miss must evict the least recently retired runs: one that evicts fresh ones
+// loses the 8192 plusN round's probe and two fillers. Every resubmit / plusN-resubmit request of the 8192 phase must hit.
 // PF_REPLAY_VERBOSE=1 prints one line per request in the g6m4 "# s2 reuse request" format.
 #include "s2/pool.h"
 #include <cstdio>
@@ -24,7 +24,7 @@ struct Sim {
         Run run; int skip = 0;
         if (h.skip > 0) { run = pool.take(h, r); skip = h.skip; } else run = pool.reserve(r);
         if (expect_hit && h.skip <= 0) ++lost;
-        if (log) std::printf("req %llu %-5s %-14s retained %5d lcp %5d prompt %5zu base %4u pages %3u kept %u\n", (unsigned long long)id, h.why, tag, h.skip, h.lcp, p.size(), run.base_page, run.pages, pool.kept_runs());
+        if (log) std::printf("req %llu %-5s %-14s retained %5d lcp %5d prompt %5zu first %4u pages %3u kept %u\n", (unsigned long long)id, h.why, tag, h.skip, h.lcp, p.size(), run.first_page, run.pages, pool.kept_runs());
         ++id;
         live.push_back(Live{run, p, seq(maxtok, int(id) + 5000), skip});
     }

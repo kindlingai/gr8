@@ -16,17 +16,15 @@ struct Launch {
     std::vector<int> req_slots;     // raw slot ids, for join with request ids
     std::vector<int> events;        // per-session E1/E2 class (s2::Step::Event), parallel to step.sess
     s2::Step::Event event = s2::Step::ROUND; // strongest (lowest ordinal) class among the sessions
-    std::vector<int> bases, buckets, source_rows;   // per session: run base page, context bucket, first row in the last main step
+    std::vector<int> buckets, source_rows;          // per session: context bucket, first row in the last main step
     int bucket = 0;                                  // the step's bucket: the largest of its sessions'
     std::vector<Sampling> samples;
-    // the graph key: kind, M and the step's bucket. Not the sessions, bases or source rows: those are data (S2In)
+    // the graph key: kind, M and the step's bucket. The sessions and source rows are data (S2In)
     std::string graph_key;
 };
 struct DispatchHooks {
-    // Canonical native S2Model base, AFTER binding. No allocator lookup here.
-    std::function<int(bool draft, int slot)> base;
     std::function<int(bool draft, int context)> bucket;
-    // At a synchronized boundary: hprev handoff, solo tables B+i, s2on toggles.
+    // At a synchronized boundary: hprev handoff, the solo session's tables, s2on toggles.
     std::function<void(int old_solo, int new_solo)> mode;
     // All model work synchronous on return (including the draft).
     std::function<std::vector<int>(const Launch&)> launch;
@@ -54,7 +52,7 @@ class Dispatch {
     bool track_ = false;
 public:
     Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h) : sessions_(sessions), hooks_(std::move(h)), max_rows_(rows) {
-        require(rows && bool(hooks_.base) && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && bool(hooks_.prefill), "incomplete dispatch hooks");
+        require(rows && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && bool(hooks_.prefill), "incomplete dispatch hooks");
     }
     // Call at every safe boundary after local EOS/commit, not inside a Step.
     // Resident means Prefill OR Decode; a 1-session prompt step within S>=2 is
@@ -90,10 +88,10 @@ public:
             const auto& s = sessions_.at(unsigned(q));
             require(sp.row0[j] == next_row && sp.rows[j] > 0 && sp.rows[j] <= sp.M() - next_row && sp.ctx[j] > 0 &&
                     uint64_t(sp.ctx[j]) <= uint64_t(s.run.pages) * PAGE, "step outside session run");
-            const int base = hooks_.base(draft, q), bucket = hooks_.bucket(draft, sp.ctx[j]);
-            require(base >= 0 && unsigned(base) == s.run.base_page && bucket >= 0, "native/canonical binding mismatch");
+            const int bucket = hooks_.bucket(draft, sp.ctx[j]);
+            require(bucket >= 0, "native bucket outside the captured ones");
             require(!draft || have_main_[q], "draft before session target step");
-            l.bases.push_back(base); l.buckets.push_back(bucket); l.source_rows.push_back(source_[q]);
+            l.buckets.push_back(bucket); l.source_rows.push_back(source_[q]);
             // per-session event; hand-built Steps may predate the field (default ROUND)
             l.requests.push_back(s.request); l.req_slots.push_back(q);
             l.events.push_back(j < sp.ev.size() ? sp.ev[j] : int(sp.event));
@@ -154,7 +152,7 @@ void native_inputs(const Launch& l, StepIn& si, S2In& h) {
     for (int j = 0; j < h.ns; ++j) si.srow[l.step.row0[j] + l.step.rows[j] - 1].nodraft = 1;   // the next row is another session's
     for (int j = 0; j < h.ns; ++j) {
         h.sess[j] = l.step.sess[j]; h.row0[j] = l.step.row0[j]; h.rows[j] = l.step.rows[j];
-        h.ctx[j] = l.step.ctx[j]; h.base[j] = l.bases[j]; h.src0[j] = l.source_rows[j];
+        h.ctx[j] = l.step.ctx[j]; h.src0[j] = l.source_rows[j];
     }
 }
 } // namespace g6s2

@@ -488,7 +488,7 @@ static void run_rep(const Case& c, uint64_t seed)
     std::vector<int> pos;
     for (int j = 0; j < ns; ++j)
     {
-        h.sess[j] = slots[j]; h.row0[j] = (int)pos.size(); h.rows[j] = c.s[j].first; h.ctx[j] = c.s[j].second; h.base[j] = base[slots[j]];
+        h.sess[j] = slots[j]; h.row0[j] = (int)pos.size(); h.rows[j] = c.s[j].first; h.ctx[j] = c.s[j].second;
         for (int i = 0; i < c.s[j].first; ++i) pos.push_back(c.s[j].second - c.s[j].first + i);
     }
     const Inputs in = make_inputs(A, rng, heads, pos);

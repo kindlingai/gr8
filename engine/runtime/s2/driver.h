@@ -102,6 +102,7 @@ public:
     void dsel(const s2::DSel& d) { batch_.dsel(d); }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
+    void pool_digest(uint64_t d) { scheduler_.pool_digest(d); }
     Changes apply(const Commit& c, const Payload* p = nullptr) {
         if (c.admit) {
             require(p && p->prompt.size() == c.admit->req.prompt_tokens && p->chunk > 0, "admit payload mismatch");

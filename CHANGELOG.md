@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-11: S2 sessions hold page lists
+
+- A session's KV is a list of pool pages, the lowest free ones first. A request is admitted whenever enough pages are
+  free anywhere in the pool: fragmentation never stalls admission. `status.s2` drops `fragmentation_stalls`, and with it
+  the `g6:s2_fragmentation_stalls_total` metric. `largest_free_run` counts the pages one request can take.
+- A prefix-reuse hit keeps the retained run's first pages, as many as its cached rows fill, and takes the rest from the
+  free pages. A miss evicts whole retained runs, the least recently retired first.
+- Every rank runs the same allocator. A grant carries its list's hash, and each event's state hash covers every rank's
+  pool. The control frames are version `G6S2E2`, so every rank needs this build.
+- m4sim: `G6_S2_PAGES=seed[,pages]` gives every `--s2` session a shuffled, non-contiguous page list.
+
 ## 2026-10-11: requests up to 65,536 tokens share decode steps at TP=4 and TP=3
 
 - A request shares the pool only while its prompt + `max_tokens` fits in R, the KV every rank holds in full. R was

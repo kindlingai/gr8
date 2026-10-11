@@ -26,7 +26,6 @@ struct S2In
 {
     int ns, cls;                      // cls: the step's k1 row class (1 / 3 / 5)
     int sess[S2N], row0[S2N], rows[S2N], ctx[S2N];
-    int base[S2N];                    // first page of the session's run (host bookkeeping: the kernels read the slot's table)
     int src0[S2N];                    // draft model, first form: the j-th session's first row in the main model's x
 };
 

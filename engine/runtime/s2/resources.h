@@ -117,13 +117,13 @@ public:
         require(generation_[g.key.slot] != UINT32_MAX && g.key.generation == generation_[g.key.slot] + 1, "resource generation mismatch");
         require(!have_request_ || g.req.id > last_request_, "resource request ordinals must increase");
         require(g.run.table_version && g.run.pages == reserve_pages(config_, g.req) &&
-                uint64_t(g.run.base_page) + g.run.pages <= config_.pool_rows / PAGE, "invalid canonical resource run");
+                uint64_t(g.run.first_page) + g.run.pages <= config_.pool_rows / PAGE, "invalid canonical resource run");
         for (const auto& e : entries_) if (e) {
             const auto& run = e->grant.run;
-            require(uint64_t(g.run.base_page) + g.run.pages <= run.base_page ||
-                    uint64_t(run.base_page) + run.pages <= g.run.base_page, "resource runs overlap");
+            require(uint64_t(g.run.first_page) + g.run.pages <= run.first_page ||
+                    uint64_t(run.first_page) + run.pages <= g.run.first_page, "resource runs overlap");
         }
-        require(resident() || g.run.identity(), "empty resource pool must start at zero");
+        require(resident() || g.run.first_page == 0, "empty resource pool must start at zero");
         require(probe(g.req) == Fit::Ready, "resource admission without a fitting quote");
         const auto& q = *quotes_.lookup(g.req);
         // Check/allocate before mutation. Predicted time overflow must not leave a
@@ -142,12 +142,12 @@ public:
         healthy(); auto& e = entry(k);
         require(rank < capacity_.size() && unsigned(storage) < 3, "invalid resource observation");
         const auto& run = e.grant.run;
-        const bool range = first_page >= run.base_page && first_page - run.base_page <= run.pages &&
-                           pages <= run.pages - (first_page - run.base_page);
+        const bool range = first_page >= run.first_page && first_page - run.first_page <= run.pages &&
+                           pages <= run.pages - (first_page - run.first_page);
         if (!range || auxiliary_bytes > e.quote.auxiliary_bytes[rank])
             kill({k, rank, storage, first_page, pages, auxiliary_bytes, run, e.quote.auxiliary_bytes[rank]});
         auto& u = e.usage[rank]; const unsigned s = unsigned(storage);
-        if (pages) u.extent_pages[s] = std::max(u.extent_pages[s], first_page - run.base_page + pages);
+        if (pages) u.extent_pages[s] = std::max(u.extent_pages[s], first_page - run.first_page + pages);
         u.auxiliary_peak = std::max(u.auxiliary_peak, auxiliary_bytes); u.observed[s] = true;
     }
     void observe_shared(unsigned rank, uint64_t bytes) {

@@ -10,9 +10,9 @@
 
 namespace g6s2 {
 struct PoolHooks {
-    std::function<uint32_t()> free_pages, largest_run;
-    std::function<Run(uint64_t rows)> reserve; // head only, after ALL event ACKs
-    std::function<void(const Run&, uint64_t rows)> claim; // workers: exact head grant
+    std::function<uint32_t()> free_pages, room;
+    // head after ALL event ACKs, workers at the grant (the same call on the same pool state must give the same Run)
+    std::function<Run(uint64_t rows)> reserve;
     std::function<void(const Run&)> release;
     // optional (S2 below R, pool.h): false = the FIFO head may not take a run yet even though one fits (a past-R
     // request waits for an empty pool); counted as an admission stall
@@ -22,6 +22,8 @@ struct PoolHooks {
     std::function<void(const Run&, const g6rt::PrefixReuse&)> retain;
     std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, int limit)> match;
     std::function<Run(const PoolHit&, uint64_t rows)> take;
+    // optional: the pool's state, compared across ranks at every event (Scheduler::pool_digest)
+    std::function<uint64_t()> digest;
 };
 struct NativeHooks {
     PoolHooks pool;
@@ -75,14 +77,13 @@ class Service {
         native_.pool.retain(s.run, st);
     }
     void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
-        const auto free = native_.pool.free_pages(), largest = native_.pool.largest_run();
-        require(largest <= free && free <= c_.scheduler.pool_rows / PAGE, "invalid pool status");
+        const auto free = native_.pool.free_pages(), room = native_.pool.room();
+        require(room <= free && free <= c_.scheduler.pool_rows / PAGE, "invalid pool status");
         std::ostringstream o;
         o << "{\"epoch\":" << c_.scheduler.epoch << ",\"resident\":" << progress_.resident.load()
           << ",\"queued\":" << queue_.size() << ",\"retiring\":" << progress_.retiring.load()
           << ",\"reserved_pages\":" << c_.scheduler.pool_rows / PAGE - free << ",\"free_pages\":" << free
-          << ",\"largest_free_run\":" << largest << ",\"admission_stalls\":" << queue_.stalls
-          << ",\"fragmentation_stalls\":" << queue_.fragmentation_stalls << "}\n";
+          << ",\"largest_free_run\":" << room << ",\"admission_stalls\":" << queue_.stalls << "}\n";
         atomic_file(c_.directory + "/status.s2", o.str());
     }
     void event(const Command& command) { // CONTROL thread: never read Driver until ALL ACKs
@@ -100,7 +101,7 @@ class Service {
             if (command.admit) {
                 const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
                 unsigned live = s.resident();
-                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.free_pages(), native_.pool.largest_run());
+                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
                 const auto rows = reserve_rows(c_.scheduler, *request);
                 const bool ok = fit->why == Stall::None && (!native_.pool.admissible || native_.pool.admissible(rows));
@@ -111,8 +112,8 @@ class Service {
                     if (reuse() && pr != prompts_.end()) {
                         const PoolHit h = native_.pool.match(pr->second, rows, int(request->prompt_tokens) - 1);
                         if (h.skip > 0) { run = native_.pool.take(h, rows); skip = uint32_t(h.skip); }
-                        fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u base %u\n", (unsigned long long)request->id,
-                                h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.base_page : 0u);
+                        fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
+                                h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
                     if (!skip) run = native_.pool.reserve(rows);
                     cm.admit = Grant{s.next_key(), *request, run, skip};
@@ -185,6 +186,7 @@ class Service {
                     require(payload_hash(bytes) == n.payload_hash, "request bytes do not match the ADMIT notice");
                     staged_ = parse_request(bytes);
                 }
+                if (native_.pool.digest) driver_->pool_digest(native_.pool.digest());
                 return driver_->state().digest(); // once per event, NEVER per round
             });
             if (cm) {
@@ -212,19 +214,21 @@ public:
         : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk),
           dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
         c_.validate();
-        require(bool(native_.pool.free_pages) && bool(native_.pool.largest_run) && bool(native_.pool.reserve) &&
-                bool(native_.pool.claim) && bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
+        require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) &&
+                bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
         DriverHooks h;
         h.bind = [&](const Grant& g) {
             require(staged_.has_value(), "binding without verified payload");
             require(!g.reuse || reuse(), "reused rows without prefix reuse");
-            if (c_.rank) {
+            if (c_.rank) {   // the head's call, on the same pool state
                 const auto rows = reserve_rows(c_.scheduler,g.req);
-                if (g.reuse) {   // the head's decision, from the same retained runs on this rank
+                Run mine;
+                if (g.reuse) {
                     const PoolHit h = native_.pool.match(staged_->prompt, rows, int(g.req.prompt_tokens) - 1);
-                    require(h.skip == int(g.reuse) && h.run.base_page == g.run.base_page && h.run.pages == g.run.pages, "worker prefix reuse differs from the head");
-                }
-                native_.pool.claim(g.run, rows);
+                    require(h.skip == int(g.reuse), "worker prefix reuse differs from the head");
+                    mine = native_.pool.take(h, rows);
+                } else mine = native_.pool.reserve(rows);
+                require(mine == g.run, "worker page list differs from the head's grant");
             }
             dispatch_.begin(g.key.slot, int(g.reuse));
             native_.bind(g); sessions_.bind(g,*staged_);

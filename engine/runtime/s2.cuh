@@ -8,8 +8,8 @@
 // rows of the step (batched, below; G6_S2_ATTN_PERSESSION=1: once per session over the session's rows of q_b / kv_a / index
 // inputs, then a device copy of its output rows) into the concatenated attention rows (cat) that o_proj's fragment table reads.
 // KV: per layer the pool is the layer's OWN binding (y.ab, created by build at s2_pool_slots x the per-session
-// reservation, the --cap pages, identity block table). Session slot q owns a list of pool pages (S2Model::run[q]). The
-// allocator still grants contiguous runs base + i. Slot q's view = the pool binding's args with the slot's block table
+// reservation, the --cap pages, identity block table). Session slot q owns a list of pool pages (S2Model::run[q], the
+// allocator's list: s2/pool.h). Slot q's view = the pool binding's args with the slot's block table
 // (one per slot, shared by every layer's view, run_pages entries, -1 past the list), table_size = run_pages (logical
 // bound), page_count = the pool's pages (fixed physical bound of the args), and its own index list / output / error
 // words. The step cell bounds the live context: table_size = pages(ctx), page_count = the pool's pages (k_s2_cells;
@@ -60,7 +60,9 @@ struct S2Model
     std::vector<int> run[S2N];        // per slot, its pages in table order (empty = unbound: table all -1); s2_set_pages
     int base[S2N] = {};               // per slot, run[q][0]
     int pages[S2N] = {};              // per slot, run[q].size()
+    bool exclusive[S2N] = {};         // per slot: a run past R (s2_set_exclusive), solo on the tables as built
     int* table[S2N] = {};             // [nslots] device: the slot's block table, run_pages entries, shared by every layer's view
+    int* zero_list = nullptr;         // [pool_pages] device: the pages s2_reset_pages clears
     G6AttnStepCell* cells = nullptr;  // [S2N][nl] device
     bool batch = true;                // one attention call per layer for the whole step (false: per session)
     G6AttnStepCell* bcells = nullptr; // [nl] device: the batched cells, rows = rowcells + l * MX
@@ -122,6 +124,13 @@ inline void s2_set_pages(Model& m, int q, const std::vector<int>& list)
     s.run[q] = list;
     s.base[q] = list[0];
     s.pages[q] = (int)list.size();
+    s.exclusive[q] = false;
+}
+// slot q holds a run past R: S=1 only, on the layers' tables as built (s2_solo_built). Its view table is 0, 1, ..
+inline void s2_set_exclusive(Model& m, int q)
+{
+    s2_set_pages(m, q, s2_run_list(0, m.s2->run_pages));
+    m.s2->exclusive[q] = true;
 }
 
 // once per model, after build, before any S2 step: nslots session slots (views on the pool). The layers' own bindings
@@ -174,7 +183,8 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         s->run_pages = m.s2_run_pages;
         s->pool_pages = m.layers[0].ab.args.page_count;
     }
-    size_t bytes = 0, vbytes = 0;
+    size_t bytes = 0, vbytes = (size_t)s->pool_pages * 4;
+    s->zero_list = dmalloc<int>(s->pool_pages);
     for (int q = 0; q < nslots; ++q)
     {
         s->table[q] = dmalloc<int>(s->run_pages);
@@ -187,7 +197,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         if ((m.s2_below ? y.ab.args.page_count < s->pool_pages : y.ab.args.page_count != s->pool_pages) || s->pool_pages < s->run_pages)
             die("s2: pool bindings differ or are smaller than one run");
         s->pool.push_back(&y.ab);
-        if (m.s2_below)             // the layer's table as built (CP map / identity): s2_solo_pages of 0, 1, .. restores it
+        if (m.s2_below)             // the layer's table as built (CP map / identity): s2_solo_built restores it
         {
             s->tab0.emplace_back(y.ab.args.table_size);
             G6RT_CK(cudaMemcpy(s->tab0.back().data(), y.ab.args.block_table, s->tab0.back().size() * 4, cudaMemcpyDeviceToHost));
@@ -284,24 +294,28 @@ inline void s2_reset(Model& m, cudaStream_t st)
     }
 }
 
+// grid (pages of the list), block 256: page list[blockIdx.x] of a latent cache (656 B per row) and an index cache (132 B
+// per row, or none) := 0
+__global__ void __launch_bounds__(256) k_zero_pages(const int* list, uint4* mla, uint4* index)
+{
+    const size_t p = (size_t)list[blockIdx.x];
+    for (size_t k = threadIdx.x; k < 64 * 656 / 16; k += blockDim.x) mla[p * (64 * 656 / 16) + k] = make_uint4(0, 0, 0, 0);
+    if (index) for (size_t k = threadIdx.x; k < 64 * 132 / 16; k += blockDim.x) index[p * (64 * 132 / 16) + k] = make_uint4(0, 0, 0, 0);
+}
 // a new session's pages on the layers' own bindings: today's reset() limited to those pages (other sessions' pages stay),
 // plus the bindings' per-step words. The whole pool = today's reset(). Host, at an admission fence, on every rank, main
-// AND draft model, before the session's prefill. One memset per span of consecutive pages.
+// AND draft model, before the session's prefill.
 inline void s2_reset_pages(Model& m, const std::vector<int>& list, cudaStream_t st)
 {
     const S2Model& s = *m.s2;
     s2_check_pages(s, list, s.pool_pages, "s2_reset_pages");
     if ((int)list.size() == s.pool_pages) { reset(m, st); return; }
+    G6RT_CK(g6h2d::copy(s.zero_list, list.data(), list.size() * 4, st));
     for (G6AttnBinding* p : s.pool)
     {
         const G6Attn& a = p->args;
-        for (size_t i = 0, j; i < list.size(); i = j)
-        {
-            for (j = i + 1; j < list.size() && list[j] == list[j - 1] + 1; ++j) {}
-            const size_t p0 = (size_t)list[i], n = j - i;
-            G6RT_CK(cudaMemsetAsync((char*)a.mla_cache + p0 * 64 * 656, 0, n * 64 * 656, st));
-            if (a.index_cache) G6RT_CK(cudaMemsetAsync((char*)a.index_cache + p0 * 64 * 132, 0, n * 64 * 132, st));
-        }
+        k_zero_pages<<<(unsigned)list.size(), 256, 0, st>>>(s.zero_list, static_cast<uint4*>(a.mla_cache), static_cast<uint4*>(a.index_cache));
+        G6RT_CK(cudaGetLastError());
         G6RT_CK(cudaMemsetAsync(a.indices, 0xff, (size_t)p->max_rows * 2048 * 4, st));
         G6RT_CK(cudaMemsetAsync(a.output, 0, (size_t)p->max_rows * a.heads * 256 * 2, st));
         G6RT_CK(cudaMemsetAsync(a.error, 0, 4, st));
@@ -317,23 +331,24 @@ inline void s2_set_base(Model& m, int q, int base_page)
 }
 // S=1 on today's path with the session's pages (fresh, or the 2 -> 1 survivor's): the layers' own tables = the list, -1
 // over the rest. Same rules as s2_set_pages. The driver then sets StepIn::page_bound = pool_pages on every step of it.
-// S2 below R: a list 0, 1, .. keeps the table as built (the CP map, identity below R), so an exclusive run reads past R.
 inline void s2_solo_pages(Model& m, const std::vector<int>& list)
 {
     S2Model& s = *m.s2;
     s2_check_pages(s, list, s.run_pages, "s2_solo_pages");
-    bool ident = true;
-    for (size_t i = 0; i < list.size(); ++i) ident = ident && list[i] == (int)i;
     for (size_t l = 0; l < s.pool.size(); ++l)
     {
-        std::vector<int> t = m.s2_below ? s.tab0[l] : std::vector<int>(s.pool_pages);   // all table_size entries: the CP map is longer
-        if (!m.s2_below || !ident)
-        {
-            std::fill(t.begin(), t.end(), -1);
-            std::copy(list.begin(), list.end(), t.begin());
-        }
+        std::vector<int> t(m.s2_below ? s.tab0[l].size() : s.pool_pages, -1);   // the CP map has table_size entries
+        std::copy(list.begin(), list.end(), t.begin());
         G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), t.data(), t.size() * 4));
     }
+}
+// S=1 for a run past R (S2 below R only): the layers' tables as built, with the CP map
+inline void s2_solo_built(Model& m)
+{
+    const S2Model& s = *m.s2;
+    if (!m.s2_below) die("s2_solo_built: only S2 below R has runs past R");
+    for (size_t l = 0; l < s.pool.size(); ++l)
+        G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), s.tab0[l].data(), s.tab0[l].size() * 4));
 }
 
 // pages [B, B + pages) -> [0, pages) of a page-major cache (page_bytes per page), overlap-safe: chunks of at most B pages
@@ -355,6 +370,7 @@ inline void s2_relocate(Model& m, int q, int pages, cudaStream_t st)
 {
     S2Model& s = *m.s2;
     const int B = s.base[q];
+    if (s.run[q] != s2_run_list(B, s.pages[q])) die("s2_relocate: the run is not contiguous");
     if (B == 0) return;
     if (pages < 0 || pages > s.pages[q]) die("s2_relocate: pages out of the run");
     for (G6AttnBinding* p : s.pool)

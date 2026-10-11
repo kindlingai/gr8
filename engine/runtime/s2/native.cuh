@@ -104,8 +104,10 @@ class NativeDispatch {
         if (next >= 0) {
             // the survivor's own pages (set by bind)
             const std::vector<int>& run = c_.main.s2->run[next];
-            require(!run.empty() && run == c_.draft.d.s2->run[next], "main/draft survivor runs differ");
-            g6rt::s2_solo_pages(c_.main,run); g6rt::s2_solo_pages(c_.draft.d,run);
+            const bool ex = c_.main.s2->exclusive[next];
+            require(!run.empty() && run == c_.draft.d.s2->run[next] && ex == c_.draft.d.s2->exclusive[next], "main/draft survivor runs differ");
+            if (ex) { g6rt::s2_solo_built(c_.main); g6rt::s2_solo_built(c_.draft.d); }
+            else { g6rt::s2_solo_pages(c_.main,run); g6rt::s2_solo_pages(c_.draft.d,run); }
             g6rt::s2_hprev_to_solo(c_.draft,next,c_.stream);
         }
         c_.main.s2on = c_.draft.d.s2on = next < 0; fence();
@@ -244,7 +246,7 @@ public:
     //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
-    // contexts, bases and source rows are read from S2In at launch. Call before the first launch / before connecting.
+    // contexts and source rows are read from S2In at launch. Call before the first launch / before connecting.
     void capture_all(unsigned sessions, int mtp, int chunk) {
         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
@@ -270,7 +272,7 @@ public:
             g6rt::S2In h{};
             h.ns = chain ? M : 1; h.cls = cls;
             for (int j = 0; j < h.ns; ++j) {
-                h.sess[j] = j; h.row0[j] = chain ? j : 0; h.rows[j] = chain ? 1 : M; h.ctx[j] = model.bk[k]; h.base[j] = 0; h.src0[j] = 0;
+                h.sess[j] = j; h.row0[j] = chain ? j : 0; h.rows[j] = chain ? 1 : M; h.ctx[j] = model.bk[k]; h.src0[j] = 0;
             }
             model.s2->h = h; model.s2->bucket = k;
             for (int j = 0; j < g6rt::S2N; ++j) model.s2->bk[j] = k;
@@ -301,7 +303,6 @@ public:
     }
     DispatchHooks hooks() {
         return {
-            [&](bool draft,int slot){return (draft?c_.draft.d:c_.main).s2->base[slot];},
             [&](bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);},
             [&](int old,int next){mode(old,next);},
             [&](const Launch& l){return launch(l);},

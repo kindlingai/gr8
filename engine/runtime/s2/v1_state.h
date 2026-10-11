@@ -88,9 +88,9 @@ public:
         for (int id:s.history) require(id>=0, "bad history token");
         require(s.main_end<=s.history.size() && s.draft_end<=s.history.size(), "poisoned valid ends");
         require(s.main_end>=s.history.size()-1, "unprepared target prefix before verify");
-        require(s.run.table_version && s.run.pages>=pages(s.prompt_size,s.max_output,s.k,pool_) && uint64_t(s.run.base_page)+s.run.pages<=pool_/PAGE, "bad full run reservation");
+        require(s.run.table_version && s.run.pages>=pages(s.prompt_size,s.max_output,s.k,pool_) && uint64_t(s.run.first_page)+s.run.pages<=pool_/PAGE, "bad full run reservation");
         for (const auto& x:live_) if (x)
-            require(uint64_t(s.run.base_page)+s.run.pages<=x->run.base_page || uint64_t(x->run.base_page)+x->run.pages<=s.run.base_page, "overlapping runs");
+            require(uint64_t(s.run.first_page)+s.run.pages<=x->run.first_page || uint64_t(x->run.first_page)+x->run.pages<=s.run.first_page, "overlapping runs");
         live_[q]=s; generations_[q]=s.key.generation; last_ordinal_=s.ordinal; have_ordinal_=true; ++revision_;
     }
     Run retire(Key key) {

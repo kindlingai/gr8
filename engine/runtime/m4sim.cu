@@ -275,7 +275,7 @@ int main(int argc, char** argv)
                        (cp_L.send_bytes() + cp_L.recv_bytes()) / 1e9);
 #endif
     // --s2 on a CP build (G6_CP on): S2 below R. Every session's run <= G6_S2_BELOW rows (default G6_CP_R,
-    // multiple of 64, <= G6_CP_R), on the CP binding as built; runs are granted by G6_S2_RUNS or the default layout
+    // multiple of 64, <= G6_CP_R), on the CP binding as built. G6_S2_RUNS, G6_S2_PAGES or the default layout grant the runs
     int s2_below = 0;
 #if defined(G6_CP) && G6_CP
     if (s2mode && cp_on)
@@ -498,6 +498,32 @@ int main(int argc, char** argv)
                 for (Model& m : R) s2_set_pages(m, (int)k / 2, s2_run_list(v[k], v[k + 1]));
                 for (Draft& D : DR) s2_set_pages(D.d, (int)k / 2, s2_run_list(v[k], v[k + 1]));
             }
+        }
+        // G6_S2_PAGES=seed[,pages]: slot q's run = `pages` (default run_pages) pages of a seeded shuffle of the pool, from
+        // position q x pages, on every model: scattered, non-contiguous lists. Output must equal the default layout's.
+        if (const char* e = getenv("G6_S2_PAGES"))
+        {
+            const std::vector<int> v = parse_ints(e);
+            int pool = R[0].s2->pool_pages, run = R[0].s2->run_pages;
+            for (const Draft& D : DR) { pool = std::min(pool, D.d.s2->pool_pages); run = std::min(run, D.d.s2->run_pages); }
+            const int n = v.size() > 1 ? v[1] : run;
+            if (v.empty() || v.size() > 2 || n < 1 || n > run || (int64_t)n * (int64_t)plans.size() > pool)
+                die("G6_S2_PAGES=seed[,pages]: slots x pages must fit the pool, pages <= the run size");
+            std::vector<int> perm = s2_run_list(0, pool);
+            uint64_t x = (uint64_t)v[0] * 0x9E3779B97F4A7C15ull + 1;
+            for (int i = pool - 1; i > 0; --i)        // Fisher-Yates on splitmix64, so every platform draws the same lists
+            {
+                uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
+                std::swap(perm[i], perm[z % (uint64_t)(i + 1)]);
+            }
+            for (int q = 0; q < (int)plans.size(); ++q)
+            {
+                const std::vector<int> list(perm.begin() + (size_t)q * n, perm.begin() + (size_t)(q + 1) * n);
+                for (Model& m : R) s2_set_pages(m, q, list);
+                for (Draft& D : DR) s2_set_pages(D.d, q, list);
+            }
+            fprintf(stderr, "# s2: G6_S2_PAGES seed %d: %d shuffled pages per slot of a pool of %d\n", v[0], n, pool);
         }
     }
 #endif
@@ -972,9 +998,8 @@ int main(int argc, char** argv)
             for (int j = 0; j < h.ns; ++j)
             {
                 const S2Model& s2m = *(draft ? DR[0].d : R[0]).s2;
-                h.base[j] = s2m.base[h.sess[j]];
                 h.src0[j] = mrow0[h.sess[j]];
-                if (h.ctx[j] > s2m.pages[h.sess[j]] * 64) die("s2: session context past its run (G6_S2_RUNS grant)");   // caller's grant check
+                if (h.ctx[j] > s2m.pages[h.sess[j]] * 64) die("s2: session context past its run (G6_S2_RUNS / G6_S2_PAGES grant)");   // caller's grant check
             }
             std::string key = sp.key();   // kind + M; until attention is layout-free the per-session layout stays in this driver's key
             for (int j = 0; j < h.ns; ++j) key += ":" + std::to_string(h.sess[j]) + "x" + std::to_string(h.rows[j]);
@@ -983,8 +1008,7 @@ int main(int argc, char** argv)
                 for (int j = 0; j < h.ns; ++j)
                 {
                     m.s2->bk[h.sess[j]] = bucket_of(m, h.ctx[j]);
-                    if (first) key += ":b" + std::to_string(m.s2->bk[h.sess[j]]) + "p" + std::to_string(h.base[j]) +
-                                      (draft && !chain ? "s" + std::to_string(h.src0[j]) : "");
+                    if (first) key += ":b" + std::to_string(m.s2->bk[h.sess[j]]) + (draft && !chain ? "s" + std::to_string(h.src0[j]) : "");
                 }
             };
             if (draft) for (Draft& D : DR) set(D.d, D.d.rank == 0);
