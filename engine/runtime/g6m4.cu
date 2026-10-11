@@ -823,6 +823,27 @@ int main(int argc, char** argv)
                 h.dsel.d.draft_round = 5.6 + 2.5;
                 h.dsel.m.draft_round = 2.5 + 3.0;
                 h.dsel.m.draft_each = 2.1;
+                // sweeps (measurement only; every rank must see the same values, as above): G6_SPEC_TABLE = verify ms for
+                // 1..8 rows, G6_SPEC_DRAFT = DFlash2 round, MTP round, MTP each (ms)
+                auto doubles = [](const char* e) {
+                    std::vector<double> v;
+                    for (char* p = (char*)e; *p;) { char* q; v.push_back(strtod(p, &q)); if (q == p) die(std::string("not a number list: ") + e); p = *q == ',' ? q + 1 : q; }
+                    return v;
+                };
+                if (const char* e = getenv("G6_SPEC_TABLE"))
+                {
+                    const std::vector<double> t = doubles(e);
+                    if (t.size() != SpecLen::KX + 1) die("G6_SPEC_TABLE: want 8 values, the verify ms for 1..8 rows");
+                    for (int r = 1; r <= SpecLen::KX + 1; ++r) h.dfl_spec.table[r] = h.dsel.d.table[r] = h.dsel.m.table[r] = t[r - 1];
+                    if (R == 0) fprintf(stderr, "# spec: verify table from G6_SPEC_TABLE: %s\n", e);
+                }
+                if (const char* e = getenv("G6_SPEC_DRAFT"))
+                {
+                    const std::vector<double> d = doubles(e);
+                    if (d.size() != 3) die("G6_SPEC_DRAFT: want DFlash2 round, MTP round, MTP each (ms)");
+                    h.dsel.d.draft_round = d[0]; h.dsel.m.draft_round = d[1]; h.dsel.m.draft_each = d[2];
+                    if (R == 0) fprintf(stderr, "# spec: drafting ms from G6_SPEC_DRAFT: %s\n", e);
+                }
                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
