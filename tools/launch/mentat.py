@@ -117,6 +117,17 @@ def kv_nodes(snap, group):
     return sorted(out, key=lambda x: ipaddress.ip_address(x[0]))
 
 
+def kv_target(nodes, rails):
+    """host:port of the KV node a box with these fabric addresses should use: the first node with an RDMA address on
+    one of the rails' /24 subnets, else the first node's LAN address (TCP)."""
+    nets = {a.rsplit('.', 1)[0] for a in rails if a}
+    for _, port, meta in nodes:
+        for a in filter(None, (meta.get('gr8.kv.rdma') or '').split(',')):
+            if a.rsplit('.', 1)[0] in nets:
+                return f'{a}:{port}'
+    return f'{nodes[0][0]}:{nodes[0][1]}' if nodes else None
+
+
 def format_offers(ranks):
     """None (any rank) -> 'any', else '2' or '1,3' ('' for none)."""
     return 'any' if ranks is None else ','.join(map(str, ranks))

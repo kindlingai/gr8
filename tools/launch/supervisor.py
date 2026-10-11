@@ -603,10 +603,27 @@ class Supervisor:
         self.helpers[name] = p
         return p
 
+    def kv_tier(self):
+        """KV_TIER for this box's engine: each remote:auto becomes the KV node mentat announces, by this box's rails."""
+        tiers = opt.kv_tiers(self.o)
+        if not any(t['host'] == 'auto' for t in tiers):
+            return None
+        g = self.o.get('GROUP')
+        try:
+            nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
+        except (OSError, RuntimeError, ValueError) as e:
+            raise Stop(1, f'--kv-tier remote:auto: mentat: {e}')
+        target = mentat.kv_target(nodes, self.rails)
+        if not target:
+            raise Stop(1, f'--kv-tier remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
+        log(f'KV tier: the KV node at {target}')
+        return ';'.join(t['text'].replace('remote:auto', f'remote:{target}', 1) if t['host'] == 'auto' else t['text']
+                        for t in tiers)
+
     def boot(self):
         o, hs, r = self.o, self.hs, self.rank
         plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.rank_dir(r), aux_dir=self.ms.rank_dir(r), home=self.home,
-                               epoch=hs['epoch'], set_id=self.model_id)
+                               epoch=hs['epoch'], set_id=self.model_id, kv_tier=self.kv_tier())
         work = os.path.join(self.home, 's2')
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)

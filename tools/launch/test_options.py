@@ -284,5 +284,50 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotIn('/a/qo.pack', p['args'])
 
 
+class KvTierTests(unittest.TestCase):
+    def plan(self, *argv, kv_tier=None, env=None):
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        opt.validate(o)
+        return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_tier=kv_tier)
+
+    def tiers(self, p):
+        return [p['args'][i + 1] for i, a in enumerate(p['args']) if a == '--kv-tier']
+
+    def test_off_by_default(self):
+        o, p = self.plan()
+        self.assertEqual(opt.kv_tiers(o), [])
+        self.assertNotIn('--kv-tier', p['args'])
+        self.assertNotIn('--kv-shared-after', p['args'])
+        self.assertNotIn('--kv-tier', self.plan('--kv-tier', 'off')[1]['args'])
+
+    def test_tiers_in_flag_order(self):
+        a, b = 'ssd:/nvme/gr8kv,size=200G,keep=shared', 'remote:192.0.2.5:7350,size=8G,keep=evicted'
+        o, p = self.plan('--kv-tier', a, '--kv-tier', b, '--kv-shared-after', '5')
+        self.assertEqual(self.tiers(p), [a, b])
+        self.assertEqual(p['args'][p['args'].index('--kv-shared-after') + 1], '5')
+        t = opt.kv_tiers(o)
+        self.assertEqual([(x['kind'], x['path'], x['host'], x['port'], x['size'], x['keep']) for x in t],
+                         [('ssd', '/nvme/gr8kv', None, None, '200G', 'shared'),
+                          ('remote', None, '192.0.2.5', '7350', '8G', 'evicted')])
+        # the same from the environment, tiers separated by ;
+        self.assertEqual(self.tiers(self.plan(env={'KV_TIER': f'{a};{b}'})[1]), [a, b])
+
+    def test_remote_auto_is_resolved_per_box(self):
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-tier', 'remote:auto,size=8G'], {})
+        opt.validate(o)
+        self.assertEqual(opt.kv_tiers(o)[0]['host'], 'auto')
+        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_tier='remote:192.0.2.5:7350,size=8G')
+        self.assertEqual(self.tiers(p), ['remote:192.0.2.5:7350,size=8G'])
+        self.assertIn('--kv-tier remote:auto,size=8G ', opt.canonical(o, opt.engine_plan(o), None)[1])
+
+    def test_refusals(self):
+        v = ValidateTests()
+        for argv, want in ((['--kv-tier', 'nvme:/x,size=8G'], 'the store is'), (['--kv-tier', 'ssd:/x'], 'size=N'),
+                           (['--kv-tier', 'ssd:/x,size=8'], 'want size='), (['--kv-tier', 'ssd:/x,size=8G,keep=most'], 'keep='),
+                           (['--kv-tier', 'remote:auto,size=8G'], 'name it'), (['--kv-tier', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
+                           (['--kv-tier', 'ssd:/x,size=8G', '--kv-shared-after', '0'], 'from 1')):
+            v.check(['--peers', PEERS, *argv], want)
+
+
 if __name__ == '__main__':
     unittest.main()

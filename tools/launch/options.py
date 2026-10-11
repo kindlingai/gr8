@@ -63,6 +63,10 @@ KEYS = {
     'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
+    'KV_TIER': ('cluster', None, 'block stores below the KV pool, tried in order: STORE,size=N(G|T)[,keep=evicted|shared|all] '
+                                 'each, separated by ; (or --kv-tier given again). STORE: ssd:PATH, remote:HOST:PORT or '
+                                 'remote:auto (a KV node from the mentat group). Sizes per rank'),
+    'KV_SHARED_AFTER': ('cluster', None, 'conversations a prefix must start before a keep=shared tier stores it (3)'),
     'PF_OWN': ('cluster', None, 'prefill attention ownership'),
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),
@@ -186,6 +190,8 @@ def parse(argv, environ=None):
                 if i >= len(argv):
                     raise OptionError(f'{name} needs a value')
                 val = argv[i]
+            if key == 'KV_TIER' and cmd.get(key):   # one tier per --kv-tier
+                val = cmd[key] + ';' + val
             cmd[key] = val
         else:
             args.append(a)
@@ -300,6 +306,47 @@ def validate(o):
         raise OptionError('IPS and IPS2 go together')
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
+    tiers = kv_tiers(o)
+    if tiers:
+        if o.get('REUSE') == '0':
+            raise OptionError('--kv-tier keeps the runs prefix reuse retains: it needs REUSE (on by default)')
+        if any(t['host'] == 'auto' for t in tiers) and mode(o) == 'peers':
+            raise OptionError('--kv-tier remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
+    sa = o.get('KV_SHARED_AFTER')
+    if sa is not None and not (str(sa).isdigit() and int(sa) >= 1):
+        raise OptionError(f'--kv-shared-after {sa}: want a whole number from 1')
+
+
+def kv_tiers(o):
+    """KV_TIER parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size', 'keep'}]
+    ([] when unset or off). Raises OptionError naming the bad tier."""
+    v = o.get('KV_TIER')
+    if v in (None, 'off'):
+        return []
+    out = []
+    for text in [t.strip() for t in v.split(';') if t.strip()]:
+        store, *kvs = text.split(',')
+        m = re.fullmatch(r'ssd:(.+)', store) or re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', store)
+        if not m or (store.startswith('remote:auto') and m.group(2)):
+            raise OptionError(f'--kv-tier {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
+        t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
+             'host': None, 'port': None, 'size': None, 'keep': 'evicted'}
+        if t['kind'] == 'ssd':
+            t['path'] = m.group(1)
+        else:
+            t['host'], t['port'] = m.group(1), m.group(2)
+        for kv in kvs:
+            k, _, x = kv.partition('=')
+            if k == 'size' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
+                t['size'] = x
+            elif k == 'keep' and x in ('evicted', 'shared', 'all'):
+                t['keep'] = x
+            else:
+                raise OptionError(f'--kv-tier {text}: {kv}: want size=N(M|G|T) or keep=evicted|shared|all')
+        if not t['size']:
+            raise OptionError(f'--kv-tier {text}: size=N(G|T) is needed (per rank)')
+        out.append(t)
+    return out
 
 
 def split_list(v):
@@ -324,13 +371,17 @@ def resolve_peers(o):
 
 
 # ---- the engine plan: scripts/engine_args.sh, so the ssh launchers and the supervisor start the same engine ---------
-def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id=''):
+def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
+                kv_tier=None):
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
-    The defaults give the canonical template, with every per-box value as a placeholder."""
+    The defaults give the canonical template, with every per-box value as a placeholder. kv_tier: this box's KV_TIER
+    with the KV node resolved (remote:GB names none)."""
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'TP': o.get('TP'), 'SET_ID': set_id}
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
             env[k] = o.get(k)
+    if kv_tier:
+        env['KV_TIER'] = kv_tier
     if rank == '@R':   # the template: v2 paths are per box
         for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE'):
             if env.get(k):

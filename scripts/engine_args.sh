@@ -67,6 +67,13 @@ engine_args() {
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
   [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
   [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+  # KV_TIER: one --kv-tier per tier (tiers separated by ;)
+  if [ -n "${KV_TIER:-}" ] && [ "$KV_TIER" != off ]; then
+    local t IFS=';'
+    for t in $KV_TIER; do [ -n "$t" ] && a="$a --kv-tier $t"; done
+    unset IFS
+    [ -n "${KV_SHARED_AFTER:-}" ] && a="$a --kv-shared-after $KV_SHARED_AFTER"
+  fi
   [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
   [ -n "${SPEC_ACCEPT:-}" ] && a="$a --spec-accept $SPEC_ACCEPT"
   a="$a $df $qo"
