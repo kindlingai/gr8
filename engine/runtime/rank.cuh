@@ -21,7 +21,6 @@
 // Call prepare(m, M, st) outside a capture before the first step with M rows.
 #pragma once
 #include <algorithm>
-#include "context_buckets.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +28,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "context_buckets.h"
 #include "draft_shape.h"
 #include "serve.h"
 #include "spec_len.h"
