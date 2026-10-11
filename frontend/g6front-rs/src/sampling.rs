@@ -114,7 +114,7 @@ pub fn build(
     let f = Fields { body, raw };
     if let Some(n) = body.get("n").filter(|v| pyjson::truthy(Some(v))) {
         if !pyjson::eq_int(n, 1) {
-            return Err(ApiError::bad("only n=1 is supported by the g6 front end", Some("n")));
+            return Err(ApiError::bad("only n=1 is supported by the gr8 front end", Some("n")));
         }
     }
     if let Some(b) = body.get("best_of").filter(|v| !v.is_null()) {
@@ -229,14 +229,14 @@ pub fn build(
     for k in ["frequency_penalty", "presence_penalty"] {
         if let Some(v) = body.get(k).filter(|v| !v.is_null()) {
             if !pyjson::eq_int(v, 0) {
-                return Err(ApiError::bad(format!("{k} is not supported by the g6 engine yet"), Some(k)));
+                return Err(ApiError::bad(format!("{k} is not supported by the gr8 engine yet"), Some(k)));
             }
         }
     }
     if let Some(v) = body.get("repetition_penalty").filter(|v| !v.is_null()) {
         if !pyjson::eq_int(v, 1) {
             return Err(ApiError::bad(
-                "repetition_penalty is not supported by the g6 engine yet",
+                "repetition_penalty is not supported by the gr8 engine yet",
                 Some("repetition_penalty"),
             ));
         }

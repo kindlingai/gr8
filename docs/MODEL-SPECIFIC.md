@@ -1,10 +1,10 @@
 # What is GLM 5.3-specific, and what is not
 
-g6 was written for one model, GLM 5.3 (full), on GB10 boxes: three, four or six ranks. Nothing here is a plug-in model
+gr8 was written for one model, GLM 5.3 (full), on GB10 boxes: three, four or six ranks. Nothing here is a plug-in model
 interface. This page is a map for porting: it lists every place the model is baked in, roughly in the order you would
 meet them. It also lists the parts that do not depend on the model.
 
-GLM 5.3 as g6 sees it: hidden 6144; 78 layers, of which 0-2 are dense MLP (intermediate 12288) and 3-77 are MoE with 256
+GLM 5.3 as gr8 sees it: hidden 6144; 78 layers: 0-2 are dense MLP (intermediate 12288) and 3-77 are MoE with 256
 routed experts, top-8, expert intermediate 2048, plus one shared expert (2048); one MTP layer (index 78); MLA attention
 with 64 heads, q_lora 2048, kv_lora 512, qk 192 + 64 rope, v 256; a sparse indexer (32 heads x 128, top-2048 keys) on
 the full-index layers; vocab 154,880.

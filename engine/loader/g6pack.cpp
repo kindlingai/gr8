@@ -1,4 +1,4 @@
-// g6 pack loader implementation (see g6pack.h). Host-only; no CUDA dependency.
+// gr8 pack loader implementation (see g6pack.h). Host-only; no CUDA dependency.
 #include "g6pack.h"
 
 #include <algorithm>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mock g6 engine speaking PROTOCOL.md, so the front end and the old rulers run with no model.
+"""Mock gr8 engine speaking PROTOCOL.md, so the front end and the old rulers run with no model.
 
 Deterministic: the output depends only on the prompt ids and request fields (never on temperature/seed).
 It decodes the prompt to pick a canned reply:

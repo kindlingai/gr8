@@ -42,7 +42,7 @@ every detailed result, and the flat `metrics` the gates compare.
 
 ## Prompt sets of another bench (cross-stack comparisons)
 
-`run --prompt-set FILE` also runs another bench's prompts, given as exact token ids, so g6 and another stack can be
+`run --prompt-set FILE` also runs another bench's prompts, given as exact token ids, so gr8 and another stack can be
 compared on the same text (the harness's own `workloads` use different prompts, and drafter acceptance depends on the
 text). The ids go to `/v1/completions` as they are: the other bench's chat template, system message and thinking
 setting are kept. One request per prompt, `--prompt-set-tokens` (default 512) at `--prompt-set-temp` (default 0).
@@ -65,7 +65,7 @@ the gate set; a baseline built from runs with it gates these metrics like any ot
   (never below 1e-6). Until then `check` reports `NO THRESHOLD` for `kl.mean` rather than passing or failing it.
   The margin is a default for people to confirm after they see the three-boot spread.
 - **Check:** needle passes must be 1; `kl.mean` at or below the threshold; every other gated metric no worse than the
-  baseline median by more than `max(--noise, the baseline's boot-to-boot spread)` (`--noise` defaults to 3%, g6's own
+  baseline median by more than `max(--noise, the baseline's boot-to-boot spread)` (`--noise` defaults to 3%, gr8's own
   single-boot decode noise). Shown, not gated: KL p95 and top-1, and the long-prompt decode tok/s (one request's decode
   varies with its text; the workloads gate decode).
 - **Result line:** `RESULT: PASS` only when the whole gate set (default sizes) is in the baseline and in the run, nothing
@@ -82,7 +82,7 @@ the gate set; a baseline built from runs with it gates these metrics like any ot
 ## Notes
 
 - The KL reference must be taken on the same topology, from gr8 `main` at a recorded commit (`--commit` is stored in
-  the file). g6's front end needs an engine that returns `prompt_logprobs`: `frontend/g6s2shim.py` passes them for
+  the file). gr8's front end needs an engine that returns `prompt_logprobs`: `frontend/g6s2shim.py` passes them for
   prompts up to `--max-plp-prompt` (default 1,024 tokens).
 - KL treatment of tokens missing from the new build's top 20: they take the new build's 20th logprob (an upper bound),
   so KL is a lower bound for those terms. The tail bucket is everything outside the reference's top 20.

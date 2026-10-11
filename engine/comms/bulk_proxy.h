@@ -1,4 +1,4 @@
-// g6 fabric bulk-mode proxy logic that does not touch verbs or CUDA, so a host test can drive it with a fake CQ and a
+// gr8 fabric bulk-mode proxy logic that does not touch verbs or CUDA, so a host test can drive it with a fake CQ and a
 // fake clock (tools/cp/proxytest.cpp). fabric.cpp adapts ibv_poll_cq / steady_clock to these templates.
 #pragma once
 #include <cstdint>

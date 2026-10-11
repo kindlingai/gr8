@@ -1,4 +1,4 @@
-//! g6's exlr8 dense decoder against the reference loader's output on synthetic matrices of every format
+//! gr8's exlr8 dense decoder against the reference loader's output on synthetic matrices of every format
 //! (tests/data/exlr8-fixture.safetensors, written by tests/make_exlr8_fixture.py). Bit equality in fp32.
 
 use g6load::exlr8::{self, Matrix, StFile, FP8_BLOCK, INT4, SIDE_IN, TRELLIS};

@@ -1,4 +1,4 @@
-// Independently written g6 paged sparse MLA + indexer. No inference-engine code.
+// Independently written gr8 paged sparse MLA + indexer. No inference-engine code.
 #include "attn.h"
 #include "replay.h"
 #include "../g6nr.h"

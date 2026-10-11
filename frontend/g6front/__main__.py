@@ -1,4 +1,4 @@
-"""g6 front end: OpenAI/vLLM-compatible HTTP server in front of the g6 engine (PROTOCOL.md).
+"""gr8 front end: OpenAI/vLLM-compatible HTTP server in front of the gr8 engine (PROTOCOL.md).
 
 python -m g6front --model-dir DIR [--engine-sock /run/g6/engine.sock] [--port 8100]
 """

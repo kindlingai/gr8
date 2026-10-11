@@ -1,4 +1,4 @@
-"""exlr8 v2 expert files -> g6 rank pack tensors. Format: exlr8quant SPEC.md sections 5.2, 6.1-6.5, 7.1, 8.
+"""exlr8 v2 expert files -> gr8 rank pack tensors. Format: exlr8quant SPEC.md sections 5.2, 6.1-6.5, 7.1, 8.
 
 v2 stores every routed expert of a layer at K2, K3 and K4 (one trellis file per width) and the shared expert at K3 and
 K4. A deployment picks a width per unit from a manifest: gate and up per (expert, 128-channel half), down per expert.
@@ -7,7 +7,7 @@ layer's index file, then only the halves the requested ranks own, checks each ha
 tensors convert.py writes for TR3 / exlr8 v1 layers:
 
   tr3.fc1    [blocks][2][384][8][TB]  gate then up of each owned half; TB = 32 * the width of that (half, matrix)
-  tr3.fc2    [blocks][384][8][TB]     down of each owned half, item128 order permuted to g6's [col16][k16]
+  tr3.fc2    [blocks][384][8][TB]     down of each owned half, item128 order permuted to gr8's [col16][k16]
   tr3.v2     [blk][3][128]            gate / up output-side (svh) and down input-side (suh) channels of the half
   tr3.v1     [blk][2][6144]           gate / up input-side vector of the encode each half came from (signs.in x su_block)
   tr3.v3     [blk][6144]              down output-side vector (signs.out x sv_block, the expert's down width)
@@ -90,7 +90,7 @@ def half_digest(trellis, chan, block):
 
 
 def down_to_g6(half, k):
-    """down half in item128 order [col16 / 8][k16][col16 % 8][tile] -> g6 fc2 order [col16][k16][tile]."""
+    """down half in item128 order [col16 / 8][k16][col16 % 8][tile] -> gr8 fc2 order [col16][k16][tile]."""
     tb = 32 * k
     return np.ascontiguousarray(half.reshape(48, 8, 8, tb).transpose(0, 2, 1, 3).reshape(KSH, 8, tb))
 
@@ -306,7 +306,7 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
     fc1_bytes = {r: sum(half_bytes(W[e][0][h]) + half_bytes(W[e][1][h]) for e in experts for h in own[r][e]) for r in writers}
     fc2_bytes = {r: sum(half_bytes(W[e][2]) * len(own[r][e]) for e in experts) for r in writers}
 
-    # pass 1: fc1 (gate and up halves, whose grouped order is g6's fc1 block order), v1, v2[0:2]
+    # pass 1: fc1 (gate and up halves, whose grouped order is gr8's fc1 block order), v1, v2[0:2]
     for r, w in writers.items():
         w.begin(f'{P}.tr3.fc1', 'u8', (fc1_bytes[r],),
                 layout='tr3_fc1 per expert per block [2][384][8][TB], TB = 32 * width of (block, matrix) (tr3.kmix)', **xf)

@@ -1,4 +1,4 @@
-//! The DFlash2 drafter (config.json + one BF16 model.safetensors) -> one g6 pack per rank: the same bytes and the same
+//! The DFlash2 drafter (config.json + one BF16 model.safetensors) -> one gr8 pack per rank: the same bytes and the same
 //! manifest tools/convert/dflash2.py writes, without numpy. tools/convert/dflash2.py documents the tensors, the split
 //! across ranks and the record layouts. tests/dflash2.rs checks both agree.
 

@@ -1,4 +1,4 @@
-// g6 glue kernels: embedding, all-reduce consume + residual + RMSNorm, router top-8 -> K1 plan,
+// gr8 glue kernels: embedding, all-reduce consume + residual + RMSNorm, router top-8 -> K1 plan,
 // vocab-split head (local argmax / LSE / Gumbel sample + merge), RoPE, fabric publish/wait helpers.
 // Conventions: partials BF16 in fabric slots, residual FP32, activations FP16.
 // Every rank runs these on identical bits with fixed reduction orders, so all decisions are bit-identical.

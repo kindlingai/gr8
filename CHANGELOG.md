@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-11: the engine is called gr8 in the docs
+
+- The README opens with "gr8: a super-fast local AI engine". Docs, comments, error messages and the API's `owned_by`
+  call the engine gr8. Binary names (`g6m4`, `g6load`, `g6front-rs`), `G6_*` settings, `--g6env-x`, the `g6:` metrics
+  and the protocol tags keep their names.
+- The Docker instructions pull the image first, and docker/README.md says how to update every box to a new image.
+
 ## 2026-10-11: CI builds everything on GitHub's runners
 
 - The engine job builds on GitHub's hosted arm64 runner, so `ghcr.io/kindlingai/gr8` is published from every push to

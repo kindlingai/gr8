@@ -1,4 +1,4 @@
-//! g6 S2 KV page allocator (the KV manager). Host only. One pool per rank. Every call is at an all-rank event fence
+//! gr8 S2 KV page allocator (the KV manager). Host only. One pool per rank. Every call is at an all-rank event fence
 //! (engine/runtime/s2/service.h), and every rank makes the same calls in the same order: the head reserves (or takes a
 //! match hit) at the event, and each worker repeats that call at its grant and requires the same Run, list hash
 //! included. Nothing here depends on time, floats or hash-map order, so the same calls give the same pages and digest.

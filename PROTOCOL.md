@@ -1,4 +1,4 @@
-# PROTOCOL — g6 front end <-> engine (v1)
+# PROTOCOL — gr8 front end <-> engine (v1)
 
 The front end (`frontend/`: `g6front-rs`, or the Python reference `g6front`) owns HTTP, tokenization, chat templates, detokenization, stop strings,
 reasoning/tool parsing and the OpenAI/vLLM response shapes. The engine (C++/CUDA, rank 0) sees **token ids only**.

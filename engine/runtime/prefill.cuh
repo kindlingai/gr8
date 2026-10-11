@@ -1,4 +1,4 @@
-// g6 rank prefill: one rank's prefill sub-batch (M rows of one sequence at consecutive positions, M up to
+// gr8 rank prefill: one rank's prefill sub-batch (M rows of one sequence at consecutive positions, M up to
 // Prefill::Mmax) over the model's layers, through the prefill binder (bind_prefill.cuh: MXFP8 dense, TR3 -> FP8
 // expert GEMMs, BF16 via cuBLAS) and the same attention bindings as the decode step (rank.cuh), so the KV and index
 // caches a prefill writes are the ones the decode steps read.

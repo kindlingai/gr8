@@ -20,14 +20,14 @@ async def prepare(st: State, body: dict):
     st.check_model(body)
     st.require_engine()
     if body.get('echo'):
-        raise ApiError('echo is not supported by the g6 front end', param='echo')
+        raise ApiError('echo is not supported by the gr8 front end', param='echo')
     try:
         tools = normalize_tools(body.get('tools'))
         tool_choice = body.get('tool_choice')
         if tool_choice is None:
             tool_choice = 'auto' if tools else 'none'
         if isinstance(tool_choice, dict) or tool_choice == 'required':
-            raise ApiError('named / required tool_choice is not supported by the g6 front end', param='tool_choice')
+            raise ApiError('named / required tool_choice is not supported by the gr8 front end', param='tool_choice')
         kw = build_template_kwargs(body.get('chat_template_kwargs'),
                                    add_generation_prompt=body.get('add_generation_prompt', True),
                                    continue_final_message=body.get('continue_final_message', False),

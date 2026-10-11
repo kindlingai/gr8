@@ -1,4 +1,4 @@
-"""g6 M1 NumPy reference: codecs, kernel record layouts, reference forwards.
+"""gr8 M1 NumPy reference: codecs, kernel record layouts, reference forwards.
 
 Codecs
   TR3   : EXL3 trellis (K bits/weight, 16x16 tiles, mcg 3INST codebook), Hadamard-128 rotations.

@@ -1,4 +1,4 @@
-// g6 device image: rank manifest (an opened g6::Pack) + pack stream (file or pipe) -> ONE cudaMalloc allocation that is
+// gr8 device image: rank manifest (an opened g6::Pack) + pack stream (file or pipe) -> ONE cudaMalloc block that is
 // a byte-for-byte image of the pack. Tensor i lives at base + entries[i].offset, the same offsets as the manifest.
 //
 // No host copy of the pack is kept: the stream is read in chunks into a small pinned staging ring (3 buffers,

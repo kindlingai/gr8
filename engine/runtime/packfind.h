@@ -1,4 +1,4 @@
-// g6 M4 tensor provider: pack image in host memory -> per-tensor device copies on first use, as the
+// gr8 M4 tensor provider: pack image in host memory -> per-tensor device copies on first use, as the
 // g6rt::Find that rank.cuh binds from. One DevStore may serve several packs (m4sim's six simulated ranks): tensors
 // with the same sha256 and size share one device copy, so replicated tensors are held once.
 // M5 replaces this by the builder's g6::DevImage (the pack streamed straight into one device allocation).

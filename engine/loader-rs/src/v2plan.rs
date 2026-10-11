@@ -379,7 +379,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
             row += 1;
         }
     }
-    // pass 2: fc2 (down halves, item128 -> g6 order), v2[2], v3
+    // pass 2: fc2 (down halves, item128 -> gr8 order), v2[2], v3
     let fc2_bytes: u64 = experts.iter().zip(&own).map(|(&e, hs)| hs.len() as u64 * hb(of(e).2)).sum();
     let fc2 = b.begin(format!("{p}.tr3.fc2"), "u8", vec![fc2_bytes as i64], fc2_bytes, Some(XF_EXLR8));
     let (mut off, mut row) = (0u64, 0usize);

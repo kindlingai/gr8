@@ -1,4 +1,4 @@
-// g6 binder: one rank's pack tensors of one layer -> ready kernel arguments + launch helpers.
+// gr8 binder: one rank's pack tensors of one layer -> ready kernel arguments + launch helpers.
 // Decode path, M <= 8 rows (M <= G6_MX under DEC_S2, g6mx.h). Everything a kernel reads per thread (control words, plan, scratch, fragment tables)
 // must be DEVICE memory; only the two partial outputs may point into a fabric send slot (see put_partial below).
 //

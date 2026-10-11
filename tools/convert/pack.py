@@ -1,4 +1,4 @@
-"""g6 pack writer: one sequential file per rank + manifest JSON (name, dtype, shape, offset, nbytes, sha256).
+"""gr8 pack writer: one sequential file per rank + manifest JSON (name, dtype, shape, offset, nbytes, sha256).
 
 Tensors start on 4096-byte boundaries (zero padding). Everything is deterministic: no timestamps, fixed order,
 sorted JSON keys. Every data byte is covered by its tensor's sha256; padding bytes must be zero.

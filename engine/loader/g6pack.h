@@ -1,4 +1,4 @@
-// g6 pack loader: rank manifest (JSON) + pack (sequential stream from a file or a pipe) -> one allocation.
+// gr8 pack loader: rank manifest (JSON) + pack (sequential stream from a file or a pipe) -> one allocation.
 //
 // The allocation is a byte-for-byte image of the pack, so the manifest offsets ARE the engine's offset table:
 // tensor i lives at base + entries[i].offset. Every tensor's sha256 (from the manifest) is checked while the

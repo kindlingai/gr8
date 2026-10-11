@@ -50,7 +50,7 @@ async def detokenize(request: web.Request) -> web.Response:
 
 async def models(request: web.Request) -> web.Response:
     st: State = request.app['state']
-    data = [{'id': name, 'object': 'model', 'created': st.started, 'owned_by': 'g6', 'root': st.args.model_dir,
+    data = [{'id': name, 'object': 'model', 'created': st.started, 'owned_by': 'gr8', 'root': st.args.model_dir,
              'parent': None, 'max_model_len': st.max_model_len, 'permission': []} for name in st.served]
     return web.json_response({'object': 'list', 'data': data}, dumps=dumps)
 

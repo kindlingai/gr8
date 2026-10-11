@@ -1,6 +1,6 @@
-# g6 front end
+# gr8 front end
 
-An OpenAI/vLLM-compatible HTTP server in front of the g6 engine. It talks to the engine's shim over a Unix socket using
+An OpenAI/vLLM-compatible HTTP server in front of the gr8 engine. It talks to the engine's shim over a Unix socket using
 the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
 streaming and `/metrics`. It comes in two implementations with the same flags and byte-identical responses
 (`tests/diff_fronts.py`): `g6front-rs/`, one static Rust binary, which `./gr8 glm53 up` runs; and `g6front/`, pure

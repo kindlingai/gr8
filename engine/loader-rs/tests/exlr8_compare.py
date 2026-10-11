@@ -1,4 +1,4 @@
-"""Exact comparison of g6's exlr8 dense decoder (src/exlr8.rs, through the exlr8dump binary) against the reference
+"""Exact comparison of gr8's exlr8 dense decoder (src/exlr8.rs, through the exlr8dump binary) against the reference
 loader `loader/exlr8.py` of kindlingai/exlr8, on the release's own files.
 
     python3 exlr8_compare.py --release DIR --ref EXLR8_REPO --dump target/release/exlr8dump \

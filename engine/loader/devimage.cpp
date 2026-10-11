@@ -1,4 +1,4 @@
-// g6 device image implementation (see devimage.h). Depends on g6pack + the CUDA runtime only.
+// gr8 device image implementation (see devimage.h). Depends on g6pack + the CUDA runtime only.
 #include "devimage.h"
 
 #include <algorithm>

@@ -103,7 +103,7 @@ class V2(unittest.TestCase):
         for k in (2, 3, 4):
             a = np.random.default_rng(k).integers(0, 256, v2.half_bytes(k), dtype=np.uint8)
             self.assertTrue(np.array_equal(v2.down_from_g6(v2.down_to_g6(a, k), k), a))
-            # item128 tile (c8, k16, c1) lands at g6 tile (c8 * 8 + c1, k16)
+            # item128 tile (c8, k16, c1) lands at gr8 tile (c8 * 8 + c1, k16)
             tb = 32 * k
             g = v2.down_to_g6(a, k)
             c8, k16, c1 = 5, 3, 6

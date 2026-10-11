@@ -1,8 +1,8 @@
-# GLM-5.3 (full) on DGX Spark (GB10)
+# gr8: a super-fast local AI engine
 
-Early release. If you run it, tell us what breaks: issues and PRs are welcome.
+Full GLM-5.3 on DGX Spark (GB10). Early release. If you run it, tell us what breaks: issues and PRs are welcome.
 
-g6 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
+gr8 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
 sparse indexer, one MTP layer) on three, four or six DGX Spark (GB10) boxes, tensor-parallel across all of them. It
 uses no vLLM, PyTorch or NCCL at serve time. Each box runs one `g6m4` process, the ranks talk over RoCE v2 through
 their own verbs fabric, and an OpenAI-compatible API runs on the first box.
@@ -66,7 +66,7 @@ RigMark. One test window on one cluster.
   the kernel's background compaction moves pages under the engine in bursts that delay every collective. As root,
   once (it holds across reboots; `vm.compaction_proactiveness=20` undoes it):
 
-      echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-g6-no-proactive-compaction.conf
+      echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-gr8-no-proactive-compaction.conf
       sysctl -w vm.compaction_proactiveness=0
 
 - To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev, Rust through
@@ -82,11 +82,11 @@ On every box:
     TP=4 BUNDLE_LIBS=1 ./gr8 glm53 build
     python3 -m venv venv && venv/bin/pip install -r frontend/requirements.txt    # the python the head runs the shim on
     ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
-        --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/g6/cache \
+        --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/gr8/cache \
         --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
 
-`--model-cache` must be a directory you can create or write (here, `sudo mkdir -p /opt/g6/cache && sudo chown $USER
-/opt/g6/cache` first). Then `./gr8 glm53 status` from any box, and on the head (the first address in `--peers`):
+`--model-cache` must be a directory you can create or write (here, `sudo mkdir -p /opt/gr8/cache && sudo chown $USER
+/opt/gr8/cache` first). Then `./gr8 glm53 status` from any box, and on the head (the first address in `--peers`):
 
     ./gr8 glm53 status        # every box, the front end, /health
     ./gr8 glm53 smoke         # questions with answers that can be checked (from another box: smoke http://10.0.0.1:8100)
@@ -108,11 +108,12 @@ Nothing to build: CI publishes the image, `ghcr.io/kindlingai/gr8`. On every box
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
     cp docker/.env.example docker/.env        # set MODEL, PEERS and (TP=4 only) DRAFTER: the same file on every box
+    docker compose -f docker/compose.yaml pull
     docker compose -f docker/compose.yaml run --rm gr8 prepare
     docker compose -f docker/compose.yaml up -d
 
 Then `docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 status` (or `smoke`, or `down` to stop every
-box). [docker/README.md](docker/README.md) has the settings and what the container gets.
+box). [docker/README.md](docker/README.md) has the settings, how to update, and what the container gets.
 
 ## Running it
 
@@ -216,7 +217,7 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 | `docs/` | engine settings, the prefill attention design, the model-specific parts |
 | [KNOBS.md](KNOBS.md), [CHANGELOG.md](CHANGELOG.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | every option; what changed and the measurements behind it; open bugs; the front end to engine protocol; how to build, test and land a change |
 
-g6 is written for GLM 5.3's shapes, not as a general engine. [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every
+gr8 is written for GLM 5.3's shapes, not as a general engine. [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every
 place the model is built in, and what would carry over to another model.
 
 ## Credits

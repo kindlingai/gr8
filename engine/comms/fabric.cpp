@@ -1,4 +1,4 @@
-// g6 fabric implementation (fabric.h).
+// gr8 fabric implementation (fabric.h).
 #include "fabric.h"
 #include "bulk_proxy.h"
 #include "progress_cpus.h"

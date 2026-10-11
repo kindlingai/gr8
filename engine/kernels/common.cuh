@@ -1,4 +1,4 @@
-// g6 M1 kernels: shared PTX helpers (GB10, sm_121a). Our own code.
+// gr8 M1 kernels: shared PTX helpers (GB10, sm_121a). Our own code.
 #pragma once
 #include <cstdint>
 #include <cstddef>

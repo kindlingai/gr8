@@ -339,7 +339,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     st.check_model(body)?;
     st.require_engine()?;
     if truthy(body.get("echo")) {
-        return Err(ApiError::bad("echo is not supported by the g6 front end", Some("echo")));
+        return Err(ApiError::bad("echo is not supported by the gr8 front end", Some("echo")));
     }
     let tools = normalize_tools(body.get("tools"))?;
     let tool_choice = match body.get("tool_choice") {
@@ -348,7 +348,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     };
     if tool_choice.is_object() || tool_choice.as_str() == Some("required") {
         return Err(ApiError::bad(
-            "named / required tool_choice is not supported by the g6 front end",
+            "named / required tool_choice is not supported by the gr8 front end",
             Some("tool_choice"),
         ));
     }
@@ -719,7 +719,7 @@ async fn prompt_ids(st: &'static State, body: &Map<String, Value>) -> Result<Vec
             Ok(ids)
         }
         Some(Value::Array(a)) if a.len() > 1 => Err(ApiError::bad(
-            "batched prompts are not supported by the g6 front end; send one prompt per request",
+            "batched prompts are not supported by the gr8 front end; send one prompt per request",
             Some("prompt"),
         )),
         _ => Err(ApiError::bad("`prompt` must be a string or a non-empty list of token ids", Some("prompt"))),
@@ -736,7 +736,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
         st.require_engine()?;
         for k in ["echo", "suffix"] {
             if truthy(body.get(k)) {
-                return Err(ApiError::bad(format!("`{k}` is not supported by the g6 front end"), Some(k)));
+                return Err(ApiError::bad(format!("`{k}` is not supported by the gr8 front end"), Some(k)));
             }
         }
         let prompt = prompt_ids(st, &body).await?;
@@ -1037,7 +1037,7 @@ fn models(st: &State) -> Response<HttpBody> {
             m.str("id", name);
             m.str("object", "model");
             m.int("created", st.started);
-            m.str("owned_by", "g6");
+            m.str("owned_by", "gr8");
             m.str("root", &st.model_dir);
             m.raw("parent", b"null");
             m.int("max_model_len", st.max_model_len());

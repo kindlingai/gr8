@@ -6,7 +6,7 @@ rolling pack), `engine/runtime/qp_wire.h` (the RDMA protocol), `tools/convert/pa
 
 ## Why
 
-`G6_PF_OWN=3` (QO attention) is g6's biggest prefill lever: the owner of a row runs the whole attention block for all
+`G6_PF_OWN=3` (QO attention) is gr8's biggest prefill lever: the owner of a row runs the whole attention block for all
 64 heads of that row. It needs the full-head QO pack (13.1 GB) on every rank. At TP4 a rank pack is 90.3 GB, and the
 two do not fit together on a GB10. So TP4 ran `G6_PF_OWN=1`.
 

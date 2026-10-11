@@ -9,7 +9,7 @@
   against numbers taken at the same cap.
 - KL reference: `../refs/tp6.json`, `gate.py kl-ref` on boot b1 (16 sequences x 256 tokens, top 20).
 - Three boots (b1, b2, b3), each stopped completely and started again; `gate.py run --repeat 2 --skip mixed4 --kl-ref`.
-- KL: 0.0 on every run of every boot (4096 positions, top-1 agreement 1.0): g6 at a fixed commit gives the same
+- KL: 0.0 on every run of every boot (4096 positions, top-1 agreement 1.0): gr8 at a fixed commit gives the same
   top-20 logprobs boot to boot on TP6. The KL threshold is therefore the floor, 1e-6 (2 x worst boot = 0).
 - Not in the baseline: `work.mixed4.*` (needs `-DDEC_S2`), so `check` reports PARTIAL.
 - The `workloads` numbers are reasoning text: `effort=nothink` cannot turn thinking off with the GLM 5.3 template.

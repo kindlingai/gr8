@@ -20,7 +20,7 @@ def build(body: dict, prompt_len: int, max_model_len: int, eos_ids: list[int], g
           default_max_tokens: int | None, max_logprobs: int, chat: bool) -> dict:
     """Returns the sampling part of a `generate` frame plus front-end-only fields (stop strings etc.)."""
     if (body.get('n') or 1) != 1:
-        raise ApiError('only n=1 is supported by the g6 front end', param='n')
+        raise ApiError('only n=1 is supported by the gr8 front end', param='n')
     if body.get('best_of') not in (None, 1):
         raise ApiError('best_of is not supported', param='best_of')
     max_tokens = _num(body, 'max_completion_tokens' if chat and body.get('max_completion_tokens') is not None
@@ -62,9 +62,9 @@ def build(body: dict, prompt_len: int, max_model_len: int, eos_ids: list[int], g
     stop_ids = list(dict.fromkeys(([] if ignore_eos else list(eos_ids)) + stop_token_ids))
     for k in ('frequency_penalty', 'presence_penalty'):
         if body.get(k) not in (None, 0, 0.0):
-            raise ApiError(f'{k} is not supported by the g6 engine yet', param=k)
+            raise ApiError(f'{k} is not supported by the gr8 engine yet', param=k)
     if body.get('repetition_penalty') not in (None, 1, 1.0):
-        raise ApiError('repetition_penalty is not supported by the g6 engine yet', param='repetition_penalty')
+        raise ApiError('repetition_penalty is not supported by the gr8 engine yet', param='repetition_penalty')
 
     # logprobs
     if chat:

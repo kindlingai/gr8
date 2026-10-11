@@ -1,4 +1,4 @@
-// g6 rank step: one rank's decode step over a list of real layers + head, as launch helpers.
+// gr8 rank step: one rank's decode step over a list of real layers + head, as launch helpers.
 // Used unchanged by the NR-process runtime (engine/runtime/g6m4.cu, real fabric; NR = G6_NR, six or four) and by the
 // one-process NR-simulated-rank driver (engine/runtime/m4sim.cu, loopback fabric), so their outputs must be bit-identical.
 //

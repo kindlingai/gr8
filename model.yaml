@@ -8,7 +8,7 @@ checkpoints:
   drafter: incoai/GLM-5.3-DFlash2                         # DFlash2 (TP=4), CC BY-NC-ND 4.0: --drafter fetches and converts it per box
 
 description: >-
-  Full GLM 5.3 (MoE with 256 routed experts, MLA attention with the sparse indexer, one MTP layer) on g6, a
+  Full GLM 5.3 (MoE with 256 routed experts, MLA attention with the sparse indexer, one MTP layer) on gr8, a
   from-scratch CUDA engine: one g6m4 process per GB10 box, RoCE v2 between them, an OpenAI-compatible front end on
   rank 0. TP=4 and TP=3 serve up to 8 requests at once (S2); TP=4 drafts with DFlash2 for a request that runs alone.
 

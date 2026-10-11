@@ -1,4 +1,4 @@
-"""g6 weight converter: TR3 checkpoint + the old-rank D8 GPTQ dirs -> per-rank packs.
+"""gr8 weight converter: TR3 checkpoint + the old-rank D8 GPTQ dirs -> per-rank packs.
 
 python3 -m tools.convert.convert --tr3 DIR --d8 R0 R1 R2 R3 R4 R5 --out DIR [--layers 0,3,40,77,78]
         [--ranks 0,1,2,3,4,5] [--skip embed,head] [--drop-cache]

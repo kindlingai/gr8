@@ -34,7 +34,7 @@ constexpr int DEFAULT_DENSE_LIMIT=8192;
 // Bound all prefill scratch and GEMM widths at creation, independent of tails.
 // Larger batches reduce launch overhead and improve selector/WMMA occupancy.
 constexpr int DEFAULT_QUERY_TILE=256;
-static int blas_status(cublasStatus_t s){if(s==CUBLAS_STATUS_SUCCESS)return 0;fprintf(stderr,"g6 prefill cuBLAS status %d\n",int(s));return int(cudaErrorUnknown);}
+static int blas_status(cublasStatus_t s){if(s==CUBLAS_STATUS_SUCCESS)return 0;fprintf(stderr,"gr8 prefill cuBLAS status %d\n",int(s));return int(cudaErrorUnknown);}
 __global__ void weight_half(const void* src,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[i]=__float2half_rn(ga::bfloat(src,i));}
 __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int count){
     auto a=ga::resolve(fixed);int pos=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(pos>=count)return;

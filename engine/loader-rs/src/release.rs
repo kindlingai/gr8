@@ -1,4 +1,4 @@
-//! A rank's whole image from the exlr8 v2 release alone, planned at boot: no g6 rank pack. Every non-expert tensor
+//! A rank's whole image from the exlr8 v2 release alone, planned at boot: no gr8 rank pack. Every non-expert tensor
 //! comes from the release's dense and vocabulary files (src/exlr8.rs), the routed and shared experts from the width
 //! files at the index slices' offsets (src/v2plan.rs, as `--v2` plans them). The tensors and their names are the ones
 //! the engine binds from a converted pack (tools/convert/convert.py), in the forms it reads today:
@@ -51,7 +51,7 @@ pub struct Shard {
 impl Shard {
     pub fn new(nr: usize, rank: usize) -> Result<Shard, String> {
         if !(nr == 3 || nr == 6 || (nr > 0 && 64 % nr == 0)) || rank >= nr {
-            return Err(format!("TP {nr} rank {rank}: g6 builds TP 3, 6 or a divisor of 64"));
+            return Err(format!("TP {nr} rank {rank}: gr8 builds TP 3, 6 or a divisor of 64"));
         }
         if !(384 / nr).is_multiple_of(4) {
             return Err(format!("TP {nr}: the dense MLP's rank slices do not fall on the release's 128-channel blocks"));
@@ -167,7 +167,7 @@ impl Planner {
         self.b.segs.push(crate::plan::Seg { pack_off: a, nbytes: span, op: Op::Gen, file_off: 0, file: gi });
     }
 
-    /// A vector (norm, bias) as stored, under its g6 name.
+    /// A vector (norm, bias) as stored, under its gr8 name.
     fn vector(&mut self, name: String, f: &StFile, t: &str) -> Result<(), String> {
         let i = f.info(t)?.clone();
         let dtype = match i.dtype.as_str() { "BF16" => "bf16", "F32" => "f32", "F16" => "f16", d => return Err(format!("{t}: dtype {d}")) };
@@ -178,7 +178,7 @@ impl Planner {
     fn mxfp8(&mut self, l: usize, what: &'static str, p: &str, f: &Arc<StFile>, m: &str, decode_only: bool) -> Result<(), String> {
         let mx = Matrix::open(f, m)?;
         if mx.rec.fmt != MXFP8 {
-            return Err(format!("{}: {m} is {}, g6 reads it as MXFP8", f.path, fmt_name(&mx)));
+            return Err(format!("{}: {m} is {}, gr8 reads it as MXFP8", f.path, fmt_name(&mx)));
         }
         let (o, k) = (mx.rec.out, mx.rec.inp);
         if !decode_only {
@@ -213,7 +213,7 @@ impl Planner {
                 });
                 self.note(l, Form { what, src: "MXFP8".into(), form: "BF16 + decode record", exact: EXACT });
             }
-            _ => return Err(format!("{}: {m} is {}, g6 reads it as BF16", f.path, fmt_name(&mx))),
+            _ => return Err(format!("{}: {m} is {}, gr8 reads it as BF16", f.path, fmt_name(&mx))),
         }
         let (f2, m2) = (f.clone(), m.to_string());
         let t = self.threads;
@@ -477,9 +477,9 @@ impl Planner {
         Ok(())
     }
 
-    /// The exactness table: one line per (matrix, release format, g6 form) with its layers.
+    /// The exactness table: one line per (matrix, release format, gr8 form) with its layers.
     fn table(&self) -> String {
-        let mut s = String::from("| matrix | release | g6 form | weights | layers |\n|---|---|---|---|---|\n");
+        let mut s = String::from("| matrix | release | gr8 form | weights | layers |\n|---|---|---|---|---|\n");
         for (f, ls) in &self.forms {
             let layers = if ls == &[L_MTP + 1] { "vocab".to_string() } else { ranges(ls) };
             s += &format!("| {} | {} | {} | {} | {} |\n", f.what, f.src, f.form, f.exact, layers);
