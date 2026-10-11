@@ -1,5 +1,6 @@
 // s2_batch.h Batch: one round = ONE main step (every active session's K+1 rows), ONE first-form draft step, K-1 chain
-// steps; the k1 class follows the step's row count; a session's rows and tokens do not depend on the other sessions.
+// steps; the k1 class follows the step's row count; a session's rows and tokens do not depend on the other sessions,
+// nor on the rounds it sits out.
 // Host only. Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_round_test.cpp -o /tmp/batch_round_test
 // The fake model is a pure function of (session salt, row position, row token): row invariance holds by construction,
 // so any difference between a solo run and a batched run comes from the step planner.
@@ -159,6 +160,37 @@ int main()
         int expect = 0;
         for (const auto& s : S) expect += ((int)s.prompt.size() + s.chunk - 1) / s.chunk;
         CHECK(prompt_main == expect);
+    }
+
+    // 5. a session left out of a round (its run could not grow: Driver::step's stall mask) sits it out: its rows, samples,
+    // tokens and stats afterwards are those of its solo run, whatever rounds it missed
+    {
+        Trace t;
+        Batch b(K, NS * (K + 1), make_hooks(salt, t, 14));
+        std::vector<int> qs(NS);
+        for (int q = 0; q < NS; ++q) qs[q] = q;
+        b.admit(qs, S);
+        uint32_t x = 5;
+        long sat = 0;
+        for (;;) {
+            std::vector<int> act, order;
+            for (int q : qs) if (b.active(q)) act.push_back(q);
+            if (act.empty()) break;
+            for (int q : act) { x = mix(x, q, 3); if (x % 3) order.push_back(q); else ++sat; }
+            if (order.empty()) order.push_back(act[x % act.size()]);
+            b.round(order);
+        }
+        CHECK(sat > 5);
+        for (int q = 0; q < NS; ++q) {
+            CHECK(b.result(q) == outb[q]);
+            CHECK(b.stats(q).rounds == stb[q].rounds && b.stats(q).acc == stb[q].acc);
+            bool same = t.rows[q].size() == tb.rows[q].size();
+            for (size_t i = 0; same && i < t.rows[q].size(); ++i) {
+                const auto &u = t.rows[q][i], &v = tb.rows[q][i];
+                same = u.kind == v.kind && u.tok == v.tok && u.pos == v.pos && u.spos == v.spos;
+            }
+            CHECK(same && t.sample[q] == tb.sample[q]);
+        }
     }
 
     std::printf("batch_round_test: %s (%zu steps, %zu rounds)\n", fails ? "FAIL" : "PASS", tb.steps.size(), rounds.size());

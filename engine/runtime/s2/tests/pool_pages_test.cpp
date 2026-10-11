@@ -41,7 +41,7 @@ int main()
         for (int i = 0; i < 10; i += 2) p.release(r[i]);     // 50 free pages in five gaps of 10
         AdmissionQueue q(Config{1, 100 * 64, 24, 8, 2, UINT32_MAX, 4096, true});
         q.push(Request{1, 30 * 64 - 4 - 10, 10});
-        const auto s = q.check(1, true, p.room());
+        const auto s = q.check(1, true, p.fits(30 * 64, 30 * 64), p.room());
         CHECK(s && s->why == Stall::None && s->requested == 30 && p.room() == 50);
         const Run big = p.reserve(30 * 64);
         std::vector<int> want;
@@ -49,7 +49,7 @@ int main()
         CHECK(p.list(big) == want && big.first_page == 0 && p.room() == 20);
         q.push(Request{2, 30 * 64 - 4 - 10, 10});
         q.admitted(1);
-        const auto s2 = q.check(2, true, p.room());
+        const auto s2 = q.check(2, true, p.fits(30 * 64, 30 * 64), p.room());
         CHECK(s2 && s2->why == Stall::Capacity);
     }
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-11: S2 sessions take KV pages as they need them
+
+- A session below R starts with the pages for its prompt, the token after it and the guard, and takes one more page
+  each time its output reaches the end of the last one. Agent harnesses send `max_tokens` 32,000, so a 13,000-45,000
+  token prompt used to hold 45,000-77,000 rows from admission, and one or two sessions filled the 1,920-page pool at
+  TP=4.
+- No session ever has to give pages back: the pool admits a request, or lets a session grow, only when every live
+  session can still reach prompt + `max_tokens` + guard (a safe state). A session whose page would break that sits out
+  rounds until another session finishes, then runs the same steps it would have run. Requests past R, by prompt +
+  `max_tokens`, still take the whole pool at once.
+- A finished session's pages go back to the pool when it finishes, not at the next admission.
+- `status.s2` adds `held_pages`, `worst_pages`, `grown`, `stalled_rounds` and each run's pages held and worst case.
+  The front ends export the first four as `g6:s2_held_pages`, `g6:s2_worst_pages`, `g6:s2_grown_total` and
+  `g6:s2_stalled_rounds_total`. `G6_S2_GROW=0` gives every run its worst case at admission, as before.
+- The control frames are version `G6S2E3`, so every rank needs this build.
+- Predicted by `kvman-sim` on two recorded opencode traces (four sessions each, TP=4 time model, not yet measured on
+  the cluster): median TTFT 42.6 s -> 4.1 s and wall time -15% on the first. The second gains 6-9% wall time and
+  little TTFT, since 25 of its 54 requests are past R with their `max_tokens`. `engine/kvman-rs/SSD-TIER.md` has the
+  tables.
+
 ## 2026-10-11: README: what concurrent requests produce
 
 - The README and `kindling.json` said each request's output is byte for byte what it would be alone. That does not

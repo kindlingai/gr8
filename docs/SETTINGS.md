@@ -83,6 +83,7 @@ the short version.
 | `G6_PF_TR_BM` | 16 | row blocks per CTA of the prefill GEMM on trellis tiles (`k_gemm_tr`) for large launches: 16 (256 rows, 512 threads) or 8. Small launches take 4 |
 | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
 | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+| `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
 | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
 | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |

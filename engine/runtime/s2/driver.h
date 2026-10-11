@@ -26,8 +26,14 @@ struct DriverHooks {
     std::function<bool(Key)> dfl_ok;
     std::function<int(Key)> dfl_start;
     std::function<s2::DflDrafts(Key, const s2::DflReq&)> dfl;
-    // One completion notification; physical KV release waits for the event fence.
+    // One completion notification.
     std::function<void(Key, const s2::Stats&)> terminal;
+    // optional: before a round, a decoding session's run grows to cover `rows` (round_rows). The run, perhaps the same,
+    // or nothing: the pages would leave the pool unsafe and the session sits this round out. Every rank, same order.
+    std::function<std::optional<Run>(const Slot&, uint64_t rows)> grow;
+    // optional: a session finished at this step (now Retiring): its pages go back to the pool now, on every rank, so
+    // the sessions still decoding can grow before the next event fence frees the slot
+    std::function<void(const Slot&)> finished;
 };
 class Driver {
     Scheduler scheduler_;
@@ -128,7 +134,17 @@ public:
         return changes;
     }
     Quantum step() {
-        auto q = scheduler_.next();
+        std::array<bool, MAX_SESSIONS> stalled{};
+        try {
+            if (hooks_.grow)
+                for (const Key& k : scheduler_.decoding()) {
+                    const auto& s = scheduler_.slots()[k.slot];
+                    const auto r = hooks_.grow(s, round_rows(scheduler_.config(), uint64_t(batch_.length(int(k.slot)))));
+                    if (!r) stalled[k.slot] = true;
+                    else if (*r != s.run) scheduler_.grow(k, *r);
+                }
+        } catch (...) { scheduler_.fail(); throw; }
+        auto q = scheduler_.next(stalled);
         try {
             if (q.kind == Kind::Prefill) {
                 auto k = q.keys[0];
@@ -157,8 +173,9 @@ public:
             if (q.kind == Kind::PromptTail || q.kind == Kind::Decode)
                 for (unsigned i = 0; i < q.count; ++i) {
                     auto k = q.keys[i];
-                    if (scheduler_.slots()[k.slot].phase == Phase::Retiring && hooks_.terminal)
-                        hooks_.terminal(k, batch_.stats(int(k.slot)));
+                    if (scheduler_.slots()[k.slot].phase != Phase::Retiring) continue;
+                    if (hooks_.terminal) hooks_.terminal(k, batch_.stats(int(k.slot)));
+                    if (hooks_.finished) hooks_.finished(scheduler_.slots()[k.slot]);
                 }
         } catch (...) { scheduler_.fail(); throw; }
         return q;

@@ -47,8 +47,18 @@ inline uint32_t reserve_pages(const Config& c, const Request& r) {
     require(rows <= c.pool_rows, "request exceeds pool including guard");
     return uint32_t((rows + PAGE - 1) / PAGE);
 }
+// rows a session holds from its admission: its prompt, the token the tail samples and the guard, which covers the prompt
+// tail, its chain steps and the first round. A round at `length` tokens (prompt + output) writes rows below
+// length + 2 * mtp - 1 (verify, first-form draft, chain), DFlash2 below length + 7, so round_rows = length + guard covers
+// it (Config::validate keeps guard >= 2 * mtp, and DFlash2 builds set 14). Later rows come by growth (Driver::step).
+inline uint64_t round_rows(const Config& c, uint64_t length) { return length + c.guard(); }
+inline uint64_t grant_rows(const Config& c, const Request& r) {
+    return std::min(reserve_rows(c, r), round_rows(c, uint64_t(r.prompt_tokens) + 1));
+}
+inline uint32_t grant_pages(const Config& c, const Request& r) { return uint32_t((grant_rows(c, r) + PAGE - 1) / PAGE); }
 // a session's pages, as the control link carries them. Each rank's pool (pool.h) holds the list and fills it the same
-// way. list_hash names the list, so a rank whose list differs fails at its grant.
+// way. list_hash names the list, so a rank whose list differs fails at its grant. A run grows (Scheduler::grow) between
+// events on every rank alike: same table version, more pages, a new hash.
 struct Run {
     uint32_t first_page = 0, pages = 0, table_version = 0;
     uint64_t list_hash = 0;
@@ -172,8 +182,9 @@ public:
             require(g.key.slot < MAX_SESSIONS && g.key.epoch == c_.epoch, "bad grant key");
             auto& target = after[g.key.slot];
             require(target.phase == Phase::Free && target.key.generation != UINT32_MAX && g.key.generation == target.key.generation + 1, "grant slot generation mismatch");
-            // the pool rejects a page two runs hold (RunPool::mark)
-            require(g.run.pages == reserve_pages(c_, g.req) && g.run.first_page < c_.pool_rows/PAGE && g.run.table_version, "bad reservation");
+            // the pool rejects a page two runs hold. A run past R holds its worst case (reserve_pages) from the start
+            require((g.run.pages == grant_pages(c_, g.req) || g.run.pages == reserve_pages(c_, g.req)) &&
+                    g.run.first_page < c_.pool_rows/PAGE && g.run.table_version, "bad reservation");
             unsigned live = 0;
             for (const auto& s : after) if (s.phase != Phase::Free) {
                 ++live;
@@ -187,11 +198,28 @@ public:
         s_ = after; event_ = e.event; ++revision_;
         return d; // allocator adapter now applies these canonical changes; no local allocation choice here
     }
-    Quantum next() {
+    // a decoding session's run grew (Driver::step, every rank alike, between events)
+    void grow(const Key& k, const Run& r) {
+        auto& s = slot(k);
+        require(!busy_ && s.phase == Phase::Decode && r.table_version == s.run.table_version && r.first_page == s.run.first_page &&
+                r.pages > s.run.pages && r.pages <= reserve_pages(c_, s.req), "bad run growth");
+        s.run = r;
+    }
+    // the decoding sessions in ascending request id, as next() orders them
+    std::vector<Key> decoding() const {
+        std::vector<const Slot*> v;
+        for (const auto& s : s_) if (s.phase == Phase::Decode) v.push_back(&s);
+        std::sort(v.begin(), v.end(), [](const Slot* a, const Slot* b) { return a->req.id < b->req.id; });
+        std::vector<Key> out;
+        for (const Slot* s : v) out.push_back(s->key);
+        return out;
+    }
+    // stalled[slot]: a decoding session left out of this round (its run could not grow); it keeps its place
+    Quantum next(const std::array<bool, MAX_SESSIONS>& stalled = {}) {
         require(!failed_ && !busy_, "scheduler failed or work in flight");
         Quantum q; q.boundary = boundary_ + 1;
         std::array<const Slot*, MAX_SESSIONS> ordered{}; unsigned n = 0;
-        for (const auto& s : s_) if (s.phase == Phase::Prefill || s.phase == Phase::Decode) ordered[n++] = &s;
+        for (const auto& s : s_) if (s.phase == Phase::Prefill || (s.phase == Phase::Decode && !stalled[s.key.slot])) ordered[n++] = &s;
         // At most eight entries; avoid STL's 16-entry insertion-sort threshold
         // (and GCC's array-bounds diagnostic on a partially filled std::array).
         for (unsigned i = 1; i < n; ++i) {
@@ -263,13 +291,13 @@ public:
     const Request* front() const { return q_.empty() ? nullptr : &q_.front(); }
     size_t size() const { return q_.size(); }
     void admitted(uint64_t id) { require(!q_.empty() && q_.front().id == id, "FIFO admission violated"); q_.pop_front(); }
-    // room: the pages one reservation can take now (RunPool::room)
-    std::optional<AdmissionStatus> check(uint64_t revision, bool slot, uint32_t room) {
+    // fits: the pool can admit the head (RunPool::fits); room: the pages one reservation can take now (RunPool::room)
+    std::optional<AdmissionStatus> check(uint64_t revision, bool slot, bool fits, uint32_t room) {
         if (q_.empty() || (last_head_ == q_.front().id && last_revision_ == revision)) return {};
         require(room <= c_.pool_rows/PAGE, "invalid allocator view");
         last_head_ = q_.front().id; last_revision_ = revision;
-        AdmissionStatus s; s.requested = reserve_pages(c_, q_.front()); s.room = room;
-        s.why = !slot ? Stall::Slots : room < s.requested ? Stall::Capacity : Stall::None;
+        AdmissionStatus s; s.requested = grant_pages(c_, q_.front()); s.room = room;
+        s.why = !slot ? Stall::Slots : !fits ? Stall::Capacity : Stall::None;
         if (s.why != Stall::None) ++stalls;
         return s;
     }

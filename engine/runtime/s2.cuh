@@ -322,6 +322,21 @@ inline void s2_reset_pages(Model& m, const std::vector<int>& list, cudaStream_t 
     }
 }
 
+// pages a run takes when it grows: the latent and index caches of those pages := 0 on the layers' own bindings, as
+// s2_reset_pages clears a new run, without its per-step words (other sessions' steps are under way). Host, between
+// rounds, on every rank, main AND draft model.
+inline void s2_zero_pages(Model& m, const std::vector<int>& list, cudaStream_t st)
+{
+    const S2Model& s = *m.s2;
+    if (list.empty()) return;
+    s2_check_pages(s, list, s.pool_pages, "s2_zero_pages");
+    G6RT_CK(g6h2d::copy(s.zero_list, list.data(), list.size() * 4, st));
+    for (G6AttnBinding* p : s.pool)
+    {
+        k_zero_pages<<<(unsigned)list.size(), 256, 0, st>>>(s.zero_list, static_cast<uint4*>(p->args.mla_cache), static_cast<uint4*>(p->args.index_cache));
+        G6RT_CK(cudaGetLastError());
+    }
+}
 // re-base slot q's run, keeping its pages (s2_relocate)
 inline void s2_set_base(Model& m, int q, int base_page)
 {

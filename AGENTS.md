@@ -37,8 +37,8 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 
 | test | where | command |
 |---|---|---|
-| S2 batch planner, control barrier, pool reuse, the Rust pool against the C++ one it replaced | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
-| the S2 page allocator's properties (no page lost or held twice, ranks agree) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
+| S2 batch planner, control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
+| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
 | row budget, S2 attention, decode heads | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |

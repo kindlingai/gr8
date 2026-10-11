@@ -85,7 +85,16 @@ pub fn render(m: &Value, model_name: &str) -> String {
     );
     // S2-only native allocator/scheduler snapshot; legacy exposition is unchanged.
     if let Some(s2) = m.get("scheduler").filter(|v| !v.is_null()) {
-        for key in ["resident", "queued", "retiring", "reserved_pages", "free_pages", "largest_free_run"] {
+        for key in [
+            "resident",
+            "queued",
+            "retiring",
+            "reserved_pages",
+            "free_pages",
+            "largest_free_run",
+            "held_pages",
+            "worst_pages",
+        ] {
             if let Some(v) = s2.get(key) {
                 metric(
                     &format!("g6:s2_{key}"),
@@ -95,7 +104,7 @@ pub fn render(m: &Value, model_name: &str) -> String {
                 );
             }
         }
-        for key in ["admission_stalls", "fragmentation_stalls"] {
+        for key in ["admission_stalls", "fragmentation_stalls", "grown", "stalled_rounds"] {
             if let Some(v) = s2.get(key) {
                 metric(
                     &format!("g6:s2_{key}_total"),

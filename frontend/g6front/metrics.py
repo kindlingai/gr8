@@ -41,10 +41,11 @@ def render(m: dict, model_name: str) -> str:
     # S2-only native allocator/scheduler snapshot; legacy exposition is unchanged.
     s2 = m.get('scheduler')
     if s2 is not None:
-        for key in ('resident', 'queued', 'retiring', 'reserved_pages', 'free_pages', 'largest_free_run'):
+        for key in ('resident', 'queued', 'retiring', 'reserved_pages', 'free_pages', 'largest_free_run', 'held_pages',
+                    'worst_pages'):
             if key in s2:
                 metric('g6:s2_' + key, 'gauge', 'S2 native ' + key.replace('_', ' ') + '.', [('', s2[key])])
-        for key in ('admission_stalls', 'fragmentation_stalls'):
+        for key in ('admission_stalls', 'fragmentation_stalls', 'grown', 'stalled_rounds'):
             if key in s2:
                 metric('g6:s2_' + key + '_total', 'counter', 'S2 native ' + key.replace('_', ' ') + '.', [('', s2[key])])
     return '\n'.join(out) + '\n'

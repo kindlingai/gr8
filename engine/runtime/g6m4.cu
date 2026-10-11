@@ -763,15 +763,24 @@ int main(int argc, char** argv)
             g6s2::NativeHooks h;
             h.pool.free_pages = [&] { return pool.free_pages(); };
             h.pool.room = [&] { return pool.room(); };
-            h.pool.reserve = [&](uint64_t rows) { return pool.reserve(rows); };
+            h.pool.reserve = [&](uint64_t rows, uint64_t worst) { return pool.reserve(rows, worst); };
             h.pool.digest = [&] { return pool.digest(); };
             h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
-            h.pool.admissible = [&](uint64_t rows) { return pool.admissible(rows); };
+            h.pool.fits = [&](uint64_t rows, uint64_t worst) { return pool.fits(rows, worst); };
+            h.pool.stats = [&] { return pool.stats(); };
+            h.pool.runs = [&] { return pool.runs(); };
+            // G6_S2_GROW=0: every run holds its worst case (prompt + max_tokens + guard) from admission, as before growth
+            {
+                std::string err;
+                const int grow = env_choice("G6_S2_GROW", 1, 1, &err);
+                if (grow < 0) die(err);
+                if (grow) h.pool.grow = [&](const g6s2::Run& r, uint64_t rows) { return pool.grow(r, rows); };
+            }
             if (pool.keeping())
             {
                 h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s) { pool.retain(r, s); };
-                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, int limit) { return pool.match(p, rows, limit); };
-                h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows) { return pool.take(x, rows); };
+                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit) { return pool.match(p, rows, worst, limit); };
+                h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst) { return pool.take(x, rows, worst); };
             }
             h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
                 const int q = (int)g.key.slot;
@@ -795,6 +804,20 @@ int main(int argc, char** argv)
                         G6RT_CK(cudaMemsetAsync(v->args.output, 0, (size_t)v->max_rows * v->args.heads * 256 * 2, st));
                         G6RT_CK(cudaMemsetAsync(v->args.error, 0, 4, st));
                     }
+                }
+                G6RT_CK(cudaStreamSynchronize(st));
+            };
+            // a run grew between rounds (every rank, same order): the new pages, cleared as a new run's are, into slot q's
+            // table, and into the layers' own tables when q runs alone on today's path
+            h.grown = [&](unsigned q, const g6s2::Run& r) {
+                const std::vector<int> list = pool.list(r);
+                for (Model* x : {&m, &D.d})
+                {
+                    const std::vector<int> old = x->s2->run[q];
+                    g6s2::require(list.size() > old.size() && std::equal(old.begin(), old.end(), list.begin()), "grown run does not extend the slot's pages");
+                    s2_zero_pages(*x, std::vector<int>(list.begin() + old.size(), list.end()), st);
+                    s2_set_pages(*x, (int)q, list);
+                    if (!x->s2on) s2_solo_pages(*x, list);
                 }
                 G6RT_CK(cudaStreamSynchronize(st));
             };

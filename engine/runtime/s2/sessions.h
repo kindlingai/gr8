@@ -73,7 +73,7 @@ public:
         auto& s = sessions_[g.key.slot]; require(!s.bound, "session already bound");
         auto req = request(g.req.id, r);
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
-                reserve_pages(config_, req) == g.run.pages, "session payload/grant mismatch");
+                (grant_pages(config_, req) == g.run.pages || reserve_pages(config_, req) == g.run.pages), "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
@@ -83,6 +83,11 @@ public:
                     g.key.generation, g.run.first_page, g.run.pages);
             require(!fflush(s.emitter.f), "S2 admission output failed"); output_ok(s.emitter);
         }
+    }
+    // the session's run grew (Driver::step): Dispatch checks each step's rows against it
+    void grow(unsigned slot, const Run& r) {
+        require(slot < MAX_SESSIONS && sessions_[slot].bound && sessions_[slot].run.table_version == r.table_version, "growth of an unbound session");
+        sessions_[slot].run = r;
     }
     const Session& at(unsigned slot) const {
         require(slot < MAX_SESSIONS && sessions_[slot].bound, "unbound session"); return sessions_[slot];

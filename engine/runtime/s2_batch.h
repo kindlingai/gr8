@@ -120,7 +120,10 @@ struct Hooks
 //                           given, then one batched chain over those still live. A session finished by emit during its
 //                           prompt is finished at once (finished(q), result(q)).
 //   round(order)            one round over the sessions of `order` that are active (admitted, not finished, fewer than
-//                           n_gen tokens), rows in that order; false = none active (nothing ran)
+//                           n_gen tokens), rows in that order; false = none active (nothing ran). An active session
+//                           left out of `order` sits the round out: its state does not change, so its later rounds,
+//                           rows and tokens are the ones it would have had (the driver does this when its pages
+//                           cannot grow)
 //   cancel(q)               the session leaves now (result(q) = what it committed); its slot can be admitted again
 //   active(q) / finished(q) / result(q) / stats(q)
 // Acceptance and draft state stay here; the scheduler keeps generations and pages. mtp_batch below = admit(all) and
@@ -173,6 +176,8 @@ public:
           chain(live, evs, choose(all)); } // first-step timer: post-admit chains follow the tail steps
     }
     bool active(int q) const { const St& x = st_[q]; return x.on && !x.done && (int)x.tokens.size() - x.n < x.s.n_gen; }
+    // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
+    int length(int q) const { return (int)st_[q].tokens.size(); }
     bool finished(int q) const { return st_[q].on && !active(q); }
     void cancel(int q) { St& x = st_[q]; x.done = true; x.on = false; }
     std::vector<int> result(int q) const

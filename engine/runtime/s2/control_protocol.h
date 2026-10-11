@@ -7,7 +7,7 @@ enum class Tag : uint64_t { Notice=1, Ack=2, Commit=3, Request=4, Quit=5 };
 struct Encoder {
     std::vector<uint8_t> b;
     void u64(uint64_t x){for(int i=7;i>=0;--i)b.push_back(uint8_t(x>>(i*8)));}
-    explicit Encoder(Tag t){u64(0x473653324532ull);u64(uint64_t(t));} // G6S2E2
+    explicit Encoder(Tag t){u64(0x473653324533ull);u64(uint64_t(t));} // G6S2E3
     void notice(const Notice& n){u64(n.epoch);u64(n.event);u64(n.boundary);u64(n.request);u64(n.payload_hash);u64(uint64_t(n.kind));}
     void key(Key k){u64(k.epoch);u64(k.slot);u64(k.generation);}
 };
@@ -15,7 +15,7 @@ struct Decoder {
     const std::vector<uint8_t>& b;size_t i=0;Tag tag;
     uint64_t u64(){require(b.size()-i>=8,"truncated control metadata");uint64_t x=0;for(unsigned n=0;n<8;++n)x=x*256+b[i++];return x;}
     uint32_t u32(){auto x=u64();require(x<=UINT32_MAX,"control integer overflow");return uint32_t(x);}
-    explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324532ull,"control version mismatch");auto t=u64();require(t>=1&&t<=5,"unknown control tag");tag=Tag(t);}
+    explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324533ull,"control version mismatch");auto t=u64();require(t>=1&&t<=5,"unknown control tag");tag=Tag(t);}
     Notice notice(){Notice n;n.epoch=u64();n.event=u64();n.boundary=u64();n.request=u64();n.payload_hash=u64();auto k=u64();require(k==1||k==2,"unknown event kind");n.kind=EventKind(k);return n;}
     Key key(){Key k;k.epoch=u64();k.slot=u32();k.generation=u32();return k;}
     void end(){require(i==b.size(),"trailing control metadata");}

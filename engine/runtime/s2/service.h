@@ -9,25 +9,33 @@
 #include <thread>
 
 namespace g6s2 {
+// rows: what a request needs at admission (grant_rows), worst: all it may grow to (reserve_rows)
 struct PoolHooks {
     std::function<uint32_t()> free_pages, room;
     // head after ALL event ACKs, workers at the grant (the same call on the same pool state must give the same Run)
-    std::function<Run(uint64_t rows)> reserve;
+    std::function<Run(uint64_t rows, uint64_t worst)> reserve;
     std::function<void(const Run&)> release;
-    // optional (S2 below R, pool.h): false = the FIFO head may not take a run yet even though one fits (a past-R
-    // request waits for an empty pool); counted as an admission stall
-    std::function<bool(uint64_t rows)> admissible;
+    // can the FIFO head be admitted now: room, no exclusive run in the way, and every live run still able to reach its
+    // worst case (pool.h fits). false is counted as an admission stall
+    std::function<bool(uint64_t rows, uint64_t worst)> fits;
+    // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
+    std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
+    // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
+    std::function<std::vector<PoolUse>()> runs;
+    std::function<g6kv_totals()> stats;
     // optional, prefix reuse (pool.h keep): every rank retires a run with its session's reuse state; the head matches a
-    // new prompt against the retained runs (rows: the request's reservation; limit: rows its prefill may skip) and takes a hit
+    // new prompt against the retained runs (limit: rows its prefill may skip) and takes a hit
     std::function<void(const Run&, const g6rt::PrefixReuse&)> retain;
-    std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, int limit)> match;
-    std::function<Run(const PoolHit&, uint64_t rows)> take;
+    std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit)> match;
+    std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst)> take;
     // optional: the pool's state, compared across ranks at every event (Scheduler::pool_digest)
     std::function<uint64_t()> digest;
 };
 struct NativeHooks {
     PoolHooks pool;
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
+    // with pool.grow: slot's run grew; its new pages go into the main and draft tables before the round
+    std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK
     DispatchHooks dispatch;
@@ -55,6 +63,8 @@ class Service {
     std::map<uint64_t, std::string> payloads_;   // head: queued requests' bytes, sent to the workers with each ADMIT notice
     std::map<uint64_t, std::vector<int>> prompts_;   // head, prefix reuse: queued requests' prompts (none for prompt logprobs)
     bool reuse() const { return bool(native_.pool.match); }
+    // rows a request's run holds at admission: grant_rows when runs grow on demand, else its worst case
+    uint64_t admit_rows(const Request& r) const { return native_.pool.grow ? grant_rows(c_.scheduler, r) : reserve_rows(c_.scheduler, r); }
     std::optional<g6rt::ServeReq> staged_; // COMPUTE thread only, parsed before event ACK
     Progress progress_;
     std::atomic<bool> stopping_{false};
@@ -67,8 +77,9 @@ class Service {
         stopping_.store(true); endpoint_->fail();
     }
     void shutdown() { stopping_.store(true); endpoint_->fail(); }
-    // a slot leaves: its run back to the pool, retained with the session's reuse state when prefix reuse is on.
-    // Head at the event, workers at apply: the same point of the same commit, so every rank keeps the same runs.
+    // a slot leaves: its run back to the pool, retained with the session's reuse state when prefix reuse is on. A
+    // finished session at the step it finished (Driver finished hook, every rank), a cancelled one at the event: head in
+    // event(), workers at apply, the same point of the same commit. So every rank keeps the same runs.
     void retire_run(const Slot& s) {
         if (!reuse()) { native_.pool.release(s.run); return; }
         g6rt::PrefixReuse st = dispatch_.rows(s.key.slot);
@@ -83,7 +94,21 @@ class Service {
         o << "{\"epoch\":" << c_.scheduler.epoch << ",\"resident\":" << progress_.resident.load()
           << ",\"queued\":" << queue_.size() << ",\"retiring\":" << progress_.retiring.load()
           << ",\"reserved_pages\":" << c_.scheduler.pool_rows / PAGE - free << ",\"free_pages\":" << free
-          << ",\"largest_free_run\":" << room << ",\"admission_stalls\":" << queue_.stalls << "}\n";
+          << ",\"largest_free_run\":" << room << ",\"admission_stalls\":" << queue_.stalls;
+        // growth on demand: pages the live runs hold and could grow to, each run's pair, and rounds a session sat out
+        if (native_.pool.stats) {
+            const auto st = native_.pool.stats();
+            o << ",\"held_pages\":" << st.held_pages << ",\"worst_pages\":" << st.worst_pages << ",\"grown\":" << st.grows
+              << ",\"stalled_rounds\":" << st.stalls;
+        }
+        if (native_.pool.runs) {
+            o << ",\"runs\":[";
+            const auto runs = native_.pool.runs();
+            for (size_t i = 0; i < runs.size(); ++i)
+                o << (i ? "," : "") << "{\"held\":" << runs[i].held << ",\"worst\":" << runs[i].worst << "}";
+            o << "]";
+        }
+        o << "}\n";
         atomic_file(c_.directory + "/status.s2", o.str());
     }
     void event(const Command& command) { // CONTROL thread: never read Driver until ALL ACKs
@@ -95,27 +120,26 @@ class Service {
             const auto& s = driver_->state(); // compute paused in boundary() until this commit
             Commit cm{n.epoch, n.event, n.boundary, hash, {}, {}};
             if (!command.admit) cm.cancel = s.find(command.request);
-            // Head owns the real pool delta once; Driver callbacks skip it here.
+            // Head owns the real pool delta once; Driver callbacks skip it here. A Retiring slot gave its run back when it
+            // finished (Driver finished hook); a cancelled live one gives it back now.
             for (const auto& sl : s.slots())
-                if (sl.phase == Phase::Retiring || (cm.cancel && sl.phase != Phase::Free && sl.key == *cm.cancel)) retire_run(sl);
+                if (cm.cancel && sl.phase != Phase::Free && sl.phase != Phase::Retiring && sl.key == *cm.cancel) retire_run(sl);
             if (command.admit) {
                 const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
                 unsigned live = s.resident();
-                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.room());
+                const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
+                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.fits(rows, worst), native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
-                const auto rows = reserve_rows(c_.scheduler, *request);
-                const bool ok = fit->why == Stall::None && (!native_.pool.admissible || native_.pool.admissible(rows));
-                if (fit->why == Stall::None && !ok) ++queue_.stalls;
-                if (ok) {
+                if (fit->why == Stall::None) {
                     Run run{}; uint32_t skip = 0;
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
-                        const PoolHit h = native_.pool.match(pr->second, rows, int(request->prompt_tokens) - 1);
-                        if (h.skip > 0) { run = native_.pool.take(h, rows); skip = uint32_t(h.skip); }
+                        const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1);
+                        if (h.skip > 0) { run = native_.pool.take(h, rows, worst); skip = uint32_t(h.skip); }
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
                                 h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
-                    if (!skip) run = native_.pool.reserve(rows);
+                    if (!skip) run = native_.pool.reserve(rows, worst);
                     cm.admit = Grant{s.next_key(), *request, run, skip};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
@@ -214,33 +238,41 @@ public:
         : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk),
           dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
         c_.validate();
-        require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) &&
+        require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
                 bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
+        require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
         DriverHooks h;
         h.bind = [&](const Grant& g) {
             require(staged_.has_value(), "binding without verified payload");
             require(!g.reuse || reuse(), "reused rows without prefix reuse");
             if (c_.rank) {   // the head's call, on the same pool state
-                const auto rows = reserve_rows(c_.scheduler,g.req);
+                const auto worst = reserve_rows(c_.scheduler,g.req), rows = admit_rows(g.req);
                 Run mine;
                 if (g.reuse) {
-                    const PoolHit h = native_.pool.match(staged_->prompt, rows, int(g.req.prompt_tokens) - 1);
+                    const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1);
                     require(h.skip == int(g.reuse), "worker prefix reuse differs from the head");
-                    mine = native_.pool.take(h, rows);
-                } else mine = native_.pool.reserve(rows);
+                    mine = native_.pool.take(h, rows, worst);
+                } else mine = native_.pool.reserve(rows, worst);
                 require(mine == g.run, "worker page list differs from the head's grant");
             }
             dispatch_.begin(g.key.slot, int(g.reuse));
             native_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {
-            if (c_.rank) retire_run(old);
+            if (c_.rank && old.phase != Phase::Retiring) retire_run(old);   // a cancelled live session (finished ones: below)
             native_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
         };
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) { dispatch_.prefill(s,p,first,rows); };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
         h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
+        h.finished = [&](const Slot& s) { retire_run(s); };
+        if (native_.pool.grow)
+            h.grow = [&](const Slot& s, uint64_t rows) {
+                const auto r = native_.pool.grow(s.run, rows);
+                if (r && *r != s.run) { native_.grown(s.key.slot, *r); sessions_.grow(s.key.slot, *r); }
+                return r;
+            };
         h.terminal = [&](Key k,const s2::Stats& stats) {
             if (stats.switches || stats.mtp_rounds)
                 fprintf(stderr,"# s2 drafter choice slot %u: %ld of %ld rounds on MTP, %ld switches, %ld tokens\n",unsigned(k.slot),

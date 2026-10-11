@@ -1,8 +1,8 @@
 #!/bin/bash
 # Host-only tests (g++, no CUDA): the S2 batch planner (engine/runtime/s2_batch.h, with a DFlash2 session), the S2 control barrier, the
 # pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool
-# against the C++ one it replaced), the commit frame (s2/control_protocol.h), and the pack manifest parser
-# (engine/loader/g6pack.cpp).
+# against the C++ one it replaced), runs that grow on demand through Driver::step (driver_grow_test), the commit frame
+# (s2/control_protocol.h), and the pack manifest parser (engine/loader/g6pack.cpp).
 #   scripts/host_tests.sh
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,6 +30,8 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/pool_pages_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_diff_test.cpp" "${KVLIB[@]}" -o "$T/pool_diff_test"
 "$T/pool_diff_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_grow_test.cpp" "${KVLIB[@]}" -o "$T/driver_grow_test"
+"$T/driver_grow_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
 g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/tests/manifest_test.cpp" \
