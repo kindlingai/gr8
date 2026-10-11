@@ -1,13 +1,15 @@
 # CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# The Rust binaries (the loader and the front end) build on GitHub's hosted arm64 runner, for every pull request,
-# forks included. The engine job runs on GR8_ARM_RUNNER (a repository variable, default ubuntu-24.04-arm). GR8_NATIVE=1
-# (a repository variable) builds the engines on the runner itself, for a self-hosted runner with the CUDA 13 toolchain
-# and no Docker daemon, linking the Rust job's loader. A pull request from a branch in this repository also builds the
-# engines and the image. One from a fork runs the CPU tests and the Rust build only, so its code never runs on the
-# self-hosted runner. The image job assembles the runtime image from the engine job's binaries on a hosted runner, and
-# only it can write packages.
+# The Rust binaries (the loader and the front end) build on GitHub's hosted arm64 runner, for every pull request, forks
+# included. The engine job runs on GR8_ARM_RUNNER (a repository variable, default ubuntu-24.04-arm). GR8_NATIVE=1 (a
+# repository variable) builds the engines on the runner itself, for a self-hosted runner with the CUDA 13 toolchain and
+# no Docker daemon, linking the Rust job's loader. A pull request from a branch in this repository also builds the
+# engines and the image. One from a fork runs only the CPU tests and the Rust build, on hosted runners. That `if:` does
+# not keep fork code off the self-hosted runner, because a fork's pull request runs the fork's own copy of this file:
+# the runner's job-started hook (.github/ci/runner/refuse-forks.sh) refuses those jobs, and the repository requires
+# approval before an outside contributor's workflow runs at all. The image job assembles the runtime image from the
+# engine job's binaries on a hosted runner, and only it can write packages.
 name: ci
 
 on:
