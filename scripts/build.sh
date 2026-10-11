@@ -27,6 +27,9 @@ if command -v cargo > /dev/null 2>&1; then
 fi
 G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
+# the KV node ./gr8 kv up runs
+KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
+if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 S2_FLAG=""
 case "${G6_NR:-6}" in

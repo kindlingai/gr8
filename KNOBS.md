@@ -99,6 +99,28 @@ manifest instead.
 `PACKS`, `RANK_HEALTH` and `PROBE_ARGS` work with `--ssh` only. The symmetric launch takes the packs from `MODEL`, and it
 does not run the rank health probe yet: run `scripts/rank_health.sh` first if you want it.
 
+## `./gr8 kv`
+
+A KV node: a box that locks some of its memory and serves it as KV page blocks to the cluster, over RDMA where both
+ends have a RoCE v2 address and TCP otherwise (`engine/kvman-rs/REMOTE-TIER.md`). The engine does not use it yet.
+`./gr8 kv up --gb N` starts it on this box. The node joins the mentat group as an agent without GPUs, with the service
+`gr8-kv`, and the model's election counts only agents with GPUs. `down`, `status` (`status all`: every node the group
+announces) and `logs [-f]` work as for the model. The options come from the same places as above. A shared config
+file is read for these keys only.
+
+| name | flag | default | meaning |
+|---|---|---|---|
+| `KV_GB` | `--gb` | none | GiB of this box's memory to lock and serve. RLIMIT_MEMLOCK must allow it (`ulimit -l`; root, or `systemd-run -p LimitMEMLOCK=infinity`) |
+| `KV_PORT` | `--port` | 7350 | the node's TCP port; RDMA connections are set up through it |
+| `KV_BIND` | `--bind` | `0.0.0.0` | the address it listens on |
+| `KV_MIN_FREE_GB` | `--min-free-gb` | 10 | refuse to start when locking `KV_GB` would leave less MemAvailable than this |
+| `KV_RDMA` | `--no-rdma` | 1 | 0 = TCP only |
+| `KV_BIN` | `--bin` | `bin/kvman-remote` | the node binary (`./gr8 glm53 build` puts it in `bin/`) |
+| `MENTAT` | `--mentat` | `localhost` | the daemon to announce through; `none` = do not announce |
+| `GROUP` | `--group` | `gr8-glm53` | the mentat group it joins |
+| `NODE_IP` | `--node-ip` | mentat's | the LAN address to announce |
+| `G6_HOME` | `--g6-home` | the repo checkout | the node keeps `out/kv/` here: `kv.log`, `state.json`, `ready.json` |
+
 ## Build and stage
 
 | variable | script | meaning |

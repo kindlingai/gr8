@@ -39,7 +39,7 @@ FROM rust AS kvman
 COPY engine/kvman-rs engine/kvman-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/kvman-rs/Cargo.toml \
- && cp engine/kvman-rs/target/release/libg6kvman.a /out/ \
+ && cp engine/kvman-rs/target/release/libg6kvman.a engine/kvman-rs/target/release/kvman-remote /out/ \
  && rm -rf engine/kvman-rs/target
 
 # the slowest step (fat LTO); it runs beside the engine builds
@@ -87,6 +87,7 @@ FROM scratch AS dist
 COPY --from=engine-tp4 /out/bin/g6m4 /out/bin/m4sim /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
+COPY --from=kvman /out/kvman-remote /bin/
 COPY --from=loader /out/g6load /bin6/
 COPY --from=engine-tp6 /out/bin6/g6m4 /out/bin6/m4sim /out/bin6/gpuprobe /out/bin6/tr3_e4m3_test /bin6/
 COPY --from=loader /out/g6load /bin3/

@@ -1,5 +1,6 @@
 #!/bin/bash
-# The one entry point: ./gr8 <model> <command>; the only model is glm53. Run the same command on every box, from the
+# The one entry point: ./gr8 <model> <command>; the only model is glm53, and ./gr8 kv runs a KV node. Run the same
+# command on every box, from the
 # repo checkout on that box. Each box's supervisor (tools/launch) finds the others, checks that every box has the same
 # options, model set and engine, and starts its own rank. The head (rank 0) also runs the front end and the shim.
 #
@@ -25,6 +26,10 @@
 #   ./gr8 glm53 stage [PACK_DIR]      scripts/stage.sh bin/ PACK_DIR, and the head's front end venv if it is missing
 #   ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]   scripts/build_packs.sh, at TP=4 the drafter packs, and
 #                                     the tokenizer files in OUT_DIR/tokenizer
+#
+#   ./gr8 kv up --gb N [OPTIONS]      lock N GiB of this box's memory and serve it as KV page blocks to the cluster
+#                                     (engine/kvman-rs/REMOTE-TIER.md), announced in the mentat group; ./gr8 kv --help
+#   ./gr8 kv down | status [all] | logs [-f]
 #
 # Options come from the command line, then one config file (@FILE, else ./cluster.env, else config/cluster.env, which
 # ./gr8 parses and does not source), then the environment, then the defaults. An old config file works: HOSTS is read as PEERS. KNOBS.md
@@ -57,7 +62,8 @@ options "$@"; set -- ${rest[@]+"${rest[@]}"}
 [ $# -gt 0 ] || { usage; exit 0; }
 case $1 in
   glm53) shift ;;
-  *) echo "gr8: the first argument names the model, and the only one is glm53: ./gr8 glm53 <command>" >&2; exit 2 ;;
+  kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;
+  *) echo "gr8: the first argument names the model, and the only one is glm53: ./gr8 glm53 <command> (or ./gr8 kv)" >&2; exit 2 ;;
 esac
 options "$@"; set -- ${rest[@]+"${rest[@]}"}
 [ $# -gt 0 ] || { usage; exit 0; }
