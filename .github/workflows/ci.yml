@@ -221,8 +221,10 @@ jobs:
           cache-from: type=gha,scope=runtime
           cache-to: type=gha,scope=runtime,mode=max
       - name: Smoke test (no GPU)
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          img=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          img=$(echo "$TAGS" | head -1)
           docker image ls "$img"
           docker run --rm --entrypoint bash "$img" -c '
             set -eu
@@ -238,9 +240,12 @@ jobs:
       - name: Push
         id: push
         if: env.PUSH == 'true'
+        # the tags are one per line: through env, not pasted into the script
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          for t in ${{ steps.meta.outputs.tags }}; do docker push "$t"; done
-          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$(echo "${{ steps.meta.outputs.tags }}" | head -1)" | cut -d@ -f2)" >> "$GITHUB_OUTPUT"
+          for t in $TAGS; do docker push "$t"; done
+          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$(echo "$TAGS" | head -1)" | cut -d@ -f2)" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         if: env.PUSH == 'true'
         with:
