@@ -33,15 +33,14 @@
 //                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
 //                     Under S2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
-//      [--serve DIR]  serve requests; --prompt is ignored. A DEC_S2 build (every TP) always serves through S2 (below); any
-//                     other build one request at a time: DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h)
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)
-//      [--s2-port N [--s2-sessions S] [--s2-epoch E]]  S2 serving (DEC_S2 + G6_CP build, with --serve DIR): up to S sessions
-//                     share decode steps (runs of at most G6_S2_BELOW rows, default G6_CP_R), a longer request runs alone at
-//                     base 0 of the pool (s2/pool.h); requests over the control sockets (s2/service.h, head = rank 0 on the
-//                     bootstrap address, port N); DIR is this rank's fresh S2 directory (cmd.<n> / req.<n> / resp.<n>,
-//                     ready.s2, status.s2). Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3.
+//      [--serve DIR --s2-port N [--s2-sessions S] [--s2-epoch E]]  serve requests through S2 (a G6_CP build); --prompt is
+//                     ignored. Up to S sessions share decode steps (runs of at most G6_S2_BELOW rows, default G6_CP_R), a
+//                     longer request runs alone at base 0 of the pool (s2/pool.h); requests over the control sockets
+//                     (s2/service.h, head = rank 0 on the bootstrap address, port N); DIR is this rank's fresh S2 directory
+//                     (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2). Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3.
+//                     Without --serve the --prompt sequences run once and the process exits.
 //      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident from tools/convert/pairpack.py; or
 //                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
 //      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
@@ -61,21 +60,21 @@
 //                     Needs --mtp or --dflash-manifest. Under S2: the DFlash2 sessions' policy (needs --dflash-manifest).
 //      [--set-id HEX]  the model set id from ./gr8 glm53 up (tools/launch/modelset.py). Under S2 it joins the bootstrap
 //                     agreement, so ranks loaded from different model sets refuse to start. Otherwise unused.
+#ifndef DEC_S2
+#error "g6m4 needs a DEC_S2 build (scripts/build.sh defines it at every TP)"
+#endif
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
 #include "prefill.cuh"
 #include "dflash.cuh"
-#include "serve.h"
 #include "prefix_reuse.h"
 #include "reuse_poison.cuh"
 #include "reuse_hdump.cuh"
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
-#ifdef DEC_S2
 #include "s2/native.cuh"
 #include "s2/pool.h"
-#endif
 
 using namespace g6rt;
 
@@ -119,9 +118,8 @@ int main(int argc, char** argv)
     int MP = 0, top = 0;
     bool wide = false, pfv2 = false;
     int pfrows = 0, mtp = 0, lanes = 1;
-    std::string serve;
     int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
-    std::string s2dir;                  // a DEC_S2 build serves --serve DIR through S2 (below R)
+    std::string s2dir;                  // --serve DIR: serve through S2 (below R)
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
     int s2port = 0, s2sess = 8;
     unsigned long long s2epoch = 1;
@@ -175,7 +173,7 @@ int main(int argc, char** argv)
         else if (a == "--pf-rows") pfrows = atoi(next().c_str());
         else if (a == "--mtp") mtp = atoi(next().c_str());
         else if (a == "--pf-lanes") lanes = atoi(next().c_str());
-        else if (a == "--serve") serve = next();
+        else if (a == "--serve") s2dir = next();
         else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
         else if (a == "--top-p-cands") nc = atoi(next().c_str());
         else if (a == "--spec-accept")
@@ -208,9 +206,6 @@ int main(int argc, char** argv)
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1.." + std::to_string(MX));
     if (mtp < 0 || mtp > std::min<int>(MX - 1, 7)) die("--mtp must be 1..7 drafts");   // the scheduler caps k at 7 whatever MX is
     if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
-#ifdef DEC_S2
-    s2dir.swap(serve);                  // a DEC_S2 build always serves through S2; serve stays the one-request loop's
-#endif
     const bool s2mode = !s2dir.empty();
     const bool dfl = !dfl_man.empty();
     // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
@@ -253,7 +248,7 @@ int main(int argc, char** argv)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
         plans.push_back(p);
     }
-    if (!serve.empty() || s2mode || reuse_prefix)   // any prompt (reuse changes the offline prompt-step row counts too): 1..chunk
+    if (s2mode || reuse_prefix)         // any prompt (reuse changes the offline prompt-step row counts too): 1..chunk
         for (int M = 1; M <= plan.chunk; ++M)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     std::vector<int> draft_rows;        // row counts of first-form draft passes: the prompt steps' and 1..K+1
@@ -511,9 +506,7 @@ int main(int argc, char** argv)
     auto cp_pf_err = [&]() -> unsigned { return qp_err(); };   // the qp wire's error word (G6_PF_QP_ROLL)
 #endif
     FILE* rlf = R == 0 ? route_log_open(m) : nullptr;     // G6_ROUTE_LOG=<file> (measurement, MTP main steps)
-#ifdef DEC_S2
     if (s2mode && R == 0 && getenv("G6_S2_ROUNDLOG") && *getenv("G6_S2_ROUNDLOG") == '1') route_log_alloc(m);   // route copies for the "# s2_round" lines (s2/native.cuh)
-#endif
     m.graph = graph; m.in = in; m.out = out;
     Prefill P;
     g6::FabricDev fp{};
@@ -578,7 +571,6 @@ int main(int argc, char** argv)
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
     }
-#ifdef DEC_S2
     // S2: below R on the CP binding. Session views on the pool, main and draft; today's graphs below
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
     int s2_below = 0;
@@ -596,7 +588,6 @@ int main(int argc, char** argv)
         s2_init(D.d, s2sess, st);
         m.s2on = D.d.s2on = false;
     }
-#endif
     u64 ls0 = 1;
     double pf_ms = 0;
     long pf_rows = 0;
@@ -685,11 +676,10 @@ int main(int argc, char** argv)
     if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u%s\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed,
                       plan.rs ? ", spec-accept rejection" : "");
 
-#ifdef DEC_S2
     if (s2mode)
     {
-        // S2 below R served loop (replaces the request loop below). Pool: logical capacity = cap (a past-R request alone at
-        // base 0 reads the table as built), runs below R placed in the physical pages every rank and model has.
+        // S2 below R served loop. Pool: logical capacity = cap (a past-R request alone at base 0 reads the table as
+        // built), runs below R placed in the physical pages every rank and model has.
         g6s2::Config sc;
         sc.epoch = s2epoch;
         sc.pool_rows = (uint32_t)(cap / 64 * 64);
@@ -697,12 +687,12 @@ int main(int argc, char** argv)
         sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>((uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk));
         sc.max_sessions = (uint32_t)s2sess;
         sc.mtp = (uint32_t)mtp;
-        if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the plain build's cap rule
+        if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the offline loop's cap rule
         sc.prefill_rows = (uint32_t)MP;
         sc.two_lanes = two;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
-        // the plain build's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
+        // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
         // and NOEND (G6_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
         if (reuse_prefix)
         {
@@ -747,7 +737,7 @@ int main(int argc, char** argv)
                 if (ex) { s2_solo_built(m); s2_solo_built(D.d); }
                 else { const std::vector<int> run = pool.list(sl.run); s2_solo_pages(m, run); s2_solo_pages(D.d, run); }
                 m.s2_pf_table = D.d.s2_pf_table = !ex;
-                // OWN=4: the serve loop's per-request rule (prompt + gen against the QO key table). The CP staging pool holds
+                // OWN=4: the offline loop's per-request rule (prompt + gen against the QO key table). The CP staging pool holds
                 // S2 prefill rows by position, and the run's pages never reach the QO prepass.
                 if (pf_qp)
                 {
@@ -756,7 +746,7 @@ int main(int argc, char** argv)
                     fprintf(stderr, "# rank %d: s2 request %llu prompt %u ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d)\n", R,
                             (unsigned long long)sl.req.id, sl.req.prompt_tokens, ctx, on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx);
                 }
-                if (dfl && DF.pf_feat && sl.req.id != dfl_req)   // a request's first prefill quantum: as the plain build per request
+                if (dfl && DF.pf_feat && sl.req.id != dfl_req)   // a request's first prefill quantum: as the offline loop per sequence
                 {
                     dfl_req = sl.req.id;
                     DF.pf_hi = (int)sl.req.prompt_tokens - 1; DF.pf_lo = std::max(0, DF.pf_hi - dfl::WIN);
@@ -828,7 +818,7 @@ int main(int argc, char** argv)
                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
-                h.dispatch.dfl_start = [&](int q) {    // the fill steps of g6m4's serve loop: Dfl::pf_feat -> the ring
+                h.dispatch.dfl_start = [&](int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
                     if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
                     const auto t0 = std::chrono::steady_clock::now();
                     for (int c0 = DF.pf_lo; c0 < DF.pf_hi; c0 += dfl::B)
@@ -897,7 +887,6 @@ int main(int argc, char** argv)
             exit(3);
         }
     }
-#endif
     u64 step0 = 0, dstep = 0;
     MtpStats mtp_stats;
     int mtp_steps = 0;
@@ -927,38 +916,12 @@ int main(int argc, char** argv)
     }
     if (R == 0 && (!hd.dir.empty() || hd.zscratch))
         fprintf(stderr, "# reuse diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
-    Emitter em;
-    PfTimes pt;                         // G6_PF_TIMES=1 (serve.h)
     boot("ready");
-    if (!serve.empty()) serve_ready(serve);
-    for (size_t q = 0; !s2mode; ++q)
+    for (size_t q = 0; !s2mode && q < plans.size(); ++q)   // offline: each --prompt once
     {
-        Plan sp;
-        if (serve.empty())
-        {
-            if (q >= plans.size()) break;
-            sp = plans[q];
-        }
-        else
-        {
-            ServeReq rq;
-            if (!serve_next(serve, q, glue::VOCAB, rq)) break;
-            pt.start(serve + "/req." + std::to_string(q));
-            sp = plan;
-            sp.prompt = rq.prompt; sp.n_gen = rq.n_gen; sp.seed = rq.seed;
-            sp.inv_temp = rq.temp > 0.f ? 1.f / rq.temp : 0.f;
-            sp.top_p = rq.top_p;
-            sp.lp = rq.lp; sp.plp = rq.plp;
-            em.open(serve, q, R == 0, rq);
-            if (sp.prompt.empty() || sp.n_gen < 1 || (long long)sp.prompt.size() + sp.n_gen + 2LL * K > cap)
-            {
-                em.end("error", 0, 0, 0, nullptr);
-                continue;
-            }
-            if (MP) sp.first = sp.plp >= 0 ? 0 : (int)sp.prompt.size() - 1;   // prompt logprobs: every prompt row is a decode-step row
-        }
-        // Never skip into a teacher-forced scoring tail (--pf-rows, prompt logprobs). Without tensor prefill, the
-        // decode prompt steps start directly at skip.
+        Plan sp = plans[q];
+        // Never skip into a teacher-forced scoring tail (--pf-rows). Without tensor prefill, the decode prompt steps
+        // start directly at skip.
         const int old_end = reuse.written_end, old_dirty = reuse.dirty_end;   // dirty: every row written since the last reset
         const int skip = reuse_prefix ? reuse.begin(sp.prompt, MP ? sp.first : (int)sp.prompt.size() - 1, mtp > 0) : 0;
         if (skip > sp.first) sp.first = skip;
@@ -971,8 +934,6 @@ int main(int argc, char** argv)
                     on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx);
         }
         const int PS = prompt_steps(p), NS = total_steps(p);
-        if (serve.empty()) pt.start("");
-        else pt.lap("open");
         if (!skip)
         {
             reset(m, st);
@@ -996,7 +957,6 @@ int main(int argc, char** argv)
             if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
         }
         G6RT_CK(cudaStreamSynchronize(st));
-        pt.lap("reset");
         printf("seq %zu prompt %zu tokens\n", q, p.prompt.size());
         if (reuse_prefix && R == 0)         // every miss with its reason (first / strict / no-lcp / short), counted by the gate
             fprintf(stderr, "# reuse seq %zu %s retained %d lcp %d history %zu prompt %zu written_end %d dirty_end %d\n", q, reuse.why, skip,
@@ -1013,10 +973,8 @@ int main(int argc, char** argv)
                 for (int r = 0; r < MA + MB; ++r) pos[r] = a + r;
                 pf_inputs(P, MA, p.prompt.data() + a, pos.data());
                 pf_inputs(P2, MB, p.prompt.data() + a + MA, pos.data() + MA);
-                pt.lap("inputs_h2d");
                 pf_enqueue(fabp, P, ls0, NL, MA);
                 pf_enqueue(fabp2, P2, ls0b, NL, MB);
-                pt.lap("fabric_enqueue");
                 const auto t0 = std::chrono::steady_clock::now();
                 cp_pf_in();
                 if (pf_streams) pf_step2s(m, P, P2, MA, MB, a + MA, a + MA + MB, ls0, ls0b, st, lanes2);
@@ -1024,7 +982,6 @@ int main(int argc, char** argv)
                 cp_pf_out();
                 G6RT_CK(cudaStreamSynchronize(st));
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                pt.lap("prefill");
                 ls0 += NL; ls0b += NL;
                 if (mtp)
                 {
@@ -1036,14 +993,12 @@ int main(int argc, char** argv)
                     G6RT_CK(cudaStreamSynchronize(st));
                     if (const unsigned ae = attn_errors(D.d)) { fprintf(stderr, "g6m4: rank %d MTP layer attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
                 }
-                pt.lap("draft_prefill");
                 if (*fp.error || *fp2.error || cp_pf_err()) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x / %08x (CP staging / qp wire %08x), seq %zu rows %d..\n", R, *fp.error, *fp2.error, cp_pf_err(), q, a); return 3; }
                 if (const unsigned ae = attn_errors(m)) { fprintf(stderr, "g6m4: rank %d attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
                 printf("prefill rows %d..%d resid %016llx\n", a, a + MA - 1, (unsigned long long)pf_hash(P, MA));
                 printf("prefill rows %d..%d resid %016llx\n", a + MA, a + MA + MB - 1, (unsigned long long)pf_hash(P2, MB));
                 fprintf(stderr, "# seq %zu prefill %d + %d rows (two lanes): %.3f ms (%.0f tok/s)\n", q, MA, MB, ms, (MA + MB) * 1000.0 / ms);
                 if (reuse_prefix) reuse.prefill_rows(a, MA + MB, mtp > 0);
-                pt.lap("checks_hash");
                 if (q > 0 || a > 0) { pf_ms += ms; pf_rows += MA + MB; }
                 a += MP;
                 continue;
@@ -1096,10 +1051,8 @@ int main(int argc, char** argv)
             fprintf(stderr, "# seq %zu dflash prompt context %d..%d: %.1f ms\n", q, DF.pf_lo, DF.pf_hi - 1,
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             dfl_lo = DF.pf_lo;
-            pt.lap("dflash_context");
         }
         // MTP / DFlash after the prefill loop (as in m4sim): prompt rows past p.first go through their sequence's prompt steps
-        LpStep lpm;                     // logprobs of the last target step (--serve with lp / plp)
         auto rm = [&](const StepIn& si, int s, double& ms) {
             const int M = si.M;
             *in = si;
@@ -1122,23 +1075,9 @@ int main(int argc, char** argv)
             std::string line;
             step_line(m, so, s, M, line);
             printf("%s\n", line.c_str());
-            if (top > 0 && (!em.on || p.lp >= 0 || p.plp >= 0)) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
-            if (em.on && (p.lp >= 0 || p.plp >= 0))
-            {
-                lp_fetch(m, so, si, lpm);
-                for (int r = 0; r < M && p.plp >= 0; ++r)
-                    if (si.tgt[r] >= 0) em.push_prompt(si.pos[r] + 1, lp_row(lpm, r, true, p.plp));
-            }
+            if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
             fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, dt);
             return so;
-        };
-        // emit (--serve): k committed tokens from rows row0.. of the last target step, with their logprobs when asked
-        std::function<bool(const int*, int, int)> emit;
-        if (em.on) emit = [&](const int* t, int k, int row0) {
-            pt.first_token(q);
-            LpRow rows[MX];
-            for (int i = 0; p.lp >= 0 && i < k; ++i) rows[i] = lp_row(lpm, row0 + i, false, p.lp);
-            return em.push(t, k, p.lp >= 0 ? rows : nullptr);
         };
         if (dfl)
         {
@@ -1163,13 +1102,11 @@ int main(int argc, char** argv)
                 fprintf(stderr, "# seq %zu dflash %s %d: %.3f ms\n", q, di.query ? "draft" : "context", s, dt);
                 return so;
             };
-            pt.lap("pre_decode");
-            const std::vector<int> gen = dflash_sequence(p, step0, dstep, rm, rf, mtp_stats, mtp_steps, dfl_lo, emit, dfl_k, &spec);
+            const std::vector<int> gen = dflash_sequence(p, step0, dstep, rm, rf, mtp_stats, mtp_steps, dfl_lo, {}, dfl_k, &spec);
             if (dfl_dump) { std::vector<int> all = p.prompt; all.insert(all.end(), gen.begin(), gen.end()); dfl_dump_tokens(dfl_dump, all); }
             printf("generated");
             for (int t : gen) printf(" %d", t);
             printf("\n");
-            em.end(nullptr, mtp_stats.rounds, dfl_k, mtp_stats.tokens, mtp_stats.acc, mtp_stats.drafted);
             continue;
         }
         if (mtp)
@@ -1196,16 +1133,14 @@ int main(int argc, char** argv)
                 fprintf(stderr, "# seq %zu %s %d M %d: %.3f ms\n", q, chain ? "chain" : "draft", s, M, dt);
                 return DraftOut{t, so.lp[M - 1]};
             };
-            pt.lap("pre_decode");
-            const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, mtp_steps, emit, &spec);
+            const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, mtp_steps, {}, &spec);
             printf("generated");
             for (int t : gen) printf(" %d", t);
             printf("\n");
-            if (reuse_prefix) reuse.finish(p.prompt, gen, em.on ? em.emitted : (int)gen.size(), true);
-            em.end(nullptr, mtp_stats.rounds, mtp, mtp_stats.tokens, mtp_stats.acc, mtp_stats.drafted);
+            if (reuse_prefix) reuse.finish(p.prompt, gen, (int)gen.size(), true);
             continue;
         }
-        int last_tok = 0, ns_run = NS;
+        int last_tok = 0;
         std::vector<int> gen;
         for (int s = 0; s < NS; ++s)
         {
@@ -1232,29 +1167,13 @@ int main(int argc, char** argv)
             if (reuse_prefix) reuse.main_rows(in->pos[0], M);
             last_tok = step_line(m, so, s, M, line);
             printf("%s\n", line.c_str());
-            if (top > 0 && (!em.on || p.lp >= 0 || p.plp >= 0)) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
-            LpStep lps;
-            if (em.on && (p.lp >= 0 || p.plp >= 0))
-            {
-                lp_fetch(m, so, *in, lps);
-                for (int r = 0; r < M && p.plp >= 0; ++r)
-                    if (in->tgt[r] >= 0) em.push_prompt(in->pos[r] + 1, lp_row(lps, r, true, p.plp));
-            }
-            const LpRow lrow = p.lp >= 0 && s >= PS - 1 ? lp_row(lps, M - 1, false, p.lp) : LpRow();
+            if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
             if (s >= PS - 1) gen.push_back(last_tok);
-            if (s >= PS - 1 && em.on) pt.first_token(q);
-            if (s >= PS - 1 && em.on && em.push(&last_tok, 1, p.lp >= 0 ? &lrow : nullptr))
-            {
-                fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, ms);
-                ns_run = s + 1;
-                break;
-            }
             fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, ms);
             if (s >= PS + 2) t1.push_back(ms);
         }
-        step0 += ns_run;
-        if (reuse_prefix) reuse.finish(p.prompt, gen, em.on ? em.emitted : (int)gen.size(), false);
-        em.end(nullptr, 0, 0, 0, nullptr);
+        step0 += NS;
+        if (reuse_prefix) reuse.finish(p.prompt, gen, (int)gen.size(), false);
         printf("generated");
         for (int t : gen) printf(" %d", t);
         printf("\n");

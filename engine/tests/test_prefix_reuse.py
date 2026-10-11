@@ -30,7 +30,7 @@ class PrefixReuseTests(unittest.TestCase):
         self.assertIn('reuse_prefix = false;', s)
         self.assertLess(s.index('reuse.begin(sp.prompt'), s.index('const int PS = prompt_steps(p)'))
         self.assertIn('reuse.begin(sp.prompt, MP ? sp.first : (int)sp.prompt.size() - 1, mtp > 0)', s)
-        self.assertIn('if (!serve.empty() || s2mode || reuse_prefix)', s)   # prompt-step row counts 1..chunk
+        self.assertIn('if (s2mode || reuse_prefix)', s)   # prompt-step row counts 1..chunk
         self.assertIn('for (int a = skip; a < p.first; a += MP)', s)
         # the reuse grid is ONE sub-batch (MP = --prefill = 4096 served), not 2 * MP
         self.assertIn('reuse.grid = al_ == 1 ? MP : 0;', s)
@@ -52,10 +52,8 @@ class PrefixReuseTests(unittest.TestCase):
         self.assertLess(pos, s.index('for (int a = skip; a < p.first; a += MP)'))
         self.assertIn('reuse_poison_on = po_ == 1;', s)
         for mtp in [True, False]:
-            call = 'reuse.finish(p.prompt, gen, em.on ? em.emitted : (int)gen.size(), ' + str(mtp).lower() + ');'
-            pos = s.index(call)
-            self.assertLess(pos, s.index('em.end(', pos))
-        # the one-request loop refuses DFlash2 with reuse (the drafter's prompt taps come from the prefill a hit
+            self.assertIn('reuse.finish(p.prompt, gen, (int)gen.size(), ' + str(mtp).lower() + ');', s)
+        # the offline loop refuses DFlash2 with reuse (the drafter's prompt taps come from the prefill a hit
         # skips); S2 keeps retired runs in its pool (s2/pool.h) and gives DFlash2 only to a session that owns them
         self.assertIn('if (reuse_prefix && dfl && !s2mode) die(', s)
         self.assertNotIn('if (reuse_prefix && s2mode) die(', s)

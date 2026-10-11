@@ -5,22 +5,23 @@ machine passes `engine/tests/test_prefix_reuse.{cpp,py}`. Nothing here has run o
 W44-style check that proves the two claims the old line measured: **a hit's output is the cold run's bit for bit**, and
 **a hit's TTFT is far below cold's**.
 
-## One boot, four requests
+## One run, four prompts
 
-Boot the six ranks as the normal TP6 serve, with two additions to the `g6m4` line:
+Run `g6m4` on the six ranks with the TP6 engine line but without `--serve` (the offline loop runs each `--prompt` once,
+in order, and exits), with these additions:
 
 - the flag `--reuse-prefix`
 - the env `G6_REUSE_ALIGN=1`
+- `--gen 32 --temp 0` and four `--prompt @<file>` arguments, the prompts below in order
 
-and keep `--prefill 4096 --pf-lanes 2 --mtp K --graph`. `--cap` must hold `20001 + 32 + 2K`. Rank 0 must print at boot
+and keep `--prefill 4096 --pf-lanes 2 --mtp K --graph`. `--cap` must hold `20001 + 32 + 2K`. Rank 0 must print at start
 
 ```
 # reuse grid 4096 rows (--prefill 4096, lanes 2)
 ```
 
-Build one id corpus `P` of 20001 ids (any text; the old line used 8 seeded head ids + the KAT corpus, cycled). Write
-four requests into ONE `--serve` directory, in this order, each `n_gen 32 temp 0`, and wait for each `resp.<n>`'s
-`end` line before writing the next:
+Build one id corpus `P` of 20001 ids (any text; the old line used 8 seeded head ids + the KAT corpus, cycled). The four
+prompts:
 
 | n | arm | prompt ids | what it is |
 |---|-----|-----------|------------|
@@ -41,15 +42,14 @@ Read rank 0's stderr for the four `# reuse seq ...` lines and the ranks' stdout 
    (`grid = MP`) is in the binary; a grid-8192 build would retain 8192 and fail.
    The second line for the same seq must read `# reuse seq 1 grid 4096 raw 14000 retained 12288`.
 2. **C is cold.** `# reuse seq 3 no-lcp retained 0 ...` (and seq 2 likewise `no-lcp retained 0`).
-3. **Bitwise-equal output.** `resp.1`'s `t` ids == `resp.3`'s `t` ids, and the two `end` lines match
-   (`stop|length`, stop id, completion tokens).
+3. **Bitwise-equal output.** seq 1's `generated` line equals seq 3's.
 4. **Bitwise-equal rows.** On EVERY rank, seq 1's and seq 3's stdout must agree:
    - every `prefill rows a..b resid X` line with `a >= 12288` is identical between the two seqs, and
    - the two seqs have the same number of `step ...` lines (and `draft` / `chain` lines) and each one is identical.
    Seq 1 has `reuse rows 0..12287` and no prefill lines below 12288; that is the only allowed difference.
 5. **TTFT.** H's time to first token must be far below C's. The old line measured -65% over 14 requests
-   (53.8 s vs 155.6 s at `--prefill 4096 --pf-lanes 2`). Take the number from the front end, or boot with
-   `G6_PF_TIMES=1` and read the `req.1` / `req.3` lap lines.
+   (53.8 s vs 155.6 s at `--prefill 4096 --pf-lanes 2`). Add up rank 0's `# seq 1 prefill ...` times and compare
+   them with seq 3's.
 6. **No fabric or attention error words** on any rank, and `rc 0` on all six.
 
 Any line unreadable or missing = FAIL. The check is fail-closed: a boot that does not print the grid line is not

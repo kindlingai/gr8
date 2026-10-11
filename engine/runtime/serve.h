@@ -1,13 +1,13 @@
-// --serve DIR (g6m4 and m4sim): requests come as files, rank 0 streams the committed tokens to a file; the front-end
-// shim (frontend/g6shim.py) turns that into PROTOCOL.md frames. Every rank reads the same request file and runs the
-// same steps; only rank 0 writes.
+// The request file and the response lines. m4sim --serve DIR reads requests one at a time with serve_next. S2
+// (g6m4 --serve, s2/sessions.h) parses the same request format itself and writes the same response lines through
+// Emitter, plus its own `a` line (frontend/g6s2shim.py describes the S2 files).
 //   DIR/req.<n>  (written atomically: req.<n>.tmp then rename), two lines:
 //       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>] [lp <k>] [plp <k>]
 //       (lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
 //        A request with plp is run as decode steps from its first token, no prefill path: the shim limits its length.)
 //       <prompt ids, comma-separated>
 //   DIR/quit     ends the loop
-//   DIR/ready    (every rank) written once the model is loaded, before the first request is read
+//   DIR/ready    written once the model is loaded, before the first request is read
 //   DIR/resp.<n> (rank 0, one flushed line per event):
 //       l <lp> <rank> <n> <id>:<lp> ..                   with lp: one line per token of the next t line, before it
 //                                                        (lp: logprob of the token; rank: 1 = best, -1 = beyond the top 20;
@@ -111,7 +111,7 @@ inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
     {
         long k;
         if (w[i] == "top_p") { if (!real(w[i + 1], &r.top_p)) r.top_p = 0.f; }
-        // the shim never sends k > LP_MAX (g6shim.py ENGINE_MAX_LP); clamping is a backstop
+        // the shim never sends k > LP_MAX; clamping is a backstop
         else if (w[i] == "lp") r.lp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
         else if (w[i] == "plp") r.plp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
         else break;
