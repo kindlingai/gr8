@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-11: CI builds everything on GitHub's runners
+
+- The engine job builds on GitHub's hosted arm64 runner, so `ghcr.io/kindlingai/gr8` is published from every push to
+  main and every tag again. The self-hosted runner, its fork-refusal hook and the `GR8_ARM_RUNNER` / `GR8_NATIVE`
+  switches are gone. Pull requests from forks now build the engines and the image too (never pushed).
+- `docker/.env.example` and `--variant`'s help name the current defaults (`bit225` at TP=3) and every variant.
+
 ## 2026-10-11: S2 sessions take KV pages as they need them
 
 - A session below R starts with the pages for its prompt, the token after it and the guard, and takes one more page

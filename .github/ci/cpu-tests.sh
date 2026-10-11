@@ -22,7 +22,6 @@ g++ -O2 -std=c++17 -I engine/kernels engine/tests/test_topk.cpp -o "$T/test_topk
 g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_request_test.cpp -o "$T/control_request_test"
 "$T/control_request_test"
 g++ -std=c++17 -O1 -fsanitize=address,undefined -I engine/runtime engine/runtime/tests/serve_parse_test.cpp -o "$T/serve_parse_test"
-.github/ci/runner/test_refuse_forks.sh   # the self-hosted runner's hook that refuses fork pull requests
 "$T/serve_parse_test"
 g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_idle_test.cpp -o "$T/control_idle_test"
 "$T/control_idle_test"     # the socketpair cases. The silent-peer case needs a network namespace.

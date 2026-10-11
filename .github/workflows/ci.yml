@@ -1,15 +1,10 @@
 # CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# The Rust binaries (the loader and the front end) build on GitHub's hosted arm64 runner, for every pull request, forks
-# included. The engine job runs on GR8_ARM_RUNNER (a repository variable, default ubuntu-24.04-arm). GR8_NATIVE=1 (a
-# repository variable) builds the engines on the runner itself, for a self-hosted runner with the CUDA 13 toolchain and
-# no Docker daemon, linking the Rust job's loader. A pull request from a branch in this repository also builds the
-# engines and the image. One from a fork runs only the CPU tests and the Rust build, on hosted runners. That `if:` does
-# not keep fork code off the self-hosted runner, because a fork's pull request runs the fork's own copy of this file:
-# the runner's job-started hook (.github/ci/runner/refuse-forks.sh) refuses those jobs, and the repository requires
-# approval before an outside contributor's workflow runs at all. The image job assembles the runtime image from the
-# engine job's binaries on a hosted runner, and only it can write packages.
+# Every job runs on GitHub's hosted runners, for every pull request, forks included. The engine job builds the
+# Dockerfile's dist stage on the arm64 runner (no GPU is needed to compile). The image job assembles the runtime image
+# from the engine job's binaries, and only it can write packages: it pushes from main and from tags, never from a pull
+# request.
 name: ci
 
 on:
@@ -77,56 +72,17 @@ jobs:
 
   engine:
     name: Engine build (arm64, CUDA 13, sm_121a)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    needs: rust
-    runs-on: ${{ vars.GR8_ARM_RUNNER || 'ubuntu-24.04-arm' }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
-        if: vars.GR8_NATIVE == '1'
-        with:
-          name: rust-bin-arm64
-          path: rust-dist
-      - name: Build the binaries on the runner (GR8_NATIVE)
-        if: vars.GR8_NATIVE == '1'
-        # the Dockerfile's dist stage, without Docker: the TP=4, TP=6 and TP=3 engines, linking the Rust job's loader
-        # and page allocator. build.sh runs cargo whenever it finds it, which would rebuild them, so cargo is off the
-        # PATH here.
-        run: |
-          set -eux
-          mkdir -p engine/loader-rs/target/release
-          cp rust-dist/libg6load.a engine/loader-rs/target/release/
-          mkdir -p engine/kvman-rs/target/release
-          cp rust-dist/libg6kvman.a engine/kvman-rs/target/release/
-          install -m 755 rust-dist/g6load engine/loader-rs/target/release/
-          PATH=$(printf %s "$PATH" | tr ':' '\n' | grep -v cargo | paste -sd: -)
-          if command -v cargo; then echo "cargo is still on the PATH"; exit 1; fi
-          mkdir -p build-front && install -m 755 rust-dist/g6front-rs build-front/
-          G6_NR=4 scripts/build.sh "$PWD/build-tp4"
-          scripts/build.sh "$PWD/build-tp6"
-          G6_NR=3 scripts/build.sh "$PWD/build-tp3"
-          mkdir -p dist/bin dist/bin6 dist/bin3
-          cp build-tp4/g6m4 build-tp4/m4sim build-tp4/gpuprobe build-tp4/tr3_e4m3_test build-front/g6front-rs dist/bin/
-          cp build-tp6/g6m4 build-tp6/m4sim build-tp6/gpuprobe build-tp6/tr3_e4m3_test dist/bin6/
-          cp engine/loader-rs/target/release/g6load dist/bin/
-          cp engine/loader-rs/target/release/g6load dist/bin6/
-          cp build-tp3/g6m4 build-tp3/m4sim build-tp3/gpuprobe build-tp3/tr3_e4m3_test engine/loader-rs/target/release/g6load dist/bin3/
       - name: Free disk space
-        if: vars.GR8_NATIVE != '1'
         # the CUDA devel image is about 10 GB unpacked
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
-      - name: QEMU (x86 runner only)
-        if: runner.arch != 'ARM64' && vars.GR8_NATIVE != '1'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3.7.0
-        with:
-          platforms: arm64
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
-        if: vars.GR8_NATIVE != '1'
       - name: Build the binaries (Dockerfile target dist)
-        if: vars.GR8_NATIVE != '1'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
