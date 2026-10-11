@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-11: a remote KV page store, and `./gr8 kv` to run its node
+
+- `./gr8 kv up --gb N` locks N GiB on a box with spare memory and serves it as KV page blocks (`kvman-remote`). It
+  joins the mentat group as an agent without GPUs, with the service `gr8-kv`. `down`, `status` (`status all` for every
+  node in the group) and `logs` work as for the model. KNOBS.md lists its options.
+- Clients reach a node over RDMA (one-sided reads and writes) where both ends have a RoCE v2 address, over TCP
+  otherwise. Each client holds a named lease, and the NIC refuses its QPs any other lease's memory.
+- The engine does not use it yet. `engine/kvman-rs/REMOTE-TIER.md` has the numbers: 14.0 GB/s per PCIe root over a
+  direct cable and 3.8 us for one row, against 5.7-7.0 GB/s and 43 us on the box's NVMe, and 1.18 GB/s over a 10G LAN.
+  The same file has the plan for spilling evicted retained runs to either store.
+- `kvman-remote-bench` reports what a lease moves from a client box, and how fast.
+
 ## 2026-10-11: the engine is called gr8 in the docs
 
 - The README opens with "gr8: a super-fast local AI engine". Docs, comments, error messages and the API's `owned_by`

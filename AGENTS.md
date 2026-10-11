@@ -38,7 +38,7 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | test | where | command |
 |---|---|---|
 | S2 batch planner, control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
-| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
+| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
 | row budget, S2 attention, decode heads | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |
@@ -47,7 +47,7 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |
 | a rank image planned from the release (`--v2-dense`) against an independent derivation | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py` |
 | m4sim from the release against a PyTorch forward of the same weights | one GB10, transformers with `glm_moe_dsa` | `engine/ref/release_forward.py` |
-| the launch: options, model sets, handshake, mentat | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
+| the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`) | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
 | the launch end to end (four supervisors, stub engines) | Linux (it needs 127.0.0.2-4) | the line above runs it, and skips it elsewhere |
 
 A kernel or anything else that changes numerics gets an exactness or tolerance test against the path it replaces, and
