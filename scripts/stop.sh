@@ -3,7 +3,7 @@
 set -u
 . "$(dirname "$0")/common.sh"
 for p in front shim; do [ -f "$G6_HOME/out/$p.pid" ] && kill "$(cat "$G6_HOME/out/$p.pid")" 2>/dev/null; done
-for ((r = 0; r < NRANK; r++)); do on $r "touch $G6_HOME/serve/quit $G6_HOME/s2/quit 2>/dev/null" & done; wait   # each rank leaves its serve (or S2) loop
+for ((r = 0; r < NRANK; r++)); do on $r "touch $G6_HOME/s2/quit 2>/dev/null" & done; wait   # each rank leaves its S2 loop
 sleep 10
 for ((r = 0; r < NRANK; r++)); do
   on $r "p=\$(cat $G6_HOME/out/g6m4.pid 2>/dev/null); [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null && kill \$p; echo rank $r stopped" &

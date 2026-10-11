@@ -240,7 +240,6 @@ class Supervisor:
         self.stop_failed = False      # the stop is a failure (exit 1): a rank failed, here or elsewhere
         self.head = None              # handshake.Head on rank 0
         self.head_ready = threading.Event()
-        self.ready_ranks = set()
         self.engine = None
         self.helpers = {}             # the head's front end and shim: name -> Popen
         self.agent = self.api_agent = None
@@ -311,11 +310,8 @@ class Supervisor:
         if t == 'abort':
             self.request_stop(f'rank {m.get("rank")} ({peer}) failed: {m.get("why")}', all_boxes=True)
             return {'t': 'ok'}
-        if t == 'ready':
-            self.ready_ranks.add(m.get('rank'))
-            return {'t': 'ok'}
         if t == 'serving':
-            if self.state in ('loading', 'ready'):
+            if self.state == 'loading':
                 self.set_state('serving')
                 log(f'the head serves {m.get("url")}')
             return {'t': 'ok'}
@@ -521,9 +517,8 @@ class Supervisor:
         if not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
-            if self.tmpl['s2'] or o.get('FRONT') == 'rs':
-                if not os.access(self.front_bin(), os.X_OK):
-                    fails.append(f'no {self.front_bin()}: ./gr8 glm53 build (or scripts/build_front.sh bin/)')
+            if not os.access(self.front_bin(), os.X_OK):
+                fails.append(f'no {self.front_bin()}: ./gr8 glm53 build (or scripts/build_front.sh bin/)')
             if not os.access(self.py(), os.X_OK):
                 fails.append(f'no {self.py()} for the shim: python3 -m venv {self.home}/venv && '
                              f'{self.home}/venv/bin/pip install -r frontend/requirements.txt')
@@ -609,13 +604,12 @@ class Supervisor:
         return p
 
     def boot(self):
-        o, hs, r, tp = self.o, self.hs, self.rank, int(self.o.get('TP'))
+        o, hs, r = self.o, self.hs, self.rank
         plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.rank_dir(r), aux_dir=self.ms.rank_dir(r), home=self.home,
                                epoch=hs['epoch'], set_id=self.model_id)
-        work = 's2' if plan['s2'] else 'serve'
-        for d in ('s2', 'serve'):
-            shutil.rmtree(os.path.join(self.home, d), ignore_errors=True)
-        os.makedirs(os.path.join(self.home, work))
+        work = os.path.join(self.home, 's2')
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work)
         env = self.engine_env(plan)
         argv = ['./bin/g6m4', '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
@@ -632,21 +626,17 @@ class Supervisor:
         self.set_state('loading')
         if r == 0:
             self.start_front(plan)
-        ready = os.path.join(self.home, work, 'ready.s2' if plan['s2'] else 'ready')
+        ready = os.path.join(work, 'ready.s2')
         tmo = float(plan['knobs'].get('READY_TMO') or 1800)
-        t0, told, ask_at = time.monotonic(), False, tmo
+        t0, ask_at = time.monotonic(), tmo
         log(f'engine started (epoch {hs["epoch"]}); waiting for it to load (up to {tmo:.0f}s)')
         while True:
             self.watch()
             if r == 0:
-                if os.path.exists(ready) and (plan['s2'] or self.ready_ranks >= set(range(1, tp))):
+                if os.path.exists(ready):
                     break
                 if time.monotonic() - t0 > tmo:
                     raise Stop(1, f'the engines did not load within {tmo:.0f}s')
-            elif not plan['s2'] and not told and os.path.exists(ready):
-                told = True
-                self.tell_head({'t': 'ready', 'rank': r})
-                self.set_state('ready')
             elif self.state == 'serving':
                 break
             elif time.monotonic() - t0 > ask_at and self.head_serves():
@@ -658,7 +648,7 @@ class Supervisor:
             time.sleep(1)
         if r == 0:
             log(f'engines ready after {time.monotonic() - t0:.0f}s')
-            self.start_shim(plan, work)
+            self.start_shim(work)
         self.run_forever()
 
     def start_front(self, plan):
@@ -670,9 +660,7 @@ class Supervisor:
         except FileNotFoundError:
             pass
         front = [self.front_bin()]
-        if not plan['s2'] and (o.get('FRONT') == 'py' or not os.access(self.front_bin(), os.X_OK)):
-            front = [self.py(), '-m', 'g6front']
-        elif o.get('DEFAULT_MAX_TOKENS') != '0':
+        if o.get('DEFAULT_MAX_TOKENS') != '0':
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
         else:   # a request within the limit, guard rows included, shares decode steps: keep a page in hand for the guard
             front += ['--share-tokens', str(int(plan['knobs']['SHARE_LIMIT']) - 64)]
@@ -686,18 +674,13 @@ class Supervisor:
             return ['taskset', '-c', f'0-{cpu - 8}']
         return []
 
-    def start_shim(self, plan, work):
+    def start_shim(self, work):
+        """The shim drives the head's engine directory. The head engine passes requests to the other ranks itself, over
+        its control links."""
         sock = os.path.join(self.home, 'run', 'engine.sock')
-        if plan['s2']:   # the head engine passes requests to the other ranks itself, over its control links
-            argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', os.path.join(self.home, work),
-                    '--sock', sock]
-            if self.o.get('TP') == '6':
-                argv += ['--stall-timeout', '2400']
-        else:            # a build without DEC_S2: every rank's serve dir, the others over ssh
-            dirs = [os.path.join(self.home, work)]
-            dirs += [f'{self.members[r]}:{os.path.join(self.hs["homes"][str(r)], work)}' for r in range(1, len(self.members))]
-            argv = [self.py(), os.path.join(REPO, 'frontend', 'g6shim.py'), '--rank-dirs', *dirs, '--sock', sock,
-                    '--max-model-len', plan['knobs']['CAP'], '--stall-timeout', '2400']
+        argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock]
+        if self.o.get('TP') == '6':
+            argv += ['--stall-timeout', '2400']
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
         for _ in range(150):
             if os.path.exists(sock):
@@ -861,9 +844,8 @@ def stop_local(home, log=log):
     pid = recorded(os.path.join(out, 'g6m4.pid'))
     if not pid:
         return False
-    for d in ('serve', 's2'):
-        if os.path.isdir(os.path.join(home, d)):
-            open(os.path.join(home, d, 'quit'), 'w').close()
+    if os.path.isdir(os.path.join(home, 's2')):
+        open(os.path.join(home, 's2', 'quit'), 'w').close()
     for _ in range(100):
         if not alive(pid):
             break

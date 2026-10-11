@@ -57,9 +57,8 @@ manifest instead.
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
 | `READY_TMO` | 1800 | 1800 | 1800 | seconds to wait for the ranks to load |
-| `FRONT` | rs only | rs only | rs only | front end: `rs` = `bin/g6front-rs`. The Python front end serves no S2 boot |
 | `FRONT_BIN` | `bin/g6front-rs` | same | same | the Rust front end binary |
-| `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim (and the Python front end) |
+| `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim |
 | `S2PORT` | 7341 | 7341 | 7341 | the multi-session control port on the head |
 | `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
 | `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
@@ -84,7 +83,7 @@ manifest instead.
 | `RANK` | `--rank` | none | run | `prepare`: the rank to fetch, when this box cannot tell (mentat mode) |
 | `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
 | `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |
-| `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `serve/`, `run/` |
+| `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `run/` |
 | `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
 | `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |

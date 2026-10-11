@@ -98,8 +98,6 @@ launcher() {
     *) return 1 ;;
   esac
 }
-# s2: whether this boot is the multi-session engine (every boot: TP=4, 6 and 3).
-s2() { [ "$TP" = 4 ] || [ "$TP" = 6 ] || [ "$TP" = 3 ]; }
 api() { echo "http://127.0.0.1:$PORT"; }
 # dflash: whether the TP=4 launcher loads the DFlash2 drafter (DFLASH, default 1).
 dflash() {
@@ -114,7 +112,7 @@ do_check() {
   ok()   { printf '  ok    %-16s %s\n' "$1" "$2"; }
   warn() { printf '  WARN  %-16s %s\n' "$1" "$2"; warns=$((warns + 1)); }
   fail() { printf '  FAIL  %-16s %s\n' "$1" "$2"; fails=$((fails + 1)); }
-  echo "check (TP=$TP, $NRANK hosts, $(s2 && echo 'S2 engine' || echo 'one-request engine'), config $CFG)"
+  echo "check (TP=$TP, $NRANK hosts, config $CFG)"
 
   if [ "$TP" != "$NRANK" ]; then fail TP "TP=$TP but HOSTS names $NRANK boxes"
   elif ! launcher > /dev/null; then fail TP "no launcher for TP=$TP (4, 6 or 3)"
@@ -134,8 +132,7 @@ do_check() {
   done
   [ -z "$missing" ] && ok MODEL_DIR "${MODEL_DIR}" || fail MODEL_DIR "${MODEL_DIR:-unset} lacks$missing (the TR3 checkpoint dir has all four)"
   if [ -x "${FRONT_BIN:-$REPO/bin/g6front-rs}" ]; then ok "front end" "${FRONT_BIN:-$REPO/bin/g6front-rs}"
-  elif s2 || [ "${FRONT:-}" = rs ]; then fail "front end" "no ${FRONT_BIN:-$REPO/bin/g6front-rs}: ./gr8 glm53 build (or scripts/build_front.sh bin/)"
-  else warn "front end" "no ${FRONT_BIN:-$REPO/bin/g6front-rs}: the launcher falls back to the Python front end"; fi
+  else fail "front end" "no ${FRONT_BIN:-$REPO/bin/g6front-rs}: ./gr8 glm53 build (or scripts/build_front.sh bin/)"; fi
   if [ -x "$PY" ]; then ok python "$PY"
   else fail python "no $PY for the shim: ./gr8 glm53 stage creates it (python3 -m venv $G6_HOME/venv && $G6_HOME/venv/bin/pip install -r frontend/requirements.txt)"; fi
   for p in front shim; do
@@ -203,15 +200,15 @@ do_check() {
 # --- status: what the cluster is doing now ------------------------------------------------------------------------
 do_status() {
   local r out code rdy
-  echo "TP=$TP, $NRANK hosts, $(s2 && echo 'S2 engine' || echo 'one-request engine')"
+  echo "TP=$TP, $NRANK hosts"
   for ((r = 0; r < NRANK; r++)); do
-    # The S2 engine writes its ready file on rank 0 only.
-    rdy=1; if s2 && [ "$r" != 0 ]; then rdy=0; fi
+    # The engine writes its ready file on rank 0 only.
+    rdy=1; if [ "$r" != 0 ]; then rdy=0; fi
     out=$(on "$r" "cd $G6_HOME 2>/dev/null || exit 0
       p=\$(cat out/g6m4.pid 2>/dev/null)
       if [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null; then
         echo -n \"engine running (pid \$p)\"
-        if [ $rdy = 0 ]; then :; elif [ -e serve/ready ] || [ -e s2/ready.s2 ]; then echo -n ', ready'; else echo -n ', loading'; fi
+        if [ $rdy = 0 ]; then :; elif [ -e s2/ready.s2 ]; then echo -n ', ready'; else echo -n ', loading'; fi
       else echo -n 'engine stopped'; fi
       echo -n \", MemAvailable \$(awk '/MemAvailable/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo 2>/dev/null) GiB\"
       if ! { [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null; } && [ -s out/g6m4.r$r.err ]; then echo; echo -n \"        last log line: \$(tail -n 1 out/g6m4.r$r.err)\"; fi

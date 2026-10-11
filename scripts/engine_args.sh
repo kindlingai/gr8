@@ -2,15 +2,14 @@
 # the per-box supervisor (tools/launch) source this file, so the ssh launchers and `./gr8 glm53 up` start the same engine. KNOBS.md lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
-#   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP, and S2=1
-#                            (every TP serves through the multi-session engine). An unset CAP follows SHARE_LIMIT, so
-#                            the KV pool keeps the same physical pages per rank (share_cap below)
+#   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP. An unset CAP
+#                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words)
 #   engine_args R RANK_PACKS AUX_PACKS HOME [EPOCH]
 #                            prints the arguments that follow `--proxy-cpu N` for rank R. RANK_PACKS holds
 #                            rank<R>.{manifest.json,pack} (unused with V2_DENSE: the release is the model), AUX_PACKS
 #                            the drafter and QO packs, HOME is G6_HOME
-#                            (the serve/ and s2/ directories), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
+#                            (the s2/ directory), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
 
 # share_cap P: the CAP that gives P physical KV pages per rank at this SHARE_LIMIT. Each rank holds the first
 # SHARE_LIMIT tokens of a session (64 per page) and 1/TP of the rest.
@@ -21,13 +20,13 @@ share_cap() {
 
 engine_defaults() {
   case $TP in
-    4) S2=1; SHARE_LIMIT=${SHARE_LIMIT:-65536}; CAP=${CAP:-$(share_cap 1920)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    4) SHARE_LIMIT=${SHARE_LIMIT:-65536}; CAP=${CAP:-$(share_cap 1920)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
-    6) S2=1; SHARE_LIMIT=${SHARE_LIMIT:-32768}
+    6) SHARE_LIMIT=${SHARE_LIMIT:-32768}
        [ "$SHARE_LIMIT" = 32768 ] && CAP=${CAP:-614400} || CAP=${CAP:-$(share_cap 2026)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=6: the drafter's 8 KV heads do not split six ways" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
-    3) S2=1; SHARE_LIMIT=${SHARE_LIMIT:-65536}; CAP=${CAP:-$(share_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    3) SHARE_LIMIT=${SHARE_LIMIT:-65536}; CAP=${CAP:-$(share_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6 or 3" >&2; return 2 ;;
@@ -64,23 +63,14 @@ engine_args() {
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
-  case $TP in
-    4|3|6)
-      a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 \
+  a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
-      [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
-      [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
-      [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
-      [ -n "${SPEC_ACCEPT:-}" ] && a="$a --spec-accept $SPEC_ACCEPT"
-      a="$a $df $qo"
-      [ "$TP" = 6 ] && a="$a ${G6ARGS_X:-}"   # TP=6 kept this knob from the one-request launcher
-      ;;
-    *)
-      a="$a $src --serve $home/serve --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --mtp $MTP --prefill 4096 \
---pf-lanes 2 --pfv2 $qo"
-      [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
-      a="$a ${G6ARGS_X:-}" ;;
-  esac
+  [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
+  [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+  [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
+  [ -n "${SPEC_ACCEPT:-}" ] && a="$a --spec-accept $SPEC_ACCEPT"
+  a="$a $df $qo"
+  [ "$TP" = 6 ] && a="$a ${G6ARGS_X:-}"
   [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
   (set -f; echo $a)
 }

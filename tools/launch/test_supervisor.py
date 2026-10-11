@@ -50,7 +50,7 @@ class ControlPortTests(unittest.TestCase):
     @mock.patch.object(S, 'log')
     def test_requests_from_non_members_are_ignored(self, logged):
         s = supervisor(rank=1)
-        for t in ('down', 'abort', 'ready', 'serving', 'hello', 'verdict', 'status', 'logs'):
+        for t in ('down', 'abort', 'serving', 'hello', 'verdict', 'status', 'logs'):
             r = s.on_rpc({'t': t}, '192.0.2.99')
             self.assertEqual(r['t'], 'error', t)
             self.assertIn('not a member', r['error'])
@@ -119,7 +119,7 @@ class FrontTests(unittest.TestCase):
         s = supervisor(*argv)
         s.ms = mock.Mock(tokenizer='/t')
         with mock.patch.object(s, 'spawn') as spawn, mock.patch.object(S.os, 'access', return_value=True):
-            s.start_front({'s2': True, 'knobs': {'SHARE_LIMIT': '65536'}})
+            s.start_front({'knobs': {'SHARE_LIMIT': '65536'}})
         return spawn.call_args[0][1]
 
     def test_the_front_end_gets_the_default_max_tokens_or_else_the_share_limit(self):

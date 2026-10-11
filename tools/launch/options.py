@@ -38,13 +38,12 @@ KEYS = {
                                 'instead of the release'),
     'MODEL_CACHE': ('box', None, "this box's local directory for its shard of the model set"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
-    'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, serve/, run/'),
+    'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
     'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
                                'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
-    'FRONT': ('box', None, 'front end: rs or py'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
     'DEFAULT_MAX_TOKENS': ('box', '0', 'max_tokens for a chat request that names none; 0 = what keeps the request '
                                        'within SHARE_LIMIT, but at least 8192'),
@@ -85,7 +84,7 @@ KEYS = {
 FLAGS = {'S2PORT': '--s2-port', 'G6_HOME': '--g6-home'}
 # Read from old config files and ignored here, so they do not draw a warning.
 IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'G6_CLUSTER', 'G6_NR', 'BUNDLE_LIBS', 'ARCH', 'EXTRA', 'SHARED',
-           'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN'}
+           'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN', 'FRONT'}
 SWITCHES = {'--no-config', '--no-check', '--foreground'}
 ENGINE_KNOBS = [k for k in list(KEYS)[list(KEYS).index('CAP'):]]
 FABRIC_PORT = 18600   # engine/comms/fabric.h: the fabric bootstrap and per-collective ports start here
@@ -325,7 +324,7 @@ def resolve_peers(o):
 
 # ---- the engine plan: scripts/engine_args.sh, so the ssh launchers and the supervisor start the same engine ---------
 def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id=''):
-    """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..], 's2': bool} from scripts/engine_args.sh.
+    """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
     The defaults give the canonical template, with every per-box value as a placeholder."""
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'TP': o.get('TP'), 'SET_ID': set_id}
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
@@ -335,7 +334,7 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
         for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE'):
             if env.get(k):
                 env[k] = '@' + k
-    names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO', 'S2'])
+    names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO'])
     script = ('set -e; . "$0"; engine_defaults; engine_env; for k in ' + names + '; do echo "knob $k=${!k-}"; done; '
               'echo "env $ENGINE_ENV"; echo "args $(engine_args "$@")"')
     r = subprocess.run(['bash', '-c', script, os.path.join(REPO, 'scripts', 'engine_args.sh'),
@@ -352,7 +351,6 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
             plan['env'] = rest.split()
         elif kind == 'args':
             plan['args'] = rest.split()
-    plan['s2'] = plan['knobs'].pop('S2') == '1'
     plan['drafter_dir'] = o.get('DFLASH_DIR')
     return plan
 
@@ -376,8 +374,8 @@ def canonical(o, plan, members, variant=None):
         c['head'] = o.get('HEAD', '')
     for k in ('IPS', 'IPS2', 'CONTROL_PORT', 'PORT'):
         c[k] = o.get(k) or ''
-    # Every knob that reaches the engine is in engine.env and engine.args below. These are the ones the supervisor
-    # reads itself: the shim's context limit, and which pack files a rank needs.
+    # Every knob that reaches the engine is in engine.env and engine.args below. CAP is also here by name, so a refusal
+    # names it. DFLASH and PF_OWN decide which pack files a rank needs.
     for k in ('CAP', 'DFLASH', 'PF_OWN'):
         c[k] = plan['knobs'].get(k, '')
     if variant:

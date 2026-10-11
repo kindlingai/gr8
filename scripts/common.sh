@@ -4,7 +4,7 @@ CFG=${G6_CLUSTER:-$REPO/config/cluster.env}
 [ -f "$CFG" ] || { echo "missing $CFG (copy config/cluster.env.example)" >&2; exit 2; }
 # shellcheck disable=SC1090
 . "$CFG"
-# the scripts run cd $G6_HOME, rm -rf s2 serve, touch $G6_HOME/s2/quit on every box: an empty one means the home dir or /
+# the scripts run cd $G6_HOME, rm -rf s2, touch $G6_HOME/s2/quit on every box: an empty one means the home dir or /
 if [ "${G6_HOME+set}" = set ] && [ -z "$G6_HOME" ]; then echo "$CFG: G6_HOME is empty" >&2; exit 2; fi
 read -r -a HOST <<< "$HOSTS"
 NRANK=${#HOST[@]}

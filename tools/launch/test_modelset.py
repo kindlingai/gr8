@@ -32,8 +32,8 @@ def make_packs(d, tp=4, dflash=True, qo=False, tokenizer=True, size=4096):
     return d
 
 
-def plan(dflash='1', own='4', tp=4):
-    return {'knobs': {'DFLASH': dflash, 'PF_OWN': own}, 's2': tp == 4, 'env': [], 'args': []}
+def plan(dflash='1', own='4'):
+    return {'knobs': {'DFLASH': dflash, 'PF_OWN': own}, 'env': [], 'args': []}
 
 
 class SetTests(unittest.TestCase):

@@ -8,7 +8,7 @@
 #   DFLASH=1          also load the DFlash2 drafter: a session alone at its prompt tail drafts with it (adaptive draft
 #                     count, SPEC_ADAPT=1) and goes to MTP when a second session arrives. DFLASH=0: MTP only
 #   CAP, PACKS, PF_OWN (default 4; short prompts take OWN=2, G6_PF_QP_MIN), QP_ROLL, QP_CTX, QP_EARLY,
-#   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end; S2 has no Python front end path here)
+#   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end)
 #   S2PORT=7341       the S2 control port on the head
 #   TP=6 only:        PF_OWN defaults to 3 (loads packs/qo.pack; PF_OWN=1 needs no QO pack). DFLASH=1 is refused (the
 #                     drafter's 8 KV heads do not split six ways). RANK_HEALTH=0 skips the rank health probe, which
@@ -45,7 +45,7 @@ fi
 engine_env   # scripts/engine_args.sh has the engine environment and arguments, shared with ./gr8 glm53 up
 for ((r = NRANK - 1; r >= 0; r--)); do
   ARGS=$(engine_args $r "$PACKS" packs "$G6_HOME" "$EPOCH")
-  on $r "cd $G6_HOME && rm -rf s2 serve && mkdir -p s2 out && { \
+  on $r "cd $G6_HOME && rm -rf s2 && mkdir -p s2 out && { \
     nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
       --proxy-cpu $PROXY_CPU $ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
