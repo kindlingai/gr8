@@ -3,7 +3,8 @@
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 #   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP, and S2=1
-#                            (every TP serves through the multi-session engine)
+#                            (every TP serves through the multi-session engine). An unset CAP follows SHARE_LIMIT, so
+#                            the KV pool keeps the same physical pages per rank (share_cap below)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words)
 #   engine_args R RANK_PACKS AUX_PACKS HOME [EPOCH]
 #                            prints the arguments that follow `--proxy-cpu N` for rank R. RANK_PACKS holds
@@ -11,14 +12,22 @@
 #                            the drafter and QO packs, HOME is G6_HOME
 #                            (the serve/ and s2/ directories), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
 
+# share_cap P: the CAP that gives P physical KV pages per rank at this SHARE_LIMIT. Each rank holds the first
+# SHARE_LIMIT tokens of a session (64 per page) and 1/TP of the rest.
+share_cap() {
+  [ $(( SHARE_LIMIT / 64 )) -le "$1" ] || { echo "engine_defaults: SHARE_LIMIT $SHARE_LIMIT is more than the $(( $1 * 64 )) tokens a rank's KV pool holds at TP=$TP" >&2; return 2; }
+  echo $(( SHARE_LIMIT + ($1 - SHARE_LIMIT / 64) * 64 * TP ))
+}
+
 engine_defaults() {
   case $TP in
-    4) S2=1; CAP=${CAP:-393216}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    4) S2=1; SHARE_LIMIT=${SHARE_LIMIT:-65536}; CAP=${CAP:-$(share_cap 1920)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
-    6) S2=1; CAP=${CAP:-614400}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    6) S2=1; SHARE_LIMIT=${SHARE_LIMIT:-32768}
+       [ "$SHARE_LIMIT" = 32768 ] && CAP=${CAP:-614400} || CAP=${CAP:-$(share_cap 2026)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=6: the drafter's 8 KV heads do not split six ways" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
-    3) S2=1; CAP=${CAP:-307200}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    3) S2=1; SHARE_LIMIT=${SHARE_LIMIT:-65536}; CAP=${CAP:-$(share_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6 or 3" >&2; return 2 ;;
@@ -29,15 +38,15 @@ engine_defaults() {
 # attention up to 8192 tokens of context and the indexer's sparse attention past it, reduce-scatter in place of
 # all-reduce with o_proj writing into the send slot, two lanes on two streams, attention and cuBLAS in 1024-row chunks,
 # timing lines on rank 0, the residual hash on the GPU, and G6_PF_OWN as the attention ownership. Decode: two step
-# graphs split at layer 3, one scratch shared with prefill. KV: the first 32,768 tokens replicated on every rank and
-# later pages spread across ranks (CP), every staged page checked against a HASH2 hash.
+# graphs split at layer 3, one scratch shared with prefill. KV: the first SHARE_LIMIT tokens replicated on every rank
+# and later pages spread across ranks (CP), every staged page checked against a HASH2 hash.
 # TP=4 defaults G6_PF_OWN to 4. OWN=3 needs the 13 GB full-head QO pack on every rank, and that pack does not fit next to
 # a 90 GB TP=4 rank pack. OWN=4 runs the same attention over two head pairs, with the pair weights rolled in per layer
 # (about 1.3-1.4 GB of device memory plus 84 MB pinned per rank). About 1.4 KB per position of it scales with QP_CTX.
 engine_env() {
   ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
 G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
-G6_CP=1 G6_CP_R=32768 G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
+G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
   if [ "$TP" = 4 ] && [ "$PF_OWN" = 4 ]; then
     ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G6_PF_QP_CTX=${QP_CTX:-$CAP} G6_PF_QP_EARLY=${QP_EARLY:-1}"
   fi

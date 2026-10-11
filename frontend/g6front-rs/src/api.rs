@@ -291,6 +291,10 @@ impl State {
         self.engine.hello().and_then(|h| h.get("max_model_len").and_then(Value::as_u64)).unwrap_or(0)
     }
 
+    pub fn chat_default_max_tokens(&self, prompt_len: usize) -> Option<u64> {
+        sampling::chat_default_max_tokens(self.default_max_tokens, self.share_tokens, prompt_len)
+    }
+
     fn max_logprobs(&self) -> i64 {
         self.engine.hello().and_then(|h| h.get("max_logprobs").and_then(Value::as_i64)).unwrap_or(20)
     }
@@ -377,7 +381,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         &st.tok.eos_ids,
         st.tok.vocab_size,
         &st.tok.gen_defaults,
-        (st.default_max_tokens > 0).then_some(st.default_max_tokens),
+        st.chat_default_max_tokens(prompt.len()),
         st.max_logprobs(),
         true,
     )?;

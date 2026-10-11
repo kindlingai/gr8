@@ -17,7 +17,8 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 | aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.6 / 60.7 tok/s | 57.6 / 79.0 tok/s‡ |
 | prefill, 8K prompt, cold | 1,374 tok/s | 628 tok/s | 1,953 tok/s‡ |
 | prefill, 8K prompt, cached | 54,867 tok/s | 56,995 tok/s | – |
-| KV pool (longest context) | 393,216 tokens | 307,200 tokens | 614,400 tokens |
+| KV pool (longest context) | 294,912 tokens | 241,600 tokens | 614,400 tokens |
+| requests that share decode steps | up to 65,536 tokens | up to 65,536 tokens | up to 32,768 tokens |
 | requests decoding at once | 8 | 8 | 8 |
 
 \* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks capped at 2200 MHz,
@@ -44,8 +45,8 @@ RigMark. One test window on one cluster.
 - Prefix reuse: a request that continues an earlier conversation re-prefills only the new part, with the same output
   as a cold run. A continued 20K conversation takes 7.1 s instead of 17.3 s at TP=4.
 - Prefill attention split by query and head owner across ranks ([docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
-- Context-parallel KV: the first 32,768 tokens are on every rank, later pages are spread across ranks, so the pools
-  above fit.
+- Context-parallel KV: the first `SHARE_LIMIT` tokens (65,536 at TP=4 and TP=3) are on every rank, later pages are
+  spread across ranks, so the pools above fit. Requests up to that size share decode steps.
 
 ## What you need
 
@@ -177,11 +178,12 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 - The boot stops with "GiB left after the weights and part of a KV pool": lower `--cap`, or use a smaller `--variant`.
 - A box waits for the others: with mentat, check that every box's daemon sees the rest (`mentatd status`); with
   `--peers`, the workers wait for the head.
-- Decode slows past 32,768 tokens of context: from there the KV is spread across ranks, and every step gathers from
+- Decode slows past `SHARE_LIMIT` tokens of context: from there the KV is spread across ranks, and every step gathers from
   all of them.
-- A request past 32,768 tokens waits for the pool to empty, and runs alone. Its size is the prompt plus `max_tokens`,
-  and a chat request without `max_tokens` gets all the room the context leaves, so it always runs alone: send
-  `max_tokens`, or set `--default-max-tokens`.
+- A request past `SHARE_LIMIT` waits for the pool to empty, and runs alone. Its size is the prompt plus `max_tokens`.
+  A chat request without `max_tokens` gets what keeps it within the limit, but at least 8,192 tokens, so a prompt
+  past about 57,000 tokens runs alone. `--share-limit 32768` gives back the longest context (393,216 at TP=4) and
+  shares only requests up to 32,768 tokens.
 - A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
   meanwhile. The shim caps those prompts at 1,024 tokens.
 - `top_k` and `min_p` are ignored with a warning. `logprobs` and `prompt_logprobs` work up to k = 20.

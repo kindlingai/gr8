@@ -39,8 +39,10 @@ pub struct State {
     pub reasoning_fields: &'static [&'static str],
     pub prompt_tokens_details: bool,
     pub max_model_len_override: u64,
-    /// max_tokens for a chat request that names none; 0: all the room the context leaves
+    /// max_tokens for a chat request that names none; 0: see State::chat_default_max_tokens
     pub default_max_tokens: u64,
+    /// the tokens (prompt + max_tokens) a request may take and still share decode steps; 0: no such limit
+    pub share_tokens: u64,
     pub started: u64,
 }
 
@@ -57,6 +59,7 @@ struct Args {
     workers: usize,
     encode_threads: usize,
     default_max_tokens: u64,
+    share_tokens: u64,
     max_connections: usize,
 }
 
@@ -65,7 +68,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
-                  [--max-connections N]";
+                  [--share-tokens N] [--max-connections N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -81,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
         workers: 2,
         encode_threads: 0,
         default_max_tokens: 0,
+        share_tokens: 0,
         max_connections: 512,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -113,6 +117,9 @@ fn parse_args() -> Result<Args, String> {
             "--default-max-tokens" => {
                 a.default_max_tokens =
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-max-tokens: not a number")?
+            }
+            "--share-tokens" => {
+                a.share_tokens = next(&mut i, &flag, inline)?.parse().map_err(|_| "--share-tokens: not a number")?
             }
             "--max-connections" => {
                 a.max_connections = next(&mut i, &flag, inline)?.parse().map_err(|_| "--max-connections: not a number")?
@@ -213,6 +220,7 @@ async fn serve(args: Args) -> Result<(), String> {
         prompt_tokens_details: args.prompt_tokens_details,
         max_model_len_override: args.max_model_len,
         default_max_tokens: args.default_max_tokens,
+        share_tokens: args.share_tokens,
         started: util::now_secs(),
     }));
     engine.start();

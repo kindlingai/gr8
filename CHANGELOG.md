@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-11: requests up to 65,536 tokens share decode steps at TP=4 and TP=3
+
+- A request shares the pool only while its prompt + `max_tokens` fits in R, the KV every rank holds in full. R was
+  32,768, and agent harnesses send longer prompts, often without `max_tokens`, so each of their requests ran alone and
+  the others waited. `SHARE_LIMIT` (`--share-limit`) sets R: 65,536 at TP=4 and TP=3, 32,768 at TP=6. At TP=4 two
+  49,000-token requests now decode together at about 21 tok/s each (40.1 aggregate), where they ran one after the
+  other at 13.8 aggregate; three 33,000-token ones reach 50.3 aggregate.
+- An unset `CAP` follows `SHARE_LIMIT` so each rank keeps the same KV memory. The longest context drops to 294,912
+  tokens at TP=4 (was 393,216) and 241,600 at TP=3 (was 307,200). `--share-limit 32768` gives back the old pool.
+  Past 32,768 tokens a session that fits the limit decodes without the cross-rank gather, so it is faster alone too
+  (29.5-31.3 vs 26.5-27.6 tok/s at 49,000 tokens of context).
+- A chat request without `max_tokens` gets what keeps it within the limit, but at least 8,192 tokens
+  (`--share-tokens` in the front end). It used to get all the room the context leaves, which always ran alone.
+
 ## 2026-10-11: TP=3 boots bit225 by default; a new release commit reuses the cached files
 
 - The exlr8 release (v0.5) adds five width profiles: `bit225`, `bit243`, `bit260`, `bit325`, `bit338`. They spend

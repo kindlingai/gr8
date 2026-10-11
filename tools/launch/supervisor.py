@@ -674,6 +674,8 @@ class Supervisor:
             front = [self.py(), '-m', 'g6front']
         elif o.get('DEFAULT_MAX_TOKENS') != '0':
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
+        else:   # a request within the limit, guard rows included, shares decode steps: keep a page in hand for the guard
+            front += ['--share-tokens', str(int(plan['knobs']['SHARE_LIMIT']) - 64)]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT')], os.path.join(REPO, 'frontend'))
 

@@ -36,8 +36,8 @@
           "aggregate_tps": 64.0
         }
       ],
-      "max_context": 393216,
-      "kv_pool_tokens": 393216,
+      "max_context": 294912,
+      "kv_pool_tokens": 294912,
       "max_concurrent": 8,
       "quality": [
         {
@@ -71,8 +71,8 @@
           "aggregate_tps": 60.7
         }
       ],
-      "max_context": 307200,
-      "kv_pool_tokens": 307200,
+      "max_context": 241600,
+      "kv_pool_tokens": 241600,
       "max_concurrent": 8,
       "quality": [
         {

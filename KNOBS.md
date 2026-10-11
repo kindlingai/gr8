@@ -34,7 +34,8 @@ manifest instead.
 
 | variable | TP=4 | TP=6 | TP=3 | meaning |
 |---|---|---|---|---|
-| `CAP` | 393216 | 614400 | 307200 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory |
+| `CAP` | 294912 | 614400 | 241600 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory. Unset, it follows `SHARE_LIMIT`: each rank keeps the same KV memory (1,920 pages of 64 tokens at TP=4, 2,026 at TP=6, 1,941 at TP=3) |
+| `SHARE_LIMIT` | 65536 | 32768 | 65536 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 32768 gives `CAP` 393216. A power of two from 4096 |
 | `SESS` | 8 | 8 | 8 | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
 | `REUSE` | 1 | 1 | 1 | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
 | `DFLASH` | 1 with a drafter, else 0 | 0 (fixed) | 0 (fixed) | 1 = the DFlash2 drafter (`--drafter`, or `dflash.r<r>.*` in the model set); 0 = MTP only. TP=3 and TP=6 refuse 1: the drafter's 8 KV heads do not split three or six ways |
@@ -89,7 +90,7 @@ manifest instead.
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
 | `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |
-| `DEFAULT_MAX_TOKENS` | `--default-max-tokens` | 0 | box | the head's front end: `max_tokens` for a chat request that names none. 0 = all the room the context leaves, which is always past R (32,768), so every such request runs alone; a smaller value keeps them shared and ends longer answers there |
+| `DEFAULT_MAX_TOKENS` | `--default-max-tokens` | 0 | box | the head's front end: `max_tokens` for a chat request that names none. 0 = what keeps the request within `SHARE_LIMIT`, but at least 8,192, and never more than the room the context leaves; another value is used as it is |
 | `JOIN_TIMEOUT` | `--join-timeout` | 600 | run | seconds for the mentat group to fill, for a worker to reach the head, and on the head from the first hello to the last (0 = forever) |
 | `CHECK` | `--no-check` | 1 | run | 0 = skip this box's checks (the model files are checked anyway) |
 | `G6_CLUSTER` | | none | | the config file when there is no `@FILE` |

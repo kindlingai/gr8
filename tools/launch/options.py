@@ -46,13 +46,15 @@ KEYS = {
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT': ('box', None, 'front end: rs or py'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
-    'DEFAULT_MAX_TOKENS': ('box', '0', 'max_tokens for a chat request that names none; 0 = all the room the context '
-                                       'leaves (such a request is always past R, so it runs alone)'),
+    'DEFAULT_MAX_TOKENS': ('box', '0', 'max_tokens for a chat request that names none; 0 = what keeps the request '
+                                       'within SHARE_LIMIT, but at least 8192'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
     'CHECK': ('run', '1', '0 = skip the local checks'),
-    'CAP': ('cluster', None, 'KV pool in tokens'),
+    'CAP': ('cluster', None, 'KV pool in tokens (default: what SHARE_LIMIT leaves of the default pool memory)'),
+    'SHARE_LIMIT': ('cluster', None, 'requests up to this many tokens (prompt + max_tokens) share decode steps; a '
+                                     'longer one runs alone. Each rank holds the first SHARE_LIMIT tokens of a session'),
     'SESS': ('cluster', None, 'S2 sessions'),
     'MTP': ('cluster', None, 'MTP draft count'),
     'DFLASH': ('cluster', None, 'DFlash2 drafter'),
@@ -264,7 +266,11 @@ def validate(o):
     if o.get('DRAFTER') and tp != '4':
         raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
-        raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = all the room)')
+        raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
+    share = o.get('SHARE_LIMIT')
+    if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) & (int(share) - 1) == 0):
+        # the engine needs the limit to be one of its decode buckets (2048 doubling)
+        raise OptionError(f'--share-limit {share}: want a power of two from 4096')
     if o.get('V2') and not o.get('V2_SLICES'):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):

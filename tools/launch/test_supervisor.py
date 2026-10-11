@@ -119,13 +119,16 @@ class FrontTests(unittest.TestCase):
         s = supervisor(*argv)
         s.ms = mock.Mock(tokenizer='/t')
         with mock.patch.object(s, 'spawn') as spawn, mock.patch.object(S.os, 'access', return_value=True):
-            s.start_front({'s2': True})
+            s.start_front({'s2': True, 'knobs': {'SHARE_LIMIT': '65536'}})
         return spawn.call_args[0][1]
 
-    def test_default_max_tokens_reaches_the_front_end_only_when_set(self):
-        self.assertNotIn('--default-max-tokens', self.front_argv())
+    def test_the_front_end_gets_the_default_max_tokens_or_else_the_share_limit(self):
+        a = self.front_argv()
+        self.assertNotIn('--default-max-tokens', a)
+        self.assertEqual(a[a.index('--share-tokens') + 1], '65472')     # a page short of the limit, for the guard rows
         a = self.front_argv('--default-max-tokens', '16384')
         self.assertEqual(a[a.index('--default-max-tokens') + 1], '16384')
+        self.assertNotIn('--share-tokens', a)
 
 
 class EngineTests(unittest.TestCase):

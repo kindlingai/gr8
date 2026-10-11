@@ -68,7 +68,7 @@ the short version.
 | `G6_DEC_SPLIT` | 3 | the decode step is captured as two graphs split at layer 3, so the second submission overlaps the first one's GPU time |
 | `G6_DEC_SHARED_SCRATCH` | 1 | one decode attention scratch for all layers (frees memory for the big pool; needs `--pfv2`) |
 | `G6_CP` | 1 | context-parallel KV on (build flag `-DG6_CP=1` too) |
-| `G6_CP_R` | 32768 | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks (multiple of 64) |
+| `G6_CP_R` | `SHARE_LIMIT` | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks. Under S2 it is also the largest request that shares decode steps. A decode bucket (2048 doubling) |
 | `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
 | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
 | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |

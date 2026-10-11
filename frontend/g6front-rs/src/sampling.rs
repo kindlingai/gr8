@@ -85,6 +85,20 @@ fn default_num(defaults: &Map<String, Value>, key: &str, neutral: f64) -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The least max_tokens a chat request without one gets under --share-tokens.
+pub const SHARE_MIN_MAX_TOKENS: u64 = 8192;
+
+/// max_tokens for a chat request of `prompt_len` tokens that names none, before build() caps it by the room the
+/// context leaves. `default` (--default-max-tokens) wins when set. Otherwise, with `share` (--share-tokens), the most
+/// that keeps prompt + max_tokens within the share limit, but at least SHARE_MIN_MAX_TOKENS: past the limit the request
+/// runs alone, and a short answer budget would cost more than sharing gains. None: all the room.
+pub fn chat_default_max_tokens(default: u64, share: u64, prompt_len: usize) -> Option<u64> {
+    if default > 0 {
+        return Some(default);
+    }
+    (share > 0).then(|| share.saturating_sub(prompt_len as u64).max(SHARE_MIN_MAX_TOKENS))
+}
+
 pub fn build(
     body: &Map<String, Value>,
     raw: &[u8],
@@ -325,5 +339,14 @@ mod tests {
         assert_eq!(max_tokens("{}", 100, 393202, Some(16384)), 16384);
         assert_eq!(max_tokens("{}", 393000, 393202, Some(16384)), 202); // less room than the default
         assert_eq!(max_tokens(r#"{"max_tokens": 200000}"#, 100, 393202, Some(16384)), 200000); // named: kept
+    }
+
+    #[test]
+    fn without_a_default_a_chat_request_fits_the_share_limit_when_it_can() {
+        assert_eq!(chat_default_max_tokens(0, 65472, 49439), Some(16033));
+        assert_eq!(chat_default_max_tokens(0, 65472, 60000), Some(SHARE_MIN_MAX_TOKENS)); // past the limit anyway
+        assert_eq!(chat_default_max_tokens(0, 65472, 100000), Some(SHARE_MIN_MAX_TOKENS));
+        assert_eq!(chat_default_max_tokens(4096, 65472, 100), Some(4096)); // --default-max-tokens wins
+        assert_eq!(chat_default_max_tokens(0, 0, 100), None); // no share limit: all the room
     }
 }

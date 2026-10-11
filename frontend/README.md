@@ -46,7 +46,8 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--max-model-len` | 0 (use the engine `hello`) | Overrides the context length. |
 | `--reasoning-fields` | `reasoning` | `reasoning`, `reasoning_content` or both. The default matches vLLM 0.30, which sends only `reasoning`. |
 | `--enable-prompt-tokens-details` | off | Adds `usage.prompt_tokens_details.cached_tokens`. |
-| `--default-max-tokens` | 0 (all the room the context leaves) | `max_tokens` for a chat request that names none. Under S2 a request whose prompt + `max_tokens` passes R (`G6_CP_R`, 32,768) runs alone, and all the room always passes it; a smaller default keeps such requests shared, and ends longer answers at that length. `./gr8 glm53 up` passes `DEFAULT_MAX_TOKENS` when it is set. |
+| `--default-max-tokens` | 0 | `max_tokens` for a chat request that names none, capped by the room the context leaves. 0 = see `--share-tokens`. `./gr8 glm53 up` passes `DEFAULT_MAX_TOKENS` when it is set. |
+| `--share-tokens` | 0 | With `--default-max-tokens 0`: a chat request that names no `max_tokens` gets what keeps prompt + `max_tokens` within N, but at least 8,192 (past the limit it runs alone anyway). 0 = all the room the context leaves. `./gr8 glm53 up` passes `SHARE_LIMIT` less a 64-token page for the engine's guard rows. |
 | `--max-connections` | 512 | Connections served at once; more wait in the listen backlog. Request headers must arrive within 30 s and a body within 120 s. |
 | `--log-level` | `INFO` | |
 
