@@ -21,6 +21,7 @@
 // Call prepare(m, M, st) outside a capture before the first step with M rows.
 #pragma once
 #include <algorithm>
+#include "context_buckets.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -430,17 +431,11 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     {
         const char* e = getenv("G6_DEC_BK");
         int b = e ? atoi(e) : 2048;
-        m.nbk = 0;
-        if (b > 0) for (; b < capacity && m.nbk < NBK - 1; b *= 2) m.bk[m.nbk++] = b;
-        m.bk[m.nbk++] = capacity;
+        int cp_r = 0;
 #if defined(G6_CP) && G6_CP
-        if (m.cp.on && m.cp.R > 0 && m.cp.R < capacity && std::find(m.bk, m.bk + m.nbk, m.cp.R) == m.bk + m.nbk)
-        {   // R is a bucket boundary: buckets <= R run the replicated graphs, buckets > R the CP graphs
-            if (m.nbk == NBK) die("G6_CP: no room for the R bucket (G6_DEC_BK)");
-            m.bk[m.nbk++] = m.cp.R;
-            std::sort(m.bk, m.bk + m.nbk);
-        }
+        if (m.cp.on) cp_r = m.cp.R;
 #endif
+        m.nbk = context_buckets(m.bk, b, capacity, cp_r);
     }
     m.cells = dmalloc<G6AttnStepCell>(m.nl);
     m.shared = dmalloc<int>(m.nl);
@@ -1220,6 +1215,9 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
     D.d.eh_in = dmalloc<__half>((size_t)MX * 2 * HID);
     D.d.eh_out = dmalloc<__half>((size_t)MX * HID);
     build(D.d, main.rank, std::vector<int>{78}, find, capacity, f, stepp, st, max_rows);
+    // The draft has no CP binding, but its graph indices must use the target context buckets.
+    D.d.nbk = main.nbk;
+    std::copy(main.bk, main.bk + main.nbk, D.d.bk);
     D.d.final_norm = (const __nv_bfloat16*)need(find, "L078.shared_head_norm");
     D.enorm = (const __nv_bfloat16*)need(find, "L078.enorm");
     D.hnorm = (const __nv_bfloat16*)need(find, "L078.hnorm");
