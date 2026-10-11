@@ -4,8 +4,9 @@
 #   docker buildx build --platform linux/arm64 --target dist -o type=local,dest=out .
 #                                                                              only the binaries, into out/bin, bin3 and bin6
 #
-# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) -> engine-tp4, engine-tp6, engine-tp3, with
-# front (the Rust front end) beside them -> dist (the binaries only) -> runtime (CUDA runtime + binaries, scripts, shims).
+# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) and kvman (the Rust S2 page allocator)
+# -> engine-tp4, engine-tp6, engine-tp3, with front (the Rust front end) beside them -> dist (the binaries only)
+# -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU=ubuntu24.04
 
@@ -34,6 +35,13 @@ RUN mkdir -p /out \
  && cp engine/loader-rs/target/release/libg6load.a engine/loader-rs/target/release/g6load /out/ \
  && rm -rf engine/loader-rs/target
 
+FROM rust AS kvman
+COPY engine/kvman-rs engine/kvman-rs
+RUN mkdir -p /out \
+ && cargo build --release --locked --manifest-path engine/kvman-rs/Cargo.toml \
+ && cp engine/kvman-rs/target/release/libg6kvman.a /out/ \
+ && rm -rf engine/kvman-rs/target
+
 # the slowest step (fat LTO); it runs beside the engine builds
 FROM rust AS front
 COPY frontend/g6front-rs frontend/g6front-rs
@@ -45,13 +53,14 @@ RUN mkdir -p /out \
  && rm -rf target
 
 # engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
-# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a built above.
+# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a and libg6kvman.a built above.
 FROM toolchain AS engine-src
 WORKDIR /src
 COPY engine engine
 COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
 COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
+COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
 
 # scripts/launch_tp4.sh runs this TP=4 build with the multi-session path (DEC_S2)
 FROM engine-src AS engine-tp4
@@ -65,8 +74,10 @@ FROM engine-src AS engine-tp3
 RUN G6_NR=3 scripts/build.sh /out/bin3
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a
+# and libg6kvman.a
 FROM scratch AS rust-dist
 COPY --from=loader /out/libg6load.a /out/g6load /
+COPY --from=kvman /out/libg6kvman.a /
 COPY --from=front /out/g6front-rs /
 
 # dist holds the shipped binaries: bin/ is TP=4, bin6/ is TP=6 and bin3/ is TP=3. g6load (the Hugging Face fetch's

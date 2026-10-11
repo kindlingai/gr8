@@ -45,6 +45,7 @@ jobs:
             ~/.cargo/git
             ~/.rustup/toolchains
             engine/loader-rs/target
+            engine/kvman-rs/target
             frontend/g6front-rs/target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-
@@ -89,12 +90,15 @@ jobs:
           path: rust-dist
       - name: Build the binaries on the runner (GR8_NATIVE)
         if: vars.GR8_NATIVE == '1'
-        # the Dockerfile's dist stage, without Docker: the TP=4, TP=6 and TP=3 engines, linking the Rust job's loader.
-        # build.sh runs cargo whenever it finds it, which would rebuild the loader, so cargo is off the PATH here.
+        # the Dockerfile's dist stage, without Docker: the TP=4, TP=6 and TP=3 engines, linking the Rust job's loader
+        # and page allocator. build.sh runs cargo whenever it finds it, which would rebuild them, so cargo is off the
+        # PATH here.
         run: |
           set -eux
           mkdir -p engine/loader-rs/target/release
           cp rust-dist/libg6load.a engine/loader-rs/target/release/
+          mkdir -p engine/kvman-rs/target/release
+          cp rust-dist/libg6kvman.a engine/kvman-rs/target/release/
           install -m 755 rust-dist/g6load engine/loader-rs/target/release/
           PATH=$(printf %s "$PATH" | tr ':' '\n' | grep -v cargo | paste -sd: -)
           if command -v cargo; then echo "cargo is still on the PATH"; exit 1; fi

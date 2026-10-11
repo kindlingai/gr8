@@ -1,0 +1,12 @@
+[package]
+name = "g6kvman"
+version = "0.1.0"
+edition = "2021"
+description = "g6 S2 KV page allocator: every rank's pool of KV pages, the page list of each live and retained run"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[profile.release]
+opt-level = 3
+panic = "abort"        # a panic must not unwind into the C++ engine

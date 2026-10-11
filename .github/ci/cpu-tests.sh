@@ -51,5 +51,7 @@ bash -n docker/entrypoint.sh
 
 step "Rust: engine/loader-rs"
 cargo test --locked --manifest-path engine/loader-rs/Cargo.toml
+step "Rust: engine/kvman-rs"
+cargo test --locked --manifest-path engine/kvman-rs/Cargo.toml
 step "Rust: frontend/g6front-rs"
 (cd frontend/g6front-rs && cargo test --locked)

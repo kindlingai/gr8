@@ -29,13 +29,16 @@ On a GB10 with CUDA 13:
     scripts/build.sh bin6           # the TP=6 engine
 
 `scripts/build.sh` also builds and runs `test_spec_len` and `test_prefix_reuse`, and `tr3_e4m3_test` when a GPU is
-visible. A PR builds every topology (CI's engine build does).
+visible. A PR builds every topology (CI's engine build does). g6m4 links the S2 page allocator from
+`engine/kvman-rs`, which build.sh builds with cargo. Where cargo is missing, build that crate (and `engine/loader-rs`)
+first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 
 ## Test
 
 | test | where | command |
 |---|---|---|
-| S2 batch planner, control barrier, pool reuse | any Linux box with g++ | `scripts/host_tests.sh` |
+| S2 batch planner, control barrier, pool reuse, the Rust pool against the C++ one it replaced | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
+| the S2 page allocator's properties (no page lost or held twice, ranks agree) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
 | row budget, S2 attention, decode heads | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |

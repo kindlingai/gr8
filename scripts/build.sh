@@ -19,8 +19,11 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 # the Rust pack loader (engine/loader-rs), and bin/g6load, which plans and checks the Hugging Face fetch. Where cargo is
 # missing (the CUDA image), build it on the host first: cargo build --release --manifest-path engine/loader-rs/Cargo.toml
 # (g6m4 links target/release/libg6load.a when it exists, and target/release/g6load is copied next to g6m4)
+# The S2 page allocator (engine/kvman-rs) is not optional: g6m4 always links target/release/libg6kvman.a, built the
+# same way.
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
+  cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
 fi
 G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi

@@ -44,7 +44,10 @@ if [ "$WHAT" != g6 ]; then
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
-  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/g6m4 g6m4.cu ../comms/fabric.cpp $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o $RS -lcublas -libverbs -lpthread
+  # the S2 page allocator (engine/kvman-rs, wrapped by s2/pool.h). scripts/build.sh builds it with cargo
+  KVLIB=../kvman-rs/target/release/libg6kvman.a
+  [ -f "$KVLIB" ] || { echo "g6m4 needs $KVLIB: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/g6m4 g6m4.cu ../comms/fabric.cpp $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o $RS $KVLIB -ldl -lm -lcublas -libverbs -lpthread
   [ -n "$RS" ] && echo "g6m4: Rust pack loader linked" || echo "g6m4: no $RSLIB, C++ pack loader only"
   ls -la $OUT/g6m4
 fi
