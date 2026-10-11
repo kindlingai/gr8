@@ -128,7 +128,7 @@ path. The `#if` blocks and their comments in the source are the reference:
 
 ## Front end and shim
 
-The head runs a shim that hands requests to the engine: `frontend/g6s2shim.py --dir <the head's DIR> --sock <sock>` for
-S2 (the head engine passes them to the other ranks over its control links), or `frontend/g6shim.py --rank-dirs` for
-TP=6's one-request loop (the other ranks over ssh). The API is the Rust front end,
+The head runs a shim that hands requests to the engine: `frontend/g6s2shim.py --dir <the head's DIR> --sock <sock>`
+(the head engine passes them to the other ranks over its control links). `frontend/g6shim.py --rank-dirs` drives an
+older build without the multi-session path, writing to the other ranks over ssh. The API is the Rust front end,
 `bin/g6front-rs --model-dir <tokenizer dir> --engine-sock <sock> --port 8100`. Its flags are in `frontend/README.md`.
