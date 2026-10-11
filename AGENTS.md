@@ -61,10 +61,12 @@ The engine command line lives in `scripts/engine_args.sh`. The supervisor and th
 S2 is the only served path. `scripts/build.sh` builds every TP with DEC_S2, which g6m4 needs. `g6m4 --serve` serves up
 to `SESS` requests at once, and at TP=4 the DFlash2 drafter for a request that runs alone (TP=3 and TP=6 are MTP only).
 `scripts/launch_tp4.sh`, `launch_tp3.sh` and `launch_tp6.sh` run `scripts/launch_s2.sh` with four, three or six ranks.
-A change to decode, prefill or the scheduler is measured under S2, and multi-session output must stay byte-identical to
-each request run alone.
+A change to decode, prefill or the scheduler is measured under S2. Its output must stay byte-identical to the build
+before it for the same requests in the same order, alone and sharing steps (m4sim prints every session's lines, so
+compare its stdout between the two builds). Sharing steps can change a request's output against its solo run, so
+that is not the comparison.
 
-A change to the packs, the loader or the converter needs a boot with the pack hash check on (no `NOHASH=1`).
+A change to the loader or the converter needs a boot with the hash check on (no `NOHASH=1`).
 
 A change to `./gr8 glm53`, the supervisor or a launcher keeps every knob working, and keeps the checks to failures a
 boot cannot survive. A new knob that reaches the engine goes in `scripts/engine_args.sh` and `tools/launch/options.py`

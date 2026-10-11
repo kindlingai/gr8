@@ -39,12 +39,7 @@
       "max_context": 294912,
       "kv_pool_tokens": 294912,
       "max_concurrent": 8,
-      "quality": [
-        {
-          "name": "Exactness",
-          "value": "each request byte-identical to running alone"
-        }
-      ],
+      "quality": [],
       "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. Code varies between boots (41.5 to 49.3 on one build). Structured output is not reported: it measures predictable output, not agent speed."
     },
     {
@@ -74,12 +69,7 @@
       "max_context": 241600,
       "kv_pool_tokens": 241600,
       "max_concurrent": 8,
-      "quality": [
-        {
-          "name": "Exactness",
-          "value": "each request byte-identical to running alone"
-        }
-      ],
+      "quality": [],
       "notes": "bit225 experts (about 2.25 bpw), MTP only. Mean of two boots. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release."
     },
     {

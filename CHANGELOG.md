@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-11: README: what concurrent requests produce
+
+- The README and `kindling.json` said each request's output is byte for byte what it would be alone. That does not
+  hold: when requests share decode steps, a request's tokens and logprobs can differ from its solo run (seen in m4sim
+  on main). The README now says so, and AGENTS.md asks a change to keep output identical to the
+  build before it, not to the solo run.
+- The README's section on rank packs goes: it covers only the release on Hugging Face.
+
 ## 2026-10-11: S2 is the only serving path
 
 - `g6m4` needs a DEC_S2 build and refuses to compile without one. The loop that served one request at a time (`--serve`

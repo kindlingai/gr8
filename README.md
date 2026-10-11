@@ -25,7 +25,7 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 booted from the Hugging Face release with `./gr8 glm53 up`. RigMark's structured row is left out: it measures
 predictable output, not agent speed. TP=4 code varies between boots (41.5 to 49.3 on one build), because which requests
 get DFlash2 depends on timing.
-‡ TP=6, served through S2 (MTP only: the DFlash2 drafter's 8 KV heads do not split six ways), GPU clocks uncapped (about
+‡ TP=6, MTP only (the DFlash2 drafter's 8 KV heads do not split six ways), GPU clocks uncapped (about
 2450 to 2550 MHz), not the 2200 MHz cap of the other columns, so do not compare the columns row by row. Decode is a
 concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; it is not
 RigMark. One test window on one cluster.
@@ -37,13 +37,14 @@ RigMark. One test window on one cluster.
 - One model: the [exlr8 release](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) on Hugging Face. Each box
   fetches only its own part, once, and boots from its cache in about 40 s. Each rank plans its weights from the
   release's files at load. The routed experts and the dense trellis matrices are decoded inside the kernels.
-- Several requests at once (TP=4 and TP=3): up to 8 sessions share each decode step. Each request's output is byte for byte what it
-  would be alone, logprobs included.
+- Several requests at once: up to 8 sessions share each decode step. Each request's output is a valid continuation at
+  its sampling settings, but when requests share decode steps its tokens and logprobs can differ slightly from running
+  it alone.
 - Speculative decoding: every round drafts with the MTP layer, or at TP=4, for a request that runs alone, with the
   DFlash2 drafter when that is expected to commit more tokens per ms (DFlash2 wins on code, MTP on prose). The draft
   count comes from a live model of step cost and acceptance.
-- Prefix reuse: a request that continues an earlier conversation re-prefills only the new part, with the same output
-  as a cold run. A continued 20K conversation takes 7.1 s instead of 17.3 s at TP=4.
+- Prefix reuse: a request that continues an earlier conversation re-prefills only the new part. A continued 20K
+  conversation takes 7.1 s instead of 17.3 s at TP=4.
 - Prefill attention split by query and head owner across ranks ([docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
 - Context-parallel KV: the first `SHARE_LIMIT` tokens (65,536 at TP=4 and TP=3) are on every rank, later pages are
   spread across ranks, so the pools above fit. Requests up to that size share decode steps.
@@ -57,7 +58,7 @@ RigMark. One test window on one cluster.
   At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and at TP=4
   the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned per
   rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited.
-- A LAN between the boxes with TCP ports 7340 and 7341 open. No TP needs ssh between the boxes: the head engine
+- A LAN between the boxes with TCP ports 7340 and 7341 open. The boxes need no ssh between them: the head engine
   passes each request to the other ranks over its control links.
 - Disk per box: about 90 GB at TP=4 (its experts, the 11 GB of dense and vocab files, the drafter) and about 85 GB at
   TP=3. One cache holds both, because their parts share the sparse expert files.
@@ -196,15 +197,6 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 | 7341 | the multi-session control channel between the ranks | head |
 | 18600-18659 | fabric bootstrap and the per-collective regions | head |
 
-## Packs (optional)
-
-Before the release, the model was converted into per-rank packs from the TR3 expert checkpoint
-([davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw)) and GPTQ dense
-codes ([adapt-ai-systems/glm-5.3-full-exl3-gptq-dense](https://huggingface.co/adapt-ai-systems/glm-5.3-full-exl3-gptq-dense)).
-Packs still boot: `./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]` builds them, with `GPTQ_DIR` the
-GPTQ repo's `tp4/` or `tp6/` folder (about 390 GB written, CPU only), and `--model OUT_DIR` boots from them. Most users
-should use the release.
-
 ## Layout
 
 | path | what |
@@ -218,7 +210,7 @@ should use the release.
 | `engine/loader-rs/` | the Rust loader: plans each rank's image from the release, fetches from Hugging Face, converts the drafter |
 | `frontend/` | the HTTP front end (`g6front-rs`) and the shim that drives the engine |
 | `scripts/` | build, tests and `engine_args.sh` (the engine command line) |
-| `tools/convert/` | packs from public checkpoints (optional) |
+| `tools/convert/` | the DFlash2 drafter's conversion, the QO weight pack, and the writers and test fixtures behind the release |
 | `smoketest/`, `bench/` | the smoke test, benchmarks and the quality gate |
 | `docs/` | engine settings, the prefill attention design, the model-specific parts |
 | [KNOBS.md](KNOBS.md), [CHANGELOG.md](CHANGELOG.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | every option; what changed and the measurements behind it; open bugs; the front end to engine protocol; how to build, test and land a change |
