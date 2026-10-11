@@ -17,6 +17,10 @@
 //!
 //! Slots are allocated lowest free first, and spill / restore order is the run's page order, so two ranks given the
 //! same calls use the same slots, as the pool does.
+//!
+//! A Tier keeps its slots in any BlockStore: the SSD's SlotFile here, or a lease on a KV node over the network
+//! (remote::RemoteStore, REMOTE-TIER.md). The store is a fixed array of blocks. The Tier decides which block holds
+//! which page and when a block is free, so every store follows the same lock-step allocation.
 
 use crate::pool::Kept;
 use crate::reuse::Finished;
@@ -150,6 +154,30 @@ impl SlotFile {
     }
 }
 
+/// A fixed array of equal blocks that threads read and write concurrently. Blocks are whole: a write fills a block
+/// from its start, a read reads from its start.
+pub trait BlockStore: Sync {
+    fn block_bytes(&self) -> usize;
+    fn blocks(&self) -> u64;
+    fn write_block(&self, block: u64, buf: &[u8]) -> io::Result<()>;
+    fn read_block(&self, block: u64, buf: &mut [u8]) -> io::Result<()>;
+}
+
+impl BlockStore for SlotFile {
+    fn block_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+    fn blocks(&self) -> u64 {
+        self.slots
+    }
+    fn write_block(&self, block: u64, buf: &[u8]) -> io::Result<()> {
+        self.write(block, buf)
+    }
+    fn read_block(&self, block: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.read(block, buf)
+    }
+}
+
 /// Runs `f(worker, i)` for i in 0..n on `threads` threads, each i once. Workers take the next index in turn, so the
 /// order work completes in varies, but each i's work is the same.
 pub fn par_for<F: Fn(usize, usize) -> io::Result<()> + Sync>(threads: usize, n: usize, f: F) -> io::Result<()> {
@@ -215,8 +243,8 @@ pub struct Spilled {
 }
 
 /// Spilled retained runs, by handle (the order they were spilled in).
-pub struct Tier {
-    file: SlotFile,
+pub struct Tier<S: BlockStore = SlotFile> {
+    store: S,
     alloc: SlotAlloc,
     spilled: BTreeMap<u64, Spilled>,
     next: u64,
@@ -225,19 +253,30 @@ pub struct Tier {
     pub bytes_read: u64,
 }
 
-impl Tier {
-    /// A store of `slots` page blocks of `block_bytes` each (PAGE_BLOCK_BYTES for the engine's layout).
+impl Tier<SlotFile> {
+    /// A file of `slots` page blocks of `block_bytes` each (PAGE_BLOCK_BYTES for the engine's layout).
     pub fn create(path: &Path, block_bytes: usize, slots: u64, threads: usize, direct: bool) -> io::Result<Tier> {
         let file = SlotFile::create(path, block_bytes.div_ceil(ALIGN) * ALIGN, slots, direct)?;
-        Ok(Tier {
-            alloc: SlotAlloc::new(slots),
-            file,
+        Ok(Tier::new(file, threads))
+    }
+}
+
+impl<S: BlockStore> Tier<S> {
+    /// Runs in `store`'s blocks, moved by `threads` threads at a time.
+    pub fn new(store: S, threads: usize) -> Tier<S> {
+        Tier {
+            alloc: SlotAlloc::new(store.blocks()),
+            store,
             spilled: BTreeMap::new(),
             next: 0,
             threads,
             bytes_written: 0,
             bytes_read: 0,
-        })
+        }
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
     }
 
     pub fn free_slots(&self) -> u64 {
@@ -255,13 +294,13 @@ impl Tier {
         F: Fn(u32, &mut [u8]) + Sync,
     {
         let Some(slots) = self.alloc.alloc(k.list.len()) else { return Ok(None) };
-        let sb = self.file.slot_bytes();
+        let sb = self.store.block_bytes();
         let bufs: Vec<std::sync::Mutex<AlignedBuf>> =
             (0..self.threads.max(1)).map(|_| std::sync::Mutex::new(AlignedBuf::new(sb))).collect();
         let r = par_for(self.threads, slots.len(), |w, i| {
             let mut b = bufs[w].lock().expect("one worker per buffer");
-            page(k.list[i], b.as_mut_slice());
-            self.file.write(slots[i], b.as_slice())
+            page(k.list[i], &mut b.as_mut_slice()[..sb]);
+            self.store.write_block(slots[i], &b.as_slice()[..sb])
         });
         if let Err(e) = r {
             self.alloc.release(&slots);
@@ -283,13 +322,13 @@ impl Tier {
         let s =
             self.spilled.remove(&h).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such spilled run"))?;
         let n = pages.len().min(s.slots.len());
-        let sb = self.file.slot_bytes();
+        let sb = self.store.block_bytes();
         let bufs: Vec<std::sync::Mutex<AlignedBuf>> =
             (0..self.threads.max(1)).map(|_| std::sync::Mutex::new(AlignedBuf::new(sb))).collect();
         let r = par_for(self.threads, n, |w, i| {
             let mut b = bufs[w].lock().expect("one worker per buffer");
-            self.file.read(s.slots[i], b.as_mut_slice())?;
-            put(pages[i], b.as_slice());
+            self.store.read_block(s.slots[i], &mut b.as_mut_slice()[..sb])?;
+            put(pages[i], &b.as_slice()[..sb]);
             Ok(())
         });
         self.alloc.release(&s.slots);
