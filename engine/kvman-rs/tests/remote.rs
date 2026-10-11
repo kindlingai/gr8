@@ -166,7 +166,8 @@ fn a_tier_spills_to_a_remote_store() {
     let mut t = Tier::new(store, 3);
     let block =
         |p: u32, buf: &mut [u8]| buf.iter_mut().enumerate().for_each(|(i, b)| *b = (p as usize * 31 + i * 7) as u8);
-    let a = Kept { list: vec![5, 2, 9, 0], st: Finished { valid: 100, ..Default::default() }, age: 1 };
+    let a =
+        Kept { list: vec![5, 2, 9, 0], st: Finished { valid: 100, ..Default::default() }, age: 1, exclusive: false };
     let ha = t.spill(&a, block).unwrap().unwrap();
     assert_eq!(t.spilled()[&ha].slots, vec![0, 1, 2, 3]);
     let got = std::sync::Mutex::new(Vec::new());

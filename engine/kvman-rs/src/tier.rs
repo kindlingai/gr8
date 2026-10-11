@@ -226,6 +226,18 @@ impl SlotAlloc {
         self.free -= n as u64;
         Some(out)
     }
+    /// Marks these slots used, all or none: false when one is already used (or repeated).
+    pub fn claim(&mut self, slots: &[u64]) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        if slots.iter().any(|&s| s as usize >= self.used.len() || self.used[s as usize] || !seen.insert(s)) {
+            return false;
+        }
+        for &s in slots {
+            self.used[s as usize] = true;
+        }
+        self.free -= slots.len() as u64;
+        true
+    }
     pub fn release(&mut self, slots: &[u64]) {
         for &s in slots {
             debug_assert!(self.used[s as usize]);
@@ -366,13 +378,21 @@ mod tests {
     fn spill_and_restore_round_trip() {
         let dir = std::env::temp_dir().join(format!("g6kvman-tier-{}", std::process::id()));
         let mut t = Tier::create(&dir, 3 * ALIGN, 16, 3, false).unwrap();
-        let a = Kept { list: vec![5, 2, 9, 0], st: Finished { valid: 100, ..Default::default() }, age: 1 };
-        let b = Kept { list: vec![1, 3], st: Finished { valid: 7, ..Default::default() }, age: 2 };
+        let a = Kept {
+            list: vec![5, 2, 9, 0],
+            st: Finished { valid: 100, ..Default::default() },
+            age: 1,
+            exclusive: false,
+        };
+        let b = Kept { list: vec![1, 3], st: Finished { valid: 7, ..Default::default() }, age: 2, exclusive: false };
         let ha = t.spill(&a, block).unwrap().unwrap();
         let hb = t.spill(&b, block).unwrap().unwrap();
         assert_eq!(t.spilled()[&ha].slots, vec![0, 1, 2, 3]);
         assert_eq!(t.spilled()[&hb].slots, vec![4, 5]);
-        assert!(t.spill(&Kept { list: vec![0; 11], st: Finished::default(), age: 3 }, block).unwrap().is_none());
+        assert!(t
+            .spill(&Kept { list: vec![0; 11], st: Finished::default(), age: 3, exclusive: false }, block)
+            .unwrap()
+            .is_none());
         // restore a's first three pages into other pages: each gets a's page block in list order
         let got = std::sync::Mutex::new(Vec::new());
         let st = t.restore(ha, &[40, 41, 42], |p, buf| got.lock().unwrap().push((p, buf.to_vec()))).unwrap();
@@ -386,7 +406,10 @@ mod tests {
         }
         // a's slots are free again, and the next spill takes the lowest
         assert_eq!(t.free_slots(), 14);
-        let hc = t.spill(&Kept { list: vec![7], st: Finished::default(), age: 4 }, block).unwrap().unwrap();
+        let hc = t
+            .spill(&Kept { list: vec![7], st: Finished::default(), age: 4, exclusive: false }, block)
+            .unwrap()
+            .unwrap();
         assert_eq!(t.spilled()[&hc].slots, vec![0]);
         assert_eq!(t.bytes_read, 3 * 3 * ALIGN as u64);
         drop(t);

@@ -18,12 +18,15 @@ struct g6kv_run
 };
 
 // g6kv_match's result: skip = the retained rows a prompt can reuse (0 = none), age = the retained run, for g6kv_take.
-// why is a static string: "hit", or why there is none (none, room, first, strict, no-lcp, short, grid).
+// why is a static string: "hit", "stored", or why there is none (none, room, first, strict, no-lcp, short, grid).
+// stored = 1: the run is in tier `tier` (g6kv_add_tier), and g6kv_take queues the copies that restore its pages.
 struct g6kv_hit
 {
     int32_t skip, lcp;
     const char* why;
     uint64_t age;
+    int32_t stored;
+    uint32_t tier;
 };
 
 // status.s2 totals: live runs, the pages they hold and could grow to, granted and refused growth
@@ -68,7 +71,8 @@ int g6kv_retain(g6kv_pool* p, const g6kv_run* r, const int32_t* history, size_t 
                 int32_t pf_end);
 int g6kv_match(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst, int32_t limit,
                g6kv_hit* out);
-int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, uint64_t rows, uint64_t worst, g6kv_run* out);
+// from: -1 for a pool hit, else the tier of a stored one
+int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, g6kv_run* out);
 
 uint64_t g6kv_digest(const g6kv_pool* p);
 // one stderr line per claim (g6m4: G6_POOL_LOG=1)
@@ -77,4 +81,54 @@ uint32_t g6kv_kept_runs(const g6kv_pool* p);
 int g6kv_stats(const g6kv_pool* p, g6kv_totals* out);
 // writes up to cap live runs into out, returns how many there are
 size_t g6kv_runs(const g6kv_pool* p, g6kv_use* out, size_t cap);
+
+// Block stores below the pool (src/stash.rs, --kv-tier): retained runs the pool evicts, and prefixes that started
+// shared_after conversations, kept in tiers of blocks. After g6kv_keep: g6kv_stores, then g6kv_add_tier per tier in
+// flag order. Each reserve, take, grow or retain may queue copies. The engine takes the copies (g6kv_io_take), runs
+// them in order before anything writes those pages, then calls g6kv_io_done. Until then reserve, take and grow fail.
+void g6kv_stores(g6kv_pool* p, uint32_t shared_after);
+// keep: 0 = evicted runs, 1 = shared prefixes, 2 = both. index_dir (or NULL): the tier's shared prefixes survive
+// restarts while `compat` stays the same. 0, or -1 with g6kv_tier_error.
+int g6kv_add_tier(g6kv_pool* p, uint64_t slots, int32_t keep, const char* index_dir, const char* compat);
+// at admission, before the grant, on every rank: counts the prompt toward its prefixes and returns how many
+uint32_t g6kv_count(g6kv_pool* p, const int32_t* prompt, size_t n);
+// one copy: kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's slot -> page)
+struct g6kv_io
+{
+    uint32_t kind, page, tier, to;
+    uint64_t slot, to_slot;
+};
+size_t g6kv_io_pending(const g6kv_pool* p);
+// takes every queued copy into out. out holds cap entries, at least g6kv_io_pending.
+int g6kv_io_take(g6kv_pool* p, g6kv_io* out, size_t cap);
+// after the copies: commits the index records of the entries they wrote. 0, or -1 with g6kv_tier_error (the pool is
+// unchanged)
+int g6kv_io_done(g6kv_pool* p);
+struct g6kv_tier_totals
+{
+    uint64_t slots, free_slots;
+    uint32_t entries, shared;
+    uint64_t spilled_pages, moved_in_pages, restored_pages, hits, dropped;
+};
+// tier t's counters, or an error when there is no such tier
+int g6kv_tier_stats(const g6kv_pool* p, uint32_t t, g6kv_tier_totals* out);
+// writes into buf the entries loaded from indexes, one line each. The ranks compare these lines at boot. Returns the
+// length of the whole text plus its NUL.
+size_t g6kv_stored_summary(const g6kv_pool* p, char* buf, size_t cap);
+// keeps the entries the agreed text lists (the head's intersection of every rank's summary), in its order
+void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
+
+// A block store for those copies (src/blocks.rs): "ssd:PATH", "remote:HOST:PORT" (a lease named `name` on a KV node,
+// kvman-remote) or "mem:". Blocks are block_bytes rounded up to 4 KiB (g6kv_tier_block_bytes), and every read and
+// write moves one whole block. Calls return 0, or -1 with the reason in g6kv_tier_error (this thread's last).
+struct g6kv_tier;
+int g6kv_tier_open(const char* spec, const char* name, uint64_t block_bytes, uint64_t blocks, g6kv_tier** out);
+void g6kv_tier_free(g6kv_tier* t);
+const char* g6kv_tier_error();
+uint64_t g6kv_tier_block_bytes(const g6kv_tier* t);
+void g6kv_tier_describe(const g6kv_tier* t, char* buf, size_t cap);
+int g6kv_tier_write(const g6kv_tier* t, uint64_t block, const void* buf);
+int g6kv_tier_read(const g6kv_tier* t, uint64_t block, void* buf);
+// staging memory a KV node's RDMA device may read and write directly (a no-op for the other stores)
+int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
 }

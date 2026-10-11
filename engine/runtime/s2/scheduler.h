@@ -74,7 +74,9 @@ struct Slot {
     uint32_t prefilled = 0, emitted = 0;
 };
 // reuse: prompt rows the run already holds from a retained session (pool.h match), so prefill starts there
-struct Grant { Key key; Request req; Run run; uint32_t reuse = 0; };
+// reuse: rows the prefill skips. restored: 0, or 1 + the tier those rows come from (pool.h add_tier). counted: the
+// prefixes the request counted toward (pool.h count)
+struct Grant { Key key; Request req; Run run; uint32_t reuse = 0, restored = 0, counted = 0; };
 struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;
     std::optional<Key> cancel;

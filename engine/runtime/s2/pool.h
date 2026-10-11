@@ -5,18 +5,22 @@
 // growth and retirement in Driver::step. Calls take a lock: on the head, publish_status reads the pool from the control
 // thread. Binaries that include it link libg6kvman.a. A pool error throws, with the message of require().
 // log(true) (g6m4: G6_POOL_LOG=1): one stderr line per claim, with its pages and every retained run it evicted.
+// stores() + add_tier(): block stores below the pool (kvman-rs src/stash.rs). The engine then takes io() after each
+// reserve, take, grow or retain, runs the copies in order before anything writes those pages, and calls io_done().
 #pragma once
 #include "scheduler.h"
 #include "../prefix_reuse.h"
 #include "../../kvman-rs/g6kvman.h"
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace g6s2 {
-// match()'s result: skip = the retained rows a prompt can reuse (0 = none), age = the retained run, for take()
-struct PoolHit { int skip = 0, lcp = 0; const char* why = "none"; uint64_t age = 0; };
+// match()'s result: skip = the retained rows a prompt can reuse (0 = none), age = the retained run, for take().
+// stored: the run is in tier `tier`, and take() queues the copies that restore its pages.
+struct PoolHit { int skip = 0, lcp = 0; const char* why = "none"; uint64_t age = 0; bool stored = false; uint32_t tier = 0; };
 // status.s2: one live run's pages now and at worst
 struct PoolUse { uint32_t table_version = 0, held = 0, worst = 0; };
 class RunPool {
@@ -74,12 +78,12 @@ public:
     PoolHit match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit) const {
         Lock l(mu_); g6kv_hit h;
         check(g6kv_match(p_, prompt.data(), prompt.size(), rows, worst, limit, &h));
-        return PoolHit{h.skip, h.lcp, h.why, h.age};
+        return PoolHit{h.skip, h.lcp, h.why, h.age, h.stored != 0, h.tier};
     }
     PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit) const { return match(prompt, rows, rows, limit); }
     // claim a match() hit as a new grant (a fresh table version, as reserve)
     Run take(const PoolHit& h, uint64_t rows, uint64_t worst) {
-        Lock l(mu_); g6kv_run r; check(g6kv_take(p_, h.skip, h.age, rows, worst, &r)); return run(r);
+        Lock l(mu_); g6kv_run r; check(g6kv_take(p_, h.skip, h.age, h.stored ? int32_t(h.tier) : -1, rows, worst, &r)); return run(r);
     }
     Run take(const PoolHit& h, uint64_t rows) { return take(h, rows, rows); }
     // every rank's pool must agree: folded into Scheduler::digest at each event boundary
@@ -87,6 +91,39 @@ public:
     void log(bool on) { Lock l(mu_); g6kv_log(p_, on); }
     uint32_t kept_runs() const { Lock l(mu_); return g6kv_kept_runs(p_); }
     g6kv_totals stats() const { Lock l(mu_); g6kv_totals s; check(g6kv_stats(p_, &s)); return s; }
+    void stores(uint32_t shared_after) { Lock l(mu_); g6kv_stores(p_, shared_after); }
+    // keep: 0 evicted, 1 shared, 2 all. index_dir: empty, or the folder of the tier's index
+    void add_tier(uint64_t slots, int keep, const std::string& index_dir, const std::string& compat) {
+        Lock l(mu_);
+        require(g6kv_add_tier(p_, slots, keep, index_dir.empty() ? nullptr : index_dir.c_str(), compat.c_str()) == 0,
+                g6kv_tier_error());
+    }
+    // at admission, before the grant, on every rank
+    uint32_t count(const std::vector<int>& prompt) { Lock l(mu_); return g6kv_count(p_, prompt.data(), prompt.size()); }
+    // the copies queued since the last io(), in the order to run them. Then io_done()
+    std::vector<g6kv_io> io() {
+        Lock l(mu_);
+        std::vector<g6kv_io> v(g6kv_io_pending(p_));
+        check(g6kv_io_take(p_, v.data(), v.size()));
+        return v;
+    }
+    // nullptr, or why an index record could not be written (the pool is unchanged)
+    const char* io_done() { Lock l(mu_); return g6kv_io_done(p_) ? g6kv_tier_error() : nullptr; }
+    size_t io_pending() const { Lock l(mu_); return g6kv_io_pending(p_); }
+    std::vector<g6kv_tier_totals> tiers() const {
+        Lock l(mu_);
+        std::vector<g6kv_tier_totals> v;
+        for (g6kv_tier_totals t; g6kv_tier_stats(p_, uint32_t(v.size()), &t) == 0;) v.push_back(t);
+        return v;
+    }
+    std::string stored_summary() const {
+        Lock l(mu_);
+        std::string s(g6kv_stored_summary(p_, nullptr, 0), '\0');
+        g6kv_stored_summary(p_, s.data(), s.size());
+        s.pop_back();
+        return s;
+    }
+    void keep_agreed(const std::string& agreed) { Lock l(mu_); g6kv_keep_agreed(p_, agreed.c_str()); }
     std::vector<PoolUse> runs() const {
         Lock l(mu_);
         std::vector<g6kv_use> u(g6kv_runs(p_, nullptr, 0));

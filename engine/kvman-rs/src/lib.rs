@@ -30,10 +30,12 @@
 //! serves the same blocks from another box's locked memory over RDMA or TCP (REMOTE-TIER.md). The engine uses
 //! neither.
 
+pub mod blocks;
 pub mod ffi;
 pub mod pool;
 pub mod remote;
 pub mod reuse;
+pub mod stash;
 pub mod tier;
 
 pub use pool::{Error, Hit, Kept, Pool, Run, PAGE};

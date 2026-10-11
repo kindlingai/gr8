@@ -1,7 +1,8 @@
 #!/bin/bash
 # Host-only tests (g++, no CUDA): the S2 batch planner (engine/runtime/s2_batch.h, with a DFlash2 session), the S2 control barrier, the
 # pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool
-# against the C++ one it replaced), runs that grow on demand through Driver::step (driver_grow_test), the commit frame
+# against the C++ one it replaced), runs that grow on demand through Driver::step (driver_grow_test), the pool's block
+# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit frame
 # (s2/control_protocol.h), and the pack manifest parser (engine/loader/g6pack.cpp).
 #   scripts/host_tests.sh
 set -eu
@@ -32,6 +33,18 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/pool_diff_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_grow_test.cpp" "${KVLIB[@]}" -o "$T/driver_grow_test"
 "$T/driver_grow_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
+STORES=("mem:" "ssd:$T/store")
+NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
+if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in a container is usually 8 MiB)
+  "$NODE" --gb 0.05 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --ready "$T/node.json" > "$T/node.log" 2>&1 &
+  NODE_PID=$!
+  for _ in $(seq 50); do [ -s "$T/node.json" ] && break; sleep 0.1; done
+  PORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/node.json")
+  [ -n "$PORT" ] && STORES+=("remote:127.0.0.1:$PORT")
+fi
+"$T/pool_stash_test" "${STORES[@]}"
+[ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
 g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/tests/manifest_test.cpp" \

@@ -34,11 +34,16 @@
 //        leave the pool unsafe, and gives its pages back when it finishes (cleared when another session takes them)
 // [--spec-accept coupled|rejection]  as g6m4 (needs --mtp, no --s2): rejection = greedy drafts, accepted by rejection sampling
 // [--spec-adaptive [--spec-levels 1,2,4]]  as g6m4 (needs --mtp, no --s2): the drafts each round verifies (spec_len.h)
+// With --reuse-prefix, before each hit's prefill (s2/kv_tier.cuh):
+//   G6_KV_TIER_CHECK=STORE (mem:, ssd:PATH, remote:HOST:PORT): every rank's reused pages go to a block store, are
+//        poisoned, and come back. The lines printed must be the run's without it.
+//   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
 #include "prefill.cuh"
 #include "serve.h"
+#include "s2/kv_tier.cuh"
 #ifdef DEC_S2
 #include <map>
 #include <set>
@@ -49,6 +54,64 @@
 using namespace g6rt;
 
 constexpr int NR = g6nr::NR;           // simulated ranks: six, or four in a -DG6_NR=4 build
+
+// G6_KV_TIER_CHECK / G6_KV_RANKS_CMP (the header): logical pages 0..n-1 of every rank, main model then draft
+static void kv_tier_check(std::vector<Model>& R, std::vector<Draft>& DR, int n, int cap, cudaStream_t st)
+{
+    static std::vector<std::unique_ptr<g6s2::KvTiers>> tiers;
+    const char* spec = getenv("G6_KV_TIER_CHECK");
+    std::vector<std::vector<uint8_t>> blocks(R.size());
+    for (size_t r = 0; r < R.size(); ++r)
+    {
+        std::vector<const G6AttnBinding*> bs;
+        for (const Layer& y : R[r].layers) bs.push_back(&y.ab);
+        if (!DR.empty()) for (const Layer& y : DR[r].d.layers) bs.push_back(&y.ab);
+        // logical page -> physical page through the first binding's table (identity, or the CP map's replicated prefix)
+        std::vector<int> table(n);
+        G6RT_CK(cudaMemcpy(table.data(), bs[0]->args.block_table, n * sizeof(int), cudaMemcpyDeviceToHost));
+        std::vector<int> pages;
+        for (int t : table) if (t >= 0) pages.push_back(t);
+        if (tiers.size() <= r)
+        {
+            tiers.emplace_back(new g6s2::KvTiers(bs));
+            tiers.back()->add(spec ? spec : "mem:", "m4sim-r" + std::to_string(r), uint64_t(cap / 64 + 1) << 22);   // 4 MiB a page block
+        }
+        g6s2::KvTiers& t = *tiers[r];
+        if (getenv("G6_KV_RANKS_CMP"))
+            for (size_t i = 0; i < pages.size(); i += t.blocks().batch())
+            {
+                const std::vector<int> part(pages.begin() + long(i), pages.begin() + long(std::min(pages.size(), i + t.blocks().batch())));
+                t.blocks().copy(part, true, st);
+                for (size_t j = 0; j < part.size(); ++j)
+                    blocks[r].insert(blocks[r].end(), t.blocks().host(int(j)), t.blocks().host(int(j)) + t.blocks().block_bytes());
+            }
+        if (spec)
+            for (size_t i = 0; i < pages.size(); i += t.blocks().batch())
+            {
+                const std::vector<int> part(pages.begin() + long(i), pages.begin() + long(std::min(pages.size(), i + t.blocks().batch())));
+                t.round_trip(part, st, [&] {
+                    for (const G6AttnBinding* b : bs)
+                        for (int p : part)
+                        {
+                            G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)p * 64 * 656, 0x7f, 64 * 656, st));
+                            if (b->args.index_cache)
+                                G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)p * 64 * 132, 0x7f, 64 * 132, st));
+                        }
+                    G6RT_CK(cudaStreamSynchronize(st));
+                });
+            }
+    }
+    if (spec) fprintf(stderr, "# kv tier check: %d pages of %zu ranks through %s and back\n", n, R.size(), tiers[0]->describe(0).c_str());
+    if (getenv("G6_KV_RANKS_CMP"))
+        for (size_t r = 1; r < R.size(); ++r)
+        {
+            size_t diff = 0, first = SIZE_MAX;
+            for (size_t i = 0; i < blocks[r].size() && i < blocks[0].size(); ++i)
+                if (blocks[r][i] != blocks[0][i]) { ++diff; if (first == SIZE_MAX) first = i; }
+            fprintf(stderr, "# kv ranks: rank %zu vs rank 0, %d pages, %zu bytes: %zu differ%s\n", r, n, blocks[r].size(), diff,
+                    diff ? (" (first at byte " + std::to_string(first) + ")").c_str() : "");
+        }
+}
 
 // the NIC: every rank's send slot of collective c -> the shared recv slot [c][rank], then the tail. grid NR, block 128.
 struct Loop
@@ -1278,6 +1341,8 @@ int main(int argc, char** argv)
         else pt.lap("open");
         G6RT_CK(cudaStreamSynchronize(st));
         pt.lap("reset");
+        if (skip && (getenv("G6_KV_TIER_CHECK") || getenv("G6_KV_RANKS_CMP")))
+            kv_tier_check(R, DR, (skip + 63) / 64, cap, st);
         if (skip) printf("seq %zu prompt %zu tokens, %d reused\n", q, p.prompt.size(), skip);
         else printf("seq %zu prompt %zu tokens\n", q, p.prompt.size());
         const int npf = p.first;

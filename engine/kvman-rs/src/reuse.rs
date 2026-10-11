@@ -33,6 +33,8 @@ pub enum Why {
     Short,
     Grid,
     Hit,
+    /// a hit on a stored run (stash.rs)
+    Stored,
 }
 
 impl Why {
@@ -46,6 +48,7 @@ impl Why {
             Why::Short => c"short",
             Why::Grid => c"grid",
             Why::Hit => c"hit",
+            Why::Stored => c"stored",
         }
     }
 }

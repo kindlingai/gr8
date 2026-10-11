@@ -1,6 +1,7 @@
 //! The S2 page allocator below R (the pool every rank runs). See lib.rs for the rules it follows.
 
 use crate::reuse::{self, Finished, Rules, Why};
+use crate::stash::{continues, Index, Io, Keep, Stash, TierStats};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -19,12 +20,15 @@ pub struct Run {
 }
 
 /// match()'s result: skip = the retained rows a prompt can reuse (0 = none), age = the retained run, for take().
+/// stored: the run is in tier `tier` (stash.rs), and take() restores its pages.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hit {
     pub skip: i32,
     pub lcp: i32,
     pub why: Why,
     pub age: u64,
+    pub stored: bool,
+    pub tier: u32,
 }
 
 /// Every error leaves the pool as it was. The engine treats each one as fatal.
@@ -38,6 +42,7 @@ pub enum Error {
     VersionExhausted,
     BadArgument,
     PastWorst,
+    PendingIo,
 }
 
 impl Error {
@@ -55,6 +60,7 @@ impl Error {
             Error::VersionExhausted => c"pool table version exhausted",
             Error::BadArgument => c"pool call with a null or invalid argument",
             Error::PastWorst => c"pool growth past the run's worst case",
+            Error::PendingIo => c"pool call before the store copies of the last one ran",
         }
     }
     pub fn from_code(code: i32) -> Option<Error> {
@@ -67,6 +73,7 @@ impl Error {
             Error::VersionExhausted,
             Error::BadArgument,
             Error::PastWorst,
+            Error::PendingIo,
         ]
         .into_iter()
         .find(|e| e.code() == code)
@@ -82,6 +89,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 struct Held {
+    tokens: Vec<i32>, // the prompt, kept only while a tier counts shared prefixes
     list: Vec<u32>,
     exclusive: bool,
     worst: u32, // the most pages the run may grow to
@@ -103,6 +111,7 @@ pub struct Kept {
     pub list: Vec<u32>,
     pub st: Finished,
     pub age: u64,
+    pub exclusive: bool,
 }
 
 const FNV_OFFSET: u64 = 14695981039346656037;
@@ -139,6 +148,8 @@ pub struct Pool {
     age: u64,
     grows: u64,
     stalls: u64,
+    stash: Option<Stash>,
+    next_tokens: Option<Vec<i32>>,
 }
 
 impl Pool {
@@ -169,7 +180,90 @@ impl Pool {
             age: 0,
             grows: 0,
             stalls: 0,
+            stash: None,
+            next_tokens: None,
         })
+    }
+
+    /// Block stores below the pool (stash.rs), after keep(): a prefix that started `shared_after` conversations is
+    /// shared. Then add_tier() for each, in flag order.
+    pub fn stores(&mut self, shared_after: u32) {
+        self.stash = Some(Stash::new(shared_after, self.rules.grid.max(0) as u64));
+    }
+
+    /// A tier of `slots` blocks with its keep rule. index: (its folder, what makes its blocks compatible) to keep shared
+    /// prefixes across restarts.
+    pub fn add_tier(&mut self, slots: u64, keep: Keep, index: Option<(&std::path::Path, &str)>) -> std::io::Result<()> {
+        let ix = match index {
+            Some((dir, compat)) => Some(Index::open(dir, compat)?),
+            None => None,
+        };
+        self.stash.as_mut().ok_or_else(|| std::io::Error::other("add_tier before stores()"))?.add_tier(slots, keep, ix);
+        Ok(())
+    }
+
+    pub fn stash(&self) -> Option<&Stash> {
+        self.stash.as_ref()
+    }
+
+    pub fn tier_stats(&self, t: usize) -> Option<TierStats> {
+        self.stash.as_ref()?.stats(t)
+    }
+
+    /// The entries loaded at boot, one line each, for the ranks to agree on (keep_agreed).
+    pub fn stored_summary(&self) -> String {
+        self.stash.as_ref().map_or_else(String::new, Stash::summary)
+    }
+
+    pub fn keep_agreed(&mut self, agreed: &str) {
+        if let Some(s) = &mut self.stash {
+            s.keep_agreed(agreed);
+        }
+    }
+
+    /// At admission, before the grant (head at the event, workers at their grant): counts the prompt toward the
+    /// prefixes it starts (stash.rs). Returns how many it counted, which the grant carries.
+    pub fn count(&mut self, prompt: &[i32]) -> u32 {
+        let Some(s) = &self.stash else { return 0 };
+        if !s.counting() {
+            return 0;
+        }
+        let continuing = self.held.values().any(|h| continues(prompt, &h.tokens))
+            || self.kept.iter().any(|k| continues(prompt, &k.st.history))
+            || s.continues_stored(prompt);
+        self.next_tokens = Some(prompt.to_vec());
+        self.stash.as_mut().expect("checked").count(prompt, continuing)
+    }
+
+    /// The queued copies (stash.rs Io), in the order to run them. The engine calls io_done() after it ran them.
+    pub fn io(&mut self) -> Vec<Io> {
+        self.stash.as_mut().map_or_else(Vec::new, Stash::take_io)
+    }
+
+    /// After the copies from io(): commits the index records of the entries they wrote. An error leaves the pool as it
+    /// is. The entries stay, and only a restart misses them.
+    pub fn io_done(&mut self) -> std::io::Result<()> {
+        self.stash.as_mut().map_or(Ok(()), Stash::io_done)
+    }
+
+    /// Copies queued since the last io().
+    pub fn io_pending(&self) -> usize {
+        self.stash.as_ref().map_or(0, |s| s.io.len())
+    }
+
+    fn pending(&self) -> Result<(), Error> {
+        match &self.stash {
+            Some(s) if s.pending() => Err(Error::PendingIo),
+            _ => Ok(()),
+        }
+    }
+
+    // evicted retained runs go to the store, when there is one
+    fn spill(&mut self, gone: &[Kept]) {
+        let below = (self.below_rows as u64 / PAGE) as usize;
+        if let Some(s) = &mut self.stash {
+            s.put_evicted(gone, below);
+        }
     }
 
     pub fn exclusive(&self, rows: u64) -> bool {
@@ -215,6 +309,7 @@ impl Pool {
 
     /// A run of pages for `rows` now that may grow (grow()) to `worst` rows. An exclusive run holds its worst case.
     pub fn reserve(&mut self, rows: u64, worst: u64) -> Result<Run, Error> {
+        self.pending()?;
         if !self.fits(rows, worst) {
             return Err(Error::NoRoom);
         }
@@ -222,11 +317,13 @@ impl Pool {
         let w = pages_for(worst) as u32;
         if self.exclusive(worst) {
             let gone = std::mem::take(&mut self.kept);
+            self.spill(&gone);
             return Ok(self.grant((0..w).collect(), true, w, worst, "exclusive", &gone));
         }
         let n = pages_for(rows) as usize;
         let mut list = Vec::with_capacity(n);
         let gone = self.fill(&mut list, n);
+        self.spill(&gone);
         Ok(self.grant(list, false, w, rows, if gone.is_empty() { "free" } else { "lru" }, &gone))
     }
 
@@ -234,6 +331,7 @@ impl Pool {
     /// does). Ok(None) when the pages would leave the pool unsafe: the caller leaves the session out of this round.
     /// The run keeps its table version, and its list grows at the end.
     pub fn grow(&mut self, r: &Run, rows: u64) -> Result<Option<Run>, Error> {
+        self.pending()?;
         let h = self.held(r)?;
         let (n, have) = (pages_for(rows), h.list.len() as u64);
         if n <= have {
@@ -249,6 +347,7 @@ impl Pool {
         }
         let mut h = self.held.remove(&r.table_version).expect("held() found it");
         let gone = self.fill(&mut h.list, n as usize);
+        self.spill(&gone);
         self.mark(&h.list[have as usize..], true);
         self.grows += 1;
         let g = Run {
@@ -288,12 +387,17 @@ impl Pool {
 
     /// A retiring session's run: retained with its finished reuse state, or released when no row is valid.
     pub fn retain(&mut self, r: &Run, st: Finished) -> Result<(), Error> {
+        let exclusive = self.held(r)?.exclusive;
         let list = self.remove(r)?;
         if !self.keep || st.valid <= 0 {
             return Ok(());
         }
+        let rows_max = if exclusive { self.below_rows as u64 } else { u64::MAX };
+        if let Some(s) = &mut self.stash {
+            s.promote(&list, &st, rows_max);
+        }
         self.age += 1;
-        self.kept.push(Kept { list, st, age: self.age });
+        self.kept.push(Kept { list, st, age: self.age, exclusive });
         Ok(())
     }
 
@@ -333,17 +437,89 @@ impl Pool {
                 continue;
             }
             if t.skip > best.skip || (t.skip == best.skip && k.age > best.age) {
-                best = Hit { skip: t.skip, lcp: t.lcp, why: Why::Hit, age: k.age };
+                best = Hit { skip: t.skip, lcp: t.lcp, why: Why::Hit, age: k.age, stored: false, tier: 0 };
+            }
+        }
+        // the tiers in order. A stored hit must reuse more rows than the pool's best, since a pool hit is free of copies
+        let Some(stash) = &self.stash else { return best };
+        for t in 0..stash.tiers() {
+            for e in stash.entries(t) {
+                let b = reuse::begin(&self.rules, &e.st, prompt, limit, true);
+                if b.skip <= 0 {
+                    if best.skip == 0 && b.lcp >= best.lcp {
+                        best.lcp = b.lcp;
+                        best.why = b.why;
+                    }
+                    continue;
+                }
+                let a = pages_for(b.skip as u64);
+                if a > e.slots.len() as u64 || !self.restore_room(a, n, w, worst) {
+                    if best.skip == 0 {
+                        best.why = Why::Room;
+                    }
+                    continue;
+                }
+                let tier = t as u32;
+                if b.skip > best.skip || (best.stored && b.skip == best.skip && tier == best.tier && e.id > best.age) {
+                    best = Hit { skip: b.skip, lcp: b.lcp, why: Why::Stored, age: e.id, stored: true, tier };
+                }
             }
         }
         best
     }
 
+    // whether a grant of n pages (worst w) can restore its first a pages. Below R it is as reserve() makes it. Past R it
+    // needs an empty pool, and the restored pages must lie inside the CP map's replicated start
+    fn restore_room(&self, a: u64, n: u64, w: u64, worst: u64) -> bool {
+        if a > n {
+            return false;
+        }
+        if self.exclusive(worst) {
+            return self.live == 0 && !self.exclusive && n <= self.pages as u64 && a * PAGE <= self.below_rows as u64;
+        }
+        n <= self.place.wrapping_sub(self.live) as u64 && n <= w && self.safe(Some((n, w)), None)
+    }
+
+    /// Claims a stored hit: a fresh grant as reserve() makes it, with the entry's first ceil(skip / 64) blocks queued
+    /// for restore into its first pages.
+    fn take_stored(&mut self, skip: i32, id: u64, tier: usize, rows: u64, worst: u64) -> Result<Run, Error> {
+        let e = self.stash.as_ref().and_then(|s| s.find(tier, id)).ok_or(Error::NotRetained)?;
+        let w = pages_for(worst);
+        let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w } else { pages_for(rows) });
+        if a > e.slots.len() as u64 || !self.restore_room(a, n, w, worst) {
+            return Err(Error::NoRoom);
+        }
+        self.check_version()?;
+        let e = self.stash.as_mut().expect("found in it").begin_restore(tier, id);
+        let (list, gone, exclusive) = if self.exclusive(worst) {
+            let gone = std::mem::take(&mut self.kept);
+            self.spill(&gone);
+            ((0..n as u32).collect::<Vec<u32>>(), gone, true)
+        } else {
+            let mut list = Vec::with_capacity(n as usize);
+            let gone = self.fill(&mut list, n as usize);
+            self.spill(&gone);
+            (list, gone, false)
+        };
+        self.stash.as_mut().expect("found in it").restore(tier, &e, &list[..a as usize]);
+        let rows = if exclusive { worst } else { rows };
+        Ok(self.grant(list, exclusive, w as u32, rows, "stored", &gone))
+    }
+
     /// Claims a match_prefix() hit (skip, age) as a new grant: the retained run's first ceil(skip / 64) pages, then
     /// pages as reserve() takes them.
     pub fn take(&mut self, skip: i32, age: u64, rows: u64, worst: u64) -> Result<Run, Error> {
+        self.take_hit(skip, age, None, rows, worst)
+    }
+
+    /// take() for a hit that may be stored (from = its tier).
+    pub fn take_hit(&mut self, skip: i32, age: u64, from: Option<u32>, rows: u64, worst: u64) -> Result<Run, Error> {
+        self.pending()?;
         if skip <= 0 || !self.admissible(worst) {
             return Err(Error::NoHit);
+        }
+        if let Some(t) = from {
+            return self.take_stored(skip, age, t as usize, rows, worst);
         }
         let i = self.kept.iter().position(|k| k.age == age).ok_or(Error::NotRetained)?;
         let w = pages_for(worst);
@@ -370,10 +546,12 @@ impl Pool {
         list.truncate(a as usize);
         if self.exclusive(worst) {
             let gone = std::mem::take(&mut self.kept);
+            self.spill(&gone);
             list.extend(a as u32..n as u32);
             return Ok(self.grant(list, true, w as u32, worst, "hit", &gone));
         }
         let gone = self.fill(&mut list, n as usize);
+        self.spill(&gone);
         Ok(self.grant(list, false, w as u32, rows, "hit", &gone))
     }
 
@@ -394,7 +572,11 @@ impl Pool {
         for k in &self.kept {
             h = mix(mix(mix(h, k.age), hash(&k.list, false)), k.st.valid as i64 as u64);
         }
-        h
+        // without a store the digest is what it was before stores existed
+        match &self.stash {
+            Some(s) => s.fold(h, mix),
+            None => h,
+        }
     }
 
     /// One stderr line per claim (g6m4: G6_POOL_LOG=1).
@@ -566,7 +748,8 @@ impl Pool {
             list_hash: hash(&list, exclusive),
         };
         self.log_claim(how, &r, rows, gone);
-        self.held.insert(r.table_version, Held { list, exclusive, worst });
+        let tokens = self.next_tokens.take().unwrap_or_default();
+        self.held.insert(r.table_version, Held { tokens, list, exclusive, worst });
         self.exclusive = self.exclusive || exclusive;
         r
     }

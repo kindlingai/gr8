@@ -28,6 +28,10 @@ struct PoolHooks {
     std::function<void(const Run&, const g6rt::PrefixReuse&)> retain;
     std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit)> match;
     std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst)> take;
+    // optional, block stores (pool.h add_tier): counting toward shared prefixes at admission (head and workers, before
+    // the grant), and each tier's counters for status.s2
+    std::function<uint32_t(const std::vector<int>& prompt)> count;
+    std::function<std::vector<g6kv_tier_totals>()> tiers;
     // optional: the pool's state, compared across ranks at every event (Scheduler::pool_digest)
     std::function<uint64_t()> digest;
 };
@@ -101,6 +105,17 @@ class Service {
             o << ",\"held_pages\":" << st.held_pages << ",\"worst_pages\":" << st.worst_pages << ",\"grown\":" << st.grows
               << ",\"stalled_rounds\":" << st.stalls;
         }
+        if (native_.pool.tiers) {
+            o << ",\"tiers\":[";
+            const auto ts = native_.pool.tiers();
+            for (size_t i = 0; i < ts.size(); ++i) {
+                const auto& t = ts[i];
+                o << (i ? "," : "") << "{\"slots\":" << t.slots << ",\"free_slots\":" << t.free_slots << ",\"entries\":" << t.entries
+                  << ",\"shared\":" << t.shared << ",\"spilled_pages\":" << t.spilled_pages << ",\"moved_in_pages\":" << t.moved_in_pages
+                  << ",\"restored_pages\":" << t.restored_pages << ",\"hits\":" << t.hits << ",\"dropped\":" << t.dropped << "}";
+            }
+            o << "]";
+        }
         if (native_.pool.runs) {
             o << ",\"runs\":[";
             const auto runs = native_.pool.runs();
@@ -131,16 +146,17 @@ class Service {
                 const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.fits(rows, worst), native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
                 if (fit->why == Stall::None) {
-                    Run run{}; uint32_t skip = 0;
+                    Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
+                        if (native_.pool.count) counted = native_.pool.count(pr->second);
                         const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1);
-                        if (h.skip > 0) { run = native_.pool.take(h, rows, worst); skip = uint32_t(h.skip); }
+                        if (h.skip > 0) { run = native_.pool.take(h, rows, worst); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0; }
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
                                 h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
                     if (!skip) run = native_.pool.reserve(rows, worst);
-                    cm.admit = Grant{s.next_key(), *request, run, skip};
+                    cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
                 if (cm.admit) { queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request); payloads_.erase(command.request); }
@@ -248,9 +264,12 @@ public:
             if (c_.rank) {   // the head's call, on the same pool state
                 const auto worst = reserve_rows(c_.scheduler,g.req), rows = admit_rows(g.req);
                 Run mine;
+                if (native_.pool.count && reuse() && staged_->plp < 0)
+                    require(native_.pool.count(staged_->prompt) == g.counted, "worker prefix counts differ from the head");
+                else require(!g.counted, "a counted grant without counting");
                 if (g.reuse) {
                     const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1);
-                    require(h.skip == int(g.reuse), "worker prefix reuse differs from the head");
+                    require(h.skip == int(g.reuse) && (h.stored ? h.tier + 1 : 0) == g.restored, "worker prefix reuse differs from the head");
                     mine = native_.pool.take(h, rows, worst);
                 } else mine = native_.pool.reserve(rows, worst);
                 require(mine == g.run, "worker page list differs from the head's grant");

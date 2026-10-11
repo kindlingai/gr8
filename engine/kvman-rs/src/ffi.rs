@@ -3,15 +3,19 @@
 
 use crate::pool::{Error, Pool, Run, Stats};
 use crate::reuse::{Finished, Rules};
+use crate::stash::{Io, Keep, TierStats};
 use std::ffi::c_char;
+use std::ffi::CStr;
 
-/// g6kv_hit: match's result. `why` points at a static string.
+/// g6kv_hit: match's result. `why` points at a static string. stored: the run is in the store.
 #[repr(C)]
 pub struct G6kvHit {
     pub skip: i32,
     pub lcp: i32,
     pub why: *const c_char,
     pub age: u64,
+    pub stored: i32,
+    pub tier: u32,
 }
 
 fn code(r: Result<(), Error>) -> i32 {
@@ -211,20 +215,35 @@ pub unsafe extern "C" fn g6kv_match(
         return Error::BadArgument.code();
     }
     let h = (*p).match_prefix(prompt, rows, worst, limit);
-    *out = G6kvHit { skip: h.skip, lcp: h.lcp, why: h.why.name().as_ptr(), age: h.age };
+    *out = G6kvHit {
+        skip: h.skip,
+        lcp: h.lcp,
+        why: h.why.name().as_ptr(),
+        age: h.age,
+        stored: h.stored as i32,
+        tier: h.tier,
+    };
     0
 }
 
-/// Claims a g6kv_match hit (its skip and age).
+/// Claims a g6kv_match hit: its skip and age, and `from` = -1 for the pool or the tier of a stored hit.
 ///
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_take(p: *mut Pool, skip: i32, age: u64, rows: u64, worst: u64, out: *mut Run) -> i32 {
+pub unsafe extern "C" fn g6kv_take(
+    p: *mut Pool,
+    skip: i32,
+    age: u64,
+    from: i32,
+    rows: u64,
+    worst: u64,
+    out: *mut Run,
+) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).take(skip, age, rows, worst) {
+    match (*p).take_hit(skip, age, (from >= 0).then_some(from as u32), rows, worst) {
         Ok(r) => {
             *out = r;
             0
@@ -307,4 +326,146 @@ pub unsafe extern "C" fn g6kv_log(p: *mut Pool, on: i32) {
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_kept_runs(p: *const Pool) -> u32 {
     (*p).kept_runs()
+}
+
+/// Block stores below the pool (src/stash.rs), after g6kv_keep. Then g6kv_add_tier per tier, in flag order.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stores(p: *mut Pool, shared_after: u32) {
+    (*p).stores(shared_after);
+}
+
+/// A tier of `slots` blocks: keep 0 = evicted runs, 1 = shared prefixes, 2 = both. index_dir (or NULL) keeps its
+/// shared prefixes across restarts, valid while `compat` is the same. 0, or -1 with g6kv_tier_error.
+///
+/// # Safety
+/// As g6kv_exclusive. index_dir and compat are NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_add_tier(
+    p: *mut Pool,
+    slots: u64,
+    keep: i32,
+    index_dir: *const c_char,
+    compat: *const c_char,
+) -> i32 {
+    let keep = match keep {
+        0 => Keep::Evicted,
+        1 => Keep::Shared,
+        2 => Keep::All,
+        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2")),
+    };
+    let text = |c: *const c_char| (!c.is_null()).then(|| CStr::from_ptr(c).to_string_lossy().into_owned());
+    let (dir, compat) = (text(index_dir), text(compat).unwrap_or_default());
+    match (*p).add_tier(slots, keep, dir.as_deref().map(|d| (std::path::Path::new(d), compat.as_str()))) {
+        Ok(()) => 0,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// At admission, before the grant, on every rank: counts the prompt toward the prefixes it starts. Returns how many.
+///
+/// # Safety
+/// As g6kv_exclusive; `prompt` points at `n` ints.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_count(p: *mut Pool, prompt: *const i32, n: usize) -> u32 {
+    slice(prompt, n).map_or(0, |pr| (*p).count(pr))
+}
+
+/// g6kv_io: one copy. kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's
+/// slot -> page).
+#[repr(C)]
+pub struct G6kvIo {
+    pub kind: u32,
+    pub page: u32,
+    pub tier: u32,
+    pub to: u32,
+    pub slot: u64,
+    pub to_slot: u64,
+}
+
+/// Copies queued since the last g6kv_io_take.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_io_pending(p: *const Pool) -> usize {
+    (*p).io_pending()
+}
+
+/// Takes the queued copies into `out`, in the order to run them. `cap` must hold them all (g6kv_io_pending). Then
+/// g6kv_io_done once they ran.
+///
+/// # Safety
+/// As g6kv_exclusive, and `out` must hold `cap` entries.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_io_take(p: *mut Pool, out: *mut G6kvIo, cap: usize) -> i32 {
+    let p = &mut *p;
+    if p.io_pending() > cap || (cap > 0 && out.is_null()) {
+        return Error::BadArgument.code();
+    }
+    for (i, x) in p.io().into_iter().enumerate() {
+        *out.add(i) = match x {
+            Io::Spill { tier, page, slot } => G6kvIo { kind: 0, page, tier, to: 0, slot, to_slot: 0 },
+            Io::Move { tier, slot, to, to_slot } => G6kvIo { kind: 1, page: 0, tier, to, slot, to_slot },
+            Io::Restore { tier, slot, page } => G6kvIo { kind: 2, page, tier, to: 0, slot, to_slot: 0 },
+        };
+    }
+    0
+}
+
+/// The copies ran: commits what they wrote to the tiers' indexes. 0, or -1 with g6kv_tier_error (the pool is unchanged;
+/// only a restart would miss those entries).
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_io_done(p: *mut Pool) -> i32 {
+    match (*p).io_done() {
+        Ok(()) => 0,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// Tier t's counters, or BadArgument when there is no such tier.
+///
+/// # Safety
+/// As g6kv_exclusive, and `out` must be valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_stats(p: *const Pool, t: u32, out: *mut TierStats) -> i32 {
+    match ((*p).tier_stats(t as usize), out.is_null()) {
+        (Some(s), false) => {
+            *out = s;
+            0
+        }
+        _ => Error::BadArgument.code(),
+    }
+}
+
+/// Writes into `buf` (NUL-terminated, cut to `cap`) the stored entries the ranks compare at boot, one line each. Returns
+/// the length of the whole text plus its NUL.
+///
+/// # Safety
+/// As g6kv_exclusive; `buf` holds `cap` bytes (or is NULL with cap 0).
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stored_summary(p: *const Pool, buf: *mut c_char, cap: usize) -> usize {
+    let s = (*p).stored_summary();
+    if !buf.is_null() && cap > 0 {
+        let n = s.len().min(cap - 1);
+        std::ptr::copy_nonoverlapping(s.as_ptr() as *const c_char, buf, n);
+        *buf.add(n) = 0;
+    }
+    s.len() + 1
+}
+
+/// Keeps the stored entries that `agreed` names (the head's intersection of every rank's summary), in the text's order.
+///
+/// # Safety
+/// As g6kv_exclusive; `agreed` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_keep_agreed(p: *mut Pool, agreed: *const c_char) {
+    if !agreed.is_null() {
+        (*p).keep_agreed(&CStr::from_ptr(agreed).to_string_lossy());
+    }
 }
