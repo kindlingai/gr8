@@ -2,7 +2,7 @@
 // G6_REUSE_HDUMP=<dir> + G6_REUSE_HDUMP_SEQ=<q[,q..]>: after the prefill loop of a listed seq (before any decode step),
 //   every layer's cache bytes for rows [0, n) (n = the prefill end, p.first) -> <dir>/hd.<q>.r<rank>.bin, raw, page by
 //   page: the target model (tag 'm') then the MTP draft model (tag 'd'). tools/reuse/hdump.py hashes the rows and
-//   merges the ranks by GLOBAL row (latent rows live on their owner rank only; index rows are replicated under CP).
+//   merges the ranks by GLOBAL row (latent and index rows live on their owner rank only).
 // G6_REUSE_ZSCRATCH=1 (with --reuse-prefix): on a hit, every layer's per-seq attention scratch is cleared before the
 //   suffix prefill: indices := -1 (0xff bytes), output := 0 (max_rows rows of each binding).
 // File format (little endian): per layer a header of 12 int32
@@ -80,8 +80,7 @@ inline size_t hdump_model(FILE* f, Model& m, int tag, int n)
         for (int lp = 0; lp < np; ++lp)
         {
             const int pg = bt[lp];
-            const int ip0 = cp ? lp : pg;     // as k_reuse_poison: CP index keys are replicated, logical-page addressed
-            const int ip = (a.index_cache && ip0 >= 0 && ip0 < (cp ? a.table_size : a.page_count)) ? ip0 : -1;
+            const int ip = (a.index_cache && pg >= 0 && pg < a.page_count) ? pg : -1;   // index keys sit on the latent's pages
             const int rec[2] = {pg, ip};
             hdump_put(f, rec, sizeof rec); bytes += sizeof rec;
             if (pg >= 0 && pg < a.page_count)

@@ -220,9 +220,12 @@ struct CpState
     unsigned* tickets = nullptr;      // [colls.ncoll()] publish tickets, device, zero
     uint64_t* cand = nullptr;         // [nr][MX][2048] candidate lists, own at [rank] (layout [s][M][2048] per step)
     float *qbuf = nullptr, *part_all = nullptr, *part_tmp = nullptr;   // [MX][HMAX][576], [nr][cp_blk(MX, HMAX)], [nr-1][same]
-    // prefill staging (step 4, prefill.cuh cp_pf_*): two latent pools of one layer at capacity, the identity table, and
-    // every layer's CP args while the prefill view is swapped in (pf_staged)
+    // prefill staging (step 4, prefill.cuh cp_pf_*): two latent pools of one layer at capacity (each followed by one
+    // layer's index pages at pf_ixoff), the identity table, and every layer's CP args while the prefill view is swapped in
+    // (pf_staged); pf_ixon: this staged view stages the index keys (not an S2 run below R)
     char* pf_pool[2] = {};
+    size_t pf_ixoff = 0;
+    bool pf_ixon = false;
     int* pf_ident = nullptr;
     std::vector<G6Attn> pf_saved;
     bool pf_staged = false;

@@ -48,8 +48,8 @@ RigMark. One test window on one cluster.
 - Prefix reuse: a request that continues an earlier conversation re-prefills only the new part. A continued 20K
   conversation takes 7.1 s instead of 17.3 s at TP=4.
 - Prefill attention split by query and head owner across ranks ([docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
-- Context-parallel KV: the first `SHARE_LIMIT` tokens (65,536 at TP=4 and TP=3) are on every rank, later pages are
-  spread across ranks, so the pools above fit. Requests up to that size share decode steps.
+- Context-parallel KV: the first `SHARE_LIMIT` tokens (65,536 at TP=4 and TP=3) are on every rank, later pages (their
+  latent and their indexer keys) are spread across ranks, so the pools above fit. Requests up to that size share decode steps.
 
 ## What you need
 

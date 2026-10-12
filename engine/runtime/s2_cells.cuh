@@ -72,7 +72,7 @@ __global__ void __launch_bounds__(128) k_s2_cells(S2Cells c)
         x.context = sh.ctx[j];
         x.page_count = c.page_bound;
         x.table_size = pages;
-        x.ibase = 0;                         // CP index-run base: S2 views run replicated (cp_nr = 0), so unused here
+        x.ibase = 0;                         // unused (attn.cu ipage: index keys sit on the block table's pages)
         x.sess = sh.sess[j];
     }
     int ctx = 0, tab = 0;

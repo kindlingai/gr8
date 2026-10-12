@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-12: CP: indexer keys are spread across ranks with the latent
+
+- Under CP every rank held every token's indexer keys (22 layers x 132 B per token, all CAP tokens), though a rank
+  scores only the keys of its own pages past R. They now sit on the latent's pages: the replicated first `SHARE_LIMIT`
+  tokens, then the rank's own pages. At TP=4 that is 0.32 GiB per rank instead of 0.76 GiB; at TP=6, 0.33 instead
+  of 1.59 (SHARE_LIMIT 32768).
+- Prefill stages them with the latent: each staging pool gains one layer's index pages (2 x 8.4 KB per page of CAP),
+  filled, gathered from the owners (two more RDMA ranges per page), hashed (`G6_CP_PF_VERIFY`) and copied back with
+  the latent rows. An S2 run below R reads them in place, as before.
+- Output is unchanged: m4sim prints the same lines as before with CP pages spread across ranks, two prefill lanes,
+  row-owner index (`G6_PF_OWN=2`), MTP, prefix reuse and S2 sessions. Tier page blocks keep their layout and contents.
+- The defaults (`CAP`, pages per rank) are unchanged; the memory this frees is listed in the PR for a later default.
+
 ## 2026-10-12: what the KV stores keep (`--kv-store`, `--kv-keep`), system prompts by default
 
 - Experimental, off by default. `--kv-store STORE,size=N` (repeatable, tried in order; `KV_STORE`, stores separated by `;`) says where, and

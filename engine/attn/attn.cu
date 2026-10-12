@@ -53,7 +53,7 @@ __device__ __forceinline__ DeviceAttn resolve(ReplayInput input) {
 #ifdef DEC_S2
 // Batched step (cell->rows): the row's own session table / bounds. Every KV access of a row (append, indexer keys, scores,
 // context) calls this once r is known, so one launch serves rows of different sessions. CP: page_count is the rank's
-// physical page count (fixed), ibase offsets the session's run in the logical-page addressed index cache.
+// physical page count (fixed). ibase is not read: index keys sit on the block table's pages, as the latent does.
 __device__ __forceinline__ void for_row(DeviceAttn&,const G6Attn&,int){}
 __device__ __forceinline__ void for_row(DeviceAttn& a,const ReplayInput& in,int r){
     const G6AttnRow* rows=in.cell->rows;if(!rows)return;
@@ -163,14 +163,10 @@ __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
     int p=page(a,pos);return p<0?nullptr:(const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*KV_BYTES;
 }
 #if defined(G6_CP) && G6_CP
-// CP: index keys are REPLICATED: the index cache is logical-page addressed (table_size pages) on every
-// rank; below R the replicated path's identity prefix of the block table gives the same address
+// CP: index keys are stored as the latent: on the pages of the block table (the replicated prefix, then this rank's
+// pages past R), so a rank holds exactly the keys it scores (CP_MINE). The staged prefill view reads every key from the
+// staging pool (runtime/prefill.cuh cp_pf_enter), or through index_table (S2 below R: the run's own table).
 __device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){
-#ifdef DEC_S2
-    if(a.cp_nr){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}return a.ibase+pos/a.page_size;}
-#else
-    if(a.cp_nr){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}return pos/a.page_size;}
-#endif
     if(a.index_table){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}
         const int p=a.index_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;}
     return page(a,pos);
@@ -206,7 +202,7 @@ __global__ void append_kv(Input input){
 template<class Input>
 __global__ void append_index(Input input){
     auto a=resolve(input);if(!a.active)return;
-    int r=blockIdx.x,t=threadIdx.x,pos=a.positions[r];FOR_ROW(a,input,r);int pg=ipage(a,pos);if(pg<0)return;   // CP: every rank appends every key
+    int r=blockIdx.x,t=threadIdx.x,pos=a.positions[r];FOR_ROW(a,input,r);CP_REMOTE_ROW(a,pos)int pg=ipage(a,pos);if(pg<0)return;   // CP: the page's owner appends it, as append_kv
     __shared__ float v[128],sum[4],scale;
     float x=hfloat(a.index_k,(int64_t)r*128+t),s=warp_sum(x);if((t&31)==0)sum[t/32]=s;__syncthreads();
     float mean=(sum[0]+sum[1]+sum[2]+sum[3])/128;

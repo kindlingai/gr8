@@ -11,7 +11,7 @@
 struct G6AttnRow {
     const int* table;                    // the session's block table (logical page -> physical page, G6_CP_REMOTE, -1)
     int context, page_count, table_size; // the session's live bounds, as the step cell's fields
-    int ibase;                           // CP: first page of the session's index-cache run (logical-page addressed)
+    int ibase;                           // unused (index keys sit on the block table's pages); kept for the cell layout
     int sess;                            // session id: positions must be distinct only within one session
 };
 #endif

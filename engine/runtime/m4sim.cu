@@ -655,7 +655,7 @@ int main(int argc, char** argv)
                 {
                     const G6Attn& a = y.ab.args;
                     G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * 656, st));
-                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)std::max(a.page_count, a.table_size) * 64 * 132, st));
+                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)a.page_count * 64 * 132, st));
                 }
             };
             for (Model& m : R) poison(m);

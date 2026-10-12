@@ -15,8 +15,8 @@
 //   cp:  context-parallel decode (cp_front / cp_index / cp_merge_index / cp_group / cp_finish), query tile 32. All NR ranks run
 //        one after the other on this GPU (the exchange is plain device buffers), each with its own binding. Reference: one
 //        standalone CP binding per (session, rank) in the plain form; batched: one CP binding per rank holding every
-//        session's pages (per-row table with the session's physical pages, G6_CP_REMOTE for pages of other ranks, per-row
-//        index-cache run base). Compared: output rows of every rank's head group, merged index lists.
+//        session's pages (per-row table with the session's physical pages, G6_CP_REMOTE for pages of other ranks; index keys on
+//        the same pages). Compared: output rows of every rank's head group, merged index lists, latent and index caches.
 // KV is filled by the append path itself (random fp16 inputs through g6_attn_append), the step's own rows are appended by the
 // step. Row i of a session sits at position ctx - rows + i (a decode / verify step), so every row of a session sees its own
 // causal bound.
@@ -734,7 +734,7 @@ static void run_cp(const Case& c, uint64_t seed)
     CK(cudaStreamSynchronize(ST));
 
     // history on the reference bindings (each rank appends the pages it stores), then copied into the batched binding:
-    // MLA pages of session s at physical base s * PH (the reference map + base), index cache (logical pages) at ibase = s * P
+    // MLA and index pages of session s at physical base s * PH (the reference map + base; index keys sit on the latent's pages)
     int PH[NRK];
     for (int r = 0; r < NRK; ++r)
     {
@@ -756,8 +756,8 @@ static void run_cp(const Case& c, uint64_t seed)
                 CK(cudaMemcpy((char*)bw->b[r][l].args.mla_cache + (size_t)s * PH[r] * 64 * KV_B, ref[s]->b[r][l].args.mla_cache,
                               (size_t)PH[r] * 64 * KV_B, cudaMemcpyDeviceToDevice));
                 if (l == 0)
-                    CK(cudaMemcpy((char*)bw->b[r][l].args.index_cache + (size_t)s * P * 64 * IX_B, ref[s]->b[r][l].args.index_cache,
-                                  (size_t)P * 64 * IX_B, cudaMemcpyDeviceToDevice));
+                    CK(cudaMemcpy((char*)bw->b[r][l].args.index_cache + (size_t)s * PH[r] * 64 * IX_B, ref[s]->b[r][l].args.index_cache,
+                                  (size_t)PH[r] * 64 * IX_B, cudaMemcpyDeviceToDevice));
             }
 
     // the step
@@ -864,8 +864,8 @@ static void run_cp(const Case& c, uint64_t seed)
                 if (l == 0)
                 {
                     k.rows(bw->b[r][l].args.indices + (size_t)row0[s] * 2048, ref[s]->b[r][l].args.indices, c.s[s].first, 2048 * 4, "lists" + at);
-                    k.need(dev_eq((const char*)bw->b[r][l].args.index_cache + (size_t)s * P * 64 * IX_B, ref[s]->b[r][l].args.index_cache,
-                                  (size_t)P * 64 * IX_B), "idx-cache" + at);
+                    k.need(dev_eq((const char*)bw->b[r][l].args.index_cache + (size_t)s * PH[r] * 64 * IX_B, ref[s]->b[r][l].args.index_cache,
+                                  (size_t)PH[r] * 64 * IX_B), "idx-cache" + at);
                 }
             }
     for (int r = 0; r < NRK; ++r)
