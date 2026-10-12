@@ -599,6 +599,7 @@ mod tests {
                 stop_ids: vec![EOS as i64],
                 logprobs: None,
                 prompt_logprobs: None,
+                system_tokens: None,
             },
             stop: vec![],
             include_stop: false,
