@@ -7,11 +7,15 @@
 # the pool's block
 # store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
 # frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
-# after load (engine/runtime/host_reclaim.h).
+# after load (engine/runtime/host_reclaim.h), and steering profile contracts/validation.
 #   scripts/host_tests.sh
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+# Inactive steering contracts/profile loader: CPU only, no CUDA or Rust dependencies.
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
+  "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
+"$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" -o "$T/relay_test"
 "$T/relay_test"
 python3 "$REPO/engine/comms/tests/relay_loop_test.py"

@@ -1,0 +1,153 @@
+{
+  "profile_names": [
+    {
+      "input": "",
+      "valid": false
+    },
+    {
+      "input": "example",
+      "valid": true
+    },
+    {
+      "input": "A-0_b.c",
+      "valid": true
+    },
+    {
+      "input": "0",
+      "valid": true
+    },
+    {
+      "input": ".example",
+      "valid": false
+    },
+    {
+      "input": "_example",
+      "valid": false
+    },
+    {
+      "input": "-example",
+      "valid": false
+    },
+    {
+      "input": "bad/name",
+      "valid": false
+    },
+    {
+      "input": "bad name",
+      "valid": false
+    },
+    {
+      "input": "\u00e9",
+      "valid": false
+    },
+    {
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": true
+    },
+    {
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false
+    }
+  ],
+  "scales": [
+    {
+      "input": "0",
+      "valid": true,
+      "bits": "00000000"
+    },
+    {
+      "input": "-0",
+      "valid": true,
+      "bits": "00000000"
+    },
+    {
+      "input": "1",
+      "valid": true,
+      "bits": "3f800000"
+    },
+    {
+      "input": "1.1",
+      "valid": true,
+      "bits": "3f8ccccd"
+    },
+    {
+      "input": "0.5",
+      "valid": true,
+      "bits": "3f000000"
+    },
+    {
+      "input": "2.5",
+      "valid": true,
+      "bits": "40200000"
+    },
+    {
+      "input": "4",
+      "valid": true,
+      "bits": "40800000"
+    },
+    {
+      "input": "4.00000001",
+      "valid": false
+    },
+    {
+      "input": "-1e-50",
+      "valid": false
+    },
+    {
+      "input": "1e-50",
+      "valid": true,
+      "bits": "00000000"
+    },
+    {
+      "input": "-1",
+      "valid": false
+    },
+    {
+      "input": "1e100",
+      "valid": false
+    },
+    {
+      "input": "nan",
+      "valid": false
+    },
+    {
+      "input": "inf",
+      "valid": false
+    },
+    {
+      "input": "-inf",
+      "valid": false
+    }
+  ],
+  "json_valid": [
+    "{}",
+    "[]",
+    "{\"name\":\"\\ud83d\\udd25\"}",
+    "\"\u00e9\ud83d\udd25\"",
+    "[0,-0,1.5,1e-20,1e-400]",
+    "{\"a\":[true,false,null]}"
+  ],
+  "json_invalid": [
+    "00",
+    "01",
+    "-01",
+    "[01]",
+    "{\"n\":00}",
+    "+1",
+    ".1",
+    "1.",
+    "1e",
+    "1e+",
+    "NaN",
+    "Infinity",
+    "1e309",
+    "[1,]",
+    "{\"n\":1,}",
+    "true false",
+    "\"\\ud800\"",
+    "\"\\udc00\"",
+    "\"\\ud800\\u0041\"",
+    "\"\\q\"",
+    "\"unescaped\nnewline\""
+  ]
+}
