@@ -42,6 +42,10 @@ struct NativeHooks {
     std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK
+    // optional: did this rank run tier copies since the last call (the same answer on every rank: the copies are). Then
+    // the ranks line up before the next round: one rank's copies can take seconds longer than another's, and a GPU wait
+    // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
+    std::function<bool()> drained;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
@@ -75,6 +79,7 @@ class Service {
     std::mutex failure_mu_; std::exception_ptr failure_;
     uint64_t attempted_head_ = UINT64_MAX, attempted_revision_ = UINT64_MAX;
     uint64_t event_ = 1;
+    uint64_t sync_ = 0;   // compute thread: barriers passed (native_.drained)
     static constexpr uint64_t LOOKAHEAD = 8; // future safe boundary; late notices remain fatal
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
@@ -286,6 +291,8 @@ public:
         h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
         h.finished = [&](const Slot& s) { retire_run(s); };
+        if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
+            h.settle = [&] { if (native_.drained()) endpoint_->sync(++sync_); };
         if (native_.pool.grow)
             h.grow = [&](const Slot& s, uint64_t rows) {
                 const auto r = native_.pool.grow(s.run, rows);

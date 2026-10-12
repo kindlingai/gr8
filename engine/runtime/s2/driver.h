@@ -34,6 +34,9 @@ struct DriverHooks {
     // optional: a session finished at this step (now Retiring): its pages go back to the pool now, on every rank, so
     // the sessions still decoding can grow before the next event fence frees the slot
     std::function<void(const Slot&)> finished;
+    // optional: after the growth and before the round, every rank (the host work since the last round may have taken a
+    // different time on each rank: the round's fabric waits time out)
+    std::function<void()> settle;
 };
 class Driver {
     Scheduler scheduler_;
@@ -143,6 +146,7 @@ public:
                     if (!r) stalled[k.slot] = true;
                     else if (*r != s.run) scheduler_.grow(k, *r);
                 }
+            if (hooks_.settle) hooks_.settle();
         } catch (...) { scheduler_.fail(); throw; }
         auto q = scheduler_.next(stalled);
         try {

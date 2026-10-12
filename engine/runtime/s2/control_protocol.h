@@ -3,7 +3,7 @@
 #include "event_gate.h"
 #include <string>
 namespace g6s2 {
-enum class Tag : uint64_t { Notice=1, Ack=2, Commit=3, Request=4, Quit=5 };
+enum class Tag : uint64_t { Notice=1, Ack=2, Commit=3, Request=4, Quit=5, Sync=6, Go=7 };
 struct Encoder {
     std::vector<uint8_t> b;
     void u64(uint64_t x){for(int i=7;i>=0;--i)b.push_back(uint8_t(x>>(i*8)));}
@@ -15,7 +15,7 @@ struct Decoder {
     const std::vector<uint8_t>& b;size_t i=0;Tag tag;
     uint64_t u64(){require(b.size()-i>=8,"truncated control metadata");uint64_t x=0;for(unsigned n=0;n<8;++n)x=x*256+b[i++];return x;}
     uint32_t u32(){auto x=u64();require(x<=UINT32_MAX,"control integer overflow");return uint32_t(x);}
-    explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324534ull,"control version mismatch");auto t=u64();require(t>=1&&t<=5,"unknown control tag");tag=Tag(t);}
+    explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324534ull,"control version mismatch");auto t=u64();require(t>=1&&t<=7,"unknown control tag");tag=Tag(t);}
     Notice notice(){Notice n;n.epoch=u64();n.event=u64();n.boundary=u64();n.request=u64();n.payload_hash=u64();auto k=u64();require(k==1||k==2,"unknown event kind");n.kind=EventKind(k);return n;}
     Key key(){Key k;k.epoch=u64();k.slot=u32();k.generation=u32();return k;}
     void end(){require(i==b.size(),"trailing control metadata");}
@@ -55,4 +55,11 @@ inline RequestBytes decode_request(const std::vector<uint8_t>& b){
 // The head's orderly quit (its DIR/quit), passed on so every worker quits the same way
 inline std::vector<uint8_t> encode_quit(uint64_t epoch){Encoder e(Tag::Quit);e.u64(epoch);return e.b;}
 inline uint64_t decode_quit(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Quit,"expected quit");auto e=d.u64();d.end();return e;}
+// A barrier between rounds (EventEndpoint::sync): each worker sends Sync with the barrier's number, the head answers Go
+// once every worker has. No tensors, no event: it only lines the ranks up in time.
+struct SyncFrame { uint64_t epoch = 0; unsigned rank = 0; uint64_t seq = 0; };
+inline std::vector<uint8_t> encode(const SyncFrame& s){Encoder e(Tag::Sync);e.u64(s.epoch);e.u64(s.rank);e.u64(s.seq);return e.b;}
+inline SyncFrame decode_sync(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Sync,"expected sync");SyncFrame s;s.epoch=d.u64();s.rank=d.u32();s.seq=d.u64();d.end();return s;}
+inline std::vector<uint8_t> encode_go(uint64_t epoch,uint64_t seq){Encoder e(Tag::Go);e.u64(epoch);e.u64(seq);return e.b;}
+inline std::pair<uint64_t,uint64_t> decode_go(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Go,"expected go");auto e=d.u64();auto q=d.u64();d.end();return {e,q};}
 } // namespace g6s2

@@ -771,12 +771,14 @@ int main(int argc, char** argv)
         // Every rank prints its drain with the wall clock (ms since the Unix epoch): the drain runs after the event fence
         // and before the next quantum's fabric waits (G6_SPIN_TIMEOUT_CYC, ~10 s), so the skew between ranks' drains is
         // the number that matters, and only the lines of every rank show it.
+        std::atomic<bool> kv_drained{false};   // the head drains a cancelled run on its control thread
         auto kv_drain = [&] {
             if (!kvt) return;
             const auto io = pool.io();
             kvt->run(io, st);
             if (!io.empty())
             {
+                kv_drained = true;
                 size_t n[3] = {0, 0, 0};
                 for (const auto& x : io) ++n[x.kind];
                 fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s\n", R,
@@ -925,6 +927,7 @@ int main(int argc, char** argv)
             };
             h.retire = [&](const g6s2::Slot& old) { nd.retire(old); };
             h.fence = [&] { nd.synchronize(); };
+            if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
             h.dispatch = nd.hooks();
             if (dfl)
             {
