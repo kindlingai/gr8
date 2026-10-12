@@ -98,8 +98,18 @@ public:
         require(g6kv_add_tier(p_, slots, keep, index_dir.empty() ? nullptr : index_dir.c_str(), compat.c_str()) == 0,
                 g6kv_tier_error());
     }
-    // at admission, before the grant, on every rank
-    uint32_t count(const std::vector<int>& prompt) { Lock l(mu_); return g6kv_count(p_, prompt.data(), prompt.size()); }
+    // at admission, before the grant, on every rank. span: the prompt's system span in tokens, -1 = none
+    uint32_t count(const std::vector<int>& prompt, int64_t span) {
+        Lock l(mu_);
+        return g6kv_count(p_, prompt.data(), prompt.size(), span);
+    }
+    // tier t's policy: evicted runs need min_rows rows and min_hits continuations; block_bytes for the counters
+    void policy(uint32_t t, uint64_t min_rows, uint32_t min_hits, uint64_t block_bytes) {
+        Lock l(mu_);
+        check(g6kv_tier_policy(p_, t, min_rows, min_hits, block_bytes));
+    }
+    // the stores write at most milli / 1000 blocks per page of KV computed (0 = no limit)
+    void write_limit(uint64_t milli) { Lock l(mu_); g6kv_write_limit(p_, milli); }
     // the copies queued since the last io(), in the order to run them. Then io_done()
     std::vector<g6kv_io> io() {
         Lock l(mu_);

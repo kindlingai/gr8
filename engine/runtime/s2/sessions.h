@@ -25,13 +25,14 @@ inline g6rt::ServeReq parse_request(const std::string& bytes) {
     require(bool(in >> k) && k == "n_gen" && bool(in >> gen >> k) && k == "temp" &&
             bool(in >> r.temp >> k) && k == "seed" && bool(in >> seed >> k) && k == "min" &&
             bool(in >> min >> k) && k == "stop" && bool(in >> stop), "invalid request header");
-    // optional, in this order: top_p <float>, lp <k>, plp <k>
+    // optional, in this order: top_p <float>, lp <k>, plp <k>, sys <tokens>
     auto next = [&] { if (!(in >> k)) k.clear(); };
     next();
     if (k == "top_p") { require(bool(in >> r.top_p), "invalid top_p header"); next(); }
     if (k == "lp") { require(bool(in >> r.lp) && r.lp >= 0 && r.lp <= g6rt::LP_MAX, "invalid lp header"); next(); }
     if (k == "plp") { require(bool(in >> r.plp) && r.plp >= 0 && r.plp <= g6rt::LP_MAX, "invalid plp header"); next(); }
-    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp and plp)");
+    if (k == "sys") { require(bool(in >> r.sys) && r.sys >= 0 && r.sys <= INT32_MAX, "invalid sys header"); next(); }
+    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp and sys)");
     auto g = number(gen), sd = number(seed), mn = number(min);
     require(g > 0 && g <= INT32_MAX && sd <= UINT32_MAX && mn <= g &&
             std::isfinite(r.temp) && r.temp >= 0 && std::isfinite(r.top_p) && r.top_p >= 0 && r.top_p <= 1,

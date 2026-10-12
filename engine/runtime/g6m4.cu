@@ -33,12 +33,19 @@
 //                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
 //                     Under S2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
-//      [--kv-tier STORE,size=N(G|T)[,keep=evicted|shared|all]]...  under S2 with --reuse-prefix: block stores below the
-//                     pool, tried in flag order (s2/kv_tier.cuh, kvman-rs src/stash.rs). keep=evicted: retained runs the
-//                     pool evicts. shared: prefixes that started --kv-shared-after N conversations (default 3), written
-//                     once. all: both. A request that continues a stored entry reads its pages back and skips their prefill.
-//                     STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id its shared prefixes survive
-//                     restarts) or remote:HOST:PORT (a lease on a KV node, ./gr8 kv up; RDMA where both ends can, else TCP)
+//      [--kv-store STORE,size=N(G|T)]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
+//                     (s2/kv_tier.cuh, kvman-rs src/stash.rs). A request that continues a stored entry reads its pages
+//                     back and skips their prefill. STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id
+//                     its system prefixes and their counts survive restarts) or remote:HOST:PORT (a lease on a KV node,
+//                     ./gr8 kv up; RDMA where both ends can, else TCP)
+//      [--kv-keep system|sessions|all]  what the stores keep (default system). system: the system prompts and tool
+//                     definitions (the span the front end sends, else every grid cell) that --kv-system-after N
+//                     conversations started with (default 2), once each. sessions: those, plus the runs the pool evicts
+//                     that continued their conversation at least once, stored on the system prefix they start with.
+//                     all: every run the pool evicts (benchmarks)
+//      [--kv-write-limit F]  the stores write at most F page blocks per page of KV the engine computes (off by default)
+//      [--kv-tier STORE,size=N[,keep=evicted|shared|all]] [--kv-shared-after N]  deprecated: --kv-store, with --kv-keep
+//                     all when any keep is evicted or all, else system; --kv-system-after N
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)
 //      [--serve DIR --s2-port N [--s2-sessions S] [--s2-epoch E]]  serve requests through S2 (a G6_CP build); --prompt is
@@ -129,8 +136,11 @@ int main(int argc, char** argv)
     int pfrows = 0, mtp = 0, lanes = 1;
     int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
     std::string s2dir;                  // --serve DIR: serve through S2 (below R)
-    std::vector<std::string> kv_tiers;  // --kv-tier, in flag order
-    int kv_shared_after = 3;            // --kv-shared-after
+    std::vector<std::string> kv_tiers;  // --kv-store (and the deprecated --kv-tier), in flag order
+    std::string kv_keep;                // --kv-keep system|sessions|all
+    int kv_system_after = 2;            // --kv-system-after
+    double kv_write_limit = 0;          // --kv-write-limit F
+    bool kv_old = false, kv_old_all = false;   // a deprecated --kv-tier, and whether one kept evicted runs
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
     int s2port = 0, s2sess = 8;
     unsigned long long s2epoch = 1;
@@ -177,8 +187,19 @@ int main(int argc, char** argv)
         else if (a == "--image") image = true;
         else if (a == "--no-hash") hash = false;
         else if (a == "--reuse-prefix") reuse_prefix = true;
-        else if (a == "--kv-tier") kv_tiers.push_back(next());
-        else if (a == "--kv-shared-after") kv_shared_after = atoi(next().c_str());
+        else if (a == "--kv-store") kv_tiers.push_back(next());
+        else if (a == "--kv-keep") kv_keep = next();
+        else if (a == "--kv-system-after") kv_system_after = atoi(next().c_str());
+        else if (a == "--kv-write-limit") kv_write_limit = atof(next().c_str());
+        else if (a == "--kv-tier")
+        {
+            const std::string v = next();
+            kv_old = true;
+            kv_old_all = kv_old_all || v.find("keep=evicted") != std::string::npos || v.find("keep=all") != std::string::npos ||
+                         v.find("keep=") == std::string::npos;
+            kv_tiers.push_back(v);
+        }
+        else if (a == "--kv-shared-after") { kv_old = true; kv_system_after = atoi(next().c_str()); }
         else if (a == "--prefill") MP = atoi(next().c_str());
         else if (a == "--top") top = atoi(next().c_str());
         else if (a == "--wide") wide = true;
@@ -246,7 +267,18 @@ int main(int argc, char** argv)
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
-    if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-tier needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
+    if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
+    if (kv_old)
+    {
+        if (kv_keep.empty()) kv_keep = kv_old_all ? "all" : "system";
+        if (cfg.rank == 0)
+            fprintf(stderr, "# warning: --kv-tier and --kv-shared-after are deprecated: --kv-store STORE,size=N, --kv-keep %s, "
+                            "--kv-system-after %d\n", kv_keep.c_str(), kv_system_after);
+    }
+    if (kv_keep.empty()) kv_keep = "system";
+    if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep system, sessions or all");
+    if (kv_system_after < 1) die("--kv-system-after N: N >= 1");
+    if (!(kv_write_limit >= 0) || kv_write_limit > 1000) die("--kv-write-limit F: 0 (off) to 1000 blocks per page computed");
     if (reuse_prefix && dfl && !s2mode) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
@@ -723,10 +755,13 @@ int main(int argc, char** argv)
             if (env_choice("G6_POOL_LOG", 1, 0, &err) == 1) pool.log(true);   // one stderr line per pool claim: first page, pages, evicted retained runs
             if (R == 0) fprintf(stderr, "# s2 reuse on: retired runs kept until a claim overlaps them; grid %d rows\n", rules.grid);
         }
-        // --kv-tier: block stores below the pool, in flag order, the same number of blocks on every rank. An SSD tier lives in
-        // PATH/r<rank>; its shared prefixes survive restarts (their index needs --set-id: the blocks belong to one model)
+        // --kv-store: block stores below the pool, in flag order, the same number of blocks on every rank. An SSD store lives in
+        // PATH/r<rank>; its system prefixes and the counts survive restarts (their index needs --set-id: the blocks belong to
+        // one model). --kv-keep sets each store's keep rule and policy (kvman-rs stash.rs Keep, Policy)
         std::unique_ptr<g6s2::KvTiers> kvt;
-        bool kv_index = false, kv_count = false;
+        bool kv_index = false;
+        const int kv_keep_rule = kv_keep == "system" ? 1 : 2;           // shared prefixes, or those and evicted runs
+        const uint32_t kv_min_hits = kv_keep == "sessions" ? 1 : 0;
         if (!kv_tiers.empty())
         {
             std::vector<const G6AttnBinding*> bs;
@@ -739,33 +774,35 @@ int main(int argc, char** argv)
             try
             {
                 kvt.reset(new g6s2::KvTiers(bs));
-                pool.stores((uint32_t)std::max(1, kv_shared_after));
+                pool.stores((uint32_t)kv_system_after);
                 for (size_t i = 0; i < kv_tiers.size(); ++i)
                 {
-                    const g6s2::TierSpec t = g6s2::TierSpec::parse(kv_tiers[i]);
+                    const g6s2::TierSpec t = g6s2::TierSpec::parse(kv_tiers[i], kv_old);
                     std::string spec = t.store, index;
                     if (t.ssd())
                     {
                         const std::string dir = t.store.substr(4) + "/r" + std::to_string(R);
                         std::filesystem::create_directories(dir);
                         spec = "ssd:" + dir + "/blocks";
-                        if (t.keep != 0 && !set_id.empty()) index = dir;
+                        if (!set_id.empty()) index = dir;
                     }
                     const uint64_t slots = kvt->add(spec, name + "-t" + std::to_string(i), t.bytes);
                     const std::string compat = "set " + set_id + " nr " + std::to_string(g6nr::NR) + " below " + std::to_string(s2_below) +
                         " place " + std::to_string(place) + " grid " + std::to_string(reuse_grid) + " block " +
                         std::to_string(kvt->blocks().slot_bytes()) + " bindings " + std::to_string(bs.size()) + "/" +
                         std::to_string(nidx) + " slots " + std::to_string(slots);
-                    pool.add_tier(slots, t.keep, index, compat);
+                    pool.add_tier(slots, kv_keep_rule, index, compat);
+                    pool.policy((uint32_t)i, 0, kv_min_hits, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();
-                    kv_count = kv_count || t.keep != 0;
-                    fprintf(stderr, "# rank %d: s2 tier %zu: %s, %llu blocks of %zu B, keep %s%s\n", R, i, kvt->describe(i).c_str(),
-                            (unsigned long long)slots, kvt->blocks().slot_bytes(), t.keep == 0 ? "evicted" : t.keep == 1 ? "shared" : "all",
-                            index.empty() ? "" : ", indexed");
+                    fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B%s\n", R, i, kvt->describe(i).c_str(),
+                            (unsigned long long)slots, kvt->blocks().slot_bytes(), index.empty() ? "" : ", indexed");
                 }
+                pool.write_limit((uint64_t)std::llround(kv_write_limit * 1000));
             }
-            catch (const std::exception& e) { die(std::string("--kv-tier: ") + e.what()); }
-            if (R == 0 && kv_count) fprintf(stderr, "# s2 tiers: a prefix is shared after %d conversations\n", std::max(1, kv_shared_after));
+            catch (const std::exception& e) { die(std::string("--kv-store: ") + e.what()); }
+            if (R == 0)
+                fprintf(stderr, "# s2 stores keep %s: a system prefix is stored after %d conversations%s\n", kv_keep.c_str(), kv_system_after,
+                        kv_write_limit > 0 ? (", write limit " + std::to_string(kv_write_limit) + " blocks per page computed").c_str() : "");
         }
         // the copies the pool queued: run them before anything writes those pages, then commit what they wrote
         // Every rank prints its drain with the wall clock (ms since the Unix epoch): the drain runs after the event fence
@@ -780,10 +817,40 @@ int main(int argc, char** argv)
         if (const char* e = getenv("G6_KV_DRAIN_DELAY"))
             if (sscanf(e, "%d:%d:%d", &kv_delay_rank, &kv_delay_ms, &kv_delay_every) < 2 || kv_delay_ms < 0 || kv_delay_every < 1)
                 die("G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]");
+        // rank 0, at most once a minute: what the stores did since the last line, once one fills, passes entries on, drops
+        // them or refuses them (the store rotates silently otherwise). Counts only: the clock decides nothing else
+        std::vector<g6kv_tier_totals> kv_logged;
+        auto kv_last_log = std::chrono::steady_clock::now();
+        bool kv_logged_once = false;
+        auto kv_log = [&] {
+            const auto now = std::chrono::steady_clock::now();
+            if (R != 0 || (kv_logged_once && now - kv_last_log < std::chrono::minutes(1))) return;
+            const auto ts = pool.tiers();
+            kv_logged.resize(ts.size(), g6kv_tier_totals{});
+            bool any = false;
+            for (size_t i = 0; i < ts.size(); ++i)
+            {
+                const auto &a = kv_logged[i], &b = ts[i];
+                if (b.full == a.full && b.moved_out == a.moved_out && b.dropped == a.dropped && b.refused == a.refused) continue;
+                const double gb = b.block_bytes / 1e9;
+                fprintf(stderr, "# s2 store %zu: %llu of %llu blocks used, %u entries (%u prefixes); in the last %.0f s: %.1f GB spilled, "
+                                "%.1f GB restored, full %llu times, %llu entries (%.1f GB) passed on, %llu (%.1f GB) dropped, %llu (%.1f GB) "
+                                "refused by the keep policy or write limit\n",
+                        i, (unsigned long long)(b.slots - b.free_slots), (unsigned long long)b.slots, b.entries, b.shared,
+                        std::chrono::duration<double>(now - kv_last_log).count(), (b.spilled_pages - a.spilled_pages) * gb,
+                        (b.restored_pages - a.restored_pages) * gb, (unsigned long long)(b.full - a.full),
+                        (unsigned long long)(b.moved_out - a.moved_out), (b.moved_out_pages - a.moved_out_pages) * gb,
+                        (unsigned long long)(b.dropped - a.dropped), (b.dropped_pages - a.dropped_pages) * gb,
+                        (unsigned long long)(b.refused - a.refused), (b.refused_pages - a.refused_pages) * gb);
+                any = true;
+            }
+            if (any) { kv_logged = ts; kv_last_log = now; kv_logged_once = true; }
+        };
         auto kv_drain = [&] {
             if (!kvt) return;
             const auto io = pool.io();
             kvt->run(io, st);
+            kv_log();
             if (!io.empty())
             {
                 kv_drained = true;
@@ -888,7 +955,7 @@ int main(int argc, char** argv)
             if (kvt)
             {
                 h.pool.tiers = [&] { return pool.tiers(); };
-                if (kv_count) h.pool.count = [&](const std::vector<int>& p) { return pool.count(p); };
+                h.pool.count = [&](const std::vector<int>& p, int64_t span) { return pool.count(p, span); };
                 h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s) { pool.retain(r, s); kv_drain(); };   // a promoted prefix
             }
             h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
@@ -1017,7 +1084,7 @@ int main(int argc, char** argv)
                 pool.keep_agreed(g6s2::agree_lines(bc, links, pool.stored_summary()));
                 size_t n = 0;
                 for (const auto& t : pool.tiers()) n += t.entries;
-                fprintf(stderr, "# rank %d: s2 tiers: %zu stored prefixes from earlier runs\n", R, n);
+                fprintf(stderr, "# rank %d: s2 stores: %zu stored prefixes from earlier runs\n", R, n);
             }
             // every reachable S2 graph key, captured after the bootstrap (its timeout does not cover the capture) and before
             // the head publishes ready.s2 (Service::run): the all-rank barrier, with no receive timeout, replaces the skew limit

@@ -4,7 +4,7 @@
 //! between tiers on the way. Two ranks given the same calls must queue the same copies and agree on the digest. Also:
 //! what counts as a new conversation, promotion of a shared prefix, moves between tiers and the persistent index.
 
-use g6kvman::stash::{prefix_key, Io, Keep};
+use g6kvman::stash::{prefix_key, Io, Keep, Kind, Policy};
 use g6kvman::{Error, Finished, Pool, Rules, Run, PAGE};
 
 struct Rng(u64);
@@ -143,7 +143,7 @@ fn finished(tokens: &[i32]) -> Finished {
 
 #[test]
 fn restored_rows_hold_the_prompt_and_ranks_agree() {
-    let (mut evicted_hits, mut shared_hits, mut moves, mut spills, mut exclusive) = (0, 0, 0, 0, 0);
+    let (mut evicted_hits, mut shared_hits, mut moves, mut spills, mut exclusive, mut refused) = (0, 0, 0, 0, 0, 0);
     for seed in 1..=60u64 {
         let mut rng = Rng(seed * 104_729);
         let pages = rng.range(12, 48) as u32;
@@ -156,6 +156,19 @@ fn restored_rows_hold_the_prompt_and_ranks_agree() {
         }
         let after = rng.range(2, 3) as u32;
         let mut ranks = [Rank::new(pages, place, below, &tiers, after), Rank::new(pages, place, below, &tiers, after)];
+        // the policies the keep modes set (min_hits 1 for sessions), a length floor and the write limit
+        let policy = Policy {
+            min_rows: if seed % 5 == 0 { rng.range(64, 300) } else { 0 },
+            min_hits: (seed % 3 == 0) as u32,
+            block_bytes: 4096,
+        };
+        let limit = if seed % 4 == 1 { rng.range(100, 600) } else { 0 };
+        for r in &mut ranks {
+            for t in 0..tiers.len() {
+                r.pool.set_policy(t, policy).unwrap();
+            }
+            r.pool.write_limit(limit);
+        }
         // a few system prompts that many conversations start with
         let systems: Vec<Vec<i32>> =
             (0..3).map(|_| (0..rng.range(130, 400)).map(|_| rng.range(0, 1 << 20) as i32).collect()).collect();
@@ -174,12 +187,20 @@ fn restored_rows_hold_the_prompt_and_ranks_agree() {
                 histories.push(s.tokens);
                 continue;
             }
+            // a prompt on a system prompt carries its span half the time, as a chat front end sends it
+            let mut span = None;
             let mut prompt: Vec<i32> = match rng.range(0, 3) {
                 0 if !histories.is_empty() => {
                     let h = &histories[rng.range(0, histories.len() as u64 - 1) as usize];
                     h[..rng.range(1, h.len() as u64) as usize].to_vec()
                 }
-                1 | 2 => systems[rng.range(0, 2) as usize].clone(),
+                1 | 2 => {
+                    let sys = systems[rng.range(0, 2) as usize].clone();
+                    if rng.one_in(2) {
+                        span = Some(sys.len() as u32);
+                    }
+                    sys
+                }
                 _ => Vec::new(),
             };
             prompt.extend((0..rng.range(1, 2 * PAGE)).map(|_| rng.range(0, 1 << 20) as i32));
@@ -190,7 +211,7 @@ fn restored_rows_hold_the_prompt_and_ranks_agree() {
                 continue;
             }
             let limit = prompt.len() as i32 - 1;
-            let counted: Vec<u32> = ranks.iter_mut().map(|r| r.pool.count(&prompt)).collect();
+            let counted: Vec<u32> = ranks.iter_mut().map(|r| r.pool.count(&prompt, span)).collect();
             assert_eq!(counted[0], counted[1]);
             let h = ranks[0].pool.match_prefix(&prompt, now, worst, limit);
             assert_eq!(h, ranks[1].pool.match_prefix(&prompt, now, worst, limit));
@@ -236,10 +257,13 @@ fn restored_rows_hold_the_prompt_and_ranks_agree() {
             tokens.truncate(end);
             live.push(Live { run, tokens });
         }
+        let s = ranks[0].pool.stash().unwrap();
+        refused += (0..s.tiers()).map(|t| s.stats(t).unwrap().refused).sum::<u64>();
     }
     assert!(
-        evicted_hits > 20 && shared_hits > 20 && moves > 50 && spills > 100 && exclusive > 0,
-        "evicted hits {evicted_hits}, shared hits {shared_hits}, moves {moves}, spills {spills}, exclusive {exclusive}"
+        evicted_hits > 20 && shared_hits > 20 && moves > 50 && spills > 100 && exclusive > 0 && refused > 20,
+        "evicted hits {evicted_hits}, shared hits {shared_hits}, moves {moves}, spills {spills}, exclusive {exclusive}, \
+         refused {refused}"
     );
 }
 
@@ -249,7 +273,11 @@ fn toks(seed: i32, n: usize) -> Vec<i32> {
 
 // admits a prompt (count, match, take or reserve, copies) and retires it after `gen` more tokens
 fn session(r: &mut Rank, prompt: &[i32], gen: usize) -> (u32, bool, Vec<i32>) {
-    let n = r.pool.count(prompt);
+    session_span(r, prompt, gen, None)
+}
+
+fn session_span(r: &mut Rank, prompt: &[i32], gen: usize, span: Option<u32>) -> (u32, bool, Vec<i32>) {
+    let n = r.pool.count(prompt, span);
     let rows = (prompt.len() + gen + 1) as u64;
     let h = r.pool.match_prefix(prompt, rows, rows, prompt.len() as i32 - 1);
     let run = if h.skip > 0 {
@@ -362,7 +390,7 @@ fn shared_prefixes_survive_a_restart_and_a_torn_record_does_not() {
         for c in 6..8 {
             let mut p = other.clone();
             p.extend(toks(c, 30));
-            assert!(r.pool.count(&p) > 0);
+            assert!(r.pool.count(&p, None) > 0);
             let run = r.pool.reserve(p.len() as u64 + 10, p.len() as u64 + 10).unwrap();
             r.run_io();
             r.pool.retain(&run, finished(&p)).unwrap();
@@ -379,7 +407,10 @@ fn shared_prefixes_survive_a_restart_and_a_torn_record_does_not() {
     let e = r.pool.stash().unwrap().entries(0);
     assert_eq!(e.len(), 1, "only the committed prefix comes back");
     assert_eq!(e[0].key, key);
-    assert!(r.pool.stored_summary().lines().count() == 1);
+    assert_eq!(r.pool.stored_summary().lines().filter(|l| !l.starts_with("c ")).count(), 1);
+    // the counts came back too: the two conversations, and the other prefix's two
+    assert_eq!(r.pool.stash().unwrap().count_of(key), 2);
+    assert_eq!(r.pool.stash().unwrap().count_of(prefix_key(&toks(5, 200)[..129])), 2);
     // the ranks keep the entries all of them loaded: here, none
     let mut r2 = open("model-a tp4");
     r2.pool.keep_agreed("");
@@ -410,11 +441,14 @@ fn a_hit_on_a_shared_prefix_keeps_the_rest_of_the_run_it_takes() {
     let mut b = system.clone();
     b.extend(toks(3, 100));
     session(&mut r, &b, 20);
-    assert_eq!(r.pool.stash().unwrap().entries(0).len(), 1, "a's run is in the tier");
+    // a's run is in the tier as the system prompt they share (a prefix entry, stored once) and the rest of a's rows
+    let e = r.pool.stash().unwrap().entries(0).to_vec();
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert!(e[0].kind == Kind::Prefix && e[0].st.valid == 128 && e[1].base == Some((e[0].id, 2)), "{e:?}");
     // a's next turn carries its own prompt and an edited reply: it continues a, and a's rows come back
     let mut a2 = a.clone();
     a2.extend(toks(4, 30));
-    assert_eq!(r.pool.count(&a2), 0);
+    assert_eq!(r.pool.count(&a2, None), 0);
     let h = r.pool.match_prefix(&a2, a2.len() as u64 + 10, a2.len() as u64 + 10, a2.len() as i32 - 1);
     assert!(h.stored && h.skip == 384, "{h:?}");
     let run = r.pool.take_hit(h.skip, h.age, Some(0), a2.len() as u64 + 10, a2.len() as u64 + 10).unwrap();
@@ -457,4 +491,117 @@ fn a_run_on_a_stored_shared_prefix_spills_only_its_own_pages() {
         assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], hist[row]);
     }
     assert!(r.pool.stash().unwrap().entries(0).iter().any(|e| e.id == shared), "the shared prefix stays");
+}
+
+#[test]
+fn a_system_span_counts_once_per_conversation_and_is_stored_cut_to_the_grid() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::Shared)], 2);
+    let system = toks(1, 300); // the front end's span: 300 tokens, 256 rows on a grid of 128
+    let key = prefix_key(&system[..257]);
+    let mut p = system.clone();
+    p.extend(toks(2, 50));
+    let (n, _, mut t) = session_span(&mut r, &p, 20, Some(300));
+    assert_eq!(n, 2, "the cells within the span: 128 and 256");
+    t.extend(toks(3, 10));
+    assert_eq!(session_span(&mut r, &t, 20, Some(300)).0, 0, "a continued chat counts toward nothing");
+    assert!(r.pool.stash().unwrap().entries(0).is_empty(), "one conversation so far");
+    let mut q = system.clone();
+    q.extend(toks(4, 70));
+    session_span(&mut r, &q, 10, Some(300));
+    let e = r.pool.stash().unwrap().entries(0).to_vec();
+    assert_eq!(e.len(), 1, "stored at the second conversation");
+    assert_eq!((e[0].key, e[0].st.valid, e[0].slots.len()), (key, 256, 4));
+    // a span shorter than a grid cell counts nothing
+    let mut x = toks(5, 100);
+    x.extend(toks(6, 300));
+    assert_eq!(session_span(&mut r, &x, 5, Some(100)).0, 0);
+    // two system prompts that differ after 200 tokens share the first cell, which is stored at the second
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::Shared)], 2);
+    for c in 0..2 {
+        let mut p = toks(7, 200);
+        p.extend(toks(20 + c, 100)); // a different working folder in each system prompt
+        let span = p.len() as u32;
+        p.extend(toks(30 + c, 50));
+        session_span(&mut r, &p, 5, Some(span));
+    }
+    let e = r.pool.stash().unwrap().entries(0).to_vec();
+    assert!(e.len() == 1 && e[0].st.valid == 128, "{e:?}");
+}
+
+#[test]
+fn min_hits_keeps_one_shots_out_and_min_rows_keeps_short_runs_out() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::Evicted)], 3);
+    r.pool.set_policy(0, Policy { min_rows: 0, min_hits: 1, block_bytes: 4096 }).unwrap();
+    // a one-shot conversation, evicted: not stored
+    session(&mut r, &toks(1, 200), 20);
+    flush(&mut r);
+    assert!(r.pool.stash().unwrap().entries(0).is_empty());
+    assert_eq!(r.pool.tier_stats(0).unwrap().refused, 1);
+    // a conversation that continued once: stored
+    let (_, _, mut t) = session(&mut r, &toks(2, 200), 20);
+    t.extend(toks(3, 30));
+    let (_, _, t2) = session(&mut r, &t, 20);
+    flush(&mut r);
+    let e = r.pool.stash().unwrap().entries(0).to_vec();
+    assert!(e.len() == 1 && e[0].st.history == t2 && e[0].hits == 1, "{e:?}");
+    // min_rows: a run below it is refused, one above it stored
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::Evicted)], 3);
+    r.pool.set_policy(0, Policy { min_rows: 300, min_hits: 0, block_bytes: 4096 }).unwrap();
+    session(&mut r, &toks(4, 200), 20);
+    flush(&mut r);
+    assert!(r.pool.stash().unwrap().entries(0).is_empty());
+    session(&mut r, &toks(5, 400), 20);
+    flush(&mut r);
+    assert_eq!(r.pool.stash().unwrap().entries(0).len(), 1);
+}
+
+#[test]
+fn the_write_limit_holds_writes_to_its_share_of_the_pages_computed() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(4096, Keep::Evicted)], 3);
+    r.pool.write_limit(250); // a block per four pages computed
+    let mut computed = 0u64;
+    for c in 0..4000 {
+        let p = toks(10 + c, 100 + (c as usize * 37) % 500);
+        computed += (p.len() as u64).div_ceil(PAGE);
+        session(&mut r, &p, 10);
+    }
+    flush(&mut r);
+    let st = r.pool.tier_stats(0).unwrap();
+    let burst = g6kvman::stash::BURST as u64;
+    assert!(st.spilled_pages <= computed / 4 + burst + 16, "{} blocks written for {computed} pages", st.spilled_pages);
+    assert!(st.refused > 0 && st.spilled_pages > computed / 8, "{st:?}");
+}
+
+#[test]
+fn a_run_on_a_resident_prefix_comes_back_with_its_prefix_from_the_pool_or_the_tier() {
+    for from_pool in [true, false] {
+        let mut r = Rank::new(24, 24, 24 * 64, &[(64, Keep::Evicted)], 3);
+        let system = toks(1, 300);
+        let mut a = system.clone();
+        a.extend(toks(2, 200));
+        let (_, _, a_hist) = session(&mut r, &a, 20);
+        let mut b = system.clone();
+        b.extend(toks(3, 200));
+        session(&mut r, &b, 20); // b takes a's system prompt rows: a's run is stored as a prefix and its own rows
+        if !from_pool {
+            flush(&mut r); // no run in the pool holds the system prompt now
+        }
+        let e = r.pool.stash().unwrap().entries(0).to_vec();
+        let a_e = e.iter().find(|x| x.st.history == a_hist).unwrap().clone();
+        assert!(a_e.base.is_some(), "{e:?}");
+        let mut a2 = a_hist.clone();
+        a2.extend(toks(4, 20));
+        let rows = a2.len() as u64 + 5;
+        let h = r.pool.match_prefix(&a2, rows, rows, a2.len() as i32 - 1);
+        assert!(h.stored && h.age == a_e.id, "{h:?}");
+        let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), rows, rows).unwrap();
+        let io = r.run_io();
+        let reads = io.iter().filter(|x| matches!(x, Io::Restore { .. })).count();
+        let base = a_e.base.unwrap().1;
+        assert_eq!(reads, (h.skip as usize).div_ceil(ROWS) - if from_pool { base } else { 0 }, "pool {from_pool}");
+        let list = r.pool.list(&run).unwrap().to_vec();
+        for row in 0..h.skip as usize {
+            assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], a_hist[row], "pool {from_pool} row {row}");
+        }
+    }
 }

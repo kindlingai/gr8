@@ -171,13 +171,14 @@ public:
     }
 };
 
-// One --kv-tier value: STORE[,size=N(G|T)][,keep=evicted|shared|all]. STORE is ssd:PATH (a folder) or
-// remote:HOST:PORT (remote:auto is the launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40.
+// One --kv-store value: STORE,size=N(M|G|T). STORE is ssd:PATH (a folder) or remote:HOST:PORT (remote:auto is the
+// launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40. The deprecated --kv-tier (old) also takes
+// keep=evicted|shared|all, which g6m4 maps to --kv-keep.
 struct TierSpec {
     std::string store;
     uint64_t bytes = 0;
-    int keep = 0;   // 0 evicted, 1 shared, 2 all
-    static TierSpec parse(const std::string& v) {
+    int keep = 0;   // --kv-tier only: 0 evicted, 1 shared, 2 all
+    static TierSpec parse(const std::string& v, bool old = false) {
         TierSpec t;
         size_t at = v.find(',');
         t.store = v.substr(0, at);
@@ -191,19 +192,21 @@ struct TierSpec {
                 const double n = strtod(x.c_str(), &end);
                 const std::string unit = end ? end : "";
                 const double mul = unit == "T" ? 1099511627776.0 : unit == "G" ? 1073741824.0 : unit == "M" ? 1048576.0 : 0.0;
-                if (!(n > 0) || !mul) throw std::runtime_error("--kv-tier " + v + ": size=N with M, G or T");
+                if (!(n > 0) || !mul) throw std::runtime_error("--kv-store " + v + ": size=N with M, G or T");
                 t.bytes = uint64_t(n * mul);
+            } else if (k == "keep" && !old) {
+                throw std::runtime_error("--kv-store " + v + ": what the stores keep is --kv-keep system|sessions|all");
             } else if (k == "keep") {
                 if (x == "evicted") t.keep = 0; else if (x == "shared") t.keep = 1; else if (x == "all") t.keep = 2;
                 else throw std::runtime_error("--kv-tier " + v + ": keep=evicted, shared or all");
-            } else throw std::runtime_error("--kv-tier " + v + ": unknown option " + k);
+            } else throw std::runtime_error("--kv-store " + v + ": unknown option " + k);
             at = next;
         }
         const bool ssd = t.store.rfind("ssd:", 0) == 0 && t.store.size() > 4;
         const bool remote = t.store.rfind("remote:", 0) == 0 && t.store.size() > 7 && t.store != "remote:auto";
         if (!ssd && !remote && t.store != "mem:")
-            throw std::runtime_error("--kv-tier " + v + ": the store is ssd:PATH or remote:HOST:PORT (remote:auto needs the launcher)");
-        if (!t.bytes) throw std::runtime_error("--kv-tier " + v + ": size=N(G|T) is needed");
+            throw std::runtime_error("--kv-store " + v + ": the store is ssd:PATH or remote:HOST:PORT (remote:auto needs the launcher)");
+        if (!t.bytes) throw std::runtime_error("--kv-store " + v + ": size=N(G|T) is needed");
         return t;
     }
     bool ssd() const { return store.rfind("ssd:", 0) == 0; }

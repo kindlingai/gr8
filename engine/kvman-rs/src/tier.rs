@@ -383,14 +383,21 @@ mod tests {
             st: Finished { valid: 100, ..Default::default() },
             age: 1,
             exclusive: false,
+            hits: 0,
         };
-        let b = Kept { list: vec![1, 3], st: Finished { valid: 7, ..Default::default() }, age: 2, exclusive: false };
+        let b = Kept {
+            list: vec![1, 3],
+            st: Finished { valid: 7, ..Default::default() },
+            age: 2,
+            exclusive: false,
+            hits: 0,
+        };
         let ha = t.spill(&a, block).unwrap().unwrap();
         let hb = t.spill(&b, block).unwrap().unwrap();
         assert_eq!(t.spilled()[&ha].slots, vec![0, 1, 2, 3]);
         assert_eq!(t.spilled()[&hb].slots, vec![4, 5]);
         assert!(t
-            .spill(&Kept { list: vec![0; 11], st: Finished::default(), age: 3, exclusive: false }, block)
+            .spill(&Kept { list: vec![0; 11], st: Finished::default(), age: 3, exclusive: false, hits: 0 }, block)
             .unwrap()
             .is_none());
         // restore a's first three pages into other pages: each gets a's page block in list order
@@ -407,7 +414,7 @@ mod tests {
         // a's slots are free again, and the next spill takes the lowest
         assert_eq!(t.free_slots(), 14);
         let hc = t
-            .spill(&Kept { list: vec![7], st: Finished::default(), age: 4, exclusive: false }, block)
+            .spill(&Kept { list: vec![7], st: Finished::default(), age: 4, exclusive: false, hits: 0 }, block)
             .unwrap()
             .unwrap();
         assert_eq!(t.spilled()[&hc].slots, vec![0]);

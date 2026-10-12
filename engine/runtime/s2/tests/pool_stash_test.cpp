@@ -45,6 +45,9 @@ struct Rank {
         tiers.push_back(std::make_unique<Tier>(spec, name + "-t1", slots));
         pool.add_tier(4, 0, "", "");
         pool.add_tier(slots, 2, "", "");
+        // the policies --kv-keep sessions and --kv-write-limit set, through the C interface
+        pool.policy(1, 0, 1, sizeof(Page));
+        pool.write_limit(500);
         for (auto& p : dev) p.fill(-1);
     }
     // the engine's part: every copy, in order, then io_done
@@ -111,7 +114,11 @@ int main(int argc, char** argv)
                     continue;
                 }
                 std::vector<int> prompt;
-                if (rng.one_in(3)) for (int n = 0; n < 300; ++n) prompt.push_back(7000 + n);   // a shared system prompt
+                int64_t span = -1;   // the front end's system span, sent for half the prompts on the system prompt
+                if (rng.one_in(3)) {
+                    for (int n = 0; n < 300; ++n) prompt.push_back(7000 + n);   // a shared system prompt
+                    if (rng.one_in(2)) span = 300;
+                }
                 else if (!hist.empty() && !rng.one_in(4)) {
                     const auto& h = hist[rng.range(0, int(hist.size()) - 1)];
                     prompt.assign(h.begin(), h.begin() + rng.range(1, int(h.size())));
@@ -122,7 +129,7 @@ int main(int argc, char** argv)
                 const uint64_t now = ranks[0].pool.exclusive(worst) ? worst : prompt.size() + 1;
                 if (worst > uint64_t(pages) * 64 || !ranks[0].pool.fits(now, worst)) continue;
                 const int limit = int(prompt.size()) - 1;
-                const uint32_t c0 = ranks[0].pool.count(prompt), c1 = ranks[1].pool.count(prompt);
+                const uint32_t c0 = ranks[0].pool.count(prompt, span), c1 = ranks[1].pool.count(prompt, span);
                 CHECK(c0 == c1);
                 counted += c0;
                 const PoolHit h = ranks[0].pool.match(prompt, now, worst, limit), h1 = ranks[1].pool.match(prompt, now, worst, limit);

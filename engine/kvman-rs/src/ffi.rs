@@ -3,7 +3,7 @@
 
 use crate::pool::{Error, Pool, Run, Stats};
 use crate::reuse::{Finished, Rules};
-use crate::stash::{Io, Keep, TierStats};
+use crate::stash::{Io, Keep, Policy, TierStats};
 use std::ffi::c_char;
 use std::ffi::CStr;
 
@@ -365,12 +365,35 @@ pub unsafe extern "C" fn g6kv_add_tier(
 }
 
 /// At admission, before the grant, on every rank: counts the prompt toward the prefixes it starts. Returns how many.
+/// span: its system span in tokens, or -1 for none.
 ///
 /// # Safety
 /// As g6kv_exclusive; `prompt` points at `n` ints.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_count(p: *mut Pool, prompt: *const i32, n: usize) -> u32 {
-    slice(prompt, n).map_or(0, |pr| (*p).count(pr))
+pub unsafe extern "C" fn g6kv_count(p: *mut Pool, prompt: *const i32, n: usize, span: i64) -> u32 {
+    let span = u32::try_from(span).ok();
+    slice(prompt, n).map_or(0, |pr| (*p).count(pr, span))
+}
+
+/// Tier t's policy (stash.rs Policy). 0, or BadArgument when there is no such tier.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_policy(p: *mut Pool, t: u32, min_rows: u64, min_hits: u32, block_bytes: u64) -> i32 {
+    match (*p).set_policy(t as usize, Policy { min_rows, min_hits, block_bytes }) {
+        Ok(()) => 0,
+        Err(e) => e.code(),
+    }
+}
+
+/// The write limit: all tiers write at most milli / 1000 blocks per page of KV computed (0 = none).
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_write_limit(p: *mut Pool, milli: u64) {
+    (*p).write_limit(milli);
 }
 
 /// g6kv_io: one copy. kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's

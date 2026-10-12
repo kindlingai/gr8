@@ -8,7 +8,13 @@
 //!          admission, a page more whenever its tokens reach the end of its pages, admission and growth only when the
 //!          pool stays safe (every live run can still reach prompt + max_tokens + guard), else the session waits
 //!   grow+ssd  both
-//!   kvman-sim TRACE.csv [--policies none,today,ssd,grow,grow+ssd] [flags]
+//!   system[N], sessions, all, evicted: the engine's own store (src/stash.rs) under the --kv-keep policies, with
+//!          growth: system prefixes stored after N conversations (default 2), plus sessions that continued once, or
+//!          every eviction. evicted is #37's keep=evicted (every eviction, no prefix bases). Suffixes: -nodedup (no
+//!          prefix bases), -dedupe (prefix bases), -nospan (no system span from the front end: grid-cell counting), @F
+//!          (--kv-write-limit F)
+//!   kvman-sim TRACE.csv [--policies none,today,ssd,grow,grow+ssd] [--repeat N] [flags]
+//! --repeat N runs the trace N times over, each copy started --stagger seconds after the last, as N times the agents.
 //! Time model (the engine at TP=4): one prefill at a time (--prefill-tps, new tokens only), and no decode while a prefill
 //! runs. Decode shares a total rate by how many sessions decode (--decode-tps: 1, 2, 4 sessions, 3 interpolated, more than
 //! 4 as 4). The SSD store moves page blocks (src/tier.rs PAGE_SLOT) at --ssd-write-gbs / --ssd-read-gbs, on the
@@ -18,6 +24,7 @@
 //! outside a W-token resident window, read from SSD at --row-iops.
 
 use g6kvman::reuse::{begin, Finished, Rules};
+use g6kvman::stash::{Io, Keep};
 use g6kvman::tier::PAGE_SLOT;
 use g6kvman::{Pool, Run, PAGE};
 use std::collections::{BTreeMap, VecDeque};
@@ -31,6 +38,9 @@ struct Req {
     think: f64,
     max_tokens: usize,
     ttft_measured: f64,
+    system: usize,        // the session's system span, tokens (0 = unknown)
+    system_shared: usize, // tokens of it that session system_from's span starts with
+    system_from: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -50,35 +60,90 @@ struct Opts {
     rowcache: Vec<usize>,
     row_iops: f64,
     groups: usize,
+    store_slots: u64,
 }
 
+/// The engine's store under a --kv-keep policy.
 #[derive(Clone, Copy, PartialEq)]
+struct StoreCfg {
+    keep: Keep,
+    after: u32,
+    min_hits: u32,
+    dedupe: bool,
+    span: bool,
+    limit_milli: u64,
+}
+
+#[derive(Clone, PartialEq)]
 enum Policy {
     None,
     Today,
     Ssd,
     Grow,
     GrowSsd,
+    Store(String, StoreCfg),
 }
 
 impl Policy {
-    fn name(self) -> &'static str {
+    fn name(&self) -> &str {
         match self {
             Policy::None => "none",
             Policy::Today => "today",
             Policy::Ssd => "ssd",
             Policy::Grow => "grow",
             Policy::GrowSsd => "grow+ssd",
+            Policy::Store(n, _) => n,
         }
     }
-    fn reuse(self) -> bool {
-        self != Policy::None
+    fn reuse(&self) -> bool {
+        *self != Policy::None
     }
-    fn ssd(self) -> bool {
+    fn ssd(&self) -> bool {
         matches!(self, Policy::Ssd | Policy::GrowSsd)
     }
-    fn grow(self) -> bool {
-        matches!(self, Policy::Grow | Policy::GrowSsd)
+    fn grow(&self) -> bool {
+        matches!(self, Policy::Grow | Policy::GrowSsd | Policy::Store(..))
+    }
+    fn store(&self) -> Option<StoreCfg> {
+        match self {
+            Policy::Store(_, c) => Some(*c),
+            _ => None,
+        }
+    }
+    fn parse(p: &str) -> Option<Policy> {
+        Some(match p {
+            "none" => Policy::None,
+            "today" => Policy::Today,
+            "ssd" => Policy::Ssd,
+            "grow" => Policy::Grow,
+            "grow+ssd" => Policy::GrowSsd,
+            _ => {
+                let (base, limit) = match p.split_once('@') {
+                    Some((b, f)) => (b, (f.parse::<f64>().ok()? * 1000.0).round() as u64),
+                    None => (p, 0),
+                };
+                let mut c = StoreCfg { keep: Keep::Shared, after: 2, min_hits: 0, dedupe: true, span: true, limit_milli: limit };
+                let mut words = base.split('-');
+                match words.next()? {
+                    w if w.starts_with("system") => {
+                        c.after = if w.len() > 6 { w[6..].parse().ok()? } else { 2 };
+                    }
+                    "sessions" => (c.keep, c.min_hits) = (Keep::All, 1),
+                    "all" => c.keep = Keep::All,
+                    "evicted" => (c.keep, c.dedupe) = (Keep::Evicted, false),
+                    _ => return None,
+                }
+                for w in words {
+                    match w {
+                        "nodedup" => c.dedupe = false,
+                        "dedupe" => c.dedupe = true,
+                        "nospan" => c.span = false,
+                        _ => return None,
+                    }
+                }
+                Policy::Store(p.to_string(), c)
+            }
+        })
     }
 }
 
@@ -87,7 +152,8 @@ fn usage() -> ! {
         "usage: kvman-sim TRACE.csv [--policies none,today,ssd] [--prefill-tps 1300] [--decode-tps 30,51.5,64.4]\n\
          [--pages 4608] [--place 1920] [--share-limit 65536] [--sessions 8] [--guard 14] [--grid 4096] [--strict]\n\
          [--end-rule] [--ssd-write-gbs 5.7] [--ssd-read-gbs 7.0] [--ssd-gb 256] [--spill evict|retire]\n\
-         [--rowcache 16384,32768] [--row-iops 832000] [--groups 21] [--max-tokens N]"
+         [--rowcache 16384,32768] [--row-iops 832000] [--groups 21] [--max-tokens N] [--repeat N] [--stagger S]\n\
+         policies also: system[N] sessions all evicted, -nodedup -nospan, @F (write limit)"
     );
     std::process::exit(2)
 }
@@ -110,6 +176,8 @@ fn read_trace(path: &str, max_tokens: Option<usize>) -> Vec<Req> {
         col("max_tokens"),
         col("ttft_s"),
     ];
+    let opt = |name: &str| head.iter().position(|h| h.trim() == name);
+    let sys = [opt("system_tokens"), opt("system_shared"), opt("system_from")];
     lines
         .map(|l| {
             let f: Vec<f64> = l.split(',').map(|x| x.trim().parse().expect("a number")).collect();
@@ -123,9 +191,37 @@ fn read_trace(path: &str, max_tokens: Option<usize>) -> Vec<Req> {
                 think: f[c[4]],
                 max_tokens,
                 ttft_measured: f[c[6]],
+                system: sys[0].map_or(0, |i| f[i] as usize),
+                system_shared: sys[1].map_or(0, |i| f[i] as usize),
+                system_from: sys[2].and_then(|i| (f[i] >= 0.0).then_some(f[i] as usize)),
             }
         })
         .collect()
+}
+
+// the trace n times over, each copy's sessions starting `stagger` seconds after the last copy's
+// (agents in other folders: a copy's system span starts with the part every span in the trace shares)
+fn repeat(reqs: Vec<Req>, n: usize, stagger: f64) -> Vec<Req> {
+    let sessions = reqs.iter().map(|r| r.session + 1).max().unwrap_or(0);
+    let common = reqs.iter().map(|r| r.system_shared).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for k in 0..n {
+        let mut first = vec![true; sessions];
+        for r in &reqs {
+            let mut x = r.clone();
+            x.session += k * sessions;
+            if k > 0 {
+                x.system_from = Some(r.session);
+                x.system_shared = common.min(r.system);
+            }
+            if first[r.session] {
+                x.think += k as f64 * stagger;
+                first[r.session] = false;
+            }
+            out.push(x);
+        }
+    }
+    out
 }
 
 fn main() {
@@ -147,25 +243,17 @@ fn main() {
         rowcache: Vec::new(),
         row_iops: 832_000.0,
         groups: 21,
+        store_slots: 0,
     };
     let mut policies = vec![Policy::None, Policy::Today, Policy::Ssd, Policy::Grow, Policy::GrowSsd];
     let mut max_tokens = None;
+    let (mut copies, mut stagger) = (1usize, 600.0f64);
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| usage());
         let num = |s: String| s.parse::<f64>().unwrap_or_else(|_| usage());
         match k.as_str() {
             "--policies" => {
-                policies = v()
-                    .split(',')
-                    .map(|p| match p {
-                        "none" => Policy::None,
-                        "today" => Policy::Today,
-                        "ssd" => Policy::Ssd,
-                        "grow" => Policy::Grow,
-                        "grow+ssd" => Policy::GrowSsd,
-                        _ => usage(),
-                    })
-                    .collect()
+                policies = v().split(',').map(|p| Policy::parse(p).unwrap_or_else(|| usage())).collect()
             }
             "--prefill-tps" => o.prefill_tps = num(v()),
             "--decode-tps" => {
@@ -194,10 +282,13 @@ fn main() {
             "--row-iops" => o.row_iops = num(v()),
             "--groups" => o.groups = num(v()) as usize,
             "--max-tokens" => max_tokens = Some(num(v()) as usize),
+            "--repeat" => copies = num(v()) as usize,
+            "--stagger" => stagger = num(v()),
             _ => usage(),
         }
     }
-    let reqs = read_trace(&trace, max_tokens);
+    let reqs = repeat(read_trace(&trace, max_tokens), copies.max(1), stagger);
+    o.store_slots = ((o.store_gb * 1e9) as u64 / PAGE_SLOT as u64).max(1);
     let sessions = reqs.iter().map(|r| r.session + 1).max().unwrap_or(0);
     let prompt_total: usize = reqs.iter().map(|r| r.prompt).sum();
     println!(
@@ -212,7 +303,7 @@ fn main() {
         quantile(&mut meas, 0.9)
     );
     println!(
-        "{:<8} {:>8} {:>8} {:>9} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9} {:>9} {:>7} {:>8}",
+        "{:<16} {:>8} {:>8} {:>9} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9} {:>9} {:>7} {:>8} {:>8}",
         "policy",
         "TTFT p50",
         "TTFT p90",
@@ -226,13 +317,14 @@ fn main() {
         "SSD wr GB",
         "SSD rd GB",
         "live",
-        "waited s"
+        "waited s",
+        "wr GB/h"
     );
     for p in policies {
-        let r = simulate(&reqs, &o, p);
+        let r = simulate(&reqs, &o, &p);
         let mut t = r.ttft.clone();
         println!(
-            "{:<8} {:>8.1} {:>8.1} {:>9.0} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9.1} {:>9.1} {:>7.2} {:>8.0}",
+            "{:<16} {:>8.1} {:>8.1} {:>9.0} {:>10} {:>9} {:>6} {:>6} {:>6} {:>7} {:>9.1} {:>9.1} {:>7.2} {:>8.0} {:>8.1}",
             p.name(),
             quantile(&mut t, 0.5),
             quantile(&mut t, 0.9),
@@ -246,7 +338,8 @@ fn main() {
             r.written as f64 / 1e9,
             r.read as f64 / 1e9,
             r.live_s / r.wall.max(1e-9),
-            r.stall_s
+            r.stall_s,
+            r.written as f64 / 1e9 / r.wall.max(1e-9) * 3600.0
         );
     }
     for &w in &o.rowcache {
@@ -347,10 +440,19 @@ fn decode_rate(o: &Opts, n: usize) -> f64 {
     total / n as f64
 }
 
-fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
+fn simulate(reqs: &[Req], o: &Opts, policy: &Policy) -> Result {
     let mut pool = Pool::new(o.pages, o.place, o.below).expect("pool sizes");
     if policy.reuse() {
         pool.keep(o.rules);
+    }
+    let cfg = policy.store();
+    if let Some(c) = cfg {
+        pool.stores(c.after);
+        pool.add_tier(o.store_slots, c.keep, None).expect("a tier");
+        let p = g6kvman::stash::Policy { min_rows: 0, min_hits: c.min_hits, block_bytes: PAGE_SLOT as u64 };
+        pool.set_policy(0, p).expect("tier 0");
+        pool.write_limit(c.limit_milli);
+        pool.stash_mut().expect("stores").dedupe = c.dedupe;
     }
     let mut res = Result::default();
     let nsess = reqs.iter().map(|r| r.session + 1).max().unwrap_or(0);
@@ -366,6 +468,18 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
         token += 1;
         token
     };
+    // each session's system span: the part another session's span starts with, then its own tokens
+    let mut system: Vec<Vec<i32>> = vec![Vec::new(); nsess];
+    for q in &by_session {
+        if let Some(r) = q.front() {
+            let mut t: Vec<i32> = match r.system_from {
+                Some(f) if f < r.session => system[f][..r.system_shared.min(system[f].len())].to_vec(),
+                _ => Vec::new(),
+            };
+            t.extend((t.len()..r.system).map(|_| fresh()));
+            system[r.session] = t;
+        }
+    }
     let mut fifo: VecDeque<(usize, f64)> = VecDeque::new();
     let mut active: Vec<Active> = Vec::new();
     let page_bytes = PAGE_SLOT as u64;
@@ -385,6 +499,7 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
                 io_block: &mut f64| {
         let before: Vec<u64> = pool.kept().iter().map(|k| k.age).collect();
         let r = pool.grow(&x.run, rows).expect("live run");
+        *io_block += drain(pool, res, o);
         evicted(pool, &before, 0, retained, res, |y, res| {
             if policy.ssd() && !o.spill_retire {
                 res.written += y.pages as u64 * page_bytes;
@@ -421,16 +536,31 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
             }
             fifo.pop_front();
             let mut prompt: Vec<i32> = last_prompt[s][..r.overlap.min(last_prompt[s].len())].to_vec();
+            if prompt.is_empty() {
+                prompt = system[s][..system[s].len().min(r.prompt)].to_vec();
+            }
             prompt.extend((prompt.len()..r.prompt).map(|_| fresh()));
             let before: Vec<u64> = pool.kept().iter().map(|k| k.age).collect();
             let limit = r.prompt as i32 - 1;
+            if let Some(c) = cfg {
+                let span = (c.span && r.system > 0).then_some(r.system as u32);
+                pool.count(&prompt, span);
+            }
             let h = if policy.reuse() { pool.match_prefix(&prompt, rows, worst, limit) } else { Default::default() };
             let (mut io_s, mut skip) = (0.0, 0usize);
-            let run = if h.skip > 0 {
+            let run = if h.stored {
+                res.ssd_hits += 1;
+                skip = h.skip as usize;
+                let run = pool.take_hit(h.skip, h.age, Some(h.tier), rows, worst).expect("a stored hit from match");
+                io_block += drain(&mut pool, &mut res, o);
+                run
+            } else if h.skip > 0 {
                 res.pool_hits += 1;
                 skip = h.skip as usize;
                 retained.remove(&h.age);
-                pool.take(h.skip, h.age, rows, worst).expect("a hit from match")
+                let run = pool.take(h.skip, h.age, rows, worst).expect("a hit from match");
+                io_block += drain(&mut pool, &mut res, o);
+                run
             } else {
                 // a stored run this prompt continues, the longest first, then the most recent
                 let best = policy
@@ -446,6 +576,7 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
                     })
                     .flatten();
                 let run = pool.reserve(rows, worst).expect("fits checked");
+                io_block += drain(&mut pool, &mut res, o);
                 if let Some((i, k)) = best {
                     let x = store.q.remove(i).expect("found");
                     store.pages -= x.pages;
@@ -555,6 +686,7 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
             } else {
                 let kept = pool.kept_runs();
                 pool.retain(&x.run, st.clone()).expect("live run");
+                io_block += drain(&mut pool, &mut res, o);
                 if pool.kept_runs() > kept {
                     let age = pool.kept().last().expect("just retained").age;
                     if policy.ssd() && o.spill_retire {
@@ -570,6 +702,27 @@ fn simulate(reqs: &[Req], o: &Opts, policy: Policy) -> Result {
         }
     }
     res
+}
+
+// the store copies the last pool call queued (the engine's drain): bytes written and read, and the seconds the drain
+// holds every session up
+fn drain(pool: &mut Pool, res: &mut Result, o: &Opts) -> f64 {
+    let io = pool.io();
+    if io.is_empty() {
+        let _ = pool.io_done();
+        return 0.0;
+    }
+    let (mut w, mut r) = (0u64, 0u64);
+    for x in &io {
+        match x {
+            Io::Spill { .. } | Io::Move { .. } => w += PAGE_SLOT as u64,
+            Io::Restore { .. } => r += PAGE_SLOT as u64,
+        }
+    }
+    pool.io_done().expect("no index");
+    res.written += w;
+    res.read += r;
+    w as f64 / (o.write_gbs * 1e9) + r as f64 / (o.read_gbs * 1e9)
 }
 
 // the retained runs a grant evicted (in `before`, not kept now, not the run a hit adopted): counted, and handed to

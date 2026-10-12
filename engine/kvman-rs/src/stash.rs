@@ -14,15 +14,28 @@
 //! - Counting: count() at each admission. A request that continues a live, retained or stored run (its prompt holds
 //!   all of that run's prompt) counts toward nothing, so a five-turn chat counts once. The next prompt may carry
 //!   another reply than the run wrote: an agent client can drop the reasoning or edit the reply. Any other request
-//!   starts a conversation and counts once toward every grid-cell prefix of its prompt. The key of a prefix of S rows is
-//!   its first S + 1 tokens: the MTP layer's row S - 1 depends on token S. When a run retires, the longest counted
-//!   prefix it holds goes to the first tier that keeps shared prefixes, unless a tier has it already. The tier writes
-//!   that prefix once, every later hit reads it, and it stays until its tier needs the room.
+//!   starts a conversation and counts once toward every grid-cell prefix of its prompt, up to its system span (the
+//!   system message and tool definitions as the chat template renders them) when the front end sent one. Conversations
+//!   whose system prompts differ partway (an agent writes its working folder into it) still share the cells before the
+//!   difference. The key of a prefix of S rows is its first S + 1 tokens: the MTP layer's row S - 1 depends on token S.
+//!   When a run retires, the longest prefix it holds, within its span, that shared_after conversations started with
+//!   goes to the first tier that keeps shared prefixes, unless a tier has it already. The tier writes that prefix once, every later hit reads it, and it stays until
+//!   its tier needs the room. An SSD tier's index keeps the counts across restarts.
 //! - A hit on an evicted run takes the run out of its tier, a hit on a shared prefix leaves the prefix there. Either way
 //!   the blocks go back into the grant's first pages.
 //! - Each call's copies, in order: Moves and Spills as placement made them (a Move reads a slot before a later copy
 //!   reuses the slot), then Restores (a restore writes a page a spill of the same call may still have to read). Until
 //!   the engine has run the copies and called io_done(), the pool refuses reserve, take and grow (Error::PendingIo).
+//! - Each tier may refuse what it is offered (Policy): evicted runs of fewer than min_rows rows, and runs that
+//!   continued their conversation fewer than min_hits times (a one-shot never). A refused entry tries the next tier.
+//! - A write limit (--kv-write-limit F) caps the blocks all tiers write at F per page of KV the engine computes
+//!   (earn(): prefill and decode pages, never the clock), so every rank refuses the same writes. A write needs credit
+//!   above zero and may take it below; the credit holds at most BURST pages' worth. Without credit a spill is refused
+//!   and a move drops its entry.
+//! - A run's leading pages that another run in the pool also holds (live or retained, the same tokens) are a prefix
+//!   conversations share. Spilling the run stores that prefix once as a Prefix entry, and the run as a reference to it
+//!   plus its own pages. Later runs with that prefix store only their own pages, in every keep mode. A restore takes
+//!   the prefix from a retained run in the pool when one holds it, else from the tier.
 //! - A tier with an index (an SSD folder) keeps its shared prefixes across restarts. The engine writes the blocks,
 //!   then io_done() commits their index records. A drop record reaches the disk before the entry's slots are reused.
 //!   See Index.
@@ -44,15 +57,42 @@ pub enum Keep {
 
 impl Keep {
     fn takes(self, k: Kind) -> bool {
-        matches!((self, k), (Keep::All, _) | (Keep::Evicted, Kind::Evicted) | (Keep::Shared, Kind::Shared))
+        matches!(
+            (self, k),
+            (Keep::All, _) | (_, Kind::Prefix) | (Keep::Evicted, Kind::Evicted) | (Keep::Shared, Kind::Shared)
+        )
     }
 }
 
+/// Evicted: a retained run the pool let go. Shared: a prefix that started shared_after conversations. Prefix: a prefix
+/// two runs in the pool held when one of them spilled, the base of the runs stored on it (every keep mode takes it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Evicted,
     Shared,
+    Prefix,
 }
+
+impl Kind {
+    /// A prefix entry: hits leave it in its tier, and runs may be stored on it.
+    pub fn prefix(self) -> bool {
+        self != Kind::Evicted
+    }
+}
+
+/// What a tier refuses. 0 = no limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Policy {
+    /// evicted runs need at least this many rows
+    pub min_rows: u64,
+    /// evicted runs need to have continued their conversation at least this many times
+    pub min_hits: u32,
+    /// bytes one block takes (status.s2 counts bytes)
+    pub block_bytes: u64,
+}
+
+/// The write limit's credit starts at, and holds at most, this many blocks.
+pub const BURST: i64 = 4096;
 
 /// One copy for the engine. A page is one pool page of every layer, a slot one block of a tier's store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +112,8 @@ pub struct Entry {
     pub st: Finished,
     pub slots: Vec<u64>,
     pub base: Option<(u64, usize)>,
+    /// times the conversation continued a run before this one was stored
+    pub hits: u32,
 }
 
 impl Entry {
@@ -81,7 +123,7 @@ impl Entry {
     }
 }
 
-/// Counters for status.s2, per tier.
+/// Counters for status.s2, per tier (g6kvman.h g6kv_tier_totals). Pages are blocks; block_bytes makes them bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TierStats {
@@ -93,7 +135,20 @@ pub struct TierStats {
     pub moved_in_pages: u64,
     pub restored_pages: u64,
     pub hits: u64,
+    /// entries that left the tier with no tier to go to, and their pages
     pub dropped: u64,
+    pub dropped_pages: u64,
+    /// entries passed on to the next tier, and their pages
+    pub moved_out: u64,
+    pub moved_out_pages: u64,
+    /// entries the policy refused (min_rows, min_hits, rate), and their pages
+    pub refused: u64,
+    pub refused_pages: u64,
+    /// times the tier had to make room (it was full)
+    pub full: u64,
+    pub block_bytes: u64,
+    /// write limit credit left, blocks (0 without a limit; the same on every tier)
+    pub credit: i64,
 }
 
 pub struct Tier {
@@ -103,6 +158,14 @@ pub struct Tier {
     entries: Vec<Entry>, // least recently used first
     index: Option<Index>,
     stats: TierStats,
+    policy: Policy,
+}
+
+impl Tier {
+    // whether the policy takes an evicted run of `rows` and `hits` (other kinds always)
+    fn admits(&self, kind: Kind, rows: u64, hits: u32) -> bool {
+        kind != Kind::Evicted || (rows >= self.policy.min_rows && hits >= self.policy.min_hits)
+    }
 }
 
 /// Prefix counts kept at most, the least recently counted dropped first.
@@ -116,12 +179,18 @@ pub struct Stash {
     taken: bool,
     commits: Vec<(usize, u64)>,
     counts: BTreeMap<u64, (u32, u64)>,
+    counted: Vec<(u64, u32, u64)>, // counts since the last io_done, for the index
     clock: u64,
     shared_after: u32,
     grid: u64,
     next_id: u64,
     pin: Vec<u64>,
     pub index_errors: u64,
+    // the write limit: blocks per 1000 pages computed (0 = none), and the credit in thousandths of a block
+    limit_milli: u64,
+    credit: i64,
+    /// prefix bases for evicted runs (on; kvman-sim turns it off to compare)
+    pub dedupe: bool,
 }
 
 const FNV: u64 = 14695981039346656037;
@@ -142,12 +211,16 @@ impl Stash {
             taken: false,
             commits: Vec::new(),
             counts: BTreeMap::new(),
+            counted: Vec::new(),
             clock: 0,
             shared_after: shared_after.max(1),
             grid: if grid == 0 { GRID } else { grid },
             next_id: 1,
             pin: Vec::new(),
             index_errors: 0,
+            limit_milli: 0,
+            credit: 0,
+            dedupe: true,
         }
     }
 
@@ -160,12 +233,20 @@ impl Stash {
             entries: Vec::new(),
             index: None,
             stats: TierStats::default(),
+            policy: Policy::default(),
         };
         if let Some((ix, loaded)) = index {
             for e in loaded {
                 if e.slots.iter().all(|&s| s < slots) && t.alloc.claim(&e.slots) {
                     self.next_id = self.next_id.max(e.id + 1);
                     t.entries.push(e);
+                }
+            }
+            // the counts live in the first index
+            if !self.tiers.iter().any(|x| x.index.is_some()) {
+                for (&k, &c) in &ix.counts {
+                    self.counts.insert(k, c);
+                    self.clock = self.clock.max(c.1);
                 }
             }
             t.index = Some(ix);
@@ -177,13 +258,42 @@ impl Stash {
         self.tiers.len()
     }
 
+    pub fn set_policy(&mut self, t: usize, p: Policy) {
+        self.tiers[t].policy = p;
+    }
+
+    /// The write limit: the tiers write at most `milli` / 1000 blocks per page of KV computed. 0 = none.
+    pub fn set_limit(&mut self, milli: u64) {
+        self.limit_milli = milli;
+        self.credit = BURST * 1000;
+    }
+
+    /// `pages` pages of KV were computed (a grant's prefill, a growth): the write limit earns credit.
+    pub(crate) fn earn(&mut self, pages: u64) {
+        if self.limit_milli > 0 {
+            self.credit = (self.credit + (self.limit_milli * pages).min(i64::MAX as u64 / 2) as i64).min(BURST * 1000);
+        }
+    }
+
+    fn writable(&self) -> bool {
+        self.limit_milli == 0 || self.credit > 0
+    }
+
+    fn charge(&mut self, n: usize) {
+        if self.limit_milli > 0 {
+            self.credit -= n as i64 * 1000;
+        }
+    }
+
     pub fn stats(&self, t: usize) -> Option<TierStats> {
         let x = self.tiers.get(t)?;
         Some(TierStats {
             slots: x.slots,
             free_slots: x.alloc.free(),
             entries: x.entries.len() as u32,
-            shared: x.entries.iter().filter(|e| e.kind == Kind::Shared).count() as u32,
+            shared: x.entries.iter().filter(|e| e.kind.prefix()).count() as u32,
+            block_bytes: x.policy.block_bytes,
+            credit: if self.limit_milli > 0 { self.credit / 1000 } else { 0 },
             ..x.stats
         })
     }
@@ -214,6 +324,15 @@ impl Stash {
     pub(crate) fn io_done(&mut self) -> io::Result<()> {
         self.taken = false;
         let mut err = Ok(());
+        let counted = std::mem::take(&mut self.counted);
+        if let Some(ix) = self.tiers.iter_mut().find_map(|t| t.index.as_mut()) {
+            if !counted.is_empty() {
+                if let Err(e) = ix.add_counts(&counted) {
+                    self.index_errors += 1;
+                    err = Err(e);
+                }
+            }
+        }
         for (t, id) in std::mem::take(&mut self.commits) {
             let tier = &mut self.tiers[t];
             if let (Some(ix), Some(e)) = (&mut tier.index, tier.entries.iter().find(|e| e.id == id)) {
@@ -234,42 +353,49 @@ impl Stash {
             .any(|e| e.kind == Kind::Evicted && continues(prompt, &e.st.history, e.st.pf_end.max(0) as usize))
     }
 
-    /// Counts a request that starts a conversation toward every grid-cell prefix of its prompt. Returns how many.
-    pub(crate) fn count(&mut self, prompt: &[i32], continuing: bool) -> u32 {
+    /// The rows of a system span of `span` tokens that a tier can hold: cut to the grid, 0 when shorter than a cell.
+    pub fn span_rows(&self, span: u32, prompt_len: usize) -> u64 {
+        let s = (span as u64).min(prompt_len.saturating_sub(1) as u64);
+        s / self.grid * self.grid
+    }
+
+    /// Counts a request that starts a conversation toward every grid-cell prefix of its prompt, up to its system span
+    /// (rows, from span_rows) when it has one. Returns how many prefixes it counted.
+    pub(crate) fn count(&mut self, prompt: &[i32], continuing: bool, span: Option<u64>) -> u32 {
         if !self.counting() || continuing || prompt.len() < 2 {
             return 0;
         }
-        let g = self.grid as usize;
-        let mut n = 0;
-        let mut s = g;
-        while s < prompt.len() {
+        let end = span.map_or(prompt.len() - 1, |s| s as usize);
+        let cells: Vec<usize> = (1..).map(|i| i * self.grid as usize).take_while(|&s| s <= end).collect();
+        for &s in &cells {
             self.clock += 1;
-            let c = self.counts.entry(prefix_key(&prompt[..s + 1])).or_insert((0, 0));
+            let key = prefix_key(&prompt[..s + 1]);
+            let c = self.counts.entry(key).or_insert((0, 0));
             c.0 += 1;
             c.1 = self.clock;
-            n += 1;
-            s += g;
+            self.counted.push((key, c.0, c.1));
         }
         while self.counts.len() > COUNTS {
             let (&k, _) = self.counts.iter().min_by_key(|(k, c)| (c.1, **k)).expect("not empty");
             self.counts.remove(&k);
         }
-        n
+        cells.len() as u32
     }
 
-    /// A retiring run: the longest counted prefix it holds that no tier has yet goes to the first tier that keeps shared
-    /// prefixes. `rows_max`: the rows whose pages are the same logical pages on every rank (R for a run past R).
-    pub(crate) fn promote(&mut self, list: &[u32], st: &Finished, rows_max: u64) {
+    /// A retiring run: the longest prefix it holds, within its system span (rows, span_rows) when it has one, that
+    /// shared_after conversations started with goes to the first tier that keeps shared prefixes, unless a tier has it.
+    /// `rows_max`: the rows whose pages are the same logical pages on every rank (R for a run past R).
+    pub(crate) fn promote(&mut self, list: &[u32], st: &Finished, rows_max: u64, span: Option<u64>) {
         if !self.counting() || st.valid <= 0 || st.history.is_empty() {
             return;
         }
         let g = self.grid;
         let top = (st.valid as u64).min(st.history.len() as u64 - 1).min(rows_max).min(list.len() as u64 * PAGE);
-        let mut s = top / g * g;
+        let mut s = top.min(span.unwrap_or(u64::MAX)) / g * g;
         while s >= g {
             let key = prefix_key(&st.history[..s as usize + 1]);
             if self.count_of(key) >= self.shared_after {
-                if self.tiers.iter().flat_map(|t| &t.entries).any(|e| e.kind == Kind::Shared && e.key == key) {
+                if self.tiers.iter().flat_map(|t| &t.entries).any(|e| e.kind.prefix() && e.key == key) {
                     return;
                 }
                 let n = pages(s);
@@ -279,7 +405,7 @@ impl Stash {
                     written_end: s as i32,
                     pf_end: s as i32,
                 };
-                self.store(Kind::Shared, key, fin, &list[..n]);
+                self.store(Kind::Shared, key, fin, &list[..n], 0, &[]);
                 return;
             }
             s -= g;
@@ -287,7 +413,8 @@ impl Stash {
     }
 
     /// Stores evicted retained runs, oldest first. below_pages: the pages of a run past R that are alike on every rank.
-    pub(crate) fn put_evicted(&mut self, gone: &[Kept], below_pages: usize) {
+    /// resident: the token histories of the runs still in the pool (live and retained), for prefix bases.
+    pub(crate) fn put_evicted(&mut self, gone: &[Kept], below_pages: usize, resident: &[&[i32]]) {
         for k in gone {
             if k.st.valid <= 0 {
                 continue;
@@ -301,30 +428,69 @@ impl Stash {
             if n == 0 {
                 continue;
             }
-            self.store(Kind::Evicted, 0, st, &k.list[..n]);
+            self.store(Kind::Evicted, 0, st, &k.list[..n], k.hits, resident);
         }
     }
 
-    // the longest stored shared prefix that `history` starts with and whose pages fit in `max_pages`: (id, pages)
+    // the longest stored prefix entry that `history` starts with and whose pages fit in `max_pages`: (id, pages)
     fn shared_base(&self, history: &[i32], max_pages: usize) -> Option<(u64, usize)> {
         self.tiers
             .iter()
             .flat_map(|t| &t.entries)
-            .filter(|e| e.kind == Kind::Shared && e.slots.len() <= max_pages && history.starts_with(&e.st.history))
+            .filter(|e| e.kind.prefix() && e.slots.len() <= max_pages && history.starts_with(&e.st.history))
             .max_by_key(|e| (e.slots.len(), e.id))
             .map(|e| (e.id, e.slots.len()))
     }
 
-    fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32]) {
-        // a run that starts with a stored shared prefix stores only the pages after it
-        let base = if kind == Kind::Evicted { self.shared_base(&st.history, pages.len()) } else { None };
+    // the longest grid-cell prefix of `st`, within `max_pages`, that a run still in the pool also holds: its rows
+    fn resident_prefix(&self, st: &Finished, max_pages: usize, resident: &[&[i32]]) -> u64 {
+        let g = self.grid;
+        let top = (st.valid.max(0) as u64).min(st.history.len() as u64 - 1).min(max_pages as u64 * PAGE);
+        let mut s = top / g * g;
+        while s >= g {
+            let n = s as usize + 1;
+            if resident.iter().any(|r| r.len() > n && r[..n] == st.history[..n]) {
+                return s;
+            }
+            s -= g;
+        }
+        0
+    }
+
+    fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32, resident: &[&[i32]]) {
+        // a run that starts with a stored prefix stores only the pages after it. Else a prefix another run in the pool
+        // holds becomes one, stored once, when a tier takes it
+        let rows = st.valid.max(0) as u64;
+        if !self.tiers.iter().any(|t| t.keep.takes(kind) && t.admits(kind, rows, hits)) {
+            if let Some(t) = self.tiers.iter_mut().find(|t| t.keep.takes(kind)) {
+                t.stats.refused += 1;
+                t.stats.refused_pages += pages.len() as u64;
+            }
+            return;
+        }
+        let mut base = if kind == Kind::Evicted { self.shared_base(&st.history, pages.len()) } else { None };
+        if kind == Kind::Evicted && base.is_none() && self.dedupe {
+            let s = self.resident_prefix(&st, pages.len(), resident);
+            if s > 0 {
+                let fin = Finished {
+                    history: st.history[..s as usize + 1].to_vec(),
+                    valid: s as i32,
+                    written_end: s as i32,
+                    pf_end: s as i32,
+                };
+                let key = prefix_key(&fin.history);
+                if let Some(id) = self.put(Kind::Prefix, key, fin, &pages[..s.div_ceil(PAGE) as usize], 0) {
+                    base = Some((id, s.div_ceil(PAGE) as usize));
+                }
+            }
+        }
         let own = &pages[base.map_or(0, |b| b.1)..];
         if own.is_empty() {
             return;
         }
         let pin = std::mem::take(&mut self.pin);
         self.pin = pin.iter().copied().chain(base.map(|b| b.0)).collect();
-        let placed = self.place(0, kind, own.len());
+        let placed = self.place(0, kind, own.len(), rows, hits);
         self.pin = pin;
         let Some((t, slots)) = placed else { return };
         self.io.extend(own.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier: t as u32, page, slot }));
@@ -332,23 +498,55 @@ impl Stash {
         self.next_id += 1;
         let tier = &mut self.tiers[t];
         tier.stats.spilled_pages += own.len() as u64;
-        tier.entries.push(Entry { id, kind, key, st, slots, base });
-        if kind == Kind::Shared && tier.index.is_some() {
+        tier.entries.push(Entry { id, kind, key, st, slots, base, hits });
+        if kind.prefix() && tier.index.is_some() {
             self.commits.push((t, id));
         }
     }
 
-    /// The first tier from `start` whose keep takes `kind` and which can make room for n blocks: (tier, slots).
-    fn place(&mut self, start: usize, kind: Kind, n: usize) -> Option<(usize, Vec<u64>)> {
+    // a prefix entry of its own (no base): its id, or None when no tier takes it
+    fn put(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32) -> Option<u64> {
+        let (t, slots) = self.place(0, kind, pages.len(), st.valid.max(0) as u64, hits)?;
+        self.io.extend(pages.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier: t as u32, page, slot }));
+        let id = self.next_id;
+        self.next_id += 1;
+        let tier = &mut self.tiers[t];
+        tier.stats.spilled_pages += pages.len() as u64;
+        tier.entries.push(Entry { id, kind, key, st, slots, base: None, hits });
+        if tier.index.is_some() {
+            self.commits.push((t, id));
+        }
+        Some(id)
+    }
+
+    /// The first tier from `start` whose keep and policy take the entry (`rows`, `hits`) and which can make room for n
+    /// blocks: (tier, slots). The tier's rate credit pays for the writes.
+    fn place(&mut self, start: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Option<(usize, Vec<u64>)> {
+        let mut refused = None;
         for t in start..self.tiers.len() {
-            if self.tiers[t].keep.takes(kind) && n as u64 <= self.tiers[t].slots && self.make_room(t, n) {
+            if !self.tiers[t].keep.takes(kind) || n as u64 > self.tiers[t].slots {
+                continue;
+            }
+            if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {
+                refused.get_or_insert(t);
+                continue;
+            }
+            if self.make_room(t, n) {
+                self.charge(n);
                 return Some((t, self.tiers[t].alloc.alloc(n).expect("room made")));
             }
+        }
+        if let Some(t) = refused {
+            self.tiers[t].stats.refused += 1;
+            self.tiers[t].stats.refused_pages += n as u64;
         }
         None
     }
 
     fn make_room(&mut self, t: usize, n: usize) -> bool {
+        if self.tiers[t].alloc.free() < n as u64 {
+            self.tiers[t].stats.full += 1;
+        }
         while self.tiers[t].alloc.free() < n as u64 {
             let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else { return false };
             let e = self.tiers[t].entries.remove(i);
@@ -360,7 +558,7 @@ impl Stash {
     // e leaves tier t for the next tier that keeps its kind, or is dropped. Tier t frees e's slots after queueing the move.
     fn evict(&mut self, t: usize, e: Entry) {
         if let Some(ix) = &mut self.tiers[t].index {
-            if e.kind == Kind::Shared && ix.drop(e.id).is_err() {
+            if e.kind.prefix() && ix.drop(e.id).is_err() {
                 self.index_errors += 1;
             }
         }
@@ -368,7 +566,7 @@ impl Stash {
         // the base of a run on the move must stay while the run finds a place
         let pinned = self.pin.len();
         self.pin.extend(e.base.map(|b| b.0));
-        let placed = self.place(t + 1, e.kind, e.slots.len());
+        let placed = self.place(t + 1, e.kind, e.slots.len(), e.st.valid.max(0) as u64, e.hits);
         self.pin.truncate(pinned);
         match placed {
             Some((u, new)) => {
@@ -380,14 +578,17 @@ impl Stash {
                 }));
                 let to = &mut self.tiers[u];
                 to.stats.moved_in_pages += new.len() as u64;
-                if e.kind == Kind::Shared && to.index.is_some() {
+                if e.kind.prefix() && to.index.is_some() {
                     self.commits.push((u, e.id));
                 }
                 self.tiers[u].entries.insert(0, Entry { slots: new, ..e.clone() });
+                self.tiers[t].stats.moved_out += 1;
+                self.tiers[t].stats.moved_out_pages += e.slots.len() as u64;
             }
             None => {
                 self.tiers[t].stats.dropped += 1;
-                if e.kind == Kind::Shared {
+                self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
+                if e.kind.prefix() {
                     self.drop_dependents(e.id);
                 }
             }
@@ -405,6 +606,7 @@ impl Stash {
             for e in gone {
                 self.tiers[t].alloc.release(&e.slots);
                 self.tiers[t].stats.dropped += 1;
+                self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
             }
         }
     }
@@ -421,6 +623,11 @@ impl Stash {
         self.tiers.get(t)?.entries.iter().find(|e| e.id == id)
     }
 
+    /// The history of a prefix entry, wherever it is.
+    pub(crate) fn base_history(&self, id: u64) -> Option<&[i32]> {
+        self.tiers.iter().flat_map(|t| &t.entries).find(|e| e.id == id).map(|e| &e.st.history[..])
+    }
+
     /// A hit's entry, for a grant: an evicted run leaves its tier (its slots stay held until restore() queues the
     /// copies), a shared prefix stays, pinned against this call's placements, and becomes the most recently used.
     pub(crate) fn begin_restore(&mut self, t: usize, id: u64) -> Entry {
@@ -428,7 +635,7 @@ impl Stash {
         let i = tier.entries.iter().position(|e| e.id == id).expect("found by the caller");
         let e = tier.entries.remove(i);
         tier.stats.hits += 1;
-        if e.kind == Kind::Shared {
+        if e.kind.prefix() {
             tier.entries.push(e.clone());
             self.pin.push(id);
         }
@@ -436,9 +643,11 @@ impl Stash {
         e
     }
 
-    pub(crate) fn restore(&mut self, t: usize, e: &Entry, pages: &[u32]) {
+    /// Queues the copies of a hit's entry into `pages` (its first ones). pool_base: the grant's first base pages came
+    /// from a retained run in the pool, so only the entry's own blocks are read.
+    pub(crate) fn restore(&mut self, t: usize, e: &Entry, pages: &[u32], pool_base: bool) {
         let b = e.base.map_or(0, |b| b.1).min(pages.len());
-        if let Some((base, _)) = e.base {
+        if let Some((base, _)) = e.base.filter(|_| !pool_base) {
             let (u, slots) = self.locate(base).expect("a base outlives the runs on it");
             let copies: Vec<Io> = slots
                 .iter()
@@ -468,12 +677,17 @@ impl Stash {
                 s += &format!("{t} {} {:x} {} {:x}\n", e.id, e.key, e.st.valid, slots_hash(&e.slots));
             }
         }
+        for (k, c) in &self.counts {
+            s += &format!("c {k:x} {} {}\n", c.0, c.1);
+        }
         s
     }
 
     /// Keeps the entries on the lines of `agreed`, in their order, and drops the rest (with their index records).
     pub fn keep_agreed(&mut self, agreed: &str) {
         let want: Vec<&str> = agreed.lines().collect();
+        self.counts.retain(|k, c| want.contains(&format!("c {k:x} {} {}", c.0, c.1).as_str()));
+        self.clock = self.counts.values().map(|c| c.1).max().unwrap_or(0);
         for t in 0..self.tiers.len() {
             let all = std::mem::take(&mut self.tiers[t].entries);
             let line = |e: &Entry| format!("{t} {} {:x} {} {:x}", e.id, e.key, e.st.valid, slots_hash(&e.slots));
@@ -499,10 +713,14 @@ impl Stash {
 
     pub(crate) fn fold(&self, mut h: u64, mix: fn(u64, u64) -> u64) -> u64 {
         h = mix(h, self.next_id);
+        if self.limit_milli > 0 {
+            h = mix(h, self.credit as u64);
+        }
         for t in &self.tiers {
             h = mix(mix(h, t.slots), t.alloc.free());
             for e in &t.entries {
                 h = mix(mix(mix(mix(h, e.id), e.key), e.st.valid as i64 as u64), slots_hash(&e.slots));
+                h = mix(mix(h, e.kind as u64), e.hits as u64);
                 if let Some((id, n)) = e.base {
                     h = mix(mix(h, id), n as u64);
                 }
@@ -525,8 +743,8 @@ fn slots_hash(s: &[u64]) -> u64 {
 }
 
 /// A tier's persistent index (PATH/index beside the blocks): a header naming what makes blocks compatible (model,
-/// TP, R, page-block layout, size), then records, each [u32 length][u64 checksum][payload]: add (an entry) or drop (an
-/// id). A record whose checksum fails ends the log, and the file is cut there. The engine writes an entry's blocks
+/// TP, R, page-block layout, size), then records, each [u32 length][u64 checksum][payload]: add (an entry), drop (an
+/// id) or count (a prefix count; the first index holds them). A record whose checksum fails ends the log, and the file is cut there. The engine writes an entry's blocks
 /// before io_done() appends its add record, and a drop record is synced before the entry's slots are reused, so a torn
 /// write never names blocks that hold anything else.
 pub struct Index {
@@ -535,6 +753,8 @@ pub struct Index {
     compat: String,
     records: u64,
     live: BTreeMap<u64, Entry>,
+    /// the prefix counts (key -> count, clock), loaded and kept
+    pub counts: BTreeMap<u64, (u32, u64)>,
 }
 
 const MAGIC: &str = "g6kv-index 1";
@@ -570,6 +790,23 @@ impl Cursor<'_> {
     }
 }
 
+// one record: [u32 length][u64 checksum][payload]
+fn frame(p: &[u8]) -> Vec<u8> {
+    let mut r = Vec::with_capacity(p.len() + 12);
+    put_u32(&mut r, p.len() as u32);
+    put_u64(&mut r, fnv_bytes(p));
+    r.extend_from_slice(p);
+    r
+}
+
+fn encode_count(k: u64, n: u32, clock: u64) -> Vec<u8> {
+    let mut p = vec![3u8];
+    put_u64(&mut p, k);
+    put_u32(&mut p, n);
+    put_u64(&mut p, clock);
+    p
+}
+
 fn encode_add(e: &Entry) -> Vec<u8> {
     let mut p = vec![1u8];
     put_u64(&mut p, e.id);
@@ -588,7 +825,13 @@ fn encode_add(e: &Entry) -> Vec<u8> {
     p
 }
 
-fn decode(p: &[u8]) -> Option<Result<Entry, u64>> {
+enum Record {
+    Add(Entry),
+    Drop(u64),
+    Count(u64, u32, u64),
+}
+
+fn decode(p: &[u8]) -> Option<Record> {
     let mut c = Cursor(p);
     match c.take(1)?[0] {
         1 => {
@@ -598,16 +841,18 @@ fn decode(p: &[u8]) -> Option<Result<Entry, u64>> {
             let history = (0..n).map(|_| c.u32().map(|t| t as i32)).collect::<Option<Vec<_>>>()?;
             let n = c.u32()? as usize;
             let slots = (0..n).map(|_| c.u64()).collect::<Option<Vec<_>>>()?;
-            Some(Ok(Entry {
+            Some(Record::Add(Entry {
                 id,
                 kind: Kind::Shared,
                 key,
                 st: Finished { history, valid, written_end, pf_end },
                 slots,
                 base: None,
+                hits: 0,
             }))
         }
-        2 => Some(Err(c.u64()?)),
+        2 => Some(Record::Drop(c.u64()?)),
+        3 => Some(Record::Count(c.u64()?, c.u32()?, c.u64()?)),
         _ => None,
     }
 }
@@ -623,6 +868,7 @@ impl Index {
         }
         let head = format!("{MAGIC} {compat}\n");
         let mut live: BTreeMap<u64, Entry> = BTreeMap::new();
+        let mut counts: BTreeMap<u64, (u32, u64)> = BTreeMap::new();
         let mut order: Vec<u64> = Vec::new();
         let (mut good, mut records) = (0usize, 0u64);
         if raw.starts_with(head.as_bytes()) {
@@ -634,14 +880,17 @@ impl Index {
                     break;
                 }
                 match decode(p) {
-                    Some(Ok(e)) => {
+                    Some(Record::Add(e)) => {
                         order.retain(|&i| i != e.id);
                         order.push(e.id);
                         live.insert(e.id, e);
                     }
-                    Some(Err(id)) => {
+                    Some(Record::Drop(id)) => {
                         live.remove(&id);
                         order.retain(|&i| i != id);
+                    }
+                    Some(Record::Count(k, n, clock)) => {
+                        counts.insert(k, (n, clock));
                     }
                     None => break,
                 }
@@ -659,22 +908,43 @@ impl Index {
         file.seek(SeekFrom::End(0))?;
         file.sync_all()?;
         let loaded = order.iter().filter_map(|i| live.get(i).cloned()).collect();
-        let ix = Index { path, file, compat: compat.to_string(), records, live };
+        while counts.len() > COUNTS {
+            let (&k, _) = counts.iter().min_by_key(|(k, c)| (c.1, **k)).expect("not empty");
+            counts.remove(&k);
+        }
+        let ix = Index { path, file, compat: compat.to_string(), records, live, counts };
         Ok((ix, loaded))
     }
 
     fn append(&mut self, p: &[u8]) -> io::Result<()> {
-        let mut r = Vec::with_capacity(p.len() + 12);
-        put_u32(&mut r, p.len() as u32);
-        put_u64(&mut r, fnv_bytes(p));
-        r.extend_from_slice(p);
-        self.file.write_all(&r)?;
+        self.file.write_all(&frame(p))?;
         self.file.sync_data()?;
         self.records += 1;
-        if self.records > 4 * self.live.len() as u64 + 64 {
+        self.maybe_compact()
+    }
+
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        if self.records > 4 * (self.live.len() + self.counts.len()) as u64 + 64 {
             self.compact()?;
         }
         Ok(())
+    }
+
+    /// Prefix counts (key, count, clock), in one write and one sync.
+    pub fn add_counts(&mut self, c: &[(u64, u32, u64)]) -> io::Result<()> {
+        let mut r = Vec::new();
+        for &(k, n, clock) in c {
+            self.counts.insert(k, (n, clock));
+            r.extend(frame(&encode_count(k, n, clock)));
+        }
+        while self.counts.len() > COUNTS {
+            let (&k, _) = self.counts.iter().min_by_key(|(k, c)| (c.1, **k)).expect("not empty");
+            self.counts.remove(&k);
+        }
+        self.file.write_all(&r)?;
+        self.file.sync_data()?;
+        self.records += c.len() as u64;
+        self.maybe_compact()
     }
 
     pub fn add(&mut self, e: &Entry) -> io::Result<()> {
@@ -697,17 +967,15 @@ impl Index {
         let mut f = File::create(&tmp)?;
         f.write_all(format!("{MAGIC} {}\n", self.compat).as_bytes())?;
         for e in self.live.values() {
-            let p = encode_add(e);
-            let mut r = Vec::new();
-            put_u32(&mut r, p.len() as u32);
-            put_u64(&mut r, fnv_bytes(&p));
-            r.extend_from_slice(&p);
-            f.write_all(&r)?;
+            f.write_all(&frame(&encode_add(e)))?;
+        }
+        for (&k, &(n, clock)) in &self.counts {
+            f.write_all(&frame(&encode_count(k, n, clock)))?;
         }
         f.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
         self.file = OpenOptions::new().append(true).open(&self.path)?;
-        self.records = self.live.len() as u64;
+        self.records = (self.live.len() + self.counts.len()) as u64;
         Ok(())
     }
 }

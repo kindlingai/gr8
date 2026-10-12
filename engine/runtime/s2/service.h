@@ -29,8 +29,8 @@ struct PoolHooks {
     std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit)> match;
     std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst)> take;
     // optional, block stores (pool.h add_tier): counting toward shared prefixes at admission (head and workers, before
-    // the grant), and each tier's counters for status.s2
-    std::function<uint32_t(const std::vector<int>& prompt)> count;
+    // the grant; span: the request's system span, -1 = none), and each tier's counters for status.s2
+    std::function<uint32_t(const std::vector<int>& prompt, int64_t span)> count;
     std::function<std::vector<g6kv_tier_totals>()> tiers;
     // optional: the pool's state, compared across ranks at every event (Scheduler::pool_digest)
     std::function<uint64_t()> digest;
@@ -70,6 +70,7 @@ class Service {
     std::map<uint64_t, Command> commands_;
     std::map<uint64_t, std::string> payloads_;   // head: queued requests' bytes, sent to the workers with each ADMIT notice
     std::map<uint64_t, std::vector<int>> prompts_;   // head, prefix reuse: queued requests' prompts (none for prompt logprobs)
+    std::map<uint64_t, int64_t> spans_;              // head: their system spans (ServeReq::sys)
     bool reuse() const { return bool(native_.pool.match); }
     // rows a request's run holds at admission: grant_rows when runs grow on demand, else its worst case
     uint64_t admit_rows(const Request& r) const { return native_.pool.grow ? grant_rows(c_.scheduler, r) : reserve_rows(c_.scheduler, r); }
@@ -115,9 +116,16 @@ class Service {
             const auto ts = native_.pool.tiers();
             for (size_t i = 0; i < ts.size(); ++i) {
                 const auto& t = ts[i];
+                // pages are page blocks; *_bytes = pages x block_bytes
+                const uint64_t bb = t.block_bytes;
                 o << (i ? "," : "") << "{\"slots\":" << t.slots << ",\"free_slots\":" << t.free_slots << ",\"entries\":" << t.entries
-                  << ",\"shared\":" << t.shared << ",\"spilled_pages\":" << t.spilled_pages << ",\"moved_in_pages\":" << t.moved_in_pages
-                  << ",\"restored_pages\":" << t.restored_pages << ",\"hits\":" << t.hits << ",\"dropped\":" << t.dropped << "}";
+                  << ",\"shared\":" << t.shared << ",\"block_bytes\":" << bb << ",\"spilled_pages\":" << t.spilled_pages
+                  << ",\"spilled_bytes\":" << t.spilled_pages * bb << ",\"moved_in_pages\":" << t.moved_in_pages
+                  << ",\"moved_in_bytes\":" << t.moved_in_pages * bb << ",\"moved_out\":" << t.moved_out
+                  << ",\"moved_out_pages\":" << t.moved_out_pages << ",\"restored_pages\":" << t.restored_pages
+                  << ",\"restored_bytes\":" << t.restored_pages * bb << ",\"hits\":" << t.hits << ",\"dropped\":" << t.dropped
+                  << ",\"dropped_pages\":" << t.dropped_pages << ",\"refused\":" << t.refused << ",\"refused_pages\":" << t.refused_pages
+                  << ",\"full\":" << t.full << ",\"write_credit\":" << t.credit << "}";
             }
             o << "]";
         }
@@ -154,7 +162,7 @@ class Service {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
-                        if (native_.pool.count) counted = native_.pool.count(pr->second);
+                        if (native_.pool.count) counted = native_.pool.count(pr->second, spans_.count(request->id) ? spans_.at(request->id) : -1);
                         const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1);
                         if (h.skip > 0) { run = native_.pool.take(h, rows, worst); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0; }
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
@@ -164,7 +172,10 @@ class Service {
                     cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
-                if (cm.admit) { queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request); payloads_.erase(command.request); }
+                if (cm.admit) {
+                    queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request);
+                    spans_.erase(command.request); payloads_.erase(command.request);
+                }
             }
             return cm;
         }, command.admit ? &payloads_.at(command.request) : nullptr);
@@ -181,9 +192,13 @@ class Service {
                     auto request = parse_request(bytes);
                     queue_.push(Sessions::request(command->request, request)); commands_.emplace(command->request, *command);
                     payloads_.emplace(command->request, std::move(bytes));
-                    if (reuse() && request.plp < 0) prompts_.emplace(command->request, std::move(request.prompt));
+                    if (reuse() && request.plp < 0) {
+                        spans_.emplace(command->request, request.sys);
+                        prompts_.emplace(command->request, std::move(request.prompt));
+                    }
                 } else if (queue_.cancel(command->request)) {
-                    commands_.erase(command->request); prompts_.erase(command->request); payloads_.erase(command->request);
+                    commands_.erase(command->request); prompts_.erase(command->request); spans_.erase(command->request);
+                    payloads_.erase(command->request);
                     atomic_file(c_.directory + "/resp." + std::to_string(command->request), "end abort -1 0\n");
                 } else event(*command); // resident/retiring lookup only at the fence
                 if (stopping_.load()) return;
@@ -270,7 +285,7 @@ public:
                 const auto worst = reserve_rows(c_.scheduler,g.req), rows = admit_rows(g.req);
                 Run mine;
                 if (native_.pool.count && reuse() && staged_->plp < 0)
-                    require(native_.pool.count(staged_->prompt) == g.counted, "worker prefix counts differ from the head");
+                    require(native_.pool.count(staged_->prompt, staged_->sys) == g.counted, "worker prefix counts differ from the head");
                 else require(!g.counted, "a counted grant without counting");
                 if (g.reuse) {
                     const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1);

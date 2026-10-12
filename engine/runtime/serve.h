@@ -38,6 +38,7 @@ struct ServeReq
     float temp = 0.f, top_p = 0.f;
     uint32_t seed = 1234u;
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
+    int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
 };
 
 constexpr int LP_MAX = 20;       // = glue::LP_K (rank.cuh checks)
