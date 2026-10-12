@@ -16,7 +16,8 @@
 //!   A hit that takes a retained run for its first pages stores that run too, as an evicted one: the grant writes past
 //!   the hit's skip, and the run's owner would keep only the shared prefix.
 //! - Counting: count() at each admission. A request that continues a live, retained or stored run (its prompt holds
-//!   all of that run's prompt) counts toward nothing, so a five-turn chat counts once. The next prompt may carry
+//!   all of that run's prompt) counts toward nothing, so a five-turn chat counts once, also when the pool let its last
+//!   run go unstored (the heads of the last 1,024 runs the pool let go are remembered). The next prompt may carry
 //!   another reply than the run wrote: an agent client can drop the reasoning or edit the reply. Any other request
 //!   starts a conversation and counts once toward every grid-cell prefix of its prompt, up to its system span (the
 //!   system message and tool definitions as the chat template renders them) when the front end sent one. Conversations
@@ -198,6 +199,8 @@ impl Tier {
 
 /// Prefix counts kept at most, the least recently counted dropped first.
 pub const COUNTS: usize = 4096;
+/// Heads of runs the pool let go, kept at most for the continuation test.
+pub const HEADS: usize = 1024;
 /// The grid when prefix reuse has none: the served prefill chunk.
 pub const GRID: u64 = 4096;
 
@@ -208,6 +211,9 @@ pub struct Stash {
     commits: Vec<(usize, u64)>,
     counts: BTreeMap<u64, (u32, u64)>,
     counted: Vec<(u64, u32, u64)>, // counts since the last io_done, for the index
+    // the heads of runs the pool let go (prompt rows, head_hash of them), oldest first, so a conversation whose last
+    // run left the pool unstored still continues it
+    heads: std::collections::VecDeque<(usize, u64)>,
     clock: u64,
     shared_after: u32,
     grid: u64,
@@ -242,6 +248,7 @@ impl Stash {
             commits: Vec::new(),
             counts: BTreeMap::new(),
             counted: Vec::new(),
+            heads: std::collections::VecDeque::new(),
             clock: 0,
             shared_after: shared_after.max(1),
             grid: if grid == 0 { GRID } else { grid },
@@ -382,12 +389,53 @@ impl Stash {
         err
     }
 
-    /// Whether `prompt` continues a stored evicted run.
+    /// Whether `prompt` continues a stored evicted run, or a run the pool let go (heads).
     pub(crate) fn continues_stored(&self, prompt: &[i32]) -> bool {
         self.tiers
             .iter()
             .flat_map(|t| &t.entries)
             .any(|e| e.kind == Kind::Evicted && continues(prompt, &e.st.history, e.st.pf_end.max(0) as usize))
+            || self.continues_head(prompt)
+    }
+
+    // one pass over the prompt: does a remembered head's hash match the prompt's first rows?
+    fn continues_head(&self, prompt: &[i32]) -> bool {
+        if self.heads.is_empty() {
+            return false;
+        }
+        let mut want: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+        for &(n, h) in &self.heads {
+            if n > 0 && n <= prompt.len() {
+                want.entry(n).or_default().push(h);
+            }
+        }
+        let mut h = FNV;
+        let mut next = want.iter().peekable();
+        for (i, &t) in prompt.iter().enumerate() {
+            h = (h ^ t as u32 as u64).wrapping_mul(1099511628211);
+            while let Some((&n, hs)) = next.peek() {
+                if n > i + 1 {
+                    break;
+                }
+                if n == i + 1 && hs.contains(&h) {
+                    return true;
+                }
+                next.next();
+            }
+        }
+        false
+    }
+
+    /// A run left the pool (evicted, stored or not): remember its prompt's head for continuations.
+    pub(crate) fn forget(&mut self, st: &Finished) {
+        let n = (st.pf_end.max(0) as usize).min(st.history.len());
+        if !self.counting() || n == 0 {
+            return;
+        }
+        self.heads.push_back((n, head_hash(&st.history[..n])));
+        while self.heads.len() > HEADS {
+            self.heads.pop_front();
+        }
     }
 
     /// The rows of a system span of `span` tokens that a tier can hold: cut to the grid, 0 when shorter than a cell.
@@ -453,6 +501,7 @@ impl Stash {
     /// resident: the token histories of the runs still in the pool (live and retained), for prefix bases.
     pub(crate) fn put_evicted(&mut self, gone: &[Kept], below_pages: usize, resident: &[&[i32]]) {
         for k in gone {
+            self.forget(&k.st);
             if k.st.valid <= 0 {
                 continue;
             }
@@ -838,6 +887,9 @@ impl Stash {
         for (k, c) in &self.counts {
             h = mix(mix(h, *k), c.0 as u64);
         }
+        for &(n, x) in &self.heads {
+            h = mix(mix(h, n as u64), x);
+        }
         h
     }
 }
@@ -845,6 +897,11 @@ impl Stash {
 /// Whether a prompt continues a run: it holds the run's first `n` tokens (its prompt, the rows the run prefilled).
 pub(crate) fn continues(prompt: &[i32], run: &[i32], n: usize) -> bool {
     n > 0 && n <= run.len() && prompt.len() >= n && prompt[..n] == run[..n]
+}
+
+// FNV-1a of the tokens, without prefix_key's length seed, so one pass gives every prefix's hash
+fn head_hash(t: &[i32]) -> u64 {
+    t.iter().fold(FNV, |h, &x| (h ^ x as u32 as u64).wrapping_mul(1099511628211))
 }
 
 fn slots_hash(s: &[u64]) -> u64 {

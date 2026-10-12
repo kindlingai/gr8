@@ -706,6 +706,25 @@ fn simulate(reqs: &[Req], o: &Opts, policy: &Policy) -> Result {
             next[x.session] = by_session[x.session].front().map(|r| t + r.think);
         }
     }
+    if std::env::var_os("KVSIM_ENTRIES").is_some() {
+        if let Some(s) = pool.stash() {
+            for t in 0..s.tiers() {
+                for e in s.entries(t) {
+                    let key =
+                        g6kvman::stash::prefix_key(&e.st.history[..(e.st.valid as usize + 1).min(e.st.history.len())]);
+                    eprintln!(
+                        "{}: entry {} {:?} rows {} blocks {} counted {}",
+                        policy.name(),
+                        e.id,
+                        e.kind,
+                        e.st.valid,
+                        e.slots.len(),
+                        s.count_of(key)
+                    );
+                }
+            }
+        }
+    }
     res
 }
 

@@ -186,45 +186,56 @@ folders: each copy shares the 7.4K tokens every span shares). Writes are per ran
 
 | 4 agents | TTFT p50 / p90 s | prefilled tokens | written GB/h | read GB |
 |---|---|---|---|---|
-| grow | 4.1 / 25.3 | 285,008 | 0 | 0 |
-| evicted (#37) | 4.0 / 20.8 | 252,240 | 107.8 | 1.8 |
-| all | 4.0 / 20.8 | 252,240 | 92.5 | 1.8 |
-| sessions | 3.9 / 20.7 | 252,240 | 47.7 | 1.8 |
-| system | 4.1 / 20.6 | 272,720 | 3.9 | 0.7 |
+| grow | 3.1 / 25.3 | 248,144 | 0 | 0 |
+| evicted (#37) | 3.4 / 20.8 | 215,376 | 109.0 | 1.8 |
+| all | 3.3 / 20.8 | 215,376 | 93.5 | 1.8 |
+| sessions | 3.3 / 20.8 | 215,376 | 90.8 | 1.8 |
+| system, N = 1 | 3.1 / 20.6 | 235,856 | 3.7 | 0.7 |
+| system, N = 2 | 3.1 / 24.4 | 244,048 | 0.3 | 0.2 |
 
 | 8 agents | TTFT p50 / p90 s | prefilled tokens | written GB/h | read GB |
 |---|---|---|---|---|
 | grow | 197 / 615 | 2,578,825 | 0 | 0 |
-| evicted (#37) | 123 / 511 | 539,017 | 143.5 | 123.0 |
-| evicted + prefix bases | 123 / 511 | 539,017 | 125.1 | 116.9 |
-| all | 123 / 511 | 539,017 | 109.6 | 118.9 |
-| sessions | 143 / 541 | 977,289 | 61.2 | 96.7 |
-| system, N = 1 / 2 / 3 | 154 / 584, 160 / 584, 174 / 584 | 1.76M / 1.82M / 1.89M | 4.0 / 4.4 / 3.9 | 56 / 51 / 46 |
-| system, no span (grid cells) | 143 / 523 | 788,873 | 41.6 | 107.0 |
-| all, write limit 0.25 | 143 / 603 | 1,780,105 | 25.7 | 46.7 |
+| evicted (#37) | 123 / 508 | 473,481 | 145.1 | 126.6 |
+| evicted + prefix bases | 122 / 508 | 473,481 | 126.4 | 120.5 |
+| all | 122 / 508 | 473,481 | 126.4 | 120.5 |
+| sessions | 122 / 508 | 506,249 | 122.7 | 118.7 |
+| system, N = 1 | 152 / 584 | 1,751,433 | 3.6 | 56.5 |
+| system, N = 2 or 3 | 197 / 615 | 2,501,001 | 0.1 | 4.3 |
+| all, write limit 0.25 | 148 / 615 | 2,025,865 | 28.5 | 31.0 |
 
 | 32 agents, 200 GB store | TTFT p50 / p90 s | prefilled tokens | written GB/h | read GB |
 |---|---|---|---|---|
 | grow | 1,333 / 2,285 | 11.5M | 0 | 0 |
-| evicted (#37) | 914 / 1,770 | 2.07M | 153.6 | 580 |
-| all | 914 / 1,767 | 2.09M | 109.1 | 564 |
-| sessions | 1,029 / 1,812 | 4.07M | 62.8 | 465 |
-| system | 1,232 / 2,104 | 8.21M | 4.3 | 240 |
-| sessions, write limit 0.25 | 1,177 / 2,018 | 7.38M | 20.8 | 277 |
+| evicted (#37) | 889 / 1,751 | 1.81M | 155.4 | 594 |
+| all | 896 / 1,749 | 1.84M | 135.2 | 554 |
+| sessions | 904 / 1,749 | 2.15M | 130.2 | 536 |
+| system, N = 1 | 1,211 / 2,064 | 7.92M | 3.5 | 263 |
+| system, N = 2 | 1,373 / 2,268 | 11.1M | 0.0 | 21 |
+| sessions, write limit 0.25 | 1,350 / 2,236 | 10.5M | 24.8 | 56 |
 
-With a 29 GB store (what the testers ran) the 8-agent numbers are the same, and at 32 agents `all` falls to 1,241 /
-2,242 s and `sessions` to 1,181 / 2,077 s: the store turns over before the agents come back.
+With a 29 GB store (what the testers ran) the 8-agent numbers are the same; at 32 agents `all` falls to 1,148 / 2,194 s
+and `sessions` to 1,174 / 2,194 s, since the store turns over before the agents come back.
 
-- With the agents inside the pool, every policy that stores evictions writes 50-110 GB/h per rank for one restore: what
-  the testers saw (~22 MiB/s a node). `system` writes 4 GB/h and loses nothing measurable.
-- With more agents than the pool holds, storing sessions pays: `all` cuts TTFT 30-40% and prefill 80% against no
-  store, `sessions` most of that for half the writes, `system` 8-19% for 4 GB/h.
-- N barely matters (2 is the default): one agent's span counts once however long its chat.
+- Inside the pool, every policy that stores evictions writes 90-110 GB/h per rank for one restore: what the testers saw
+  (~22 MiB/s a node). `system` writes 0.3-3.7 GB/h and loses nothing measurable.
+- With more agents than the pool holds, storing sessions pays: `all` and `sessions` cut TTFT 33-38% and prefill 80-85%
+  against no store. `sessions` writes about what `all` does on agent traffic, since nearly every agent turn continues
+  its conversation; it saves the one-shots.
+- `system` with N = 2 stores, for these agents, only the 4,096 rows every agent shares: opencode puts each agent's
+  working folder 29% into the system prompt, so agents in different folders share only the cells before it, and each
+  agent's own span starts one conversation. N = 1 stores every conversation's span the first time (3.6 GB/h here) and
+  gets about half of what `sessions` gets. For many conversations on one system prompt (a chat front end, agents in
+  one folder) N = 2 stores it once.
 - Prefix bases save 13% of `evicted`'s writes; under `all` and `sessions` the stored system prefix already does it.
-- Without the span, grid-cell counting stores agents' own histories (a turn that does not continue its previous
-  prompt counts as a new conversation): better TTFT than `system` but ten times the writes. That is `sessions`'s job.
+- An earlier version of this table counted a conversation's turn as a new conversation whenever the pool had let its
+  last run go unstored, so under `system` each agent's own span reached N and was stored (9 prefixes, 9.4 GB/h on the
+  cluster). The pool now remembers the heads of the runs it lets go (the last 1,024), and a turn that continues one
+  counts toward nothing and counts as continued for `sessions`. The sim's traces had also cut each continuation's
+  overlap short (characters scaled to tokens); a turn that holds the whole previous request now overlaps it exactly.
 
-So `system` stays the default, and `sessions` (with a big store) is for agent fleets larger than the KV pool.
+So `system` stays the default: cheap and safe, but on agent fleets in separate folders it does little. `sessions`
+(with a big store) is for agent fleets larger than the KV pool.
 
 ### A run's tail past R
 

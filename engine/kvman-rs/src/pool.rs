@@ -114,7 +114,8 @@ pub struct Kept {
     pub st: Finished,
     pub age: u64,
     pub exclusive: bool,
-    /// times the conversation continued a run to get here (a tier's min_hits)
+    /// times the conversation continued a run to get here (a tier's min_hits): a hit on its run, or a prompt that holds
+    /// an earlier run's prompt
     pub hits: u32,
 }
 
@@ -155,6 +156,7 @@ pub struct Pool {
     stash: Option<Stash>,
     next_tokens: Option<Vec<i32>>,
     next_span: Option<u64>,
+    next_continues: bool, // count() found the next grant continues a conversation
 }
 
 impl Pool {
@@ -188,6 +190,7 @@ impl Pool {
             stash: None,
             next_tokens: None,
             next_span: None,
+            next_continues: false,
         })
     }
 
@@ -278,6 +281,7 @@ impl Pool {
         let continuing = self.held.values().any(|h| continues(prompt, &h.tokens, h.tokens.len().saturating_sub(1)))
             || self.kept.iter().any(|k| continues(prompt, &k.st.history, k.st.pf_end.max(0) as usize))
             || s.continues_stored(prompt);
+        self.next_continues = continuing;
         let span = self.next_span;
         self.stash.as_mut().expect("checked").count(prompt, continuing, span)
     }
@@ -885,6 +889,8 @@ impl Pool {
         self.log_claim(how, &r, rows, gone);
         let tokens = self.next_tokens.take().unwrap_or_default();
         let span = self.next_span.take();
+        // a run that continues its conversation counts as continued once, even when it found nothing to reuse
+        let hits = hits.max(std::mem::take(&mut self.next_continues) as u32);
         self.held.insert(r.table_version, Held { tokens, hits, span, list, exclusive, worst });
         self.exclusive = self.exclusive || exclusive;
         r

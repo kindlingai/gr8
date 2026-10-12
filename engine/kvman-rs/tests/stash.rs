@@ -752,3 +752,27 @@ fn a_run_past_r_comes_back_with_every_ranks_shard_of_its_tail() {
         }
     }
 }
+
+#[test]
+fn a_chat_counts_once_when_the_pool_lets_its_runs_go_unstored() {
+    // a store of system prefixes only: the chat's runs are not stored when the pool evicts them
+    let mut r = Rank::new(12, 12, 12 * 64, &[(64, Keep::Shared)], 2);
+    let system = toks(1, 300);
+    let mut t = system.clone();
+    t.extend(toks(2, 50));
+    let (first, _, mut t) = session_span(&mut r, &t, 20, Some(300));
+    assert_eq!(first, 2);
+    for c in 0..4 {
+        flush(&mut r); // the chat's last run leaves the pool
+        t.extend(toks(10 + c, 10));
+        let (n, _, t2) = session_span(&mut r, &t, 20, Some(300));
+        assert_eq!(n, 0, "turn {c} continues the chat");
+        t = t2;
+    }
+    assert!(r.pool.stash().unwrap().entries(0).is_empty(), "one conversation never reaches N = 2");
+    // a second conversation on the same system prompt does
+    let mut q = system.clone();
+    q.extend(toks(30, 40));
+    session_span(&mut r, &q, 10, Some(300));
+    assert_eq!(r.pool.stash().unwrap().entries(0).len(), 1);
+}

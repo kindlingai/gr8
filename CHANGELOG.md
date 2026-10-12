@@ -8,8 +8,10 @@
   continued their conversation at least once. `all`: every eviction (#37's `keep=evicted`). `--kv-tier` and
   `--kv-shared-after` remain one release as deprecated aliases: a tier that kept evicted runs maps to `all`.
 - Testers ran `keep=evicted` on live agent traffic: ~30,400 pages a rank in 37 minutes, nothing restored, ~2 TB a day.
-  kvman-sim on the opencode captures agrees (108 GB/h a rank for four agents that fit the pool, one restore); `system`
-  writes ~4 GB/h. `sessions` and `all` pay off only with more agents than the KV pool holds.
+  kvman-sim on the opencode captures agrees (109 GB/h a rank for four agents that fit the pool, one restore); `system`
+  writes under 4 GB/h. `sessions` and `all` pay off only with more agents than the KV pool holds.
+- A turn that continues a conversation whose last run the pool let go unstored counts toward no prefix (the pool
+  remembers the heads of the last 1,024 runs it let go), and counts as continued for `sessions`.
   `engine/kvman-rs/REMOTE-TIER.md` has the numbers. `system` is the recommended setting; `sessions` for agent fleets
   larger than the KV pool.
 - The front ends send each chat request's system span (`system_tokens`, PROTOCOL.md): the system messages and tools as

@@ -14,7 +14,8 @@ group, numbered in the order they start. Requests without tools (title and summa
     overlap_tokens         the longest common prefix of this request and the session's previous one, serialized
                            (tools, then system messages, then the other messages, as the GLM template renders them),
                            in characters, scaled to tokens by this request's prompt_tokens per character (at most
-                           either request's prompt_tokens)
+                           either request's prompt_tokens), or the previous request's prompt_tokens when this
+                           one holds all of it
     completion_tokens      usage.completion_tokens
     think_s                seconds from the previous request's end to this one's start (0 when they overlap). For a
                            session's first request, seconds from the start of the first request in the capture
@@ -105,8 +106,11 @@ def main(paths):
             prompt = int(r["usage"]["prompt_tokens"])
             overlap = 0
             if prev is not None and text:
-                chars = common_prefix(serialize(prev["body"]), text)
+                old = serialize(prev["body"])
+                chars = common_prefix(old, text)
                 overlap = min(prompt, int(prev["usage"]["prompt_tokens"]), round(chars * prompt / len(text)))
+                if chars == len(old):   # it holds the whole previous request: a continuation, exactly
+                    overlap = min(prompt, int(prev["usage"]["prompt_tokens"]))
             think = r["t_start"] - t0 if prev is None else max(0.0, r["t_start"] - prev["t_end"])
             ttft = (r.get("t_first") or r["t_end"]) - r["t_start"]
             out.append(f"{s},{turn},{prompt},{overlap},{int(r['usage']['completion_tokens'])},{think:.3f},"
