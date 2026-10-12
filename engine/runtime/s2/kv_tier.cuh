@@ -8,11 +8,11 @@
 // of pages between the bindings and mapped pinned host memory, and the store reads and writes that memory.
 // Spills run before restores: a restore may write a page that a spill of the same call still has to read.
 //
-// Past R (a CP binding, cp_nr > 0) a binding's attention cache holds this rank's every nr-th logical page at physical
-// pages R/64 + j, and its indexer keys every logical page. A run's tail past R goes to the store in two parts
-// (g6kv_io part): 1 = this rank's shard, the attention pages of the CP bindings at a physical page, in the page block's
-// layout; 2 = a logical page's replicated parts (the indexer keys, and every page of the bindings that are not CP: the
-// MTP layer), rep_bytes() each, per_slot() to a block.
+// Past R (a CP binding, cp_nr > 0) a binding's attention cache and its indexer keys hold this rank's every nr-th logical
+// page at physical pages R/64 + j. A run's tail past R goes to the store in two parts (g6kv_io part): 1 = this rank's
+// shard, the attention pages and indexer keys of the CP bindings at a physical page, in the page block's layout; 2 = a
+// logical page's replicated parts (every page of the bindings that are not CP: the MTP layer), rep_bytes() each,
+// per_slot() to a block.
 #pragma once
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
@@ -27,7 +27,7 @@
 namespace g6s2 {
 // The page block's format: bump it whenever what a block holds, or how, changes (a stored block of another format is
 // not this engine's). Stores keyed on it also carry the engine binary's stamp (exe_stamp).
-constexpr int KV_BLOCK_FORMAT = 2;
+constexpr int KV_BLOCK_FORMAT = 3;   // 3: a tail's indexer keys moved from the replicated part to the shard
 
 // FNV-1a of this process's executable, hex: two builds that may compute different KV bits get different stamps
 inline std::string exe_stamp() {
@@ -66,11 +66,14 @@ __global__ void k_page_blocks(const Item* items, const Piece* pieces, uint4* hos
         move16(slot + pc.off16, pc.mla + p * MLA16, MLA16, out);
         if (pc.idx) move16(slot + pc.off16 + MLA16, pc.idx + p * IDX16, IDX16, out);
     } else if (it.part == 1) {
-        if (pc.cp && it.page < pc.phys) move16(slot + pc.off16, pc.mla + p * MLA16, MLA16, out);   // a rank's shorter shard
-    } else {
+        if (pc.cp && it.page < pc.phys) {   // a rank's shorter shard
+            move16(slot + pc.off16, pc.mla + p * MLA16, MLA16, out);
+            if (pc.idx) move16(slot + pc.off16 + MLA16, pc.idx + p * IDX16, IDX16, out);
+        }
+    } else if (!pc.cp) {
         uint4* h = slot + (size_t)it.sub * rep16 + pc.rep16;
-        if (!pc.cp) { move16(h, pc.mla + p * MLA16, MLA16, out); h += MLA16; }
-        if (pc.idx) move16(h, pc.idx + p * IDX16, IDX16, out);
+        move16(h, pc.mla + p * MLA16, MLA16, out);
+        if (pc.idx) move16(h + MLA16, pc.idx + p * IDX16, IDX16, out);
     }
 }
 } // namespace kvt
@@ -93,7 +96,7 @@ public:
             pieces_.push_back({static_cast<uint4*>(b->args.mla_cache), static_cast<uint4*>(b->args.index_cache), off / 16, rep / 16,
                                b->args.page_count, cp});
             off += 64 * 656 + (b->args.index_cache ? 64 * 132 : 0);
-            rep += (cp ? 0 : 64 * 656) + (b->args.index_cache ? 64 * 132 : 0);
+            rep += cp ? 0 : 64 * 656 + (b->args.index_cache ? 64 * 132 : 0);
         }
         block_ = off;
         rep_ = rep;

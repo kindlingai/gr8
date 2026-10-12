@@ -10,7 +10,9 @@
   filled, gathered from the owners (two more RDMA ranges per page), hashed (`G6_CP_PF_VERIFY`) and copied back with
   the latent rows. An S2 run below R reads them in place, as before.
 - Output is unchanged: m4sim prints the same lines as before with CP pages spread across ranks, two prefill lanes,
-  row-owner index (`G6_PF_OWN=2`), MTP, prefix reuse and S2 sessions. Tier page blocks keep their layout and contents.
+  row-owner index (`G6_PF_OWN=2`), MTP, prefix reuse and S2 sessions. Tier page blocks below R keep their layout and contents. A
+  stored run's tail past R now carries its indexer keys in each rank's shard instead of the replicated part
+  (`KV_BLOCK_FORMAT` 3, so a `persist=on` store of format 2 starts empty).
 - The defaults (`CAP`, pages per rank) are unchanged; the memory this frees is listed in the PR for a later default.
 
 ## 2026-10-12: what the KV stores keep (`--kv-store`, `--kv-keep`), system prompts by default

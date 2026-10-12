@@ -9,8 +9,8 @@
 //!   Move), or the tier drops it.
 //! - The store holds an evicted run below R by its first ceil(valid / 64) pages. A run past R (exclusive) holds the CP
 //!   map. That map's pages below R are the same logical pages on every rank. Past R each rank holds every nr-th logical
-//!   page of the attention cache (its own shard), and every logical page of the indexer keys and of the bindings that
-//!   are not sharded (the MTP layer). With set_tail(), a tail of T logical pages goes to each rank's own store as
+//!   page of the attention cache and its indexer keys (its own shard), and every logical page of the bindings that are
+//!   not sharded (the MTP layer). With set_tail(), a tail of T logical pages goes to each rank's own store as
 //!   ceil(T / nr) blocks of its shard (Part::Own, the rank's physical pages below R + j) and the T pages' replicated
 //!   parts, per_slot to a block (Part::Rep). Every rank queues the same copies; each block holds that rank's bytes.
 //!   A hit that takes a retained run for its first pages stores that run too, as an evicted one: the grant writes past
@@ -100,8 +100,8 @@ pub struct Policy {
 pub const BURST: i64 = 4096;
 
 /// What of a page a copy moves. Full: one pool page of every layer (below R). Own: past R, physical page `page` of the
-/// sharded attention caches only (this rank's shard). Rep(i): past R, logical page `page`'s replicated parts (indexer
-/// keys, unsharded bindings), the i-th of a block's per_slot.
+/// sharded attention caches and their indexer keys (this rank's shard). Rep(i): past R, logical page `page`'s
+/// replicated parts (the unsharded bindings), the i-th of a block's per_slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
     Full,

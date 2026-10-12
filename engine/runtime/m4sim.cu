@@ -95,12 +95,12 @@ static void kv_tier_check(std::vector<Model>& R, std::vector<Draft>& DR, int n, 
             t.run(out, st);
             for (const G6AttnBinding* b : bs)   // poison what the copies hold: every page they name, as each part reads it
             {
-                const int phys = b->args.page_count, logical = b->args.cp_nr ? b->args.table_size : b->args.page_count;
+                const int phys = b->args.page_count;   // the indexer keys sit on the latent's pages
                 for (const g6kv_io& x : out)
                 {
-                    const bool mla = x.part == 0 || (x.part == 1 && b->args.cp_nr && (int)x.page < phys) || (x.part == 2 && !b->args.cp_nr);
-                    if (mla) G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)x.page * 64 * 656, 0x7f, 64 * 656, st));
-                    if (b->args.index_cache && (x.part == 0 || x.part == 2) && (int)x.page < logical)
+                    if (!(x.part == 0 || (x.part == 1 && b->args.cp_nr && (int)x.page < phys) || (x.part == 2 && !b->args.cp_nr))) continue;
+                    G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)x.page * 64 * 656, 0x7f, 64 * 656, st));
+                    if (b->args.index_cache)
                         G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)x.page * 64 * 132, 0x7f, 64 * 132, st));
                 }
             }

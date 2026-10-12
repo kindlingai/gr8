@@ -242,12 +242,13 @@ So `system` stays the default: cheap and safe, but on agent fleets in separate f
 
 ### A run's tail past R
 
-Past R each rank holds every nr-th logical page of the attention caches (its shard, at physical pages R/64 + j), and
-every logical page of the indexer keys and of the bindings that are not sharded (the MTP layer). #37 stored only a run's
+Past R each rank holds every nr-th logical page of the attention caches and their indexer keys (its shard, at physical
+pages R/64 + j), and every logical page of the bindings that are not sharded (the MTP layer). #37 stored only a run's
 pages below R, so a 94K-token session restored 65,536 rows and prefilled the rest (~22 of 26.2 s TTFT, reported by
-testers). Now each rank's own store keeps the tail too: ceil(T / nr) blocks of its shard, and the T logical pages'
-replicated parts packed into blocks (15 a block for the full GLM 5.3: 22 x 8,448 B of indexer keys and 41,984 B of the
-MTP layer each). Every rank queues the same copies and the same slots; the bytes in them are each rank's own. A tail
+testers). Now each rank's own store keeps the tail too: ceil(T / nr) blocks of its shard (attention pages and indexer
+keys, in the page block's layout), and the T logical pages' replicated parts packed into blocks (83 a block for the full
+GLM 5.3: 41,984 B of the MTP layer each). Before the indexer keys were sharded with the latent (#44) every rank held
+every page's keys, and the replicated part carried them too (15 a block); that is block format 2. Every rank queues the same copies and the same slots; the bytes in them are each rank's own. A tail
 goes back only into a run past R, whole, before the prefill writes the rows past the hit. It is on when the pool's R is
 the CP map's (`G6_S2_BELOW` = `G6_CP_R`, the default). The blocks of a tail differ by rank by design, so a store shared
 by the ranks would have to leave tails out.
