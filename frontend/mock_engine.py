@@ -8,9 +8,11 @@ It decodes the prompt to pick a canned reply:
   - prompt asks for a python block  -> short reasoning, a ```python block, stop on <|user|>
   - anything else                   -> short reasoning, then prose repeated until max_tokens (finish=length)
 Spec decode is simulated: rounds of 1 + accepted tokens (k=3 drafts, fixed acceptance cycle) at --rounds-per-s,
-after a prefill delay of uncached_prompt_tokens / --prefill-tps. Prefix cache: longest shared prefix (64-token
-blocks) with the last 64 prompts. Logprobs and prompt_logprobs are fake but deterministic, proper (sum p < 1),
-and the scored token is not always the argmax.
+after a prefill delay of uncached_prompt_tokens / --prefill-tps. Prefix cache: longest shared prefix with the last 64
+prompts, in whole blocks of --reuse-block tokens (64 by default; S2 reuses whole 4,096-row prefill cells and, like this,
+never the rows a request decoded). A prompt whose last assistant turn already closed its think block (a thinking
+budget's continuation) gets its reply without the reasoning. Logprobs and prompt_logprobs are fake but deterministic,
+proper (sum p < 1), and the scored token is not always the argmax.
 
 usage: mock_engine.py --model-dir DIR [--sock /tmp/g6-mock.sock]
 """
@@ -30,14 +32,13 @@ from g6front.tokenizer import GlmTokenizer  # noqa: E402
 
 log = logging.getLogger('mock_engine')
 
-USER, OBSERVATION = '<|user|>', '<|observation|>'
+USER, ASSISTANT, OBSERVATION = '<|user|>', '<|assistant|>', '<|observation|>'
 REASONING = 'Let me think about how to answer this well. I will keep it short and clear.'
 PROSE = ('The harbor lay quiet under a pale morning sky, and the old keeper walked the length of the stone pier '
          'as he had done for thirty years. Gulls turned over the water, the tide pulled at the pilings, and the '
          'town behind him woke slowly, one lamp and one chimney at a time. ')
 ACCEPT_CYCLE = [3, 2, 3, 1, 0, 2, 3, 3, 1, 2]  # accepted drafts per round (k=3)
 K_DRAFT = 3
-BLOCK = 64
 
 
 class Mock:
@@ -48,7 +49,7 @@ class Mock:
         self.stop_user = self.t.tok.token_to_id(USER)
         self.stop_obs = self.t.tok.token_to_id(OBSERVATION)
         self.think_end = self.t.encode('</think>', add_special_tokens=False)
-        self.reasoning_ids = self.t.encode(REASONING, add_special_tokens=False)
+        self.reasoning_ids = self.t.encode(' '.join([REASONING] * a.reasoning_repeat), add_special_tokens=False)
         self.prose_ids = self.t.encode(PROSE, add_special_tokens=False)
         self.recent = collections.deque(maxlen=64)
         self.c = {'drafts': 0, 'draft_tokens': 0, 'accepted': 0, 'per_pos': [0] * K_DRAFT, 'pc_q': 0, 'pc_h': 0,
@@ -62,7 +63,7 @@ class Mock:
             return self.reasoning_ids + self.think_end, None
         text = self.t.decode(prompt, skip_special_tokens=False)
         last_user = text.rsplit(USER, 1)[-1]
-        head = self.reasoning_ids + self.think_end
+        head = [] if '</think>' in text.rsplit(ASSISTANT, 1)[-1] else self.reasoning_ids + self.think_end
         enc = lambda s: self.t.encode(s, add_special_tokens=False)  # noqa: E731
         if text.rfind(OBSERVATION) > text.rfind(USER):  # answering after a tool result
             return head + enc('The tool returned its result; here is the answer.'), self.stop_user
@@ -122,7 +123,7 @@ class Mock:
                 i += 1
             best = max(best, i)
         self.recent.append(tuple(prompt))
-        return best // BLOCK * BLOCK
+        return best // self.a.reuse_block * self.a.reuse_block
 
     # ---- protocol -----------------------------------------------------------------------------------------------
     async def serve(self, reader, writer):
@@ -239,6 +240,9 @@ async def main():
     ap.add_argument('--max-model-len', type=int, default=200000)
     ap.add_argument('--prefill-tps', type=float, default=50000.0, help='simulated prefill tokens/s')
     ap.add_argument('--rounds-per-s', type=float, default=100.0, help='simulated verify rounds/s (0 = no delay)')
+    ap.add_argument('--reuse-block', type=int, default=64,
+                    help='prefix cache hits are whole blocks of this many tokens (S2: 4096)')
+    ap.add_argument('--reasoning-repeat', type=int, default=1, help='the canned reasoning, this many times over')
     ap.add_argument('--plain', action='store_true',
                     help='skip prompt-dependent scripting and the prefix cache (front-end overhead benchmarks)')
     a = ap.parse_args()

@@ -47,6 +47,11 @@ KEYS = {
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
     'DEFAULT_MAX_TOKENS': ('box', '0', 'max_tokens for a chat request that names none; 0 = what keeps the request '
                                        'within SHARE_LIMIT, but at least 8192'),
+    'DEFAULT_REASONING_EFFORT': ('box', None, 'reasoning_effort for a chat request that names none: minimal, low, '
+                                              'medium, high, xhigh or max (the template hears the nearest level it '
+                                              'names); unset = the template\'s own default'),
+    'DEFAULT_THINKING_BUDGET': ('box', '0', 'thinking_budget for a chat request that names none: reply tokens before '
+                                            'the front end closes the think block; 0 = no limit'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
@@ -273,6 +278,15 @@ def validate(o):
         raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
+    effort = o.get('DEFAULT_REASONING_EFFORT')
+    if effort == 'none':
+        raise OptionError('--default-reasoning-effort none: GLM 5.3 cannot turn thinking off (use low, or '
+                          '--default-thinking-budget)')
+    if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+        raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
+    if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
+        raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
+                          '(0 = no limit)')
     share = o.get('SHARE_LIMIT')
     if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) & (int(share) - 1) == 0):
         # the engine needs the limit to be one of its decode buckets (2048 doubling)

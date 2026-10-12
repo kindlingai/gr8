@@ -175,6 +175,26 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 - `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.
 
+### Thinking
+
+GLM 5.3 always thinks: its chat template has no switch to turn thinking off. A chat request controls how much it thinks
+with these fields:
+
+| field | values | on GLM 5.3 |
+|---|---|---|
+| `reasoning_effort` (top level, or in `chat_template_kwargs`) | `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | The template names `low`, `high` and `max`. Another value becomes the nearest of those, ties going higher: `minimal` is `low`, `medium` is `high`, `xhigh` is `max`. Unset is `max`. `none` and any other value are a 400 |
+| `thinking_budget` | an integer, or null | After this many reply tokens still inside the think block, the front end puts `\n</think>\n\n` in place of the next token and the answer follows. 0 or a negative number is no limit. Null or unset takes the server default |
+| `chat_template_kwargs.enable_thinking` | `true` | `false` is a 400 that names `reasoning_effort` `low` and `thinking_budget` instead |
+| `response_format` | `{"type": "text"}` | `json_object` and `json_schema` are a 400 for now |
+
+`usage.completion_tokens_details.reasoning_tokens` counts the reply's tokens through its `</think>`.
+`--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (KNOBS.md).
+A budget costs a prefill when it cuts: the engine cannot take a token it did not sample, so the front end ends the run
+and continues from the prompt, the reply and the close. Prefix reuse keeps the prompt's whole 4,096-token cells and
+never the decoded reasoning, so the continuation prefills the prompt's last partial cell, the reasoning and the close
+again: about 2.5 s for a 32K prompt and a budget of 5, 4.2 s with a budget of 2,048, at TP=4's cold prefill rate. A
+request that uses `logprobs` cannot have a budget.
+
 ## Troubleshooting
 
 - "handshake refused": every box prints the field that differs and each box's value. It is an option, the model (a

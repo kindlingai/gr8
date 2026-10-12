@@ -12,6 +12,7 @@ mod parser;
 mod pyjson;
 mod sampling;
 mod template;
+mod thinking;
 mod tok;
 mod util;
 mod wire;
@@ -43,6 +44,8 @@ pub struct State {
     pub default_max_tokens: u64,
     /// the tokens (prompt + max_tokens) a request may take and still share decode steps; 0: no such limit
     pub share_tokens: u64,
+    /// reasoning_effort and thinking_budget for a request that names none
+    pub thinking: thinking::Defaults,
     pub started: u64,
 }
 
@@ -61,6 +64,8 @@ struct Args {
     default_max_tokens: u64,
     share_tokens: u64,
     max_connections: usize,
+    default_effort: Option<&'static str>,
+    default_budget: u64,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
@@ -68,7 +73,9 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
-                  [--share-tokens N] [--max-connections N]";
+                  [--share-tokens N] [--max-connections N]
+                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max]
+                  [--default-thinking-budget N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -86,6 +93,8 @@ fn parse_args() -> Result<Args, String> {
         default_max_tokens: 0,
         share_tokens: 0,
         max_connections: 512,
+        default_effort: None,
+        default_budget: 0,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -123,6 +132,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--max-connections" => {
                 a.max_connections = next(&mut i, &flag, inline)?.parse().map_err(|_| "--max-connections: not a number")?
+            }
+            "--default-reasoning-effort" => {
+                a.default_effort = Some(thinking::parse_default_effort(&next(&mut i, &flag, inline)?)?)
+            }
+            "--default-thinking-budget" => {
+                a.default_budget =
+                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
             "--encode-threads" => {
                 a.encode_threads = next(&mut i, &flag, inline)?.parse().map_err(|_| "--encode-threads: not a number")?
@@ -208,6 +224,12 @@ async fn serve(args: Args) -> Result<(), String> {
     let template =
         template::ChatTemplate::load(&PathBuf::from(&args.model_dir), tok.eos_token.clone(), tok.pad_token.clone())?;
     log::info!("tokenizer + template loaded in {:.0} ms (vocab {})", t0.elapsed().as_secs_f64() * 1e3, tok.vocab_size);
+    log::info!(
+        "reasoning efforts the template names: {:?}; default effort {:?}, default thinking budget {}",
+        template.levels,
+        args.default_effort,
+        args.default_budget
+    );
     let engine = engine::Engine::new(args.engine_sock.clone());
     let st: &'static State = Box::leak(Box::new(State {
         tok,
@@ -221,6 +243,7 @@ async fn serve(args: Args) -> Result<(), String> {
         max_model_len_override: args.max_model_len,
         default_max_tokens: args.default_max_tokens,
         share_tokens: args.share_tokens,
+        thinking: thinking::Defaults { effort: args.default_effort, budget: args.default_budget },
         started: util::now_secs(),
     }));
     engine.start();

@@ -681,6 +681,10 @@ class Supervisor:
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
         else:   # a request within the limit, guard rows included, shares decode steps: keep a page in hand for the guard
             front += ['--share-tokens', str(int(plan['knobs']['SHARE_LIMIT']) - 64)]
+        if o.get('DEFAULT_REASONING_EFFORT'):
+            front += ['--default-reasoning-effort', o.get('DEFAULT_REASONING_EFFORT')]
+        if o.get('DEFAULT_THINKING_BUDGET') != '0':
+            front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT')], os.path.join(REPO, 'frontend'))
 

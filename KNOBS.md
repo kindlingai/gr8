@@ -92,6 +92,8 @@ manifest instead.
 | `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |
 | `DEFAULT_MAX_TOKENS` | `--default-max-tokens` | 0 | box | the head's front end: `max_tokens` for a chat request that names none. 0 = what keeps the request within `SHARE_LIMIT`, but at least 8,192, and never more than the room the context leaves; another value is used as it is |
+| `DEFAULT_REASONING_EFFORT` | `--default-reasoning-effort` | none | box | the head's front end: `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, which the template hears as the nearest level it names (README, "Thinking"). Unset = the template's default (`max` on GLM 5.3). `none` is refused: GLM 5.3 cannot turn thinking off |
+| `DEFAULT_THINKING_BUDGET` | `--default-thinking-budget` | 0 | box | the head's front end: `thinking_budget` for a chat request that names none. After this many reply tokens inside the think block, the front end closes it. 0 = no limit. A request with `logprobs` gets no default budget |
 | `JOIN_TIMEOUT` | `--join-timeout` | 600 | run | seconds for the mentat group to fill, for a worker to reach the head, and on the head from the first hello to the last (0 = forever) |
 | `CHECK` | `--no-check` | 1 | run | 0 = skip this box's checks (the model files are checked anyway) |
 | `G6_CLUSTER` | | none | | the config file when there is no `@FILE` |

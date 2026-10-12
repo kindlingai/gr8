@@ -35,6 +35,12 @@ pub struct Tok {
     /// sampling defaults from generation_config.json (temperature, top_p, top_k, min_p)
     pub gen_defaults: serde_json::Map<String, Value>,
     pub vocab_size: usize,
+    /// the ids of the whole tokens `<think>` and `</think>` (None without them)
+    pub think_start: Option<u32>,
+    pub think_end: Option<u32>,
+    /// what a thinking budget puts in place of the next token: "\n" + `</think>` + "\n\n" (TensorFold's close); empty
+    /// without a `</think>` token
+    pub think_close: Vec<u32>,
     par_ok: bool,
     strs: String,
     offs: Vec<u32>,
@@ -72,12 +78,21 @@ impl Tok {
             pad_token: cfg.get("pad_token").cloned().unwrap_or(Value::Null),
             gen_defaults,
             vocab_size,
+            think_start: tk.token_to_id("<think>"),
+            think_end: tk.token_to_id("</think>"),
+            think_close: Vec::new(),
             par_ok: false,
             strs: String::new(),
             offs: Vec::new(),
         };
         t.build_token_strs();
         t.par_ok = t.check_parallel();
+        if let Some(end) = t.think_end {
+            let mut close = t.encode_seq("\n", false)?;
+            close.push(end);
+            close.extend(t.encode_seq("\n\n", false)?);
+            t.think_close = close;
+        }
         Ok(t)
     }
 

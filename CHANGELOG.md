@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-12: thinking controls and a `response_format` guard in the front end
+
+- GLM 5.3's chat template cannot turn thinking off, and the front end passed `enable_thinking` to it, which it never
+  read. Now `chat_template_kwargs.enable_thinking` false and `reasoning_effort` `none` are a 400 that points to
+  `reasoning_effort` `low` or a `thinking_budget`. The front end stops adding an `enable_thinking` of its own.
+- `reasoning_effort` (top level, or in `chat_template_kwargs`) must be none, minimal, low, medium, high, xhigh or max,
+  and the template hears the nearest level it names, ties going higher (TensorFold 0.6.1's rule): on GLM 5.3 minimal is
+  low, medium is high and xhigh is max. Before, every value but low and high rendered as max.
+- `thinking_budget` (an integer or null): after that many reply tokens still inside the think block, the next token is
+  replaced by `\n</think>\n\n` and the answer follows. The front end ends the engine run there and continues from the
+  prompt, the reply and the close, so the client sees one reply. The continuation prefills the prompt's last partial
+  4,096-row cell and the reasoning again (2.5-4.2 s at TP=4's cold prefill rate on the mock, frontend/README.md).
+- `--default-reasoning-effort` and `--default-thinking-budget` (`DEFAULT_REASONING_EFFORT`, `DEFAULT_THINKING_BUDGET`),
+  off by default.
+- `response_format` other than `{"type": "text"}` is a 400 until JSON mode lands. It was ignored before.
+- Chat usage reports `completion_tokens_details.reasoning_tokens`.
+- The smoke test checks the refusal and a budget where it checked thinking off. The gate's client, `pbench --effort
+  nothink` and the smoke test leave out `enable_thinking`. Their prompts render the same as before.
+
 ## 2026-10-11: block stores below the KV pool (`--kv-tier`), off by default
 
 - `--kv-tier STORE,size=N(G|T)[,keep=evicted|shared|all]`, given once per tier (`KV_TIER`, tiers separated by `;`).

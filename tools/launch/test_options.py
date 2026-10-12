@@ -123,6 +123,13 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--ips', 'a,b,c,d'], 'IPS and IPS2 go together')
         self.check(['--peers', PEERS, '--ips', 'a,b', '--ips2', 'a,b'], 'IPS has 2 addresses')
         self.check(['--peers', PEERS, '--default-max-tokens', '4k'], 'want a whole number')
+        self.check(['--peers', PEERS, '--default-reasoning-effort', 'none'], 'cannot turn thinking off')
+        self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
+        self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a whole number')
+        o = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'medium',
+                       '--default-thinking-budget', '4096'], {})
+        opt.validate(o)
+        self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
 
     def test_peers_resolve(self):
         o = opt.parse(['--no-config', '--peers', '127.0.0.1,127.0.0.2'], {})

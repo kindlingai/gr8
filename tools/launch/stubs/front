@@ -13,6 +13,8 @@ ap.add_argument('--engine-sock')
 ap.add_argument('--port', type=int)
 ap.add_argument('--default-max-tokens', type=int)
 ap.add_argument('--share-tokens', type=int)
+ap.add_argument('--default-reasoning-effort')
+ap.add_argument('--default-thinking-budget', type=int)
 a = ap.parse_args()
 with open(os.path.join(os.path.dirname(os.path.dirname(a.engine_sock)), 'out', 'front.json'), 'w') as f:
     json.dump(vars(a), f)

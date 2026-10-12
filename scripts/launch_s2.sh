@@ -62,7 +62,9 @@ fi
 FRONT_RS="${FRONT_BIN:-$REPO/bin/g6front-rs}"
 [ -x "$FRONT_RS" ] || { echo "$FRONT_RS missing (scripts/build_front.sh)"; exit 1; }
 (cd "$REPO/frontend" && { nohup setsid bash -c 'echo $$ > "$0"; exec "$@"' "$G6_HOME/out/front.pid" \
-  $PIN "$FRONT_RS" --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" ${DEFAULT_MAX_TOKENS:+--default-max-tokens "$DEFAULT_MAX_TOKENS"} > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
+  $PIN "$FRONT_RS" --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --port "$PORT" ${DEFAULT_MAX_TOKENS:+--default-max-tokens "$DEFAULT_MAX_TOKENS"} \
+  ${DEFAULT_REASONING_EFFORT:+--default-reasoning-effort "$DEFAULT_REASONING_EFFORT"} \
+  ${DEFAULT_THINKING_BUDGET:+--default-thinking-budget "$DEFAULT_THINKING_BUDGET"} > "$G6_HOME/out/front.log" 2>&1 < /dev/null & })
 echo "engines started (epoch $EPOCH); waiting for ready.s2 (up to ${READY_TMO}s)"
 t0=$(date +%s)
 while :; do

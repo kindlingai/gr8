@@ -17,12 +17,12 @@ use hyper::{header, Method, Request, Response, StatusCode};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use crate::gen::{Generation, Res, Step, StopReason};
+use crate::gen::{think_open, Budget, Generation, Res, Step, StopReason};
 use crate::parser::{Delta, GlmParser};
 use crate::pyjson::{self, truthy};
 use crate::template::{build_template_kwargs, normalize_tools};
 use crate::util::{new_id, now_secs};
-use crate::{logprobs as L, metrics, sampling, State};
+use crate::{logprobs as L, metrics, sampling, thinking, State};
 
 const MAX_BODY: usize = 512 << 20;
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -217,7 +217,17 @@ fn stop_reason_json(o: &mut Vec<u8>, s: &Option<StopReason>) {
     }
 }
 
-fn usage(o: &mut Vec<u8>, prompt: usize, completion: usize, cached: Option<u64>, details: bool, full: bool) {
+/// `reasoning`: a chat reply's reasoning tokens, as `completion_tokens_details.reasoning_tokens` (OpenAI's field), so
+/// a client can tell visible output from reasoning.
+fn usage(
+    o: &mut Vec<u8>,
+    prompt: usize,
+    completion: usize,
+    cached: Option<u64>,
+    details: bool,
+    full: bool,
+    reasoning: Option<usize>,
+) {
     let mut u = Obj::new(o);
     u.int("prompt_tokens", prompt);
     u.int("total_tokens", prompt + completion);
@@ -229,6 +239,12 @@ fn usage(o: &mut Vec<u8>, prompt: usize, completion: usize, cached: Option<u64>,
         d.push(b'}');
     } else if full {
         u.raw("prompt_tokens_details", b"null");
+    }
+    if let Some(r) = reasoning {
+        let d = u.key("completion_tokens_details");
+        d.extend_from_slice(b"{\"reasoning_tokens\":");
+        pyjson::int(d, r);
+        d.push(b'}');
     }
     u.end();
 }
@@ -333,6 +349,8 @@ struct ChatReq {
     tool_choice: Value,
     prompt: Vec<u32>,
     params: sampling::Params,
+    /// the thinking budget in reply tokens; 0: none
+    budget: u64,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
@@ -352,11 +370,13 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
             Some("tool_choice"),
         ));
     }
+    thinking::check_response_format(body.get("response_format"))?;
+    let th = thinking::resolve(body, &st.template.levels, st.thinking)?;
     let kw = build_template_kwargs(
         body.get("chat_template_kwargs"),
         body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
         body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false)),
-        body.get("reasoning_effort"),
+        th.effort,
         body.get("documents"),
     )?;
     if truthy(body.get("chat_template")) {
@@ -385,7 +405,16 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         st.max_logprobs(),
         true,
     )?;
-    Ok(ChatReq { tools, tool_choice, prompt, params })
+    // the close a budget puts in has no logprobs: a request that asks for both is refused, and the server's default
+    // budget leaves a logprobs request alone
+    let budget = match (th.budget, params.gen.logprobs.is_some()) {
+        (b, true) if b > 0 && th.budget_explicit => {
+            return Err(ApiError::bad("thinking_budget cannot be combined with logprobs", Some("thinking_budget")))
+        }
+        (_, true) => 0,
+        (b, false) => b,
+    };
+    Ok(ChatReq { tools, tool_choice, prompt, params, budget })
 }
 
 async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
@@ -403,6 +432,12 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
+    if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
+        if think_open(&gen.prompt, start, end) {
+            let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
+            gen.thinking(end, (limit > 0).then_some(Budget { limit, close: &st.tok.think_close }));
+        }
+    }
     if stream {
         let (sse, resp) = Sse::open();
         tokio::spawn(async move { chat_stream(st, body, gen, parser, sse).await });
@@ -501,6 +536,7 @@ fn chat_full(
         Some(res.cached_tokens),
         st.prompt_tokens_details,
         true,
+        Some(res.reasoning_tokens),
     );
     if let Err(e) = L::prompt_logprobs(c.key("prompt_logprobs"), res.prompt_logprobs.as_deref(), &gen.prompt, &st.tok) {
         return ApiError::new(500, &e, None).response();
@@ -594,7 +630,7 @@ async fn chat_stream(
                     ids_json(c.key("prompt_token_ids"), &gen.prompt);
                 }
                 if continuous {
-                    usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false);
+                    usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false, None);
                 }
                 c.end();
                 if sse.json(o).await.is_err() {
@@ -613,7 +649,15 @@ async fn chat_stream(
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "chat.completion.chunk", created, &st.model_name);
             c.raw("choices", b"[]");
-            usage(c.key("usage"), res.prompt_tokens, res.completion_tokens, Some(res.cached_tokens), st.prompt_tokens_details, false);
+            usage(
+                c.key("usage"),
+                res.prompt_tokens,
+                res.completion_tokens,
+                Some(res.cached_tokens),
+                st.prompt_tokens_details,
+                false,
+                Some(res.reasoning_tokens),
+            );
             c.end();
             if sse.json(o).await.is_err() {
                 return Ok(());
@@ -686,7 +730,7 @@ async fn chat_step(
         ch.push(b']');
     }
     if continuous {
-        usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false);
+        usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None);
     }
     c.end();
     sse.json(o).await
@@ -739,6 +783,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
                 return Err(ApiError::bad(format!("`{k}` is not supported by the gr8 front end"), Some(k)));
             }
         }
+        thinking::check_response_format(body.get("response_format"))?;
         let prompt = prompt_ids(st, &body).await?;
         let params = sampling::build(
             &body,
@@ -821,6 +866,7 @@ fn completions_full(st: &State, body: &Map<String, Value>, gen: &Generation, cre
         Some(res.cached_tokens),
         st.prompt_tokens_details,
         true,
+        None,
     );
     c.raw("kv_transfer_params", b"null");
     c.end();
@@ -894,7 +940,7 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
             }
             first = false;
             if continuous {
-                usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false);
+                usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None);
             }
             c.end();
             if sse.json(o).await.is_err() {
@@ -913,6 +959,7 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
                 Some(res.cached_tokens),
                 st.prompt_tokens_details,
                 false,
+                None,
             );
             c.end();
             if sse.json(o).await.is_err() {
@@ -949,7 +996,9 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                     None,
                 ));
             }
-            let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, None, None)?;
+            // the same effort and the same refusals as a chat request, so the counts agree
+            let th = thinking::resolve(&body, &st.template.levels, st.thinking)?;
+            let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
             let tools = normalize_tools(body.get("tools"))?;
             let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
             st.tok

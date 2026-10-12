@@ -73,7 +73,9 @@ must never emit a token it later retracts.
 
 Stop the request as soon as possible and free its state. The engine answers with a `finish` frame
 (`"reason": "abort"`) unless the request already finished. Cancelling an unknown id is a no-op (no reply). The front
-end sends it when the HTTP client disconnects or when a text stop string matched.
+end sends it when the HTTP client disconnects, when a text stop string matched, or when a `thinking_budget` closes the
+think block. In the last case it waits for the `finish`, then sends a new `generate` (a new id) whose prompt is the old
+prompt, the reply so far and the close (frontend/README.md, "Thinking controls").
 
 ### `metrics`
 

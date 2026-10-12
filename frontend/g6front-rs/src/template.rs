@@ -35,6 +35,8 @@ pub struct ChatTemplate {
     env: Environment<'static>,
     special: Vec<(&'static str, Value)>,
     supports_developer: bool,
+    /// the reasoning efforts the template names (`thinking::template_levels`), highest first
+    pub levels: Vec<&'static str>,
 }
 
 /// Keyword args the renderer owns; a request cannot override them through chat_template_kwargs.
@@ -44,6 +46,11 @@ impl ChatTemplate {
     pub fn load(dir: &Path, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
         let p = dir.join("chat_template.jinja");
         let source = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        Self::from_source(source, eos_token, pad_token)
+    }
+
+    pub fn from_source(source: String, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
+        let levels = crate::thinking::template_levels(&source);
         let supports_developer = source.contains("\"developer\"") || source.contains("'developer'");
         let mut env = Environment::new();
         env.set_trim_blocks(true);
@@ -58,7 +65,12 @@ impl ChatTemplate {
         });
         env.add_function("strftime_now", |fmt: String| -> Result<String, Error> { Ok(strftime_now(&fmt)) });
         env.add_template_owned("chat", source).map_err(|e| format!("chat_template.jinja: {e:#}"))?;
-        Ok(ChatTemplate { env, special: vec![("eos_token", eos_token), ("pad_token", pad_token)], supports_developer })
+        Ok(ChatTemplate {
+            env,
+            special: vec![("eos_token", eos_token), ("pad_token", pad_token)],
+            supports_developer,
+            levels,
+        })
     }
 
     /// `kw` is the output of `build_template_kwargs()`.
@@ -584,12 +596,14 @@ pub fn normalize_tools(tools: Option<&Value>) -> Result<Option<Value>, TemplateE
 }
 
 /// vLLM ChatCompletionRequest.build_chat_params(): request chat_template_kwargs are the defaults; the top-level
-/// fields override them unless null/"auto".
+/// fields override them unless null/"auto". `reasoning_effort` is the resolved one (`thinking::resolve`), already
+/// mapped to the template's levels: it replaces whatever the kwargs held. No `enable_thinking` is added: GLM 5.3's
+/// template does not read it.
 pub fn build_template_kwargs(
     chat_template_kwargs: Option<&Value>,
     add_generation_prompt: Value,
     continue_final_message: Value,
-    reasoning_effort: Option<&Value>,
+    reasoning_effort: Option<&str>,
     documents: Option<&Value>,
 ) -> Result<Map<String, Value>, TemplateError> {
     let mut user = match chat_template_kwargs {
@@ -597,16 +611,11 @@ pub fn build_template_kwargs(
         v if !pyjson::truthy(v) => Map::new(), // dict(x or {})
         _ => return Err("chat_template_kwargs must be an object".into()),
     };
-    let reasoning_effort = reasoning_effort.cloned().unwrap_or(Value::Null);
-    let mut extra: Vec<(&str, Value)> = vec![
+    let extra: [(&str, Value); 3] = [
         ("add_generation_prompt", add_generation_prompt),
         ("continue_final_message", continue_final_message),
         ("documents", documents.cloned().unwrap_or(Value::Null)),
-        ("reasoning_effort", reasoning_effort.clone()),
     ];
-    if !reasoning_effort.is_null() && !user.contains_key("enable_thinking") {
-        extra.push(("enable_thinking", Value::Bool(reasoning_effort.as_str() != Some("none"))));
-    }
     let mut bad: Vec<&str> = ["chat_template", "tokenize"].into_iter().filter(|k| user.contains_key(*k)).collect();
     if !bad.is_empty() {
         bad.sort();
@@ -618,5 +627,80 @@ pub fn build_template_kwargs(
             user.insert(k.to_string(), v);
         }
     }
+    user.shift_remove("reasoning_effort");
+    if let Some(e) = reasoning_effort {
+        user.insert("reasoning_effort".into(), Value::from(e));
+    }
     Ok(user)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thinking::{resolve, Defaults};
+    use serde_json::json;
+
+    /// GLM 5.3's effort lines and generation prompt, with a minimal message loop.
+    const GLM_HEAD: &str = r#"[gMASK]<sop>
+{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
+{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+{%- for m in messages -%}{%- if m.role == 'user' -%}<|user|>{{ m.content[0].text }}{%- endif -%}{%- endfor -%}
+{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}"#;
+
+    fn render(t: &ChatTemplate, body: Value) -> String {
+        let body = body.as_object().unwrap();
+        let th = resolve(body, &t.levels, Defaults::default()).unwrap();
+        let kw = build_template_kwargs(
+            body.get("chat_template_kwargs"),
+            Value::Bool(true),
+            Value::Bool(false),
+            th.effort,
+            None,
+        )
+        .unwrap();
+        t.render(Some(&json!([{"role": "user", "content": "hi"}])), None, kw).unwrap()
+    }
+
+    fn effort_lines(t: &ChatTemplate) {
+        let line = |b: Value| {
+            let text = render(t, b);
+            let i = text.find("Reasoning Effort: ").expect("an effort line");
+            text[i + 18..].split('<').next().unwrap().to_string()
+        };
+        assert_eq!(line(json!({})), "Max"); // the template's own default, as before
+        let want = [
+            ("minimal", "Low"),
+            ("low", "Low"),
+            ("medium", "High"),
+            ("high", "High"),
+            ("xhigh", "Max"),
+            ("max", "Max"),
+        ];
+        for (e, l) in want {
+            assert_eq!(line(json!({ "reasoning_effort": e })), l, "{e}");
+            assert_eq!(line(json!({"chat_template_kwargs": { "reasoning_effort": e }})), l, "kwargs {e}");
+        }
+        // an explicit switch on is accepted and changes nothing
+        assert_eq!(line(json!({"chat_template_kwargs": {"enable_thinking": true}})), "Max");
+        assert_eq!(render(t, json!({"chat_template_kwargs": {"enable_thinking": true}})), render(t, json!({})));
+    }
+
+    #[test]
+    fn each_effort_renders_the_nearest_named_level() {
+        let t = ChatTemplate::from_source(GLM_HEAD.into(), Value::Null, Value::Null).unwrap();
+        assert_eq!(t.levels, vec!["max", "high", "low"]);
+        effort_lines(&t);
+    }
+
+    /// The real template: G6_TOKENIZER_DIR=<dir with chat_template.jinja ...> cargo test --release
+    #[test]
+    fn each_effort_renders_the_nearest_named_level_in_the_model_template() {
+        let Ok(dir) = std::env::var("G6_TOKENIZER_DIR") else {
+            eprintln!("G6_TOKENIZER_DIR not set; skipping");
+            return;
+        };
+        let t = ChatTemplate::load(Path::new(&dir), Value::Null, Value::Null).unwrap();
+        assert_eq!(t.levels, vec!["max", "high", "low"]);
+        effort_lines(&t);
+    }
 }

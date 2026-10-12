@@ -222,7 +222,9 @@ def main():
                    help='refuse a probe result older than this (a file left from an earlier boot)')
     p.add_argument('--allow-unhealthy', action='store_true',
                    help='measure a boot whose probe refused a rank (the record is marked; baseline and check refuse it)')
-    p.add_argument('--effort', default='nothink', help='nothink|low|high|max')
+    p.add_argument('--effort', default='nothink',
+                   help='low|high|max, or nothink: no thinking controls, which is Max on GLM 5.3 (it cannot turn '
+                        'thinking off)')
     p.add_argument('--temp', type=float, default=0.7)
     p.add_argument('--needle-sizes', default='87000,437000')
     p.add_argument('--needle-depth', type=float, default=0.15)

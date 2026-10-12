@@ -231,6 +231,13 @@ impl Stream {
         }
         m
     }
+
+    /// Ask the engine to stop this request but keep reading it: its `finish` frame still arrives here.
+    pub fn cancel(&self) {
+        if !self.finished {
+            let _ = self.engine.send(wire::cancel(&self.id));
+        }
+    }
 }
 
 impl Drop for Stream {

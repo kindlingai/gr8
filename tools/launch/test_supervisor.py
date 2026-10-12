@@ -130,6 +130,14 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-max-tokens') + 1], '16384')
         self.assertNotIn('--share-tokens', a)
 
+    def test_the_thinking_defaults_reach_the_front_end_only_when_set(self):
+        a = self.front_argv()
+        self.assertNotIn('--default-reasoning-effort', a)
+        self.assertNotIn('--default-thinking-budget', a)
+        a = self.front_argv('--default-reasoning-effort', 'low', '--default-thinking-budget', '2048')
+        self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
+        self.assertEqual(a[a.index('--default-thinking-budget') + 1], '2048')
+
 
 class EngineTests(unittest.TestCase):
     def test_the_engine_gets_the_plan_and_an_allowlist(self):

@@ -13,6 +13,8 @@
   top-20 logprobs boot to boot on TP6. The KL threshold is therefore the floor, 1e-6 (2 x worst boot = 0).
 - Not in the baseline: `work.mixed4.*` (needs `-DDEC_S2`), so `check` reports PARTIAL.
 - The `workloads` numbers are reasoning text: `effort=nothink` cannot turn thinking off with the GLM 5.3 template.
+  Since 2026-10-12 the front end refuses `enable_thinking` false, and `nothink` leaves out every thinking control. The
+  prompt is the same as before (the template's default effort, Max).
 
 ## tp4.json — `main` at 34d0d05, TP4, GPU clock cap 2200 MHz
 

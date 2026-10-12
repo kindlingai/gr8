@@ -2,9 +2,12 @@
 
 An OpenAI/vLLM-compatible HTTP server in front of the gr8 engine. It talks to the engine's shim over a Unix socket using
 the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
-streaming and `/metrics`. It comes in two implementations with the same flags and byte-identical responses
-(`tests/diff_fronts.py`): `g6front-rs/`, one static Rust binary, which `./gr8 glm53 up` runs; and `g6front/`, pure
-Python asyncio, the reference the tests compare against.
+streaming and `/metrics`. The front end comes in two implementations. `./gr8 glm53 up` runs `g6front-rs/`, one static
+Rust binary. `tests/diff_fronts.py` compares it with `g6front/`, pure Python asyncio. Nothing
+launches or ships the Python one (the shim and the mock use only its `wire` and `tokenizer` modules), and it does not
+have the thinking controls below: it still passes `enable_thinking` to the template, ignores `thinking_budget` and
+`response_format`, and has no `completion_tokens_details`. So `diff_fronts.py` shows those differences in every chat
+case.
 
 ## Endpoints
 
@@ -49,7 +52,44 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--default-max-tokens` | 0 | `max_tokens` for a chat request that names none, capped by the room the context leaves. 0 = see `--share-tokens`. `./gr8 glm53 up` passes `DEFAULT_MAX_TOKENS` when it is set. |
 | `--share-tokens` | 0 | With `--default-max-tokens 0`: a chat request that names no `max_tokens` gets what keeps prompt + `max_tokens` within N, but at least 8,192 (past the limit it runs alone anyway). 0 = all the room the context leaves. `./gr8 glm53 up` passes `SHARE_LIMIT` less a 64-token page for the engine's guard rows. |
 | `--max-connections` | 512 | Connections served at once; more wait in the listen backlog. Request headers must arrive within 30 s and a body within 120 s. |
+| `--default-reasoning-effort` | none | `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, heard as the nearest level the template names. `./gr8 glm53 up` passes `DEFAULT_REASONING_EFFORT` when it is set. |
+| `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none (0 = no limit). A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
 | `--log-level` | `INFO` | |
+
+## Thinking controls (Rust front end)
+
+Read as TensorFold 0.6.1 reads them (`server/request_options.py`). The code is `g6front-rs/src/thinking.rs` and
+`gen.rs`.
+
+| field | accepted | effect |
+|---|---|---|
+| `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold) |
+| `chat_template_kwargs.enable_thinking` | `true`, or unset | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. The front end adds no `enable_thinking` kwarg of its own |
+| `thinking_budget` (top level) | an integer, an integral float, a string holding an integer, or null. Anything else is a 400 | null or unset: `--default-thinking-budget`. 0 or negative: no limit. N: once the reply holds N tokens and its think block is still open, the next token is replaced by `\n</think>\n\n`, cut to what `max_tokens` leaves. It applies to a chat prompt that leaves a think block open. The close has no logprobs, so naming both `thinking_budget` and `logprobs` is a 400 |
+| `response_format` (chat and completions) | absent, null, `{"type": "text"}` | `json_object`, `json_schema` and any other type are a 400 until the engine has constrained decoding |
+
+`/tokenize` with `messages` applies the same effort and refusals, so its count matches the chat request's prompt.
+Chat usage carries `completion_tokens_details.reasoning_tokens`: the reply's tokens through its `</think>`, or all of
+them when the reply never closes its think block (TensorFold counts the same way). The response and the last stream
+chunk carry the count. The `continuous_usage_stats` chunks leave the count out.
+
+How a budget cuts. PROTOCOL.md has no way to put a token into a running request, so the cut ends the engine run (a
+`cancel`, then its `finish` is awaited) and the reply goes on in a new `generate` whose prompt is the prompt, the reply
+so far and the close, with `max_tokens` and `min_tokens` less the reply's length. The client sees one response or one
+SSE stream. Usage counts every reply token once: the close counts, and tokens the cut run made past the cut do not.
+`cached_tokens` is the first run's. The continuation is a second request to the engine, and S2's prefix reuse keeps
+only the prompt's whole 4,096-row prefill cells (decoded rows never count), so it prefills the prompt's last partial
+cell, the reasoning and the close again. On the mock with S2's reuse rule and TP=4's cold prefill rate
+(`--reuse-block 4096 --prefill-tps 1374`):
+
+| prompt | budget | rows prefilled again | added time |
+|---|---|---|---|
+| 1.1K | 5 / 512 / 2,048 | 1,111 / 1,604 / 3,140 (the whole prompt: under one cell) | 0.8 / 1.2 / 2.3 s |
+| 7.5K | 5 / 512 / 2,048 | 3,486 / 4,002 / 5,547 | 2.6 / 2.9 / 4.1 s |
+| 32K | 5 / 512 / 2,048 | 3,566 / 4,129 / 5,721 | 2.5 / 3.0 / 4.2 s |
+
+The front end logs each continuation's cached tokens (`thinking budget: the continuation took N of its M prompt
+tokens from the cache`). An engine command that puts tokens into a running request would make the cut free.
 
 ## Metrics mapping
 
@@ -160,14 +200,19 @@ tools/s2_costfit.py --selftest
 
 ```bash
 python mock_engine.py --model-dir <tokenizer dir> --sock /tmp/g6-mock.sock \
-  [--prefill-tps 50000] [--rounds-per-s 100] [--max-model-len 200000]
-tests/serve_mock.sh start|stop      # mock + front end on :8100 (env PY, MODEL_DIR, PORT, ROUNDS, FRONT_ARGS)
+  [--prefill-tps 50000] [--rounds-per-s 100] [--max-model-len 200000] [--reuse-block 64] [--reasoning-repeat 1]
+tests/serve_mock.sh start|stop      # mock + front end on :8100 (env PY, MODEL_DIR, PORT, ROUNDS, FRONT, FRONT_ARGS, MOCK_ARGS)
 python -m unittest tests.test_parser tests.test_api   # with the mock + front end running
 ```
 
+`--reuse-block 4096` reuses prefixes as S2 does, in whole 4,096-row prefill cells. `--reasoning-repeat N` makes the
+canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve_mock.sh` runs `../bin/g6front-rs`
+(`FRONT` names another binary), and the Python front end only when there is none. `tests.test_api` tests the Rust front
+end: the Python one fails its thinking tests (see the top of this file).
+
 ## Deviations from vLLM
 
-- These return 400: `n>1`, batched prompts, `echo`, `suffix`, named or required `tool_choice`, presence/frequency/repetition penalties, and a custom `chat_template`.
+- These return 400: `n>1`, batched prompts, `echo`, `suffix`, named or required `tool_choice`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off (above).
 - Tool-call argument JSON streams once per completed key/value pair instead of per token. The final concatenated string is identical.
 - Tool-call tags are parsed only when the request has `tools` and `tool_choice` is not `none`.
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).
