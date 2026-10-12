@@ -291,48 +291,65 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotIn('/a/qo.pack', p['args'])
 
 
-class KvTierTests(unittest.TestCase):
-    def plan(self, *argv, kv_tier=None, env=None):
+class KvStoreTests(unittest.TestCase):
+    def plan(self, *argv, kv_store=None, env=None):
         o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
         opt.validate(o)
-        return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_tier=kv_tier)
+        return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store=kv_store)
 
-    def tiers(self, p):
-        return [p['args'][i + 1] for i, a in enumerate(p['args']) if a == '--kv-tier']
+    def stores(self, p):
+        return [p['args'][i + 1] for i, a in enumerate(p['args']) if a == '--kv-store']
+
+    def arg(self, p, name):
+        return p['args'][p['args'].index(name) + 1] if name in p['args'] else None
 
     def test_off_by_default(self):
         o, p = self.plan()
-        self.assertEqual(opt.kv_tiers(o), [])
-        self.assertNotIn('--kv-tier', p['args'])
-        self.assertNotIn('--kv-shared-after', p['args'])
-        self.assertNotIn('--kv-tier', self.plan('--kv-tier', 'off')[1]['args'])
+        self.assertEqual(opt.kv_stores(o), [])
+        for a in ('--kv-store', '--kv-keep', '--kv-system-after', '--kv-write-limit', '--kv-tier'):
+            self.assertNotIn(a, p['args'])
+        self.assertNotIn('--kv-store', self.plan('--kv-store', 'off')[1]['args'])
 
-    def test_tiers_in_flag_order(self):
-        a, b = 'ssd:/nvme/gr8kv,size=200G,keep=shared', 'remote:192.0.2.5:7350,size=8G,keep=evicted'
-        o, p = self.plan('--kv-tier', a, '--kv-tier', b, '--kv-shared-after', '5')
-        self.assertEqual(self.tiers(p), [a, b])
-        self.assertEqual(p['args'][p['args'].index('--kv-shared-after') + 1], '5')
-        t = opt.kv_tiers(o)
-        self.assertEqual([(x['kind'], x['path'], x['host'], x['port'], x['size'], x['keep']) for x in t],
-                         [('ssd', '/nvme/gr8kv', None, None, '200G', 'shared'),
-                          ('remote', None, '192.0.2.5', '7350', '8G', 'evicted')])
-        # the same from the environment, tiers separated by ;
-        self.assertEqual(self.tiers(self.plan(env={'KV_TIER': f'{a};{b}'})[1]), [a, b])
+    def test_stores_in_flag_order_and_what_they_keep(self):
+        a, b = 'ssd:/nvme/gr8kv,size=200G', 'remote:192.0.2.5:7350,size=8G'
+        o, p = self.plan('--kv-store', a, '--kv-store', b, '--kv-keep', 'sessions', '--kv-system-after', '3',
+                         '--kv-write-limit', '0.25')
+        self.assertEqual(self.stores(p), [a, b])
+        self.assertEqual((self.arg(p, '--kv-keep'), self.arg(p, '--kv-system-after'), self.arg(p, '--kv-write-limit')),
+                         ('sessions', '3', '0.25'))
+        t = opt.kv_stores(o)
+        self.assertEqual([(x['kind'], x['path'], x['host'], x['port'], x['size']) for x in t],
+                         [('ssd', '/nvme/gr8kv', None, None, '200G'), ('remote', None, '192.0.2.5', '7350', '8G')])
+        # the same from the environment, stores separated by ;
+        self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
+
+    def test_the_deprecated_tier_options_map_to_the_nearest_policy(self):
+        o, p = self.plan('--kv-tier', 'ssd:/x,size=200G,keep=shared', '--kv-shared-after', '5')
+        self.assertEqual((self.stores(p), self.arg(p, '--kv-keep'), self.arg(p, '--kv-system-after')),
+                         (['ssd:/x,size=200G'], 'system', '5'))
+        self.assertTrue(any('deprecated' in w for w in o.warnings))
+        self.assertNotIn('--kv-tier', p['args'])
+        _, p = self.plan('--kv-tier', 'ssd:/x,size=200G,keep=shared', '--kv-tier', 'remote:192.0.2.5:7350,size=8G')
+        self.assertEqual(self.arg(p, '--kv-keep'), 'all', 'a tier that kept evicted runs (the default) maps to all')
+        _, p = self.plan(env={'KV_TIER': 'ssd:/x,size=8G,keep=evicted', 'KV_KEEP': 'sessions'})
+        self.assertEqual(self.arg(p, '--kv-keep'), 'sessions', 'an explicit KV_KEEP wins')
 
     def test_remote_auto_is_resolved_per_box(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-tier', 'remote:auto,size=8G'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-store', 'remote:auto,size=8G'], {})
         opt.validate(o)
-        self.assertEqual(opt.kv_tiers(o)[0]['host'], 'auto')
-        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_tier='remote:192.0.2.5:7350,size=8G')
-        self.assertEqual(self.tiers(p), ['remote:192.0.2.5:7350,size=8G'])
-        self.assertIn('--kv-tier remote:auto,size=8G ', opt.canonical(o, opt.engine_plan(o), None)[1])
+        self.assertEqual(opt.kv_stores(o)[0]['host'], 'auto')
+        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store='remote:192.0.2.5:7350,size=8G')
+        self.assertEqual(self.stores(p), ['remote:192.0.2.5:7350,size=8G'])
+        self.assertIn('--kv-store remote:auto,size=8G ', opt.canonical(o, opt.engine_plan(o), None)[1])
 
     def test_refusals(self):
         v = ValidateTests()
-        for argv, want in ((['--kv-tier', 'nvme:/x,size=8G'], 'the store is'), (['--kv-tier', 'ssd:/x'], 'size=N'),
-                           (['--kv-tier', 'ssd:/x,size=8'], 'want size='), (['--kv-tier', 'ssd:/x,size=8G,keep=most'], 'keep='),
-                           (['--kv-tier', 'remote:auto,size=8G'], 'name it'), (['--kv-tier', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
-                           (['--kv-tier', 'ssd:/x,size=8G', '--kv-shared-after', '0'], 'from 1')):
+        for argv, want in ((['--kv-store', 'nvme:/x,size=8G'], 'the store is'), (['--kv-store', 'ssd:/x'], 'size=N'),
+                           (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=all'], '--kv-keep'),
+                           (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
+                           (['--kv-store', 'ssd:/x,size=8G', '--kv-system-after', '0'], 'from 1'),
+                           (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),
+                           (['--kv-store', 'ssd:/x,size=8G', '--kv-write-limit', 'lots'], 'per page computed')):
             v.check(['--peers', PEERS, *argv], want)
 
 

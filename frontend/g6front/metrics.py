@@ -48,4 +48,19 @@ def render(m: dict, model_name: str) -> str:
         for key in ('admission_stalls', 'fragmentation_stalls', 'grown', 'stalled_rounds'):
             if key in s2:
                 metric('g6:s2_' + key + '_total', 'counter', 'S2 native ' + key.replace('_', ' ') + '.', [('', s2[key])])
+        # the KV stores (--kv-store), one series per store
+        stores = s2.get('tiers') or []
+        for key in KV_STORE_GAUGES:
+            if stores and key in stores[0]:
+                metric('g6:kv_store_' + key, 'gauge', 'KV store ' + key.replace('_', ' ') + '.',
+                       [(f'store="{i}"', t.get(key, 0)) for i, t in enumerate(stores)])
+        for key in KV_STORE_COUNTERS:
+            if stores and key in stores[0]:
+                metric('g6:kv_store_' + key + '_total', 'counter', 'KV store ' + key.replace('_', ' ') + '.',
+                       [(f'store="{i}"', t.get(key, 0)) for i, t in enumerate(stores)])
     return '\n'.join(out) + '\n'
+
+
+KV_STORE_GAUGES = ('slots', 'free_slots', 'entries', 'shared')
+KV_STORE_COUNTERS = ('spilled_bytes', 'moved_in_bytes', 'restored_bytes', 'hits', 'moved_out', 'dropped', 'dropped_pages',
+                     'refused', 'refused_pages', 'full')

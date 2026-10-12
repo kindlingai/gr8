@@ -57,6 +57,7 @@ the largest k the engine accepts for `logprobs` and `prompt_logprobs`.
 | `stop_ids` | generation stops after emitting any of these ids. The front end always sends the full list (EOS ids from `generation_config.json` + request `stop_token_ids`), empty if `ignore_eos` |
 | `logprobs` | null = none. k >= 0: for every generated token return its logprob and rank plus the top-k (k = 0 means the sampled token only) |
 | `prompt_logprobs` | null = none. k >= 0: for every prompt position j >= 1 return the logprob and rank of `prompt[j]` under the distribution predicted at j-1, plus the top-k |
+| `system_tokens` | optional (chat requests). How many of the prompt's first tokens are its system span: the leading system messages and the tool definitions as the chat template renders them, up to where the first other message begins. The engine's KV stores (`--kv-keep system`) keep system prefixes by it. Absent (completions): the engine counts every prefix of the prompt instead |
 
 Logprobs are of the distribution the token was sampled from **before** temperature/top-p/top-k/min-p are applied
 (vLLM's default `logprobs_mode=raw_logprobs`), log-softmax over the full vocab. Rank is 1-based over that same
@@ -169,3 +170,5 @@ The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/
 ## Version history
 
 - v1 (2026-09-30): initial.
+- v1 (2026-10-12): `generate` takes an optional `system_tokens` (an engine without KV stores ignores it). The shim
+  passes it on as `sys <n>` in the request header.

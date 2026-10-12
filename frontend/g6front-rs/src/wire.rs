@@ -168,6 +168,8 @@ pub struct GenParams {
     pub stop_ids: Vec<i64>,
     pub logprobs: Option<i64>,
     pub prompt_logprobs: Option<i64>,
+    /// the prompt's system span in tokens (PROTOCOL.md): chat requests only
+    pub system_tokens: Option<u64>,
 }
 
 fn opt_int(b: &mut Vec<u8>, v: Option<i64>) {
@@ -214,6 +216,10 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     opt_int(b, p.logprobs);
     b.extend_from_slice(b",\"prompt_logprobs\":");
     opt_int(b, p.prompt_logprobs);
+    if let Some(n) = p.system_tokens {
+        b.extend_from_slice(b",\"system_tokens\":");
+        pyjson::int(b, n);
+    }
     b.extend_from_slice(b",\"type\":\"generate\"}");
     w.finish()
 }
@@ -251,6 +257,7 @@ mod tests {
             stop_ids: vec![1, 2],
             logprobs: Some(3),
             prompt_logprobs: None,
+            system_tokens: Some(2),
         };
         let mut all = Vec::new();
         all.extend_from_slice(&generate("cmpl-1", &[10, 20, 30], &p));
@@ -261,6 +268,7 @@ mod tests {
         assert_eq!(v["prompt"], serde_json::json!([10, 20, 30]));
         assert_eq!(v["temperature"], serde_json::json!(0.0));
         assert_eq!(v["type"], "generate");
+        assert_eq!(v["system_tokens"], serde_json::json!(2));
         let h = r.next().await.unwrap().unwrap();
         let h = head(&h).unwrap();
         assert_eq!((h.kind.as_ref(), h.id.as_deref()), ("cancel", Some("cmpl-1")));

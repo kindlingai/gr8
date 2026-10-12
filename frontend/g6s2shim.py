@@ -10,6 +10,7 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
         n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
+        [sys <system_tokens>]
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -119,6 +120,12 @@ def build_request(f: dict, ordinal: int):
             return None, f'{key} must be 0..20'
         if v is not None:
             lps[word] = v
+    sys_tokens = f.get('system_tokens')   # the prompt's system span (PROTOCOL.md), for the engine's KV stores
+    if sys_tokens is not None and (not isinstance(sys_tokens, int) or isinstance(sys_tokens, bool)
+                                   or not 0 <= sys_tokens <= len(prompt)):
+        return None, 'system_tokens must be 0..len(prompt)'
+    if sys_tokens is not None:
+        lps['sys'] = sys_tokens
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
             + ''.join(f' {w} {v}' for w, v in lps.items()) + '\n' + ','.join(map(str, prompt)) + '\n').encode()
     return body, None
@@ -215,7 +222,9 @@ class Shim:
              'tokens': {'prompt': c['prompt'], 'generation': c['gen']}}
         st = self.status()
         if st:
-            m['s2'] = st    # extra field (ignored by the front end): the engine's own queue/pool status
+            # the engine's own queue/pool/store status. The front ends read `scheduler` (g6:s2_* and g6:kv_store_*
+            # metrics); `s2` is the same, for older readers
+            m['s2'] = m['scheduler'] = st
         return m
 
     # ---- socket side --------------------------------------------------------------------------------------------

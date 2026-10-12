@@ -383,17 +383,19 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         return Err(ApiError::bad("custom chat_template is not supported", Some("chat_template")));
     }
     let t0 = std::time::Instant::now();
+    let kw_system = kw.clone();
     let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
     let (t1, chars) = (std::time::Instant::now(), text.len());
     let add_special = truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
+    let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await;
     log::debug!(
         "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms",
         prompt.len(),
         (t1 - t0).as_secs_f64() * 1e3,
         t1.elapsed().as_secs_f64() * 1e3
     );
-    let params = sampling::build(
+    let mut params = sampling::build(
         body,
         raw,
         prompt.len(),
@@ -414,7 +416,35 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         (_, true) => 0,
         (b, false) => b,
     };
+    params.gen.system_tokens = system;
     Ok(ChatReq { tools, tool_choice, prompt, params, budget })
+}
+
+/// The prompt's system span (PROTOCOL.md `system_tokens`): its tokens up to where the first message after the leading
+/// system ones begins, found by rendering those messages and the tools alone. The engine's KV stores keep system
+/// prefixes by it. None when the template cannot render them alone.
+async fn system_span(
+    st: &'static State,
+    messages: Option<&Value>,
+    tools: Option<&Value>,
+    mut kw: Map<String, Value>,
+    add_special: bool,
+    prompt: &[u32],
+) -> Option<u64> {
+    let lead: Vec<Value> = messages?
+        .as_array()?
+        .iter()
+        .take_while(|m| matches!(m.get("role").and_then(Value::as_str), Some("system" | "developer")))
+        .cloned()
+        .collect();
+    if lead.is_empty() && tools.is_none() {
+        return Some(0);
+    }
+    kw.insert("add_generation_prompt".into(), Value::Bool(false));
+    kw.insert("continue_final_message".into(), Value::Bool(false));
+    let text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    let ids = st.tok.aencode(text, add_special).await.ok()?;
+    Some(ids.iter().zip(prompt).take_while(|(a, b)| a == b).count() as u64)
 }
 
 async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {

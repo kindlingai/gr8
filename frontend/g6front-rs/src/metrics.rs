@@ -114,6 +114,41 @@ pub fn render(m: &Value, model_name: &str) -> String {
                 );
             }
         }
+        // the KV stores (--kv-store), one series per store
+        let stores = s2.get("tiers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let per = |key: &str| -> Vec<(String, f64)> {
+            stores.iter().enumerate().map(|(i, t)| (format!("store=\"{i}\""), num(t.get(key)))).collect()
+        };
+        let has = |key: &str| stores.first().is_some_and(|t| t.get(key).is_some());
+        for key in KV_STORE_GAUGES {
+            if has(key) {
+                metric(&format!("g6:kv_store_{key}"), "gauge", &format!("KV store {}.", key.replace('_', " ")), &per(key));
+            }
+        }
+        for key in KV_STORE_COUNTERS {
+            if has(key) {
+                metric(
+                    &format!("g6:kv_store_{key}_total"),
+                    "counter",
+                    &format!("KV store {}.", key.replace('_', " ")),
+                    &per(key),
+                );
+            }
+        }
     }
     out
 }
+
+const KV_STORE_GAUGES: [&str; 4] = ["slots", "free_slots", "entries", "shared"];
+const KV_STORE_COUNTERS: [&str; 10] = [
+    "spilled_bytes",
+    "moved_in_bytes",
+    "restored_bytes",
+    "hits",
+    "moved_out",
+    "dropped",
+    "dropped_pages",
+    "refused",
+    "refused_pages",
+    "full",
+];

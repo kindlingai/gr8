@@ -110,6 +110,10 @@ class UnitTests(unittest.TestCase):
         self.assertIn(b' top_p 1.0 lp 0\n', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'logprobs': 0}, 0)[0])
         self.assertIn(b' top_p 1.0 lp 2 plp 3\n',
                       g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'logprobs': 2, 'prompt_logprobs': 3}, 0)[0])
+        # the system span (PROTOCOL.md system_tokens) goes last, as sys <n>, and must lie within the prompt
+        self.assertIn(b' top_p 1.0 sys 2\n', g6s2shim.build_request({'prompt': [1, 2, 3], 'max_tokens': 4, 'system_tokens': 2}, 0)[0])
+        self.assertEqual(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'system_tokens': 5}, 0)[1],
+                         'system_tokens must be 0..len(prompt)')
         for lp in (-1, 21, 1.5, True, '3'):
             for key in ('logprobs', 'prompt_logprobs'):
                 self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, key: lp}, 0)[1], (key, lp))

@@ -285,6 +285,7 @@ pub fn build(
             stop_ids,
             logprobs: lp.map(|v| v as i64),
             prompt_logprobs: plp.map(|v| v as i64),
+            system_tokens: None,
         },
         stop,
         include_stop: pyjson::truthy(body.get("include_stop_str_in_output")),

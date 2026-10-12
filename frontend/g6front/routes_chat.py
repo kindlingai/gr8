@@ -40,7 +40,34 @@ async def prepare(st: State, body: dict):
     prompt = await st.tok.aencode(text, add_special_tokens=bool(body.get('add_special_tokens', False)))
     params = sampling.build(body, len(prompt), st.max_model_len, st.tok.eos_ids, st.tok.gen_defaults, None,
                             st.max_logprobs, chat=True)
+    span = await system_span(st, body, tools, kw, prompt)
+    if span is not None:
+        params['system_tokens'] = span
     return tools, tool_choice, prompt, params
+
+
+async def system_span(st: State, body: dict, tools, kw: dict, prompt: list) -> int | None:
+    """The prompt's system span (PROTOCOL.md `system_tokens`): its tokens up to where the first message after the
+    leading system ones begins, found by rendering those messages and the tools alone. The engine's KV stores keep
+    system prefixes by it. None when the template cannot render them alone."""
+    lead = []
+    for m in body.get('messages') or []:
+        if not isinstance(m, dict) or m.get('role') not in ('system', 'developer'):
+            break
+        lead.append(m)
+    if not lead and not tools:
+        return 0
+    try:
+        text = st.template.render(lead, tools=tools, **dict(kw, add_generation_prompt=False, continue_final_message=False))
+    except TemplateError:
+        return None
+    ids = await st.tok.aencode(text, add_special_tokens=bool(body.get('add_special_tokens', False)))
+    n = 0
+    for a, b in zip(ids, prompt):
+        if a != b:
+            break
+        n += 1
+    return n
 
 
 async def handle(request: web.Request) -> web.StreamResponse:
