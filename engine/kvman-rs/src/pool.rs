@@ -232,6 +232,13 @@ impl Pool {
     }
 
     /// The write limit (stash.rs): the tiers write at most milli / 1000 blocks per page of KV computed. 0 = none.
+    /// Runs past R keep their tails in the stores (stash.rs set_tail): nr ranks, per_slot replicated parts a block.
+    pub fn tail(&mut self, nr: u32, per_slot: u32) {
+        if let Some(s) = &mut self.stash {
+            s.set_tail(nr, per_slot);
+        }
+    }
+
     pub fn write_limit(&mut self, milli: u64) {
         if let Some(s) = &mut self.stash {
             s.set_limit(milli);
@@ -517,7 +524,7 @@ impl Pool {
                     continue;
                 }
                 let a = pages_for(b.skip as u64);
-                if a > e.pages() as u64 || !self.restore_room(a, n, w, worst) {
+                if a > self.restorable(e, worst) || !self.restore_room(a, n, w, worst, e.tail.is_some()) {
                     if best.skip == 0 {
                         best.why = Why::Room;
                     }
@@ -532,14 +539,23 @@ impl Pool {
         best
     }
 
+    // the pages of stored entry e a grant of `worst` rows can restore: a tail only goes back into a run past R
+    fn restorable(&self, e: &crate::stash::Entry, worst: u64) -> u64 {
+        (if self.exclusive(worst) { e.pages() } else { e.below() }) as u64
+    }
+
     // whether a grant of n pages (worst w) can restore its first a pages. Below R it is as reserve() makes it. Past R it
-    // needs an empty pool, and the restored pages must lie inside the CP map's replicated start
-    fn restore_room(&self, a: u64, n: u64, w: u64, worst: u64) -> bool {
+    // needs an empty pool, and the restored pages must lie inside the CP map's replicated start unless the entry has
+    // its tail
+    fn restore_room(&self, a: u64, n: u64, w: u64, worst: u64, tail: bool) -> bool {
         if a > n {
             return false;
         }
         if self.exclusive(worst) {
-            return self.live == 0 && !self.exclusive && n <= self.pages as u64 && a * PAGE <= self.below_rows as u64;
+            return self.live == 0
+                && !self.exclusive
+                && n <= self.pages as u64
+                && (tail || a * PAGE <= self.below_rows as u64);
         }
         n <= self.place.wrapping_sub(self.live) as u64 && n <= w && self.safe(Some((n, w)), None)
     }
@@ -550,7 +566,7 @@ impl Pool {
         let e = self.stash.as_ref().and_then(|s| s.find(tier, id)).ok_or(Error::NotRetained)?;
         let w = pages_for(worst);
         let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w } else { pages_for(rows) });
-        if a > e.pages() as u64 || !self.restore_room(a, n, w, worst) {
+        if a > self.restorable(e, worst) || !self.restore_room(a, n, w, worst, e.tail.is_some()) {
             return Err(Error::NoRoom);
         }
         self.check_version()?;
@@ -577,7 +593,7 @@ impl Pool {
             self.spill(&gone);
             (list, gone, false, from_pool.is_some())
         };
-        self.stash.as_mut().expect("found in it").restore(tier, &e, &list[..a as usize], pool_base);
+        self.stash.as_mut().expect("found in it").restore(tier, &e, &list[..a as usize], pool_base, exclusive);
         let rows = if exclusive { worst } else { rows };
         Ok(self.grant(list, exclusive, w as u32, rows, if pool_base { "stored+pool" } else { "stored" }, &gone, hits))
     }

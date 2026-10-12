@@ -122,7 +122,14 @@ impl Policy {
                     Some((b, f)) => (b, (f.parse::<f64>().ok()? * 1000.0).round() as u64),
                     None => (p, 0),
                 };
-                let mut c = StoreCfg { keep: Keep::Shared, after: 2, min_hits: 0, dedupe: true, span: true, limit_milli: limit };
+                let mut c = StoreCfg {
+                    keep: Keep::Shared,
+                    after: 2,
+                    min_hits: 0,
+                    dedupe: true,
+                    span: true,
+                    limit_milli: limit,
+                };
                 let mut words = base.split('-');
                 match words.next()? {
                     w if w.starts_with("system") => {
@@ -252,9 +259,7 @@ fn main() {
         let mut v = || a.next().unwrap_or_else(|| usage());
         let num = |s: String| s.parse::<f64>().unwrap_or_else(|_| usage());
         match k.as_str() {
-            "--policies" => {
-                policies = v().split(',').map(|p| Policy::parse(p).unwrap_or_else(|| usage())).collect()
-            }
+            "--policies" => policies = v().split(',').map(|p| Policy::parse(p).unwrap_or_else(|| usage())).collect(),
             "--prefill-tps" => o.prefill_tps = num(v()),
             "--decode-tps" => {
                 let d: Vec<f64> = v().split(',').map(|x| x.parse().unwrap_or_else(|_| usage())).collect();
@@ -712,13 +717,15 @@ fn drain(pool: &mut Pool, res: &mut Result, o: &Opts) -> f64 {
         let _ = pool.io_done();
         return 0.0;
     }
-    let (mut w, mut r) = (0u64, 0u64);
+    // blocks, not copies: a tail's replicated parts share blocks
+    let (mut w, mut r) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
     for x in &io {
-        match x {
-            Io::Spill { .. } | Io::Move { .. } => w += PAGE_SLOT as u64,
-            Io::Restore { .. } => r += PAGE_SLOT as u64,
-        }
+        match *x {
+            Io::Spill { tier, slot, .. } | Io::Move { to: tier, to_slot: slot, .. } => w.insert((tier, slot)),
+            Io::Restore { tier, slot, .. } => r.insert((tier, slot)),
+        };
     }
+    let (w, r) = (w.len() as u64 * PAGE_SLOT as u64, r.len() as u64 * PAGE_SLOT as u64);
     pool.io_done().expect("no index");
     res.written += w;
     res.read += r;

@@ -108,6 +108,8 @@ public:
         Lock l(mu_);
         check(g6kv_tier_policy(p_, t, min_rows, min_hits, block_bytes));
     }
+    // runs past R keep their tails: nr ranks share the attention caches past R, per_slot replicated parts a block
+    void tail(uint32_t nr, uint32_t per_slot) { Lock l(mu_); g6kv_tail(p_, nr, per_slot); }
     // the stores write at most milli / 1000 blocks per page of KV computed (0 = no limit)
     void write_limit(uint64_t milli) { Lock l(mu_); g6kv_write_limit(p_, milli); }
     // the copies queued since the last io(), in the order to run them. Then io_done()

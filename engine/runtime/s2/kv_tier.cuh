@@ -7,6 +7,12 @@
 // caches and 22 index caches: 3,502,592 B. Each binding stores page p at p x its page bytes, so one kernel copies a batch
 // of pages between the bindings and mapped pinned host memory, and the store reads and writes that memory.
 // Spills run before restores: a restore may write a page that a spill of the same call still has to read.
+//
+// Past R (a CP binding, cp_nr > 0) a binding's attention cache holds this rank's every nr-th logical page at physical
+// pages R/64 + j, and its indexer keys every logical page. A run's tail past R goes to the store in two parts
+// (g6kv_io part): 1 = this rank's shard, the attention pages of the CP bindings at a physical page, in the page block's
+// layout; 2 = a logical page's replicated parts (the indexer keys, and every page of the bindings that are not CP: the
+// MTP layer), rep_bytes() each, per_slot() to a block.
 #pragma once
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
@@ -20,63 +26,101 @@
 namespace g6s2 {
 namespace kvt {
 constexpr size_t MLA16 = 64 * 656 / 16, IDX16 = 64 * 132 / 16;
-struct Piece { uint4* mla; uint4* idx; unsigned long long off16; };
-// grid (pages, bindings): page i of the batch, binding b. out: device -> host, else host -> device
-__global__ void k_page_blocks(const int* pages, const Piece* pieces, uint4* host, unsigned long long slot16, int out)
+// off16: the binding's place in a page block; rep16: in a replicated record. phys: its attention cache's pages (the
+// last physical page differs by rank past R). cp: its attention cache is sharded past R
+struct Piece { uint4* mla; uint4* idx; unsigned long long off16, rep16; int phys; int cp; };
+// one copy of a batch: page, part (g6kv_io), sub (part 2), and the host slot it goes to or comes from
+struct Item { int page, part, sub, hslot; };
+__device__ __forceinline__ void move16(uint4* h, uint4* d, size_t n, int out)
+{
+    for (size_t k = threadIdx.x; k < n; k += blockDim.x) { if (out) h[k] = d[k]; else d[k] = h[k]; }
+}
+// grid (items, bindings): item i of the batch, binding b. out: device -> host, else host -> device
+__global__ void k_page_blocks(const Item* items, const Piece* pieces, uint4* host, unsigned long long slot16,
+                              unsigned long long rep16, int out)
 {
     const Piece pc = pieces[blockIdx.y];
-    const size_t p = (size_t)pages[blockIdx.x];
-    uint4* h = host + (size_t)blockIdx.x * slot16 + pc.off16;
-    uint4* d = pc.mla + p * MLA16;
-    for (size_t k = threadIdx.x; k < MLA16; k += blockDim.x) { if (out) h[k] = d[k]; else d[k] = h[k]; }
-    if (!pc.idx) return;
-    h += MLA16; d = pc.idx + p * IDX16;
-    for (size_t k = threadIdx.x; k < IDX16; k += blockDim.x) { if (out) h[k] = d[k]; else d[k] = h[k]; }
+    const Item it = items[blockIdx.x];
+    const size_t p = (size_t)it.page;
+    uint4* slot = host + (size_t)it.hslot * slot16;
+    if (it.part == 0) {
+        move16(slot + pc.off16, pc.mla + p * MLA16, MLA16, out);
+        if (pc.idx) move16(slot + pc.off16 + MLA16, pc.idx + p * IDX16, IDX16, out);
+    } else if (it.part == 1) {
+        if (pc.cp && it.page < pc.phys) move16(slot + pc.off16, pc.mla + p * MLA16, MLA16, out);   // a rank's shorter shard
+    } else {
+        uint4* h = slot + (size_t)it.sub * rep16 + pc.rep16;
+        if (!pc.cp) { move16(h, pc.mla + p * MLA16, MLA16, out); h += MLA16; }
+        if (pc.idx) move16(h, pc.idx + p * IDX16, IDX16, out);
+    }
 }
 } // namespace kvt
 
 class PageBlocks {
     std::vector<kvt::Piece> pieces_;
     kvt::Piece* d_pieces_ = nullptr;
-    size_t block_ = 0, slot_ = 0;
-    int batch_ = 0;
+    size_t block_ = 0, slot_ = 0, rep_ = 0;
+    int batch_ = 0, items_cap_ = 0;
     uint8_t* host_ = nullptr;   // mapped pinned: batch_ slots
     uint8_t* host_dev_ = nullptr;
-    int* pages_ = nullptr;      // mapped pinned: batch_ page numbers
-    int* pages_dev_ = nullptr;
+    kvt::Item* items_ = nullptr;   // mapped pinned: items_cap_ copies
+    kvt::Item* items_dev_ = nullptr;
 public:
     // bindings: every layer binding of the pool, main model then draft, in an order every rank shares
     PageBlocks(const std::vector<const G6AttnBinding*>& bindings, int batch = 32) : batch_(batch) {
-        size_t off = 0;
+        size_t off = 0, rep = 0;
         for (const G6AttnBinding* b : bindings) {
-            pieces_.push_back({static_cast<uint4*>(b->args.mla_cache), static_cast<uint4*>(b->args.index_cache), off / 16});
+            const bool cp = b->args.cp_nr != 0;
+            pieces_.push_back({static_cast<uint4*>(b->args.mla_cache), static_cast<uint4*>(b->args.index_cache), off / 16, rep / 16,
+                               b->args.page_count, cp});
             off += 64 * 656 + (b->args.index_cache ? 64 * 132 : 0);
+            rep += (cp ? 0 : 64 * 656) + (b->args.index_cache ? 64 * 132 : 0);
         }
         block_ = off;
+        rep_ = rep;
         slot_ = (block_ + 4095) / 4096 * 4096;
+        items_cap_ = batch_ * int(per_slot() ? per_slot() : 1);
         G6RT_CK(cudaMalloc(&d_pieces_, pieces_.size() * sizeof(kvt::Piece)));
         G6RT_CK(cudaMemcpy(d_pieces_, pieces_.data(), pieces_.size() * sizeof(kvt::Piece), cudaMemcpyHostToDevice));
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&host_), slot_ * batch_, cudaHostAllocMapped));
         G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev_), host_, 0));
-        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&pages_), sizeof(int) * batch_, cudaHostAllocMapped));
-        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&pages_dev_), pages_, 0));
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&items_), sizeof(kvt::Item) * items_cap_, cudaHostAllocMapped));
+        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&items_dev_), items_, 0));
     }
-    ~PageBlocks() { cudaFree(d_pieces_); cudaFreeHost(host_); cudaFreeHost(pages_); }
+    ~PageBlocks() { cudaFree(d_pieces_); cudaFreeHost(host_); cudaFreeHost(items_); }
     PageBlocks(const PageBlocks&) = delete;
     PageBlocks& operator=(const PageBlocks&) = delete;
     size_t block_bytes() const { return block_; }
     size_t slot_bytes() const { return slot_; }
+    // a logical page's replicated parts past R, and how many fit a block (0: no binding is CP)
+    size_t rep_bytes() const { return rep_; }
+    uint32_t per_slot() const {
+        bool cp = false;
+        for (const auto& p : pieces_) cp = cp || p.cp;
+        return cp && rep_ ? uint32_t(slot_ / rep_) : 0;
+    }
     int batch() const { return batch_; }
+    int items() const { return items_cap_; }
     uint8_t* host(int i) const { return host_ + (size_t)i * slot_; }
     size_t host_bytes() const { return slot_ * batch_; }
-    // pages (at most batch()) <-> host(0..n-1); synchronous on st
+    // whole pages (at most batch()) <-> host(0..n-1); synchronous on st
     void copy(const std::vector<int>& pages, bool out, cudaStream_t st) {
-        if (pages.empty()) return;
-        if ((int)pages.size() > batch_) throw std::runtime_error("page block batch too large");
-        G6RT_CK(cudaStreamSynchronize(st));   // the previous batch's host reads or writes are done before pages_ changes
-        for (size_t i = 0; i < pages.size(); ++i) pages_[i] = pages[i];
-        kvt::k_page_blocks<<<dim3((unsigned)pages.size(), (unsigned)pieces_.size()), 256, 0, st>>>(
-            pages_dev_, d_pieces_, reinterpret_cast<uint4*>(host_dev_), slot_ / 16, out);
+        std::vector<kvt::Item> items;
+        for (size_t i = 0; i < pages.size(); ++i) items.push_back({pages[i], 0, 0, int(i)});
+        copy(items, out, st);
+    }
+    // copies (at most items(), host slots below batch()) <-> their host slots; synchronous on st
+    void copy(const std::vector<kvt::Item>& items, bool out, cudaStream_t st) {
+        if (items.empty()) return;
+        if ((int)items.size() > items_cap_) throw std::runtime_error("page block batch too large");
+        G6RT_CK(cudaStreamSynchronize(st));   // the previous batch's host reads or writes are done before items_ changes
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].hslot < 0 || items[i].hslot >= batch_ || (items[i].part == 2 && uint32_t(items[i].sub) >= per_slot()))
+                throw std::runtime_error("page block copy out of its batch");
+            items_[i] = items[i];
+        }
+        kvt::k_page_blocks<<<dim3((unsigned)items.size(), (unsigned)pieces_.size()), 256, 0, st>>>(
+            items_dev_, d_pieces_, reinterpret_cast<uint4*>(host_dev_), slot_ / 16, rep_ / 16, out);
         G6RT_CK(cudaGetLastError());
         G6RT_CK(cudaStreamSynchronize(st));
     }
@@ -115,7 +159,8 @@ public:
     size_t size() const { return t_.size(); }
     std::string describe(size_t i) const { char b[256]; g6kv_tier_describe(t_[i], b, sizeof b); return b; }
     // the pool's copies, in order: runs of spills (pages -> blocks), moves (block -> block) and restores (blocks ->
-    // pages), each a batch of up to batch() blocks. A batch's store reads and writes go out at once, per tier.
+    // pages), each a batch of up to batch() blocks. A batch's store reads and writes go out at once, per tier. The
+    // copies of one block (a tail's replicated parts) stay in one batch.
     void run(const std::vector<g6kv_io>& io, cudaStream_t st) {
         if (io.empty()) return;
         const auto t0 = std::chrono::steady_clock::now();
@@ -131,28 +176,35 @@ public:
                          : g6kv_tier_read_many(t_[tier], b.size(), b.data(), p.data()), write ? "write" : "read");
             }
         };
-        auto device = [&](const std::vector<int>& pages, bool out) {
+        auto device = [&](const std::vector<kvt::Item>& items, bool out) {
             const auto d0 = std::chrono::steady_clock::now();
-            pb_.copy(pages, out, st);
+            pb_.copy(items, out, st);
             dev += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
         };
         while (i < io.size()) {
             const uint32_t kind = io[i].kind;
-            std::vector<int> pages; std::vector<uint32_t> from, to; std::vector<uint64_t> slots, to_slots;
-            while (i < io.size() && io[i].kind == kind && (int)pages.size() < pb_.batch()) {
+            std::vector<kvt::Item> items;   // spills and restores: each copy and its host slot
+            std::vector<uint32_t> from, to; std::vector<uint64_t> slots, to_slots;   // per host slot
+            while (i < io.size() && io[i].kind == kind) {
+                const g6kv_io& x = io[i];
                 // an entry passed on twice in one call: the first move writes a block, then the second move reads it. A
                 // batch reads before it writes, so the second move starts the next batch
                 if (kind == 1) {
                     bool dep = false;
-                    for (size_t j = 0; j < pages.size() && !dep; ++j) dep = to[j] == io[i].tier && to_slots[j] == io[i].slot;
-                    if (dep) break;
+                    for (size_t j = 0; j < slots.size() && !dep; ++j) dep = to[j] == x.tier && to_slots[j] == x.slot;
+                    if (dep || (int)slots.size() == pb_.batch()) break;
+                    from.push_back(x.tier); to.push_back(x.to); slots.push_back(x.slot); to_slots.push_back(x.to_slot); ++i;
+                    continue;
                 }
-                pages.push_back((int)io[i].page); from.push_back(io[i].tier); to.push_back(io[i].to);
-                slots.push_back(io[i].slot); to_slots.push_back(io[i].to_slot); ++i;
+                // a block's copies are next to each other: one host slot for them all
+                const bool same = !slots.empty() && from.back() == x.tier && slots.back() == x.slot;
+                if (!same && ((int)slots.size() == pb_.batch() || (int)items.size() + (int)pb_.per_slot() + 1 > pb_.items())) break;
+                if (!same) { from.push_back(x.tier); slots.push_back(x.slot); }
+                items.push_back({(int)x.page, (int)x.part, (int)x.sub, (int)slots.size() - 1}); ++i;
             }
-            if (kind == 0) { device(pages, true); many(from, slots, true); spilled += pages.size(); }
-            else if (kind == 1) { many(from, slots, false); many(to, to_slots, true); moved += pages.size(); }
-            else { many(from, slots, false); device(pages, false); restored += pages.size(); }
+            if (kind == 0) { device(items, true); many(from, slots, true); spilled += slots.size(); }
+            else if (kind == 1) { many(from, slots, false); many(to, to_slots, true); moved += slots.size(); }
+            else { many(from, slots, false); device(items, false); restored += slots.size(); }
         }
         const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ms += t;
@@ -162,8 +214,8 @@ public:
     void round_trip(const std::vector<int>& pages, cudaStream_t st, const std::function<void()>& between) {
         std::vector<g6kv_io> out, in;
         for (size_t i = 0; i < pages.size(); ++i) {
-            out.push_back(g6kv_io{0, (uint32_t)pages[i], 0, 0, i, 0});
-            in.push_back(g6kv_io{2, (uint32_t)pages[i], 0, 0, i, 0});
+            out.push_back(g6kv_io{0, (uint32_t)pages[i], 0, 0, i, 0, 0, 0});
+            in.push_back(g6kv_io{2, (uint32_t)pages[i], 0, 0, i, 0, 0, 0});
         }
         run(out, st);
         between();

@@ -798,6 +798,9 @@ int main(int argc, char** argv)
                             (unsigned long long)slots, kvt->blocks().slot_bytes(), index.empty() ? "" : ", indexed");
                 }
                 pool.write_limit((uint64_t)std::llround(kv_write_limit * 1000));
+                // a run past R keeps its tail: each rank's shard and the replicated parts (only when the pool's R is the CP
+                // map's, so the pages past it are the sharded ones)
+                if (m.cp.on && s2_below == m.cp.R && kvt->blocks().per_slot()) pool.tail((uint32_t)g6nr::NR, kvt->blocks().per_slot());
             }
             catch (const std::exception& e) { die(std::string("--kv-store: ") + e.what()); }
             if (R == 0)

@@ -4,7 +4,7 @@
 //! between tiers on the way. Two ranks given the same calls must queue the same copies and agree on the digest. Also:
 //! what counts as a new conversation, promotion of a shared prefix, moves between tiers and the persistent index.
 
-use g6kvman::stash::{prefix_key, Io, Keep, Kind, Policy};
+use g6kvman::stash::{prefix_key, Io, Keep, Kind, Part, Policy};
 use g6kvman::{Error, Finished, Pool, Rules, Run, PAGE};
 
 struct Rng(u64);
@@ -602,6 +602,153 @@ fn a_run_on_a_resident_prefix_comes_back_with_its_prefix_from_the_pool_or_the_ti
         let list = r.pool.list(&run).unwrap().to_vec();
         for row in 0..h.skip as usize {
             assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], a_hist[row], "pool {from_pool} row {row}");
+        }
+    }
+}
+
+/// A CP rank (stash.rs Tail): below R its pages hold every row; past R it holds the attention rows of every nr-th
+/// logical page (its shard, at physical page bp + j) and the indexer rows of every logical page.
+struct CpRank {
+    pool: Pool,
+    rank: usize,
+    attn: Vec<Page>, // by physical page
+    idx: Vec<Page>,  // by logical page
+    tiers: Vec<Vec<(Page, Page, Vec<Page>)>>,
+}
+
+const NR: usize = 4;
+const PER: u32 = 3;
+
+impl CpRank {
+    fn new(rank: usize, pages: u32, place: u32, below: u32, slots: u64) -> CpRank {
+        let mut pool = pool(pages, place, below, 2);
+        pool.add_tier(slots, Keep::All, None).unwrap();
+        pool.tail(NR as u32, PER);
+        let blank = ([-2; ROWS], [-2; ROWS], vec![[-2; ROWS]; PER as usize]);
+        CpRank {
+            pool,
+            rank,
+            attn: vec![[-1; ROWS]; pages as usize],
+            idx: vec![[-1; ROWS]; pages as usize],
+            tiers: vec![vec![blank; slots as usize]],
+        }
+    }
+    // logical page -> this rank's physical page of the attention cache, when it holds it
+    fn phys(&self, lp: usize, bp: usize) -> Option<usize> {
+        if lp < bp {
+            Some(lp)
+        } else if lp % NR == self.rank {
+            Some(bp + (lp - bp) / NR)
+        } else {
+            None
+        }
+    }
+    // an exclusive run's rows (its list is the logical pages 0, 1, ..)
+    fn write(&mut self, from: usize, tokens: &[i32], bp: usize) {
+        for (r, &t) in tokens.iter().enumerate().skip(from) {
+            let lp = r / ROWS;
+            self.idx[lp][r % ROWS] = t;
+            if let Some(p) = self.phys(lp, bp) {
+                self.attn[p][r % ROWS] = t;
+            }
+        }
+    }
+    fn run_io(&mut self) -> Vec<Io> {
+        let io = self.pool.io();
+        for x in &io {
+            match *x {
+                Io::Spill { tier, page, slot, part } => {
+                    let b = &mut self.tiers[tier as usize][slot as usize];
+                    match part {
+                        Part::Full => (b.0, b.1) = (self.attn[page as usize], self.idx[page as usize]),
+                        Part::Own => b.0 = self.attn[page as usize],
+                        Part::Rep(i) => b.2[i as usize] = self.idx[page as usize],
+                    }
+                }
+                Io::Move { tier, slot, to, to_slot } => {
+                    self.tiers[to as usize][to_slot as usize] = self.tiers[tier as usize][slot as usize].clone()
+                }
+                Io::Restore { tier, slot, page, part } => {
+                    let b = self.tiers[tier as usize][slot as usize].clone();
+                    match part {
+                        Part::Full => (self.attn[page as usize], self.idx[page as usize]) = (b.0, b.1),
+                        Part::Own => self.attn[page as usize] = b.0,
+                        Part::Rep(i) => self.idx[page as usize] = b.2[i as usize],
+                    }
+                }
+            }
+        }
+        self.pool.io_done().unwrap();
+        io
+    }
+}
+
+#[test]
+fn a_run_past_r_comes_back_with_every_ranks_shard_of_its_tail() {
+    // 8 pages below R (512 rows), 32 logical pages past it shared by 4 ranks: 8 + 8 physical pages a rank
+    let (pages, bp) = (40u32, 8usize);
+    let place = bp as u32 + (pages - bp as u32) / NR as u32;
+    let mut ranks: Vec<CpRank> = (0..NR).map(|r| CpRank::new(r, pages, place, bp as u32 * 64, 256)).collect();
+    type Got = (Run, Vec<Io>, u64);
+    let all = |ranks: &mut [CpRank], f: &mut dyn FnMut(&mut CpRank) -> Got| {
+        let got: Vec<Got> = ranks.iter_mut().map(&mut *f).collect();
+        assert!(got.iter().all(|g| *g == got[0]), "the ranks differ");
+        got.into_iter().next().unwrap()
+    };
+    // a session past R: 1,500 prompt rows, 100 generated
+    let a = toks(1, 1500);
+    let mut a_hist = a.clone();
+    a_hist.extend(toks(2, 100));
+    let worst = (a.len() + 100 + 1) as u64;
+    let (run, ..) = all(&mut ranks, &mut |r| {
+        r.pool.count(&a, None);
+        let run = r.pool.reserve(worst, worst).unwrap();
+        let io = r.run_io();
+        r.write(0, &a_hist, bp);
+        (run, io, r.pool.digest())
+    });
+    all(&mut ranks, &mut |r| {
+        r.pool.retain(&run, finished(&a_hist)).unwrap();
+        let io = r.run_io();
+        (run, io, r.pool.digest())
+    });
+    // another run past R takes the pool: a's run goes to the store, its tail as each rank's shard
+    let b = toks(3, 2400);
+    let wb = (b.len() + 1) as u64;
+    let (runb, io, _) = all(&mut ranks, &mut |r| {
+        r.pool.count(&b, None);
+        let run = r.pool.reserve(wb, wb).unwrap();
+        let io = r.run_io();
+        r.write(0, &b, bp);
+        (run, io, r.pool.digest())
+    });
+    let tail = (a_hist.len() - 1).div_ceil(ROWS) - bp; // logical pages past R the run held
+    let owns = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Own, .. })).count();
+    let reps = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Rep(_), .. })).count();
+    assert_eq!((owns, reps), (tail.div_ceil(NR), tail), "{io:?}");
+    all(&mut ranks, &mut |r| {
+        r.pool.release(&runb).unwrap();
+        (runb, Vec::new(), r.pool.digest())
+    });
+    // a's next turn: past R, its rows come back from the store on every rank, b's rows overwritten
+    let mut a2 = a_hist.clone();
+    a2.extend(toks(4, 30));
+    let w2 = (a2.len() + 10) as u64;
+    let h = ranks[0].pool.match_prefix(&a2, w2, w2, a2.len() as i32 - 1);
+    assert!(h.stored && h.skip as usize > bp * ROWS, "{h:?}");
+    all(&mut ranks, &mut |r| {
+        r.pool.count(&a2, None);
+        let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), w2, w2).unwrap();
+        let io = r.run_io();
+        (run, io, r.pool.digest())
+    });
+    for r in &ranks {
+        for (row, &t) in a2.iter().enumerate().take(h.skip as usize) {
+            let lp = row / ROWS;
+            assert_eq!(r.idx[lp][row % ROWS], t, "rank {} indexer row {row}", r.rank);
+            if let Some(p) = r.phys(lp, bp) {
+                assert_eq!(r.attn[p][row % ROWS], t, "rank {} attention row {row}", r.rank);
+            }
         }
     }
 }

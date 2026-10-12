@@ -8,7 +8,11 @@
 //!   tier makes room by its least recently used entries. Each such entry goes on to the next tier whose keep takes it (a
 //!   Move), or the tier drops it.
 //! - The store holds an evicted run below R by its first ceil(valid / 64) pages. A run past R (exclusive) holds the CP
-//!   map. That map's pages below R are the same logical pages on every rank, and the store keeps only those.
+//!   map. That map's pages below R are the same logical pages on every rank. Past R each rank holds every nr-th logical
+//!   page of the attention cache (its own shard), and every logical page of the indexer keys and of the bindings that
+//!   are not sharded (the MTP layer). With set_tail(), a tail of T logical pages goes to each rank's own store as
+//!   ceil(T / nr) blocks of its shard (Part::Own, the rank's physical pages below R + j) and the T pages' replicated
+//!   parts, per_slot to a block (Part::Rep). Every rank queues the same copies; each block holds that rank's bytes.
 //!   A hit that takes a retained run for its first pages stores that run too, as an evicted one: the grant writes past
 //!   the hit's skip, and the run's owner would keep only the shared prefix.
 //! - Counting: count() at each admission. A request that continues a live, retained or stored run (its prompt holds
@@ -94,12 +98,31 @@ pub struct Policy {
 /// The write limit's credit starts at, and holds at most, this many blocks.
 pub const BURST: i64 = 4096;
 
+/// What of a page a copy moves. Full: one pool page of every layer (below R). Own: past R, physical page `page` of the
+/// sharded attention caches only (this rank's shard). Rep(i): past R, logical page `page`'s replicated parts (indexer
+/// keys, unsharded bindings), the i-th of a block's per_slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Full,
+    Own,
+    Rep(u32),
+}
+
 /// One copy for the engine. A page is one pool page of every layer, a slot one block of a tier's store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Io {
-    Spill { tier: u32, page: u32, slot: u64 },
+    Spill { tier: u32, page: u32, slot: u64, part: Part },
     Move { tier: u32, slot: u64, to: u32, to_slot: u64 },
-    Restore { tier: u32, slot: u64, page: u32 },
+    Restore { tier: u32, slot: u64, page: u32, part: Part },
+}
+
+/// A stored run's tail past R (set_tail): `logical` pages, held in `own` blocks of each rank's shard then `rep` blocks of
+/// replicated parts, the last own + rep of the entry's slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tail {
+    pub logical: u32,
+    pub own: u32,
+    pub rep: u32,
 }
 
 /// A stored run or prefix, and st is what match() runs begin() on. Its first pages are the blocks of `base` (a shared
@@ -114,12 +137,17 @@ pub struct Entry {
     pub base: Option<(u64, usize)>,
     /// times the conversation continued a run before this one was stored
     pub hits: u32,
+    pub tail: Option<Tail>,
 }
 
 impl Entry {
-    /// The pages it can restore: its base's and its own.
+    /// The (logical) pages it can restore: its base's, its own below R, and its tail's.
     pub fn pages(&self) -> usize {
-        self.base.map_or(0, |b| b.1) + self.slots.len()
+        self.below() + self.tail.map_or(0, |t| t.logical as usize)
+    }
+    /// The pages it can restore below R.
+    pub fn below(&self) -> usize {
+        self.base.map_or(0, |b| b.1) + self.slots.len() - self.tail.map_or(0, |t| (t.own + t.rep) as usize)
     }
 }
 
@@ -191,6 +219,8 @@ pub struct Stash {
     credit: i64,
     /// prefix bases for evicted runs (on; kvman-sim turns it off to compare)
     pub dedupe: bool,
+    // set_tail: (ranks, replicated parts per block); None = a run past R keeps only its pages below R
+    tail: Option<(u32, u32)>,
 }
 
 const FNV: u64 = 14695981039346656037;
@@ -221,6 +251,7 @@ impl Stash {
             limit_milli: 0,
             credit: 0,
             dedupe: true,
+            tail: None,
         }
     }
 
@@ -260,6 +291,12 @@ impl Stash {
 
     pub fn set_policy(&mut self, t: usize, p: Policy) {
         self.tiers[t].policy = p;
+    }
+
+    /// Runs past R keep their tails: nr ranks share the attention cache past R, and a block holds per_slot logical
+    /// pages' replicated parts (the engine's page block layout decides it).
+    pub fn set_tail(&mut self, nr: u32, per_slot: u32) {
+        self.tail = (nr > 0 && per_slot > 0).then_some((nr, per_slot));
     }
 
     /// The write limit: the tiers write at most `milli` / 1000 blocks per page of KV computed. 0 = none.
@@ -421,14 +458,19 @@ impl Stash {
             }
             let mut n = pages(k.st.valid as u64).min(k.list.len());
             let mut st = k.st.clone();
+            let mut tail = 0;
             if k.exclusive {
+                if self.tail.is_some() && n > below_pages {
+                    tail = n - below_pages;
+                } else {
+                    st.valid = st.valid.min((n.min(below_pages) as u64 * PAGE) as i32);
+                }
                 n = n.min(below_pages);
-                st.valid = st.valid.min((n as u64 * PAGE) as i32);
             }
             if n == 0 {
                 continue;
             }
-            self.store(Kind::Evicted, 0, st, &k.list[..n], k.hits, resident);
+            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], k.hits, resident, tail as u32);
         }
     }
 
@@ -458,6 +500,21 @@ impl Stash {
     }
 
     fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32, resident: &[&[i32]]) {
+        self.store_tail(kind, key, st, pages, hits, resident, 0)
+    }
+
+    // store() for a run past R whose tail is `tail` logical pages after `pages` (the pages below R, 0, 1, ..)
+    #[allow(clippy::too_many_arguments)]
+    fn store_tail(
+        &mut self,
+        kind: Kind,
+        key: u64,
+        st: Finished,
+        pages: &[u32],
+        hits: u32,
+        resident: &[&[i32]],
+        tail: u32,
+    ) {
         // a run that starts with a stored prefix stores only the pages after it. Else a prefix another run in the pool
         // holds becomes one, stored once, when a tier takes it
         let rows = st.valid.max(0) as u64;
@@ -485,20 +542,45 @@ impl Stash {
             }
         }
         let own = &pages[base.map_or(0, |b| b.1)..];
-        if own.is_empty() {
+        let tail = self.tail.filter(|_| tail > 0).map(|(nr, per)| Tail {
+            logical: tail,
+            own: tail.div_ceil(nr),
+            rep: tail.div_ceil(per),
+        });
+        let n = own.len() + tail.map_or(0, |t| (t.own + t.rep) as usize);
+        if n == 0 {
             return;
         }
         let pin = std::mem::take(&mut self.pin);
         self.pin = pin.iter().copied().chain(base.map(|b| b.0)).collect();
-        let placed = self.place(0, kind, own.len(), rows, hits);
+        let placed = self.place(0, kind, n, rows, hits);
         self.pin = pin;
         let Some((t, slots)) = placed else { return };
-        self.io.extend(own.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier: t as u32, page, slot }));
+        let tier = t as u32;
+        self.io.extend(own.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier, page, slot, part: Part::Full }));
+        if let Some(x) = tail {
+            // this rank's shard: its physical pages past R (below + j); then every logical page's replicated parts
+            let (below, per) = (pages.len() as u32, self.tail.expect("set").1);
+            let own_slots = &slots[own.len()..own.len() + x.own as usize];
+            let rep_slots = &slots[own.len() + x.own as usize..];
+            self.io.extend(own_slots.iter().enumerate().map(|(j, &slot)| Io::Spill {
+                tier,
+                page: below + j as u32,
+                slot,
+                part: Part::Own,
+            }));
+            self.io.extend((0..x.logical).map(|i| Io::Spill {
+                tier,
+                page: below + i,
+                slot: rep_slots[(i / per) as usize],
+                part: Part::Rep(i % per),
+            }));
+        }
         let id = self.next_id;
         self.next_id += 1;
         let tier = &mut self.tiers[t];
-        tier.stats.spilled_pages += own.len() as u64;
-        tier.entries.push(Entry { id, kind, key, st, slots, base, hits });
+        tier.stats.spilled_pages += n as u64;
+        tier.entries.push(Entry { id, kind, key, st, slots, base, hits, tail });
         if kind.prefix() && tier.index.is_some() {
             self.commits.push((t, id));
         }
@@ -507,12 +589,13 @@ impl Stash {
     // a prefix entry of its own (no base): its id, or None when no tier takes it
     fn put(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32) -> Option<u64> {
         let (t, slots) = self.place(0, kind, pages.len(), st.valid.max(0) as u64, hits)?;
-        self.io.extend(pages.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier: t as u32, page, slot }));
+        let tier = t as u32;
+        self.io.extend(pages.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier, page, slot, part: Part::Full }));
         let id = self.next_id;
         self.next_id += 1;
         let tier = &mut self.tiers[t];
         tier.stats.spilled_pages += pages.len() as u64;
-        tier.entries.push(Entry { id, kind, key, st, slots, base: None, hits });
+        tier.entries.push(Entry { id, kind, key, st, slots, base: None, hits, tail: None });
         if tier.index.is_some() {
             self.commits.push((t, id));
         }
@@ -644,25 +727,51 @@ impl Stash {
     }
 
     /// Queues the copies of a hit's entry into `pages` (its first ones). pool_base: the grant's first base pages came
-    /// from a retained run in the pool, so only the entry's own blocks are read.
-    pub(crate) fn restore(&mut self, t: usize, e: &Entry, pages: &[u32], pool_base: bool) {
+    /// from a retained run in the pool, so only the entry's own blocks are read. exclusive: the grant is a run past R
+    /// (the CP map), the only kind a tail may go back into.
+    pub(crate) fn restore(&mut self, t: usize, e: &Entry, pages: &[u32], pool_base: bool, exclusive: bool) {
         let b = e.base.map_or(0, |b| b.1).min(pages.len());
         if let Some((base, _)) = e.base.filter(|_| !pool_base) {
             let (u, slots) = self.locate(base).expect("a base outlives the runs on it");
             let copies: Vec<Io> = slots
                 .iter()
                 .zip(&pages[..b])
-                .map(|(&slot, &page)| Io::Restore { tier: u as u32, slot, page })
+                .map(|(&slot, &page)| Io::Restore { tier: u as u32, slot, page, part: Part::Full })
                 .collect();
             self.io.extend(copies);
             self.tiers[u].stats.restored_pages += b as u64;
         }
-        self.io.extend(e.slots.iter().zip(&pages[b..]).map(|(&slot, &page)| Io::Restore {
-            tier: t as u32,
+        let tier = t as u32;
+        let below = e.slots.len() - e.tail.map_or(0, |x| (x.own + x.rep) as usize);
+        let own = &e.slots[..below];
+        let n = own.len().min(pages.len().saturating_sub(b));
+        self.io.extend(own.iter().zip(&pages[b..b + n]).map(|(&slot, &page)| Io::Restore {
+            tier,
             slot,
             page,
+            part: Part::Full,
         }));
-        self.tiers[t].stats.restored_pages += (pages.len() - b) as u64;
+        let mut restored = n;
+        // a tail comes back whole on every rank (its pages past the hit are written over by the prefill)
+        if let (Some(x), Some((_, per)), true) = (e.tail, self.tail, exclusive) {
+            let first = (b + below) as u32;
+            let own_slots = &e.slots[below..below + x.own as usize];
+            let rep_slots = &e.slots[below + x.own as usize..];
+            self.io.extend(own_slots.iter().enumerate().map(|(j, &slot)| Io::Restore {
+                tier,
+                slot,
+                page: first + j as u32,
+                part: Part::Own,
+            }));
+            self.io.extend((0..x.logical).map(|i| Io::Restore {
+                tier,
+                slot: rep_slots[(i / per) as usize],
+                page: first + i,
+                part: Part::Rep(i % per),
+            }));
+            restored += (x.own + x.rep) as usize;
+        }
+        self.tiers[t].stats.restored_pages += restored as u64;
         if e.kind == Kind::Evicted {
             self.tiers[t].alloc.release(&e.slots);
         }
@@ -849,6 +958,7 @@ fn decode(p: &[u8]) -> Option<Record> {
                 slots,
                 base: None,
                 hits: 0,
+                tail: None,
             }))
         }
         2 => Some(Record::Drop(c.u64()?)),

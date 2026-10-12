@@ -123,43 +123,120 @@ What the numbers show:
 `kvman-remote` alone: `kvman-remote --gb 8 [--port 7350] [--min-free-gb 10] [--no-rdma]`. For a test outside the
 launcher, `sudo systemd-run --unit=kv-node -p LimitMEMLOCK=infinity -p User=$USER kvman-remote --gb 8` is easy to stop.
 
-## Stage B: tiers below the pool
+## Stage B: stores below the pool
 
-Built and tested on one box. It has not run on the cluster yet. Off unless `--kv-tier` is given. Without it the pool has
-no store, counts nothing, queues no copies, and its digest is what it was. The control frames move to `G6S2E4` for the
-two new grant fields, so every rank needs this build.
+Off unless `--kv-store` is given. Without it the pool has no store, counts nothing, queues no copies, and its digest is
+what it was. #37 shipped this as `--kv-tier STORE,size=N,keep=evicted|shared|all` per tier; that flag and
+`--kv-shared-after` remain for one release as deprecated aliases (a tier that kept evicted runs, the old default, maps to
+`--kv-keep all`, else `system`).
 
 ### Configuration
 
-    --kv-tier ssd:/nvme/gr8kv,size=200G,keep=shared
-    --kv-tier remote:auto,size=8G,keep=evicted
-    --kv-shared-after 5
+    --kv-store ssd:/nvme/gr8kv,size=200G       # where: repeatable, tried in order
+    --kv-store remote:auto,size=8G
+    --kv-keep system|sessions|all              # what: default system
+    --kv-system-after 2                        # default 2
+    --kv-write-limit 0.25                      # optional cap, off by default
 
-`--kv-tier` is given once per tier. The launcher's `KV_TIER` holds the same values separated by `;` (KNOBS.md). A store
-is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or `remote:HOST:PORT`. `remote:auto` is
-the launcher's: each box's supervisor names the KV node mentat announces, with an RDMA address on one of the box's rails
-first. `size` is per rank, binary (G = 2^30, T = 2^40). `keep` is `evicted` (the default), `shared` or `all`.
+The launcher's `KV_STORE` holds the stores separated by `;`, with `KV_KEEP`, `KV_SYSTEM_AFTER` and `KV_WRITE_LIMIT`
+(KNOBS.md). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
+`remote:HOST:PORT`. `remote:auto` is the launcher's: each box's supervisor names the KV node mentat announces, with an
+RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40).
 
-### What each tier keeps
+### What the stores keep
 
-- `keep=evicted`: a retained run the pool evicts, by its first ceil(valid / 64) pages. A run past R holds the CP map,
-  whose pages below R are the same logical pages on every rank, so only those are kept. A hit that takes a retained
-  run for its first pages (another conversation with the same system prompt, say) also stores what that run held past
-  the hit's skip. Without that, the run's owner keeps only the shared prefix. On the cluster this cost agent sessions
-  their runs more often than a full pool did.
-- `keep=shared`: a prefix that started `--kv-shared-after` conversations (default 3). A request counts at admission.
-  When it continues a live, retained or stored run (its prompt holds all of that run's prompt), it counts toward
-  nothing, so a five-turn chat counts once. The next prompt may carry another reply than the run wrote: an agent
-  client can drop the reasoning or edit the reply. Otherwise it counts once toward every grid-cell prefix of its
-  prompt (4,096 rows served). The key of a prefix of S rows is its first S + 1 tokens, since the MTP layer's row S - 1
-  depends on token S. When a run retires, the longest counted prefix it holds that no tier has yet is written once to
-  the first tier that keeps shared prefixes. In practice that prefix is the system prompt and tool definitions. The
-  engine has no idea of chat roles. The count table keeps the 4,096 most recently counted prefixes.
-- Tiers are tried in flag order, for lookups and for placement. A full tier frees its least recently used entries, and
-  each goes on to the next tier that keeps its kind (a block-to-block move), or is dropped.
-- A hit on an evicted run takes it out of its tier, and a hit on a shared prefix leaves it there. A stored hit wins
-  only when it reuses more rows than the pool can. Its blocks go back into the grant's first pages: below R as a
-  reservation takes them, past R into the CP map's start, which is below R.
+- `system` (the default): the system prompt and tool definitions of each conversation, once per distinct span, after
+  `--kv-system-after` conversations started with it. The front ends send the span (`system_tokens`, PROTOCOL.md): the
+  prompt's tokens up to where the first message after the leading system messages begins, as the chat template renders
+  them. A new conversation counts once toward every grid-cell prefix (4,096 rows served) of its prompt within the span;
+  without a span (the completions API) toward every cell of its prompt. A request that continues a live, retained or
+  stored run (its prompt holds all of that run's prompt) counts toward nothing, so one long chat never reaches N. When a
+  run retires, the longest counted prefix it holds within its span goes to the first store, unless a store has it. The
+  key of a prefix of S rows is its first S + 1 tokens, since the MTP layer's row S - 1 depends on token S. The count
+  table keeps the 4,096 most recently counted prefixes, and the first SSD store's index keeps it across restarts.
+  Counting cells rather than whole spans matters for agents: opencode writes the workspace folder into its system
+  prompt 29% of the way in, so agents in different folders share 6,926 of their 12,637-token spans, and only the
+  cells before the folder.
+- `sessions`: those, plus every run the pool evicts that continued its conversation at least once (a store policy,
+  `min_hits` 1: a one-shot never spills). A run past R also keeps its tail (below).
+- `all`: every run the pool evicts, and the system prefixes. For benchmarks.
+- Every policy: a run whose leading pages another run in the pool holds (live or retained, the same tokens) stores
+  that prefix once as a prefix entry, and itself as a reference to it plus its own pages; a run that starts with a
+  stored prefix stores only the pages after it. A restore takes the prefix from a retained run in the pool when one
+  holds it (no copy), else from the store.
+- `--kv-write-limit F`: the stores write at most F blocks per page of KV the engine computes (a grant's prefill pages
+  and growth). Every rank earns and spends the same credit, never by the clock. A write needs credit above zero and
+  may take it below; the credit holds at most 4,096 blocks. Without credit a spill is refused and a move drops its
+  entry.
+- Stores are tried in order, for lookups and for placement. A full store frees its least recently used entries, and
+  each goes on to the next store that takes it (a block-to-block move), or is dropped. Rank 0 logs, at most once a
+  minute, what a store did once it fills, passes entries on, drops or refuses them; `status.s2` carries each store's
+  pages and bytes spilled, moved in and out, restored, dropped and refused, and the front ends export them as
+  `g6:kv_store_*{store="i"}`.
+- A hit on an evicted run takes it out of its store, and a hit on a prefix leaves it there. A stored hit wins only when
+  it reuses more rows than the pool can.
+
+### The policies on agent traffic (kvman-sim)
+
+`kvman-sim` runs the pool and the stores' own code (src/stash.rs) over the opencode captures with the engine's time
+model (prefill 1,300 tok/s, decode 30/51.5/64.4 tok/s for 1/2/4 sessions, SSD 5.7 GB/s write, 7.0 read, every drain on
+everyone's critical path), runs growing on demand. Traces: `sim/traces/before.csv` (4 agents, which fit the pool),
+`agents8.csv` (the 8-agent replay: both captures at once) and `agents8.csv --repeat 4 --stagger 300` (32 agents in other
+folders: each copy shares the 7.4K tokens every span shares). Writes are per rank. `grow` has no store.
+
+| 4 agents | TTFT p50 / p90 s | prefilled tokens | written GB/h | read GB |
+|---|---|---|---|---|
+| grow | 4.1 / 25.3 | 285,008 | 0 | 0 |
+| evicted (#37) | 4.0 / 20.8 | 252,240 | 107.8 | 1.8 |
+| all | 4.0 / 20.8 | 252,240 | 92.5 | 1.8 |
+| sessions | 3.9 / 20.7 | 252,240 | 47.7 | 1.8 |
+| system | 4.1 / 20.6 | 272,720 | 3.9 | 0.7 |
+
+| 8 agents | TTFT p50 / p90 s | prefilled tokens | written GB/h | read GB |
+|---|---|---|---|---|
+| grow | 197 / 615 | 2,578,825 | 0 | 0 |
+| evicted (#37) | 123 / 511 | 539,017 | 143.5 | 123.0 |
+| evicted + prefix bases | 123 / 511 | 539,017 | 125.1 | 116.9 |
+| all | 123 / 511 | 539,017 | 109.6 | 118.9 |
+| sessions | 143 / 541 | 977,289 | 61.2 | 96.7 |
+| system, N = 1 / 2 / 3 | 154 / 584, 160 / 584, 174 / 584 | 1.76M / 1.82M / 1.89M | 4.0 / 4.4 / 3.9 | 56 / 51 / 46 |
+| system, no span (grid cells) | 143 / 523 | 788,873 | 41.6 | 107.0 |
+| all, write limit 0.25 | 143 / 603 | 1,780,105 | 25.7 | 46.7 |
+
+| 32 agents, 200 GB store | TTFT p50 / p90 s | prefilled tokens | written GB/h | read GB |
+|---|---|---|---|---|
+| grow | 1,333 / 2,285 | 11.5M | 0 | 0 |
+| evicted (#37) | 914 / 1,770 | 2.07M | 153.6 | 580 |
+| all | 914 / 1,767 | 2.09M | 109.1 | 564 |
+| sessions | 1,029 / 1,812 | 4.07M | 62.8 | 465 |
+| system | 1,232 / 2,104 | 8.21M | 4.3 | 240 |
+| sessions, write limit 0.25 | 1,177 / 2,018 | 7.38M | 20.8 | 277 |
+
+With a 29 GB store (what the testers ran) the 8-agent numbers are the same, and at 32 agents `all` falls to 1,241 /
+2,242 s and `sessions` to 1,181 / 2,077 s: the store turns over before the agents come back.
+
+- With the agents inside the pool, every policy that stores evictions writes 50-110 GB/h per rank for one restore: what
+  the testers saw (~22 MiB/s a node). `system` writes 4 GB/h and loses nothing measurable.
+- With more agents than the pool holds, storing sessions pays: `all` cuts TTFT 30-40% and prefill 80% against no
+  store, `sessions` most of that for half the writes, `system` 8-19% for 4 GB/h.
+- N barely matters (2 is the default): one agent's span counts once however long its chat.
+- Prefix bases save 13% of `evicted`'s writes; under `all` and `sessions` the stored system prefix already does it.
+- Without the span, grid-cell counting stores agents' own histories (a turn that does not continue its previous
+  prompt counts as a new conversation): better TTFT than `system` but ten times the writes. That is `sessions`'s job.
+
+So `system` stays the default, and `sessions` (with a big store) is for agent fleets larger than the KV pool.
+
+### A run's tail past R
+
+Past R each rank holds every nr-th logical page of the attention caches (its shard, at physical pages R/64 + j), and
+every logical page of the indexer keys and of the bindings that are not sharded (the MTP layer). #37 stored only a run's
+pages below R, so a 94K-token session restored 65,536 rows and prefilled the rest (~22 of 26.2 s TTFT, reported by
+testers). Now each rank's own store keeps the tail too: ceil(T / nr) blocks of its shard, and the T logical pages'
+replicated parts packed into blocks (15 a block for the full GLM 5.3: 22 x 8,448 B of indexer keys and 41,984 B of the
+MTP layer each). Every rank queues the same copies and the same slots; the bytes in them are each rank's own. A tail
+goes back only into a run past R, whole, before the prefill writes the rows past the hit. It is on when the pool's R is
+the CP map's (`G6_S2_BELOW` = `G6_CP_R`, the default). The blocks of a tail differ by rank by design, so a store shared
+by the ranks would have to leave tails out.
 
 ### Lock-step
 
@@ -188,12 +265,13 @@ On the device a page block is one pool page of every layer binding, main model t
 (`engine/runtime/s2/kv_tier.cuh`). The staging memory is registered with the RDMA device, so a KV node reads and writes
 it directly.
 
-### Persistence (SSD tiers, shared prefixes)
+### Persistence (SSD stores: prefixes and counts)
 
-An SSD tier with `--set-id` (the launcher always passes the model id) keeps an index beside its blocks. The header names
+An SSD store with `--set-id` (the launcher always passes the model id) keeps an index beside its blocks. The header names
 what makes blocks compatible: the model id, TP, R, the pool's placement pages, the grid, the page block's size and
-layout, and the tier's size. Another header starts the index empty. Records are add (an entry: id, key, tokens, valid
-rows, slots) and drop (an id), each with a length and a checksum, synced as they are written. The engine writes an
+layout, and the store's size. Another header starts the index empty. Records are add (an entry: id, key, tokens, valid
+rows, slots), drop (an id) and count (a prefix's count; the first SSD store's index holds the table), each with a
+length and a checksum, synced as they are written (the counts of an admission at its drain). The engine writes an
 entry's blocks before `io_done` appends its add record. A drop record is synced before the entry's slots can be reused.
 A record that fails its checksum ends the log, and the file is cut there, so a torn write never names blocks that hold
 anything else. Entries load in commit order. After boot, every worker sends the head its loaded entries. The head keeps

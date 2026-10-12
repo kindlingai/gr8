@@ -100,13 +100,19 @@ int g6kv_tier_policy(g6kv_pool* p, uint32_t t, uint64_t min_rows, uint32_t min_h
 // the write limit: all tiers write at most milli / 1000 blocks per page of KV computed (0 = none)
 void g6kv_write_limit(g6kv_pool* p, uint64_t milli);
 // one copy: kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's slot -> page).
-// An earlier copy of the list can write the block a later one reads: an engine that runs copies together keeps that
-// order.
+// part 0: the whole page block of pool page `page`. Past R (g6kv_tail): 1 = this rank's shard of the attention caches at
+// physical page `page`; 2 = logical page `page`'s replicated parts (indexer keys, unsharded bindings), the sub-th of the
+// block's per_slot. An earlier copy of the list can write the block a later one reads: an engine that runs copies
+// together keeps that order.
 struct g6kv_io
 {
     uint32_t kind, page, tier, to;
     uint64_t slot, to_slot;
+    uint32_t part, sub;
 };
+// runs past R keep their tails: nr ranks share the attention caches past R, a block holds per_slot logical pages'
+// replicated parts. After g6kv_stores
+void g6kv_tail(g6kv_pool* p, uint32_t nr, uint32_t per_slot);
 size_t g6kv_io_pending(const g6kv_pool* p);
 // takes every queued copy into out. out holds cap entries, at least g6kv_io_pending.
 int g6kv_io_take(g6kv_pool* p, g6kv_io* out, size_t cap);

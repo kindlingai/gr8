@@ -36,7 +36,8 @@
 // [--spec-adaptive [--spec-levels 1,2,4]]  as g6m4 (needs --mtp, no --s2): the drafts each round verifies (spec_len.h)
 // With --reuse-prefix, before each hit's prefill (s2/kv_tier.cuh):
 //   G6_KV_TIER_CHECK=STORE (mem:, ssd:PATH, remote:HOST:PORT): every rank's reused pages go to a block store, are
-//        poisoned, and come back. The lines printed must be the run's without it.
+//        poisoned, and come back. The lines printed must be the run's without it. Past G6_CP_R the reused rows go as the
+//        pool stores a run's tail: each rank's shard of the attention caches, and every logical page's replicated parts
 //   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
 #include <algorithm>
 #include <chrono>
@@ -74,9 +75,42 @@ static void kv_tier_check(std::vector<Model>& R, std::vector<Draft>& DR, int n, 
         if (tiers.size() <= r)
         {
             tiers.emplace_back(new g6s2::KvTiers(bs));
-            tiers.back()->add(spec ? spec : "mem:", "m4sim-r" + std::to_string(r), uint64_t(cap / 64 + 1) << 22);   // 4 MiB a page block
+            tiers.back()->add(spec ? spec : "mem:", "m4sim-r" + std::to_string(r), uint64_t(cap / 64 + 2) << 22);   // 4 MiB a page block
         }
         g6s2::KvTiers& t = *tiers[r];
+        // past R: the copies the pool queues for a run's tail (kvman-rs stash.rs Part), through the store and back
+        const int bp = R[r].cp.on ? R[r].cp.R / 64 : n, nr = g6nr::NR;
+        const uint32_t per = t.blocks().per_slot();
+        if (spec && n > bp && per)
+        {
+            std::vector<g6kv_io> out, in;
+            uint64_t slot = 0;
+            for (int p = 0; p < bp; ++p) out.push_back(g6kv_io{0, (uint32_t)p, 0, 0, slot++, 0, 0, 0});
+            const int tail = n - bp, own = (tail + nr - 1) / nr;
+            for (int j = 0; j < own; ++j) out.push_back(g6kv_io{0, (uint32_t)(bp + j), 0, 0, slot++, 0, 1, 0});
+            for (int i = 0; i < tail; ++i) out.push_back(g6kv_io{0, (uint32_t)(bp + i), 0, 0, slot + i / per, 0, 2, i % per});
+            // G6_KV_TIER_CHECK_DROP=PART (0, 1 or 2): those copies do not come back (the check must then see the poison)
+            const int drop = getenv("G6_KV_TIER_CHECK_DROP") ? atoi(getenv("G6_KV_TIER_CHECK_DROP")) : -1;
+            for (g6kv_io x : out) if ((int)x.part != drop) { x.kind = 2; in.push_back(x); }
+            t.run(out, st);
+            for (const G6AttnBinding* b : bs)   // poison what the copies hold: every page they name, as each part reads it
+            {
+                const int phys = b->args.page_count, logical = b->args.cp_nr ? b->args.table_size : b->args.page_count;
+                for (const g6kv_io& x : out)
+                {
+                    const bool mla = x.part == 0 || (x.part == 1 && b->args.cp_nr && (int)x.page < phys) || (x.part == 2 && !b->args.cp_nr);
+                    if (mla) G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)x.page * 64 * 656, 0x7f, 64 * 656, st));
+                    if (b->args.index_cache && (x.part == 0 || x.part == 2) && (int)x.page < logical)
+                        G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)x.page * 64 * 132, 0x7f, 64 * 132, st));
+                }
+            }
+            G6RT_CK(cudaStreamSynchronize(st));
+            t.run(in, st);
+            if (r == 0)
+                fprintf(stderr, "# kv tier check: past R, %d pages: %d below, %d of this rank's shard, %d replicated (%u a block)\n", n, bp,
+                        own, tail, per);
+            continue;
+        }
         if (getenv("G6_KV_RANKS_CMP"))
             for (size_t i = 0; i < pages.size(); i += t.blocks().batch())
             {

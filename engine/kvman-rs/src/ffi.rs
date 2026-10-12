@@ -3,7 +3,7 @@
 
 use crate::pool::{Error, Pool, Run, Stats};
 use crate::reuse::{Finished, Rules};
-use crate::stash::{Io, Keep, Policy, TierStats};
+use crate::stash::{Io, Keep, Part, Policy, TierStats};
 use std::ffi::c_char;
 use std::ffi::CStr;
 
@@ -397,7 +397,8 @@ pub unsafe extern "C" fn g6kv_write_limit(p: *mut Pool, milli: u64) {
 }
 
 /// g6kv_io: one copy. kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's
-/// slot -> page).
+/// slot -> page). part (stash.rs Part): 0 = the whole page block, 1 = past R, this rank's shard at physical page `page`,
+/// 2 = past R, logical page `page`'s replicated parts, the sub-th in the block.
 #[repr(C)]
 pub struct G6kvIo {
     pub kind: u32,
@@ -406,6 +407,26 @@ pub struct G6kvIo {
     pub to: u32,
     pub slot: u64,
     pub to_slot: u64,
+    pub part: u32,
+    pub sub: u32,
+}
+
+fn part_code(p: Part) -> (u32, u32) {
+    match p {
+        Part::Full => (0, 0),
+        Part::Own => (1, 0),
+        Part::Rep(i) => (2, i),
+    }
+}
+
+/// Runs past R keep their tails in the stores: nr ranks share the attention cache past R, and a block holds per_slot
+/// logical pages' replicated parts (the engine's page block layout). After g6kv_stores.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tail(p: *mut Pool, nr: u32, per_slot: u32) {
+    (*p).tail(nr, per_slot);
 }
 
 /// Copies queued since the last g6kv_io_take.
@@ -430,9 +451,17 @@ pub unsafe extern "C" fn g6kv_io_take(p: *mut Pool, out: *mut G6kvIo, cap: usize
     }
     for (i, x) in p.io().into_iter().enumerate() {
         *out.add(i) = match x {
-            Io::Spill { tier, page, slot } => G6kvIo { kind: 0, page, tier, to: 0, slot, to_slot: 0 },
-            Io::Move { tier, slot, to, to_slot } => G6kvIo { kind: 1, page: 0, tier, to, slot, to_slot },
-            Io::Restore { tier, slot, page } => G6kvIo { kind: 2, page, tier, to: 0, slot, to_slot: 0 },
+            Io::Spill { tier, page, slot, part } => {
+                let (part, sub) = part_code(part);
+                G6kvIo { kind: 0, page, tier, to: 0, slot, to_slot: 0, part, sub }
+            }
+            Io::Move { tier, slot, to, to_slot } => {
+                G6kvIo { kind: 1, page: 0, tier, to, slot, to_slot, part: 0, sub: 0 }
+            }
+            Io::Restore { tier, slot, page, part } => {
+                let (part, sub) = part_code(part);
+                G6kvIo { kind: 2, page, tier, to: 0, slot, to_slot: 0, part, sub }
+            }
         };
     }
     0

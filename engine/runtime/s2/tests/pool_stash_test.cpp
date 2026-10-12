@@ -48,13 +48,19 @@ struct Rank {
         // the policies --kv-keep sessions and --kv-write-limit set, through the C interface
         pool.policy(1, 0, 1, sizeof(Page));
         pool.write_limit(500);
+        // runs past R keep their tails. One rank's model: its shard is every page past R and a block holds one page's
+        // replicated parts, so each part is the whole page again
+        pool.tail(1, 1);
         for (auto& p : dev) p.fill(-1);
     }
     // the engine's part: every copy, in order, then io_done
+    long tail_spills = 0, tail_restores = 0;
     std::vector<g6kv_io> run_io() {
         const auto io = pool.io();
         bool restoring = false;
         for (const auto& x : io) {
+            require(x.part <= 2 && (x.part == 2 || x.sub == 0) && (x.part != 2 || x.sub < 1), "a copy's part");
+            if (x.part) ++(x.kind == 0 ? tail_spills : tail_restores);
             if (x.kind == 0) {
                 require(!restoring, "a spill after a restore");
                 Tier& t = *tiers.at(x.tier);
@@ -87,7 +93,7 @@ int main(int argc, char** argv)
     std::vector<const char*> specs(argv + 1, argv + argc);
     if (specs.empty()) specs.push_back("mem:");
     for (const char* spec : specs) {
-        long hits = 0, stored = 0, spills = 0, moves = 0, pending = 0, counted = 0;
+        long hits = 0, stored = 0, spills = 0, moves = 0, pending = 0, counted = 0, tail_out = 0, tail_back = 0;
         for (uint64_t seed = 1; seed <= 25; ++seed) {
             Rng rng{seed * 7907};
             const uint32_t pages = rng.range(6, 30), place = rng.one_in(2) ? pages : rng.range(4, pages);
@@ -162,18 +168,21 @@ int main(int argc, char** argv)
                 }
                 CHECK(got[0] == got[1] && digests[0] == digests[1] && ends[0] == ends[1] && ios[0].size() == ios[1].size());
                 for (size_t i = 0; i < ios[0].size() && i < ios[1].size(); ++i)
-                    CHECK(ios[0][i].kind == ios[1][i].kind && ios[0][i].page == ios[1][i].page && ios[0][i].slot == ios[1][i].slot);
+                    CHECK(ios[0][i].kind == ios[1][i].kind && ios[0][i].page == ios[1][i].page && ios[0][i].slot == ios[1][i].slot &&
+                          ios[0][i].part == ios[1][i].part && ios[0][i].sub == ios[1][i].sub);
                 for (const auto& x : ios[0]) { spills += x.kind == 0; moves += x.kind == 1; }
                 hits += h.skip > 0; stored += h.stored;
                 tokens.resize(ends[0]);
                 live.push_back(Live{got[0], tokens});
             }
             CHECK(ranks[0].pool.tiers().size() == 2);
+            CHECK(ranks[0].tail_spills == ranks[1].tail_spills && ranks[0].tail_restores == ranks[1].tail_restores);
+            tail_out += ranks[0].tail_spills; tail_back += ranks[0].tail_restores;
         }
         const uint64_t seed = 0;
-        CHECK(stored > 10 && spills > 50 && moves > 10 && pending > 0 && counted > 10);
-        std::printf("pool_stash_test %s: %ld hits (%ld stored), %ld spills, %ld moves, %ld counted, %ld refused claims\n", spec, hits,
-                    stored, spills, moves, counted, pending);
+        CHECK(stored > 10 && spills > 50 && moves > 10 && pending > 0 && counted > 10 && tail_out > 0);
+        std::printf("pool_stash_test %s: %ld hits (%ld stored), %ld spills, %ld moves, %ld counted, %ld refused claims, %ld tail "
+                    "copies out and %ld back\n", spec, hits, stored, spills, moves, counted, pending, tail_out, tail_back);
     }
     std::printf("pool_stash_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
