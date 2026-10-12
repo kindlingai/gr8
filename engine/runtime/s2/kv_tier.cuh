@@ -140,6 +140,13 @@ public:
             const uint32_t kind = io[i].kind;
             std::vector<int> pages; std::vector<uint32_t> from, to; std::vector<uint64_t> slots, to_slots;
             while (i < io.size() && io[i].kind == kind && (int)pages.size() < pb_.batch()) {
+                // an entry passed on twice in one call: the first move writes a block, then the second move reads it. A
+                // batch reads before it writes, so the second move starts the next batch
+                if (kind == 1) {
+                    bool dep = false;
+                    for (size_t j = 0; j < pages.size() && !dep; ++j) dep = to[j] == io[i].tier && to_slots[j] == io[i].slot;
+                    if (dep) break;
+                }
                 pages.push_back((int)io[i].page); from.push_back(io[i].tier); to.push_back(io[i].to);
                 slots.push_back(io[i].slot); to_slots.push_back(io[i].to_slot); ++i;
             }

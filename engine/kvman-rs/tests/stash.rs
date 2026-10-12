@@ -27,6 +27,7 @@ impl Rng {
 
 const ROWS: usize = PAGE as usize;
 const GRID: i32 = 128;
+const BATCH: usize = 32;
 type Page = [i32; ROWS];
 
 /// One rank: its pool, its device pages and each tier's blocks.
@@ -67,14 +68,39 @@ impl Rank {
         }
         let first_restore = io.iter().position(|x| matches!(x, Io::Restore { .. })).unwrap_or(io.len());
         assert!(io[first_restore..].iter().all(|x| matches!(x, Io::Restore { .. })), "a copy after a restore");
-        for x in &io {
-            match *x {
-                Io::Spill { tier, page, slot } => self.tiers[tier as usize][slot as usize] = self.dev[page as usize],
-                Io::Move { tier, slot, to, to_slot } => {
-                    assert!(to > tier, "a move goes to a later tier");
-                    self.tiers[to as usize][to_slot as usize] = self.tiers[tier as usize][slot as usize];
+        // as the engine runs them (s2/kv_tier.cuh KvTiers::run): batches of up to 32 copies of one kind, a batch's reads
+        // before its writes, and a batch of moves ends before a move that reads a block the batch writes
+        let mut i = 0;
+        while i < io.len() {
+            let kind = std::mem::discriminant(&io[i]);
+            let mut batch: Vec<Io> = Vec::new();
+            while i < io.len() && std::mem::discriminant(&io[i]) == kind && batch.len() < BATCH {
+                if let Io::Move { tier, slot, .. } = io[i] {
+                    if batch.iter().any(|b| matches!(*b, Io::Move { to, to_slot, .. } if (to, to_slot) == (tier, slot)))
+                    {
+                        break;
+                    }
                 }
-                Io::Restore { tier, slot, page } => self.dev[page as usize] = self.tiers[tier as usize][slot as usize],
+                batch.push(io[i]);
+                i += 1;
+            }
+            let reads: Vec<Page> = batch
+                .iter()
+                .map(|x| match *x {
+                    Io::Spill { page, .. } => self.dev[page as usize],
+                    Io::Move { tier, slot, to, .. } => {
+                        assert!(to > tier, "a move goes to a later tier");
+                        self.tiers[tier as usize][slot as usize]
+                    }
+                    Io::Restore { tier, slot, .. } => self.tiers[tier as usize][slot as usize],
+                })
+                .collect();
+            for (x, data) in batch.iter().zip(reads) {
+                match *x {
+                    Io::Spill { tier, slot, .. } => self.tiers[tier as usize][slot as usize] = data,
+                    Io::Move { to, to_slot, .. } => self.tiers[to as usize][to_slot as usize] = data,
+                    Io::Restore { page, .. } => self.dev[page as usize] = data,
+                }
             }
         }
         self.pool.io_done().unwrap();
@@ -123,7 +149,11 @@ fn restored_rows_hold_the_prompt_and_ranks_agree() {
         let pages = rng.range(12, 48) as u32;
         let place = if rng.one_in(2) { pages } else { rng.range(8, pages as u64) as u32 };
         let below = rng.range(4, place as u64) as u32 * PAGE as u32;
-        let tiers = [(rng.range(2, 12), Keep::Evicted), (rng.range(4, 40), Keep::All)];
+        // every second seed adds a middle tier. A full middle tier can pass on an entry in the call that brought it in
+        let mut tiers = vec![(rng.range(2, 12), Keep::Evicted), (rng.range(4, 40), Keep::All)];
+        if seed % 2 == 0 {
+            tiers.insert(1, (rng.range(2, 10), Keep::Evicted));
+        }
         let after = rng.range(2, 3) as u32;
         let mut ranks = [Rank::new(pages, place, below, &tiers, after), Rank::new(pages, place, below, &tiers, after)];
         // a few system prompts that many conversations start with

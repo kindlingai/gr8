@@ -92,7 +92,9 @@ void g6kv_stores(g6kv_pool* p, uint32_t shared_after);
 int g6kv_add_tier(g6kv_pool* p, uint64_t slots, int32_t keep, const char* index_dir, const char* compat);
 // at admission, before the grant, on every rank: counts the prompt toward its prefixes and returns how many
 uint32_t g6kv_count(g6kv_pool* p, const int32_t* prompt, size_t n);
-// one copy: kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's slot -> page)
+// one copy: kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's slot -> page).
+// An earlier copy of the list can write the block a later one reads: an engine that runs copies together keeps that
+// order.
 struct g6kv_io
 {
     uint32_t kind, page, tier, to;
