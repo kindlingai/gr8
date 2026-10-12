@@ -37,6 +37,7 @@ k_pair_add_norm(RsNormArgs a, const __nv_bfloat16* mine, int peer, bool mine_lo)
         glue::bf16x8_to_f(__ldcv(reinterpret_cast<const uint4*>(hi + off)), b);
         #pragma unroll
         for (int k = 0; k < 8; ++k) x[k] += b[k];
+        glue::cluster_project(x, a.steer, m, col0);
         float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);
         const float4 r0 = r[0], r1 = r[1];
         x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
@@ -410,11 +411,13 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
     pf_mark(3, st);
 }
 // the c0 consume after pf_attn_block_qp: the counterpart's partial of the owner rows, then the pair norm and c1 publish
-inline void pf_qp_norm(Prefill& P, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
+inline void pf_qp_norm(Prefill& P, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st,
+                       glue::SteerArgs steer = {})
 {
     const int cp = P.f.rank ^ 2, rows = pf_rows(M, P.f.rank, P.f.nr);
     k_wait_rs1<<<1, 32, 0, st>>>(P.f, P.stepp, 0, M, P.loop, cp);
     RsNormArgs a{P.f, P.stepp, 0, M, P.loop, P.resid, w, out, glue::RMS_EPS, P.tickets + 1};
+    a.steer = steer;
     k_pair_add_norm<<<dim3(glue::RN_CL, rows > 0 ? rows : 1), glue::RN_T, 0, st>>>(a, P.qp_mine, cp, (P.f.rank >> 1) == pair_lo(P.qp_pend));
     P.qp_pend = -1;
 }

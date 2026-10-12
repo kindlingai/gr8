@@ -88,3 +88,15 @@ if nvidia-smi -L > /dev/null 2>&1; then
 else
   echo "tr3_e4m3_test: no GPU visible, not run"
 fi
+
+# General steering projection/consume fixtures: compile in CI even without a GPU. No model or fabric service needed.
+for test in steering_cuda_test steering_consume_test; do
+  # shellcheck disable=SC2086
+  nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} \
+    $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 -o "$OUT/$test" "$REPO/engine/runtime/tests/$test.cu" -lcublas
+  if nvidia-smi -L > /dev/null 2>&1; then
+    "$OUT/$test"
+  else
+    echo "$test: compiled; no GPU visible, not run"
+  fi
+done

@@ -178,6 +178,7 @@ struct RsNormArgs
     float eps;
     unsigned* ticket;             // of collective c + 1
     bool ag = true;               // false: no AG rows and no doorbell of c + 1 (G6_PF_OWN sends records there instead)
+    glue::SteerArgs steer{};
 };
 // grid (RN_CL, max(rows, 1)), block RN_T: k_ar_add_norm on this rank's rows (same op order), the normed row also
 // into the send slot of collective c + 1 (row j of the rank at j * 6144), then the doorbell of c + 1
@@ -199,6 +200,7 @@ __global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T
             #pragma unroll
             for (int k = 0; k < 8; ++k) x[k] += b[k];
         }
+        glue::cluster_project(x, a.steer, m, col0);
         float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);
         const float4 r0 = r[0], r1 = r[1];
         x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
@@ -224,7 +226,7 @@ __global__ void __launch_bounds__(glue::RN_CL * glue::RN_T) k_rs_add_norm_w(RsNo
 {
     constexpr int NW = glue::RN_CL * glue::RN_T / 32, WPC = glue::RN_T / 32;
     __shared__ float wsum[NW];
-    __shared__ float s_inv;
+    __shared__ float s_inv, s_kappa;
     const u64 step = *a.stepp;
     const int j = blockIdx.x;
     if (j < pf_rows(a.M, a.f.rank, a.f.nr))
@@ -259,6 +261,37 @@ __global__ void __launch_bounds__(glue::RN_CL * glue::RN_T) k_rs_add_norm_w(RsNo
             for (int k = 0; k < 8; ++k) x[k] += b[k];
         }
 #endif
+        const float scale = a.steer.row_scale ? a.steer.row_scale[m] : a.steer.scale;
+        if (a.steer.dir && scale != 0.f && a.steer.alpha != 0.f)
+        {
+            const float4 r0 = *reinterpret_cast<const float4*>(a.steer.dir + col0);
+            const float4 r1 = *reinterpret_cast<const float4*>(a.steer.dir + col0 + 4);
+            const float r[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+            float dot = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) dot = fmaf(x[k], r[k], dot);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = dot;
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                float total = 0.f;
+                #pragma unroll
+                for (int c = 0; c < glue::RN_CL; ++c)
+                {
+                    float t = 0.f;
+                    #pragma unroll
+                    for (int i = 0; i < WPC; ++i) t += wsum[c * WPC + i];
+                    total += t;
+                }
+                s_kappa = (scale * a.steer.alpha) * total;
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) x[k] -= s_kappa * r[k];
+            __syncthreads();
+        }
         float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);
         const float4 r0 = r[0], r1 = r[1];
         x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
@@ -315,6 +348,7 @@ __global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T
         const float4* ov = reinterpret_cast<const float4*>(o + (size_t)j * HID + col0);
         const float4 o0 = ov[0], o1 = ov[1];
         float x[8] = {o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w};
+        glue::cluster_project(x, a.steer, m, col0);
         float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);
         const float4 r0 = r[0], r1 = r[1];
         x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
@@ -1024,6 +1058,12 @@ inline void pf_adump(const Prefill& P, int i, const char* what, const void* dev,
     if (!o || fwrite(h.data(), 1, h.size(), o) != h.size()) die("G6_PF_ADUMP: cannot write " + f);
     fclose(o);
 }
+inline glue::SteerArgs pf_steer(const Model& m, const Prefill& P, int i, bool attention)
+{
+    if (i < 0 || i >= (int)m.steering_dir.size() ||
+        (!attention && m.steering_scope == steering::Scope::Shared && m.layers[i].moe)) return {};
+    return {m.steering_dir[i], nullptr, P.steering_scale, m.steering_alpha[i]};
+}
 #if G6_NR == 4
 #include "qp.cuh"
 #else
@@ -1031,7 +1071,7 @@ inline void pf_qp_alloc(Prefill&, Model&, int, const g6::FabricDev&, Prefill*) {
 inline void pf_qp_states(Prefill&, Model&, cudaStream_t, Prefill*) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
 inline void pf_qp_warm(Model&, Prefill&, cudaStream_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
 inline void pf_attn_block_qp(Model&, Prefill&, int, int, int, cudaStream_t, cudaEvent_t, cudaEvent_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
-inline void pf_qp_norm(Prefill&, int, const __nv_bfloat16*, __half*, cudaStream_t) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
+inline void pf_qp_norm(Prefill&, int, const __nv_bfloat16*, __half*, cudaStream_t, glue::SteerArgs = {}) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); }
 inline bool pf_qp_select(Prefill&, Prefill*, int, int) { die("G6_PF_OWN=4 is TP4 only (G6_NR=4)"); return false; }
 inline int pf_qp_min() { return 0; }
 #endif
@@ -1138,6 +1178,7 @@ inline void pf_attn_block_qo(Model& m, Prefill& P, int i, int M, int context, cu
     if (qp) Q.tick(st, i, 6);
     pf_mark(2, st);
     RsNormArgs a{P.f, P.stepp, 0, M, P.loop, P.resid, y.mlp_norm, P.x2, glue::RMS_EPS, P.tickets + 1};
+    a.steer = pf_steer(m, P, i, true);
     k_own_add_norm<<<dim3(glue::RN_CL, Ro > 0 ? Ro : 1), glue::RN_T, 0, st>>>(a, P.qo_o);
     if (qp) Q.tick(st, i, 7);
     pf_mark(4, st);
@@ -1223,13 +1264,15 @@ inline void pf_attn_block(Model& m, Prefill& P, int i, int M, int context, cudaS
     pf_mark(3, st);
 }
 // RS form in two halves (a loopback driver delivers collective 2c + 1 between them): owner rows, then the gather
-inline void pf_consume_rs(Prefill& P, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st, bool ag = true)
+inline void pf_consume_rs(Prefill& P, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st, bool ag = true,
+                          glue::SteerArgs steer = {})
 {
-    if (c == 0 && P.qp_pend >= 0) { pf_qp_norm(P, M, w, out, st); return; }   // G6_PF_OWN=4: the pair norm (qp.cuh)
+    if (c == 0 && P.qp_pend >= 0) { pf_qp_norm(P, M, w, out, st, steer); return; }   // G6_PF_OWN=4: pair norm (qp.cuh)
     const int cr = 2 * c, rows = pf_rows(M, P.f.rank, P.f.nr);
     k_wait_rs<<<1, 32, 0, st>>>(P.f, P.stepp, cr, M, P.loop);
     RsNormArgs a{P.f, P.stepp, cr, M, P.loop, P.resid, w, out, glue::RMS_EPS, P.tickets + cr + 1};
     a.ag = ag;
+    a.steer = steer;
 #ifdef PF_RNWIDE
     k_rs_add_norm_w<<<rows > 0 ? rows : 1, glue::RN_CL * glue::RN_T, 0, st>>>(a);
 #else
@@ -1240,7 +1283,8 @@ inline void pf_consume_ag(Prefill& P, int c, int M, __half* out, cudaStream_t st
 {
     pf_ag(P.f, P.stepp, 2 * c + 1, M, HID * 2, reinterpret_cast<char*>(out), st);
 }
-inline void pf_consume(Prefill& P, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
+inline void pf_consume(Prefill& P, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st,
+                       glue::SteerArgs steer = {})
 {
     pf_mark(7, st);
     if (P.qo && c == 0)          // G6_PF_OWN=3: the owner normed its rows in pf_attn_block_qo; only the c1 gather
@@ -1251,12 +1295,13 @@ inline void pf_consume(Prefill& P, int c, int M, const __nv_bfloat16* w, __half*
     }
     if (P.rs)
     {
-        pf_consume_rs(P, c, M, w, out, st);
+        pf_consume_rs(P, c, M, w, out, st, true, steer);
         pf_consume_ag(P, c, M, out, st);
         pf_mark(4, st);
         return;
     }
     glue::ArNormArgs a{P.f, P.stepp, c, M, P.resid, w, out, glue::RMS_EPS};
+    a.steer = steer;
     glue::k_wait_peers<<<1, 32, 0, st>>>(P.f, P.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
     pf_mark(4, st);
@@ -1269,7 +1314,7 @@ inline OwnRec pf_own_rec(Prefill& P) { return OwnRec{P.q_a_n, P.kv_a, P.idx_k, P
 inline void pf_consume_x_rs(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
     const bool own = pf_own_next(m, P, i);
-    pf_consume_rs(P, 1, M, norm_after(m, i), P.x, st, !own);
+    pf_consume_rs(P, 1, M, norm_after(m, i), P.x, st, !own, pf_steer(m, P, i, false));
     if (!own) return;
     pf_mark(4, st);
     const int r0 = pf_r0(M, P.f.rank, P.f.nr), rows = pf_rows(M, P.f.rank, P.f.nr);
@@ -1296,7 +1341,7 @@ inline void pf_consume_x_ag(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 }
 inline void pf_consume_x(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
-    if (!P.rs) { pf_consume(P, 1, M, norm_after(m, i), P.x, st); return; }
+    if (!P.rs) { pf_consume(P, 1, M, norm_after(m, i), P.x, st, pf_steer(m, P, i, false)); return; }
     pf_mark(7, st);
     pf_consume_x_rs(m, P, i, M, st);
     pf_consume_x_ag(m, P, i, M, st);
@@ -1467,7 +1512,7 @@ inline void pf_step(Model& m, Prefill& P, int M, int context, u64 ls0, cudaStrea
         pf_attn_block(m, P, i, M, context, st);
         cp_pf_prefetch(m, i, context - M, st);
         cp_pf_post(m, i, context - M, M, 0, 0, st);
-        pf_consume(P, 0, M, m.layers[i].mlp_norm, P.x2, st);
+        pf_consume(P, 0, M, m.layers[i].mlp_norm, P.x2, st, pf_steer(m, P, i, true));
         pf_mlp_block(m, P, i, M, st);
         pf_consume_x(m, P, i, M, st);
         if (P.dfl_tap) P.dfl_tap(m, P, i, M, st);
@@ -1496,9 +1541,9 @@ inline void pf_step2(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA,
         pf_set_step(B, lsB + i, st);
         pf_attn_block(m, B, i, MB, ctxB, st);
         cp_pf_post(m, i, ctxA - MA, MA, ctxB - MB, MB, st);
-        pf_consume(A, 0, MA, m.layers[i].mlp_norm, A.x2, st);
+        pf_consume(A, 0, MA, m.layers[i].mlp_norm, A.x2, st, pf_steer(m, A, i, true));
         pf_mlp_block(m, A, i, MA, st);
-        pf_consume(B, 0, MB, m.layers[i].mlp_norm, B.x2, st);
+        pf_consume(B, 0, MB, m.layers[i].mlp_norm, B.x2, st, pf_steer(m, B, i, true));
         pf_mlp_block(m, B, i, MB, st);
         pf_consume_x(m, A, i, MA, st);
         if (A.dfl_tap) A.dfl_tap(m, A, i, MA, st);
@@ -1567,7 +1612,7 @@ inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA
         cp_pf_pre(m, i, ctxA - MA, sa);
         pf_attn_block(m, A, i, MA, ctxA, sa, false, i > 0 ? L.eb[i - 1] : nullptr, L.ea[i]);
         cp_pf_prefetch(m, i, ctxA - MA, sa);
-        pf_consume(A, 0, MA, m.layers[i].mlp_norm, A.x2, sa);
+        pf_consume(A, 0, MA, m.layers[i].mlp_norm, A.x2, sa, pf_steer(m, A, i, true));
         pf_mlp_block(m, A, i, MA, sa);
         pf_consume_x(m, A, i, MA, sa);
         if (A.dfl_tap) A.dfl_tap(m, A, i, MA, sa);
@@ -1575,7 +1620,7 @@ inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA
         pf_set_step(B, lsB + i, sb);
         pf_attn_block(m, B, i, MB, ctxB, sb, false, L.ea[i], L.eb[i]);
         cp_pf_post(m, i, ctxA - MA, MA, ctxB - MB, MB, sb);   // after B: A's rows are in the pool (B waited A.ea[i])
-        pf_consume(B, 0, MB, m.layers[i].mlp_norm, B.x2, sb);
+        pf_consume(B, 0, MB, m.layers[i].mlp_norm, B.x2, sb, pf_steer(m, B, i, true));
         pf_mlp_block(m, B, i, MB, sb);
         pf_consume_x(m, B, i, MB, sb);
         if (B.dfl_tap) B.dfl_tap(m, B, i, MB, sb);

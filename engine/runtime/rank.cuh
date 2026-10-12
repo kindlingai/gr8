@@ -291,6 +291,9 @@ struct Model
     unsigned* tickets = nullptr;      // [2*nl+1] publish tickets, device, zero
     float* resid = nullptr;           // [MX][6144]
     float* steering_scale = nullptr;  // [MX], refreshed by the existing k_step_in launch
+    std::vector<const float*> steering_dir; // [nl], empty until verified boot activation
+    std::vector<float> steering_alpha;      // [nl], immutable profile alphas
+    steering::Scope steering_scope = steering::Scope::Full;
     __half *x = nullptr, *x2 = nullptr, *q_a = nullptr, *q_a_n = nullptr, *kv_a = nullptr, *q_b = nullptr;
     __half *idx_q = nullptr, *idx_k = nullptr, *idx_w = nullptr;
     float *logits = nullptr, *hlog = nullptr, *lp = nullptr, *lpt = nullptr;
@@ -911,6 +914,10 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
 {
     glue::ArNormArgs a{m.f, m.stepp, c, M, m.resid, w, out, glue::RMS_EPS};
+    const int i = c / 2;
+    if (i < (int)m.steering_dir.size() &&
+        (c % 2 == 0 || m.steering_scope == steering::Scope::Full || !m.layers[i].moe))
+        a.steer = {m.steering_dir[i], m.steering_scale, 0.f, m.steering_alpha[i]};
 #ifdef DEC_SLOT
     // fold: the normed rows also go into the fragment tables the next kernel reads (xf_x2 of this layer, xf_x of the
     // next; after the last layer the head's xf_h still runs)
