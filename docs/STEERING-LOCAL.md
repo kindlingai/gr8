@@ -47,8 +47,8 @@ a loaded profile, sets the same request identity/scales as normal selection and 
 It also selects offline `g6m4 --prompt` plans. This mode is not a replacement for matched serving qualification.
 `m4sim` does not expose profile boot flags in this slice and refuses them as unknown arguments.
 
-HF selectors and automatic release discovery are not supported by this local-directory interface. Loading a model
-from HF alone does not opt into any profile artifact. Download/materialization support is a separate change.
+For explicit `hf:default` / `hf:NAME` selection from a model release, see [HF profile loading](STEERING-HF.md).
+Loading a model from HF alone does not opt into any profile artifact.
 
 ## Validation limits
 

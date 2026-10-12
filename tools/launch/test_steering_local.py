@@ -131,7 +131,7 @@ class LocalTests(FixtureTestCase):
             with self.assertRaisesRegex(modelset.ModelError, 'mixed external weights'):
                 steering_local.prepare(o, self.ms)
 
-    def test_force_and_hf_refusals(self):
+    def test_force_and_selector_validation(self):
         with self.assertRaisesRegex(options.OptionError, 'weight hash checks'):
             self.opts('--nohash', '1')
         for force in ('0', '-1', '4.1', 'nan', 'inf', 'word', '1e-50'):
@@ -139,8 +139,10 @@ class LocalTests(FixtureTestCase):
                 self.opts('--steering-force', force)
         for force in ('1e-45', '4'):
             self.opts('--steering-force', force)
-        with self.assertRaisesRegex(options.OptionError, 'local profile'):
-            self.opts('--steering-profile', 'hf:default')
+        self.opts('--steering-profile', 'hf:default')
+        for selector in ('hf:', 'hf:../bad', 'hf:.bad', 'hf:a/b', 'hf:' + 'a' * 129):
+            with self.assertRaises(options.OptionError):
+                self.opts('--steering-profile', selector)
         with self.assertRaisesRegex(options.OptionError, 'needs --steering-profile'):
             o = options.parse(['--no-config', '--peers', PEERS, '--steering-force', '1'], {})
             options.validate(o)

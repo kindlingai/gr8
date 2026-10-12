@@ -27,6 +27,7 @@ import mentat
 import modelset
 import options as opt
 import steering_local
+import steering_hf
 
 REPO = opt.REPO
 # What the engine gets from the supervisor's environment, besides the plan's own variables.
@@ -142,12 +143,15 @@ def resolve_model(o, refresh=False, log=log):
     try:
         model = o.get('MODEL')
         hf = hfsource.parse_url(model)
+        steering = steering_hf.request(o)
+        if steering and (not hf or o.get('BASE_PACKS')):
+            raise modelset.ModelError('--steering-profile hf:... requires an HF release without --base-packs')
         if hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
             release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
-            release.fetch_meta()
+            release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             if o.get('BASE_PACKS'):
                 model = o.get('BASE_PACKS')
@@ -173,6 +177,7 @@ def resolve_model(o, refresh=False, log=log):
         variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
+        steering_hf.bind(o, release)
         steering_local.prepare(o, ms)
         ms.drafter = drafter_of(o, ms, refresh, log)
         return ms, variant, ''

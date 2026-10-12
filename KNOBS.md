@@ -148,7 +148,7 @@ Profile loading is explicit. See [local steering](docs/STEERING-LOCAL.md) for id
 
 | key | flag | default | scope | meaning |
 |---|---|---|---|---|
-| `STEERING_PROFILE` | `--steering-profile` | unset | box | verified local schema-v1 profile directory |
+| `STEERING_PROFILE` | `--steering-profile` | unset | box | verified schema-v1 profile directory, or `hf:default` / `hf:NAME` from the model release |
 | `STEERING_FORCE` | `--steering-force` | unset | cluster | force qualification requests to this positive FP32 scale, at most 4 |
 | `STEERING_MODEL_REVISION` | `--steering-model-revision` | unset | cluster | profile's exact model revision assertion; checked against config metadata where present |
 | `STEERING_TOKENIZER_REVISION` | `--steering-tokenizer-revision` | unset | cluster | profile's exact tokenizer revision assertion; checked where present |

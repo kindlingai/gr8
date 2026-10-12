@@ -147,3 +147,6 @@ The head runs a shim that hands requests to the engine: `frontend/g6s2shim.py --
 needs it and `--set-id` explicitly. Profile loading refuses disabled weight hash checks.
 `--steering-force SCALE` enables explicit forced qualification mode. These are g6m4 flags; m4sim does not load profiles.
 See [local steering](STEERING-LOCAL.md) for the complete contract, identity limitations and unit-test boundaries.
+The launcher also accepts `--steering-profile hf:default` / `hf:NAME` with an HF model release and derives the
+profile's identity assertions before validating the actual model. See [HF steering](STEERING-HF.md) for publication,
+explicit selection and cached offline restart. The engine itself receives only the verified local directory.

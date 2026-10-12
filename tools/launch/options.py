@@ -102,7 +102,7 @@ KEYS = {
     'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
-    'STEERING_PROFILE': ('box', None, 'verified local schema-v1 profile directory'),
+    'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory, or hf:default / hf:NAME from the model release'),
     'STEERING_CHAT_TEMPLATE': ('box', None, 'served chat template file; resolved from the model'),
     'STEERING_FORCE': ('cluster', None, 'force the loaded steering profile at this request scale'),
     'STEERING_MODEL_REVISION': ('cluster', None, 'exact model revision recorded by the steering profile'),
@@ -324,11 +324,12 @@ def validate(o):
     if steering:
         if o.get('NOHASH') == '1':
             raise OptionError('--steering-profile requires weight hash checks (unset NOHASH)')
-        if steering.startswith('hf:'):
-            raise OptionError('--steering-profile needs a local profile directory')
+        bundled = steering.startswith('hf:')
+        if bundled and not re.fullmatch(r'hf:[A-Za-z0-9][A-Za-z0-9._-]{0,127}', steering):
+            raise OptionError('--steering-profile: want a profile directory, hf:default or hf:NAME')
         missing = [flag_of(k) for k in ('STEERING_MODEL_REVISION', 'STEERING_TOKENIZER_REVISION',
                                         'STEERING_CHAT_TEMPLATE_SHA256') if not o.get(k)]
-        if missing:
+        if missing and not bundled:
             raise OptionError('--steering-profile needs ' + ', '.join(missing))
         for key in ('STEERING_CHAT_TEMPLATE_SHA256', 'STEERING_WEIGHT_SET'):
             if o.get(key) and not re.fullmatch(r'[0-9a-f]{64}', o.get(key)):

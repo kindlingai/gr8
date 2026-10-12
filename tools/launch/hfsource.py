@@ -221,6 +221,7 @@ class Release:
         self.slices = os.path.join(self.dir, 'index-slices')
         self.tokenizer = os.path.join(self.dir, 'tokenizer')
         self.manifests = os.path.join(self.dir, 'manifests')
+        self.steering_profile = None
 
     @property
     def commit(self):
@@ -233,7 +234,15 @@ class Release:
     def id(self):
         return f'{self.repo.repo}@{self.commit}'
 
-    def fetch_meta(self):
+    def fetch_meta(self, steering=None):
+        """Fetch model metadata, then an optional explicitly selected steering artifact."""
+        self._fetch_meta()
+        self.steering_profile = None
+        if steering:
+            import steering_hf
+            self.steering_profile = steering_hf.fetch(self, steering)
+
+    def _fetch_meta(self):
         """The manifests and the tokenizer and config files. Once there, a boot needs no network for them."""
         done = os.path.join(self.dir, 'meta.json')
         if os.path.isfile(done):
