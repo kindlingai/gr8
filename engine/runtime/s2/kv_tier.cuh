@@ -17,6 +17,7 @@
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
 #include <chrono>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -24,6 +25,24 @@
 #include <vector>
 
 namespace g6s2 {
+// The page block's format: bump it whenever what a block holds, or how, changes (a stored block of another format is
+// not this engine's). Stores keyed on it also carry the engine binary's stamp (exe_stamp).
+constexpr int KV_BLOCK_FORMAT = 2;
+
+// FNV-1a of this process's executable, hex: two builds that may compute different KV bits get different stamps
+inline std::string exe_stamp() {
+    FILE* f = fopen("/proc/self/exe", "rb");
+    if (!f) return "unknown";
+    uint64_t h = 14695981039346656037ull;
+    std::vector<unsigned char> buf(1 << 20);
+    for (size_t n; (n = fread(buf.data(), 1, buf.size(), f)) > 0;)
+        for (size_t i = 0; i < n; ++i) h = (h ^ buf[i]) * 1099511628211ull;
+    fclose(f);
+    char s[17];
+    snprintf(s, sizeof s, "%016llx", (unsigned long long)h);
+    return s;
+}
+
 namespace kvt {
 constexpr size_t MLA16 = 64 * 656 / 16, IDX16 = 64 * 132 / 16;
 // off16: the binding's place in a page block; rep16: in a replicated record. phys: its attention cache's pages (the
@@ -223,13 +242,15 @@ public:
     }
 };
 
-// One --kv-store value: STORE,size=N(M|G|T). STORE is ssd:PATH (a folder) or remote:HOST:PORT (remote:auto is the
-// launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40. The deprecated --kv-tier (old) also takes
-// keep=evicted|shared|all, which g6m4 maps to --kv-keep.
+// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off]. STORE is ssd:PATH (a folder) or remote:HOST:PORT
+// (remote:auto is the launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40. persist=on (SSD only) keeps the
+// folder's system prefixes and counts across restarts; off (the default) clears it at boot. The deprecated --kv-tier
+// (old) also takes keep=evicted|shared|all, which g6m4 maps to --kv-keep.
 struct TierSpec {
     std::string store;
     uint64_t bytes = 0;
     int keep = 0;   // --kv-tier only: 0 evicted, 1 shared, 2 all
+    bool persist = false;
     static TierSpec parse(const std::string& v, bool old = false) {
         TierSpec t;
         size_t at = v.find(',');
@@ -246,6 +267,9 @@ struct TierSpec {
                 const double mul = unit == "T" ? 1099511627776.0 : unit == "G" ? 1073741824.0 : unit == "M" ? 1048576.0 : 0.0;
                 if (!(n > 0) || !mul) throw std::runtime_error("--kv-store " + v + ": size=N with M, G or T");
                 t.bytes = uint64_t(n * mul);
+            } else if (k == "persist") {
+                if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": persist=on or off");
+                t.persist = x == "on";
             } else if (k == "keep" && !old) {
                 throw std::runtime_error("--kv-store " + v + ": what the stores keep is --kv-keep system|sessions|all");
             } else if (k == "keep") {
@@ -259,6 +283,7 @@ struct TierSpec {
         if (!ssd && !remote && t.store != "mem:")
             throw std::runtime_error("--kv-store " + v + ": the store is ssd:PATH or remote:HOST:PORT (remote:auto needs the launcher)");
         if (!t.bytes) throw std::runtime_error("--kv-store " + v + ": size=N(G|T) is needed");
+        if (t.persist && !ssd) throw std::runtime_error("--kv-store " + v + ": persist=on is for ssd: stores");
         return t;
     }
     bool ssd() const { return store.rfind("ssd:", 0) == 0; }

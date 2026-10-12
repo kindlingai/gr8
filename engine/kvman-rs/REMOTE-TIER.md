@@ -125,7 +125,7 @@ launcher, `sudo systemd-run --unit=kv-node -p LimitMEMLOCK=infinity -p User=$USE
 
 ## Stage B: stores below the pool
 
-Off unless `--kv-store` is given. Without it the pool has no store, counts nothing, queues no copies, and its digest is
+Experimental. Off unless `--kv-store` is given. Without it the pool has no store, counts nothing, queues no copies, and its digest is
 what it was. #37 shipped this as `--kv-tier STORE,size=N,keep=evicted|shared|all` per tier; that flag and
 `--kv-shared-after` remain for one release as deprecated aliases (a tier that kept evicted runs, the old default, maps to
 `--kv-keep all`, else `system`).
@@ -133,6 +133,7 @@ what it was. #37 shipped this as `--kv-tier STORE,size=N,keep=evicted|shared|all
 ### Configuration
 
     --kv-store ssd:/nvme/gr8kv,size=200G       # where: repeatable, tried in order
+                                               # ,persist=on keeps an SSD store across restarts
     --kv-store remote:auto,size=8G
     --kv-keep system|sessions|all              # what: default system
     --kv-system-after 2                        # default 2
@@ -141,7 +142,8 @@ what it was. #37 shipped this as `--kv-tier STORE,size=N,keep=evicted|shared|all
 The launcher's `KV_STORE` holds the stores separated by `;`, with `KV_KEEP`, `KV_SYSTEM_AFTER` and `KV_WRITE_LIMIT`
 (KNOBS.md). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
 `remote:HOST:PORT`. `remote:auto` is the launcher's: each box's supervisor names the KV node mentat announces, with an
-RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40).
+RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40). An SSD store is cleared
+at every boot unless it has `persist=on` (below, Persistence).
 
 ### What the stores keep
 
@@ -153,7 +155,8 @@ RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^
   stored run (its prompt holds all of that run's prompt) counts toward nothing, so one long chat never reaches N. When a
   run retires, the longest counted prefix it holds within its span goes to the first store, unless a store has it. The
   key of a prefix of S rows is its first S + 1 tokens, since the MTP layer's row S - 1 depends on token S. The count
-  table keeps the 4,096 most recently counted prefixes, and the first SSD store's index keeps it across restarts.
+  table keeps the 4,096 most recently counted prefixes, and the first `persist=on` SSD store's index keeps it across
+  restarts.
   Counting cells rather than whole spans matters for agents: opencode writes the workspace folder into its system
   prompt 29% of the way in, so agents in different folders share 6,926 of their 12,637-token spans, and only the
   cells before the folder.
@@ -278,9 +281,23 @@ it directly.
 
 ### Persistence (SSD stores: prefixes and counts)
 
-An SSD store with `--set-id` (the launcher always passes the model id) keeps an index beside its blocks. The header names
-what makes blocks compatible: the model id, TP, R, the pool's placement pages, the grid, the page block's size and
-layout, and the store's size. Another header starts the index empty. Records are add (an entry: id, key, tokens, valid
+Off by default: at boot each rank removes its folder (`PATH/r<r>`: blocks, index and the count table) and starts empty,
+and logs that it did. `persist=on` keeps it. The reason is a boot that serves wrong output. On 2026-10-12 some cluster
+boots of this branch failed the gate (first token and smoke) while others passed, and for a while a store that the
+failing boots had written looked like a cause: such a boot could spill wrong blocks and push counts, and a persisted
+store would hand both to every later boot. The failures turned out not to involve the store: one came on a boot whose
+store had just been wiped, all four came within half an hour (18:37-19:03 UTC), and the 41 boots that followed in a
+gate-only A/B, stores on and off alternating, all passed, with the same prefill output on every boot probed. But the gap is
+real: nothing checks that a stored block holds what a cold prefill would compute. So a store keeps blocks only within
+the boot that wrote them unless asked otherwise. Persist only a store you trust, and clear it (remove the folder) after
+a boot that served wrong output.
+
+A `persist=on` SSD store with `--set-id` (the launcher always passes the model id) keeps an index beside its blocks.
+The header names what makes blocks compatible: the model id, TP, R, the pool's placement pages, the grid, the page
+block's size and layout, the store's size, the block format (`KV_BLOCK_FORMAT` in `engine/runtime/s2/kv_tier.cuh`,
+bumped whenever what a block holds changes) and the engine build (an FNV-1a hash of the running engine binary, so a
+rebuild that could compute other KV bits never reads the old build's blocks). Another header starts the index empty,
+with a log line naming both headers: the old blocks are then unreferenced and their slots are reused. Records are add (an entry: id, key, tokens, valid
 rows, slots), drop (an id) and count (a prefix's count; the first SSD store's index holds the table), each with a
 length and a checksum, synced as they are written (the counts of an admission at its drain). The engine writes an
 entry's blocks before `io_done` appends its add record. A drop record is synced before the entry's slots can be reused.
@@ -334,7 +351,7 @@ whole run (~200 pages) and took 1.2-3.8 s. With dedupe (32f7bfd) a sibling's run
 and the hits take 0.92-1.06 s once the prefix is stored. The variants' first tokens and logprobs agree across all
 builds, including a variant read from the SSD after the pool was flushed and one read after a restart.
 
-Restart: an SSD tier's index brought back 10 (first build) and 2 (later build) shared prefixes. The first request after
+Restart (#37 kept an SSD tier across restarts; now that takes `persist=on`): its index brought back 10 (first build) and 2 (later build) shared prefixes. The first request after
 boot read its 12,288 rows from the SSD: TTFT 1.32 s and 1.41 s, against 9.6-10.3 s cold.
 
 Copies, rank 0, from the drain log: a 200-page spill to the KV node 725-898 ms (device copy 6 ms), the same to the SSD
@@ -368,6 +385,28 @@ With the barrier and no delay, the 8-agent replay ran clean twice: all 47 turns 
 198 s, p90 598 s). The ranks' drain ends spread by up to 5.0 and 7.3 s in those two runs, the second close to the GPU
 wait timeout; the barrier took both.
 
+### On the cluster: store policies (TP=4, 2026-10-12)
+
+The same boxes and release, against `main` at #37. First token and logprob as above.
+
+- Stores off: RigMark code 51.0 tok/s, prose 30.6, 8K prefill cold 1,333 tok/s, against `main` 51.1 / 30.5 / 1,277;
+  smoke 11/11 and the same outputs. The front end's system span costs 3.1-4.3 ms a request (one more template render).
+- `--kv-keep system`, SSD store: the shared-prefix conversations above stored their 12,288-row system prefix. After a
+  70K-token request flushed the pool, the first of them again took 1.07 s (9.6 s cold), first token and logprob equal
+  to the cold run's.
+- A run past R, 93,908 tokens, asked again after a 70K-token request flushed the pool: 74 s with no store, 31.3 s on
+  `main` with `--kv-tier keep=evicted` (65,536 rows restored, the rest prefilled), 8.41 s with `--kv-keep all` and the
+  tail. First token and logprob the same in all three.
+- `system` on the 8-agent replay: all 47 turns' first tokens and logprobs equal to `main`'s without a store; 1,899 s,
+  TTFT median 194 s, 9 prefixes stored at 9.4 GB/h a rank. That was the miscount described above (each agent's own
+  span reached N); fixed since, and the sim now puts the same trace at 0.1 GB/h.
+- `sessions` and `all` on the 8-agent replay after the count fix: not yet run on the cluster.
+- Rebased onto #41, with persistence opt-in: stores off, smoke 12/12, RigMark code 50.6 tok/s, prose 30.5, 8K prefill
+  cold 1,325. `--kv-keep system` without `persist`: a planted index was removed at boot, no index was written, and
+  after the 70K flush the system prefix came back from the store in 1.06 s with the cold first token and logprob.
+  With `persist=on` the index header ended `format 2 engine <hash>`; after a restart the index brought back the
+  prefix and the gate's first request read its 192 pages from the store, first token and logprob as cold.
+
 ### Byte-identical ranks, and one copy for all
 
 m4sim's ranks hold identical page blocks below R. The cluster check will say whether the real ranks do: the latent comes
@@ -380,6 +419,10 @@ deterministic like the others. The writes could be split across ranks (page i by
 read the whole run. Until the cluster check, each rank keeps its own store.
 
 ### Still to do
+
+- The 8-agent replay under `sessions` (and `system` again) on the cluster, after the count fix.
+- A check that a stored block holds what a cold prefill computes (a sampled block verified at boot or on restore), so
+  `persist=on` can trust a store across boots.
 
 - The DFlash2 drafter's prompt-context taps come from the prefill a hit skips, so a restored run drafts like a pool
   hit does today.

@@ -171,6 +171,10 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 - `--cap` is the KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory.
 - `--sess` is how many requests decode at once (1-8). Each one adds step graphs: about 2.5 GiB at 8.
 - `--reuse 0` turns prefix reuse off.
+- `--kv-store ssd:PATH,size=N` (experimental, off by default) keeps system prompts, or more with `--kv-keep`, in
+  blocks below the KV pool, so a request whose prefix the pool let go reads it back instead of prefilling it. An SSD
+  store starts empty at every boot unless it has `persist=on`
+  ([engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
 - `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.

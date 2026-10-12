@@ -68,9 +68,10 @@ KEYS = {
     'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
-    'KV_STORE': ('cluster', None, 'block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, separated by ; '
-                                  '(or --kv-store given again). STORE: ssd:PATH, remote:HOST:PORT or remote:auto (a KV node '
-                                  'from the mentat group). Sizes per rank'),
+    'KV_STORE': ('cluster', None, 'experimental: block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, '
+                                  'separated by ; (or --kv-store given again). STORE: ssd:PATH, remote:HOST:PORT or remote:auto '
+                                  '(a KV node from the mentat group). Sizes per rank. An SSD store starts empty at every boot; '
+                                  ',persist=on keeps it across restarts'),
     'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
@@ -364,8 +365,8 @@ def deprecated_kv(values, origin, warnings):
 
 
 def kv_stores(o):
-    """KV_STORE parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size'}]
-    ([] when unset or off). Raises OptionError naming the bad store."""
+    """KV_STORE parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size',
+    'persist'}] ([] when unset or off). Raises OptionError naming the bad store."""
     v = o.get('KV_STORE')
     if v in (None, 'off'):
         return []
@@ -376,7 +377,7 @@ def kv_stores(o):
         if not m or (store.startswith('remote:auto') and m.group(2)):
             raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
         t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
-             'host': None, 'port': None, 'size': None}
+             'host': None, 'port': None, 'size': None, 'persist': False}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
         else:
@@ -385,10 +386,14 @@ def kv_stores(o):
             k, _, x = kv.partition('=')
             if k == 'size' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
                 t['size'] = x
+            elif k == 'persist' and x in ('on', 'off'):
+                if t['kind'] != 'ssd' and x == 'on':
+                    raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
+                t['persist'] = x == 'on'
             elif k == 'keep':
                 raise OptionError(f'--kv-store {text}: what the stores keep is --kv-keep system|sessions|all')
             else:
-                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T)')
+                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T) or persist=on|off')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
         out.append(t)

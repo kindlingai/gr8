@@ -1064,6 +1064,15 @@ impl Index {
                 records += 1;
                 good = raw.len() - c.0.len();
             }
+        } else if !raw.is_empty() {
+            // another model, layout, block format or engine build wrote it: its blocks are not this engine's
+            let old = raw.split(|&b| b == b'\n').next().unwrap_or_default();
+            eprintln!(
+                "# s2 store {}: index is for another engine or layout, starting empty (was: {}; now: {})",
+                dir.display(),
+                String::from_utf8_lossy(&old[..old.len().min(400)]),
+                head.trim_end()
+            );
         }
         let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
         if good == 0 {

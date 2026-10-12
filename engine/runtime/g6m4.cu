@@ -781,16 +781,27 @@ int main(int argc, char** argv)
                     std::string spec = t.store, index;
                     if (t.ssd())
                     {
+                        // without persist=on the folder starts empty: a boot that served wrong output (a degenerate boot)
+                        // must not hand its blocks or prefix counts to the next one
                         const std::string dir = t.store.substr(4) + "/r" + std::to_string(R);
+                        if (!t.persist && std::filesystem::exists(dir))
+                        {
+                            std::filesystem::remove_all(dir);
+                            fprintf(stderr, "# rank %d: s2 store %zu: %s cleared at boot (persist=on keeps it)\n", R, i, dir.c_str());
+                        }
                         std::filesystem::create_directories(dir);
                         spec = "ssd:" + dir + "/blocks";
-                        if (!set_id.empty()) index = dir;
+                        if (t.persist && !set_id.empty()) index = dir;
                     }
                     const uint64_t slots = kvt->add(spec, name + "-t" + std::to_string(i), t.bytes);
+                    // what makes stored blocks this engine's: the model, the layout, the block format, and the engine binary
+                    // itself (another build may compute other KV bits); an index with another line starts empty
+                    static const std::string exe = g6s2::exe_stamp();
                     const std::string compat = "set " + set_id + " nr " + std::to_string(g6nr::NR) + " below " + std::to_string(s2_below) +
                         " place " + std::to_string(place) + " grid " + std::to_string(reuse_grid) + " block " +
                         std::to_string(kvt->blocks().slot_bytes()) + " bindings " + std::to_string(bs.size()) + "/" +
-                        std::to_string(nidx) + " slots " + std::to_string(slots);
+                        std::to_string(nidx) + " slots " + std::to_string(slots) + " format " + std::to_string(g6s2::KV_BLOCK_FORMAT) +
+                        " engine " + exe;
                     pool.add_tier(slots, kv_keep_rule, index, compat);
                     pool.policy((uint32_t)i, 0, kv_min_hits, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();

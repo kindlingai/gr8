@@ -2,7 +2,7 @@
 
 ## 2026-10-12: what the KV stores keep (`--kv-store`, `--kv-keep`), system prompts by default
 
-- `--kv-store STORE,size=N` (repeatable, tried in order; `KV_STORE`, stores separated by `;`) says where, and
+- Experimental, off by default. `--kv-store STORE,size=N` (repeatable, tried in order; `KV_STORE`, stores separated by `;`) says where, and
   `--kv-keep system|sessions|all` (`KV_KEEP`) what. `system`, the default: each system prompt with its tools, once,
   after `--kv-system-after` conversations (default 2) started with it. `sessions`: those, plus runs the pool evicts that
   continued their conversation at least once. `all`: every eviction (#37's `keep=evicted`). `--kv-tier` and
@@ -16,7 +16,10 @@
   larger than the KV pool.
 - The front ends send each chat request's system span (`system_tokens`, PROTOCOL.md): the system messages and tools as
   templated. A new conversation counts only the prefix cells inside it, so an agent's own history never passes for a
-  system prompt. The counts persist with an SSD store.
+  system prompt.
+- An SSD store starts empty at every boot: blocks, index and counts. `persist=on` keeps it across restarts, keyed on
+  the model, layout, block format (`KV_BLOCK_FORMAT`) and a hash of the engine binary; another key clears it with a log
+  line. A boot that served wrong output must not hand its blocks or counts to the next (REMOTE-TIER.md, Persistence).
 - A run's prefix that another run in the pool holds is stored once and referenced; a restore takes it from a retained
   run in the pool when one has it.
 - A run past `SHARE_LIMIT` keeps its tail under `sessions` and `all`: each rank stores its own shard and the
