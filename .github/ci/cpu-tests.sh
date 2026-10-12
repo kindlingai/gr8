@@ -36,6 +36,10 @@ step "bin/g6load (the Hugging Face fetch's planner and checker, for the launch t
 cargo build --release --locked --quiet --manifest-path engine/loader-rs/Cargo.toml
 
 step "Python tests"
+# Artifact tools and the C++ loader must agree on the same materialized profiles.
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I engine/runtime \
+  engine/runtime/tests/steering_profile_check.cpp engine/loader/g6pack.cpp -o "$T/steering_profile_check"
+STEERING_PROFILE_CHECK="$T/steering_profile_check" python3 -m unittest discover -s tools/steering/tests -v
 python3 -m unittest tools.convert.test_v2
 python3 -m unittest tools.convert.test_slim
 python3 -m unittest discover -s tools/health
