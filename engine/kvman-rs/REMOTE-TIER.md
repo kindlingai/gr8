@@ -201,7 +201,7 @@ those every rank has, in its own order, and every rank keeps exactly that list, 
 is rewritten from the live entries when it holds four times as many records. Evicted runs are not persisted, and neither
 are KV node leases.
 
-### Tested on d800
+### Tested on a single GB10 build box
 
 | test | what it checks |
 |---|---|
@@ -250,8 +250,8 @@ boot read its 12,288 rows from the SSD: TTFT 1.32 s and 1.41 s, against 9.6-10.3
 
 Copies, rank 0, from the drain log: a 200-page spill to the KV node 725-898 ms (device copy 6 ms), the same to the SSD
 158 ms. Restores of 256-384 pages took 162-238 ms, and a spill that also moved 400-500 pages on to the SSD 0.8-1.4 s.
-Remote writes run at about 1 GB/s per rank because all four ranks write through efcd's single 100G port without PFC: the
-clients count 90,000-150,000 packet sequence errors and efcd 247,000 out-of-sequence packets and 166,000 CNPs, with no
+Remote writes run at about 1 GB/s per rank because all four ranks write through the KV node box's single 100G port without PFC: the
+clients count 90,000-150,000 packet sequence errors and the KV node box 247,000 out-of-sequence packets and 166,000 CNPs, with no
 ack timeouts. The four-box bench through that port: 2.6-3.2 GB/s write and 3.1-3.8 GB/s read per box (about 12 GB/s
 total), rows at 13.7 us p50 (6.0 us alone), a 2,048-row gather 1.77 ms (0.85 alone).
 
@@ -263,7 +263,7 @@ before the barrier above, once after 38 s and once after 35 requests: every rank
 fabric/attention error". The cause was one rank's drain running seconds longer than the others'. Logging every rank's
 drains showed it: the same drain took 5.0 s on one rank and 1.3 s on the other three, and in three later clean runs the
 ranks' drain ends spread by up to 2.6, 3.8 and 4.4 s, with the slow rank changing from drain to drain. The KV node's
-writes are what vary: four ranks write into efcd's one 100G port with no PFC, and the switch dropped 23-27 million
+writes are what vary: four ranks write into the KV node box's one 100G port with no PFC, and the switch dropped 23-27 million
 packets on that port in each 8-agent run (90-190 thousand on each GLM box's port).
 
 `G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]` (test only: that rank sleeps inside every `every`th drain that copies
