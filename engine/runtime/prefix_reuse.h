@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cassert>
 #include <vector>
+#include "cache_namespace.h"
 
 namespace g6rt {
 struct PrefixReuse
@@ -34,6 +35,7 @@ struct PrefixReuse
                                         // every sequence of a NOEND hit chain: every stale row lies in [skip, dirty_end) (2b G2)
     int lcp = 0;                        // of the last begin(), for the log line
     const char* why = "first";          // last begin(): "hit", or the miss reason first / strict / no-lcp / short / grid
+    CacheNamespace cache_namespace{};
 
     static int common_prefix(const std::vector<int>& a, const std::vector<int>& b)
     {
@@ -41,11 +43,12 @@ struct PrefixReuse
         return (int)(std::mismatch(a.begin(), a.begin() + n, b.begin()).first - a.begin());
     }
     // limit: rows the prefill path may skip (g6m4: p.first, >= 1 row always goes through the normal path)
-    int begin(const std::vector<int>& prompt, int limit, bool mtp)
+    int begin(const std::vector<int>& prompt, int limit, bool mtp, const CacheNamespace& incoming = {})
     {
         lcp = common_prefix(history, prompt);
         int skip = 0;
         if (history.empty()) why = "first";
+        else if (cache_namespace != incoming) why = "namespace";
         else if (strict && !(prompt.size() > history.size() && lcp == (int)history.size())) why = "strict";
         else
         {
@@ -62,13 +65,15 @@ struct PrefixReuse
         }
         if (!skip) dirty_end = 0;       // a miss resets every cache (g6m4: reset(m) + reset(D.d))
         main_end = draft_end = written_end = pf_end = skip;
+        cache_namespace = incoming;
         return skip;
     }
-    void clear() { history.clear(); valid = main_end = draft_end = written_end = dirty_end = pf_end = raw = 0; }
+    void clear() { history.clear(); valid = main_end = draft_end = written_end = dirty_end = pf_end = raw = 0; cache_namespace = {}; }
     // S2: a session that continues a retained run whose begin() gave `skip` (the run's other state stays with the pool)
-    void resume(int skip)
+    void resume(int skip, const CacheNamespace& incoming = {})
     {
         clear();
+        cache_namespace = incoming;
         main_end = draft_end = written_end = dirty_end = pf_end = skip;
     }
     static void written(int& end, int first, int count)

@@ -63,6 +63,8 @@ if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in
   [ -n "$PORT" ] && STORES+=("remote:127.0.0.1:$PORT")
 fi
 "$T/pool_stash_test" "${STORES[@]}"
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_namespace_test.cpp" "${KVLIB[@]}" -o "$T/pool_namespace_test"
+"$T/pool_namespace_test" "${STORES[@]}"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"

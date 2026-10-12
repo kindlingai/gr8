@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#define G6KV_NAMESPACE_BYTES 70
+
 extern "C" {
 
 struct g6kv_pool;
@@ -71,6 +73,13 @@ int g6kv_retain(g6kv_pool* p, const g6kv_run* r, const int32_t* history, size_t 
                 int32_t pf_end);
 int g6kv_match(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst, int32_t limit,
                g6kv_hit* out);
+// Opaque namespaces: exactly G6KV_NAMESPACE_BYTES bytes, copied during the call. Nonzero identities support
+// resident reuse only. Null buffers or any other size return BadArgument without changing the pool/output.
+// The existing retain/match/count entry points above/below retain all-zero namespace behavior and their ABI.
+int g6kv_retain_namespaced(g6kv_pool* p, const g6kv_run* r, const int32_t* history, size_t n, int32_t valid,
+                           int32_t written_end, int32_t pf_end, const uint8_t* namespace_, size_t namespace_bytes);
+int g6kv_match_namespaced(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst,
+                          int32_t limit, const uint8_t* namespace_, size_t namespace_bytes, g6kv_hit* out);
 // from: -1 for a pool hit, else the tier of a stored one
 int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, g6kv_run* out);
 
@@ -94,6 +103,10 @@ int g6kv_add_tier(g6kv_pool* p, uint64_t slots, int32_t keep, const char* index_
 // span: the prompt's system span in tokens (the system message and tool definitions as templated), or -1 when the
 // front end sent none
 uint32_t g6kv_count(g6kv_pool* p, const int32_t* prompt, size_t n, int64_t span);
+// Call before a namespace-aware admission's grant: nonzero identities count nothing and clear pending stock
+// admission metadata. span follows g6kv_count. Returns an error code, with the count in *out on success.
+int g6kv_count_namespaced(g6kv_pool* p, const int32_t* prompt, size_t n, int64_t span,
+                          const uint8_t* namespace_, size_t namespace_bytes, uint32_t* out);
 // tier t's policy (after g6kv_add_tier): evicted runs need min_rows rows and min_hits continuations to be stored there.
 // block_bytes: what one block takes, for the counters
 int g6kv_tier_policy(g6kv_pool* p, uint32_t t, uint64_t min_rows, uint32_t min_hits, uint64_t block_bytes);

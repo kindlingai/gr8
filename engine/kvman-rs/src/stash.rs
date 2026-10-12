@@ -507,6 +507,11 @@ impl Stash {
     /// resident: the token histories of the runs still in the pool (live and retained), for prefix bases.
     pub(crate) fn put_evicted(&mut self, gone: &[Kept], below_pages: usize, resident: &[&[i32]]) {
         for k in gone {
+            // The stored-tier format has no namespace. Non-stock prefixes support resident reuse only;
+            // never serialize them or remember their histories as stock entries.
+            if k.namespace != crate::pool::STOCK_NAMESPACE {
+                continue;
+            }
             self.forget(&k.st);
             if k.st.valid <= 0 {
                 continue;
