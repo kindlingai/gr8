@@ -58,11 +58,11 @@ t_thinking_off_refused() {
   ok
 }
 
-# A thinking budget closes the think block after N reply tokens. The answer follows in the content.
+# A thinking budget makes the reply's Nth token the close of the think block. The answer follows in the content.
 t_thinking_budget() {
   post /v1/chat/completions "$(chat '{"thinking_budget":32}' 512 'What is 17*23? Reply with the number only.')"
   check "content should be 391" '.choices[0].message.content | test("391")' || return
-  check "reasoning should stop within the budget" '.usage.completion_tokens_details.reasoning_tokens <= 34' || return
+  check "reasoning should stop within the budget" '.usage.completion_tokens_details.reasoning_tokens <= 33' || return
   ok "$(jqb '.usage.completion_tokens_details.reasoning_tokens') reasoning tok"
 }
 

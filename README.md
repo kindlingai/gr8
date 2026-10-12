@@ -183,7 +183,7 @@ with these fields:
 | field | values | on GLM 5.3 |
 |---|---|---|
 | `reasoning_effort` (top level, or in `chat_template_kwargs`) | `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | The template names `low`, `high` and `max`. Another value becomes the nearest of those, ties going higher: `minimal` is `low`, `medium` is `high`, `xhigh` is `max`. Unset is `max`. `none` and any other value are a 400 |
-| `thinking_budget` | an integer, or null | After this many reply tokens still inside the think block, the front end puts `\n</think>\n\n` in place of the next token and the answer follows. 0 or a negative number is no limit. Null or unset takes the server default |
+| `thinking_budget` | an integer, or null | While the think block is open, the front end puts `\n</think>\n\n` in place of the reply's Nth token (so N-1 reasoning tokens come first), and the answer follows. 0, null or unset takes the server default, as in TensorFold. A negative number is no limit |
 | `chat_template_kwargs.enable_thinking` | `true` | `false` is a 400 that names `reasoning_effort` `low` and `thinking_budget` instead |
 | `response_format` | `{"type": "text"}` | `json_object` and `json_schema` are a 400 for now |
 

@@ -45,8 +45,9 @@ pub struct Res {
     pub stop_reason: Option<StopReason>,
 }
 
-/// A thinking budget: once the reply holds `limit` tokens and its think block is still open, the next token is
-/// replaced by `close` ("\n" + `</think>` + "\n\n").
+/// A thinking budget, as TensorFold's ThinkBudget: while the think block is open, the reply's `limit`-th token is
+/// replaced by `close` ("\n" + `</think>` + "\n\n"), even when it is `</think>` itself. So `limit` - 1 reasoning
+/// tokens come before the close.
 ///
 /// The engine cannot take a token it did not sample (PROTOCOL.md has no such command), so the cut ends the engine
 /// run and the reply goes on in a new one whose prompt is the prompt, the reply so far and the close. Under S2 the
@@ -157,7 +158,7 @@ impl Generation {
     }
 
     /// The reply starts inside a think block (the chat prompt opened one): count its reasoning tokens, and with a
-    /// budget close the block once the reply holds `budget.limit` tokens.
+    /// budget close the block at the reply's `budget.limit`-th token.
     pub fn thinking(&mut self, think_end: u32, budget: Option<Budget>) {
         self.think_end = Some(think_end);
         self.budget = budget.filter(|b| b.limit > 0 && !b.close.is_empty());
@@ -310,7 +311,7 @@ impl Generation {
         let mut step = Step { ids: Vec::with_capacity(f.ids.len()), ..Default::default() };
         let mut lps = f.logprobs.unwrap_or_default().into_iter();
         for tid in f.ids {
-            if self.budget_due(tid) {
+            if self.budget_due() {
                 return self.close_think(step);
             }
             if let Push::StopStr = self.push(tid, lps.next(), &mut step) {
@@ -321,13 +322,9 @@ impl Generation {
         step
     }
 
-    /// Whether `tid` is the token the budget replaces: the reply holds `limit` tokens, all inside the think block,
-    /// and `tid` does not close it.
-    fn budget_due(&self, tid: u32) -> bool {
-        match (&self.budget, self.think_end) {
-            (Some(b), Some(end)) => self.res.completion_tokens >= b.limit && tid != end,
-            _ => false,
-        }
+    /// Whether the next token is the one the budget replaces: the block is open and it is the `limit`-th.
+    fn budget_due(&self) -> bool {
+        self.think_end.is_some() && self.budget.as_ref().is_some_and(|b| self.res.completion_tokens + 1 >= b.limit)
     }
 
     /// Put the budget's close in place of the next token. `max_tokens` may cut the close short.
@@ -619,9 +616,13 @@ mod tests {
         }
     }
 
-    /// Two reasoning tokens, </think>, two answer tokens, EOS.
-    fn closes_early(_: &Value) -> Vec<u32> {
-        vec![A, A, END, Y, Y, EOS]
+    /// Two reasoning tokens, </think>, two answer tokens, EOS. After a budget's close: two answer tokens and EOS.
+    fn closes_early(g: &Value) -> Vec<u32> {
+        if g["prompt"].as_array().unwrap().last() == Some(&json!(NLNL)) {
+            vec![Y, Y, EOS]
+        } else {
+            vec![A, A, END, Y, Y, EOS]
+        }
     }
 
     const PROMPT: [u32; 2] = [6, THINK]; // "x<think>"
@@ -663,23 +664,24 @@ mod tests {
     async fn a_budget_reached_mid_thinking_closes_the_block_and_the_reply_goes_on() {
         let fake = fake_engine(endless_thinking).await;
         let (steps, g) = run(&fake, params(50, 0), 5, true).await;
-        let want = [A, A, A, A, A, NL, END, NLNL, Y, Y, EOS];
+        // the 5th reply token becomes the close (TensorFold): 4 reasoning tokens before it
+        let want = [A, A, A, A, NL, END, NLNL, Y, Y, EOS];
         assert_eq!(g.res.ids, want);
         assert_eq!(joined(&steps).1, want);
-        assert_eq!(g.res.text, "aaaaa\n</think>\n\nyy");
+        assert_eq!(g.res.text, "aaaa\n</think>\n\nyy");
         assert_eq!(joined(&steps).0, g.res.text);
         assert_eq!((g.res.finish_reason, &g.res.stop_reason), (Some("stop"), &Some(StopReason::None)));
         // usage counts each reply token once: the close counts, the cut run's tokens past the cut do not. Reasoning
         // runs through </think>, and cached_tokens is the first run's
         assert_eq!(g.res.completion_tokens, want.len());
-        assert_eq!(g.res.reasoning_tokens, 7);
+        assert_eq!(g.res.reasoning_tokens, 6);
         assert_eq!(g.res.cached_tokens, 200);
         let gens = fake.gens.lock().unwrap().clone();
         assert_eq!(gens.len(), 2);
         let mut cont = PROMPT.to_vec();
-        cont.extend([A, A, A, A, A, NL, END, NLNL]);
+        cont.extend([A, A, A, A, NL, END, NLNL]);
         assert_eq!(gens[1]["prompt"], json!(cont));
-        assert_eq!(gens[1]["max_tokens"], json!(50 - 8));
+        assert_eq!(gens[1]["max_tokens"], json!(50 - 7));
         assert_ne!(gens[0]["id"], gens[1]["id"]);
     }
 
@@ -690,7 +692,7 @@ mod tests {
         let (steps, g) = run(&fake, params(50, 0), 5, false).await;
         assert_eq!(joined(&steps), joined(&full));
         assert!(g.res.ids.is_empty()); // a stream keeps no ids
-        assert_eq!((g.res.completion_tokens, g.res.reasoning_tokens), (11, 7));
+        assert_eq!((g.res.completion_tokens, g.res.reasoning_tokens), (10, 6));
         assert_eq!(g.res.completion_tokens, g_full.res.completion_tokens);
         let close = steps.iter().find(|s| s.ids.contains(&END)).unwrap();
         assert!(close.ids.ends_with(&[NL, END, NLNL]) && close.text.contains("</think>"));
@@ -704,10 +706,19 @@ mod tests {
         assert_eq!(g.res.ids, [A, A, END, Y, Y, EOS]);
         assert_eq!((g.res.reasoning_tokens, g.res.completion_tokens, g.res.cached_tokens), (3, 6, 100));
         assert_eq!(fake.gens.lock().unwrap().len(), 1);
-        // at the budget exactly: the token there is </think> itself, which closes the block as it is
-        let (_, g) = run(&fake, params(50, 0), 2, true).await;
-        assert_eq!(g.res.ids, [A, A, END, Y, Y, EOS]);
-        assert_eq!(fake.gens.lock().unwrap().len(), 2);
+        // the budget's token is </think> itself: TensorFold replaces it with the close all the same
+        let (_, g) = run(&fake, params(50, 0), 3, true).await;
+        assert_eq!(g.res.ids, [A, A, NL, END, NLNL, Y, Y, EOS]);
+        assert_eq!(g.res.reasoning_tokens, 4);
+        assert_eq!(fake.gens.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn budget_one_makes_the_first_reply_token_the_close() {
+        let fake = fake_engine(endless_thinking).await;
+        let (_, g) = run(&fake, params(50, 0), 1, true).await;
+        assert_eq!(g.res.ids, [NL, END, NLNL, Y, Y, EOS]);
+        assert_eq!((g.res.reasoning_tokens, g.res.completion_tokens), (2, 6));
     }
 
     #[tokio::test]
@@ -722,12 +733,12 @@ mod tests {
     #[tokio::test]
     async fn the_close_is_cut_to_max_tokens() {
         let fake = fake_engine(endless_thinking).await;
-        let (steps, g) = run(&fake, params(7, 0), 5, true).await;
-        assert_eq!(g.res.ids, [A, A, A, A, A, NL, END]);
-        assert_eq!((g.res.finish_reason, g.res.completion_tokens), (Some("length"), 7));
+        let (steps, g) = run(&fake, params(6, 0), 5, true).await;
+        assert_eq!(g.res.ids, [A, A, A, A, NL, END]);
+        assert_eq!((g.res.finish_reason, g.res.completion_tokens), (Some("length"), 6));
         assert_eq!(steps.last().unwrap().finish_reason, Some("length"));
-        let (_, g) = run(&fake, params(8, 0), 5, true).await; // the whole close fits, nothing after it
-        assert_eq!(g.res.ids, [A, A, A, A, A, NL, END, NLNL]);
+        let (_, g) = run(&fake, params(7, 0), 5, true).await; // the whole close fits, nothing after it
+        assert_eq!(g.res.ids, [A, A, A, A, NL, END, NLNL]);
         assert_eq!(g.res.finish_reason, Some("length"));
         assert_eq!(fake.gens.lock().unwrap().len(), 2); // one run each: no continuation
     }
@@ -735,10 +746,10 @@ mod tests {
     #[tokio::test]
     async fn the_continuation_owes_what_is_left_of_min_tokens() {
         let fake = fake_engine(endless_thinking).await;
-        let (_, g) = run(&fake, params(50, 10), 5, true).await;
+        let (_, g) = run(&fake, params(50, 9), 5, true).await;
         let gens = fake.gens.lock().unwrap().clone();
-        assert_eq!((gens[0]["min_tokens"].clone(), gens[1]["min_tokens"].clone()), (json!(10), json!(2)));
-        // the continuation's EOS comes at reply token 11, past min_tokens
+        assert_eq!((gens[0]["min_tokens"].clone(), gens[1]["min_tokens"].clone()), (json!(9), json!(2)));
+        // the continuation's EOS comes at reply token 10, past min_tokens
         assert_eq!(g.res.finish_reason, Some("stop"));
     }
 }

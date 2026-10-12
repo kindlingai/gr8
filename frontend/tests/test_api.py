@@ -155,7 +155,7 @@ class Thinking(unittest.TestCase):
         self.assertEqual(s, 200, r)
         msg = r['choices'][0]['message']
         self.assertTrue(msg['content'].endswith('#### 42'), msg)
-        self.assertEqual(reasoning_tokens(r), 7)        # 5 tokens, then the close's "\n" and </think>
+        self.assertEqual(reasoning_tokens(r), 6)        # 4 tokens, then the close's "\n" and </think>
         self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
         chunks = sse('/v1/chat/completions', dict(body, stream_options={'include_usage': True}))
         deltas = [c['choices'][0]['delta'] for c in chunks if c['choices']]
@@ -167,15 +167,15 @@ class Thinking(unittest.TestCase):
         # every reply token once: the ids returned are the completion tokens
         s, r = post('/v1/chat/completions', dict(body, return_token_ids=True))
         self.assertEqual(len(r['choices'][0]['token_ids']), r['usage']['completion_tokens'])
-        self.assertEqual(r['choices'][0]['token_ids'][5:8], [198, 154842, 271])
+        self.assertEqual(r['choices'][0]['token_ids'][4:7], [198, 154842, 271])   # the 5th token is the close
 
     def test_budget_counts_against_max_tokens(self):
         s, r = post('/v1/chat/completions', dict(CHAT, thinking_budget=5))
-        self.assertEqual((r['usage']['completion_tokens'], reasoning_tokens(r)), (60, 7))
+        self.assertEqual((r['usage']['completion_tokens'], reasoning_tokens(r)), (60, 6))
         self.assertEqual(r['choices'][0]['finish_reason'], 'length')
         self.assertTrue(r['choices'][0]['message']['content'])
 
-    def test_budget_zero_or_null_is_no_limit(self):
+    def test_budget_zero_null_or_negative_is_no_limit_without_a_default(self):
         s, plain = post('/v1/chat/completions', CHAT)
         for b in (0, None, -3):
             s, r = post('/v1/chat/completions', dict(CHAT, thinking_budget=b))

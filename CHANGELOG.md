@@ -8,8 +8,9 @@
 - `reasoning_effort` (top level, or in `chat_template_kwargs`) must be none, minimal, low, medium, high, xhigh or max,
   and the template hears the nearest level it names, ties going higher (TensorFold 0.6.1's rule): on GLM 5.3 minimal is
   low, medium is high and xhigh is max. Before, every value but low and high rendered as max.
-- `thinking_budget` (an integer or null): after that many reply tokens still inside the think block, the next token is
-  replaced by `\n</think>\n\n` and the answer follows. The front end ends the engine run there and continues from the
+- `thinking_budget` (an integer or null), as TensorFold reads it: while the think block is open, the reply's Nth token
+  is replaced by `\n</think>\n\n` and the answer follows. 0 and null take the server default, and a negative budget is
+  no limit. The front end ends the engine run there and continues from the
   prompt, the reply and the close, so the client sees one reply. The continuation prefills the prompt's last partial
   4,096-row cell and the reasoning again (2.5-4.2 s at TP=4's cold prefill rate on the mock, frontend/README.md).
 - `--default-reasoning-effort` and `--default-thinking-budget` (`DEFAULT_REASONING_EFFORT`, `DEFAULT_THINKING_BUDGET`),

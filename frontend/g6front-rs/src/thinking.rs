@@ -53,7 +53,7 @@ pub struct Thinking {
     pub effort: Option<&'static str>,
     /// The think block's limit in reply tokens, after which the front end closes it. 0: no limit.
     pub budget: u64,
-    /// The request named a budget itself (an explicit 0 included).
+    /// The budget is the request's own positive value, not the server default.
     pub budget_explicit: bool,
 }
 
@@ -96,13 +96,19 @@ pub fn resolve(body: &Map<String, Value>, levels: &[&'static str], defaults: Def
         e => e,
     };
     let effort = explicit.or(defaults.effort).map(|e| nearest(e, levels));
-    let budget = parse_budget(body.get("thinking_budget"))?;
-    Ok(Thinking { effort, budget: budget.unwrap_or(defaults.budget), budget_explicit: budget.is_some() })
+    // TensorFold: int(budget or default), and a budget <= 0 is no limit. So 0 and null take the server default, and a
+    // negative budget is no limit even when the server has a default.
+    let (budget, budget_explicit) = match parse_budget(body.get("thinking_budget"))? {
+        None | Some(0) => (defaults.budget, false),
+        Some(n) if n < 0 => (0, false),
+        Some(n) => (n as u64, true),
+    };
+    Ok(Thinking { effort, budget, budget_explicit })
 }
 
 /// `thinking_budget`: None when absent or null. TensorFold parses it with int(): an integer, a float with no
-/// fraction, or a string holding an integer. A negative budget is no limit, as it is there (0).
-pub fn parse_budget(v: Option<&Value>) -> Result<Option<u64>, ApiError> {
+/// fraction, or a string holding an integer. Values past 64 bits saturate.
+pub fn parse_budget(v: Option<&Value>) -> Result<Option<i64>, ApiError> {
     let bad = || ApiError::bad(BUDGET_ERROR, Some("thinking_budget"));
     let n: i128 = match v {
         None | Some(Value::Null) => return Ok(None),
@@ -129,7 +135,7 @@ pub fn parse_budget(v: Option<&Value>) -> Result<Option<u64>, ApiError> {
         }
         Some(_) => return Err(bad()), // booleans, lists, objects
     };
-    Ok(Some(n.clamp(0, u64::MAX as i128) as u64))
+    Ok(Some(n.clamp(i64::MIN as i128, i64::MAX as i128) as i64))
 }
 
 /// `response_format`: absent, null or `{"type": "text"}` is plain text, which is what the engine produces.
@@ -245,10 +251,17 @@ mod tests {
         let d = Defaults { effort: Some("medium"), budget: 512 };
         let r = resolve(&body(json!({})), &GLM, d).unwrap();
         assert_eq!(r, Thinking { effort: Some("high"), budget: 512, budget_explicit: false });
-        let r = resolve(&body(json!({"reasoning_effort": "low", "thinking_budget": 0})), &GLM, d).unwrap();
-        assert_eq!(r, Thinking { effort: Some("low"), budget: 0, budget_explicit: true });
-        let r = resolve(&body(json!({"thinking_budget": null})), &GLM, d).unwrap();
-        assert_eq!(r.budget, 512);
+        // 0 and null take the default, as in TensorFold; a negative budget is no limit; a positive one wins
+        for b in [json!(0), json!(null), json!("0")] {
+            let r = resolve(&body(json!({"reasoning_effort": "low", "thinking_budget": b})), &GLM, d).unwrap();
+            assert_eq!(r, Thinking { effort: Some("low"), budget: 512, budget_explicit: false }, "{b}");
+        }
+        let r = resolve(&body(json!({"thinking_budget": -1})), &GLM, d).unwrap();
+        assert_eq!((r.budget, r.budget_explicit), (0, false));
+        let r = resolve(&body(json!({"thinking_budget": 64})), &GLM, d).unwrap();
+        assert_eq!((r.budget, r.budget_explicit), (64, true));
+        let r = resolve(&body(json!({"thinking_budget": -1})), &GLM, Defaults::default()).unwrap();
+        assert_eq!(r.budget, 0);
         assert_eq!(parse_default_effort("xhigh"), Ok("xhigh"));
         assert!(parse_default_effort("none").is_err());
         assert!(parse_default_effort("auto").is_err());
@@ -261,12 +274,13 @@ mod tests {
         assert_eq!(parse_budget(None).unwrap(), None);
         assert_eq!(p(json!(256)).unwrap(), Some(256));
         assert_eq!(p(json!(0)).unwrap(), Some(0));
-        assert_eq!(p(json!(-5)).unwrap(), Some(0)); // negative: no limit
+        assert_eq!(p(json!(-5)).unwrap(), Some(-5));
         assert_eq!(p(json!(64.0)).unwrap(), Some(64));
         assert_eq!(p(json!(" 128 ")).unwrap(), Some(128));
-        assert_eq!(p(json!("-3")).unwrap(), Some(0));
-        assert_eq!(p(json!(u64::MAX)).unwrap(), Some(u64::MAX));
-        assert_eq!(p(json!("99999999999999999999999")).unwrap(), Some(u64::MAX));
+        assert_eq!(p(json!("-3")).unwrap(), Some(-3));
+        assert_eq!(p(json!(u64::MAX)).unwrap(), Some(i64::MAX));
+        assert_eq!(p(json!("99999999999999999999999")).unwrap(), Some(i64::MAX));
+        assert_eq!(p(json!("-99999999999999999999999")).unwrap(), Some(i64::MIN));
         for v in [json!(true), json!(false), json!(1.5), json!("1.5"), json!("abc"), json!(""), json!([1]), json!({})] {
             let e = p(v.clone()).err().unwrap_or_else(|| panic!("{v} accepted"));
             assert_eq!(
