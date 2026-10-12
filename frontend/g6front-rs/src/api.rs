@@ -388,12 +388,14 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let (t1, chars) = (std::time::Instant::now(), text.len());
     let add_special = truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
+    let t2 = std::time::Instant::now();
     let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await;
     log::debug!(
-        "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms",
+        "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms, system span {system:?} tokens {:.2} ms",
         prompt.len(),
         (t1 - t0).as_secs_f64() * 1e3,
-        t1.elapsed().as_secs_f64() * 1e3
+        (t2 - t1).as_secs_f64() * 1e3,
+        t2.elapsed().as_secs_f64() * 1e3
     );
     let mut params = sampling::build(
         body,
