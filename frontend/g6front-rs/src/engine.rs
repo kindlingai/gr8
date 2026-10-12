@@ -61,6 +61,11 @@ impl Engine {
         self.conn.lock().unwrap().hello.clone()
     }
 
+    /// The engine applies `generate`'s insert rule (its hello says `"insert": true`).
+    pub fn inserts(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))
+    }
+
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move { me.run().await });

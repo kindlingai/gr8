@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-12: the engine inserts tokens (`generate` `insert`), and the thinking budget uses it
+
+- A request may carry one insert rule: once the reply holds N tokens and none of them is X, the engine puts the rule's
+  tokens (1 to 64) in place of the reply's next token, even when that token is X. S2 requests carry it as
+  `ins <N>:<X or -1>:<ids>`, and ready.s2 is version 3. The shim passes `generate`'s `insert` and says `"insert": true`
+  in its hello. It refuses `insert` with `logprobs` (an inserted token has none) and on a version-2 engine.
+- The rule is applied in s2_batch.h from the committed tokens alone, so every rank cuts at the same token. Tokens the
+  verify sampled past it are dropped, as rejected drafts are. The inserted tokens are emitted at once. At the session's
+  next round, after its run grew to the new length, they run as teacher-forced main steps (as prompt steps, each with
+  its first-form draft and the DFlash2 drafter's context), the last row sampling the token after them, then the chain.
+  The scheduler digest counts inserted tokens, so a rank that missed a rule fails at the next event. A request without
+  a rule runs as before: m4sim prints the same lines.
+- The front end sends `thinking_budget` as the rule (after N - 1 tokens, unless `</think>`, insert `\n</think>\n\n`)
+  when the engine's hello says `insert`. The cut then costs one more main step, where the continuation cost 0.8 to
+  4.2 s of prefill. With an older engine the front end still cancels and continues.
+
 ## 2026-10-12: CP: indexer keys are spread across ranks with the latent
 
 - Under CP every rank held every token's indexer keys (22 layers x 132 B per token, all CAP tokens), though a rank

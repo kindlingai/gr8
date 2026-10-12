@@ -11,7 +11,9 @@ Spec decode is simulated: rounds of 1 + accepted tokens (k=3 drafts, fixed accep
 after a prefill delay of uncached_prompt_tokens / --prefill-tps. Prefix cache: longest shared prefix with the last 64
 prompts, in whole blocks of --reuse-block tokens (64 by default; S2 reuses whole 4,096-row prefill cells and, like this,
 never the rows a request decoded). A prompt whose last assistant turn already closed its think block (a thinking
-budget's continuation) gets its reply without the reasoning. Logprobs and prompt_logprobs are fake but deterministic,
+budget's continuation) gets its reply without the reasoning. A generate frame's insert rule (PROTOCOL.md; off with
+--no-insert, which leaves `insert` out of the hello) puts its tokens in place of the reply's after_tokens+1-th, and the
+reply goes on as the continuation of a prompt that holds them. Logprobs and prompt_logprobs are fake but deterministic,
 proper (sum p < 1), and the scored token is not always the argmax.
 
 usage: mock_engine.py --model-dir DIR [--sock /tmp/g6-mock.sock]
@@ -84,7 +86,20 @@ class Mock:
             return head + enc(f'```python\ndef {name}(*args, **kwargs):\n    return None\n```'), self.stop_user
         return head, None
 
-    def stream(self, prompt, max_tokens, min_tokens, stop_ids):
+    def stream(self, prompt, max_tokens, min_tokens, stop_ids, insert=None):
+        out, stop = self.plain_stream(prompt, max_tokens, min_tokens, stop_ids)
+        if not insert:
+            return out, stop
+        after, unless, ins = insert[0]['after_tokens'], insert[0]['unless_emitted'], insert[0]['tokens']
+        if after >= len(out) or unless in out[:after]:
+            return out, stop
+        head = out[:after] + ins
+        if len(head) >= max_tokens:
+            return head[:max_tokens], None
+        rest, stop = self.plain_stream(prompt + head, max_tokens - len(head), max(0, min_tokens - len(head)), stop_ids)
+        return head + rest, stop
+
+    def plain_stream(self, prompt, max_tokens, min_tokens, stop_ids):
         ids, stop = self.script(prompt)
         out = list(ids)
         if stop is None or stop not in stop_ids or len(out) + 1 < min_tokens:
@@ -127,9 +142,11 @@ class Mock:
 
     # ---- protocol -----------------------------------------------------------------------------------------------
     async def serve(self, reader, writer):
-        wire.write_frame(writer, {'type': 'hello', 'version': 1, 'model': 'glm-5.3-mock',
-                                  'max_model_len': self.a.max_model_len, 'vocab_size': self.V,
-                                  'eos_ids': self.t.eos_ids, 'max_logprobs': 20})
+        hello = {'type': 'hello', 'version': 1, 'model': 'glm-5.3-mock', 'max_model_len': self.a.max_model_len,
+                 'vocab_size': self.V, 'eos_ids': self.t.eos_ids, 'max_logprobs': 20}
+        if not self.a.no_insert:
+            hello['insert'] = True
+        wire.write_frame(writer, hello)
         tasks: dict[str, asyncio.Task] = {}
         try:
             while True:
@@ -183,7 +200,9 @@ class Mock:
             if f.get('prompt_logprobs') is not None:
                 wire.write_frame(writer, {'type': 'prompt_logprobs', 'id': rid,
                                           'lps': self.prompt_lps(prompt, f['prompt_logprobs'])})
-            ids, stop = self.stream(prompt, max_tokens, f.get('min_tokens', 0), set(f.get('stop_ids') or []))
+            if f.get('insert') and self.a.no_insert:
+                raise ValueError('insert sent to an engine without it')
+            ids, stop = self.stream(prompt, max_tokens, f.get('min_tokens', 0), set(f.get('stop_ids') or []), f.get('insert'))
             rnd, prev = 0, prompt[-1]
             while emitted < len(ids):
                 acc = ACCEPT_CYCLE[rnd % len(ACCEPT_CYCLE)]
@@ -243,6 +262,7 @@ async def main():
     ap.add_argument('--reuse-block', type=int, default=64,
                     help='prefix cache hits are whole blocks of this many tokens (S2: 4096)')
     ap.add_argument('--reasoning-repeat', type=int, default=1, help='the canned reasoning, this many times over')
+    ap.add_argument('--no-insert', action='store_true', help='an engine without the insert rule (the hello says so)')
     ap.add_argument('--plain', action='store_true',
                     help='skip prompt-dependent scripting and the prefix cache (front-end overhead benchmarks)')
     a = ap.parse_args()

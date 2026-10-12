@@ -7,7 +7,7 @@
 
 namespace g6s2 {
 // decode_prompt: the whole prompt runs as decode steps from position 0, no tensor prefill (prompt logprobs)
-struct Payload { std::vector<int> prompt; int chunk = 4; bool decode_prompt = false; };
+struct Payload { std::vector<int> prompt; int chunk = 4; bool decode_prompt = false; g6rt::InsertRule ins; };
 struct Emission { uint32_t count = 0; bool finished = false; };
 struct DriverHooks {
     // Real TP4 pool/binding adapter: canonical base, never a per-rank first-fit.
@@ -80,7 +80,7 @@ class Driver {
     }
     Completion completion(Key k) const {
         const auto& s = scheduler_.slots()[k.slot];
-        return {k, emitted_[k.slot] - s.emitted, batch_.finished(int(k.slot))};
+        return {k, emitted_[k.slot] - s.emitted, batch_.finished(int(k.slot)), uint32_t(batch_.stats(int(k.slot)).inserted)};
     }
 public:
     Driver(Config c, DriverHooks h) : scheduler_(c), hooks_(std::move(h)),
@@ -159,7 +159,7 @@ public:
                 const auto& p = payload_[k.slot];
                 require(!initialized_[k.slot], "duplicate prompt tail");
                 const bool dfl = hooks_.dfl_ok && live() == 1 && !p.decode_prompt && hooks_.dfl_ok(k);
-                batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens), dfl}});
+                batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens), dfl, p.ins}});
                 initialized_[k.slot] = true;
                 scheduler_.complete_tail(completion(k));
             } else if (q.kind == Kind::Decode) {

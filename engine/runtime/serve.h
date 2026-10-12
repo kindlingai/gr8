@@ -28,6 +28,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "insert_rule.h"
 
 namespace g6rt {
 
@@ -39,6 +40,7 @@ struct ServeReq
     uint32_t seed = 1234u;
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
+    InsertRule ins;               // S2 only (s2/sessions.h parse_request)
 };
 
 constexpr int LP_MAX = 20;       // = glue::LP_K (rank.cuh checks)

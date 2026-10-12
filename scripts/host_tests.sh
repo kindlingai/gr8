@@ -1,7 +1,8 @@
 #!/bin/bash
-# Host-only tests (g++, no CUDA): the S2 batch planner (engine/runtime/s2_batch.h, with a DFlash2 session), the S2 control barrier, the
-# pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool
-# against the C++ one it replaced), runs that grow on demand through Driver::step (driver_grow_test), the pool's block
+# Host-only tests (g++, no CUDA): the S2 batch planner (engine/runtime/s2_batch.h, with a DFlash2 session and the insert
+# rule), the S2 control barrier, the pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs,
+# and pool_diff_test: that pool against the C++ one it replaced), runs that grow on demand through Driver::step
+# (driver_grow_test, with insert rules), the pool's block
 # store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit frame
 # (s2/control_protocol.h), and the pack manifest parser (engine/loader/g6pack.cpp).
 #   scripts/host_tests.sh
@@ -21,6 +22,8 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/batch_dflash_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dsel_test.cpp" -o "$T/batch_dsel_test"
 "$T/batch_dsel_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test"
+"$T/batch_insert_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test"
 "$T/capture_barrier_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_reuse_test.cpp" "${KVLIB[@]}" -o "$T/pool_reuse_test"

@@ -73,14 +73,18 @@ Chat usage carries `completion_tokens_details.reasoning_tokens`: the reply's tok
 them when the reply never closes its think block (TensorFold counts the same way). The response and the last stream
 chunk carry the count. The `continuous_usage_stats` chunks leave the count out.
 
-How a budget cuts. PROTOCOL.md has no way to put a token into a running request, so the cut ends the engine run (a
-`cancel`, then its `finish` is awaited) and the reply goes on in a new `generate` whose prompt is the prompt, the reply
-so far and the close, with `max_tokens` and `min_tokens` less the reply's length. The client sees one response or one
-SSE stream. Usage counts every reply token once: the close counts, and tokens the cut run made past the cut do not.
-`cached_tokens` is the first run's. The continuation is a second request to the engine, and S2's prefix reuse keeps
-only the prompt's whole 4,096-row prefill cells (decoded rows never count), so it prefills the prompt's last partial
-cell, the reasoning and the close again. On the mock with S2's reuse rule and TP=4's cold prefill rate
-(`--reuse-block 4096 --prefill-tps 1374`):
+How a budget cuts. When the engine's hello says `"insert": true` (g6m4 since ready.s2 version 3, and the mock), the
+front end sends the budget as `generate`'s insert rule (PROTOCOL.md): after N - 1 reply tokens without `</think>`, the
+close takes the next token's place. The engine applies it at the token itself, on every rank, and the reply goes on in
+the same run (engine/runtime/s2_batch.h). The close's three tokens cost one more main step and its draft.
+
+With an engine that lacks it, the cut ends the engine run (a `cancel`, then its `finish` is awaited) and the reply goes
+on in a new `generate` whose prompt is the prompt, the reply so far and the close, with `max_tokens` and `min_tokens`
+less the reply's length. The client sees one response or one SSE stream either way. Usage counts every reply token
+once: the close counts, and tokens the cut run made past the cut do not. `cached_tokens` is the first run's. The
+continuation is a second request to the engine, and S2's prefix reuse keeps only the prompt's whole 4,096-row prefill
+cells (decoded rows never count), so it prefills the prompt's last partial cell, the reasoning and the close again. On
+the mock with S2's reuse rule and TP=4's cold prefill rate (`--reuse-block 4096 --prefill-tps 1374 --no-insert`):
 
 | prompt | budget | rows prefilled again | added time |
 |---|---|---|---|
@@ -89,7 +93,7 @@ cell, the reasoning and the close again. On the mock with S2's reuse rule and TP
 | 32K | 5 / 512 / 2,048 | 3,566 / 4,129 / 5,721 | 2.5 / 3.0 / 4.2 s |
 
 The front end logs each continuation's cached tokens (`thinking budget: the continuation took N of its M prompt
-tokens from the cache`). An engine command that puts tokens into a running request would make the cut free.
+tokens from the cache`).
 
 ## Metrics mapping
 
@@ -163,8 +167,8 @@ then the successful ones replayed concurrently); `tests/bench_fronts.py` (the nu
 
 `g6s2shim.py` is the engine-side shim for `g6m4 --serve DIR`, on the head: it listens on the PROTOCOL.md socket, and up to `--s2-sessions` requests decode in one step. Stdlib only. The engine side of the file protocol is `engine/runtime/s2/{ingress.h,sessions.h,service.h,scheduler.h}`; the shim docstring has the summary:
 
-- The engine writes `DIR/ready.s2` (`G6S2 2 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>`) when every rank has booted. Version 1 (no `<max_lp>`) has no logprobs. The shim sends `hello` only after that, with `max_model_len = pool_rows - guard` (lower it with `--max-model-len`). `DIR/status.s2` (queue, free pages, the pages sessions hold and could grow to) goes into the `metrics` frame as an extra `s2` field.
-- A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [lp <k>] [plp <k>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
+- The engine writes `DIR/ready.s2` (`G6S2 3 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>`) when every rank has booted. Version 1 (no `<max_lp>`) has no logprobs, version 2 no insert rule: the shim's hello says `"insert": true` from version 3, and refuses `insert` before it. The shim sends `hello` only after that, with `max_model_len = pool_rows - guard` (lower it with `--max-model-len`). `DIR/status.s2` (queue, free pages, the pages sessions hold and could grow to) goes into the `metrics` frame as an extra `s2` field.
+- A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [lp <k>] [plp <k>] [ins <after>:<unless or -1>:<ids>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
 - Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics`), `end <reason> <stop_id> <n>` (finish frame).
 - `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice.
 - The engine ends the whole epoch on a request it cannot parse or fit, so the shim checks prompt, ids (0 to 154879: the engine does not bound-check the embedding index), `max_tokens`, `top_p` (must be in (0, 1]; 0 is an error, not off), and the length first and answers `error` itself. `logprobs` / `prompt_logprobs` (k = 0..min(`--max-logprobs`, the ready line's `<max_lp>`)) go to the engine as `lp <k>` / `plp <k>`. A `prompt_logprobs` request runs its whole prompt as 8-row decode steps, and every other session waits until that is done: an 813-token prompt held a decoding session for 10.9 s (TP4, about 13.4 ms per prompt token). `--max-plp-prompt` defaults to 1,024 tokens here (about 14 s). `top_k`/`min_p` are ignored with a warning (`top_p` and `min_tokens` go to the engine).

@@ -29,6 +29,7 @@
 // [--s2] (DEC_S2 build, needs --mtp, no --prefill / --serve): every --prompt is a session (<= 8) and their rows share
 //        steps (s2_batch.h mtp_batch, s2.cuh). Lines per session: "q<j> " + the solo line (step / draft / chain /
 //        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped.
+//        G6_S2_INSERT=q:after:unless:id,id,..[;..]: session q's insert rule (s2_batch.h), as an S2 request's `ins`
 //        G6_S2_GROW=P: the runs come from a pool of P pages (s2/pool.h) and grow on demand: each session starts with its
 //        prompt + 1 + guard rows, grows to its length + guard before each round, sits a round out when the pages would
 //        leave the pool unsafe, and gives its pages back when it finishes (cleared when another session takes them)
@@ -1205,6 +1206,23 @@ int main(int argc, char** argv)
         {
             const std::vector<int> g = parse_ints(e);
             for (int q = 0; q < NSS && q < (int)g.size(); ++q) SS[q].n_gen = g[q];
+        }
+        // G6_S2_INSERT=q:after:unless:id,id,..[;..]: session q's insert rule (s2_batch.h), unless -1 = none
+        if (const char* e = getenv("G6_S2_INSERT"))
+        {
+            const std::string spec = e;
+            for (size_t i = 0; i <= spec.size();)
+            {
+                const size_t j = std::min(spec.find(';', i), spec.size());
+                const std::string one = spec.substr(i, j - i);
+                int q, after, unless, n = 0;
+                if (sscanf(one.c_str(), "%d:%d:%d:%n", &q, &after, &unless, &n) != 3 || !n || q < 0 || q >= NSS || after < 0)
+                    die("G6_S2_INSERT=q:after:unless:id,id,..[;..]");
+                SS[q].ins.after = after; SS[q].ins.unless = unless; SS[q].ins.tokens = parse_ints(one.substr(n));
+                if (SS[q].ins.tokens.empty() || (int)SS[q].ins.tokens.size() > INSERT_MAX) die("G6_S2_INSERT: 1..64 tokens");
+                fprintf(stderr, "# s2 insert: session %d after %d unless %d, %zu tokens\n", q, after, unless, SS[q].ins.tokens.size());
+                i = j + 1;
+            }
         }
         auto go_solo = [&](int q) {
             const auto t0 = std::chrono::steady_clock::now();

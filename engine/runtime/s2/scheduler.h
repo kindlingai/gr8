@@ -72,6 +72,7 @@ struct Slot {
     Key key; Request req; Run run;
     Phase phase = Phase::Free;
     uint32_t prefilled = 0, emitted = 0;
+    uint32_t inserted = 0;   // tokens the request's insert rule put in (s2_batch.h): in the digest, so the ranks agree it fired
 };
 // reuse: prompt rows the run already holds from a retained session (pool.h match), so prefill starts there
 // reuse: rows the prefill skips. restored: 0, or 1 + the tier those rows come from (pool.h add_tier). counted: the
@@ -95,7 +96,7 @@ struct Quantum {
     uint32_t first = 0, rows = 0;
     bool solo() const { return count == 1; }
 };
-struct Completion { Key key; uint32_t emitted = 0; bool finished = false; };
+struct Completion { Key key; uint32_t emitted = 0; bool finished = false; uint32_t inserted = 0; };   // inserted: in total
 
 class Scheduler {
     Config c_;
@@ -111,6 +112,8 @@ class Scheduler {
     void finish_slot(Slot& s, const Completion& r) {
         require(s.key == r.key && r.emitted <= s.req.max_tokens - s.emitted, "invalid completion");
         s.emitted += r.emitted;
+        require(r.inserted >= s.inserted, "insert count went back");
+        s.inserted = r.inserted;
         if (r.finished || s.emitted == s.req.max_tokens) { s.phase = Phase::Retiring; ++revision_; }
         else s.phase = Phase::Decode;
     }
@@ -166,6 +169,7 @@ public:
             if (s.phase == Phase::Free) continue;
             add(s.req.id); add(s.req.prompt_tokens); add(s.req.max_tokens);
             add(s.run.first_page); add(s.run.pages); add(s.run.table_version); add(s.run.list_hash); add(s.prefilled); add(s.emitted);
+            add(s.inserted);
         }
         return h;
     }

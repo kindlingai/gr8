@@ -193,11 +193,10 @@ with these fields:
 
 `usage.completion_tokens_details.reasoning_tokens` counts the reply's tokens through its `</think>`.
 `--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (KNOBS.md).
-A budget costs a prefill when it cuts: the engine cannot take a token it did not sample, so the front end ends the run
-and continues from the prompt, the reply and the close. Prefix reuse keeps the prompt's whole 4,096-token cells and
-never the decoded reasoning, so the continuation prefills the prompt's last partial cell, the reasoning and the close
-again: about 2.5 s for a 32K prompt and a budget of 5, 4.2 s with a budget of 2,048, at TP=4's cold prefill rate. A
-request that uses `logprobs` cannot have a budget.
+The engine puts the close in place of the token itself (an insert rule, PROTOCOL.md), so a cut costs one more main step.
+With an engine from before that, the front end ends the run and continues from the prompt, the reply and the close,
+which prefills the prompt's last partial 4,096-token cell and the reasoning again: 2.5 to 4.2 s at TP=4's cold prefill
+rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 
 ## Troubleshooting
 

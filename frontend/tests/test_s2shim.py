@@ -80,9 +80,12 @@ class UnitTests(unittest.TestCase):
 
     def test_parse_ready(self):
         c = g6s2shim.parse_ready('G6S2 1 7 6 20000 2 4 8\n')
-        self.assertEqual(c, {'max_lp': 0, 'epoch': 7, 'ranks': 6, 'pool_rows': 20000, 'mtp': 2, 'guard': 4, 'max_rows': 8})
+        self.assertEqual(c, {'max_lp': 0, 'epoch': 7, 'ranks': 6, 'pool_rows': 20000, 'mtp': 2, 'guard': 4, 'max_rows': 8,
+                             'insert': False})
         self.assertEqual(g6s2shim.parse_ready('G6S2 2 7 6 20000 2 4 8 20\n')['max_lp'], 20)
-        for bad in ('G6S2 2 7 6 20000 2 4 8\n', 'G6S2 1 7 6 20000 2 4 8 20\n', 'G6S2 3 7 6 20000 2 4 8 20\n',
+        self.assertFalse(g6s2shim.parse_ready('G6S2 2 7 6 20000 2 4 8 20\n')['insert'])
+        self.assertTrue(g6s2shim.parse_ready('G6S2 3 7 6 20000 2 4 8 20\n')['insert'])
+        for bad in ('G6S2 2 7 6 20000 2 4 8\n', 'G6S2 1 7 6 20000 2 4 8 20\n', 'G6S2 4 7 6 20000 2 4 8 20\n',
                     'G6S2 1 7 6\n', 'ready\n', 'G6S2 1 7 6 20000 2 4 x\n'):
             with self.assertRaises(ValueError):
                 g6s2shim.parse_ready(bad)
@@ -123,6 +126,22 @@ class UnitTests(unittest.TestCase):
                     {'prompt': [1], 'max_tokens': 4, 'stop_ids': [-3]}, {'prompt': [1], 'max_tokens': 4, 'top_p': 2.0},
                     {'prompt': [1], 'max_tokens': 4, 'temperature': float('nan')}):
             self.assertIsNotNone(g6s2shim.build_request(bad, 0)[1], bad)
+
+    def test_build_request_insert(self):
+        rule = {'after_tokens': 7, 'unless_emitted': 154842, 'tokens': [198, 154842, 271]}
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 9, 'prompt_logprobs': 1, 'insert': [rule]}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 plp 1 ins 7:154842:198,154842,271\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 9, 'insert': [dict(rule, unless_emitted=None)]}, 0)
+        self.assertIn(b' ins 7:-1:198,154842,271\n', body)
+        self.assertNotIn(b'ins', g6s2shim.build_request({'prompt': [1], 'max_tokens': 9, 'insert': []}, 0)[0])
+        V = g6s2shim.VOCAB
+        for bad in (rule, [rule, rule], [dict(rule, after_tokens=-1)], [dict(rule, after_tokens=True)],
+                    [dict(rule, unless_emitted=V)], [dict(rule, tokens=[])], [dict(rule, tokens=[V])],
+                    [dict(rule, tokens=[1] * 65)], [dict(rule, tokens='198')], ['x']):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 9, 'insert': bad}, 0)[1], bad)
+        err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 9, 'logprobs': 0, 'insert': [rule]}, 0)[1]
+        self.assertIn('logprobs', err)
 
     def test_scan_numbers(self):
         with tempfile.TemporaryDirectory() as d:
@@ -375,6 +394,43 @@ class ConcurrentStreams(S2Base):
         self.assertIsNone(self.fake.poll())
         self.assertNotIn('EPOCH FAILED', self.fake_log())
         self.assertTrue(os.path.exists(os.path.join(self.dirs[0], 'cmd.3')))
+
+
+class InsertTests(S2Base):
+    async def test_insert_replaces_the_token_after_the_rule(self):
+        c = await self.client()
+        self.assertTrue(c.hello['insert'])
+        p, ins = [3, 1, 4], [198, 154842, 271]
+        c.send(gen('i', p, max_tokens=20, insert=[{'after_tokens': 5, 'unless_emitted': None, 'tokens': ins}]))
+        ids, fin, _ = await c.wait('i')
+        self.assertEqual(ids[:5], self.expect(p, 5))
+        self.assertEqual(ids[5:8], ins)
+        self.assertEqual((len(ids), fin['completion_tokens'], fin['reason']), (20, 20, 'length'))
+        # the unless token among the first five: no insert
+        c.send(gen('u', p, max_tokens=20, insert=[{'after_tokens': 5, 'unless_emitted': self.expect(p, 3)[2], 'tokens': ins}]))
+        ids, _, _ = await c.wait('u')
+        self.assertEqual(ids, self.expect(p, 20))
+        # an invalid rule is the request's error, and the engine lives on
+        c.send(gen('bad', p, insert=[{'after_tokens': 1, 'tokens': []}]))
+        _, fin, _ = await c.wait('bad')
+        self.assertEqual(fin['reason'], 'error')
+        c.send(gen('after', p, max_tokens=4))
+        ids, _, _ = await c.wait('after')
+        self.assertEqual(ids, self.expect(p, 4))
+
+
+class NoInsertEngine(S2Base):
+    FAKE = ('--ready-version', '2')
+
+    async def test_an_engine_without_insert(self):
+        c = await self.client()
+        self.assertNotIn('insert', c.hello)
+        c.send(gen('i', [1, 2], insert=[{'after_tokens': 1, 'unless_emitted': None, 'tokens': [5]}]))
+        _, fin, _ = await c.wait('i')
+        self.assertEqual((fin['reason'], fin['message']), ('error', 'not supported by this engine: insert'))
+        c.send(gen('ok', [1, 2], max_tokens=3))
+        ids, _, _ = await c.wait('ok')
+        self.assertEqual(ids, self.expect([1, 2], 3))
 
 
 class QueueTests(S2Base):

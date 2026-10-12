@@ -27,6 +27,13 @@
 // needs no catch-up; every DSel::probe-th of them also drafts, and its 7 drafts are scored against the tokens later
 // rounds commit. On DFlash2 rounds the MTP first-form pass already drafts d[1], which scores MTP's first position. The
 // estimates start afresh with each request.
+// Insert rule (Session::ins, insert_rule.h): the rule's tokens take the place of the reply's after+1-th token, when none
+// of the first after is `unless`. The verify's tokens after that one are dropped, as rejected drafts are. The inserted
+// tokens are committed and emitted at once. Their own steps (forced, below) run at the start of the session's next
+// round, after Driver::step has grown its run to the new length: one main step per chunk of them, teacher-forced as
+// prompt steps are, each followed by its first-form draft, the last row sampling the token after them. Then the chain.
+// Rows the verify wrote past the cut are rewritten later, as rejected drafts' rows are. The rule is a function of the
+// committed tokens alone, so every rank cuts at the same token.
 // Within a step the sessions are in ascending index and each session's rows are contiguous, in position order.
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
@@ -37,6 +44,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "insert_rule.h"
 #include "spec_len.h"
 
 namespace s2
@@ -85,11 +93,13 @@ struct Session
     int chunk = 4;                    // rows per prompt step
     int n_gen = 16;
     bool dflash = false;              // the DFlash2 drafter while the session is alone (Batch::dflash)
+    g6rt::InsertRule ins;             // off unless the request has one
 };
 struct Stats
 {
     long rounds = 0, tokens = 0, drafted = 0;
     long mtp_rounds = 0, switches = 0;    // drafter choice: a DFlash2 session's rounds on MTP, drafter switches
+    long inserted = 0;                // tokens the insert rule put in
     std::vector<long> acc;            // [K+1] rounds by accepted drafts (K = 7 for a DFlash2 session)
 };
 // one DFlash2 drafter step of session sess (dflash.cuh DflIn): context = its target rows at positions pos0 .. pos0 + rows - 1,
@@ -168,7 +178,7 @@ public:
         {
             const int q = qs[k];
             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
-            if (prompt(q, ss[k]) && !st_[q].dfl) live.push_back(q);
+            if (prompt(q, ss[k]) && !st_[q].dfl && st_[q].force < 0) live.push_back(q);
         }
         std::vector<int> all;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
@@ -199,7 +209,8 @@ public:
             if (st_[q].dfl && active(q))
             {
                 st_[q].dfl = false;
-                if (!st_[q].mtp) chain({q}, {int(Step::ROUND)}, K_);   // on MTP already: d[2..K] are drafted
+                // on MTP already: d[2..K] are drafted. Inserted tokens waiting for their steps: forced() chains them
+                if (!st_[q].mtp && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_);
                 st_[q].mtp = false;
             }
     }
@@ -216,6 +227,9 @@ public:
         if (act.size() * (K_ + 1) > (size_t)max_rows_)
             throw std::runtime_error("s2: " + std::to_string(act.size()) + " sessions x " + std::to_string(K_ + 1) + " rows > max rows " + std::to_string(max_rows_));
         cur_round_ = round_no_++; cur_active_ = (int)act.size();
+        for (int q : act) if (st_[q].force >= 0) forced(q);
+        act.erase(std::remove_if(act.begin(), act.end(), [&](int q) { return !active(q); }), act.end());
+        if (act.empty()) { cur_round_ = -1; cur_active_ = 0; return true; }
         if (act.size() == 1 && st_[act[0]].dfl) round_dfl(act[0]);
         else { demote(); round_all(act); }
         cur_round_ = -1; cur_active_ = 0;
@@ -256,14 +270,15 @@ private:
             const int* so = &t[v.row0[i]];
             int a = 0;
             while (a < k && x.d[a + 1] == so[a]) ++a;
-            for (int r = 0; r <= a; ++r) x.tokens.push_back(so[r]);
+            int kept;
+            const int c = commit(q, so, a + 1, &kept);
             sl_[q].observe(k, a, nullptr, 0);
             if (h_.round) h_.round(q, stats_[q].rounds, base[q], a, k);
             ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
             ++st_[q].rounds;
-            acc[q] = a;
-            if (h_.emit && h_.emit(q, so, a + 1, v.row0[i])) { x.done = true; continue; }
-            on.push_back(q);
+            acc[q] = std::min(kept, a);   // the draft step's rows: those whose input the session committed
+            if (h_.emit && h_.emit(q, &x.tokens[base[q] + 1], c, v.row0[i])) { x.done = true; continue; }
+            if (x.force < 0) on.push_back(q);
         }
         {                                                         // first-form draft: one step, rows a+1 of each survivor
             Step d;
@@ -273,7 +288,7 @@ private:
             {
                 const int q = v.sess[i];
                 if (st_[q].done) continue;
-                add_rows(d, q, draft_rows(q, acc[q] + 1, base[q], &t[v.row0[i]]), v.ev[i]);
+                add_rows(d, q, draft_rows(q, acc[q] + 1, base[q], &st_[q].tokens[base[q] + 1]), v.ev[i]);
             }
             if (!d.sess.empty())
             {
@@ -314,21 +329,29 @@ private:
         const std::vector<int> t = h_.run(v);
         int a = 0;
         while (a < k && dr[a + 1] == t[a]) ++a;
-        for (int r = 0; r <= a; ++r) x.tokens.push_back(t[r]);
+        int kept;
+        const int c = commit(q, t.data(), a + 1, &kept);
         if (!m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
         if (sel_.on) score(x, k, a, t.data());
         if (h_.round) h_.round(q, stats_[q].rounds, base, a, k);
         ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
         ++x.rounds;
         if (m) ++stats_[q].mtp_rounds;
-        if (h_.emit && h_.emit(q, t.data(), a + 1, 0)) { x.done = true; return; }
+        if (h_.emit && h_.emit(q, &x.tokens[base + 1], c, 0)) { x.done = true; return; }
         Step d;
         d.kind = Step::DRAFT; d.event = v.event;
         d.round = cur_round_; d.round_active = cur_active_;
-        add_rows(d, q, draft_rows(q, a + 1, base, t.data()), v.event);
+        const int dn = std::min(kept, a) + 1;   // rows whose input the session committed
+        add_rows(d, q, draft_rows(q, dn, base, &x.tokens[base + 1]), v.event);
         d.cls = row_class(d.M());
         check(d);
-        x.d[1] = h_.run(d)[a];
+        x.d[1] = h_.run(d)[dn - 1];
+        if (x.force >= 0)                 // the insert cut this round: the drafter takes the rows as context, forced() drafts
+        {
+            drafts(q, DflReq{q, dn, base, 0, x.lo, false});
+            x.pb = -1;
+            return;
+        }
         const bool nm = sel_.on && next_mtp(x);
         if (nm != m) { x.since = 0; ++stats_[q].switches; }
         ++x.since;
@@ -361,6 +384,8 @@ private:
         float pl[DFL_B] = {};
         int since = 0, mn = 0;            // drafter choice: rounds on the current drafter; MTP rounds (probe count)
         int lo = 0;                       // DFlash2: the lowest position the drafter holds context for
+        bool armed = false;               // the insert rule (s.ins) may still fire
+        int force = -1;                   // inserted tokens from this position on wait for their steps (forced); -1: none
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
     };
@@ -492,6 +517,7 @@ private:
         sl_[q] = g6rt::SpecLen();
         stats_[q] = Stats();
         x.dfl = p.dflash;
+        x.armed = p.ins.on();
         if (x.dfl && sel_.on)             // drafter choice learns each request afresh: the last request's text says little
         {
             sel_.d = fresh(sel_.d);
@@ -519,8 +545,9 @@ private:
             if (h_.prompt) h_.prompt(q, M, rows[0].pos);
             if (s == PS - 1)
             {
-                x.tokens.push_back(t[M - 1]);
-                if (h_.emit && h_.emit(q, &t[M - 1], 1, M - 1)) { x.done = true; return false; }
+                int kept;
+                const int c = commit(q, &t[M - 1], 1, &kept);
+                if (h_.emit && h_.emit(q, &x.tokens[n], c, M - 1)) { x.done = true; return false; }
             }
             std::vector<int> next(M);
             for (int r = 0; r < M; ++r) next[r] = x.tokens[rows[r].pos + 1];
@@ -530,9 +557,68 @@ private:
             check(d);
             const std::vector<int> u = h_.run(d);
             x.d[1] = u[M - 1];
-            if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, s == PS - 1 ? t[M - 1] : 0, x.lo, s == PS - 1});
+            const bool query = s == PS - 1 && x.force < 0;
+            if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, query ? t[M - 1] : 0, x.lo, query});
         }
         return true;
+    }
+    // the c tokens t a step sampled for session q (the verify's accepted ones and its bonus), committed with the insert
+    // rule applied. Returns how many tokens were committed, inserted ones included. kept: how many of t
+    int commit(int q, const int* t, int c, int* kept)
+    {
+        St& x = st_[q];
+        const int len = (int)x.tokens.size() - x.n;
+        int i = 0;
+        for (; i < c; ++i)
+        {
+            if (x.armed && len + i == x.s.ins.after) break;
+            if (t[i] == x.s.ins.unless) x.armed = false;
+            x.tokens.push_back(t[i]);
+        }
+        *kept = i;
+        if (i == c) return c;
+        x.armed = false;
+        const int m = std::max(0, std::min((int)x.s.ins.tokens.size(), x.s.n_gen - (len + i)));
+        const int from = (int)x.tokens.size();
+        x.tokens.insert(x.tokens.end(), x.s.ins.tokens.begin(), x.s.ins.tokens.begin() + m);
+        stats_[q].inserted += m;
+        if ((int)x.tokens.size() - x.n < x.s.n_gen) x.force = from;   // else the reply ends with them: no step follows
+        return i + m;
+    }
+    // the inserted tokens (positions x.force on) as session q's own steps, as its prompt steps run: each main step followed
+    // by its first-form draft and the DFlash2 drafter's context, the last main row sampling the token after them. Then the
+    // chain, unless the session drafts with DFlash2. The emit may finish the session
+    void forced(int q)
+    {
+        St& x = st_[q];
+        const int from = x.force, end = (int)x.tokens.size(), ev = x.rounds == 0 ? Step::DECODE1 : Step::ROUND;
+        x.force = -1;
+        for (int p0 = from; p0 < end; p0 += x.s.chunk)
+        {
+            const int M = std::min(x.s.chunk, end - p0);
+            const bool last = p0 + M == end;
+            std::vector<Row> rows;
+            for (int r = 0; r < M; ++r) rows.push_back(Row{q, x.tokens[p0 + r], p0 + r, p0 + r + 1, -1});
+            Step m;
+            m.kind = Step::MAIN; m.cls = row_class(M); m.event = Step::Event(ev);
+            m.round = cur_round_; m.round_active = cur_active_;
+            add_rows(m, q, rows, ev);
+            check(m);
+            const std::vector<int> t = h_.run(m);
+            if (last)
+            {
+                x.tokens.push_back(t[M - 1]);
+                if (h_.emit && h_.emit(q, &t[M - 1], 1, M - 1)) { x.done = true; return; }
+            }
+            Step d;
+            d.kind = Step::DRAFT; d.cls = row_class(M); d.event = m.event;
+            d.round = cur_round_; d.round_active = cur_active_;
+            add_rows(d, q, draft_rows(q, M, p0, &x.tokens[p0 + 1]), ev);
+            check(d);
+            x.d[1] = h_.run(d)[M - 1];
+            if (x.dfl) drafts(q, DflReq{q, M, p0, last ? t[M - 1] : 0, x.lo, last});
+        }
+        if (!x.dfl || x.mtp) chain({q}, {ev}, K_);
     }
 };
 

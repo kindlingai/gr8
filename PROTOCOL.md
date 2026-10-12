@@ -29,7 +29,8 @@ Every message in both directions is one frame:
 ```
 
 The front end refuses to serve if `version` != 1. `max_model_len` bounds prompt + max_tokens. `max_logprobs` is
-the largest k the engine accepts for `logprobs` and `prompt_logprobs`.
+the largest k the engine accepts for `logprobs` and `prompt_logprobs`. `"insert": true` (absent = false) says the
+engine applies `generate`'s `insert` rule.
 
 ## Front end -> engine
 
@@ -58,13 +59,15 @@ the largest k the engine accepts for `logprobs` and `prompt_logprobs`.
 | `logprobs` | null = none. k >= 0: for every generated token return its logprob and rank plus the top-k (k = 0 means the sampled token only) |
 | `prompt_logprobs` | null = none. k >= 0: for every prompt position j >= 1 return the logprob and rank of `prompt[j]` under the distribution predicted at j-1, plus the top-k |
 | `system_tokens` | optional (chat requests). How many of the prompt's first tokens are its system span: the leading system messages and the tool definitions as the chat template renders them, up to where the first other message begins. The engine's KV stores (`--kv-keep system`) keep system prefixes by it. Absent (completions): the engine counts every prefix of the prompt instead |
+| `insert` | optional, only to an engine whose hello says `"insert": true`. A list of at most one rule `{"after_tokens": N, "unless_emitted": X or null, "tokens": [ids]}` (1 to 64 ids): once the reply holds N tokens and none of them is X, the engine puts `tokens` in place of the reply's next token, even when that token is X. The tokens count as generated tokens, toward `max_tokens` (which cuts them short) and `completion_tokens`, and stop ids among them stop the request. The reply goes on from them as from a prompt that ended with them. Not with `logprobs`: an inserted token has none |
 
 Logprobs are of the distribution the token was sampled from **before** temperature/top-p/top-k/min-p are applied
 (vLLM's default `logprobs_mode=raw_logprobs`), log-softmax over the full vocab. Rank is 1-based over that same
 distribution (rank 1 = argmax).
 
 Speculative decoding is invisible here: the engine may emit several accepted tokens in one `tokens` frame; it
-must never emit a token it later retracts.
+must never emit a token it later retracts. An insert is the same: the engine decides it from the tokens it commits, so
+tokens it sampled past the insert are never sent.
 
 ### `cancel`
 
@@ -97,7 +100,8 @@ Ask for a counters snapshot; the engine replies with a `metrics` frame carrying 
               {"lp": -2.1,   "rank": 3, "top": [[11, -0.4],    [13, -1.3]]}]}
 ```
 
-- `ids`: one or more newly generated ids (MTP accepts arrive together), in order.
+- `ids`: one or more newly generated ids (MTP accepts arrive together), in order. Inserted tokens come in the same
+  frames as the tokens around them.
 - `logprobs`: present only if the request asked for `logprobs`; one entry per id. `lp` and `rank` are for the
   emitted id (`rank` is null when the engine does not know it: the id is below the engine's top 20, or k = 0); `top` is the top-k `[id, logprob]` pairs sorted by logprob descending (k entries; the emitted id may or
   may not be among them).
@@ -172,3 +176,5 @@ The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/
 - v1 (2026-09-30): initial.
 - v1 (2026-10-12): `generate` takes an optional `system_tokens` (an engine without KV stores ignores it). The shim
   passes it on as `sys <n>` in the request header.
+- v1 (2026-10-12): `generate` `insert` and hello `insert`. An engine without them leaves the hello key out, and the
+  front end then sends no `insert`, so the version stays 1.

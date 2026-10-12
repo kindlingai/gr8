@@ -22,6 +22,7 @@ use crate::parser::{Delta, GlmParser};
 use crate::pyjson::{self, truthy};
 use crate::template::{build_template_kwargs, normalize_tools};
 use crate::util::{new_id, now_secs};
+use crate::wire::InsertRule;
 use crate::{logprobs as L, metrics, sampling, thinking, State};
 
 const MAX_BODY: usize = 512 << 20;
@@ -467,7 +468,17 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
         if think_open(&gen.prompt, start, end) {
             let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
-            gen.thinking(end, (limit > 0).then_some(Budget { limit, close: &st.tok.think_close }));
+            if limit > 0 && !st.tok.think_close.is_empty() && st.engine.inserts() {
+                // the engine puts the close in place of the budget-th reply token itself: no second run
+                gen.params.gen.insert = Some(InsertRule {
+                    after_tokens: limit as u64 - 1,
+                    unless_emitted: Some(end),
+                    tokens: st.tok.think_close.clone(),
+                });
+                gen.thinking(end, None);
+            } else {
+                gen.thinking(end, (limit > 0).then_some(Budget { limit, close: &st.tok.think_close }));
+            }
         }
     }
     if stream {

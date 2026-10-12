@@ -600,6 +600,7 @@ mod tests {
                 logprobs: None,
                 prompt_logprobs: None,
                 system_tokens: None,
+                insert: None,
             },
             stop: vec![],
             include_stop: false,
