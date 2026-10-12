@@ -1483,7 +1483,12 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
     pf_mark(5, st);
     pf_blas_x2(m, P, i, M, st);
     bindp::launch_shared(b, st);                 // exlr8 v2 trellis shared expert; no-op otherwise
-    bindp::launch_experts(b.ex, st);
+    bindp::Expert ex = b.ex;
+    if (m.steering_scope == steering::Scope::Shared && i < (int)m.steering_dir.size() && m.layers[i].moe)
+    {
+        ex.steer_dir = m.steering_dir[i]; ex.steer_scale = P.steering_scale; ex.steer_alpha = m.steering_alpha[i];
+    }
+    bindp::launch_experts(ex, st);
     if (!P.rc_file.empty() && b.ex.on) pf_rcdump(m, P, i, M, b.ex.cnt, st);
     pf_mark(6, st);
     pf_put(P, 1, M, st);

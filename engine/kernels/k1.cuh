@@ -145,10 +145,10 @@ template <bool SH = false>
 __global__ void k1_tr3_fin(K1Args A)
 {
     const int plan = A.ctl[2];
-    tr3_fin_body<SH>(A, plan);
+    [[maybe_unused]] const bool corrected = tr3_fin_body<SH>(A, plan);
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[0] = (plan + 1) % A.n_plans;
 #if DEC_SLOT >= 2
-    if (A.slot.send) dslot::publish(A.slot, threadIdx.x < 32);      // warp 0 stored (tr3_fin_body)
+    if (A.slot.send) dslot::publish(A.slot, threadIdx.x < 32 || corrected);
 #endif
 }
 

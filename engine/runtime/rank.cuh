@@ -294,6 +294,8 @@ struct Model
     std::vector<const float*> steering_dir; // [nl], empty until verified boot activation
     std::vector<float> steering_alpha;      // [nl], immutable profile alphas
     steering::Scope steering_scope = steering::Scope::Full;
+    float* steering_part = nullptr;         // [MX][48], deterministic shared-scope finalize reductions
+    unsigned* steering_count = nullptr;     // [MX], shared across stream-ordered layer finalizers
     __half *x = nullptr, *x2 = nullptr, *q_a = nullptr, *q_a_n = nullptr, *kv_a = nullptr, *q_b = nullptr;
     __half *idx_q = nullptr, *idx_k = nullptr, *idx_w = nullptr;
     float *logits = nullptr, *hlog = nullptr, *lp = nullptr, *lpt = nullptr;
@@ -667,6 +669,12 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
         static const int fuse = getenv("G6_FUSE") ? atoi(getenv("G6_FUSE")) : 1;
         if (const char* e = bind::make_layer(y.T, M, m.sc, io, y.L[M], fuse))
             die("rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
+        if (y.moe && m.steering_scope == steering::Scope::Shared && i < (int)m.steering_dir.size())
+        {
+            bind::K1& k = y.L[M].k1;
+            k.a.steer_dir = m.steering_dir[i]; k.a.steer_scale = m.steering_scale;
+            k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
+        }
         if (y.L[M].heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
 #ifdef DEC_SLOT
         // DEC_SLOT: o_proj and the K1 finalize / dense fc2 write the partial into the send slot (decslot.cuh)

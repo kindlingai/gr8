@@ -86,6 +86,9 @@ if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run weight_check_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
+if [ "$TEST" = all ] || [ "$TEST" = steering_shared_test ]; then
+  build_run steering_shared_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
 if [ "$TEST" = all ] || [ "$TEST" = steering_consume_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run steering_consume_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }

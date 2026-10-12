@@ -71,6 +71,13 @@ struct K1Args
     int out_bf16;
     int s_direct;              // dense layer (n_slots = 0, no finalize launch): the shared/dense MLP fc2 writes out itself
     int* fctl;                 // [FCTL_N] counters of the fused fc1+fc2 launch (k1.cuh k1_tr3_fused), zero between steps
+    // shared-scope steering (MoE finalize only). The 48 hidden blocks write fixed-index dot partials; the last block
+    // sums them in index order and corrects the already combined local partial before publish. Zero row scale bypasses
+    // every steering load/store. Storage is shared across layers because launches are stream-ordered.
+    const float *steer_dir = nullptr, *steer_scale = nullptr;
+    float steer_alpha = 0.f;
+    float* steer_part = nullptr;       // [G6_MX][48]
+    unsigned* steer_count = nullptr;   // [G6_MX], zero between finalize launches
 #ifdef DEC_SLOT
     dslot::Slot slot;          // send = nullptr: out as above; else out is this rank's send slot of slot.c (decslot.cuh)
 #endif

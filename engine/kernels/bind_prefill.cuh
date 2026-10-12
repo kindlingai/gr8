@@ -1656,6 +1656,8 @@ struct Expert
     const __half* ysh = nullptr;      // [M][6144] fp16 shared expert output
     uint16_t* out = nullptr;          // [M][6144] BF16
     RsOut rs;                         // set: k_pf_fin writes its rows to the RS send slot instead of out
+    const float* steer_dir = nullptr; // shared-scope projection in this existing finalize launch
+    float steer_scale = 0.f, steer_alpha = 0.f;
 #if defined(PF_AOP) || defined(PF_F12)
     uint8_t* aop = nullptr;           // PF_AOP: [maxseg][AOP_NS][gate, up][AOPS] fragment-ready fc1 A records (k_pf_aop); nullptr = off
 #endif
@@ -3241,9 +3243,62 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
 template <bool RS = false, bool SHX = false> __global__ void __launch_bounds__(256) k_pf_fin(Expert A)
 {
     const int m = blockIdx.x;
+    __shared__ float steer_warp[8], steer_kappa;
+    const bool steer = A.steer_dir && A.steer_scale != 0.f && A.steer_alpha != 0.f;
     int p[TOPK];
     #pragma unroll
     for (int k = 0; k < TOPK; ++k) p[k] = A.pos[m * TOPK + k];
+    if (steer)
+    {
+        float dot = 0.f;
+        for (int i = threadIdx.x; i < HID / 8; i += 256)
+        {
+            float s[8];
+            if constexpr (SHX)
+            {
+                const uint4 q = *reinterpret_cast<const uint4*>(A.ysh + static_cast<size_t>(m) * HID + i * 8);
+                const uint4 sq = *reinterpret_cast<const uint4*>(A.sh_svh + i * 8);
+                const u32 qw[4] = {q.x, q.y, q.z, q.w}, sw[4] = {sq.x, sq.y, sq.z, sq.w};
+                float v[8], sv[8];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    const float2 f = __half22float2(as_h2(qw[j])), g = __half22float2(as_h2(sw[j]));
+                    v[2*j] = f.x; v[2*j+1] = f.y; sv[2*j] = g.x; sv[2*j+1] = g.y;
+                }
+                if (A.sh_sc)
+                {
+                    const float c = __half2float(A.sh_sc[(i * 8) / 128]);
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) sv[j] *= c;
+                }
+                had128_l8(v, threadIdx.x & 31);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) s[j] = rnd_h(v[j] * sv[j]);
+            }
+            else
+            {
+                const uint4 q = *reinterpret_cast<const uint4*>(A.ysh + static_cast<size_t>(m) * HID + i * 8);
+                const u32 qw[4] = {q.x, q.y, q.z, q.w};
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) { const float2 f = __half22float2(as_h2(qw[j])); s[2*j] = f.x; s[2*j+1] = f.y; }
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) dot = fmaf(s[j], A.steer_dir[i * 8 + j], dot);
+        }
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, d);
+        if ((threadIdx.x & 31) == 0) steer_warp[threadIdx.x >> 5] = dot;
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            float total = 0.f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) total += steer_warp[w];
+            steer_kappa = (A.steer_scale * A.steer_alpha) * total;
+        }
+        __syncthreads();
+    }
     for (int i = threadIdx.x; i < HID / 8; i += 256)
     {
         float a[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -3278,9 +3333,24 @@ template <bool RS = false, bool SHX = false> __global__ void __launch_bounds__(2
             }
             had128_l8(v, threadIdx.x & 31);            // 16 lanes x 8 columns = one 128-block (i = threadIdx.x + 256 n)
             #pragma unroll
-            for (int j = 0; j < 8; ++j) a[j] += rnd_h(v[j] * sv[j]);
+            for (int j = 0; j < 8; ++j) {
+                const float sh = rnd_h(v[j] * sv[j]);
+                a[j] += steer ? sh - steer_kappa * A.steer_dir[i * 8 + j] : sh;
+            }
         }
-        else add(A.ysh + static_cast<size_t>(m) * HID);
+        else if (!steer) add(A.ysh + static_cast<size_t>(m) * HID);
+        else
+        {
+            const uint4 q = *reinterpret_cast<const uint4*>(A.ysh + static_cast<size_t>(m) * HID + i * 8);
+            const u32 qw[4] = {q.x, q.y, q.z, q.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                const float2 f = __half22float2(as_h2(qw[j]));
+                a[2*j] += f.x - steer_kappa * A.steer_dir[i * 8 + 2*j];
+                a[2*j+1] += f.y - steer_kappa * A.steer_dir[i * 8 + 2*j+1];
+            }
+        }
         uint4 o;
         o.x = pack_bf2(a[0], a[1]); o.y = pack_bf2(a[2], a[3]); o.z = pack_bf2(a[4], a[5]); o.w = pack_bf2(a[6], a[7]);
         if constexpr (RS) *reinterpret_cast<uint4*>(rs_row(A.rs, m, HID) + i * 8) = o;
