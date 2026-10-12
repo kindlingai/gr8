@@ -13,6 +13,7 @@ import ipaddress
 import os
 import re
 import socket
+import struct
 import subprocess
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -101,6 +102,13 @@ KEYS = {
     'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
+    'STEERING_PROFILE': ('box', None, 'verified local schema-v1 profile directory'),
+    'STEERING_CHAT_TEMPLATE': ('box', None, 'served chat template file; resolved from the model'),
+    'STEERING_FORCE': ('cluster', None, 'force the loaded steering profile at this request scale'),
+    'STEERING_MODEL_REVISION': ('cluster', None, 'exact model revision recorded by the steering profile'),
+    'STEERING_TOKENIZER_REVISION': ('cluster', None, 'exact tokenizer revision recorded by the steering profile'),
+    'STEERING_CHAT_TEMPLATE_SHA256': ('cluster', None, 'sha256 of the served chat template recorded by the profile'),
+    'STEERING_WEIGHT_SET': ('cluster', None, 'stable exlr8 weight-set identity recorded by the steering profile'),
 }
 FLAGS = {'S2PORT': '--s2-port', 'G6_HOME': '--g6-home'}
 # Read from old config files and ignored here, so they do not draw a warning.
@@ -253,9 +261,10 @@ def parse(argv, environ=None):
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT', 'BASE_PACKS',
-              'DFLASH_DIR', 'V2_DENSE'):
-        if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or (k == 'VARIANT' and '/' not in values[k]
-                                                                               and not values[k].endswith('.json')):
+              'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE'):
+        if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or \
+                (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
+                (k == 'VARIANT' and '/' not in values[k] and not values[k].endswith('.json')):
             continue
         values[k] = os.path.abspath(values[k])   # the engine runs in G6_HOME
     return opts
@@ -309,6 +318,28 @@ def validate(o):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
+    steering = o.get('STEERING_PROFILE')
+    if o.get('STEERING_FORCE') and not steering:
+        raise OptionError('--steering-force needs --steering-profile')
+    if steering:
+        if o.get('NOHASH') == '1':
+            raise OptionError('--steering-profile requires weight hash checks (unset NOHASH)')
+        if steering.startswith('hf:'):
+            raise OptionError('--steering-profile needs a local profile directory')
+        missing = [flag_of(k) for k in ('STEERING_MODEL_REVISION', 'STEERING_TOKENIZER_REVISION',
+                                        'STEERING_CHAT_TEMPLATE_SHA256') if not o.get(k)]
+        if missing:
+            raise OptionError('--steering-profile needs ' + ', '.join(missing))
+        for key in ('STEERING_CHAT_TEMPLATE_SHA256', 'STEERING_WEIGHT_SET'):
+            if o.get(key) and not re.fullmatch(r'[0-9a-f]{64}', o.get(key)):
+                raise OptionError(flag_of(key) + ': want 64 lowercase hex digits')
+        if o.get('STEERING_FORCE'):
+            try:
+                force = float(o.get('STEERING_FORCE'))
+            except ValueError:
+                force = 0.0
+            if not (0.0 < force <= 4.0) or struct.unpack('<f', struct.pack('<f', force))[0] == 0:
+                raise OptionError('--steering-force: want a finite number in (0, 4]')
     if tp not in ('3', '4', '6'):
         raise OptionError(f'--tp {tp}: want 4, 6 or 3')
     if o.get('SHAPE') not in ('mesh', 'ring'):
@@ -436,10 +467,16 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
             env[k] = o.get(k)
+    if o.get('STEERING_PROFILE'):
+        for key in ('STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'STEERING_MODEL_REVISION', 'STEERING_TOKENIZER_REVISION'):
+            if any(c.isspace() for c in o.get(key) or ''):
+                raise OptionError(flag_of(key) + ': whitespace is not supported by the engine launcher')
+    if o.get('STEERING_PROFILE') and not env.get('STEERING_CHAT_TEMPLATE'):
+        env['STEERING_CHAT_TEMPLATE'] = '@STEERING_CHAT_TEMPLATE'
     if kv_store:
         env['KV_STORE'] = kv_store
     if rank == '@R':   # the template: v2 paths are per box
-        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE'):
+        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE'):
             if env.get(k):
                 env[k] = '@' + k
     names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO'])

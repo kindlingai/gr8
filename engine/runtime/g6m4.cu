@@ -86,6 +86,7 @@
 #include "prefix_reuse.h"
 #include "reuse_poison.cuh"
 #include "reuse_hdump.cuh"
+#include "steering_boot.cuh"
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
@@ -137,6 +138,8 @@ int main(int argc, char** argv)
     std::string kv_format;              // --kv-format fp8|int4: which latent row this binary was built for (refused otherwise)
     bool kv_old = false, kv_old_all = false;   // a deprecated --kv-tier, and whether one kept evicted runs
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
+    std::string steering_dir, steering_force_s;
+    std::string steering_model_revision, steering_tokenizer_revision, steering_template_digest, steering_weight_set, steering_template_file;
     int s2port = 0, s2sess = 8;
     unsigned long long s2epoch = 1;
     for (int i = 1; i < argc; ++i)
@@ -186,6 +189,13 @@ int main(int argc, char** argv)
             if (set_id.empty() || set_id.size() > 64 || set_id.find_first_not_of("0123456789abcdef") != std::string::npos)
                 die("--set-id must be 1..64 lowercase hex digits");
         }
+        else if (a == "--steering-profile") steering_dir = next();
+        else if (a == "--steering-weight-set") steering_weight_set = next();
+        else if (a == "--steering-force") steering_force_s = next();
+        else if (a == "--steering-model-revision") steering_model_revision = next();
+        else if (a == "--steering-tokenizer-revision") steering_tokenizer_revision = next();
+        else if (a == "--steering-chat-template") steering_template_file = next();
+        else if (a == "--steering-chat-template-sha256") steering_template_digest = next();
         else die("unknown argument " + a);
     }
     // the shared flags, under the names the rest of this file uses
@@ -237,6 +247,17 @@ int main(int argc, char** argv)
     }
     if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    steering::PreparedBoot steering_prepared;
+    try {
+        if (!steering_dir.empty() && !hash) die("--steering-profile requires weight hash checks");
+        if (!steering_dir.empty() && (set_id.empty() || steering_weight_set.empty()))
+            die("--steering-profile needs --set-id and --steering-weight-set");
+        const steering::ExpectedModel expected{"glm-5.3", steering_model_revision, steering_weight_set,
+            steering_tokenizer_revision, steering_template_digest, HID, 78};
+        steering_prepared = steering::prepare_boot(steering_dir, expected, steering_template_file, layers, steering_force_s);
+    } catch (const std::exception& e) { die(e.what()); }
+    const auto& steering_profile = steering_prepared.profile;
+    const auto& steering_boot = steering_prepared.config;
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
@@ -271,6 +292,10 @@ int main(int argc, char** argv)
     for (const std::string& ps : prompts)
     {
         Plan p = plan;
+        if (steering_boot.forced) {
+            p.steering = steering_boot.selected(steering_boot.forced_scale_bits);
+            p.steering_scale = steering::bits_float(steering_boot.forced_scale_bits);
+        }
         p.prompt = parse_ints(ps);
         if (p.prompt.empty()) die("empty prompt");
         if ((int)p.prompt.size() + p.n_gen + 2 * K > cap) die("prompt + gen (+ 2 x drafts) exceeds --cap");
@@ -507,6 +532,16 @@ int main(int argc, char** argv)
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
     build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
+    if (steering_boot.loaded)
+    {
+        try { materialize_steering(m, steering_profile, st); }
+        catch (const std::exception& e) { die(e.what()); }
+        fprintf(stderr, "# rank %d: steering profile %s manifest %s tensor %s scope %s layers %zu forced %s\n", R,
+                steering_profile.name.c_str(), steering::digest_hex(steering_profile.manifest_digest).c_str(),
+                steering::digest_hex(steering_profile.tensor_digest).c_str(), steering::scope_name(steering_profile.scope),
+                steering_profile.layers.size(), steering_boot.forced ? steering_force_s.c_str() : "off");
+        if (R == 0) fprintf(stderr, "# steering manifest %s\n", steering_profile.manifest_json.c_str());
+    }
     boot("layers bound");
 #if defined(G6_CP) && G6_CP
     if (cp_on)
@@ -724,6 +759,7 @@ int main(int argc, char** argv)
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the offline loop's cap rule
         sc.prefill_rows = (uint32_t)MP;
         sc.two_lanes = two;
+        sc.steering = steering_boot;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
         // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
@@ -1203,9 +1239,11 @@ int main(int argc, char** argv)
         // Never skip into a teacher-forced scoring tail (--pf-rows). Without tensor prefill, the decode prompt steps
         // start directly at skip.
         const int old_end = reuse.written_end, old_dirty = reuse.dirty_end;   // dirty: every row written since the last reset
-        const int skip = reuse_prefix ? reuse.begin(sp.prompt, MP ? sp.first : (int)sp.prompt.size() - 1, mtp > 0) : 0;
+        const int skip = reuse_prefix ? reuse.begin(sp.prompt, MP ? sp.first : (int)sp.prompt.size() - 1, mtp > 0,
+                                                    steering::cache_namespace(sp.steering)) : 0;
         if (skip > sp.first) sp.first = skip;
         const Plan& p = sp;
+        P.steering_scale = P2.steering_scale = p.steering_scale;
         if (pf_qp)                      // OWN=4 iff prompt + gen fits the QO table (G6_PF_QP_CTX), else OWN=2 for this request
         {
             const int ctx = (int)p.prompt.size() + p.n_gen;

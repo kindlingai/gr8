@@ -102,7 +102,12 @@ engine_args() {
   [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
   [ -n "${SPEC_ACCEPT:-}" ] && a="$a --spec-accept $SPEC_ACCEPT"
   a="$a $df $qo"
+  [ -n "${STEERING_PROFILE:-}" ] && a="$a --steering-profile $STEERING_PROFILE \
+--steering-model-revision $STEERING_MODEL_REVISION --steering-tokenizer-revision $STEERING_TOKENIZER_REVISION \
+--steering-chat-template-sha256 $STEERING_CHAT_TEMPLATE_SHA256 --steering-chat-template $STEERING_CHAT_TEMPLATE \
+--steering-weight-set ${STEERING_WEIGHT_SET:-$SET_ID} ${STEERING_FORCE:+--steering-force $STEERING_FORCE}"
   [ "$TP" = 6 ] && a="$a ${G6ARGS_X:-}"
+
   [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
   [ "${KV_FORMAT:-fp8}" = int4 ] && a="$a --kv-format int4"   # bin/g6m4-int4 (the supervisor picks it), which needs it
   (set -f; echo $a)

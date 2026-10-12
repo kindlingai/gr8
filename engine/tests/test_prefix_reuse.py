@@ -29,7 +29,9 @@ class PrefixReuseTests(unittest.TestCase):
         s = (ROOT / 'engine/runtime/g6m4.cu').read_text()
         self.assertIn('reuse_prefix = false;', s)
         self.assertLess(s.index('reuse.begin(sp.prompt'), s.index('const int PS = prompt_steps(p)'))
-        self.assertIn('reuse.begin(sp.prompt, MP ? sp.first : (int)sp.prompt.size() - 1, mtp > 0)', s)
+        # Offline reuse must use the same steering namespace as the request plan.
+        self.assertRegex(s, r'reuse\.begin\(sp\.prompt, MP \? sp\.first : \(int\)sp\.prompt\.size\(\) - 1, mtp > 0,\s*'
+                            r'steering::cache_namespace\(sp\.steering\)\)')
         self.assertIn('if (s2mode || reuse_prefix)', s)   # prompt-step row counts 1..chunk
         self.assertIn('for (int a = skip; a < p.first; a += MP)', s)
         # the reuse grid is ONE sub-batch (MP = --prefill = 4096 served), not 2 * MP

@@ -50,7 +50,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -I engine/runtime \
   engine/runtime/s2/tests/steering_transport_test.cpp -o "$T/steering_transport_test"
 (cd frontend && STEERING_TRANSPORT_CHECK="$T/steering_transport_test" python3 -m unittest tests.test_s2shim tests.test_steering)
 # the launch: options, model sets, the handshake, mentat, and four supervisors end to end on 127.0.0.1-4
-python3 -m unittest discover -s tools/launch
+g++ -std=c++17 -O2 -pthread -I engine/runtime engine/runtime/tests/steering_boot_check.cpp engine/loader/g6pack.cpp -o "$T/steering_boot_check"
+STEERING_BOOT_CHECK="$T/steering_boot_check" python3 -m unittest discover -s tools/launch
 # the container's compose file and entrypoint
 if docker compose version > /dev/null 2>&1; then docker compose -f docker/compose.yaml config -q
 else echo "(no docker compose here: compose.yaml not checked)"; fi

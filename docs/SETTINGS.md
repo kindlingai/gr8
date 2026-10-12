@@ -138,3 +138,12 @@ path. The `#if` blocks and their comments in the source are the reference:
 The head runs a shim that hands requests to the engine: `frontend/g6s2shim.py --dir <the head's DIR> --sock <sock>`
 (the head engine passes them to the other ranks over its control links). The API is the Rust front end,
 `bin/g6front-rs --model-dir <tokenizer dir> --engine-sock <sock> --port 8100`. Its flags are in `frontend/README.md`.
+
+## Local profile boot flags
+
+`--steering-profile DIR` loads one verified local profile. Supply `--steering-model-revision`,
+`--steering-tokenizer-revision`, `--steering-chat-template-sha256`, and the actual served file through
+`--steering-chat-template FILE`. The supervisor derives/checks `--steering-weight-set`; a direct engine invocation
+needs it and `--set-id` explicitly. Profile loading refuses disabled weight hash checks.
+`--steering-force SCALE` enables explicit forced qualification mode. These are g6m4 flags; m4sim does not load profiles.
+See [local steering](STEERING-LOCAL.md) for the complete contract, identity limitations and unit-test boundaries.

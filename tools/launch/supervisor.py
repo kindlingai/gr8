@@ -26,6 +26,7 @@ import hfsource
 import mentat
 import modelset
 import options as opt
+import steering_local
 
 REPO = opt.REPO
 # What the engine gets from the supervisor's environment, besides the plan's own variables.
@@ -166,13 +167,14 @@ def resolve_model(o, refresh=False, log=log):
             if release:
                 ms.source = f'{release}, base packs {ms.source}'
         ms.release = release
-        ms.drafter = drafter_of(o, ms, refresh, log)
         search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
                               release.dir if release else None) if d and os.path.isdir(d)]
         spec = o.get('VARIANT') or o.get('V2_WIDTHS')
         variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
+        steering_local.prepare(o, ms)
+        ms.drafter = drafter_of(o, ms, refresh, log)
         return ms, variant, ''
     except modelset.ModelError as e:
         return ms, variant, f'model: {e}'

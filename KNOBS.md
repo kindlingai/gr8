@@ -141,3 +141,17 @@ file is read for these keys only.
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |
 | `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine when `KV_FORMAT=int4` |
 | `SHARED` | `stage.sh` | 1 = `PACK_DIR` is a shared mount at the same path on every box; each box copies its own files |
+
+## Local steering profile
+
+Profile loading is explicit. See [local steering](docs/STEERING-LOCAL.md) for identity checks and validation limits.
+
+| key | flag | default | scope | meaning |
+|---|---|---|---|---|
+| `STEERING_PROFILE` | `--steering-profile` | unset | box | verified local schema-v1 profile directory |
+| `STEERING_FORCE` | `--steering-force` | unset | cluster | force qualification requests to this positive FP32 scale, at most 4 |
+| `STEERING_MODEL_REVISION` | `--steering-model-revision` | unset | cluster | profile's exact model revision assertion; checked against config metadata where present |
+| `STEERING_TOKENIZER_REVISION` | `--steering-tokenizer-revision` | unset | cluster | profile's exact tokenizer revision assertion; checked where present |
+| `STEERING_CHAT_TEMPLATE_SHA256` | `--steering-chat-template-sha256` | unset | cluster | must match the actual served template bytes |
+| `STEERING_WEIGHT_SET` | `--steering-weight-set` | resolved model | cluster | content identity; explicit mismatches fail |
+| `STEERING_CHAT_TEMPLATE` | `--steering-chat-template` | resolved model | box | actual served template file, resolved by the supervisor |
