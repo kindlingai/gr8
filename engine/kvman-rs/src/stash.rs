@@ -9,8 +9,11 @@
 //!   Move), or the tier drops it.
 //! - The store holds an evicted run below R by its first ceil(valid / 64) pages. A run past R (exclusive) holds the CP
 //!   map. That map's pages below R are the same logical pages on every rank, and the store keeps only those.
+//!   A hit that takes a retained run for its first pages stores that run too, as an evicted one: the grant writes past
+//!   the hit's skip, and the run's owner would keep only the shared prefix.
 //! - Counting: count() at each admission. A request that continues a live, retained or stored run (its prompt holds
-//!   all of that run's tokens but the last) counts toward nothing, so a five-turn chat counts once. Any other request
+//!   all of that run's prompt) counts toward nothing, so a five-turn chat counts once. The next prompt may carry
+//!   another reply than the run wrote: an agent client can drop the reasoning or edit the reply. Any other request
 //!   starts a conversation and counts once toward every grid-cell prefix of its prompt. The key of a prefix of S rows is
 //!   its first S + 1 tokens: the MTP layer's row S - 1 depends on token S. When a run retires, the longest counted
 //!   prefix it holds goes to the first tier that keeps shared prefixes, unless a tier has it already. The tier writes
@@ -216,7 +219,10 @@ impl Stash {
 
     /// Whether `prompt` continues a stored evicted run.
     pub(crate) fn continues_stored(&self, prompt: &[i32]) -> bool {
-        self.tiers.iter().flat_map(|t| &t.entries).any(|e| e.kind == Kind::Evicted && continues(prompt, &e.st.history))
+        self.tiers
+            .iter()
+            .flat_map(|t| &t.entries)
+            .any(|e| e.kind == Kind::Evicted && continues(prompt, &e.st.history, e.st.pf_end.max(0) as usize))
     }
 
     /// Counts a request that starts a conversation toward every grid-cell prefix of its prompt. Returns how many.
@@ -430,10 +436,9 @@ impl Stash {
     }
 }
 
-/// Whether a prompt continues a run with these tokens: the prompt holds all of them but the last. The last token has no
-/// cache row.
-pub(crate) fn continues(prompt: &[i32], run: &[i32]) -> bool {
-    run.len() > 1 && prompt.len() >= run.len() - 1 && prompt[..run.len() - 1] == run[..run.len() - 1]
+/// Whether a prompt continues a run: it holds the run's first `n` tokens (its prompt, the rows the run prefilled).
+pub(crate) fn continues(prompt: &[i32], run: &[i32], n: usize) -> bool {
+    n > 0 && n <= run.len() && prompt.len() >= n && prompt[..n] == run[..n]
 }
 
 fn slots_hash(s: &[u64]) -> u64 {

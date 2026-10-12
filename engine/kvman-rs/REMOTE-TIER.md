@@ -143,10 +143,14 @@ first. `size` is per rank, binary (G = 2^30, T = 2^40). `keep` is `evicted` (the
 ### What each tier keeps
 
 - `keep=evicted`: a retained run the pool evicts, by its first ceil(valid / 64) pages. A run past R holds the CP map,
-  whose pages below R are the same logical pages on every rank, so only those are kept.
+  whose pages below R are the same logical pages on every rank, so only those are kept. A hit that takes a retained
+  run for its first pages (another conversation with the same system prompt, say) also stores what that run held past
+  the hit's skip. Without that, the run's owner keeps only the shared prefix. On the cluster this cost agent sessions
+  their runs more often than a full pool did.
 - `keep=shared`: a prefix that started `--kv-shared-after` conversations (default 3). A request counts at admission.
-  When it continues a live, retained or stored run (its prompt holds all of that run's tokens but the last), it counts
-  toward nothing, so a five-turn chat counts once. Otherwise it counts once toward every grid-cell prefix of its
+  When it continues a live, retained or stored run (its prompt holds all of that run's prompt), it counts toward
+  nothing, so a five-turn chat counts once. The next prompt may carry another reply than the run wrote: an agent
+  client can drop the reasoning or edit the reply. Otherwise it counts once toward every grid-cell prefix of its
   prompt (4,096 rows served). The key of a prefix of S rows is its first S + 1 tokens, since the MTP layer's row S - 1
   depends on token S. When a run retires, the longest counted prefix it holds that no tier has yet is written once to
   the first tier that keeps shared prefixes. In practice that prefix is the system prompt and tool definitions. The

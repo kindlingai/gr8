@@ -364,3 +364,29 @@ fn shared_prefixes_survive_a_restart_and_a_torn_record_does_not() {
     assert!(open("model-a tp4").pool.stash().unwrap().entries(0).is_empty(), "the other model's index replaced it");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_hit_on_a_shared_prefix_keeps_the_rest_of_the_run_it_takes() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(32, Keep::Evicted)], 3);
+    let system = toks(1, 200);
+    let mut a = system.clone();
+    a.extend(toks(2, 300));
+    let (_, _, a_hist) = session(&mut r, &a, 20);
+    // b shares only the system prompt: its hit takes a's run for 128 rows, and the rest of a's run goes to the tier
+    let mut b = system.clone();
+    b.extend(toks(3, 100));
+    session(&mut r, &b, 20);
+    assert_eq!(r.pool.stash().unwrap().entries(0).len(), 1, "a's run is in the tier");
+    // a's next turn carries its own prompt and an edited reply: it continues a, and a's rows come back
+    let mut a2 = a.clone();
+    a2.extend(toks(4, 30));
+    assert_eq!(r.pool.count(&a2), 0);
+    let h = r.pool.match_prefix(&a2, a2.len() as u64 + 10, a2.len() as u64 + 10, a2.len() as i32 - 1);
+    assert!(h.stored && h.skip == 384, "{h:?}");
+    let run = r.pool.take_hit(h.skip, h.age, Some(0), a2.len() as u64 + 10, a2.len() as u64 + 10).unwrap();
+    r.run_io();
+    let list = r.pool.list(&run).unwrap().to_vec();
+    for row in 0..h.skip as usize {
+        assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], a_hist[row]);
+    }
+}

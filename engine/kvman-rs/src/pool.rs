@@ -228,8 +228,8 @@ impl Pool {
         if !s.counting() {
             return 0;
         }
-        let continuing = self.held.values().any(|h| continues(prompt, &h.tokens))
-            || self.kept.iter().any(|k| continues(prompt, &k.st.history))
+        let continuing = self.held.values().any(|h| continues(prompt, &h.tokens, h.tokens.len().saturating_sub(1)))
+            || self.kept.iter().any(|k| continues(prompt, &k.st.history, k.st.pf_end.max(0) as usize))
             || s.continues_stored(prompt);
         self.next_tokens = Some(prompt.to_vec());
         self.stash.as_mut().expect("checked").count(prompt, continuing)
@@ -542,7 +542,13 @@ impl Pool {
             return Err(Error::NoRoom);
         }
         self.check_version()?;
-        let mut list = self.kept.remove(i).list;
+        let k = self.kept.remove(i);
+        // the grant keeps the run's first a pages and writes past its skip: what the run held beyond that goes to a
+        // tier, read before the grant writes
+        if k.st.valid > skip {
+            self.spill(std::slice::from_ref(&k));
+        }
+        let mut list = k.list;
         list.truncate(a as usize);
         if self.exclusive(worst) {
             let gone = std::mem::take(&mut self.kept);
