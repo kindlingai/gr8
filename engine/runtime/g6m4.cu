@@ -772,6 +772,14 @@ int main(int argc, char** argv)
         // and before the next quantum's fabric waits (G6_SPIN_TIMEOUT_CYC, ~10 s), so the skew between ranks' drains is
         // the number that matters, and only the lines of every rank show it.
         std::atomic<bool> kv_drained{false};   // the head drains a cancelled run on its control thread
+        // G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>], TEST ONLY: that rank sleeps <ms> inside every <every>th tier drain that
+        // copies anything (default every one), as a drain stalled on its store would. Reproduces the rank skew the
+        // barrier after a drain (NativeHooks::drained) has to absorb.
+        int kv_delay_rank = -1, kv_delay_ms = 0, kv_delay_every = 1;
+        long kv_delay_n = 0;
+        if (const char* e = getenv("G6_KV_DRAIN_DELAY"))
+            if (sscanf(e, "%d:%d:%d", &kv_delay_rank, &kv_delay_ms, &kv_delay_every) < 2 || kv_delay_ms < 0 || kv_delay_every < 1)
+                die("G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]");
         auto kv_drain = [&] {
             if (!kvt) return;
             const auto io = pool.io();
@@ -779,6 +787,12 @@ int main(int argc, char** argv)
             if (!io.empty())
             {
                 kv_drained = true;
+                if (R == kv_delay_rank && ++kv_delay_n % kv_delay_every == 0)
+                {
+                    fprintf(stderr, "# rank %d: G6_KV_DRAIN_DELAY: sleeping %d ms in tier drain %ld at %lld ms\n", R, kv_delay_ms, kv_delay_n,
+                            (long long)g6s2::s2_wall_ms());
+                    std::this_thread::sleep_for(std::chrono::milliseconds(kv_delay_ms));
+                }
                 size_t n[3] = {0, 0, 0};
                 for (const auto& x : io) ++n[x.kind];
                 fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s\n", R,
