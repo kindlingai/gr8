@@ -1,5 +1,7 @@
 # gr8: a super-fast local AI engine
 
+Need help? Join us on discord: https://discord.gg/M7XTrRJW3
+
 Full GLM-5.3 on DGX Spark (GB10). Early release. If you run it, tell us what breaks: issues and PRs are welcome.
 
 gr8 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
