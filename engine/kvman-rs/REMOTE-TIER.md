@@ -169,6 +169,11 @@ its grant and requires the same values and the same pages. The pool digest folds
 id, key, valid rows and slots) and the count table, so a rank whose tiers differ fails at the next event. I/O results
 and timing never feed back into a decision.
 
+The same copies take a different time on each rank, and a GPU wait for a peer's rows gives up after ~10 s
+(`G6_SPIN_TIMEOUT_CYC`). So after any drain that copied something, every rank passes a barrier before the next round
+(`EventEndpoint::sync`, a Sync/Go round on the control links, run from the Driver's `settle` hook after growth). The copy
+lists are the same on every rank, so every rank passes the same barriers. With no tiers there is no hook and no frame.
+
 ### The copies
 
 Each pool call that can queue copies (reserve, take, grow, retain) leaves a list, in order: spills (page to block) and
@@ -253,12 +258,26 @@ total), rows at 13.7 us p50 (6.0 us alone), a 2,048-row gather 1.77 ms (0.85 alo
 Ranks byte-identical: every block of the SSD tier was the same on all four ranks, 512 slots (shared prefixes), 1,895
 slots (whole evicted runs, decode rows included, moved on from the KV node) and 1,164 slots in three runs.
 
-Not resolved: the 8-agent replay (both captures, six turns each, all at once) with the KV node + SSD tiers lost the
-cluster twice, on the first KV-node build and on the dedupe build, once after 38 s and once after 35 requests. The
-second time every rank stopped with "S2 prefill fabric/attention error" on the request after a drain of 469 spilled, 317
-moved and 256 restored pages. The same replay on the first KV-node build after a restart finished all 47 turns. A
-three-tier case of the batched copies did corrupt blocks (95cc5e0 fixes it), but these runs had two tiers. The engine's
-fabric and the KV node share each box's rail-0 NIC.
+The 8-agent replay (both captures, six turns each, all at once) with the KV node + SSD tiers lost the cluster twice
+before the barrier above, once after 38 s and once after 35 requests: every rank stopped with "S2 prefill
+fabric/attention error". The cause was one rank's drain running seconds longer than the others'. Logging every rank's
+drains showed it: the same drain took 5.0 s on one rank and 1.3 s on the other three, and in three later clean runs the
+ranks' drain ends spread by up to 2.6, 3.8 and 4.4 s, with the slow rank changing from drain to drain. The KV node's
+writes are what vary: four ranks write into efcd's one 100G port with no PFC, and the switch dropped 23-27 million
+packets on that port in each 8-agent run (90-190 thousand on each GLM box's port).
+
+`G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]` (test only: that rank sleeps inside every `every`th drain that copies
+anything) makes it deterministic. Without the barrier, 12 s on rank 2's first drain failed the epoch at the next prefill
+with the crashes' text on every rank. Ranks 0, 1 and 3 printed `extra 63000c02`, a CP staging wait (`k_cp_pf_wait`,
+`0x63000c00 | flag << 8 | peer`) for peer 2 that timed out 25 s into the quantum; rank 2 was still asleep. With the
+barrier, ten such 12 s drains on rank 2 in the evict run passed: the ranks started every prefill quantum within 45 ms of
+each other, each affected TTFT grew by the 12 s, and the eight turns' first tokens and logprobs were those of the runs
+without the delay.
+
+With the barrier and no delay, the 8-agent replay ran clean twice: all 47 turns in 1,469 s and 1,609 s (TTFT median
+137 and 167 s, p90 370 and 407 s), every turn's first token and logprob those of `main` without a tier (2,354 s, median
+198 s, p90 598 s). The ranks' drain ends spread by up to 5.0 and 7.3 s in those two runs, the second close to the GPU
+wait timeout; the barrier took both.
 
 ### Byte-identical ranks, and one copy for all
 
@@ -273,9 +292,9 @@ read the whole run. Until the cluster check, each rank keeps its own store.
 
 ### Still to do
 
-- On the cluster: the byte-identical check above, the four-box measurement through efcd's 100G port, and an end-to-end
-  run with an SSD tier and a KV node (TTFT on agent traces against `main`, output identical to `main` for the same
-  requests, the tiers' counters in `status.s2`).
 - The DFlash2 drafter's prompt-context taps come from the prefill a hit skips, so a restored run drafts like a pool
   hit does today.
 - `status.s2` carries each tier's counters. The front ends do not export them yet.
+- One store for all ranks (above): the cluster showed the blocks are byte-identical.
+- A KV node shared by four writers needs a port that does not drop: PFC or ECN on the switch port to the node, or a
+  rate limit in the client. The barrier keeps the ranks in step, but each slow drain still costs every rank its time.

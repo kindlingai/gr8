@@ -15,8 +15,13 @@
 - The head counts and matches, and the grant carries the restored tier and the count. The control frames are version
   `G6S2E4`, so every rank needs this build. Without `--kv-tier` the pool does no extra work and its digest is unchanged.
 - On the TP=4 cluster an evicted agent turn came back in 2.2-5.1 s (12.9-17.1 s without a tier), a stored system
-  prompt after a restart in 1.3-1.4 s (~10 s cold), and the restored blocks were the same on all four ranks. An 8-agent replay
-  with a KV node tier stopped the cluster twice, cause not yet found. `engine/kvman-rs/REMOTE-TIER.md` has the numbers.
+  prompt after a restart in 1.3-1.4 s (~10 s cold), and the restored blocks were the same on all four ranks.
+  `engine/kvman-rs/REMOTE-TIER.md` has the numbers.
+- After a tier's copies the ranks pass a barrier (a Sync/Go round on the control links, frames `Sync` and `Go`) before
+  the next round. One rank's copies to a KV node ran seconds longer than another's, and a skew near 10 s failed the next
+  prefill's GPU waits with "S2 prefill fabric/attention error": an 8-agent replay lost the cluster twice that way. The
+  prefill error now prints each error word, the layer, the request and the time into the quantum, and every rank logs
+  its drains with the wall clock. `G6_KV_DRAIN_DELAY` and `G6_S2_BIND_DELAY` are test-only knobs that stall one rank.
 
 ## 2026-10-11: a remote KV page store, and `./gr8 kv` to run its node
 
