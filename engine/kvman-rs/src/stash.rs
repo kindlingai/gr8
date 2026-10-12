@@ -62,7 +62,8 @@ pub enum Io {
     Restore { tier: u32, slot: u64, page: u32 },
 }
 
-/// A stored run or prefix: its blocks hold its first slots.len() pages, and st is what match() runs begin() on.
+/// A stored run or prefix, and st is what match() runs begin() on. Its first pages are the blocks of `base` (a shared
+/// prefix entry's id and its pages), when it has one, and its own slots hold the pages after them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub id: u64,
@@ -70,6 +71,14 @@ pub struct Entry {
     pub key: u64,
     pub st: Finished,
     pub slots: Vec<u64>,
+    pub base: Option<(u64, usize)>,
+}
+
+impl Entry {
+    /// The pages it can restore: its base's and its own.
+    pub fn pages(&self) -> usize {
+        self.base.map_or(0, |b| b.1) + self.slots.len()
+    }
 }
 
 /// Counters for status.s2, per tier.
@@ -111,7 +120,7 @@ pub struct Stash {
     shared_after: u32,
     grid: u64,
     next_id: u64,
-    pin: Option<(usize, u64)>,
+    pin: Vec<u64>,
     pub index_errors: u64,
 }
 
@@ -137,7 +146,7 @@ impl Stash {
             shared_after: shared_after.max(1),
             grid: if grid == 0 { GRID } else { grid },
             next_id: 1,
-            pin: None,
+            pin: Vec::new(),
             index_errors: 0,
         }
     }
@@ -296,14 +305,34 @@ impl Stash {
         }
     }
 
+    // the longest stored shared prefix that `history` starts with and whose pages fit in `max_pages`: (id, pages)
+    fn shared_base(&self, history: &[i32], max_pages: usize) -> Option<(u64, usize)> {
+        self.tiers
+            .iter()
+            .flat_map(|t| &t.entries)
+            .filter(|e| e.kind == Kind::Shared && e.slots.len() <= max_pages && history.starts_with(&e.st.history))
+            .max_by_key(|e| (e.slots.len(), e.id))
+            .map(|e| (e.id, e.slots.len()))
+    }
+
     fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32]) {
-        let Some((t, slots)) = self.place(0, kind, pages.len()) else { return };
-        self.io.extend(pages.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier: t as u32, page, slot }));
+        // a run that starts with a stored shared prefix stores only the pages after it
+        let base = if kind == Kind::Evicted { self.shared_base(&st.history, pages.len()) } else { None };
+        let own = &pages[base.map_or(0, |b| b.1)..];
+        if own.is_empty() {
+            return;
+        }
+        let pin = std::mem::take(&mut self.pin);
+        self.pin = pin.iter().copied().chain(base.map(|b| b.0)).collect();
+        let placed = self.place(0, kind, own.len());
+        self.pin = pin;
+        let Some((t, slots)) = placed else { return };
+        self.io.extend(own.iter().zip(&slots).map(|(&page, &slot)| Io::Spill { tier: t as u32, page, slot }));
         let id = self.next_id;
         self.next_id += 1;
         let tier = &mut self.tiers[t];
-        tier.stats.spilled_pages += pages.len() as u64;
-        tier.entries.push(Entry { id, kind, key, st, slots });
+        tier.stats.spilled_pages += own.len() as u64;
+        tier.entries.push(Entry { id, kind, key, st, slots, base });
         if kind == Kind::Shared && tier.index.is_some() {
             self.commits.push((t, id));
         }
@@ -321,8 +350,7 @@ impl Stash {
 
     fn make_room(&mut self, t: usize, n: usize) -> bool {
         while self.tiers[t].alloc.free() < n as u64 {
-            let pin = self.pin;
-            let Some(i) = self.tiers[t].entries.iter().position(|e| pin != Some((t, e.id))) else { return false };
+            let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else { return false };
             let e = self.tiers[t].entries.remove(i);
             self.evict(t, e);
         }
@@ -337,7 +365,12 @@ impl Stash {
             }
         }
         self.commits.retain(|c| *c != (t, e.id));
-        match self.place(t + 1, e.kind, e.slots.len()) {
+        // the base of a run on the move must stay while the run finds a place
+        let pinned = self.pin.len();
+        self.pin.extend(e.base.map(|b| b.0));
+        let placed = self.place(t + 1, e.kind, e.slots.len());
+        self.pin.truncate(pinned);
+        match placed {
             Some((u, new)) => {
                 self.io.extend(e.slots.iter().zip(&new).map(|(&slot, &to_slot)| Io::Move {
                     tier: t as u32,
@@ -352,9 +385,36 @@ impl Stash {
                 }
                 self.tiers[u].entries.insert(0, Entry { slots: new, ..e.clone() });
             }
-            None => self.tiers[t].stats.dropped += 1,
+            None => {
+                self.tiers[t].stats.dropped += 1;
+                if e.kind == Kind::Shared {
+                    self.drop_dependents(e.id);
+                }
+            }
         }
         self.tiers[t].alloc.release(&e.slots);
+    }
+
+    // a shared prefix left every tier: the runs stored on top of it go too
+    fn drop_dependents(&mut self, id: u64) {
+        for t in 0..self.tiers.len() {
+            let all = std::mem::take(&mut self.tiers[t].entries);
+            let (gone, keep): (Vec<Entry>, Vec<Entry>) =
+                all.into_iter().partition(|e| e.base.is_some_and(|b| b.0 == id));
+            self.tiers[t].entries = keep;
+            for e in gone {
+                self.tiers[t].alloc.release(&e.slots);
+                self.tiers[t].stats.dropped += 1;
+            }
+        }
+    }
+
+    /// Where a shared entry is now: (tier, its slots).
+    fn locate(&self, id: u64) -> Option<(usize, &[u64])> {
+        self.tiers
+            .iter()
+            .enumerate()
+            .find_map(|(t, x)| x.entries.iter().find(|e| e.id == id).map(|e| (t, &e.slots[..])))
     }
 
     pub(crate) fn find(&self, t: usize, id: u64) -> Option<&Entry> {
@@ -370,18 +430,34 @@ impl Stash {
         tier.stats.hits += 1;
         if e.kind == Kind::Shared {
             tier.entries.push(e.clone());
-            self.pin = Some((t, id));
+            self.pin.push(id);
         }
+        self.pin.extend(e.base.map(|b| b.0));
         e
     }
 
     pub(crate) fn restore(&mut self, t: usize, e: &Entry, pages: &[u32]) {
-        self.io.extend(e.slots.iter().zip(pages).map(|(&slot, &page)| Io::Restore { tier: t as u32, slot, page }));
-        self.tiers[t].stats.restored_pages += pages.len() as u64;
+        let b = e.base.map_or(0, |b| b.1).min(pages.len());
+        if let Some((base, _)) = e.base {
+            let (u, slots) = self.locate(base).expect("a base outlives the runs on it");
+            let copies: Vec<Io> = slots
+                .iter()
+                .zip(&pages[..b])
+                .map(|(&slot, &page)| Io::Restore { tier: u as u32, slot, page })
+                .collect();
+            self.io.extend(copies);
+            self.tiers[u].stats.restored_pages += b as u64;
+        }
+        self.io.extend(e.slots.iter().zip(&pages[b..]).map(|(&slot, &page)| Io::Restore {
+            tier: t as u32,
+            slot,
+            page,
+        }));
+        self.tiers[t].stats.restored_pages += (pages.len() - b) as u64;
         if e.kind == Kind::Evicted {
             self.tiers[t].alloc.release(&e.slots);
         }
-        self.pin = None;
+        self.pin.clear();
     }
 
     /// The entries loaded from indexes, one line each. Every rank compares these lines at boot.
@@ -427,6 +503,9 @@ impl Stash {
             h = mix(mix(h, t.slots), t.alloc.free());
             for e in &t.entries {
                 h = mix(mix(mix(mix(h, e.id), e.key), e.st.valid as i64 as u64), slots_hash(&e.slots));
+                if let Some((id, n)) = e.base {
+                    h = mix(mix(h, id), n as u64);
+                }
             }
         }
         for (k, c) in &self.counts {
@@ -519,7 +598,14 @@ fn decode(p: &[u8]) -> Option<Result<Entry, u64>> {
             let history = (0..n).map(|_| c.u32().map(|t| t as i32)).collect::<Option<Vec<_>>>()?;
             let n = c.u32()? as usize;
             let slots = (0..n).map(|_| c.u64()).collect::<Option<Vec<_>>>()?;
-            Some(Ok(Entry { id, kind: Kind::Shared, key, st: Finished { history, valid, written_end, pf_end }, slots }))
+            Some(Ok(Entry {
+                id,
+                kind: Kind::Shared,
+                key,
+                st: Finished { history, valid, written_end, pf_end },
+                slots,
+                base: None,
+            }))
         }
         2 => Some(Err(c.u64()?)),
         _ => None,

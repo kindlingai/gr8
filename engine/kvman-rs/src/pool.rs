@@ -453,7 +453,7 @@ impl Pool {
                     continue;
                 }
                 let a = pages_for(b.skip as u64);
-                if a > e.slots.len() as u64 || !self.restore_room(a, n, w, worst) {
+                if a > e.pages() as u64 || !self.restore_room(a, n, w, worst) {
                     if best.skip == 0 {
                         best.why = Why::Room;
                     }
@@ -486,7 +486,7 @@ impl Pool {
         let e = self.stash.as_ref().and_then(|s| s.find(tier, id)).ok_or(Error::NotRetained)?;
         let w = pages_for(worst);
         let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w } else { pages_for(rows) });
-        if a > e.slots.len() as u64 || !self.restore_room(a, n, w, worst) {
+        if a > e.pages() as u64 || !self.restore_room(a, n, w, worst) {
             return Err(Error::NoRoom);
         }
         self.check_version()?;

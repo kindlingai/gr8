@@ -129,6 +129,9 @@ uint64_t g6kv_tier_block_bytes(const g6kv_tier* t);
 void g6kv_tier_describe(const g6kv_tier* t, char* buf, size_t cap);
 int g6kv_tier_write(const g6kv_tier* t, uint64_t block, const void* buf);
 int g6kv_tier_read(const g6kv_tier* t, uint64_t block, void* buf);
+// n blocks at once, blocks[i] from or into bufs[i], on up to 8 threads (RDMA lanes, O_DIRECT requests)
+int g6kv_tier_write_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, void* const* bufs);
+int g6kv_tier_read_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, void* const* bufs);
 // staging memory a KV node's RDMA device may read and write directly (a no-op for the other stores)
 int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
 }

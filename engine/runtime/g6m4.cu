@@ -770,7 +770,15 @@ int main(int argc, char** argv)
         // the copies the pool queued: run them before anything writes those pages, then commit what they wrote
         auto kv_drain = [&] {
             if (!kvt) return;
-            kvt->run(pool.io(), st);
+            const auto io = pool.io();
+            kvt->run(io, st);
+            if (R == 0 && !io.empty())
+            {
+                size_t n[3] = {0, 0, 0};
+                for (const auto& x : io) ++n[x.kind];
+                fprintf(stderr, "# s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms)\n", n[0], n[1], n[2],
+                        kvt->last_ms, kvt->last_device_ms);
+            }
             if (const char* e = pool.io_done()) fprintf(stderr, "# rank %d: s2 tier index: %s\n", R, e);
         };
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)

@@ -94,7 +94,7 @@ class KvTiers {
     }
 public:
     uint64_t spilled = 0, moved = 0, restored = 0;
-    double ms = 0;
+    double ms = 0, last_ms = 0, last_device_ms = 0;
     explicit KvTiers(const std::vector<const G6AttnBinding*>& bindings) : pb_(bindings) {}
     ~KvTiers() { for (auto* t : t_) g6kv_tier_free(t); }
     KvTiers(const KvTiers&) = delete;
@@ -114,35 +114,42 @@ public:
     }
     size_t size() const { return t_.size(); }
     std::string describe(size_t i) const { char b[256]; g6kv_tier_describe(t_[i], b, sizeof b); return b; }
-    // the pool's copies, in order: runs of spills (pages -> blocks, a batch per kernel), moves (block -> block) and
-    // restores (blocks -> pages)
+    // the pool's copies, in order: runs of spills (pages -> blocks), moves (block -> block) and restores (blocks ->
+    // pages), each a batch of up to batch() blocks. A batch's store reads and writes go out at once, per tier.
     void run(const std::vector<g6kv_io>& io, cudaStream_t st) {
         if (io.empty()) return;
         const auto t0 = std::chrono::steady_clock::now();
+        double dev = 0;
         size_t i = 0;
+        // blocks[j] of tier t[j] from or into host(j)
+        auto many = [&](const std::vector<uint32_t>& t, const std::vector<uint64_t>& blocks, bool write) {
+            for (uint32_t tier = 0; tier < t_.size(); ++tier) {
+                std::vector<uint64_t> b; std::vector<void*> p;
+                for (size_t j = 0; j < t.size(); ++j) if (t[j] == tier) { b.push_back(blocks[j]); p.push_back(pb_.host((int)j)); }
+                if (b.empty()) continue;
+                ck(write ? g6kv_tier_write_many(t_[tier], b.size(), b.data(), p.data())
+                         : g6kv_tier_read_many(t_[tier], b.size(), b.data(), p.data()), write ? "write" : "read");
+            }
+        };
+        auto device = [&](const std::vector<int>& pages, bool out) {
+            const auto d0 = std::chrono::steady_clock::now();
+            pb_.copy(pages, out, st);
+            dev += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
+        };
         while (i < io.size()) {
-            const g6kv_io& x = io[i];
-            if (x.kind == 1) {   // a move: one block through host(0)
-                ck(g6kv_tier_read(t_.at(x.tier), x.slot, pb_.host(0)), "read");
-                ck(g6kv_tier_write(t_.at(x.to), x.to_slot, pb_.host(0)), "write");
-                ++moved; ++i;
-                continue;
+            const uint32_t kind = io[i].kind;
+            std::vector<int> pages; std::vector<uint32_t> from, to; std::vector<uint64_t> slots, to_slots;
+            while (i < io.size() && io[i].kind == kind && (int)pages.size() < pb_.batch()) {
+                pages.push_back((int)io[i].page); from.push_back(io[i].tier); to.push_back(io[i].to);
+                slots.push_back(io[i].slot); to_slots.push_back(io[i].to_slot); ++i;
             }
-            std::vector<int> pages; std::vector<const g6kv_io*> part;
-            while (i < io.size() && io[i].kind == x.kind && (int)pages.size() < pb_.batch()) {
-                pages.push_back((int)io[i].page); part.push_back(&io[i]); ++i;
-            }
-            if (x.kind == 0) {
-                pb_.copy(pages, true, st);
-                for (size_t j = 0; j < part.size(); ++j) ck(g6kv_tier_write(t_.at(part[j]->tier), part[j]->slot, pb_.host((int)j)), "write");
-                spilled += pages.size();
-            } else {
-                for (size_t j = 0; j < part.size(); ++j) ck(g6kv_tier_read(t_.at(part[j]->tier), part[j]->slot, pb_.host((int)j)), "read");
-                pb_.copy(pages, false, st);
-                restored += pages.size();
-            }
+            if (kind == 0) { device(pages, true); many(from, slots, true); spilled += pages.size(); }
+            else if (kind == 1) { many(from, slots, false); many(to, to_slots, true); moved += pages.size(); }
+            else { many(from, slots, false); device(pages, false); restored += pages.size(); }
         }
-        ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ms += t;
+        last_ms = t; last_device_ms = dev;
     }
     // spills pages to tier 0 and reads them back, with `between` run in the middle (the round-trip check)
     void round_trip(const std::vector<int>& pages, cudaStream_t st, const std::function<void()>& between) {

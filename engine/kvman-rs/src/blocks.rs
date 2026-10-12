@@ -5,7 +5,7 @@
 //! A block's bytes are rounded up to 4 KiB, the slot an SSD needs, so every store takes the same buffers.
 
 use crate::remote::{Opts, RemoteStore};
-use crate::tier::{BlockStore, SlotFile, ALIGN};
+use crate::tier::{par_for, BlockStore, SlotFile, ALIGN};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io;
@@ -40,7 +40,10 @@ impl Blocks {
                 } else {
                     format!("{rest}:{}", crate::remote::proto::DEFAULT_PORT)
                 };
-                Ok(Blocks::Remote(Box::new(RemoteStore::open(&addr, &Opts::new(name, slot, blocks))?)))
+                // four ranks share one switch port without PFC: a dropped packet costs one ack timeout, and 4.096 us *
+                // 2^17 (0.5 s) leaves room for the retries before a lane fails
+                let o = Opts { lanes: THREADS, qp_timeout: 17, ..Opts::new(name, slot, blocks) };
+                Ok(Blocks::Remote(Box::new(RemoteStore::open(&addr, &o)?)))
             }
             "mem" => Ok(Blocks::Mem(Mutex::new(vec![0u8; slot * blocks as usize]), slot, blocks)),
             _ => Err(bad()),
@@ -111,6 +114,9 @@ impl BlockStore for Blocks {
         }
     }
 }
+
+/// Blocks a batch call moves at once: an RDMA lane or an O_DIRECT request each.
+const THREADS: usize = 8;
 
 thread_local! {
     static LAST: RefCell<CString> = RefCell::new(CString::default());
@@ -225,5 +231,66 @@ pub unsafe extern "C" fn g6kv_tier_register(t: *const Blocks, buf: *mut c_void, 
             Err(e) => fail(e),
         },
         _ => 0,
+    }
+}
+
+// a batch call: block blocks[i] from or into bufs[i], for i < n
+unsafe fn batch(
+    t: *const Blocks,
+    n: usize,
+    blocks: *const u64,
+    bufs: *const *mut c_void,
+    write: bool,
+) -> io::Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    if blocks.is_null() || bufs.is_null() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "null argument"));
+    }
+    let (t, len) = (&*t, (*t).block_bytes());
+    let blocks = std::slice::from_raw_parts(blocks, n);
+    // the workers share the buffers as plain addresses
+    let bufs: Vec<usize> = std::slice::from_raw_parts(bufs, n).iter().map(|&p| p as usize).collect();
+    par_for(THREADS.min(n), n, |_, i| {
+        if write {
+            t.write_block(blocks[i], std::slice::from_raw_parts(bufs[i] as *const u8, len))
+        } else {
+            t.read_block(blocks[i], std::slice::from_raw_parts_mut(bufs[i] as *mut u8, len))
+        }
+    })
+}
+
+/// Writes `n` blocks at once, block `blocks[i]` from `bufs[i]`, on up to 8 threads.
+///
+/// # Safety
+/// `t` must be a live store; `blocks` and `bufs` hold `n` entries, each buffer valid for g6kv_tier_block_bytes reads.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_write_many(
+    t: *const Blocks,
+    n: usize,
+    blocks: *const u64,
+    bufs: *const *mut c_void,
+) -> i32 {
+    match batch(t, n, blocks, bufs, true) {
+        Ok(()) => 0,
+        Err(e) => fail(e),
+    }
+}
+
+/// Reads `n` blocks at once, block `blocks[i]` into `bufs[i]`, on up to 8 threads.
+///
+/// # Safety
+/// As g6kv_tier_write_many, each buffer valid for g6kv_tier_block_bytes writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_read_many(
+    t: *const Blocks,
+    n: usize,
+    blocks: *const u64,
+    bufs: *const *mut c_void,
+) -> i32 {
+    match batch(t, n, blocks, bufs, false) {
+        Ok(()) => 0,
+        Err(e) => fail(e),
     }
 }

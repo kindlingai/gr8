@@ -91,6 +91,10 @@ impl Rank {
             let st = s.stats(t).unwrap();
             let mut seen = vec![false; st.slots as usize];
             for e in s.entries(t) {
+                if let Some((base, n)) = e.base {
+                    let found = (0..s.tiers()).flat_map(|u| s.entries(u)).find(|b| b.id == base);
+                    assert!(found.is_some_and(|b| b.slots.len() == n), "entry {} lost its base {base}", e.id);
+                }
                 for &x in &e.slots {
                     assert!(!seen[x as usize], "slot {x} of tier {t} held twice");
                     seen[x as usize] = true;
@@ -389,4 +393,38 @@ fn a_hit_on_a_shared_prefix_keeps_the_rest_of_the_run_it_takes() {
     for row in 0..h.skip as usize {
         assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], a_hist[row]);
     }
+}
+
+#[test]
+fn a_run_on_a_stored_shared_prefix_spills_only_its_own_pages() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::All)], 3);
+    let system = toks(1, 300); // a shared prefix of 256 rows (4 pages) once three conversations start with it
+    for c in 2..5 {
+        let mut p = system.clone();
+        p.extend(toks(c, 40));
+        session(&mut r, &p, 10);
+    }
+    let shared = r.pool.stash().unwrap().entries(0).iter().find(|e| e.key != 0).map(|e| e.id).unwrap();
+    // a fourth conversation: its run, evicted, spills only the pages past the shared prefix
+    let mut p = system.clone();
+    p.extend(toks(9, 140));
+    let (_, _, hist) = session(&mut r, &p, 10);
+    let before = r.pool.tier_stats(0).unwrap().spilled_pages;
+    flush(&mut r);
+    let e = r.pool.stash().unwrap().entries(0).iter().find(|e| e.st.history == hist).cloned().unwrap();
+    assert_eq!(e.base, Some((shared, 4)));
+    assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages - before, e.slots.len() as u64);
+    assert_eq!(e.pages(), 8);
+    // and it comes back whole: the shared prefix's blocks, then its own
+    let mut p2 = hist.clone();
+    p2.extend(toks(10, 5));
+    let h = r.pool.match_prefix(&p2, p2.len() as u64 + 5, p2.len() as u64 + 5, p2.len() as i32 - 1);
+    assert!(h.stored && h.age == e.id && h.skip == 384, "{h:?}");
+    let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), p2.len() as u64 + 5, p2.len() as u64 + 5).unwrap();
+    r.run_io();
+    let list = r.pool.list(&run).unwrap().to_vec();
+    for row in 0..h.skip as usize {
+        assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], hist[row]);
+    }
+    assert!(r.pool.stash().unwrap().entries(0).iter().any(|e| e.id == shared), "the shared prefix stays");
 }
