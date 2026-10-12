@@ -11,6 +11,11 @@
 #include <set>
 
 namespace g6s2 {
+// wall clock in ms since the Unix epoch: the ranks' logs carry no timestamps, and the skew between ranks at a bind or a
+// prefill start is what a silent GPU wait timeout (G6_SPIN_TIMEOUT_CYC) turns into an error word
+inline long long s2_wall_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 // Use g6m4's EXISTING capture arrays/main_enqueue. In particular solo_main must
 // replay its production split3 A/B graphs, not capture an S2 replacement graph.
 struct NativeContext {
@@ -182,6 +187,7 @@ class NativeDispatch {
         return {out.tok,out.tok + rows};
     }
     void prefill(const Slot& slot,const Payload& payload,uint32_t first,uint32_t rows) {
+        const auto t0 = std::chrono::steady_clock::now();   // for the error-word line: a ~10 s quantum is a GPU wait timeout
         require(rows <= uint64_t(c_.prefill_rows)*(c_.two_lanes?2:1), "prefill quantum exceeds native lanes");
         c_.begin_prefill(slot); // real run/view selector supplied by TP4/fc2
         const int a = int(first), ma = std::min(int(rows),c_.prefill_rows), mb = int(rows)-ma;
@@ -208,8 +214,23 @@ class NativeDispatch {
             g6rt::pf_draft_inputs(dq,mb,payload.prompt.data()+a+ma+1,pos.data()+ma);
             g6rt::pf_draft(c_.draft,dq,p2.x,mb,a+ma+mb,c_.stream); fence();
         }
-        require(!*c_.prefill_fabric.dev().error && (!mb || !*c_.prefill_fabric2.dev().error) &&
-                !g6rt::attn_errors(c_.main) && !g6rt::attn_errors(c_.draft.d) && !(c_.extra_error && c_.extra_error()), "S2 prefill fabric/attention error");
+        {
+            // Name every word before the fail-closed require, as launch() does for steps. Codes: fabric 0x61.. = a GPU wait
+            // for a peer's rows timed out (glue::ERR_AR | coll << 8 | peer), 0x70../0x71../0x74.. = the proxy (it printed);
+            // attention bits 1 position, 2 page, 4 NaN, 8 reuse row, 16 no end, 32 cell bounds; extra 0x63000400 = a
+            // missing owner page in the CP staging fill, 0x63000800 = a staging hash mismatch, 0x63000c00 = a staging wait
+            // timed out, 0x65.. = the QO pair wire (qp_wire.h)
+            const unsigned f1 = *c_.prefill_fabric.dev().error, f2 = mb ? *c_.prefill_fabric2.dev().error : 0u;
+            int lm = -1, ld = -1;
+            const unsigned am = g6rt::attn_errors_at(c_.main, &lm), ad = g6rt::attn_errors_at(c_.draft.d, &ld);
+            const unsigned ce = c_.extra_error ? c_.extra_error() : 0u;
+            if (f1 || f2 || am || ad || ce)
+                fprintf(stderr,"# S2 prefill error words rank %d: fabric %08x/%08x attn main %08x (layer %d) draft %08x (layer %d) extra %08x "
+                        "(request %llu first %u rows %u, %.1f ms into the quantum, at %lld ms)\n",c_.main.rank,f1,f2,am,lm,ad,ld,ce,
+                        (unsigned long long)slot.req.id,first,rows,
+                        std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(),(long long)s2_wall_ms());
+            require(!f1 && !f2 && !am && !ad && !ce, "S2 prefill fabric/attention error");
+        }
         c_.end_prefill(); // restore decode views before yielding; NEVER late_draft
     }
 public:

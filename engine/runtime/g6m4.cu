@@ -768,19 +768,27 @@ int main(int argc, char** argv)
             if (R == 0 && kv_count) fprintf(stderr, "# s2 tiers: a prefix is shared after %d conversations\n", std::max(1, kv_shared_after));
         }
         // the copies the pool queued: run them before anything writes those pages, then commit what they wrote
+        // Every rank prints its drain with the wall clock (ms since the Unix epoch): the drain runs after the event fence
+        // and before the next quantum's fabric waits (G6_SPIN_TIMEOUT_CYC, ~10 s), so the skew between ranks' drains is
+        // the number that matters, and only the lines of every rank show it.
         auto kv_drain = [&] {
             if (!kvt) return;
             const auto io = pool.io();
             kvt->run(io, st);
-            if (R == 0 && !io.empty())
+            if (!io.empty())
             {
                 size_t n[3] = {0, 0, 0};
                 for (const auto& x : io) ++n[x.kind];
-                fprintf(stderr, "# s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms)\n", n[0], n[1], n[2],
-                        kvt->last_ms, kvt->last_device_ms);
+                fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s\n", R,
+                        n[0], n[1], n[2], kvt->last_ms, kvt->last_device_ms, (long long)g6s2::s2_wall_ms(), kvt->last_ms > 2000 ? " SLOW" : "");
             }
             if (const char* e = pool.io_done()) fprintf(stderr, "# rank %d: s2 tier index: %s\n", R, e);
         };
+        // G6_S2_BIND_DELAY=<rank>:<ms>: that rank sleeps after its bind (after the drain), as a drain that slow would. Shows
+        // what a bind skew does to the next quantum on the other ranks (nothing else changes), with or without tiers.
+        int bind_delay_rank = -1, bind_delay_ms = 0;
+        if (const char* e = getenv("G6_S2_BIND_DELAY"))
+            if (sscanf(e, "%d:%d", &bind_delay_rank, &bind_delay_ms) != 2 || bind_delay_ms < 0) die("G6_S2_BIND_DELAY=<rank>:<ms>");
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
         G6RT_CK(cudaStreamSynchronize(st));
         // DFlash2: Dfl::pf_feat holds one request's prefill taps, the last WIN prompt positions of the session whose
@@ -817,8 +825,9 @@ int main(int argc, char** argv)
                 {
                     const int ctx = (int)(sl.req.prompt_tokens + sl.req.max_tokens);
                     const bool on = pf_qp_select(P, two ? &P2 : nullptr, ctx, (int)sl.req.prompt_tokens);
-                    fprintf(stderr, "# rank %d: s2 request %llu prompt %u ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d)\n", R,
-                            (unsigned long long)sl.req.id, sl.req.prompt_tokens, ctx, on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx);
+                    fprintf(stderr, "# rank %d: s2 request %llu prompt %u ctx %d (prompt + gen) -> %s (QP_MIN %d, QP_CTX %d) first %u at %lld ms\n", R,
+                            (unsigned long long)sl.req.id, sl.req.prompt_tokens, ctx, on ? "OWN=4 pair-owner" : "OWN=2", pf_qp_min(), P.qp_ctx,
+                            (unsigned)sl.prefilled, (long long)g6s2::s2_wall_ms());
                 }
                 if (dfl && DF.pf_feat && sl.req.id != dfl_req)   // a request's first prefill quantum: as the offline loop per sequence
                 {
@@ -830,7 +839,11 @@ int main(int argc, char** argv)
             },
             [&]() { m.s2_pf_table = D.d.s2_pf_table = false; },
             [&]() { cp_pf_in(); }, [&]() { cp_pf_out(); },
-            [&]() -> unsigned { return cp_error() | cp_pf_err(); }};
+            [&]() -> unsigned {   // cp: the CP decode fabric; cp_pf|qp: the CP prefill staging fabric (0x63..), else the QO pair wire (0x65..)
+                const unsigned c = cp_error(), p = cp_pf_err();
+                if (c || p) fprintf(stderr, "# rank %d: S2 extra error words: cp %08x cp_pf|qp %08x\n", R, c, p);
+                return c | p;
+            }};
         try
         {
             g6s2::NativeDispatch nd(nx, sc);
@@ -865,6 +878,12 @@ int main(int argc, char** argv)
             h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
                 // the store copies the grant queued: evicted runs out before anything writes their pages, a stored run in
                 kv_drain();
+                if (R == bind_delay_rank && bind_delay_ms)
+                {
+                    fprintf(stderr, "# rank %d: G6_S2_BIND_DELAY: sleeping %d ms after the bind of request %llu at %lld ms\n", R, bind_delay_ms,
+                            (unsigned long long)g.req.id, (long long)g6s2::s2_wall_ms());
+                    std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
+                }
                 const int q = (int)g.key.slot;
                 slot_prompt[q] = g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps

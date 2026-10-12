@@ -1034,17 +1034,20 @@ inline int bucket_of(const Model& m, int context)
     for (int k = 0; k < m.nbk; ++k) if (m.bk[k] >= context) return k;
     return m.nbk - 1;
 }
-// after the stream is synchronized: attention error words of every layer (0 = clean), by host copies
-inline unsigned attn_errors(Model& m)
+// after the stream is synchronized: the first layer's nonzero attention error word (0 = clean), by host copies; *layer =
+// its index in m.layers (-1 when clean)
+inline unsigned attn_errors_at(Model& m, int* layer)
 {
-    for (Layer& y : m.layers)
+    for (size_t i = 0; i < m.layers.size(); ++i)
     {
         unsigned e = 0;
-        G6RT_CK(cudaMemcpy(&e, y.ab.args.error, 4, cudaMemcpyDeviceToHost));
-        if (e) return e;
+        G6RT_CK(cudaMemcpy(&e, m.layers[i].ab.args.error, 4, cudaMemcpyDeviceToHost));
+        if (e) { if (layer) *layer = (int)i; return e; }
     }
+    if (layer) *layer = -1;
     return 0;
 }
+inline unsigned attn_errors(Model& m) { return attn_errors_at(m, nullptr); }
 // new sequence: clear every layer's attention caches (load time / between requests, not inside a capture)
 inline void reset(Model& m, cudaStream_t st)
 {
