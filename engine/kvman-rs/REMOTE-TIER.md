@@ -209,6 +209,57 @@ are KV node leases.
 TP=4, TP=3 and TP=6 build. The served path (Service with stored hits, counting in the grant, the boot agreement) has not
 run on the cluster: it needs four boxes.
 
+### On the cluster (TP=4, 2026-10-12)
+
+The four GLM boxes, TP=4 home, the release from Hugging Face with the DFlash2 drafter, `--g6env-x G6_POOL_LOG=1`.
+Requests went one at a time at temperature 0 with logprobs, unless stated. The replays are the opencode captures in the
+agent capture set. Boot-to-boot byte equality is not a check under the default config (the DFlash2 verify shape varies),
+so the check of output identity is the first token and its logprob: prefill is deterministic for the same reused rows.
+
+RigMark at `reasoning_effort` low, this branch without `--kv-tier`: code 49.7 tok/s, prose 30.4, 8K prefill cold 1,321
+tok/s, aggregate C1 36.3 / C2 51.2 / C4 64.0. Smoke 11/11.
+
+Evict run: turn 3 of four agents one after another, then turn 4 of each. The pool keeps none of the turn-3 runs. A new
+agent's first hit takes the previous agent's run for the 4,096 rows of system prompt they share, and the pool dropped
+the rest of that run.
+
+| turn 4 TTFT, s | no tier | SSD tier (first build) | KV node + SSD | KV node + SSD, shared-prefix dedupe |
+|---|---|---|---|---|
+| agent 0 | 13.17 | 4.47 | 4.67 | 4.56 |
+| agent 1 | 17.12 | 16.78 (miss) | 2.19 | 2.15 |
+| agent 2 | 14.53 | 14.48 (miss) | 2.82 | 2.94 |
+| agent 3 | 12.85 | 4.10 | 4.67 | 5.12 |
+
+The first build missed two of four. A hit on another conversation's run took that run without evicting it, so the tier
+never saw it. Since ef55a86 that run's rows past the hit go to the tier, and every turn 4 restores. The first token and
+its logprob of each turn 4 are the same in both later builds.
+
+Shared prefix: eight conversations whose prompts differ only in the last user message (~12,600 tokens shared). With no
+tier each hit on a sibling's run takes 0.85 s. With the KV node tier first and no dedupe, each hit spilled the sibling's
+whole run (~200 pages) and took 1.2-3.8 s. With dedupe (32f7bfd) a sibling's run past the stored prefix is 7-9 pages,
+and the hits take 0.92-1.06 s once the prefix is stored. The variants' first tokens and logprobs agree across all
+builds, including a variant read from the SSD after the pool was flushed and one read after a restart.
+
+Restart: an SSD tier's index brought back 10 (first build) and 2 (later build) shared prefixes. The first request after
+boot read its 12,288 rows from the SSD: TTFT 1.32 s and 1.41 s, against 9.6-10.3 s cold.
+
+Copies, rank 0, from the drain log: a 200-page spill to the KV node 725-898 ms (device copy 6 ms), the same to the SSD
+158 ms. Restores of 256-384 pages took 162-238 ms, and a spill that also moved 400-500 pages on to the SSD 0.8-1.4 s.
+Remote writes run at about 1 GB/s per rank because all four ranks write through efcd's single 100G port without PFC: the
+clients count 90,000-150,000 packet sequence errors and efcd 247,000 out-of-sequence packets and 166,000 CNPs, with no
+ack timeouts. The four-box bench through that port: 2.6-3.2 GB/s write and 3.1-3.8 GB/s read per box (about 12 GB/s
+total), rows at 13.7 us p50 (6.0 us alone), a 2,048-row gather 1.77 ms (0.85 alone).
+
+Ranks byte-identical: every block of the SSD tier was the same on all four ranks, 512 slots (shared prefixes), 1,895
+slots (whole evicted runs, decode rows included, moved on from the KV node) and 1,164 slots in three runs.
+
+Not resolved: the 8-agent replay (both captures, six turns each, all at once) with the KV node + SSD tiers lost the
+cluster twice, on the first KV-node build and on the dedupe build, once after 38 s and once after 35 requests. The
+second time every rank stopped with "S2 prefill fabric/attention error" on the request after a drain of 469 spilled, 317
+moved and 256 restored pages. The same replay on the first KV-node build after a restart finished all 47 turns. A
+three-tier case of the batched copies did corrupt blocks (95cc5e0 fixes it), but these runs had two tiers. The engine's
+fabric and the KV node share each box's rail-0 NIC.
+
 ### Byte-identical ranks, and one copy for all
 
 m4sim's ranks hold identical page blocks below R. The cluster check will say whether the real ranks do: the latent comes

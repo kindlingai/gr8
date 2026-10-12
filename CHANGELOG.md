@@ -14,7 +14,9 @@
   rank loaded.
 - The head counts and matches, and the grant carries the restored tier and the count. The control frames are version
   `G6S2E4`, so every rank needs this build. Without `--kv-tier` the pool does no extra work and its digest is unchanged.
-- Not yet run on the cluster. `engine/kvman-rs/REMOTE-TIER.md` has the design and the single-box tests.
+- On the TP=4 cluster an evicted agent turn came back in 2.2-5.1 s (12.9-17.1 s without a tier), a stored system
+  prompt after a restart in 1.3-1.4 s (~10 s cold), and the restored blocks were the same on all four ranks. An 8-agent replay
+  with a KV node tier stopped the cluster twice, cause not yet found. `engine/kvman-rs/REMOTE-TIER.md` has the numbers.
 
 ## 2026-10-11: a remote KV page store, and `./gr8 kv` to run its node
 
