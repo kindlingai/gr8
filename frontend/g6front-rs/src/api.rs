@@ -320,6 +320,10 @@ impl State {
     fn max_logprobs(&self) -> i64 {
         self.engine.hello().and_then(|h| h.get("max_logprobs").and_then(Value::as_i64)).unwrap_or(20)
     }
+
+    fn steering(&self) -> Option<Value> {
+        self.engine.hello().and_then(|h| h.get("steering").cloned())
+    }
 }
 
 pub async fn route(
@@ -451,6 +455,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     };
     let force = choice.forced_ids(&st.tok, close)?;
     params.gen.system_tokens = system;
+    (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(body, st.steering().as_ref())?;
     Ok(ChatReq { tools, choice, force, prompt, params, budget })
 }
 
@@ -871,7 +876,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
         }
         thinking::check_response_format(body.get("response_format"))?;
         let prompt = prompt_ids(st, &body).await?;
-        let params = sampling::build(
+        let mut params = sampling::build(
             &body,
             &raw,
             prompt.len(),
@@ -883,6 +888,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
             st.max_logprobs(),
             false,
         )?;
+        (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(&body, st.steering().as_ref())?;
         Ok((prompt, params))
     };
     let (prompt, params) = match prep.await {
@@ -1186,9 +1192,23 @@ fn models(st: &State) -> Response<HttpBody> {
 }
 
 fn health(st: &State) -> Response<HttpBody> {
-    let mut r = Response::new(HttpBody::Full(None));
-    *r.status_mut() = if st.engine.ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    r
+    health_response(st.engine.ready(), st.steering().as_ref())
+}
+
+fn health_response(ready: bool, capability: Option<&Value>) -> Response<HttpBody> {
+    let steering = match capability {
+        Some(c) => serde_json::json!({
+            "enabled": true,
+            "forced": c.get("forced").and_then(Value::as_bool).unwrap_or(false),
+            "profile": c.get("profile").and_then(Value::as_str).unwrap_or(""),
+            "digest": c.get("digest").and_then(Value::as_str).unwrap_or("").chars().take(12).collect::<String>(),
+            "scope": c.get("scope").and_then(Value::as_str).unwrap_or(""),
+            "layers": c.get("layers").and_then(Value::as_u64).unwrap_or(0),
+        }),
+        None => serde_json::json!({"enabled": false, "forced": false}),
+    };
+    let body = serde_json::to_vec(&serde_json::json!({"ready": ready, "steering": steering})).unwrap();
+    json_response(if ready { 200 } else { 503 }, body)
 }
 
 /// /health?deep: the head's supervisor checks every rank (weights against the engine's sealed sums, while it serves) and
@@ -1229,5 +1249,28 @@ async fn metrics_route(st: &State) -> Response<HttpBody> {
         Err(e) => {
             response(503, "text/plain; charset=utf-8", format!("engine metrics unavailable: {}\n", e.0).into_bytes())
         }
+    }
+}
+
+#[cfg(test)]
+mod steering_health_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn health_reports_disabled_or_the_loaded_receipt_with_readiness_status() {
+        for (ready, status) in [(true, 200), (false, 503)] {
+            let r = health_response(ready, None);
+            assert_eq!(r.status().as_u16(), status);
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v, serde_json::json!({"ready":ready,"steering":{"enabled":false,"forced":false}}));
+        }
+        let cap = serde_json::json!({"profile":"example","digest":"a".repeat(64),"scope":"full",
+                                    "layers":2,"forced":true,"forced_scale":2.0});
+        let r = health_response(true, Some(&cap));
+        let body = r.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["steering"], serde_json::json!({"enabled":true,"forced":true,"profile":"example",
+                                                   "digest":"a".repeat(12),"scope":"full","layers":2}));
     }
 }

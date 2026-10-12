@@ -27,12 +27,13 @@ struct PoolHooks {
     std::function<g6kv_totals()> stats;
     // optional, prefix reuse (pool.h keep): every rank retires a run with its session's reuse state; the head matches a
     // new prompt against the retained runs (limit: rows its prefill may skip) and takes a hit
-    std::function<void(const Run&, const g6rt::PrefixReuse&)> retain;
-    std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit)> match;
+    std::function<void(const Run&, const g6rt::PrefixReuse&, const g6rt::CacheNamespace&)> retain;
+    std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
+                          const g6rt::CacheNamespace&)> match;
     std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst)> take;
     // optional, block stores (pool.h add_tier): counting toward shared prefixes at admission (head and workers, before
-    // the grant; span: the request's system span, -1 = none), and each tier's counters for status.s2
-    std::function<uint32_t(const std::vector<int>& prompt, int64_t span)> count;
+    // the grant, including nonstock calls that clear pending stock metadata; span: the request's system span, -1 = none), and each tier's counters for status.s2
+    std::function<uint32_t(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace&)> count;
     std::function<std::vector<g6kv_tier_totals>()> tiers;
     // optional: the pool's state, compared across ranks at every event (Scheduler::pool_digest)
     std::function<uint64_t()> digest;
@@ -107,7 +108,7 @@ class Service {
         g6rt::PrefixReuse st = dispatch_.rows(s.key.slot);
         const auto gen = driver_->emitted(s.key.slot);
         st.finish(driver_->prompt(s.key.slot), gen, int(gen.size()), true);
-        native_.pool.retain(s.run, st);
+        native_.pool.retain(s.run, st, g6rt::steering::cache_namespace(s.req.steering));
     }
     void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
         const auto free = native_.pool.free_pages(), room = native_.pool.room();
@@ -183,8 +184,11 @@ class Service {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
-                        if (native_.pool.count) counted = native_.pool.count(pr->second, spans_.count(request->id) ? spans_.at(request->id) : -1);
-                        const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1);
+                        if (native_.pool.count)
+                            counted = native_.pool.count(pr->second, spans_.count(request->id) ? spans_.at(request->id) : -1,
+                                g6rt::steering::cache_namespace(request->steering));
+                        const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1,
+                                                            g6rt::steering::cache_namespace(request->steering));
                         if (h.skip > 0) { run = native_.pool.take(h, rows, worst); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0; }
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
                                 h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
@@ -210,7 +214,7 @@ class Service {
                 changed = true;
                 if (command->admit) {
                     auto bytes = ingress_.request(*command);
-                    auto request = parse_request(bytes);
+                    auto request = parse_request(bytes, c_.scheduler.steering);
                     queue_.push(Sessions::request(command->request, request)); commands_.emplace(command->request, *command);
                     payloads_.emplace(command->request, std::move(bytes));
                     if (reuse() && request.plp < 0) {
@@ -266,7 +270,7 @@ class Service {
                 if (n.kind == EventKind::Admit) {   // the head reads its own req.<id>; a worker has the bytes from the head
                     const auto bytes = worker_ ? worker_->request(n.request) : ingress_.request({true,n.epoch,n.request,n.payload_hash});
                     require(payload_hash(bytes) == n.payload_hash, "request bytes do not match the ADMIT notice");
-                    staged_ = parse_request(bytes);
+                    staged_ = parse_request(bytes, c_.scheduler.steering);
                 }
                 if (native_.pool.digest) driver_->pool_digest(native_.pool.digest());
                 return driver_->state().digest(); // once per event, NEVER per round
@@ -315,16 +319,18 @@ public:
                 const auto worst = reserve_rows(c_.scheduler,g.req), rows = admit_rows(g.req);
                 Run mine;
                 if (native_.pool.count && reuse() && staged_->plp < 0)
-                    require(native_.pool.count(staged_->prompt, staged_->sys) == g.counted, "worker prefix counts differ from the head");
+                    require(native_.pool.count(staged_->prompt, staged_->sys,
+                        g6rt::steering::cache_namespace(g.req.steering)) == g.counted, "worker prefix counts differ from the head");
                 else require(!g.counted, "a counted grant without counting");
                 if (g.reuse) {
-                    const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1);
+                    const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1,
+                                                         g6rt::steering::cache_namespace(g.req.steering));
                     require(h.skip == int(g.reuse) && (h.stored ? h.tier + 1 : 0) == g.restored, "worker prefix reuse differs from the head");
                     mine = native_.pool.take(h, rows, worst);
                 } else mine = native_.pool.reserve(rows, worst);
                 require(mine == g.run, "worker page list differs from the head's grant");
             }
-            dispatch_.begin(g.key.slot, int(g.reuse));
+            dispatch_.begin(g.key.slot, int(g.reuse), g6rt::steering::cache_namespace(g.req.steering));
             native_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {

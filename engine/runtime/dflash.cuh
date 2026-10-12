@@ -998,6 +998,7 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
             si.pos[r] = base + r;
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
+            si.steering_scale[r] = p.steering_scale;
         }
         si.context = base + k + 1;
         double tv = 0, tf = 0;

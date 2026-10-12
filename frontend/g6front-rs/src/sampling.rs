@@ -18,6 +18,74 @@ pub struct Params {
     pub include_stop: bool,
 }
 
+pub fn steering(
+    body: &Map<String, Value>,
+    capability: Option<&Value>,
+) -> Result<(Option<String>, Option<f64>), ApiError> {
+    let hp = body.get("steering_profile").is_some_and(|v| !v.is_null());
+    let hs = body.get("steering_scale").is_some_and(|v| !v.is_null());
+    if !hp && !hs {
+        return Ok((None, None));
+    }
+    let profile = if hp {
+        match body.get("steering_profile") {
+            Some(Value::String(s))
+                if !s.is_empty()
+                    && s.len() <= 128
+                    && s.as_bytes()[0].is_ascii_alphanumeric()
+                    && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-')) =>
+            {
+                Some(s.clone())
+            }
+            _ => return Err(ApiError::bad("steering_profile must be a profile name", Some("steering_profile"))),
+        }
+    } else {
+        None
+    };
+    let raw = if hs {
+        match body.get("steering_scale") {
+            Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
+            _ => return Err(ApiError::bad("steering_scale must be a number", Some("steering_scale"))),
+        }
+    } else if hp {
+        1.0
+    } else {
+        0.0
+    };
+    if !raw.is_finite() || !(0.0..=4.0).contains(&raw) {
+        return Err(ApiError::bad("steering_scale must be finite and in [0, 4]", Some("steering_scale")));
+    }
+    let mut scale = (raw as f32) as f64;
+    if scale == 0.0 {
+        scale = 0.0;
+    }
+    if !scale.is_finite() || !(0.0..=4.0).contains(&scale) {
+        return Err(ApiError::bad("steering_scale must be finite and in [0, 4]", Some("steering_scale")));
+    }
+    if profile.is_none() {
+        if scale != 0.0 {
+            return Err(ApiError::bad("steering_scale requires steering_profile", Some("steering_scale")));
+        }
+        if capability.and_then(|c| c.get("forced")).and_then(Value::as_bool) == Some(true) {
+            return Err(ApiError::bad("request steering conflicts with forced mode", Some("steering_scale")));
+        }
+        return Ok((None, None));
+    }
+    let loaded = capability.and_then(|c| c.get("profile")).and_then(Value::as_str);
+    if loaded.is_none() {
+        return Err(ApiError::bad("steering is not enabled on this server", Some("steering_profile")));
+    }
+    if loaded != profile.as_deref() {
+        return Err(ApiError::bad("unknown steering_profile", Some("steering_profile")));
+    }
+    if capability.and_then(|c| c.get("forced")).and_then(Value::as_bool) == Some(true)
+        && capability.and_then(|c| c.get("forced_scale")).and_then(Value::as_f64) != Some(scale)
+    {
+        return Err(ApiError::bad("request steering conflicts with forced mode", Some("steering_scale")));
+    }
+    Ok((profile, Some(scale)))
+}
+
 /// The request body, parsed and raw. The raw bytes are only read again for an integer that serde could not hold
 /// exactly (beyond 64 bits); Python's json keeps those exact, so the range checks must too.
 struct Fields<'a> {
@@ -287,6 +355,8 @@ pub fn build(
             prompt_logprobs: plp.map(|v| v as i64),
             system_tokens: None,
             insert: None,
+            steering_profile: None,
+            steering_scale: None,
         },
         stop,
         include_stop: pyjson::truthy(body.get("include_stop_str_in_output")),
@@ -350,5 +420,82 @@ mod tests {
         assert_eq!(chat_default_max_tokens(0, 65472, 100000), Some(SHARE_MIN_MAX_TOKENS));
         assert_eq!(chat_default_max_tokens(4096, 65472, 100), Some(4096)); // --default-max-tokens wins
         assert_eq!(chat_default_max_tokens(0, 0, 100), None); // no share limit: all the room
+    }
+
+    #[test]
+    fn steering_is_canonical_and_checked_against_hello() {
+        let cap = serde_json::json!({"profile":"example","forced":false,"forced_scale":0.0});
+        let body = serde_json::json!({"steering_profile":"example","steering_scale":1.1});
+        let (p, s) = steering(body.as_object().unwrap(), Some(&cap)).unwrap();
+        assert_eq!(p.as_deref(), Some("example"));
+        assert_eq!(s, Some((1.1f32) as f64));
+        let zero = serde_json::json!({"steering_scale":-0.0});
+        assert_eq!(steering(zero.as_object().unwrap(), Some(&cap)).unwrap(), (None, None));
+        let other = serde_json::json!({"steering_profile":"other"});
+        assert_eq!(
+            steering(other.as_object().unwrap(), Some(&cap)).unwrap_err().param.as_deref(),
+            Some("steering_profile")
+        );
+        let malformed = serde_json::json!({"steering_profile":"bad/name"});
+        assert_eq!(
+            steering(malformed.as_object().unwrap(), Some(&cap)).unwrap_err().message,
+            "steering_profile must be a profile name"
+        );
+        let disabled = steering(body.as_object().unwrap(), None).unwrap_err();
+        assert_eq!(disabled.param.as_deref(), Some("steering_profile"));
+        assert_eq!(disabled.message, "steering is not enabled on this server");
+        let forced = serde_json::json!({"profile":"example","forced":true,"forced_scale":2.0});
+        assert!(steering(body.as_object().unwrap(), Some(&forced)).is_err());
+        let default = serde_json::json!({"steering_profile":"example"});
+        assert_eq!(steering(default.as_object().unwrap(), Some(&cap)).unwrap(), (Some("example".into()), Some(1.0)));
+        let nulls = serde_json::json!({"steering_profile":null,"steering_scale":null});
+        assert_eq!(steering(nulls.as_object().unwrap(), Some(&cap)).unwrap(), (None, None));
+        let null_scale = serde_json::json!({"steering_profile":"example","steering_scale":null});
+        assert_eq!(steering(null_scale.as_object().unwrap(), Some(&cap)).unwrap().1, Some(1.0));
+        let named_zero = serde_json::json!({"steering_profile":"example","steering_scale":-0.0});
+        assert_eq!(steering(named_zero.as_object().unwrap(), Some(&cap)).unwrap().1, Some(0.0));
+        assert!(steering(named_zero.as_object().unwrap(), None).is_err());
+        assert!(steering(named_zero.as_object().unwrap(), Some(&forced)).is_err());
+        let none = serde_json::json!({});
+        assert_eq!(steering(none.as_object().unwrap(), Some(&forced)).unwrap(), (None, None));
+        let matching = serde_json::json!({"steering_profile":"example","steering_scale":2});
+        assert_eq!(steering(matching.as_object().unwrap(), Some(&forced)).unwrap().1, Some(2.0));
+        for (body, param) in [
+            (serde_json::json!({"steering_profile":7}), "steering_profile"),
+            (serde_json::json!({"steering_scale":1}), "steering_scale"),
+            (serde_json::json!({"steering_profile":"example","steering_scale":4.1}), "steering_scale"),
+        ] {
+            assert_eq!(steering(body.as_object().unwrap(), Some(&cap)).unwrap_err().param.as_deref(), Some(param));
+        }
+    }
+
+    #[test]
+    fn steering_matches_shared_host_contract() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../../engine/runtime/tests/fixtures/steering_contract.json"))
+                .unwrap();
+        for case in cases["profile_names"].as_array().unwrap() {
+            let body = serde_json::json!({"steering_profile":case["input"]});
+            let cap = serde_json::json!({"profile":case["input"]});
+            assert_eq!(
+                steering(body.as_object().unwrap(), Some(&cap)).is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{case}"
+            );
+        }
+        let cap = serde_json::json!({"profile":"example"});
+        for case in cases["scales"].as_array().unwrap() {
+            let raw = case["input"].as_str().unwrap().parse::<f64>().unwrap();
+            let value = serde_json::Number::from_f64(raw).map(Value::Number).unwrap_or(Value::Null);
+            // Non-finite numbers are not JSON numbers; a string exercises the API's type rejection.
+            let value = if value.is_null() { case["input"].clone() } else { value };
+            let body = serde_json::json!({"steering_profile":"example","steering_scale":value});
+            let result = steering(body.as_object().unwrap(), Some(&cap));
+            assert_eq!(result.is_ok(), case["valid"].as_bool().unwrap(), "{case}");
+            if let Ok((_, Some(scale))) = result {
+                let bits = u32::from_str_radix(case["bits"].as_str().unwrap(), 16).unwrap();
+                assert_eq!((scale as f32).to_bits(), bits, "{case}");
+            }
+        }
     }
 }

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "../steering.h"
 
 namespace g6s2 {
 inline void require(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
@@ -41,6 +42,7 @@ struct Config {
     uint32_t pool_rows = 614400, max_rows = 24, max_sessions = 8, mtp = 2;
     uint32_t guard_tokens = UINT32_MAX, prefill_rows = 4096;
     bool two_lanes = true;
+    g6rt::steering::BootConfig steering{};
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
@@ -48,6 +50,15 @@ struct Config {
         require(epoch && pool_rows >= PAGE && pool_rows % PAGE == 0, "bad epoch/pool");
         require(mtp > 0 && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");
         require(guard() >= 2 * mtp && prefill_rows, "insufficient guard/prefill rows");
+        require(!steering.loaded || (g6rt::steering::valid_profile_name(steering.profile_name) && steering.active_layers &&
+                (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full)),
+                "invalid loaded steering receipt");
+        require(!steering.forced || steering.loaded, "forced steering needs a loaded profile");
+        if (steering.forced) {
+            const float scale = g6rt::steering::bits_float(steering.forced_scale_bits);
+            require(std::isfinite(scale) && scale > 0.f && scale <= g6rt::steering::SCALE_MAX,
+                    "forced steering needs a finite scale in (0,4]");
+        } else require(!steering.forced_scale_bits, "unforced steering has a forced scale");
     }
 };
 struct Key {
@@ -58,6 +69,7 @@ struct Key {
 struct Request {
     uint64_t id = 0; // immutable native request ordinal; public HTTP ids may be reused
     uint32_t prompt_tokens = 0, max_tokens = 0;
+    g6rt::steering::Identity steering{};
 };
 inline uint64_t reserve_rows(const Config& c, const Request& r) {
     require(r.prompt_tokens && r.max_tokens, "empty request");
@@ -206,11 +218,12 @@ public:
         auto add = [&](uint64_t v) { for (unsigned i = 0; i < 8; ++i) { h ^= uint8_t(v >> (8*i)); h *= 1099511628211ull; } };
         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
         add(c_.prefill_rows); add(c_.two_lanes); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
-        add(pool_);
+        add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
             if (s.phase == Phase::Free) continue;
             add(s.req.id); add(s.req.prompt_tokens); add(s.req.max_tokens);
+            g6rt::steering::hash_identity(h, s.req.steering);
             add(s.run.first_page); add(s.run.pages); add(s.run.table_version); add(s.run.list_hash); add(s.prefilled); add(s.emitted);
             add(s.inserted); add(s.deferred);
         }

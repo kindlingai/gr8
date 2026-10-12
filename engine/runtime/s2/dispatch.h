@@ -19,7 +19,8 @@ struct Launch {
     std::vector<int> buckets, source_rows;          // per session: context bucket, first row in the last main step
     int bucket = 0;                                  // the step's bucket: the largest of its sessions'
     std::vector<Sampling> samples;
-    // the graph key: kind, M and the step's bucket. The sessions and source rows are data (S2In)
+    std::vector<float> steering_scales;                 // per row; exact request FP32, target MAIN rows only
+    // the graph key: kind, M and the step's bucket. The sessions, source rows and steering scales are data (S2In)
     std::string graph_key;
 };
 struct DispatchHooks {
@@ -65,9 +66,9 @@ public:
     }
     void track_rows() { track_ = true; }
     // a new session on `slot`; skip: rows its run already holds (Grant::reuse)
-    void begin(unsigned slot, int skip) {
+    void begin(unsigned slot, int skip, const g6rt::CacheNamespace& ns = {}) {
         require(slot < MAX_SESSIONS, "invalid dispatch slot");
-        rows_[slot].resume(skip);
+        rows_[slot].resume(skip, ns);
     }
     const g6rt::PrefixReuse& rows(unsigned slot) const { require(slot < MAX_SESSIONS, "invalid dispatch slot"); return rows_[slot]; }
     void release(unsigned slot) {
@@ -100,6 +101,8 @@ public:
                 require(sp.r[r].sess == q && sp.r[r].pos >= 0 && sp.r[r].pos < sp.ctx[j] &&
                         (r == next_row || sp.r[r].pos == sp.r[r-1].pos + 1), "row/session position mismatch");
                 l.samples.push_back(s.sampling);
+                l.steering_scales.push_back(sp.kind == s2::Step::MAIN && s.payload.steering.enabled
+                    ? g6rt::steering::bits_float(s.payload.steering.scale_bits) : 0.f);
             }
             require(sp.r[next_row + sp.rows[j] - 1].pos + 1 == sp.ctx[j], "wrong session context");
             next_row += sp.rows[j]; l.context = std::max(l.context, sp.ctx[j]);
@@ -144,6 +147,7 @@ void native_inputs(const Launch& l, StepIn& si, S2In& h) {
     for (int r = 0; r < si.M; ++r) {
         const auto& x = l.step.r[r]; const auto& sample = l.samples[r];
         si.tok[r] = x.tok; si.pos[r] = x.pos; si.tgt[r] = x.tgt;
+        si.steering_scale[r] = l.steering_scales.at(r);
         // top list: main-step rows of a request with lp > 0 (sampled rows) or plp > 0 (prompt rows; rank.cuh step_inputs)
         const int topk = l.step.kind == s2::Step::MAIN && (x.tgt >= 0 ? sample.plp : sample.lp) > 0;
         si.srow[r] = {sample.inv_temp, sample.seed, 0u, x.spos, 0, sample.top_p, topk};

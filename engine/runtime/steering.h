@@ -172,7 +172,7 @@ struct BootConfig {
     Identity resolve(const RequestFields& f) const {
         uint32_t bits = 0;
         if (f.has_profile) {
-            if (!loaded) throw std::runtime_error("steering is not enabled on this server (start it with --steering-profile)");
+            if (!loaded) throw std::runtime_error("steering is not enabled on this server");
             if (f.profile != profile_name) throw std::runtime_error("unknown steering_profile");
             bits = f.has_scale ? canonical_scale_bits(f.scale) : canonical_scale_bits(1.0);
         } else if (f.has_scale) {

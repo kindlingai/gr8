@@ -1002,15 +1002,15 @@ int main(int argc, char** argv)
             }
             if (pool.keeping())
             {
-                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s) { pool.retain(r, s); };
-                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit) { return pool.match(p, rows, worst, limit); };
+                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); };
+                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns) { return pool.match(p, rows, worst, limit, ns); };
                 h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst) { return pool.take(x, rows, worst); };
             }
             if (kvt)
             {
                 h.pool.tiers = [&] { return pool.tiers(); };
-                h.pool.count = [&](const std::vector<int>& p, int64_t span) { return pool.count(p, span); };
-                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s) { pool.retain(r, s); kv_drain(); };   // a promoted prefix
+                h.pool.count = [&](const std::vector<int>& p, int64_t span, const CacheNamespace& ns) { return pool.count(p, span, ns); };
+                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); kv_drain(); };   // a promoted prefix
             }
             h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
                 // the store copies the grant queued: evicted runs out before anything writes their pages, a stored run in

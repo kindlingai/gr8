@@ -7,7 +7,11 @@
 
 namespace g6s2 {
 // decode_prompt: the whole prompt runs as decode steps from position 0, no tensor prefill (prompt logprobs)
-struct Payload { std::vector<int> prompt; int chunk = 4; bool decode_prompt = false; g6rt::InsertRule ins; };
+struct Payload {
+    std::vector<int> prompt; int chunk = 4; bool decode_prompt = false;
+    g6rt::InsertRule ins;
+    g6rt::steering::Identity steering{};
+};
 struct Emission { uint32_t count = 0; bool finished = false; };
 struct DriverHooks {
     // Real TP4 pool/binding adapter: canonical base, never a per-rank first-fit.
@@ -114,7 +118,8 @@ public:
     void pool_digest(uint64_t d) { scheduler_.pool_digest(d); }
     Changes apply(const Commit& c, const Payload* p = nullptr) {
         if (c.admit) {
-            require(p && p->prompt.size() == c.admit->req.prompt_tokens && p->chunk > 0, "admit payload mismatch");
+            require(p && p->prompt.size() == c.admit->req.prompt_tokens && p->chunk > 0 &&
+                    p->steering == c.admit->req.steering, "admit payload mismatch");
             require(c.admit->req.max_tokens <= INT32_MAX && p->prompt.size() <= INT32_MAX, "Batch integer range");
         } else require(!p, "payload without grant");
         auto before = scheduler_.slots();

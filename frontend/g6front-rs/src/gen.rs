@@ -601,6 +601,8 @@ mod tests {
                 prompt_logprobs: None,
                 system_tokens: None,
                 insert: None,
+                steering_profile: None,
+                steering_scale: None,
             },
             stop: vec![],
             include_stop: false,
@@ -685,6 +687,21 @@ mod tests {
         assert_eq!(gens[1]["prompt"], json!(cont));
         assert_eq!(gens[1]["max_tokens"], json!(50 - 7));
         assert_ne!(gens[0]["id"], gens[1]["id"]);
+    }
+
+    #[tokio::test]
+    async fn steering_survives_a_thinking_budget_continuation() {
+        let fake = fake_engine(endless_thinking).await;
+        let mut p = params(50, 0);
+        p.gen.steering_profile = Some("example".into());
+        p.gen.steering_scale = Some(1.1f32 as f64);
+        run(&fake, p, 5, true).await;
+        let gens = fake.gens.lock().unwrap();
+        assert_eq!(gens.len(), 2);
+        for g in gens.iter() {
+            assert_eq!(g["steering_profile"], "example");
+            assert_eq!((g["steering_scale"].as_f64().unwrap() as f32).to_bits(), 0x3f8ccccd);
+        }
     }
 
     #[tokio::test]

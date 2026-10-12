@@ -6,7 +6,8 @@ The engine side is the code, not a document: engine/runtime/s2/{ingress.h,sessio
 File protocol, in the head rank's DIR (the shim runs on the head), one engine epoch per start of g6m4 --serve (every
 rank needs a FRESH DIR). The head passes each request's bytes and the quit to the other ranks over its control links.
   engine rank 0 -> DIR/ready.s2        "G6S2 3 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>" once all ranks
-                                       booted (version 1 has no <max_lp>: no logprobs; version 2 has no insert rule)
+                                       booted (version 1 has no <max_lp>; version 2 has no insert rule). Version 4 appends
+                                       the steering receipt: <profile> <digest> <scope> <layers> <forced> <scale_bits>.
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
         n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
@@ -41,6 +42,7 @@ import math
 import os
 import re
 import signal
+import struct
 import sys
 import time
 
@@ -69,11 +71,33 @@ def payload_hash(data: bytes) -> int:
 
 def parse_ready(text: str) -> dict:
     w = text.split()
+    if len(w) >= 2 and w[:2] == ['G6S2', '4']:
+        if len(w) != 15 or not all(x.isdigit() for x in w[2:9]):
+            raise ValueError(f'bad ready.s2: {text!r}')
+        base = ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')
+        c = dict(zip(base, map(int, w[2:9])))
+        name, digest, scope, layers_s, forced, scale_bits_s = w[9:]
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name) or not re.fullmatch(r'[0-9a-f]{64}', digest)
+                or scope not in ('shared', 'full') or not layers_s.isdigit() or forced not in ('0', '1')
+                or not scale_bits_s.isdigit()):
+            raise ValueError(f'bad ready.s2 steering receipt: {text!r}')
+        layers, scale_bits = int(layers_s), int(scale_bits_s)
+        if layers < 1 or scale_bits > 0xffffffff:
+            raise ValueError(f'bad ready.s2 steering receipt: {text!r}')
+        scale = struct.unpack('!f', struct.pack('!I', scale_bits))[0]
+        if ((forced == '1' and (not math.isfinite(scale) or not 0 < scale <= 4))
+                or (forced == '0' and scale_bits)):
+            raise ValueError(f'bad ready.s2 steering forced scale: {text!r}')
+        c['steering'] = {'profile': name, 'digest': digest, 'scope': scope, 'layers': layers,
+                         'forced': forced == '1', 'forced_scale': scale if forced == '1' else 0.0}
+        c['insert'] = True
+        return c
     names = READY_FIELDS.get(w[1]) if len(w) > 1 and w[0] == 'G6S2' else None
     if not names or len(w) != 2 + len(names) or not all(x.isdigit() for x in w[2:]):
         raise ValueError(f'bad ready.s2: {text!r}')
-    # version 1 has no logprobs, version 3 adds the insert rule
-    return {'max_lp': 0, **dict(zip(names, map(int, w[2:]))), 'insert': int(w[1]) >= 3}
+    # version 1 has no logprobs; version 3 adds insert rules; only version 4 advertises steering
+    return {'max_lp': 0, **dict(zip(names, map(int, w[2:]))),
+            'insert': int(w[1]) >= 3, 'steering': None}
 
 
 def insert_field(rules):
@@ -109,7 +133,46 @@ def lp_entry(w):
     return {'lp': num(w[0]), 'rank': rank if rank > 0 else None, 'top': top}
 
 
-def build_request(f: dict, ordinal: int):
+def _steering_header(f: dict, capability: dict | None):
+    """Validate the generate frame against ready.s2 and return its canonical request-file suffix."""
+    has_profile = 'steering_profile' in f and f.get('steering_profile') is not None
+    has_scale = 'steering_scale' in f and f.get('steering_scale') is not None
+    if not has_profile and not has_scale:
+        return '', None
+    profile = f.get('steering_profile')
+    if has_profile and (not isinstance(profile, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', profile)):
+        return None, 'steering_profile must be a profile name'
+    value = f['steering_scale'] if has_scale else (1.0 if has_profile else 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, 'steering_scale must be a number'
+    try:
+        raw = float(value)
+        if not math.isfinite(raw) or not 0.0 <= raw <= 4.0:
+            return None, 'steering_scale must be finite and in [0, 4]'
+        bits = struct.unpack('!I', struct.pack('!f', raw))[0]
+        scale = struct.unpack('!f', struct.pack('!I', bits))[0]
+    except (OverflowError, struct.error):
+        return None, 'steering_scale must be finite and in [0, 4]'
+    if scale == 0.0:
+        bits, scale = 0, 0.0
+    if not math.isfinite(scale) or not 0.0 <= scale <= 4.0:
+        return None, 'steering_scale must be finite and in [0, 4]'
+    if not has_profile:
+        if scale != 0.0:
+            return None, 'steering_scale requires steering_profile'
+        if capability and capability.get('forced'):
+            return None, 'request steering conflicts with forced mode'
+        return '', None
+    if not capability or not capability.get('profile'):
+        return None, 'steering is not enabled on this server'
+    if profile != capability.get('profile'):
+        return None, 'unknown steering_profile'
+    if capability.get('forced') and scale != capability.get('forced_scale'):
+        return None, 'request steering conflicts with forced mode'
+    return f' steer {profile} {bits:08x}', None
+
+
+def build_request(f: dict, ordinal: int, steering: dict | None = None):
     """-> (req.<id> bytes, error message or None). Validates what g6s2::parse_request / reserve_rows would reject."""
     prompt = f.get('prompt') or []
     mt = f.get('max_tokens')
@@ -154,8 +217,12 @@ def build_request(f: dict, ordinal: int):
         return None, err
     if ins and 'lp' in lps:
         return None, 'insert cannot be combined with logprobs: an inserted token has none'
+    steer, err = _steering_header(f, steering)
+    if err:
+        return None, err
+
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + '\n' + ','.join(map(str, prompt)) + '\n').encode()
+            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + steer + '\n' + ','.join(map(str, prompt)) + '\n').encode()
     return body, None
 
 
@@ -258,10 +325,13 @@ class Shim:
     # ---- socket side --------------------------------------------------------------------------------------------
     async def serve(self, reader, writer):
         await self.ready.wait()
-        hello = {'type': 'hello', 'version': 1, 'model': 'glm-5.3-g6', 'max_model_len': self.max_model_len(),
-                 'vocab_size': VOCAB, 'eos_ids': EOS_IDS, 'max_logprobs': self.max_logprobs()}
+        hello = {'type': 'hello', 'version': 1, 'model': 'glm-5.3-g6',
+                 'max_model_len': self.max_model_len(), 'vocab_size': VOCAB,
+                 'eos_ids': EOS_IDS, 'max_logprobs': self.max_logprobs()}
         if self.cfg['insert']:
             hello['insert'] = True
+        if self.cfg['steering']:
+            hello['steering'] = self.cfg['steering']
         wire.write_frame(writer, hello)
         mine: set[str] = set()
         try:
@@ -365,7 +435,7 @@ class Shim:
                     return
                 ordinal = self.next_id
                 self.next_id += 1
-                body, err = build_request(r.f, ordinal)
+                body, err = build_request(r.f, ordinal, self.cfg['steering'])
                 if err:
                     return self.finish(r, 'error', message=err)
                 errs = await self.write_all(f'req.{ordinal}', body)

@@ -400,6 +400,7 @@ template <bool QO = false> __global__ void __launch_bounds__(256) k_own_unpack(O
 
 struct Prefill
 {
+    float steering_scale = 0.f; // One request per lane; transported before projection kernels are enabled.
     int Mmax = 0;
     g6::FabricDev f{};                // ncoll = 2 (all-reduce) or 5 (RS form), stride >= pf_slot_bytes(Mmax, rs) + 8
     u64* stepp = nullptr;             // device layer-step cell

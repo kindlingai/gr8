@@ -32,6 +32,12 @@ The front end refuses to serve if `version` != 1. `max_model_len` bounds prompt 
 the largest k the engine accepts for `logprobs` and `prompt_logprobs`. `"insert": true` (absent = false) says the
 engine applies `generate`'s `insert` rule.
 
+An optional `steering` object advertises a loaded profile: `profile` (name), `digest` (64 lowercase hex
+manifest SHA-256), `scope` (`shared` or `full`), `layers` (positive active-layer count), `forced` (boolean),
+and `forced_scale` (canonical FP32 number; zero unless forced). Absent/null means unavailable. Current real
+engines advertise no loaded profile; the synthetic mock's `--steering` option exercises transport only.
+See [request transport](docs/STEERING-TRANSPORT.md).
+
 ## Front end -> engine
 
 ### `generate`
@@ -59,6 +65,8 @@ engine applies `generate`'s `insert` rule.
 | `logprobs` | null = none. k >= 0: for every generated token return its logprob and rank plus the top-k (k = 0 means the sampled token only) |
 | `prompt_logprobs` | null = none. k >= 0: for every prompt position j >= 1 return the logprob and rank of `prompt[j]` under the distribution predicted at j-1, plus the top-k |
 | `system_tokens` | optional (chat requests). How many of the prompt's first tokens are its system span: the leading system messages and the tool definitions as the chat template renders them, up to where the first other message begins. The engine's KV stores (`--kv-keep system`) keep system prefixes by it. Absent (completions): the engine counts every prefix of the prompt instead |
+| `steering_profile` | optional profile name; must match the engine's loaded capability, even when scale is zero. Missing/null selects stock unless the engine is in forced mode |
+| `steering_scale` | optional finite number in [0,4], default 1 with a profile. Converted to FP32 once, negative zero normalized to positive zero. A nonzero scale requires a profile; zero selects the stock identity |
 | `insert` | optional, only to an engine whose hello says `"insert": true`. A list of at most one rule `{"after_tokens": N, "unless_emitted": X or null, "tokens": [ids]}` (1 to 64 ids): once the reply holds N tokens and none of them is X, the engine puts `tokens` in place of the reply's next token, even when that token is X. The tokens count as generated tokens, toward `max_tokens` (which cuts them short) and `completion_tokens`, and stop ids among them stop the request. The reply goes on from them as from a prompt that ended with them. Not with `logprobs`: an inserted token has none |
 
 Logprobs are of the distribution the token was sampled from **before** temperature/top-p/top-k/min-p are applied

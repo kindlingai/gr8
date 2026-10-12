@@ -32,14 +32,14 @@ inline g6rt::InsertRule parse_insert(const std::string& s) {
     require(!r.tokens.empty() && r.tokens.size() <= size_t(g6rt::INSERT_MAX), "invalid ins token count");
     return r;
 }
-inline g6rt::ServeReq parse_request(const std::string& bytes) {
+inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {}) {
     const auto line = bytes.find('\n'); require(line != std::string::npos, "request missing prompt line");
     std::istringstream in(bytes.substr(0, line));
     g6rt::ServeReq r; std::string k, gen, seed, min, stop, extra;
     require(bool(in >> k) && k == "n_gen" && bool(in >> gen >> k) && k == "temp" &&
             bool(in >> r.temp >> k) && k == "seed" && bool(in >> seed >> k) && k == "min" &&
             bool(in >> min >> k) && k == "stop" && bool(in >> stop), "invalid request header");
-    // optional, in this order: top_p <float>, lp <k>, plp <k>, sys <tokens>, ins <rule>
+    // optional, in this order: top_p <float>, lp <k>, plp <k>, sys <tokens>, ins <rule>, steer <profile> <canonical-fp32-hex>
     auto next = [&] { if (!(in >> k)) k.clear(); };
     next();
     if (k == "top_p") { require(bool(in >> r.top_p), "invalid top_p header"); next(); }
@@ -47,9 +47,17 @@ inline g6rt::ServeReq parse_request(const std::string& bytes) {
     if (k == "plp") { require(bool(in >> r.plp) && r.plp >= 0 && r.plp <= g6rt::LP_MAX, "invalid plp header"); next(); }
     if (k == "sys") { require(bool(in >> r.sys) && r.sys >= 0 && r.sys <= INT32_MAX, "invalid sys header"); next(); }
     if (k == "ins") { std::string v; require(bool(in >> v), "invalid ins header"); r.ins = parse_insert(v); next(); }
-    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys and ins)");
-    // an inserted token has no logprob entry
+    g6rt::steering::RequestFields sf;
+    if (k == "steer") {
+        std::string name, bits; require(bool(in >> name >> bits), "invalid steering header"); next();
+        require(g6rt::steering::valid_profile_name(name), "invalid steering profile name");
+        const uint32_t scale = g6rt::steering::parse_scale_bits(bits);
+        sf.has_profile = sf.has_scale = true; sf.profile = std::move(name);
+        sf.scale = g6rt::steering::bits_float(scale);
+    }
+    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins and steer)");
     require(!r.ins.on() || r.lp < 0, "ins with lp");
+    r.steering = steering.resolve(sf);
     auto g = number(gen), sd = number(seed), mn = number(min);
     require(g > 0 && g <= INT32_MAX && sd <= UINT32_MAX && mn <= g &&
             std::isfinite(r.temp) && r.temp >= 0 && std::isfinite(r.top_p) && r.top_p >= 0 && r.top_p <= 1,
@@ -82,8 +90,10 @@ public:
     }
     ~Sessions() { for (auto& s : sessions_) if (s.emitter.f) fclose(s.emitter.f); }
     Sessions(const Sessions&) = delete; Sessions& operator=(const Sessions&) = delete;
-    static Request request(uint64_t id, const g6rt::ServeReq& r) { return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen)}; }
-    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins}; }
+    static Request request(uint64_t id, const g6rt::ServeReq& r) {
+        return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen), r.steering};
+    }
+    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering}; }
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;
     void bind(const Grant& g, const g6rt::ServeReq& r) {
@@ -91,6 +101,7 @@ public:
         auto& s = sessions_[g.key.slot]; require(!s.bound, "session already bound");
         auto req = request(g.req.id, r);
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
+                req.steering == g.req.steering &&
                 (grant_pages(config_, req) == g.run.pages || reserve_pages(config_, req) == g.run.pages), "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};

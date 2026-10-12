@@ -21,7 +21,9 @@ From the head itself, `curl localhost:8100/health?deep` asks the head's supervis
 `./gr8 glm53 up`) to check every rank, and answers with one JSON object: 200 when every rank passes, else 503. Other
 addresses get 403. Each rank's engine sums its weights on the GPU, on a low-priority stream while it serves, and compares
 them with the sums it took once it was ready to serve (engine/runtime/weight_check.cuh): it reads every weight byte once,
-about 0.3 s at TP=4. Plain `/health` is unchanged.
+about 0.3 s at TP=4. Plain `/health` keeps its 200/503 readiness status and returns JSON with `ready` and `steering`.
+Current real engines report `"steering": {"enabled": false, "forced": false}`. A synthetic loaded capability
+also reports profile name, the first 12 digest characters, scope, active layers, and forced status.
 
 ```json
 {"t": "check", "ok": true, "time": 1760371200.5,
@@ -230,3 +232,11 @@ canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve
 - `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. The close leads because the template leaves `<think>` open at the end of a chat prompt, so without it the forced call would be reasoning text and the parser would read the reply as prose. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text, and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (the inserted close ends the block before any reasoning is written), its inserted tokens count toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request).
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).
 - The benchmark client is `../bench/pbench.py`.
+
+## Steering request transport (inactive on real engines)
+
+Chat and completion requests recognize `steering_profile` and `steering_scale`. Named profiles require a
+matching loaded capability; current real servers return HTTP 400 with `param: "steering_profile"`.
+The frontend preserves a selected profile and its exact canonical FP32 scale through budget continuations.
+The shim independently validates the fields before writing any request file. Stock frames omit both fields.
+[Transport details and testing](../docs/STEERING-TRANSPORT.md) describe the reserved loaded receipt and mock fixtures.

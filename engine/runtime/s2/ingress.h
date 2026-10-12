@@ -32,9 +32,14 @@ inline Command parse_command(const std::string& text, uint64_t epoch) {
 }
 inline std::string capability(Config c, unsigned ranks) {
     c.validate(); require(ranks==3 || ranks==4 || ranks==6, "invalid rank count");
-    // version 3: version 2's fields, and requests may carry an insert rule (sessions.h `ins`)
-    return "G6S2 3 "+std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
-        std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+" "+std::to_string(g6rt::LP_MAX)+"\n";
+    const std::string base=std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
+        std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+" "+std::to_string(g6rt::LP_MAX);
+    // Version 3 adds insert rules. Version 4 appends the immutable steering receipt.
+    if (!c.steering.loaded) return "G6S2 3 "+base+"\n";
+    const auto& s=c.steering;
+    return "G6S2 4 "+base+" "+s.profile_name+" "+g6rt::steering::digest_hex(s.profile_digest)+" "+
+        g6rt::steering::scope_name(s.scope)+" "+std::to_string(s.active_layers)+" "+std::to_string(s.forced)+" "+
+        std::to_string(s.forced_scale_bits)+"\n";
 }
 class Ingress {
     std::string dir_; uint64_t epoch_, next_=0;

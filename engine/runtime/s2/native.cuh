@@ -205,6 +205,8 @@ class NativeDispatch {
         const int a = int(first), ma = std::min(int(rows),c_.prefill_rows), mb = int(rows)-ma;
         std::vector<int> pos(rows); for (unsigned r=0;r<rows;++r) pos[r]=a+int(r);
         auto& p = c_.prefill; auto& p2 = c_.prefill2; auto& dq = c_.draft_prefill;
+        const float scale = payload.steering.enabled ? g6rt::steering::bits_float(payload.steering.scale_bits) : 0.f;
+        p.steering_scale = p2.steering_scale = scale;
         g6rt::pf_inputs(p,ma,payload.prompt.data()+a,pos.data());
         g6rt::pf_enqueue(c_.prefill_fabric,p,prefill_sequence_,c_.main.nl,ma);
         if (mb) {

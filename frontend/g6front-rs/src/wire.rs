@@ -172,6 +172,10 @@ pub struct GenParams {
     pub system_tokens: Option<u64>,
     /// the engine's insert rule (PROTOCOL.md `insert`); only sent when set
     pub insert: Option<InsertRule>,
+    /// Only sent after validation against hello.steering. None preserves stock frame bytes.
+    pub steering_profile: Option<String>,
+    /// Canonical FP32 widened to f64 for lossless JSON serialization.
+    pub steering_scale: Option<f64>,
 }
 
 /// Once the reply holds `after_tokens` tokens and none of them is `unless_emitted`, the engine puts `tokens` in place of
@@ -245,6 +249,12 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         }
         b.extend_from_slice(b"]}]");
     }
+    if let Some(profile) = &p.steering_profile {
+        b.extend_from_slice(b",\"steering_profile\":");
+        pyjson::string(b, profile);
+        b.extend_from_slice(b",\"steering_scale\":");
+        pyjson::float(b, p.steering_scale.unwrap_or(1.0));
+    }
     b.extend_from_slice(b",\"type\":\"generate\"}");
     w.finish()
 }
@@ -284,6 +294,8 @@ mod tests {
             prompt_logprobs: None,
             system_tokens: Some(2),
             insert: None,
+            steering_profile: None,
+            steering_scale: None,
         };
         let mut all = Vec::new();
         all.extend_from_slice(&generate("cmpl-1", &[10, 20, 30], &p));
@@ -300,6 +312,13 @@ mod tests {
         assert_eq!((h.kind.as_ref(), h.id.as_deref()), ("cancel", Some("cmpl-1")));
         assert!(r.next().await.unwrap().is_none());
         assert!(!String::from_utf8_lossy(&generate("x", &[1], &p)[4..]).contains("insert"));
+        assert!(!v.as_object().unwrap().contains_key("steering_profile"));
+        assert!(!v.as_object().unwrap().contains_key("steering_scale"));
+        let selected =
+            GenParams { steering_profile: Some("example".into()), steering_scale: Some(1.1f32 as f64), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &selected)[4..]).unwrap();
+        assert_eq!(v["steering_profile"], "example");
+        assert_eq!((v["steering_scale"].as_f64().unwrap() as f32).to_bits(), 0x3f8ccccd);
         let p = GenParams {
             logprobs: None,
             insert: Some(InsertRule { after_tokens: 31, unless_emitted: Some(154842), tokens: vec![198, 154842, 271] }),

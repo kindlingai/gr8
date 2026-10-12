@@ -18,7 +18,7 @@ reply goes on as the continuation of a prompt that holds them; an insert that op
 close, with no reasoning. Logprobs and prompt_logprobs are fake but deterministic,
 proper (sum p < 1), and the scored token is not always the argmax.
 
-usage: mock_engine.py --model-dir DIR [--sock /tmp/g6-mock.sock]
+usage: mock_engine.py --model-dir DIR [--sock /tmp/g6-mock.sock] [--steering]
 """
 import argparse
 import asyncio
@@ -43,6 +43,8 @@ PROSE = ('The harbor lay quiet under a pale morning sky, and the old keeper walk
          'as he had done for thirty years. Gulls turned over the water, the tide pulled at the pilings, and the '
          'town behind him woke slowly, one lamp and one chimney at a time. ')
 ACCEPT_CYCLE = [3, 2, 3, 1, 0, 2, 3, 3, 1, 2]  # accepted drafts per round (k=3)
+STEERING = {'profile': 'example', 'digest': 'a' * 64, 'scope': 'full', 'layers': 48,
+            'forced': False, 'forced_scale': 0.0}
 K_DRAFT = 3
 
 
@@ -175,10 +177,13 @@ class Mock:
 
     # ---- protocol -----------------------------------------------------------------------------------------------
     async def serve(self, reader, writer):
-        hello = {'type': 'hello', 'version': 1, 'model': 'glm-5.3-mock', 'max_model_len': self.a.max_model_len,
-                 'vocab_size': self.V, 'eos_ids': self.t.eos_ids, 'max_logprobs': 20}
+        hello = {'type': 'hello', 'version': 1, 'model': 'glm-5.3-mock',
+                 'max_model_len': self.a.max_model_len, 'vocab_size': self.V,
+                 'eos_ids': self.t.eos_ids, 'max_logprobs': 20}
         if not self.a.no_insert:
             hello['insert'] = True
+        if self.a.steering:
+            hello['steering'] = STEERING
         wire.write_frame(writer, hello)
         tasks: dict[str, asyncio.Task] = {}
         try:
@@ -298,6 +303,7 @@ async def main():
     ap.add_argument('--no-insert', action='store_true', help='an engine without the insert rule (the hello says so)')
     ap.add_argument('--plain', action='store_true',
                     help='skip prompt-dependent scripting and the prefix cache (front-end overhead benchmarks)')
+    ap.add_argument('--steering', action='store_true', help='advertise a synthetic profile for transport tests; tokens are unchanged')
     a = ap.parse_args()
     logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     mock = Mock(a)
