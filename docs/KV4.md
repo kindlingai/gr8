@@ -146,8 +146,34 @@ prefill:
   two-layer model's flat distributions.
 - No attention error word was set, and every rank stored the same bytes.
 
+**Full-vocabulary KL** (2026-10-12). The served weights (exlr8 v2 `home`) run through a streamed BF16 forward, with the
+cached latent (the `kv_a_layernorm` output, which feeds both K and V) replaced by its round trip through each row.
+Setup: 100 windows of 2,048 tokens, microbatch 8 (the same rows and plan as the `v2-home` arm). Scored against the
+BF16 model:
+
+| arm | held-out KL mean / median | wikitext KL mean / median | top-1 held-out / wikitext |
+|---|---|---|---|
+| BF16 latent | 0.1488 / 0.0125 | 0.1036 / 0.0143 | 0.883 / 0.905 |
+| FP8 row (today) | 0.1511 / 0.0127 | 0.1036 / 0.0140 | 0.882 / 0.905 |
+| INT4 row | 0.1609 / 0.0145 | 0.1117 / 0.0155 | 0.877 / 0.900 |
+| INT4 row, layers 0-3 on the FP8 row | 0.1617 / 0.0145 | 0.1112 / 0.0155 | 0.878 / 0.901 |
+
+- **Cost of the INT4 row.** Over the FP8 row it adds 0.010 (held-out) and 0.008 (wikitext) KL. That is 6.5% and 7.8%
+  of what the weight quantization costs.
+- **Pairwise against the FP8 row, same weights:**
+  - INT4 row: 0.1155 / 0.0058 held-out, 0.0256 / 0.0043 wikitext.
+  - For scale, the FP8 row against a BF16 latent: 0.0947 / 0.0031 and 0.0134 / 0.0021.
+  - The BF16 forward's own noise (microbatch 4 against 8): 0.112 / 0.0043.
+  - On held-out text the INT4 row is at that noise floor. On wikitext it doubles the FP8 row's divergence.
+- **Keeping layers 0-3 on the FP8 row changes nothing measurable.**
+- **Per-layer attention output error** (the same input run with the exact and the quantized latent; real queries):
+  - FP8 row: 0.2-2.9%, median 2.2%.
+  - INT4 row: 0.3-11%, median 8.5%. It grows with depth: 1-5% in layers 1-9, 8-11% past layer 60.
+- **Limits.** These windows are 2,048 tokens, so the indexer selects every key, and the MTP layer is not in this
+  forward. Long-context needles and acceptance length are still open.
+
 ## Not measured yet
 
-- Full-vocabulary KL and long-context needles on the cluster.
+- Long-context needles on the cluster.
 - Decode and prefill speed.
 - MTP and DFlash2 acceptance. The MTP layer's cache is quantized too.
