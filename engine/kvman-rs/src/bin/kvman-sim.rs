@@ -17,7 +17,7 @@
 //! --repeat N runs the trace N times over, each copy started --stagger seconds after the last, as N times the agents.
 //! Time model (the engine at TP=4): one prefill at a time (--prefill-tps, new tokens only), and no decode while a prefill
 //! runs. Decode shares a total rate by how many sessions decode (--decode-tps: 1, 2, 4 sessions, 3 interpolated, more than
-//! 4 as 4). The SSD store moves page blocks (src/tier.rs PAGE_SLOT) at --ssd-write-gbs / --ssd-read-gbs, on the
+//! 4 as 4). The SSD store moves page blocks (src/tier.rs page_slot: --mla-row 656, or 416 for a G6_KV4 engine) at --ssd-write-gbs / --ssd-read-gbs, on the
 //! admitting request's critical path (--spill evict), or writes every retained run at retirement off the critical path
 //! (--spill retire). The pool, its reuse rules and its evictions are the engine's own code (src/pool.rs).
 //! --rowcache W[,W..] adds an estimate for a sparse row cache: per decoded token, the indexer's selected rows that fall
@@ -25,7 +25,7 @@
 
 use g6kvman::reuse::{begin, Finished, Rules};
 use g6kvman::stash::{Io, Keep};
-use g6kvman::tier::PAGE_SLOT;
+use g6kvman::tier::{page_slot, MLA_ROW};
 use g6kvman::{Pool, Run, PAGE};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -61,6 +61,7 @@ struct Opts {
     row_iops: f64,
     groups: usize,
     store_slots: u64,
+    mla_row: usize,
 }
 
 /// The engine's store under a --kv-keep policy.
@@ -159,7 +160,7 @@ fn usage() -> ! {
         "usage: kvman-sim TRACE.csv [--policies none,today,ssd] [--prefill-tps 1300] [--decode-tps 30,51.5,64.4]\n\
          [--pages 4608] [--place 1920] [--share-limit 65536] [--sessions 8] [--guard 14] [--grid 4096] [--strict]\n\
          [--end-rule] [--ssd-write-gbs 5.7] [--ssd-read-gbs 7.0] [--ssd-gb 256] [--spill evict|retire]\n\
-         [--rowcache 16384,32768] [--row-iops 832000] [--groups 21] [--max-tokens N] [--repeat N] [--stagger S]\n\
+         [--rowcache 16384,32768] [--row-iops 832000] [--groups 21] [--max-tokens N] [--repeat N] [--stagger S] [--mla-row 656]\n\
          policies also: system[N] sessions all evicted, -nodedup -nospan, @F (write limit)"
     );
     std::process::exit(2)
@@ -251,6 +252,7 @@ fn main() {
         row_iops: 832_000.0,
         groups: 21,
         store_slots: 0,
+        mla_row: MLA_ROW,
     };
     let mut policies = vec![Policy::None, Policy::Today, Policy::Ssd, Policy::Grow, Policy::GrowSsd];
     let mut max_tokens = None;
@@ -286,6 +288,7 @@ fn main() {
             "--rowcache" => o.rowcache = v().split(',').map(|x| x.parse().unwrap_or_else(|_| usage())).collect(),
             "--row-iops" => o.row_iops = num(v()),
             "--groups" => o.groups = num(v()) as usize,
+            "--mla-row" => o.mla_row = num(v()) as usize,
             "--max-tokens" => max_tokens = Some(num(v()) as usize),
             "--repeat" => copies = num(v()) as usize,
             "--stagger" => stagger = num(v()),
@@ -293,7 +296,7 @@ fn main() {
         }
     }
     let reqs = repeat(read_trace(&trace, max_tokens), copies.max(1), stagger);
-    o.store_slots = ((o.store_gb * 1e9) as u64 / PAGE_SLOT as u64).max(1);
+    o.store_slots = ((o.store_gb * 1e9) as u64 / page_slot(o.mla_row) as u64).max(1);
     let sessions = reqs.iter().map(|r| r.session + 1).max().unwrap_or(0);
     let prompt_total: usize = reqs.iter().map(|r| r.prompt).sum();
     println!(
@@ -454,7 +457,7 @@ fn simulate(reqs: &[Req], o: &Opts, policy: &Policy) -> Result {
     if let Some(c) = cfg {
         pool.stores(c.after);
         pool.add_tier(o.store_slots, c.keep, None).expect("a tier");
-        let p = g6kvman::stash::Policy { min_rows: 0, min_hits: c.min_hits, block_bytes: PAGE_SLOT as u64 };
+        let p = g6kvman::stash::Policy { min_rows: 0, min_hits: c.min_hits, block_bytes: page_slot(o.mla_row) as u64 };
         pool.set_policy(0, p).expect("tier 0");
         pool.write_limit(c.limit_milli);
         pool.stash_mut().expect("stores").dedupe = c.dedupe;
@@ -487,7 +490,7 @@ fn simulate(reqs: &[Req], o: &Opts, policy: &Policy) -> Result {
     }
     let mut fifo: VecDeque<(usize, f64)> = VecDeque::new();
     let mut active: Vec<Active> = Vec::new();
-    let page_bytes = PAGE_SLOT as u64;
+    let page_bytes = page_slot(o.mla_row) as u64;
     let mut store = Store { q: VecDeque::new(), pages: 0, cap: ((o.store_gb * 1e9) as u64 / page_bytes) as usize };
     let mut io_block = 0.0f64; // SSD writes of runs that growth evicted: they hold up every session, as a prefill does
                                // the retained runs' contents by age: what the ssd policies write out when the pool evicts one
@@ -744,7 +747,7 @@ fn drain(pool: &mut Pool, res: &mut Result, o: &Opts) -> f64 {
             Io::Restore { tier, slot, .. } => r.insert((tier, slot)),
         };
     }
-    let (w, r) = (w.len() as u64 * PAGE_SLOT as u64, r.len() as u64 * PAGE_SLOT as u64);
+    let (w, r) = (w.len() as u64 * page_slot(o.mla_row) as u64, r.len() as u64 * page_slot(o.mla_row) as u64);
     pool.io_done().expect("no index");
     res.written += w;
     res.read += r;

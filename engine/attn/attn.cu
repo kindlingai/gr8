@@ -4,6 +4,7 @@
 #include "../g6nr.h"
 #include "../g6mx.h"
 #include "../h2d.h"
+#include "kvfmt.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -22,7 +23,7 @@ extern "C" { void (*g6_attn_mark)(int stage,void* stream)=nullptr; }
 #define AMARK(k) do{if(g6_attn_mark)g6_attn_mark((k),(void*)stream);}while(0)
 namespace ga {
 constexpr int TOP=2048, PART=8;
-constexpr int KV_BYTES=656, IDX_BYTES=132;
+constexpr int KV_BYTES=g6kv::ROW, IDX_BYTES=g6kv::IDX_ROW;
 using half=__half; using bf16=__nv_bfloat16;
 // The old C ABI remains unchanged. Static launches fold this resolver away;
 // replay launches retain capacity strides but read live bounds from device RAM.
@@ -179,7 +180,36 @@ __device__ const uint8_t* ik_at(const DeviceAttn& a,int pos,float& scale){
     const uint8_t* base=(const uint8_t*)a.index_cache+(int64_t)p*a.page_size*IDX_BYTES;
     scale=((const float*)(base+a.page_size*128))[pos%a.page_size];return base+(pos%a.page_size)*128;
 }
+#if G6_KV4
+__device__ float latent(const uint8_t* v,int d){return (float)(((v[d>>1]>>((d&1)*4))&15)-8)*__half2float(((const half*)(v+g6kv::SCALE_OFF))[d>>5]);}
+// x[k] = element lane + 32 k of a 512-vector held by one warp -> H x, unscaled (Sylvester order: bits 0-4 are the lane,
+// bits 5-8 are k). Every lane of the warp must call it.
+__device__ __forceinline__ void fwht16(float (&x)[16],int lane){
+    #pragma unroll
+    for(int h=1;h<16;h<<=1){
+        #pragma unroll
+        for(int k=0;k<16;k++)if(!(k&h)){const float a=x[k],b=x[k|h];x[k]=a+b;x[k|h]=a-b;}}
+    #pragma unroll
+    for(int o=1;o<32;o<<=1){
+        #pragma unroll
+        for(int k=0;k<16;k++){const float y=__shfl_xor_sync(0xffffffff,x[k],o);x[k]=(lane&o)?y-x[k]:x[k]+y;}}
+}
+constexpr float HSCALE=0.04419417382415922f;   // 1/sqrt(512): H is orthonormal, so H^-1 = H
+// rows of 512 floats := H x (decode: the absorbed query before scores, the context before value_project). Warp per row.
+__global__ void fwht_rows(float* p,int rows){
+    const int row=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(row>=rows)return;
+    float* r=p+(int64_t)row*512;float x[16];
+    #pragma unroll
+    for(int k=0;k<16;k++)x[k]=r[lane+32*k];
+    fwht16(x,lane);
+    #pragma unroll
+    for(int k=0;k<16;k++)r[lane+32*k]=x[k]*HSCALE;
+}
+#define KV4_ROTATE(p,rows,st) do{if((rows)>0)ga::fwht_rows<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));}while(0)
+#else
 __device__ float latent(const uint8_t* v,int d){return e4(v[d])*((const float*)(v+512))[d/128];}
+#define KV4_ROTATE(p,rows,st) do{}while(0)
+#endif
 
 template<class Input>
 __global__ void append_kv(Input input){
@@ -191,13 +221,33 @@ __global__ void append_kv(Input input){
     ss=warp_sum(ss);if((t&31)==0)sums[t/32]=ss;__syncthreads();
     float total=0;for(int j=0;j<8;j++)total+=sums[j];float inv=rsqrtf(total/512+1e-5f);
     for(int d=t;d<512;d+=256)v[d]*=inv*bfloat(a.kv_norm,d);__syncthreads();
+#if G6_KV4
+    // H x (warp 0), then INT4 per 32 dims with an FP16 scale amax / 7 (warp w: groups 2w and 2w + 1)
+    __shared__ uint8_t code[512];
+    if(t<32){float x[16];
+        #pragma unroll
+        for(int k=0;k<16;k++)x[k]=v[t+32*k];
+        fwht16(x,t);
+        #pragma unroll
+        for(int k=0;k<16;k++)v[t+32*k]=x[k]*HSCALE;}
+    __syncthreads();
+    uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
+    {const int w=t>>5,l=t&31;
+     for(int g=2*w;g<2*w+2;g++){const float x=v[g*32+l];if(!isfinite(x))error(a,4);
+        const half s=__float2half_rn(warp_max(fabsf(x))*(1.f/7.f));const float sf=__half2float(s);
+        const int q=sf>0.f?(int)fminf(fmaxf(rintf(x/sf),-7.f),7.f):0;code[g*32+l]=(uint8_t)(q+8);
+        if(l==0)((half*)(dst+g6kv::SCALE_OFF))[g]=s;}}
+    __syncthreads();
+    dst[t]=(uint8_t)(code[2*t]|(code[2*t+1]<<4));
+#else
     if(t<4){float mx=0;for(int d=t*128;d<(t+1)*128;d++)mx=fmaxf(mx,fabsf(v[d]));sc[t]=fmaxf(mx/448.f,FLT_MIN);}
     __syncthreads();
     uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
     for(int d=t;d<512;d+=256){if(!isfinite(v[d]))error(a,4);dst[d]=q4(v[d]/sc[d/128]);}
     if(t<4)((float*)(dst+512))[t]=sc[t];
+#endif
     if(t<32){float c,s;RCS(pos,t,c,s);float x=hfloat(a.kv_a,(int64_t)row*576+512+2*t),y=hfloat(a.kv_a,(int64_t)row*576+513+2*t);
-        ((bf16*)(dst+528))[2*t]=__float2bfloat16_rn(x*c-y*s);((bf16*)(dst+528))[2*t+1]=__float2bfloat16_rn(y*c+x*s);}
+        ((bf16*)(dst+g6kv::ROPE_OFF))[2*t]=__float2bfloat16_rn(x*c-y*s);((bf16*)(dst+g6kv::ROPE_OFF))[2*t+1]=__float2bfloat16_rn(y*c+x*s);}
 }
 template<class Input>
 __global__ void append_index(Input input){
@@ -293,7 +343,7 @@ __global__ void mla_scores(Input input,int start,const float* q,const float* rop
     int row=blockIdx.z,r=start+row,h=blockIdx.y,j=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;FOR_ROW(a,input,r);
     __shared__ float qr[512],rp[64];for(int d=t;d<512;d+=256)qr[d]=q[((int64_t)row*a.heads+h)*512+d];if(t<64)rp[t]=rope[((int64_t)row*a.heads+h)*64+t];__syncthreads();
     int id=a.indices[(int64_t)r*TOP+j];const uint8_t* v=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?kv_at(a,id):nullptr;float sum=0;
-    if(v){for(int d=lane;d<512;d+=32)sum=fmaf(qr[d],latent(v,d),sum);for(int d=lane;d<64;d+=32)sum=fmaf(rp[d],__bfloat162float(((const bf16*)(v+528))[d]),sum);}
+    if(v){for(int d=lane;d<512;d+=32)sum=fmaf(qr[d],latent(v,d),sum);for(int d=lane;d<64;d+=32)sum=fmaf(rp[d],__bfloat162float(((const bf16*)(v+g6kv::ROPE_OFF))[d]),sum);}
     sum=warp_sum(sum);if(lane==0)score[((int64_t)row*a.heads+h)*TOP+j]=v?sum*(1.f/16):-INFINITY;
 }
 template<class Input>
@@ -319,6 +369,16 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
     const float prob=p[slot];const uint8_t* src=nullptr;
     if(id>=0&&id<=a.positions[r]&&prob!=0)src=kv_at(a,id);
     rows[t]=(uintptr_t)src;probability[t]=prob;
+#if G6_KV4
+    __syncthreads();
+    #pragma unroll 4
+    for(int j=0;j<TOP/PART;j++){
+        const uint8_t* v=(const uint8_t*)rows[j];if(!v)continue;
+        float weight=probability[j];
+        lo=fmaf(weight,latent(v,t),lo);
+        hi=fmaf(weight,latent(v,t+256),hi);
+    }
+#else
     if(src)for(int g=0;g<4;g++)scales[t*4+g]=((const float*)(src+512))[g];
     __syncthreads();
     #pragma unroll 4
@@ -328,6 +388,7 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
         lo=fmaf(weight,e4(v[t])*scales[j*4+(t>>7)],lo);
         hi=fmaf(weight,e4(v[t+256])*scales[j*4+2+(t>>7)],hi);
     }
+#endif
     float* dst=parts+(((int64_t)row*a.heads+h)*PART+part)*512;dst[t]=lo;dst[t+256]=hi;
 }
 template<class Input>
@@ -464,6 +525,7 @@ static Work workspace(const G6Attn& a,void* base){
     size_t single=0;e=cub::DeviceRadixSort::SortPairsDescending(nullptr,single,w.si,w.so,w.ii,w.io,(int)T);
     if(e!=cudaSuccess)return Work{};b=std::max(b,single);w.temp_bytes=b;w.temp=alloc(b);w.total=n;return w;
 }
+#include "kv4.cuh"
 #include "decode-small.cuh"
 template<class Input>
 static void threshold_compact(const G6Attn& a,Input input,Work& w,int count,cudaStream_t stream){
@@ -581,6 +643,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         if(avp1_on())launch_absorb_m1(a,input,w,start,n,stream);else if(launch_absorb_rows(a,input,w,start,n,stream)){}else
 #endif
         ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,start,w.q,w.rope);
+        KV4_ROTATE(w.q,n*a.heads,stream);
         AMARK(3);
         ga::launch_mla_scores(a,input,w,start,n,stream);
         AMARK(4);
@@ -589,6 +652,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         ga::launch_context_parts(a,input,w,start,n,stream);
         AMARK(6);
         ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        KV4_ROTATE(w.context,n*a.heads,stream);
         AMARK(7);
 #if defined(DEC_AVP) && DEC_AVP
         if(avp1_on())launch_value_project_m1(a,input,w,start,n,stream);else if(launch_value_project_rows(a,input,w,start,n,stream)){}else
@@ -661,6 +725,7 @@ static cudaError_t cp_front_body(const G6Attn& a,Input input,Work& w,cudaStream_
     if(avp1_on())launch_absorb_m1(a,input,w,0,n,stream);else if(launch_absorb_rows(a,input,w,0,n,stream)){}else
 #endif
     ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,0,w.q,w.rope);
+    KV4_ROTATE(w.q,n*a.heads,stream);
     return cudaGetLastError();
 }
 template<class Input>
@@ -696,6 +761,7 @@ template<class Input>
 static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const float* part_all,cudaStream_t stream){
     const int n=a.rows;
     cp_lse<<<n*a.heads,256,0,stream>>>(input,part_all,w.context);
+    KV4_ROTATE(w.context,n*a.heads,stream);
 #if defined(DEC_AVP) && DEC_AVP
     if(avp1_on())launch_value_project_m1(a,input,w,0,n,stream);else if(launch_value_project_rows(a,input,w,0,n,stream)){}else
 #endif

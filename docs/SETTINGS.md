@@ -126,6 +126,7 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `DEC_IDX31=1` | decode index scorer reads each key once for all query rows and skips tiles another CP rank owns; select stops at the live end of the bucket (exact; needs `SEL32`) |
 | `G6_CP=1`, `G6_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
 | `PF_F12` (TP4 build only) | prefill expert fc1: one fat CTA runs `F12_NE` (default 2) adjacent expert blocks on one quantized A record (`kernels/bind_prefill.cuh`, `k_pf_fc1f`). `F12_NE` must divide the expert blocks per rank (4 at TP4, 3 at TP6). `G6_PF_F12=0` turns it off at run time |
+| `G6_KV4=1` (not in the stock build; experimental) | the MLA latent cached as INT4 after a Hadamard rotation, 416 B a row instead of 656 B (`attn/kvfmt.h`, [KV4.md](KV4.md)). Changes the outputs; off by default (`EXTRA=-DG6_KV4=1 scripts/build.sh`) |
 
 ## Front end and shim
 

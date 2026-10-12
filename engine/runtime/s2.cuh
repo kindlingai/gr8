@@ -294,13 +294,13 @@ inline void s2_reset(Model& m, cudaStream_t st)
     }
 }
 
-// grid (pages of the list), block 256: page list[blockIdx.x] of a latent cache (656 B per row) and an index cache (132 B
+// grid (pages of the list), block 256: page list[blockIdx.x] of a latent cache (g6kv::ROW B per row) and an index cache (132 B
 // per row, or none) := 0
 __global__ void __launch_bounds__(256) k_zero_pages(const int* list, uint4* mla, uint4* index)
 {
     const size_t p = (size_t)list[blockIdx.x];
-    for (size_t k = threadIdx.x; k < 64 * 656 / 16; k += blockDim.x) mla[p * (64 * 656 / 16) + k] = make_uint4(0, 0, 0, 0);
-    if (index) for (size_t k = threadIdx.x; k < 64 * 132 / 16; k += blockDim.x) index[p * (64 * 132 / 16) + k] = make_uint4(0, 0, 0, 0);
+    for (size_t k = threadIdx.x; k < 64 * g6kv::ROW / 16; k += blockDim.x) mla[p * (64 * g6kv::ROW / 16) + k] = make_uint4(0, 0, 0, 0);
+    if (index) for (size_t k = threadIdx.x; k < 64 * g6kv::IDX_ROW / 16; k += blockDim.x) index[p * (64 * g6kv::IDX_ROW / 16) + k] = make_uint4(0, 0, 0, 0);
 }
 // a new session's pages on the layers' own bindings: today's reset() limited to those pages (other sessions' pages stay),
 // plus the bindings' per-step words. The whole pool = today's reset(). Host, at an admission fence, on every rank, main
@@ -378,7 +378,7 @@ inline void s2_reloc_copy(char* cache, size_t page_bytes, int B, int pages, cuda
     }
 }
 // the 2->1 transition (m4sim G6_S2_RELOC=1): the survivor in slot q (a run at base B != 0) moves to base 0, its first
-// `pages` pages of every layer's MLA cache (656 B per row) and index cache (132 B per row, full-index layers), then
+// `pages` pages of every layer's MLA cache (g6kv::ROW B per row) and index cache (132 B per row, full-index layers), then
 // s2_set_base(q, 0). Host, at a round boundary, outside capture, before any new admission, for the main and the draft
 // model of every rank.
 inline void s2_relocate(Model& m, int q, int pages, cudaStream_t st)
@@ -390,8 +390,8 @@ inline void s2_relocate(Model& m, int q, int pages, cudaStream_t st)
     if (pages < 0 || pages > s.pages[q]) die("s2_relocate: pages out of the run");
     for (G6AttnBinding* p : s.pool)
     {
-        s2_reloc_copy(static_cast<char*>(p->args.mla_cache), 64 * 656, B, pages, st);
-        if (p->args.index_cache) s2_reloc_copy(static_cast<char*>(p->args.index_cache), 64 * 132, B, pages, st);
+        s2_reloc_copy(static_cast<char*>(p->args.mla_cache), 64 * g6kv::ROW, B, pages, st);
+        if (p->args.index_cache) s2_reloc_copy(static_cast<char*>(p->args.index_cache), 64 * g6kv::IDX_ROW, B, pages, st);
     }
     s2_set_base(m, q, 0);
 }

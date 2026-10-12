@@ -3,7 +3,7 @@
 // node over RDMA or TCP).
 //
 // A page block is one pool page of every layer binding, main model then draft: per binding 64 rows of the MLA cache
-// (64 x 656 B), then, on full-index layers, 64 rows of the indexer keys (64 x 132 B). The full GLM 5.3 has 79 MLA
+// (64 x g6kv::ROW B: 656, or 416 under G6_KV4), then, on full-index layers, 64 rows of the indexer keys (64 x 132 B). The full GLM 5.3 has 79 MLA
 // caches and 22 index caches: 3,502,592 B. Each binding stores page p at p x its page bytes, so one kernel copies a batch
 // of pages between the bindings and mapped pinned host memory, and the store reads and writes that memory.
 // Spills run before restores: a restore may write a page that a spill of the same call still has to read.
@@ -44,7 +44,7 @@ inline std::string exe_stamp() {
 }
 
 namespace kvt {
-constexpr size_t MLA16 = 64 * 656 / 16, IDX16 = 64 * 132 / 16;
+constexpr size_t MLA16 = 64 * g6kv::ROW / 16, IDX16 = 64 * g6kv::IDX_ROW / 16;
 // off16: the binding's place in a page block; rep16: in a replicated record. phys: its attention cache's pages (the
 // last physical page differs by rank past R). cp: its attention cache is sharded past R
 struct Piece { uint4* mla; uint4* idx; unsigned long long off16, rep16; int phys; int cp; };
@@ -95,8 +95,8 @@ public:
             const bool cp = b->args.cp_nr != 0;
             pieces_.push_back({static_cast<uint4*>(b->args.mla_cache), static_cast<uint4*>(b->args.index_cache), off / 16, rep / 16,
                                b->args.page_count, cp});
-            off += 64 * 656 + (b->args.index_cache ? 64 * 132 : 0);
-            rep += cp ? 0 : 64 * 656 + (b->args.index_cache ? 64 * 132 : 0);
+            off += 64 * g6kv::ROW + (b->args.index_cache ? 64 * g6kv::IDX_ROW : 0);
+            rep += cp ? 0 : 64 * g6kv::ROW + (b->args.index_cache ? 64 * g6kv::IDX_ROW : 0);
         }
         block_ = off;
         rep_ = rep;

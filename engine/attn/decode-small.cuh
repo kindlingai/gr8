@@ -282,6 +282,11 @@ static void launch_context_tile(const G6Attn& a,Input input,Work& w,int start,in
 // index and contexts past 2048 included.
 template<class Input>
 static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ #if G6_KV4   // the INT4 row has the head-batched kernel and the generic one; the FP8-only variants below are not used
+ if(attn_heads()){constexpr int HG=16;kv4::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
+ else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+ return;
+ #endif
  if(use_attn_flip(a,n))small_decode::scores_flip<Input,11><<<dim3(TOP/8,(a.heads+10)/11,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else if(attn_heads()&&attn_p11()&&a.heads%16==0)small_decode::scores_tr<16><<<dim3(TOP/8,a.heads/16,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else if(attn_heads()){constexpr int HG=16;small_decode::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
@@ -291,6 +296,12 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int 
 }
 template<class Input>
 static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ #if G6_KV4
+ if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
+ else if(n>=5){constexpr int HG=8;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+ else{constexpr int HG=4;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+ return;
+ #endif
  if(use_attn_flip(a,n)){const bool fk=use_fixed_k_decode(a),ge4=!fk&&!attn_heads();   // ge4: the reference is the generic context_parts
   if(attn_flip_d256()){
    if(n==1){if(!ge4)small_decode::context_flip<Input,4,256,16,false,false><<<dim3(PART*2,(a.heads+3)/4,n),128,0,st>>>(input,start,w.prob,w.parts);

@@ -16,13 +16,13 @@ __global__ void __launch_bounds__(128) k_reuse_poison(G6Attn a, int r0)
     const int pg = a.block_table[lp];
     if (pg >= 0 && pg < a.page_count)
     {
-        uint8_t* d = static_cast<uint8_t*>(a.mla_cache) + ((size_t)pg * a.page_size + off) * 656;
-        for (int k = threadIdx.x; k < 656; k += blockDim.x) d[k] = 0xff;        // fp8 e4m3 NaN, NaN fp32 scales
+        uint8_t* d = static_cast<uint8_t*>(a.mla_cache) + ((size_t)pg * a.page_size + off) * g6kv::ROW;
+        for (int k = threadIdx.x; k < g6kv::ROW; k += blockDim.x) d[k] = 0xff;        // fp8 e4m3 NaN, NaN fp32 scales (KV4: NaN fp16 scales)
     }
     const int ip = pg;                         // index keys sit on the latent's pages (attn.cu ipage)
     if (a.index_cache && ip >= 0 && ip < a.page_count)
     {
-        uint8_t* base = static_cast<uint8_t*>(a.index_cache) + (size_t)ip * a.page_size * 132;
+        uint8_t* base = static_cast<uint8_t*>(a.index_cache) + (size_t)ip * a.page_size * g6kv::IDX_ROW;
         base[off * 128 + threadIdx.x] = 0xff;
         if (threadIdx.x == 0) reinterpret_cast<float*>(base + a.page_size * 128)[off] = __int_as_float(0x7fc00000);
     }

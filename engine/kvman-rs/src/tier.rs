@@ -34,15 +34,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const ALIGN: usize = 4096;
 pub const PAGE_ROWS: usize = 64;
 pub const MLA_ROW: usize = 656;
+/// The MLA row of an engine built with G6_KV4=1 (engine/attn/kvfmt.h): 256 B of INT4 latent, 16 FP16 scales, 64 BF16
+/// rope. The index keys keep their 132 B.
+pub const MLA_ROW_KV4: usize = 416;
 pub const IDX_ROW: usize = 132;
 pub const MLA_LAYERS: usize = 79;
 pub const INDEX_LAYERS: usize = 22;
 pub const GROUP_LAYERS: usize = 4;
 
-/// Bytes of one logical page across every layer's caches, before rounding to 4 KiB.
-pub const PAGE_BLOCK_BYTES: usize = MLA_LAYERS * PAGE_ROWS * MLA_ROW + INDEX_LAYERS * PAGE_ROWS * IDX_ROW;
+/// Bytes of one logical page across every layer's caches for an MLA row of `mla_row` bytes, before rounding to 4 KiB.
+pub const fn page_block_bytes(mla_row: usize) -> usize {
+    MLA_LAYERS * PAGE_ROWS * mla_row + INDEX_LAYERS * PAGE_ROWS * IDX_ROW
+}
+/// One page block's slot for an MLA row of `mla_row` bytes.
+pub const fn page_slot(mla_row: usize) -> usize {
+    page_block_bytes(mla_row).div_ceil(ALIGN) * ALIGN
+}
+/// Bytes of one logical page across every layer's caches (the FP8 row), before rounding to 4 KiB.
+pub const PAGE_BLOCK_BYTES: usize = page_block_bytes(MLA_ROW);
 /// One page block's slot.
-pub const PAGE_SLOT: usize = PAGE_BLOCK_BYTES.div_ceil(ALIGN) * ALIGN;
+pub const PAGE_SLOT: usize = page_slot(MLA_ROW);
 /// One token's rows of one indexer group, and its slot.
 pub const ROW_BYTES: usize = GROUP_LAYERS * MLA_ROW;
 pub const ROW_SLOT: usize = ALIGN;
@@ -372,6 +383,9 @@ mod tests {
         assert_eq!(PAGE_BLOCK_BYTES, 3_502_592);
         assert_eq!(PAGE_SLOT, 856 * 4096);
         assert_eq!(ROW_BYTES, 2_624);
+        // G6_KV4=1: the engine's PageBlocks (s2/kv_tier.cuh) sums the same 79 x 64 x 416 + 22 x 64 x 132
+        assert_eq!(page_block_bytes(MLA_ROW_KV4), 2_289_152);
+        assert_eq!(page_slot(MLA_ROW_KV4), 559 * 4096);
     }
 
     #[test]

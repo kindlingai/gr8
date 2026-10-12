@@ -100,9 +100,9 @@ static void kv_tier_check(std::vector<Model>& R, std::vector<Draft>& DR, int n, 
                 for (const g6kv_io& x : out)
                 {
                     if (!(x.part == 0 || (x.part == 1 && b->args.cp_nr && (int)x.page < phys) || (x.part == 2 && !b->args.cp_nr))) continue;
-                    G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)x.page * 64 * 656, 0x7f, 64 * 656, st));
+                    G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)x.page * 64 * g6kv::ROW, 0x7f, 64 * g6kv::ROW, st));
                     if (b->args.index_cache)
-                        G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)x.page * 64 * 132, 0x7f, 64 * 132, st));
+                        G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)x.page * 64 * g6kv::IDX_ROW, 0x7f, 64 * g6kv::IDX_ROW, st));
                 }
             }
             G6RT_CK(cudaStreamSynchronize(st));
@@ -128,9 +128,9 @@ static void kv_tier_check(std::vector<Model>& R, std::vector<Draft>& DR, int n, 
                     for (const G6AttnBinding* b : bs)
                         for (int p : part)
                         {
-                            G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)p * 64 * 656, 0x7f, 64 * 656, st));
+                            G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)p * 64 * g6kv::ROW, 0x7f, 64 * g6kv::ROW, st));
                             if (b->args.index_cache)
-                                G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)p * 64 * 132, 0x7f, 64 * 132, st));
+                                G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)p * 64 * g6kv::IDX_ROW, 0x7f, 64 * g6kv::IDX_ROW, st));
                         }
                     G6RT_CK(cudaStreamSynchronize(st));
                 });
@@ -655,8 +655,8 @@ int main(int argc, char** argv)
                 for (const Layer& y : m.layers)
                 {
                     const G6Attn& a = y.ab.args;
-                    G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * 656, st));
-                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)a.page_count * 64 * 132, st));
+                    G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::ROW, st));
+                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::IDX_ROW, st));
                 }
             };
             for (Model& m : R) poison(m);
@@ -1437,7 +1437,7 @@ int main(int argc, char** argv)
                         {
                             const void* src = k ? c.index_cache : c.mla_cache;
                             if (!src) continue;
-                            std::vector<uint8_t> h(slots * (k ? 132 : 656));
+                            std::vector<uint8_t> h(slots * (k ? g6kv::IDX_ROW : g6kv::ROW));
                             G6RT_CK(cudaMemcpy(h.data(), src, h.size(), cudaMemcpyDeviceToHost));
                             FILE* f = fopen((b + (k ? ".idx" : ".kv")).c_str(), "wb");
                             if (!f) die("G6_PF_DRAFTDUMP: cannot write " + b);
@@ -1528,7 +1528,7 @@ int main(int argc, char** argv)
                 for (Model& m : R)
                 {
                     const G6Attn& c = m.layers[i].ab.args;
-                    kv[m.rank].resize((size_t)c.page_count * c.page_size * 656);
+                    kv[m.rank].resize((size_t)c.page_count * c.page_size * g6kv::ROW);
                     tb[m.rank].resize(c.table_size);
                     G6RT_CK(cudaMemcpy(kv[m.rank].data(), c.mla_cache, kv[m.rank].size(), cudaMemcpyDeviceToHost));
                     G6RT_CK(cudaMemcpy(tb[m.rank].data(), c.block_table, tb[m.rank].size() * 4, cudaMemcpyDeviceToHost));
@@ -1541,12 +1541,12 @@ int main(int argc, char** argv)
                     {
                         const int pg = tb[r][x / ps];
                         if (pg < 0) continue;
-                        const uint8_t* rec = kv[r].data() + ((size_t)pg * ps + x % ps) * 656;
+                        const uint8_t* rec = kv[r].data() + ((size_t)pg * ps + x % ps) * g6kv::ROW;
                         if (!ref) ref = rec;
-                        else if (memcmp(ref, rec, 656)) ++mism;
+                        else if (memcmp(ref, rec, g6kv::ROW)) ++mism;
                     }
                     if (!ref) die("G6_KV_HASH: position " + std::to_string(x) + " stored by no rank");
-                    h = fnv(h, ref, 656);
+                    h = fnv(h, ref, g6kv::ROW);
                 }
                 printf("kvhash seq %zu layer %d positions %d %016llx%s\n", q, layers[i], npf, (unsigned long long)h,
                        mism ? " HOLDERS DIFFER" : "");

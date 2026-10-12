@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 #include "context_buckets.h"
+#include "../attn/kvfmt.h"
 #include "draft_shape.h"
 #include "serve.h"
 #include "spec_len.h"

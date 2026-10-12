@@ -39,8 +39,19 @@ __global__ void weight_half(const void* src,half* dst,int n){int i=blockIdx.x*bl
 __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int count){
     auto a=ga::resolve(fixed);int pos=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(pos>=count)return;
     const uint8_t* v=pos<a.context?ga::kv_at(a,pos):nullptr;
+#if G6_KV4   // the table holds the latent in the model's basis: H (stored) = the latent, so prefill Q and UV are unchanged
+    {float x[16];
+     #pragma unroll
+     for(int k=0;k<16;k++)x[k]=v?ga::latent(v,lane+32*k):0.f;
+     ga::fwht16(x,lane);
+     #pragma unroll
+     for(int k=0;k<16;k++){half h=__float2half_rn(x[k]*ga::HSCALE);if(!isfinite(__half2float(h)))ga::error(a,4);cache[(int64_t)pos*576+lane+32*k]=h;}}
+    for(int d=512+lane;d<576;d+=32){float x=v?__bfloat162float(((const bf16*)(v+g6kv::ROPE_OFF))[d-512]):0;
+        half h=__float2half_rn(x);if(!isfinite(__half2float(h)))ga::error(a,4);cache[(int64_t)pos*576+d]=h;}
+#else
     for(int d=lane;d<576;d+=32){float x=v?(d<512?ga::latent(v,d):__bfloat162float(((const bf16*)(v+528))[d-512])):0;
         half h=__float2half_rn(x);if(!isfinite(__half2float(h)))ga::error(a,4);cache[(int64_t)pos*576+d]=h;}
+#endif
     if(!a.reuse_indices){float s=0;const uint8_t* k=pos<a.context?ga::ik_at(a,pos,s):nullptr;
         for(int d=lane;d<128;d+=32)ikey[(int64_t)pos*128+d]=__float2half_rn(k?ga::e4(k[d]):0);if(lane==0)scales[pos]=s;}
 }

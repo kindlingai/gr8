@@ -44,6 +44,7 @@ int main()
 }
 #else
 #include "../../attn/bind.h"
+#include "../../attn/kvfmt.h"
 #include "../../g6nr.h"
 #include "../s2_cells.cuh"
 
@@ -146,7 +147,7 @@ constexpr int NRK = g6nr::NR;
 constexpr int NL = 2;
 constexpr int LAYER[NL] = {6, 7};     // layer 6: full index, layer 7: shared index (reuses layer 6's lists)
 constexpr int IDXQ = 4096, IDXK = 128, IDXW = 32, KVA = 576;
-constexpr int KV_B = 656, IX_B = 132;  // bytes per cached key (MLA, indexer)
+constexpr int KV_B = g6kv::ROW, IX_B = g6kv::IDX_ROW;  // bytes per cached key (MLA, indexer; attn/kvfmt.h)
 
 // ---- synthetic attention pack of (rank, layer): random weights, shapes from the head-group rule
 struct Pack

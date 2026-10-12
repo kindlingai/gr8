@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-12: `G6_KV4`: a 4-bit MLA latent behind a build flag (experimental, off by default)
+
+- `EXTRA=-DG6_KV4=1 scripts/build.sh` caches the MLA latent as INT4 (one FP16 scale per 32 dims) after a 512-point
+  Hadamard rotation: 416 B a row instead of 656 B. The rope key stays BF16 and the indexer keys stay FP8. At the same
+  memory a TP=4 pool holds about 1.6x the tokens. [docs/KV4.md](docs/KV4.md) has the row, the kernels and the numbers.
+- `engine/attn/kvfmt.h` is now the one definition of the row: kernels, CP staging, S2 page copies, tier page blocks,
+  dumps and m4sim read it. A build without the flag compiles to the same kernel code as before.
+- `kv4_test` (`TEST=kv4_test scripts/c1_tests.sh`): the append round trip and the decode, prefill and row-owner
+  attention against a host reference, for either row. `kvman-sim --mla-row 416` models the smaller page blocks.
+
 ## 2026-10-12: the engine inserts tokens (`generate` `insert`), and the thinking budget uses it
 
 - A request may carry one insert rule: once the reply holds N tokens and none of them is X, the engine puts the rule's

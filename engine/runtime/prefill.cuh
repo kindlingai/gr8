@@ -1724,8 +1724,8 @@ inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
 // pool; cp_pf_back then copies the rows this rank stores into its sharded store (before the pool is reused at i + 2).
 // cp_pf_exit restores the CP args. Plain launches only (the args go by value into every launch). A missing owner page
 // sets 0x63000400 in the fabric error word (the attention error word is cleared by every prepare).
-constexpr int CP_KVB = 656;           // attn.cu KV_BYTES: one latent record
-constexpr int CP_IXB = 132;           // attn.cu IDX_BYTES: one index key; a page is 64 x 128 codes, then 64 FP32 scales
+constexpr int CP_KVB = g6kv::ROW;     // attn.cu KV_BYTES: one latent record (kvfmt.h)
+constexpr int CP_IXB = g6kv::IDX_ROW; // attn.cu IDX_BYTES: one index key; a page is 64 x 128 codes, then 64 FP32 scales
 constexpr int CP_PF_MAXNR = 8;
 struct CpPfSrc { const char* kv[CP_PF_MAXNR]; const int* table[CP_PF_MAXNR]; const char* ix[CP_PF_MAXNR]; };
 // one page of 64 index keys, src -> dst (uint4 pieces of 64 x 132 B = 528), by the block's threads
@@ -1935,7 +1935,7 @@ __global__ void __launch_bounds__(256) k_cp_pf_hash2(const char* pool, int nr, C
     const int lp = cp_pf_first(nr, own.o[blockIdx.y], Rp) + (int)blockIdx.x * nr;
     const int rows = cp_pf_rows(lp, ps, start);          // block-uniform: a page at or past start returns as a whole block
     if (rows <= 0) return;
-    const size_t base = (size_t)lp * ps * CP_KVB / 8, n2 = (size_t)rows * CP_KVB / 16;   // CP_KVB = 656 = 41 x 16 B
+    const size_t base = (size_t)lp * ps * CP_KVB / 8, n2 = (size_t)rows * CP_KVB / 16;   // CP_KVB = 656 = 41 x 16 B (KV4: 416 = 26 x 16 B)
     const ulonglong2* w = reinterpret_cast<const ulonglong2*>(reinterpret_cast<const unsigned long long*>(pool) + base);
     unsigned long long h = 0;
     for (size_t k = threadIdx.x; k < n2; k += blockDim.x) { const ulonglong2 v = w[k]; h += cp_pf_hw(v.x, base + 2 * k) + cp_pf_hw(v.y, base + 2 * k + 1); }

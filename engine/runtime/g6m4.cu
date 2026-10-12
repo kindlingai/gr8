@@ -801,7 +801,11 @@ int main(int argc, char** argv)
                         " place " + std::to_string(place) + " grid " + std::to_string(reuse_grid) + " block " +
                         std::to_string(kvt->blocks().slot_bytes()) + " bindings " + std::to_string(bs.size()) + "/" +
                         std::to_string(nidx) + " slots " + std::to_string(slots) + " format " + std::to_string(g6s2::KV_BLOCK_FORMAT) +
-                        " engine " + exe;
+                        " engine " + exe
+#if G6_KV4
+                        + " kv " + g6kv::NAME   // the latent row's layout (kvfmt.h); the FP8 row keeps the old key
+#endif
+                        ;
                     pool.add_tier(slots, kv_keep_rule, index, compat);
                     pool.policy((uint32_t)i, 0, kv_min_hits, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();

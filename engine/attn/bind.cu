@@ -1,6 +1,7 @@
 #include "bind.h"
 #include "../g6nr.h"
 #include "../h2d.h"
+#include "kvfmt.h"
 #include <cuda_runtime.h>
 #include <climits>
 #include <initializer_list>
@@ -107,11 +108,11 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
     const size_t uk = take((size_t)h * 512 * 192 * 2);
-    const size_t kv = take((size_t)a.page_count * 64 * 656);
+    const size_t kv = take((size_t)a.page_count * 64 * g6kv::ROW);
     // Shared layers never append/index their own indexer cache. Index keys sit on the same pages as the latent (under
     // CP: the replicated prefix and this rank's pages past R), so the index cache has the latent's page count.
     const int ix_pages = a.page_count;
-    const size_t ix = take(full ? (size_t)ix_pages * 64 * 132 : 0);
+    const size_t ix = take(full ? (size_t)ix_pages * 64 * g6kv::IDX_ROW : 0);
     const size_t table = take((size_t)a.table_size * sizeof(int));
     const size_t ids = take((size_t)max_rows * 2048 * sizeof(int));
     const size_t output = take((size_t)max_rows * h * 256 * 2);
@@ -192,9 +193,9 @@ extern "C" int g6_attn_bind_reset(G6AttnBinding* b, void* s) {
     if (!b || !b->storage) return invalid;
     const G6Attn& a = b->args;
     cudaStream_t stream = (cudaStream_t)s;
-    cudaError_t e = cudaMemsetAsync(a.mla_cache, 0, (size_t)a.page_count * 64 * 656, stream);
+    cudaError_t e = cudaMemsetAsync(a.mla_cache, 0, (size_t)a.page_count * 64 * g6kv::ROW, stream);
     const int ix_pages = a.page_count;
-    if (e == cudaSuccess && a.index_cache) e = cudaMemsetAsync(a.index_cache, 0, (size_t)ix_pages * 64 * 132, stream);
+    if (e == cudaSuccess && a.index_cache) e = cudaMemsetAsync(a.index_cache, 0, (size_t)ix_pages * 64 * g6kv::IDX_ROW, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)b->max_rows * 2048 * 4, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.output, 0, (size_t)b->max_rows * a.heads * 256 * 2, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);

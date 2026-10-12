@@ -18,6 +18,24 @@
 #include "prefill-qo-r1.cuh"
 #define G6_QO_HAVE_R1 1
 #endif
+#if G6_KV4
+namespace gqkv4 {
+// prepass_b for the INT4 row (kvfmt.h): warp per key -> its FP16 [576] table row, the latent back in the model's basis
+// (H x the stored latent) then the RoPE key, and the key's nonfinite byte, as gqob::prepass_b writes them
+__global__ void __launch_bounds__(256) prepass(const uint8_t* __restrict__ records,__half* __restrict__ table,uint8_t* __restrict__ bad,int tokens){
+    const int key=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(key>=tokens)return;
+    const uint8_t* p=records+(int64_t)key*g6kv::ROW;__half* row=table+(int64_t)key*576;float x[16];bool nf=false;
+    #pragma unroll
+    for(int k=0;k<16;k++)x[k]=ga::latent(p,lane+32*k);
+    ga::fwht16(x,lane);
+    #pragma unroll
+    for(int k=0;k<16;k++){const __half h=__float2half_rn(x[k]*ga::HSCALE);nf|=!isfinite(__half2float(h));row[lane+32*k]=h;}
+    for(int d=512+lane;d<576;d+=32){const __half h=__float2half_rn(__bfloat162float(((const __nv_bfloat16*)(p+g6kv::ROPE_OFF))[d-512]));
+        nf|=!isfinite(__half2float(h));row[d]=h;}
+    nf=__any_sync(0xffffffff,nf);if(lane==0)bad[key]=(uint8_t)nf;
+}
+}
+#endif
 
 struct G6AttnQoWork {
     void* data = nullptr; size_t bytes = 0; int cap = 0, max_rows = 0, device = 0;
@@ -182,6 +200,9 @@ extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G
 #ifndef G6_QO_HAVE_R1
     if (kernel == 2) kernel = -1;
 #endif
+#if G6_KV4
+    if (kernel != 0) kernel = -1;           // v1 and R1 read the FP8 row directly; only B's prepass knows the INT4 row
+#endif
     if (kernel < 0) return int(cudaErrorInvalidValue);
     auto p = new G6AttnQo; p->kernel = kernel; p->cap = (b->capacity + 31) & ~31; p->max_rows = max_rows; p->heads = heads;
     if (gqi::cap_limit > 0 && p->cap > ((gqi::cap_limit + 31) & ~31)) p->cap = (gqi::cap_limit + 31) & ~31;
@@ -264,7 +285,7 @@ extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep*
     if (s->rows < 0 || s->rows > p->max_rows || s->context <= 0 || s->context > b->capacity || s->context > p->cap || !s->q_b ||
         s->ld_qb < p->heads * 256 ||
         !s->positions || !s->ids || !s->out) return int(cudaErrorInvalidValue);
-    if ((uintptr_t)b->args.mla_cache % 16) return int(cudaErrorInvalidValue);   // 656-B records, 16-B cp.async gathers (B, R1)
+    if ((uintptr_t)b->args.mla_cache % 16) return int(cudaErrorInvalidValue);   // 16-B-multiple records (kvfmt.h), 16-B cp.async gathers (B, R1)
     cudaStream_t st = (cudaStream_t)stream;
     const int R = s->rows, H = p->heads;
     int rc = gp::blas_status(cublasSetStream(p->w->blas, st));
@@ -311,7 +332,12 @@ extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep*
     cudaError_t e;
     gqi::prof_tick(st, 0);
     if (p->kernel == 0) {
+#if G6_KV4
+        gqkv4::prepass<<<(s->context + 7) / 8, 256, 0, st>>>((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context);
+        e = cudaGetLastError();
+#else
         e = gqob::prepass((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context, st);
+#endif
         if (e != cudaSuccess) return int(e);
         gqi::prof_tick(st, 1);
 #if PF_QOBH
