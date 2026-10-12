@@ -37,7 +37,7 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 
 | test | where | command |
 |---|---|---|
-| S2 batch planner, control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced, the pool's block stores (`--kv-tier`) in lock-step through memory, a file and a loopback KV node | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
+| S2 batch planner, control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced, the pool's block stores (`--kv-store`) in lock-step through memory, a file and a loopback KV node | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
 | the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
 | row budget, S2 attention, decode heads | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
