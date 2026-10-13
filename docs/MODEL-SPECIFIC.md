@@ -34,7 +34,8 @@ the full-index layers; vocab 154,880.
 
 ## Topology-specific (TP6, TP4, TP3)
 
-- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; `-DG6_NR=4` builds TP4 (`G6_NR=4 scripts/build.sh`). Every
+- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; `-DG6_NR=4` builds TP4. `scripts/build.sh` compiles the engine
+  once per width into one binary (`engine/runtime/build_m4.sh`). Every
   per-rank width the engine uses (heads, expert blocks, dense channels, vocab slice, scratch sizes) comes from it;
   the NR=6 values equal the old TP6 literals, so the TP6 build is SASS-identical. The engine also compiles for other
   divisors of 64; 6, 4 and 3 have been run.

@@ -66,5 +66,5 @@ prompts stay coherent and diverge from OWN=1 after a few dozen tokens, as two at
 
 ## Builds
 
-All OWN=4 kernels and host paths compile only with `G6_NR=4`. A TP6 build has no OWN=4 code, and `G6_PF_OWN=4` exits
-with a message there.
+All OWN=4 kernels and host paths compile only with `G6_NR=4`: the binary's TP=4 instance has them, the other widths
+have no OWN=4 code, and `G6_PF_OWN=4` exits with a message there.

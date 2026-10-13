@@ -1,13 +1,14 @@
 #!/bin/bash
 # Build the K1H2 engine (g6m4 = one rank on the real fabric, m4sim = one GPU simulating all NR ranks) on ONE Spark.
 # Needs CUDA 13 (nvcc with sm_121a), g++ with C++20, libibverbs-dev, cuBLAS. A few minutes on a GB10, CPU only.
-#   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin
-#   G6_NR=4 scripts/build.sh bin4         the TP4 engine (four Sparks, packs from build_packs.sh with the TP4 codes), with
-#                                         DEC_S2 (the multi-session path launch_tp4.sh runs) and PF_F12 (the fat-CTA prefill fc1)
-#   scripts/build.sh bin6                 the TP6 engine (G6_NR=6 is the default), with DEC_S2 (launch_tp6.sh runs it)
-#   G6_NR=3 scripts/build.sh bin3         the TP3 engine, with DEC_S2 (launch_tp3.sh runs it)
+# One g6m4 and one m4sim run every TP width: g6m4 takes its width from --ips, m4sim from --tp N or --packs DIR. Each
+# width is compiled as its own build was (engine/runtime/build_m4.sh): DEC_S2 (the multi-session path) at every width,
+# and PF_F12 (the fat-CTA prefill fc1) at 4.
+#   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin; TP = 1, 2, 3, 4, 6 and 8
+#   G6_WIDTHS="3 4" scripts/build.sh bin  only those widths (a shorter build); G6_NR=4 is G6_WIDTHS=4
+#   JOBS=N                                compiles at once (default: the CPU count)
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
-#                                         docs/KV4.md), which `--kv-format int4` runs. Same G6_NR rules as above.
+#                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (the engine finds it there at any TP)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
@@ -33,31 +34,40 @@ if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
 if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
-S2_FLAG=""
-case "${G6_NR:-6}" in
-  4|3|6)
-    [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: TP4, TP6 and TP3 builds always have the multi-session path (DEC_S2)"; exit 2; }
-    S2_FLAG="-DDEC_S2"
-    # PF_F12: F12_NE=2 must divide the expert blocks per rank (4 at TP4, 3 at TP6)
-    [ "${G6_NR:-6}" = 4 ] && S2_FLAG="$S2_FLAG -DPF_F12" ;;
-esac
+[ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
+WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 6 8}}
+# each width runs its own instance: the --top-p-cands bound is TP_SORT (2048) / NR, checked before any CUDA work
+widths_ok() {   # widths_ok <g6m4> [<m4sim>]
+  local n ips want
+  for n in $WIDTHS; do
+    ips=$(printf 'x,%.0s' $(seq "$n")); want="--top-p-cands must be 0..$((2048 / n))"
+    "$1" --rank 0 --ips "${ips%,}" --manifest m --pack p --top-p-cands 99999 2>&1 | grep -qF -- "$want" \
+      || { echo "$1 does not run TP=$n"; exit 1; }
+    if [ -n "${2:-}" ]; then
+      "$2" --tp "$n" --packs . --top-p-cands 99999 2>&1 | grep -qF -- "$want" || { echo "$2 does not run TP=$n"; exit 1; }
+    fi
+  done
+  echo "$(basename "$1")${2:+ and $(basename "$2")} run TP = $WIDTHS"
+}
 case "${KV_FORMAT:-fp8}" in
   fp8) ;;
   int4)   # g6m4 alone, in its own object dir, installed as g6m4-int4 next to the fp8 build
-    EXTRA="$K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/int4" bash build_m4.sh "${ARCH:-121a}" g6
+    WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/int4" bash build_m4.sh "${ARCH:-121a}" g6
     mv "$OUT/int4/g6m4" "$OUT/g6m4-int4" && rm -rf "$OUT/int4"
     strings "$OUT/g6m4-int4" | grep -q int4g32h || { echo "g6m4-int4: not the int4 build (no int4g32h row name)"; exit 1; }
     md5sum "$OUT/g6m4-int4"
+    widths_ok "$OUT/g6m4-int4"
     exit 0 ;;
   *) echo "KV_FORMAT=$KV_FORMAT: fp8 or int4"; exit 2 ;;
 esac
-EXTRA="$K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
+WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
 if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
   mkdir -p "$OUT/lib"
   cp -L /usr/local/cuda/lib64/libcublas.so.13 /usr/local/cuda/lib64/libcublasLt.so.13 "$OUT/lib/"
 fi
 strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
 md5sum "$OUT/g6m4" "$OUT/m4sim"
+widths_ok "$OUT/g6m4" "$OUT/m4sim"
 export PATH=/usr/local/cuda/bin:$PATH
 # the adaptive draft length decision, CPU
 g++ -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
@@ -72,9 +82,6 @@ nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o
 # TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
   "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" -lcublas
-# dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
-nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG \
-  -I "$REPO/engine/kernels" -o "$OUT/dtr_test" "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas
 if nvidia-smi -L > /dev/null 2>&1; then
   t=$("$OUT/tr3_e4m3_test") || { echo "$t"; echo "tr3_e4m3_test FAILED"; exit 1; }
   echo "tr3_e4m3_test: $(echo "$t" | tail -1)"

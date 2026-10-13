@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-13: one engine binary for every TP width
+
+- `scripts/build.sh` builds one `g6m4` and one `m4sim` that run TP = 1, 2, 3, 4, 6 and 8 (and with `KV_FORMAT=int4`
+  one `g6m4-int4`). `g6m4` takes the width from `--ips`; `m4sim` from `--tp N`, else from the rank packs in
+  `--packs DIR`. Each width is compiled as its one-width build was (`DEC_S2` at every width, `PF_F12` at 4) into its
+  own instance in the binary (`engine/runtime/build_m4.sh`), so its kernels are byte for byte the ones that build had.
+- `G6_WIDTHS="3 4"` builds only those widths, and `G6_NR=4` only TP=4. `./gr8 glm53 build` no longer needs the TP. The
+  image and the tester zip ship `bin/` alone (the image keeps `bin3/` and `bin6/` as links to it, which
+  `docker/entrypoint.sh` still picks from), and the handshake's engine hash is the same at every width.
+- `dtr_test` is `dtr_test_tp<N>`, one per width.
+
 ## 2026-10-13: the TP=4 fp8 KV pool grows to 1,981 pages a rank (CAP 310,528)
 
 - The default TP=4 pool was 1,920 pages a rank (CAP 294,912), sized when every rank held every token's indexer keys.
