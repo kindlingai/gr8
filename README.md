@@ -2,7 +2,7 @@
 
 Need help? Join us on discord: https://discord.gg/M7XTrRJW3
 
-Full GLM-5.3 on DGX Spark (GB10). Early release. If you run it, tell us what breaks: issues and PRs are welcome.
+Full GLM-5.3 on DGX Spark (GB10). *Beta release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 
 gr8 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
 sparse indexer, one MTP layer) on three, four or six DGX Spark (GB10) boxes, tensor-parallel across all of them. It
