@@ -114,9 +114,15 @@ inline void s2_set_pages(Model& m, int q, const std::vector<int>& list)
     s2_check_pages(s, list, s.run_pages, s.pool_pages, "s2_set_pages");
     const std::vector<int>& old = s.run[q];
     auto at = [](const std::vector<int>& v, size_t i) { return i < v.size() ? v[i] : -1; };
-    size_t lo = 0, hi = std::max(old.size(), list.size());
-    while (lo < hi && at(old, lo) == at(list, lo)) ++lo;
-    while (hi > lo && at(old, hi - 1) == at(list, hi - 1)) --hi;
+    // after a run past R on the page classes, run[q] holds that run's whole list (longer than the view table) and the
+    // view table was never written for it, so the diff has nothing to go on: rewrite the whole table
+    const bool unknown = s.ex_split[q];
+    size_t lo = 0, hi = unknown ? (size_t)s.run_pages : std::max(old.size(), list.size());
+    if (!unknown)
+    {
+        while (lo < hi && at(old, lo) == at(list, lo)) ++lo;
+        while (hi > lo && at(old, hi - 1) == at(list, hi - 1)) --hi;
+    }
     if (hi > lo)
     {
         std::vector<int> t(hi - lo);
