@@ -401,7 +401,20 @@ The same boxes and release, against `main` at #37. First token and logprob as ab
 - `system` on the 8-agent replay: all 47 turns' first tokens and logprobs equal to `main`'s without a store; 1,899 s,
   TTFT median 194 s, 9 prefixes stored at 9.4 GB/h a rank. That was the miscount described above (each agent's own
   span reached N); fixed since, and the sim now puts the same trace at 0.1 GB/h.
-- `sessions` and `all` on the 8-agent replay after the count fix: not yet run on the cluster.
+- The 8-agent replay after the count fix (2026-10-13, main at #43): both captures, six turns each, all at once, one
+  50 GiB SSD store a rank, `--kv-system-after 2`. Written and restored bytes are rank 0's store counters.
+
+| `--kv-keep` | wall | TTFT p50 / p90 | tokens generated | written | restored, hits | first tokens = no store |
+|---|---|---|---|---|---|---|
+| no store | 2,045 s | 234 / 480 s | 63,974 | 0 | - | - |
+| `sessions` | 1,576 s | 126 / 407 s | 59,173 | 98 GB/h (43.0 GB) | 29.8 GB, 28 hits | 47/47 |
+| `all` | 1,729 s | 131 / 436 s | 69,969 | 97 GB/h (46.7 GB) | 32.3 GB, 36 hits | 47/47 |
+| `system` | 2,589 s | 213 / 750 s | 86,690 | 1.2 GB/h (0.9 GB) | 4.3 GB, 9 hits | 47/47 |
+
+  Wall time follows the tokens generated, which vary from run to run with the same inputs (the long turns differ), so
+  TTFT p50 and GB/h are the numbers to compare. `sessions` cuts TTFT p50 by 46% for about 98 GB/h a rank; `all` writes
+  about the same; `system` writes 1.2 GB/h (9.4 before the count fix) for a smaller gain on agents in different
+  folders, as the simulator predicted.
 - Rebased onto #41, with persistence opt-in: stores off, smoke 12/12, RigMark code 50.6 tok/s, prose 30.5, 8K prefill
   cold 1,325. `--kv-keep system` without `persist`: a planted index was removed at boot, no index was written, and
   after the 70K flush the system prefix came back from the store in 1.06 s with the cold first token and logprob.
@@ -421,7 +434,6 @@ read the whole run. Until the cluster check, each rank keeps its own store.
 
 ### Still to do
 
-- The 8-agent replay under `sessions` (and `system` again) on the cluster, after the count fix.
 - A check that a stored block holds what a cold prefill computes (a sampled block verified at boot or on restore), so
   `persist=on` can trust a store across boots.
 
