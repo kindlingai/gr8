@@ -22,7 +22,7 @@
 // --prompt may be repeated: each is its own sequence (attention caches reset in between); "@file" reads ids
 // --v2-dense (Rust loader build): each simulated rank's image is planned from the exlr8 release as g6m4 --v2-dense plans
 //        it, and each tensor is read from the release when a rank first binds it (only the --layers' tensors are read).
-//        --v2-dense-form trellis|rounded as in g6m4
+//        --v2-dense-form trellis|rounded and --layout FILE as in g6m4
 // [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 // [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                (0 = top_p off; 256 is the served setting; misses printed at the end)
@@ -319,7 +319,7 @@ int main(int argc, char** argv)
     const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
     std::vector<std::string>& prompts = co.prompts;
     v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
-    v2src.trellis = co.v2_trellis;
+    v2src.trellis = co.v2_trellis; v2src.layout = co.v2_layout;
     if (co.n_gen) plan.n_gen = *co.n_gen;          // Plan owns these defaults; apply only what the command line set
     if (co.seed) plan.seed = *co.seed;
     if (co.chunk) plan.chunk = *co.chunk;
@@ -333,6 +333,7 @@ int main(int argc, char** argv)
     }
     if (packs.empty() == !release || (release && (v2src.dir.empty() || v2src.slices.empty() || v2src.widths.empty())))
         die("usage: m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
+    if (!release && !v2src.layout.empty()) die("--layout needs --v2-dense (it places the release's pieces)");
 #ifndef G6_RS_LOADER
     if (release) die("--v2-dense needs the Rust loader (scripts/build.sh links it when cargo is installed)");
 #endif
