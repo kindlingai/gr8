@@ -270,5 +270,44 @@ class PidFileTests(unittest.TestCase):
         self.assertEqual(said, ['front (pid 4242) belongs to another account: not stopped'])
 
 
+class EngineLogTests(unittest.TestCase):
+    """A restart keeps the earlier boots' engine logs, and an exit names the line that says why."""
+    def write(self, d, name, text):
+        with open(os.path.join(d, name), 'w') as f:
+            f.write(text)
+
+    def test_each_boot_shifts_the_last_three(self):
+        out = tempfile.mkdtemp()
+        names = ['g6m4.r0.txt', 'g6m4.r0.err']
+        S.rotate_logs(out, names)
+        self.assertFalse(os.path.exists(os.path.join(out, 'prev1')))    # nothing to keep on a first boot
+        for boot in range(5):
+            self.write(out, 'g6m4.r0.err', f'boot {boot}\n')
+            S.rotate_logs(out, names)
+        kept = {d: open(os.path.join(out, d, 'g6m4.r0.err')).read().strip() for d in sorted(os.listdir(out))}
+        self.assertEqual(kept, {'prev1': 'boot 4', 'prev2': 'boot 3', 'prev3': 'boot 2'})
+
+    def test_the_reason_is_found_behind_later_lines(self):
+        d = tempfile.mkdtemp()
+        self.write(d, 'e', '# rank 1: exlr8 release 78.49 GB -> device image\n'
+                   'g6: G6_PF_OWN needs the reduce-scatter form (G6_PF_RS=1)\n' + '# loader thread done\n' * 30)
+        reason = S.exit_reason([os.path.join(d, 'e')])
+        self.assertEqual(reason, 'g6: G6_PF_OWN needs the reduce-scatter form (G6_PF_RS=1)')
+        self.assertNotIn(reason, S.tail(os.path.join(d, 'e'), 20))
+
+    def test_stdout_is_read_when_stderr_has_no_reason(self):
+        d = tempfile.mkdtemp()
+        self.write(d, 'e', '# loading\n')
+        self.write(d, 't', "thread 'main' panicked at src/lib.rs:9:5:\nshort read\n")
+        self.assertEqual(S.exit_reason([os.path.join(d, 'e'), os.path.join(d, 't'), os.path.join(d, 'none')]),
+                         "thread 'main' panicked at src/lib.rs:9:5:")
+        self.assertEqual(S.exit_reason([os.path.join(d, 'e')]), '')
+
+    def test_a_signal_is_named(self):
+        self.assertEqual(S.exit_status(2), '2')
+        self.assertEqual(S.exit_status(-6), '-6, SIGABRT')
+        self.assertEqual(S.exit_status(-9), '-9, SIGKILL: the OOM killer? see dmesg')
+
+
 if __name__ == '__main__':
     unittest.main()

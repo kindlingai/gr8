@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-13: a restart keeps the earlier boots' engine logs, and an engine's exit names its reason
+
+- Each boot moves the previous `g6m4.r<r>.txt` and `.err` to `out/prev1` and keeps three earlier boots (`prev1` to
+  `prev3`). A restart after a bad boot used to overwrite its logs (#49).
+- When an engine exits, the supervisor log names the line that says why (`g6: ...`, an error word, a CUDA or fabric
+  check, a Rust panic), found anywhere in the last 4 MB of the rank's stderr or stdout. Before, it showed only the last
+  20 lines, and threads still writing could push the reason out of them. A process killed by a signal is named (SIGKILL
+  points at the OOM killer).
+- The low-memory warning before boot names this TP and the variant's expert size, not "a TP=4 rank needs ~90 GB".
+- The checks warn when `vm.compaction_proactiveness` is not 0, which the README requires.
 ## 2026-10-13: zero new device memory before the engine's streams write to it
 
 - `dmalloc` zeroed with `cudaMemset`, which runs on the legacy default stream and returns before it finishes. The

@@ -141,8 +141,10 @@ Options come from the command line, then a config file (`@FILE`, else `./cluster
 `config/cluster.env.tp4.example`, `.tp3.example`, or `cluster.env.example` for TP=6), then the environment. With the
 options in `cluster.env`, `./gr8 glm53 up` alone is enough. [KNOBS.md](KNOBS.md) lists every option.
 
-When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line. Logs are in
-`out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and `shim.log` and `front.log` on the head).
+When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line, and the
+supervisor log names the line that says why. Logs are in `out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and
+`shim.log` and `front.log` on the head). Each boot moves the previous engine logs to `out/prev1`, and keeps the three
+boots before it (`prev1` is the newest), so a restart does not overwrite the boot you want to look at.
 
 ### The model cache
 

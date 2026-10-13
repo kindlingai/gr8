@@ -92,6 +92,14 @@ def recorded(path, proc='/proc'):
     return pid
 
 
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def mem_available_gib():
     try:
         with open('/proc/meminfo') as f:
@@ -526,7 +534,14 @@ class Supervisor:
         m = mem_available_gib()
         log(f'MemAvailable {m} GiB' if m is not None else 'MemAvailable unknown')
         if m is not None and m < 8:
-            log(f'warning: MemAvailable is {m} GiB before boot: something else holds memory (a TP=4 rank needs ~90 GB)')
+            need = (f'about {modelset.expert_gb(self.variant.path, int(o.get("TP"))):.0f} GB of experts'
+                    if self.variant and self.variant.path else 'most of the box')
+            log(f'warning: MemAvailable is {m} GiB before boot: something else holds memory (a rank at '
+                f'TP={o.get("TP")} loads {need}, plus its dense weights and KV pool)')
+        c = read_int('/proc/sys/vm/compaction_proactiveness')
+        if c:
+            log(f'warning: vm.compaction_proactiveness is {c}: background compaction stalls the collectives of a full '
+                'box; as root, sysctl -w vm.compaction_proactiveness=0 (README, What you need)')
         return fails
 
     def handshake_head(self, hello):
@@ -634,6 +649,7 @@ class Supervisor:
         if o.get('SHAPE') == 'ring':
             argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
         log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
+        rotate_logs(self.out, [f'g6m4.r{r}.txt', f'g6m4.r{r}.err'])
         with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \
                 open(os.path.join(self.out, f'g6m4.r{r}.err'), 'wb') as se:
             self.engine = subprocess.Popen(argv, cwd=self.home, env=env, stdout=so, stderr=se, stdin=subprocess.DEVNULL,
@@ -763,8 +779,10 @@ class Supervisor:
         if self.stop_ev.is_set():
             raise Stop(1 if self.stop_failed else 0, self.stop_why)
         if self.engine and self.engine.poll() is not None:
-            why = f'engine exited ({self.engine.returncode}); last lines of g6m4.r{self.rank}.err:\n' + \
-                  tail(os.path.join(self.out, f'g6m4.r{self.rank}.err'), 20)
+            name = f'g6m4.r{self.rank}'
+            reason = exit_reason([os.path.join(self.out, f'{name}.err'), os.path.join(self.out, f'{name}.txt')])
+            why = f'engine exited ({exit_status(self.engine.returncode)})' + (f': {reason}' if reason else '') + \
+                  f'; last lines of {name}.err:\n' + tail(os.path.join(self.out, f'{name}.err'), 20)
             raise Stop(1, why)
         # the head's front end and shim: without either the API is gone, so the cluster stops as for an engine
         # (polling also reaps them; a zombie still answered kill(pid, 0), and status called it running)
@@ -842,14 +860,61 @@ def opt_timeout(o):
     return float(o.int('JOIN_TIMEOUT'))
 
 
-def tail(path, n):
+def tail(path, n, nbytes=65536):
     try:
         with open(path, 'rb') as f:
             f.seek(0, 2)
-            f.seek(max(0, f.tell() - 65536))
+            f.seek(max(0, f.tell() - nbytes))
             return b'\n'.join(f.read().splitlines()[-n:]).decode(errors='replace')
     except OSError:
         return ''
+
+
+# Lines that say why an engine stopped: die() and the error words, CUDA and fabric checks, a Rust panic, a C++ abort.
+EXIT_REASON_PREFIXES = ('g6: ', 'g6m4: ', 'CUDA ', '[fabric ', 'terminate called')
+
+
+def exit_reason(paths):
+    """The last line in the first of paths that names why the engine stopped, or ''. Threads that keep writing after a
+    fatal line can push it out of the tail."""
+    for p in paths:
+        lines = tail(p, 100000, nbytes=4 << 20).splitlines()
+        for line in reversed(lines):
+            s = line.strip()
+            if s.startswith(EXIT_REASON_PREFIXES) or ("thread '" in s and 'panicked' in s):
+                return s
+    return ''
+
+
+def exit_status(code):
+    """A return code as text: a negative one is the signal that killed the process."""
+    if code is None or code >= 0:
+        return str(code)
+    try:
+        name = signal.Signals(-code).name
+    except ValueError:
+        name = f'signal {-code}'
+    return f'{code}, {name}' + (': the OOM killer? see dmesg' if name == 'SIGKILL' else '')
+
+
+KEEP_BOOTS = 3
+
+
+def rotate_logs(out, names, keep=KEEP_BOOTS):
+    """Move the last boot's files among names to out/prev1, shifting older boots to prev2..prev<keep>, so a restart
+    keeps the logs of the boots before it."""
+    if not any(os.path.exists(os.path.join(out, n)) for n in names):
+        return
+    shutil.rmtree(os.path.join(out, f'prev{keep}'), ignore_errors=True)
+    for i in range(keep - 1, 0, -1):
+        d = os.path.join(out, f'prev{i}')
+        if os.path.isdir(d):
+            os.replace(d, os.path.join(out, f'prev{i + 1}'))
+    prev = os.path.join(out, 'prev1')
+    os.makedirs(prev)
+    for n in names:
+        if os.path.exists(os.path.join(out, n)):
+            os.replace(os.path.join(out, n), os.path.join(prev, n))
 
 
 def signal_pid(pid, sig, name, log=log):
