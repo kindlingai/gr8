@@ -22,7 +22,7 @@
 // --prompt may be repeated: each is its own sequence (attention caches reset in between); "@file" reads ids
 // --v2-dense (Rust loader build): each simulated rank's image is planned from the exlr8 release as g6m4 --v2-dense plans
 //        it, and each tensor is read from the release when a rank first binds it (only the --layers' tensors are read).
-//        --v2-dense-form trellis|rounded as in g6m4
+//        --v2-dense-form trellis|rounded and --layout FILE as in g6m4
 // [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 // [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                (0 = top_p off; 256 is the served setting; misses printed at the end)
@@ -259,6 +259,7 @@ int main(int argc, char** argv)
         else if (a == "--v2-slices") v2src.slices = next();
         else if (a == "--v2-widths") v2src.widths = next();
         else if (a == "--v2-dense") v2src.dense = next();
+        else if (a == "--layout") v2src.layout = next();
         else if (a == "--v2-dense-form")
         {
             const std::string f = next();
@@ -302,6 +303,7 @@ int main(int argc, char** argv)
     const bool release = !v2src.dense.empty();
     if (packs.empty() == !release || (release && (v2src.dir.empty() || v2src.slices.empty() || v2src.widths.empty())))
         die("usage: m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
+    if (!release && !v2src.layout.empty()) die("--layout needs --v2-dense (it places the release's pieces)");
 #ifndef G6_RS_LOADER
     if (release) die("--v2-dense needs the Rust loader (scripts/build.sh links it when cargo is installed)");
 #endif
