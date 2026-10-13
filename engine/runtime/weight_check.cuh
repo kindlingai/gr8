@@ -13,6 +13,7 @@
 //
 // G6_WEIGHT_CHECK=0 turns all of it off.
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -204,8 +205,9 @@ inline void record(const char* what, const g6::Pack& pack, const uint8_t* base, 
     if (bad)
     {
         fprintf(stderr, "g6: weight check: rank %d: %zu of %zu chunks of the %s image differ from the bytes read "
-                "(first at offset %llu, %s)\n", rank, bad, dev.size(), what,
-                (unsigned long long)(first * l.chunk), tensor_at(&pack, first * l.chunk).c_str());
+                "(the first is bytes %llu..%llu, which starts in %s)\n", rank, bad, dev.size(), what,
+                (unsigned long long)(first * l.chunk), (unsigned long long)std::min((first + 1) * l.chunk, l.bytes),
+                tensor_at(&pack, first * l.chunk).c_str());
         exit(3);
     }
     fprintf(stderr, "# rank %d: weight check: %s image, %zu chunks equal to the bytes read (%.0f ms)\n", rank, what,
@@ -262,7 +264,8 @@ inline std::string check_json(int rank, cudaStream_t st)
         imgs += b;
         if (bad)
         {
-            snprintf(b, sizeof b, ",\"first\":{\"offset\":%llu,\"tensor\":\"%s\"}", (unsigned long long)(first * im.chunk),
+            snprintf(b, sizeof b, ",\"first\":{\"offset\":%llu,\"end\":%llu,\"starts_in\":\"%s\"}",
+                     (unsigned long long)(first * im.chunk), (unsigned long long)std::min((first + 1) * im.chunk, im.bytes),
                      tensor_at(im.pack, first * im.chunk).c_str());
             imgs += b;
         }

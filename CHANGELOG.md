@@ -4,7 +4,7 @@
 
 - The Rust loader sums each 32 MB chunk of an image on the CPU while it sits in the pinned staging buffer. After the load
   the GPU sums the same chunks from device memory. A chunk that differs stops the boot with exit 3, naming the rank, the
-  image and the tensor ("g6: weight check: ..."), and the supervisor exits 3 as well. This is the load-time check #49
+  image, the chunk's bytes and the tensor it starts in ("g6: weight check: ..."), and the supervisor exits 3 as well. This is the load-time check #49
   asked for: it catches a bad copy to the GPU before any request is served.
 - Once the graphs are captured, each rank sums its images again (binding rewrites some tensors in place) and logs the
   digest. `curl localhost:8100/health?deep` on the head then has every rank sum its weights on a low-priority stream

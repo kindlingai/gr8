@@ -220,7 +220,7 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 - A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
   meanwhile. The shim caps those prompts at 1,024 tokens.
 - Each rank checks its weights at boot: the GPU sums what it holds and compares with the bytes the loader read. A
-  difference stops the boot with exit 3 and names the rank and tensor ("g6: weight check: ..."). Once serving,
+  difference stops the boot with exit 3 and names the rank and the chunk ("g6: weight check: ..."). Once serving,
   `curl localhost:8100/health?deep` on the head checks every rank again ([frontend/README.md](frontend/README.md)).
   `G6ENV_X=G6_WEIGHT_CHECK=0` turns both off.
 - `top_k` and `min_p` are ignored with a warning. `logprobs` and `prompt_logprobs` work up to k = 20.

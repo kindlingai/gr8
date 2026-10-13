@@ -34,8 +34,8 @@ about 0.3 s at TP=4. Plain `/health` is unchanged.
                         "chunks": 2340, "changed": 0, "digest": "9c0e..."}]}}, ...]}
 ```
 
-A rank whose weights changed has `"changed": N` and `"first": {"offset": ..., "tensor": "..."}` for the first chunk that
-differs.
+A rank whose weights changed has `"changed": N` and, for the first chunk that differs, `"first": {"offset": ..., "end":
+..., "starts_in": "..."}`: its bytes, and the tensor it starts in (a 32 MB chunk can hold several tensors).
 
 ## Build and run (on the head)
 
