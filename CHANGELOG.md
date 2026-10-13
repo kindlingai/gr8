@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-13: the engine checks its weights at boot, and `/health?deep` checks them again while it serves
+
+- The Rust loader sums each 32 MB chunk of an image on the CPU while it sits in the pinned staging buffer. After the load
+  the GPU sums the same chunks from device memory. A chunk that differs stops the boot with exit 3, naming the rank, the
+  image and the tensor ("g6: weight check: ..."), and the supervisor exits 3 as well. This is the load-time check #49
+  asked for: it catches a bad copy to the GPU before any request is served.
+- Once the graphs are captured, each rank sums its images again (binding rewrites some tensors in place) and logs the
+  digest. `curl localhost:8100/health?deep` on the head then has every rank sum its weights on a low-priority stream
+  while it serves (about 0.3 s at TP=4) and compare them with those sums. The answer is one JSON object, 200 when every
+  rank passes, else 503. It answers localhost only.
+- `G6_WEIGHT_CHECK=0` turns both off. The check adds about 1 s of CPU across the loader threads and two GPU passes at
+  boot. `weight_check_test` (`TEST=weight_check_test scripts/c1_tests.sh`) checks the GPU sums against the CPU's.
+
 ## 2026-10-13: a restart keeps the earlier boots' engine logs, and an engine's exit names its reason
 
 - Each boot moves the previous `g6m4.r<r>.txt` and `.err` to `out/prev1` and keeps three earlier boots (`prev1` to

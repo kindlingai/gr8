@@ -16,8 +16,26 @@ case.
 - `POST /tokenize`
 - `POST /detokenize`
 - `GET /v1/models`
-- `GET /health`
+- `GET /health`; `GET /health?deep` (localhost only): the cluster's self-checks, below
 - `GET /metrics`
+
+## /health?deep
+
+From the head itself, `curl localhost:8100/health?deep` asks the head's supervisor (`--supervisor HOST:PORT`, set by
+`./gr8 glm53 up`) to check every rank, and answers with one JSON object: 200 when every rank passes, else 503. Other
+addresses get 403. Each rank's engine sums its weights on the GPU, on a low-priority stream while it serves, and compares
+them with the sums it took once it was ready to serve (engine/runtime/weight_check.cuh): it reads every weight byte once,
+about 0.3 s at TP=4. Plain `/health` is unchanged.
+
+```json
+{"t": "check", "ok": true, "time": 1760371200.5,
+ "ranks": [{"rank": 0, "ok": true, "state": "serving", "mem_gib": 7.0, "compaction_proactiveness": 0,
+            "weights": {"rank": 0, "ok": true, "ms": 310, "images": [{"what": "exlr8 release", "bytes": 78490000000,
+                        "chunks": 2340, "changed": 0, "digest": "9c0e..."}]}}, ...]}
+```
+
+A rank whose weights changed has `"changed": N` and `"first": {"offset": ..., "tensor": "..."}` for the first chunk that
+differs.
 
 ## Build and run (on the head)
 

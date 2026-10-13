@@ -1,8 +1,12 @@
 """HTTP-level tests against a running front end + mock engine (tests/serve_mock.sh start).
-Run: URL=http://127.0.0.1:8100 python -m unittest tests.test_api -v"""
+Run: URL=http://127.0.0.1:8100 python -m unittest tests.test_api -v
+/health?deep needs the front end started with FRONT_ARGS='--supervisor 127.0.0.1:8198' (SUP_PORT): the test plays the
+supervisor there."""
 import http.client
 import json
 import os
+import socketserver
+import threading
 import time
 import unittest
 import urllib.error
@@ -282,6 +286,46 @@ class Misc(unittest.TestCase):
         self.assertEqual(m['data'][0]['id'], 'glm-5.3')
         self.assertEqual(urllib.request.urlopen(URL + '/health').status, 200)
         self.assertGreaterEqual(metric('vllm:spec_decode_num_drafts_total'), 0)
+
+
+class FakeSupervisor(socketserver.StreamRequestHandler):
+    answer = {}
+
+    def handle(self):
+        self.server.asked.append(json.loads(self.rfile.readline()))
+        self.wfile.write((json.dumps(FakeSupervisor.answer) + '\n').encode())
+
+
+class DeepHealth(unittest.TestCase):
+    def get(self, path):
+        try:
+            with urllib.request.urlopen(URL + path, timeout=30) as f:
+                return f.status, json.loads(f.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_the_supervisor_decides_the_status(self):
+        socketserver.TCPServer.allow_reuse_address = True
+        try:
+            srv = socketserver.TCPServer(('127.0.0.1', int(os.environ.get('SUP_PORT', 8198))), FakeSupervisor)
+        except OSError as e:
+            self.skipTest(f'cannot play the supervisor: {e}')
+        srv.asked = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            FakeSupervisor.answer = {'t': 'check', 'ok': True, 'ranks': [{'rank': 0, 'ok': True}]}
+            s, r = self.get('/health?deep')
+            if s == 503 and 'no supervisor' in r.get('error', ''):
+                self.skipTest("the front end has no --supervisor (FRONT_ARGS='--supervisor 127.0.0.1:8198')")
+            self.assertEqual((s, r['ranks'][0]['ok']), (200, True))
+            self.assertEqual(srv.asked[-1], {'t': 'check_all'})
+            FakeSupervisor.answer = {'t': 'check', 'ok': False, 'ranks': [{'rank': 0, 'ok': False}]}
+            self.assertEqual(self.get('/health?deep')[0], 503)
+            self.assertEqual(urllib.request.urlopen(URL + '/health').status, 200)     # plain /health asks nobody
+            self.assertEqual(len(srv.asked), 2)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == '__main__':

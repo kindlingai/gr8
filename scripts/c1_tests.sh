@@ -3,7 +3,8 @@
 # against chunks of 8 rows), s2_attn_test (batched attention over several sessions against the per-session calls;
 # needs EXTRA=-DDEC_S2, else it only prints SKIP), dec_heads_test (the decode attention kernels against the ones they
 # replaced) and kv4_test (the KV latent row: append round trip, and decode / prefill / row-owner attention against a host
-# reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md).
+# reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and weight_check_test (the weight check's GPU sums
+# against the CPU's, and one changed byte caught in its own chunk).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -69,6 +70,10 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = kv4_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  build_run weight_check_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"

@@ -138,6 +138,12 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
         self.assertEqual(a[a.index('--default-thinking-budget') + 1], '2048')
 
+    def test_the_front_end_finds_the_supervisor_for_deep_health(self):
+        a = self.front_argv()
+        host, port = a[a.index('--supervisor') + 1].rsplit(':', 1)
+        self.assertEqual(host, MEMBERS[0])                      # the head's LAN address, where its supervisor listens
+        self.assertTrue(port.isdigit())
+
 
 class EngineTests(unittest.TestCase):
     def test_the_engine_gets_the_plan_and_an_allowlist(self):
@@ -306,10 +312,70 @@ class EngineLogTests(unittest.TestCase):
                          "thread 'main' panicked at src/lib.rs:9:5:")
         self.assertEqual(S.exit_reason([os.path.join(d, 'e')]), '')
 
+    def test_a_failed_weight_check_stops_with_exit_3(self):
+        s = supervisor()
+        s.engine = mock.Mock(poll=mock.Mock(return_value=3), returncode=3)
+        with open(os.path.join(s.out, 'g6m4.r0.err'), 'w') as f:
+            f.write('g6: weight check: rank 0: 1 of 2400 chunks of the exlr8 release image differ from the bytes read\n')
+        with self.assertRaises(S.Stop) as e:
+            s.watch()
+        self.assertEqual(e.exception.code, 3)
+        with open(os.path.join(s.out, 'g6m4.r0.err'), 'w') as f:
+            f.write('g6: G6_PF_OWN needs the reduce-scatter form (G6_PF_RS=1)\n')
+        with self.assertRaises(S.Stop) as e:
+            s.watch()
+        self.assertEqual(e.exception.code, 1)
+
     def test_a_signal_is_named(self):
         self.assertEqual(S.exit_status(2), '2')
         self.assertEqual(S.exit_status(-6), '-6, SIGABRT')
         self.assertEqual(S.exit_status(-9), '-9, SIGKILL: the OOM killer? see dmesg')
+
+
+class SelfCheckTests(unittest.TestCase):
+    """/health?deep: each rank asks its engine for check.<n>.json; the head gathers every rank."""
+    def serving(self, rank=0):
+        s = supervisor(rank=rank)
+        os.makedirs(os.path.join(s.home, 's2'))
+        s.state, s.engine = 'serving', mock.Mock(poll=mock.Mock(return_value=None))
+        return s
+
+    def answer(self, s, n, body):
+        """The engine's side: wait for DIR/check.<n>, then answer it."""
+        def run():
+            req = os.path.join(s.home, 's2', f'check.{n}')
+            while not os.path.exists(req):
+                time.sleep(0.01)
+            with open(req + '.json', 'w') as f:
+                f.write(body)
+        threading.Thread(target=run, daemon=True).start()
+
+    def test_a_rank_passes_its_engines_answer_on_in_order(self):
+        s = self.serving()
+        self.answer(s, 0, '{"rank": 0, "ok": true, "images": []}')
+        r = s.local_check(timeout=5)
+        self.assertTrue(r['ok'])
+        self.assertEqual(r['weights']['images'], [])
+        self.answer(s, 1, '{"rank": 0, "ok": false, "images": [{"changed": 3}]}')
+        r = s.local_check(timeout=5)
+        self.assertFalse(r['ok'])
+        self.assertEqual(r['weights']['images'][0]['changed'], 3)
+
+    def test_an_engine_that_is_not_serving_or_silent_fails(self):
+        s = supervisor()
+        self.assertIn('not serving', s.local_check(timeout=1)['error'])
+        s = self.serving()
+        self.assertIn('did not answer check.0', s.local_check(timeout=0.3)['error'])
+
+    def test_the_head_gathers_every_rank(self):
+        s = self.serving()
+        self.answer(s, 0, '{"rank": 0, "ok": true}')
+        answers = {1: {'t': 'check', 'rank': 1, 'ok': True}, 2: None, 3: {'t': 'check', 'rank': 3, 'ok': True}}
+        with mock.patch.object(s, 'tell', side_effect=lambda r, m, timeout: answers[r]):
+            a = s.check_all()
+        self.assertFalse(a['ok'])                               # rank 2 did not answer
+        self.assertEqual([x.get('ok') for x in a['ranks']], [True, True, False, True])
+        self.assertIn('error', supervisor(rank=1).check_all())  # only the head gathers
 
 
 if __name__ == '__main__':

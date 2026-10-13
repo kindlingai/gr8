@@ -126,6 +126,10 @@ fn json_response(status: u16, body: Vec<u8>) -> Response<HttpBody> {
     response(status, "application/json; charset=utf-8", body)
 }
 
+fn json_value(status: u16, v: Value) -> Response<HttpBody> {
+    json_response(status, serde_json::to_vec(&v).unwrap_or_default())
+}
+
 fn sse_bytes(json: Vec<u8>) -> Bytes {
     let mut b = Vec::with_capacity(json.len() + 8);
     b.extend_from_slice(b"data: ");
@@ -317,8 +321,13 @@ impl State {
     }
 }
 
-pub async fn route(st: &'static State, req: Request<Incoming>) -> Result<Response<HttpBody>, Infallible> {
+pub async fn route(
+    st: &'static State,
+    req: Request<Incoming>,
+    peer: std::net::SocketAddr,
+) -> Result<Response<HttpBody>, Infallible> {
     let path = req.uri().path();
+    let deep = req.uri().query().is_some_and(|q| q.split('&').any(|x| x == "deep" || x.starts_with("deep=")));
     let m = req.method().clone();
     let r = match (path, &m) {
         ("/v1/chat/completions", &Method::POST) => chat(st, req).await,
@@ -326,6 +335,7 @@ pub async fn route(st: &'static State, req: Request<Incoming>) -> Result<Respons
         ("/tokenize", &Method::POST) => tokenize(st, req).await,
         ("/detokenize", &Method::POST) => detokenize(st, req).await,
         ("/v1/models", &Method::GET | &Method::HEAD) => models(st),
+        ("/health", &Method::GET | &Method::HEAD) if deep => health_deep(st, peer).await,
         ("/health", &Method::GET | &Method::HEAD) => health(st),
         ("/metrics", &Method::GET | &Method::HEAD) => metrics_route(st).await,
         ("/v1/chat/completions" | "/v1/completions" | "/tokenize" | "/detokenize", _) => {
@@ -1146,6 +1156,38 @@ fn health(st: &State) -> Response<HttpBody> {
     let mut r = Response::new(HttpBody::Full(None));
     *r.status_mut() = if st.engine.ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     r
+}
+
+/// /health?deep: the head's supervisor checks every rank (weights against the engine's sealed sums, while it serves) and
+/// answers with one JSON object; 200 when every rank passes, else 503. Each check reads every weight byte once, so it
+/// answers localhost only.
+async fn health_deep(st: &State, peer: std::net::SocketAddr) -> Response<HttpBody> {
+    if !peer.ip().is_loopback() {
+        return json_value(403, serde_json::json!({"ok": false, "error": "/health?deep answers localhost only"}));
+    }
+    let Some(addr) = st.supervisor.as_deref() else {
+        return json_value(503, serde_json::json!({"ok": false, "error": "no supervisor (--supervisor HOST:PORT)"}));
+    };
+    match tokio::time::timeout(Duration::from_secs(90), ask_supervisor(addr, r#"{"t": "check_all"}"#)).await {
+        Ok(Ok(v)) => {
+            let ok = v.get("ok").and_then(Value::as_bool) == Some(true);
+            json_value(if ok { 200 } else { 503 }, v)
+        }
+        Ok(Err(e)) => json_value(503, serde_json::json!({"ok": false, "error": format!("supervisor {addr}: {e}")})),
+        Err(_) => {
+            json_value(503, serde_json::json!({"ok": false, "error": format!("supervisor {addr}: no answer in 90 s")}))
+        }
+    }
+}
+
+/// One JSON line to a supervisor's control port, one JSON line back.
+async fn ask_supervisor(addr: &str, msg: &str) -> Result<Value, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut s = tokio::net::TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+    s.write_all(format!("{msg}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&line).map_err(|e| format!("bad answer: {e}"))
 }
 
 async fn metrics_route(st: &State) -> Response<HttpBody> {

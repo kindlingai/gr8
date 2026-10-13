@@ -79,6 +79,7 @@
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
+#include "weight_check.cuh"
 #include "prefill.cuh"
 #include "dflash.cuh"
 #include "prefix_reuse.h"
@@ -1127,7 +1128,17 @@ int main(int argc, char** argv)
             // the batched graphs carry no DFlash2 taps (their rows outnumber Dfl::feat's 8); the solo graphs keep them
             auto* const tap = m.dfl_tap;
             m.dfl_tap = nullptr;
-            try { nd.capture_all(sc.limit(), mtp, plan.chunk); m.dfl_tap = tap; g6s2::capture_barrier(bc, links); }
+            // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
+            try
+            {
+                nd.capture_all(sc.limit(), mtp, plan.chunk);
+                m.dfl_tap = tap;
+                wcheck::seal(R);
+                int dev = 0;
+                G6RT_CK(cudaGetDevice(&dev));
+                wcheck::start_watcher(s2dir, R, dev);
+                g6s2::capture_barrier(bc, links);
+            }
             catch (...) { links.shutdown(); throw; }
             g6s2::Service service(bc, links, std::move(h), plan.chunk);
             service.run();               // returns on DIR/quit

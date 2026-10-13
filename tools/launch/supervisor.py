@@ -258,6 +258,7 @@ class Supervisor:
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
         self.offers = self.variant = self.model_id = None
         self.lingered = False
+        self.check_n, self.check_lock = 0, threading.Lock()   # the engine's DIR/check.<n>, numbered per boot
 
     # ---- state ----------------------------------------------------------------------------------------------------
     def set_state(self, state, **meta):
@@ -325,6 +326,10 @@ class Supervisor:
             return {'t': 'ok'}
         if t == 'logs':
             return self.read_log(m.get('which', 'engine'), int(m.get('offset', -8192)))
+        if t == 'check':
+            return {'t': 'check', **self.local_check()}
+        if t == 'check_all':
+            return self.check_all()
         return {'t': 'error', 'error': f'unknown request {t!r}'}
 
     def request_stop(self, why, all_boxes=False, failed=False):
@@ -347,6 +352,48 @@ class Supervisor:
             for p in ('shim', 'front'):
                 s[p] = bool(recorded(os.path.join(self.out, f'{p}.pid')))
         return s
+
+    def local_check(self, timeout=60):
+        """This box's self-checks: the engine's weights against the sums it sealed when it was ready to serve
+        (engine/runtime/weight_check.cuh), checked on a stream of their own while it serves."""
+        r = {'rank': self.rank, 'lan': self.lan, 'state': self.state, 'mem_gib': mem_available_gib(),
+             'compaction_proactiveness': read_int('/proc/sys/vm/compaction_proactiveness')}
+        if self.state != 'serving' or not (self.engine and self.engine.poll() is None):
+            return {**r, 'ok': False, 'error': f'the engine is not serving ({self.state})'}
+        with self.check_lock:   # the engine answers check.<n> in order
+            n, self.check_n = self.check_n, self.check_n + 1
+            req = os.path.join(self.home, 's2', f'check.{n}')
+            open(req, 'w').close()
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                try:
+                    with open(req + '.json') as f:
+                        w = json.load(f)
+                    return {**r, 'ok': bool(w.get('ok')), 'weights': w}
+                except FileNotFoundError:
+                    time.sleep(0.2)
+                except ValueError as e:
+                    return {**r, 'ok': False, 'error': f'check.{n}.json: {e}'}
+        return {**r, 'ok': False, 'error': f'the engine did not answer check.{n} within {timeout} s'}
+
+    def check_all(self):
+        """The head asks every rank for its self-checks at once (the front end's /health?deep)."""
+        if self.rank != 0:
+            return {'t': 'error', 'error': f'rank {self.rank} is not the head'}
+        ranks = [None] * len(self.members)
+
+        def one(r):
+            if r == self.rank:
+                ranks[r] = self.local_check()
+            else:
+                a = self.tell(r, {'t': 'check'}, timeout=75)
+                ranks[r] = a if a and a.get('t') == 'check' else {'rank': r, 'ok': False, 'error': f'no answer: {a}'}
+        ts = [threading.Thread(target=one, args=(r,)) for r in range(len(self.members))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        return {'t': 'check', 'ok': all(x.get('ok') for x in ranks), 'ranks': ranks, 'time': time.time()}
 
     def read_log(self, which, offset):
         name = {'shim': 'shim.log', 'front': 'front.log', 'supervisor': 'supervisor.log'}.get(which, f'g6m4.r{self.rank}.err')
@@ -643,6 +690,7 @@ class Supervisor:
         work = os.path.join(self.home, 's2')
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
+        self.check_n = 0
         env = self.engine_env(plan)
         argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
@@ -703,7 +751,8 @@ class Supervisor:
         if o.get('DEFAULT_THINKING_BUDGET') != '0':
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
-                                                  '--port', o.get('PORT')], os.path.join(REPO, 'frontend'))
+                                                  '--port', o.get('PORT'), '--supervisor', f'{self.lan}:{self.port}'],
+                   os.path.join(REPO, 'frontend'))
 
     def pin(self):
         """At TP=6 and TP=3 the shim and front end stay off the proxy CPUs (PROXY_CPU-7..PROXY_CPU), as the launchers do."""
@@ -756,9 +805,9 @@ class Supervisor:
             self.api_agent.start()
             log(f'announced the API to mentat as {g}@gr8-api@{self.lan}')
 
-    def tell(self, r, msg):
+    def tell(self, r, msg, timeout=5):
         try:
-            return handshake.call(self.members[r], self.port, msg, timeout=5, bind=self.lan)
+            return handshake.call(self.members[r], self.port, msg, timeout=timeout, bind=self.lan)
         except OSError as e:
             log(f'rank {r} ({self.members[r]}): {e}')
             return None
@@ -783,7 +832,9 @@ class Supervisor:
             reason = exit_reason([os.path.join(self.out, f'{name}.err'), os.path.join(self.out, f'{name}.txt')])
             why = f'engine exited ({exit_status(self.engine.returncode)})' + (f': {reason}' if reason else '') + \
                   f'; last lines of {name}.err:\n' + tail(os.path.join(self.out, f'{name}.err'), 20)
-            raise Stop(1, why)
+            # the weights on the GPU differ from the bytes read (engine/runtime/weight_check.cuh): exit 3, as the rank
+            # health refusal does, so a restart policy can tell it from a crash
+            raise Stop(3 if reason.startswith('g6: weight check') else 1, why)
         # the head's front end and shim: without either the API is gone, so the cluster stops as for an engine
         # (polling also reaps them; a zombie still answered kill(pid, 0), and status called it running)
         for name, p in self.helpers.items():
