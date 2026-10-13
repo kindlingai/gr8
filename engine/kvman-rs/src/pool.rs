@@ -423,11 +423,12 @@ impl Pool {
                 return Ok(self.grant((0..w).collect(), true, w, worst, "exclusive", &gone, 0));
             }
             // its own pages: the prefix and its shard of the tail from below place, the drafter's copy of the
-            // rest from above it. Retained runs give their pages back only as the classes need them.
+            // rest from above it. Retained runs give their pages back only as the classes need them, and every
+            // one the classes evict spills (either class may be the one that runs out of room).
             let (main, draft) = self.exclusive_pages(worst);
             let mut list = Vec::with_capacity(w as usize);
-            let gone = self.fill_range(&mut list, main as usize, 0, self.place);
-            self.fill_range(&mut list, draft as usize, self.place, self.pages);
+            let mut gone = self.fill_range(&mut list, main as usize, 0, self.place);
+            gone.extend(self.fill_range(&mut list, draft as usize, self.place, self.pages));
             self.spill(&gone);
             return Ok(self.grant(list, true, w, worst, "exclusive", &gone, 0));
         }
@@ -634,11 +635,12 @@ impl Pool {
                 self.spill(&gone);
                 ((0..n as u32).collect::<Vec<u32>>(), gone, true, false)
             } else {
-                // its own pages, a fresh two-class grant; the entry's blocks (its tail included) restore into them
+                // its own pages, a fresh two-class grant; the entry's blocks (its tail included) restore into them.
+                // Every run the classes evict spills, from either class.
                 let (main, draft) = self.exclusive_pages(worst);
                 let mut list = Vec::with_capacity(n as usize);
-                let gone = self.fill_range(&mut list, main as usize, 0, self.place);
-                self.fill_range(&mut list, draft as usize, self.place, self.pages);
+                let mut gone = self.fill_range(&mut list, main as usize, 0, self.place);
+                gone.extend(self.fill_range(&mut list, draft as usize, self.place, self.pages));
                 self.spill(&gone);
                 (list, gone, true, false)
             }

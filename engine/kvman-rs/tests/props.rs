@@ -4,6 +4,7 @@
 //! the same calls grant the same runs and agree on the digest. The bit-for-bit match with the C++ pool is
 //! engine/runtime/s2/tests/pool_diff_test.cpp.
 
+use g6kvman::stash::{Io, Keep, Part};
 use g6kvman::{Finished, Pool, Rules, Run, PAGE};
 
 struct Rng(u64);
@@ -200,6 +201,61 @@ fn lowest_free_first_and_exclusive() {
     let x = p.reserve(90 * PAGE, 90 * PAGE).unwrap();
     assert!(p.exclusive_run(&x).unwrap() && p.list(&x).unwrap() == (0..90).collect::<Vec<u32>>());
     assert_eq!((p.room(), p.free_pages(), p.admissible(PAGE)), (0, 0, false));
+}
+
+#[test]
+fn the_drafter_s_class_spills_the_past_r_run_it_evicts() {
+    // R/64 = 8 pages in a pool of 80 with place 40 and 4 ranks: two past-R runs' prefix and shard fit below place
+    // together, so the low class still has room for a third long run while the drafter's class does not. The run
+    // the drafter's class evicts must spill to the store — its prefix as full blocks, its tail as its shard and
+    // the drafter's copy — not leave kept with its pages freed and nothing written or logged.
+    let mut p = Pool::new(80, 40, 8 * 64).unwrap();
+    p.keep(Rules { strict: false, noend: true, grid: 0 });
+    p.stores(2);
+    p.add_tier(64, Keep::All, None).unwrap();
+    p.tail(4, 3);
+    let hist = |n: usize| (0..n as i32).collect::<Vec<i32>>();
+    let done = |n: usize| Finished {
+        history: hist(n * 64 - 1),
+        valid: (n * 64 - 2) as i32,
+        written_end: (n * 64 - 1) as i32,
+        pf_end: (n * 64 - 2) as i32,
+    };
+    // two long conversations retained: 44 pages (8 prefix + 9 shard below place, 27 above) and 16 (8 + 2, 6)
+    let a = p.reserve(44 * PAGE, 44 * PAGE).unwrap();
+    assert_eq!(p.list(&a).unwrap().len(), 44);
+    p.retain(&a, done(44)).unwrap();
+    let b = p.reserve(16 * PAGE, 16 * PAGE).unwrap();
+    let b_list = p.list(&b).unwrap().to_vec();
+    p.retain(&b, done(16)).unwrap();
+    assert_eq!(p.kept_runs(), 2);
+    // a third long turn: 20 pages, 11 below place (13 spare) and 9 above (7 spare): the drafter's class evicts a
+    let c = p.reserve(20 * PAGE, 20 * PAGE).unwrap();
+    assert_eq!(p.kept_runs(), 1, "the drafter's class evicts the older past-R run");
+    assert_eq!(p.kept().first().unwrap().list, b_list, "the younger past-R run stays");
+    // a's spill: its 8 prefix pages as full blocks, its 9 shard pages, the drafter's copy of its 36 tail pages
+    let io = p.io();
+    let fulls = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Full, .. })).count();
+    let owns = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Own, .. })).count();
+    let reps = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Rep(_), .. })).count();
+    assert_eq!((fulls, owns, reps), (8, 9, 36), "the drafter's class eviction spilled nothing: {io:?}");
+    p.io_done().unwrap();
+    let c_list = p.list(&c).unwrap().to_vec();
+    assert_eq!(c_list.len(), 20);
+    check(&p, &[Live { run: c, list: c_list, prompt: hist(20 * 64) }], 4, 8 * 64);
+    // the store holds a: its blocks restore into a fresh two-class grant
+    p.release(&c).unwrap();
+    let h = p.match_prefix(&hist(44 * 64 - 2), 45 * PAGE, 45 * PAGE, (44 * 64 - 2) as i32);
+    assert!(h.stored && h.skip as usize >= 8 * 64, "a's spilled rows are in the store: {h:?}");
+    let (run2, io) = match (p.take_hit(h.skip, h.age, Some(h.tier), 45 * PAGE, 45 * PAGE), p.io()) {
+        (Ok(r), io) => (r, io),
+        (Err(e), _) => panic!("a does not restore: {e}"),
+    };
+    p.io_done().unwrap();
+    assert!(p.exclusive_run(&run2).unwrap());
+    assert_eq!(io.iter().filter(|x| matches!(x, Io::Restore { part: Part::Own, .. })).count(), 9);
+    assert_eq!(io.iter().filter(|x| matches!(x, Io::Restore { part: Part::Rep(_), .. })).count(), 36);
+    check(&p, &[Live { run: run2, list: p.list(&run2).unwrap().to_vec(), prompt: hist(44 * 64) }], 4, 8 * 64);
 }
 
 #[test]
