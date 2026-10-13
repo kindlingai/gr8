@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-13: a session past R takes its own pages from the shared pool
+
+- A request whose worst case exceeds R (`SHARE_LIMIT`, default `G6_CP_R`) runs alone, and its run took logical pages
+  0..w-1 of the whole pool: every retained conversation was evicted, and the requests behind it waited for the pool
+  even though their own pages would fit. The pool now grants such a run its own pages in the two classes the models
+  already have: its prefix (R/64 pages) and its shard of the tail below `place` (the main model's physical pages),
+  the drafter's copy of the rest above it. Retained short runs keep their pages through a long turn and give them
+  back only as the classes need them; a continuation of the long conversation adopts the retained run's start as
+  today. Scheduling is unchanged: the run still needs the pool to itself while it lives.
+- The engine builds the run's tables from its list (`s2_solo_cp_pages`: its CP map, the MTP layer and the drafter
+  take the list as built) and clears its pages only at bind (`s2_reset_pages`), on both models. A run's output is
+  byte-identical to the tables-as-built run: the new m4sim gate `G6_S2_XLIST` runs every sequence of a `--prefill`
+  CP build past R on a shuffled two-class page list and compares stdout (as `G6_S2_PFBASE` does below R).
+- The store's tail blocks name the run's list pages (its shard below `place`, the drafter's pages above), and a
+  restore into a shorter new request drops the blocks past its grant, whose rows the prefill rewrites. A tail's
+  blocks were the binding's sharded pages; `KV_BLOCK_FORMAT` goes to 4, so a persisted store of format 3 starts
+  empty.
+
 ## 2026-10-13: the engine checks its weights at boot, and `/health?deep` checks them again while it serves
 
 - The Rust loader sums each 32 MB chunk of an image on the CPU while it sits in the pinned staging buffer. After the load

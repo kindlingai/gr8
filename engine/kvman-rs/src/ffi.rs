@@ -420,13 +420,24 @@ fn part_code(p: Part) -> (u32, u32) {
 }
 
 /// Runs past R keep their tails in the stores: nr ranks share the attention cache past R, and a block holds per_slot
-/// logical pages' replicated parts (the engine's page block layout). After g6kv_stores.
+/// logical pages' replicated parts (the engine's page block layout). After g6kv_stores. nr > 0 also turns the pool's
+/// page classes on: a run past R takes its own pages instead of the whole pool.
 ///
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_tail(p: *mut Pool, nr: u32, per_slot: u32) {
     (*p).tail(nr, per_slot);
+}
+
+/// Whether g6kv_tail set the CP map's ranks: a run past R carries its own page list (1) or holds the pool as pages
+/// 0, 1, .. (0).
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_split(p: *const Pool) -> i32 {
+    (*p).split() as i32
 }
 
 /// Copies queued since the last g6kv_io_take.

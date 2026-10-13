@@ -607,12 +607,14 @@ fn a_run_on_a_resident_prefix_comes_back_with_its_prefix_from_the_pool_or_the_ti
 }
 
 /// A CP rank (stash.rs Tail): below R its pages hold every row; past R it holds the attention rows of every nr-th
-/// logical page (its shard, at physical page bp + j) and the indexer rows of every logical page.
+/// logical page (its shard) and the drafter holds every page. A run past R carries its own page list (pool.rs): its
+/// prefix and shard pages are the ones below the pool's place, the drafter's tail pages the ones above it, so this
+/// rank's shard sits on its own pages of the shared list.
 struct CpRank {
     pool: Pool,
     rank: usize,
-    attn: Vec<Page>, // by physical page
-    idx: Vec<Page>,  // by logical page
+    attn: Vec<Page>, // by physical page (this rank's attention cache)
+    idx: Vec<Page>,  // by physical page (the drafter's, every logical page at its list page)
     tiers: Vec<Vec<(Page, Page, Vec<Page>)>>,
 }
 
@@ -633,22 +635,34 @@ impl CpRank {
             tiers: vec![vec![blank; slots as usize]],
         }
     }
-    // logical page -> this rank's physical page of the attention cache, when it holds it
-    fn phys(&self, lp: usize, bp: usize) -> Option<usize> {
+    // logical page -> this rank's physical page of the attention cache, when it holds it: the prefix at its list
+    // page, an owned page at the (bp + j)-th page of the list below place (j its owned index)
+    fn phys(&self, list: &[u32], lp: usize, bp: usize, place: u32) -> Option<usize> {
         if lp < bp {
-            Some(lp)
-        } else if lp % NR == self.rank {
-            Some(bp + (lp - bp) / NR)
-        } else {
-            None
+            return Some(list[lp] as usize);
         }
+        if lp % NR != self.rank {
+            return None;
+        }
+        let j = (bp..lp).filter(|q| q % NR == self.rank).count();
+        let mut seen = 0;
+        for &p in list {
+            if p < place {
+                seen += 1;
+                if seen == bp + j + 1 {
+                    return Some(p as usize);
+                }
+            }
+        }
+        None
     }
-    // an exclusive run's rows (its list is the logical pages 0, 1, ..)
-    fn write(&mut self, from: usize, tokens: &[i32], bp: usize) {
+    // a run's rows through its list: the attention cache at this rank's owned pages, the drafter at every page
+    fn write(&mut self, run: &Run, from: usize, tokens: &[i32], bp: usize, place: u32) {
+        let list = self.pool.list(run).unwrap().to_vec();
         for (r, &t) in tokens.iter().enumerate().skip(from) {
             let lp = r / ROWS;
-            self.idx[lp][r % ROWS] = t;
-            if let Some(p) = self.phys(lp, bp) {
+            self.idx[list[lp] as usize][r % ROWS] = t;
+            if let Some(p) = self.phys(&list, lp, bp, place) {
                 self.attn[p][r % ROWS] = t;
             }
         }
@@ -704,7 +718,7 @@ fn a_run_past_r_comes_back_with_every_ranks_shard_of_its_tail() {
         r.pool.count(&a, None);
         let run = r.pool.reserve(worst, worst).unwrap();
         let io = r.run_io();
-        r.write(0, &a_hist, bp);
+        r.write(&run, 0, &a_hist, bp, place);
         (run, io, r.pool.digest())
     });
     all(&mut ranks, &mut |r| {
@@ -719,7 +733,7 @@ fn a_run_past_r_comes_back_with_every_ranks_shard_of_its_tail() {
         r.pool.count(&b, None);
         let run = r.pool.reserve(wb, wb).unwrap();
         let io = r.run_io();
-        r.write(0, &b, bp);
+        r.write(&run, 0, &b, bp, place);
         (run, io, r.pool.digest())
     });
     let tail = (a_hist.len() - 1).div_ceil(ROWS) - bp; // logical pages past R the run held
@@ -736,17 +750,18 @@ fn a_run_past_r_comes_back_with_every_ranks_shard_of_its_tail() {
     let w2 = (a2.len() + 10) as u64;
     let h = ranks[0].pool.match_prefix(&a2, w2, w2, a2.len() as i32 - 1);
     assert!(h.stored && h.skip as usize > bp * ROWS, "{h:?}");
-    all(&mut ranks, &mut |r| {
+    let (run2, ..) = all(&mut ranks, &mut |r| {
         r.pool.count(&a2, None);
         let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), w2, w2).unwrap();
         let io = r.run_io();
         (run, io, r.pool.digest())
     });
     for r in &ranks {
+        let list = r.pool.list(&run2).unwrap().to_vec();
         for (row, &t) in a2.iter().enumerate().take(h.skip as usize) {
             let lp = row / ROWS;
-            assert_eq!(r.idx[lp][row % ROWS], t, "rank {} indexer row {row}", r.rank);
-            if let Some(p) = r.phys(lp, bp) {
+            assert_eq!(r.idx[list[lp] as usize][row % ROWS], t, "rank {} indexer row {row}", r.rank);
+            if let Some(p) = r.phys(&list, lp, bp, place) {
                 assert_eq!(r.attn[p][row % ROWS], t, "rank {} attention row {row}", r.rank);
             }
         }

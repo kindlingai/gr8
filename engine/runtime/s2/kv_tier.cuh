@@ -8,11 +8,11 @@
 // of pages between the bindings and mapped pinned host memory, and the store reads and writes that memory.
 // Spills run before restores: a restore may write a page that a spill of the same call still has to read.
 //
-// Past R (a CP binding, cp_nr > 0) a binding's attention cache and its indexer keys hold this rank's every nr-th logical
-// page at physical pages R/64 + j. A run's tail past R goes to the store in two parts (g6kv_io part): 1 = this rank's
-// shard, the attention pages and indexer keys of the CP bindings at a physical page, in the page block's layout; 2 = a
-// logical page's replicated parts (every page of the bindings that are not CP: the MTP layer), rep_bytes() each,
-// per_slot() to a block.
+// Past R (a CP binding, cp_nr > 0) a binding's attention cache and its indexer keys hold this rank's every nr-th
+// logical page, on the run's own pages of the pool's two classes (pool.rs): its shard below place, the drafter's tail
+// copy above. A run's tail past R goes to the store in two parts (g6kv_io part): 1 = this rank's shard, the attention
+// pages and indexer keys of the CP bindings at its list's shard pages, in the page block's layout; 2 = a logical page's
+// replicated parts (every page of the bindings that are not CP: the MTP layer), rep_bytes() each, per_slot() to a block.
 #pragma once
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
@@ -27,7 +27,7 @@
 namespace g6s2 {
 // The page block's format: bump it whenever what a block holds, or how, changes (a stored block of another format is
 // not this engine's). Stores keyed on it also carry the engine binary's stamp (exe_stamp).
-constexpr int KV_BLOCK_FORMAT = 3;   // 3: a tail's indexer keys moved from the replicated part to the shard
+constexpr int KV_BLOCK_FORMAT = 4;   // 4: a tail's blocks are a run's own pages (the pool's page classes); 3: a tail's indexer keys moved from the replicated part to the shard
 
 // FNV-1a of this process's executable, hex: two builds that may compute different KV bits get different stamps
 inline std::string exe_stamp() {

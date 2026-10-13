@@ -755,6 +755,10 @@ int main(int argc, char** argv)
         sc.two_lanes = two;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+        // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
+        // drafter's tail copy above it — instead of the whole pool, and retained runs keep their pages through a long
+        // turn. The stores' tail blocks (per_slot) come with --kv-store below.
+        if (m.cp.on && s2_below == m.cp.R) pool.tail((uint32_t)g6nr::NR, 0);
         int reuse_grid = 0;
         // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
         // and NOEND (G6_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
@@ -936,7 +940,17 @@ int main(int argc, char** argv)
             // the run's pages go into the layers' tables. Staged prefill reads index keys through them too.
             [&](const g6s2::Slot& sl) {
                 const bool ex = pool.exclusive_run(sl.run);
-                if (ex) { s2_solo_built(m); s2_solo_built(D.d); }
+                if (ex)
+                {
+                    if (pool.split())   // the run's own pages: its CP map over its list
+                    {
+                        const std::vector<int> run = pool.list(sl.run);
+                        const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+                        s2_solo_cp_pages(m, run, most);
+                        s2_solo_cp_pages(D.d, run, most);
+                    }
+                    else { s2_solo_built(m); s2_solo_built(D.d); }
+                }
                 else { const std::vector<int> run = pool.list(sl.run); s2_solo_pages(m, run); s2_solo_pages(D.d, run); }
                 m.s2_pf_table = D.d.s2_pf_table = !ex;
                 // OWN=4: the offline loop's per-request rule (prompt + gen against the QO key table). The CP staging pool holds
@@ -1010,13 +1024,25 @@ int main(int argc, char** argv)
                 const bool ex = pool.exclusive_run(g.run);
                 // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
                 // past them is written by this request before any step reads it (prefix_reuse.h)
+                const std::vector<int> run = pool.list(g.run);
+                const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
                 for (Model* x : {&m, &D.d})
                 {
-                    if (ex) { s2_set_exclusive(*x, q); if (!g.reuse) reset(*x, st); }   // alone: the whole pool, today's reset
+                    if (ex)
+                    {
+                        if (pool.split()) s2_set_exclusive(*x, q, run, most);   // its own list; the slot view stays unused while solo
+                        else s2_set_exclusive(*x, q);
+                        // alone: the run's pages clear (the whole pool on the identity map, today's reset)
+                        if (!g.reuse)
+                        {
+                            if (pool.split()) s2_reset_pages(*x, run, st, most);
+                            else reset(*x, st);
+                        }
+                    }
                     else
                     {
-                        s2_set_pages(*x, q, pool.list(g.run));
-                        if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st);
+                        s2_set_pages(*x, q, run);
+                        if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st, most);
                     }
                     for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)
                     {
