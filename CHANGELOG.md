@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-13: zero new device memory before the engine's streams write to it
+
+- `dmalloc` zeroed with `cudaMemset`, which runs on the legacy default stream and returns before it finishes. The
+  engine's streams are non-blocking, so a write issued right after on them could land first and then be zeroed. The
+  prefill identity page table (`cp_pf_alloc`) is filled that way at boot: if the zeros won for entry k >= 1, every
+  prefill row from 64k on went to page 0, with no error word, while decode stayed exact. That fits #49's bad boots
+  (wrong for the whole boot, a cutoff at 64 or 128 prefilled rows, decode exact, weights exact); a bad boot with this
+  build would confirm it. `dmalloc` now waits
+  for its zeroing, the TP=4 pair-weight slots do the same before their rolls, and the boot reads the identity table
+  back and stops on a wrong entry.
+
 ## 2026-10-13: the TP=4 fp8 KV pool grows to 1,981 pages a rank (CAP 310,528)
 
 - The default TP=4 pool was 1,920 pages a rank (CAP 294,912), sized when every rank held every token's indexer keys.

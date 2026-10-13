@@ -99,11 +99,14 @@ struct TensorRef
 };
 using Find = std::function<TensorRef(const std::string&)>;
 
+// cudaMemset runs on the legacy default stream and returns before it finishes. The engine's streams are non-blocking, so
+// nothing orders a later write on them after the zeroing: wait for it here, or the zeros can land on top of that write.
 template <typename T> inline T* dmalloc(size_t n)
 {
     T* p;
     G6RT_CK(cudaMalloc(&p, n * sizeof(T)));
     G6RT_CK(cudaMemset(p, 0, n * sizeof(T)));
+    G6RT_CK(cudaStreamSynchronize(nullptr));
     return p;
 }
 inline std::string lname(int l, const char* t) { char b[96]; snprintf(b, sizeof b, "L%03d.%s", l, t); return b; }
