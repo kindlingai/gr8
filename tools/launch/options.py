@@ -58,7 +58,7 @@ KEYS = {
     'CHECK': ('run', '1', '0 = skip the local checks'),
     'CAP': ('cluster', None, 'KV pool in tokens (default: what SHARE_LIMIT leaves of the default pool memory)'),
     'KV_FORMAT': ('cluster', None, 'the KV latent row: fp8 (default, 656 B) or int4 (416 B, a Hadamard-rotated INT4 row, '
-                                   'experimental): bin/g6m4 or bin/g6m4-int4. int4 holds about 1.4x the tokens at TP=4 '
+                                   'experimental): bin/g6m4 or bin/g6m4-int4. int4 holds about 1.34x the tokens at TP=4 '
                                    '(its own CAP default) for about 3% slower decode (docs/KV4.md)'),
     'SHARE_LIMIT': ('cluster', None, 'requests up to this many tokens (prompt + max_tokens) share decode steps; a '
                                      'longer one runs alone. Each rank holds the first SHARE_LIMIT tokens of a session'),

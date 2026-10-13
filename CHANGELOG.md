@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-13: the TP=4 fp8 KV pool grows to 1,981 pages a rank (CAP 310,528)
+
+- The default TP=4 pool was 1,920 pages a rank (CAP 294,912), sized when every rank held every token's indexer keys.
+  Since #44 the keys sit on the latent's pages, and the corrected memory model (docs/KV4.md, Capacity: it counts the
+  buffers that grow with CAP) puts the same per-rank memory at 1,981 pages. The default `CAP` is now 310,528, and
+  `--share-limit 32768` gives 408,832. TP=3 and TP=6 are unchanged.
+- Boxes keep about 0.3 GiB less free memory than with #44 at 1,920 pages: what they had before #44.
+- `--kv-format int4` keeps its measured 2,390 pages (CAP 415,232): 1.34x the fp8 default now.
+
 ## 2026-10-13: `--kv-format int4`: a 4-bit KV latent, chosen at launch (experimental, off by default)
 
 - `--kv-format int4` (`KV_FORMAT=int4`) caches the MLA latent as INT4 (one FP16 scale per 32 dims) after a 512-point

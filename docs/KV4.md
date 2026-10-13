@@ -4,8 +4,8 @@ The KV cache spends most of its bytes on the MLA latent: 512 dims per token per 
 (`KV_FORMAT=int4`) stores that latent in 4 bits, so the same memory holds more pages. The rope key stays BF16 and the
 indexer keys stay FP8.
 
-**The trade at TP=4** (measured on the cluster, below): about 1.4x the tokens in the same memory (CAP 415,232 against
-294,912), decode about 3% slower, 8K prefill about 6% faster, speculative acceptance about 2% lower, and needles found
+**The trade at TP=4** (measured on the cluster, below): about 1.4x the tokens in the same memory (CAP 415,232, against 294,912 for
+fp8 at the same 1,920-page memory; the fp8 default has since grown to 1,981 pages, CAP 310,528), decode about 3% slower, 8K prefill about 6% faster, speculative acceptance about 2% lower, and needles found
 12/12 from 32K to 200K tokens (and at 400K with a larger CAP), as with fp8.
 
 The row is fixed when the engine is compiled (`-DG6_KV4=1`, `attn/kvfmt.h`), so there are two engines: `bin/g6m4` (fp8,
@@ -100,14 +100,16 @@ costs 2.3 MB of int4 pool and 2.9 MB of them.
 
 | TP (SHARE_LIMIT) | fp8 (the default) | int4 (`--kv-format int4`) | gain | |
 |---|---|---|---|---|
-| TP=4 (65,536) | 1,920 pages a rank, CAP 294,912 | 2,390 pages, CAP 415,232 | 1.41x | measured |
+| TP=4 (65,536) | 1,981 pages a rank, CAP 310,528 | 2,390 pages, CAP 415,232 | 1.34x | measured |
 | TP=3 (65,536) | 1,941, CAP 241,600 | 2,480, CAP 345,088 | 1.43x | estimate |
 | TP=6 (32,768) | 2,026, CAP 614,400 | 2,440, CAP 773,120 | 1.26x | estimate |
 | TP=6 (131,072, the default) | 3,307, CAP 614,400 | 3,940, CAP 857,600 | 1.40x | estimate |
 
 - **TP=4 rests on two boots.** At 1,920 pages the int4 row leaves 2.31 GiB more free than fp8 (the model says 2.34).
   At 2,876 pages it leaves 2.39 GiB less (model 2.23). Interpolating gives equal headroom at about 2,390 pages a rank.
-  The model alone says 2,409.
+  The model alone says 2,409. The fp8 default then moved from 1,920 to 1,981 pages a rank (the same model's
+  equal-memory figure against the replicated index keys before #44), and int4 kept 2,390, so at TP=4 int4 now
+  leaves about 0.3 GiB more free than fp8.
 - **TP=3 and TP=6 are the model's figures, rounded down by the 0.8% it overshoots at TP=4.** They reuse TP=4's
   per-token buffer sizes, and the QO tables differ with `G6_PF_OWN`, so they are not measured.
 - `scripts/engine_args.sh` (`int4_pages`) holds these page counts. A `CAP` given by hand wins, as for fp8.

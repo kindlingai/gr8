@@ -19,7 +19,7 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 | aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.6 / 60.7 tok/s | 57.6 / 79.0 tok/s‡ |
 | prefill, 8K prompt, cold | 1,374 tok/s | 628 tok/s | 1,953 tok/s‡ |
 | prefill, 8K prompt, cached | 54,867 tok/s | 56,995 tok/s | – |
-| KV pool (longest context) | 294,912 tokens | 241,600 tokens | 614,400 tokens |
+| KV pool (longest context) | 310,528 tokens | 241,600 tokens | 614,400 tokens |
 | requests that share decode steps | up to 65,536 tokens | up to 65,536 tokens | up to 32,768 tokens |
 | requests decoding at once | 8 | 8 | 8 |
 
@@ -175,8 +175,8 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
   blocks below the KV pool, so a request whose prefix the pool let go reads it back instead of prefilling it. An SSD
   store starts empty at every boot unless it has `persist=on`
   ([engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md)).
-- `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.4x the context at TP=4 (CAP 415,232 against
-  294,912) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
+- `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 415,232 against
+  310,528) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
 - `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.
@@ -211,7 +211,7 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
   all of them.
 - A request past `SHARE_LIMIT` waits for the pool to empty, and runs alone. Its size is the prompt plus `max_tokens`.
   A chat request without `max_tokens` gets what keeps it within the limit, but at least 8,192 tokens, so a prompt
-  past about 57,000 tokens runs alone. `--share-limit 32768` gives back the longest context (393,216 at TP=4) and
+  past about 57,000 tokens runs alone. `--share-limit 32768` gives back the longest context (408,832 at TP=4) and
   shares only requests up to 32,768 tokens.
 - A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
   meanwhile. The shim caps those prompts at 1,024 tokens.

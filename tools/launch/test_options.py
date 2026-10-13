@@ -210,14 +210,14 @@ class CanonicalTests(unittest.TestCase):
 
     def test_defaults_resolved_and_equal_to_explicit(self):
         a, text, da = self.digest()
-        self.assertIn('CAP=294912\n', text)
+        self.assertIn('CAP=310528\n', text)
         self.assertIn('--s2-sessions 8 ', text)
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
-        self.assertEqual(da, self.digest('--cap', '294912', '--share-limit', '65536', '--sess', '8', '--dflash', '1')[2])
+        self.assertEqual(da, self.digest('--cap', '310528', '--share-limit', '65536', '--sess', '8', '--dflash', '1')[2])
 
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
-        self.assertIn('CAP=393216\n', text)              # 1,920 physical pages per rank at TP=4, as at 65536
+        self.assertIn('CAP=408832\n', text)              # 1,981 physical pages per rank at TP=4, as at 65536
         self.assertIn('G6_CP_R=32768 ', text)
         _, text, _ = self.digest('--share-limit', '32768', '--cap', '200000')
         self.assertIn('CAP=200000\n', text)
@@ -233,7 +233,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(base, self.digest('--g6env-x', 'G6_X=1')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
-        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '294912', '--reuse', '1', '--g6args-x', '--top 5')[2])
+        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '310528', '--reuse', '1', '--g6args-x', '--top 5')[2])
 
     def test_template_has_no_paths(self):
         _, text, _ = self.digest('--g6-home', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
@@ -368,7 +368,7 @@ class KvFormatTests(unittest.TestCase):
         o, p = self.plan()
         _, p8 = self.plan('--kv-format', 'fp8')
         self.assertNotIn('--kv-format', p['args'])
-        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '294912'))
+        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '310528'))
 
     def test_int4_runs_its_own_engine_with_its_own_pool(self):
         o, p = self.plan('--kv-format', 'int4')
