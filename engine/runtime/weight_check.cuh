@@ -181,6 +181,20 @@ inline void record(const char* what, const g6::Pack& pack, const uint8_t* base, 
     const auto t0 = std::chrono::steady_clock::now();
     cudaStream_t st;
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    // G6_WEIGHT_CHECK_FLIP=RANK:OFFSET (a test of this check): flip one byte of rank RANK's first image before it runs
+    if (const char* f = getenv("G6_WEIGHT_CHECK_FLIP"))
+    {
+        int r = -1;
+        unsigned long long off = 0;
+        if (sscanf(f, "%d:%llu", &r, &off) == 2 && r == rank && off < l.bytes && images().empty())
+        {
+            uint8_t b = 0;
+            cudaMemcpy(&b, base + off, 1, cudaMemcpyDeviceToHost);
+            b ^= 0x40;
+            cudaMemcpy(const_cast<uint8_t*>(base) + off, &b, 1, cudaMemcpyHostToDevice);
+            fprintf(stderr, "# rank %d: G6_WEIGHT_CHECK_FLIP: flipped the byte at offset %llu of the %s image\n", rank, off, what);
+        }
+    }
     const std::vector<uint64_t> dev = device_sums(base, l.bytes, l.chunk, st);
     cudaStreamDestroy(st);
     size_t bad = 0, first = 0;
