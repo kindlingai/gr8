@@ -99,12 +99,27 @@ struct TensorRef
 };
 using Find = std::function<TensorRef(const std::string&)>;
 
+// G6_TEST_ZERO_DELAY_MS=N (a test of #49's race): dmalloc's zeroing waits behind an N ms kernel on the legacy stream, so
+// any write to new memory that is not ordered after the zeroing loses to it every time.
+__global__ void k_test_spin(unsigned long long ns)
+{
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); while (t - t0 < ns);
+}
+inline void test_zero_delay()
+{
+    static const int ms = getenv("G6_TEST_ZERO_DELAY_MS") ? atoi(getenv("G6_TEST_ZERO_DELAY_MS")) : 0;
+    if (ms > 0) k_test_spin<<<1, 1, 0, nullptr>>>(ms * 1000000ull);
+}
+
 // cudaMemset runs on the legacy default stream and returns before it finishes. The engine's streams are non-blocking, so
 // nothing orders a later write on them after the zeroing: wait for it here, or the zeros can land on top of that write.
 template <typename T> inline T* dmalloc(size_t n)
 {
     T* p;
     G6RT_CK(cudaMalloc(&p, n * sizeof(T)));
+    test_zero_delay();
     G6RT_CK(cudaMemset(p, 0, n * sizeof(T)));
     G6RT_CK(cudaStreamSynchronize(nullptr));
     return p;

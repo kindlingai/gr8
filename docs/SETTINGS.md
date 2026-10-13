@@ -47,6 +47,7 @@ the short version.
 | `G6_PF_TILE` | 64 | prefill attention query tile (64/128/256) |
 | `G6_PF_DENSE` | 8192 | context threshold for the dense prefill attention path; past it the sparse (indexer-selected) path runs; 0 = always sparse |
 | `G6_PF_RS` | 1 | prefill uses reduce-scatter + all-gather instead of all-reduce |
+| `G6_TEST_ZERO_DELAY_MS` | unset | a test of the zeroing order (#49, #54): every `dmalloc` zeroing waits behind an N ms kernel on the legacy stream, so a write to new memory not ordered after it loses every time. Boots take about N ms longer per allocation |
 | `G6_PF_STREAMS` | 2 | the two prefill lanes run on two CUDA streams |
 | `G6_PF_ATTN_ROWS` | 1024 | prefill attention runs in chunks of this many rows inside a sub-batch |
 | `G6_PF_OWN` | 3 | row-owner prefill. 1 = the owner computes the next layer's projections. 2 = also the indexer. 3 = the owner runs the whole attention block for all 64 heads of its rows (QO; needs the QO pack, `G6_PF_RS=1`, `--pfv2`). 4 = TP4 only: pair-owner QO, OWN=3's attention block split over two head pairs ([DESIGN-QO-PAIR.md](DESIGN-QO-PAIR.md)); TP4 launcher default |
