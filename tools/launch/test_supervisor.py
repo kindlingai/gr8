@@ -284,7 +284,10 @@ class EngineLogTests(unittest.TestCase):
         for boot in range(5):
             self.write(out, 'g6m4.r0.err', f'boot {boot}\n')
             S.rotate_logs(out, names)
-        kept = {d: open(os.path.join(out, d, 'g6m4.r0.err')).read().strip() for d in sorted(os.listdir(out))}
+        kept = {}
+        for d in sorted(os.listdir(out)):
+            with open(os.path.join(out, d, 'g6m4.r0.err')) as f:
+                kept[d] = f.read().strip()
         self.assertEqual(kept, {'prev1': 'boot 4', 'prev2': 'boot 3', 'prev3': 'boot 2'})
 
     def test_the_reason_is_found_behind_later_lines(self):

@@ -10,6 +10,7 @@
   points at the OOM killer).
 - The low-memory warning before boot names this TP and the variant's expert size, not "a TP=4 rank needs ~90 GB".
 - The checks warn when `vm.compaction_proactiveness` is not 0, which the README requires.
+
 ## 2026-10-13: zero new device memory before the engine's streams write to it
 
 - `dmalloc` zeroed with `cudaMemset`, which runs on the legacy default stream and returns before it finishes. The
