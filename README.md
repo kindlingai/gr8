@@ -19,7 +19,7 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 | aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.6 / 60.7 tok/s | 57.6 / 79.0 tok/s‡ |
 | prefill, 8K prompt, cold | 1,374 tok/s | 628 tok/s | 1,953 tok/s‡ |
 | prefill, 8K prompt, cached | 54,867 tok/s | 56,995 tok/s | – |
-| KV pool (longest context) | 310,528 tokens | 241,600 tokens | 614,400 tokens |
+| KV pool (longest context) | 310,528 tokens (415,232 with int4§) | 241,600 tokens (345,088 with int4§) | 614,400 tokens (857,600 with int4§) |
 | requests that share decode steps | up to 65,536 tokens | up to 65,536 tokens | up to 32,768 tokens |
 | requests decoding at once | 8 | 8 | 8 |
 
@@ -31,6 +31,8 @@ get DFlash2 depends on timing.
 2450 to 2550 MHz), not the 2200 MHz cap of the other columns, so do not compare the columns row by row. Decode is a
 concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; it is not
 RigMark. One test window on one cluster.
+§ `--kv-format int4` (experimental): 4-bit KV latent, about 3% slower decode at TP=4; TP=3 and TP=6 int4 figures are
+estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [docs/KV4.md](docs/KV4.md)
 
 [kindling.json](kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
 

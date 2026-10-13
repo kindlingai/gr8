@@ -36,11 +36,11 @@
           "aggregate_tps": 64.0
         }
       ],
-      "max_context": 294912,
-      "kv_pool_tokens": 294912,
+      "max_context": 310528,
+      "kv_pool_tokens": 310528,
       "max_concurrent": 8,
       "quality": [],
-      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. Code varies between boots (41.5 to 49.3 on one build). Structured output is not reported: it measures predictable output, not agent speed."
+      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. Code varies between boots (41.5 to 49.3 on one build). Structured output is not reported: it measures predictable output, not agent speed. With --kv-format int4 (experimental, about 3% slower decode) the KV pool is 415,232 tokens."
     },
     {
       "id": "tp3",
@@ -70,7 +70,7 @@
       "kv_pool_tokens": 241600,
       "max_concurrent": 8,
       "quality": [],
-      "notes": "bit225 experts (about 2.25 bpw), MTP only. Mean of two boots. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release."
+      "notes": "bit225 experts (about 2.25 bpw), MTP only. Mean of two boots. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. With --kv-format int4 (experimental) the KV pool is 345,088 tokens, an estimate not yet booted."
     },
     {
       "id": "tp6",
@@ -98,7 +98,7 @@
       "max_context": 614400,
       "kv_pool_tokens": 614400,
       "max_concurrent": 8,
-      "notes": "Served through S2, MTP only. GPU clocks uncapped (about 2450 to 2550 MHz), not the 2200 MHz cap of the other configs. Decode is a concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; not RigMark. One test window on one cluster."
+      "notes": "Served through S2, MTP only. GPU clocks uncapped (about 2450 to 2550 MHz), not the 2200 MHz cap of the other configs. Decode is a concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; not RigMark. One test window on one cluster. With --kv-format int4 (experimental) the KV pool is 857,600 tokens at the default SHARE_LIMIT of 131,072, an estimate not yet booted."
     }
   ]
 }
