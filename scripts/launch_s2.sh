@@ -46,7 +46,7 @@ engine_env   # scripts/engine_args.sh has the engine environment and arguments, 
 for ((r = NRANK - 1; r >= 0; r--)); do
   ARGS=$(engine_args $r "$PACKS" packs "$G6_HOME" "$EPOCH")
   on $r "cd $G6_HOME && rm -rf s2 && mkdir -p s2 out && { \
-    nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/g6m4 --rank $r --ips $IPS --ips2 $IPS2 \
+    nohup setsid bash -c 'echo \$\$ > out/g6m4.pid; exec env LD_LIBRARY_PATH=$G6_HOME/bin/lib $ENGINE_ENV ./bin/$ENGINE_BIN --rank $r --ips $IPS --ips2 $IPS2 \
       --proxy-cpu $PROXY_CPU $ARGS' > out/g6m4.r$r.txt 2> out/g6m4.r$r.err < /dev/null & }" &
 done
 wait

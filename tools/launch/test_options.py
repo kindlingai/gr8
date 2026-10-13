@@ -357,5 +357,30 @@ class KvStoreTests(unittest.TestCase):
             v.check(['--peers', PEERS, *argv], want)
 
 
+class KvFormatTests(unittest.TestCase):
+    def plan(self, *argv, tp='4'):
+        o = opt.parse(['--no-config', '--peers', ','.join(PEERS.split(',')[:int(tp)]) if tp != '6' else
+                       ','.join(f'10.0.0.{i}' for i in range(1, 7)), *argv], {})
+        opt.validate(o)
+        return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
+
+    def test_fp8_is_the_default_and_unchanged(self):
+        o, p = self.plan()
+        _, p8 = self.plan('--kv-format', 'fp8')
+        self.assertNotIn('--kv-format', p['args'])
+        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '294912'))
+
+    def test_int4_runs_its_own_engine_with_its_own_pool(self):
+        o, p = self.plan('--kv-format', 'int4')
+        self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
+        self.assertEqual(p['knobs']['CAP'], str(65536 + (2390 - 1024) * 64 * 4), '2,390 pages a rank at TP=4')
+        self.assertEqual(self.plan('--kv-format', 'int4', '--cap', '300000')[1]['knobs']['CAP'], '300000', 'CAP wins')
+        self.assertEqual(self.plan('--kv-format', 'int4', tp='3')[1]['knobs']['CAP'], str(65536 + (2480 - 1024) * 64 * 3))
+        self.assertEqual(self.plan('--kv-format', 'int4', tp='6')[1]['knobs']['CAP'], str(131072 + (3940 - 2048) * 64 * 6))
+
+    def test_refusal(self):
+        ValidateTests().check(['--peers', PEERS, '--kv-format', 'int8'], 'fp8 or int4')
+
+
 if __name__ == '__main__':
     unittest.main()

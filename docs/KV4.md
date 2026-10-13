@@ -1,9 +1,19 @@
-# 4-bit MLA KV latent (`G6_KV4`, experimental, off by default)
+# 4-bit MLA KV latent (`--kv-format int4`, experimental, off by default)
 
-The KV cache spends most of its bytes on the MLA latent: 512 dims per token per layer. `G6_KV4=1` stores that latent
-in 4 bits, so the same memory holds more pages. The rope key stays BF16 and the indexer keys stay FP8.
+The KV cache spends most of its bytes on the MLA latent: 512 dims per token per layer. `--kv-format int4`
+(`KV_FORMAT=int4`) stores that latent in 4 bits, so the same memory holds more pages. The rope key stays BF16 and the
+indexer keys stay FP8.
 
-The switch is at compile time. A build without it has the same row, the same kernels and the same SASS as before.
+**The trade at TP=4** (measured on the cluster, below): about 1.4x the tokens in the same memory (CAP 415,232 against
+294,912), decode about 3% slower, 8K prefill about 6% faster, speculative acceptance about 2% lower, and needles found
+12/12 from 32K to 200K tokens (and at 400K with a larger CAP), as with fp8.
+
+The row is fixed when the engine is compiled (`-DG6_KV4=1`, `attn/kvfmt.h`), so there are two engines: `bin/g6m4` (fp8,
+the default, unchanged) and `bin/g6m4-int4`. The image ships both for every TP; `./gr8 glm53 build` builds
+`g6m4-int4` when `KV_FORMAT=int4`. `--kv-format int4` makes the launcher run `g6m4-int4` with its own CAP default
+(Capacity, below) and pass the engine `--kv-format int4`. Each engine refuses the other's format, and `g6m4-int4`
+refuses to start without the flag. A build without `G6_KV4` has the same row, the same kernels and the same SASS as
+before.
 
 ## The row
 
@@ -49,13 +59,15 @@ an MMA on the latent, and prefill turns it into an FP16 table first, so FP4 tens
   refused. They read the FP8 row directly.
 
 **Stores.** Page blocks shrink from 3,502,592 B to 2,289,152 B (79 x 64 x 416 + 22 x 64 x 132; 559 x 4 KiB slots).
-A tier's compat key also names the row format (`kv int4g32h`), so a KV4 engine never reads blocks an FP8 engine
-wrote. `kvman-sim --mla-row 416` models the smaller blocks.
+A store's index key names the row format (`kv int4g32h`) and the engine binary's stamp, so a `persist=on` store that
+the other format wrote is cleared at boot (with a log line), never read. A KV node sizes each lease by the engine's
+block, and the lease name ends in `-int4`. `kvman-sim --mla-row 416` models the smaller blocks.
 
 ## Build and test
 
 ```bash
-EXTRA=-DG6_KV4=1 G6_NR=4 scripts/build.sh bin4-kv4                 # the TP4 engine with the INT4 row
+KV_FORMAT=int4 G6_NR=4 scripts/build.sh bin                        # bin/g6m4-int4: the TP4 engine with the INT4 row
+EXTRA=-DG6_KV4=1 G6_NR=4 scripts/build.sh bin4-kv4                 # the same as a full build (g6m4, m4sim) in its own dir
 TEST=kv4_test G6_NR=4 scripts/c1_tests.sh bin4                     # the FP8 row
 TEST=kv4_test G6_NR=4 EXTRA=-DG6_KV4=1 scripts/c1_tests.sh bin4-kv4 # the INT4 row
 ```
@@ -72,31 +84,35 @@ TEST=kv4_test G6_NR=4 EXTRA=-DG6_KV4=1 scripts/c1_tests.sh bin4-kv4 # the INT4 r
 
 ## Capacity
 
-Every rank holds the first `SHARE_LIMIT` tokens and 1/TP of the rest: `CAP = R + (P - R/64) * 64 * TP`. The table
-below assumes the same per-rank memory for everything that grows with CAP:
+Every rank holds the first `SHARE_LIMIT` tokens and 1/TP of the rest: `CAP = SHARE_LIMIT + (P - SHARE_LIMIT/64) x 64 x TP`.
+The int4 default keeps each rank's memory where fp8's default puts it. The model counts everything that grows with the
+pool or with CAP:
 
-- the MLA pages;
-- the index keys (22 x 132 B per token, on every rank);
-- the CP staging pools (2 x row per token);
-- the FP16 prefill key table (about 1.4 KB per token).
+- the pool: 78 MLA layers and 21 index caches on P pages a rank (the index keys sit on the latent's pages);
+- the CP staging pools: 2 x (row + index key) a token;
+- the MTP layer's latent and index key;
+- five buffers sized by CAP, from the boot logs: the QO tables (1.41 KB a token), the tensor-core prefill states
+  (2.95 KB), the shared decode scratch (0.77 KB), the MTP layer's scratch (1.53 KB) and the MTP layer's own tensor-core
+  prefill state (2.95 KB).
 
-Pages per rank:
+Those buffers do not shrink with the row, which is why the gain is below 656/416. At TP=4 each added page (256 tokens)
+costs 2.3 MB of int4 pool and 2.9 MB of them.
 
-| TP (R) | FP8 | INT4 |
-|---|---|---|
-| TP=4 (64K) | 1920 | about 2640 |
-| TP=3 (64K) | 1941 | about 2740 |
-| TP=6 (32K) | 2026 | about 2700 |
+| TP (SHARE_LIMIT) | fp8 (the default) | int4 (`--kv-format int4`) | gain | |
+|---|---|---|---|---|
+| TP=4 (65,536) | 1,920 pages a rank, CAP 294,912 | 2,390 pages, CAP 415,232 | 1.41x | measured |
+| TP=3 (65,536) | 1,941, CAP 241,600 | 2,480, CAP 345,088 | 1.43x | estimate |
+| TP=6 (32,768) | 2,026, CAP 614,400 | 2,440, CAP 773,120 | 1.26x | estimate |
+| TP=6 (131,072, the default) | 3,307, CAP 614,400 | 3,940, CAP 857,600 | 1.40x | estimate |
 
-CAP:
-
-| TP (R) | FP8 | INT4 | gain |
-|---|---|---|---|
-| TP=4 (64K) | 294,912 | 479,744 | 1.63x |
-| TP=3 (64K) | 241,600 | 395,008 | 1.63x |
-| TP=6 (32K) | 614,144 | 872,960 | 1.42x |
-
-The launcher does not set these yet. Pass `CAP` by hand, and check the boot's memory line.
+- **TP=4 rests on two boots.** At 1,920 pages the int4 row leaves 2.31 GiB more free than fp8 (the model says 2.34).
+  At 2,876 pages it leaves 2.39 GiB less (model 2.23). Interpolating gives equal headroom at about 2,390 pages a rank.
+  The model alone says 2,409.
+- **TP=3 and TP=6 are the model's figures, rounded down by the 0.8% it overshoots at TP=4.** They reuse TP=4's
+  per-token buffer sizes, and the QO tables differ with `G6_PF_OWN`, so they are not measured.
+- `scripts/engine_args.sh` (`int4_pages`) holds these page counts. A `CAP` given by hand wins, as for fp8.
+- An earlier version of this table (1.42-1.63x) counted only the pool, the staging pools and one prefill table, and
+  allowed 2,876 pages a rank at TP=4. That boot ran with 4.7-5.4 GiB free against fp8's 7.2-8.0.
 
 ## Measured so far (one GB10, no cluster)
 
@@ -170,10 +186,26 @@ BF16 model:
   - FP8 row: 0.2-2.9%, median 2.2%.
   - INT4 row: 0.3-11%, median 8.5%. It grows with depth: 1-5% in layers 1-9, 8-11% past layer 60.
 - **Limits.** These windows are 2,048 tokens, so the indexer selects every key, and the MTP layer is not in this
-  forward. Long-context needles and acceptance length are still open.
+  forward. Long-context needles and acceptance are on the cluster, below.
+
+## On the cluster (TP=4, 2026-10-13)
+
+Four GB10 boxes, the HF release with the DFlash2 drafter. The same session and front end for both. fp8 is main with
+#44 and #43; int4 is the same tree built with `G6_KV4=1`, at 1,920 pages unless stated.
+
+- **Gate.** Smoke 12/12 on both. The cold shared-prefix probe's first token stays 'The'; its logprob moves from
+  -0.0770 to -0.1991, the same on two int4 boots.
+- **Needles** (one fact in synthetic records at 10/50/90% depth, temperature 0, `reasoning_effort` low, every prompt
+  cold): 12/12 found on both, with the same answers, at 32K, 64K, 128K and 200K tokens, and the same TTFT
+  (24 / 48 / 105 / 181 s). The first token agrees on 11 of 12, logprobs within 0.2. At 128K and 10% depth fp8 closes
+  the think block at once and int4 writes a few characters of reasoning first; both answer correctly. With CAP 539,648
+  (2,876 pages) a 400K-token needle was found too (TTFT 461 s).
+- **RigMark** (`reasoning_effort` low): code 49.1 tok/s against 50.8 (-3.3%), prose 29.9 against 30.6 (-2.3%), 8K
+  prefill cold 1,358 against 1,284 (+5.8%).
+- **Speculative acceptance**, one request at a time (DFlash2 at TP=4), 4 code and 4 prose prompts of 512 tokens, from
+  the `vllm:spec_decode_*` counters: code 3.51 accepted per draft against 3.60 (-2.3%), prose 1.22 against 1.25
+  (-2.1%). Decode 51.3 against 51.8 and 33.2 against 34.4 tok/s.
 
 ## Not measured yet
 
-- Long-context needles on the cluster.
-- Decode and prefill speed.
-- MTP and DFlash2 acceptance. The MTP layer's cache is quantized too.
+- TP=3 and TP=6 boots (their CAP defaults are estimates).

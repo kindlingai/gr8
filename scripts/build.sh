@@ -6,6 +6,8 @@
 #                                         DEC_S2 (the multi-session path launch_tp4.sh runs) and PF_F12 (the fat-CTA prefill fc1)
 #   scripts/build.sh bin6                 the TP6 engine (G6_NR=6 is the default), with DEC_S2 (launch_tp6.sh runs it)
 #   G6_NR=3 scripts/build.sh bin3         the TP3 engine, with DEC_S2 (launch_tp3.sh runs it)
+#   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
+#                                         docs/KV4.md), which `--kv-format int4` runs. Same G6_NR rules as above.
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (the engine finds it there at any TP)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
@@ -38,6 +40,16 @@ case "${G6_NR:-6}" in
     S2_FLAG="-DDEC_S2"
     # PF_F12: F12_NE=2 must divide the expert blocks per rank (4 at TP4, 3 at TP6)
     [ "${G6_NR:-6}" = 4 ] && S2_FLAG="$S2_FLAG -DPF_F12" ;;
+esac
+case "${KV_FORMAT:-fp8}" in
+  fp8) ;;
+  int4)   # g6m4 alone, in its own object dir, installed as g6m4-int4 next to the fp8 build
+    EXTRA="$K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/int4" bash build_m4.sh "${ARCH:-121a}" g6
+    mv "$OUT/int4/g6m4" "$OUT/g6m4-int4" && rm -rf "$OUT/int4"
+    strings "$OUT/g6m4-int4" | grep -q int4g32h || { echo "g6m4-int4: not the int4 build (no int4g32h row name)"; exit 1; }
+    md5sum "$OUT/g6m4-int4"
+    exit 0 ;;
+  *) echo "KV_FORMAT=$KV_FORMAT: fp8 or int4"; exit 2 ;;
 esac
 EXTRA="$K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
 if [ "${BUNDLE_LIBS:-0}" = 1 ]; then

@@ -175,6 +175,8 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
   blocks below the KV pool, so a request whose prefix the pool let go reads it back instead of prefilling it. An SSD
   store starts empty at every boot unless it has `persist=on`
   ([engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md)).
+- `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.4x the context at TP=4 (CAP 415,232 against
+  294,912) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
 - `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.

@@ -57,6 +57,9 @@ KEYS = {
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
     'CHECK': ('run', '1', '0 = skip the local checks'),
     'CAP': ('cluster', None, 'KV pool in tokens (default: what SHARE_LIMIT leaves of the default pool memory)'),
+    'KV_FORMAT': ('cluster', None, 'the KV latent row: fp8 (default, 656 B) or int4 (416 B, a Hadamard-rotated INT4 row, '
+                                   'experimental): bin/g6m4 or bin/g6m4-int4. int4 holds about 1.4x the tokens at TP=4 '
+                                   '(its own CAP default) for about 3% slower decode (docs/KV4.md)'),
     'SHARE_LIMIT': ('cluster', None, 'requests up to this many tokens (prompt + max_tokens) share decode steps; a '
                                      'longer one runs alone. Each rank holds the first SHARE_LIMIT tokens of a session'),
     'SESS': ('cluster', None, 'S2 sessions'),
@@ -335,6 +338,8 @@ def validate(o):
             raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
+    if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
+        raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
         raise OptionError(f'--kv-keep {o.get("KV_KEEP")}: want system, sessions or all')
     sa = o.get('KV_SYSTEM_AFTER')

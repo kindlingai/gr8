@@ -1,14 +1,25 @@
 # Changelog
 
-## 2026-10-12: `G6_KV4`: a 4-bit MLA latent behind a build flag (experimental, off by default)
+## 2026-10-13: `--kv-format int4`: a 4-bit KV latent, chosen at launch (experimental, off by default)
 
-- `EXTRA=-DG6_KV4=1 scripts/build.sh` caches the MLA latent as INT4 (one FP16 scale per 32 dims) after a 512-point
-  Hadamard rotation: 416 B a row instead of 656 B. The rope key stays BF16 and the indexer keys stay FP8. At the same
-  memory a TP=4 pool holds about 1.6x the tokens. [docs/KV4.md](docs/KV4.md) has the row, the kernels and the numbers.
-- `engine/attn/kvfmt.h` is now the one definition of the row: kernels, CP staging, S2 page copies, tier page blocks,
-  dumps and m4sim read it. A build without the flag compiles to the same kernel code as before.
-- `kv4_test` (`TEST=kv4_test scripts/c1_tests.sh`): the append round trip and the decode, prefill and row-owner
-  attention against a host reference, for either row. `kvman-sim --mla-row 416` models the smaller page blocks.
+- `--kv-format int4` (`KV_FORMAT=int4`) caches the MLA latent as INT4 (one FP16 scale per 32 dims) after a 512-point
+  Hadamard rotation: 416 B a row instead of 656 B. The rope key stays BF16 and the indexer keys stay FP8.
+  [docs/KV4.md](docs/KV4.md) has the row, the kernels and the numbers.
+- At TP=4 it holds about 1.4x the tokens in the same memory: its default CAP is 415,232 against 294,912. Decode is about
+  3% slower, 8K prefill about 6% faster and speculative acceptance about 2% lower. Needles at 32K-200K are found as with
+  fp8, 12/12. TP=3 and TP=6 have estimated defaults (345,088 and 857,600) until they are measured.
+- The row is fixed at build time (`-DG6_KV4=1`), so the image ships two engines per TP: `bin/g6m4` (fp8, the default,
+  unchanged) and `bin/g6m4-int4`, about 15 MB each. The launcher picks one from `KV_FORMAT`, and each refuses the other's
+  format. `KV_FORMAT=int4 ./gr8 glm53 build` builds `g6m4-int4` next to the fp8 engine.
+- A KV store's index key names the row and the engine build, so a `persist=on` store written in one format is cleared
+  by the other. KV node leases are sized by the engine's block and named `-int4` for int4.
+- `engine/attn/kvfmt.h` is the one definition of the row: kernels, CP staging, S2 page copies, store page blocks, dumps
+  and m4sim read it. `kv4_test` (`TEST=kv4_test scripts/c1_tests.sh`) checks the append round trip and the decode,
+  prefill and row-owner attention against a host reference, for either row. `kvman-sim --mla-row 416` models the
+  smaller page blocks.
+- The capacity model now counts the five buffers that grow with CAP (QO tables, tensor-core prefill states, decode
+  scratch, the MTP layer's scratch and prefill state, about 9.6 KB a token). They are why int4's gain is 1.4x, not
+  656/416.
 
 ## 2026-10-12: the engine inserts tokens (`generate` `insert`), and the thinking budget uses it
 

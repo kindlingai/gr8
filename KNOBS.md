@@ -35,6 +35,7 @@ manifest instead.
 | variable | TP=4 | TP=6 | TP=3 | meaning |
 |---|---|---|---|---|
 | `CAP` | 294912 | 614400 | 241600 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory. Unset, it follows `SHARE_LIMIT`: each rank keeps the same KV memory (1,920 pages of 64 tokens at TP=4, 2,026 at TP=6, 1,941 at TP=3) |
+| `KV_FORMAT` | fp8 | fp8 | fp8 | experimental. The KV latent row: `fp8` (656 B) or `int4` (416 B, INT4 after a Hadamard rotation). `int4` runs `bin/g6m4-int4` (in the image; `KV_FORMAT=int4 ./gr8 glm53 build` builds it), and its default `CAP` keeps fp8's memory a rank: 415,232 at TP=4 (2,390 pages a rank, measured), 345,088 at TP=3 and 857,600 at TP=6 (estimates). At TP=4 it decodes about 3% slower and prefills about 6% faster, and finds the same needles. `docs/KV4.md` |
 | `SHARE_LIMIT` | 65536 | 32768 | 65536 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 32768 gives `CAP` 393216. A power of two from 4096 |
 | `SESS` | 8 | 8 | 8 | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
 | `REUSE` | 1 | 1 | 1 | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
@@ -136,4 +137,5 @@ file is read for these keys only.
 | `BUNDLE_LIBS` | `build.sh` | 1 = copy cuBLAS into `bin/lib` for boxes without the CUDA toolkit |
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |
+| `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine when `KV_FORMAT=int4` |
 | `SHARED` | `stage.sh` | 1 = `PACK_DIR` is a shared mount at the same path on every box; each box copies its own files |

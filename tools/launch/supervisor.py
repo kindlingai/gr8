@@ -205,7 +205,7 @@ def running_engines(proc='/proc'):
             cwd = os.readlink(os.path.join(proc, pid, 'cwd'))
         except OSError:
             continue
-        if b'--rank' in argv and any(os.path.basename(a) == b'g6m4' for a in argv[:2]):
+        if b'--rank' in argv and any(os.path.basename(a) in (b'g6m4', b'g6m4-int4') for a in argv[:2]):
             out.append((int(pid), cwd))
     return out
 
@@ -389,7 +389,7 @@ class Supervisor:
                 log(f'variant {self.variant.name}: about {modelset.expert_gb(self.variant.path, tp):.1f} GB of experts '
                     f'on the busiest rank at TP={tp}')
         self.tmpl = opt.engine_plan(o)
-        self.build = engine_build(self.home)
+        self.build = engine_build(self.home, engine_bin(o))
         self.offers = modelset.offers(self.ms, self.tmpl) if self.ms else []
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
@@ -513,7 +513,8 @@ class Supervisor:
         if o.get('CHECK') == '0':
             return fails
         if self.build == 'missing':
-            fails.append(f'no {self.home}/bin/g6m4: ./gr8 glm53 build')
+            name = engine_bin(o)
+            fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name != 'g6m4' else '') + './gr8 glm53 build')
         if not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
@@ -628,7 +629,7 @@ class Supervisor:
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
         env = self.engine_env(plan)
-        argv = ['./bin/g6m4', '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
+        argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
         if o.get('SHAPE') == 'ring':
             argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
@@ -817,13 +818,19 @@ class Supervisor:
             s.shutdown()
 
 
-def engine_build(home):
-    """sha256 over bin/g6m4 and every file in bin/lib (the bundled cuBLAS), or 'missing'."""
+def engine_bin(o):
+    """The engine binary under bin/ for KV_FORMAT: g6m4 (the fp8 KV row) or g6m4-int4 (docs/KV4.md)."""
+    return 'g6m4-int4' if o.get('KV_FORMAT') == 'int4' else 'g6m4'
+
+
+def engine_build(home, name='g6m4'):
+    """sha256 over bin/NAME (the engine for this KV format) and every file in bin/lib (the bundled cuBLAS), or
+    'missing'."""
     b = os.path.join(home, 'bin')
-    if not os.path.isfile(os.path.join(b, 'g6m4')):
+    if not os.path.isfile(os.path.join(b, name)):
         return 'missing'
     lib = os.path.join(b, 'lib')
-    names = ['g6m4'] + sorted(os.path.join('lib', n) for n in os.listdir(lib)) if os.path.isdir(lib) else ['g6m4']
+    names = [name] + sorted(os.path.join('lib', n) for n in os.listdir(lib)) if os.path.isdir(lib) else [name]
     h = hashlib.sha256()
     for n in names:
         if os.path.isfile(os.path.join(b, n)):

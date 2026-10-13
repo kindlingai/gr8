@@ -22,7 +22,8 @@
 #   ./gr8 glm53 prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part without booting
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
-#   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh for this TP (G6_NR=4 at TP=4) and scripts/build_front.sh
+#   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh for this TP (G6_NR=4 at TP=4) and scripts/build_front.sh; with
+#                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
 #   ./gr8 glm53 stage [PACK_DIR]      scripts/stage.sh bin/ PACK_DIR, and the head's front end venv if it is missing
 #   ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]   scripts/build_packs.sh, at TP=4 the drafter packs, and
 #                                     the tokenizer files in OUT_DIR/tokenizer
@@ -288,12 +289,16 @@ case $cmd in
       [ -n "$TP" ] || { echo "build: say which build: TP=4 ./gr8 glm53 build (or 6, 3)" >&2; exit 2; }
     fi
     out=${1:-$REPO/bin}
+    [ -n "${KV_FORMAT:-}" ] || KV_FORMAT=$(python3 "$REPO/tools/launch/launch.py" get KV_FORMAT 2> /dev/null) || KV_FORMAT=""
     case $TP in
-      4) G6_NR=4 "$SCRIPTS/build.sh" "$out" ;;
-      6) "$SCRIPTS/build.sh" "$out" ;;
-      3) G6_NR=3 "$SCRIPTS/build.sh" "$out" ;;
+      4) nr=4 ;;
+      6) nr="" ;;   # build.sh's default (6), as the image builds it
+      3) nr=3 ;;
       *) echo "build: TP=$TP; want 4, 6 or 3" >&2; exit 2 ;;
     esac
+    env ${nr:+G6_NR=$nr} KV_FORMAT=fp8 "$SCRIPTS/build.sh" "$out"
+    # the int4 KV engine (--kv-format int4) only when asked: it is a second full g6m4 build
+    if [ "$KV_FORMAT" = int4 ]; then env ${nr:+G6_NR=$nr} KV_FORMAT=int4 "$SCRIPTS/build.sh" "$out"; fi
     exec "$SCRIPTS/build_front.sh" "$out" ;;
   stage)
     config

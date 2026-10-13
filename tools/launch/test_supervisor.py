@@ -180,6 +180,19 @@ class EngineTests(unittest.TestCase):
             f.write('two')
         self.assertEqual(len({a, b, S.engine_build(home)}), 3)
 
+    def test_the_kv_format_picks_the_engine(self):
+        home = tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, 'bin'))
+        with open(os.path.join(home, 'bin', 'g6m4'), 'w') as f:
+            f.write('fp8')
+        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], {})
+        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'int4'], {})
+        self.assertEqual((S.engine_bin(o8), S.engine_bin(o4)), ('g6m4', 'g6m4-int4'))
+        self.assertEqual(S.engine_build(home, S.engine_bin(o4)), 'missing', 'an fp8-only bin/ cannot run int4')
+        with open(os.path.join(home, 'bin', 'g6m4-int4'), 'w') as f:
+            f.write('int4')
+        self.assertNotEqual(S.engine_build(home, 'g6m4-int4'), S.engine_build(home, 'g6m4'))
+
 
 class PidFileTests(unittest.TestCase):
     """out/g6m4.pid, shim.pid and front.pid outlive their processes; a number taken later is not ours."""

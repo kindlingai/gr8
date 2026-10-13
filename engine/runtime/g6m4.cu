@@ -140,6 +140,7 @@ int main(int argc, char** argv)
     std::string kv_keep;                // --kv-keep system|sessions|all
     int kv_system_after = 2;            // --kv-system-after
     double kv_write_limit = 0;          // --kv-write-limit F
+    std::string kv_format;              // --kv-format fp8|int4: which latent row this binary was built for (refused otherwise)
     bool kv_old = false, kv_old_all = false;   // a deprecated --kv-tier, and whether one kept evicted runs
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
     int s2port = 0, s2sess = 8;
@@ -191,6 +192,7 @@ int main(int argc, char** argv)
         else if (a == "--kv-keep") kv_keep = next();
         else if (a == "--kv-system-after") kv_system_after = atoi(next().c_str());
         else if (a == "--kv-write-limit") kv_write_limit = atof(next().c_str());
+        else if (a == "--kv-format") kv_format = next();
         else if (a == "--kv-tier")
         {
             const std::string v = next();
@@ -279,6 +281,20 @@ int main(int argc, char** argv)
     if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep system, sessions or all");
     if (kv_system_after < 1) die("--kv-system-after N: N >= 1");
     if (!(kv_write_limit >= 0) || kv_write_limit > 1000) die("--kv-write-limit F: 0 (off) to 1000 blocks per page computed");
+    {   // the KV row is fixed at build time (attn/kvfmt.h): the launcher runs bin/g6m4 for fp8 and bin/g6m4-int4 for int4,
+        // and each binary refuses the other's format. The int4 build needs the flag, so it never starts by accident.
+#if defined(G6_KV4) && G6_KV4
+        const std::string built = "int4";
+#else
+        const std::string built = "fp8";
+#endif
+        if (kv_format.empty() && built == "int4") die("this engine is the int4 KV build (bin/g6m4-int4): it needs --kv-format int4");
+        if (kv_format.empty()) kv_format = built;
+        if (kv_format != "fp8" && kv_format != "int4") die("--kv-format fp8 or int4");
+        if (kv_format != built)
+            die("--kv-format " + kv_format + ": this engine is the " + built + " build (bin/g6m4 is fp8, bin/g6m4-int4 is int4)");
+        if (cfg.rank == 0) fprintf(stderr, "# rank 0: KV format %s (latent row %d B, %s)\n", kv_format.c_str(), g6kv::ROW, g6kv::NAME);
+    }
     if (reuse_prefix && dfl && !s2mode) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
@@ -770,7 +786,9 @@ int main(int argc, char** argv)
             for (const G6AttnBinding* b : bs) nidx += b->args.index_cache != nullptr;
             char host[64] = "host";
             gethostname(host, sizeof host - 1);
-            const std::string name = std::string("g6m4-") + host + "-" + std::to_string(s2epoch) + "-r" + std::to_string(R);
+            // the lease name on a KV node carries the format (its blocks are sized by it)
+            const std::string name = std::string("g6m4-") + host + "-" + std::to_string(s2epoch) + "-r" + std::to_string(R) +
+                                     (kv_format == "fp8" ? "" : "-" + kv_format);
             try
             {
                 kvt.reset(new g6s2::KvTiers(bs));
