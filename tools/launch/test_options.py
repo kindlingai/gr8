@@ -319,6 +319,24 @@ class CanonicalTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError):
             self.digest(*rel, '--kvb', 'int4')
 
+    def test_a_layout_counts_by_its_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b, c = (os.path.join(d, n) for n in ('a.json', 'b.json', 'c.json'))
+            for p, t in ((a, '{"x": 1}'), (b, '{"x": 1}'), (c, '{"x": 2}')):
+                with open(p, 'w') as f:
+                    f.write(t)
+            rel = ('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel')
+            _, text, da = self.digest(*rel, '--layout', a)
+            self.assertIn('--v2-dense @V2_DENSE --layout @LAYOUT', text)
+            self.assertNotIn(d, text)
+            self.assertEqual(da, self.digest(*rel, '--layout', b)[2])      # another path, the same file
+            self.assertNotEqual(da, self.digest(*rel, '--layout', c)[2])
+            self.assertNotEqual(da, self.digest(*rel)[2])
+            with self.assertRaises(opt.OptionError):
+                self.digest(*rel, '--layout', os.path.join(d, 'none.json'))
+            with self.assertRaises(opt.OptionError):
+                self.digest('--model', 'https://huggingface.co/org/repo', '--layout', a)
+
     def test_tp3_is_s2_without_drafter(self):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})
         opt.validate(o)

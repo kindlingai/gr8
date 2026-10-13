@@ -16,14 +16,17 @@
 //!     rounded: MXFP8 (q_b, and every prefill copy) and int4 g32 decode records (o_proj, dense MLP) of the decoded weight
 //!   rounded, either way: lm_head (MXFP8 decode record); the prefill copies of int4 q_b / o_proj (MXFP8)
 //! The rounding is round to nearest (src/records.rs). The planner returns a table of which matrix took which form.
-//! Sharding follows tools/convert/plan.py: heads and dense channels rotate by layer, vocab rows do not.
+//! Sharding follows a layout (src/layout.rs), by default the formulas of tools/convert/plan.py: heads and dense
+//! channels rotate by layer, vocab rows do not. A rank's heads and dense blocks need not be contiguous: each tensor
+//! holds them in ascending order.
 
 use crate::exlr8::{self, bf16_bits, Matrix, StFile, FP8_BLOCK, INT4, MXFP8, TRELLIS};
 use crate::json::Json;
+use crate::layout::{Group, Layout, Model};
 use crate::plan::{Gen, Op, Plan};
 use crate::records;
-use crate::v2plan::{self, Builder, V2Image};
-use std::collections::BTreeMap;
+use crate::v2plan::{self, Builder, Slices, V2Image};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -34,45 +37,61 @@ const H: usize = 6144;
 const L_MTP: usize = 78;
 const VOCAB: usize = 154880;
 
-/// Units over nr ranks, the larger chunks first (engine/g6nr.h, tools/convert/plan.py widths).
-fn widths(n: usize, nr: usize) -> Vec<usize> {
-    (0..nr).map(|j| n / nr + usize::from(j < n % nr)).collect()
-}
-
-/// (start, count) of rank r's chunk when rank order starts at `off` (plan.py _chunks).
-fn chunk(w: &[usize], off: usize, r: usize) -> (usize, usize) {
-    let nr = w.len();
-    let j = (r + nr - off % nr) % nr;
-    (w[..j].iter().sum(), w[j])
-}
-
-/// Rank r's ownership at TP nr (plan.py heads, dense_groups, vocab_rows).
-pub struct Shard {
-    pub nr: usize,
-    pub rank: usize,
-}
-
-impl Shard {
-    pub fn new(nr: usize, rank: usize) -> Result<Shard, String> {
-        if !(nr == 3 || nr == 5 || nr == 6 || (nr > 0 && 64 % nr == 0)) || rank >= nr {
-            return Err(format!("TP {nr} rank {rank}: gr8 builds TP 3, 5, 6 or a divisor of 64"));
+/// Runs of consecutive pieces as channel ranges, `unit` channels a piece: [0, 1, 2, 9] x 256 is 0..768, 2304..2560.
+fn runs(pieces: &[usize], unit: usize) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for &p in pieces {
+        match out.last_mut() {
+            Some(r) if r.end == p * unit => r.end += unit,
+            _ => out.push(p * unit..(p + 1) * unit),
         }
-        Ok(Shard { nr, rank })
     }
-    /// (first head, heads) of layer l
-    pub fn heads(&self, l: usize) -> (usize, usize) {
-        chunk(&widths(64, self.nr), l, self.rank)
+    out
+}
+
+fn total(runs: &[Range<usize>]) -> usize {
+    runs.iter().map(Range::len).sum()
+}
+
+/// Blocks of the same rows, side by side: each block's rows are its length / `rows` wide.
+fn cat_cols<T: Copy>(mut parts: Vec<Vec<T>>, rows: usize) -> Vec<T> {
+    if parts.len() == 1 {
+        return parts.pop().unwrap();
     }
-    /// dense MLP channels of layer l, whole 128-channel blocks of the release (96 blocks; at TP 3/4/6/8 the same
-    /// ranges as 384 g32 groups)
-    pub fn dense(&self, l: usize) -> Range<usize> {
-        let (a, n) = chunk(&widths(96, self.nr), l, self.rank);
-        a * 128..(a + n) * 128
+    let mut o = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for i in 0..rows {
+        for p in &parts {
+            let w = p.len() / rows;
+            o.extend_from_slice(&p[i * w..(i + 1) * w]);
+        }
     }
-    pub fn vocab(&self) -> Range<usize> {
-        let (a, n) = chunk(&widths(1210, self.nr), 0, self.rank);
-        a * 128..(a + n) * 128
+    o
+}
+
+fn cat_rows<T: Copy>(mut parts: Vec<Vec<T>>) -> Vec<T> {
+    if parts.len() == 1 { parts.pop().unwrap() } else { parts.concat() }
+}
+
+/// decode_par of the rows `rows` x the columns `cols`, each given as runs: row runs one after another, column runs
+/// side by side.
+fn decode_runs(m: &Matrix, rows: &[Range<usize>], cols: &[Range<usize>], t: usize) -> Result<Vec<f32>, String> {
+    let mut out = Vec::new();
+    for r in rows {
+        let parts = cols.iter().map(|c| exlr8::decode_par(m, r.clone(), c.clone(), t)).collect::<Result<Vec<_>, _>>()?;
+        out.push(cat_cols(parts, r.len()));
     }
+    Ok(cat_rows(out))
+}
+
+/// Matrix::int4 over runs of rows and columns, as decode_runs.
+fn int4_runs(m: &Matrix, rows: &[Range<usize>], cols: &[Range<usize>]) -> Result<(Vec<u8>, Vec<u16>), String> {
+    let (mut q, mut s) = (Vec::new(), Vec::new());
+    for r in rows {
+        let (qs, ss): (Vec<_>, Vec<_>) = cols.iter().map(|c| m.int4(r, c)).collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
+        q.push(cat_cols(qs, r.len()));
+        s.push(cat_cols(ss, r.len()));
+    }
+    Ok((cat_rows(q), cat_rows(s)))
 }
 
 fn le16(v: &[u16]) -> Vec<u8> {
@@ -108,9 +127,10 @@ fn fmt_name(m: &Matrix) -> String {
     }
 }
 
-struct Planner {
+struct Planner<'a> {
     b: Builder,
-    shard: Shard,
+    layout: &'a Layout,
+    rank: usize,
     threads: usize,
     forms: BTreeMap<Form, Vec<usize>>,
     /// add every layer's full-head q_b / o_proj / UK / UV (G6_PF_OWN=3)
@@ -129,21 +149,40 @@ fn nbytes(dtype: &str, shape: &[i64]) -> u64 {
     shape.iter().product::<i64>() as u64 * e
 }
 
-impl Planner {
+impl Planner<'_> {
     fn note(&mut self, l: usize, f: Form) {
         self.forms.entry(f).or_default().push(l);
     }
 
+    /// The pieces of `g` this rank holds as (first, count), for GLM-5.3-Flash's planner (flash.rs), which reads one
+    /// contiguous chunk a rank as the formulas give it.
+    fn chunk(&self, g: Group) -> Result<(usize, usize), String> {
+        match runs(&self.layout.held(g, self.rank)?, 1).as_slice() {
+            [r] => Ok((r.start, r.len())),
+            _ => Err(format!("{g}: GLM-5.3-Flash plans only layouts whose pieces are contiguous, as the formulas' are")),
+        }
+    }
+
     /// A tensor copied from a file range.
     fn copy(&mut self, name: String, dtype: &'static str, shape: Vec<i64>, f: &StFile, t: &str, off: u64) -> Result<(), String> {
+        let n = nbytes(dtype, &shape);
+        self.copy_runs(name, dtype, shape, f, t, &[(off, n)])
+    }
+
+    /// A tensor copied from ranges of file tensor `t`, one after another: (offset in t, bytes).
+    fn copy_runs(&mut self, name: String, dtype: &'static str, shape: Vec<i64>, f: &StFile, t: &str, runs: &[(u64, u64)])
+                 -> Result<(), String> {
         let i = f.info(t)?;
         let n = nbytes(dtype, &shape);
-        if i.start + off + n > i.end {
+        if runs.iter().map(|r| r.1).sum::<u64>() != n || runs.iter().any(|&(o, k)| i.start + o + k > i.end) {
             return Err(format!("{}: {t} is smaller than {name}", f.path));
         }
-        let o = self.b.begin(name, dtype, shape, n, None);
+        let mut o = self.b.begin(name, dtype, shape, n, None);
         let fi = self.b.file(f.path.clone());
-        self.b.seg(o, n, Op::Copy, fi, i.start + off);
+        for &(off, k) in runs {
+            self.b.seg(o, k, Op::Copy, fi, i.start + off);
+            o += k;
+        }
         Ok(())
     }
 
@@ -253,7 +292,8 @@ impl Planner {
         let f = Arc::new(StFile::open(&exlr8::dense_path(dir, Some(l)))?);
         let p = format!("L{l:03}");
         let mtp = l == L_MTP;
-        let (h0, nh) = self.shard.heads(l);
+        let heads = self.layout.held(Group::Heads(l), self.rank)?;
+        let nh = heads.len();
         let t = self.threads;
         self.vector(format!("{p}.attn_norm"), &f, "input_layernorm.weight")?;
         // q_a has only its MXFP8 record. Decode reads it as the MTP layer always did
@@ -262,11 +302,11 @@ impl Planner {
         self.mxfp8(l, "kv_a", &format!("{p}.kv_a"), &f, "self_attn.kv_a_proj_with_mqa", false)?;
         self.vector(format!("{p}.kv_a_norm"), &f, "self_attn.kv_a_layernorm.weight")?;
 
-        // q_b: this rank's heads, output rows h0*256..
+        // q_b: this rank's heads, output rows h*256..
         let qb = Matrix::open(&f, "self_attn.q_b_proj")?;
-        let rows = h0 * 256..(h0 + nh) * 256;
+        let rows = runs(&heads, 256);
         if qb.rec.fmt == TRELLIS && self.trellis {
-            self.trellis(l, "q_b", &p, &qb, rows.clone())?;
+            self.trellis(l, "q_b", &p, &qb, &rows)?;
         } else {
             self.q_b_rounded(l, &p, &f, &qb, rows.clone());
         }
@@ -274,15 +314,20 @@ impl Planner {
         // kv_b: heads' rows of [64 x 448][512]; per head the first 192 rows are UK, the other 256 UV
         let kvb = Matrix::open(&f, "self_attn.kv_b_proj")?;
         if self.kvb_fp8 {
+            // the FP8 form takes a contiguous head range (kv_b_fp8): a planned layout's heads may not be
+            let h0 = heads[0];
+            if heads.iter().enumerate().any(|(i, &h)| h != h0 + i) {
+                return Err(format!("L{l:03}: G6_KVB=fp8 needs this rank's heads in one run; the layout gives {heads:?}"));
+            }
             self.kv_b_fp8(l, &p, &f, &kvb, h0, nh)?;
         } else {
             self.note(l, Form { what: "kv_b", src: fmt_name(&kvb), form: "BF16 (UK, UV)",
                                 exact: if kvb.rec.fmt == FP8_BLOCK { BF16_OF } else { ROUNDED } });
-            let f2 = f.clone();
+            let (f2, kv_rows) = (f.clone(), runs(&heads, 448));
             self.gen(format!("{p}.kv_b"), vec![
                 (format!("{p}.kv_b.uk"), "bf16", vec![nh as i64, 192, 512]),
                 (format!("{p}.kv_b.uv"), "bf16", vec![nh as i64, 256, 512])], move || {
-                let w = bf16v(&exlr8::decode_par(&Matrix::open(&f2, "self_attn.kv_b_proj")?, h0 * 448..(h0 + nh) * 448, 0..512, t)?);
+                let w = bf16v(&decode_runs(&Matrix::open(&f2, "self_attn.kv_b_proj")?, &kv_rows, &[0..512], t)?);
                 let (mut uk, mut uv) = (Vec::new(), Vec::new());
                 for h in 0..nh {
                     uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
@@ -294,9 +339,9 @@ impl Planner {
 
         // o_proj: this rank's heads' input columns
         let op = Matrix::open(&f, "self_attn.o_proj")?;
-        let cols = h0 * 256..(h0 + nh) * 256;
+        let cols = rows;
         if op.rec.fmt == TRELLIS && self.trellis {
-            self.trellis(l, "o_proj", &p, &op, cols)?;
+            self.trellis(l, "o_proj", &p, &op, &cols)?;
         } else {
             self.o_proj_rounded(l, &p, &f, &op, cols);
         }
@@ -314,9 +359,9 @@ impl Planner {
             self.vector(format!("{p}.router.bias"), &f, "mlp.gate.e_score_correction_bias")?;
         } else if self.trellis && ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"].iter()
             .all(|m| Matrix::open(&f, m).is_ok_and(|x| x.rec.fmt == TRELLIS)) {
-            let ch = self.shard.dense(l);
+            let ch = runs(&self.layout.held(Group::Dense(l), self.rank)?, 128);
             for (n, m) in [("dense.gate", "mlp.gate_proj"), ("dense.up", "mlp.up_proj"), ("dense.down", "mlp.down_proj")] {
-                self.trellis(l, n, &p, &Matrix::open(&f, m)?, ch.clone())?;
+                self.trellis(l, n, &p, &Matrix::open(&f, m)?, &ch)?;
             }
         } else {
             self.dense_mlp(l, &p, &f)?;
@@ -334,13 +379,13 @@ impl Planner {
     }
 
     /// q_b as MXFP8 (prefill copy + decode record) of the decoded weight. An int4 q_b also gets its exact int4 record.
-    fn q_b_rounded(&mut self, l: usize, p: &str, f: &Arc<StFile>, qb: &Matrix, rows: Range<usize>) {
+    fn q_b_rounded(&mut self, l: usize, p: &str, f: &Arc<StFile>, qb: &Matrix, rows: Vec<Range<usize>>) {
         let int4 = qb.rec.fmt == INT4;
         self.note(l, Form { what: "q_b", src: fmt_name(qb), form: "MXFP8 + decode record", exact: ROUNDED });
         if int4 {
             self.note(l, Form { what: "q_b", src: fmt_name(qb), form: "int4 g32 decode record", exact: EXACT });
         }
-        let (n, t, f2) = (rows.len(), self.threads, f.clone());
+        let (n, t, f2) = (total(&rows), self.threads, f.clone());
         let mut specs = vec![
             (format!("{p}.q_b.mx.codes"), "u8", vec![n as i64, 2048]),
             (format!("{p}.q_b.mx.scales"), "u8", vec![n as i64, 64]),
@@ -350,12 +395,12 @@ impl Planner {
         }
         self.gen(format!("{p}.q_b"), specs, move || {
             let m = Matrix::open(&f2, "self_attn.q_b_proj")?;
-            let w = exlr8::decode_par(&m, rows.clone(), 0..2048, t)?;
+            let w = decode_runs(&m, &rows, &[0..2048], t)?;
             let (c, s) = records::mxfp8_quantize(&w, 2048);
             let gv = records::mxfp8_record(&c, &s, 2048);
             let mut out = vec![c, s, gv];
             if int4 {
-                let (q, qs) = m.int4(&rows, &(0..2048))?;
+                let (q, qs) = int4_runs(&m, &rows, &[0..2048])?;
                 out.push(records::rt_record(&q, &qs, 2048));
             }
             Ok(out)
@@ -364,8 +409,8 @@ impl Planner {
 
     /// o_proj for today's kernels: decode reads an int4 record (MXFP8 in the MTP layer), prefill an MXFP8 copy. The
     /// int4 record is the release's own where o_proj is stored as int4, else rounded like the MXFP8 copy.
-    fn o_proj_rounded(&mut self, l: usize, p: &str, f: &Arc<StFile>, op: &Matrix, cols: Range<usize>) {
-        let (mtp, int4, k, t) = (l == L_MTP, op.rec.fmt == INT4, cols.len(), self.threads);
+    fn o_proj_rounded(&mut self, l: usize, p: &str, f: &Arc<StFile>, op: &Matrix, cols: Vec<Range<usize>>) {
+        let (mtp, int4, k, t) = (l == L_MTP, op.rec.fmt == INT4, total(&cols), self.threads);
             if !mtp {
                 self.note(l, Form { what: "o_proj decode", src: fmt_name(op), form: "int4 g32 decode record", exact: if int4 { EXACT } else { ROUNDED } });
             }
@@ -382,11 +427,11 @@ impl Planner {
             let f2 = f.clone();
             self.gen(format!("{p}.o_proj"), specs, move || {
                 let m = Matrix::open(&f2, "self_attn.o_proj")?;
-                let w = exlr8::decode_par(&m, 0..H, cols.clone(), t)?;
+                let w = decode_runs(&m, &[0..H], &cols, t)?;
                 let (c, s) = records::mxfp8_quantize(&w, k);
                 let mut out = Vec::new();
                 if !mtp {
-                    let (q, qs) = if int4 { m.int4(&(0..H), &cols)? } else { records::int4_quantize(&w, k) };
+                    let (q, qs) = if int4 { int4_runs(&m, &[0..H], &cols)? } else { records::int4_quantize(&w, k) };
                     out.push(records::rt_record(&q, &qs, k));
                 }
                 let gv = if mtp { Some(records::mxfp8_record(&c, &s, k)) } else { None };
@@ -398,19 +443,29 @@ impl Planner {
     }
 
     /// A trellis matrix as the dense trellis kernels read it (engine/kernels/dtr.cuh layer_mats): the rank's entries of
-    /// M.trellis as stored, `ch` on the sharded side (128-channel entries), and suh / svh sliced on that side.
-    fn trellis(&mut self, l: usize, what: &str, p: &str, m: &Matrix, ch: Range<usize>) -> Result<(), String> {
+    /// M.trellis as stored, `ch` on the sharded side (runs of 128-channel entries), and suh / svh sliced on that side.
+    fn trellis(&mut self, l: usize, what: &str, p: &str, m: &Matrix, ch: &[Range<usize>]) -> Result<(), String> {
         let r = m.rec;
         self.note(l, Form { what: match what { "q_b" => "q_b", "o_proj" => "o_proj", w if w.starts_with("dense.") => "dense MLP", _ => "KDA projection" }, src: fmt_name(m),
                             form: "trellis entries (dense trellis kernels)", exact: EXACT });
-        let ents = ch.start / 128..ch.end / 128;
-        let (off, eb) = m.trellis_entries(&ents)?;
         let t = format!("{}.trellis", m.name);
-        let rel = off - m.f.info(&t)?.start;
-        self.copy(format!("{p}.{what}.trellis"), "u8", vec![ents.len() as i64, eb as i64], m.f, &t, rel)?;
-        let (suh, svh) = if r.side == exlr8::SIDE_IN { (ch.clone(), 0..r.out) } else { (0..r.inp, ch.clone()) };
-        self.copy(format!("{p}.{what}.suh"), "f16", vec![suh.len() as i64], m.f, &format!("{}.suh", m.name), 2 * suh.start as u64)?;
-        self.copy(format!("{p}.{what}.svh"), "f16", vec![svh.len() as i64], m.f, &format!("{}.svh", m.name), 2 * svh.start as u64)
+        let start = m.f.info(&t)?.start;
+        let (mut ents, mut eb, mut n) = (Vec::new(), 0, 0);
+        for c in ch {
+            let e = c.start / 128..c.end / 128;
+            let (off, b) = m.trellis_entries(&e)?;
+            ents.push((off - start, e.len() as u64 * b));
+            (eb, n) = (b, n + e.len());
+        }
+        self.copy_runs(format!("{p}.{what}.trellis"), "u8", vec![n as i64, eb as i64], m.f, &t, &ents)?;
+        // f16 vectors: the sharded side's runs, the other side whole
+        let side = |sharded: bool, all: usize| -> Vec<(u64, u64)> {
+            if sharded { ch.iter().map(|c| (2 * c.start as u64, 2 * c.len() as u64)).collect() } else { vec![(0, 2 * all as u64)] }
+        };
+        let (suh, svh) = (side(r.side == exlr8::SIDE_IN, r.inp), side(r.side != exlr8::SIDE_IN, r.out));
+        let len = |v: &[(u64, u64)]| v.iter().map(|x| x.1 as i64 / 2).sum::<i64>();
+        self.copy_runs(format!("{p}.{what}.suh"), "f16", vec![len(&suh)], m.f, &format!("{}.suh", m.name), &suh)?;
+        self.copy_runs(format!("{p}.{what}.svh"), "f16", vec![len(&svh)], m.f, &format!("{}.svh", m.name), &svh)
     }
 
     /// kv_b of heads h0 .. h0 + nh as the release's block FP8 (#50, Opts::kvb_fp8): L.kv_b.uk / .uv hold the E4M3 bytes of
@@ -556,13 +611,13 @@ fn full_heads_make(f2: &StFile, t: usize) -> Result<Vec<Vec<u8>>, String> {
     }
 }
 
-impl Planner {
+impl Planner<'_> {
 
     /// Layers 0-2: this rank's channels of gate/up (rows) and down (columns), int4 records for decode and MXFP8
     /// copies for prefill, both rounded from the decoded weights.
     fn dense_mlp(&mut self, l: usize, p: &str, f: &Arc<StFile>) -> Result<(), String> {
-        let ch = self.shard.dense(l);
-        let i = ch.len();
+        let ch = runs(&self.layout.held(Group::Dense(l), self.rank)?, 128);
+        let i = total(&ch);
         for m in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
             let mx = Matrix::open(f, m)?;
             self.note(l, Form { what: "dense MLP", src: fmt_name(&mx), form: "int4 g32 decode records + MXFP8", exact: ROUNDED });
@@ -577,9 +632,9 @@ impl Planner {
             (format!("{p}.dense.up.mx.scales"), "u8", vec![i as i64, (H / 32) as i64]),
             (format!("{p}.dense.down.mx.codes"), "u8", vec![H as i64, i as i64]),
             (format!("{p}.dense.down.mx.scales"), "u8", vec![H as i64, (i / 32) as i64])], move || {
-            let g = exlr8::decode_par(&Matrix::open(&f2, "mlp.gate_proj")?, ch.clone(), 0..H, t)?;
-            let u = exlr8::decode_par(&Matrix::open(&f2, "mlp.up_proj")?, ch.clone(), 0..H, t)?;
-            let d = exlr8::decode_par(&Matrix::open(&f2, "mlp.down_proj")?, 0..H, ch.clone(), t)?;
+            let g = decode_runs(&Matrix::open(&f2, "mlp.gate_proj")?, &ch, &[0..H], t)?;
+            let u = decode_runs(&Matrix::open(&f2, "mlp.up_proj")?, &ch, &[0..H], t)?;
+            let d = decode_runs(&Matrix::open(&f2, "mlp.down_proj")?, &[0..H], &ch, t)?;
             let (gq, gs) = records::int4_quantize(&g, H);
             let (uq, us) = records::int4_quantize(&u, H);
             let (dq, ds) = records::int4_quantize(&d, i);
@@ -611,7 +666,9 @@ impl Planner {
         self.vector("G.final_norm".into(), &f, "norm.weight")?;
         let lm = Matrix::open(&f, "lm_head")?;
         self.note(L_MTP + 1, Form { what: "lm_head", src: fmt_name(&lm), form: "MXFP8 decode record", exact: ROUNDED });
-        let rows = self.shard.vocab();
+        // contiguous: Layout::check holds vocab tiles to the formula
+        let tiles = self.layout.held(Group::Vocab, self.rank)?;
+        let rows = tiles[0] * 128..(tiles[tiles.len() - 1] + 1) * 128;
         let n = rows.len();
         let f2 = f.clone();
         self.gen("G.lm_head".into(), vec![("G.lm_head.mx.gv".into(), "u8", vec![(n / 16) as i64, (H / 32) as i64, 528])], move || {
@@ -663,16 +720,36 @@ pub struct Opts {
 
 /// Plans rank `rank`'s image at TP `nr` from the release: dense and vocabulary files under `dense_dir` (or its
 /// dense/), experts from the width files under `v2_dir` (or its experts/) at the index slices' offsets, widths from
-/// the width manifest. Returns the image and the exactness table (markdown).
-pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, nr: usize, rank: usize, opts: Opts)
-            -> Result<(V2Image, String), String> {
-    let shard = Shard::new(nr, rank)?;
+/// the width manifest. The rank holds the pieces `layout` gives it (None: the formulas). It reads the index slices
+/// at TP `nr` of every rank whose slice lists one of its halves. Returns the image and the exactness table (markdown).
+#[allow(clippy::too_many_arguments)]
+pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, nr: usize, rank: usize,
+            layout: Option<&Layout>, opts: Opts) -> Result<(V2Image, String), String> {
     let man: Json = v2plan::width_manifest(widths_path)?;
-    let slices = v2plan::open_slices(slices_dir, nr, rank)?;
+    let pieces = Model::release(&man)?;
+    let formula;
+    let layout = match layout {
+        Some(l) => l,
+        None => {
+            formula = Layout::formula(&pieces, (0..nr).map(|r| r.to_string()).collect())?;
+            &formula
+        }
+    };
+    if layout.nr() != nr || rank >= nr {
+        return Err(format!("rank {rank} of TP {nr} with a layout of {} members", layout.nr()));
+    }
+    layout.check(&pieces)?;
+    let mut need = BTreeSet::new();
+    for (g, _) in &pieces.groups {
+        if let Group::Halves(l, e) = *g {
+            need.extend(layout.held(*g, rank)?.iter().map(|h| (16 * e + h + l) % nr));
+        }
+    }
+    let slices = Slices::open(slices_dir, nr, &need.into_iter().collect::<Vec<_>>())?;
     let wfile = |l: usize, k: u8| v2plan::width_file(v2_dir, l, k);
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(8);
-    let mut p = Planner { b: Builder::new(), shard, threads: (cores / workers).max(1), forms: BTreeMap::new(),
+    let mut p = Planner { b: Builder::new(), layout, rank, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8 };
     // the release's files name the model (their metadata); the width manifest has one format for every model
     let model = flash::model_meta(dense_dir)?;
@@ -687,7 +764,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     for l in 0..=last {
         if is_flash { flash::layer(&mut p, l, dense_dir, &model)?; } else { p.layer(l, dense_dir)?; }
         if let Some(w) = v2plan::widths(&man, l)? {
-            v2plan::v2_layer(&mut p.b, l, &w, &slices, &wfile, nr, rank)?;
+            v2plan::v2_layer(&mut p.b, l, &w, &slices, &wfile, &|e| layout.held(Group::Halves(l, e), rank))?;
             moe += 1;
         } else if l >= 3 {
             return Err(format!("{widths_path} has no widths for MoE layer {l}"));
@@ -726,45 +803,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ownership_matches_plan_py() {
-        // tools/convert/plan.py at TP4: heads 16 per rank rotating with the layer, dense 3072 channels, vocab tiles
-        // 303, 303, 302, 302
-        let s = Shard::new(4, 1).unwrap();
-        assert_eq!(s.heads(0), (16, 16));
-        assert_eq!(s.heads(1), (0, 16));
-        assert_eq!(s.heads(2), (48, 16));
-        assert_eq!(s.dense(0), 3072..6144);
-        assert_eq!(s.vocab(), 303 * 128..606 * 128);
-        // TP3: 22, 21, 21 heads. Layer 4's rank 0 holds the last group (the TP3 pack's L004 heads [43, 64])
-        let s = Shard::new(3, 0).unwrap();
-        assert_eq!(s.heads(0), (0, 22));
-        assert_eq!(s.heads(4), (43, 21));
-        assert_eq!(s.dense(0), 0..4096);
-        assert_eq!(s.vocab(), 0..51712);
-        // TP6: 11, 11, 11, 11, 10, 10
-        assert_eq!(Shard::new(6, 5).unwrap().heads(0), (54, 10));
-        // TP5: 13, 13, 13, 13, 12 heads; dense 20, 19, 19, 19, 19 blocks of 128 (rotating); vocab 242 tiles each
-        let s = Shard::new(5, 4).unwrap();
-        assert_eq!(s.heads(0), (52, 12));
-        assert_eq!(s.dense(0), 77 * 128..96 * 128);
-        for l in 0..3 {
-            let mut v: Vec<_> = (0..5).map(|r| Shard::new(5, r).unwrap().dense(l)).collect();
-            v.sort_by_key(|x| x.start);
-            assert!(v.windows(2).all(|w| w[0].end == w[1].start) && v[0].start == 0 && v[4].end == 12288);
-            assert!(v.iter().all(|x| x.start % 128 == 0 && x.len() % 128 == 0 && x.len() <= 2560));
-        }
-        assert_eq!(s.vocab(), 968 * 128..1210 * 128);
-        assert_eq!(Shard::new(5, 0).unwrap().dense(0), 0..2560);
-        for nr in [3, 4, 6, 8] {
-            for r in 0..nr {
-                for l in 0..3 {
-                    let s = Shard::new(nr, r).unwrap();
-                    let (a, n) = chunk(&widths(384, nr), l, r);
-                    assert_eq!(s.dense(l), a * 32..(a + n) * 32);
-                }
-            }
-        }
-        assert!(Shard::new(7, 0).is_err());
+    fn runs_join_consecutive_pieces() {
+        assert_eq!(runs(&[0, 1, 2, 9], 256), vec![0..768, 2304..2560]);
+        assert_eq!(runs(&[16, 17], 448), vec![7168..8064]);
+    }
+
+    #[test]
+    fn blocks_of_runs_are_the_blocks_of_the_whole() {
+        // a 4 x 6 matrix, rows 0..1 and 2..4, columns 0..2 and 4..6: the block of rows 0, 2, 3 and columns 0, 1, 4, 5
+        let w: Vec<u32> = (0..24).collect();
+        let get = |r: &Range<usize>, c: &Range<usize>| -> Vec<u32> {
+            r.clone().flat_map(|i| w[i * 6 + c.start..i * 6 + c.end].to_vec()).collect()
+        };
+        let (rows, cols) = ([0..1, 2..4], [0..2, 4..6]);
+        let out = cat_rows(rows.iter().map(|r| cat_cols(cols.iter().map(|c| get(r, c)).collect(), r.len())).collect());
+        assert_eq!(out, vec![0, 1, 4, 5, 12, 13, 16, 17, 18, 19, 22, 23]);
     }
 
     #[test]

@@ -3,12 +3,13 @@
 //! engine/ref/release_forward.py's weights follow the same forms.
 //!
 //!   g6plandump DENSE V2 SLICES WIDTHS NR RANK OUT.safetensors [--layers 0,3,78] [--globals] [--experts] [--qo]
-//!              [--rounded] [--kvb-fp8] [--sizes]
+//!              [--rounded] [--kvb-fp8] [--sizes] [--layout FILE]
 //!
 //! --layers picks the L<LLL>.* tensors to write (default none), --globals the G.* ones. Routed-expert tensors (tr3.*)
 //! are written only with --experts. --qo plans the G6_PF_OWN=3 full-head tensors too. --rounded gives the trellis
 //! matrices in today's forms (MXFP8 / int4), and without it they are the release's entries. --kvb-fp8 plans kv_b as the
-//! engine does under G6_KVB=fp8 (#50). The table of forms goes to stderr, and with --sizes
+//! engine does under G6_KVB=fp8 (#50). --layout plans the rank's pieces from a layout file (src/layout.rs) instead
+//! of the formulas. The table of forms goes to stderr, and with --sizes
 //! the image's bytes by tensor kind to stdout.
 
 use std::io::Write;
@@ -29,6 +30,7 @@ fn run() -> Result<(), String> {
     let (nr, rank, out) = (num(5)?, num(6)?, &a[7]);
     let (mut layers, mut globals, mut experts, mut qo, mut rounded, mut sizes) = (Vec::new(), false, false, false, false, false);
     let mut kvb_fp8 = false;
+    let mut layout = None;
     let mut i = 8;
     while i < a.len() {
         match a[i].as_str() {
@@ -43,12 +45,16 @@ fn run() -> Result<(), String> {
             "--rounded" => { rounded = true; i += 1; }
             "--sizes" => { sizes = true; i += 1; }
             "--kvb-fp8" => { kvb_fp8 = true; i += 1; }
+            "--layout" => {
+                layout = Some(g6load::layout::Layout::read(a.get(i + 1).ok_or("--layout FILE")?)?);
+                i += 2;
+            }
             x => return Err(format!("unknown option {x}")),
         }
     }
     let t0 = std::time::Instant::now();
     let opts = g6load::release::Opts { qo, trellis: !rounded, kvb_fp8 };
-    let (img, table) = g6load::release::plan(&a[1], &a[2], &a[3], &a[4], nr, rank, opts)?;
+    let (img, table) = g6load::release::plan(&a[1], &a[2], &a[3], &a[4], nr, rank, layout.as_ref(), opts)?;
     eprint!("{table}");
     if sizes {
         // bytes by tensor kind over the whole image: the name without its layer, or tr3.* for every expert tensor
