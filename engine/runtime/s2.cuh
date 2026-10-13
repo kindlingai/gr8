@@ -61,6 +61,7 @@ struct S2Model
     int base[S2N] = {};               // per slot, run[q][0]
     int pages[S2N] = {};              // per slot, run[q].size()
     bool exclusive[S2N] = {};         // per slot: a run past R (s2_set_exclusive), solo on the tables as built
+    bool ex_split[S2N] = {};          // per slot: that run on the pool's page classes (its own list): the solo tables are its CP map
     int* table[S2N] = {};             // [nslots] device: the slot's block table, run_pages entries, shared by every layer's view
     int* zero_list = nullptr;         // [pool_pages] device: the pages s2_reset_pages clears
     G6AttnStepCell* cells = nullptr;  // [S2N][nl] device
@@ -126,11 +127,14 @@ inline void s2_set_pages(Model& m, int q, const std::vector<int>& list)
     s.base[q] = list[0];
     s.pages[q] = (int)list.size();
     s.exclusive[q] = false;
+    s.ex_split[q] = false;
 }
 // slot q holds a run past R: S=1 only. On the pool's page classes (the run carries its own list): the layers' tables
 // become its CP map (s2_solo_cp_pages, written at its prefill and at the mode switch), the slot's own view stays
 // unused while it runs alone, and `most` (the larger of the two models' pools) bounds the list, whose draft-only
 // pages sit past the main model's. Else the run is pages 0, 1, .. on the layers' tables as built (s2_solo_built).
+// ex_split records which, so the mode switch rebuilds what bind decided (the pool's mode at the grant), not what
+// the stored list's shape suggests.
 inline void s2_set_exclusive(Model& m, int q, const std::vector<int>& list, int most)
 {
     S2Model& s = *m.s2;
@@ -140,6 +144,7 @@ inline void s2_set_exclusive(Model& m, int q, const std::vector<int>& list, int 
     s.base[q] = list.empty() ? 0 : list[0];
     s.pages[q] = (int)list.size();
     s.exclusive[q] = true;
+    s.ex_split[q] = true;
 }
 // slot q holds a run past R: S=1 only, on the layers' tables as built (s2_solo_built). Its view table is 0, 1, ..
 inline void s2_set_exclusive(Model& m, int q)
