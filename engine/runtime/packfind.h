@@ -12,6 +12,9 @@
 #include "rank.cuh"
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
+#ifdef G6_RS_LOADER
+#include "weight_check.cuh"
+#endif
 
 namespace g6rt
 {
@@ -81,7 +84,6 @@ struct V2Src
 #ifdef G6_RS_LOADER
 #include <mutex>
 #include "../loader-rs/g6load.h"
-#include "weight_check.cuh"
 
 // The Rust loader's sink: pinned staging buffers and one stream per worker into the device image. Each chunk is summed
 // in staging for the weight check (weight_check.cuh).
