@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-10-14: a notice targets the work in flight, not a constant eight boundaries
+
+- The first hardware trace of the event log says what #61's remaining delay is: the cancel anchored at boundary 8 landed
+  at 16, while the 31,984-token prompt's prefill ran boundaries 9-13. The lookahead bound — `LOOKAHEAD = 8`
+  (`s2/service.h`) — and at the cluster's line it could hardly be otherwise: a quantum at `--prefill 4096 --pf-lanes 2`
+  is 8,192 rows and R is 65,536, exactly 8 quanta, so no below-R prompt spans more than 8 prefill boundaries and a
+  notice anchored when one starts can never land inside it. The abort took 20.096 s, and the follow-up — whose admit
+  cannot anchor until the cancel commits, because events serialize — saw 20.527 s TTFT. The reading rule this record
+  carried was backwards: `N >= L` is what a lookahead larger than the remaining prefill produces (that run had `L` = 13,
+  `N` = 16), not an acquittal of the lookahead.
+- The target is now sized by the work in flight: the first boundary whose work after the one in flight covers 2,048
+  prefill rows, within `boundary + 2` and `boundary + 8` (`Scheduler::horizon`, `s2/scheduler.h`; `s2/service.h` reads
+  and clamps it). During a prefill that is the floor — the trace's cancel targets boundary 10, landing one to two
+  quanta after the abort instead of past the whole prefill, and the follow-up's admit then anchors on an engine whose
+  long prefill is gone, commits at once, and its TTFT is its own short prefill. In pure decode the target is the cap,
+  exactly the old constant's behaviour, because a decode round adds no coverage (stalls can shrink one to almost
+  nothing). The boundary in flight is not counted, since its remaining time is unknowable; tails count one row; the
+  alternation with a decoding session and a partial last quantum are accounted; and a remainder under 2,048 rows opens
+  the target to the cap, because that work is fast.
+- The margin is sound for the same reason the constant's was: each step is one TP collective, so no rank departs a
+  boundary before every rank completed it, and 2,048 prefill rows is about 1.5 s at the ~1,300 rows/s the gate measures
+  for a cold 8K prefill — an order of magnitude past the milliseconds a notice needs to reach every rank. `horizon()`
+  is a pure function of the scheduler state: it projects the same state machine `next()`/`completed()` drive, on a copy,
+  so every rank names the same boundary and the notice's digest agreement holds; the compute thread publishes it beside
+  the progress boundary, horizon first, so a torn read of the pair can only widen the target.
+- `next()` is unchanged: its selection moved verbatim to `Scheduler::plan`, which `horizon()` also drives, and
+  `scheduler_fair_test` still passes bit-for-bit, so m4sim's batch and every quantum the fair prefill serves are
+  untouched. New `scheduler_horizon_test` (host, `scripts/host_tests.sh`) pins the rule: pure decode keeps the cap,
+  #61's 31,990-token prompt targets the floor and opens to the cap when only its tail remains, the alternation and the
+  partial quantum are counted, a 2,048-row quantum covers exactly, and a randomized run checks the clamp, re-derives the
+  target through `plan()` at every boundary, and confirms two schedulers driven by the same events name the same one.
+- `docs/EVENT-LATENCY.md` is rewritten to the rule and carries two corrections: the reading rule above, and the
+  discrimination run — do not grow the prompt to 64K (that crosses R, where the run is exclusive and the follow-up is
+  refused, so abort and TTFT stop measuring the same thing); shrink the quantum instead (`--prefill 2048 --pf-lanes 1`,
+  where every notice lands mid-prefill).
+
 ## 2026-10-14: the event boundaries are logged, so a cancel's delay can be attributed
 
 - #61's ~24 s has two candidate mechanisms that need different fixes: the scheduler served one prefill at a time and
