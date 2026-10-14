@@ -902,7 +902,8 @@ static int time_v2(int reps)
     return 0;
 }
 
-// --ab [reps]: K1 (launch_k1 as the engine binds it: fuse = 1 through make_k1's policy) against K2x (k2x.cuh) on the same
+// --ab [reps]: K1 (make_k1 with fuse = 1 through its own policy, split_m = 0: the M-row split, as --time-v2; an S2 step binds
+// split_m = the session row class) against K2x (k2x.cuh) on the same
 // exlr8 v2 layers, M = 1, 3, 5, 8, 20 (and 32 when G6_MX allows). Same routing per call for both (64 token sets of random
 // logits, a new set per call), the router's own time subtracted, NLAY layer copies used in turn so no call finds the
 // previous one's experts in L2. Prints per M: K1 time, then each K2x config (R = fc1 rows per item, OB = fc2 output
@@ -931,7 +932,7 @@ static int ab_mode(int reps, int k2)
     fill_f32(lg, static_cast<size_t>(NSET) * G6_MX * 256, 0.5f, 77u);
     printf("A/B K1 vs K2x, exlr8 v2 layer k2=%d, %d reps, TP%d (EB=%d)\n", k2, reps, g6nr::NR, g6nr::EB);
     struct Cfg { int R, OB, f16; };
-    const Cfg cfgs[] = {{16, 2, 0}, {16, 3, 0}, {16, 4, 0}, {16, 6, 0}, {32, 3, 0}, {32, 4, 0}, {16, 2, 1}, {16, 4, 1}};
+    const Cfg cfgs[] = {{16, 2, 0}, {16, 3, 0}, {16, 4, 0}, {16, 6, 0}, {32, 3, 0}, {32, 4, 0}, {64, 6, 0}, {16, 4, 1}, {16, 6, 1}};
     for (int M : {1, 3, 5, 8, 12, 16, 20, 24, 32})
     {
         if (M > G6_MX) break;
@@ -972,6 +973,15 @@ static int ab_mode(int reps, int k2)
             { printf("M=%d make_k1: %s\n", M, err); return 2; }
         const double k1us = 1000.0 * (timeit([&](int i) { bind::launch_k1(k1s[i % NLAY], ST); }) - pms) / reps;
         printf("M=%2d experts=%5.1f MB=%6.2f K1 fuse=%d     us=%7.1f GB/s=%6.1f\n", M, nex, bytes / 1e6, k1s[0].fuse, k1us, bytes / k1us / 1e3);
+        if (M > 8)      // the same K1 as an S2 step of 1-row sessions binds it (split_m = 1)
+        {
+            std::vector<bind::K1> kc(NLAY);
+            for (int l = 0; l < NLAY; ++l)
+                if (const char* err = bind::make_k1(Ts[l], M, E.sc, E.x2, E.sc.xf_x2, bind::plan_ptrs(E.dplan), E.of, 1, kc[l], sh, 1, 1))
+                { printf("M=%d make_k1 split_m=1: %s\n", M, err); return 2; }
+            const double us = 1000.0 * (timeit([&](int i) { bind::launch_k1(kc[i % NLAY], ST); }) - pms) / reps;
+            printf("M=%2d                           K1 split_m=1 fuse=%d us=%7.1f GB/s=%6.1f\n", M, kc[0].fuse, us, bytes / us / 1e3);
+        }
         // reference output on routing set 0
         plan(0);
         bind::launch_k1(k1s[0], ST);
@@ -1001,7 +1011,7 @@ static int ab_mode(int reps, int k2)
                 a.out = o2; a.out_bf16 = 1; a.R = c.R; a.OB = c.OB; a.f16rows = c.f16;
             }
             plan(0);
-            k2x::launch(as[0], ST);
+            if (const char* err = k2x::launch(as[0], ST)) { printf("M=%d k2x: %s\n", M, err); return 2; }
             CK(cudaDeviceSynchronize());
             CK(cudaGetLastError());
             CK(cudaMemcpy(r2.data(), o2, r2.size() * 2, cudaMemcpyDeviceToHost));

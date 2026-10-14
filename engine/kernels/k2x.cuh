@@ -5,13 +5,14 @@
 //   plan     one CTA counts each expert's routes with shared-memory atomics and places every (token, expert) pair into
 //            worst-case-sized grids (per-expert rows, route -> row). The other CTAs of the same launch rotate each
 //            token once: xr = f16(H128(x * tr3.sg)). On block-scale layers the per-row scale is constant over a
-//            128 block, so H128(x * sg * c) = c * H128(x * sg): fc1 applies c to the activation fragment instead.
+//            128 block, so H128(x * sg * c) = c * H128(x * sg): fc1 multiplies the fp16 fragment by c (in fp16, after
+//            the rounding; K1 rounds once, f16(H128(x * sg * c))).
 //   fc1      work item = one expert x one R-row block of its intermediate (R = 16, 32 or 64), gate and up, full K.
 //            Trellis tiles decode into registers as the mma B operand (the tokens are the A operand, 16 per mma), so an
 //            expert's tokens (up to 32 at G6_MX = 32) share every decoded tile. Writes f16(gate), f16(up) per row.
 //   fc2      work item = one expert x OB blocks of 128 output columns. Prologue as K1's (H128, svh, silu * up, suh_d,
 //            H128); the per-block output scales are folded into the fp32 sum (sum_b c_b H(z_b) = H(sum_b c_b z_b)), one
-//            H128 per output block; each route's row is written as int8 with one fp32 scale per 128 columns (or fp16
+//            H128 per output block (K1 rounds each block's z to fp16 before its H128; K2x keeps the fp32 sum); each route's row is written as int8 with one fp32 scale per 128 columns (or fp16
 //            with f16rows = 1).
 //   combine  out[m] = sum_k w[m][k] row(m, k) + shared row(m), fp32, fixed order, written as BF16 (or fp16).
 // Every grid is sized for the worst case of M rows (CTAs past the plan's experts exit), so the step can be captured in
@@ -25,6 +26,7 @@ namespace k2x
 constexpr int NE = 257;                     // 256 routed experts + the trellis shared expert
 constexpr int MAXR = 9 * G6_MX;             // rows: 8 routes + the shared expert per token
 constexpr int EBW = g6nr::EB * 128;         // intermediate columns per expert on a rank
+static_assert(G6_MX <= 32, "k2x: at most 32 rows per expert (two 16-row mma tiles, the 32-row fc2 stage)");
 
 struct Plan
 {
@@ -523,12 +525,17 @@ __global__ void __launch_bounds__(256) k_combine(Args A)
 inline cudaError_t init() { return cudaFuncSetAttribute(k_fc2, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(FC2_SMEM)); }
 
 inline int max_experts(int M) { return (8 * M < 256 ? 8 * M : 256) + 1; }
-inline void launch(const Args& A, cudaStream_t st)
+// R: 16, 32 or 64 rows of the intermediate per fc1 item; OB: a divisor of 48. nullptr = launched.
+inline const char* launch(const Args& A, cudaStream_t st)
 {
     const int M = A.M, nx = max_experts(M);
+    if (M < 1 || M > G6_MX) return "k2x: M outside 1..G6_MX";
+    if (A.R != 16 && A.R != 32 && A.R != 64) return "k2x: R must be 16, 32 or 64";
+    if (A.OB < 1 || (HID / 128) % A.OB) return "k2x: OB must divide 48";
     k_plan_rot<<<1 + (M * 48 + 7) / 8, 256, 0, st>>>(A);
     k_fc1<<<nx * (EBW / A.R), 256, 0, st>>>(A);
     k_fc2<<<nx * ((HID / 128) / A.OB), 256, FC2_SMEM, st>>>(A);
     k_combine<<<(M * 48 + 7) / 8, 256, 0, st>>>(A);
+    return nullptr;
 }
 } // namespace k2x
