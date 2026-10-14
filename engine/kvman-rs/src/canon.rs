@@ -324,7 +324,9 @@ pub fn import(
         for lp in span.clone() {
             match t[lp] {
                 REMOTE => continue,
-                NONE => return Err(Error::Bad("no page for a row this rank holds (the list is too short below place)")),
+                NONE => {
+                    return Err(Error::Bad("no page for a row this rank holds (the list is too short below place)"))
+                }
                 _ => {}
             }
             let p = t[lp] as usize;
