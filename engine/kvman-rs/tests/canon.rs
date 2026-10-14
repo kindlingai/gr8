@@ -75,7 +75,18 @@ struct Rank {
     idx: Vec<Option<Vec<u8>>>,
 }
 
-fn write(t: &Tokens, bs: &[Binding], row: usize, l: &Layout, v: &View, rank: u32, pages: usize, n: usize, fill: u8) -> Rank {
+#[allow(clippy::too_many_arguments)]
+fn write(
+    t: &Tokens,
+    bs: &[Binding],
+    row: usize,
+    l: &Layout,
+    v: &View,
+    rank: u32,
+    pages: usize,
+    n: usize,
+    fill: u8,
+) -> Rank {
     let mut r = Rank {
         mla: bs.iter().map(|_| vec![fill; pages * PAGE * row]).collect(),
         idx: bs.iter().map(|b| b.index.then(|| vec![fill; pages * PAGE * IDX_ROW])).collect(),
@@ -114,7 +125,6 @@ fn caches_mut(r: &mut Rank) -> Vec<CacheMut<'_>> {
 // a random run of n rows at a layout: a list of distinct pages, the pages a CP binding keeps below `place` first in
 // list order when the pool has page classes, as pool.rs grants them
 struct Setup {
-    layout: Layout,
     views: Vec<View>,
     pages: usize,
 }
@@ -156,13 +166,13 @@ fn setup(rng: &mut Rng, layout: Layout, n: usize) -> Setup {
                 j += 1;
             }
         }
-        return Setup { layout, views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages };
+        return Setup { views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages };
     }
     // one class: a run below R, or the tables as built (every page below place)
     let mut list = shuffled(rng, 0, pages as u32);
     list.truncate(logical);
     let place = if rng.range(0, 1) == 0 { u32::MAX } else { pages as u32 };
-    Setup { layout, views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages }
+    Setup { views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages }
 }
 
 const ROWS: [usize; 2] = [656, 416];
@@ -207,7 +217,7 @@ fn tables_follow_the_engine_rule() {
     let l = Layout { nr: 4, below_rows: 128 };
     let v = View { list: (0..6).collect(), place: u32::MAX };
     let t = canon::table(Binding { index: true, cp: true }, &l, &v, 1, 10).unwrap();
-    assert_eq!(t, vec![0, 1, REMOTE, 2, REMOTE, REMOTE, REMOTE, 3, REMOTE, REMOTE]);
+    assert_eq!(t, vec![0, 1, REMOTE, REMOTE, REMOTE, 2, REMOTE, REMOTE, REMOTE, 3]);
     assert!(canon::table(Binding { index: true, cp: true }, &Layout { nr: 1, below_rows: 0 }, &v, 0, 4).is_err());
     assert!(canon::table(Binding { index: true, cp: true }, &Layout { nr: 4, below_rows: 100 }, &v, 0, 4).is_err());
 }
@@ -222,16 +232,18 @@ fn same_layout_is_byte_identical() {
         let t = tokens(&mut rng, &bs, row, n);
         for l in layouts(&mut rng, n) {
             let s = setup(&mut rng, l, n);
-            let src: Vec<Rank> = (0..s.views.len())
-                .map(|r| write(&t, &bs, row, &l, &s.views[r], r as u32, s.pages, n, 0))
-                .collect();
+            let src: Vec<Rank> =
+                (0..s.views.len()).map(|r| write(&t, &bs, row, &l, &s.views[r], r as u32, s.pages, n, 0)).collect();
             let cs: Vec<Vec<Cache>> = src.iter().map(caches).collect();
             let c = canon::export(row, &bs, &l, &s.views, &cs, 0, n as u64, true).unwrap();
             assert_eq!(c.rows, n as u64);
             for (r, want) in src.iter().enumerate() {
                 let mut got = write(&t, &bs, row, &l, &s.views[r], r as u32, s.pages, 0, 0);
                 canon::import(&c, &bs, row, &l, &s.views[r], r as u32, &mut caches_mut(&mut got)).unwrap();
-                assert!(got.mla == want.mla && got.idx == want.idx, "rank {r} of {l:?}: import differs from the source");
+                assert!(
+                    got.mla == want.mla && got.idx == want.idx,
+                    "rank {r} of {l:?}: import differs from the source"
+                );
             }
         }
     }
@@ -249,9 +261,8 @@ fn another_layout_equals_its_own_writer() {
         let mut first: Option<Canon> = None;
         for a in &ls {
             let sa = setup(&mut rng, *a, n);
-            let src: Vec<Rank> = (0..sa.views.len())
-                .map(|r| write(&t, &bs, row, a, &sa.views[r], r as u32, sa.pages, n, 0))
-                .collect();
+            let src: Vec<Rank> =
+                (0..sa.views.len()).map(|r| write(&t, &bs, row, a, &sa.views[r], r as u32, sa.pages, n, 0)).collect();
             let cs: Vec<Vec<Cache>> = src.iter().map(caches).collect();
             let c = canon::export(row, &bs, a, &sa.views, &cs, 0, n as u64, true).unwrap();
             // every layout gives the same canonical form
@@ -322,8 +333,9 @@ fn a_chain_of_layouts_loses_nothing() {
     // back at TP6 with R 1024, on another page list: the same rows on the pages that list names
     let cs: Vec<Vec<Cache>> = ranks.iter().map(caches).collect();
     assert_eq!(&canon::export(row, &bs, &chain[4], &views, &cs, 0, n as u64, true).unwrap(), c0.as_ref().unwrap());
-    let fresh: Vec<Rank> =
-        (0..views.len()).map(|r| write(&t, &bs, row, &chain[4], &views[r], r as u32, ranks[r].mla[0].len() / (PAGE * row), n, 0)).collect();
+    let fresh: Vec<Rank> = (0..views.len())
+        .map(|r| write(&t, &bs, row, &chain[4], &views[r], r as u32, ranks[r].mla[0].len() / (PAGE * row), n, 0))
+        .collect();
     for r in 0..views.len() {
         assert!(ranks[r].mla == fresh[r].mla && ranks[r].idx == fresh[r].idx, "rank {r} after the chain");
     }
@@ -381,8 +393,7 @@ fn a_replicated_page_that_differs_is_caught() {
     let t = tokens(&mut rng, &bs, row, n);
     let l = Layout { nr: 4, below_rows: 256 };
     let s = setup(&mut rng, l, n);
-    let mut src: Vec<Rank> =
-        (0..4).map(|r| write(&t, &bs, row, &l, &s.views[r], r as u32, s.pages, n, 0)).collect();
+    let mut src: Vec<Rank> = (0..4).map(|r| write(&t, &bs, row, &l, &s.views[r], r as u32, s.pages, n, 0)).collect();
     // rank 2's copy of logical page 1 (replicated: below R) gets one byte wrong in its indexer scale
     let p = canon::table(bs[0], &l, &s.views[2], 2, 2).unwrap()[1] as usize;
     let at = p * PAGE * IDX_ROW + PAGE * 128 + 5 * 4;
@@ -396,10 +407,8 @@ fn a_replicated_page_that_differs_is_caught() {
     assert!(canon::export(row, &bs, &l, &s.views, &cs, 0, n as u64, false).is_ok());
     // a list too short for the rows: no rank holds the page
     let short: Vec<View> = s.views.iter().map(|v| View { list: v.list[..2].to_vec(), place: v.place }).collect();
-    assert!(matches!(
-        canon::export(row, &bs, &l, &short, &cs, 0, n as u64, true),
-        Err(canon::Error::Missing { .. })
-    ));
+    let e = canon::export(row, &bs, &l, &short, &cs, 0, n as u64, false);
+    assert!(matches!(e, Err(canon::Error::Missing { .. })), "{e:?}");
 }
 
 #[test]

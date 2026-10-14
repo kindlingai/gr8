@@ -52,7 +52,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Bad(w) => write!(f, "canonical state: {w}"),
-            Error::Missing { binding, page } => write!(f, "canonical state: binding {binding} page {page} held by no rank"),
+            Error::Missing { binding, page } => {
+                write!(f, "canonical state: binding {binding} page {page} held by no rank")
+            }
             Error::Disagree { binding, page, rank } => {
                 write!(f, "canonical state: binding {binding} page {page} differs on rank {rank} from rank 0")
             }
@@ -83,7 +85,7 @@ impl Layout {
         if self.nr == 1 || self.nr > 64 {
             return Err(Error::Bad("CP ranks must be 0 or 2..64"));
         }
-        if self.below_rows as usize % PAGE != 0 {
+        if !(self.below_rows as usize).is_multiple_of(PAGE) {
             return Err(Error::Bad("R must be a multiple of 64 rows"));
         }
         Ok(())
@@ -204,7 +206,8 @@ pub fn export(
     let span = pages_of(first, rows);
     let mut data = Vec::with_capacity(bindings.len());
     for (bi, &b) in bindings.iter().enumerate() {
-        let mut out = Rows { mla: vec![0; rows as usize * mla_row], idx: b.index.then(|| vec![0; rows as usize * IDX_ROW]) };
+        let mut out =
+            Rows { mla: vec![0; rows as usize * mla_row], idx: b.index.then(|| vec![0; rows as usize * IDX_ROW]) };
         let mut tabs = Vec::with_capacity(ranks);
         for (r, v) in views.iter().enumerate() {
             let c = caches[r].get(bi).ok_or(Error::Bad("a cache per binding"))?;
@@ -221,7 +224,8 @@ pub fn export(
             let lo = (lp * PAGE).max(first as usize);
             let hi = ((lp + 1) * PAGE).min((first + rows) as usize);
             let c = &caches[r0][bi];
-            let mpage = c.mla.get(p0 * PAGE * mla_row..(p0 + 1) * PAGE * mla_row).ok_or(Error::Bad("page past a cache"))?;
+            let mpage =
+                c.mla.get(p0 * PAGE * mla_row..(p0 + 1) * PAGE * mla_row).ok_or(Error::Bad("page past a cache"))?;
             let ib = PAGE * IDX_ROW;
             let ipage = match c.idx {
                 Some(ix) => Some(ix.get(p0 * ib..(p0 + 1) * ib).ok_or(Error::Bad("page past an indexer cache"))?),
@@ -238,7 +242,10 @@ pub fn export(
             if check {
                 for &(r, p) in &holders[1..] {
                     let c = &caches[r][bi];
-                    let m2 = c.mla.get(p * PAGE * mla_row..(p + 1) * PAGE * mla_row).ok_or(Error::Bad("page past a cache"))?;
+                    let m2 = c
+                        .mla
+                        .get(p * PAGE * mla_row..(p + 1) * PAGE * mla_row)
+                        .ok_or(Error::Bad("page past a cache"))?;
                     let i2 = match c.idx {
                         Some(ix) => Some(ix.get(p * ib..(p + 1) * ib).ok_or(Error::Bad("page past an indexer cache"))?),
                         None => None,
