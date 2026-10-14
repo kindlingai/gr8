@@ -289,7 +289,15 @@ static void run(uint64_t seed, int T, int B, int M)
              P, NRK, g6kv::NAME);
     Pack pk[NRK][NL];
     for (int r = 0; r < NRK; ++r)
-        for (int l = 0; l < NL; ++l) pk[r][l] = make_pack(A, rng, r, LAYER[l]);
+        for (int l = 0; l < NL; ++l) {
+            pk[r][l] = make_pack(A, rng, r, LAYER[l]);
+            // the norms are replicated weights, the same on every rank (only uk / uv split by head)
+            if (r) {
+                pk[r][l].p.kv_norm = pk[0][l].p.kv_norm;
+                pk[r][l].p.index_norm = pk[0][l].p.index_norm;
+                pk[r][l].p.index_bias = pk[0][l].p.index_bias;
+            }
+        }
     const int heads[NL] = {pk[0][0].h, pk[0][1].h};
     const size_t sb = std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap, MXR, 32), g6_attn_bind_scratch_need(g6nr::HMAX, cap, MXR, 32));
     void* scr = A.alloc<char>(sb);
