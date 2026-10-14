@@ -97,8 +97,9 @@ impl Layout {
 }
 
 /// A rank's view of one run: its page list (the pool's, the same on every rank) and `place`, the bound s2_solo_cp_pages
-/// passes to s2_list_place: the main model's pool pages (S2Model::pool_pages), which is the pool's place pages because
-/// the draft model's pool is never the smaller (g6m4.cu). u32::MAX: the whole list (the tables as built).
+/// passes to s2_list_place for a CP binding: the main model's pool pages (S2Model::pool_pages). The Pool's place pages
+/// (g6m4.cu: the fewer of main and draft) equal it when the draft pool is not the smaller. u32::MAX: the whole list
+/// (the tables as built).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     pub list: Vec<u32>,
@@ -309,6 +310,9 @@ pub fn import(
     if end.div_ceil(PAGE as u64) > view.list.len() as u64 {
         return Err(Error::Bad("the run's list is shorter than the canonical rows"));
     }
+    if canon.rows == 0 {
+        return Ok(0);
+    }
     let span = pages_of(canon.first, canon.rows);
     let mut written = 0;
     for (bi, &b) in bindings.iter().enumerate() {
@@ -320,7 +324,7 @@ pub fn import(
         for lp in span.clone() {
             match t[lp] {
                 REMOTE => continue,
-                NONE => return Err(Error::Bad("the run's list is shorter than the canonical rows")),
+                NONE => return Err(Error::Bad("no page for a row this rank holds (the list is too short below place)")),
                 _ => {}
             }
             let p = t[lp] as usize;
