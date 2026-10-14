@@ -160,4 +160,22 @@ int g6kv_tier_write_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, v
 int g6kv_tier_read_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, void* const* bufs);
 // staging memory a KV node's RDMA device may read and write directly (a no-op for the other stores)
 int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
+// A session's KV in a form independent of the layout (src/canon.rs, #152): per binding and token, in order, the MLA
+// latent row and, on full-index layers, the indexer key row (128 codes, then its FP32 scale). Host memory only: the
+// caller copies the pages between the device and the buffers. flags[b]: 1 = binding b has index keys, 2 = its cache is
+// sharded past R (cp_nr > 0). nr = CP ranks (0: every page on every rank), below_rows = R. list / place: the run's page
+// list (the same on every rank) and the pool's place pages (UINT32_MAX: the whole list).
+// export: mla[r * nb + b] is rank r's MLA cache of binding b (nr ranks, or 1 without CP), idx likewise (NULL on
+// bindings without index keys). *need = the blob's size; 1 when cap is too small (nothing written), 0 = done.
+// import: one rank's caches mla[b], idx[b]; *written = rows written, summed over bindings.
+// Both return -1 on an error, with the reason in g6kv_canon_error (this thread's last).
+const char* g6kv_canon_error();
+int g6kv_canon_export(uint32_t mla_row, uint32_t nb, const uint8_t* flags, uint32_t nr, uint32_t below_rows,
+                      const uint32_t* list, size_t n_list, uint32_t place, const uint8_t* const* mla,
+                      const size_t* mla_bytes, const uint8_t* const* idx, const size_t* idx_bytes, uint64_t first,
+                      uint64_t rows, int check, uint8_t* out, size_t cap, size_t* need);
+int g6kv_canon_import(const uint8_t* blob, size_t n, uint32_t mla_row, uint32_t nb, const uint8_t* flags, uint32_t nr,
+                      uint32_t below_rows, const uint32_t* list, size_t n_list, uint32_t place, uint32_t rank,
+                      uint8_t* const* mla, const size_t* mla_bytes, uint8_t* const* idx, const size_t* idx_bytes,
+                      uint64_t* written);
 }

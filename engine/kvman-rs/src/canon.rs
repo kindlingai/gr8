@@ -435,3 +435,165 @@ pub fn heads_in(canon: &[u8], heads: usize, outer: usize, inner: usize, nr: usiz
     }
     Ok(out)
 }
+
+// ---- C interface (g6kvman.h g6kv_canon_*) ----
+
+use std::cell::RefCell;
+use std::ffi::{c_char, CString};
+
+thread_local! {
+    static LAST: RefCell<CString> = RefCell::new(CString::default());
+}
+
+fn fail(e: Error) -> i32 {
+    LAST.with(|l| *l.borrow_mut() = CString::new(e.to_string()).unwrap_or_default());
+    -1
+}
+
+/// The message of this thread's last failed g6kv_canon call.
+#[no_mangle]
+pub extern "C" fn g6kv_canon_error() -> *const c_char {
+    LAST.with(|l| l.borrow().as_ptr())
+}
+
+unsafe fn c_bindings(nb: usize, flags: *const u8) -> Option<Vec<Binding>> {
+    if nb > 0 && flags.is_null() {
+        return None;
+    }
+    Some((0..nb).map(|i| *flags.add(i)).map(|f| Binding { index: f & 1 != 0, cp: f & 2 != 0 }).collect())
+}
+
+unsafe fn c_view(list: *const u32, n: usize, place: u32) -> Option<View> {
+    if n > 0 && list.is_null() {
+        return None;
+    }
+    Some(View { list: if n == 0 { Vec::new() } else { std::slice::from_raw_parts(list, n).to_vec() }, place })
+}
+
+/// Exports rows [first, first + rows) of a run from every rank (`ranks` = nr, or 1 without CP) into `out` (the byte
+/// form, Canon::to_bytes). mla[r * nb + b] / mla_bytes: rank r's MLA cache of binding b (host memory), idx the same
+/// for indexer caches (NULL entries on bindings without index keys). flags[b]: 1 = index keys, 2 = CP. Writes the
+/// blob's size to *need; with cap < *need nothing else is written and the call returns 1. 0 = done, -1 = error
+/// (g6kv_canon_error).
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_export(
+    mla_row: u32,
+    nb: u32,
+    flags: *const u8,
+    nr: u32,
+    below_rows: u32,
+    list: *const u32,
+    n_list: usize,
+    place: u32,
+    mla: *const *const u8,
+    mla_bytes: *const usize,
+    idx: *const *const u8,
+    idx_bytes: *const usize,
+    first: u64,
+    rows: u64,
+    check: i32,
+    out: *mut u8,
+    cap: usize,
+    need: *mut usize,
+) -> i32 {
+    let (Some(bs), Some(v)) = (c_bindings(nb as usize, flags), c_view(list, n_list, place)) else {
+        return fail(Error::Bad("null argument"));
+    };
+    let ranks = nr.max(1) as usize;
+    let nb = nb as usize;
+    if need.is_null() || (nb > 0 && (mla.is_null() || mla_bytes.is_null() || idx.is_null() || idx_bytes.is_null())) {
+        return fail(Error::Bad("null argument"));
+    }
+    let mut caches: Vec<Vec<Cache>> = Vec::with_capacity(ranks);
+    for r in 0..ranks {
+        let mut v = Vec::with_capacity(nb);
+        for b in 0..nb {
+            let k = r * nb + b;
+            let m = *mla.add(k);
+            let i = *idx.add(k);
+            if m.is_null() {
+                return fail(Error::Bad("null MLA cache"));
+            }
+            v.push(Cache {
+                mla: std::slice::from_raw_parts(m, *mla_bytes.add(k)),
+                idx: (!i.is_null()).then(|| std::slice::from_raw_parts(i, *idx_bytes.add(k))),
+            });
+        }
+        caches.push(v);
+    }
+    let views = vec![v; ranks];
+    let layout = Layout { nr, below_rows };
+    match export(mla_row as usize, &bs, &layout, &views, &caches, first, rows, check != 0) {
+        Ok(c) => {
+            *need = c.byte_len();
+            if cap < *need || out.is_null() {
+                return 1;
+            }
+            let b = c.to_bytes();
+            std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Imports a blob from g6kv_canon_export into one rank's caches (mla[b], idx[b], host memory) at a layout. Writes
+/// the rows written (summed over bindings) to *written when not NULL. 0, or -1 (g6kv_canon_error).
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_import(
+    blob: *const u8,
+    n: usize,
+    mla_row: u32,
+    nb: u32,
+    flags: *const u8,
+    nr: u32,
+    below_rows: u32,
+    list: *const u32,
+    n_list: usize,
+    place: u32,
+    rank: u32,
+    mla: *const *mut u8,
+    mla_bytes: *const usize,
+    idx: *const *mut u8,
+    idx_bytes: *const usize,
+    written: *mut u64,
+) -> i32 {
+    let (Some(bs), Some(v)) = (c_bindings(nb as usize, flags), c_view(list, n_list, place)) else {
+        return fail(Error::Bad("null argument"));
+    };
+    let nb = nb as usize;
+    if blob.is_null() || (nb > 0 && (mla.is_null() || mla_bytes.is_null() || idx.is_null() || idx_bytes.is_null())) {
+        return fail(Error::Bad("null argument"));
+    }
+    let c = match Canon::from_bytes(std::slice::from_raw_parts(blob, n)) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let mut caches = Vec::with_capacity(nb);
+    for b in 0..nb {
+        let m = *mla.add(b);
+        let i = *idx.add(b);
+        if m.is_null() {
+            return fail(Error::Bad("null MLA cache"));
+        }
+        caches.push(CacheMut {
+            mla: std::slice::from_raw_parts_mut(m, *mla_bytes.add(b)),
+            idx: (!i.is_null()).then(|| std::slice::from_raw_parts_mut(i, *idx_bytes.add(b))),
+        });
+    }
+    match import(&c, &bs, mla_row as usize, &Layout { nr, below_rows }, &v, rank, &mut caches) {
+        Ok(w) => {
+            if !written.is_null() {
+                *written = w;
+            }
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
