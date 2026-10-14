@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-14: the event boundaries are logged, so a cancel's delay can be attributed
+
+- #61's ~24 s has two candidate mechanisms that need different fixes: the scheduler served one prefill at a time and
+  always the lowest request id, and a cancel is anchored at `boundary + LOOKAHEAD` with `LOOKAHEAD = 8` (`s2/service.h`).
+  Eight boundaries is fine slack for decode rounds of tens of milliseconds; during a prefill it is up to eight 8,192-row
+  quanta, about 50 s. Nothing printed the boundary a notice was anchored to, so a run could show the delay but not say
+  which mechanism produced it — and the two disagree only when a prompt outruns the lookahead.
+- `G6_S2_EVENTLOG=1` prints three lines to stderr on a serving build, with no state, no digest and no behaviour change:
+  `notice` (rank 0's control thread: the boundary it read and the future boundary it chose, i.e. `A` and `A + 8`),
+  `commit` (every rank: the boundary the notice landed at, so a rank that never prints it failed the epoch) and `step`
+  (every rank: one line per prefill quantum and prompt tail — request, row range, boundary — and not per decode round,
+  which would be far too much). Off by default.
+- `docs/EVENT-LATENCY.md` is the run: a long prompt whose client aborts 1.5 ms after admission (the shim already turns
+  the disconnect into the CANCEL), then a short follow-up, at 16K/32K/64K and `SESS` 2 and 4. 64K is the discriminator,
+  because 8 prefill quanta plus the tail outrun the 8-boundary lookahead. If the notice lands before the long request's
+  last prefill boundary the lookahead binds and the event-latency work is needed; if it lands after, the scheduler's
+  admission was the whole story.
+
 ## 2026-10-13: a session past R takes its own pages from the shared pool
 
 - A request whose worst case exceeds R (`SHARE_LIMIT`, default `G6_CP_R`) runs alone, and its run took logical pages
