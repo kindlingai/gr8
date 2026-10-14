@@ -16,6 +16,7 @@ int main()
     CHECK(proc_kb(mi, "MemAvailable") == 118000000);
     CHECK(proc_kb(mi, "Cached") == 4194304);           // not SwapCached
     CHECK(proc_kb(mi, "SwapCached") == 7);
+    CHECK(proc_kb("Shmem:  1024 kB\nShmemHugePages: 0 kB\n", "Shmem") == 1024);
     CHECK(proc_kb(mi, "MemTotal") == 125000000);
     CHECK(proc_kb(mi, "Mem") == -1);                   // a prefix of a key is not the key
     CHECK(proc_kb(mi, "VmRSS") == -1);
@@ -26,6 +27,10 @@ int main()
     const HostMem m = host_mem();                       // Linux: all three are there
     CHECK(m.avail_kb > 0 && m.cached_kb >= 0 && m.rss_kb > 0);
 
+#if !defined(__GLIBC__)
+    printf("host_reclaim_test: parser ok; trim not tested (no glibc)\n");
+    return fails ? 1 : 0;
+#else
     // 256 MiB in 1 MiB blocks kept in the heap (mmap threshold raised), each followed by a small block that stays live:
     // the freed blocks cannot merge into the heap's top, so free() keeps them resident, as a loader's freed plans and
     // vectors stay between live allocations. malloc_trim must give most of them back (whole pages inside free chunks;
@@ -44,6 +49,7 @@ int main()
     fprintf(stderr, "malloc_trim gave back %ld MiB of 256\n", freed >> 10);
     CHECK(freed >= 192 << 10);
     for (char* p : keep) free(p);
+#endif
 
     if (fails) { fprintf(stderr, "host_reclaim_test: %d FAILED\n", fails); return 1; }
     printf("host_reclaim_test: ok (trim gave back %ld MiB)\n", freed >> 10);

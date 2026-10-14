@@ -34,6 +34,7 @@
 #include "serve.h"
 #include "spec_len.h"
 #include "../h2d.h"
+#include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
 #include "../attn/bind.h"
@@ -64,15 +65,7 @@ inline double mem_min_gib()
 
 inline void check_headroom(int rank, int capacity, bool log)
 {
-    double gib = -1;
-    if (FILE* f = fopen("/proc/meminfo", "r"))
-    {
-        char line[128];
-        long kb;
-        while (fgets(line, sizeof line, f))
-            if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gib = kb / 1048576.0; break; }
-        fclose(f);
-    }
+    const double gib = kb_gib(host_mem().avail_kb);
     static const double need = mem_min_gib();
     if (log) fprintf(stderr, "# rank %d: MemAvailable %.1f GiB after the weights and the KV pool\n", rank, gib);
     if (gib >= 0 && gib < need)

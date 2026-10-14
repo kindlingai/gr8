@@ -536,7 +536,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
 #endif
-    host_reclaim(R, "after the weights");      // the loaders keep no page cache; this trims the heap they freed
+    host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
     build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
     boot("layers bound");
@@ -1166,6 +1166,7 @@ int main(int argc, char** argv)
                 int dev = 0;
                 G6RT_CK(cudaGetDevice(&dev));
                 wcheck::start_watcher(s2dir, R, dev);
+                host_reclaim(R, "serving");     // #4: after the drafter, the S2 pool and the graphs; the barrier absorbs it
                 g6s2::capture_barrier(bc, links);
             }
             catch (...) { links.shutdown(); throw; }
@@ -1208,7 +1209,7 @@ int main(int argc, char** argv)
     }
     if (R == 0 && (!hd.dir.empty() || hd.zscratch))
         fprintf(stderr, "# reuse diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
-    host_reclaim(R, "ready");                  // after the graphs, the drafter and the warmup steps
+    if (!s2mode) host_reclaim(R, "ready");     // offline runs; a served rank trimmed before its capture barrier
     boot("ready");
     for (size_t q = 0; !s2mode && q < plans.size(); ++q)   // offline: each --prompt once
     {
