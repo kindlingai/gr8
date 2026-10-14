@@ -236,7 +236,10 @@ fn tables_follow_the_engine_rule() {
         }
     }
     // the traces reach the cases that matter: Pool runs, scattered lists, past-R runs with drafter pages above place
-    assert!(pooled * 6 > total && scattered * 4 > pooled && split > 50, "pooled {pooled} of {total}, scattered {scattered}, split {split}");
+    assert!(
+        pooled * 6 > total && scattered * 4 > pooled && split > 50,
+        "pooled {pooled} of {total}, scattered {scattered}, split {split}"
+    );
     // the CP map as built (bind.cu): pages 0, 1, .. -> the prefix, then this rank's pages past R, in order
     let l = Layout { nr: 4, below_rows: 128 };
     let v = View { list: (0..6).collect(), place: u32::MAX };
