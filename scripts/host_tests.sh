@@ -4,7 +4,8 @@
 # and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the pool's block
 # store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
-# frame (s2/control_protocol.h), and the pack manifest parser (engine/loader/g6pack.cpp).
+# frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
+# after load (engine/runtime/host_reclaim.h).
 #   scripts/host_tests.sh
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -59,3 +60,7 @@ g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/
 
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/test_context_buckets.cpp" -o "$T/test_context_buckets"
 "$T/test_context_buckets"
+
+# host memory after load (#4): the /proc parser and malloc_trim (glibc)
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$T/host_reclaim_test"
+"$T/host_reclaim_test"

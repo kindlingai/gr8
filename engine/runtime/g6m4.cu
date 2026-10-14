@@ -90,6 +90,7 @@
 #include "s2/native.cuh"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
+#include "host_reclaim.h"
 #include <filesystem>
 #include <unistd.h>
 
@@ -474,6 +475,7 @@ int main(int argc, char** argv)
     Model m;
     g6::DevImage img;
     boot("fabric up");
+    host_mem_log(R, "before the weights");     // #4: MemAvailable, page cache and RSS around the load
     if (!v2src.dir.empty() && (!image || v2src.slices.empty() || v2src.widths.empty()))
         die("--v2 needs --image, --v2-slices and --v2-widths");
     if (image) load_image(pack, img, manifest, packfile, R, hash, v2src);
@@ -534,6 +536,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
 #endif
+    host_reclaim(R, "after the weights");      // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
     build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
     boot("layers bound");
@@ -1205,6 +1208,7 @@ int main(int argc, char** argv)
     }
     if (R == 0 && (!hd.dir.empty() || hd.zscratch))
         fprintf(stderr, "# reuse diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
+    host_reclaim(R, "ready");                  // after the graphs, the drafter and the warmup steps
     boot("ready");
     for (size_t q = 0; !s2mode && q < plans.size(); ++q)   // offline: each --prompt once
     {
