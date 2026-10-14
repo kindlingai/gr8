@@ -24,6 +24,9 @@
 //! taking pages back, since a re-prefilled session would not emit the same bytes. From a safe state some session can
 //! always go on, so the engine never deadlocks. An exclusive run takes its worst case at once.
 //!
+//! src/canon.rs is a session's KV in a form independent of the layout (NR, R, CP shards): export from one layout's
+//! pages, import into another's (#152). The engine does not call it yet.
+//!
 //! The C interface (g6kvman.h, src/ffi.rs) is what engine/runtime/s2/pool.h wraps for g6m4 and m4sim.
 //!
 //! src/tier.rs is a proof of concept of an SSD store for retained runs (SSD-TIER.md), and src/remote a KV node that
@@ -31,6 +34,7 @@
 //! neither.
 
 pub mod blocks;
+pub mod canon;
 pub mod ffi;
 pub mod pool;
 pub mod remote;
