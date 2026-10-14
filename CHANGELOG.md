@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-14: the prefill quantum goes to the shortest prompt, not the lowest request id
+
+- A client that disconnected 1.5 ms into a 31,984-token prompt left the slot occupied for 23.8 s, and a short follow-up
+  admitted behind it saw the same 23.8 s TTFT (#61). The prompt is below R, so this is the ordinary shared path, not the
+  exclusive one: `Scheduler::next()` took at most one prefilling session per quantum and always the **lowest request
+  id**, so a short request admitted behind a long prefill waited out every one of its quanta. At `--prefill 4096
+  --pf-lanes 2` a quantum is 8,192 rows, about 6 s on the reported cluster, and that prompt is four of them (8,192 x 3
+  plus 7,407) and then its one-row prompt tail: five boundaries behind one request.
+- The prefill choice is now the session with the fewest prompt rows left, `req.id` breaking ties. A session passed over
+  `PREFILL_DEFER_MAX` (3) times is owed a turn and outranks every session that is not; once owed it is passed over at
+  most once more per competing prefilling session, so a stream of short requests cannot defer a long prefill without
+  bound. The choice reads only replicated slot state — `phase`, `prefilled`, `req.id` and the new per-slot `deferred`
+  counter, which is in `Scheduler::digest` — never wall clock or arrival order, so every rank picks the same session and
+  the event digest confirms it. Decode still gets its round between prefill quanta; only which prefill runs changed.
+- `scheduler_fair_test` (`scripts/host_tests.sh`, no GPU) covers it: a short request admitted behind a 31,984-token
+  prefill gets the first quantum and reaches decode in two boundaries while the long one is still prefilling; a long
+  prefill under seven short ones is never passed over more than `PREFILL_DEFER_MAX + MAX_SESSIONS` quanta; a single
+  session's quanta are unchanged (8192/8192/8192/7407/1 rows); and two schedulers driven by the same events choose the
+  same sessions and agree on every digest over 300 boundaries.
+
 ## 2026-10-13: a session past R takes its own pages from the shared pool
 
 - A request whose worst case exceeds R (`SHARE_LIMIT`, default `G6_CP_R`) runs alone, and its run took logical pages
