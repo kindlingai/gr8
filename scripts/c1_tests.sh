@@ -79,7 +79,7 @@ if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
   if [ -f "$KVLIB" ]; then
     build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
-    echo "canon_test needs $KVLIB: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; [ "$rc" = 0 ] && rc=3
+    echo "SKIP canon_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then

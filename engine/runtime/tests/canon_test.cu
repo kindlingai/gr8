@@ -9,9 +9,10 @@
 //      step (g6_attn_bind_run, full-index layer, then the shared-index layer on its lists) gives the same output bits,
 //      index lists and appended rows as the step on the source session;
 //   3. another layout (G6_CP builds): the same tokens appended on NR CP bindings (rank r stores the replicated prefix
-//      and its pages past R), exported from all NR ranks and imported into a replicated binding, equal the replicated
-//      binding's own caches byte for byte, and the decode step after it matches; and back: the replicated caches
-//      imported into NR CP bindings equal the CP bindings' own caches;
+//      and its pages past R), exported from all NR ranks, give the replicated binding's blob byte for byte; imported
+//      into a replicated binding they equal its own caches, and a decode step (on the replicated bindings) after it
+//      matches; and back: the replicated caches imported into NR CP bindings equal the CP bindings' own caches. The CP
+//      run here is the CP map as built (list 0, 1, ..); other page lists past R are the Rust tests' (tests/canon.rs);
 //   4. a live migration's two parts: rows [0, B) then [B, T) imported one after the other equal one import of [0, T).
 // Build and run: TEST=canon_test scripts/c1_tests.sh <bin_dir> (links engine/kvman-rs's libg6kvman.a)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
@@ -386,15 +387,11 @@ static void run(uint64_t seed, int T, int B, int M)
         // the CP map as built is the run's list 0, 1, .. (bind.cu)
         const auto from_cp = export_rows(cc, FLAGS_CP, NRK, R, run_list, 0, T);
         const auto from_rep = export_rows(sc, FLAGS_REP, 0, 0, run_list, 0, T);
-        // the canonical rows are the same bytes; the header differs only in the bindings' CP flag
-        const size_t hdr = 8 + 24 + NL;
-        const bool rows_same = from_cp.size() == from_rep.size() &&
-                               std::equal(from_cp.begin() + hdr, from_cp.end(), from_rep.begin() + hdr);
-        report(rows_same, std::string("another layout: CP (R 128) and replicated export the same rows, ") + nm);
-        // CP -> replicated: equal the replicated binding's own caches, and the decode step after it matches. The
-        // bindings' CP flags are the source's; the import needs the destination's, so re-flag the blob.
-        std::vector<uint8_t> as_rep = from_cp;
-        for (int l = 0; l < NL; ++l) as_rep[8 + 24 + l] = FLAGS_REP[l];
+        // the canonical form does not depend on the layout: the same blob, byte for byte
+        report(from_cp == from_rep, std::string("another layout: CP (R 128) and replicated export the same blob, ") + nm);
+        // CP -> replicated: equal the replicated binding's own caches, and the decode step after it matches (the
+        // decode runs on replicated bindings; the CP ranks are compared byte for byte below and in the other direction)
+        const std::vector<uint8_t>& as_rep = from_cp;
         G6AttnBinding dst[NL] = {};
         make(dst, 0);
         std::vector<HostCache> dc{down(dst[0]), down(dst[1])};
@@ -405,8 +402,7 @@ static void run(uint64_t seed, int T, int B, int M)
         const StepOut b = step(dst, A, rng, M, T + M, heads, seed * 31 + 2);
         report(caches_same && same(a, b), std::string("CP -> replicated: the caches and the decode step match, ") + nm);
         // replicated -> CP: each rank's import equals that rank's own caches
-        std::vector<uint8_t> as_cp = from_rep;
-        for (int l = 0; l < NL; ++l) as_cp[8 + 24 + l] = FLAGS_CP[l];
+        const std::vector<uint8_t>& as_cp = from_rep;
         bool all_same = true;
         for (int r = 0; r < NRK; ++r) {
             std::vector<HostCache> z = cc[r];

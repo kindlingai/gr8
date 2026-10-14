@@ -1,7 +1,8 @@
 //! Session state independent of the layout (src/canon.rs, #152). Each rank's caches are filled by an independent
-//! writer: every token's rows go to the page its rank's table names, the table derived here from the rules in
-//! engine/runtime/s2.cuh (s2_solo_cp_pages) and engine/attn/bind.cu, not from canon::table. Then:
-//! - the tables match that derivation, for lists in any order, with and without CP;
+//! writer: every token's rows go to the page its rank's table names, the table written here as engine/runtime/s2.cuh
+//! s2_solo_cp_pages writes it (prefix list[lp], owned tail pages through s2_list_place), not from canon::table. Runs
+//! come from a real Pool (pool.rs: below R, and past R on the page classes) or are the tables as built. Then:
+//! - the tables match that derivation, with and without CP;
 //! - same layout: export then import into empty caches is byte-identical on every page the run holds;
 //! - another layout: export at A, import at B gives B's caches as B's own writer fills them from the same tokens, and
 //!   export at B gives A's canonical form back; chains of layouts (6 -> 4 -> 3 -> no CP -> 6) lose nothing;
@@ -10,6 +11,7 @@
 //! - head-split state gathers and splits back for every width.
 
 use g6kvman::canon::{self, Binding, Cache, CacheMut, Canon, Layout, View, IDX_ROW, NONE, PAGE, REMOTE};
+use g6kvman::Pool;
 
 struct Rng(u64);
 
@@ -42,7 +44,8 @@ fn tokens(rng: &mut Rng, bs: &[Binding], row: usize, n: usize) -> Tokens {
     }
 }
 
-// the oracle: logical page lp of a CP binding on `rank` (s2_solo_cp_pages), or of any other binding (list as built)
+// the oracle, as s2_solo_cp_pages writes a CP binding's table: prefix pages lp < R/64 at list[lp], an owned tail page
+// (lp % nr == rank) at s2_list_place(list, rp + j, place), every other page REMOTE; any other binding: list as built
 fn oracle(b: Binding, l: &Layout, list: &[u32], place: u32, rank: u32, logical: usize) -> Vec<i64> {
     let mut t = vec![NONE; logical];
     if !b.cp || l.nr == 0 {
@@ -52,14 +55,25 @@ fn oracle(b: Binding, l: &Layout, list: &[u32], place: u32, rank: u32, logical: 
         return t;
     }
     let rp = l.below_rows as usize / PAGE;
-    // the at-th page of the list below place
-    let below = |at: usize| list.iter().filter(|&&p| p < place).nth(at).map_or(NONE, |&p| p as i64);
+    // s2_list_place: the at-th page of the list below place, -1 when the list has none
+    let list_place = |at: usize| -> i64 {
+        let mut seen = 0;
+        for &p in list {
+            if p < place {
+                if seen == at {
+                    return p as i64;
+                }
+                seen += 1;
+            }
+        }
+        -1
+    };
     let mut j = 0;
     for (lp, e) in t.iter_mut().enumerate() {
         if lp < rp {
-            *e = below(lp);
+            *e = if lp < list.len() { list[lp] as i64 } else { NONE };
         } else if lp % l.nr as usize == rank as usize {
-            *e = below(rp + j);
+            *e = list_place(rp + j);
             j += 1;
         } else {
             *e = REMOTE;
@@ -122,8 +136,9 @@ fn caches_mut(r: &mut Rank) -> Vec<CacheMut<'_>> {
     r.mla.iter_mut().zip(r.idx.iter_mut()).map(|(m, i)| CacheMut { mla: m, idx: i.as_deref_mut() }).collect()
 }
 
-// a random run of n rows at a layout: a list of distinct pages, the pages a CP binding keeps below `place` first in
-// list order when the pool has page classes, as pool.rs grants them
+// a random run of n rows at a layout, from a real Pool where the layout has one: a run below R (every page in the
+// prefix), or a run past R on the page classes (nr > 0: pool.rs grants the prefix and this rank's shard below place,
+// the drafter's copy above). Else the tables as built: pages 0, 1, .. (place = the whole list).
 struct Setup {
     views: Vec<View>,
     pages: usize,
@@ -132,46 +147,43 @@ struct Setup {
 fn setup(rng: &mut Rng, layout: Layout, n: usize) -> Setup {
     let logical = n.div_ceil(PAGE);
     let ranks = layout.nr.max(1) as usize;
-    let extra = rng.range(0, 8) as usize;
-    let pages = logical + extra;
-    let shuffled = |rng: &mut Rng, lo: u32, hi: u32| {
-        let mut v: Vec<u32> = (lo..hi).collect();
-        for i in (1..v.len()).rev() {
-            v.swap(i, rng.range(0, i as u64) as usize);
-        }
-        v
+    let as_built = |pages: usize| Setup {
+        views: (0..ranks).map(|_| View { list: (0..logical as u32).collect(), place: u32::MAX }).collect(),
+        pages,
     };
-    let rp = (layout.below_rows as usize / PAGE).min(logical);
-    if layout.nr > 0 && rng.range(0, 1) == 1 {
-        // the pool's page classes (pool.rs exclusive_pages): the prefix and a rank's shard of the tail from below
-        // place, the drafter's copy of the rest from above it; the two classes interleaved in list order here, which
-        // the rule allows
-        let t = logical - rp;
-        let own = t.div_ceil(layout.nr as usize);
-        let low_n = rp + own;
-        let place = (low_n + rng.range(0, 4) as usize) as u32;
-        let pages = pages.max(place as usize + (logical - low_n));
-        let mut low = shuffled(rng, 0, place);
-        low.truncate(low_n);
-        let mut high = shuffled(rng, place, pages as u32);
-        high.truncate(logical - low_n);
-        let mut list = Vec::with_capacity(logical);
-        let (mut i, mut j) = (0, 0);
-        while i < low.len() || j < high.len() {
-            if j == high.len() || (i < low.len() && rng.range(0, 1) == 0) {
-                list.push(low[i]);
-                i += 1;
-            } else {
-                list.push(high[j]);
-                j += 1;
-            }
-        }
-        return Setup { views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages };
+    let rp = layout.below_rows as usize / PAGE;
+    if rp == 0 || rng.range(0, 3) == 0 {
+        return as_built(logical + rng.range(0, 4) as usize);
     }
-    // one class: a run below R, or the tables as built (every page below place)
-    let mut list = shuffled(rng, 0, pages as u32);
-    list.truncate(logical);
-    let place = if rng.range(0, 1) == 0 { u32::MAX } else { pages as u32 };
+    let nr = layout.nr.max(1) as usize;
+    let tail = logical.saturating_sub(rp);
+    let own = tail.div_ceil(nr);
+    // the pool: room for the run plus some retained garbage, so its pages are not 0, 1, ..
+    let place = (rp.max(logical.min(rp + own)) + rng.range(0, 6) as usize) as u32;
+    let pages = place as usize + (tail - own.min(tail)) + rng.range(0, 6) as usize;
+    let mut pool = Pool::new(pages as u32, place, layout.below_rows).unwrap();
+    if layout.nr > 0 {
+        pool.tail(layout.nr, 0);
+    }
+    // a few short runs first, some released, so the run's pages are scattered
+    let mut held = Vec::new();
+    for _ in 0..rng.range(0, 4) {
+        let rows = PAGE as u64 * rng.range(1, 2);
+        if pool.fits(rows, rows) {
+            held.push(pool.reserve(rows, rows).unwrap());
+        }
+    }
+    for r in held.iter().filter(|_| rng.range(0, 1) == 0) {
+        pool.release(r).unwrap();
+    }
+    let rows = n as u64;
+    if !pool.fits(rows, rows) {
+        return as_built(logical);
+    }
+    let run = pool.reserve(rows, rows).unwrap();
+    let list = pool.list(&run).unwrap().to_vec();
+    assert_eq!(list.len(), logical);
+    // s2_solo_cp_pages bounds s2_list_place with the main model's pool pages: the pool's place
     Setup { views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages }
 }
 
@@ -407,8 +419,10 @@ fn a_replicated_page_that_differs_is_caught() {
     assert!(canon::export(row, &bs, &l, &s.views, &cs, 0, n as u64, false).is_ok());
     // a list too short for the rows: no rank holds the page
     let short: Vec<View> = s.views.iter().map(|v| View { list: v.list[..2].to_vec(), place: v.place }).collect();
-    let e = canon::export(row, &bs, &l, &short, &cs, 0, n as u64, false);
-    assert!(matches!(e, Err(canon::Error::Missing { .. })), "{e:?}");
+    assert_eq!(
+        canon::export(row, &bs, &l, &short, &cs, 0, n as u64, false),
+        Err(canon::Error::Bad("rows past the run's list"))
+    );
 }
 
 #[test]
@@ -431,6 +445,27 @@ fn the_byte_form_round_trips_and_refuses_others() {
     let mut other = b.clone();
     other[0] ^= 1;
     assert!(Canon::from_bytes(&other).is_err());
+    // sizes in the header that overflow or exceed the blob are refused before anything is sliced (a release build
+    // aborts on a panic)
+    for rows in [u64::MAX, u64::MAX / 2 + 1, 1 << 40, c.rows + 1] {
+        let mut x = b.clone();
+        x[24..32].copy_from_slice(&rows.to_le_bytes());
+        assert!(Canon::from_bytes(&x).is_err(), "rows {rows}");
+    }
+    let mut x = b.clone();
+    x[8..12].copy_from_slice(&1u32.to_le_bytes());
+    assert!(Canon::from_bytes(&x).is_err());
+    let mut x = b.clone();
+    x[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(Canon::from_bytes(&x).is_err());
+    let mut x = b.clone();
+    x[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(Canon::from_bytes(&x).is_err());
+    // a hand-built form whose data does not match its header is refused at import
+    let mut bent = c.clone();
+    bent.data[0].mla.pop();
+    let mut dst = write(&t, &bs, row, &l, &s.views[0], 0, s.pages, 0, 0);
+    assert!(canon::import(&bent, &bs, row, &l, &s.views[0], 0, &mut caches_mut(&mut dst)).is_err());
     // another row format or other bindings are refused at import
     let mut dst = write(&t, &bs, 656, &l, &s.views[0], 0, s.pages, 0, 0);
     assert_eq!(

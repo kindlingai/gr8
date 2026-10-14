@@ -163,8 +163,10 @@ int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
 // A session's KV in a form independent of the layout (src/canon.rs, #152): per binding and token, in order, the MLA
 // latent row and, on full-index layers, the indexer key row (128 codes, then its FP32 scale). Host memory only: the
 // caller copies the pages between the device and the buffers. flags[b]: 1 = binding b has index keys, 2 = its cache is
-// sharded past R (cp_nr > 0). nr = CP ranks (0: every page on every rank), below_rows = R. list / place: the run's page
-// list (the same on every rank) and the pool's place pages (UINT32_MAX: the whole list).
+// sharded past R (cp_nr > 0); the blob keeps only bit 1, so a blob exported at one layout imports at any other.
+// nr = CP ranks (0: every page on every rank), below_rows = R. list / place: the run's page list (the same on every
+// rank) and the main model's pool pages, the bound s2_solo_cp_pages gives s2_list_place (UINT32_MAX: the whole list,
+// the tables as built). The idx / idx_bytes arrays are never NULL when nb > 0.
 // export: mla[r * nb + b] is rank r's MLA cache of binding b (nr ranks, or 1 without CP), idx likewise (NULL on
 // bindings without index keys). *need = the blob's size; 1 when cap is too small (nothing written), 0 = done.
 // import: one rank's caches mla[b], idx[b]; *written = rows written, summed over bindings.

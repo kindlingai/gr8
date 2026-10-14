@@ -4,10 +4,11 @@
 //!
 //! What a rank holds of a run, per layer binding (engine/runtime/s2.cuh s2_solo_cp_pages, engine/attn/bind.cu):
 //! - a binding that is not CP (the MTP layer, the draft model), or a layout without CP: logical page lp at list[lp];
-//! - a CP binding: lp < R/64 (the replicated prefix) at the lp-th page of the list below `place`; past R, the pages
-//!   with lp % nr == rank at the (R/64 + j)-th page of the list below place (j counts this rank's pages past R), every
-//!   other page on another rank (REMOTE). A run below R, or a run past R on the tables as built (pages 0, 1, ..), is
-//!   the same rule with the list as granted.
+//! - a CP binding: lp < R/64 (the replicated prefix) at list[lp]; past R, the pages with lp % nr == rank at the
+//!   (R/64 + j)-th page of the list below `place` (j counts this rank's pages past R; s2_list_place), every other page
+//!   on another rank (REMOTE). The pool grants a past-R run its low class first (pool.rs), so its prefix pages are
+//!   below place too. A run below R (every page in the prefix), or a run past R on the tables as built (pages 0, 1, ..,
+//!   place = the whole list), is the same rule.
 //!
 //! The canonical form: per binding and per token, in order, the MLA latent row (kvfmt.h: 656 B in FP8, 416 B in INT4)
 //! and, on full-index layers, the indexer key row (128 E4M3 codes, then its FP32 scale: 132 B). Those rows are the
@@ -95,8 +96,9 @@ impl Layout {
     }
 }
 
-/// A rank's view of one run: its page list (the pool's, the same on every rank) and the pool's place pages (the
-/// pages below which a CP binding keeps its prefix and shard; u32::MAX = the whole list).
+/// A rank's view of one run: its page list (the pool's, the same on every rank) and `place`, the bound s2_solo_cp_pages
+/// passes to s2_list_place: the main model's pool pages (S2Model::pool_pages), which is the pool's place pages because
+/// the draft model's pool is never the smaller (g6m4.cu). u32::MAX: the whole list (the tables as built).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     pub list: Vec<u32>,
@@ -123,7 +125,7 @@ pub fn table(b: Binding, layout: &Layout, view: &View, rank: u32, logical: usize
     let mut j = 0;
     for (lp, e) in t.iter_mut().enumerate() {
         *e = if lp < rp {
-            low.get(lp).map_or(NONE, |&p| p as i64)
+            view.list.get(lp).map_or(NONE, |&p| p as i64)
         } else if lp % nr == rank as usize {
             let at = rp + j;
             j += 1;
@@ -142,11 +144,13 @@ pub struct Rows {
     pub idx: Option<Vec<u8>>,
 }
 
-/// A session's KV in canonical form: rows [first, first + rows) of every binding.
+/// A session's KV in canonical form: rows [first, first + rows) of every binding. `index` says which bindings carry
+/// indexer rows; whether a binding is sharded is the layout's business, so it is not part of the form and an import
+/// takes it from the destination's bindings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Canon {
     pub mla_row: usize,
-    pub bindings: Vec<Binding>,
+    pub index: Vec<bool>,
     pub first: u64,
     pub rows: u64,
     pub data: Vec<Rows>,
@@ -202,6 +206,11 @@ pub fn export(
     }
     if mla_row == 0 || !mla_row.is_multiple_of(16) {
         return Err(Error::Bad("MLA row bytes"));
+    }
+    // the rows must lie within the pages the run lists: that bounds every size below
+    let end = first.checked_add(rows).ok_or(Error::Bad("row range"))?;
+    if end.div_ceil(PAGE as u64) > views.iter().map(|v| v.list.len()).max().unwrap_or(0) as u64 {
+        return Err(Error::Bad("rows past the run's list"));
     }
     let span = pages_of(first, rows);
     let mut data = Vec::with_capacity(bindings.len());
@@ -271,7 +280,7 @@ pub fn export(
         }
         data.push(out);
     }
-    Ok(Canon { mla_row, bindings: bindings.to_vec(), first, rows, data })
+    Ok(Canon { mla_row, index: bindings.iter().map(|b| b.index).collect(), first, rows, data })
 }
 
 /// Writes a canonical form's rows into one rank's caches at a layout (caches[binding]). Only the rows the canonical
@@ -289,11 +298,16 @@ pub fn import(
     if canon.mla_row != mla_row {
         return Err(Error::Mismatch("MLA row format"));
     }
-    if canon.bindings != bindings {
+    if canon.index.len() != bindings.len() || canon.index.iter().zip(bindings).any(|(&i, b)| i != b.index) {
         return Err(Error::Mismatch("layer bindings"));
     }
+    canon.check_shape()?;
     if caches.len() != bindings.len() {
         return Err(Error::Bad("a cache per binding"));
+    }
+    let end = canon.first.checked_add(canon.rows).ok_or(Error::Bad("row range"))?;
+    if end.div_ceil(PAGE as u64) > view.list.len() as u64 {
+        return Err(Error::Bad("the run's list is shorter than the canonical rows"));
     }
     let span = pages_of(canon.first, canon.rows);
     let mut written = 0;
@@ -340,11 +354,11 @@ impl Canon {
         let mut v = Vec::with_capacity(self.byte_len());
         v.extend_from_slice(MAGIC);
         v.extend_from_slice(&(self.mla_row as u32).to_le_bytes());
-        v.extend_from_slice(&(self.bindings.len() as u32).to_le_bytes());
+        v.extend_from_slice(&(self.index.len() as u32).to_le_bytes());
         v.extend_from_slice(&self.first.to_le_bytes());
         v.extend_from_slice(&self.rows.to_le_bytes());
-        for b in &self.bindings {
-            v.push(b.index as u8 | (b.cp as u8) << 1);
+        for &i in &self.index {
+            v.push(i as u8);
         }
         for d in &self.data {
             v.extend_from_slice(&d.mla);
@@ -356,8 +370,27 @@ impl Canon {
     }
 
     pub fn byte_len(&self) -> usize {
-        let per: usize = self.bindings.iter().map(|b| self.mla_row + if b.index { IDX_ROW } else { 0 }).sum();
-        MAGIC.len() + 24 + self.bindings.len() + self.rows as usize * per
+        MAGIC.len() + 24 + self.index.len() + self.rows as usize * self.row_bytes()
+    }
+
+    // bytes of one row over every binding
+    fn row_bytes(&self) -> usize {
+        self.index.iter().map(|&i| self.mla_row + if i { IDX_ROW } else { 0 }).sum()
+    }
+
+    // the data matches the header (a Canon built by hand through the Rust API may not)
+    fn check_shape(&self) -> Result<(), Error> {
+        let r = usize::try_from(self.rows).map_err(|_| Error::Mismatch("rows"))?;
+        let ok = self.data.len() == self.index.len()
+            && self.data.iter().zip(&self.index).all(|(d, &i)| {
+                Some(d.mla.len()) == r.checked_mul(self.mla_row)
+                    && d.idx.as_ref().map(|x| x.len()) == if i { r.checked_mul(IDX_ROW) } else { None }
+            });
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Mismatch("rows of another shape than the header"))
+        }
     }
 
     pub fn from_bytes(v: &[u8]) -> Result<Canon, Error> {
@@ -369,26 +402,28 @@ impl Canon {
         let u64_at = |o: usize| u64::from_le_bytes(v[o..o + 8].try_into().unwrap());
         let (mla_row, nb, first, rows) = (u32_at(8) as usize, u32_at(12) as usize, u64_at(16), u64_at(24));
         let mut at = 32;
-        if v.len() < at + nb || mla_row == 0 {
+        if mla_row == 0 || nb > v.len() - at || first.checked_add(rows).is_none() {
             return Err(bad);
         }
-        let bindings: Vec<Binding> =
-            v[at..at + nb].iter().map(|&f| Binding { index: f & 1 != 0, cp: f & 2 != 0 }).collect();
+        if v[at..at + nb].iter().any(|&f| f > 1) {
+            return Err(bad);
+        }
+        let index: Vec<bool> = v[at..at + nb].iter().map(|&f| f == 1).collect();
         at += nb;
-        let mut data = Vec::with_capacity(nb);
-        for b in &bindings {
-            let m = rows as usize * mla_row;
-            let i = if b.index { rows as usize * IDX_ROW } else { 0 };
-            if v.len() < at + m + i {
-                return Err(bad);
-            }
-            data.push(Rows { mla: v[at..at + m].to_vec(), idx: b.index.then(|| v[at + m..at + m + i].to_vec()) });
-            at += m + i;
-        }
-        if at != v.len() {
+        // every size from the header is checked against what is left before anything is sliced or allocated
+        let per: usize = index.iter().map(|&i| mla_row + if i { IDX_ROW } else { 0 }).sum();
+        let left = (v.len() - at) as u64;
+        if per == 0 || rows.checked_mul(per as u64) != Some(left) {
             return Err(bad);
         }
-        Ok(Canon { mla_row, bindings, first, rows, data })
+        let r = rows as usize;
+        let mut data = Vec::with_capacity(nb);
+        for &i in &index {
+            let (m, x) = (r * mla_row, if i { r * IDX_ROW } else { 0 });
+            data.push(Rows { mla: v[at..at + m].to_vec(), idx: i.then(|| v[at + m..at + m + x].to_vec()) });
+            at += m + x;
+        }
+        Ok(Canon { mla_row, index, first, rows, data })
     }
 }
 
@@ -401,8 +436,10 @@ pub fn start(n: usize, nr: usize, j: usize) -> usize {
     j * (n / nr) + j.min(n % nr)
 }
 
-/// Gathers state split by head: ranks[j] is rank j's buffer laid out [outer][its heads][inner bytes]. Returns the
-/// canonical [outer][heads][inner].
+/// Gathers state split by head: parts[j] is head group j's buffer laid out [outer][its heads][inner bytes], group j
+/// holding heads start(heads, nr, j) .. + width(heads, nr, j). Returns the canonical [outer][heads][inner]. The caller
+/// maps ranks to groups: the MLA attention heads rotate by layer ((rank - layer) mod NR, bind.cu), the drafter's KV
+/// heads do not.
 pub fn heads_out(ranks: &[&[u8]], heads: usize, outer: usize, inner: usize) -> Result<Vec<u8>, Error> {
     let nr = ranks.len();
     if nr == 0 || nr > heads {
@@ -422,7 +459,7 @@ pub fn heads_out(ranks: &[&[u8]], heads: usize, outer: usize, inner: usize) -> R
     Ok(out)
 }
 
-/// Rank j of nr's heads of a canonical [outer][heads][inner] buffer, laid out [outer][its heads][inner].
+/// Head group j of nr's heads of a canonical [outer][heads][inner] buffer, laid out [outer][its heads][inner].
 pub fn heads_in(canon: &[u8], heads: usize, outer: usize, inner: usize, nr: usize, j: usize) -> Result<Vec<u8>, Error> {
     if nr == 0 || nr > heads || j >= nr || canon.len() != outer * heads * inner {
         return Err(Error::Bad("head split arguments"));
@@ -472,7 +509,7 @@ unsafe fn c_view(list: *const u32, n: usize, place: u32) -> Option<View> {
 
 /// Exports rows [first, first + rows) of a run from every rank (`ranks` = nr, or 1 without CP) into `out` (the byte
 /// form, Canon::to_bytes). mla[r * nb + b] / mla_bytes: rank r's MLA cache of binding b (host memory), idx the same
-/// for indexer caches (NULL entries on bindings without index keys). flags[b]: 1 = index keys, 2 = CP. Writes the
+/// for indexer caches (NULL entries on bindings without index keys; the arrays themselves are never NULL when nb > 0). flags[b]: 1 = index keys, 2 = CP. Writes the
 /// blob's size to *need; with cap < *need nothing else is written and the call returns 1. 0 = done, -1 = error
 /// (g6kv_canon_error).
 ///
