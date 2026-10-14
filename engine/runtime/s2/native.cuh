@@ -45,6 +45,8 @@ struct NativeContext {
     std::function<void()> pf_enter, pf_exit;
     // optional: runtime error words the adapter does not own (CP fabric / CP staging proxy); nonzero fails the epoch
     std::function<unsigned()> extra_error;
+    // optional: a draft step's extra fabric work after its draft fabric enqueue (G6_MTP_SPLIT: the draft gathers)
+    std::function<void(unsigned long long step, int rows)> enqueue_draft_extra;
 };
 class NativeDispatch {
     NativeContext c_;
@@ -168,6 +170,7 @@ class NativeDispatch {
         if (draft) {
             std::vector<uint32_t> sizes(3,uint32_t(rows*::HID*2));
             sizes[2] = uint32_t(glue::head_bytes(rows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
+            if (c_.enqueue_draft_extra) c_.enqueue_draft_extra(input.step,rows);
         } else c_.enqueue_main(input); // preserves existing RS order/fabric layout
         const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
         if (l.solo >= 0) {

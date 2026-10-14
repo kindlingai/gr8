@@ -263,6 +263,12 @@ inline int cp_heads(int d, int l) { return g6nr::width(g6nr::HEADS, (d - l % g6n
 // 2: q_a only, published first, then kv_a / idx_k / idx_w in full while the gather is on the wire.
 // Rank s holds tiles start(T, j) .. + width(T, j) of each part (T = its 16-output tiles), j = (s - layer) mod NR.
 // The weights stay replicated (nothing changes at load); only what each rank reads changes.
+// G6_IDXQ_SPLIT=1 (default 0): the indexer's wq_b (idx_q, [4096] outputs, 8.65 MB on each indexer layer) the same way, on
+// the same fabric: published right after its tiles, gathered after q_b (head-sharded, local), which runs in between.
+// G6_MTP_SPLIT=1 (default 0): the MTP draft layer (its own Model and gather fabric): eh_proj ([6144] outputs, 78 MB),
+// then q_a / kv_a / idx (mode 1) and idx_q, one collective each in that (publish) order.
+// Collectives are numbered in GPU publish order (the proxy posts them in order): per step, eh (draft), then per layer
+// q_a (if on), idx_q (if on and an indexer layer).
 constexpr int QS_MAXP = 4, QS_MAXR = 8;
 struct QsGeo                          // one layer's gather, by value into the two kernels
 {
@@ -274,23 +280,37 @@ struct QsGeo                          // one layer's gather, by value into the t
 struct QSplit
 {
     int mode = 0;                     // set before build (G6_QA_SPLIT): 0 off, 1 q_a + kv_a + idx_k + idx_w, 2 q_a only
-    g6::FabricDev g{};                // set before build: the gather fabric, ncoll = layers
-    unsigned* tickets = nullptr;      // [nl] publish tickets, device, zero
-    std::vector<QsGeo> geo;           // [nl] (build)
+    bool iq = false;                  // set before build (G6_IDXQ_SPLIT): idx.wq_b of the indexer layers
+    bool eh = false;                  // set before build, MTP draft model only (G6_MTP_SPLIT): eh_proj
+    g6::FabricDev g{};                // qs_attach after build: the gather fabric, ncoll = ncoll()
+    unsigned* tickets = nullptr;      // [ncoll] publish tickets, device, zero
+    std::vector<QsGeo> geo;           // [ncoll] (build)
+    std::vector<int> cqa, ciq;        // [nl] collective of layer i's q_a / idx_q gather (-1 = none)
+    int ceh = -1;                     // collective of the eh_proj gather (-1 = none)
+    bool on() const { return mode || iq || eh; }
+    int ncoll() const { return (int)geo.size(); }
+    int wmax() const { int w = 0; for (const QsGeo& G : geo) w = std::max(w, G.wmax); return w; }
 };
-constexpr unsigned ERR_QS = 0x66000000u;   // error word code: q_a gather wait timeout (low bits (layer << 8) | peer)
-// the widest wire row (columns) any layer of mode `mode` can have: the fabric's slot size, known before build
-inline int qs_wire_cols_max(int mode)
+constexpr unsigned ERR_QS = 0x66000000u;   // error word code: gather wait timeout (low bits (collective << 8) | peer)
+// the gather of np parts of layer l: part p has T[p] tiles of 16 outputs, rows of width W[p] at D[p]
+inline QsGeo qs_geo(int l, int np, const int* T, const int* W, __half* const* D)
 {
-    const int T[QS_MAXP] = {QA / 16, KVA / 16, IDXK / 16, IDXW / 16};
-    int w = 0;
-    for (int j = 0; j < g6nr::NR; ++j)
+    QsGeo G;
+    G.np = np;
+    for (int p = 0; p < np; ++p) { G.ld[p] = W[p]; G.dst[p] = D[p]; }
+    for (int s = 0; s < g6nr::NR; ++s)
     {
-        int s = 0;
-        for (int p = 0; p < (mode == 2 ? 1 : QS_MAXP); ++p) s += g6nr::width(T[p], j) * 16;
-        w = std::max(w, s);
+        const int j = (s + g6nr::NR - l % g6nr::NR) % g6nr::NR;
+        int w = 0;
+        for (int p = 0; p < np; ++p)
+        {
+            G.c0[s][p] = g6nr::start(T[p], j) * 16;
+            G.n[s][p] = g6nr::width(T[p], j) * 16;
+            w += G.n[s][p];
+        }
+        G.wmax = std::max(G.wmax, w);
     }
-    return w;
+    return G;
 }
 
 #ifdef DEC_S2
@@ -617,39 +637,47 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         G6RT_CK(g6h2d::copy(m.shared, sh.data(), m.nl * sizeof(int)));
         G6RT_CK(g6h2d::copy(m.errs, er.data(), m.nl * sizeof(unsigned*)));
     }
-    if (m.qs.mode)
+    if (m.qs.on())
     {
+        // the gathers' plan, in publish order (QSplit); the fabric comes after build (qs_attach)
         QSplit& Q = m.qs;
-        if (Q.mode != 1 && Q.mode != 2) die("G6_QA_SPLIT must be 0, 1 or 2");
+        if (Q.mode < 0 || Q.mode > 2) die("G6_QA_SPLIT must be 0, 1 or 2");
         if (g6nr::NR > QS_MAXR) die("G6_QA_SPLIT: more than 8 ranks");
-        if (Q.g.ncoll != m.nl || Q.g.nr != g6nr::NR || Q.g.rank != rank) die("G6_QA_SPLIT: the gather fabric must have one collective per layer");
-        Q.tickets = dmalloc<unsigned>(m.nl);
-        Q.geo.assign(m.nl, QsGeo{});
+        Q.geo.clear();
+        Q.cqa.assign(m.nl, -1);
+        Q.ciq.assign(m.nl, -1);
+        Q.ceh = -1;
+        if (Q.eh)
+        {
+            if (!m.eh_out) die("G6_MTP_SPLIT: eh_proj split on a model without eh_proj (the MTP draft only)");
+            const int T = HID / 16, W = HID;
+            __half* D = m.eh_out;
+            Q.ceh = (int)Q.geo.size();
+            Q.geo.push_back(qs_geo(ids[0], 1, &T, &W, &D));
+        }
         const int T[QS_MAXP] = {QA / 16, KVA / 16, IDXK / 16, IDXW / 16}, W[QS_MAXP] = {QA, KVA, IDXK, IDXW};
         __half* D[QS_MAXP] = {m.q_a, m.kv_a, m.idx_k, m.idx_w};
+        const int TQ = IDXQ / 16, WQ = IDXQ;
+        __half* DQ = m.idx_q;
         for (int i = 0; i < m.nl; ++i)
         {
             const Layer& y = m.layers[i];
-            QsGeo& G = Q.geo[i];
-            G.np = Q.mode == 2 ? 1 : y.indexer ? 4 : 2;
-            for (int p = 0; p < G.np; ++p) { G.ld[p] = W[p]; G.dst[p] = D[p]; }
-            for (int s = 0; s < g6nr::NR; ++s)
+            if (Q.mode)
             {
-                const int j = (s + g6nr::NR - y.l % g6nr::NR) % g6nr::NR;
-                int w = 0;
-                for (int p = 0; p < G.np; ++p)
-                {
-                    G.c0[s][p] = g6nr::start(T[p], j) * 16;
-                    G.n[s][p] = g6nr::width(T[p], j) * 16;
-                    w += G.n[s][p];
-                }
-                G.wmax = std::max(G.wmax, w);
+                Q.cqa[i] = (int)Q.geo.size();
+                Q.geo.push_back(qs_geo(y.l, Q.mode == 2 ? 1 : y.indexer ? 4 : 2, T, W, D));
             }
-            if ((size_t)MX * G.wmax * 2 + 8 > Q.g.stride) die("G6_QA_SPLIT: the gather fabric's slots are too small");
+            if (Q.iq && y.indexer)
+            {
+                Q.ciq[i] = (int)Q.geo.size();
+                Q.geo.push_back(qs_geo(y.l, 1, &TQ, &WQ, &DQ));
+            }
         }
+        Q.tickets = dmalloc<unsigned>(std::max(1, Q.ncoll()));
         if (rank == 0)
-            fprintf(stderr, "# rank 0: G6_QA_SPLIT=%d: %s split by output tiles over %d ranks, gathered per layer (wire row %d columns)\n",
-                    Q.mode, Q.mode == 2 ? "q_a" : "q_a, kv_a, idx.wk, idx.weights_proj", g6nr::NR, qs_wire_cols_max(Q.mode));
+            fprintf(stderr, "# rank 0: %s: split by output tiles over %d ranks:%s%s%s; %d gathers per step (wire row up to %d columns)\n",
+                    m.nl == 1 && ids[0] == 78 ? "G6_MTP_SPLIT (draft)" : "G6_QA_SPLIT / G6_IDXQ_SPLIT", g6nr::NR, Q.eh ? " eh_proj" : "",
+                    Q.mode == 2 ? " q_a" : Q.mode ? " q_a, kv_a, idx.wk, idx.weights_proj" : "", Q.iq ? " idx.wq_b" : "", Q.ncoll(), Q.wmax());
     }
 #if defined(G6_CP) && G6_CP
     if (m.cp.on)
@@ -715,17 +743,36 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
 }
 
+// after build, before any launch: the gather fabric (ncoll = m.qs.ncoll(), slots of at least MX rows of the widest wire row);
+// err: the error word GPU-side gather wait timeouts write (the one the step loop checks)
+inline void qs_attach(Model& m, const g6::FabricDev& g, unsigned* err)
+{
+    QSplit& Q = m.qs;
+    if (g.ncoll != Q.ncoll() || g.nr != g6nr::NR || g.rank != m.rank) die("G6_QA_SPLIT: the gather fabric does not match the plan");
+    if ((size_t)MX * Q.wmax() * 2 + 8 > g.stride) die("G6_QA_SPLIT: the gather fabric's slots are too small");
+    Q.g = g;
+    Q.g.error = err;
+}
+// slot bytes the gather fabric of m needs
+inline size_t qs_slot_bytes(const Model& m) { return (size_t)MX * m.qs.wmax() * 2; }
+
 // G6_QA_SPLIT: a bound layer's input GEMVs narrowed to this rank's output tiles (QsGeo), and their gv_multi launch rebuilt
 // from the narrowed GEMVs (mode 2: q_a alone, then kv_a / idx_k / idx_w in full as x_rest). Same bits per output tile.
 // G6_QA_SPLIT_TPC (default 1): tiles per CTA of the narrowed GEMVs (more CTAs for the smaller grids; no output change).
 inline void qs_narrow(Model& m, int i, bind::Layer& L)
 {
+    static const int tpc = getenv("G6_QA_SPLIT_TPC") ? atoi(getenv("G6_QA_SPLIT_TPC")) : 1;
+    if (m.qs.iq && m.qs.ciq[i] >= 0)          // G6_IDXQ_SPLIT: idx.wq_b, alone in its launch
+    {
+        const QsGeo& G = m.qs.geo[m.qs.ciq[i]];
+        if (L.idx_q.O != IDXQ) die("G6_IDXQ_SPLIT: layer " + std::to_string(m.layers[i].l) + " idx.wq_b is not [4096] outputs");
+        bind::narrow(L.idx_q, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+    }
     if (!m.qs.mode) return;
-    const QsGeo& G = m.qs.geo[i];
+    const QsGeo& G = m.qs.geo[m.qs.cqa[i]];
     const Layer& y = m.layers[i];
     if (L.q_a.O != QA || L.kv_a.O != KVA || (y.indexer && (!L.idx_k.on || L.idx_k.O != IDXK || !L.idx_w.on || L.idx_w.O != IDXW)))
         die("G6_QA_SPLIT: layer " + std::to_string(y.l) + " input GEMVs are not q_a [2048] / kv_a [576] / idx.wk [128] / idx.weights_proj [32]");
-    static const int tpc = getenv("G6_QA_SPLIT_TPC") ? atoi(getenv("G6_QA_SPLIT_TPC")) : 1;
     const bool multi = L.x_in.n > 0;          // today's choice (M <= 8, G6_GV_MULTI): keep it
     bind::Gv* part[QS_MAXP] = {&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w};
     for (int p = 0; p < G.np; ++p) bind::narrow(*part[p], G.c0[m.rank][p] / 16, G.n[m.rank][p] / 16, tpc);
@@ -864,23 +911,32 @@ __global__ void __launch_bounds__(256) k_qs_get(QsGeo a, g6::FabricDev g, const 
 // payload bytes of the gather collectives of a step with M rows (Fabric::enqueue_step on the gather fabric)
 inline std::vector<uint32_t> qs_sizes(const Model& m, int M)
 {
-    std::vector<uint32_t> s(m.nl);
-    for (int i = 0; i < m.nl; ++i) s[i] = (uint32_t)(M * m.qs.geo[i].wmax * 2);
+    std::vector<uint32_t> s(m.qs.ncoll());
+    for (int c = 0; c < m.qs.ncoll(); ++c) s[c] = (uint32_t)(M * m.qs.geo[c].wmax * 2);
     return s;
+}
+// gather collective c: this rank's columns out (the tiles' GEMVs ran before it on the stream)
+inline void qs_put(Model& m, int c, int M, cudaStream_t st)
+{
+    k_qs_put<<<M <= 8 ? 1 : 4, 256, 0, st>>>(m.qs.geo[c], m.qs.g, m.stepp, c, M, m.qs.tickets + c);
+}
+// gather collective c: wait for the peers, their columns in
+inline void qs_get(Model& m, int c, int M, cudaStream_t st)
+{
+    k_qs_get<<<M <= 8 ? 1 : 4, 256, 0, st>>>(m.qs.geo[c], m.qs.g, m.stepp, c, M, (size_t)M * m.qs.geo[c].wmax * 2);
 }
 // G6_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
 inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st)
 {
     const QSplit& Q = m.qs;
-    const QsGeo& G = Q.geo[i];
-    const int grid = M <= 8 ? 1 : 4;
+    const int c = Q.cqa[i];
     if (b.x_in.n) bind::launch(b.x_in, st);
     else
     {
         bind::launch(b.q_a, st);
         if (Q.mode == 1) { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
     }
-    k_qs_put<<<grid, 256, 0, st>>>(G, Q.g, m.stepp, i, M, Q.tickets + i);
+    qs_put(m, c, M, st);
     dmark(DP_QA, st);
     if (Q.mode == 2)
     {
@@ -888,9 +944,27 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
         else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
     }
     dmark(DP_IDXKW, st);
-    k_qs_get<<<grid, 256, 0, st>>>(G, Q.g, m.stepp, i, M, (size_t)M * G.wmax * 2);
+    qs_get(m, c, M, st);
     glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
     dmark(DP_QAG, st);
+}
+
+// q_a_norm's fragment table, q_b (this rank's heads) and idx_q. G6_IDXQ_SPLIT on an indexer layer: idx_q's tiles first,
+// published, then q_b while the gather is on the wire, then the gather (the outputs are the same; only the order changes)
+inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st)
+{
+    bind::launch(b.xf_qa, st);
+    const int c = m.qs.iq ? m.qs.ciq[i] : -1;
+    if (c < 0)
+    {
+        bind::launch_q_b(b, st);
+        bind::launch(b.idx_q, st);
+        return;
+    }
+    bind::launch(b.idx_q, st);
+    qs_put(m, c, M, st);
+    bind::launch_q_b(b, st);
+    qs_get(m, c, M, st);
 }
 
 // the GEMVs on the layer input (q_a + its norm, kv_a, the indexer's k and weights): one gv_multi launch when bound
@@ -954,9 +1028,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         bind::launch(b.xf_x, st);
 #endif
         launch_layer_in(m, i, y, b, M, st);
-        bind::launch(b.xf_qa, st);
-        bind::launch_q_b(b, st);
-        bind::launch(b.idx_q, st);
+        launch_qb_idxq(m, i, b, M, st);
         dmark(DP_QB, st);
         for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
         if (!m.graph)
@@ -1057,9 +1129,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     bind::launch(b.xf_x, st);
 #endif
     launch_layer_in(m, i, y, b, M, st);
-    bind::launch(b.xf_qa, st);
-    bind::launch_q_b(b, st);
-    bind::launch(b.idx_q, st);
+    launch_qb_idxq(m, i, b, M, st);
     dmark(DP_QB, st);
 #ifdef DEC_S2
     if (m.s2on) s2_attention(m, i, M, st);
@@ -1209,6 +1279,13 @@ inline const bind::Head& head_for(Model& m, int M)
         io.h = m.x; io.logits = m.hlog;
         io.eh_in = m.eh_in; io.eh = m.eh_out;
         if (const char* e = bind::make_head(m.head_t, m.rank, M, m.sc, io, H)) die("rank " + std::to_string(m.rank) + " head: " + e);
+        if (m.qs.eh)                  // G6_MTP_SPLIT: this rank's tiles of eh_proj (same bits per tile, bind::narrow)
+        {
+            const QsGeo& G = m.qs.geo[m.qs.ceh];
+            if (!H.eh.on || H.eh.O != HID) die("G6_MTP_SPLIT: no eh_proj of [6144] outputs");
+            static const int tpc = getenv("G6_QA_SPLIT_TPC") ? atoi(getenv("G6_QA_SPLIT_TPC")) : 1;
+            bind::narrow(H.eh, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+        }
     }
     return H;
 }
@@ -1449,6 +1526,7 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st)
 #endif
     bind::launch(H.xf_eh, st);
     bind::launch(H.eh, st);
+    if (d.qs.eh) { qs_put(d, d.qs.ceh, M, st); qs_get(d, d.qs.ceh, M, st); }   // G6_MTP_SPLIT: every rank's eh_proj columns
     k_mtp_resid_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(d.eh_out, d.layers[0].attn_norm, d.resid, d.x, glue::RMS_EPS);
 }
 inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
