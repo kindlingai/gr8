@@ -142,6 +142,7 @@ fn caches_mut(r: &mut Rank) -> Vec<CacheMut<'_>> {
 struct Setup {
     views: Vec<View>,
     pages: usize,
+    pooled: bool, // the list came from a Pool, not the tables as built
 }
 
 fn setup(rng: &mut Rng, layout: Layout, n: usize) -> Setup {
@@ -150,6 +151,7 @@ fn setup(rng: &mut Rng, layout: Layout, n: usize) -> Setup {
     let as_built = |pages: usize| Setup {
         views: (0..ranks).map(|_| View { list: (0..logical as u32).collect(), place: u32::MAX }).collect(),
         pages,
+        pooled: false,
     };
     let rp = layout.below_rows as usize / PAGE;
     if rp == 0 || rng.range(0, 3) == 0 {
@@ -184,7 +186,7 @@ fn setup(rng: &mut Rng, layout: Layout, n: usize) -> Setup {
     let list = pool.list(&run).unwrap().to_vec();
     assert_eq!(list.len(), logical);
     // s2_solo_cp_pages bounds s2_list_place with the main model's pool pages: the pool's place
-    Setup { views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages }
+    Setup { views: (0..ranks).map(|_| View { list: list.clone(), place }).collect(), pages, pooled: true }
 }
 
 const ROWS: [usize; 2] = [656, 416];
@@ -212,10 +214,18 @@ fn layouts(rng: &mut Rng, n: usize) -> Vec<Layout> {
 #[test]
 fn tables_follow_the_engine_rule() {
     let mut rng = Rng(11);
+    let (mut pooled, mut scattered, mut split, mut total) = (0, 0, 0, 0);
     for _ in 0..400 {
         let n = rng.range(1, 3000) as usize;
         for l in layouts(&mut rng, n) {
             let s = setup(&mut rng, l, n);
+            total += 1;
+            if s.pooled {
+                pooled += 1;
+                let v = &s.views[0];
+                scattered += v.list.iter().enumerate().any(|(i, &p)| p as usize != i) as u32;
+                split += v.list.iter().any(|&p| p >= v.place) as u32;
+            }
             for b in [Binding { index: true, cp: true }, Binding { index: false, cp: false }] {
                 for r in 0..l.nr.max(1) {
                     let v = &s.views[r as usize];
@@ -225,6 +235,8 @@ fn tables_follow_the_engine_rule() {
             }
         }
     }
+    // the traces reach the cases that matter: Pool runs, scattered lists, past-R runs with drafter pages above place
+    assert!(pooled * 6 > total && scattered * 4 > pooled && split > 50, "pooled {pooled} of {total}, scattered {scattered}, split {split}");
     // the CP map as built (bind.cu): pages 0, 1, .. -> the prefix, then this rank's pages past R, in order
     let l = Layout { nr: 4, below_rows: 128 };
     let v = View { list: (0..6).collect(), place: u32::MAX };
