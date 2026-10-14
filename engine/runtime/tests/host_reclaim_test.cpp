@@ -49,9 +49,9 @@ int main()
     fprintf(stderr, "malloc_trim gave back %ld MiB of 256\n", freed >> 10);
     CHECK(freed >= 192 << 10);
     for (char* p : keep) free(p);
-#endif
 
     if (fails) { fprintf(stderr, "host_reclaim_test: %d FAILED\n", fails); return 1; }
     printf("host_reclaim_test: ok (trim gave back %ld MiB)\n", freed >> 10);
     return 0;
+#endif
 }
