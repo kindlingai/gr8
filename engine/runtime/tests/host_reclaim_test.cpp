@@ -26,21 +26,24 @@ int main()
     const HostMem m = host_mem();                       // Linux: all three are there
     CHECK(m.avail_kb > 0 && m.cached_kb >= 0 && m.rss_kb > 0);
 
-    // 256 MiB in small blocks (below the mmap threshold, so they live in the heap), touched, then freed out of order so
-    // free() cannot shrink the heap's top by itself. malloc_trim must give most of it back.
-    std::vector<char*> v;
-    for (int i = 0; i < 256 * 16; ++i)
+    // 256 MiB in 1 MiB blocks kept in the heap (mmap threshold raised), each followed by a small block that stays live:
+    // the freed blocks cannot merge into the heap's top, so free() keeps them resident, as a loader's freed plans and
+    // vectors stay between live allocations. malloc_trim must give most of them back (whole pages inside free chunks;
+    // the Sparks run 64 KiB pages).
+    mallopt(M_MMAP_THRESHOLD, 64 << 20);
+    std::vector<char*> v, keep;
+    for (int i = 0; i < 256; ++i)
     {
-        char* p = (char*)malloc(64 << 10);
-        memset(p, 1, 64 << 10);
+        char* p = (char*)malloc(1 << 20);
+        memset(p, 1, 1 << 20);
         v.push_back(p);
+        keep.push_back((char*)malloc(64));
     }
-    char* pin = (char*)malloc(64);                      // keeps the heap's top in use
     for (char* p : v) free(p);
     const long freed = host_reclaim(0, "test");
     fprintf(stderr, "malloc_trim gave back %ld MiB of 256\n", freed >> 10);
-    CHECK(freed >= 128 << 10);
-    free(pin);
+    CHECK(freed >= 192 << 10);
+    for (char* p : keep) free(p);
 
     if (fails) { fprintf(stderr, "host_reclaim_test: %d FAILED\n", fails); return 1; }
     printf("host_reclaim_test: ok (trim gave back %ld MiB)\n", freed >> 10);
