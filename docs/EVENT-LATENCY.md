@@ -16,7 +16,16 @@ anchored to.
 
 ## What gets logged
 
-Set `G6_S2_EVENTLOG=1` on every rank. Three kinds of line land on stderr, `out/g6m4.r<r>.err`:
+Start the cluster with the diagnostic in the engine environment:
+
+    G6ENV_X="G6_S2_EVENTLOG=1" ./gr8 glm53 up
+
+`G6ENV_X` is the launch knob for extra engine environment on every rank. Do **not** export `G6_S2_EVENTLOG` directly:
+the engine does not inherit `G6_*` from the environment, and `./gr8 glm53 up` refuses to start while one is set
+([KNOBS.md](../KNOBS.md)). As a cluster-scope knob it goes into the pre-boot handshake, so either every box runs with it
+or none does.
+
+Three kinds of line then land on stderr, `out/g6m4.r<r>.err`:
 
     # s2_event notice rank 0 event 3 cancel request 2 anchored 41 -> boundary 49 (lookahead 8)
     # s2_event commit rank 0 event 3 cancel request 2 boundary 49
