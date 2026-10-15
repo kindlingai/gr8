@@ -662,6 +662,11 @@ int main(int argc, char** argv)
     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
     if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die("G6_QA_SPLIT, G6_IDXQ_SPLIT and G6_MTP_SPLIT are GLM-5.3 paths");
     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
+    // G6_S2_DSEL_START=mtp (s2_batch.h DSel::start_mtp; default dflash): a DFlash2 request starts on MTP. In the S2 runtime
+    // signature
+    const char* dse = getenv("G6_S2_DSEL_START");
+    const bool dsel_start_mtp = dse && !strcmp(dse, "mtp");
+    if (dse && *dse && !dsel_start_mtp && strcmp(dse, "dflash")) die("G6_S2_DSEL_START: mtp or dflash");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -1874,6 +1879,7 @@ int main(int argc, char** argv)
                 if (const char* e = getenv("G6_S2_DSEL_MARGIN")) h.dsel.margin = atof(e);
                 if (const char* e = getenv("G6_S2_DSEL_DWELL")) h.dsel.dwell = std::max(1, atoi(e));
                 if (const char* e = getenv("G6_S2_DSEL_PROBE")) h.dsel.probe = std::max(1, atoi(e));
+                h.dsel.start_mtp = dsel_start_mtp;
                 h.dsel.d.draft_round = 5.6 + 2.5;
                 h.dsel.m.draft_round = 2.5 + 3.0;
                 h.dsel.m.draft_each = 2.1;
@@ -1908,6 +1914,7 @@ int main(int argc, char** argv)
                 h.dfl_reuse.min = dfl_reuse_min;
                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
                                                  dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
+                if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 // G6_DFL_REUSE: also a hit into the window (the fill starts past its rows) and a hit with no prefill at all
                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1 || slot_whole[q]; };
@@ -1989,7 +1996,8 @@ int main(int argc, char** argv)
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dfl_body_i4_on ? " dflbodyi4 1" : "");
+                (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+                (dsel_start_mtp ? " dselstart mtp" : "");
 
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);

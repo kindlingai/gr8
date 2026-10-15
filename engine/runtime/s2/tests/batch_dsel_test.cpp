@@ -81,6 +81,23 @@ int main()
         CHECK(!rounds.empty() && rounds.back() == 'm');
         CHECK(b.stats(0).mtp_rounds > 0);
     }
+    // DSel::start_mtp: the same request starts on MTP (first round 'm', its d[2..K] chained at admit), and the drafter's
+    // prompt-tail probe and later probes move it to DFlash2; every committed token is still the target's
+    {
+        Batch c(3, 32, h);
+        c.dflash(7, g6rt::SpecLen());
+        DSel s2 = sel;
+        s2.start_mtp = true;
+        c.dsel(s2);
+        rounds.clear(); got.clear();
+        c.admit({0}, {s});
+        for (int i = 0; i < 60; ++i) CHECK(c.round({0}));
+        CHECK(rounds.size() == 60 && rounds[0] == 'm' && rounds.back() == 'd');
+        CHECK(c.stats(0).switches == 1 && c.stats(0).mtp_rounds >= 8);
+        bool ex = true;
+        for (size_t i = 0; i < got.size(); ++i) ex &= got[i] == target(9 + (int)i);
+        CHECK(ex && got.size() > 60);
+    }
     std::printf("batch_dsel_test: %s (%ld rounds, %ld on MTP, %ld switches)\n", fails ? "FAIL" : "PASS", b.stats(0).rounds,
                 b.stats(0).mtp_rounds, b.stats(0).switches);
     return fails ? 1 : 0;

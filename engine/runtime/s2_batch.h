@@ -192,6 +192,9 @@ struct DSel
     int dwell = 8;                    // rounds on a drafter before the next switch (4 switched code to MTP too often)
     double margin = 0.15;             // switch when the other drafter's tokens per ms is this much higher (0.05: code -2.7%)
     int probe = 4;                    // every probe-th MTP round the drafter step also drafts (scored next round)
+    // G6_S2_DSEL_START=mtp: a request starts on MTP and the drafter's prompt-tail drafts are its first probe (default:
+    // it starts on DFlash2)
+    bool start_mtp = false;
     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
 };
 // G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
@@ -233,7 +236,7 @@ public:
             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
             if (!prompt(q, ss[k]) || st_[q].force >= 0) continue;
             if (!st_[q].dfl) live.push_back(q);
-            else if (st_[q].mtp) kchain(q, Step::TAIL);   // G6_DFL_REUSE warm-up: d[2..K] (KStop: d[2..k]) for its first round
+            else if (st_[q].mtp) kchain(q, Step::TAIL);   // G6_DFL_REUSE warm-up, DSel::start_mtp: d[2..K] (KStop: d[2..k]) for its first round
         }
         std::vector<int> all;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
@@ -746,6 +749,7 @@ private:
         {
             sel_.d = fresh(sel_.d);
             sel_.m = fresh(sel_.m);
+            x.mtp = sel_.start_mtp;
         }
         if (x.dfl && !(h_.dfl && h_.dfl_start)) throw std::runtime_error("s2: DFlash2 session without drafter hooks");
         stats_[q].acc.assign(std::max(K_, x.dfl ? DFL_B - 1 : 0) + 1, 0);
@@ -785,6 +789,7 @@ private:
             x.dlm[1] = dlp(M - 1);
             const bool query = s == PS - 1 && x.force < 0 && !x.warm;
             if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, query ? t[M - 1] : 0, x.lo, query});
+            if (x.dfl && x.mtp && query) { x.pb = n; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
         }
         return true;
     }
