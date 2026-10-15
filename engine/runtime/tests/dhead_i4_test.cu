@@ -9,6 +9,10 @@
 //    are within that tolerance.
 // --time: the lm_head GEMV of one TP4 vocab slice (38784 x 6144): today's MXFP8 head (tpc 1, ks 32) against the INT4 head
 //    over (tpc, ks), M = 1 and 3, mean of reps launches (CUDA events), and the bytes per launch.
+// 3. (G6_DFL_BODY_I4) 1 and 2 on the DFlash2 drafter's body shapes, at their splits.
+// --time-dfl [reps]: those GEMVs at TP4 per-rank sizes, M = 8, MXFP8 against INT4 at the same split,
+//    each cycling through copies of its records that together exceed the 25 MB L2 (a draft step streams 700 MB), and the
+//    sum over one DFlash2 draft step (context fc + 6 kv; 6 x aconv q kv o mconv gu down).
 // Build: scripts/c1_tests.sh <bin_dir> (TEST=dhead_i4_test)      Exit code: 0 all PASS, 1 any FAIL, 2 CUDA error.
 #include <algorithm>
 #include <cmath>
@@ -173,9 +177,9 @@ static void run_head(const void* rec, int codec, int O, int K, int tpc, int ks, 
     bind::launch(g, nullptr);
 }
 
-static void test_convert_and_gemv()
+static void test_convert_and_gemv(int n = 1024, int K = 6144, std::vector<std::pair<int, int>> splits = {{1, 32}, {1, 16}, {2, 8}})
 {
-    const int n = 1024, K = 6144, ng = K / 32;
+    const int ng = K / 32;
     std::vector<uint8_t> c, s, q;
     std::vector<__half> sc;
     random_mx(n, K, 11u, c, s);
@@ -200,8 +204,7 @@ static void test_convert_and_gemv()
     report(bad == 0, b);
 
     // GEMV on the converted records
-    const int MS[2] = {1, 3};
-    const int SPLIT[3][2] = {{1, 32}, {1, 16}, {2, 8}};
+    const int MS[3] = {1, 3, 8};
     std::vector<__half> hx((size_t)8 * K);
     for (size_t i = 0; i < hx.size(); ++i) hx[i] = __float2half_rn(((rnd(i, 99u) >> 8) * (1.f / 16777216.f) * 2.f - 1.f));
     __half* dx;
@@ -213,15 +216,15 @@ static void test_convert_and_gemv()
     CK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
     uint8_t* dp;
     CK(cudaMalloc(&dp, want.size()));
-    for (const auto& sp : SPLIT)
+    for (const auto& sp : splits)
     {
         CK(cudaMemcpy(dp, di4, want.size(), cudaMemcpyDeviceToDevice));
 #if DEC_I4PAIR
-        launch_i4pair(dp, n / 16, ng, sp[1], nullptr);
+        launch_i4pair(dp, n / 16, ng, sp.second, nullptr);
 #endif
         for (int M : MS)
         {
-            run_head(dp, bind::INT4, n, K, sp[0], sp[1], M, dx, xf, dy);
+            run_head(dp, bind::INT4, n, K, sp.first, sp.second, M, dx, xf, dy);
             CK(cudaDeviceSynchronize());
             std::vector<float> y((size_t)M * n);
             CK(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
@@ -251,7 +254,7 @@ static void test_convert_and_gemv()
                 if (rg != gg && std::fabs(ref[rg] - ref[gg]) > 1e-5 * (mag[rg] + mag[gg])) ++argmax_bad;
             }
             snprintf(b, sizeof b, "INT4 head GEMV O=%d K=%d tpc=%d ks=%d M=%d: worst |gpu - host| / sum|terms| %.2e, argmax differs in %d rows",
-                     n, K, sp[0], sp[1], M, worst, argmax_bad);
+                     n, K, sp.first, sp.second, M, worst, argmax_bad);
             report(worst < 1e-5 && argmax_bad == 0, b);
         }
     }
@@ -316,13 +319,100 @@ static void time_heads(int reps)
     fflush(stdout);
 }
 
+// the drafter's body GEMVs at TP4 per-rank sizes (dflash.cuh dfl_build)
+struct DflShape { const char* name; int O, K, tpc, ks, n; };   // n: launches per draft step
+static const DflShape DFL[] = {{"fc", 1536, 36864, 1, 32, 1}, {"kv", 512, 6144, 1, 32, 12}, {"aconv/mconv", 1536, 6144, 1, 16, 12},
+                               {"q", 2048, 6144, 1, 16, 6}, {"o", 6144, 2048, 2, 8, 6}, {"gu", 6144, 6144, 2, 16, 6},
+                               {"down", 6144, 3072, 2, 8, 6}};
+
+static void time_dfl(int reps)
+{
+    const size_t L2SET = 96u << 20;   // > 25 MB L2: each launch reads records the previous ones evicted
+    double tot_mx = 0, tot_i4 = 0;
+    __half* dx;
+    u32* xf;
+    void* dy;
+    CK(cudaMalloc(&dx, (size_t)8 * 36864 * 2));
+    CK(cudaMemset(dx, 0x31, (size_t)8 * 36864 * 2));
+    CK(cudaMalloc(&xf, (size_t)36864 / 16 * 64 * 4 * g6mx::NT));
+    CK(cudaMalloc(&dy, (size_t)8 * 6144 * 4));
+    bind::Xfrag f;
+    f.on = 1; f.src = dx; f.ld = 36864; f.K = 36864; f.M = 8; f.f16 = xf;
+    bind::launch(f, nullptr);
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    for (const DflShape& d : DFL)
+    {
+        const int ng = d.K / 32;
+        const size_t mxb = (size_t)d.O / 16 * ng * 528, i4b = head_i4::bytes(d.O / 16, ng);
+        const int copies = (int)std::max<size_t>(1, (L2SET + mxb - 1) / mxb);
+        std::vector<uint8_t> h(mxb);
+        for (size_t i = 0; i < mxb; ++i)
+        {
+            uint8_t v = (uint8_t)rnd(i, 7u);
+            if (i % 528 >= 512) v = (uint8_t)(116 + v % 6);
+            else if ((v & 0x7f) == 0x7f) v &= 0xbf;
+            h[i] = v;
+        }
+        std::vector<uint8_t*> mx(copies), i4(copies);
+        for (int c = 0; c < copies; ++c)
+        {
+            CK(cudaMalloc(&mx[c], mxb));
+            CK(cudaMalloc(&i4[c], i4b));
+            CK(cudaMemcpy(mx[c], h.data(), mxb, cudaMemcpyHostToDevice));
+            head_i4::launch(mx[c], i4[c], d.O / 16, ng, nullptr);
+#if DEC_I4PAIR
+            int ks = d.ks;
+            while (ks > 1 && ng % ks) ks >>= 1;       // make_gv's k-part count
+            launch_i4pair(i4[c], d.O / 16, ng, ks, nullptr);
+#endif
+        }
+        for (int M : d.n ? std::vector<int>{8} : std::vector<int>{1, 3})
+        {
+            auto timeit = [&](const std::vector<uint8_t*>& rec, int codec) {
+                std::vector<bind::Gv> g(copies);
+                for (int c = 0; c < copies; ++c)
+                    if (const char* e = bind::make_gv(mk(rec[c], d.O / 16, ng, codec == bind::INT4 ? 288 : 528), codec, d.tpc, d.ks, M, xf, dy,
+                                                      gv::O_F16, g[c]))
+                    {
+                        printf("make_gv: %s\n", e);
+                        exit(2);
+                    }
+                for (int i = 0; i < 2 * copies; ++i) bind::launch(g[i % copies], nullptr);
+                CK(cudaEventRecord(e0));
+                for (int i = 0; i < reps; ++i) bind::launch(g[i % copies], nullptr);
+                CK(cudaEventRecord(e1));
+                CK(cudaEventSynchronize(e1));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                return 1e3 * ms / reps;
+            };
+            const double t = timeit(mx, bind::MXFP8);
+            const double u = timeit(i4, bind::INT4);
+            printf("TIME dfl %-12s O=%d K=%d tpc=%d ks=%d M=%d x%d: MXFP8 %.1f us (%.1f MB, %.0f GB/s), INT4 %.1f us (%.1f MB, %.0f GB/s), %.2fx\n",
+                   d.name, d.O, d.K, d.tpc, d.ks, M, d.n, t, mxb / 1e6, mxb / t / 1e3, u, i4b / 1e6, i4b / u / 1e3, t / u);
+            tot_mx += d.n * t; tot_i4 += d.n * u;
+        }
+        for (int c = 0; c < copies; ++c) { cudaFree(mx[c]); cudaFree(i4[c]); }
+    }
+    printf("TIME dfl draft step body GEMVs: MXFP8 %.3f ms, INT4 %.3f ms, saved %.3f ms\n", tot_mx / 1e3, tot_i4 / 1e3, (tot_mx - tot_i4) / 1e3);
+    cudaFree(dx); cudaFree(xf); cudaFree(dy);
+    fflush(stdout);
+}
+
 int main(int argc, char** argv)
 {
-    int reps = 0;
+    int reps = 0, dreps = 0;
     for (int i = 1; i < argc; ++i)
+    {
         if (!strcmp(argv[i], "--time")) reps = i + 1 < argc ? atoi(argv[++i]) : 200;
+        else if (!strcmp(argv[i], "--time-dfl")) dreps = i + 1 < argc ? atoi(argv[++i]) : 400;
+    }
     test_convert_and_gemv();
+    for (const DflShape& d : DFL) test_convert_and_gemv(256, d.K, {{d.tpc, d.ks}});   // G6_DFL_BODY_I4 shapes
     if (reps > 0) time_heads(reps);
+    if (dreps > 0) time_dfl(dreps);
     printf("%d PASS, %d FAIL\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

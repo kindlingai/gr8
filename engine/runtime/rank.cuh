@@ -1026,6 +1026,36 @@ inline void route_log_line(FILE* f, const Model& m, const std::vector<int>& ids,
 
 inline const __nv_bfloat16* norm_after(const Model& m, int i) { return i + 1 < m.nl ? m.layers[i + 1].attn_norm : m.final_norm; }
 
+// G6_DFL_BODY_I4: a bound MXFP8 GEMV rebound to INT4 g32 records of the same rows (k_mx_to_i4 over
+// its O/16 tiles x K/32 groups, the G6_DRAFT_HEAD_I4 arithmetic; DEC_I4PAIR builds repack them for its ks): same split,
+// fragment table and output, only the weights' codec changes. One copy per (records, tiles, ks), so GEMVs that bind the
+// same records share it (the drafter's kv record: its context and block GEMVs).
+// Device memory for the life of the process; the MXFP8 records stay (they sit in the pack image). Returns the bytes made.
+inline size_t gv_to_i4(bind::Gv& g, const char* who, cudaStream_t st)
+{
+    struct Made { const uint8_t* mx; int tiles, ks; const uint8_t* i4; };
+    static std::vector<Made> made;
+    if (!g.on) return 0;
+    if (g.codec != bind::MXFP8) die(std::string(who) + ": a GEMV that is not on MXFP8 records");
+    const int tiles = g.O / 16, ng = g.K / 32;
+    for (const Made& x : made)
+        if (x.mx == g.w && x.tiles == tiles && x.ks == g.ks) { g.codec = bind::INT4; g.w = x.i4; return 0; }
+#if DEC_I4PAIR
+    if ((size_t)ng / g.ks * head_i4::I4GR > 48 * 1024) die(std::string(who) + ": k part too long for k_i4pair's shared memory");
+#endif
+    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
+    head_i4::launch(g.w, rec, tiles, ng, st);
+    G6RT_CK(cudaGetLastError());
+#if DEC_I4PAIR
+    launch_i4pair(rec, tiles, ng, g.ks, st);   // make_gv kept ng % ks == 0
+    G6RT_CK(cudaGetLastError());
+#endif
+    G6RT_CK(cudaStreamSynchronize(st));
+    made.push_back(Made{g.w, tiles, g.ks, rec});
+    g.codec = bind::INT4; g.w = rec;
+    return head_i4::bytes(tiles, ng);
+}
+
 inline glue::HeadArgs head_args(Model& m, int M)
 {
     return glue::HeadArgs{m.f, m.stepp, 2 * m.nl, M, m.hlog, m.vn, m.vlo, m.vn, m.srow, m.tickets + 2 * m.nl, m.tok_out, m.lp,
