@@ -6,8 +6,9 @@ streaming and `/metrics`. The front end comes in two implementations. `./gr8 glm
 Rust binary. `tests/diff_fronts.py` compares it with `g6front/`, pure Python asyncio. Nothing
 launches or ships the Python one (the shim and the mock use only its `wire` and `tokenizer` modules), and it does not
 have the thinking controls below: it still passes `enable_thinking` to the template, ignores `thinking_budget` and
-`response_format`, and has no `completion_tokens_details`. So `diff_fronts.py` shows those differences in every chat
-case.
+`response_format`, and has no `completion_tokens_details`. It also refuses a forced `tool_choice` (`required` or a named
+function), which needs the engine's insert rule and the protocol version the Python one does not speak. So
+`diff_fronts.py` shows those differences in every chat case.
 
 ## Endpoints
 
@@ -234,8 +235,9 @@ end: the Python one fails its thinking tests (see the top of this file).
 
 ## Deviations from vLLM
 
-- These return 400: `n>1`, batched prompts, `echo`, `suffix`, named or required `tool_choice`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off (above).
+- These return 400: `n>1`, batched prompts, `echo`, `suffix`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off (above).
 - Tool-call argument JSON streams once per completed key/value pair instead of per token. The final concatenated string is identical.
 - Tool-call tags are parsed only when the request has `tools` and `tool_choice` is not `none`.
+- `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text, and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (its first token is the opener, not `<think>`), its opener counts toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request), and it is Rust-only (see the top of this file).
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).
 - The benchmark client is `../bench/pbench.py`.

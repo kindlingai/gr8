@@ -14,6 +14,7 @@ mod sampling;
 mod template;
 mod thinking;
 mod tok;
+mod tool_choice;
 mod util;
 mod wire;
 

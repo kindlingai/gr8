@@ -13,7 +13,9 @@ prompts, in whole blocks of --reuse-block tokens (64 by default; S2 reuses whole
 never the rows a request decoded). A prompt whose last assistant turn already closed its think block (a thinking
 budget's continuation) gets its reply without the reasoning. A generate frame's insert rule (PROTOCOL.md; off with
 --no-insert, which leaves `insert` out of the hello) puts its tokens in place of the reply's after_tokens+1-th, and the
-reply goes on as the continuation of a prompt that holds them. Logprobs and prompt_logprobs are fake but deterministic,
+reply goes on as the continuation of a prompt that holds them; an insert that opens a tool call (a front end's forced
+`tool_choice`) continues inside the call -- the name, if the opener does not hold one, then the arguments, then the
+close, with no reasoning. Logprobs and prompt_logprobs are fake but deterministic,
 proper (sum p < 1), and the scored token is not always the argmax.
 
 usage: mock_engine.py --model-dir DIR [--sock /tmp/g6-mock.sock]
@@ -35,6 +37,7 @@ from g6front.tokenizer import GlmTokenizer  # noqa: E402
 log = logging.getLogger('mock_engine')
 
 USER, ASSISTANT, OBSERVATION = '<|user|>', '<|assistant|>', '<|observation|>'
+TOOL_OPEN, TOOL_CLOSE = '<tool_call>', '</tool_call>'  # GLM's tool-call format (frontend/g6front-rs/src/parser.rs)
 REASONING = 'Let me think about how to answer this well. I will keep it short and clear.'
 PROSE = ('The harbor lay quiet under a pale morning sky, and the old keeper walked the length of the stone pier '
          'as he had done for thirty years. Gulls turned over the water, the tide pulled at the pilings, and the '
@@ -69,15 +72,10 @@ class Mock:
         enc = lambda s: self.t.encode(s, add_special_tokens=False)  # noqa: E731
         if text.rfind(OBSERVATION) > text.rfind(USER):  # answering after a tool result
             return head + enc('The tool returned its result; here is the answer.'), self.stop_user
-        blocks = re.findall(r'<tools>(.*?)</tools>', text, re.S)
-        tool_lines = [ln for ln in (blocks[-1] if blocks else '').splitlines() if ln.strip().startswith('{')]
-        if tool_lines:
-            tool = json.loads(tool_lines[0])
-            props = list(((tool.get('parameters') or {}).get('properties') or {}).keys())
-            args = ''.join(f'<arg_key>{k}</arg_key><arg_value>{"Paris" if i == 0 else 3}</arg_value>'
-                           for i, k in enumerate(props[:2]))
-            return head + enc('I will call a tool.') + enc(f'<tool_call>{tool["name"]}{args}</tool_call>'), \
-                self.stop_obs
+        tool = self.first_tool(text)
+        if tool:
+            return head + enc('I will call a tool.') + enc(f'{TOOL_OPEN}{tool["name"]}{self.tool_args(tool)}'
+                                                           f'{TOOL_CLOSE}'), self.stop_obs
         if '####' in last_user:
             return head + enc('Working: 6 * 7 = 42.\n#### 42'), self.stop_user
         if '```python' in last_user:
@@ -85,6 +83,36 @@ class Mock:
             name = fn.group(1) if fn else 'solution'
             return head + enc(f'```python\ndef {name}(*args, **kwargs):\n    return None\n```'), self.stop_user
         return head, None
+
+    def first_tool(self, text):
+        """The first tool the prompt defines (the front end renders them into a <tools> block), or None."""
+        blocks = re.findall(r'<tools>(.*?)</tools>', text, re.S)
+        lines = [ln for ln in (blocks[-1] if blocks else '').splitlines() if ln.strip().startswith('{')]
+        return json.loads(lines[0]) if lines else None
+
+    def tool_args(self, tool):
+        """Two arguments, deterministic (the first is the 'Paris' every test expects)."""
+        props = list(((tool.get('parameters') or {}).get('properties') or {}).keys())
+        return ''.join(f'<arg_key>{k}</arg_key><arg_value>{"Paris" if i == 0 else 3}</arg_value>'
+                       for i, k in enumerate(props[:2]))
+
+    def forced_rest(self, text):
+        """The rest of a reply the insert rule opened inside a tool call (a front end's forced `tool_choice`), else None.
+
+        The engine put the opener -- and, for a named choice, the name -- in place of the reply's first token, so the
+        model goes on inside the call: it writes the name only if the opener does not hold one, then the arguments, then
+        the close. No reasoning head: the reply is already inside the call. An insert that opened no call (the thinking
+        budget's close) is not this, and returns None.
+        """
+        if TOOL_OPEN not in text or TOOL_CLOSE in text.rsplit(TOOL_OPEN, 1)[-1]:
+            return None
+        tool = self.first_tool(text)
+        if tool is None:
+            return None
+        open_txt = text.rsplit(TOOL_OPEN, 1)[-1]
+        name = '' if open_txt.strip() else tool['name']
+        enc = self.t.encode(name + self.tool_args(tool) + TOOL_CLOSE, add_special_tokens=False)
+        return enc, self.stop_obs
 
     def stream(self, prompt, max_tokens, min_tokens, stop_ids, insert=None):
         out, stop = self.plain_stream(prompt, max_tokens, min_tokens, stop_ids)
@@ -96,8 +124,10 @@ class Mock:
         head = out[:after] + ins
         if len(head) >= max_tokens:
             return head[:max_tokens], None
-        rest, stop = self.plain_stream(prompt + head, max_tokens - len(head), max(0, min_tokens - len(head)), stop_ids)
-        return head + rest, stop
+        rest = self.forced_rest(self.t.decode(prompt + head, skip_special_tokens=False))
+        if rest is None:
+            rest = self.plain_stream(prompt + head, max_tokens - len(head), max(0, min_tokens - len(head)), stop_ids)
+        return head + rest[0], rest[1]
 
     def plain_stream(self, prompt, max_tokens, min_tokens, stop_ids):
         ids, stop = self.script(prompt)

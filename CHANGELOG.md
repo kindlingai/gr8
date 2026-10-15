@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-10-14: a forced tool_choice makes the reply a call, not text
+
+- `tool_choice: "required"` and a function-naming object were a 400 ("named / required tool_choice is not supported").
+  They now force the reply to be a tool call with the engine's insert rule (PROTOCOL.md `insert`): the engine puts the
+  tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer
+  in text. That is the mechanism the thinking budget already uses to close a `<think>` block, per request and from the
+  committed tokens alone, so no engine or protocol change was needed — the front end only had to stop refusing them.
+- It is a strong nudge, not a grammar. gr8's engine samples, so the front end cannot mask logits: a call to a name the
+  request did not offer still comes back as text (the parser drops an unknown name), and the arguments are the model's
+  own, coerced by the tool's schema as before. A forced reply carries no reasoning — its first token is the opener, not
+  `<think>` — and the opener counts toward `completion_tokens` and toward `max_tokens` like any inserted token.
+- Refused, with the field named: `required` with no tools, a name that is not in `tools`, an unknown string (it used to
+  reach the parser and be treated as `auto`), `tool_choice` beyond a string or a function object, `logprobs` (an
+  inserted token has no logprob), an explicit `thinking_budget` (one insert rule to a request; a server default budget
+  steps aside instead), and an engine whose hello does not say `insert` — the capability `thinking_budget` needs too.
+- New `tool_choice.rs` unit tests for the parsing and the forced text (the pure parts; the ids need the tokenizer);
+  `tests/test_api.py` cases against the mock, which now continues inside a call an insert opened (the name if the opener
+  does not hold one, then the arguments, then the close, with no reasoning); and a smoke case where the message asks for
+  prose in French and still gets `get_weather`. The Python reference front end stays a 400 — it speaks hello version 1
+  and has no `insert` field — so the two `err_tool_choice` cases are gone from `diff_fronts.py` rather than diverging
+  there, and `frontend/README.md` says which front end has it.
+
 ## 2026-10-14: the event boundaries are logged, so a cancel's delay can be attributed
 
 - #61's ~24 s has two candidate mechanisms that need different fixes: the scheduler served one prefill at a time and

@@ -214,9 +214,9 @@ CASES = {
     'err_message_role': chat([{'content': 'x'}]),
     'err_content_type': chat([{'role': 'user', 'content': 5}]),
     'err_echo': chat([U('x')], echo=True),
-    'err_tool_choice': chat([U('x')], tools=TOOLS, tool_choice='required'),
-    'err_tool_choice_named': chat([U('x')], tools=TOOLS, tool_choice={'type': 'function',
-                                                                      'function': {'name': 'get_weather'}}),
+    # no tool_choice required/named cases: the shipping Rust front end forces the call with the engine's insert rule
+    # (force_tool_choice), which the Python one does not speak (it is pinned at hello version 1), so those would differ
+    # by design. tests/test_api.py covers them against the mock.
     'err_tools_shape': chat([U('x')], tools=[{'type': 'function'}]),
     'err_template_kwargs': chat([U('x')], chat_template_kwargs={'tokenize': True}),
     'err_custom_template': chat([U('x')], chat_template='{{ x }}'),
