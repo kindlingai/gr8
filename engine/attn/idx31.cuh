@@ -53,6 +53,86 @@ template<class Input>
 static void launch_index_scores_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
     index_scores_m<<<(a.context+31)/32,128,0,st>>>(input,start,n,w.iq,w.weights,w.si);
 }
+// G6_IDX_GRP=<G> (attn_idx_grp; decode run_body, the per-row indexer calls, i.e. S2 batched steps): index_scores with the
+// key tile read once for a group of rows of ONE session (rows bound to the same G6AttnRow bounds and table; step rows of a
+// session are contiguous), at most G rows: the groups are the session runs cut at rows that are multiples of G, and the CTA
+// of a group's first row runs the group (the others return). Tile load as index_scores<1> (16 B loads when page_size >= 32
+// and the tile is this CP rank's; else index_scores' scalar loop: the same fp16 key values and scales; the same ik_at
+// errors, which depend on the tile's page only), skipped when the tile is past every row of the group. Then warp w runs
+// rows w, w + 4, ... of the group: per row index_scores' four 16x16 wmma tiles (the same fragments, k order and
+// accumulator chain per tile; one warp computes all four), stored to the warp's own products, and index_scores' epilogue
+// (the same head-order ReLU-weighted sum, scale, masks, error 4, score and id stores). A row the tile is past writes
+// index_scores' early-return values. Per row bit-identical to index_scores (and small_decode::index_scores).
+#ifdef DEC_S2
+__device__ __forceinline__ bool same_session(const G6Attn&,int,int){return true;}
+__device__ __forceinline__ bool same_session(const ReplayInput& in,int r1,int r2){
+    const G6AttnRow* rows=in.cell->rows;if(!rows)return true;
+    const G6AttnRow x=rows[r1],y=rows[r2];
+    return x.table==y.table&&x.context==y.context&&x.page_count==y.page_count&&x.table_size==y.table_size&&x.ibase==y.ibase;
+}
+#else
+template<class Input> __device__ __forceinline__ bool same_session(const Input&,int,int){return true;}
+#endif
+template<class Input>
+__global__ void __launch_bounds__(128) index_scores_g(Input input,int start,int n,int G,const half* q,const float* weights,float* scores,int* ids){
+    auto a=resolve(input);if(!a.active)return;
+    using namespace nvcuda;
+    const int t0=blockIdx.x*32,row0=blockIdx.y,r0=start+row0,t=threadIdx.x,warp=t/32,lane=t&31;
+    if(row0%G&&same_session(input,r0-1,r0))return;   // not the first row of its group
+    int g=1;while(row0+g<n&&(row0+g)%G&&same_session(input,r0,r0+g))g++;
+    FOR_ROW(a,input,r0);   // the group's bounds and table
+    __shared__ __align__(32) half key[32*128];
+    __shared__ __align__(32) float products[4][32*32];
+    __shared__ float scales[32];
+    int pmax=-1;for(int k=0;k<g;k++)pmax=max(pmax,a.positions[r0+k]);
+    if(t0<=pmax){
+        if(a.page_size>=32&&CP_MINE(a,t0)){
+            const int live=min(32,a.live_context-t0);float scale=0;const uint8_t* src=live>0?ik_at(a,t0,scale):nullptr;
+            if(t<32)scales[t]=src&&t<live?((const float*)(src-(t0%a.page_size)*128+a.page_size*128))[t0%a.page_size+t]:0.f;
+            #pragma unroll
+            for(int u=0;u<2;u++){const int i=t+u*128,col=i/8;   // 256 x 16 B
+                uint4 v=src&&col<live?((const uint4*)src)[i]:make_uint4(0,0,0,0);const uint16_t* c=(const uint16_t*)&v;
+                __half2* dst=(__half2*)key+i*8;
+                #pragma unroll
+                for(int k=0;k<8;k++)dst[k]=__half2(__nv_cvt_fp8x2_to_halfraw2(c[k],__NV_E4M3));}
+        }else
+        for(int i=t;i<32*128;i+=128){int col=i/128,dim=i%128,pos=t0+col;float scale=0;const uint8_t* src=pos<a.live_context&&CP_MINE(a,pos)?ik_at(a,pos,scale):nullptr;
+            key[i]=__float2half_rn(src?e4(src[dim]):0);if(dim==0)scales[col]=scale;}
+    }
+    __syncthreads();
+    float* prod=products[warp];
+    for(int k=warp;k<g;k+=4){
+        const int row=row0+k,r=start+row;
+        if(t0>a.positions[r]){if(t0+lane<a.context){scores[(int64_t)row*a.context+t0+lane]=-INFINITY;ids[(int64_t)row*a.context+t0+lane]=t0+lane;}continue;}
+        wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> A[2];
+        wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> B[2];
+        wmma::fragment<wmma::accumulator,16,16,16,float> C[2][2];
+        #pragma unroll
+        for(int x=0;x<2;x++)
+            #pragma unroll
+            for(int y=0;y<2;y++)wmma::fill_fragment(C[x][y],0.f);
+        for(int kk=0;kk<128;kk+=16){
+            #pragma unroll
+            for(int x=0;x<2;x++){wmma::load_matrix_sync(A[x],q+((int64_t)row*32+x*16)*128+kk,128);wmma::load_matrix_sync(B[x],key+x*16*128+kk,128);}
+            #pragma unroll
+            for(int x=0;x<2;x++)
+                #pragma unroll
+                for(int y=0;y<2;y++)wmma::mma_sync(C[x][y],A[x],B[y],C[x][y]);}
+        #pragma unroll
+        for(int x=0;x<2;x++)
+            #pragma unroll
+            for(int y=0;y<2;y++)wmma::store_matrix_sync(prod+x*16*32+y*16,C[x][y],32,wmma::mem_row_major);
+        __syncwarp();
+        if(t0+lane<a.context){float score=0;for(int h=0;h<32;h++)score+=fmaxf(prod[h*32+lane],0.f)*weights[row*32+h];score*=scales[lane];
+            int pos=t0+lane;if(pos>a.positions[r]||!CP_MINE(a,pos))score=-INFINITY;else if(!isfinite(score)){error(a,4);score=-INFINITY;}
+            scores[(int64_t)row*a.context+pos]=score;ids[(int64_t)row*a.context+pos]=pos;}
+        __syncwarp();
+    }
+}
+template<class Input>
+static void launch_index_scores_g(const G6Attn& a,Input input,Work& w,int start,int n,int G,cudaStream_t st){
+    index_scores_g<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,n,G,w.iq,w.weights,w.si,w.ii);
+}
 #ifdef SEL32
 template<class Input>
 __global__ void radix_histogram32_live(Input input,const float* scores,SelectionState* state,int* bins,int pass){
@@ -132,10 +212,11 @@ static void threshold_compact32_live(const G6Attn& a,Input input,Work& w,int cou
 }
 // the DEC_IDX31 select: as select_index, with the live-context chunk bound past 32768
 template<class Input>
-static cudaError_t select_index31(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream){
-    if(a.context<=32768)return select_index(a,input,w,start,count,stream);
+static cudaError_t select_index31(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,int rank=0){
+    if(a.context<=32768)return select_index(a,input,w,start,count,stream,rank);
     threshold_compact32_live(a,input,w,count,stream);
-    sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
+    if(rank)launch_rank_selected<2>(rank,input,start,w.si,w.selected,count,stream);
+    else sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
     return cudaGetLastError();
 }
 #endif
