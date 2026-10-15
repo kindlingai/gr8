@@ -1302,28 +1302,35 @@ inline DraftHeadI4 draft_head_i4_env()
     if (c.tpc * c.ks > 32) die("G6_DRAFT_HEAD_TPC x G6_DRAFT_HEAD_KS must be <= 32 (warps of one CTA)");
     return c;
 }
+// INT4 g32 head records [vn/16][192][288] of a rank's MXFP8 lm_head slice mx (G.lm_head.mx.gv), DEC_I4PAIR-repacked for
+// k-part count ks; device memory owned by the caller for the life of the process. Shared by the MTP draft
+// (G6_DRAFT_HEAD_I4) and the DFlash2 drafter (G6_DFL_HEAD_I4, dflash.cuh dfl_head_i4): same slice, same ks, one copy.
+inline const uint8_t* head_i4_records(const bind::Tensor& mx, int vn, int ks, int rank, const char* who, cudaStream_t st)
+{
+    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
+        die(std::string(who) + ": G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
+    const int tiles = vn / 16, ng = HID / 32;
+    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
+    head_i4::launch(static_cast<const uint8_t*>(mx.p), rec, tiles, ng, st);
+    G6RT_CK(cudaGetLastError());
+#if DEC_I4PAIR
+    launch_i4pair(rec, tiles, ng, ks, st);      // the pair records gv_gemv reads for k-part count ks (ng % ks == 0: make_gv keeps it)
+    G6RT_CK(cudaGetLastError());
+#endif
+    G6RT_CK(cudaStreamSynchronize(st));
+    fprintf(stderr, "# rank %d: %s: INT4 g32 head records, %.1f MB (MXFP8 %.1f MB), ks %d\n", rank, who,
+            head_i4::bytes(tiles, ng) / 1e6, (double)tiles * ng * head_i4::MXGR / 1e6, ks);
+    return rec;
+}
 // after build_draft, before prepare / any capture of a draft step (head_for binds the records on first use)
 inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
 {
     Model& d = D.d;
     if (!c.on) return;
-    const bind::Tensor& mx = d.head_t.lm_head;
-    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != d.vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
-        die("G6_DRAFT_HEAD_I4: G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
     for (int M = 1; M <= MX; ++M)
         if (d.head[M].M) die("G6_DRAFT_HEAD_I4: the draft head was bound before its INT4 records were made");
-    const int tiles = d.vn / 16, ng = HID / 32;
-    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
-    head_i4::launch(static_cast<const uint8_t*>(mx.p), rec, tiles, ng, st);
-    G6RT_CK(cudaGetLastError());
-#if DEC_I4PAIR
-    launch_i4pair(rec, tiles, ng, c.ks, st);    // the pair records gv_gemv reads for k-part count ks (ng % ks == 0: make_gv keeps it)
-    G6RT_CK(cudaGetLastError());
-#endif
-    G6RT_CK(cudaStreamSynchronize(st));
-    d.dh_i4 = rec; d.dh_tpc = c.tpc; d.dh_ks = c.ks;
-    fprintf(stderr, "# rank %d: G6_DRAFT_HEAD_I4: MTP draft head as INT4 g32, %.1f MB (MXFP8 %.1f MB), tpc %d ks %d\n", d.rank,
-            head_i4::bytes(tiles, ng) / 1e6, (double)tiles * ng * head_i4::MXGR / 1e6, c.tpc, c.ks);
+    d.dh_i4 = head_i4_records(d.head_t.lm_head, d.vn, c.ks, d.rank, "G6_DRAFT_HEAD_I4", st);
+    d.dh_tpc = c.tpc; d.dh_ks = c.ks;
 }
 #ifdef DEC_S2
 inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);

@@ -679,6 +679,22 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
             D.fc.codec == bind::MXFP8 ? "MXFP8" : "BF16");
 }
 
+// G6_DFL_HEAD_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's head GEMV reads INT4 g32 records of this
+// rank's vocab slice (rank.cuh head_i4_records; the MTP draft's copy when G6_DRAFT_HEAD_I4 made one, same slice and ks)
+// instead of the target's MXFP8 records. The head feeds the drafter two ways: argmax mode samples from its logits
+// (k_head_local / merge, as the MTP draft); selector mode takes each row's global top-16 by raw logit (k_top_local, merged
+// in k_walk) and scores them as logit + pred[prev] . hp[s] . succ[c], so INT4 can change both which 16 are candidates and
+// their scores. The target's head and the verify step are unchanged. After dfl_build, before the drafter's graphs.
+inline void dfl_head_i4(Dfl& D, const uint8_t* rec, int tpc, int ks)
+{
+    bind::Tensor t;
+    t.p = rec; t.nd = 3;
+    t.shape[0] = D.vn / 16; t.shape[1] = HID / 32; t.shape[2] = head_i4::I4GR;
+    if (const char* e = bind::make_gv(t, bind::INT4, tpc, ks, dfl::B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head))
+        die(std::string("G6_DFL_HEAD_I4: ") + e);
+    if (D.head.lm_head.O != D.vn || D.head.lm_head.K != HID) die("G6_DFL_HEAD_I4: INT4 head is not this rank's vocab slice");
+}
+
 // ---------------------------------------------------------------- the step, in phases
 inline void dfl_xfrag(const __half* src, int K_, u32* f16, u32* b16, cudaStream_t st)
 {
