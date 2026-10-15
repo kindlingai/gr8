@@ -2,7 +2,8 @@
 // (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier attention-chain bench without the MK
 // chain kernel. Flags under test (each a host-side static the bench assigns): G6_ATTN_SC2 / _SC2_TR (scores_sc), G6_ATTN_CTX2
 // (context_parts_heads PB / context_pk), G6_ATTN_CTX3 / _CTX3_HG (context_pk3), G6_ATTN_SEL2 (rank_selected), G6_IDX_GRP
-// (index_scores_g).
+// (index_scores_g); round 3: G6_ATTN_ABS2 (absorb_m2), G6_ATTN_VP2 (value_project_m2), G6_ATTN_QT (lane-transposed q for
+// scores_sc), G6_ATTN_FRONT (attn_front), G6_ATTN_CTX4 (context_pk4).
 // Layers: a full-index layer (its own indexer + select) then a shared layer reusing its indices, M rows at live context L in
 // capture bucket T, S2 batched cell with per-row tables (s2=1, as served). One call's GPU time inside a graph of K calls,
 // median of TR alternating trials; "cold" = a 96 MB L2 flush before every call, flush subtracted (served case: the experts
@@ -17,8 +18,9 @@
 //           rows and index pages, per layer the raw scores (chain prefix through the scores node) and the context parts
 //           (prefix through the context node), the shared layer's normalized probabilities and merged context. Captured
 //           once, before any arm is touched.
-//   BASE    the round-1 kernels (default SC2=4,TR=1,CTX2=4, the round-1 best combo; ATTNK_BASE overrides, "stock" = all 0):
-//           every arm's timing is against BASE, so a gain is on top of round 1. BASE itself is the first arm (against stock).
+//   BASE    the serving kernels of rounds 1 + 2 (default SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16; ATTNK_BASE overrides,
+//           "stock" = all 0): every arm's timing is against BASE, so a gain is on top of round 2. BASE itself is the first
+//           arm (against stock).
 //   CHAIN   per-kernel table of BASE (what bit 1) and of stock (bit 4): in-chain cost of every node = T(prefix k) -
 //           T(prefix k-1), hot / cold / dead, DRAM floor.
 //   ARM     one flag setting (BASE + changes):
@@ -36,8 +38,8 @@
 //   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o attnk attnk.cu ../bind.cu -lcublas
 // run: attnk T L M [what=3] [s2=1] [reps=10] [K=16] [TR=7] [chk=5] [bw=250]
 //   what: 1 CHAIN of BASE, 2 the arms, 4 CHAIN of stock. Arms: env ATTNK_ARMS="arm arm ..." with an arm = comma-separated
-//   KEY=VALUE changes over BASE (keys SC2 TR CTX2 CTX3 HG SEL2 IDX; "base" = BASE alone, compared against stock), default
-//   below. ATTNK_BASE="SC2=4,TR=1,CTX2=4" (the same syntax over stock).
+//   KEY=VALUE changes over BASE (keys SC2 TR CTX2 CTX3 HG SEL2 IDX ABS2 VP2 QT FRONT CTX4; "base" = BASE alone, compared
+//   against stock), default below. ATTNK_BASE="SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16" (the same syntax over stock).
 //   sweep: for M in 1 3 8 12; do ./attnk 2048 1000 $M; ./attnk 8192 8000 $M; ./attnk 32768 32000 $M; done
 // Exit 3 on any byte difference of an exact arm, 1 on a CUDA / validation error.
 #include "../attn.cu"
@@ -108,6 +110,7 @@ static std::string short_name(const void* f){
     const size_t par=s.find('(');if(par!=std::string::npos)s=s.substr(0,par);
     for(const char* cut:{"ga::small_decode::","ga::kv4::","ga::"}){size_t i;while((i=s.find(cut))!=std::string::npos)s.erase(i,strlen(cut));}
     {size_t i;while((i=s.find("ReplayInput"))!=std::string::npos)s.erase(i,11);
+     while((i=s.find(", , "))!=std::string::npos)s.replace(i,4,", ");
      for(const char* f:{", >",",>","<, ","<,","<>"}){const char* r=f[0]==','?">":f[1]=='>'?"":"<";while((i=s.find(f))!=std::string::npos)s.replace(i,strlen(f),r);}}
     return s;
 }
@@ -152,18 +155,21 @@ static double floor_bytes(const std::string& s,int H,int L){
     if(s.find("scores")!=std::string::npos)return kv;
     return 0;
 }
-struct Arm{int sc,tr,ctx2,ctx3,hg,sel,idx;bool vs_stock;};
+struct Arm{int sc,tr,ctx2,ctx3,hg,sel,idx,abs2,vp2,qt,front,ctx4;bool vs_stock;};
 static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;
-    ga::attn_sel2()=x.sel;ga::attn_idx_grp()=x.idx;}
-static const Arm STOCK{0,0,0,0,0,0,0,false};
-static std::string tag_of(const Arm& x){char b[96];snprintf(b,sizeof b,"SC2=%d TR=%d CTX2=%d CTX3=%d HG=%d SEL2=%d IDX=%d",x.sc,x.tr,x.ctx2,x.ctx3,x.hg,x.sel,x.idx);return b;}
+    ga::attn_sel2()=x.sel;ga::attn_idx_grp()=x.idx;ga::attn_abs2()=x.abs2;ga::attn_vp2()=x.vp2;ga::attn_qt()=x.qt;ga::attn_front_on()=x.front;
+    ga::attn_ctx4()=x.ctx4;}
+static const Arm STOCK{0,0,0,0,0,0,0,0,0,0,0,0,false};
+static std::string tag_of(const Arm& x){char b[160];snprintf(b,sizeof b,"SC2=%d TR=%d CTX2=%d CTX3=%d HG=%d SEL2=%d IDX=%d ABS2=%d VP2=%d QT=%d FRONT=%d CTX4=%d",
+    x.sc,x.tr,x.ctx2,x.ctx3,x.hg,x.sel,x.idx,x.abs2,x.vp2,x.qt,x.front,x.ctx4);return b;}
 // "KEY=V,KEY=V" over `on`; false on an unknown key
 static bool parse_arm(const std::string& s,Arm& x){
     if(s=="base"||s=="stock")return true;
     size_t i=0;while(i<s.size()){size_t e=s.find(',',i);if(e==std::string::npos)e=s.size();const std::string kv=s.substr(i,e-i);i=e+1;
         const size_t q=kv.find('=');if(q==std::string::npos)return false;const std::string k=kv.substr(0,q);const int v=atoi(kv.c_str()+q+1);
         if(k=="SC2")x.sc=v;else if(k=="TR")x.tr=v;else if(k=="CTX2")x.ctx2=v;else if(k=="CTX3")x.ctx3=v;else if(k=="HG")x.hg=v;
-        else if(k=="SEL2")x.sel=v;else if(k=="IDX")x.idx=v;else return false;}
+        else if(k=="SEL2")x.sel=v;else if(k=="IDX")x.idx=v;else if(k=="ABS2")x.abs2=v;else if(k=="VP2")x.vp2=v;else if(k=="QT")x.qt=v;
+        else if(k=="FRONT")x.front=v;else if(k=="CTX4")x.ctx4=v;else return false;}
     return true;
 }
 
@@ -185,10 +191,12 @@ int main(int argc,char** argv){
     const int TIES=getenv("ATTNK_TIES")&&atoi(getenv("ATTNK_TIES"))?1:0;
     const float QS=getenv("ATTNK_QSCALE")?(float)atof(getenv("ATTNK_QSCALE")):1.f;
     // BASE and the arms
-    Arm base{4,1,4,0,0,0,0,false};
+    Arm base{4,2,4,2,0,16,16,0,0,0,0,0,false};   // the serving flags (rounds 1 + 2)
     if(const char* e=getenv("ATTNK_BASE")){base=STOCK;if(!parse_arm(e,base)){fprintf(stderr,"ATTNK_BASE: KEY=V,...\n");return 2;}}
-    std::vector<std::string> specs={"base","TR=2","SC2=8,TR=0","SC2=2,TR=2","CTX3=1","CTX3=2","CTX3=3","CTX3=4","CTX3=1,HG=2","CTX3=2,HG=2",
-        "CTX3=3,HG=2","CTX3=1,HG=8","SEL2=8","SEL2=16","SEL2=32","SEL2=64","IDX=4","IDX=16","TR=2,CTX3=2,SEL2=16,IDX=16"};
+    // round 3: ABS2 / VP2 (staging + R outputs per warp; R = 1 isolates the staging), QT (alone it implies ABS2 = 1, so QT=1
+    // vs ABS2=1 isolates the transposed q), FRONT, CTX4, then the combination
+    std::vector<std::string> specs={"base","ABS2=1","ABS2=2","ABS2=4","ABS2=8","VP2=1","VP2=2","VP2=4","QT=1","QT=1,ABS2=4","QT=1,SC2=2",
+        "FRONT=1","CTX4=1","CTX4=2","CTX4=3","ABS2=4,VP2=2,QT=1,FRONT=1,CTX4=1"};
     if(const char* e=getenv("ATTNK_ARMS")){specs.clear();std::string s=e;size_t i=0;
         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
     std::vector<Arm> arms;
