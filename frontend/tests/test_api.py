@@ -91,6 +91,18 @@ class Chat(unittest.TestCase):
         self.assertEqual(args, call['function']['arguments'])
         self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
 
+    def test_prose_about_a_tool_call_is_not_a_call(self):
+        # the reply writes about the call format: none of it may become a tool_calls entry, and none may be lost
+        body = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'describe the call format'}],
+                'tools': TOOLS, 'max_tokens': 200}
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertNotIn('tool_calls', msg)
+        self.assertIn('<tool_call>get_weather', msg['content'])
+        self.assertIn('in your code.', msg['content'])
+        self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+
     def test_tool_result_turn_renders(self):
         body = {'model': 'glm-5.3', 'tools': TOOLS, 'max_tokens': 100, 'messages': [
             {'role': 'user', 'content': 'weather?'},

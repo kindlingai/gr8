@@ -1,4 +1,4 @@
-//! Engine `metrics` snapshot -> Prometheus text with vLLM's metric names (a port of `g6front/metrics.py`).
+//! Engine `metrics` snapshot -> Prometheus text with vLLM's metric names.
 
 use serde_json::Value;
 

@@ -1,5 +1,5 @@
 //! Engine logprob entries ({lp, rank, top:[[id, lp], ...]}) -> vLLM's response shapes, written straight as JSON
-//! (a port of `g6front/logprobs.py`). `prompt_logprobs` is transcoded from the raw engine frame one position at a
+//! in vLLM's shapes. `prompt_logprobs` is transcoded from the raw engine frame one position at a
 //! time, so a 200K-position result never exists as a parsed tree.
 
 use std::fmt;

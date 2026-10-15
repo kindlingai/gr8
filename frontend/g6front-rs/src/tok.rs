@@ -1,4 +1,4 @@
-//! The checkpoint's own tokenizer.json (HF `tokenizers`, the same library and version the Python front end uses),
+//! The checkpoint's own tokenizer.json (HF `tokenizers`, the library and version the release pins),
 //! plus the per-token display strings logprob entries need, built once into one arena.
 //!
 //! Long prompts are encoded in parallel. The text is cut only where GLM's GPT-style pre-tokenizer regex always ends

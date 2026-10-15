@@ -1,4 +1,4 @@
-//! HTTP routes, shaped like vLLM 0.30 and byte-identical to the Python front end (`g6front/routes_*.py`):
+//! HTTP routes, shaped like vLLM 0.30:
 //! POST /v1/chat/completions, /v1/completions, /tokenize, /detokenize; GET /v1/models, /health, /metrics.
 //!
 //! Responses are written directly as JSON text into one buffer per response or per SSE event; a stream's events

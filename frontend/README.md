@@ -2,12 +2,8 @@
 
 An OpenAI/vLLM-compatible HTTP server in front of the gr8 engine. It talks to the engine's shim over a Unix socket using
 the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
-streaming and `/metrics`. The front end comes in two implementations. `./gr8 glm53 up` runs `g6front-rs/`, one static
-Rust binary. `tests/diff_fronts.py` compares it with `g6front/`, pure Python asyncio. Nothing
-launches or ships the Python one (the shim and the mock use only its `wire` and `tokenizer` modules), and it does not
-have the thinking controls below: it still passes `enable_thinking` to the template, ignores `thinking_budget` and
-`response_format`, and has no `completion_tokens_details`. So `diff_fronts.py` shows those differences in every chat
-case.
+streaming and `/metrics`. It is one static Rust binary, `g6front-rs/`, which `./gr8 glm53 up` runs. The Python code
+under `frontend/` is the shim and the mock engine (and the frame codec they share, `wire.py`), not a second front end.
 
 ## Endpoints
 
@@ -45,13 +41,6 @@ A rank whose weights changed has `"changed": N` and, for the first chunk that di
 scripts/build_front.sh                 # -> bin/g6front-rs (rustup fetches the pinned toolchain on first build)
 bin/g6front-rs --model-dir <dir with tokenizer.json, tokenizer_config.json, chat_template.jinja, generation_config.json> \
   --engine-sock $G6_HOME/run/engine.sock --port 8100
-```
-
-The Python implementation instead:
-
-```bash
-python3 -m venv $G6_HOME/venv && $G6_HOME/venv/bin/pip install --no-cache-dir -r frontend/requirements.txt
-cd frontend && $G6_HOME/venv/bin/python -m g6front --model-dir <dir> --engine-sock $G6_HOME/run/engine.sock --port 8100
 ```
 
 On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 ms at 32K tokens.
@@ -126,11 +115,12 @@ Engine `metrics` frame → Prometheus names (the same names vLLM uses, so the ex
 | `spec.drafts` / `.draft_tokens` / `.accepted` | `vllm:spec_decode_num_drafts_total` / `_num_draft_tokens_total` / `_num_accepted_tokens_total` |
 | `spec.accepted_per_pos[i]` | `vllm:spec_decode_num_accepted_tokens_per_pos_total{position="i"}` |
 
-## Rust front end: g6front-rs
+## Inside it
 
-It uses less head-node memory and adds less time to TTFT than the Python one.
+The notes below are why it is one static Rust binary; the numbers were measured against the Python implementation it
+replaced, which has since been removed.
 
-Extra flags (the rest are the Python ones):
+Flags beyond those above:
 
 | flag | default | meaning |
 |---|---|---|
@@ -150,36 +140,35 @@ How it differs inside (not in its output):
   encode; `src/tok.rs` gives the argument. A start-up self-check and a fuzz test (`G6_TOKENIZER_DIR=<dir> cargo test
   --release`) confirm it. The self-check turns the parallel path off for a tokenizer whose shape the argument does not
   cover.
-- **Memory goes back to the OS.** It uses mimalloc. Loading `tokenizer.json` peaks at ~280 MB, and the Python process
-  keeps most of that resident. Here it is collected after load and after each long encode, off the request path.
+- **Memory goes back to the OS.** It uses mimalloc. Loading `tokenizer.json` peaks at ~280 MB, and it is collected
+  after load and after each long encode, off the request path, instead of staying resident.
 
-Measured against the Python front end in a linux/aarch64 container (12 CPUs, so 6 encode threads;
-`tests/bench_fronts.py`, mock engine with instant prefill, each side alone):
+Measured in a linux/aarch64 container (12 CPUs, so 6 encode threads; mock engine with instant prefill), beside the
+Python implementation it replaced:
 
-| | Python | Rust |
+| | Python | this one |
 |---|---|---|
 | resident memory, idle / after 16 concurrent streams | 211 / 362 MB | 64 / 95 MB |
 | TTFT, 7K / 28K / 112K / 225K-token prompt | 8.8 / 31.4 / 151 / 316 ms | 4.7 / 6.5 / 20.7 / 37.7 ms |
 | one stream, tokens/s through the front end | 43K | 193K |
 | 16 streams, chunks/s / CPU per chunk | 53K / 18.7 µs | 179K / 8.4 µs |
 
-Known differences, outside what the diff harness and the clients send:
+Known rough edges, outside what the clients send:
 
 - The text of two errors differs: invalid request JSON (`invalid JSON body: ...`) and jinja errors
   (`chat template error: ...`). The status and error type are the same.
 - An integer in request JSON that does not fit in 64 bits is read as a float. One example is a huge number inside
   past tool-call arguments in `messages`. The template then renders it in float form. Tool-call arguments parsed from
   model output are exact at any size.
-- Some odd request values that make Python raise `TypeError` (HTTP 500) get a 400 here, e.g. `stop: 5`.
-- Request JSON is parsed strictly: `NaN`/`Infinity` literals, which Python's `json` accepts, are invalid JSON here.
+- Some odd request values that a Python `json` stack raises `TypeError` on (HTTP 500) get a 400 here, e.g. `stop: 5`.
+- Request JSON is parsed strictly: `NaN`/`Infinity` literals, which CPython's `json` accepts, are invalid JSON here.
   So is the same in a JSON-string `arguments` of a past tool call, which then renders as `{}`. A `-0` there renders
   as `-0.0`.
 - `top_k` beyond 64 bits is sent to the engine as 0 (off) instead of the exact integer.
 - Templates using transformers' `{% generation %}` tag are not supported. GLM's template does not use it.
 
-Tests: `cargo test --release` (unit tests); `tests/diff_fronts.py` (parity with the Python front end over 127 cases,
-then the successful ones replayed concurrently); `tests/bench_fronts.py` (the numbers above); and `tests.test_api` and
-`bench/pbench.py` run unchanged against it.
+Tests: `cargo test --release` (unit tests); `python -m unittest tests.test_api` with `tests/serve_mock.sh` up (HTTP,
+streaming, tools, thinking); and `bench/pbench.py` runs against it unchanged.
 
 ## Real engine through files: g6s2shim.py
 
@@ -224,18 +213,19 @@ tools/s2_costfit.py --selftest
 python mock_engine.py --model-dir <tokenizer dir> --sock /tmp/g6-mock.sock \
   [--prefill-tps 50000] [--rounds-per-s 100] [--max-model-len 200000] [--reuse-block 64] [--reasoning-repeat 1]
 tests/serve_mock.sh start|stop      # mock + front end on :8100 (env PY, MODEL_DIR, PORT, ROUNDS, FRONT, FRONT_ARGS, MOCK_ARGS)
-python -m unittest tests.test_parser tests.test_api   # with the mock + front end running
+python -m unittest tests.test_api                     # with the mock + front end running
 ```
 
 `--reuse-block 4096` reuses prefixes as S2 does, in whole 4,096-row prefill cells. `--reasoning-repeat N` makes the
 canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve_mock.sh` runs `../bin/g6front-rs`
-(`FRONT` names another binary), and the Python front end only when there is none. `tests.test_api` tests the Rust front
-end: the Python one fails its thinking tests (see the top of this file).
+(`FRONT` names another binary), which is the front end.
 
 ## Deviations from vLLM
 
 - These return 400: `n>1`, batched prompts, `echo`, `suffix`, named or required `tool_choice`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off (above).
-- Tool-call argument JSON streams once per completed key/value pair instead of per token. The final concatenated string is identical.
+- A tool call's arguments arrive when the call is confirmed, not as they are written: nothing in the text says whether
+  the model is making a call or writing about one, so the parser waits for the reply to end with it
+  (`g6front-rs/src/parser.rs`). The final concatenated string is identical.
 - Tool-call tags are parsed only when the request has `tools` and `tool_choice` is not `none`.
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).
 - The benchmark client is `../bench/pbench.py`.

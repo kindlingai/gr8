@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-10-15: the tool-call parser stops reading prose as calls, and the Python front end is gone
+
+- The GLM parser searched the whole reply for the tool-call tags, so a reply that *wrote about* a call was taken for one:
+  an example in the answer became a real `tool_calls` entry (and in reasoning it ended the reasoning, moving the text
+  around it), an opener with no closer swallowed everything after it, a `</tool_call>` inside an `<arg_value>` cut the
+  call short and leaked the rest of the format into the content, and a call naming a tool the request did not offer
+  vanished from the text instead of staying prose. Those are one bug: the tags meant something wherever they appeared.
+- A run of the reply from a `<tool_call>` on is now held and decided as a whole. It is a call only when the reply ends
+  with it — a call the model makes is its last segment, and it stops right after `</tool_call>` — and text again when
+  anything else follows: prose, a code fence's closing backticks, a `</think>`. As text its raw bytes go back where they
+  came from, so nothing is lost and reasoning that quoted an example stays reasoning. An opener right after a backtick is
+  inline code; a closer inside an `<arg_value>` is part of the value (the format has no escape); an unterminated call, or
+  one naming a tool the request did not offer, is prose.
+- The visible cost is the streaming cadence for calls: their deltas go out when the run is decided rather than as it is
+  written, because a call that turns out to be prose cannot be taken back from a client. The final text and arguments are
+  identical, and the README says so where it described the old per-key streaming.
+- The Python front end (`frontend/g6front/`) is removed. `./gr8 glm53 up` runs `g6front-rs`, and the Python one was a
+  second implementation of this same parser that a change like this would have had to keep in step byte for byte; its
+  only consumers were `tests/diff_fronts.py`, `tests/bench_fronts.py` and `tests/test_parser.py`, removed with it.
+  `wire.py` and `tokenizer.py` move up to `frontend/` for the shim, the mock engine and the shim tests, which stay, and
+  `requirements.txt` is the tokenizer alone. The parser's tests are the Rust front end's now (11 new, 48 in all), and
+  `frontend/tests/test_api.py` covers the HTTP path against the mock engine.
+
 ## 2026-10-14: the event boundaries are logged, so a cancel's delay can be attributed
 
 - #61's ~24 s has two candidate mechanisms that need different fixes: the scheduler served one prefill at a time and

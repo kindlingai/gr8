@@ -1,5 +1,5 @@
 //! g6front-rs: OpenAI/vLLM-compatible HTTP front end for the gr8 engine, speaking PROTOCOL.md over the engine's
-//! Unix socket. A drop-in for the Python `g6front` (same flags, same responses byte for byte).
+//! Unix socket. This is the front end `./gr8 glm53 up` runs.
 //!
 //! g6front-rs --model-dir DIR [--engine-sock /run/g6/engine.sock] [--port 8100]
 
