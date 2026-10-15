@@ -42,7 +42,7 @@ python3 -m unittest discover -s tools/health
 python3 -m unittest discover -s bench/gate/tests
 python3 tools/s2_costfit.py --selftest
 (cd engine/tests && python3 -m unittest test_prefix_reuse)
-(cd frontend && python3 -m unittest tests.test_s2shim tests.test_parser)
+(cd frontend && python3 -m unittest tests.test_s2shim)
 # the launch: options, model sets, the handshake, mentat, and four supervisors end to end on 127.0.0.1-4
 python3 -m unittest discover -s tools/launch
 # the container's compose file and entrypoint

@@ -31,8 +31,8 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from g6front import wire  # noqa: E402
-from g6front.tokenizer import GlmTokenizer  # noqa: E402
+import wire  # noqa: E402
+from tokenizer import GlmTokenizer  # noqa: E402
 
 log = logging.getLogger('mock_engine')
 
@@ -72,6 +72,9 @@ class Mock:
         enc = lambda s: self.t.encode(s, add_special_tokens=False)  # noqa: E731
         if text.rfind(OBSERVATION) > text.rfind(USER):  # answering after a tool result
             return head + enc('The tool returned its result; here is the answer.'), self.stop_user
+        if 'describe the call format' in last_user:  # a reply *about* a call: prose, not one (front end tests)
+            return head + enc('Call it like <tool_call>get_weather<arg_key>city</arg_key>'
+                              '<arg_value>Paris</arg_value></tool_call> in your code.'), self.stop_user
         tool = self.first_tool(text)
         if tool:
             return head + enc('I will call a tool.') + enc(f'{TOOL_OPEN}{tool["name"]}{self.tool_args(tool)}'

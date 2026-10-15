@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start / stop the mock engine + front end for local tests.
 # usage: serve_mock.sh start|stop  (env: PY=venv python, MODEL_DIR=tokenizer dir, PORT=8100, ROUNDS=100,
-#   FRONT=front-end binary (default ../bin/g6front-rs, else the Python g6front), FRONT_ARGS, MOCK_ARGS)
+#   FRONT=front-end binary (default ../bin/g6front-rs), FRONT_ARGS, MOCK_ARGS)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PY:-/tmp/g6venv/bin/python}
@@ -15,8 +15,8 @@ start)
   "$PY" "$HERE/mock_engine.py" --model-dir "$MODEL_DIR" --sock "$SOCK" --rounds-per-s "${ROUNDS:-100}" \
       ${MOCK_ARGS:-} > "$W/mock.log" 2>&1 & echo $! > "$W/mock.pid"
   for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
-  if [ -x "$FRONT" ]; then front=("$FRONT"); else front=("$PY" -m g6front); fi
-  (cd "$HERE" && exec "${front[@]}" --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --host 127.0.0.1 \
+  [ -x "$FRONT" ] || { echo "no front end at $FRONT: scripts/build_front.sh builds it"; exit 1; }
+  (cd "$HERE" && exec "$FRONT" --model-dir "$MODEL_DIR" --engine-sock "$SOCK" --host 127.0.0.1 \
       --port "$PORT" ${FRONT_ARGS:-}) > "$W/front.log" 2>&1 & echo $! > "$W/front.pid"
   for _ in $(seq 50); do curl -sf "localhost:$PORT/health" >/dev/null && break; sleep 0.2; done
   curl -sf "localhost:$PORT/health" >/dev/null && echo "up on :$PORT" ;;

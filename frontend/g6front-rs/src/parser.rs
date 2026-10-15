@@ -1,5 +1,5 @@
-//! GLM 5.3 output parser: reasoning split + tool calls, a port of `g6front/glm_parser.py` (which matches vLLM 0.30
-//! `--reasoning-parser glm45 --tool-call-parser glm47`). Same states, holdback and coercion rules:
+//! GLM 5.3 output parser: reasoning split + tool calls, matching vLLM 0.30
+//! `--reasoning-parser glm45 --tool-call-parser glm47`. Same states, holdback and coercion rules:
 //! - Output starts in REASONING (the prompt ends with `<think>`); `</think>` -> CONTENT; stray `<think>` in
 //!   REASONING / `</think>` in CONTENT are swallowed; `<think>` in CONTENT re-enters REASONING.
 //! - `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` -> {name, arguments JSON}; values
@@ -18,12 +18,36 @@ const THINK_END: &str = "</think>";
 const TOOL_START: &str = "<tool_call>";
 const TOOL_END: &str = "</tool_call>";
 const ARG_KEY: &str = "<arg_key>";
+const ARG_VALUE: &str = "<arg_value>";
+const ARG_VALUE_END: &str = "</arg_value>";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Reasoning,
     Content,
-    Tool,
+}
+
+/// How a pending run resolved; see `GlmParser::region_step`.
+enum Step {
+    Hold,
+    Text,
+    Calls,
+}
+
+/// A run of the reply that might be tool calls: from a `<tool_call>` on, held until it is decided either way.
+///
+/// A reply *writing about* a call and a reply *making* one are the same bytes, so nothing about the text itself tells
+/// them apart -- only what follows. A call the model makes is the reply's last segment (the model stops right after
+/// `</tool_call>`); a call it writes about is followed by prose, by a code fence's closing backticks, or by a `</think>`.
+/// So the run is text unless the reply ends with it, and when it is text its raw bytes go back where they came from
+/// instead of being dropped. That is also why a call's deltas are emitted when the run is decided rather than as it is
+/// read: a call that turns out to be prose cannot be taken back from the client.
+struct Region {
+    state: State,  // the state at the opener: where the raw text goes if the run is not a call
+    text: String,  // the raw reply text from the opener on
+    at: usize,     // how much of `text` the scan has consumed
+    slot0: usize,  // the first slot this run pushed
+    open: bool,    // an opener whose closer has not been seen
 }
 
 #[derive(Default)]
@@ -31,7 +55,6 @@ struct Slot {
     body: String,
     name: Option<String>,
     id: Option<String>,
-    done_pairs: usize,
     streamed: String,
     valid: bool,
 }
@@ -69,6 +92,8 @@ pub struct GlmParser {
     state: State,
     buf: String,
     slots: Vec<Slot>,
+    region: Option<Region>,
+    last: Option<char>,
     reasoning_ended: bool,
     deferred_reasoning: String,
     deferred_content: String,
@@ -96,6 +121,8 @@ impl GlmParser {
             state: State::Reasoning,
             buf: String::new(),
             slots: Vec::new(),
+            region: None,
+            last: None,
             reasoning_ended: false,
             deferred_reasoning: String::new(),
             deferred_content: String::new(),
@@ -104,20 +131,64 @@ impl GlmParser {
     }
 
     fn terms(&self) -> &'static [&'static str] {
-        match (self.state, self.parse_tools) {
-            (State::Tool, _) => &[TOOL_END],
-            (_, true) => &[THINK_START, THINK_END, TOOL_START],
-            (_, false) => &[THINK_START, THINK_END],
+        match self.parse_tools {
+            true => &[THINK_START, THINK_END, TOOL_START],
+            false => &[THINK_START, THINK_END],
         }
     }
 
     // ---- core ---------------------------------------------------------------------------------------------------
 
+    /// Route text to where the reply is: reasoning before `</think>`, content after. `last` is the last character the
+    /// reply produced anywhere, which the backtick rule reads (an opener right after a backtick is inline code).
+    fn emit_text(&mut self, t: &str, state: State, reasoning: &mut String, content: &mut String) {
+        if t.is_empty() {
+            return;
+        }
+        match state {
+            State::Reasoning => reasoning.push_str(t),
+            State::Content => content.push_str(t),
+        }
+        self.last = t.chars().next_back();
+    }
+
     fn feed(&mut self, text: &str, final_: bool) -> (String, String, Vec<ToolDelta>) {
         let (mut reasoning, mut content, mut tools) = (String::new(), String::new(), Vec::new());
         self.buf.push_str(text);
-        let mut pos = 0; // consumed prefix of buf
+        let mut pos = 0;
         loop {
+            if let Some(mut reg) = self.region.take() {
+                // a pending run absorbs what arrives; nothing about it is emitted until it is decided
+                reg.text.push_str(&self.buf);
+                self.buf.clear();
+                match self.region_step(&mut reg, final_) {
+                    Step::Hold => {
+                        self.region = Some(reg);
+                        break;
+                    }
+                    Step::Text => {
+                        // the run was prose: its raw text goes back where it came from, and what follows it is read
+                        // again from there -- a `</think>` inside it still closes the reasoning, a fence still counts
+                        let rest = reg.text.split_off(reg.at);
+                        self.emit_text(&reg.text, reg.state, &mut reasoning, &mut content);
+                        self.slots.truncate(reg.slot0);
+                        self.state = reg.state;
+                        self.buf.clear();
+                        self.buf.push_str(&rest);
+                        pos = 0;
+                        continue;
+                    }
+                    Step::Calls => {
+                        // the reply ended with the run: the calls are real, and their deltas go out together
+                        self.emit_calls(reg.slot0, &mut tools);
+                        if reg.state == State::Reasoning {
+                            self.reasoning_ended = true;
+                        }
+                        self.state = State::Content;
+                        break;
+                    }
+                }
+            }
             if pos >= self.buf.len() {
                 break;
             }
@@ -134,10 +205,31 @@ impl GlmParser {
             if let Some((i, tag)) = best {
                 if i > 0 {
                     let t = self.buf[pos..pos + i].to_string();
-                    self.on_text(&t, &mut reasoning, &mut content, &mut tools);
+                    let st = self.state;
+                    self.emit_text(&t, st, &mut reasoning, &mut content);
                 }
                 pos += i + tag.len();
-                self.on_term(tag, &mut tools);
+                if tag == TOOL_START {
+                    // an opener right after a backtick is code the model is writing about, not a call it makes
+                    if self.last == Some('`') {
+                        let st = self.state;
+                        self.emit_text(TOOL_START, st, &mut reasoning, &mut content);
+                    } else {
+                        self.buf.drain(..pos);
+                        pos = 0;
+                        self.slots.push(Slot::default());
+                        self.region = Some(Region {
+                            state: self.state,
+                            text: TOOL_START.to_string(),
+                            at: TOOL_START.len(),
+                            slot0: self.slots.len() - 1,
+                            open: true,
+                        });
+                        self.last = Some('>');
+                    }
+                } else {
+                    self.on_think(tag);
+                }
                 continue;
             }
             let mut keep = 0;
@@ -153,52 +245,122 @@ impl GlmParser {
                     }
                 }
             }
-            let end = self.buf.len() - keep;
+            let end = self.buf.len().saturating_sub(keep).max(pos);
             if end > pos {
                 let t = self.buf[pos..end].to_string();
-                self.on_text(&t, &mut reasoning, &mut content, &mut tools);
+                let st = self.state;
+                self.emit_text(&t, st, &mut reasoning, &mut content);
             }
             pos = end;
-            break;
+            break; // `buf[end..]` is a partial tag: it waits for the next delta
         }
-        self.buf.drain(..pos);
-        if final_ && self.state == State::Tool && !self.slots.is_empty() {
-            self.tool_end(&mut tools); // unterminated call at end of output
-        }
+        self.buf.drain(..pos); // what was emitted or fed to a region is done with
         (reasoning, content, tools)
     }
 
-    fn on_text(&mut self, t: &str, reasoning: &mut String, content: &mut String, tools: &mut Vec<ToolDelta>) {
-        match self.state {
-            State::Reasoning => reasoning.push_str(t),
-            State::Content => content.push_str(t),
-            State::Tool => self.tool_text(t, tools),
+    /// Advance a pending run as far as its text allows: `Hold` (more input may still decide it), `Text` (it was never a
+    /// call: prose the model wrote about one, or a call it left unfinished or named a non-tool in), or `Calls` (it was,
+    /// decided only when the reply ends with it).
+    fn region_step(&mut self, reg: &mut Region, final_: bool) -> Step {
+        loop {
+            if reg.open {
+                let closer = find_tag(&reg.text, reg.at, TOOL_END);
+                let think = {
+                    let a = find_tag(&reg.text, reg.at, THINK_START);
+                    let b = find_tag(&reg.text, reg.at, THINK_END);
+                    match (a, b) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    }
+                };
+                match (closer, think) {
+                    (Some(c), Some(t)) if t < c => return Step::Text, // the reply moved on: never a call
+                    (Some(c), _) => {
+                        let body = reg.text[reg.at..c].to_string();
+                        reg.at = c + TOOL_END.len();
+                        reg.open = false;
+                        self.last = Some('>');
+                        if !self.close_call(body) {
+                            return Step::Text; // a name no tool of this request has: the text stays prose
+                        }
+                    }
+                    (None, Some(_)) => return Step::Text,
+                    // an unterminated opener is prose, not a call, and its text is kept
+                    (None, None) => return if final_ { Step::Text } else { Step::Hold },
+                }
+                continue;
+            }
+            // between calls only another call, or whitespace, may follow: anything else proves the run was prose
+            let scan = &reg.text[reg.at..];
+            match earliest_nonspace(scan) {
+                None => return if final_ { Step::Calls } else { Step::Hold },
+                Some(n) => {
+                    let rest = &scan[n..];
+                    if rest.starts_with(TOOL_START) {
+                        if reg.text[..reg.at + n].ends_with('`') {
+                            return Step::Text; // inline code again
+                        }
+                        self.slots.push(Slot::default());
+                        reg.at += n + TOOL_START.len();
+                        reg.open = true;
+                        self.last = Some('>');
+                        continue;
+                    }
+                    if !final_ && TOOL_START.starts_with(rest) {
+                        return Step::Hold; // a partial opener: wait for the rest of it
+                    }
+                    return Step::Text;
+                }
+            }
         }
     }
 
-    fn on_term(&mut self, tag: &str, tools: &mut Vec<ToolDelta>) {
+    /// Take the body between a call's tags: its name (everything before the first `<arg_key>`, or the whole body for a
+    /// call with no arguments), and whether that name is a tool this request offered.
+    fn close_call(&mut self, body: String) -> bool {
+        let idx = self.slots.len() - 1;
+        let name = match body.find(ARG_KEY) {
+            Some(at) => py_strip(&body[..at]).to_string(),
+            None => py_strip(&body).to_string(),
+        };
+        let valid = self.name_valid(&name);
+        let s = &mut self.slots[idx];
+        s.body = body;
+        s.name = Some(name);
+        s.valid = valid;
+        valid
+    }
+
+    /// The deltas for a run's calls, one each: nothing about them was streamed while the run was pending.
+    fn emit_calls(&mut self, slot0: usize, deltas: &mut Vec<ToolDelta>) {
+        for i in slot0..self.slots.len() {
+            if !self.slots[i].valid {
+                continue;
+            }
+            let name = self.slots[i].name.clone().unwrap_or_default();
+            let args = self.args_json(&name, &pairs(&self.slots[i].body));
+            let id = self.slots[i].id.clone().unwrap_or_else(tool_call_id);
+            self.slots[i].id = Some(id.clone());
+            self.slots[i].streamed = args.clone();
+            deltas.push(ToolDelta { index: i, id: Some(id), name: Some(name), arguments: Some(args) });
+        }
+        self.last = Some('>');
+    }
+
+    fn on_think(&mut self, tag: &str) {
+        // A think tag separates the next opener from any preceding backtick in the raw reply.
+        self.last = Some('>');
         match self.state {
             State::Reasoning => {
                 if tag == THINK_END {
                     self.state = State::Content;
                     self.reasoning_ended = true;
-                } else if tag == TOOL_START {
-                    self.state = State::Tool;
-                    self.reasoning_ended = true;
-                    self.slots.push(Slot::default());
                 }
             }
             State::Content => {
                 if tag == THINK_START {
                     self.state = State::Reasoning;
-                } else if tag == TOOL_START {
-                    self.state = State::Tool;
-                    self.slots.push(Slot::default());
                 }
-            }
-            State::Tool => {
-                self.tool_end(tools);
-                self.state = State::Content;
             }
         }
     }
@@ -206,78 +368,6 @@ impl GlmParser {
     fn name_valid(&self, name: &str) -> bool {
         !name.is_empty() && (self.tools.is_empty() || self.tools.contains_key(name))
     }
-
-    fn tool_text(&mut self, v: &str, deltas: &mut Vec<ToolDelta>) {
-        let idx = self.slots.len() - 1;
-        self.slots[idx].body.push_str(v);
-        if self.slots[idx].name.is_none() {
-            if let Some(at) = self.slots[idx].body.find(ARG_KEY) {
-                let name = py_strip(&self.slots[idx].body[..at]).to_string();
-                let valid = self.name_valid(&name);
-                let s = &mut self.slots[idx];
-                s.valid = valid;
-                s.name = Some(name.clone());
-                if valid {
-                    let id = tool_call_id();
-                    s.id = Some(id.clone());
-                    deltas.push(ToolDelta { index: idx, id: Some(id), name: Some(name), arguments: None });
-                }
-            }
-        }
-        let s = &self.slots[idx];
-        if s.name.is_some() && s.valid {
-            let pairs = pairs(&s.body);
-            if pairs.len() > s.done_pairs {
-                let json = self.args_json(s.name.as_deref().unwrap(), &pairs);
-                let prefix = &json[..json.len() - 1]; // without the closing brace
-                let s = &mut self.slots[idx];
-                s.done_pairs = pairs.len();
-                if prefix.starts_with(s.streamed.as_str()) && prefix != s.streamed {
-                    deltas.push(ToolDelta {
-                        index: idx,
-                        id: None,
-                        name: None,
-                        arguments: Some(prefix[s.streamed.len()..].to_string()),
-                    });
-                    s.streamed = prefix.to_string();
-                }
-            }
-        }
-    }
-
-    fn tool_end(&mut self, deltas: &mut Vec<ToolDelta>) {
-        let idx = self.slots.len() - 1;
-        if self.slots[idx].name.is_none() {
-            let name = py_strip(&self.slots[idx].body).to_string();
-            let valid = self.name_valid(&name);
-            let args = if valid { Some(self.args_json(&name, &[])) } else { None };
-            let s = &mut self.slots[idx];
-            s.valid = valid;
-            s.name = Some(name.clone());
-            if let Some(args) = args {
-                let id = tool_call_id();
-                s.id = Some(id.clone());
-                deltas.push(ToolDelta { index: idx, id: Some(id), name: Some(name), arguments: Some(args.clone()) });
-                s.streamed = args;
-            }
-            return;
-        }
-        if self.slots[idx].valid {
-            let s = &self.slots[idx];
-            let final_ = self.args_json(s.name.as_deref().unwrap(), &pairs(&s.body));
-            let s = &mut self.slots[idx];
-            if final_.starts_with(s.streamed.as_str()) && final_ != s.streamed {
-                deltas.push(ToolDelta {
-                    index: idx,
-                    id: None,
-                    name: None,
-                    arguments: Some(final_[s.streamed.len()..].to_string()),
-                });
-            }
-            s.streamed = final_;
-        }
-    }
-
     fn args_json(&self, name: &str, pairs: &[(String, String)]) -> String {
         let mut params: Map<String, Value> = Map::new();
         for (k, v) in pairs {
@@ -312,7 +402,8 @@ impl GlmParser {
     /// Feed newly decoded text; returns the DeltaMessage fields (None if empty).
     pub fn delta(&mut self, text: &str, finished: bool) -> Option<Delta> {
         let (mut reasoning, content, tools) = self.feed(text, finished);
-        let valid_tools = self.slots.iter().any(|s| s.valid);
+        // a run still pending is not a call yet: only a decided one trims the whitespace-only content before it
+        let valid_tools = self.region.is_none() && self.slots.iter().any(|s| s.valid);
         if !reasoning.is_empty() {
             let comb = std::mem::take(&mut self.deferred_reasoning) + &reasoning;
             let trimmed = py_rstrip(&comb).len();
@@ -363,6 +454,36 @@ impl GlmParser {
             calls,
         }
     }
+}
+
+/// The first `tag` at or after `from` that does not sit inside an `<arg_value>...</arg_value>`.
+///
+/// The format has no escape, so an argument value may hold the tag as text; that text is part of the value and does not
+/// end the call (or the reply's reasoning). `from` and the result are byte indices into `text`.
+fn find_tag(text: &str, from: usize, tag: &str) -> Option<usize> {
+    let mut at = from;
+    while let Some(i) = text[at..].find(tag) {
+        let abs = at + i;
+        if !inside_value(&text[..abs]) {
+            return Some(abs);
+        }
+        at = abs + tag.len();
+    }
+    None
+}
+
+/// Whether `before` ends inside an `<arg_value>` that no `</arg_value>` has closed yet.
+fn inside_value(before: &str) -> bool {
+    match (before.rfind(ARG_VALUE), before.rfind(ARG_VALUE_END)) {
+        (Some(v), Some(e)) => v > e,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// The byte index of the first character `str.strip()` would keep, if any.
+fn earliest_nonspace(t: &str) -> Option<usize> {
+    t.char_indices().find(|(_, c)| !is_py_space(*c)).map(|(i, _)| i)
 }
 
 fn coalesce(deltas: Vec<ToolDelta>) -> Vec<ToolDelta> {
@@ -719,4 +840,207 @@ mod tests {
         assert_eq!(p, vec![("a</arg_key>x".to_string(), "1".to_string())]);
         assert!(pairs("<arg_key>a</arg_key><arg_value>1").is_empty());
     }
+    /// Feed `text` in `chunk`-sized pieces and accumulate what a client would (ids differ per run, so compare names and
+    /// arguments, as `stream_equals_full` does).
+    fn streamed(text: &str, chunk: usize) -> FullParse {
+        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true);
+        let chars: Vec<char> = text.chars().collect();
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        let mut calls: Vec<(String, String, String)> = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = (i + chunk).min(chars.len());
+            let s: String = chars[i..end].iter().collect();
+            i = end;
+            if let Some(d) = p.delta(&s, i >= chars.len()) {
+                reasoning += d.reasoning.as_deref().unwrap_or("");
+                content += d.content.as_deref().unwrap_or("");
+                for t in d.tool_calls {
+                    while calls.len() <= t.index {
+                        calls.push((String::new(), String::new(), String::new()));
+                    }
+                    if let Some(n) = t.name {
+                        calls[t.index].1 = n;
+                    }
+                    if let Some(a) = t.arguments {
+                        calls[t.index].2 += &a;
+                    }
+                }
+            }
+        }
+        FullParse {
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            content: (!content.is_empty()).then_some(content),
+            calls,
+        }
+    }
+
+    // A reply the model *writes about* a call and one it *makes* are the same bytes: what tells them apart is that a
+    // call it makes is the reply's last segment. Everything below is prose, and none of it may lose text.
+
+    /// A documented example in the answer is content, not a call (it used to end the reasoning and be promoted).
+    #[test]
+    fn prose_example_is_not_a_call() {
+        let text = "</think>Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+                    </tool_call> in your code.";
+        let r = full(text);
+        assert!(r.calls.is_empty());
+        assert_eq!(r.reasoning, None);
+        assert_eq!(
+            r.content.as_deref(),
+            Some("Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
+                  in your code.")
+        );
+    }
+
+    /// The same inside reasoning: the raw text goes back to the reasoning, which the later `</think>` still closes.
+    #[test]
+    fn prose_example_in_reasoning_stays_reasoning() {
+        let r = full("Think about <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
+                      a bit.</think>Here.");
+        assert!(r.calls.is_empty());
+        assert_eq!(
+            r.reasoning.as_deref(),
+            Some("Think about <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> a bit.")
+        );
+        assert_eq!(r.content.as_deref(), Some("Here."));
+    }
+
+    /// A backtick before a think tag is not adjacent to the tool opener after that tag.
+    #[test]
+    fn backtick_before_think_end_does_not_quote_a_call() {
+        let text = "Use `get_weather`</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>";
+        let r = full(text);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.reasoning.as_deref(), Some("Use `get_weather`"));
+        assert_eq!(r.calls[0].2, r#"{"city": "Paris"}"#);
+        for chunk in [1, 2, 7, 11, 4096] {
+            let s = streamed(text, chunk);
+            assert_eq!(s.calls.len(), 1, "chunk {chunk}");
+            assert_eq!(s.calls[0].2, r.calls[0].2);
+            assert_eq!(s.reasoning, r.reasoning);
+            assert_eq!(s.content, r.content);
+        }
+    }
+
+    /// An opener right after a backtick is inline code, even when the reply ends with it (the trailing rule cannot tell).
+    #[test]
+    fn inline_code_opener_is_not_a_call() {
+        let quoted = "</think>Write `<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+                      </tool_call>";
+        let r = full(quoted);
+        assert!(r.calls.is_empty());
+        assert_eq!(
+            r.content.as_deref(),
+            Some("Write `<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>")
+        );
+        // without the backtick the same text is the model's call
+        let plain = quoted.replacen("`<tool_call>", "<tool_call>", 1);
+        let r = full(&plain);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].2, r#"{"city": "Paris"}"#);
+    }
+
+    /// An opener the reply never closes is prose, and the text after it is kept (`used to be swallowed whole`).
+    #[test]
+    fn unterminated_opener_keeps_its_text() {
+        let text = "</think>The format is <tool_call>get_weather and then the arguments.";
+        let r = full(text);
+        assert!(r.calls.is_empty());
+        assert_eq!(r.content.as_deref(), Some("The format is <tool_call>get_weather and then the arguments."));
+    }
+
+    /// A call whose name is not one of the request's tools is prose, tags and all (the text used to be dropped).
+    #[test]
+    fn unknown_name_keeps_its_text() {
+        let text = "</think>Use <tool_call>nope<arg_key>a</arg_key><arg_value>1</arg_value></tool_call> here.";
+        let r = full(text);
+        assert!(r.calls.is_empty());
+        assert_eq!(
+            r.content.as_deref(),
+            Some("Use <tool_call>nope<arg_key>a</arg_key><arg_value>1</arg_value></tool_call> here.")
+        );
+    }
+
+    /// A call followed by prose is prose too (the model writes about the call, then goes on).
+    #[test]
+    fn a_call_followed_by_prose_is_prose() {
+        let r = full("</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
+                      and that is how you ask.");
+        assert!(r.calls.is_empty());
+        assert_eq!(
+            r.content.as_deref(),
+            Some("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> and that is how \
+                  you ask.")
+        );
+    }
+
+    /// A fenced example: the closing fence is text after the call, so the run is prose.
+    #[test]
+    fn fenced_example_is_prose() {
+        let text = "</think>Like this:\n```\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+                    </tool_call>\n```\n";
+        let r = full(text);
+        assert!(r.calls.is_empty());
+        assert!(r.content.as_deref().unwrap().contains("```"));
+    }
+
+    /// The format has no escape, so an argument value may hold the closing tag: it is part of the value, not the end.
+    #[test]
+    fn closer_inside_an_argument_value() {
+        let r = full("</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> \
+                      b</arg_value></tool_call>");
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].2, r#"{"city": "a </tool_call> b"}"#);
+        assert_eq!(r.content, None);
+    }
+
+    /// A think tag inside an open call means the reply moved on: the "call" was reasoning, and the answer follows.
+    #[test]
+    fn think_tag_in_an_open_call_is_prose() {
+        let r = full("Think <tool_call>get_weather here</think>Done.");
+        assert!(r.calls.is_empty());
+        assert_eq!(r.reasoning.as_deref(), Some("Think <tool_call>get_weather here"));
+        assert_eq!(r.content.as_deref(), Some("Done."));
+    }
+
+    /// Two real calls in a row are both calls (a zero-argument one included).
+    #[test]
+    fn trailing_calls_are_all_reported() {
+        let r = full("</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>\
+                      <tool_call>get_current_date</tool_call>");
+        assert_eq!(r.calls.len(), 2);
+        assert_eq!(r.calls[0].1, "get_weather");
+        assert_eq!(r.calls[0].2, r#"{"city": "Paris"}"#);
+        assert_eq!(r.calls[1].1, "get_current_date");
+        assert_eq!(r.calls[1].2, "{}");
+    }
+
+    /// A held run gives the same answer streamed, whatever the chunk size.
+    #[test]
+    fn prose_streams_the_same_as_a_whole_reply() {
+        let cases = [
+            "</think>Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> in your code.",
+            "Think <tool_call>get_weather here</think>Done.",
+            "</think>The format is <tool_call>get_weather and then the arguments.",
+            "</think>Use `<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+            "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> sure.",
+            "Think <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> a bit.</think>Done.",
+            "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+            "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>get_current_date</tool_call>",
+            "</think>Like this:\n```\n<tool_call>get_current_date</tool_call>\n```\n",
+        ];
+        for text in cases {
+            let f = full(text);
+            for chunk in [1usize, 2, 3, 5, 11] {
+                let s = streamed(text, chunk);
+                assert_eq!(
+                    (s.reasoning, s.content, s.calls.iter().map(|c| (c.1.clone(), c.2.clone())).collect::<Vec<_>>()),
+                    (f.reasoning.clone(), f.content.clone(), f.calls.iter().map(|c| (c.1.clone(), c.2.clone())).collect()),
+                    "chunk {chunk} of {text:?}"
+                );
+            }
+        }
+    }
+
 }

@@ -1,6 +1,6 @@
-//! Chat template rendering, token-identical to the Python front end (and so to the old vLLM stacks).
+//! Chat template rendering, token-identical to the old vLLM stacks.
 //!
-//! Two layers, ported from `g6front/template.py`:
+//! Two layers:
 //! - `normalize_messages()`: vLLM's message parsing for an "openai"-content-format template (string content -> text
 //!   parts, tool results -> one string, assistant `reasoning` -> `reasoning_content`, tool-call `arguments` JSON
 //!   strings -> objects, `developer` -> merged `system`).

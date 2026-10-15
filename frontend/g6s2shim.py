@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Engine-side S2 shim: speaks PROTOCOL.md v1 on the Unix socket and drives g6m4 --serve DIR (a DEC_S2 build) over the
-S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire).
+S2 file protocol, so several requests run at the same time. Stdlib only (plus the frame codec in wire.py).
 
 The engine side is the code, not a document: engine/runtime/s2/{ingress.h,sessions.h,service.h,bootstrap.h,scheduler.h}.
 File protocol, in the head rank's DIR (the shim runs on the head), one engine epoch per start of g6m4 --serve (every
@@ -45,7 +45,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from g6front import wire  # noqa: E402
+import wire  # noqa: E402
 
 log = logging.getLogger('g6s2shim')
 

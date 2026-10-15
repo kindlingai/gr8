@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
-from g6front import wire  # noqa: E402
+import wire  # noqa: E402
 import g6s2shim  # noqa: E402
 from fake_s2_engine import token_at, payload_hash as fake_hash  # noqa: E402
 

@@ -3,7 +3,8 @@
 # (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
 # and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
-# prefill choice and its deferral bound (scheduler_fair_test), the pool's block
+# prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
+# the pool's block
 # store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
 # frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
 # after load (engine/runtime/host_reclaim.h).
@@ -44,6 +45,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # the scheduler's own prefill choice (fewest prompt rows first, with a deferral bound): no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_fair_test.cpp" -o "$T/scheduler_fair_test"
 "$T/scheduler_fair_test"
+# the notice target's sizing (the work in flight, not a constant): no pool, no CUDA
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_horizon_test.cpp" -o "$T/scheduler_horizon_test"
+"$T/scheduler_horizon_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
 NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
