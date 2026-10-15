@@ -2,13 +2,15 @@
 // form whatever its spelling, survives each request's fresh estimates, prices MTP rounds as the confidence stop runs
 // them (so a K-stop MTP that verifies three confident drafts wins where the fixed-K pricing keeps DFlash2, and one that
 // verifies one draft loses to a better DFlash2), ranks reading the same table make the same choices bit for bit, and
-// with the model off the steps are the ones without it. Host only, a fake engine.
+// with the model off the steps are the ones without it; on structured text with a dip the position-rate DFlash2
+// estimate strands the model on MTP, and r (DFlash2 priced from its rounds) brings it back. Host only, a fake engine.
 // Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_dselmodel_test.cpp -o /tmp/batch_dselmodel_test
 #include "s2_batch.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <tuple>
 using namespace s2;
@@ -22,6 +24,7 @@ static int target(int pos) { return (pos * 37 + 11) % 997; }    // the token at 
 struct Fake
 {
     int dright = 3;
+    std::function<int(int)> dright_at;   // if set: DFlash2's right drafts for a block starting at position q0
     float p_ok = 0.95f, p_bad = 0.6f;
     int mtp_depth = 99;       // MTP drafts d[1..mtp_depth] right, the later ones wrong
     int idx = 0;              // the draft index of the last DRAFT (1) or CHAIN (2, 3) step
@@ -48,7 +51,8 @@ struct Fake
         h.dfl = [this](const DflReq& r) {
             DflDrafts o{};
             const int q0 = r.pos0 + r.rows;
-            for (int i = 1; i < DFL_B; ++i) { o.tok[i] = i <= dright ? target(q0 + i - 1) : -1; o.lp[i] = i <= dright ? -0.05f : -3.f; }
+            const int dr = dright_at ? dright_at(q0) : dright;
+            for (int i = 1; i < DFL_B; ++i) { o.tok[i] = i <= dr ? target(q0 + i - 1) : -1; o.lp[i] = i <= dr ? -0.05f : -3.f; }
             return o;
         };
         h.emit = [this](int, const int* t, int k, int) { got.insert(got.end(), t, t + k); return false; };
@@ -106,10 +110,11 @@ int main()
         CHECK(std::fabs(a.v[6] - 84) < 1e-9);                    // between v4 and v8
         CHECK(std::fabs(a.verify(3.5) - 60.5) < 1e-9 && std::fabs(a.verify(20) - 104) < 1e-9);
         CHECK(a.str().find(' ') == std::string::npos && a.str().find(';') == std::string::npos);
+        CHECK(table((std::string(TAB) + ",r:0.95").c_str()).str() == a.str() + ",r:0.95");
         for (const char* bad : {"", "v2:49.6,d:6.9,m:2,e:1", "v2:49.6,v3:57,m:2,e:1", "v2:49.6,v3:57,d:6.9,m:2,e:1,x:3",
                                 "v2:49.6,v3:57,d:6.9,m:2,e:-1", "v2:49.6,v3:57,d:6.9,m:2,e:1,v9:3", "v2:49.6,v3:57,d:6.9,m:2,e:nan",
                                 "v2:49.6,v3:57,d:6.9,m:2,e:1,k:3,n:2", "v2:49.6,v3:57,d:6.9,m:2,e", "v2:10,v3:57,d:1,m:1,e:1",
-                                "v2:0,v3:57,d:1,m:1,e:1", "v2:49.6,v3:57,d:6.9,m:2,e:1,w:0"})
+                                "v2:0,v3:57,d:1,m:1,e:1", "v2:49.6,v3:57,d:6.9,m:2,e:1,w:0", "v2:49.6,v3:57,d:6.9,m:2,e:1,r:0", "v2:49.6,v3:57,d:6.9,m:2,e:1,r:1.5"})
         {
             DSelTable t;
             std::string err;
@@ -261,6 +266,73 @@ int main()
         if (model == 1) CHECK(full == 40);
         else CHECK(full == 0 && seven == 40);
         CHECK(exact(f.got));
+    }
+    // 8. structured text (fleet 10-15: structured -21 % with the model). MTP verifies three confident right drafts (4
+    //    tokens per v4 + m + 2e = 68.3 ms), DFlash2 seven (8 per v8 + d = 104.1 ms), but for a stretch DFlash2 drafts one
+    //    right. With the position-rate estimate the model moves to MTP in the stretch and never comes back: MTP is now
+    //    priced at its real 0.057 tokens/ms, so coming back needs 0.066, more than a seven-for-seven block's estimate
+    //    reaches. Fixed-K pricing (MTP as two drafts) comes back; so does r (the rounds as they ran). Then prose-like text
+    //    (MTP two right of three, DFlash2 mostly one right): r keeps MTP as often as without it
+    {
+        const char* M0 = "v2:46.63,v3:54.71,v4:63.99,v5:71.54,v6:79.37,v7:88.23,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,g:1.107,k:2.177,n:2.486,w:1";
+        const std::string withr = std::string(M0) + ",r:0.95";
+        int prose[2] = {};
+        long mtp[3] = {};
+        double tps[3] = {}, ptps[2] = {};
+        const DSelTable cost = table(M0);
+        // tokens per ms of a run at the table's costs: verify steps, first forms + drafter steps, chain steps
+        auto speed = [&](const Fake& f, const Batch& b) {
+            double ms = 0;
+            int prev = -1;
+            for (const auto& x : f.trace)
+            {
+                if (std::get<2>(x) < 0) continue;
+                const int kind = std::get<0>(x), M = std::get<1>(x);
+                if (kind == Step::MAIN) { ms += cost.verify(M); prev = M; }
+                else if (kind == Step::DRAFT) ms += prev == 8 ? cost.d : cost.m;
+                else ms += cost.e;
+            }
+            return b.stats(0).tokens / ms;
+        };
+        for (int arm = 0; arm < 3; ++arm)              // fixed-K, model (C), model + r
+        {
+            Fake f;
+            f.p_ok = 0.97f;
+            f.dright_at = [](int q0) { return q0 >= 600 && q0 < 900 ? 1 : (unsigned)(q0 * 2246822519u) >> 28 < 3 ? 3 : 7; };   // 3 in 16: 3
+            Batch b(2, 32, f.hooks());
+            b.dflash(7, g6rt::SpecLen());
+            DSel sel = dsel(arm ? 1 : 0, table(arm == 2 ? withr.c_str() : M0));
+            sel.probe = 32;                            // the serving setting
+            b.dsel(sel);
+            b.kstop(kstop3());
+            b.admit({0}, {session()});
+            while (b.length(0) < 4000) CHECK(b.round({0}));
+            mtp[arm] = b.stats(0).mtp_rounds;
+            tps[arm] = speed(f, b);
+            CHECK(b.stats(0).switches >= 1 && exact(f.got));
+        }
+        CHECK(tps[1] < 0.95 * tps[0]);                 // the model alone loses to fixed-K (fleet: -21 %)
+        CHECK(tps[2] >= tps[0]);                       // r: at least fixed-K
+        for (int arm = 0; arm < 2; ++arm)              // prose: model, model + r
+        {
+            Fake f;
+            f.mtp_depth = 2;
+            f.dright_at = [](int q0) { return (unsigned)(q0 * 2654435761u) >> 28 < 3 ? 5 : 1; };   // 3 in 16 blocks 5 right
+            Batch b(2, 32, f.hooks());
+            b.dflash(7, g6rt::SpecLen());
+            DSel sel = dsel(1, table(arm ? withr.c_str() : M0));
+            sel.probe = 32;
+            b.dsel(sel);
+            b.kstop(kstop3());
+            b.admit({0}, {session()});
+            for (int i = 0; i < 600; ++i) CHECK(b.round({0}));
+            prose[arm] = (int)b.stats(0).mtp_rounds;
+            ptps[arm] = speed(f, b);
+            CHECK(exact(f.got));
+        }
+        CHECK(prose[0] > 540 && prose[1] >= prose[0] - 20 && ptps[1] >= 0.99 * ptps[0]);
+        std::printf("structured tokens/ms (MTP rounds): fixed-K %.4f (%ld), model %.4f (%ld), model+r %.4f (%ld); prose: model %.4f (%d of 600), "
+                    "model+r %.4f (%d)\n", tps[0], mtp[0], tps[1], mtp[1], tps[2], mtp[2], ptps[0], prose[0], ptps[1], prose[1]);
     }
     std::printf("batch_dselmodel_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
