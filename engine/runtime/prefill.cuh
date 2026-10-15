@@ -1799,6 +1799,12 @@ inline void cp_pf_alloc(Model& m, cudaStream_t st, char* region = nullptr)
     std::vector<int> id(a.table_size);
     for (int k = 0; k < a.table_size; ++k) id[k] = k;
     G6RT_CK(g6h2d::copy(m.cp.pf_ident, id.data(), id.size() * sizeof(int), st));
+    // every prefill row's KV goes through this table and no hash covers it (#49): a wrong entry k sends rows 64k.. to
+    // the wrong page with no error word, so read it back once
+    std::vector<int> back(id.size());
+    G6RT_CK(cudaMemcpy(back.data(), m.cp.pf_ident, back.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int k = 0; k < a.table_size; ++k)
+        if (back[k] != k) die("CP prefill identity table: entry " + std::to_string(k) + " is " + std::to_string(back[k]));
     fprintf(stderr, "# rank %d: G6_CP prefill staging 2 x %.3f GB (%s)\n", m.rank, pool / 1e9, region ? "pinned, registered" : "device");
 }
 inline void cp_pf_enter(Model& m)

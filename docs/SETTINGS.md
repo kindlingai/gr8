@@ -47,6 +47,9 @@ the short version.
 | `G6_PF_TILE` | 64 | prefill attention query tile (64/128/256) |
 | `G6_PF_DENSE` | 8192 | context threshold for the dense prefill attention path; past it the sparse (indexer-selected) path runs; 0 = always sparse |
 | `G6_PF_RS` | 1 | prefill uses reduce-scatter + all-gather instead of all-reduce |
+| `G6_TEST_ZERO_DELAY_MS` | unset | a test of the zeroing order (#49, #54): every `dmalloc` zeroing waits behind an N ms kernel on the legacy stream, so a write to new memory not ordered after it loses every time. Boots take about N ms longer per allocation |
+| `G6_WEIGHT_CHECK` | 1 | sum each loaded image on the CPU and the GPU and stop the boot with exit 3 if they differ; seal the sums once ready to serve and answer `DIR/check.<n>` (`/health?deep`, engine/runtime/weight_check.cuh). 0 = off |
+| `G6_WEIGHT_CHECK_FLIP` | unset | `RANK:OFFSET`, a test of the weight check: flip one byte of rank RANK's first image after the load, so the boot stops with exit 3 |
 | `G6_PF_STREAMS` | 2 | the two prefill lanes run on two CUDA streams |
 | `G6_PF_ATTN_ROWS` | 1024 | prefill attention runs in chunks of this many rows inside a sub-batch |
 | `G6_PF_OWN` | 3 | row-owner prefill. 1 = the owner computes the next layer's projections. 2 = also the indexer. 3 = the owner runs the whole attention block for all 64 heads of its rows (QO; needs the QO pack, `G6_PF_RS=1`, `--pfv2`). 4 = TP4 only: pair-owner QO, OWN=3's attention block split over two head pairs ([DESIGN-QO-PAIR.md](DESIGN-QO-PAIR.md)); TP4 launcher default |
@@ -85,6 +88,8 @@ the short version.
 | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
 | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
 | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
+| `G6_SPEC_TABLE` | built-in measured table | Override verify costs for 1–8 rows with eight comma-separated finite positive times in ms. Applies to adaptive DFlash2 length and drafter choice; survives session resets. |
+| `G6_SPEC_DRAFT` | built-in drafting costs | Override DFlash2 round, MTP round and MTP additional chain-step costs with three comma-separated finite nonnegative times in ms. |
 | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
 | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |

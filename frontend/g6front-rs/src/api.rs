@@ -1,4 +1,4 @@
-//! HTTP routes, shaped like vLLM 0.30 and byte-identical to the Python front end (`g6front/routes_*.py`):
+//! HTTP routes, shaped like vLLM 0.30:
 //! POST /v1/chat/completions, /v1/completions, /tokenize, /detokenize; GET /v1/models, /health, /metrics.
 //!
 //! Responses are written directly as JSON text into one buffer per response or per SSE event; a stream's events
@@ -21,6 +21,7 @@ use crate::gen::{think_open, Budget, Generation, Res, Step, StopReason};
 use crate::parser::{Delta, GlmParser};
 use crate::pyjson::{self, truthy};
 use crate::template::{build_template_kwargs, normalize_tools};
+use crate::tool_choice::ToolChoice;
 use crate::util::{new_id, now_secs};
 use crate::wire::InsertRule;
 use crate::{logprobs as L, metrics, sampling, thinking, State};
@@ -124,6 +125,10 @@ fn response(status: u16, ctype: &'static str, body: Vec<u8>) -> Response<HttpBod
 
 fn json_response(status: u16, body: Vec<u8>) -> Response<HttpBody> {
     response(status, "application/json; charset=utf-8", body)
+}
+
+fn json_value(status: u16, v: Value) -> Response<HttpBody> {
+    json_response(status, serde_json::to_vec(&v).unwrap_or_default())
 }
 
 fn sse_bytes(json: Vec<u8>) -> Bytes {
@@ -317,8 +322,13 @@ impl State {
     }
 }
 
-pub async fn route(st: &'static State, req: Request<Incoming>) -> Result<Response<HttpBody>, Infallible> {
+pub async fn route(
+    st: &'static State,
+    req: Request<Incoming>,
+    peer: std::net::SocketAddr,
+) -> Result<Response<HttpBody>, Infallible> {
     let path = req.uri().path();
+    let deep = req.uri().query().is_some_and(|q| q.split('&').any(|x| x == "deep" || x.starts_with("deep=")));
     let m = req.method().clone();
     let r = match (path, &m) {
         ("/v1/chat/completions", &Method::POST) => chat(st, req).await,
@@ -326,6 +336,7 @@ pub async fn route(st: &'static State, req: Request<Incoming>) -> Result<Respons
         ("/tokenize", &Method::POST) => tokenize(st, req).await,
         ("/detokenize", &Method::POST) => detokenize(st, req).await,
         ("/v1/models", &Method::GET | &Method::HEAD) => models(st),
+        ("/health", &Method::GET | &Method::HEAD) if deep => health_deep(st, peer).await,
         ("/health", &Method::GET | &Method::HEAD) => health(st),
         ("/metrics", &Method::GET | &Method::HEAD) => metrics_route(st).await,
         ("/v1/chat/completions" | "/v1/completions" | "/tokenize" | "/detokenize", _) => {
@@ -347,7 +358,9 @@ pub async fn route(st: &'static State, req: Request<Incoming>) -> Result<Respons
 
 struct ChatReq {
     tools: Option<Value>,
-    tool_choice: Value,
+    choice: ToolChoice,
+    /// what the insert rule puts in place of the reply's first token (empty: nothing is forced)
+    force: Vec<u32>,
     prompt: Vec<u32>,
     params: sampling::Params,
     /// the thinking budget in reply tokens; 0: none
@@ -361,16 +374,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         return Err(ApiError::bad("echo is not supported by the gr8 front end", Some("echo")));
     }
     let tools = normalize_tools(body.get("tools"))?;
-    let tool_choice = match body.get("tool_choice") {
-        None | Some(Value::Null) => Value::from(if tools.is_some() { "auto" } else { "none" }),
-        Some(v) => v.clone(),
-    };
-    if tool_choice.is_object() || tool_choice.as_str() == Some("required") {
-        return Err(ApiError::bad(
-            "named / required tool_choice is not supported by the gr8 front end",
-            Some("tool_choice"),
-        ));
-    }
+    let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     thinking::check_response_format(body.get("response_format"))?;
     let th = thinking::resolve(body, &st.template.levels, st.thinking)?;
     let kw = build_template_kwargs(
@@ -410,17 +414,44 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         st.max_logprobs(),
         true,
     )?;
-    // the close a budget puts in has no logprobs: a request that asks for both is refused, and the server's default
-    // budget leaves a logprobs request alone
-    let budget = match (th.budget, params.gen.logprobs.is_some()) {
+    // a forced choice rides the engine's insert rule, and an inserted token has no logprob (PROTOCOL.md `insert`)
+    if choice.is_forced() && params.gen.logprobs.is_some() {
+        return Err(ApiError::bad(
+            "a forced tool_choice cannot be combined with logprobs",
+            Some("tool_choice"),
+        ));
+    }
+    // the close a budget puts in is an insert rule too, and a request carries at most one: one that asks for both is
+    // refused, while the server's default budget steps aside, as it does for logprobs
+    let budget = match (th.budget, params.gen.logprobs.is_some() || choice.is_forced()) {
         (b, true) if b > 0 && th.budget_explicit => {
-            return Err(ApiError::bad("thinking_budget cannot be combined with logprobs", Some("thinking_budget")))
+            return Err(ApiError::bad(
+                if choice.is_forced() {
+                    "thinking_budget cannot be combined with a forced tool_choice"
+                } else {
+                    "thinking_budget cannot be combined with logprobs"
+                },
+                Some("thinking_budget"),
+            ))
         }
         (_, true) => 0,
         (b, false) => b,
     };
+    if choice.is_forced() && !st.engine.inserts() {
+        return Err(ApiError::bad(
+            "the engine does not support a forced tool_choice",
+            Some("tool_choice"),
+        ));
+    }
+    // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
+    // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
+    let close = match (st.tok.think_start, st.tok.think_end) {
+        (Some(s), Some(e)) if think_open(&prompt, s, e) => st.tok.think_close.as_slice(),
+        _ => &[],
+    };
+    let force = choice.forced_ids(&st.tok, close)?;
     params.gen.system_tokens = system;
-    Ok(ChatReq { tools, tool_choice, prompt, params, budget })
+    Ok(ChatReq { tools, choice, force, prompt, params, budget })
 }
 
 /// The prompt's system span (PROTOCOL.md `system_tokens`): its tokens up to where the first message after the leading
@@ -461,7 +492,8 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     };
     let rid = new_id("chatcmpl");
     let include_reasoning = body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
-    let parser = GlmParser::new(cr.tools.as_ref(), &cr.tool_choice, include_reasoning);
+    let choice_value = cr.choice.as_value();
+    let parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
@@ -480,6 +512,17 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
                 gen.thinking(end, (limit > 0).then_some(Budget { limit, close: &st.tok.think_close }));
             }
         }
+    }
+    if !cr.force.is_empty() {
+        // `tool_choice: required` (or a named function): the engine puts the thinking close and the opener -- and the
+        // name -- in place of the reply's first token, so the reply is a call and cannot be text. A budget cannot also
+        // be in force here (the combination is refused above), so this is the request's one rule, and it replaces the
+        // thinking state that block set: the close is in the insert now.
+        gen.params.gen.insert = Some(InsertRule {
+            after_tokens: 0,
+            unless_emitted: None,
+            tokens: cr.force.clone(),
+        });
     }
     if stream {
         let (sse, resp) = Sse::open();
@@ -1146,6 +1189,38 @@ fn health(st: &State) -> Response<HttpBody> {
     let mut r = Response::new(HttpBody::Full(None));
     *r.status_mut() = if st.engine.ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     r
+}
+
+/// /health?deep: the head's supervisor checks every rank (weights against the engine's sealed sums, while it serves) and
+/// answers with one JSON object; 200 when every rank passes, else 503. Each check reads every weight byte once, so it
+/// answers localhost only.
+async fn health_deep(st: &State, peer: std::net::SocketAddr) -> Response<HttpBody> {
+    if !peer.ip().is_loopback() {
+        return json_value(403, serde_json::json!({"ok": false, "error": "/health?deep answers localhost only"}));
+    }
+    let Some(addr) = st.supervisor.as_deref() else {
+        return json_value(503, serde_json::json!({"ok": false, "error": "no supervisor (--supervisor HOST:PORT)"}));
+    };
+    match tokio::time::timeout(Duration::from_secs(90), ask_supervisor(addr, r#"{"t": "check_all"}"#)).await {
+        Ok(Ok(v)) => {
+            let ok = v.get("ok").and_then(Value::as_bool) == Some(true);
+            json_value(if ok { 200 } else { 503 }, v)
+        }
+        Ok(Err(e)) => json_value(503, serde_json::json!({"ok": false, "error": format!("supervisor {addr}: {e}")})),
+        Err(_) => {
+            json_value(503, serde_json::json!({"ok": false, "error": format!("supervisor {addr}: no answer in 90 s")}))
+        }
+    }
+}
+
+/// One JSON line to a supervisor's control port, one JSON line back.
+async fn ask_supervisor(addr: &str, msg: &str) -> Result<Value, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut s = tokio::net::TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+    s.write_all(format!("{msg}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&line).map_err(|e| format!("bad answer: {e}"))
 }
 
 async fn metrics_route(st: &State) -> Response<HttpBody> {

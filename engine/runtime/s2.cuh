@@ -61,6 +61,7 @@ struct S2Model
     int base[S2N] = {};               // per slot, run[q][0]
     int pages[S2N] = {};              // per slot, run[q].size()
     bool exclusive[S2N] = {};         // per slot: a run past R (s2_set_exclusive), solo on the tables as built
+    bool ex_split[S2N] = {};          // per slot: that run on the pool's page classes (its own list): the solo tables are its CP map
     int* table[S2N] = {};             // [nslots] device: the slot's block table, run_pages entries, shared by every layer's view
     int* zero_list = nullptr;         // [pool_pages] device: the pages s2_reset_pages clears
     G6AttnStepCell* cells = nullptr;  // [S2N][nl] device
@@ -88,15 +89,16 @@ inline std::vector<int> s2_run_list(int base_page, int pages)
     for (int i = 0; i < pages; ++i) t[i] = base_page + i;
     return t;
 }
-// 1..most distinct pages, each inside the pool
-inline void s2_check_pages(const S2Model& s, const std::vector<int>& list, int most, const char* who)
+// 1..most distinct pages, each below `bound` (the model's own pool; a run past R on the page classes carries the
+// drafter's pages too, so its callers pass the larger of the two models' pools)
+inline void s2_check_pages(const S2Model& s, const std::vector<int>& list, int most, int bound, const char* who)
 {
     if (list.empty() || (int)list.size() > most)
         die(std::string(who) + ": " + std::to_string(list.size()) + " pages, want 1.." + std::to_string(most));
-    std::vector<bool> seen(s.pool_pages);
+    std::vector<bool> seen(bound);
     for (int p : list)
     {
-        if (p < 0 || p >= s.pool_pages || seen[p]) die(std::string(who) + ": page " + std::to_string(p) + " outside the pool or repeated");
+        if (p < 0 || p >= bound || seen[p]) die(std::string(who) + ": page " + std::to_string(p) + " outside the pool or repeated");
         seen[p] = true;
     }
 }
@@ -109,12 +111,18 @@ inline void s2_set_pages(Model& m, int q, const std::vector<int>& list)
 {
     S2Model& s = *m.s2;
     if (q < 0 || q >= s.nslots) die("s2_set_pages: slot out of range");
-    s2_check_pages(s, list, s.run_pages, "s2_set_pages");
+    s2_check_pages(s, list, s.run_pages, s.pool_pages, "s2_set_pages");
     const std::vector<int>& old = s.run[q];
     auto at = [](const std::vector<int>& v, size_t i) { return i < v.size() ? v[i] : -1; };
-    size_t lo = 0, hi = std::max(old.size(), list.size());
-    while (lo < hi && at(old, lo) == at(list, lo)) ++lo;
-    while (hi > lo && at(old, hi - 1) == at(list, hi - 1)) --hi;
+    // after a run past R on the page classes, run[q] holds that run's whole list (longer than the view table) and the
+    // view table was never written for it, so the diff has nothing to go on: rewrite the whole table
+    const bool unknown = s.ex_split[q];
+    size_t lo = 0, hi = unknown ? (size_t)s.run_pages : std::max(old.size(), list.size());
+    if (!unknown)
+    {
+        while (lo < hi && at(old, lo) == at(list, lo)) ++lo;
+        while (hi > lo && at(old, hi - 1) == at(list, hi - 1)) --hi;
+    }
     if (hi > lo)
     {
         std::vector<int> t(hi - lo);
@@ -125,6 +133,24 @@ inline void s2_set_pages(Model& m, int q, const std::vector<int>& list)
     s.base[q] = list[0];
     s.pages[q] = (int)list.size();
     s.exclusive[q] = false;
+    s.ex_split[q] = false;
+}
+// slot q holds a run past R: S=1 only. On the pool's page classes (the run carries its own list): the layers' tables
+// become its CP map (s2_solo_cp_pages, written at its prefill and at the mode switch), the slot's own view stays
+// unused while it runs alone, and `most` (the larger of the two models' pools) bounds the list, whose draft-only
+// pages sit past the main model's. Else the run is pages 0, 1, .. on the layers' tables as built (s2_solo_built).
+// ex_split records which, so the mode switch rebuilds what bind decided (the pool's mode at the grant), not what
+// the stored list's shape suggests.
+inline void s2_set_exclusive(Model& m, int q, const std::vector<int>& list, int most)
+{
+    S2Model& s = *m.s2;
+    if (q < 0 || q >= s.nslots) die("s2_set_exclusive: slot out of range");
+    s2_check_pages(s, list, most, most, "s2_set_exclusive");
+    s.run[q] = list;
+    s.base[q] = list.empty() ? 0 : list[0];
+    s.pages[q] = (int)list.size();
+    s.exclusive[q] = true;
+    s.ex_split[q] = true;
 }
 // slot q holds a run past R: S=1 only, on the layers' tables as built (s2_solo_built). Its view table is 0, 1, ..
 inline void s2_set_exclusive(Model& m, int q)
@@ -302,19 +328,29 @@ __global__ void __launch_bounds__(256) k_zero_pages(const int* list, uint4* mla,
     for (size_t k = threadIdx.x; k < 64 * g6kv::ROW / 16; k += blockDim.x) mla[p * (64 * g6kv::ROW / 16) + k] = make_uint4(0, 0, 0, 0);
     if (index) for (size_t k = threadIdx.x; k < 64 * g6kv::IDX_ROW / 16; k += blockDim.x) index[p * (64 * g6kv::IDX_ROW / 16) + k] = make_uint4(0, 0, 0, 0);
 }
-// a new session's pages on the layers' own bindings: today's reset() limited to those pages (other sessions' pages stay),
-// plus the bindings' per-step words. The whole pool = today's reset(). Host, at an admission fence, on every rank, main
-// AND draft model, before the session's prefill.
-inline void s2_reset_pages(Model& m, const std::vector<int>& list, cudaStream_t st)
+// a new session's pages on the layers' own bindings: today's reset() limited to those pages (other sessions' pages
+// stay), plus the bindings' per-step words. The whole pool = today's reset(). A run past R on the page classes holds
+// pages past this model's pool too (the drafter's tail copy): they are skipped here and cleared on the model that has
+// them. Host, at an admission fence, on every rank, main AND draft model, before the session's prefill.
+inline void s2_reset_pages(Model& m, const std::vector<int>& list, cudaStream_t st, int most)
 {
     const S2Model& s = *m.s2;
-    s2_check_pages(s, list, s.pool_pages, "s2_reset_pages");
-    if ((int)list.size() == s.pool_pages) { reset(m, st); return; }
-    G6RT_CK(g6h2d::copy(s.zero_list, list.data(), list.size() * 4, st));
+    s2_check_pages(s, list, most, most, "s2_reset_pages");
+    std::vector<int> mine;
+    mine.reserve(list.size());
+    for (int p : list)
+        if (p < s.pool_pages)
+            mine.push_back(p);
+    if ((int)mine.size() == s.pool_pages)
+    {
+        reset(m, st);
+        return;
+    }
+    G6RT_CK(g6h2d::copy(s.zero_list, mine.data(), mine.size() * 4, st));
     for (G6AttnBinding* p : s.pool)
     {
         const G6Attn& a = p->args;
-        k_zero_pages<<<(unsigned)list.size(), 256, 0, st>>>(s.zero_list, static_cast<uint4*>(a.mla_cache), static_cast<uint4*>(a.index_cache));
+        k_zero_pages<<<(unsigned)mine.size(), 256, 0, st>>>(s.zero_list, static_cast<uint4*>(a.mla_cache), static_cast<uint4*>(a.index_cache));
         G6RT_CK(cudaGetLastError());
         G6RT_CK(cudaMemsetAsync(a.indices, 0xff, (size_t)p->max_rows * 2048 * 4, st));
         G6RT_CK(cudaMemsetAsync(a.output, 0, (size_t)p->max_rows * a.heads * 256 * 2, st));
@@ -329,7 +365,7 @@ inline void s2_zero_pages(Model& m, const std::vector<int>& list, cudaStream_t s
 {
     const S2Model& s = *m.s2;
     if (list.empty()) return;
-    s2_check_pages(s, list, s.pool_pages, "s2_zero_pages");
+    s2_check_pages(s, list, s.pool_pages, s.pool_pages, "s2_zero_pages");
     G6RT_CK(g6h2d::copy(s.zero_list, list.data(), list.size() * 4, st));
     for (G6AttnBinding* p : s.pool)
     {
@@ -349,7 +385,7 @@ inline void s2_set_base(Model& m, int q, int base_page)
 inline void s2_solo_pages(Model& m, const std::vector<int>& list)
 {
     S2Model& s = *m.s2;
-    s2_check_pages(s, list, s.run_pages, "s2_solo_pages");
+    s2_check_pages(s, list, s.run_pages, s.pool_pages, "s2_solo_pages");
     for (size_t l = 0; l < s.pool.size(); ++l)
     {
         std::vector<int> t(m.s2_below ? s.tab0[l].size() : s.pool_pages, -1);   // the CP map has table_size entries
@@ -364,6 +400,54 @@ inline void s2_solo_built(Model& m)
     if (!m.s2_below) die("s2_solo_built: only S2 below R has runs past R");
     for (size_t l = 0; l < s.pool.size(); ++l)
         G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), s.tab0[l].data(), s.tab0[l].size() * 4));
+}
+
+// the `at`-th page of `list` below `place` (0-based), -1 when the list has none: a run's pages below place, in list
+// order, are its prefix then its shard of the tail past R
+inline int s2_list_place(const std::vector<int>& list, int at, int place)
+{
+    int seen = 0;
+    for (int p : list)
+        if (p < place && seen++ == at)
+            return p;
+    return -1;
+}
+// S=1 for a run past R on the page classes: the layers' tables become the run's CP map over its list — prefix pages
+// lp < R/64 at list[lp], an owned tail page (lp % nr == rank) at the (R/64 + j)-th page of the list below place (j
+// its owned index), every other page G6_CP_REMOTE. A binding without CP (the MTP layer, and the whole draft model)
+// takes the list as built: page lp at list[lp]. The driver keeps StepIn::page_bound = pool_pages on every step of it,
+// as for any solo run. `most`: as s2_set_exclusive's.
+inline void s2_solo_cp_pages(Model& m, const std::vector<int>& list, int most)
+{
+    S2Model& s = *m.s2;
+    if (!m.s2_below) die("s2_solo_cp_pages: only S2 below R has runs past R");
+    s2_check_pages(s, list, most, most, "s2_solo_cp_pages");
+    const int rp = m.s2_below / 64;
+    for (size_t l = 0; l < s.pool.size(); ++l)
+    {
+        const G6Attn& a = s.pool[l]->args;
+        std::vector<int> t(m.s2_below ? s.tab0[l].size() : s.pool_pages, -1);
+#if defined(G6_CP) && G6_CP
+        if (a.cp_nr)
+        {
+            int j = 0;
+            for (size_t lp = 0; lp < t.size(); ++lp)
+            {
+                if ((int)lp < rp)
+                    t[lp] = lp < list.size() ? list[lp] : -1;
+                else if ((int)lp % a.cp_nr == a.cp_rank)
+                    t[lp] = s2_list_place(list, rp + j++, s.pool_pages);
+                else
+                    t[lp] = G6_CP_REMOTE;
+            }
+        }
+        else
+#endif
+        {
+            for (size_t i = 0; i < t.size() && i < list.size(); ++i) t[i] = list[i];
+        }
+        G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), t.data(), t.size() * 4));
+    }
 }
 
 // pages [B, B + pages) -> [0, pages) of a page-major cache (page_bytes per page), overlap-safe: chunks of at most B pages

@@ -48,9 +48,11 @@ struct Rank {
         // the policies --kv-keep sessions and --kv-write-limit set, through the C interface
         pool.policy(1, 0, 1, sizeof(Page));
         pool.write_limit(500);
-        // runs past R keep their tails. One rank's model: its shard is every page past R and a block holds one page's
-        // replicated parts, so each part is the whole page again
-        pool.tail(1, 1);
+        // runs past R keep their tails. Two ranks share the tail: a run past R takes its own pages (its prefix and
+        // shard below place, the drafter's copy above it, pool.rs page classes), and each rank spills its shard (the
+        // (below + j)-th page of its list below place) and every tail page's replicated parts — with per_slot 1, a
+        // block holds one page's parts, the whole page again
+        pool.tail(2, 1);
         for (auto& p : dev) p.fill(-1);
     }
     // the engine's part: every copy, in order, then io_done

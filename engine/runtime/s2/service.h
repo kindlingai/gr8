@@ -5,6 +5,8 @@
 #include "control_channel.h"
 #include "dispatch.h"
 #include "pool.h"
+#include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <thread>
 
@@ -53,11 +55,16 @@ struct NativeHooks {
     s2::DSel dsel;                    // drafter choice (G6_S2_DSEL)
 };
 // Only atomic scalar stores/loads on the compute hot path. No request-file
-// checks, digest, allocation, or lock in an event-free boundary.
+// checks, digest, allocation, or lock in an event-free boundary. horizon() is
+// a bounded six-step projection over the eight slots: no allocation, no lock,
+// a few hundred nanoseconds against a >= 20 ms round.
 struct Progress {
-    std::atomic<uint64_t> boundary{0}, revision{0};
+    std::atomic<uint64_t> boundary{0}, revision{0}, horizon{0};
     std::atomic<unsigned> resident{0}, retiring{0};
     void publish(const Scheduler& s) {
+        // horizon before boundary: a reader that loads boundary first and horizon second (event) sees a horizon
+        // computed for that boundary or a later one, never an earlier one. Later only widens the margin.
+        horizon.store(s.horizon());
         boundary.store(s.boundary()); resident.store(s.resident()); retiring.store(s.retiring()); revision.store(s.revision());
     }
 };
@@ -81,7 +88,12 @@ class Service {
     uint64_t attempted_head_ = UINT64_MAX, attempted_revision_ = UINT64_MAX;
     uint64_t event_ = 1;
     uint64_t sync_ = 0;   // compute thread: barriers passed (native_.drained)
-    static constexpr uint64_t LOOKAHEAD = 8; // future safe boundary; late notices remain fatal
+    // G6_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
+    // boundary it read and the future boundary it chose), one "commit" line when that notice lands on each rank, and one
+    // "step" line per prefill quantum. Together they say whether a cancel was installed while a long prefill was still
+    // running -- the lookahead binding -- or merely waited for it, which is the scheduler's admission. Logs only: no
+    // state, no digest and no behaviour change, so it can run on a serving build.
+    const bool elog_ = ::getenv("G6_S2_EVENTLOG") && *::getenv("G6_S2_EVENTLOG") == '1';
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
         stopping_.store(true); endpoint_->fail();
@@ -140,9 +152,18 @@ class Service {
         atomic_file(c_.directory + "/status.s2", o.str());
     }
     void event(const Command& command) { // CONTROL thread: never read Driver until ALL ACKs
-        const auto boundary = progress_.boundary.load();
-        require(boundary <= uint64_t(INT64_MAX) - LOOKAHEAD, "event boundary overflow");
-        Notice n{c_.scheduler.epoch, event_, boundary + LOOKAHEAD, command.request, command.hash,
+        const auto boundary = progress_.boundary.load(); // first: the horizon below is for this boundary or a later one
+        const auto horizon = progress_.horizon.load();
+        require(boundary <= uint64_t(INT64_MAX) - NOTICE_MAX, "event boundary overflow");
+        // The notice lands at the first boundary whose work after the one in flight covers NOTICE_ROWS rows, so a
+        // prefill no longer waits out eight ~6 s quanta for a propagation that takes milliseconds (#61); late notices
+        // remain fatal. Clamped, so a torn read of the pair can only widen the target, never narrow it past the floor.
+        const auto target = std::clamp(horizon, boundary + NOTICE_MIN, boundary + NOTICE_MAX);
+        if (elog_)
+            fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu)\n",
+                    c_.rank, (unsigned long long)event_, command.admit ? "admit" : "cancel", (unsigned long long)command.request,
+                    (unsigned long long)boundary, (unsigned long long)target, (unsigned long long)(target - boundary));
+        Notice n{c_.scheduler.epoch, event_, target, command.request, command.hash,
                  command.admit ? EventKind::Admit : EventKind::Cancel};
         leader_->event(n, [&](uint64_t hash) {
             const auto& s = driver_->state(); // compute paused in boundary() until this commit
@@ -236,11 +257,12 @@ class Service {
     }
     void compute() {
         while (!stopping_.load()) {
+            Notice noticed{};
             if (!driver_->state().resident()) {
                 const auto n = endpoint_->wait_notice(); driver_->idle_boundary(n.boundary);
             }
             auto cm = endpoint_->boundary(driver_->state().boundary(), [&] {
-                native_.fence(); const auto n = endpoint_->wait_notice(); staged_.reset();
+                native_.fence(); const auto n = endpoint_->wait_notice(); noticed = n; staged_.reset();
                 if (n.kind == EventKind::Admit) {   // the head reads its own req.<id>; a worker has the bytes from the head
                     const auto bytes = worker_ ? worker_->request(n.request) : ingress_.request({true,n.epoch,n.request,n.payload_hash});
                     require(payload_hash(bytes) == n.payload_hash, "request bytes do not match the ADMIT notice");
@@ -260,11 +282,19 @@ class Service {
                 std::optional<Payload> payload;
                 if (cm->admit) { require(staged_.has_value(), "commit without verified request"); payload = sessions_.payload(*staged_); }
                 driver_->apply(*cm, payload ? &*payload : nullptr);
+                if (elog_)
+                    fprintf(stderr, "# s2_event commit rank %u event %llu %s request %llu boundary %llu\n", c_.rank,
+                            (unsigned long long)noticed.event, noticed.kind == EventKind::Cancel ? "cancel" : "admit",
+                            (unsigned long long)noticed.request, (unsigned long long)cm->boundary);
                 if (worker_ && cm->admit) worker_->admitted(cm->admit->req.id);
                 dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
                 staged_.reset(); endpoint_->applied(); continue;
             }
             const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
+            if (elog_ && work.kind != Kind::Decode)
+                fprintf(stderr, "# s2_event step rank %u boundary %llu request %llu %s first %u rows %u\n", c_.rank,
+                        (unsigned long long)work.boundary, (unsigned long long)driver_->state().slots()[work.keys[0].slot].req.id,
+                        work.kind == Kind::Prefill ? "prefill" : "tail", work.first, work.rows);
             dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
         }
     }

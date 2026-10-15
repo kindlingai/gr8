@@ -636,6 +636,8 @@ int main(int argc, char** argv)
     // the run at B = 0.
     // G6_S2_PFPOISON=1: fill every cache with 0x3c bytes first, so a read outside the run changes the output.
     int pf_base = 0;
+    int pf_xlist = 0;            // G6_S2_XLIST: the shuffled two-class list every sequence runs on (past R)
+    std::vector<int> pf_xlist_pages;
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
     int pf_pages = 0;
     if (const char* e = getenv("G6_S2_PFBASE"))
@@ -670,12 +672,69 @@ int main(int argc, char** argv)
         fprintf(stderr, "# s2 base-page gate: every sequence at base page %d, run of %d pages (main pool %d pages)%s%s\n", pf_base, pf_pages,
                 R[0].s2->pool_pages, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "", ixt ? "" : ", NOFIX");
     }
+    // Gate: DEC_S2 CP build, --prefill, no --s2: G6_S2_XLIST=seed[,pages] runs every sequence as one session past R on
+    // a shuffled page list of the pool's two classes (the prefix and the run's shard below place, the drafter's tail
+    // copy above it): the tables become the run's CP map (s2_solo_cp_pages, main and draft), StepIn::page_bound = the
+    // pool's pages, and s2_reset_pages clears the run between sequences. Stdout must equal the run on the tables as
+    // built (the same build without G6_S2_XLIST). G6_S2_PFPOISON works as for the base-page gate.
+    if (const char* e = getenv("G6_S2_XLIST"))
+    {
+        const std::vector<int> v = parse_ints(e);
+        if (s2mode || !cp_on || !MP || v.empty() || v.size() > 2) die("G6_S2_XLIST=seed[,pages]: needs G6_CP on, --prefill, no --s2");
+        pf_xlist = v[0];
+        for (Model& m : R) { m.s2_below = cp_R; s2_init(m, 1, st); m.s2on = false; }
+        for (Draft& D : DR) { D.d.s2_below = cp_R; s2_init(D.d, 1, st); D.d.s2on = false; }
+        // the classes: place = the main pool's pages (every rank model has the same), most = the drafter's
+        int place = R[0].s2->pool_pages, most = DR[0].d.s2->pool_pages;
+        for (const Model& m : R) place = std::min(place, m.s2->pool_pages);
+        for (const Draft& D : DR) most = std::max(most, D.d.s2->pool_pages);
+        const int rp = cp_R / 64;
+        const int n = v.size() > 1 ? v[1] : std::min(most, rp + (place - rp) * g6nr::NR);
+        const int shard = (n - rp + g6nr::NR - 1) / g6nr::NR;
+        if (n <= rp || rp + shard > place || n - rp - shard > most - place)
+            die("G6_S2_XLIST: pages must leave the run's prefix and shard below place");
+        for (const Plan& p : plans)
+            if ((int)p.prompt.size() + p.n_gen > n * 64)
+                die("G6_S2_XLIST: a sequence needs more than its run's pages; pass a larger pages or a longer G6_CP_R build");
+        // a seeded shuffle of each class (splitmix64, as G6_S2_PAGES): the run's pages may sit anywhere in them
+        auto shuffle = [](std::vector<int> v, uint64_t x) {
+            for (int i = (int)v.size() - 1; i > 0; --i)
+            {
+                uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
+                std::swap(v[i], v[z % (uint64_t)(i + 1)]);
+            }
+            return v;
+        };
+        std::vector<int> low = shuffle(s2_run_list(0, place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 1),
+                          high = shuffle(s2_run_list(place, most - place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 0x517CC1B727220A95ull);
+        pf_xlist_pages.insert(pf_xlist_pages.end(), low.begin(), low.begin() + (rp + shard));
+        pf_xlist_pages.insert(pf_xlist_pages.end(), high.begin(), high.begin() + (n - rp - shard));
+        if (getenv("G6_S2_PFPOISON"))
+        {
+            auto poison = [&](Model& m) {
+                for (const Layer& y : m.layers)
+                {
+                    const G6Attn& a = y.ab.args;
+                    G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::ROW, st));
+                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::IDX_ROW, st));
+                }
+            };
+            for (Model& m : R) poison(m);
+            for (Draft& D : DR) poison(D.d);
+        }
+        for (Model& m : R) s2_solo_cp_pages(m, pf_xlist_pages, most);
+        for (Draft& D : DR) s2_solo_cp_pages(D.d, pf_xlist_pages, most);
+        G6RT_CK(cudaStreamSynchronize(st));
+        fprintf(stderr, "# s2 xlist gate: every sequence past R on %d shuffled pages (prefix %d + shard %d below place %d, %d above)%s\n",
+                n, rp, shard, place, n - rp - shard, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "");
+    }
 #endif
-    // StepIn to the device; G6_S2_PFBASE: the pool's page bound
+    // StepIn to the device; G6_S2_PFBASE / G6_S2_XLIST: the pool's page bound
     auto put_in = [&](StepIn* dst, const StepIn& si) {
         StepIn x = si;
 #ifdef DEC_S2
-        if (pf_base) x.page_bound = (dst == in ? R[0] : DR[0].d).s2->pool_pages;
+        if (pf_base || pf_xlist) x.page_bound = (dst == in ? R[0] : DR[0].d).s2->pool_pages;
 #endif
         G6RT_CK(g6h2d::copy(dst, &x, sizeof x));
     };
@@ -1376,10 +1435,17 @@ int main(int argc, char** argv)
         if (!skip)
         {
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
-            if (getenv("G6_S2_PFBASE"))         // base-page gate: clear the run only (s2_reset_pages)
+            if (getenv("G6_S2_XLIST"))            // xlist gate: clear the run only (s2_reset_pages, its classes)
             {
-                for (Model& m : R) s2_reset_pages(m, s2_run_list(pf_base, pf_pages), st);
-                for (Draft& D : DR) s2_reset_pages(D.d, s2_run_list(pf_base, pf_pages), st);
+                const int most = std::max(R[0].s2->pool_pages, DR[0].d.s2->pool_pages);
+                for (Model& m : R) s2_reset_pages(m, pf_xlist_pages, st, most);
+                for (Draft& D : DR) s2_reset_pages(D.d, pf_xlist_pages, st, most);
+            }
+            else if (getenv("G6_S2_PFBASE"))      // base-page gate: clear the run only (s2_reset_pages)
+            {
+                const int most = std::max(R[0].s2->pool_pages, DR[0].d.s2->pool_pages);
+                for (Model& m : R) s2_reset_pages(m, s2_run_list(pf_base, pf_pages), st, most);
+                for (Draft& D : DR) s2_reset_pages(D.d, s2_run_list(pf_base, pf_pages), st, most);
             }
             else
 #endif

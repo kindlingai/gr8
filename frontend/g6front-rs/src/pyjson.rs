@@ -1,5 +1,5 @@
-//! JSON text exactly as CPython's `json.dumps(..., ensure_ascii=False)` writes it, so responses diff clean against
-//! the Python front end: `repr()` floats (`1e-05`, `1e+16`, `-9999.0`), only `"`, `\` and C0 controls escaped
+//! JSON text exactly as CPython's `json.dumps(..., ensure_ascii=False)` writes it, which is what vLLM's clients
+//! expect: `repr()` floats (`1e-05`, `1e+16`, `-9999.0`), only `"`, `\` and C0 controls escaped
 //! (`\u001f` lowercase), keys in insertion order. Writes straight into a `Vec<u8>`; no intermediate tree.
 
 use serde_json::Value;

@@ -141,6 +141,10 @@ pub struct Pool {
     pages: u32,
     place: u32,
     below_rows: u32,
+    // ranks of the CP map past R (tail()): 0 = a run past R takes the whole pool as pages 0, 1, .. (the CP map as
+    // built); above 0 it takes its own pages in two classes: the prefix (R/64 pages) and its shard (ceil of the tail
+    // pages / nr) from [0, place), the rest (the drafter's copy of the tail) from [place, pages)
+    nr: u32,
     version: u32,
     live: u32,
     used: Vec<bool>,
@@ -175,6 +179,7 @@ impl Pool {
             pages: pool_pages,
             place: place_pages,
             below_rows,
+            nr: 0,
             version: 0,
             live: 0,
             used: vec![false; pool_pages as usize],
@@ -234,14 +239,23 @@ impl Pool {
         }
     }
 
-    /// The write limit (stash.rs): the tiers write at most milli / 1000 blocks per page of KV computed. 0 = none.
     /// Runs past R keep their tails in the stores (stash.rs set_tail): nr ranks, per_slot replicated parts a block.
+    /// nr > 0 also turns the page classes on for the pool itself (see Pool::nr), so this is set whenever the pool's R
+    /// is the CP map's, stores or not.
     pub fn tail(&mut self, nr: u32, per_slot: u32) {
+        self.nr = nr;
         if let Some(s) = &mut self.stash {
-            s.set_tail(nr, per_slot);
+            s.set_tail(nr, per_slot, self.place);
         }
     }
 
+    /// Whether a run past R takes its own pages (tail() set the CP map's ranks): the engine builds its tables from
+    /// its list instead of using the layers' tables as built.
+    pub fn split(&self) -> bool {
+        self.nr > 0
+    }
+
+    /// The write limit (stash.rs): the tiers write at most milli / 1000 blocks per page of KV computed. 0 = none.
     pub fn write_limit(&mut self, milli: u64) {
         if let Some(s) = &mut self.stash {
             s.set_limit(milli);
@@ -340,6 +354,16 @@ impl Pool {
         rows > self.below_rows as u64
     }
 
+    // A run past R (nr > 0) takes its own pages: of its L = ceil(worst / 64) pages, the prefix (R / 64) and its shard
+    // of the tail (ceil of the tail pages / nr) come from [0, place), the tail pages the drafter needs and this rank
+    // does not hold from [place, pages). The lists are the same on every rank; what each page holds differs.
+    fn exclusive_pages(&self, worst: u64) -> (u64, u64) {
+        let rp = self.below_rows as u64 / PAGE;
+        let t = pages_for(worst).saturating_sub(rp);
+        let own = t.div_ceil(self.nr.max(1) as u64).min(t);
+        (rp + own, t - own)
+    }
+
     pub fn free_pages(&self) -> u32 {
         if self.exclusive {
             0
@@ -372,7 +396,13 @@ impl Pool {
             return false;
         }
         if self.exclusive(worst) {
-            return w <= self.room() as u64;
+            if self.nr == 0 {
+                return w <= self.room() as u64;
+            }
+            // its own pages: both classes must have room in an empty pool (a reservation evicts retained runs as it
+            // needs them, so every page of a class is free or evictable)
+            let (main, draft) = self.exclusive_pages(worst);
+            return main <= self.place as u64 && draft <= (self.pages - self.place) as u64;
         }
         n <= self.room() as u64 && w <= self.place as u64 && self.safe(Some((n, w)), None)
     }
@@ -387,9 +417,20 @@ impl Pool {
         let w = pages_for(worst) as u32;
         if self.exclusive(worst) {
             self.earn(w as u64, 0);
-            let gone = std::mem::take(&mut self.kept);
+            if self.nr == 0 {
+                let gone = std::mem::take(&mut self.kept);
+                self.spill(&gone);
+                return Ok(self.grant((0..w).collect(), true, w, worst, "exclusive", &gone, 0));
+            }
+            // its own pages: the prefix and its shard of the tail from below place, the drafter's copy of the
+            // rest from above it. Retained runs give their pages back only as the classes need them, and every
+            // one the classes evict spills (either class may be the one that runs out of room).
+            let (main, draft) = self.exclusive_pages(worst);
+            let mut list = Vec::with_capacity(w as usize);
+            let mut gone = self.fill_range(&mut list, main as usize, 0, self.place);
+            gone.extend(self.fill_range(&mut list, draft as usize, self.place, self.pages));
             self.spill(&gone);
-            return Ok(self.grant((0..w).collect(), true, w, worst, "exclusive", &gone, 0));
+            return Ok(self.grant(list, true, w, worst, "exclusive", &gone, 0));
         }
         let n = pages_for(rows) as usize;
         self.earn(n as u64, 0);
@@ -498,9 +539,14 @@ impl Pool {
             let adopted = &k.list[..(a as usize).min(k.list.len())];
             let mut room = a <= k.list.len() as u64 && a <= n;
             if self.exclusive(worst) {
-                // an exclusive run is pages 0, 1, ..: the adopted ones must be its start
                 room = room && self.live == 0 && n <= self.pages as u64;
-                room = room && adopted.iter().enumerate().all(|(i, &p)| p as usize == i);
+                if self.nr == 0 {
+                    // an exclusive run is pages 0, 1, ..: the adopted ones must be its start
+                    room = room && adopted.iter().enumerate().all(|(i, &p)| p as usize == i);
+                } else {
+                    // its own pages: the adopted ones and fresh ones of both classes must fit
+                    room = room && self.hit_room(adopted, a, n, worst);
+                }
             } else {
                 room = room && n <= (self.place.wrapping_sub(self.live)) as u64 && n <= w;
                 room = room && adopted.iter().all(|&p| p < self.place) && self.safe(Some((n, w)), None);
@@ -556,10 +602,16 @@ impl Pool {
             return false;
         }
         if self.exclusive(worst) {
-            return self.live == 0
+            let room = self.live == 0
                 && !self.exclusive
                 && n <= self.pages as u64
                 && (tail || a * PAGE <= self.below_rows as u64);
+            if self.nr == 0 || !room {
+                return room;
+            }
+            // its own pages: the two classes must fit (a fresh grant restores into them)
+            let (main, draft) = self.exclusive_pages(worst);
+            return main <= self.place as u64 && draft <= (self.pages - self.place) as u64;
         }
         n <= self.place.wrapping_sub(self.live) as u64 && n <= w && self.safe(Some((n, w)), None)
     }
@@ -578,9 +630,20 @@ impl Pool {
         let hits = self.hits_from(&e.st, e.hits);
         self.earn(n, a);
         let (list, gone, exclusive, pool_base) = if self.exclusive(worst) {
-            let gone = std::mem::take(&mut self.kept);
-            self.spill(&gone);
-            ((0..n as u32).collect::<Vec<u32>>(), gone, true, false)
+            if self.nr == 0 {
+                let gone = std::mem::take(&mut self.kept);
+                self.spill(&gone);
+                ((0..n as u32).collect::<Vec<u32>>(), gone, true, false)
+            } else {
+                // its own pages, a fresh two-class grant; the entry's blocks (its tail included) restore into them.
+                // Every run the classes evict spills, from either class.
+                let (main, draft) = self.exclusive_pages(worst);
+                let mut list = Vec::with_capacity(n as usize);
+                let mut gone = self.fill_range(&mut list, main as usize, 0, self.place);
+                gone.extend(self.fill_range(&mut list, draft as usize, self.place, self.pages));
+                self.spill(&gone);
+                (list, gone, true, false)
+            }
         } else {
             // the entry's base from a retained run that holds it, when one does: those pages need no copy
             let mut list = Vec::with_capacity(n as usize);
@@ -597,7 +660,9 @@ impl Pool {
             self.spill(&gone);
             (list, gone, false, from_pool.is_some())
         };
-        self.stash.as_mut().expect("found in it").restore(tier, &e, &list[..a as usize], pool_base, exclusive);
+        // a past-R grant restores its tail into pages past the hit's, so it passes its whole list
+        let into = if exclusive { &list[..] } else { &list[..a as usize] };
+        self.stash.as_mut().expect("found in it").restore(tier, &e, into, pool_base, exclusive);
         let rows = if exclusive { worst } else { rows };
         Ok(self.grant(list, exclusive, w as u32, rows, if pool_base { "stored+pool" } else { "stored" }, &gone, hits))
     }
@@ -644,7 +709,15 @@ impl Pool {
         }
         let adopted = &k.list[..a as usize];
         if self.exclusive(worst) {
-            if n > self.pages as u64 || adopted.iter().enumerate().any(|(i, &p)| p as usize != i) {
+            if n > self.pages as u64 {
+                return Err(Error::NoRoom);
+            }
+            if self.nr == 0 {
+                // an exclusive run is pages 0, 1, ..: the adopted ones must be its start
+                if adopted.iter().enumerate().any(|(i, &p)| p as usize != i) {
+                    return Err(Error::NoRoom);
+                }
+            } else if !self.hit_room(adopted, a, n, worst) {
                 return Err(Error::NoRoom);
             }
         } else if n > (self.place.wrapping_sub(self.live)) as u64
@@ -666,9 +739,16 @@ impl Pool {
         let mut list = k.list;
         list.truncate(a as usize);
         if self.exclusive(worst) {
-            let gone = std::mem::take(&mut self.kept);
+            if self.nr == 0 {
+                let gone = std::mem::take(&mut self.kept);
+                self.spill(&gone);
+                list.extend(a as u32..n as u32);
+                return Ok(self.grant(list, true, w as u32, worst, "hit", &gone, hits));
+            }
+            // its own pages: the adopted ones, then the two classes fill the rest (the low ones first, so the run's
+            // pages below place stay a prefix of its low pages in list order)
+            let gone = self.fill_hit(&mut list, a, n, worst);
             self.spill(&gone);
-            list.extend(a as u32..n as u32);
             return Ok(self.grant(list, true, w as u32, worst, "hit", &gone, hits));
         }
         let gone = self.fill(&mut list, n as usize);
@@ -833,37 +913,72 @@ impl Pool {
         self.live = if on { self.live + n } else { self.live - n };
     }
 
-    // `list` (adopted pages, if any) grows to n pages below place: the lowest pages no run holds or retains, after
-    // evicting the least recently retired runs until there are enough of them. Returns the evicted runs.
-    fn fill(&mut self, list: &mut Vec<u32>, n: usize) -> Vec<Kept> {
-        let place = self.place as usize;
+    // `list` (adopted pages, if any) grows by `need` pages out of [lo, hi): the lowest pages no run holds or retains,
+    // after evicting the least recently retired runs until there are enough of them. Returns the evicted runs.
+    fn fill_range(&mut self, list: &mut Vec<u32>, need: usize, lo: u32, hi: u32) -> Vec<Kept> {
+        let (lo, hi) = (lo as usize, hi as usize);
         // claims[p]: 1 when a live run or the adopted list holds p, plus one per retained run that holds it. A page
         // is spare at 0, and evicting a run only ever takes back its own claims.
-        let mut claims: Vec<u32> = self.used[..place].iter().map(|&u| u as u32).collect();
+        let mut claims: Vec<u32> = self.used[lo..hi].iter().map(|&u| u as u32).collect();
         for &p in list.iter() {
-            claims[p as usize] = 1;
+            if (p as usize) >= lo && (p as usize) < hi {
+                claims[p as usize - lo] = 1;
+            }
         }
         for k in &self.kept {
-            for &p in k.list.iter().filter(|&&p| (p as usize) < place) {
-                claims[p as usize] += 1;
+            for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
+                claims[p as usize - lo] += 1;
             }
         }
         let mut spare = claims.iter().filter(|&&c| c == 0).count();
         let mut evict = 0;
-        while spare < n - list.len() {
-            // the room checks before fill() guarantee enough pages once every retained run is gone
+        while spare < need {
+            // the room checks before fill_range() guarantee enough pages once every retained run is gone
             let k = &self.kept[evict];
-            for &p in k.list.iter().filter(|&&p| (p as usize) < place) {
-                claims[p as usize] -= 1;
-                if claims[p as usize] == 0 {
+            for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
+                claims[p as usize - lo] -= 1;
+                if claims[p as usize - lo] == 0 {
                     spare += 1;
                 }
             }
             evict += 1;
         }
         let gone: Vec<Kept> = self.kept.drain(..evict).collect();
-        let more = n - list.len();
-        list.extend((0..place as u32).filter(|&p| claims[p as usize] == 0).take(more));
+        list.extend((lo as u32..hi as u32).filter(|&p| claims[p as usize - lo] == 0).take(need));
+        gone
+    }
+
+    // `list` (adopted pages, if any) grows to n pages below place: the lowest pages no run holds or retains, after
+    // evicting the least recently retired runs until there are enough of them. Returns the evicted runs.
+    fn fill(&mut self, list: &mut Vec<u32>, n: usize) -> Vec<Kept> {
+        let need = n - list.len();
+        let place = self.place;
+        self.fill_range(list, need, 0, place)
+    }
+
+    // Whether a past-R hit's grant works with its own pages (nr > 0): the adopted low pages plus fresh ones of both
+    // classes must fit, the fresh low pages within the positions the grant still has (hit_room's caller checked
+    // a <= n and n <= pages).
+    fn hit_room(&self, adopted: &[u32], a: u64, n: u64, worst: u64) -> bool {
+        let (main, _draft) = self.exclusive_pages(worst);
+        let alt = adopted.iter().filter(|&&p| p < self.place).count() as u64;
+        let fresh_lt = main.saturating_sub(alt);
+        fresh_lt <= n - a
+            && alt + fresh_lt <= self.place as u64
+            && n - alt - fresh_lt <= (self.pages - self.place) as u64
+    }
+
+    // take_hit's past-R grant (nr > 0): the list grows from a to n pages, the low class first so the run's pages
+    // below place stay, in list order, its prefix, its shard and then the drafter's tail pages. Returns the evicted.
+    fn fill_hit(&mut self, list: &mut Vec<u32>, a: u64, n: u64, worst: u64) -> Vec<Kept> {
+        let (main, _draft) = self.exclusive_pages(worst);
+        let alt = list.iter().filter(|&&p| p < self.place).count() as u64;
+        let fresh_lt = main.saturating_sub(alt).min(n - a);
+        let fresh_gt = n - a - fresh_lt;
+        let mut gone = self.fill_range(list, fresh_lt as usize, 0, self.place);
+        if fresh_gt > 0 {
+            gone.extend(self.fill_range(list, fresh_gt as usize, self.place, self.pages));
+        }
         gone
     }
 

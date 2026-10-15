@@ -141,8 +141,10 @@ Options come from the command line, then a config file (`@FILE`, else `./cluster
 `config/cluster.env.tp4.example`, `.tp3.example`, or `cluster.env.example` for TP=6), then the environment. With the
 options in `cluster.env`, `./gr8 glm53 up` alone is enough. [KNOBS.md](KNOBS.md) lists every option.
 
-When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line. Logs are in
-`out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and `shim.log` and `front.log` on the head).
+When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line, and the
+supervisor log names the line that says why. Logs are in `out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and
+`shim.log` and `front.log` on the head). Each boot moves the previous engine logs to `out/prev1`, and keeps the three
+boots before it (`prev1` is the newest), so a restart does not overwrite the boot you want to look at.
 
 ### The model cache
 
@@ -217,6 +219,10 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
   shares only requests up to 32,768 tokens.
 - A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
   meanwhile. The shim caps those prompts at 1,024 tokens.
+- Each rank checks its weights at boot: the GPU sums what it holds and compares with the bytes the loader read. A
+  difference stops the boot with exit 3 and names the rank and the chunk ("g6: weight check: ..."). Once serving,
+  `curl localhost:8100/health?deep` on the head checks every rank again ([frontend/README.md](frontend/README.md)).
+  `G6ENV_X=G6_WEIGHT_CHECK=0` turns both off.
 - `top_k` and `min_p` are ignored with a warning. `logprobs` and `prompt_logprobs` work up to k = 20.
   [frontend/README.md](frontend/README.md) has the full API.
 
@@ -258,7 +264,7 @@ place the model is built in, and what would carry over to another model.
 - [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw), whose
   per-expert bit distribution `home` keeps expert for expert.
 - [RigMark](https://github.com/alexellis/rigmark) by alexellis, for the decode and concurrency numbers above.
-- The tool-call cases in `frontend/tests/test_parser.py` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
+- The tool-call cases in `frontend/g6front-rs/src/parser.rs` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
 
 ## License
 

@@ -111,8 +111,13 @@ struct g6kv_io
     uint32_t part, sub;
 };
 // runs past R keep their tails: nr ranks share the attention caches past R, a block holds per_slot logical pages'
-// replicated parts. After g6kv_stores
+// replicated parts. After g6kv_stores. nr > 0 also turns the page classes on for the pool itself: a run past R then
+// takes its own pages (its prefix and shard below the pool's place pages, the drafter's tail copy above them)
+// instead of the whole pool, and g6kv_split reports it.
 void g6kv_tail(g6kv_pool* p, uint32_t nr, uint32_t per_slot);
+// whether g6kv_tail set the CP map's ranks: a run past R carries its own page list, and the engine builds its tables
+// from it (1), or it holds the pool as pages 0, 1, .. on the tables as built (0)
+int g6kv_split(const g6kv_pool* p);
 size_t g6kv_io_pending(const g6kv_pool* p);
 // takes every queued copy into out. out holds cap entries, at least g6kv_io_pending.
 int g6kv_io_take(g6kv_pool* p, g6kv_io* out, size_t cap);

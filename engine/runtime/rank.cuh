@@ -34,6 +34,7 @@
 #include "serve.h"
 #include "spec_len.h"
 #include "../h2d.h"
+#include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
 #include "../attn/bind.h"
@@ -64,15 +65,7 @@ inline double mem_min_gib()
 
 inline void check_headroom(int rank, int capacity, bool log)
 {
-    double gib = -1;
-    if (FILE* f = fopen("/proc/meminfo", "r"))
-    {
-        char line[128];
-        long kb;
-        while (fgets(line, sizeof line, f))
-            if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gib = kb / 1048576.0; break; }
-        fclose(f);
-    }
+    const double gib = kb_gib(host_mem().avail_kb);
     static const double need = mem_min_gib();
     if (log) fprintf(stderr, "# rank %d: MemAvailable %.1f GiB after the weights and the KV pool\n", rank, gib);
     if (gib >= 0 && gib < need)
@@ -99,11 +92,29 @@ struct TensorRef
 };
 using Find = std::function<TensorRef(const std::string&)>;
 
+// G6_TEST_ZERO_DELAY_MS=N (a test of #49's race): dmalloc's zeroing waits behind an N ms kernel on the legacy stream, so
+// any write to new memory that is not ordered after the zeroing loses to it every time.
+__global__ void k_test_spin(unsigned long long ns)
+{
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); while (t - t0 < ns);
+}
+inline void test_zero_delay()
+{
+    static const int ms = getenv("G6_TEST_ZERO_DELAY_MS") ? atoi(getenv("G6_TEST_ZERO_DELAY_MS")) : 0;
+    if (ms > 0) k_test_spin<<<1, 1, 0, nullptr>>>(ms * 1000000ull);
+}
+
+// cudaMemset runs on the legacy default stream and returns before it finishes. The engine's streams are non-blocking, so
+// nothing orders a later write on them after the zeroing: wait for it here, or the zeros can land on top of that write.
 template <typename T> inline T* dmalloc(size_t n)
 {
     T* p;
     G6RT_CK(cudaMalloc(&p, n * sizeof(T)));
+    test_zero_delay();
     G6RT_CK(cudaMemset(p, 0, n * sizeof(T)));
+    G6RT_CK(cudaStreamSynchronize(nullptr));
     return p;
 }
 inline std::string lname(int l, const char* t) { char b[96]; snprintf(b, sizeof b, "L%03d.%s", l, t); return b; }

@@ -79,6 +79,7 @@
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
+#include "weight_check.cuh"
 #include "prefill.cuh"
 #include "dflash.cuh"
 #include "prefix_reuse.h"
@@ -89,6 +90,7 @@
 #include "s2/native.cuh"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
+#include "host_reclaim.h"
 #include <filesystem>
 #include <unistd.h>
 
@@ -473,6 +475,7 @@ int main(int argc, char** argv)
     Model m;
     g6::DevImage img;
     boot("fabric up");
+    host_mem_log(R, "before the weights");     // #4: MemAvailable, page cache and RSS around the load
     if (!v2src.dir.empty() && (!image || v2src.slices.empty() || v2src.widths.empty()))
         die("--v2 needs --image, --v2-slices and --v2-widths");
     if (image) load_image(pack, img, manifest, packfile, R, hash, v2src);
@@ -533,6 +536,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
 #endif
+    host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
     build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
     boot("layers bound");
@@ -754,6 +758,10 @@ int main(int argc, char** argv)
         sc.two_lanes = two;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+        // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
+        // drafter's tail copy above it — instead of the whole pool, and retained runs keep their pages through a long
+        // turn. The stores' tail blocks (per_slot) come with --kv-store below.
+        if (m.cp.on && s2_below == m.cp.R) pool.tail((uint32_t)g6nr::NR, 0);
         int reuse_grid = 0;
         // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
         // and NOEND (G6_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
@@ -935,7 +943,17 @@ int main(int argc, char** argv)
             // the run's pages go into the layers' tables. Staged prefill reads index keys through them too.
             [&](const g6s2::Slot& sl) {
                 const bool ex = pool.exclusive_run(sl.run);
-                if (ex) { s2_solo_built(m); s2_solo_built(D.d); }
+                if (ex)
+                {
+                    if (pool.split())   // the run's own pages: its CP map over its list
+                    {
+                        const std::vector<int> run = pool.list(sl.run);
+                        const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+                        s2_solo_cp_pages(m, run, most);
+                        s2_solo_cp_pages(D.d, run, most);
+                    }
+                    else { s2_solo_built(m); s2_solo_built(D.d); }
+                }
                 else { const std::vector<int> run = pool.list(sl.run); s2_solo_pages(m, run); s2_solo_pages(D.d, run); }
                 m.s2_pf_table = D.d.s2_pf_table = !ex;
                 // OWN=4: the offline loop's per-request rule (prompt + gen against the QO key table). The CP staging pool holds
@@ -1009,13 +1027,25 @@ int main(int argc, char** argv)
                 const bool ex = pool.exclusive_run(g.run);
                 // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
                 // past them is written by this request before any step reads it (prefix_reuse.h)
+                const std::vector<int> run = pool.list(g.run);
+                const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
                 for (Model* x : {&m, &D.d})
                 {
-                    if (ex) { s2_set_exclusive(*x, q); if (!g.reuse) reset(*x, st); }   // alone: the whole pool, today's reset
+                    if (ex)
+                    {
+                        if (pool.split()) s2_set_exclusive(*x, q, run, most);   // its own list; the slot view stays unused while solo
+                        else s2_set_exclusive(*x, q);
+                        // alone: the run's pages clear (the whole pool on the identity map, today's reset)
+                        if (!g.reuse)
+                        {
+                            if (pool.split()) s2_reset_pages(*x, run, st, most);
+                            else reset(*x, st);
+                        }
+                    }
                     else
                     {
-                        s2_set_pages(*x, q, pool.list(g.run));
-                        if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st);
+                        s2_set_pages(*x, q, run);
+                        if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st, most);
                     }
                     for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)
                     {
@@ -1059,6 +1089,24 @@ int main(int argc, char** argv)
                 h.dsel.d.draft_round = 5.6 + 2.5;
                 h.dsel.m.draft_round = 2.5 + 3.0;
                 h.dsel.m.draft_each = 2.1;
+                // sweeps (measurement only; every rank must see the same values, as above): G6_SPEC_TABLE = verify ms for
+                // 1..8 rows, G6_SPEC_DRAFT = DFlash2 round, MTP round, MTP each (ms)
+                if (const char* e = getenv("G6_SPEC_TABLE"))
+                {
+                    double t[SpecLen::KX + 1];
+                    if (!parse_spec_costs(e, t, SpecLen::KX + 1))
+                        die("G6_SPEC_TABLE: want 8 comma-separated finite positive verify times in ms");
+                    for (int r = 1; r <= SpecLen::KX + 1; ++r) h.dfl_spec.table[r] = h.dsel.d.table[r] = h.dsel.m.table[r] = t[r - 1];
+                    if (R == 0) fprintf(stderr, "# spec: verify table from G6_SPEC_TABLE: %s\n", e);
+                }
+                if (const char* e = getenv("G6_SPEC_DRAFT"))
+                {
+                    double d[3];
+                    if (!parse_spec_costs(e, d, 3, true))
+                        die("G6_SPEC_DRAFT: want 3 comma-separated finite nonnegative drafting times in ms");
+                    h.dsel.d.draft_round = d[0]; h.dsel.m.draft_round = d[1]; h.dsel.m.draft_each = d[2];
+                    if (R == 0) fprintf(stderr, "# spec: drafting ms from G6_SPEC_DRAFT: %s\n", e);
+                }
                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
@@ -1127,7 +1175,18 @@ int main(int argc, char** argv)
             // the batched graphs carry no DFlash2 taps (their rows outnumber Dfl::feat's 8); the solo graphs keep them
             auto* const tap = m.dfl_tap;
             m.dfl_tap = nullptr;
-            try { nd.capture_all(sc.limit(), mtp, plan.chunk); m.dfl_tap = tap; g6s2::capture_barrier(bc, links); }
+            // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
+            try
+            {
+                nd.capture_all(sc.limit(), mtp, plan.chunk);
+                m.dfl_tap = tap;
+                wcheck::seal(R);
+                int dev = 0;
+                G6RT_CK(cudaGetDevice(&dev));
+                wcheck::start_watcher(s2dir, R, dev);
+                host_reclaim(R, "serving");     // #4: after the drafter, the S2 pool and the graphs; the barrier absorbs it
+                g6s2::capture_barrier(bc, links);
+            }
             catch (...) { links.shutdown(); throw; }
             g6s2::Service service(bc, links, std::move(h), plan.chunk);
             service.run();               // returns on DIR/quit
@@ -1168,6 +1227,7 @@ int main(int argc, char** argv)
     }
     if (R == 0 && (!hd.dir.empty() || hd.zscratch))
         fprintf(stderr, "# reuse diag: hdump %s seqs %zu, zscratch %d\n", hd.dir.empty() ? "off" : hd.dir.c_str(), hd.seqs.size(), (int)hd.zscratch);
+    if (!s2mode) host_reclaim(R, "ready");     // offline runs; a served rank trimmed before its capture barrier
     boot("ready");
     for (size_t q = 0; !s2mode && q < plans.size(); ++q)   // offline: each --prompt once
     {

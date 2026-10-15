@@ -108,8 +108,13 @@ public:
         Lock l(mu_);
         check(g6kv_tier_policy(p_, t, min_rows, min_hits, block_bytes));
     }
-    // runs past R keep their tails: nr ranks share the attention caches past R, per_slot replicated parts a block
+    // runs past R keep their tails: nr ranks share the attention caches past R, per_slot replicated parts a block.
+    // nr > 0 also turns the pool's page classes on: a run past R takes its own pages (prefix and shard below place,
+    // the drafter's tail copy above it) instead of the whole pool, which split() reports
     void tail(uint32_t nr, uint32_t per_slot) { Lock l(mu_); g6kv_tail(p_, nr, per_slot); }
+    // whether tail() set the CP map's ranks: a run past R carries its own page list, and the engine builds its tables
+    // from it (true), or it holds the pool as pages 0, 1, .. on the tables as built (false)
+    bool split() const { Lock l(mu_); return g6kv_split(p_) != 0; }
     // the stores write at most milli / 1000 blocks per page of KV computed (0 = no limit)
     void write_limit(uint64_t milli) { Lock l(mu_); g6kv_write_limit(p_, milli); }
     // the copies queued since the last io(), in the order to run them. Then io_done()

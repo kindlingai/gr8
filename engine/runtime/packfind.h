@@ -12,6 +12,9 @@
 #include "rank.cuh"
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
+#ifdef G6_RS_LOADER
+#include "weight_check.cuh"
+#endif
 
 namespace g6rt
 {
@@ -82,12 +85,15 @@ struct V2Src
 #include <mutex>
 #include "../loader-rs/g6load.h"
 
-// The Rust loader's sink: pinned staging buffers and one stream per worker into the device image.
+// The Rust loader's sink: pinned staging buffers and one stream per worker into the device image. Each chunk is summed
+// in staging for the weight check (weight_check.cuh).
 struct RsSink
 {
     uint8_t* dev = nullptr;
     std::mutex mu;
     std::vector<cudaStream_t> streams;
+    wcheck::Loaded sums;
+    bool check = false;
 
     static void* alloc(void*, size_t n)
     {
@@ -109,6 +115,7 @@ struct RsSink
             }
             st = s.streams[w];
         }
+        if (s.check) s.sums.add(off, src, n);
         if (cudaMemcpyAsync(s.dev + off, src, n, cudaMemcpyHostToDevice, st) != cudaSuccess) return 3;
         return cudaStreamSynchronize(st) == cudaSuccess ? 0 : 4;
     }
@@ -121,6 +128,8 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
     void* dev = nullptr;
     if (cudaMalloc(&dev, pack.bytes()) != cudaSuccess) die("cudaMalloc of " + std::to_string(pack.bytes()) + " bytes failed");
     sink.dev = (uint8_t*)dev;
+    sink.check = wcheck::enabled();
+    if (sink.check) sink.sums.begin(pack.bytes());
     const g6l_sink s{&sink, &RsSink::alloc, &RsSink::release, &RsSink::copy};
     g6l_stats st{};
     char err[1024] = "";
@@ -130,6 +139,7 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
     fprintf(stderr, "# rank %d: %s %.2f GB -> device image (Rust loader, %s, %u threads, %llu ranges, %.2f GB read)"
             " in %.1f s (%.2f GB/s)\n", rank, what, st.image_bytes / 1e9, st.mode ? "read" : "mmap", st.threads,
             (unsigned long long)st.ranges, st.read_bytes / 1e9, st.seconds, st.image_bytes / 1e9 / st.seconds);
+    if (sink.check) wcheck::record(what, pack, (const uint8_t*)dev, sink.sums, rank);
 }
 
 // The pack -> one device image with the Rust loader: parallel reads, no checksum (the files are checked offline).

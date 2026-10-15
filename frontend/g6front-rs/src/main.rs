@@ -1,5 +1,5 @@
 //! g6front-rs: OpenAI/vLLM-compatible HTTP front end for the gr8 engine, speaking PROTOCOL.md over the engine's
-//! Unix socket. A drop-in for the Python `g6front` (same flags, same responses byte for byte).
+//! Unix socket. This is the front end `./gr8 glm53 up` runs.
 //!
 //! g6front-rs --model-dir DIR [--engine-sock /run/g6/engine.sock] [--port 8100]
 
@@ -14,6 +14,7 @@ mod sampling;
 mod template;
 mod thinking;
 mod tok;
+mod tool_choice;
 mod util;
 mod wire;
 
@@ -47,6 +48,8 @@ pub struct State {
     /// reasoning_effort and thinking_budget for a request that names none
     pub thinking: thinking::Defaults,
     pub started: u64,
+    /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
+    pub supervisor: Option<String>,
 }
 
 struct Args {
@@ -66,6 +69,7 @@ struct Args {
     max_connections: usize,
     default_effort: Option<&'static str>,
     default_budget: u64,
+    supervisor: Option<String>,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
@@ -75,7 +79,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max]
-                  [--default-thinking-budget N]";
+                  [--default-thinking-budget N] [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -95,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
         max_connections: 512,
         default_effort: None,
         default_budget: 0,
+        supervisor: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -140,6 +145,7 @@ fn parse_args() -> Result<Args, String> {
                 a.default_budget =
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
+            "--supervisor" => a.supervisor = Some(next(&mut i, &flag, inline)?),
             "--encode-threads" => {
                 a.encode_threads = next(&mut i, &flag, inline)?.parse().map_err(|_| "--encode-threads: not a number")?
             }
@@ -245,6 +251,7 @@ async fn serve(args: Args) -> Result<(), String> {
         share_tokens: args.share_tokens,
         thinking: thinking::Defaults { effort: args.default_effort, budget: args.default_budget },
         started: util::now_secs(),
+        supervisor: args.supervisor,
     }));
     engine.start();
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
@@ -264,7 +271,7 @@ async fn serve(args: Args) -> Result<(), String> {
             _ = tokio::signal::ctrl_c() => break,
             _ = term.recv() => break,
         };
-        let (sock, _) = tokio::select! {
+        let (sock, peer) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(x) => x,
                 Err(e) => {
@@ -280,7 +287,7 @@ async fn serve(args: Args) -> Result<(), String> {
         let _ = sock.set_nodelay(true);
         tokio::spawn(async move {
             let _slot = slot;
-            let svc = service_fn(move |req| api::route(st, req));
+            let svc = service_fn(move |req| api::route(st, req, peer));
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
                 .keep_alive(true)

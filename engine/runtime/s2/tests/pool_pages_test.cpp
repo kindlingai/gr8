@@ -130,6 +130,52 @@ int main()
         CHECK(!p.exclusive_run(y) && p.list(y) == iota_list(0, 500));
     }
 
+    // a run past R on the page classes (tail set, split): its own pages — the prefix and its shard below place, the
+    // drafter's tail copy above it — so a retained short run survives a long turn that leaves it room, and gives its
+    // pages back only when a longer one needs them
+    {
+        RunPool p(80, 32, 8 * 64), w(80, 32, 8 * 64);
+        p.keep(rules); w.keep(rules);
+        p.tail(2, 0); w.tail(2, 0);
+        CHECK(p.split() && w.split());
+        const Run s = p.reserve(4 * 64);
+        CHECK(w.reserve(4 * 64) == s && p.list(s) == iota_list(0, 4));
+        p.retain(s, finished(seq(4 * 64 - 1, 5), 0)); w.retain(s, finished(seq(4 * 64 - 1, 5), 0));
+        // 1,024 rows = 16 pages: 8 prefix + 4 shard below place, 4 above; the retained run keeps its pages
+        const Run big = p.reserve(1024);
+        CHECK(big == w.reserve(1024) && p.exclusive_run(big) && p.kept_runs() == 1);
+        std::vector<int> want = iota_list(4, 12), high = iota_list(32, 4);
+        want.insert(want.end(), high.begin(), high.end());
+        CHECK(p.list(big) == want && p.list(big) == w.list(big) && p.room() == 0 && p.free_pages() == 0 && !p.admissible(64));
+        p.release(big); w.release(big);
+        // 2,560 rows = 40 pages: 8 + 16 below place, 16 above; retained, then its continuation adopts 32 pages of it
+        const Run conv = p.reserve(2560);
+        std::vector<int> wc = iota_list(4, 24), wch = iota_list(32, 16);
+        wc.insert(wc.end(), wch.begin(), wch.end());
+        CHECK(conv == w.reserve(2560) && p.exclusive_run(conv) && p.kept_runs() == 1 && p.list(conv) == wc);
+        p.retain(conv, finished(seq(2560 - 8, 11), 8)); w.retain(conv, finished(seq(2560 - 8, 11), 8));
+        std::vector<int> B = seq(2560 - 8, 11); const auto g8 = seq(8, 77), extra = seq(300, 13);
+        B.insert(B.end(), g8.begin(), g8.end()); B.insert(B.end(), extra.begin(), extra.end());
+        const uint64_t rows = B.size() + 68;
+        const PoolHit h = p.match(B, rows, int(B.size()) - 1), hw = w.match(B, rows, int(B.size()) - 1);
+        CHECK(h.skip == 2048 && h.skip == hw.skip && h.age == hw.age);
+        const Run c = p.take(h, rows);
+        CHECK(c == w.take(hw, rows) && p.exclusive_run(c) && p.kept_runs() == 1);
+        // the adopted 32 pages (the run's 24 below place and 8 above), then 3 below place and 11 above
+        std::vector<int> lc(iota_list(4, 24));
+        const auto ah = iota_list(32, 8), fl = iota_list(28, 3), fh = iota_list(40, 11);
+        lc.insert(lc.end(), ah.begin(), ah.end()); lc.insert(lc.end(), fl.begin(), fl.end()); lc.insert(lc.end(), fh.begin(), fh.end());
+        CHECK(p.list(c) == lc && p.list(c) == w.list(c) && p.digest() == w.digest());
+        CHECK(c.pages == 46 && p.free_pages() == 0 && !p.admissible(64));
+        p.release(c); w.release(c);
+        // 3,584 rows = 56 pages wants every page below place: the retained short run gives its back, only then
+        const Run huge = p.reserve(3584);
+        CHECK(huge == w.reserve(3584) && p.kept_runs() == 0 && p.list(huge) == iota_list(0, 56));
+        p.release(huge); w.release(huge);
+        // 3,648 rows: its shard wants 25 pages below place, one more than there is: refused, the pool whole again
+        CHECK(!p.fits(3648, 3648) && p.free_pages() == 80 && p.admissible(64));
+    }
+
     std::printf("pool_pages_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

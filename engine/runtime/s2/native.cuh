@@ -110,8 +110,20 @@ class NativeDispatch {
             // the survivor's own pages (set by bind)
             const std::vector<int>& run = c_.main.s2->run[next];
             const bool ex = c_.main.s2->exclusive[next];
-            require(!run.empty() && run == c_.draft.d.s2->run[next] && ex == c_.draft.d.s2->exclusive[next], "main/draft survivor runs differ");
-            if (ex) { g6rt::s2_solo_built(c_.main); g6rt::s2_solo_built(c_.draft.d); }
+            require(!run.empty() && run == c_.draft.d.s2->run[next] && ex == c_.draft.d.s2->exclusive[next]
+                     && c_.main.s2->ex_split[next] == c_.draft.d.s2->ex_split[next], "main/draft survivor runs differ");
+            if (ex)
+            {
+                // a run past R: on the pool's page classes its own list -> its CP map; the identity run -> the
+                // tables as built. ex_split records which at bind (the pool's mode), not the list's shape
+                if (c_.main.s2->ex_split[next])
+                {
+                    const int most = std::max(c_.main.s2->pool_pages, c_.draft.d.s2->pool_pages);
+                    g6rt::s2_solo_cp_pages(c_.main, run, most);
+                    g6rt::s2_solo_cp_pages(c_.draft.d, run, most);
+                }
+                else { g6rt::s2_solo_built(c_.main); g6rt::s2_solo_built(c_.draft.d); }
+            }
             else { g6rt::s2_solo_pages(c_.main,run); g6rt::s2_solo_pages(c_.draft.d,run); }
             g6rt::s2_hprev_to_solo(c_.draft,next,c_.stream);
         }

@@ -18,6 +18,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -143,7 +144,9 @@ struct RelayCtx {
   uint64_t fin_addr = 0; uint32_t fin_rkey = 0, rbuf_lkey = 0; volatile unsigned* err = nullptr; int rank = -1;
   uint64_t cred_addr = 0; uint32_t cred_rkey = 0;         // the origin's credit word
   uint64_t done = 0, sent = 0;                            // ring position forwarded, and the last credit written
-  int unsig = 0, cunsig = 0; int inflight = 0; std::deque<int> batches;
+  int unsig = 0, inflight = 0; std::deque<int> batches;
+  RelayCreditQueue credits; unsigned credit_sq_capacity = 0;
+  std::string ri_dev;
 };
 std::mutex g_relay_mu;
 RelayCtx* g_relay[32]; std::atomic<int> g_nrelay{0};
@@ -168,6 +171,20 @@ void relay_loop(int cpu) {
     fprintf(stderr, "[fabric r%d] relay %s (%s)\n", c.rank, what, st >= 0 ? ibv_wc_status_str((ibv_wc_status)st) : "-");
     __sync_val_compare_and_swap(c.err, 0u, 0x75000000u);
   };
+  auto credit_fail = [](RelayCtx& c, int rc, int saved_errno, const ibv_send_wr* bad, const ibv_send_wr* wr) {
+    ibv_qp_attr at{}; ibv_qp_init_attr ia{};
+    const int qrc = ibv_query_qp(c.ri, &at, IBV_QP_STATE, &ia);
+    const std::string rc_msg = strerror(rc);                  // strerror has one buffer: copy before the second call
+    const std::string errno_msg = strerror(saved_errno);
+    fprintf(stderr, "[fabric r%d] relay credit post (-): rc=%d (%s) errno=%d (%s) dev=%s "
+                    "qpn=%u state=%d query_rc=%d sq_capacity=%u sq_limit=%u credits_in_flight=%u "
+                    "credit_batches=%zu credit_unsignaled=%u done=%llu sent=%llu bad_wr=%d\n",
+            c.rank, rc, rc_msg.c_str(), saved_errno, errno_msg.c_str(), c.ri_dev.c_str(),
+            c.ri->qp_num, qrc ? -1 : (int)at.qp_state, qrc, c.credit_sq_capacity, c.credits.capacity,
+            c.credits.in_flight, c.credits.batches.size(), c.credits.unsignaled,
+            (unsigned long long)c.done, (unsigned long long)c.sent, bad == wr);
+    __sync_val_compare_and_swap(c.err, 0u, 0x75000000u);
+  };
   for (;;) {
     const int n = g_nrelay.load(std::memory_order_acquire);
     for (int k = 0; k < n; k++) {
@@ -177,17 +194,18 @@ void relay_loop(int cpu) {
       while ((m = ibv_poll_cq(c.fwd_cq, 32, fc)) > 0)
         for (int i = 0; i < m; i++) {
           if (fc[i].status != IBV_WC_SUCCESS) { fail(c, "forward completion", fc[i].status); break; }
-          if (!c.batches.empty()) { c.inflight -= c.batches.front(); c.batches.pop_front(); }
-          if (fc[i].wr_id) c.done = fc[i].wr_id;
+          relay_forward_completed(c.inflight, c.batches, fc[i].wr_id, c.done);
         }
       if (m < 0) { fail(c, "forward CQ poll", -1); continue; }
-      if (c.done != c.sent && !*c.err) {                  // credit: the origin may reuse the ring below done
+      if (c.done != c.sent && c.credits.available() && !*c.err) { // credit: the origin may reuse the ring below done
         ibv_sge cs{(uint64_t)&c.done, 8, 0};
         ibv_send_wr w{}, *bad = nullptr; w.sg_list = &cs; w.num_sge = 1; w.opcode = IBV_WR_RDMA_WRITE;
         w.wr.rdma.remote_addr = c.cred_addr; w.wr.rdma.rkey = c.cred_rkey;
-        w.send_flags = IBV_SEND_INLINE | (++c.cunsig >= 32 ? IBV_SEND_SIGNALED : 0);
-        if (c.cunsig >= 32) c.cunsig = 0;
-        if (ibv_post_send(c.ri, &w, &bad) != 0) { fail(c, "credit post", -1); continue; }
+        const bool sig = c.credits.signal_next();
+        w.send_flags = IBV_SEND_INLINE | (sig ? IBV_SEND_SIGNALED : 0);
+        const int rc = ibv_post_send(c.ri, &w, &bad);
+        if (rc != 0) { const int e = errno; credit_fail(c, rc, e, bad, &w); continue; }
+        c.credits.posted(sig);
         c.sent = c.done;
       }
       ibv_wc wc[32];
@@ -195,7 +213,10 @@ void relay_loop(int cpu) {
       if (got < 0) { fail(c, "relay-in CQ poll", -1); continue; }
       for (int i = 0; i < got && !*c.err; i++) {
         if (wc[i].status != IBV_WC_SUCCESS) { fail(c, "relay-in completion", wc[i].status); break; }
-        if (wc[i].opcode != IBV_WC_RECV) continue;          // a signaled credit write
+        if (wc[i].opcode != IBV_WC_RECV) {                  // a signaled credit write
+          if (!c.credits.completed()) { fail(c, "unexpected credit completion", -1); break; }
+          continue;
+        }
         const int slot = (int)wc[i].wr_id;
         char* buf = c.rbuf + (size_t)slot * kRelayBuf;
         RelayHdr h; memcpy(&h, buf, sizeof h);
@@ -206,7 +227,7 @@ void relay_loop(int cpu) {
         while (c.inflight >= 1800 && !*c.err) {            // forward queue full: reap
           ibv_wc f; const int r = ibv_poll_cq(c.fwd_cq, 1, &f);
           if (r < 0 || (r == 1 && f.status != IBV_WC_SUCCESS)) { fail(c, "forward drain", r < 0 ? -1 : f.status); break; }
-          if (r == 1 && !c.batches.empty()) { c.inflight -= c.batches.front(); c.batches.pop_front(); }
+          if (r == 1) relay_forward_completed(c.inflight, c.batches, f.wr_id, c.done);
         }
         ibv_sge sge;
         ibv_send_wr w{}, *bad = nullptr; w.sg_list = &sge; w.num_sge = 1; w.opcode = IBV_WR_RDMA_WRITE;
@@ -394,11 +415,12 @@ void Fabric::init(const FabricConfig& cfg) {
       FCHECK(ibv_query_gid(R.ctx, 1, R.di.gid_index, &R.gid) == 0);
       R.mr = ibv_reg_mr(R.pd, I.region, I.region_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE); FCHECK(R.mr);
     }
-    auto mkqp = [&](Rail& R, ibv_cq* rcq, int send_wr, int recv_wr, int sge, int inl) {
+    auto mkqp = [&](Rail& R, ibv_cq* rcq, int send_wr, int recv_wr, int sge, int inl, ibv_qp_cap* actual) {
       ibv_qp_init_attr ia{}; ia.send_cq = ia.recv_cq = rcq ? rcq : R.cq; ia.qp_type = IBV_QPT_RC;
       ia.cap.max_send_wr = send_wr; ia.cap.max_recv_wr = recv_wr; ia.cap.max_send_sge = sge; ia.cap.max_recv_sge = 1;
       ia.cap.max_inline_data = inl;
       ibv_qp* q = ibv_create_qp(R.pd, &ia); FCHECK(q);
+      if (actual) *actual = ia.cap;                         // ibv_create_qp returns the provider's actual capacities
       ibv_qp_attr at{}; at.qp_state = IBV_QPS_INIT; at.port_num = 1; at.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
       FCHECK(ibv_modify_qp(q, &at, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0);
       return q;
@@ -419,8 +441,8 @@ void Fabric::init(const FabricConfig& cfg) {
     const int inl = I.bulk ? 64 : 0;
     I.qp.assign(nr, nullptr); I.unsignaled.assign(nr, 0); I.peer.resize(nr);
     RingInfo mi{};
-    ibv_qp* qdn = mkqp(I.rails[0], nullptr, 2048, 1, 1, inl);
-    ibv_qp* qdp = mkqp(I.rails[1], nullptr, 2048, 1, 1, inl);
+    ibv_qp* qdn = mkqp(I.rails[0], nullptr, 2048, 1, 1, inl, nullptr);
+    ibv_qp* qdp = mkqp(I.rails[1], nullptr, 2048, 1, 1, inl, nullptr);
     mi.dn = info(qdn, I.rails[0], I.rails[0].mr->rkey, recv, 1);
     mi.dp = info(qdp, I.rails[1], I.rails[1].mr->rkey, recv, 2);
     ibv_qp *qor = nullptr, *qri = nullptr, *qfwd = nullptr, *qfin = nullptr;
@@ -435,16 +457,21 @@ void Fabric::init(const FabricConfig& cfg) {
       CUCHECK(cudaHostAlloc((void**)&X.rbuf, (size_t)kRelayRecv * kRelayBuf, cudaHostAllocPortable));
       ibv_mr* rmr = ibv_reg_mr(I.rails[3].pd, X.rbuf, (size_t)kRelayRecv * kRelayBuf, IBV_ACCESS_LOCAL_WRITE); FCHECK(rmr);
       X.rbuf_lkey = rmr->lkey;
-      X.ri_cq = ibv_create_cq(I.rails[3].ctx, kRelayRecv + 64, nullptr, nullptr, 0); FCHECK(X.ri_cq);
+      X.ri_cq = ibv_create_cq(I.rails[3].ctx, kRelayRecv + (int)kRelayCredit, nullptr, nullptr, 0); FCHECK(X.ri_cq);
       X.fwd_cq = ibv_create_cq(I.rails[2].ctx, 4096, nullptr, nullptr, 0); FCHECK(X.fwd_cq);
-      qor = mkqp(I.rails[2], nullptr, 4096, 1, 2, 128);
-      qri = mkqp(I.rails[3], X.ri_cq, 64, kRelayRecv, 1, 64);   // its sends are the credit writes back to the origin
+      qor = mkqp(I.rails[2], nullptr, 4096, 1, 2, 128, nullptr);
+      ibv_qp_cap credit_cap{};
+      qri = mkqp(I.rails[3], X.ri_cq, (int)kRelayCredit, kRelayRecv, 1, 64, &credit_cap); // its sends are the credits
+      X.credit_sq_capacity = credit_cap.max_send_wr;
+      // A provider may grant more than it was asked for, but the CQ only reserves kRelayCredit beyond the receives.
+      X.credits.capacity = std::min<unsigned>(kRelayCredit, X.credit_sq_capacity);
+      FCHECK(X.credits.capacity > 0);
       { ibv_qp_init_attr ia{}; ia.send_cq = X.fwd_cq; ia.recv_cq = X.fwd_cq; ia.qp_type = IBV_QPT_RC;
         ia.cap.max_send_wr = 2048; ia.cap.max_recv_wr = 1; ia.cap.max_send_sge = 1; ia.cap.max_recv_sge = 1; ia.cap.max_inline_data = 64;
         qfwd = ibv_create_qp(I.rails[2].pd, &ia); FCHECK(qfwd);
         ibv_qp_attr at{}; at.qp_state = IBV_QPS_INIT; at.port_num = 1; at.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
         FCHECK(ibv_modify_qp(qfwd, &at, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0); }
-      qfin = mkqp(I.rails[3], nullptr, 1, 1, 1, 0);
+      qfin = mkqp(I.rails[3], nullptr, 1, 1, 1, 0, nullptr);
       for (int i = 0; i < kRelayRecv; i++) {
         ibv_sge rs{(uint64_t)(X.rbuf + (size_t)i * kRelayBuf), kRelayBuf, X.rbuf_lkey};
         ibv_recv_wr rw{}, *bad = nullptr; rw.wr_id = (uint64_t)i; rw.sg_list = &rs; rw.num_sge = 1;
@@ -469,6 +496,7 @@ void Fabric::init(const FabricConfig& cfg) {
       X.cred_addr = A[I.prv].orq.addr; X.cred_rkey = A[I.prv].orq.rkey;
       I.ring_addr = A[I.nxt].ri.addr; I.ring_rkey = A[I.nxt].ri.rkey;
       X.err = I.err = dev_.error; X.rank = me;
+      X.ri_dev = I.rails[3].di.dev;
       std::lock_guard<std::mutex> lk(g_relay_mu);
       const int k = g_nrelay.load(); FCHECK(k < 32);
       g_relay[k] = &X; g_nrelay.store(k + 1, std::memory_order_release);

@@ -1,14 +1,24 @@
 #!/bin/bash
-# Host-only tests (g++, no CUDA): the S2 batch planner (engine/runtime/s2_batch.h, with a DFlash2 session and the insert
-# rule), the S2 control barrier, the pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs,
-# and pool_diff_test: that pool against the C++ one it replaced), runs that grow on demand through Driver::step
-# (driver_grow_test, with insert rules), the pool's block
-# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit frame
-# (s2/control_protocol.h), and the pack manifest parser (engine/loader/g6pack.cpp).
+# Host-only tests (g++, no CUDA): the switchless relay's ring and credit accounting, the S2 batch planner
+# (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
+# and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
+# it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
+# prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
+# the pool's block
+# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
+# frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
+# after load (engine/runtime/host_reclaim.h), and steering profile contracts/validation.
 #   scripts/host_tests.sh
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+# Inactive steering contracts/profile loader: CPU only, no CUDA or Rust dependencies.
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
+  "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
+"$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" -o "$T/relay_test"
+"$T/relay_test"
+python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the Rust page allocator (engine/kvman-rs) that s2/pool.h wraps, built here where cargo is on the PATH
 KV=$REPO/engine/kvman-rs/target/release/libg6kvman.a
 if command -v cargo > /dev/null 2>&1; then
@@ -36,6 +46,12 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/pool_diff_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_grow_test.cpp" "${KVLIB[@]}" -o "$T/driver_grow_test"
 "$T/driver_grow_test"
+# the scheduler's own prefill choice (fewest prompt rows first, with a deferral bound): no pool, no CUDA
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_fair_test.cpp" -o "$T/scheduler_fair_test"
+"$T/scheduler_fair_test"
+# the notice target's sizing (the work in flight, not a constant): no pool, no CUDA
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_horizon_test.cpp" -o "$T/scheduler_horizon_test"
+"$T/scheduler_horizon_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
 NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
@@ -56,3 +72,7 @@ g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/
 
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/test_context_buckets.cpp" -o "$T/test_context_buckets"
 "$T/test_context_buckets"
+
+# host memory after load (#4): the /proc parser and malloc_trim (glibc)
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$T/host_reclaim_test"
+"$T/host_reclaim_test"

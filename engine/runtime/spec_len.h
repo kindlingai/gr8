@@ -21,6 +21,8 @@
 // Rounds only teach c_j for the positions they offered (k >= j) after an accepted prefix.
 #pragma once
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -30,6 +32,29 @@
 #include <vector>
 
 namespace g6rt {
+
+// Boot-time cost overrides: an exact comma-separated list of finite milliseconds.
+// Verify steps must cost > 0; drafting may be free in a tuning experiment.
+inline bool parse_spec_costs(const char* text, double* values, int count, bool allow_zero = false)
+{
+    if (!text) return false;
+    const char* p = text;
+    for (int i = 0; i < count; ++i)
+    {
+        while (std::isspace((unsigned char)*p)) ++p;
+        char* end;
+        errno = 0;
+        const double v = std::strtod(p, &end);
+        if (end == p || errno == ERANGE || !std::isfinite(v) || (allow_zero ? v < 0 : v <= 0)) return false;
+        values[i] = v;
+        p = end;
+        while (std::isspace((unsigned char)*p)) ++p;
+        if (i + 1 == count) return *p == '\0';
+        if (*p != ',') return false;
+        ++p;
+    }
+    return false;
+}
 
 struct SpecLen
 {
