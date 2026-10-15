@@ -20,6 +20,7 @@ pub mod dflash2;
 pub mod exlr8;
 pub mod fetch;
 pub mod json;
+pub mod layout;
 mod plan;
 pub mod records;
 pub mod release;
@@ -311,7 +312,8 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
 
 /// Plans rank `rank`'s image at TP `nr` from the exlr8 v2 release alone (src/release.rs): the dense and vocabulary
 /// files under `dense_dir`, the experts from the width files under `v2_dir` at the offsets of the index slices under
-/// `slices_dir`, at the widths of the width manifest. Writes the image's manifest to `out_manifest`. On rank 0 it also
+/// `slices_dir`, at the widths of the width manifest. The rank holds the pieces the layout file `layout` gives it
+/// (src/layout.rs), or with NULL or "" the formulas'. Writes the image's manifest to `out_manifest`. On rank 0 it also
 /// prints the form of each matrix to stderr. Returns a handle for g6l_plan_load and g6l_plan_free, or
 /// NULL with a message in `err`.
 ///
@@ -320,13 +322,14 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
 #[no_mangle]
 pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *const c_char, slices_dir: *const c_char,
                                           widths: *const c_char, nr: u32, rank: u32, qo: i32, trellis: i32,
-                                          out_manifest: *const c_char,
+                                          layout: *const c_char, out_manifest: *const c_char,
                                           err: *mut c_char, errlen: usize) -> *mut c_void {
     let t0 = Instant::now();
     let arg = |p, what| cstr(p).ok_or(format!("g6l_release_plan: no {what}"));
     let r = (|| {
+        let layout = cstr(layout).map(|p| layout::Layout::read(&p)).transpose()?;
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
-                                         &arg(widths, "width manifest")?, nr as usize, rank as usize,
+                                         &arg(widths, "width manifest")?, nr as usize, rank as usize, layout.as_ref(),
                                          release::Opts { qo: qo != 0, trellis: trellis != 0 })?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;

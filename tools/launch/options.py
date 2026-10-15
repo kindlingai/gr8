@@ -98,6 +98,8 @@ KEYS = {
     'V2_DENSE': ('box', None, 'the exlr8 release directory whose dense/ files give every non-expert weight (no rank packs)'),
     'V2_DENSE_FORM': ('cluster', None, 'with V2_DENSE: trellis (the release\'s entries, the default) or rounded (MXFP8 / '
                                        'int4, the fallback)'),
+    'LAYOUT': ('box', None, 'with V2_DENSE: a layout file (bin/g6layout) that says which pieces each rank holds, instead '
+                            'of the formulas. The handshake compares its sha256'),
     'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
@@ -253,7 +255,7 @@ def parse(argv, environ=None):
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT', 'BASE_PACKS',
-              'DFLASH_DIR', 'V2_DENSE'):
+              'DFLASH_DIR', 'V2_DENSE', 'LAYOUT'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or (k == 'VARIANT' and '/' not in values[k]
                                                                                and not values[k].endswith('.json')):
             continue
@@ -307,6 +309,11 @@ def validate(o):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+    if o.get('LAYOUT') and not os.path.isfile(o.get('LAYOUT')):
+        raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
+    if o.get('LAYOUT') and looks_remote(o.get('MODEL') or ''):
+        raise OptionError('--layout needs a local copy of the release (--model DIR): a box\'s cache holds only the '
+                          'pieces the formulas give its rank')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     if tp not in ('3', '4', '6'):
@@ -439,7 +446,7 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
     if kv_store:
         env['KV_STORE'] = kv_store
     if rank == '@R':   # the template: v2 paths are per box
-        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE'):
+        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE', 'LAYOUT'):
             if env.get(k):
                 env[k] = '@' + k
     names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO'])
@@ -489,6 +496,8 @@ def canonical(o, plan, members, variant=None):
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''
+    if o.get('LAYOUT'):   # a path per box: its bytes are what every rank must agree on
+        c['layout.sha256'] = file_sha256(o.get('LAYOUT'))
     c['engine.env'] = ' '.join(sorted(plan['env']))
     c['engine.args'] = ' '.join(plan['args'])
     text = ''.join(f'{k}={c[k]}\n' for k in sorted(c))

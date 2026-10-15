@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-15: placement as data: a layout file says which rank holds each piece (experimental, off by default)
+
+- Each rank's weights came from formulas: expert halves by `(16 e + h + l) % nr`, heads, dense channels and vocab tiles
+  by rotating chunks. `engine/loader-rs/src/layout.rs` makes them data. A layout is the member list and the owner of
+  every piece: an expert's 128-column half, an attention head, a dense MLP's 128-channel block, or an lm_head tile.
+  The formulas are one way to make a layout, and with no layout file the loader plans exactly today's images.
+- `bin/g6layout plan` makes a layout for a new member list from the current one. Each group of pieces keeps the counts
+  the engine reads (it checks how many heads, dense channels and halves of an expert a rank holds, not which ones), and
+  every box keeps what it held up to its count. Vocab tiles follow the formula, because the engine maps a logit to its
+  token id by the rank's range. On the `home` widths, going from TP=4 to TP=3 each remaining box gains 25.0 GB of
+  expert halves, a twelfth of the model, instead of the 74.9 GB the TP=3 formula gives it. Going from 3 to 4 only the
+  new box's quarter moves (74.9 GB), against 224.6 GB with the formulas.
+- `--layout FILE` (`LAYOUT`) boots from one, with `--v2-dense`: the loader places heads and dense blocks that are not
+  contiguous, and reads each half's index-slice row from whichever rank's slice holds it. It needs a local copy of the
+  release for now: a box's Hugging Face cache holds only the halves the formula gives its rank. The handshake compares
+  the layout file's sha256.
+- `engine/loader-rs/tests/release_check.py --layout FILE` checks a planned rank's image against an independent
+  derivation, as it does today's.
+
 ## 2026-10-15: one engine binary for every TP width
 
 - `scripts/build.sh` builds one `g6m4` and one `m4sim` that run TP = 1, 2, 3, 4, 6 and 8 (and with `KV_FORMAT=int4`

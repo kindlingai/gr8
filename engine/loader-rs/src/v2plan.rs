@@ -12,7 +12,7 @@ use std::os::unix::fs::FileExt;
 const ALIGN: u64 = 4096;
 pub(crate) const HALF_PER_BIT: u64 = 98304;
 pub(crate) const NH: usize = 16;
-const SHARED: usize = 256;
+pub(crate) const SHARED: usize = 256;
 const XF_EXLR8: &str = "exlr8-e4m3";
 
 /// A manifest entry (tools/convert/pack.py): dtype is the manifest label (u8, f16, i64, ...).
@@ -235,7 +235,7 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
         .iter().map(base_tensor).collect::<Result<Vec<_>, _>>()?;
     base.sort_by_key(|t| t.offset);
     let man = width_manifest(widths_path)?;
-    let slices = open_slices(slices_dir, nr, rank)?;
+    let slices = Slices::open(slices_dir, nr, &[rank])?;
     let wfile = |l: usize, k: u8| width_file(v2_dir, l, k);
     let mut b = Builder::new();
     let base_file = b.file(base_pack.to_string());
@@ -248,7 +248,7 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
         if let Some(l) = layer.filter(|_| rest.starts_with("tr3.") || rest.starts_with("shared.")) {
             if let Some(w) = widths(&man, l)? {
                 if !done.contains(&l) {
-                    v2_layer(&mut b, l, &w, &slices, &wfile, nr, rank)?;
+                    v2_layer(&mut b, l, &w, &slices, &wfile, &|e| Ok(formula_halves(e, l, nr, rank)))?;
                     done.push(l);
                 }
                 continue;
@@ -277,22 +277,39 @@ pub(crate) fn width_manifest(path: &str) -> Result<Json, String> {
     Ok(man)
 }
 
-/// Rank `rank`'s index slices at TP `nr`, one per width present: SLICES/tp<N>/k<K>/rank<r>.safetensors, SLICES being
-/// the index-slices dir itself or a release dir that holds index-slices/.
-pub(crate) fn open_slices(slices_dir: &str, nr: usize, rank: usize) -> Result<HashMap<u8, Slice>, String> {
-    let mut slices: HashMap<u8, Slice> = HashMap::new();
-    for root in [slices_dir.to_string(), format!("{slices_dir}/index-slices")] {
-        for k in [2u8, 3, 4] {
-            let p = format!("{root}/tp{nr}/k{k}/rank{rank}.safetensors");
-            if !slices.contains_key(&k) && std::path::Path::new(&p).exists() {
-                slices.insert(k, Slice::open(&p)?);
+/// The halves of expert e in layer l that rank `rank` of TP `nr` owns under the formula, which the index slices of
+/// TP `nr` follow too (tools/convert/v2.py owner).
+pub(crate) fn formula_halves(e: usize, l: usize, nr: usize, rank: usize) -> Vec<usize> {
+    (0..NH).filter(|&h| (16 * e + h + l) % nr == rank).collect()
+}
+
+/// Index slices at TP `nr` of some of its ranks, by (width, rank): unit (e, h) of layer l is in rank
+/// (16 e + h + l) % nr's slice.
+pub(crate) struct Slices {
+    nr: usize,
+    by: HashMap<(u8, usize), Slice>,
+}
+
+impl Slices {
+    /// The slices of `ranks` at TP `nr`, one per width present: SLICES/tp<N>/k<K>/rank<r>.safetensors, SLICES being
+    /// the index-slices dir itself or a release dir that holds index-slices/.
+    pub(crate) fn open(slices_dir: &str, nr: usize, ranks: &[usize]) -> Result<Slices, String> {
+        let mut by: HashMap<(u8, usize), Slice> = HashMap::new();
+        for &rank in ranks {
+            for root in [slices_dir.to_string(), format!("{slices_dir}/index-slices")] {
+                for k in [2u8, 3, 4] {
+                    let p = format!("{root}/tp{nr}/k{k}/rank{rank}.safetensors");
+                    if !by.contains_key(&(k, rank)) && std::path::Path::new(&p).exists() {
+                        by.insert((k, rank), Slice::open(&p)?);
+                    }
+                }
+            }
+            if !by.keys().any(|&(_, r)| r == rank) {
+                return Err(format!("no index slices for TP {nr} rank {rank} under {slices_dir}"));
             }
         }
+        Ok(Slices { nr, by })
     }
-    if slices.is_empty() {
-        return Err(format!("no index slices for TP {nr} rank {rank} under {slices_dir}"));
-    }
-    Ok(slices)
 }
 
 /// The width file of layer l at width k: DIR/exlr8-layer-LLL.kK.safetensors, or under DIR/experts/.
@@ -313,11 +330,12 @@ fn base_tensor(t: &Json) -> Result<Tensor, String> {
     })
 }
 
-pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u8, Slice>, wfile: &dyn Fn(usize, u8) -> String,
-            nr: usize, rank: usize) -> Result<(), String> {
+/// Layer l's v2 expert tensors for the halves `own` gives for each expert (256: the shared expert), in ascending order.
+pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, wfile: &dyn Fn(usize, u8) -> String,
+            own: &dyn Fn(usize) -> Result<Vec<usize>, String>) -> Result<(), String> {
     let p = format!("L{l:03}");
-    let mut ls: HashMap<u8, LayerSlice> = HashMap::new();
-    for (&k, s) in slices {
+    let mut ls: HashMap<(u8, usize), LayerSlice> = HashMap::new();
+    for (&k, s) in &slices.by {
         if let Some(x) = layer_slice(s, l)? {
             ls.insert(k, x);
         }
@@ -330,10 +348,11 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
     let of = |e: usize| -> ([u8; NH], [u8; NH], u8) {
         if e == SHARED { (w.sgate, w.sup, w.sdown) } else { (w.gate[e], w.up[e], w.down[e]) }
     };
-    let own: Vec<Vec<usize>> = experts.iter().map(|&e| (0..NH).filter(|&h| (16 * e + h + l) % nr == rank).collect()).collect();
+    let own: Vec<Vec<usize>> = experts.iter().map(|&e| own(e)).collect::<Result<_, _>>()?;
     let nblk: usize = own.iter().map(Vec::len).sum();
     let bs = w.sdown > 0;
-    let get = |k: u8| ls.get(&k).ok_or(format!("layer {l}: no index slice at K{k}"));
+    // the slice that holds unit (e, h) at width k
+    let get = |k: u8, e: usize, h: usize| ls.get(&(k, (16 * e + h + l) % slices.nr)).ok_or(format!("layer {l}: no index slice at K{k}"));
     let row_of = |s: &LayerSlice, e: usize, h: usize| s.row.get(&(e, h)).copied().ok_or(format!("layer {l}: expert {e} half {h} not in the slice"));
     // block row of expert e: routed e, the shared expert after the routed ones
     let brow = |e: usize| if e == SHARED { nroute } else { e };
@@ -368,7 +387,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
         kmix[i] = kmix_word(&gw, &uw, dk, hs);
         for &h in hs {
             for (proj, k) in [(0usize, gw[h]), (1, uw[h])] {
-                let s = get(k)?;
+                let s = get(k, e, h)?;
                 let j = row_of(s, e, h)?;
                 let f = b.file(wfile(l, k));
                 b.seg(fc1 + off, hb(k), Op::Copy, f, s.offset[j * 3 + proj] as u64);
@@ -387,7 +406,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
         let dk = of(e).2;
         table[i][1] = off as i64;
         for &h in &own[i] {
-            let s = get(dk)?;
+            let s = get(dk, e, h)?;
             let j = row_of(s, e, h)?;
             let f = b.file(wfile(l, dk));
             b.seg(fc2 + off, hb(dk), Op::Item128, f, s.offset[j * 3 + 2] as u64);
