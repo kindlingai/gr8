@@ -152,6 +152,40 @@ __global__ void k1_tr3_fin(K1Args A)
 #endif
 }
 
+// ------------------------------------------------------------------ G6_ROUTE_OVL: the trellis shared expert apart
+// SH layers, separate fc1 / fc2 launches (bind.cuh k1_ovl_fork / launch_k1_ovl). The shared expert's units need nothing
+// from the route plan (k1_slot: item slots 0 .. nsh-1, scratch slots n_slots + t; tr3_fc1_body reads the plan only for
+// routed slots, tr3_fc2_body not at all), so they can run on a forked stream while the router GEMV and the plan kernel
+// run. PART 1 = the shared expert's CTAs of k1_tr3_fc1 / k1_tr3_fc2 (the first nsh * ups of their grids), PART 2 = the
+// routed ones (the rest: blockIdx.x is offset by nsh * ups). Same units, same bodies, same scratch, so the same bytes.
+// PART 2 keeps the ctl bookkeeping (ctl[1], ctl[2]); PART 1 writes no ctl word and reads only ctl[0], which nothing
+// writes between the fork and the join (the finalize, after the join, advances it).
+template <bool E4, bool K2, int PART>
+__global__ __launch_bounds__(1024) void k1_tr3_fc1_ovl(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    const int plan = A.ctl[0];
+    const int ups = A.B * 2 * A.KS1;
+    const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
+    int e, mask, ss;
+    const int slot = cta / ups;
+    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, true>(A, plan, cta + (ss - slot) * ups, e, mask, smem);
+    if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
+}
+
+template <bool E4, bool K2, int PART>
+__global__ __launch_bounds__(512, 2) void k1_tr3_fc2_ovl(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    const int plan = PART == 2 ? A.ctl[1] : A.ctl[0];
+    const int ups = A.B * A.NS2;
+    const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
+    int e, mask, ss;
+    const int slot = cta / ups;
+    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2>(A, plan, cta + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
+    if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
+}
+
 // ------------------------------------------------------------------ TR3 fused fc1 + fc2: one persistent launch
 // Work items in order: routed fc1 units, shared fc1 CTAs, routed fc2 units, shared fc2 CTAs. CTAs take items from a
 // counter (A.fctl[0]); an fc2 item waits until the fc1 units of its (slot, block) are done (A.fctl[1 + slot*B + b],

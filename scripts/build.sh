@@ -100,3 +100,9 @@ for test in steering_cuda_test steering_consume_test; do
     echo "$test: compiled; no GPU visible, not run"
   fi
 done
+
+# G6_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
+# + bench on a synthetic TP4 layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
+# shellcheck disable=SC2086
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 \
+  -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" "$REPO/engine/kernels/tests/k1_ovl_test.cu"
