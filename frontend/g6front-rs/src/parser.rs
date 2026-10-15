@@ -348,6 +348,8 @@ impl GlmParser {
     }
 
     fn on_think(&mut self, tag: &str) {
+        // A think tag separates the next opener from any preceding backtick in the raw reply.
+        self.last = Some('>');
         match self.state {
             State::Reasoning => {
                 if tag == THINK_END {
@@ -902,6 +904,23 @@ mod tests {
             Some("Think about <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> a bit.")
         );
         assert_eq!(r.content.as_deref(), Some("Here."));
+    }
+
+    /// A backtick before a think tag is not adjacent to the tool opener after that tag.
+    #[test]
+    fn backtick_before_think_end_does_not_quote_a_call() {
+        let text = "Use `get_weather`</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>";
+        let r = full(text);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.reasoning.as_deref(), Some("Use `get_weather`"));
+        assert_eq!(r.calls[0].2, r#"{"city": "Paris"}"#);
+        for chunk in [1, 2, 7, 11, 4096] {
+            let s = streamed(text, chunk);
+            assert_eq!(s.calls.len(), 1, "chunk {chunk}");
+            assert_eq!(s.calls[0].2, r.calls[0].2);
+            assert_eq!(s.reasoning, r.reasoning);
+            assert_eq!(s.content, r.content);
+        }
     }
 
     /// An opener right after a backtick is inline code, even when the reply ends with it (the trailing rule cannot tell).
