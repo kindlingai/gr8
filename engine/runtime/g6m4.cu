@@ -114,6 +114,8 @@
 #include "rt_rows.cuh"
 #include "host_reclaim.h"
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <unistd.h>
 
 using namespace g6rt;
@@ -672,6 +674,25 @@ int main(int argc, char** argv)
     std::string pce;
     const int dsel_posclk = env_choice("G6_S2_DSEL_POSCLK", 1, 0, &pce);
     if (dsel_posclk < 0) die(pce);
+    // G6_S2_DSEL_MODEL=1|2 + G6_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
+    // choice prices both drafters from one frozen cost table and MTP rounds under the confidence stop. Every rank reads
+    // the same table; its canonical form is in the S2 runtime signature
+    const int dsel_model = env_choice("G6_S2_DSEL_MODEL", 2, 0, &pce);
+    if (dsel_model < 0) die(pce);
+    s2::DSelTable dsel_tab;
+    if (dsel_model)
+    {
+        const char* e = getenv("G6_S2_DSEL_TABLE");
+        if (!e || !*e || !dfl || !s2mode) die("G6_S2_DSEL_MODEL needs G6_S2_DSEL_TABLE, --serve and --dflash-manifest");
+        std::string text = e, err;
+        if (text.find(':') == std::string::npos)    // no key:value: the path of a file holding the table
+        {
+            std::ifstream f(text);
+            if (!f) die("G6_S2_DSEL_TABLE: cannot read " + text);
+            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        if (!dsel_tab.parse(text, &err)) die(err);
+    }
     // G6_DFL_SEL_ALPHA=<a> (dflash.cuh k_walk; default 1): the DFlash2 selector walk scores logit + a * correction. Drafts
     // only: the verify is unchanged. In the S2 runtime signature
     const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
@@ -1918,6 +1939,15 @@ int main(int argc, char** argv)
                 if (const char* e = getenv("G6_S2_DSEL_DCOST")) h.dsel.d.draft_round = atof(e);
                 if (const char* e = getenv("G6_S2_DSEL_MCOST")) h.dsel.m.draft_round = atof(e);
                 if (const char* e = getenv("G6_S2_DSEL_MEACH")) h.dsel.m.draft_each = atof(e);
+                h.dsel.model = dsel_model;    // the table replaces the drafting ms above (Batch::dsel)
+                h.dsel.tab = dsel_tab;
+                if (R == 0 && dsel_model)
+                {
+                    fprintf(stderr, "# s2 drafter choice cost model %d: table %s%s\n", dsel_model, dsel_tab.str().c_str(),
+                            dsel_model > 1 ? " (also the DFlash2 draft count)" : "");
+                    for (const char* o : {"G6_S2_DSEL_DCOST", "G6_S2_DSEL_MCOST", "G6_S2_DSEL_MEACH"})
+                        if (getenv(o)) fprintf(stderr, "# warning: %s is ignored under G6_S2_DSEL_MODEL (the table's d, m, e)\n", o);
+                }
                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d, "
                                                     "drafting ms: DFlash2 %.2f, MTP %.2f + %.2f per chain step)\n",
                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe, h.dsel.d.draft_round, h.dsel.m.draft_round,
@@ -2019,7 +2049,8 @@ int main(int argc, char** argv)
                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
                 (dsel_start_mtp ? " dselstart mtp" : "") +
                 (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
-                (dsel_posclk ? " dselposclk 1" : "");
+                (dsel_posclk ? " dselposclk 1" : "") +
+                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);

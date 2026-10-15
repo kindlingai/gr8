@@ -26,7 +26,8 @@
 // every rank chooses the same). On MTP rounds the drafter still takes the accepted rows as context, so a switch back
 // needs no catch-up; every DSel::probe-th of them also drafts, and its 7 drafts are scored against the tokens later
 // rounds commit. On DFlash2 rounds the MTP first-form pass already drafts d[1], which scores MTP's first position. The
-// estimates start afresh with each request.
+// estimates start afresh with each request. G6_S2_DSEL_MODEL: the costs come from one frozen table (DSelTable), and MTP
+// rounds are priced as the confidence stop runs them.
 // Confidence stop (Batch::kstop, G6_MTP_KSTOP): a solo DFlash2 session's MTP rounds draft and verify k <= KStop::kmax
 // MTP drafts, chosen from the drafts' log-probabilities under the MTP head (StepOut::lp, Hooks::lp): the chain stops
 // before a draft that could not be verified, and the verify takes the drafts that pass. The log-probabilities are the
@@ -43,8 +44,10 @@
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -186,6 +189,117 @@ inline bool dsel_env() { const char* e = getenv("G6_S2_DSEL"); return !e || atoi
 // step before the MTP first form, on its own stream, and waits for it at the end of the round (after the chain on MTP).
 // Both are fixed graphs on separate weights, scratch and fabrics, so each one's output bytes are as serial; 0 = serial
 inline int draft_par_env() { const char* e = getenv("G6_DRAFT_PAR"); return e ? atoi(e) : 0; }
+// G6_S2_DSEL_MODEL=1|2 with G6_S2_DSEL_TABLE (every rank, read at boot; DSel::model): the drafter choice prices both
+// drafters from one frozen cost table in place of the drafting constants (G6_S2_DSEL_DCOST / _MCOST / _MEACH) and
+// spec_len.h's verify table, and prices MTP rounds as the active confidence stop (KStop) runs them, not as K drafts.
+// 2: the DFlash2 rounds' own draft count (--spec-adaptive, Batch::dflash) uses the table too. The table is a list of
+// key:value separated by commas or white space ('#' to the line's end is a comment), given inline or as the path of a
+// file holding it; its canonical form goes into the S2 runtime signature, so ranks with different tables do not start:
+//   v<M>     a verify step of M rows, ms (M 1..8; rows not given are interpolated, and extrapolated past the ends)
+//   d        a DFlash2 round's drafting: the MTP first form and the drafter's query step
+//   m        an MTP round's drafting: the first form and the drafter's context-only step
+//   e        an MTP chain step
+//   p        a probe's extra: the drafter's query step over its context-only one (p / DSel::probe per MTP round)
+//   g k n    MTP rounds under the confidence stop, as the prior of a request's estimate: the drafts accepted after the
+//            first when the first is (g), drafts verified (k) and drafted (n) per round. Default: K, K, the seeds
+//   w        the acceptance estimates' prior in rounds (SpecLen::prior, default 4). With decay 0.9 the seed keeps
+//            w / (w + 10) of every rate, and the positions of a round compound it: at 4 a DFlash2 block whose 7 drafts
+//            are all accepted is expected to commit 6.1 tokens, not 8 (at 1: 7.3), which favours MTP's shorter rounds
+// tools/s2_dsel_table.py writes it from a G6_S2_TIMELINE (+ G6_MTP_LPLOG) boot. Measured once and frozen: step times
+// differ per rank, and a decision that differs between ranks hangs the fabric (spec_len.h).
+struct DSelTable
+{
+    static constexpr int VX = g6rt::SpecLen::KX + 1;    // verify rows 1..VX
+    double v[VX + 1] = {};
+    double d = 0, m = 0, e = 0, p = 0;
+    double g = -1, k = 0, n = 0;                        // the MTP prior (-1 / 0: not given)
+    double w = 0;                                       // SpecLen::prior (0: not given)
+    // the verify ms of a fractional row count (the prior's mean drafts), linear between rows
+    double verify(double rows) const
+    {
+        rows = std::min(std::max(rows, 1.0), (double)VX);
+        const int a = std::min((int)rows, VX - 1);
+        return v[a] + (rows - a) * (v[a + 1] - v[a]);
+    }
+    // the table's text (an inline list, or a file's contents); false with *err on a bad key or value
+    bool parse(const std::string& text, std::string* err)
+    {
+        *this = DSelTable();
+        auto fail = [&](const std::string& w) { *err = "G6_S2_DSEL_TABLE: " + w; return false; };
+        bool have[VX + 1] = {}, hd = false, hm = false, he = false;
+        std::string s;
+        for (size_t i = 0; i < text.size(); ++i)
+        {   // comments out, every separator a space
+            if (text[i] == '#') { while (i < text.size() && text[i] != '\n') ++i; s += ' '; continue; }
+            s += text[i] == ',' || std::isspace((unsigned char)text[i]) ? ' ' : text[i];
+        }
+        size_t a = 0;
+        while ((a = s.find_first_not_of(' ', a)) != std::string::npos)
+        {
+            const size_t b = std::min(s.find(' ', a), s.size());
+            const std::string item = s.substr(a, b - a);
+            a = b;
+            const size_t c = item.find(':');
+            if (c == std::string::npos) return fail("'" + item + "' is not key:value");
+            const std::string key = item.substr(0, c), val = item.substr(c + 1);
+            char* end = nullptr;
+            const double x = q(strtod(val.c_str(), &end));
+            if (val.empty() || *end || !std::isfinite(x) || x < 0) return fail("'" + item + "': not a number >= 0");
+            if (key.size() == 2 && key[0] == 'v' && key[1] >= '1' && key[1] <= '0' + VX)
+            {
+                const int r = key[1] - '0';
+                if (!(x > 0)) return fail("'" + item + "': a verify step takes time");
+                v[r] = x; have[r] = true;
+            }
+            else if (key == "d") { d = x; hd = true; }
+            else if (key == "m") { m = x; hm = true; }
+            else if (key == "e") { e = x; he = true; }
+            else if (key == "p") p = x;
+            else if (key == "g") g = x;
+            else if (key == "k") k = x;
+            else if (key == "n") n = x;
+            else if (key == "w") { if (!(x > 0)) return fail("'" + item + "': the prior needs weight"); w = x; }
+            else return fail("unknown key '" + key + "' (v1..v" + std::to_string(VX) + ", d, m, e, p, g, k, n, w)");
+        }
+        std::vector<int> rs;
+        for (int r = 1; r <= VX; ++r) if (have[r]) rs.push_back(r);
+        if (rs.size() < 2 || !hd || !hm || !he) return fail("needs two or more verify rows v<M>, and d, m and e");
+        if ((k && (k < 1 || k > VX - 1)) || (n && (n < 1 || n > VX - 1)) || (k && n && n < k))
+            return fail("k and n are mean draft counts, 1 <= k <= n");
+        for (int r = 1; r <= VX; ++r)
+        {
+            if (have[r]) continue;
+            size_t j = 1;                 // the pair of given rows around r (or the nearest pair past an end)
+            while (j + 1 < rs.size() && rs[j] < r) ++j;
+            const int lo = rs[j - 1], hi = rs[j];
+            v[r] = q(v[lo] + (v[hi] - v[lo]) * (r - lo) / (hi - lo));
+            if (!(v[r] > 0)) return fail("v" + std::to_string(r) + " extrapolates to " + std::to_string(v[r]) + " ms");
+        }
+        return true;
+    }
+    // every value on a 1e-4 grid, so the canonical form below is equal exactly when the doubles are
+    static double q(double x) { return std::isfinite(x) ? std::round(x * 1e4) / 1e4 : x; }
+    // canonical form: every rank that read the same table prints the same bytes
+    std::string str() const
+    {
+        std::string s;
+        char b[64];
+        for (int r = 1; r <= VX; ++r) { snprintf(b, sizeof b, "v%d:%.10g,", r, v[r]); s += b; }
+        snprintf(b, sizeof b, "d:%.10g,m:%.10g,e:%.10g,p:%.10g", d, m, e, p); s += b;
+        if (g >= 0) { snprintf(b, sizeof b, ",g:%.10g", g); s += b; }
+        if (k > 0) { snprintf(b, sizeof b, ",k:%.10g", k); s += b; }
+        if (n > 0) { snprintf(b, sizeof b, ",n:%.10g", n); s += b; }
+        if (w > 0) { snprintf(b, sizeof b, ",w:%.10g", w); s += b; }
+        return s;
+    }
+    // a SpecLen's verify table, drafting ms and prior weight
+    void price(g6rt::SpecLen& s, double round, double each) const
+    {
+        std::copy(v + 1, v + VX + 1, s.table + 1);
+        s.draft_round = round; s.draft_each = each;
+        if (w > 0) s.prior = w;
+    }
+};
 struct DSel
 {
     bool on = false;
@@ -197,6 +311,13 @@ struct DSel
     bool start_mtp = false;
     bool posclk = false;              // G6_S2_DSEL_POSCLK=1: d and m keep a clock per position (SpecLen::posclk)
     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
+    int model = 0;                    // G6_S2_DSEL_MODEL (above): 0 = the constants in d and m; 1, 2 = tab
+    DSelTable tab;
+    // model: the request's MTP rounds, decayed as m's positions (SpecLen::pos_decay) per MTP round: rounds and their
+    // table cost (ms), rounds whose first draft was accepted and the drafts accepted after it. The table's prior counts
+    // as `prior` rounds: it decides until the request has MTP rounds, then keeps ~9% (SpecLen's 4 would keep 29%)
+    double rn = 0, rc = 0, an = 0, ag = 0;
+    double prior = 1;
 };
 // G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
 //   0  off: K every round
@@ -259,8 +380,17 @@ public:
     // choose each round's draft count (k <= K); off: every round verifies K drafts
     void adapt(bool on) { adapt_ = on; }
     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
-    void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
-    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; kstop(ks_); }
+    void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; price(); }
+    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; price(); kstop(ks_); }
+    const DSel& dsel() const { return sel_; }
+    // the drafter choice's tokens per ms of an MTP round and of a DFlash2 round, as next_mtp compares them
+    std::pair<double, double> dsel_rates() const
+    {
+        double rd = 0;
+        if (dsl_.on) { for (int k : dsl_.levels) rd = std::max(rd, sel_.d.ratio(k, nullptr, k)); }
+        else rd = sel_.d.ratio(dkv_, nullptr, dkv_);
+        return {sel_.model ? mtp_rate() : sel_.m.ratio(K_, nullptr, K_), rd};
+    }
     // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
     void kstop(const KStop& k)
     {
@@ -286,7 +416,7 @@ public:
         x.lo = (int)x.tokens.size() - 1;
         x.warm = x.lo + std::max(1, reuse_.min);
         x.pb = -1; x.since = 0; x.mn = 0;
-        if (sel_.on) { sel_.d = fresh(sel_.d); sel_.m = fresh(sel_.m); }
+        if (sel_.on) restart();
         Stats& s = stats_[q];
         if ((int)s.acc.size() < DFL_B) s.acc.resize(DFL_B, 0);
         s.promoted = s.dfl_lo = x.lo; s.dfl_warm = x.warm;
@@ -495,6 +625,12 @@ private:
     {
         St& x = st_[q];
         nm = sel_.on && next_mtp(x);
+        if (ks_.log && sel_.on && sel_.model)
+        {   // G6_MTP_LPLOG with DSel::model: the tokens per ms the choice compares after this round, and its MTP means
+            const auto [rm, rd] = dsel_rates();
+            fprintf(stderr, "# dsel round %ld slot %d rm %.6f rd %.6f c1 %.4f mtp_rounds %.3f ms %.3f g %.4f next %s\n", cur_round_, q, rm, rd,
+                    sel_.m.rate(1), sel_.rn, sel_.rn > 0 ? sel_.rc / sel_.rn : 0., sel_.an > 0 ? sel_.ag / sel_.an : 0., nm ? "mtp" : "dfl");
+        }
         if (x.warm) { nm = base + a + 1 < x.warm; if (!nm) x.warm = 0; }   // G6_DFL_REUSE warm-up: DFlash2 once it is over
         if (nm != x.mtp) { x.since = 0; ++stats_[q].switches; }
         ++x.since;
@@ -617,6 +753,13 @@ private:
             return;
         }
         sel_.m.observe(k, a, ml, pe);
+        if (sel_.model)
+        {   // the round as drafted (x.k) and verified (k); the cost is the table's, never this rank's clock
+            const double f = sel_.m.pos_decay;
+            sel_.rn = sel_.rn * f + 1; sel_.rc = sel_.rc * f + mtp_cost(k, x.k);
+            sel_.an *= f; sel_.ag *= f;
+            if (a >= 1) { sel_.an += 1; sel_.ag += a - 1; }
+        }
         probe_score(x);
     }
     // a probe's drafts pd[j] are for positions pb + j; score them once a mismatch or all DFL_B - 1 are committed
@@ -634,11 +777,40 @@ private:
     bool next_mtp(const St& x) const
     {
         if (x.since < sel_.dwell) return x.mtp;
-        double rd = 0;
-        if (dsl_.on) { for (int k : dsl_.levels) rd = std::max(rd, sel_.d.ratio(k, nullptr, k)); }
-        else rd = sel_.d.ratio(dkv_, nullptr, dkv_);
-        const double rm = sel_.m.ratio(K_, nullptr, K_);
+        const auto [rm, rd] = dsel_rates();
         return x.mtp ? rm * (1 + sel_.margin) >= rd : rm > rd * (1 + sel_.margin);
+    }
+    // DSel::model: an MTP round's tokens per ms under the confidence stop. It commits 1 + c_1 (1 + g) tokens: c_1 = MTP's
+    // first-position rate, which every round teaches (DFlash2 rounds score d[1]); g = the drafts accepted after the first
+    // when the first is, which only MTP rounds teach, so before them the table's prior holds. It costs the mean table
+    // cost of the request's MTP rounds (verify k + 1 rows, m, e per chain step), plus its share of a probe. Both means
+    // shrink toward the table's prior (DSel::prior rounds)
+    double mtp_rate() const
+    {
+        const DSelTable& t = sel_.tab;
+        const double w = sel_.prior;
+        double g0 = t.g;
+        if (g0 < 0) { g0 = 0; double s = 1; for (int j = 2; j <= K_; ++j) { s *= sel_.m.seed[j]; g0 += s; } }
+        const double k0 = t.k > 0 ? t.k : K_, n0 = t.n > 0 ? t.n : std::max<double>(K_, k0);
+        const double c0 = t.verify(k0 + 1) + t.m + t.e * (n0 - 1);
+        const double g = (sel_.ag + w * g0) / (sel_.an + w), c = (sel_.rc + w * c0) / (sel_.rn + w);
+        return (1 + sel_.m.rate(1) * (1 + g)) / (c + t.p / sel_.probe);
+    }
+    double mtp_cost(int k, int nd) const { return sel_.tab.verify(k + 1) + sel_.tab.m + sel_.tab.e * std::max(0, nd - 1); }
+    // DSel::model: the table's costs in the drafter choice's estimates (2: also in the DFlash2 rounds' own draft count)
+    void price()
+    {
+        if (!sel_.model) return;
+        sel_.tab.price(sel_.d, sel_.tab.d, 0);
+        sel_.tab.price(sel_.m, sel_.tab.m, sel_.tab.e);
+        if (sel_.model >= 2) sel_.tab.price(dsl_, sel_.tab.d, 0);
+    }
+    // the drafter choice learns each request afresh; its settings (the verify table included) stay
+    void restart()
+    {
+        sel_.d = fresh(sel_.d);
+        sel_.m = fresh(sel_.m);
+        sel_.rn = sel_.rc = sel_.an = sel_.ag = 0;
     }
     static g6rt::SpecLen fresh(const g6rt::SpecLen& o)
     {
@@ -646,6 +818,8 @@ private:
         f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each; f.posclk = o.posclk;
         std::copy(o.table, o.table + g6rt::SpecLen::KX + 2, f.table);
         std::copy(o.seed, o.seed + g6rt::SpecLen::KX + 1, f.seed);
+        std::copy(o.table, o.table + g6rt::SpecLen::KX + 2, f.table);
+        f.pos_decay = o.pos_decay; f.bucket_decay = o.bucket_decay; f.prior = o.prior;
         return f;
     }
     // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round
@@ -748,8 +922,7 @@ private:
         x.armed = p.ins.on();
         if (x.dfl && sel_.on)             // drafter choice learns each request afresh: the last request's text says little
         {
-            sel_.d = fresh(sel_.d);
-            sel_.m = fresh(sel_.m);
+            restart();
             x.mtp = sel_.start_mtp;
         }
         if (x.dfl && !(h_.dfl && h_.dfl_start)) throw std::runtime_error("s2: DFlash2 session without drafter hooks");
