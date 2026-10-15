@@ -385,11 +385,12 @@ public:
     // Boot capture of every graph key a decode step can reach, before serving (a launch of any other key fails):
     //   main : M in 1..chunk (prompt tails, class row_class(M)) U S*(k+1), S = 1..sessions, k = 1..K with G6_S2_ADAPT
     //          (else k = K), class row_class(K+1)                          -> two graphs (split A / B)
+    //          U with G6_MTP_KSTOPB (kb) the shared rounds' widths s2::kstopb_widths, class row_class(K+1)
     //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
     // contexts and source rows are read from S2In at launch. Call before the first launch / before connecting.
-    void capture_all(unsigned sessions, int mtp, int chunk) {
+    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}) {
         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
@@ -399,6 +400,7 @@ public:
         for (int M = 1; M <= chunk; ++M) { mains.insert({M, s2::row_class(M)}); drafts.insert(M); }
         for (int S = 1; S <= N; ++S)
             for (int k = s2::adapt_env() ? 1 : K; k <= K; ++k) mains.insert({S * (k + 1), s2::row_class(K + 1)});
+        for (int M : s2::kstopb_widths(kb, N, K)) mains.insert({M, s2::row_class(K + 1)});
         for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
         if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
         for (const auto& mc : mains) require(mc.first <= g6rt::MX, "main step rows exceed G6_MX");

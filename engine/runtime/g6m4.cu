@@ -295,6 +295,48 @@ int main(int argc, char** argv)
             die("G6_MTP_KSTOP needs --serve, --dflash-manifest and --mtp 2+; G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), "
                 "G6_MTP_KSTOP_SEED3 in (0, 1)");
         if (!kstop.mode) kstop.kmax = 0;
+        // G6_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
+        // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least G6_MTP_KSTOPB_KMIN (0|1, default 0).
+        // G6_MTP_KSTOPB_TAU=t1[,t2[,t3]] (default 0.6,0.88) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n sessions.
+        // G6_MTP_KSTOPB_WIDTHS=M,..: the main widths captured besides the multiples of K + 1 (default every width the rule reaches;
+        // a width outside them takes the next most likely drafts). G6_MTP_KSTOPB_EXPLORE=n (measurement): every n-th
+        // round's shared sessions verify a hashed k_q instead. In the S2 runtime signature
+        kstop.b.mode = env_choice("G6_MTP_KSTOPB", 1, 0, &ke);
+        kstop.b.kmin = env_choice("G6_MTP_KSTOPB_KMIN", 1, 0, &ke);
+        if (kstop.b.mode < 0 || kstop.b.kmin < 0) die(ke);
+        auto nums = [](const char* name, size_t most) {
+            std::vector<double> t;
+            const std::string v = getenv(name);
+            for (size_t a = 0; a <= v.size();)
+            {
+                const size_t b = std::min(v.find(',', a), v.size());
+                char* end = nullptr;
+                const std::string f = v.substr(a, b - a);
+                t.push_back(strtod(f.c_str(), &end));
+                if (f.empty() || *end || !std::isfinite(t.back()) || t.size() > most)
+                    die(std::string(name) + ": at most " + std::to_string(most) + " comma-separated numbers");
+                a = b + 1;
+            }
+            return t;
+        };
+        double bt[4] = {0, 0.6, 0.88, 0.95};
+        if (getenv("G6_MTP_KSTOPB_TAU")) { const auto t = nums("G6_MTP_KSTOPB_TAU", 3); std::copy(t.begin(), t.end(), bt + 1); }
+        for (int S = 1; S <= s2::S2N_SLOTS; ++S)
+        {
+            std::copy(bt, bt + 4, kstop.b.tau[S]);
+            const std::string n = "G6_MTP_KSTOPB_TAU_S" + std::to_string(S);
+            if (getenv(n.c_str())) { const auto t = nums(n.c_str(), 3); std::copy(t.begin(), t.end(), kstop.b.tau[S] + 1); }
+        }
+        if (getenv("G6_MTP_KSTOPB_WIDTHS"))
+            for (double w : nums("G6_MTP_KSTOPB_WIDTHS", 64))
+            {
+                if (w != (int)w || w < 1 || w > s2sess * (mtp + 1)) die("G6_MTP_KSTOPB_WIDTHS: whole widths 1..sessions x (mtp + 1)");
+                kstop.b.widths.push_back((int)w);
+            }
+        if (getenv("G6_MTP_KSTOPB_EXPLORE")) kstop.b.explore = atoi(getenv("G6_MTP_KSTOPB_EXPLORE"));
+        if (kstop.b.mode && (!s2mode || !dfl || kstop.b.explore < 0))
+            die("G6_MTP_KSTOPB needs --serve and --dflash-manifest (the draft log-probabilities); G6_MTP_KSTOPB_EXPLORE >= 0");
+        if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
@@ -1346,6 +1388,17 @@ int main(int argc, char** argv)
                                                std::to_string(kstop.tau[3])).c_str()
                                             : ("MTP estimates, seed3 " + std::to_string(kstop.seed3)).c_str(),
                             h.dsel.on ? "" : dfl_reuse ? "; the drafter choice is off: G6_DFL_REUSE warm-up rounds only" : "; the drafter choice is off, so no MTP rounds");
+                if (R == 0 && kstop.b.mode)
+                {
+                    std::string t, w;
+                    for (int S = 1; S <= s2sess; ++S)
+                        t += (S > 1 ? " " : "") + std::to_string(S) + ":" + std::to_string(kstop.b.tau[S][1]).substr(0, 5) + "," +
+                             std::to_string(kstop.b.tau[S][2]).substr(0, 5) + "," + std::to_string(kstop.b.tau[S][3]).substr(0, 5);
+                    for (int M : s2::kstopb_widths(kstop.b, s2sess, mtp)) w += (w.empty() ? "" : ",") + std::to_string(M);
+                    fprintf(stderr, "# s2 MTP shared-round stop: each session verifies %d..%d drafts, tau by sessions %s; main widths %s%s\n",
+                            kstop.b.kmin, mtp, t.c_str(), w.c_str(),
+                            kstop.b.explore ? (", explore every " + std::to_string(kstop.b.explore) + " rounds").c_str() : "");
+                }
                 h.dfl_reuse.mode = dfl_reuse;
                 h.dfl_reuse.min = dfl_reuse_min;
                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
@@ -1437,7 +1490,7 @@ int main(int argc, char** argv)
                 (dsel_start_mtp ? " dselstart mtp" : "") +
                 (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
                 (dsel_posclk ? " dselposclk 1" : "") +
-                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "");
+                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -1456,7 +1509,7 @@ int main(int argc, char** argv)
             // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
             try
             {
-                nd.capture_all(sc.limit(), mtp, plan.chunk);
+                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b);
                 m.dfl_tap = tap;
                 wcheck::seal(R);
                 int dev = 0;
