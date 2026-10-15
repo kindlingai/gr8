@@ -154,7 +154,7 @@ class Expect:
             T[f'{P}.qo.o_proj.mx.codes'], T[f'{P}.qo.o_proj.mx.scales'] = mx_quantize(dec('self_attn.o_proj'))
             T[f'{P}.qo.kv_b.uk'], T[f'{P}.qo.kv_b.uv'] = kvb[:, :192], kvb[:, 192:]
         if mtp:
-            mx_copy('eh', 'eh_proj', copy=False)
+            mx_copy('eh', 'eh_proj')                         # MTP prefill reads the codes too
             vec('enorm', 'enorm.weight')
             vec('hnorm', 'hnorm.weight')
             vec('shared_head_norm', 'shared_head.norm.weight')
