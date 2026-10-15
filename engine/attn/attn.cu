@@ -519,6 +519,23 @@ static int& attn_ctx2(){static int v=[]{
     const char* e=getenv("G6_ATTN_CTX2");const int x=e?atoi(e):0;return (x>=1&&x<=4)||x==9?x:0;
 #endif
     }();return v;}
+// G6_ATTN_CTX3 (default 0 = off; decode-small.cuh context_pk3): replaces context_parts_heads / G6_ATTN_CTX2 on their calls.
+// 1 / 2 = PB 16 / 32 gathered pairs per batch over D = 256 dims per CTA, 3 / 4 = the same over D = 512. G6_ATTN_CTX3_HG =
+// 2 / 4 / 8 forces the head group (default: 4 up to 4 rows, then 8, as context_parts_heads). Bit-identical parts. FP8 KV only.
+// G6_ATTN_SEL2=<CH> (8 / 16 / 32 / 64, default 0 = off; select.cuh rank_selected): the decode selector's final sort as a
+// rank by count over CH CTAs per row. G6_IDX_GRP=<G> (1..64, default 0 = off; idx31.cuh index_scores_g): the decode
+// per-row indexer reads each key tile once for up to G rows of one session. Both bit-identical, decode run_body only.
+// Host-side, read once (before graph capture); tests may assign them.
+static int& attn_ctx3(){static int v=[]{
+#if G6_KV4
+    return 0;
+#else
+    const char* e=getenv("G6_ATTN_CTX3");const int x=e?atoi(e):0;return x>=1&&x<=4?x:0;
+#endif
+    }();return v;}
+static int& attn_ctx3_hg(){static int v=[]{const char* e=getenv("G6_ATTN_CTX3_HG");const int x=e?atoi(e):0;return x==2||x==4||x==8?x:0;}();return v;}
+static int& attn_sel2(){static int v=[]{const char* e=getenv("G6_ATTN_SEL2");const int x=e?atoi(e):0;return x==8||x==16||x==32||x==64?x:0;}();return v;}
+static int& attn_idx_grp(){static int v=[]{const char* e=getenv("G6_IDX_GRP");const int x=e?atoi(e):0;return x>=1&&x<=64?x:0;}();return v;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
     half* iq;int *ii,*io,*offsets;uint64_t* selected;SelectionState* selection;int* histogram;void* temp;size_t temp_bytes,total;
@@ -561,17 +578,31 @@ static void threshold_compact32(const G6Attn& a,Input input,Work& w,int count,cu
 }
 #endif
 static void threshold_compact(const G6Attn& a,Work& w,int count,cudaStream_t stream){threshold_compact(a,a,w,count,stream);}
+// rank = G6_ATTN_SEL2 (attn_sel2, decode run_body): rank_selected<MODE> with rank CTAs per row in place of the sort
+template<int MODE,class Input>
+static void launch_rank_selected(int rank,Input input,int start,const float* scores,const uint64_t* selected,int count,cudaStream_t st){
+    switch(rank){
+        case 8:rank_selected<MODE,8><<<dim3(8,count),256,0,st>>>(input,start,scores,selected);break;
+        case 32:rank_selected<MODE,32><<<dim3(32,count),256,0,st>>>(input,start,scores,selected);break;
+        case 64:rank_selected<MODE,64><<<dim3(64,count),256,0,st>>>(input,start,scores,selected);break;
+        default:rank_selected<MODE,16><<<dim3(16,count),256,0,st>>>(input,start,scores,selected);break;}
+}
 template<class Input>
-static cudaError_t select_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream){
-    if(a.context<=TOP){sort_selected<false><<<count,256,0,stream>>>(input,start,w.si,w.selected);return cudaGetLastError();}
+static cudaError_t select_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,int rank=0){
+    if(a.context<=TOP){
+        if(rank)launch_rank_selected<0>(rank,input,start,w.si,w.selected,count,stream);
+        else sort_selected<false><<<count,256,0,stream>>>(input,start,w.si,w.selected);
+        return cudaGetLastError();}
     if(a.context<=32768){
         threshold_compact(a,input,w,count,stream);
-        sort_selected<true><<<count,256,0,stream>>>(input,start,w.si,w.selected);
+        if(rank)launch_rank_selected<1>(rank,input,start,w.si,w.selected,count,stream);
+        else sort_selected<true><<<count,256,0,stream>>>(input,start,w.si,w.selected);
         return cudaGetLastError();
     }
 #ifdef SEL32
     threshold_compact32(a,input,w,count,stream);
-    sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
+    if(rank)launch_rank_selected<2>(rank,input,start,w.si,w.selected,count,stream);
+    else sort_selected32<<<count,256,0,stream>>>(input,start,w.selected);
     return cudaGetLastError();
 #endif
     cudaError_t e;
@@ -604,14 +635,16 @@ static void launch_index_scores31(const G6Attn& a,Input input,Work& w,int start,
     if(idx31_ok(a,n))launch_index_scores_m(a,input,w,start,n,st);else launch_index_scores(a,input,w,start,n,st);
 }
 template<class Input>
-static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-    return idx31_ok(a,n)?select_index31(a,input,w,start,n,st):select_index(a,input,w,start,n,st);
+static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int rank=0){
+    return idx31_ok(a,n)?select_index31(a,input,w,start,n,st,rank):select_index(a,input,w,start,n,st,rank);
 }
+static bool idx_keys_shared(const G6Attn& a,int n){return idx31_ok(a,n);}   // index_scores_m: keys read once per step
 #define LAUNCH_INDEX_SCORES launch_index_scores31
 #define SELECT_INDEX select_index_dec
 #else
 #define LAUNCH_INDEX_SCORES launch_index_scores
 #define SELECT_INDEX select_index
+static bool idx_keys_shared(const G6Attn&,int){return false;}
 #endif
 template<class Input>
 static cudaError_t make_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,float* diagnostic){
@@ -649,8 +682,11 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
     cudaError_t e;
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);
         if(a.reuse_indices){AMARK(1);ga::reuse<<<n,256,0,stream>>>(input,start);}
-        else{prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);AMARK(1);
-            e=SELECT_INDEX(a,input,w,start,n,stream);if(e!=cudaSuccess)return e;}
+        else{prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
+            if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,start,n,attn_idx_grp(),stream);
+            else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
+            AMARK(1);
+            e=SELECT_INDEX(a,input,w,start,n,stream,attn_sel2());if(e!=cudaSuccess)return e;}
         AMARK(2);
 #if defined(DEC_AVP) && DEC_AVP
         if(avp1_on())launch_absorb_m1(a,input,w,start,n,stream);else if(launch_absorb_rows(a,input,w,start,n,stream)){}else
