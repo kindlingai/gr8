@@ -11,6 +11,9 @@ Bugs we are still working out. Fixed ones move to CHANGELOG.md.
   are not hurt.
 - The drafter-choice log line only appears when a request switched drafters or ran MTP rounds, so a request that never
   had DFlash2 is hard to tell apart from one that ran it throughout.
+- `G6_DFL_REUSE=1` (off by default) lets a request whose prefix-reuse hit skipped into the window keep the drafter, and
+  `G6_DFL_REUSE=2` also gives it to a request that runs alone on MTP (docs/SETTINGS.md). With it on, rank 0 prints a
+  `# s2 dflash reuse` line for every request, including one that never had DFlash2.
 
 ## 2. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open
 

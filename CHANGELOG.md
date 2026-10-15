@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-16: DFlash2 after a prefix-reuse hit, and for a request left alone on MTP (G6_DFL_REUSE, off by default)
+
+- KNOWN-ISSUES #1: at TP=4 a request whose prefix-reuse hit skipped into the drafter's 2,048-position window, or that
+  was not alone at its prompt tail, ran MTP for its whole life. That is most later turns of a conversation.
+  `G6_DFL_REUSE=1` lets the hit request keep the drafter: the drafter's context starts past the hit's rows, or at the
+  window's start when its KV ring still holds the previous turn of the same conversation (S2 tracks which tokens the
+  ring's rows belong to). With fewer than `G6_DFL_REUSE_MIN` (256) context rows the request runs MTP rounds that feed
+  the drafter until it holds that many, then drafts with DFlash2. `G6_DFL_REUSE=2` also gives the drafter to a request
+  that runs alone on MTP, from its last token, the same way.
+- Drafts only: the target decides every token. Unset, no step changes. A session that starts its warm-up on MTP has
+  its chain drafted at admit, so its first MTP round verifies K drafts. Host test: `batch_dflreuse_test`.
+- With it on, rank 0 prints a `# s2 dflash reuse slot` line for every request: rounds on each drafter, where the
+  context started, the warm-up and the promotion, so a request that never had DFlash2 shows too.
+
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
 - The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for
