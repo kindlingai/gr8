@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-16: a decode step timeline for S2 (G6_S2_TIMELINE, a measurement)
+
+- `G6_S2_TIMELINE=N` (every rank, off by default) splits the time between decode steps into GPU work and host round
+  trip. Around each decode step launch (main, first-form draft, chain, DFlash2 context-only and query steps) the host
+  stamps its clock and records a CUDA event before and after the graph launch; after the fence it adds the step's GPU
+  span, input prep, launch call and fence wait to per-kind totals, and the GPU idle since the previous step's end plus
+  the host time since the previous fence to per-transition totals. Every N main steps each rank prints them.
+- Prefill quanta, mode switches and the drafter's prompt fill cut the chain; gaps over 20 ms count as breaks. With
+  `G6_DRAFT_PAR` the drafter step on its own stream is timed apart (`dfl_ctx_par` / `dfl_query_par`).
+- It sizes the host round trip that a device-side accept and launch could remove. Unset, it records nothing.
+
 ## 2026-10-16: the DFlash2 drafter step under MTP's first form, on its own stream (G6_DRAFT_PAR, off by default)
 
 - In a round of a request that decodes alone with DFlash2, the drafter step ran after MTP's first form (and after the
