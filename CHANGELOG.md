@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-16: the fabric's queue pairs take the ports' active MTU, not 4096
+
+- Every RDMA queue pair was moved to RTR with `path_mtu = IBV_MTU_4096`, whatever the port could carry. On a switched
+  RoCE fabric whose interfaces run a 1500-byte MTU the ports' active MTU is 1024, and the first boot failed with an S2
+  prefill fabric error. With this change the same cluster boots and serves at 1500.
+- Each rail now reads its port's active MTU at init (`ibv_query_port`) and sends it with its QP in the bootstrap; each
+  connection takes the lower of the two ends' values, as the KV node's verbs code already does
+  (`engine/kvman-rs/src/remote/verbs.rs`). After RTS the QP is read back and its path MTU checked, and every rail and QP
+  logs its MTU.
+- Ports at 4096 behave as before. The bootstrap's `QPInfo` grows one field, so every rank must run the same build (the
+  launcher's handshake compares engine builds already). `fabric_mtu_test` (host) checks the choice.
+
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
 - The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for
