@@ -428,6 +428,7 @@ private:
     {
         g6rt::SpecLen f;
         f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each;
+        std::copy(o.table, o.table + g6rt::SpecLen::KX + 2, f.table);
         return f;
     }
     // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round

@@ -69,6 +69,20 @@ static double run(const std::vector<int>& levels, int fixed, bool mtp, const std
 int main()
 {
     {
+        double values[8] = {};
+        check(parse_spec_costs("43,52.5,59.7,68.9,77.5,86.5,95.2,104.9", values, 8)
+              && values[0] == 43 && values[7] == 104.9, "parse the verify override");
+        check(parse_spec_costs(" 8.1, 4.3, 2.0 ", values, 3, true)
+              && values[0] == 8.1 && values[2] == 2.0, "parse drafting costs with whitespace");
+        check(parse_spec_costs("0,0,0", values, 3, true), "zero drafting costs are allowed");
+        check(!parse_spec_costs(nullptr, values, 3), "reject a missing cost list");
+        for (const char* bad : {"", "1,2", "1,2,3,4", "1,,3", ",1,2", "1,2,3,", "1,2,3junk",
+                                "1 2 3", "nan,2,3", "inf,2,3", "-1,2,3", "0,2,3", "1e999,2,3", "1e-999,2,3"})
+            check(!parse_spec_costs(bad, values, 3), bad);
+        check(!parse_spec_costs("-1,2,3", values, 3, true), "negative drafting cost is rejected");
+        check(!parse_spec_costs("nan,2,3", values, 3, true), "NaN drafting cost is rejected");
+    }
+    {
         SpecLen sl;
         sl.set_levels({2, 3, 5, 7});
         sl.draft_round = 5.6;
