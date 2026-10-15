@@ -12,6 +12,7 @@ On every box, with the NVIDIA container toolkit (on DGX OS by default):
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
     cp docker/.env.example docker/.env        # then set MODEL, DRAFTER and PEERS (the same file on every box)
+    docker compose -f docker/compose.yaml pull                     # the latest image
     docker compose -f docker/compose.yaml run --rm gr8 prepare    # this box's part of the model, ~90 GB at TP=4
     docker compose -f docker/compose.yaml up -d
 
@@ -32,6 +33,19 @@ cluster with it: the other boxes restart and wait for it, retrying every `JOIN_T
 needs to stop a wedged rank should end its `g6m4`, not its container: the supervisor then reports the failure, and
 every box restarts and boots again together. Killing the container takes the supervisor with it, so no supervisor
 reports the failure.
+
+## Updating
+
+CI publishes `ghcr.io/kindlingai/gr8:latest` from every push to main, and `sha-<commit>` and release tags beside it.
+Compose pulls an image only when the box has none, so a box keeps the image it first pulled until you pull again. To
+update, on every box:
+
+    docker compose -f docker/compose.yaml pull
+    docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 down     # once, on any box: stops every box
+    docker compose -f docker/compose.yaml up -d
+
+Every box must run the same image: the boxes compare their engine builds before loading, and refuse to boot with a mix.
+To stay on one build, set `GR8_IMAGE=ghcr.io/kindlingai/gr8:sha-<commit>` in `docker/.env` on every box.
 
 `bench` (bench/pbench.py) appends its results to `out/pbench-results.jsonl` in the home volume.
 

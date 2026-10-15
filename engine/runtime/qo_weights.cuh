@@ -340,6 +340,7 @@ inline QpRoll* qp_roll_new(int S, bool ser, const std::vector<Find>& finds, int 
         G6RT_CK(cudaMemset(const_cast<void*>(w.uk.data), 0, (size_t)QP_HEADS * 192 * 512 * 2));   // defined bytes for create
         G6RT_CK(cudaMemset(const_cast<void*>(w.uv.data), 0, (size_t)QP_HEADS * 256 * 512 * 2));
     }
+    G6RT_CK(cudaStreamSynchronize(nullptr));   // the memsets (legacy stream) before the rolls write on the non-blocking R->ss
     for (size_t k = 0; k < layers.size(); ++k) if (qpl[k]) qpw[k] = R->slot[k % S];
     R->have.assign(S, -1);
     G6RT_CK(cudaStreamCreateWithFlags(&R->ss, cudaStreamNonBlocking));

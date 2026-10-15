@@ -11,6 +11,11 @@
 #include <set>
 
 namespace g6s2 {
+// wall clock in ms since the Unix epoch: the ranks' logs carry no timestamps, and the skew between ranks at a bind or a
+// prefill start is what a silent GPU wait timeout (G6_SPIN_TIMEOUT_CYC) turns into an error word
+inline long long s2_wall_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 // Use g6m4's EXISTING capture arrays/main_enqueue. In particular solo_main must
 // replay its production split3 A/B graphs, not capture an S2 replacement graph.
 struct NativeContext {
@@ -102,12 +107,24 @@ class NativeDispatch {
         const auto t0 = std::chrono::steady_clock::now(); fence();
         if (old >= 0) g6rt::s2_hprev_from_solo(c_.draft,old,c_.stream);
         if (next >= 0) {
-            const int base = c_.main.s2->base[next];
-            require(base == c_.draft.d.s2->base[next], "main/draft survivor bases differ");
-            // the survivor's own run (pages[next], set by bind), not the last solo run's pages
-            const int pages = c_.main.s2->pages[next];
-            require(pages > 0 && pages == c_.draft.d.s2->pages[next], "main/draft survivor runs differ");
-            g6rt::s2_solo_run(c_.main,base,pages); g6rt::s2_solo_run(c_.draft.d,base,pages);
+            // the survivor's own pages (set by bind)
+            const std::vector<int>& run = c_.main.s2->run[next];
+            const bool ex = c_.main.s2->exclusive[next];
+            require(!run.empty() && run == c_.draft.d.s2->run[next] && ex == c_.draft.d.s2->exclusive[next]
+                     && c_.main.s2->ex_split[next] == c_.draft.d.s2->ex_split[next], "main/draft survivor runs differ");
+            if (ex)
+            {
+                // a run past R: on the pool's page classes its own list -> its CP map; the identity run -> the
+                // tables as built. ex_split records which at bind (the pool's mode), not the list's shape
+                if (c_.main.s2->ex_split[next])
+                {
+                    const int most = std::max(c_.main.s2->pool_pages, c_.draft.d.s2->pool_pages);
+                    g6rt::s2_solo_cp_pages(c_.main, run, most);
+                    g6rt::s2_solo_cp_pages(c_.draft.d, run, most);
+                }
+                else { g6rt::s2_solo_built(c_.main); g6rt::s2_solo_built(c_.draft.d); }
+            }
+            else { g6rt::s2_solo_pages(c_.main,run); g6rt::s2_solo_pages(c_.draft.d,run); }
             g6rt::s2_hprev_to_solo(c_.draft,next,c_.stream);
         }
         c_.main.s2on = c_.draft.d.s2on = next < 0; fence();
@@ -136,6 +153,7 @@ class NativeDispatch {
         auto& fabric = draft ? c_.draft_fabric : c_.main_fabric;
         const int rows = l.step.M();
         g6rt::StepIn input{}; g6rt::S2In layout{}; native_inputs(l,input,layout);
+        if (l.solo >= 0) input.page_bound = model.s2->pool_pages;   // the solo tables hold -1 past the session's pages
         if (draft && c_.main.rs) for (int r = 0; r < rows; ++r) input.srow[r].inv_temp = 0.f;   // rejection sampling: greedy drafts
         require(model.s2on == (l.solo < 0), "native solo mode differs from host");
         model.s2->h = layout;
@@ -181,6 +199,7 @@ class NativeDispatch {
         return {out.tok,out.tok + rows};
     }
     void prefill(const Slot& slot,const Payload& payload,uint32_t first,uint32_t rows) {
+        const auto t0 = std::chrono::steady_clock::now();   // for the error-word line: a ~10 s quantum is a GPU wait timeout
         require(rows <= uint64_t(c_.prefill_rows)*(c_.two_lanes?2:1), "prefill quantum exceeds native lanes");
         c_.begin_prefill(slot); // real run/view selector supplied by TP4/fc2
         const int a = int(first), ma = std::min(int(rows),c_.prefill_rows), mb = int(rows)-ma;
@@ -207,8 +226,23 @@ class NativeDispatch {
             g6rt::pf_draft_inputs(dq,mb,payload.prompt.data()+a+ma+1,pos.data()+ma);
             g6rt::pf_draft(c_.draft,dq,p2.x,mb,a+ma+mb,c_.stream); fence();
         }
-        require(!*c_.prefill_fabric.dev().error && (!mb || !*c_.prefill_fabric2.dev().error) &&
-                !g6rt::attn_errors(c_.main) && !g6rt::attn_errors(c_.draft.d) && !(c_.extra_error && c_.extra_error()), "S2 prefill fabric/attention error");
+        {
+            // Name every word before the fail-closed require, as launch() does for steps. Codes: fabric 0x61.. = a GPU wait
+            // for a peer's rows timed out (glue::ERR_AR | coll << 8 | peer), 0x70../0x71../0x74.. = the proxy (it printed);
+            // attention bits 1 position, 2 page, 4 NaN, 8 reuse row, 16 no end, 32 cell bounds; extra 0x63000400 = a
+            // missing owner page in the CP staging fill, 0x63000800 = a staging hash mismatch, 0x63000c00 = a staging wait
+            // timed out, 0x65.. = the QO pair wire (qp_wire.h)
+            const unsigned f1 = *c_.prefill_fabric.dev().error, f2 = mb ? *c_.prefill_fabric2.dev().error : 0u;
+            int lm = -1, ld = -1;
+            const unsigned am = g6rt::attn_errors_at(c_.main, &lm), ad = g6rt::attn_errors_at(c_.draft.d, &ld);
+            const unsigned ce = c_.extra_error ? c_.extra_error() : 0u;
+            if (f1 || f2 || am || ad || ce)
+                fprintf(stderr,"# S2 prefill error words rank %d: fabric %08x/%08x attn main %08x (layer %d) draft %08x (layer %d) extra %08x "
+                        "(request %llu first %u rows %u, %.1f ms into the quantum, at %lld ms)\n",c_.main.rank,f1,f2,am,lm,ad,ld,ce,
+                        (unsigned long long)slot.req.id,first,rows,
+                        std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(),(long long)s2_wall_ms());
+            require(!f1 && !f2 && !am && !ad && !ce, "S2 prefill fabric/attention error");
+        }
         c_.end_prefill(); // restore decode views before yielding; NEVER late_draft
     }
 public:
@@ -245,7 +279,7 @@ public:
     //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
-    // contexts, bases and source rows are read from S2In at launch. Call before the first launch / before connecting.
+    // contexts and source rows are read from S2In at launch. Call before the first launch / before connecting.
     void capture_all(unsigned sessions, int mtp, int chunk) {
         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
@@ -271,7 +305,7 @@ public:
             g6rt::S2In h{};
             h.ns = chain ? M : 1; h.cls = cls;
             for (int j = 0; j < h.ns; ++j) {
-                h.sess[j] = j; h.row0[j] = chain ? j : 0; h.rows[j] = chain ? 1 : M; h.ctx[j] = model.bk[k]; h.base[j] = 0; h.src0[j] = 0;
+                h.sess[j] = j; h.row0[j] = chain ? j : 0; h.rows[j] = chain ? 1 : M; h.ctx[j] = model.bk[k]; h.src0[j] = 0;
             }
             model.s2->h = h; model.s2->bucket = k;
             for (int j = 0; j < g6rt::S2N; ++j) model.s2->bk[j] = k;
@@ -302,7 +336,6 @@ public:
     }
     DispatchHooks hooks() {
         return {
-            [&](bool draft,int slot){return (draft?c_.draft.d:c_.main).s2->base[slot];},
             [&](bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);},
             [&](int old,int next){mode(old,next);},
             [&](const Launch& l){return launch(l);},

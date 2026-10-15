@@ -1,4 +1,4 @@
-// g6 prefill binder: one rank's pack tensors of one layer -> kernel arguments + launch helpers for the
+// gr8 prefill binder: one rank's pack tensors of one layer -> kernel arguments + launch helpers for the
 // prefill path, M >= 256 rows (M3b). Same style as bind.cuh (plain tensor struct in, launch helpers out); all
 // buffers are DEVICE memory. Not meant for a CUDA graph (the expert grids are sized for the worst case of M).
 //

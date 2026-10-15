@@ -13,7 +13,8 @@ It follows the engine code (engine/runtime/s2/ingress.h, sessions.h, service.h, 
     unknown (already ended) -> nothing
   - anything the real engine would reject (bad header, epoch, duplicate/decreasing id, hash mismatch, request over the
     pool) ends the epoch: DIR/abort.s2, exit 3. DIR/quit = clean exit 0.
-Output tokens are a pure function of the prompt and the position, so a stream can be checked for cross-talk.
+Output tokens are a pure function of the prompt and the position, so a stream can be checked for cross-talk. A
+request's insert rule (`ins after:unless:ids`, ready.s2 version 3) puts its tokens in place of the reply's after+1-th.
 
 usage: fake_s2_engine.py DIR0 [DIR1 ...] [--epoch 7] [--sessions 4] [--pool-rows 20000] [--mtp 2] [--round-ms 20]
 """
@@ -58,10 +59,17 @@ def parse_request(data: bytes):
     if not _:
         raise ValueError('request missing prompt line')
     w = line.decode().split()
-    if len(w) not in (10, 12, 14, 16) or w[0] != 'n_gen' or w[2] != 'temp' or w[4] != 'seed' or w[6] != 'min' or w[8] != 'stop':
+    if len(w) % 2 or len(w) > 18 or w[0] != 'n_gen' or w[2] != 'temp' or w[4] != 'seed' or w[6] != 'min' or w[8] != 'stop':
         raise ValueError(f'invalid request header {line!r}')
     r = {'n_gen': number(w[1]), 'temp': float(w[3]), 'seed': number(w[5]), 'min': number(w[7]),
-         'stop': [] if w[9] == '-' else [number(x) for x in w[9].split(',')], 'top_p': 1.0, 'lp': None, 'plp': None}
+         'stop': [] if w[9] == '-' else [number(x) for x in w[9].split(',')], 'top_p': 1.0, 'lp': None, 'plp': None,
+         'ins': None}
+    if len(w) >= 12 and w[-2] == 'ins':      # the last field (sessions.h parse_request)
+        after, unless, ids = w[-1].split(':')
+        r['ins'] = (number(after), -1 if unless == '-1' else number(unless), [number(x) for x in ids.split(',')])
+        if not 1 <= len(r['ins'][2]) <= 64 or max(r['ins'][2]) >= VOCAB:
+            raise ValueError('invalid ins header')
+        w = w[:-2]
     if len(w) >= 12:
         if w[10] != 'top_p':
             raise ValueError('invalid top_p header')
@@ -71,6 +79,8 @@ def parse_request(data: bytes):
                 or not 0 <= number(w[i + 1]) <= 20:
             raise ValueError('invalid lp/plp header')
         r[w[i]] = number(w[i + 1])
+    if r['ins'] and r['lp'] is not None:
+        raise ValueError('ins with lp')
     return r, rest
 
 
@@ -174,7 +184,8 @@ class Fake:
             f = open(os.path.join(self.d0, f'resp.{q["id"]}'), 'w', buffering=1)
             f.write(f'a {self.a.epoch} {slot} {self.gen[slot]} {self.pages_used - q["pages"]} {q["pages"]}\n')
             self.res[slot] = dict(q, slot=slot, f=f, emitted=0, rounds=0, acc=[0] * (self.a.mtp + 1), stop_id=-1,
-                                  ready_at=time.monotonic() + self.a.prefill_ms / 1e3, done=False)
+                                  ready_at=time.monotonic() + self.a.prefill_ms / 1e3, done=False,
+                                  armed=q['req']['ins'] is not None)
             self.max_resident = max(self.max_resident, len(self.res))
             self.say(f'RESIDENT {len(self.res)} (admitted {q["id"]} slot {slot})')
             self.dirty = True
@@ -200,8 +211,15 @@ class Fake:
             req, ids, done = s['req'], [], False
             for _ in range(1 + acc):
                 n = s['emitted'] + len(ids) + 1
+                if s['armed'] and n - 1 == req['ins'][0]:     # the insert takes this token's place, and the round ends
+                    s['armed'] = False
+                    ids += req['ins'][2][:req['n_gen'] - n + 1]
+                    done = s['emitted'] + len(ids) >= req['n_gen']
+                    break
                 stop_here = req['stop'] and self.a.stop_at and n == max(self.a.stop_at, req['min'] + 1)
                 ids.append(req['stop'][0] if stop_here else token_at(s['prompt'], n))
+                if s['armed'] and ids[-1] == req['ins'][1]:
+                    s['armed'] = False
                 if stop_here:
                     s['stop_id'] = ids[-1]
                     done = True
@@ -211,7 +229,7 @@ class Fake:
                     break
             s['emitted'] += len(ids)
             s['rounds'] += 1
-            s['acc'][len(ids) - 1] += 1
+            s['acc'][min(len(ids), self.a.mtp + 1) - 1] += 1
             if req['plp'] is not None and s['rounds'] == 1:     # the first round (counted above)
                 s['f'].write(''.join(lp_line(t, req['plp'], f'p {j}') for j, t in enumerate(s['prompt'][1:], 1)))
             if req['lp'] is not None:
@@ -237,7 +255,7 @@ class Fake:
                     self.die(f'S2 directory {d} is not fresh')
         time.sleep(a.ready_delay)
         tmp = os.path.join(self.d0, 'ready.s2.tmp')
-        open(tmp, 'w').write(f'G6S2 2 {a.epoch} {len(a.dirs)} {a.pool_rows} {a.mtp} {self.guard} {a.max_rows} 20\n')
+        open(tmp, 'w').write(f'G6S2 {a.ready_version} {a.epoch} {len(a.dirs)} {a.pool_rows} {a.mtp} {self.guard} {a.max_rows} 20\n')
         os.rename(tmp, os.path.join(self.d0, 'ready.s2'))
         self.say('ready')
         next_round = time.monotonic()
@@ -273,5 +291,6 @@ if __name__ == '__main__':
     ap.add_argument('--round-ms', type=float, default=20.0)
     ap.add_argument('--prefill-ms', type=float, default=30.0)
     ap.add_argument('--ready-delay', type=float, default=0.0)
+    ap.add_argument('--ready-version', type=int, default=3, help='2: an engine without the insert rule')
     ap.add_argument('--stop-at', type=int, default=0, help='first stop id is token #N of a request that has stop ids (0 = never)')
     sys.exit(Fake(ap.parse_args()).run())

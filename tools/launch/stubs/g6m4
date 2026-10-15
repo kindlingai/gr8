@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Stub engine for the supervisor tests: records its argv and environment, then plays one rank's file side with the
-repo's fake engines. S2 rank 0 runs frontend/tests/fake_s2_engine.py on its own directory; the other S2 ranks wait for
-quit. One-request ranks write serve/ready and run frontend/tests/fake_serve_engine.py."""
+"""Stub engine for the supervisor tests: records its argv and environment, then plays one rank's file side. Rank 0 runs
+frontend/tests/fake_s2_engine.py on its --serve directory; the other ranks wait for quit."""
 import json
 import os
 import sys
@@ -21,16 +20,9 @@ os.makedirs('out', exist_ok=True)
 with open('out/stub.json', 'w') as f:
     json.dump({'argv': argv, 'env': {k: v for k, v in os.environ.items() if k.startswith('G6_')},
                'ld': os.environ.get('LD_LIBRARY_PATH'), 'cwd': os.getcwd()}, f)
-fakes = os.path.join(REPO, 'frontend', 'tests')
-if val('--s2-port'):                  # a DEC_S2 build serves --serve DIR through S2
-    d = val('--serve')
-    if rank == 0:
-        os.execv(sys.executable, [sys.executable, os.path.join(fakes, 'fake_s2_engine.py'), d,
-                                  '--epoch', val('--s2-epoch'), '--mtp', val('--mtp', '2'), '--ready-delay', '0.5'])
-    while not os.path.exists(os.path.join(d, 'quit')):
-        time.sleep(0.2)
-    sys.exit(0)
 d = val('--serve')
-time.sleep(0.5)
-open(os.path.join(d, 'ready'), 'w').close()
-os.execv(sys.executable, [sys.executable, os.path.join(fakes, 'fake_serve_engine.py'), d, '--rank', str(rank)])
+if rank == 0:
+    os.execv(sys.executable, [sys.executable, os.path.join(REPO, 'frontend', 'tests', 'fake_s2_engine.py'), d,
+                              '--epoch', val('--s2-epoch'), '--mtp', val('--mtp', '2'), '--ready-delay', '0.5'])
+while not os.path.exists(os.path.join(d, 'quit')):
+    time.sleep(0.2)

@@ -9,9 +9,9 @@ model, cut to the first --layers layers, in fp32, with every matrix set to the v
 The weights: the release's MXFP8 matrices as stored, kv_b and the embedding in BF16, int4 q_b / o_proj as stored,
 and the trellis matrices as --form says: `rounded` takes the MXFP8 / int4 values src/release.rs rounds them to for decode
 (engine/loader-rs/tests/release_check.py proves the planner's bytes equal these), `trellis` the release's decoded
-values. The experts come from loader/exlr8.py at the width manifest's widths. Each attention and MLP runs on g6's own
-input to it (the residual dump), over every position, and its output is compared with g6's residual delta. Then the
-whole cut model's logits are compared with g6's. The same in BF16 gives the size of a BF16 model's own rounding.
+values. The experts come from loader/exlr8.py at the width manifest's widths. Each attention and MLP runs on gr8's own
+input to it (the residual dump), over every position, and its output is compared with gr8's residual delta. Then the
+whole cut model's logits are compared with gr8's. The same in BF16 gives the size of a BF16 model's own rounding.
 Routed experts are decoded when a token first picks one, so the cut model needs about 15 GB. Needs torch and
 transformers with glm_moe_dsa.
 """
@@ -180,8 +180,8 @@ def build(a, X, L, dev):
 
 
 def sublayers(model, g6, dev, dtype):
-    """Each sublayer's output on g6's own input to it: the attention of layer i on g6's residual before layer i, the MLP
-    on g6's residual after that attention. [(attention, MLP)] per layer, [T, H] fp32."""
+    """Each sublayer's output on gr8's own input to it: the attention of layer i on gr8's residual before it, the MLP
+    on gr8's residual after that attention. [(attention, MLP)] per layer, [T, H] fp32."""
     T = g6.shape[1]
     pos = torch.arange(T, device=dev)[None]
     out, topk = [], None
@@ -235,17 +235,17 @@ def main():
         model.model.layers[i].mlp.gate.e_score_correction_bias = b
     bfr, bf_logits = sublayers(model, g6, dev, torch.bfloat16), logits_of(model, ids, dev)
     print(f'{len(ids)} positions, tokens {ids}')
-    print('| sublayer, on g6\'s input | g6 vs fp32 reference (rel L2) | BF16 reference vs fp32 |\n|---|---:|---:|')
+    print('| sublayer, on gr8\'s input | gr8 vs fp32 reference (rel L2) | BF16 reference vs fp32 |\n|---|---:|---:|')
     for i in range(L):
         for k, what in ((0, 'attention'), (1, 'MLP')):
             d_g6 = torch.from_numpy(g6[2 * i + k + 1] - g6[2 * i + k])
             print(f'| layer {i} {what} | {rel(d_g6, ref[i][k]):.2e} | {rel(bfr[i][k], ref[i][k]):.2e} |')
     top_g6, top_ref, top_bf = g6l.argmax(-1), ref_logits.argmax(-1), bf_logits.argmax(-1)
-    print(f'logits: rel L2 g6 {rel(g6l, ref_logits):.2e}, BF16 {rel(bf_logits, ref_logits):.2e}; argmax agrees with '
+    print(f'logits: rel L2 gr8 {rel(g6l, ref_logits):.2e}, BF16 {rel(bf_logits, ref_logits):.2e}; argmax agrees with '
           f'fp32 at {(top_g6 == top_ref).sum().item()}/{len(ids)} positions (BF16 {(top_bf == top_ref).sum().item()})')
     lp = lambda x: torch.log_softmax(x.double(), -1)
     kl = lambda p, q: (lp(p).exp() * (lp(p) - lp(q))).sum(-1).mean().item()
-    print(f'KL(fp32 || g6) {kl(ref_logits, g6l):.2e}, KL(fp32 || BF16) {kl(ref_logits, bf_logits):.2e} nats per position')
+    print(f'KL(fp32 || gr8) {kl(ref_logits, g6l):.2e}, KL(fp32 || BF16) {kl(ref_logits, bf_logits):.2e} nats per position')
 
 
 if __name__ == '__main__':

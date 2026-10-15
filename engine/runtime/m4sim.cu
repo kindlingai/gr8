@@ -28,23 +28,125 @@
 //                (0 = top_p off; 256 is the served setting; misses printed at the end)
 // [--s2] (DEC_S2 build, needs --mtp, no --prefill / --serve): every --prompt is a session (<= 8) and their rows share
 //        steps (s2_batch.h mtp_batch, s2.cuh). Lines per session: "q<j> " + the solo line (step / draft / chain /
-//        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped
+//        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped.
+//        G6_S2_INSERT=q:after:unless:id,id,..[;..]: session q's insert rule (s2_batch.h), as an S2 request's `ins`
+//        G6_S2_GROW=P: the runs come from a pool of P pages (s2/pool.h) and grow on demand: each session starts with its
+//        prompt + 1 + guard rows, grows to its length + guard before each round, sits a round out when the pages would
+//        leave the pool unsafe, and gives its pages back when it finishes (cleared when another session takes them)
 // [--spec-accept coupled|rejection]  as g6m4 (needs --mtp, no --s2): rejection = greedy drafts, accepted by rejection sampling
 // [--spec-adaptive [--spec-levels 1,2,4]]  as g6m4 (needs --mtp, no --s2): the drafts each round verifies (spec_len.h)
+// With --reuse-prefix, before each hit's prefill (s2/kv_tier.cuh):
+//   G6_KV_TIER_CHECK=STORE (mem:, ssd:PATH, remote:HOST:PORT): every rank's reused pages go to a block store, are
+//        poisoned, and come back. The lines printed must be the run's without it. Past G6_CP_R the reused rows go as the
+//        pool stores a run's tail: each rank's shard of the attention caches, and every logical page's replicated parts
+//   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
 #include "prefill.cuh"
 #include "serve.h"
+#include "s2/kv_tier.cuh"
 #ifdef DEC_S2
 #include <map>
 #include <set>
 #include "s2_batch.h"
+#include "s2/pool.h"
 #endif
 
 using namespace g6rt;
 
 constexpr int NR = g6nr::NR;           // simulated ranks: six, or four in a -DG6_NR=4 build
+
+// G6_KV_TIER_CHECK / G6_KV_RANKS_CMP (the header): logical pages 0..n-1 of every rank, main model then draft
+static void kv_tier_check(std::vector<Model>& R, std::vector<Draft>& DR, int n, int cap, cudaStream_t st)
+{
+    static std::vector<std::unique_ptr<g6s2::KvTiers>> tiers;
+    const char* spec = getenv("G6_KV_TIER_CHECK");
+    std::vector<std::vector<uint8_t>> blocks(R.size());
+    for (size_t r = 0; r < R.size(); ++r)
+    {
+        std::vector<const G6AttnBinding*> bs;
+        for (const Layer& y : R[r].layers) bs.push_back(&y.ab);
+        if (!DR.empty()) for (const Layer& y : DR[r].d.layers) bs.push_back(&y.ab);
+        // logical page -> physical page through the first binding's table (identity, or the CP map's replicated prefix)
+        std::vector<int> table(n);
+        G6RT_CK(cudaMemcpy(table.data(), bs[0]->args.block_table, n * sizeof(int), cudaMemcpyDeviceToHost));
+        std::vector<int> pages;
+        for (int t : table) if (t >= 0) pages.push_back(t);
+        if (tiers.size() <= r)
+        {
+            tiers.emplace_back(new g6s2::KvTiers(bs));
+            tiers.back()->add(spec ? spec : "mem:", "m4sim-r" + std::to_string(r), uint64_t(cap / 64 + 2) << 22);   // 4 MiB a page block
+        }
+        g6s2::KvTiers& t = *tiers[r];
+        // past R: the copies the pool queues for a run's tail (kvman-rs stash.rs Part), through the store and back
+        const int bp = R[r].cp.on ? R[r].cp.R / 64 : n, nr = g6nr::NR;
+        const uint32_t per = t.blocks().per_slot();
+        if (spec && n > bp && per)
+        {
+            std::vector<g6kv_io> out, in;
+            uint64_t slot = 0;
+            for (int p = 0; p < bp; ++p) out.push_back(g6kv_io{0, (uint32_t)p, 0, 0, slot++, 0, 0, 0});
+            const int tail = n - bp, own = (tail + nr - 1) / nr;
+            for (int j = 0; j < own; ++j) out.push_back(g6kv_io{0, (uint32_t)(bp + j), 0, 0, slot++, 0, 1, 0});
+            for (int i = 0; i < tail; ++i) out.push_back(g6kv_io{0, (uint32_t)(bp + i), 0, 0, slot + i / per, 0, 2, i % per});
+            // G6_KV_TIER_CHECK_DROP=PART (0, 1 or 2): those copies do not come back (the check must then see the poison)
+            const int drop = getenv("G6_KV_TIER_CHECK_DROP") ? atoi(getenv("G6_KV_TIER_CHECK_DROP")) : -1;
+            for (g6kv_io x : out) if ((int)x.part != drop) { x.kind = 2; in.push_back(x); }
+            t.run(out, st);
+            for (const G6AttnBinding* b : bs)   // poison what the copies hold: every page they name, as each part reads it
+            {
+                const int phys = b->args.page_count;   // the indexer keys sit on the latent's pages
+                for (const g6kv_io& x : out)
+                {
+                    if (!(x.part == 0 || (x.part == 1 && b->args.cp_nr && (int)x.page < phys) || (x.part == 2 && !b->args.cp_nr))) continue;
+                    G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)x.page * 64 * g6kv::ROW, 0x7f, 64 * g6kv::ROW, st));
+                    if (b->args.index_cache)
+                        G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)x.page * 64 * g6kv::IDX_ROW, 0x7f, 64 * g6kv::IDX_ROW, st));
+                }
+            }
+            G6RT_CK(cudaStreamSynchronize(st));
+            t.run(in, st);
+            if (r == 0)
+                fprintf(stderr, "# kv tier check: past R, %d pages: %d below, %d of this rank's shard, %d replicated (%u a block)\n", n, bp,
+                        own, tail, per);
+            continue;
+        }
+        if (getenv("G6_KV_RANKS_CMP"))
+            for (size_t i = 0; i < pages.size(); i += t.blocks().batch())
+            {
+                const std::vector<int> part(pages.begin() + long(i), pages.begin() + long(std::min(pages.size(), i + t.blocks().batch())));
+                t.blocks().copy(part, true, st);
+                for (size_t j = 0; j < part.size(); ++j)
+                    blocks[r].insert(blocks[r].end(), t.blocks().host(int(j)), t.blocks().host(int(j)) + t.blocks().block_bytes());
+            }
+        if (spec)
+            for (size_t i = 0; i < pages.size(); i += t.blocks().batch())
+            {
+                const std::vector<int> part(pages.begin() + long(i), pages.begin() + long(std::min(pages.size(), i + t.blocks().batch())));
+                t.round_trip(part, st, [&] {
+                    for (const G6AttnBinding* b : bs)
+                        for (int p : part)
+                        {
+                            G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.mla_cache + (size_t)p * 64 * g6kv::ROW, 0x7f, 64 * g6kv::ROW, st));
+                            if (b->args.index_cache)
+                                G6RT_CK(cudaMemsetAsync((uint8_t*)b->args.index_cache + (size_t)p * 64 * g6kv::IDX_ROW, 0x7f, 64 * g6kv::IDX_ROW, st));
+                        }
+                    G6RT_CK(cudaStreamSynchronize(st));
+                });
+            }
+    }
+    if (spec) fprintf(stderr, "# kv tier check: %d pages of %zu ranks through %s and back\n", n, R.size(), tiers[0]->describe(0).c_str());
+    if (getenv("G6_KV_RANKS_CMP"))
+        for (size_t r = 1; r < R.size(); ++r)
+        {
+            size_t diff = 0, first = SIZE_MAX;
+            for (size_t i = 0; i < blocks[r].size() && i < blocks[0].size(); ++i)
+                if (blocks[r][i] != blocks[0][i]) { ++diff; if (first == SIZE_MAX) first = i; }
+            fprintf(stderr, "# kv ranks: rank %zu vs rank 0, %d pages, %zu bytes: %zu differ%s\n", r, n, blocks[r].size(), diff,
+                    diff ? (" (first at byte " + std::to_string(first) + ")").c_str() : "");
+        }
+}
 
 // the NIC: every rank's send slot of collective c -> the shared recv slot [c][rank], then the tail. grid NR, block 128.
 struct Loop
@@ -275,7 +377,7 @@ int main(int argc, char** argv)
                        (cp_L.send_bytes() + cp_L.recv_bytes()) / 1e9);
 #endif
     // --s2 on a CP build (G6_CP on): S2 below R. Every session's run <= G6_S2_BELOW rows (default G6_CP_R,
-    // multiple of 64, <= G6_CP_R), on the CP binding as built; runs are granted by G6_S2_RUNS or the default layout
+    // multiple of 64, <= G6_CP_R), on the CP binding as built. G6_S2_RUNS, G6_S2_PAGES or the default layout grant the runs
     int s2_below = 0;
 #if defined(G6_CP) && G6_CP
     if (s2mode && cp_on)
@@ -495,17 +597,47 @@ int main(int argc, char** argv)
             if (v.size() % 2 || (int)v.size() / 2 > (int)plans.size()) die("G6_S2_RUNS: base:pages per slot");
             for (size_t k = 0; k + 1 < v.size(); k += 2)
             {
-                for (Model& m : R) s2_set_run(m, (int)k / 2, v[k], v[k + 1]);
-                for (Draft& D : DR) s2_set_run(D.d, (int)k / 2, v[k], v[k + 1]);
+                for (Model& m : R) s2_set_pages(m, (int)k / 2, s2_run_list(v[k], v[k + 1]));
+                for (Draft& D : DR) s2_set_pages(D.d, (int)k / 2, s2_run_list(v[k], v[k + 1]));
             }
         }
+        // G6_S2_PAGES=seed[,pages]: slot q's run = `pages` (default run_pages) pages of a seeded shuffle of the pool, from
+        // position q x pages, on every model: scattered, non-contiguous lists. Output must equal the default layout's.
+        if (const char* e = getenv("G6_S2_PAGES"))
+        {
+            const std::vector<int> v = parse_ints(e);
+            int pool = R[0].s2->pool_pages, run = R[0].s2->run_pages;
+            for (const Draft& D : DR) { pool = std::min(pool, D.d.s2->pool_pages); run = std::min(run, D.d.s2->run_pages); }
+            const int n = v.size() > 1 ? v[1] : run;
+            if (v.empty() || v.size() > 2 || n < 1 || n > run || (int64_t)n * (int64_t)plans.size() > pool)
+                die("G6_S2_PAGES=seed[,pages]: slots x pages must fit the pool, pages <= the run size");
+            std::vector<int> perm = s2_run_list(0, pool);
+            uint64_t x = (uint64_t)v[0] * 0x9E3779B97F4A7C15ull + 1;
+            for (int i = pool - 1; i > 0; --i)        // Fisher-Yates on splitmix64, so every platform draws the same lists
+            {
+                uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
+                std::swap(perm[i], perm[z % (uint64_t)(i + 1)]);
+            }
+            for (int q = 0; q < (int)plans.size(); ++q)
+            {
+                const std::vector<int> list(perm.begin() + (size_t)q * n, perm.begin() + (size_t)(q + 1) * n);
+                for (Model& m : R) s2_set_pages(m, q, list);
+                for (Draft& D : DR) s2_set_pages(D.d, q, list);
+            }
+            fprintf(stderr, "# s2: G6_S2_PAGES seed %d: %d shuffled pages per slot of a pool of %d\n", v[0], n, pool);
+        }
+        if (getenv("G6_S2_GROW") && (getenv("G6_S2_RUNS") || getenv("G6_S2_PAGES"))) die("G6_S2_GROW takes the runs from its own pool: no G6_S2_RUNS / G6_S2_PAGES");
     }
 #endif
     // Gate: DEC_S2 CP build, --prefill, no --s2: G6_S2_PFBASE=B[,pages] runs every sequence as one session
-    // at base page B below R: tables B + i (s2_solo_run, main and draft), staged prefill index keys from page B
-    // (Model::s2_pf_base), StepIn::base_page = B, s2_reset_run instead of reset(). Stdout must equal the run at B = 0.
+    // at base page B below R: tables B + i (s2_solo_pages, main and draft), staged prefill index keys through them
+    // (Model::s2_pf_table), StepIn::page_bound = the pool's pages, and s2_reset_pages clears the run. Stdout must equal
+    // the run at B = 0.
     // G6_S2_PFPOISON=1: fill every cache with 0x3c bytes first, so a read outside the run changes the output.
     int pf_base = 0;
+    int pf_xlist = 0;            // G6_S2_XLIST: the shuffled two-class list every sequence runs on (past R)
+    std::vector<int> pf_xlist_pages;
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
     int pf_pages = 0;
     if (const char* e = getenv("G6_S2_PFBASE"))
@@ -525,27 +657,84 @@ int main(int argc, char** argv)
                 for (const Layer& y : m.layers)
                 {
                     const G6Attn& a = y.ab.args;
-                    G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * 656, st));
-                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)std::max(a.page_count, a.table_size) * 64 * 132, st));
+                    G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::ROW, st));
+                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::IDX_ROW, st));
                 }
             };
             for (Model& m : R) poison(m);
             for (Draft& D : DR) poison(D.d);
         }
-        // G6_S2_PFNOFIX=1 (negative control): tables at B but staged index keys from page 0 (before 4c2596b); must differ
-        const int ixb = getenv("G6_S2_PFNOFIX") ? 0 : pf_base;
-        for (Model& m : R) { s2_solo_run(m, pf_base, pf_pages); m.s2on = false; m.s2_pf_base = ixb; }
-        for (Draft& D : DR) { s2_solo_run(D.d, pf_base, pf_pages); D.d.s2on = false; D.d.s2_pf_base = ixb; }
+        // G6_S2_PFNOFIX=1 (negative control): tables at B but staged index keys at logical pages, from page 0; must differ
+        const bool ixt = !getenv("G6_S2_PFNOFIX");
+        for (Model& m : R) { s2_solo_pages(m, s2_run_list(pf_base, pf_pages)); m.s2on = false; m.s2_pf_table = ixt; }
+        for (Draft& D : DR) { s2_solo_pages(D.d, s2_run_list(pf_base, pf_pages)); D.d.s2on = false; D.d.s2_pf_table = ixt; }
         G6RT_CK(cudaStreamSynchronize(st));
         fprintf(stderr, "# s2 base-page gate: every sequence at base page %d, run of %d pages (main pool %d pages)%s%s\n", pf_base, pf_pages,
-                R[0].s2->pool_pages, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "", ixb != pf_base ? ", NOFIX" : "");
+                R[0].s2->pool_pages, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "", ixt ? "" : ", NOFIX");
+    }
+    // Gate: DEC_S2 CP build, --prefill, no --s2: G6_S2_XLIST=seed[,pages] runs every sequence as one session past R on
+    // a shuffled page list of the pool's two classes (the prefix and the run's shard below place, the drafter's tail
+    // copy above it): the tables become the run's CP map (s2_solo_cp_pages, main and draft), StepIn::page_bound = the
+    // pool's pages, and s2_reset_pages clears the run between sequences. Stdout must equal the run on the tables as
+    // built (the same build without G6_S2_XLIST). G6_S2_PFPOISON works as for the base-page gate.
+    if (const char* e = getenv("G6_S2_XLIST"))
+    {
+        const std::vector<int> v = parse_ints(e);
+        if (s2mode || !cp_on || !MP || v.empty() || v.size() > 2) die("G6_S2_XLIST=seed[,pages]: needs G6_CP on, --prefill, no --s2");
+        pf_xlist = v[0];
+        for (Model& m : R) { m.s2_below = cp_R; s2_init(m, 1, st); m.s2on = false; }
+        for (Draft& D : DR) { D.d.s2_below = cp_R; s2_init(D.d, 1, st); D.d.s2on = false; }
+        // the classes: place = the main pool's pages (every rank model has the same), most = the drafter's
+        int place = R[0].s2->pool_pages, most = DR[0].d.s2->pool_pages;
+        for (const Model& m : R) place = std::min(place, m.s2->pool_pages);
+        for (const Draft& D : DR) most = std::max(most, D.d.s2->pool_pages);
+        const int rp = cp_R / 64;
+        const int n = v.size() > 1 ? v[1] : std::min(most, rp + (place - rp) * g6nr::NR);
+        const int shard = (n - rp + g6nr::NR - 1) / g6nr::NR;
+        if (n <= rp || rp + shard > place || n - rp - shard > most - place)
+            die("G6_S2_XLIST: pages must leave the run's prefix and shard below place");
+        for (const Plan& p : plans)
+            if ((int)p.prompt.size() + p.n_gen > n * 64)
+                die("G6_S2_XLIST: a sequence needs more than its run's pages; pass a larger pages or a longer G6_CP_R build");
+        // a seeded shuffle of each class (splitmix64, as G6_S2_PAGES): the run's pages may sit anywhere in them
+        auto shuffle = [](std::vector<int> v, uint64_t x) {
+            for (int i = (int)v.size() - 1; i > 0; --i)
+            {
+                uint64_t z = (x += 0x9E3779B97F4A7C15ull);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
+                std::swap(v[i], v[z % (uint64_t)(i + 1)]);
+            }
+            return v;
+        };
+        std::vector<int> low = shuffle(s2_run_list(0, place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 1),
+                          high = shuffle(s2_run_list(place, most - place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 0x517CC1B727220A95ull);
+        pf_xlist_pages.insert(pf_xlist_pages.end(), low.begin(), low.begin() + (rp + shard));
+        pf_xlist_pages.insert(pf_xlist_pages.end(), high.begin(), high.begin() + (n - rp - shard));
+        if (getenv("G6_S2_PFPOISON"))
+        {
+            auto poison = [&](Model& m) {
+                for (const Layer& y : m.layers)
+                {
+                    const G6Attn& a = y.ab.args;
+                    G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::ROW, st));
+                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)a.page_count * 64 * g6kv::IDX_ROW, st));
+                }
+            };
+            for (Model& m : R) poison(m);
+            for (Draft& D : DR) poison(D.d);
+        }
+        for (Model& m : R) s2_solo_cp_pages(m, pf_xlist_pages, most);
+        for (Draft& D : DR) s2_solo_cp_pages(D.d, pf_xlist_pages, most);
+        G6RT_CK(cudaStreamSynchronize(st));
+        fprintf(stderr, "# s2 xlist gate: every sequence past R on %d shuffled pages (prefix %d + shard %d below place %d, %d above)%s\n",
+                n, rp, shard, place, n - rp - shard, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "");
     }
 #endif
-    // StepIn to the device; G6_S2_PFBASE: the run's base page
+    // StepIn to the device; G6_S2_PFBASE / G6_S2_XLIST: the pool's page bound
     auto put_in = [&](StepIn* dst, const StepIn& si) {
         StepIn x = si;
 #ifdef DEC_S2
-        if (pf_base) x.base_page = pf_base;
+        if (pf_base || pf_xlist) x.page_bound = (dst == in ? R[0] : DR[0].d).s2->pool_pages;
 #endif
         G6RT_CK(g6h2d::copy(dst, &x, sizeof x));
     };
@@ -971,9 +1160,8 @@ int main(int argc, char** argv)
             for (int j = 0; j < h.ns; ++j)
             {
                 const S2Model& s2m = *(draft ? DR[0].d : R[0]).s2;
-                h.base[j] = s2m.base[h.sess[j]];
                 h.src0[j] = mrow0[h.sess[j]];
-                if (h.ctx[j] > s2m.pages[h.sess[j]] * 64) die("s2: session context past its run (G6_S2_RUNS grant)");   // caller's grant check
+                if (h.ctx[j] > s2m.pages[h.sess[j]] * 64) die("s2: session context past its run (G6_S2_RUNS / G6_S2_PAGES grant)");   // caller's grant check
             }
             std::string key = sp.key();   // kind + M; until attention is layout-free the per-session layout stays in this driver's key
             for (int j = 0; j < h.ns; ++j) key += ":" + std::to_string(h.sess[j]) + "x" + std::to_string(h.rows[j]);
@@ -982,8 +1170,7 @@ int main(int argc, char** argv)
                 for (int j = 0; j < h.ns; ++j)
                 {
                     m.s2->bk[h.sess[j]] = bucket_of(m, h.ctx[j]);
-                    if (first) key += ":b" + std::to_string(m.s2->bk[h.sess[j]]) + "p" + std::to_string(h.base[j]) +
-                                      (draft && !chain ? "s" + std::to_string(h.src0[j]) : "");
+                    if (first) key += ":b" + std::to_string(m.s2->bk[h.sess[j]]) + (draft && !chain ? "s" + std::to_string(h.src0[j]) : "");
                 }
             };
             if (draft) for (Draft& D : DR) set(D.d, D.d.rank == 0);
@@ -991,7 +1178,7 @@ int main(int argc, char** argv)
             StepOut so[NR];
             if (solo >= 0)                  // S=1: today's path and graphs (run_main / run_draft), the run at solo_base
             {
-                si.base_page = solo_base;
+                si.page_bound = (draft ? DR[0].d : R[0]).s2->pool_pages;
                 const double w = draft ? run_draft(si, chain, so) : run_main(si, so);
                 tk[{(int)sp.kind + 3, M}].push_back(w);
             }
@@ -1069,7 +1256,7 @@ int main(int argc, char** argv)
         hk.round = [&](int q, long rd, int base, int a, int K) { printf("q%d round %ld base %d accepted %d of %d\n", q, rd, base, a, K); };
         // S=1 transition contract (joint TP6 + TP4 ruling, TP4 option (a), provisional): a session alone (fresh, or the
         // survivor of 2 -> 1) runs today's path (s2on off on every model, the layers' own bindings, D.hprev, today's graphs)
-        // with its run where it is: the layers' tables = base + i (s2_solo_base), StepIn::base_page = base.
+        // with its run where it is: the layers' tables = its pages (s2_solo_pages), StepIn::page_bound = the pool's pages.
         // G6_S2_SOLO1=0: stay on the S2 path at S=1 (screen). G6_S2_RELOC=1: the fallback, relocate the survivor to base 0.
         // G6_S2_GEN=a,b,..: per-session --gen (so the sessions finish at different rounds and 2 -> 1 happens).
         const bool solo1 = !getenv("G6_S2_SOLO1") || atoi(getenv("G6_S2_SOLO1")) != 0;
@@ -1078,6 +1265,23 @@ int main(int argc, char** argv)
         {
             const std::vector<int> g = parse_ints(e);
             for (int q = 0; q < NSS && q < (int)g.size(); ++q) SS[q].n_gen = g[q];
+        }
+        // G6_S2_INSERT=q:after:unless:id,id,..[;..]: session q's insert rule (s2_batch.h), unless -1 = none
+        if (const char* e = getenv("G6_S2_INSERT"))
+        {
+            const std::string spec = e;
+            for (size_t i = 0; i <= spec.size();)
+            {
+                const size_t j = std::min(spec.find(';', i), spec.size());
+                const std::string one = spec.substr(i, j - i);
+                int q, after, unless, n = 0;
+                if (sscanf(one.c_str(), "%d:%d:%d:%n", &q, &after, &unless, &n) != 3 || !n || q < 0 || q >= NSS || after < 0)
+                    die("G6_S2_INSERT=q:after:unless:id,id,..[;..]");
+                SS[q].ins.after = after; SS[q].ins.unless = unless; SS[q].ins.tokens = parse_ints(one.substr(n));
+                if (SS[q].ins.tokens.empty() || (int)SS[q].ins.tokens.size() > INSERT_MAX) die("G6_S2_INSERT: 1..64 tokens");
+                fprintf(stderr, "# s2 insert: session %d after %d unless %d, %zu tokens\n", q, after, unless, SS[q].ins.tokens.size());
+                i = j + 1;
+            }
         }
         auto go_solo = [&](int q) {
             const auto t0 = std::chrono::steady_clock::now();
@@ -1093,14 +1297,45 @@ int main(int argc, char** argv)
             }
             solo_base = R[0].s2->base[q];
             const int solo_pages = R[0].s2->pages[q];
-            for (Model& m : R) { s2_solo_run(m, solo_base, solo_pages); m.s2on = false; }
-            for (Draft& D : DR) { s2_solo_run(D.d, solo_base, solo_pages); s2_hprev_to_solo(D, q, st); D.d.s2on = false; }
+            const std::vector<int> run = R[0].s2->run[q];
+            for (Model& m : R) { s2_solo_pages(m, run); m.s2on = false; }
+            for (Draft& D : DR) { s2_solo_pages(D.d, run); s2_hprev_to_solo(D, q, st); D.d.s2on = false; }
             G6RT_CK(cudaStreamSynchronize(st));
             solo = q;
             fprintf(stderr, "# s2 -> S=1: session %d alone, run at base page %d (was %d), %s %d pages; %.3f ms (tables%s, hprev)\n", q, solo_base, B,
                     reloc && B ? "relocated" : "no copy,", pages, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
                     reloc && B ? " + relocation" : "");
         };
+        // G6_S2_GROW=P: the sessions' runs from a pool of P pages, admitted in slot order (each must leave the pool safe)
+        std::unique_ptr<g6s2::RunPool> gpool;
+        std::vector<g6s2::Run> grun(NSS);
+        std::vector<bool> gone(NSS, false);
+        const uint64_t guard = 2 * (uint64_t)mtp;
+        long grows = 0, stalls = 0;
+        // slot q's pages := list on every model; grown: list extends the slot's pages, and the new ones are cleared first
+        auto set_run = [&](int q, const std::vector<int>& list, bool grown) {
+            std::vector<int> fresh;
+            if (grown) fresh.assign(list.begin() + R[0].s2->run[q].size(), list.end());
+            for (Model& m : R) { s2_zero_pages(m, fresh, st); s2_set_pages(m, q, list); if (solo == q) s2_solo_pages(m, list); }
+            for (Draft& D : DR) { s2_zero_pages(D.d, fresh, st); s2_set_pages(D.d, q, list); if (solo == q) s2_solo_pages(D.d, list); }
+            G6RT_CK(cudaStreamSynchronize(st));
+        };
+        if (const char* e = getenv("G6_S2_GROW"))
+        {
+            int pool = R[0].s2->pool_pages;
+            for (const Draft& D : DR) pool = std::min(pool, D.d.s2->pool_pages);
+            const int P = atoi(e);
+            if (P < 1 || P > pool) die("G6_S2_GROW=P: 1..the pool's pages");
+            gpool.reset(new g6s2::RunPool((uint32_t)P, (uint32_t)P, (uint32_t)P * 64));
+            for (int q = 0; q < NSS; ++q)
+            {
+                const uint64_t n = SS[q].prompt.size(), worst = n + SS[q].n_gen + guard, rows = std::min(worst, n + 1 + guard);
+                if (!gpool->fits(rows, worst)) die("G6_S2_GROW: session " + std::to_string(q) + " does not leave the pool safe at admission");
+                grun[q] = gpool->reserve(rows, worst);
+                set_run(q, gpool->list(grun[q]), false);   // the pool is cleared at the start (s2_reset)
+                fprintf(stderr, "# s2 grow: session %d starts with %u pages, worst case %llu\n", q, grun[q].pages, (unsigned long long)((worst + 63) / 64));
+            }
+        }
         std::vector<s2::Stats> sst(NSS);
         std::vector<std::vector<int>> gen(NSS);
         {
@@ -1114,9 +1349,25 @@ int main(int argc, char** argv)
                 std::vector<int> act;
                 for (int q : qs) if (b.active(q)) act.push_back(q);
                 if (act.empty()) break;
+                std::vector<int> order = qs;
+                if (gpool)
+                {
+                    order.clear();
+                    for (int q : act)
+                    {
+                        const auto r = gpool->grow(grun[q], (uint64_t)b.length(q) + guard);
+                        if (!r) { ++stalls; continue; }
+                        if (*r != grun[q]) { grun[q] = *r; set_run(q, gpool->list(*r), true); ++grows; }
+                        order.push_back(q);
+                    }
+                    if (order.empty()) die("G6_S2_GROW: every session sat the round out");
+                }
                 if (solo1 && solo < 0 && act.size() == 1) go_solo(act[0]);
-                b.round(qs);
+                b.round(order);
+                for (int q = 0; gpool && q < NSS; ++q)
+                    if (!gone[q] && !b.active(q)) { gpool->release(grun[q]); gone[q] = true; }
             }
+            if (gpool) fprintf(stderr, "# s2 grow: %ld growths, %ld rounds sat out\n", grows, stalls);
             for (int q = 0; q < NSS; ++q) { gen[q] = b.result(q); sst[q] = b.stats(q); }
         }
         for (int q = 0; q < NSS; ++q)
@@ -1184,10 +1435,17 @@ int main(int argc, char** argv)
         if (!skip)
         {
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
-            if (getenv("G6_S2_PFBASE"))         // base-page gate: clear the run only (s2_reset_run)
+            if (getenv("G6_S2_XLIST"))            // xlist gate: clear the run only (s2_reset_pages, its classes)
             {
-                for (Model& m : R) s2_reset_run(m, pf_base, pf_pages, st);
-                for (Draft& D : DR) s2_reset_run(D.d, pf_base, pf_pages, st);
+                const int most = std::max(R[0].s2->pool_pages, DR[0].d.s2->pool_pages);
+                for (Model& m : R) s2_reset_pages(m, pf_xlist_pages, st, most);
+                for (Draft& D : DR) s2_reset_pages(D.d, pf_xlist_pages, st, most);
+            }
+            else if (getenv("G6_S2_PFBASE"))      // base-page gate: clear the run only (s2_reset_pages)
+            {
+                const int most = std::max(R[0].s2->pool_pages, DR[0].d.s2->pool_pages);
+                for (Model& m : R) s2_reset_pages(m, s2_run_list(pf_base, pf_pages), st, most);
+                for (Draft& D : DR) s2_reset_pages(D.d, s2_run_list(pf_base, pf_pages), st, most);
             }
             else
 #endif
@@ -1201,6 +1459,8 @@ int main(int argc, char** argv)
         else pt.lap("open");
         G6RT_CK(cudaStreamSynchronize(st));
         pt.lap("reset");
+        if (skip && (getenv("G6_KV_TIER_CHECK") || getenv("G6_KV_RANKS_CMP")))
+            kv_tier_check(R, DR, (skip + 63) / 64, cap, st);
         if (skip) printf("seq %zu prompt %zu tokens, %d reused\n", q, p.prompt.size(), skip);
         else printf("seq %zu prompt %zu tokens\n", q, p.prompt.size());
         const int npf = p.first;
@@ -1243,7 +1503,7 @@ int main(int argc, char** argv)
                         {
                             const void* src = k ? c.index_cache : c.mla_cache;
                             if (!src) continue;
-                            std::vector<uint8_t> h(slots * (k ? 132 : 656));
+                            std::vector<uint8_t> h(slots * (k ? g6kv::IDX_ROW : g6kv::ROW));
                             G6RT_CK(cudaMemcpy(h.data(), src, h.size(), cudaMemcpyDeviceToHost));
                             FILE* f = fopen((b + (k ? ".idx" : ".kv")).c_str(), "wb");
                             if (!f) die("G6_PF_DRAFTDUMP: cannot write " + b);
@@ -1334,7 +1594,7 @@ int main(int argc, char** argv)
                 for (Model& m : R)
                 {
                     const G6Attn& c = m.layers[i].ab.args;
-                    kv[m.rank].resize((size_t)c.page_count * c.page_size * 656);
+                    kv[m.rank].resize((size_t)c.page_count * c.page_size * g6kv::ROW);
                     tb[m.rank].resize(c.table_size);
                     G6RT_CK(cudaMemcpy(kv[m.rank].data(), c.mla_cache, kv[m.rank].size(), cudaMemcpyDeviceToHost));
                     G6RT_CK(cudaMemcpy(tb[m.rank].data(), c.block_table, tb[m.rank].size() * 4, cudaMemcpyDeviceToHost));
@@ -1347,12 +1607,12 @@ int main(int argc, char** argv)
                     {
                         const int pg = tb[r][x / ps];
                         if (pg < 0) continue;
-                        const uint8_t* rec = kv[r].data() + ((size_t)pg * ps + x % ps) * 656;
+                        const uint8_t* rec = kv[r].data() + ((size_t)pg * ps + x % ps) * g6kv::ROW;
                         if (!ref) ref = rec;
-                        else if (memcmp(ref, rec, 656)) ++mism;
+                        else if (memcmp(ref, rec, g6kv::ROW)) ++mism;
                     }
                     if (!ref) die("G6_KV_HASH: position " + std::to_string(x) + " stored by no rank");
-                    h = fnv(h, ref, 656);
+                    h = fnv(h, ref, g6kv::ROW);
                 }
                 printf("kvhash seq %zu layer %d positions %d %016llx%s\n", q, layers[i], npf, (unsigned long long)h,
                        mism ? " HOLDERS DIFFER" : "");

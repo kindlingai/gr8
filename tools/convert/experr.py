@@ -8,7 +8,7 @@ and with each checkpoint's decoded weights, summed over its TP4 rank slices (eac
 Decoding follows engine/ref/g6ref.py (the trellis codebook, Hadamard-128 rotations, fp16 at the kernel's rounding
 points). An exlr8-e4m3 layer is also run with the codebook rounded to E4M3 (`NAME+e4m3`), as the engine decodes it;
 `NAME` alone is the unrounded decode. Prints the relative output error ||y_q - y|| / ||y|| over all sampled experts and
-rows, and its mean per expert. --e4m3-all adds the rounded arm for TR3 files too (what g6's prefill does to TR3
+rows, and its mean per expert. --e4m3-all adds the rounded arm for TR3 files too (what gr8's prefill does to TR3
 weights). BF16 dir: a Hugging Face checkpoint with model.safetensors.index.json.
 """
 import argparse

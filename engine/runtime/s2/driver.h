@@ -7,7 +7,7 @@
 
 namespace g6s2 {
 // decode_prompt: the whole prompt runs as decode steps from position 0, no tensor prefill (prompt logprobs)
-struct Payload { std::vector<int> prompt; int chunk = 4; bool decode_prompt = false; };
+struct Payload { std::vector<int> prompt; int chunk = 4; bool decode_prompt = false; g6rt::InsertRule ins; };
 struct Emission { uint32_t count = 0; bool finished = false; };
 struct DriverHooks {
     // Real TP4 pool/binding adapter: canonical base, never a per-rank first-fit.
@@ -26,8 +26,17 @@ struct DriverHooks {
     std::function<bool(Key)> dfl_ok;
     std::function<int(Key)> dfl_start;
     std::function<s2::DflDrafts(Key, const s2::DflReq&)> dfl;
-    // One completion notification; physical KV release waits for the event fence.
+    // One completion notification.
     std::function<void(Key, const s2::Stats&)> terminal;
+    // optional: before a round, a decoding session's run grows to cover `rows` (round_rows). The run, perhaps the same,
+    // or nothing: the pages would leave the pool unsafe and the session sits this round out. Every rank, same order.
+    std::function<std::optional<Run>(const Slot&, uint64_t rows)> grow;
+    // optional: a session finished at this step (now Retiring): its pages go back to the pool now, on every rank, so
+    // the sessions still decoding can grow before the next event fence frees the slot
+    std::function<void(const Slot&)> finished;
+    // optional: after the growth and before the round, every rank (the host work since the last round may have taken a
+    // different time on each rank: the round's fabric waits time out)
+    std::function<void()> settle;
 };
 class Driver {
     Scheduler scheduler_;
@@ -71,7 +80,7 @@ class Driver {
     }
     Completion completion(Key k) const {
         const auto& s = scheduler_.slots()[k.slot];
-        return {k, emitted_[k.slot] - s.emitted, batch_.finished(int(k.slot))};
+        return {k, emitted_[k.slot] - s.emitted, batch_.finished(int(k.slot)), uint32_t(batch_.stats(int(k.slot)).inserted)};
     }
 public:
     Driver(Config c, DriverHooks h) : scheduler_(c), hooks_(std::move(h)),
@@ -102,6 +111,7 @@ public:
     void dsel(const s2::DSel& d) { batch_.dsel(d); }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
+    void pool_digest(uint64_t d) { scheduler_.pool_digest(d); }
     Changes apply(const Commit& c, const Payload* p = nullptr) {
         if (c.admit) {
             require(p && p->prompt.size() == c.admit->req.prompt_tokens && p->chunk > 0, "admit payload mismatch");
@@ -127,7 +137,18 @@ public:
         return changes;
     }
     Quantum step() {
-        auto q = scheduler_.next();
+        std::array<bool, MAX_SESSIONS> stalled{};
+        try {
+            if (hooks_.grow)
+                for (const Key& k : scheduler_.decoding()) {
+                    const auto& s = scheduler_.slots()[k.slot];
+                    const auto r = hooks_.grow(s, round_rows(scheduler_.config(), uint64_t(batch_.length(int(k.slot)))));
+                    if (!r) stalled[k.slot] = true;
+                    else if (*r != s.run) scheduler_.grow(k, *r);
+                }
+            if (hooks_.settle) hooks_.settle();
+        } catch (...) { scheduler_.fail(); throw; }
+        auto q = scheduler_.next(stalled);
         try {
             if (q.kind == Kind::Prefill) {
                 auto k = q.keys[0];
@@ -138,7 +159,7 @@ public:
                 const auto& p = payload_[k.slot];
                 require(!initialized_[k.slot], "duplicate prompt tail");
                 const bool dfl = hooks_.dfl_ok && live() == 1 && !p.decode_prompt && hooks_.dfl_ok(k);
-                batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens), dfl}});
+                batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens), dfl, p.ins}});
                 initialized_[k.slot] = true;
                 scheduler_.complete_tail(completion(k));
             } else if (q.kind == Kind::Decode) {
@@ -156,8 +177,9 @@ public:
             if (q.kind == Kind::PromptTail || q.kind == Kind::Decode)
                 for (unsigned i = 0; i < q.count; ++i) {
                     auto k = q.keys[i];
-                    if (scheduler_.slots()[k.slot].phase == Phase::Retiring && hooks_.terminal)
-                        hooks_.terminal(k, batch_.stats(int(k.slot)));
+                    if (scheduler_.slots()[k.slot].phase != Phase::Retiring) continue;
+                    if (hooks_.terminal) hooks_.terminal(k, batch_.stats(int(k.slot)));
+                    if (hooks_.finished) hooks_.finished(scheduler_.slots()[k.slot]);
                 }
         } catch (...) { scheduler_.fail(); throw; }
         return q;

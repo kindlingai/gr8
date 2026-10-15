@@ -1,4 +1,4 @@
-//! Decodes one exlr8 v2 dense or vocabulary file with g6's decoder (src/exlr8.rs) and writes the tensors under the
+//! Decodes one exlr8 v2 dense or vocabulary file with gr8's decoder (src/exlr8.rs) and writes the tensors under the
 //! HF names `loader/exlr8.py` gives them, for an exact comparison against it (engine/loader-rs/tests/exlr8_compare.py).
 //!
 //!   exlr8dump DIR LAYER|vocab OUT.safetensors [--dtype f32|bf16] [--shard N R] [--threads T]

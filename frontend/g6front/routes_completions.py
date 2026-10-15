@@ -25,7 +25,7 @@ async def _prompt_ids(st: State, body: dict) -> list[int]:
             raise ApiError('prompt contains a token id out of vocabulary range', param='prompt')
         return p
     if isinstance(p, list) and len(p) > 1:
-        raise ApiError('batched prompts are not supported by the g6 front end; send one prompt per request',
+        raise ApiError('batched prompts are not supported by the gr8 front end; send one prompt per request',
                        param='prompt')
     raise ApiError('`prompt` must be a string or a non-empty list of token ids', param='prompt')
 
@@ -38,7 +38,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
         st.require_engine()
         for k in ('echo', 'suffix'):
             if body.get(k):
-                raise ApiError(f'`{k}` is not supported by the g6 front end', param=k)
+                raise ApiError(f'`{k}` is not supported by the gr8 front end', param=k)
         prompt = await _prompt_ids(st, body)
         params = sampling.build(body, len(prompt), st.max_model_len, st.tok.eos_ids, st.tok.gen_defaults, 16,
                                 st.max_logprobs, chat=False)

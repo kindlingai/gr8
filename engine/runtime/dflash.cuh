@@ -11,7 +11,7 @@
 //            q - k < window) -> o_proj partial, all-reduce (collective 1 + 2j) -> conv finish -> residual ->
 //            post_norm -> conv prepare -> gate/up, silu, down partial, all-reduce (collective 2 + 2j) -> conv finish ->
 //            residual -> the next in_norm (or the final norm)
-//   head     the target's lm_head on this rank's vocab slice. Argmax mode: g6's head sampler (collective 2L + 1), row r
+//   head     the target's lm_head on this rank's vocab slice. Argmax: gr8's head sampler (collective 2L + 1), row r
 //            keyed to position q0 + r like the target's sample of that position. Selector mode (DFlash2): this rank's
 //            top-16 per row -> all-gather (collective 2L + 1) -> global top-16 -> the walk with the selector codebooks
 //   conv     two taps over the block rows r and r-1 (none for r = 0), per channel c: (base[side][tap][c] +
@@ -78,7 +78,7 @@ struct DLayer
 struct Dfl
 {
     int rank = -1;
-    bool sel = false;                 // DFlash2 selector walk (else argmax / g6's sampler)
+    bool sel = false;                 // DFlash2 selector walk (else argmax / gr8's sampler)
     int mask_id = 0;
     float theta = 1e6f, eps = 1e-5f;
     int tlayer[dfl::NT] = {};         // target_layer_ids
@@ -835,7 +835,7 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
         else glue::k_head_local<<<B, 1024, 0, st>>>(dfl_head_args(D));
         return;
     }
-    // p == NC: the merge (g6's head merge in argmax mode, the walk in selector mode), StepOut
+    // p == NC: the merge (gr8's head merge in argmax mode, the walk in selector mode), StepOut
     if (D.sel)
         dflk::k_walk<<<1, 256, 0, st>>>(dflk::WalkArgs{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp});
     else if (D.nc > 0) glue::k_head_merge_tp<<<B, 1024, 0, st>>>(dfl_head_args(D));

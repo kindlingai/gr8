@@ -1,4 +1,4 @@
-"""Teacher-forced scoring of token rows on a running g6 (the student side of a KL against a teacher).
+"""Teacher-forced scoring of token rows on a running gr8 (the student side of a KL against a teacher).
 
 python3 bench/score_rows.py ROWS OUT.jsonl [--url http://127.0.0.1:8100] [--k 20] [--rows 977:1041] [--timeout 300]
         [--label L --note TEXT] [--raw]

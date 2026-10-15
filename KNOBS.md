@@ -34,10 +34,16 @@ manifest instead.
 
 | variable | TP=4 | TP=6 | TP=3 | meaning |
 |---|---|---|---|---|
-| `CAP` | 294912 | 614400 | 241600 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory. Unset, it follows `SHARE_LIMIT`: each rank keeps the same KV memory (1,920 pages of 64 tokens at TP=4, 2,026 at TP=6, 1,941 at TP=3) |
-| `SHARE_LIMIT` | 65536 | 32768 | 65536 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 32768 gives `CAP` 393216. A power of two from 4096 |
+| `CAP` | 310528 | 614400 | 241600 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory. Unset, it follows `SHARE_LIMIT`: each rank keeps the same KV memory (1,981 pages of 64 tokens at TP=4, 2,026 at TP=6, 1,941 at TP=3) |
+| `KV_FORMAT` | fp8 | fp8 | fp8 | experimental. The KV latent row: `fp8` (656 B) or `int4` (416 B, INT4 after a Hadamard rotation). `int4` runs `bin/g6m4-int4` (in the image; `KV_FORMAT=int4 ./gr8 glm53 build` builds it), and its default `CAP` keeps fp8's memory a rank: 415,232 at TP=4 (2,390 pages a rank, measured against fp8 at 1,920; the fp8 default is 1,981 now), 345,088 at TP=3 and 857,600 at TP=6 (estimates). At TP=4 it decodes about 3% slower and prefills about 6% faster, and finds the same needles. `docs/KV4.md` |
+| `SHARE_LIMIT` | 65536 | 32768 | 65536 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 32768 gives `CAP` 408832. A power of two from 4096 |
 | `SESS` | 8 | 8 | 8 | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
 | `REUSE` | 1 | 1 | 1 | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
+| `KV_STORE` | off | off | off | experimental. Block stores below the KV pool (`--kv-store`, given once per store, or stores separated by `;` in a file or the environment), tried in order: `STORE,size=N(M\|G\|T)[,persist=on\|off]`. STORE is `ssd:PATH` (a folder on each box: rank r uses `PATH/r<r>`), `remote:HOST:PORT` or `remote:auto` (a KV node the mentat group announces, `./gr8 kv up`). An SSD store is cleared at every boot. With `persist=on` its system prefixes and the counts survive restarts while the model, layout, block format and engine build stay the same; a boot that served wrong output would hand them on, so persist only a store you trust. Sizes are per rank, G = 2^30. Needs `REUSE`. `engine/kvman-rs/REMOTE-TIER.md` |
+| `KV_KEEP` | system | system | system | what the stores keep. `system`: each system prompt with its tool definitions (the span the front end sends; without one, the prompt's grid cells), once, after `KV_SYSTEM_AFTER` conversations started with it. `sessions`: those, plus the runs the pool evicts that continued their conversation at least once, stored on the system prefix they start with, a run past `SHARE_LIMIT` with each rank's shard of its tail. `all`: every run the pool evicts, for benchmarks. `system` suits most; `sessions` suits agent fleets larger than the KV pool. On the cluster's 8-agent replay (TP=4) `sessions` cut TTFT p50 from 234 s to 126 s writing 98 GB/h a rank, `all` was about the same, and `system` wrote 1.2 GB/h (TTFT p50 213 s); `engine/kvman-rs/REMOTE-TIER.md` has the table. In kvman-sim on the opencode captures `system` writes under 4 GB/h per rank and `all` 90-135 |
+| `KV_SYSTEM_AFTER` | 2 | 2 | 2 | the conversations a system prefix must start before the stores keep it. A request that continues a live, retained or stored run counts toward nothing |
+| `KV_WRITE_LIMIT` | off | off | off | a cap on store writes: at most this many page blocks per page of KV the engine computes (prefill and decode), so `0.25` writes at most a quarter of what the engine fills. Counted the same on every rank, never by the clock; a store refuses what would go past it |
+| `KV_TIER`, `KV_SHARED_AFTER` | | | | deprecated, for one release: `KV_TIER` is `KV_STORE` with `keep=evicted\|shared\|all` per tier, and maps to `KV_KEEP=all` when any tier kept evicted runs (the old default), else `system`; `KV_SHARED_AFTER` is `KV_SYSTEM_AFTER`. A warning says so |
 | `DFLASH` | 1 with a drafter, else 0 | 0 (fixed) | 0 (fixed) | 1 = the DFlash2 drafter (`--drafter`, or `dflash.r<r>.*` in the model set); 0 = MTP only. TP=3 and TP=6 refuse 1: the drafter's 8 KV heads do not split three or six ways |
 | `DFLASH_SEL` | engine default (1) | – | – | 1 = the DFlash2 selector walk, 0 = the drafter's argmax |
 | `DFLASH_K` | engine default (7) | – | – | verify at most the first k of the 7 drafts |
@@ -57,9 +63,8 @@ manifest instead.
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
 | `READY_TMO` | 1800 | 1800 | 1800 | seconds to wait for the ranks to load |
-| `FRONT` | rs only | rs only | rs only | front end: `rs` = `bin/g6front-rs`. The Python front end serves no S2 boot |
 | `FRONT_BIN` | `bin/g6front-rs` | same | same | the Rust front end binary |
-| `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim (and the Python front end) |
+| `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim |
 | `S2PORT` | 7341 | 7341 | 7341 | the multi-session control port on the head |
 | `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
 | `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
@@ -84,13 +89,15 @@ manifest instead.
 | `RANK` | `--rank` | none | run | `prepare`: the rank to fetch, when this box cannot tell (mentat mode) |
 | `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
 | `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |
-| `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `serve/`, `run/` |
+| `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `run/` |
 | `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
 | `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
 | `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |
 | `DEFAULT_MAX_TOKENS` | `--default-max-tokens` | 0 | box | the head's front end: `max_tokens` for a chat request that names none. 0 = what keeps the request within `SHARE_LIMIT`, but at least 8,192, and never more than the room the context leaves; another value is used as it is |
+| `DEFAULT_REASONING_EFFORT` | `--default-reasoning-effort` | none | box | the head's front end: `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, which the template hears as the nearest level it names (README, "Thinking"). Unset = the template's default (`max` on GLM 5.3). `none` is refused: GLM 5.3 cannot turn thinking off |
+| `DEFAULT_THINKING_BUDGET` | `--default-thinking-budget` | 0 | box | the head's front end: `thinking_budget` for a chat request that names none, or names 0 or null (TensorFold's rule). The front end closes the think block at the reply's Nth token. 0 = no limit. A request with `logprobs` gets no default budget |
 | `JOIN_TIMEOUT` | `--join-timeout` | 600 | run | seconds for the mentat group to fill, for a worker to reach the head, and on the head from the first hello to the last (0 = forever) |
 | `CHECK` | `--no-check` | 1 | run | 0 = skip this box's checks (the model files are checked anyway) |
 | `G6_CLUSTER` | | none | | the config file when there is no `@FILE` |
@@ -100,6 +107,28 @@ manifest instead.
 `PACKS`, `RANK_HEALTH` and `PROBE_ARGS` work with `--ssh` only. The symmetric launch takes the packs from `MODEL`, and it
 does not run the rank health probe yet: run `scripts/rank_health.sh` first if you want it.
 
+## `./gr8 kv`
+
+A KV node: a box that locks some of its memory and serves it as KV page blocks to the cluster, over RDMA where both
+ends have a RoCE v2 address and TCP otherwise (`engine/kvman-rs/REMOTE-TIER.md`). The engine does not use it yet.
+`./gr8 kv up --gb N` starts it on this box. The node joins the mentat group as an agent without GPUs, with the service
+`gr8-kv`, and the model's election counts only agents with GPUs. `down`, `status` (`status all`: every node the group
+announces) and `logs [-f]` work as for the model. The options come from the same places as above. A shared config
+file is read for these keys only.
+
+| name | flag | default | meaning |
+|---|---|---|---|
+| `KV_GB` | `--gb` | none | GiB of this box's memory to lock and serve. RLIMIT_MEMLOCK must allow it (`ulimit -l`; root, or `systemd-run -p LimitMEMLOCK=infinity`) |
+| `KV_PORT` | `--port` | 7350 | the node's TCP port; RDMA connections are set up through it |
+| `KV_BIND` | `--bind` | `0.0.0.0` | the address it listens on |
+| `KV_MIN_FREE_GB` | `--min-free-gb` | 10 | refuse to start when locking `KV_GB` would leave less MemAvailable than this |
+| `KV_RDMA` | `--no-rdma` | 1 | 0 = TCP only |
+| `KV_BIN` | `--bin` | `bin/kvman-remote` | the node binary (`./gr8 glm53 build` puts it in `bin/`) |
+| `MENTAT` | `--mentat` | `localhost` | the daemon to announce through; `none` = do not announce |
+| `GROUP` | `--group` | `gr8-glm53` | the mentat group it joins |
+| `NODE_IP` | `--node-ip` | mentat's | the LAN address to announce |
+| `G6_HOME` | `--g6-home` | the repo checkout | the node keeps `out/kv/` here: `kv.log`, `state.json`, `ready.json` |
+
 ## Build and stage
 
 | variable | script | meaning |
@@ -108,4 +137,5 @@ does not run the rank health probe yet: run `scripts/rank_health.sh` first if yo
 | `BUNDLE_LIBS` | `build.sh` | 1 = copy cuBLAS into `bin/lib` for boxes without the CUDA toolkit |
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |
+| `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine when `KV_FORMAT=int4` |
 | `SHARED` | `stage.sh` | 1 = `PACK_DIR` is a shared mount at the same path on every box; each box copies its own files |

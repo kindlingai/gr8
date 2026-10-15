@@ -38,21 +38,28 @@ KEYS = {
                                 'instead of the release'),
     'MODEL_CACHE': ('box', None, "this box's local directory for its shard of the model set"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
-    'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, serve/, run/'),
+    'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
     'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
                                'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
-    'FRONT': ('box', None, 'front end: rs or py'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
     'DEFAULT_MAX_TOKENS': ('box', '0', 'max_tokens for a chat request that names none; 0 = what keeps the request '
                                        'within SHARE_LIMIT, but at least 8192'),
+    'DEFAULT_REASONING_EFFORT': ('box', None, 'reasoning_effort for a chat request that names none: minimal, low, '
+                                              'medium, high, xhigh or max (the template hears the nearest level it '
+                                              'names); unset = the template\'s own default'),
+    'DEFAULT_THINKING_BUDGET': ('box', '0', 'thinking_budget for a chat request that names none: reply tokens before '
+                                            'the front end closes the think block; 0 = no limit'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
     'CHECK': ('run', '1', '0 = skip the local checks'),
     'CAP': ('cluster', None, 'KV pool in tokens (default: what SHARE_LIMIT leaves of the default pool memory)'),
+    'KV_FORMAT': ('cluster', None, 'the KV latent row: fp8 (default, 656 B) or int4 (416 B, a Hadamard-rotated INT4 row, '
+                                   'experimental): bin/g6m4 or bin/g6m4-int4. int4 holds about 1.34x the tokens at TP=4 '
+                                   '(its own CAP default) for about 3% slower decode (docs/KV4.md)'),
     'SHARE_LIMIT': ('cluster', None, 'requests up to this many tokens (prompt + max_tokens) share decode steps; a '
                                      'longer one runs alone. Each rank holds the first SHARE_LIMIT tokens of a session'),
     'SESS': ('cluster', None, 'S2 sessions'),
@@ -64,6 +71,18 @@ KEYS = {
     'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
+    'KV_STORE': ('cluster', None, 'experimental: block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, '
+                                  'separated by ; (or --kv-store given again). STORE: ssd:PATH, remote:HOST:PORT or remote:auto '
+                                  '(a KV node from the mentat group). Sizes per rank. An SSD store starts empty at every boot; '
+                                  ',persist=on keeps it across restarts'),
+    'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
+                                 'started with), sessions (those, and evicted runs that continued their conversation) or all '
+                                 '(every eviction). Default system'),
+    'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
+    'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
+    'KV_TIER': ('cluster', None, 'deprecated: KV_STORE with keep=evicted|shared|all per tier (any evicted or all maps to '
+                                 'KV_KEEP=all, else system)'),
+    'KV_SHARED_AFTER': ('cluster', None, 'deprecated: KV_SYSTEM_AFTER'),
     'PF_OWN': ('cluster', None, 'prefill attention ownership'),
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),
@@ -74,7 +93,8 @@ KEYS = {
     'V2': ('box', None, 'exlr8 v2 width files directory'),
     'V2_SLICES': ('box', None, 'exlr8 v2 index slices'),
     'V2_WIDTHS': ('box', None, 'exlr8 v2 width manifest; --variant names one instead'),
-    'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default; down1 at TP=3), down1, up1, or a width manifest path'),
+    'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default; bit225 at TP=3, or down1 without it), down1, '
+                                  'up1, bit225, bit243, bit260, bit325, bit338, or a width manifest path'),
     'V2_DENSE': ('box', None, 'the exlr8 release directory whose dense/ files give every non-expert weight (no rank packs)'),
     'V2_DENSE_FORM': ('cluster', None, 'with V2_DENSE: trellis (the release\'s entries, the default) or rounded (MXFP8 / '
                                        'int4, the fallback)'),
@@ -85,7 +105,7 @@ KEYS = {
 FLAGS = {'S2PORT': '--s2-port', 'G6_HOME': '--g6-home'}
 # Read from old config files and ignored here, so they do not draw a warning.
 IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'G6_CLUSTER', 'G6_NR', 'BUNDLE_LIBS', 'ARCH', 'EXTRA', 'SHARED',
-           'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN'}
+           'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN', 'FRONT'}
 SWITCHES = {'--no-config', '--no-check', '--foreground'}
 ENGINE_KNOBS = [k for k in list(KEYS)[list(KEYS).index('CAP'):]]
 FABRIC_PORT = 18600   # engine/comms/fabric.h: the fabric bootstrap and per-collective ports start here
@@ -186,6 +206,8 @@ def parse(argv, environ=None):
                 if i >= len(argv):
                     raise OptionError(f'{name} needs a value')
                 val = argv[i]
+            if key in ('KV_STORE', 'KV_TIER') and cmd.get(key):   # one store per --kv-store
+                val = cmd[key] + ';' + val
             cmd[key] = val
         else:
             args.append(a)
@@ -226,6 +248,7 @@ def parse(argv, environ=None):
         values['MENTAT'], origin['MENTAT'] = 'localhost', 'default'
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
+    deprecated_kv(values, origin, warnings)
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
@@ -267,6 +290,15 @@ def validate(o):
         raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
+    effort = o.get('DEFAULT_REASONING_EFFORT')
+    if effort == 'none':
+        raise OptionError('--default-reasoning-effort none: GLM 5.3 cannot turn thinking off (use low, or '
+                          '--default-thinking-budget)')
+    if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+        raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
+    if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
+        raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
+                          '(0 = no limit)')
     share = o.get('SHARE_LIMIT')
     if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) & (int(share) - 1) == 0):
         # the engine needs the limit to be one of its decode buckets (2048 doubling)
@@ -300,6 +332,77 @@ def validate(o):
         raise OptionError('IPS and IPS2 go together')
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
+    stores = kv_stores(o)
+    if stores:
+        if o.get('REUSE') == '0':
+            raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
+        if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
+            raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
+    if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
+        raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
+    if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
+        raise OptionError(f'--kv-keep {o.get("KV_KEEP")}: want system, sessions or all')
+    sa = o.get('KV_SYSTEM_AFTER')
+    if sa is not None and not (str(sa).isdigit() and int(sa) >= 1):
+        raise OptionError(f'--kv-system-after {sa}: want a whole number from 1')
+    wl = o.get('KV_WRITE_LIMIT')
+    if wl is not None and not re.fullmatch(r'\d+(\.\d+)?', str(wl)):
+        raise OptionError(f'--kv-write-limit {wl}: want a number of page blocks per page computed, such as 0.25')
+
+
+def deprecated_kv(values, origin, warnings):
+    """KV_TIER and KV_SHARED_AFTER (one release, deprecated) become KV_STORE, KV_KEEP and KV_SYSTEM_AFTER."""
+    old = values.get('KV_TIER')
+    if old not in (None, 'off') and values.get('KV_STORE') is None:
+        texts = [t.strip() for t in old.split(';') if t.strip()]
+        keeps = [m.group(1) if (m := re.search(r',keep=(\w+)', t)) else 'evicted' for t in texts]   # the old default
+        values['KV_STORE'] = ';'.join(re.sub(r',keep=\w+', '', t) for t in texts)
+        origin['KV_STORE'] = origin['KV_TIER']
+        if values.get('KV_KEEP') is None:
+            values['KV_KEEP'] = 'all' if any(k in ('evicted', 'all') for k in keeps) else 'system'
+            origin['KV_KEEP'] = origin['KV_TIER']
+        warnings.append(f'KV_TIER (--kv-tier) is deprecated: KV_STORE={values["KV_STORE"]} KV_KEEP={values["KV_KEEP"]}')
+    if values.get('KV_SHARED_AFTER') is not None:
+        if values.get('KV_SYSTEM_AFTER') is None:
+            values['KV_SYSTEM_AFTER'], origin['KV_SYSTEM_AFTER'] = values['KV_SHARED_AFTER'], origin['KV_SHARED_AFTER']
+        warnings.append(f'KV_SHARED_AFTER (--kv-shared-after) is deprecated: KV_SYSTEM_AFTER={values["KV_SYSTEM_AFTER"]}')
+    values['KV_TIER'] = values['KV_SHARED_AFTER'] = None
+
+
+def kv_stores(o):
+    """KV_STORE parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size',
+    'persist'}] ([] when unset or off). Raises OptionError naming the bad store."""
+    v = o.get('KV_STORE')
+    if v in (None, 'off'):
+        return []
+    out = []
+    for text in [t.strip() for t in v.split(';') if t.strip()]:
+        store, *kvs = text.split(',')
+        m = re.fullmatch(r'ssd:(.+)', store) or re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', store)
+        if not m or (store.startswith('remote:auto') and m.group(2)):
+            raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
+        t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
+             'host': None, 'port': None, 'size': None, 'persist': False}
+        if t['kind'] == 'ssd':
+            t['path'] = m.group(1)
+        else:
+            t['host'], t['port'] = m.group(1), m.group(2)
+        for kv in kvs:
+            k, _, x = kv.partition('=')
+            if k == 'size' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
+                t['size'] = x
+            elif k == 'persist' and x in ('on', 'off'):
+                if t['kind'] != 'ssd' and x == 'on':
+                    raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
+                t['persist'] = x == 'on'
+            elif k == 'keep':
+                raise OptionError(f'--kv-store {text}: what the stores keep is --kv-keep system|sessions|all')
+            else:
+                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T) or persist=on|off')
+        if not t['size']:
+            raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
+        out.append(t)
+    return out
 
 
 def split_list(v):
@@ -324,18 +427,22 @@ def resolve_peers(o):
 
 
 # ---- the engine plan: scripts/engine_args.sh, so the ssh launchers and the supervisor start the same engine ---------
-def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id=''):
-    """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..], 's2': bool} from scripts/engine_args.sh.
-    The defaults give the canonical template, with every per-box value as a placeholder."""
+def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
+                kv_store=None):
+    """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
+    The defaults give the canonical template, with every per-box value as a placeholder. kv_store: this box's KV_STORE
+    with the KV node resolved (remote:GB names none)."""
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'TP': o.get('TP'), 'SET_ID': set_id}
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
             env[k] = o.get(k)
+    if kv_store:
+        env['KV_STORE'] = kv_store
     if rank == '@R':   # the template: v2 paths are per box
         for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE'):
             if env.get(k):
                 env[k] = '@' + k
-    names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO', 'S2'])
+    names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO'])
     script = ('set -e; . "$0"; engine_defaults; engine_env; for k in ' + names + '; do echo "knob $k=${!k-}"; done; '
               'echo "env $ENGINE_ENV"; echo "args $(engine_args "$@")"')
     r = subprocess.run(['bash', '-c', script, os.path.join(REPO, 'scripts', 'engine_args.sh'),
@@ -352,7 +459,6 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
             plan['env'] = rest.split()
         elif kind == 'args':
             plan['args'] = rest.split()
-    plan['s2'] = plan['knobs'].pop('S2') == '1'
     plan['drafter_dir'] = o.get('DFLASH_DIR')
     return plan
 
@@ -376,8 +482,8 @@ def canonical(o, plan, members, variant=None):
         c['head'] = o.get('HEAD', '')
     for k in ('IPS', 'IPS2', 'CONTROL_PORT', 'PORT'):
         c[k] = o.get(k) or ''
-    # Every knob that reaches the engine is in engine.env and engine.args below. These are the ones the supervisor
-    # reads itself: the shim's context limit, and which pack files a rank needs.
+    # Every knob that reaches the engine is in engine.env and engine.args below. CAP is also here by name, so a refusal
+    # names it. DFLASH and PF_OWN decide which pack files a rank needs.
     for k in ('CAP', 'DFLASH', 'PF_OWN'):
         c[k] = plan['knobs'].get(k, '')
     if variant:

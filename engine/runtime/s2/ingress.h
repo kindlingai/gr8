@@ -32,7 +32,8 @@ inline Command parse_command(const std::string& text, uint64_t epoch) {
 }
 inline std::string capability(Config c, unsigned ranks) {
     c.validate(); require(ranks==3 || ranks==4 || ranks==6, "invalid rank count");
-    return "G6S2 2 "+std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
+    // version 3: version 2's fields, and requests may carry an insert rule (sessions.h `ins`)
+    return "G6S2 3 "+std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
         std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+" "+std::to_string(g6rt::LP_MAX)+"\n";
 }
 class Ingress {

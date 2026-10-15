@@ -291,7 +291,7 @@ template <class T> inline const char* make_mat(const T& ent, const T& suh, const
 //   LLLL.NAME.trellis  u8 [E][entry bytes]  the rank's rows of the release's M.trellis, as stored
 //   LLLL.NAME.suh      f16 [K]              M.suh, the rank's slice on side 2 (o_proj, down), whole on side 1
 //   LLLL.NAME.svh      f16 [N]              M.svh, the rank's slice on side 1 (q_b, gate, up), whole on side 2
-// The rank's channels follow g6's split: q_b / o_proj the rank's heads (g6nr::start / width of 64, 256 channels each),
+// The rank's channels follow gr8's split: q_b / o_proj the rank's heads (g6nr::start / width of 64, 256 channels each),
 // the dense MLP DENSE_CH contiguous channels.
 constexpr int NMAT = 5;
 static const char* const MAT_NAMES[NMAT] = {"q_b", "o_proj", "dense.gate", "dense.up", "dense.down"};

@@ -2,14 +2,14 @@
 // G6_REUSE_HDUMP=<dir> + G6_REUSE_HDUMP_SEQ=<q[,q..]>: after the prefill loop of a listed seq (before any decode step),
 //   every layer's cache bytes for rows [0, n) (n = the prefill end, p.first) -> <dir>/hd.<q>.r<rank>.bin, raw, page by
 //   page: the target model (tag 'm') then the MTP draft model (tag 'd'). tools/reuse/hdump.py hashes the rows and
-//   merges the ranks by GLOBAL row (latent rows live on their owner rank only; index rows are replicated under CP).
+//   merges the ranks by GLOBAL row (latent and index rows live on their owner rank only).
 // G6_REUSE_ZSCRATCH=1 (with --reuse-prefix): on a hit, every layer's per-seq attention scratch is cleared before the
 //   suffix prefill: indices := -1 (0xff bytes), output := 0 (max_rows rows of each binding).
 // File format (little endian): per layer a header of 12 int32
 //   {0x31444448 'HDD1', tag, layer index, n, page_size, np = ceil(n / page_size), table_size, page_count, cp_nr,
-//    has_index, latent row bytes 656, index row bytes 132}
+//    has_index, latent row bytes (g6kv::ROW: 656, or 416 under G6_KV4), index row bytes 132}
 //   then np page records: int32 pg (block_table[lp]: >= 0 local physical page, < 0 not on this rank), int32 ip (the index
-//   page read, -1 = none), then page_size * 656 latent bytes if 0 <= pg < page_count, then page_size * 132 index bytes
+//   page read, -1 = none), then page_size * g6kv::ROW latent bytes if 0 <= pg < page_count, then page_size * 132 index bytes
 //   (keys [ps][128], then fp32 scales [ps]) if ip >= 0.
 #pragma once
 #include <cstdio>
@@ -74,24 +74,23 @@ inline size_t hdump_model(FILE* f, Model& m, int tag, int n)
         if (np > a.table_size) die("G6_REUSE_HDUMP: rows past the block table");
         std::vector<int> bt(a.table_size);
         G6RT_CK(cudaMemcpy(bt.data(), a.block_table, (size_t)a.table_size * sizeof(int), cudaMemcpyDeviceToHost));
-        const int hdr[12] = {0x31444448, tag, (int)i, n, ps, np, a.table_size, a.page_count, cp, a.index_cache ? 1 : 0, 656, 132};
+        const int hdr[12] = {0x31444448, tag, (int)i, n, ps, np, a.table_size, a.page_count, cp, a.index_cache ? 1 : 0, g6kv::ROW, g6kv::IDX_ROW};
         hdump_put(f, hdr, sizeof hdr); bytes += sizeof hdr;
-        lat.resize((size_t)ps * 656); ix.resize((size_t)ps * 132);
+        lat.resize((size_t)ps * g6kv::ROW); ix.resize((size_t)ps * g6kv::IDX_ROW);
         for (int lp = 0; lp < np; ++lp)
         {
             const int pg = bt[lp];
-            const int ip0 = cp ? lp : pg;     // as k_reuse_poison: CP index keys are replicated, logical-page addressed
-            const int ip = (a.index_cache && ip0 >= 0 && ip0 < (cp ? a.table_size : a.page_count)) ? ip0 : -1;
+            const int ip = (a.index_cache && pg >= 0 && pg < a.page_count) ? pg : -1;   // index keys sit on the latent's pages
             const int rec[2] = {pg, ip};
             hdump_put(f, rec, sizeof rec); bytes += sizeof rec;
             if (pg >= 0 && pg < a.page_count)
             {
-                G6RT_CK(cudaMemcpy(lat.data(), static_cast<const char*>(a.mla_cache) + (size_t)pg * ps * 656, lat.size(), cudaMemcpyDeviceToHost));
+                G6RT_CK(cudaMemcpy(lat.data(), static_cast<const char*>(a.mla_cache) + (size_t)pg * ps * g6kv::ROW, lat.size(), cudaMemcpyDeviceToHost));
                 hdump_put(f, lat.data(), lat.size()); bytes += lat.size();
             }
             if (ip >= 0)
             {
-                G6RT_CK(cudaMemcpy(ix.data(), static_cast<const char*>(a.index_cache) + (size_t)ip * ps * 132, ix.size(), cudaMemcpyDeviceToHost));
+                G6RT_CK(cudaMemcpy(ix.data(), static_cast<const char*>(a.index_cache) + (size_t)ip * ps * g6kv::IDX_ROW, ix.size(), cudaMemcpyDeviceToHost));
                 hdump_put(f, ix.data(), ix.size()); bytes += ix.size();
             }
         }

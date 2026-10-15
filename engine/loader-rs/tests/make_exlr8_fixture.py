@@ -1,7 +1,7 @@
 """Writes tests/data/exlr8-fixture.safetensors: small synthetic matrices in every exlr8 dense format and on both
 sharded sides, with the reference loader's fp32 decode of each (the HF weight (out, in)) as a 64-bit FNV-1a hash of its little-endian
 bytes (`<name>.want_fnv`), and in full (`<name>.want`) where it is small.
-tests/exlr8_fixture.rs checks g6's decoder against it, so CI needs neither torch nor the release.
+tests/exlr8_fixture.rs checks gr8's decoder against it, so CI needs neither torch nor the release.
 
     python3 make_exlr8_fixture.py EXLR8_REPO OUT.safetensors
 

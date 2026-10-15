@@ -210,7 +210,7 @@ fn parse_sources(path: &str, root: Option<&str>, pack_bytes: u64, files: &mut Ve
     Ok(segs)
 }
 
-/// v2 item128 down half -> g6 fc2 order: out[a][c][b] = in[a][b][c] for a < 48 and b, c < 8, tiles of n / 3072 bytes
+/// v2 item128 down half -> gr8 fc2 order: out[a][c][b] = in[a][b][c] for a < 48 and b, c < 8, tiles of n / 3072 bytes
 /// (tools/convert/v2.py down_to_g6).
 pub fn item128_to_g6(src: &[u8], dst: &mut [u8]) {
     let tb = src.len() / 3072;

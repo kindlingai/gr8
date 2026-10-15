@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Stub KV node for the kvnode tests: takes kvman-remote's arguments, answers STATS on its port, writes the ready
+line, and runs until SIGTERM. STUB_KV_FAIL=msg prints msg and exits 1 instead."""
+import json
+import os
+import signal
+import socket
+import struct
+import sys
+import threading
+
+argv = sys.argv[1:]
+
+
+def val(flag, default=None):
+    return argv[argv.index(flag) + 1] if flag in argv else default
+
+
+if os.environ.get('STUB_KV_FAIL'):
+    print(f'kvman-remote: {os.environ["STUB_KV_FAIL"]}', flush=True)
+    sys.exit(1)
+port, gb = int(val('--port')), float(val('--gb'))
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', port))
+srv.listen()
+MAGIC = 0x5653_3647 ^ 1
+st = {'bytes': int(gb * (1 << 30)), 'free': int(gb * (1 << 30)), 'largest_free': int(gb * (1 << 30)),
+      'locked': True, 'uptime_s': 1, 'opened': 0, 'leases': [], 'argv': argv}
+
+
+def serve():
+    while True:
+        c, _ = srv.accept()
+        with c:
+            h = c.recv(32, socket.MSG_WAITALL)
+            j = json.dumps(st).encode()
+            c.sendall(struct.pack('<II3Q', MAGIC, 0, len(j), 0, 0) + j)
+
+
+threading.Thread(target=serve, daemon=True).start()
+rd = [] if '--no-rdma' in argv else [{'ip': '192.0.2.77', 'dev': 'rocep1s0f0', 'gid': 3}]
+line = json.dumps({'port': port, 'bytes': st['bytes'], 'locked': True, 'rdma': rd, 'libibverbs': True,
+                   'pid': os.getpid(), 'setup_s': 0.0})
+print(line, flush=True)
+with open(val('--ready') + '.tmp', 'w') as f:
+    f.write(line + '\n')
+os.replace(val('--ready') + '.tmp', val('--ready'))
+signal.sigwait([signal.SIGTERM])

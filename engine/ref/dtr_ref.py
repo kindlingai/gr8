@@ -6,7 +6,7 @@
 
 prepare writes, per trellis matrix of dense/exlr8-dense-LLL.safetensors and rank, what the loader hands g6: the rank's
 entries of M.trellis as stored, its slices of M.suh / M.svh, plus random fp16 input rows. Rank r holds chunk
-(r - layer) mod TP (tools/convert/plan.py): q_b and o_proj g6's head split (64 heads, the larger slices first), the dense
+(r - layer) mod TP (tools/convert/plan.py): q_b and o_proj gr8's head split (64 heads, the larger slices first), the dense
 MLP 12288 / TP contiguous channels. OUT/meta.txt names them for dtr_test.
 
 check compares dtr_test's outputs with loader/exlr8.py of kindlingai/exlr8 (pure PyTorch, value for value equal to

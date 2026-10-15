@@ -168,6 +168,19 @@ pub struct GenParams {
     pub stop_ids: Vec<i64>,
     pub logprobs: Option<i64>,
     pub prompt_logprobs: Option<i64>,
+    /// the prompt's system span in tokens (PROTOCOL.md): chat requests only
+    pub system_tokens: Option<u64>,
+    /// the engine's insert rule (PROTOCOL.md `insert`); only sent when set
+    pub insert: Option<InsertRule>,
+}
+
+/// Once the reply holds `after_tokens` tokens and none of them is `unless_emitted`, the engine puts `tokens` in place of
+/// the next one.
+#[derive(Clone, Debug)]
+pub struct InsertRule {
+    pub after_tokens: u64,
+    pub unless_emitted: Option<u32>,
+    pub tokens: Vec<u32>,
 }
 
 fn opt_int(b: &mut Vec<u8>, v: Option<i64>) {
@@ -214,6 +227,24 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     opt_int(b, p.logprobs);
     b.extend_from_slice(b",\"prompt_logprobs\":");
     opt_int(b, p.prompt_logprobs);
+    if let Some(n) = p.system_tokens {
+        b.extend_from_slice(b",\"system_tokens\":");
+        pyjson::int(b, n);
+    }
+    if let Some(r) = &p.insert {
+        b.extend_from_slice(b",\"insert\":[{\"after_tokens\":");
+        pyjson::int(b, r.after_tokens);
+        b.extend_from_slice(b",\"unless_emitted\":");
+        opt_int(b, r.unless_emitted.map(i64::from));
+        b.extend_from_slice(b",\"tokens\":[");
+        for (i, t) in r.tokens.iter().enumerate() {
+            if i > 0 {
+                b.push(b',');
+            }
+            pyjson::int(b, *t);
+        }
+        b.extend_from_slice(b"]}]");
+    }
     b.extend_from_slice(b",\"type\":\"generate\"}");
     w.finish()
 }
@@ -251,6 +282,8 @@ mod tests {
             stop_ids: vec![1, 2],
             logprobs: Some(3),
             prompt_logprobs: None,
+            system_tokens: Some(2),
+            insert: None,
         };
         let mut all = Vec::new();
         all.extend_from_slice(&generate("cmpl-1", &[10, 20, 30], &p));
@@ -261,10 +294,26 @@ mod tests {
         assert_eq!(v["prompt"], serde_json::json!([10, 20, 30]));
         assert_eq!(v["temperature"], serde_json::json!(0.0));
         assert_eq!(v["type"], "generate");
+        assert_eq!(v["system_tokens"], serde_json::json!(2));
         let h = r.next().await.unwrap().unwrap();
         let h = head(&h).unwrap();
         assert_eq!((h.kind.as_ref(), h.id.as_deref()), ("cancel", Some("cmpl-1")));
         assert!(r.next().await.unwrap().is_none());
+        assert!(!String::from_utf8_lossy(&generate("x", &[1], &p)[4..]).contains("insert"));
+        let p = GenParams {
+            logprobs: None,
+            insert: Some(InsertRule { after_tokens: 31, unless_emitted: Some(154842), tokens: vec![198, 154842, 271] }),
+            ..p
+        };
+        let g = generate("x", &[1], &p);
+        let v: serde_json::Value = serde_json::from_slice(&g[4..]).unwrap();
+        assert_eq!(
+            v["insert"],
+            serde_json::json!([{"after_tokens": 31, "unless_emitted": 154842, "tokens": [198, 154842, 271]}])
+        );
+        let p = GenParams { insert: Some(InsertRule { unless_emitted: None, ..p.insert.unwrap() }), ..p };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &p)[4..]).unwrap();
+        assert_eq!(v["insert"][0]["unless_emitted"], serde_json::Value::Null);
     }
 
     #[test]

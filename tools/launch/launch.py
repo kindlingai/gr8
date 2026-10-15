@@ -284,7 +284,7 @@ def cmd_show_config(argv):
             print(f'          about {modelset.expert_gb(variant.path, int(o.get("TP"))):.1f} GB of experts on the busiest '
                   f'rank at TP={o.get("TP")}')
         print(f'model id  {modelset.model_id(ms, variant)} (the handshake and the engine compare this)')
-    print(f'engine    {sv.engine_build(os.path.abspath(o.get("G6_HOME")))} (bin/g6m4 and bin/lib)')
+    print(f'engine    {sv.engine_build(os.path.abspath(o.get("G6_HOME")), sv.engine_bin(o))} (bin/{sv.engine_bin(o)} and bin/lib)')
     if members:
         try:
             r = local_rank(o)
@@ -308,7 +308,7 @@ def cmd_check(argv):
     except RuntimeError as e:
         print(f'FAIL  {e}')
         return 1
-    s.build = sv.engine_build(s.home)
+    s.build = sv.engine_build(s.home, sv.engine_bin(o))
     print(f'model set {s.ms.id[:16]} from {s.ms.source}, variant {s.variant}; ' +
           (f'rank {s.rank}' if s.rank is not None else 'rank unknown until the mentat election: rank files not checked'))
     fails = s.checks(copy=False)

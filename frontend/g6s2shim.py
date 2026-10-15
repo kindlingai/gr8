@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Engine-side S2 shim: speaks PROTOCOL.md v1 on the Unix socket and drives g6m4 --serve DIR (a DEC_S2 build) over the
-S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire, and EOS_IDS from g6shim).
+S2 file protocol, so several requests run at the same time. Stdlib only (plus g6front.wire).
 
 The engine side is the code, not a document: engine/runtime/s2/{ingress.h,sessions.h,service.h,bootstrap.h,scheduler.h}.
 File protocol, in the head rank's DIR (the shim runs on the head), one engine epoch per start of g6m4 --serve (every
 rank needs a FRESH DIR). The head passes each request's bytes and the quit to the other ranks over its control links.
-  engine rank 0 -> DIR/ready.s2        "G6S2 2 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>" once all ranks
-                                       booted (version 1 has no <max_lp>: no logprobs)
+  engine rank 0 -> DIR/ready.s2        "G6S2 3 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>" once all ranks
+                                       booted (version 1 has no <max_lp>: no logprobs; version 2 has no insert rule)
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
         n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
+        [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -20,7 +21,7 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
         a <epoch> <slot> <generation> <base_page> <pages>   admitted (the request got a slot and its KV run)
         p <j> <lp> <rank> <n> <id>:<lp> ...                  with plp: prompt token j (1 <= j < prompt length), before the
                                                              first t line; the shim sends one prompt_logprobs frame then
-        l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line (as g6shim.py)
+        l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line, before it
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
         m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
         end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame
@@ -45,13 +46,17 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from g6front import wire  # noqa: E402
-from g6shim import EOS_IDS, VOCAB, Shim as PlainShim  # noqa: E402
 
 log = logging.getLogger('g6s2shim')
 
+EOS_IDS = [154820, 154827, 154829]
+VOCAB = 154880
+FLOOR = -9999.0   # logprob sent for -inf / nan (the front end clamps at the same value)
 INT32_MAX = 2**31 - 1
 READY_FIELDS = {'1': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows'),
-                '2': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
+                '2': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp'),
+                '3': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
+INSERT_MAX = 64   # tokens one insert rule may hold (engine/runtime/insert_rule.h)
 
 
 def payload_hash(data: bytes) -> int:
@@ -67,7 +72,41 @@ def parse_ready(text: str) -> dict:
     names = READY_FIELDS.get(w[1]) if len(w) > 1 and w[0] == 'G6S2' else None
     if not names or len(w) != 2 + len(names) or not all(x.isdigit() for x in w[2:]):
         raise ValueError(f'bad ready.s2: {text!r}')
-    return {'max_lp': 0, **dict(zip(names, map(int, w[2:])))}    # version 1: no logprobs
+    # version 1 has no logprobs, version 3 adds the insert rule
+    return {'max_lp': 0, **dict(zip(names, map(int, w[2:]))), 'insert': int(w[1]) >= 3}
+
+
+def insert_field(rules):
+    """The generate frame's `insert` (a list of at most one rule) -> (the request line's ins field or '', error or None)."""
+    if rules is None or rules == []:
+        return '', None
+    if not isinstance(rules, list) or len(rules) != 1 or not isinstance(rules[0], dict):
+        return '', 'insert must be a list of one rule'
+    r = rules[0]
+    def ok(v, lo, hi):
+        return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+    after, unless, tokens = r.get('after_tokens'), r.get('unless_emitted'), r.get('tokens')
+    if not ok(after, 0, INT32_MAX):
+        return '', 'insert after_tokens must be 0..2^31-1'
+    if unless is not None and not ok(unless, 0, VOCAB - 1):
+        return '', f'insert unless_emitted must be a token id (0..{VOCAB - 1}) or null'
+    # the engine embeds them unchecked, as prompt ids
+    if not isinstance(tokens, list) or not 1 <= len(tokens) <= INSERT_MAX or not all(ok(t, 0, VOCAB - 1) for t in tokens):
+        return '', f'insert tokens must be 1..{INSERT_MAX} token ids (0..{VOCAB - 1})'
+    return f" ins {after}:{-1 if unless is None else unless}:{','.join(map(str, tokens))}", None
+
+
+def lp_entry(w):
+    """engine logprob fields <lp> <rank> <n> <id>:<lp> ... -> a PROTOCOL.md entry {lp, rank, top}"""
+    def num(x):
+        x = float(x)
+        return x if math.isfinite(x) else FLOOR
+    rank, k = int(w[1]), int(w[2])
+    top = []
+    for tok in w[3:3 + k]:
+        i, v = tok.split(':')
+        top.append([int(i), num(v)])
+    return {'lp': num(w[0]), 'rank': rank if rank > 0 else None, 'top': top}
 
 
 def build_request(f: dict, ordinal: int):
@@ -104,8 +143,19 @@ def build_request(f: dict, ordinal: int):
             return None, f'{key} must be 0..20'
         if v is not None:
             lps[word] = v
+    sys_tokens = f.get('system_tokens')   # the prompt's system span (PROTOCOL.md), for the engine's KV stores
+    if sys_tokens is not None and (not isinstance(sys_tokens, int) or isinstance(sys_tokens, bool)
+                                   or not 0 <= sys_tokens <= len(prompt)):
+        return None, 'system_tokens must be 0..len(prompt)'
+    if sys_tokens is not None:
+        lps['sys'] = sys_tokens
+    ins, err = insert_field(f.get('insert'))
+    if err:
+        return None, err
+    if ins and 'lp' in lps:
+        return None, 'insert cannot be combined with logprobs: an inserted token has none'
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + ''.join(f' {w} {v}' for w, v in lps.items()) + '\n' + ','.join(map(str, prompt)) + '\n').encode()
+            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + '\n' + ','.join(map(str, prompt)) + '\n').encode()
     return body, None
 
 
@@ -200,15 +250,19 @@ class Shim:
              'tokens': {'prompt': c['prompt'], 'generation': c['gen']}}
         st = self.status()
         if st:
-            m['s2'] = st    # extra field (ignored by the front end): the engine's own queue/pool status
+            # the engine's own queue/pool/store status. The front ends read `scheduler` (g6:s2_* and g6:kv_store_*
+            # metrics); `s2` is the same, for older readers
+            m['s2'] = m['scheduler'] = st
         return m
 
     # ---- socket side --------------------------------------------------------------------------------------------
     async def serve(self, reader, writer):
         await self.ready.wait()
-        wire.write_frame(writer, {'type': 'hello', 'version': 1, 'model': 'glm-5.3-g6',
-                                  'max_model_len': self.max_model_len(), 'vocab_size': VOCAB,
-                                  'eos_ids': EOS_IDS, 'max_logprobs': self.max_logprobs()})
+        hello = {'type': 'hello', 'version': 1, 'model': 'glm-5.3-g6', 'max_model_len': self.max_model_len(),
+                 'vocab_size': VOCAB, 'eos_ids': EOS_IDS, 'max_logprobs': self.max_logprobs()}
+        if self.cfg['insert']:
+            hello['insert'] = True
+        wire.write_frame(writer, hello)
         mine: set[str] = set()
         try:
             while True:
@@ -254,6 +308,8 @@ class Shim:
                 return self.finish(r, 'error', message=f'not supported by this engine: {k}')
             if not (isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= self.max_logprobs()):
                 return self.finish(r, 'error', message=f'{k} must be 0..{self.max_logprobs()}')
+        if f.get('insert') not in (None, []) and not self.cfg['insert']:   # a version-2 engine would end the epoch
+            return self.finish(r, 'error', message='not supported by this engine: insert')
         if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
             return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
@@ -352,9 +408,9 @@ class Shim:
         if w[0] == 'a':
             r.admitted = True
         elif w[0] == 'l':
-            r.lps.append(PlainShim.entry(w[1:]))
+            r.lps.append(lp_entry(w[1:]))
         elif w[0] == 'p':
-            r.plps[int(w[1])] = PlainShim.entry(w[2:])
+            r.plps[int(w[1])] = lp_entry(w[2:])
         elif w[0] == 't':
             ids = [int(x) for x in w[1:]]
             r.emitted += len(ids)

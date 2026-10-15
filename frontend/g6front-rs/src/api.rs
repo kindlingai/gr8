@@ -17,12 +17,13 @@ use hyper::{header, Method, Request, Response, StatusCode};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use crate::gen::{Generation, Res, Step, StopReason};
+use crate::gen::{think_open, Budget, Generation, Res, Step, StopReason};
 use crate::parser::{Delta, GlmParser};
 use crate::pyjson::{self, truthy};
 use crate::template::{build_template_kwargs, normalize_tools};
 use crate::util::{new_id, now_secs};
-use crate::{logprobs as L, metrics, sampling, State};
+use crate::wire::InsertRule;
+use crate::{logprobs as L, metrics, sampling, thinking, State};
 
 const MAX_BODY: usize = 512 << 20;
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -125,6 +126,10 @@ fn json_response(status: u16, body: Vec<u8>) -> Response<HttpBody> {
     response(status, "application/json; charset=utf-8", body)
 }
 
+fn json_value(status: u16, v: Value) -> Response<HttpBody> {
+    json_response(status, serde_json::to_vec(&v).unwrap_or_default())
+}
+
 fn sse_bytes(json: Vec<u8>) -> Bytes {
     let mut b = Vec::with_capacity(json.len() + 8);
     b.extend_from_slice(b"data: ");
@@ -217,7 +222,17 @@ fn stop_reason_json(o: &mut Vec<u8>, s: &Option<StopReason>) {
     }
 }
 
-fn usage(o: &mut Vec<u8>, prompt: usize, completion: usize, cached: Option<u64>, details: bool, full: bool) {
+/// `reasoning`: a chat reply's reasoning tokens, as `completion_tokens_details.reasoning_tokens` (OpenAI's field), so
+/// a client can tell visible output from reasoning.
+fn usage(
+    o: &mut Vec<u8>,
+    prompt: usize,
+    completion: usize,
+    cached: Option<u64>,
+    details: bool,
+    full: bool,
+    reasoning: Option<usize>,
+) {
     let mut u = Obj::new(o);
     u.int("prompt_tokens", prompt);
     u.int("total_tokens", prompt + completion);
@@ -229,6 +244,12 @@ fn usage(o: &mut Vec<u8>, prompt: usize, completion: usize, cached: Option<u64>,
         d.push(b'}');
     } else if full {
         u.raw("prompt_tokens_details", b"null");
+    }
+    if let Some(r) = reasoning {
+        let d = u.key("completion_tokens_details");
+        d.extend_from_slice(b"{\"reasoning_tokens\":");
+        pyjson::int(d, r);
+        d.push(b'}');
     }
     u.end();
 }
@@ -300,8 +321,13 @@ impl State {
     }
 }
 
-pub async fn route(st: &'static State, req: Request<Incoming>) -> Result<Response<HttpBody>, Infallible> {
+pub async fn route(
+    st: &'static State,
+    req: Request<Incoming>,
+    peer: std::net::SocketAddr,
+) -> Result<Response<HttpBody>, Infallible> {
     let path = req.uri().path();
+    let deep = req.uri().query().is_some_and(|q| q.split('&').any(|x| x == "deep" || x.starts_with("deep=")));
     let m = req.method().clone();
     let r = match (path, &m) {
         ("/v1/chat/completions", &Method::POST) => chat(st, req).await,
@@ -309,6 +335,7 @@ pub async fn route(st: &'static State, req: Request<Incoming>) -> Result<Respons
         ("/tokenize", &Method::POST) => tokenize(st, req).await,
         ("/detokenize", &Method::POST) => detokenize(st, req).await,
         ("/v1/models", &Method::GET | &Method::HEAD) => models(st),
+        ("/health", &Method::GET | &Method::HEAD) if deep => health_deep(st, peer).await,
         ("/health", &Method::GET | &Method::HEAD) => health(st),
         ("/metrics", &Method::GET | &Method::HEAD) => metrics_route(st).await,
         ("/v1/chat/completions" | "/v1/completions" | "/tokenize" | "/detokenize", _) => {
@@ -333,13 +360,15 @@ struct ChatReq {
     tool_choice: Value,
     prompt: Vec<u32>,
     params: sampling::Params,
+    /// the thinking budget in reply tokens; 0: none
+    budget: u64,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
     st.check_model(body)?;
     st.require_engine()?;
     if truthy(body.get("echo")) {
-        return Err(ApiError::bad("echo is not supported by the g6 front end", Some("echo")));
+        return Err(ApiError::bad("echo is not supported by the gr8 front end", Some("echo")));
     }
     let tools = normalize_tools(body.get("tools"))?;
     let tool_choice = match body.get("tool_choice") {
@@ -348,32 +377,38 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     };
     if tool_choice.is_object() || tool_choice.as_str() == Some("required") {
         return Err(ApiError::bad(
-            "named / required tool_choice is not supported by the g6 front end",
+            "named / required tool_choice is not supported by the gr8 front end",
             Some("tool_choice"),
         ));
     }
+    thinking::check_response_format(body.get("response_format"))?;
+    let th = thinking::resolve(body, &st.template.levels, st.thinking)?;
     let kw = build_template_kwargs(
         body.get("chat_template_kwargs"),
         body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
         body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false)),
-        body.get("reasoning_effort"),
+        th.effort,
         body.get("documents"),
     )?;
     if truthy(body.get("chat_template")) {
         return Err(ApiError::bad("custom chat_template is not supported", Some("chat_template")));
     }
     let t0 = std::time::Instant::now();
+    let kw_system = kw.clone();
     let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
     let (t1, chars) = (std::time::Instant::now(), text.len());
     let add_special = truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
+    let t2 = std::time::Instant::now();
+    let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await;
     log::debug!(
-        "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms",
+        "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms, system span {system:?} tokens {:.2} ms",
         prompt.len(),
         (t1 - t0).as_secs_f64() * 1e3,
-        t1.elapsed().as_secs_f64() * 1e3
+        (t2 - t1).as_secs_f64() * 1e3,
+        t2.elapsed().as_secs_f64() * 1e3
     );
-    let params = sampling::build(
+    let mut params = sampling::build(
         body,
         raw,
         prompt.len(),
@@ -385,7 +420,44 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         st.max_logprobs(),
         true,
     )?;
-    Ok(ChatReq { tools, tool_choice, prompt, params })
+    // the close a budget puts in has no logprobs: a request that asks for both is refused, and the server's default
+    // budget leaves a logprobs request alone
+    let budget = match (th.budget, params.gen.logprobs.is_some()) {
+        (b, true) if b > 0 && th.budget_explicit => {
+            return Err(ApiError::bad("thinking_budget cannot be combined with logprobs", Some("thinking_budget")))
+        }
+        (_, true) => 0,
+        (b, false) => b,
+    };
+    params.gen.system_tokens = system;
+    Ok(ChatReq { tools, tool_choice, prompt, params, budget })
+}
+
+/// The prompt's system span (PROTOCOL.md `system_tokens`): its tokens up to where the first message after the leading
+/// system ones begins, found by rendering those messages and the tools alone. The engine's KV stores keep system
+/// prefixes by it. None when the template cannot render them alone.
+async fn system_span(
+    st: &'static State,
+    messages: Option<&Value>,
+    tools: Option<&Value>,
+    mut kw: Map<String, Value>,
+    add_special: bool,
+    prompt: &[u32],
+) -> Option<u64> {
+    let lead: Vec<Value> = messages?
+        .as_array()?
+        .iter()
+        .take_while(|m| matches!(m.get("role").and_then(Value::as_str), Some("system" | "developer")))
+        .cloned()
+        .collect();
+    if lead.is_empty() && tools.is_none() {
+        return Some(0);
+    }
+    kw.insert("add_generation_prompt".into(), Value::Bool(false));
+    kw.insert("continue_final_message".into(), Value::Bool(false));
+    let text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    let ids = st.tok.aencode(text, add_special).await.ok()?;
+    Some(ids.iter().zip(prompt).take_while(|(a, b)| a == b).count() as u64)
 }
 
 async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
@@ -403,6 +475,22 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
+    if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
+        if think_open(&gen.prompt, start, end) {
+            let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
+            if limit > 0 && !st.tok.think_close.is_empty() && st.engine.inserts() {
+                // the engine puts the close in place of the budget-th reply token itself: no second run
+                gen.params.gen.insert = Some(InsertRule {
+                    after_tokens: limit as u64 - 1,
+                    unless_emitted: Some(end),
+                    tokens: st.tok.think_close.clone(),
+                });
+                gen.thinking(end, None);
+            } else {
+                gen.thinking(end, (limit > 0).then_some(Budget { limit, close: &st.tok.think_close }));
+            }
+        }
+    }
     if stream {
         let (sse, resp) = Sse::open();
         tokio::spawn(async move { chat_stream(st, body, gen, parser, sse).await });
@@ -501,6 +589,7 @@ fn chat_full(
         Some(res.cached_tokens),
         st.prompt_tokens_details,
         true,
+        Some(res.reasoning_tokens),
     );
     if let Err(e) = L::prompt_logprobs(c.key("prompt_logprobs"), res.prompt_logprobs.as_deref(), &gen.prompt, &st.tok) {
         return ApiError::new(500, &e, None).response();
@@ -594,7 +683,7 @@ async fn chat_stream(
                     ids_json(c.key("prompt_token_ids"), &gen.prompt);
                 }
                 if continuous {
-                    usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false);
+                    usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false, None);
                 }
                 c.end();
                 if sse.json(o).await.is_err() {
@@ -613,7 +702,15 @@ async fn chat_stream(
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "chat.completion.chunk", created, &st.model_name);
             c.raw("choices", b"[]");
-            usage(c.key("usage"), res.prompt_tokens, res.completion_tokens, Some(res.cached_tokens), st.prompt_tokens_details, false);
+            usage(
+                c.key("usage"),
+                res.prompt_tokens,
+                res.completion_tokens,
+                Some(res.cached_tokens),
+                st.prompt_tokens_details,
+                false,
+                Some(res.reasoning_tokens),
+            );
             c.end();
             if sse.json(o).await.is_err() {
                 return Ok(());
@@ -686,7 +783,7 @@ async fn chat_step(
         ch.push(b']');
     }
     if continuous {
-        usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false);
+        usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None);
     }
     c.end();
     sse.json(o).await
@@ -719,7 +816,7 @@ async fn prompt_ids(st: &'static State, body: &Map<String, Value>) -> Result<Vec
             Ok(ids)
         }
         Some(Value::Array(a)) if a.len() > 1 => Err(ApiError::bad(
-            "batched prompts are not supported by the g6 front end; send one prompt per request",
+            "batched prompts are not supported by the gr8 front end; send one prompt per request",
             Some("prompt"),
         )),
         _ => Err(ApiError::bad("`prompt` must be a string or a non-empty list of token ids", Some("prompt"))),
@@ -736,9 +833,10 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
         st.require_engine()?;
         for k in ["echo", "suffix"] {
             if truthy(body.get(k)) {
-                return Err(ApiError::bad(format!("`{k}` is not supported by the g6 front end"), Some(k)));
+                return Err(ApiError::bad(format!("`{k}` is not supported by the gr8 front end"), Some(k)));
             }
         }
+        thinking::check_response_format(body.get("response_format"))?;
         let prompt = prompt_ids(st, &body).await?;
         let params = sampling::build(
             &body,
@@ -821,6 +919,7 @@ fn completions_full(st: &State, body: &Map<String, Value>, gen: &Generation, cre
         Some(res.cached_tokens),
         st.prompt_tokens_details,
         true,
+        None,
     );
     c.raw("kv_transfer_params", b"null");
     c.end();
@@ -894,7 +993,7 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
             }
             first = false;
             if continuous {
-                usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false);
+                usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None);
             }
             c.end();
             if sse.json(o).await.is_err() {
@@ -913,6 +1012,7 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
                 Some(res.cached_tokens),
                 st.prompt_tokens_details,
                 false,
+                None,
             );
             c.end();
             if sse.json(o).await.is_err() {
@@ -949,7 +1049,9 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                     None,
                 ));
             }
-            let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, None, None)?;
+            // the same effort and the same refusals as a chat request, so the counts agree
+            let th = thinking::resolve(&body, &st.template.levels, st.thinking)?;
+            let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
             let tools = normalize_tools(body.get("tools"))?;
             let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
             st.tok
@@ -1037,7 +1139,7 @@ fn models(st: &State) -> Response<HttpBody> {
             m.str("id", name);
             m.str("object", "model");
             m.int("created", st.started);
-            m.str("owned_by", "g6");
+            m.str("owned_by", "gr8");
             m.str("root", &st.model_dir);
             m.raw("parent", b"null");
             m.int("max_model_len", st.max_model_len());
@@ -1054,6 +1156,38 @@ fn health(st: &State) -> Response<HttpBody> {
     let mut r = Response::new(HttpBody::Full(None));
     *r.status_mut() = if st.engine.ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     r
+}
+
+/// /health?deep: the head's supervisor checks every rank (weights against the engine's sealed sums, while it serves) and
+/// answers with one JSON object; 200 when every rank passes, else 503. Each check reads every weight byte once, so it
+/// answers localhost only.
+async fn health_deep(st: &State, peer: std::net::SocketAddr) -> Response<HttpBody> {
+    if !peer.ip().is_loopback() {
+        return json_value(403, serde_json::json!({"ok": false, "error": "/health?deep answers localhost only"}));
+    }
+    let Some(addr) = st.supervisor.as_deref() else {
+        return json_value(503, serde_json::json!({"ok": false, "error": "no supervisor (--supervisor HOST:PORT)"}));
+    };
+    match tokio::time::timeout(Duration::from_secs(90), ask_supervisor(addr, r#"{"t": "check_all"}"#)).await {
+        Ok(Ok(v)) => {
+            let ok = v.get("ok").and_then(Value::as_bool) == Some(true);
+            json_value(if ok { 200 } else { 503 }, v)
+        }
+        Ok(Err(e)) => json_value(503, serde_json::json!({"ok": false, "error": format!("supervisor {addr}: {e}")})),
+        Err(_) => {
+            json_value(503, serde_json::json!({"ok": false, "error": format!("supervisor {addr}: no answer in 90 s")}))
+        }
+    }
+}
+
+/// One JSON line to a supervisor's control port, one JSON line back.
+async fn ask_supervisor(addr: &str, msg: &str) -> Result<Value, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut s = tokio::net::TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+    s.write_all(format!("{msg}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&line).map_err(|e| format!("bad answer: {e}"))
 }
 
 async fn metrics_route(st: &State) -> Response<HttpBody> {

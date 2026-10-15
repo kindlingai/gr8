@@ -1,8 +1,12 @@
 """HTTP-level tests against a running front end + mock engine (tests/serve_mock.sh start).
-Run: URL=http://127.0.0.1:8100 python -m unittest tests.test_api -v"""
+Run: URL=http://127.0.0.1:8100 python -m unittest tests.test_api -v
+/health?deep needs the front end started with FRONT_ARGS='--supervisor 127.0.0.1:8198' (SUP_PORT): the test plays the
+supervisor there."""
 import http.client
 import json
 import os
+import socketserver
+import threading
 import time
 import unittest
 import urllib.error
@@ -55,7 +59,8 @@ class Chat(unittest.TestCase):
         self.assertEqual(''.join(d.get('content') or '' for d in deltas), msg['content'] or '')
         self.assertEqual(chunks[-1]['choices'], [])
         self.assertEqual(chunks[-1]['usage'], {k: full['usage'][k] for k in
-                                               ('prompt_tokens', 'total_tokens', 'completion_tokens')})
+                                               ('prompt_tokens', 'total_tokens', 'completion_tokens',
+                                                'completion_tokens_details')})
         self.assertEqual(chunks[-2]['choices'][0]['finish_reason'], full['choices'][0]['finish_reason'])
         self.assertEqual(full['usage']['completion_tokens'], 60)
 
@@ -127,6 +132,96 @@ class Chat(unittest.TestCase):
             metric('vllm:request_success_total{engine="0",model_name="glm-5.3",finished_reason="abort"}'), before)
 
 
+def reasoning_tokens(r):
+    return r['usage']['completion_tokens_details']['reasoning_tokens']
+
+
+def bad(path, body):
+    """-> the error message of a request that must be a 400"""
+    s, e = post(path, body)
+    assert s == 400, (s, e)
+    return e['error']['message']
+
+
+class Thinking(unittest.TestCase):
+    """reasoning_effort, thinking_budget and the refusals (GLM 5.3's template cannot turn thinking off)."""
+
+    def test_reasoning_tokens_count_through_think_end(self):
+        s, r = post('/v1/chat/completions', CHAT)
+        n = post('/tokenize', {'model': 'glm-5.3', 'prompt': r['choices'][0]['message']['reasoning'],
+                               'add_special_tokens': False})[1]['count']
+        self.assertEqual(reasoning_tokens(r), n + 1)    # the mock's reasoning, then </think>
+
+    def test_budget_closes_the_think_block_and_the_answer_follows(self):
+        body = dict(CHAT, messages=[{'role': 'user', 'content': "Solve. Answer as '#### <number>'."}],
+                    max_tokens=200, thinking_budget=5)
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertTrue(msg['content'].endswith('#### 42'), msg)
+        self.assertEqual(reasoning_tokens(r), 6)        # 4 tokens, then the close's "\n" and </think>
+        self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+        chunks = sse('/v1/chat/completions', dict(body, stream_options={'include_usage': True}))
+        deltas = [c['choices'][0]['delta'] for c in chunks if c['choices']]
+        self.assertEqual(''.join(d.get('reasoning', '') for d in deltas), msg['reasoning'])
+        self.assertEqual(''.join(d.get('content') or '' for d in deltas), msg['content'])
+        self.assertEqual(chunks[-1]['usage'], {k: r['usage'][k] for k in
+                                               ('prompt_tokens', 'total_tokens', 'completion_tokens',
+                                                'completion_tokens_details')})
+        # every reply token once: the ids returned are the completion tokens
+        s, r = post('/v1/chat/completions', dict(body, return_token_ids=True))
+        self.assertEqual(len(r['choices'][0]['token_ids']), r['usage']['completion_tokens'])
+        self.assertEqual(r['choices'][0]['token_ids'][4:7], [198, 154842, 271])   # the 5th token is the close
+
+    def test_budget_counts_against_max_tokens(self):
+        s, r = post('/v1/chat/completions', dict(CHAT, thinking_budget=5))
+        self.assertEqual((r['usage']['completion_tokens'], reasoning_tokens(r)), (60, 6))
+        self.assertEqual(r['choices'][0]['finish_reason'], 'length')
+        self.assertTrue(r['choices'][0]['message']['content'])
+
+    def test_budget_zero_null_or_negative_is_no_limit_without_a_default(self):
+        s, plain = post('/v1/chat/completions', CHAT)
+        for b in (0, None, -3):
+            s, r = post('/v1/chat/completions', dict(CHAT, thinking_budget=b))
+            self.assertEqual(r['choices'][0]['message'], plain['choices'][0]['message'], b)
+
+    def test_efforts_render_the_nearest_named_level(self):
+        def ids(**kw):
+            return post('/tokenize', dict({'model': 'glm-5.3', 'messages': CHAT['messages']}, **kw))[1]['tokens']
+        default, low, high = ids(), ids(reasoning_effort='low'), ids(reasoning_effort='high')
+        self.assertEqual(ids(reasoning_effort='max'), default)
+        self.assertEqual(ids(reasoning_effort='xhigh'), default)
+        self.assertEqual(ids(reasoning_effort='minimal'), low)
+        self.assertEqual(ids(reasoning_effort='medium'), high)
+        self.assertEqual(ids(chat_template_kwargs={'reasoning_effort': 'minimal'}), low)
+        self.assertEqual(ids(chat_template_kwargs={'enable_thinking': True}), default)
+        self.assertNotEqual(low, default)
+        self.assertNotEqual(high, default)
+        s, r = post('/v1/chat/completions', dict(CHAT, reasoning_effort='medium'))
+        self.assertEqual(r['usage']['prompt_tokens'], len(high))
+
+    def test_refusals(self):
+        for path in ('/v1/chat/completions', '/tokenize'):
+            m = bad(path, dict(CHAT, chat_template_kwargs={'enable_thinking': False}))
+            self.assertIn('thinking cannot be disabled', m)
+            self.assertIn('reasoning_effort "low"', m)
+            self.assertIn('"none"', bad(path, dict(CHAT, reasoning_effort='none')))
+            for e in ('auto', 'LOW', 3):
+                self.assertEqual(bad(path, dict(CHAT, reasoning_effort=e)),
+                                 'reasoning_effort must be none, minimal, low, medium, high, xhigh or max')
+        for b in (True, 1.5, 'abc', [5]):
+            self.assertEqual(bad('/v1/chat/completions', dict(CHAT, thinking_budget=b)),
+                             'thinking_budget must be an integer or null')
+        self.assertIn('logprobs', bad('/v1/chat/completions', dict(CHAT, thinking_budget=5, logprobs=True)))
+
+    def test_response_format(self):
+        self.assertEqual(post('/v1/chat/completions', dict(CHAT, response_format={'type': 'text'}))[0], 200)
+        for rf in ({'type': 'json_object'}, {'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': {}}}):
+            for path, body in (('/v1/chat/completions', CHAT),
+                               ('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4})):
+                self.assertIn('is not supported by the gr8 front end yet', bad(path, dict(body, response_format=rf)))
+
+
 class Completions(unittest.TestCase):
     def test_stop_string(self):
         s, r = post('/v1/completions', {'model': 'glm-5.3', 'prompt': 'Tell me a story.', 'max_tokens': 200,
@@ -140,8 +235,7 @@ class Completions(unittest.TestCase):
 
     def test_d8_kl_gen_shape(self):
         s, t = post('/tokenize', {'model': 'glm-5.3', 'add_generation_prompt': True,
-                                  'messages': [{'role': 'user', 'content': 'hi'}],
-                                  'chat_template_kwargs': {'enable_thinking': False}})
+                                  'messages': [{'role': 'user', 'content': 'hi'}]})
         s, r = post('/v1/completions', {'model': 'glm-5.3', 'prompt': t['tokens'], 'max_tokens': 8,
                                         'temperature': 0, 'return_tokens_as_token_ids': True, 'logprobs': 1})
         toks = [int(x.split(':')[1]) for x in r['choices'][0]['logprobs']['tokens']]
@@ -192,6 +286,46 @@ class Misc(unittest.TestCase):
         self.assertEqual(m['data'][0]['id'], 'glm-5.3')
         self.assertEqual(urllib.request.urlopen(URL + '/health').status, 200)
         self.assertGreaterEqual(metric('vllm:spec_decode_num_drafts_total'), 0)
+
+
+class FakeSupervisor(socketserver.StreamRequestHandler):
+    answer = {}
+
+    def handle(self):
+        self.server.asked.append(json.loads(self.rfile.readline()))
+        self.wfile.write((json.dumps(FakeSupervisor.answer) + '\n').encode())
+
+
+class DeepHealth(unittest.TestCase):
+    def get(self, path):
+        try:
+            with urllib.request.urlopen(URL + path, timeout=30) as f:
+                return f.status, json.loads(f.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_the_supervisor_decides_the_status(self):
+        socketserver.TCPServer.allow_reuse_address = True
+        try:
+            srv = socketserver.TCPServer(('127.0.0.1', int(os.environ.get('SUP_PORT', 8198))), FakeSupervisor)
+        except OSError as e:
+            self.skipTest(f'cannot play the supervisor: {e}')
+        srv.asked = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            FakeSupervisor.answer = {'t': 'check', 'ok': True, 'ranks': [{'rank': 0, 'ok': True}]}
+            s, r = self.get('/health?deep')
+            if s == 503 and 'no supervisor' in r.get('error', ''):
+                self.skipTest("the front end has no --supervisor (FRONT_ARGS='--supervisor 127.0.0.1:8198')")
+            self.assertEqual((s, r['ranks'][0]['ok']), (200, True))
+            self.assertEqual(srv.asked[-1], {'t': 'check_all'})
+            FakeSupervisor.answer = {'t': 'check', 'ok': False, 'ranks': [{'rank': 0, 'ok': False}]}
+            self.assertEqual(self.get('/health?deep')[0], 503)
+            self.assertEqual(urllib.request.urlopen(URL + '/health').status, 200)     # plain /health asks nobody
+            self.assertEqual(len(srv.asked), 2)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == '__main__':

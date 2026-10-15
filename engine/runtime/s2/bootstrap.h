@@ -3,6 +3,7 @@
 #pragma once
 #include "control_io.h"
 #include "ingress.h"
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -146,6 +147,43 @@ inline ControlLinks bootstrap(const BootstrapConfig& c) {
         }
         return out;
     } catch (...) { out.shutdown(); throw; }
+}
+// After bootstrap, every rank sends its lines (one stored entry each). The head keeps the lines every rank has, in its own
+// order, and sends them back. Every rank then starts from the same stored entries (pool.h keep_agreed).
+inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, const std::string& mine) {
+    auto lines = [](const std::string& s) {
+        std::vector<std::string> v;
+        for (size_t a = 0; a < s.size();) {
+            size_t e = s.find('\n', a);
+            if (e == std::string::npos) e = s.size();
+            if (e > a) v.push_back(s.substr(a, e - a));
+            a = e + 1;
+        }
+        return v;
+    };
+    const std::string ask = "G6S2 STORED\n", agreed = "G6S2 AGREED\n";
+    if (c.rank) {
+        require(links.links.size() == 1 && links.links[0], "store agreement without head link");
+        links.links[0]->send(frame(ask + mine));
+        const auto b = links.links[0]->receive();
+        const std::string r(b.begin(), b.end());
+        require(r.rfind(agreed, 0) == 0, "store agreement: unexpected frame");
+        return r.substr(agreed.size());
+    }
+    std::vector<std::string> keep = lines(mine);
+    for (auto& io : links.links) {
+        require(bool(io), "store agreement with missing rank");
+        const auto b = io->receive();
+        const std::string r(b.begin(), b.end());
+        require(r.rfind(ask, 0) == 0, "store agreement: unexpected frame");
+        const auto theirs = lines(r.substr(ask.size()));
+        keep.erase(std::remove_if(keep.begin(), keep.end(), [&](const std::string& l) {
+            return std::find(theirs.begin(), theirs.end(), l) == theirs.end(); }), keep.end());
+    }
+    std::string out;
+    for (const auto& l : keep) out += l + "\n";
+    for (auto& io : links.links) io->send(frame(agreed + out));
+    return out;
 }
 // All-rank barrier after the boot graph capture (native.cuh capture_all, which runs after bootstrap): every worker reports
 // "captured" to the head and the head waits for all of them before it publishes ready.s2 (Service::run). The wait is

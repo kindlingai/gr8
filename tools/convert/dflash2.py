@@ -1,4 +1,4 @@
-"""DFlash2 drafter (one safetensors file + config.json) -> one g6 pack per rank for the drafter step
+"""DFlash2 drafter (one safetensors file + config.json) -> one gr8 pack per rank for the drafter step
 (engine/runtime/dflash.cuh). CPU only, numpy.
 
 python3 -m tools.convert.dflash2 --src DIR --out DIR --nr 4 [--ranks 0,1,2,3] [--bf16 conv,sel] [--drop-cache]

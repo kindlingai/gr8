@@ -2,7 +2,7 @@
 name = "g6load"
 version = "0.1.0"
 edition = "2021"
-description = "g6 pack loader: fills a device image from a (sparse) pack and its rank<r>.sources, in parallel"
+description = "gr8 pack loader: fills a device image from a (sparse) pack and its rank<r>.sources, in parallel"
 
 [lib]
 crate-type = ["staticlib", "rlib"]

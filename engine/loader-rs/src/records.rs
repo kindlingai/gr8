@@ -1,4 +1,4 @@
-//! g6's weight forms, built at load from decoded values. The decode GEMV records (engine/kernels/densev.cuh and
+//! gr8's weight forms, built at load from decoded values. The decode GEMV records (engine/kernels/densev.cuh and
 //! rowtile.cuh) follow the byte layouts of engine/ref/g6ref.py mxfp8_record, bf16_record, rt_record and
 //! rt_expert_record. Two round-to-nearest quantizers make MXFP8 and int4 copies of matrices the release stores otherwise:
 //!   MXFP8: the D2 equation of tools/convert/mxfp8.py, one E8M0 scale per 32 inputs, on fp32 inputs;

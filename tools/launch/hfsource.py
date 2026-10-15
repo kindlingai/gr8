@@ -4,7 +4,7 @@ Each box fetches only its part of the exlr8 release into --model-cache, and noth
 
     <cache>/hf/<org>--<repo>/refs/<rev>        the commit a revision resolved to (prepare resolves it again)
     <cache>/hf/<org>--<repo>/<commit>/
-        manifests/                             the width manifests (home, down1, up1)
+        manifests/                             the width manifests (home, down1, up1, bit*)
         tokenizer/                             config, generation config, tokenizer and chat template
         experts/                               this rank's expert halves at their file offsets (sparse files), and
                                                every layer's index file (tools/tune/fetch_ranks.py)

@@ -61,6 +61,11 @@ impl Engine {
         self.conn.lock().unwrap().hello.clone()
     }
 
+    /// The engine applies `generate`'s insert rule (its hello says `"insert": true`).
+    pub fn inserts(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))
+    }
+
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move { me.run().await });
@@ -230,6 +235,13 @@ impl Stream {
             _ => {}
         }
         m
+    }
+
+    /// Ask the engine to stop this request but keep reading it: its `finish` frame still arrives here.
+    pub fn cancel(&self) {
+        if !self.finished {
+            let _ = self.engine.send(wire::cancel(&self.id));
+        }
     }
 }
 

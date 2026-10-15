@@ -21,13 +21,13 @@ the short version.
 | `--layers all` | all | all 78 layers + the MTP layer |
 | `--qo-manifest` / `--qo-pack` | `packs/qo.*` | full-head attention weights for `G6_PF_OWN=3` (identical file on every node) |
 | `--qp-manifest` / `--qp-pack` | (TP4, not used) | resident pair weights for `G6_PF_OWN=4` (`tools/convert/pairpack.py`, one file per rank); the TP4 launcher uses `G6_PF_QP_ROLL` instead |
-| `--dflash-manifest` / `--dflash-pack` | TP4 launcher default (`DFLASH=1`; `DFLASH=0` for MTP) | replaces MTP with the DFlash2 block drafter (`engine/runtime/dflash.cuh`), packs from `tools/convert/dflash2.py` (one per rank, about 0.86 GB). It drafts 7 tokens per round in one forward. One request at a time it replaces `--mtp`; under S2, `--mtp` stays on: a request alone at its prompt tail drafts with DFlash2, the others with MTP. TP4 builds (the rank count must divide the drafter's 8 KV heads) |
+| `--dflash-manifest` / `--dflash-pack` | TP4 launcher default (`DFLASH=1`; `DFLASH=0` for MTP) | replaces MTP with the DFlash2 block drafter (`engine/runtime/dflash.cuh`), packs from `tools/convert/dflash2.py` (one per rank, about 0.86 GB). It drafts 7 tokens per round in one forward. Offline (`--prompt`) it replaces `--mtp`. Served, `--mtp` stays on: a request alone at its prompt tail drafts with DFlash2, the others with MTP. TP4 builds (the rank count must divide the drafter's 8 KV heads) |
 | `--dflash-sel 0\|1` | 1 (`DFLASH_SEL`) | 1 = the DFlash2 selector walk over the top-16 candidates of each position, 0 = the drafter's argmax (sampled with the target's position keys) |
 | `--dflash-k K` | 7 (`DFLASH_K`) | the drafts a round verifies (1..7); a verify step carries K + 1 rows. The drafter always drafts the whole block |
 | `--spec-accept coupled\|rejection` | coupled (`SPEC_ACCEPT`) | how verify steps accept drafts at temperature > 0, for MTP and the DFlash2 drafter. coupled: drafts are sampled with the target's position-keyed noise and kept when they equal the target's sample, so a seed gives the same text with or without speculation. rejection: greedy drafts, each kept with probability p(draft) under the request's temperature and top_p (the engine has no top_k or min_p), else replaced by a sample of p without it. The output distribution is the target's in both modes, but rejection gives other text for a seed. Which mode keeps more drafts depends on how close the drafter's distribution is to the target's. Temperature 0 is the same in both. Needs a drafter |
 | `--spec-adaptive` | TP4 launcher default with DFlash2 (`SPEC_ADAPT`, default 1 with DFlash2, 0 with MTP) | each round verifies the draft count with the most expected tokens per ms (`engine/runtime/spec_len.h`), from the drafter's own probability of each draft, recent acceptance per position and the verify cost by row count at 2200 MHz. MTP (`--mtp K`: up to K drafts) also stops its chain when one more draft does not pay. DFlash2 chooses among 1..`--dflash-k`. Every level gets a verify graph. Under S2 it is the policy of the DFlash2 sessions |
 | `--spec-levels 7,5,3,2` | all of 1..K (`SPEC_LEVELS`) | `--spec-adaptive`: the draft counts it may choose, for example 7,5,3,2 with the drafter or 1,2,4 with `--mtp 4`. The MTP chain drafts up to the next allowed count, so gaps are fine |
-| `--serve DIR` | `$G6_HOME/s2` | serve requests. A DEC_S2 build (every TP) always serves through S2: the shim drives DIR (`cmd.<n>` / `req.<n>` / `resp.<n>`), `DIR/ready.s2` appears once loaded. A build without DEC_S2 serves one request at a time: `DIR/req.<n>` in, rank 0 writes `DIR/resp.<n>`, `DIR/quit` ends it, `DIR/ready` appears once loaded |
+| `--serve DIR` | `$G6_HOME/s2` | serve requests through S2: the shim drives DIR (`cmd.<n>` / `req.<n>` / `resp.<n>`), `DIR/ready.s2` appears once loaded. Without it, g6m4 runs its `--prompt` sequences once and exits |
 | `--s2-port N` / `--s2-sessions S` / `--s2-epoch E` | 7341 (`S2PORT`) / 8 (`SESS`) / the boot epoch | S2: the head's control port, the sessions that decode at once (1-8), and the epoch every rank must share |
 | `--cap N` | 614400 | KV pool in tokens (the longest context) |
 | `--mtp K` | 2 | MTP speculative draft length |
@@ -47,6 +47,9 @@ the short version.
 | `G6_PF_TILE` | 64 | prefill attention query tile (64/128/256) |
 | `G6_PF_DENSE` | 8192 | context threshold for the dense prefill attention path; past it the sparse (indexer-selected) path runs; 0 = always sparse |
 | `G6_PF_RS` | 1 | prefill uses reduce-scatter + all-gather instead of all-reduce |
+| `G6_TEST_ZERO_DELAY_MS` | unset | a test of the zeroing order (#49, #54): every `dmalloc` zeroing waits behind an N ms kernel on the legacy stream, so a write to new memory not ordered after it loses every time. Boots take about N ms longer per allocation |
+| `G6_WEIGHT_CHECK` | 1 | sum each loaded image on the CPU and the GPU and stop the boot with exit 3 if they differ; seal the sums once ready to serve and answer `DIR/check.<n>` (`/health?deep`, engine/runtime/weight_check.cuh). 0 = off |
+| `G6_WEIGHT_CHECK_FLIP` | unset | `RANK:OFFSET`, a test of the weight check: flip one byte of rank RANK's first image after the load, so the boot stops with exit 3 |
 | `G6_PF_STREAMS` | 2 | the two prefill lanes run on two CUDA streams |
 | `G6_PF_ATTN_ROWS` | 1024 | prefill attention runs in chunks of this many rows inside a sub-batch |
 | `G6_PF_OWN` | 3 | row-owner prefill. 1 = the owner computes the next layer's projections. 2 = also the indexer. 3 = the owner runs the whole attention block for all 64 heads of its rows (QO; needs the QO pack, `G6_PF_RS=1`, `--pfv2`). 4 = TP4 only: pair-owner QO, OWN=3's attention block split over two head pairs ([DESIGN-QO-PAIR.md](DESIGN-QO-PAIR.md)); TP4 launcher default |
@@ -59,7 +62,7 @@ the short version.
 | `G6_PF_QP_WIRE_E` | 1 | `G6_PF_OWN=4` with `G6_PF_QP_ROLL`: entries (1..4) in the RDMA ring of half images |
 | `G6_PF_QP_ROLL_SER` | 0 | measurement: 1 = build rolling slots on the prefill stream (fully exposed) |
 | `G6_PF_BLAS_ROWS` | 1024 | prefill cuBLAS calls in chunks of this many rows (multiple of 16) |
-| `G6_PF_TIMES` | 1 | per-request prefill timing lines in rank 0's log |
+| `G6_PF_TIMES` | 1 | `m4sim --serve`: per-request timing lines on stderr, from the request file to the first token. g6m4 does not read it |
 | `G6_PF_HASH_GPU` | 1 | the per-sub-batch residual hash (rank agreement check) is computed on the GPU |
 | `G6_PF_RSDIRECT` | 1 | o_proj, dense down and the MoE final sum write straight into the reduce-scatter send slot |
 | `G6_PF_AOP` | 1 (when built with `-DPF_AOP`) | fc1 A-operand share: `k_pf_aop` quantizes the fc1 A operand once per (segment, matrix, distinct prologue input) into global records that the fc1 block-CTAs stage by cp.async. Needs build flag `-DPF_AOP`; 0 disables; `G6_PF_AOP_MMIN` (default 3072) sets the M floor. Byte-exact |
@@ -83,6 +86,7 @@ the short version.
 | `G6_PF_TR_BM` | 16 | row blocks per CTA of the prefill GEMM on trellis tiles (`k_gemm_tr`) for large launches: 16 (256 rows, 512 threads) or 8. Small launches take 4 |
 | `G6_GV_MULTI` | 1 | steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch; 0 = one launch each (same bits) |
 | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
+| `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
 | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
 | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
@@ -125,10 +129,10 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `DEC_IDX31=1` | decode index scorer reads each key once for all query rows and skips tiles another CP rank owns; select stops at the live end of the bucket (exact; needs `SEL32`) |
 | `G6_CP=1`, `G6_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
 | `PF_F12` (TP4 build only) | prefill expert fc1: one fat CTA runs `F12_NE` (default 2) adjacent expert blocks on one quantized A record (`kernels/bind_prefill.cuh`, `k_pf_fc1f`). `F12_NE` must divide the expert blocks per rank (4 at TP4, 3 at TP6). `G6_PF_F12=0` turns it off at run time |
+| `G6_KV4=1` (a build flag; experimental) | the MLA latent cached as INT4 after a Hadamard rotation, 416 B a row instead of 656 B (`attn/kvfmt.h`, [KV4.md](KV4.md)). Changes the outputs. The image ships it as `bin/g6m4-int4`, which `--kv-format int4` (`KV_FORMAT`) runs; `KV_FORMAT=int4 scripts/build.sh` builds it |
 
 ## Front end and shim
 
 The head runs a shim that hands requests to the engine: `frontend/g6s2shim.py --dir <the head's DIR> --sock <sock>`
-(the head engine passes them to the other ranks over its control links). `frontend/g6shim.py --rank-dirs` drives an
-older build without the multi-session path, writing to the other ranks over ssh. The API is the Rust front end,
+(the head engine passes them to the other ranks over its control links). The API is the Rust front end,
 `bin/g6front-rs --model-dir <tokenizer dir> --engine-sock <sock> --port 8100`. Its flags are in `frontend/README.md`.

@@ -1,4 +1,4 @@
-// serve.h's request parser (the --serve request file, frontend/g6shim.py writes it), host only.
+// serve.h's request parser (the m4sim --serve request file), host only.
 //   g++ -std=c++17 -O1 -fsanitize=address,undefined -I engine/runtime engine/runtime/tests/serve_parse_test.cpp -o /tmp/serve_parse_test
 #include "serve.h"
 
@@ -22,7 +22,7 @@ static bool refused(const std::string& text) { return parse(text).n_gen == 0; }
 
 int main()
 {
-    // a request as g6shim.py writes it
+    // a request with every key the format has
     ServeReq r = parse("n_gen 16 temp 0.7 seed 1235 min 2 stop 154820,154827 top_p 0.9 lp 5\n5,6,154879\n");
     CHECK(r.n_gen == 16 && r.min_tokens == 2 && r.seed == 1235u && r.temp > 0.69f && r.top_p > 0.89f && r.lp == 5);
     CHECK(r.plp == -1 && r.stop == (std::vector<int>{154820, 154827}) && r.prompt == (std::vector<int>{5, 6, 154879}));

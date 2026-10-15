@@ -19,6 +19,8 @@ import urllib.request
 
 PROTO = '0.99'
 PING_S = 2.0
+# the service a KV node (./gr8 kv up) announces
+KV_SERVICE = 'gr8-kv'
 
 
 def frame(header):
@@ -101,6 +103,29 @@ def members(snap, group):
         if a.get('alive') and (a.get('machine') or {}).get('gpus') and a.get('node_ip'):
             seen.setdefault(a['node_ip'], (a.get('node_id', ''), (a.get('meta') or {}).get('gr8.offers')))
     return sorted(((ip, n, o) for ip, (n, o) in seen.items()), key=lambda x: ipaddress.ip_address(x[0]))
+
+
+def kv_nodes(snap, group):
+    """[(address, port, meta)] of the group's live KV nodes (agents announcing KV_SERVICE), by address. meta has
+    gr8.kv.bytes and gr8.kv.rdma, the node's addresses with a RoCE v2 GID."""
+    agents = ((snap.get('groups') or {}).get(group) or {}).get('agents') or {}
+    out = []
+    for a in agents.values():
+        svc = (a.get('services') or {}).get(KV_SERVICE)
+        if a.get('alive') and svc and a.get('node_ip'):
+            out.append((svc.get('host') or a['node_ip'], int(svc['port']), a.get('meta') or {}))
+    return sorted(out, key=lambda x: ipaddress.ip_address(x[0]))
+
+
+def kv_target(nodes, rails):
+    """host:port of the KV node a box with these fabric addresses should use: the first node with an RDMA address on
+    one of the rails' /24 subnets, else the first node's LAN address (TCP)."""
+    nets = {a.rsplit('.', 1)[0] for a in rails if a}
+    for _, port, meta in nodes:
+        for a in filter(None, (meta.get('gr8.kv.rdma') or '').split(',')):
+            if a.rsplit('.', 1)[0] in nets:
+                return f'{a}:{port}'
+    return f'{nodes[0][0]}:{nodes[0][1]}' if nodes else None
 
 
 def format_offers(ranks):

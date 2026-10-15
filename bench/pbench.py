@@ -13,7 +13,8 @@ ap.add_argument('--sizes', default='8192,32768')
 ap.add_argument('--decode-tokens', type=int, default=1500)
 ap.add_argument('--temp', type=float, default=0.7)
 ap.add_argument('--min-p', type=float, default=0.0)
-ap.add_argument('--effort', default='low', help='low|high|max|nothink')
+ap.add_argument('--effort', default='low', help='low|high|max, or nothink: no thinking controls (GLM 5.3 cannot turn '
+                                                'thinking off, so the template default, Max)')
 ap.add_argument('--no-prefill', action='store_true')
 a = ap.parse_args()
 
@@ -39,7 +40,7 @@ def stream(messages, max_tokens):
     TEXT.clear()
     p = {'model': 'glm-5.3', 'messages': messages, 'max_tokens': max_tokens, 'stream': True,
          'temperature': a.temp, 'min_p': a.min_p, 'stream_options': {'include_usage': True},
-         'chat_template_kwargs': ({'enable_thinking': False} if a.effort == 'nothink' else {'reasoning_effort': a.effort})}
+         'chat_template_kwargs': ({} if a.effort == 'nothink' else {'reasoning_effort': a.effort})}
     t0 = time.time(); tfirst = None; usage = None; S['tc'] = None; CONTENT.clear()
     with req(p) as r:
         for line in r:

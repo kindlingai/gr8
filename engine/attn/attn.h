@@ -20,6 +20,10 @@ struct G6Attn {
     // keys whose page (pos / page_size) % cp_nr == cp_rank, block_table holds G6_CP_REMOTE for pages stored elsewhere,
     // page_count = physical pages of this rank (the replay cell's page_count is then ignored).
     int cp_nr, cp_rank;
+    // cp_nr = 0 only: the index cache's page of each logical page (table_size entries). nullptr = block_table. The staged
+    // prefill view of an S2 run below R sets it: its block_table addresses the staging pool, while the run's index keys
+    // stay on its own pages. Other staged views stage the index keys in the pool too (runtime/prefill.cuh).
+    const int *index_table;
 #endif
 #ifdef DEC_S2
     // S2 batched step (the replay cell carries per-row sessions, replay.h G6AttnRow): set by g6_attn_bind_prepare from

@@ -1,6 +1,6 @@
 # Working on this repo
 
-g6 serves the full GLM 5.3 on three, four or six GB10 boxes, and every change has to keep its numbers. Most of what follows is
+gr8 serves the full GLM 5.3 on three, four or six GB10 boxes, and every change has to keep its numbers. Most of what follows is
 about proving a change does, before it lands.
 
 If you're an agent working here, read this whole file first. If you're a person, the same rules apply to you.
@@ -29,13 +29,16 @@ On a GB10 with CUDA 13:
     scripts/build.sh bin6           # the TP=6 engine
 
 `scripts/build.sh` also builds and runs `test_spec_len` and `test_prefix_reuse`, and `tr3_e4m3_test` when a GPU is
-visible. A PR builds every topology (CI's engine build does).
+visible. A PR builds every topology (CI's engine build does). g6m4 links the S2 page allocator from
+`engine/kvman-rs`, which build.sh builds with cargo. Where cargo is missing, build that crate (and `engine/loader-rs`)
+first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 
 ## Test
 
 | test | where | command |
 |---|---|---|
-| S2 batch planner, control barrier, pool reuse | any Linux box with g++ | `scripts/host_tests.sh` |
+| S2 batch planner (with insert rules), control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced, the pool's block stores (`--kv-store`) in lock-step through memory, a file and a loopback KV node | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
+| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
 | row budget, S2 attention, decode heads | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |
@@ -44,7 +47,7 @@ visible. A PR builds every topology (CI's engine build does).
 | the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |
 | a rank image planned from the release (`--v2-dense`) against an independent derivation | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py` |
 | m4sim from the release against a PyTorch forward of the same weights | one GB10, transformers with `glm_moe_dsa` | `engine/ref/release_forward.py` |
-| the launch: options, model sets, handshake, mentat | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
+| the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`) | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
 | the launch end to end (four supervisors, stub engines) | Linux (it needs 127.0.0.2-4) | the line above runs it, and skips it elsewhere |
 
 A kernel or anything else that changes numerics gets an exactness or tolerance test against the path it replaces, and
@@ -58,13 +61,15 @@ and engine build, and each starts its own rank; `status`, `logs` and `down` work
 The engine command line lives in `scripts/engine_args.sh`. The supervisor and the deprecated ssh launchers
 (`./gr8 glm53 --ssh up`) both build it from there, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
 
-S2 is the served path at every TP. A DEC_S2 build (`scripts/build.sh` builds all three that way) always serves through
-S2 (`g6m4 --serve`): up to `SESS` requests at once, and at TP=4 the DFlash2 drafter for a request that runs alone (TP=3
-and TP=6 are MTP only). `scripts/launch_tp4.sh`, `launch_tp3.sh` and `launch_tp6.sh` run `scripts/launch_s2.sh` with
-four, three or six ranks. A change to decode, prefill or the scheduler is measured under S2, and multi-session output
-must stay byte-identical to each request run alone.
+S2 is the only served path. `scripts/build.sh` builds every TP with DEC_S2, which g6m4 needs. `g6m4 --serve` serves up
+to `SESS` requests at once, and at TP=4 the DFlash2 drafter for a request that runs alone (TP=3 and TP=6 are MTP only).
+`scripts/launch_tp4.sh`, `launch_tp3.sh` and `launch_tp6.sh` run `scripts/launch_s2.sh` with four, three or six ranks.
+A change to decode, prefill or the scheduler is measured under S2. Its output must stay byte-identical to the build
+before it for the same requests in the same order, alone and sharing steps (m4sim prints every session's lines, so
+compare its stdout between the two builds). Sharing steps can change a request's output against its solo run, so
+that is not the comparison.
 
-A change to the packs, the loader or the converter needs a boot with the pack hash check on (no `NOHASH=1`).
+A change to the loader or the converter needs a boot with the hash check on (no `NOHASH=1`).
 
 A change to `./gr8 glm53`, the supervisor or a launcher keeps every knob working, and keeps the checks to failures a
 boot cannot survive. A new knob that reaches the engine goes in `scripts/engine_args.sh` and `tools/launch/options.py`

@@ -1,4 +1,4 @@
-// g6 stage-0 transport trace (G6_XTRACE=1; default off). Measurement only: nothing here feeds a compute result.
+// gr8 stage-0 transport trace (G6_XTRACE=1; default off). Measurement only: nothing here feeds a compute result.
 // GPU side: one record of XT_W u64 per (step % XT_STEPS, collective) in DEVICE memory (FabricDev::xt; null = off).
 //   [0] globaltimer before the final publish work (last CTA, before its system fence + doorbell store)
 //   [1] globaltimer right after the doorbell store       [2 + p] globaltimer when peer p's tail was seen (own = 0)

@@ -19,10 +19,9 @@ class Client:
         with self._post('/tokenize', {'model': self.model, 'prompt': text, 'add_special_tokens': False}) as r:
             return json.load(r)['tokens']
 
-    def tokenize_chat(self, messages, enable_thinking=False):
-        """Chat-templated prompt ids (generation prompt added). -> list of token ids."""
-        body = {'model': self.model, 'messages': messages, 'add_generation_prompt': True,
-                'chat_template_kwargs': {'enable_thinking': enable_thinking}}
+    def tokenize_chat(self, messages):
+        """Chat-templated prompt ids (generation prompt added, the template's default effort). -> list of token ids."""
+        body = {'model': self.model, 'messages': messages, 'add_generation_prompt': True}
         with self._post('/tokenize', body) as r:
             return json.load(r)['tokens']
 
@@ -43,8 +42,10 @@ class Client:
     def chat(self, messages, max_tokens, temperature=0.7, effort='nothink', min_p=0.0):
         """Streamed /v1/chat/completions. Times the first generated token (reasoning or content).
         -> dict: ttft, decode_s, tokens (completion_tokens from usage), prompt_tokens, cached_tokens, content,
-        reasoning, finish_reason."""
-        kwargs = {'enable_thinking': False} if effort == 'nothink' else {'reasoning_effort': effort}
+        reasoning, finish_reason.
+        effort 'nothink' sends no thinking controls: GLM 5.3 cannot turn thinking off (the front end refuses
+        enable_thinking false), so it renders the template's default effort, Max, as it always did."""
+        kwargs = {} if effort == 'nothink' else {'reasoning_effort': effort}
         body = {'model': self.model, 'messages': messages, 'max_tokens': max_tokens, 'stream': True,
                 'temperature': temperature, 'min_p': min_p, 'stream_options': {'include_usage': True},
                 'chat_template_kwargs': kwargs}

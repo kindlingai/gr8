@@ -18,6 +18,20 @@ inline std::vector<int> request_ids(const std::string& s) {
     } while (true);
     return out;
 }
+// `ins <after>:<unless or -1>:<id,id,..>` (insert_rule.h)
+inline g6rt::InsertRule parse_insert(const std::string& s) {
+    const auto a = s.find(':'), b = a == std::string::npos ? a : s.find(':', a + 1);
+    require(b != std::string::npos, "invalid ins header");
+    g6rt::InsertRule r;
+    const auto after = number(s.substr(0, a));
+    require(after <= INT32_MAX, "invalid ins after");
+    r.after = int(after);
+    const auto unless = s.substr(a + 1, b - a - 1);
+    r.unless = unless == "-1" ? -1 : int(std::min<uint64_t>(number(unless), INT32_MAX));
+    r.tokens = request_ids(s.substr(b + 1));
+    require(!r.tokens.empty() && r.tokens.size() <= size_t(g6rt::INSERT_MAX), "invalid ins token count");
+    return r;
+}
 inline g6rt::ServeReq parse_request(const std::string& bytes) {
     const auto line = bytes.find('\n'); require(line != std::string::npos, "request missing prompt line");
     std::istringstream in(bytes.substr(0, line));
@@ -25,13 +39,17 @@ inline g6rt::ServeReq parse_request(const std::string& bytes) {
     require(bool(in >> k) && k == "n_gen" && bool(in >> gen >> k) && k == "temp" &&
             bool(in >> r.temp >> k) && k == "seed" && bool(in >> seed >> k) && k == "min" &&
             bool(in >> min >> k) && k == "stop" && bool(in >> stop), "invalid request header");
-    // optional, in this order: top_p <float>, lp <k>, plp <k>
+    // optional, in this order: top_p <float>, lp <k>, plp <k>, sys <tokens>, ins <rule>
     auto next = [&] { if (!(in >> k)) k.clear(); };
     next();
     if (k == "top_p") { require(bool(in >> r.top_p), "invalid top_p header"); next(); }
     if (k == "lp") { require(bool(in >> r.lp) && r.lp >= 0 && r.lp <= g6rt::LP_MAX, "invalid lp header"); next(); }
     if (k == "plp") { require(bool(in >> r.plp) && r.plp >= 0 && r.plp <= g6rt::LP_MAX, "invalid plp header"); next(); }
-    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp and plp)");
+    if (k == "sys") { require(bool(in >> r.sys) && r.sys >= 0 && r.sys <= INT32_MAX, "invalid sys header"); next(); }
+    if (k == "ins") { std::string v; require(bool(in >> v), "invalid ins header"); r.ins = parse_insert(v); next(); }
+    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys and ins)");
+    // an inserted token has no logprob entry
+    require(!r.ins.on() || r.lp < 0, "ins with lp");
     auto g = number(gen), sd = number(seed), mn = number(min);
     require(g > 0 && g <= INT32_MAX && sd <= UINT32_MAX && mn <= g &&
             std::isfinite(r.temp) && r.temp >= 0 && std::isfinite(r.top_p) && r.top_p >= 0 && r.top_p <= 1,
@@ -65,7 +83,7 @@ public:
     ~Sessions() { for (auto& s : sessions_) if (s.emitter.f) fclose(s.emitter.f); }
     Sessions(const Sessions&) = delete; Sessions& operator=(const Sessions&) = delete;
     static Request request(uint64_t id, const g6rt::ServeReq& r) { return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen)}; }
-    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0}; }
+    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins}; }
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;
     void bind(const Grant& g, const g6rt::ServeReq& r) {
@@ -73,16 +91,21 @@ public:
         auto& s = sessions_[g.key.slot]; require(!s.bound, "session already bound");
         auto req = request(g.req.id, r);
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
-                reserve_pages(config_, req) == g.run.pages, "session payload/grant mismatch");
+                (grant_pages(config_, req) == g.run.pages || reserve_pages(config_, req) == g.run.pages), "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
         require(!head_ || s.emitter.f, "cannot open S2 response");
         if (s.emitter.f) {
             fprintf(s.emitter.f, "a %llu %u %u %u %u\n", (unsigned long long)g.key.epoch, g.key.slot,
-                    g.key.generation, g.run.base_page, g.run.pages);
+                    g.key.generation, g.run.first_page, g.run.pages);
             require(!fflush(s.emitter.f), "S2 admission output failed"); output_ok(s.emitter);
         }
+    }
+    // the session's run grew (Driver::step): Dispatch checks each step's rows against it
+    void grow(unsigned slot, const Run& r) {
+        require(slot < MAX_SESSIONS && sessions_[slot].bound && sessions_[slot].run.table_version == r.table_version, "growth of an unbound session");
+        sessions_[slot].run = r;
     }
     const Session& at(unsigned slot) const {
         require(slot < MAX_SESSIONS && sessions_[slot].bound, "unbound session"); return sessions_[slot];

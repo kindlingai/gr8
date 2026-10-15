@@ -12,7 +12,7 @@ set -eu
 BIN=$1; P=$2
 for ((r = 0; r < NRANK; r++)); do
   h=${HOST[$r]}
-  on $r "mkdir -p $G6_HOME/bin $G6_HOME/packs $G6_HOME/serve $G6_HOME/out"
+  on $r "mkdir -p $G6_HOME/bin $G6_HOME/packs $G6_HOME/out"
   rsync -a "$BIN/g6m4" "$h:$G6_HOME/bin/" &
   [ -f "$BIN/gpuprobe" ] && rsync -a "$BIN/gpuprobe" "$h:$G6_HOME/bin/" &
   if [ -d "$BIN/lib" ]; then rsync -a "$BIN/lib" "$h:$G6_HOME/bin/" & fi

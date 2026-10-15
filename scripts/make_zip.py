@@ -42,9 +42,9 @@ def skipped_file(path):
 
 
 # Each binary has the same path under --bin and in the zip.
-BINARIES = ['bin/g6m4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs', 'bin/g6load',
-            'bin6/g6m4', 'bin6/m4sim', 'bin6/gpuprobe', 'bin6/tr3_e4m3_test', 'bin6/g6load',
-            'bin3/g6m4', 'bin3/m4sim', 'bin3/gpuprobe', 'bin3/tr3_e4m3_test', 'bin3/g6load']
+BINARIES = ['bin/g6m4', 'bin/g6m4-int4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs', 'bin/g6load',
+            'bin6/g6m4', 'bin6/g6m4-int4', 'bin6/m4sim', 'bin6/gpuprobe', 'bin6/tr3_e4m3_test', 'bin6/g6load',
+            'bin3/g6m4', 'bin3/g6m4-int4', 'bin3/m4sim', 'bin3/gpuprobe', 'bin3/tr3_e4m3_test', 'bin3/g6load']
 
 HEADER = """gr8 {short} (commit {commit}, {date})
 
@@ -54,7 +54,8 @@ bin6/  the TP=6 engine (scripts/build.sh)
 bin3/  the TP=3 engine (G6_NR=3 scripts/build.sh)
 Built for GB10 (aarch64, CUDA 13, sm_121a). The binaries link cuBLAS 13 and libibverbs at run time: a node needs the
 CUDA 13 runtime libraries (DGX OS has them) and rdma-core. With the prebuilt bin/, bin6/ and bin3/, skip the engine and
-front end builds in README.md: copy the one for your TP to bin/ on every box.
+front end builds in README.md: copy the one for your TP to bin/ on every box. g6m4-int4 in each is the same engine
+with the 4-bit KV latent, which --kv-format int4 runs (docs/KV4.md).
 
 sha256 of every file below:
 """

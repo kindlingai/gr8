@@ -1,4 +1,4 @@
-# g6 front end runtime deps (pure asyncio; no torch, no vLLM)
+# gr8 front end runtime deps (pure asyncio; no torch, no vLLM)
 tokenizers>=0.21
 jinja2>=3.1
 aiohttp>=3.9

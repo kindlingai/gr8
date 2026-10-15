@@ -1,4 +1,4 @@
-// g6 fabric: NR-rank (six or four) one-shot all-reduce over raw ibverbs with the GPU in the loop.
+// gr8 fabric: NR-rank (six or four) one-shot all-reduce over raw ibverbs with the GPU in the loop.
 // Buffers are cudaHostAlloc'd (pinned, device-mapped) and registered on both rails: the GPU writes partials and
 // reads peers' partials directly; a host proxy thread posts the RDMA writes when the GPU rings a doorbell.
 #pragma once

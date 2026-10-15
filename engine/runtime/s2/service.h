@@ -5,29 +5,49 @@
 #include "control_channel.h"
 #include "dispatch.h"
 #include "pool.h"
+#include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <thread>
 
 namespace g6s2 {
+// rows: what a request needs at admission (grant_rows), worst: all it may grow to (reserve_rows)
 struct PoolHooks {
-    std::function<uint32_t()> free_pages, largest_run;
-    std::function<Run(uint64_t rows)> reserve; // head only, after ALL event ACKs
-    std::function<void(const Run&, uint64_t rows)> claim; // workers: exact head grant
+    std::function<uint32_t()> free_pages, room;
+    // head after ALL event ACKs, workers at the grant (the same call on the same pool state must give the same Run)
+    std::function<Run(uint64_t rows, uint64_t worst)> reserve;
     std::function<void(const Run&)> release;
-    // optional (S2 below R, pool.h): false = the FIFO head may not take a run yet even though one fits (a past-R
-    // request waits for an empty pool); counted as an admission stall
-    std::function<bool(uint64_t rows)> admissible;
+    // can the FIFO head be admitted now: room, no exclusive run in the way, and every live run still able to reach its
+    // worst case (pool.h fits). false is counted as an admission stall
+    std::function<bool(uint64_t rows, uint64_t worst)> fits;
+    // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
+    std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
+    // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
+    std::function<std::vector<PoolUse>()> runs;
+    std::function<g6kv_totals()> stats;
     // optional, prefix reuse (pool.h keep): every rank retires a run with its session's reuse state; the head matches a
-    // new prompt against the retained runs (rows: the request's reservation; limit: rows its prefill may skip) and takes a hit
+    // new prompt against the retained runs (limit: rows its prefill may skip) and takes a hit
     std::function<void(const Run&, const g6rt::PrefixReuse&)> retain;
-    std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, int limit)> match;
-    std::function<Run(const PoolHit&, uint64_t rows)> take;
+    std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit)> match;
+    std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst)> take;
+    // optional, block stores (pool.h add_tier): counting toward shared prefixes at admission (head and workers, before
+    // the grant; span: the request's system span, -1 = none), and each tier's counters for status.s2
+    std::function<uint32_t(const std::vector<int>& prompt, int64_t span)> count;
+    std::function<std::vector<g6kv_tier_totals>()> tiers;
+    // optional: the pool's state, compared across ranks at every event (Scheduler::pool_digest)
+    std::function<uint64_t()> digest;
 };
 struct NativeHooks {
     PoolHooks pool;
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
+    // with pool.grow: slot's run grew; its new pages go into the main and draft tables before the round
+    std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK
+    // optional: did this rank run tier copies since the last call (the same answer on every rank: the copies are). Then
+    // the ranks line up before the next round: one rank's copies can take seconds longer than another's, and a GPU wait
+    // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
+    std::function<bool()> drained;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
@@ -35,11 +55,16 @@ struct NativeHooks {
     s2::DSel dsel;                    // drafter choice (G6_S2_DSEL)
 };
 // Only atomic scalar stores/loads on the compute hot path. No request-file
-// checks, digest, allocation, or lock in an event-free boundary.
+// checks, digest, allocation, or lock in an event-free boundary. horizon() is
+// a bounded six-step projection over the eight slots: no allocation, no lock,
+// a few hundred nanoseconds against a >= 20 ms round.
 struct Progress {
-    std::atomic<uint64_t> boundary{0}, revision{0};
+    std::atomic<uint64_t> boundary{0}, revision{0}, horizon{0};
     std::atomic<unsigned> resident{0}, retiring{0};
     void publish(const Scheduler& s) {
+        // horizon before boundary: a reader that loads boundary first and horizon second (event) sees a horizon
+        // computed for that boundary or a later one, never an earlier one. Later only widens the margin.
+        horizon.store(s.horizon());
         boundary.store(s.boundary()); resident.store(s.resident()); retiring.store(s.retiring()); revision.store(s.revision());
     }
 };
@@ -52,21 +77,31 @@ class Service {
     std::map<uint64_t, Command> commands_;
     std::map<uint64_t, std::string> payloads_;   // head: queued requests' bytes, sent to the workers with each ADMIT notice
     std::map<uint64_t, std::vector<int>> prompts_;   // head, prefix reuse: queued requests' prompts (none for prompt logprobs)
+    std::map<uint64_t, int64_t> spans_;              // head: their system spans (ServeReq::sys)
     bool reuse() const { return bool(native_.pool.match); }
+    // rows a request's run holds at admission: grant_rows when runs grow on demand, else its worst case
+    uint64_t admit_rows(const Request& r) const { return native_.pool.grow ? grant_rows(c_.scheduler, r) : reserve_rows(c_.scheduler, r); }
     std::optional<g6rt::ServeReq> staged_; // COMPUTE thread only, parsed before event ACK
     Progress progress_;
     std::atomic<bool> stopping_{false};
     std::mutex failure_mu_; std::exception_ptr failure_;
     uint64_t attempted_head_ = UINT64_MAX, attempted_revision_ = UINT64_MAX;
     uint64_t event_ = 1;
-    static constexpr uint64_t LOOKAHEAD = 8; // future safe boundary; late notices remain fatal
+    uint64_t sync_ = 0;   // compute thread: barriers passed (native_.drained)
+    // G6_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
+    // boundary it read and the future boundary it chose), one "commit" line when that notice lands on each rank, and one
+    // "step" line per prefill quantum. Together they say whether a cancel was installed while a long prefill was still
+    // running -- the lookahead binding -- or merely waited for it, which is the scheduler's admission. Logs only: no
+    // state, no digest and no behaviour change, so it can run on a serving build.
+    const bool elog_ = ::getenv("G6_S2_EVENTLOG") && *::getenv("G6_S2_EVENTLOG") == '1';
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
         stopping_.store(true); endpoint_->fail();
     }
     void shutdown() { stopping_.store(true); endpoint_->fail(); }
-    // a slot leaves: its run back to the pool, retained with the session's reuse state when prefix reuse is on.
-    // Head at the event, workers at apply: the same point of the same commit, so every rank keeps the same runs.
+    // a slot leaves: its run back to the pool, retained with the session's reuse state when prefix reuse is on. A
+    // finished session at the step it finished (Driver finished hook, every rank), a cancelled one at the event: head in
+    // event(), workers at apply, the same point of the same commit. So every rank keeps the same runs.
     void retire_run(const Slot& s) {
         if (!reuse()) { native_.pool.release(s.run); return; }
         g6rt::PrefixReuse st = dispatch_.rows(s.key.slot);
@@ -75,50 +110,93 @@ class Service {
         native_.pool.retain(s.run, st);
     }
     void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
-        const auto free = native_.pool.free_pages(), largest = native_.pool.largest_run();
-        require(largest <= free && free <= c_.scheduler.pool_rows / PAGE, "invalid pool status");
+        const auto free = native_.pool.free_pages(), room = native_.pool.room();
+        require(room <= free && free <= c_.scheduler.pool_rows / PAGE, "invalid pool status");
         std::ostringstream o;
         o << "{\"epoch\":" << c_.scheduler.epoch << ",\"resident\":" << progress_.resident.load()
           << ",\"queued\":" << queue_.size() << ",\"retiring\":" << progress_.retiring.load()
           << ",\"reserved_pages\":" << c_.scheduler.pool_rows / PAGE - free << ",\"free_pages\":" << free
-          << ",\"largest_free_run\":" << largest << ",\"admission_stalls\":" << queue_.stalls
-          << ",\"fragmentation_stalls\":" << queue_.fragmentation_stalls << "}\n";
+          << ",\"largest_free_run\":" << room << ",\"admission_stalls\":" << queue_.stalls;
+        // growth on demand: pages the live runs hold and could grow to, each run's pair, and rounds a session sat out
+        if (native_.pool.stats) {
+            const auto st = native_.pool.stats();
+            o << ",\"held_pages\":" << st.held_pages << ",\"worst_pages\":" << st.worst_pages << ",\"grown\":" << st.grows
+              << ",\"stalled_rounds\":" << st.stalls;
+        }
+        if (native_.pool.tiers) {
+            o << ",\"tiers\":[";
+            const auto ts = native_.pool.tiers();
+            for (size_t i = 0; i < ts.size(); ++i) {
+                const auto& t = ts[i];
+                // pages are page blocks; *_bytes = pages x block_bytes
+                const uint64_t bb = t.block_bytes;
+                o << (i ? "," : "") << "{\"slots\":" << t.slots << ",\"free_slots\":" << t.free_slots << ",\"entries\":" << t.entries
+                  << ",\"shared\":" << t.shared << ",\"block_bytes\":" << bb << ",\"spilled_pages\":" << t.spilled_pages
+                  << ",\"spilled_bytes\":" << t.spilled_pages * bb << ",\"moved_in_pages\":" << t.moved_in_pages
+                  << ",\"moved_in_bytes\":" << t.moved_in_pages * bb << ",\"moved_out\":" << t.moved_out
+                  << ",\"moved_out_pages\":" << t.moved_out_pages << ",\"restored_pages\":" << t.restored_pages
+                  << ",\"restored_bytes\":" << t.restored_pages * bb << ",\"hits\":" << t.hits << ",\"dropped\":" << t.dropped
+                  << ",\"dropped_pages\":" << t.dropped_pages << ",\"refused\":" << t.refused << ",\"refused_pages\":" << t.refused_pages
+                  << ",\"full\":" << t.full << ",\"write_credit\":" << t.credit << "}";
+            }
+            o << "]";
+        }
+        if (native_.pool.runs) {
+            o << ",\"runs\":[";
+            const auto runs = native_.pool.runs();
+            for (size_t i = 0; i < runs.size(); ++i)
+                o << (i ? "," : "") << "{\"held\":" << runs[i].held << ",\"worst\":" << runs[i].worst << "}";
+            o << "]";
+        }
+        o << "}\n";
         atomic_file(c_.directory + "/status.s2", o.str());
     }
     void event(const Command& command) { // CONTROL thread: never read Driver until ALL ACKs
-        const auto boundary = progress_.boundary.load();
-        require(boundary <= uint64_t(INT64_MAX) - LOOKAHEAD, "event boundary overflow");
-        Notice n{c_.scheduler.epoch, event_, boundary + LOOKAHEAD, command.request, command.hash,
+        const auto boundary = progress_.boundary.load(); // first: the horizon below is for this boundary or a later one
+        const auto horizon = progress_.horizon.load();
+        require(boundary <= uint64_t(INT64_MAX) - NOTICE_MAX, "event boundary overflow");
+        // The notice lands at the first boundary whose work after the one in flight covers NOTICE_ROWS rows, so a
+        // prefill no longer waits out eight ~6 s quanta for a propagation that takes milliseconds (#61); late notices
+        // remain fatal. Clamped, so a torn read of the pair can only widen the target, never narrow it past the floor.
+        const auto target = std::clamp(horizon, boundary + NOTICE_MIN, boundary + NOTICE_MAX);
+        if (elog_)
+            fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu)\n",
+                    c_.rank, (unsigned long long)event_, command.admit ? "admit" : "cancel", (unsigned long long)command.request,
+                    (unsigned long long)boundary, (unsigned long long)target, (unsigned long long)(target - boundary));
+        Notice n{c_.scheduler.epoch, event_, target, command.request, command.hash,
                  command.admit ? EventKind::Admit : EventKind::Cancel};
         leader_->event(n, [&](uint64_t hash) {
             const auto& s = driver_->state(); // compute paused in boundary() until this commit
             Commit cm{n.epoch, n.event, n.boundary, hash, {}, {}};
             if (!command.admit) cm.cancel = s.find(command.request);
-            // Head owns the real pool delta once; Driver callbacks skip it here.
+            // Head owns the real pool delta once; Driver callbacks skip it here. A Retiring slot gave its run back when it
+            // finished (Driver finished hook); a cancelled live one gives it back now.
             for (const auto& sl : s.slots())
-                if (sl.phase == Phase::Retiring || (cm.cancel && sl.phase != Phase::Free && sl.key == *cm.cancel)) retire_run(sl);
+                if (cm.cancel && sl.phase != Phase::Free && sl.phase != Phase::Retiring && sl.key == *cm.cancel) retire_run(sl);
             if (command.admit) {
                 const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
                 unsigned live = s.resident();
-                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.free_pages(), native_.pool.largest_run());
+                const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
+                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.fits(rows, worst), native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
-                const auto rows = reserve_rows(c_.scheduler, *request);
-                const bool ok = fit->why == Stall::None && (!native_.pool.admissible || native_.pool.admissible(rows));
-                if (fit->why == Stall::None && !ok) ++queue_.stalls;
-                if (ok) {
-                    Run run{}; uint32_t skip = 0;
+                if (fit->why == Stall::None) {
+                    Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
-                        const PoolHit h = native_.pool.match(pr->second, rows, int(request->prompt_tokens) - 1);
-                        if (h.skip > 0) { run = native_.pool.take(h, rows); skip = uint32_t(h.skip); }
-                        fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u base %u\n", (unsigned long long)request->id,
-                                h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.base_page : 0u);
+                        if (native_.pool.count) counted = native_.pool.count(pr->second, spans_.count(request->id) ? spans_.at(request->id) : -1);
+                        const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1);
+                        if (h.skip > 0) { run = native_.pool.take(h, rows, worst); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0; }
+                        fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
+                                h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
-                    if (!skip) run = native_.pool.reserve(rows);
-                    cm.admit = Grant{s.next_key(), *request, run, skip};
+                    if (!skip) run = native_.pool.reserve(rows, worst);
+                    cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
-                if (cm.admit) { queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request); payloads_.erase(command.request); }
+                if (cm.admit) {
+                    queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request);
+                    spans_.erase(command.request); payloads_.erase(command.request);
+                }
             }
             return cm;
         }, command.admit ? &payloads_.at(command.request) : nullptr);
@@ -135,9 +213,13 @@ class Service {
                     auto request = parse_request(bytes);
                     queue_.push(Sessions::request(command->request, request)); commands_.emplace(command->request, *command);
                     payloads_.emplace(command->request, std::move(bytes));
-                    if (reuse() && request.plp < 0) prompts_.emplace(command->request, std::move(request.prompt));
+                    if (reuse() && request.plp < 0) {
+                        spans_.emplace(command->request, request.sys);
+                        prompts_.emplace(command->request, std::move(request.prompt));
+                    }
                 } else if (queue_.cancel(command->request)) {
-                    commands_.erase(command->request); prompts_.erase(command->request); payloads_.erase(command->request);
+                    commands_.erase(command->request); prompts_.erase(command->request); spans_.erase(command->request);
+                    payloads_.erase(command->request);
                     atomic_file(c_.directory + "/resp." + std::to_string(command->request), "end abort -1 0\n");
                 } else event(*command); // resident/retiring lookup only at the fence
                 if (stopping_.load()) return;
@@ -175,16 +257,18 @@ class Service {
     }
     void compute() {
         while (!stopping_.load()) {
+            Notice noticed{};
             if (!driver_->state().resident()) {
                 const auto n = endpoint_->wait_notice(); driver_->idle_boundary(n.boundary);
             }
             auto cm = endpoint_->boundary(driver_->state().boundary(), [&] {
-                native_.fence(); const auto n = endpoint_->wait_notice(); staged_.reset();
+                native_.fence(); const auto n = endpoint_->wait_notice(); noticed = n; staged_.reset();
                 if (n.kind == EventKind::Admit) {   // the head reads its own req.<id>; a worker has the bytes from the head
                     const auto bytes = worker_ ? worker_->request(n.request) : ingress_.request({true,n.epoch,n.request,n.payload_hash});
                     require(payload_hash(bytes) == n.payload_hash, "request bytes do not match the ADMIT notice");
                     staged_ = parse_request(bytes);
                 }
+                if (native_.pool.digest) driver_->pool_digest(native_.pool.digest());
                 return driver_->state().digest(); // once per event, NEVER per round
             });
             if (cm) {
@@ -198,11 +282,19 @@ class Service {
                 std::optional<Payload> payload;
                 if (cm->admit) { require(staged_.has_value(), "commit without verified request"); payload = sessions_.payload(*staged_); }
                 driver_->apply(*cm, payload ? &*payload : nullptr);
+                if (elog_)
+                    fprintf(stderr, "# s2_event commit rank %u event %llu %s request %llu boundary %llu\n", c_.rank,
+                            (unsigned long long)noticed.event, noticed.kind == EventKind::Cancel ? "cancel" : "admit",
+                            (unsigned long long)noticed.request, (unsigned long long)cm->boundary);
                 if (worker_ && cm->admit) worker_->admitted(cm->admit->req.id);
                 dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
                 staged_.reset(); endpoint_->applied(); continue;
             }
             const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
+            if (elog_ && work.kind != Kind::Decode)
+                fprintf(stderr, "# s2_event step rank %u boundary %llu request %llu %s first %u rows %u\n", c_.rank,
+                        (unsigned long long)work.boundary, (unsigned long long)driver_->state().slots()[work.keys[0].slot].req.id,
+                        work.kind == Kind::Prefill ? "prefill" : "tail", work.first, work.rows);
             dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
         }
     }
@@ -212,31 +304,46 @@ public:
         : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk),
           dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
         c_.validate();
-        require(bool(native_.pool.free_pages) && bool(native_.pool.largest_run) && bool(native_.pool.reserve) &&
-                bool(native_.pool.claim) && bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
+        require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
+                bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
+        require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
         DriverHooks h;
         h.bind = [&](const Grant& g) {
             require(staged_.has_value(), "binding without verified payload");
             require(!g.reuse || reuse(), "reused rows without prefix reuse");
-            if (c_.rank) {
-                const auto rows = reserve_rows(c_.scheduler,g.req);
-                if (g.reuse) {   // the head's decision, from the same retained runs on this rank
-                    const PoolHit h = native_.pool.match(staged_->prompt, rows, int(g.req.prompt_tokens) - 1);
-                    require(h.skip == int(g.reuse) && h.run.base_page == g.run.base_page && h.run.pages == g.run.pages, "worker prefix reuse differs from the head");
-                }
-                native_.pool.claim(g.run, rows);
+            if (c_.rank) {   // the head's call, on the same pool state
+                const auto worst = reserve_rows(c_.scheduler,g.req), rows = admit_rows(g.req);
+                Run mine;
+                if (native_.pool.count && reuse() && staged_->plp < 0)
+                    require(native_.pool.count(staged_->prompt, staged_->sys) == g.counted, "worker prefix counts differ from the head");
+                else require(!g.counted, "a counted grant without counting");
+                if (g.reuse) {
+                    const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1);
+                    require(h.skip == int(g.reuse) && (h.stored ? h.tier + 1 : 0) == g.restored, "worker prefix reuse differs from the head");
+                    mine = native_.pool.take(h, rows, worst);
+                } else mine = native_.pool.reserve(rows, worst);
+                require(mine == g.run, "worker page list differs from the head's grant");
             }
             dispatch_.begin(g.key.slot, int(g.reuse));
             native_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {
-            if (c_.rank) retire_run(old);
+            if (c_.rank && old.phase != Phase::Retiring) retire_run(old);   // a cancelled live session (finished ones: below)
             native_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
         };
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) { dispatch_.prefill(s,p,first,rows); };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
         h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
+        h.finished = [&](const Slot& s) { retire_run(s); };
+        if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
+            h.settle = [&] { if (native_.drained()) endpoint_->sync(++sync_); };
+        if (native_.pool.grow)
+            h.grow = [&](const Slot& s, uint64_t rows) {
+                const auto r = native_.pool.grow(s.run, rows);
+                if (r && *r != s.run) { native_.grown(s.key.slot, *r); sessions_.grow(s.key.slot, *r); }
+                return r;
+            };
         h.terminal = [&](Key k,const s2::Stats& stats) {
             if (stats.switches || stats.mtp_rounds)
                 fprintf(stderr,"# s2 drafter choice slot %u: %ld of %ld rounds on MTP, %ld switches, %ld tokens\n",unsigned(k.slot),

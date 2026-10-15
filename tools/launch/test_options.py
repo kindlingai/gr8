@@ -123,6 +123,13 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--ips', 'a,b,c,d'], 'IPS and IPS2 go together')
         self.check(['--peers', PEERS, '--ips', 'a,b', '--ips2', 'a,b'], 'IPS has 2 addresses')
         self.check(['--peers', PEERS, '--default-max-tokens', '4k'], 'want a whole number')
+        self.check(['--peers', PEERS, '--default-reasoning-effort', 'none'], 'cannot turn thinking off')
+        self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
+        self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a whole number')
+        o = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'medium',
+                       '--default-thinking-budget', '4096'], {})
+        opt.validate(o)
+        self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
 
     def test_peers_resolve(self):
         o = opt.parse(['--no-config', '--peers', '127.0.0.1,127.0.0.2'], {})
@@ -203,14 +210,14 @@ class CanonicalTests(unittest.TestCase):
 
     def test_defaults_resolved_and_equal_to_explicit(self):
         a, text, da = self.digest()
-        self.assertIn('CAP=294912\n', text)
+        self.assertIn('CAP=310528\n', text)
         self.assertIn('--s2-sessions 8 ', text)
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
-        self.assertEqual(da, self.digest('--cap', '294912', '--share-limit', '65536', '--sess', '8', '--dflash', '1')[2])
+        self.assertEqual(da, self.digest('--cap', '310528', '--share-limit', '65536', '--sess', '8', '--dflash', '1')[2])
 
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
-        self.assertIn('CAP=393216\n', text)              # 1,920 physical pages per rank at TP=4, as at 65536
+        self.assertIn('CAP=408832\n', text)              # 1,981 physical pages per rank at TP=4, as at 65536
         self.assertIn('G6_CP_R=32768 ', text)
         _, text, _ = self.digest('--share-limit', '32768', '--cap', '200000')
         self.assertIn('CAP=200000\n', text)
@@ -226,7 +233,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(base, self.digest('--g6env-x', 'G6_X=1')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
-        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '294912', '--reuse', '1', '--g6args-x', '--top 5')[2])
+        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '310528', '--reuse', '1', '--g6args-x', '--top 5')[2])
 
     def test_template_has_no_paths(self):
         _, text, _ = self.digest('--g6-home', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
@@ -257,7 +264,6 @@ class CanonicalTests(unittest.TestCase):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
-        self.assertTrue(p['s2'])
         self.assertIn('G6_PF_OWN=1', p['env'])
         self.assertEqual(p['args'][:2], ['--manifest', '/r/rank2.manifest.json'])
         self.assertEqual(p['args'][-2:], ['--set-id', 'ab'])
@@ -270,7 +276,6 @@ class CanonicalTests(unittest.TestCase):
         o = opt.parse(['--no-config', '--peers', peers], {})
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
-        self.assertTrue(p['s2'])
         self.assertIn('G6_PF_OWN=3', p['env'])
         self.assertIn('/a/qo.pack', p['args'])
         self.assertIn('/h/s2', p['args'])
@@ -278,13 +283,103 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--s2-sessions', p['args'])
         self.assertNotIn('--spec-adaptive', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
-        self.assertNotIn('/h/serve', p['args'])
         # PF_OWN=1 is the fallback: no QO pack
         o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], {})
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=1', p['env'])
         self.assertNotIn('/a/qo.pack', p['args'])
+
+
+class KvStoreTests(unittest.TestCase):
+    def plan(self, *argv, kv_store=None, env=None):
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        opt.validate(o)
+        return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store=kv_store)
+
+    def stores(self, p):
+        return [p['args'][i + 1] for i, a in enumerate(p['args']) if a == '--kv-store']
+
+    def arg(self, p, name):
+        return p['args'][p['args'].index(name) + 1] if name in p['args'] else None
+
+    def test_off_by_default(self):
+        o, p = self.plan()
+        self.assertEqual(opt.kv_stores(o), [])
+        for a in ('--kv-store', '--kv-keep', '--kv-system-after', '--kv-write-limit', '--kv-tier'):
+            self.assertNotIn(a, p['args'])
+        self.assertNotIn('--kv-store', self.plan('--kv-store', 'off')[1]['args'])
+
+    def test_stores_in_flag_order_and_what_they_keep(self):
+        a, b = 'ssd:/nvme/gr8kv,size=200G', 'remote:192.0.2.5:7350,size=8G'
+        o, p = self.plan('--kv-store', a, '--kv-store', b, '--kv-keep', 'sessions', '--kv-system-after', '3',
+                         '--kv-write-limit', '0.25')
+        self.assertEqual(self.stores(p), [a, b])
+        self.assertEqual((self.arg(p, '--kv-keep'), self.arg(p, '--kv-system-after'), self.arg(p, '--kv-write-limit')),
+                         ('sessions', '3', '0.25'))
+        t = opt.kv_stores(o)
+        self.assertEqual([(x['kind'], x['path'], x['host'], x['port'], x['size']) for x in t],
+                         [('ssd', '/nvme/gr8kv', None, None, '200G'), ('remote', None, '192.0.2.5', '7350', '8G')])
+        self.assertEqual([x['persist'] for x in t], [False, False], 'an SSD store starts empty unless persist=on')
+        self.assertTrue(opt.kv_stores(self.plan('--kv-store', a + ',persist=on')[0])[0]['persist'])
+        # the same from the environment, stores separated by ;
+        self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
+
+    def test_the_deprecated_tier_options_map_to_the_nearest_policy(self):
+        o, p = self.plan('--kv-tier', 'ssd:/x,size=200G,keep=shared', '--kv-shared-after', '5')
+        self.assertEqual((self.stores(p), self.arg(p, '--kv-keep'), self.arg(p, '--kv-system-after')),
+                         (['ssd:/x,size=200G'], 'system', '5'))
+        self.assertTrue(any('deprecated' in w for w in o.warnings))
+        self.assertNotIn('--kv-tier', p['args'])
+        _, p = self.plan('--kv-tier', 'ssd:/x,size=200G,keep=shared', '--kv-tier', 'remote:192.0.2.5:7350,size=8G')
+        self.assertEqual(self.arg(p, '--kv-keep'), 'all', 'a tier that kept evicted runs (the default) maps to all')
+        _, p = self.plan(env={'KV_TIER': 'ssd:/x,size=8G,keep=evicted', 'KV_KEEP': 'sessions'})
+        self.assertEqual(self.arg(p, '--kv-keep'), 'sessions', 'an explicit KV_KEEP wins')
+
+    def test_remote_auto_is_resolved_per_box(self):
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-store', 'remote:auto,size=8G'], {})
+        opt.validate(o)
+        self.assertEqual(opt.kv_stores(o)[0]['host'], 'auto')
+        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store='remote:192.0.2.5:7350,size=8G')
+        self.assertEqual(self.stores(p), ['remote:192.0.2.5:7350,size=8G'])
+        self.assertIn('--kv-store remote:auto,size=8G ', opt.canonical(o, opt.engine_plan(o), None)[1])
+
+    def test_refusals(self):
+        v = ValidateTests()
+        for argv, want in ((['--kv-store', 'nvme:/x,size=8G'], 'the store is'), (['--kv-store', 'ssd:/x'], 'size=N'),
+                           (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=all'], '--kv-keep'),
+                           (['--kv-store', 'remote:192.0.2.5:7350,size=8G,persist=on'], 'for ssd:'),
+                           (['--kv-store', 'ssd:/x,size=8G,persist=yes'], 'persist=on|off'),
+                           (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
+                           (['--kv-store', 'ssd:/x,size=8G', '--kv-system-after', '0'], 'from 1'),
+                           (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),
+                           (['--kv-store', 'ssd:/x,size=8G', '--kv-write-limit', 'lots'], 'per page computed')):
+            v.check(['--peers', PEERS, *argv], want)
+
+
+class KvFormatTests(unittest.TestCase):
+    def plan(self, *argv, tp='4'):
+        o = opt.parse(['--no-config', '--peers', ','.join(PEERS.split(',')[:int(tp)]) if tp != '6' else
+                       ','.join(f'10.0.0.{i}' for i in range(1, 7)), *argv], {})
+        opt.validate(o)
+        return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
+
+    def test_fp8_is_the_default_and_unchanged(self):
+        o, p = self.plan()
+        _, p8 = self.plan('--kv-format', 'fp8')
+        self.assertNotIn('--kv-format', p['args'])
+        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '310528'))
+
+    def test_int4_runs_its_own_engine_with_its_own_pool(self):
+        o, p = self.plan('--kv-format', 'int4')
+        self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
+        self.assertEqual(p['knobs']['CAP'], str(65536 + (2390 - 1024) * 64 * 4), '2,390 pages a rank at TP=4')
+        self.assertEqual(self.plan('--kv-format', 'int4', '--cap', '300000')[1]['knobs']['CAP'], '300000', 'CAP wins')
+        self.assertEqual(self.plan('--kv-format', 'int4', tp='3')[1]['knobs']['CAP'], str(65536 + (2480 - 1024) * 64 * 3))
+        self.assertEqual(self.plan('--kv-format', 'int4', tp='6')[1]['knobs']['CAP'], str(131072 + (3940 - 2048) * 64 * 6))
+
+    def test_refusal(self):
+        ValidateTests().check(['--peers', PEERS, '--kv-format', 'int8'], 'fp8 or int4')
 
 
 if __name__ == '__main__':

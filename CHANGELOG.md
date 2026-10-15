@@ -1,5 +1,355 @@
 # Changelog
 
+## 2026-10-14: a notice targets the work in flight, not a constant eight boundaries
+
+- The first hardware trace of the event log says what #61's remaining delay is: the cancel anchored at boundary 8 landed
+  at 16, while the 31,984-token prompt's prefill ran boundaries 9-13. The lookahead bound — `LOOKAHEAD = 8`
+  (`s2/service.h`) — and at the cluster's line it could hardly be otherwise: a quantum at `--prefill 4096 --pf-lanes 2`
+  is 8,192 rows and R is 65,536, exactly 8 quanta, so no below-R prompt spans more than 8 prefill boundaries and a
+  notice anchored when one starts can never land inside it. The abort took 20.096 s, and the follow-up — whose admit
+  cannot anchor until the cancel commits, because events serialize — saw 20.527 s TTFT. The reading rule this record
+  carried was backwards: `N >= L` is what a lookahead larger than the remaining prefill produces (that run had `L` = 13,
+  `N` = 16), not an acquittal of the lookahead.
+- The target is now sized by the work in flight: the first boundary whose work after the one in flight covers 2,048
+  prefill rows, within `boundary + 2` and `boundary + 8` (`Scheduler::horizon`, `s2/scheduler.h`; `s2/service.h` reads
+  and clamps it). During a prefill that is the floor — the trace's cancel targets boundary 10, landing one to two
+  quanta after the abort instead of past the whole prefill, and the follow-up's admit then anchors on an engine whose
+  long prefill is gone, commits at once, and its TTFT is its own short prefill. In pure decode the target is the cap,
+  exactly the old constant's behaviour, because a decode round adds no coverage (stalls can shrink one to almost
+  nothing). The boundary in flight is not counted, since its remaining time is unknowable; tails count one row; the
+  alternation with a decoding session and a partial last quantum are accounted; and a remainder under 2,048 rows opens
+  the target to the cap, because that work is fast.
+- The margin is sound for the same reason the constant's was: each step is one TP collective, so no rank departs a
+  boundary before every rank completed it, and 2,048 prefill rows is about 1.5 s at the ~1,300 rows/s the gate measures
+  for a cold 8K prefill — an order of magnitude past the milliseconds a notice needs to reach every rank. `horizon()`
+  is a pure function of the scheduler state: it projects the same state machine `next()`/`completed()` drive, on a copy,
+  so every rank names the same boundary and the notice's digest agreement holds; the compute thread publishes it beside
+  the progress boundary, horizon first, so a torn read of the pair can only widen the target.
+- `next()` is unchanged: its selection moved verbatim to `Scheduler::plan`, which `horizon()` also drives, and
+  `scheduler_fair_test` still passes bit-for-bit, so m4sim's batch and every quantum the fair prefill serves are
+  untouched. New `scheduler_horizon_test` (host, `scripts/host_tests.sh`) pins the rule: pure decode keeps the cap,
+  #61's 31,990-token prompt targets the floor and opens to the cap when only its tail remains, the alternation and the
+  partial quantum are counted, a 2,048-row quantum covers exactly, and a randomized run checks the clamp, re-derives the
+  target through `plan()` at every boundary, and confirms two schedulers driven by the same events name the same one.
+- `docs/EVENT-LATENCY.md` is rewritten to the rule and carries two corrections: the reading rule above, and the
+  discrimination run — do not grow the prompt to 64K (that crosses R, where the run is exclusive and the follow-up is
+  refused, so abort and TTFT stop measuring the same thing); shrink the quantum instead (`--prefill 2048 --pf-lanes 1`,
+  where every notice lands mid-prefill).
+
+## 2026-10-14: the event boundaries are logged, so a cancel's delay can be attributed
+
+- #61's ~24 s has two candidate mechanisms that need different fixes: the scheduler served one prefill at a time and
+  always the lowest request id, and a cancel is anchored at `boundary + LOOKAHEAD` with `LOOKAHEAD = 8` (`s2/service.h`).
+  Eight boundaries is fine slack for decode rounds of tens of milliseconds; during a prefill it is up to eight 8,192-row
+  quanta, about 50 s. Nothing printed the boundary a notice was anchored to, so a run could show the delay but not say
+  which mechanism produced it — and the two disagree only when a prompt outruns the lookahead.
+- `G6_S2_EVENTLOG=1` prints three lines to stderr on a serving build, with no state, no digest and no behaviour change:
+  `notice` (rank 0's control thread: the boundary it read and the future boundary it chose, i.e. `A` and `A + 8`),
+  `commit` (every rank: the boundary the notice landed at, so a rank that never prints it failed the epoch) and `step`
+  (every rank: one line per prefill quantum and prompt tail — request, row range, boundary — and not per decode round,
+  which would be far too much). Off by default.
+- `docs/EVENT-LATENCY.md` is the run: a long prompt whose client aborts 1.5 ms after admission (the shim already turns
+  the disconnect into the CANCEL), then a short follow-up, at 16K/32K/64K and `SESS` 2 and 4. 64K is the discriminator,
+  because 8 prefill quanta plus the tail outrun the 8-boundary lookahead. If the notice lands before the long request's
+  last prefill boundary the lookahead binds and the event-latency work is needed; if it lands after, the scheduler's
+  admission was the whole story.
+
+## 2026-10-14: the prefill quantum goes to the shortest prompt, not the lowest request id
+
+- `Scheduler::next()` took at most one prefilling session per quantum and always the lowest request id. Native ordinals
+  only increase, so the session that started prefilling first held every quantum until its prompt was done, whatever
+  sizes were waiting: a 900-token prompt sharing the engine with a 32K one got no step until the 32K prompt finished.
+  Found while reading #61.
+- It does not change #61's number, and the cluster run says why: the follow-up there is never admitted. An admit is an
+  event anchored at `boundary + LOOKAHEAD` with `LOOKAHEAD = 8` (`s2/service.h`), a quantum at `--prefill 4096
+  --pf-lanes 2` is 8,192 rows, and R is 65,536 — exactly 8 quanta. A below-R prompt therefore never occupies more than
+  8 prefill boundaries, so the admit lands at or after its last one, and above R the run is exclusive and the admit is
+  refused outright. Two sessions prefilling at once is unreachable from a client in that configuration, which is the one
+  #61 reports. Measured on four GB10s at TP=4, a short request submitted as a 31,990-token prompt is admitted: 23.5 s
+  against 22.6 s on `main`, i.e. unchanged. At `--prefill 2048 --pf-lanes 1`, where that prompt is 16 quanta and the
+  second admit lands mid-prefill, 14.2 s against 28.5 s, with the long prompt's own time unchanged. #61's remaining
+  delay is the lookahead, counted in boundaries rather than time.
+- The prefill choice is now the session with the fewest prompt rows left, `req.id` breaking ties. A session passed over
+  `PREFILL_DEFER_MAX` (3) times is owed a turn and outranks every session that is not; once owed it is passed over at
+  most once more per competing prefilling session, so a stream of short requests cannot defer a long prefill without
+  bound. The choice reads only replicated slot state — `phase`, `prefilled`, `req.id` and the new per-slot `deferred`
+  counter, which is in `Scheduler::digest` — never wall clock or arrival order, so every rank picks the same session and
+  the event digest confirms it. Decode still gets its round between prefill quanta; only which prefill runs changed.
+- `scheduler_fair_test` (`scripts/host_tests.sh`, no GPU) covers it: a short request admitted behind a 31,984-token
+  prefill gets the first quantum and reaches decode in two boundaries while the long one is still prefilling; a long
+  prefill under seven short ones is never passed over more than `PREFILL_DEFER_MAX + MAX_SESSIONS` quanta; a single
+  session's quanta are unchanged (8192/8192/8192/7407/1 rows); and two schedulers driven by the same events choose the
+  same sessions and agree on every digest over 300 boundaries.
+- A prefill can now be interrupted by another session's quantum and resumed, which no earlier build could reach. On the
+  cluster, at a 2,048-row quantum, the interrupted 32K prompt still answers from the row its quanta cover: incident
+  000948, item 13, shard 12, checksum 07887, all correct.
+
+## 2026-10-13: a session past R takes its own pages from the shared pool
+
+- A request whose worst case exceeds R (`SHARE_LIMIT`, default `G6_CP_R`) runs alone, and its run took logical pages
+  0..w-1 of the whole pool: every retained conversation was evicted, and the requests behind it waited for the pool
+  even though their own pages would fit. The pool now grants such a run its own pages in the two classes the models
+  already have: its prefix (R/64 pages) and its shard of the tail below `place` (the main model's physical pages),
+  the drafter's copy of the rest above it. Retained short runs keep their pages through a long turn and give them
+  back only as the classes need them; a continuation of the long conversation adopts the retained run's start as
+  today. Scheduling is unchanged: the run still needs the pool to itself while it lives.
+- The engine builds the run's tables from its list (`s2_solo_cp_pages`: its CP map, the MTP layer and the drafter
+  take the list as built) and clears its pages only at bind (`s2_reset_pages`), on both models. A run's output is
+  byte-identical to the tables-as-built run: the new m4sim gate `G6_S2_XLIST` runs every sequence of a `--prefill`
+  CP build past R on a shuffled two-class page list and compares stdout (as `G6_S2_PFBASE` does below R).
+- The store's tail blocks name the run's list pages (its shard below `place`, the drafter's pages above), and a
+  restore into a shorter new request drops the blocks past its grant, whose rows the prefill rewrites. A tail's
+  blocks were the binding's sharded pages; `KV_BLOCK_FORMAT` goes to 4, so a persisted store of format 3 starts
+  empty.
+
+## 2026-10-13: the engine checks its weights at boot, and `/health?deep` checks them again while it serves
+
+- The Rust loader sums each 32 MB chunk of an image on the CPU while it sits in the pinned staging buffer. After the load
+  the GPU sums the same chunks from device memory. A chunk that differs stops the boot with exit 3, naming the rank, the
+  image, the chunk's bytes and the tensor it starts in ("g6: weight check: ..."), and the supervisor exits 3 as well. This is the load-time check #49
+  asked for: it catches a bad copy to the GPU before any request is served.
+- Once the graphs are captured, each rank sums its images again (binding rewrites some tensors in place) and logs the
+  digest. `curl localhost:8100/health?deep` on the head then has every rank sum its weights on a low-priority stream
+  while it serves (about 0.3 s at TP=4) and compare them with those sums. The answer is one JSON object, 200 when every
+  rank passes, else 503. It answers localhost only.
+- `G6_WEIGHT_CHECK=0` turns both off. The check adds about 1 s of CPU across the loader threads and two GPU passes at
+  boot. `weight_check_test` (`TEST=weight_check_test scripts/c1_tests.sh`) checks the GPU sums against the CPU's.
+
+## 2026-10-13: a restart keeps the earlier boots' engine logs, and an engine's exit names its reason
+
+- Each boot moves the previous `g6m4.r<r>.txt` and `.err` to `out/prev1` and keeps three earlier boots (`prev1` to
+  `prev3`). A restart after a bad boot used to overwrite its logs (#49).
+- When an engine exits, the supervisor log names the line that says why (`g6: ...`, an error word, a CUDA or fabric
+  check, a Rust panic), found anywhere in the last 4 MB of the rank's stderr or stdout. Before, it showed only the last
+  20 lines, and threads still writing could push the reason out of them. A process killed by a signal is named (SIGKILL
+  points at the OOM killer).
+- The low-memory warning before boot names this TP and the variant's expert size, not "a TP=4 rank needs ~90 GB".
+- The checks warn when `vm.compaction_proactiveness` is not 0, which the README requires.
+
+## 2026-10-13: zero new device memory before the engine's streams write to it
+
+- `dmalloc` zeroed with `cudaMemset`, which runs on the legacy default stream and returns before it finishes. The
+  engine's streams are non-blocking, so a write issued right after on them could land first and then be zeroed. The
+  prefill identity page table (`cp_pf_alloc`) is filled that way at boot: if the zeros won for entry k >= 1, every
+  prefill row from 64k on went to page 0, with no error word, while decode stayed exact. That fits #49's bad boots
+  (wrong for the whole boot, a cutoff at 64 or 128 prefilled rows, decode exact, weights exact); a bad boot with this
+  build would confirm it. `dmalloc` now waits
+  for its zeroing, the TP=4 pair-weight slots do the same before their rolls, and the boot reads the identity table
+  back and stops on a wrong entry.
+
+## 2026-10-13: the TP=4 fp8 KV pool grows to 1,981 pages a rank (CAP 310,528)
+
+- The default TP=4 pool was 1,920 pages a rank (CAP 294,912), sized when every rank held every token's indexer keys.
+  Since #44 the keys sit on the latent's pages, and the corrected memory model (docs/KV4.md, Capacity: it counts the
+  buffers that grow with CAP) puts the same per-rank memory at 1,981 pages. The default `CAP` is now 310,528, and
+  `--share-limit 32768` gives 408,832. TP=3 and TP=6 are unchanged.
+- Boxes keep about 0.3 GiB less free memory than with #44 at 1,920 pages: what they had before #44.
+- `--kv-format int4` keeps its measured 2,390 pages (CAP 415,232): 1.34x the fp8 default now.
+
+## 2026-10-13: `--kv-format int4`: a 4-bit KV latent, chosen at launch (experimental, off by default)
+
+- `--kv-format int4` (`KV_FORMAT=int4`) caches the MLA latent as INT4 (one FP16 scale per 32 dims) after a 512-point
+  Hadamard rotation: 416 B a row instead of 656 B. The rope key stays BF16 and the indexer keys stay FP8.
+  [docs/KV4.md](docs/KV4.md) has the row, the kernels and the numbers.
+- At TP=4 it holds about 1.4x the tokens in the same memory: its default CAP is 415,232 against 294,912. Decode is about
+  3% slower, 8K prefill about 6% faster and speculative acceptance about 2% lower. Needles at 32K-200K are found as with
+  fp8, 12/12. TP=3 and TP=6 have estimated defaults (345,088 and 857,600) until they are measured.
+- The row is fixed at build time (`-DG6_KV4=1`), so the image ships two engines per TP: `bin/g6m4` (fp8, the default,
+  unchanged) and `bin/g6m4-int4`, about 15 MB each. The launcher picks one from `KV_FORMAT`, and each refuses the other's
+  format. `KV_FORMAT=int4 ./gr8 glm53 build` builds `g6m4-int4` next to the fp8 engine.
+- A KV store's index key names the row and the engine build, so a `persist=on` store written in one format is cleared
+  by the other. KV node leases are sized by the engine's block and named `-int4` for int4.
+- `engine/attn/kvfmt.h` is the one definition of the row: kernels, CP staging, S2 page copies, store page blocks, dumps
+  and m4sim read it. `kv4_test` (`TEST=kv4_test scripts/c1_tests.sh`) checks the append round trip and the decode,
+  prefill and row-owner attention against a host reference, for either row. `kvman-sim --mla-row 416` models the
+  smaller page blocks.
+- The capacity model now counts the five buffers that grow with CAP (QO tables, tensor-core prefill states, decode
+  scratch, the MTP layer's scratch and prefill state, about 9.6 KB a token). They are why int4's gain is 1.4x, not
+  656/416.
+
+## 2026-10-12: the engine inserts tokens (`generate` `insert`), and the thinking budget uses it
+
+- A request may carry one insert rule: once the reply holds N tokens and none of them is X, the engine puts the rule's
+  tokens (1 to 64) in place of the reply's next token, even when that token is X. S2 requests carry it as
+  `ins <N>:<X or -1>:<ids>`, and ready.s2 is version 3. The shim passes `generate`'s `insert` and says `"insert": true`
+  in its hello. It refuses `insert` with `logprobs` (an inserted token has none) and on a version-2 engine.
+- The rule is applied in s2_batch.h from the committed tokens alone, so every rank cuts at the same token. Tokens the
+  verify sampled past it are dropped, as rejected drafts are. The inserted tokens are emitted at once. At the session's
+  next round, after its run grew to the new length, they run as teacher-forced main steps (as prompt steps, each with
+  its first-form draft and the DFlash2 drafter's context), the last row sampling the token after them, then the chain.
+  The scheduler digest counts inserted tokens, so a rank that missed a rule fails at the next event. A request without
+  a rule runs as before: m4sim prints the same lines.
+- The front end sends `thinking_budget` as the rule (after N - 1 tokens, unless `</think>`, insert `\n</think>\n\n`)
+  when the engine's hello says `insert`. The cut then costs one more main step, where the continuation cost 0.8 to
+  4.2 s of prefill. With an older engine the front end still cancels and continues.
+
+## 2026-10-12: CP: indexer keys are spread across ranks with the latent
+
+- Under CP every rank held every token's indexer keys (22 layers x 132 B per token, all CAP tokens), though a rank
+  scores only the keys of its own pages past R. They now sit on the latent's pages: the replicated first `SHARE_LIMIT`
+  tokens, then the rank's own pages. At TP=4 that is 0.32 GiB per rank instead of 0.76 GiB; at TP=6, 0.33 instead
+  of 1.59 (SHARE_LIMIT 32768).
+- Prefill stages them with the latent: each staging pool gains one layer's index pages (2 x 8.4 KB per page of CAP),
+  filled, gathered from the owners (two more RDMA ranges per page), hashed (`G6_CP_PF_VERIFY`) and copied back with
+  the latent rows. An S2 run below R reads them in place, as before.
+- Output is unchanged: m4sim prints the same lines as before with CP pages spread across ranks, two prefill lanes,
+  row-owner index (`G6_PF_OWN=2`), MTP, prefix reuse and S2 sessions. Tier page blocks below R keep their layout and contents. A
+  stored run's tail past R now carries its indexer keys in each rank's shard instead of the replicated part
+  (`KV_BLOCK_FORMAT` 3, so a `persist=on` store of format 2 starts empty).
+- The defaults (`CAP`, pages per rank) are unchanged; the memory this frees is listed in the PR for a later default.
+
+## 2026-10-12: what the KV stores keep (`--kv-store`, `--kv-keep`), system prompts by default
+
+- Experimental, off by default. `--kv-store STORE,size=N` (repeatable, tried in order; `KV_STORE`, stores separated by `;`) says where, and
+  `--kv-keep system|sessions|all` (`KV_KEEP`) what. `system`, the default: each system prompt with its tools, once,
+  after `--kv-system-after` conversations (default 2) started with it. `sessions`: those, plus runs the pool evicts that
+  continued their conversation at least once. `all`: every eviction (#37's `keep=evicted`). `--kv-tier` and
+  `--kv-shared-after` remain one release as deprecated aliases: a tier that kept evicted runs maps to `all`.
+- Testers ran `keep=evicted` on live agent traffic: ~30,400 pages a rank in 37 minutes, nothing restored, ~2 TB a day.
+  kvman-sim on the opencode captures agrees (109 GB/h a rank for four agents that fit the pool, one restore); `system`
+  writes under 4 GB/h. `sessions` and `all` pay off only with more agents than the KV pool holds.
+- A turn that continues a conversation whose last run the pool let go unstored counts toward no prefix (the pool
+  remembers the heads of the last 1,024 runs it let go), and counts as continued for `sessions`.
+  `engine/kvman-rs/REMOTE-TIER.md` has the numbers. `system` is the recommended setting; `sessions` for agent fleets
+  larger than the KV pool.
+- The front ends send each chat request's system span (`system_tokens`, PROTOCOL.md): the system messages and tools as
+  templated. A new conversation counts only the prefix cells inside it, so an agent's own history never passes for a
+  system prompt.
+- An SSD store starts empty at every boot: blocks, index and counts. `persist=on` keeps it across restarts, keyed on
+  the model, layout, block format (`KV_BLOCK_FORMAT`) and a hash of the engine binary; another key clears it with a log
+  line. A boot that served wrong output must not hand its blocks or counts to the next (REMOTE-TIER.md, Persistence).
+- A run's prefix that another run in the pool holds is stored once and referenced; a restore takes it from a retained
+  run in the pool when one has it.
+- A run past `SHARE_LIMIT` keeps its tail under `sessions` and `all`: each rank stores its own shard and the
+  replicated parts, and a hit restores the rows past R instead of prefilling them again (checked in m4sim; not yet on
+  the cluster).
+- `--kv-write-limit F` (`KV_WRITE_LIMIT`): at most F blocks written per page of KV computed. Deterministic, off by
+  default.
+- Rank 0 logs, at most once a minute, what a store did once it fills, passes entries on, drops or refuses them.
+  `status.s2` has per-store bytes and pages spilled, moved, restored, dropped and refused, exported as
+  `g6:kv_store_*{store="i"}`. The shim now sends the engine status under `scheduler`, so the `g6:s2_*` metrics, never
+  exported before, are too.
+
+## 2026-10-12: thinking controls and a `response_format` guard in the front end
+
+- GLM 5.3's chat template cannot turn thinking off, and the front end passed `enable_thinking` to it, which it never
+  read. Now `chat_template_kwargs.enable_thinking` false and `reasoning_effort` `none` are a 400 that points to
+  `reasoning_effort` `low` or a `thinking_budget`. The front end stops adding an `enable_thinking` of its own.
+- `reasoning_effort` (top level, or in `chat_template_kwargs`) must be none, minimal, low, medium, high, xhigh or max,
+  and the template hears the nearest level it names, ties going higher (TensorFold 0.6.1's rule): on GLM 5.3 minimal is
+  low, medium is high and xhigh is max. Before, every value but low and high rendered as max.
+- `thinking_budget` (an integer or null), as TensorFold reads it: while the think block is open, the reply's Nth token
+  is replaced by `\n</think>\n\n` and the answer follows. 0 and null take the server default, and a negative budget is
+  no limit. The front end ends the engine run there and continues from the
+  prompt, the reply and the close, so the client sees one reply. The continuation prefills the prompt's last partial
+  4,096-row cell and the reasoning again (2.5-4.2 s at TP=4's cold prefill rate on the mock, frontend/README.md).
+- `--default-reasoning-effort` and `--default-thinking-budget` (`DEFAULT_REASONING_EFFORT`, `DEFAULT_THINKING_BUDGET`),
+  off by default.
+- `response_format` other than `{"type": "text"}` is a 400 until JSON mode lands. It was ignored before.
+- Chat usage reports `completion_tokens_details.reasoning_tokens`.
+- The smoke test checks the refusal and a budget where it checked thinking off. The gate's client, `pbench --effort
+  nothink` and the smoke test leave out `enable_thinking`. Their prompts render the same as before.
+
+## 2026-10-11: block stores below the KV pool (`--kv-tier`), off by default
+
+- `--kv-tier STORE,size=N(G|T)[,keep=evicted|shared|all]`, given once per tier (`KV_TIER`, tiers separated by `;`).
+  STORE is `ssd:PATH` (a folder per box), `remote:HOST:PORT` or `remote:auto` (a KV node from the mentat group). A
+  `keep=evicted` tier holds the retained runs the pool evicts. A `keep=shared` tier holds the prefixes that started
+  `--kv-shared-after` conversations (default 3), written once. A request that continues a stored entry reads its pages
+  back and skips their prefill. Tiers are tried in flag order, and a full tier passes its least recently used entries
+  on to the next tier that keeps them.
+- A request that continues a live, retained or stored run counts toward no prefix, so a chat of five turns counts once.
+- An SSD tier's shared prefixes survive restarts: an index beside the blocks, keyed by the model, TP, R and the page
+  block's layout. A record is committed only after its blocks are written, and the ranks keep only the entries every
+  rank loaded.
+- The head counts and matches, and the grant carries the restored tier and the count. The control frames are version
+  `G6S2E4`, so every rank needs this build. Without `--kv-tier` the pool does no extra work and its digest is unchanged.
+- On the TP=4 cluster an evicted agent turn came back in 2.2-5.1 s (12.9-17.1 s without a tier), a stored system
+  prompt after a restart in 1.3-1.4 s (~10 s cold), and the restored blocks were the same on all four ranks.
+  `engine/kvman-rs/REMOTE-TIER.md` has the numbers.
+- After a tier's copies the ranks pass a barrier (a Sync/Go round on the control links, frames `Sync` and `Go`) before
+  the next round. One rank's copies to a KV node ran seconds longer than another's, and a skew near 10 s failed the next
+  prefill's GPU waits with "S2 prefill fabric/attention error": an 8-agent replay lost the cluster twice that way. The
+  prefill error now prints each error word, the layer, the request and the time into the quantum, and every rank logs
+  its drains with the wall clock. `G6_KV_DRAIN_DELAY` and `G6_S2_BIND_DELAY` are test-only knobs that stall one rank.
+
+## 2026-10-11: a remote KV page store, and `./gr8 kv` to run its node
+
+- `./gr8 kv up --gb N` locks N GiB on a box with spare memory and serves it as KV page blocks (`kvman-remote`). It
+  joins the mentat group as an agent without GPUs, with the service `gr8-kv`. `down`, `status` (`status all` for every
+  node in the group) and `logs` work as for the model. KNOBS.md lists its options.
+- Clients reach a node over RDMA (one-sided reads and writes) where both ends have a RoCE v2 address, over TCP
+  otherwise. Each client holds a named lease, and the NIC refuses its QPs any other lease's memory.
+- The engine does not use it yet. `engine/kvman-rs/REMOTE-TIER.md` has the numbers: 14.0 GB/s per PCIe root over a
+  direct cable and 3.8 us for one row, against 5.7-7.0 GB/s and 43 us on the box's NVMe, and 1.18 GB/s over a 10G LAN.
+  The same file has the plan for spilling evicted retained runs to either store.
+- `kvman-remote-bench` reports what a lease moves from a client box, and how fast.
+
+## 2026-10-11: the engine is called gr8 in the docs
+
+- The README opens with "gr8: a super-fast local AI engine". Docs, comments, error messages and the API's `owned_by`
+  call the engine gr8. Binary names (`g6m4`, `g6load`, `g6front-rs`), `G6_*` settings, `--g6env-x`, the `g6:` metrics
+  and the protocol tags keep their names.
+- The Docker instructions pull the image first, and docker/README.md says how to update every box to a new image.
+
+## 2026-10-11: CI builds everything on GitHub's runners
+
+- The engine job builds on GitHub's hosted arm64 runner, so `ghcr.io/kindlingai/gr8` is published from every push to
+  main and every tag again. The self-hosted runner, its fork-refusal hook and the `GR8_ARM_RUNNER` / `GR8_NATIVE`
+  switches are gone. Pull requests from forks now build the engines and the image too (never pushed).
+- `docker/.env.example` and `--variant`'s help name the current defaults (`bit225` at TP=3) and every variant.
+
+## 2026-10-11: S2 sessions take KV pages as they need them
+
+- A session below R starts with the pages for its prompt, the token after it and the guard, and takes one more page
+  each time its output reaches the end of the last one. Agent harnesses send `max_tokens` 32,000, so a 13,000-45,000
+  token prompt used to hold 45,000-77,000 rows from admission, and one or two sessions filled the 1,920-page pool at
+  TP=4.
+- No session ever has to give pages back: the pool admits a request, or lets a session grow, only when every live
+  session can still reach prompt + `max_tokens` + guard (a safe state). A session whose page would break that sits out
+  rounds until another session finishes, then runs the same steps it would have run. Requests past R, by prompt +
+  `max_tokens`, still take the whole pool at once.
+- A finished session's pages go back to the pool when it finishes, not at the next admission.
+- `status.s2` adds `held_pages`, `worst_pages`, `grown`, `stalled_rounds` and each run's pages held and worst case.
+  The front ends export the first four as `g6:s2_held_pages`, `g6:s2_worst_pages`, `g6:s2_grown_total` and
+  `g6:s2_stalled_rounds_total`. `G6_S2_GROW=0` gives every run its worst case at admission, as before.
+- The control frames are version `G6S2E3`, so every rank needs this build.
+- Predicted by `kvman-sim` on two recorded opencode traces (four sessions each, TP=4 time model, not yet measured on
+  the cluster): median TTFT 42.6 s -> 4.1 s and wall time -15% on the first. The second gains 6-9% wall time and
+  little TTFT, since 25 of its 54 requests are past R with their `max_tokens`. `engine/kvman-rs/SSD-TIER.md` has the
+  tables.
+- m4sim: `G6_S2_GROW=P` runs the `--s2` sessions on a pool of P pages that grows on demand.
+
+## 2026-10-11: README: what concurrent requests produce
+
+- The README and `kindling.json` said each request's output is byte for byte what it would be alone. That does not
+  hold: when requests share decode steps, a request's tokens and logprobs can differ from its solo run (seen in m4sim
+  on main). The README now says so, and AGENTS.md asks a change to keep output identical to the
+  build before it, not to the solo run.
+- The README's section on rank packs goes: it covers only the release on Hugging Face.
+
+## 2026-10-11: S2 is the only serving path
+
+- `g6m4` needs a DEC_S2 build and refuses to compile without one. The loop that served one request at a time (`--serve`
+  without S2, `DIR/req.<n>` and `DIR/ready` on every rank) is gone. Without `--serve`, `g6m4` still runs its `--prompt`
+  sequences once and exits: `docs/REUSE-GPU-TEST.md` uses that.
+- `frontend/g6shim.py` is gone, with `tests/test_g6shim.py`, `tests/test_shim.py` and `tests/fake_serve_engine.py`.
+  `g6s2shim.py` now holds `EOS_IDS` and `VOCAB`.
+- The launcher always starts the Rust front end and `g6s2shim.py`. The `FRONT` option is gone, and a `FRONT` line in an
+  old config file is ignored. The Python front end (`frontend/g6front`) stays as the reference the Rust one is tested
+  against.
+
+## 2026-10-11: S2 sessions hold page lists
+
+- A session's KV is a list of pool pages, the lowest free ones first. A request is admitted whenever enough pages are
+  free anywhere in the pool: fragmentation never stalls admission. `status.s2` drops `fragmentation_stalls`, and with it
+  the `g6:s2_fragmentation_stalls_total` metric. `largest_free_run` counts the pages one request can take.
+- A prefix-reuse hit keeps the retained run's first pages, as many as its cached rows fill, and takes the rest from the
+  free pages. A miss evicts whole retained runs, the least recently retired first.
+- Every rank runs the same allocator. A grant carries its list's hash, and each event's state hash covers every rank's
+  pool. The control frames are version `G6S2E2`, so every rank needs this build.
+- m4sim: `G6_S2_PAGES=seed[,pages]` gives every `--s2` session a shuffled, non-contiguous page list.
+
 ## 2026-10-11: requests up to 65,536 tokens share decode steps at TP=4 and TP=3
 
 - A request shares the pool only while its prompt + `max_tokens` fits in R, the KV every rank holds in full. R was

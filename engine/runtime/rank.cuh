@@ -1,4 +1,4 @@
-// g6 rank step: one rank's decode step over a list of real layers + head, as launch helpers.
+// gr8 rank step: one rank's decode step over a list of real layers + head, as launch helpers.
 // Used unchanged by the NR-process runtime (engine/runtime/g6m4.cu, real fabric; NR = G6_NR, six or four) and by the
 // one-process NR-simulated-rank driver (engine/runtime/m4sim.cu, loopback fabric), so their outputs must be bit-identical.
 //
@@ -28,10 +28,13 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "context_buckets.h"
+#include "../attn/kvfmt.h"
 #include "draft_shape.h"
 #include "serve.h"
 #include "spec_len.h"
 #include "../h2d.h"
+#include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
 #include "../attn/bind.h"
@@ -62,15 +65,7 @@ inline double mem_min_gib()
 
 inline void check_headroom(int rank, int capacity, bool log)
 {
-    double gib = -1;
-    if (FILE* f = fopen("/proc/meminfo", "r"))
-    {
-        char line[128];
-        long kb;
-        while (fgets(line, sizeof line, f))
-            if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gib = kb / 1048576.0; break; }
-        fclose(f);
-    }
+    const double gib = kb_gib(host_mem().avail_kb);
     static const double need = mem_min_gib();
     if (log) fprintf(stderr, "# rank %d: MemAvailable %.1f GiB after the weights and the KV pool\n", rank, gib);
     if (gib >= 0 && gib < need)
@@ -97,11 +92,29 @@ struct TensorRef
 };
 using Find = std::function<TensorRef(const std::string&)>;
 
+// G6_TEST_ZERO_DELAY_MS=N (a test of #49's race): dmalloc's zeroing waits behind an N ms kernel on the legacy stream, so
+// any write to new memory that is not ordered after the zeroing loses to it every time.
+__global__ void k_test_spin(unsigned long long ns)
+{
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); while (t - t0 < ns);
+}
+inline void test_zero_delay()
+{
+    static const int ms = getenv("G6_TEST_ZERO_DELAY_MS") ? atoi(getenv("G6_TEST_ZERO_DELAY_MS")) : 0;
+    if (ms > 0) k_test_spin<<<1, 1, 0, nullptr>>>(ms * 1000000ull);
+}
+
+// cudaMemset runs on the legacy default stream and returns before it finishes. The engine's streams are non-blocking, so
+// nothing orders a later write on them after the zeroing: wait for it here, or the zeros can land on top of that write.
 template <typename T> inline T* dmalloc(size_t n)
 {
     T* p;
     G6RT_CK(cudaMalloc(&p, n * sizeof(T)));
+    test_zero_delay();
     G6RT_CK(cudaMemset(p, 0, n * sizeof(T)));
+    G6RT_CK(cudaStreamSynchronize(nullptr));
     return p;
 }
 inline std::string lname(int l, const char* t) { char b[96]; snprintf(b, sizeof b, "L%03d.%s", l, t); return b; }
@@ -126,7 +139,7 @@ struct StepIn
     glue::SampleRow srow[MX];
     int tgt[MX];                      // teacher forcing: the id each row should predict (< 0 = none)
 #ifdef DEC_S2
-    int base_page, pad_s2;            // S2 (TP4 option (a), provisional): first pool page of the session (0 = today)
+    int page_bound, pad_s2;           // S2 solo run: the pool's pages, the cells' page_count (0 = the context's pages, today)
 #endif
 };
 struct StepOut
@@ -160,7 +173,7 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
     {
         c.cells[l].context = sh.context;
 #ifdef DEC_S2
-        c.cells[l].page_count = sh.base_page + pages;   // the physical page bound of a run at base_page (table B + i)
+        c.cells[l].page_count = sh.page_bound ? sh.page_bound : pages;   // a solo run's table holds -1 past its pages
 #else
         c.cells[l].page_count = pages;
 #endif
@@ -219,9 +232,12 @@ struct CpState
     unsigned* tickets = nullptr;      // [colls.ncoll()] publish tickets, device, zero
     uint64_t* cand = nullptr;         // [nr][MX][2048] candidate lists, own at [rank] (layout [s][M][2048] per step)
     float *qbuf = nullptr, *part_all = nullptr, *part_tmp = nullptr;   // [MX][HMAX][576], [nr][cp_blk(MX, HMAX)], [nr-1][same]
-    // prefill staging (step 4, prefill.cuh cp_pf_*): two latent pools of one layer at capacity, the identity table, and
-    // every layer's CP args while the prefill view is swapped in (pf_staged)
+    // prefill staging (step 4, prefill.cuh cp_pf_*): two latent pools of one layer at capacity (each followed by one
+    // layer's index pages at pf_ixoff), the identity table, and every layer's CP args while the prefill view is swapped in
+    // (pf_staged); pf_ixon: this staged view stages the index keys (not an S2 run below R)
     char* pf_pool[2] = {};
+    size_t pf_ixoff = 0;
+    bool pf_ixon = false;
     int* pf_ident = nullptr;
     std::vector<G6Attn> pf_saved;
     bool pf_staged = false;
@@ -249,7 +265,8 @@ struct Model
     int s2_pool_slots = 1;            // set before build: > 1 = the layers' own attention bindings hold the S2 pool
     int s2_run_pages = 0;             // build: the MOST pages one session's run can hold (the capacity argument; each view's table)
     int s2_pool_pages = 0;            // set before build: pages of the pool (0 = s2_pool_slots x s2_run_pages); >= s2_run_pages
-    int s2_pf_base = 0;               // S2 below R: first page of the run being prefilled (CP staging index offset, prefill.cuh)
+    bool s2_pf_table = false;         // S2 below R: staged prefill reads index keys through the run's table (prefill.cuh
+                                      // cp_pf_enter); false = logical pages, as an exclusive run past R
     int s2_below = 0;                 // set before s2_init: S2 below R (CP builds): every session's run <= s2_below rows on the
                                       // replicated (non-CP) path; the pool is the layer's own binding as built (s2.cuh)
 #endif
@@ -430,17 +447,11 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     {
         const char* e = getenv("G6_DEC_BK");
         int b = e ? atoi(e) : 2048;
-        m.nbk = 0;
-        if (b > 0) for (; b < capacity && m.nbk < NBK - 1; b *= 2) m.bk[m.nbk++] = b;
-        m.bk[m.nbk++] = capacity;
+        int cp_r = 0;
 #if defined(G6_CP) && G6_CP
-        if (m.cp.on && m.cp.R > 0 && m.cp.R < capacity && std::find(m.bk, m.bk + m.nbk, m.cp.R) == m.bk + m.nbk)
-        {   // R is a bucket boundary: buckets <= R run the replicated graphs, buckets > R the CP graphs
-            if (m.nbk == NBK) die("G6_CP: no room for the R bucket (G6_DEC_BK)");
-            m.bk[m.nbk++] = m.cp.R;
-            std::sort(m.bk, m.bk + m.nbk);
-        }
+        if (m.cp.on) cp_r = m.cp.R;
 #endif
+        m.nbk = context_buckets(m.bk, b, capacity, cp_r);
     }
     m.cells = dmalloc<G6AttnStepCell>(m.nl);
     m.shared = dmalloc<int>(m.nl);
@@ -1038,17 +1049,20 @@ inline int bucket_of(const Model& m, int context)
     for (int k = 0; k < m.nbk; ++k) if (m.bk[k] >= context) return k;
     return m.nbk - 1;
 }
-// after the stream is synchronized: attention error words of every layer (0 = clean), by host copies
-inline unsigned attn_errors(Model& m)
+// after the stream is synchronized: the first layer's nonzero attention error word (0 = clean), by host copies; *layer =
+// its index in m.layers (-1 when clean)
+inline unsigned attn_errors_at(Model& m, int* layer)
 {
-    for (Layer& y : m.layers)
+    for (size_t i = 0; i < m.layers.size(); ++i)
     {
         unsigned e = 0;
-        G6RT_CK(cudaMemcpy(&e, y.ab.args.error, 4, cudaMemcpyDeviceToHost));
-        if (e) return e;
+        G6RT_CK(cudaMemcpy(&e, m.layers[i].ab.args.error, 4, cudaMemcpyDeviceToHost));
+        if (e) { if (layer) *layer = (int)i; return e; }
     }
+    if (layer) *layer = -1;
     return 0;
 }
+inline unsigned attn_errors(Model& m) { return attn_errors_at(m, nullptr); }
 // new sequence: clear every layer's attention caches (load time / between requests, not inside a capture)
 inline void reset(Model& m, cudaStream_t st)
 {
@@ -1220,6 +1234,9 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
     D.d.eh_in = dmalloc<__half>((size_t)MX * 2 * HID);
     D.d.eh_out = dmalloc<__half>((size_t)MX * HID);
     build(D.d, main.rank, std::vector<int>{78}, find, capacity, f, stepp, st, max_rows);
+    // The draft has no CP binding, but its graph indices must use the target context buckets.
+    D.d.nbk = main.nbk;
+    std::copy(main.bk, main.bk + main.nbk, D.d.bk);
     D.d.final_norm = (const __nv_bfloat16*)need(find, "L078.shared_head_norm");
     D.enorm = (const __nv_bfloat16*)need(find, "L078.enorm");
     D.hnorm = (const __nv_bfloat16*)need(find, "L078.hnorm");
