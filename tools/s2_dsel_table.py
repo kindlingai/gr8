@@ -23,7 +23,7 @@ plus G6ENV_X="G6_S2_TIMELINE=200 G6_MTP_LPLOG=1" (no G6_S2_ROUNDLOG: its route c
 solo decode that visits both drafters (RigMark c1 prose, code and structured), then pass every rank's log. Check the
 derivation: each v<M> the drafters reach (2..4 MTP, 2..8 DFlash2) from enough steps, and enough MTP rounds for g k n.
 
-  s2_dsel_table.py LOG [LOG ...] [--min-n 30] [--roundlog] [--no-prior] [--w W]
+  s2_dsel_table.py LOG [LOG ...] [--min-n 30] [--roundlog] [--no-prior] [--w W] [--r R]
   s2_dsel_table.py --selftest
 """
 import argparse
@@ -164,6 +164,7 @@ def main(argv=None):
     ap.add_argument('--roundlog', action='store_true', help='fill verify rows from "# s2_round" lines (launch+fence)')
     ap.add_argument('--no-prior', action='store_true', help='leave out g, k, n')
     ap.add_argument('--w', type=float, default=None, help="the acceptance estimates' prior weight in rounds (engine default 4)")
+    ap.add_argument('--r', type=float, default=None, help="price DFlash2 from its rounds, aged by R per MTP round (e.g. 0.95)")
     ap.add_argument('--selftest', action='store_true')
     a = ap.parse_args(argv)
     if a.selftest:
@@ -173,6 +174,8 @@ def main(argv=None):
     t, why = table(read(a.logs, a.roundlog), a.min_n, not a.no_prior)
     if a.w is not None:
         t['w'] = a.w
+    if a.r is not None:
+        t['r'] = a.r
     for w in why:
         print('# ' + w, file=sys.stderr)
     print(fmt(t))

@@ -205,6 +205,10 @@ inline int draft_par_env() { const char* e = getenv("G6_DRAFT_PAR"); return e ? 
 //   w        the acceptance estimates' prior in rounds (SpecLen::prior, default 4). With decay 0.9 the seed keeps
 //            w / (w + 10) of every rate, and the positions of a round compound it: at 4 a DFlash2 block whose 7 drafts
 //            are all accepted is expected to commit 6.1 tokens, not 8 (at 1: 7.3), which favours MTP's shorter rounds
+//   r        price DFlash2 as MTP is: its tokens per ms = the request's DFlash2 rounds' committed tokens over their table
+//            cost (verify k + 1 rows, d), a scored probe counting as a round of K drafts; r (0..1] ages that evidence
+//            per MTP round, so the probes after a dip decide (0.95: about two). Not given: SpecLen's position rates
+//            (spec_len.h), whose compounded prior caps a full block's estimate below MTP's three-draft rounds' price
 // tools/s2_dsel_table.py writes it from a G6_S2_TIMELINE (+ G6_MTP_LPLOG) boot. Measured once and frozen: step times
 // differ per rank, and a decision that differs between ranks hangs the fabric (spec_len.h).
 struct DSelTable
@@ -214,6 +218,7 @@ struct DSelTable
     double d = 0, m = 0, e = 0, p = 0;
     double g = -1, k = 0, n = 0;                        // the MTP prior (-1 / 0: not given)
     double w = 0;                                       // SpecLen::prior (0: not given)
+    double r = 0;                                       // DFlash2 priced from its rounds, aged by r per MTP round (0: off)
     // the verify ms of a fractional row count (the prior's mean drafts), linear between rows
     double verify(double rows) const
     {
@@ -259,7 +264,8 @@ struct DSelTable
             else if (key == "k") k = x;
             else if (key == "n") n = x;
             else if (key == "w") { if (!(x > 0)) return fail("'" + item + "': the prior needs weight"); w = x; }
-            else return fail("unknown key '" + key + "' (v1..v" + std::to_string(VX) + ", d, m, e, p, g, k, n, w)");
+            else if (key == "r") { if (!(x > 0 && x <= 1)) return fail("'" + item + "': an aging factor in (0, 1]"); r = x; }
+            else return fail("unknown key '" + key + "' (v1..v" + std::to_string(VX) + ", d, m, e, p, g, k, n, w, r)");
         }
         std::vector<int> rs;
         for (int r = 1; r <= VX; ++r) if (have[r]) rs.push_back(r);
@@ -290,6 +296,7 @@ struct DSelTable
         if (k > 0) { snprintf(b, sizeof b, ",k:%.10g", k); s += b; }
         if (n > 0) { snprintf(b, sizeof b, ",n:%.10g", n); s += b; }
         if (w > 0) { snprintf(b, sizeof b, ",w:%.10g", w); s += b; }
+        if (r > 0) { snprintf(b, sizeof b, ",r:%.10g", r); s += b; }
         return s;
     }
     // a SpecLen's verify table, drafting ms and prior weight
@@ -318,6 +325,7 @@ struct DSel
     // as `prior` rounds: it decides until the request has MTP rounds, then keeps ~9% (SpecLen's 4 would keep 29%)
     double rn = 0, rc = 0, an = 0, ag = 0;
     double prior = 1;
+    double dn = 0, dt = 0, dc = 0;    // tab.r: DFlash2 rounds (and scored probes), their tokens and table cost, decayed
 };
 // G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
 //   0  off: K every round
@@ -387,7 +395,8 @@ public:
     std::pair<double, double> dsel_rates() const
     {
         double rd = 0;
-        if (dsl_.on) { for (int k : dsl_.levels) rd = std::max(rd, sel_.d.ratio(k, nullptr, k)); }
+        if (sel_.model && sel_.tab.r > 0 && sel_.dc > 0) rd = sel_.dt / sel_.dc;   // tab.r: the rounds as they ran
+        else if (dsl_.on) { for (int k : dsl_.levels) rd = std::max(rd, sel_.d.ratio(k, nullptr, k)); }
         else rd = sel_.d.ratio(dkv_, nullptr, dkv_);
         return {sel_.model ? mtp_rate() : sel_.m.ratio(K_, nullptr, K_), rd};
     }
@@ -750,6 +759,7 @@ private:
         {
             sel_.d.observe(k, a, x.dl, 0);
             sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, ml, 0);
+            dfl_obs(a + 1, k);
             return;
         }
         sel_.m.observe(k, a, ml, pe);
@@ -759,8 +769,16 @@ private:
             sel_.rn = sel_.rn * f + 1; sel_.rc = sel_.rc * f + mtp_cost(k, x.k);
             sel_.an *= f; sel_.ag *= f;
             if (a >= 1) { sel_.an += 1; sel_.ag += a - 1; }
+            sel_.dn *= sel_.tab.r; sel_.dt *= sel_.tab.r; sel_.dc *= sel_.tab.r;   // tab.r: DFlash2's evidence ages
         }
         probe_score(x);
+    }
+    // tab.r: a DFlash2 round (or a scored probe) that committed c tokens verifying k drafts, at the table's cost
+    void dfl_obs(int c, int k)
+    {
+        if (!sel_.model || !(sel_.tab.r > 0)) return;
+        const double f = sel_.d.pos_decay;
+        sel_.dn = sel_.dn * f + 1; sel_.dt = sel_.dt * f + c; sel_.dc = sel_.dc * f + sel_.tab.verify(k + 1) + sel_.tab.d;
     }
     // a probe's drafts pd[j] are for positions pb + j; score them once a mismatch or all DFL_B - 1 are committed
     void probe_score(St& x)
@@ -771,6 +789,7 @@ private:
         while (b < n && b < have && x.pd[b + 1] == x.tokens[x.pb + b + 1]) ++b;
         if (b < n && b == have) return;             // every committed position matched so far: wait for more
         sel_.d.observe(std::min(b + 1, n), b, x.pl, 0);
+        dfl_obs(std::min(b, dkv_) + 1, dkv_);        // as a round verifying K drafts would have
         x.pb = -1;
     }
     // the drafter for the next round: switch after dwell rounds when the other one's tokens per ms is margin higher
@@ -811,6 +830,7 @@ private:
         sel_.d = fresh(sel_.d);
         sel_.m = fresh(sel_.m);
         sel_.rn = sel_.rc = sel_.an = sel_.ag = 0;
+        sel_.dn = sel_.dt = sel_.dc = 0;
     }
     static g6rt::SpecLen fresh(const g6rt::SpecLen& o)
     {
