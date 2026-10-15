@@ -96,8 +96,9 @@ t_tool_call_parsed() {
 # A forced choice is a call even when the message asks for prose: the engine puts the opener (and, named, the name) in
 # place of the reply's first token, so the model cannot answer in text.
 t_tool_choice_required() {
-  local tools='[{type:"function", function:{name:"get_weather", description:"Get the current weather for a city.",
-            parameters:{type:"object", properties:{city:{type:"string"}}, required:["city"]}}}]'
+  # jq --argjson takes strict JSON, so these keys are quoted (a jq -n program's keys need not be)
+  local tools='[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a city.",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
   for tc in '"required"' '{"type":"function","function":{"name":"get_weather"}}'; do
     post /v1/chat/completions "$(jq -n --arg m "$NAME" --argjson tc "$tc" --argjson t "$tools" '{
       model:$m, max_tokens:256, temperature:0, tool_choice:$tc, tools:$t,

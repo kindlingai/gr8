@@ -443,7 +443,13 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
             Some("tool_choice"),
         ));
     }
-    let force = choice.forced_ids(&st.tok)?;
+    // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
+    // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
+    let close = match (st.tok.think_start, st.tok.think_end) {
+        (Some(s), Some(e)) if think_open(&prompt, s, e) => st.tok.think_close.as_slice(),
+        _ => &[],
+    };
+    let force = choice.forced_ids(&st.tok, close)?;
     params.gen.system_tokens = system;
     Ok(ChatReq { tools, choice, force, prompt, params, budget })
 }
@@ -508,9 +514,10 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         }
     }
     if !cr.force.is_empty() {
-        // `tool_choice: required` (or a named function): the engine puts the opener -- and the name -- in place of the
-        // reply's first token, so the reply is a call and cannot be text. A budget cannot also be in force here (the
-        // combination is refused above), so this is the request's one rule.
+        // `tool_choice: required` (or a named function): the engine puts the thinking close and the opener -- and the
+        // name -- in place of the reply's first token, so the reply is a call and cannot be text. A budget cannot also
+        // be in force here (the combination is refused above), so this is the request's one rule, and it replaces the
+        // thinking state that block set: the close is in the insert now.
         gen.params.gen.insert = Some(InsertRule {
             after_tokens: 0,
             unless_emitted: None,

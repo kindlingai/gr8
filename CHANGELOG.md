@@ -63,8 +63,9 @@
 
 - `tool_choice: "required"` and a function-naming object were a 400 ("named / required tool_choice is not supported").
   They now force the reply to be a tool call with the engine's insert rule (PROTOCOL.md `insert`): the engine puts the
-  tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer
-  in text. That is the mechanism the thinking budget already uses to close a `<think>` block, per request and from the
+  thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so
+  the model cannot answer in text. The close comes first because the template leaves `<think>` open at the end of a
+  chat prompt, and a call written inside the reasoning span is reasoning text, not a call. That is the mechanism the thinking budget already uses to close a `<think>` block, per request and from the
   committed tokens alone, so no engine or protocol change was needed — the front end only had to stop refusing them.
 - It is a strong nudge, not a grammar. gr8's engine samples, so the front end cannot mask logits: a call to a name the
   request did not offer still comes back as text (the parser drops an unknown name), and the arguments are the model's

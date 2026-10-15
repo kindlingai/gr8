@@ -6,6 +6,12 @@
 //! mechanism the thinking budget uses for `</think>`): the engine puts the tool-call opener in place of the reply's first
 //! token, so the model can only go on inside a call.
 //!
+//! The opener goes where the reply's first token would be, and GLM's chat template leaves `<think>` open at the end of
+//! the prompt, so that position is inside the reasoning span. A call written there is reasoning text, and the parser
+//! does not read a call in reasoning (`parser.rs`), which left `required` returning prose for some prompts. So the rule
+//! closes thinking first, the way the budget's rule does: the inserted tokens are `think_close` then the opener, and the
+//! reply's first content token is the call.
+//!
 //! It is a strong nudge, not a grammar. gr8's engine samples, so the front end cannot mask logits, and a reply that
 //! opens a call to a name the request did not offer is still possible -- the parser drops such a name, which leaves text
 //! and `finish_reason: stop` -- as are arguments the tool's schema rejects (`strict` is not enforced; the parser coerces
@@ -109,14 +115,18 @@ impl ToolChoice {
         }
     }
 
-    /// `forced_text` as token ids: what goes in the request's insert rule (engine/runtime/insert_rule.h). Empty when the
-    /// choice forces nothing.
-    pub fn forced_ids(&self, tok: &Tok) -> Result<Vec<u32>, ApiError> {
+    /// `forced_text` as token ids, behind `think_close`: what goes in the request's insert rule
+    /// (engine/runtime/insert_rule.h). `think_close` is the template's `</think>` when the prompt leaves `<think>` open
+    /// (`gen::think_open`) and empty otherwise, so the opener always starts the reply's content rather than its
+    /// reasoning. Empty when the choice forces nothing.
+    pub fn forced_ids(&self, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
         let Some(text) = self.forced_text() else { return Ok(Vec::new()) };
-        let ids = tok.encode(&text, false).map_err(|e| ApiError::new(500, &e, None))?;
-        if ids.is_empty() {
+        let opener = tok.encode(&text, false).map_err(|e| ApiError::new(500, &e, None))?;
+        if opener.is_empty() {
             return Err(ApiError::bad(format!("'{text}' does not tokenize"), Some("tool_choice")));
         }
+        let mut ids = think_close.to_vec();
+        ids.extend_from_slice(&opener);
         if ids.len() > INSERT_MAX {
             return Err(ApiError::bad(
                 format!("the forced tool_choice is {} tokens, more than the engine's {INSERT_MAX}", ids.len()),
