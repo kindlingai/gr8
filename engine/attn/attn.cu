@@ -211,10 +211,12 @@ __device__ float latent(const uint8_t* v,int d){return e4(v[d])*((const float*)(
 #define KV4_ROTATE(p,rows,st) do{}while(0)
 #endif
 
+// The bodies of append_kv / append_index / prep_index / reuse take their row (and head, thread, shared slot) as arguments so
+// attn_front (G6_ATTN_FRONT) can run them in one launch; the kernels below call them with the launch indices.
 template<class Input>
-__global__ void append_kv(Input input){
+__device__ __forceinline__ void append_kv_row(Input input,int row){
     auto a=resolve(input);if(!a.active)return;
-    int row=blockIdx.x,t=threadIdx.x,pos=a.positions[row];FOR_ROW(a,input,row);CP_REMOTE_ROW(a,pos)int pg=page(a,pos);if(pg<0)return;
+    int t=threadIdx.x,pos=a.positions[row];FOR_ROW(a,input,row);CP_REMOTE_ROW(a,pos)int pg=page(a,pos);if(pg<0)return;
     __shared__ float v[512],sums[8],sc[4];
     float ss=0;
     for(int d=t;d<512;d+=256){float x=hfloat(a.kv_a,(int64_t)row*576+d);v[d]=x;ss=fmaf(x,x,ss);}
@@ -250,10 +252,13 @@ __global__ void append_kv(Input input){
         ((bf16*)(dst+g6kv::ROPE_OFF))[2*t]=__float2bfloat16_rn(x*c-y*s);((bf16*)(dst+g6kv::ROPE_OFF))[2*t+1]=__float2bfloat16_rn(y*c+x*s);}
 }
 template<class Input>
-__global__ void append_index(Input input){
+__global__ void append_kv(Input input){append_kv_row(input,blockIdx.x);}
+// NH shared slots (hf < NH): attn_front runs two copies of a row in one block, each on its own slot
+template<int NH,class Input>
+__device__ __forceinline__ void append_index_row(Input input,int r,int t,int hf){
     auto a=resolve(input);if(!a.active)return;
-    int r=blockIdx.x,t=threadIdx.x,pos=a.positions[r];FOR_ROW(a,input,r);CP_REMOTE_ROW(a,pos)int pg=ipage(a,pos);if(pg<0)return;   // CP: the page's owner appends it, as append_kv
-    __shared__ float v[128],sum[4],scale;
+    int pos=a.positions[r];FOR_ROW(a,input,r);CP_REMOTE_ROW(a,pos)int pg=ipage(a,pos);if(pg<0)return;   // CP: the page's owner appends it, as append_kv
+    __shared__ float v_[NH][128],sum_[NH][4],scale_[NH];float* v=v_[hf];float* sum=sum_[hf];float& scale=scale_[hf];
     float x=hfloat(a.index_k,(int64_t)r*128+t),s=warp_sum(x);if((t&31)==0)sum[t/32]=s;__syncthreads();
     float mean=(sum[0]+sum[1]+sum[2]+sum[3])/128;
     float dx=x-mean;float ss=warp_sum(dx*dx);__syncthreads();if((t&31)==0)sum[t/32]=ss;__syncthreads();
@@ -266,9 +271,11 @@ __global__ void append_index(Input input){
     if(t==0)((float*)(base+a.page_size*128))[pos%a.page_size]=scale;
 }
 template<class Input>
-__global__ void prep_index(Input input,int start,half* q,float* w){
+__global__ void append_index(Input input){append_index_row<1>(input,blockIdx.x,threadIdx.x,0);}
+template<int NH,class Input>
+__device__ __forceinline__ void prep_index_row(Input input,int start,half* q,float* w,int row,int h,int t,int hf){
     auto a=resolve(input);if(!a.active)return;
-    int row=blockIdx.x,r=start+row,h=blockIdx.y,t=threadIdx.x;__shared__ float v[128],maxima[4],scale;
+    int r=start+row;__shared__ float v_[NH][128],maxima_[NH][4],scale_[NH];float* v=v_[hf];float* maxima=maxima_[hf];float& scale=scale_[hf];
     v[t]=hfloat(a.index_q,((int64_t)r*32+h)*128+t);__syncthreads();
     if(t<32){float c,s;RCS(a.positions[r],t,c,s);float x=v[2*t],y=v[2*t+1];v[2*t]=x*c-y*s;v[2*t+1]=y*c+x*s;}__syncthreads();
     float mx=warp_max(fabsf(v[t]));if((t&31)==0)maxima[t/32]=mx;__syncthreads();
@@ -276,6 +283,8 @@ __global__ void prep_index(Input input,int start,half* q,float* w){
         w[row*32+h]=hfloat(a.index_weight,(int64_t)r*32+h)*scale*(1.f/64.f);}
     __syncthreads();q[((int64_t)row*32+h)*128+t]=__float2half_rn(e4(q4(v[t]/scale)));
 }
+template<class Input>
+__global__ void prep_index(Input input,int start,half* q,float* w){prep_index_row<1>(input,start,q,w,blockIdx.x,blockIdx.y,threadIdx.x,0);}
 // Four warps: two 16-head tiles x two 16-key tiles; no approximate candidate reduction.
 // VEC=1 (G6_IDX_VEC=1): when page_size >= 32 and the tile is this CP rank's, the tile's
 // 32 keys are one contiguous 4 KB run of one page -> 16 B vector loads + fp8x2 -> half2 (index_scores_m's load). Same fp16
@@ -322,10 +331,27 @@ __global__ void top_from_sort(Input input,int start,const float* scores,const in
 }
 #include "select.cuh"
 template<class Input>
-__global__ void reuse(Input input,int start){
-    auto a=resolve(input);if(!a.active)return;int r=start+blockIdx.x;int src=a.reuse_row_map?a.reuse_row_map[r]:r;
+__device__ __forceinline__ void reuse_row(Input input,int start,int row){
+    auto a=resolve(input);if(!a.active)return;int r=start+row;int src=a.reuse_row_map?a.reuse_row_map[r]:r;
     if(src<0||src>=a.reuse_rows){error(a,8);for(int j=threadIdx.x;j<TOP;j+=256)a.indices[(int64_t)r*TOP+j]=-1;return;}
     for(int j=threadIdx.x;j<TOP;j+=256)a.indices[(int64_t)r*TOP+j]=a.reuse_indices[(int64_t)src*TOP+j];
+}
+template<class Input>
+__global__ void reuse(Input input,int start){reuse_row(input,start,blockIdx.x);}
+// G6_ATTN_FRONT=1 (attn_front_on; g6_attn_replay_run with one query tile): the step's front kernels in one launch of
+// 256-thread blocks: [0, n) append_kv rows; then a full-index layer's append_index rows, one per block, the row run twice
+// (threads 0-127 and 128-255, each on its own shared slot: the same bytes stored twice, the same error bits), and its
+// prep_index rows two heads per block (threads 0-127 head 2y, 128-255 head 2y + 1); or a shared layer's reuse rows. Each
+// body is the kernel's own. They touch disjoint buffers (the MLA cache row; the index cache row; w.iq / w.weights from
+// index_q, index_weight and positions; the indices from reuse_indices), so no block reads what another writes and the
+// bytes are those of the separate launches. grid n * (index ? 18 : 2), block 256.
+template<class Input>
+__global__ void __launch_bounds__(256) attn_front(Input input,int n,half* iq,float* iw){
+    const int b=blockIdx.x,t=threadIdx.x;
+    if(b<n){append_kv_row(input,b);return;}
+    if(!iq){reuse_row(input,0,b-n);return;}
+    if(b<2*n){append_index_row<2>(input,b-n,t&127,t>>7);return;}
+    const int k=b-2*n;prep_index_row<2>(input,0,iq,iw,k/16,2*(k%16)+(t>>7),t&127,t>>7);
 }
 template<class Input>
 __global__ void absorb(Input input,int start,float* q,float* rope){
@@ -446,6 +472,85 @@ __global__ void value_project_m(Input input,int start,int n,const float* context
             for(int m=0;m<16;m++)sum=fmaf(ctx[row][lane+32*m],u[m],sum);
             sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)(start+c+row)*a.heads+h)*256+d]=__float2half_rn(sum);}}
 }
+// G6_ATTN_ABS2=<R> (attn_abs2; 1 / 2 / 4 / 8): absorb_m with R outputs per warp and the q_b rows staged in one round trip.
+// Warp w of block x owns d = 8R x + w + 8i (i < R): its R lane-strided weight rows are loaded first (6R loads in flight);
+// a chunk of <= AVP_ROWS q_b rows is staged with 16 B loads, each half converted by __half2float (= hfloat; absorb_m's
+// loop was one 2 B load and store per round trip); per row each of the R sums is absorb_m's: the same fmaf chain over
+// k = lane + 32m, m = 0..5, from 0, the same warp_sum, lane 0 stores. Rope: the last block column (no weights), warp w
+// rows w, w + 8, ..: absorb_m's formula and stores (absorb_m ran every row in block 0). QT (G6_ATTN_QT, attn_qt): q and
+// rope stored lane-transposed for scores_sc<S,TR,true> (decode-small.cuh): q of (row, head) at float (c*32 + l)*4 + e
+// for d = l + 32(4c + e), rope at l*2 + k for j = l + 32k; the same values. Needs q_b 16 B aligned (dispatch).
+// grid (64/R + 1, heads), block 256; registers capped for one wave (R <= 4: 6 blocks / SM, 64/R + 1 blocks per head; R = 8: 3).
+template<int R,bool QT,class Input>
+__global__ void __launch_bounds__(256,R==8?3:6) absorb_m2(Input input,int start,int n,float* q,float* rope){
+    auto a=resolve(input);if(!a.active)return;
+    const int h=blockIdx.y,w=threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;
+    if(blockIdx.x==gridDim.x-1){
+        for(int row=w;row<n;row+=8){int r=start+row;float c,s;RCS(a.positions[r],lane,c,s);int j=lane;
+            float x=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+192+2*j),y=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+193+2*j);
+            float* o=rope+((int64_t)row*a.heads+h)*64;
+            if(QT){o[(2*j%32)*2+2*j/32]=x*c-y*s;o[((2*j+1)%32)*2+(2*j+1)/32]=y*c+x*s;}
+            else{o[2*j]=x*c-y*s;o[2*j+1]=y*c+x*s;}}
+        return;}
+    const int d0=blockIdx.x*8*R+w;
+    __shared__ __align__(16) float qb[AVP_ROWS][192];
+    float u[R][6];
+    #pragma unroll
+    for(int i=0;i<R;i++)
+        #pragma unroll
+        for(int m=0;m<6;m++)u[i][m]=bfloat(a.uk,((int64_t)h*512+d0+8*i)*192+lane+32*m);
+    for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
+        if(c)__syncthreads();
+        if(t<nc*24){const int row=t/24,k=(t%24)*8;   // 24 x 16 B per row, nc*24 <= 192 threads
+            const uint4 v=*(const uint4*)((const half*)a.q_b+((int64_t)(start+c+row)*a.heads+h)*256+k);const half* hv=(const half*)&v;
+            #pragma unroll
+            for(int e=0;e<8;e++)qb[row][k+e]=__half2float(hv[e]);}
+        __syncthreads();
+        for(int row=0;row<nc;row++){float s[R];
+            #pragma unroll
+            for(int i=0;i<R;i++){float sum=0;
+                #pragma unroll
+                for(int m=0;m<6;m++)sum=fmaf(qb[row][lane+32*m],u[i][m],sum);
+                s[i]=sum;}
+            #pragma unroll
+            for(int i=0;i<R;i++)s[i]=warp_sum(s[i]);
+            if(lane==0){float* o=q+((int64_t)(c+row)*a.heads+h)*512;
+                #pragma unroll
+                for(int i=0;i<R;i++){const int d=d0+8*i;if(QT)o[((d>>7)*32+(d&31))*4+((d>>5)&3)]=s[i];else o[d]=s[i];}}}}
+}
+// G6_ATTN_VP2=<R> (attn_vp2; 1 / 2 / 4): value_project_m with R outputs per warp (d = 8R x + w + 8i, 16R weight registers
+// loaded first) and the context rows staged with float4 loads, unrolled (one round trip; value_project_m's loop was one
+// 4 B load and store per round trip). Per row each sum is value_project_m's: the same 16-fmaf chain over k = lane + 32m,
+// the same warp_sum, lane 0 stores __float2half_rn. Needs the context 16 B aligned (workspace). grid (32/R, heads), block 256;
+// registers capped for the fewest waves (R = 1: 6 blocks / SM; R = 2: 5, as 6 spills; R = 4: 3, one wave).
+template<int R,class Input>
+__global__ void __launch_bounds__(256,R==4?3:R==2?5:6) value_project_m2(Input input,int start,int n,const float* context){
+    auto a=resolve(input);if(!a.active)return;
+    const int h=blockIdx.y,w=threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x,d0=blockIdx.x*8*R+w;
+    __shared__ __align__(16) float ctx[AVP_ROWS][512];
+    float u[R][16];
+    #pragma unroll
+    for(int i=0;i<R;i++)
+        #pragma unroll
+        for(int m=0;m<16;m++)u[i][m]=bfloat(a.uv,((int64_t)h*256+d0+8*i)*512+lane+32*m);
+    for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
+        if(c)__syncthreads();
+        #pragma unroll
+        for(int b=0;b<AVP_ROWS/2;b++){const int i=t+256*b,row=i/128,k=(i%128)*4;   // nc*128 <= 1024 float4
+            if(row<nc)*(float4*)&ctx[row][k]=*(const float4*)&context[((int64_t)(c+row)*a.heads+h)*512+k];}
+        __syncthreads();
+        for(int row=0;row<nc;row++){float s[R];
+            #pragma unroll
+            for(int i=0;i<R;i++){float sum=0;
+                #pragma unroll
+                for(int m=0;m<16;m++)sum=fmaf(ctx[row][lane+32*m],u[i][m],sum);
+                s[i]=sum;}
+            #pragma unroll
+            for(int i=0;i<R;i++)s[i]=warp_sum(s[i]);
+            if(lane==0){
+                #pragma unroll
+                for(int i=0;i<R;i++)((half*)a.output)[((int64_t)(start+c+row)*a.heads+h)*256+d0+8*i]=__float2half_rn(s[i]);}}}
+}
 // G6_AVP1=1 (default off; tp3-avp-onelaunch): one launch for any n, weights in registers, rows staged AVP_STAGE at a time.
 constexpr int AVP_STAGE=8;
 template<class Input>
@@ -536,6 +641,28 @@ static int& attn_ctx3(){static int v=[]{
 static int& attn_ctx3_hg(){static int v=[]{const char* e=getenv("G6_ATTN_CTX3_HG");const int x=e?atoi(e):0;return x==2||x==4||x==8?x:0;}();return v;}
 static int& attn_sel2(){static int v=[]{const char* e=getenv("G6_ATTN_SEL2");const int x=e?atoi(e):0;return x==8||x==16||x==32||x==64?x:0;}();return v;}
 static int& attn_idx_grp(){static int v=[]{const char* e=getenv("G6_IDX_GRP");const int x=e?atoi(e):0;return x>=1&&x<=64?x:0;}();return v;}
+// Round 3 (default 0 = off, bit-identical, host-side, read once before graph capture; tests may assign them):
+// G6_ATTN_ABS2=<R> / G6_ATTN_VP2=<R> (DEC_AVP launches: absorb_m2 / value_project_m2 above), G6_ATTN_QT=1 (run_body:
+// absorb_m2 stores q / rope lane-transposed and scores_sc reads them with 16 B loads; decode-small.cuh use_qt), G6_ATTN_FRONT=1
+// (g6_attn_replay_run: attn_front), G6_ATTN_CTX4=1..3 (decode-small.cuh context_pk4; FP8 KV only).
+static int& attn_abs2(){static int v=[]{const char* e=getenv("G6_ATTN_ABS2");const int x=e?atoi(e):0;return x==1||x==2||x==4||x==8?x:0;}();return v;}
+static int& attn_vp2(){static int v=[]{const char* e=getenv("G6_ATTN_VP2");const int x=e?atoi(e):0;return x==1||x==2||x==4?x:0;}();return v;}
+static int& attn_qt(){static int v=[]{
+#if G6_KV4
+    return 0;
+#else
+    const char* e=getenv("G6_ATTN_QT");return e&&atoi(e)==1?1:0;
+#endif
+    }();return v;}
+static int& attn_front_on(){static int v=[]{const char* e=getenv("G6_ATTN_FRONT");return e&&atoi(e)==1?1:0;}();return v;}
+static int& attn_ctx4(){static int v=[]{
+#if G6_KV4
+    return 0;
+#else
+    const char* e=getenv("G6_ATTN_CTX4");const int x=e?atoi(e):0;return x>=1&&x<=3?x:0;
+#endif
+    }();return v;}
+static bool al16(const void* p){return ((uintptr_t)p&15)==0;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
     half* iq;int *ii,*io,*offsets;uint64_t* selected;SelectionState* selection;int* histogram;void* temp;size_t temp_bytes,total;
@@ -658,18 +785,37 @@ template<class Input>   // DEC_AVP launches (tests call these regardless of the 
 static void launch_absorb_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){absorb_m<<<dim3(64,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);}
 template<class Input>
 static void launch_value_project_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){value_project_m<<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);}
+template<int R,class Input>
+static void launch_absorb_m2r(const G6Attn& a,Input input,Work& w,int start,int n,bool qt,cudaStream_t st){
+    const dim3 g(64/R+1,a.heads);
+    if(qt)absorb_m2<R,true><<<g,256,0,st>>>(input,start,n,w.q,w.rope);else absorb_m2<R,false><<<g,256,0,st>>>(input,start,n,w.q,w.rope);
+}
+template<class Input>   // G6_ATTN_ABS2 / G6_ATTN_QT (tests call these regardless of the build flag); q_b 16 B aligned
+static void launch_absorb_m2(const G6Attn& a,Input input,Work& w,int start,int n,int R,bool qt,cudaStream_t st){
+    switch(R){case 2:launch_absorb_m2r<2>(a,input,w,start,n,qt,st);break;case 4:launch_absorb_m2r<4>(a,input,w,start,n,qt,st);break;
+        case 8:launch_absorb_m2r<8>(a,input,w,start,n,qt,st);break;default:launch_absorb_m2r<1>(a,input,w,start,n,qt,st);break;}
+}
+template<class Input>   // G6_ATTN_VP2; w.context 16 B aligned
+static void launch_value_project_m2(const G6Attn& a,Input input,Work& w,int start,int n,int R,cudaStream_t st){
+    switch(R){case 2:value_project_m2<2><<<dim3(16,a.heads),256,0,st>>>(input,start,n,w.context);break;
+        case 4:value_project_m2<4><<<dim3(8,a.heads),256,0,st>>>(input,start,n,w.context);break;
+        default:value_project_m2<1><<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);break;}
+}
 #if defined(DEC_AVP) && DEC_AVP
 // absorb / value_project of n rows from row `start`: one _m launch for n <= AVP_ROWS; under DEC_S2 (up to G6_MX rows per step) chunks of
 // AVP_ROWS rows, each chunk on its own slice of the row-relative buffers (q, rope, context), so every row's bytes are the _m kernels'.
 // Otherwise (n > AVP_ROWS, no DEC_S2) false: the caller runs the per-row kernel.
+// qt (run_body, use_qt): absorb_m2 with the lane-transposed q / rope that its scores launch reads
 template<class Input>
-static bool launch_absorb_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-    launch_absorb_m(a,input,w,start,n,st);
+static bool launch_absorb_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
+    if(qt||(attn_abs2()&&al16(a.q_b)))launch_absorb_m2(a,input,w,start,n,attn_abs2()?attn_abs2():1,qt,st);
+    else launch_absorb_m(a,input,w,start,n,st);
     return true;
 }
 template<class Input>
 static bool launch_value_project_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-    launch_value_project_m(a,input,w,start,n,st);
+    if(attn_vp2()&&al16(w.context))launch_value_project_m2(a,input,w,start,n,attn_vp2(),st);
+    else launch_value_project_m(a,input,w,start,n,st);
     return true;
 }
 #endif
@@ -677,24 +823,37 @@ template<class Input>
 static void launch_absorb_m1(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){absorb_m1<<<dim3(64,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);}
 template<class Input>
 static void launch_value_project_m1(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){value_project_m1<<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);}
+// G6_ATTN_QT (attn_qt): run_body's absorb stores q / rope lane-transposed exactly when its scores launch reads them so:
+// launch_mla_scores' scores_sc branch with S = 2 / 4 (no FLIP, no P11), absorb_m2 (DEC_AVP without G6_AVP1), q_b, the
+// scratch q / rope and the KV rows 16 B aligned. The CP paths never pass qt.
+static bool use_qt(const G6Attn& a,const Work& w,int n){
+#if defined(DEC_AVP) && DEC_AVP
+    return attn_qt()&&!avp1_on()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&(attn_sc2()==2||attn_sc2()==4)&&a.heads%16==0&&
+        al16(a.q_b)&&al16(w.q)&&al16(w.rope)&&al16(a.mla_cache);
+#else
+    (void)a;(void)w;(void)n;return false;
+#endif
+}
+// front: attn_front already ran the first query tile's reuse / prep_index (g6_attn_replay_run, rows <= query_tile)
 template<class Input>
-static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream){
+static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream,bool front=false){
     cudaError_t e;
-    for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);
-        if(a.reuse_indices){AMARK(1);ga::reuse<<<n,256,0,stream>>>(input,start);}
-        else{prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
+    for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);const bool fr=front&&start==0;
+        if(a.reuse_indices){AMARK(1);if(!fr)ga::reuse<<<n,256,0,stream>>>(input,start);}
+        else{if(!fr)prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
             if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,start,n,attn_idx_grp(),stream);
             else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
             AMARK(1);
             e=SELECT_INDEX(a,input,w,start,n,stream,attn_sel2());if(e!=cudaSuccess)return e;}
         AMARK(2);
+        const bool qt=use_qt(a,w,n);
 #if defined(DEC_AVP) && DEC_AVP
-        if(avp1_on())launch_absorb_m1(a,input,w,start,n,stream);else if(launch_absorb_rows(a,input,w,start,n,stream)){}else
+        if(avp1_on())launch_absorb_m1(a,input,w,start,n,stream);else if(launch_absorb_rows(a,input,w,start,n,stream,qt)){}else
 #endif
         ga::absorb<<<dim3(64,a.heads,n),256,0,stream>>>(input,start,w.q,w.rope);
         KV4_ROTATE(w.q,n*a.heads,stream);
         AMARK(3);
-        ga::launch_mla_scores(a,input,w,start,n,stream);
+        ga::launch_mla_scores(a,input,w,start,n,stream,qt);
         AMARK(4);
         ga::normalize<<<n*a.heads,256,0,stream>>>(input,w.prob);
         AMARK(5);
@@ -861,10 +1020,12 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
     cudaStream_t stream=(cudaStream_t)s;
     ga::validate_replay<<<1,256,0,stream>>>(a,r->cell);
     ga::ReplayInput input{a,r->cell};
-    ga::append_kv<<<a.rows,256,0,stream>>>(input);
-    if(!a.reuse_indices)ga::append_index<<<a.rows,128,0,stream>>>(input);
+    const bool front=ga::attn_front_on()&&a.rows<=a.query_tile;   // G6_ATTN_FRONT: one query tile
+    if(front)ga::attn_front<<<a.rows*(a.reuse_indices?2:18),256,0,stream>>>(input,a.rows,a.reuse_indices?nullptr:w.iq,w.weights);
+    else{ga::append_kv<<<a.rows,256,0,stream>>>(input);
+        if(!a.reuse_indices)ga::append_index<<<a.rows,128,0,stream>>>(input);}
     AMARK(0);
-    return (int)ga::run_body(a,input,w,stream);
+    return (int)ga::run_body(a,input,w,stream,front);
 }
 
 #include "prefill.cuh"
