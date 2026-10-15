@@ -1,5 +1,98 @@
 # Changelog
 
+## 2026-10-15: one engine binary for every TP width
+
+- `scripts/build.sh` builds one `g6m4` and one `m4sim` that run TP = 1, 2, 3, 4, 6 and 8 (and with `KV_FORMAT=int4`
+  one `g6m4-int4`). `g6m4` takes the width from `--ips`; `m4sim` from `--tp N`, else from the rank packs in
+  `--packs DIR`. Each width is compiled as its one-width build was (`DEC_S2` at every width, `PF_F12` at 4) into its
+  own instance in the binary (`engine/runtime/build_m4.sh`), so its kernels are byte for byte the ones that build had.
+- `G6_WIDTHS="3 4"` builds only those widths, and `G6_NR=4` only TP=4. `./gr8 glm53 build` no longer needs the TP. The
+  image and the tester zip ship `bin/` alone (the image keeps `bin3/` and `bin6/` as links to it, which
+  `docker/entrypoint.sh` still picks from), and the handshake's engine hash is the same at every width.
+- `dtr_test` is `dtr_test_tp<N>`, one per width.
+
+## 2026-10-15: the tool-call parser stops reading prose as calls, and the Python front end is gone
+
+- The GLM parser searched the whole reply for the tool-call tags, so a reply that *wrote about* a call was taken for one:
+  an example in the answer became a real `tool_calls` entry (and in reasoning it ended the reasoning, moving the text
+  around it), an opener with no closer swallowed everything after it, a `</tool_call>` inside an `<arg_value>` cut the
+  call short and leaked the rest of the format into the content, and a call naming a tool the request did not offer
+  vanished from the text instead of staying prose. Those are one bug: the tags meant something wherever they appeared.
+- A run of the reply from a `<tool_call>` on is now held and decided as a whole. It is a call only when the reply ends
+  with it — a call the model makes is its last segment, and it stops right after `</tool_call>` — and text again when
+  anything else follows: prose, a code fence's closing backticks, a `</think>`. As text its raw bytes go back where they
+  came from, so nothing is lost and reasoning that quoted an example stays reasoning. An opener right after a backtick is
+  inline code; a closer inside an `<arg_value>` is part of the value (the format has no escape); an unterminated call, or
+  one naming a tool the request did not offer, is prose.
+- The visible cost is the streaming cadence for calls: their deltas go out when the run is decided rather than as it is
+  written, because a call that turns out to be prose cannot be taken back from a client. The final text and arguments are
+  identical, and the README says so where it described the old per-key streaming.
+- The Python front end (`frontend/g6front/`) is removed. `./gr8 glm53 up` runs `g6front-rs`, and the Python one was a
+  second implementation of this same parser that a change like this would have had to keep in step byte for byte; its
+  only consumers were `tests/diff_fronts.py`, `tests/bench_fronts.py` and `tests/test_parser.py`, removed with it.
+  `wire.py` and `tokenizer.py` move up to `frontend/` for the shim, the mock engine and the shim tests, which stay, and
+  `requirements.txt` is the tokenizer alone. The parser's tests are the Rust front end's now (11 new, 48 in all), and
+  `frontend/tests/test_api.py` covers the HTTP path against the mock engine.
+
+## 2026-10-14: a notice targets the work in flight, not a constant eight boundaries
+
+- The first hardware trace of the event log says what #61's remaining delay is: the cancel anchored at boundary 8 landed
+  at 16, while the 31,984-token prompt's prefill ran boundaries 9-13. The lookahead bound — `LOOKAHEAD = 8`
+  (`s2/service.h`) — and at the cluster's line it could hardly be otherwise: a quantum at `--prefill 4096 --pf-lanes 2`
+  is 8,192 rows and R is 65,536, exactly 8 quanta, so no below-R prompt spans more than 8 prefill boundaries and a
+  notice anchored when one starts can never land inside it. The abort took 20.096 s, and the follow-up — whose admit
+  cannot anchor until the cancel commits, because events serialize — saw 20.527 s TTFT. The reading rule this record
+  carried was backwards: `N >= L` is what a lookahead larger than the remaining prefill produces (that run had `L` = 13,
+  `N` = 16), not an acquittal of the lookahead.
+- The target is now sized by the work in flight: the first boundary whose work after the one in flight covers 2,048
+  prefill rows, within `boundary + 2` and `boundary + 8` (`Scheduler::horizon`, `s2/scheduler.h`; `s2/service.h` reads
+  and clamps it). During a prefill that is the floor — the trace's cancel targets boundary 10, landing one to two
+  quanta after the abort instead of past the whole prefill, and the follow-up's admit then anchors on an engine whose
+  long prefill is gone, commits at once, and its TTFT is its own short prefill. In pure decode the target is the cap,
+  exactly the old constant's behaviour, because a decode round adds no coverage (stalls can shrink one to almost
+  nothing). The boundary in flight is not counted, since its remaining time is unknowable; tails count one row; the
+  alternation with a decoding session and a partial last quantum are accounted; and a remainder under 2,048 rows opens
+  the target to the cap, because that work is fast.
+- The margin is sound for the same reason the constant's was: each step is one TP collective, so no rank departs a
+  boundary before every rank completed it, and 2,048 prefill rows is about 1.5 s at the ~1,300 rows/s the gate measures
+  for a cold 8K prefill — an order of magnitude past the milliseconds a notice needs to reach every rank. `horizon()`
+  is a pure function of the scheduler state: it projects the same state machine `next()`/`completed()` drive, on a copy,
+  so every rank names the same boundary and the notice's digest agreement holds; the compute thread publishes it beside
+  the progress boundary, horizon first, so a torn read of the pair can only widen the target.
+- `next()` is unchanged: its selection moved verbatim to `Scheduler::plan`, which `horizon()` also drives, and
+  `scheduler_fair_test` still passes bit-for-bit, so m4sim's batch and every quantum the fair prefill serves are
+  untouched. New `scheduler_horizon_test` (host, `scripts/host_tests.sh`) pins the rule: pure decode keeps the cap,
+  #61's 31,990-token prompt targets the floor and opens to the cap when only its tail remains, the alternation and the
+  partial quantum are counted, a 2,048-row quantum covers exactly, and a randomized run checks the clamp, re-derives the
+  target through `plan()` at every boundary, and confirms two schedulers driven by the same events name the same one.
+- `docs/EVENT-LATENCY.md` is rewritten to the rule and carries two corrections: the reading rule above, and the
+  discrimination run — do not grow the prompt to 64K (that crosses R, where the run is exclusive and the follow-up is
+  refused, so abort and TTFT stop measuring the same thing); shrink the quantum instead (`--prefill 2048 --pf-lanes 1`,
+  where every notice lands mid-prefill).
+
+## 2026-10-15: a forced tool_choice makes the reply a call, not text
+
+- `tool_choice: "required"` and a function-naming object were a 400 ("named / required tool_choice is not supported").
+  They now force the reply to be a tool call with the engine's insert rule (PROTOCOL.md `insert`): the engine puts the
+  thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so
+  the model cannot answer in text. The close comes first because the template leaves `<think>` open at the end of a
+  chat prompt, and a call written inside the reasoning span is reasoning text, not a call. That is the mechanism the thinking budget already uses to close a `<think>` block, per request and from the
+  committed tokens alone, so no engine or protocol change was needed — the front end only had to stop refusing them.
+- It is a strong nudge, not a grammar. gr8's engine samples, so the front end cannot mask logits: a call to a name the
+  request did not offer still comes back as text (the parser drops an unknown name), and the arguments are the model's
+  own, coerced by the tool's schema as before. A forced reply carries no reasoning — its first token is the opener, not
+  `<think>` — and the opener counts toward `completion_tokens` and toward `max_tokens` like any inserted token.
+- Refused, with the field named: `required` with no tools, a name that is not in `tools`, an unknown string (it used to
+  reach the parser and be treated as `auto`), `tool_choice` beyond a string or a function object, `logprobs` (an
+  inserted token has no logprob), an explicit `thinking_budget` (one insert rule to a request; a server default budget
+  steps aside instead), and an engine whose hello does not say `insert` — the capability `thinking_budget` needs too.
+- New `tool_choice.rs` unit tests for the parsing and the forced text (the pure parts; the ids need the tokenizer);
+  `tests/test_api.py` cases against the mock, which now continues inside a call an insert opened (the name if the opener
+  does not hold one, then the arguments, then the close, with no reasoning); and a smoke case where the message asks for
+  prose in French and still gets `get_weather`. The Python reference front end stays a 400 — it speaks hello version 1
+  and has no `insert` field — so the two `err_tool_choice` cases are gone from `diff_fronts.py` rather than diverging
+  there, and `frontend/README.md` says which front end has it.
+
 ## 2026-10-14: the event boundaries are logged, so a cancel's delay can be attributed
 
 - #61's ~24 s has two candidate mechanisms that need different fixes: the scheduler served one prefill at a time and

@@ -868,3 +868,56 @@ fn a_chat_counts_once_when_the_pool_lets_its_runs_go_unstored() {
     session_span(&mut r, &q, 10, Some(300));
     assert_eq!(r.pool.stash().unwrap().entries(0).len(), 1);
 }
+
+#[test]
+fn non_stock_resident_rows_cannot_supply_a_stored_stock_base() {
+    use g6kvman::pool::NAMESPACE_BYTES;
+    let mut r = Rank::new(24, 24, 24 * 64, &[(64, Keep::Evicted)], 3);
+    let system = toks(1, 300);
+    let mut a = system.clone(); a.extend(toks(2, 200));
+    let (_, _, a_hist) = session(&mut r, &a, 20);
+    let mut b = system.clone(); b.extend(toks(3, 200));
+    session(&mut r, &b, 20);
+    flush(&mut r);
+    let stored = r.pool.stash().unwrap().entries(0).iter().find(|e| e.st.history == a_hist).unwrap().clone();
+    assert!(stored.base.is_some());
+    // Same tokens, deliberately different KV bytes in the non-stock resident run.
+    let ns = [1; NAMESPACE_BYTES];
+    r.pool.count_namespaced(&b, None, ns);
+    let run = r.pool.reserve(550, 550).unwrap(); r.run_io();
+    let list = r.pool.list(&run).unwrap().to_vec();
+    r.write(&list, 0, &vec![-999; b.len()]);
+    r.pool.retain_namespaced(&run, finished(&b), ns).unwrap(); r.run_io();
+    let mut next = a_hist.clone(); next.extend(toks(4, 20));
+    r.pool.count(&next, None);
+    let rows = next.len() as u64 + 5;
+    let h = r.pool.match_prefix(&next, rows, rows, next.len() as i32 - 1);
+    assert!(h.stored && h.age == stored.id);
+    let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), rows, rows).unwrap();
+    let io = r.run_io();
+    assert_eq!(io.iter().filter(|x| matches!(x, Io::Restore { .. })).count(), (h.skip as usize).div_ceil(ROWS));
+    let list = r.pool.list(&run).unwrap();
+    for row in 0..h.skip as usize {
+        assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], a_hist[row]);
+    }
+}
+
+#[test]
+fn non_stock_resident_history_cannot_create_a_stock_prefix_base() {
+    let mut r = Rank::new(24, 24, 24 * 64, &[(64, Keep::Evicted)], 3);
+    let system = toks(1, 300);
+    let mut a = system.clone(); a.extend(toks(2, 200));
+    let (_, _, a_hist) = session(&mut r, &a, 20);
+    let mut b = system; b.extend(toks(3, 200));
+    let ns = [1; g6kvman::pool::NAMESPACE_BYTES];
+    r.pool.count_namespaced(&b, None, ns);
+    let run = r.pool.reserve(550, 550).unwrap(); r.run_io();
+    r.pool.retain_namespaced(&run, finished(&b), ns).unwrap();
+    // Evict the older stock run while its only matching resident prefix is non-stock.
+    let fresh = r.pool.reserve(550, 550).unwrap(); r.run_io();
+    let entries = r.pool.stash().unwrap().entries(0);
+    let stored = entries.iter().find(|e| e.st.history == a_hist).unwrap();
+    assert!(stored.base.is_none(), "a non-stock history cannot establish a stock base");
+    assert!(entries.iter().all(|e| e.kind == Kind::Evicted));
+    r.pool.release(&fresh).unwrap();
+}

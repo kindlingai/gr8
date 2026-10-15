@@ -91,6 +91,52 @@ class Chat(unittest.TestCase):
         self.assertEqual(args, call['function']['arguments'])
         self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
 
+    def test_prose_about_a_tool_call_is_not_a_call(self):
+        # the reply writes about the call format: none of it may become a tool_calls entry, and none may be lost
+        body = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'describe the call format'}],
+                'tools': TOOLS, 'max_tokens': 200}
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertNotIn('tool_calls', msg)
+        self.assertIn('<tool_call>get_weather', msg['content'])
+        self.assertIn('in your code.', msg['content'])
+        self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+
+    def test_tool_choice_required_forces_a_call(self):
+        # `required` and a named function force the opener with the engine's insert rule, so the reply is a call even
+        # though the messages ask for an answer and not the weather
+        for choice, name in (('required', 'get_weather'),
+                             ({'type': 'function', 'function': {'name': 'get_weather'}}, 'get_weather')):
+            body = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'Say hello in French.'}],
+                    'tools': TOOLS, 'tool_choice': choice, 'max_tokens': 200}
+            s, r = post('/v1/chat/completions', body)
+            self.assertEqual(s, 200, r)
+            msg = r['choices'][0]['message']
+            self.assertEqual(msg['tool_calls'][0]['function']['name'], name)
+            self.assertEqual(json.loads(msg['tool_calls'][0]['function']['arguments']), {'city': 'Paris', 'days': 3})
+            self.assertEqual(r['choices'][0]['finish_reason'], 'tool_calls')
+            # the reply's first token is the opener, so there is no think block and no reasoning
+            self.assertEqual(''.join(msg.get('reasoning') or ''), '')
+        # the named choice is the first token (opener) plus the name, and the opener is not in content
+        s, r = post('/v1/chat/completions', {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'hi'}],
+                                            'tools': TOOLS,
+                                            'tool_choice': {'type': 'function', 'function': {'name': 'get_weather'}},
+                                            'max_tokens': 200})
+        self.assertNotIn('<tool_call>', r['choices'][0]['message'].get('content') or '')
+
+    def test_tool_choice_errors(self):
+        forced = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'hi'}], 'tools': TOOLS,
+                  'tool_choice': 'required'}
+        self.assertEqual(post('/v1/chat/completions', dict(forced, logprobs=True))[0], 400)
+        self.assertEqual(post('/v1/chat/completions', dict(forced, thinking_budget=8))[0], 400)
+        self.assertEqual(post('/v1/chat/completions', {'model': 'glm-5.3', 'messages': [{'role': 'user',
+                                                                                         'content': 'hi'}],
+                                                       'tool_choice': 'required'})[0], 400)
+        self.assertEqual(post('/v1/chat/completions', dict(forced, tool_choice={
+            'type': 'function', 'function': {'name': 'get_rain'}}))[0], 400)
+        self.assertEqual(post('/v1/chat/completions', dict(forced, tool_choice='require'))[0], 400)
+
     def test_tool_result_turn_renders(self):
         body = {'model': 'glm-5.3', 'tools': TOOLS, 'max_tokens': 100, 'messages': [
             {'role': 'user', 'content': 'weather?'},

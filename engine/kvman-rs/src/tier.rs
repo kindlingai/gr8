@@ -311,11 +311,14 @@ impl<S: BlockStore> Tier<S> {
     }
 
     /// Writes a retained run's pages to the store: `page(p, buf)` fills buf with page p's block (from device memory in
-    /// an engine). Returns the run's handle, or None when the store has too few free slots (nothing written).
+    /// an engine). Returns the run's handle, or None for a non-stock namespace or too few slots (nothing written).
     pub fn spill<F>(&mut self, k: &Kept, page: F) -> io::Result<Option<u64>>
     where
         F: Fn(u32, &mut [u8]) + Sync,
     {
+        if k.namespace != crate::pool::STOCK_NAMESPACE {
+            return Ok(None);
+        }
         let Some(slots) = self.alloc.alloc(k.list.len()) else { return Ok(None) };
         let sb = self.store.block_bytes();
         let bufs: Vec<std::sync::Mutex<AlignedBuf>> =
@@ -398,20 +401,43 @@ mod tests {
             age: 1,
             exclusive: false,
             hits: 0,
+            namespace: crate::pool::STOCK_NAMESPACE,
         };
+        let nonstock = Kept {
+            list: vec![0],
+            st: Finished::default(),
+            age: 0,
+            exclusive: false,
+            hits: 0,
+            namespace: [1; crate::pool::NAMESPACE_BYTES],
+        };
+        let free = t.free_slots();
+        assert!(t.spill(&nonstock, |_, _| panic!("non-stock spill must never read a page")).unwrap().is_none());
+        assert_eq!(t.free_slots(), free);
         let b = Kept {
             list: vec![1, 3],
             st: Finished { valid: 7, ..Default::default() },
             age: 2,
             exclusive: false,
             hits: 0,
+            namespace: crate::pool::STOCK_NAMESPACE,
         };
         let ha = t.spill(&a, block).unwrap().unwrap();
         let hb = t.spill(&b, block).unwrap().unwrap();
         assert_eq!(t.spilled()[&ha].slots, vec![0, 1, 2, 3]);
         assert_eq!(t.spilled()[&hb].slots, vec![4, 5]);
         assert!(t
-            .spill(&Kept { list: vec![0; 11], st: Finished::default(), age: 3, exclusive: false, hits: 0 }, block)
+            .spill(
+                &Kept {
+                    list: vec![0; 11],
+                    st: Finished::default(),
+                    age: 3,
+                    exclusive: false,
+                    hits: 0,
+                    namespace: crate::pool::STOCK_NAMESPACE,
+                },
+                block
+            )
             .unwrap()
             .is_none());
         // restore a's first three pages into other pages: each gets a's page block in list order
@@ -428,7 +454,17 @@ mod tests {
         // a's slots are free again, and the next spill takes the lowest
         assert_eq!(t.free_slots(), 14);
         let hc = t
-            .spill(&Kept { list: vec![7], st: Finished::default(), age: 4, exclusive: false, hits: 0 }, block)
+            .spill(
+                &Kept {
+                    list: vec![7],
+                    st: Finished::default(),
+                    age: 4,
+                    exclusive: false,
+                    hits: 0,
+                    namespace: crate::pool::STOCK_NAMESPACE,
+                },
+                block,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(t.spilled()[&hc].slots, vec![0]);

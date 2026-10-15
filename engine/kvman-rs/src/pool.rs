@@ -117,7 +117,13 @@ pub struct Kept {
     /// times the conversation continued a run to get here (a tier's min_hits): a hit on its run, or a prompt that holds
     /// an earlier run's prompt
     pub hits: u32,
+    pub namespace: Namespace,
 }
+
+/// Opaque cache identity. Only the all-zero namespace participates in stored tiers.
+pub const NAMESPACE_BYTES: usize = 70;
+pub type Namespace = [u8; NAMESPACE_BYTES];
+pub const STOCK_NAMESPACE: Namespace = [0; NAMESPACE_BYTES];
 
 const FNV_OFFSET: u64 = 14695981039346656037;
 
@@ -293,11 +299,25 @@ impl Pool {
             return 0;
         }
         let continuing = self.held.values().any(|h| continues(prompt, &h.tokens, h.tokens.len().saturating_sub(1)))
-            || self.kept.iter().any(|k| continues(prompt, &k.st.history, k.st.pf_end.max(0) as usize))
+            || self.kept.iter().any(|k| {
+                k.namespace == STOCK_NAMESPACE && continues(prompt, &k.st.history, k.st.pf_end.max(0) as usize)
+            })
             || s.continues_stored(prompt);
         self.next_continues = continuing;
         let span = self.next_span;
         self.stash.as_mut().expect("checked").count(prompt, continuing, span)
+    }
+
+    /// Prepare an admission without counting non-stock prompts toward stock promotion. Call before its grant,
+    /// including after an abandoned stock admission, so no pending stock metadata is inherited.
+    pub fn count_namespaced(&mut self, prompt: &[i32], span: Option<u32>, namespace: Namespace) -> u32 {
+        if namespace == STOCK_NAMESPACE {
+            return self.count(prompt, span);
+        }
+        self.next_tokens = None;
+        self.next_span = None;
+        self.next_continues = false;
+        0
     }
 
     /// The queued copies (stash.rs Io), in the order to run them. The engine calls io_done() after it ran them.
@@ -335,7 +355,7 @@ impl Pool {
             .held
             .values()
             .map(|h| &h.tokens[..])
-            .chain(self.kept.iter().map(|k| &k.st.history[..]))
+            .chain(self.kept.iter().filter(|k| k.namespace == STOCK_NAMESPACE).map(|k| &k.st.history[..]))
             .chain(self.next_tokens.as_deref())
             .filter(|t| !t.is_empty())
             .collect();
@@ -503,23 +523,40 @@ impl Pool {
 
     /// A retiring session's run: retained with its finished reuse state, or released when no row is valid.
     pub fn retain(&mut self, r: &Run, st: Finished) -> Result<(), Error> {
+        self.retain_namespaced(r, st, STOCK_NAMESPACE)
+    }
+
+    pub fn retain_namespaced(&mut self, r: &Run, st: Finished, namespace: Namespace) -> Result<(), Error> {
         let (exclusive, hits, span) = self.held(r).map(|h| (h.exclusive, h.hits, h.span))?;
         let list = self.remove(r)?;
         if !self.keep || st.valid <= 0 {
             return Ok(());
         }
         let rows_max = if exclusive { self.below_rows as u64 } else { u64::MAX };
-        if let Some(s) = &mut self.stash {
-            s.promote(&list, &st, rows_max, span);
+        if namespace == STOCK_NAMESPACE {
+            if let Some(s) = &mut self.stash {
+                s.promote(&list, &st, rows_max, span);
+            }
         }
         self.age += 1;
-        self.kept.push(Kept { list, st, age: self.age, exclusive, hits });
+        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace });
         Ok(())
     }
 
     /// The retained run with the longest reusable prefix for `prompt` (limit: rows the prefill may skip) that a
     /// reservation of `rows` now and `worst` at most can grow from. Ties go to the most recent.
     pub fn match_prefix(&self, prompt: &[i32], rows: u64, worst: u64, limit: i32) -> Hit {
+        self.match_prefix_namespaced(prompt, rows, worst, limit, STOCK_NAMESPACE)
+    }
+
+    pub fn match_prefix_namespaced(
+        &self,
+        prompt: &[i32],
+        rows: u64,
+        worst: u64,
+        limit: i32,
+        namespace: Namespace,
+    ) -> Hit {
         let mut best = Hit::default();
         if !self.keep || self.exclusive {
             return best;
@@ -527,6 +564,12 @@ impl Pool {
         let w = pages_for(worst);
         let n = if self.exclusive(worst) { w } else { pages_for(rows) };
         for k in &self.kept {
+            if k.namespace != namespace {
+                if best.skip == 0 {
+                    best.why = Why::Namespace;
+                }
+                continue;
+            }
             let t = reuse::begin(&self.rules, &k.st, prompt, limit, true);
             if t.skip <= 0 {
                 if best.skip == 0 && t.lcp >= best.lcp {
@@ -562,6 +605,9 @@ impl Pool {
             }
         }
         // the tiers in order. A stored hit must reuse more rows than the pool's best, since a pool hit is free of copies
+        if namespace != STOCK_NAMESPACE {
+            return best;
+        }
         let Some(stash) = &self.stash else { return best };
         for t in 0..stash.tiers() {
             for e in stash.entries(t) {
@@ -676,7 +722,8 @@ impl Pool {
         let hist = self.stash.as_ref()?.base_history(id)?;
         let rows = (b as u64 * PAGE) as i32;
         self.kept.iter().rposition(|k| {
-            k.st.valid >= rows
+            k.namespace == STOCK_NAMESPACE
+                && k.st.valid >= rows
                 && k.st.history.len() >= hist.len()
                 && k.st.history[..hist.len()] == *hist
                 && k.list.len() >= b
@@ -772,6 +819,17 @@ impl Pool {
         }
         for k in &self.kept {
             h = mix(mix(mix(h, k.age), hash(&k.list, false)), k.st.valid as i64 as u64);
+            // Keep the pre-namespace digest bit-for-bit stable for stock runs. A non-stock identity contributes every
+            // namespace byte so ranks still fail closed if their retained cache identities diverge.
+            if k.namespace != STOCK_NAMESPACE {
+                for chunk in k.namespace.chunks(8) {
+                    let mut v = 0u64;
+                    for (i, &b) in chunk.iter().enumerate() {
+                        v |= (b as u64) << (8 * i);
+                    }
+                    h = mix(h, v);
+                }
+            }
         }
         // without a store the digest is what it was before stores existed
         match &self.stash {

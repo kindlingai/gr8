@@ -133,7 +133,9 @@ file is read for these keys only.
 
 | variable | script | meaning |
 |---|---|---|
-| `G6_NR` | `build.sh`, `c1_tests.sh` | rank count of the build: 4, 3, or unset for 6 (`./gr8 glm53 build` sets it from `TP`) |
+| `G6_WIDTHS` | `build.sh` | the TP widths g6m4 and m4sim run, default `1 2 3 4 6 8`; fewer is a shorter build |
+| `G6_NR` | `build.sh`, `c1_tests.sh` | `build.sh`: one width, as `G6_WIDTHS=N`. `c1_tests.sh`: rank count of the tests, 4, 3, or unset for 6 |
+| `JOBS` | `build.sh` | compiles at once, default the CPU count |
 | `BUNDLE_LIBS` | `build.sh` | 1 = copy cuBLAS into `bin/lib` for boxes without the CUDA toolkit |
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |

@@ -264,7 +264,7 @@ place the model is built in, and what would carry over to another model.
 - [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw), whose
   per-expert bit distribution `home` keeps expert for expert.
 - [RigMark](https://github.com/alexellis/rigmark) by alexellis, for the decode and concurrency numbers above.
-- The tool-call cases in `frontend/tests/test_parser.py` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
+- The tool-call cases in `frontend/g6front-rs/src/parser.rs` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
 
 ## License
 

@@ -1,7 +1,7 @@
 # The gr8 container
 
-One image for GB10 boxes (linux/arm64, CUDA 13, sm_121a): the TP=4 engine (`bin/`), the TP=3 engine (`bin3/`), the TP=6
-engine (`bin6/`), the Rust front end, the loader, the shims and the launcher, on the CUDA 13 runtime image (which brings
+One image for GB10 boxes (linux/arm64, CUDA 13, sm_121a): the engine for every TP width (`bin/`; `bin3/` and `bin6/`
+link to it), the Rust front end, the loader, the shims and the launcher, on the CUDA 13 runtime image (which brings
 cuBLAS) with libibverbs and the mlx5 provider. Each box runs one container, which holds one rank. The head (rank 0)
 also runs the shim and the OpenAI front end. The container's entrypoint is `./gr8 glm53`, so it takes the launcher's
 commands and options (KNOBS.md) and runs the same checks and handshake as a bare-metal box.
@@ -87,7 +87,7 @@ CI publishes `ghcr.io/kindlingai/gr8`. To build it yourself (about 10 minutes on
 the CUDA base images), from the repo root:
 
     docker build -t gr8 .                      # then GR8_IMAGE=gr8 in docker/.env
-    docker build --target dist -o out .        # only the binaries, into out/bin, out/bin3 and out/bin6
+    docker build --target dist -o out .        # only the binaries, into out/bin
 
 To run a single command in the image without compose, give `docker run` the launcher command, for example
 `docker run --rm gr8 show-config --peers ...`, or `--entrypoint bash` for a shell.

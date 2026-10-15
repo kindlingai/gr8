@@ -11,7 +11,7 @@ the short version.
 | flag | served value | meaning |
 |---|---|---|
 | `--rank R` | 0..TP-1 | this process's rank; rank r loads `rank<r>.pack` |
-| `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order (exactly `G6_NR` of them) |
+| `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order (their count is the TP width) |
 | `--proxy-cpu N` | 19 | CPU core for the decode fabric's proxy thread. Every other fabric's proxy has its own core below it: N-1 and N-2 the two prefill lanes, N-3 the CP fabric, N-4 CP staging, N-5 the QP roll, N-6 the MTP draft, N-7 DFlash |
 | `--manifest` / `--pack` | `packs/rank<r>.*` | this rank's pack; `--pack -` reads it from stdin |
 | `--v2 DIR` / `--v2-slices DIR` / `--v2-widths FILE` | the release (`V2`, `V2_SLICES`, `--variant`) | the routed and shared experts from the exlr8 width files at the index slices' offsets, at the manifest's widths, in place of the pack's |
@@ -66,7 +66,7 @@ the short version.
 | `G6_PF_HASH_GPU` | 1 | the per-sub-batch residual hash (rank agreement check) is computed on the GPU |
 | `G6_PF_RSDIRECT` | 1 | o_proj, dense down and the MoE final sum write straight into the reduce-scatter send slot |
 | `G6_PF_AOP` | 1 (when built with `-DPF_AOP`) | fc1 A-operand share: `k_pf_aop` quantizes the fc1 A operand once per (segment, matrix, distinct prologue input) into global records that the fc1 block-CTAs stage by cp.async. Needs build flag `-DPF_AOP`; 0 disables; `G6_PF_AOP_MMIN` (default 3072) sets the M floor. Byte-exact |
-| `G6_PF_F12` | 1 (when built with `-DPF_F12`) | fc1 runs as the fat-CTA kernel `k_pf_fc1f` (NE=2 expert blocks share one quantized A record). Needs build flag `-DPF_F12`, which `G6_NR=4 scripts/build.sh` sets; 0 = the stock fc1. Byte-exact |
+| `G6_PF_F12` | 1 (when built with `-DPF_F12`) | fc1 runs as the fat-CTA kernel `k_pf_fc1f` (NE=2 expert blocks share one quantized A record). Needs build flag `-DPF_F12`, which `scripts/build.sh` sets at TP=4; 0 = the stock fc1. Byte-exact |
 | `G6_PF_GEMMF32` | 0 | the row-owner QO o_proj (`G6_PF_OWN=3`; its FP32 output kept it on the guarded kernel) runs as `k_gemm_mx8f` with an FP32 epilogue instead of the guarded `k_gemm_mx8b`. Needs build flag `-DPF_GEMMF` (in the stock build); read once at the first launch, so set it for the boot. Byte-exact |
 | `G6_DEC_SPLIT` | 3 | the decode step is captured as two graphs split at layer 3, so the second submission overlaps the first one's GPU time |
 | `G6_DEC_SHARED_SCRATCH` | 1 | one decode attention scratch for all layers (frees memory for the big pool; needs `--pfv2`) |
@@ -88,6 +88,8 @@ the short version.
 | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
 | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
 | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
+| `G6_SPEC_TABLE` | built-in measured table | Override verify costs for 1–8 rows with eight comma-separated finite positive times in ms. Applies to adaptive DFlash2 length and drafter choice; survives session resets. |
+| `G6_SPEC_DRAFT` | built-in drafting costs | Override DFlash2 round, MTP round and MTP additional chain-step costs with three comma-separated finite nonnegative times in ms. |
 | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
 | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |

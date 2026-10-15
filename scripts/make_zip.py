@@ -4,7 +4,7 @@
     scripts/make_zip.py --bin DIR [--ref HEAD] [--out DIR] [--allow-missing]
 
 DIR is the `dist` export of the Dockerfile (docker buildx build --target dist -o type=local,dest=DIR .): DIR/bin holds
-the TP=4 build and the front end, DIR/bin6 the TP=6 build, DIR/bin3 the TP=3 build. The source files come from
+the engine (every TP width) and the front end. The source files come from
 `git archive <ref>`, not the working tree, so untracked or modified files never reach the zip. Writes
 OUT/gr8-<short sha>.zip and
 OUT/gr8-<short sha>.zip.sha256. The zip is reproducible: the same commit and the same binaries give the same bytes
@@ -42,20 +42,16 @@ def skipped_file(path):
 
 
 # Each binary has the same path under --bin and in the zip.
-BINARIES = ['bin/g6m4', 'bin/g6m4-int4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs', 'bin/g6load',
-            'bin6/g6m4', 'bin6/g6m4-int4', 'bin6/m4sim', 'bin6/gpuprobe', 'bin6/tr3_e4m3_test', 'bin6/g6load',
-            'bin3/g6m4', 'bin3/g6m4-int4', 'bin3/m4sim', 'bin3/gpuprobe', 'bin3/tr3_e4m3_test', 'bin3/g6load']
+BINARIES = ['bin/g6m4', 'bin/g6m4-int4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs', 'bin/g6load']
 
 HEADER = """gr8 {short} (commit {commit}, {date})
 
-bin/   the TP=4 engine with the multi-session path (G6_NR=4 scripts/build.sh), the Rust front end g6front-rs, and
-       g6load, which plans and checks the Hugging Face fetch (engine/loader-rs)
-bin6/  the TP=6 engine (scripts/build.sh)
-bin3/  the TP=3 engine (G6_NR=3 scripts/build.sh)
+bin/   the engine for every TP width (scripts/build.sh: g6m4 takes the width from --ips), the Rust front end
+       g6front-rs, and g6load, which plans and checks the Hugging Face fetch (engine/loader-rs)
 Built for GB10 (aarch64, CUDA 13, sm_121a). The binaries link cuBLAS 13 and libibverbs at run time: a node needs the
-CUDA 13 runtime libraries (DGX OS has them) and rdma-core. With the prebuilt bin/, bin6/ and bin3/, skip the engine and
-front end builds in README.md: copy the one for your TP to bin/ on every box. g6m4-int4 in each is the same engine
-with the 4-bit KV latent, which --kv-format int4 runs (docs/KV4.md).
+CUDA 13 runtime libraries (DGX OS has them) and rdma-core. With the prebuilt bin/, skip the engine and front end builds
+in README.md: copy it to bin/ on every box, whatever the TP. g6m4-int4 is the same engine with the 4-bit KV latent,
+which --kv-format int4 runs (docs/KV4.md).
 
 sha256 of every file below:
 """
@@ -67,7 +63,7 @@ def git(*args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--bin', required=True, help='the dist export: DIR/bin, DIR/bin6 and DIR/bin3')
+    ap.add_argument('--bin', required=True, help='the dist export: DIR/bin')
     ap.add_argument('--ref', default='HEAD')
     ap.add_argument('--out', default='.')
     ap.add_argument('--allow-missing', action='store_true', help='leave out missing binaries instead of failing')

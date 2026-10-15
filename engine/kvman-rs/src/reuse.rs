@@ -32,6 +32,7 @@ pub enum Why {
     NoLcp,
     Short,
     Grid,
+    Namespace,
     Hit,
     /// a hit on a stored run (stash.rs)
     Stored,
@@ -47,6 +48,7 @@ impl Why {
             Why::NoLcp => c"no-lcp",
             Why::Short => c"short",
             Why::Grid => c"grid",
+            Why::Namespace => c"namespace",
             Why::Hit => c"hit",
             Why::Stored => c"stored",
         }

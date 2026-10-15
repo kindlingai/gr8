@@ -1,6 +1,6 @@
-//! One request's generation: engine frames -> text steps with stop tokens / stop strings applied (vLLM semantics),
-//! a port of `g6front/runner.py`. String positions that Python counts in characters (stop-string holdback and
-//! search windows) are counted in characters here too, so stream chunk boundaries come out the same.
+//! One request's generation: engine frames -> text steps with stop tokens / stop strings applied (vLLM semantics).
+//! String positions are counted in characters, not bytes, for the stop-string holdback and the search windows, so a
+//! chunk boundary lands where a character-based client expects it.
 
 use std::sync::Arc;
 

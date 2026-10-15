@@ -28,13 +28,12 @@ the full-index layers; vocab 154,880.
 | | `engine/runtime/qo_weights.cuh`, `attn/prefill-qo-*` | full-head QO attention shapes |
 | drafter | `engine/runtime/dflash.cuh`, `tools/convert/dflash2.py` | the GLM 5.3 DFlash2 drafter: 6 layers, 64 q / 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), target layers 5..75 (from the pack), selector rank 256 / top 16; TP must divide the 8 KV heads |
 | front end | `frontend/g6s2shim.py` | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
-| | `frontend/g6front/glm_parser.py` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format |
-| | `frontend/g6front/template.py`, `tokenizer.py` | read `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so these follow the model directory |
-| | `frontend/g6front-rs/src/` | the same parser, template and tokenizer handling in the Rust front end that `./gr8 glm53 up` runs |
+| | `frontend/g6front-rs/src/{parser,template,tok}.rs` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format, and it reads `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so those follow the model directory |
 
 ## Topology-specific (TP6, TP4, TP3)
 
-- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; `-DG6_NR=4` builds TP4 (`G6_NR=4 scripts/build.sh`). Every
+- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; `-DG6_NR=4` builds TP4. `scripts/build.sh` compiles the engine
+  once per width into one binary (`engine/runtime/build_m4.sh`). Every
   per-rank width the engine uses (heads, expert blocks, dense channels, vocab slice, scratch sizes) comes from it;
   the NR=6 values equal the old TP6 literals, so the TP6 build is SASS-identical. The engine also compiles for other
   divisors of 64; 6, 4 and 3 have been run.
@@ -56,7 +55,7 @@ the full-index layers; vocab 154,880.
 | device image loader (whole pack into one allocation, optional hash check) | `engine/loader/devimage.*` |
 | multi-session scheduler (S2), the request and response files, step plan, CUDA graph capture per row count, MTP draft/verify loop | `engine/runtime/s2/`, `s2_batch.h`, `serve.h`, `rank.cuh` |
 | context-parallel KV layout and the staged-page hash check | `engine/comms/cplayout.h`, `engine/runtime/prefill.cuh` (CP sections) |
-| OpenAI/vLLM-compatible HTTP server, metrics, streaming, socket protocol | `frontend/g6front-rs/`, `frontend/g6front/`, `PROTOCOL.md` |
+| OpenAI/vLLM-compatible HTTP server, metrics, streaming, socket protocol | `frontend/g6front-rs/`, `PROTOCOL.md` |
 | the per-box launcher: options, handshake, model cache, Hugging Face fetch | `gr8`, `tools/launch/` |
 
 ## A realistic porting path

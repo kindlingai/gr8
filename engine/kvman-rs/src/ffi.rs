@@ -1,7 +1,7 @@
 //! The C entry points (g6kvman.h). Each returns 0 or an error code that g6kv_error names, and an error leaves the pool
 //! unchanged. Release builds abort on a panic, so none unwinds into C++.
 
-use crate::pool::{Error, Pool, Run, Stats};
+use crate::pool::{Error, Namespace, Pool, Run, Stats, NAMESPACE_BYTES, STOCK_NAMESPACE};
 use crate::reuse::{Finished, Rules};
 use crate::stash::{Io, Keep, Part, Policy, TierStats};
 use std::ffi::c_char;
@@ -33,6 +33,13 @@ unsafe fn slice<'a, T>(p: *const T, n: usize) -> Option<&'a [T]> {
     } else {
         Some(std::slice::from_raw_parts(p, n))
     }
+}
+
+unsafe fn namespace(p: *const u8, n: usize) -> Option<Namespace> {
+    if n != NAMESPACE_BYTES || p.is_null() {
+        return None;
+    }
+    slice(p, n)?.try_into().ok()
 }
 
 /// Names an error code with a static string: "" for 0, "unknown pool error" for a code no call returns.
@@ -191,11 +198,31 @@ pub unsafe extern "C" fn g6kv_retain(
     written_end: i32,
     pf_end: i32,
 ) -> i32 {
+    g6kv_retain_namespaced(p, r, history, n, valid, written_end, pf_end, STOCK_NAMESPACE.as_ptr(), NAMESPACE_BYTES)
+}
+
+/// Retire a run in an opaque namespace. Invalid sizes/pointers leave the pool unchanged.
+///
+/// # Safety
+/// As g6kv_retain. A nonnull namespace of the required size must point to that many readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_retain_namespaced(
+    p: *mut Pool,
+    r: *const Run,
+    history: *const i32,
+    n: usize,
+    valid: i32,
+    written_end: i32,
+    pf_end: i32,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+) -> i32 {
+    let Some(namespace) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
     let Some(history) = slice(history, n) else { return Error::BadArgument.code() };
-    if r.is_null() {
+    if p.is_null() || r.is_null() {
         return Error::BadArgument.code();
     }
-    code((*p).retain(&*r, Finished { history: history.to_vec(), valid, written_end, pf_end }))
+    code((*p).retain_namespaced(&*r, Finished { history: history.to_vec(), valid, written_end, pf_end }, namespace))
 }
 
 /// # Safety
@@ -210,11 +237,31 @@ pub unsafe extern "C" fn g6kv_match(
     limit: i32,
     out: *mut G6kvHit,
 ) -> i32 {
+    g6kv_match_namespaced(p, prompt, n, rows, worst, limit, STOCK_NAMESPACE.as_ptr(), NAMESPACE_BYTES, out)
+}
+
+/// Find a prefix only in the exact namespace. Non-stock queries never search stored tiers.
+///
+/// # Safety
+/// As g6kv_match. A nonnull namespace of the required size must point to that many readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_match_namespaced(
+    p: *const Pool,
+    prompt: *const i32,
+    n: usize,
+    rows: u64,
+    worst: u64,
+    limit: i32,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    out: *mut G6kvHit,
+) -> i32 {
+    let Some(namespace) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
     let Some(prompt) = slice(prompt, n) else { return Error::BadArgument.code() };
-    if out.is_null() {
+    if p.is_null() || out.is_null() {
         return Error::BadArgument.code();
     }
-    let h = (*p).match_prefix(prompt, rows, worst, limit);
+    let h = (*p).match_prefix_namespaced(prompt, rows, worst, limit, namespace);
     *out = G6kvHit {
         skip: h.skip,
         lcp: h.lcp,
@@ -373,6 +420,29 @@ pub unsafe extern "C" fn g6kv_add_tier(
 pub unsafe extern "C" fn g6kv_count(p: *mut Pool, prompt: *const i32, n: usize, span: i64) -> u32 {
     let span = u32::try_from(span).ok();
     slice(prompt, n).map_or(0, |pr| (*p).count(pr, span))
+}
+
+/// Prepare a namespace-aware admission. Non-stock prompts are excluded from stock counting/promotion.
+///
+/// # Safety
+/// As g6kv_match, with `out` valid for a u32 write and a readable namespace buffer of the required size.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_count_namespaced(
+    p: *mut Pool,
+    prompt: *const i32,
+    n: usize,
+    span: i64,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    out: *mut u32,
+) -> i32 {
+    let Some(namespace) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
+    let Some(prompt) = slice(prompt, n) else { return Error::BadArgument.code() };
+    if p.is_null() || out.is_null() {
+        return Error::BadArgument.code();
+    }
+    *out = (*p).count_namespaced(prompt, u32::try_from(span).ok(), namespace);
+    0
 }
 
 /// Tier t's policy (stash.rs Policy). 0, or BadArgument when there is no such tier.

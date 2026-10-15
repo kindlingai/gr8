@@ -1,5 +1,5 @@
 //! OpenAI/vLLM request fields -> PROTOCOL.md `generate` fields, with vLLM's defaults and validation
-//! (a port of `g6front/sampling.py`; same checks in the same order, same messages).
+//! (vLLM's checks in the same order, with the same messages).
 
 use std::collections::HashSet;
 

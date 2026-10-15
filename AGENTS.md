@@ -23,13 +23,13 @@ your own setup. The config examples use placeholders for a reason.
 
 On a GB10 with CUDA 13:
 
-    ./gr8 glm53 build               # this cluster's TP, and the Rust front end, into bin/
-    G6_NR=4 scripts/build.sh bin4   # the TP=4 engine on its own
-    G6_NR=3 scripts/build.sh bin3   # the TP=3 engine
-    scripts/build.sh bin6           # the TP=6 engine
+    ./gr8 glm53 build               # the engine and the Rust front end, into bin/
+    scripts/build.sh bin            # the engine: one g6m4 and one m4sim for TP = 1, 2, 3, 4, 6 and 8
+    G6_NR=4 scripts/build.sh bin4   # TP=4 only, a shorter build (G6_WIDTHS="3 4" for several)
 
-`scripts/build.sh` also builds and runs `test_spec_len` and `test_prefix_reuse`, and `tr3_e4m3_test` when a GPU is
-visible. A PR builds every topology (CI's engine build does). g6m4 links the S2 page allocator from
+g6m4 takes its width from `--ips`, m4sim from `--tp N` or the rank packs in `--packs DIR`. Each width is compiled as
+its own build was (`engine/runtime/build_m4.sh`), so one build covers every topology. `scripts/build.sh` also builds
+and runs `test_spec_len` and `test_prefix_reuse`, and `tr3_e4m3_test` when a GPU is visible. g6m4 links the S2 page allocator from
 `engine/kvman-rs`, which build.sh builds with cargo. Where cargo is missing, build that crate (and `engine/loader-rs`)
 first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 

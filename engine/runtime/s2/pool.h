@@ -69,18 +69,23 @@ public:
     void keep(const g6rt::PrefixReuse& rules) { Lock l(mu_); g6kv_keep(p_, rules.strict, rules.noend, rules.grid); }
     bool keeping() const { Lock l(mu_); return g6kv_keeping(p_); }
     // a retiring session's run: retained with its finished reuse state (st.valid rows), or released when nothing is valid
-    void retain(const Run& r, const g6rt::PrefixReuse& st) {
+    void retain(const Run& r, const g6rt::PrefixReuse& st) { retain(r, st, st.cache_namespace); }
+    void retain(const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
         Lock l(mu_); const g6kv_run x = c(r);
-        check(g6kv_retain(p_, &x, st.history.data(), st.history.size(), st.valid, st.written_end, st.pf_end));
+        check(g6kv_retain_namespaced(p_, &x, st.history.data(), st.history.size(), st.valid,
+                                    st.written_end, st.pf_end, ns.data(), ns.size()));
     }
     // head, at admission (workers at their grant): the retained run with the longest reusable prefix for `prompt` (limit:
     // rows the prefill may skip) that the request (`rows` now, `worst` at most) can grow from. Ties go to the most recent.
-    PoolHit match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit) const {
+    PoolHit match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
+                  const g6rt::CacheNamespace& ns = {}) const {
         Lock l(mu_); g6kv_hit h;
-        check(g6kv_match(p_, prompt.data(), prompt.size(), rows, worst, limit, &h));
+        check(g6kv_match_namespaced(p_, prompt.data(), prompt.size(), rows, worst, limit, ns.data(), ns.size(), &h));
         return PoolHit{h.skip, h.lcp, h.why, h.age, h.stored != 0, h.tier};
     }
-    PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit) const { return match(prompt, rows, rows, limit); }
+    PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit, const g6rt::CacheNamespace& ns = {}) const {
+        return match(prompt, rows, rows, limit, ns);
+    }
     // claim a match() hit as a new grant (a fresh table version, as reserve)
     Run take(const PoolHit& h, uint64_t rows, uint64_t worst) {
         Lock l(mu_); g6kv_run r; check(g6kv_take(p_, h.skip, h.age, h.stored ? int32_t(h.tier) : -1, rows, worst, &r)); return run(r);
@@ -99,9 +104,11 @@ public:
                 g6kv_tier_error());
     }
     // at admission, before the grant, on every rank. span: the prompt's system span in tokens, -1 = none
-    uint32_t count(const std::vector<int>& prompt, int64_t span) {
+    uint32_t count(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace& ns = {}) {
         Lock l(mu_);
-        return g6kv_count(p_, prompt.data(), prompt.size(), span);
+        uint32_t out;
+        check(g6kv_count_namespaced(p_, prompt.data(), prompt.size(), span, ns.data(), ns.size(), &out));
+        return out;
     }
     // tier t's policy: evicted runs need min_rows rows and min_hits continuations; block_bytes for the counters
     void policy(uint32_t t, uint64_t min_rows, uint32_t min_hits, uint64_t block_bytes) {
