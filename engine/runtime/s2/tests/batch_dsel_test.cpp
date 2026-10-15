@@ -67,6 +67,20 @@ int main()
     b.admit({0}, {s});
     for (int i = 0; i < 40; ++i) CHECK(b.round({0}));
     CHECK(std::count(rounds.begin(), rounds.end(), 'm') == 0);
+    // A session reset must preserve custom verify costs while clearing learned acceptance.
+    // With both drafters right, the defaults above prefer DFlash2. This table makes MTP cheaper.
+    sel.d.table[8] = 1000000;
+    sel.m.table[4] = 1;
+    b.dsel(sel);
+    for (int request = 0; request < 2; ++request)
+    {
+        b.cancel(0); b.release(0);
+        rounds.clear();
+        b.admit({0}, {s});
+        for (int i = 0; i < 40; ++i) CHECK(b.round({0}));
+        CHECK(!rounds.empty() && rounds.back() == 'm');
+        CHECK(b.stats(0).mtp_rounds > 0);
+    }
     std::printf("batch_dsel_test: %s (%ld rounds, %ld on MTP, %ld switches)\n", fails ? "FAIL" : "PASS", b.stats(0).rounds,
                 b.stats(0).mtp_rounds, b.stats(0).switches);
     return fails ? 1 : 0;
