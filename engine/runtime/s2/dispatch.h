@@ -39,6 +39,8 @@ struct DispatchHooks {
     std::function<bool(int slot)> dfl_ok;
     std::function<int(int slot)> dfl_start;
     std::function<s2::DflDrafts(const s2::DflReq&, const Sampling&)> dfl;
+    // optional: row's log-probability in the last draft or chain step (StepOut::lp; s2_batch.h Batch::kstop)
+    std::function<float(int row)> draft_lp;
 };
 // the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
 inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
