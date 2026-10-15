@@ -79,6 +79,7 @@ struct Dfl
 {
     int rank = -1;
     bool sel = false;                 // DFlash2 selector walk (else argmax / gr8's sampler)
+    float sel_alpha = 1.f;            // G6_DFL_SEL_ALPHA: the walk's correction coefficient (draft tokens and lp only)
     int mask_id = 0;
     float theta = 1e6f, eps = 1e-5f;
     int tlayer[dfl::NT] = {};         // target_layer_ids
@@ -416,7 +417,7 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
     glue::publish(a.f, a.c, g6::coll_seq(*a.stepp, a.c, a.f.ncoll), a.ticket);
 }
 // merge every rank's candidates -> global top-16 per row, then the walk, with prev = the bonus token at s = 1:
-//   score(c) = logit(c) + sum_i pred[prev][i] hp[s][i] succ[c][i]
+//   score(c) = logit(c) + alpha * sum_i pred[prev][i] hp[s][i] succ[c][i]   (alpha = Dfl::sel_alpha, 1 by default)
 //   pick = argmax of score * inv_temp + gumbel(row s's key, c), or of score when greedy
 //   prev = pick, s = s + 1, up to s = 7. lp_out = log-probability of the pick in softmax(score) over the 16
 // grid 1, block 256. Warp w < 7 merges row w + 1, then warp w scores candidates w and w + 8.
@@ -429,6 +430,7 @@ struct WalkArgs
     const glue::SampleRow* srow;
     int* tok_out;
     float* lp_out;
+    float alpha;                      // the correction's coefficient (1: the trained selector, exactly)
 };
 __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
 {
@@ -472,7 +474,7 @@ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
                 acc += __bfloat162float(a.pred[(size_t)prev * SELR + i]) * hp[i] * __bfloat162float(a.succ[(size_t)id * SELR + i]);
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-            if (l == 0) s_sc[cc] = s_l[s][cc] + acc;
+            if (l == 0) s_sc[cc] = s_l[s][cc] + a.alpha * acc;
         }
         __syncthreads();
         if (t == 0)
@@ -873,7 +875,7 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
     }
     // p == NC: the merge (gr8's head merge in argmax mode, the walk in selector mode), StepOut
     if (D.sel)
-        dflk::k_walk<<<1, 256, 0, st>>>(dflk::WalkArgs{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp});
+        dflk::k_walk<<<1, 256, 0, st>>>(dflk::WalkArgs{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp, D.sel_alpha});
     else if (D.nc > 0) glue::k_head_merge_tp<<<B, 1024, 0, st>>>(dfl_head_args(D));
     else glue::k_head_merge<<<1, 32, 0, st>>>(dfl_head_args(D));
     dflk::k_out<<<1, 32, 0, st>>>(dflk::OutArgs{D.tok_out, D.lp, D.out});

@@ -667,6 +667,11 @@ int main(int argc, char** argv)
     const char* dse = getenv("G6_S2_DSEL_START");
     const bool dsel_start_mtp = dse && !strcmp(dse, "mtp");
     if (dse && *dse && !dsel_start_mtp && strcmp(dse, "dflash")) die("G6_S2_DSEL_START: mtp or dflash");
+    // G6_DFL_SEL_ALPHA=<a> (dflash.cuh k_walk; default 1): the DFlash2 selector walk scores logit + a * correction. Drafts
+    // only: the verify is unchanged. In the S2 runtime signature
+    const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
+    if (!std::isfinite(dfl_alpha)) die("G6_DFL_SEL_ALPHA: not a finite number");
+    if (dfl_alpha != 1.f && !dfl) die("G6_DFL_SEL_ALPHA needs --dflash-manifest");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -992,6 +997,8 @@ int main(int argc, char** argv)
             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
                         dhead.tpc, dhead.ks);
         if (dfl_body_i4_on) dfl_body_i4(DF, st);
+        if (dfl_alpha != 1.f && !DF.sel) die("G6_DFL_SEL_ALPHA needs the selector walk");
+        DF.sel_alpha = dfl_alpha;
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
     }
@@ -1997,8 +2004,8 @@ int main(int argc, char** argv)
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
-                (dsel_start_mtp ? " dselstart mtp" : "");
-
+                (dsel_start_mtp ? " dselstart mtp" : "") +
+                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
