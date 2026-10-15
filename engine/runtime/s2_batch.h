@@ -185,6 +185,7 @@ struct DSel
     // G6_S2_DSEL_START=mtp: a request starts on MTP and the drafter's prompt-tail drafts are its first probe (default:
     // it starts on DFlash2)
     bool start_mtp = false;
+    bool posclk = false;              // G6_S2_DSEL_POSCLK=1: d and m keep a clock per position (SpecLen::posclk)
     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
 };
 // G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
@@ -249,7 +250,7 @@ public:
     void adapt(bool on) { adapt_ = on; }
     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
     void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
-    void dsel(const DSel& d) { sel_ = d; kstop(ks_); }
+    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; kstop(ks_); }
     // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
     void kstop(const KStop& k)
     {
@@ -632,7 +633,7 @@ private:
     static g6rt::SpecLen fresh(const g6rt::SpecLen& o)
     {
         g6rt::SpecLen f;
-        f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each;
+        f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each; f.posclk = o.posclk;
         std::copy(o.table, o.table + g6rt::SpecLen::KX + 2, f.table);
         std::copy(o.seed, o.seed + g6rt::SpecLen::KX + 1, f.seed);
         return f;

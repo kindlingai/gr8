@@ -162,6 +162,17 @@ int main()
             }
         }
     }
+    {   // posclk: rounds that observe position 1 alone leave position 2's evidence as it was; off, they age it
+        g6rt::SpecLen on, off;
+        on.posclk = true;
+        for (g6rt::SpecLen* s : {&on, &off})
+        {
+            for (int i = 0; i < 20; ++i) s->observe(2, 2, nullptr, 0);    // position 2 accepted every round
+            for (int i = 0; i < 20; ++i) s->observe(1, 0, nullptr, 0);    // then 20 rounds of position 1 only
+        }
+        check(on.rate(2) > 0.9 && off.rate(2) < 0.8, "posclk: position 2 keeps its rate through position-1-only rounds");
+        check(on.rate(1) == off.rate(1), "posclk: position 1 decays as before");
+    }
     printf("%d/%d checks passed\n", checks - fails, checks);
     return fails ? 1 : 0;
 }
