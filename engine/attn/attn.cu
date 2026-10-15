@@ -391,10 +391,10 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
 #endif
     float* dst=parts+(((int64_t)row*a.heads+h)*PART+part)*512;dst[t]=lo;dst[t+256]=hi;
 }
-template<class Input>
+template<class Input,int P=PART>   // P = PART_E1 under G6_ATTN_CTX2=9 (decode-small.cuh launch_merge_parts)
 __global__ void merge_parts(Input input,const float* parts,float* out){
     auto a=resolve(input);if(!a.active)return;
-    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<PART;part++)s+=parts[((int64_t)rowhead*PART+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
+    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<P;part++)s+=parts[((int64_t)rowhead*P+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
 }
 template<class Input>
 __global__ void value_project(Input input,int start,const float* context){
@@ -506,6 +506,19 @@ __global__ void value_project_m1(Input input,int start,int n,const float* contex
 }
 // Host-side, read once (first decode call precedes graph capture). Tests may assign it.
 static int& avp1_on(){static int v=[]{const char* e=getenv("G6_AVP1");return e&&atoi(e)?1:0;}();return v;}
+// G6_ATTN_CTX2 (default 0 = off; decode-small.cuh): replaces context_parts_heads on its own calls. 1 / 2 = context_parts_heads
+// with 32 / 64 gathered pairs per batch, 3 / 4 = context_pk with 16 / 32 (two batches in flight): bit-identical parts.
+// 9 = E1: context_pk over PART_E1 = 32 partitions of 64 slots (4x the CTAs, 64-slot chains) and merge_parts over 32
+// partials: the fp32 sum order changes (gate by KL, not bytes). FP8 KV only. Host-side, read once before the first
+// workspace() (9 sizes the parts scratch); tests may assign it before computing the scratch size.
+constexpr int PART_E1=32;
+static int& attn_ctx2(){static int v=[]{
+#if G6_KV4
+    return 0;
+#else
+    const char* e=getenv("G6_ATTN_CTX2");const int x=e?atoi(e):0;return (x>=1&&x<=4)||x==9?x:0;
+#endif
+    }();return v;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
     half* iq;int *ii,*io,*offsets;uint64_t* selected;SelectionState* selection;int* histogram;void* temp;size_t temp_bytes,total;
@@ -518,7 +531,7 @@ static Work workspace(const G6Attn& a,void* base){
     w.si=(float*)alloc(R*T*4);w.so=(float*)alloc(R*T*4);w.ii=(int*)alloc(R*T*4);w.io=(int*)alloc(R*T*4);w.offsets=(int*)alloc((R+1)*4);
     w.selected=(uint64_t*)alloc(R*TOP*8);w.selection=(SelectionState*)alloc(R*sizeof(SelectionState));
     w.histogram=(int*)alloc(R*((std::min(T,size_t(32768))+RADIX_CHUNK-1)/RADIX_CHUNK)*256*4);
-    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*PART*512*4);w.context=(float*)alloc(R*H*512*4);
+    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*(attn_ctx2()==9?PART_E1:PART)*512*4);w.context=(float*)alloc(R*H*512*4);
     size_t b=0;cudaError_t e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,b,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);
     if(e!=cudaSuccess)return Work{};
     // The last query tile can contain one row even when the workspace has R>1.
@@ -651,7 +664,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         AMARK(5);
         ga::launch_context_parts(a,input,w,start,n,stream);
         AMARK(6);
-        ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        ga::launch_merge_parts(a,input,w.parts,w.context,n,stream);
         KV4_ROTATE(w.context,n*a.heads,stream);
         AMARK(7);
 #if defined(DEC_AVP) && DEC_AVP
@@ -754,7 +767,7 @@ static cudaError_t cp_group_body(const G6Attn& a,Input input,Work w,const float*
     launch_mla_scores(a,input,w,0,n,stream);
     cp_softmax<<<nh,256,0,stream>>>(input,w.prob,part+(int64_t)nh*512,part+(int64_t)nh*513);
     launch_context_parts(a,input,w,0,n,stream);
-    merge_parts<<<nh,256,0,stream>>>(input,w.parts,part);
+    launch_merge_parts(a,input,w.parts,part,n,stream);
     return cudaGetLastError();
 }
 template<class Input>
