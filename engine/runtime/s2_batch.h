@@ -116,7 +116,9 @@ struct Stats
 // lo = the lowest position the drafter holds; query: also draft the block after them, bonus token tok0
 constexpr int DFL_B = 8;              // = dfl::B: the bonus row and 7 drafts
 constexpr int DFL_WIN = 2048, DFL_RING = 4096;   // = dfl::WIN, dfl::RING: the drafter's window and its KV ring (positions)
-struct DflReq { int sess, rows, pos0, tok0, lo; bool query; };
+// phase (G6_DRAFT_PAR): 0 = launch and wait; 1 = launch on the drafter's own stream and return at once; 2 = wait for
+// that launch and return its drafts
+struct DflReq { int sess, rows, pos0, tok0, lo; bool query; int phase = 0; };
 struct DflDrafts { int tok[DFL_B]; float lp[DFL_B]; };
 
 // run(step) -> the sampled token of every row of the step (step.M() ids), for MAIN, DRAFT and CHAIN steps
@@ -170,6 +172,10 @@ struct S2Cost
 // G6_S2_DSEL (every rank, read at boot): drafter choice for DFlash2 sessions (Batch::dsel), on unless 0. RigMark TP4:
 // prose 28.8 -> 30.1 tok/s, code 48.9 -> 49.0, C4 62.7 -> 63.8 (margin 0.15, dwell 8)
 inline bool dsel_env() { const char* e = getenv("G6_S2_DSEL"); return !e || atoi(e) != 0; }
+// G6_DRAFT_PAR (every rank, read at boot; g6m4 creates the drafter's stream): a solo DFlash2 round launches the drafter
+// step before the MTP first form, on its own stream, and waits for it at the end of the round (after the chain on MTP).
+// Both are fixed graphs on separate weights, scratch and fabrics, so each one's output bytes are as serial; 0 = serial
+inline int draft_par_env() { const char* e = getenv("G6_DRAFT_PAR"); return e ? atoi(e) : 0; }
 struct DSel
 {
     bool on = false;
@@ -428,6 +434,17 @@ private:
         if (m) ++stats_[q].mtp_rounds;
         else ++stats_[q].dfl_rounds;
         if (h_.emit && h_.emit(q, &x.tokens[base + 1], c, 0)) { x.done = true; return; }
+        // G6_DRAFT_PAR: the drafter choice reads nothing the first form writes, so it is made first and the drafter step
+        // runs under the first form
+        const bool par = par_ && x.force < 0;
+        bool nm = false, probe = false;
+        DflReq r{};
+        if (par)
+        {
+            r = choose_drafter(q, base, a, t[a], nm, probe);
+            r.phase = 1;
+            drafts(q, r);
+        }
         Step d;
         d.kind = Step::DRAFT; d.event = v.event;
         d.round = cur_round_; d.round_active = cur_active_;
@@ -443,22 +460,39 @@ private:
             x.pb = -1;
             return;
         }
-        bool nm = sel_.on && next_mtp(x);
-        if (x.warm) { nm = base + a + 1 < x.warm; if (!nm) x.warm = 0; }   // G6_DFL_REUSE warm-up: DFlash2 once it is over
-        if (nm != m) { x.since = 0; ++stats_[q].switches; }
-        ++x.since;
-        x.mtp = nm;
-        const bool probe = nm && !x.warm && x.pb < 0 && ++x.mn % sel_.probe == 0;
-        drafts(q, DflReq{q, a + 1, base, t[a], x.lo, !nm || probe});
+        if (!par)
+        {
+            r = choose_drafter(q, base, a, t[a], nm, probe);
+            drafts(q, r);
+        }
+        else
+        {   // the chain needs only d[1]: it runs before the wait, under the drafter step too
+            if (nm) kchain(q, v.event);
+            r.phase = 2;
+            drafts(q, r);
+        }
         if (probe) { x.pb = base + a + 1; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
         if (!nm) x.pb = -1;
-        if (nm) kchain(q, v.event);
+        if (nm && !par) kchain(q, v.event);
+    }
+    // the drafter of the next round (drafter choice, G6_DFL_REUSE warm-up) and this round's drafter step: the a + 1
+    // committed rows as context, drafting when the next round is on DFlash2 or probes
+    DflReq choose_drafter(int q, int base, int a, int tok, bool& nm, bool& probe)
+    {
+        St& x = st_[q];
+        nm = sel_.on && next_mtp(x);
+        if (x.warm) { nm = base + a + 1 < x.warm; if (!nm) x.warm = 0; }   // G6_DFL_REUSE warm-up: DFlash2 once it is over
+        if (nm != x.mtp) { x.since = 0; ++stats_[q].switches; }
+        ++x.since;
+        x.mtp = nm;
+        probe = nm && !x.warm && x.pb < 0 && ++x.mn % sel_.probe == 0;
+        return DflReq{q, a + 1, base, tok, x.lo, !nm || probe};
     }
     void drafts(int q, const DflReq& r)
     {
         const DflDrafts o = h_.dfl(r);
-        if (reuse_.mode) ring_rows(q, r);
-        if (!r.query) return;
+        if (reuse_.mode && r.phase != 2) ring_rows(q, r);
+        if (!r.query || r.phase == 1) return;
         for (int i = 1; i < DFL_B; ++i) { st_[q].dd[i] = o.tok[i]; st_[q].dl[i] = o.lp[i]; }
     }
 
@@ -623,6 +657,7 @@ private:
     int K_, max_rows_;
     bool adapt_ = false;
     int dkv_ = DFL_B - 1;
+    bool par_ = draft_par_env() != 0;
     g6rt::SpecLen dsl_;
     DSel sel_;
     KStop ks_;

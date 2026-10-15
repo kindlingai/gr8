@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-16: the DFlash2 drafter step under MTP's first form, on its own stream (G6_DRAFT_PAR, off by default)
+
+- In a round of a request that decodes alone with DFlash2, the drafter step ran after MTP's first form (and after the
+  MTP chain on the drafter choice's MTP rounds). Neither reads what the other writes: they are fixed graphs on separate
+  weights, scratch and fabrics, and the drafter choice reads nothing the first form writes. `G6_DRAFT_PAR=1` makes the
+  choice first, launches the drafter step on its own stream, runs the first form (and the chain) on the main stream,
+  and waits for the drafter at the end of the round. 2 puts a drafting step on a high-priority stream.
+- Every kernel that waits for its peers runs at most 8 CTAs, so the other stream always finds SMs and neither can
+  starve the other's fabric wait.
+- The same graphs on the same inputs as serial: every step's bytes are unchanged. `batch_draftpar_test` (host) runs
+  serial and parallel batches through the drafter choice, the confidence stop, the insert rule and `G6_DFL_REUSE`, and
+  checks the same tokens, requests, steps and statistics. `G6_S2_ROUNDLOG` adds a `# s2_dfl` line: the drafter step's
+  launch-to-wait time.
+
 ## 2026-10-16: an MTP confidence stop for a request's solo MTP rounds (G6_MTP_KSTOP, off by default)
 
 - A request that decodes alone and drafts with MTP (the drafter choice's MTP rounds, and with `G6_DFL_REUSE` its

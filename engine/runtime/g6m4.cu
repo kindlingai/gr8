@@ -478,6 +478,15 @@ int main(int argc, char** argv)
         if (!*e || *end || v < 0 || v > dfl::WIN) die("G6_DFL_REUSE_MIN: 0.." + std::to_string(dfl::WIN) + " rows");
         dfl_reuse_min = (int)v;
     }
+    // G6_DRAFT_PAR=1|2 (s2_batch.h draft_par_env; default 0): a solo DFlash2 round's drafter step runs on its own stream
+    // under the MTP first form (and the chain on MTP rounds). 2: a drafting step goes on a high-priority stream (its CTAs
+    // are dispatched first while both wait), a context-only step stays at the default priority. Each graph's bytes are as
+    // serial. Progress: every kernel that waits for peers runs at most 8 CTAs (k_wait_peers 1, k_walk 1, head merges M),
+    // so the other stream always finds SMs. In the S2 runtime signature
+    std::string dpe;
+    const int draft_par = env_choice("G6_DRAFT_PAR", 2, 0, &dpe);
+    if (draft_par < 0) die(dpe);
+    if (draft_par && !(dfl && s2mode && mtp)) die("G6_DRAFT_PAR needs --dflash-manifest, --mtp and --serve");
 #if defined(G6_CP) && G6_CP
     // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
@@ -776,6 +785,17 @@ int main(int argc, char** argv)
         capture([&] { dfl_step(DF, st, true); }, &exec_f[1], "dflash draft ", dfl::B);
         if (DF.pf_feat) capture([&] { dfl_fill_step(DF, st); }, &exec_f[2], "dflash fill ", dfl::B);
     }
+    cudaStream_t st_par[2] = {};        // G6_DRAFT_PAR: the drafter's streams, [0] context only, [1] drafting
+    if (draft_par)
+    {
+        int lo = 0, hi = 0;
+        G6RT_CK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+        G6RT_CK(cudaStreamCreateWithFlags(&st_par[0], cudaStreamNonBlocking));
+        if (draft_par == 2) G6RT_CK(cudaStreamCreateWithPriority(&st_par[1], cudaStreamNonBlocking, hi));
+        else st_par[1] = st_par[0];
+        if (R == 0) fprintf(stderr, "# rank %d: G6_DRAFT_PAR=%d: the DFlash2 drafter step runs under the MTP first form "
+                            "(drafting stream priority %d, range %d..%d)\n", R, draft_par, draft_par == 2 ? hi : 0, lo, hi);
+    }
     fprintf(stderr, "# rank %d: device tensors %.2f GB\n", R, (image ? img.bytes() : store.bytes) / 1e9);
     const bool pf_streams = two && getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2;   // pf_step2s
     if (pf_streams && pf_prof().on) die("G6_PF_STREAMS=2 cannot run with G6_PF_PROF (the marks synchronize one stream)");
@@ -990,6 +1010,9 @@ int main(int argc, char** argv)
         std::array<uint32_t, g6s2::MAX_SESSIONS> slot_prompt{};
         std::array<bool, g6s2::MAX_SESSIONS> slot_whole{};   // G6_DFL_REUSE: a hit holds every prompt row but the last (no prefill)
         u64 s2_dstep = 0;                // the drafter fabric's steps
+        cudaStream_t dfl_par_st = st;    // G6_DRAFT_PAR: the stream of the drafter step in flight
+        const bool dfl_tl = R == 0 && getenv("G6_S2_ROUNDLOG") && *getenv("G6_S2_ROUNDLOG") == '1';
+        std::chrono::steady_clock::time_point dfl_t0;
         g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
             [&](const StepIn& si) {
                 std::vector<uint32_t> sizes(NC, (uint32_t)(si.M * HID * 2));
@@ -1210,16 +1233,28 @@ int main(int argc, char** argv)
                     return dfl_from;
                 };
                 h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
-                    DflIn di;
-                    memset(&di, 0, sizeof di);
-                    di.step = ++s2_dstep;
-                    di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
-                    const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
-                    for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
-                    *in_f = di;
-                    fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
-                    G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));
-                    G6RT_CK(cudaStreamSynchronize(st));
+                    // G6_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq).
+                    // The target step before phase 1 was fenced on st, and phase 2 comes before the next one
+                    cudaStream_t& ds = dfl_par_st;
+                    if (r.phase != 2)
+                    {
+                        DflIn di;
+                        memset(&di, 0, sizeof di);
+                        di.step = ++s2_dstep;
+                        di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
+                        const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
+                        for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
+                        *in_f = di;
+                        fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                        ds = r.phase ? st_par[di.query ? 1 : 0] : st;
+                        if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
+                        G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], ds));
+                        if (r.phase == 1) return s2::DflDrafts{};
+                    }
+                    G6RT_CK(cudaStreamSynchronize(ds));
+                    if (dfl_tl)   // G6_S2_ROUNDLOG: the drafter step's launch to its wait (G6_DRAFT_PAR: the first form and chain within)
+                        fprintf(stderr, "# s2_dfl step %llu query %d par %d ms %.3f\n", (unsigned long long)s2_dstep, (int)r.query, r.phase ? 1 : 0,
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dfl_t0).count());
                     g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error");
                     s2::DflDrafts o;
                     for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
@@ -1241,7 +1276,8 @@ int main(int argc, char** argv)
                 (set_id.empty() ? "" : " set " + set_id) +
                 (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") +
                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
-                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "");
+                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
+                (draft_par ? " draftpar " + std::to_string(draft_par) : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
