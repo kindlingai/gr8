@@ -16,6 +16,89 @@ namespace g6s2 {
 inline long long s2_wall_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+// G6_S2_TIMELINE=N (every rank, N > 0): where the time between decode steps goes. Each step launch (main, first-form
+// draft, chain here; the DFlash2 drafter steps in g6m4) stamps the host clock on entry, before and after its graph launch
+// and after its fence, and records a CUDA event before and after its graph(s). After the fence it adds the step to its
+// kind's totals (GPU span = event to event; host input prep, launch call, fence wait) and the transition from the step
+// before to that pair's totals (GPU idle = the previous step's end event to this step's start event; host = the previous
+// fence to this launch's entry: accept, emit, drafter choice, step planning). Prints them every N main steps. The idle
+// time is what launching the next step from the GPU could remove; the spans stay. Unset: no events, no stamps.
+// G6_DRAFT_PAR: a solo DFlash2 round's drafter step (launched before the first form on its own stream, waited for after
+// the first form and the chain) counts as dfl_ctx_par / dfl_query_par through par_*, with its own event pair: span = its
+// GPU start to end on its stream (under the first form and chain, so it overlaps their spans), prep and launch as above,
+// wait = the phase 2 wait alone (the drafter's tail the first form and chain did not hide). It is not in the
+// transitions, which stay on the target stream: main>draft's host time holds the phase 1 launch, and the idle before
+// the next main step holds that tail.
+struct S2Timeline {
+    enum Kind { MAIN, DRAFT, CHAIN, DCTX, DQUERY, DCTX_PAR, DQUERY_PAR, NK };
+    using clk = std::chrono::steady_clock;
+    int every = 0;
+    cudaEvent_t ev[2][2] = {};          // [pair][start, end]; pairs alternate, so the previous step's end stays readable
+    int cur = 0, prev_kind = 0;
+    bool have_prev = false;
+    clk::time_point t_enter, t_pre, t_post, t_prev;
+    cudaEvent_t evp[2] = {};            // G6_DRAFT_PAR: the drafter step on its own stream [start, end]
+    clk::time_point p_enter, p_pre, p_post, p_wait;
+    long n[NK] = {}, rows[NK] = {}, tn[NK][NK] = {}, mains = 0, breaks = 0;
+    double span[NK] = {}, prep[NK] = {}, call[NK] = {}, wait[NK] = {}, idle[NK][NK] = {}, host[NK][NK] = {};
+    static const char* name(int k) { static const char* s[NK] = {"main", "draft", "chain", "dfl_ctx", "dfl_query", "dfl_ctx_par", "dfl_query_par"}; return s[k]; }
+    static double ms(clk::time_point a, clk::time_point b) { return std::chrono::duration<double,std::milli>(b - a).count(); }
+    S2Timeline() {
+        const char* e = getenv("G6_S2_TIMELINE");
+        every = e ? atoi(e) : 0;
+        if (every > 0) for (auto& p : ev) for (auto& x : p) G6RT_CK(cudaEventCreate(&x));
+        if (every > 0) for (auto& x : evp) G6RT_CK(cudaEventCreate(&x));
+    }
+    bool on() const { return every > 0; }
+    void enter() { if (on()) t_enter = clk::now(); }
+    void pre(cudaStream_t st) { if (!on()) return; t_pre = clk::now(); G6RT_CK(cudaEventRecord(ev[cur][0], st)); }
+    void post(cudaStream_t st) { if (!on()) return; G6RT_CK(cudaEventRecord(ev[cur][1], st)); t_post = clk::now(); }
+    // G6_DRAFT_PAR's drafter step: entry, around its launch on its stream (phase 1), phase 2's entry, after its wait
+    void par_enter() { if (on()) p_enter = clk::now(); }
+    void par_pre(cudaStream_t st) { if (!on()) return; p_pre = clk::now(); G6RT_CK(cudaEventRecord(evp[0], st)); }
+    void par_post(cudaStream_t st) { if (!on()) return; G6RT_CK(cudaEventRecord(evp[1], st)); p_post = clk::now(); }
+    void par_wait() { if (on()) p_wait = clk::now(); }
+    void par_done(int kind, int M) {
+        if (!on()) return;
+        const auto t = clk::now();
+        float s = 0; G6RT_CK(cudaEventElapsedTime(&s, evp[0], evp[1]));
+        ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(p_enter, p_pre); call[kind] += ms(p_pre, p_post); wait[kind] += ms(p_wait, t);
+    }
+    // not a decode transition: a prefill quantum, a mode switch, the drafter's prompt fill
+    void cut() { have_prev = false; }
+    // after the step's fence
+    void done(int kind, int M, int rank) {
+        if (!on()) return;
+        const auto t = clk::now();
+        float s = 0; G6RT_CK(cudaEventElapsedTime(&s, ev[cur][0], ev[cur][1]));
+        ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(t_enter, t_pre); call[kind] += ms(t_pre, t_post); wait[kind] += ms(t_post, t);
+        if (have_prev) {
+            float g = 0; G6RT_CK(cudaEventElapsedTime(&g, ev[cur ^ 1][1], ev[cur][0]));
+            if (g > 20.f) ++breaks;      // an event fence or an idle engine in between, not a round's transition
+            else { ++tn[prev_kind][kind]; idle[prev_kind][kind] += g; host[prev_kind][kind] += ms(t_prev, t_enter); }
+        }
+        have_prev = true; prev_kind = kind; t_prev = t; cur ^= 1;
+        if (kind == MAIN && ++mains % every == 0) print(rank);
+    }
+    void print(int rank) const {
+        double ti = 0, th = 0, ds = 0;
+        for (int a = 0; a < NK; ++a) for (int b = 0; b < NK; ++b) { ti += idle[a][b]; th += host[a][b]; }
+        for (int k = 1; k < NK; ++k) ds += span[k];
+        const double m = double(mains);
+        fprintf(stderr, "# s2_tl rank %d mains %ld: per main step: GPU idle %.3f ms (host between steps %.3f), drafting GPU span %.3f ms, breaks %ld\n",
+                rank, mains, ti / m, th / m, ds / m, breaks);
+        for (int k = 0; k < NK; ++k)
+            if (n[k])
+                fprintf(stderr, "# s2_tl rank %d step %s n %ld rows %.2f span %.3f prep %.3f launch %.3f wait %.3f ms\n", rank, name(k), n[k],
+                        double(rows[k]) / n[k], span[k] / n[k], prep[k] / n[k], call[k] / n[k], wait[k] / n[k]);
+        for (int a = 0; a < NK; ++a)
+            for (int b = 0; b < NK; ++b)
+                if (tn[a][b])
+                    fprintf(stderr, "# s2_tl rank %d trans %s>%s n %ld idle %.3f host %.3f ms\n", rank, name(a), name(b), tn[a][b],
+                            idle[a][b] / tn[a][b], host[a][b] / tn[a][b]);
+    }
+};
+inline S2Timeline& s2_tl() { static S2Timeline t; return t; }
 // Use g6m4's EXISTING capture arrays/main_enqueue. In particular solo_main must
 // replay its production split3 A/B graphs, not capture an S2 replacement graph.
 struct NativeContext {
@@ -106,7 +189,7 @@ class NativeDispatch {
         return s;
     }
     void mode(int old, int next) {
-        const auto t0 = std::chrono::steady_clock::now(); fence();
+        const auto t0 = std::chrono::steady_clock::now(); fence(); s2_tl().cut();
         if (old >= 0) g6rt::s2_hprev_from_solo(c_.draft,old,c_.stream);
         if (next >= 0) {
             // the survivor's own pages (set by bind)
@@ -154,6 +237,7 @@ class NativeDispatch {
         auto& model = draft ? c_.draft.d : c_.main;
         auto& fabric = draft ? c_.draft_fabric : c_.main_fabric;
         const int rows = l.step.M();
+        S2Timeline& tl = s2_tl(); tl.enter();
         g6rt::StepIn input{}; g6rt::S2In layout{}; native_inputs(l,input,layout);
         if (l.solo >= 0) input.page_bound = model.s2->pool_pages;   // the solo tables hold -1 past the session's pages
         if (draft && c_.main.rs) for (int r = 0; r < rows; ++r) input.srow[r].inv_temp = 0.f;   // rejection sampling: greedy drafts
@@ -172,13 +256,16 @@ class NativeDispatch {
             sizes[2] = uint32_t(glue::head_bytes(rows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
         } else c_.enqueue_main(input); // preserves existing RS order/fabric layout
         const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
+        tl.pre(c_.stream);
         if (l.solo >= 0) {
             if (draft) c_.solo_draft(l.buckets[0],chain,rows); else c_.solo_main(l.buckets[0],rows);
         } else {
             const auto& g = graphs_.at(l.graph_key); G6RT_CK(cudaGraphLaunch(g.a,c_.stream));
             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
         }
-        fence(); const auto out = *(draft ? c_.draft_output : c_.output);
+        tl.post(c_.stream);
+        fence(); tl.done(draft ? (chain ? S2Timeline::CHAIN : S2Timeline::DRAFT) : S2Timeline::MAIN, rows, c_.main.rank);
+        const auto out = *(draft ? c_.draft_output : c_.output);
         if (draft) { std::copy(out.lp, out.lp + rows, dlp_); dlp_rows_ = rows; }
         if (!draft) {
             g6rt::evprof_read(rows,c_.stream,c_.main.rank);
@@ -203,6 +290,7 @@ class NativeDispatch {
     }
     void prefill(const Slot& slot,const Payload& payload,uint32_t first,uint32_t rows) {
         const auto t0 = std::chrono::steady_clock::now();   // for the error-word line: a ~10 s quantum is a GPU wait timeout
+        s2_tl().cut();
         require(rows <= uint64_t(c_.prefill_rows)*(c_.two_lanes?2:1), "prefill quantum exceeds native lanes");
         c_.begin_prefill(slot); // real run/view selector supplied by TP4/fc2
         const int a = int(first), ma = std::min(int(rows),c_.prefill_rows), mb = int(rows)-ma;
