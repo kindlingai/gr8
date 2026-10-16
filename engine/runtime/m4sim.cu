@@ -42,6 +42,7 @@
 //   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
 #include <algorithm>
 #include <chrono>
+#include "engine_opts.h"
 #include "packfind.h"
 #include "prefill.cuh"
 #include "serve.h"
@@ -232,73 +233,40 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
-    std::string packs, layers_s = "0,3,40,77";
+    std::string packs;
     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
-    std::vector<std::string> prompts;
+    g6rt::CommonOpts co;                // every flag g6m4 takes too, parsed in engine_opts.h
     Plan plan;
-    int cap = 64;
-    float temp = 0.f;
-    bool graph = false;
-    int MP = 0, top = 0;
-    bool wide = false, pfv2 = false;
-    int pfrows = 0, mtp = 0, lanes = 1;
     bool reuse = false;                 // --reuse-prefix: keep the caches of the rows a prompt shares with the previous one
     std::string serve;
-    int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
-    std::string qo_man, qo_file;       // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py) for G6_PF_OWN=3
     std::string mtp_dump;               // --mtp-dump PREFIX: rank 0 draft buffers of seq 0 (tools/m6/check_draft.py)
     bool s2mode = false;                // --s2: the prompts as sessions of one batched decode (DEC_S2)
-    bool adapt = false;                 // --spec-adaptive
-    std::string levels_s;               // --spec-levels
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) die("missing value for " + a); return std::string(argv[++i]); };
+        std::string oerr;
+        if (g6rt::common_arg(a, next, co, oerr)) { if (!oerr.empty()) die(oerr); continue; }
         if (a == "--packs") packs = next();
-        else if (a == "--v2") v2src.dir = next();
-        else if (a == "--v2-slices") v2src.slices = next();
-        else if (a == "--v2-widths") v2src.widths = next();
-        else if (a == "--v2-dense") v2src.dense = next();
-        else if (a == "--v2-dense-form")
-        {
-            const std::string f = next();
-            if (f != "trellis" && f != "rounded") die("--v2-dense-form: trellis or rounded");
-            v2src.trellis = f == "trellis";
-        }
-        else if (a == "--qo-manifest") qo_man = next();
-        else if (a == "--qo-pack") qo_file = next();
-        else if (a == "--layers") layers_s = next();
-        else if (a == "--prompt") prompts.push_back(next());
-        else if (a == "--gen") plan.n_gen = atoi(next().c_str());
-        else if (a == "--temp") temp = (float)atof(next().c_str());
-        else if (a == "--seed") plan.seed = (uint32_t)strtoul(next().c_str(), nullptr, 10);
-        else if (a == "--cap") cap = atoi(next().c_str());
-        else if (a == "--chunk") plan.chunk = atoi(next().c_str());
-        else if (a == "--graph") graph = true;
-        else if (a == "--prefill") MP = atoi(next().c_str());
-        else if (a == "--top") top = atoi(next().c_str());
-        else if (a == "--wide") wide = true;
-        else if (a == "--pfv2") pfv2 = true;
-        else if (a == "--pf-rows") pfrows = atoi(next().c_str());
-        else if (a == "--mtp") mtp = atoi(next().c_str());
-        else if (a == "--pf-lanes") lanes = atoi(next().c_str());
         else if (a == "--reuse-prefix") reuse = true;
         else if (a == "--mtp-dump") mtp_dump = next();
         else if (a == "--serve") serve = next();
-        else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
-        else if (a == "--top-p-cands") nc = atoi(next().c_str());
         else if (a == "--s2") s2mode = true;
-        else if (a == "--spec-adaptive") adapt = true;
-        else if (a == "--spec-levels") levels_s = next();
-        else if (a == "--spec-accept")
-        {
-            const std::string v = next();
-            if (v == "coupled") plan.rs = false;
-            else if (v == "rejection") plan.rs = true;
-            else die("--spec-accept must be coupled or rejection");
-        }
         else die("unknown argument " + a);
     }
+    // the shared flags, under the names the rest of this file uses
+    const int cap = co.cap, top = co.top, pfrows = co.pfrows, lanes = co.lanes, nc = co.nc, mtp = co.mtp, MP = co.MP;
+    const float temp = co.temp;
+    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2, adapt = co.adapt;
+    const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
+    std::vector<std::string>& prompts = co.prompts;
+    v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
+    v2src.trellis = co.v2_trellis;
+    if (co.n_gen) plan.n_gen = *co.n_gen;          // Plan owns these defaults; apply only what the command line set
+    if (co.seed) plan.seed = *co.seed;
+    if (co.chunk) plan.chunk = *co.chunk;
+    if (co.top_p) plan.top_p = *co.top_p;
+    if (co.rs) plan.rs = *co.rs;
     const bool release = !v2src.dense.empty();
     if (packs.empty() == !release || (release && (v2src.dir.empty() || v2src.slices.empty() || v2src.widths.empty())))
         die("usage: m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
@@ -307,10 +275,9 @@ int main(int argc, char** argv)
 #endif
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
-    if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
-    plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
-    if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1.." + std::to_string(MX));
-    if (mtp < 0 || mtp > std::min<int>(MX - 1, 7)) die("--mtp must be 1..7 drafts");   // the scheduler caps k at 7 whatever MX is
+    if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
+    plan.inv_temp = g6rt::inv_temp(temp);
+    if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);   // the scheduler caps k at 7 whatever MX is
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)

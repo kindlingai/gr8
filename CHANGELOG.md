@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-16: g6m4 and m4sim parse their shared flags in one place
+
+- The real engine and the reference driver take 29 of the same flags, and m4sim's output is the oracle g6m4 is held to,
+  but each main held its own copy of the parse lines: 171 identical lines between them, 103 of them substantial. They
+  now come from `engine/runtime/engine_opts.h`, which is host-only, so `engine_opts_test` checks every shared flag, the
+  bounds both mains checked (`--chunk`, `--mtp`) and the two bad values (`--v2-dense-form`, `--spec-accept`) under g++
+  (`scripts/host_tests.sh`). Nothing about the flags changed: `--layers` still defaults to the same four layers, the
+  flags that land in `Plan` are applied only when the command line names them so `Plan` keeps its own defaults, and the
+  flags each main owns alone are untouched.
+
 ## 2026-10-15: one engine binary for every TP width
 
 - `scripts/build.sh` builds one `g6m4` and one `m4sim` that run TP = 1, 2, 3, 4, 6 and 8 (and with `KV_FORMAT=int4`

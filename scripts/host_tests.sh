@@ -75,6 +75,10 @@ g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/test_context_buckets.cpp" -o "$T/test_context_buckets"
 "$T/test_context_buckets"
 
+# the flags g6m4 and m4sim both take (engine/runtime/engine_opts.h)
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/engine_opts_test.cpp" -o "$T/engine_opts_test"
+"$T/engine_opts_test"
+
 # host memory after load (#4): the /proc parser and malloc_trim (glibc)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$T/host_reclaim_test"
 "$T/host_reclaim_test"

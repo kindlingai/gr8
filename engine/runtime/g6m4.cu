@@ -78,6 +78,7 @@
 #endif
 #include <algorithm>
 #include <chrono>
+#include "engine_opts.h"
 #include "packfind.h"
 #include "weight_check.cuh"
 #include "prefill.cuh"
@@ -119,24 +120,15 @@ int main(int argc, char** argv)
     const int progress_isolate = env_choice("G6_PROGRESS_ISOLATE", 1, 1, &progress_err);
     if (progress_isolate < 0) die(progress_err);
     g6::FabricConfig cfg;
-    std::string manifest, packfile, layers_s = "0,3,40,77";
+    std::string manifest, packfile;
     V2Src v2src;
-    std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
+    g6rt::CommonOpts co;                // every flag m4sim takes too, parsed in engine_opts.h
     std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
     std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
     int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
     int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
-    bool adapt = false;                 // --spec-adaptive
-    std::string levels_s;               // --spec-levels
-    std::vector<std::string> prompts;
     Plan plan;
-    int cap = 64;
-    float temp = 0.f;
-    bool graph = false, image = false, hash = true, reuse_prefix = false;
-    int MP = 0, top = 0;
-    bool wide = false, pfv2 = false;
-    int pfrows = 0, mtp = 0, lanes = 1;
-    int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
+    bool image = false, hash = true, reuse_prefix = false;
     std::string s2dir;                  // --serve DIR: serve through S2 (below R)
     std::vector<std::string> kv_tiers;  // --kv-store (and the deprecated --kv-tier), in flag order
     std::string kv_keep;                // --kv-keep system|sessions|all
@@ -151,6 +143,8 @@ int main(int argc, char** argv)
     {
         const std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) die("missing value for " + a); return std::string(argv[++i]); };
+        std::string oerr;
+        if (g6rt::common_arg(a, next, co, oerr)) { if (!oerr.empty()) die(oerr); continue; }
         if (a == "--rank") cfg.rank = atoi(next().c_str());
         else if (a == "--ips") cfg.ips = split(next(), ',');
         else if (a == "--ips2") cfg.ips2 = split(next(), ',');
@@ -159,34 +153,12 @@ int main(int argc, char** argv)
         else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
         else if (a == "--manifest") manifest = next();
         else if (a == "--pack") packfile = next();
-        else if (a == "--v2") v2src.dir = next();
-        else if (a == "--v2-slices") v2src.slices = next();
-        else if (a == "--v2-widths") v2src.widths = next();
-        else if (a == "--v2-dense") v2src.dense = next();
-        else if (a == "--v2-dense-form")
-        {
-            const std::string f = next();
-            if (f != "trellis" && f != "rounded") die("--v2-dense-form: trellis or rounded");
-            v2src.trellis = f == "trellis";
-        }
-        else if (a == "--qo-manifest") qo_man = next();
-        else if (a == "--qo-pack") qo_file = next();
         else if (a == "--qp-manifest") qp_man = next();
         else if (a == "--qp-pack") qp_file = next();
         else if (a == "--dflash-manifest") dfl_man = next();
         else if (a == "--dflash-pack") dfl_file = next();
         else if (a == "--dflash-sel") dfl_sel = atoi(next().c_str());
         else if (a == "--dflash-k") dfl_k = atoi(next().c_str());
-        else if (a == "--spec-adaptive") adapt = true;
-        else if (a == "--spec-levels") levels_s = next();
-        else if (a == "--layers") layers_s = next();
-        else if (a == "--prompt") prompts.push_back(next());
-        else if (a == "--gen") plan.n_gen = atoi(next().c_str());
-        else if (a == "--temp") temp = (float)atof(next().c_str());
-        else if (a == "--seed") plan.seed = (uint32_t)strtoul(next().c_str(), nullptr, 10);
-        else if (a == "--cap") cap = atoi(next().c_str());
-        else if (a == "--chunk") plan.chunk = atoi(next().c_str());
-        else if (a == "--graph") graph = true;
         else if (a == "--image") image = true;
         else if (a == "--no-hash") hash = false;
         else if (a == "--reuse-prefix") reuse_prefix = true;
@@ -204,23 +176,7 @@ int main(int argc, char** argv)
             kv_tiers.push_back(v);
         }
         else if (a == "--kv-shared-after") { kv_old = true; kv_system_after = atoi(next().c_str()); }
-        else if (a == "--prefill") MP = atoi(next().c_str());
-        else if (a == "--top") top = atoi(next().c_str());
-        else if (a == "--wide") wide = true;
-        else if (a == "--pfv2") pfv2 = true;
-        else if (a == "--pf-rows") pfrows = atoi(next().c_str());
-        else if (a == "--mtp") mtp = atoi(next().c_str());
-        else if (a == "--pf-lanes") lanes = atoi(next().c_str());
         else if (a == "--serve") s2dir = next();
-        else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
-        else if (a == "--top-p-cands") nc = atoi(next().c_str());
-        else if (a == "--spec-accept")
-        {
-            const std::string v = next();
-            if (v == "coupled") plan.rs = false;
-            else if (v == "rejection") plan.rs = true;
-            else die("--spec-accept must be coupled or rejection");
-        }
         else if (a == "--s2-port") s2port = atoi(next().c_str());
         else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
         else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
@@ -232,6 +188,19 @@ int main(int argc, char** argv)
         }
         else die("unknown argument " + a);
     }
+    // the shared flags, under the names the rest of this file uses
+    const int cap = co.cap, top = co.top, pfrows = co.pfrows, lanes = co.lanes, nc = co.nc, mtp = co.mtp, MP = co.MP;
+    const float temp = co.temp;
+    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2, adapt = co.adapt;
+    const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
+    std::vector<std::string>& prompts = co.prompts;
+    v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
+    v2src.trellis = co.v2_trellis;
+    if (co.n_gen) plan.n_gen = *co.n_gen;          // Plan owns these defaults; apply only what the command line set
+    if (co.seed) plan.seed = *co.seed;
+    if (co.chunk) plan.chunk = *co.chunk;
+    if (co.top_p) plan.top_p = *co.top_p;
+    if (co.rs) plan.rs = *co.rs;
     const bool release = !v2src.dense.empty();
     if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || (!release && (manifest.empty() || packfile.empty())))
         die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
@@ -239,10 +208,9 @@ int main(int argc, char** argv)
         die("--v2-dense replaces --manifest / --pack and needs --v2 (the image comes from the release alone)");
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
-    if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
-    plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
-    if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1.." + std::to_string(MX));
-    if (mtp < 0 || mtp > std::min<int>(MX - 1, 7)) die("--mtp must be 1..7 drafts");   // the scheduler caps k at 7 whatever MX is
+    if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
+    plan.inv_temp = g6rt::inv_temp(temp);
+    if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);
     if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
     const bool s2mode = !s2dir.empty();
     const bool dfl = !dfl_man.empty();
