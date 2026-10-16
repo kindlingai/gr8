@@ -12,7 +12,7 @@ the short version.
 |---|---|---|
 | `--rank R` | 0..TP-1 | this process's rank; rank r loads `rank<r>.pack` |
 | `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order (their count is the TP width) |
-| `--proxy-cpu N` | 19 | CPU core for the decode fabric's proxy thread. Every other fabric's proxy has its own core below it: N-1 and N-2 the two prefill lanes, N-3 the CP fabric, N-4 CP staging, N-5 the QP roll, N-6 the MTP draft, N-7 DFlash |
+| `--proxy-cpu N` | 19 | CPU core for the decode fabric's proxy thread. Every other fabric's proxy has its own core below it: N-1 and N-2 the two prefill lanes, N-3 the CP fabric, N-4 CP staging, N-5 the QP roll, N-6 the MTP draft, N-7 DFlash; N-9 the replicated-GEMV gathers when `G6_QA_SPLIT`, `G6_IDXQ_SPLIT` or `G6_MTP_SPLIT` is on (`G6_QA_SPLIT_CPU` moves it) |
 | `--manifest` / `--pack` | `packs/rank<r>.*` | this rank's pack; `--pack -` reads it from stdin |
 | `--v2 DIR` / `--v2-slices DIR` / `--v2-widths FILE` | the release (`V2`, `V2_SLICES`, `--variant`) | the routed and shared experts from the exlr8 width files at the index slices' offsets, at the manifest's widths, in place of the pack's |
 | `--v2-dense DIR` | the release (`V2_DENSE`) | with `--v2`: no `--manifest` / `--pack`. Every other weight comes from the release's `dense/` files, planned at load (`engine/loader-rs/src/release.rs`); rank 0 prints which form each matrix took. Under `G6_PF_OWN=3` the image also holds the full-head q_b / o_proj / UK / UV, so no QO pack |

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-16: the replicated decode GEMVs split across the ranks (G6_QA_SPLIT, G6_IDXQ_SPLIT, G6_MTP_SPLIT, off by default)
+
+- Every rank runs the GEMVs on the layer input in full (q_a, kv_a, the indexer's k and weights; the indexer's wq_b;
+  the MTP draft layer's eh_proj and its own q_a / kv_a / indexer), because their weights are replicated. With the flags
+  on, each rank runs only its own 16-output tiles (`bind::narrow` offsets the record pointer and the output columns; the
+  weights stay replicated) and the columns are all-gathered on a fabric of their own: one collective per layer, port +
+  64 for the main model and port + 72 for the MTP draft, proxy on `--proxy-cpu` - 9.
+- `G6_QA_SPLIT=1` splits q_a, kv_a and the indexer's k and weights and gathers before the q_a norm; `=2` splits q_a only
+  and runs the others in full while the gather is on the wire. `G6_IDXQ_SPLIT=1` splits the indexer's wq_b, publishes
+  it, runs q_b, then gathers. `G6_MTP_SPLIT=1` does both for the MTP draft layer, and its eh_proj.
+- Bit-exact: an output tile's arithmetic does not depend on which tiles a launch covers. Every rank must set the same
+  values: they are in the S2 runtime signature, but the gather fabrics are made at engine start, before the engines
+  compare their settings, so ranks started with different split flags hang at boot instead of failing.
+
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
 - The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for
