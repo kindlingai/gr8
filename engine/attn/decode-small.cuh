@@ -233,13 +233,13 @@ __global__ void __launch_bounds__(128) scores_sc(Input input,int start,const flo
 template<int S,int TR,class Input>
 __global__ void __launch_bounds__(128,4) scores_sc_qt(Input input,int start,const float* q,const float* rope,float* out){
  scores_sc_body<S,TR,true>(input,start,q,rope,out,threadIdx.x);}
-// G6_ATTN_CTX2=3 / 4 / 9 (attn_ctx2): context_parts_heads<HG> with the per-slot work packed and branch-free. Prologue as
+// G6_ATTN_CTX2=3 / 4 (attn_ctx2): context_parts_heads<HG> with the per-slot work packed and branch-free. Prologue as
 // context_parts_heads, but slot j's HG probabilities sit together (pm[j], 16 B smem loads), a slot whose row pointer is null
 // gets p = 0 for every head, and the skip is a select: lo = p != 0 ? fmaf(p, x*s, lo) : lo, which is `if (!rows[j]) continue`
 // + `if (p == 0) continue` (-0 and NaN p included). The gathered pairs of the next PB slots are loaded before the current PB
 // are consumed (two register batches in flight). SP = slots per partition: 256 (P = PART partitions) gives every (row, head,
-// dim) chain the same fmaf operands in the same slot order -> parts bit-identical to context_parts_heads; SP = 64 is the E1
-// form (G6_ATTN_CTX2=9: PART_E1 partitions, merge_parts<P> sums them in order). grid dim3(P*2, heads/HG, n), block 128.
+// dim) chain the same fmaf operands in the same slot order -> parts bit-identical to context_parts_heads.
+// grid dim3(P*2, heads/HG, n), block 128.
 template<int HG,int PB,int SP,class Input>
 __global__ void __launch_bounds__(128) context_pk(Input input,int start,const float* probs,float* parts){
  static_assert(SP%(2*PB)==0&&HG%4==0,"SP multiple of 2*PB, HG multiple of 4");
@@ -341,83 +341,6 @@ __global__ void __launch_bounds__(D/2) context_pk3(Input input,int start,const f
      for(int hh=0;hh<HG;hh++){const float fl=fmaf(p[hh],x.x*sc,lo[hh]),fh=fmaf(p[hh],x.y*sc,hi[hh]);lo[hh]=p[hh]!=0?fl:lo[hh];hi[hh]=p[hh]!=0?fh:hi[hh];}}}};
   load(ra,0);
   for(int b=0;b<nb;b+=2){if(b+1<nb)load(rb,b+1);use(ra,b);if(b+2<nb)load(ra,b+2);if(b+1<nb)use(rb,b+1);}}
- #pragma unroll
- for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
-}
-// G6_ATTN_CTX4=1..3 (attn_ctx4): context_pk3 (D = 256) with each batch's KV bytes gathered into shared memory by cp.async:
-// a ring of NS stages of PB rows x 256 B (the CTA's dims d0 .. d0 + 255 of the row, 16 copies of 16 B per row), filled
-// NS - 1 batches ahead of the batch in use, so (NS - 1) * PB rows are in flight without registers (pk3: one batch of PB in
-// registers). Sequencing: the prologue commits one group per batch 0 .. NS - 2, iteration b commits batch b + NS - 1's group
-// (empty past nb or for a batch with no slot read), waits until at most NS - 1 groups are pending (batch b's has landed),
-// __syncthreads (every thread's copies visible), uses stage b % NS, and __syncthreads again before iteration b + 1 refills
-// that stage (with batch b + NS). nb (the batch count) is CTA-uniform, so every thread meets every barrier. Prologue, states,
-// batch order, skips and use() are context_pk3's, and the pair a thread uses is the same 2 bytes (ring row u byte 2t = KV row
-// byte d0 + 2t, pk3's __ldg), so the parts are bit-identical. Rows of slots not read are copied (row 0, as pk3) or, for a
-// batch with no slot read, not copied; neither is used. grid dim3(PART*2, ceil(heads/HG), n), block 128.
-template<int HG,int PB,int NS,class Input>
-__global__ void __launch_bounds__(128) context_pk4(Input input,int start,const float* probs,float* parts){
- static_assert((PB==16||PB==32)&&(HG==2||HG%4==0)&&NS>=2,"PB 16 / 32, HG 2 or a multiple of 4, NS >= 2");
- auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2,GROUPS=D/128,SP=256,NB=SP/PB;
- const int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x,lane=t&31;FOR_ROW(a,input,r);
- const int nh=min(HG,a.heads-h0);
- __shared__ __align__(16) float pm[SP][HG];__shared__ float scl[GROUPS][SP];__shared__ int kv_row[SP];__shared__ uint8_t state[NB];
- __shared__ __align__(16) uint8_t ring[NS][PB][D];
- for(int j=t;j<SP;j+=THREADS){const int slot=part*SP+j,id=a.indices[(int64_t)r*ga::TOP+slot];   // j - lane: a multiple of 32
-  const bool idok=id>=0&&id<=a.positions[r];   // dead slots read no probabilities
-  float p[HG];bool live=false,full=true;
-  #pragma unroll
-  for(int hh=0;hh<HG;hh++){p[hh]=idok&&hh<nh?probs[((int64_t)row*a.heads+h0+hh)*ga::TOP+slot]:0.f;live|=p[hh]!=0;full&=hh>=nh||p[hh]!=0;}
-  int kr=-1;if(live){const int pg=ga::page(a,id);if(pg>=0)kr=(int)((int64_t)pg*a.page_size+id%a.page_size);}   // kv_at's row (< 2^31: dispatch)
-  const bool rd=kr>=0;full&=rd;
-  #pragma unroll
-  for(int hh=0;hh<HG;hh++)pm[j][hh]=rd?p[hh]:0.f;
-  kv_row[j]=rd?kr:0;
-  #pragma unroll
-  for(int g=0;g<GROUPS;g++)scl[g][j]=rd?((const float*)((const uint8_t*)a.mla_cache+(int64_t)kr*ga::KV_BYTES+512))[d0/128+g]:0.f;
-  const unsigned br=__ballot_sync(0xffffffffu,rd),bf=__ballot_sync(0xffffffffu,full);
-  if(lane==0){
-   #pragma unroll
-   for(int h2=0;h2<32/PB;h2++){const unsigned m=PB==32?0xffffffffu:0xffffu<<(16*h2);state[j/PB+h2]=(bf&m)==m?1:(br&m)?2:0;}}}
- __syncthreads();
- int nb=0;
- #pragma unroll
- for(int b=0;b<NB;b++)if(state[b])nb=b+1;
- float lo[HG],hi[HG];
- #pragma unroll
- for(int hh=0;hh<HG;hh++){lo[hh]=0;hi[hh]=0;}
- const int d=d0+2*t,gs=(2*t)/128;
- if(nb){const uint8_t* kvb=(const uint8_t*)a.mla_cache+d0;const float* sg=scl[gs];
-  auto issue=[&](int b){
-   if(b<nb&&state[b]){uint8_t (*dst)[D]=ring[b%NS];
-    #pragma unroll
-    for(int i=t;i<PB*16;i+=THREADS){const int u=i>>4,c=i&15;
-     const unsigned sa=(unsigned)__cvta_generic_to_shared(&dst[u][c*16]);
-     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"::"r"(sa),"l"(kvb+(int64_t)kv_row[b*PB+u]*ga::KV_BYTES+c*16):"memory");}}
-   asm volatile("cp.async.commit_group;\n"::);};
-  auto probs_of=[&](int j,float (&p)[HG]){
-   if constexpr(HG==2){const float2 q2=*(const float2*)&pm[j][0];p[0]=q2.x;p[1]=q2.y;}
-   else{
-    #pragma unroll
-    for(int i=0;i<HG;i+=4){const float4 q4=*(const float4*)&pm[j][i];p[i]=q4.x;p[i+1]=q4.y;p[i+2]=q4.z;p[i+3]=q4.w;}}};
-  auto use=[&](int b){
-   const int st=state[b];const uint8_t (*src)[D]=ring[b%NS];
-   if(st==1){
-    #pragma unroll
-    for(int u=0;u<PB;u++){const int j=b*PB+u;const float2 x=fp8_pair(*(const uint16_t*)&src[u][2*t]);const float sc=sg[j];float p[HG];probs_of(j,p);
-     #pragma unroll
-     for(int hh=0;hh<HG;hh++){lo[hh]=fmaf(p[hh],x.x*sc,lo[hh]);hi[hh]=fmaf(p[hh],x.y*sc,hi[hh]);}}}
-   else if(st==2){
-    #pragma unroll
-    for(int u=0;u<PB;u++){const int j=b*PB+u;const float2 x=fp8_pair(*(const uint16_t*)&src[u][2*t]);const float sc=sg[j];float p[HG];probs_of(j,p);
-     #pragma unroll
-     for(int hh=0;hh<HG;hh++){const float fl=fmaf(p[hh],x.x*sc,lo[hh]),fh=fmaf(p[hh],x.y*sc,hi[hh]);lo[hh]=p[hh]!=0?fl:lo[hh];hi[hh]=p[hh]!=0?fh:hi[hh];}}}};
-  #pragma unroll
-  for(int b=0;b<NS-1;b++)issue(b);
-  for(int b=0;b<nb;b++){issue(b+NS-1);
-   asm volatile("cp.async.wait_group %0;\n"::"n"(NS-1):"memory");
-   __syncthreads();
-   use(b);
-   __syncthreads();}}
  #pragma unroll
  for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
 }
@@ -582,8 +505,7 @@ static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cuda
   case 1:small_decode::context_parts_heads<HG,32><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
   case 2:small_decode::context_parts_heads<HG,64><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
   case 3:small_decode::context_pk<HG,16,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
-  case 4:small_decode::context_pk<HG,32,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
-  default:small_decode::context_pk<HG,16,TOP/PART_E1><<<dim3(PART_E1*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);break;}
+  case 4:small_decode::context_pk<HG,32,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;}
 }
 // G6_ATTN_CTX3 (attn.cu attn_ctx3): context_pk3 on the context_parts_heads calls; head group G6_ATTN_CTX3_HG, else as there.
 // Only while every KV row index fits in 32 bits (page() bounds a page by the fixed page_count).
@@ -603,24 +525,6 @@ static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cuda
   case 2:launch_ctx3_hg<2>(a,input,w,start,n,st);break;
   case 8:launch_ctx3_hg<8>(a,input,w,start,n,st);break;
   default:launch_ctx3_hg<4>(a,input,w,start,n,st);break;}
-}
-// G6_ATTN_CTX4 (attn.cu attn_ctx4): context_pk4 on the context_parts_heads calls (before G6_ATTN_CTX3); head group as CTX3.
-// Needs 32-bit KV row indices (as CTX3) and 16 B aligned KV rows (cp.async 16 B).
-static bool use_ctx4(const G6Attn& a){return attn_ctx4()&&(int64_t)a.page_count*a.page_size<=INT_MAX&&al16(a.mla_cache)&&ga::KV_BYTES%16==0;}
-template<int HG,class Input>
-static void launch_ctx4_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
- const dim3 g(PART*2,(a.heads+HG-1)/HG,n);
- switch(attn_ctx4()){
-  case 2:small_decode::context_pk4<HG,16,6><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
-  case 3:small_decode::context_pk4<HG,32,4><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
-  default:small_decode::context_pk4<HG,16,4><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;}
-}
-template<class Input>
-static void launch_ctx4(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
- switch(attn_ctx3_hg()?attn_ctx3_hg():n>=5?8:4){
-  case 2:launch_ctx4_hg<2>(a,input,w,start,n,st);break;
-  case 8:launch_ctx4_hg<8>(a,input,w,start,n,st);break;
-  default:launch_ctx4_hg<4>(a,input,w,start,n,st);break;}
 }
 // G6_ATTN_P11 decode tile retune. Host-side, read once (set before graph
 // capture). G6_ATTN_P11=0 -> the old head-batched path (scores_heads<16>, context_parts_heads HG4/HG8 x D256), unchanged.
@@ -713,7 +617,6 @@ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,i
  if(attn_heads()&&attn_p11()){launch_context_tile(a,input,w,start,n,st);return;}
  if(attn_heads()){
   // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
-  if(use_ctx4(a)){launch_ctx4(a,input,w,start,n,st);return;}
   if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st);return;}
   if(attn_ctx2()){if(n>=5)launch_ctx2<8>(a,input,w,start,n,st);else launch_ctx2<4>(a,input,w,start,n,st);return;}
   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
@@ -730,13 +633,4 @@ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,i
 template<class Input>   // tests: the DEC_CPB fixed-K launch regardless of the build flag
 static void launch_context_parts_cpb(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
  small_decode::context_parts_cpb<<<dim3(PART*2,a.heads,n),128,0,st>>>(input,start,w.prob,w.parts);
-}
-// G6_ATTN_CTX2=9 (E1): launch_context_parts took context_pk over PART_E1 partitions exactly when this holds
-static bool ctx_e1(const G6Attn& a,int n){   // attn_ctx2() is 0 under G6_KV4
- return attn_ctx2()==9&&!use_ctx3(a)&&!use_ctx4(a)&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11();
-}
-template<class Input>
-static void launch_merge_parts(const G6Attn& a,Input input,const float* parts,float* out,int n,cudaStream_t st){
- if(ctx_e1(a,n))merge_parts<Input,PART_E1><<<n*a.heads,256,0,st>>>(input,parts,out);
- else merge_parts<<<n*a.heads,256,0,st>>>(input,parts,out);
 }

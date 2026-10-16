@@ -382,7 +382,7 @@ extern "C" int g6_attn_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* st
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile),H=a.heads;
         if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);ga::launch_index_scores(a,a,w,start,n,st);if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);}
         ga::absorb<<<dim3(64,H,n),256,0,st>>>(a,start,w.q,w.rope);gp::trace_copy(tr.q,w.q,start,n,H,512,st);ga::launch_mla_scores(a,a,w,start,n,st);gp::trace_copy(tr.scores,w.prob,start,n,H,ga::TOP,st);
-        ga::normalize<<<n*H,256,0,st>>>(a,w.prob);gp::trace_copy(tr.probs,w.prob,start,n,H,ga::TOP,st);ga::launch_context_parts(a,a,w,start,n,st);ga::launch_merge_parts(a,a,w.parts,w.context,n,st);gp::trace_copy(tr.context,w.context,start,n,H,512,st);ga::value_project<<<dim3(32,H,n),256,0,st>>>(a,start,w.context);
+        ga::normalize<<<n*H,256,0,st>>>(a,w.prob);gp::trace_copy(tr.probs,w.prob,start,n,H,ga::TOP,st);ga::launch_context_parts(a,a,w,start,n,st);ga::merge_parts<<<n*H,256,0,st>>>(a,w.parts,w.context);gp::trace_copy(tr.context,w.context,start,n,H,512,st);ga::value_project<<<dim3(32,H,n),256,0,st>>>(a,start,w.context);
     }return int(cudaGetLastError());
 }
 
