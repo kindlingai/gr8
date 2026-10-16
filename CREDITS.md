@@ -1,6 +1,14 @@
 KindlingAI is:
 
-- @ck2084, [@coffee-the-dev](https://github.com/coffee-the-dev), [@mmastrac](https://github.com/mmastrac)
+- [@adapt-ai-systems](https://github.com/adapt-ai-systems)
+  - Prefill optimization, TP=6 S2 serving and context-budget improvements
+    ([#7](https://github.com/kindlingai/gr8/pull/7), [#9](https://github.com/kindlingai/gr8/pull/9),
+    [#27](https://github.com/kindlingai/gr8/pull/27), [#29](https://github.com/kindlingai/gr8/pull/29)).
+  - Earlier engine, TP=3 conversion and gate foundations preserved in the Git history
+    ([range fetching and manifests](https://github.com/kindlingai/gr8/commit/2d88926cb08bec602ba6382ccf10d90e1a735841),
+    [gate harness](https://github.com/kindlingai/gr8/commit/3d6116f084b86aa96d4be47b253e223ef7a5dcea)).
+- [@coffee-the-dev](https://github.com/coffee-the-dev)
+- [@mmastrac](https://github.com/mmastrac)
 
 The following contributions are greatly appreciated. If your name is missing, please file a PR: we want to ensure your work is recognized!
 
@@ -28,13 +36,6 @@ Thanks to:
     ([#82](https://github.com/kindlingai/gr8/pull/82), [#84](https://github.com/kindlingai/gr8/pull/84),
     [#86](https://github.com/kindlingai/gr8/pull/86), [#87](https://github.com/kindlingai/gr8/pull/87),
     [#90](https://github.com/kindlingai/gr8/pull/90)).
-- [@adapt-ai-systems](https://github.com/adapt-ai-systems)
-  - Prefill optimization, TP=6 S2 serving and context-budget improvements
-    ([#7](https://github.com/kindlingai/gr8/pull/7), [#9](https://github.com/kindlingai/gr8/pull/9),
-    [#27](https://github.com/kindlingai/gr8/pull/27), [#29](https://github.com/kindlingai/gr8/pull/29)).
-  - Earlier engine, TP=3 conversion and gate foundations preserved in the Git history
-    ([range fetching and manifests](https://github.com/kindlingai/gr8/commit/2d88926cb08bec602ba6382ccf10d90e1a735841),
-    [gate harness](https://github.com/kindlingai/gr8/commit/3d6116f084b86aa96d4be47b253e223ef7a5dcea)).
 - [@eqvse](https://github.com/eqvse) and [@cl83](https://github.com/cl83)
   - TP=3/TP=4 ring fabric and relay support ([#4](https://github.com/kindlingai/gr8/pull/4)).
 - [@chuck-ads](https://github.com/chuck-ads)
