@@ -40,6 +40,16 @@
 //        poisoned, and come back. The lines printed must be the run's without it. Past G6_CP_R the reused rows go as the
 //        pool stores a run's tail: each rank's shard of the attention caches, and every logical page's replicated parts
 //   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
+// G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (needs --mtp): the split replicated GEMVs as g6m4 runs them (rank.cuh
+//        QSplit), each model's gathers on a loopback of their own: every rank's attention block (and the draft's eh_proj)
+//        runs in gather phases (rank.cuh QsPh) with the delivery between them. The lines must equal the run without them.
+// G6_ROW_LINES=1: after each target step, one line per row (rank 0; the ranks' residual rows are compared):
+//        "row q<seq> pos <p> M <M> s <step> | in <token fed> tok <sampled> lp <bits> lpt <bits> resid <fnv of the row's
+//        residual> logits <fnv of the row's logits, the ranks' slices in rank order>". The part after "|" must not depend
+//        on the step's row count or on the other rows of the step (scripts/m4sim_split_check.sh compares it).
+// [--minv B] [--minv-rows 1,2,..]: per --prompt, rows 0..B-1 in --chunk steps, then for every row count M of the list
+//        (default 1..MX then MX-1..1, each <= prompt - B) one step over prompt rows B..B+M-1 (teacher-forced) from that same
+//        state, with its row lines. Row B + j must print the same line at every M > j. No --mtp / --s2 / --serve / --prefill.
 #include <algorithm>
 #include <chrono>
 #include "engine_opts.h"
@@ -241,6 +251,8 @@ int main(int argc, char** argv)
     std::string serve;
     std::string mtp_dump;               // --mtp-dump PREFIX: rank 0 draft buffers of seq 0 (tools/m6/check_draft.py)
     bool s2mode = false;                // --s2: the prompts as sessions of one batched decode (DEC_S2)
+    int minv = -1;                      // --minv B: the row-count sweep from prompt row B (header)
+    std::string minv_s;                 // --minv-rows
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -252,6 +264,8 @@ int main(int argc, char** argv)
         else if (a == "--mtp-dump") mtp_dump = next();
         else if (a == "--serve") serve = next();
         else if (a == "--s2") s2mode = true;
+        else if (a == "--minv") minv = atoi(next().c_str());
+        else if (a == "--minv-rows") minv_s = next();
         else die("unknown argument " + a);
     }
     // the shared flags, under the names the rest of this file uses
@@ -278,6 +292,26 @@ int main(int argc, char** argv)
     if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
     plan.inv_temp = g6rt::inv_temp(temp);
     if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);   // the scheduler caps k at 7 whatever MX is
+    // G6_QA_SPLIT / G6_IDXQ_SPLIT / G6_MTP_SPLIT as g6m4 (rank.cuh QSplit); the gathers go over loopbacks here
+    std::string qse;
+    const int qs_mode = env_choice("G6_QA_SPLIT", 2, 0, &qse), iq_split = env_choice("G6_IDXQ_SPLIT", 1, 0, &qse),
+              mtp_split = env_choice("G6_MTP_SPLIT", 1, 0, &qse);
+    if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
+    if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
+    const bool row_lines_on = getenv("G6_ROW_LINES") && atoi(getenv("G6_ROW_LINES")) != 0;
+    std::vector<int> minv_rows;         // --minv: the row counts, in order
+    if (minv >= 0)
+    {
+        if (mtp || s2mode || !serve.empty() || MP) die("--minv: no --mtp, --s2, --serve or --prefill");
+        if (!minv_s.empty()) minv_rows = parse_ints(minv_s);
+        else
+        {
+            for (int M = 1; M <= MX; ++M) minv_rows.push_back(M);
+            for (int M = MX - 1; M >= 1; --M) minv_rows.push_back(M);
+        }
+        for (int M : minv_rows) if (M < 1 || M > MX) die("--minv-rows: each 1.." + std::to_string(MX));
+    }
+    else if (!minv_s.empty()) die("--minv-rows needs --minv");
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
@@ -309,6 +343,9 @@ int main(int argc, char** argv)
         if (MP) { const int pr = pfrows < 0 ? (int)p.prompt.size() + pfrows : pfrows;   // --pf-rows -N: all rows but the last N
                   p.first = pr > 0 && pr < (int)p.prompt.size() - 1 ? pr : (int)p.prompt.size() - 1; }   // --pf-rows: the rest is teacher-forced through decode steps
         for (int M : plan_rows(p))
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+        if (minv >= (int)p.prompt.size()) die("--minv B: B must be below every prompt's length");
+        for (int M : minv_rows)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
         plans.push_back(p);
     }
@@ -470,6 +507,31 @@ int main(int argc, char** argv)
                 n, layers.size(), qp_roll_s ? " (rolling)" : "");
     }
 #endif
+    // G6_QA_SPLIT / G6_IDXQ_SPLIT (main) and G6_MTP_SPLIT (draft): each model's gather fabric as a loopback (k_deliver),
+    // made once its model is built (the plan sizes it): every rank's own send region, one shared recv region
+    struct QsLoop
+    {
+        Loop l{};
+        unsigned long long* bell = nullptr;
+    };
+    QsLoop qsl, qsl_d;
+    auto qs_loop_attach = [&](Model& mm, QsLoop& L, const u64* sp) {
+        if (!mm.qs.on()) return;
+        const int n = mm.qs.ncoll();
+        if (!L.bell)
+        {
+            L.l.stride = (qs_slot_bytes(mm) + 8 + 255) / 256 * 256;
+            L.l.recv = dmalloc<char>(2 * (size_t)n * NR * L.l.stride);
+            L.l.stepp = sp; L.l.ncoll = n;
+            L.bell = dmalloc<unsigned long long>(n);
+        }
+        g6::FabricDev g{};
+        g.send = dmalloc<char>(2 * (size_t)n * L.l.stride);
+        g.recv = L.l.recv; g.doorbell = L.bell; g.error = err;
+        g.rank = mm.rank; g.nr = NR; g.ncoll = n; g.stride = L.l.stride;
+        qs_attach(mm, g, err);
+        L.l.send[mm.rank] = g.send;
+    };
     for (int r = 0; r < NR; ++r)
     {
         if (!pf_qo && !pf_qp) rload(r);
@@ -488,7 +550,9 @@ int main(int argc, char** argv)
         else if (s2mode) R[r].s2_pool_slots = (int)prompts.size();       // the layers' own bindings hold the S2 pool
         if (s2mode && !s2_below && getenv("G6_S2_POOL")) R[r].s2_pool_pages = atoi(getenv("G6_S2_POOL"));   // pool pages (variable runs)
 #endif
+        R[r].qs.mode = qs_mode; R[r].qs.iq = iq_split == 1;
         build(R[r], r, layers, rfind(r), cap, f, stepp, st, pf_attn_rows(MP));
+        qs_loop_attach(R[r], qsl, stepp);
 #if defined(G6_CP) && G6_CP
         if (cp_on)
             for (int c = 0; c < cp_colls.ncoll(); ++c) R[r].cp.vs.push_back(cp_L.vslot(c, r, cp_send[r], cp_recv[r], cp_bell[r], err));
@@ -538,7 +602,9 @@ int main(int argc, char** argv)
             else if (s2mode) DR[r].d.s2_pool_slots = (int)prompts.size();
             if (s2mode && !s2_below && getenv("G6_S2_POOL")) DR[r].d.s2_pool_pages = atoi(getenv("G6_S2_POOL"));
 #endif
+            if (mtp_split) { DR[r].d.qs.mode = 1; DR[r].d.qs.iq = true; DR[r].d.qs.eh = true; }   // as g6m4
             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
+            qs_loop_attach(DR[r].d, qsl_d, stepp_d);
             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
             loop_d.send[r] = fd.send;
             if (MP) DQ[r].P.attn_rows = pf_attn_rows(MP);   // DQ is empty without --prefill (was an out-of-bounds write)
@@ -722,6 +788,24 @@ int main(int argc, char** argv)
         a.c = c; a.n16 = (int)(payload / 16);
         k_deliver<<<NR, 128, 0, st>>>(a);
     };
+    // gather c of model mm's loopback L, M rows (the wire size every sender writes, as k_qs_get waits for it)
+    auto qs_deliver = [&](const QsLoop& L, const Model& mm, int c, int M) {
+        Loop a = L.l;
+        a.c = c; a.n16 = M * mm.qs.geo[c].wmax * 2 / 16;
+        k_deliver<<<NR, 128, 0, st>>>(a);
+    };
+    // layer i's attention block of models ms in gather phases (rank.cuh QsPh), the loopback L between them
+    auto attn_qs = [&](const std::vector<Model*>& ms, const QsLoop& L, int i, int M, int context) {
+        const std::vector<int> gs = ms[0]->qs.layer_gathers(i);
+        for (size_t p = 0; p <= gs.size(); ++p)
+        {
+            for (Model* m : ms) launch_attn_block(*m, i, M, context, st, gs.empty() ? -1 : (int)p);
+            if (p < gs.size()) qs_deliver(L, *ms[0], gs[p], M);
+        }
+    };
+    std::vector<Model*> rptr, dptr;
+    for (Model& m : R) rptr.push_back(&m);
+    for (Draft& D : DR) dptr.push_back(&D.d);
 #if defined(G6_CP) && G6_CP
     auto vdeliver = [&](int c, int M) {
         VLoop a{};
@@ -741,8 +825,15 @@ int main(int argc, char** argv)
     };
     // layer i's attention block on every rank: the CP block in its three phases with the loopback between them
     auto attn_all = [&](int i, int M, int context) {
-        if (!cp_active(R[0], context)) { for (Model& m : R) launch_attn_block(m, i, M, context, st); return; }
-        for (Model& m : R) launch_attn_cp(m, i, M, context, 0, st);
+        if (!cp_active(R[0], context)) { attn_qs(rptr, qsl, i, M, context); return; }
+        {
+            const std::vector<int> gs = R[0].qs.layer_gathers(i);     // phase 0 in gather phases
+            for (size_t p = 0; p <= gs.size(); ++p)
+            {
+                for (Model& m : R) launch_attn_cp(m, i, M, context, 0, st, gs.empty() ? -1 : (int)p);
+                if (p < gs.size()) qs_deliver(qsl, R[0], gs[p], M);
+            }
+        }
         vdeliver(cp_colls.q[i], M);
         if (cp_colls.cand[i] >= 0) vdeliver(cp_colls.cand[i], M);
         for (Model& m : R) launch_attn_cp(m, i, M, context, 1, st);
@@ -750,7 +841,7 @@ int main(int argc, char** argv)
         for (Model& m : R) launch_attn_cp(m, i, M, context, 2, st);
     };
 #else
-    auto attn_all = [&](int i, int M, int context) { for (Model& m : R) launch_attn_block(m, i, M, context, st); };
+    auto attn_all = [&](int i, int M, int context) { attn_qs(rptr, qsl, i, M, context); };
 #endif
     // triage: G6_RESID_DUMP=FILE — rank 0's residual stream after the embedding and after every consume c
     // (slot c + 1: 2i = after layer i's attention, 2i + 1 = after its MLP), per main step: int32 s, M, slots, HID, then
@@ -940,8 +1031,14 @@ int main(int argc, char** argv)
             k_deliver<<<NR, 128, 0, st>>>(a);
         };
         const size_t part = (size_t)M * HID * 2;
-        for (Draft& D : DR) { launch_step_in(D.d, st); launch_draft_embed(D, M, chain, st); }
-        for (Draft& D : DR) launch_attn_block(D.d, 0, M, context, st);
+        const bool eh = DR[0].d.qs.eh;     // G6_MTP_SPLIT: the eh_proj gather between the embed's two phases
+        for (Draft& D : DR) { launch_step_in(D.d, st); launch_draft_embed(D, M, chain, st, eh ? 0 : -1); }
+        if (eh)
+        {
+            qs_deliver(qsl_d, DR[0].d, DR[0].d.qs.ceh, M);
+            for (Draft& D : DR) launch_draft_embed(D, M, chain, st, 1);
+        }
+        attn_qs(dptr, qsl_d, 0, M, context);
         deliver_d(0, part);
         for (Draft& D : DR) launch_consume(D.d, 0, M, D.d.layers[0].mlp_norm, D.d.x2, st);
         for (Draft& D : DR) launch_mlp_block(D.d, 0, M, st);
@@ -1062,6 +1159,37 @@ int main(int argc, char** argv)
         }
         printf("%s\n", line0.c_str());
         return last;
+    };
+    // G6_ROW_LINES (header): the target step's rows, one line each (rank 0); every rank's residual row must be rank 0's
+    auto row_lines = [&](size_t q, int s, const StepIn& si, const StepOut* so) {
+        const int M = si.M;
+        std::vector<std::vector<float>> res(NR), lg(NR);
+        for (int r = 0; r < NR; ++r)
+        {
+            res[r].resize((size_t)M * HID);
+            G6RT_CK(cudaMemcpy(res[r].data(), R[r].resid, res[r].size() * 4, cudaMemcpyDeviceToHost));
+            lg[r].resize((size_t)M * R[r].vn);
+            G6RT_CK(cudaMemcpy(lg[r].data(), R[r].hlog, lg[r].size() * 4, cudaMemcpyDeviceToHost));
+        }
+        for (int j = 0; j < M; ++j)
+        {
+            const uint64_t hr = fnv(0xcbf29ce484222325ull, res[0].data() + (size_t)j * HID, HID * 4);
+            uint64_t hl = 0xcbf29ce484222325ull;
+            for (int r = 0; r < NR; ++r)
+            {
+                hl = fnv(hl, lg[r].data() + (size_t)j * R[r].vn, (size_t)R[r].vn * 4);
+                if (r && fnv(0xcbf29ce484222325ull, res[r].data() + (size_t)j * HID, HID * 4) != hr)
+                {
+                    ++bad;
+                    printf("RANK %d DIFFERS: row q%zu pos %d residual\n", r, q, si.pos[j]);
+                }
+            }
+            uint32_t ul, ut;
+            memcpy(&ul, &so[0].lp[j], 4);
+            memcpy(&ut, &so[0].lpt[j], 4);
+            printf("row q%zu pos %d M %d s %d | in %d tok %d lp %08x lpt %08x resid %016llx logits %016llx\n", q, si.pos[j], M, s,
+                   si.tok[j], so[0].tok[j], ul, ut, (unsigned long long)hr, (unsigned long long)hl);
+        }
     };
     u64 dstep = 0;
     auto dumpf = [&](const char* name, const void* dev, size_t bytes) {
@@ -1365,6 +1493,54 @@ int main(int argc, char** argv)
         return bad ? 1 : 0;
     }
 #endif
+    if (minv >= 0)                      // --minv (header): the row-count sweep, per --prompt
+    {
+        u64 sc = 0;
+        for (size_t q = 0; q < plans.size(); ++q)
+        {
+            const Plan& p = plans[q];
+            const int n = (int)p.prompt.size();
+            for (Model& m : R) reset(m, st);
+            G6RT_CK(cudaStreamSynchronize(st));
+            printf("seq %zu prompt %d tokens, minv from row %d\n", q, n, minv);
+            auto rows = [&](int a, int M) {   // prompt rows a..a+M-1, teacher-forced, as step_inputs makes a prompt step
+                StepIn si;
+                memset(&si, 0, sizeof si);
+                si.step = ++sc; si.M = M;
+                for (int r = 0; r < M; ++r)
+                {
+                    si.tok[r] = p.prompt[a + r];
+                    si.pos[r] = a + r;
+                    si.tgt[r] = a + r + 1 < n ? p.prompt[a + r + 1] : -1;
+                    si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, a + r + 1, 0, p.top_p, 0};
+                }
+                si.context = a + M;
+                return si;
+            };
+            StepOut so[NR];
+            int s = 0;
+            for (int a = 0; a < minv; a += p.chunk, ++s)
+            {
+                const StepIn si = rows(a, std::min(p.chunk, minv - a));
+                run_main(si, so);
+                lines("prefix", false, so, s, si.M);
+                if (row_lines_on) row_lines(q, s, si, so);
+                ++steps;
+            }
+            for (int M : minv_rows)
+            {
+                if (minv + M > n) continue;
+                const StepIn si = rows(minv, M);
+                const double ms = run_main(si, so);
+                lines("minv", false, so, s, M);
+                row_lines(q, s, si, so);
+                fprintf(stderr, "# seq %zu minv step %d M %d: %.3f ms for the ranks in turn\n", q, s, M, ms);
+                ++s; ++steps;
+            }
+        }
+        printf("# m4sim: %d steps, %d rank lines differ from rank 0\n", steps, bad);
+        return bad ? 1 : 0;
+    }
     if (!serve.empty()) serve_ready(serve);
     for (size_t q = 0;; ++q)
     {
@@ -1593,6 +1769,7 @@ int main(int argc, char** argv)
                 ms += run_main(si, so);
                 if (rlf) route_log_line(rlf, R[0], layers, q, s, si.M, si.pos[0], p.prompt.size());
                 lines("step", false, so, s, si.M);
+                if (row_lines_on) row_lines(q, s, si, so);
                 if (top > 0) for (Model& m : R) { std::string tl; top_lines(m, s, si.M, top, tl); fputs(tl.c_str(), stdout); }
                 logit_dump(s, si.M);
                 return so[0];
@@ -1677,6 +1854,7 @@ int main(int argc, char** argv)
                 else if (line != line0) { ++bad; printf("RANK %d DIFFERS: %s\n", m.rank, line.c_str()); }
             }
             printf("%s\n", line0.c_str());
+            if (row_lines_on) row_lines(q, s, si, so);
             if (top > 0) for (Model& m : R) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
             logit_dump(s, M);
             if (s >= PS - 1) gen.push_back(last_tok);

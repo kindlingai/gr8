@@ -13,6 +13,11 @@
 - Bit-exact: an output tile's arithmetic does not depend on which tiles a launch covers. Every rank must set the same
   values: they are in the S2 runtime signature, but the gather fabrics are made at engine start, before the engines
   compare their settings, so ranks started with different split flags hang at boot instead of failing.
+- m4sim reads the three flags too and runs each model's gathers on a loopback, with the attention block (and the
+  draft's eh_proj) launched in gather phases between which it delivers (`QsPh`; phase -1, what g6m4 passes, launches the
+  block in its old order). `scripts/m4sim_split_check.sh` (one GB10 and a model) runs flags off against every
+  combination on the plain, graph, MTP, S2 and CP paths and compares stdout byte for byte. m4sim also gains row lines
+  (`G6_ROW_LINES=1`) and a row-count sweep (`--minv`) as probes.
 
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
