@@ -87,6 +87,7 @@ KEYS = {
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),
     'QP_EARLY': ('cluster', None, 'PF_OWN=4 early counterpart partial'),
+    'ROUTE_OVL': ('cluster', None, 'shared expert on a forked stream during the router (G6_ROUTE_OVL)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

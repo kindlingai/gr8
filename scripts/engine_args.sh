@@ -72,6 +72,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   if [ "$TP" = 4 ] && [ "$PF_OWN" = 4 ]; then
     ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G6_PF_QP_CTX=${QP_CTX:-$CAP} G6_PF_QP_EARLY=${QP_EARLY:-1}"
   fi
+  # the trellis shared expert on a forked stream during the router (ROUTE_OVL; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${ROUTE_OVL:+ G6_ROUTE_OVL=$ROUTE_OVL}"
   return 0
 }
 
