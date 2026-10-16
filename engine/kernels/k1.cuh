@@ -50,21 +50,23 @@ template <bool E4, bool K2, bool BS = false>
 __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit, int e, int mask, u32* smem)
 {
     const long long* tr = A.t_tab + 6 * e;
-    const int mat = (unit / A.KS1) & 1, b = (unit / (A.KS1 * 2)) % A.B;
+    const int s_ks1 = __ffs(A.KS1) - 1;
+    const int u_ks1 = unit >> s_ks1, mat = u_ks1 & 1, u_b = u_ks1 >> 1;
+    const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
     if (b >= static_cast<int>(tr[3])) return;
     size_t off;
     const int k = tr3_unit(A.t_kmix, e, tr, b * 2 + mat, off);
     const uint8_t* mw = A.t_fc1 + off;
-    if (k == 3) tr3_fc1_body<3, E4, BS>(A, plan, unit, tr, mw, mask, smem);
+    if ((!BS || K2) && k == 3) tr3_fc1_body<3, E4, BS>(A, plan, unit, tr, mw, mask, smem);
     else if (!K2 || k == 4) tr3_fc1_body<4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
     else tr3_fc1_body<K2 ? 2 : 4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
 }
 
 // one fc2 unit. Down has one width per expert (tr[4]).
-template <bool E4, bool K2>
+template <bool E4, bool K2, bool BS = false>
 __device__ __forceinline__ void tr3_fc2_any(const K1Args& A, int plan, int unit, const long long* tr, int mask, u32* smem)
 {
-    if (tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, unit, tr, mask, smem);
+    if ((!BS || K2) && tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, unit, tr, mask, smem);
     else if (!K2 || tr[4] == 4) tr3_fc2_body<4, E4>(A, plan, unit, tr, mask, smem);
     else tr3_fc2_body<K2 ? 2 : 4, E4>(A, plan, unit, tr, mask, smem);
 }
@@ -111,11 +113,11 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
     const int plan = A.ctl[0];
-    const int ups = A.B * 2 * A.KS1, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
+    const int ups = g6nr::EB * 2 * A.KS1, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
     if (static_cast<int>(blockIdx.x) < nr)
     {
         int e, mask, ss;
-        const int slot = blockIdx.x / ups;
+        const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
         if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem);
     }
     else if (!SH) k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
@@ -127,12 +129,12 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 reg
 {
     extern __shared__ __align__(16) u32 smem[];
     const int plan = A.ctl[1];
-    const int ups = A.B * A.NS2, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
+    const int ups = g6nr::EB * A.NS2, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
     if (static_cast<int>(blockIdx.x) < nr)
     {
         int e, mask, ss;
-        const int slot = blockIdx.x / ups;
-        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
+        const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
+        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
     }
     else if (!SH) k1_shared_fc2(A, blockIdx.x - nr, smem);
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
@@ -142,7 +144,7 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 reg
 }
 
 template <bool SH = false>
-__global__ void k1_tr3_fin(K1Args A)
+__global__ __launch_bounds__(SH ? 288 : 256, 3) void k1_tr3_fin(K1Args A)
 {
     const int plan = A.ctl[2];
     [[maybe_unused]] const bool corrected = tr3_fin_body<SH>(A, plan);
@@ -211,9 +213,9 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
     const int plan = A.ctl[0];
     // items for the plan's own slots only (A.n_slots is the capacity, M x 8): the slots past them were empty items
     const int nsl = A.n_slots_dev[plan] + k1_nsh<SH>(A);
-    const int u1 = A.B * 2 * A.KS1, n1 = nsl * u1;                     // fc1 units per slot, routed (+ SH shared) fc1 items
+    const int u1 = g6nr::EB * 2 * A.KS1, n1 = nsl * u1;                  // fc1 units per slot, routed (+ SH shared) fc1 items
     const int sh1 = SH ? 0 : (A.s_nch + A.s_cw - 1) / A.s_cw;           // shared fc1 CTAs (s_* records)
-    const int u2 = A.B * A.NS2, n2 = nsl * u2;                          // fc2 units per slot, routed (+ SH shared) fc2 items
+    const int u2 = g6nr::EB * A.NS2, n2 = nsl * u2;                      // fc2 units per slot, routed (+ SH shared) fc2 items
     const int total = n1 + sh1 + n2 + (SH ? 0 : A.s_ns2);
     int* done = A.fctl + 1;
     int* sdone = A.fctl + 1 + SMAX * g6nr::EB;
@@ -226,40 +228,66 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
         if (item >= total) break;
         if (item < n1)
         {
-            const int slot = item / u1, b = (item / (A.KS1 * 2)) % A.B;
+            const int u_b = item >> __ffs(A.KS1);
+            const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (item / u1);
+            const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
             int e, mask, ss = slot;
             if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, item + (ss - slot) * u1, e, mask, smem);
             __threadfence();
             __syncthreads();
-            if (t == 0) atomicAdd(done + ss * A.B + b, 1);
+            if (t == 0) atomicAdd(done + ss * g6nr::EB + b, 1);
         }
-        else if (item < n1 + sh1)
+        else if constexpr (!SH)
         {
-            k1_shared_fc1(A, item - n1, reinterpret_cast<float*>(smem));
-            __threadfence();
-            __syncthreads();
-            if (t == 0) atomicAdd(sdone, 1);
+            if (item < n1 + sh1)
+            {
+                k1_shared_fc1(A, item - n1, reinterpret_cast<float*>(smem));
+                __threadfence();
+                __syncthreads();
+                if (t == 0) atomicAdd(sdone, 1);
+            }
+            else if (item < n1 + sh1 + n2)
+            {
+                const int unit = item - n1 - sh1;
+                const int u_b = unit >> (__ffs(A.NS2) - 1);
+                const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (unit / u2);
+                const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
+                int e, mask, ss;
+                if (k1_slot<SH>(A, plan, slot, e, mask, ss))
+                {
+                    const long long* tr = A.t_tab + 6 * e;
+                    if (b < static_cast<int>(tr[3]))
+                    {
+                        if (t == 0) while (ld_acquire(done + ss * g6nr::EB + b) < 2 * A.KS1) {}
+                        __syncthreads();
+                        tr3_fc2_any<E4, K2, SH>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
+                    }
+                }
+            }
+            else
+            {
+                if (t == 0) while (ld_acquire(sdone) < sh1) {}
+                __syncthreads();
+                k1_shared_fc2(A, item - n1 - sh1 - n2, smem);
+            }
         }
-        else if (item < n1 + sh1 + n2)
+        else
         {
-            const int unit = item - n1 - sh1, slot = unit / u2, b = (unit / A.NS2) % A.B;
+            const int unit = item - n1;
+            const int u_b = unit >> (__ffs(A.NS2) - 1);
+            const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (unit / u2);
+            const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
             int e, mask, ss;
             if (k1_slot<SH>(A, plan, slot, e, mask, ss))
             {
                 const long long* tr = A.t_tab + 6 * e;
                 if (b < static_cast<int>(tr[3]))
                 {
-                    if (t == 0) while (ld_acquire(done + ss * A.B + b) < 2 * A.KS1) {}
+                    if (t == 0) while (ld_acquire(done + ss * g6nr::EB + b) < 2 * A.KS1) {}
                     __syncthreads();
-                    tr3_fc2_any<E4, K2>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
+                    tr3_fc2_any<E4, K2, SH>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
                 }
             }
-        }
-        else
-        {
-            if (t == 0) while (ld_acquire(sdone) < sh1) {}
-            __syncthreads();
-            k1_shared_fc2(A, item - n1 - sh1 - n2, smem);
         }
         __syncthreads();                                                // smem and s_item are reused
     }
@@ -286,8 +314,7 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
     k1_fused_body<E4, K2, SH>(A);
 }
 
-// The same with the trellis shared expert. Under __launch_bounds__(512) alone nvcc gives the no-K2 instantiation 64
-// registers and spills (104 B stores, 132 B loads). The others get 101-128 and no spills. This entry sets the cap.
+// The same with the trellis shared expert. 128 registers (1 CTA/SM of 512 threads) avoids 64-reg load-ahead throttling.
 template <bool E4 = true, bool K2 = false>
 __global__ __maxnreg__(128) void k1_tr3_fused_sh(K1Args A)
 {

@@ -40,7 +40,7 @@ step "Python tests"
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I engine/runtime \
   engine/runtime/tests/steering_profile_check.cpp engine/loader/g6pack.cpp -o "$T/steering_profile_check"
 STEERING_PROFILE_CHECK="$T/steering_profile_check" python3 -m unittest discover -s tools/steering/tests -v
-python3 -m unittest tools.convert.test_v2
+python3 -m unittest tools.convert.test_v2 tools.convert.test_flash_v2
 python3 -m unittest tools.convert.test_slim
 python3 -m unittest discover -s tools/health
 python3 -m unittest discover -s bench/gate/tests

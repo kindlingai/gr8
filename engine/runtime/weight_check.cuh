@@ -41,9 +41,23 @@ __host__ __device__ inline uint64_t term(uint64_t w, uint64_t i) { return mix(w 
 // The sum of image bytes off .. off + n held at p.
 inline uint64_t host_sum(const uint8_t* p, uint64_t off, uint64_t n)
 {
-    uint64_t s = 0, i0 = off / 8;
+    uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, i0 = off / 8;
     const uint64_t nw = n / 8;
-    for (uint64_t k = 0; k < nw; ++k)
+    uint64_t k = 0;
+    for (; k + 4 <= nw; k += 4)
+    {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p + 8 * k, 8);
+        memcpy(&w1, p + 8 * (k + 1), 8);
+        memcpy(&w2, p + 8 * (k + 2), 8);
+        memcpy(&w3, p + 8 * (k + 3), 8);
+        s0 += term(w0, i0 + k);
+        s1 += term(w1, i0 + k + 1);
+        s2 += term(w2, i0 + k + 2);
+        s3 += term(w3, i0 + k + 3);
+    }
+    uint64_t s = (s0 + s1) + (s2 + s3);
+    for (; k < nw; ++k)
     {
         uint64_t w;
         memcpy(&w, p + 8 * k, 8);

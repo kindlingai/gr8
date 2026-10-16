@@ -59,9 +59,19 @@ GATE_UP_ORDER = 'grouped'
 DOWN_ORDER = 'item128'
 
 
-def half_bytes(k):
+def geometry(meta):
+    """Legacy GLM defaults; Flash indexes carry explicit geometry."""
+    h = int(meta.get('hidden_size', H))
+    e = int(meta.get('n_routed_experts', N_EXP))
+    i = int(meta.get('moe_intermediate_size', I))
+    if h not in (6144, 4096) or not 0 < e <= 288 or i != 2048:
+        raise ValueError(f'unsupported expert geometry H{h} E{e} I{i}')
+    return h, e
+
+
+def half_bytes(k, hidden=H):
     """B: bytes of one 128-channel half of one projection at width k: 384 x 8 tiles of 32k bytes."""
-    return KSH * 8 * 32 * k
+    return (hidden // 16) * 8 * 32 * k
 
 
 def owner(e, h, l, n):
@@ -89,16 +99,16 @@ def half_digest(trellis, chan, block):
     return xxh64(trellis, chan, block)
 
 
-def down_to_g6(half, k):
+def down_to_g6(half, k, hidden=H):
     """down half in item128 order [col16 / 8][k16][col16 % 8][tile] -> gr8 fc2 order [col16][k16][tile]."""
     tb = 32 * k
-    return np.ascontiguousarray(half.reshape(48, 8, 8, tb).transpose(0, 2, 1, 3).reshape(KSH, 8, tb))
+    return np.ascontiguousarray(half.reshape(hidden // 128, 8, 8, tb).transpose(0, 2, 1, 3).reshape(hidden // 16, 8, tb))
 
 
-def down_from_g6(rec, k):
+def down_from_g6(rec, k, hidden=H):
     """Inverse of down_to_g6 (tests)."""
     tb = 32 * k
-    return np.ascontiguousarray(rec.reshape(48, 8, 8, tb).transpose(0, 2, 1, 3).reshape(-1))
+    return np.ascontiguousarray(rec.reshape(hidden // 128, 8, 8, tb).transpose(0, 2, 1, 3).reshape(-1))
 
 
 # ---------------------------------------------------------------------------------------------- reading
@@ -110,12 +120,14 @@ class V2Layer:
         self.files, self.cache = {}, {}
         self.idx = ST(os.path.join(d, INDEX_FILE.format(l=l)))
         m = self.idx.meta
+        self.hidden_size, self.n_experts = geometry(m)
+        self.shared = int(m.get("n_routed_experts", SHARED))
         if m.get('format') != 'exlr8-v2' or m.get('contents', 'index') != 'index':
             raise ValueError(f'L{l}: index file format {m.get("format")!r} / {m.get("contents")!r}')
         if m.get('gate_up_order', GATE_UP_ORDER) != GATE_UP_ORDER or m.get('down_order', DOWN_ORDER) != DOWN_ORDER:
             raise ValueError(f'L{l}: tile orders {m.get("gate_up_order")}/{m.get("down_order")}, want '
                              f'{GATE_UP_ORDER}/{DOWN_ORDER}')
-        self.experts = parse_experts(m.get('experts', f'0-{N_EXP - 1}'))      # routed experts the files hold
+        self.experts = parse_experts(m.get('experts', f'0-{self.n_experts - 1}'))      # routed experts the files hold
         self.row = {e: i for i, e in enumerate(self.experts)}                 # their rows in the routed index tensors
         self.widths = [k for k in WIDTHS if f'k{k}.index' in self.idx]
         self.shared_widths = [k for k in WIDTHS if f'shared.k{k}.index' in self.idx]
@@ -146,7 +158,7 @@ class V2Layer:
 
     def _t(self, e, k, what):
         """Row of expert e (256 = shared, row 0 of its E = 1 tensors) of width k's index tensor `what`."""
-        if e == SHARED:
+        if e == self.shared:
             if k not in self.shared_widths:
                 raise FileNotFoundError(f'L{self.l}: no shared expert at k{k}')
             return self._get(f'shared.k{k}.{what}')[0]
@@ -161,7 +173,7 @@ class V2Layer:
         gate / up input = signs.in x su_block, down output = signs.out x sv_block (SPEC.md 5.2)."""
         sc = self._t(e, k, BLOCK[p])
         sign = self._get(SIGNS[p])
-        if sc.shape != (H // 128,) or sc.dtype != np.float16 or sign.shape != (H,):
+        if sc.shape != (self.hidden_size // 128,) or sc.dtype != np.float16 or sign.shape != (self.hidden_size,):
             raise ValueError(f'L{self.l} k{k} {p}: block scales {sc.shape} {sc.dtype} / signs {sign.shape}')
         if not np.isin(sign, (-1, 1)).all():
             raise ValueError(f'L{self.l}: {SIGNS[p]} holds values other than +1 and -1')
@@ -177,8 +189,8 @@ class V2Layer:
     def loc(self, e, p, h, k):
         """(path, absolute file offset, length) of half h of projection p of expert e at width k."""
         off, n = (int(x) for x in self._t(e, k, 'index')[PROJ.index(p), h])
-        if n != half_bytes(k):
-            raise ValueError(f'L{self.l} k{k} expert {e} {p} half {h}: length {n}, want {half_bytes(k)}')
+        if n != half_bytes(k, self.hidden_size):
+            raise ValueError(f'L{self.l} k{k} expert {e} {p} half {h}: length {n}, want {half_bytes(k, self.hidden_size)}')
         return self.file(k).path, off, n
 
     def half(self, e, p, h, k):
@@ -200,7 +212,9 @@ class Widths:
     sgate[h], sup[h], sdown (sdown = 0: the shared expert is not taken from the v2 files)."""
 
     def __init__(self, down, gate, up, shared=0, name=''):
-        self.down = np.asarray(down, np.int64).reshape(N_EXP)
+        self.down = np.asarray(down, np.int64).reshape(-1)
+        self.n_experts = len(self.down)
+        N_EXP = self.n_experts
         self.gate = np.broadcast_to(np.asarray(gate, np.int64).reshape(N_EXP, -1), (N_EXP, NH)).copy()
         self.up = np.broadcast_to(np.asarray(up, np.int64).reshape(N_EXP, -1), (N_EXP, NH)).copy()
         if isinstance(shared, dict):
@@ -215,8 +229,8 @@ class Widths:
         for a in (self.down, self.gate, self.up):
             if not np.isin(a, WIDTHS).all():
                 raise ValueError(f'widths {name}: values outside {WIDTHS}')
-        if self.sdown and not (np.isin(self.sgate, (3, 4)).all() and np.isin(self.sup, (3, 4)).all() and self.sdown in (3, 4)):
-            raise ValueError(f'widths {name}: the shared expert is stored at K3 and K4 only')
+        if self.sdown and not (np.isin(self.sgate, WIDTHS).all() and np.isin(self.sup, WIDTHS).all() and self.sdown in WIDTHS):
+            raise ValueError(f'widths {name}: shared expert width must be K2, K3 or K4')
 
     @property
     def shared(self):
@@ -224,18 +238,19 @@ class Widths:
 
     def of(self, e):
         """(gate[16], up[16], down) of expert e (256 = shared)."""
-        if e == SHARED:
+        if e == (288 if self.n_experts == 288 else SHARED):
             return list(self.sgate), list(self.sup), self.sdown
         return list(self.gate[e]), list(self.up[e]), int(self.down[e])
 
 
-def load_widths(spec, l, v1_bits=None, shared=None):
+def load_widths(spec, l, v1_bits=None, shared=None, n_experts=None):
     """spec: a manifest file (SPEC.md 6.5: {"format": "exlr8-v2-manifest", "name", "layers": {"40": {"gate": [256][16],
     "up": [256][16], "down": [256], "shared": {"gate": [16], "up": [16], "down": K}}}}); home / down1 / up1 rebuilt
     from the v1 per-expert bits (home = those bits, down1 = one less, up1 = all K4; shared K4 / K3 / K4 as the shipped
     manifests); or k2 / k3 / k4 (every routed unit at that width, shared at K3 for k2 and k3, K4 for k4; tests).
     shared overrides the shared expert's width (0 = do not take it from the v2 files).
     Returns (Widths, provenance string for the pack manifest)."""
+    N_EXP = n_experts if n_experts is not None else globals()["N_EXP"]
     if spec in ('k2', 'k3', 'k4'):
         k = int(spec[1])
         return Widths([k] * N_EXP, [k] * N_EXP, [k] * N_EXP, max(k, 3) if shared is None else shared, spec), spec
@@ -279,6 +294,9 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
     shared: also store the shared expert as trellis row 256 when widths.shared and the files have it.
     routed: the routed experts to take (tests on a partial layer); the others get empty table rows (no blocks), which
     the kernels skip. Default: all 256, which the files must hold."""
+    H, N_EXP, SHARED = v2.hidden_size, v2.n_experts, v2.shared
+    if widths.n_experts != N_EXP:
+        raise ValueError('manifest/index expert count mismatch')
     P = P or f'L{l:03d}'
     xf = dict(info or {})
     routed = set(range(N_EXP) if routed is None else routed)
@@ -303,13 +321,13 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
     v2v = {r: np.empty((nblk[r], 3, 128), np.float16) for r in writers}
     v3 = {r: np.empty((nblk[r], NB if bs else H), np.float16) for r in writers}
     hid = (lambda e, p, k: v2.hidden(e, p, k)[1]) if bs else (lambda e, p, k: v2.hidden(e, p, k)[0])
-    fc1_bytes = {r: sum(half_bytes(W[e][0][h]) + half_bytes(W[e][1][h]) for e in experts for h in own[r][e]) for r in writers}
-    fc2_bytes = {r: sum(half_bytes(W[e][2]) * len(own[r][e]) for e in experts) for r in writers}
+    fc1_bytes = {r: sum(half_bytes(W[e][0][h], H) + half_bytes(W[e][1][h], H) for e in experts for h in own[r][e]) for r in writers}
+    fc2_bytes = {r: sum(half_bytes(W[e][2], H) * len(own[r][e]) for e in experts) for r in writers}
 
     # pass 1: fc1 (gate and up halves, whose grouped order is gr8's fc1 block order), v1, v2[0:2]
     for r, w in writers.items():
         w.begin(f'{P}.tr3.fc1', 'u8', (fc1_bytes[r],),
-                layout='tr3_fc1 per expert per block [2][384][8][TB], TB = 32 * width of (block, matrix) (tr3.kmix)', **xf)
+                layout=f'tr3_fc1 per expert per block [2][{H // 16}][8][TB], TB = 32 * width of (block, matrix) (tr3.kmix)', **xf)
     off = {r: 0 for r in writers}
     row = {r: 0 for r in writers}
     for i, e in enumerate(experts):
@@ -327,14 +345,14 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
                 v1[r][row[r], 1] = hid(e, 'up', uw[h])
                 v2v[r][row[r], 0] = v2.inter(e, 'gate', gw[h])[h * 128:(h + 1) * 128]
                 v2v[r][row[r], 1] = v2.inter(e, 'up', uw[h])[h * 128:(h + 1) * 128]
-                off[r] += half_bytes(gw[h]) + half_bytes(uw[h])
+                off[r] += half_bytes(gw[h], H) + half_bytes(uw[h], H)
                 row[r] += 1
     for w in writers.values():
         w.end()
 
     # pass 2: fc2 (down halves, item128 -> [col16][k16]), v2[2], v3
     for r, w in writers.items():
-        w.begin(f'{P}.tr3.fc2', 'u8', (fc2_bytes[r],), layout='tr3_fc2 per expert per block [384][8][TB]', **xf)
+        w.begin(f'{P}.tr3.fc2', 'u8', (fc2_bytes[r],), layout=f'tr3_fc2 per expert per block [{H // 16}][8][TB]', **xf)
     off = {r: 0 for r in writers}
     row = {r: 0 for r in writers}
     for i, e in enumerate(experts):
@@ -346,24 +364,24 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
         for r, w in writers.items():
             table[r][i][1] = off[r]
             for h in own[r][e]:
-                w.write(down_to_g6(dn[h], dk))
+                w.write(down_to_g6(dn[h], dk, H))
                 v2v[r][row[r], 2] = sud[h * 128:(h + 1) * 128]
                 v3[r][row[r]] = svd
-                off[r] += half_bytes(dk)
+                off[r] += half_bytes(dk, H)
                 row[r] += 1
     for r, w in writers.items():
         w.end()
         if bs:
             sg = np.stack([v2._get('signs.in'), v2._get('signs.out')]).astype(np.float16)
-            w.put(f'{P}.tr3.sg', sg, 'f16', layout='[2][6144] signs.in, signs.out (+-1)', **xf)
-            w.put(f'{P}.tr3.v1b', v1[r], 'f16', layout='[blk][2][48] su_block gate, up (encode of the half)', **xf)
+            w.put(f'{P}.tr3.sg', sg, 'f16', layout=f'[2][{H}] signs.in, signs.out (+-1)', **xf)
+            w.put(f'{P}.tr3.v1b', v1[r], 'f16', layout=f'[blk][2][{NB}] su_block gate, up (encode of the half)', **xf)
         else:
-            w.put(f'{P}.tr3.v1', v1[r], 'f16', layout='[blk][2][6144] suh gate, suh up (encode of the half)', **xf)
+            w.put(f'{P}.tr3.v1', v1[r], 'f16', layout=f'[blk][2][{H}] suh gate, suh up (encode of the half)', **xf)
         w.put(f'{P}.tr3.v2', v2v[r], 'f16', layout='[blk][3][128] svh gate, svh up, suh down (half slice)', **xf)
         if bs:
-            w.put(f'{P}.tr3.v3b', v3[r], 'f16', layout='[blk][48] sv_block down (expert)', **xf)
+            w.put(f'{P}.tr3.v3b', v3[r], 'f16', layout=f'[blk][{NB}] sv_block down (expert)', **xf)
         else:
-            w.put(f'{P}.tr3.v3', v3[r], 'f16', layout='[blk][6144] svh down (expert)', **xf)
+            w.put(f'{P}.tr3.v3', v3[r], 'f16', layout=f'[blk][{H}] svh down (expert)', **xf)
         w.put(f'{P}.tr3.table', table[r], 'i64',
               layout=f'[{E}][6] fc1_byte_off, fc2_byte_off, first_blk_row, n_blocks, bits (down), first half', **xf)
         w.put(f'{P}.tr3.kmix', kmix[r], 'i64', layout=f'[{E}] fc1 width per (block b, matrix m) at bit 8b + 4m; 0 = all bits', **xf)
@@ -382,7 +400,7 @@ def check_layer(v2):
     for k in v2.shared_widths:
         for p in PROJ:
             for h in range(NH):
-                v2.half(SHARED, p, h, k)
+                v2.half(v2.shared, p, h, k)
                 n += 1
     return dict(layer=v2.l, widths=v2.widths, shared_widths=v2.shared_widths, experts=len(v2.experts), halves_verified=n)
 
@@ -416,13 +434,13 @@ def main(argv=None):
         s = ST(os.path.join(a.v1, f'model-layer-{a.layer:03d}.safetensors'))
         bits = v1_bits_of(s, a.layer)
         s.close()
-    wd, prov = load_widths(a.widths, a.layer, bits, a.shared_width if a.shared == 'trellis' else 0)
+    v2 = V2Layer(a.v2, a.layer)
+    wd, prov = load_widths(a.widths, a.layer, bits, a.shared_width if a.shared == 'trellis' else 0, v2.n_experts)
     ranks = list(range(a.nr)) if a.ranks == 'all' else [int(x) for x in a.ranks.split(',')]
     os.makedirs(a.out, exist_ok=True)
     meta = dict(converter='g6convert-v2experts', layers=[a.layer], nr=a.nr, v2_widths=prov,
                 expert_formats={str(a.layer): 'exlr8-e4m3'})
     writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, False, meta) for r in ranks}
-    v2 = V2Layer(a.v2, a.layer)
     routed = None if a.routed == 'all' else v2.experts if a.routed == 'files' else parse_experts(a.routed)
     ex = convert_experts_v2(a.layer, v2, wd, writers, a.nr, info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'),
                             shared=a.shared == 'trellis', routed=routed)

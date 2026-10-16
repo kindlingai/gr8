@@ -4,13 +4,12 @@
 //! inputs src/v2plan.rs builds the rank's image from.
 
 use crate::json::{self, Json};
-use crate::v2plan::{widths, Slice, HALF_PER_BIT};
+use crate::v2plan::{widths, Slice};
 use crate::xxh64::Xxh64;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-const SHARED: usize = 256;
 
 /// One half of one projection (0 gate, 1 up, 2 down) at width k, as its width file holds it.
 pub struct Unit {
@@ -52,6 +51,7 @@ struct Rows {
     checksum: Vec<u64>,
     chan: Vec<u8>,
     block: Vec<u8>,
+    blocks: usize,
 }
 
 fn rows(s: &Slice, l: usize) -> Result<Option<Rows>, String> {
@@ -69,6 +69,7 @@ fn rows(s: &Slice, l: usize) -> Result<Option<Rows>, String> {
         checksum: u64s(s.get(&format!("{p}checksum"))?.0),
         chan: s.get(&format!("{p}chan"))?.0,
         block: s.get(&format!("{p}block"))?.0,
+        blocks: s.get(&format!("{p}block"))?.1.get(2).copied().ok_or("bad block shape")?,
     }))
 }
 
@@ -76,8 +77,8 @@ fn unit(r: &Rows, l: usize, k: u8, e: usize, h: usize, p: usize) -> Option<Unit>
     let j = *r.row.get(&(e, h))?;
     let i = j * 3 + p;
     let mut side = r.chan[i * 256..(i + 1) * 256].to_vec();
-    side.extend_from_slice(&r.block[(e * 3 + p) * 96..(e * 3 + p + 1) * 96]);
-    Some(Unit { layer: l, k, expert: e, half: h, proj: p, offset: r.offset[i], nbytes: HALF_PER_BIT * k as u64,
+    side.extend_from_slice(&r.block[(e * 3 + p) * r.blocks * 2..(e * 3 + p + 1) * r.blocks * 2]);
+    Some(Unit { layer: l, k, expert: e, half: h, proj: p, offset: r.offset[i], nbytes: r.blocks as u64 * 2048 * k as u64,
                 checksum: r.checksum[i], side })
 }
 
@@ -134,10 +135,10 @@ pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: 
                 let w = widths(m, l)?.ok_or(format!("layer {l}: the manifest has no widths for it"))?;
                 let owned: BTreeSet<(usize, usize)> = at.values().flat_map(|r| r.row.keys().copied()).collect();
                 for &(e, h) in &owned {
-                    if e == SHARED && w.sdown == 0 {
+                    if e == w.down.len() && w.sdown == 0 {
                         continue; // the manifest leaves the shared expert to the base pack
                     }
-                    let ks = if e == SHARED {
+                    let ks = if e == w.down.len() {
                         [w.sgate[h], w.sup[h], w.sdown]
                     } else {
                         [w.gate.get(e).ok_or(format!("layer {l}: no widths for expert {e}"))?[h], w.up[e][h], w.down[e]]

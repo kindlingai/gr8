@@ -15,6 +15,9 @@ struct G6AttnPack {
     G6AttnTensor kv_norm;     // Lnnn.kv_a_norm [512]
     G6AttnTensor index_norm;  // Lnnn.idx.k_norm.w [128], only full-index layers
     G6AttnTensor index_bias;  // Lnnn.idx.k_norm.b [128], only full-index layers
+#if G6_MODEL_FLASH
+    G6AttnTensor index_ape;   // Lnnn.self_attn.indexer.index_kpool_compress_ape [4,128]; uk is [H,256,512], not transposed
+#endif
 };
 struct G6AttnStep {
     int rows, context;        // current logical context, NOT allocated capacity
@@ -23,6 +26,9 @@ struct G6AttnStep {
     const int *positions;    // device int32 [rows], absolute positions
     const int *reuse_indices, *reuse_row_map; // device [reuse_rows,2048], [rows]
     int reuse_rows;
+#if G6_MODEL_FLASH
+    const void* index_gate;   // FP16 [rows,128] x @ index_kpool_compress_gate^T, full-index steps only
+#endif
 #ifdef DEC_S2
     int s2_batched;           // the step is replayed with a batched cell (G6AttnStepCell::rows): rows of several sessions
 #endif

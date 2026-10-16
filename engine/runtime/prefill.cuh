@@ -645,6 +645,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.back().fc1_wide = y.T.fc1_wide;      // decode widened tr3.fc1 in place: prefill must read the same order
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
         P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths)
+        P.T.back().k3 = y.T.k3;                  // 3-bit units (scan_widths)
         P.T.back().sh_trellis = y.T.sh_trellis;  // the shared expert as trellis row 256
         if (y.T.shfp8.codes[0])                  // ... and its FP8 copy for the prefill GEMMs (bind::make_shared_fp8)
         {
@@ -1673,9 +1674,9 @@ inline void build_draft_prefill(DraftPrefill& Q, Draft& D, const Find& find, int
     Q.eh_in = dmalloc<__half>(n * 2 * HID);
     Q.eh_out = dmalloc<__half>(n * HID);
     Q.x8 = dmalloc<uint8_t>((n + 15) / 16 * (2 * HID / 32) * bindp::REC);
-    Q.codes = as_bind(find("L078.eh.mx.codes"));
-    Q.scales = as_bind(find("L078.eh.mx.scales"));
-    if (!Q.codes.p || !Q.scales.p) die("pack has no L078.eh.mx.codes / .scales (MTP prefill)");
+    Q.codes = as_bind(find(G6_MTP_L ".eh.mx.codes"));
+    Q.scales = as_bind(find(G6_MTP_L ".eh.mx.scales"));
+    if (!Q.codes.p || !Q.scales.p) die("pack has no " G6_MTP_L ".eh.mx.codes / .scales (MTP prefill)");
 }
 // host -> device: the rows' NEXT tokens and positions (the stream must be idle)
 inline void pf_draft_inputs(DraftPrefill& Q, int M, const int* next_tok, const int* pos) { pf_inputs(Q.P, M, next_tok, pos); }
@@ -1720,7 +1721,7 @@ inline void pf_draft(Draft& D, DraftPrefill& Q, const __half* hid, int M, int co
     if (!g.on)
     {
         if (const char* e = bindp::make_gemm(Q.codes, Q.scales, M, Q.x8, Q.eh_out, 0, g)) die(std::string("MTP prefill eh_proj: ") + e);
-        if (g.K != 2 * HID || g.N != HID) die("L078.eh.mx.codes is not [6144][12288]");
+        if (g.K != 2 * HID || g.N != HID) die(G6_MTP_L ".eh.mx.codes is not [HID][2 * HID]");
     }
     k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{P.tok, P.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, Q.eh_in});
     bindp::Xq xq;
@@ -1781,6 +1782,8 @@ inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
 constexpr int CP_KVB = g6kv::ROW;     // attn.cu KV_BYTES: one latent record (kvfmt.h)
 constexpr int CP_IXB = g6kv::IDX_ROW; // attn.cu IDX_BYTES: one index key; a page is 64 x 128 codes, then 64 FP32 scales
 constexpr int CP_PF_MAXNR = 8;
+// Keep the GLM launch unchanged; the BF16 Flash record needs 64 + 9 lanes.
+constexpr int CP_BACK_THREADS = CP_KVB / 16 + 9 <= 64 ? 64 : 128;
 // np: each rank's physical pages; a table entry at or past it is a page the rows tier released (rt_rows.cuh rt_pf_stage
 // fills it)
 struct CpPfSrc { const char* kv[CP_PF_MAXNR]; const int* table[CP_PF_MAXNR]; const char* ix[CP_PF_MAXNR]; int np[CP_PF_MAXNR]; };
@@ -1807,7 +1810,7 @@ __global__ void __launch_bounds__(256) k_cp_pf_gather(CpPfSrc s, char* dst, int 
 }
 // grid n, block 64: row pos = a0 + blockIdx.x of the pool -> this rank's store, if it stores that page; ixoff != 0: the
 // row's index key too (128 B of codes, then its FP32 scale in the page's scale block) -> ix
-__global__ void __launch_bounds__(64) k_cp_pf_back(const char* pool, char* kv, const int* table, int a0, int ps, char* ix, size_t ixoff)
+__global__ void __launch_bounds__(CP_BACK_THREADS) k_cp_pf_back(const char* pool, char* kv, const int* table, int a0, int ps, char* ix, size_t ixoff)
 {
     const int pos = a0 + blockIdx.x, pg = table[pos / ps];
     if (pg == G6_CP_REMOTE) return;
@@ -1821,7 +1824,7 @@ __global__ void __launch_bounds__(64) k_cp_pf_back(const char* pool, char* kv, c
     if (t >= 0 && t < 8) reinterpret_cast<uint4*>(dp + off * 128)[t] = reinterpret_cast<const uint4*>(sp + off * 128)[t];
     if (t == 8) reinterpret_cast<float*>(dp + ps * 128)[off] = reinterpret_cast<const float*>(sp + ps * 128)[off];
 }
-static_assert(CP_KVB / 16 + 9 <= 64, "k_cp_pf_back: one thread per 16 B of a row and its index key");
+static_assert(CP_KVB / 16 + 9 <= CP_BACK_THREADS, "k_cp_pf_back: one thread per 16 B of a row and its index key");
 inline size_t cp_pf_mla_bytes(const Model& m)
 {
     const G6Attn& a = m.layers[0].ab.args;
@@ -1920,7 +1923,7 @@ inline void cp_pf_gather(Model& m, const CpPfSrc& s, int i, int start, cudaStrea
 inline void cp_pf_back(Model& m, int i, int a0, int n, cudaStream_t st)
 {
     const G6Attn& a = m.cp.pf_saved[i];
-    if (n > 0) k_cp_pf_back<<<n, 64, 0, st>>>(m.cp.pf_pool[cp_pf_k(m, i)], (char*)a.mla_cache, a.block_table, a0, a.page_size, (char*)a.index_cache, cp_pf_ixoff(m, i));
+    if (n > 0) k_cp_pf_back<<<n, CP_BACK_THREADS, 0, st>>>(m.cp.pf_pool[cp_pf_k(m, i)], (char*)a.mla_cache, a.block_table, a0, a.page_size, (char*)a.index_cache, cp_pf_ixoff(m, i));
 }
 // ---- real fabric (g6m4): the pools are the registered area of a bulk-mode Fabric, identical layout on
 // every rank. Use g of pool k = g % 2: begin(g) = local fill of the pages I hold (lp < R/64 or my pages) + doorbell k;

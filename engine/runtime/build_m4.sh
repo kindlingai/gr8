@@ -8,6 +8,7 @@
 #      G6_DFL_BODY_I4 replay of a G6_DFL_DUMP)
 # rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution.
 # tests, dfl and rs build the one width EXTRA names (EXTRA="-DG6_NR=4 -DDEC_S2"; default 6).
+# EXTRA=-DG6_MODEL_FLASH=1: the GLM 5.3 Flash geometry (engine/model_geom.h); scripts/build.sh MODEL=flash names the results *_flash.
 set -e
 cd "$(dirname "$0")"
 export PATH=/usr/local/cuda/bin:$PATH
@@ -19,9 +20,12 @@ CPU=""
 OUT=${OUT:-../../bin}
 O=$OUT/obj                 # one object dir per variant (OUT): concurrent flag / NR builds never share objects
 mkdir -p $OUT $O
+# the attention TU and its binder: attn.cu + bind.cu (GLM), flash_attn.cu + flash_bind.cu (Flash: NoPE MLA + kpool indexer)
+ATTN_CU=../attn/attn.cu; ATTN_BIND_CU=../attn/bind.cu
+case " $EXTRA " in *" -DG6_MODEL_FLASH=1 "*) ATTN_CU=../attn/flash_attn.cu; ATTN_BIND_CU=../attn/flash_bind.cu ;; esac
 if [ "$WHAT" = tests ]; then
   nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/row_budget_test tests/row_budget_test.cu
-  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/s2_attn_test tests/s2_attn_test.cu ../attn/attn.cu ../attn/bind.cu -lcublas
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/s2_attn_test tests/s2_attn_test.cu $ATTN_CU $ATTN_BIND_CU -lcublas
   ls -la $OUT/row_budget_test $OUT/s2_attn_test
   exit 0
 fi
@@ -33,8 +37,8 @@ fi
 nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack.o
 nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
 if [ "$WHAT" = dfl ]; then
-  nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/attn.cu -o $O/attn.o
-  nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/bind.cu -o $O/attn_bind.o
+  nice -n 19 nvcc -O3 -std=c++17 $GEN -c $ATTN_CU -o $O/attn.o
+  nice -n 19 nvcc -O3 -std=c++17 $GEN -c $ATTN_BIND_CU -o $O/attn_bind.o
   nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
   nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
   ls -la $OUT/dfltest $OUT/dflreplay
@@ -60,10 +64,10 @@ KVLIB=../kvman-rs/target/release/libg6kvman.a
 # progress CPU lists). widths.cpp is the main that picks the instance.
 WIDTHS=${WIDTHS:-6}
 # the flags of width N: the multi-session path (DEC_S2, which g6m4 needs) at every width, and PF_F12 (F12_NE=2 must
-# divide the expert blocks per rank: 4 at TP4, 3 at TP6) at 4
+# divide the expert blocks per rank: 4 at TP4, 3 at TP6) at 4, except in the Flash build, whose fp16 MoE refuses it
 wflags() {
   local f="-DG6_NR=$1 -DDEC_S2"
-  if [ "$1" = 4 ]; then f="$f -DPF_F12"; fi
+  if [ "$1" = 4 ] && [ "$ATTN_CU" = ../attn/attn.cu ]; then f="$f -DPF_F12"; fi
   echo "$f"
 }
 for n in $WIDTHS; do
@@ -78,8 +82,8 @@ job() {   # job <log> <command..>: in the background, at most J at once; a failu
 if [ "$WHAT" != sim ]; then job $O/fabric.log nvcc -O2 -std=c++17 $GEN -c ../comms/fabric.cpp -o $O/fabric.o; fi
 for n in $WIDTHS; do
   F="$GEN $(wflags $n) -Xcompiler -fno-gnu-unique"
-  job $O/attn.w$n.log nvcc -O3 -std=c++17 $F -c ../attn/attn.cu -o $O/attn.w$n.o
-  job $O/attn_bind.w$n.log nvcc -O3 -std=c++17 $F -c ../attn/bind.cu -o $O/attn_bind.w$n.o
+  job $O/attn.w$n.log nvcc -O3 -std=c++17 $F -c $ATTN_CU -o $O/attn.w$n.o
+  job $O/attn_bind.w$n.log nvcc -O3 -std=c++17 $F -c $ATTN_BIND_CU -o $O/attn_bind.w$n.o
   if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log nvcc -O2 -std=c++17 $F $RSDEF -c m4sim.cu -o $O/m4sim.w$n.o; fi
   if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log nvcc -O2 -std=c++17 $F $RSDEF -c g6m4.cu -o $O/g6m4.w$n.o; fi
   # dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)

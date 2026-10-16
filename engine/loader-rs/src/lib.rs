@@ -81,7 +81,24 @@ struct Loader<'a> {
     plan: Plan,
     files: Vec<Src>,
     mode: Mode,
+    cache: bool,
     sink: &'a G6lSink,
+    direct_read_ns: AtomicU64,
+    direct_read_bytes: AtomicU64,
+    buf_read_ns: AtomicU64,
+    buf_read_bytes: AtomicU64,
+    mmap_copy_ns: AtomicU64,
+    gen_get_ns: AtomicU64,
+    gen_memcpy_ns: AtomicU64,
+    gen_bytes: AtomicU64,
+    item128_read_ns: AtomicU64,
+    item128_perm_ns: AtomicU64,
+    item128_bytes: AtomicU64,
+    mem_memcpy_ns: AtomicU64,
+    mem_bytes: AtomicU64,
+    sink_copy_ns: AtomicU64,
+    alloc_staging_ns: AtomicU64,
+    free_staging_ns: AtomicU64,
 }
 
 unsafe impl Sync for Loader<'_> {}
@@ -92,7 +109,10 @@ impl Loader<'_> {
         let s = &self.files[f];
         let name = &self.plan.files[f];
         if let Some(m) = &s.map {
-            return m.copy_out(off, dst).map_err(|e| format!("{name}: {e}"));
+            let t0 = Instant::now();
+            let res = m.copy_out(off, dst).map_err(|e| format!("{name}: {e}"));
+            self.mmap_copy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return res;
         }
         let mut done = 0usize;
         // O_DIRECT for the 4096-aligned head of the range when the destination is aligned too
@@ -100,14 +120,23 @@ impl Loader<'_> {
             if off.is_multiple_of(ALIGN) && (dst.as_ptr() as u64).is_multiple_of(ALIGN) {
                 let head = dst.len() / ALIGN as usize * ALIGN as usize;
                 if head > 0 {
+                    let t0 = Instant::now();
                     read_exact_at(d, &mut dst[..head], off).map_err(|e| format!("{name}: {e} (O_DIRECT)"))?;
+                    self.direct_read_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.direct_read_bytes.fetch_add(head as u64, Ordering::Relaxed);
                     done = head;
                 }
             }
         }
         if done < dst.len() {
+            let t0 = Instant::now();
+            let rem = dst.len() - done;
             read_exact_at(&s.buffered, &mut dst[done..], off + done as u64).map_err(|e| format!("{name}: {e}"))?;
-            sys::fadvise_dontneed(&s.buffered, off + done as u64, (dst.len() - done) as u64);
+            if !self.cache {
+                sys::fadvise_dontneed(&s.buffered, off + done as u64, rem as u64);
+            }
+            self.buf_read_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.buf_read_bytes.fetch_add(rem as u64, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -131,23 +160,36 @@ impl Loader<'_> {
                     read += y - x;
                 }
                 Op::Mem => {
+                    let t0 = Instant::now();
                     let m = &self.plan.mems[s.file];
                     buf[(x - a) as usize..(y - a) as usize]
                         .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
+                    self.mem_memcpy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.mem_bytes.fetch_add(y - x, Ordering::Relaxed);
                 }
                 Op::Gen => {
+                    let tg = Instant::now();
                     let g = &self.plan.gens[s.file];
                     let m = g.get()?;
+                    self.gen_get_ns.fetch_add(tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let tc = Instant::now();
                     buf[(x - a) as usize..(y - a) as usize]
                         .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
                     g.used(y - x);
+                    self.gen_memcpy_ns.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.gen_bytes.fetch_add(y - x, Ordering::Relaxed);
                 }
-                Op::Item128 => {
+                Op::Item128 { hidden } => {
                     let n = s.nbytes as usize;
+                    let tr = Instant::now();
                     self.read(s.file, s.file_off, half.slice(n))?;
-                    plan::item128_to_g6(half.slice(n), perm.slice(n));
+                    self.item128_read_ns.fetch_add(tr.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let tp = Instant::now();
+                    plan::item128_to_g6_geometry(half.slice(n), perm.slice(n), hidden);
                     buf[(x - a) as usize..(y - a) as usize]
                         .copy_from_slice(&perm.slice(n)[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
+                    self.item128_perm_ns.fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.item128_bytes.fetch_add(y - x, Ordering::Relaxed);
                     read += s.nbytes;
                 }
             }
@@ -175,10 +217,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(default)
 }
 
-fn open_src(path: &str, mode: Mode) -> Result<Src, String> {
+fn open_src(path: &str, mode: Mode, cache: bool) -> Result<Src, String> {
     let buffered = File::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
     let (direct, map) = match mode {
-        Mode::Read => (std::fs::OpenOptions::new().read(true).custom_flags(sys::O_DIRECT).open(path).ok(), None),
+        Mode::Read if !cache => (std::fs::OpenOptions::new().read(true).custom_flags(sys::O_DIRECT).open(path).ok(), None),
+        Mode::Read => (None, None),
         Mode::Mmap => (None, Some(sys::Map::new(&buffered).map_err(|e| format!("cannot map {path}: {e}"))?)),
     };
     Ok(Src { buffered, direct, map })
@@ -193,15 +236,40 @@ pub fn load(pack: &str, pack_bytes: u64, tensors: &[G6lExtent], sources: Option<
 
 /// Fills image bytes 0..pack_bytes from `plan` through `sink`. The stats count time from `t0`.
 fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant) -> Result<G6lStats, String> {
+    let t_run = Instant::now();
     let mode = match std::env::var("G6_LOAD_MODE").as_deref() {
         Ok("read") | Err(_) => Mode::Read,
         Ok("mmap") => Mode::Mmap,
         Ok(v) => return Err(format!("G6_LOAD_MODE={v}: use mmap or read")),
     };
-    let threads = env_u64("G6_LOAD_THREADS", 8) as usize;
+    let cache = std::env::var("G6_LOAD_CACHE").ok().as_deref() == Some("1");
+    let threads = env_u64("G6_LOAD_THREADS", 16) as usize;
     let chunk = env_u64("G6_LOAD_CHUNK_MB", 32) << 20;
-    let files = plan.files.iter().map(|p| open_src(p, mode)).collect::<Result<Vec<_>, _>>()?;
-    let l = Loader { plan, files, mode, sink };
+    let files = plan.files.iter().map(|p| open_src(p, mode, cache)).collect::<Result<Vec<_>, _>>()?;
+    let open_files_s = t_run.elapsed().as_secs_f64();
+    let l = Loader {
+        plan,
+        files,
+        mode,
+        cache,
+        sink,
+        direct_read_ns: AtomicU64::new(0),
+        direct_read_bytes: AtomicU64::new(0),
+        buf_read_ns: AtomicU64::new(0),
+        buf_read_bytes: AtomicU64::new(0),
+        mmap_copy_ns: AtomicU64::new(0),
+        gen_get_ns: AtomicU64::new(0),
+        gen_memcpy_ns: AtomicU64::new(0),
+        gen_bytes: AtomicU64::new(0),
+        item128_read_ns: AtomicU64::new(0),
+        item128_perm_ns: AtomicU64::new(0),
+        item128_bytes: AtomicU64::new(0),
+        mem_memcpy_ns: AtomicU64::new(0),
+        mem_bytes: AtomicU64::new(0),
+        sink_copy_ns: AtomicU64::new(0),
+        alloc_staging_ns: AtomicU64::new(0),
+        free_staging_ns: AtomicU64::new(0),
+    };
     let nchunks = pack_bytes.div_ceil(chunk);
     let next = AtomicU64::new(0);
     let read_total = AtomicU64::new(0);
@@ -209,17 +277,30 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant) -> Result<G6lSt
     let error: Mutex<Option<String>> = Mutex::new(None);
     let max_half = l.plan.max_item128() as usize;
     let started = AtomicUsize::new(0);
+    let t_workers = Instant::now();
     std::thread::scope(|sc| {
         for w in 0..threads {
             let (l, next, read_total, failed, error, started) = (&l, &next, &read_total, &failed, &error, &started);
             sc.spawn(move || {
                 started.fetch_add(1, Ordering::Relaxed);
-                let p = (l.sink.alloc_staging)(l.sink.ctx, chunk as usize) as *mut u8;
-                if p.is_null() {
+                let ta = Instant::now();
+                let p0 = (l.sink.alloc_staging)(l.sink.ctx, chunk as usize) as *mut u8;
+                let p1 = if p0.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    (l.sink.alloc_staging)(l.sink.ctx, chunk as usize) as *mut u8
+                };
+                l.alloc_staging_ns.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if p1.is_null() {
+                    if !p0.is_null() {
+                        (l.sink.free_staging)(l.sink.ctx, p0 as *mut c_void);
+                    }
                     failed.store(true, Ordering::Relaxed);
                     error.lock().unwrap().get_or_insert(format!("worker {w}: no staging buffer of {chunk} bytes"));
                     return;
                 }
+                let bufs = [p0, p1];
+                let mut slot = 0usize;
                 let mut half = sys::AlignedBuf::new(max_half.max(1));
                 let mut perm = sys::AlignedBuf::new(max_half.max(1));
                 while !failed.load(Ordering::Relaxed) {
@@ -227,12 +308,17 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant) -> Result<G6lSt
                     if c >= nchunks {
                         break;
                     }
+                    let p = bufs[slot];
+                    slot ^= 1;
                     let a = c * chunk;
                     let n = chunk.min(pack_bytes - a) as usize;
                     let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
                     let r = l.fill(a, buf, &mut half, &mut perm).and_then(|read| {
                         read_total.fetch_add(read, Ordering::Relaxed);
-                        match (l.sink.copy)(l.sink.ctx, w as i32, a, p as *const c_void, n) {
+                        let ts = Instant::now();
+                        let rc = (l.sink.copy)(l.sink.ctx, w as i32, a, p as *const c_void, n);
+                        l.sink_copy_ns.fetch_add(ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        match rc {
                             0 => Ok(()),
                             e => Err(format!("copy of image bytes {a}..{} failed ({e})", a + n as u64)),
                         }
@@ -242,15 +328,119 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant) -> Result<G6lSt
                         error.lock().unwrap().get_or_insert(e);
                     }
                 }
-                (l.sink.free_staging)(l.sink.ctx, p as *mut c_void);
+                let tf = Instant::now();
+                (l.sink.free_staging)(l.sink.ctx, p0 as *mut c_void);
+                (l.sink.free_staging)(l.sink.ctx, p1 as *mut c_void);
+                l.free_staging_ns.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
             });
         }
     });
     if let Some(e) = error.into_inner().unwrap() {
         return Err(e);
     }
+    let workers_wall_s = t_workers.elapsed().as_secs_f64();
+    let total_wall_s = t0.elapsed().as_secs_f64();
+    let mut gen_comp_total_ns = 0u64;
+    let mut gen_wait_total_ns = 0u64;
+    let mut gen_embed_ns = 0u64;
+    let mut gen_lm_head_ns = 0u64;
+    let mut gen_kv_b_ns = 0u64;
+    let mut gen_mxgv_ns = 0u64;
+    let mut gen_tr3gv_ns = 0u64;
+    let mut gen_other_ns = 0u64;
+    let mut by_what: std::collections::BTreeMap<&str, (u64, u64, u64, usize)> = std::collections::BTreeMap::new();
+    for g in &l.plan.gens {
+        let c = g.compute_ns.load(Ordering::Relaxed);
+        let w = g.wait_ns.load(Ordering::Relaxed);
+        gen_comp_total_ns += c;
+        gen_wait_total_ns += w;
+        if g.what.contains("G.embed") {
+            gen_embed_ns += c;
+        } else if g.what.contains("G.lm_head") {
+            gen_lm_head_ns += c;
+        } else if g.what.contains("kv_b") {
+            gen_kv_b_ns += c;
+        } else if g.what.contains(".mx.gv") {
+            gen_mxgv_ns += c;
+        } else if g.what.contains(".tr3.gv") {
+            gen_tr3gv_ns += c;
+        } else {
+            gen_other_ns += c;
+        }
+        let e = by_what.entry(g.what.as_str()).or_insert((0, 0, 0, 0));
+        e.0 += g.nbytes;
+        e.1 += c;
+        e.2 += w;
+        e.3 += 1;
+    }
+    for (what, (nb, c, w, cnt)) in by_what {
+        if c >= 20_000_000 || w >= 20_000_000 {
+            eprintln!(
+                "# boot-prof gen [{what}] ({cnt} segs): {:.2} MB, compute {:.3} s, mutex_wait {:.3} thread-s",
+                nb as f64 / 1e6,
+                c as f64 / 1e9,
+                w as f64 / 1e9
+            );
+        }
+    }
+    let d_ns = l.direct_read_ns.load(Ordering::Relaxed);
+    let d_bytes = l.direct_read_bytes.load(Ordering::Relaxed);
+    let b_ns = l.buf_read_ns.load(Ordering::Relaxed);
+    let b_bytes = l.buf_read_bytes.load(Ordering::Relaxed);
+    let i_read_ns = l.item128_read_ns.load(Ordering::Relaxed);
+    let i_perm_ns = l.item128_perm_ns.load(Ordering::Relaxed);
+    let i_bytes = l.item128_bytes.load(Ordering::Relaxed);
+    let g_get_ns = l.gen_get_ns.load(Ordering::Relaxed);
+    let g_cpy_ns = l.gen_memcpy_ns.load(Ordering::Relaxed);
+    let g_bytes = l.gen_bytes.load(Ordering::Relaxed);
+    let m_cpy_ns = l.mem_memcpy_ns.load(Ordering::Relaxed);
+    let m_bytes = l.mem_bytes.load(Ordering::Relaxed);
+    let s_cpy_ns = l.sink_copy_ns.load(Ordering::Relaxed);
+    let a_stg_ns = l.alloc_staging_ns.load(Ordering::Relaxed);
+    let f_stg_ns = l.free_staging_ns.load(Ordering::Relaxed);
+    eprintln!(
+        "# boot-prof loader-rs wall: total {:.3} s (plan_to_run {:.3} s, open_files {:.3} s, workers_wall {:.3} s across {} threads)",
+        total_wall_s,
+        (total_wall_s - workers_wall_s - open_files_s).max(0.0),
+        open_files_s,
+        workers_wall_s,
+        threads
+    );
+    eprintln!(
+        "# boot-prof loader-rs thread-sums ({} threads, {:.3} thread-s cap): direct_read {:.3} s ({:.2} GB), buf_read {:.3} s ({:.2} GB), item128(read {:.3} s + perm {:.3} s, {:.2} GB), gen(get {:.3} s = compute {:.3} s + mutex_wait {:.3} s, memcpy {:.3} s, {:.2} GB), mem_memcpy {:.3} s ({:.2} GB), sink_copy {:.3} s, staging(alloc {:.3} s, free {:.3} s)",
+        threads,
+        workers_wall_s * threads as f64,
+        d_ns as f64 / 1e9,
+        d_bytes as f64 / 1e9,
+        b_ns as f64 / 1e9,
+        b_bytes as f64 / 1e9,
+        i_read_ns as f64 / 1e9,
+        i_perm_ns as f64 / 1e9,
+        i_bytes as f64 / 1e9,
+        g_get_ns as f64 / 1e9,
+        gen_comp_total_ns as f64 / 1e9,
+        gen_wait_total_ns as f64 / 1e9,
+        g_cpy_ns as f64 / 1e9,
+        g_bytes as f64 / 1e9,
+        m_cpy_ns as f64 / 1e9,
+        m_bytes as f64 / 1e9,
+        s_cpy_ns as f64 / 1e9,
+        a_stg_ns as f64 / 1e9,
+        f_stg_ns as f64 / 1e9
+    );
+    eprintln!(
+        "# boot-prof loader-rs gen-by-kind (compute thread-s): G.embed {:.3} s, G.lm_head {:.3} s, kv_b {:.3} s, mx.gv {:.3} s, tr3.gv {:.3} s, other {:.3} s (total {:.3} s compute, {:.3} s mutex_wait)",
+        gen_embed_ns as f64 / 1e9,
+        gen_lm_head_ns as f64 / 1e9,
+        gen_kv_b_ns as f64 / 1e9,
+        gen_mxgv_ns as f64 / 1e9,
+        gen_tr3gv_ns as f64 / 1e9,
+        gen_other_ns as f64 / 1e9,
+        gen_comp_total_ns as f64 / 1e9,
+        gen_wait_total_ns as f64 / 1e9
+    );
     Ok(G6lStats {
-        seconds: t0.elapsed().as_secs_f64(),
+        seconds: total_wall_s,
         image_bytes: pack_bytes,
         read_bytes: read_total.load(Ordering::Relaxed),
         ranges: l.plan.ranges() as u64,
@@ -322,12 +512,36 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
                                           widths: *const c_char, nr: u32, rank: u32, qo: i32, trellis: i32,
                                           out_manifest: *const c_char,
                                           err: *mut c_char, errlen: usize) -> *mut c_void {
+    release_plan_inner(dense_dir, v2_dir, slices_dir, widths, nr, rank, qo, trellis, None, out_manifest, err, errlen)
+}
+
+/// Test-only subset planner for m4sim. The normal g6l_release_plan retains the full-model check.
+///
+/// # Safety
+/// Strings must be NUL-terminated; layers must point to n_layers u32 values; err holds errlen bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_release_plan_selected(dense_dir: *const c_char, v2_dir: *const c_char,
+    slices_dir: *const c_char, widths: *const c_char, nr: u32, rank: u32, qo: i32, trellis: i32,
+    layers: *const u32, n_layers: usize, out_manifest: *const c_char,
+    err: *mut c_char, errlen: usize) -> *mut c_void {
+    if layers.is_null() || n_layers == 0 {
+        write_err(err, errlen, "selected release plan needs a nonempty layer list");
+        return std::ptr::null_mut();
+    }
+    let selected: Vec<usize> = std::slice::from_raw_parts(layers, n_layers).iter().map(|&l| l as usize).collect();
+    release_plan_inner(dense_dir, v2_dir, slices_dir, widths, nr, rank, qo, trellis,
+                       Some(&selected), out_manifest, err, errlen)
+}
+
+unsafe fn release_plan_inner(dense_dir: *const c_char, v2_dir: *const c_char, slices_dir: *const c_char,
+    widths: *const c_char, nr: u32, rank: u32, qo: i32, trellis: i32, selected: Option<&[usize]>,
+    out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
     let t0 = Instant::now();
     let arg = |p, what| cstr(p).ok_or(format!("g6l_release_plan: no {what}"));
     let r = (|| {
-        let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
+        let (img, table) = release::plan_selected(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
                                          &arg(widths, "width manifest")?, nr as usize, rank as usize,
-                                         release::Opts { qo: qo != 0, trellis: trellis != 0 })?;
+                                         release::Opts { qo: qo != 0, trellis: trellis != 0 }, selected, true, true)?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
         if rank == 0 {
@@ -380,11 +594,11 @@ pub fn read_range(plan: &Plan, a: u64, buf: &mut [u8]) -> Result<(), String> {
             Op::Copy => read_exact_at(&file()?, dst, s.file_off + lo as u64).map_err(|e| format!("{}: {e}", plan.files[s.file]))?,
             Op::Mem => dst.copy_from_slice(&plan.mems[s.file][lo..hi]),
             Op::Gen => dst.copy_from_slice(&plan.gens[s.file].compute()?[lo..hi]),
-            Op::Item128 => {
+            Op::Item128 { hidden } => {
                 let n = s.nbytes as usize;
                 let (mut half, mut perm) = (vec![0u8; n], vec![0u8; n]);
                 read_exact_at(&file()?, &mut half, s.file_off).map_err(|e| format!("{}: {e}", plan.files[s.file]))?;
-                plan::item128_to_g6(&half, &mut perm);
+                plan::item128_to_g6_geometry(&half, &mut perm, hidden);
                 dst.copy_from_slice(&perm[lo..hi]);
             }
         }

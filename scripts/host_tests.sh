@@ -117,3 +117,20 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 # host memory after load (#4): the /proc parser and malloc_trim (glibc)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$T/host_reclaim_test"
 "$T/host_reclaim_test"
+
+# Offline distributed logit dump framing and merge validation.
+(cd "$REPO" && python3 -m unittest tools.cp.test_merge_logits)
+# Flash single-session KDA state rollback across accepted prefixes.
+g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_ring.cpp" -o "$T/test_flash_ring"
+"$T/test_flash_ring"
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test"
+"$T/control_tp2_test"
+g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost"
+"$T/test_flash_s2_cost"
+g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost"
+"$T/test_full_s2_cost"
+python3 "$REPO/engine/tests/test_flash_serve_check.py"
+# Flash prefill non-kernel span (NK): G6_PF_PREWARM source check, G6_PF_STAGE_ASYNC source check + schedule hazard model.
+python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
+g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test"
+"$T/pf_peer_stage_test"

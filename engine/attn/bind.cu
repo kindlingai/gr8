@@ -64,14 +64,14 @@ static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, 
 extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
 #endif
-    if (!out || out->storage || !p || rank < 0 || rank >= g6nr::NR || layer < 0 || layer > 78 ||
+    if (!out || out->storage || !p || rank < 0 || rank >= g6nr::NR || layer < 0 || layer > geom::MTP_LAYER ||
         capacity <= 0 || max_rows <= 0 || max_rows > capacity || query_tile <= 0 ||
         query_tile > 64 || capacity > INT_MAX / query_tile) return invalid;
     // head group of this rank at this layer: (rank - layer) % NR, the larger groups first (TP6 edges
     // 0,11,22,33,44,54,64; TP4 16 heads each)
     const int group = (rank - layer % g6nr::NR + g6nr::NR) % g6nr::NR;
     const int h = g6nr::width(g6nr::HEADS, group);
-    const bool full = layer == 78 || layer <= 2 || (layer - 2) % 4 == 0;
+    const bool full = geom::full_index(layer);
     if (!shape(p->uk, {h,192,512}) || !shape(p->uv, {h,256,512}) ||
         !shape(p->kv_norm, {512}) ||
         (full && (!shape(p->index_norm, {128}) || !shape(p->index_bias, {128})))) return invalid;

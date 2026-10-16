@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[path = "flash.rs"]
+mod flash;
+
 const H: usize = 6144;
 const L_MTP: usize = 78;
 const VOCAB: usize = 154880;
@@ -165,6 +168,27 @@ impl Planner {
             Ok(v)
         })));
         self.b.segs.push(crate::plan::Seg { pack_off: a, nbytes: span, op: Op::Gen, file_off: 0, file: gi });
+    }
+
+    /// A single manifest tensor split into contiguous `Op::Gen` segments so loader worker threads compute stripes in parallel.
+    fn gen_striped(
+        &mut self,
+        what: &str,
+        name: String,
+        dtype: &'static str,
+        shape: Vec<i64>,
+        stripes: Vec<(u64, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>)>,
+    ) {
+        let total = nbytes(dtype, &shape);
+        let base = self.b.begin(name, dtype, shape, total, None);
+        let mut off = 0u64;
+        for (span, make) in stripes {
+            let gi = self.b.gens.len();
+            self.b.gens.push(Gen::new(what.to_string(), span, make));
+            self.b.segs.push(crate::plan::Seg { pack_off: base + off, nbytes: span, op: Op::Gen, file_off: 0, file: gi });
+            off += span;
+        }
+        assert_eq!(off, total);
     }
 
     /// A vector (norm, bias) as stored, under its gr8 name.
@@ -370,9 +394,9 @@ impl Planner {
 
     /// A trellis matrix as the dense trellis kernels read it (engine/kernels/dtr.cuh layer_mats): the rank's entries of
     /// M.trellis as stored, `ch` on the sharded side (128-channel entries), and suh / svh sliced on that side.
-    fn trellis(&mut self, l: usize, what: &'static str, p: &str, m: &Matrix, ch: Range<usize>) -> Result<(), String> {
+    fn trellis(&mut self, l: usize, what: &str, p: &str, m: &Matrix, ch: Range<usize>) -> Result<(), String> {
         let r = m.rec;
-        self.note(l, Form { what: if what.starts_with("dense.") { "dense MLP" } else { what }, src: fmt_name(m),
+        self.note(l, Form { what: match what { "q_b" => "q_b", "o_proj" => "o_proj", w if w.starts_with("dense.") => "dense MLP", _ => "KDA projection" }, src: fmt_name(m),
                             form: "trellis entries (dense trellis kernels)", exact: EXACT });
         let ents = ch.start / 128..ch.end / 128;
         let (off, eb) = m.trellis_entries(&ents)?;
@@ -519,27 +543,44 @@ pub struct Opts {
 /// the width manifest. Returns the image and the exactness table (markdown).
 pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, nr: usize, rank: usize, opts: Opts)
             -> Result<(V2Image, String), String> {
+    plan_selected(dense_dir, v2_dir, slices_dir, widths_path, nr, rank, opts, None, true, true)
+}
+
+/// Partial images are for CPU component tests, never for a full model boot.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_selected(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str,
+                     nr: usize, rank: usize, opts: Opts, selected: Option<&[usize]>,
+                     globals: bool, dense: bool) -> Result<(V2Image, String), String> {
     let shard = Shard::new(nr, rank)?;
     let man: Json = v2plan::width_manifest(widths_path)?;
     let slices = v2plan::open_slices(slices_dir, nr, rank)?;
     let wfile = |l: usize, k: u8| v2plan::width_file(v2_dir, l, k);
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(8);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16);
+    let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(16);
     let mut p = Planner { b: Builder::new(), shard, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis };
-    p.vocab(dense_dir)?;
+    let is_flash = man.get("hidden_size").and_then(|x| x.str().and_then(|s| s.parse::<usize>().ok()).or_else(|| x.int().map(|v| v as usize))) == Some(4096);
+    if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
+    let last = if is_flash { 45 } else { L_MTP };
+    if globals {
+        if is_flash { flash::globals(&mut p, dense_dir, &man)?; } else { p.vocab(dense_dir)?; }
+    }
+    let layers: Vec<usize> = selected.map(|ls| ls.to_vec()).unwrap_or_else(|| (0..=last).collect());
     let mut moe = 0;
-    for l in 0..=L_MTP {
-        p.layer(l, dense_dir)?;
+    for l in layers {
+        if l > last { return Err(format!("layer {l} exceeds MTP layer {last}")); }
+        if dense {
+            if is_flash { flash::layer(&mut p, l, dense_dir, &man)?; } else { p.layer(l, dense_dir)?; }
+        }
         if let Some(w) = v2plan::widths(&man, l)? {
             v2plan::v2_layer(&mut p.b, l, &w, &slices, &wfile, nr, rank)?;
             moe += 1;
-        } else if l >= 3 {
+        } else if l >= 3 && selected.is_none() {
             return Err(format!("{widths_path} has no widths for MoE layer {l}"));
         }
     }
     let listed = man.get("layers").and_then(Json::obj).map(|m| m.len()).unwrap_or(0);
-    if moe != listed {
+    if selected.is_none() && moe != listed {
         return Err(format!("{widths_path} lists {listed} layers, the model has {moe} MoE layers"));
     }
     let bytes = p.b.cur.div_ceil(4096) * 4096;

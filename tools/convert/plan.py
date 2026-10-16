@@ -21,6 +21,18 @@ N_DENSE_G = 384      # g32 groups of the dense MLP (I = 12288)
 VOCAB = 154880
 
 
+MODEL = 'glm53'
+
+
+def set_model(model):
+    """Select the geometry for ownership helpers; GLM remains the default."""
+    global MODEL, H, L_MAIN, L_MTP, N_EXP
+    if model not in ('glm53', 'flash'):
+        raise ValueError(f'unknown model {model}')
+    MODEL = model
+    H, L_MAIN, L_MTP, N_EXP = (4096,45,45,288) if model == 'flash' else (6144,78,78,256)
+
+
 def widths(n, nr):
     """n units over nr ranks, as engine/g6nr.h width(): the larger chunks first."""
     return tuple(n // nr + (1 if j < n % nr else 0) for j in range(nr))
@@ -75,7 +87,7 @@ def vocab_rows(r):
 
 def has_indexer(l):
     """Full indexer (own weights) layers: max(l-3+1,0)%4==0, and MTP always."""
-    return l == L_MTP or max(l - 2, 0) % 4 == 0
+    return (l == L_MTP or l % 4 == 3) if MODEL == 'flash' else (l == L_MTP or max(l - 2, 0) % 4 == 0)
 
 
 def is_moe(l):
@@ -92,6 +104,8 @@ def _gq(n, k):     # GPTQ int4 g32 codes + 16-bit scales (row-tile record is the
 
 def rank_bytes(r, bits_of):
     """Bytes of every tensor class rank r holds. bits_of(l) -> list of 256 expert bit widths."""
+    if MODEL != 'glm53':
+        raise ValueError('Flash image sizes must come from g6plandump --sizes, not the GLM quant estimator')
     out = {}
 
     def add(k, v):

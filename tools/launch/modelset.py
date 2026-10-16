@@ -301,7 +301,10 @@ def expert_gb(path, tp):
     """GB of routed and shared expert weights on the busiest rank at this TP, under the manifest's widths (half h of
     expert e in layer l belongs to rank (16e + h + l) mod tp)."""
     with open(path) as f:
-        layers = json.load(f)['layers']
+        manifest = json.load(f)
+        layers = manifest['layers']
+    hidden = int(manifest.get('hidden_size', 6144))
+    half_bytes = {k: hidden * 16 * k for k in (2, 3, 4)}
     per = [0] * tp
     for key, e in layers.items():
         l = int(key)
@@ -310,10 +313,10 @@ def expert_gb(path, tp):
             sh = {'gate': [sh] * 16, 'up': [sh] * 16, 'down': sh}
         rows = [(x, e['gate'][x], e['up'][x], e['down'][x]) for x in range(len(e['down']))]
         if sh['down']:
-            rows.append((256, sh['gate'], sh['up'], sh['down']))      # the shared expert is e = 256 in the half rule
+            rows.append((len(e['down']), sh['gate'], sh['up'], sh['down']))      # the shared expert is e = 256 in the half rule
         for x, g, u, d in rows:
             for h in range(16):
-                per[(16 * x + h + l) % tp] += HALF_BYTES[g[h]] + HALF_BYTES[u[h]] + HALF_BYTES[d]
+                per[(16 * x + h + l) % tp] += half_bytes[g[h]] + half_bytes[u[h]] + half_bytes[d]
     return max(per) / 1e9
 
 

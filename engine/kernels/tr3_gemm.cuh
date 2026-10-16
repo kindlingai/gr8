@@ -129,7 +129,7 @@ __global__ __launch_bounds__(256) void tr3_gemm(const __half* X, const uint8_t* 
 #ifdef HOST_CMDS
 static int cmd_prefill(const Args& a)
 {
-    const int K = a.i("K", 6144), N = a.i("N", 768), bits = a.i("bits", 3);
+    const int K = a.i("K", HID), N = a.i("N", 768), bits = a.i("bits", 3);
     const int E = a.i("experts", 256), rpe = a.i("rpe", 128), P = a.i("pool", 64), reps = a.i("reps", 5);
     const std::string dump = a.s("dump", "");
     const int TB = 32 * bits;
