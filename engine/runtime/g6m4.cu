@@ -421,6 +421,21 @@ int main(int argc, char** argv)
 #else
     auto qp_err = [&]() -> unsigned { return 0u; };
 #endif
+    // G6_DRAFT_HEAD_I4=1 (rank.cuh build_draft_head_i4; default 0): the MTP draft's head reads INT4 g32 records of the
+    // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature.
+    const DraftHeadI4 dhead = draft_head_i4_env();
+    if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+    // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
+    // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
+    std::string dfe;
+    const int dfl_i4 = env_choice("G6_DFL_HEAD_I4", 1, 0, &dfe);
+    if (dfl_i4 < 0) die(dfe);
+    if (dfl_i4 && !dfl) die("G6_DFL_HEAD_I4=1 needs --dflash-manifest");
+    // G6_DFL_BODY_I4=1 (dflash.cuh dfl_body_i4; default 0): the DFlash2 drafter's body GEMVs read INT4 g32 copies of their
+    // MXFP8 records. Drafts only; +382 MB per rank. In the S2 runtime signature
+    const int dfl_body_i4_on = env_choice("G6_DFL_BODY_I4", 1, 0, &dfe);
+    if (dfl_body_i4_on < 0) die(dfe);
+    if (dfl_body_i4_on && !dfl) die("G6_DFL_BODY_I4=1 needs --dflash-manifest");
 #if defined(G6_CP) && G6_CP
     // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
@@ -616,6 +631,7 @@ int main(int argc, char** argv)
         G6RT_CK(cudaHostAlloc((void**)&in_d, sizeof(StepIn), cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
+        build_draft_head_i4(D, dhead, st);
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
@@ -637,6 +653,10 @@ int main(int argc, char** argv)
         // G6_DFL_PFCTX=0 (measurement): the drafter gets no prompt context from the prefill and starts at the last prompt token
         const bool pfctx = MP && !(getenv("G6_DFL_PFCTX") && atoi(getenv("G6_DFL_PFCTX")) == 0);
         dfl_build(DF, m, dfind, meta, fabf.dev(), dmalloc<u64>(1), dfl_sel < 0 ? meta.sel : dfl_sel == 1, st, pfctx);
+        if (dfl_i4)
+            dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
+                        dhead.tpc, dhead.ks);
+        if (dfl_body_i4_on) dfl_body_i4(DF, st);
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
     }
@@ -1163,7 +1183,10 @@ int main(int argc, char** argv)
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
-                (set_id.empty() ? "" : " set " + set_id);
+                (set_id.empty() ? "" : " set " + set_id) +
+                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (dfl_body_i4_on ? " dflbodyi4 1" : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);

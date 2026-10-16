@@ -233,6 +233,7 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+    const DraftHeadI4 dhead = draft_head_i4_env();   // G6_DRAFT_HEAD_I4 (rank.cuh), as g6m4: the MTP draft's INT4 head
     std::string packs;
     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
     g6rt::CommonOpts co;                // every flag g6m4 takes too, parsed in engine_opts.h
@@ -278,6 +279,7 @@ int main(int argc, char** argv)
     if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
     plan.inv_temp = g6rt::inv_temp(temp);
     if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);   // the scheduler caps k at 7 whatever MX is
+    if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
@@ -539,6 +541,7 @@ int main(int argc, char** argv)
             if (s2mode && !s2_below && getenv("G6_S2_POOL")) DR[r].d.s2_pool_pages = atoi(getenv("G6_S2_POOL"));
 #endif
             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
+            build_draft_head_i4(DR[r], dhead, st);
             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
             loop_d.send[r] = fd.send;
             if (MP) DQ[r].P.attn_rows = pf_attn_rows(MP);   // DQ is empty without --prefill (was an out-of-bounds write)

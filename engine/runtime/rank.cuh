@@ -33,10 +33,12 @@
 #include "draft_shape.h"
 #include "serve.h"
 #include "spec_len.h"
+#include "envparse.h"
 #include "../h2d.h"
 #include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
+#include "../kernels/head_i4.cuh"
 #include "../attn/bind.h"
 #if defined(G6_CP) && G6_CP
 #include "../kernels/cpglue.cuh"
@@ -312,6 +314,10 @@ struct Model
     bind::Head head[MX + 1];
     __half *eh_in = nullptr, *eh_out = nullptr;   // MTP draft model only: eh_proj input [MX][12288] and output [MX][6144]
     int vlo = 0, vn = 0;
+    // G6_DRAFT_HEAD_I4 (MTP draft model only, set before prepare): the head GEMV reads these INT4 g32 records of the same
+    // vocab slice instead of head_t.lm_head (build_draft_head_i4); dh_tpc / dh_ks = its CTA split. nullptr = MXFP8
+    const uint8_t* dh_i4 = nullptr;
+    int dh_tpc = 1, dh_ks = 32;
     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
@@ -1028,6 +1034,36 @@ inline void route_log_line(FILE* f, const Model& m, const std::vector<int>& ids,
 
 inline const __nv_bfloat16* norm_after(const Model& m, int i) { return i + 1 < m.nl ? m.layers[i + 1].attn_norm : m.final_norm; }
 
+// G6_DFL_BODY_I4: a bound MXFP8 GEMV rebound to INT4 g32 records of the same rows (k_mx_to_i4 over
+// its O/16 tiles x K/32 groups, the G6_DRAFT_HEAD_I4 arithmetic; DEC_I4PAIR builds repack them for its ks): same split,
+// fragment table and output, only the weights' codec changes. One copy per (records, tiles, ks), so GEMVs that bind the
+// same records share it (the drafter's kv record: its context and block GEMVs).
+// Device memory for the life of the process; the MXFP8 records stay (they sit in the pack image). Returns the bytes made.
+inline size_t gv_to_i4(bind::Gv& g, const char* who, cudaStream_t st)
+{
+    struct Made { const uint8_t* mx; int tiles, ks; const uint8_t* i4; };
+    static std::vector<Made> made;
+    if (!g.on) return 0;
+    if (g.codec != bind::MXFP8) die(std::string(who) + ": a GEMV that is not on MXFP8 records");
+    const int tiles = g.O / 16, ng = g.K / 32;
+    for (const Made& x : made)
+        if (x.mx == g.w && x.tiles == tiles && x.ks == g.ks) { g.codec = bind::INT4; g.w = x.i4; return 0; }
+#if DEC_I4PAIR
+    if ((size_t)ng / g.ks * head_i4::I4GR > 48 * 1024) die(std::string(who) + ": k part too long for k_i4pair's shared memory");
+#endif
+    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
+    head_i4::launch(g.w, rec, tiles, ng, st);
+    G6RT_CK(cudaGetLastError());
+#if DEC_I4PAIR
+    launch_i4pair(rec, tiles, ng, g.ks, st);   // make_gv kept ng % ks == 0
+    G6RT_CK(cudaGetLastError());
+#endif
+    G6RT_CK(cudaStreamSynchronize(st));
+    made.push_back(Made{g.w, tiles, g.ks, rec});
+    g.codec = bind::INT4; g.w = rec;
+    return head_i4::bytes(tiles, ng);
+}
+
 inline glue::HeadArgs head_args(Model& m, int M)
 {
     return glue::HeadArgs{m.f, m.stepp, 2 * m.nl, M, m.hlog, m.vn, m.vlo, m.vn, m.srow, m.tickets + 2 * m.nl, m.tok_out, m.lp,
@@ -1042,6 +1078,15 @@ inline const bind::Head& head_for(Model& m, int M)
         io.h = m.x; io.logits = m.hlog;
         io.eh_in = m.eh_in; io.eh = m.eh_out;
         if (const char* e = bind::make_head(m.head_t, m.rank, M, m.sc, io, H)) die("rank " + std::to_string(m.rank) + " head: " + e);
+        if (m.dh_i4)                  // G6_DRAFT_HEAD_I4: the same slice's INT4 records, same fragment table and logits
+        {
+            bind::Tensor t;
+            t.p = m.dh_i4; t.nd = 3;
+            t.shape[0] = m.vn / 16; t.shape[1] = HID / 32; t.shape[2] = head_i4::I4GR;
+            if (const char* e = bind::make_gv(t, bind::INT4, m.dh_tpc, m.dh_ks, M, m.sc.xf_head, m.hlog, gv::O_F32, H.lm_head))
+                die("rank " + std::to_string(m.rank) + " INT4 draft head: " + e);
+            if (H.lm_head.O != H.vn || H.lm_head.K != HID) die("INT4 draft head is not this rank's vocab slice");
+        }
     }
     return H;
 }
@@ -1262,6 +1307,68 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
     D.hnorm = (const __nv_bfloat16*)need(find, "L078.hnorm");
     D.hprev = dmalloc<__half>(HID);
     D.main_x = main.x;
+}
+
+// G6_DRAFT_HEAD_I4=1 (default 0; needs --mtp): the MTP draft's head GEMV reads INT4 g32 records of this rank's vocab slice,
+// made at boot from its MXFP8 records (kernels/head_i4.cuh), instead of the MXFP8 records the target's head reads: 134 MB
+// instead of 246 MB per draft step at TP4. The target's head and every verify step are unchanged, so the committed tokens
+// are the target's at any acceptance; the drafts and their log-probabilities (which spec_len reads) can differ from the
+// MXFP8 head's. They stay the same on every rank: each rank converts its own slice by the same arithmetic, and the
+// head merge runs in rank order. G6_DRAFT_HEAD_KS (32) and G6_DRAFT_HEAD_TPC (1): the GEMV's k parts per tile and tiles
+// per CTA (make_gv), for an A/B of the split; ks sets the summation order, so every rank must run the same values (the S2
+// runtime signature carries all three). DEC_I4PAIR builds repack the records once for that ks (densev.cuh k_i4pair), as
+// the int4 q_a / o_proj records are.
+struct DraftHeadI4
+{
+    int on = 0, tpc = 1, ks = 32;
+};
+inline DraftHeadI4 draft_head_i4_env()
+{
+    DraftHeadI4 c;
+    std::string err;
+    c.on = env_choice("G6_DRAFT_HEAD_I4", 1, 0, &err);
+    if (c.on < 0) die(err);
+    auto pow2 = [](const char* name, int dflt, int lo) {
+        const char* v = getenv(name);
+        if (!v) return dflt;
+        for (int x = lo; x <= 32; x *= 2)
+            if (std::string(v) == std::to_string(x)) return x;
+        die(std::string(name) + "='" + v + "' is not a power of two in " + std::to_string(lo) + "..32");
+    };
+    c.ks = pow2("G6_DRAFT_HEAD_KS", 32, 2);    // >= 2: k_i4pair's shared memory holds one k part (192 / ks groups)
+    c.tpc = pow2("G6_DRAFT_HEAD_TPC", 1, 1);
+    if (c.tpc * c.ks > 32) die("G6_DRAFT_HEAD_TPC x G6_DRAFT_HEAD_KS must be <= 32 (warps of one CTA)");
+    return c;
+}
+// INT4 g32 head records [vn/16][192][288] of a rank's MXFP8 lm_head slice mx (G.lm_head.mx.gv), DEC_I4PAIR-repacked for
+// k-part count ks; device memory owned by the caller for the life of the process. Shared by the MTP draft
+// (G6_DRAFT_HEAD_I4) and the DFlash2 drafter (G6_DFL_HEAD_I4, dflash.cuh dfl_head_i4): same slice, same ks, one copy.
+inline const uint8_t* head_i4_records(const bind::Tensor& mx, int vn, int ks, int rank, const char* who, cudaStream_t st)
+{
+    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
+        die(std::string(who) + ": G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
+    const int tiles = vn / 16, ng = HID / 32;
+    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
+    head_i4::launch(static_cast<const uint8_t*>(mx.p), rec, tiles, ng, st);
+    G6RT_CK(cudaGetLastError());
+#if DEC_I4PAIR
+    launch_i4pair(rec, tiles, ng, ks, st);      // the pair records gv_gemv reads for k-part count ks (ng % ks == 0: make_gv keeps it)
+    G6RT_CK(cudaGetLastError());
+#endif
+    G6RT_CK(cudaStreamSynchronize(st));
+    fprintf(stderr, "# rank %d: %s: INT4 g32 head records, %.1f MB (MXFP8 %.1f MB), ks %d\n", rank, who,
+            head_i4::bytes(tiles, ng) / 1e6, (double)tiles * ng * head_i4::MXGR / 1e6, ks);
+    return rec;
+}
+// after build_draft, before prepare / any capture of a draft step (head_for binds the records on first use)
+inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
+{
+    Model& d = D.d;
+    if (!c.on) return;
+    for (int M = 1; M <= MX; ++M)
+        if (d.head[M].M) die("G6_DRAFT_HEAD_I4: the draft head was bound before its INT4 records were made");
+    d.dh_i4 = head_i4_records(d.head_t.lm_head, d.vn, c.ks, d.rank, "G6_DRAFT_HEAD_I4", st);
+    d.dh_tpc = c.tpc; d.dh_ks = c.ks;
 }
 #ifdef DEC_S2
 inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);

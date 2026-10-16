@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-16: the draft heads and the DFlash2 drafter body on INT4 g32 copies (G6_DRAFT_HEAD_I4, G6_DFL_HEAD_I4, G6_DFL_BODY_I4, off by default)
+
+- A draft step reads the same MXFP8 weights as the target: the MTP draft's lm_head (246 MB a rank at TP4), and the
+  DFlash2 drafter's head and body (701 MB of body records a rank). Drafts are only proposals, so their weights can be
+  smaller without touching what is committed. At boot each rank converts its own records to INT4 g32 copies on the GPU
+  (`kernels/head_i4.cuh`, `k_mx_to_i4`; `DEC_I4PAIR` builds repack them for the GEMV's k parts) and rebinds the draft
+  GEMVs to them, with the same splits: the MTP draft head reads 134 MB instead of 246 MB (`G6_DRAFT_HEAD_I4=1`), the
+  DFlash2 drafter's head the same records (`G6_DFL_HEAD_I4=1`, one copy for both), and its body 382 MB instead of 701 MB
+  (`G6_DFL_BODY_I4=1`). The MXFP8 records stay in the image (the target's head reads them), so each copy is extra memory.
+- Drafts only: the target's head and every verify step are unchanged, so every committed token is the target's. The
+  drafts and their log-probabilities can differ from the MXFP8 ones. Every rank converts its own slice by the same
+  arithmetic, so the drafts are the same on every rank; the flags are in the S2 runtime signature.
+- Tests: `dhead_i4_test` (`scripts/c1_tests.sh`, one GB10) checks the conversion byte for byte against a host
+  derivation and the INT4 GEMV against a host dot on the head and drafter shapes, and times them. `dflreplay`
+  (`build_m4.sh dfl`) replays a `G6_DFL_DUMP` through the MXFP8 and the INT4 drafter on one GPU and reports how often
+  their drafts agree and how many each would have had accepted.
+
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
 - The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for
