@@ -120,7 +120,8 @@ The decode attention variables from `G6_ATTN_SC2` to `G6_ATTN_FRONT` are read on
 for the boot. Other values than the ones listed mean off. `G6_ATTN_P11=1`, and `G6_ATTN_FLIP` where it applies, take
 precedence over `G6_ATTN_SC2`, `G6_ATTN_CTX2` and `G6_ATTN_CTX3` (and so over `G6_ATTN_QT`), and `G6_ATTN_HEADS=0` turns
 those four off. The measured set is `G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16
-G6_IDX_GRP=16 G6_ATTN_QT=1 G6_ATTN_FRONT=1` (CHANGELOG, 2026-10-16).
+G6_IDX_GRP=16 G6_ATTN_QT=1 G6_ATTN_FRONT=1` (CHANGELOG, 2026-10-16). "Same bits" is by construction for every value;
+the attnk bench (`engine/attn/tests/attnk.cu`) checked the measured set, with and without `QT=1 FRONT=1`.
 
 `G6ENV_X="NAME=value ..."` adds more variables on every rank. The engine rejects bad `G6_PF_*` values at startup
 (`engine/runtime/envparse.h`).
