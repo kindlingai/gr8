@@ -417,10 +417,10 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
 #endif
     float* dst=parts+(((int64_t)row*a.heads+h)*PART+part)*512;dst[t]=lo;dst[t+256]=hi;
 }
-template<class Input,int P=PART>   // P = PART_E1 under G6_ATTN_CTX2=9 (decode-small.cuh launch_merge_parts)
+template<class Input>
 __global__ void merge_parts(Input input,const float* parts,float* out){
     auto a=resolve(input);if(!a.active)return;
-    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<P;part++)s+=parts[((int64_t)rowhead*P+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
+    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<PART;part++)s+=parts[((int64_t)rowhead*PART+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
 }
 template<class Input>
 __global__ void value_project(Input input,int start,const float* context){
@@ -472,7 +472,7 @@ __global__ void value_project_m(Input input,int start,int n,const float* context
             for(int m=0;m<16;m++)sum=fmaf(ctx[row][lane+32*m],u[m],sum);
             sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)(start+c+row)*a.heads+h)*256+d]=__float2half_rn(sum);}}
 }
-// G6_ATTN_ABS2=<R> (attn_abs2; 1 / 2 / 4 / 8): absorb_m with R outputs per warp and the q_b rows staged in one round trip.
+// absorb_m2<R,QT>: absorb_m with R outputs per warp and the q_b rows staged in one round trip.
 // Warp w of block x owns d = 8R x + w + 8i (i < R): its R lane-strided weight rows are loaded first (6R loads in flight);
 // a chunk of <= AVP_ROWS q_b rows is staged with 16 B loads, each half converted by __half2float (= hfloat; absorb_m's
 // loop was one 2 B load and store per round trip); per row each of the R sums is absorb_m's: the same fmaf chain over
@@ -480,6 +480,7 @@ __global__ void value_project_m(Input input,int start,int n,const float* context
 // rows w, w + 8, ..: absorb_m's formula and stores (absorb_m ran every row in block 0). QT (G6_ATTN_QT, attn_qt): q and
 // rope stored lane-transposed for scores_sc<S,TR,true> (decode-small.cuh): q of (row, head) at float (c*32 + l)*4 + e
 // for d = l + 32(4c + e), rope at l*2 + k for j = l + 32k; the same values. Needs q_b 16 B aligned (dispatch).
+// Launched with R = 1, QT = true only (launch_absorb_m2, under G6_ATTN_QT).
 // grid (64/R + 1, heads), block 256; registers capped for one wave (R <= 4: 6 blocks / SM, 64/R + 1 blocks per head; R = 8: 3).
 template<int R,bool QT,class Input>
 __global__ void __launch_bounds__(256,R==8?3:6) absorb_m2(Input input,int start,int n,float* q,float* rope){
@@ -517,39 +518,6 @@ __global__ void __launch_bounds__(256,R==8?3:6) absorb_m2(Input input,int start,
             if(lane==0){float* o=q+((int64_t)(c+row)*a.heads+h)*512;
                 #pragma unroll
                 for(int i=0;i<R;i++){const int d=d0+8*i;if(QT)o[((d>>7)*32+(d&31))*4+((d>>5)&3)]=s[i];else o[d]=s[i];}}}}
-}
-// G6_ATTN_VP2=<R> (attn_vp2; 1 / 2 / 4): value_project_m with R outputs per warp (d = 8R x + w + 8i, 16R weight registers
-// loaded first) and the context rows staged with float4 loads, unrolled (one round trip; value_project_m's loop was one
-// 4 B load and store per round trip). Per row each sum is value_project_m's: the same 16-fmaf chain over k = lane + 32m,
-// the same warp_sum, lane 0 stores __float2half_rn. Needs the context 16 B aligned (workspace). grid (32/R, heads), block 256;
-// registers capped for the fewest waves (R = 1: 6 blocks / SM; R = 2: 5, as 6 spills; R = 4: 3, one wave).
-template<int R,class Input>
-__global__ void __launch_bounds__(256,R==4?3:R==2?5:6) value_project_m2(Input input,int start,int n,const float* context){
-    auto a=resolve(input);if(!a.active)return;
-    const int h=blockIdx.y,w=threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x,d0=blockIdx.x*8*R+w;
-    __shared__ __align__(16) float ctx[AVP_ROWS][512];
-    float u[R][16];
-    #pragma unroll
-    for(int i=0;i<R;i++)
-        #pragma unroll
-        for(int m=0;m<16;m++)u[i][m]=bfloat(a.uv,((int64_t)h*256+d0+8*i)*512+lane+32*m);
-    for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
-        if(c)__syncthreads();
-        #pragma unroll
-        for(int b=0;b<AVP_ROWS/2;b++){const int i=t+256*b,row=i/128,k=(i%128)*4;   // nc*128 <= 1024 float4
-            if(row<nc)*(float4*)&ctx[row][k]=*(const float4*)&context[((int64_t)(c+row)*a.heads+h)*512+k];}
-        __syncthreads();
-        for(int row=0;row<nc;row++){float s[R];
-            #pragma unroll
-            for(int i=0;i<R;i++){float sum=0;
-                #pragma unroll
-                for(int m=0;m<16;m++)sum=fmaf(ctx[row][lane+32*m],u[i][m],sum);
-                s[i]=sum;}
-            #pragma unroll
-            for(int i=0;i<R;i++)s[i]=warp_sum(s[i]);
-            if(lane==0){
-                #pragma unroll
-                for(int i=0;i<R;i++)((half*)a.output)[((int64_t)(start+c+row)*a.heads+h)*256+d0+8*i]=__float2half_rn(s[i]);}}}
 }
 // G6_AVP1=1 (default off; tp3-avp-onelaunch): one launch for any n, weights in registers, rows staged AVP_STAGE at a time.
 constexpr int AVP_STAGE=8;
@@ -613,15 +581,12 @@ __global__ void value_project_m1(Input input,int start,int n,const float* contex
 static int& avp1_on(){static int v=[]{const char* e=getenv("G6_AVP1");return e&&atoi(e)?1:0;}();return v;}
 // G6_ATTN_CTX2 (default 0 = off; decode-small.cuh): replaces context_parts_heads on its own calls. 1 / 2 = context_parts_heads
 // with 32 / 64 gathered pairs per batch, 3 / 4 = context_pk with 16 / 32 (two batches in flight): bit-identical parts.
-// 9 = E1: context_pk over PART_E1 = 32 partitions of 64 slots (4x the CTAs, 64-slot chains) and merge_parts over 32
-// partials: the fp32 sum order changes (gate by KL, not bytes). FP8 KV only. Host-side, read once before the first
-// workspace() (9 sizes the parts scratch); tests may assign it before computing the scratch size.
-constexpr int PART_E1=32;
+// FP8 KV only. Host-side, read once (before graph capture); tests may assign it.
 static int& attn_ctx2(){static int v=[]{
 #if G6_KV4
     return 0;
 #else
-    const char* e=getenv("G6_ATTN_CTX2");const int x=e?atoi(e):0;return (x>=1&&x<=4)||x==9?x:0;
+    const char* e=getenv("G6_ATTN_CTX2");const int x=e?atoi(e):0;return x>=1&&x<=4?x:0;
 #endif
     }();return v;}
 // G6_ATTN_CTX3 (default 0 = off; decode-small.cuh context_pk3): replaces context_parts_heads / G6_ATTN_CTX2 on their calls.
@@ -642,11 +607,8 @@ static int& attn_ctx3_hg(){static int v=[]{const char* e=getenv("G6_ATTN_CTX3_HG
 static int& attn_sel2(){static int v=[]{const char* e=getenv("G6_ATTN_SEL2");const int x=e?atoi(e):0;return x==8||x==16||x==32||x==64?x:0;}();return v;}
 static int& attn_idx_grp(){static int v=[]{const char* e=getenv("G6_IDX_GRP");const int x=e?atoi(e):0;return x>=1&&x<=64?x:0;}();return v;}
 // Round 3 (default 0 = off, bit-identical, host-side, read once before graph capture; tests may assign them):
-// G6_ATTN_ABS2=<R> / G6_ATTN_VP2=<R> (DEC_AVP launches: absorb_m2 / value_project_m2 above), G6_ATTN_QT=1 (run_body:
-// absorb_m2 stores q / rope lane-transposed and scores_sc reads them with 16 B loads; decode-small.cuh use_qt), G6_ATTN_FRONT=1
-// (g6_attn_replay_run: attn_front), G6_ATTN_CTX4=1..3 (decode-small.cuh context_pk4; FP8 KV only).
-static int& attn_abs2(){static int v=[]{const char* e=getenv("G6_ATTN_ABS2");const int x=e?atoi(e):0;return x==1||x==2||x==4||x==8?x:0;}();return v;}
-static int& attn_vp2(){static int v=[]{const char* e=getenv("G6_ATTN_VP2");const int x=e?atoi(e):0;return x==1||x==2||x==4?x:0;}();return v;}
+// G6_ATTN_QT=1 (run_body, use_qt: absorb_m2 above stores q / rope lane-transposed and scores_sc reads them with 16 B loads;
+// FP8 KV only), G6_ATTN_FRONT=1 (g6_attn_replay_run: attn_front).
 static int& attn_qt(){static int v=[]{
 #if G6_KV4
     return 0;
@@ -655,13 +617,6 @@ static int& attn_qt(){static int v=[]{
 #endif
     }();return v;}
 static int& attn_front_on(){static int v=[]{const char* e=getenv("G6_ATTN_FRONT");return e&&atoi(e)==1?1:0;}();return v;}
-static int& attn_ctx4(){static int v=[]{
-#if G6_KV4
-    return 0;
-#else
-    const char* e=getenv("G6_ATTN_CTX4");const int x=e?atoi(e):0;return x>=1&&x<=3?x:0;
-#endif
-    }();return v;}
 static bool al16(const void* p){return ((uintptr_t)p&15)==0;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
@@ -675,7 +630,7 @@ static Work workspace(const G6Attn& a,void* base){
     w.si=(float*)alloc(R*T*4);w.so=(float*)alloc(R*T*4);w.ii=(int*)alloc(R*T*4);w.io=(int*)alloc(R*T*4);w.offsets=(int*)alloc((R+1)*4);
     w.selected=(uint64_t*)alloc(R*TOP*8);w.selection=(SelectionState*)alloc(R*sizeof(SelectionState));
     w.histogram=(int*)alloc(R*((std::min(T,size_t(32768))+RADIX_CHUNK-1)/RADIX_CHUNK)*256*4);
-    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*(attn_ctx2()==9?PART_E1:PART)*512*4);w.context=(float*)alloc(R*H*512*4);
+    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*PART*512*4);w.context=(float*)alloc(R*H*512*4);
     size_t b=0;cudaError_t e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,b,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);
     if(e!=cudaSuccess)return Work{};
     // The last query tile can contain one row even when the workspace has R>1.
@@ -785,21 +740,9 @@ template<class Input>   // DEC_AVP launches (tests call these regardless of the 
 static void launch_absorb_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){absorb_m<<<dim3(64,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);}
 template<class Input>
 static void launch_value_project_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){value_project_m<<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);}
-template<int R,class Input>
-static void launch_absorb_m2r(const G6Attn& a,Input input,Work& w,int start,int n,bool qt,cudaStream_t st){
-    const dim3 g(64/R+1,a.heads);
-    if(qt)absorb_m2<R,true><<<g,256,0,st>>>(input,start,n,w.q,w.rope);else absorb_m2<R,false><<<g,256,0,st>>>(input,start,n,w.q,w.rope);
-}
-template<class Input>   // G6_ATTN_ABS2 / G6_ATTN_QT (tests call these regardless of the build flag); q_b 16 B aligned
-static void launch_absorb_m2(const G6Attn& a,Input input,Work& w,int start,int n,int R,bool qt,cudaStream_t st){
-    switch(R){case 2:launch_absorb_m2r<2>(a,input,w,start,n,qt,st);break;case 4:launch_absorb_m2r<4>(a,input,w,start,n,qt,st);break;
-        case 8:launch_absorb_m2r<8>(a,input,w,start,n,qt,st);break;default:launch_absorb_m2r<1>(a,input,w,start,n,qt,st);break;}
-}
-template<class Input>   // G6_ATTN_VP2; w.context 16 B aligned
-static void launch_value_project_m2(const G6Attn& a,Input input,Work& w,int start,int n,int R,cudaStream_t st){
-    switch(R){case 2:value_project_m2<2><<<dim3(16,a.heads),256,0,st>>>(input,start,n,w.context);break;
-        case 4:value_project_m2<4><<<dim3(8,a.heads),256,0,st>>>(input,start,n,w.context);break;
-        default:value_project_m2<1><<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);break;}
+template<class Input>   // G6_ATTN_QT (tests call it regardless of the build flag); q_b 16 B aligned
+static void launch_absorb_m2(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+    absorb_m2<1,true><<<dim3(64+1,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);
 }
 #if defined(DEC_AVP) && DEC_AVP
 // absorb / value_project of n rows from row `start`: one _m launch for n <= AVP_ROWS; under DEC_S2 (up to G6_MX rows per step) chunks of
@@ -808,14 +751,13 @@ static void launch_value_project_m2(const G6Attn& a,Input input,Work& w,int star
 // qt (run_body, use_qt): absorb_m2 with the lane-transposed q / rope that its scores launch reads
 template<class Input>
 static bool launch_absorb_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
-    if(qt||(attn_abs2()&&al16(a.q_b)))launch_absorb_m2(a,input,w,start,n,attn_abs2()?attn_abs2():1,qt,st);
+    if(qt)launch_absorb_m2(a,input,w,start,n,st);
     else launch_absorb_m(a,input,w,start,n,st);
     return true;
 }
 template<class Input>
 static bool launch_value_project_rows(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-    if(attn_vp2()&&al16(w.context))launch_value_project_m2(a,input,w,start,n,attn_vp2(),st);
-    else launch_value_project_m(a,input,w,start,n,st);
+    launch_value_project_m(a,input,w,start,n,st);
     return true;
 }
 #endif
@@ -859,7 +801,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         AMARK(5);
         ga::launch_context_parts(a,input,w,start,n,stream);
         AMARK(6);
-        ga::launch_merge_parts(a,input,w.parts,w.context,n,stream);
+        ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
         KV4_ROTATE(w.context,n*a.heads,stream);
         AMARK(7);
 #if defined(DEC_AVP) && DEC_AVP
@@ -962,7 +904,7 @@ static cudaError_t cp_group_body(const G6Attn& a,Input input,Work w,const float*
     launch_mla_scores(a,input,w,0,n,stream);
     cp_softmax<<<nh,256,0,stream>>>(input,w.prob,part+(int64_t)nh*512,part+(int64_t)nh*513);
     launch_context_parts(a,input,w,0,n,stream);
-    launch_merge_parts(a,input,w.parts,part,n,stream);
+    merge_parts<<<nh,256,0,stream>>>(input,w.parts,part);
     return cudaGetLastError();
 }
 template<class Input>

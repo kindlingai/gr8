@@ -2,8 +2,7 @@
 // (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier attention-chain bench without the MK
 // chain kernel. Flags under test (each a host-side static the bench assigns): G6_ATTN_SC2 / _SC2_TR (scores_sc), G6_ATTN_CTX2
 // (context_parts_heads PB / context_pk), G6_ATTN_CTX3 / _CTX3_HG (context_pk3), G6_ATTN_SEL2 (rank_selected), G6_IDX_GRP
-// (index_scores_g); round 3: G6_ATTN_ABS2 (absorb_m2), G6_ATTN_VP2 (value_project_m2), G6_ATTN_QT (lane-transposed q for
-// scores_sc), G6_ATTN_FRONT (attn_front), G6_ATTN_CTX4 (context_pk4).
+// (index_scores_g); round 3: G6_ATTN_QT (absorb_m2 with the lane-transposed q for scores_sc), G6_ATTN_FRONT (attn_front).
 // Layers: a full-index layer (its own indexer + select) then a shared layer reusing its indices, M rows at live context L in
 // capture bucket T, S2 batched cell with per-row tables (s2=1, as served). One call's GPU time inside a graph of K calls,
 // median of TR alternating trials; "cold" = a 96 MB L2 flush before every call, flush subtracted (served case: the experts
@@ -25,8 +24,7 @@
 //           T(prefix k-1), hot / cold / dead, DRAM floor.
 //   ARM     one flag setting (BASE + changes):
 //           EXACT  bytes differing vs REF over chk poisoned launches (raw scores, parts, probs, context, outputs, indices,
-//                  index scores / ids, kv); ctx2=9 is E1: parts have another layout (not compared), outputs / context report
-//                  max |diff|, the rest must still be identical.
+//                  index scores / ids, kv).
 //           NODE   per layer, every node whose kernel or grid differs from BASE: its in-chain cost (prefix delta) BASE -> arm,
 //                  hot / cold.
 //           TIME   whole call BASE vs arm alternating, hot / cold, per layer, and the per-step projection over the main
@@ -38,7 +36,7 @@
 //   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o attnk attnk.cu ../bind.cu -lcublas
 // run: attnk T L M [what=3] [s2=1] [reps=10] [K=16] [TR=7] [chk=5] [bw=250]
 //   what: 1 CHAIN of BASE, 2 the arms, 4 CHAIN of stock. Arms: env ATTNK_ARMS="arm arm ..." with an arm = comma-separated
-//   KEY=VALUE changes over BASE (keys SC2 TR CTX2 CTX3 HG SEL2 IDX ABS2 VP2 QT FRONT CTX4; "base" = BASE alone, compared
+//   KEY=VALUE changes over BASE (keys SC2 TR CTX2 CTX3 HG SEL2 IDX QT FRONT; "base" = BASE alone, compared
 //   against stock), default below. ATTNK_BASE="SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16" (the same syntax over stock).
 //   sweep: for M in 1 3 8 12; do ./attnk 2048 1000 $M; ./attnk 8192 8000 $M; ./attnk 32768 32000 $M; done
 // Exit 3 on any byte difference of an exact arm, 1 on a CUDA / validation error.
@@ -155,21 +153,19 @@ static double floor_bytes(const std::string& s,int H,int L){
     if(s.find("scores")!=std::string::npos)return kv;
     return 0;
 }
-struct Arm{int sc,tr,ctx2,ctx3,hg,sel,idx,abs2,vp2,qt,front,ctx4;bool vs_stock;};
+struct Arm{int sc,tr,ctx2,ctx3,hg,sel,idx,qt,front;bool vs_stock;};
 static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;
-    ga::attn_sel2()=x.sel;ga::attn_idx_grp()=x.idx;ga::attn_abs2()=x.abs2;ga::attn_vp2()=x.vp2;ga::attn_qt()=x.qt;ga::attn_front_on()=x.front;
-    ga::attn_ctx4()=x.ctx4;}
-static const Arm STOCK{0,0,0,0,0,0,0,0,0,0,0,0,false};
-static std::string tag_of(const Arm& x){char b[160];snprintf(b,sizeof b,"SC2=%d TR=%d CTX2=%d CTX3=%d HG=%d SEL2=%d IDX=%d ABS2=%d VP2=%d QT=%d FRONT=%d CTX4=%d",
-    x.sc,x.tr,x.ctx2,x.ctx3,x.hg,x.sel,x.idx,x.abs2,x.vp2,x.qt,x.front,x.ctx4);return b;}
+    ga::attn_sel2()=x.sel;ga::attn_idx_grp()=x.idx;ga::attn_qt()=x.qt;ga::attn_front_on()=x.front;}
+static const Arm STOCK{0,0,0,0,0,0,0,0,0,false};
+static std::string tag_of(const Arm& x){char b[160];snprintf(b,sizeof b,"SC2=%d TR=%d CTX2=%d CTX3=%d HG=%d SEL2=%d IDX=%d QT=%d FRONT=%d",
+    x.sc,x.tr,x.ctx2,x.ctx3,x.hg,x.sel,x.idx,x.qt,x.front);return b;}
 // "KEY=V,KEY=V" over `on`; false on an unknown key
 static bool parse_arm(const std::string& s,Arm& x){
     if(s=="base"||s=="stock")return true;
     size_t i=0;while(i<s.size()){size_t e=s.find(',',i);if(e==std::string::npos)e=s.size();const std::string kv=s.substr(i,e-i);i=e+1;
         const size_t q=kv.find('=');if(q==std::string::npos)return false;const std::string k=kv.substr(0,q);const int v=atoi(kv.c_str()+q+1);
         if(k=="SC2")x.sc=v;else if(k=="TR")x.tr=v;else if(k=="CTX2")x.ctx2=v;else if(k=="CTX3")x.ctx3=v;else if(k=="HG")x.hg=v;
-        else if(k=="SEL2")x.sel=v;else if(k=="IDX")x.idx=v;else if(k=="ABS2")x.abs2=v;else if(k=="VP2")x.vp2=v;else if(k=="QT")x.qt=v;
-        else if(k=="FRONT")x.front=v;else if(k=="CTX4")x.ctx4=v;else return false;}
+        else if(k=="SEL2")x.sel=v;else if(k=="IDX")x.idx=v;else if(k=="QT")x.qt=v;else if(k=="FRONT")x.front=v;else return false;}
     return true;
 }
 
@@ -191,12 +187,10 @@ int main(int argc,char** argv){
     const int TIES=getenv("ATTNK_TIES")&&atoi(getenv("ATTNK_TIES"))?1:0;
     const float QS=getenv("ATTNK_QSCALE")?(float)atof(getenv("ATTNK_QSCALE")):1.f;
     // BASE and the arms
-    Arm base{4,2,4,2,0,16,16,0,0,0,0,0,false};   // the serving flags (rounds 1 + 2)
+    Arm base{4,2,4,2,0,16,16,0,0,false};   // the serving flags (rounds 1 + 2)
     if(const char* e=getenv("ATTNK_BASE")){base=STOCK;if(!parse_arm(e,base)){fprintf(stderr,"ATTNK_BASE: KEY=V,...\n");return 2;}}
-    // round 3: ABS2 / VP2 (staging + R outputs per warp; R = 1 isolates the staging), QT (alone it implies ABS2 = 1, so QT=1
-    // vs ABS2=1 isolates the transposed q), FRONT, CTX4, then the combination
-    std::vector<std::string> specs={"base","ABS2=1","ABS2=2","ABS2=4","ABS2=8","VP2=1","VP2=2","VP2=4","QT=1","QT=1,ABS2=4","QT=1,SC2=2",
-        "FRONT=1","CTX4=1","CTX4=2","CTX4=3","ABS2=4,VP2=2,QT=1,FRONT=1,CTX4=1"};
+    // round 3: QT (S = 4 and S = 2), FRONT, then both (the serving arm)
+    std::vector<std::string> specs={"base","QT=1","QT=1,SC2=2","FRONT=1","QT=1,FRONT=1"};
     if(const char* e=getenv("ATTNK_ARMS")){specs.clear();std::string s=e;size_t i=0;
         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
     std::vector<Arm> arms;
@@ -257,8 +251,7 @@ int main(int argc,char** argv){
 #endif
         CK(cudaMalloc(&dcell[l],sizeof c));CK(cudaMemcpy(dcell[l],&c,sizeof c,cudaMemcpyHostToDevice));
         c.context=0;CK(cudaMalloc(&dead[l],sizeof c));CK(cudaMemcpy(dead[l],&c,sizeof c,cudaMemcpyHostToDevice));}
-    // scratch for the largest layout (ctx2 = 9 widens the parts)
-    size_t sb=0;for(int c:{0,9}){ga::attn_ctx2()=c;sb=std::max({sb,g6_attn_scratch_bytes(&a[0]),g6_attn_scratch_bytes(&a[1])});}
+    const size_t sb=std::max(g6_attn_scratch_bytes(&a[0]),g6_attn_scratch_bytes(&a[1]));
     void* scr=dalloc<uint8_t>(sb);
     G6AttnReplay rp[2]={{a[0],dcell[0],scr,sb},{a[1],dcell[1],scr,sb}},rd[2]={{a[0],dead[0],scr,sb},{a[1],dead[1],scr,sb}};
     const size_t fl=(size_t)96<<20;float4* fb=dalloc<float4>(fl/16);float* sink=dalloc<float>(1);
@@ -277,12 +270,12 @@ int main(int argc,char** argv){
         CK(cudaMemsetAsync(W.si,0xab,nsi*4,st));CK(cudaMemsetAsync(W.ii,0xab,nsi*4,st));};
     auto poison=[&](const ga::Work& W){for(int l=0;l<2;l++){CK(cudaMemsetAsync(out[l],0xff,no*2,st));CK(cudaMemsetAsync(ind[l],0x5a,ni*4,st));}poison_w(W);};
     // the full call into s (both layers), then per layer the chain prefixes through the scores and the context node
-    auto take=[&](Snap& s,bool e1){
+    auto take=[&](Snap& s){
         const ga::Work W=ga::workspace(a[1],scr);   // the layers share the scratch (the same layout: rows, heads, context)
         {cudaGraphExec_t g=inst(st,both);poison(W);CK(cudaGraphLaunch(g,st));CK(cudaStreamSynchronize(st));cudaGraphExecDestroy(g);}
         s.o0=host(out[0],no);s.o1=host(out[1],no);s.i0=host(ind[0],ni);s.cx=host(W.context,nc);s.pr=host(W.prob,np);
         s.si=host(W.si,nsi);s.ii=host(W.ii,nsi);   // written by the full layer's indexer only (the shared layer reuses)
-        s.pa=e1?std::vector<float>():host(W.parts,npa);
+        s.pa=host(W.parts,npa);
         s.kv.clear();s.ix.clear();
         for(int i=0;i<M;i++){for(int l=0;l<2;l++){auto v=host(mla[l]+prow[i]*g6kv::ROW,(size_t)g6kv::ROW);s.kv.insert(s.kv.end(),v.begin(),v.end());}
             auto v=host(ixc+(prow[i]/64)*ipb,ipb);s.ix.insert(s.ix.end(),v.begin(),v.end());}
@@ -291,10 +284,10 @@ int main(int argc,char** argv){
             if(ks<0||kc<0){fprintf(stderr,"no scores / context node\n");exit(1);}
             // (the shared layer reads the full layer's indices: they are in place from the call above; scratch poisoned after)
             poison_w(W);for(int j=0;j<=ks;j++)relaunch(c[j],st);CK(cudaStreamSynchronize(st));s.sc[l]=host(W.prob,np);
-            poison_w(W);for(int j=0;j<=kc;j++)relaunch(c[j],st);CK(cudaStreamSynchronize(st));s.pl[l]=e1?std::vector<float>():host(W.parts,npa);
+            poison_w(W);for(int j=0;j<=kc;j++)relaunch(c[j],st);CK(cudaStreamSynchronize(st));s.pl[l]=host(W.parts,npa);
             cudaGraphDestroy(g);}
         CK(cudaGetLastError());};
-    Snap ref;take(ref,false);
+    Snap ref;take(ref);
     {int live=0;for(int v:ref.i0)live+=v>=0;size_t nan=0;for(auto h:ref.o0)nan+=!std::isfinite(__half2float(h));for(auto h:ref.o1)nan+=!std::isfinite(__half2float(h));
      printf("REF selected %d, nonfinite out %zu, err %u/%u valid %u/%u\n",live,nan,ref.e0,ref.e1,ref.v0,ref.v1);
      if(ref.e0||ref.e1||!ref.v0||!ref.v1)return 1;}
@@ -341,7 +334,6 @@ int main(int argc,char** argv){
     if(WHAT&2)for(const Arm& x:arms){
         const Arm ref_arm=x.vs_stock?STOCK:base;   // timing reference
         const std::string tag=tag_of(x),rtag=x.vs_stock?"stock":"BASE";
-        const bool e1=x.ctx2==9&&!x.ctx3;
         // the arm must reach this call's dispatch: some node of some layer differs from its timing reference
         {bool differs=false;
          for(int l=0;l<2&&!differs;l++){set_arm(ref_arm);cudaGraph_t g0=capture(st,[&]{call(l);});auto c0=chain_of(g0);
@@ -351,23 +343,17 @@ int main(int argc,char** argv){
          if(!differs){printf("ARM %s not taken by this call's dispatch (same chain as %s)\n",tag.c_str(),rtag.c_str());continue;}}
         set_arm(x);
         // EXACT (against stock)
-        size_t w[14]={0};bool ok=true;double dout=0,dcx=0,mout=0,mcx=0;
-        for(int it=0;it<CHK;it++){Snap s;take(s,e1);
-            size_t d[14]={vdiff(ref.o0,s.o0),vdiff(ref.o1,s.o1),vdiff(ref.i0,s.i0),vdiff(ref.pr,s.pr),e1?0:vdiff(ref.pa,s.pa),vdiff(ref.cx,s.cx),
+        size_t w[14]={0};bool ok=true;
+        for(int it=0;it<CHK;it++){Snap s;take(s);
+            size_t d[14]={vdiff(ref.o0,s.o0),vdiff(ref.o1,s.o1),vdiff(ref.i0,s.i0),vdiff(ref.pr,s.pr),vdiff(ref.pa,s.pa),vdiff(ref.cx,s.cx),
                 vdiff(ref.kv,s.kv)+vdiff(ref.ix,s.ix),vdiff(ref.sc[0],s.sc[0]),vdiff(ref.sc[1],s.sc[1]),
-                e1?0:vdiff(ref.pl[0],s.pl[0]),e1?0:vdiff(ref.pl[1],s.pl[1]),vdiff(ref.si,s.si),vdiff(ref.ii,s.ii),0};
-            for(int q=0;q<13;q++)w[q]=std::max(w[q],d[q]);ok&=!s.e0&&!s.e1&&s.v0&&s.v1;
-            for(size_t i=0;i<no;i++){const double r0=__half2float(ref.o0[i]),r1=__half2float(ref.o1[i]);
-                dout=std::max({dout,fabs(r0-__half2float(s.o0[i])),fabs(r1-__half2float(s.o1[i]))});mout=std::max({mout,fabs(r0),fabs(r1)});}
-            for(size_t i=0;i<nc;i++){dcx=std::max(dcx,(double)fabs(ref.cx[i]-s.cx[i]));mcx=std::max(mcx,(double)fabs(ref.cx[i]));}}
+                vdiff(ref.pl[0],s.pl[0]),vdiff(ref.pl[1],s.pl[1]),vdiff(ref.si,s.si),vdiff(ref.ii,s.ii),0};
+            for(int q=0;q<13;q++)w[q]=std::max(w[q],d[q]);ok&=!s.e0&&!s.e1&&s.v0&&s.v1;}
         bool exact=ok;for(int q=0;q<13;q++)exact&=!w[q];
         printf("EXACT %s T=%d L=%d M=%d x%d | bytes differing vs stock: index scores %zu ids %zu, indices %zu, scores full %zu shared %zu, "
                "parts full %zu shared %zu, probs %zu, parts(call) %zu, context %zu, out full %zu shared %zu, kv+index cache %zu | err/valid %s | %s\n",
-               tag.c_str(),T,L,M,CHK,w[11],w[12],w[2],w[7],w[8],w[9],w[10],w[3],w[4],w[5],w[0],w[1],w[6],ok?"ok":"BAD",exact?"IDENTICAL":e1?"DIFFER (E1)":"DIFFER");
-        if(e1)printf("  E1 max |diff|: out %.3g (max |out| %.3g), context %.3g (max |context| %.3g)%s\n",dout,mout,dcx,mcx,
-            w[2]||w[3]||w[6]||w[7]||w[8]||w[11]||w[12]||!ok?" | indices / probs / scores / kv / err NOT identical: BAD":"");
-        if(!exact&&!e1){bad++;continue;}
-        if(e1&&(w[2]||w[3]||w[6]||w[7]||w[8]||w[11]||w[12]||!ok)){bad++;continue;}
+               tag.c_str(),T,L,M,CHK,w[11],w[12],w[2],w[7],w[8],w[9],w[10],w[3],w[4],w[5],w[0],w[1],w[6],ok?"ok":"BAD",exact?"IDENTICAL":"DIFFER");
+        if(!exact){bad++;continue;}
         // NODE: per layer, the nodes that differ from the timing reference: prefix deltas, reference vs arm
         for(int l=0;l<2;l++){
             std::vector<Node> nn[2];cudaGraph_t gg[2];
@@ -392,7 +378,7 @@ int main(int argc,char** argv){
         const double gate=x.vs_stock?0.5:M>=12||T>=32768?1.0:0.3;
         printf("TIME %s vs %s T=%d L=%d M=%d | hot full %.1f -> %.1f, shared %.1f -> %.1f | cold full %.1f -> %.1f, shared %.1f -> %.1f us | "
                "saved per step (21 full + 57 shared): cold %.3f ms, hot %.3f ms | gate %.1f %s\n",tag.c_str(),rtag.c_str(),T,L,M,o[0],o[4],o[2],o[6],o[1],o[5],o[3],o[7],
-               step_cold,step_hot,gate,step_cold>=gate?(e1?"PASS (E1: needs KL)":"PASS"):"below");
+               step_cold,step_hot,gate,step_cold>=gate?"PASS":"below");
     }
     set_arm(STOCK);
     if(bad)return 3;
