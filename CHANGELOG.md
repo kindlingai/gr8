@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-10-16: a decode step timeline for S2 (G6_S2_TIMELINE, a measurement)
+
+- `G6_S2_TIMELINE=N` (every rank, off by default) splits the time between decode steps into GPU work and host round
+  trip. Around each decode step launch (main, first-form draft, chain, DFlash2 context-only and query steps) the host
+  stamps its clock and records a CUDA event before and after the graph launch; after the fence it adds the step's GPU
+  span, input prep, launch call and fence wait to per-kind totals, and the GPU idle since the previous step's end plus
+  the host time since the previous fence to per-transition totals. Every N main steps each rank prints them.
+- Prefill quanta, mode switches and the drafter's prompt fill cut the chain; gaps over 20 ms count as breaks. With
+  `G6_DRAFT_PAR` the drafter step on its own stream is timed apart (`dfl_ctx_par` / `dfl_query_par`).
+- It sizes the host round trip that a device-side accept and launch could remove. Unset, it records nothing.
+
+## 2026-10-16: the DFlash2 drafter step under MTP's first form, on its own stream (G6_DRAFT_PAR, off by default)
+
+- In a round of a request that decodes alone with DFlash2, the drafter step ran after MTP's first form (and after the
+  MTP chain on the drafter choice's MTP rounds). Neither reads what the other writes: they are fixed graphs on separate
+  weights, scratch and fabrics, and the drafter choice reads nothing the first form writes. `G6_DRAFT_PAR=1` makes the
+  choice first, launches the drafter step on its own stream, runs the first form (and the chain) on the main stream,
+  and waits for the drafter at the end of the round. 2 puts a drafting step on a high-priority stream.
+- Every kernel that waits for its peers runs at most 8 CTAs, so the other stream always finds SMs and neither can
+  starve the other's fabric wait.
+- The same graphs on the same inputs as serial: every step's bytes are unchanged. `batch_draftpar_test` (host) runs
+  serial and parallel batches through the drafter choice, the confidence stop, the insert rule and `G6_DFL_REUSE`, and
+  checks the same tokens, requests, steps and statistics. `G6_S2_ROUNDLOG` adds a `# s2_dfl` line: the drafter step's
+  launch-to-wait time.
+
+## 2026-10-16: an MTP confidence stop for a request's solo MTP rounds (G6_MTP_KSTOP, off by default)
+
+- A request that decodes alone and drafts with MTP (the drafter choice's MTP rounds, and with `G6_DFL_REUSE` its
+  warm-up and promoted rounds) chained and verified `--mtp` drafts every round. `G6_MTP_KSTOP=1` chains and verifies
+  1..`G6_MTP_KSTOP_KMAX` (at most 3) drafts instead, chosen from the MTP head's own log-probabilities, which S2 now
+  returns with the draft steps: draft j is verified while p_1 x .. x p_j >= `G6_MTP_KSTOP_TAU` t_j, and the chain stops
+  before a draft that could not pass. `G6_MTP_KSTOP=2` takes the count from the drafter choice's MTP estimates.
+- The log-probabilities are the same bytes on every rank, so every rank takes the same k; the policy is in the S2
+  runtime signature. A session that another request joins has its chain completed to K before its first shared round.
+- Drafts only: the target decides every token, but the verify's row count varies (2..kmax + 1) as a DFlash2 round's
+  does. Off, the planner's steps are unchanged with or without the log-probability hook (`batch_kstop_test`).
+- `G6_MTP_LPLOG=1` prints one `# kstop` line per solo round on rank 0 (the drafts' log-probabilities, the verified and
+  accepted counts), for tuning the thresholds offline. It changes nothing else.
+
+## 2026-10-16: DFlash2 after a prefix-reuse hit, and for a request left alone on MTP (G6_DFL_REUSE, off by default)
+
+- KNOWN-ISSUES #1: at TP=4 a request whose prefix-reuse hit skipped into the drafter's 2,048-position window, or that
+  was not alone at its prompt tail, ran MTP for its whole life. That is most later turns of a conversation.
+  `G6_DFL_REUSE=1` lets the hit request keep the drafter: the drafter's context starts past the hit's rows, or at the
+  window's start when its KV ring still holds the previous turn of the same conversation (S2 tracks which tokens the
+  ring's rows belong to). With fewer than `G6_DFL_REUSE_MIN` (256) context rows the request runs MTP rounds that feed
+  the drafter until it holds that many, then drafts with DFlash2. `G6_DFL_REUSE=2` also gives the drafter to a request
+  that runs alone on MTP, from its last token, the same way.
+- Drafts only: the target decides every token. Unset, no step changes. A session that starts its warm-up on MTP has
+  its chain drafted at admit, so its first MTP round verifies K drafts. Host test: `batch_dflreuse_test`.
+- With it on, rank 0 prints a `# s2 dflash reuse slot` line for every request: rounds on each drafter, where the
+  context started, the warm-up and the promotion, so a request that never had DFlash2 shows too.
+
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
 - The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for

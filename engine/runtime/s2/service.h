@@ -54,6 +54,8 @@ struct NativeHooks {
     int dfl_kv = 7;
     g6rt::SpecLen dfl_spec;
     s2::DSel dsel;                    // drafter choice (G6_S2_DSEL)
+    s2::KStop kstop;                  // solo MTP rounds' draft count (G6_MTP_KSTOP, G6_MTP_LPLOG)
+    s2::DflReuse dfl_reuse;           // G6_DFL_REUSE
 };
 // Only atomic scalar stores/loads on the compute hot path. No request-file
 // checks, digest, allocation, or lock in an event-free boundary. horizon() is
@@ -354,6 +356,10 @@ public:
             if (stats.switches || stats.mtp_rounds)
                 fprintf(stderr,"# s2 drafter choice slot %u: %ld of %ld rounds on MTP, %ld switches, %ld tokens\n",unsigned(k.slot),
                         stats.mtp_rounds,stats.rounds,stats.switches,stats.tokens);
+            if (native_.dfl_reuse.mode && !c_.rank)   // every request, so one that never had the drafter shows too
+                fprintf(stderr,"# s2 dflash reuse slot %u: %ld of %ld rounds on DFlash2, %ld on MTP; context from %d (taps from %d), "
+                        "warm-up to %d, promoted at %d, %ld tokens\n",unsigned(k.slot),stats.dfl_rounds,stats.rounds,stats.mtp_rounds,
+                        stats.dfl_lo,stats.dfl_from,stats.dfl_warm,stats.promoted,stats.tokens);
             sessions_.terminal(k,stats);
         };
         if (native_.dispatch.dfl) {
@@ -361,9 +367,13 @@ public:
             h.dfl_ok = [&](Key k) { return dispatch_.dfl_ok(k.slot); };
             h.dfl_start = [&](Key k) { return dispatch_.dfl_start(k.slot); };
             h.dfl = [&](Key, const s2::DflReq& r) { return dispatch_.dfl(r); };
+            h.draft_lp = native_.dispatch.draft_lp;
         }
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
-        if (native_.dispatch.dfl) { driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); }
+        if (native_.dispatch.dfl) {
+            driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
+            driver_->dfl_reuse(native_.dfl_reuse);
+        }
         if (reuse()) {
             require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
             dispatch_.track_rows();

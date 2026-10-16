@@ -72,6 +72,16 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   if [ "$TP" = 4 ] && [ "$PF_OWN" = 4 ]; then
     ENGINE_ENV="$ENGINE_ENV G6_PF_QP_ROLL=${QP_ROLL:-2} G6_PF_QP_CTX=${QP_CTX:-$CAP} G6_PF_QP_EARLY=${QP_EARLY:-1}"
   fi
+  # DFlash2 after a prefix-reuse hit (DFL_REUSE, DFL_REUSE_MIN; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${DFL_REUSE:+ G6_DFL_REUSE=$DFL_REUSE}"
+  ENGINE_ENV="$ENGINE_ENV${DFL_REUSE_MIN:+ G6_DFL_REUSE_MIN=$DFL_REUSE_MIN}"
+  # the MTP confidence stop for solo MTP rounds (MTP_KSTOP, MTP_KSTOP_KMAX, MTP_KSTOP_TAU; docs/SETTINGS.md): off
+  # unless set. G6_MTP_KSTOP_SEED3 and the round log G6_MTP_LPLOG stay engine environment (G6ENV_X)
+  ENGINE_ENV="$ENGINE_ENV${MTP_KSTOP:+ G6_MTP_KSTOP=$MTP_KSTOP}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_KSTOP_KMAX:+ G6_MTP_KSTOP_KMAX=$MTP_KSTOP_KMAX}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_KSTOP_TAU:+ G6_MTP_KSTOP_TAU=$MTP_KSTOP_TAU}"
+  # the DFlash2 drafter step under MTP's first form on its own stream (DRAFT_PAR; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${DRAFT_PAR:+ G6_DRAFT_PAR=$DRAFT_PAR}"
   return 0
 }
 
