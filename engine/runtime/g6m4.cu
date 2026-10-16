@@ -421,6 +421,32 @@ int main(int argc, char** argv)
 #else
     auto qp_err = [&]() -> unsigned { return 0u; };
 #endif
+    // G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (rank.cuh QSplit; default 0 = off): replicated GEMVs split by output
+    // tiles across the ranks and all-gathered. The main model's gathers run on fabg (port + 64), the MTP draft's on fabdg
+    // (port + 72), each created right after its model is built (the plan sets the collective count). Proxy CPU N-9 for
+    // both (main and draft steps never run at once; inside the shim / front end's taskset range 0..N-8;
+    // G6_QA_SPLIT_CPU moves it). Every rank must run the same values (the S2 runtime signature carries them).
+    std::string qse;
+    const int qs_mode = env_choice("G6_QA_SPLIT", 2, 0, &qse), iq_split = env_choice("G6_IDXQ_SPLIT", 1, 0, &qse),
+              mtp_split = env_choice("G6_MTP_SPLIT", 1, 0, &qse);
+    if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
+    if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
+    g6::Fabric fabg, fabdg;
+    bool fabg_on = false, fabdg_on = false;
+    auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+        g6::FabricConfig gc = cfg;
+        gc.vcap.clear(); gc.vdst_k.clear();
+        gc.ncoll = mm.qs.ncoll();
+        gc.slot_bytes = qs_slot_bytes(mm);
+        gc.port = cfg.port + port_off;
+        gc.proxy_cpu = cfg.proxy_cpu > 8 ? cfg.proxy_cpu - 9 : -1;
+        if (const char* e = getenv("G6_QA_SPLIT_CPU")) gc.proxy_cpu = atoi(e);   // its proxy's core (-1 = unpinned); A/B of the placement
+        fb.init(gc);
+        fb.start_proxy();
+        fprintf(stderr, "# rank %d: %s gather fabric: %d collectives of up to %zu B, %.1f MB pinned, proxy CPU %d\n", cfg.rank, what,
+                gc.ncoll, gc.slot_bytes, 2.0 * gc.ncoll * (1 + cfg.ips.size()) * ((gc.slot_bytes + 8 + 255) & ~size_t(255)) / 1e6, gc.proxy_cpu);
+    };
+    auto qs_err = [&]() -> unsigned { return (fabg_on ? *fabg.dev().error : 0u) | (fabdg_on ? *fabdg.dev().error : 0u); };   // the gather proxies' own error words
 #if defined(G6_CP) && G6_CP
     // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
@@ -452,10 +478,10 @@ int main(int argc, char** argv)
     }
     // enqueue the CP collectives of a step that runs the CP block (context > R), before its GPU work
     auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
-    auto cp_error = [&]() -> unsigned { return cp_on ? *fabc.dev().error : 0u; };
+    auto cp_error = [&]() -> unsigned { return (cp_on ? *fabc.dev().error : 0u) | qs_err(); };   // + the G6_QA_SPLIT proxy
 #else
     auto cp_enqueue = [&](unsigned long long, int, int) {};
-    auto cp_error = [&]() -> unsigned { return 0u; };
+    auto cp_error = [&]() -> unsigned { return qs_err(); };   // the G6_QA_SPLIT proxy
 #endif
     G6RT_CK(bind::init());
     pf_prof().on = getenv("G6_PF_PROF") != nullptr;
@@ -526,6 +552,8 @@ int main(int argc, char** argv)
     }
 #endif
     m.wide = wide;
+    m.qs.mode = qs_mode;
+    m.qs.iq = iq_split == 1;
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
 #endif
@@ -543,6 +571,17 @@ int main(int argc, char** argv)
         if (R == 0) fprintf(stderr, "# steering manifest %s\n", steering_profile.manifest_json.c_str());
     }
     boot("layers bound");
+    if (m.qs.on())                      // every rank, at the same point: its TCP bootstrap is a barrier
+    {
+        qs_fabric(fabg, m, 64, "G6_QA_SPLIT / G6_IDXQ_SPLIT");
+        fabg_on = true;
+        qs_attach(m, fabg.dev(), f.error);   // GPU-side gather wait timeouts land in the error word the step loop checks
+    }
+    // enqueue the gathers of a main step (every main step runs all of them), before its GPU work
+    auto qs_enqueue = [&](unsigned long long step, int M) { if (fabg_on) fabg.enqueue_step(step, qs_sizes(m, M)); };
+    // the same for a draft step (G6_MTP_SPLIT); D is built further down, before any step
+    Draft D;
+    auto qsd_enqueue = [&](unsigned long long step, int M) { if (fabdg_on) fabdg.enqueue_step(step, qs_sizes(D.d, M)); };
 #if defined(G6_CP) && G6_CP
     if (cp_on)
         for (int c = 0; c < cp_colls.ncoll(); ++c)
@@ -605,7 +644,6 @@ int main(int argc, char** argv)
         build_prefill(P2, m, find, MP, fp2, dmalloc<u64>(1), st, &P);
     }
     u64 ls0b = 1;
-    Draft D;
     DraftPrefill DQ;
     g6::FabricDev fd{};
     StepIn* in_d = nullptr;
@@ -615,7 +653,14 @@ int main(int argc, char** argv)
         fd = fabd.dev();
         G6RT_CK(cudaHostAlloc((void**)&in_d, sizeof(StepIn), cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
+        if (mtp_split) { D.d.qs.mode = 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // G6_MTP_SPLIT: eh_proj, q_a / kv_a / idx, idx_q
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
+        if (D.d.qs.on())
+        {
+            qs_fabric(fabdg, D.d, 72, "G6_MTP_SPLIT");
+            fabdg_on = true;
+            qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
+        }
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
@@ -935,6 +980,7 @@ int main(int argc, char** argv)
                 sizes[2 * NL] = head_size(si, nc);
                 fab.enqueue_step(si.step, sizes);
                 cp_enqueue(si.step, si.M, si.context);
+                qs_enqueue(si.step, si.M);
             },
             [&](int k, int M) {
                 g6s2::require(k >= 0 && k < m.nbk && M >= 1 && M <= MX && exec[k][M] && exec2[k][M], "S=1 target graph not captured");
@@ -984,7 +1030,8 @@ int main(int argc, char** argv)
                 const unsigned c = cp_error(), p = cp_pf_err();
                 if (c || p) fprintf(stderr, "# rank %d: S2 extra error words: cp %08x cp_pf|qp %08x\n", R, c, p);
                 return c | p;
-            }};
+            },
+            [&](unsigned long long step, int rows) { qsd_enqueue(step, rows); }};
         try
         {
             g6s2::NativeDispatch nd(nx, sc);
@@ -1163,7 +1210,8 @@ int main(int argc, char** argv)
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
-                (set_id.empty() ? "" : " set " + set_id);
+                (set_id.empty() ? "" : " set " + set_id) + (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
+                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -1378,6 +1426,7 @@ int main(int argc, char** argv)
             sizes[2 * NL] = head_size(si, nc);
             fab.enqueue_step(si.step, sizes);
             cp_enqueue(si.step, M, si.context);
+            qs_enqueue(si.step, M);
             const auto t0 = std::chrono::steady_clock::now();
             if (graph) launch_main(bucket_of(m, si.context), M);
             else launch_step(m, M, si.context, st);
@@ -1435,6 +1484,7 @@ int main(int argc, char** argv)
                 std::vector<uint32_t> sizes(3, (uint32_t)(M * HID * 2));
                 sizes[2] = (uint32_t)glue::head_bytes(M, nc);
                 fabd.enqueue_step(di.step, sizes);
+                qsd_enqueue(di.step, M);
                 const auto t0 = std::chrono::steady_clock::now();
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_d[bucket_of(D.d, di.context)][chain][M], st));
                 else launch_draft_step(D, M, di.context, chain, st);
@@ -1468,6 +1518,7 @@ int main(int argc, char** argv)
             sizes[2 * NL] = head_size(*in, nc);
             fab.enqueue_step(in->step, sizes);
             cp_enqueue(in->step, M, in->context);
+            qs_enqueue(in->step, M);
             dec_prof().on = getenv("G6_DEC_PROF") != nullptr && s > 0;      // the first step of a sequence carries first-launch costs
             dec_prof().M = M; dec_prof().last = 0;
             const auto t0 = std::chrono::steady_clock::now();
@@ -1538,6 +1589,8 @@ int main(int argc, char** argv)
     if (pf_prof().on) pf_prof().print("this rank,");
     if (rlf) fclose(rlf);
     if (getenv("G6_DEC_PROF")) { char tag[32]; snprintf(tag, sizeof tag, "rank %d", R); dp_print(tag, "synchronized", dec_prof().t, dec_prof().steps); }
+    if (fabdg_on) { fabdg.wait_proxy_idle(); fabdg.stop_proxy(); }
+    if (fabg_on) { fabg.wait_proxy_idle(); fabg.stop_proxy(); }
     fab.wait_proxy_idle();
     fab.barrier();
     fab.stop_proxy();
