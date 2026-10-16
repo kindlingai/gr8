@@ -82,3 +82,10 @@ STEERING_PROFILE_CHECK=/tmp/steering_profile_check python3 -m unittest discover 
 The CPU CI entry point builds the bridge and runs the complete suite. Running Python alone skips only the C++ parity
 test. The shared fixtures live at `engine/runtime/tests/fixtures/steering_contract.json`; scale cases exercise the
 manifest alpha bounds here, with request-scale canonicalization covered by the host contract tests.
+
+## Offline qualification reports
+
+`evaluate.py` summarizes frozen paired evaluation rows; `trace_audit.py` compares normalized CUDA operation counts.
+Both use only the standard library. See [REPORTS.md](REPORTS.md) for their input contracts, reproducibility settings,
+exit status and limits. These reports complement the [runtime integration guide](../../docs/STEERING.md); they do not
+run a model or replace matched serving qualification.

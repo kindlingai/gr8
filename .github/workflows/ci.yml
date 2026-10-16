@@ -229,6 +229,8 @@ jobs:
             python3 -c "import tools.convert.convert, tools.convert.dflash2"
             PYTHONPATH=tools/launch python3 -c "import supervisor, steering_hf; from steering import release"
             python3 tools/steering/release.py --help > /dev/null
+            python3 tools/steering/evaluate.py --help > /dev/null
+            python3 tools/steering/trace_audit.py --help > /dev/null
             bin/g6front-rs --help > /dev/null
             echo smoke OK'
           docker run --rm "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4 \
