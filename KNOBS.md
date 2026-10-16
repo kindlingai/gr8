@@ -59,6 +59,14 @@ manifest instead.
 | `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
 | `VARIANT` (`--variant`) | `home` | `home` | `bit225` | the exlr8 v2 width manifest: `bit225`, `bit243`, `bit260`, `bit325`, `bit338` (routed experts at about 2.25-3.38 bpw, spent where they lower KL against bf16 the most), `home` (3.25 bpw), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). At TP=3, a release without `bit225` boots `down1`. Without `V2`, only `home` |
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
+| `ATTN_SC2` | unset (0) | unset (0) | unset (0) | decode attention scores with S = 1, 2, 4 or 8 key slots per warp (`G6_ATTN_SC2`; bit-exact) |
+| `ATTN_SC2_TR` | unset (0) | unset (0) | unset (0) | with `ATTN_SC2`: the transpose reduction, 1 or 2 = eager (`G6_ATTN_SC2_TR`; bit-exact) |
+| `ATTN_CTX2` | unset (0) | unset (0) | unset (0) | decode attention context kernel variant 1..4 (`G6_ATTN_CTX2`; bit-exact) |
+| `ATTN_CTX3` | unset (0) | unset (0) | unset (0) | decode attention context with one test per batch of slots, 1..4 (`G6_ATTN_CTX3`; bit-exact) |
+| `ATTN_SEL2` | unset (0) | unset (0) | unset (0) | decode index selection's final sort as a rank by count over 8, 16, 32 or 64 CTAs per row (`G6_ATTN_SEL2`; bit-exact) |
+| `IDX_GRP` | unset (0) | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
+| `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
+| `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
