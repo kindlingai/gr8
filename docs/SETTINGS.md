@@ -74,6 +74,7 @@ the short version.
 | `G6_CP` | 1 | context-parallel KV on (build flag `-DG6_CP=1` too) |
 | `G6_CP_R` | `SHARE_LIMIT` | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks. Under S2 it is also the largest request that shares decode steps. A multiple of 64; R is always a decode bucket boundary (a value off the 2048 doubling is added as a bucket of its own) |
 | `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
+| `G6_CP_ONECHAIN` | 0 | 1 = past R, the other ranks' head groups run as one attention call of 48 heads instead of three of 16 (the scores, softmax, context and merge kernels once per layer, not three times; their partials are published after it, in the order `G6_CP_S3=0` uses). Byte-exact. TP=4 only, and not with `G6_ATTN_FLIP`; about 1.3 MB a row of the CP fabric's rows (`G6_CP_MMAX`) for the gathered queries and the call's scratch |
 | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
 | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
 | `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (the cores of the proxies this rank started, see `--proxy-cpu`) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
