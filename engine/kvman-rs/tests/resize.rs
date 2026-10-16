@@ -5,6 +5,7 @@
 //! always safe (growth only from a safe state), no session deadlocks, and two ranks given the same calls agree on every
 //! result and digest. With every chunk online the pool behaves as one that never had chunks.
 
+use g6kvman::stash::{Io, Keep};
 use g6kvman::{Error, Finished, Pool, Rules, Run, PAGE};
 
 struct Rng(u64);
@@ -78,6 +79,11 @@ fn check(p: &Pool, live: &[Live]) {
     let retained = owner.iter().filter(|&&o| o == 2).count();
     assert_eq!(held + retained + free + offline, pages, "a page lost");
     assert!((0..pages as u32).all(|q| p.used(q) == (owner[q as usize] == 1)));
+    // a resident past-R run holds the pool: nothing is free and the safe-state check is its own (it holds its worst)
+    if live.iter().any(|l| p.exclusive_run(&l.run).unwrap()) {
+        assert_eq!(p.free_pages(), 0);
+        return;
+    }
     assert_eq!(p.free_pages() as usize, pages - offline - held);
     let runs: Vec<(u32, u32)> = p.runs().map(|(_, h, w)| (h, w)).collect();
     assert!(safe(p.place_online(), p.live_pages(), &runs), "pool left unsafe");
@@ -411,4 +417,156 @@ fn chunks_online_change_nothing() {
             assert_eq!(a.digest(), b.digest());
         }
     }
+}
+
+// the served configuration: the CP map's page classes on (tail(nr)), the drafter's class above place, and requests past
+// R that take their own pages (prefix and shard below place, the drafter's tail above it). Across shrinks and grows no
+// page is lost or held twice, no run holds an offline page, a past-R run keeps its prefix and shard below place, a
+// shrink waits while a past-R run is resident, and two ranks agree.
+#[test]
+fn resize_traces_two_classes() {
+    let (mut shrinks, mut grows, mut exclusive, mut hits) = (0u64, 0u64, 0u64, 0u64);
+    for seed in 1..=150u64 {
+        let mut rng = Rng(seed * 92821);
+        let place = rng.range(16, 300) as u32;
+        let pages = place + rng.range(1, place as u64 * 2) as u32;
+        let below_pages = rng.range(1, (place as u64 / 3).max(1)) as u32;
+        let chunk = rng.range(1, (place as u64 / 4).max(1)) as u32;
+        let nr = rng.range(2, 6) as u32;
+        let mut a = Pool::new(pages, place, below_pages * 64).unwrap();
+        let mut b = Pool::new(pages, place, below_pages * 64).unwrap();
+        for p in [&mut a, &mut b] {
+            p.tail(nr, 0);
+            p.chunks(chunk).unwrap();
+            p.keep(Rules { strict: false, noend: true, grid: 0 });
+        }
+        let mut live: Vec<Live> = Vec::new();
+        let mut past: Vec<Vec<i32>> = Vec::new();
+        for _ in 0..1200 {
+            match rng.range(0, 9) {
+                0..=3 => {
+                    let mut prompt = if !past.is_empty() && rng.one_in(2) {
+                        past[rng.range(0, past.len() as u64 - 1) as usize].clone()
+                    } else {
+                        Vec::new()
+                    };
+                    // past R (an exclusive run) one in two, the rest below it
+                    let long = rng.one_in(2);
+                    let most = if long { pages as u64 * 64 } else { below_pages as u64 * 64 };
+                    prompt.extend((0..rng.range(1, most / 2)).map(|_| rng.range(0, 9) as i32));
+                    let rows = prompt.len() as u64 + rng.range(1, 64);
+                    if rows > most {
+                        continue;
+                    }
+                    let fits = a.fits(rows, rows);
+                    assert_eq!(fits, b.fits(rows, rows));
+                    if !fits {
+                        assert!(a.reserve(rows, rows).is_err());
+                        continue;
+                    }
+                    let h = a.match_prefix(&prompt, rows, rows, prompt.len() as i32 - 1);
+                    assert_eq!(h, b.match_prefix(&prompt, rows, rows, prompt.len() as i32 - 1));
+                    let (ra, rb) = if h.skip > 0 {
+                        hits += 1;
+                        (a.take(h.skip, h.age, rows, rows).unwrap(), b.take(h.skip, h.age, rows, rows).unwrap())
+                    } else {
+                        (a.reserve(rows, rows).unwrap(), b.reserve(rows, rows).unwrap())
+                    };
+                    assert_eq!(ra, rb);
+                    if a.exclusive_run(&ra).unwrap() {
+                        exclusive += 1;
+                        // its prefix and shard below place, all online
+                        let l = a.list(&ra).unwrap();
+                        let rp = below_pages as u64;
+                        let n = l.len() as u64;
+                        let main = rp + (n - rp).div_ceil(nr as u64).min(n - rp);
+                        assert!(l.iter().filter(|&&q| q < place).count() as u64 >= main);
+                        assert!(l.iter().take(rp as usize).all(|&q| q < place));
+                    }
+                    live.push(Live { run: ra, list: a.list(&ra).unwrap().to_vec(), prompt });
+                }
+                4..=5 => {
+                    if live.is_empty() {
+                        continue;
+                    }
+                    let l = live.remove(rng.range(0, live.len() as u64 - 1) as usize);
+                    let st = finish(&mut rng, &l.prompt);
+                    if st.valid > 0 {
+                        past.push(st.history.clone());
+                    }
+                    a.retain(&l.run, st.clone()).unwrap();
+                    b.retain(&l.run, st).unwrap();
+                }
+                6..=7 => {
+                    let n = rng.range(1, 2) as u32;
+                    let resident = live.iter().any(|l| a.exclusive_run(&l.run).unwrap());
+                    let before = a.digest();
+                    let r = a.shrink(n);
+                    assert_eq!(r, b.shrink(n));
+                    match r {
+                        Ok(Some(_)) => {
+                            assert!(!resident, "a shrink went while a past-R run was resident");
+                            shrinks += 1;
+                        }
+                        _ => assert_eq!(a.digest(), before, "a shrink that did not go changed the pool"),
+                    }
+                }
+                _ => {
+                    let off = (0..a.chunk_count()).filter(|&k| !a.chunk_online(k)).count() as u64;
+                    if off > 0 {
+                        let n = rng.range(1, off) as u32;
+                        assert_eq!(a.grow_pool(n), b.grow_pool(n));
+                        grows += 1;
+                    }
+                }
+            }
+            assert_eq!(a.digest(), b.digest());
+            check(&a, &live);
+            // the drafter's class never goes offline
+            assert!((place..pages).all(|q| a.online(q)));
+        }
+    }
+    assert!(
+        shrinks > 2_000 && grows > 1_000 && exclusive > 800 && hits > 100,
+        "shrinks {shrinks} grows {grows} exclusive {exclusive} hits {hits}"
+    );
+}
+
+// with block stores: a shrink that evicts retained runs queues their spills, and every later call waits for the engine
+// to run them (io(), io_done()) before the memory may go; the spilled run then restores from the store
+#[test]
+fn a_shrink_spills_before_the_memory_goes() {
+    let mut p = Pool::new(40, 40, 10 * 64).unwrap();
+    p.keep(Rules { strict: false, noend: true, grid: 0 });
+    p.stores(1);
+    p.add_tier(64, Keep::All, None).unwrap();
+    p.chunks(10).unwrap();
+    let hist: Vec<i32> = (0..10 * 64 - 1).collect();
+    let st = Finished { history: hist.clone(), valid: 10 * 64 - 2, written_end: 10 * 64 - 1, pf_end: 10 * 64 - 2 };
+    let a = p.reserve(10 * PAGE, 10 * PAGE).unwrap();
+    let b = p.reserve(10 * PAGE, 10 * PAGE).unwrap();
+    let c = p.reserve(10 * PAGE, 10 * PAGE).unwrap();
+    let d = p.reserve(10 * PAGE, 10 * PAGE).unwrap(); // pages 30..40
+    p.retain(&d, st).unwrap();
+    let _ = p.io();
+    p.io_done().unwrap();
+    assert_eq!(p.shrink(1), Ok(Some(vec![3])));
+    assert_eq!(p.kept_runs(), 0);
+    assert!(p.io_pending() > 0, "the evicted run's spills are queued");
+    assert_eq!(p.grow_pool(1), Err(Error::PendingIo), "nothing goes on before the spills ran");
+    assert_eq!(p.shrink(1), Err(Error::PendingIo));
+    let io = p.io();
+    assert!(io.iter().all(|x| matches!(x, Io::Spill { page, .. } if (30..40).contains(page))), "{io:?}");
+    p.io_done().unwrap();
+    for r in [&a, &b, &c] {
+        p.release(r).unwrap();
+    }
+    // the run spilled from the offline chunk comes back from the store into online pages
+    let h = p.match_prefix(&hist, 11 * PAGE, 11 * PAGE, hist.len() as i32 - 1);
+    assert!(h.stored && h.skip > 0, "{h:?}");
+    let r = p.take_hit(h.skip, h.age, Some(h.tier), 11 * PAGE, 11 * PAGE).unwrap();
+    assert!(p.list(&r).unwrap().iter().all(|&q| q < 30 && p.online(q)));
+    let io = p.io();
+    assert!(io.iter().any(|x| matches!(x, Io::Restore { .. })));
+    p.io_done().unwrap();
 }

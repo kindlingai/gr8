@@ -41,9 +41,15 @@ it reaches is one) and only gains free pages, so it stays safe. The engine maps 
 granule by granule with `cuMemCreate` / `cuMemMap` (2 MiB granules on GB10, at either host page size). `g6_kvc_sync`
 backs exactly the granules that hold a byte of an online chunk or of a page past `place`, and releases the rest. The
 address never moves, so block tables, kernels and captured graphs keep working. A granule two chunks share stays while
-either chunk is online, so a chunk should be a whole number of granules of every cache it covers to give back all its
-bytes (an FP8 MLA page is 26 KiB, so 2 MiB is not a whole number of pages; 4,096 pages is 104 MiB of MLA rows, a whole
-number of granules of every row format).
+either chunk is online, so a chunk gives back all its bytes only when it is a whole number of granules of every cache
+it covers. A page is 64 rows: 41,984 B of FP8 MLA rows (`ROW` 656), 26,624 B of INT4 rows (416) and 8,448 B of index
+keys (132), so a 2 MiB granule is never a whole number of pages. 8,192 pages is a whole number of granules of all three
+(328, 208 and 66 MiB); with smaller chunks the boundary granules stay, at most two per cache per chunk.
+
+`g6_kvc_sync` synchronizes the whole context before it unmaps anything, since g6m4 runs prefill lanes, decode graphs
+and store copies on several streams. A remote store registers KV pages with the RDMA device; a resize must happen
+with no such copy in flight, and #156 must register the regions again after a grow (granules that come back are new
+memory at the same address).
 
 Order for a shrink: `shrink` -> run the queued spills (`io()` / `io_done()`) -> `g6_kvc_sync` for every cache (memory
 goes). For a grow: `g6_kvc_sync` with the chunks marked online (memory comes, zeroed) -> `grow_pool`.
@@ -56,5 +62,9 @@ goes). For a grow: `g6_kvc_sync` with the chunks marked online (memory comes, ze
 - **Limits per layout.** `CAP` and `SHARE_LIMIT` stay per boot in `scripts/engine_args.sh`. Per layout, they become
   the pool's chunk count online at that layout (`place_online`) and its R; what the plan file or the switch command
   carries is #150's and #156's format.
+- **Speed of a VMM-backed pool.** Each granule is its own `cuMemCreate` and mapping (about 50,000 for a 100 GB pool).
+  The attention kernels read the same addresses, and `kv_resize_test` checks they give the same bits, but whether
+  decode and prefill keep their numbers with the caches in mapped granules instead of one `cudaMalloc` is measured
+  when #156 moves the engine's caches into it (one allocation per chunk is the alternative if they do not).
 - **The reserve.** How much of the pool a deployment holds back so it can shrink is decision 4 on #147 (people).
   Nothing here picks a number: a shrink takes what is free of live runs and waits for the rest.

@@ -23,9 +23,11 @@ size_t g6_kvc_granule(const G6KvChunks* c);
 // bytes backed now
 size_t g6_kvc_backed(const G6KvChunks* c);
 // Pages of page_bytes from the region's start; chunk k is pages [k * chunk_pages, min((k + 1) * chunk_pages, place)),
-// online[k] != 0 when it is online. Pages from place on are always backed. Backs and releases granules to match;
-// granules it backs are zeroed on `stream` (synchronized before the call returns). *mapped / *released: granule bytes
-// changed (either may be NULL).
+// online[k] != 0 when it is online; chunks = ceil(place / chunk_pages). Pages from place on are always backed. Backs and
+// releases granules to match. It synchronizes the whole context first (no stream may still use a granule that goes),
+// and zeroes the granules it backs on `stream`, synchronized before it returns. *mapped / *released: granule bytes
+// changed (either may be NULL). On an error the granules changed so far stay changed (*mapped / *released count them,
+// g6_kvc_backed says what is backed).
 int g6_kvc_sync(G6KvChunks* c, size_t page_bytes, uint32_t chunk_pages, uint32_t place, const uint8_t* online,
                 uint32_t chunks, void* stream, size_t* mapped, size_t* released);
 }

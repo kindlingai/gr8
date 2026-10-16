@@ -172,8 +172,9 @@ struct StepOut {
     }
 };
 // one decode step of M rows ending at ctx, inputs from `seed`
-static StepOut step(Sess& s, Arena& A, const int* heads, int M, int ctx, uint64_t seed)
+static StepOut step(Sess& s, Arena&, const int* heads, int M, int ctx, uint64_t seed)
 {
+    Arena A;   // the step's inputs, freed when it returns (it synchronizes before)
     Rng in(seed);
     std::vector<int> p(M);
     for (int i = 0; i < M; ++i) p[i] = ctx - M + i;

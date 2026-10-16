@@ -1,6 +1,7 @@
 #include "kvchunks.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <utility>
 #include <vector>
 
 struct G6KvChunks {
@@ -40,11 +41,11 @@ int back(G6KvChunks* c, size_t g, CUstream s) {
 int drop(G6KvChunks* c, size_t g) {
     const CUdeviceptr at = c->base + g * c->gran;
     CUresult r = cuMemUnmap(at, c->gran);
-    if (r == CUDA_SUCCESS) r = cuMemRelease(c->h[g]);
     if (r != CUDA_SUCCESS) return (int)r;
-    c->h[g] = 0;
+    // unmapped: the granule is gone from the region whatever the release says (a failed release leaks the handle)
     c->on[g] = 0;
-    return 0;
+    r = cuMemRelease(std::exchange(c->h[g], 0));
+    return (int)r;
 }
 }
 
@@ -109,23 +110,24 @@ extern "C" int g6_kvc_sync(G6KvChunks* c, size_t page_bytes, uint32_t chunk_page
         for (size_t g = blo / c->gran; g * c->gran < end; ++g) need[g] = 1;
     }
     CUstream s = (CUstream)stream;
-    // nothing may still read a granule that goes
-    CUresult r = cuStreamSynchronize(s);
+    // nothing on any stream may still read a granule that goes
+    CUresult r = cuCtxSynchronize();
     if (r != CUDA_SUCCESS) return (int)r;
     size_t m = 0, d = 0;
+    if (mapped) *mapped = 0;
+    if (released) *released = 0;
     for (size_t g = 0; g < n; ++g) {
         if (need[g] && !c->on[g]) {
             int e = back(c, g, s);
-            if (e) return e;
+            if (e) return e;   // what changed so far stays changed: g6_kvc_backed says what is backed
             m += c->gran;
+            if (mapped) *mapped = m;
         } else if (!need[g] && c->on[g]) {
             int e = drop(c, g);
             if (e) return e;
             d += c->gran;
+            if (released) *released = d;
         }
     }
-    r = cuStreamSynchronize(s);
-    if (mapped) *mapped = m;
-    if (released) *released = d;
-    return (int)r;
+    return (int)cuStreamSynchronize(s);
 }

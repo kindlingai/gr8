@@ -231,9 +231,12 @@ impl Pool {
         self.offline.len() as u32
     }
 
-    /// Whether chunk k is online (resize off: every chunk is).
+    /// Whether chunk k is online: false for k >= chunk_count() once chunks are on, true for every k while they are off.
     pub fn chunk_online(&self, k: u32) -> bool {
-        !self.offline.get(k as usize).copied().unwrap_or(false)
+        if self.chunk == 0 {
+            return true;
+        }
+        self.offline.get(k as usize).is_some_and(|&o| !o)
     }
 
     fn chunk_range(&self, k: usize) -> std::ops::Range<u32> {

@@ -136,7 +136,9 @@ int g6kv_split(const g6kv_pool* p);
 // offline (the highest no live run holds a page of; retained runs in them are evicted and spill): *done = 1 and the
 // chunks in out[0..*got], or *done = 0 when the pool must wait for sessions (nothing changed). It never evicts a live
 // run, and refuses (*done = 0) a shrink that would leave a live run unable to reach its worst case. g6kv_grow_pool
-// brings n chunks back, the lowest first, after the engine mapped their memory. An error when the size cannot be.
+// brings n chunks back, the lowest first, after the engine mapped their memory. Errors: before g6kv_chunks (both),
+// a size no state allows (shrink), fewer than n chunks offline (grow). g6kv_chunk_online is 0 for k >= g6kv_chunk_count
+// (and 1 for every k while chunks are off).
 int g6kv_chunks(g6kv_pool* p, uint32_t pages_per_chunk);
 uint32_t g6kv_chunk_count(const g6kv_pool* p);
 int g6kv_chunk_online(const g6kv_pool* p, uint32_t k);
