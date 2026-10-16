@@ -12,6 +12,7 @@
 #include "rank.cuh"
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
+#include "../vmm.h"
 #ifdef G6_RS_LOADER
 #include "weight_check.cuh"
 #endif
@@ -126,7 +127,25 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
 {
     RsSink sink;
     void* dev = nullptr;
-    if (cudaMalloc(&dev, pack.bytes()) != cudaSuccess) die("cudaMalloc of " + std::to_string(pack.bytes()) + " bytes failed");
+    // G6_IMG_VMM=1 (A/B): the image as cuMemCreate chunks of the recommended granularity mapped into one range
+    // (engine/vmm.h; k1_audit --alloc vmm), =N: chunks of N MB. Same bytes at the same offsets; only the physical
+    // backing (the GPU's page size) can differ. Falls back to cudaMalloc, with a line saying why.
+    static const long vmm = getenv("G6_IMG_VMM") ? atol(getenv("G6_IMG_VMM")) : 0;
+    void (*release)(void*) = nullptr;
+    if (vmm > 0)
+    {
+        int d = 0;
+        size_t gmin = 0, grec = 0;
+        cudaGetDevice(&d);
+        g6vmm::granularity(d, gmin, grec);
+        std::string why;
+        const size_t chunk = vmm > 1 ? (size_t)vmm << 20 : 0;
+        if ((dev = g6vmm::alloc(pack.bytes(), chunk, why))) release = [](void* p) { g6vmm::release(p); };
+        fprintf(stderr, "# rank %d: G6_IMG_VMM=%ld: %s (granularity min %zu KB, recommended %zu KB)\n", rank, vmm,
+                dev ? ("image in chunks of " + std::to_string((chunk ? (chunk + gmin - 1) / gmin * gmin : grec) >> 20) + " MB").c_str()
+                    : ("cudaMalloc instead: " + why).c_str(), gmin >> 10, grec >> 10);
+    }
+    if (!dev && cudaMalloc(&dev, pack.bytes()) != cudaSuccess) die("cudaMalloc of " + std::to_string(pack.bytes()) + " bytes failed");
     sink.dev = (uint8_t*)dev;
     sink.check = wcheck::enabled();
     if (sink.check) sink.sums.begin(pack.bytes());
@@ -135,7 +154,7 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
     char err[1024] = "";
     if (load(&s, &st, err, sizeof err)) die(std::string("Rust loader: ") + err);
     for (cudaStream_t x : sink.streams) cudaStreamDestroy(x);
-    img.adopt(pack, (uint8_t*)dev, pack.bytes());
+    img.adopt(pack, (uint8_t*)dev, pack.bytes(), release);
     fprintf(stderr, "# rank %d: %s %.2f GB -> device image (Rust loader, %s, %u threads, %llu ranges, %.2f GB read)"
             " in %.1f s (%.2f GB/s)\n", rank, what, st.image_bytes / 1e9, st.mode ? "read" : "mmap", st.threads,
             (unsigned long long)st.ranges, st.read_bytes / 1e9, st.seconds, st.image_bytes / 1e9 / st.seconds);
