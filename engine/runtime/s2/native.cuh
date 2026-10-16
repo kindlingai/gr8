@@ -78,6 +78,8 @@ class NativeDispatch {
     uint64_t prefill_sequence_ = 1, prefill_sequence2_ = 1;
     g6rt::LpStep lp_{};   // logprobs of the last main step, fetched when a session in it asked (lp_rows_ rows; 0 = none)
     int lp_rows_ = 0;
+    float dlp_[g6rt::MX] = {};   // the last draft or chain step's StepOut::lp (dlp_rows_ rows; s2_batch.h Batch::kstop)
+    int dlp_rows_ = 0;
     struct Graphs { cudaGraphExec_t a = nullptr, b = nullptr; };
     std::map<std::string, Graphs> graphs_;
     static void destroy(Graphs& g) {
@@ -177,6 +179,7 @@ class NativeDispatch {
             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
         }
         fence(); const auto out = *(draft ? c_.draft_output : c_.output);
+        if (draft) { std::copy(out.lp, out.lp + rows, dlp_); dlp_rows_ = rows; }
         if (!draft) {
             g6rt::evprof_read(rows,c_.stream,c_.main.rank);
             lp_rows_ = 0;
@@ -337,7 +340,7 @@ public:
                 (double(free0)-double(free1))/(1024.0*1024.0));
     }
     DispatchHooks hooks() {
-        return {
+        DispatchHooks h{
             [&](bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);},
             [&](int old,int next){mode(old,next);},
             [&](const Launch& l){return launch(l);},
@@ -347,6 +350,11 @@ public:
                 return g6rt::lp_row(lp_,row,target,k);
             }
         };
+        h.draft_lp = [&](int row) {
+            require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
+            return dlp_[row];
+        };
+        return h;
     }
     void synchronize() { fence(); }
 };

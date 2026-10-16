@@ -59,6 +59,12 @@ manifest instead.
 | `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
 | `VARIANT` (`--variant`) | `home` | `home` | `bit225` | the exlr8 v2 width manifest: `bit225`, `bit243`, `bit260`, `bit325`, `bit338` (routed experts at about 2.25-3.38 bpw, spent where they lower KL against bf16 the most), `home` (3.25 bpw), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). At TP=3, a release without `bit225` boots `down1`. Without `V2`, only `home` |
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
+| `DFL_REUSE` | unset (0) | – | – | 1 = a request whose prefix-reuse hit skipped into the DFlash2 drafter's window keeps the drafter (KNOWN-ISSUES #1); 2 = also a request alone on MTP takes it (`G6_DFL_REUSE`). Needs `DFLASH=1` |
+| `DFL_REUSE_MIN` | unset (256) | – | – | `DFL_REUSE`: context rows the drafter must hold before it drafts; fewer = MTP warm-up rounds (`G6_DFL_REUSE_MIN`) |
+| `MTP_KSTOP` | unset (0) | – | – | a request's solo MTP rounds chain and verify the drafts the MTP head is confident in: 1 = thresholds (`MTP_KSTOP_TAU`), 2 = the drafter choice's MTP estimates (`G6_MTP_KSTOP`). Needs `DFLASH=1`, `MTP` 2+ |
+| `MTP_KSTOP_KMAX` | unset (`MTP`) | – | – | `MTP_KSTOP`: the most drafts a solo MTP round chains, 1..3 (`G6_MTP_KSTOP_KMAX`) |
+| `MTP_KSTOP_TAU` | unset (`0,0.2,0.5`) | – | – | `MTP_KSTOP=1`: thresholds t1,t2,t3 on the drafts' cumulative probability (`G6_MTP_KSTOP_TAU`) |
+| `DRAFT_PAR` | unset (0) | – | – | a solo DFlash2 round's drafter step on its own stream under MTP's first form, 1, or 2 = drafting steps at high priority (`G6_DRAFT_PAR`; bit-exact). Needs `DFLASH=1` |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

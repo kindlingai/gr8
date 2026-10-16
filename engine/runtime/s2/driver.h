@@ -30,6 +30,8 @@ struct DriverHooks {
     std::function<bool(Key)> dfl_ok;
     std::function<int(Key)> dfl_start;
     std::function<s2::DflDrafts(Key, const s2::DflReq&)> dfl;
+    // optional: row r's log-probability in the last draft or chain step (s2::Hooks::lp, G6_MTP_KSTOP / G6_MTP_LPLOG)
+    std::function<float(int)> draft_lp;
     // One completion notification.
     std::function<void(Key, const s2::Stats&)> terminal;
     // optional: before a round, a decoding session's run grows to cover `rows` (round_rows). The run, perhaps the same,
@@ -73,7 +75,8 @@ class Driver {
             hooks_.dfl ? std::function<s2::DflDrafts(const s2::DflReq&)>([this](const s2::DflReq& r) {
                 return hooks_.dfl(scheduler_.slots()[r.sess].key, r);
             }) : nullptr,
-            hooks_.dfl_start ? std::function<int(int)>([this](int q) { return hooks_.dfl_start(scheduler_.slots()[q].key); }) : nullptr
+            hooks_.dfl_start ? std::function<int(int)>([this](int q) { return hooks_.dfl_start(scheduler_.slots()[q].key); }) : nullptr,
+            hooks_.draft_lp
         };
     }
     // sessions in Prefill or Decode (Dispatch::synchronize_mode's count: 1 = the solo path)
@@ -113,6 +116,8 @@ public:
     // DFlash2 sessions verify up to kv drafts with the --spec-adaptive policy sl (s2_batch.h Batch::dflash)
     void dflash(int kv, const g6rt::SpecLen& sl) { batch_.dflash(kv, sl); }
     void dsel(const s2::DSel& d) { batch_.dsel(d); }
+    void kstop(const s2::KStop& k) { batch_.kstop(k); }
+    void dfl_reuse(const s2::DflReuse& r) { batch_.dfl_reuse(r); }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
     void pool_digest(uint64_t d) { scheduler_.pool_digest(d); }
@@ -174,6 +179,7 @@ public:
                     order.push_back(int(q.keys[i].slot));
                 }
                 if (live() > 1) batch_.demote();   // another session is resident (perhaps still prefilling): the shared path
+                else if (q.count == 1 && !payload_[q.keys[0].slot].decode_prompt) batch_.promote(int(q.keys[0].slot));   // G6_DFL_REUSE=2
                 require(batch_.round(order), "empty scheduled decode round");
                 std::vector<Completion> results;
                 for (unsigned i = 0; i < q.count; ++i) results.push_back(completion(q.keys[i]));
