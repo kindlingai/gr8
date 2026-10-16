@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-16: the trellis shared expert on a forked stream during the router (G6_ROUTE_OVL, off by default)
+
+- On a decode MoE layer with separate fc1 / fc2 launches (2+ rows), the shared expert waited for the router GEMV (8 of
+  48 SMs) and the single-CTA plan kernel, though it reads only x2 and not the plan, and the DRAM sat mostly idle while
+  those ran. `G6_ROUTE_OVL=1` forks a side stream before the router GEMV and runs the shared expert's fc1 and fc2 units
+  there, joined before the finalize; `=2` runs its fc1 only there, joined before fc2. In a capture the fork and the join
+  are graph edges. Fused layers (1 row) and the MTP layer run as before.
+- `k1_tr3_fc1_ovl` / `k1_tr3_fc2_ovl` run the shared (or the routed) CTAs of `k1_tr3_fc1` / `_fc2` with the same unit
+  numbering, bodies and scratch, so the output bytes are the default's. Registers equal the default kernels' (64, no
+  new spills).
+- `k1_ovl_test` (built by `scripts/build.sh`, run by hand on an idle GB10) checks mode 1 and mode 2 byte for byte against
+  the default MoE layer, as plain launches and as one CUDA graph, M = 1..12 on a synthetic TP4 layer with the real router
+  GEMV, and benches them.
+
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
 - The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for
