@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
+
+- The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for
+  one runner's four cores for most of it (int4 finished at 551 s, fp8 at about 1,000 s). They share no compilation, so
+  each has a runner now. `dist` splits into `dist-fp8` and `dist-int4`, which are what the two jobs export, and stays
+  the union of them, so `docker build --target dist -o out .` is unchanged.
+- A pull request compiles three TP widths instead of six: 1, the `PF_F12` width 4, and the largest. A binary that lacks
+  a width names the ones it has when asked for another (`engine/runtime/widths.cpp`), so an artifact built this way
+  cannot quietly fail a TP=3 run. `main` and tags still compile all six.
+- One leg exports the build cache for both, rather than a scope each. This repo's Actions cache was at 10.29 GiB
+  against a 10 GB cap and evicting, which is why the cargo and loader stages had been rebuilding on runs that should
+  have hit them.
+
 ## 2026-10-16: g6m4 and m4sim parse their shared flags in one place
 
 - The real engine and the reference driver take 29 of the same flags, and m4sim's output is the oracle g6m4 is held to,

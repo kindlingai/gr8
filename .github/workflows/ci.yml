@@ -2,9 +2,9 @@
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
 # Every job runs on GitHub's hosted runners, for every pull request, forks included. The engine job builds the
-# Dockerfile's dist stage on the arm64 runner (no GPU is needed to compile). The image job assembles the runtime image
-# from the engine job's binaries, and only it can write packages: it pushes from main and from tags, never from a pull
-# request.
+# Dockerfile's binaries on arm64 runners, one per KV format, no GPU needed to compile. The image job assembles the
+# runtime image from both of their artifacts, and only it can write packages: it pushes from main and from tags, never
+# from a pull request.
 name: ci
 
 on:
@@ -71,9 +71,27 @@ jobs:
           if-no-files-found: error
 
   engine:
-    name: Engine build (arm64, CUDA 13, sm_121a)
+    # The two KV formats are the whole cost of a build and share no compilation,
+    # so they get a runner each: on one runner they spent most of their lives
+    # competing for its four cores (fp8 ~1,000 s, int4 ~551 s, job 1,187 s).
+    name: Engine build (${{ matrix.kv }} KV, arm64, CUDA 13, sm_121a)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both legs share every stage before the compile (toolchain, rust,
+          # the three cargo builds, engine-src), and neither leg's own compile
+          # layer survives a change under engine/, which is most pull requests.
+          # So one leg exports the cache for both: a scope each would double
+          # what this repo keeps in a cache that is already at its 10 GB cap.
+          - kv: fp8
+            target: dist-fp8
+            cache_to: type=gha,scope=gr8,mode=max
+          - kv: int4
+            target: dist-int4
+            cache_to: ''
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Free disk space
@@ -82,18 +100,30 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
-      - name: Build the binaries (Dockerfile target dist)
+      - name: Widths
+        # A pull request compiles the three widths whose code differs: 1, the
+        # PF_F12 fat-CTA width 4, and the largest. main and tags compile all
+        # six, so a width-specific break still fails before a release.
+        id: w
+        run: |
+          widths=''
+          [ "${{ github.event_name }}" = pull_request ] && widths='1 4 8'
+          echo "widths=$widths" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.kv }} KV, TP widths ${widths:-1 2 3 4 6 8}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the binaries (Dockerfile target ${{ matrix.target }})
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
-          target: dist
+          target: ${{ matrix.target }}
           platforms: linux/arm64
+          build-args: |
+            G6_WIDTHS=${{ steps.w.outputs.widths }}
           outputs: type=local,dest=dist
           cache-from: type=gha,scope=gr8
-          cache-to: type=gha,scope=gr8,mode=max
+          cache-to: ${{ matrix.cache_to }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: engine-bin-arm64
+          name: engine-bin-arm64-${{ matrix.kv }}
           path: dist/
           retention-days: 7
           if-no-files-found: error
@@ -108,7 +138,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          name: engine-bin-arm64
+          pattern: engine-bin-arm64-*
+          merge-multiple: true
           path: dist
       - name: Assemble
         id: zip
@@ -144,7 +175,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          name: engine-bin-arm64
+          pattern: engine-bin-arm64-*
+          merge-multiple: true
           path: ${{ runner.temp }}/dist
       - name: Restore the executable bits (artifacts drop them)
         run: find "$RUNNER_TEMP/dist" -type f ! -name '*.a' -exec chmod 755 {} +

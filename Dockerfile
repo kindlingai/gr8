@@ -62,14 +62,18 @@ COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
 
-# one g6m4 and one m4sim for every TP width; every launcher runs this build
+# one g6m4 and one m4sim for every TP width; every launcher runs this build.
+# G6_WIDTHS builds a subset (build.sh): CI passes one on a pull request and
+# leaves it empty, for all six widths, on main and on tags.
 FROM engine-src AS engine
-RUN scripts/build.sh /out/bin
+ARG G6_WIDTHS=
+RUN G6_WIDTHS="$G6_WIDTHS" scripts/build.sh /out/bin
 
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src AS engine-int4
-RUN KV_FORMAT=int4 scripts/build.sh /out/bin
+ARG G6_WIDTHS=
+RUN G6_WIDTHS="$G6_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a
 # and libg6kvman.a
@@ -81,12 +85,22 @@ COPY --from=front /out/g6front-rs /
 # dist holds the shipped binaries in bin/: g6m4 (fp8 KV) and g6m4-int4 (--kv-format int4), both for every TP width,
 # and g6load (the Hugging Face fetch's planner and checker). build.sh's CPU test binaries and objects stay behind.
 # tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
-FROM scratch AS dist
+# dist-fp8 and dist-int4 are the two halves of dist. The two engine stages are
+# the whole cost of a build and they share nothing, so CI builds one in each of
+# two jobs and unpacks both artifacts into one directory. dist stays the union,
+# for a local build and for anything that wants every binary from one target.
+FROM scratch AS dist-fp8
 COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
-COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
 COPY --from=kvman /out/kvman-remote /bin/
+
+FROM scratch AS dist-int4
+COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/
+
+FROM scratch AS dist
+COPY --from=dist-fp8 / /
+COPY --from=dist-int4 / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
 # libibverbs1 + ibverbs-providers (mlx5) for the fabric, ibverbs-utils for ibv_devinfo, python3 for the shims,
