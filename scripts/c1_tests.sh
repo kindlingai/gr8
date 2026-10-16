@@ -5,7 +5,8 @@
 # replaced) and kv4_test (the KV latent row: append round trip, and decode / prefill / row-owner attention against a host
 # reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and weight_check_test (the weight check's GPU sums
 # against the CPU's, and one changed byte caught in its own chunk) and canon_test (a session's KV exported and imported
-# across page lists and layouts, then a decode step on it; #152).
+# across page lists and layouts, then a decode step on it; #152) and kv_resize_test (the KV pool's chunks shrunk and grown
+# under live sessions, on caches in virtual memory, against caches that never resized; #153).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -80,6 +81,16 @@ if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
     build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP canon_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+  fi
+fi
+if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
+  # the KV pool's chunks shrunk and grown under live sessions (#153): the allocator's library and the driver API
+  [ "$TEST" = all ] && ARGS=()
+  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  if [ -f "$KVLIB" ]; then
+    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  else
+    echo "SKIP kv_resize_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then

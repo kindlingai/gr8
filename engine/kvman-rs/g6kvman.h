@@ -131,6 +131,18 @@ void g6kv_tail(g6kv_pool* p, uint32_t nr, uint32_t per_slot);
 // whether g6kv_tail set the CP map's ranks: a run past R carries its own page list, and the engine builds its tables
 // from it (1), or it holds the pool as pages 0, 1, .. on the tables as built (0)
 int g6kv_split(const g6kv_pool* p);
+// Resize (#153): pages below place come in chunks of pages_per_chunk (the last may be shorter), set while every chunk is
+// online. An offline chunk holds no live or retained run, so its memory may be released. g6kv_shrink takes n chunks
+// offline (the highest no live run holds a page of; retained runs in them are evicted and spill): *done = 1 and the
+// chunks in out[0..*got], or *done = 0 when the pool must wait for sessions (nothing changed). It never evicts a live
+// run, and refuses (*done = 0) a shrink that would leave a live run unable to reach its worst case. g6kv_grow_pool
+// brings n chunks back, the lowest first, after the engine mapped their memory. An error when the size cannot be.
+int g6kv_chunks(g6kv_pool* p, uint32_t pages_per_chunk);
+uint32_t g6kv_chunk_count(const g6kv_pool* p);
+int g6kv_chunk_online(const g6kv_pool* p, uint32_t k);
+uint32_t g6kv_place_online(const g6kv_pool* p);
+int g6kv_shrink(g6kv_pool* p, uint32_t n, uint32_t* out, size_t cap, size_t* got, int* done);
+int g6kv_grow_pool(g6kv_pool* p, uint32_t n, uint32_t* out, size_t cap);
 size_t g6kv_io_pending(const g6kv_pool* p);
 // takes every queued copy into out. out holds cap entries, at least g6kv_io_pending.
 int g6kv_io_take(g6kv_pool* p, g6kv_io* out, size_t cap);
