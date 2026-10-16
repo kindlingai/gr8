@@ -589,6 +589,7 @@ inline void s2_attention(Model& m, int i, int M, cudaStream_t st)
 inline void s2_prepare(Model& m, int M, cudaStream_t st)
 {
     S2Model& s = *m.s2;
+    route_ovl_init(m);
     head_for(m, M);
     for (int i = 0; i < m.nl; ++i)
     {
