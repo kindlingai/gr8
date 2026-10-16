@@ -3,8 +3,8 @@
 ## 2026-10-16: exact decode attention kernels, off by default
 
 - Three rounds of decode attention kernels, each behind an environment variable that defaults to 0
-  ([docs/SETTINGS.md](docs/SETTINGS.md)). Every one is bit-identical to the kernel it replaces: the same products, the
-  same fmaf order and the same skips per (row, head, slot).
+  ([docs/SETTINGS.md](docs/SETTINGS.md)). Each is written to be bit-identical to the kernel it replaces (the same
+  products, the same fmaf order and the same skips per row, head and slot); the measured set below is the one checked.
   - Round 1: `G6_ATTN_SC2` (scores with S key slots per warp, the query loaded once for all S) and `G6_ATTN_CTX2` (the
     context kernel with more gathered pairs per batch, or packed and branch-free with two batches in flight).
   - Round 2: `G6_ATTN_SC2_TR` (the heads' score sums reduced by one transpose across the warp), `G6_ATTN_CTX3` (context
@@ -18,8 +18,9 @@
   against that stock chain over several runs with the outputs and scratch poisoned first: both layers' outputs, the
   indices, the indexer's scores and ids, the appended KV and index rows, per layer the raw scores and context parts,
   and the shared layer's probabilities and context. Any difference fails the arm and the bench exits 3. It also times
-  each arm against a base (the rounds 1 + 2 set) per kernel and per call, hot and behind an L2 flush. Every arm was
-  byte-identical at contexts 2K, 8K and 32K with 1, 3, 8 and 12 rows.
+  each arm against a base (the rounds 1 + 2 set) per kernel and per call, hot and behind an L2 flush. Checked: the
+  rounds 1 + 2 set (`SC2=4 SC2_TR=2 CTX2=4 CTX3=2 SEL2=16 IDX_GRP=16`) and it with `QT=1 FRONT=1` were byte-identical
+  at contexts 2K, 8K and 32K with 1, 3, 8 and 12 rows. The other accepted values were not swept.
 - Measured on 4x DGX Spark at TP4, RigMark c1 decode screens on base 6448a16:
   - round 1 (`SC2=4 CTX2=4`): prose +3.4% to +4.7%, code and structured +4% to +7%, and 8.6 ms less per step at c4
     (12 rows);
