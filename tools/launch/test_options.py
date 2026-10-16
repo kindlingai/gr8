@@ -221,7 +221,10 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('G6_CP_R=32768 ', text)
         _, text, _ = self.digest('--share-limit', '32768', '--cap', '200000')
         self.assertIn('CAP=200000\n', text)
-        for bad in ('3000', '4095', '0', 'x'):
+        _, text, _ = self.digest('--share-limit', '98304')
+        self.assertIn('CAP=212224\n', text)              # 98304 + (1981 - 1536) x 64 x 4
+        self.assertIn('G6_CP_R=98304 ', text)
+        for bad in ('3000', '4095', '4100', '0', 'x'):
             with self.assertRaises(opt.OptionError):
                 self.digest('--share-limit', bad)
 
