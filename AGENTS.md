@@ -19,6 +19,15 @@ The rules, short:
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
 your own setup. The config examples use placeholders for a reason.
 
+## Contributor credit
+
+External contributors should add their GitHub username to [CREDITS.md](CREDITS.md) in their contribution PR, with a
+short description of their work and links to relevant PRs or commits when available. Extend an existing entry when
+adding more work. Keep the full contributor list in the README's Credits section in sync with CREDITS.md.
+
+When preparing a PR on someone else's behalf, ensure their work is credited and preserve their Git author/coauthor
+attribution. Describe proposed work accurately without presenting it as a merged or measured improvement.
+
 ## Build
 
 On a GB10 with CUDA 13:
