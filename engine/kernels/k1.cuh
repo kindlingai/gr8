@@ -104,6 +104,33 @@ __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int
     return false;
 }
 
+// G6_K1_TLBW (A/B, bind.cuh make_k1): warp 0 of fc1 CTA s, s < the step's item slots, prefetches one L2 line per
+// 2^tlbw-byte granule of item slot s's fc1 and fc2 ranges at the start of the launch. The GPU's address translations
+// of every routed slot (fc1 units of the later CTA waves, all fc2 units) are then walked while fc1 runs, not when
+// those CTAs start (k1_audit --arms tlbw). prefetch.global.L2 has no result: no output changes.
+template <bool SH>
+__device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
+{
+    int e, mask, ss;
+    if (threadIdx.x >= 32 || !k1_slot<SH>(A, plan, s, e, mask, ss)) return;
+    const long long* tr = A.t_tab + 6 * e;
+    const int nb = static_cast<int>(tr[3]);
+    constexpr size_t MB = static_cast<size_t>(KSH) * 8 * 32;      // bytes of one fc1 matrix or fc2 block per bit of width
+    size_t f1lo, f1hi;
+    tr3_unit(A.t_kmix, e, tr, 0, f1lo);                          // units are back to back in unit order
+    const int kl = tr3_unit(A.t_kmix, e, tr, 2 * nb - 1, f1hi);
+    f1hi += kl * MB;
+    const size_t f2lo = static_cast<size_t>(tr[1]), f2hi = f2lo + static_cast<size_t>(nb) * static_cast<size_t>(tr[4]) * MB;
+    const uintptr_t g = uintptr_t(1) << A.tlbw;
+    auto warm = [&](const uint8_t* base, size_t lo, size_t hi) {
+        const uintptr_t a0 = reinterpret_cast<uintptr_t>(base + lo), a1 = reinterpret_cast<uintptr_t>(base + hi);
+        for (uintptr_t a = (a0 & ~(g - 1)) + threadIdx.x * g; a < a1; a += 32 * g)
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(a < a0 ? a0 : a) : "memory");
+    };
+    warm(A.t_fc1, f1lo, f1hi);
+    warm(A.t_fc2, f2lo, f2hi);
+}
+
 // E4 = the layer's routed experts are exlr8-e4m3 (codebook rounded to E4M3, tr3.cuh tr3_cb2); K2 = it has 2-bit units;
 // SH = its shared expert is trellis row 256, run as one more slot, and its hidden-side vectors are in block-scale form
 // (tr3.sg, tr3.v1b, tr3.v3b; exlr8 v2). The binder picks the instantiation
@@ -114,6 +141,7 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
     extern __shared__ __align__(16) u32 smem[];
     const int plan = A.ctl[0];
     const int ups = g6nr::EB * 2 * A.KS1, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
+    if (A.tlbw && static_cast<int>(blockIdx.x) < A.n_slots + k1_nsh<SH>(A)) k1_tlbw<SH>(A, plan, blockIdx.x);
     if (static_cast<int>(blockIdx.x) < nr)
     {
         int e, mask, ss;
@@ -169,6 +197,7 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1_ovl(K1Args A)
     const int plan = A.ctl[0];
     const int ups = A.B * 2 * A.KS1;
     const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
+    if (PART == 2 && A.tlbw && static_cast<int>(blockIdx.x) < A.n_slots) k1_tlbw<true>(A, plan, blockIdx.x + k1_nsh<true>(A));
     int e, mask, ss;
     const int slot = cta / ups;
     if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, true>(A, plan, cta + (ss - slot) * ups, e, mask, smem);
@@ -220,6 +249,7 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
     int* done = A.fctl + 1;
     int* sdone = A.fctl + 1 + SMAX * g6nr::EB;
     if (blockIdx.x == 0 && t == 0) A.ctl[2] = plan;
+    if (A.tlbw && static_cast<int>(blockIdx.x) < nsl) k1_tlbw<SH>(A, plan, blockIdx.x);
     for (;;)
     {
         if (t == 0) s_item = atomicAdd(A.fctl, 1);
