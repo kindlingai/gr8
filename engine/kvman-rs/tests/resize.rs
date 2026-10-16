@@ -79,9 +79,10 @@ fn check(p: &Pool, live: &[Live]) {
     let retained = owner.iter().filter(|&&o| o == 2).count();
     assert_eq!(held + retained + free + offline, pages, "a page lost");
     assert!((0..pages as u32).all(|q| p.used(q) == (owner[q as usize] == 1)));
-    // a resident past-R run holds the pool: nothing is free and the safe-state check is its own (it holds its worst)
+    // a resident past-R run holds the pool: nothing is free, nothing admits, and it already holds its worst case. Its
+    // draft-class pages above place count in live_pages, so the below-place Banker's model does not apply
     if live.iter().any(|l| p.exclusive_run(&l.run).unwrap()) {
-        assert_eq!(p.free_pages(), 0);
+        assert_eq!((p.free_pages(), p.room(), p.admissible(PAGE)), (0, 0, false));
         return;
     }
     assert_eq!(p.free_pages() as usize, pages - offline - held);
@@ -94,6 +95,35 @@ fn finish(rng: &mut Rng, prompt: &[i32]) -> Finished {
     history.extend((0..rng.range(0, 20)).map(|_| rng.range(0, 9) as i32));
     let n = history.len() as i32;
     Finished { valid: n - 1, written_end: n, pf_end: prompt.len() as i32 - 1, history }
+}
+
+// what a shrink of n must do, from the pool's visible state (independent of Pool::shrink): Err(BadSize) when no state
+// allows it, Ok(None) when it must wait, Ok(Some(chunks)) otherwise
+fn shrink_model(a: &Pool, n: u32, chunk: u32, place: u32, below_pages: u32) -> Result<Option<Vec<u32>>, Error> {
+    let on: Vec<u32> = (0..a.chunk_count()).filter(|&k| a.chunk_online(k)).collect();
+    let size = |k: u32| (k * chunk..((k + 1) * chunk).min(place)).len() as u32;
+    let mut sizes: Vec<u32> = on.iter().map(|&k| size(k)).collect();
+    sizes.sort_unstable_by(|x, y| y.cmp(x));
+    if sizes.len() < n as usize || a.place_online() - sizes.iter().take(n as usize).sum::<u32>() < below_pages {
+        return Err(Error::BadSize);
+    }
+    if !a.admissible(PAGE) {
+        return Ok(None); // a past-R run is resident
+    }
+    let mut free_chunks: Vec<u32> = on
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&k| !(k * chunk..((k + 1) * chunk).min(place)).any(|q| a.used(q)))
+        .take(n as usize)
+        .collect();
+    let left = a.place_online() - free_chunks.iter().map(|&k| size(k)).sum::<u32>();
+    let runs: Vec<(u32, u32)> = a.runs().map(|(_, h, w)| (h, w)).collect();
+    if free_chunks.len() < n as usize || !safe(left, a.live_pages(), &runs) {
+        return Ok(None);
+    }
+    free_chunks.sort_unstable();
+    Ok(Some(free_chunks))
 }
 
 #[test]
@@ -425,7 +455,7 @@ fn chunks_online_change_nothing() {
 // shrink waits while a past-R run is resident, and two ranks agree.
 #[test]
 fn resize_traces_two_classes() {
-    let (mut shrinks, mut grows, mut exclusive, mut hits) = (0u64, 0u64, 0u64, 0u64);
+    let (mut shrinks, mut grows, mut exclusive, mut hits, mut stalls_or_grows) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for seed in 1..=150u64 {
         let mut rng = Rng(seed * 92821);
         let place = rng.range(16, 300) as u32;
@@ -443,7 +473,7 @@ fn resize_traces_two_classes() {
         let mut live: Vec<Live> = Vec::new();
         let mut past: Vec<Vec<i32>> = Vec::new();
         for _ in 0..1200 {
-            match rng.range(0, 9) {
+            match rng.range(0, 10) {
                 0..=3 => {
                     let mut prompt = if !past.is_empty() && rng.one_in(2) {
                         past[rng.range(0, past.len() as u64 - 1) as usize].clone()
@@ -458,19 +488,21 @@ fn resize_traces_two_classes() {
                     if rows > most {
                         continue;
                     }
-                    let fits = a.fits(rows, rows);
-                    assert_eq!(fits, b.fits(rows, rows));
+                    // below R a run may grow to its worst case; past R it takes it at once
+                    let worst = if long { rows } else { (rows + rng.range(0, most / 2)).min(most) };
+                    let fits = a.fits(rows, worst);
+                    assert_eq!(fits, b.fits(rows, worst));
                     if !fits {
-                        assert!(a.reserve(rows, rows).is_err());
+                        assert!(a.reserve(rows, worst).is_err());
                         continue;
                     }
-                    let h = a.match_prefix(&prompt, rows, rows, prompt.len() as i32 - 1);
-                    assert_eq!(h, b.match_prefix(&prompt, rows, rows, prompt.len() as i32 - 1));
+                    let h = a.match_prefix(&prompt, rows, worst, prompt.len() as i32 - 1);
+                    assert_eq!(h, b.match_prefix(&prompt, rows, worst, prompt.len() as i32 - 1));
                     let (ra, rb) = if h.skip > 0 {
                         hits += 1;
-                        (a.take(h.skip, h.age, rows, rows).unwrap(), b.take(h.skip, h.age, rows, rows).unwrap())
+                        (a.take(h.skip, h.age, rows, worst).unwrap(), b.take(h.skip, h.age, rows, worst).unwrap())
                     } else {
-                        (a.reserve(rows, rows).unwrap(), b.reserve(rows, rows).unwrap())
+                        (a.reserve(rows, worst).unwrap(), b.reserve(rows, worst).unwrap())
                     };
                     assert_eq!(ra, rb);
                     if a.exclusive_run(&ra).unwrap() {
@@ -500,15 +532,36 @@ fn resize_traces_two_classes() {
                 6..=7 => {
                     let n = rng.range(1, 2) as u32;
                     let resident = live.iter().any(|l| a.exclusive_run(&l.run).unwrap());
+                    let want = shrink_model(&a, n, chunk, place, below_pages);
                     let before = a.digest();
                     let r = a.shrink(n);
                     assert_eq!(r, b.shrink(n));
+                    assert_eq!(r, want, "shrink {n} against the model");
                     match r {
                         Ok(Some(_)) => {
                             assert!(!resident, "a shrink went while a past-R run was resident");
                             shrinks += 1;
                         }
                         _ => assert_eq!(a.digest(), before, "a shrink that did not go changed the pool"),
+                    }
+                }
+                8 => {
+                    // a round of growth for the runs below R
+                    for l in live.iter_mut() {
+                        let (_, held, worst) = a.runs().find(|u| u.0 == l.run.table_version).unwrap();
+                        if worst == held || a.exclusive_run(&l.run).unwrap() {
+                            continue;
+                        }
+                        let rows = (held + rng.range(1, (worst - held) as u64) as u32) as u64 * PAGE;
+                        let ga = a.grow(&l.run, rows).unwrap();
+                        assert_eq!(ga, b.grow(&l.run, rows).unwrap());
+                        if let Some(r) = ga {
+                            let list = a.list(&r).unwrap().to_vec();
+                            assert!(list.starts_with(&l.list) && list.iter().all(|&q| q < place && a.online(q)));
+                            l.run = r;
+                            l.list = list;
+                            stalls_or_grows += 1;
+                        }
                     }
                 }
                 _ => {
@@ -527,13 +580,14 @@ fn resize_traces_two_classes() {
         }
     }
     assert!(
-        shrinks > 2_000 && grows > 1_000 && exclusive > 800 && hits > 100,
-        "shrinks {shrinks} grows {grows} exclusive {exclusive} hits {hits}"
+        shrinks > 2_000 && grows > 1_000 && exclusive > 800 && hits > 100 && stalls_or_grows > 1_000,
+        "shrinks {shrinks} grows {grows} exclusive {exclusive} hits {hits} run growths {stalls_or_grows}"
     );
 }
 
-// with block stores: a shrink that evicts retained runs queues their spills, and every later call waits for the engine
-// to run them (io(), io_done()) before the memory may go; the spilled run then restores from the store
+// with block stores: a shrink that evicts retained runs queues their spills, and the next pool call that changes
+// state (here shrink and grow_pool, as for reserve, take and grow: Pool::pending) is refused until the engine ran them
+// (io(), io_done()), so the memory goes only after the copies. The spilled run then restores from the store
 #[test]
 fn a_shrink_spills_before_the_memory_goes() {
     let mut p = Pool::new(40, 40, 10 * 64).unwrap();
@@ -555,13 +609,15 @@ fn a_shrink_spills_before_the_memory_goes() {
     assert!(p.io_pending() > 0, "the evicted run's spills are queued");
     assert_eq!(p.grow_pool(1), Err(Error::PendingIo), "nothing goes on before the spills ran");
     assert_eq!(p.shrink(1), Err(Error::PendingIo));
+    assert_eq!(p.reserve(PAGE, PAGE), Err(Error::PendingIo));
     let io = p.io();
     assert!(io.iter().all(|x| matches!(x, Io::Spill { page, .. } if (30..40).contains(page))), "{io:?}");
     p.io_done().unwrap();
     for r in [&a, &b, &c] {
         p.release(r).unwrap();
     }
-    // the run spilled from the offline chunk comes back from the store into online pages
+    // the run spilled from the offline chunk comes back from the store into online pages: 11 pages is past R (10), so
+    // this is an exclusive grant on the tables as built, into the 30 pages before the offline chunk (prefix_online)
     let h = p.match_prefix(&hist, 11 * PAGE, 11 * PAGE, hist.len() as i32 - 1);
     assert!(h.stored && h.skip > 0, "{h:?}");
     let r = p.take_hit(h.skip, h.age, Some(h.tier), 11 * PAGE, 11 * PAGE).unwrap();

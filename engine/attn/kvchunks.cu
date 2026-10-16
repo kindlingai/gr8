@@ -110,12 +110,12 @@ extern "C" int g6_kvc_sync(G6KvChunks* c, size_t page_bytes, uint32_t chunk_page
         for (size_t g = blo / c->gran; g * c->gran < end; ++g) need[g] = 1;
     }
     CUstream s = (CUstream)stream;
-    // nothing on any stream may still read a granule that goes
-    CUresult r = cuCtxSynchronize();
-    if (r != CUDA_SUCCESS) return (int)r;
     size_t m = 0, d = 0;
     if (mapped) *mapped = 0;
     if (released) *released = 0;
+    // nothing on any stream may still read a granule that goes
+    CUresult r = cuCtxSynchronize();
+    if (r != CUDA_SUCCESS) return (int)r;
     for (size_t g = 0; g < n; ++g) {
         if (need[g] && !c->on[g]) {
             int e = back(c, g, s);
@@ -124,9 +124,9 @@ extern "C" int g6_kvc_sync(G6KvChunks* c, size_t page_bytes, uint32_t chunk_page
             if (mapped) *mapped = m;
         } else if (!need[g] && c->on[g]) {
             int e = drop(c, g);
-            if (e) return e;
-            d += c->gran;
+            if (!c->on[g]) d += c->gran;   // unmapped, even when the release failed
             if (released) *released = d;
+            if (e) return e;
         }
     }
     return (int)cuStreamSynchronize(s);

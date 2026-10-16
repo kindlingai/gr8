@@ -273,7 +273,8 @@ impl Pool {
     /// of live runs, when the live runs could not all reach their worst cases in what stays online, or while an
     /// exclusive run is resident: the caller waits for sessions to finish and tries again. A shrink never evicts or
     /// moves a live run. Err(BadSize) when no state allows it: fewer than n chunks online, or the largest n of them
-    /// would leave less than R / 64 pages online below place (a request of R rows could never fit). Ok(Some(chunks)): the chunks now offline, ascending. The evicted runs' spills
+    /// would leave less than R / 64 pages online below place (a request of R rows could never fit). Err(BadArgument)
+    /// before chunks(). Ok(Some(chunks)): the chunks now offline, ascending. The evicted runs' spills
     /// are queued (io()): the engine runs them before it releases the chunks' memory.
     pub fn shrink(&mut self, n: u32) -> Result<Option<Vec<u32>>, Error> {
         self.pending()?;
@@ -337,7 +338,7 @@ impl Pool {
     /// Brings `n` offline chunks back, the lowest first (so an exclusive run on the tables as built gets its pages 0, 1,
     /// .. back first). The engine maps their memory before this call. Growth starts from a safe state (every state
     /// the pool reaches is one) and adds only free pages, so it stays safe. Err(BadArgument) when fewer than n chunks
-    /// are offline. Returns the chunks now online, ascending.
+    /// are offline, or before chunks(). Returns the chunks now online, ascending.
     pub fn grow_pool(&mut self, n: u32) -> Result<Vec<u32>, Error> {
         self.pending()?;
         if self.chunk == 0 {
