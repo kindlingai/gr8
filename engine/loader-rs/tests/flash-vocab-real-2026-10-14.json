@@ -1,0 +1,35 @@
+{
+  "status": "PASS",
+  "tp": 4,
+  "ranks": [
+    {
+      "rank": 0,
+      "status": "PASS",
+      "planned_tensors": 3,
+      "fp32_matrix_shards": 2
+    },
+    {
+      "rank": 1,
+      "status": "PASS",
+      "planned_tensors": 3,
+      "fp32_matrix_shards": 2
+    },
+    {
+      "rank": 2,
+      "status": "PASS",
+      "planned_tensors": 3,
+      "fp32_matrix_shards": 2
+    },
+    {
+      "rank": 3,
+      "status": "PASS",
+      "planned_tensors": 3,
+      "fp32_matrix_shards": 2
+    }
+  ],
+  "planned_tensors": 12,
+  "fp32_matrix_shards": 8,
+  "unique_matrices": 2,
+  "globals": true,
+  "experts": false
+}

@@ -15,6 +15,10 @@ struct FabricConfig {
   int rank = -1;
   std::vector<std::string> ips;   // rail 0 addresses, index = rank (also used for the TCP bootstrap)
   std::vector<std::string> ips2;  // rail 1 addresses (empty = single rail)
+  // dual-rail striping (uniform layout, ips2 set, not ring/bulk): a payload write of >= stripe_min bytes goes out as two
+  // halves, the first on a second QP over the other rail, the second (+ tail) on the peer's QP; the proxy posts the
+  // tail write only after the first half completed, so the tail still means "the whole payload landed". 0 = off.
+  size_t stripe_min = 0;
   size_t slot_bytes = 0;          // max payload bytes per collective (tail is appended)
   int ncoll = 0;                  // collectives per step (slot count per parity)
   int port = 18600;               // TCP bootstrap port on rank 0 (uses port..port+3)

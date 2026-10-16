@@ -27,13 +27,13 @@ __device__ __forceinline__ char* ptr(const Slot& s)
 
 // All threads of every CTA, after the CTA's last store into the slot (stored = this thread stored into it).
 // Same protocol as glue::publish: system fence, CTA barrier, last CTA rings doorbell[c] = coll_seq (release, sys).
-__device__ __forceinline__ void publish(const Slot& s, bool stored)
+__device__ __forceinline__ void publish(const Slot& s, bool stored, unsigned n = 0)
 {
     if (stored) __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0)
     {
-        const unsigned n = gridDim.x * gridDim.y * gridDim.z;
+        if (!n) n = gridDim.x * gridDim.y * gridDim.z;
         if (atomicAdd(s.ticket, 1u) == n - 1)
         {
             const u64 step = *s.stepp;

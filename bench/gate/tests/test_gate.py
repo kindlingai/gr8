@@ -227,6 +227,16 @@ class Records(unittest.TestCase):
         runs = [rec('b1', {'m': 10.0}), rec('b1', {'m': 12.0}), rec('b1', {'m': 11.0}), rec('b2', {'m': 20.0})]
         self.assertEqual(baseline(runs)['boots']['b1']['metrics']['m'], 11.0)
 
+    def test_zero_baseline_uses_metric_direction(self):
+        for metric, direction in (('d.decode_tok_s', 1), ('x.ttft_s', -1)):
+            base = baseline([rec('b1', {metric: 0.0})])
+            for value, verdict in ((0.0, 'PASS'), (direction, 'better'), (-direction, 'FAIL')):
+                with self.subTest(metric=metric, value=value):
+                    rows, status, _ = record.check([rec('n', {metric: value})], base, required=None)
+                    self.assertEqual(rows[0][3], None)  # a relative percentage is undefined at zero
+                    self.assertEqual(rows[0][4], verdict)
+                    self.assertEqual(status, 'FAIL' if verdict == 'FAIL' else 'PASS')
+
     def test_check_rules(self):
         base = baseline([rec('b1', {'d.decode_tok_s': 40.0, 'x.ttft_s': 2.0, 'needle.87k.pass': 1.0,
                                                  'kl.mean': 0.004})])
@@ -397,6 +407,14 @@ class CLI(Base):
             with open(runs) as f:
                 lines = [json.loads(ln) for ln in f]
             self.assertEqual(len(lines), 6)
+            # This tests CLI baseline/check plumbing, not wall-clock performance. A fast fake
+            # server can round TTFT to zero in some runs and 1 ms in others. Use deterministic
+            # positive timing metrics; zero-baseline behavior has separate comparison tests.
+            for row in lines:
+                for key, metric in row['metrics'].items():
+                    if key.endswith(('.ttft_s', '.prefill_tok_s', '.decode_tok_s', '.agg_tok_s', '.stream_tok_s')):
+                        metric['value'] = 1.0
+            Path(runs).write_text(''.join(json.dumps(row) + '\n' for row in lines))
             r = lines[0]
             for key in ('commit', 'topology', 'build_flags', 'settings', 'results', 'metrics', 'harness_commit'):
                 self.assertIn(key, r)

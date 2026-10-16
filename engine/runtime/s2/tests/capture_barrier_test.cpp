@@ -14,27 +14,27 @@ using namespace g6s2;
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-static BootstrapConfig config(unsigned rank, uint16_t port, const std::string& dir) {
-    BootstrapConfig c; c.rank = rank; c.ranks = 4; c.timeout = 1; c.head_ip = "127.0.0.1"; c.port = port;
+static BootstrapConfig config(unsigned rank, uint16_t port, const std::string& dir, unsigned nr) {
+    BootstrapConfig c; c.rank = rank; c.ranks = nr; c.timeout = 1; c.head_ip = "127.0.0.1"; c.port = port;
     c.directory = dir + "/r" + std::to_string(rank); c.runtime_signature = "test";
     ::mkdir(c.directory.c_str(), 0700);
     return c;
 }
 
 // delay_ms: capture time of worker 3; die: worker 3 closes its link without reporting
-static bool run(uint16_t port, const std::string& dir, int delay_ms, bool die, long& head_ms) {
+static bool run(uint16_t port, const std::string& dir, int delay_ms, bool die, long& head_ms, unsigned nr = 4) {
     std::vector<std::thread> w; std::atomic<bool> bad{false};
-    for (unsigned r = 1; r < 4; ++r) w.emplace_back([&, r] {
+    for (unsigned r = 1; r < nr; ++r) w.emplace_back([&, r] {
         try {
-            auto c = config(r, port, dir); auto links = bootstrap(c);
-            if (r == 3) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-            if (r == 3 && die) { links.shutdown(); return; }
+            auto c = config(r, port, dir, nr); auto links = bootstrap(c);
+            if (r == nr - 1) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            if (r == nr - 1 && die) { links.shutdown(); return; }
             capture_barrier(c, links);
         } catch (...) { bad = true; }
     });
     bool ok = true;
     const auto t0 = std::chrono::steady_clock::now();
-    try { auto c = config(0, port, dir); auto links = bootstrap(c); capture_barrier(c, links); }
+    try { auto c = config(0, port, dir, nr); auto links = bootstrap(c); capture_barrier(c, links); }
     catch (...) { ok = false; }
     head_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     for (auto& t : w) t.join();
@@ -49,6 +49,8 @@ int main() {
     CHECK(ms >= 3000);
     const std::string dir2 = dir + "/b"; ::mkdir(dir2.c_str(), 0700);
     CHECK(!run(uint16_t(port + 1), dir2, 200, true, ms)); // a worker that dies before reporting
+    const std::string dir3 = dir + "/tp2"; ::mkdir(dir3.c_str(), 0700);
+    CHECK(run(uint16_t(port + 2), dir3, 0, false, ms, 2));
     if (!fails) std::printf("capture_barrier_test: PASS\n");
     return fails ? 1 : 0;
 }

@@ -219,7 +219,7 @@ static int cmd_gemm(const Args& a)
     const std::string kname = a.s("kind", "fp8");
     int kind = -1;
     for (int i = 0; i < gx::KINDS; ++i) if (kname == names[i]) kind = i;
-    const int K = a.i("K", 6144), N = a.i("N", 768), bits = a.i("bits", 3), MB = a.i("MB", 4);
+    const int K = a.i("K", HID), N = a.i("N", 768), bits = a.i("bits", 3), MB = a.i("MB", 4);
     const int E = a.i("experts", 64), rpe = a.i("rpe", 64), P = a.i("pool", 16), reps = a.i("reps", 5);
     const std::string dump = a.s("dump", "");
     if (kind < 0 || (MB != 4 && MB != 8)) { fprintf(stderr, "bad kind/MB\n"); return 1; }

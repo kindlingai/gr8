@@ -380,7 +380,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let tools = normalize_tools(body.get("tools"))?;
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     thinking::check_response_format(body.get("response_format"))?;
-    let th = thinking::resolve(body, &st.template.levels, st.thinking)?;
+    let th = st.template.resolve_thinking(body, st.thinking)?;
     let kw = build_template_kwargs(
         body.get("chat_template_kwargs"),
         body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
@@ -1089,7 +1089,7 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 ));
             }
             // the same effort and the same refusals as a chat request, so the counts agree
-            let th = thinking::resolve(&body, &st.template.levels, st.thinking)?;
+            let th = st.template.resolve_thinking(&body, st.thinking)?;
             let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
             let tools = normalize_tools(body.get("tools"))?;
             let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;

@@ -87,7 +87,7 @@ inline std::vector<char> pf_qp_mask(const std::vector<int>& layers)
     std::vector<char> on(layers.size(), 0);
     const char* e = getenv("G6_PF_QP_LAYERS");
     const std::string v = e && *e ? e : "all";
-    std::vector<char> want(78, 0);
+    std::vector<char> want(geom::L_MAIN, 0);
     if (v == "all") std::fill(want.begin(), want.end(), 1);
     else
         for (size_t k = 0; k < v.size();)
@@ -97,13 +97,13 @@ inline std::vector<char> pf_qp_mask(const std::vector<int>& layers)
             long b = a;
             if (end == v.c_str() + k) die("G6_PF_QP_LAYERS: bad list " + v);
             if (*end == '-') { const char* q = end + 1; b = strtol(q, &end, 10); if (end == q) die("G6_PF_QP_LAYERS: bad list " + v); }
-            if (a < 0 || b < a || b > 77) die("G6_PF_QP_LAYERS: layers must be 0..77 (the MTP layer keeps the head-split path): " + v);
+            if (a < 0 || b < a || b >= geom::L_MAIN) die("G6_PF_QP_LAYERS: layers must be 0.." + std::to_string(geom::L_MAIN - 1) + " (the MTP layer keeps the head-split path): " + v);
             for (long l = a; l <= b; ++l) want[l] = 1;
             k = end - v.c_str();
             if (k < v.size() && v[k] != ',') die("G6_PF_QP_LAYERS: bad list " + v);
             if (k < v.size()) ++k;
         }
-    for (size_t i = 0; i < layers.size(); ++i) on[i] = layers[i] >= 0 && layers[i] < 78 && want[layers[i]];
+    for (size_t i = 0; i < layers.size(); ++i) on[i] = layers[i] >= 0 && layers[i] < geom::L_MAIN && want[layers[i]];
     return on;
 }
 
@@ -165,7 +165,7 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
         G6RT_CK(cudaStreamSynchronize(st));
         P.qa.assign(m.nl, nullptr);
         for (int i = 0; i < m.nl; ++i) if (P.qpl[i]) P.qa[i] = R.qa[i % R.S];
-        const size_t sb = (size_t)R.S * ((size_t)8192 * 2048 + (size_t)8192 * 64 + (size_t)HID * 8192 + (size_t)HID * 256 +
+        const size_t sb = (size_t)R.S * ((size_t)8192 * geom::QA + (size_t)8192 * (geom::QA / 32) + (size_t)HID * 8192 + (size_t)HID * 256 +
                                          (size_t)QP_HEADS * (192 + 256) * 512 * 2);
         if (m.rank == 0) fprintf(stderr, "# rank %d: G6_PF_QP_ROLL=%d rolling pair pack: %d slots %.3f GB + QO states/workspace %.3f GB (QO cap %d)\n",
                                  m.rank, R.S, R.S, sb / 1e9, b / 1e9, P.qp_ctx);

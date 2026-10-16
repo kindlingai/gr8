@@ -1,0 +1,156 @@
+{
+  "scope": "BF16 independent operations; not end-to-end runtime or K4",
+  "layer": 45,
+  "rows": 8,
+  "batches": {
+    "1": {
+      "ops": {
+        "concat norms / pos0": {
+          "rel_l2": 6.09168617e-08,
+          "gate": 0.0001
+        },
+        "eh_proj": {
+          "rel_l2": 3.27678346e-07,
+          "gate": 0.0001
+        },
+        "attention norm": {
+          "rel_l2": 6.66989638e-08,
+          "gate": 0.0001
+        },
+        "attention residual": {
+          "rel_l2": 0.0,
+          "gate": 0.0001
+        },
+        "MLP norm": {
+          "rel_l2": 6.87924465e-08,
+          "gate": 0.0001
+        },
+        "router logits": {
+          "rel_l2": 1.51473857e-07,
+          "gate": 0.0001
+        },
+        "BF16 routed experts": {
+          "rel_l2": 7.86854324e-07,
+          "gate": 0.0001
+        },
+        "BF16 shared expert": {
+          "rel_l2": 4.70269845e-07,
+          "gate": 0.0001
+        },
+        "BF16 MoE output": {
+          "rel_l2": 6.48299285e-07,
+          "gate": 0.0001
+        },
+        "MLP residual": {
+          "rel_l2": 0.0,
+          "gate": 0.0001
+        },
+        "shared head norm": {
+          "rel_l2": 5.59277639e-08,
+          "gate": 0.0001
+        },
+        "shared lm_head": {
+          "rel_l2": 0.00121156377,
+          "gate": 0.01
+        }
+      },
+      "router_choice_mismatches": 0,
+      "router_weight_max_abs": 1.1920929e-07,
+      "head_top1": [
+        8,
+        8
+      ],
+      "head_mean_kl": 4.65631352e-06
+    },
+    "8": {
+      "ops": {
+        "concat norms / pos0": {
+          "rel_l2": 6.09168617e-08,
+          "gate": 0.0001
+        },
+        "eh_proj": {
+          "rel_l2": 3.27678346e-07,
+          "gate": 0.0001
+        },
+        "attention norm": {
+          "rel_l2": 6.66989638e-08,
+          "gate": 0.0001
+        },
+        "attention residual": {
+          "rel_l2": 0.0,
+          "gate": 0.0001
+        },
+        "MLP norm": {
+          "rel_l2": 6.87924465e-08,
+          "gate": 0.0001
+        },
+        "router logits": {
+          "rel_l2": 1.51473857e-07,
+          "gate": 0.0001
+        },
+        "BF16 routed experts": {
+          "rel_l2": 7.86854324e-07,
+          "gate": 0.0001
+        },
+        "BF16 shared expert": {
+          "rel_l2": 4.70269845e-07,
+          "gate": 0.0001
+        },
+        "BF16 MoE output": {
+          "rel_l2": 6.48299285e-07,
+          "gate": 0.0001
+        },
+        "MLP residual": {
+          "rel_l2": 0.0,
+          "gate": 0.0001
+        },
+        "shared head norm": {
+          "rel_l2": 5.59277639e-08,
+          "gate": 0.0001
+        },
+        "shared lm_head": {
+          "rel_l2": 0.00121156377,
+          "gate": 0.01
+        }
+      },
+      "router_choice_mismatches": 0,
+      "router_weight_max_abs": 1.1920929e-07,
+      "head_top1": [
+        8,
+        8
+      ],
+      "head_mean_kl": 4.65631352e-06
+    }
+  },
+  "dsa_checks": 24,
+  "dsa": {
+    "contexts": [
+      1,
+      5,
+      8
+    ],
+    "ranks": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "batches": [
+      1,
+      8
+    ],
+    "max_rel_l2_printed": 0.0022,
+    "max_fp32_input_ref_rel_l2_printed": 0.00219,
+    "selection_mismatches": 0,
+    "replay_bit_identical": true,
+    "gate": 0.01
+  },
+  "golden_sha256": "fb0308267c752ca1e07b5fc473a820d97025c5afaa19e86f9028cb639389e3a3",
+  "host_suite_exit": 0,
+  "tiny_reference_suite_exit": 0,
+  "driver_compile_exit": {
+    "m4sim": 0,
+    "g6m4": 0
+  },
+  "glm_regression": "Both preprocessed driver translation units match base except diagnostic line numbers; no GPU GLM run."
+}

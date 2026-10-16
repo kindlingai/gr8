@@ -36,7 +36,8 @@ TOL_DECODE = 4e-3        # vs exact W: fp16 rotated activations (rel 2^-11 each)
 TOL_PREFILL = 1.5        # prefill, row rms error: at most this times today's MXFP8 prefill (k_xq8 activations, exact W)
 TOL_PREFILL_GLU = 6e-2   # the MLP chain, whose today-equivalent is not emulated: the class of the single matrices
 TOL_BF16 = 6e-3          # decode with BF16 output (o_proj, MLP partials): the BF16 rounding (rel 2^-9) on top of TOL_DECODE's
-MATS = [("q_b", "self_attn.q_b_proj"), ("o_proj", "self_attn.o_proj"), ("gate", "mlp.gate_proj"), ("up", "mlp.up_proj"),
+MATS = [("q_proj", "self_attn.q_proj"), ("k_proj", "self_attn.k_proj"), ("v_proj", "self_attn.v_proj"),
+        ("q_b", "self_attn.q_b_proj"), ("o_proj", "self_attn.o_proj"), ("gate", "mlp.gate_proj"), ("up", "mlp.up_proj"),
         ("down", "mlp.down_proj")]
 
 
@@ -71,13 +72,13 @@ def chunk(n, tp, j):
     return j * (n // tp) + min(j, n % tp), w
 
 
-def rank_channels(short, tp, r, layer):
+def rank_channels(short, tp, r, layer, unit=256):
     """the rank's channels on the sharded side: rank r holds chunk (r - layer) mod tp (tools/convert/plan.py heads and
-    dense_groups), heads of 256 channels or the dense MLP's 12288 channels"""
+    dense_groups), heads of unit (128 or 256) channels or the dense MLP's 12288 channels"""
     j = (r - layer) % tp
-    if short in ("q_b", "o_proj"):
+    if short in ("q_b", "o_proj", "q_proj", "k_proj", "v_proj"):
         s, w = chunk(64, tp, j)
-        return 256 * s, 256 * (s + w)
+        return unit * s, unit * (s + w)
     s, w = chunk(96, tp, j)
     return 128 * s, 128 * (s + w)
 
@@ -95,16 +96,16 @@ def prepare(a):
     rng = np.random.default_rng(a.layer * 101 + a.tp)
     lines, xs, have = [], {}, set()
     for short, name, rec in trellis_mats(T):
-        fmt, out, inp, K, side = rec[:5]
+        fmt, out, inp, K, side, unit = rec[:6]
         if K != 4:
             sys.exit(f"{name}: K{K}, the kernels take K4 only")
         have.add(short)
         # one input per input space: q_b reads q_a_norm, o_proj the attention output, gate/up the mlp input, down the MLP activation
-        space = {"gate": "mlp_in", "up": "mlp_in"}.get(short, short)
+        space = {"gate": "mlp_in", "up": "mlp_in", "q_proj": "kda_in", "k_proj": "kda_in", "v_proj": "kda_in"}.get(short, short)
         if space not in xs:
             xs[space] = rng.standard_normal((a.rows, inp)).astype(np.float16)
         for r in ranks:
-            c0, c1 = rank_channels(short, a.tp, r, a.layer)
+            c0, c1 = rank_channels(short, a.tp, r, a.layer, unit)
             ent = T[name + ".trellis"][c0 // 128:c1 // 128]
             if side == 1:
                 suh, svh, x = T[name + ".suh"], T[name + ".svh"][c0:c1], xs[space]
@@ -171,15 +172,15 @@ def check(a):
         rec = f.get(name + ".record")
         t = {s: f.get(f"{name}.{s}") for s in X.DATA[int(rec[0])]}
         W = X.decode_dense(rec, t, dev).double()                    # (out, in) fp64 of exlr8.py's fp32 values
-        side = int(rec[4])
-        space = {"gate": "mlp_in", "up": "mlp_in"}.get(short, short)
+        side, unit = int(rec[4]), int(rec[5])
+        space = {"gate": "mlp_in", "up": "mlp_in", "q_proj": "kda_in", "k_proj": "kda_in", "v_proj": "kda_in"}.get(short, short)
         xfull = torch.from_numpy(np.fromfile(os.path.join(a.out, f"xfull.{space}.bin"), np.float16).reshape(R, -1)).to(dev).double()
         full[short] = (W, side, xfull)
         parts = []
         for r in ranks:
             nm = f"{short}.r{r}"
             K, N, _ = mats[nm]
-            c0, c1 = rank_channels(short, P["tp"], r, a.layer)
+            c0, c1 = rank_channels(short, P["tp"], r, a.layer, unit)
             E = (N if side == 1 else K) // 128
             ent = torch.from_numpy(np.fromfile(os.path.join(a.out, nm + ".codes.bin"), np.uint8).reshape(E, -1)).to(dev)
             suh = torch.from_numpy(np.fromfile(os.path.join(a.out, nm + ".suh.bin"), np.float16)).to(dev)
@@ -228,8 +229,8 @@ def check(a):
             ref = xfull[:8] @ W.T
             y = sum(p[1] for p in parts) if side == 2 else torch.cat([p[1] for p in sorted(parts, key=lambda p: p[0])], 1)
             if side == 1:
-                lo = min(rank_channels(short, P["tp"], r, a.layer)[0] for r in ranks)
-                hi = max(rank_channels(short, P["tp"], r, a.layer)[1] for r in ranks)
+                lo = min(rank_channels(short, P["tp"], r, a.layer, unit)[0] for r in ranks)
+                hi = max(rank_channels(short, P["tp"], r, a.layer, unit)[1] for r in ranks)
                 ref = ref[:, lo:hi]
             r_ = dict(ranks=ranks, combined_max_rel=rel(y, ref))
             r_["ok"] = r_["combined_max_rel"] < TOL_DECODE

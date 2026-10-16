@@ -52,7 +52,7 @@ __device__ __forceinline__ void put(void* y, size_t i, float v, int odt)
 struct Mxfp8
 {
     static constexpr int G = 2, TW = 2, GR = 528, PFB = 2;
-    static constexpr bool SCALED = true;
+    static constexpr bool SCALED = true, ROW_SCALED = false;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v2(tile + lane * 8, w); }
     static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { a[0] = e4m3x2(w[0]); a[1] = e4m3x2(w[0] >> 16); a[2] = e4m3x2(w[1]); a[3] = e4m3x2(w[1] >> 16); }
     static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { mma16816(g, a[0], a[1], a[2], a[3], b0, b1); }
@@ -67,10 +67,22 @@ struct Mxfp8
     static __device__ __forceinline__ float2 scale(u32 raw) { return make_float2(e8m0(raw & 0xffu), e8m0((raw >> 8) & 0xffu)); }
 };
 
+struct Fp8r
+{
+    static constexpr int G = 2, TW = 2, GR = 512, PFB = 2;
+    static constexpr bool SCALED = false, ROW_SCALED = true;
+    static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v2(tile + lane * 8, w); }
+    static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { Mxfp8::dec(w, a); }
+    static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { mma16816(g, a[0], a[1], a[2], a[3], b0, b1); }
+    static __device__ __forceinline__ void mma(float (&g)[4], const u32* w, u32 b0, u32 b1) { Mxfp8::mma(g, w, b0, b1); }
+    static __device__ __forceinline__ u32 ld_scale(const uint8_t*, int) { return 0; }
+    static __device__ __forceinline__ float2 scale(u32) { return make_float2(1.f, 1.f); }
+};
+
 struct Bf16w
 {
     static constexpr int G = 1, TW = 4, GR = 512, PFB = 4;
-    static constexpr bool SCALED = false;
+    static constexpr bool SCALED = false, ROW_SCALED = false;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v4(tile + lane * 16, w); }
     static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { a[0] = w[0]; a[1] = w[1]; a[2] = w[2]; a[3] = w[3]; }
     static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { gv::mma_bf16(g, a[0], a[1], a[2], a[3], b0, b1); }
@@ -84,7 +96,7 @@ struct Bf16w
 struct Int4v
 {
     static constexpr int G = 2, TW = 1, GR = 288, PFB = 2;
-    static constexpr bool SCALED = true;
+    static constexpr bool SCALED = true, ROW_SCALED = false;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { w[0] = ld_nc(tile + lane * 4); }
     static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4])
     {
@@ -326,9 +338,9 @@ __device__ __forceinline__ void gv_warp_part(const uint8_t* stream, const u32* x
 // cta: this CTA's index within the GEMV (blockIdx.x, or less in gv_multi).
 template <class C, int NT>
 __device__ __forceinline__ void gv_gemv_body(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
-                                             int M, void* y, int ystride, int odt, int cta = blockIdx.x)
+                                             int M, void* y, int ystride, int odt, float4 (&red)[32][32], int cta = blockIdx.x,
+                                             const float* rscale = nullptr)
 {
-    __shared__ float4 red[32][32];   // [warp][lane]
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int tl = warp / ks, part = warp % ks;
     const int ot = cta * tiles_per_cta + tl;
@@ -343,9 +355,16 @@ __device__ __forceinline__ void gv_gemv_body(const uint8_t* stream, const u32* x
     // C regs: (row r, tok 2c), (row r, tok 2c+1), (row r+8, tok 2c), (row r+8, tok 2c+1); tile t: tokens 8t + ...
     const int r = lane >> 2, c = lane & 3;
     const size_t o = static_cast<size_t>(ot) * 16 + r;
+    float s0 = 1.f, s8 = 1.f;
+    if constexpr (C::ROW_SCALED) { s0 = rscale[o]; s8 = rscale[o + 8]; }
     #pragma unroll
     for (int t = 0; t < NT; ++t)
     {
+        if constexpr (C::ROW_SCALED)
+        {
+            acc[t][0] *= s0; acc[t][1] *= s0;
+            acc[t][2] *= s8; acc[t][3] *= s8;
+        }
         const int m0 = 8 * t + 2 * c;
         if (m0 < M)
         {
@@ -359,26 +378,33 @@ __device__ __forceinline__ void gv_gemv_body(const uint8_t* stream, const u32* x
         }
     }
 }
+template <class C, int NT>
+__device__ __forceinline__ void gv_gemv_body(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                                             int M, void* y, int ystride, int odt, int cta = blockIdx.x, const float* rscale = nullptr)
+{
+    __shared__ float4 red[32][32];   // [warp][lane]
+    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, red, cta, rscale);
+}
 template <class C, int NT = 1>
 __global__ void gv_gemv(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
-                        int M, void* y, int ystride, int odt)
+                        int M, void* y, int ystride, int odt, const float* rscale = nullptr)
 {
-    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
+    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, blockIdx.x, rscale);
 }
 // NT > 1: capped at 64 registers so a 1024-thread CTA (tpc x ks warps) launches; NT = 1 keeps the uncapped kernel above
 template <class C, int NT>
 __global__ void __launch_bounds__(1024) gv_gemv_lb(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
-                                                    int ks, int M, void* y, int ystride, int odt)
+                                                    int ks, int M, void* y, int ystride, int odt, const float* rscale = nullptr)
 {
-    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
+    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, blockIdx.x, rscale);
 }
 // The same at <= 512 threads (up to 128 registers), for ks <= 16: at the 64-register cap the INT4 GEMVs fell from ~190
 // to ~120 GB/s at 24 rows. bind.cuh launch picks it; gv_fit_tpc gives fewer tiles per CTA, same bits.
 template <class C, int NT>
 __global__ void __launch_bounds__(512) gv_gemv_lb512(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
-                                                      int ks, int M, void* y, int ystride, int odt)
+                                                      int ks, int M, void* y, int ystride, int odt, const float* rscale = nullptr)
 {
-    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt);
+    gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, blockIdx.x, rscale);
 }
 
 // Several GEMVs of up to 8 rows (NT = 1) in one launch of 1024-thread CTAs: CTAs cta0[i] .. cta0[i + 1] - 1 run part i,
@@ -394,19 +420,20 @@ struct GvPart
 };
 struct GvMulti
 {
-    static constexpr int MAXP = 4;
+    static constexpr int MAXP = 5;
     int n = 0, M = 0, ctas = 0;
     GvPart p[MAXP];
 };
 __global__ void __launch_bounds__(1024) gv_multi(GvMulti a)
 {
+    __shared__ float4 red[32][32];
     int i = 0;
     while (i + 1 < a.n && blockIdx.x >= a.p[i + 1].cta0) ++i;
     const GvPart& p = a.p[i];
     const int cta = blockIdx.x - p.cta0;
-    if (p.codec == 0) gv_gemv_body<Int4v, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, cta);
-    else if (p.codec == 1) gv_gemv_body<Mxfp8, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, cta);
-    else gv_gemv_body<Bf16w, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, cta);
+    if (p.codec == 0) gv_gemv_body<Int4v, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
+    else if (p.codec == 1) gv_gemv_body<Mxfp8, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
+    else gv_gemv_body<Bf16w, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
 }
 
 #ifdef DEC_SLOT
@@ -486,7 +513,7 @@ inline float h_h2f(uint16_t h)
 template <class C>
 static int run_gv(const Args& a, const char* codec)
 {
-    const int K = a.i("K", 6144), O = a.i("O", 576), M = a.i("M", 1);
+    const int K = a.i("K", HID), O = a.i("O", geom::KVA), M = a.i("M", 1);
     const int ks = a.i("ks", 1), tpc = a.i("tpc", 4), warps = tpc * ks;
     const int steps = a.i("steps", 64), reps = a.i("reps", 9);
     const std::string dump = a.s("dump", ""), os = a.s("odt", "f16");

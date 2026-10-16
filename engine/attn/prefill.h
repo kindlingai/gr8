@@ -101,3 +101,19 @@ extern "C" int g6_attn_bind_index_append(G6AttnBinding*,const G6AttnStep* full_s
 // normal full-row prefill_run with reuse_indices (appends latent KV exactly once).
 extern "C" int g6_attn_bind_prefill_index_rows(G6AttnPrefill*,G6AttnBinding*,
     const G6AttnStep* owner_step,int* out_ids,float* out_scores,void* stream);
+
+#if G6_MODEL_FLASH
+// Optional TP2 Flash selection owner. Both callbacks enqueue work on the supplied
+// stream; no allocations/synchronization. publish packs the owned half after
+// selection; receive fills the peer half before ANY MLA selected-ID consumer.
+// Buffers and callback state must survive stream completion. Caller supplies
+// lane-private transport and unchanged per-rank projections/cache inputs.
+struct G6FlashPoolOwner {
+    int rank;
+    void* opaque;
+    int (*publish)(void*, const int* indices, const int* positions, int rows, void* stream);
+    int (*receive)(void*, int* indices, const int* positions, int rows, void* stream);
+};
+extern "C" int g6_attn_bind_prefill_run_owned(G6AttnPrefill*, G6AttnBinding*,
+    const G6AttnStep*, void* stream, const G6FlashPoolOwner*);
+#endif
