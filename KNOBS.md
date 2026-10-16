@@ -61,6 +61,9 @@ manifest instead.
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
 | `DFL_REUSE` | unset (0) | – | – | 1 = a request whose prefix-reuse hit skipped into the DFlash2 drafter's window keeps the drafter (KNOWN-ISSUES #1); 2 = also a request alone on MTP takes it (`G6_DFL_REUSE`). Needs `DFLASH=1` |
 | `DFL_REUSE_MIN` | unset (256) | – | – | `DFL_REUSE`: context rows the drafter must hold before it drafts; fewer = MTP warm-up rounds (`G6_DFL_REUSE_MIN`) |
+| `MTP_KSTOP` | unset (0) | – | – | a request's solo MTP rounds chain and verify the drafts the MTP head is confident in: 1 = thresholds (`MTP_KSTOP_TAU`), 2 = the drafter choice's MTP estimates (`G6_MTP_KSTOP`). Needs `DFLASH=1`, `MTP` 2+ |
+| `MTP_KSTOP_KMAX` | unset (`MTP`) | – | – | `MTP_KSTOP`: the most drafts a solo MTP round chains, 1..3 (`G6_MTP_KSTOP_KMAX`) |
+| `MTP_KSTOP_TAU` | unset (`0,0.2,0.5`) | – | – | `MTP_KSTOP=1`: thresholds t1,t2,t3 on the drafts' cumulative probability (`G6_MTP_KSTOP_TAU`) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
