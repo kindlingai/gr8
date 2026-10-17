@@ -182,7 +182,8 @@ class Fake:
             self.gen[slot] += 1
             self.pages_used += q['pages']
             f = open(os.path.join(self.d0, f'resp.{q["id"]}'), 'w', buffering=1)
-            f.write(f'a {self.a.epoch} {slot} {self.gen[slot]} {self.pages_used - q["pages"]} {q["pages"]}\n')
+            reuse = '' if self.a.report_reuse is None else f' {min(self.a.report_reuse, len(q["prompt"]) - 1)}'
+            f.write(f'a {self.a.epoch} {slot} {self.gen[slot]} {self.pages_used - q["pages"]} {q["pages"]}{reuse}\n')
             self.res[slot] = dict(q, slot=slot, f=f, emitted=0, rounds=0, acc=[0] * (self.a.mtp + 1), stop_id=-1,
                                   ready_at=time.monotonic() + self.a.prefill_ms / 1e3, done=False,
                                   armed=q['req']['ins'] is not None)
@@ -292,5 +293,6 @@ if __name__ == '__main__':
     ap.add_argument('--prefill-ms', type=float, default=30.0)
     ap.add_argument('--ready-delay', type=float, default=0.0)
     ap.add_argument('--ready-version', type=int, default=3, help='2: an engine without the insert rule')
+    ap.add_argument('--report-reuse', type=int, default=None, help='end every "a" line with this many reused prompt rows (an engine that reports its prefix reuse)')
     ap.add_argument('--stop-at', type=int, default=0, help='first stop id is token #N of a request that has stop ids (0 = never)')
     sys.exit(Fake(ap.parse_args()).run())
