@@ -43,6 +43,14 @@ EOF
 #!/bin/bash
 echo "systemctl $*" >> "$MOCK/calls"
 EOF
+  # DETACH stub: logs the unit and runs its command in the foreground (the mock ups return at once)
+  cat > "$M/bin/detach" <<'EOF'
+#!/bin/bash
+while [ $# -gt 0 ]; do case $1 in --unit=*) u=${1#--unit=}; shift; break ;; *) shift ;; esac; done
+echo "detach $MOCK_HOST $u" >> "$MOCK/calls"
+[ "$1" = /bin/bash ] && [ "$2" = -c ] || { echo "detach: want /bin/bash -c CMD, got $*" >&2; exit 2; }
+exec bash -c "$3"
+EOF
   spec < "$REPO/tools/launch/launch.py" > "$T/tp8.spec"
   if [ "${SERVE_REV:-}" ]; then git -C "$REPO" show "$SERVE_REV:tools/launch/launch.py" | spec > "$T/a.spec"
   else cp "$T/tp8.spec" "$T/a.spec"; fi
@@ -76,6 +84,7 @@ SSH_USER=u
 RECOVERY_HOST=rec
 RECOVERY_ROOT=$T
 SYSTEMD_RUN=true
+DETACH=$M/bin/detach
 ALERT_CMD='echo "\$1" > $M/alerted'
 TP8_BOXES=(b0 b1 b2 b3 b4 b5 b6 b7)
 TP8_HOME=$T/tp8
@@ -251,6 +260,25 @@ printf 'routes sha %s\n%s  /x/run/routes.txt\n' "$X" "$Y" > "$L/routes-receipts/
 rr "$L/routes-receipts" "$X" b0 b1 b2 b3 b4 b5 b6 b7 && bad "a host with another sha fails" || ok "a host with another sha fails"
 printf 'routes sha %s\n%s  /x/run/routes.txt\n%s  /x/extra\n' "$X" "$X" "$X" > "$L/routes-receipts/b3"
 rr "$L/routes-receipts" "$X" b0 b1 b2 b3 b4 b5 b6 b7 && bad "a host with 3 shas fails" || ok "a host with 3 shas fails"
+
+# 15. v4: every up is detached in its own unit, nothing is backgrounded with &; a failed UP_GUARD starts nothing
+setup; cp "$M/canary.good" "$M/canary.src"
+restore
+[ "$(grep -c '^detach b. tp8-A-up-run-test-a1$' "$M/calls")" = 4 ] && ok "serve up x4 detached, unit per run+attempt" \
+  || bad "serve up x4 detached, unit per run+attempt"
+bash "$T/rd/tp8-window.sh" cmds "$T/rd/window.conf" > "$T/cmds" 2>&1
+grep -P '^(tp8|A)-up\t' "$T/cmds" | grep -q '&$' && bad "an up still ends in &" || ok "no up ends in &"
+grep -qP '^tp8-up\t.*--unit=tp8-up-RUNID /bin/bash -c ' "$T/cmds" && ok "tp8 up detached" || bad "tp8 up detached"
+guard() { echo "B_UP_GUARD='echo \"bguard \$MOCK_HOST\" >> $M/calls; [ ! -e $M/running ] || { echo refused; exit 1; }'" >> "$T/rd/window.conf"
+  (cd "$T/rd" && sha256sum tp8-window.sh window.conf > SHA256SUMS); }
+setup; hooked; guard; touch "$M/smoke.ok" "$M/running"
+restore
+grep -q '^bguard b6' "$M/calls" && ! grep -q '^bup' "$M/calls" && ! grep -q '^detach' "$M/calls" \
+  && ok "guard refuses: no up, no unit" || bad "guard refuses: no up, no unit"
+setup; hooked; guard; touch "$M/smoke.ok"
+restore
+[ -e "$T/rd/RESTORED_OK" ] && grep -q '^bguard b6' "$M/calls" && grep -q '^detach b6 tp8-B-up-run-test-a1$' "$M/calls" \
+  && grep -q '^bup b6' "$M/calls" && ok "guard passes: detached up, RESTORED_OK" || bad "guard passes: detached up, RESTORED_OK"
 
 echo "passed $pass, failed $failn"
 [ $failn = 0 ]
