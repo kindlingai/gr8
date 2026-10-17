@@ -26,6 +26,11 @@
 # <S>_UP_GUARD (each up box, before the up; exit 1 = do not start it, e.g. its up script already runs).
 # Optional report-only speed rows: BASE_SPEED_CMD on BASE_SPEED_HOST at the end of P0 (live serve), SPEED_CMD on the
 # TP8 head after a P6 PASS when at most SPEED_MAX_ELAPSED s have passed (bounded by SPEED_S, added to T_MAX).
+# A test cluster that is not the TP8 hybrid (e.g. a TP4 build of another revision): TP8_NBOX (box count, default 8),
+# TEST_STOP_CMD and TEST_VERIFY_CMD (each test box: stop and verify down / read-only verify down, exit 0 = down; default
+# the tp8-ring launch.py), ROUTES_CHECK=0 (no routes.py dry run and no routes receipts: not a hybrid fabric), and
+# STEPS_CMD on STEPS_HOST (phase P2b after P2, bounded by B_STEPS, added to T_MAX; exit 0 = pass, else the run fails
+# and restores; with STEPS_CMD the identical-bin/ check runs after P2b instead of in P0, since the steps may build it).
 set -u
 ME=$(readlink -f "$0")
 UNIT_STOP_S=120 STOP_S=300   # remote caps (s) of a launch-unit stop (90 s stop + reads) and of a serve's stop hook
@@ -59,7 +64,8 @@ load() {
            B_P6 B_RESTORE B_MARGIN; do
     [ -n "${!k:-}" ] || die "$1: $k is not set"
   done
-  [ "${#TP8_BOXES[@]}" -eq 8 ] || die "$1: TP8_BOXES needs 8 boxes"
+  [ "${#TP8_BOXES[@]}" -eq "${TP8_NBOX:-8}" ] || die "$1: TP8_BOXES needs ${TP8_NBOX:-8} boxes"
+  if [ -n "${STEPS_CMD:-}" ]; then [ -n "${STEPS_HOST:-}" ] && [ -n "${B_STEPS:-}" ] || die "$1: STEPS_CMD needs STEPS_HOST and B_STEPS"; fi
   [ "${#SERVES[@]}" -ge 1 ] || die "$1: SERVES is empty"
   for s in "${SERVES[@]}"; do
     for k in HEAD HOME ENV ENV_SHA URL UP CANARY_HOST CANARY_CMD CANARY_MD5; do
@@ -71,7 +77,7 @@ load() {
   local p1=0
   for s in "${SERVES[@]}"; do p1=$((p1 + $(svd "$s" DOWN_S 300) + 20 + UNIT_STOP_S + 20 + STOP_S + 20)); done
   [ "$B_P1" -ge "$p1" ] || die "$1: B_P1=$B_P1 < $p1 s, the sum of P1's caps (head down + unit stop + stop, + 20 s ssh each)"
-  T_MAX=$((B_P0 + B_ARM + B_P1 + B_P2 + B_P3 + B_P4 + B_P5 + B_P6 + ${SPEED_CMD:+${SPEED_S:-600} +} B_RESTORE + B_MARGIN))
+  T_MAX=$((B_P0 + B_ARM + B_P1 + B_P2 + ${STEPS_CMD:+${B_STEPS:-0} +} B_P3 + B_P4 + B_P5 + B_P6 + ${SPEED_CMD:+${SPEED_S:-600} +} B_RESTORE + B_MARGIN))
 }
 
 # each BOX in parallel: CMD; prints "BOX rc" lines into $2-file and returns the number of failures
@@ -133,10 +139,10 @@ else echo \"launch units \$u NOT STOPPED: active [\$l] processes \$n\"; exit 1; 
 }
 # with_unit_stop PATTERN CMD: the unit stop, then (only if it verified) CMD
 with_unit_stop() { printf '( %s ) || exit 1; %s' "$(unit_stop_cmd "$1")" "$2"; }
-tp8_stop_cmd() { with_unit_stop "tp8-up-${RUN_ID:-RUNID}" "$(local_stop_cmd "$TP8_HOME" "$TP8_ENV")"; }
+tp8_stop_cmd() { with_unit_stop "tp8-up-${RUN_ID:-RUNID}" "${TEST_STOP_CMD:-$(local_stop_cmd "$TP8_HOME" "$TP8_ENV")}"; }
 # P0, read only: the restore's verify half while the serves still run. A stale out/handshake.json (an older boot's
 # ports, e.g. a serve's API port) makes verify-down see the live serve and fail, so the restore could never pass.
-tp8_verify_cmd() { echo "cd $(printf %q "$TP8_HOME") && python3 tools/launch/launch.py verify-down @$TP8_ENV"; }
+tp8_verify_cmd() { if [ -n "${TEST_VERIFY_CMD:-}" ]; then printf '%s' "$TEST_VERIFY_CMD"; else echo "cd $(printf %q "$TP8_HOME") && python3 tools/launch/launch.py verify-down @$TP8_ENV"; fi; }
 # detach UNIT CMD: CMD in its own transient unit; returns once the unit is started (its exit status = systemd-run's)
 # (HOME and PATH are copied from the ssh session: a unit gets no HOME and a minimal PATH otherwise)
 detach() { echo "${DETACH:-$SYSTEMD_RUN --quiet --collect -p RemainAfterExit=yes -p TimeoutStopSec=30 --setenv=HOME --setenv=PATH} --unit=$1 /bin/bash -c $(printf %q "$2")"; }
@@ -261,6 +267,12 @@ finish() {
   exit 3
 }
 
+bin_same() {   # every test box's bin/ hashes the same (and is there)
+  local h sums=()
+  for h in "${TP8_BOXES[@]}"; do sums+=("$(rsh "$h" 60 "cd $TP8_HOME && md5sum bin/* | md5sum" | cut -d' ' -f1)"); done
+  [ "$(printf '%s\n' "${sums[@]}" | sort -u | wc -l)" = 1 ] && [ -n "${sums[0]}" ] || { say "TP8 bin/ differs or is missing: ${sums[*]}"; return 1; }
+}
+
 p0() {
   say "P0 preflight (read only)"
   local all=("${TP8_BOXES[@]}") s h p ports=() deny cp scp
@@ -278,9 +290,7 @@ p0() {
       [ "$(rsh "$h" 30 "sha256sum $(sv "$s" ENV)" | cut -d' ' -f1)" = "$(sv "$s" ENV_SHA)" ] || die "$s env on $h changed"
     done
   done
-  local sums=()
-  for h in "${TP8_BOXES[@]}"; do sums+=("$(rsh "$h" 60 "cd $TP8_HOME && md5sum bin/* | md5sum" | cut -d' ' -f1)"); done
-  [ "$(printf '%s\n' "${sums[@]}" | sort -u | wc -l)" = 1 ] && [ -n "${sums[0]}" ] || die "TP8 bin/ differs or is missing: ${sums[*]}"
+  [ -n "${STEPS_CMD:-}" ] || bin_same || die "TP8 bin/ differs or is missing"
   on_all 60 memclean-md5 "[ \$(md5sum < $MEMCLEAN_PATH | cut -d' ' -f1) = $MEMCLEAN_MD5 ]" "${TP8_BOXES[@]}" || die "memclean md5"
   on_all 60 tp8-verify-down "$(tp8_verify_cmd)" "${TP8_BOXES[@]}" || die "TP8 verify-down (read only) does not pass beside the live serves"
   on_all 30 dirty "[ \$(awk '/^Dirty:/{print \$2}' /proc/meminfo) -lt ${DIRTY_MAX_KB:-1048576} ]" "${TP8_BOXES[@]}" || die "dirty pages"
@@ -292,14 +302,18 @@ p0() {
     scp=$(envkey "$(sv "$s" HEAD)" "$(sv "$s" ENV)" CONTROL_PORT); scp=${scp:-7340}
     [ "$cp" != "$scp" ] || die "TP8 CONTROL_PORT $cp is $s's control port"
   done
-  for h in "${TP8_BOXES[@]}"; do
-    p=$(envkey "$h" "$TP8_ENV" FAB_PORTS); [ -n "$p" ] || die "$h: no FAB_PORTS"; ports+=("$p")
-  done
-  deny=$(envkey "${TP8_BOXES[0]}" "$TP8_ENV" FAB_DENY)
-  ROUTES_SHA=$(rsh "${TP8_BOXES[0]}" 60 "python3 $TP8_HOME/tools/launch/routes.py ${ports[*]} ${deny:+--deny $deny}" \
-               | tee -a "$LOG" | sed -n 's/^routes sha \([0-9a-f]\{64\}\)$/\1/p')
-  [ -n "$ROUTES_SHA" ] || die "routes.py dry run refused the declared ports"
-  echo "$ROUTES_SHA" > "$LOCAL/routes-expected.sha"
+  if [ "${ROUTES_CHECK:-1}" = 1 ]; then
+    for h in "${TP8_BOXES[@]}"; do
+      p=$(envkey "$h" "$TP8_ENV" FAB_PORTS); [ -n "$p" ] || die "$h: no FAB_PORTS"; ports+=("$p")
+    done
+    deny=$(envkey "${TP8_BOXES[0]}" "$TP8_ENV" FAB_DENY)
+    ROUTES_SHA=$(rsh "${TP8_BOXES[0]}" 60 "python3 $TP8_HOME/tools/launch/routes.py ${ports[*]} ${deny:+--deny $deny}" \
+                 | tee -a "$LOG" | sed -n 's/^routes sha \([0-9a-f]\{64\}\)$/\1/p')
+    [ -n "$ROUTES_SHA" ] || die "routes.py dry run refused the declared ports"
+    echo "$ROUTES_SHA" > "$LOCAL/routes-expected.sha"
+  else
+    ROUTES_SHA=off
+  fi
   if [ -n "${BASE_SPEED_CMD:-}" ]; then   # report only: the same speed row on a live serve, for compare
     say "P0 base speed row on $BASE_SPEED_HOST (report only)"
     rsh "$BASE_SPEED_HOST" "${BASE_SPEED_S:-600}" "$BASE_SPEED_CMD" > "$LOCAL/speed-base.txt" 2>&1 || say "P0: base speed row failed (not a gate)"
@@ -350,6 +364,13 @@ cmd_run() {
   say "P2 verify weights"
   on_all "$B_P2" weights "$VERIFY_WEIGHTS_CMD" "${TP8_BOXES[@]}" || finish "P2: weights"
 
+  if [ -n "${STEPS_CMD:-}" ]; then
+    say "P2b steps on $STEPS_HOST (<= ${B_STEPS}s)"
+    fenced && finish "fenced before P2b"
+    rsh "$STEPS_HOST" "$B_STEPS" "$STEPS_CMD" >> "$LOG" 2>&1 || finish "P2b: steps"
+    bin_same || finish "P2b: test bin/ differs or is missing"
+  fi
+
   say "P3 memclean and prep"
   on_all "$B_P3" prep "$MEMCLEAN && $PREP_CMD" "${TP8_BOXES[@]}" || finish "P3: memclean/prep"
 
@@ -380,13 +401,15 @@ cmd_run() {
   done
   cmp -s "$LOCAL/chat1.txt" "$LOCAL/chat2.txt" || { say "P6: the two temperature-0 chats differ"; ok=0; }
   healthy "${TP8_BOXES[0]}" "$TP8_URL" || ok=0
-  mkdir -p "$LOCAL/routes-receipts"
-  for h in "${TP8_BOXES[@]}"; do
-    rsh "$h" 30 "grep -o 'routes sha [0-9a-f]*' $TP8_HOME/out/supervisor.log | tail -1; sha256sum $TP8_HOME/run/routes.txt" \
-      > "$LOCAL/routes-receipts/$h" 2>> "$LOG"
-  done
-  routes_receipts_ok "$LOCAL/routes-receipts" "$ROUTES_SHA" "${TP8_BOXES[@]}" >> "$LOG" 2>&1 \
-    || { say "P6: not every box's routes receipt (supervisor log + run/routes.txt) is $ROUTES_SHA"; ok=0; }
+  if [ "${ROUTES_CHECK:-1}" = 1 ]; then
+    mkdir -p "$LOCAL/routes-receipts"
+    for h in "${TP8_BOXES[@]}"; do
+      rsh "$h" 30 "grep -o 'routes sha [0-9a-f]*' $TP8_HOME/out/supervisor.log | tail -1; sha256sum $TP8_HOME/run/routes.txt" \
+        > "$LOCAL/routes-receipts/$h" 2>> "$LOG"
+    done
+    routes_receipts_ok "$LOCAL/routes-receipts" "$ROUTES_SHA" "${TP8_BOXES[@]}" >> "$LOG" 2>&1 \
+      || { say "P6: not every box's routes receipt (supervisor log + run/routes.txt) is $ROUTES_SHA"; ok=0; }
+  fi
   for h in "${TP8_BOXES[@]}"; do   # best effort, bounded
     mkdir -p "$LOCAL/logs/$h"
     timeout 120 scp -q -o ConnectTimeout=10 -o BatchMode=yes "$SSH_USER@$h:$TP8_HOME/out/*.log" "$SSH_USER@$h:$TP8_HOME/out/*.err" \
@@ -425,6 +448,7 @@ cmd_cmds() {   # CONF: every remote command, NAME TAB HOSTS TAB CMD; runs nothin
   row tp8-prep "${TP8_BOXES[*]}" "$MEMCLEAN && $PREP_CMD"
   row tp8-weights "${TP8_BOXES[*]}" "$VERIFY_WEIGHTS_CMD"
   row tp8-up "${TP8_BOXES[*]}" "$(tp8_up_cmd)"
+  [ -n "${STEPS_CMD:-}" ] && row tp8-steps "$STEPS_HOST" "$STEPS_CMD"
   for s in "${SERVES[@]}"; do
     row "$s-down" "$(sv "$s" HEAD)" "$(serve_down_cmd "$s")"
     row "$s-unitstop" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(serve_unit_stop_cmd "$s")"
