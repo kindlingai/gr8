@@ -429,6 +429,8 @@ int main(int argc, char** argv)
     const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
     int cp_mmax = K + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block
+    if (s2mode) cp_mmax = std::max(cp_mmax, std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk)));
     if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
     if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
     g6::CpColls cp_colls;
