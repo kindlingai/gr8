@@ -113,6 +113,7 @@ public:
     // DFlash2 sessions verify up to kv drafts with the --spec-adaptive policy sl (s2_batch.h Batch::dflash)
     void dflash(int kv, const g6rt::SpecLen& sl) { batch_.dflash(kv, sl); }
     void dsel(const s2::DSel& d) { batch_.dsel(d); }
+    void dfl_reuse(const s2::DflReuse& r) { batch_.dfl_reuse(r); }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
     void pool_digest(uint64_t d) { scheduler_.pool_digest(d); }
@@ -174,6 +175,7 @@ public:
                     order.push_back(int(q.keys[i].slot));
                 }
                 if (live() > 1) batch_.demote();   // another session is resident (perhaps still prefilling): the shared path
+                else if (q.count == 1 && !payload_[q.keys[0].slot].decode_prompt) batch_.promote(int(q.keys[0].slot));   // G6_DFL_REUSE=2
                 require(batch_.round(order), "empty scheduled decode round");
                 std::vector<Completion> results;
                 for (unsigned i = 0; i < q.count; ++i) results.push_back(completion(q.keys[i]));

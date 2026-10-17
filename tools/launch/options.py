@@ -88,6 +88,8 @@ KEYS = {
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),
     'QP_EARLY': ('cluster', None, 'PF_OWN=4 early counterpart partial'),
+    'DFL_REUSE': ('cluster', None, 'DFlash2 after a prefix-reuse hit: 1, or 2 = also a request alone on MTP (G6_DFL_REUSE)'),
+    'DFL_REUSE_MIN': ('cluster', None, 'DFL_REUSE warm-up: context rows before the drafter drafts (G6_DFL_REUSE_MIN)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

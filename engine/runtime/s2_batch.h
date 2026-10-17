@@ -101,10 +101,15 @@ struct Stats
     long mtp_rounds = 0, switches = 0;    // drafter choice: a DFlash2 session's rounds on MTP, drafter switches
     long inserted = 0;                // tokens the insert rule put in
     std::vector<long> acc;            // [K+1] rounds by accepted drafts (K = 7 for a DFlash2 session)
+    long dfl_rounds = 0;              // rounds that verified DFlash2 drafts
+    // G6_DFL_REUSE (Batch::dfl_reuse, -1 = not set): where dfl_start filled the drafter from, the lowest position it held
+    // context for, the position the MTP warm-up ran to (0 = none), the position the session took the drafter at (promote)
+    int dfl_from = -1, dfl_lo = -1, dfl_warm = 0, promoted = -1;
 };
 // one DFlash2 drafter step of session sess (dflash.cuh DflIn): context = its target rows at positions pos0 .. pos0 + rows - 1,
 // lo = the lowest position the drafter holds; query: also draft the block after them, bonus token tok0
 constexpr int DFL_B = 8;              // = dfl::B: the bonus row and 7 drafts
+constexpr int DFL_WIN = 2048, DFL_RING = 4096;   // = dfl::WIN, dfl::RING: the drafter's window and its KV ring (positions)
 struct DflReq { int sess, rows, pos0, tok0, lo; bool query; };
 struct DflDrafts { int tok[DFL_B]; float lp[DFL_B]; };
 
@@ -165,6 +170,14 @@ struct DSel
     int probe = 4;                    // every probe-th MTP round the drafter step also drafts (scored next round)
     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
 };
+// G6_DFL_REUSE (every rank, read at boot; g6m4): mode 1 = a DFlash2 session whose prefill a prefix-reuse hit cut short
+// keeps the drafter (Batch::reuse_start); 2 = also a session that runs alone on MTP takes it (Batch::promote). min: the
+// context rows the drafter must hold before it drafts (G6_DFL_REUSE_MIN, 0..DFL_WIN); fewer = MTP rounds until then
+struct DflReuse
+{
+    int mode = 0;
+    int min = 256;
+};
 class Batch
 {
 public:
@@ -178,7 +191,9 @@ public:
         {
             const int q = qs[k];
             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
-            if (prompt(q, ss[k]) && !st_[q].dfl && st_[q].force < 0) live.push_back(q);
+            if (!prompt(q, ss[k]) || st_[q].force >= 0) continue;
+            if (!st_[q].dfl) live.push_back(q);
+            else if (st_[q].mtp) chain({q}, {int(Step::TAIL)}, K_);   // G6_DFL_REUSE warm-up: d[2..K] for its first round
         }
         std::vector<int> all;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
@@ -202,6 +217,26 @@ public:
     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
     void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
     void dsel(const DSel& d) { sel_ = d; }
+    void dfl_reuse(const DflReuse& r) { reuse_ = r; }
+    // G6_DFL_REUSE=2: session q, the only active one and drafting with MTP (it was not alone at its prompt tail, or was
+    // demoted), takes the drafter before the next round: MTP rounds feed it the accepted rows as context from the
+    // session's last token on, and once it holds reuse_.min rows the session drafts with DFlash2, as a new request starts.
+    // The driver calls it while q is the only live session. Inserted tokens waiting for their steps: not this round
+    void promote(int q)
+    {
+        St& x = st_[q];
+        if (reuse_.mode < 2 || !h_.dfl || !active(q) || x.dfl || x.force >= 0) return;
+        for (int o = 0; o < S2N_SLOTS; ++o) if (o != q && active(o)) return;
+        x.dfl = x.mtp = true;            // d[1..K] are drafted (the last round's chain): this round is an MTP one
+        x.lo = (int)x.tokens.size() - 1;
+        x.warm = x.lo + std::max(1, reuse_.min);
+        x.pb = -1; x.since = 0; x.mn = 0;
+        if (sel_.on) { sel_.d = fresh(sel_.d); sel_.m = fresh(sel_.m); }
+        Stats& s = stats_[q];
+        if ((int)s.acc.size() < DFL_B) s.acc.resize(DFL_B, 0);
+        s.promoted = s.dfl_lo = x.lo; s.dfl_warm = x.warm;
+        ring_ = Ring{q, {}, x.lo, x.lo, x.lo - 1};
+    }
     // a second session is resident: every DFlash2 session goes to MTP (the K-1 chain steps), before the next round
     void demote()
     {
@@ -337,6 +372,7 @@ private:
         ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
         ++x.rounds;
         if (m) ++stats_[q].mtp_rounds;
+        else ++stats_[q].dfl_rounds;
         if (h_.emit && h_.emit(q, &x.tokens[base + 1], c, 0)) { x.done = true; return; }
         Step d;
         d.kind = Step::DRAFT; d.event = v.event;
@@ -352,11 +388,12 @@ private:
             x.pb = -1;
             return;
         }
-        const bool nm = sel_.on && next_mtp(x);
+        bool nm = sel_.on && next_mtp(x);
+        if (x.warm) { nm = base + a + 1 < x.warm; if (!nm) x.warm = 0; }   // G6_DFL_REUSE warm-up: DFlash2 once it is over
         if (nm != m) { x.since = 0; ++stats_[q].switches; }
         ++x.since;
         x.mtp = nm;
-        const bool probe = nm && x.pb < 0 && ++x.mn % sel_.probe == 0;
+        const bool probe = nm && !x.warm && x.pb < 0 && ++x.mn % sel_.probe == 0;
         drafts(q, DflReq{q, a + 1, base, t[a], x.lo, !nm || probe});
         if (probe) { x.pb = base + a + 1; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
         if (!nm) x.pb = -1;
@@ -365,6 +402,7 @@ private:
     void drafts(int q, const DflReq& r)
     {
         const DflDrafts o = h_.dfl(r);
+        if (reuse_.mode) ring_rows(q, r);
         if (!r.query) return;
         for (int i = 1; i < DFL_B; ++i) { st_[q].dd[i] = o.tok[i]; st_[q].dl[i] = o.lp[i]; }
     }
@@ -384,11 +422,49 @@ private:
         float pl[DFL_B] = {};
         int since = 0, mn = 0;            // drafter choice: rounds on the current drafter; MTP rounds (probe count)
         int lo = 0;                       // DFlash2: the lowest position the drafter holds context for
+        int warm = 0;                     // G6_DFL_REUSE: MTP rounds until the drafter's context reaches this position (0: none)
         bool armed = false;               // the insert rule (s.ins) may still fire
         int force = -1;                   // inserted tokens from this position on wait for their steps (forced); -1: none
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
     };
+    // G6_DFL_REUSE: what the drafter's KV ring holds. Its context rows at position p depend on the tokens 0..p alone, so
+    // rows [lo, end) of the session that wrote it last (slot q, or after that slot took another session, its tokens in
+    // tok) serve any prompt with those tokens. top: the highest position written, block rows included; a position below
+    // top - DFL_RING + 1 has been written over
+    struct Ring
+    {
+        int q = -1;
+        std::vector<int> tok;
+        int lo = 0, end = 0, top = -1;
+    };
+    void ring_rows(int q, const DflReq& r)
+    {
+        if (ring_.q != q) ring_ = Ring{q, {}, r.pos0, r.pos0, r.pos0 - 1};
+        if (r.pos0 > ring_.end) ring_.lo = r.pos0;   // a gap: the rows below are not this context's
+        ring_.end = r.pos0 + r.rows;
+        ring_.top = std::max(ring_.top, ring_.end - 1 + (r.query ? DFL_B : 0));
+    }
+    // G6_DFL_REUSE, a DFlash2 session's start: dfl_start filled the drafter from x.lo, past the rows a prefix-reuse hit
+    // skipped (the prefill taps none of those). The window's rows below x.lo are still in the ring when the last session
+    // there had this prompt's tokens up to x.lo and wrote them after its ring last wrapped (turn N+1 of a conversation
+    // whose turn N drafted with DFlash2): the context then starts at the lowest of them. With fewer than reuse_.min rows
+    // the session drafts with MTP (the drafter taking the rows as context) until the drafter holds that many
+    void reuse_start(int q)
+    {
+        St& x = st_[q];
+        const int n = x.n, from = x.lo, wlo = std::max(0, n - 1 - DFL_WIN);
+        if (from > wlo)
+        {
+            const std::vector<int>& t = ring_.q >= 0 ? st_[ring_.q].tokens : ring_.tok;
+            const int a = std::max({wlo, ring_.lo, ring_.top - DFL_RING + 1});
+            if (a < from && ring_.end >= from && (int)t.size() >= from && std::equal(t.begin(), t.begin() + from, x.tokens.begin()))
+                x.lo = a;
+        }
+        ring_ = Ring{q, {}, x.lo, n - 1, n - 2};
+        if (reuse_.min && x.lo > 0 && n - x.lo < reuse_.min) { x.warm = x.lo + reuse_.min; x.mtp = true; }
+        stats_[q].dfl_from = from; stats_[q].dfl_lo = x.lo; stats_[q].dfl_warm = x.warm;
+    }
     // drafter choice: teach the estimates what this round's tokens t[0..a] say about each drafter. DFlash2 rounds score
     // MTP's first draft (x.d[1], drafted for position base + 1 = t[0]); MTP rounds score a probe's DFlash2 drafts on the
     // positions the round committed
@@ -456,6 +532,8 @@ private:
     int dkv_ = DFL_B - 1;
     g6rt::SpecLen dsl_;
     DSel sel_;
+    DflReuse reuse_;
+    Ring ring_;
     S2Cost cost_;
     std::vector<g6rt::SpecLen> sl_ = std::vector<g6rt::SpecLen>(S2N_SLOTS);
     long round_no_ = 0, cur_round_ = -1; // G6_S2_ROUNDLOG: id of the round in progress and its active-session count
@@ -510,6 +588,11 @@ private:
     bool prompt(int q, const Session& p)
     {
         St& x = st_[q];
+        if (ring_.q == q)                 // the slot's last session wrote the drafter's ring: keep its tokens
+        {
+            ring_.tok.assign(x.tokens.begin(), x.tokens.begin() + std::min((int)x.tokens.size(), ring_.end));
+            ring_.q = -1;
+        }
         x = St();
         x.s = p; x.on = true;
         x.tokens = p.prompt;
@@ -528,6 +611,7 @@ private:
         stats_[q].acc.assign(std::max(K_, x.dfl ? DFL_B - 1 : 0) + 1, 0);
         for (float& v : x.dl) v = NAN;
         x.lo = x.dfl ? h_.dfl_start(q) : 0;
+        if (x.dfl && reuse_.mode) reuse_start(q);
         const int n = x.n, PS = (n - p.first + p.chunk - 1) / p.chunk;
         for (int s = 0; s < PS; ++s)
         {
@@ -558,7 +642,7 @@ private:
             check(d);
             const std::vector<int> u = h_.run(d);
             x.d[1] = u[M - 1];
-            const bool query = s == PS - 1 && x.force < 0;
+            const bool query = s == PS - 1 && x.force < 0 && !x.warm;
             if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, query ? t[M - 1] : 0, x.lo, query});
         }
         return true;
