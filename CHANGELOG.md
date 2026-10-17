@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-17: the decode-perf flags default on in the serving config
+
+- `G6_DRAFT_PAR`, `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT`, and `G6_MTP_KSTOP` now default on where their
+  preconditions hold (DRAFT_PAR and KSTOP: `--serve` + DFlash2 + `--mtp` [2+ for KSTOP]; the split group: TP>1, and
+  MTP_SPLIT also `--mtp`). A bare or TP=1 boot is unchanged, and any knob still overrides to 0.
+- Measured on four GB10 at TP=4 (pbench, single stream) against all off: all four on gave +7.0% decode (all_decode
+  30.85 -> 33.0 tok/s), no prefill regression, acceptance 0.513 -> 0.565. Alone: DRAFT_PAR +3.7%, QA_SPLIT +4.7%,
+  KSTOP +2.3%. The split group and DRAFT_PAR are bit-exact by construction; KSTOP changes only draft count (the target
+  decides every token). `G6_DFL_REUSE` stays off (its gain is multi-turn only and did not show here).
 ## 2026-10-16: a decode step timeline for S2 (G6_S2_TIMELINE, a measurement)
 
 - `G6_S2_TIMELINE=N` (every rank, off by default) splits the time between decode steps into GPU work and host round
