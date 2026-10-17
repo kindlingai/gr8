@@ -19,7 +19,8 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
         CANCEL <epoch> <id> 0                                   (a real cancel: queued, prefilling or decoding)
       Requests wait in the engine's FIFO until a session slot and a KV run are free (several decode in one step).
   engine rank 0 -> DIR/resp.<id>       one line per event:
-        a <epoch> <slot> <generation> <base_page> <pages>   admitted (the request got a slot and its KV run)
+        a <epoch> <slot> <generation> <base_page> <pages> [<reused>]   admitted (the request got a slot and its KV run);
+                                                             <reused>: prompt rows its prefix reuse skips, if the engine says
         p <j> <lp> <rank> <n> <id>:<lp> ...                  with plp: prompt token j (1 <= j < prompt length), before the
                                                              first t line; the shim sends one prompt_logprobs frame then
         l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line, before it
@@ -59,6 +60,7 @@ READY_FIELDS = {'1': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows')
                 '2': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp'),
                 '3': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
 INSERT_MAX = 64   # tokens one insert rule may hold (engine/runtime/insert_rule.h)
+PAGE = 64         # KV rows per page (engine/runtime/s2/scheduler.h); status.s2 counts pages
 
 
 def payload_hash(data: bytes) -> int:
@@ -255,7 +257,11 @@ class Req:
         self.plp_sent = False    # the prompt_logprobs frame went out
         self.fh = None
         self.buf = b''
-        self.last = time.monotonic()
+        self.last = self.t_arrive = time.monotonic()
+        self.t_admit = None      # the "a" line: the request got a slot
+        self.t_first = None      # its first tokens line
+        self.t_tok = None        # its latest tokens line
+        self.reused = None       # prompt rows the engine took from its prefix reuse: the "a" line's last field, if it has one
 
 
 class Shim:
@@ -271,7 +277,10 @@ class Shim:
         self.next_cmd = scan_numbers(a.dir, 'cmd')
         self.wake = asyncio.Event()
         self.c = {'rounds': 0, 'draft_tokens': 0, 'accepted': 0, 'per_pos': [], 'prompt': 0, 'gen': 0,
-                  'fin': collections.Counter(), 'max_active': 0}
+                  'fin': collections.Counter(), 'max_active': 0,
+                  'cached': None, 'pc_queries': 0,    # None until the engine reports reuse (an "a" line with the field)
+                  'ttft_sum': 0.0, 'ttft_count': 0, 'itl_sum': 0.0, 'itl_count': 0,
+                  'prefill_sum': 0.0, 'decode_sum': 0.0, 'prefill_tokens': 0, 'gen_tokens': 0, 'done_count': 0}
 
     # ---- frames -------------------------------------------------------------------------------------------------
     def send(self, r: Req, frame: dict):
@@ -293,11 +302,26 @@ class Shim:
             r.fh.close()
             r.fh = None
         self.c['fin'][reason] += 1
+        self.account(r, reason)
         f = {'type': 'finish', 'id': r.rid, 'reason': reason, 'stop_id': stop_id,
-             'prompt_tokens': len(r.f.get('prompt') or []), 'cached_tokens': 0, 'completion_tokens': ct}
+             'prompt_tokens': len(r.f.get('prompt') or []), 'cached_tokens': r.reused or 0, 'completion_tokens': ct}
         if message:
             f['message'] = message
         self.send(r, f)
+
+    def account(self, r: Req, reason):
+        """Per-request timing, added once when the request ends (as vLLM's request_*_time histograms): prefill is the
+        admission to the first tokens line, decode the first tokens line to the end. A request that never produced a
+        token, or that failed, adds nothing."""
+        if r.t_first is None or reason == 'error':
+            return
+        c = self.c
+        c['prefill_sum'] += r.t_first - (r.t_admit if r.t_admit is not None else r.t_arrive)
+        c['decode_sum'] += time.monotonic() - r.t_first
+        # tokens the prefill computed: the whole prompt, less the rows the engine took from its prefix reuse (when it says)
+        c['prefill_tokens'] += max(len(r.f.get('prompt') or []) - (r.reused or 0), 0)
+        c['gen_tokens'] += r.emitted
+        c['done_count'] += 1
 
     def status(self):
         try:
@@ -312,10 +336,24 @@ class Shim:
         m = {'type': 'metrics', 'seq': seq,
              'spec': {'drafts': c['rounds'], 'draft_tokens': c['draft_tokens'], 'accepted': c['accepted'],
                       'accepted_per_pos': list(c['per_pos']) or [0] * (self.cfg['mtp'] if self.cfg else 0)},
-             'prefix_cache': {'queries': 0, 'hits': 0},
              'requests': {'running': running, 'waiting': len(self.live) - running, 'finished': dict(c['fin'])},
-             'tokens': {'prompt': c['prompt'], 'generation': c['gen']}}
+             'tokens': {'prompt': c['prompt'], 'generation': c['gen']},
+             'latency': {'ttft_sum': c['ttft_sum'], 'ttft_count': c['ttft_count'], 'itl_sum': c['itl_sum'],
+                         'itl_count': c['itl_count'],
+                         'prefill_sum': c['prefill_sum'], 'decode_sum': c['decode_sum'],
+                         'prefill_tokens_sum': c['prefill_tokens'], 'gen_tokens_sum': c['gen_tokens'],
+                         'gen_tokens_count': c['done_count']}}
+        if c['cached'] is not None:   # only an engine that reports its prefix reuse gives cached tokens
+            m['tokens']['cached'] = c['cached']
+            m['prefix_cache'] = {'queries': c['pc_queries'], 'hits': c['cached']}
         st = self.status()
+        if self.cfg:
+            kv = {'size_tokens': self.cfg['pool_rows'], 'max_concurrency': self.a.sessions}
+            if st and isinstance(st.get('held_pages'), int):   # pages actually held by live runs, not their reservations
+                kv['active_tokens'] = st['held_pages'] * PAGE
+            if st and isinstance(st.get('reserved_pages'), int):
+                kv['reserved_tokens'] = st['reserved_pages'] * PAGE
+            m['kv'] = kv
         if st:
             # the engine's own queue/pool/store status. The front ends read `scheduler` (g6:s2_* and g6:kv_store_*
             # metrics); `s2` is the same, for older readers
@@ -477,6 +515,12 @@ class Shim:
             return
         if w[0] == 'a':
             r.admitted = True
+            r.t_admit = time.monotonic()
+            if len(w) > 6:   # a <epoch> <slot> <generation> <base_page> <pages> [<reused rows>]
+                r.reused = int(w[6])
+                c = self.c
+                c['cached'] = (c['cached'] or 0) + r.reused
+                c['pc_queries'] += len(r.f['prompt'])
         elif w[0] == 'l':
             r.lps.append(lp_entry(w[1:]))
         elif w[0] == 'p':
@@ -494,6 +538,16 @@ class Shim:
                     return self.finish(r, 'error', ct=r.emitted, message='engine returned incomplete prompt logprobs')
                 self.send(r, {'type': 'prompt_logprobs', 'id': r.rid, 'lps': [None] + [r.plps[j] for j in range(1, n)]})
             if ids:
+                now = time.monotonic()
+                if r.t_first is None:
+                    r.t_first = now
+                    self.c['ttft_sum'] += now - r.t_arrive
+                    self.c['ttft_count'] += 1
+                    self.c['itl_count'] += len(ids) - 1   # the tokens after the first one; their gaps are the ITL
+                else:
+                    self.c['itl_sum'] += now - r.t_tok    # one tokens line can carry several (speculative) tokens
+                    self.c['itl_count'] += len(ids)
+                r.t_tok = now
                 fr = {'type': 'tokens', 'id': r.rid, 'ids': ids}
                 if r.f.get('logprobs') is not None:
                     if len(lps) != len(ids):
@@ -620,6 +674,9 @@ async def main(argv=None):
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=0,
                     help='cap on prompt + max_tokens (0 = what the KV pool allows: pool_rows - guard, from ready.s2)')
+    ap.add_argument('--sessions', type=int, default=8,
+                    help='requests the engine decodes at once (its --s2-sessions, SESS; 1..8): metrics report it as the '
+                         'concurrency of the KV cache')
     ap.add_argument('--max-logprobs', type=int, default=20, help='largest k of logprobs (also capped by the engine ready line)')
     ap.add_argument('--max-plp-prompt', type=int, default=1024,
                     help='longest prompt of a request with prompt_logprobs: it runs as decode steps (~13 ms per token at '
