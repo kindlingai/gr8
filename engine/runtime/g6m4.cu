@@ -911,6 +911,13 @@ int main(int argc, char** argv)
             if (v < 0 || v % 64 || v > MP) die("S2: G6_S2_DECODE_PF must be 0 or a multiple of 64 no larger than --prefill");
             sc.decode_prefill_rows = (uint32_t)v;
         }
+        // G6_S2_DECODE_ROUNDS=<K>: while a prefill waits and sessions decode, K decode rounds per prefill quantum
+        // (scheduler.h Config::decode_rounds); unset, 0 or 1 = off
+        if (const char* e = getenv("G6_S2_DECODE_ROUNDS")) {
+            const int v = atoi(e);
+            if (v < 0 || v > (int)g6s2::MAX_DECODE_ROUNDS) die("S2: G6_S2_DECODE_ROUNDS must be 0..64");
+            sc.decode_rounds = (uint32_t)v;
+        }
         sc.steering = steering_boot;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);

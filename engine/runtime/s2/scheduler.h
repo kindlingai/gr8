@@ -20,6 +20,7 @@ constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold.
 constexpr unsigned CONTROL_VERSION = 6;
+constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
 // alone can defer a long prefill under a stream of short ones, so a session passed over this many times is owed a turn:
@@ -51,6 +52,9 @@ struct Config {
     // round sooner (each round waits out one prefill quantum). 0 = off: the full prefill_rows x lanes quantum, as before.
     // A multiple of PAGE, at most prefill_rows (native.cuh prefill: lane A takes up to prefill_rows rows).
     uint32_t decode_prefill_rows = 0;   // last: tests build Config positionally
+    // While a prefill waits and sessions decode, this many decode rounds run per prefill quantum, so the decoders get
+    // K rounds per quantum's wait instead of one (Scheduler::alternate). 0 or 1 = off: one round per quantum, as before.
+    uint32_t decode_rounds = 0;         // after decode_prefill_rows, for the same reason
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
@@ -60,6 +64,7 @@ struct Config {
         require(guard() >= 2 * mtp && prefill_rows, "insufficient guard/prefill rows");
         require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
                 "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");
+        require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
         require(!steering.loaded || (g6rt::steering::valid_profile_name(steering.profile_name) && steering.active_layers &&
                 (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full)),
                 "invalid loaded steering receipt");
@@ -166,6 +171,7 @@ class Scheduler {
     uint64_t boundary_ = 0, event_ = 0, revision_ = 0, last_id_ = 0, pool_ = 0;
     bool have_id_ = false;
     bool want_decode_ = true, busy_ = false, failed_ = false;
+    uint32_t decode_run_ = 0;   // decode rounds completed since the last prefill quantum (alternate; read only when decode_rounds > 1)
     Quantum work_;
     Slot& slot(const Key& k) {
         require(k.slot < MAX_SESSIONS && s_[k.slot].key == k && s_[k.slot].phase != Phase::Free, "stale session key");
@@ -180,7 +186,7 @@ class Scheduler {
         else s.phase = Phase::Decode;
     }
     void completed() {
-        boundary_ = work_.boundary; busy_ = false; want_decode_ = work_.kind != Kind::Decode;
+        boundary_ = work_.boundary; busy_ = false; alternate(c_, work_.kind, want_decode_, decode_run_);
         // The prefill choice below reads these counters, so they advance here on replicated state alone: the session this
         // quantum served has had its turn, every other prefilling session was passed over once. A PromptTail leaves
         // Phase::Prefill as it completes, so it is never reset here and its rivals are still counted as passed over.
@@ -232,6 +238,7 @@ public:
         auto add = [&](uint64_t v) { for (unsigned i = 0; i < 8; ++i) { h ^= uint8_t(v >> (8*i)); h *= 1099511628211ull; } };
         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
         add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
+        if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
@@ -289,6 +296,15 @@ public:
         std::vector<Key> out;
         for (const Slot* s : v) out.push_back(s->key);
         return out;
+    }
+    // The alternation flag after a completed quantum of kind k: a prefill (or tail) asks for a decode round next; a decode
+    // round asks for the prefill unless fewer than decode_rounds rounds have run since the last prefill. With
+    // decode_rounds <= 1 this is exactly `want = k != Decode`. Replicated state only (the kinds every rank completed), and
+    // horizon() runs the same function forward, so the notice target agrees with the steps the ranks will take.
+    static void alternate(const Config& c, Kind k, bool& want, uint32_t& run) {
+        if (k != Kind::Decode) { want = true; run = 0; return; }
+        if (run < MAX_DECODE_ROUNDS) ++run;
+        want = c.decode_rounds > 1 && run < c.decode_rounds;
     }
     // The next quantum's shape from slot state `s` and the alternation flag `want_decode`, without touching the
     // scheduler: next() runs it on the live state to do the work, horizon() runs it forward on a copy to size a notice.
@@ -356,16 +372,17 @@ public:
     uint64_t horizon() const {
         auto sim = s_;
         bool want = want_decode_;
+        uint32_t run = decode_run_;
         const Quantum inflight = plan(c_, sim, want);
         if (inflight.kind == Kind::Idle) return boundary_ + NOTICE_MIN;   // the engine blocks: no boundary departs
         advance(sim, inflight);
-        want = inflight.kind != Kind::Decode;
+        alternate(c_, inflight.kind, want, run);
         uint32_t covered = 0;
         for (uint64_t k = NOTICE_MIN; k < NOTICE_MAX; ++k) {
             const Quantum q = plan(c_, sim, want);
             if (q.kind == Kind::Idle) return boundary_ + k;   // no work left: the engine blocks before this boundary
             advance(sim, q);
-            want = q.kind != Kind::Decode;
+            alternate(c_, q.kind, want, run);
             covered += q.kind == Kind::Prefill ? q.rows : q.kind == Kind::PromptTail ? 1 : 0;
             if (covered >= NOTICE_ROWS) return boundary_ + k;
         }
