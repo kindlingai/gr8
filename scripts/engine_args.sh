@@ -82,6 +82,10 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${MTP_KSTOP_TAU:+ G6_MTP_KSTOP_TAU=$MTP_KSTOP_TAU}"
   # the DFlash2 drafter step under MTP's first form on its own stream (DRAFT_PAR; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${DRAFT_PAR:+ G6_DRAFT_PAR=$DRAFT_PAR}"
+  # the replicated decode GEMVs split across the ranks (QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${QA_SPLIT:+ G6_QA_SPLIT=$QA_SPLIT}"
+  ENGINE_ENV="$ENGINE_ENV${IDXQ_SPLIT:+ G6_IDXQ_SPLIT=$IDXQ_SPLIT}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_SPLIT:+ G6_MTP_SPLIT=$MTP_SPLIT}"
   return 0
 }
 

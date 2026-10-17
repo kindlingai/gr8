@@ -511,6 +511,7 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M)
     if (const char* e = bind::make_layer(y.T, M, m.sc, io, *L, fuse, s.h.cls))
         die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
     if (L->heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
+    qs_narrow(m, i, *L);                                // G6_QA_SPLIT: this rank's tiles of the input GEMVs, as layer_base
 #ifdef DEC_SLOT
     bind::set_slots(*L, base.o_proj.slot, base.k1.a.slot);
 #else

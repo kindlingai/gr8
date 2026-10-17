@@ -256,6 +256,82 @@ inline size_t cp_blk(int M, int H) { return ((size_t)M * H * 514 + 3) & ~(size_t
 inline int cp_heads(int d, int l) { return g6nr::width(g6nr::HEADS, (d - l % g6nr::NR + g6nr::NR) % g6nr::NR); }
 #endif
 
+// G6_QA_SPLIT (default 0 = off): the GEMVs on the layer input read weights every rank holds in full (q_a, kv_a, idx.wk,
+// idx.weights_proj: ~17-19 MB a layer, the same bytes on every rank). With the split each rank runs its own output
+// tiles of them (bind::narrow: the same bits per tile) and an all-gather on its own fabric (collective i = layer i)
+// puts every rank's columns into the full q_a / kv_a / idx_k / idx_w rows before the q_a norm. 1: all four GEMVs;
+// 2: q_a only, published first, then kv_a / idx_k / idx_w in full while the gather is on the wire.
+// Rank s holds tiles start(T, j) .. + width(T, j) of each part (T = its 16-output tiles), j = (s - layer) mod NR.
+// The weights stay replicated (nothing changes at load); only what each rank reads changes.
+// G6_IDXQ_SPLIT=1 (default 0): the indexer's wq_b (idx_q, [4096] outputs, 8.65 MB on each indexer layer) the same way, on
+// the same fabric: published right after its tiles, gathered after q_b (head-sharded, local), which runs in between.
+// G6_MTP_SPLIT=1 (default 0): the MTP draft layer (its own Model and gather fabric): eh_proj ([6144] outputs, 78 MB),
+// then q_a / kv_a / idx (mode 1) and idx_q, one collective each in that (publish) order.
+// Collectives are numbered in GPU publish order (the proxy posts them in order): per step, eh (draft), then per layer
+// q_a (if on), idx_q (if on and an indexer layer).
+constexpr int QS_MAXP = 4, QS_MAXR = 8;
+struct QsGeo                          // one layer's gather, by value into the two kernels
+{
+    int np = 0, wmax = 0;             // parts; wire row width in columns (the most any rank sends: the payload is M x wmax)
+    int ld[QS_MAXP] = {};             // full width of part p (its row stride in dst[p])
+    __half* dst[QS_MAXP] = {};        // q_a, kv_a, idx_k, idx_w rows [M][ld]
+    int c0[QS_MAXR][QS_MAXP] = {}, n[QS_MAXR][QS_MAXP] = {};   // sender s, part p: first column, columns (multiples of 16)
+};
+struct QSplit
+{
+    int mode = 0;                     // set before build (G6_QA_SPLIT): 0 off, 1 q_a + kv_a + idx_k + idx_w, 2 q_a only
+    bool iq = false;                  // set before build (G6_IDXQ_SPLIT): idx.wq_b of the indexer layers
+    bool eh = false;                  // set before build, MTP draft model only (G6_MTP_SPLIT): eh_proj
+    g6::FabricDev g{};                // qs_attach after build: the gather fabric, ncoll = ncoll()
+    unsigned* tickets = nullptr;      // [ncoll] publish tickets, device, zero
+    std::vector<QsGeo> geo;           // [ncoll] (build)
+    std::vector<int> cqa, ciq;        // [nl] collective of layer i's q_a / idx_q gather (-1 = none)
+    int ceh = -1;                     // collective of the eh_proj gather (-1 = none)
+    bool on() const { return mode || iq || eh; }
+    int ncoll() const { return (int)geo.size(); }
+    int wmax() const { int w = 0; for (const QsGeo& G : geo) w = std::max(w, G.wmax); return w; }
+    // the gathers of layer i's attention block, in the order its gets run (q_a, then idx_q)
+    std::vector<int> layer_gathers(int i) const
+    {
+        std::vector<int> v;
+        if (!on()) return v;
+        if (cqa[i] >= 0) v.push_back(cqa[i]);
+        if (ciq[i] >= 0) v.push_back(ciq[i]);
+        return v;
+    }
+};
+// The loopback driver (m4sim) runs every rank on one stream, so a rank's gather get cannot wait for a peer whose put
+// comes later in that stream. It launches a block that holds gathers in phases instead: phase p is the part between the
+// get of the block's gather p - 1 (included) and the get of its gather p (excluded); between two phases it delivers the
+// gather on the loopback. want = -1 (default, g6m4): the whole block in order, as before.
+struct QsPh
+{
+    int want = -1, cur = 0;
+    bool on() const { return want < 0 || want == cur; }
+    void next() { ++cur; }
+};
+constexpr unsigned ERR_QS = 0x66000000u;   // error word code: gather wait timeout (low bits (collective << 8) | peer)
+// the gather of np parts of layer l: part p has T[p] tiles of 16 outputs, rows of width W[p] at D[p]
+inline QsGeo qs_geo(int l, int np, const int* T, const int* W, __half* const* D)
+{
+    QsGeo G;
+    G.np = np;
+    for (int p = 0; p < np; ++p) { G.ld[p] = W[p]; G.dst[p] = D[p]; }
+    for (int s = 0; s < g6nr::NR; ++s)
+    {
+        const int j = (s + g6nr::NR - l % g6nr::NR) % g6nr::NR;
+        int w = 0;
+        for (int p = 0; p < np; ++p)
+        {
+            G.c0[s][p] = g6nr::start(T[p], j) * 16;
+            G.n[s][p] = g6nr::width(T[p], j) * 16;
+            w += G.n[s][p];
+        }
+        G.wmax = std::max(G.wmax, w);
+    }
+    return G;
+}
+
 #ifdef DEC_S2
 struct S2Model;                       // s2.cuh: S2 batched decode state (sessions' rows in one step)
 #endif
@@ -317,6 +393,7 @@ struct Model
     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
     bool rs = false;                  // --spec-accept rejection (set before capture): the head accepts each row's draft by
                                       // rejection sampling (the glue.cuh _rs head kernels)
+    QSplit qs;                        // G6_QA_SPLIT (main model only; mode 0 = today's replicated GEMVs)
     int ncoll() const { return 2 * nl + 1; }
 #if defined(G6_CP) && G6_CP
     CpState cp;
@@ -327,14 +404,14 @@ struct Model
 // DP_A_*: inside the attention call (attn.cu g6_attn_mark), stages 0..8 of its replay form.
 enum DecStage { DP_OTHER, DP_QA, DP_IDXKW, DP_QB, DP_ATTN, DP_OPROJ, DP_WAIT_A, DP_NORM_A, DP_ROUTER, DP_EXPERTS, DP_PUT_M,
                 DP_WAIT_M, DP_NORM_M, DP_HEAD_L, DP_HEAD_M, DP_STEP, DP_A_APPEND, DP_A_INDEX, DP_A_SELECT, DP_A_ABSORB,
-                DP_A_SCORES, DP_A_NORMALIZE, DP_A_CONTEXT, DP_A_MERGE, DP_A_VPROJ, DP_GAP, NDP };
+                DP_A_SCORES, DP_A_NORMALIZE, DP_A_CONTEXT, DP_A_MERGE, DP_A_VPROJ, DP_QAG, DP_GAP, NDP };
 inline const char* dp_name(int k)
 {
     static const char* n[NDP] = {"other", "q_a+kv_a", "idx_k+idx_w", "q_b+idx_q", "attention", "o_proj+put", "wait(attn)",
                                  "reduce+norm(attn)", "router+plan", "experts", "put(mlp)", "wait(mlp)", "reduce+norm(mlp)",
                                  "head local", "head merge", "step in/out+embed", "attn append", "attn index scores",
                                  "attn select/reuse", "attn absorb", "attn mla scores", "attn normalize", "attn context",
-                                 "attn merge", "attn value project", "gap between main steps"};
+                                 "attn merge", "attn value project", "q_a gather+norm", "gap between main steps"};
     return n[k];
 }
 inline void dp_print(const char* tag, const char* how, const double (*t)[NDP], const long* steps)
@@ -581,6 +658,48 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         G6RT_CK(g6h2d::copy(m.shared, sh.data(), m.nl * sizeof(int)));
         G6RT_CK(g6h2d::copy(m.errs, er.data(), m.nl * sizeof(unsigned*)));
     }
+    if (m.qs.on())
+    {
+        // the gathers' plan, in publish order (QSplit); the fabric comes after build (qs_attach)
+        QSplit& Q = m.qs;
+        if (Q.mode < 0 || Q.mode > 2) die("G6_QA_SPLIT must be 0, 1 or 2");
+        if (g6nr::NR > QS_MAXR) die("G6_QA_SPLIT: more than 8 ranks");
+        Q.geo.clear();
+        Q.cqa.assign(m.nl, -1);
+        Q.ciq.assign(m.nl, -1);
+        Q.ceh = -1;
+        if (Q.eh)
+        {
+            if (!m.eh_out) die("G6_MTP_SPLIT: eh_proj split on a model without eh_proj (the MTP draft only)");
+            const int T = HID / 16, W = HID;
+            __half* D = m.eh_out;
+            Q.ceh = (int)Q.geo.size();
+            Q.geo.push_back(qs_geo(ids[0], 1, &T, &W, &D));
+        }
+        const int T[QS_MAXP] = {QA / 16, KVA / 16, IDXK / 16, IDXW / 16}, W[QS_MAXP] = {QA, KVA, IDXK, IDXW};
+        __half* D[QS_MAXP] = {m.q_a, m.kv_a, m.idx_k, m.idx_w};
+        const int TQ = IDXQ / 16, WQ = IDXQ;
+        __half* DQ = m.idx_q;
+        for (int i = 0; i < m.nl; ++i)
+        {
+            const Layer& y = m.layers[i];
+            if (Q.mode)
+            {
+                Q.cqa[i] = (int)Q.geo.size();
+                Q.geo.push_back(qs_geo(y.l, Q.mode == 2 ? 1 : y.indexer ? 4 : 2, T, W, D));
+            }
+            if (Q.iq && y.indexer)
+            {
+                Q.ciq[i] = (int)Q.geo.size();
+                Q.geo.push_back(qs_geo(y.l, 1, &TQ, &WQ, &DQ));
+            }
+        }
+        Q.tickets = dmalloc<unsigned>(std::max(1, Q.ncoll()));
+        if (rank == 0)
+            fprintf(stderr, "# rank 0: %s: split by output tiles over %d ranks:%s%s%s; %d gathers per step (wire row up to %d columns)\n",
+                    m.nl == 1 && ids[0] == 78 ? "G6_MTP_SPLIT (draft)" : "G6_QA_SPLIT / G6_IDXQ_SPLIT", g6nr::NR, Q.eh ? " eh_proj" : "",
+                    Q.mode == 2 ? " q_a" : Q.mode ? " q_a, kv_a, idx.wk, idx.weights_proj" : "", Q.iq ? " idx.wq_b" : "", Q.ncoll(), Q.wmax());
+    }
 #if defined(G6_CP) && G6_CP
     if (m.cp.on)
     {
@@ -645,6 +764,50 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
 }
 
+// after build, before any launch: the gather fabric (ncoll = m.qs.ncoll(), slots of at least MX rows of the widest wire row);
+// err: the error word GPU-side gather wait timeouts write (the one the step loop checks)
+inline void qs_attach(Model& m, const g6::FabricDev& g, unsigned* err)
+{
+    QSplit& Q = m.qs;
+    if (g.ncoll != Q.ncoll() || g.nr != g6nr::NR || g.rank != m.rank) die("G6_QA_SPLIT: the gather fabric does not match the plan");
+    if ((size_t)MX * Q.wmax() * 2 + 8 > g.stride) die("G6_QA_SPLIT: the gather fabric's slots are too small");
+    Q.g = g;
+    Q.g.error = err;
+}
+// slot bytes the gather fabric of m needs
+inline size_t qs_slot_bytes(const Model& m) { return (size_t)MX * m.qs.wmax() * 2; }
+
+// G6_QA_SPLIT: a bound layer's input GEMVs narrowed to this rank's output tiles (QsGeo), and their gv_multi launch rebuilt
+// from the narrowed GEMVs (mode 2: q_a alone, then kv_a / idx_k / idx_w in full as x_rest). Same bits per output tile.
+// G6_QA_SPLIT_TPC (default 1): tiles per CTA of the narrowed GEMVs (more CTAs for the smaller grids; no output change).
+inline void qs_narrow(Model& m, int i, bind::Layer& L)
+{
+    static const int tpc = getenv("G6_QA_SPLIT_TPC") ? atoi(getenv("G6_QA_SPLIT_TPC")) : 1;
+    if (m.qs.iq && m.qs.ciq[i] >= 0)          // G6_IDXQ_SPLIT: idx.wq_b, alone in its launch
+    {
+        const QsGeo& G = m.qs.geo[m.qs.ciq[i]];
+        if (L.idx_q.O != IDXQ) die("G6_IDXQ_SPLIT: layer " + std::to_string(m.layers[i].l) + " idx.wq_b is not [4096] outputs");
+        bind::narrow(L.idx_q, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+    }
+    if (!m.qs.mode) return;
+    const QsGeo& G = m.qs.geo[m.qs.cqa[i]];
+    const Layer& y = m.layers[i];
+    if (L.q_a.O != QA || L.kv_a.O != KVA || (y.indexer && (!L.idx_k.on || L.idx_k.O != IDXK || !L.idx_w.on || L.idx_w.O != IDXW)))
+        die("G6_QA_SPLIT: layer " + std::to_string(y.l) + " input GEMVs are not q_a [2048] / kv_a [576] / idx.wk [128] / idx.weights_proj [32]");
+    const bool multi = L.x_in.n > 0;          // today's choice (M <= 8, G6_GV_MULTI): keep it
+    bind::Gv* part[QS_MAXP] = {&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w};
+    for (int p = 0; p < G.np; ++p) bind::narrow(*part[p], G.c0[m.rank][p] / 16, G.n[m.rank][p] / 16, tpc);
+    L.x_in = GvMulti();
+    L.x_rest = GvMulti();
+    if (!multi) return;
+    if (m.qs.mode == 2)
+    {
+        bind::make_gv_multi({&L.q_a}, L.M, L.x_in);
+        bind::make_gv_multi({&L.kv_a, &L.idx_k, &L.idx_w}, L.M, L.x_rest);
+    }
+    else bind::make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w}, L.M, L.x_in);
+}
+
 #ifdef DEC_S2
 inline const bind::Layer& s2_layer(Model& m, int i, int M);
 inline const bind::Layer& layer_base(Model& m, int i, int M);
@@ -676,6 +839,7 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
             k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
         }
         if (y.L[M].heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
+        qs_narrow(m, i, y.L[M]);
 #ifdef DEC_SLOT
         // DEC_SLOT: o_proj and the K1 finalize / dense fc2 write the partial into the send slot (decslot.cuh)
         auto slot = [&](int c) {
@@ -727,9 +891,128 @@ inline G6AttnStep attn_step(Model& m, int i, int M, int context)
     return s;
 }
 
-// the GEMVs on the layer input (q_a + its norm, kv_a, the indexer's k and weights): one gv_multi launch when bound
-inline void launch_layer_in(Model& m, const Layer& y, const bind::Layer& b, int M, cudaStream_t st)
+// G6_QA_SPLIT gather, collective c of the gather fabric g. Payload of rank s: part after part, [M][n[s][p]] fp16 rows of
+// its columns, packed; the wire size is M x wmax x 2 for every sender (the tail sits there).
+// grid G, block 256: this rank's columns of the step's rows -> its send slot, then the doorbell (last CTA, ticket)
+__global__ void __launch_bounds__(256) k_qs_put(QsGeo a, g6::FabricDev g, const u64* stepp, int c, int M, unsigned* ticket)
 {
+    const u64 step = *stepp;
+    uint4* dst = reinterpret_cast<uint4*>(glue::send_slot(g, step, c));
+    const int me = g.rank;
+    int base = 0;
+    for (int p = 0; p < a.np; ++p)
+    {
+        const int w8 = a.n[me][p] / 8, nu = M * w8;
+        for (int u = blockIdx.x * 256 + threadIdx.x; u < nu; u += gridDim.x * 256)
+        {
+            const int r = u / w8, k = u - r * w8;
+            dst[base + u] = *reinterpret_cast<const uint4*>(a.dst[p] + (size_t)r * a.ld[p] + a.c0[me][p] + 8 * k);
+        }
+        base += nu;
+    }
+    glue::publish(g, c, g6::coll_seq(step, c, g.ncoll), ticket);
+}
+// grid G, block 256: wait for every peer's slot of collective c (each CTA, as k_vwaitget), then its columns -> the rows.
+// Ordering as wait_peers' other readers: acquire (sys) by the spinning threads, __syncthreads, then __ldcv reads.
+__global__ void __launch_bounds__(256) k_qs_get(QsGeo a, g6::FabricDev g, const u64* stepp, int c, int M, size_t wire)
+{
+    const u64 step = *stepp;
+    glue::wait_peers(g, step, c, g6::coll_seq(step, c, g.ncoll), wire, ERR_QS);
+    for (int s = 0; s < g.nr; ++s)
+    {
+        if (s == g.rank) continue;
+        const uint4* src = reinterpret_cast<const uint4*>(glue::peer_slot(g, step, c, s));
+        int base = 0;
+        for (int p = 0; p < a.np; ++p)
+        {
+            const int w8 = a.n[s][p] / 8, nu = M * w8;
+            for (int u = blockIdx.x * 256 + threadIdx.x; u < nu; u += gridDim.x * 256)
+            {
+                const int r = u / w8, k = u - r * w8;
+                *reinterpret_cast<uint4*>(a.dst[p] + (size_t)r * a.ld[p] + a.c0[s][p] + 8 * k) = __ldcv(src + base + u);
+            }
+            base += nu;
+        }
+    }
+}
+// payload bytes of the gather collectives of a step with M rows (Fabric::enqueue_step on the gather fabric)
+inline std::vector<uint32_t> qs_sizes(const Model& m, int M)
+{
+    std::vector<uint32_t> s(m.qs.ncoll());
+    for (int c = 0; c < m.qs.ncoll(); ++c) s[c] = (uint32_t)(M * m.qs.geo[c].wmax * 2);
+    return s;
+}
+// gather collective c: this rank's columns out (the tiles' GEMVs ran before it on the stream)
+inline void qs_put(Model& m, int c, int M, cudaStream_t st)
+{
+    k_qs_put<<<M <= 8 ? 1 : 4, 256, 0, st>>>(m.qs.geo[c], m.qs.g, m.stepp, c, M, m.qs.tickets + c);
+}
+// gather collective c: wait for the peers, their columns in
+inline void qs_get(Model& m, int c, int M, cudaStream_t st)
+{
+    k_qs_get<<<M <= 8 ? 1 : 4, 256, 0, st>>>(m.qs.geo[c], m.qs.g, m.stepp, c, M, (size_t)M * m.qs.geo[c].wmax * 2);
+}
+// G6_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
+// P (QsPh): the phase the loopback driver wants; the get starts the next phase
+inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
+{
+    const QSplit& Q = m.qs;
+    const int c = Q.cqa[i];
+    if (P.on())
+    {
+        if (b.x_in.n) bind::launch(b.x_in, st);
+        else
+        {
+            bind::launch(b.q_a, st);
+            if (Q.mode == 1) { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
+        }
+        qs_put(m, c, M, st);
+        dmark(DP_QA, st);
+        if (Q.mode == 2)
+        {
+            if (b.x_rest.n) bind::launch(b.x_rest, st);
+            else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
+        }
+        dmark(DP_IDXKW, st);
+    }
+    P.next();
+    if (!P.on()) return;
+    qs_get(m, c, M, st);
+    glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
+    dmark(DP_QAG, st);
+}
+
+// q_a_norm's fragment table, q_b (this rank's heads) and idx_q. G6_IDXQ_SPLIT on an indexer layer: idx_q's tiles first,
+// published, then q_b while the gather is on the wire, then the gather (the outputs are the same; only the order changes)
+inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
+{
+    const int c = m.qs.iq ? m.qs.ciq[i] : -1;
+    if (!P.on())                              // not this phase: only the gather's get may be (it starts the next one)
+    {
+        if (c < 0) return;
+        P.next();
+        if (P.on()) qs_get(m, c, M, st);
+        return;
+    }
+    bind::launch(b.xf_qa, st);
+    if (c < 0)
+    {
+        bind::launch_q_b(b, st);
+        bind::launch(b.idx_q, st);
+        return;
+    }
+    bind::launch(b.idx_q, st);
+    qs_put(m, c, M, st);
+    bind::launch_q_b(b, st);
+    P.next();
+    if (P.on()) qs_get(m, c, M, st);
+}
+
+// the GEMVs on the layer input (q_a + its norm, kv_a, the indexer's k and weights): one gv_multi launch when bound
+inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
+{
+    if (m.qs.mode) { launch_layer_in_qs(m, i, y, b, M, st, P); return; }
+    if (!P.on()) return;
     if (b.x_in.n)
     {
         bind::launch(b.x_in, st);
@@ -757,7 +1040,8 @@ inline bool cp_active(const Model& m, int context) { return m.cp.on && (m.graph 
 //      S3 publishes each partial as soon as it is computed, S1 computes all three, then publishes them
 //   2: wait the nr-1 partials of my heads, LSE merge in shard order, value_project, then o_proj and publish(2i) as today
 // S3 and S1 run the same kernels on the same inputs (only the order differs), so they are byte-identical (gate A).
-inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaStream_t st)
+// qph (phase 0 only, QsPh): the G6_QA_SPLIT / G6_IDXQ_SPLIT gather phase of phase 0 the loopback driver wants (-1 = all)
+inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaStream_t st, int qph = -1)
 {
     Layer& y = m.layers[i];
     CpState& C = m.cp;
@@ -777,19 +1061,23 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     auto part_of = [&](int s) { return C.part_all + s * blk; };
     auto cpart = [&](int k) { return C.colls.part[(size_t)i * (nr - 1) + k - 1]; };
     const float *q = nullptr, *rope = nullptr;
+    if (phase < 0 && qph >= 0) die("launch_attn_cp: a gather phase needs CP phase 0");
+    QsPh P{qph};
     if (phase <= 0)
     {
         if (m.graph && !y.rp_on[m.cur][M]) die("prepare(m, M) was not called before a graph step");
-        dmark(DP_OTHER, st);
+        if (P.on())
+        {
+            dmark(DP_OTHER, st);
 #ifdef DEC_SLOT
-        if (i == 0) bind::launch(b.xf_x, st);
+            if (i == 0) bind::launch(b.xf_x, st);
 #else
-        bind::launch(b.xf_x, st);
+            bind::launch(b.xf_x, st);
 #endif
-        launch_layer_in(m, y, b, M, st);
-        bind::launch(b.xf_qa, st);
-        bind::launch_q_b(b, st);
-        bind::launch(b.idx_q, st);
+        }
+        launch_layer_in(m, i, y, b, M, st, P);
+        launch_qb_idxq(m, i, b, M, st, P);
+        if (!P.on()) return;                  // an earlier gather phase of phase 0
         dmark(DP_QB, st);
         for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
         if (!m.graph)
@@ -871,7 +1159,8 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 #endif
 
 // rows at positions m.pos[0..M-1] (device), context = last position + 1 (plain form; the graph form reads the cell)
-inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t st)
+// qph (QsPh): the gather phase the loopback driver wants (-1 = the whole block, as the real fabric runs it)
+inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t st, int qph = -1)
 {
 #if defined(G6_CP) && G6_CP
 #ifdef DEC_S2
@@ -879,20 +1168,28 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     // m.cur is not the S2 step's bucket (each slot has its own, S2Model::bk)
     if (!m.s2on)
 #endif
-    if (cp_active(m, context)) { launch_attn_cp(m, i, M, context, -1, st); return; }
+    if (cp_active(m, context))
+    {
+        if (qph >= 0) die("launch_attn_block: a gather phase of the CP block goes through launch_attn_cp phase 0");
+        launch_attn_cp(m, i, M, context, -1, st);
+        return;
+    }
 #endif
     Layer& y = m.layers[i];
     const bind::Layer& b = layer_for(m, i, M);
-    dmark(DP_OTHER, st);
+    QsPh P{qph};
+    if (P.on())
+    {
+        dmark(DP_OTHER, st);
 #ifdef DEC_SLOT
-    if (i == 0) bind::launch(b.xf_x, st);      // later layers: the fragment tables come from launch_consume(2i-1)
+        if (i == 0) bind::launch(b.xf_x, st);      // later layers: the fragment tables come from launch_consume(2i-1)
 #else
-    bind::launch(b.xf_x, st);
+        bind::launch(b.xf_x, st);
 #endif
-    launch_layer_in(m, y, b, M, st);
-    bind::launch(b.xf_qa, st);
-    bind::launch_q_b(b, st);
-    bind::launch(b.idx_q, st);
+    }
+    launch_layer_in(m, i, y, b, M, st, P);
+    launch_qb_idxq(m, i, b, M, st, P);
+    if (!P.on()) return;                      // an earlier gather phase
     dmark(DP_QB, st);
 #ifdef DEC_S2
     if (m.s2on) s2_attention(m, i, M, st);
@@ -1042,6 +1339,13 @@ inline const bind::Head& head_for(Model& m, int M)
         io.h = m.x; io.logits = m.hlog;
         io.eh_in = m.eh_in; io.eh = m.eh_out;
         if (const char* e = bind::make_head(m.head_t, m.rank, M, m.sc, io, H)) die("rank " + std::to_string(m.rank) + " head: " + e);
+        if (m.qs.eh)                  // G6_MTP_SPLIT: this rank's tiles of eh_proj (same bits per tile, bind::narrow)
+        {
+            const QsGeo& G = m.qs.geo[m.qs.ceh];
+            if (!H.eh.on || H.eh.O != HID) die("G6_MTP_SPLIT: no eh_proj of [6144] outputs");
+            static const int tpc = getenv("G6_QA_SPLIT_TPC") ? atoi(getenv("G6_QA_SPLIT_TPC")) : 1;
+            bind::narrow(H.eh, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+        }
     }
     return H;
 }
@@ -1269,19 +1573,28 @@ inline void s2_draft_keep(Draft& D, cudaStream_t st);
 inline int s2_sessions(const Model& m);
 #endif
 // the draft step's "embedding": StepIn cells -> eh input -> eh_proj -> residual + layer 78 input norm
-inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st)
+// qph (QsPh, G6_MTP_SPLIT): 0 = up to the eh_proj gather's put, 1 = its get and the rest (-1 = all; the loopback driver)
+inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int qph = -1)
 {
     Model& d = D.d;
     const bind::Head& H = head_for(d, M);
     if (!H.eh.on) die("the head binder has no eh_proj");
+    QsPh P{qph};
+    if (P.on())
+    {
 #ifdef DEC_S2
-    const __half* hid = d.s2on ? s2_draft_hid(D, chain, st) : chain ? D.hprev : D.main_x;
-    k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, d.eh_in});
+        const __half* hid = d.s2on ? s2_draft_hid(D, chain, st) : chain ? D.hprev : D.main_x;
+        k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, d.eh_in});
 #else
-    k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, chain ? D.hprev : D.main_x, glue::RMS_EPS, d.eh_in});
+        k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, chain ? D.hprev : D.main_x, glue::RMS_EPS, d.eh_in});
 #endif
-    bind::launch(H.xf_eh, st);
-    bind::launch(H.eh, st);
+        bind::launch(H.xf_eh, st);
+        bind::launch(H.eh, st);
+        if (d.qs.eh) qs_put(d, d.qs.ceh, M, st);   // G6_MTP_SPLIT: every rank's eh_proj columns
+    }
+    if (d.qs.eh) P.next();
+    if (!P.on()) return;
+    if (d.qs.eh) qs_get(d, d.qs.ceh, M, st);
     k_mtp_resid_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(d.eh_out, d.layers[0].attn_norm, d.resid, d.x, glue::RMS_EPS);
 }
 inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
