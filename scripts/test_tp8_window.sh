@@ -127,5 +127,49 @@ restore
 [ -e "$T/rd/ALERT" ] && ! grep -q "gr8 b. a glm53 up" "$M/calls" && ok "TP8 not down: no serve start, ALERT" \
   || bad "TP8 not down: no serve start, ALERT"
 
+# 8. a hooked (non-gr8) serve: its own stop/prep/check/up/health/smoke commands, up on its head only
+hooked() {   # replace serve A with a hooked serve B
+  sed -i '/^SERVES=/,/^A_CANARY_MD5=/d' "$T/rd/window.conf"
+  cat >> "$T/rd/window.conf" <<HOOK
+SERVES=(B)
+B_BOXES=(b6 b5 b0 b7)
+B_UP_BOXES=(b6)
+B_HEAD=b6
+B_HOME=$T/a
+B_ENV=$T/b.env
+B_ENV_SHA=x
+B_URL=http://b6:8888
+B_HEALTH=/v1/models
+B_UP=seq
+B_GAP=0
+B_STOP_CMD='echo "bstop \$MOCK_HOST" >> $M/calls'
+B_PREP='echo "bprep \$MOCK_HOST" >> $M/calls'
+B_PRE_UP_CHECK='echo "bpre \$MOCK_HOST" >> $M/calls; [ ! -e $M/prefail ]'
+B_POST_CHECK='echo "bpost \$MOCK_HOST" >> $M/calls'
+B_UP_CMD='echo "bup \$MOCK_HOST" >> $M/calls; touch $M/up'
+B_CANARY_HOST=b6
+B_CANARY_CMD='echo bsmoke >> $M/calls; [ -e $M/smoke.ok ]'
+B_CANARY_MD5=exit0
+HOOK
+  (cd "$T/rd" && sha256sum tp8-window.sh window.conf > SHA256SUMS)
+}
+setup; hooked; touch "$M/smoke.ok"
+restore
+[ -e "$T/rd/RESTORED_OK" ] && ok "hooked serve: RESTORED_OK" || bad "hooked serve: RESTORED_OK"
+[ "$(grep -c '^bstop' "$M/calls")" = 4 ] && [ "$(grep -c '^bprep' "$M/calls")" = 4 ] && ok "hooked stop+prep x4" \
+  || bad "hooked stop+prep x4"
+[ "$(grep -c '^bup' "$M/calls")" = 1 ] && grep -q '^bup b6$' "$M/calls" && ok "hooked up on UP_BOXES only" || bad "hooked up on UP_BOXES only"
+[ "$(grep -c '^bpre ' "$M/calls")" = 4 ] && [ "$(grep -c '^bpost' "$M/calls")" = 4 ] && grep -q '^bsmoke' "$M/calls" \
+  && ok "hooked checks x4 + smoke" || bad "hooked checks x4 + smoke"
+grep -q "gr8 b. a " "$M/calls" && bad "hooked serve ran gr8" || ok "hooked serve ran no gr8"
+
+# 9. hooked serve: a failed pre-up check never starts it; a failed smoke is an ALERT after 2 attempts
+setup; hooked; touch "$M/smoke.ok" "$M/prefail"
+restore
+[ -e "$T/rd/ALERT" ] && ! grep -q '^bup' "$M/calls" && ok "pre-up check fail: no up, ALERT" || bad "pre-up check fail: no up, ALERT"
+setup; hooked
+restore
+[ -e "$T/rd/ALERT" ] && [ "$(grep -c '^bup' "$M/calls")" = 2 ] && ok "smoke fail: 2 attempts, ALERT" || bad "smoke fail: 2 attempts, ALERT"
+
 echo "passed $pass, failed $failn"
 [ $failn = 0 ]
