@@ -31,6 +31,11 @@ EOF
 #!/bin/bash
 echo "systemctl $*" >> "$MOCK/calls"
 [ "$1" = show ] && echo active
+# steps.live: the P2b units (tp8-steps-*) run until a stop for that name (with steps.stuck: a stop does not end them)
+case "$1 ${2:-}" in
+  "stop tp8-steps-"*) [ -e "$MOCK/steps.stuck" ] || touch "$MOCK/stopped.$2" ;;
+  "list-units "*) for u in "$@"; do case $u in tp8-steps-*) [ -e "$MOCK/steps.live" ] && [ ! -e "$MOCK/stopped.$u" ] && echo "$u loaded active running x" ;; esac; done ;;
+esac
 exit 0
 EOF
   # systemd-run: a timer (--on-active) is only logged; a unit without one runs now, in the foreground
@@ -133,7 +138,9 @@ setup; steps; bash "$W" cmds "$T/window.conf" > "$T/cmds" 2>&1
 grep -qP '^tp8-stop\tb0 b1 b2 b3\t\( u=.tp8-up-RUNID.service.*\) \|\| exit 1; echo "tstop' "$T/cmds" && ! grep -q 'launch.py down --local' "$T/cmds" \
   && ok "cmds: unit stop then TEST_STOP_CMD, no launch.py" || bad "cmds: unit stop then TEST_STOP_CMD, no launch.py"
 grep -qP '^tp8-p0-verify\tb0 b1 b2 b3\techo "tverify' "$T/cmds" && ok "cmds: TEST_VERIFY_CMD" || bad "cmds: TEST_VERIFY_CMD"
-grep -qP '^tp8-steps\tb0\techo "steps' "$T/cmds" && ok "cmds: steps row" || bad "cmds: steps row"
+grep -qP '^tp8-steps\tb0\t.*--unit=tp8-steps-RUNID /bin/bash -c .*export\\ TP8_RUN_ID=RUNID.*/tmp/tp8-steps-RUNID.rc' "$T/cmds" && ok "cmds: steps row = detached unit tp8-steps-<run>" || bad "cmds: steps row = detached unit tp8-steps-<run>"
+grep -qP "^tp8-steps-ctl-stop\tb0\tu='tp8-steps-RUNID.service'" "$T/cmds" && grep -qP "^tp8-steps-stop\tb0 b1 b2 b3\tu='tp8-steps-RUNID-\\*.service'" "$T/cmds" \
+  && ok "cmds: steps controller stop (STEPS_HOST) + per-box steps unit stop (all boxes)" || bad "cmds: steps controller stop + per-box steps unit stop"
 
 # 4. a whole run, no steps, ROUTES_CHECK=0: PASS, RESTORED_OK, no routes.py, no receipts, test stop by hook x4
 setup; run
@@ -163,13 +170,39 @@ s=$(grep -n -m1 '^steps b0' "$M/calls" | cut -d: -f1); m=$(grep -n -m1 '^md5bin'
 setup; steps false; run
 [ "$(cat "$T/rc")" = 1 ] && grep -q 'finish: P2b: steps' "$T/runs/$RID/window.log" && ok "steps fail: finish P2b" \
   || bad "steps fail: finish P2b [rc $(cat "$T/rc")]"
-! grep -q '^tgr8' "$M/calls" && grep -qx 'P2b: steps; RESTORED_OK' "$T/runs/$RID/RESULT" && ok "steps fail: no test up, RESTORED_OK" \
+! grep -q '^tgr8' "$M/calls" && grep -qx 'P2b: steps (rc 1); RESTORED_OK' "$T/runs/$RID/RESULT" && ok "steps fail: no test up, RESTORED_OK" \
   || bad "steps fail: no test up, RESTORED_OK"
 
 # 7. steps pass but the boxes' bin/ differ: fails at P2b, no test up
 setup; steps "touch $T/mock/bindiff"; run
 grep -q 'finish: P2b: test bin/ differs' "$T/runs/$RID/window.log" && ! grep -q '^tgr8' "$M/calls" \
   && ok "bin/ differs after steps: no test up" || bad "bin/ differs after steps: no test up"
+
+# 9. precheck pr95 B3: the restore completes during P2b (steps rc 0) -> the primary stops at the fence after P2b: no P3
+# memclean/prep, no bin check, no test up on the restored boxes
+rsc() { echo "bash $T/rec/\$TP8_RUN_ID/tp8-window.sh restore $T/rec/\$TP8_RUN_ID"; }   # the restore, run by STEPS_CMD
+setup; steps "$(rsc)"; run
+L=$T/runs/$RID/window.log
+grep -q 'finish: fenced after P2b' "$L" && [ -e "$T/rec/$RID/RESTORED_OK" ] && ok "B3: restore during P2b -> fenced after P2b, RESTORED_OK" \
+  || bad "B3: restore during P2b -> fenced after P2b [rc $(cat "$T/rc")]"
+u=$(grep -n -m1 '^aup' "$M/calls" | cut -d: -f1)   # the restore's own memclean runs before its serve up
+! grep -q 'P3 memclean' "$L" && [ -n "$u" ] && ! tail -n +"$u" "$M/calls" | grep -q '^memclean' && ! grep -q '^md5bin' "$M/calls" && ! grep -q '^tgr8' "$M/calls" \
+  && ok "B3: no P3 memclean/prep, no bin check, no test up after the restore" || bad "B3: no P3 memclean/prep, no bin check, no test up after the restore"
+
+# 10. precheck pr95 B2: the P2b units still run when the restore starts -> the restore stops the steps controller unit on
+# STEPS_HOST, then tp8-steps-<run>-* on every box, then the test cluster, and only then brings the serve up
+setup; steps "touch $T/mock/steps.live; $(rsc)"; run
+c=$(grep -n -m1 "^systemctl stop tp8-steps-$RID.service" "$M/calls" | cut -d: -f1)
+p=$(grep -n -m1 "^systemctl stop tp8-steps-$RID-\\*.service" "$M/calls" | cut -d: -f1)
+t=$(grep -n -m1 '^tstop' "$M/calls" | cut -d: -f1); u=$(grep -n -m1 '^aup' "$M/calls" | cut -d: -f1)
+[ -n "$c" ] && [ -n "$p" ] && [ -n "$t" ] && [ -n "$u" ] && [ "$c" -lt "$p" ] && [ "$p" -lt "$t" ] && [ "$t" -lt "$u" ] \
+  && grep -q 'finish: fenced after P2b' "$T/runs/$RID/window.log" && ok "B2: steps ctl stop < per-box steps stop < test stop < serve up (restore inside P2b)" || bad "B2: order [$c $p $t $u]"
+[ "$(grep -c "^systemctl stop tp8-steps-$RID.service" "$M/calls")" = 1 ] && [ "$(grep -c "^systemctl stop tp8-steps-$RID-\\*.service" "$M/calls")" = 4 ] \
+  && [ -e "$T/rec/$RID/RESTORED_OK" ] && ok "B2: ctl stop once (STEPS_HOST), per-box stop x4, RESTORED_OK" || bad "B2: stop counts / RESTORED_OK"
+# a steps unit that does not stop: no serve up, ALERT
+setup; steps "touch $T/mock/steps.live $T/mock/steps.stuck; $(rsc)"; run
+! grep -q '^aup' "$M/calls" && [ -e "$T/rec/$RID/ALERT" ] && [ ! -e "$T/rec/$RID/RESTORED_OK" ] && grep -q 'NOT STOPPED' "$T/rec/$RID/restore.log" 2>/dev/null \
+  && ok "B2: stuck steps unit -> no serve up, ALERT" || bad "B2: stuck steps unit -> no serve up, ALERT"
 
 # 8. defaults unchanged: no TEST_* / ROUTES_CHECK -> the tp8-ring launch.py stop and the routes dry run
 setup; sed -i '/^TEST_STOP_CMD=/d;/^TEST_VERIFY_CMD=/d;/^ROUTES_CHECK=/d' "$T/window.conf"

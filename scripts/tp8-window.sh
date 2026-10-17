@@ -31,6 +31,11 @@
 # the tp8-ring launch.py), ROUTES_CHECK=0 (no routes.py dry run and no routes receipts: not a hybrid fabric), and
 # STEPS_CMD on STEPS_HOST (phase P2b after P2, bounded by B_STEPS, added to T_MAX; exit 0 = pass, else the run fails
 # and restores; with STEPS_CMD the identical-bin/ check runs after P2b instead of in P0, since the steps may build it).
+# P2b runs in its own unit tp8-steps-<run> on STEPS_HOST (env TP8_RUN_ID; output /tmp/tp8-steps-<run>.log, exit status
+# /tmp/tp8-steps-<run>.rc), so the restore can stop it: STEPS_CMD must start any per-box work in units named
+# tp8-steps-<run>-* (precheck pr95 B2). The restore first stops and verifies the controller unit on STEPS_HOST, then
+# every tp8-steps-<run>-* unit on every test box, then the test cluster, and only then restores a serve. The primary
+# re-checks the fence after P2b and before P6 (precheck pr95 B3).
 set -u
 ME=$(readlink -f "$0")
 UNIT_STOP_S=120 STOP_S=300   # remote caps (s) of a launch-unit stop (90 s stop + reads) and of a serve's stop hook
@@ -139,6 +144,12 @@ else echo \"launch units \$u NOT STOPPED: active [\$l] processes \$n\"; exit 1; 
 }
 # with_unit_stop PATTERN CMD: the unit stop, then (only if it verified) CMD
 with_unit_stop() { printf '( %s ) || exit 1; %s' "$(unit_stop_cmd "$1")" "$2"; }
+steps_unit() { echo "tp8-steps-${RUN_ID:-RUNID}"; }
+steps_cmd() {   # the detached P2b unit; its exit status lands in /tmp/<unit>.rc
+  local u
+  u=$(steps_unit)
+  detach "$u" "export TP8_RUN_ID=${RUN_ID:-RUNID}; ( $STEPS_CMD ) > /tmp/$u.log 2>&1; echo \$? > /tmp/$u.rc"
+}
 tp8_stop_cmd() { with_unit_stop "tp8-up-${RUN_ID:-RUNID}" "${TEST_STOP_CMD:-$(local_stop_cmd "$TP8_HOME" "$TP8_ENV")}"; }
 # P0, read only: the restore's verify half while the serves still run. A stale out/handshake.json (an older boot's
 # ports, e.g. a serve's API port) makes verify-down see the live serve and fail, so the restore could never pass.
@@ -160,6 +171,10 @@ serve_up_cmd() {   # NAME: the guard (if any), then the detached up; the unit na
     "cd $(printf %q "$(sv "$1" HOME)") && exec timeout 3000 ./gr8 glm53 up @$(sv "$1" ENV) > out/window-up.log 2>&1 < /dev/null")")"
 }
 tp8_local_stop() {   # one box: this box's test processes, by recorded identity
+  if [ -n "${STEPS_CMD:-}" ]; then   # P2b first: its controller (no new per-box work after), then its per-box units
+    on_all "$UNIT_STOP_S" steps-ctl-stop "$(unit_stop_cmd "$(steps_unit)")" "$STEPS_HOST" || return 1
+    on_all "$UNIT_STOP_S" steps-stop "$(unit_stop_cmd "$(steps_unit)-*")" "${TP8_BOXES[@]}" || return 1
+  fi
   on_all "$((UNIT_STOP_S + STOP_S))" tp8-stop "$(tp8_stop_cmd)" "${TP8_BOXES[@]}"
 }
 serve_local_stop() {
@@ -367,7 +382,20 @@ cmd_run() {
   if [ -n "${STEPS_CMD:-}" ]; then
     say "P2b steps on $STEPS_HOST (<= ${B_STEPS}s)"
     fenced && finish "fenced before P2b"
-    rsh "$STEPS_HOST" "$B_STEPS" "$STEPS_CMD" >> "$LOG" 2>&1 || finish "P2b: steps"
+    local su rc=""
+    su=$(steps_unit)
+    rsh "$STEPS_HOST" 60 "rm -f /tmp/$su.rc /tmp/$su.log && $(steps_cmd)" >> "$LOG" 2>&1 || finish "P2b: steps unit did not start"
+    local end=$((SECONDS + B_STEPS))
+    while [ $SECONDS -lt $end ]; do
+      rc=$(rsh "$STEPS_HOST" 30 "cat /tmp/$su.rc 2>/dev/null")
+      [ -n "$rc" ] && break
+      fenced && finish "fenced during P2b"
+      sleep 15
+    done
+    rsh "$STEPS_HOST" 30 "tail -60 /tmp/$su.log" >> "$LOG" 2>&1
+    [ -n "$rc" ] || finish "P2b: no exit status within ${B_STEPS}s"
+    [ "$rc" = 0 ] || finish "P2b: steps (rc $rc)"
+    fenced && finish "fenced after P2b"
     bin_same || finish "P2b: test bin/ differs or is missing"
   fi
 
@@ -391,6 +419,7 @@ cmd_run() {
   [ $up = 1 ] || finish "P5: no /health within ${B_P5}s"
 
   say "P6 two chats at temperature 0"
+  fenced && finish "fenced before P6"
   local body
   body=$(printf '{"messages":[{"role":"user","content":"Say hello in one sentence."}],"temperature":0,"max_tokens":%s}' "${TP8_CHAT_TOKENS:-128}")
   for h in 1 2; do
@@ -448,7 +477,11 @@ cmd_cmds() {   # CONF: every remote command, NAME TAB HOSTS TAB CMD; runs nothin
   row tp8-prep "${TP8_BOXES[*]}" "$MEMCLEAN && $PREP_CMD"
   row tp8-weights "${TP8_BOXES[*]}" "$VERIFY_WEIGHTS_CMD"
   row tp8-up "${TP8_BOXES[*]}" "$(tp8_up_cmd)"
-  [ -n "${STEPS_CMD:-}" ] && row tp8-steps "$STEPS_HOST" "$STEPS_CMD"
+  if [ -n "${STEPS_CMD:-}" ]; then
+    row tp8-steps "$STEPS_HOST" "$(steps_cmd)"
+    row tp8-steps-ctl-stop "$STEPS_HOST" "$(unit_stop_cmd "$(steps_unit)")"
+    row tp8-steps-stop "${TP8_BOXES[*]}" "$(unit_stop_cmd "$(steps_unit)-*")"
+  fi
   for s in "${SERVES[@]}"; do
     row "$s-down" "$(sv "$s" HEAD)" "$(serve_down_cmd "$s")"
     row "$s-unitstop" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(serve_unit_stop_cmd "$s")"
