@@ -9,10 +9,13 @@
 // CP_MINE, the cand / part offsets), so a row that read another row's table, bound or slot would show here.
 // Checks per seed:
 //   1. batched == solo: every row of session s in the batched step gives the same bits (merged index list, context of
-//      every head group, KV pages) as the step of session s alone (its own rows only, its own fresh physical placement).
+//      every head group) as the step of session s alone (its own rows only, its own fresh physical placement).
 //   2. the merged list == the exact global top-TOP of the row (all keys, one rank), and every rank merges the same list.
-//   3. context == the replicated (cp_nr = 0) reference within 1e-5 normwise (max abs error / max abs value per row-head) (the LSE merge rounds differently).
-//   4. no rank ever dereferences a G6_CP_REMOTE / out-of-range page (error bits as attn.cu page()).
+//   3. context == the replicated (cp_nr = 0) reference within 1e-5 normwise (max abs error / max abs value per
+//      row-head; the LSE merge rounds differently).
+// Scope: address / candidate-merge / LSE parity of the exchange. Not CUDA numerics, not the KV append (no append here).
+//   4. every context value is finite (identical NaNs would pass 1 and 3).
+//   5. no rank ever dereferences a G6_CP_REMOTE / out-of-range page (error bits as attn.cu page()).
 // Dimensions are scaled down (latent 64, index 16, TOP 128); the algorithm does not depend on them.
 // Build/run: g++ -O2 -std=c++17 cp_batch_cpu_test.cpp -o cp_batch_cpu_test && ./cp_batch_cpu_test [--seeds N]
 // --break: negative control (for_row uses row 0 for every row); must FAIL every multi-session case.
@@ -273,6 +276,8 @@ bool run_case(const std::string& name, const std::vector<std::pair<int, int>>& s
     const Out B = run_cp(ss, all, W);
     std::string bad;
     if (B.error) bad += " batched-error=" + std::to_string(B.error);
+    // identical NaNs would pass the bit compare and give normwise 0: every context value must be finite
+    if (!std::all_of(B.ctx.begin(), B.ctx.end(), [](float x) { return std::isfinite(x); })) bad += " batched-nonfinite";
     if (!B.ranks_agree) bad += " batched-ranks-disagree";
     double worst = 0;
     int row0 = 0;
@@ -287,6 +292,7 @@ bool run_case(const std::string& name, const std::vector<std::pair<int, int>>& s
         std::vector<RankWorld> Ws; for (int r = 0; r < NR; ++r) Ws.push_back(place(ss, {(int)s}, r, rng));
         const Out S = run_cp(ss, so, Ws);
         if (S.error) bad += " solo-error(s" + std::to_string(s) + ")";
+        if (!std::all_of(S.ctx.begin(), S.ctx.end(), [](float x) { return std::isfinite(x); })) bad += " solo-nonfinite(s" + std::to_string(s) + ")";
         if (!S.ranks_agree) bad += " solo-ranks-disagree(s" + std::to_string(s) + ")";
         if (!std::equal(S.indices.begin(), S.indices.end(), B.indices.begin() + (size_t)row0 * TOP)) bad += " lists!=solo(s" + std::to_string(s) + ")";
         if (memcmp(S.ctx.data(), B.ctx.data() + (size_t)row0 * H * D, S.ctx.size() * 4)) bad += " ctx!=solo(s" + std::to_string(s) + ")";
@@ -300,6 +306,7 @@ bool run_case(const std::string& name, const std::vector<std::pair<int, int>>& s
                     const double got = B.ctx[((size_t)(row0 + i) * H + h) * D + e], want = rc[(size_t)h * D + e];
                     num = std::max(num, std::fabs(got - want)); den = std::max(den, std::fabs(want));
                 }
+                if (!std::isfinite(num) || !std::isfinite(den)) num = INFINITY;   // a NaN never passes the bound
                 worst = std::max(worst, num / std::max(den, 1e-30));
             }
         }
