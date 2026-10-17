@@ -61,6 +61,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/batch_kstop_mtp_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test"
 "$T/capture_barrier_test"
+# S2 at TP8: 8-rank guards, bootstrap over 8 loopback sockets, LeaderChannel with 7 peers, Agreement(8)
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/tp8_ranks_test.cpp" -o "$T/tp8_ranks_test"
+"$T/tp8_ranks_test" 2> "$T/tp8_ranks_test.err" || { cat "$T/tp8_ranks_test.err"; exit 1; }
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_reuse_test.cpp" "${KVLIB[@]}" -o "$T/pool_reuse_test"
 "$T/pool_reuse_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_conc_replay_test.cpp" "${KVLIB[@]}" -o "$T/pool_conc_replay_test"
