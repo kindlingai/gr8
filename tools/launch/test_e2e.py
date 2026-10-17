@@ -399,5 +399,138 @@ class EndToEnd(unittest.TestCase):
                 d.close()
 
 
+TP8 = 8
+LAN8 = [f'127.0.0.{i + 1}' for i in range(TP8)]
+
+
+def fab_ports8(r):
+    """Synthetic loopback ports shaped like the TP8 topology (test_routes.py): ranks 0-5 on a two-rail switch, 5-6,
+    0-7 and 6-7 cabled."""
+    p = [f'127.0.{s}.{r + 1}/24' for s in (101, 102)] if r < 6 else []
+    cables = {0: (121, 122), 5: (111, 112), 6: (131, 132, 111, 112), 7: (121, 122, 131, 132)}
+    return ','.join(p + [f'127.0.{s}.{r + 1}/24' for s in cables.get(r, ())])
+
+
+def loopback8():
+    try:
+        with socket.socket() as s:
+            s.bind(('127.0.0.8', 0))
+        return True
+    except OSError:
+        return False
+
+
+@unittest.skipUnless(loopback8(), 'needs 127.0.0.2..8 (Linux)')
+class Hybrid8(unittest.TestCase):
+    """Eight supervisors, --tp 8 --shape hybrid: the verdict carries the route table, every box writes the same
+    run/routes.txt, the engine argv carries --hybrid/--fab-routes/--fab-ports, the head pins shim and front to 0-10,
+    and the cluster's control port must be its own."""
+    def setUp(self):
+        self.t = tempfile.mkdtemp(prefix='gr8e2e8-')
+        self.packs = make_packs(os.path.join(self.t, 'packs'), tp=TP8, dflash=False, qo=True)
+        self.port, self.api = free_port(), free_port()
+        self.homes = []
+        for i in range(TP8):
+            h = os.path.join(self.t, f'box{i}')
+            os.makedirs(os.path.join(h, 'bin'))
+            os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', 'g6m4'))
+            self.homes.append(h)
+        self.env = {**os.environ, 'PATH': os.path.join(HERE, 'stubs') + os.pathsep + os.environ['PATH'],
+                    'GR8_REFUSAL_LINGER': '3'}
+        for k in ('CAP', 'SESS', 'PEERS', 'G6_CLUSTER'):
+            self.env.pop(k, None)
+
+    def tearDown(self):
+        for i in range(TP8):
+            self.gr8(i, 'down', timeout=60)
+        shutil.rmtree(self.t, ignore_errors=True)
+
+    def argv(self, i, *extra, control=None):
+        return ['--no-config', '--no-check', '--peers', ','.join(LAN8), '--node-ip', LAN8[i], '--shape', 'hybrid',
+                '--fab-ports', fab_ports8(i), '--model', self.packs, '--model-cache', os.path.join(self.homes[i], 'cache'),
+                '--g6-home', self.homes[i], '--control-port', str(control or self.port), '--port', str(self.api),
+                '--py', sys.executable, '--front-bin', os.path.join(HERE, 'stubs', 'front'), '--join-timeout', '60',
+                '--ready-tmo', '60', *extra]
+
+    def gr8(self, i, cmd, *extra, timeout=120):
+        args = self.argv(i, *extra) if cmd == 'up' else ['--g6-home', self.homes[i], *extra]
+        return subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), cmd, *args], env=self.env,
+                              capture_output=True, text=True, timeout=timeout)
+
+    def up_all(self, extra=None):
+        procs = [subprocess.Popen([sys.executable, os.path.join(HERE, 'launch.py'), 'up',
+                                   *self.argv(i, *(extra or {}).get(i, []))],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                 for i in range(TP8)]
+        out = []
+        for p in procs:
+            with p.stdout:
+                out.append((p.wait(timeout=240), p.stdout.read()))
+        return out
+
+    def stub(self, i):
+        with open(os.path.join(self.homes[i], 'out', 'stub.json')) as f:
+            return json.load(f)
+
+    def test_hybrid_boot_routes_argv_pin_and_verified_down(self):
+        sys.path.insert(0, HERE)
+        import routes
+        res = self.up_all()
+        for i, (rc, out) in enumerate(res):
+            self.assertEqual(rc, 0, f'box {i}:\n{out}')
+        hs = [json.loads(read(os.path.join(h, 'out', 'handshake.json'))) for h in self.homes]
+        want = routes.compute([fab_ports8(r) for r in range(TP8)])
+        texts = {read(os.path.join(h, 'run', 'routes.txt')) for h in self.homes}
+        self.assertEqual(texts, {want.text})                                    # the same file on every box
+        for i in range(TP8):
+            self.assertEqual((hs[i]['routes'], hs[i]['routes_sha']), (want.text, want.sha))
+            self.assertEqual(hs[i]['ips'], LAN8)                                # bootstrap over the LAN
+            self.assertIn(f'routes sha {want.sha}', read(os.path.join(self.homes[i], 'out', 'supervisor.log')))
+            a = self.stub(i)['argv']
+            self.assertEqual(a[:4], ['--hybrid', '--fab-routes', 'run/routes.txt', '--fab-ports'])
+            self.assertEqual(a[4], fab_ports8(i))
+            self.assertEqual(a[a.index('--ips') + 1], ','.join(LAN8))
+            self.assertEqual(self.stub(i)['env']['G6_PF_OWN'], '3')
+            self.assertEqual(self.stub(i)['cwd'], self.homes[i])
+            self.assertEqual(a[a.index('--cap') + 1], '65536')
+        self.assertEqual(len({x['opts_digest'] for x in hs}), 1)
+        self.assertEqual(len(want.relay), 20)
+        for name in ('front', 'shim'):        # the live affinity, not the argv: pinned off the proxy and relay cores
+            pid = int(read(os.path.join(self.homes[0], 'out', f'{name}.pid')))
+            aff = subprocess.run(['taskset', '-cp', str(pid)], capture_output=True, text=True).stdout
+            self.assertTrue(aff.strip().endswith(': 0-10'), (name, aff))
+        rec = json.loads(read(os.path.join(self.homes[3], 'out', 'g6m4.id')))
+        self.assertEqual(rec['cwd'], self.homes[3])
+        dn = self.gr8(5, 'down', timeout=90)
+        self.assertEqual(dn.returncode, 0, dn.stdout + dn.stderr)
+        for i in range(TP8):                    # a successful down is checked, not trusted
+            for _ in range(200):
+                v = self.gr8(i, 'verify-down')
+                if v.returncode == 0:
+                    break
+                time.sleep(0.1)
+            self.assertEqual(v.returncode, 0, f'box {i}: {v.stdout}{v.stderr}')
+            self.assertIn('down, verified', v.stdout)
+
+    def test_a_deny_relays_and_an_unroutable_table_refuses_every_box(self):
+        res = self.up_all(extra={i: ['--fab-deny', '5-6'] for i in range(TP8)})
+        for i, (rc, out) in enumerate(res):   # 6 keeps rank 7 as its only neighbour: rank 1 has none in common
+            self.assertEqual(rc, 4, f'box {i}:\n{out}')
+            self.assertIn('handshake refused: routes: no route between rank 1 (127.0.0.2) and rank 6 (127.0.0.7)', out)
+        for h in self.homes:
+            self.assertFalse(os.path.exists(os.path.join(h, 'out', 'stub.json')))   # no engine started
+
+    def test_the_control_port_must_be_the_clusters_own(self):
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), 'up', *self.argv(0, control=7340)],
+                           env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--control-port 7340: that is the serves' default control port", r.stderr)
+        args = [a for a in self.argv(0) if a not in ('--control-port', str(self.port))]
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), 'up', *args], env=self.env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('--shape hybrid needs its own --control-port', r.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
