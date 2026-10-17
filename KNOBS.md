@@ -68,6 +68,9 @@ manifest instead.
 | `QA_SPLIT` | on (2) when TP>1 | unset (0) | unset (0) | decode: the layer-input GEMVs split by output tiles across the ranks and all-gathered (`G6_QA_SPLIT`, 1 or 2; bit-exact). Measured at TP=4 only |
 | `IDXQ_SPLIT` | on (1) when TP>1 | unset (0) | unset (0) | decode: the indexer's wq_b split the same way (`G6_IDXQ_SPLIT`; bit-exact) |
 | `MTP_SPLIT` | on (1) when TP>1 + MTP | unset (0) | unset (0) | MTP draft steps: eh_proj and the draft layer's input GEMVs split the same way (`G6_MTP_SPLIT`; bit-exact) |
+| `DRAFT_HEAD_I4` | unset (0) | unset (0) | unset (0) | 1 = the MTP draft's lm_head on INT4 g32 copies made at boot (`G6_DRAFT_HEAD_I4`; drafts only, +134 MB a rank at TP=4) |
+| `DFL_HEAD_I4` | unset (0) | – | – | 1 = the DFlash2 drafter's lm_head on the same INT4 records (`G6_DFL_HEAD_I4`; drafts only). Needs `DFLASH=1` |
+| `DFL_BODY_I4` | unset (0) | – | – | 1 = the DFlash2 drafter's body GEMVs on INT4 g32 copies (`G6_DFL_BODY_I4`; drafts only, +382 MB a rank). Needs `DFLASH=1` |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

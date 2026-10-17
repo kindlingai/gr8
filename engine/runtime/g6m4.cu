@@ -514,6 +514,21 @@ int main(int argc, char** argv)
                 gc.ncoll, gc.slot_bytes, 2.0 * gc.ncoll * (1 + cfg.ips.size()) * ((gc.slot_bytes + 8 + 255) & ~size_t(255)) / 1e6, gc.proxy_cpu);
     };
     auto qs_err = [&]() -> unsigned { return (fabg_on ? *fabg.dev().error : 0u) | (fabdg_on ? *fabdg.dev().error : 0u); };   // the gather proxies' own error words
+    // G6_DRAFT_HEAD_I4=1 (rank.cuh build_draft_head_i4; default 0): the MTP draft's head reads INT4 g32 records of the
+    // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature.
+    const DraftHeadI4 dhead = draft_head_i4_env();
+    if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+    // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
+    // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
+    std::string dfe;
+    const int dfl_i4 = env_choice("G6_DFL_HEAD_I4", 1, 0, &dfe);
+    if (dfl_i4 < 0) die(dfe);
+    if (dfl_i4 && !dfl) die("G6_DFL_HEAD_I4=1 needs --dflash-manifest");
+    // G6_DFL_BODY_I4=1 (dflash.cuh dfl_body_i4; default 0): the DFlash2 drafter's body GEMVs read INT4 g32 copies of their
+    // MXFP8 records. Drafts only; +382 MB per rank. In the S2 runtime signature
+    const int dfl_body_i4_on = env_choice("G6_DFL_BODY_I4", 1, 0, &dfe);
+    if (dfl_body_i4_on < 0) die(dfe);
+    if (dfl_body_i4_on && !dfl) die("G6_DFL_BODY_I4=1 needs --dflash-manifest");
 #if defined(G6_CP) && G6_CP
     // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
@@ -728,6 +743,7 @@ int main(int argc, char** argv)
             fabdg_on = true;
             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
         }
+        build_draft_head_i4(D, dhead, st);
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
@@ -749,6 +765,10 @@ int main(int argc, char** argv)
         // G6_DFL_PFCTX=0 (measurement): the drafter gets no prompt context from the prefill and starts at the last prompt token
         const bool pfctx = MP && !(getenv("G6_DFL_PFCTX") && atoi(getenv("G6_DFL_PFCTX")) == 0);
         dfl_build(DF, m, dfind, meta, fabf.dev(), dmalloc<u64>(1), dfl_sel < 0 ? meta.sel : dfl_sel == 1, st, pfctx);
+        if (dfl_i4)
+            dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
+                        dhead.tpc, dhead.ks);
+        if (dfl_body_i4_on) dfl_body_i4(DF, st);
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
     }
@@ -1336,7 +1356,11 @@ int main(int argc, char** argv)
                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
                 (draft_par ? " draftpar " + std::to_string(draft_par) : "") +
                 (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
-                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "");
+                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (dfl_body_i4_on ? " dflbodyi4 1" : "");
+
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
