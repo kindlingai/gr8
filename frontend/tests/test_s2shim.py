@@ -85,6 +85,7 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(g6s2shim.parse_ready('G6S2 2 7 6 20000 2 4 8 20\n')['max_lp'], 20)
         self.assertFalse(g6s2shim.parse_ready('G6S2 2 7 6 20000 2 4 8 20\n')['insert'])
         self.assertTrue(g6s2shim.parse_ready('G6S2 3 7 6 20000 2 4 8 20\n')['insert'])
+        self.assertEqual(g6s2shim.parse_ready('G6S2 3 7 8 20000 2 4 8 20\n')['ranks'], 8)   # TP8: no fixed-width rank guard
         v4 = 'G6S2 4 7 4 20000 2 4 8 20 example ' + 'a' * 64 + ' full 48 0 0'
         c = g6s2shim.parse_ready(v4 + '\n')
         self.assertTrue(c['insert'])
