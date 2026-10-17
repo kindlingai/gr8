@@ -126,3 +126,5 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 # host memory after load (#4): the /proc parser and malloc_trim (glibc)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$T/host_reclaim_test"
 "$T/host_reclaim_test"
+# the TP8 arm of the engine defaults
+"$REPO/scripts/engine_args_tp8_test.sh"

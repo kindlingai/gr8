@@ -2,7 +2,7 @@
 # the per-box supervisor (tools/launch) source this file, so the ssh launchers and `./gr8 glm53 up` start the same engine. KNOBS.md lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
-#   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP. An unset CAP
+#   engine_defaults          needs TP (4, 6, 3 or 8); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words), and ENGINE_BIN, the
 #                            engine under bin/ for KV_FORMAT (g6m4, or g6m4-int4 for int4)
@@ -52,7 +52,12 @@ engine_defaults() {
     3) SHARE_LIMIT=${SHARE_LIMIT:-65536}; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
-    *) echo "engine_defaults: TP=$TP; want 4, 6 or 3" >&2; return 2 ;;
+    8) [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=8: no TP8 int4 page count; TP=8 is fp8 only" >&2; return 2; }
+       KV_FORMAT=fp8; SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-65536}; READY_TMO=${READY_TMO:-3600}; MTP=${MTP:-2}; SESS=${SESS:-8}
+       S2PORT=${S2PORT:-7341}   # CAP 65536 at SHARE_LIMIT 32768 = 576 pages a rank (not boot-proven)
+       [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=8: no TP8 drafter packs" >&2; return 2; }
+       DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
+    *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 8" >&2; return 2 ;;
   esac
 }
 
