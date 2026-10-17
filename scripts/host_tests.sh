@@ -34,6 +34,9 @@ python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the fabric pool (engine/comms/fabric_pool.h, #154): boot, groups and their ports over loopback, no leaked descriptor
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_pool_test.cpp" -o "$T/fabric_pool_test"
 "$T/fabric_pool_test"
+# G6_XTRACE proxy stamps: every rail index of a ring or hybrid fabric in bounds (engine/comms/xtrail.h)
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/xtrail_test.cpp" -o "$T/xtrail_test"
+"$T/xtrail_test"
 # the Rust page allocator (engine/kvman-rs) that s2/pool.h wraps, built here where cargo is on the PATH
 KV=$REPO/engine/kvman-rs/target/release/libg6kvman.a
 if command -v cargo > /dev/null 2>&1; then

@@ -5,6 +5,7 @@
 #include "progress_cpus.h"
 #include "relay.h"
 #include "xtrace.h"
+#include "xtrail.h"
 
 #include <cuda_runtime.h>
 #include <infiniband/verbs.h>
@@ -380,13 +381,13 @@ struct Fabric::Impl {
   // G6_XTRACE (xtrace.h). xenv: env on (WC error counters dumped for every fabric); xt: proxy stamps on this fabric
   bool xenv = false, xt = false, xdumped = false;
   unsigned long long* xgpu = nullptr;                // device records (dev_.xt), cudaMalloc'd
-  std::vector<uint64_t> xp;                          // [XT_STEPS][ncoll][2 rails][4]: db seen, tail stored, first, last post
+  std::vector<uint64_t> xp;                          // [XT_STEPS][ncoll][XT_RAILS][4]: db seen, tail stored, first, last post (xtrail.h)
   std::vector<unsigned long long> xpseq;             // [XT_STEPS][ncoll] seq of the proxy record
-  unsigned long long xwc[2][8][3] = {};              // [rail][peer][retry-exceeded, rnr-exceeded, other bad status]
+  unsigned long long xwc[XT_WC_RAILS][XT_WC_PEERS][3] = {};   // [rail][peer][retry-exceeded, rnr-exceeded, other bad status]
   int bump = 1;                                      // barrier port rotation (per fabric: groups run their own barriers)
   std::thread xquit;                                 // G6_XTRACE_QUIT watcher
   void wc_count(int r, int peer, int st) {
-    if (peer < 0 || peer >= 8 || r < 0 || r > 1) return;
+    if (peer < 0 || peer >= XT_WC_PEERS || r < 0 || r >= XT_WC_RAILS) return;
     xwc[r][peer][st == IBV_WC_RETRY_EXC_ERR ? 0 : st == IBV_WC_RNR_RETRY_EXC_ERR ? 1 : 2]++;
   }
 };
@@ -505,7 +506,7 @@ void Fabric::init(const FabricConfig& cfg) {
   if (cfg.xtrace && !I.var && xtrace_env()) {        // stage-0 trace (default off)
     I.xgpu = xt_alloc(cfg_.ncoll); dev_.xt = I.xgpu;
     I.xt = I.xgpu != nullptr;
-    I.xp.assign((size_t)XT_STEPS * cfg_.ncoll * 2 * 4, 0); I.xpseq.assign((size_t)XT_STEPS * cfg_.ncoll, 0);
+    I.xp.assign(xt_stamps((size_t)XT_STEPS * cfg_.ncoll), 0); I.xpseq.assign((size_t)XT_STEPS * cfg_.ncoll, 0);
     fprintf(stderr, "[fabric r%d] G6_XTRACE on: %d steps x %d collectives, GPU %s\n", cfg.rank, XT_STEPS, cfg_.ncoll, I.xt ? "ok" : "FAILED");
   }
   }
@@ -902,8 +903,8 @@ void Fabric::start_proxy() {
         uint64_t* xr = nullptr;                         // G6_XTRACE proxy record of (step, c): [rail][4]
         if (I.xt) {
           const size_t k = (size_t)(job.step % XT_STEPS) * cfg_.ncoll + c;
-          xr = &I.xp[k * 8]; for (int z = 0; z < 8; z++) xr[z] = 0;
-          xr[0] = xr[4] = xt_tick(); I.xpseq[k] = seq;
+          xr = &I.xp[xt_at(k, 0, 0)]; for (int z = 0; z < XT_REC; z++) xr[z] = 0;
+          xr[0] = xr[XT_TICKS] = xt_tick(); I.xpseq[k] = seq;
         }
         if (I.var) {  // variable layout: own slot, all peers (compact slots) or one destination
           const VLayout& L = I.L;
@@ -927,7 +928,7 @@ void Fabric::start_proxy() {
         const uint32_t bytes = job.sizes[c];
         char* src = dev_.send + ((size_t)par * cfg_.ncoll + c) * dev_.stride;
         if (!rs) *(volatile unsigned long long*)(src + bytes) = seq;  // tail travels with the payload in one write
-        if (xr) xr[1] = xr[5] = xt_tick();
+        if (xr) xr[1] = xr[XT_TICKS + 1] = xt_tick();
         for (int p = 0; p < nr; p++) {
           if (p == me || (rs && bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
           Rail& R = I.rails[I.rail_of(p, me)];
@@ -946,10 +947,10 @@ void Fabric::start_proxy() {
           bool sig = (I.unsignaled[p] += I.wrs(p, wr)) >= 256; if (sig) I.unsignaled[p] = 0;
           wr.send_flags = sig ? IBV_SEND_SIGNALED : 0;
           wr.wr_id = (uint64_t)p;                       // peer, for the per-QP WC error counters
-          const int xrl = I.rail_of(p, me) > 1 ? 1 : I.rail_of(p, me);   // trace keeps two rails; ring mode folds the relay rail into 1
-          if (xr && !xr[xrl * 4 + 2]) xr[xrl * 4 + 2] = xt_tick();
+          const int xrl = xt_rail(I.rail_of(p, me));    // trace keeps two rails; ring and hybrid fold rails 1..3 into 1
+          if (xr && !xr[xrl * XT_TICKS + 2]) xr[xrl * XT_TICKS + 2] = xt_tick();
           (void)bad; I.post(p, wr);
-          if (xr) xr[xrl * 4 + 3] = xt_tick();
+          if (xr) xr[xrl * XT_TICKS + 3] = xt_tick();
         }
         }
         for (int r = 0; r < I.nrails; r++) {
@@ -1005,7 +1006,7 @@ void Fabric::xtrace_dump(const char* why) {
   fprintf(o, "# g6xtrace v1 why=%s rank=%d nr=%d ncoll=%d nrails=%d bulk=%d steps=%d cntfrq=%llu stamps=%d\n", why, cfg_.rank, I.nr,
           cfg_.ncoll, I.nrails, (int)I.bulk, XT_STEPS, (unsigned long long)fq, (int)I.xt);
   fprintf(o, "# W rail peer retry_exc rnr_exc other\n");
-  for (int r = 0; r < 2; r++) for (int p = 0; p < 8; p++)
+  for (int r = 0; r < XT_WC_RAILS; r++) for (int p = 0; p < XT_WC_PEERS; p++)
     if (I.xwc[r][p][0] | I.xwc[r][p][1] | I.xwc[r][p][2]) fprintf(o, "W %d %d %llu %llu %llu\n", r, p, I.xwc[r][p][0], I.xwc[r][p][1], I.xwc[r][p][2]);
   if (I.xt) {
     auto ns = [&](uint64_t a, uint64_t b) -> long long { return (a && b && fq) ? (long long)((double)(int64_t)(a - b) * 1e9 / (double)fq) : 0LL; };
@@ -1013,8 +1014,8 @@ void Fabric::xtrace_dump(const char* why) {
     for (size_t k = 0; k < I.xpseq.size(); k++) {
       if (!I.xpseq[k]) continue;
       const unsigned long long step = (I.xpseq[k] - 1) / cfg_.ncoll; const int c = (int)((I.xpseq[k] - 1) % cfg_.ncoll);
-      for (int r = 0; r < I.nrails; r++) {
-        const uint64_t* x = &I.xp[k * 8 + r * 4];
+      for (int r = 0; r < xt_dump_rails(I.nrails); r++) {   // the stamps hold two rails (xtrail.h), whatever nrails is
+        const uint64_t* x = &I.xp[xt_at(k, r, 0)];
         if (!x[2]) continue;                         // no post on this rail
         fprintf(o, "P %llu %d %d %llu %llu %llu %llu | %lld %lld %lld\n", step, c, r, (unsigned long long)x[0], (unsigned long long)x[1],
                 (unsigned long long)x[2], (unsigned long long)x[3], ns(x[1], x[0]), ns(x[2], x[0]), ns(x[3], x[0]));
