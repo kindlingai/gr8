@@ -102,23 +102,26 @@ int main() {
     });
     CHECK(threw >= 2);                                  // the odd box and the head; box 1 may time out or be refused
   }
-  // 5. groups created and dropped in a loop: no descriptor grows, and the announce and the follow stay in step
+  // 5. groups created and dropped in a loop: no descriptor grows while the pool runs, none is left after close, and the
+  //    announce and the follow stay in step. The head samples while every other box waits for the next group (it has
+  //    taken the last one, or announce would not have returned).
   {
     const int n = 4, loops = 2000;
-    std::vector<int> fds_after(n, 0);
-    int fds_before = 0;
+    const int fds_start = open_fds();
+    int fds_early = 0, fds_late = 0;
     boxes(n, [&](int i) {
       FabricPool p; p.init(pool(n, i, base_port + 4));
       for (int k = 0; k < loops; k++) {
         const std::vector<int> L = k % 3 == 0 ? std::vector<int>{0, 1, 2, 3} : k % 3 == 1 ? std::vector<int>{1, 2, 3} : std::vector<int>{3, 0};
         const Group g = i == 0 ? p.announce(L) : p.follow(20000);
         if (g.members != L || g.id != (uint64_t)k + 1) { fails++; return; }
-        if (i == 0 && k == 10) fds_before = open_fds();
+        if (i == 0 && k == 10) fds_early = open_fds();
+        if (i == 0 && k == loops - 2) fds_late = open_fds();
       }
-      if (i == 0) fds_after[0] = open_fds();
       p.close();
     });
-    CHECK(fds_before > 0 && fds_after[0] == fds_before);
+    CHECK(fds_early > fds_start && fds_late == fds_early);   // the pool's links, and nothing more per group
+    CHECK(open_fds() == fds_start);                          // close drops every link
   }
   // 6. close: a box waiting for a group learns that the pool closed
   {
