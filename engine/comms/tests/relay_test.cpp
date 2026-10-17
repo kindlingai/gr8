@@ -98,6 +98,45 @@ static void forward_drain_advances_the_credit() {
   CHECK(in_flight == 0 && batches.empty() && done == 99);
 }
 
+// Hybrid origin (fabric.cpp FabricConfig::hybrid): one RelayOut + credit per relayed destination, each into its own
+// relay ring. Five destinations interleave at random; one of them never gets a credit. Every route keeps its own bytes
+// safe and in order, and the stalled route never takes room from the other four.
+static void per_route(unsigned seed) {
+  const uint64_t ring = 1 << 16;
+  const int routes = 5, msgs = 4000;
+  std::mt19937 rng(seed);
+  struct R { RelayOut out; std::vector<uint32_t> mem; std::deque<Msg> wire; uint64_t done = 0; int sent = 0, fwd = 0; uint32_t want = 1; };
+  std::vector<R> r(routes);
+  for (auto& x : r) x.mem.assign(ring / 4, 0);
+  const int stalled = (int)(seed % routes);
+  int refused_stalled = 0;
+  for (int it = 0; it < 400000; it++) {
+    const int d = (int)(rng() % routes);
+    R& x = r[d];
+    if (rng() % 2 == 0 && x.sent < msgs) {
+      const uint32_t len = 4 * (1 + rng() % (8192 / 4));
+      uint64_t at;
+      if (x.out.reserve(len, ring, x.done, &at)) {
+        CHECK(at % ring + relay_pad(len) <= ring);
+        const uint32_t tag = (uint32_t)++x.sent;
+        for (uint64_t b = 0; b < len; b += 4) x.mem[(at % ring + b) / 4] = tag;
+        x.wire.push_back({at, len, tag});
+      } else if (d == stalled) refused_stalled++;
+    } else if (!x.wire.empty() && d != stalled) {
+      const Msg m = x.wire.front(); x.wire.pop_front();
+      CHECK(m.tag == x.want++);
+      for (uint64_t b = 0; b < m.len; b += 4) CHECK(x.mem[(m.at % ring + b) / 4] == m.tag);
+      x.done = m.at + relay_pad(m.len);
+      x.fwd++;
+    }
+  }
+  for (int d = 0; d < routes; d++) {
+    if (d == stalled) { CHECK(r[d].fwd == 0 && r[d].out.pos - r[d].done <= ring && refused_stalled > 0); continue; }
+    CHECK(r[d].sent == msgs && r[d].fwd >= msgs - (int)r[d].wire.size());
+    CHECK(r[d].out.pos >= r[d].done);
+  }
+}
+
 int main() {
   for (unsigned s = 1; s <= 20; s++) credits(4096, 1024, 3000, s);
   credits(4096, 4096, 3000, 77);            // a payload as long as the ring
@@ -105,6 +144,7 @@ int main() {
   credit_backpressure();
   credit_small_capacity_signals_at_the_limit();
   forward_drain_advances_the_credit();
+  for (unsigned s = 1; s <= 10; s++) per_route(s);
   if (fails) { fprintf(stderr, "%d failures\n", fails); return 1; }
   printf("relay_test: OK\n");
   return 0;

@@ -169,7 +169,7 @@ void check_qp_mtu(ibv_qp* qp, const Rail& R, const QPInfo& peer, ibv_mtu selecte
 // That rank's relay thread writes it on to its own next rank, at the offset a direct write would have used, and writes
 // the origin a credit once the forward has completed. One QP chain per origin keeps a payload ahead of its tail and the
 // bulk ranges ahead of their flags. Writes of up to kRelayInline bytes (the bulk flags) travel inside the SEND.
-struct RelayHdr { uint64_t off, pos; uint32_t len, kind; };   // kind 0: len bytes at ring position pos; 1: inline
+// RelayHdr (relay.h): kind 0: len bytes at ring position pos; 1: inline. A hybrid route packs (dst, src) into kind.
 constexpr int kRelayRecv = 4096, kRelayBuf = 64, kRelayInline = kRelayBuf - (int)sizeof(RelayHdr);
 struct RingInfo { QPInfo dn, dp, orq, ri, fwd, fin; };        // my QPs; addr/rkey = where the paired QP writes
 struct RelayCtx {
@@ -181,6 +181,7 @@ struct RelayCtx {
   int unsig = 0, inflight = 0; std::deque<int> batches;
   RelayCreditQueue credits; unsigned credit_sq_capacity = 0;
   std::string ri_dev;
+  bool hybrid = false; int src = -1, dst = -1;            // hybrid: the one route src->dst this context relays
 };
 std::mutex g_relay_mu;
 // Live verbs objects and pinned bytes of mesh fabrics (fabric_live(); the leak gate of #154). Ring fabrics are counted
@@ -189,7 +190,7 @@ std::atomic<long> g_live[7];   // fabrics, qps, mrs, cqs, pds, ctxs, pinned_byte
 enum { kLiveFab, kLiveQp, kLiveMr, kLiveCq, kLivePd, kLiveCtx, kLivePinned };
 std::atomic<long> g_live_ring{0};
 inline void live(int k, long d) { g_live[k].fetch_add(d, std::memory_order_relaxed); }
-RelayCtx* g_relay[32]; std::atomic<int> g_nrelay{0};
+RelayCtx* g_relay[kRelayMaxContexts]; std::atomic<int> g_nrelay{0};
 bool g_relay_started = false;
 
 int ring_gid_index(const std::string& dev) {
@@ -260,21 +261,34 @@ void relay_loop(int cpu) {
         const int slot = (int)wc[i].wr_id;
         char* buf = c.rbuf + (size_t)slot * kRelayBuf;
         RelayHdr h; memcpy(&h, buf, sizeof h);
-        // an inline write is at most what follows the header in its 64-byte slot; more would read past the slot
-        if (h.kind > 1 || (h.kind == 1 && h.len > (uint32_t)kRelayInline)) {
+        // an inline write is at most what follows the header in its 64-byte slot; more would read past the slot. A hybrid
+        // header must name this context's route; hk is the decoded kind, used for every kind test below
+        uint32_t hk = 0;
+        if (!relay_header_ok(h, c.hybrid, c.src, c.dst, wc[i].byte_len, (uint32_t)kRelayInline, kRelayChunk, &hk)) {
           fail(c, "relay header", (int)h.len); break;
         }
-        while (c.inflight >= 1800 && !*c.err) {            // forward queue full: reap
-          ibv_wc f; const int r = ibv_poll_cq(c.fwd_cq, 1, &f);
-          if (r < 0 || (r == 1 && f.status != IBV_WC_SUCCESS)) { fail(c, "forward drain", r < 0 ? -1 : f.status); break; }
-          if (r == 1) relay_forward_completed(c.inflight, c.batches, f.wr_id, c.done);
+        if (c.inflight >= 1800) {                            // forward queue full: reap, with a progress deadline
+          auto t0 = std::chrono::steady_clock::now();
+          while (c.inflight >= 1800 && !*c.err) {
+            ibv_wc f; const int r = ibv_poll_cq(c.fwd_cq, 1, &f);
+            if (r < 0 || (r == 1 && f.status != IBV_WC_SUCCESS)) { fail(c, "forward drain", r < 0 ? -1 : f.status); break; }
+            if (r == 1) { relay_forward_completed(c.inflight, c.batches, f.wr_id, c.done); t0 = std::chrono::steady_clock::now(); continue; }
+            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > relay_drain_stall_s) {
+              // the forward CQ made no progress: fail this Fabric, so the one relay thread serves the other contexts
+              fprintf(stderr, "[fabric r%d] relay forward queue full with no completion for %.1f s (route %d->%d, %d in flight)\n",
+                      c.rank, relay_drain_stall_s, c.src, c.dst, c.inflight);
+              __sync_val_compare_and_swap(c.err, 0u, 0x75000002u);
+              break;
+            }
+          }
+          if (*c.err) break;
         }
         ibv_sge sge;
         ibv_send_wr w{}, *bad = nullptr; w.sg_list = &sge; w.num_sge = 1; w.opcode = IBV_WR_RDMA_WRITE;
         w.wr.rdma.remote_addr = c.fin_addr + h.off; w.wr.rdma.rkey = c.fin_rkey;
-        if (h.kind == 1) { sge = ibv_sge{(uint64_t)(buf + sizeof h), h.len, 0}; w.send_flags = IBV_SEND_INLINE; }
+        if (hk == 1) { sge = ibv_sge{(uint64_t)(buf + sizeof h), h.len, 0}; w.send_flags = IBV_SEND_INLINE; }
         else { sge = ibv_sge{(uint64_t)(c.ring + h.pos % kRelayRing), h.len, c.ring_lkey}; w.wr_id = h.pos + relay_pad(h.len); }
-        const bool sig = ++c.unsig >= 64 || h.kind == 0;     // every ring forward reports its end position
+        const bool sig = ++c.unsig >= 64 || hk == 0;         // every ring forward reports its end position
         if (sig) { w.send_flags |= IBV_SEND_SIGNALED; c.batches.push_back(c.unsig); c.unsig = 0; }
         ++c.inflight;
         if (ibv_post_send(c.fwd, &w, &bad) != 0) { fail(c, "forward post", -1); break; }
@@ -605,7 +619,7 @@ void Fabric::init(const FabricConfig& cfg) {
       X.err = I.err = dev_.error; X.rank = me;
       X.ri_dev = I.rails[3].di.dev;
       std::lock_guard<std::mutex> lk(g_relay_mu);
-      const int k = g_nrelay.load(); FCHECK(k < 32);
+      const int k = g_nrelay.load(); FCHECK(k < (int)kRelayMaxContexts);
       g_relay[k] = &X; g_nrelay.store(k + 1, std::memory_order_release);
       if (!g_relay_started) { g_relay_started = true; std::thread(relay_loop, cfg.relay_cpu).detach(); }
     }
