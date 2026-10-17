@@ -418,6 +418,70 @@ class ConcurrentStreams(S2Base):
         self.assertTrue(os.path.exists(os.path.join(self.dirs[0], 'cmd.3')))
 
 
+class RequestMetrics(S2Base):
+    FAKE = ('--prefill-ms', '60', '--round-ms', '20')
+    SHIM = ('--sessions', '6')
+
+    async def metrics(self, c, seq):
+        c.send({'type': 'metrics', 'seq': seq})
+        return await asyncio.wait_for(c.metrics.get(), 5)
+
+    async def test_timing_kv_and_concurrency(self):
+        c = await self.client()
+        m0 = await self.metrics(c, 1)
+        self.assertEqual(m0['kv'], {'size_tokens': 20000, 'max_concurrency': 6, 'active_tokens': 0})
+        self.assertEqual(m0['latency']['ttft_count'], 0)
+        self.assertNotIn('cached', m0['tokens'])   # an engine that does not report reuse: no cached figure at all
+        self.assertNotIn('prefix_cache', m0)
+        prompt, n = list(range(100, 164)), 40
+        c.send(gen('r1', prompt, max_tokens=n))
+        await asyncio.sleep(0.4)                    # mid-request: the run's pages are reserved
+        mid = await self.metrics(c, 2)
+        self.assertGreater(mid['kv']['active_tokens'], 0)
+        self.assertEqual(mid['kv']['active_tokens'] % 64, 0)
+        ids, fin, _ = await c.wait('r1')
+        m = await self.metrics(c, 3)
+        lat = m['latency']
+        self.assertEqual(lat['ttft_count'], 1)
+        self.assertGreaterEqual(lat['ttft_sum'], 0.05)               # the fake engine's prefill takes 60 ms
+        self.assertLess(lat['ttft_sum'], 2.0)
+        self.assertGreaterEqual(lat['prefill_sum'], 0.05)
+        self.assertLessEqual(lat['prefill_sum'], lat['ttft_sum'] + 1e-6)   # admission is never before arrival
+        self.assertGreater(lat['decode_sum'], 0.1)                   # n tokens at ~3 per 20 ms round
+        self.assertEqual(lat['prefill_tokens_sum'], len(prompt))     # no reuse reported: the whole prompt
+        self.assertEqual((lat['gen_tokens_sum'], lat['gen_tokens_count']), (n, 1))
+        self.assertEqual(lat['itl_count'], n - 1)                    # the tokens after the first
+        self.assertGreater(lat['itl_sum'], 0)
+        self.assertLessEqual(lat['itl_sum'], lat['decode_sum'] + 1e-6)
+        self.assertEqual(m['kv']['active_tokens'], 0)                # the run is back in the pool
+
+    async def test_a_cancelled_request_before_its_first_token_adds_no_timing(self):
+        c = await self.client()
+        c.send(gen('r1', [1, 2, 3], max_tokens=500))
+        c.send({'type': 'cancel', 'id': 'r1'})
+        await c.wait('r1')
+        m = await self.metrics(c, 1)
+        lat = m['latency']
+        if lat['ttft_count'] == 0:
+            self.assertEqual((lat['gen_tokens_count'], lat['decode_sum'], lat['prefill_tokens_sum']), (0, 0.0, 0))
+
+
+class ReportedReuse(S2Base):
+    FAKE = ('--report-reuse', '2')
+
+    async def test_cached_tokens_come_from_the_engine(self):
+        c = await self.client()
+        for i in range(2):
+            c.send(gen(f'r{i}', [5, 6, 7, 8], max_tokens=10))
+            _, fin, _ = await c.wait(f'r{i}')
+            self.assertEqual(fin['cached_tokens'], 2)
+        c.send({'type': 'metrics', 'seq': 1})
+        m = await asyncio.wait_for(c.metrics.get(), 5)
+        self.assertEqual(m['tokens'], {'prompt': 8, 'generation': 20, 'cached': 4})
+        self.assertEqual(m['prefix_cache'], {'queries': 8, 'hits': 4})
+        self.assertEqual(m['latency']['prefill_tokens_sum'], 4)    # 2 requests x (4 prompt - 2 reused)
+
+
 class InsertTests(S2Base):
     async def test_insert_replaces_the_token_after_the_rule(self):
         c = await self.client()
