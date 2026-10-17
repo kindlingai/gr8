@@ -51,7 +51,7 @@ public:
     }
     void applied() {
         std::lock_guard<std::mutex> l(mu_);require(notice_ && commit_ && !failed_,"apply without event commit");
-        gate_.applied(*notice_);notice_.reset();commit_.reset();ack_.reset();cv_.notify_all();
+        gate_.applied(*notice_,commit_->hold);notice_.reset();commit_.reset();ack_.reset();cv_.notify_all();
     }
     // Compute thread, every rank at the same point with the same seq (1, 2, ...): return once every rank has arrived. For
     // host work whose time differs by rank (a tier's copies) before GPU work that waits for peers with a timeout.

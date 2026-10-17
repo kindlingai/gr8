@@ -41,12 +41,12 @@ struct Config {
     uint64_t epoch = 1;
     uint32_t pool_rows = 614400, max_rows = 24, max_sessions = 8, mtp = 2;
     uint32_t guard_tokens = UINT32_MAX, prefill_rows = 4096;
+    bool two_lanes = true;
+    g6rt::steering::BootConfig steering{};
     // While any session decodes, a prefill quantum takes at most this many rows on one lane, so a decode round comes
     // round sooner (each round waits out one prefill quantum). 0 = off: the full prefill_rows x lanes quantum, as before.
     // A multiple of PAGE, at most prefill_rows (native.cuh prefill: lane A takes up to prefill_rows rows).
-    uint32_t decode_prefill_rows = 0;
-    bool two_lanes = true;
-    g6rt::steering::BootConfig steering{};
+    uint32_t decode_prefill_rows = 0;   // last: tests build Config positionally
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
@@ -136,6 +136,10 @@ struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;
     std::optional<Key> cancel;
     std::optional<Grant> admit; // empty if FIFO head still cannot fit after reclaim
+    // hold (an admit only): every rank stays stopped at this boundary after applying, and the head's next notice names
+    // the SAME boundary (event_gate.h EventGate::applied), so queued admissions land one after another at one boundary
+    // instead of one per NOTICE_MIN boundaries. A commit without hold releases the boundary. Never read by apply().
+    bool hold = false;
 };
 struct Changes {
     std::vector<Run> freed;

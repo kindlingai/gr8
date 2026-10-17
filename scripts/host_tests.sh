@@ -68,6 +68,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
+# a held event boundary (Commit::hold): queued admissions chained at one boundary, three ranks on socket pairs
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_hold_test.cpp" -o "$T/control_hold_test"
+"$T/control_hold_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_state_test.cpp" "${KVLIB[@]}" -o "$T/steering_state_test"
 "$T/steering_state_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_transport_test.cpp" -o "$T/steering_transport_test"

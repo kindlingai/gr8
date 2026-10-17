@@ -96,6 +96,11 @@ class Service {
     // running -- the lookahead binding -- or merely waited for it, which is the scheduler's admission. Logs only: no
     // state, no digest and no behaviour change, so it can run on a serving build.
     const bool elog_ = ::getenv("G6_S2_EVENTLOG") && *::getenv("G6_S2_EVENTLOG") == '1';
+    // G6_S2_ADMIT_HOLD=1 (head only; the workers follow Commit::hold): an admission with another request queued behind it
+    // and a slot left holds its boundary, and the next admission is announced at that same boundary (event below), so a
+    // burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each behind
+    // 8,192-row prefill quanta). Default off: one admission per notice, as before.
+    const bool admit_hold_ = ::getenv("G6_S2_ADMIT_HOLD") && *::getenv("G6_S2_ADMIT_HOLD") == '1';
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
         stopping_.store(true); endpoint_->fail();
@@ -153,20 +158,24 @@ class Service {
         o << "}\n";
         atomic_file(c_.directory + "/status.s2", o.str());
     }
-    void event(const Command& command) { // CONTROL thread: never read Driver until ALL ACKs
-        const auto boundary = progress_.boundary.load(); // first: the horizon below is for this boundary or a later one
+    // held: the boundary every rank is stopped at after a commit with hold (Commit::hold); the notice names it, not a
+    // future one. Only event() itself passes it, at once after the held commit, so nothing else is announced between.
+    void event(const Command& command, std::optional<uint64_t> held = {}) { // CONTROL thread: never read Driver until ALL ACKs
+        const auto boundary = held ? *held : progress_.boundary.load(); // first: the horizon below is for this boundary or a later one
         const auto horizon = progress_.horizon.load();
         require(boundary <= uint64_t(INT64_MAX) - NOTICE_MAX, "event boundary overflow");
         // The notice lands at the first boundary whose work after the one in flight covers NOTICE_ROWS rows, so a
         // prefill no longer waits out eight ~6 s quanta for a propagation that takes milliseconds (#61); late notices
         // remain fatal. Clamped, so a torn read of the pair can only widen the target, never narrow it past the floor.
-        const auto target = std::clamp(horizon, boundary + NOTICE_MIN, boundary + NOTICE_MAX);
+        // A held boundary has no work in flight: every rank is stopped at it (event_gate.h before_work returns true).
+        const auto target = held ? *held : std::clamp(horizon, boundary + NOTICE_MIN, boundary + NOTICE_MAX);
         if (elog_)
             fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu)\n",
                     c_.rank, (unsigned long long)event_, command.admit ? "admit" : "cancel", (unsigned long long)command.request,
                     (unsigned long long)boundary, (unsigned long long)target, (unsigned long long)(target - boundary));
         Notice n{c_.scheduler.epoch, event_, target, command.request, command.hash,
                  command.admit ? EventKind::Admit : EventKind::Cancel};
+        bool hold = false;
         leader_->event(n, [&](uint64_t hash) {
             const auto& s = driver_->state(); // compute paused in boundary() until this commit
             Commit cm{n.epoch, n.event, n.boundary, hash, {}, {}};
@@ -201,11 +210,17 @@ class Service {
                 if (cm.admit) {
                     queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request);
                     spans_.erase(command.request); payloads_.erase(command.request);
+                    // another request queued and a slot left after this one: keep the ranks at this boundary for it
+                    hold = cm.hold = admit_hold_ && queue_.front() && live + 1 < c_.scheduler.limit();
                 }
             }
             return cm;
         }, command.admit ? &payloads_.at(command.request) : nullptr);
         require(event_ != UINT64_MAX, "event sequence exhausted"); ++event_; publish_status();
+        // Every rank is stopped at n.boundary and waits for a notice that names it (event_gate.h held_): announce the new
+        // FIFO head there now. Its commit holds again or releases (no grant, or nothing left to chain), so the chain
+        // ends within limit() admissions.
+        if (hold) { const auto next = commands_.at(queue_.front()->id); event(next, n.boundary); }
     }
     void controller() {
         uint64_t status_revision = UINT64_MAX;
