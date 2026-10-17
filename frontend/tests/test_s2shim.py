@@ -429,16 +429,18 @@ class RequestMetrics(S2Base):
     async def test_timing_kv_and_concurrency(self):
         c = await self.client()
         m0 = await self.metrics(c, 1)
-        self.assertEqual(m0['kv'], {'size_tokens': 20000, 'max_concurrency': 6, 'active_tokens': 0})
+        self.assertEqual(m0['kv'], {'size_tokens': 20000, 'max_concurrency': 6,
+                                    'active_tokens': 0, 'reserved_tokens': 0})
         self.assertEqual(m0['latency']['ttft_count'], 0)
         self.assertNotIn('cached', m0['tokens'])   # an engine that does not report reuse: no cached figure at all
         self.assertNotIn('prefix_cache', m0)
-        prompt, n = list(range(100, 164)), 40
+        prompt, n = list(range(100, 164)), 100
         c.send(gen('r1', prompt, max_tokens=n))
-        await asyncio.sleep(0.4)                    # mid-request: the run's pages are reserved
+        await asyncio.sleep(0.4)                    # mid-request: held pages differ from the reservation
         mid = await self.metrics(c, 2)
         self.assertGreater(mid['kv']['active_tokens'], 0)
         self.assertEqual(mid['kv']['active_tokens'] % 64, 0)
+        self.assertGreater(mid['kv']['reserved_tokens'], mid['kv']['active_tokens'])
         ids, fin, _ = await c.wait('r1')
         m = await self.metrics(c, 3)
         lat = m['latency']
@@ -454,6 +456,7 @@ class RequestMetrics(S2Base):
         self.assertGreater(lat['itl_sum'], 0)
         self.assertLessEqual(lat['itl_sum'], lat['decode_sum'] + 1e-6)
         self.assertEqual(m['kv']['active_tokens'], 0)                # the run is back in the pool
+        self.assertEqual(m['kv']['reserved_tokens'], 0)
 
     async def test_a_cancelled_request_before_its_first_token_adds_no_timing(self):
         c = await self.client()

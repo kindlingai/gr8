@@ -349,8 +349,10 @@ class Shim:
         st = self.status()
         if self.cfg:
             kv = {'size_tokens': self.cfg['pool_rows'], 'max_concurrency': self.a.sessions}
-            if st and isinstance(st.get('reserved_pages'), int):   # pool pages not free: the sessions' runs
-                kv['active_tokens'] = st['reserved_pages'] * PAGE
+            if st and isinstance(st.get('held_pages'), int):   # pages actually held by live runs, not their reservations
+                kv['active_tokens'] = st['held_pages'] * PAGE
+            if st and isinstance(st.get('reserved_pages'), int):
+                kv['reserved_tokens'] = st['reserved_pages'] * PAGE
             m['kv'] = kv
         if st:
             # the engine's own queue/pool/store status. The front ends read `scheduler` (g6:s2_* and g6:kv_store_*
