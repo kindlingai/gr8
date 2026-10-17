@@ -24,11 +24,16 @@ M_CANARY_HOST=b0; M_CANARY_CMD=true; M_CANARY_MD5=exit0
 T_BOXES=(b0); T_HEAD=b0; T_HOME=$S/tp8; T_ENV=$S/tp8.env; T_ENV_SHA=x; T_URL=x; T_UP=together
 T_CANARY_HOST=b0; T_CANARY_CMD=true; T_CANARY_MD5=exit0
 MEMCLEAN=true; MEMCLEAN_MD5=x; MEMCLEAN_PATH=x; PREP_CMD=true; VERIFY_WEIGHTS_CMD=true; ERR_RE=x
-B_P0=1; B_ARM=1; B_P1=1; B_P2=1; B_P3=1; B_P4=1; B_P5=1; B_P6=1; B_RESTORE=1; B_MARGIN=1
+B_P0=1; B_ARM=1; B_P1=1560; B_P2=1; B_P3=1; B_P4=1; B_P5=1; B_P6=1; B_RESTORE=1; B_MARGIN=1
 EOF
 bash "$REPO/scripts/tp8-window.sh" cmds "$S/w.conf" > "$S/cmds" || { bad "cmds"; exit 1; }
 row() { awk -F'\t' -v n="$1" '$1 == n {print $3}' "$S/cmds"; }
-run() { (cd / && timeout 120 bash -c "$1") > "$S/out" 2>&1; }
+# systemctl stub (this suite runs as any user; a non-root stop is refused, and the unit stop rightly fails closed on that):
+# answers as root's systemctl does for an absent unit: stop rc 5 "not loaded", list-units rc 0 and empty
+mkdir -p "$S/sbin"
+printf '#!/bin/bash\ncase $1 in stop) echo "Failed to stop $2: Unit $2 not loaded." >&2; exit 5 ;; list-units) exit 0 ;; esac\nexit 1\n' > "$S/sbin/systemctl"
+chmod +x "$S/sbin/systemctl"
+run() { (cd / && PATH="$S/sbin:$PATH" timeout 120 bash -c "$1") > "$S/out" 2>&1; }
 # the real wrapper
 (cd "$S/tp8" && ./gr8 glm53 --help > /dev/null) && ok "tp8 ./gr8 glm53 --help" || bad "tp8 ./gr8 glm53 --help"
 (cd "$S/main" && ./gr8 glm53 --help > /dev/null) && ok "main ./gr8 glm53 --help" || bad "main ./gr8 glm53 --help"
@@ -38,8 +43,13 @@ run() { (cd / && timeout 120 bash -c "$1") > "$S/out" 2>&1; }
 for n in tp8-stop T-stop; do
   c=$(row $n); run "$c"; rc=$?
   [ $rc = 0 ] && grep -q "^--local: stopping this box only" "$S/out" && grep -q "down, verified" "$S/out" \
+    && { [ $n = T-stop ] || grep -q "launch units tp8-up-RUNID.service: none running, verified" "$S/out"; } \
     && ok "$n: rc 0, down --local + verified [$c]" || { bad "$n: rc $rc"; cat "$S/out"; }
 done
+# a serve's unit stop row (its own barrier before the serve's stop): every attempt's unit, verified
+c=$(row T-unitstop); run "$c"; rc=$?
+[ $rc = 0 ] && grep -q "launch units tp8-T-up-RUNID-a\*.service: none running, verified" "$S/out" && ok "T-unitstop: rc 0, verified" \
+  || { bad "T-unitstop: rc $rc"; cat "$S/out"; }
 # the head down of a main serve (P1): the real main wrapper, exit 0
 c=$(row M-down); run "$c"; rc=$?
 [ $rc = 0 ] && grep -q "nothing was running" "$S/out" && ok "M-down (main head down): rc 0 [$c]" || { bad "M-down: rc $rc"; cat "$S/out"; }

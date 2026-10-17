@@ -42,9 +42,18 @@ EOF
   cat > "$M/bin/systemctl" <<'EOF'
 #!/bin/bash
 echo "systemctl $*" >> "$MOCK/calls"
-# a launch unit that does not stop (unit.stuck): list-units still shows it active
-[ "$1" = list-units ] && [ -e "$MOCK/unit.stuck" ] && echo "tp8-x.service loaded active running x"
+# a launch unit that does not stop (unit.stuck): list-units still shows it active; a failed query (unit.listfail:
+# list-units, unit.stopfail: stop) exits 1 like systemctl without a bus
+[ "$1" = list-units ] && [ -e "$MOCK/unit.listfail" ] && { echo "Failed to connect to bus (injected)" >&2; exit 1; }
+[ "$1" = stop ] && [ -e "$MOCK/unit.stopfail" ] && { echo "Failed to connect to bus (injected)" >&2; exit 1; }
+[ "$1" = list-units ] && { [ -e "$MOCK/unit.stuck" ] || { [ -e "$MOCK/unit.stuckA.${MOCK_HOST:-}" ] && [[ "$*" == *tp8-A-up-* ]]; }; } && echo "tp8-x.service loaded active running x"
 exit 0
+EOF
+  # cat stub: with cg.eio, a read under /sys/fs/cgroup fails with an I/O error (an existing but unreadable cgroup)
+  cat > "$M/bin/cat" <<'EOF'
+#!/bin/bash
+case "${1:-}" in /sys/fs/cgroup/*) [ -e "$MOCK/cg.eio" ] && { echo "cat: $1: Input/output error" >&2; exit 1; } ;; esac
+exec /bin/cat "$@"
 EOF
   # DETACH stub: logs the unit and runs its command in the foreground (the mock ups return at once)
   cat > "$M/bin/detach" <<'EOF'
@@ -115,7 +124,7 @@ PREP_CMD=true
 VERIFY_WEIGHTS_CMD=true
 ERR_RE=FAIL
 SERVE_HEALTH_S=5
-B_P0=1; B_ARM=1; B_P1=1; B_P2=1; B_P3=30; B_P4=1; B_P5=1; B_P6=1; B_RESTORE=1; B_MARGIN=1
+B_P0=1; B_ARM=1; B_P1=780; B_P2=1; B_P3=30; B_P4=1; B_P5=1; B_P6=1; B_RESTORE=1; B_MARGIN=1
 EOF
   cp "$W" "$T/rd/tp8-window.sh"
   echo run-test > "$T/rd/RUN_ID"
@@ -305,6 +314,32 @@ setup; cp "$M/canary.good" "$M/canary.src"; touch "$M/unit.stuck"
 restore
 grep -q 'NOT STOPPED' "$T/rd/restore.log" && ! grep -q 'glm53 down --local' "$M/calls" && ! grep -q '^detach' "$M/calls" \
   && [ -e "$T/rd/ALERT" ] && ok "unit not stopped: no down, no up, ALERT" || bad "unit not stopped: no down, no up, ALERT"
+
+# 17. v4.3 (precheck w2v42 B1): the unit stop fails closed: a failed list-units, a failed stop, an unreadable cgroup
+# are NOT VERIFIED (no down, no up, ALERT), never "none running"
+for f in unit.listfail unit.stopfail cg.eio; do
+  setup; cp "$M/canary.good" "$M/canary.src"; touch "$M/$f"
+  restore
+  grep -q 'NOT VERIFIED' "$T/rd/restore.log" && ! grep -q 'none running, verified' "$T/rd/restore.log" \
+    && ! grep -q 'glm53 down --local' "$M/calls" && ! grep -q '^detach' "$M/calls" && [ -e "$T/rd/ALERT" ] \
+    && ok "$f: NOT VERIFIED, no down, no up, ALERT" || bad "$f: NOT VERIFIED, no down, no up, ALERT"
+done
+# 18. v4.3 (precheck w2v42 B2): a serve's unit stop runs on ALL its boxes before its stop runs on ANY box
+setup; cp "$M/canary.good" "$M/canary.src"
+restore
+last=$(grep -n -F 'systemctl stop tp8-A-up-run-test-a*.service' "$M/calls" | tail -1 | cut -d: -f1)
+b=$(first 'gr8 b1 a glm53 down --local'); b2=$(grep -n 'a glm53 down --local' "$M/calls" | head -1 | cut -d: -f1)
+[ -n "$last" ] && [ -n "$b2" ] && [ "$last" -lt "$b2" ] && ok "serve: unit stop on all 4 boxes before the first box's stop" \
+  || bad "serve: unit stop on all 4 boxes before the first box's stop [$last $b2]"
+setup; cp "$M/canary.good" "$M/canary.src"; touch "$M/unit.stuckA.b3"; restore   # serve A's unit stuck on ONE of its boxes (TP8 stops fine)
+! grep -q 'a glm53 down --local' "$M/calls" && grep -q 'b3.*NOT STOPPED' "$T/rd/restore.log" && [ -e "$T/rd/ALERT" ] \
+  && ok "serve unit stuck on b3 only: no box (b0-b2 neither) runs the serve's stop, ALERT" \
+  || bad "serve unit stuck on b3 only: no box (b0-b2 neither) runs the serve's stop, ALERT"
+# 19. v4.3: B_P1 must cover P1's caps (head down + unit stop + stop, + 20 s ssh each, per serve)
+setup; sed -i 's/B_P1=780/B_P1=779/' "$T/rd/window.conf"
+bash "$W" cmds "$T/rd/window.conf" > "$T/out" 2>&1; rc=$?
+[ $rc != 0 ] && grep -q 'B_P1=779 < 780' "$T/out" && ok "B_P1 below P1's caps: refused" || bad "B_P1 below P1's caps: refused [rc $rc]"
+setup; bash "$W" cmds "$T/rd/window.conf" > "$T/out" 2>&1 && ok "B_P1 = P1's caps: accepted" || bad "B_P1 = P1's caps: accepted"
 
 echo "passed $pass, failed $failn"
 [ $failn = 0 ]
