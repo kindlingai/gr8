@@ -1,10 +1,26 @@
 #!/bin/bash
-# tp8-window.sh restore paths against mocks: ssh runs the command here, gr8/curl/systemctl/memclean are stubs that log.
-# No host, no GPU. Run: bash scripts/test_tp8_window.sh
+# tp8-window.sh restore paths against mocks: ssh runs the command here, curl/systemctl/memclean are stubs that log.
+# Each tree gets the REAL ./gr8 wrapper and a stub tools/launch/launch.py that accepts only the commands and flags of a
+# real launch.py: the TP8 tree's from this checkout, a serve tree's from SERVE_REV (default: this checkout; main for the
+# C4 tree), so a command the real CLI rejects fails here too. No host, no GPU. Run: bash scripts/test_tp8_window.sh
 # ok/bad always return 0, so A && ok || bad is safe here; the sed text is literal on purpose
 # shellcheck disable=SC2015,SC2016
 set -u
 W=$(readlink -f "$(dirname "$0")/tp8-window.sh")
+REPO=$(readlink -f "$(dirname "$0")/..")
+PY=$(command -v python3)
+MAIN_REV=${MAIN_REV:-1f8a84f}   # the revision the C4 serve runs (/root/ablit/gr8)
+# spec < launch.py: "cmd:flag,flag" per line, read from a real launch.py (its command table, the flags each cmd_* tests)
+spec() {
+  "$PY" -c '
+import re, sys
+s = sys.stdin.read()
+cmds = re.search(r"f = \{(.*?)\}\.get\(cmd\)", s, re.S).group(1)
+for c, fn in re.findall(r"\x27([a-z-]+)\x27: (cmd_\w+)", cmds):
+    body = re.search(r"def " + fn + r"\(argv\):(.*?)\n(?=def |\Z)", s, re.S)
+    flags = re.findall(r"\x27(--[a-z-]+)\x27 in argv", body.group(1) if body else "")
+    print(c + ":" + ",".join(flags))'
+}
 pass=0 failn=0
 ok() { echo "ok   $1"; pass=$((pass + 1)); }
 bad() { echo "FAIL $1"; failn=$((failn + 1)); }
@@ -27,16 +43,33 @@ EOF
 #!/bin/bash
 echo "systemctl $*" >> "$MOCK/calls"
 EOF
+  spec < "$REPO/tools/launch/launch.py" > "$T/tp8.spec"
+  if [ "${SERVE_REV:-}" ]; then git -C "$REPO" show "$SERVE_REV:tools/launch/launch.py" | spec > "$T/a.spec"
+  else cp "$T/tp8.spec" "$T/a.spec"; fi
   for h in tp8 a; do
-    cat > "$T/$h/gr8" <<'EOF'
-#!/bin/bash
-echo "gr8 $MOCK_HOST $(basename "$PWD") $*" >> "$MOCK/calls"
-case $2 in up) touch "$MOCK/up" ;; down) [ "$(basename "$PWD")" = a ] && rm -f "$MOCK/up" ;; esac
+    mkdir -p "$T/$h/out" "$T/$h/tools/launch"
+    cp "$REPO/gr8" "$T/$h/gr8"
+    { echo '#!/bin/bash'; echo "SPEC=$T/$h.spec"; cat <<'EOF'
+# a stub of the real launch.py: its command table and per-command flags (SPEC); --no-check and @FILE always pass
+cmd=$1; shift
+echo "gr8 $MOCK_HOST $(basename "$PWD") glm53 $cmd $*" >> "$MOCK/calls"
+grep -q "^$cmd:" "$SPEC" || { echo "launch.py: unknown command $cmd" >&2; exit 2; }
+flags=$(sed -n "s/^$cmd://p" "$SPEC")
+for a in "$@"; do
+  case $a in @*|--no-check) ;; --*) case ",$flags," in *",$a,"*) ;; *) echo "gr8: unknown option $a" >&2; exit 2 ;; esac ;; esac
+done
+case $cmd in
+  up) touch "$MOCK/up" ;;
+  down) [ "$(basename "$PWD")" = a ] && rm -f "$MOCK/up" ;;
+  verify-down) [ -e "$MOCK/notdown.$MOCK_HOST" ] && exit 1 ;;
+esac
 exit 0
 EOF
-    mkdir -p "$T/$h/out"
+    } > "$T/$h/tools/launch/launch.py"
   done
-  chmod +x "$M"/bin/* "$T"/tp8/gr8 "$T"/a/gr8
+  # python3 tools/launch/launch.py runs the stub; anything else the real python3
+  printf '#!/bin/bash\ncase $1 in tools/launch/launch.py|*/tools/launch/launch.py) exec bash "$@" ;; esac\nexec %s "$@"\n' "$PY" > "$M/bin/python3"
+  chmod +x "$M"/bin/*
   echo hello > "$M/canary.good"
   cat > "$T/rd/window.conf" <<EOF
 SSH_USER=u
@@ -122,7 +155,7 @@ restore
 
 # 7. a TP8 box that is not verified down blocks every serve start
 setup; cp "$M/canary.good" "$M/canary.src"
-sed -i 's/^exit 0$/[ "$MOCK_HOST" = b5 ] \&\& [ "$2" = verify-down ] \&\& exit 1; exit 0/' "$T/tp8/gr8"
+touch "$M/notdown.b5"
 restore
 [ -e "$T/rd/ALERT" ] && ! grep -q "gr8 b. a glm53 up" "$M/calls" && ok "TP8 not down: no serve start, ALERT" \
   || bad "TP8 not down: no serve start, ALERT"
@@ -170,6 +203,37 @@ restore
 setup; hooked
 restore
 [ -e "$T/rd/ALERT" ] && [ "$(grep -c '^bup' "$M/calls")" = 2 ] && ok "smoke fail: 2 attempts, ALERT" || bad "smoke fail: 2 attempts, ALERT"
+
+# 10. the real wrapper: ./gr8 glm53 verify-down is not routed (why the stop calls launch.py); down --local is
+setup
+(cd "$T/tp8" && MOCK_HOST=w ./gr8 glm53 verify-down > /dev/null 2>&1); [ $? = 2 ] && ok "real wrapper rejects verify-down" \
+  || bad "real wrapper rejects verify-down"
+(cd "$T/tp8" && MOCK_HOST=w ./gr8 glm53 down --local @x > /dev/null 2>&1) && grep -q "gr8 w tp8 glm53 down --local @x" "$M/calls" \
+  && ok "real wrapper routes down --local to launch.py" || bad "real wrapper routes down --local to launch.py"
+
+# 11. a serve on main's CLI (the C4 tree) with the default local stop: main has no down --local / verify-down, so the
+# stop fails, the serve is never started over it, and the restore ends in ALERT (window 2, 10-17 18:01Z)
+SERVE_REV=$MAIN_REV setup; cp "$M/canary.good" "$M/canary.src"
+grep -q '^verify-down:' "$T/a.spec" && bad "main spec: no verify-down" || ok "main spec: no verify-down"
+grep -q '^verify-down:--kill$' "$T/tp8.spec" && grep -q '^down:--local$' "$T/tp8.spec" && ok "tp8 spec: down --local, verify-down --kill" \
+  || bad "tp8 spec: down --local, verify-down --kill"
+restore
+[ -e "$T/rd/ALERT" ] && ! grep -q "gr8 b. a glm53 up" "$M/calls" && grep -q "gr8 b. a glm53 down --local" "$M/calls" \
+  && ok "main-CLI serve + default stop: ALERT, no up" || bad "main-CLI serve + default stop: ALERT, no up"
+
+# 12. a serve on main's CLI with a STOP_CMD hook that uses no gr8 command: restored, up through the real wrapper
+SERVE_REV=$MAIN_REV setup; cp "$M/canary.good" "$M/canary.src"
+echo "A_STOP_CMD='echo \"astop \$MOCK_HOST\" >> $M/calls'" >> "$T/rd/window.conf"
+(cd "$T/rd" && sha256sum tp8-window.sh window.conf > SHA256SUMS)
+restore
+[ -e "$T/rd/RESTORED_OK" ] && [ "$(grep -c '^astop' "$M/calls")" = 4 ] && [ "$(grep -c 'gr8 b. a glm53 up' "$M/calls")" = 4 ] \
+  && ok "main-CLI serve + stop hook: RESTORED_OK" || bad "main-CLI serve + stop hook: RESTORED_OK"
+
+# 13. cmds prints every remote command and runs none
+setup; : > "$M/calls"
+bash "$T/rd/tp8-window.sh" cmds "$T/rd/window.conf" > "$T/cmds" 2>&1
+[ ! -s "$M/calls" ] && grep -q "^tp8-stop	b0 b1 b2 b3 b4 b5 b6 b7	cd .*launch.py down --local" "$T/cmds" \
+  && grep -q "^A-down	b0	" "$T/cmds" && grep -q "^A-up	" "$T/cmds" && ok "cmds: printed, nothing run" || bad "cmds: printed, nothing run"
 
 echo "passed $pass, failed $failn"
 [ $failn = 0 ]

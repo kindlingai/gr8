@@ -3,11 +3,13 @@
 #
 #   tp8-window.sh run CONF       the primary (start it under systemd-run so it outlives the session)
 #   tp8-window.sh restore RD     the recovery owner, on RECOVERY_HOST only (the timer or the primary starts it)
+#   tp8-window.sh cmds CONF      print every remote command the run and the restore send (NAME, TAB, HOSTS, TAB, CMD),
+#                                one per line, for a test of each against the real trees; runs nothing
 #
 # CONF (scripts/tp8-window.conf.example) holds every host, path and hash. The primary never restores: it arms a timer on
 # the recovery host before any change, and on success, failure or a signal it starts that host's restore and waits.
-# restore is single-owner (flock), fences further TP8 launches, stops the test cluster box by box (down --local and
-# verify-down --kill: no cluster-wide down, so no stale epoch-free RPC can reach a restored serve), leaves a serve that
+# restore is single-owner (flock), fences further TP8 launches, stops the test cluster box by box (launch.py down --local
+# and verify-down --kill, called directly: the ./gr8 wrapper does not route verify-down; no cluster-wide down, so no stale epoch-free RPC can reach a restored serve), leaves a serve that
 # is already healthy with its canary hash alone, and otherwise restarts it (max 2 attempts). Its end state is
 # RD/RESTORED_OK or RD/ALERT. An ALERT is not a restored serve: an unreachable host can still leave a serve down.
 #
@@ -94,17 +96,29 @@ canary() {   # NAME [KEY]: KEY = CANARY_CMD (default) or P0_CANARY_CMD (exit0 se
   [ "$md5" = "$(sv "$s" CANARY_MD5)" ] || { say "$s canary: md5 $md5, want $(sv "$s" CANARY_MD5)"; return 1; }
   say "$s canary: md5 OK"
 }
+# The remote commands, one builder each (cmds prints them all). A local stop calls tools/launch/launch.py directly:
+# down --local and verify-down exist there (tp8-ring), and ./gr8 does not route verify-down.
+local_stop_cmd() {   # HOME ENV: this box's processes of the last boot from HOME, by recorded identity; exit 0 = down
+  printf 'cd %s && python3 tools/launch/launch.py down --local @%s; python3 tools/launch/launch.py verify-down --kill @%s' \
+    "$(printf %q "$1")" "$2" "$2"
+}
+tp8_stop_cmd() { local_stop_cmd "$TP8_HOME" "$TP8_ENV"; }
+# P0, read only: the restore's verify half while the serves still run. A stale out/handshake.json (an older boot's
+# ports, e.g. a serve's API port) makes verify-down see the live serve and fail, so the restore could never pass.
+tp8_verify_cmd() { echo "cd $(printf %q "$TP8_HOME") && python3 tools/launch/launch.py verify-down @$TP8_ENV"; }
+tp8_up_cmd() { echo "cd $TP8_HOME && setsid nohup timeout $TP8_LIFE ./gr8 glm53 up @$TP8_ENV > out/window-up.log 2>&1 < /dev/null &"; }
+serve_stop_cmd() { svd "$1" STOP_CMD "$(local_stop_cmd "$(sv "$1" HOME)" "$(sv "$1" ENV)")"; }
+serve_down_cmd() { svd "$1" DOWN_CMD "cd $(sv "$1" HOME) && ./gr8 glm53 down @$(sv "$1" ENV)"; }
+serve_up_cmd() {
+  svd "$1" UP_CMD \
+    "cd $(printf %q "$(sv "$1" HOME)") && setsid nohup timeout 3000 ./gr8 glm53 up @$(sv "$1" ENV) > out/window-up.log 2>&1 < /dev/null &"
+}
 tp8_local_stop() {   # one box: this box's test processes, by recorded identity
-  local c
-  c="cd $(printf %q "$TP8_HOME") && ./gr8 glm53 down --local @$TP8_ENV; ./gr8 glm53 verify-down --kill @$TP8_ENV"
-  on_all 180 tp8-stop "$c" "${TP8_BOXES[@]}"
+  on_all 180 tp8-stop "$(tp8_stop_cmd)" "${TP8_BOXES[@]}"
 }
 serve_local_stop() {
-  local s=$1 home env
-  home=$(printf %q "$(sv "$s" HOME)"); env=$(sv "$s" ENV)
   # shellcheck disable=SC2046
-  on_all 180 "$s-stop" "$(svd "$s" STOP_CMD "cd $home && ./gr8 glm53 down --local @$env; ./gr8 glm53 verify-down --kill @$env")" \
-    $(svboxes "$s")
+  on_all 180 "$1-stop" "$(serve_stop_cmd "$1")" $(svboxes "$1")
 }
 serve_check() {   # NAME KEY: the serve's optional per-box check; unset passes
   local c
@@ -115,8 +129,7 @@ serve_check() {   # NAME KEY: the serve's optional per-box check; unset passes
 }
 serve_up() {
   local s=$1 h c
-  c=$(svd "$s" UP_CMD \
-      "cd $(printf %q "$(sv "$s" HOME)") && setsid nohup timeout 3000 ./gr8 glm53 up @$(sv "$s" ENV) > out/window-up.log 2>&1 < /dev/null &")
+  c=$(serve_up_cmd "$s")
   if [ "$(sv "$s" UP)" = together ]; then
     # shellcheck disable=SC2046
     on_all 60 "$s-up" "$c" $(svupboxes "$s")
@@ -227,6 +240,7 @@ p0() {
   for h in "${TP8_BOXES[@]}"; do sums+=("$(rsh "$h" 60 "cd $TP8_HOME && md5sum bin/* | md5sum" | cut -d' ' -f1)"); done
   [ "$(printf '%s\n' "${sums[@]}" | sort -u | wc -l)" = 1 ] && [ -n "${sums[0]}" ] || die "TP8 bin/ differs or is missing: ${sums[*]}"
   on_all 60 memclean-md5 "[ \$(md5sum < $MEMCLEAN_PATH | cut -d' ' -f1) = $MEMCLEAN_MD5 ]" "${TP8_BOXES[@]}" || die "memclean md5"
+  on_all 60 tp8-verify-down "$(tp8_verify_cmd)" "${TP8_BOXES[@]}" || die "TP8 verify-down (read only) does not pass beside the live serves"
   on_all 30 dirty "[ \$(awk '/^Dirty:/{print \$2}' /proc/meminfo) -lt ${DIRTY_MAX_KB:-1048576} ]" "${TP8_BOXES[@]}" || die "dirty pages"
   [ -n "${P0_BOX_CHECK:-}" ] && { on_all 600 box-check "$P0_BOX_CHECK" "${TP8_BOXES[@]}" || die "P0_BOX_CHECK"; }
   # isolation: the test control port is set and is no serve's (unset in a serve env = 7340)
@@ -287,7 +301,7 @@ cmd_run() {
   say "P1 serves down"
   fenced && finish "fenced before P1"
   for s in "${SERVES[@]}"; do
-    rsh "$(sv "$s" HEAD)" "$(svd "$s" DOWN_S 300)" "$(svd "$s" DOWN_CMD "cd $(sv "$s" HOME) && ./gr8 glm53 down @$(sv "$s" ENV)")" >> "$LOG" 2>&1
+    rsh "$(sv "$s" HEAD)" "$(svd "$s" DOWN_S 300)" "$(serve_down_cmd "$s")" >> "$LOG" 2>&1
     serve_local_stop "$s" || finish "P1: $s not verified down"
   done
 
@@ -299,7 +313,7 @@ cmd_run() {
 
   say "P4 TP8 up"
   fenced && finish "fenced before P4: restore has begun"
-  on_all 60 tp8-up "cd $TP8_HOME && setsid nohup timeout $TP8_LIFE ./gr8 glm53 up @$TP8_ENV > out/window-up.log 2>&1 < /dev/null &" \
+  on_all 60 tp8-up "$(tp8_up_cmd)" \
     "${TP8_BOXES[@]}" || finish "P4: launch"
 
   say "P5 wait for /health (<= ${B_P5}s), error scan every 60 s"
@@ -348,8 +362,32 @@ cmd_run() {
   if [ $ok = 1 ]; then finish "TP8 PASS"; else finish "TP8 FAIL at P6"; fi
 }
 
+cmd_cmds() {   # CONF: every remote command, NAME TAB HOSTS TAB CMD; runs nothing
+  load "$1"
+  local s k c
+  row() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+  row tp8-stop "${TP8_BOXES[*]}" "$(tp8_stop_cmd)"
+  row tp8-p0-verify "${TP8_BOXES[*]}" "$(tp8_verify_cmd)"
+  row tp8-prep "${TP8_BOXES[*]}" "$MEMCLEAN && $PREP_CMD"
+  row tp8-weights "${TP8_BOXES[*]}" "$VERIFY_WEIGHTS_CMD"
+  row tp8-up "${TP8_BOXES[*]}" "$(tp8_up_cmd)"
+  for s in "${SERVES[@]}"; do
+    row "$s-down" "$(sv "$s" HEAD)" "$(serve_down_cmd "$s")"
+    row "$s-stop" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(serve_stop_cmd "$s")"
+    row "$s-prep" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(svd "$s" PREP "$MEMCLEAN && $PREP_CMD")"
+    for k in P0_CHECK PRE_UP_CHECK POST_CHECK; do
+      c=$(svd "$s" "$k" ""); [ -n "$c" ] && row "$s-${k,,}" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$c"
+    done
+    row "$s-up" "$(svupboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(serve_up_cmd "$s")"
+    row "$s-canary" "$(sv "$s" CANARY_HOST)" "$(sv "$s" CANARY_CMD)"
+    c=$(svd "$s" P0_CANARY_CMD ""); [ -n "$c" ] && row "$s-p0_canary" "$(sv "$s" CANARY_HOST)" "$c"
+  done
+  return 0
+}
+
 case "${1:-}" in
+  cmds) [ $# = 2 ] || { echo "usage: $0 cmds CONF" >&2; exit 2; }; cmd_cmds "$2" ;;
   run) [ $# = 2 ] || { echo "usage: $0 run CONF" >&2; exit 2; }; cmd_run "$2" ;;
   restore) [ $# = 2 ] || { echo "usage: $0 restore RD" >&2; exit 2; }; cmd_restore "$2" ;;
-  *) echo "usage: $0 run CONF | restore RD" >&2; exit 2 ;;
+  *) echo "usage: $0 run CONF | restore RD | cmds CONF" >&2; exit 2 ;;
 esac
