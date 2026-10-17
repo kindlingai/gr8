@@ -380,9 +380,11 @@ FabricLive fabric_live() {
 // something leaked. Ring: the proxy stops and the rest stays (the shared relay thread polls its queues).
 void Fabric::close() {
   if (!impl_) return;
-  stop_proxy();
   Impl& I = *impl_;
-  if (I.ring) return;                                  // mesh only (#154): kept for the life of the process
+  if (!I.ring && I.th.joinable() && !I.exited.load() && I.pending.load() != 0 && !wait_proxy_idle(60.0))
+    fprintf(stderr, "[fabric r%d] close: %ld jobs were not posted; peers waiting on them will time out\n", cfg_.rank, I.pending.load());
+  stop_proxy();
+  if (I.ring) return;                                  // mesh only (#154): the object stays as it is (fabric.h)
   for (ibv_qp*& q : I.qp) if (q) { FCHECK(ibv_destroy_qp(q) == 0); q = nullptr; live(kLiveQp, -1); }
   for (int r = 0; r < I.nrails; r++) {
     Rail& R = I.rails[r];
@@ -394,7 +396,7 @@ void Fabric::close() {
   if (I.xgpu) { CUCHECK(cudaFree(I.xgpu)); I.xgpu = nullptr; }
   if (I.region) { CUCHECK(cudaFreeHost(I.region)); I.region = nullptr; live(kLivePinned, -(long)I.region_bytes); }
   delete impl_; impl_ = nullptr;
-  dev_ = FabricDev{};
+  dev_ = FabricDev{}; cfg_ = FabricConfig{};
   live(kLiveFab, -1);
 }
 
@@ -620,6 +622,7 @@ void Fabric::init(const FabricConfig& cfg) {
 }
 
 void Fabric::barrier() {
+  FCHECK(impl_);
   char z = 0; allgather(cfg_.rank, nranks(), cfg_.ips[0], cfg_.port + (impl_->bump++ % 3) + 1, &z, 1);
 }
 
@@ -634,7 +637,7 @@ VSlotDev Fabric::vslot(int c) const {
 }
 
 void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes, const Rs& rs) {
-  FCHECK((int)sizes.size() <= cfg_.ncoll);
+  FCHECK(impl_ && (int)sizes.size() <= cfg_.ncoll);
   if (impl_->var) {
     FCHECK(!rs.mask && !rs.skip);
     for (size_t c = 0; c < sizes.size(); c++) FCHECK(sizes[c] <= impl_->L.cap[c] && sizes[c] % 8 == 0);
@@ -650,6 +653,7 @@ void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& 
 }
 
 void Fabric::enqueue_bulk(BulkJob job) {
+  FCHECK(impl_);
   Impl& I = *impl_;
   FCHECK(I.bulk && job.db < I.bd.nflags && job.wait_flag < I.bd.nflags && job.post_flag < I.bd.nflags);
   for (const auto& r : job.ranges) FCHECK(r.first % 8 == 0 && r.second % 8 == 0 && r.second > 0 && r.first + r.second <= cfg_.bulk_bytes);
@@ -662,6 +666,7 @@ void Fabric::enqueue_bulk(BulkJob job) {
 BulkDev Fabric::bulk_dev() const { FCHECK(impl_ && impl_->bulk); return impl_->bd; }
 
 bool Fabric::wait_proxy_idle(double stall_s) {
+  FCHECK(impl_);
   Impl& I = *impl_;
   const unsigned e = drain_wait([&] { return I.pending.load(std::memory_order_acquire); },
                                 [&] { return I.exited.load(std::memory_order_acquire); },
@@ -675,6 +680,7 @@ bool Fabric::wait_proxy_idle(double stall_s) {
 }
 
 void Fabric::start_proxy() {
+  FCHECK(impl_);
   Impl& I = *impl_;
   I.stop = false; I.exited = false; I.proxy_started = false;
   if (cfg_.proxy_cpu >= 0 && I.pinned_cpu < 0) { I.pinned_cpu = cfg_.proxy_cpu; progress_cpu_add(I.pinned_cpu); }

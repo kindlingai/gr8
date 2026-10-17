@@ -10,7 +10,11 @@
 //     (bit-identical), and its received bytes must be the senders' payloads;
 //  3. `loops` groups (every box, then subsets in other orders, two fabrics a group), each created, used and dropped;
 //     after each, every box's live verbs objects, pinned bytes (fabric_live) and open descriptors are back where they
-//     were before step 1, members and idle boxes alike.
+//     were after step 1 (step 1 also loads CUDA and the verbs provider, which keep descriptors for the process), members
+//     and idle boxes alike. Where rdma(8) is installed, the kernel's own count of this process's QPs, MRs, CQs and PDs
+//     (`rdma res show`) must be zero after every group too: that check does not trust fabric.cpp's counters.
+// Steps 1 and 2 show that a group's config (group_fabric) delivers exactly the bytes today's fabric does: the payloads
+// are fixed, so the digests match whenever delivery is correct. The decode gate needs the engine on a group (#156).
 // The head prints one PASS line, or the box exits non-zero with what differed.
 #include "fabric.h"
 #include "fabric_pool.h"
@@ -37,6 +41,14 @@ static int open_fds() {
   int n = 0; DIR* d = opendir("/proc/self/fd"); if (!d) return -1;
   while (auto* e = readdir(d)) if (e->d_name[0] != '.') n++;
   closedir(d); return n - 1;                           // the DIR's own descriptor
+}
+// QPs, MRs, CQs and PDs the kernel holds for this process (rdma(8)); -1 = rdma not installed
+static long rdma_res(const char* what) {
+  char cmd[160]; snprintf(cmd, sizeof cmd, "rdma res show %s 2>/dev/null | grep -c ' pid %d '; exit ${PIPESTATUS[0]}", what, (int)getpid());
+  std::string full = "bash -c \"" + std::string(cmd) + "\"";
+  FILE* p = popen(full.c_str(), "r"); if (!p) return -1;
+  long n = -1; if (fscanf(p, "%ld", &n) != 1) n = -1;
+  return pclose(p) == 0 ? n : -1;
 }
 static void die(const std::string& s) { fprintf(stderr, "fabric_group_test: FAIL %s\n", s.c_str()); exit(1); }
 static uint64_t word(uint64_t step, int c, int from, uint64_t k) {   // payload word k of collective c, sent by pool box `from`
@@ -109,8 +121,6 @@ int main(int argc, char** argv) {
   if (n < 2 || pc.index < 0 || pc.index >= n) die("--index I --ips A0,A1,..: at least two boxes");
   FabricPool pool;
   try { pool.init(pc); } catch (const std::exception& e) { die(e.what()); }
-  const FabricLive live0 = fabric_live();
-  const int fds0 = open_fds();
   FabricConfig base; base.slot_bytes = 6144 * 2 * 8; base.ncoll = 5;   // decode-sized slots (MX x HID x 2 at MX 8)
   const int bytes = 6144 * 2;                                          // one row of a decode all-reduce
   std::vector<int> all(n); for (int i = 0; i < n; i++) all[i] = i;
@@ -123,6 +133,10 @@ int main(int argc, char** argv) {
     h_fixed = run(f, all, steps, bytes);
     f.barrier(); f.close();
   }
+  const FabricLive live0 = fabric_live();             // after step 1: CUDA and the verbs provider are loaded
+  const int fds0 = open_fds();
+  if (live0.fabrics || live0.qps || live0.mrs || live0.cqs || live0.pds || live0.ctxs || live0.pinned_bytes) die("today's fabric left " + str(live0));
+  const bool kernel_check = rdma_res("qp") >= 0;
   // 2. the group of every box in pool order
   uint64_t h_group = 0;
   {
@@ -158,12 +172,15 @@ int main(int argc, char** argv) {
     if (!same(l, live0)) die("group " + std::to_string(g.id) + ": " + str(l) + ", before " + str(live0));
     const int fds = open_fds();
     if (fds != fds0) die("group " + std::to_string(g.id) + ": " + std::to_string(fds) + " open descriptors, before " + std::to_string(fds0));
+    if (kernel_check && (k < 8 || k % 25 == 0))
+      for (const char* w : {"qp", "mr", "cq", "pd"})
+        if (const long n = rdma_res(w)) die("group " + std::to_string(g.id) + ": the kernel still holds " + std::to_string(n) + " " + w + " of this process");
   }
   // one last group so every box has checked its counters before the head reports
   try { if (pool.head()) pool.announce(all); else pool.follow(600000); } catch (const std::exception& e) { die(e.what()); }
   printf("fabric_group_test box %d: digest today %016llx group %016llx (identical), %d groups (%ld as a member), "
-         "live objects and %d descriptors unchanged PASS\n", pc.index, (unsigned long long)h_fixed, (unsigned long long)h_group,
-         loops, groups_in, fds0);
+         "live objects and %d descriptors unchanged, kernel rdma resources %s PASS\n", pc.index, (unsigned long long)h_fixed,
+         (unsigned long long)h_group, loops, groups_in, fds0, kernel_check ? "zero" : "not checked (no rdma tool)");
   pool.close();
   return 0;
 }

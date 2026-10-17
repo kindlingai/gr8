@@ -78,10 +78,12 @@ class Fabric {
   Fabric() = default;
   ~Fabric();
   void init(const FabricConfig& cfg);
-  // Stop the proxy and free everything init made (mesh): QPs, MRs, CQs, PDs, device contexts, the pinned region. Every
-  // peer must be done writing into this fabric first (a barrier on any fabric of the group). The Fabric can then be
-  // init'ed again. A ring fabric only stops its proxy (its relay is shared by the process). The destructor only stops
-  // the proxy, as before (at exit a peer may still be writing).
+  // Stop the proxy and free everything init made (mesh): QPs, MRs, CQs, PDs, device contexts, the pinned region. The
+  // caller first lets the proxy post what it was given (wait_proxy_idle; close waits up to 60 s itself and says so if
+  // jobs were left) and runs a barrier on a fabric of the group, so no peer still writes into this one. The Fabric can
+  // then be init'ed again; any other call before that aborts. A ring fabric (never regrouped) only stops its proxy and
+  // cannot be init'ed again: its relay is shared by the process. The destructor only stops the proxy, as before (at
+  // exit a peer may still be writing).
   void close();
   FabricDev dev() const { return dev_; }
   int rank() const { return cfg_.rank; }

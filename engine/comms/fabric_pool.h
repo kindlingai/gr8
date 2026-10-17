@@ -14,6 +14,9 @@
 // still writes) and then Fabric::close() on each, which frees every QP, MR, CQ, PD, device context and pinned region.
 //
 // Mesh only: a cabled ring (FabricConfig::ring) cannot regroup, and group_fabric() refuses it.
+// Any exception from init, announce or follow leaves the pool broken (some boxes may have taken a group the others did
+// not): up() turns false and every later call throws. As with a fabric error, the engine then stops.
+// The links keep TCP keepalive on (10 s idle, 5 s apart, 4 probes, as the S2 control links), so a dead box is noticed.
 // Two groups may exist at once (the current layout and the one being built for a switch): group ids alternate between
 // two port ranges, so the next group never collides with the current one's bootstrap ports.
 //
@@ -21,11 +24,13 @@
 #pragma once
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -43,7 +48,7 @@ struct PoolConfig {
   std::vector<std::string> ips;       // rail 0 address of every pool box; ips[0] is the pool head
   std::vector<std::string> ips2;      // rail 1 addresses (empty = single rail; else one per pool box)
   int port = 18660;                   // pool control port on the head
-  int group_port[2] = {18600, 18700}; // fabric bootstrap base of even / odd group ids (each fabric uses base..base+59)
+  int group_port[2] = {18600, 18700}; // fabric bootstrap base of even / odd group ids (a group's fabrics use base..base+59)
   int s2_port[2] = {7341, 7342};      // S2 control port of even / odd group ids, on the group's rank 0
   unsigned timeout_s = 120;           // boot: how long the head waits for every box, and a box for the head
 };
@@ -106,12 +111,49 @@ inline std::string get(int fd, int timeout_ms = -1) {
   return s;
 }
 inline std::string join(const std::vector<std::string>& v) { std::string s; for (auto& x : v) s += x + ","; return s; }
+inline void keepalive(int fd) {
+  int one = 1, idle = 10, intvl = 5, cnt = 4;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+}
+// connect with a deadline (a filtered port would otherwise block for the kernel's SYN retries); -1 = not yet
+inline int connect_by(const std::string& ip, int port, Clock::time_point end) {
+  int s = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0); need(s >= 0, "socket");
+  sockaddr_in a = addr(ip, port);
+  int rc = ::connect(s, (sockaddr*)&a, sizeof a), err = 0;
+  if (rc != 0 && errno == EINPROGRESS) {
+    pollfd q{s, POLLOUT, 0};
+    const int w = ::poll(&q, 1, left_ms(end) < 1000 ? left_ms(end) : 1000);
+    socklen_t n = sizeof err;
+    if (w > 0 && getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &n) == 0 && err == 0) rc = 0;
+  }
+  if (rc != 0) { ::close(s); return -1; }
+  const int fl = fcntl(s, F_GETFL, 0); fcntl(s, F_SETFL, fl & ~O_NONBLOCK);
+  return s;
+}
+// a list of non-negative integers separated by commas, nothing else
+inline bool parse_ints(const std::string& s, std::vector<int>* out) {
+  out->clear();
+  for (size_t a = 0; a <= s.size();) {
+    size_t e = s.find(',', a); if (e == std::string::npos) e = s.size();
+    if (e == a || e - a > 6) return false;
+    for (size_t k = a; k < e; k++) if (s[k] < '0' || s[k] > '9') return false;
+    out->push_back(atoi(s.substr(a, e - a).c_str()));
+    a = e + 1;
+  }
+  return true;
+}
 inline std::string join(const std::vector<int>& v) { std::string s; for (int x : v) s += (s.empty() ? "" : ",") + std::to_string(x); return s; }
 }  // namespace pool_detail
 
-// The pool's rule for a group: 2..pool size members, each a pool index, none twice.
+// The pool's rule for a group: 2..8 members (the fabric's limit) and at most the pool, each a pool index, none twice.
+// Which widths the engine serves (S2 takes 3, 4 and 6 today) is the caller's check (#156).
 inline std::string group_refusal(const std::vector<int>& members, int pool_size) {
   if (members.size() < 2) return "a group needs at least two members";
+  if (members.size() > 8) return "a group has more than 8 members (the fabric's limit)";
   if ((int)members.size() > pool_size) return "a group has more members than the pool";
   std::vector<char> seen(pool_size, 0);
   for (int m : members) {
@@ -175,9 +217,10 @@ class FabricPool {
           need(r > 0, "timed out waiting for every pool box (" + std::to_string(got - 1) + " of " + std::to_string(n - 1) + " connected)");
           int c = ::accept4(ls, nullptr, nullptr, SOCK_CLOEXEC);
           if (c < 0) continue;
-          setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+          keepalive(c);
           std::string hello;
-          try { hello = get(c, left_ms(end)); } catch (...) { ::close(c); throw; }
+          try { hello = get(c, std::min(left_ms(end), 10000)); }   // a box sends its hello at once
+          catch (const std::exception& e) { ::close(c); fprintf(stderr, "fabric pool: dropped a connection without a hello (%s)\n", e.what()); continue; }
           const size_t eol = hello.find('\n');
           int idx = -1;
           if (hello.compare(0, 7, "G6POOL ") == 0 && eol != std::string::npos) idx = atoi(hello.substr(7, eol - 7).c_str());
@@ -195,19 +238,18 @@ class FabricPool {
     } else {
       int s = -1;
       for (;;) {
-        s = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0); need(s >= 0, "socket");
-        sockaddr_in a = addr(pc.ips[0], pc.port);
-        if (::connect(s, (sockaddr*)&a, sizeof a) == 0) break;
-        ::close(s); s = -1;
+        s = connect_by(pc.ips[0], pc.port, end);
+        if (s >= 0) break;
         need(Clock::now() < end, "timed out connecting to the pool head");
         usleep(100000);
       }
-      int one = 1; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+      keepalive(s);
       links_.assign(1, s);
       try {
         put(s, "G6POOL " + std::to_string(pc.index) + "\n" + agree);
         const std::string up = get(s, left_ms(end));
-        need(up == "G6POOL UP\n" + agree, up.compare(0, 15, "G6POOL REFUSED ") == 0 ? "the head refused this box: " + up.substr(15) : "bad pool reply");
+        need(up == "G6POOL UP\n" + agree, up.compare(0, 15, "G6POOL REFUSED ") == 0 ? "the head refused this box: " + up.substr(15)
+                                         : up == "G6POOL QUIT" ? "the pool head closed the pool" : "bad pool reply");
       } catch (...) { close(); throw; }
     }
   }
@@ -216,43 +258,54 @@ class FabricPool {
   int index() const { return pc_.index; }
   bool head() const { return pc_.index == 0; }
   const PoolConfig& config() const { return pc_; }
-  bool up() const { return !links_.empty(); }
+  bool up() const { return !links_.empty() && !broken_; }
 
   // Head: send group `members` to every pool box and wait until each has acknowledged it; returns the head's view.
   // Members are pool indices in rank order (the head need not be one of them).
   Group announce(const std::vector<int>& members) {
     using namespace pool_detail;
-    need(head() && up(), "announce is for the pool head");
+    need(up(), "the pool is not up (closed, or broken by an earlier error)");
+    need(head(), "announce is for the pool head");
     const std::string why = group_refusal(members, size());
-    need(why.empty(), why);
+    need(why.empty(), why);                           // a refused group leaves the pool as it was
+    broken_ = true;                                   // until every box has acknowledged
     const uint64_t id = ++last_;
     const std::string f = "G6GROUP " + std::to_string(id) + " " + join(members);
     for (int i = 1; i < size(); i++) put(links_[i], f);
+    const auto end = Clock::now() + std::chrono::seconds(pc_.timeout_s);   // one deadline for all the acknowledgements
     for (int i = 1; i < size(); i++)
-      need(get(links_[i], (int)pc_.timeout_s * 1000) == "G6GROUP OK " + std::to_string(id), "pool box " + std::to_string(i) + " did not take group " + std::to_string(id));
+      need(get(links_[i], left_ms(end)) == "G6GROUP OK " + std::to_string(id), "pool box " + std::to_string(i) + " did not take group " + std::to_string(id));
+    broken_ = false;
     return make(id, members);
   }
 
-  // Every other box: wait for the head's next group (timeout_ms < 0: no limit) and acknowledge it.
+  // Every other box: wait for the head's next group (timeout_ms < 0: no limit) and acknowledge it. Nothing arriving
+  // within timeout_ms throws and leaves the pool usable; any other failure breaks it.
   Group follow(int timeout_ms = -1) {
     using namespace pool_detail;
-    need(!head() && up(), "follow is for a box other than the pool head");
-    const std::string f = get(links_[0], timeout_ms);
+    need(up(), "the pool is not up (closed, or broken by an earlier error)");
+    need(!head(), "follow is for a box other than the pool head");
+    for (;;) {                                        // wait for the frame's first byte: a timeout here leaves the pool as it was
+      pollfd q{links_[0], POLLIN, 0};
+      const int w = ::poll(&q, 1, timeout_ms);
+      if (w < 0 && errno == EINTR) continue;
+      need(w != 0, "no group from the pool head within the timeout");
+      need(w > 0, "poll failed");
+      break;
+    }
+    broken_ = true;                                   // until the group is acknowledged
+    const std::string f = get(links_[0], (int)pc_.timeout_s * 1000);   // the rest of a frame follows at once
     need(f.compare(0, 8, "G6GROUP ") == 0, f == "G6POOL QUIT" ? "the pool head closed the pool" : "bad group frame");
     const size_t sp = f.find(' ', 8);
-    need(sp != std::string::npos, "bad group frame");
+    need(sp != std::string::npos && sp > 8 && f.find_first_not_of("0123456789", 8) == sp, "bad group frame");
     const uint64_t id = strtoull(f.substr(8, sp - 8).c_str(), nullptr, 10);
     std::vector<int> members;
-    for (size_t a = sp + 1; a <= f.size();) {
-      size_t e = f.find(',', a); if (e == std::string::npos) e = f.size();
-      need(e > a, "bad group frame");
-      members.push_back(atoi(f.substr(a, e - a).c_str()));
-      a = e + 1;
-    }
+    need(parse_ints(f.substr(sp + 1), &members), "bad group frame");
     const std::string why = group_refusal(members, size());
     need(why.empty() && id == last_ + 1, why.empty() ? "group id out of order" : why);
     last_ = id;
     put(links_[0], "G6GROUP OK " + std::to_string(id));
+    broken_ = false;
     return make(id, members);
   }
 
@@ -281,6 +334,7 @@ class FabricPool {
   PoolConfig pc_;
   std::vector<int> links_;            // head: [pool index] -> link (index 0 unused); others: [0] = link to the head
   uint64_t last_ = 0;
+  bool broken_ = false;               // an announce or follow failed part way (or one is in progress)
 };
 
 }  // namespace g6

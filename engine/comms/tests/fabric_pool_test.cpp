@@ -90,6 +90,8 @@ int main() {
   CHECK(!group_refusal({-1, 1}, 4).empty());
   CHECK(!group_refusal({1, 2, 1}, 4).empty());
   CHECK(group_refusal({3, 1, 0}, 4).empty());
+  CHECK(!group_refusal({0, 1, 2, 3, 4, 5, 6, 7, 8}, 12).empty());   // the fabric's limit is 8
+  CHECK(group_refusal({0, 1, 2, 3, 4, 5, 6, 7}, 12).empty());
   // 4. a box started with another pool is refused, and the head fails too
   {
     std::atomic<int> threw{0};
@@ -100,7 +102,7 @@ int main() {
       FabricPool p;
       try { p.init(pc); } catch (const std::exception&) { threw++; return; }
     });
-    CHECK(threw >= 2);                                  // the odd box and the head; box 1 may time out or be refused
+    CHECK(threw == 3);                                  // the odd box is refused, the head stops, box 1 hears QUIT or times out
   }
   // 5. groups created and dropped in a loop: no descriptor grows while the pool runs, none is left after close, and the
   //    announce and the follow stay in step. The head samples while every other box waits for the next group (it has
@@ -134,6 +136,39 @@ int main() {
     });
     CHECK(told == 2);
   }
+  // 7. a follow that times out with nothing sent leaves the pool usable; a refused announce leaves it as it was
+  {
+    boxes(2, [&](int i) {
+      FabricPool p; p.init(pool(2, i, base_port + 8));
+      if (i == 0) {
+        bool threw = false;
+        try { p.announce({0, 0}); } catch (const std::exception&) { threw = true; }
+        CHECK(threw && p.up());
+        usleep(300000);                                 // box 1 times out once meanwhile
+        CHECK(p.announce({1, 0}).id == 1);
+      } else {
+        bool threw = false;
+        try { p.follow(100); } catch (const std::exception&) { threw = true; }
+        CHECK(threw && p.up());
+        const Group g = p.follow(20000);
+        CHECK(g.id == 1 && g.rank == 0 && g.s2_head_ip == "127.0.0.1");
+      }
+    });
+  }
+  // 8. a broken pool refuses further use: the head dies mid-life, a waiting box sees the link close, then up() is false
+  {
+    boxes(2, [&](int i) {
+      FabricPool p; p.init(pool(2, i, base_port + 10));
+      if (i == 0) { p.announce({0, 1}); usleep(100000); return; }   // the destructor sends QUIT
+      p.follow(20000);
+      bool threw = false;
+      try { p.follow(20000); } catch (const std::exception&) { threw = true; }
+      CHECK(threw && !p.up());
+      threw = false;
+      try { p.follow(100); } catch (const std::exception&) { threw = true; }
+      CHECK(threw);
+    });
+  }
   if (fails) { fprintf(stderr, "fabric pool: %d FAILED\n", fails.load()); return 1; }
-  puts("fabric pool: boot, 6 layouts on 6 boxes, group_fabric = the fixed config, refusals, pool mismatch, 2000 groups without a leaked fd, close PASS");
+  puts("fabric pool: boot, 6 layouts on 6 boxes, group_fabric = the fixed config, refusals, pool mismatch, 2000 groups without a leaked fd, close, timeouts and a broken pool PASS");
 }
