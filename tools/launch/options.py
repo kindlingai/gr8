@@ -21,9 +21,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'TP': ('cluster', None, 'tensor-parallel size: 4, 6 or 3'),
-    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
-                                 "cabled to the f1 port of the next box in --peers order, the last to the first)"),
+    'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 8'),
+    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), ring (TP=3 or 4, no switch: each box's f0 port "
+                                 "cabled to the f1 port of the next box in --peers order, the last to the first), or "
+                                 "hybrid (a per-pair route table from every box's --fab-ports: direct where two boxes "
+                                 "share a subnet, else one relay hop through the lowest common neighbour; "
+                                 "tools/launch/routes.py)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
     'GROUP': ('cluster', 'gr8-glm53', 'mentat group the boxes join'),
@@ -43,6 +46,9 @@ KEYS = {
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
     'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
                                'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
+    'FAB_PORTS': ('box', None, "--shape hybrid: this box's fabric addresses with prefix, 1 to 4 (ip/prefix,...). Only "
+                               'these are used: an address the box holds but does not list makes no route'),
+    'FAB_DENY': ('cluster', None, '--shape hybrid: rank pairs that must not go direct (a-b,...), so they relay'),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
@@ -142,6 +148,8 @@ IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'G6_CLUSTER', 'G6_NR', 'BUND
 SWITCHES = {'--no-config', '--no-check', '--foreground'}
 ENGINE_KNOBS = [k for k in list(KEYS)[list(KEYS).index('CAP'):]]
 FABRIC_PORT = 18600   # engine/comms/fabric.h: the fabric bootstrap and per-collective ports start here
+FABRIC_PORTS = range(FABRIC_PORT, FABRIC_PORT + 64)   # g6m4 offsets each Fabric by 8..56 and uses base..base+3
+SERVE_CONTROL_PORT = KEYS['CONTROL_PORT'][1]   # every cluster that does not set CONTROL_PORT listens here
 
 
 class OptionError(Exception):
@@ -312,7 +320,7 @@ def validate(o):
             tp = str(len(split_list(o.get('PEERS'))))
             o.values['TP'], o.origin['TP'] = tp, 'the number of peers'
         else:
-            raise OptionError('--tp is needed with --mentat (4, 6 or 3)')
+            raise OptionError('--tp is needed with --mentat (4, 6, 3 or 8)')
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
                           'them with --g6env-x "NAME=value ..." so every box compares them')
@@ -372,10 +380,10 @@ def validate(o):
                 force = 0.0
             if not (0.0 < force <= 4.0) or struct.unpack('<f', struct.pack('<f', force))[0] == 0:
                 raise OptionError('--steering-force: want a finite number in (0, 4]')
-    if tp not in ('3', '4', '6'):
-        raise OptionError(f'--tp {tp}: want 4, 6 or 3')
-    if o.get('SHAPE') not in ('mesh', 'ring'):
-        raise OptionError(f'--shape {o.get("SHAPE")}: want mesh or ring')
+    if tp not in ('3', '4', '6', '8'):
+        raise OptionError(f'--tp {tp}: want 4, 6, 3 or 8')
+    if o.get('SHAPE') not in ('mesh', 'ring', 'hybrid'):
+        raise OptionError(f'--shape {o.get("SHAPE")}: want mesh, ring or hybrid')
     if o.get('SHAPE') == 'ring':
         if tp not in ('3', '4'):
             raise OptionError(f'--shape ring: TP=3 or 4, not {tp}')
@@ -384,6 +392,10 @@ def validate(o):
         if o.get('IPS'):
             raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
                               'and bootstraps over the LAN')
+    if o.get('SHAPE') == 'hybrid':
+        validate_hybrid(o, tp)
+    elif o.get('FAB_PORTS') or o.get('FAB_DENY'):
+        raise OptionError('--fab-ports and --fab-deny are for --shape hybrid')
     if o.get('RING_DEVS') and len(split_list(o.get('RING_DEVS'))) != 4:
         raise OptionError(f'--ring-devs {o.get("RING_DEVS")}: want four devices')
     if mode(o) == 'peers' and len(split_list(o.get('PEERS'))) != int(tp):
@@ -411,6 +423,36 @@ def validate(o):
     wl = o.get('KV_WRITE_LIMIT')
     if wl is not None and not re.fullmatch(r'\d+(\.\d+)?', str(wl)):
         raise OptionError(f'--kv-write-limit {wl}: want a number of page blocks per page computed, such as 0.25')
+
+
+def validate_hybrid(o, tp):
+    """--shape hybrid: the peer list, declared ports, a valid deny list, and a control port of its own. A test cluster
+    that shares the serves' control port can be stopped, or stop them, by a stale epoch-free `down`."""
+    import routes
+    if mode(o) != 'peers':
+        raise OptionError('--shape hybrid needs --peers: the ranks and the route table follow their order')
+    if o.get('IPS') or o.get('IPS2'):
+        raise OptionError('--shape hybrid takes no --ips/--ips2: each box declares its fabric addresses (--fab-ports) '
+                          'and the engines bootstrap over the LAN')
+    if o.get('RING_DEVS'):
+        raise OptionError('--shape hybrid takes no --ring-devs: the route table names every address')
+    if not o.get('FAB_PORTS'):
+        raise OptionError("--shape hybrid needs --fab-ports: this box's fabric addresses with prefix (ip/prefix,...)")
+    try:
+        routes.parse_ports(o.get('FAB_PORTS'))
+        routes.parse_deny(o.get('FAB_DENY'), int(tp))
+    except routes.RouteError as e:
+        raise OptionError(str(e))
+    if o.origin.get('CONTROL_PORT') == 'default':
+        raise OptionError(f'--shape hybrid needs its own --control-port (not the default {SERVE_CONTROL_PORT}, which '
+                          'the serves use): a stale down on a shared port can stop another cluster')
+    port = o.int('CONTROL_PORT')
+    taken = {int(SERVE_CONTROL_PORT): 'the serves\' default control port', o.int('PORT'): '--port'}
+    if o.get('S2PORT'):
+        taken[o.int('S2PORT')] = '--s2-port'
+    if port in taken or port in FABRIC_PORTS:
+        raise OptionError(f'--control-port {port}: ' + (f'that is {taken[port]}' if port in taken else
+                          f'inside the fabric port block {FABRIC_PORTS.start}-{FABRIC_PORTS.stop - 1}'))
 
 
 def deprecated_kv(values, origin, warnings):
@@ -551,6 +593,8 @@ def canonical(o, plan, members, variant=None):
         c['head'] = o.get('HEAD', '')
     for k in ('IPS', 'IPS2', 'CONTROL_PORT', 'PORT'):
         c[k] = o.get(k) or ''
+    if o.get('SHAPE') == 'hybrid':   # the route table's own sha joins at the verdict (supervisor.handshake_head)
+        c['FAB_DENY'] = o.get('FAB_DENY') or ''
     # Every knob that reaches the engine is in engine.env and engine.args below. CAP is also here by name, so a refusal
     # names it. DFLASH and PF_OWN decide which pack files a rank needs.
     for k in ('CAP', 'DFLASH', 'PF_OWN'):

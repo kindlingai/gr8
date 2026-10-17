@@ -6,6 +6,10 @@ own and answers at once: `refused` at the first difference, with the field and e
 worker then asks for the `verdict` about once a second. Once every rank has said hello and the rails answer, the
 verdict is `ok` with the boot epoch and the assembled IPS/IPS2. A refusal goes to every box, and every box exits 4.
 
+With --shape hybrid the hello also carries `ports`, the box's declared FAB_PORTS. The head computes the route table
+from every rank's ports (routes.py) and the ok verdict carries it as `routes` (the file text) and `routes_sha`; a table
+that cannot be built refuses the boot, naming the pair.
+
 The head answers `retry` while it has not finished its own checks, so a worker waits for a slow head for as long as
 the head answers. The head drops a rank that stops asking for 30 s and refuses the boot, naming that rank.
 """
@@ -15,6 +19,7 @@ import socket
 import threading
 import time
 
+import routes
 from fabric import same_subnet
 
 PROTO = 1
@@ -63,6 +68,11 @@ def compare(ref, h, peer, have):
     if not isinstance(h.get('home'), str) or not SAFE_HOME.fullmatch(h['home']):
         return refusal('G6_HOME', both, lambda x: repr(x.get('home')),
                        'G6_HOME must be an absolute path without control characters (the head uses it in ssh commands)')
+    if ref['opts'].get('shape') == 'hybrid':
+        try:
+            routes.parse_ports(','.join(h.get('ports') or []))
+        except (routes.RouteError, TypeError) as e:
+            return refusal('fabric ports', both, lambda x: ','.join(x.get('ports') or []) or '(none)', str(e))
     if h.get('fails') or ref.get('fails'):   # Head.wait_all lists every failing box once all have said hello
         return None
     if h['engine_build'] != ref['engine_build']:
@@ -168,6 +178,32 @@ class Head:
             if self.verdict is None:
                 self.verdict = verdict
             self.cv.notify_all()
+
+
+def route_table(have, deny_text):
+    """(routes.Table, None), or (None, a refusal naming the pair), from every rank's hello. have: {rank: hello}."""
+    ranks = sorted(have)
+    try:
+        t = routes.compute([have[r]['ports'] for r in ranks], routes.parse_deny(deny_text, len(ranks)),
+                           names=[have[r]['lan'] for r in ranks])
+    except routes.RouteError as e:
+        return None, refusal('routes', have, lambda x: ','.join(x['ports']), str(e))
+    return t, None
+
+
+def check_routes(v, rank, ports, deny_text):
+    """A worker's own check of an ok hybrid verdict before it writes the file: the table rebuilt from the verdict's
+    ports gives the same text and sha, and this rank's ports in it are the ones it declared. '' or the reason."""
+    try:
+        t = routes.compute(v['ports'], routes.parse_deny(deny_text, len(v['ports'])))
+    except (routes.RouteError, KeyError, TypeError) as e:
+        return f'the route table does not rebuild here: {e}'
+    if t.text != v.get('routes') or t.sha != v.get('routes_sha'):
+        return f'the route table rebuilt here has sha {t.sha[:16]}, the head sent {str(v.get("routes_sha"))[:16]}'
+    mine = [str(i) for i in routes.parse_ports(ports)]
+    if [str(i) for i in t.ports[rank]] != mine:
+        return f'the table lists {" ".join(map(str, t.ports[rank]))} for rank {rank}, this box declares {" ".join(mine)}'
+    return ''
 
 
 def describe(v):

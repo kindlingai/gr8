@@ -111,12 +111,12 @@ class ValidateTests(unittest.TestCase):
         self.assertIn(want, str(e.exception))
 
     def test_refusals(self):
-        self.check(['--peers', PEERS, '--shape', 'star'], 'want mesh or ring')
+        self.check(['--peers', PEERS, '--shape', 'star'], 'want mesh, ring or hybrid')
         self.check(['--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--shape', 'ring'], 'TP=3 or 4')
         self.check(['--mentat', 'localhost', '--tp', '4', '--shape', 'ring'], 'needs --peers')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ips', 'a,b,c,d', '--ips2', 'a,b,c,d'], 'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ring-devs', 'a,b'], 'want four devices')
-        self.check(['--peers', PEERS, '--tp', '5'], 'want 4, 6 or 3')
+        self.check(['--peers', PEERS, '--tp', '5'], 'want 4, 6, 3 or 8')
         self.check(['--peers', PEERS, '--tp', '6'], 'names 4 boxes for --tp 6')
         self.check(['--mentat', 'localhost'], '--tp is needed')
         self.check(['--peers', PEERS], 'PLAIN=1', {'PLAIN': '1'})
@@ -315,6 +315,86 @@ class CanonicalTests(unittest.TestCase):
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=1', p['env'])
         self.assertNotIn('/a/qo.pack', p['args'])
+
+
+PEERS8 = ','.join(f'10.0.0.{i}' for i in range(1, 9))
+HYB = ['--peers', PEERS8, '--shape', 'hybrid', '--fab-ports', '192.0.2.1/24,198.51.100.1/24', '--control-port', '7350']
+
+
+class HybridTests(unittest.TestCase):
+    def parse(self, *argv, env=None):
+        o = opt.parse(['--no-config', *argv], env or {})
+        opt.validate(o)
+        return o
+
+    def refuse(self, argv, want):
+        o = opt.parse(['--no-config', *argv], {})
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(o)
+        self.assertIn(want, str(e.exception))
+
+    def test_tp8_hybrid_is_accepted(self):
+        o = self.parse(*HYB, '--fab-deny', '0-2,1-3')
+        self.assertEqual((o.get('TP'), o.origin['TP'], o.get('SHAPE')), ('8', 'the number of peers', 'hybrid'))
+        self.parse('--peers', PEERS, '--shape', 'hybrid', '--fab-ports', '192.0.2.1/24', '--control-port', '7350')
+
+    def test_tp8_ring_is_refused(self):
+        self.refuse(['--peers', PEERS8, '--shape', 'ring'], '--shape ring: TP=3 or 4, not 8')
+
+    def test_hybrid_refusals(self):
+        base = ['--fab-ports', '192.0.2.1/24', '--control-port', '7350']
+        self.refuse(['--mentat', 'localhost', '--tp', '8', '--shape', 'hybrid', *base], 'hybrid needs --peers')
+        self.refuse([*HYB, '--ips', PEERS8, '--ips2', PEERS8], 'hybrid takes no --ips')
+        self.refuse([*HYB, '--ring-devs', 'a,b,c,d'], 'no --ring-devs')
+        self.refuse(['--peers', PEERS8, '--shape', 'hybrid', '--control-port', '7350'], 'needs --fab-ports')
+        for bad, why in (('192.0.2.1', 'with its prefix'), ('192.0.2.1/24,192.0.2.2/24', 'overlap'),
+                         (','.join(f'192.0.{i}.1/24' for i in range(5)), '1 to 4')):
+            self.refuse(['--peers', PEERS8, '--shape', 'hybrid', '--fab-ports', bad, '--control-port', '7350'], why)
+        self.refuse([*HYB, '--fab-deny', '0-8'], 'want two different ranks in 0..7')
+        self.refuse(['--peers', PEERS, '--fab-ports', '192.0.2.1/24'], 'are for --shape hybrid')
+        self.refuse(['--peers', PEERS, '--fab-deny', '0-1'], 'are for --shape hybrid')
+
+    def test_hybrid_needs_its_own_control_port(self):
+        argv = HYB[:-2]
+        self.refuse(argv, 'needs its own --control-port (not the default 7340')
+        self.refuse([*argv, '--control-port', '7340'], "that is the serves' default control port")
+        self.refuse([*argv, '--control-port', '8100'], 'that is --port')
+        self.refuse([*argv, '--control-port', '7341', '--s2-port', '7341'], 'that is --s2-port')
+        self.refuse([*argv, '--control-port', '18610'], 'inside the fabric port block 18600-18663')
+        o = opt.parse(['--no-config', *argv], {'CONTROL_PORT': '7350'})   # explicit from the environment is fine
+        opt.validate(o)
+
+    def test_deny_is_in_the_digest_and_ports_are_not(self):
+        def digest(*argv):
+            o = self.parse(*argv)
+            return opt.canonical(o, opt.engine_plan(o), opt.split_list(PEERS8))
+        c, text, d = digest(*HYB)
+        self.assertIn('shape=hybrid\n', text)
+        self.assertIn('FAB_DENY=\n', text)
+        self.assertNotEqual(d, digest(*HYB, '--fab-deny', '0-2')[2])
+        other = list(HYB)
+        other[other.index('--fab-ports') + 1] = '192.0.2.9/24'   # a box option: the route sha carries it, not this
+        self.assertEqual(d, digest(*other)[2])
+
+    def test_tp8_arm_knobs(self):
+        o = self.parse(*HYB)
+        p = opt.engine_plan(o, rank=7, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
+        k = p['knobs']
+        self.assertEqual({x: k[x] for x in ('SHARE_LIMIT', 'CAP', 'READY_TMO', 'MTP', 'SESS', 'S2PORT', 'DFLASH',
+                                             'SPEC_ADAPT', 'PF_OWN', 'REUSE')},
+                         {'SHARE_LIMIT': '32768', 'CAP': '65536', 'READY_TMO': '3600', 'MTP': '2', 'SESS': '8',
+                          'S2PORT': '7341', 'DFLASH': '0', 'SPEC_ADAPT': '0', 'PF_OWN': '3', 'REUSE': '1'})
+        self.assertIn('G6_PF_OWN=3', p['env'])
+        self.assertIn('G6_CP_R=32768', p['env'])
+        self.assertFalse(any(e.startswith('G6_PF_QP_ROLL') for e in p['env']))   # the TP4-only QP roll stays off
+        self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
+        self.assertNotIn('--spec-adaptive', p['args'])
+        self.assertIn('/a/qo.pack', p['args'])          # PF_OWN=3 without a release: the QO pack
+        for argv, why in ((['--dflash', '1'], 'DFLASH=1 at TP=8'), (['--kv-format', 'int4'], 'KV_FORMAT=int4 at TP=8')):
+            o = self.parse(*HYB, *argv)
+            with self.assertRaisesRegex(opt.OptionError, why):
+                opt.engine_plan(o)
+        self.refuse([*HYB, '--drafter', 'https://huggingface.co/a/b'], 'TP=4 only')
 
 
 class KvStoreTests(unittest.TestCase):
