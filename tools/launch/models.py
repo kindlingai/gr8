@@ -33,7 +33,7 @@ class Model:
 # release from before it boots down1. home's experts take 99.8 GB of a rank at TP=3, which leaves no room for the KV
 # pool on a 128 GB box. At TP=4 home stays: bit325 lowers KL by 1.5-7% at home's size but decoded ~2.5% slower in
 # three boots each.
-GLM53 = Model('glm53', 'g6m4', 'glm', ('4', '6', '3'),
+GLM53 = Model('glm53', 'g6m4', 'glm', ('4', '6', '3', '8'),
               {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
                'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38},
               {3: ('bit225', 'down1')}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, False)

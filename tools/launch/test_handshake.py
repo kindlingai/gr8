@@ -248,5 +248,35 @@ def _after(s):
     return e
 
 
+class HybridHandshakeTests(unittest.TestCase):
+    PORTS = [['192.0.2.1/24', '198.51.100.1/24'], ['192.0.2.2/24', '198.51.100.2/24'], ['192.0.2.3/24'],
+             ['192.0.2.4/24', '198.51.100.4/24']]
+
+    def hybrid(self, rank, **kw):
+        return hello(rank, opts={'shape': 'hybrid'}, rails=[LAN, LAN], **{'ports': self.PORTS[rank], **kw})
+
+    def test_bad_ports_in_a_hello_are_refused(self):
+        head = H.Head(self.hybrid(0))
+        r = head.rpc(self.hybrid(1, ports=['192.0.2.2']), LAN)
+        self.assertEqual((r['t'], r['field']), ('refused', 'fabric ports'))
+        self.assertIn('with its prefix', r['detail'])
+
+    def test_route_table_and_the_workers_own_check(self):
+        have = {r: {**self.hybrid(r), 'lan': f'192.0.2.{50 + r}'} for r in range(4)}
+        t, bad = H.route_table(have, '')
+        self.assertIsNone(bad)
+        v = {'t': 'ok', 'ports': [[str(i) for i in p] for p in t.ports], 'routes': t.text, 'routes_sha': t.sha}
+        self.assertEqual(H.check_routes(v, 2, '192.0.2.3/24', ''), '')
+        self.assertIn('this box declares 192.0.2.9/24', H.check_routes(v, 2, '192.0.2.9/24', ''))
+        self.assertIn('the head sent', H.check_routes({**v, 'routes_sha': 'f' * 64}, 2, '192.0.2.3/24', ''))
+        self.assertIn('the head sent', H.check_routes(v, 2, '192.0.2.3/24', '0-1'))   # another deny, another table
+        # an unroutable table is a refusal naming the pair, by LAN address
+        have[2] = {**have[2], 'ports': ['203.0.113.3/24']}
+        t, bad = H.route_table(have, '')
+        self.assertIsNone(t)
+        self.assertEqual(bad['field'], 'routes')
+        self.assertIn('no route between rank 0 (192.0.2.50) and rank 2 (192.0.2.52)', bad['detail'])
+
+
 if __name__ == '__main__':
     unittest.main()

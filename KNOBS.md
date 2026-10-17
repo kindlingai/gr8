@@ -102,8 +102,8 @@ manifest instead.
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|
 | `GR8_MODEL` | `--gr8-model` | `glm53` | cluster | the model: `glm53` or `glm53f`. `./gr8 <model>` sets it |
-| `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3 (glm53f: 4 or 2); needed with mentat |
-| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch): each box's f0 port cabled to the next box's f1 port, in `--peers` order. Needs `--peers`, takes no `--ips` |
+| `TP` | `--tp` | the number of peers | cluster | 4, 6, 3 or 8 (glm53f: 4 or 2); needed with mentat |
+| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch): each box's f0 port cabled to the next box's f1 port, in `--peers` order. Needs `--peers`, takes no `--ips`. Or `hybrid` (any TP): a per-pair route table from every box's `--fab-ports` (`tools/launch/routes.py`): direct where two boxes share a subnet, else one relay hop through the lowest common neighbour. Needs `--peers`, `--fab-ports` and its own `--control-port`; takes no `--ips` |
 | `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
 | `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
 | `GROUP` | `--group` | `gr8-<model>` | cluster | the mentat group the boxes join |
@@ -121,8 +121,10 @@ manifest instead.
 | `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `run/` |
 | `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
 | `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
+| `FAB_PORTS` | `--fab-ports` | unset | box | `--shape hybrid`: this box's fabric addresses with prefix, 1 to 4 (`ip/prefix,...`). Only these are used; an address the box holds but does not list makes no route. Every box lists its switch subnets in one order: that order is the switch rail order |
+| `FAB_DENY` | `--fab-deny` | unset | cluster | `--shape hybrid`: rank pairs that must not go direct (`a-b,...`), so they relay (tests) |
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
-| `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
+| `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down). `--shape hybrid` needs one set explicitly, not 7340, `--port`, `--s2-port` or the fabric block 18600-18663 |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |
 | `DEFAULT_MAX_TOKENS` | `--default-max-tokens` | 0 | box | the head's front end: `max_tokens` for a chat request that names none. 0 = what keeps the request within `SHARE_LIMIT`, but at least 8,192, and never more than the room the context leaves; another value is used as it is |
 | `DEFAULT_REASONING_EFFORT` | `--default-reasoning-effort` | none | box | the head's front end: `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, which the template hears as the nearest level it names (README, "Thinking"). Unset = the template's default (`max` on GLM 5.3). `none` is refused: GLM 5.3 cannot turn thinking off |
