@@ -169,7 +169,7 @@ inline std::string group_refusal(const std::vector<int>& members, int pool_size)
 inline FabricConfig group_fabric(const PoolConfig& pc, const Group& g, const FabricConfig& base) {
   using namespace pool_detail;
   need(g.member(), "group_fabric on a box outside the group");
-  need(!base.ring, "a ring fabric (--shape ring) cannot regroup: groups are mesh only");
+  need(!base.ring && !base.hybrid, "a ring or hybrid fabric (--shape ring|hybrid) cannot regroup: groups are mesh only");
   FabricConfig c = base;
   c.rank = g.rank;
   c.ips.clear(); c.ips2.clear();
