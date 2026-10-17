@@ -44,6 +44,11 @@ RUN mkdir -p /out \
 
 # the slowest step (fat LTO); it runs beside the engine builds
 FROM rust AS front
+# the xgrammar crate builds XGrammar's C++ (json_schema grammars) with CMake and clang, and binds it through libclang
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake clang libclang-dev \
+ && rm -rf /var/lib/apt/lists/*
 COPY frontend/g6front-rs frontend/g6front-rs
 # from the crate's directory, so rustup reads its rust-toolchain.toml
 WORKDIR /src/frontend/g6front-rs
