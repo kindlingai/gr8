@@ -26,6 +26,7 @@ import hfsource
 import mentat
 import modelset
 import options as opt
+import routes
 import steering_local
 import steering_hf
 
@@ -76,6 +77,59 @@ def started_at(pid, proc='/proc'):
     except (OSError, IndexError, ValueError, StopIteration):
         return None
     return btime + ticks / os.sysconf('SC_CLK_TCK')
+
+
+def boot_id():
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def identity(pid, proc='/proc'):
+    """{pid, start, exe, cwd, boot}: who pid is now, or None when it is gone (or a zombie). pid and start (with the boot
+    id) name one process for good; exe and cwd say what it runs, for the record and the reports."""
+    try:
+        with open(os.path.join(proc, str(pid), 'stat')) as f:
+            st = f.read().rsplit(')', 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    if st[0] in ('Z', 'X'):
+        return None
+    out = {'pid': pid, 'start': int(st[19]), 'boot': boot_id()}
+    for k in ('exe', 'cwd'):
+        try:
+            out[k] = os.readlink(os.path.join(proc, str(pid), k))
+        except OSError:
+            out[k] = None
+    return out
+
+
+def write_identity(out, name, pid):
+    """out/<name>.id: the launched process's identity, read right after it started (Popen returns after the exec)."""
+    who = identity(pid)
+    if who:
+        tmp = os.path.join(out, f'{name}.id.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(who, f)
+        os.replace(tmp, os.path.join(out, f'{name}.id'))
+    return who
+
+
+def same_process(rec, proc='/proc'):
+    """Whether the process recorded in rec still runs: the same pid, start time, boot and cwd."""
+    now = identity(rec.get('pid'), proc) if isinstance(rec, dict) and isinstance(rec.get('pid'), int) else None
+    return bool(now) and all(now[k] == rec.get(k) for k in ('start', 'boot', 'cwd'))
+
+
+def read_identity(out, name):
+    try:
+        with open(os.path.join(out, f'{name}.id')) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 def recorded(path, proc='/proc'):
@@ -434,6 +488,7 @@ class Supervisor:
         self.locked = True
         with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
             f.write(f'{os.getpid()}\n')
+        write_identity(self.out, 'supervisor', os.getpid())
         for p in ('handshake.json', 'gr8.state'):
             try:
                 os.unlink(os.path.join(self.out, p))
@@ -480,6 +535,8 @@ class Supervisor:
                  'set_source': f'{self.ms.source}, variant {self.variant}' if self.ms else self.model_error,
                  'engine_build': self.build, 'fails': fails, 'version': version(self.home),
                  'offers': mentat.format_offers(self.offers)}
+        if o.get('SHAPE') == 'hybrid':
+            hello['ports'] = [str(i) for i in routes.parse_ports(o.get('FAB_PORTS'))]
         self.set_state('handshake')
         verdict = self.handshake_head(hello) if self.rank == 0 else self.handshake_worker(hello)
         if verdict.get('t') == 'ok' and fails:   # never boot past a failed check, whatever the verdict
@@ -492,6 +549,8 @@ class Supervisor:
         self.hs = verdict
         with open(os.path.join(self.out, 'handshake.json'), 'w') as f:
             json.dump({**verdict, 'rank': self.rank, 'control_port': self.port}, f, indent=1)
+        if o.get('SHAPE') == 'hybrid':
+            self.write_routes(verdict)
         self.boot()
 
     def rendezvous(self, tp):
@@ -532,7 +591,7 @@ class Supervisor:
                 self.rails = ranks[self.rank][2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
                     log(f'warning: {p}')
-        if o.get('SHAPE') == 'ring':    # no switch: the engine bootstraps over the LAN and finds its devices by name
+        if o.get('SHAPE') in ('ring', 'hybrid'):   # the engine bootstraps over the LAN; RoCE by device name or table
             self.rails = (self.lan, self.lan)
         elif o.get('IPS'):
             self.rails = (opt.split_list(o.get('IPS'))[self.rank], opt.split_list(o.get('IPS2'))[self.rank])
@@ -542,6 +601,23 @@ class Supervisor:
             except RuntimeError as e:
                 self.fabric_error = f'fabric: {e}'
                 log(self.fabric_error)
+
+    def write_routes(self, v):
+        """run/routes.txt from the verdict, after this box rebuilt the table from the verdict's ports and found its own
+        declared ports in it (an independent check of the head's table). A mismatch fails this box, and the head hears."""
+        bad = handshake.check_routes(v, self.rank, self.o.get('FAB_PORTS'), self.o.get('FAB_DENY'))
+        if bad:
+            raise Stop(4, f'routes: {bad}')
+        run = os.path.join(self.home, 'run')
+        os.makedirs(run, exist_ok=True)
+        tmp = os.path.join(run, 'routes.txt.tmp')
+        with open(tmp, 'w') as f:
+            f.write(v['routes'])
+        os.replace(tmp, os.path.join(run, 'routes.txt'))
+        if opt.file_sha256(os.path.join(run, 'routes.txt')) != v['routes_sha']:
+            raise Stop(1, f'routes: {run}/routes.txt does not hash to {v["routes_sha"][:16]} after writing')
+        log(f'routes sha {v["routes_sha"]} ({len(v["routes"].splitlines())} lines) in run/routes.txt; boot digest '
+            f'{v["opts_digest"][:16]}')
 
     def checks(self, copy=True):
         """What would stop this box's boot, as text. copy: make this rank's model files ready first. The rank's files
@@ -578,6 +654,18 @@ class Supervisor:
         for pid, cwd in running_engines():
             if pid != p:
                 fails.append(f'a g6m4 --rank process is running (pid {pid}, cwd {cwd}): stop it first')
+        if o.get('SHAPE') == 'hybrid':
+            try:
+                for i in routes.parse_ports(o.get('FAB_PORTS')):
+                    if not fabric.is_local(str(i.ip)):
+                        fails.append(f'--fab-ports {i}: {i.ip} is not an address of this box')
+            except routes.RouteError as e:
+                fails.append(f'--fab-ports: {e}')
+        if self.rank == 0:
+            try:
+                self.pin()
+            except Stop as e:
+                fails.append(str(e))
         if o.get('CHECK') == '0':
             return fails
         if self.build == 'missing':
@@ -611,17 +699,27 @@ class Supervisor:
         log(f'head: waiting for {tp - 1} hellos on {self.lan}:{self.port}')
         if self.head.wait_all(opt_timeout(self.o), self.stop_ev):
             bad = self.rail_check()
+            table, refused = (handshake.route_table(self.head.have, self.o.get('FAB_DENY'))
+                              if self.o.get('SHAPE') == 'hybrid' and not bad else (None, None))
             if bad:
                 self.head.decide(handshake.refusal('fabric', self.head.have, lambda x: ','.join(x['rails']), bad))
+            elif refused:
+                self.head.decide(refused)
             else:
                 have = self.head.have
+                extra = {}
+                if table:   # the route sha joins the option digest: the boot digest names the table too
+                    log(f'routes ({len(table.direct)} direct pairs, {len(table.relay)} relayed routes):\n{table.text}')
+                    extra = {'ports': [[str(i) for i in p] for p in table.ports], 'routes': table.text,
+                             'routes_sha': table.sha,
+                             'opts_digest': hashlib.sha256(f'{self.digest}\nroutes.sha256={table.sha}\n'.encode()).hexdigest()}
                 self.head.decide({'t': 'ok', 'epoch': int(time.time()), 'members': self.members,
                                   'ips': [have[r]['rails'][0] for r in range(tp)],
                                   'ips2': [have[r]['rails'][1] for r in range(tp)],
                                   'homes': {str(r): have[r]['home'] for r in range(tp)}, 'set_id': self.model_id,
                                   'variant': self.variant.name,
                                   'opts_digest': self.digest, 's2port': self.tmpl['knobs'].get('S2PORT'),
-                                  'fabric_port': opt.FABRIC_PORT, 'tp': tp, 'port': self.o.get('PORT')})
+                                  'fabric_port': opt.FABRIC_PORT, 'tp': tp, 'port': self.o.get('PORT'), **extra})
         elif self.stop_ev.is_set():
             self.head.decide({'t': 'refused', 'field': 'stopped', 'values': {}, 'detail': self.stop_why, 'exit': 1})
         v = self.head.verdict
@@ -676,6 +774,7 @@ class Supervisor:
                                  env=env, start_new_session=True)
         with open(os.path.join(self.out, f'{name}.pid'), 'w') as f:
             f.write(f'{p.pid}\n')
+        write_identity(self.out, name, p.pid)
         self.helpers[name] = p
         return p
 
@@ -709,6 +808,9 @@ class Supervisor:
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
         if o.get('SHAPE') == 'ring':
             argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
+        elif o.get('SHAPE') == 'hybrid':   # the engine checks its own P line against the ports this box declared
+            argv[1:1] = ['--hybrid', '--fab-routes', os.path.join('run', 'routes.txt'),
+                         '--fab-ports', ','.join(str(i) for i in routes.parse_ports(o.get('FAB_PORTS')))]
         log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
         rotate_logs(self.out, [f'g6m4.r{r}.txt', f'g6m4.r{r}.err'])
         with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \
@@ -717,6 +819,7 @@ class Supervisor:
                                            start_new_session=True)
         with open(os.path.join(self.out, 'g6m4.pid'), 'w') as f:
             f.write(f'{self.engine.pid}\n')
+        write_identity(self.out, 'g6m4', self.engine.pid)
         self.started = True
         self.set_state('loading')
         if r == 0:
@@ -768,8 +871,17 @@ class Supervisor:
                    os.path.join(REPO, 'frontend'))
 
     def pin(self):
-        """At TP=6 and TP=3 the shim and front end stay off the proxy CPUs (PROXY_CPU-7..PROXY_CPU), as the launchers do."""
+        """At TP=6 and TP=3 the shim and front end stay off the proxy CPUs (PROXY_CPU-7..PROXY_CPU), as the launchers do.
+        At TP=8 they also stay off the relay core PROXY_CPU-8: cores 0..PROXY_CPU-9 (0-10 at PROXY_CPU=19), and a box that
+        cannot pin them is refused rather than left unpinned."""
         cpu = int(self.o.get('PROXY_CPU'))
+        if self.o.get('TP') == '8':
+            if cpu < 9:
+                raise Stop(1, f'--proxy-cpu {cpu}: TP=8 needs 9 or more (proxies on PROXY_CPU-6..PROXY_CPU, the relay on '
+                              'PROXY_CPU-8, the shim and front end on 0..PROXY_CPU-9)')
+            if not shutil.which('taskset'):
+                raise Stop(1, 'TP=8 pins the shim and front end off the proxy and relay cores: no taskset on this box')
+            return ['taskset', '-c', f'0-{cpu - 9}']
         if self.o.get('TP') in ('6', '3') and cpu >= 8 and shutil.which('taskset'):
             return ['taskset', '-c', f'0-{cpu - 8}']
         return []
@@ -780,7 +892,7 @@ class Supervisor:
         sock = os.path.join(self.home, 'run', 'engine.sock')
         argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock,
                 '--sessions', self.o.get('SESS') or '8']
-        if self.o.get('TP') == '6':
+        if self.o.get('TP') in ('6', '8'):
             argv += ['--stall-timeout', '2400']
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
         for _ in range(150):
@@ -992,38 +1104,144 @@ def signal_pid(pid, sig, name, log=log):
         log(f'{name} (pid {pid}) belongs to another account: not stopped')
 
 
-def stop_local(home, log=log):
-    """What scripts/stop.sh does, on this box: shim and front end, then quit files, then the engine."""
-    out = os.path.join(home, 'out')
-    for p in ('front', 'shim'):
-        pid = recorded(os.path.join(out, f'{p}.pid'))
-        if pid:
-            signal_pid(pid, signal.SIGTERM, p, log)
-    pid = recorded(os.path.join(out, 'g6m4.pid'))
-    if not pid:
+STOPPED = ('front', 'shim', 'g6m4')     # what stop_local stops, by their out/<name>.id records
+VERIFIED = ('supervisor',) + STOPPED  # what verify_down checks
+
+
+def target(out, name):
+    """(pid, identity record or None) of out/<name> while that process runs, else (None, None). The .id record is the
+    proof (pid, start time, boot, cwd); a box with only the old .pid file falls back to its mtime check."""
+    rec = read_identity(out, name)
+    if rec:
+        return (rec['pid'], rec) if same_process(rec) else (None, None)
+    return recorded(os.path.join(out, f'{name}.pid')), None
+
+
+def running(pid, rec):
+    if rec:
+        return same_process(rec)
+    if not alive(pid):
         return False
-    if os.path.isdir(os.path.join(home, 's2')):
-        open(os.path.join(home, 's2', 'quit'), 'w').close()
-    for _ in range(100):
-        if not alive(pid):
-            break
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
+    who = identity(pid)
+    return who is not None           # a zombie answers kill(pid, 0) but has stopped
+
+
+def wait_gone(pid, rec, seconds):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:   # a zombie counts as gone: its parent reaps it (here, the Popen)
+        if not running(pid, rec):
+            return True
         time.sleep(0.1)
-    if alive(pid):
-        signal_pid(pid, signal.SIGTERM, 'engine', log)
-        for _ in range(50):
-            try:
-                os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                pass
-            if not alive(pid):
-                break
-            time.sleep(0.1)
-    log(f'engine (pid {pid}) stopped')
-    return True
+    return not running(pid, rec)
+
+
+def stop_local(home, log=log, grace=10.0, term_s=5.0, kill_s=5.0):
+    """What scripts/stop.sh does, on this box: shim and front end, then quit files, then the engine. Each process is
+    named by its recorded identity, so a recycled pid is never signalled. Whatever outlives TERM gets KILL, and a final
+    recheck says what is gone: a process that survives even KILL is logged as STILL RUNNING. Returns whether there was
+    an engine to stop."""
+    out = os.path.join(home, 'out')
+    found = {n: target(out, n) for n in STOPPED}
+    for n in ('front', 'shim'):
+        pid, rec = found[n]
+        if pid:
+            signal_pid(pid, signal.SIGTERM, n, log)
+    pid, rec = found['g6m4']
+    if pid:
+        if os.path.isdir(os.path.join(home, 's2')):
+            open(os.path.join(home, 's2', 'quit'), 'w').close()
+        if not wait_gone(pid, rec, grace):
+            signal_pid(pid, signal.SIGTERM, 'engine', log)
+            if not wait_gone(pid, rec, term_s):
+                log(f'engine (pid {pid}) outlived SIGTERM for {term_s:.0f}s: SIGKILL')
+                signal_pid(pid, signal.SIGKILL, 'engine', log)
+                wait_gone(pid, rec, kill_s)
+    for n in ('front', 'shim'):
+        p, r = found[n]
+        if p and not wait_gone(p, r, term_s):
+            log(f'{n} (pid {p}) outlived SIGTERM: SIGKILL')
+            signal_pid(p, signal.SIGKILL, n, log)
+            wait_gone(p, r, kill_s)
+    for n, (p, r) in found.items():
+        if p and running(p, r):
+            log(f'{"engine" if n == "g6m4" else n} (pid {p}) STILL RUNNING after SIGKILL')
+        elif p and n == 'g6m4':
+            log(f'engine (pid {pid}) stopped')
+    return bool(pid)
+
+
+def listening(ports, addrs=None, proc='/proc'):
+    """[(address, port)] of TCP sockets in LISTEN on any of ports (on one of addrs, or a wildcard, when addrs is given)."""
+    want, out = {int(p) for p in ports if p}, []
+    wild = {'0.0.0.0', '::'}
+    for name, fam in (('tcp', 4), ('tcp6', 6)):
+        try:
+            with open(os.path.join(proc, 'net', name)) as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            col = row.split()
+            if len(col) < 4 or col[3] != '0A':
+                continue
+            hexip, hexport = col[1].split(':')
+            port = int(hexport, 16)
+            if port not in want:
+                continue
+            raw = bytes.fromhex(hexip)
+            if fam == 4:
+                ip = socket.inet_ntop(socket.AF_INET, raw[::-1])
+            else:
+                ip = socket.inet_ntop(socket.AF_INET6, b''.join(raw[i:i + 4][::-1] for i in range(0, 16, 4)))
+                if ip.startswith('::ffff:'):
+                    ip = ip[7:]
+            if addrs is None or ip in wild or ip in addrs:
+                out.append((ip, port))
+    return sorted(set(out))
+
+
+def unix_listening(path, proc='/proc'):
+    """Whether a unix socket listens at path."""
+    try:
+        with open(os.path.join(proc, 'net', 'unix')) as f:
+            rows = f.read().splitlines()[1:]
+    except OSError:
+        return False
+    for row in rows:
+        col = row.split()
+        if len(col) >= 8 and col[-1] == path and int(col[3], 16) & 0x10000:   # __SO_ACCEPTCON
+            return True
+    return False
+
+
+def verify_down(home, ports, addrs=None, kill=False, log=log):
+    """What of this box's last boot is still up: the recorded supervisor, engine, front end and shim (by identity, not
+    by a successful `down`), TCP listeners on ports (the control, API and S2 ports) and the shim's socket. kill: SIGKILL
+    the recorded processes still running, then recheck. [] when everything is gone."""
+    out = os.path.join(home, 'out')
+
+    def look():
+        left = []
+        for n in VERIFIED:
+            pid, rec = target(out, n)
+            if pid:
+                left.append((f'{n} pid {pid} still runs' + (f' ({rec.get("exe")}, cwd {rec.get("cwd")})' if rec else ''),
+                             pid, rec, n))
+        for ip, port in listening(ports, addrs):
+            left.append((f'something listens on {ip}:{port}', None, None, None))
+        sock = os.path.join(home, 'run', 'engine.sock')
+        if unix_listening(sock):
+            left.append((f'something listens on {sock}', None, None, None))
+        return left
+    left = look()
+    if kill and any(p for _, p, _, _ in left):
+        for why, pid, rec, n in left:
+            if pid:
+                log(f'{why}: SIGKILL')
+                signal_pid(pid, signal.SIGKILL, n, log)
+                wait_gone(pid, rec, 5.0)
+        left = look()
+    return [why for why, _, _, _ in left]
 
 
 def main(o):

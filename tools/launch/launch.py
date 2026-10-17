@@ -3,6 +3,9 @@
 
     up [OPTIONS] [@FILE]       start this box's supervisor in the background and follow it until the cluster serves
     down                       stop every box of the last boot (or this box alone)
+    verify-down [--kill]       this box: exit 0 only when the last boot's supervisor, engine, front end and shim (by
+                               their recorded identity: pid, start time, boot, cwd) are gone and nothing listens on
+                               the control, API or S2 port or the shim socket; --kill SIGKILLs recorded survivors first
     restart [OPTIONS]          down, then up
     status                     every box: its state, the engine, MemAvailable; the head's shim, front end and /health
     logs [RANK|shim|front|supervisor] [-f]   a log, from any box
@@ -168,6 +171,23 @@ def cmd_down(argv):
     stopped = sv.stop_local(home, lambda s: print(s))
     print(f'this box: {"stopped" if pid or stopped else "nothing was running"}')
     return 0
+
+
+def cmd_verify_down(argv):
+    kill = '--kill' in argv
+    o = parse([a for a in argv if a != '--kill'], check=False)
+    out, home = out_dir(o), os.path.abspath(o.get('G6_HOME'))
+    hs = read_handshake(out) or {}
+    ports = [hs.get('control_port') or o.get('CONTROL_PORT'), hs.get('port') or o.get('PORT'),
+             hs.get('s2port') or o.get('S2PORT') or '7341']
+    addrs = None
+    if hs.get('members') and isinstance(hs.get('rank'), int):
+        addrs = {hs['members'][hs['rank']], '127.0.0.1'}
+    left = sv.verify_down(home, ports, addrs, kill=kill, log=lambda s: print(s))
+    for why in left:
+        print(f'not down: {why}')
+    print(f'this box: {"NOT DOWN (" + str(len(left)) + ")" if left else "down, verified"} (ports {",".join(map(str, ports))})')
+    return 1 if left else 0
 
 
 def cmd_status(argv):
@@ -378,7 +398,7 @@ def main(argv):
         cmd_down(rest)
         return cmd_up(rest)
     f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'logs': cmd_logs, 'show-config': cmd_show_config,
-         'check': cmd_check, 'prepare': cmd_prepare}.get(cmd)
+         'check': cmd_check, 'prepare': cmd_prepare, 'verify-down': cmd_verify_down}.get(cmd)
     if not f:
         print(f'gr8: unknown command {cmd}\n{__doc__}', file=sys.stderr)
         return 2
