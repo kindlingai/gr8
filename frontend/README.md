@@ -117,6 +117,7 @@ Engine `metrics` frame → Prometheus names (the same names vLLM uses, so the ex
 | `spec.drafts` / `.draft_tokens` / `.accepted` | `vllm:spec_decode_num_drafts_total` / `_num_draft_tokens_total` / `_num_accepted_tokens_total` |
 | `spec.accepted_per_pos[i]` | `vllm:spec_decode_num_accepted_tokens_per_pos_total{position="i"}` |
 | `kv.size_tokens` / `kv.active_tokens` | `vllm:kv_cache_size_tokens` / `vllm:kv_active_tokens` |
+| `kv.reserved_tokens` | `g6:s2_reserved_tokens` (reservation, not KV fill) |
 | `kv.size_tokens` + `kv.max_concurrency` | `vllm:cache_config_info{kv_cache_size_tokens=...,kv_cache_max_concurrency=...}` |
 | `tokens.cached` (and `tokens.prompt`) | `vllm:prompt_tokens_cached_total`, `vllm:prompt_tokens_by_source_total{source="local_cache_hit"\|"local_compute"}` |
 | `latency.ttft_sum` / `.ttft_count` | `vllm:time_to_first_token_seconds_sum` / `_count` |

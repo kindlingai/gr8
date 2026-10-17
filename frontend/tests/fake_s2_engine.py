@@ -241,8 +241,10 @@ class Fake:
 
     def status(self):
         free = self.a.pool_rows // 64 - self.pages_used
+        held = sum((len(s['prompt']) + s['emitted'] + 63) // 64 for s in self.res.values())
         body = json.dumps({'epoch': self.a.epoch, 'resident': len(self.res), 'queued': len(self.queue), 'retiring': 0,
-                           'reserved_pages': self.pages_used, 'free_pages': free, 'largest_free_run': free,
+                           'reserved_pages': self.pages_used, 'held_pages': held,
+                           'free_pages': free, 'largest_free_run': free,
                            'admission_stalls': 0, 'fragmentation_stalls': 0}) + '\n'
         tmp = os.path.join(self.d0, 'status.s2.tmp')
         open(tmp, 'w').write(body)

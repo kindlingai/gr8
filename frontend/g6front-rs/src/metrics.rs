@@ -85,7 +85,8 @@ pub fn render(m: &Value, model_name: &str) -> String {
     if let Some(kv) = m.get("kv") {
         for (key, name, help) in [
             ("size_tokens", "vllm:kv_cache_size_tokens", "KV cache pool capacity, in tokens."),
-            ("active_tokens", "vllm:kv_active_tokens", "KV cache tokens held by running requests."),
+            ("active_tokens", "vllm:kv_active_tokens", "KV cache tokens held by running requests (page-rounded)."),
+            ("reserved_tokens", "g6:s2_reserved_tokens", "KV cache tokens reserved for running requests, including unfilled room."),
         ] {
             if let Some(value) = kv.get(key).and_then(Value::as_f64) {
                 metric(name, "gauge", help, &[(String::new(), value)]);
@@ -266,7 +267,7 @@ mod tests {
     #[test]
     fn reported_values_are_exported() {
         let mut m = base();
-        m["kv"] = json!({"size_tokens": 393216, "active_tokens": 77376});
+        m["kv"] = json!({"size_tokens": 393216, "active_tokens": 77376, "reserved_tokens": 393216});
         m["latency"] = json!({"ttft_sum": 12.5, "ttft_count": 5});
         m["tokens"] = json!({"prompt": 1000, "generation": 10, "cached": 300});
         m["prefix_cache"] = json!({"queries": 900, "hits": 300});
@@ -274,6 +275,7 @@ mod tests {
         for (name, kind) in [
             ("vllm:kv_cache_size_tokens", "gauge"),
             ("vllm:kv_active_tokens", "gauge"),
+            ("g6:s2_reserved_tokens", "gauge"),
             ("vllm:prompt_tokens_cached_total", "counter"),
             ("vllm:prompt_tokens_by_source_total", "counter"),
             ("vllm:time_to_first_token_seconds_sum", "counter"),
@@ -285,6 +287,7 @@ mod tests {
         for want in [
             format!("vllm:kv_cache_size_tokens{{{LAB}}} 393216.0\n"),
             format!("vllm:kv_active_tokens{{{LAB}}} 77376.0\n"),
+            format!("g6:s2_reserved_tokens{{{LAB}}} 393216.0\n"),
             format!("vllm:time_to_first_token_seconds_sum{{{LAB}}} 12.5\n"),
             format!("vllm:time_to_first_token_seconds_count{{{LAB}}} 5.0\n"),
             format!("vllm:prompt_tokens_cached_total{{{LAB}}} 300.0\n"),
@@ -300,12 +303,13 @@ mod tests {
     #[test]
     fn partial_snapshots_do_not_fabricate_zeros() {
         let mut m = base();
-        m["kv"] = json!({"size_tokens": null, "active_tokens": "unknown"});
+        m["kv"] = json!({"size_tokens": null, "active_tokens": "unknown", "reserved_tokens": null});
         m["tokens"] = json!({"cached": 25});
         m["latency"] = json!({"ttft_count": 2});
         let t = render(&m, "test-model");
         assert!(!t.contains("vllm:kv_cache_size_tokens"));
         assert!(!t.contains("vllm:kv_active_tokens"));
+        assert!(!t.contains("g6:s2_reserved_tokens"));
         assert!(t.contains("vllm:prompt_tokens_cached_total"));
         assert!(!t.contains("vllm:prompt_tokens_by_source_total"));
         assert!(!t.contains("vllm:time_to_first_token_seconds_sum"));
@@ -327,18 +331,20 @@ mod tests {
         let t = render(&m, "test-model");
         assert!(t.contains(&format!("vllm:kv_cache_size_tokens{{{LAB}}} 100.0\n")));
         assert!(!t.contains("vllm:kv_active_tokens"));
+        assert!(!t.contains("g6:s2_reserved_tokens"));
         assert!(!t.contains("time_to_first_token"));
     }
 
     #[test]
     fn request_timing_and_concurrency_families() {
         let mut m = base();
-        m["kv"] = json!({"size_tokens": 408832, "active_tokens": 128, "max_concurrency": 8});
+        m["kv"] = json!({"size_tokens": 408832, "active_tokens": 128, "reserved_tokens": 512, "max_concurrency": 8});
         m["latency"] = json!({"ttft_sum": 3.5, "ttft_count": 2, "itl_sum": 1.25, "itl_count": 40, "prefill_sum": 3.0, "decode_sum": 4.5,
                               "prefill_tokens_sum": 9000, "gen_tokens_sum": 300, "gen_tokens_count": 2});
         let t = render(&m, "test-model");
         for want in [
             format!("vllm:inter_token_latency_seconds_sum{{{LAB}}} 1.25\n"),
+            format!("g6:s2_reserved_tokens{{{LAB}}} 512.0\n"),
             format!("vllm:inter_token_latency_seconds_count{{{LAB}}} 40.0\n"),
             format!("vllm:request_prefill_time_seconds_sum{{{LAB}}} 3.0\n"),
             format!("vllm:request_decode_time_seconds_sum{{{LAB}}} 4.5\n"),
