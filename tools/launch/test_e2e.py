@@ -512,6 +512,20 @@ class Hybrid8(unittest.TestCase):
             self.assertEqual(v.returncode, 0, f'box {i}: {v.stdout}{v.stderr}')
             self.assertIn('down, verified', v.stdout)
 
+    def test_a_local_down_reaches_no_other_box(self):
+        res = self.up_all(extra={i: ['--fab-deny', '1-2'] for i in range(TP8)})
+        self.assertTrue(all(rc == 0 for rc, _ in res), res)
+        hs = json.loads(read(os.path.join(self.homes[1], 'out', 'handshake.json')))
+        self.assertEqual(hs['routes'].count('\nR 1 2 ') + hs['routes'].count('\nR 2 1 '), 2)   # the denied pair relays
+        dn = self.gr8(2, 'down', '--local', timeout=90)
+        self.assertIn('--local: stopping this box only', dn.stdout)
+        self.assertNotIn('rank 0 (', dn.stdout)
+        self.assertEqual(self.gr8(2, 'verify-down').returncode, 0)
+        for i in (0, 3, 7):
+            st = json.loads(read(os.path.join(self.homes[i], 'out', 'gr8.state')))['state']
+            self.assertEqual(st, 'serving', i)
+            self.assertEqual(self.gr8(i, 'verify-down').returncode, 1)          # still up: not verified down
+
     def test_a_deny_relays_and_an_unroutable_table_refuses_every_box(self):
         res = self.up_all(extra={i: ['--fab-deny', '5-6'] for i in range(TP8)})
         for i, (rc, out) in enumerate(res):   # 6 keeps rank 7 as its only neighbour: rank 1 has none in common
