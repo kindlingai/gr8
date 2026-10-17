@@ -6,6 +6,8 @@
 # (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
 # (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule
 # and the MTP confidence stop), the S2 control barrier, the pool's page lists
+# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule,
+# the MTP confidence stop and the parallel drafter step (G6_DRAFT_PAR)), the S2 control barrier, the pool's page lists
 # and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
 # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
@@ -44,6 +46,8 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test"
 "$T/batch_insert_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_test.cpp" -o "$T/batch_kstop_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_draftpar_test.cpp" -o "$T/batch_draftpar_test"
+"$T/batch_draftpar_test"
 "$T/batch_kstop_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test"
 "$T/capture_barrier_test"

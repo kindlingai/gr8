@@ -64,6 +64,7 @@ manifest instead.
 | `MTP_KSTOP` | unset (0) | – | – | a request's solo MTP rounds chain and verify the drafts the MTP head is confident in: 1 = thresholds (`MTP_KSTOP_TAU`), 2 = the drafter choice's MTP estimates (`G6_MTP_KSTOP`). Needs `DFLASH=1`, `MTP` 2+ |
 | `MTP_KSTOP_KMAX` | unset (`MTP`) | – | – | `MTP_KSTOP`: the most drafts a solo MTP round chains, 1..3 (`G6_MTP_KSTOP_KMAX`) |
 | `MTP_KSTOP_TAU` | unset (`0,0.2,0.5`) | – | – | `MTP_KSTOP=1`: thresholds t1,t2,t3 on the drafts' cumulative probability (`G6_MTP_KSTOP_TAU`) |
+| `DRAFT_PAR` | unset (0) | – | – | a solo DFlash2 round's drafter step on its own stream under MTP's first form, 1, or 2 = drafting steps at high priority (`G6_DRAFT_PAR`; bit-exact). Needs `DFLASH=1` |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
