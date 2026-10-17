@@ -4,6 +4,7 @@
 #include "fabric_mtu.h"
 #include "progress_cpus.h"
 #include "relay.h"
+#include "route.h"
 #include "xtrace.h"
 #include "xtrail.h"
 
@@ -29,6 +30,8 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <mutex>
 #include <thread>
 #if !defined(__aarch64__)
@@ -325,7 +328,7 @@ struct Fabric::Impl {
   int pinned_cpu = -1;                               // CPU registered with progress_cpus.h (-1 = none)
   std::atomic<int> proxy_tid{0};                     // thread id of the running proxy, registered with progress_cpus.h (0 = none)
   std::atomic<bool> proxy_started{false};            // the proxy thread has pinned itself and registered its tid
-  int rail_of(int p, int me) const { return ring ? ring_rail[p] : nrails == 1 ? 0 : (p + me) % 2; }
+  int rail_of(int p, int me) const { return ring ? ring_rail[p] : hybrid ? hyb_rail[p] : nrails == 1 ? 0 : (p + me) % 2; }
   // ring mode: rails[0] direct-next, [1] direct-prev, [2] relay-out (also carries the diagonal's QP), [3] relay-in
   bool ring = false; int nxt = -1, prv = -1, dia = -1; int ring_rail[8] = {};
   RelayCtx relay;
@@ -333,22 +336,33 @@ struct Fabric::Impl {
   uint64_t* credit = nullptr;                        // the relay's credit: ring position forwarded (written by its NIC)
   uint64_t ring_addr = 0; uint32_t ring_rkey = 0;
   volatile unsigned* err = nullptr;
+  // hybrid: per destination, its first-hop rail and, for a relayed one, its own relay ring on the via (route.h)
+  struct HybDst { bool relayed = false; int via = -1; RelayOut rout; uint64_t* credit = nullptr; uint64_t ring_addr = 0; uint32_t ring_rkey = 0; };
+  bool hybrid = false; int me = -1; int hyb_rail[8] = {};
+  std::vector<HybDst> hd;                            // [nr], sized once before any pointer into it is taken
+  bool relayed(int p) const { return ring ? p == dia : hybrid && hd[p].relayed; }
   // the number of WRs post(p, wr) puts on the send queue
   int wrs(int p, const ibv_send_wr& wr) const {
     const uint32_t len = wr.sg_list[0].length;
-    return ring && p == dia && len > (uint32_t)kRelayInline ? 2 * (int)((len + kRelayChunk - 1) / kRelayChunk) : 1;
+    return relayed(p) && len > (uint32_t)kRelayInline ? 2 * (int)((len + kRelayChunk - 1) / kRelayChunk) : 1;
   }
   // post one write to peer p. The diagonal peer: each chunk of the payload goes into the relay ring, then a SEND gives
   // its position and destination offset (or the SEND carries a short payload itself). The last SEND takes the write's
   // signaled flag and wr_id. With the ring full, this waits for the relay's credit, and gives up after 30 s with the
   // error word set.
+  // hybrid: the same, through p's own relay ring on its via, and the header names the route (relay.h relay_kind).
   void post(int p, ibv_send_wr& wr) {
     ibv_send_wr* bad = nullptr;
-    if (!ring || p != dia) { FCHECK(ibv_post_send(qp[p], &wr, &bad) == 0); return; }
+    if (!relayed(p)) { FCHECK(ibv_post_send(qp[p], &wr, &bad) == 0); return; }
     FCHECK(wr.num_sge == 1 && wr.opcode == IBV_WR_RDMA_WRITE);
+    RelayOut& rout = hybrid ? hd[p].rout : this->rout;
+    uint64_t* const credit = hybrid ? hd[p].credit : this->credit;
+    const uint64_t ring_addr = hybrid ? hd[p].ring_addr : this->ring_addr;
+    const uint32_t ring_rkey = hybrid ? hd[p].ring_rkey : this->ring_rkey;
+    const uint32_t k_payload = hybrid ? relay_kind(0, p, me) : 0, k_inline = hybrid ? relay_kind(1, p, me) : 1;
     const uint64_t off = wr.wr.rdma.remote_addr - peer[p].addr, src = wr.sg_list[0].addr;
     const uint32_t len = wr.sg_list[0].length, lkey = wr.sg_list[0].lkey;
-    RelayHdr h{off, 0, len, 1};
+    RelayHdr h{off, 0, len, k_inline};
     ibv_sge hs[2]; hs[0] = ibv_sge{(uint64_t)&h, (uint32_t)sizeof h, 0};
     ibv_send_wr s{}; s.opcode = IBV_WR_SEND; s.sg_list = hs; s.num_sge = 1;
     if (len <= (uint32_t)kRelayInline) {
@@ -372,7 +386,7 @@ struct Fabric::Impl {
       ibv_sge ds{src + at, n, lkey};
       ibv_send_wr w{}; w.opcode = IBV_WR_RDMA_WRITE; w.sg_list = &ds; w.num_sge = 1; w.next = &s;
       w.wr.rdma.remote_addr = ring_addr + pos % kRelayRing; w.wr.rdma.rkey = ring_rkey;
-      h = RelayHdr{off + at, pos, n, 0};
+      h = RelayHdr{off + at, pos, n, k_payload};
       const bool last = at + n == len;
       s.wr_id = last ? wr.wr_id : 0; s.send_flags = IBV_SEND_INLINE | (last ? (wr.send_flags & IBV_SEND_SIGNALED) : 0);
       FCHECK(ibv_post_send(qp[p], &w, &bad) == 0);
@@ -394,6 +408,202 @@ struct Fabric::Impl {
 
 // Process exit keeps today's behaviour: stop the proxy only. A peer may still be writing, and the CUDA context may be
 // gone, so freeing happens only in an explicit close().
+// ---- hybrid (FabricConfig::hybrid) ----------------------------------------------------------------------------------
+// The route file (route.h) names, for every pair, a direct rail or a via rank. QPs by role:
+//   direct to p       one QP on the pair's rail, writes p's receive region
+//   origin me->d      orq[d] on the rail toward the via, writes d's relay ring on the via (+ the via's credit word back)
+//   via for o->d      a RelayCtx: ri from o (the ring, notices, credits), fwd to d (d's receive region)
+//   destination o->me fin[o] on the rail toward the via: the target of the via's fwd
+// One allgather of a fixed HybInfo, then each pair connects. Every failure names the pair and stops before any QP connects.
+struct HybInfo {
+  uint64_t magic, route_hash; uint32_t rank, nr;
+  QPInfo direct[kRelayMaxRanks], orq[kRelayMaxRanks], ri[kRelayMaxRanks][kRelayMaxRanks], fwd[kRelayMaxRanks][kRelayMaxRanks], fin[kRelayMaxRanks];
+};
+constexpr uint64_t kHybMagic = 0x6738687962726964ull;   // "g8hybrid"
+
+static void hybrid_init(Fabric::Impl& I, const FabricConfig& cfg, const FabricDev& dev) {
+  const int me = cfg.rank, nr = I.nr;
+  // every hybrid rank has the error word before any role is set up: an origin with no relay context waits on credits too
+  I.err = dev.error;
+  I.hybrid = true; I.me = me;
+  FCHECK(nr >= 2 && nr <= kRelayMaxRanks && cfg.ips2.empty() && !cfg.ring);
+  std::string text;
+  { std::ifstream f(cfg.routes_file, std::ios::binary); FCHECK(f.good());
+    text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); }
+  RouteTable t; std::string why;
+  if (!route_parse(text, nr, &t, &why) || !route_ports_match(t, me, cfg.fab_ports, &why)) {
+    fprintf(stderr, "[fabric r%d] hybrid routes %s refused: %s\n", me, cfg.routes_file.c_str(), why.c_str());
+    FCHECK(!"hybrid route table");
+  }
+  const RoutePlan plan = route_plan(t, me);
+  const std::string sha = route_sha256(text);
+  uint64_t rhash = 0; for (int i = 0; i < 16; i++) rhash = rhash << 4 | (uint64_t)(sha[i] <= '9' ? sha[i] - '0' : sha[i] - 'a' + 10);
+  fprintf(stderr, "[fabric r%d] hybrid: routes sha %s, %d direct, %d relayed, %zu relay contexts, %zu final routes, %zu rails\n",
+          me, sha.c_str(), (int)std::count_if(plan.peer.begin(), plan.peer.end(), [](const RoutePlan::Peer& x) { return !x.relayed; }) - 1,
+          (int)std::count_if(plan.peer.begin(), plan.peer.end(), [](const RoutePlan::Peer& x) { return x.relayed; }),
+          plan.ctx.size(), plan.fin.size(), plan.local_ips.size());
+  // one rail per distinct local address, the GID of that exact IPv4 (find_dev); two addresses on one device are refused
+  FCHECK(plan.local_ips.size() >= 1 && plan.local_ips.size() <= 4);
+  I.nrails = (int)plan.local_ips.size();
+  auto rail_at = [&](const std::string& ip) {
+    for (int r = 0; r < I.nrails; r++) if (plan.local_ips[r] == ip) return r;
+    FCHECK(!"hybrid: address not opened"); return -1;
+  };
+  for (int r = 0; r < I.nrails; r++) {
+    Rail& R = I.rails[r];
+    R.di = find_dev(plan.local_ips[r]);
+    for (int q = 0; q < r; q++)
+      if (I.rails[q].di.dev == R.di.dev) {
+        fprintf(stderr, "[fabric r%d] hybrid: %s and %s are both on %s (netdev %s): one address per device\n", me,
+                plan.local_ips[q].c_str(), plan.local_ips[r].c_str(), R.di.dev.c_str(), R.di.netdev.c_str());
+        FCHECK(!"hybrid: ambiguous local device");
+      }
+    int n; ibv_device** list = ibv_get_device_list(&n); FCHECK(list);
+    for (int i = 0; i < n; i++) if (R.di.dev == ibv_get_device_name(list[i])) R.ctx = ibv_open_device(list[i]);
+    ibv_free_device_list(list); FCHECK(R.ctx);
+    R.pd = ibv_alloc_pd(R.ctx); FCHECK(R.pd);
+    R.cq = ibv_create_cq(R.ctx, 8192, nullptr, nullptr, 0); FCHECK(R.cq);
+    FCHECK(ibv_query_gid(R.ctx, 1, R.di.gid_index, &R.gid) == 0);
+    R.mr = ibv_reg_mr(R.pd, I.region, I.region_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE); FCHECK(R.mr);
+    fprintf(stderr, "[fabric r%d] hybrid rail %d: %s netdev %s dev %s gid %d\n", me, r, plan.local_ips[r].c_str(),
+            R.di.netdev.c_str(), R.di.dev.c_str(), R.di.gid_index);
+  }
+  auto mkqp = [&](Rail& R, ibv_cq* cq, int send_wr, int recv_wr, int sge, int inl, ibv_qp_cap* actual) {
+    ibv_qp_init_attr ia{}; ia.send_cq = ia.recv_cq = cq ? cq : R.cq; ia.qp_type = IBV_QPT_RC;
+    ia.cap.max_send_wr = send_wr; ia.cap.max_recv_wr = recv_wr; ia.cap.max_send_sge = sge; ia.cap.max_recv_sge = 1;
+    ia.cap.max_inline_data = inl;
+    ibv_qp* q = ibv_create_qp(R.pd, &ia); FCHECK(q);
+    if (actual) *actual = ia.cap;
+    ibv_qp_attr at{}; at.qp_state = IBV_QPS_INIT; at.port_num = 1; at.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+    FCHECK(ibv_modify_qp(q, &at, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0);
+    return q;
+  };
+  // PSN unique per (role, a, b) on this rank; the peer takes it from the allgather
+  auto info = [&](ibv_qp* q, Rail& R, uint32_t rkey, uint64_t addr, int role, int a, int b) {
+    QPInfo x{q->qp_num, (uint32_t)(((uint32_t)(me * 4099 + role * 577 + a * 61 + b * 7) & 0xfffff) + 1), rkey, addr, {}};
+    memcpy(x.gid, R.gid.raw, 16); return x;
+  };
+  auto connect = [&](ibv_qp* q, Rail& R, const QPInfo& mine, const QPInfo& pi, const char* what, int a, int b) {
+    if (!pi.qpn) { fprintf(stderr, "[fabric r%d] hybrid: no peer QP for %s %d->%d (the tables disagree)\n", me, what, a, b); FCHECK(!"hybrid peer QP"); }
+    ibv_qp_attr at{}; at.qp_state = IBV_QPS_RTR; at.path_mtu = IBV_MTU_4096; at.dest_qp_num = pi.qpn; at.rq_psn = pi.psn;
+    at.max_dest_rd_atomic = 1; at.min_rnr_timer = 12;
+    at.ah_attr.is_global = 1; memcpy(at.ah_attr.grh.dgid.raw, pi.gid, 16); at.ah_attr.grh.sgid_index = R.di.gid_index;
+    at.ah_attr.grh.hop_limit = 64; at.ah_attr.port_num = 1;
+    FCHECK(ibv_modify_qp(q, &at, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) == 0);
+    ibv_qp_attr as{}; as.qp_state = IBV_QPS_RTS; as.timeout = 14; as.retry_cnt = 7; as.rnr_retry = 7; as.sq_psn = mine.psn; as.max_rd_atomic = 1;
+    FCHECK(ibv_modify_qp(q, &as, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) == 0);
+  };
+  const uint64_t recv = (uint64_t)dev.recv;
+  const int inl = I.bulk ? 64 : 0;
+  I.qp.assign(nr, nullptr); I.unsignaled.assign(nr, 0); I.peer.assign(nr, QPInfo{});
+  I.hd.assign(nr, Fabric::Impl::HybDst{});            // stable from here on: post() holds no pointer across a resize
+  std::unique_ptr<HybInfo> mi(new HybInfo); memset(mi.get(), 0, sizeof *mi);
+  mi->magic = kHybMagic; mi->route_hash = rhash; mi->rank = (uint32_t)me; mi->nr = (uint32_t)nr;
+  // direct peers and relayed origins
+  std::vector<ibv_qp*> qdir(nr, nullptr), qorq(nr, nullptr);
+  for (int p = 0; p < nr; p++) {
+    if (p == me) continue;
+    const RoutePlan::Peer& x = plan.peer[p];
+    const int r = rail_at(x.ip);
+    Rail& R = I.rails[r];
+    I.hyb_rail[p] = r;                                // the first hop's rail: QP, lkey and CQ for every write to p
+    if (!x.relayed) {
+      qdir[p] = mkqp(R, nullptr, 2048, 1, 1, inl, nullptr);
+      mi->direct[p] = info(qdir[p], R, R.mr->rkey, recv, 1, me, p);
+    } else {
+      Fabric::Impl::HybDst& D = I.hd[p];
+      D.relayed = true; D.via = x.via;
+      CUCHECK(cudaHostAlloc((void**)&D.credit, 64, cudaHostAllocPortable)); memset(D.credit, 0, 64);
+      ibv_mr* cmr = ibv_reg_mr(R.pd, D.credit, 64, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE); FCHECK(cmr);
+      qorq[p] = mkqp(R, nullptr, 4096, 1, 2, 128, nullptr);
+      mi->orq[p] = info(qorq[p], R, cmr->rkey, (uint64_t)D.credit, 2, me, p);
+    }
+  }
+  // relay contexts (one per route I relay) and final-hop QPs (one per relayed route that ends at me)
+  std::vector<RelayCtx*> ctxs;
+  for (const RoutePlan::Ctx& c : plan.ctx) {
+    Rail& Ri = I.rails[rail_at(c.ip_in)];
+    Rail& Ro = I.rails[rail_at(c.ip_out)];
+    RelayCtx* X = new RelayCtx();                    // process lifetime, like the ring's: the relay thread holds it
+    X->hybrid = true; X->src = c.src; X->dst = c.dst; X->rank = me; X->err = dev.error;
+    CUCHECK(cudaHostAlloc((void**)&X->ring, kRelayRing, cudaHostAllocPortable));
+    ibv_mr* rin = ibv_reg_mr(Ri.pd, X->ring, kRelayRing, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE); FCHECK(rin);
+    ibv_mr* rout = ibv_reg_mr(Ro.pd, X->ring, kRelayRing, IBV_ACCESS_LOCAL_WRITE); FCHECK(rout);
+    X->ring_lkey = rout->lkey;
+    CUCHECK(cudaHostAlloc((void**)&X->rbuf, (size_t)kRelayRecv * kRelayBuf, cudaHostAllocPortable));
+    ibv_mr* rmr = ibv_reg_mr(Ri.pd, X->rbuf, (size_t)kRelayRecv * kRelayBuf, IBV_ACCESS_LOCAL_WRITE); FCHECK(rmr);
+    X->rbuf_lkey = rmr->lkey;
+    X->ri_cq = ibv_create_cq(Ri.ctx, kRelayRecv + (int)kRelayCredit, nullptr, nullptr, 0); FCHECK(X->ri_cq);
+    X->fwd_cq = ibv_create_cq(Ro.ctx, 4096, nullptr, nullptr, 0); FCHECK(X->fwd_cq);
+    ibv_qp_cap credit_cap{};
+    X->ri = mkqp(Ri, X->ri_cq, (int)kRelayCredit, kRelayRecv, 1, 64, &credit_cap);
+    X->credit_sq_capacity = credit_cap.max_send_wr;
+    X->credits.capacity = std::min<unsigned>(kRelayCredit, X->credit_sq_capacity);
+    FCHECK(X->credits.capacity > 0);
+    X->fwd = mkqp(Ro, X->fwd_cq, 2048, 1, 1, 64, nullptr);
+    for (int i = 0; i < kRelayRecv; i++) {
+      ibv_sge rs{(uint64_t)(X->rbuf + (size_t)i * kRelayBuf), kRelayBuf, X->rbuf_lkey};
+      ibv_recv_wr rw{}, *bad = nullptr; rw.wr_id = (uint64_t)i; rw.sg_list = &rs; rw.num_sge = 1;
+      FCHECK(ibv_post_recv(X->ri, &rw, &bad) == 0);
+    }
+    X->ri_dev = Ri.di.dev;
+    mi->ri[c.src][c.dst] = info(X->ri, Ri, rin->rkey, (uint64_t)X->ring, 3, c.src, c.dst);
+    mi->fwd[c.src][c.dst] = info(X->fwd, Ro, 0, 0, 4, c.src, c.dst);
+    ctxs.push_back(X);
+  }
+  std::vector<ibv_qp*> qfin(nr, nullptr);
+  for (const RoutePlan::Fin& f : plan.fin) {
+    Rail& R = I.rails[rail_at(f.ip)];
+    qfin[f.src] = mkqp(R, nullptr, 1, 1, 1, 0, nullptr);
+    mi->fin[f.src] = info(qfin[f.src], R, R.mr->rkey, recv, 5, f.src, me);
+  }
+  // exchange, then refuse any rank whose table differs, before connecting anything
+  auto all = allgather(me, nr, cfg.ips[0], cfg.port, mi.get(), sizeof *mi);
+  const HybInfo* A = (const HybInfo*)all.data();
+  for (int r = 0; r < nr; r++)
+    if (A[r].magic != kHybMagic || A[r].rank != (uint32_t)r || A[r].nr != (uint32_t)nr || A[r].route_hash != rhash) {
+      fprintf(stderr, "[fabric r%d] hybrid: rank %d has another route table or config (hash %016llx, mine %016llx)\n", me, r,
+              (unsigned long long)A[r].route_hash, (unsigned long long)rhash);
+      FCHECK(!"hybrid: route tables differ across ranks");
+    }
+  for (int p = 0; p < nr; p++) {
+    if (p == me) continue;
+    Rail& R = I.rails[I.hyb_rail[p]];
+    if (!I.hd[p].relayed) {
+      connect(qdir[p], R, mi->direct[p], A[p].direct[me], "direct", me, p);
+      I.qp[p] = qdir[p]; I.peer[p] = A[p].direct[me];
+    } else {
+      Fabric::Impl::HybDst& D = I.hd[p];
+      const QPInfo& via_ri = A[D.via].ri[me][p];       // p's relay ring on the via: post() writes there
+      connect(qorq[p], R, mi->orq[p], via_ri, "origin", me, p);
+      I.qp[p] = qorq[p]; I.peer[p] = via_ri;
+      D.ring_addr = via_ri.addr; D.ring_rkey = via_ri.rkey;
+    }
+  }
+  for (size_t i = 0; i < plan.ctx.size(); i++) {
+    const RoutePlan::Ctx& c = plan.ctx[i];
+    RelayCtx& X = *ctxs[i];
+    connect(X.ri, I.rails[rail_at(c.ip_in)], mi->ri[c.src][c.dst], A[c.src].orq[c.dst], "relay-in", c.src, c.dst);
+    connect(X.fwd, I.rails[rail_at(c.ip_out)], mi->fwd[c.src][c.dst], A[c.dst].fin[c.src], "forward", c.src, c.dst);
+    X.fin_addr = A[c.dst].fin[c.src].addr; X.fin_rkey = A[c.dst].fin[c.src].rkey;    // d's receive base
+    X.cred_addr = A[c.src].orq[c.dst].addr; X.cred_rkey = A[c.src].orq[c.dst].rkey;  // o's credit word for this route
+  }
+  for (const RoutePlan::Fin& f : plan.fin)
+    connect(qfin[f.src], I.rails[rail_at(f.ip)], mi->fin[f.src], A[f.via].fwd[f.src][me], "final", f.src, me);
+  // publish the contexts only now, every pointer and key set
+  if (!ctxs.empty()) {
+    std::lock_guard<std::mutex> lk(g_relay_mu);
+    const int k = g_nrelay.load();
+    if (k + ctxs.size() > kRelayMaxContexts) {
+      fprintf(stderr, "[fabric r%d] hybrid: %zu relay contexts on top of %d exceed %u\n", me, ctxs.size(), k, kRelayMaxContexts);
+      FCHECK(!"relay context capacity");
+    }
+    for (size_t i = 0; i < ctxs.size(); i++) g_relay[k + i] = ctxs[i];
+    g_nrelay.store(k + (int)ctxs.size(), std::memory_order_release);
+    if (!g_relay_started) { g_relay_started = true; std::thread(relay_loop, cfg.relay_cpu).detach(); }
+  }
+}
+
 Fabric::~Fabric() { stop_proxy(); }
 
 FabricLive fabric_live() {
@@ -410,10 +620,10 @@ FabricLive fabric_live() {
 void Fabric::close() {
   if (!impl_) return;
   Impl& I = *impl_;
-  if (!I.ring && I.pending.load() != 0 && (!I.th.joinable() || I.exited.load() || !wait_proxy_idle(60.0)))
+  if (!I.ring && !I.hybrid && I.pending.load() != 0 && (!I.th.joinable() || I.exited.load() || !wait_proxy_idle(60.0)))
     fprintf(stderr, "[fabric r%d] close: %ld jobs were not posted; peers waiting on them will time out\n", cfg_.rank, I.pending.load());
   stop_proxy();
-  if (I.ring) return;                                  // mesh only (#154): the object stays as it is (fabric.h)
+  if (I.ring || I.hybrid) return;                      // mesh only (#154): ring and hybrid stay as they are (fabric.h)
   // Report what the proxy never saw. It polls the CQ only while it posts, so a write that fails after the last post of
   // a run (retries exhausted, a flushed queue) is still in the CQ here, and its QP has left RTS. Teardown only; silent
   // when every QP is in RTS and every completion was good.
@@ -512,6 +722,12 @@ void Fabric::init(const FabricConfig& cfg) {
   }
   I.xenv = xtrace_env();
 
+  if (cfg.hybrid) {                                   // per-pair route table (hybrid_init above)
+    g_live_ring.fetch_add(1);                         // counted with the ring fabrics: close() does not free it
+    hybrid_init(I, cfg_, dev_);
+    barrier();
+    return;
+  }
   if (cfg.ring) {                                     // switchless ring (see RelayHdr above)
     FCHECK(nr == 3 || nr == 4);
     g_live_ring.fetch_add(1);

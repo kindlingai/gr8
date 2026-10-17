@@ -39,6 +39,11 @@ struct FabricConfig {
   bool ring = false;
   std::vector<std::string> ring_devs;  // relay-out, direct-next, relay-in, direct-prev (empty = the GB10 CX-7 names)
   int relay_cpu = -1;                  // pin the relay thread to this CPU (-1 = no pinning)
+  // hybrid (fabric.cpp, route.h): a per-pair route table. Each pair is direct on one named rail, or relayed by one via
+  // rank (the ring's relay, one context per directed route). ips then only says where the TCP bootstrap goes.
+  bool hybrid = false;
+  std::string routes_file;              // the route file (route.h format), the same bytes on every rank
+  std::vector<std::string> fab_ports;   // this box's declared fabric addresses (ip/prefix): must equal my P record
 };
 
 // bulk mode kernel view (pinned host, device-mapped). flags[(f * nr + p) * 2 + {0, 1}] = {val, aux} written by peer p as
