@@ -14,6 +14,34 @@ constexpr unsigned kRelayCreditSignal = 32;    // one credit CQE retires this ba
 
 inline uint64_t relay_pad(uint64_t len) { return (len + 63) & ~63ull; }
 
+// The notice SEND that follows a ring payload (kind 0: len bytes at ring position pos) or carries a short write itself
+// (kind 1). The legacy ring writes kind exactly 0 or 1. A hybrid route (FabricConfig::hybrid) packs the route into it:
+// kind = k | dst << 8 | src << 16, bits 24..31 zero, so a miswired relay fails at once instead of writing into the wrong
+// rank's region. Every kind test of the relay uses the decoded k.
+struct RelayHdr { uint64_t off, pos; uint32_t len, kind; };
+static_assert(sizeof(RelayHdr) == 24, "RelayHdr is 24 bytes: kRelayInline = 64 - 24 depends on it");
+constexpr int kRelayMaxRanks = 8;
+constexpr unsigned kRelayMaxContexts = 128;   // relay contexts per process (6 TP8 Fabrics x 10 routes on a via rank = 60)
+inline uint32_t relay_kind(uint32_t k, int dst, int src) { return k | (uint32_t)dst << 8 | (uint32_t)src << 16; }
+
+// Check a received header against the context it arrived on. hybrid: the packed route must be exactly (src, dst) of the
+// context; legacy: kind is 0 or 1. Then: k = 1 carries at most `inline_max` bytes; k = 0 is 1..chunk bytes. byte_len (the
+// received SEND length) is checked in hybrid mode only: header + inline bytes, or the header alone. *k = the decoded kind.
+inline bool relay_header_ok(const RelayHdr& h, bool hybrid, int src, int dst, uint32_t byte_len, uint32_t inline_max,
+                            uint32_t chunk, uint32_t* k) {
+  if (!hybrid) {
+    *k = h.kind;
+    return !(h.kind > 1 || (h.kind == 1 && h.len > inline_max));
+  }
+  const uint32_t kk = h.kind & 0xff, d = h.kind >> 8 & 0xff, s = h.kind >> 16 & 0xff;
+  *k = kk;
+  if (h.kind >> 24 || kk > 1) return false;
+  if (d >= (uint32_t)kRelayMaxRanks || s >= (uint32_t)kRelayMaxRanks || d == s) return false;
+  if ((int)d != dst || (int)s != src) return false;
+  if (kk == 1) return h.len <= inline_max && byte_len == sizeof(RelayHdr) + h.len;
+  return h.len > 0 && h.len <= chunk && byte_len == sizeof(RelayHdr);
+}
+
 // Positions are monotonic byte counts, and position % ring is the offset in the ring. done is the relay's credit: every
 // byte below it has been forwarded, so it may be overwritten.
 struct RelayOut {
@@ -57,6 +85,11 @@ struct RelayCreditQueue {
 
 // Both the ordinary poll and the queue-full drain consume the same signaled forward completions. Keep their credit
 // advance identical: a payload completion's wr_id is the first ring position the origin may reuse.
+// A relay's forward queue that stays full with no completion for this long fails its Fabric (error 0x75000002), so the
+// one relay thread returns to the other contexts. Not a timeout of healthy traffic: a forward completes on the
+// destination NIC's ACK alone.
+inline double relay_drain_stall_s = 10.0;
+
 inline void relay_forward_completed(int& in_flight, std::deque<int>& batches, uint64_t wr_id, uint64_t& done) {
   if (!batches.empty()) { in_flight -= batches.front(); batches.pop_front(); }
   if (wr_id) done = wr_id;
