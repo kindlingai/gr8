@@ -257,7 +257,7 @@ p0() {
   ROUTES_SHA=$(rsh "${TP8_BOXES[0]}" 60 "python3 $TP8_HOME/tools/launch/routes.py ${ports[*]} ${deny:+--deny $deny}" \
                | tee -a "$LOG" | sed -n 's/^routes sha \([0-9a-f]\{64\}\)$/\1/p')
   [ -n "$ROUTES_SHA" ] || die "routes.py dry run refused the declared ports"
-  echo "$ROUTES_SHA" > "$LOCAL/routes.sha"
+  echo "$ROUTES_SHA" > "$LOCAL/routes-expected.sha"
   if [ -n "${BASE_SPEED_CMD:-}" ]; then   # report only: the same speed row on a live serve, for compare
     say "P0 base speed row on $BASE_SPEED_HOST (report only)"
     rsh "$BASE_SPEED_HOST" "${BASE_SPEED_S:-600}" "$BASE_SPEED_CMD" > "$LOCAL/speed-base.txt" 2>&1 || say "P0: base speed row failed (not a gate)"
@@ -338,14 +338,13 @@ cmd_run() {
   done
   cmp -s "$LOCAL/chat1.txt" "$LOCAL/chat2.txt" || { say "P6: the two temperature-0 chats differ"; ok=0; }
   healthy "${TP8_BOXES[0]}" "$TP8_URL" || ok=0
+  mkdir -p "$LOCAL/routes-receipts"
   for h in "${TP8_BOXES[@]}"; do
     rsh "$h" 30 "grep -o 'routes sha [0-9a-f]*' $TP8_HOME/out/supervisor.log | tail -1; sha256sum $TP8_HOME/run/routes.txt" \
-      > "$LOCAL/routes.$h" 2>> "$LOG"
+      > "$LOCAL/routes-receipts/$h" 2>> "$LOG"
   done
-  shas=$(cat "$LOCAL"/routes.* | grep -oE '[0-9a-f]{64}' | sort | uniq -c)
-  echo "$shas" >> "$LOG"
-  [ "$(echo "$shas" | awk -v s="$ROUTES_SHA" '$2 == s {print $1}')" = 16 ] && [ "$(echo "$shas" | wc -l)" = 1 ] \
-    || { say "P6: the 8 boxes' routes sha (log + run/routes.txt) are not all $ROUTES_SHA"; ok=0; }
+  routes_receipts_ok "$LOCAL/routes-receipts" "$ROUTES_SHA" "${TP8_BOXES[@]}" >> "$LOG" 2>&1 \
+    || { say "P6: not every box's routes receipt (supervisor log + run/routes.txt) is $ROUTES_SHA"; ok=0; }
   for h in "${TP8_BOXES[@]}"; do   # best effort, bounded
     mkdir -p "$LOCAL/logs/$h"
     timeout 120 scp -q -o ConnectTimeout=10 -o BatchMode=yes "$SSH_USER@$h:$TP8_HOME/out/*.log" "$SSH_USER@$h:$TP8_HOME/out/*.err" \
@@ -360,6 +359,19 @@ cmd_run() {
     fi
   fi
   if [ $ok = 1 ]; then finish "TP8 PASS"; else finish "TP8 FAIL at P6"; fi
+}
+
+# routes_receipts_ok DIR SHA HOST...: DIR/<host> for every host, each exactly 2 sha256 (the supervisor log's routes sha
+# line, then run/routes.txt), both SHA. By name per host, not a count over a glob (precheck B1: the glob also caught the
+# P0 expectation file, so a correct boot counted 17 of 16, and a missing host could still make 16).
+routes_receipts_ok() {
+  local d=$1 want=$2 h got rc=0; shift 2
+  for h in "$@"; do
+    if [ ! -s "$d/$h" ]; then echo "routes receipt $h: missing"; rc=1; continue; fi
+    got=$(grep -oE '[0-9a-f]{64}' "$d/$h" | tr '\n' ' ')
+    if [ "$got" = "$want $want " ]; then echo "routes receipt $h: OK"; else echo "routes receipt $h: BAD [$got]"; rc=1; fi
+  done
+  return $rc
 }
 
 cmd_cmds() {   # CONF: every remote command, NAME TAB HOSTS TAB CMD; runs nothing
@@ -384,6 +396,8 @@ cmd_cmds() {   # CONF: every remote command, NAME TAB HOSTS TAB CMD; runs nothin
   done
   return 0
 }
+
+[ "${TP8_WINDOW_LIB:-}" = 1 ] && return 0   # sourced by a test for its functions
 
 case "${1:-}" in
   cmds) [ $# = 2 ] || { echo "usage: $0 cmds CONF" >&2; exit 2; }; cmd_cmds "$2" ;;
