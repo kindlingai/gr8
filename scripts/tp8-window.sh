@@ -28,6 +28,7 @@
 # TP8 head after a P6 PASS when at most SPEED_MAX_ELAPSED s have passed (bounded by SPEED_S, added to T_MAX).
 set -u
 ME=$(readlink -f "$0")
+UNIT_STOP_S=120 STOP_S=300   # remote caps (s) of a launch-unit stop (90 s stop + reads) and of a serve's stop hook
 
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a "${LOG:-/dev/stderr}" >&2; }
 die() { say "ABORT: $*"; exit 1; }
@@ -67,6 +68,9 @@ load() {
     [ "$(svboxes "$s" | wc -l)" -ge 1 ] || die "$1: ${s}_BOXES is empty"
     [ "$(sv "$s" CANARY_MD5)" = exit0 ] || [ -n "$(sv "$s" CANARY_OUT)" ] || die "$1: ${s}_CANARY_OUT is not set"
   done
+  local p1=0
+  for s in "${SERVES[@]}"; do p1=$((p1 + $(svd "$s" DOWN_S 300) + 20 + UNIT_STOP_S + 20 + STOP_S + 20)); done
+  [ "$B_P1" -ge "$p1" ] || die "$1: B_P1=$B_P1 < $p1 s, the sum of P1's caps (head down + unit stop + stop, + 20 s ssh each)"
   T_MAX=$((B_P0 + B_ARM + B_P1 + B_P2 + B_P3 + B_P4 + B_P5 + B_P6 + ${SPEED_CMD:+${SPEED_S:-600} +} B_RESTORE + B_MARGIN))
 }
 
@@ -109,11 +113,21 @@ local_stop_cmd() {   # HOME ENV: this box's processes of the last boot from HOME
 # unit_stop_cmd PATTERN: this run's launch units first (precheck w2v41 B1: a late up in a unit could spawn after an
 # identity-based "down, verified"). Stop every loaded unit matching PATTERN (SIGTERM to its whole cgroup, SIGKILL after
 # TimeoutStopSec), then verify: no matching unit is still loaded+active and no matching cgroup holds a process.
-# Exit 1 = not stopped; the caller's stop then fails (nothing is started over it).
+# Fail closed (precheck w2v42 B1): exit 1 = not stopped OR not known. A stop that fails (rc other than 0 or 5 = not
+# loaded), a failed list-units, a missing cgroup v2 tree, or a cgroup.procs read that fails for any reason but "No such
+# file or directory" (= the unit's cgroup is gone) is NOT VERIFIED. The caller's stop then fails; nothing starts over it.
 unit_stop_cmd() {
-  printf '%s' "u='$1.service'; timeout 90 systemctl stop \"\$u\" 2>&1 | grep -v 'not loaded' ; \
-l=\$(systemctl list-units --all --plain --no-legend \"\$u\" | awk '\$3 != \"inactive\" && \$3 != \"failed\" {print \$1}' | tr '\\n' ' '); \
-n=\$(cat /sys/fs/cgroup/system.slice/\$u/cgroup.procs 2>/dev/null | wc -l); \
+  printf '%s' "u='$1.service'; so=\$(timeout 90 systemctl stop \"\$u\" 2>&1); sr=\$?; \
+[ -n \"\$so\" ] && printf '%s\n' \"\$so\" | grep -v 'not loaded'; \
+case \$sr in 0|5) ;; *) echo \"launch units \$u NOT VERIFIED: systemctl stop rc \$sr\"; exit 1 ;; esac; \
+lo=\$(systemctl list-units --all --plain --no-legend \"\$u\") || { echo \"launch units \$u NOT VERIFIED: list-units failed\"; exit 1; }; \
+l=\$(printf '%s\n' \"\$lo\" | awk 'NF && \$3 != \"inactive\" && \$3 != \"failed\" {print \$1}' | tr '\\n' ' '); \
+[ -d /sys/fs/cgroup/system.slice ] || { echo \"launch units \$u NOT VERIFIED: no /sys/fs/cgroup/system.slice\"; exit 1; }; \
+n=0; for f in /sys/fs/cgroup/system.slice/\$u/cgroup.procs; do \
+co=\$(cat \"\$f\" 2>&1); cr=\$?; \
+if [ \$cr = 0 ]; then n=\$((n + \$(printf '%s\n' \"\$co\" | grep -c '[0-9]'))); \
+else case \"\$co\" in *'No such file or directory'*) ;; *) echo \"launch units \$u NOT VERIFIED: \$f: \$co\"; exit 1 ;; esac; fi; \
+done; \
 if [ -z \"\$l\" ] && [ \"\$n\" = 0 ]; then echo \"launch units \$u: none running, verified\"; \
 else echo \"launch units \$u NOT STOPPED: active [\$l] processes \$n\"; exit 1; fi"
 }
@@ -127,9 +141,11 @@ tp8_verify_cmd() { echo "cd $(printf %q "$TP8_HOME") && python3 tools/launch/lau
 # (HOME and PATH are copied from the ssh session: a unit gets no HOME and a minimal PATH otherwise)
 detach() { echo "${DETACH:-$SYSTEMD_RUN --quiet --collect -p RemainAfterExit=yes -p TimeoutStopSec=30 --setenv=HOME --setenv=PATH} --unit=$1 /bin/bash -c $(printf %q "$2")"; }
 tp8_up_cmd() { detach "tp8-up-${RUN_ID:-RUNID}" "cd $TP8_HOME && exec timeout $TP8_LIFE ./gr8 glm53 up @$TP8_ENV > out/window-up.log 2>&1 < /dev/null"; }
-serve_stop_cmd() {   # NAME: every attempt's launch unit of this run, then the serve's own stop (hook or default)
-  with_unit_stop "tp8-$1-up-${RUN_ID:-RUNID}-a*" "$(svd "$1" STOP_CMD "$(local_stop_cmd "$(sv "$1" HOME)" "$(sv "$1" ENV)")")"
-}
+# A serve stop is two barriers (precheck w2v42 B2): every attempt's launch unit of this run on ALL the serve's boxes,
+# then the serve's own stop (hook or default) on all its boxes. A controller on one box (the DS up script on 89f0
+# starts the workers over ssh) is dead before any box checks for its late work.
+serve_unit_stop_cmd() { unit_stop_cmd "tp8-$1-up-${RUN_ID:-RUNID}-a*"; }
+serve_hook_cmd() { svd "$1" STOP_CMD "$(local_stop_cmd "$(sv "$1" HOME)" "$(sv "$1" ENV)")"; }
 serve_down_cmd() { svd "$1" DOWN_CMD "cd $(sv "$1" HOME) && ./gr8 glm53 down @$(sv "$1" ENV)"; }
 serve_up_cmd() {   # NAME: the guard (if any), then the detached up; the unit name carries the run and the attempt
   local g
@@ -138,11 +154,13 @@ serve_up_cmd() {   # NAME: the guard (if any), then the detached up; the unit na
     "cd $(printf %q "$(sv "$1" HOME)") && exec timeout 3000 ./gr8 glm53 up @$(sv "$1" ENV) > out/window-up.log 2>&1 < /dev/null")")"
 }
 tp8_local_stop() {   # one box: this box's test processes, by recorded identity
-  on_all 300 tp8-stop "$(tp8_stop_cmd)" "${TP8_BOXES[@]}"
+  on_all "$((UNIT_STOP_S + STOP_S))" tp8-stop "$(tp8_stop_cmd)" "${TP8_BOXES[@]}"
 }
 serve_local_stop() {
   # shellcheck disable=SC2046
-  on_all 300 "$1-stop" "$(serve_stop_cmd "$1")" $(svboxes "$1")
+  on_all "$UNIT_STOP_S" "$1-unitstop" "$(serve_unit_stop_cmd "$1")" $(svboxes "$1") || return 1
+  # shellcheck disable=SC2046
+  on_all "$STOP_S" "$1-stop" "$(serve_hook_cmd "$1")" $(svboxes "$1")
 }
 serve_check() {   # NAME KEY: the serve's optional per-box check; unset passes
   local c
@@ -409,7 +427,8 @@ cmd_cmds() {   # CONF: every remote command, NAME TAB HOSTS TAB CMD; runs nothin
   row tp8-up "${TP8_BOXES[*]}" "$(tp8_up_cmd)"
   for s in "${SERVES[@]}"; do
     row "$s-down" "$(sv "$s" HEAD)" "$(serve_down_cmd "$s")"
-    row "$s-stop" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(serve_stop_cmd "$s")"
+    row "$s-unitstop" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(serve_unit_stop_cmd "$s")"
+    row "$s-stop" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(serve_hook_cmd "$s")"
     row "$s-prep" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$(svd "$s" PREP "$MEMCLEAN && $PREP_CMD")"
     for k in P0_CHECK PRE_UP_CHECK POST_CHECK; do
       c=$(svd "$s" "$k" ""); [ -n "$c" ] && row "$s-${k,,}" "$(svboxes "$s" | tr '\n' ' ' | sed 's/ $//')" "$c"
