@@ -27,6 +27,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_
 "$T/fabric_mtu_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" -o "$T/relay_test"
 "$T/relay_test"
+# the hybrid route table (engine/comms/route.h) and the packed relay header
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/comms" "$REPO/engine/comms/tests/route_test.cpp" -o "$T/route_test"
+"$T/route_test"
 python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the fabric pool (engine/comms/fabric_pool.h, #154): boot, groups and their ports over loopback, no leaked descriptor
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_pool_test.cpp" -o "$T/fabric_pool_test"
