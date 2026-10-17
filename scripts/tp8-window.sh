@@ -16,7 +16,8 @@
 # <S>_PREP (each box before up), <S>_PRE_UP_CHECK and <S>_POST_CHECK (each box, exit 0 = pass; PRE before every up,
 # POST after the canary), <S>_P0_CHECK (each box in P0, while the serve still runs), <S>_ENV_BOXES (the boxes that hold
 # <S>_ENV; default <S>_BOXES), <S>_HEALTH (path, default /health), <S>_HEALTH_S, and <S>_CANARY_MD5=exit0 (the canary
-# passes on the command's exit status; no output file).
+# passes on the command's exit status; no output file; <S>_P0_CANARY_CMD replaces it in P0, e.g. while the serve runs
+# a test config that the restore must not reproduce).
 # Optional report-only speed rows: BASE_SPEED_CMD on BASE_SPEED_HOST at the end of P0 (live serve), SPEED_CMD on the
 # TP8 head after a P6 PASS when at most SPEED_MAX_ELAPSED s have passed (bounded by SPEED_S, added to T_MAX).
 set -u
@@ -81,11 +82,11 @@ on_all() {
 healthy() { rsh "$1" 30 "curl -s -o /dev/null -m 10 -w '%{http_code}' $(printf %q "$2")${3:-/health}" 2>/dev/null | grep -qx 200; }
 shealthy() { healthy "$(sv "$1" HEAD)" "$(sv "$1" URL)" "$(svd "$1" HEALTH /health)"; }
 # canary NAME: run the pinned canary command, hash its pinned output file, compare
-canary() {
-  local s=$1 h md5
+canary() {   # NAME [KEY]: KEY = CANARY_CMD (default) or P0_CANARY_CMD (exit0 serves only; falls back to CANARY_CMD)
+  local s=$1 h md5 key=${2:-CANARY_CMD}
   h=$(sv "$s" CANARY_HOST)
   if [ "$(sv "$s" CANARY_MD5)" = exit0 ]; then
-    rsh "$h" 900 "$(sv "$s" CANARY_CMD)" >> "$LOG" 2>&1 || { say "$s canary: command failed"; return 1; }
+    rsh "$h" 900 "$(svd "$s" "$key" "$(sv "$s" CANARY_CMD)")" >> "$LOG" 2>&1 || { say "$s canary: command failed"; return 1; }
     say "$s canary: exit 0 OK"; return 0
   fi
   rsh "$h" 900 "rm -f $(sv "$s" CANARY_OUT) && $(sv "$s" CANARY_CMD)" >> "$LOG" 2>&1 || { say "$s canary: command failed"; return 1; }
@@ -216,7 +217,7 @@ p0() {
   RD_REMOTE "command -v flock && command -v $SYSTEMD_RUN" > /dev/null || die "the recovery host lacks flock or systemd-run"
   for s in "${SERVES[@]}"; do
     shealthy "$s" || die "$s is not serving"
-    canary "$s" || die "$s baseline canary"
+    canary "$s" P0_CANARY_CMD || die "$s baseline canary"
     serve_check "$s" P0_CHECK || die "$s P0 check (its restore would fail)"
     for h in $(svlist "$s" ENV_BOXES); do
       [ "$(rsh "$h" 30 "sha256sum $(sv "$s" ENV)" | cut -d' ' -f1)" = "$(sv "$s" ENV_SHA)" ] || die "$s env on $h changed"
