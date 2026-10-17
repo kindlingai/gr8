@@ -27,6 +27,10 @@
 //! src/canon.rs is a session's KV in a form independent of the layout (NR, R, CP shards): export from one layout's
 //! pages, import into another's (#152). The engine does not call it yet.
 //!
+//! Resize (#153, RESIZE.md): the pages below place come in chunks (Pool::chunks). shrink takes chunks no live run holds
+//! offline, evicting the retained runs in them, and waits instead when it would touch a live run or leave the pool
+//! unsafe; grow_pool brings them back. The engine does not call them yet.
+//!
 //! The C interface (g6kvman.h, src/ffi.rs) is what engine/runtime/s2/pool.h wraps for g6m4 and m4sim.
 //!
 //! src/tier.rs is a proof of concept of an SSD store for retained runs (SSD-TIER.md), and src/remote a KV node that
