@@ -67,11 +67,22 @@ __host__ __device__
 #endif
 inline unsigned long long coll_seq(unsigned long long step, int c, int ncoll) { return step * (unsigned long long)ncoll + c + 1; }
 
+// Verbs objects and pinned bytes held by the live mesh fabrics of this process (each counter goes up in init and back
+// down in close). A group created and dropped (fabric_pool.h) must leave every counter where it was. ring_fabrics counts
+// ring fabrics, which are never freed.
+struct FabricLive { long fabrics = 0, qps = 0, mrs = 0, cqs = 0, pds = 0, ctxs = 0, pinned_bytes = 0, ring_fabrics = 0; };
+FabricLive fabric_live();
+
 class Fabric {
  public:
   Fabric() = default;
   ~Fabric();
   void init(const FabricConfig& cfg);
+  // Stop the proxy and free everything init made (mesh): QPs, MRs, CQs, PDs, device contexts, the pinned region. Every
+  // peer must be done writing into this fabric first (a barrier on any fabric of the group). The Fabric can then be
+  // init'ed again. A ring fabric only stops its proxy (its relay is shared by the process). The destructor only stops
+  // the proxy, as before (at exit a peer may still be writing).
+  void close();
   FabricDev dev() const { return dev_; }
   int rank() const { return cfg_.rank; }
   int nranks() const { return (int)cfg_.ips.size(); }

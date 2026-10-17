@@ -172,6 +172,12 @@ struct RelayCtx {
   std::string ri_dev;
 };
 std::mutex g_relay_mu;
+// Live verbs objects and pinned bytes of mesh fabrics (fabric_live(); the leak gate of #154). Ring fabrics are counted
+// in ring_fabrics only: close() does not free them (the relay thread keeps their contexts).
+std::atomic<long> g_live[7];   // fabrics, qps, mrs, cqs, pds, ctxs, pinned_bytes
+enum { kLiveFab, kLiveQp, kLiveMr, kLiveCq, kLivePd, kLiveCtx, kLivePinned };
+std::atomic<long> g_live_ring{0};
+inline void live(int k, long d) { g_live[k].fetch_add(d, std::memory_order_relaxed); }
 RelayCtx* g_relay[32]; std::atomic<int> g_nrelay{0};
 bool g_relay_started = false;
 
@@ -349,6 +355,7 @@ struct Fabric::Impl {
   std::vector<uint64_t> xp;                          // [XT_STEPS][ncoll][2 rails][4]: db seen, tail stored, first, last post
   std::vector<unsigned long long> xpseq;             // [XT_STEPS][ncoll] seq of the proxy record
   unsigned long long xwc[2][8][3] = {};              // [rail][peer][retry-exceeded, rnr-exceeded, other bad status]
+  int bump = 1;                                      // barrier port rotation (per fabric: groups run their own barriers)
   std::thread xquit;                                 // G6_XTRACE_QUIT watcher
   void wc_count(int r, int peer, int st) {
     if (peer < 0 || peer >= 8 || r < 0 || r > 1) return;
@@ -356,9 +363,43 @@ struct Fabric::Impl {
   }
 };
 
+// Process exit keeps today's behaviour: stop the proxy only. A peer may still be writing, and the CUDA context may be
+// gone, so freeing happens only in an explicit close().
 Fabric::~Fabric() { stop_proxy(); }
 
+FabricLive fabric_live() {
+  FabricLive l;
+  l.fabrics = g_live[kLiveFab].load(); l.qps = g_live[kLiveQp].load(); l.mrs = g_live[kLiveMr].load();
+  l.cqs = g_live[kLiveCq].load(); l.pds = g_live[kLivePd].load(); l.ctxs = g_live[kLiveCtx].load();
+  l.pinned_bytes = g_live[kLivePinned].load(); l.ring_fabrics = g_live_ring.load();
+  return l;
+}
+
+// Mesh: every QP, MR, CQ, PD and device context this fabric made, its pinned region and its trace buffer go, in that
+// order (a QP before its CQ, an MR before its PD). A destroy that fails aborts: a PD still in use (EBUSY) means
+// something leaked. Ring: the proxy stops and the rest stays (the shared relay thread polls its queues).
+void Fabric::close() {
+  if (!impl_) return;
+  stop_proxy();
+  Impl& I = *impl_;
+  if (I.ring) return;                                  // mesh only (#154): kept for the life of the process
+  for (ibv_qp*& q : I.qp) if (q) { FCHECK(ibv_destroy_qp(q) == 0); q = nullptr; live(kLiveQp, -1); }
+  for (int r = 0; r < I.nrails; r++) {
+    Rail& R = I.rails[r];
+    if (R.mr) { FCHECK(ibv_dereg_mr(R.mr) == 0); R.mr = nullptr; live(kLiveMr, -1); }
+    if (R.cq) { FCHECK(ibv_destroy_cq(R.cq) == 0); R.cq = nullptr; live(kLiveCq, -1); }
+    if (R.pd) { FCHECK(ibv_dealloc_pd(R.pd) == 0); R.pd = nullptr; live(kLivePd, -1); }
+    if (R.ctx) { FCHECK(ibv_close_device(R.ctx) == 0); R.ctx = nullptr; live(kLiveCtx, -1); }
+  }
+  if (I.xgpu) { CUCHECK(cudaFree(I.xgpu)); I.xgpu = nullptr; }
+  if (I.region) { CUCHECK(cudaFreeHost(I.region)); I.region = nullptr; live(kLivePinned, -(long)I.region_bytes); }
+  delete impl_; impl_ = nullptr;
+  dev_ = FabricDev{};
+  live(kLiveFab, -1);
+}
+
 void Fabric::init(const FabricConfig& cfg) {
+  FCHECK(!impl_);                                     // close() first to init again
   cfg_ = cfg; g_rank = cfg.rank;
   impl_ = new Impl();
   Impl& I = *impl_;
@@ -380,6 +421,7 @@ void Fabric::init(const FabricConfig& cfg) {
     const size_t fl = (size_t)cfg.bulk_flags * nr * 16, db = (size_t)cfg.bulk_flags * 8;
     I.region_bytes = ((cfg.bulk_bytes + fl + 2 * db + 64) + 4095) & ~size_t(4095);
     CUCHECK(cudaHostAlloc((void**)&I.region, I.region_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+    if (!cfg.ring) live(kLivePinned, (long)I.region_bytes);
     memset(I.region, 0, I.region_bytes);
     char* bdev = nullptr; CUCHECK(cudaHostGetDevicePointer((void**)&bdev, I.region, 0));
     FCHECK(bdev == I.region);
@@ -399,6 +441,7 @@ void Fabric::init(const FabricConfig& cfg) {
   const size_t db_bytes = (size_t)cfg_.ncoll * 8;
   I.region_bytes = ((send_bytes + recv_bytes + db_bytes + 64) + 4095) & ~size_t(4095);
   CUCHECK(cudaHostAlloc((void**)&I.region, I.region_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+  if (!cfg.ring) live(kLivePinned, (long)I.region_bytes);
   memset(I.region, 0, I.region_bytes);
   char* base_dev = nullptr; CUCHECK(cudaHostGetDevicePointer((void**)&base_dev, I.region, 0));
   FCHECK(base_dev == I.region);  // unified addressing: host pointer == device pointer (true on GB10 / sm_120 UVA)
@@ -418,6 +461,7 @@ void Fabric::init(const FabricConfig& cfg) {
 
   if (cfg.ring) {                                     // switchless ring (see RelayHdr above)
     FCHECK(nr == 3 || nr == 4);
+    g_live_ring.fetch_add(1);
     const int me = cfg.rank;
     I.ring = true; I.nxt = (me + 1) % nr; I.prv = (me + nr - 1) % nr; I.dia = nr == 4 ? (me + 2) % nr : -1;
     I.ring_rail[I.nxt] = 0; I.ring_rail[I.prv] = 1; if (I.dia >= 0) I.ring_rail[I.dia] = 2;
@@ -530,17 +574,18 @@ void Fabric::init(const FabricConfig& cfg) {
     barrier();
     return;
   }
+  live(kLiveFab, 1);
   for (int r = 0; r < I.nrails; r++) {
     Rail& R = I.rails[r];
     R.di = find_dev(r == 0 ? cfg.ips[cfg.rank] : cfg.ips2[cfg.rank]);
     int n; ibv_device** list = ibv_get_device_list(&n); FCHECK(list);
     for (int i = 0; i < n; i++) if (R.di.dev == ibv_get_device_name(list[i])) R.ctx = ibv_open_device(list[i]);
-    ibv_free_device_list(list); FCHECK(R.ctx);
-    R.pd = ibv_alloc_pd(R.ctx); FCHECK(R.pd);
-    R.cq = ibv_create_cq(R.ctx, 8192, nullptr, nullptr, 0); FCHECK(R.cq);
+    ibv_free_device_list(list); FCHECK(R.ctx); live(kLiveCtx, 1);
+    R.pd = ibv_alloc_pd(R.ctx); FCHECK(R.pd); live(kLivePd, 1);
+    R.cq = ibv_create_cq(R.ctx, 8192, nullptr, nullptr, 0); FCHECK(R.cq); live(kLiveCq, 1);
     FCHECK(ibv_query_gid(R.ctx, 1, R.di.gid_index, &R.gid) == 0);
     read_rail_mtu(R, r, cfg.port);
-    R.mr = ibv_reg_mr(R.pd, I.region, I.region_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE); FCHECK(R.mr);
+    R.mr = ibv_reg_mr(R.pd, I.region, I.region_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE); FCHECK(R.mr); live(kLiveMr, 1);
   }
   I.qp.assign(nr, nullptr); I.unsignaled.assign(nr, 0);
   std::vector<QPInfo> mine(nr);
@@ -550,7 +595,7 @@ void Fabric::init(const FabricConfig& cfg) {
     ibv_qp_init_attr ia{}; ia.send_cq = R.cq; ia.recv_cq = R.cq; ia.qp_type = IBV_QPT_RC;
     ia.cap.max_send_wr = 2048; ia.cap.max_recv_wr = 1; ia.cap.max_send_sge = 1; ia.cap.max_recv_sge = 1;
     if (I.bulk) ia.cap.max_inline_data = 64;            // bulk: 8-B flag writes go inline
-    I.qp[p] = ibv_create_qp(R.pd, &ia); FCHECK(I.qp[p]);
+    I.qp[p] = ibv_create_qp(R.pd, &ia); FCHECK(I.qp[p]); live(kLiveQp, 1);
     ibv_qp_attr at{}; at.qp_state = IBV_QPS_INIT; at.port_num = 1; at.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
     FCHECK(ibv_modify_qp(I.qp[p], &at, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0);
     mine[p] = QPInfo{I.qp[p]->qp_num, (uint32_t)((cfg.rank * 131 + p * 7) & 0xffffff), R.mr->rkey, (uint64_t)dev_.recv, {}, uint32_t(R.mtu)};
@@ -575,8 +620,7 @@ void Fabric::init(const FabricConfig& cfg) {
 }
 
 void Fabric::barrier() {
-  static int bump = 1;
-  char z = 0; allgather(cfg_.rank, nranks(), cfg_.ips[0], cfg_.port + (bump++ % 3) + 1, &z, 1);
+  char z = 0; allgather(cfg_.rank, nranks(), cfg_.ips[0], cfg_.port + (impl_->bump++ % 3) + 1, &z, 1);
 }
 
 void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes) { enqueue_step(step, sizes, Rs{}); }
