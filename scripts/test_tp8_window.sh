@@ -235,5 +235,22 @@ bash "$T/rd/tp8-window.sh" cmds "$T/rd/window.conf" > "$T/cmds" 2>&1
 [ ! -s "$M/calls" ] && grep -q "^tp8-stop	b0 b1 b2 b3 b4 b5 b6 b7	cd .*launch.py down --local" "$T/cmds" \
   && grep -q "^A-down	b0	" "$T/cmds" && grep -q "^A-up	" "$T/cmds" && ok "cmds: printed, nothing run" || bad "cmds: printed, nothing run"
 
+# 14. P6 routes receipts (precheck B1), with the files laid out as P0 and P6 write them in LOCAL
+rr() { (TP8_WINDOW_LIB=1; . "$W"; routes_receipts_ok "$@") > /dev/null 2>&1; }
+setup; L=$T/local; mkdir -p "$L/routes-receipts"; X=$(printf 'b%.0s' {1..64}); Y=$(printf 'c%.0s' {1..64})
+echo "$X" > "$L/routes-expected.sha"     # P0's expectation file sits beside the receipts dir, as in a run
+grep -q 'routes-expected.sha' "$W" && grep -q 'routes-receipts/\$h' "$W" && ok "P0 expectation and P6 receipts have separate names" \
+  || bad "P0 expectation and P6 receipts have separate names"
+for h in b0 b1 b2 b3 b4 b5 b6 b7; do printf 'routes sha %s\n%s  /x/run/routes.txt\n' "$X" "$X" > "$L/routes-receipts/$h"; done
+rr "$L/routes-receipts" "$X" b0 b1 b2 b3 b4 b5 b6 b7 && ok "8 correct receipts: pass" || bad "8 correct receipts: pass"
+mv "$L/routes-receipts/b5" "$L/b5.away"
+rr "$L/routes-receipts" "$X" b0 b1 b2 b3 b4 b5 b6 b7 && bad "a missing host fails" || ok "a missing host fails"
+mv "$L/b5.away" "$L/routes-receipts/b5"; printf 'routes sha %s\n' "$X" > "$L/routes-receipts/b3"
+rr "$L/routes-receipts" "$X" b0 b1 b2 b3 b4 b5 b6 b7 && bad "a host with one receipt line fails" || ok "a host with one receipt line fails"
+printf 'routes sha %s\n%s  /x/run/routes.txt\n' "$X" "$Y" > "$L/routes-receipts/b3"
+rr "$L/routes-receipts" "$X" b0 b1 b2 b3 b4 b5 b6 b7 && bad "a host with another sha fails" || ok "a host with another sha fails"
+printf 'routes sha %s\n%s  /x/run/routes.txt\n%s  /x/extra\n' "$X" "$X" "$X" > "$L/routes-receipts/b3"
+rr "$L/routes-receipts" "$X" b0 b1 b2 b3 b4 b5 b6 b7 && bad "a host with 3 shas fails" || ok "a host with 3 shas fails"
+
 echo "passed $pass, failed $failn"
 [ $failn = 0 ]
