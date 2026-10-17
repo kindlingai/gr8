@@ -138,18 +138,20 @@ int main() {
   }
   // 7. a follow that times out with nothing sent leaves the pool usable; a refused announce leaves it as it was
   {
+    std::atomic<bool> timed_out{false};
     boxes(2, [&](int i) {
       FabricPool p; p.init(pool(2, i, base_port + 8));
       if (i == 0) {
         bool threw = false;
         try { p.announce({0, 0}); } catch (const std::exception&) { threw = true; }
         CHECK(threw && p.up());
-        usleep(300000);                                 // box 1 times out once meanwhile
+        while (!timed_out.load()) usleep(1000);         // box 1 has timed out once
         CHECK(p.announce({1, 0}).id == 1);
       } else {
         bool threw = false;
         try { p.follow(100); } catch (const std::exception&) { threw = true; }
         CHECK(threw && p.up());
+        timed_out = true;
         const Group g = p.follow(20000);
         CHECK(g.id == 1 && g.rank == 0 && g.s2_head_ip == "127.0.0.1");
       }

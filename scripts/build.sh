@@ -102,5 +102,5 @@ for test in steering_cuda_test steering_consume_test steering_shared_test steeri
 done
 # fabric groups over real verbs (#154): built here, run by hand on the cluster (one process per box; see its header)
 nvcc -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" "$REPO/engine/comms/tests/fabric_group_test.cpp" \
-  "$REPO/engine/comms/fabric.cpp" -libverbs
+  "$REPO/engine/comms/fabric.cpp" -libverbs -lpthread
 echo "fabric_group_test: built (cluster test, not run here)"

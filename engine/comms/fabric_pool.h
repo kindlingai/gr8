@@ -121,8 +121,8 @@ inline void keepalive(int fd) {
 }
 // connect with a deadline (a filtered port would otherwise block for the kernel's SYN retries); -1 = not yet
 inline int connect_by(const std::string& ip, int port, Clock::time_point end) {
-  int s = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0); need(s >= 0, "socket");
   sockaddr_in a = addr(ip, port);
+  int s = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0); need(s >= 0, "socket");
   int rc = ::connect(s, (sockaddr*)&a, sizeof a), err = 0;
   if (rc != 0 && errno == EINPROGRESS) {
     pollfd q{s, POLLOUT, 0};

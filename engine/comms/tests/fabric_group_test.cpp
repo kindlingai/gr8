@@ -42,12 +42,13 @@ static int open_fds() {
   while (auto* e = readdir(d)) if (e->d_name[0] != '.') n++;
   closedir(d); return n - 1;                           // the DIR's own descriptor
 }
-// QPs, MRs, CQs and PDs the kernel holds for this process (rdma(8)); -1 = rdma not installed
+// QPs, MRs, CQs or PDs the kernel holds for this process (rdma(8) output, counted here); -1 = rdma failed or missing
 static long rdma_res(const char* what) {
-  char cmd[160]; snprintf(cmd, sizeof cmd, "rdma res show %s 2>/dev/null | grep -c ' pid %d '; exit ${PIPESTATUS[0]}", what, (int)getpid());
-  std::string full = "bash -c \"" + std::string(cmd) + "\"";
-  FILE* p = popen(full.c_str(), "r"); if (!p) return -1;
-  long n = -1; if (fscanf(p, "%ld", &n) != 1) n = -1;
+  const std::string cmd = std::string("rdma res show ") + what + " 2>/dev/null";
+  FILE* p = popen(cmd.c_str(), "r"); if (!p) return -1;
+  const std::string mine = " pid " + std::to_string((int)getpid()) + " ";
+  long n = 0; char line[1024];
+  while (fgets(line, sizeof line, p)) if (strstr(line, mine.c_str())) n++;
   return pclose(p) == 0 ? n : -1;
 }
 static void die(const std::string& s) { fprintf(stderr, "fabric_group_test: FAIL %s\n", s.c_str()); exit(1); }
@@ -136,13 +137,15 @@ int main(int argc, char** argv) {
   const FabricLive live0 = fabric_live();             // after step 1: CUDA and the verbs provider are loaded
   const int fds0 = open_fds();
   if (live0.fabrics || live0.qps || live0.mrs || live0.cqs || live0.pds || live0.ctxs || live0.pinned_bytes) die("today's fabric left " + str(live0));
-  const bool kernel_check = rdma_res("qp") >= 0;
+  bool kernel_check = rdma_res("qp") == 0;
+  std::string kernel_why = kernel_check ? "" : "rdma res show failed or is missing";
   // 2. the group of every box in pool order
   uint64_t h_group = 0;
   {
     Group g;
     try { g = pool.head() ? pool.announce(all) : pool.follow(600000); } catch (const std::exception& e) { die(e.what()); }
     Fabric f; f.init(group_fabric(pc, g, base)); f.start_proxy();
+    if (kernel_check && rdma_res("qp") <= 0) { kernel_check = false; kernel_why = "rdma res show does not list this process's QPs"; }
     h_group = run(f, g.members, steps, bytes);
     f.barrier(); f.close();
   }
@@ -174,13 +177,13 @@ int main(int argc, char** argv) {
     if (fds != fds0) die("group " + std::to_string(g.id) + ": " + std::to_string(fds) + " open descriptors, before " + std::to_string(fds0));
     if (kernel_check && (k < 8 || k % 25 == 0))
       for (const char* w : {"qp", "mr", "cq", "pd"})
-        if (const long n = rdma_res(w)) die("group " + std::to_string(g.id) + ": the kernel still holds " + std::to_string(n) + " " + w + " of this process");
+        if (const long n = rdma_res(w)) die("group " + std::to_string(g.id) + (n < 0 ? std::string(": rdma res show failed") : ": the kernel still holds " + std::to_string(n) + " " + w + " of this process"));
   }
   // one last group so every box has checked its counters before the head reports
   try { if (pool.head()) pool.announce(all); else pool.follow(600000); } catch (const std::exception& e) { die(e.what()); }
   printf("fabric_group_test box %d: digest today %016llx group %016llx (identical), %d groups (%ld as a member), "
          "live objects and %d descriptors unchanged, kernel rdma resources %s PASS\n", pc.index, (unsigned long long)h_fixed,
-         (unsigned long long)h_group, loops, groups_in, fds0, kernel_check ? "zero" : "not checked (no rdma tool)");
+         (unsigned long long)h_group, loops, groups_in, fds0, kernel_check ? "zero" : ("not checked: " + kernel_why).c_str());
   pool.close();
   return 0;
 }

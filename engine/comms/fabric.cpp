@@ -381,7 +381,7 @@ FabricLive fabric_live() {
 void Fabric::close() {
   if (!impl_) return;
   Impl& I = *impl_;
-  if (!I.ring && I.th.joinable() && !I.exited.load() && I.pending.load() != 0 && !wait_proxy_idle(60.0))
+  if (!I.ring && I.pending.load() != 0 && (!I.th.joinable() || I.exited.load() || !wait_proxy_idle(60.0)))
     fprintf(stderr, "[fabric r%d] close: %ld jobs were not posted; peers waiting on them will time out\n", cfg_.rank, I.pending.load());
   stop_proxy();
   if (I.ring) return;                                  // mesh only (#154): the object stays as it is (fabric.h)

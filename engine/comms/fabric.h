@@ -81,7 +81,8 @@ class Fabric {
   // Stop the proxy and free everything init made (mesh): QPs, MRs, CQs, PDs, device contexts, the pinned region. The
   // caller first lets the proxy post what it was given (wait_proxy_idle; close waits up to 60 s itself and says so if
   // jobs were left) and runs a barrier on a fabric of the group, so no peer still writes into this one. The Fabric can
-  // then be init'ed again; any other call before that aborts. A ring fabric (never regrouped) only stops its proxy and
+  // then be init'ed again; enqueue, barrier and the proxy calls abort before that, and dev() is empty. A thread that
+  // watches dev().error must stop before close (the word is in the freed region). A ring fabric (never regrouped) only stops its proxy and
   // cannot be init'ed again: its relay is shared by the process. The destructor only stops the proxy, as before (at
   // exit a peer may still be writing).
   void close();
