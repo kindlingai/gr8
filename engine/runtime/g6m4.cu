@@ -11,6 +11,9 @@
 //      [--ring [--ring-devs relay-out,next,relay-in,prev]]  switchless ring (engine/comms/fabric.cpp): QPs on four local
 //                     devices to the cabled neighbours, the diagonal relayed through the next rank. --ips are then the LAN
 //                     addresses, for the TCP bootstraps only
+//      [--hybrid --fab-routes FILE --fab-ports ip/prefix,ip/prefix]  per-pair route table (engine/comms/route.h): each
+//                     pair direct on one named rail or relayed by one via rank. FILE is the same bytes on every rank;
+//                     --fab-ports are this box's fabric addresses and must equal its P record. Not with --ring / --ips2
 //      [--image]      stream the pack straight into one device image (g6::DevImage; needed for a full 60 GB pack)
 //      [--v2 DIR --v2-slices DIR --v2-widths FILE]  with --image and the Rust loader: --manifest/--pack is a base pack
 //                     whose routed experts the exlr8 v2 experts replace, read from the raw width files in DIR at the
@@ -199,6 +202,9 @@ int main(int argc, char** argv)
         else if (a == "--ips2") cfg.ips2 = split(next(), ',');
         else if (a == "--pf-ips2") pf_ips2 = split(next(), ',');
         else if (a == "--ring") cfg.ring = true;
+        else if (a == "--hybrid") cfg.hybrid = true;
+        else if (a == "--fab-routes") cfg.routes_file = next();
+        else if (a == "--fab-ports") cfg.fab_ports = split(next(), ',');
         else if (a == "--ring-devs") cfg.ring_devs = split(next(), ',');
         else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
         else if (a == "--manifest") manifest = next();
@@ -272,6 +278,11 @@ int main(int argc, char** argv)
     }
     if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || (!release && (manifest.empty() || packfile.empty())))
         die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
+    if (cfg.hybrid) {
+        if (cfg.ring || !cfg.ips2.empty()) die("--hybrid excludes --ring and --ips2 (the route file names every rail)");
+        if (cfg.routes_file.empty() || cfg.fab_ports.empty()) die("--hybrid needs --fab-routes FILE and --fab-ports a/p,b/p");
+        if (FILE* rf = fopen(cfg.routes_file.c_str(), "r")) fclose(rf); else die("--fab-routes: cannot read " + cfg.routes_file);
+    } else if (!cfg.routes_file.empty() || !cfg.fab_ports.empty()) die("--fab-routes / --fab-ports need --hybrid");
     if (release && (!manifest.empty() || !packfile.empty() || v2src.dir.empty()))
         die("--v2-dense replaces --manifest / --pack and needs --v2 (the image comes from the release alone)");
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
