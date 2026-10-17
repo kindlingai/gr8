@@ -34,6 +34,7 @@ python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the fabric pool (engine/comms/fabric_pool.h, #154): boot, groups and their ports over loopback, no leaked descriptor
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_pool_test.cpp" -o "$T/fabric_pool_test"
 "$T/fabric_pool_test"
+python3 "$REPO/engine/comms/tests/relay_post_test.py"
 # G6_XTRACE proxy stamps: every rail index of a ring or hybrid fabric in bounds (engine/comms/xtrail.h)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/xtrail_test.cpp" -o "$T/xtrail_test"
 "$T/xtrail_test"
