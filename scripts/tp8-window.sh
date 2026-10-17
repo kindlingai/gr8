@@ -14,12 +14,16 @@
 # RD/RESTORED_OK or RD/ALERT. An ALERT is not a restored serve: an unreachable host can still leave a serve down.
 #
 # A serve is a gr8 glm53 serve unless its conf sets hooks (any serve, e.g. a non-gr8 one): <S>_DOWN_CMD (head, P1),
-# <S>_DOWN_S (its timeout, default 300), <S>_STOP_CMD (each box: stop and verify down, exit 0 = down), <S>_UP_CMD (each of <S>_UP_BOXES, must return at once),
+# <S>_DOWN_S (its timeout, default 300), <S>_STOP_CMD (each box: stop and verify down, exit 0 = down), <S>_UP_CMD (each of <S>_UP_BOXES, runs in the foreground: the script detaches it),
 # <S>_PREP (each box before up), <S>_PRE_UP_CHECK and <S>_POST_CHECK (each box, exit 0 = pass; PRE before every up,
 # POST after the canary), <S>_P0_CHECK (each box in P0, while the serve still runs), <S>_ENV_BOXES (the boxes that hold
 # <S>_ENV; default <S>_BOXES), <S>_HEALTH (path, default /health), <S>_HEALTH_S, and <S>_CANARY_MD5=exit0 (the canary
 # passes on the command's exit status; no output file; <S>_P0_CANARY_CMD replaces it in P0, e.g. while the serve runs
 # a test config that the restore must not reproduce).
+# Every up (TP8 P4 and a serve's) runs detached in its own systemd unit (DETACH, default systemd-run --collect with
+# RemainAfterExit, so the children of an up that exits keep running): the up command returns at once over any ssh,
+# Tailscale SSH included (window 2 v3: a backgrounded `setsid nohup ... &` held the session until the load ended).
+# <S>_UP_GUARD (each up box, before the up; exit 1 = do not start it, e.g. its up script already runs).
 # Optional report-only speed rows: BASE_SPEED_CMD on BASE_SPEED_HOST at the end of P0 (live serve), SPEED_CMD on the
 # TP8 head after a P6 PASS when at most SPEED_MAX_ELAPSED s have passed (bounded by SPEED_S, added to T_MAX).
 set -u
@@ -106,12 +110,17 @@ tp8_stop_cmd() { local_stop_cmd "$TP8_HOME" "$TP8_ENV"; }
 # P0, read only: the restore's verify half while the serves still run. A stale out/handshake.json (an older boot's
 # ports, e.g. a serve's API port) makes verify-down see the live serve and fail, so the restore could never pass.
 tp8_verify_cmd() { echo "cd $(printf %q "$TP8_HOME") && python3 tools/launch/launch.py verify-down @$TP8_ENV"; }
-tp8_up_cmd() { echo "cd $TP8_HOME && setsid nohup timeout $TP8_LIFE ./gr8 glm53 up @$TP8_ENV > out/window-up.log 2>&1 < /dev/null &"; }
+# detach UNIT CMD: CMD in its own transient unit; returns once the unit is started (its exit status = systemd-run's)
+# (HOME and PATH are copied from the ssh session: a unit gets no HOME and a minimal PATH otherwise)
+detach() { echo "${DETACH:-$SYSTEMD_RUN --quiet --collect -p RemainAfterExit=yes --setenv=HOME --setenv=PATH} --unit=$1 /bin/bash -c $(printf %q "$2")"; }
+tp8_up_cmd() { detach "tp8-up-${RUN_ID:-RUNID}" "cd $TP8_HOME && exec timeout $TP8_LIFE ./gr8 glm53 up @$TP8_ENV > out/window-up.log 2>&1 < /dev/null"; }
 serve_stop_cmd() { svd "$1" STOP_CMD "$(local_stop_cmd "$(sv "$1" HOME)" "$(sv "$1" ENV)")"; }
 serve_down_cmd() { svd "$1" DOWN_CMD "cd $(sv "$1" HOME) && ./gr8 glm53 down @$(sv "$1" ENV)"; }
-serve_up_cmd() {
-  svd "$1" UP_CMD \
-    "cd $(printf %q "$(sv "$1" HOME)") && setsid nohup timeout 3000 ./gr8 glm53 up @$(sv "$1" ENV) > out/window-up.log 2>&1 < /dev/null &"
+serve_up_cmd() {   # NAME: the guard (if any), then the detached up; the unit name carries the run and the attempt
+  local g
+  g=$(svd "$1" UP_GUARD "")
+  echo "${g:+( $g ) && }$(detach "tp8-$1-up-${RUN_ID:-RUNID}-a${a:-0}" "$(svd "$1" UP_CMD \
+    "cd $(printf %q "$(sv "$1" HOME)") && exec timeout 3000 ./gr8 glm53 up @$(sv "$1" ENV) > out/window-up.log 2>&1 < /dev/null")")"
 }
 tp8_local_stop() {   # one box: this box's test processes, by recorded identity
   on_all 180 tp8-stop "$(tp8_stop_cmd)" "${TP8_BOXES[@]}"
