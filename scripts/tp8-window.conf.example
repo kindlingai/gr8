@@ -1,0 +1,72 @@
+# tp8-window.sh configuration (sourced by bash). Every host, path and hash for a real window lives in a copy of this
+# file outside the repo. The values below are placeholders: <ANGLE> names and documentation addresses.
+
+SSH_USER=root
+LOG_ROOT=$HOME/tp8-window                 # on the box that runs `run`: one directory per run
+
+# --- recovery: one host owns restore. It needs ssh to every box below (P0 checks it) and systemd-run.
+RECOVERY_HOST=<RECOVERY_HOST>
+RECOVERY_ROOT=/var/lib/tp8-window         # RD = $RECOVERY_ROOT/<run id>, created fresh per run
+SYSTEMD_RUN="systemd-run"                 # on the recovery host
+ALERT_CMD='echo "tp8-window ALERT $RUN_ID: $1"'   # run on the recovery host (and on the primary when RD is gone); $1 = reason
+
+# --- the TP8 test cluster, in rank order, head first
+TP8_BOXES=(<BOX0> <BOX1> <BOX2> <BOX3> <BOX4> <BOX5> <BOX6> <BOX7>)
+TP8_HOME=<TEST_G6_HOME>                   # the staged test tree on every box (its own G6_HOME)
+TP8_ENV=<TEST_ENV_PATH>                   # the TP8 env on every box (SHAPE=hybrid, its own CONTROL_PORT, FAB_PORTS)
+TP8_URL=http://<BOX0>:8100                # the test front end
+TP8_LIFE=4800                             # remote `timeout` on each TP8 `up` (seconds)
+TP8_READY=4200                            # P5 bound: READY_TMO + 600
+TP8_CHAT_TOKENS=128
+
+# --- the serves to take down and restore. One name per serve; each name has the keys below.
+SERVES=(A B)
+A_BOXES=(<A_W1> <A_W2> <A_W3> <A_HEAD>)   # in up order (the serve's boot recipe)
+A_HEAD=<A_HEAD>
+A_HOME=<A_G6_HOME>
+A_ENV=<A_ENV_PATH>
+A_ENV_SHA=<sha256 of A_ENV>               # P0 refuses a changed serve env
+A_URL=http://<A_HEAD>:8000
+A_UP=seq                                  # seq: one box after the other, A_GAP seconds apart; together: same second
+A_GAP=20
+A_CANARY_HOST=<A_HEAD>
+A_CANARY_CMD='<canary command that writes the generated text to A_CANARY_OUT>'
+A_CANARY_OUT=<A_CANARY_OUT_PATH>
+A_CANARY_MD5=<md5 of A_CANARY_OUT>
+B_BOXES=(<B_HEAD> <B_W1> <B_W2> <B_W3>)
+B_HEAD=<B_HEAD>
+B_HOME=<B_G6_HOME>
+B_ENV=<B_ENV_PATH>
+B_ENV_SHA=<sha256 of B_ENV>
+B_URL=http://<B_HEAD>:8000
+B_UP=together
+B_GAP=0
+B_CANARY_HOST=<B_HEAD>
+B_CANARY_CMD='<canary command>'
+B_CANARY_OUT=<B_CANARY_OUT_PATH>
+B_CANARY_MD5=<md5>
+
+# --- per-box commands (run with `bash -c` on each box under a remote timeout)
+MEMCLEAN='bash <MEMCLEAN_PATH>'
+MEMCLEAN_MD5=<md5 of the memclean script>
+MEMCLEAN_PATH=<MEMCLEAN_PATH>
+PREP_CMD='nvidia-smi -lgc 0,2000 && cpupower idle-set -D 0'
+VERIFY_WEIGHTS_CMD='<prints the verify JSON; exit 0 only for "bad": []>'
+P0_BOX_CHECK='<extra read-only per-box check: slices sha, release links; exit 0 = pass>'
+DIRTY_MAX_KB=1048576
+
+# --- phase budgets in seconds. T_MAX (the recovery timer) is their sum: pre-up work, TP8 and restore all count.
+B_P0=900
+B_ARM=120
+B_P1=900
+B_P2=1800
+B_P3=2100
+B_P4=120
+B_P5=$TP8_READY
+B_P6=900
+B_RESTORE=7800    # TP8 stop + 2 attempts per serve (memclean 30 min + health 40 min + canary) in parallel
+B_MARGIN=600
+SERVE_HEALTH_S=2400       # restore: /health wait per serve attempt
+
+# the fabric error kill regex for P5 (engine stderr); bare hex too, the fabric prints codes without 0x
+ERR_RE='FAIL|TIMEOUT|relay .*credit|0x7[0-5]|\b7[0-5][0-9a-f]{6}\b|invalid rank count'
