@@ -50,11 +50,20 @@ t_thinking_on_by_default() {
   ok "$(jqb '.usage.completion_tokens') tok"
 }
 
-# GLM 5.3's template cannot turn thinking off: asking for it is a 400 that says what to use instead.
-t_thinking_off_refused() {
+# Forced-disabled thinking is opt-in (--allow-thinking-off): off by default it is a 400 that names the
+# flag; with the flag it answers with no reasoning at all. OFF=1 runs the flag-on half (the front end must
+# have been started with --allow-thinking-off, e.g. OFF=1 ./smoketest/run.sh ...).
+t_thinking_off() {
   post /v1/chat/completions "$(chat '{"chat_template_kwargs":{"enable_thinking":false}}' 256 'Say hi.')"
-  [ "$STATUS" = 400 ] || { BODY="{\"status\": $STATUS}"; check "status should be 400" 'false'; return; }
-  check "error should say thinking cannot be disabled" '.error.message | test("cannot be disabled")' || return
+  if [ "$STATUS" = 400 ]; then
+    check "error should name --allow-thinking-off" '.error.message | test("--allow-thinking-off")' || return
+    ok
+    return
+  fi
+  [ "$OFF" = 1 ] || { BODY="{\"status\": $STATUS}"; check "should be 400 unless OFF=1" 'false'; return; }
+  [ "$STATUS" = 200 ] || { BODY="{\"status\": $STATUS}"; check "status should be 200 with the flag" 'false'; return; }
+  check "reasoning should be absent" '(.choices[0].message.reasoning // .choices[0].message.reasoning_content // "") | length == 0' || return
+  check "content should answer" '.choices[0].message.content | length > 0' || return
   ok
 }
 

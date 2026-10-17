@@ -248,10 +248,6 @@ class Thinking(unittest.TestCase):
 
     def test_refusals(self):
         for path in ('/v1/chat/completions', '/tokenize'):
-            m = bad(path, dict(CHAT, chat_template_kwargs={'enable_thinking': False}))
-            self.assertIn('thinking cannot be disabled', m)
-            self.assertIn('reasoning_effort "low"', m)
-            self.assertIn('"none"', bad(path, dict(CHAT, reasoning_effort='none')))
             for e in ('auto', 'LOW', 3):
                 self.assertEqual(bad(path, dict(CHAT, reasoning_effort=e)),
                                  'reasoning_effort must be none, minimal, low, medium, high, xhigh or max')
@@ -259,6 +255,72 @@ class Thinking(unittest.TestCase):
             self.assertEqual(bad('/v1/chat/completions', dict(CHAT, thinking_budget=b)),
                              'thinking_budget must be an integer or null')
         self.assertIn('logprobs', bad('/v1/chat/completions', dict(CHAT, thinking_budget=5, logprobs=True)))
+
+    def test_thinking_off_is_opt_in(self):
+        if os.environ.get('G6_ALLOW_THINKING_OFF'):
+            self.skipTest('front end runs without --allow-thinking-off only')
+        s, r = post('/v1/chat/completions', dict(CHAT, chat_template_kwargs={'enable_thinking': False}))
+        self.assertEqual(s, 400, r)
+        self.assertIn('--allow-thinking-off', r['error']['message'])
+        s, r = post('/v1/chat/completions', dict(CHAT, reasoning_effort='none'))
+        self.assertEqual(s, 400, r)
+        self.assertIn('--allow-thinking-off', r['error']['message'])
+        # 'none' with an explicit enable_thinking true is still a 400 for a bad effort? no: true wins and
+        # 'none' is dropped -> thinking stays on
+        s, r = post('/v1/chat/completions', dict(CHAT, reasoning_effort='none',
+                                                 chat_template_kwargs={'enable_thinking': True}))
+        self.assertEqual(s, 200, r)
+
+    def test_enable_thinking_false_produces_no_reasoning(self):
+        if not os.environ.get('G6_ALLOW_THINKING_OFF'):
+            self.skipTest('front end must run with --allow-thinking-off (set G6_ALLOW_THINKING_OFF)')
+        body = dict(CHAT, chat_template_kwargs={'enable_thinking': False})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertIsNone(msg['reasoning'])
+        self.assertTrue(msg['content'])
+        # the rendered prompt carries no effort header and no think-open (the prompt ends on the close)
+        ids = post('/tokenize', {'model': 'glm-5.3', 'messages': CHAT['messages'],
+                                 'chat_template_kwargs': {'enable_thinking': False}})[1]['tokens']
+        text = post('/detokenize', {'tokens': ids})[1]['prompt']
+        self.assertNotIn('Reasoning Effort:', text)
+        self.assertNotIn(chr(0x3C) + 'think' + chr(0x3E), text)
+        self.assertIn(chr(0x3C) + '/think' + chr(0x3E), text)
+        chunks = sse('/v1/chat/completions', body)
+        deltas = [c['choices'][0]['delta'] for c in chunks if c['choices']]
+        self.assertFalse(any(d.get('reasoning') for d in deltas))
+        self.assertEqual(''.join(d.get('content') or '' for d in deltas), msg['content'])
+
+    def test_reasoning_effort_none_matches_enable_thinking_false(self):
+        if not os.environ.get('G6_ALLOW_THINKING_OFF'):
+            self.skipTest('front end must run with --allow-thinking-off (set G6_ALLOW_THINKING_OFF)')
+        none_ids = post('/tokenize', {'model': 'glm-5.3', 'messages': CHAT['messages'],
+                                      'reasoning_effort': 'none'})[1]['tokens']
+        switch_ids = post('/tokenize', {'model': 'glm-5.3', 'messages': CHAT['messages'],
+                                        'chat_template_kwargs': {'enable_thinking': False}})[1]['tokens']
+        self.assertEqual(none_ids, switch_ids)
+        s, r = post('/v1/chat/completions', dict(CHAT, reasoning_effort='none'))
+        s2, r2 = post('/v1/chat/completions', dict(CHAT, chat_template_kwargs={'enable_thinking': False}))
+        self.assertEqual((s, s2), (200, 200))
+        self.assertEqual(r['choices'][0]['message']['content'], r2['choices'][0]['message']['content'])
+        self.assertIsNone(r['choices'][0]['message']['reasoning'])
+        # an explicit enable_thinking true wins over "none" (TensorFold): thinking stays on
+        s, r = post('/v1/chat/completions', dict(CHAT, reasoning_effort='none',
+                                                 chat_template_kwargs={'enable_thinking': True}))
+        self.assertEqual(s, 200, r)
+        self.assertEqual(r['choices'][0]['message']['reasoning'],
+                         post('/v1/chat/completions', CHAT)[1]['choices'][0]['message']['reasoning'])
+
+    def test_reasoning_effort_low_render_unchanged(self):
+        if not os.environ.get('G6_ALLOW_THINKING_OFF'):
+            self.skipTest('front end must run with --allow-thinking-off (set G6_ALLOW_THINKING_OFF)')
+        def ids(**kw):
+            return post('/tokenize', dict({'model': 'glm-5.3', 'messages': CHAT['messages']}, **kw))[1]['tokens']
+        low = ids(reasoning_effort='low')
+        # the render for a named effort is untouched by no-think support: same ids as the kwarg form
+        self.assertEqual(low, ids(chat_template_kwargs={'reasoning_effort': 'low'}))
+        self.assertIn('Reasoning Effort:', post('/detokenize', {'tokens': low})[1]['prompt'])
 
     def test_response_format_json_object_extracts(self):
         body = dict(CHAT, messages=[{'role': 'user', 'content': 'Give me JSON.'}],

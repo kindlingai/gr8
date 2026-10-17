@@ -49,6 +49,8 @@ pub struct State {
     pub share_tokens: u64,
     /// reasoning_effort and thinking_budget for a request that names none
     pub thinking: thinking::Defaults,
+    /// forced-disabled thinking is opt-in (see the degenerate-output probe in the README)
+    pub allow_thinking_off: bool,
     /// the compiled-grammar cache for response_format json_schema (xgrammar)
     pub json_grammar: xgrammar::Grammar,
     pub started: u64,
@@ -73,6 +75,7 @@ struct Args {
     max_connections: usize,
     default_effort: Option<&'static str>,
     default_budget: u64,
+    allow_thinking_off: bool,
     supervisor: Option<String>,
 }
 
@@ -83,7 +86,8 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max]
-                  [--default-thinking-budget N] [--supervisor HOST:PORT]";
+                  [--default-thinking-budget N] [--allow-thinking-off]
+                  [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -99,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
         workers: 2,
         encode_threads: 0,
         default_max_tokens: 0,
+        allow_thinking_off: false,
         share_tokens: 0,
         max_connections: 512,
         default_effort: None,
@@ -149,6 +154,9 @@ fn parse_args() -> Result<Args, String> {
                 a.default_budget =
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
+        "--allow-thinking-off" => {
+            a.allow_thinking_off = true;
+        }
             "--supervisor" => a.supervisor = Some(next(&mut i, &flag, inline)?),
             "--encode-threads" => {
                 a.encode_threads = next(&mut i, &flag, inline)?.parse().map_err(|_| "--encode-threads: not a number")?
@@ -255,6 +263,7 @@ async fn serve(args: Args) -> Result<(), String> {
         default_max_tokens: args.default_max_tokens,
         share_tokens: args.share_tokens,
         thinking: thinking::Defaults { effort: args.default_effort, budget: args.default_budget },
+        allow_thinking_off: args.allow_thinking_off,
         json_grammar,
         started: util::now_secs(),
         supervisor: args.supervisor,

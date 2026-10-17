@@ -372,6 +372,8 @@ struct ChatReq {
     budget: u64,
     /// the validated response_format ('text' enforces nothing)
     rf: jsonmode::Rf,
+    /// the request turned thinking off: the prompt has no effort header and ends on the think close
+    no_think: bool,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
@@ -383,13 +385,15 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let tools = normalize_tools(body.get("tools"))?;
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     let rf = jsonmode::parse_response_format(body.get("response_format"), Some(&st.json_grammar.0))?;
-    let th = thinking::resolve(body, &st.template.levels, st.thinking)?;
+    let th = thinking::resolve(body, &st.template.levels, st.thinking, st.allow_thinking_off)?;
+    let agp = body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true));
     let kw = build_template_kwargs(
         body.get("chat_template_kwargs"),
-        body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
+        agp.clone(),
         body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false)),
         th.effort,
         body.get("documents"),
+        th.no_think,
     )?;
     if truthy(body.get("chat_template")) {
         return Err(ApiError::bad("custom chat_template is not supported", Some("chat_template")));
@@ -402,11 +406,16 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let t0 = std::time::Instant::now();
     let kw_system = kw.clone();
     let text = st.template.render(Some(&messages), tools.as_ref(), kw)?;
+    let text = if th.no_think {
+        st.template.strip_reasoning(&text, pyjson::truthy(Some(&agp)))
+    } else {
+        text
+    };
     let (t1, chars) = (std::time::Instant::now(), text.len());
     let add_special = truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
     let t2 = std::time::Instant::now();
-    let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await;
+    let system = system_span(st, Some(&messages), tools.as_ref(), kw_system, add_special, &prompt, th.no_think).await;
     log::debug!(
         "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms, system span {system:?} tokens {:.2} ms",
         prompt.len(),
@@ -464,7 +473,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let force = choice.forced_ids(&st.tok, close)?;
     params.gen.system_tokens = system;
     (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(body, st.steering().as_ref())?;
-    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf })
+    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf, no_think: th.no_think })
 }
 
 /// Append a one-line instruction after the last user or tool message (vLLM's chat-ml injection shape).
@@ -507,6 +516,7 @@ async fn system_span(
     mut kw: Map<String, Value>,
     add_special: bool,
     prompt: &[u32],
+    no_think: bool,
 ) -> Option<u64> {
     let lead: Vec<Value> = messages?
         .as_array()?
@@ -519,7 +529,10 @@ async fn system_span(
     }
     kw.insert("add_generation_prompt".into(), Value::Bool(false));
     kw.insert("continue_final_message".into(), Value::Bool(false));
-    let text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    let mut text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    if no_think {
+        text = st.template.strip_reasoning(&text, false);
+    }
     let ids = st.tok.aencode(text, add_special).await.ok()?;
     Some(ids.iter().zip(prompt).take_while(|(a, b)| a == b).count() as u64)
 }
@@ -536,7 +549,7 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let rid = new_id("chatcmpl");
     let include_reasoning = body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
     let choice_value = cr.choice.as_value();
-    let parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
+    let parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning, cr.no_think);
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
@@ -1191,10 +1204,15 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 ));
             }
             // the same effort and the same refusals as a chat request, so the counts agree
-            let th = thinking::resolve(&body, &st.template.levels, st.thinking)?;
-            let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
+            let th = thinking::resolve(&body, &st.template.levels, st.thinking, st.allow_thinking_off)?;
+            let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp.clone(), cfm, th.effort, None, th.no_think)?;
             let tools = normalize_tools(body.get("tools"))?;
             let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+            let text = if th.no_think {
+                st.template.strip_reasoning(&text, pyjson::truthy(Some(&agp)))
+            } else {
+                text
+            };
             st.tok
                 .aencode(text, truthy(body.get("add_special_tokens")))
                 .await
