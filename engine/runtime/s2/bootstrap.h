@@ -97,7 +97,9 @@ struct BootstrapConfig {
     }
     std::string agreement() const {
         return capability(scheduler, ranks) + std::to_string(scheduler.max_sessions) + " " +
-            std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) + "\n" + runtime_signature;
+            std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) +
+            (scheduler.decode_prefill_rows ? " dpf " + std::to_string(scheduler.decode_prefill_rows) : std::string()) +
+            "\n" + runtime_signature;
     }
 };
 inline void atomic_file(const std::string& path, const std::string& bytes) {

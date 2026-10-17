@@ -41,6 +41,10 @@ struct Config {
     uint64_t epoch = 1;
     uint32_t pool_rows = 614400, max_rows = 24, max_sessions = 8, mtp = 2;
     uint32_t guard_tokens = UINT32_MAX, prefill_rows = 4096;
+    // While any session decodes, a prefill quantum takes at most this many rows on one lane, so a decode round comes
+    // round sooner (each round waits out one prefill quantum). 0 = off: the full prefill_rows x lanes quantum, as before.
+    // A multiple of PAGE, at most prefill_rows (native.cuh prefill: lane A takes up to prefill_rows rows).
+    uint32_t decode_prefill_rows = 0;
     bool two_lanes = true;
     g6rt::steering::BootConfig steering{};
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
@@ -50,6 +54,8 @@ struct Config {
         require(epoch && pool_rows >= PAGE && pool_rows % PAGE == 0, "bad epoch/pool");
         require(mtp > 0 && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");
         require(guard() >= 2 * mtp && prefill_rows, "insufficient guard/prefill rows");
+        require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
+                "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");
         require(!steering.loaded || (g6rt::steering::valid_profile_name(steering.profile_name) && steering.active_layers &&
                 (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full)),
                 "invalid loaded steering receipt");
@@ -217,7 +223,7 @@ public:
         uint64_t h = 14695981039346656037ull;
         auto add = [&](uint64_t v) { for (unsigned i = 0; i < 8; ++i) { h ^= uint8_t(v >> (8*i)); h *= 1099511628211ull; } };
         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
-        add(c_.prefill_rows); add(c_.two_lanes); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
+        add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
@@ -297,6 +303,10 @@ public:
         // prefill_first picks the shortest prompt that is not still owed a turn. Before, this was the lowest request id,
         // which let one long prompt hold every prefill quantum against a short request admitted behind it (#61).
         const Slot* pf = nullptr;
+        // any decoding session, stalled or not: the projection (horizon) passes none stalled, so the cap must not
+        // depend on `stalled`, or a projected quantum could be larger than the real one (the unsafe direction)
+        bool decoding = false;
+        for (unsigned i = 0; i < MAX_SESSIONS; ++i) decoding |= s[i].phase == Phase::Decode;
         for (unsigned i = 0; i < n; ++i) {
             if (ordered[i]->phase == Phase::Decode) q.keys[q.count++] = ordered[i]->key;
             else if (!pf || prefill_first(*ordered[i], *pf)) pf = ordered[i];
@@ -306,7 +316,8 @@ public:
             q.count = 1; q.keys[0] = pf->key; q.first = pf->prefilled;
             const uint32_t left = pf->req.prompt_tokens - 1 - pf->prefilled;
             q.kind = left ? Kind::Prefill : Kind::PromptTail;
-            const uint64_t cap = uint64_t(c.prefill_rows) * (c.two_lanes && left > c.prefill_rows ? 2 : 1);
+            const uint64_t cap = decoding && c.decode_prefill_rows ? uint64_t(c.decode_prefill_rows)
+                : uint64_t(c.prefill_rows) * (c.two_lanes && left > c.prefill_rows ? 2 : 1);
             q.rows = left ? uint32_t(std::min(uint64_t(left), cap)) : 1;
         }
         return q;

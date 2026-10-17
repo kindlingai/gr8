@@ -761,6 +761,13 @@ int main(int argc, char** argv)
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the offline loop's cap rule
         sc.prefill_rows = (uint32_t)MP;
         sc.two_lanes = two;
+        // G6_S2_DECODE_PF=<rows>: while a session decodes, prefill quanta of at most this many rows (scheduler.h
+        // Config::decode_prefill_rows); unset or 0 = off
+        if (const char* e = getenv("G6_S2_DECODE_PF")) {
+            const int v = atoi(e);
+            if (v < 0 || v % 64 || v > MP) die("S2: G6_S2_DECODE_PF must be 0 or a multiple of 64 no larger than --prefill");
+            sc.decode_prefill_rows = (uint32_t)v;
+        }
         sc.steering = steering_boot;
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
