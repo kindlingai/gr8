@@ -8,6 +8,7 @@
 // same events name is the same boundary at every step of a randomized run. Host only (scheduler.h is plain C++): no
 // GPU, no CUDA, no pool. Build and run: see scripts/host_tests.sh.
 #include "s2/scheduler.h"
+#include <algorithm>
 #include <cstdio>
 #include <utility>
 #include <vector>
@@ -188,6 +189,50 @@ static void small_quantum_config()
     }
 }
 
+// Config::decode_prefill_rows: while a session decodes, every prefill quantum is at most the knob on one lane; with no
+// decoder (or the knob 0) the quantum is the full prefill_rows x lanes, as before. The notice target still re-derives.
+static void decode_prefill_cap()
+{
+    for (uint32_t knob : {0u, 2048u, 1024u}) {
+        Config c = cfg();
+        c.decode_prefill_rows = knob;
+        Scheduler s(c);
+        admit(s, 1, 32768, 16);                            // alone: full quanta even with the knob set
+        const Quantum q0 = s.next(); s.complete_prefill();
+        CHECK(q0.kind == Kind::Prefill && q0.rows == 8192);
+        admit(s, 2, 100, 1000);                            // short: fewest rows first, so it prefills, tails, decodes
+        bool want = want_after(Kind::Prefill);
+        unsigned prefills = 0;
+        for (unsigned i = 0; i < 60; ++i) {
+            check_invariants(s, want, "decode prefill cap");
+            const bool decoding = s.slots()[1].phase == Phase::Decode || s.slots()[0].phase == Phase::Decode;
+            const Quantum q = s.next();
+            if (q.kind == Kind::Prefill && q.keys[0].slot == 0) {
+                ++prefills;
+                const uint32_t left = 32767 - s.slots()[0].prefilled;
+                const uint32_t cap = decoding && knob ? knob : (left > 4096 ? 8192 : 4096);
+                CHECK(q.rows == std::min(left, cap));
+            }
+            if (q.kind == Kind::Prefill) s.complete_prefill();
+            else if (q.kind == Kind::PromptTail) s.complete_tail(Completion{q.keys[0], 1, false, 0});
+            else if (q.kind == Kind::Decode) {
+                std::vector<Completion> out;
+                for (unsigned k = 0; k < q.count; ++k) out.push_back(Completion{q.keys[k], 1, false, 0});
+                s.complete_decode(out);
+            }
+            want = want_after(q.kind);
+        }
+        CHECK(prefills > 0);
+    }
+    // validate: a multiple of PAGE, at most prefill_rows
+    for (uint32_t bad : {100u, 8192u}) {
+        Config c = cfg(); c.decode_prefill_rows = bad;
+        bool threw = false;
+        try { c.validate(); } catch (...) { threw = true; }
+        CHECK(threw);
+    }
+}
+
 // The smallest RNG the battery needs, so the run is reproducible from the seed alone.
 struct Rng {
     uint64_t s = 1;
@@ -205,6 +250,7 @@ static void randomized_agrees()
         Config c = cfg();
         c.prefill_rows = rng.range(1024, 4096);
         c.two_lanes = (rng.next() & 1) != 0;
+        if (rng.next() & 1) c.decode_prefill_rows = rng.range(1, c.prefill_rows / PAGE) * PAGE;
         Scheduler a(c), b(c);
         bool want = true;
         uint64_t next_id = 1;
@@ -237,6 +283,7 @@ int main()
     alternation_is_counted();
     threshold_is_notice_rows();
     small_quantum_config();
+    decode_prefill_cap();
     randomized_agrees();
     if (fails) { std::fprintf(stderr, "scheduler_horizon_test: %d failure(s)\n", fails); return 1; }
     std::printf("scheduler_horizon_test: notice target floored at %llu, capped at %llu, %u rows of cover\n",
