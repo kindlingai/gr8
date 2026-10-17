@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The supervisor's control port, a head that fails before its checks finish, the engine's environment and build id.
     python3 -m unittest discover -s tools/launch"""
+import json
 import os
 import socket
 import subprocess
@@ -376,6 +377,122 @@ class SelfCheckTests(unittest.TestCase):
         self.assertFalse(a['ok'])                               # rank 2 did not answer
         self.assertEqual([x.get('ok') for x in a['ranks']], [True, True, False, True])
         self.assertIn('error', supervisor(rank=1).check_all())  # only the head gathers
+
+
+HPORTS = '127.0.0.1/8'
+
+
+def hybrid(*argv, rank=0, members=MEMBERS):
+    return supervisor('--shape', 'hybrid', '--fab-ports', HPORTS, *argv, rank=rank, members=members)
+
+
+class HybridTests(unittest.TestCase):
+    @mock.patch.object(S, 'log')
+    def test_hybrid_uses_the_lan_for_its_rails(self, _):
+        s = hybrid('--node-ip', MEMBERS[1])
+        with mock.patch.object(S.fabric, 'rails', side_effect=AssertionError('no fabric discovery on hybrid')):
+            s.rendezvous(4)
+        self.assertEqual((s.rank, s.rails), (1, (MEMBERS[1], MEMBERS[1])))
+
+    def test_tp8_pins_off_the_proxy_and_relay_cores(self):
+        m8 = [f'192.0.2.{i}' for i in range(1, 9)]
+        s = hybrid(members=m8)
+        with mock.patch.object(S.shutil, 'which', return_value='/usr/bin/taskset'):
+            self.assertEqual(s.pin(), ['taskset', '-c', '0-10'])
+        with mock.patch.object(S.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(S.Stop, 'no taskset'):
+                s.pin()
+        s = hybrid('--proxy-cpu', '8', members=m8)
+        with self.assertRaisesRegex(S.Stop, '--proxy-cpu 8: TP=8 needs 9 or more'):
+            s.pin()
+        self.assertEqual(supervisor('--tp', '4').pin(), [])                     # TP=4 unchanged
+
+    def routes_verdict(self, ports):
+        import routes
+        t = routes.compute(ports)
+        return {'t': 'ok', 'ports': [[str(i) for i in p] for p in t.ports], 'routes': t.text, 'routes_sha': t.sha,
+                'opts_digest': 'd' * 64}
+
+    @mock.patch.object(S, 'log')
+    def test_the_worker_writes_routes_after_its_own_check(self, _):
+        s = hybrid(rank=2)
+        ports = [[f'198.51.100.{r + 1}/24'] for r in range(4)]
+        s.o.values['FAB_PORTS'] = '198.51.100.3/24'
+        v = self.routes_verdict(ports)
+        s.write_routes(v)
+        with open(os.path.join(s.home, 'run', 'routes.txt')) as f:
+            self.assertEqual(f.read(), v['routes'])
+        s.o.values['FAB_PORTS'] = '198.51.100.9/24'        # the head's table lists another address for this rank
+        with self.assertRaisesRegex(S.Stop, 'this box declares 198.51.100.9/24'):
+            s.write_routes(v)
+        s.o.values['FAB_PORTS'] = '198.51.100.3/24'
+        with self.assertRaisesRegex(S.Stop, 'the head sent'):
+            s.write_routes({**v, 'routes': v['routes'].replace('D 0 1', 'D 1 0')})
+
+    def test_declared_ports_must_be_local(self):
+        s = hybrid()
+        s.build, s.ms, s.offers, s.tmpl = 'x', None, None, None
+        s.o.values['FAB_PORTS'] = '127.0.0.1/8,192.0.2.77/24'
+        with mock.patch.object(S, 'running_engines', return_value=[]), mock.patch.object(S, 'log'):
+            fails = s.checks(copy=False)
+        self.assertIn('--fab-ports 192.0.2.77/24: 192.0.2.77 is not an address of this box', fails)
+        self.assertFalse(any('127.0.0.1' in f for f in fails))
+
+
+@unittest.skipUnless(os.path.isfile('/proc/self/stat'), 'needs /proc')
+class TeardownTests(unittest.TestCase):
+    """B3: processes are named by identity, TERM escalates to KILL, and `down` is checked, not trusted."""
+    def home(self):
+        h = tempfile.mkdtemp()
+        os.makedirs(os.path.join(h, 'out'))
+        return h
+
+    def launch(self, home, name, code='import time; time.sleep(60)'):
+        p = subprocess.Popen([sys.executable, '-c', code], cwd=home)
+        self.addCleanup(p.kill)
+        time.sleep(0.2)
+        with open(os.path.join(home, 'out', f'{name}.pid'), 'w') as f:
+            f.write(f'{p.pid}\n')
+        rec = S.write_identity(os.path.join(home, 'out'), name, p.pid)
+        self.assertEqual((rec['pid'], rec['cwd']), (p.pid, os.path.realpath(home)))
+        return p
+
+    def test_an_engine_that_ignores_term_gets_kill(self):
+        h = self.home()
+        eng = self.launch(h, 'g6m4', 'import signal, time; signal.signal(15, signal.SIG_IGN); time.sleep(60)')
+        said = []
+        self.assertTrue(S.stop_local(h, log=said.append, grace=0.3, term_s=0.3, kill_s=3))
+        self.assertEqual(eng.wait(timeout=5), -9)
+        self.assertIn(f'engine (pid {eng.pid}) outlived SIGTERM for 0s: SIGKILL', said)
+        self.assertIn(f'engine (pid {eng.pid}) stopped', said)
+
+    def test_a_record_for_another_process_is_not_signalled(self):
+        h = self.home()
+        other = self.launch(h, 'g6m4')
+        rec = S.read_identity(os.path.join(h, 'out'), 'g6m4')
+        with open(os.path.join(h, 'out', 'g6m4.id'), 'w') as f:
+            json.dump({**rec, 'start': rec['start'] - 1}, f)          # same pid, another start time: a reused pid
+        self.assertFalse(S.stop_local(h, log=lambda s: None, grace=0.2, term_s=0.2, kill_s=0.2))
+        self.assertIsNone(other.poll())
+
+    def test_verify_down_names_survivors_and_listeners(self):
+        h = self.home()
+        sup = self.launch(h, 'supervisor')
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen()
+        self.addCleanup(srv.close)
+        port = srv.getsockname()[1]
+        left = S.verify_down(h, [port], {'127.0.0.1'})
+        self.assertEqual(len(left), 2, left)
+        self.assertIn(f'supervisor pid {sup.pid} still runs', left[0])
+        self.assertEqual(left[1], f'something listens on 127.0.0.1:{port}')
+        self.assertEqual(S.verify_down(h, [port], {'192.0.2.1'})[1:], [])    # another box's address: not ours
+        left = S.verify_down(h, [port], {'127.0.0.1'}, kill=True, log=lambda s: None)
+        self.assertEqual(sup.wait(timeout=5), -9)
+        self.assertEqual(left, [f'something listens on 127.0.0.1:{port}'])
+        srv.close()
+        self.assertEqual(S.verify_down(h, [port]), [])
 
 
 if __name__ == '__main__':
