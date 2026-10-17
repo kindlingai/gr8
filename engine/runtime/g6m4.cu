@@ -1228,16 +1228,20 @@ int main(int argc, char** argv)
                         G6RT_CK(cudaStreamSynchronize(st));
                         g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
                     }
+                    g6s2::s2_tl().cut();
                     if (R == 0) fprintf(stderr, "# s2 dflash slot %d prompt context %d..%d: %.1f ms\n", q, dfl_from, DF.pf_hi - 1,
                                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
                     return dfl_from;
                 };
                 h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
                     // G6_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq).
-                    // The target step before phase 1 was fenced on st, and phase 2 comes before the next one
+                    // The target step before phase 1 was fenced on st, and phase 2 comes before the next one.
+                    // G6_S2_TIMELINE: phase 0 is a step in the target stream's sequence; phases 1 + 2 are timed apart (par_*)
                     cudaStream_t& ds = dfl_par_st;
+                    g6s2::S2Timeline& tl = g6s2::s2_tl();
                     if (r.phase != 2)
                     {
+                        if (r.phase) tl.par_enter(); else tl.enter();
                         DflIn di;
                         memset(&di, 0, sizeof di);
                         di.step = ++s2_dstep;
@@ -1248,10 +1252,15 @@ int main(int argc, char** argv)
                         fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
                         ds = r.phase ? st_par[di.query ? 1 : 0] : st;
                         if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
+                        if (r.phase) tl.par_pre(ds); else tl.pre(ds);
                         G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], ds));
+                        if (r.phase) tl.par_post(ds); else tl.post(ds);
                         if (r.phase == 1) return s2::DflDrafts{};
                     }
+                    else tl.par_wait();
                     G6RT_CK(cudaStreamSynchronize(ds));
+                    if (r.phase) tl.par_done(r.query ? g6s2::S2Timeline::DQUERY_PAR : g6s2::S2Timeline::DCTX_PAR, r.rows);
+                    else tl.done(r.query ? g6s2::S2Timeline::DQUERY : g6s2::S2Timeline::DCTX, r.rows, R);
                     if (dfl_tl)   // G6_S2_ROUNDLOG: the drafter step's launch to its wait (G6_DRAFT_PAR: the first form and chain within)
                         fprintf(stderr, "# s2_dfl step %llu query %d par %d ms %.3f\n", (unsigned long long)s2_dstep, (int)r.query, r.phase ? 1 : 0,
                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dfl_t0).count());

@@ -207,6 +207,8 @@ tools/s2_costfit.py engine_rank0.log [--residuals] [--json]   # also ms per whol
 tools/s2_costfit.py --selftest
 ```
 
+`G6_S2_TIMELINE=N` (every rank, through `G6ENV_X`) splits the time between decode steps into main-stream work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: main-stream gap <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean main-stream gap from one step's end to the next step's start and the host time from the fence to the next launch. The gap is bounded by events on the main stream only: it is not total GPU idle time — with `G6_DRAFT_PAR` the drafter's side stream can execute inside it. The `drafting GPU span` figure includes side-stream spans alongside all other non-main spans; `dfl_ctx_par` / `dfl_query_par` report mean side-stream spans per step. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `G6_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing.
+
 ## Mock engine and tests
 
 `mock_engine.py` speaks PROTOCOL.md with no model, so the front end and the old benchmark tools can run anywhere:
