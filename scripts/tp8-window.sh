@@ -17,6 +17,8 @@
 # POST after the canary), <S>_P0_CHECK (each box in P0, while the serve still runs), <S>_ENV_BOXES (the boxes that hold
 # <S>_ENV; default <S>_BOXES), <S>_HEALTH (path, default /health), <S>_HEALTH_S, and <S>_CANARY_MD5=exit0 (the canary
 # passes on the command's exit status; no output file).
+# Optional report-only speed rows: BASE_SPEED_CMD on BASE_SPEED_HOST at the end of P0 (live serve), SPEED_CMD on the
+# TP8 head after a P6 PASS when at most SPEED_MAX_ELAPSED s have passed (bounded by SPEED_S, added to T_MAX).
 set -u
 ME=$(readlink -f "$0")
 
@@ -58,7 +60,7 @@ load() {
     [ "$(svboxes "$s" | wc -l)" -ge 1 ] || die "$1: ${s}_BOXES is empty"
     [ "$(sv "$s" CANARY_MD5)" = exit0 ] || [ -n "$(sv "$s" CANARY_OUT)" ] || die "$1: ${s}_CANARY_OUT is not set"
   done
-  T_MAX=$((B_P0 + B_ARM + B_P1 + B_P2 + B_P3 + B_P4 + B_P5 + B_P6 + B_RESTORE + B_MARGIN))
+  T_MAX=$((B_P0 + B_ARM + B_P1 + B_P2 + B_P3 + B_P4 + B_P5 + B_P6 + ${SPEED_CMD:+${SPEED_S:-600} +} B_RESTORE + B_MARGIN))
 }
 
 # each BOX in parallel: CMD; prints "BOX rc" lines into $2-file and returns the number of failures
@@ -241,6 +243,10 @@ p0() {
                | tee -a "$LOG" | sed -n 's/^routes sha \([0-9a-f]\{64\}\)$/\1/p')
   [ -n "$ROUTES_SHA" ] || die "routes.py dry run refused the declared ports"
   echo "$ROUTES_SHA" > "$LOCAL/routes.sha"
+  if [ -n "${BASE_SPEED_CMD:-}" ]; then   # report only: the same speed row on a live serve, for compare
+    say "P0 base speed row on $BASE_SPEED_HOST (report only)"
+    rsh "$BASE_SPEED_HOST" "${BASE_SPEED_S:-600}" "$BASE_SPEED_CMD" > "$LOCAL/speed-base.txt" 2>&1 || say "P0: base speed row failed (not a gate)"
+  fi
   say "P0 OK: routes sha $ROUTES_SHA, T_MAX ${T_MAX}s"
 }
 
@@ -330,6 +336,14 @@ cmd_run() {
     timeout 120 scp -q -o ConnectTimeout=10 -o BatchMode=yes "$SSH_USER@$h:$TP8_HOME/out/*.log" "$SSH_USER@$h:$TP8_HOME/out/*.err" \
       "$LOCAL/logs/$h/" 2>> "$LOG"
   done
+  if [ $ok = 1 ] && [ -n "${SPEED_CMD:-}" ]; then   # P7, report only, never a gate; skipped late in the window
+    if [ $SECONDS -le "${SPEED_MAX_ELAPSED:-4500}" ] && ! fenced; then
+      say "P7 speed row (report only, <= ${SPEED_S:-600}s)"
+      rsh "${TP8_BOXES[0]}" "${SPEED_S:-600}" "$SPEED_CMD" > "$LOCAL/speed-tp8.txt" 2>&1 || say "P7: speed row failed (not a gate)"
+    else
+      say "P7: speed row skipped (${SECONDS}s since start, or fenced)"
+    fi
+  fi
   if [ $ok = 1 ]; then finish "TP8 PASS"; else finish "TP8 FAIL at P6"; fi
 }
 
