@@ -16,7 +16,8 @@
 # with the same flags.
 # Exit code: 0 = every case PASS, 1 = a case FAILED, 2 = CUDA error, other = build failure (the first failing test's code).
 # Test args go to the selected test (TEST=...), with both selected to row_budget_test:
-#   row_budget_test: --only gv|k1, --time [reps] (K1 timing over M = 6..24, see scripts/tune_k1_split.sh)
+#   row_budget_test: --only gv|k1, --time [reps] (K1 timing over M = 6..24, see scripts/tune_k1_split.sh),
+#                    --ab | --ab-k2 [reps] (K1 against the K2x decode design, engine/kernels/k2x.cuh, issue #8)
 #   s2_attn_test:    --only rep|cp, --seeds N, --no-long (skips the two cases above 32768 tokens)
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
