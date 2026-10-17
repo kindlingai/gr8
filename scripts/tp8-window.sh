@@ -12,7 +12,7 @@
 # RD/RESTORED_OK or RD/ALERT. An ALERT is not a restored serve: an unreachable host can still leave a serve down.
 #
 # A serve is a gr8 glm53 serve unless its conf sets hooks (any serve, e.g. a non-gr8 one): <S>_DOWN_CMD (head, P1),
-# <S>_STOP_CMD (each box: stop and verify down, exit 0 = down), <S>_UP_CMD (each of <S>_UP_BOXES, must return at once),
+# <S>_DOWN_S (its timeout, default 300), <S>_STOP_CMD (each box: stop and verify down, exit 0 = down), <S>_UP_CMD (each of <S>_UP_BOXES, must return at once),
 # <S>_PREP (each box before up), <S>_PRE_UP_CHECK and <S>_POST_CHECK (each box, exit 0 = pass; PRE before every up,
 # POST after the canary), <S>_P0_CHECK (each box in P0, while the serve still runs), <S>_ENV_BOXES (the boxes that hold
 # <S>_ENV; default <S>_BOXES), <S>_HEALTH (path, default /health), <S>_HEALTH_S, and <S>_CANARY_MD5=exit0 (the canary
@@ -280,7 +280,7 @@ cmd_run() {
   say "P1 serves down"
   fenced && finish "fenced before P1"
   for s in "${SERVES[@]}"; do
-    rsh "$(sv "$s" HEAD)" 300 "$(svd "$s" DOWN_CMD "cd $(sv "$s" HOME) && ./gr8 glm53 down @$(sv "$s" ENV)")" >> "$LOG" 2>&1
+    rsh "$(sv "$s" HEAD)" "$(svd "$s" DOWN_S 300)" "$(svd "$s" DOWN_CMD "cd $(sv "$s" HOME) && ./gr8 glm53 down @$(sv "$s" ENV)")" >> "$LOG" 2>&1
     serve_local_stop "$s" || finish "P1: $s not verified down"
   done
 
