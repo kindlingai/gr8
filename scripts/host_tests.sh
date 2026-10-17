@@ -147,3 +147,5 @@ python3 "$REPO/engine/tests/test_flash_serve_check.py"
 python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test"
 "$T/pf_peer_stage_test"
+# the TP8 arm of the engine defaults
+"$REPO/scripts/engine_args_tp8_test.sh"
