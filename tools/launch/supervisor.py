@@ -804,7 +804,9 @@ class Supervisor:
         os.makedirs(work)
         self.check_n = 0
         env = self.engine_env(plan)
-        argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
+        # hybrid: the route file names every rail, and the engine refuses --ips2 with --hybrid
+        ips2 = [] if o.get('SHAPE') == 'hybrid' else ['--ips2', ','.join(hs['ips2'])]
+        argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), *ips2,
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
         if o.get('SHAPE') == 'ring':
             argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
