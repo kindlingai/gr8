@@ -13,9 +13,10 @@
 #
 # A serve is a gr8 glm53 serve unless its conf sets hooks (any serve, e.g. a non-gr8 one): <S>_DOWN_CMD (head, P1),
 # <S>_STOP_CMD (each box: stop and verify down, exit 0 = down), <S>_UP_CMD (each of <S>_UP_BOXES, must return at once),
-# <S>_PREP (each box before up), <S>_PRE_UP_CHECK and <S>_POST_CHECK (each box, exit 0 = pass; PRE in P0 and before
-# every up, POST after the canary), <S>_HEALTH (path, default /health), <S>_HEALTH_S, and <S>_CANARY_MD5=exit0 (the
-# canary passes on the command's exit status; no output file).
+# <S>_PREP (each box before up), <S>_PRE_UP_CHECK and <S>_POST_CHECK (each box, exit 0 = pass; PRE before every up,
+# POST after the canary), <S>_P0_CHECK (each box in P0, while the serve still runs), <S>_ENV_BOXES (the boxes that hold
+# <S>_ENV; default <S>_BOXES), <S>_HEALTH (path, default /health), <S>_HEALTH_S, and <S>_CANARY_MD5=exit0 (the canary
+# passes on the command's exit status; no output file).
 set -u
 ME=$(readlink -f "$0")
 
@@ -34,7 +35,9 @@ sv() { local v="${1}_$2"; printf '%s' "${!v}"; }
 svboxes() { local v="${1}_BOXES[@]"; printf '%s\n' "${!v}"; }
 # svd NAME KEY DEFAULT: a serve's optional setting
 svd() { local v="${1}_$2"; printf '%s' "${!v:-$3}"; }
-svupboxes() { local v="${1}_UP_BOXES[@]"; if declare -p "${1}_UP_BOXES" > /dev/null 2>&1; then printf '%s\n' "${!v}"; else svboxes "$1"; fi; }
+# svlist NAME KEY: the serve's optional box list <S>_KEY, else <S>_BOXES
+svlist() { local v="${1}_$2[@]"; if declare -p "${1}_$2" > /dev/null 2>&1; then printf '%s\n' "${!v}"; else svboxes "$1"; fi; }
+svupboxes() { svlist "$1" UP_BOXES; }
 envkey() { rsh "$1" 30 "sed -n 's/^\\(export \\)\\{0,1\\}$3=//p' $(printf %q "$2") | tail -1 | tr -d \"\\\"'\""; }
 
 load() {
@@ -212,8 +215,8 @@ p0() {
   for s in "${SERVES[@]}"; do
     shealthy "$s" || die "$s is not serving"
     canary "$s" || die "$s baseline canary"
-    serve_check "$s" PRE_UP_CHECK || die "$s pre-up check (its restore would fail)"
-    for h in $(svboxes "$s"); do
+    serve_check "$s" P0_CHECK || die "$s P0 check (its restore would fail)"
+    for h in $(svlist "$s" ENV_BOXES); do
       [ "$(rsh "$h" 30 "sha256sum $(sv "$s" ENV)" | cut -d' ' -f1)" = "$(sv "$s" ENV_SHA)" ] || die "$s env on $h changed"
     done
   done
