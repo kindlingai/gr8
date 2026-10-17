@@ -591,6 +591,22 @@ inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, c
     return nullptr;
 }
 
+// G6_QA_SPLIT (rank.cuh qs_narrow): g limited to its output tiles t0 .. t0 + nt - 1 (16 outputs each), written at their
+// columns of the same y rows (ld unchanged). An output tile's arithmetic depends only on the tile, K and ks (warp w of
+// a tile always takes the same k range, the k parts are summed in the same order, gv_gemv_body), so the narrowed GEMV
+// writes the bits the full one writes for those columns, at any tpc. nt = 0: the GEMV is off on this rank.
+inline void narrow(Gv& g, int t0, int nt, int tpc)
+{
+    if (!g.on) return;
+    if (nt <= 0) { g.on = 0; return; }
+    const int GR = g.codec == INT4 ? 288 : g.codec == MXFP8 ? 528 : 512, gk = g.codec == BF16W ? 16 : 32;
+    const int esz = g.odt == gv::O_F32 ? 4 : 2;
+    g.w += static_cast<size_t>(t0) * (g.K / gk) * GR;
+    g.y = static_cast<char*>(g.y) + static_cast<size_t>(t0) * 16 * esz;
+    g.O = nt * 16;
+    if (tpc > 0 && tpc < g.tpc) g.tpc = tpc;
+}
+
 // ------------------------------------------------------------------------------------------ K1
 struct K1
 {
@@ -887,6 +903,7 @@ struct Layer
     Xfrag xf_x, xf_qa, xf_attn, xf_x2;
     Gv q_a, kv_a, q_b, idx_q, idx_k, idx_w, o_proj, router;
     GvMulti x_in;                     // q_a, kv_a, idx_k, idx_w as one launch (n = 0: one launch each)
+    GvMulti x_rest;                   // G6_QA_SPLIT=2 only: kv_a, idx_k, idx_w (full) as one launch after the q_a slice
     K1 k1;
     Tensor sh[3];                     // the K1's shared / dense MLP records (fc1 or gate, up, fc2 or down), for warm_mlp
     const void* shw = nullptr;        // trellis shared expert: its fc1 tiles (tr3.table row 256) and their bytes,
