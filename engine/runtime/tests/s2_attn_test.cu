@@ -17,6 +17,7 @@
 //        standalone CP binding per (session, rank) in the plain form; batched: one CP binding per rank holding every
 //        session's pages (per-row table with the session's physical pages, G6_CP_REMOTE for pages of other ranks; index keys on
 //        the same pages). Compared: output rows of every rank's head group, merged index lists, latent and index caches.
+//        Long cases (off with --no-long): index selection past 32768 keys, globally and on every rank's own keys.
 // KV is filled by the append path itself (random fp16 inputs through g6_attn_append), the step's own rows are appended by the
 // step. Row i of a session sits at position ctx - rows + i (a decode / verify step), so every row of a session sees its own
 // causal bound.
@@ -938,6 +939,11 @@ int main(int argc, char** argv)
             {"three sessions, mixed", 16, {{3, 200}, {1, 700}, {8, 1024}}},
             {"four sessions, equal", 16, {{2, 600}, {2, 600}, {2, 600}, {2, 600}}},
         };
+        if (longcase)   // index selection past 32768 keys (SEL32): globally, then on every rank's own keys (> 4 x 32768)
+        {
+            cp.push_back({"long context above 32768, with a short session", 530, {{1, 200}, {2, 33500}}});
+            cp.push_back({"long context, rank-local keys above 32768", 2200, {{1, 1000}, {1, 140000}}});
+        }
         for (int i = 0; i < std::min(seeds, 3); ++i)
         {
             Rng r(2000 + i);

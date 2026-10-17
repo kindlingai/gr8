@@ -153,6 +153,7 @@ pub struct Pool {
     nr: u32,
     version: u32,
     live: u32,
+    live_hi: u32, // of live: the pages at or above place (the drafter's tail copies of split runs)
     used: Vec<bool>,
     held: BTreeMap<u32, Held>,
     exclusive: bool,
@@ -188,6 +189,7 @@ impl Pool {
             nr: 0,
             version: 0,
             live: 0,
+            live_hi: 0,
             used: vec![false; pool_pages as usize],
             held: BTreeMap::new(),
             exclusive: false,
@@ -397,15 +399,26 @@ impl Pool {
         if self.exclusive {
             0
         } else if self.live != 0 {
-            self.place.wrapping_sub(self.live)
+            self.lo_free()
         } else {
             self.pages
         }
     }
 
-    /// Head, before reserve: a past-R request (by its worst case) waits for an empty pool.
+    // pages below place no live run holds (retained runs count as free)
+    fn lo_free(&self) -> u32 {
+        self.place.wrapping_sub(self.live - self.live_hi)
+    }
+
+    // pages at or above place no live run holds: the drafter's class of split runs
+    fn hi_free(&self) -> u32 {
+        self.pages - self.place - self.live_hi
+    }
+
+    /// Head, before reserve: a past-R request (by its worst case) waits for an empty pool, unless the page classes are
+    /// on (nr > 0): then split runs share the pool with each other and with runs below R (decoded in one CP step).
     pub fn admissible(&self, worst: u64) -> bool {
-        !self.exclusive && (!self.exclusive(worst) || self.live == 0)
+        !self.exclusive && (!self.exclusive(worst) || self.live == 0 || self.nr > 0)
     }
 
     /// Whether a request that needs `rows` now and at most `worst` rows can be admitted: an exclusive run takes its
@@ -419,10 +432,11 @@ impl Pool {
             if self.nr == 0 {
                 return w <= self.room() as u64;
             }
-            // its own pages: both classes must have room in an empty pool (a reservation evicts retained runs as it
-            // needs them, so every page of a class is free or evictable)
+            // its own pages: both classes must have room beside the live runs (a reservation evicts retained runs as
+            // it needs them, so every page of a class no live run holds is free or evictable), and the runs below R
+            // must still reach their worst cases with its prefix and shard taken (it holds its worst case at once)
             let (main, draft) = self.exclusive_pages(worst);
-            return main <= self.place as u64 && draft <= (self.pages - self.place) as u64;
+            return self.split_room(main, draft);
         }
         n <= self.room() as u64 && w <= self.place as u64 && self.safe(Some((n, w)), None)
     }
@@ -474,7 +488,7 @@ impl Pool {
             return Err(Error::PastWorst);
         }
         let add = n - have;
-        if add > self.place.wrapping_sub(self.live) as u64 || !self.safe(None, Some((r.table_version, add))) {
+        if add > self.lo_free() as u64 || !self.safe(None, Some((r.table_version, add))) {
             self.stalls += 1;
             return Ok(None);
         }
@@ -582,7 +596,7 @@ impl Pool {
             let adopted = &k.list[..(a as usize).min(k.list.len())];
             let mut room = a <= k.list.len() as u64 && a <= n;
             if self.exclusive(worst) {
-                room = room && self.live == 0 && n <= self.pages as u64;
+                room = room && (self.live == 0 || self.nr > 0) && n <= self.pages as u64;
                 if self.nr == 0 {
                     // an exclusive run is pages 0, 1, ..: the adopted ones must be its start
                     room = room && adopted.iter().enumerate().all(|(i, &p)| p as usize == i);
@@ -591,7 +605,7 @@ impl Pool {
                     room = room && self.hit_room(adopted, a, n, worst);
                 }
             } else {
-                room = room && n <= (self.place.wrapping_sub(self.live)) as u64 && n <= w;
+                room = room && n <= self.lo_free() as u64 && n <= w;
                 room = room && adopted.iter().all(|&p| p < self.place) && self.safe(Some((n, w)), None);
             }
             if !room {
@@ -648,18 +662,18 @@ impl Pool {
             return false;
         }
         if self.exclusive(worst) {
-            let room = self.live == 0
+            let room = (self.live == 0 || self.nr > 0)
                 && !self.exclusive
                 && n <= self.pages as u64
                 && (tail || a * PAGE <= self.below_rows as u64);
             if self.nr == 0 || !room {
                 return room;
             }
-            // its own pages: the two classes must fit (a fresh grant restores into them)
+            // its own pages: the two classes must fit beside the live runs (a fresh grant restores into them)
             let (main, draft) = self.exclusive_pages(worst);
-            return main <= self.place as u64 && draft <= (self.pages - self.place) as u64;
+            return self.split_room(main, draft);
         }
-        n <= self.place.wrapping_sub(self.live) as u64 && n <= w && self.safe(Some((n, w)), None)
+        n <= self.lo_free() as u64 && n <= w && self.safe(Some((n, w)), None)
     }
 
     /// Claims a stored hit: a fresh grant as reserve() makes it, with the entry's first ceil(skip / 64) blocks queued
@@ -767,7 +781,7 @@ impl Pool {
             } else if !self.hit_room(adopted, a, n, worst) {
                 return Err(Error::NoRoom);
             }
-        } else if n > (self.place.wrapping_sub(self.live)) as u64
+        } else if n > self.lo_free() as u64
             || n > w
             || adopted.iter().any(|&p| p >= self.place)
             || !self.safe(Some((n, w)), None)
@@ -874,22 +888,35 @@ impl Pool {
     /// version, pages) added to a live run, can every live run still reach its worst case? Runs finish in order of
     /// their remaining need, smallest first, each returning what it holds. Retained runs count as free.
     pub fn safe(&self, new: Option<(u64, u64)>, grow: Option<(u32, u64)>) -> bool {
+        self.safe_with(new, grow, None)
+    }
+
+    // safe() per page class. Only runs below R ever need more pages, all below place, so the drafter's class is safe
+    // as soon as it fits; below place the Banker's order runs over every live run's pages there. `split` = the pages
+    // below place of a new split run (its prefix and shard: held at once, need 0).
+    fn safe_with(&self, new: Option<(u64, u64)>, grow: Option<(u32, u64)>, split: Option<u64>) -> bool {
         if self.exclusive {
-            return new.is_none() && grow.is_none();
+            return new.is_none() && grow.is_none() && split.is_none();
         }
-        let mut free = self.place as i64 - self.live as i64;
+        let mut free = self.lo_free() as i64;
+        let place = self.place;
         let mut runs: Vec<(u64, u64)> = self
             .held
             .iter()
             .map(|(v, h)| {
-                let held = h.list.len() as u64 + grow.filter(|g| g.0 == *v).map_or(0, |g| g.1);
-                ((h.worst as u64).saturating_sub(held), held)
+                let add = grow.filter(|g| g.0 == *v).map_or(0, |g| g.1);
+                let low = h.list.iter().filter(|&&p| p < place).count() as u64 + add;
+                ((h.worst as u64).saturating_sub(h.list.len() as u64 + add), low)
             })
             .collect();
         free -= grow.map_or(0, |g| g.1 as i64);
         if let Some((n, w)) = new {
             free -= n as i64;
             runs.push((w.saturating_sub(n), n));
+        }
+        if let Some(m) = split {
+            free -= m as i64;
+            runs.push((0, m));
         }
         if free < 0 {
             return false;
@@ -968,7 +995,9 @@ impl Pool {
             self.used[p as usize] = on;
         }
         let n = list.len() as u32;
+        let hi = list.iter().filter(|&&p| p >= self.place).count() as u32;
         self.live = if on { self.live + n } else { self.live - n };
+        self.live_hi = if on { self.live_hi + hi } else { self.live_hi - hi };
     }
 
     // `list` (adopted pages, if any) grows by `need` pages out of [lo, hi): the lowest pages no run holds or retains,
@@ -1017,13 +1046,21 @@ impl Pool {
     // Whether a past-R hit's grant works with its own pages (nr > 0): the adopted low pages plus fresh ones of both
     // classes must fit, the fresh low pages within the positions the grant still has (hit_room's caller checked
     // a <= n and n <= pages).
+    // The adopted pages are retained (no live run holds them), so they count among each class's free pages.
     fn hit_room(&self, adopted: &[u32], a: u64, n: u64, worst: u64) -> bool {
         let (main, _draft) = self.exclusive_pages(worst);
         let alt = adopted.iter().filter(|&&p| p < self.place).count() as u64;
         let fresh_lt = main.saturating_sub(alt);
-        fresh_lt <= n - a
-            && alt + fresh_lt <= self.place as u64
-            && n - alt - fresh_lt <= (self.pages - self.place) as u64
+        fresh_lt <= n - a && self.split_room(alt + fresh_lt, n - alt - fresh_lt)
+    }
+
+    // whether a split run holding `low` pages below place and `high` above it fits beside the live runs, with every
+    // run below R still able to reach its worst case (safe_with)
+    fn split_room(&self, low: u64, high: u64) -> bool {
+        !self.exclusive
+            && low <= self.lo_free() as u64
+            && high <= self.hi_free() as u64
+            && self.safe_with(None, None, Some(low))
     }
 
     // take_hit's past-R grant (nr > 0): the list grows from a to n pages, the low class first so the run's pages
@@ -1065,7 +1102,8 @@ impl Pool {
         // a run that continues its conversation counts as continued once, even when it found nothing to reuse
         let hits = hits.max(std::mem::take(&mut self.next_continues) as u32);
         self.held.insert(r.table_version, Held { tokens, hits, span, list, exclusive, worst });
-        self.exclusive = self.exclusive || exclusive;
+        // with the page classes on (nr > 0) a split run holds only its own pages; without, the whole pool
+        self.exclusive = self.exclusive || (exclusive && self.nr == 0);
         r
     }
 

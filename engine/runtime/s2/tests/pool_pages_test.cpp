@@ -146,7 +146,8 @@ int main()
         CHECK(big == w.reserve(1024) && p.exclusive_run(big) && p.kept_runs() == 1);
         std::vector<int> want = iota_list(4, 12), high = iota_list(32, 4);
         want.insert(want.end(), high.begin(), high.end());
-        CHECK(p.list(big) == want && p.list(big) == w.list(big) && p.room() == 0 && p.free_pages() == 0 && !p.admissible(64));
+        // a split run holds only its own pages (multi-agent CP batching): 32 - 12 low pages stay free and admissible
+        CHECK(p.list(big) == want && p.list(big) == w.list(big) && p.room() == 20 && p.free_pages() == 64 && p.admissible(64));
         p.release(big); w.release(big);
         // 2,560 rows = 40 pages: 8 + 16 below place, 16 above; retained, then its continuation adopts 32 pages of it
         const Run conv = p.reserve(2560);
@@ -166,7 +167,7 @@ int main()
         const auto ah = iota_list(32, 8), fl = iota_list(28, 3), fh = iota_list(40, 11);
         lc.insert(lc.end(), ah.begin(), ah.end()); lc.insert(lc.end(), fl.begin(), fl.end()); lc.insert(lc.end(), fh.begin(), fh.end());
         CHECK(p.list(c) == lc && p.list(c) == w.list(c) && p.digest() == w.digest());
-        CHECK(c.pages == 46 && p.free_pages() == 0 && !p.admissible(64));
+        CHECK(c.pages == 46 && p.free_pages() == 80 - 46 && p.admissible(64));
         p.release(c); w.release(c);
         // 3,584 rows = 56 pages wants every page below place: the retained short run gives its back, only then
         const Run huge = p.reserve(3584);

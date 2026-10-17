@@ -284,7 +284,9 @@ fn a_past_r_run_leaves_the_short_runs_retained() {
     let bigger = p.reserve(1536, 1536).unwrap();
     assert_eq!(p.kept_runs(), 0, "the retained run gives its pages back when the classes need them");
     assert_eq!(p.list(&bigger).unwrap(), &(0..16).chain(16..24).collect::<Vec<u32>>()[..]);
-    assert_eq!((p.room(), p.free_pages(), p.admissible(PAGE)), (0, 0, false));
+    // with the page classes on a split run holds only its own pages: the pool stays admissible, but no page below
+    // place is left, so nothing fits (the 16 free pages are the drafter's class)
+    assert_eq!((p.room(), p.free_pages(), p.admissible(PAGE), p.fits(PAGE, PAGE)), (0, 16, true, false));
     // a request past what the classes hold is refused: 17 shard pages want more than place has
     p.release(&bigger).unwrap();
     assert!(p.reserve(1600, 1600).is_err(), "main = 8 + ceil(17 / 2) = 17 > place 16");

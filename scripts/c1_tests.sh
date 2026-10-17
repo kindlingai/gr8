@@ -16,7 +16,7 @@
 # Exit code: 0 = every case PASS, 1 = a case FAILED, 2 = CUDA error, other = build failure (the first failing test's code).
 # Test args go to the selected test (TEST=...), with both selected to row_budget_test:
 #   row_budget_test: --only gv|k1, --time [reps] (K1 timing over M = 6..24, see scripts/tune_k1_split.sh)
-#   s2_attn_test:    --only rep|cp, --seeds N, --no-long (skips the two cases above 32768 tokens)
+#   s2_attn_test:    --only rep|cp, --seeds N, --no-long (skips the cases above 32768 tokens: two replicated, two CP)
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)

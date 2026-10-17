@@ -648,6 +648,8 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
 #ifdef DEC_S2
 inline const bind::Layer& s2_layer(Model& m, int i, int M);
 inline const bind::Layer& layer_base(Model& m, int i, int M);
+inline bool s2_cp_step(const Model& m);
+inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M);
 inline const bind::Layer& layer_for(Model& m, int i, int M) { return m.s2on ? s2_layer(m, i, M) : layer_base(m, i, M); }
 #define G6RT_LAYER_BASE layer_base
 #else
@@ -749,6 +751,15 @@ inline void launch_layer_in(Model& m, const Layer& y, const bind::Layer& b, int 
 
 #if defined(G6_CP) && G6_CP
 inline bool cp_active(const Model& m, int context) { return m.cp.on && (m.graph ? m.bk[m.cur] : context) > m.cp.R; }
+// the step takes the CP block. S2 below R: when its bucket is past R (a split run past R among its sessions,
+// s2_cp_step), on the CP batch views; m.cur is not the S2 step's bucket (S2Model::bucket), so cp_active does not apply
+inline bool cp_block(const Model& m, int context)
+{
+#ifdef DEC_S2
+    if (m.s2on) return s2_cp_step(m);
+#endif
+    return cp_active(m, context);
+}
 // The CP attention block, in three phases so the loopback driver can deliver between them (phase -1 = all,
 // in order, as the real fabric runs it):
 //   0: projections, cp_front (append, absorb) -> q(i) put; cp_index -> cand(i) put (full layers); S3 + shared layer: my
@@ -764,10 +775,16 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     const bind::Layer& b = layer_for(m, i, M);
     const int r = m.rank, nr = g6nr::NR, H = y.ab.args.heads, G = 16;
     if (H != cp_heads(r, y.l)) die("G6_CP: layer " + std::to_string(y.l) + " binding heads disagree with the group rule");
-    G6Attn* a = m.graph ? &y.rp[m.cur][M].fixed : &y.ab.args;
-    const G6AttnStepCell* cell = m.graph ? y.rp[m.cur][M].cell : nullptr;
-    void* scr = y.ab.scratch;
-    const size_t sb = y.ab.scratch_bytes;
+    // S2 (a step past R with several sessions' rows): the layer's CP batch view, rows' tables and bounds per row in its
+    // cell, with or without graphs (s2_cp_step)
+    G6AttnReplay* srp = nullptr;
+#ifdef DEC_S2
+    if (m.s2on) srp = s2_cp_replay(m, i, M);
+#endif
+    G6Attn* a = srp ? &srp->fixed : m.graph ? &y.rp[m.cur][M].fixed : &y.ab.args;
+    const G6AttnStepCell* cell = srp ? srp->cell : m.graph ? y.rp[m.cur][M].cell : nullptr;
+    void* scr = srp ? srp->scratch : y.ab.scratch;
+    const size_t sb = srp ? srp->scratch_bytes : y.ab.scratch_bytes;
     const int cq = C.colls.q[i], cc = C.colls.cand[i];
     // NR=6: q payloads and partials are sized by the group they belong to (10 or 11 heads); the wire size (tail offset) of
     // every collective is M x its row bytes (CpColls, sized for the widest group)
@@ -779,7 +796,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     const float *q = nullptr, *rope = nullptr;
     if (phase <= 0)
     {
-        if (m.graph && !y.rp_on[m.cur][M]) die("prepare(m, M) was not called before a graph step");
+        if (!srp && m.graph && !y.rp_on[m.cur][M]) die("prepare(m, M) was not called before a graph step");
         dmark(DP_OTHER, st);
 #ifdef DEC_SLOT
         if (i == 0) bind::launch(b.xf_x, st);
@@ -792,7 +809,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         bind::launch(b.idx_q, st);
         dmark(DP_QB, st);
         for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
-        if (!m.graph)
+        if (!srp && !m.graph)
         {
             const G6AttnStep s = attn_step(m, i, M, context);
             G6RT_CK(g6_attn_bind_prepare(&y.ab, &s, st));
@@ -874,12 +891,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t st)
 {
 #if defined(G6_CP) && G6_CP
-#ifdef DEC_S2
-    // S2 below R: every session's run is <= G6_CP_R rows (s2_init run_pages), so an S2 step never takes the CP block;
-    // m.cur is not the S2 step's bucket (each slot has its own, S2Model::bk)
-    if (!m.s2on)
-#endif
-    if (cp_active(m, context)) { launch_attn_cp(m, i, M, context, -1, st); return; }
+    if (cp_block(m, context)) { launch_attn_cp(m, i, M, context, -1, st); return; }
 #endif
     Layer& y = m.layers[i];
     const bind::Layer& b = layer_for(m, i, M);

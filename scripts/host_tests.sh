@@ -52,6 +52,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # the notice target's sizing (the work in flight, not a constant): no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_horizon_test.cpp" -o "$T/scheduler_horizon_test"
 "$T/scheduler_horizon_test"
+# Config::decode_rounds (G6_S2_DECODE_ROUNDS): K decode rounds per prefill quantum, its notice target, default off
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rounds_test.cpp" -o "$T/scheduler_rounds_test"
+"$T/scheduler_rounds_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
 NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
@@ -68,6 +71,12 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
+# a held event boundary (Commit::hold): queued admissions chained at one boundary, three ranks on socket pairs
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_hold_test.cpp" -o "$T/control_hold_test"
+"$T/control_hold_test"
+# ranks of different control builds refuse at bootstrap (CONTROL_VERSION in the agreement and the frame magic)
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_version_test.cpp" -o "$T/control_version_test"
+"$T/control_version_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_state_test.cpp" "${KVLIB[@]}" -o "$T/steering_state_test"
 "$T/steering_state_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_transport_test.cpp" -o "$T/steering_transport_test"

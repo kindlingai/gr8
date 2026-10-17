@@ -28,6 +28,7 @@ class EventGate {
     std::optional<Notice> n_;
     uint64_t next_event_ = 1;
     bool arrived_ = false, committed_ = false;
+    bool held_ = false;   // applied(n, true): stopped at due_, and the next notice must name it
 public:
     EventGate(uint64_t epoch, unsigned rank) : epoch_(epoch), rank_(rank) { require(epoch, "bad epoch"); }
     // No-event hot path: atomic scalars only, no mutex, syscall, message, digest or allocation.
@@ -54,7 +55,8 @@ public:
         require(n.epoch == epoch_ && n.event == next_event_ &&
                 (n.kind == EventKind::Admit || n.kind == EventKind::Cancel), "notice epoch/sequence/kind mismatch");
         require(n.boundary <= uint64_t(INT64_MAX) && int64_t(n.boundary) > passed_.load(), "late event notice");
-        n_ = n; arrived_ = committed_ = false;
+        require(!held_ || n.boundary == due_.load(), "notice does not name the held boundary");
+        n_ = n; arrived_ = committed_ = held_ = false;
         due_.store(n.boundary);
         // Close race with before_work(): if it departed while notice was being installed,
         // fail the entire epoch. Never silently apply this event one round late.
@@ -78,11 +80,13 @@ public:
         cv_.wait(lock, [&] { return committed_ || failed_.load(); });
         require(!failed_, "control epoch failed");
     }
-    void applied(const Notice& n) { // caller applied canonical pool/scheduler changes successfully
+    // hold (Commit::hold): stay stopped at this boundary, NOT departed, for the next event, which must name it. The
+    // compute thread re-enters before_work(n.boundary), which returns true (due == boundary), and waits for that notice.
+    void applied(const Notice& n, bool hold = false) { // caller applied canonical pool/scheduler changes successfully
         std::lock_guard<std::mutex> lock(mu_);
         require(n_ && *n_ == n && committed_ && !failed_, "invalid event application");
         require(next_event_ != UINT64_MAX, "event sequence exhausted");
-        ++next_event_; n_.reset(); arrived_ = committed_ = false; due_ = UINT64_MAX;
+        ++next_event_; n_.reset(); arrived_ = committed_ = false; held_ = hold; due_ = hold ? n.boundary : UINT64_MAX;
     }
     void fail() {
         // Share the waiter's mutex: an atomic predicate alone can lose a notify

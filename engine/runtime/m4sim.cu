@@ -741,7 +741,7 @@ int main(int argc, char** argv)
     };
     // layer i's attention block on every rank: the CP block in its three phases with the loopback between them
     auto attn_all = [&](int i, int M, int context) {
-        if (!cp_active(R[0], context)) { for (Model& m : R) launch_attn_block(m, i, M, context, st); return; }
+        if (!cp_block(R[0], context)) { for (Model& m : R) launch_attn_block(m, i, M, context, st); return; }
         for (Model& m : R) launch_attn_cp(m, i, M, context, 0, st);
         vdeliver(cp_colls.q[i], M);
         if (cp_colls.cand[i] >= 0) vdeliver(cp_colls.cand[i], M);
