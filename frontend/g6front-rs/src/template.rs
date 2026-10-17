@@ -37,6 +37,9 @@ pub struct ChatTemplate {
     supports_developer: bool,
     /// the reasoning efforts the template names (`thinking::template_levels`), highest first
     pub levels: Vec<&'static str>,
+    /// the think tags the generation prompt renders: open always, close when the template knows one
+    pub think_open: Option<String>,
+    pub think_close: Option<String>,
 }
 
 /// Keyword args the renderer owns; a request cannot override them through chat_template_kwargs.
@@ -64,13 +67,41 @@ impl ChatTemplate {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
         env.add_function("strftime_now", |fmt: String| -> Result<String, Error> { Ok(strftime_now(&fmt)) });
+        let (think_open, think_close) = think_tags(&source);
         env.add_template_owned("chat", source).map_err(|e| format!("chat_template.jinja: {e:#}"))?;
         Ok(ChatTemplate {
             env,
             special: vec![("eos_token", eos_token), ("pad_token", pad_token)],
             supports_developer,
             levels,
+            think_open,
+            think_close,
         })
+    }
+
+    /// The no-think prompt: drop the Reasoning Effort header, and with `tail` close the generation prompt's
+    /// think block (the template rendered an open; the model must start on content).
+    pub fn strip_reasoning(&self, text: &str, tail: bool) -> String {
+        const HEADER: &str = "Reasoning Effort: ";
+        let mut text = text.to_string();
+        if let Some(i) = text.find(HEADER) {
+            let rest = &text[i + HEADER.len()..];
+            let end = rest.find(|c: char| !(c.is_ascii_alphabetic() || c.is_whitespace())).unwrap_or(rest.len());
+            text = format!("{}{}", &text[..i], &rest[end..]);
+        }
+        if tail && self.think_close.is_some() {
+            if let (Some(open), Some(close)) = (&self.think_open, &self.think_close) {
+                if let Some(k) = text.rfind(open.as_str()) {
+                    let rest = &text[k + open.len()..];
+                    if rest.starts_with(close.as_str()) {
+                        text = format!("{}{}", &text[..k], rest); // the template rendered open+close: drop the open
+                    } else if !rest.contains(close.as_str()) {
+                        text = format!("{}{}{}", &text[..k], close, rest); // open with no close: close it
+                    }
+                }
+            }
+        }
+        text
     }
 
     /// `kw` is the output of `build_template_kwargs()`.
@@ -595,6 +626,46 @@ pub fn normalize_tools(tools: Option<&Value>) -> Result<Option<Value>, TemplateE
     Ok(Some(Value::Array(out)))
 }
 
+/// The think-open and think-close tags a template renders around the generation prompt: the quoted literals of
+/// the last `add_generation_prompt` branch. Either two literals (open and close), one literal holding both
+/// (open first), or the open alone with the close derived from it (` InitializeComponent`-free: the close is the
+/// open with a `/` after its `<`). None when the source has no recognizable generation tail.
+fn think_tags(source: &str) -> (Option<String>, Option<String>) {
+    let Some(i) = source.rfind("add_generation_prompt") else { return (None, None) };
+    let rest = &source[i..];
+    let bytes = rest.as_bytes();
+    let mut lits: Vec<&str> = Vec::new();
+    let mut j = 0;
+    while j < bytes.len() {
+        if bytes[j] == b'\'' {
+            match rest[j + 1..].find('\'') {
+                Some(end) => {
+                    lits.push(&rest[j + 1..j + 1 + end]);
+                    j += end + 2;
+                }
+                None => break,
+            }
+        } else {
+            j += 1;
+        }
+    }
+    if lits.is_empty() {
+        return (None, None);
+    }
+    let short = lits.iter().copied().min_by_key(|l| l.len()).unwrap();
+    let long = lits.iter().copied().max_by_key(|l| l.len()).unwrap();
+    if short != long && long.starts_with(short) {
+        return (Some(short.to_string()), Some(long[short.len()..].to_string()));
+    }
+    let head = lits[0];
+    if head.starts_with('<') && head.ends_with('>') {
+        let close = format!("</{}", &head[1..]);
+        let close = if source.contains(&close) { Some(close) } else { None };
+        return (Some(head.to_string()), close);
+    }
+    (Some(head.to_string()), None)
+}
+
 /// vLLM ChatCompletionRequest.build_chat_params(): request chat_template_kwargs are the defaults; the top-level
 /// fields override them unless null/"auto". `reasoning_effort` is the resolved one (`thinking::resolve`), already
 /// mapped to the template's levels: it replaces whatever the kwargs held. No `enable_thinking` is added: GLM 5.3's
@@ -605,6 +676,7 @@ pub fn build_template_kwargs(
     continue_final_message: Value,
     reasoning_effort: Option<&str>,
     documents: Option<&Value>,
+    no_think: bool,
 ) -> Result<Map<String, Value>, TemplateError> {
     let mut user = match chat_template_kwargs {
         Some(Value::Object(o)) => o.clone(),
@@ -631,6 +703,9 @@ pub fn build_template_kwargs(
     if let Some(e) = reasoning_effort {
         user.insert("reasoning_effort".into(), Value::from(e));
     }
+    if !user.contains_key("enable_thinking") && (no_think || reasoning_effort.is_some()) {
+        user.insert("enable_thinking".into(), Value::from(!no_think));
+    }
     Ok(user)
 }
 
@@ -649,13 +724,14 @@ mod tests {
 
     fn render(t: &ChatTemplate, body: Value) -> String {
         let body = body.as_object().unwrap();
-        let th = resolve(body, &t.levels, Defaults::default()).unwrap();
+        let th = resolve(body, &t.levels, Defaults::default(), false).unwrap();
         let kw = build_template_kwargs(
             body.get("chat_template_kwargs"),
             Value::Bool(true),
             Value::Bool(false),
             th.effort,
             None,
+            th.no_think,
         )
         .unwrap();
         t.render(Some(&json!([{"role": "user", "content": "hi"}])), None, kw).unwrap()

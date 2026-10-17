@@ -72,10 +72,11 @@ Read as TensorFold 0.6.1 reads them (`server/request_options.py`). The code is `
 
 | field | accepted | effect |
 |---|---|---|
-| `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold) |
-| `chat_template_kwargs.enable_thinking` | `true`, or unset | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. The front end adds no `enable_thinking` kwarg of its own |
+| `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` turns thinking off (next row), unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold) |
+| `chat_template_kwargs.enable_thinking` | `true`, `false`, or unset | `false` (or another false value) asks for thinking off. This is OPT-IN: unless the front end runs `--allow-thinking-off`, the request is a 400 naming the flag (degenerate output was seen with a closed think block on this model — see below). With the flag, `false` turns thinking off: the rendered prompt carries no effort header and the generation prompt is closed on the think-close tag. `true` overrides `reasoning_effort: "none"` |
 | `thinking_budget` (top level) | an integer, an integral float, a string holding an integer, or null. Anything else is a 400 | 0, null or unset: `--default-thinking-budget` (TensorFold's `int(budget or default)`). Negative: no limit. N: while the think block is open, the reply's Nth token is replaced by `\n</think>\n\n`, even when it is `</think>` itself, so N-1 reasoning tokens come first (TensorFold's ThinkBudget). `max_tokens` may cut the close short. It applies to a chat prompt that leaves a think block open. The close has no logprobs, so naming both `thinking_budget` and `logprobs` is a 400 |
-| `response_format` (chat and completions) | absent, null, `{"type": "text"}` | `json_object`, `json_schema` and any other type are a 400 until the engine has constrained decoding |
+| `response_format` (chat) | absent, null, `{"type": "text"}`, `{"type": "json_object"}`, `{"type": "json_schema", "json_schema": {"name": str, "schema": object}}` | JSON modes are enforced after generation: the reply's first JSON value is extracted; for `json_schema` the extracted span's tokens are replayed through an xgrammar-compiled schema (compiled per request — an unsupported schema is a 400 before the engine sees it). No JSON or a mismatch returns the reply unchanged with a `warnings` entry |
+| `response_format` (`/v1/completions`) | absent, null, `{"type": "text"}` | any other type is a 400: the legacy route has no JSON handling |
 
 `/tokenize` with `messages` applies the same effort and refusals, so its count matches the chat request's prompt.
 Chat usage carries `completion_tokens_details.reasoning_tokens`: the reply's tokens through its `</think>`, or all of
@@ -228,6 +229,26 @@ canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve
 - A tool call's arguments arrive when the call is confirmed, not as they are written: nothing in the text says whether
   the model is making a call or writing about one, so the parser waits for the reply to end with it
   (`g6front-rs/src/parser.rs`). The final concatenated string is identical.
+- `response_format` `json_object`/`json_schema` are enforced after generation (the engine has no constrained
+  decoding). The extractor finds the reply's first JSON value with a balanced scan (strings and escapes
+  honored, parse-failing candidates skipped, bounded so pathological prose stays linear). For `json_schema`
+  the extracted span's own tokenization is replayed through a grammar compiled by
+  [xgrammar](https://crates.io/crates/xgrammar) (`xgrammar-rs` bindings): the schema is compiled at request
+  time, so an unsupported schema is a 400 before the engine sees the request, and the replay decides whether
+  the reply satisfies the schema.
+- Two costs of the post-generation approach, up front: `warnings` is NOT an OpenAI response field — a client
+  that asked for JSON and gets prose plus a warning is still broken, just visibly so — and JSON mode has no
+  incremental output: the stream withholds content until the finish (the JSON may sit anywhere in the reply,
+  so nothing can be emitted before it ends). On a mismatch or missing JSON the reply is returned unchanged
+  with a `warnings` entry (stream: on the last choice), never a 500.
+- `reasoning_effort: "none"` and `chat_template_kwargs.enable_thinking: false` are OPT-IN
+  (`--allow-thinking-off`; off by default the request is a 400 naming the flag). With the flag they produce a
+  real no-think prompt: no `Reasoning Effort:` header, generation prompt closed on the think-close tag, and
+  the reply carries `reasoning: null` with content from the first token. Named efforts render exactly as
+  before. CAVEAT: a previous serving stack saw degenerate output with a closed think block on this model
+  (count-to-200 probes corrupt in 3-8 of 8 runs at temperature 0 across ~18 boots; thinking on was clean
+  8/8) — the flag exists so the prompt shape can be probed on gr8, not because it is known safe. The gate:
+  count 1 to 200, one number per line, digits only, temperature 0, thinking off, eight runs.
 - Tool-call tags are parsed only when the request has `tools` and `tool_choice` is not `none`.
 - `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. The close leads because the template leaves `<think>` open at the end of a chat prompt, so without it the forced call would be reasoning text and the parser would read the reply as prose. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text, and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (the inserted close ends the block before any reasoning is written), its inserted tokens count toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request).
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).
