@@ -2,7 +2,8 @@
 """./gr8 glm53 <command> for the symmetric launch: the same command on every box. Python 3 standard library only.
 
     up [OPTIONS] [@FILE]       start this box's supervisor in the background and follow it until the cluster serves
-    down                       stop every box of the last boot (or this box alone)
+    down [--local]             stop every box of the last boot (or this box alone); --local: this box only, no
+                               request to any other box (a recovery that must not reach another cluster)
     verify-down [--kill]       this box: exit 0 only when the last boot's supervisor, engine, front end and shim (by
                                their recorded identity: pid, start time, boot, cwd) are gone and nothing listens on
                                the control, API or S2 port or the shim socket; --kill SIGKILLs recorded survivors first
@@ -136,10 +137,13 @@ def rpc(m, addr, msg, timeout=5):
 
 
 def cmd_down(argv):
-    o = parse(argv, check=False)
+    local = '--local' in argv
+    o = parse([a for a in argv if a != '--local'], check=False)
     out, home = out_dir(o), os.path.abspath(o.get('G6_HOME'))
-    m = members_of(o)
-    if m:
+    m = None if local else members_of(o)
+    if local:
+        print('--local: stopping this box only')
+    elif m:
         members, _, me = m
         results = {}
 
@@ -180,9 +184,10 @@ def cmd_verify_down(argv):
     hs = read_handshake(out) or {}
     ports = [hs.get('control_port') or o.get('CONTROL_PORT'), hs.get('port') or o.get('PORT'),
              hs.get('s2port') or o.get('S2PORT') or '7341']
-    addrs = None
-    if hs.get('members') and isinstance(hs.get('rank'), int):
-        addrs = {hs['members'][hs['rank']], '127.0.0.1'}
+    addrs = None      # any address of this box: a listener on any of them is not down
+    lan = hs['members'][hs['rank']] if hs.get('members') and isinstance(hs.get('rank'), int) else None
+    if lan and lan.startswith('127.'):   # several boxes on one machine (the tests): only this box's address
+        addrs = {lan}
     left = sv.verify_down(home, ports, addrs, kill=kill, log=lambda s: print(s))
     for why in left:
         print(f'not down: {why}')
