@@ -6,6 +6,7 @@
 mod api;
 mod engine;
 mod gen;
+mod jsonmode;
 mod logprobs;
 mod metrics;
 mod parser;
@@ -13,6 +14,7 @@ mod pyjson;
 mod sampling;
 mod template;
 mod thinking;
+mod xgrammar;
 mod tok;
 mod tool_choice;
 mod util;
@@ -47,6 +49,8 @@ pub struct State {
     pub share_tokens: u64,
     /// reasoning_effort and thinking_budget for a request that names none
     pub thinking: thinking::Defaults,
+    /// the compiled-grammar cache for response_format json_schema (xgrammar)
+    pub json_grammar: xgrammar::Grammar,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
@@ -237,6 +241,7 @@ async fn serve(args: Args) -> Result<(), String> {
         args.default_budget
     );
     let engine = engine::Engine::new(args.engine_sock.clone());
+    let json_grammar = xgrammar::Grammar::build(&tok);
     let st: &'static State = Box::leak(Box::new(State {
         tok,
         template,
@@ -250,6 +255,7 @@ async fn serve(args: Args) -> Result<(), String> {
         default_max_tokens: args.default_max_tokens,
         share_tokens: args.share_tokens,
         thinking: thinking::Defaults { effort: args.default_effort, budget: args.default_budget },
+        json_grammar,
         started: util::now_secs(),
         supervisor: args.supervisor,
     }));
