@@ -2,6 +2,8 @@
 # Host-only tests (g++, no CUDA): the switchless relay's ring and credit accounting, the S2 batch planner
 # (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE) and the insert
 # rule), the S2 control barrier, the pool's page lists
+# Host-only tests (g++, no CUDA): the fabric's QP MTU choice, the switchless relay's ring and credit accounting, the S2 batch planner
+# (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
 # and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
 # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
@@ -17,6 +19,8 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
 "$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
+"$T/fabric_mtu_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" -o "$T/relay_test"
 "$T/relay_test"
 python3 "$REPO/engine/comms/tests/relay_loop_test.py"

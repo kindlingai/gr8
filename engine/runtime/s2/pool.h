@@ -148,6 +148,22 @@ public:
         return s;
     }
     void keep_agreed(const std::string& agreed) { Lock l(mu_); g6kv_keep_agreed(p_, agreed.c_str()); }
+    // resize (#153): chunks of pages below place (kvman-rs g6kvman.h). shrink: the chunks now offline, or nothing while
+    // the pool must wait for sessions to finish. grow: the chunks back online, after their memory is mapped
+    void chunks(uint32_t pages_per_chunk) { Lock l(mu_); check(g6kv_chunks(p_, pages_per_chunk)); }
+    uint32_t chunk_count() const { Lock l(mu_); return g6kv_chunk_count(p_); }
+    bool chunk_online(uint32_t k) const { Lock l(mu_); return g6kv_chunk_online(p_, k) != 0; }
+    uint32_t place_online() const { Lock l(mu_); return g6kv_place_online(p_); }
+    std::optional<std::vector<uint32_t>> shrink(uint32_t n) {
+        Lock l(mu_); std::vector<uint32_t> v(n); size_t got = 0; int done = 0;
+        check(g6kv_shrink(p_, n, v.data(), v.size(), &got, &done));
+        if (!done) return std::nullopt;
+        v.resize(got);
+        return v;
+    }
+    std::vector<uint32_t> grow_pool(uint32_t n) {
+        Lock l(mu_); std::vector<uint32_t> v(n); check(g6kv_grow_pool(p_, n, v.data(), v.size())); return v;
+    }
     std::vector<PoolUse> runs() const {
         Lock l(mu_);
         std::vector<g6kv_use> u(g6kv_runs(p_, nullptr, 0));

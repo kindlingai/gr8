@@ -167,6 +167,10 @@ pub struct Pool {
     next_tokens: Option<Vec<i32>>,
     next_span: Option<u64>,
     next_continues: bool, // count() found the next grant continues a conversation
+    // resize (#153): pages [0, place) come in chunks of `chunk` pages (0 = off). An offline chunk's pages hold no live
+    // or retained run and are not counted anywhere, so the engine may release their memory.
+    chunk: u32,
+    offline: Vec<bool>,
 }
 
 impl Pool {
@@ -202,7 +206,168 @@ impl Pool {
             next_tokens: None,
             next_span: None,
             next_continues: false,
+            chunk: 0,
+            offline: Vec::new(),
         })
+    }
+
+    /// Resize (#153): pages [0, place) in chunks of `pages_per_chunk` (the last one may be shorter). Only while every
+    /// chunk is online. Chunk k is pages [k * pages_per_chunk, min((k + 1) * pages_per_chunk, place)).
+    pub fn chunks(&mut self, pages_per_chunk: u32) -> Result<(), Error> {
+        if pages_per_chunk == 0 || self.offline.iter().any(|&o| o) {
+            return Err(Error::BadArgument);
+        }
+        self.chunk = pages_per_chunk;
+        self.offline = vec![false; self.place.div_ceil(pages_per_chunk) as usize];
+        Ok(())
+    }
+
+    /// Pages a chunk holds (0 = resize off).
+    pub fn chunk_pages(&self) -> u32 {
+        self.chunk
+    }
+
+    pub fn chunk_count(&self) -> u32 {
+        self.offline.len() as u32
+    }
+
+    /// Whether chunk k is online: false for k >= chunk_count() once chunks are on, true for every k while they are off.
+    pub fn chunk_online(&self, k: u32) -> bool {
+        if self.chunk == 0 {
+            return true;
+        }
+        self.offline.get(k as usize).is_some_and(|&o| !o)
+    }
+
+    fn chunk_range(&self, k: usize) -> std::ops::Range<u32> {
+        let lo = k as u32 * self.chunk;
+        lo..(lo + self.chunk).min(self.place)
+    }
+
+    /// Whether page p is online: past place always, below it when its chunk is.
+    pub fn online(&self, p: u32) -> bool {
+        self.chunk == 0 || p >= self.place || !self.offline[(p / self.chunk) as usize]
+    }
+
+    /// The online pages below place: what runs below R and the main class past R can hold.
+    pub fn place_online(&self) -> u32 {
+        self.place - self.offline_pages()
+    }
+
+    /// Pages of offline chunks.
+    pub fn offline_pages(&self) -> u32 {
+        (0..self.offline.len()).filter(|&k| self.offline[k]).map(|k| self.chunk_range(k).len() as u32).sum()
+    }
+
+    // the online pages from page 0 on, up to the first offline one: what an exclusive run on the tables as built
+    // (pages 0, 1, ..) can take
+    fn prefix_online(&self) -> u32 {
+        match self.offline.iter().position(|&o| o) {
+            Some(k) => self.chunk_range(k).start,
+            None => self.pages,
+        }
+    }
+
+    /// Takes `n` chunks offline: the highest online chunks no live run holds a page of, after evicting (and
+    /// spilling) every retained run that holds one. Ok(None), with the pool unchanged, when fewer than n chunks are free
+    /// of live runs, when the live runs could not all reach their worst cases in what stays online, or while an
+    /// exclusive run is resident: the caller waits for sessions to finish and tries again. A shrink never evicts or
+    /// moves a live run. Err(BadSize) when no state allows it: fewer than n chunks online, or the largest n of them
+    /// would leave less than R / 64 pages online below place (a request of R rows could never fit). Err(BadArgument)
+    /// before chunks(). Ok(Some(chunks)): the chunks now offline, ascending. The evicted runs' spills
+    /// are queued (io()): the engine runs them before it releases the chunks' memory.
+    pub fn shrink(&mut self, n: u32) -> Result<Option<Vec<u32>>, Error> {
+        self.pending()?;
+        if self.chunk == 0 {
+            return Err(Error::BadArgument);
+        }
+        if n == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // a size no state allows: fewer than n chunks online, or the largest n of them leave less than R / 64 pages
+        let mut sizes: Vec<u32> =
+            (0..self.offline.len()).filter(|&k| !self.offline[k]).map(|k| self.chunk_range(k).len() as u32).collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        if sizes.len() < n as usize
+            || ((self.place_online() - sizes.iter().take(n as usize).sum::<u32>()) as u64)
+                < self.below_rows as u64 / PAGE
+        {
+            return Err(Error::BadSize);
+        }
+        if self.exclusive {
+            return Ok(None);
+        }
+        let mut pick = Vec::new();
+        for k in (0..self.offline.len()).rev() {
+            if pick.len() == n as usize {
+                break;
+            }
+            if !self.offline[k] && !self.chunk_range(k).any(|p| self.used[p as usize]) {
+                pick.push(k);
+            }
+        }
+        if pick.len() < n as usize {
+            return Ok(None); // live runs hold a page in too many chunks: wait for sessions to finish
+        }
+        let left = self.place_online() - pick.iter().map(|&k| self.chunk_range(k).len() as u32).sum::<u32>();
+        if !self.safe_with(left, None, None) {
+            return Ok(None);
+        }
+        let hit: Vec<bool> = {
+            let mut h = vec![false; self.place as usize];
+            for &k in &pick {
+                for p in self.chunk_range(k) {
+                    h[p as usize] = true;
+                }
+            }
+            h
+        };
+        let (gone, stay): (Vec<Kept>, Vec<Kept>) = std::mem::take(&mut self.kept)
+            .into_iter()
+            .partition(|k| k.list.iter().any(|&p| p < self.place && hit[p as usize]));
+        self.kept = stay;
+        self.spill(&gone);
+        for &k in &pick {
+            self.offline[k] = true;
+        }
+        pick.sort_unstable();
+        self.log_resize("shrink", &pick, gone.len());
+        Ok(Some(pick.into_iter().map(|k| k as u32).collect()))
+    }
+
+    /// Brings `n` offline chunks back, the lowest first (so an exclusive run on the tables as built gets its pages 0, 1,
+    /// .. back first). The engine maps their memory before this call. Growth starts from a safe state (every state
+    /// the pool reaches is one) and adds only free pages, so it stays safe. Err(BadArgument) when fewer than n chunks
+    /// are offline, or before chunks(). Returns the chunks now online, ascending.
+    pub fn grow_pool(&mut self, n: u32) -> Result<Vec<u32>, Error> {
+        self.pending()?;
+        if self.chunk == 0 {
+            return Err(Error::BadArgument);
+        }
+        let back: Vec<usize> = (0..self.offline.len()).filter(|&k| self.offline[k]).take(n as usize).collect();
+        if back.len() < n as usize {
+            return Err(Error::BadArgument);
+        }
+        debug_assert!(self.safe(None, None), "the pool left a safe state");
+        for &k in &back {
+            self.offline[k] = false;
+        }
+        self.log_resize("grow", &back, 0);
+        Ok(back.into_iter().map(|k| k as u32).collect())
+    }
+
+    fn log_resize(&self, how: &str, chunks: &[usize], evicted: usize) {
+        if !self.log {
+            return;
+        }
+        let s = format!(
+            "# s2 pool {how} chunks {chunks:?} online {} of {} live {} kept {} evicted {evicted}\n",
+            self.place_online(),
+            self.place,
+            self.live,
+            self.kept.len()
+        );
+        let _ = std::io::stderr().write_all(s.as_bytes());
     }
 
     /// Block stores below the pool (stash.rs), after keep(): a prefix that started `shared_after` conversations is
@@ -388,7 +553,7 @@ impl Pool {
         if self.exclusive {
             0
         } else {
-            self.pages - self.live
+            self.pages - self.offline_pages() - self.live
         }
     }
 
@@ -397,9 +562,12 @@ impl Pool {
         if self.exclusive {
             0
         } else if self.live != 0 {
-            self.place.wrapping_sub(self.live)
+            self.place_online().wrapping_sub(self.live)
+        } else if self.nr == 0 {
+            // an exclusive run takes pages 0, 1, .. up to the first offline one; a run below R any online page
+            self.prefix_online().max(self.place_online())
         } else {
-            self.pages
+            self.pages - self.offline_pages()
         }
     }
 
@@ -417,14 +585,16 @@ impl Pool {
         }
         if self.exclusive(worst) {
             if self.nr == 0 {
-                return w <= self.room() as u64;
+                return w <= self.prefix_online() as u64;
             }
             // its own pages: both classes must have room in an empty pool (a reservation evicts retained runs as it
             // needs them, so every page of a class is free or evictable)
             let (main, draft) = self.exclusive_pages(worst);
-            return main <= self.place as u64 && draft <= (self.pages - self.place) as u64;
+            return main <= self.place_online() as u64 && draft <= (self.pages - self.place) as u64;
         }
-        n <= self.room() as u64 && w <= self.place as u64 && self.safe(Some((n, w)), None)
+        n <= self.place_online().wrapping_sub(self.live) as u64
+            && w <= self.place_online() as u64
+            && self.safe(Some((n, w)), None)
     }
 
     /// A run of pages for `rows` now that may grow (grow()) to `worst` rows. An exclusive run holds its worst case.
@@ -474,7 +644,7 @@ impl Pool {
             return Err(Error::PastWorst);
         }
         let add = n - have;
-        if add > self.place.wrapping_sub(self.live) as u64 || !self.safe(None, Some((r.table_version, add))) {
+        if add > self.place_online().wrapping_sub(self.live) as u64 || !self.safe(None, Some((r.table_version, add))) {
             self.stalls += 1;
             return Ok(None);
         }
@@ -584,6 +754,7 @@ impl Pool {
             if self.exclusive(worst) {
                 room = room && self.live == 0 && n <= self.pages as u64;
                 if self.nr == 0 {
+                    room = room && n <= self.prefix_online() as u64;
                     // an exclusive run is pages 0, 1, ..: the adopted ones must be its start
                     room = room && adopted.iter().enumerate().all(|(i, &p)| p as usize == i);
                 } else {
@@ -591,7 +762,7 @@ impl Pool {
                     room = room && self.hit_room(adopted, a, n, worst);
                 }
             } else {
-                room = room && n <= (self.place.wrapping_sub(self.live)) as u64 && n <= w;
+                room = room && n <= (self.place_online().wrapping_sub(self.live)) as u64 && n <= w;
                 room = room && adopted.iter().all(|&p| p < self.place) && self.safe(Some((n, w)), None);
             }
             if !room {
@@ -653,13 +824,13 @@ impl Pool {
                 && n <= self.pages as u64
                 && (tail || a * PAGE <= self.below_rows as u64);
             if self.nr == 0 || !room {
-                return room;
+                return room && n <= self.prefix_online() as u64;
             }
             // its own pages: the two classes must fit (a fresh grant restores into them)
             let (main, draft) = self.exclusive_pages(worst);
-            return main <= self.place as u64 && draft <= (self.pages - self.place) as u64;
+            return main <= self.place_online() as u64 && draft <= (self.pages - self.place) as u64;
         }
-        n <= self.place.wrapping_sub(self.live) as u64 && n <= w && self.safe(Some((n, w)), None)
+        n <= self.place_online().wrapping_sub(self.live) as u64 && n <= w && self.safe(Some((n, w)), None)
     }
 
     /// Claims a stored hit: a fresh grant as reserve() makes it, with the entry's first ceil(skip / 64) blocks queued
@@ -756,7 +927,7 @@ impl Pool {
         }
         let adopted = &k.list[..a as usize];
         if self.exclusive(worst) {
-            if n > self.pages as u64 {
+            if n > self.pages as u64 || (self.nr == 0 && n > self.prefix_online() as u64) {
                 return Err(Error::NoRoom);
             }
             if self.nr == 0 {
@@ -767,7 +938,7 @@ impl Pool {
             } else if !self.hit_room(adopted, a, n, worst) {
                 return Err(Error::NoRoom);
             }
-        } else if n > (self.place.wrapping_sub(self.live)) as u64
+        } else if n > (self.place_online().wrapping_sub(self.live)) as u64
             || n > w
             || adopted.iter().any(|&p| p >= self.place)
             || !self.safe(Some((n, w)), None)
@@ -831,6 +1002,13 @@ impl Pool {
                 }
             }
         }
+        // offline chunks (resize): with every chunk online the digest is what it was before resize existed
+        if self.offline.iter().any(|&o| o) {
+            h = mix(h, self.chunk as u64);
+            for k in (0..self.offline.len()).filter(|&k| self.offline[k]) {
+                h = mix(h, k as u64);
+            }
+        }
         // without a store the digest is what it was before stores existed
         match &self.stash {
             Some(s) => {
@@ -874,10 +1052,15 @@ impl Pool {
     /// version, pages) added to a live run, can every live run still reach its worst case? Runs finish in order of
     /// their remaining need, smallest first, each returning what it holds. Retained runs count as free.
     pub fn safe(&self, new: Option<(u64, u64)>, grow: Option<(u32, u64)>) -> bool {
+        self.safe_with(self.place_online(), new, grow)
+    }
+
+    // safe() with `place` online pages below place
+    fn safe_with(&self, place: u32, new: Option<(u64, u64)>, grow: Option<(u32, u64)>) -> bool {
         if self.exclusive {
             return new.is_none() && grow.is_none();
         }
-        let mut free = self.place as i64 - self.live as i64;
+        let mut free = place as i64 - self.live as i64;
         let mut runs: Vec<(u64, u64)> = self
             .held
             .iter()
@@ -977,7 +1160,8 @@ impl Pool {
         let (lo, hi) = (lo as usize, hi as usize);
         // claims[p]: 1 when a live run or the adopted list holds p, plus one per retained run that holds it. A page
         // is spare at 0, and evicting a run only ever takes back its own claims.
-        let mut claims: Vec<u32> = self.used[lo..hi].iter().map(|&u| u as u32).collect();
+        // an offline page is claimed for good: no retained run holds one, so no eviction frees it
+        let mut claims: Vec<u32> = (lo..hi).map(|p| (self.used[p] || !self.online(p as u32)) as u32).collect();
         for &p in list.iter() {
             if (p as usize) >= lo && (p as usize) < hi {
                 claims[p as usize - lo] = 1;
@@ -1022,7 +1206,7 @@ impl Pool {
         let alt = adopted.iter().filter(|&&p| p < self.place).count() as u64;
         let fresh_lt = main.saturating_sub(alt);
         fresh_lt <= n - a
-            && alt + fresh_lt <= self.place as u64
+            && alt + fresh_lt <= self.place_online() as u64
             && n - alt - fresh_lt <= (self.pages - self.place) as u64
     }
 

@@ -319,6 +319,96 @@ pub unsafe extern "C" fn g6kv_grow(p: *mut Pool, r: *const Run, rows: u64, out: 
     }
 }
 
+/// Resize (#153): pages below place in chunks of `pages_per_chunk`. Only while every chunk is online.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_chunks(p: *mut Pool, pages_per_chunk: u32) -> i32 {
+    code((*p).chunks(pages_per_chunk))
+}
+
+/// Chunks (0 when resize is off), and whether chunk k is online.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_chunk_count(p: *const Pool) -> u32 {
+    (*p).chunk_count()
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_chunk_online(p: *const Pool, k: u32) -> i32 {
+    (*p).chunk_online(k) as i32
+}
+
+/// The online pages below place.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_place_online(p: *const Pool) -> u32 {
+    (*p).place_online()
+}
+
+/// Takes `n` chunks offline (Pool::shrink): `*done` = 1 and the chunks in out[0..*got], ascending, or `*done` = 0 when
+/// the pool must wait for sessions to finish (nothing changed). out holds cap entries, at least n.
+///
+/// # Safety
+/// As g6kv_exclusive. `out` must be valid for cap writes, `got` and `done` for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_shrink(
+    p: *mut Pool,
+    n: u32,
+    out: *mut u32,
+    cap: usize,
+    got: *mut usize,
+    done: *mut i32,
+) -> i32 {
+    if (out.is_null() && n > 0) || got.is_null() || done.is_null() || cap < n as usize {
+        return Error::BadArgument.code();
+    }
+    match (*p).shrink(n) {
+        Ok(Some(v)) => {
+            for (i, &k) in v.iter().enumerate() {
+                *out.add(i) = k;
+            }
+            *got = v.len();
+            *done = 1;
+            0
+        }
+        Ok(None) => {
+            *got = 0;
+            *done = 0;
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// Brings `n` offline chunks back, the lowest first (Pool::grow_pool), into out[0..n], ascending. The engine maps their
+/// memory first.
+///
+/// # Safety
+/// As g6kv_exclusive. `out` must be valid for cap writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_grow_pool(p: *mut Pool, n: u32, out: *mut u32, cap: usize) -> i32 {
+    if (out.is_null() && n > 0) || cap < n as usize {
+        return Error::BadArgument.code();
+    }
+    match (*p).grow_pool(n) {
+        Ok(v) => {
+            for (i, &k) in v.iter().enumerate() {
+                *out.add(i) = k;
+            }
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]

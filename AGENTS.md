@@ -19,6 +19,15 @@ The rules, short:
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
 your own setup. The config examples use placeholders for a reason.
 
+## Contributor credit
+
+External contributors should add their GitHub username to [CREDITS.md](CREDITS.md) in their contribution PR, with a
+short description of their work and links to relevant PRs or commits when available. Extend an existing entry when
+adding more work. Keep the full contributor list in the README's Credits section in sync with CREDITS.md.
+
+When preparing a PR on someone else's behalf, ensure their work is credited and preserve their Git author/coauthor
+attribution. Describe proposed work accurately without presenting it as a merged or measured improvement.
+
 ## Build
 
 On a GB10 with CUDA 13:
@@ -38,8 +47,8 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | test | where | command |
 |---|---|---|
 | S2 batch planner (with insert rules), control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced, the pool's block stores (`--kv-store`) in lock-step through memory, a file and a loopback KV node | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
-| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
-| row budget, S2 attention, decode heads | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
+| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree, across shrinks and grows of the pool), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
+| row budget, S2 attention, decode heads, the KV pool shrunk and grown under live sessions | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |
 | the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
