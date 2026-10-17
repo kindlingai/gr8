@@ -266,7 +266,7 @@ int main(int argc, char** argv)
     s2::KStop kstop;
     {
         std::string ke;
-        kstop.mode = env_choice("G6_MTP_KSTOP", 2, 0, &ke);
+        kstop.mode = env_choice("G6_MTP_KSTOP", 2, (s2mode && dfl && mtp >= 2) ? 2 : 0, &ke);
         const int lplog = env_choice("G6_MTP_LPLOG", 2, 0, &ke);
         if (kstop.mode < 0 || lplog < 0) die(ke);
         kstop.log = lplog == 2 || (lplog == 1 && cfg.rank == 0);
@@ -484,7 +484,7 @@ int main(int argc, char** argv)
     // serial. Progress: every kernel that waits for peers runs at most 8 CTAs (k_wait_peers 1, k_walk 1, head merges M),
     // so the other stream always finds SMs. In the S2 runtime signature
     std::string dpe;
-    const int draft_par = env_choice("G6_DRAFT_PAR", 2, 0, &dpe);
+    const int draft_par = env_choice("G6_DRAFT_PAR", 2, (dfl && s2mode && mtp) ? 2 : 0, &dpe);
     if (draft_par < 0) die(dpe);
     if (draft_par && !(dfl && s2mode && mtp)) die("G6_DRAFT_PAR needs --dflash-manifest, --mtp and --serve");
     // G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (rank.cuh QSplit; default 0 = off): replicated GEMVs split by output
@@ -493,8 +493,9 @@ int main(int argc, char** argv)
     // both (main and draft steps never run at once; inside the shim / front end's taskset range 0..N-8;
     // G6_QA_SPLIT_CPU moves it). Every rank must run the same values (the S2 runtime signature carries them).
     std::string qse;
-    const int qs_mode = env_choice("G6_QA_SPLIT", 2, 0, &qse), iq_split = env_choice("G6_IDXQ_SPLIT", 1, 0, &qse),
-              mtp_split = env_choice("G6_MTP_SPLIT", 1, 0, &qse);
+    const bool qs_def = g6nr::NR > 1;   // replicated-GEMV split needs peers to gather across; pointless at TP1
+    const int qs_mode = env_choice("G6_QA_SPLIT", 2, qs_def ? 2 : 0, &qse), iq_split = env_choice("G6_IDXQ_SPLIT", 1, qs_def ? 1 : 0, &qse),
+              mtp_split = env_choice("G6_MTP_SPLIT", 1, (qs_def && mtp) ? 1 : 0, &qse);
     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
     g6::Fabric fabg, fabdg;
