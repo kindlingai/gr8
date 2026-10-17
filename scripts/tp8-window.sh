@@ -34,8 +34,12 @@
 # P2b runs in its own unit tp8-steps-<run> on STEPS_HOST (env TP8_RUN_ID; output /tmp/tp8-steps-<run>.log, exit status
 # /tmp/tp8-steps-<run>.rc), so the restore can stop it: STEPS_CMD must start any per-box work in units named
 # tp8-steps-<run>-* (precheck pr95 B2). The restore first stops and verifies the controller unit on STEPS_HOST, then
-# every tp8-steps-<run>-* unit on every test box, then the test cluster, and only then restores a serve. The primary
-# re-checks the fence after P2b and before P6 (precheck pr95 B3).
+# every tp8-steps-<run>-* unit on every test box, then the test cluster, and only then restores a serve. Before those
+# stops it writes the per-host steps fence STEPS_FENCE_DIR/tp8-steps-<run>.fence (default /run) on every test box and
+# STEPS_HOST (a failed write = no serve up, ALERT); the controller unit and every per-box unit must check that file as
+# their first action and refuse to start when it exists (env TP8_STEPS_FENCE), so a unit registered after the stop's
+# scan never runs (precheck pr95v2 B2). The primary re-checks the run fence after P2b, right before P3, and before P6
+# (precheck pr95 B3, pr95v2 B3).
 set -u
 ME=$(readlink -f "$0")
 UNIT_STOP_S=120 STOP_S=300   # remote caps (s) of a launch-unit stop (90 s stop + reads) and of a serve's stop hook
@@ -145,11 +149,14 @@ else echo \"launch units \$u NOT STOPPED: active [\$l] processes \$n\"; exit 1; 
 # with_unit_stop PATTERN CMD: the unit stop, then (only if it verified) CMD
 with_unit_stop() { printf '( %s ) || exit 1; %s' "$(unit_stop_cmd "$1")" "$2"; }
 steps_unit() { echo "tp8-steps-${RUN_ID:-RUNID}"; }
-steps_cmd() {   # the detached P2b unit; its exit status lands in /tmp/<unit>.rc
-  local u
-  u=$(steps_unit)
-  detach "$u" "export TP8_RUN_ID=${RUN_ID:-RUNID}; ( $STEPS_CMD ) > /tmp/$u.log 2>&1; echo \$? > /tmp/$u.rc"
+steps_fence() { echo "${STEPS_FENCE_DIR:-/run}/$(steps_unit).fence"; }
+steps_cmd() {   # the detached P2b unit; refuses to start on a fenced host; its exit status lands in /tmp/<unit>.rc
+  local u f
+  u=$(steps_unit); f=$(steps_fence)
+  detach "$u" "if [ -e $f ]; then echo 'steps fence $f is set: not starting' > /tmp/$u.log; echo 97 > /tmp/$u.rc; exit 97; fi; \
+export TP8_RUN_ID=${RUN_ID:-RUNID} TP8_STEPS_FENCE=$f; ( $STEPS_CMD ) > /tmp/$u.log 2>&1; echo \$? > /tmp/$u.rc"
 }
+steps_fence_cmd() { local f; f=$(steps_fence); echo "mkdir -p $(dirname "$f") && touch $f && test -e $f && echo 'steps fence $f set'"; }
 tp8_stop_cmd() { with_unit_stop "tp8-up-${RUN_ID:-RUNID}" "${TEST_STOP_CMD:-$(local_stop_cmd "$TP8_HOME" "$TP8_ENV")}"; }
 # P0, read only: the restore's verify half while the serves still run. A stale out/handshake.json (an older boot's
 # ports, e.g. a serve's API port) makes verify-down see the live serve and fail, so the restore could never pass.
@@ -171,7 +178,9 @@ serve_up_cmd() {   # NAME: the guard (if any), then the detached up; the unit na
     "cd $(printf %q "$(sv "$1" HOME)") && exec timeout 3000 ./gr8 glm53 up @$(sv "$1" ENV) > out/window-up.log 2>&1 < /dev/null")")"
 }
 tp8_local_stop() {   # one box: this box's test processes, by recorded identity
-  if [ -n "${STEPS_CMD:-}" ]; then   # P2b first: its controller (no new per-box work after), then its per-box units
+  if [ -n "${STEPS_CMD:-}" ]; then   # P2b first: the per-host fence, its controller, then its per-box units
+    # shellcheck disable=SC2046
+    on_all 60 steps-fence "$(steps_fence_cmd)" $(printf '%s\n' "${TP8_BOXES[@]}" "$STEPS_HOST" | awk '!s[$0]++') || return 1
     on_all "$UNIT_STOP_S" steps-ctl-stop "$(unit_stop_cmd "$(steps_unit)")" "$STEPS_HOST" || return 1
     on_all "$UNIT_STOP_S" steps-stop "$(unit_stop_cmd "$(steps_unit)-*")" "${TP8_BOXES[@]}" || return 1
   fi
@@ -400,6 +409,7 @@ cmd_run() {
   fi
 
   say "P3 memclean and prep"
+  fenced && finish "fenced before P3"
   on_all "$B_P3" prep "$MEMCLEAN && $PREP_CMD" "${TP8_BOXES[@]}" || finish "P3: memclean/prep"
 
   say "P4 TP8 up"
@@ -479,6 +489,7 @@ cmd_cmds() {   # CONF: every remote command, NAME TAB HOSTS TAB CMD; runs nothin
   row tp8-up "${TP8_BOXES[*]}" "$(tp8_up_cmd)"
   if [ -n "${STEPS_CMD:-}" ]; then
     row tp8-steps "$STEPS_HOST" "$(steps_cmd)"
+    row tp8-steps-fence "$(printf '%s\n' "${TP8_BOXES[@]}" "$STEPS_HOST" | awk '!s[$0]++' | tr '\n' ' ' | sed 's/ $//')" "$(steps_fence_cmd)"
     row tp8-steps-ctl-stop "$STEPS_HOST" "$(unit_stop_cmd "$(steps_unit)")"
     row tp8-steps-stop "${TP8_BOXES[*]}" "$(unit_stop_cmd "$(steps_unit)-*")"
   fi

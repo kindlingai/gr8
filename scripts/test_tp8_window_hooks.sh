@@ -56,7 +56,7 @@ EOF
   # md5sum: a bin/ hash is logged (md5bin HOST); with bindiff, b2's bin/ hashes differently
   cat > "$M/bin/md5sum" <<'EOF'
 #!/bin/bash
-case "$*" in *bin/*) echo "md5bin $MOCK_HOST" >> "$MOCK/calls"; [ -e "$MOCK/bindiff" ] && [ "$MOCK_HOST" = b2 ] && { echo "ffff  bin/g6m4"; exit 0; } ;; esac
+case "$*" in *bin/*) echo "md5bin $MOCK_HOST" >> "$MOCK/calls"; [ -e "$MOCK/md5restore" ] && { c=$(/bin/cat "$MOCK/md5restore"); rm -f "$MOCK/md5restore"; bash -c "$c" > /dev/null 2>&1; }; [ -e "$MOCK/bindiff" ] && [ "$MOCK_HOST" = b2 ] && { echo "ffff  bin/g6m4"; exit 0; } ;; esac
 exec /usr/bin/md5sum "$@"
 EOF
   printf '#!/bin/bash\necho "tgr8 $MOCK_HOST $*" >> "$MOCK/calls"; touch "$MOCK/tup"\n' > "$T/t/gr8"
@@ -114,6 +114,7 @@ run() { bash "$W" run "$T/window.conf" > "$T/out" 2>&1; echo $? > "$T/rc"; RID=$
 steps() { cat >> "$T/window.conf" <<EOF
 STEPS_HOST=b0
 B_STEPS=20
+STEPS_FENCE_DIR=$T/fence
 STEPS_CMD='echo "steps \$MOCK_HOST" >> $M/calls; ${1:-true}'
 EOF
 }
@@ -203,6 +204,30 @@ t=$(grep -n -m1 '^tstop' "$M/calls" | cut -d: -f1); u=$(grep -n -m1 '^aup' "$M/c
 setup; steps "touch $T/mock/steps.live $T/mock/steps.stuck; $(rsc)"; run
 ! grep -q '^aup' "$M/calls" && [ -e "$T/rec/$RID/ALERT" ] && [ ! -e "$T/rec/$RID/RESTORED_OK" ] && grep -q 'NOT STOPPED' "$T/rec/$RID/restore.log" 2>/dev/null \
   && ok "B2: stuck steps unit -> no serve up, ALERT" || bad "B2: stuck steps unit -> no serve up, ALERT"
+
+# 11. precheck pr95v2 B3: the restore completes during the bin/ check after P2b -> fenced right before P3: no P3
+setup; steps; echo "d=\$(ls -d $T/rec/*/ | head -1); bash \$d/tp8-window.sh restore \$d" > "$M/md5restore"; run
+L=$T/runs/$RID/window.log; u=$(grep -n -m1 '^aup' "$M/calls" | cut -d: -f1)
+grep -q 'finish: fenced before P3' "$L" && [ -e "$T/rec/$RID/RESTORED_OK" ] && [ -n "$u" ] && ! tail -n +"$u" "$M/calls" | grep -q '^memclean' \
+  && ! grep -q '^tgr8' "$M/calls" && ok "B3v2: restore during the bin check -> fenced before P3, no memclean after the serve up" \
+  || bad "B3v2: restore during the bin check -> fenced before P3 [rc $(cat "$T/rc")]"
+
+# 12. precheck pr95v2 B2: the restore writes the per-host steps fence on every box BEFORE any steps unit stop
+setup; steps "touch $T/mock/steps.live; $(rsc)"; run
+f=$(grep -n -m1 -F "touch\\ $T/fence/tp8-steps-$RID.fence" "$M/calls" | cut -d: -f1); c=$(grep -n -m1 "^systemctl stop tp8-steps-$RID.service" "$M/calls" | cut -d: -f1)
+[ -n "$f" ] && [ -n "$c" ] && [ "$f" -lt "$c" ] && [ "$(grep -F "touch\\ $T/fence/tp8-steps-$RID.fence" "$M/calls" | grep -c '^ssh b[0-3] ')" = 4 ] && [ -e "$T/fence/tp8-steps-$RID.fence" ] \
+  && ok "B2v2: steps fence written on all 4 boxes before the steps unit stops (a unit registered earlier: caught by the scan)" \
+  || bad "B2v2: steps fence before the unit stops [$f $c]"
+# a steps unit registered after the fence: the controller unit refuses to start, STEPS_CMD never runs
+setup; steps; bash "$W" cmds "$T/window.conf" > "$T/cmds" 2>&1; mkdir -p "$T/fence"; touch "$T/fence/tp8-steps-RUNID.fence"
+c=$(awk -F'\t' '$1=="tp8-steps"{print $3}' "$T/cmds"); MOCK_HOST=b0 bash -c "$c" > /dev/null 2>&1
+[ "$(/bin/cat /tmp/tp8-steps-RUNID.rc)" = 97 ] && ! grep -q '^steps ' "$M/calls" && grep -q 'steps fence .* is set' /tmp/tp8-steps-RUNID.log \
+  && ok "B2v2: steps controller unit started after the fence: refuses (rc 97), STEPS_CMD not run" || bad "B2v2: fenced controller refuses"
+rm -f /tmp/tp8-steps-RUNID.rc /tmp/tp8-steps-RUNID.log
+# the fence write fails on a box: no serve up, ALERT
+setup; steps "$(rsc)"; echo file > "$T/nofence"; sed -i "s#^STEPS_FENCE_DIR=.*#STEPS_FENCE_DIR=$T/nofence/x#" "$T/window.conf"; run
+! grep -q '^aup' "$M/calls" && [ -e "$T/rec/$RID/ALERT" ] && [ ! -e "$T/rec/$RID/RESTORED_OK" ] && ! grep -q "^systemctl stop tp8-steps-$RID" "$M/calls" \
+  && ok "B2v2: steps fence write fails -> no unit stop, no serve up, ALERT" || bad "B2v2: fence write fails -> ALERT"
 
 # 8. defaults unchanged: no TEST_* / ROUTES_CHECK -> the tp8-ring launch.py stop and the routes dry run
 setup; sed -i '/^TEST_STOP_CMD=/d;/^TEST_VERIFY_CMD=/d;/^ROUTES_CHECK=/d' "$T/window.conf"
