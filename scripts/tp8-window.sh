@@ -106,15 +106,30 @@ local_stop_cmd() {   # HOME ENV: this box's processes of the last boot from HOME
   printf 'cd %s && python3 tools/launch/launch.py down --local @%s; python3 tools/launch/launch.py verify-down --kill @%s' \
     "$(printf %q "$1")" "$2" "$2"
 }
-tp8_stop_cmd() { local_stop_cmd "$TP8_HOME" "$TP8_ENV"; }
+# unit_stop_cmd PATTERN: this run's launch units first (precheck w2v41 B1: a late up in a unit could spawn after an
+# identity-based "down, verified"). Stop every loaded unit matching PATTERN (SIGTERM to its whole cgroup, SIGKILL after
+# TimeoutStopSec), then verify: no matching unit is still loaded+active and no matching cgroup holds a process.
+# Exit 1 = not stopped; the caller's stop then fails (nothing is started over it).
+unit_stop_cmd() {
+  printf '%s' "u='$1.service'; timeout 90 systemctl stop \"\$u\" 2>&1 | grep -v 'not loaded' ; \
+l=\$(systemctl list-units --all --plain --no-legend \"\$u\" | awk '\$3 != \"inactive\" && \$3 != \"failed\" {print \$1}' | tr '\\n' ' '); \
+n=\$(cat /sys/fs/cgroup/system.slice/\$u/cgroup.procs 2>/dev/null | wc -l); \
+if [ -z \"\$l\" ] && [ \"\$n\" = 0 ]; then echo \"launch units \$u: none running, verified\"; \
+else echo \"launch units \$u NOT STOPPED: active [\$l] processes \$n\"; exit 1; fi"
+}
+# with_unit_stop PATTERN CMD: the unit stop, then (only if it verified) CMD
+with_unit_stop() { printf '( %s ) || exit 1; %s' "$(unit_stop_cmd "$1")" "$2"; }
+tp8_stop_cmd() { with_unit_stop "tp8-up-${RUN_ID:-RUNID}" "$(local_stop_cmd "$TP8_HOME" "$TP8_ENV")"; }
 # P0, read only: the restore's verify half while the serves still run. A stale out/handshake.json (an older boot's
 # ports, e.g. a serve's API port) makes verify-down see the live serve and fail, so the restore could never pass.
 tp8_verify_cmd() { echo "cd $(printf %q "$TP8_HOME") && python3 tools/launch/launch.py verify-down @$TP8_ENV"; }
 # detach UNIT CMD: CMD in its own transient unit; returns once the unit is started (its exit status = systemd-run's)
 # (HOME and PATH are copied from the ssh session: a unit gets no HOME and a minimal PATH otherwise)
-detach() { echo "${DETACH:-$SYSTEMD_RUN --quiet --collect -p RemainAfterExit=yes --setenv=HOME --setenv=PATH} --unit=$1 /bin/bash -c $(printf %q "$2")"; }
+detach() { echo "${DETACH:-$SYSTEMD_RUN --quiet --collect -p RemainAfterExit=yes -p TimeoutStopSec=30 --setenv=HOME --setenv=PATH} --unit=$1 /bin/bash -c $(printf %q "$2")"; }
 tp8_up_cmd() { detach "tp8-up-${RUN_ID:-RUNID}" "cd $TP8_HOME && exec timeout $TP8_LIFE ./gr8 glm53 up @$TP8_ENV > out/window-up.log 2>&1 < /dev/null"; }
-serve_stop_cmd() { svd "$1" STOP_CMD "$(local_stop_cmd "$(sv "$1" HOME)" "$(sv "$1" ENV)")"; }
+serve_stop_cmd() {   # NAME: every attempt's launch unit of this run, then the serve's own stop (hook or default)
+  with_unit_stop "tp8-$1-up-${RUN_ID:-RUNID}-a*" "$(svd "$1" STOP_CMD "$(local_stop_cmd "$(sv "$1" HOME)" "$(sv "$1" ENV)")")"
+}
 serve_down_cmd() { svd "$1" DOWN_CMD "cd $(sv "$1" HOME) && ./gr8 glm53 down @$(sv "$1" ENV)"; }
 serve_up_cmd() {   # NAME: the guard (if any), then the detached up; the unit name carries the run and the attempt
   local g
@@ -123,11 +138,11 @@ serve_up_cmd() {   # NAME: the guard (if any), then the detached up; the unit na
     "cd $(printf %q "$(sv "$1" HOME)") && exec timeout 3000 ./gr8 glm53 up @$(sv "$1" ENV) > out/window-up.log 2>&1 < /dev/null")")"
 }
 tp8_local_stop() {   # one box: this box's test processes, by recorded identity
-  on_all 180 tp8-stop "$(tp8_stop_cmd)" "${TP8_BOXES[@]}"
+  on_all 300 tp8-stop "$(tp8_stop_cmd)" "${TP8_BOXES[@]}"
 }
 serve_local_stop() {
   # shellcheck disable=SC2046
-  on_all 180 "$1-stop" "$(serve_stop_cmd "$1")" $(svboxes "$1")
+  on_all 300 "$1-stop" "$(serve_stop_cmd "$1")" $(svboxes "$1")
 }
 serve_check() {   # NAME KEY: the serve's optional per-box check; unset passes
   local c

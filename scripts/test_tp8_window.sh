@@ -42,6 +42,9 @@ EOF
   cat > "$M/bin/systemctl" <<'EOF'
 #!/bin/bash
 echo "systemctl $*" >> "$MOCK/calls"
+# a launch unit that does not stop (unit.stuck): list-units still shows it active
+[ "$1" = list-units ] && [ -e "$MOCK/unit.stuck" ] && echo "tp8-x.service loaded active running x"
+exit 0
 EOF
   # DETACH stub: logs the unit and runs its command in the foreground (the mock ups return at once)
   cat > "$M/bin/detach" <<'EOF'
@@ -241,7 +244,7 @@ restore
 # 13. cmds prints every remote command and runs none
 setup; : > "$M/calls"
 bash "$T/rd/tp8-window.sh" cmds "$T/rd/window.conf" > "$T/cmds" 2>&1
-[ ! -s "$M/calls" ] && grep -q "^tp8-stop	b0 b1 b2 b3 b4 b5 b6 b7	cd .*launch.py down --local" "$T/cmds" \
+[ ! -s "$M/calls" ] && grep -q "^tp8-stop	b0 b1 b2 b3 b4 b5 b6 b7	( u=.tp8-up-RUNID.service.*) || exit 1; cd .*launch.py down --local" "$T/cmds" \
   && grep -q "^A-down	b0	" "$T/cmds" && grep -q "^A-up	" "$T/cmds" && ok "cmds: printed, nothing run" || bad "cmds: printed, nothing run"
 
 # 14. P6 routes receipts (precheck B1), with the files laid out as P0 and P6 write them in LOCAL
@@ -279,6 +282,29 @@ setup; hooked; guard; touch "$M/smoke.ok"
 restore
 [ -e "$T/rd/RESTORED_OK" ] && grep -q '^bguard b6' "$M/calls" && grep -q '^detach b6 tp8-B-up-run-test-a1$' "$M/calls" \
   && grep -q '^bup b6' "$M/calls" && ok "guard passes: detached up, RESTORED_OK" || bad "guard passes: detached up, RESTORED_OK"
+
+# 16. v4.2 (precheck w2v41 B1): every stop first stops this run's launch units, all attempts, before the old stop;
+# a unit that is not verified stopped blocks that stop (no down, no start over it)
+first() { grep -n -m1 -F "$1" "$M/calls" | cut -d: -f1; }
+setup; cp "$M/canary.good" "$M/canary.src"
+restore
+a=$(first 'systemctl stop tp8-up-run-test.service'); b=$(first 'tp8 glm53 down --local')
+[ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ] && ok "tp8 stop: launch unit stopped before down --local" \
+  || bad "tp8 stop: launch unit stopped before down --local"
+a=$(first 'systemctl stop tp8-A-up-run-test-a*.service'); b=$(first 'gr8 b1 a glm53 down --local')
+[ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ] && ok "serve stop: all attempts' units (a*) stopped before its down" \
+  || bad "serve stop: all attempts' units (a*) stopped before its down"
+[ "$(grep -c 'systemctl stop tp8-A-up-run-test-a\*.service' "$M/calls")" = 4 ] && ok "serve unit stop on all 4 boxes" \
+  || bad "serve unit stop on all 4 boxes"
+setup; echo other > "$M/canary.src"   # 2 attempts: attempt 2's stop also stops attempt 1's unit (a*) before its up
+restore
+n=$(grep -n 'systemctl stop tp8-A-up-run-test-a\*.service\|detach b0 tp8-A-up-run-test-a' "$M/calls" | sed 's/^[0-9]*://' | awk '{print $1 $NF}' | grep -m1 -A99 '^detach' | head -2 | tr '\n' ' ')
+case "$n" in "detachtp8-A-up-run-test-a1 systemctl"*) ok "attempt 2: unit stop after attempt 1's up" ;; *) bad "attempt 2: unit stop after attempt 1's up [$n]" ;; esac
+grep -q '^detach b0 tp8-A-up-run-test-a2$' "$M/calls" && ok "attempt 2 has its own unit" || bad "attempt 2 has its own unit"
+setup; cp "$M/canary.good" "$M/canary.src"; touch "$M/unit.stuck"
+restore
+grep -q 'NOT STOPPED' "$T/rd/restore.log" && ! grep -q 'glm53 down --local' "$M/calls" && ! grep -q '^detach' "$M/calls" \
+  && [ -e "$T/rd/ALERT" ] && ok "unit not stopped: no down, no up, ALERT" || bad "unit not stopped: no down, no up, ALERT"
 
 echo "passed $pass, failed $failn"
 [ $failn = 0 ]
