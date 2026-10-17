@@ -17,8 +17,9 @@ struct PoolHooks {
     // head after ALL event ACKs, workers at the grant (the same call on the same pool state must give the same Run)
     std::function<Run(uint64_t rows, uint64_t worst)> reserve;
     std::function<void(const Run&)> release;
-    // can the FIFO head be admitted now: room, no exclusive run in the way, and every live run still able to reach its
-    // worst case (pool.h fits). false is counted as an admission stall
+    // can the FIFO head be admitted now: room, no exclusive run in the way (on the page classes a split run past R
+    // shares the pool, kvman-rs pool.rs), and every live run still able to reach its worst case (pool.h fits). false is
+    // counted as an admission stall
     std::function<bool(uint64_t rows, uint64_t worst)> fits;
     // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
     std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
