@@ -86,7 +86,7 @@ inline void check_headroom(int rank, int capacity, bool log)
     }
 }
 
-constexpr int NBK = 8;              // decode context buckets (graph form), at most
+constexpr int NBK = 9;              // decode context buckets (graph form), at most: 7 doublings, the cap, an R off them
 constexpr int MX = G6_MX, QA = geom::QA, KVA = geom::KVA, IDXQ = geom::IDX_HEADS * geom::IDX_DIM, IDXK = geom::IDX_DIM, IDXW = geom::IDX_HEADS;
 static_assert(MX <= 32, "k_head_merge: one warp, one row per lane");
 constexpr int ATT_QT = MX > 8 ? 32 : 16;    // decode attention query tile (CP decode needs rows <= tile; attn allows <= 64); 16 = today's
@@ -384,8 +384,9 @@ struct Model
     bool graph = false;               // attention through the replay entry (set before prepare)
     bool wide = false;                // set before build: tr3.fc1 K3 records into the wide order, in place (bind::widen_fc1)
     // graph form: captured attention capacities, ascending, the last = the binding's capacity. G6_DEC_BK=B (read at
-    // build, default 2048): B, 2B, 4B, ... below the capacity, then the capacity; 0 = one bucket (the capacity). A step
-    // runs the graph of the smallest bucket >= its context (bucket_of); cur = the bucket a capture is recording
+    // build, default 2048): B, 2B, 4B, ... (7 at most) below the capacity, then the capacity, and CP's R when it is not one
+    // of them; 0 = one bucket (the capacity). A step runs the graph of the smallest bucket >= its context (bucket_of);
+    // cur = the bucket a capture is recording
     int nbk = 1, bk[NBK] = {}, cur = 0;
     const StepIn* in = nullptr;       // set by the driver: pinned host memory or device memory
     StepOut* out = nullptr;           //   same
@@ -617,7 +618,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
 #if defined(G6_CP) && G6_CP
         if (m.cp.on) cp_r = m.cp.R;
 #endif
-        m.nbk = context_buckets(m.bk, b, capacity, cp_r);
+        m.nbk = context_buckets(m.bk, b, capacity, cp_r, NBK - 2);   // a power-of-two R: the 8-slot list of before
     }
     m.cells = dmalloc<G6AttnStepCell>(m.nl);
     m.shared = dmalloc<int>(m.nl);
