@@ -93,6 +93,62 @@ __global__ void sort_selected(Input input,int start,const float* scores,const ui
     #pragma unroll
     for(int j=0;j<ITEMS;j++)a.indices[(int64_t)(start+row)*TOP+t*ITEMS+j]=keys[j]?int(0xffffu-uint32_t(keys[j]&0xffffu)):-1;
 }
+// G6_ATTN_SEL2=<CH> (attn_sel2; decode run_body): the selector's final sort (sort_selected<false> / <true>, sort_selected32)
+// as a rank by count over CH CTAs per row. The nonzero keys of a row are distinct (their low bits hold the token id), so a
+// nonzero key's place in the descending sort is the number of larger keys of the row, and the nonzero keys fill places
+// 0 .. nnz - 1; zero keys (nonfinite / past the context / unfilled) sort below them and all map to -1. Every CTA stages the
+// row's TOP keys in shared memory and counts for its KC = TOP/CH own keys, each over NP = 256/KC shares of the row (summed),
+// then writes the own key's id at its rank and -1 at its own places >= nnz: every place written once, the bytes of the sort.
+// MODE 0 (<false>): the key of place j is ordered_score << 16 | (0xffff - j), so key_j > key_i <=> s_j > s_i, or s_j == s_i
+// and j < i: counted in 32 bits as s_j > (j < i ? s_i - 1 : s_i) (s_i >= 1 for a nonzero key; a zero key counts nothing
+// and writes nothing); a warp's own keys are 32 consecutive places, so outside the warp's own block of 32 the threshold is
+// warp-uniform. MODE 1 (<true>, 48-bit keys) / 2 (sort_selected32, 64-bit): the keys compared. grid dim3(CH, count), 256.
+template<int MODE,int CH,class Input>
+__global__ void __launch_bounds__(256) rank_selected(Input input,int start,const float* scores,const uint64_t* selected){
+    auto a=resolve(input);if(!a.active)return;
+    static_assert(CH==8||CH==16||CH==32||CH==64,"CH in {8,16,32,64}");
+    constexpr int KC=TOP/CH,NP=256/KC,SH=TOP/NP;   // own keys per CTA, shares per key, comparands per share
+    const int row=blockIdx.y,c=blockIdx.x,t=threadIdx.x,lane=t&31,warp=t>>5;
+    __shared__ __align__(16) uint32_t s32[MODE==0?TOP:4];
+    __shared__ __align__(16) uint64_t k64[MODE==0?2:TOP];
+    __shared__ int cnt[256],nzw[8];
+    int nz=0;
+    #pragma unroll
+    for(int u=0;u<TOP/256;u++){const int j=u*256+t;
+        if constexpr(MODE==0){const uint32_t s=j<a.context?ordered_score(scores[(int64_t)row*a.context+j]):0u;s32[j]=s;nz+=s!=0;}
+        else{const uint64_t k=selected[(int64_t)row*TOP+j];k64[j]=k;nz+=k!=0;}}
+    nz=__reduce_add_sync(0xffffffffu,nz);if(lane==0)nzw[warp]=nz;
+    __syncthreads();
+    int nnz=0;
+    #pragma unroll
+    for(int w=0;w<8;w++)nnz+=nzw[w];
+    const int k=t%KC,i=c*KC+k,j0=(t/KC)*SH;   // own key i, comparands j0 .. j0 + SH - 1
+    int n0=0,n1=0,n2=0,n3=0;   // four independent counts (one serial add chain each)
+    if constexpr(MODE==0){
+        const uint32_t si=s32[i],ib=i&~31;
+        for(int jb=j0;jb<j0+SH;jb+=32){
+            if(jb==ib){
+                #pragma unroll
+                for(int e=0;e<32;e+=4){const uint4 v=*(const uint4*)&s32[jb+e];
+                    n0+=v.x>(jb+e<i?si-1:si);n1+=v.y>(jb+e+1<i?si-1:si);n2+=v.z>(jb+e+2<i?si-1:si);n3+=v.w>(jb+e+3<i?si-1:si);}}
+            else{const uint32_t th=jb<ib?si-1:si;
+                #pragma unroll
+                for(int e=0;e<32;e+=4){const uint4 v=*(const uint4*)&s32[jb+e];n0+=v.x>th;n1+=v.y>th;n2+=v.z>th;n3+=v.w>th;}}}}
+    else{const uint64_t ki=k64[i];
+        #pragma unroll 4
+        for(int j=j0;j<j0+SH;j+=4){const ulonglong2 v=*(const ulonglong2*)&k64[j],w=*(const ulonglong2*)&k64[j+2];
+            n0+=v.x>ki;n1+=v.y>ki;n2+=w.x>ki;n3+=w.y>ki;}}
+    cnt[t]=n0+n1+n2+n3;
+    __syncthreads();
+    if(t<KC){int rk=0;
+        #pragma unroll
+        for(int p=0;p<NP;p++)rk+=cnt[p*KC+t];
+        int* out=a.indices+(int64_t)(start+row)*TOP;
+        if constexpr(MODE==0){if(s32[i])out[rk]=i;}
+        else if constexpr(MODE==1){const uint64_t ki=k64[i];if(ki)out[rk]=int(0xffffu-uint32_t(ki&0xffffu));}
+        else{const uint64_t ki=k64[i];if(ki)out[rk]=int(0xffffffffu-uint32_t(ki));}
+        if(i>=nnz)out[i]=-1;}
+}
 #ifdef SEL32
 // SEL32: the same exact selector past context 32768, so no context size runs
 // the full CUB sort. 64-bit key = ordered_score (CUB's float order, both zeros equal as CUB treats them) in the high

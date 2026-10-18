@@ -103,6 +103,35 @@
   derivation and the INT4 GEMV against a host dot on the head and drafter shapes, and times them. `dflreplay`
   (`build_m4.sh dfl`) replays a `G6_DFL_DUMP` through the MXFP8 and the INT4 drafter on one GPU and reports how often
   their drafts agree and how many each would have had accepted.
+## 2026-10-16: exact decode attention kernels, off by default
+- Three rounds of decode attention kernels, each behind an environment variable that defaults to 0
+  ([docs/SETTINGS.md](docs/SETTINGS.md)). Each is written to be bit-identical to the kernel it replaces (the same
+  products, the same fmaf order and the same skips per row, head and slot); the measured set below is the one checked.
+  - Round 1: `G6_ATTN_SC2` (scores with S key slots per warp, the query loaded once for all S) and `G6_ATTN_CTX2` (the
+    context kernel with more gathered pairs per batch, or packed and branch-free with two batches in flight).
+  - Round 2: `G6_ATTN_SC2_TR` (the heads' score sums reduced by one transpose across the warp), `G6_ATTN_CTX3` (context
+    with one test per batch of slots, `G6_ATTN_CTX3_HG` for the head group), `G6_ATTN_SEL2` (the selector's final sort
+    as a rank by count over several CTAs per row) and `G6_IDX_GRP` (in S2 batched steps the indexer reads each key tile
+    once for a group of rows of one session).
+  - Round 3: `G6_ATTN_QT` (absorb stores q and rope lane-transposed, and the scores kernel reads them with 16 B loads)
+    and `G6_ATTN_FRONT` (a step's KV append, index append and index query prep, or index reuse, in one launch).
+- `engine/attn/tests/attnk.cu` checks them on one GB10. It runs a full-index and a shared layer as the engine replays
+  them (`g6_attn_replay_run` in a CUDA graph), first with every flag 0, then with each arm, and compares byte for byte
+  against that stock chain over several runs with the outputs and scratch poisoned first: both layers' outputs, the
+  indices, the indexer's scores and ids, the appended KV and index rows, per layer the raw scores and context parts,
+  and the shared layer's probabilities and context. Any difference fails the arm and the bench exits 3. It also times
+  each arm against a base (the rounds 1 + 2 set) per kernel and per call, hot and behind an L2 flush. Checked: the
+  rounds 1 + 2 set (`SC2=4 SC2_TR=2 CTX2=4 CTX3=2 SEL2=16 IDX_GRP=16`) and it with `QT=1 FRONT=1` were byte-identical
+  at contexts 2K, 8K and 32K with 1, 3, 8 and 12 rows. The other accepted values were not swept.
+- Measured on 4x DGX Spark at TP4, RigMark c1 decode screens on base 6448a16:
+  - round 1 (`SC2=4 CTX2=4`): prose +3.4% to +4.7%, code and structured +4% to +7%, and 8.6 ms less per step at c4
+    (12 rows);
+  - round 2 (`SC2_TR=2 CTX3=2 SEL2=16 IDX_GRP=16`): prose +0.7% at 1K context; at 32K context up to 3.1 ms less per
+    step at c1 and 10.3 ms less at c4;
+  - round 3 (`QT=1 FRONT=1`): prose +0.6%, code +0.7%, structured +1.2%; in the attnk bench 0.8 ms less per step at 2K
+    context and 3 rows, 1.5-1.9 ms less at 12 rows.
+- With all eight set (`G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16 G6_IDX_GRP=16
+  G6_ATTN_QT=1 G6_ATTN_FRONT=1`) the four-box cluster's output at T=0 was identical to the stock kernels'.
 
 ## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
 
