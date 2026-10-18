@@ -73,6 +73,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # Config::decode_rounds (G6_S2_DECODE_ROUNDS): K decode rounds per prefill quantum, its notice target, default off
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rounds_test.cpp" -o "$T/scheduler_rounds_test"
 "$T/scheduler_rounds_test"
+# G6_CP_STEP_ROWS / G6_CP_STEP_SEG (s2/cp_rows.h, Driver::step): steps past R capped at n rows, solo-exact tokens, fair cycles
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/cp_rows_test.cpp" -o "$T/cp_rows_test"
+"$T/cp_rows_test" 2> >(grep -v '^# s2 G6_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
 NODE=$REPO/engine/kvman-rs/target/release/kvman-remote

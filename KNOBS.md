@@ -80,6 +80,8 @@ manifest instead.
 | `IDX_GRP` | unset (0) | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
 | `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
 | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+| `CP_STEP_ROWS` | unset (0) | unset (0) | unset (0) | S2: a decode step past `SHARE_LIMIT` carries at most this many rows, and the CP fabric is sized for it instead of for the widest S2 step (`SESS` x (`MTP` + 1) = 24 rows, 1.358 GB pinned per rank at TP=4; 8 rows: 0.453 GB). While a session past the limit decodes and the sessions' rows do not fit, they take turns, each once per cycle. At least the rows of a solo step (the boot names the minimum, 8 with DFlash2) (`G6_CP_STEP_ROWS`) |
+| `CP_STEP_SEG` | unset (0) | unset (0) | unset (0) | with `CP_STEP_ROWS`: 1 = a round past `SHARE_LIMIT` takes only sessions past it, so a shorter session never runs the CP attention because a long one is resident (`G6_CP_STEP_SEG`) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
