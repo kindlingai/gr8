@@ -40,18 +40,23 @@ inline bool qo_from_pack(const Find& find, int l, QoW& w)
     auto get = [&](const char* s) { snprintf(n, sizeof n, "L%03d.qo.%s", l, s); return find(n); };
     w.qb_c = as_bind(get("q_b.mx.codes")); w.qb_s = as_bind(get("q_b.mx.scales"));
     w.o_c = as_bind(get("o_proj.mx.codes")); w.o_s = as_bind(get("o_proj.mx.scales"));
-    w.uk = qo_attn_tensor(get("kv_b.uk")); w.uv = qo_attn_tensor(get("kv_b.uv"));
+    const TensorRef uk = get("kv_b.uk"), uv = get("kv_b.uv");
+    if ((uk.p && !uk.bf16) || (uv.p && !uv.bf16)) die("L" + std::to_string(l) + ".qo.kv_b: the QO pack's UK / UV must be BF16");
+    w.uk = qo_attn_tensor(uk); w.uv = qo_attn_tensor(uv);
     return qo_check(w);
 }
 // #50 (G6_KVB=fp8): a rank's kv_b.uk / kv_b.uv may be E4M3 with f32 scales (kv_b.uk.scale / kv_b.uv.scale). Every QO and
 // pair-owner path keeps its BF16 UK / UV staging: kvb_put writes `rows` rows of 512 BF16 weights into dst from a BF16
-// tensor (a copy) or from an FP8 one (g6_attn_kvb_bf16: the BF16 bytes the BF16 loader stores), on stream b.
-inline void kvb_put(void* dst, const void* w, const void* scale, size_t rows, cudaStream_t b)
+// tensor (a copy) or from an FP8 one (g6_attn_kvb_bf16: the BF16 bytes the BF16 loader stores), on stream b. sync: a BF16
+// copy is a synchronous cudaMemcpy (the load-time assemblers' copies on main) and an FP8 expansion is waited for.
+inline void kvb_put(void* dst, const void* w, const void* scale, size_t rows, cudaStream_t b, bool sync = false)
 {
     if (scale)
     {
         if (int e = g6_attn_kvb_bf16(w, (const float*)scale, dst, (int)rows, b)) die("g6_attn_kvb_bf16 failed (" + std::to_string(e) + ")");
+        if (sync) G6RT_CK(cudaStreamSynchronize(b));
     }
+    else if (sync) G6RT_CK(cudaMemcpy(dst, w, rows * 512 * 2, cudaMemcpyDeviceToDevice));
     else G6RT_CK(cudaMemcpyAsync(dst, w, rows * 512 * 2, cudaMemcpyDefault, b));
 }
 // the scale tensor of an FP8 kv_b.uk / kv_b.uv (nullptr for a BF16 one); dies on an FP8 tensor without one
@@ -104,10 +109,9 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
         G6RT_CK(cudaMemcpy(qbs + (size_t)h0 * 256 * (geom::QA / 32), qs.p, (size_t)h * 256 * (geom::QA / 32), cudaMemcpyDeviceToDevice));
         G6RT_CK(cudaMemcpy2D(oc_ + (size_t)h0 * 256, 16384, oc.p, (size_t)h * 256, (size_t)h * 256, HID, cudaMemcpyDeviceToDevice));
         G6RT_CK(cudaMemcpy2D(os_ + (size_t)h0 * 8, 512, os.p, (size_t)h * 8, (size_t)h * 8, HID, cudaMemcpyDeviceToDevice));
-        kvb_put((char*)w.uk.data + (size_t)h0 * 192 * 512 * 2, uk.p, uks, (size_t)h * 192, nullptr);
-        kvb_put((char*)w.uv.data + (size_t)h0 * 256 * 512 * 2, uv.p, uvs, (size_t)h * 256, nullptr);
+        kvb_put((char*)w.uk.data + (size_t)h0 * 192 * 512 * 2, uk.p, uks, (size_t)h * 192, nullptr, true);
+        kvb_put((char*)w.uv.data + (size_t)h0 * 256 * 512 * 2, uv.p, uvs, (size_t)h * 256, nullptr, true);
     }
-    G6RT_CK(cudaDeviceSynchronize());
     if (!qo_check(w)) die("qo_from_ranks: assembled shapes wrong");
     return w;
 }
@@ -173,9 +177,9 @@ inline void qp_put_kvb(QpW& w, int k, const TensorRef& uk, const TensorRef& uv, 
     if (uk.nd != 3 || uk.shape[0] != 16 || uk.shape[1] != 192 || uk.shape[2] != 512 || uv.nd != 3 || uv.shape[0] != 16 ||
         uv.shape[1] != 256 || uv.shape[2] != 512)
         die("qp: " + what + " kv_b.uk / kv_b.uv are not [16][192|256][512]");
-    kvb_put((char*)w.uk.data + (size_t)k * 16 * 192 * 512 * 2, uk.p, uks, (size_t)16 * 192, nullptr);
-    kvb_put((char*)w.uv.data + (size_t)k * 16 * 256 * 512 * 2, uv.p, uvs, (size_t)16 * 256, nullptr);
-    G6RT_CK(cudaDeviceSynchronize());
+    if ((!uk.bf16 && !uks) || (!uv.bf16 && !uvs)) die("qp: " + what + " kv_b.uk / kv_b.uv are not BF16 and have no scales");
+    kvb_put((char*)w.uk.data + (size_t)k * 16 * 192 * 512 * 2, uk.p, uks, (size_t)16 * 192, nullptr, true);
+    kvb_put((char*)w.uv.data + (size_t)k * 16 * 256 * 512 * 2, uv.p, uvs, (size_t)16 * 256, nullptr, true);
 }
 inline void qp_free_kvb(QpW& w)
 {

@@ -729,7 +729,8 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             const TensorRef r = find(name), rs = find(name + ".scale");
             if (!r.p || r.nd != 3) die("bad attention weight " + name);
             if (r.bf16) { w = at(suffix); return; }
-            if (!rs.p || rs.nd != 3) die("attention weight " + name + " is not BF16 and has no .scale (G6_KVB=fp8 form)");
+            if (!rs.p || rs.nd != 3 || rs.shape[0] != r.shape[0] || rs.shape[1] != r.shape[1] || rs.shape[2] != 4)
+                die("attention weight " + name + " is not BF16 and has no [h][d][4] .scale (G6_KVB=fp8 form)");
             w.data = r.p; w.ndim = 3; s.data = rs.p; s.ndim = 3;
             for (int d = 0; d < 3; ++d) { w.shape[d] = r.shape[d]; s.shape[d] = rs.shape[d]; }
         };

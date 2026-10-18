@@ -318,6 +318,11 @@ int main(int argc, char** argv)
     if (co.top_p) plan.top_p = *co.top_p;
     if (co.rs) plan.rs = *co.rs;
     const bool release = !v2src.dense.empty();
+    if (const char* kvb = getenv("G6_KVB"); kvb && *kvb && strcmp(kvb, "bf16"))   // #50: read by the release planner only
+    {
+        if (strcmp(kvb, "fp8")) die(std::string("G6_KVB=") + kvb + ": use bf16 or fp8");
+        if (!release) die("G6_KVB=fp8 needs --v2-dense: packs hold kv_b in BF16");
+    }
     if (packs.empty() == !release || (release && (v2src.dir.empty() || v2src.slices.empty() || v2src.widths.empty())))
         die("usage: m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
 #ifndef G6_RS_LOADER

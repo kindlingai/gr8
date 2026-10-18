@@ -264,6 +264,11 @@ int main(int argc, char** argv)
     if (co.top_p) plan.top_p = *co.top_p;
     if (co.rs) plan.rs = *co.rs;
     const bool release = !v2src.dense.empty();
+    if (const char* kvb = getenv("G6_KVB"); kvb && *kvb && strcmp(kvb, "bf16"))   // #50: read by the release planner only
+    {
+        if (strcmp(kvb, "fp8")) die(std::string("G6_KVB=") + kvb + ": use bf16 or fp8");
+        if (!release) die("G6_KVB=fp8 needs --v2-dense: packs hold kv_b in BF16");
+    }
     if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || (!release && (manifest.empty() || packfile.empty())))
         die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
     if (release && (!manifest.empty() || !packfile.empty() || v2src.dir.empty()))
