@@ -853,6 +853,18 @@ __global__ void cp_softmax(Input input,float* scores,float* m_out,float* l_out){
     float s=0;for(int j=t;j<TOP;j+=256){float v=isfinite(mx)?expf(p[j]-mx):0;p[j]=v;s+=v;}s=warp_sum(s);if((t&31)==0)tmp[t/32]=s;__syncthreads();
     if(t==0){den=0;for(int j=0;j<8;j++)den+=tmp[j];m_out[i]=mx;l_out[i]=den;}
 }
+// G6_CP_ONECHAIN (cp_groups_body): merge_parts over a call of G head groups of gh heads (a.heads = G gh), each group's
+// (row, head) written into its own partial block as cp_group_body writes it: (row, head h) of the call is (row, h % gh) of
+// group g = h / gh, block g at part + g gblk = c [n][gh][512], m [n][gh], l [n][gh]; m / l come from cp_softmax's
+// [n x heads] outputs ml (m) and ml + n heads (l). The sum is merge_parts' (parts 0..P-1 in order).
+template<class Input,int P>
+__global__ void merge_parts_g(Input input,const float* parts,const float* ml,float* part,int gh,int64_t gblk){
+    auto a=resolve(input);if(!a.active)return;
+    const int rowhead=blockIdx.x,t=threadIdx.x,row=rowhead/a.heads,h=rowhead%a.heads,j=row*gh+h%gh;
+    const int64_t nb=(int64_t)a.rows*gh;float* b=part+(int64_t)(h/gh)*gblk;
+    for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<P;part++)s+=parts[((int64_t)rowhead*P+part)*512+d];b[(int64_t)j*512+d]=s;}
+    if(t==0){const int64_t nh=(int64_t)a.rows*a.heads;b[nb*512+j]=ml[rowhead];b[nb*513+j]=ml[nh+rowhead];}
+}
 // LSE merge of my head group's partials in shard order 0..cp_nr-1: M = max m_s, w_s = exp(m_s - M), L = sum w_s l_s,
 // ctx = (sum w_s c_s) / L. part_all: [s] blocks of c [n][H][512], m [n][H], l [n][H] (n = a.rows); block stride rounded
 // up to 4 floats (16 B; NR=6 head groups of 10/11 heads make n*H*514 odd x 2)
@@ -905,6 +917,22 @@ static cudaError_t cp_group_body(const G6Attn& a,Input input,Work w,const float*
     cp_softmax<<<nh,256,0,stream>>>(input,w.prob,part+(int64_t)nh*512,part+(int64_t)nh*513);
     launch_context_parts(a,input,w,0,n,stream);
     merge_parts<<<nh,256,0,stream>>>(input,w.parts,part);
+    return cudaGetLastError();
+}
+// G6_CP_ONECHAIN: cp_group_body over G head groups at once (a.heads = G gh; q / rope [n][G gh][512] / [64], the groups'
+// heads side by side), each group's partial into its block (merge_parts_g). The scores / context kernels index every
+// (row, head) by row * a.heads + h and batch heads in groups of 16 (scores) or 2..16 (context), which divide gh
+// (g6_attn_cp_groups_ok), so each head runs the H-head call's kernel with its operands in the same order: the same bits.
+// w: prob [n heads][TOP], parts [n heads][P][512], ml [2][n heads] (g6_attn_cp_groups_bytes).
+template<class Input>
+static cudaError_t cp_groups_body(const G6Attn& a,Input input,Work w,float* ml,const float* q,const float* rope,float* part,int gh,
+                                  int64_t gblk,cudaStream_t stream){
+    const int n=a.rows,nh=n*a.heads;
+    w.q=const_cast<float*>(q);w.rope=const_cast<float*>(rope);
+    launch_mla_scores(a,input,w,0,n,stream);
+    cp_softmax<<<nh,256,0,stream>>>(input,w.prob,ml,ml+nh);
+    launch_context_parts(a,input,w,0,n,stream);
+    merge_parts_g<Input,PART><<<nh,256,0,stream>>>(input,w.parts,ml,part,gh,gblk);
     return cudaGetLastError();
 }
 template<class Input>
@@ -1030,6 +1058,26 @@ extern "C" int g6_attn_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void
     if(!a||!a->uv||!a->output||!part_all)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_finish_body(*a,in,w,part_all,stream);});
+}
+extern "C" int g6_attn_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
+// prob, parts, ml of cp_groups_body, each 256-B aligned
+static size_t cp_groups_at(int heads,int rows,int k){
+    const size_t nh=(size_t)heads*rows,b[3]={nh*ga::TOP*4,nh*ga::PART*512*4,nh*2*4};
+    size_t o=0;for(int i=0;i<k;i++)o+=(b[i]+255)&~size_t(255);return o;
+}
+extern "C" size_t g6_attn_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
+extern "C" int g6_attn_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,
+                                 float* part,int gh,int64_t gblk,void* s){
+    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!rope||!part||!g6_attn_cp_groups_ok(gh)||a->heads%gh||
+       a->heads/gh>7)return (int)cudaErrorInvalidValue;
+    G6Attn one=*a;one.heads=gh;   // the call's shape is that of each group's call
+    if(!ga::cp_ok(&one)||bytes<g6_attn_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*514)return (int)cudaErrorInvalidValue;
+    cudaStream_t stream=(cudaStream_t)s;
+    ga::Work w{};char* b=(char*)buf;
+    w.prob=(float*)(b+cp_groups_at(a->heads,a->rows,0));w.parts=(float*)(b+cp_groups_at(a->heads,a->rows,1));
+    float* ml=(float*)(b+cp_groups_at(a->heads,a->rows,2));
+    if(cell)return (int)ga::cp_groups_body(*a,ga::ReplayInput{*a,cell},w,ml,q,rope,part,gh,gblk,stream);
+    return (int)ga::cp_groups_body(*a,*a,w,ml,q,rope,part,gh,gblk,stream);
 }
 extern "C" int g6_attn_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
     if(!ga::cp_ok(a)||!scratch||!q||!rope)return (int)cudaErrorInvalidValue;
