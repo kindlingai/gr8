@@ -74,6 +74,20 @@
 - With the block-8 DFlash2 drafter nothing changes: the captured widths, the row bound and the histogram are those of
   before. A drafter with a wider block (a block-12 one was served with these fixes) boots and serves; serving one also
   needs drafter-side changes that are not part of this.
+## 2026-10-18: CP decode: the remote head groups as one attention call (G6_CP_ONECHAIN, off by default)
+
+- Past R each rank runs the other ranks' head groups over its own keys (`launch_attn_cp`, phase 1): one `k_vget`, one
+  `g6_attn_cp_group` (scores, softmax, context parts, merge) and one `k_vput` per remote group, 18 launches a layer at
+  TP=4. `G6_CP_ONECHAIN=1` (launch knob `CP_ONECHAIN`) gathers the three groups' q / rope side by side
+  (`k_vget_heads`), runs one 48-head `g6_attn_cp_groups` call whose merge writes each group's partial into its own
+  block, and publishes the three partials in the S1 order: 8 launches a layer.
+- Every kernel indexes a (row, head) as `row * heads + h` and batches heads in groups that divide 16, so each head runs
+  the 16-head kernel's code on the same operands in the same order: the published partials are byte-identical
+  (`engine/attn/tests/cpgroups.cu`, one GPU, built by hand). TP=4 only and not with `G6_ATTN_FLIP` (the boot stops
+  with a message otherwise); about 1.3 MB per CP fabric row of device memory, printed by rank 0.
+- Measured on four GB10 at TP=4 (R 65536): decode +3.6 / +2.5 / +1.7 % at 70K / 80K / 90K-token prompts and +9.5 % at
+  ~120K, the same output SHA as off; below R nothing changes.
+
 ## 2026-10-18: decode buckets: nine slots, so a SHARE_LIMIT off the doubling keeps the 2048 bucket
 
 - The decode graphs are captured per context bucket (2048, 4096, ... below the capacity, the capacity, and CP's R when it

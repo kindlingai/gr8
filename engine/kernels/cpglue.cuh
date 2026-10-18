@@ -90,6 +90,29 @@ __global__ void __launch_bounds__(256) k_vget(g6::VSlotDev v, int j, const u64* 
     if (blockIdx.x == 0 && threadIdx.x < (n % 16) / 4)
         reinterpret_cast<unsigned*>(reinterpret_cast<uint4*>(dst) + n / 16)[threadIdx.x] = reinterpret_cast<const unsigned*>(src + n / 16)[threadIdx.x];
 }
+// G6_CP_ONECHAIN (rank.cuh launch_attn_cp): the q all-gather payloads of n head groups side by side, for one attention
+// call over all of them. grid (G, n), block 256: source j[y]'s recv slot of v (after k_vwait; q [M][hd][512] then rope
+// [M][hd][64], packed as k_vput) -> heads y hd .. (y + 1) hd - 1 of q [M][n hd][512] and rope [M][n hd][64]. The words
+// k_vget copies, at their head's place. q and rope 16-B aligned.
+struct VHeads
+{
+    int j[7];
+};
+__global__ void __launch_bounds__(256) k_vget_heads(g6::VSlotDev v, VHeads s, const u64* stepp, float* q, float* rope, int M, int hd)
+{
+    const int y = blockIdx.y, n = gridDim.y;
+    const uint4* src = reinterpret_cast<const uint4*>(vrecv(v, *stepp, s.j[y]));
+    const size_t qr = (size_t)hd * 128, rr = (size_t)hd * 16, nq = (size_t)M * qr, nt = nq + (size_t)M * rr;   // uint4 a row
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < nt; i += (size_t)gridDim.x * 256)
+    {
+        if (i < nq) reinterpret_cast<uint4*>(q)[(i / qr * n + y) * qr + i % qr] = src[i];
+        else
+        {
+            const size_t k = i - nq;
+            reinterpret_cast<uint4*>(rope)[(k / rr * n + y) * rr + k % rr] = src[i];
+        }
+    }
+}
 #ifdef CP_F1A
 // F1a: the phase-2 partial waits + gets of launch_attn_cp (one k_vwait + one k_vget per partial) as ONE launch.
 // grid (G, n), block 256: row y waits for partial collective v[y] (its one source; every CTA of the row spins on the
