@@ -66,8 +66,8 @@
           "aggregate_tps": 62.2
         }
       ],
-      "max_context": 241600,
-      "kv_pool_tokens": 241600,
+      "max_context": 307136,
+      "kv_pool_tokens": 307136,
       "max_concurrent": 8,
       "quality": [],
       "notes": "bit225 experts (about 2.25 bpw), MTP only. Mean of two boots. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. With --kv-format int4 (experimental) the KV pool is 345,088 tokens, an estimate not yet booted."

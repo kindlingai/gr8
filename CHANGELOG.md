@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
+
+- TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)
+  chats stay resident and decode together instead of the second queueing; longest context rises 241,600 -> 307,136 at
+  the same 1,941 pages a rank. Measured on three GB10 at TP=3: two 38K-token chats run concurrently (both finish
+  within 1 s of each other), smoke 14/14, decode/prefill headline unchanged. `--share-limit 65536` restores the old
+  behaviour.
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=4
 
 - The TP=4 serving default `SHARE_LIMIT` is now 32,768 (was 65,536). Each session replicates its first 32,768 tokens on
