@@ -149,6 +149,9 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
       esac
     done
   fi
+  # the drafter choice's frozen cost table (DSEL_MODEL, DSEL_TABLE; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${DSEL_MODEL:+ G6_S2_DSEL_MODEL=$DSEL_MODEL}"
+  ENGINE_ENV="$ENGINE_ENV${DSEL_TABLE:+ G6_S2_DSEL_TABLE=$DSEL_TABLE}"
   return 0
 }
 

@@ -246,6 +246,13 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--v2 @V2', text)
         self.assertIn('--v2-widths @V2_WIDTHS', text)
 
+    def test_dsel_model_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_S2_DSEL_MODEL', text)
+        tab = 'v2:46.63,v3:54.71,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,w:1,r:0.95'
+        _, text, _ = self.digest('--dsel-model', '1', '--dsel-table', tab)
+        self.assertIn(' G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=' + tab, text)
+
     def test_release_alone_has_no_rank_pack(self):
         _, text, _ = self.digest('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel')
         self.assertIn('--v2-dense @V2_DENSE', text)
