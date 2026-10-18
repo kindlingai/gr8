@@ -88,6 +88,7 @@ manifest instead.
 | `S2_DECODE_ROUNDS` | 16 | unset (0) | unset (0) | S2: while a prefill waits and sessions decode, this many decode rounds per prefill quantum (`G6_S2_DECODE_ROUNDS`; 0..64) |
 | `PF_SELX_CTX` | 53248 | unset (0) | unset (0) | prefill index tiles at context >= this select with selx instead of SEL32, same ids in the same order (`G6_PF_SELX_CTX`; 0 = SEL32) |
 | `TR3_W2ALL` | 1 | unset (0) | unset (0) | 1 = the window-2 fc1 split (KS1x2, WG1) on every MoE layer at M > 1, not only the layers the k2 gate picks (`G6_TR3_W2ALL`; bit-exact). Measured at TP=4 only |
+| `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

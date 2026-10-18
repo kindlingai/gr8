@@ -130,6 +130,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   [ "${PF_SELX_CTX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV G6_PF_SELX_CTX=$PF_SELX_CTX"
   # the window-2 fc1 split on every MoE layer at M > 1 (TR3_W2ALL; docs/SETTINGS.md): off unless set; on at TP=4
   ENGINE_ENV="$ENGINE_ENV${TR3_W2ALL:+ G6_TR3_W2ALL=$TR3_W2ALL}"
+  # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
+  ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
   return 0
 }
 
