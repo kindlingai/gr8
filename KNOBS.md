@@ -84,6 +84,7 @@ manifest instead.
 | `MTP_KSTOPB_KMIN` | unset (0) | unset (0) | unset (0) | `MTP_KSTOPB`: the least drafts a session verifies, 0 or 1 (`G6_MTP_KSTOPB_KMIN`) |
 | `MTP_KSTOPB_TAU` | unset (`0.6,0.88`) | same | same | `MTP_KSTOPB`: thresholds t1,t2,... (up to 7) on each session's cumulative draft probability, at every session count (`G6_MTP_KSTOPB_TAU`) |
 | `MTP_KSTOPB_TAU_S` | unset | unset | unset | `MTP_KSTOPB`: thresholds per session count, `n:t1,t2,...` entries separated by `/`, e.g. `1:0.7,0.7/2:0.7,0.8` (`G6_MTP_KSTOPB_TAU_S<n>`) |
+| `L2PF` | unset (0) | unset (0) | unset (0) | decode: a paced L2 prefetch of the weights the step reads next, on a side stream in the windows where DRAM is idle; window mask 1 = MLP all-reduce wait, 2 = gather waits, 4 = attention, 8 = attention all-reduce wait (`G6_L2PF`; bit-exact). Measured at TP=4 only, as 15 |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

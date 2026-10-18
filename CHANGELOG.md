@@ -134,6 +134,31 @@
   S2 runtime signature. Off, and on with zero thresholds, the planner's steps are unchanged (`batch_kstopb_test`).
 - Measured on four GB10 at TP=4 (`--mtp 2`, thresholds per session count): ABBA over six blocks, c2 +1.5 %, c4 +3.7 %
   decode; c1 unchanged.
+  and fc2 n-split (NS2) per step row count from a table, `M:KS1xWG/NS2` entries (`a-b` ranges). An fc1 shape is taken
+  only where KS1 x WG equals the row class's own, and NS2 may be any divisor of 384, so the partials, their k ranges and
+  fc2's summation order are those of the built-in split: same bytes at any accepted table. A malformed table fails the
+  bind with a message.
+  `prefetch.global.L2` per KB granule over its slot's fc1 and fc2 ranges at the start of the launch, so the address
+  translations of the later CTA waves and of fc2 are walked while fc1 runs. A decode step's routed experts touch about
+  5,300 2 MB pages a rank at TP=4, more than the GPU's translation reach. No output change.
+- `engine/kernels/tests/k1_audit.cu` (built by `scripts/build.sh`, run by hand on an idle GB10): the routed MoE phase on
+  synthetic exlr8 v2 layers in the TP=4 rank shape, all 75 MoE layers resident, against a plain read of the same bytes;
+  log-probabilities identical on 75 prompts; decode +2.0 % prose, +1.7 % code, +1.5 % structured at c1.
+## 2026-10-18: decode: a paced L2 prefetch of the next weights in the step's idle-DRAM windows (G6_L2PF, off by default)
+- A decode step leaves DRAM idle in its collective waits (the two all-reduces per layer, the `G6_QA_SPLIT` /
+  `G6_IDXQ_SPLIT` gathers) and through most of the latency-bound attention, while the GEMVs around them start cold.
+  `G6_L2PF` (launch knob `L2PF`, a window mask) has one warp on a high-priority side stream prefetch the layer's next
+  weights into L2 in those windows: 8 KiB `cp.async.bulk.prefetch.L2` chunks from a token bucket (`G6_L2PF_GBPS`, 175
+  GB/s, in waves of `G6_L2PF_WAVE`), not a burst, so dependent loads of the attention are left alone; a second warp
+  polls the collective's tails and ends the window once every peer has arrived.
+- One queue per layer in read order (x_in, idx_q, q_b, UK, UV, o_proj up to `G6_L2PF_OPMB`, router, shared fc1);
+  windows: 1 = the MLP all-reduce wait, 2 = the gather waits, 4 = the attention, 8 = the attention all-reduce wait. The
+  side stream is forked per window and joined at the end of the step part, so captured graphs hold the forks as edges.
+  Unset: no stream, no launch, the graphs are unchanged.
+- A prefetch writes nothing: same bytes out. `engine/kernels/tests/l2pf_bench.cu` (built by `scripts/build.sh`, run by
+  hand) byte-compares the decode layer sequence's outputs per arm and times it per layer.
+- Measured on four GB10 at TP=4 (`L2PF=15`): T=0 top-20 log-probabilities identical on 75 prompts; decode c1 +2.7 %
+  prose, +2.3 % code, +2.7 % structured; `l2pf_bench` -10.1 us a layer at 3 rows, -38.6 us at 12.
 
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
