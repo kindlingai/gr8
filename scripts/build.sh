@@ -123,6 +123,11 @@ done
 # shellcheck disable=SC2086
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 \
   -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" "$REPO/engine/kernels/tests/k1_ovl_test.cu"
+# the routed MoE phase against a plain read of its bytes, the G6_K1_SPLIT table and G6_K1_TLBW arms (byte-exact
+# checks + bench on synthetic TP4 layers); build only (needs an idle GPU and ~74 GB): $OUT/k1_audit (file header)
+# shellcheck disable=SC2086
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 -DPF_F12 \
+  -I "$REPO/engine/kernels" -o "$OUT/k1_audit" "$REPO/engine/kernels/tests/k1_audit.cu"
 # fabric groups over real verbs (#154): built here, run by hand on the cluster (one process per box; see its header)
 nvcc -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" "$REPO/engine/comms/tests/fabric_group_test.cpp" \
   "$REPO/engine/comms/fabric.cpp" -libverbs -lpthread

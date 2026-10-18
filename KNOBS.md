@@ -84,6 +84,8 @@ manifest instead.
 | `MTP_KSTOPB_KMIN` | unset (0) | unset (0) | unset (0) | `MTP_KSTOPB`: the least drafts a session verifies, 0 or 1 (`G6_MTP_KSTOPB_KMIN`) |
 | `MTP_KSTOPB_TAU` | unset (`0.6,0.88`) | same | same | `MTP_KSTOPB`: thresholds t1,t2,... (up to 7) on each session's cumulative draft probability, at every session count (`G6_MTP_KSTOPB_TAU`) |
 | `MTP_KSTOPB_TAU_S` | unset | unset | unset | `MTP_KSTOPB`: thresholds per session count, `n:t1,t2,...` entries separated by `/`, e.g. `1:0.7,0.7/2:0.7,0.8` (`G6_MTP_KSTOPB_TAU_S<n>`) |
+| `K1_SPLIT` | unset | unset | unset | decode MoE: the fc1 CTA shape and / or fc2 n-split per step row count, `M:KS1xWG/NS2` entries (`a-b:` ranges), e.g. `1:/4,3:2x1,4-32:/4` (`G6_K1_SPLIT`; bit-exact, an entry that would change the sums is refused at boot). Tuning: measured at TP=4 with the `home` widths |
+| `K1_TLBW` | unset (0) | unset (0) | unset (0) | decode MoE: fc1 prefetches the routed slots' weight translations into L2 at this granule in KB, a power of two; 2048 = the huge page (`G6_K1_TLBW`; bit-exact). Measured at TP=4 only |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

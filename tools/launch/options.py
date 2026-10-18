@@ -122,6 +122,8 @@ KEYS = {
     'MTP_KSTOPB_KMIN': ('cluster', None, 'MTP_KSTOPB: the least drafts a session verifies, 0 or 1 (G6_MTP_KSTOPB_KMIN)'),
     'MTP_KSTOPB_TAU': ('cluster', None, 'MTP_KSTOPB thresholds t1,t2,... at every session count (G6_MTP_KSTOPB_TAU)'),
     'MTP_KSTOPB_TAU_S': ('cluster', None, 'MTP_KSTOPB thresholds per session count, n:t1,t2/n:t1,t2... (G6_MTP_KSTOPB_TAU_S<n>)'),
+    'K1_SPLIT': ('cluster', None, 'MoE decode: fc1 shape / fc2 n-split per step row count, M:KS1xWG/NS2,... (G6_K1_SPLIT)'),
+    'K1_TLBW': ('cluster', None, "MoE decode: fc1 prefetches the routed weights' translations at this granule, KB (G6_K1_TLBW)"),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

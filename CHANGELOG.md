@@ -125,6 +125,22 @@
   S2 runtime signature. Off, and on with zero thresholds, the planner's steps are unchanged (`batch_kstopb_test`).
 - Measured on four GB10 at TP=4 (`--mtp 2`, thresholds per session count): ABBA over six blocks, c2 +1.5 %, c4 +3.7 %
   decode; c1 unchanged.
+## 2026-10-18: MoE decode: a split table per row count and a translation prefetch (G6_K1_SPLIT, G6_K1_TLBW, off by default)
+
+- `G6_K1_SPLIT` (launch knob `K1_SPLIT`): the routed-expert phase of a decode step takes its fc1 CTA shape (KS1 x WG)
+  and fc2 n-split (NS2) per step row count from a table, `M:KS1xWG/NS2` entries (`a-b` ranges). An fc1 shape is taken
+  only where KS1 x WG equals the row class's own, and NS2 may be any divisor of 384, so the partials, their k ranges and
+  fc2's summation order are those of the built-in split: same bytes at any accepted table. A malformed table fails the
+  bind with a message.
+- `G6_K1_TLBW=KB` (launch knob `K1_TLBW`): warp 0 of each fc1 CTA below the step's routed slots issues one
+  `prefetch.global.L2` per KB granule over its slot's fc1 and fc2 ranges at the start of the launch, so the address
+  translations of the later CTA waves and of fc2 are walked while fc1 runs. A decode step's routed experts touch about
+  5,300 2 MB pages a rank at TP=4, more than the GPU's translation reach. No output change.
+- `engine/kernels/tests/k1_audit.cu` (built by `scripts/build.sh`, run by hand on an idle GB10): the routed MoE phase on
+  synthetic exlr8 v2 layers in the TP=4 rank shape, all 75 MoE layers resident, against a plain read of the same bytes;
+  `--tab` checks a `G6_K1_SPLIT` table against the default byte for byte, `--arms tlbw` times the prefetch.
+- Measured on four GB10 at TP=4 (with the `home` widths, `K1_SPLIT=1:/4,3:2x1,4-32:/4 K1_TLBW=2048`): T=0 top-20
+  log-probabilities identical on 75 prompts; decode +2.0 % prose, +1.7 % code, +1.5 % structured at c1.
 
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 

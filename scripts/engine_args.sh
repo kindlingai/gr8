@@ -167,6 +167,9 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
       esac
     done
   fi
+  # the MoE split table and the translation prefetch (K1_SPLIT, K1_TLBW; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${K1_SPLIT:+ G6_K1_SPLIT=$K1_SPLIT}"
+  ENGINE_ENV="$ENGINE_ENV${K1_TLBW:+ G6_K1_TLBW=$K1_TLBW}"
   return 0
 }
 
