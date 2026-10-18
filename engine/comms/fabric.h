@@ -89,6 +89,7 @@ class Fabric {
   FabricDev dev() const { return dev_; }
   int rank() const { return cfg_.rank; }
   int nranks() const { return (int)cfg_.ips.size(); }
+  int port() const { return cfg_.port; }   // bootstrap base (FabricConfig::port), for messages
   // variable-layout fabric only: kernel view of collective c (both parities)
   VSlotDev vslot(int c) const;
   const VLayout& vlayout() const;

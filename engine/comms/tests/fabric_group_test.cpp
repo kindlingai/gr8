@@ -23,6 +23,7 @@
 #include <dirent.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +53,13 @@ static long rdma_res(const char* what) {
   return pclose(p) == 0 ? n : -1;
 }
 static void die(const std::string& s) { fprintf(stderr, "fabric_group_test: FAIL %s\n", s.c_str()); exit(1); }
+// a run that stopped: close the fabric first, so it prints any QP that left RTS and any failed completion still in its
+// CQs (the proxy polls only while it posts), then fail
+static void stall(Fabric& f, const std::string& s) {
+  fprintf(stderr, "fabric_group_test: %s; closing the fabric for its QP and completion report\n", s.c_str());
+  f.close();
+  die(s);
+}
 static uint64_t word(uint64_t step, int c, int from, uint64_t k) {   // payload word k of collective c, sent by pool box `from`
   uint64_t x = step * 0x9E3779B97F4A7C15ull ^ (uint64_t)c << 48 ^ (uint64_t)from << 40 ^ k;
   x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
@@ -87,9 +95,16 @@ static uint64_t run(Fabric& f, const std::vector<int>& members, int steps, int b
         if (p == me) continue;
         volatile uint64_t* slot = (volatile uint64_t*)(d.recv + (((size_t)par * nc + c) * nr + p) * d.stride);
         const unsigned long long want = coll_seq(s, c, nc);
+        const auto t0 = std::chrono::steady_clock::now();
         for (long spin = 0; slot[bytes / 8] != want; spin++) {
-          if (*(volatile unsigned*)d.error) die("fabric error word " + std::to_string(*d.error));
-          if (spin > 2000000000L) die("no tail from rank " + std::to_string(p));
+          if (*(volatile unsigned*)d.error) stall(f, "fabric error word " + std::to_string(*d.error));
+          // 30 s, the proxy's own doorbell timeout (a spin count was a few seconds on a loaded box)
+          if ((spin & 0xfffff) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+            char b[200];
+            snprintf(b, sizeof b, "no tail from rank %d (port %d, step %d, collective %d: slot holds seq %llu, want %llu)", p,
+                     f.port(), s, c, (unsigned long long)slot[bytes / 8], want);
+            stall(f, b);
+          }
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         for (int k = 0; k < bytes / 8; k++) {

@@ -125,6 +125,17 @@ inline uint64_t xt_freq() {
 }
 
 struct QPInfo { uint32_t qpn, psn, rkey; uint64_t addr; uint8_t gid[16]; uint32_t mtu; };
+// Starting PSN of a mesh QP. It was a fixed function of (rank, peer), so every group built on the same boxes started
+// its QPs at the PSNs of the group before it, and the kernel recycles QP numbers: a late packet of a dropped group
+// could match a new QP's number and expected PSN. Each fabric now draws its own (24 bits; the peer reads it from the
+// bootstrap, so only the value changes, never the protocol).
+uint32_t start_psn(int rank, int peer) {
+  static std::atomic<uint64_t> n{0};
+  uint64_t x = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() ^ (uint64_t)getpid() << 32 ^
+               (uint64_t)rank << 24 ^ (uint64_t)peer << 16 ^ n.fetch_add(0x9E3779B97F4A7C15ull);
+  x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 31;
+  return (uint32_t)(x & 0xffffff);
+}
 struct Rail { DevInfo di; ibv_context* ctx = nullptr; ibv_pd* pd = nullptr; ibv_cq* cq = nullptr; ibv_mr* mr = nullptr; ibv_gid gid{}; ibv_mtu mtu{}; };
 
 // The bootstrap carries the active port MTU with each QP. All ranks must use this wire format.
@@ -385,6 +396,27 @@ void Fabric::close() {
     fprintf(stderr, "[fabric r%d] close: %ld jobs were not posted; peers waiting on them will time out\n", cfg_.rank, I.pending.load());
   stop_proxy();
   if (I.ring) return;                                  // mesh only (#154): the object stays as it is (fabric.h)
+  // Report what the proxy never saw. It polls the CQ only while it posts, so a write that fails after the last post of
+  // a run (retries exhausted, a flushed queue) is still in the CQ here, and its QP has left RTS. Teardown only; silent
+  // when every QP is in RTS and every completion was good.
+  for (int p = 0; p < (int)I.qp.size(); p++) {
+    if (!I.qp[p]) continue;
+    ibv_qp_attr a{}; ibv_qp_init_attr ia{};
+    if (ibv_query_qp(I.qp[p], &a, IBV_QP_STATE, &ia) == 0 && a.qp_state != IBV_QPS_RTS)
+      fprintf(stderr, "[fabric r%d port %d] close: QP %u to rank %d (rail %d) is in state %d, not RTS\n", cfg_.rank, cfg_.port,
+              I.qp[p]->qp_num, p, I.rail_of(p, cfg_.rank), (int)a.qp_state);
+  }
+  for (int r = 0; r < I.nrails; r++) {
+    if (!I.rails[r].cq) continue;
+    ibv_wc wc[32]; int n;
+    while ((n = ibv_poll_cq(I.rails[r].cq, 32, wc)) > 0)
+      for (int i = 0; i < n; i++)
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          I.wc_count(r, (int)wc[i].wr_id, wc[i].status);
+          fprintf(stderr, "[fabric r%d port %d] close: rail %d completion to rank %d: %s\n", cfg_.rank, cfg_.port, r,
+                  (int)wc[i].wr_id, ibv_wc_status_str(wc[i].status));
+        }
+  }
   for (ibv_qp*& q : I.qp) if (q) { FCHECK(ibv_destroy_qp(q) == 0); q = nullptr; live(kLiveQp, -1); }
   for (int r = 0; r < I.nrails; r++) {
     Rail& R = I.rails[r];
@@ -600,7 +632,7 @@ void Fabric::init(const FabricConfig& cfg) {
     I.qp[p] = ibv_create_qp(R.pd, &ia); FCHECK(I.qp[p]); live(kLiveQp, 1);
     ibv_qp_attr at{}; at.qp_state = IBV_QPS_INIT; at.port_num = 1; at.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
     FCHECK(ibv_modify_qp(I.qp[p], &at, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0);
-    mine[p] = QPInfo{I.qp[p]->qp_num, (uint32_t)((cfg.rank * 131 + p * 7) & 0xffffff), R.mr->rkey, (uint64_t)dev_.recv, {}, uint32_t(R.mtu)};
+    mine[p] = QPInfo{I.qp[p]->qp_num, start_psn(cfg.rank, p), R.mr->rkey, (uint64_t)dev_.recv, {}, uint32_t(R.mtu)};
     memcpy(mine[p].gid, R.gid.raw, 16);
   }
   auto all = allgather(cfg.rank, nr, cfg.ips[0], cfg.port, mine.data(), sizeof(QPInfo) * nr);
