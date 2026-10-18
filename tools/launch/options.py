@@ -109,6 +109,8 @@ KEYS = {
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
+    'DSEL_MODEL': ('cluster', None, 'drafter choice priced from a frozen cost table, MTP rounds as the confidence stop runs them (G6_S2_DSEL_MODEL)'),
+    'DSEL_TABLE': ('cluster', None, 'DSEL_MODEL: the cost table, key:value list or a file (G6_S2_DSEL_TABLE; tools/s2_dsel_table.py)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
