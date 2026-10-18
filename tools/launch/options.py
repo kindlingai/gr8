@@ -128,6 +128,7 @@ KEYS = {
     'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
     'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
                              'needs V2_DENSE)'),
+    'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
