@@ -221,8 +221,9 @@ inline Queue queue(const Plan& P, unsigned tmask)
     {
         q.from[t] = c;
         if (!(tmask >> t & 1)) continue;
-        for (int k = 0; k < 4 && P.n[t][k] && q.count < MAXR; ++k)
+        for (int k = 0; k < 4 && P.n[t][k]; ++k)
         {
+            if (q.count == MAXR) { fprintf(stderr, "l2pf: queue full (%d ranges), target %d range %d dropped\n", MAXR, t, k); break; }
             const uintptr_t b = reinterpret_cast<uintptr_t>(P.p[t][k]), lo = (b + 15) & ~static_cast<uintptr_t>(15),
                             hi = (b + P.n[t][k]) & ~static_cast<uintptr_t>(15);
             if (hi <= lo) continue;
