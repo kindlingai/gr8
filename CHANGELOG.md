@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-18: G6_DFL_REUSE defaults on when serving DFlash2 with MTP
+
+- `G6_DFL_REUSE` now defaults to 2 when the engine serves DFlash2 with MTP (off elsewhere, and any explicit value still
+  wins). A request whose prefix-reuse hit skipped into the drafter's window, or that runs alone on MTP, keeps the
+  DFlash2 drafter instead of running MTP for its whole life. That is most later turns of a conversation.
+- Why: on a warm cache (RigMark run 2, every prompt a prefix hit) code held at 51.1 tok/s with it on against 44.3 off,
+  +15%, with prose, multi-agent and cold prefill unchanged. Drafts only, so output is bit-identical (KL mean 0.0,
+  top-1 1.0). This closes the former "which requests get the DFlash2 drafter depends on timing" issue.
+- `G6_DFL_REUSE=0` restores the old behaviour.
+
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)
@@ -114,7 +124,7 @@
 
 ## 2026-10-16: DFlash2 after a prefix-reuse hit, and for a request left alone on MTP (G6_DFL_REUSE, off by default)
 
-- KNOWN-ISSUES #1: at TP=4 a request whose prefix-reuse hit skipped into the drafter's 2,048-position window, or that
+- At TP=4 a request whose prefix-reuse hit skipped into the drafter's 2,048-position window, or that
   was not alone at its prompt tail, ran MTP for its whole life. That is most later turns of a conversation.
   `G6_DFL_REUSE=1` lets the hit request keep the drafter: the drafter's context starts past the hit's rows, or at the
   window's start when its KV ring still holds the previous turn of the same conversation (S2 tracks which tokens the
