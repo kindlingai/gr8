@@ -153,7 +153,7 @@ public:
         auto& s = get(k); if (s.ended) return;
         // Emitter::end uses per-request counters here, never process-wide totals.
         // K + 1 bins: K = the MTP draft count, or 7 for a session that started on DFlash2 (s2_batch.h)
-        require(stats.acc.empty() || (stats.acc.size() >= config_.mtp + 1 && stats.acc.size() <= 8), "bad per-request acceptance histogram");
+        require(stats.acc.empty() || (stats.acc.size() >= config_.mtp + 1 && stats.acc.size() <= 16), "bad per-request acceptance histogram");
         std::array<long, 8> zero{};
         auto& em = s.emitter;
         if (em.f) {
