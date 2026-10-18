@@ -36,6 +36,12 @@ constexpr int DEFAULT_DENSE_LIMIT=8192;
 constexpr int DEFAULT_QUERY_TILE=256;
 static int blas_status(cublasStatus_t s){if(s==CUBLAS_STATUS_SUCCESS)return 0;fprintf(stderr,"gr8 prefill cuBLAS status %d\n",int(s));return int(cudaErrorUnknown);}
 __global__ void weight_half(const void* src,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[i]=__float2half_rn(ga::bfloat(src,i));}
+// #50: the FP16 UK / UV copies from a binding's E4M3 weights (attn.h uks / uvs): each FP16 value is weight_half's of the BF16
+// weight the BF16 loader stores (ga::wuk / ga::wuv), so the copies are byte-identical. UK keeps the binder's [h][512][192].
+__global__ void weight_half_uk(G6Attn a,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n){const int h=i/(512*192),d=(i/192)%512,k=i%192;dst[i]=__float2half_rn(ga::wuk(a,h,d,k));}}
+__global__ void weight_half_uv(G6Attn a,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n){const int h=i/(256*512),e=(i/512)%256,k=i%512;dst[i]=__float2half_rn(ga::wuv(a,h,e,k));}}
 __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int count){
     auto a=ga::resolve(fixed);int pos=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(pos>=count)return;
     const uint8_t* v=pos<a.context?ga::kv_at(a,pos):nullptr;
@@ -312,7 +318,10 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
     // One handle follows the shared workspace lifetime. All calls are serialized
     // and use the same math mode; no per-layer cuBLAS state is required.
     p->blas=p->workspace->blas;
-    cudaStream_t st=(cudaStream_t)s;weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);e=cudaGetLastError();
+    cudaStream_t st=(cudaStream_t)s;
+    if(b->args.uks){weight_half_uk<<<(p->H*512*192+255)/256,256,0,st>>>(b->args,p->uk,p->H*512*192);weight_half_uv<<<(p->H*256*512+255)/256,256,0,st>>>(b->args,p->uv,p->H*256*512);}
+    else{weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);}
+    e=cudaGetLastError();
     if(e!=cudaSuccess){profile_release(p->profile);cudaFree(p->storage);release_scratch(p->workspace);delete p;return int(e);}*out=p;return 0;
 }
 }

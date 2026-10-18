@@ -171,6 +171,15 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<
     Ok(())
 }
 
+/// G6_KVB (#50): `fp8` plans kv_b (UK / UV) as the release's block FP8 bytes and scales, unset or `bf16` as BF16.
+fn kvb_fp8() -> Result<bool, String> {
+    match std::env::var("G6_KVB").as_deref() {
+        Err(_) | Ok("") | Ok("bf16") => Ok(false),
+        Ok("fp8") => Ok(true),
+        Ok(v) => Err(format!("G6_KVB={v}: use bf16 or fp8")),
+    }
+}
+
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(default)
 }
@@ -327,7 +336,7 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
     let r = (|| {
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
                                          &arg(widths, "width manifest")?, nr as usize, rank as usize,
-                                         release::Opts { qo: qo != 0, trellis: trellis != 0 })?;
+                                         release::Opts { qo: qo != 0, trellis: trellis != 0, kvb_fp8: kvb_fp8()? })?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
         if rank == 0 {

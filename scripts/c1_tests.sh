@@ -6,7 +6,8 @@
 # reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and weight_check_test (the weight check's GPU sums
 # against the CPU's, and one changed byte caught in its own chunk) and canon_test (a session's KV exported and imported
 # across page lists and layouts, then a decode step on it; #152) and kv_resize_test (the KV pool's chunks shrunk and grown
-# under live sessions, on caches in virtual memory, against caches that never resized; #153).
+# under live sessions, on caches in virtual memory, against caches that never resized; #153) and kvb8_test (kv_b in FP8:
+# decode and prefill against the BF16 form of the same weights, byte for byte; --bench times absorb / value_project; #50).
 # across page lists and layouts, then a decode step on it; #152) and dhead_i4_test (G6_DRAFT_HEAD_I4: the MXFP8 -> INT4
 # head records against a host derivation, the INT4 head GEMV against a host dot; --time: MXFP8 vs INT4 head GEMV).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
@@ -74,6 +75,14 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = kv4_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = kvb8_test ]; then
+  # kv_b (UK / UV) in FP8 (#50): decode and prefill outputs against the BF16 form of the same weights, byte for byte
+  [ "$TEST" = all ] && ARGS=()
+  case "$FLAGS" in
+    *-DG6_KV4=1*) echo "SKIP kvb8_test: it runs the FP8-row decode variants, which a G6_KV4 build does not" ;;
+    *) build_run kvb8_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
+  esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
   # a session's KV across page lists and layouts (#152): links the S2 page allocator's library (engine/kvman-rs)

@@ -129,6 +129,18 @@ __device__ float bfloat(const void* p,int64_t i){return __bfloat162float(((const
 __device__ float hfloat(const void* p,int64_t i){return __half2float(((const half*)p)[i]);}
 __device__ float e4(uint8_t x){__nv_fp8_e4m3 a;a.__x=x;return (float)a;}
 __device__ uint8_t q4(float x){return __nv_fp8_e4m3(x).__x;}
+// UK / UV weights (attn.h): BF16, or E4M3 + block scale rounded to the same BF16 (the loader's expansion, #50)
+__device__ __forceinline__ float kvb8(uint8_t b,float s){return __bfloat162float(__float2bfloat16_rn(e4(b)*s));}
+// UK of head h, latent channel d < 512, q_nope channel k < 192 (the transposed [h][512][192] layout)
+__device__ __forceinline__ float wuk(const G6Attn& a,int h,int d,int k){
+    const int64_t i=((int64_t)h*512+d)*192+k;
+    return a.uks?kvb8(((const uint8_t*)a.uk)[i],a.uks[((int64_t)h*4+(d>>7))*192+k]):bfloat(a.uk,i);
+}
+// UV of head h, value channel e < 256, latent channel k < 512 ([h][256][512])
+__device__ __forceinline__ float wuv(const G6Attn& a,int h,int e,int k){
+    const int64_t i=((int64_t)h*256+e)*512+k;
+    return a.uvs?kvb8(((const uint8_t*)a.uv)[i],a.uvs[((int64_t)h*256+e)*4+(k>>7)]):bfloat(a.uv,i);
+}
 __device__ void error(const G6Attn& a,unsigned code){atomicOr(a.error,code);}
 #if defined(G6_CP) && G6_CP
 // CP: the rank that scores key pos (indexer and split-K partial); every key is scored by exactly one rank
@@ -381,7 +393,7 @@ template<class Input>
 __global__ void absorb(Input input,int start,float* q,float* rope){
     auto a=resolve(input);if(!a.active)return;
     int row=blockIdx.z,r=start+row,h=blockIdx.y,d=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32;
-    if(d<512){float sum=0;for(int k=lane;k<192;k+=32)sum=fmaf(hfloat(a.q_b,((int64_t)r*a.heads+h)*256+k),bfloat(a.uk,((int64_t)h*512+d)*192+k),sum);
+    if(d<512){float sum=0;for(int k=lane;k<192;k+=32)sum=fmaf(hfloat(a.q_b,((int64_t)r*a.heads+h)*256+k),wuk(a,h,d,k),sum);
         sum=warp_sum(sum);if(lane==0)q[((int64_t)row*a.heads+h)*512+d]=sum;}
     if(blockIdx.x==0&&threadIdx.x<32){float c,s;RCS(a.positions[r],threadIdx.x,c,s);int j=threadIdx.x;
         float x=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+192+2*j),y=hfloat(a.q_b,((int64_t)r*a.heads+h)*256+193+2*j);
@@ -450,7 +462,7 @@ template<class Input>
 __global__ void value_project(Input input,int start,const float* context){
     auto a=resolve(input);if(!a.active)return;
     int row=blockIdx.z,r=start+row,h=blockIdx.y,d=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32;float sum=0;
-    for(int k=lane;k<512;k+=32)sum=fmaf(context[((int64_t)row*a.heads+h)*512+k],bfloat(a.uv,((int64_t)h*256+d)*512+k),sum);
+    for(int k=lane;k<512;k+=32)sum=fmaf(context[((int64_t)row*a.heads+h)*512+k],wuv(a,h,d,k),sum);
     sum=warp_sum(sum);if(lane==0)((half*)a.output)[((int64_t)r*a.heads+h)*256+d]=__float2half_rn(sum);
 }
 // DEC_AVP: absorb / value_project for all rows of a call in one launch. Grid has no row axis:
@@ -466,7 +478,7 @@ __global__ void absorb_m(Input input,int start,int n,float* q,float* rope){
     __shared__ float qb[AVP_ROWS][192];
     float u[6];
     #pragma unroll
-    for(int m=0;m<6;m++)u[m]=bfloat(a.uk,((int64_t)h*512+d)*192+lane+32*m);
+    for(int m=0;m<6;m++)u[m]=wuk(a,h,d,lane+32*m);
     for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
         if(c)__syncthreads();
         for(int i=t;i<nc*192;i+=256){int row=i/192,k=i%192;qb[row][k]=hfloat(a.q_b,((int64_t)(start+c+row)*a.heads+h)*256+k);}
@@ -486,7 +498,7 @@ __global__ void value_project_m(Input input,int start,int n,const float* context
     __shared__ float ctx[AVP_ROWS][512];
     float u[16];
     #pragma unroll
-    for(int m=0;m<16;m++)u[m]=bfloat(a.uv,((int64_t)h*256+d)*512+lane+32*m);
+    for(int m=0;m<16;m++)u[m]=wuv(a,h,d,lane+32*m);
     for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
         if(c)__syncthreads();
         for(int i=t;i<nc*512;i+=256){int row=i/512,k=i%512;ctx[row][k]=context[((int64_t)(c+row)*a.heads+h)*512+k];}
@@ -523,7 +535,7 @@ __global__ void __launch_bounds__(256,R==8?3:6) absorb_m2(Input input,int start,
     #pragma unroll
     for(int i=0;i<R;i++)
         #pragma unroll
-        for(int m=0;m<6;m++)u[i][m]=bfloat(a.uk,((int64_t)h*512+d0+8*i)*192+lane+32*m);
+        for(int m=0;m<6;m++)u[i][m]=wuk(a,h,d0+8*i,lane+32*m);
     for(int c=0;c<n;c+=AVP_ROWS){const int nc=min(AVP_ROWS,n-c);
         if(c)__syncthreads();
         if(t<nc*24){const int row=t/24,k=(t%24)*8;   // 24 x 16 B per row, nc*24 <= 192 threads
@@ -554,7 +566,7 @@ __global__ void absorb_m1(Input input,int start,int n,float* q,float* rope){
      for(int i=t;i<m*192;i+=256){int row=i/192,k=i%192;qb[row][k]=hfloat(a.q_b,((int64_t)(start+row)*a.heads+h)*256+k);}}
     float u[6];
     #pragma unroll
-    for(int m=0;m<6;m++)u[m]=bfloat(a.uk,((int64_t)h*512+d)*192+lane+32*m);
+    for(int m=0;m<6;m++)u[m]=wuk(a,h,d,lane+32*m);
     for(int r0=0;r0<n;r0+=AVP_STAGE){const int m=min(AVP_STAGE,n-r0);
         if(r0){__syncthreads();
             for(int i=t;i<m*192;i+=256){int row=i/192,k=i%192;qb[row][k]=hfloat(a.q_b,((int64_t)(start+r0+row)*a.heads+h)*256+k);}}
@@ -577,7 +589,7 @@ __global__ void value_project_m1(Input input,int start,int n,const float* contex
      for(int i=t;i<m*128;i+=256){int row=i/128,k=(i%128)*4;*(float4*)&ctx[row][k]=*(const float4*)&context[((int64_t)row*a.heads+h)*512+k];}}
     float u[16];
     #pragma unroll
-    for(int m=0;m<16;m++)u[m]=bfloat(a.uv,((int64_t)h*256+d)*512+lane+32*m);
+    for(int m=0;m<16;m++)u[m]=wuv(a,h,d,lane+32*m);
     for(int r0=0;r0<n;r0+=AVP_STAGE){const int m=min(AVP_STAGE,n-r0);
         if(r0){__syncthreads();
             for(int i=t;i<m*128;i+=256){int row=i/128,k=(i%128)*4;*(float4*)&ctx[row][k]=*(const float4*)&context[((int64_t)(r0+row)*a.heads+h)*512+k];}}

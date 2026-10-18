@@ -118,6 +118,8 @@ KEYS = {
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
+    'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
+                             'needs V2_DENSE)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
@@ -353,6 +355,8 @@ def validate(o):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+    if o.get('KVB') not in (None, 'bf16', 'fp8'):
+        raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')

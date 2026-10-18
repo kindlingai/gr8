@@ -558,6 +558,29 @@ impl<'a> Matrix<'a> {
         Ok((q, s))
     }
 
+    /// A block-FP8 matrix's E4M3 bytes of rows `rows` as stored ([rows][in]), and each row's scales: the scale of its
+    /// 128-row block for every 128-input block ([rows][in / 128], f32). Weight (i, j) = e4m3(byte) x scale[i][j / 128],
+    /// which is what decode() returns for it.
+    pub fn fp8_rows(&self, rows: &Range<usize>) -> Result<(Vec<u8>, Vec<f32>), String> {
+        let r = self.rec;
+        if r.fmt != FP8_BLOCK {
+            return Err(format!("{}: {} is not block FP8", self.f.path, self.name));
+        }
+        if rows.end > r.out || rows.is_empty() {
+            return Err(format!("{}: {} rows {rows:?} are outside {}", self.f.path, self.name, r.out));
+        }
+        let (bo, bi) = (r.out.div_ceil(128), r.inp.div_ceil(128));
+        self.check_shape("fp8", &[r.out, r.inp])?;
+        self.check_shape("scale", &[bo, bi])?;
+        let w = self.rows_of("fp8", rows, r.inp, 1)?;
+        let s = f32s(&self.f.read_all(&self.t("scale"))?);
+        let mut rs = Vec::with_capacity(rows.len() * bi);
+        for i in rows.clone() {
+            rs.extend_from_slice(&s[i / 128 * bi..][..bi]);
+        }
+        Ok((w, rs))
+    }
+
     /// MXFP8 codes and E8M0 scales of rows `rows`, as stored ([rows][in], [rows][in / 32]).
     pub fn mxfp8(&self, rows: &Range<usize>) -> Result<(Vec<u8>, Vec<u8>), String> {
         let r = self.rec;
