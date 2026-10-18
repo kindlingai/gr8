@@ -38,10 +38,24 @@ pool_cap() {
   share_cap "$p"
 }
 
+# tp4_default KNOB VALUE: KNOB=VALUE unless KNOB is set or G6ENV_X already carries G6_KNOB
+tp4_default() {
+  [ -n "${!1:-}" ] && return 0
+  case " ${G6ENV_X:-} " in *" G6_$1="*) return 0 ;; esac
+  printf -v "$1" %s "$2"
+}
+
 engine_defaults() {
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
-       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
+       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
+       # the decode options measured at TP=4 (#85 draft head, #86 shared-expert overlap, #87 attention set, the decode
+       # buckets and indexer, S2 scheduling, prefill selx); 0 turns one off, and a G6_ name in G6ENV_X keeps its own value
+       tp4_default ROUTE_OVL 1; [ "$MTP" = 0 ] || tp4_default DRAFT_HEAD_I4 1
+       tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
+       tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
+       tp4_default IDX_VEC 1; tp4_default DEC_BK 512; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
+       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248 ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
          if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
@@ -86,13 +100,13 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${QA_SPLIT:+ G6_QA_SPLIT=$QA_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${IDXQ_SPLIT:+ G6_IDXQ_SPLIT=$IDXQ_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${MTP_SPLIT:+ G6_MTP_SPLIT=$MTP_SPLIT}"
-  # draft weights on INT4 g32 copies (DRAFT_HEAD_I4, DFL_HEAD_I4, DFL_BODY_I4; docs/SETTINGS.md): off unless set
+  # draft weights on INT4 g32 copies (DRAFT_HEAD_I4, DFL_HEAD_I4, DFL_BODY_I4; docs/SETTINGS.md): off unless set; DRAFT_HEAD_I4 on at TP=4
   ENGINE_ENV="$ENGINE_ENV${DRAFT_HEAD_I4:+ G6_DRAFT_HEAD_I4=$DRAFT_HEAD_I4}"
   ENGINE_ENV="$ENGINE_ENV${DFL_HEAD_I4:+ G6_DFL_HEAD_I4=$DFL_HEAD_I4}"
   ENGINE_ENV="$ENGINE_ENV${DFL_BODY_I4:+ G6_DFL_BODY_I4=$DFL_BODY_I4}"
-  # the trellis shared expert on a forked stream during the router (ROUTE_OVL; docs/SETTINGS.md): off unless set
+  # the trellis shared expert on a forked stream during the router (ROUTE_OVL; docs/SETTINGS.md): off unless set; on at TP=4
   ENGINE_ENV="$ENGINE_ENV${ROUTE_OVL:+ G6_ROUTE_OVL=$ROUTE_OVL}"
-  # exact decode attention kernel variants (ATTN_SC2 .. ATTN_FRONT; docs/SETTINGS.md): off unless set
+  # exact decode attention kernel variants (ATTN_SC2 .. ATTN_FRONT; docs/SETTINGS.md): off unless set; the measured set at TP=4
   ENGINE_ENV="$ENGINE_ENV${ATTN_SC2:+ G6_ATTN_SC2=$ATTN_SC2}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_SC2_TR:+ G6_ATTN_SC2_TR=$ATTN_SC2_TR}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX2:+ G6_ATTN_CTX2=$ATTN_CTX2}"
@@ -101,6 +115,15 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ G6_IDX_GRP=$IDX_GRP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ G6_ATTN_QT=$ATTN_QT}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ G6_ATTN_FRONT=$ATTN_FRONT}"
+  # the decode indexer's vector loads, the decode context buckets, the S2 MTP draft count from accept rates, S2 prefill
+  # quanta and decode rounds while sessions decode, burst admissions, and prefill selx past PF_SELX_CTX (docs/SETTINGS.md):
+  # off unless set; on at TP=4. DEC_BK 0 and PF_SELX_CTX 0 = the engine default (2048; SEL32)
+  ENGINE_ENV="$ENGINE_ENV${IDX_VEC:+ G6_IDX_VEC=$IDX_VEC}"
+  [ "${DEC_BK:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV G6_DEC_BK=$DEC_BK"
+  ENGINE_ENV="$ENGINE_ENV${S2_ADAPT:+ G6_S2_ADAPT=$S2_ADAPT}"
+  ENGINE_ENV="$ENGINE_ENV${S2_DECODE_PF:+ G6_S2_DECODE_PF=$S2_DECODE_PF}"
+  ENGINE_ENV="$ENGINE_ENV${S2_ADMIT_HOLD:+ G6_S2_ADMIT_HOLD=$S2_ADMIT_HOLD}"
+  [ "${PF_SELX_CTX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV G6_PF_SELX_CTX=$PF_SELX_CTX"
   return 0
 }
 
