@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-18: SHARE_LIMIT default 32768 at TP=4
+
+- The TP=4 serving default `SHARE_LIMIT` is now 32,768 (was 65,536). Each session replicates its first 32,768 tokens on
+  every rank instead of 65,536, so two or three long (32K+) chats stay resident and decode together instead of the second
+  waiting for the first to finish (CP batch views, landed in #94). The longest context rises to 408,832 tokens (was
+  310,528) at the same per-rank KV memory. Trade: decode from 32K to 64K of context is context-parallel now, a few percent
+  slower per step for a single such session; short-context decode and prefill (the RigMark/pbench headline numbers) are
+  unchanged. `--share-limit 65536` restores the old behaviour. TP=3 and TP=6 defaults are unchanged.
 ## 2026-10-17: a fabric pool at boot and TP groups at runtime (EL6), Fabric::close
 
 - `engine/comms/fabric_pool.h` (`FabricPool`): every box that may join a layout opens one control link to the pool head at
