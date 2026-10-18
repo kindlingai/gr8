@@ -344,9 +344,9 @@ def validate(o):
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')
     share = o.get('SHARE_LIMIT')
-    if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) & (int(share) - 1) == 0):
-        # the engine needs the limit to be one of its decode buckets (2048 doubling)
-        raise OptionError(f'--share-limit {share}: want a power of two from 4096')
+    if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) % 64 == 0):
+        # the engine takes any multiple of a KV page (64 tokens) and makes it a decode bucket boundary (context_buckets.h)
+        raise OptionError(f'--share-limit {share}: want a multiple of 64 from 4096')
     if o.get('V2') and not o.get('V2_SLICES'):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):

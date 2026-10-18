@@ -65,6 +65,14 @@
 - With the block-8 DFlash2 drafter nothing changes: the captured widths, the row bound and the histogram are those of
   before. A drafter with a wider block (a block-12 one was served with these fixes) boots and serves; serving one also
   needs drafter-side changes that are not part of this.
+## 2026-10-18: --share-limit takes any multiple of 64 from 4096
+
+- The launcher refused a `SHARE_LIMIT` that is not a power of two. The engine does not need one: `context_buckets`
+  makes any `G6_CP_R` that is a multiple of a KV page a decode bucket boundary, so a graph never mixes the replicated and
+  CP paths. The rule is now a whole multiple of 64 from 4096; every limit the old rule took gives the same engine line.
+- A limit off the doubling trades longest context for decode speed between the two limits: at TP=4, 98304 gives CAP
+  212,224 (at the default 1,981 pages a rank), and on four GB10 it decoded +8.3 .. +13.6 % faster than 65536 at 70K-90K
+  token prompts (those sessions keep their KV replicated and skip the CP attention path); short prompts level.
 
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
