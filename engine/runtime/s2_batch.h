@@ -342,7 +342,7 @@ struct KStopB
 {
     int mode = 0;
     int kmin = 0;
-    double tau[S2N_SLOTS + 1][4] = {};    // [S][j]
+    double tau[S2N_SLOTS + 1][8] = {};    // [S][j]; j past the configured entries is 0 (the remaining drafts all verify)
     std::vector<int> widths;          // main widths captured besides the multiples of K + 1; empty: every width
     int explore = 0;
     // whether a shared round of S sessions may launch a main step of M rows (K: the MTP drafts)
@@ -368,7 +368,7 @@ inline std::string kstopb_sig(const KStopB& b)
     std::string s = " kstopb " + std::to_string(b.mode) + " kmin " + std::to_string(b.kmin) + " tau";
     char t[32];
     for (int S = 1; S <= S2N_SLOTS; ++S)
-        for (int j = 1; j <= 3; ++j) { snprintf(t, sizeof t, "%s%.17g", S == 1 && j == 1 ? " " : j == 1 ? "/" : ",", b.tau[S][j]); s += t; }
+        for (int j = 1; j <= 7; ++j) { snprintf(t, sizeof t, "%s%.17g", S == 1 && j == 1 ? " " : j == 1 ? "/" : ",", b.tau[S][j]); s += t; }
     s += " widths";
     for (size_t i = 0; i < b.widths.size(); ++i) s += (i ? "," : " ") + std::to_string(b.widths[i]);
     return s + " explore " + std::to_string(b.explore);
