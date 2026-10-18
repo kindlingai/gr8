@@ -263,6 +263,21 @@ class CanonicalTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError):
             self.digest('--v2-dense-form', 'exact')
 
+    def test_kvb_fp8_needs_a_release(self):
+        rel = ['--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel']
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel + ['--kvb', 'fp8'], {})
+        opt.validate(o)
+        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
+        self.assertIn('G6_KVB=fp8', p['env'])
+        self.assertNotEqual(self.digest(*rel)[2], self.digest(*rel, '--kvb', 'fp8')[2])   # a cluster option
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel, {})
+        opt.validate(o)
+        self.assertNotIn('G6_KVB', opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['env'])
+        with self.assertRaises(opt.OptionError):
+            self.digest('--kvb', 'fp8')                        # rank packs hold kv_b in BF16
+        with self.assertRaises(opt.OptionError):
+            self.digest(*rel, '--kvb', 'int4')
+
     def test_tp3_is_s2_without_drafter(self):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})
         opt.validate(o)

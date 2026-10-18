@@ -6,7 +6,7 @@
 //   2. Two bindings of one layer, BF16 and FP8, on the same KV rows and queries: decode (g6_attn_bind_run) under each
 //      absorb / value_project variant (absorb_m / value_project_m, G6_AVP1, G6_ATTN_QT) and prefill
 //      (g6_attn_bind_prefill_run) must give byte-identical outputs.
-//   3. --bench: absorb_m and value_project_m of one layer, BF16 against FP8, at M rows with a cold L2 (a 96 MB write
+//   3. --bench: absorb_m and value_project_m of one layer (their launchers: the BF16 or FP8 instantiation), BF16 against FP8, at M rows with a cold L2 (a 96 MB write
 //      between calls, as the experts' stream between two layers' attention when serving): us per call.
 //   kvb8_test [--bench] [--layer L] [--seed S]
 // Build and run: TEST=kvb8_test G6_NR=4 scripts/c1_tests.sh <bin_dir> [args]  (the K1H2 flags; attn.cu included, bind.cu)
@@ -214,8 +214,9 @@ int main(int argc, char** argv)
             {
                 G6Attn a = (k ? b8 : bb).args;
                 a.rows = M; a.q_b = dqb; a.positions = dpos; a.output = (k ? b8 : bb).args.output;
-                t[k][0] = timed([&] { ga::absorb_m<<<dim3(64, H), 256>>>(a, 0, M, q, rope); });
-                t[k][1] = timed([&] { ga::value_project_m<<<dim3(32, H), 256>>>(a, 0, M, ctx); });
+                ga::Work w{}; w.q = q; w.rope = rope; w.context = ctx;
+                t[k][0] = timed([&] { ga::launch_absorb_m(a, a, w, 0, M, nullptr); });
+                t[k][1] = timed([&] { ga::launch_value_project_m(a, a, w, 0, M, nullptr); });
                 CK(cudaGetLastError());
             }
             const float saved = t[0][0] + t[0][1] - t[1][0] - t[1][1];
