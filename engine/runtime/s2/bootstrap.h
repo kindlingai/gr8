@@ -101,6 +101,8 @@ struct BootstrapConfig {
             std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) +
             (scheduler.decode_prefill_rows ? " dpf " + std::to_string(scheduler.decode_prefill_rows) : std::string()) +
             (scheduler.decode_rounds > 1 ? " dr " + std::to_string(scheduler.decode_rounds) : std::string()) +
+            (scheduler.cp_step_rows ? " cpsr " + std::to_string(scheduler.cp_step_rows) + (scheduler.cp_seg ? " seg" : "") +
+                                      " after " + std::to_string(scheduler.cp_after) : std::string()) +
             " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
     }
 };
