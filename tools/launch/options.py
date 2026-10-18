@@ -357,8 +357,10 @@ def validate(o):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
     if o.get('KVB') not in (None, 'bf16', 'fp8'):
         raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
-    if o.get('KVB') == 'fp8' and not o.get('V2_DENSE'):
-        raise OptionError('--kvb fp8 needs a release boot (--v2-dense, or --model with a release): packs hold kv_b in BF16')
+    # a release boot sets V2_DENSE, or --model names a release (resolve_model sets V2_DENSE after this); the engine refuses
+    # KVB=fp8 on a pack boot at start
+    if o.get('KVB') == 'fp8' and not (o.get('V2_DENSE') or o.get('MODEL')):
+        raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')

@@ -274,7 +274,8 @@ class CanonicalTests(unittest.TestCase):
         opt.validate(o)
         self.assertNotIn('G6_KVB', opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['env'])
         with self.assertRaises(opt.OptionError):
-            self.digest('--kvb', 'fp8')                        # rank packs hold kv_b in BF16
+            self.digest('--kvb', 'fp8')                        # no model at all: rank packs hold kv_b in BF16
+        self.digest('--model', '/some/model', '--kvb', 'fp8')   # a --model may be a release (the engine checks)
         with self.assertRaises(opt.OptionError):
             self.digest(*rel, '--kvb', 'int4')
 

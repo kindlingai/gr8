@@ -448,11 +448,8 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     const unsigned pe = (unsigned)(e << 4) | (unsigned)x.peer;
     const unsigned long long tg = qw::tag(q.layer, x.S, x.E, x.ctx, q.form);
     const QpHalf& o = q.h[oh];
-    k_qp_wait<<<1, 32, 0, b>>>(x.bd, qw::f_consumed(e), x.peer, qw::consumed_min(n, x.E), qw::ERR_WAIT_CONSUMED | pe, 0ull, 0u);
-    G6RT_CK(cudaGetLastError());
-    char* tx = x.bd.bulk + qw::pos_off(e, oh);
     // G6_KVB=fp8: the wire carries BF16 UK / UV (qp_wire.h layout, both members alike), so my half's are expanded into my
-    // half of the slot first and sent from there
+    // half of the slot first (it needs only the slot's `used` events, waited by qp_roll_build) and sent from there
     const void *wuk = o.uk.p, *wuv = o.uv.p;
     if (o.uks)
     {
@@ -460,6 +457,9 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
         kvb_put(const_cast<void*>(wuk), o.uk.p, o.uks, (size_t)16 * 192, b);
         kvb_put(const_cast<void*>(wuv), o.uv.p, o.uvs, (size_t)16 * 256, b);
     }
+    k_qp_wait<<<1, 32, 0, b>>>(x.bd, qw::f_consumed(e), x.peer, qw::consumed_min(n, x.E), qw::ERR_WAIT_CONSUMED | pe, 0ull, 0u);
+    G6RT_CK(cudaGetLastError());
+    char* tx = x.bd.bulk + qw::pos_off(e, oh);
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QC, o.qc.p, qw::QC, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QS, o.qs.p, qw::QS, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OC, o.oc.p, q.form & 2 ? qw::OT : qw::OC, cudaMemcpyDefault, b));
