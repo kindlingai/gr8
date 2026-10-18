@@ -99,6 +99,12 @@ nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o
 # TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
   "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" -lcublas
+# G6_L2PF (paced side-stream L2 prefetch in the step's idle-DRAM windows): byte-exact check + per-layer timing of the
+# decode layer sequence (real attention, x_in / q_b / o_proj / router GEMVs, wait and MoE stand-ins); build only (needs
+# an idle GPU and ~3-5 GB): $OUT/l2pf_bench (file header)
+nvcc -O3 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
+  -I "$REPO/engine/kernels" -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
+  "$REPO/engine/attn/bind.cu" -lcublas
 if nvidia-smi -L > /dev/null 2>&1; then
   t=$("$OUT/tr3_e4m3_test") || { echo "$t"; echo "tr3_e4m3_test FAILED"; exit 1; }
   echo "tr3_e4m3_test: $(echo "$t" | tail -1)"

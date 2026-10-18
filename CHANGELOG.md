@@ -141,6 +141,22 @@
   `--tab` checks a `G6_K1_SPLIT` table against the default byte for byte, `--arms tlbw` times the prefetch.
 - Measured on four GB10 at TP=4 (with the `home` widths, `K1_SPLIT=1:/4,3:2x1,4-32:/4 K1_TLBW=2048`): T=0 top-20
   log-probabilities identical on 75 prompts; decode +2.0 % prose, +1.7 % code, +1.5 % structured at c1.
+## 2026-10-18: decode: a paced L2 prefetch of the next weights in the step's idle-DRAM windows (G6_L2PF, off by default)
+
+- A decode step leaves DRAM idle in its collective waits (the two all-reduces per layer, the `G6_QA_SPLIT` /
+  `G6_IDXQ_SPLIT` gathers) and through most of the latency-bound attention, while the GEMVs around them start cold.
+  `G6_L2PF` (launch knob `L2PF`, a window mask) has one warp on a high-priority side stream prefetch the layer's next
+  weights into L2 in those windows: 8 KiB `cp.async.bulk.prefetch.L2` chunks from a token bucket (`G6_L2PF_GBPS`, 175
+  GB/s, in waves of `G6_L2PF_WAVE`), not a burst, so dependent loads of the attention are left alone; a second warp
+  polls the collective's tails and ends the window once every peer has arrived.
+- One queue per layer in read order (x_in, idx_q, q_b, UK, UV, o_proj up to `G6_L2PF_OPMB`, router, shared fc1);
+  windows: 1 = the MLP all-reduce wait, 2 = the gather waits, 4 = the attention, 8 = the attention all-reduce wait. The
+  side stream is forked per window and joined at the end of the step part, so captured graphs hold the forks as edges.
+  Unset: no stream, no launch, the graphs are unchanged.
+- A prefetch writes nothing: same bytes out. `engine/kernels/tests/l2pf_bench.cu` (built by `scripts/build.sh`, run by
+  hand) byte-compares the decode layer sequence's outputs per arm and times it per layer.
+- Measured on four GB10 at TP=4 (`L2PF=15`): T=0 top-20 log-probabilities identical on 75 prompts; decode c1 +2.7 %
+  prose, +2.3 % code, +2.7 % structured; `l2pf_bench` -10.1 us a layer at 3 rows, -38.6 us at 12.
 
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
