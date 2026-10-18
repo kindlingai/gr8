@@ -101,6 +101,9 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ G6_IDX_GRP=$IDX_GRP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ G6_ATTN_QT=$ATTN_QT}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ G6_ATTN_FRONT=$ATTN_FRONT}"
+  # the paced L2 prefetch in the decode step's idle-DRAM windows (L2PF; docs/SETTINGS.md): off unless set. Its
+  # tuning variables G6_L2PF_T, _GBPS, _WAVE, _US, _MB and _OPMB stay engine environment (G6ENV_X)
+  ENGINE_ENV="$ENGINE_ENV${L2PF:+ G6_L2PF=$L2PF}"
   return 0
 }
 

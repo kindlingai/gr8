@@ -568,6 +568,7 @@ int main(int argc, char** argv)
     auto cp_error = [&]() -> unsigned { return qs_err(); };   // the G6_QA_SPLIT proxy
 #endif
     G6RT_CK(bind::init());
+    G6RT_CK(l2pf::init_env());     // G6_L2PF (kernels/l2pf.cuh); unset = off
     pf_prof().on = getenv("G6_PF_PROF") != nullptr;
     if (getenv("G6_DEC_PROF") && graph) die("G6_DEC_PROF needs plain launches (no --graph)");
     cudaStream_t st;
