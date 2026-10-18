@@ -274,7 +274,7 @@ class CanonicalTests(unittest.TestCase):
     def test_tp4_serve_options_default_on_and_override(self):
         on = ['G6_ROUTE_OVL=1', 'G6_DRAFT_HEAD_I4=1', 'G6_ATTN_SC2=4', 'G6_ATTN_SC2_TR=2', 'G6_ATTN_CTX2=4', 'G6_ATTN_CTX3=2',
               'G6_ATTN_SEL2=16', 'G6_IDX_GRP=16', 'G6_ATTN_QT=1', 'G6_ATTN_FRONT=1', 'G6_IDX_VEC=1', 'G6_DEC_BK=512',
-              'G6_S2_ADAPT=1', 'G6_S2_DECODE_PF=4096', 'G6_S2_ADMIT_HOLD=1', 'G6_S2_DECODE_ROUNDS=16', 'G6_PF_SELX_CTX=53248']
+              'G6_S2_ADAPT=1', 'G6_S2_DECODE_PF=4096', 'G6_S2_ADMIT_HOLD=1', 'G6_PF_SELX_CTX=53248']
         def env(peers, *argv):
             o = opt.parse(['--no-config', '--peers', peers, *argv], {})
             opt.validate(o)

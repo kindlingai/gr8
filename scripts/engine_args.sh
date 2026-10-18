@@ -55,7 +55,7 @@ engine_defaults() {
        tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
        tp4_default IDX_VEC 1; tp4_default DEC_BK 512; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
-       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default S2_DECODE_ROUNDS 16; tp4_default PF_SELX_CTX 53248 ;;
+       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248 ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
          if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
@@ -123,7 +123,6 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${S2_ADAPT:+ G6_S2_ADAPT=$S2_ADAPT}"
   ENGINE_ENV="$ENGINE_ENV${S2_DECODE_PF:+ G6_S2_DECODE_PF=$S2_DECODE_PF}"
   ENGINE_ENV="$ENGINE_ENV${S2_ADMIT_HOLD:+ G6_S2_ADMIT_HOLD=$S2_ADMIT_HOLD}"
-  ENGINE_ENV="$ENGINE_ENV${S2_DECODE_ROUNDS:+ G6_S2_DECODE_ROUNDS=$S2_DECODE_ROUNDS}"
   [ "${PF_SELX_CTX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV G6_PF_SELX_CTX=$PF_SELX_CTX"
   return 0
 }

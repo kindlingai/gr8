@@ -6,8 +6,8 @@
   (`ATTN_SC2=4 ATTN_SC2_TR=2 ATTN_CTX2=4 ATTN_CTX3=2 ATTN_SEL2=16 IDX_GRP=16 ATTN_QT=1 ATTN_FRONT=1`). TP=3 and TP=6 are
   unchanged, and any knob still overrides to 0. Measured on four GB10 at TP=4 (2000 MHz cap, MTP only) against a config
   without them: prose decode +6.4%, code c1 +7.2%, c4 +6.2%, prefill flat, temp-0 output byte-identical.
-- Also at TP=4: `IDX_VEC=1`, `DEC_BK=512`, `S2_ADAPT=1` (with `MTP` 1+), `S2_DECODE_PF=4096`, `S2_ADMIT_HOLD=1`,
-  `S2_DECODE_ROUNDS=16` and `PF_SELX_CTX=53248`, now launch knobs (each was engine environment only). `DEC_BK 0` and
+- Also at TP=4: `IDX_VEC=1`, `DEC_BK=512`, `S2_ADAPT=1` (with `MTP` 1+), `S2_DECODE_PF=4096`, `S2_ADMIT_HOLD=1`
+  and `PF_SELX_CTX=53248`, now launch knobs (each was engine environment only). `DEC_BK 0` and
   `PF_SELX_CTX 0` leave the engine default. A `G6_` name given in `G6ENV_X` keeps its value over any of these defaults.
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 

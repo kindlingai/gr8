@@ -114,7 +114,6 @@ KEYS = {
     'S2_ADAPT': ('cluster', None, 'S2 MTP draft count from accept rates and step costs (G6_S2_ADAPT)'),
     'S2_DECODE_PF': ('cluster', None, 'S2 prefill quantum rows while sessions decode (G6_S2_DECODE_PF)'),
     'S2_ADMIT_HOLD': ('cluster', None, 'S2 burst admissions at one boundary (G6_S2_ADMIT_HOLD)'),
-    'S2_DECODE_ROUNDS': ('cluster', None, 'S2 decode rounds per prefill quantum (G6_S2_DECODE_ROUNDS)'),
     'PF_SELX_CTX': ('cluster', None, 'prefill selx at context >= this; 0 = SEL32 (G6_PF_SELX_CTX)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
