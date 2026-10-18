@@ -617,16 +617,19 @@ inline int s2_step_rows(const S2Model& s) { return s.h.ns <= 0 ? 0 : s.h.row0[s.
 // the step runs the CP block (launch_attn_cp on the CP batch views): CP batch views, CP on, and the step's bucket past R.
 // The fabric side enqueues the CP collectives when the step's largest context is past R (g6m4 cp_enqueue); R is a
 // bucket boundary (context_buckets.h), so the two agree. Rows below R in such a step take the CP numerics (LSE merge).
-inline bool s2_cp_step(const Model& m)
+// s2_cp_bucket: the same for a step whose bucket is bk (NativeDispatch::capture_all skips the widths past
+// G6_CP_STEP_ROWS where it holds)
+inline bool s2_cp_bucket(const Model& m, int bk)
 {
 #if defined(G6_CP) && G6_CP
     const S2Model& s = *m.s2;
-    return s.batch && !s.cbv.empty() && m.cp.on && m.bk[s2_bucket(s)] > m.cp.R;
+    return s.batch && !s.cbv.empty() && m.cp.on && m.bk[bk] > m.cp.R;
 #else
-    (void)m;
+    (void)m; (void)bk;
     return false;
 #endif
 }
+inline bool s2_cp_step(const Model& m) { return s2_cp_bucket(m, s2_bucket(*m.s2)); }
 // the CP batch view's replay entry of layer i for the current step (s2_prepare made it)
 inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M)
 {
@@ -676,7 +679,8 @@ inline void s2_prepare(Model& m, int M, cudaStream_t st)
             const int bk = s2_bucket(s);
             const bool cp = s2_cp_step(m);
 #if defined(G6_CP) && G6_CP
-            if (cp && M > m.cp.colls.mmax) die("s2: a CP step of " + std::to_string(M) + " rows exceeds the CP fabric's mmax (G6_CP_MMAX)");
+            if (cp && M > m.cp.colls.mmax) die("s2: a CP step of " + std::to_string(M) + " rows exceeds the CP fabric's mmax " + std::to_string(m.cp.colls.mmax) +
+                                                     " (G6_CP_MMAX, G6_CP_STEP_ROWS)");
 #endif
             auto& map = cp ? s.cbrp : s.brp;
             const auto key = std::make_tuple(bk, i, M);

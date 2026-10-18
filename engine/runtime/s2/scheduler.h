@@ -55,6 +55,12 @@ struct Config {
     // While a prefill waits and sessions decode, this many decode rounds run per prefill quantum, so the decoders get
     // K rounds per quantum's wait instead of one (Scheduler::alternate). 0 or 1 = off: one round per quantum, as before.
     uint32_t decode_rounds = 0;         // after decode_prefill_rows, for the same reason
+    // G6_CP_STEP_ROWS (cp_rows.h): a step past R carries at most cp_step_rows rows (0 = off: every decoding session in
+    // every round, as before). cp_after: contexts above it run the CP block (cp_after()). cp_seg: G6_CP_STEP_SEG. Read by
+    // Driver::step only; the scheduler's quanta keep their kinds (a capped round is a Decode quantum with fewer sessions)
+    uint32_t cp_step_rows = 0;          // after decode_rounds, for the same reason
+    uint64_t cp_after = UINT64_MAX;
+    bool cp_seg = false;
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
@@ -65,6 +71,8 @@ struct Config {
         require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
                 "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");
         require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
+        require(!cp_step_rows || cp_step_rows >= mtp + 1, "cp_step_rows must be 0 or at least one session's verify (mtp + 1)");
+        require(!cp_seg || cp_step_rows, "cp_seg needs cp_step_rows");
         require(!steering.loaded || (g6rt::steering::valid_profile_name(steering.profile_name) && steering.active_layers &&
                 (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full)),
                 "invalid loaded steering receipt");
@@ -239,6 +247,7 @@ public:
         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
         add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
         if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
+        if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));

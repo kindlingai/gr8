@@ -62,6 +62,7 @@
 #include <set>
 #include "s2_batch.h"
 #include "s2/pool.h"
+#include "s2/cp_rows.h"
 #endif
 
 using namespace g6rt;
@@ -357,6 +358,9 @@ int main(int argc, char** argv)
         plans.push_back(p);
     }
     const int NL = (int)layers.size(), NC = 2 * NL + 1;
+    int cp_step = 0;                    // --s2: G6_CP_STEP_ROWS (s2/cp_rows.h), as g6m4; 0 = off
+    bool cp_seg = false;                //       G6_CP_STEP_SEG
+    (void)cp_step; (void)cp_seg;
 #if defined(G6_CP) && G6_CP
     // CP: G6_CP=0|1 (default 1 in a CP build), G6_CP_R (replicated prefix tokens, multiple of 64, default 0),
     // G6_CP_S3=0|1 (default 1), G6_CP_MMAX (CP fabric rows, default = the most rows of any step)
@@ -365,6 +369,20 @@ int main(int argc, char** argv)
     const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
     int cp_mmax = mtp + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+#ifdef DEC_S2
+    // --s2 + G6_CP_STEP_ROWS=n: as g6m4, the rounds whose step runs past R take at most n rows (s2/cp_rows.h) and the CP
+    // loopback is sized for n. (An --s2 run's sessions stay below G6_S2_BELOW <= R, so here the cap never engages.)
+    if (s2mode)
+    {
+        std::string ce;
+        cp_step = g6s2::cp_step_rows_env(getenv("G6_CP_STEP_ROWS"), cp_mmax, std::min(MX, std::max((int)plans.size() * (mtp + 1), plan.chunk)), &ce);
+        const int seg = env_choice("G6_CP_STEP_SEG", 1, 0, &ce);
+        if (cp_step < 0 || seg < 0) die(ce);
+        if (seg && !cp_step) die("G6_CP_STEP_SEG=1 needs G6_CP_STEP_ROWS");
+        cp_seg = seg == 1;
+        cp_mmax = std::max(cp_mmax, cp_step);
+    }
+#endif
     if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
     if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
     g6::CpColls cp_colls;
@@ -1441,6 +1459,14 @@ int main(int argc, char** argv)
         }
         std::vector<s2::Stats> sst(NSS);
         std::vector<std::vector<int>> gen(NSS);
+        // G6_CP_STEP_ROWS: contexts past cp_after run the CP block (s2/cp_rows.h); the cycle of capped rounds
+#if defined(G6_CP) && G6_CP
+        const uint64_t cp_after = g6s2::cp_after(R[0].bk, R[0].nbk, R[0].cp.on ? R[0].cp.R : -1);
+#else
+        const uint64_t cp_after = UINT64_MAX;
+#endif
+        g6s2::CpRound cpr;
+        long cp_capped = 0;
         {
             s2::Batch b(mtp, MX, hk);
             std::vector<int> qs(NSS);
@@ -1466,11 +1492,28 @@ int main(int argc, char** argv)
                     if (order.empty()) die("G6_S2_GROW: every session sat the round out");
                 }
                 if (solo1 && solo < 0 && act.size() == 1) go_solo(act[0]);
+                if (cp_step)                // G6_CP_STEP_ROWS: the sessions this round takes, as g6m4's Driver::step
+                {
+                    std::vector<g6s2::CpCand> cand;
+                    std::vector<int> cq;
+                    for (int q : order)
+                        if (b.active(q)) { cand.push_back({(uint64_t)q, (uint64_t)b.length(q) + (uint64_t)mtp > cp_after}); cq.push_back(q); }
+                    if (!cand.empty())
+                    {
+                        const g6s2::CpPick pk = cpr.pick(cand, (uint32_t)cp_step, (uint32_t)mtp + 1, cp_seg);
+                        cpr.commit(pk, cand);
+                        order.clear();
+                        for (size_t i = 0; i < cq.size(); ++i) if (pk.in[i]) order.push_back(cq[i]);
+                        if (pk.capped) ++cp_capped;
+                    }
+                }
                 b.round(order);
                 for (int q = 0; gpool && q < NSS; ++q)
                     if (!gone[q] && !b.active(q)) { gpool->release(grun[q]); gone[q] = true; }
             }
             if (gpool) fprintf(stderr, "# s2 grow: %ld growths, %ld rounds sat out\n", grows, stalls);
+            if (cp_step) fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%d%s: %ld capped rounds (contexts past %llu)\n", cp_step, cp_seg ? " seg" : "",
+                                 cp_capped, (unsigned long long)cp_after);
             for (int q = 0; q < NSS; ++q) { gen[q] = b.result(q); sst[q] = b.stats(q); }
         }
         for (int q = 0; q < NSS; ++q)
