@@ -41,7 +41,11 @@ pool_cap() {
 engine_defaults() {
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
-       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
+       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
+       # the exact decode options measured at TP=4 (#85 draft head, #86 shared-expert overlap, #87 attention set); 0 turns one off
+       ROUTE_OVL=${ROUTE_OVL:-1}; [ "$MTP" = 0 ] || DRAFT_HEAD_I4=${DRAFT_HEAD_I4:-1}
+       ATTN_SC2=${ATTN_SC2:-4}; ATTN_SC2_TR=${ATTN_SC2_TR:-2}; ATTN_CTX2=${ATTN_CTX2:-4}; ATTN_CTX3=${ATTN_CTX3:-2}
+       ATTN_SEL2=${ATTN_SEL2:-16}; IDX_GRP=${IDX_GRP:-16}; ATTN_QT=${ATTN_QT:-1}; ATTN_FRONT=${ATTN_FRONT:-1} ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
          if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
@@ -86,13 +90,13 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${QA_SPLIT:+ G6_QA_SPLIT=$QA_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${IDXQ_SPLIT:+ G6_IDXQ_SPLIT=$IDXQ_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${MTP_SPLIT:+ G6_MTP_SPLIT=$MTP_SPLIT}"
-  # draft weights on INT4 g32 copies (DRAFT_HEAD_I4, DFL_HEAD_I4, DFL_BODY_I4; docs/SETTINGS.md): off unless set
+  # draft weights on INT4 g32 copies (DRAFT_HEAD_I4, DFL_HEAD_I4, DFL_BODY_I4; docs/SETTINGS.md): off unless set; DRAFT_HEAD_I4 on at TP=4
   ENGINE_ENV="$ENGINE_ENV${DRAFT_HEAD_I4:+ G6_DRAFT_HEAD_I4=$DRAFT_HEAD_I4}"
   ENGINE_ENV="$ENGINE_ENV${DFL_HEAD_I4:+ G6_DFL_HEAD_I4=$DFL_HEAD_I4}"
   ENGINE_ENV="$ENGINE_ENV${DFL_BODY_I4:+ G6_DFL_BODY_I4=$DFL_BODY_I4}"
-  # the trellis shared expert on a forked stream during the router (ROUTE_OVL; docs/SETTINGS.md): off unless set
+  # the trellis shared expert on a forked stream during the router (ROUTE_OVL; docs/SETTINGS.md): off unless set; on at TP=4
   ENGINE_ENV="$ENGINE_ENV${ROUTE_OVL:+ G6_ROUTE_OVL=$ROUTE_OVL}"
-  # exact decode attention kernel variants (ATTN_SC2 .. ATTN_FRONT; docs/SETTINGS.md): off unless set
+  # exact decode attention kernel variants (ATTN_SC2 .. ATTN_FRONT; docs/SETTINGS.md): off unless set; the measured set at TP=4
   ENGINE_ENV="$ENGINE_ENV${ATTN_SC2:+ G6_ATTN_SC2=$ATTN_SC2}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_SC2_TR:+ G6_ATTN_SC2_TR=$ATTN_SC2_TR}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX2:+ G6_ATTN_CTX2=$ATTN_CTX2}"
