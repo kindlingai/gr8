@@ -53,11 +53,11 @@ wait
 PY=${PY:-$G6_HOME/venv/bin/python}
 mkdir -p "$G6_HOME/run" "$G6_HOME/out"; SOCK=$G6_HOME/run/engine.sock; rm -f "$SOCK"
 # At TP=6 the shim and front end stay off the engine's proxy cores (PROXY_CPU-7..PROXY_CPU, one per fabric)
-PIN=""; SHIM_ARGS=""
+PIN=""; SHIM_ARGS="--sessions ${SESS:-8}"
 if [ "$TP" = 6 ]; then
   [ "$PROXY_CPU" -ge 8 ] || { echo "PROXY_CPU=$PROXY_CPU < 8: no room for the shim/front band below the proxy cores"; exit 2; }
   command -v taskset > /dev/null && PIN="taskset -c 0-$((PROXY_CPU - 8))"
-  SHIM_ARGS="--stall-timeout ${STALL_TMO:-2400}"
+  SHIM_ARGS="$SHIM_ARGS --stall-timeout ${STALL_TMO:-2400}"
 fi
 FRONT_RS="${FRONT_BIN:-$REPO/bin/g6front-rs}"
 [ -x "$FRONT_RS" ] || { echo "$FRONT_RS missing (scripts/build_front.sh)"; exit 1; }

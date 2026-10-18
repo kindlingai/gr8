@@ -167,7 +167,17 @@ All values are monotonically increasing counters since engine start, except `req
   `accepted_per_pos[i]`: rounds whose draft token at position i (0-based) was accepted. The array length is the
   max draft depth (k); positions the engine never drafts are 0.
 - `prefix_cache.queries` / `hits` count **tokens** (prompt tokens looked up / found), like vLLM.
-- `tokens.prompt` counts prompt tokens computed (not cached); `tokens.generation` counts generated tokens.
+- `tokens.generation` counts generated tokens. When `tokens.cached` is present, `tokens.prompt` must count the whole
+  prompt, including cached tokens, so the front end can derive computed tokens as `prompt - cached`. Without
+  `tokens.cached`, the front end does not infer a computed/cached split.
+- Optional fields. The front end exports a series only when the field behind it is present and numeric, and leaves it
+  out otherwise: an engine that does not measure something must not send a 0 for it.
+  `prefix_cache` and `tokens.cached` are measured counters. `kv`: `size_tokens` (the KV pool, in tokens) and
+  `active_tokens` (the tokens the running requests hold), gauges; `max_concurrency` (requests decoding at once).
+  `latency`, counters over finished requests, in seconds or tokens: `ttft_sum` / `ttft_count` (arrival to the first
+  token), `itl_sum` / `itl_count` (the time between a request's token lines after its first, and the tokens after its
+  first), `prefill_sum` (admission to the first token), `decode_sum` (first token to the end), `prefill_tokens_sum`
+  (prompt tokens computed), `gen_tokens_sum` / `gen_tokens_count` (tokens generated, and requests that generated any).
 
 The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/README.md).
 

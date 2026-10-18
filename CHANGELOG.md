@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-17: the front end exports KV, TTFT and per-request prefill and decode timing
+
+- `/metrics` on the S2 serve had no `vllm:kv_*`, `request_*_time_seconds`, `time_to_first_token` or
+  `cache_config_info` series, so dashboards that read them showed no decode or prefill rate, KV use or slot count. The
+  shim now measures them from the requests' resp lines and `status.s2` (`kv`, `latency` in the `metrics` frame) and the
+  front end renders them (see `frontend/README.md`, Metrics mapping).
+- A series is rendered only when the engine sent its field. The S2 admission line now includes the reused prompt-row
+  count. The shim uses that count for measured prefix-cache hits and computed prefill tokens, instead of reporting a
+  false zero or counting reused rows as compute.
+- `g6s2shim.py --sessions N` (the launcher passes `SESS`) is the `kv_cache_max_concurrency` the shim reports.
+
 ## 2026-10-17: the decode-perf flags default on in the serving config
 
 - `G6_DRAFT_PAR`, `G6_QA_SPLIT` / `G6_IDXQ_SPLIT` / `G6_MTP_SPLIT`, and `G6_MTP_KSTOP` now default on where their
