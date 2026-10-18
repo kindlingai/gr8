@@ -80,6 +80,13 @@ manifest instead.
 | `IDX_GRP` | 16 | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
 | `ATTN_QT` | 1 | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
 | `ATTN_FRONT` | 1 | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+| `IDX_VEC` | 1 | unset (0) | unset (0) | 1 = the decode indexer's vector loads (`G6_IDX_VEC`) |
+| `DEC_BK` | 512 | unset (2048) | unset (2048) | decode context bucket in tokens: the step graphs are captured per bucket (`G6_DEC_BK`; 0 = the engine default 2048) |
+| `S2_ADAPT` | 1 (with `MTP` 1+) | unset (0) | unset (0) | S2: each round's MTP draft count from the sessions' accept rates and step costs (`G6_S2_ADAPT`; drafts only; about 1 GiB more step graphs) |
+| `S2_DECODE_PF` | 4096 | unset (0) | unset (0) | S2: while a session decodes, a prefill quantum takes at most this many rows on one lane (`G6_S2_DECODE_PF`; a multiple of 64, at most `--prefill`) |
+| `S2_ADMIT_HOLD` | 1 | unset (0) | unset (0) | S2: a burst of queued requests is admitted at one boundary instead of one per notice (`G6_S2_ADMIT_HOLD`) |
+| `S2_DECODE_ROUNDS` | 16 | unset (0) | unset (0) | S2: while a prefill waits and sessions decode, this many decode rounds per prefill quantum (`G6_S2_DECODE_ROUNDS`; 0..64) |
+| `PF_SELX_CTX` | 53248 | unset (0) | unset (0) | prefill index tiles at context >= this select with selx instead of SEL32, same ids in the same order (`G6_PF_SELX_CTX`; 0 = SEL32) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
