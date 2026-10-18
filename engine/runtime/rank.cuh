@@ -237,6 +237,14 @@ struct CpState
     unsigned* tickets = nullptr;      // [colls.ncoll()] publish tickets, device, zero
     uint64_t* cand = nullptr;         // [nr][MX][2048] candidate lists, own at [rank] (layout [s][M][2048] per step)
     float *qbuf = nullptr, *part_all = nullptr, *part_tmp = nullptr;   // [MX][HMAX][576], [nr][cp_blk(MX, HMAX)], [nr-1][same]
+    // G6_CP_B48=1 (default 0 = off): the nr-1 remote head groups of a layer in one launch set (g6_attn_cp_groups) when they
+    // all have the layer's head count and the dispatch allows it (g6_attn_cp_groups_ok); else the per-group loop. Same
+    // arithmetic per (row, head, slot), same partials on the wire. q gathered at qstage [nr-1][MX][HMAX][576], moved to q48
+    // [MX][(nr-1) HMAX][576] (q then rope), partials of all remote heads in part48, split into part_tmp blocks
+    bool b48 = false;
+    float *qstage = nullptr, *q48 = nullptr, *part48 = nullptr;
+    void* work48 = nullptr;
+    size_t work48_bytes = 0;
     // prefill staging (step 4, prefill.cuh cp_pf_*): two latent pools of one layer at capacity (each followed by one
     // layer's index pages at pf_ixoff), the identity table, and every layer's CP args while the prefill view is swapped in
     // (pf_staged); pf_ixon: this staged view stages the index keys (not an S2 run below R)
@@ -719,6 +727,18 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         m.cp.qbuf = dmalloc<float>((size_t)MX * H * 576);
         m.cp.part_all = dmalloc<float>((size_t)NR * cp_blk(MX, H));
         m.cp.part_tmp = dmalloc<float>((size_t)(NR - 1) * cp_blk(MX, H));
+        m.cp.b48 = getenv("G6_CP_B48") && atoi(getenv("G6_CP_B48")) == 1;
+        if (m.cp.b48)
+        {
+            const size_t nh = (size_t)MX * (NR - 1) * H;
+            m.cp.qstage = dmalloc<float>((size_t)(NR - 1) * MX * H * 576);
+            m.cp.q48 = dmalloc<float>(nh * 576);
+            m.cp.part48 = dmalloc<float>(nh * 514);
+            m.cp.work48_bytes = nh * 2048 * 4 + nh * 8 * 512 * 4 + 512;   // g6_attn_cp_groups_bytes at rows MX (prob, parts)
+            m.cp.work48 = dmalloc<char>(m.cp.work48_bytes);
+            fprintf(stderr, "# rank %d: G6_CP_B48: %d remote head groups in one launch set (%.1f MB)\n", rank, NR - 1,
+                    (nh * (576 + 514 + 2048 + 4096) * 4 + (size_t)(NR - 1) * MX * H * 576 * 4) / 1e6);
+        }
         fprintf(stderr, "# rank %d: G6_CP on, R %d, %s order, %d CP collectives (mmax %d)\n", rank, m.cp.R, m.cp.s3 ? "S3" : "S1",
                 m.cp.colls.ncoll(), m.cp.colls.mmax);
     }
@@ -1131,7 +1151,26 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         if (!C.s3 || cc >= 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
         const g6::VSlotDev& vq = C.vs[cq];
         cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
-        for (int k = 1; k < nr; ++k)
+        bool b48 = C.b48 && g6_attn_cp_groups_ok(a, nr - 1);
+        for (int k = 1; k < nr && b48; ++k) b48 = cp_heads((r + k) % nr, y.l) == H;
+        if (b48)   // G6_CP_B48: the nr-1 remote groups as one (nr-1) x H head set, then the same per-group partials and puts
+        {
+            const size_t qd = (size_t)M * H * 512 * 4, rd = (size_t)M * H * 64 * 4, qs = (size_t)M * H * 576;
+            for (int k = 1; k < nr; ++k)
+            {
+                const int d = (r + k) % nr, j = cpglue::vsrc_index(vq, d);
+                if (j < 0) die("G6_CP: q all-gather has no slot for rank " + std::to_string(d));
+                cpglue::k_vget<<<G, 256, 0, st>>>(vq, j, m.stepp, C.qstage + (k - 1) * qs, qd + rd);
+            }
+            float* rope48 = C.q48 + (size_t)M * (nr - 1) * H * 512;
+            G6RT_CK(g6_attn_cp_qcat(C.qstage, qs, nr - 1, M, H, C.q48, rope48, st));
+            G6RT_CK(g6_attn_cp_groups(a, cell, C.work48, C.work48_bytes, nr - 1, C.q48, rope48, C.part48, st));
+            G6RT_CK(g6_attn_cp_psplit(C.part48, nr - 1, M, H, C.part_tmp, tblk, st));
+            for (int k = 1; k < nr; ++k)
+                cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + (size_t)(k - 1) * tblk, (size_t)M * H * 514 * 4, nullptr, 0,
+                                                   C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+        }
+        for (int k = 1; k < nr && !b48; ++k)
         {
             const int d = (r + k) % nr, j = cpglue::vsrc_index(vq, d), hd = cp_heads(d, y.l);
             if (j < 0) die("G6_CP: q all-gather has no slot for rank " + std::to_string(d));
@@ -1143,7 +1182,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
             G6RT_CK(g6_attn_cp_group(&ad, cell, scr, sb, C.qbuf, C.qbuf + qd / 4, out, st));
             if (C.s3) cpglue::k_vput<<<G, 256, 0, st>>>(out, (size_t)M * hd * 514 * 4, nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
         }
-        if (!C.s3)
+        if (!C.s3 && !b48)
             for (int k = 1; k < nr; ++k)
                 cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + (size_t)(k - 1) * tblk, (size_t)M * cp_heads((r + k) % nr, y.l) * 514 * 4,
                                                    nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));

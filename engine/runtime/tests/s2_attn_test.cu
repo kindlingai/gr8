@@ -674,6 +674,13 @@ struct CpBuf
 {
     float *q[NRK] = {}, *rope[NRK] = {}, *part[NRK] = {};
     uint64_t* cand = nullptr;
+    // G6_CP_B48=1: each rank's NRK-1 remote groups once more in one launch set (g6_attn_cp_groups), split into b48 [s][NRK-1]
+    // blocks of cp_blk(MXR, HMAX) and compared byte for byte with the per-group partials (b48_bad counts mismatches)
+    bool b48 = false;
+    float *qstage = nullptr, *q48 = nullptr, *part48 = nullptr, *b48out = nullptr;
+    void* work48 = nullptr;
+    size_t work48_bytes = 0;
+    int b48_calls = 0, b48_bad = 0, b48_skip = 0;
 };
 static size_t cp_blk(int M, int H) { return ((size_t)M * H * 514 + 3) & ~(size_t)3; }
 
@@ -703,6 +710,32 @@ static void cp_layer(int l, G6Attn* const* a, const G6AttnStepCell* const* cell,
             CKI(g6_attn_cp_group(&ad, cell[s], scr[s], sb, bf.q[d], bf.rope[d], bf.part[d] + (size_t)s * blk, ST));
         }
     }
+    if (bf.b48)
+        for (int s = 0; s < NRK; ++s)
+        {
+            const int H = a[s]->heads, ng = NRK - 1;
+            bool same = g6_attn_cp_groups_ok(a[s], ng) != 0;
+            for (int k = 1; k < NRK; ++k) same = same && a[(s + k) % NRK]->heads == H;
+            if (!same) { bf.b48_skip++; continue; }
+            const size_t qs = (size_t)M * H * 576, tblk = cp_blk(MXR, g6nr::HMAX), blk = cp_blk(M, H);
+            for (int k = 1; k < NRK; ++k)   // the q all-gather payload of group d: q then rope
+            {
+                const int d = (s + k) % NRK;
+                CK(cudaMemcpyAsync(bf.qstage + (k - 1) * qs, bf.q[d], (size_t)M * H * 512 * 4, cudaMemcpyDeviceToDevice, ST));
+                CK(cudaMemcpyAsync(bf.qstage + (k - 1) * qs + (size_t)M * H * 512, bf.rope[d], (size_t)M * H * 64 * 4, cudaMemcpyDeviceToDevice, ST));
+            }
+            float* rope48 = bf.q48 + (size_t)M * ng * H * 512;
+            CKI(g6_attn_cp_qcat(bf.qstage, qs, ng, M, H, bf.q48, rope48, ST));
+            CKI(g6_attn_cp_groups(a[s], cell[s], bf.work48, bf.work48_bytes, ng, bf.q48, rope48, bf.part48, ST));
+            CKI(g6_attn_cp_psplit(bf.part48, ng, M, H, bf.b48out, tblk, ST));
+            CK(cudaStreamSynchronize(ST));
+            for (int k = 1; k < NRK; ++k)
+            {
+                const int d = (s + k) % NRK;
+                bf.b48_calls++;
+                if (!dev_eq(bf.b48out + (k - 1) * tblk, bf.part[d] + (size_t)s * blk, (size_t)M * H * 514 * 4)) bf.b48_bad++;
+            }
+        }
     for (int d = 0; d < NRK; ++d) CKI(g6_attn_cp_finish(a[d], cell[d], scr[d], sb, bf.part[d], ST));
 }
 
@@ -792,6 +825,17 @@ static void run_cp(const Case& c, uint64_t seed)
         bf.part[d] = A.alloc<float>((size_t)NRK * cp_blk(MXR, g6nr::HMAX));
     }
     bf.cand = A.alloc<uint64_t>((size_t)NRK * MXR * 2048);
+    bf.b48 = getenv("G6_CP_B48") && atoi(getenv("G6_CP_B48")) == 1;
+    if (bf.b48)
+    {
+        const size_t nh = (size_t)MXR * (NRK - 1) * g6nr::HMAX;
+        bf.qstage = A.alloc<float>(nh * 576);
+        bf.q48 = A.alloc<float>(nh * 576);
+        bf.part48 = A.alloc<float>(nh * 514);
+        bf.b48out = A.alloc<float>((size_t)(NRK - 1) * cp_blk(MXR, g6nr::HMAX));
+        bf.work48_bytes = nh * 2048 * 4 + nh * 8 * 512 * 4 + 512;
+        bf.work48 = A.alloc<char>(bf.work48_bytes);
+    }
 
     // reference: per session, plain form
     for (int s = 0; s < ns; ++s)
@@ -876,6 +920,11 @@ static void run_cp(const Case& c, uint64_t seed)
             k.need(dev_word(bw->b[r][l].args.error) == 0, "errB(r" + std::to_string(r) + ")");
             k.need(sane((const __half*)bw->b[r][l].args.output, (size_t)M * heads[r][l] * 256), "out-finite(r" + std::to_string(r) + ")");
         }
+    if (bf.b48)
+    {
+        k.need(bf.b48_bad == 0 && bf.b48_calls > 0, "b48(" + std::to_string(bf.b48_bad) + " of " + std::to_string(bf.b48_calls) + " partials differ)");
+        printf("  G6_CP_B48: %d remote-group partials compared byte for byte, %d differ, %d rank-layers fell back\n", bf.b48_calls, bf.b48_bad, bf.b48_skip);
+    }
     report(k.bad.empty(), "%s%s", nm, k.bad.c_str());
     for (auto& w : ref) w->release();
     bw->release();

@@ -59,6 +59,19 @@ extern "C" int g6_attn_cp_merge_index(const G6Attn*,const G6AttnStepCell* cell,c
 extern "C" int g6_attn_cp_group(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* stream);
 // LSE merge of part_all in shard order 0..cp_nr-1 -> context -> value_project -> a->output
 extern "C" int g6_attn_cp_finish(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* stream);
+// G6_CP_B48: ng head groups of a->heads heads each in one launch set (the TP4 remote groups: 3 x 16 = 48 heads).
+// q, rope fp32 [M][ng*H][512], [M][ng*H][64] (group g's heads at [g*H, g*H + H)) -> part c [M][ng*H][512], m, l [M][ng*H].
+// The kernels do the same per (row, head, slot) arithmetic for any head count; g6_attn_cp_groups_ok = 0 where the
+// dispatch would change with it (G6_ATTN_FLIP-eligible shapes, the heads % 16 kernels): then call g6_attn_cp_group per
+// group. work: the prob / parts buffers of ng*H heads (g6_attn_cp_groups_bytes, caller-owned, not the binding scratch).
+extern "C" int g6_attn_cp_groups_ok(const G6Attn*,int ng);
+extern "C" size_t g6_attn_cp_groups_bytes(const G6Attn*,int ng);
+extern "C" int g6_attn_cp_groups(const G6Attn*,const G6AttnStepCell* cell,void* work,size_t bytes,int ng,const float* q,const float* rope,float* part,void* stream);
+// layout moves for g6_attn_cp_groups (M rows, H heads per group): qcat: ng blocks at src + g * stride (floats), each
+// q [M][H][512] then rope [M][H][64] (a q all-gather payload) -> q [M][ng*H][512], rope [M][ng*H][64]. psplit: part of
+// ng*H heads -> ng blocks at dst + g * stride, each c [M][H][512], m [M][H], l [M][H] (one group's partial, as g6_attn_cp_group)
+extern "C" int g6_attn_cp_qcat(const float* src,size_t stride,int ng,int M,int H,float* q,float* rope,void* stream);
+extern "C" int g6_attn_cp_psplit(const float* part,int ng,int M,int H,float* dst,size_t stride,void* stream);
 // my absorbed query in the scratch workspace (valid after g6_attn_cp_front)
 extern "C" int g6_attn_cp_qabs(const G6Attn*,void* scratch,const float** q,const float** rope);
 #endif

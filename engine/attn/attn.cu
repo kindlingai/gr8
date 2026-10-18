@@ -918,6 +918,24 @@ static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const floa
     ga::value_project<<<dim3(32,a.heads,n),256,0,stream>>>(input,0,w.context);
     return cudaGetLastError();
 }
+// g6_attn_cp_groups: element moves only (no arithmetic). One thread per float of the destination.
+__global__ void cp_qcat(const float* src,size_t stride,int ng,int M,int H,float* q,float* rope){
+    const int64_t nq=(int64_t)M*ng*H*512,nr=(int64_t)M*ng*H*64;
+    for(int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;i<nq+nr;i+=(int64_t)gridDim.x*blockDim.x){
+        const bool isq=i<nq;const int D=isq?512:64;const int64_t e=isq?i:i-nq;
+        const int d=int(e%D);const int64_t rh=e/D;const int hh=int(rh%(ng*H)),row=int(rh/(ng*H)),g=hh/H,h=hh%H;
+        const float* b=src+(size_t)g*stride+(isq?0:(size_t)M*H*512);
+        (isq?q:rope)[e]=b[((int64_t)row*H+h)*D+d];}
+}
+__global__ void cp_psplit(const float* part,int ng,int M,int H,float* dst,size_t stride){
+    const int nh=M*ng*H;const int64_t n=(int64_t)nh*514;
+    for(int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(int64_t)gridDim.x*blockDim.x){
+        int64_t rh;int d,off;   // off: 0 = c, 1 = m, 2 = l
+        if(i<(int64_t)nh*512){rh=i/512;d=int(i%512);off=0;}else{rh=(i-(int64_t)nh*512)%nh;d=0;off=1+int((i-(int64_t)nh*512)/nh);}
+        const int hh=int(rh%(ng*H)),row=int(rh/(ng*H)),g=hh/H,h=hh%H;const int64_t gr=(int64_t)row*H+h,gn=(int64_t)M*H;
+        float* b=dst+(size_t)g*stride;
+        b[off==0?gr*512+d:gn*(511+off)+gr]=part[i];}
+}
 static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8&&a->cp_rank>=0&&a->cp_rank<a->cp_nr&&a->rows<=a->query_tile;}
 #endif
 }
@@ -1030,6 +1048,39 @@ extern "C" int g6_attn_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void
     if(!a||!a->uv||!a->output||!part_all)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_finish_body(*a,in,w,part_all,stream);});
+}
+// The head-count-dependent choices of launch_mla_scores / launch_context_parts: the flip / long fixed-K forms (heads <= 22)
+// and the heads % 16 kernels (scores_sc, scores_tr). Everything else picks by rows, context and env only.
+extern "C" int g6_attn_cp_groups_ok(const G6Attn* a,int ng){
+    if(!ga::cp_ok(a)||ng<1)return 0;
+    G6Attn b=*a;b.heads=ng*a->heads;
+    if(ga::attn_flip_eligible(*a,a->rows)||ga::attn_flip_eligible(b,b.rows))return 0;
+    return (a->heads%16==0)==(b.heads%16==0);
+}
+static ga::Work cp_groups_work(const G6Attn& a,int ng,void* base,size_t* total){
+    const size_t R=std::min(a.rows,a.query_tile),H=(size_t)ng*a.heads;size_t n=0;
+    auto alloc=[&](size_t bytes){size_t old=n;n=(n+bytes+255)&~size_t(255);return (void*)((uintptr_t)base+old);};
+    ga::Work w{};w.prob=(float*)alloc(R*H*ga::TOP*4);w.parts=(float*)alloc(R*H*ga::PART*512*4);*total=n;return w;
+}
+extern "C" size_t g6_attn_cp_groups_bytes(const G6Attn* a,int ng){
+    if(!ga::cp_ok(a)||ng<1)return 0;size_t t=0;cp_groups_work(*a,ng,nullptr,&t);return t;
+}
+extern "C" int g6_attn_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* work,size_t bytes,int ng,const float* q,const float* rope,float* part,void* s){
+    if(!a||!a->indices||!a->mla_cache||!a->block_table||!work||!q||!rope||!part||!g6_attn_cp_groups_ok(a,ng))return (int)cudaErrorInvalidValue;
+    size_t t=0;ga::Work w=cp_groups_work(*a,ng,work,&t);if(bytes<t)return (int)cudaErrorInvalidValue;
+    G6Attn b=*a;b.heads=ng*a->heads;cudaStream_t stream=(cudaStream_t)s;
+    if(cell)return (int)ga::cp_group_body(b,ga::ReplayInput{b,cell},w,q,rope,part,stream);
+    return (int)ga::cp_group_body(b,b,w,q,rope,part,stream);
+}
+extern "C" int g6_attn_cp_qcat(const float* src,size_t stride,int ng,int M,int H,float* q,float* rope,void* s){
+    if(!src||!q||!rope||ng<1||M<1||H<1)return (int)cudaErrorInvalidValue;
+    const int64_t n=(int64_t)M*ng*H*576;ga::cp_qcat<<<(int)std::min<int64_t>((n+255)/256,1024),256,0,(cudaStream_t)s>>>(src,stride,ng,M,H,q,rope);
+    return (int)cudaGetLastError();
+}
+extern "C" int g6_attn_cp_psplit(const float* part,int ng,int M,int H,float* dst,size_t stride,void* s){
+    if(!part||!dst||ng<1||M<1||H<1)return (int)cudaErrorInvalidValue;
+    const int64_t n=(int64_t)M*ng*H*514;ga::cp_psplit<<<(int)std::min<int64_t>((n+255)/256,1024),256,0,(cudaStream_t)s>>>(part,ng,M,H,dst,stride);
+    return (int)cudaGetLastError();
 }
 extern "C" int g6_attn_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
     if(!ga::cp_ok(a)||!scratch||!q||!rope)return (int)cudaErrorInvalidValue;
