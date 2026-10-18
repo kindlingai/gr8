@@ -24,6 +24,9 @@
 # RemainAfterExit, so the children of an up that exits keep running): the up command returns at once over any ssh,
 # Tailscale SSH included (window 2 v3: a backgrounded `setsid nohup ... &` held the session until the load ended).
 # <S>_UP_GUARD (each up box, before the up; exit 1 = do not start it, e.g. its up script already runs).
+# HOLD=1 (a standing serve): after a TP8 PASS the primary stops the dead-man timer (verified), writes RD/HOLDING and
+# leaves TP8 up with the serves down (RESULT "TP8 PASS; HOLDING (RD)"); `restore RD` on RECOVERY_HOST is the fallback.
+# Any other end, or a timer it cannot verify stopped, restores as without HOLD.
 # Optional report-only speed rows: BASE_SPEED_CMD on BASE_SPEED_HOST at the end of P0 (live serve), SPEED_CMD on the
 # TP8 head after a P6 PASS when at most SPEED_MAX_ELAPSED s have passed (bounded by SPEED_S, added to T_MAX).
 # A test cluster that is not the TP8 hybrid (e.g. a TP4 build of another revision): TP8_NBOX (box count, default 8),
@@ -270,9 +273,27 @@ cmd_restore() {
 RD_REMOTE() { rsh "$RECOVERY_HOST" 30 "$*"; }
 
 # the primary's one way out once P1 may have begun: start restore on the recovery host and wait for its end state
+# hold (HOLD=1, a standing serve): after a TP8 PASS keep TP8 up and the serves down. The dead-man timer is stopped and
+# verified gone first; when that fails, or a restore has already fenced the run, the normal restore runs instead.
+# The fallback to the serves is one command on RECOVERY_HOST: the restore of this run's recovery dir (printed below).
+hold() {
+  local st sv
+  say "hold: HOLD=1: stopping the dead-man timer tp8-restore-$RUN_ID.timer"
+  RD_REMOTE "timeout 30 systemctl stop tp8-restore-$RUN_ID.timer" >> "$LOG" 2>&1
+  st=$(RD_REMOTE "systemctl show -p ActiveState --value tp8-restore-$RUN_ID.timer")
+  sv=$(RD_REMOTE "systemctl show -p ActiveState --value tp8-restore-$RUN_ID.service")
+  [ "$st" = inactive ] && [ "$sv" = inactive ] || { say "hold: timer '$st', its service '$sv' (want inactive): restore instead"; return 1; }
+  fenced && { say "hold: a restore has fenced this run: restore instead"; return 1; }
+  RD_REMOTE "echo $RUN_ID > $RD/HOLDING" || { say "hold: cannot write $RD/HOLDING: restore instead"; return 1; }
+  say "HOLDING: TP8 stays up, the serves stay down, no timer. Fallback to the serves (on $RECOVERY_HOST):"
+  say "  $SYSTEMD_RUN --unit=tp8-restore-now-$RUN_ID /bin/bash $RD/tp8-window.sh restore $RD"
+  echo "TP8 PASS; HOLDING ($RD)" > "$LOCAL/RESULT"
+  exit 0
+}
 finish() {
   trap - EXIT INT TERM HUP
   local why=$1 end
+  [ "$why" = "TP8 PASS" ] && [ "${HOLD:-0}" = 1 ] && hold
   say "finish: $why; handing over to restore on $RECOVERY_HOST"
   RD_REMOTE "$SYSTEMD_RUN --unit=tp8-restore-now-$RUN_ID /bin/bash $RD/tp8-window.sh restore $RD" >> "$LOG" 2>&1 \
     || say "finish: could not start restore now (the timer still fires at T_MAX)"

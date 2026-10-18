@@ -30,7 +30,9 @@ EOF
   cat > "$M/bin/systemctl" <<'EOF'
 #!/bin/bash
 echo "systemctl $*" >> "$MOCK/calls"
-[ "$1" = show ] && echo active
+# a stop of the dead-man timer makes it (and its service) inactive, unless timer.stuck
+case "$1 ${2:-}" in "stop tp8-restore-"*.timer) [ -e "$MOCK/timer.stuck" ] || touch "$MOCK/timer.stopped" ;; esac
+[ "$1" = show ] && { case "$*" in *tp8-restore-*) [ -e "$MOCK/timer.stopped" ] && { echo inactive; exit 0; } ;; esac; echo active; }
 # steps.live: the P2b units (tp8-steps-*) run until a stop for that name (with steps.stuck: a stop does not end them)
 case "$1 ${2:-}" in
   "stop tp8-steps-"*) [ -e "$MOCK/steps.stuck" ] || touch "$MOCK/stopped.$2" ;;
@@ -234,6 +236,24 @@ setup; sed -i '/^TEST_STOP_CMD=/d;/^TEST_VERIFY_CMD=/d;/^ROUTES_CHECK=/d' "$T/wi
 bash "$W" cmds "$T/window.conf" > "$T/cmds" 2>&1
 grep -qP '^tp8-stop\t.*launch.py down --local' "$T/cmds" && grep -qP '^tp8-p0-verify\t.*launch.py verify-down' "$T/cmds" \
   && ok "defaults: launch.py stop + verify-down" || bad "defaults: launch.py stop + verify-down"
+
+# 9. HOLD=1 (standing serve): PASS keeps TP8 up, no restore; timer not verified stopped -> normal restore; restore RD later
+setup; echo HOLD=1 >> "$T/window.conf"; run
+[ "$(cat "$T/rc")" = 0 ] && grep -qx "TP8 PASS; HOLDING ($T/rec/$RID)" "$T/runs/$RID/RESULT" && [ -e "$T/rec/$RID/HOLDING" ] \
+  && ok "HOLD: TP8 PASS; HOLDING, RD/HOLDING written" || bad "HOLD: TP8 PASS; HOLDING [rc $(cat "$T/rc") $(cat "$T/runs/$RID/RESULT" 2>/dev/null)]"
+! grep -q 'restore-now' "$M/calls" && ! grep -q '^tstop' "$M/calls" && [ "$(grep -c '^aup' "$M/calls")" = 0 ] && [ -e "$M/tup" ] \
+  && ok "HOLD: no restore, TP8 not stopped, serve not started" || bad "HOLD: no restore, TP8 not stopped, serve not started"
+grep -q "systemctl stop tp8-restore-$RID.timer" "$M/calls" && grep -q "tp8-window.sh restore $T/rec/$RID" "$T/runs/$RID/window.log" \
+  && ok "HOLD: timer stopped, fallback command printed" || bad "HOLD: timer stopped, fallback command printed"
+: > "$M/calls"; bash "$W" restore "$T/rec/$RID" > "$T/out2" 2>&1
+[ -e "$T/rec/$RID/RESTORED_OK" ] && [ "$(grep -c '^tstop' "$M/calls")" = 4 ] && [ "$(grep -c '^aup' "$M/calls")" = 4 ] && [ ! -e "$M/tup" ] \
+  && ok "HOLD fallback: restore RD stops TP8 x4, serve up x4, RESTORED_OK" || bad "HOLD fallback: restore RD"
+setup; echo HOLD=1 >> "$T/window.conf"; touch "$M/timer.stuck"; run
+[ "$(cat "$T/rc")" = 0 ] && grep -qx 'TP8 PASS; RESTORED_OK' "$T/runs/$RID/RESULT" && [ ! -e "$T/rec/$RID/HOLDING" ] && grep -q "hold: timer 'active'" "$T/runs/$RID/window.log" \
+  && ok "HOLD, timer not verified stopped: normal restore, RESTORED_OK" || bad "HOLD, timer stuck [rc $(cat "$T/rc") $(cat "$T/runs/$RID/RESULT" 2>/dev/null)]"
+setup; echo HOLD=1 >> "$T/window.conf"; steps false; run
+[ "$(cat "$T/rc")" = 1 ] && grep -qx 'P2b: steps (rc 1); RESTORED_OK' "$T/runs/$RID/RESULT" && [ ! -e "$T/rec/$RID/HOLDING" ] \
+  && ok "HOLD, a failed run: restore as without HOLD" || bad "HOLD, failed run [rc $(cat "$T/rc")]"
 
 echo "passed $pass, failed $failn"
 [ $failn = 0 ]
