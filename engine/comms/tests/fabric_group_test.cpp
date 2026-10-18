@@ -83,6 +83,17 @@ static uint64_t run(Fabric& f, const std::vector<int>& members, int steps, int b
   uint64_t h = 0;
   for (int s = 0; s < steps; s++) {
     const int par = s & 1;
+    // The proxy waits for doorbell[c] == coll_seq(s, c) exactly, and doorbell[c] is one word for both parities. This
+    // loop rings all of a step's doorbells before it waits for any peer, so it can finish step s-1's receives (the
+    // peers' proxies posted them) before its own proxy has read step s-1's doorbells. Ringing step s then overwrites a
+    // value the proxy never saw, and the proxy waits for it until its 30 s timeout ("have" = the next step's seq). The
+    // engine has a layer of GPU work between two rings of one doorbell, so this is timing there, as on main; here the
+    // rings are back to back, so the loop lets its proxy drain first.
+    if (s > 0 && !f.wait_proxy_idle(30)) {
+      char b[160];
+      snprintf(b, sizeof b, "proxy did not post step %d (port %d)", s - 1, f.port());
+      stall(f, b);
+    }
     f.enqueue_step((unsigned long long)s, std::vector<uint32_t>(nc, (uint32_t)bytes));
     for (int c = 0; c < nc; c++) {
       volatile uint64_t* src = (volatile uint64_t*)(d.send + ((size_t)par * nc + c) * d.stride);
