@@ -122,6 +122,7 @@ KEYS = {
     'MTP_KSTOPB_KMIN': ('cluster', None, 'MTP_KSTOPB: the least drafts a session verifies, 0 or 1 (G6_MTP_KSTOPB_KMIN)'),
     'MTP_KSTOPB_TAU': ('cluster', None, 'MTP_KSTOPB thresholds t1,t2,... at every session count (G6_MTP_KSTOPB_TAU)'),
     'MTP_KSTOPB_TAU_S': ('cluster', None, 'MTP_KSTOPB thresholds per session count, n:t1,t2/n:t1,t2... (G6_MTP_KSTOPB_TAU_S<n>)'),
+    'L2PF': ('cluster', None, "decode: paced L2 prefetch of the next weights in the step's idle-DRAM windows, window mask (G6_L2PF)"),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
