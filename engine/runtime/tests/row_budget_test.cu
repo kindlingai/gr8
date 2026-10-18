@@ -546,6 +546,7 @@ static void run_k1(const std::string& name, const bind::LayerTensors& T, bool mo
     const size_t row_bytes = static_cast<size_t>(HID) * 2;
     std::string fails;
     int ncase = 0, maxsl = 0;
+    unsigned long long fnv = 1469598103934665603ull;   // FNV-1a over the full runs' rows: equal across A/B envs = same bits
     for (int M : Ms)
     {
         ++ncase;
@@ -593,8 +594,10 @@ static void run_k1(const std::string& name, const bind::LayerTensors& T, bool mo
         CK(cudaMemcpy(hc.data(), E.oc, hc.size(), cudaMemcpyDeviceToHost));
         const std::string r = cmp_out(hf, hc, M, row_bytes, odt);
         if (!r.empty()) fails += fmt_s("M=%d %s; ", M, r.c_str());
+        for (size_t i = 0; i < row_bytes * M; ++i) fnv = (fnv ^ hf[i]) * 1099511628211ull;
     }
-    report(fails.empty(), "k1 %s: %d row counts, max slots %d%s%s", name.c_str(), ncase, maxsl, fails.empty() ? "" : " | ", fails.c_str());
+    report(fails.empty(), "k1 %s: %d row counts, max slots %d, out fnv %016llx%s%s", name.c_str(), ncase, maxsl, fnv,
+           fails.empty() ? "" : " | ", fails.c_str());
 }
 
 static void test_k1(const std::vector<int>& Ms)
