@@ -32,7 +32,7 @@ namespace l2pf
 {
 
 constexpr uint32_t CHUNK = 8192;      // bytes per bulk prefetch
-constexpr int MAXR = 16;              // ranges in a queue
+constexpr int MAXR = 20;              // ranges in a queue (16 + kv_b FP8 scales, #50, with headroom)
 enum { W_M, W_Q, W_T, W_A, NW };
 enum { T_XIN, T_IDXQ, T_QB, T_UK, T_UV, T_OPROJ, T_ROUTER, T_SHARED, NTG };
 
@@ -182,7 +182,7 @@ inline cudaError_t init_env()
 }
 
 // a layer's targets from its binding and its attention weights (UK [H][512][192], UV [H][256][512] BF16)
-inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv)
+inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv, const void* uks = nullptr, const void* uvs = nullptr)
 {
     Plan P;
     for (const bind::Gv* g : {&b.q_a, &b.kv_a, &b.idx_k, &b.idx_w})
@@ -197,8 +197,12 @@ inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv)
     if (b.q_b_t.on) dtr_add(T_QB, b.q_b_t, 0);
     else if (b.q_b.on) P.add(T_QB, b.q_b.w, bind::gv_bytes(b.q_b));
     const int H = b.heads;
-    if (uk) P.add(T_UK, uk, static_cast<size_t>(H) * 512 * 192 * 2);
-    if (uv) P.add(T_UV, uv, static_cast<size_t>(H) * 256 * 512 * 2);
+    // kv_b BF16, or E4M3 with f32 block scales (#50, G6_KVB=fp8: uks / uvs set): one byte a weight plus the scales
+    const size_t ukw = uks ? 1 : 2, uvw = uvs ? 1 : 2;
+    if (uk) P.add(T_UK, uk, static_cast<size_t>(H) * 512 * 192 * ukw);
+    if (uk && uks) P.add(T_UK, uks, static_cast<size_t>(H) * 4 * 192 * 4);
+    if (uv) P.add(T_UV, uv, static_cast<size_t>(H) * 256 * 512 * uvw);
+    if (uv && uvs) P.add(T_UV, uvs, static_cast<size_t>(H) * 256 * 4 * 4);
     const size_t opcap = static_cast<size_t>(cfg().opmb * 1e6);
     if (b.o_proj_t.on) dtr_add(T_OPROJ, b.o_proj_t, opcap);
     else if (b.o_proj.on) P.add(T_OPROJ, b.o_proj.w, opcap && opcap < bind::gv_bytes(b.o_proj) ? opcap : bind::gv_bytes(b.o_proj));
