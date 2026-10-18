@@ -109,6 +109,7 @@
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
+#include "s2/cp_rows.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
 #include "rt_rows.cuh"
@@ -763,6 +764,7 @@ int main(int argc, char** argv)
     const int dfl_body_i4_on = env_choice("G6_DFL_BODY_I4", 1, 0, &dfe);
     if (dfl_body_i4_on < 0) die(dfe);
     if (dfl_body_i4_on && !dfl) die("G6_DFL_BODY_I4=1 needs --dflash-manifest");
+    int cp_step = 0;                    // G6_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
 #if defined(G6_CP) && G6_CP
     // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
@@ -771,8 +773,18 @@ int main(int argc, char** argv)
     const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
     int cp_mmax = K + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
-    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block
-    if (s2mode) cp_mmax = std::max(cp_mmax, std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk)));
+    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block.
+    // G6_CP_STEP_ROWS=n: S2 steps past R carry at most n rows (Driver::step caps their rounds, cp_rows.h), so the fabric
+    // is sized for n: at least the rows before #94 (cp_mmax here), at most the widest S2 step
+    if (s2mode)
+    {
+        const int full = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));
+        std::string ce;
+        cp_step = g6s2::cp_step_rows_env(getenv("G6_CP_STEP_ROWS"), cp_mmax, full, &ce);
+        if (cp_step < 0) die(ce);
+        cp_mmax = std::max(cp_mmax, cp_step ? cp_step : full);
+    }
+    else if (getenv("G6_CP_STEP_ROWS") && atoi(getenv("G6_CP_STEP_ROWS"))) die("G6_CP_STEP_ROWS needs --serve");
     if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
     if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
     g6::CpColls cp_colls;
@@ -1393,6 +1405,20 @@ int main(int argc, char** argv)
         }
         sc.steering = steering_boot;
         if (rtt && rtt->local) sc.window_pages = (uint32_t)rtt->local;   // a window run lists its worst case and the window
+        // G6_CP_STEP_ROWS (sized the CP fabric above) and G6_CP_STEP_SEG=1: Driver::step's rounds past R (cp_rows.h)
+        {
+            std::string ce;
+            const int seg = env_choice("G6_CP_STEP_SEG", 1, 0, &ce);
+            if (seg < 0) die(ce);
+            if (seg && !cp_step) die("G6_CP_STEP_SEG=1 needs G6_CP_STEP_ROWS");
+            sc.cp_step_rows = (uint32_t)cp_step;
+            sc.cp_seg = seg == 1;
+            sc.cp_after = g6s2::cp_after(m.bk, m.nbk, m.cp.on ? m.cp.R : -1);
+            if (cp_step && R == 0)
+                fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%d: a step past R (context > %llu) carries at most %d rows = %d sessions of %d%s; "
+                        "the CP fabric is sized for it\n", cp_step, (unsigned long long)sc.cp_after, cp_step, cp_step / (mtp + 1), mtp + 1,
+                        sc.cp_seg ? ", and no session below R (G6_CP_STEP_SEG)" : "");
+        }
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
         // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
@@ -2083,7 +2109,9 @@ int main(int argc, char** argv)
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
-                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b);
+                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
+                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "");
+
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -2102,7 +2130,7 @@ int main(int argc, char** argv)
             // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
             try
             {
-                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b);
+                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step);
                 m.dfl_tap = tap;
                 wcheck::seal(R);
                 int dev = 0;
