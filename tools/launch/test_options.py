@@ -271,6 +271,16 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--reuse-prefix', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
 
+    def test_tp4_tr3_w2all_default_on_and_override(self):
+        def env(peers, *argv):
+            o = opt.parse(['--no-config', '--peers', peers, *argv], {})
+            opt.validate(o)
+            return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env'] if a.startswith('G6_TR3_W2ALL=')]
+        self.assertEqual(env(PEERS), ['G6_TR3_W2ALL=1'])
+        self.assertEqual(env(PEERS, '--tr3-w2all', '0'), ['G6_TR3_W2ALL=0'])
+        self.assertEqual(env(PEERS, '--g6env-x', 'G6_TR3_W2ALL=0'), ['G6_TR3_W2ALL=0'])   # G6ENV_X keeps its value, no second copy
+        self.assertEqual(env('10.0.0.1,10.0.0.2,10.0.0.3'), [])   # TP=3 unchanged
+
     def test_tp6_is_s2_without_drafter(self):
         peers = ','.join(f'10.0.0.{i}' for i in range(1, 7))
         o = opt.parse(['--no-config', '--peers', peers], {})

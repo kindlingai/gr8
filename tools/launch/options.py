@@ -109,6 +109,7 @@ KEYS = {
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
+    'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

@@ -41,7 +41,10 @@ pool_cap() {
 engine_defaults() {
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
-       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
+       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
+       # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
+       # G6_TR3_W2ALL in G6ENV_X keeps its own value
+       case " ${G6ENV_X:-} " in *" G6_TR3_W2ALL="*) ;; *) TR3_W2ALL=${TR3_W2ALL:-1} ;; esac ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
          if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
@@ -101,6 +104,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ G6_IDX_GRP=$IDX_GRP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ G6_ATTN_QT=$ATTN_QT}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ G6_ATTN_FRONT=$ATTN_FRONT}"
+  # the window-2 fc1 split on every MoE layer at M > 1 (TR3_W2ALL; docs/SETTINGS.md): off unless set; on at TP=4
+  ENGINE_ENV="$ENGINE_ENV${TR3_W2ALL:+ G6_TR3_W2ALL=$TR3_W2ALL}"
   return 0
 }
 
