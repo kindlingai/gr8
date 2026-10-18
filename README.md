@@ -15,20 +15,23 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 |---|---|---|---|
 | experts | `home`, 3.25 bpw | `bit225`, 2.25 bpw | `home`, 3.25 bpw |
 | drafting | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 49.3 / 30.0 tok/s | 38.6 / 29.0 tok/s | 38.2 / –‡ tok/s |
-| aggregate\*, 2 / 4 streams | 50.8 / 64.0 tok/s | 46.6 / 60.7 tok/s | 57.6 / 79.0 tok/s‡ |
-| prefill, 8K prompt, cold | 1,374 tok/s | 628 tok/s | 1,953 tok/s‡ |
-| prefill, 8K prompt, cached | 54,867 tok/s | 56,995 tok/s | – |
+| decode\*, code / prose | 51.7 / 32.5 tok/s | 38.6 / 29.0 tok/s | 38.2 / –‡ tok/s |
+| aggregate\*, 2 / 4 streams | 53.7 / 67.8 tok/s | 46.6 / 60.7 tok/s | 57.6 / 79.0 tok/s‡ |
+| prefill, 8K prompt, cold | 1,315 tok/s | 628 tok/s | 1,953 tok/s‡ |
+| prefill, 8K prompt, cached | 60,006 tok/s | 56,995 tok/s | – |
 | KV pool (longest context) | 310,528 tokens (415,232 with int4§) | 241,600 tokens (345,088 with int4§) | 614,400 tokens (857,600 with int4§) |
 | requests that share decode steps | up to 65,536 tokens | up to 65,536 tokens | up to 32,768 tokens |
 | requests decoding at once | 8 | 8 | 8 |
 
-\* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks capped at 2200 MHz,
-booted from the Hugging Face release with `./gr8 glm53 up`. RigMark's structured row is left out: it measures
-predictable output, not agent speed. TP=4 code varies between boots (41.5 to 49.3 on one build), because which requests
-get DFlash2 depends on timing.
-‡ TP=6, MTP only (the DFlash2 drafter's 8 KV heads do not split six ways), GPU clocks uncapped (about
-2450 to 2550 MHz), not the 2200 MHz cap of the other columns, so do not compare the columns row by row. Decode is a
+\* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks uncapped (the full
+application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release
+with `./gr8 glm53 up` and its defaults, which turn the faster decode options on (`DRAFT_PAR`, `QA_SPLIT` /
+`IDXQ_SPLIT` / `MTP_SPLIT`, `MTP_KSTOP` at TP=4). One run per fresh boot (a second run on the same boot replays
+RigMark's prompts from the retained prefix), the mean of two boots. RigMark's structured row is left out: it
+measures predictable output, not agent speed. TP=4 code varies between boots (51.2 to 52.2 on one build),
+because which requests get DFlash2 depends on timing. The TP=3 column is still the earlier measurement at the 2200 MHz
+cap on an older build; its re-measurement is pending.
+‡ TP=6, MTP only (the DFlash2 drafter's 8 KV heads do not split six ways), on an earlier build. Decode is a
 concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; it is not
 RigMark. One test window on one cluster.
 § `--kv-format int4` (experimental): 4-bit KV latent, about 3% slower decode at TP=4; TP=3 and TP=6 int4 figures are
