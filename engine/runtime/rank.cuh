@@ -400,6 +400,7 @@ struct Model
     bool rs = false;                  // --spec-accept rejection (set before capture): the head accepts each row's draft by
                                       // rejection sampling (the glue.cuh _rs head kernels)
     QSplit qs;                        // G6_QA_SPLIT (main model only; mode 0 = today's replicated GEMVs)
+    bind::K1Ovl ovl;                  // G6_ROUTE_OVL (route_ovl_init; mode 0 = off): the shared expert's side stream
     int ncoll() const { return 2 * nl + 1; }
 #if defined(G6_CP) && G6_CP
     CpState cp;
@@ -1251,6 +1252,20 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     dmark(c % 2 == 0 ? DP_NORM_A : DP_NORM_M, st);
 }
 
+// G6_ROUTE_OVL=1|2 (read once; unset / 0 = off): bind::K1Ovl, the trellis shared expert on a forked stream while the
+// router GEMV and the plan kernel run (1: its fc1 + fc2, 2: its fc1 only; same bytes out). prepare / s2_prepare make the
+// side stream and its events, outside any capture; layers it does not apply to (bind::k1_ovl_on) run as before.
+inline void route_ovl_init(Model& m)
+{
+    static const int mode = getenv("G6_ROUTE_OVL") ? atoi(getenv("G6_ROUTE_OVL")) : 0;
+    if (mode < 0 || mode > 2) die("G6_ROUTE_OVL must be 0, 1 or 2");
+    if (!mode || m.ovl.side) return;
+    G6RT_CK(cudaStreamCreateWithFlags(&m.ovl.side, cudaStreamNonBlocking));
+    G6RT_CK(cudaEventCreateWithFlags(&m.ovl.fork, cudaEventDisableTiming));
+    G6RT_CK(cudaEventCreateWithFlags(&m.ovl.join, cudaEventDisableTiming));
+    m.ovl.mode = mode;
+}
+
 constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots (slots, an expert can take several), pad_[3], slot_expert[SMAX]
 inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 {
@@ -1259,6 +1274,8 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 #ifndef DEC_SLOT
     bind::launch(b.xf_x2, st);                 // DEC_SLOT: launch_consume(2i) wrote the fragment tables
 #endif
+    const bool ovl = y.moe && bind::k1_ovl_on(b.k1, m.ovl);
+    if (ovl) bind::k1_ovl_fork(b.k1, m.ovl, st);      // G6_ROUTE_OVL: the shared expert reads only x2, not the plan
     if (y.moe)
     {
         bind::launch(b.router, st);
@@ -1266,7 +1283,7 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
     }
     dmark(DP_ROUTER, st);
-    bind::launch_mlp(b, st);
+    bind::launch_mlp(b, st, ovl ? &m.ovl : nullptr);
     dmark(DP_EXPERTS, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i + 1, st);
@@ -1397,6 +1414,7 @@ inline const bind::Head& head_for(Model& m, int M)
 // once per row count, outside any capture: kernel arguments and (graph form) the attention replay entries
 inline void prepare(Model& m, int M, cudaStream_t st)
 {
+    route_ovl_init(m);
     head_for(m, M);
     for (int i = 0; i < m.nl; ++i)
     {
