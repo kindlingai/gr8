@@ -39,9 +39,9 @@ __global__ void weight_half(const void* src,half* dst,int n){int i=blockIdx.x*bl
 // #50: the FP16 UK / UV copies from a binding's E4M3 weights (attn.h uks / uvs): each FP16 value is weight_half's of the BF16
 // weight the BF16 loader stores (ga::wuk / ga::wuv), so the copies are byte-identical. UK keeps the binder's [h][512][192].
 __global__ void weight_half_uk(G6Attn a,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<n){const int h=i/(512*192),d=(i/192)%512,k=i%192;dst[i]=__float2half_rn(ga::wuk(a,h,d,k));}}
+    if(i<n){const int h=i/(512*192),d=(i/192)%512,k=i%192;dst[i]=__float2half_rn(ga::wuk<true>(a,h,d,k));}}
 __global__ void weight_half_uv(G6Attn a,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<n){const int h=i/(256*512),e=(i/512)%256,k=i%512;dst[i]=__float2half_rn(ga::wuv(a,h,e,k));}}
+    if(i<n){const int h=i/(256*512),e=(i/512)%256,k=i%512;dst[i]=__float2half_rn(ga::wuv<true>(a,h,e,k));}}
 __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int count){
     auto a=ga::resolve(fixed);int pos=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(pos>=count)return;
     const uint8_t* v=pos<a.context?ga::kv_at(a,pos):nullptr;
@@ -390,8 +390,8 @@ extern "C" int g6_attn_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const 
 extern "C" int g6_attn_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){int rc=g6_attn_bind_prepare(b,step,s);if(rc)return rc;auto a=b->args;auto st=(cudaStream_t)s;auto w=ga::workspace(a,b->scratch);rc=g6_attn_append(&a,s);if(rc)return rc;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile),H=a.heads;
         if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);ga::launch_index_scores(a,a,w,start,n,st);if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);}
-        ga::absorb<<<dim3(64,H,n),256,0,st>>>(a,start,w.q,w.rope);gp::trace_copy(tr.q,w.q,start,n,H,512,st);ga::launch_mla_scores(a,a,w,start,n,st);gp::trace_copy(tr.scores,w.prob,start,n,H,ga::TOP,st);
-        ga::normalize<<<n*H,256,0,st>>>(a,w.prob);gp::trace_copy(tr.probs,w.prob,start,n,H,ga::TOP,st);ga::launch_context_parts(a,a,w,start,n,st);ga::merge_parts<<<n*H,256,0,st>>>(a,w.parts,w.context);gp::trace_copy(tr.context,w.context,start,n,H,512,st);ga::value_project<<<dim3(32,H,n),256,0,st>>>(a,start,w.context);
+        ga::launch_absorb(a,a,w,start,n,st);gp::trace_copy(tr.q,w.q,start,n,H,512,st);ga::launch_mla_scores(a,a,w,start,n,st);gp::trace_copy(tr.scores,w.prob,start,n,H,ga::TOP,st);
+        ga::normalize<<<n*H,256,0,st>>>(a,w.prob);gp::trace_copy(tr.probs,w.prob,start,n,H,ga::TOP,st);ga::launch_context_parts(a,a,w,start,n,st);ga::merge_parts<<<n*H,256,0,st>>>(a,w.parts,w.context);gp::trace_copy(tr.context,w.context,start,n,H,512,st);ga::launch_value_project(a,a,w,start,n,st);
     }return int(cudaGetLastError());
 }
 
