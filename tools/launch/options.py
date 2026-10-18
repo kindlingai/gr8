@@ -125,6 +125,8 @@ KEYS = {
     'K1_SPLIT': ('cluster', None, 'MoE decode: fc1 shape / fc2 n-split per step row count, M:KS1xWG/NS2,... (G6_K1_SPLIT)'),
     'K1_TLBW': ('cluster', None, "MoE decode: fc1 prefetches the routed weights' translations at this granule, KB (G6_K1_TLBW)"),
     'L2PF': ('cluster', None, "decode: paced L2 prefetch of the next weights in the step's idle-DRAM windows, window mask (G6_L2PF)"),
+    'CP_STEP_ROWS': ('cluster', None, 'S2: a step past SHARE_LIMIT carries at most this many rows; the CP fabric is sized for it (G6_CP_STEP_ROWS)'),
+    'CP_STEP_SEG': ('cluster', None, 'S2 with CP_STEP_ROWS: a round past SHARE_LIMIT takes only sessions past it (G6_CP_STEP_SEG)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
