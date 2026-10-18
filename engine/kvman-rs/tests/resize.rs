@@ -79,15 +79,31 @@ fn check(p: &Pool, live: &[Live]) {
     let retained = owner.iter().filter(|&&o| o == 2).count();
     assert_eq!(held + retained + free + offline, pages, "a page lost");
     assert!((0..pages as u32).all(|q| p.used(q) == (owner[q as usize] == 1)));
-    // a resident past-R run holds the pool: nothing is free, nothing admits, and it already holds its worst case. Its
-    // draft-class pages above place count in live_pages, so the below-place Banker's model does not apply
-    if live.iter().any(|l| p.exclusive_run(&l.run).unwrap()) {
-        assert_eq!((p.free_pages(), p.room(), p.admissible(PAGE)), (0, 0, false));
+    // a resident past-R run on the tables as built (nr 0) holds the pool: nothing is free, nothing admits, and it
+    // already holds its worst case
+    if live.iter().any(|l| p.exclusive_run(&l.run).unwrap()) && !p.admissible(PAGE) {
+        assert_eq!((p.free_pages(), p.room()), (0, 0));
         return;
     }
     assert_eq!(p.free_pages() as usize, pages - offline - held);
-    let runs: Vec<(u32, u32)> = p.runs().map(|(_, h, w)| (h, w)).collect();
-    assert!(safe(p.place_online(), p.live_pages(), &runs), "pool left unsafe");
+    // the Banker's model below place: with the page classes on a split run shares the pool, holding its worst case
+    // already (need 0); only its pages below place count, its draft-class pages above place are its own class
+    let place = p.place_pages();
+    let mut low = 0u32;
+    let runs: Vec<(u32, u32)> = live
+        .iter()
+        .map(|l| {
+            let (_, h, w) = p.runs().find(|u| u.0 == l.run.table_version).unwrap();
+            let lo = l.list.iter().filter(|&&q| q < place).count() as u32;
+            low += lo;
+            if p.exclusive_run(&l.run).unwrap() {
+                (lo, lo)
+            } else {
+                (h, w)
+            }
+        })
+        .collect();
+    assert!(safe(p.place_online(), low, &runs), "pool left unsafe");
 }
 
 fn finish(rng: &mut Rng, prompt: &[i32]) -> Finished {
@@ -99,7 +115,14 @@ fn finish(rng: &mut Rng, prompt: &[i32]) -> Finished {
 
 // what a shrink of n must do, from the pool's visible state (independent of Pool::shrink): Err(BadSize) when no state
 // allows it, Ok(None) when it must wait, Ok(Some(chunks)) otherwise
-fn shrink_model(a: &Pool, n: u32, chunk: u32, place: u32, below_pages: u32) -> Result<Option<Vec<u32>>, Error> {
+fn shrink_model(
+    a: &Pool,
+    n: u32,
+    chunk: u32,
+    place: u32,
+    below_pages: u32,
+    resident: bool,
+) -> Result<Option<Vec<u32>>, Error> {
     let on: Vec<u32> = (0..a.chunk_count()).filter(|&k| a.chunk_online(k)).collect();
     let size = |k: u32| (k * chunk..((k + 1) * chunk).min(place)).len() as u32;
     let mut sizes: Vec<u32> = on.iter().map(|&k| size(k)).collect();
@@ -107,7 +130,7 @@ fn shrink_model(a: &Pool, n: u32, chunk: u32, place: u32, below_pages: u32) -> R
     if sizes.len() < n as usize || a.place_online() - sizes.iter().take(n as usize).sum::<u32>() < below_pages {
         return Err(Error::BadSize);
     }
-    if !a.admissible(PAGE) {
+    if resident || !a.admissible(PAGE) {
         return Ok(None); // a past-R run is resident
     }
     let mut free_chunks: Vec<u32> = on
@@ -532,7 +555,7 @@ fn resize_traces_two_classes() {
                 6..=7 => {
                     let n = rng.range(1, 2) as u32;
                     let resident = live.iter().any(|l| a.exclusive_run(&l.run).unwrap());
-                    let want = shrink_model(&a, n, chunk, place, below_pages);
+                    let want = shrink_model(&a, n, chunk, place, below_pages, resident);
                     let before = a.digest();
                     let r = a.shrink(n);
                     assert_eq!(r, b.shrink(n));

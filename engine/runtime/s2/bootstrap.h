@@ -88,6 +88,7 @@ struct BootstrapConfig {
     Config scheduler;
     unsigned rank = 0, ranks = 6, timeout = 120;
     std::string head_ip, directory, runtime_signature;
+    unsigned control_version = CONTROL_VERSION;   // scheduler.h; tests set another to act as a rank of another build
     uint16_t port = 0;
     void validate() const {
         scheduler.validate();
@@ -97,7 +98,10 @@ struct BootstrapConfig {
     }
     std::string agreement() const {
         return capability(scheduler, ranks) + std::to_string(scheduler.max_sessions) + " " +
-            std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) + "\n" + runtime_signature;
+            std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) +
+            (scheduler.decode_prefill_rows ? " dpf " + std::to_string(scheduler.decode_prefill_rows) : std::string()) +
+            (scheduler.decode_rounds > 1 ? " dr " + std::to_string(scheduler.decode_rounds) : std::string()) +
+            " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
     }
 };
 inline void atomic_file(const std::string& path, const std::string& bytes) {

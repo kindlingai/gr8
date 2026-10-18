@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-17: several sessions past R stay resident together (CP batch views); G6_S2_DECODE_PF, G6_S2_ADMIT_HOLD, G6_S2_DECODE_ROUNDS (default off)
+
+- A session past `SHARE_LIMIT` (R) no longer needs the KV pool to itself. On the pool's page classes a split run past R
+  shares the pool with other split runs and with runs below R (`engine/kvman-rs` `pool.rs`), and the rows of several such
+  sessions run in one batched step through the layers' CP batch views (`s2.cuh`, `rank.cuh`): a step whose bucket is past
+  R takes the CP attention block on those views, with each row's own block table. Before, a second long agent chat queued
+  until the first ended. Not behind a knob: it applies whenever more than one session is past R. Batched CP attention
+  equals the per-session calls bitwise per rank (`s2_attn_test` CP cases, `cp_batch_cpu_test`); steps below R are unchanged.
+  Each past-R session still replicates its first R tokens on every rank, so at TP=4's default `SHARE_LIMIT` of 65,536
+  (1,024 of a rank's 1,981 pages) a second one does not fit and waits as before; with `--share-limit 32768` two 72K
+  sessions sent at once were both resident on the four-box cluster (one queued behind the other on the previous build).
+- `G6_S2_DECODE_PF=<rows>` (default off): while any session decodes, a prefill quantum is at most this many rows on one
+  lane, so decoding sessions get a round sooner. 0 or a multiple of 64, at most `--prefill`.
+- `G6_S2_ADMIT_HOLD=1` (default off, head only): queued admissions are granted one after another at one held boundary
+  instead of one per notice (`Commit::hold`, `event_gate.h`).
+- `G6_S2_DECODE_ROUNDS=<K>` (default off): while a prefill waits and sessions decode, K decode rounds run per prefill
+  quantum instead of one.
+- Control version 6: the commit frame gains the hold field, so the frame magic is `G6S2E6` and the bootstrap agreement
+  carries ` ctl 6`. Ranks on different builds refuse at bootstrap, not at the first event; deploy the same build on every rank.
+
 ## 2026-10-17: the front end exports KV, TTFT and per-request prefill and decode timing
 
 - `/metrics` on the S2 serve had no `vllm:kv_*`, `request_*_time_seconds`, `time_to_first_token` or

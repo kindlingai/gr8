@@ -4,8 +4,12 @@
 //! included. Nothing here depends on time, floats or hash-map order, so the same calls give the same pages and digest.
 //!
 //! A session's run is a list of pages, the lowest free ones first. A reservation of more than `below` rows (a session
-//! past R, CP decode) is exclusive. It is admitted only into an EMPTY pool, takes pages 0, 1, .., n - 1 (the CP map as
-//! built) and, while resident, holds the whole pool (room 0, nothing else admits).
+//! past R, CP decode) is exclusive. Without page classes (tail() not set) it is admitted only into an EMPTY pool, takes
+//! pages 0, 1, .., n - 1 (the CP map as built) and, while resident, holds the whole pool (room 0, nothing else admits).
+//! With page classes (tail(nr > 0)) it is a split run: its prefix and shard below place, the drafter's copy of its tail
+//! above it, its worst case at once. Split runs are admitted beside live runs (other split runs and runs below R, all
+//! decoded in one CP step) when both classes have the pages and the state below place stays safe; their prefix hits
+//! (pool and stored) are taken the same way.
 //! Two sizes on the CP binding: `pages` = the logical capacity (Config::pool_rows / 64), `place` = the physical pages
 //! every rank has for runs below R (S2Model::pool_pages, the fewest of main and draft). Runs below R take pages in
 //! [0, place).

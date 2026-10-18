@@ -828,7 +828,7 @@ int main(int argc, char** argv)
     };
     // layer i's attention block on every rank: the CP block in its three phases with the loopback between them
     auto attn_all = [&](int i, int M, int context) {
-        if (!cp_active(R[0], context)) { attn_qs(rptr, qsl, i, M, context); return; }
+        if (!cp_block(R[0], context)) { attn_qs(rptr, qsl, i, M, context); return; }
         {
             const std::vector<int> gs = R[0].qs.layer_gathers(i);     // phase 0 in gather phases
             for (size_t p = 0; p <= gs.size(); ++p)

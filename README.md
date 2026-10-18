@@ -219,10 +219,13 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
   `--peers`, the workers wait for the head.
 - Decode slows past `SHARE_LIMIT` tokens of context: from there the KV is spread across ranks, and every step gathers from
   all of them.
-- A request past `SHARE_LIMIT` waits for the pool to empty, and runs alone. Its size is the prompt plus `max_tokens`.
-  A chat request without `max_tokens` gets what keeps it within the limit, but at least 8,192 tokens, so a prompt
-  past about 57,000 tokens runs alone. `--share-limit 32768` gives back the longest context (408,832 at TP=4) and
-  shares only requests up to 32,768 tokens.
+- A request past `SHARE_LIMIT` holds its first `SHARE_LIMIT` tokens on every rank, so it needs that many pages free on
+  each. Its size is the prompt plus `max_tokens`; a chat request without `max_tokens` gets what keeps it within the
+  limit, but at least 8,192 tokens, so a prompt past about 57,000 tokens is such a request. Several of them share
+  decode steps when the pool has room for each one's replicated prefix: at TP=4's default `SHARE_LIMIT` (65,536 tokens,
+  1,024 of a rank's 1,981 pages each) only one fits, so a second waits for the first to end; `--share-limit 32768` lets
+  two or three stay resident together, gives back the longest context (408,832 at TP=4) and shares the replicated
+  prefix only up to 32,768 tokens.
 - A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
   meanwhile. The shim caps those prompts at 1,024 tokens.
 - Each rank checks its weights at boot: the GPU sums what it holds and compares with the bytes the loader read. A
