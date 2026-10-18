@@ -170,6 +170,10 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   # the paced L2 prefetch in the decode step's idle-DRAM windows (L2PF; docs/SETTINGS.md): off unless set. Its
   # tuning variables G6_L2PF_T, _GBPS, _WAVE, _US, _MB and _OPMB stay engine environment (G6ENV_X)
   ENGINE_ENV="$ENGINE_ENV${L2PF:+ G6_L2PF=$L2PF}"
+  # the row cap for S2 steps past SHARE_LIMIT, which also sizes the CP fabric (CP_STEP_ROWS, CP_STEP_SEG;
+  # docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${CP_STEP_ROWS:+ G6_CP_STEP_ROWS=$CP_STEP_ROWS}"
+  ENGINE_ENV="$ENGINE_ENV${CP_STEP_SEG:+ G6_CP_STEP_SEG=$CP_STEP_SEG}"
   return 0
 }
 
