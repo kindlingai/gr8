@@ -679,6 +679,42 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
             D.fc.codec == bind::MXFP8 ? "MXFP8" : "BF16");
 }
 
+// G6_DFL_HEAD_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's head GEMV reads INT4 g32 records of this
+// rank's vocab slice (rank.cuh head_i4_records; the MTP draft's copy when G6_DRAFT_HEAD_I4 made one, same slice and ks)
+// instead of the target's MXFP8 records. The head feeds the drafter two ways: argmax mode samples from its logits
+// (k_head_local / merge, as the MTP draft); selector mode takes each row's global top-16 by raw logit (k_top_local, merged
+// in k_walk) and scores them as logit + pred[prev] . hp[s] . succ[c], so INT4 can change both which 16 are candidates and
+// their scores. The target's head and the verify step are unchanged. After dfl_build, before the drafter's graphs.
+inline void dfl_head_i4(Dfl& D, const uint8_t* rec, int tpc, int ks)
+{
+    bind::Tensor t;
+    t.p = rec; t.nd = 3;
+    t.shape[0] = D.vn / 16; t.shape[1] = HID / 32; t.shape[2] = head_i4::I4GR;
+    if (const char* e = bind::make_gv(t, bind::INT4, tpc, ks, dfl::B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head))
+        die(std::string("G6_DFL_HEAD_I4: ") + e);
+    if (D.head.lm_head.O != D.vn || D.head.lm_head.K != HID) die("G6_DFL_HEAD_I4: INT4 head is not this rank's vocab slice");
+}
+
+// G6_DFL_BODY_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's body GEMVs (fc, and per layer kv (context and
+// block: one record), aconv, q, o, mconv, gu, down) read INT4 g32 records made at boot from their MXFP8 records
+// (rank.cuh gv_to_i4, the G6_DRAFT_HEAD_I4 arithmetic), with the same splits: 382 MB instead of 701 MB per rank, which the
+// pack image keeps as well. The selector's hproj (1.6 MB) and the head (G6_DFL_HEAD_I4) are not touched. A BF16 record
+// (dflash2.py --bf16) stays BF16. Drafts only: the target and the verify step are unchanged; the drafts and their
+// log-probabilities can differ from the MXFP8 drafter's (dflreplay.cu measures how often). After dfl_build, before the
+// drafter's graphs.
+inline void dfl_body_i4(Dfl& D, cudaStream_t st)
+{
+    size_t mx = 0, i4 = 0;
+    auto cv = [&](bind::Gv& g) {
+        if (g.codec != bind::MXFP8) return;
+        const size_t b = bind::gv_bytes(g), n = gv_to_i4(g, "G6_DFL_BODY_I4", st);
+        if (n) { mx += b; i4 += n; }
+    };
+    cv(D.fc);
+    for (DLayer& y : D.ly) { cv(y.kvc); cv(y.kv); cv(y.ac); cv(y.q); cv(y.o); cv(y.mc); cv(y.gu); cv(y.down); }
+    fprintf(stderr, "# rank %d: G6_DFL_BODY_I4: drafter body INT4 g32 records, %.1f MB (MXFP8 %.1f MB)\n", D.rank, i4 / 1e6, mx / 1e6);
+}
+
 // ---------------------------------------------------------------- the step, in phases
 inline void dfl_xfrag(const __half* src, int K_, u32* f16, u32* b16, cudaStream_t st)
 {
