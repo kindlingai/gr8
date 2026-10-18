@@ -1128,7 +1128,10 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     else if (omx) e = make_gv(T.t[T_O_PROJ_MX], MXFP8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     else     e = make_gv(T.t[T_O_PROJ],    INT4,  2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     if (e) return e;
-    if ((e = make_gv(T.t[T_ROUTER],    BF16W, 2,  16, M, sc.xb_x2,   io.logits,    gv::O_F32,  L.router))) return e;
+    // G6_ROUTER_TPC=1: the router's 16 output tiles one per CTA (16 CTAs of 512 threads, not 8 of 1024); same tiles,
+    // k parts and reduction order, so the same bits
+    static const int rtpc = getenv("G6_ROUTER_TPC") && atoi(getenv("G6_ROUTER_TPC")) == 1 ? 1 : 2;
+    if ((e = make_gv(T.t[T_ROUTER],    BF16W, rtpc, 16, M, sc.xb_x2,  io.logits,    gv::O_F32,  L.router))) return e;
     if (!L.q_a.on || !L.kv_a.on || !(L.q_b.on || tq) || !(L.o_proj.on || to))
         return "layer without q_a.gptq (or q_a.mx.gv) / kv_a.mx.gv / q_b (trellis, q_b.gptq or q_b.mx.gv) / o_proj (trellis, o_proj.gptq or o_proj.mx.gv)";
     if (L.moe != L.router.on) return "router.w.gv and tr3.table must come together";
