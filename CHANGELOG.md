@@ -8,6 +8,9 @@
   R takes the CP attention block on those views, with each row's own block table. Before, a second long agent chat queued
   until the first ended. Not behind a knob: it applies whenever more than one session is past R. Batched CP attention
   equals the per-session calls bitwise per rank (`s2_attn_test` CP cases, `cp_batch_cpu_test`); steps below R are unchanged.
+  Each past-R session still replicates its first R tokens on every rank, so at TP=4's default `SHARE_LIMIT` of 65,536
+  (1,024 of a rank's 1,981 pages) a second one does not fit and waits as before; with `--share-limit 32768` two 72K
+  sessions sent at once were both resident on the four-box cluster (one queued behind the other on the previous build).
 - `G6_S2_DECODE_PF=<rows>` (default off): while any session decodes, a prefill quantum is at most this many rows on one
   lane, so decoding sessions get a round sooner. 0 or a multiple of 64, at most `--prefill`.
 - `G6_S2_ADMIT_HOLD=1` (default off, head only): queued admissions are granted one after another at one held boundary
