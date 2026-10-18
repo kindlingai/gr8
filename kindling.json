@@ -59,11 +59,11 @@
       "concurrency": [
         {
           "streams": 2,
-          "aggregate_tps": 46.6
+          "aggregate_tps": 47.9
         },
         {
           "streams": 4,
-          "aggregate_tps": 60.7
+          "aggregate_tps": 62.2
         }
       ],
       "max_context": 241600,
