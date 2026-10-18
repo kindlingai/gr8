@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-18: a per-session MTP confidence stop in shared rounds (G6_MTP_KSTOPB, off by default)
+
+- When several sessions decode together, a shared round drafts `--mtp` drafts for every session and verifies all of
+  them, however unlikely a session's later drafts are; the solo stop (`G6_MTP_KSTOP`) does not act there. With
+  `G6_MTP_KSTOPB=1` (launch knobs `MTP_KSTOPB`, `MTP_KSTOPB_KMIN`, `MTP_KSTOPB_TAU`, `MTP_KSTOPB_TAU_S`) the chain still
+  drafts K for every session, and each session q verifies its own k_q: the most j with p_1 x .. x p_i >= t_i for every
+  i <= j (the MTP head's log-probabilities, the same bytes on every rank), at least `G6_MTP_KSTOPB_KMIN`. Thresholds
+  `G6_MTP_KSTOPB_TAU` (default 0.6, 0.88; up to seven) at every session count, or `G6_MTP_KSTOPB_TAU_S<n>` for rounds
+  of n sessions.
+- The main step's width is the sum of the sessions' k_q + 1; the boot captures a main graph for every width the rule
+  reaches (about 115 MiB each over 8 buckets), `G6_MTP_KSTOPB_WIDTHS` limits them (a round then verifies the next most
+  likely drafts up to a captured width). `G6_MTP_LPLOG=1` adds `# kstopb` and `# kstopb_ms` lines per shared round.
+- Drafts only: the target decides every token; the verify's row count varies, as with the solo stop. The policy is in the
+  S2 runtime signature. Off, and on with zero thresholds, the planner's steps are unchanged (`batch_kstopb_test`).
+- Measured on four GB10 at TP=4 (`--mtp 2`, thresholds per session count): ABBA over six blocks, c2 +1.5 %, c4 +3.7 %
+  decode; c1 unchanged.
+
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)
