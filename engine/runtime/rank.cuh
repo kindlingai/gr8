@@ -650,7 +650,20 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             for (int d = 0; d < r.nd; ++d) t.shape[d] = r.shape[d];
             return t;
         };
-        y.ap = G6AttnPack{at("kv_b.uk"), at("kv_b.uv"), at("kv_a_norm"), at("idx.k_norm.w"), at("idx.k_norm.b")};
+        // #50 (G6_KVB=fp8): UK / UV as E4M3 u8 with f32 block scales (kv_b.uk.scale, kv_b.uv.scale), else BF16
+        auto at_kvb = [&](const char* suffix, G6AttnTensor& w, G6AttnTensor& s) {
+            const std::string name = lname(y.l, suffix);
+            const TensorRef r = find(name), rs = find(name + ".scale");
+            if (!r.p || r.nd != 3) die("bad attention weight " + name);
+            if (r.bf16) { w = at(suffix); return; }
+            if (!rs.p || rs.nd != 3) die("attention weight " + name + " is not BF16 and has no .scale (G6_KVB=fp8 form)");
+            w.data = r.p; w.ndim = 3; s.data = rs.p; s.ndim = 3;
+            for (int d = 0; d < 3; ++d) { w.shape[d] = r.shape[d]; s.shape[d] = rs.shape[d]; }
+        };
+        y.ap = G6AttnPack{{}, {}, at("kv_a_norm"), at("idx.k_norm.w"), at("idx.k_norm.b"), {}, {}};
+        at_kvb("kv_b.uk", y.ap.uk, y.ap.uks);
+        at_kvb("kv_b.uv", y.ap.uv, y.ap.uvs);
+        if (!y.ap.uks.data != !y.ap.uvs.data) die("layer " + std::to_string(y.l) + ": kv_b.uk and kv_b.uv differ in form");
 #if defined(G6_CP) && G6_CP
         if (m.cp.on)
         {
