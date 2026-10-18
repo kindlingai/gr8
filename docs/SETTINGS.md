@@ -80,6 +80,15 @@ the short version.
 | `G6_XTRACE_OUT` | /tmp | directory for the dumps, `g6xtrace.r<rank>.f<n>.txt` |
 | `G6_XTRACE_QUIT` | unset | path of a file; when it appears, each fabric dumps once |
 | `G6_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
+| `G6_ATTN_SC2` | 0 | decode attention scores of the head-group kernel with S = 1, 2, 4 or 8 key slots per warp, the query loaded once for all S; 0 = off. FP8 KV only, same bits |
+| `G6_ATTN_SC2_TR` | 0 | with `G6_ATTN_SC2`: 1 = the heads' sums reduced by one transpose across the warp, 2 = the same reduction eager; S = 8 ignores it. Same bits |
+| `G6_ATTN_CTX2` | 0 | decode attention context: 1 / 2 = the head-group kernel with 32 / 64 gathered pairs per batch (16 when off), 3 / 4 = a packed, branch-free kernel with 16 / 32, two batches in flight. FP8 KV only, same bits |
+| `G6_ATTN_CTX3` | 0 | decode attention context with one test per batch of slots instead of per slot: 1 / 2 = 16 / 32 pairs per batch over 256 dims per CTA, 3 / 4 = the same over 512. Overrides `G6_ATTN_CTX2`. FP8 KV only, same bits |
+| `G6_ATTN_CTX3_HG` | 0 | with `G6_ATTN_CTX3`: heads per CTA, 2, 4 or 8; 0 = 4 up to 4 rows, then 8 |
+| `G6_ATTN_SEL2` | 0 | decode index selection: the final sort as a rank by count over 8, 16, 32 or 64 CTAs per row. Same bits |
+| `G6_IDX_GRP` | 0 | S2 batched decode steps: the indexer reads each key tile once for up to G = 1..64 rows of one session. Same bits |
+| `G6_ATTN_QT` | 0 | 1 = decode absorb stores q and rope lane-transposed and the scores kernel reads them with 16 B loads. Needs `G6_ATTN_SC2` 2 or 4; not with `G6_AVP1`. FP8 KV only, same bits |
+| `G6_ATTN_FRONT` | 0 | 1 = a decode step's first attention kernels (KV append, then index append and index query prep, or index reuse) as one launch, when the step's rows fit one query tile. Same bits |
 | `G6_DTR` | 1 | the dense trellis matrices of the exlr8 release form (q_b, o_proj, the dense MLP of layers 0-2; `engine/kernels/dtr.cuh`) where a layer has them: decode on the trellis tiles, prefill on the o_proj tiles and on exact FP8 copies of q_b and the dense MLP (made at load). 0 = the int4 / MXFP8 records, which the layer must then have (A/B) |
 | `G6_DTR_PF_COPY` | 0 | 1 = o_proj prefill on an FP8 copy of its tiles too, as q_b and the MLP (about 25 MB more per layer at TP4; A/B, same bits) |
 | `G6_MEM_MIN` | 8 | GiB of MemAvailable the boot must keep after the weights and each layer of the KV pool; under it the engine stops with a message instead of meeting the OOM killer |
@@ -106,6 +115,13 @@ the short version.
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
 | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |
 | `G6_DFL_DUMP` | unset | `--dflash` measurement, rank 0: a file that gets every draft step's context features, drafts and the committed tokens (`engine/ref/dflash2_replay.py` replays it through the reference drafter) |
+
+The decode attention variables from `G6_ATTN_SC2` to `G6_ATTN_FRONT` are read once, before graph capture, so set them
+for the boot. Other values than the ones listed mean off. `G6_ATTN_P11=1`, and `G6_ATTN_FLIP` where it applies, take
+precedence over `G6_ATTN_SC2`, `G6_ATTN_CTX2` and `G6_ATTN_CTX3` (and so over `G6_ATTN_QT`), and `G6_ATTN_HEADS=0` turns
+those four off. The measured set is `G6_ATTN_SC2=4 G6_ATTN_SC2_TR=2 G6_ATTN_CTX2=4 G6_ATTN_CTX3=2 G6_ATTN_SEL2=16
+G6_IDX_GRP=16 G6_ATTN_QT=1 G6_ATTN_FRONT=1` (CHANGELOG, 2026-10-16). "Same bits" is by construction for every value;
+the attnk bench (`engine/attn/tests/attnk.cu`) checked the measured set, with and without `QT=1 FRONT=1`.
 
 `G6ENV_X="NAME=value ..."` adds more variables on every rank. The engine rejects bad `G6_PF_*` values at startup
 (`engine/runtime/envparse.h`).

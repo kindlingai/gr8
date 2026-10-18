@@ -80,10 +80,11 @@ __global__ void __launch_bounds__(256) scores_heads(Input input,int start,const 
    sum=ga::warp_sum(sum);if(lane==hh)mine=sum*(1.f/16);}}
  if(lane<nh)out[((int64_t)row*a.heads+h0+lane)*ga::TOP+j]=mine;
 }
-// context_parts_heads: block per (part, half of the 512 dims, head group, row); thread t owns dims d, d+1 for HG heads
-template<int HG,class Input>
+// context_parts_heads: block per (part, half of the 512 dims, head group, row); thread t owns dims d, d+1 for HG heads.
+// PB gathered pairs are loaded per batch (16; G6_ATTN_CTX2=1 / 2: 32 / 64, the same FMAs in the same order).
+template<int HG,int PB=16,class Input>
 __global__ void __launch_bounds__(128) context_parts_heads(Input input,int start,const float* probs,float* parts){
- auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2,GROUPS=(D+127)/128,PB=16;
+ auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2,GROUPS=(D+127)/128;
  int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x;FOR_ROW(a,input,r);
  const int nh=min(HG,a.heads-h0);
  __shared__ uintptr_t rows[256];__shared__ float probability[HG][256],scale[256*GROUPS];bool active=false;
@@ -103,6 +104,243 @@ __global__ void __launch_bounds__(128) context_parts_heads(Input input,int start
   for(int u=0;u<PB;u++){const int j=j0+u;if(!rows[j])continue;float2 x=fp8_pair(raw[u]);float s=scale[j*GROUPS+(2*t)/128];
    #pragma unroll
    for(int hh=0;hh<HG;hh++){float p=probability[hh][j];if(p==0)continue;lo[hh]=fmaf(p,x.x*s,lo[hh]);hi[hh]=fmaf(p,x.y*s,hi[hh]);}}}
+ #pragma unroll
+ for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
+}
+// G6_ATTN_SC2=<S> (attn_sc2): scores_heads<16> with S consecutive slots per warp. Each head's 16 latent + 2 RoPE query
+// values are loaded once per warp and used for all S slots (Q traffic / S, S independent fmaf chains per head), head loop
+// unrolled. Per (row, head, slot): the same products in the same fmaf order, then the same warp_sum (TR = false) or
+// scores_tr's transpose reduction (TR = true, G6_ATTN_SC2_TR=1: per head the same xor tree, a + b commutes bitwise), the
+// same 1/16 scale, -inf for a dead slot, the same output address -> bit-identical to scores_heads<16>. Validity is per slot
+// and warp-uniform (one id per slot), so every shuffle stays full-warp; a dead slot in a live warp runs on zero operands and
+// stores -inf. Needs heads % 16 == 0 (dispatch). grid dim3(TOP/(4*S), heads/16, n), block 128: warp w of block x owns slots
+// (4x + w)*S .. +S-1, lane l < 16 stores head h0 + l of them (one S-wide vector store).
+// TR = 2 (G6_ATTN_SC2_TR=2): the same transpose reduction, eager. Every combine of TR = 1 pairs entries i and i + n/2 of the
+// stage, so the head entering it can be computed right before: heads in bit-reversed order (0 8 4 12 2 10 6 14 1 ...), each
+// pair combined at offset 16 at once, two such results at 8, then 4, 2, and the last stage's a += shfl(a, 1). The same
+// combines of the same values (keep / send by the same lane bit) -> TR = 1's bytes, with at most a few partials per slot
+// live instead of 16 (registers). S = 8 (kv alone is 128 registers) is built with TR = 0 only (G6_ATTN_SC2_TR ignored).
+// QT (G6_ATTN_QT, attn.cu use_qt): q / rope are lane-transposed (absorb_m2<R,true>): head hh's 16 latent q of a lane are four
+// float4 (c*32 + lane, c = 0..3: qv[4c + e]) and its 2 rope q one float2 (lane), 5 loads instead of 18; a slot's 4 KV
+// scales are one float4 (row = 41 x 16 B, mla_cache 16 B aligned). The same values in qv / pv / scale -> the same bytes.
+// scores_sc_qt is that kernel, registers capped at 4 blocks / SM (S = 4 is 128 registers without QT).
+template<int S,int TR,bool QT,class Input>
+__device__ __forceinline__ void scores_sc_body(Input input,int start,const float* q,const float* rope,float* out,int tid){
+ static_assert(S==1||S==2||S==4||S==8,"S in {1,2,4,8}");
+ static_assert(TR>=0&&TR<=2&&!(S==8&&TR),"TR in {0,1,2}; S = 8 with TR 0");
+ auto a=ga::resolve(input);if(!a.active)return;constexpr int HG=16,WARPS=4;
+ int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,j0=(blockIdx.x*WARPS+tid/32)*S,lane=tid&31;FOR_ROW(a,input,r);
+ const uint8_t* v[S];bool any=false;
+ #pragma unroll
+ for(int s=0;s<S;s++){int id=a.indices[(int64_t)r*ga::TOP+j0+s];v[s]=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?ga::kv_at(a,id):nullptr;any|=v[s]!=nullptr;}
+ float mine[S];
+ #pragma unroll
+ for(int s=0;s<S;s++)mine[s]=-INFINITY;
+ if(any){float kv[S][16],rv[S][2];
+  #pragma unroll
+  for(int s=0;s<S;s++){
+   if(v[s]){float scale[4];
+    if constexpr(QT){const float4 s4=*(const float4*)(v[s]+512);scale[0]=s4.x;scale[1]=s4.y;scale[2]=s4.z;scale[3]=s4.w;}
+    else{
+    #pragma unroll
+    for(int g=0;g<4;g++)scale[g]=((const float*)(v[s]+512))[g];}
+    #pragma unroll
+    for(int k=0;k<16;k++)kv[s][k]=ga::e4(v[s][lane+k*32])*scale[k/4];
+    #pragma unroll
+    for(int k=0;k<2;k++)rv[s][k]=__bfloat162float(((const bf16*)(v[s]+528))[lane+k*32]);}
+   else{
+    #pragma unroll
+    for(int k=0;k<16;k++)kv[s][k]=0;
+    rv[s][0]=rv[s][1]=0;}}
+  const float* qh=q+((int64_t)row*a.heads+h0)*512+lane;const float* ph=rope+((int64_t)row*a.heads+h0)*64+lane;
+  // head hh's query of this lane: d = lane + 32k (qv[k]), j = lane + 32k (pv[k])
+  auto loadq=[&](int hh,float (&qv)[16],float (&pv)[2]){
+   if constexpr(QT){const float4* q4=(const float4*)(qh-lane+hh*512)+lane;
+    #pragma unroll
+    for(int c=0;c<4;c++){const float4 x=__ldg(q4+c*32);qv[4*c]=x.x;qv[4*c+1]=x.y;qv[4*c+2]=x.z;qv[4*c+3]=x.w;}
+    const float2 y=__ldg((const float2*)(ph-lane+hh*64)+lane);pv[0]=y.x;pv[1]=y.y;}
+   else{
+    #pragma unroll
+    for(int k=0;k<16;k++)qv[k]=__ldg(qh+hh*512+k*32);
+    #pragma unroll
+    for(int k=0;k<2;k++)pv[k]=__ldg(ph+hh*64+k*32);}};
+  if constexpr(TR==2){
+   // head hh's S dot products (the TR = 0 / 1 chains)
+   auto head=[&](int hh,float (&o)[S]){float qv[16],pv[2];loadq(hh,qv,pv);
+    #pragma unroll
+    for(int s=0;s<S;s++){float sum=0;
+     #pragma unroll
+     for(int k=0;k<16;k++)sum=fmaf(qv[k],kv[s][k],sum);
+     #pragma unroll
+     for(int k=0;k<2;k++)sum=fmaf(pv[k],rv[s][k],sum);
+     o[s]=sum;}};
+   // TR = 1's combine of entries x = acc[i] and y = acc[i + n/2] at offset o
+   auto comb=[&](float x,float y,int o){const bool hi=(lane&o)!=0;const float keep=hi?y:x,send=hi?x:y;return keep+__shfl_xor_sync(0xffffffff,send,o);};
+   int src=0;{const int want=lane%HG;int n=HG,o=16,hd=0;while(n>1){const int hf=n/2;if(want>=hd+hf){src|=o;hd+=hf;}n=hf;o>>=1;}}
+   float t2[2][S];   // T2(a2) = comb(T3(a2), T3(a2+2), 4), T3(i) = comb(T4(i), T4(i+4), 8), T4(i) = comb(H(i), H(i+8), 16)
+   #pragma unroll
+   for(int a2=0;a2<2;a2++){float t3[2][S];
+    #pragma unroll
+    for(int a3=0;a3<2;a3++){float t4[2][S];
+     #pragma unroll
+     for(int a4=0;a4<2;a4++){const int i=a2+2*a3+4*a4;float x0[S],x1[S];head(i,x0);head(i+8,x1);
+      #pragma unroll
+      for(int s=0;s<S;s++)t4[a4][s]=comb(x0[s],x1[s],16);}
+     #pragma unroll
+     for(int s=0;s<S;s++)t3[a3][s]=comb(t4[0][s],t4[1][s],8);}
+    #pragma unroll
+    for(int s=0;s<S;s++)t2[a2][s]=comb(t3[0][s],t3[1][s],4);}
+   #pragma unroll
+   for(int s=0;s<S;s++){float f=comb(t2[0][s],t2[1][s],2);f+=__shfl_xor_sync(0xffffffff,f,1);
+    const float got=__shfl_sync(0xffffffff,f,src);
+    if(lane<HG)mine[s]=got*(1.f/16);}}
+  else{
+  float acc[TR?S:1][TR?HG:1];
+  #pragma unroll
+  for(int hh=0;hh<HG;hh++){float qv[16],pv[2];loadq(hh,qv,pv);
+   #pragma unroll
+   for(int s=0;s<S;s++){float sum=0;
+    #pragma unroll
+    for(int k=0;k<16;k++)sum=fmaf(qv[k],kv[s][k],sum);
+    #pragma unroll
+    for(int k=0;k<2;k++)sum=fmaf(pv[k],rv[s][k],sum);
+    if constexpr(TR)acc[s][hh]=sum;
+    else{sum=ga::warp_sum(sum);if(lane==hh)mine[s]=sum*(1.f/16);}}}
+  if constexpr(TR){
+   int src=0;{const int want=lane%HG;int n=HG,o=16,hd=0;while(n>1){const int hf=n/2;if(want>=hd+hf){src|=o;hd+=hf;}n=hf;o>>=1;}}
+   #pragma unroll
+   for(int s=0;s<S;s++){   // scores_tr's reduction, per slot
+    #pragma unroll
+    for(int n=HG,o=16;o>=1;o>>=1){
+     if(n>1){const bool hi=(lane&o)!=0;const int hf=n/2;
+      #pragma unroll
+      for(int i=0;i<HG/2;i++)if(i<hf){float keep=hi?acc[s][i+hf]:acc[s][i],send=hi?acc[s][i]:acc[s][i+hf];acc[s][i]=keep+__shfl_xor_sync(0xffffffff,send,o);}
+      n=hf;}
+     else acc[s][0]+=__shfl_xor_sync(0xffffffff,acc[s][0],o);}
+    const float got=__shfl_sync(0xffffffff,acc[s][0],src);
+    if(lane<HG)mine[s]=got*(1.f/16);}}}
+  #pragma unroll
+  for(int s=0;s<S;s++)if(!v[s])mine[s]=-INFINITY;}
+ if(lane<HG){float* o=out+((int64_t)row*a.heads+h0+lane)*ga::TOP+j0;
+  if constexpr(S==8){((float4*)o)[0]=make_float4(mine[0],mine[1],mine[2],mine[3]);((float4*)o)[1]=make_float4(mine[4],mine[5],mine[6],mine[7]);}
+  else if constexpr(S==4)*(float4*)o=make_float4(mine[0],mine[1],mine[2],mine[3]);
+  else if constexpr(S==2)*(float2*)o=make_float2(mine[0],mine[1]);
+  else o[0]=mine[0];}
+}
+template<int S,int TR,class Input>
+__global__ void __launch_bounds__(128) scores_sc(Input input,int start,const float* q,const float* rope,float* out){
+ scores_sc_body<S,TR,false>(input,start,q,rope,out,threadIdx.x);}
+template<int S,int TR,class Input>
+__global__ void __launch_bounds__(128,4) scores_sc_qt(Input input,int start,const float* q,const float* rope,float* out){
+ scores_sc_body<S,TR,true>(input,start,q,rope,out,threadIdx.x);}
+// G6_ATTN_CTX2=3 / 4 (attn_ctx2): context_parts_heads<HG> with the per-slot work packed and branch-free. Prologue as
+// context_parts_heads, but slot j's HG probabilities sit together (pm[j], 16 B smem loads), a slot whose row pointer is null
+// gets p = 0 for every head, and the skip is a select: lo = p != 0 ? fmaf(p, x*s, lo) : lo, which is `if (!rows[j]) continue`
+// + `if (p == 0) continue` (-0 and NaN p included). The gathered pairs of the next PB slots are loaded before the current PB
+// are consumed (two register batches in flight). SP = slots per partition: 256 (P = PART partitions) gives every (row, head,
+// dim) chain the same fmaf operands in the same slot order -> parts bit-identical to context_parts_heads.
+// grid dim3(P*2, heads/HG, n), block 128.
+template<int HG,int PB,int SP,class Input>
+__global__ void __launch_bounds__(128) context_pk(Input input,int start,const float* probs,float* parts){
+ static_assert(SP%(2*PB)==0&&HG%4==0,"SP multiple of 2*PB, HG multiple of 4");
+ auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2,GROUPS=(D+127)/128,P=ga::TOP/SP;
+ int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x;FOR_ROW(a,input,r);
+ const int nh=min(HG,a.heads-h0);
+ __shared__ uintptr_t rows[SP];__shared__ __align__(16) float pm[SP][HG];__shared__ float scale[SP*GROUPS];bool active=false;
+ for(int j=t;j<SP;j+=THREADS){int slot=part*SP+j,id=a.indices[(int64_t)r*ga::TOP+slot];const uint8_t* src=nullptr;
+  const bool idok=id>=0&&id<=a.positions[r];   // dead slots read no probabilities
+  float p[HG];bool live=false;
+  #pragma unroll
+  for(int hh=0;hh<HG;hh++){p[hh]=idok&&hh<nh?probs[((int64_t)row*a.heads+h0+hh)*ga::TOP+slot]:0.f;live|=p[hh]!=0;}
+  if(live)src=ga::kv_at(a,id);
+  #pragma unroll
+  for(int hh=0;hh<HG;hh++)pm[j][hh]=src?p[hh]:0.f;
+  rows[j]=(uintptr_t)src;if(src)for(int g=0;g<GROUPS;g++)scale[j*GROUPS+g]=((const float*)(src+512))[d0/128+g];active|=src!=nullptr;}
+ const bool any=__syncthreads_or(active);float lo[HG],hi[HG];
+ #pragma unroll
+ for(int hh=0;hh<HG;hh++){lo[hh]=0;hi[hh]=0;}
+ const int d=d0+2*t,gs=(2*t)/128;
+ if(any){uint16_t ra[PB],rb[PB];
+  auto load=[&](uint16_t (&raw)[PB],int j0){
+   #pragma unroll
+   for(int u=0;u<PB;u++){const uint8_t* src=(const uint8_t*)rows[j0+u];raw[u]=src?*(const uint16_t*)(src+d):(uint16_t)0;}};
+  auto use=[&](const uint16_t (&raw)[PB],int j0){
+   #pragma unroll
+   for(int u=0;u<PB;u++){const int j=j0+u;const float2 x=fp8_pair(raw[u]);const float sc=scale[j*GROUPS+gs];float p[HG];
+    #pragma unroll
+    for(int i=0;i<HG;i+=4){const float4 q4=*(const float4*)&pm[j][i];p[i]=q4.x;p[i+1]=q4.y;p[i+2]=q4.z;p[i+3]=q4.w;}
+    #pragma unroll
+    for(int hh=0;hh<HG;hh++){const float fl=fmaf(p[hh],x.x*sc,lo[hh]),fh=fmaf(p[hh],x.y*sc,hi[hh]);lo[hh]=p[hh]!=0?fl:lo[hh];hi[hh]=p[hh]!=0?fh:hi[hh];}}};
+  load(ra,0);
+  for(int j0=0;j0<SP;j0+=2*PB){load(rb,j0+PB);use(ra,j0);if(j0+2*PB<SP)load(ra,j0+2*PB);use(rb,j0+PB);}}
+ #pragma unroll
+ for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*P+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
+}
+// G6_ATTN_CTX3=1..4 (attn_ctx3): context_pk with less work per slot. Prologue as context_pk (pm[j] = slot j's HG
+// probabilities, 0 for a slot whose KV row is not read), plus the slot's KV row index (kv_row; a slot that is not read points
+// at row 0, which is loaded and never used), its scales (scl[g][j], g = the CTA's 128-dim groups) and, per batch of PB
+// slots, one state from two warp ballots: 0 = no slot read (skipped), 1 = every slot read with all HG probabilities != 0
+// (plain fmaf: no test), 2 = mixed (context_pk's select lo = p != 0 ? fmaf(p, x*s, lo) : lo; an unread slot has p = 0 for
+// every head). Batches run in slot order up to the last one with a slot read, the next batch's pairs (32-bit registers, one
+// read-only 16-bit load from the row index, no pointer test) loaded before the current batch is used. Per (row, head, dim)
+// chain: the same fmaf operands in the same slot order as context_parts_heads, the same skips of unread slots and of
+// p == 0 (-0 and NaN p as there) -> parts bit-identical. D = dims per CTA: 256 (two CTAs per partition, as
+// context_parts_heads) or 512 (one, the prologue once per partition). grid dim3(PART*512/D, ceil(heads/HG), n), block D/2.
+// Rows are 32-bit: the dispatch (use_ctx3) needs page_count * page_size <= INT_MAX.
+template<int HG,int PB,int D,class Input>
+__global__ void __launch_bounds__(D/2) context_pk3(Input input,int start,const float* probs,float* parts){
+ static_assert((D==256||D==512)&&(PB==16||PB==32)&&(HG==2||HG%4==0),"D 256 / 512, PB 16 / 32, HG 2 or a multiple of 4");
+ auto a=ga::resolve(input);if(!a.active)return;constexpr int THREADS=D/2,GROUPS=D/128,SP=256,NB=SP/PB;
+ const int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x,lane=t&31;FOR_ROW(a,input,r);
+ const int nh=min(HG,a.heads-h0);
+ __shared__ __align__(16) float pm[SP][HG];__shared__ float scl[GROUPS][SP];__shared__ int kv_row[SP];__shared__ uint8_t state[NB];
+ for(int j=t;j<SP;j+=THREADS){const int slot=part*SP+j,id=a.indices[(int64_t)r*ga::TOP+slot];   // j - lane: a multiple of 32
+  const bool idok=id>=0&&id<=a.positions[r];   // dead slots read no probabilities
+  float p[HG];bool live=false,full=true;
+  #pragma unroll
+  for(int hh=0;hh<HG;hh++){p[hh]=idok&&hh<nh?probs[((int64_t)row*a.heads+h0+hh)*ga::TOP+slot]:0.f;live|=p[hh]!=0;full&=hh>=nh||p[hh]!=0;}
+  int kr=-1;if(live){const int pg=ga::page(a,id);if(pg>=0)kr=(int)((int64_t)pg*a.page_size+id%a.page_size);}   // kv_at's row (< 2^31: dispatch)
+  const bool rd=kr>=0;full&=rd;
+  #pragma unroll
+  for(int hh=0;hh<HG;hh++)pm[j][hh]=rd?p[hh]:0.f;
+  kv_row[j]=rd?kr:0;
+  #pragma unroll
+  for(int g=0;g<GROUPS;g++)scl[g][j]=rd?((const float*)((const uint8_t*)a.mla_cache+(int64_t)kr*ga::KV_BYTES+512))[d0/128+g]:0.f;
+  const unsigned br=__ballot_sync(0xffffffffu,rd),bf=__ballot_sync(0xffffffffu,full);
+  if(lane==0){
+   #pragma unroll
+   for(int h2=0;h2<32/PB;h2++){const unsigned m=PB==32?0xffffffffu:0xffffu<<(16*h2);state[j/PB+h2]=(bf&m)==m?1:(br&m)?2:0;}}}
+ __syncthreads();
+ int nb=0;
+ #pragma unroll
+ for(int b=0;b<NB;b++)if(state[b])nb=b+1;
+ float lo[HG],hi[HG];
+ #pragma unroll
+ for(int hh=0;hh<HG;hh++){lo[hh]=0;hi[hh]=0;}
+ const int d=d0+2*t,gs=(2*t)/128;
+ if(nb){const uint8_t* kvd=(const uint8_t*)a.mla_cache+d;const float* sg=scl[gs];uint32_t ra[PB],rb[PB];
+  auto load=[&](uint32_t (&raw)[PB],int b){
+   #pragma unroll
+   for(int u=0;u<PB;u++)raw[u]=__ldg((const unsigned short*)(kvd+(int64_t)kv_row[b*PB+u]*ga::KV_BYTES));};
+  auto probs_of=[&](int j,float (&p)[HG]){
+   if constexpr(HG==2){const float2 q2=*(const float2*)&pm[j][0];p[0]=q2.x;p[1]=q2.y;}
+   else{
+    #pragma unroll
+    for(int i=0;i<HG;i+=4){const float4 q4=*(const float4*)&pm[j][i];p[i]=q4.x;p[i+1]=q4.y;p[i+2]=q4.z;p[i+3]=q4.w;}}};
+  auto use=[&](const uint32_t (&raw)[PB],int b){
+   const int st=state[b];
+   if(st==1){
+    #pragma unroll
+    for(int u=0;u<PB;u++){const int j=b*PB+u;const float2 x=fp8_pair((uint16_t)raw[u]);const float sc=sg[j];float p[HG];probs_of(j,p);
+     #pragma unroll
+     for(int hh=0;hh<HG;hh++){lo[hh]=fmaf(p[hh],x.x*sc,lo[hh]);hi[hh]=fmaf(p[hh],x.y*sc,hi[hh]);}}}
+   else if(st==2){
+    #pragma unroll
+    for(int u=0;u<PB;u++){const int j=b*PB+u;const float2 x=fp8_pair((uint16_t)raw[u]);const float sc=sg[j];float p[HG];probs_of(j,p);
+     #pragma unroll
+     for(int hh=0;hh<HG;hh++){const float fl=fmaf(p[hh],x.x*sc,lo[hh]),fh=fmaf(p[hh],x.y*sc,hi[hh]);lo[hh]=p[hh]!=0?fl:lo[hh];hi[hh]=p[hh]!=0?fh:hi[hh];}}}};
+  load(ra,0);
+  for(int b=0;b<nb;b+=2){if(b+1<nb)load(rb,b+1);use(ra,b);if(b+2<nb)load(ra,b+2);if(b+1<nb)use(rb,b+1);}}
  #pragma unroll
  for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
 }
@@ -229,6 +467,65 @@ static void launch_index_scores(const G6Attn& a,Input input,Work& w,int start,in
 }
 // G6_ATTN_HEADS=0 (read at launch / capture): the per-head scores_direct / context_parts kernels (A/B and tests)
 static bool attn_heads(){static const bool on=!getenv("G6_ATTN_HEADS")||atoi(getenv("G6_ATTN_HEADS"))!=0;return on;}
+// G6_ATTN_SC2=<S> (default 0 = off): scores_sc<S> (S = 1, 2, 4, 8 slots per warp) for the scores_heads<16> calls;
+// G6_ATTN_SC2_TR=1 adds scores_tr's transpose reduction, =2 the same reduction eager (S = 8: TR 0 only).
+// Bit-identical. Host-side, read once (before graph capture). Tests may assign them.
+static int& attn_sc2(){static int v=[]{const char* e=getenv("G6_ATTN_SC2");const int x=e?atoi(e):0;return x==1||x==2||x==4||x==8?x:0;}();return v;}
+static int& attn_sc2_tr(){static int v=[]{const char* e=getenv("G6_ATTN_SC2_TR");const int x=e?atoi(e):0;return x==1||x==2?x:0;}();return v;}
+// qt (run_body, attn.cu use_qt: S = 2 / 4 only): scores_sc_qt on the lane-transposed q / rope
+template<int S,class Input>
+static void launch_scores_qt(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ const dim3 g(TOP/(4*S),a.heads/16,n);const int tr=attn_sc2_tr();
+ if(tr==2)small_decode::scores_sc_qt<S,2><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else if(tr)small_decode::scores_sc_qt<S,1><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else small_decode::scores_sc_qt<S,0><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+}
+template<class Input>
+static void launch_scores_sc(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
+ if(qt){if(attn_sc2()==2)launch_scores_qt<2>(a,input,w,start,n,st);else launch_scores_qt<4>(a,input,w,start,n,st);return;}
+ const dim3 b(128),g1(TOP/4,a.heads/16,n),g2(TOP/8,a.heads/16,n),g4(TOP/16,a.heads/16,n),g8(TOP/32,a.heads/16,n);
+ const int tr=attn_sc2_tr();
+ switch(attn_sc2()){
+  case 1:if(tr==2)small_decode::scores_sc<1,2><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else if(tr)small_decode::scores_sc<1,1><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else small_decode::scores_sc<1,0><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+  case 2:if(tr==2)small_decode::scores_sc<2,2><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else if(tr)small_decode::scores_sc<2,1><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else small_decode::scores_sc<2,0><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+  case 8:small_decode::scores_sc<8,0><<<g8,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+  default:if(tr==2)small_decode::scores_sc<4,2><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else if(tr)small_decode::scores_sc<4,1><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else small_decode::scores_sc<4,0><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;}
+}
+// G6_ATTN_CTX2 (attn.cu attn_ctx2): the context_parts_heads calls (HG 4 up to 4 rows, then 8) under the same head groups
+template<int HG,class Input>
+static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ const dim3 g(PART*2,(a.heads+HG-1)/HG,n);
+ switch(attn_ctx2()){
+  case 1:small_decode::context_parts_heads<HG,32><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
+  case 2:small_decode::context_parts_heads<HG,64><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
+  case 3:small_decode::context_pk<HG,16,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
+  case 4:small_decode::context_pk<HG,32,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;}
+}
+// G6_ATTN_CTX3 (attn.cu attn_ctx3): context_pk3 on the context_parts_heads calls; head group G6_ATTN_CTX3_HG, else as there.
+// Only while every KV row index fits in 32 bits (page() bounds a page by the fixed page_count).
+static bool use_ctx3(const G6Attn& a){return attn_ctx3()&&(int64_t)a.page_count*a.page_size<=INT_MAX;}
+template<int HG,class Input>
+static void launch_ctx3_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ const int y=(a.heads+HG-1)/HG;
+ switch(attn_ctx3()){
+  case 1:small_decode::context_pk3<HG,16,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
+  case 2:small_decode::context_pk3<HG,32,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
+  case 3:small_decode::context_pk3<HG,16,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;
+  default:small_decode::context_pk3<HG,32,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;}
+}
+template<class Input>
+static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ switch(attn_ctx3_hg()?attn_ctx3_hg():n>=5?8:4){
+  case 2:launch_ctx3_hg<2>(a,input,w,start,n,st);break;
+  case 8:launch_ctx3_hg<8>(a,input,w,start,n,st);break;
+  default:launch_ctx3_hg<4>(a,input,w,start,n,st);break;}
+}
 // G6_ATTN_P11 decode tile retune. Host-side, read once (set before graph
 // capture). G6_ATTN_P11=0 -> the old head-batched path (scores_heads<16>, context_parts_heads HG4/HG8 x D256), unchanged.
 // Default OFF (G6_ATTN_P11=1 turns it on). Compile switch: -DATTN_P11_OLD=1 forces the old path regardless of the env. Only the attn_heads() branch
@@ -280,8 +577,8 @@ static void launch_context_tile(const G6Attn& a,Input input,Work& w,int start,in
 // The head-batched kernels do the arithmetic of both the fixed-K and the generic kernels (mla_scores, context_parts:
 // the same products, FMA order and skips per (row, head, slot)), so they serve every decode call: verify rows of a fresh
 // index and contexts past 2048 included.
-template<class Input>
-static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+template<class Input>   // qt: run_body only (attn.cu use_qt, which implies the scores_sc branch below)
+static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
  #if G6_KV4   // the INT4 row has the head-batched kernel and the generic one; the FP8-only variants below are not used
  if(attn_heads()){constexpr int HG=16;kv4::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
@@ -289,6 +586,7 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int 
  #endif
  if(use_attn_flip(a,n))small_decode::scores_flip<Input,11><<<dim3(TOP/8,(a.heads+10)/11,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else if(attn_heads()&&attn_p11()&&a.heads%16==0)small_decode::scores_tr<16><<<dim3(TOP/8,a.heads/16,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else if(attn_heads()&&attn_sc2()&&a.heads%16==0)launch_scores_sc(a,input,w,start,n,st,qt);
  else if(attn_heads()){constexpr int HG=16;small_decode::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
  else if(use_long_fixed_k(a,n))small_decode::scores_flip<Input,1><<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else if(use_fixed_k_decode(a))small_decode::scores_direct<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
@@ -319,6 +617,8 @@ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,i
  if(attn_heads()&&attn_p11()){launch_context_tile(a,input,w,start,n,st);return;}
  if(attn_heads()){
   // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
+  if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st);return;}
+  if(attn_ctx2()){if(n>=5)launch_ctx2<8>(a,input,w,start,n,st);else launch_ctx2<4>(a,input,w,start,n,st);return;}
   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
   else{constexpr int HG=4;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
   return;}
