@@ -1084,7 +1084,7 @@ inline void l2pf_window(Model& m, int w, int from, int i, int M, const g6::Fabri
     l2pf::Stop s;
     if (f) { s.f = *f; s.c = c; s.payload = payload; }
     s.stepp = m.stepp;
-    l2pf::window(w, from, i, l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv), s, st);
+    l2pf::window(w, from, i, l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv, y.ab.args.uks, y.ab.args.uvs), s, st);
 }
 
 // G6_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
