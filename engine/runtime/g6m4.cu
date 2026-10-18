@@ -114,6 +114,8 @@
 #include "rt_rows.cuh"
 #include "host_reclaim.h"
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <unistd.h>
 
 using namespace g6rt;
@@ -667,6 +669,26 @@ int main(int argc, char** argv)
     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
     if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die("G6_QA_SPLIT, G6_IDXQ_SPLIT and G6_MTP_SPLIT are GLM-5.3 paths");
     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
+    // G6_S2_DSEL_MODEL=1 + G6_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
+    // choice prices both drafters from one frozen cost table and MTP rounds under the confidence stop. Every rank reads
+    // the same table; its canonical form is in the S2 runtime signature
+    std::string pce;
+    const int dsel_model = env_choice("G6_S2_DSEL_MODEL", 1, 0, &pce);
+    if (dsel_model < 0) die(pce);
+    s2::DSelTable dsel_tab;
+    if (dsel_model)
+    {
+        const char* e = getenv("G6_S2_DSEL_TABLE");
+        if (!e || !*e || !dfl || !s2mode) die("G6_S2_DSEL_MODEL needs G6_S2_DSEL_TABLE, --serve and --dflash-manifest");
+        std::string text = e, err;
+        if (text.find(':') == std::string::npos)    // no key:value: the path of a file holding the table
+        {
+            std::ifstream f(text);
+            if (!f) die("G6_S2_DSEL_TABLE: cannot read " + text);
+            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        if (!dsel_tab.parse(text, &err)) die(err);
+    }
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -1902,6 +1924,15 @@ int main(int argc, char** argv)
                     h.dsel.d.draft_round = d[0]; h.dsel.m.draft_round = d[1]; h.dsel.m.draft_each = d[2];
                     if (R == 0) fprintf(stderr, "# spec: drafting ms from G6_SPEC_DRAFT: %s\n", e);
                 }
+                h.dsel.model = dsel_model;    // the table replaces the drafter choice's verify table and drafting ms above (Batch::dsel)
+                h.dsel.tab = dsel_tab;
+                if (R == 0 && dsel_model)
+                {
+                    fprintf(stderr, "# s2 drafter choice cost model %d: table %s\n", dsel_model, dsel_tab.str().c_str());
+                    if (getenv("G6_SPEC_TABLE") || getenv("G6_SPEC_DRAFT"))
+                        fprintf(stderr, "# note: the drafter choice reads the table's v1..v8, d, m, e, not G6_SPEC_TABLE / G6_SPEC_DRAFT; "
+                                        "G6_SPEC_TABLE still prices the DFlash2 rounds' own draft count\n");
+                }
                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe);
                 h.kstop = kstop;
@@ -1996,8 +2027,8 @@ int main(int argc, char** argv)
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dfl_body_i4_on ? " dflbodyi4 1" : "");
-
+                (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
