@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-17: a fabric pool at boot and TP groups at runtime (EL6), Fabric::close
+
+- `engine/comms/fabric_pool.h` (`FabricPool`): every box that may join a layout opens one control link to the pool head at
+  boot and keeps it; the head checks that every box was started with the same pool. A group is an ordered list of pool
+  indices (its first member is rank 0), announced by the head and acknowledged by every box, each learning its rank or
+  that it is idle, plus the group's fabric port base, S2 port and S2 head. Group ids alternate between two port ranges so
+  the next layout's group can be built while the current one runs. `group_fabric()` builds a member's `FabricConfig`
+  (mesh only; rings are refused). The engine does not call the pool yet: nothing listens on the new ports until the
+  engine runs on a group.
+- `Fabric::close()` frees a mesh fabric (every QP, MR, CQ, PD, device context, the pinned region and the trace buffer, in
+  that order) after draining the proxy; the fabric can then be init'ed again. `fabric_live()` counts the live objects for
+  the leak gate. The destructor still only stops the proxy.
+- Each fabric rotates its own barrier port (before, one static counter was shared by every fabric in the process; a
+  barrier still uses one of its own fabric's `port+1..port+3`), and each mesh QP draws a fresh start PSN instead of a
+  fixed function of (rank, peer), so a late packet of a dropped group cannot match a recycled QP number at its expected PSN.
+- Tests: `fabric_pool_test` (host, loopback; in `scripts/host_tests.sh`) and `fabric_group_test` (built by
+  `scripts/build.sh`, run by hand on the cluster: today's fabric against the all-boxes group, bit-identical digests, then
+  groups created and dropped in a loop with the verbs objects, pinned bytes and descriptors checked back to baseline).
 ## 2026-10-17: several sessions past R stay resident together (CP batch views); G6_S2_DECODE_PF, G6_S2_ADMIT_HOLD, G6_S2_DECODE_ROUNDS (default off)
 
 - A session past `SHARE_LIMIT` (R) no longer needs the KV pool to itself. On the pool's page classes a split run past R

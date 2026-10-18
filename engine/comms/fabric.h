@@ -67,14 +67,29 @@ __host__ __device__
 #endif
 inline unsigned long long coll_seq(unsigned long long step, int c, int ncoll) { return step * (unsigned long long)ncoll + c + 1; }
 
+// Verbs objects and pinned bytes held by the live mesh fabrics of this process (each counter goes up in init and back
+// down in close). A group created and dropped (fabric_pool.h) must leave every counter where it was. ring_fabrics counts
+// ring fabrics, which are never freed.
+struct FabricLive { long fabrics = 0, qps = 0, mrs = 0, cqs = 0, pds = 0, ctxs = 0, pinned_bytes = 0, ring_fabrics = 0; };
+FabricLive fabric_live();
+
 class Fabric {
  public:
   Fabric() = default;
   ~Fabric();
   void init(const FabricConfig& cfg);
+  // Stop the proxy and free everything init made (mesh): QPs, MRs, CQs, PDs, device contexts, the pinned region. The
+  // caller first lets the proxy post what it was given (wait_proxy_idle; close waits up to 60 s itself and says so if
+  // jobs were left) and runs a barrier on a fabric of the group, so no peer still writes into this one. The Fabric can
+  // then be init'ed again; enqueue, barrier and the proxy calls abort before that, and dev() is empty. A thread that
+  // watches dev().error must stop before close (the word is in the freed region). A ring fabric (never regrouped) only stops its proxy and
+  // cannot be init'ed again: its relay is shared by the process. The destructor only stops the proxy, as before (at
+  // exit a peer may still be writing).
+  void close();
   FabricDev dev() const { return dev_; }
   int rank() const { return cfg_.rank; }
   int nranks() const { return (int)cfg_.ips.size(); }
+  int port() const { return cfg_.port; }   // bootstrap base (FabricConfig::port), for messages
   // variable-layout fabric only: kernel view of collective c (both parities)
   VSlotDev vslot(int c) const;
   const VLayout& vlayout() const;
