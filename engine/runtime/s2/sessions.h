@@ -108,8 +108,8 @@ public:
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
         require(!head_ || s.emitter.f, "cannot open S2 response");
         if (s.emitter.f) {
-            fprintf(s.emitter.f, "a %llu %u %u %u %u\n", (unsigned long long)g.key.epoch, g.key.slot,
-                    g.key.generation, g.run.first_page, g.run.pages);
+            fprintf(s.emitter.f, "a %llu %u %u %u %u %u\n", (unsigned long long)g.key.epoch, g.key.slot,
+                    g.key.generation, g.run.first_page, g.run.pages, g.reuse);
             require(!fflush(s.emitter.f), "S2 admission output failed"); output_ok(s.emitter);
         }
     }

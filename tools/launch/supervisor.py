@@ -772,7 +772,8 @@ class Supervisor:
         """The shim drives the head's engine directory. The head engine passes requests to the other ranks itself, over
         its control links."""
         sock = os.path.join(self.home, 'run', 'engine.sock')
-        argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock]
+        argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock,
+                '--sessions', self.o.get('SESS') or '8']
         if self.o.get('TP') == '6':
             argv += ['--stall-timeout', '2400']
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})

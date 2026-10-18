@@ -116,6 +116,20 @@ Engine `metrics` frame → Prometheus names (the same names vLLM uses, so the ex
 | `requests.finished{stop,length,abort,error}` | `vllm:request_success_total{finished_reason=...}` |
 | `spec.drafts` / `.draft_tokens` / `.accepted` | `vllm:spec_decode_num_drafts_total` / `_num_draft_tokens_total` / `_num_accepted_tokens_total` |
 | `spec.accepted_per_pos[i]` | `vllm:spec_decode_num_accepted_tokens_per_pos_total{position="i"}` |
+| `kv.size_tokens` / `kv.active_tokens` | `vllm:kv_cache_size_tokens` / `vllm:kv_active_tokens` |
+| `kv.reserved_tokens` | `g6:s2_reserved_tokens` (reservation, not KV fill) |
+| `kv.size_tokens` + `kv.max_concurrency` | `vllm:cache_config_info{kv_cache_size_tokens=...,kv_cache_max_concurrency=...}` |
+| `tokens.cached` (and `tokens.prompt`) | `vllm:prompt_tokens_cached_total`, `vllm:prompt_tokens_by_source_total{source="local_cache_hit"\|"local_compute"}` |
+| `latency.ttft_sum` / `.ttft_count` | `vllm:time_to_first_token_seconds_sum` / `_count` |
+| `latency.itl_sum` / `.itl_count` | `vllm:inter_token_latency_seconds_sum` / `_count` |
+| `latency.prefill_sum` / `.decode_sum` | `vllm:request_prefill_time_seconds_sum` / `vllm:request_decode_time_seconds_sum` |
+| `latency.prefill_tokens_sum` | `vllm:request_prefill_kv_computed_tokens_sum` |
+| `latency.gen_tokens_sum` / `.gen_tokens_count` | `vllm:request_generation_tokens_sum` / `_count` |
+
+A series whose field the engine does not send is left out, not rendered as 0 (that includes `prefix_cache`). The S2 shim
+sends `kv` and `latency` always. It sends `prefix_cache` and `tokens.cached` only if the engine's `a` line ends with the
+rows its prefix reuse took; without that field `latency.prefill_tokens_sum` counts the whole prompt, so the prefill rate
+it gives counts reused rows as computed.
 
 ## Inside it
 
