@@ -6,8 +6,9 @@
 //   2. Two bindings of one layer, BF16 and FP8, on the same KV rows and queries: decode (g6_attn_bind_run) under each
 //      absorb / value_project variant (absorb_m / value_project_m, G6_AVP1, G6_ATTN_QT) and prefill
 //      (g6_attn_bind_prefill_run) must give byte-identical outputs.
-//   3. --bench: absorb_m and value_project_m of one layer (their launchers: the BF16 or FP8 instantiation), BF16 against FP8, at M rows with a cold L2 (a 96 MB write
-//      between calls, as the experts' stream between two layers' attention when serving): us per call.
+//   3. --bench: absorb_m and value_project_m of one layer (their launchers: the BF16 or FP8 instantiation), BF16 against
+//      FP8, at M rows with a cold L2 (a 96 MB write between calls, as the experts' stream between two layers' attention
+//      when serving): us per call. Also absorb_m2<1, true> (G6_ATTN_QT), BF16 against FP8.
 //   kvb8_test [--bench] [--layer L] [--seed S]
 // Build and run: TEST=kvb8_test G6_NR=4 scripts/c1_tests.sh <bin_dir> [args]  (the K1H2 flags; attn.cu included, bind.cu)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
@@ -206,10 +207,10 @@ int main(int argc, char** argv)
         };
         printf("BENCH heads %d: UK %.2f MB / UV %.2f MB a layer in BF16, %.2f / %.2f MB in FP8 (+ scales)\n", H,
                H * 192 * 512 * 2 / 1e6, H * 256 * 512 * 2 / 1e6, H * 192 * 512 / 1e6, H * 256 * 512 / 1e6);
-        printf("BENCH rows | absorb_m BF16 FP8 us | value_project_m BF16 FP8 us | sum saved us | x 78 layers ms\n");
+        printf("BENCH rows | absorb_m BF16 FP8 us | value_project_m BF16 FP8 us | sum saved us | x 78 layers ms | absorb_m2 QT BF16 FP8 us\n");
         for (int M : {1, 3, 4, 8, 16, 24})
         {
-            float t[2][2];
+            float t[2][3];
             for (int k = 0; k < 2; ++k)
             {
                 G6Attn a = (k ? b8 : bb).args;
@@ -217,10 +218,12 @@ int main(int argc, char** argv)
                 ga::Work w{}; w.q = q; w.rope = rope; w.context = ctx;
                 t[k][0] = timed([&] { ga::launch_absorb_m(a, a, w, 0, M, nullptr); });
                 t[k][1] = timed([&] { ga::launch_value_project_m(a, a, w, 0, M, nullptr); });
+                t[k][2] = timed([&] { ga::launch_absorb_m2(a, a, w, 0, M, nullptr); });
                 CK(cudaGetLastError());
             }
             const float saved = t[0][0] + t[0][1] - t[1][0] - t[1][1];
-            printf("BENCH %4d | %8.1f %8.1f | %8.1f %8.1f | %8.1f | %6.3f\n", M, t[0][0], t[1][0], t[0][1], t[1][1], saved, saved * 78 / 1000);
+            printf("BENCH %4d | %8.1f %8.1f | %8.1f %8.1f | %8.1f | %6.3f | %8.1f %8.1f\n", M, t[0][0], t[1][0], t[0][1], t[1][1], saved,
+                   saved * 78 / 1000, t[0][2], t[1][2]);
         }
         for (void* p : {(void*)dpos, (void*)dqb, (void*)q, (void*)rope, (void*)ctx, flush}) CK(cudaFree(p));
         CKI(g6_attn_bind_release(&bb)); CKI(g6_attn_bind_release(&b8));
