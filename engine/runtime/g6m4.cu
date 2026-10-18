@@ -486,12 +486,13 @@ int main(int argc, char** argv)
 #else
     auto qp_err = [&]() -> unsigned { return 0u; };
 #endif
-    // G6_DFL_REUSE=1|2 (s2_batch.h DflReuse; default 0): 1 = a DFlash2 session whose prefill a prefix-reuse hit cut into
-    // the drafter's window keeps the drafter (the rows the prefill taps, and the ring's rows of the last DFlash2 session
-    // with the same tokens); 2 = also a session alone on MTP takes it. G6_DFL_REUSE_MIN=<rows> (0..2048, default 256): MTP
-    // rounds until the drafter holds that many context rows. Drafts only. In the S2 runtime signature
+    // G6_DFL_REUSE=1|2 (s2_batch.h DflReuse; default 2 when serving DFlash2 with MTP, else 0): 1 = a DFlash2 session whose
+    // prefill a prefix-reuse hit cut into the drafter's window keeps the drafter (the rows the prefill taps, and the ring's
+    // rows of the last DFlash2 session with the same tokens); 2 = also a session alone on MTP takes it. G6_DFL_REUSE_MIN=
+    // <rows> (0..2048, default 256): MTP rounds until the drafter holds that many context rows. Drafts only. In the S2
+    // runtime signature
     std::string dre;
-    const int dfl_reuse = env_choice("G6_DFL_REUSE", 2, 0, &dre);
+    const int dfl_reuse = env_choice("G6_DFL_REUSE", 2, (dfl && s2mode && mtp) ? 2 : 0, &dre);
     if (dfl_reuse < 0) die(dre);
     if (dfl_reuse && !(dfl && s2mode)) die("G6_DFL_REUSE needs --dflash-manifest and --serve");
     int dfl_reuse_min = 256;
