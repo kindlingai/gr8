@@ -9,6 +9,7 @@
 // q_a_n / idx_w and IDs of O_c are already on r, and layers outside the mask run OWN=2 unchanged.
 // It is included inside namespace g6rt.
 #pragma once
+#include <map>
 
 // k_own_add_norm with TWO BF16 o_proj partials of this rank's owner rows, one per head pair: `mine` (this rank's pair,
 // row j at j * 6144) and the counterpart `peer`'s, read from its slice of RS collective a.c (= 0) like k_rs_add_norm.
@@ -261,6 +262,20 @@ inline const char* qp_oproj_gemm(const QpW& w, bool tr, int n, const uint8_t* x8
     m.sB = 64 * 128; m.sG = qw::OT / 32;
     return bindp::make_gemm_tr(m, n, x8, y, 1, g);
 }
+// G6_PF_L0_PAIR_CHECK=1 (with G6_PF_L0_PAIR=1; measurement): layer 0's IDs of the pair rows against the all-rows scoring
+// (into a side buffer), int for int; rank 0 prints one line per sub-batch ("L0PAIR check ... mismatches N")
+__global__ void k_l0pair_cmp(const int* a, const int* b, size_t n, unsigned long long* bad)
+{
+    unsigned long long k = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) k += a[i] != b[i];
+    if (k) atomicAdd(bad, k);
+}
+__global__ void k_l0pair_report(unsigned long long* bad, int rank, int pos0, int M, int a0, int a1, int b0, int b1)
+{
+    if (rank == 0) printf("L0PAIR check rank %d first pos %d M %d rows [%d,%d)+[%d,%d): mismatches %llu\n", rank, pos0, M, a0, a1, b0, b1, *bad);
+    if (*bad) printf("L0PAIR MISMATCH rank %d first pos %d: %llu ids differ\n", rank, pos0, *bad);
+    *bad = 0;
+}
 // layer i's pair-owner attention block (DESIGN-QO-PAIR section 2 steps 4-5) on W = O_c then O_r (c = rank ^ 2) for this
 // rank's pair's 32 heads, as ONE QO call (one key-table prepass): q_b of each half (16-row aligned bindings; O_r's GEMM
 // first, then O_c's, which overwrites O_r's alignment rows so W is contiguous in qp_qb), positions / IDs of W copied
@@ -330,7 +345,49 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
             G6RT_CK(g6_attn_bind_index_append(&y.ab, &s, st));
         }
     }
-    if (y.indexer && i == 0)     // every row's top-2048 into idx_all (reuse layers of source 0 read any row)
+    // G6_PF_L0_PAIR=1 (default 0 = off): layer 0 scores only the pair's rows (O_c = c's, O_r = mine), as pf_ix_score does
+    // for an owner range: layer 0's IDs are read only by this block (qp_ids below; layer 1 is a full-index layer, and its
+    // c4 gather rewrites every idx_all row before any reuse layer reads one). idx_all rows of the other pair stay stale.
+    static const bool l0pair = getenv("G6_PF_L0_PAIR") && atoi(getenv("G6_PF_L0_PAIR")) == 1;
+    if (y.indexer && i == 0 && l0pair)
+        for (const int2 g : {make_int2(c0r, c1r), make_int2(r0, r1)})
+        {
+            if (g.y <= g.x) continue;
+            G6AttnStep s{};
+            s.rows = g.y - g.x; s.context = context - (M - g.y); s.positions = P.pos + g.x;
+            s.index_q = P.idx_q + (size_t)g.x * IDXQ; s.index_weight = P.idx_w + (size_t)g.x * IDXW;
+            G6RT_CK(g6_attn_bind_prefill_index_rows(P.av[i], &y.ab, &s, P.idx_all + (size_t)g.x * 2048, nullptr, st));
+        }
+    static const bool l0chk = l0pair && getenv("G6_PF_L0_PAIR_CHECK") && atoi(getenv("G6_PF_L0_PAIR_CHECK")) == 1;
+    if (y.indexer && i == 0 && l0chk)
+    {
+        struct Chk { int* ref = nullptr; size_t cap = 0; unsigned long long* bad = nullptr; };
+        static std::map<const Prefill*, Chk> per_lane;   // one side buffer per lane (two-stream lanes run concurrently)
+        Chk& k = per_lane[&P];
+        if ((size_t)M * 2048 > k.cap)
+        {
+            G6RT_CK(cudaStreamSynchronize(st));
+            if (k.ref) G6RT_CK(cudaFree(k.ref));
+            k.cap = (size_t)M * 2048;
+            G6RT_CK(cudaMalloc(&k.ref, k.cap * 4));
+            if (!k.bad) { G6RT_CK(cudaMalloc(&k.bad, 8)); G6RT_CK(cudaMemset(k.bad, 0, 8)); }
+            if (me == 0) fprintf(stderr, "# rank 0: G6_PF_L0_PAIR_CHECK on (side buffer %zu rows)\n", (size_t)M);
+        }
+        int* ref = k.ref;
+        unsigned long long* bad = k.bad;
+        for (int c0 = 0; c0 < M; c0 += P.attn_rows)       // today's all-rows scoring, as below, into ref
+        {
+            const int r = std::min(P.attn_rows, M - c0);
+            G6AttnStep s{};
+            s.rows = r; s.context = context - (M - c0 - r); s.positions = P.pos + c0;
+            s.index_q = P.idx_q + (size_t)c0 * IDXQ; s.index_weight = P.idx_w + (size_t)c0 * IDXW;
+            G6RT_CK(g6_attn_bind_prefill_index_rows(P.av[i], &y.ab, &s, ref + (size_t)c0 * 2048, nullptr, st));
+        }
+        if (nc > 0) k_l0pair_cmp<<<64, 256, 0, st>>>(P.idx_all + (size_t)c0r * 2048, ref + (size_t)c0r * 2048, (size_t)nc * 2048, bad);
+        if (no > 0) k_l0pair_cmp<<<64, 256, 0, st>>>(P.idx_all + (size_t)r0 * 2048, ref + (size_t)r0 * 2048, (size_t)no * 2048, bad);
+        k_l0pair_report<<<1, 1, 0, st>>>(bad, me, context - M, M, c0r, c1r, r0, r1);
+    }
+    if (y.indexer && i == 0 && !l0pair)     // every row's top-2048 into idx_all (reuse layers of source 0 read any row)
         for (int c0 = 0; c0 < M; c0 += P.attn_rows)
         {
             const int r = std::min(P.attn_rows, M - c0);
