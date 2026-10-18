@@ -71,6 +71,7 @@ manifest instead.
 | `DRAFT_HEAD_I4` | unset (0) | unset (0) | unset (0) | 1 = the MTP draft's lm_head on INT4 g32 copies made at boot (`G6_DRAFT_HEAD_I4`; drafts only, +134 MB a rank at TP=4) |
 | `DFL_HEAD_I4` | unset (0) | – | – | 1 = the DFlash2 drafter's lm_head on the same INT4 records (`G6_DFL_HEAD_I4`; drafts only). Needs `DFLASH=1` |
 | `DFL_BODY_I4` | unset (0) | – | – | 1 = the DFlash2 drafter's body GEMVs on INT4 g32 copies (`G6_DFL_BODY_I4`; drafts only, +382 MB a rank). Needs `DFLASH=1` |
+| `ROUTE_OVL` | unset (0) | unset (0) | unset (0) | decode MoE layers of 2+ rows: the trellis shared expert on a forked stream during the router, 1 = fc1 + fc2, 2 = fc1 (`G6_ROUTE_OVL`; bit-exact). Measured at TP=4 only |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

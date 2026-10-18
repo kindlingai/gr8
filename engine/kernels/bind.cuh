@@ -670,6 +670,52 @@ inline void launch_k1(const K1& k, cudaStream_t st)
     }
     launch_k1_fin(k, st);
 }
+// G6_ROUTE_OVL (rank.cuh launch_mlp_block): on trellis-shared layers with separate fc1 / fc2 launches the shared expert
+// runs on a forked stream from before the router GEMV, which fills 8 of the 48 SMs, and the single-CTA plan kernel
+// (k1.cuh k1_tr3_fc1_ovl / _fc2_ovl; same bytes out). mode 1: shared fc1 + fc2 on the fork, joined before the finalize;
+// mode 2: shared fc1 only, joined before the whole (default) fc2 launch. Inside a capture the fork and the join are
+// graph edges.
+struct K1Ovl
+{
+    int mode = 0;
+    cudaStream_t side = nullptr;
+    cudaEvent_t fork = nullptr, join = nullptr;
+};
+inline bool k1_ovl_on(const K1& k, const K1Ovl& o) { return o.mode && o.side && k.on && k.sh && !k.fuse && !k.dense; }
+// on st after the K1 input (x2, its fragment tables) is written, before the router GEMV
+inline void k1_ovl_fork(const K1& k, const K1Ovl& o, cudaStream_t st)
+{
+    const int nsh = g6mx::tiles(k.a.M), g1 = nsh * k.a.B * 2 * k.a.KS1, g2 = nsh * k.a.B * k.a.NS2;
+    cudaEventRecord(o.fork, st);
+    cudaStreamWaitEvent(o.side, o.fork, 0);
+    if (k.k2) k1_tr3_fc1_ovl<true, true, 1><<<g1, k.b1, k.sm1, o.side>>>(k.a);
+    else k1_tr3_fc1_ovl<true, false, 1><<<g1, k.b1, k.sm1, o.side>>>(k.a);
+    if (o.mode == 1)
+    {
+        if (k.k2) k1_tr3_fc2_ovl<true, true, 1><<<g2, k.b2, k.sm2, o.side>>>(k.a);
+        else k1_tr3_fc2_ovl<true, false, 1><<<g2, k.b2, k.sm2, o.side>>>(k.a);
+    }
+    cudaEventRecord(o.join, o.side);
+}
+// on st after the plan kernel, in place of launch_k1: the routed fc1 (and fc2), the join, the finalize
+inline void launch_k1_ovl(const K1& k, const K1Ovl& o, cudaStream_t st)
+{
+    const int g1 = k.a.n_slots * k.a.B * 2 * k.a.KS1, g2 = k.a.n_slots * k.a.B * k.a.NS2;
+    if (k.k2) k1_tr3_fc1_ovl<true, true, 2><<<g1, k.b1, k.sm1, st>>>(k.a);
+    else k1_tr3_fc1_ovl<true, false, 2><<<g1, k.b1, k.sm1, st>>>(k.a);
+    if (o.mode == 1)
+    {
+        if (k.k2) k1_tr3_fc2_ovl<true, true, 2><<<g2, k.b2, k.sm2, st>>>(k.a);
+        else k1_tr3_fc2_ovl<true, false, 2><<<g2, k.b2, k.sm2, st>>>(k.a);
+        cudaStreamWaitEvent(st, o.join, 0);
+    }
+    else
+    {
+        cudaStreamWaitEvent(st, o.join, 0);
+        launch_k1_fc2(k, st);
+    }
+    launch_k1_fin(k, st);
+}
 // persistent grid of the fused launch: min(items, resident CTAs of the device at its smem size)
 inline int k1_fused_grid(int items, size_t smem, int e4 = 0, int k2 = 0, int sh = 0)
 {
@@ -915,9 +961,11 @@ struct Layer
 
 inline void launch_q_b(const Layer& L, cudaStream_t st) { launch(L.q_b, st); dtr::launch(L.q_b_t, st); }
 inline void launch_o_proj(const Layer& L, cudaStream_t st) { launch(L.o_proj, st); dtr::launch(L.o_proj_t, st); }
-inline void launch_mlp(const Layer& L, cudaStream_t st)
+// ovl: G6_ROUTE_OVL, k1_ovl_fork ran before the router (k1_ovl_on): launch_k1_ovl in place of launch_k1
+inline void launch_mlp(const Layer& L, cudaStream_t st, const K1Ovl* ovl = nullptr)
 {
-    launch_k1(L.k1, st);
+    if (ovl) launch_k1_ovl(L.k1, *ovl, st);
+    else launch_k1(L.k1, st);
     dtr::launch(L.glu_t, st);
     dtr::launch(L.down_t, st);
 }
@@ -1131,6 +1179,15 @@ inline cudaError_t init()
                           k1_fn_fc1<true, false, true>(), k1_fn_fused<true, false, true>(), k1_fn_fc2<true, false, true>(),
                           k1_fn_fc1<true, true, true>(), k1_fn_fused<true, true, true>(), k1_fn_fc2<true, true, true>()};
     for (const void* f : fn)
+    {
+        const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
+        if (e != cudaSuccess) return e;
+    }
+    const void* fo[8] = {reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, false, 1>), reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, false, 2>),
+                         reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, true, 1>), reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, true, 2>),
+                         reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, false, 1>), reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, false, 2>),
+                         reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, true, 1>), reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, true, 2>)};
+    for (const void* f : fo)                                            // G6_ROUTE_OVL (k1_ovl_fork / launch_k1_ovl)
     {
         const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
         if (e != cudaSuccess) return e;

@@ -100,6 +100,7 @@ KEYS = {
     'DRAFT_HEAD_I4': ('cluster', None, 'MTP draft head on INT4 g32 records (G6_DRAFT_HEAD_I4)'),
     'DFL_HEAD_I4': ('cluster', None, 'DFlash2 drafter head on INT4 g32 records (G6_DFL_HEAD_I4)'),
     'DFL_BODY_I4': ('cluster', None, 'DFlash2 drafter body on INT4 g32 records (G6_DFL_BODY_I4)'),
+    'ROUTE_OVL': ('cluster', None, 'shared expert on a forked stream during the router (G6_ROUTE_OVL)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
