@@ -353,6 +353,11 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
     }
     if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
+    // a DFlash2 round's MTP first form runs on the accepted prefix + 1 rows (1 .. dfl_k + 1): capture every one of them
+    // (the prompt chunk and the verify widths above cover them for a block-8 drafter, not for a wider one)
+    if (dfl && mtp)
+        for (int M = 1; M <= dfl_k + 1; ++M)
+            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
     for (int M = 2; M <= kstop.kmax + 1; ++M)   // G6_MTP_KSTOP: solo MTP verifies of 2..kmax + 1 rows, first forms of as many
     {
         if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
@@ -897,8 +902,10 @@ int main(int argc, char** argv)
         g6s2::Config sc;
         sc.epoch = s2epoch;
         sc.pool_rows = (uint32_t)(cap / 64 * 64);
-        // one step bounds: a round (every session's mtp + 1 rows) and a prompt chunk (sessions.h: chunk <= max_rows)
-        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>((uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk));
+        // one step bounds: a round (every session's mtp + 1 rows), a prompt chunk (sessions.h: chunk <= max_rows) and a
+        // DFlash2 verify (dfl_k + 1 rows)
+        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>({(uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk,
+                                                                  dfl ? (uint32_t)(dfl_k + 1) : 0u}));
         sc.max_sessions = (uint32_t)s2sess;
         sc.mtp = (uint32_t)mtp;
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the offline loop's cap rule
