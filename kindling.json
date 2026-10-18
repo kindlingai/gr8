@@ -17,30 +17,30 @@
       "label": "TP=4",
       "nodes": 4,
       "decode": {
-        "code": 49.3,
-        "prose": 30.0
+        "code": 51.7,
+        "prose": 32.5
       },
       "prefill": [
         {
           "context": 8192,
-          "tps": 1374
+          "tps": 1315
         }
       ],
       "concurrency": [
         {
           "streams": 2,
-          "aggregate_tps": 50.8
+          "aggregate_tps": 53.7
         },
         {
           "streams": 4,
-          "aggregate_tps": 64.0
+          "aggregate_tps": 67.8
         }
       ],
       "max_context": 310528,
       "kv_pool_tokens": 310528,
       "max_concurrent": 8,
       "quality": [],
-      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. Code varies between boots (41.5 to 49.3 on one build). Structured output is not reported: it measures predictable output, not agent speed. With --kv-format int4 (experimental, about 3% slower decode) the KV pool is 415,232 tokens."
+      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks uncapped (full application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release. Code varies between boots (51.2 to 52.2 on one build). The faster decode options are on by default in the serving config. Structured output is not reported: it measures predictable output, not agent speed. With --kv-format int4 (experimental, about 3% slower decode) the KV pool is 415,232 tokens."
     },
     {
       "id": "tp3",
@@ -98,7 +98,7 @@
       "max_context": 614400,
       "kv_pool_tokens": 614400,
       "max_concurrent": 8,
-      "notes": "Served through S2, MTP only. GPU clocks uncapped (about 2450 to 2550 MHz), not the 2200 MHz cap of the other configs. Decode is a concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; not RigMark. One test window on one cluster. With --kv-format int4 (experimental) the KV pool is 857,600 tokens at the default SHARE_LIMIT of 131,072, an estimate not yet booted."
+      "notes": "Served through S2, MTP only. GPU clocks uncapped, on an earlier build. Decode is a concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; not RigMark. One test window on one cluster. With --kv-format int4 (experimental) the KV pool is 857,600 tokens at the default SHARE_LIMIT of 131,072, an estimate not yet booted."
     }
   ]
 }
