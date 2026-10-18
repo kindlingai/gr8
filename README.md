@@ -15,10 +15,10 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 |---|---|---|---|
 | experts | `home`, 3.25 bpw | `bit225`, 2.25 bpw | `home`, 3.25 bpw |
 | drafting | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 51.7 / 32.5 tok/s | 38.6 / 29.0 tok/s | 38.2 / –‡ tok/s |
-| aggregate\*, 2 / 4 streams | 53.7 / 67.8 tok/s | 46.6 / 60.7 tok/s | 57.6 / 79.0 tok/s‡ |
-| prefill, 8K prompt, cold | 1,315 tok/s | 628 tok/s | 1,953 tok/s‡ |
-| prefill, 8K prompt, cached | 60,006 tok/s | 56,995 tok/s | – |
+| decode\*, code / prose | 51.7 / 32.5 tok/s | 40.3 / 30.2 tok/s | 38.2 / –‡ tok/s |
+| aggregate\*, 2 / 4 streams | 53.7 / 67.8 tok/s | 47.9 / 62.2 tok/s | 57.6 / 79.0 tok/s‡ |
+| prefill, 8K prompt, cold | 1,315 tok/s | 654 tok/s | 1,953 tok/s‡ |
+| prefill, 8K prompt, cached | 60,006 tok/s | 57,086 tok/s | – |
 | KV pool (longest context) | 408,832 tokens (513,536 with int4§) | 241,600 tokens (345,088 with int4§) | 614,400 tokens (857,600 with int4§) |
 | requests that share decode steps | up to 32,768 tokens | up to 65,536 tokens | up to 32,768 tokens |
 | requests decoding at once | 8 | 8 | 8 |
