@@ -18,6 +18,7 @@ import fake_server  # noqa: E402
 import kl  # noqa: E402
 import measure  # noqa: E402
 import record  # noqa: E402
+import xtp_compare  # noqa: E402
 
 GATE = HERE.parent / 'gate.py'
 
@@ -202,6 +203,43 @@ def rec(boot, metrics, topo='tp6', session=None, commit='c1', flags='G6_NR=6', k
 
 def baseline(runs, **kw):
     return record.build_baseline(runs, kw.pop('topo', 'tp6'), kw.pop('commit', 'c1'), **kw)
+
+
+class CrossTopology(Base):
+    def _ref(self, topology='tp4'):
+        seqs = kl.make_reference(self.cl, ['alpha beta gamma', 'delta epsilon'], n_tokens=12, k=5)
+        f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+        json.dump({'format': 1, 'commit': 'abc', 'topology': topology, 'k': 5, 'sequences': seqs}, f)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_pass_within_tolerance_and_fail_beyond(self):
+        ref = self._ref()
+        out = tempfile.NamedTemporaryFile(suffix='.json', delete=False).name
+        self.addCleanup(os.unlink, out)
+        args = ['--url', self.url, '--ref', ref, '--topology', 'tp5', '--commit', 'x', '--out', out]
+        self.assertEqual(xtp_compare.main(args), 0)
+        rec = json.loads(Path(out).read_text())
+        self.assertEqual((rec['verdict'], rec['topology'], rec['reference']['topology']), ('PASS', 'tp5', 'tp4'))
+        self.srv.st.drift = 2.0
+        self.assertEqual(xtp_compare.main(args), 1)
+        self.assertEqual(json.loads(Path(out).read_text())['verdict'], 'FAIL')
+
+    def test_same_topology_reference_is_refused(self):
+        with self.assertRaises(SystemExit):
+            xtp_compare.main(['--url', self.url, '--ref', self._ref('tp5'), '--topology', 'tp5', '--commit', 'x'])
+
+    def test_verdict_reasons(self):
+        v, why = xtp_compare.verdict({'mean': 0.02, 'p95': 0.01, 'top1': 0.9}, 0.01, 0.05, 0.97)
+        self.assertEqual(v, 'FAIL')
+        self.assertEqual(len(why), 2)
+
+    def test_gate_accepts_tp5_and_refuses_a_tp4_reference_for_a_tp5_run(self):
+        r = subprocess.run([sys.executable, str(GATE), 'run', '--url', self.url, '--topology', 'tp5', '--commit', 'x',
+                            '--kl-ref', self._ref('tp4'), '--no-health', '--only', 'kl'], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('tp4 reference', r.stdout + r.stderr)
 
 
 class Records(unittest.TestCase):

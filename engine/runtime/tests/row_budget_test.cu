@@ -659,14 +659,18 @@ static void test_k1(const std::vector<int>& Ms)
                        true, fuse, 1, E2, false, Ms2, sr, true);
             }
     }
+    // both dense widths: when 96 blocks do not divide by NR (TP5: 20 and 19 blocks) the narrower ranks run too
+    const int nch_dense_lo = 96 / g6nr::NR * 128 / 16;
+    for (const int nd : {nch_dense, nch_dense_lo})
     {
+        if (nd == nch_dense_lo && nd == nch_dense) continue;
         Arena A;
-        const ShW d = build_shared(A, nch_dense, 0, 300u);
+        const ShW d = build_shared(A, nd, 0, 300u);
         Env E = make_env(A, false);
         const bind::LayerTensors T = make_T(nullptr, d);
         for (int fuse = 0; fuse < 3; ++fuse)
             for (int bf = 0; bf < 2; ++bf)
-                run_k1(fmt_s("dense fuse=%d out_bf16=%d", fuse, bf), T, false, fuse, bf, E, false, Ms);
+                run_k1(fmt_s("dense ch=%d fuse=%d out_bf16=%d", nd * 16, fuse, bf), T, false, fuse, bf, E, false, Ms);
     }
 }
 

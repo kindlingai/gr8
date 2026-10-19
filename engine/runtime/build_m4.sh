@@ -63,7 +63,7 @@ WIDTHS=${WIDTHS:-6}
 # divide the expert blocks per rank: 4 at TP4, 3 at TP6) at 4
 wflags() {
   local f="-DG6_NR=$1 -DDEC_S2"
-  if [ "$1" = 4 ]; then f="$f -DPF_F12"; fi
+  case " ${F12_WIDTHS:-4} " in *" $1 "*) f="$f -DPF_F12" ;; esac   # PF_F12 (fat-CTA prefill fc1): TP4 by default; F12_WIDTHS="4 5" adds TP5
   echo "$f"
 }
 for n in $WIDTHS; do

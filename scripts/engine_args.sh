@@ -51,7 +51,7 @@ engine_defaults() {
     3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
-    5) [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=5: no TP5 int4 page count; set CAP" >&2; return 2; }
+    5) [ "${KV_FORMAT:-fp8}" = fp8 ] || [ -n "${CAP:-}" ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=5: no TP5 int4 page count; set CAP" >&2; return 2; }
        SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        # 1,981 pages a rank = TP4's default (not boot-proven at TP5; a rank holds about 1/5 of the experts, so more fit)
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=5: the drafter's 8 KV heads do not split five ways" >&2; return 2; }
@@ -87,7 +87,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${MTP_KSTOP_TAU:+ G6_MTP_KSTOP_TAU=$MTP_KSTOP_TAU}"
   # the DFlash2 drafter step under MTP's first form on its own stream (DRAFT_PAR; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${DRAFT_PAR:+ G6_DRAFT_PAR=$DRAFT_PAR}"
-  # the replicated decode GEMVs split across the ranks (QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT; docs/SETTINGS.md): off unless set
+  # the replicated decode GEMVs split across the ranks (QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT; docs/SETTINGS.md): unset = the
+  # engine's default, which at TP > 1 is on (QA_SPLIT 2, IDXQ_SPLIT 1, MTP_SPLIT 1 with --mtp; g6m4.cu); 0 turns one off
   ENGINE_ENV="$ENGINE_ENV${QA_SPLIT:+ G6_QA_SPLIT=$QA_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${IDXQ_SPLIT:+ G6_IDXQ_SPLIT=$IDXQ_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${MTP_SPLIT:+ G6_MTP_SPLIT=$MTP_SPLIT}"
