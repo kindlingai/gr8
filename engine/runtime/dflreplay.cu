@@ -221,7 +221,7 @@ int main(int argc, char** argv)
     FILE* df = fopen(dump.c_str(), "rb");
     if (!df) die("cannot open " + dump);
     FILE* of = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
-    if (of) fprintf(of, "q0\tacc_dump\tacc_a\tacc_b\tcommitted\tdrafts_a\tdrafts_b\tlp_a\tlp_b\n");
+    if (of) fprintf(of, "q0\tacc_dump\tacc_a\tacc_b\tcommitted\tdrafts_a\tdrafts_b\tlp_a\tlp_b\tlpbits_a\tlpbits_b\n");
     std::vector<Round> req;               // the request's draft steps, scored at its token record
     long n_steps = 0, n_rounds = 0, same_pos[dfl::B] = {}, same_all = 0, a_eq_dump = 0;
     long hist_d[dfl::B] = {}, hist_a[dfl::B] = {}, hist_b[dfl::B] = {};
