@@ -101,8 +101,9 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ G6_IDX_GRP=$IDX_GRP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ G6_ATTN_QT=$ATTN_QT}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ G6_ATTN_FRONT=$ATTN_FRONT}"
-  # deterministic fp-order attention variants (ATTN_CTX3_SP; E1, docs/SETTINGS.md): off unless set
+  # deterministic fp-order attention variants (ATTN_CTX3_SP, ATTN_POSIDX; E1, docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX3_SP:+ G6_ATTN_CTX3_SP=$ATTN_CTX3_SP}"
+  ENGINE_ENV="$ENGINE_ENV${ATTN_POSIDX:+ G6_ATTN_POSIDX=$ATTN_POSIDX}"
   # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
   ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
   return 0

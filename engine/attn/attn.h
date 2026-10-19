@@ -37,8 +37,12 @@ struct G6Attn {
 #endif
 };
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
-// G6_ATTN_CTX3_SP as the kernels read it (attn.cu; read once): 64 / 128, 0 = off. For the S2 runtime signature.
+// Round 10 E1 flags as the kernels read them (attn.cu; read once): G6_ATTN_CTX3_SP (64 / 128, 0 = off), G6_ATTN_POSIDX
+// (1 / 0), and whether a call with these arguments takes the positional index (a full-index call of capacity <= 2048;
+// the runtime then skips that layer's idx_q GEMV, which the call does not read). For the S2 runtime signature.
 extern "C" int g6_attn_ctx_sp(void);
+extern "C" int g6_attn_posidx(void);
+extern "C" int g6_attn_posidx_takes(const G6Attn*);
 extern "C" void (*g6_attn_mark)(int stage,void* stream);
 extern "C" int g6_attn_rope_init(int cap,void* stream);   // decode RoPE table when no QO attention builds it   // decode profile hook (attn.cu AMARK); null = off
 extern "C" int g6_attn_run(const G6Attn*,void* scratch,size_t bytes,void* stream);

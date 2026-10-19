@@ -81,6 +81,7 @@ manifest instead.
 | `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
 | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
 | `ATTN_CTX3_SP` | unset (0) | unset (0) | unset (0) | with `ATTN_CTX3`: 64 or 128 key slots per context partition instead of 256 (`G6_ATTN_CTX3_SP`; deterministic, not bit-exact) |
+| `ATTN_POSIDX` | unset (0) | unset (0) | unset (0) | 1 = decode steps in the buckets up to 2048 list the keys by position instead of running the indexer, which selects all of them there (`G6_ATTN_POSIDX`; deterministic, not bit-exact) |
 | `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
