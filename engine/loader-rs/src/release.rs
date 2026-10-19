@@ -54,11 +54,8 @@ pub struct Shard {
 
 impl Shard {
     pub fn new(nr: usize, rank: usize) -> Result<Shard, String> {
-        if !(nr == 3 || nr == 6 || (nr > 0 && 64 % nr == 0)) || rank >= nr {
-            return Err(format!("TP {nr} rank {rank}: gr8 builds TP 3, 6 or a divisor of 64"));
-        }
-        if !(384 / nr).is_multiple_of(4) {
-            return Err(format!("TP {nr}: the dense MLP's rank slices do not fall on the release's 128-channel blocks"));
+        if !(nr == 3 || nr == 5 || nr == 6 || (nr > 0 && 64 % nr == 0)) || rank >= nr {
+            return Err(format!("TP {nr} rank {rank}: gr8 builds TP 3, 5, 6 or a divisor of 64"));
         }
         Ok(Shard { nr, rank })
     }
@@ -66,10 +63,11 @@ impl Shard {
     pub fn heads(&self, l: usize) -> (usize, usize) {
         chunk(&widths(64, self.nr), l, self.rank)
     }
-    /// dense MLP channels of layer l (g32 groups x 32)
+    /// dense MLP channels of layer l, whole 128-channel blocks of the release (96 blocks; at TP 3/4/6/8 the same
+    /// ranges as 384 g32 groups)
     pub fn dense(&self, l: usize) -> Range<usize> {
-        let (a, n) = chunk(&widths(384, self.nr), l, self.rank);
-        a * 32..(a + n) * 32
+        let (a, n) = chunk(&widths(96, self.nr), l, self.rank);
+        a * 128..(a + n) * 128
     }
     pub fn vocab(&self) -> Range<usize> {
         let (a, n) = chunk(&widths(1210, self.nr), 0, self.rank);
@@ -642,7 +640,28 @@ mod tests {
         assert_eq!(s.vocab(), 0..51712);
         // TP6: 11, 11, 11, 11, 10, 10
         assert_eq!(Shard::new(6, 5).unwrap().heads(0), (54, 10));
-        assert!(Shard::new(5, 0).is_err());
+        // TP5: 13, 13, 13, 13, 12 heads; dense 20, 19, 19, 19, 19 blocks of 128 (rotating); vocab 242 tiles each
+        let s = Shard::new(5, 4).unwrap();
+        assert_eq!(s.heads(0), (52, 12));
+        assert_eq!(s.dense(0), 77 * 128..96 * 128);
+        for l in 0..3 {
+            let mut v: Vec<_> = (0..5).map(|r| Shard::new(5, r).unwrap().dense(l)).collect();
+            v.sort_by_key(|x| x.start);
+            assert!(v.windows(2).all(|w| w[0].end == w[1].start) && v[0].start == 0 && v[4].end == 12288);
+            assert!(v.iter().all(|x| x.start % 128 == 0 && x.len() % 128 == 0 && x.len() <= 2560));
+        }
+        assert_eq!(s.vocab(), 968 * 128..1210 * 128);
+        assert_eq!(Shard::new(5, 0).unwrap().dense(0), 0..2560);
+        for nr in [3, 4, 6, 8] {
+            for r in 0..nr {
+                for l in 0..3 {
+                    let s = Shard::new(nr, r).unwrap();
+                    let (a, n) = chunk(&widths(384, nr), l, r);
+                    assert_eq!(s.dense(l), a * 32..(a + n) * 32);
+                }
+            }
+        }
+        assert!(Shard::new(7, 0).is_err());
     }
 
     #[test]

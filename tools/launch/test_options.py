@@ -116,7 +116,7 @@ class ValidateTests(unittest.TestCase):
         self.check(['--mentat', 'localhost', '--tp', '4', '--shape', 'ring'], 'needs --peers')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ips', 'a,b,c,d', '--ips2', 'a,b,c,d'], 'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ring-devs', 'a,b'], 'want four devices')
-        self.check(['--peers', PEERS, '--tp', '5'], 'want 4, 6 or 3')
+        self.check(['--peers', PEERS, '--tp', '7'], 'want 4, 6, 3 or 5')
         self.check(['--peers', PEERS, '--tp', '6'], 'names 4 boxes for --tp 6')
         self.check(['--mentat', 'localhost'], '--tp is needed')
         self.check(['--peers', PEERS], 'PLAIN=1', {'PLAIN': '1'})
