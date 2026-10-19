@@ -142,6 +142,16 @@
   S2 runtime signature. Off, and on with zero thresholds, the planner's steps are unchanged (`batch_kstopb_test`).
 - Measured on four GB10 at TP=4 (`--mtp 2`, thresholds per session count): ABBA over six blocks, c2 +1.5 %, c4 +3.7 %
   decode; c1 unchanged.
+## 2026-10-18: S2 sizes three things by the DFlash2 drafter's verify width, not by a block of 8
+
+- A DFlash2 round's MTP first form runs on the accepted prefix + 1 rows (1 .. `dfl_k` + 1); the boot now captures every
+  one of those widths explicitly instead of relying on the prompt chunk and the verify widths to cover them.
+- `sc.max_rows` (one step's bound) is the largest of a round (sessions x (`--mtp` + 1)), a prompt chunk and the DFlash2
+  verify width (`dfl_k` + 1).
+- The per-request acceptance histogram may have up to 16 bins (was 8).
+- With the block-8 DFlash2 drafter nothing changes: the captured widths, the row bound and the histogram are those of
+  before. A drafter with a wider block (a block-12 one was served with these fixes) boots and serves; serving one also
+  needs drafter-side changes that are not part of this.
 
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
