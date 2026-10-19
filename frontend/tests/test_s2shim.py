@@ -458,6 +458,41 @@ class RequestMetrics(S2Base):
         self.assertEqual(m['kv']['active_tokens'], 0)                # the run is back in the pool
         self.assertEqual(m['kv']['reserved_tokens'], 0)
 
+    async def test_finish_frames_carry_each_requests_share_of_the_metrics(self):
+        c = await self.client()
+        m0 = await self.metrics(c, 1)
+        n = [40, 70, 100]
+        for i, k in enumerate(n):
+            c.send(gen(f'q{i}', [7, 8, 9 + i], max_tokens=k))
+        await asyncio.sleep(0.3)
+        c.send({'type': 'cancel', 'id': 'q2'})                       # a cancelled run reports what it did too
+        fins = [(await c.wait(f'q{i}'))[1] for i in range(3)]
+        m1 = await self.metrics(c, 2)
+        for i, f in enumerate(fins):
+            sp = f['spec']
+            # the fake engine's "m" line: rounds, 2 drafts a round (mtp 2), emitted - rounds accepted
+            self.assertEqual(sp['draft_tokens'], 2 * sp['drafts'])
+            self.assertEqual(sp['accepted'], f['completion_tokens'] - sp['drafts'])
+            self.assertEqual(len(sp['accepted_per_pos']), 2)
+            self.assertGreater(f['timing']['decode_s'], 0)
+            self.assertGreaterEqual(f['timing']['prefill_s'], 0.05)    # the fake engine's prefill takes 60 ms
+        self.assertEqual(fins[2]['reason'], 'abort')
+        for k in ('drafts', 'draft_tokens', 'accepted'):
+            self.assertEqual(sum(f['spec'][k] for f in fins), m1['spec'][k] - m0['spec'][k], k)
+        self.assertEqual([sum(f['spec']['accepted_per_pos'][j] for f in fins) for j in range(2)],
+                         [b - a for a, b in zip(m0['spec']['accepted_per_pos'], m1['spec']['accepted_per_pos'])])
+        for k, total in (('prefill_s', 'prefill_sum'), ('decode_s', 'decode_sum')):
+            self.assertAlmostEqual(sum(f['timing'][k] for f in fins), m1['latency'][total] - m0['latency'][total],
+                                   places=9)
+
+    async def test_a_request_that_fails_validation_has_no_spec_or_timing(self):
+        c = await self.client()
+        c.send(gen('bad', [1, 2, 3], max_tokens=10, top_p=0))
+        _, fin, _ = await c.wait('bad')
+        self.assertEqual(fin['reason'], 'error')
+        self.assertNotIn('spec', fin)
+        self.assertNotIn('timing', fin)
+
     async def test_a_cancelled_request_before_its_first_token_adds_no_timing(self):
         c = await self.client()
         c.send(gen('r1', [1, 2, 3], max_tokens=500))
