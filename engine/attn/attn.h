@@ -37,6 +37,8 @@ struct G6Attn {
 #endif
 };
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
+// G6_ATTN_CTX3_SP as the kernels read it (attn.cu; read once): 64 / 128, 0 = off. For the S2 runtime signature.
+extern "C" int g6_attn_ctx_sp(void);
 extern "C" void (*g6_attn_mark)(int stage,void* stream);
 extern "C" int g6_attn_rope_init(int cap,void* stream);   // decode RoPE table when no QO attention builds it   // decode profile hook (attn.cu AMARK); null = off
 extern "C" int g6_attn_run(const G6Attn*,void* scratch,size_t bytes,void* stream);
