@@ -510,6 +510,10 @@ int main(int argc, char** argv)
     // are within 1..mtp + 1 (draft_rows above)
     for (int M : s2::kstopb_widths(kstop.b, 1, mtp))
         if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+    // G6_S2_ADAPT: a session alone may verify any k <= mtp, also outside limited G6_MTP_KSTOPB_WIDTHS (s2_batch.h kshared)
+    if (s2mode && s2::adapt_env())
+        for (int M = 2; M <= mtp + 1; ++M)
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
         if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
 #if G6_MODEL_FLASH
