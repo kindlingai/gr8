@@ -858,6 +858,7 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M);
 inline const bind::Layer& layer_base(Model& m, int i, int M);
 inline bool s2_cp_step(const Model& m);
 inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M);
+inline const G6AttnReplay* s2_replay(Model& m, int i, int M);
 inline const bind::Layer& layer_for(Model& m, int i, int M) { return m.s2on ? s2_layer(m, i, M) : layer_base(m, i, M); }
 #define G6RT_LAYER_BASE layer_base
 #else
@@ -1011,9 +1012,29 @@ inline void l2pf_window(Model& m, int w, int from, int i, int M, const g6::Fabri
     l2pf::window(w, from, i, l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv, y.ab.args.uks, y.ab.args.uvs), s, st);
 }
 
+// G6_ATTN_POSIDX (attn.cu use_posidx, E1): layer i's attention call in this step takes the positional index (an indexer
+// layer whose replay entry has a capacity <= 2048), so it does not read idx_q and the step skips idx_q's GEMV. Decided at
+// launch / capture from the replay entry the call runs (g6_attn_posidx_takes on its fixed arguments), so the GEMV is only
+// skipped where the call takes it; a plain call (no replay entry) keeps the GEMV (unread when the call takes it). The CP
+// block never asks (launch_attn_cp: its indexer runs).
+inline bool posidx_step(Model& m, int i, int M)
+{
+    if (!g6_attn_posidx() || !m.layers[i].indexer) return false;
+#ifdef DEC_S2
+    if (m.s2on)
+    {
+        const G6AttnReplay* r = s2_replay(m, i, M);
+        return r && g6_attn_posidx_takes(&r->fixed);
+    }
+#endif
+    const Layer& y = m.layers[i];
+    return m.graph && y.rp_on[m.cur][M] && g6_attn_posidx_takes(&y.rp[m.cur][M].fixed);
+}
+
 // G6_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
 // P (QsPh): the phase the loopback driver wants; the get starts the next phase
-inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
+// noiq (posidx_step): idx_q is skipped, so the q_a gather window prefetches from q_b
+inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
 {
     const QSplit& Q = m.qs;
     const int c = Q.cqa[i];
@@ -1033,7 +1054,7 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
             else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
         }
         dmark(DP_IDXKW, st);
-        l2pf_window(m, l2pf::W_Q, l2pf::T_IDXQ, i, M, &Q.g, c, (size_t)M * Q.geo[c].wmax * 2, st);
+        l2pf_window(m, l2pf::W_Q, noiq ? l2pf::T_QB : l2pf::T_IDXQ, i, M, &Q.g, c, (size_t)M * Q.geo[c].wmax * 2, st);
     }
     P.next();
     if (!P.on()) return;
@@ -1044,7 +1065,9 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
 
 // q_a_norm's fragment table, q_b (this rank's heads) and idx_q. G6_IDXQ_SPLIT on an indexer layer: idx_q's tiles first,
 // published, then q_b while the gather is on the wire, then the gather (the outputs are the same; only the order changes)
-inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
+// noiq (posidx_step): no idx_q GEMV. Under G6_IDXQ_SPLIT its gather still runs (put of the unread idx_q columns, get), so
+// the gather fabric's collectives keep their order and sizes on every rank
+inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
 {
     const int c = m.qs.iq ? m.qs.ciq[i] : -1;
     if (!P.on())                              // not this phase: only the gather's get may be (it starts the next one)
@@ -1058,10 +1081,10 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
     if (c < 0)
     {
         bind::launch_q_b(b, st);
-        bind::launch(b.idx_q, st);
+        if (!noiq) bind::launch(b.idx_q, st);
         return;
     }
-    bind::launch(b.idx_q, st);
+    if (!noiq) bind::launch(b.idx_q, st);
     qs_put(m, c, M, st);
     bind::launch_q_b(b, st);
     l2pf_window(m, l2pf::W_Q, l2pf::T_UK, i, M, &m.qs.g, c, (size_t)M * m.qs.geo[c].wmax * 2, st);
@@ -1070,9 +1093,9 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
 }
 
 // the GEMVs on the layer input (q_a + its norm, kv_a, the indexer's k and weights): one gv_multi launch when bound
-inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
+inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
 {
-    if (m.qs.mode) { launch_layer_in_qs(m, i, y, b, M, st, P); return; }
+    if (m.qs.mode) { launch_layer_in_qs(m, i, y, b, M, st, P, noiq); return; }
     if (!P.on()) return;
     if (b.x_in.n)
     {
@@ -1267,6 +1290,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 #endif
     Layer& y = m.layers[i];
     const bind::Layer& b = layer_for(m, i, M);
+    const bool noiq = posidx_step(m, i, M);   // G6_ATTN_POSIDX
     QsPh P{qph};
     if (P.on())
     {
@@ -1277,8 +1301,8 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
         bind::launch(b.xf_x, st);
 #endif
     }
-    launch_layer_in(m, i, y, b, M, st, P);
-    launch_qb_idxq(m, i, b, M, st, P);
+    launch_layer_in(m, i, y, b, M, st, P, noiq);
+    launch_qb_idxq(m, i, b, M, st, P, noiq);
     if (!P.on()) return;                      // an earlier gather phase
     dmark(DP_QB, st);
     l2pf_window(m, l2pf::W_T, l2pf::T_UK, i, M, nullptr, 0, 0, st);
