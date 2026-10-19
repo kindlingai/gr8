@@ -1,7 +1,7 @@
 // dfltest: the DFlash2 drafter step (dflash.cuh) of all NR ranks on ONE GPU with a loopback fabric, for the reference
 // check against engine/ref/dflash2_ref.py (engine/ref/dflash2_check.py writes the case and compares).
 //
-// dfltest DIR [--sel 0|1] [--temp T --seed S]
+// dfltest DIR [--sel 0|1] [--temp T --seed S] [--fill 1]
 //   DIR/dflash.r<r>.manifest.json + .pack   drafter packs (tools/convert/dflash2.py)
 //   DIR/head.r<r>.manifest.json + .pack     the target lm_head slice of rank r, G.lm_head.mx.gv (dflash2.py --head)
 //   DIR/case.bin   int32 n (context rows), p0 (first position), bonus (token), lo (first position the sequence wrote);
@@ -9,7 +9,10 @@
 //                  bonus and 7 mask tokens, which stand in for the 1.9 GB table)
 //   DIR/out.<sel>.bin  int32 drafts [8] (rank 0; [0] unused), float32 x [8][6144] (rank 0's final-norm rows),
 //                      float32 kv [L][2 (k, v)][NKV][n_last][128] (the ring at the last chunk's positions, every rank)
-// The context rows go through context-only steps of 8 rows, the last chunk through the whole step.
+// The context rows go through context-only steps of 8 rows, the last chunk through the whole step. --fill 1: the context
+// rows but the last chunk's go through fill steps instead (dfl_fill_phase, the served prompt-context path): each row
+// in Dfl::pf_feat of one rank (row i on rank i % NR, zeros elsewhere, as the prefill's owner rows), gathered over the
+// loopback, with collective NT (the fc slices; under REP the 0-byte barrier). Every output must equal the run without.
 #include <cstdio>
 #include <vector>
 #include "packfind.h"
@@ -34,17 +37,19 @@ __global__ void k_h2f(const __half* a, float* b, int n) { for (int i = blockIdx.
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) die("usage: dfltest DIR [--sel 0|1] [--temp T] [--seed S]");
+    if (argc < 2) die("usage: dfltest DIR [--sel 0|1] [--temp T] [--seed S] [--fill 1]");
     const std::string dir = argv[1];
     int sel = 1;
     float temp = 0.f;
     uint32_t seed = 1234;
+    bool fill = false;
     for (int i = 2; i + 1 < argc; i += 2)
     {
         const std::string a = argv[i];
         if (a == "--sel") sel = atoi(argv[i + 1]);
         else if (a == "--temp") temp = (float)atof(argv[i + 1]);
         else if (a == "--seed") seed = (uint32_t)strtoul(argv[i + 1], nullptr, 10);
+        else if (a == "--fill") fill = atoi(argv[i + 1]) != 0;
         else die("unknown argument " + a);
     }
     FILE* cf = fopen((dir + "/case.bin").c_str(), "rb");
@@ -98,17 +103,51 @@ int main(int argc, char** argv)
         out[r] = dmalloc<DflOut>(1);
         D[r].in = in; D[r].out = out[r]; D[r].nc = 0;
         const DflMeta meta = dfl_read_meta(fd);
-        dfl_build(D[r], m, fd, meta, f, stepp, sel == 1, st);
+        dfl_build(D[r], m, fd, meta, f, stepp, sel == 1, st, fill);
         D[r].emb_rows = rows_d;       // block row r reads row r of the case's table
     }
     fprintf(stderr, "# device tensors: %.2f GB held, %.2f GB shared between ranks\n", store.bytes / 1e9, store.shared_bytes / 1e9);
     loop.recv = recv; loop.stepp = stepp; loop.ncoll = dfl::NC; loop.stride = stride;
     u64 step = 0;
     const int nch = (n + dfl::B - 1) / dfl::B;
+    if (fill)                         // the prompt-context taps: row i (position p0 + i) on rank i % NR
+    {
+        if (n > dfl::WIN) die("--fill: at most WIN context rows");
+        for (int r = 0; r < NR; ++r)
+        {
+            std::vector<__half> pf((size_t)n * dfl::NT * HID, __float2half(0.f));
+            for (int i = r; i < n; i += NR)
+                for (int k = 0; k < dfl::NT * HID; ++k) pf[(size_t)i * dfl::NT * HID + k] = __float2half(feat[(size_t)i * dfl::NT * HID + k] * dfl::FEAT_SCALE);
+            G6RT_CK(cudaMemcpy(D[r].pf_feat, pf.data(), pf.size() * 2, cudaMemcpyHostToDevice));
+            D[r].pf_lo = p0; D[r].pf_hi = p0 + n;
+        }
+    }
     for (int c = 0; c < nch; ++c)
     {
         const int rows_c = std::min(dfl::B, n - c * dfl::B);
         const bool query = c == nch - 1;
+        if (fill && !query)           // a fill step: phase 0 publishes the NT gathers, phase 1 collective NT
+        {
+            DflIn di;
+            memset(&di, 0, sizeof di);
+            di.step = ++step;
+            di.ctx_rows = rows_c; di.ctx_pos0 = p0 + c * dfl::B; di.q0 = di.ctx_pos0 + rows_c; di.lo = p0;
+            G6RT_CK(cudaMemcpy(in, &di, sizeof di, cudaMemcpyHostToDevice));
+            for (int p = 0; p < DFL_FILL_PH; ++p)
+            {
+                for (Dfl& x : D) dfl_fill_phase(x, p, st);
+                const std::vector<uint32_t> sz = dfl_fill_sizes();   // phase 0 ends with collectives 0..NT-1, phase 1 with NT
+                for (int k = p == 0 ? 0 : dfl::NT; p < 2 && k < (p == 0 ? dfl::NT : dfl::NT + 1); ++k)
+                {
+                    DLoop a = loop;
+                    a.c = k; a.n16 = (int)(sz[k] / 16);
+                    k_dloop<<<NR, 128, 0, st>>>(a);
+                }
+            }
+            G6RT_CK(cudaStreamSynchronize(st));
+            G6RT_CK(cudaGetLastError());
+            continue;
+        }
         std::vector<__half> fh((size_t)dfl::B * dfl::NT * HID, __float2half(0.f));
         for (int r = 0; r < rows_c; ++r)
             for (int k = 0; k < dfl::NT * HID; ++k) fh[(size_t)r * dfl::NT * HID + k] = __float2half(feat[((size_t)c * dfl::B + r) * dfl::NT * HID + k] * dfl::FEAT_SCALE);
