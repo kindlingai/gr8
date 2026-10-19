@@ -385,11 +385,14 @@ int main(int argc, char** argv)
             for (size_t j = 0; j < t.size(); ++j) kstop.tau[j + 1] = t[j];
         }
         if (const char* e = getenv("G6_MTP_KSTOP_SEED3")) kstop.seed3 = atof(e);
-        if (kstop.mode && (!s2mode || !dfl || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 || !(kstop.seed3 > 0 && kstop.seed3 < 1) ||
-                           kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
-            die("G6_MTP_KSTOP needs --serve, --dflash-manifest and --mtp 2+; G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), "
-                "G6_MTP_KSTOP_SEED3 in (0, 1)");
+        // Without --dflash-manifest (TP=6 / TP=3, MTP only): mode 1 stops the chain of a session that decodes alone
+        // (s2_batch.h KStop::solo), with G6_MTP_KSTOP_KMAX <= --mtp; mode 2 needs the drafter choice's estimates
+        if (kstop.mode && (!s2mode || (!dfl && (kstop.mode != 1 || kstop.kmax > mtp)) || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 ||
+                           !(kstop.seed3 > 0 && kstop.seed3 < 1) || kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
+            die("G6_MTP_KSTOP needs --serve and --mtp 2+ (without --dflash-manifest: mode 1 and G6_MTP_KSTOP_KMAX <= --mtp); "
+                "G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), G6_MTP_KSTOP_SEED3 in (0, 1)");
         if (!kstop.mode) kstop.kmax = 0;
+        kstop.solo = kstop.mode == 1 && !dfl;
         // G6_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
         // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least G6_MTP_KSTOPB_KMIN (0|1, default 0).
         // G6_MTP_KSTOPB_TAU=t1[,t2[,...]] (default 0.6,0.88; past the last entry there is no stop - the remaining drafts all verify) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n sessions.
@@ -429,8 +432,9 @@ int main(int argc, char** argv)
                 kstop.b.widths.push_back((int)w);
             }
         if (getenv("G6_MTP_KSTOPB_EXPLORE")) kstop.b.explore = atoi(getenv("G6_MTP_KSTOPB_EXPLORE"));
-        if (kstop.b.mode && (!s2mode || !dfl || kstop.b.explore < 0))
-            die("G6_MTP_KSTOPB needs --serve and --dflash-manifest (the draft log-probabilities); G6_MTP_KSTOPB_EXPLORE >= 0");
+        // the draft log-probabilities come from every MTP draft step (StepOut::lp), with or without the DFlash2 drafter
+        if (kstop.b.mode && (!s2mode || kstop.b.explore < 0))
+            die("G6_MTP_KSTOPB needs --serve; G6_MTP_KSTOPB_EXPLORE >= 0");
         if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
 #if G6_MODEL_FLASH
@@ -2122,6 +2126,23 @@ int main(int argc, char** argv)
                     for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
                     return o;
                 };
+            }
+            else if (kstop.mode || kstop.b.mode || kstop.log)
+            {   // MTP only (TP=6 / TP=3): the confidence stops of round_all (KStop::solo, KStopB) and their log (s2/service.h)
+                h.kstop = kstop;
+                if (R == 0 && kstop.mode)
+                    fprintf(stderr, "# s2 MTP confidence stop (MTP only): mode %d, a session alone verifies 1..%d drafts (tau %s,%s,%s)\n",
+                            kstop.mode, kstop.kmax, std::to_string(kstop.tau[1]).c_str(), std::to_string(kstop.tau[2]).c_str(),
+                            std::to_string(kstop.tau[3]).c_str());
+                if (R == 0 && kstop.b.mode)
+                {
+                    std::string t;
+                    for (int S = 1; S <= s2sess; ++S)
+                        t += (S > 1 ? " " : "") + std::to_string(S) + ":" + std::to_string(kstop.b.tau[S][1]).substr(0, 5) + "," +
+                             std::to_string(kstop.b.tau[S][2]).substr(0, 5) + "," + std::to_string(kstop.b.tau[S][3]).substr(0, 5);
+                    fprintf(stderr, "# s2 MTP shared-round stop (MTP only): each session verifies %d..%d drafts, tau by sessions %s\n",
+                            kstop.b.kmin, mtp, t.c_str());
+                }
             }
             g6s2::BootstrapConfig bc;
             bc.scheduler = sc;

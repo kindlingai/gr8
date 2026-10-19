@@ -32,7 +32,8 @@
 //   Decision (written before running): adopt an arm if it is IDENTICAL and saves >= 0.3 ms/step cold over BASE at T=2048
 //   L=1000 M=3, or >= 1 ms/step at M=12, or >= 1 ms/step at T=32768 (index / select arms: the long-context levers). Kill
 //   otherwise, or on any byte difference.
-// build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12):
+// build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12;
+// TP=6: -DG6_NR=6 -DDEC_S2, run with ATTNK_H=11 and ATTNK_H=10, the two head counts of a TP=6 rank):
 //   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o attnk attnk.cu ../bind.cu -lcublas
 // run: attnk T L M [what=3] [s2=1] [reps=10] [K=16] [TR=7] [chk=5] [bw=250]
 //   what: 1 CHAIN of BASE, 2 the arms, 4 CHAIN of stock. Arms: env ATTNK_ARMS="arm arm ..." with an arm = comma-separated
@@ -232,7 +233,10 @@ int main(int argc,char** argv){
         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
     std::vector<Arm> arms;
     for(auto& sp:specs){Arm x=base;x.vs_stock=sp=="base";if(!parse_arm(sp,x)){fprintf(stderr,"ATTNK_ARMS: bad arm %s\n",sp.c_str());return 2;}arms.push_back(x);}
-    const int H=g6nr::HMAX,pages=(T+63)/64,pool=NSESS*pages;   // session s: physical pages [s*pages, (s+1)*pages)
+    // ATTNK_H=<heads>: the rank's head count, g6nr::HMIN or HMAX (default HMAX). A -DG6_NR=6 build runs 11 or 10 heads, the
+    // partial head groups of the SC2 / QT arms (G6_ATTN_SC2_PART); TP=4 builds have 16 either way
+    const int H=getenv("ATTNK_H")?atoi(getenv("ATTNK_H")):g6nr::HMAX,pages=(T+63)/64,pool=NSESS*pages;   // session s: physical pages [s*pages, (s+1)*pages)
+    if(H!=g6nr::HMIN&&H!=g6nr::HMAX){fprintf(stderr,"ATTNK_H=%d: %d or %d heads at G6_NR=%d\n",H,g6nr::HMIN,g6nr::HMAX,g6nr::NR);return 2;}
     cudaStream_t st;CK(cudaStreamCreate(&st));
     {int dev=0,sms=0,clk=0,l2=0;CK(cudaGetDevice(&dev));cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,dev);
      cudaDeviceGetAttribute(&clk,cudaDevAttrClockRate,dev);cudaDeviceGetAttribute(&l2,cudaDevAttrL2CacheSize,dev);

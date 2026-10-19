@@ -862,7 +862,7 @@ static void launch_value_project_m1(const G6Attn& a,Input input,Work& w,int star
 // scratch q / rope and the KV rows 16 B aligned. The CP paths never pass qt.
 static bool use_qt(const G6Attn& a,const Work& w,int n){
 #if defined(DEC_AVP) && DEC_AVP
-    return attn_qt()&&!avp1_on()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&(attn_sc2()==2||attn_sc2()==4)&&a.heads%16==0&&
+    return attn_qt()&&!avp1_on()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&(attn_sc2()==2||attn_sc2()==4)&&sc2_heads_ok(a)&&
         al16(a.q_b)&&al16(w.q)&&al16(w.rope)&&al16(a.mla_cache);
 #else
     (void)a;(void)w;(void)n;return false;

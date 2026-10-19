@@ -113,7 +113,8 @@ __global__ void __launch_bounds__(128) context_parts_heads(Input input,int start
 // scores_tr's transpose reduction (TR = true, G6_ATTN_SC2_TR=1: per head the same xor tree, a + b commutes bitwise), the
 // same 1/16 scale, -inf for a dead slot, the same output address -> bit-identical to scores_heads<16>. Validity is per slot
 // and warp-uniform (one id per slot), so every shuffle stays full-warp; a dead slot in a live warp runs on zero operands and
-// stores -inf. Needs heads % 16 == 0 (dispatch). grid dim3(TOP/(4*S), heads/16, n), block 128: warp w of block x owns slots
+// stores -inf. Full groups (heads % 16 == 0) or, with PH below, a partial last group. grid dim3(TOP/(4*S), ceil(heads/16), n),
+// block 128: warp w of block x owns slots
 // (4x + w)*S .. +S-1, lane l < 16 stores head h0 + l of them (one S-wide vector store).
 // TR = 2 (G6_ATTN_SC2_TR=2): the same transpose reduction, eager. Every combine of TR = 1 pairs entries i and i + n/2 of the
 // stage, so the head entering it can be computed right before: heads in bit-reversed order (0 8 4 12 2 10 6 14 1 ...), each
@@ -124,12 +125,18 @@ __global__ void __launch_bounds__(128) context_parts_heads(Input input,int start
 // float4 (c*32 + lane, c = 0..3: qv[4c + e]) and its 2 rope q one float2 (lane), 5 loads instead of 18; a slot's 4 KV
 // scales are one float4 (row = 41 x 16 B, mla_cache 16 B aligned). The same values in qv / pv / scale -> the same bytes.
 // scores_sc_qt is that kernel, registers capped at 4 blocks / SM (S = 4 is 128 registers without QT).
-template<int S,int TR,bool QT,class Input>
+// PH (partial heads, G6_ATTN_SC2_PART, attn.cu attn_sc2_part; TP=6 and TP=3: 10 / 11 / 21 / 22 heads a rank): the last
+// head group holds nh = heads - h0 < 16 heads. Heads nh..15 of it load nothing and enter the reductions as 0 (TR = 0:
+// skipped); a real head's partials meet only its own partials in every combine (keep / send pick the same head index on
+// both lanes), so each real head gets the full kernel's bytes, = scores_heads<16>'s with its nh. Only lanes < nh store.
+// grid y = ceil(heads / 16). PH = false is the full-group kernel as before (heads % 16 == 0).
+template<int S,int TR,bool QT,class Input,bool PH=false>
 __device__ __forceinline__ void scores_sc_body(Input input,int start,const float* q,const float* rope,float* out,int tid){
  static_assert(S==1||S==2||S==4||S==8,"S in {1,2,4,8}");
  static_assert(TR>=0&&TR<=2&&!(S==8&&TR),"TR in {0,1,2}; S = 8 with TR 0");
  auto a=ga::resolve(input);if(!a.active)return;constexpr int HG=16,WARPS=4;
  int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,j0=(blockIdx.x*WARPS+tid/32)*S,lane=tid&31;FOR_ROW(a,input,r);
+ const int nh=PH?min(HG,a.heads-h0):HG;   // PH: heads of this group (warp-uniform); else the full group
  const uint8_t* v[S];bool any=false;
  #pragma unroll
  for(int s=0;s<S;s++){int id=a.indices[(int64_t)r*ga::TOP+j0+s];v[s]=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?ga::kv_at(a,id):nullptr;any|=v[s]!=nullptr;}
@@ -166,7 +173,12 @@ __device__ __forceinline__ void scores_sc_body(Input input,int start,const float
     for(int k=0;k<2;k++)pv[k]=__ldg(ph+hh*64+k*32);}};
   if constexpr(TR==2){
    // head hh's S dot products (the TR = 0 / 1 chains)
-   auto head=[&](int hh,float (&o)[S]){float qv[16],pv[2];loadq(hh,qv,pv);
+   auto head=[&](int hh,float (&o)[S]){
+    if(PH&&hh>=nh){
+     #pragma unroll
+     for(int s=0;s<S;s++)o[s]=0.f;
+     return;}
+    float qv[16],pv[2];loadq(hh,qv,pv);
     #pragma unroll
     for(int s=0;s<S;s++){float sum=0;
      #pragma unroll
@@ -197,7 +209,13 @@ __device__ __forceinline__ void scores_sc_body(Input input,int start,const float
   else{
   float acc[TR?S:1][TR?HG:1];
   #pragma unroll
-  for(int hh=0;hh<HG;hh++){float qv[16],pv[2];loadq(hh,qv,pv);
+  for(int hh=0;hh<HG;hh++){
+   if(PH&&hh>=nh){
+    if constexpr(TR){
+     #pragma unroll
+     for(int s=0;s<S;s++)acc[s][hh]=0.f;}
+    continue;}
+   float qv[16],pv[2];loadq(hh,qv,pv);
    #pragma unroll
    for(int s=0;s<S;s++){float sum=0;
     #pragma unroll
@@ -221,18 +239,18 @@ __device__ __forceinline__ void scores_sc_body(Input input,int start,const float
     if(lane<HG)mine[s]=got*(1.f/16);}}}
   #pragma unroll
   for(int s=0;s<S;s++)if(!v[s])mine[s]=-INFINITY;}
- if(lane<HG){float* o=out+((int64_t)row*a.heads+h0+lane)*ga::TOP+j0;
+ if(lane<nh){float* o=out+((int64_t)row*a.heads+h0+lane)*ga::TOP+j0;
   if constexpr(S==8){((float4*)o)[0]=make_float4(mine[0],mine[1],mine[2],mine[3]);((float4*)o)[1]=make_float4(mine[4],mine[5],mine[6],mine[7]);}
   else if constexpr(S==4)*(float4*)o=make_float4(mine[0],mine[1],mine[2],mine[3]);
   else if constexpr(S==2)*(float2*)o=make_float2(mine[0],mine[1]);
   else o[0]=mine[0];}
 }
-template<int S,int TR,class Input>
+template<int S,int TR,class Input,bool PH=false>
 __global__ void __launch_bounds__(128) scores_sc(Input input,int start,const float* q,const float* rope,float* out){
- scores_sc_body<S,TR,false>(input,start,q,rope,out,threadIdx.x);}
-template<int S,int TR,class Input>
+ scores_sc_body<S,TR,false,Input,PH>(input,start,q,rope,out,threadIdx.x);}
+template<int S,int TR,class Input,bool PH=false>
 __global__ void __launch_bounds__(128,4) scores_sc_qt(Input input,int start,const float* q,const float* rope,float* out){
- scores_sc_body<S,TR,true>(input,start,q,rope,out,threadIdx.x);}
+ scores_sc_body<S,TR,true,Input,PH>(input,start,q,rope,out,threadIdx.x);}
 // G6_ATTN_CTX2=3 / 4 (attn_ctx2): context_parts_heads<HG> with the per-slot work packed and branch-free. Prologue as
 // context_parts_heads, but slot j's HG probabilities sit together (pm[j], 16 B smem loads), a slot whose row pointer is null
 // gets p = 0 for every head, and the skip is a select: lo = p != 0 ? fmaf(p, x*s, lo) : lo, which is `if (!rows[j]) continue`
@@ -476,30 +494,43 @@ static bool attn_heads(){static const bool on=!getenv("G6_ATTN_HEADS")||atoi(get
 // Bit-identical. Host-side, read once (before graph capture). Tests may assign them.
 static int& attn_sc2(){static int v=[]{const char* e=getenv("G6_ATTN_SC2");const int x=e?atoi(e):0;return x==1||x==2||x==4||x==8?x:0;}();return v;}
 static int& attn_sc2_tr(){static int v=[]{const char* e=getenv("G6_ATTN_SC2_TR");const int x=e?atoi(e):0;return x==1||x==2?x:0;}();return v;}
+// G6_ATTN_SC2_PART (default 1; 0 = off): scores_sc (and QT) also serve a head count that is not a multiple of 16 (TP=6:
+// 10 / 11 heads a rank, TP=3: 21 / 22) with the partial-head forms (scores_sc_body PH), bit-identical to scores_heads<16>.
+// Off: those calls take scores_heads<16> as before. Inert at a multiple of 16 (TP=4). Host-side, read once. Tests may assign it.
+static int& attn_sc2_part(){static int v=[]{const char* e=getenv("G6_ATTN_SC2_PART");return e&&*e?(atoi(e)!=0):1;}();return v;}
+static bool sc2_heads_ok(const G6Attn& a){return a.heads%16==0||(attn_sc2_part()&&a.heads>0);}
 // qt (run_body, attn.cu use_qt: S = 2 / 4 only): scores_sc_qt on the lane-transposed q / rope
-template<int S,class Input>
+// PH: the partial-head instantiations (a.heads % 16 != 0, G6_ATTN_SC2_PART), grid y = ceil(heads / 16)
+template<int S,bool PH,class Input>
 static void launch_scores_qt(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
- const dim3 g(TOP/(4*S),a.heads/16,n);const int tr=attn_sc2_tr();
- if(tr==2)small_decode::scores_sc_qt<S,2><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
- else if(tr)small_decode::scores_sc_qt<S,1><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
- else small_decode::scores_sc_qt<S,0><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+ const dim3 g(TOP/(4*S),(a.heads+15)/16,n);const int tr=attn_sc2_tr();
+ if(tr==2)small_decode::scores_sc_qt<S,2,Input,PH><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else if(tr)small_decode::scores_sc_qt<S,1,Input,PH><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else small_decode::scores_sc_qt<S,0,Input,PH><<<g,128,0,st>>>(input,start,w.q,w.rope,w.prob);
 }
-template<class Input>
-static void launch_scores_sc(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
- if(qt){if(attn_sc2()==2)launch_scores_qt<2>(a,input,w,start,n,st);else launch_scores_qt<4>(a,input,w,start,n,st);return;}
- const dim3 b(128),g1(TOP/4,a.heads/16,n),g2(TOP/8,a.heads/16,n),g4(TOP/16,a.heads/16,n),g8(TOP/32,a.heads/16,n);
+template<bool PH,class Input>
+static void launch_scores_sc_ph(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt){
+ if(qt){if(attn_sc2()==2)launch_scores_qt<2,PH>(a,input,w,start,n,st);else launch_scores_qt<4,PH>(a,input,w,start,n,st);return;}
+ const int y=(a.heads+15)/16;
+ const dim3 b(128),g1(TOP/4,y,n),g2(TOP/8,y,n),g4(TOP/16,y,n),g8(TOP/32,y,n);
  const int tr=attn_sc2_tr();
  switch(attn_sc2()){
-  case 1:if(tr==2)small_decode::scores_sc<1,2><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
-   else if(tr)small_decode::scores_sc<1,1><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
-   else small_decode::scores_sc<1,0><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
-  case 2:if(tr==2)small_decode::scores_sc<2,2><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
-   else if(tr)small_decode::scores_sc<2,1><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
-   else small_decode::scores_sc<2,0><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
-  case 8:small_decode::scores_sc<8,0><<<g8,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
-  default:if(tr==2)small_decode::scores_sc<4,2><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
-   else if(tr)small_decode::scores_sc<4,1><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
-   else small_decode::scores_sc<4,0><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;}
+  case 1:if(tr==2)small_decode::scores_sc<1,2,Input,PH><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else if(tr)small_decode::scores_sc<1,1,Input,PH><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else small_decode::scores_sc<1,0,Input,PH><<<g1,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+  case 2:if(tr==2)small_decode::scores_sc<2,2,Input,PH><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else if(tr)small_decode::scores_sc<2,1,Input,PH><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else small_decode::scores_sc<2,0,Input,PH><<<g2,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+  case 8:small_decode::scores_sc<8,0,Input,PH><<<g8,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;
+  default:if(tr==2)small_decode::scores_sc<4,2,Input,PH><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else if(tr)small_decode::scores_sc<4,1,Input,PH><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);
+   else small_decode::scores_sc<4,0,Input,PH><<<g4,b,0,st>>>(input,start,w.q,w.rope,w.prob);break;}
+}
+// heads % 16 == 0 (TP=4, ...): the full-group kernels, as before; otherwise the partial-head forms (sc2_heads_ok)
+template<class Input>
+static void launch_scores_sc(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
+ if(a.heads%16==0)launch_scores_sc_ph<false>(a,input,w,start,n,st,qt);
+ else launch_scores_sc_ph<true>(a,input,w,start,n,st,qt);
 }
 // G6_ATTN_CTX2 (attn.cu attn_ctx2): the context_parts_heads calls (HG 4 up to 4 rows, then 8) under the same head groups
 template<int HG,class Input>
@@ -608,7 +639,7 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int 
  #endif
  if(use_attn_flip(a,n))small_decode::scores_flip<Input,11><<<dim3(TOP/8,(a.heads+10)/11,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else if(attn_heads()&&attn_p11()&&a.heads%16==0)small_decode::scores_tr<16><<<dim3(TOP/8,a.heads/16,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
- else if(attn_heads()&&attn_sc2()&&a.heads%16==0)launch_scores_sc(a,input,w,start,n,st,qt);
+ else if(attn_heads()&&attn_sc2()&&sc2_heads_ok(a))launch_scores_sc(a,input,w,start,n,st,qt);
  else if(attn_heads()){constexpr int HG=16;small_decode::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
  else if(use_long_fixed_k(a,n))small_decode::scores_flip<Input,1><<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else if(use_fixed_k_decode(a))small_decode::scores_direct<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
