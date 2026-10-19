@@ -488,7 +488,13 @@ struct RoutePlan
 // grid 1, block 256 (warp w = tokens w, w + 8, ...; M <= MMAX). logits [M][256] fp32, bias [256] fp32 (e_score_correction_bias).
 // Selection key = sigmoid(logit) + bias, ties -> lowest expert id. Weights = unbiased sigmoid of the
 // selected experts / their sum * 2.5 (FACTS-M0 2(c)).
-__global__ void __launch_bounds__(256) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P)
+// keep / keep_dev (G6_MTP_LASTROW, rank.cuh launch_mlp_block): bit m = token m is routed; a token outside the mask takes no
+// route (no expert slot, tok_slot -1, as tokens m >= M), so the finalize gives it the shared expert only. keep_dev (device
+// word, read at launch) wins over keep; both 0 / nullptr = every token, today's plan. A routed token's selection, weights,
+// slot order (ascending expert id) and column (M <= 8: column m; above: its rank among the expert's routed tokens) do not
+// depend on the other tokens, and an mma column depends only on its own token: its K1 output bytes are the same.
+__global__ void __launch_bounds__(256) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P, unsigned keep = 0u,
+                                                     const unsigned* keep_dev = nullptr)
 {
     __shared__ unsigned emask[NEXP];              // bit m = token m selected the expert
     __shared__ int sel_e[MMAX][TOPK];
@@ -497,6 +503,7 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const 
     __shared__ int wcount[8];
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
     const bool dense = M > 8;
+    const unsigned on = keep_dev ? *keep_dev : keep ? keep : 0xffffffffu;
     emask[t] = 0u;
     for (int i = t; i < SMAX * 8; i += 256)
     {
@@ -506,6 +513,7 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const 
     __syncthreads();
     for (int m = w; m < M; m += 8)
     {
+        if (!(on >> m & 1u)) continue;            // the whole warp (m depends on w only)
         float s[8], key[8];
         #pragma unroll
         for (int i = 0; i < 8; ++i)
@@ -580,7 +588,7 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const 
     for (int i = t; i < MMAX * TOPK; i += 256)
     {
         const int m = i >> 3, k = i & 7;
-        if (m < M)
+        if (m < M && (on >> m & 1u))
         {
             const int e = sel_e[m][k];
             const int r = __popc(emask[e] & ((1u << m) - 1u));      // rank of token m among the expert's tokens
