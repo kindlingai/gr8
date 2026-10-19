@@ -435,10 +435,11 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
 #endif
     float* dst=parts+(((int64_t)row*a.heads+h)*PART+part)*512;dst[t]=lo;dst[t+256]=hi;
 }
-template<class Input>
+// P = TOP/SP partials (G6_ATTN_CTX3_SP, run_body: 16 or 32), summed in partition order
+template<class Input,int P=PART>
 __global__ void merge_parts(Input input,const float* parts,float* out){
     auto a=resolve(input);if(!a.active)return;
-    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<PART;part++)s+=parts[((int64_t)rowhead*PART+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
+    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<P;part++)s+=parts[((int64_t)rowhead*P+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
 }
 template<bool F8=false,class Input>
 __global__ void value_project(Input input,int start,const float* context){
@@ -635,6 +636,18 @@ static int& attn_qt(){static int v=[]{
 #endif
     }();return v;}
 static int& attn_front_on(){static int v=[]{const char* e=getenv("G6_ATTN_FRONT");return e&&atoi(e)==1?1:0;}();return v;}
+// Round 10 (E1: deterministic fp-order changes, default 0 = off; host-side, read once, before the bindings size their
+// scratch and before graph capture; in the S2 runtime signature, g6m4; tests may assign them, before sizing the scratch):
+// G6_ATTN_CTX3_SP=64 / 128 (decode-small.cuh ctx_sp): run_body's context_pk3 calls over partitions of 64 / 128 slots (32 /
+// 16 partials, merge_parts over them in order) instead of 256 (8): 4x / 2x the CTAs, each a 4x / 2x shorter slot chain.
+// FP8 KV only.
+static int& attn_ctx3_sp(){static int v=[]{
+#if G6_KV4
+    return 0;
+#else
+    const char* e=getenv("G6_ATTN_CTX3_SP");const int x=e?atoi(e):0;return x==64||x==128?x:0;
+#endif
+    }();return v;}
 static bool al16(const void* p){return ((uintptr_t)p&15)==0;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
@@ -648,7 +661,7 @@ static Work workspace(const G6Attn& a,void* base){
     w.si=(float*)alloc(R*T*4);w.so=(float*)alloc(R*T*4);w.ii=(int*)alloc(R*T*4);w.io=(int*)alloc(R*T*4);w.offsets=(int*)alloc((R+1)*4);
     w.selected=(uint64_t*)alloc(R*TOP*8);w.selection=(SelectionState*)alloc(R*sizeof(SelectionState));
     w.histogram=(int*)alloc(R*((std::min(T,size_t(32768))+RADIX_CHUNK-1)/RADIX_CHUNK)*256*4);
-    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*PART*512*4);w.context=(float*)alloc(R*H*512*4);
+    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*(attn_ctx3_sp()?TOP/attn_ctx3_sp():PART)*512*4);w.context=(float*)alloc(R*H*512*4);
     size_t b=0;cudaError_t e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,b,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);
     if(e!=cudaSuccess)return Work{};
     // The last query tile can contain one row even when the workspace has R>1.
@@ -828,9 +841,12 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         AMARK(4);
         ga::normalize<<<n*a.heads,256,0,stream>>>(input,w.prob);
         AMARK(5);
-        ga::launch_context_parts(a,input,w,start,n,stream);
+        const int sp=ctx_sp(a,n);
+        ga::launch_context_parts(a,input,w,start,n,stream,sp);
         AMARK(6);
-        ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        if(sp==64)ga::merge_parts<Input,TOP/64><<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        else if(sp==128)ga::merge_parts<Input,TOP/128><<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        else ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
         KV4_ROTATE(w.context,n*a.heads,stream);
         AMARK(7);
 #if defined(DEC_AVP) && DEC_AVP
@@ -979,6 +995,7 @@ static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8
 #endif
 }
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
+extern "C" int g6_attn_ctx_sp(void){return ga::attn_ctx3_sp();}
 extern "C" int g6_attn_append(const G6Attn* a,void* s){
     if(!a||!ga::valid(*a)||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;ga::append_kv<<<a->rows,256,0,stream>>>(*a);
