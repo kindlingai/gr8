@@ -204,7 +204,7 @@ fn bindings(rng: &mut Rng) -> Vec<Binding> {
 
 fn layouts(rng: &mut Rng, n: usize) -> Vec<Layout> {
     let mut v = vec![Layout { nr: 0, below_rows: 0 }];
-    for nr in [2u32, 3, 4, 6] {
+    for nr in [2u32, 3, 4, 5, 6] {
         let r = 64 * rng.range(0, (n / PAGE) as u64) as u32;
         v.push(Layout { nr, below_rows: r });
     }
@@ -330,6 +330,7 @@ fn a_chain_of_layouts_loses_nothing() {
         Layout { nr: 6, below_rows: 1024 },
         Layout { nr: 4, below_rows: 2048 },
         Layout { nr: 3, below_rows: 64 },
+        Layout { nr: 5, below_rows: 1088 },
         Layout { nr: 0, below_rows: 0 },
         Layout { nr: 6, below_rows: 1024 },
     ];
@@ -359,9 +360,9 @@ fn a_chain_of_layouts_loses_nothing() {
     }
     // back at TP6 with R 1024, on another page list: the same rows on the pages that list names
     let cs: Vec<Vec<Cache>> = ranks.iter().map(caches).collect();
-    assert_eq!(&canon::export(row, &bs, &chain[4], &views, &cs, 0, n as u64, true).unwrap(), c0.as_ref().unwrap());
+    assert_eq!(&canon::export(row, &bs, &chain[chain.len() - 1], &views, &cs, 0, n as u64, true).unwrap(), c0.as_ref().unwrap());
     let fresh: Vec<Rank> = (0..views.len())
-        .map(|r| write(&t, &bs, row, &chain[4], &views[r], r as u32, ranks[r].mla[0].len() / (PAGE * row), n, 0))
+        .map(|r| write(&t, &bs, row, &chain[chain.len() - 1], &views[r], r as u32, ranks[r].mla[0].len() / (PAGE * row), n, 0))
         .collect();
     for r in 0..views.len() {
         assert!(ranks[r].mla == fresh[r].mla && ranks[r].idx == fresh[r].idx, "rank {r} after the chain");
@@ -512,7 +513,7 @@ fn head_split_state_regroups_for_every_width() {
             let refs: Vec<&[u8]> = parts.iter().map(|p| &p[..]).collect();
             assert_eq!(canon::heads_out(&refs, heads, outer, inner).unwrap(), whole);
             // and through another width
-            for nr2 in [1, 2, 3, 4, 6] {
+            for nr2 in [1, 2, 3, 4, 5, 6] {
                 if nr2 > heads {
                     continue;
                 }

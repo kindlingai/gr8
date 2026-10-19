@@ -27,8 +27,8 @@ M4SIM=${M4SIM:-$HERE/m4sim}
 [ -n "${MODEL_ARGS:-}" ] || { echo "set MODEL_ARGS (--packs DIR, or the --v2 ... --v2-dense ... release form)"; exit 2; }
 OUT=${OUT:-$PWD/m4sim-split-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
-LAYERS=${LAYERS:-0,1,2,3,6}         # l % 4 = 0..3 (the gather geometry rotates by layer); dense 0-2, MoE 3 and 6; indexer
-                                    # layers 0, 1, 2, 6 and a shared-index one (3). G6_DEC_SPLIT=3 needs more than 3
+LAYERS=${LAYERS:-0,1,2,3,4,6}       # l % NR = every rotation up to NR 5 (the gather geometry rotates by layer); dense 0-2,
+                                    # MoE 3, 4 and 6; indexer layers 0, 1, 2, 6 and a shared-index one (3). G6_DEC_SPLIT=3 needs more than 3
 QUICK=${QUICK:-0}
 PARTS=${PARTS:-ab cp}
 TMO=${TMO:-1800}                    # seconds per run (a lost gather fails by its own timeout, error word 66xxxxxx)

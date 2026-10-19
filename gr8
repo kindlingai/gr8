@@ -262,7 +262,7 @@ case $cmd in
     if [ $check = 1 ]; then
       do_check || { echo "fix the FAIL rows, or boot anyway with ./gr8 glm53 --no-check up" >&2; exit 1; }
     fi
-    l=$(launcher) || { echo "no launcher for TP=$TP (4, 6 or 3)" >&2; exit 2; }
+    l=$(launcher) || { echo "no --ssh launcher for TP=$TP (4, 6 or 3; TP=5 runs only without --ssh)" >&2; exit 2; }
     exec "$l" ;;
   down) exec "$SCRIPTS/stop.sh" ;;
   restart)
@@ -271,7 +271,7 @@ case $cmd in
     if [ $check = 1 ]; then
       do_check || { echo "fix the FAIL rows, or boot anyway with ./gr8 glm53 --no-check up" >&2; exit 1; }
     fi
-    l=$(launcher) || { echo "no launcher for TP=$TP (4, 6 or 3)" >&2; exit 2; }
+    l=$(launcher) || { echo "no --ssh launcher for TP=$TP (4, 6 or 3; TP=5 runs only without --ssh)" >&2; exit 2; }
     exec "$l" ;;
   status) config; do_status ;;
   logs) config; do_logs "$@" ;;
