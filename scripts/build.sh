@@ -35,7 +35,7 @@ KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
 if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
-WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 6 8}}
+WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 5 6 8}}
 # each width runs its own instance: the --top-p-cands bound is TP_SORT (2048) / NR, checked before any CUDA work
 widths_ok() {   # widths_ok <g6m4> [<m4sim>]
   local n ips want

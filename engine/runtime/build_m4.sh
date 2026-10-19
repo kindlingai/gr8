@@ -67,7 +67,7 @@ wflags() {
   echo "$f"
 }
 for n in $WIDTHS; do
-  case $n in 1|2|3|4|6|8) ;; *) echo "WIDTHS: $n is not a TP width (1, 2, 3, 4, 6 or 8)"; exit 2 ;; esac
+  case $n in 1|2|3|4|5|6|8) ;; *) echo "WIDTHS: $n is not a TP width (1, 2, 3, 4, 5, 6 or 8)"; exit 2 ;; esac
 done
 J=${JOBS:-$(nproc)}
 rm -f $O/*.log $O/*.failed

@@ -21,7 +21,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'TP': ('cluster', None, 'tensor-parallel size: 4, 6 or 3'),
+    'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5'),
     'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
                                  "cabled to the f1 port of the next box in --peers order, the last to the first)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
@@ -308,7 +308,7 @@ def validate(o):
             tp = str(len(split_list(o.get('PEERS'))))
             o.values['TP'], o.origin['TP'] = tp, 'the number of peers'
         else:
-            raise OptionError('--tp is needed with --mentat (4, 6 or 3)')
+            raise OptionError('--tp is needed with --mentat (4, 6, 3 or 5)')
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
                           'them with --g6env-x "NAME=value ..." so every box compares them')
@@ -362,8 +362,8 @@ def validate(o):
                 force = 0.0
             if not (0.0 < force <= 4.0) or struct.unpack('<f', struct.pack('<f', force))[0] == 0:
                 raise OptionError('--steering-force: want a finite number in (0, 4]')
-    if tp not in ('3', '4', '6'):
-        raise OptionError(f'--tp {tp}: want 4, 6 or 3')
+    if tp not in ('3', '4', '5', '6'):
+        raise OptionError(f'--tp {tp}: want 4, 6, 3 or 5')
     if o.get('SHAPE') not in ('mesh', 'ring'):
         raise OptionError(f'--shape {o.get("SHAPE")}: want mesh or ring')
     if o.get('SHAPE') == 'ring':
