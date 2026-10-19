@@ -59,7 +59,7 @@ manifest instead.
 | `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
 | `VARIANT` (`--variant`) | `home` | `home` | `bit225` | the exlr8 v2 width manifest: `bit225`, `bit243`, `bit260`, `bit325`, `bit338` (routed experts at about 2.25-3.38 bpw, spent where they lower KL against bf16 the most), `home` (3.25 bpw), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). At TP=3, a release without `bit225` boots `down1`. Without `V2`, only `home` |
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
-| `DFL_REUSE` | unset (0) | – | – | 1 = a request whose prefix-reuse hit skipped into the DFlash2 drafter's window keeps the drafter (KNOWN-ISSUES #1); 2 = also a request alone on MTP takes it (`G6_DFL_REUSE`). Needs `DFLASH=1` |
+| `DFL_REUSE` | 2 | – | – | 1 = a request whose prefix-reuse hit skipped into the DFlash2 drafter's window keeps the drafter; 2 = also a request alone on MTP takes it (`G6_DFL_REUSE`). Defaults to 2 when serving DFlash2 with MTP. Needs `DFLASH=1` |
 | `DFL_REUSE_MIN` | unset (256) | – | – | `DFL_REUSE`: context rows the drafter must hold before it drafts; fewer = MTP warm-up rounds (`G6_DFL_REUSE_MIN`) |
 | `MTP_KSTOP` | on (2) when serving w/ DFlash2 + MTP 2+ | – | – | a request's solo MTP rounds chain and verify the drafts the MTP head is confident in: 1 = thresholds (`MTP_KSTOP_TAU`), 2 = the drafter choice's MTP estimates (`G6_MTP_KSTOP`). Needs `DFLASH=1`, `MTP` 2+ |
 | `MTP_KSTOP_KMAX` | unset (`MTP`) | – | – | `MTP_KSTOP`: the most drafts a solo MTP round chains, 1..3 (`G6_MTP_KSTOP_KMAX`) |
@@ -68,18 +68,27 @@ manifest instead.
 | `QA_SPLIT` | on (2) when TP>1 | unset (0) | unset (0) | decode: the layer-input GEMVs split by output tiles across the ranks and all-gathered (`G6_QA_SPLIT`, 1 or 2; bit-exact). Measured at TP=4 only |
 | `IDXQ_SPLIT` | on (1) when TP>1 | unset (0) | unset (0) | decode: the indexer's wq_b split the same way (`G6_IDXQ_SPLIT`; bit-exact) |
 | `MTP_SPLIT` | on (1) when TP>1 + MTP | unset (0) | unset (0) | MTP draft steps: eh_proj and the draft layer's input GEMVs split the same way (`G6_MTP_SPLIT`; bit-exact) |
-| `DRAFT_HEAD_I4` | unset (0) | unset (0) | unset (0) | 1 = the MTP draft's lm_head on INT4 g32 copies made at boot (`G6_DRAFT_HEAD_I4`; drafts only, +134 MB a rank at TP=4) |
+| `DRAFT_HEAD_I4` | 1 (with `MTP` 1+) | unset (0) | unset (0) | 1 = the MTP draft's lm_head on INT4 g32 copies made at boot (`G6_DRAFT_HEAD_I4`; drafts only, +134 MB a rank at TP=4) |
 | `DFL_HEAD_I4` | unset (0) | – | – | 1 = the DFlash2 drafter's lm_head on the same INT4 records (`G6_DFL_HEAD_I4`; drafts only). Needs `DFLASH=1` |
 | `DFL_BODY_I4` | unset (0) | – | – | 1 = the DFlash2 drafter's body GEMVs on INT4 g32 copies (`G6_DFL_BODY_I4`; drafts only, +382 MB a rank). Needs `DFLASH=1` |
-| `ROUTE_OVL` | unset (0) | unset (0) | unset (0) | decode MoE layers of 2+ rows: the trellis shared expert on a forked stream during the router, 1 = fc1 + fc2, 2 = fc1 (`G6_ROUTE_OVL`; bit-exact). Measured at TP=4 only |
-| `ATTN_SC2` | unset (0) | unset (0) | unset (0) | decode attention scores with S = 1, 2, 4 or 8 key slots per warp (`G6_ATTN_SC2`; bit-exact) |
-| `ATTN_SC2_TR` | unset (0) | unset (0) | unset (0) | with `ATTN_SC2`: the transpose reduction, 1 or 2 = eager (`G6_ATTN_SC2_TR`; bit-exact) |
-| `ATTN_CTX2` | unset (0) | unset (0) | unset (0) | decode attention context kernel variant 1..4 (`G6_ATTN_CTX2`; bit-exact) |
-| `ATTN_CTX3` | unset (0) | unset (0) | unset (0) | decode attention context with one test per batch of slots, 1..4 (`G6_ATTN_CTX3`; bit-exact) |
-| `ATTN_SEL2` | unset (0) | unset (0) | unset (0) | decode index selection's final sort as a rank by count over 8, 16, 32 or 64 CTAs per row (`G6_ATTN_SEL2`; bit-exact) |
-| `IDX_GRP` | unset (0) | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
-| `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
-| `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+| `ROUTE_OVL` | 1 | unset (0) | unset (0) | decode MoE layers of 2+ rows: the trellis shared expert on a forked stream during the router, 1 = fc1 + fc2, 2 = fc1 (`G6_ROUTE_OVL`; bit-exact). Measured at TP=4 only |
+| `ATTN_SC2` | 4 | unset (0) | unset (0) | decode attention scores with S = 1, 2, 4 or 8 key slots per warp (`G6_ATTN_SC2`; bit-exact) |
+| `ATTN_SC2_TR` | 2 | unset (0) | unset (0) | with `ATTN_SC2`: the transpose reduction, 1 or 2 = eager (`G6_ATTN_SC2_TR`; bit-exact) |
+| `ATTN_CTX2` | 4 | unset (0) | unset (0) | decode attention context kernel variant 1..4 (`G6_ATTN_CTX2`; bit-exact) |
+| `ATTN_CTX3` | 2 | unset (0) | unset (0) | decode attention context with one test per batch of slots, 1..4 (`G6_ATTN_CTX3`; bit-exact) |
+| `ATTN_SEL2` | 16 | unset (0) | unset (0) | decode index selection's final sort as a rank by count over 8, 16, 32 or 64 CTAs per row (`G6_ATTN_SEL2`; bit-exact) |
+| `IDX_GRP` | 16 | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
+| `ATTN_QT` | 1 | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
+| `ATTN_FRONT` | 1 | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+| `IDX_VEC` | 1 | unset (0) | unset (0) | 1 = the decode indexer's vector loads (`G6_IDX_VEC`) |
+| `DEC_BK` | 512 | unset (2048) | unset (2048) | decode context bucket in tokens: the step graphs are captured per bucket (`G6_DEC_BK`; 0 = the engine default 2048) |
+| `S2_ADAPT` | 1 (with `MTP` 1+) | unset (0) | unset (0) | S2: each round's MTP draft count from the sessions' accept rates and step costs (`G6_S2_ADAPT`; drafts only; about 1 GiB more step graphs) |
+| `S2_DECODE_PF` | 4096 | unset (0) | unset (0) | S2: while a session decodes, a prefill quantum takes at most this many rows on one lane (`G6_S2_DECODE_PF`; a multiple of 64, at most `--prefill`) |
+| `S2_ADMIT_HOLD` | 1 | unset (0) | unset (0) | S2: a burst of queued requests is admitted at one boundary instead of one per notice (`G6_S2_ADMIT_HOLD`) |
+| `S2_DECODE_ROUNDS` | 16 | unset (0) | unset (0) | S2: while a prefill waits and sessions decode, this many decode rounds per prefill quantum (`G6_S2_DECODE_ROUNDS`; 0..64) |
+| `PF_SELX_CTX` | 53248 | unset (0) | unset (0) | prefill index tiles at context >= this select with selx instead of SEL32, same ids in the same order (`G6_PF_SELX_CTX`; 0 = SEL32) |
+| `TR3_W2ALL` | 1 | unset (0) | unset (0) | 1 = the window-2 fc1 split (KS1x2, WG1) on every MoE layer at M > 1, not only the layers the k2 gate picks (`G6_TR3_W2ALL`; bit-exact). Measured at TP=4 only |
+| `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

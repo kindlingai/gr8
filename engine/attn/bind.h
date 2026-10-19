@@ -2,8 +2,8 @@
 #include "attn.h"
 #include "replay.h"
 
-// Every weight below is contiguous BF16 device storage. Shape is copied from
-// the manifest, NOT inferred from a pointer. No dependency on the pack loader.
+// Every weight below is contiguous BF16 device storage, except UK / UV when uks / uvs are set (#50: E4M3 bytes + f32
+// scales). Shape is copied from the manifest, NOT inferred from a pointer. No dependency on the pack loader.
 struct G6AttnTensor {
     const void* data;
     int ndim;
@@ -15,6 +15,10 @@ struct G6AttnPack {
     G6AttnTensor kv_norm;     // Lnnn.kv_a_norm [512]
     G6AttnTensor index_norm;  // Lnnn.idx.k_norm.w [128], only full-index layers
     G6AttnTensor index_bias;  // Lnnn.idx.k_norm.b [128], only full-index layers
+    // #50 (G6_KVB=fp8): uk / uv are u8 E4M3 [H,192,512] / [H,256,512] and these their f32 scales, the release's 128x128
+    // block scale of every weight row and 128-column block. Both null: uk / uv are BF16.
+    G6AttnTensor uks;         // Lnnn.kv_b.uk.scale [H,192,4]; transposed once by binder to [H,4,192]
+    G6AttnTensor uvs;         // Lnnn.kv_b.uv.scale [H,256,4]; borrowed unchanged
 };
 struct G6AttnStep {
     int rows, context;        // current logical context, NOT allocated capacity
@@ -66,5 +70,8 @@ extern "C" int g6_attn_bind_replay_init(G6AttnBinding*, const G6AttnStep*,
     G6AttnStepCell*, int captured_capacity, G6AttnReplay*, void* stream);
 // Explicit new-sequence reset: clear caches/output/error and set indices to -1.
 extern "C" int g6_attn_bind_reset(G6AttnBinding*, void* stream);
+// #50: rows x 512 E4M3 weights with f32 scales [rows][4] (one per row and 128-column block) -> BF16 [rows][512], each
+// BF16(e4m3 x scale): the bytes the BF16 loader stores for the same weights (engine/loader-rs/src/release.rs).
+extern "C" int g6_attn_kvb_bf16(const void* fp8, const float* scale, void* bf16, int rows, void* stream);
 // Complete outstanding uses before release; frees ONLY binder-owned storage.
 extern "C" int g6_attn_bind_release(G6AttnBinding*);

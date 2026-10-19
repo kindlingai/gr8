@@ -750,6 +750,10 @@ inline K1Split k1_split(int M, int k2 = 0)
     // Baked, no env (harness K1_KW). NS2 = 2 at M 2..3 is the W1b rule above (k2 layers). Non-k2 layers keep release.
     if (k2 && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
 #endif
+    // G6_TR3_W2ALL=1: the same window2 rule on every MoE layer, not only k2 layers (A/B, default 0 = the rule above).
+    // Same k ranges and partial order, so the same bits; only the CTA shape changes (S2 c4 runs class 3, s2_batch.h).
+    static const bool w2all = getenv("G6_TR3_W2ALL") && atoi(getenv("G6_TR3_W2ALL"));
+    if (w2all && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
     return s;
 }
 constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: only WG, s_ks, s_ns2 matter. Not tuned.

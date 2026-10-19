@@ -109,6 +109,16 @@ KEYS = {
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
+    'IDX_VEC': ('cluster', None, 'decode indexer vector loads (G6_IDX_VEC)'),
+    'DEC_BK': ('cluster', None, 'decode context bucket in tokens; 0 = engine default 2048 (G6_DEC_BK)'),
+    'S2_ADAPT': ('cluster', None, 'S2 MTP draft count from accept rates and step costs (G6_S2_ADAPT)'),
+    'S2_DECODE_PF': ('cluster', None, 'S2 prefill quantum rows while sessions decode (G6_S2_DECODE_PF)'),
+    'S2_ADMIT_HOLD': ('cluster', None, 'S2 burst admissions at one boundary (G6_S2_ADMIT_HOLD)'),
+    'S2_DECODE_ROUNDS': ('cluster', None, 'S2 decode rounds per prefill quantum (G6_S2_DECODE_ROUNDS)'),
+    'PF_SELX_CTX': ('cluster', None, 'prefill selx at context >= this; 0 = SEL32 (G6_PF_SELX_CTX)'),
+    'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
+    'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
+                             'needs V2_DENSE)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
@@ -337,6 +347,12 @@ def validate(o):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+    if o.get('KVB') not in (None, 'bf16', 'fp8'):
+        raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
+    # a release boot sets V2_DENSE, or --model names a release (resolve_model sets V2_DENSE after this); the engine refuses
+    # KVB=fp8 on a pack boot at start
+    if o.get('KVB') == 'fp8' and not (o.get('V2_DENSE') or o.get('MODEL')):
+        raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')

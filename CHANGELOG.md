@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-10-18: G6_DFL_REUSE defaults on when serving DFlash2 with MTP
+
+- `G6_DFL_REUSE` now defaults to 2 when the engine serves DFlash2 with MTP (off elsewhere, and any explicit value still
+  wins). A request whose prefix-reuse hit skipped into the drafter's window, or that runs alone on MTP, keeps the
+  DFlash2 drafter instead of running MTP for its whole life. That is most later turns of a conversation.
+- Why: on a warm cache (RigMark run 2, every prompt a prefix hit) code held at 51.1 tok/s with it on against 44.3 off,
+  +15%, with prose, multi-agent and cold prefill unchanged. Drafts only, so output is bit-identical (KL mean 0.0,
+  top-1 1.0). This closes the former "which requests get the DFlash2 drafter depends on timing" issue.
+- `G6_DFL_REUSE=0` restores the old behaviour.
+
+## 2026-10-18: the measured decode and S2 options default on at TP=4 (#85 / #86 / #87 and engine knobs)
+
+- At TP=4, `engine_defaults` now sets `ROUTE_OVL=1`, `DRAFT_HEAD_I4=1` (with `MTP` 1+) and the #87 measured attention set
+  (`ATTN_SC2=4 ATTN_SC2_TR=2 ATTN_CTX2=4 ATTN_CTX3=2 ATTN_SEL2=16 IDX_GRP=16 ATTN_QT=1 ATTN_FRONT=1`). TP=3 and TP=6 are
+  unchanged, and any knob still overrides to 0. Measured on four GB10 at TP=4 (2000 MHz cap, MTP only) against a config
+  without them: prose decode +6.4%, code c1 +7.2%, c4 +6.2%, prefill flat, temp-0 output byte-identical.
+- Also at TP=4: `IDX_VEC=1`, `DEC_BK=512`, `S2_ADAPT=1` (with `MTP` 1+), `S2_DECODE_PF=4096`, `S2_ADMIT_HOLD=1`,
+  `S2_DECODE_ROUNDS=16` and `PF_SELX_CTX=53248`, now launch knobs (each was engine environment only). `DEC_BK 0` and
+  `PF_SELX_CTX 0` leave the engine default. A `G6_` name given in `G6ENV_X` keeps its value over any of these defaults.
+## 2026-10-18: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
+
+- `G6_TR3_W2ALL=1` applies the window-2 fc1 split (KS1x2, WG1) to every MoE layer at M > 1, not only the layers the k2
+  gate picks. Bit-exact (`row_budget_test --only k1`: the same FNV on all 54 K1 lines off and on). Launch knob
+  `TR3_W2ALL`, 1 at TP=4, unset at TP=3 / TP=6; 0 turns it off. Measured on four GB10 at TP=4 (2000 MHz cap): prose
+  decode +1.3%, code c4 +3.4%.
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)
@@ -114,7 +139,7 @@
 
 ## 2026-10-16: DFlash2 after a prefix-reuse hit, and for a request left alone on MTP (G6_DFL_REUSE, off by default)
 
-- KNOWN-ISSUES #1: at TP=4 a request whose prefix-reuse hit skipped into the drafter's 2,048-position window, or that
+- At TP=4 a request whose prefix-reuse hit skipped into the drafter's 2,048-position window, or that
   was not alone at its prompt tail, ran MTP for its whole life. That is most later turns of a conversation.
   `G6_DFL_REUSE=1` lets the hit request keep the drafter: the drafter's context starts past the hit's rows, or at the
   window's start when its KV ring still holds the previous turn of the same conversation (S2 tracks which tokens the
