@@ -26,7 +26,8 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
         l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line, before it
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
         m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
-        end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame
+        end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame (with the request's
+                                                             `spec` and `timing`: what it added to the metrics frame)
       A request cancelled while still queued gets only "end abort -1 0".
 A request the engine cannot parse or fit ends the whole epoch (the engine writes DIR/abort.s2 and exits), so the shim
 checks every field before it writes a file. SIGTERM/SIGINT writes DIR/quit (quit an idle engine).
@@ -253,6 +254,8 @@ class Req:
         self.answered = False    # a finish frame went out (an abandoned request stays tracked until its end line)
         self.emitted = 0
         self.m = None            # this request's last "m" line
+        self.spec = None         # its counters as added to the metrics frame's `spec` (the finish frame's `spec`)
+        self.timing = None       # its times as added to the metrics frame's `latency` (the finish frame's `timing`)
         self.lps = []            # "l" entries for the next "t" line
         self.plps = {}           # "p" entries by prompt position
         self.plp_sent = False    # the prompt_logprobs frame went out
@@ -316,6 +319,11 @@ class Shim:
              'prompt_tokens': len(r.f.get('prompt') or []), 'cached_tokens': r.reused or 0, 'completion_tokens': ct}
         if message:
             f['message'] = message
+        # this request's share of the metrics frame's counters, the same numbers, when it added any
+        if r.spec is not None:
+            f['spec'] = r.spec
+        if r.timing is not None:
+            f['timing'] = r.timing
         self.send(r, f)
 
     def abandon(self, r: Req, reason, ct=0, message=None):
@@ -341,8 +349,10 @@ class Shim:
         if r.t_first is None or reason == 'error':
             return
         c = self.c
-        c['prefill_sum'] += r.t_first - (r.t_admit if r.t_admit is not None else r.t_arrive)
-        c['decode_sum'] += time.monotonic() - r.t_first
+        r.timing = {'prefill_s': r.t_first - (r.t_admit if r.t_admit is not None else r.t_arrive),
+                    'decode_s': time.monotonic() - r.t_first}
+        c['prefill_sum'] += r.timing['prefill_s']
+        c['decode_sum'] += r.timing['decode_s']
         # tokens the prefill computed: the whole prompt, less the rows the engine took from its prefix reuse (when it says)
         c['prefill_tokens'] += max(len(r.f.get('prompt') or []) - (r.reused or 0), 0)
         c['gen_tokens'] += r.emitted
@@ -596,6 +606,7 @@ class Shim:
                 cur, pp = self.c['per_pos'], v[3:]
                 self.c['per_pos'] = [(cur[i] if i < len(cur) else 0) + (pp[i] if i < len(pp) else 0)
                                      for i in range(max(len(cur), len(pp)))]
+                r.spec = {'drafts': v[0], 'draft_tokens': v[1], 'accepted': v[2], 'accepted_per_pos': pp}
             if reason not in ('stop', 'length', 'error', 'abort'):
                 reason = 'error'
             self.finish(r, reason, ct=ct, stop_id=sid if sid >= 0 else None,
