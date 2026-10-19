@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <vector>
+#include <cuda_bf16.h>
 #include "../l2pf.cuh"
 
 static int fails = 0;
