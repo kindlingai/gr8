@@ -758,6 +758,52 @@ inline K1Split k1_split(int M, int k2 = 0)
 }
 constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: only WG, s_ks, s_ns2 matter. Not tuned.
 
+// G6_K1_SPLIT (A/B, exact): per step row count M, the fc1 CTA shape KS1 x WG and / or the routed fc2 n-split NS2 of
+// the trellis-shared MoE layers, "M:KS1xWG/NS2" entries, M a row count or a range a-b, either part optional:
+// "3:2x1,1:/4,4-32:/4" = k1_audit's "fc1 2x1" arm at 3 rows and "ns2=4" at 1 and 4+ rows. Same bytes at any entry:
+// an fc1 shape is taken only where KS1 * WG equals the split's (partial p = h * WG + q covers the same k range and fc2
+// sums the same partials in the same order, tr3.cuh); a z tile is one warp's sum over its block's 8 k-tiles at any NS2
+// (tr3_fc2_body). M is the step's rows, also for an S2 batched step (its class keeps the partial count). Read once
+// per process (k1_audit passes its own table to set).
+struct K1SplitEnv
+{
+    signed char ks1[G6_MX + 1] = {}, wg[G6_MX + 1] = {}, ns2[G6_MX + 1] = {};
+    const char* err = nullptr;
+};
+inline const K1SplitEnv& k1_split_env(const char* set = nullptr)
+{
+    static K1SplitEnv t;
+    static bool done = false;
+    if (done && !set) return t;
+    done = true;
+    t = K1SplitEnv();
+    const char* v = set ? set : getenv("G6_K1_SPLIT");
+    for (const char* p = v; p && *p;)
+    {
+        char* q;
+        const long a = strtol(p, &q, 10);
+        const long b = *q == '-' ? strtol(q + 1, &q, 10) : a;
+        long ks = 0, wg = 0, ns = 0;
+        if ((*q != ':' && *q != '=') || a < 1 || b < a || b > G6_MX) { t.err = "G6_K1_SPLIT: entries are M:KS1xWG/NS2 or a-b:..., M in 1..G6_MX"; break; }
+        ++q;
+        if (*q != '/') { ks = strtol(q, &q, 10); if (*q++ != 'x') { t.err = "G6_K1_SPLIT: fc1 shape is KS1xWG"; break; } wg = strtol(q, &q, 10); }
+        if (*q == '/') ns = strtol(q + 1, &q, 10);
+        if (*q && *q != ',') { t.err = "G6_K1_SPLIT: entries are separated by ','"; break; }
+        if (ks && (ks > 16 || KSH % ks || (wg != 1 && wg != 2 && wg != 4) || (KSH / ks) % (8 * wg)))
+        { t.err = "G6_K1_SPLIT: KS1 must divide 384 into a multiple of 8 x WG k16 steps, WG 1, 2 or 4"; break; }
+        if (ns && (ns > 48 || KSH % ns)) { t.err = "G6_K1_SPLIT: NS2 must divide 384 (1..48)"; break; }
+        if (!ks && !ns) { t.err = "G6_K1_SPLIT: an entry sets KS1xWG, /NS2 or both"; break; }
+        for (long m = a; m <= b; ++m)
+        {
+            if (ks) { t.ks1[m] = static_cast<signed char>(ks); t.wg[m] = static_cast<signed char>(wg); }
+            if (ns) t.ns2[m] = static_cast<signed char>(ns);
+        }
+        p = *q ? q + 1 : q;
+    }
+    if (v && *v && !set) fprintf(stderr, "# G6_K1_SPLIT=%s%s%s\n", v, t.err ? ": " : "", t.err ? t.err : "");
+    return t;
+}
+
 // The route plan of the call (glue::RoutePlan or any struct with the same members), device memory.
 struct PlanPtrs
 {
@@ -819,6 +865,13 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // 16+ rows in the step (S2 batches; split_m keeps rows at the session's class): separate launches, 2-3.5% faster at
     // 24-32 rows (row_budget_test --time-v2, GB10 2200 MHz: M=24 1551 vs 1577 us, M=32 1752 vs 1812 us)
     if (policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
+    if (sh)
+    {
+        const K1SplitEnv& o = k1_split_env();
+        if (o.err) return o.err;
+        if (o.ks1[M] && o.ks1[M] * o.wg[M] == s.KS1 * s.WG) { s.KS1 = o.ks1[M]; s.WG = o.wg[M]; }
+        if (o.ns2[M]) s.NS2 = o.ns2[M];
+    }
     if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently.
@@ -830,6 +883,11 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     a.x = x2; a.xfrag = xf_x2;
     a.ctl = sc.ctl; a.n_plans = 1; a.M = M;
     a.B = g6nr::EB; a.KS1 = s.KS1; a.WG = s.WG; a.NS2 = s.NS2;
+    // G6_K1_TLBW = granule in KB, a power of 2 (A/B, no output change): fc1 prefetches the routed slots' weight
+    // translations into L2 at that granule (k1.cuh k1_tlbw); 64 / 2048 = the GPU's big / huge page. 0 = off.
+    static const long tlbw_kb = getenv("G6_K1_TLBW") ? atol(getenv("G6_K1_TLBW")) : 0;
+    if (tlbw_kb && (tlbw_kb < 1 || tlbw_kb > (1 << 20) || (tlbw_kb & (tlbw_kb - 1)))) return "G6_K1_TLBW must be a power of 2 KB (1 .. 1048576)";
+    if (moe && tlbw_kb) a.tlbw = 10 + __builtin_ctzl(static_cast<unsigned long>(tlbw_kb));
     a.s_fc1 = static_cast<const uint8_t*>(f1.p); a.s_fc2 = static_cast<const uint8_t*>(f2.p);
     a.s_up = mx ? static_cast<const uint8_t*>(fu.p) : nullptr; a.s_mx = mx;
     a.s_nch = s_nch; a.s_ks = s.s_ks; a.s_cw = w1 / s.s_ks; a.s_ns2 = s.s_ns2;
