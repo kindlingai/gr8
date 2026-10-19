@@ -151,7 +151,7 @@ def needed(setj, rank, plan):
             raise ModelError(f'{why}, and the model set has no {stem}.manifest.json')
         out[f'{stem}.pack'] = ('pack', rec)
         out[f'{stem}.manifest.json'] = ('manifest', rec)
-    if tp == 4 and k.get('DFLASH') == '1' and not plan.get('drafter_dir'):
+    if tp in (4, 6) and k.get('DFLASH') == '1' and not plan.get('drafter_dir'):
         add(f'dflash.r{rank}', (setj['dflash'] or [None] * tp)[rank], 'DFLASH=1 loads the DFlash2 drafter (DFLASH=0 for MTP only)')
     if k.get('PF_OWN') == '3' and not release:
         add('qo', setj['qo'], 'PF_OWN=3 loads the QO pack')

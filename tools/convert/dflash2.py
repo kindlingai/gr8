@@ -2,10 +2,16 @@
 (engine/runtime/dflash.cuh). CPU only, numpy.
 
 python3 -m tools.convert.dflash2 --src DIR --out DIR --nr 4 [--ranks 0,1,2,3] [--bf16 conv,sel] [--drop-cache]
+        (--nr 6: the replicated layout below, one pack per rank of TP=6)
 python3 -m tools.convert.dflash2 --head GLM_DIR --out DIR --nr 4    (test only: head.r<r>.pack with the target's
         G.lm_head.mx.gv vocab slices, for engine/runtime/dfltest; the engine itself uses the rank packs' lm_head)
 
-Tensor parallel split (NR must divide the 8 KV heads; TP4 = 16 q heads, 2 KV heads, 3,072 MLP channels per rank):
+Replicated layout (an NR that does not divide the 8 KV heads: TP=6): every rank's pack holds the whole drafter, with fc,
+q, kv and gu full-width and o_proj / down_proj as TP4's four K-slices D<j>.o<v>.gv / D<j>.down<v>.gv (v = 0..3, each
+TP4 rank v's record), so the engine's replicated body (dflash.cuh dfl::REP) computes TP4's bits. The packs of the NR
+ranks are the same bytes; their manifests differ in rank only. D.meta nr = NR.
+
+Tensor parallel split (NR divides the 8 KV heads; TP4 = 16 q heads, 2 KV heads, 3,072 MLP channels per rank):
   D.fc.gv               fc rows of this rank's output slice [6144/NR][36864] (the context features -> 6144)
   D<j>.q.gv             q_proj rows of this rank's heads [64/NR * 128][6144]
   D<j>.kv.gv            k_proj then v_proj rows of this rank's KV heads [2 * 8/NR * 128][6144]
@@ -43,6 +49,7 @@ from tools.convert.st import ST  # noqa: E402
 
 VERSION = 'g6dflash2-v1'
 HID, HD, NH, NKV, INTER = 6144, 128, 64, 8, 12288
+REF_NR = 4      # replicated packs: the split whose o_proj / down_proj K-slices they keep (TP4)
 CLASSES = ('fc', 'attn', 'mlp', 'conv', 'sel')
 
 
@@ -96,15 +103,24 @@ def put_meta(w, cfg, nr):
     w.put('D.meta', np.array(v, np.int32), 'i32', fields=list(META))
 
 
+def replicated(nr):
+    """The replicated layout: NR does not split the KV heads."""
+    return NKV % nr != 0
+
+
 def convert_rank(st, cfg, nr, r, out, bf16, drop):
     d = cfg['dflash_config']
-    nh, nkv, ni, nf = NH // nr, NKV // nr, INTER // nr, HID // nr
+    rep = replicated(nr)
+    sp, sl = (1, 0) if rep else (nr, r)  # the body's split and this pack's slice of it
+    nh, nkv, ni, nf = NH // sp, NKV // sp, INTER // sp, HID // sp
     meta = dict(format_dflash=VERSION, nr=nr, block_size=d['block_size'], mask_token_id=d['mask_token_id'],
                 target_layer_ids=d['target_layer_ids'], num_layers=cfg['num_hidden_layers'],
                 sliding_window=cfg.get('sliding_window') if cfg.get('use_sliding_window', True) else None,
                 rope_theta=cfg['rope_parameters']['rope_theta'], rms_norm_eps=cfg['rms_norm_eps'],
                 conv_group_size=d['conv_group_size'], conv_kernel_size=d['conv_kernel_size'],
                 selector_rank=d.get('selector_rank'), selector_top_k=d.get('selector_top_k'), bf16_classes=sorted(bf16))
+    if rep:
+        meta['replicated_ks'] = REF_NR
     w = PackWriter(os.path.join(out, f'dflash.r{r}.pack'), r, drop, meta)
 
     def put_rec(name, a, cls):
@@ -115,7 +131,7 @@ def convert_rank(st, cfg, nr, r, out, bf16, drop):
         w.put(name, np.ascontiguousarray(a), 'bf16')
 
     put_meta(w, cfg, nr)
-    put_rec('D.fc.gv', st.get('fc.weight', rows=(r * nf, (r + 1) * nf)), 'fc')
+    put_rec('D.fc.gv', st.get('fc.weight', rows=(sl * nf, (sl + 1) * nf)), 'fc')
     put_bf('D.hidden_norm', st.get('hidden_norm.weight'))
     put_bf('D.norm', st.get('norm.weight'))
     for j in range(cfg['num_hidden_layers']):
@@ -124,19 +140,29 @@ def convert_rank(st, cfg, nr, r, out, bf16, drop):
         put_bf(f'D{j}.post_norm', st.get(p + 'post_attention_layernorm.weight'))
         put_bf(f'D{j}.q_norm', st.get(p + 'self_attn.q_norm.weight'))
         put_bf(f'D{j}.k_norm', st.get(p + 'self_attn.k_norm.weight'))
-        put_rec(f'D{j}.q.gv', st.get(p + 'self_attn.q_proj.weight', rows=(r * nh * HD, (r + 1) * nh * HD)), 'attn')
-        kv = np.concatenate([st.get(p + 'self_attn.k_proj.weight', rows=(r * nkv * HD, (r + 1) * nkv * HD)),
-                             st.get(p + 'self_attn.v_proj.weight', rows=(r * nkv * HD, (r + 1) * nkv * HD))])
+        put_rec(f'D{j}.q.gv', st.get(p + 'self_attn.q_proj.weight', rows=(sl * nh * HD, (sl + 1) * nh * HD)), 'attn')
+        kv = np.concatenate([st.get(p + 'self_attn.k_proj.weight', rows=(sl * nkv * HD, (sl + 1) * nkv * HD)),
+                             st.get(p + 'self_attn.v_proj.weight', rows=(sl * nkv * HD, (sl + 1) * nkv * HD))])
         put_rec(f'D{j}.kv.gv', kv, 'attn')
         o = st.get(p + 'self_attn.o_proj.weight')
-        put_rec(f'D{j}.o.gv', o[:, r * nh * HD:(r + 1) * nh * HD], 'attn')
+        if rep:
+            ko = NH * HD // REF_NR
+            for v in range(REF_NR):
+                put_rec(f'D{j}.o{v}.gv', o[:, v * ko:(v + 1) * ko], 'attn')
+        else:
+            put_rec(f'D{j}.o.gv', o[:, sl * nh * HD:(sl + 1) * nh * HD], 'attn')
         del o
-        gu = np.concatenate([st.get(p + 'mlp.gate_proj.weight', rows=(r * ni, (r + 1) * ni)),
-                             st.get(p + 'mlp.up_proj.weight', rows=(r * ni, (r + 1) * ni))])
+        gu = np.concatenate([st.get(p + 'mlp.gate_proj.weight', rows=(sl * ni, (sl + 1) * ni)),
+                             st.get(p + 'mlp.up_proj.weight', rows=(sl * ni, (sl + 1) * ni))])
         put_rec(f'D{j}.gu.gv', gu, 'mlp')
         del gu
         dn = st.get(p + 'mlp.down_proj.weight')
-        put_rec(f'D{j}.down.gv', dn[:, r * ni:(r + 1) * ni], 'mlp')
+        if rep:
+            kd = INTER // REF_NR
+            for v in range(REF_NR):
+                put_rec(f'D{j}.down{v}.gv', dn[:, v * kd:(v + 1) * kd], 'mlp')
+        else:
+            put_rec(f'D{j}.down.gv', dn[:, sl * ni:(sl + 1) * ni], 'mlp')
         del dn
         for c, s in (('aconv', 'attention_conv'), ('mconv', 'mlp_conv')):
             put_rec(f'D{j}.{c}.gv', st.get(p + f'{s}.kernel_projection.weight'), 'conv')
@@ -172,8 +198,8 @@ def main():
     ap.add_argument('--bf16', default='', help=f'comma list of record classes kept in BF16: {",".join(CLASSES)}')
     ap.add_argument('--drop-cache', action='store_true')
     a = ap.parse_args()
-    if NKV % a.nr or a.nr < 1:
-        raise SystemExit('--nr must divide the 8 KV heads (1, 2, 4, 8)')
+    if a.nr < 1 or (replicated(a.nr) and (NKV % REF_NR or NH % REF_NR or INTER % REF_NR)):
+        raise SystemExit('--nr: 1 or more (one that does not divide the KV heads gives the replicated layout)')
     ranks = [int(x) for x in a.ranks.split(',')] if a.ranks else list(range(a.nr))
     os.makedirs(a.out, exist_ok=True)
     if a.head:

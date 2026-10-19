@@ -11,7 +11,7 @@
 #                                     or a prepared pack directory (every rank's manifests). A release is the whole
 #                                     model: the engine plans every rank's weights from its files
 #        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
-#        --drafter URL                TP=4: the DFlash2 drafter's repo, fetched and converted on each box
+#        --drafter URL                TP=4 or 6: the DFlash2 drafter's repo, fetched and converted on each box
 #        --cap 262144, --sess 4, ...  every knob in KNOBS.md, as --<knob> VALUE
 #   ./gr8 glm53 down                  stop every box of the last boot
 #   ./gr8 glm53 restart [OPTIONS]     down, then up
@@ -25,7 +25,7 @@
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
 #   ./gr8 glm53 stage [PACK_DIR]      scripts/stage.sh bin/ PACK_DIR, and the head's front end venv if it is missing
-#   ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]   scripts/build_packs.sh, at TP=4 the drafter packs, and
+#   ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]   scripts/build_packs.sh, the drafter packs (TP=4, 6), and
 #                                     the tokenizer files in OUT_DIR/tokenizer
 #
 #   ./gr8 kv up --gb N [OPTIONS]      lock N GiB of this box's memory and serve it as KV page blocks to the cluster
@@ -106,10 +106,13 @@ launcher() {
   esac
 }
 api() { echo "http://127.0.0.1:$PORT"; }
-# dflash: whether the TP=4 launcher loads the DFlash2 drafter (DFLASH, default 1).
+# dflash: whether the launcher loads the DFlash2 drafter (DFLASH: default 1 at TP=4, 0 at TP=6; TP=3 has none).
 dflash() {
-  [ "$TP" = 4 ] || return 1
-  [ "${DFLASH:-1}" = 1 ]
+  case $TP in
+    4) [ "${DFLASH:-1}" = 1 ] ;;
+    6) [ "${DFLASH:-0}" = 1 ] ;;
+    *) return 1 ;;
+  esac
 }
 
 # --- check: what would stop a boot, before any engine starts -------------------------------------------------------
@@ -306,7 +309,8 @@ case $cmd in
     mkdir -p "$3/tokenizer"
     for f in tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do cp "$1/$f" "$3/tokenizer/"; done
     if [ -n "${4:-}" ]; then
-      if [ -d "$2/r4" ]; then echo "DRAFTER_DIR: the DFlash2 drafter runs at TP=4 only; not built for these TP=6 packs"
+      # TP=6 packs (GPTQ_DIR/r4 exists): the drafter in the replicated layout, one whole copy per rank
+      if [ -d "$2/r4" ]; then (cd "$REPO" && python3 -m tools.convert.dflash2 --src "$4" --out "$3" --nr 6)
       else (cd "$REPO" && python3 -m tools.convert.dflash2 --src "$4" --out "$3" --nr 4); fi
     elif [ ! -d "$2/r4" ]; then
       echo "TP=4: the launcher also wants the DFlash2 drafter packs: ./gr8 glm53 packs ... DRAFTER_DIR, or boot with DFLASH=0"

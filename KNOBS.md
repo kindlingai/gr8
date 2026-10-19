@@ -44,7 +44,7 @@ manifest instead.
 | `KV_SYSTEM_AFTER` | 2 | 2 | 2 | the conversations a system prefix must start before the stores keep it. A request that continues a live, retained or stored run counts toward nothing |
 | `KV_WRITE_LIMIT` | off | off | off | a cap on store writes: at most this many page blocks per page of KV the engine computes (prefill and decode), so `0.25` writes at most a quarter of what the engine fills. Counted the same on every rank, never by the clock; a store refuses what would go past it |
 | `KV_TIER`, `KV_SHARED_AFTER` | | | | deprecated, for one release: `KV_TIER` is `KV_STORE` with `keep=evicted\|shared\|all` per tier, and maps to `KV_KEEP=all` when any tier kept evicted runs (the old default), else `system`; `KV_SHARED_AFTER` is `KV_SYSTEM_AFTER`. A warning says so |
-| `DFLASH` | 1 with a drafter, else 0 | 0 (fixed) | 0 (fixed) | 1 = the DFlash2 drafter (`--drafter`, or `dflash.r<r>.*` in the model set); 0 = MTP only. TP=3 and TP=6 refuse 1: the drafter's 8 KV heads do not split three or six ways |
+| `DFLASH` | 1 with a drafter, else 0 | 0 | 0 (fixed) | 1 = the DFlash2 drafter (`--drafter`, or `dflash.r<r>.*` in the model set); 0 = MTP only. TP=6: the drafter's body runs whole on every rank (its 8 KV heads do not split six ways; packs converted with `--nr 6`, about 2.6 GB a rank, and 1.3 GB more with `DFL_BODY_I4=1`), drafting what TP=4 drafts. TP=3 refuses 1 |
 | `DFLASH_SEL` | engine default (1) | – | – | 1 = the DFlash2 selector walk, 0 = the drafter's argmax |
 | `DFLASH_K` | engine default (7) | – | – | verify at most the first k of the 7 drafts |
 | `SPEC_ADAPT` | `DFLASH` | – | – | 1 = choose each round's draft count from step cost and acceptance |

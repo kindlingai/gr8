@@ -187,15 +187,21 @@ def resolve_model(o, refresh=False, log=log):
 
 def drafter_of(o, ms, refresh, log):
     """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter at all
-    (none in the model set either), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused."""
-    if o.get('TP') != '4':
+    (none in the model set either), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused. TP=6 (the
+    drafter's body replicated on every rank) the same, except that DFLASH defaults to 0 there: --dflash 1 turns it on."""
+    if o.get('TP') not in ('4', '6'):
+        return None
+    if o.get('TP') == '6' and o.get('DFLASH') != '1':
+        if o.get('DRAFTER'):
+            log('--drafter at TP=6 is used with --dflash 1 only: MTP only')
         return None
     if o.get('DRAFTER'):
         if not o.get('MODEL_CACHE'):
             raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
         if o.get('DFLASH') == '0':
             return None
-        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log)
+        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log,
+                             tp=int(o.get('TP')))
         o.values['DFLASH_DIR'] = d.out
         return d
     if ms.set['dflash'] or o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):

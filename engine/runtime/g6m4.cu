@@ -235,7 +235,8 @@ int main(int argc, char** argv)
     // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
     if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
         die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except under S2; --dflash-sel 0|1; --dflash-k 1..7");
-    if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
+    // TP=6 runs the drafter body replicated (dflash.cuh dfl::REP); TP=3 would too, but is not built or measured for it
+    if (dfl && dfl::REP && g6nr::NR != 6) die("--dflash: TP=" + std::to_string(g6nr::NR) + " has no DFlash2 drafter (TP=4 splits it, TP=6 replicates it)");
     if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
     if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; under S2 it is the DFlash2 sessions' policy");
@@ -1474,7 +1475,7 @@ int main(int argc, char** argv)
                         di.step = ++s2_dstep;
                         di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
                         *in_f = di;
-                        fabf.enqueue_step(di.step, dfl_fill_sizes());
+                        dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
                         G6RT_CK(cudaGraphLaunch(exec_f[2], st));
                         G6RT_CK(cudaStreamSynchronize(st));
                         g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
@@ -1500,7 +1501,7 @@ int main(int argc, char** argv)
                         const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
                         for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
                         *in_f = di;
-                        fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                        dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
                         ds = r.phase ? st_par[di.query ? 1 : 0] : st;
                         if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
                         if (r.phase) tl.par_pre(ds); else tl.pre(ds);
@@ -1764,7 +1765,7 @@ int main(int argc, char** argv)
                 di.step = ++dstep;
                 di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
                 *in_f = di;
-                fabf.enqueue_step(di.step, dfl_fill_sizes());
+                dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_f[2], st));
                 else dfl_fill_step(DF, st);
                 G6RT_CK(cudaStreamSynchronize(st));
@@ -1807,7 +1808,7 @@ int main(int argc, char** argv)
         {
             auto rf = [&](const DflIn& di, int s, double& ms) {
                 *in_f = di;
-                fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
                 const auto t0 = std::chrono::steady_clock::now();
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));
                 else dfl_step(DF, st, di.query);

@@ -11,6 +11,8 @@ use std::os::unix::fs::FileExt;
 
 pub const VERSION: &str = "g6dflash2-v1";
 pub const CLASSES: [&str; 5] = ["fc", "attn", "mlp", "conv", "sel"];
+/// Replicated packs (an nr that does not split the KV heads: TP=6) keep o_proj / down_proj as this split's K-slices (TP4).
+pub const REF_NR: usize = 4;
 const ALIGN: u64 = 4096;
 const META: [&str; 17] = ["mask_id", "nr", "block", "layers", "window", "tl0", "tl1", "tl2", "tl3", "tl4", "tl5", "theta",
                           "eps_bits", "sel_rank", "sel_topk", "conv_group", "conv_kernel"];
@@ -364,13 +366,20 @@ fn meta_values(cfg: &Json, nr: usize) -> Result<Vec<i32>, String> {
     v.into_iter().zip(META).map(|(x, k)| as_i32(x, k)).collect()
 }
 
+/// The replicated layout (tools/convert/dflash2.py): nr does not split the KV heads, every rank holds the whole drafter.
+pub fn replicated(dims: &Dims, nr: usize) -> bool {
+    dims.nkv % nr != 0
+}
+
 /// tools/convert/dflash2.convert_rank: rank r of nr into <out>/dflash.r<r>.{pack,manifest.json}. bf16 lists the record
 /// classes kept in BF16. Returns the manifest.
 pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: &str, bf16: &[String])
                     -> Result<Json, String> {
     let d = key(cfg, "dflash_config")?;
     let Dims { hid, hd, .. } = *dims;
-    let (nh, nkv, ni, nf) = (dims.nh / nr, dims.nkv / nr, dims.inter / nr, hid / nr);
+    let rep = replicated(dims, nr);
+    let (sp, s) = if rep { (1, 0) } else { (nr, r) };   // the body's split and this pack's slice of it
+    let (nh, nkv, ni, nf) = (dims.nh / sp, dims.nkv / sp, dims.inter / sp, hid / sp);
     let mut classes: Vec<String> = bf16.to_vec();
     classes.sort();
     classes.dedup();
@@ -390,6 +399,9 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
     copy(&mut meta, "selector_rank", get_or(d, "selector_rank", &Json::Null));
     copy(&mut meta, "selector_top_k", get_or(d, "selector_top_k", &Json::Null));
     meta.insert("bf16_classes".into(), Json::Arr(classes.iter().map(|c| Json::Str(c.clone())).collect()));
+    if rep {
+        meta.insert("replicated_ks".into(), Json::Int(REF_NR as i64));
+    }
 
     let mut w = Pack::new(format!("{out}/dflash.r{r}.pack"), r)?;
     let put_rec = |w: &mut Pack, name: &str, (a, shape): (Vec<u16>, Vec<usize>), cls: &str| -> Result<(), String> {
@@ -415,7 +427,7 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
     let mv = meta_values(cfg, nr)?;
     let mb: Vec<u8> = mv.iter().flat_map(|v| v.to_le_bytes()).collect();
     w.put("D.meta", &mb, "i32", &[mv.len()], vec![("fields", Json::Arr(META.iter().map(|s| Json::Str(s.to_string())).collect()))])?;
-    put_rec(&mut w, "D.fc.gv", st.get("fc.weight", Some((r * nf, (r + 1) * nf)))?, "fc")?;
+    put_rec(&mut w, "D.fc.gv", st.get("fc.weight", Some((s * nf, (s + 1) * nf)))?, "fc")?;
     w.put_bf16("D.hidden_norm", st.get("hidden_norm.weight", None)?)?;
     w.put_bf16("D.norm", st.get("norm.weight", None)?)?;
     for j in 0..int(cfg, "num_hidden_layers")? {
@@ -425,13 +437,27 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
         w.put_bf16(&format!("D{j}.post_norm"), g("post_attention_layernorm.weight", None)?)?;
         w.put_bf16(&format!("D{j}.q_norm"), g("self_attn.q_norm.weight", None)?)?;
         w.put_bf16(&format!("D{j}.k_norm"), g("self_attn.k_norm.weight", None)?)?;
-        put_rec(&mut w, &format!("D{j}.q.gv"), g("self_attn.q_proj.weight", Some((r * nh * hd, (r + 1) * nh * hd)))?, "attn")?;
-        let kvr = Some((r * nkv * hd, (r + 1) * nkv * hd));
+        put_rec(&mut w, &format!("D{j}.q.gv"), g("self_attn.q_proj.weight", Some((s * nh * hd, (s + 1) * nh * hd)))?, "attn")?;
+        let kvr = Some((s * nkv * hd, (s + 1) * nkv * hd));
         put_rec(&mut w, &format!("D{j}.kv.gv"), cat(g("self_attn.k_proj.weight", kvr)?, g("self_attn.v_proj.weight", kvr)?), "attn")?;
-        put_rec(&mut w, &format!("D{j}.o.gv"), colslice(g("self_attn.o_proj.weight", None)?, r * nh * hd, (r + 1) * nh * hd), "attn")?;
-        let mr = Some((r * ni, (r + 1) * ni));
+        if rep {
+            let (o, ko) = (g("self_attn.o_proj.weight", None)?, dims.nh * hd / REF_NR);
+            for v in 0..REF_NR {
+                put_rec(&mut w, &format!("D{j}.o{v}.gv"), (cols(&o.0, o.1[1], v * ko, (v + 1) * ko), vec![o.1[0], ko]), "attn")?;
+            }
+        } else {
+            put_rec(&mut w, &format!("D{j}.o.gv"), colslice(g("self_attn.o_proj.weight", None)?, s * nh * hd, (s + 1) * nh * hd), "attn")?;
+        }
+        let mr = Some((s * ni, (s + 1) * ni));
         put_rec(&mut w, &format!("D{j}.gu.gv"), cat(g("mlp.gate_proj.weight", mr)?, g("mlp.up_proj.weight", mr)?), "mlp")?;
-        put_rec(&mut w, &format!("D{j}.down.gv"), colslice(g("mlp.down_proj.weight", None)?, r * ni, (r + 1) * ni), "mlp")?;
+        if rep {
+            let (dn, kd) = (g("mlp.down_proj.weight", None)?, dims.inter / REF_NR);
+            for v in 0..REF_NR {
+                put_rec(&mut w, &format!("D{j}.down{v}.gv"), (cols(&dn.0, dn.1[1], v * kd, (v + 1) * kd), vec![dn.1[0], kd]), "mlp")?;
+            }
+        } else {
+            put_rec(&mut w, &format!("D{j}.down.gv"), colslice(g("mlp.down_proj.weight", None)?, s * ni, (s + 1) * ni), "mlp")?;
+        }
         for (c, s) in [("aconv", "attention_conv"), ("mconv", "mlp_conv")] {
             put_rec(&mut w, &format!("D{j}.{c}.gv"), g(&format!("{s}.kernel_projection.weight"), None)?, "conv")?;
             w.put_bf16(&format!("D{j}.{c}.base"), g(&format!("{s}.base_kernel"), None)?)?;
@@ -446,10 +472,11 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
 }
 
 /// g6load dflash2: --src DIR (config.json + model.safetensors) --out DIR [--nr 4] [--ranks 0,1] [--bf16 conv,sel].
+/// --nr 6: the replicated layout, one pack per rank of TP=6.
 /// Prints one JSON line per rank, as tools/convert/dflash2.py does.
 pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str, dims: &Dims) -> Result<(), String> {
-    if nr < 1 || dims.nkv % nr != 0 {
-        return Err(format!("--nr must divide the {} KV heads", dims.nkv));
+    if nr < 1 || (replicated(dims, nr) && (dims.nkv % REF_NR != 0 || dims.nh % REF_NR != 0 || dims.inter % REF_NR != 0)) {
+        return Err("--nr: 1 or more (one that does not divide the KV heads gives the replicated layout)".into());
     }
     let ranks: Vec<usize> = match ranks {
         Some(s) => s.split(',').map(|x| x.parse().map_err(|_| format!("--ranks {s}"))).collect::<Result<_, _>>()?,
