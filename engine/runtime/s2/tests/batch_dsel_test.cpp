@@ -42,6 +42,7 @@ int main()
     sel.on = true;
     sel.d.draft_round = 8.1; sel.m.draft_round = 5.5; sel.m.draft_each = 2.1;
     b.dsel(sel);
+    const DSel sel0 = sel;   // the start_mtp case below uses these costs, not the reset case's MTP-cheap table
     Session s; s.prompt.assign(10, 5); s.first = 9; s.chunk = 8; s.n_gen = 4000; s.dflash = true;
     b.admit({0}, {s});
     for (int i = 0; i < 40; ++i) CHECK(b.round({0}));
@@ -86,7 +87,7 @@ int main()
     {
         Batch c(3, 32, h);
         c.dflash(7, g6rt::SpecLen());
-        DSel s2 = sel;
+        DSel s2 = sel0;
         s2.start_mtp = true;
         c.dsel(s2);
         rounds.clear(); got.clear();
