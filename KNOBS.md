@@ -102,6 +102,7 @@ manifest instead.
 | `CP_STEP_SEG` | unset (0) | unset (0) | unset (0) | with `CP_STEP_ROWS`: 1 = a round past `SHARE_LIMIT` takes only sessions past it, so a shorter session never runs the CP attention because a long one is resident (`G6_CP_STEP_SEG`) |
 | `K1_SPLIT` | unset | unset | unset | decode MoE: the fc1 CTA shape and / or fc2 n-split per step row count, `M:KS1xWG/NS2` entries (`a-b:` ranges), e.g. `1:/4,3:2x1,4-32:/4` (`G6_K1_SPLIT`; bit-exact, an entry that would change the sums is refused at boot). Tuning: measured at TP=4 with the `home` widths |
 | `K1_TLBW` | unset (0) | unset (0) | unset (0) | decode MoE: fc1 prefetches the routed slots' weight translations into L2 at this granule in KB, a power of two; 2048 = the huge page (`G6_K1_TLBW`; bit-exact). Measured at TP=4 only |
+| `L2PF` | unset (0) | unset (0) | unset (0) | decode: a paced L2 prefetch of the weights the step reads next, on a side stream in the windows where DRAM is idle; window mask 1 = MLP all-reduce wait, 2 = gather waits, 4 = attention, 8 = attention all-reduce wait (`G6_L2PF`; bit-exact). Measured at TP=4 only, as 15 |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

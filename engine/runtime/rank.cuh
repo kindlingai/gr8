@@ -38,6 +38,7 @@
 #include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
+#include "../kernels/l2pf.cuh"
 #include "../kernels/head_i4.cuh"
 #include "../attn/bind.h"
 #if defined(G6_CP) && G6_CP
@@ -975,6 +976,18 @@ inline void qs_get(Model& m, int c, int M, cudaStream_t st)
 {
     k_qs_get<<<M <= 8 ? 1 : 4, 256, 0, st>>>(m.qs.geo[c], m.qs.g, m.stepp, c, M, (size_t)M * m.qs.geo[c].wmax * 2);
 }
+// G6_L2PF (kernels/l2pf.cuh): window w of layer i's prefetch queue, from target `from`, ending when collective c of f has
+// arrived (f = nullptr: the attention window, its budget only). Only between l2pf::arm and l2pf::join (launch_step).
+inline void l2pf_window(Model& m, int w, int from, int i, int M, const g6::FabricDev* f, int c, size_t payload, cudaStream_t st)
+{
+    if (!l2pf::cfg().armed) return;
+    const Layer& y = m.layers[i];
+    l2pf::Stop s;
+    if (f) { s.f = *f; s.c = c; s.payload = payload; }
+    s.stepp = m.stepp;
+    l2pf::window(w, from, i, l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv), s, st);
+}
+
 // G6_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
 // P (QsPh): the phase the loopback driver wants; the get starts the next phase
 inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P)
@@ -997,6 +1010,7 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
             else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
         }
         dmark(DP_IDXKW, st);
+        l2pf_window(m, l2pf::W_Q, l2pf::T_IDXQ, i, M, &Q.g, c, (size_t)M * Q.geo[c].wmax * 2, st);
     }
     P.next();
     if (!P.on()) return;
@@ -1027,6 +1041,7 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
     bind::launch(b.idx_q, st);
     qs_put(m, c, M, st);
     bind::launch_q_b(b, st);
+    l2pf_window(m, l2pf::W_Q, l2pf::T_UK, i, M, &m.qs.g, c, (size_t)M * m.qs.geo[c].wmax * 2, st);
     P.next();
     if (P.on()) qs_get(m, c, M, st);
 }
@@ -1224,6 +1239,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     launch_qb_idxq(m, i, b, M, st, P);
     if (!P.on()) return;                      // an earlier gather phase
     dmark(DP_QB, st);
+    l2pf_window(m, l2pf::W_T, l2pf::T_UK, i, M, nullptr, 0, 0, st);
 #ifdef DEC_S2
     if (m.s2on) s2_attention(m, i, M, st);
     else
@@ -1272,6 +1288,9 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
         if (c % 2 == 0) bind::warm_mlp(layer_for(m, c / 2, M), st);
         else if (c / 2 + 1 < m.nl) bind::warm_proj(layer_for(m, c / 2 + 1, M), st, warm >= 2);
     }
+    // G6_L2PF: this layer's router and shared expert (2i), the next layer's front (2i+1) while this rank waits
+    if (c % 2 == 0) l2pf_window(m, l2pf::W_A, l2pf::T_ROUTER, c / 2, M, &m.f, c, (size_t)M * HID * 2, st);
+    else if (c / 2 + 1 < m.nl) l2pf_window(m, l2pf::W_M, l2pf::T_XIN, c / 2 + 1, M, &m.f, c, (size_t)M * HID * 2, st);
     glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
     dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
@@ -1532,6 +1551,7 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
     if (part != 1) ep.n = 0;
     ep.rec = ep.every > 0;
     if (ep.rec || getenv("G6_DEC_PROF")) g6_attn_mark = attn_mark;
+    l2pf::arm();                      // G6_L2PF: the windows below may fork; joined at the end of this part
     if (part != 1)
     {
         dmark(DP_OTHER, st);
@@ -1555,6 +1575,7 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
         launch_step_out(m, M, st);
         dmark(DP_STEP, st);
     }
+    l2pf::join(st);
     ep.rec = false;
 }
 
