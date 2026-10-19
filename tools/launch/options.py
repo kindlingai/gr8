@@ -115,6 +115,7 @@ KEYS = {
     'ATTN_CTX2': ('cluster', None, 'decode attention context variant (G6_ATTN_CTX2)'),
     'ATTN_CTX3': ('cluster', None, 'decode attention context, per-batch states (G6_ATTN_CTX3)'),
     'ATTN_CTX3_SP': ('cluster', None, 'ATTN_CTX3 slots per context partition, 64 or 128 (G6_ATTN_CTX3_SP; E1)'),
+    'ATTN_POSIDX': ('cluster', None, 'positional index at decode buckets <= 2048 (G6_ATTN_POSIDX; E1)'),
     'ATTN_SEL2': ('cluster', None, 'decode index selection by rank (G6_ATTN_SEL2)'),
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),

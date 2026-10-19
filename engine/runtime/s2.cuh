@@ -658,6 +658,16 @@ inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M)
     return it->second.get();
 }
 
+// the batched replay entry of layer i for the current step (s2_prepare made it); nullptr: per-session calls, a CP step,
+// or no entry yet (posidx_step: then the step keeps idx_q)
+inline const G6AttnReplay* s2_replay(Model& m, int i, int M)
+{
+    const S2Model& s = *m.s2;
+    if (!s.batch || s2_cp_step(m)) return nullptr;
+    auto it = s.brp.find(std::make_tuple(s2_bucket(s), i, M));
+    return it == s.brp.end() ? nullptr : it->second.get();
+}
+
 inline void s2_attention(Model& m, int i, int M, cudaStream_t st)
 {
     S2Model& s = *m.s2;

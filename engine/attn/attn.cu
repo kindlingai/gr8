@@ -380,6 +380,18 @@ __device__ __forceinline__ void reuse_row(Input input,int start,int row){
 }
 template<class Input>
 __global__ void reuse(Input input,int start){reuse_row(input,start,blockIdx.x);}
+// G6_ATTN_POSIDX (use_posidx, E1): a full-index call whose capacity is <= TOP selects every key with a finite indexer
+// score, i.e. every key at a position <= the row's own, so the indexer only sets the slots' order (the fp32 order of
+// normalize and context). The positional index lists the row's keys in position order instead: slot j = key j for
+// j <= the row's position, -1 after (the selector's padding). No indexer query, scores or selection.
+template<class Input>
+__device__ __forceinline__ void pos_index_row(Input input,int start,int row){
+    auto a=resolve(input);if(!a.active)return;const int r=start+row;FOR_ROW(a,input,r);
+    const int p=min(a.positions[r],a.live_context-1);
+    for(int j=threadIdx.x;j<TOP;j+=blockDim.x)a.indices[(int64_t)r*TOP+j]=j<=p?j:-1;
+}
+template<class Input>
+__global__ void pos_index(Input input,int start){pos_index_row(input,start,blockIdx.x);}
 // G6_ATTN_FRONT=1 (attn_front_on; g6_attn_replay_run with one query tile): the step's front kernels in one launch of
 // 256-thread blocks: [0, n) append_kv rows; then a full-index layer's append_index rows, one per block, the row run twice
 // (threads 0-127 and 128-255, each on its own shared slot: the same bytes stored twice, the same error bits), and its
@@ -387,12 +399,15 @@ __global__ void reuse(Input input,int start){reuse_row(input,start,blockIdx.x);}
 // body is the kernel's own. They touch disjoint buffers (the MLA cache row; the index cache row; w.iq / w.weights from
 // index_q, index_weight and positions; the indices from reuse_indices), so no block reads what another writes and the
 // bytes are those of the separate launches. grid n * (index ? 18 : 2), block 256.
-template<class Input>
+// POS (G6_ATTN_POSIDX, use_posidx): a full-index layer's prep_index rows are replaced by its pos_index rows, one per block
+// (they write only the indices); grid n * 3.
+template<bool POS=false,class Input>
 __global__ void __launch_bounds__(256) attn_front(Input input,int n,half* iq,float* iw){
     const int b=blockIdx.x,t=threadIdx.x;
     if(b<n){append_kv_row(input,b);return;}
     if(!iq){reuse_row(input,0,b-n);return;}
     if(b<2*n){append_index_row<2>(input,b-n,t&127,t>>7);return;}
+    if constexpr(POS){pos_index_row(input,0,b-2*n);return;}
     const int k=b-2*n;prep_index_row<2>(input,0,iq,iw,k/16,2*(k%16)+(t>>7),t&127,t>>7);
 }
 template<bool F8=false,class Input>
@@ -664,7 +679,9 @@ static int& attn_front_on(){static int v=[]{const char* e=getenv("G6_ATTN_FRONT"
 // scratch and before graph capture; in the S2 runtime signature, g6m4; tests may assign them, before sizing the scratch):
 // G6_ATTN_CTX3_SP=64 / 128 (decode-small.cuh ctx_sp): run_body's context_pk3 calls over partitions of 64 / 128 slots (32 /
 // 16 partials, merge_parts over them in order) instead of 256 (8): 4x / 2x the CTAs, each a 4x / 2x shorter slot chain.
-// FP8 KV only.
+// FP8 KV only. G6_ATTN_POSIDX=1 (use_posidx): a full-index call of capacity <= TOP (the decode buckets up to 2048) takes
+// the positional index (pos_index) instead of prep_index + index_scores + the selector; larger capacities, shared layers
+// and the CP entry points are unchanged.
 static int& attn_ctx3_sp(){static int v=[]{
 #if G6_KV4
     return 0;
@@ -672,6 +689,8 @@ static int& attn_ctx3_sp(){static int v=[]{
     const char* e=getenv("G6_ATTN_CTX3_SP");const int x=e?atoi(e):0;return x==64||x==128?x:0;
 #endif
     }();return v;}
+static int& attn_posidx(){static int v=[]{const char* e=getenv("G6_ATTN_POSIDX");return e&&atoi(e)==1?1:0;}();return v;}
+static bool use_posidx(const G6Attn& a){return attn_posidx()&&!a.reuse_indices&&a.context<=TOP;}
 static bool al16(const void* p){return ((uintptr_t)p&15)==0;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
@@ -846,9 +865,10 @@ static bool use_qt(const G6Attn& a,const Work& w,int n){
 // front: attn_front already ran the first query tile's reuse / prep_index (g6_attn_replay_run, rows <= query_tile)
 template<class Input>
 static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream,bool front=false){
-    cudaError_t e;
+    cudaError_t e;const bool pos=use_posidx(a);
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);const bool fr=front&&start==0;
         if(a.reuse_indices){AMARK(1);if(!fr)ga::reuse<<<n,256,0,stream>>>(input,start);}
+        else if(pos){if(!fr)ga::pos_index<<<n,256,0,stream>>>(input,start);AMARK(1);}
         else{if(!fr)prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
             if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,start,n,attn_idx_grp(),stream);
             else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
@@ -1024,6 +1044,8 @@ static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8
 }
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
 extern "C" int g6_attn_ctx_sp(void){return ga::attn_ctx3_sp();}
+extern "C" int g6_attn_posidx(void){return ga::attn_posidx();}
+extern "C" int g6_attn_posidx_takes(const G6Attn* a){return a&&ga::use_posidx(*a)?1:0;}
 extern "C" int g6_attn_append(const G6Attn* a,void* s){
     if(!a||!ga::valid(*a)||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;ga::append_kv<<<a->rows,256,0,stream>>>(*a);
@@ -1065,7 +1087,8 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
     ga::validate_replay<<<1,256,0,stream>>>(a,r->cell);
     ga::ReplayInput input{a,r->cell};
     const bool front=ga::attn_front_on()&&a.rows<=a.query_tile;   // G6_ATTN_FRONT: one query tile
-    if(front)ga::attn_front<<<a.rows*(a.reuse_indices?2:18),256,0,stream>>>(input,a.rows,a.reuse_indices?nullptr:w.iq,w.weights);
+    if(front&&ga::use_posidx(a))ga::attn_front<true><<<a.rows*3,256,0,stream>>>(input,a.rows,w.iq,w.weights);
+    else if(front)ga::attn_front<<<a.rows*(a.reuse_indices?2:18),256,0,stream>>>(input,a.rows,a.reuse_indices?nullptr:w.iq,w.weights);
     else{ga::append_kv<<<a.rows,256,0,stream>>>(input);
         if(!a.reuse_indices)ga::append_index<<<a.rows,128,0,stream>>>(input);}
     AMARK(0);
