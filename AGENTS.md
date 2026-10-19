@@ -74,7 +74,7 @@ The engine command line lives in `scripts/engine_args.sh`. The supervisor and th
 (`./gr8 glm53 --ssh up`) both build it from there, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
 
 S2 is the only served path. `scripts/build.sh` builds every TP with DEC_S2, which g6m4 needs. `g6m4 --serve` serves up
-to `SESS` requests at once, and at TP=4 the DFlash2 drafter for a request that runs alone (TP=3 and TP=6 are MTP only).
+to `SESS` requests at once, and at TP=4 (and TP=6 with `DFLASH=1`, the drafter's body replicated) the DFlash2 drafter for a request that runs alone (TP=3 is MTP only).
 `scripts/launch_tp4.sh`, `launch_tp3.sh` and `launch_tp6.sh` run `scripts/launch_s2.sh` with four, three or six ranks.
 A change to decode, prefill or the scheduler is measured under S2. Its output must stay byte-identical to the build
 before it for the same requests in the same order, alone and sharing steps (m4sim prints every session's lines, so

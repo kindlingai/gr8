@@ -10,8 +10,8 @@
 #   CAP, PACKS, PF_OWN (default 4; short prompts take OWN=2, G6_PF_QP_MIN), QP_ROLL, QP_CTX, QP_EARLY,
 #   V2 / V2_SLICES / V2_WIDTHS, NOHASH, G6ENV_X, FRONT_BIN (the Rust front end)
 #   S2PORT=7341       the S2 control port on the head
-#   TP=6 only:        PF_OWN defaults to 3 (loads packs/qo.pack; PF_OWN=1 needs no QO pack). DFLASH=1 is refused (the
-#                     drafter's 8 KV heads do not split six ways). RANK_HEALTH=0 skips the rank health probe, which
+#   TP=6 only:        PF_OWN defaults to 3 (loads packs/qo.pack; PF_OWN=1 needs no QO pack). DFLASH defaults to 0; DFLASH=1
+#                     runs the drafter's body replicated on every rank (packs from dflash2 --nr 6). RANK_HEALTH=0 skips the rank health probe, which
 #                     runs before any engine starts (default: refuse to boot, exit 3, with a named reason per refused
 #                     rank; tools/health/README.md). The shim and front end run on cores 0..PROXY_CPU-8, below the
 #                     engine's proxy cores, and the shim errors a request after STALL_TMO=2400 s without a response.
