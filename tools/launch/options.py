@@ -109,6 +109,8 @@ KEYS = {
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
+    'K1_SPLIT': ('cluster', None, 'MoE decode: fc1 shape / fc2 n-split per step row count, M:KS1xWG/NS2,... (G6_K1_SPLIT)'),
+    'K1_TLBW': ('cluster', None, "MoE decode: fc1 prefetches the routed weights' translations at this granule, KB (G6_K1_TLBW)"),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

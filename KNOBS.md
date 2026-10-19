@@ -80,6 +80,8 @@ manifest instead.
 | `IDX_GRP` | unset (0) | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
 | `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
 | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+| `K1_SPLIT` | unset | unset | unset | decode MoE: the fc1 CTA shape and / or fc2 n-split per step row count, `M:KS1xWG/NS2` entries (`a-b:` ranges), e.g. `1:/4,3:2x1,4-32:/4` (`G6_K1_SPLIT`; bit-exact, an entry that would change the sums is refused at boot). Tuning: measured at TP=4 with the `home` widths |
+| `K1_TLBW` | unset (0) | unset (0) | unset (0) | decode MoE: fc1 prefetches the routed slots' weight translations into L2 at this granule in KB, a power of two; 2048 = the huge page (`G6_K1_TLBW`; bit-exact). Measured at TP=4 only |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

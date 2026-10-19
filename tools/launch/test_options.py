@@ -208,6 +208,13 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(da, db)
         self.assertEqual(sorted(k for k in a if a[k] != b[k]), ['CAP', 'engine.args', 'engine.env'])
 
+    def test_k1_split_and_tlbw_reach_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_K1_SPLIT', text)
+        self.assertNotIn('G6_K1_TLBW', text)
+        _, text, _ = self.digest('--k1-split', '1:/4,3:2x1,4-32:/4', '--k1-tlbw', '2048')
+        self.assertIn(' G6_K1_SPLIT=1:/4,3:2x1,4-32:/4 G6_K1_TLBW=2048', text)
+
     def test_defaults_resolved_and_equal_to_explicit(self):
         a, text, da = self.digest()
         self.assertIn('CAP=310528\n', text)
