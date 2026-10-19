@@ -15,7 +15,8 @@
 //                default under rejection sampling). Use the dumping run's values for the dump column to match A.
 //   --bench N    then time one rank's body GEMVs of a draft step (context fc + 6 kv, block 6 x aconv q kv o mconv gu
 //                down) for A and B as a captured graph, N replays, cold-ish (the 700 MB set does not fit the 25 MB L2)
-//   --out FILE   one TSV line per draft step: q0, accepted (dump, A, B), committed tokens, drafts and lp of A and B
+//   --out FILE   one TSV line per draft step: q0, accepted (dump, A, B), committed tokens, drafts and lp of A and B, then the
+//                lp bits of A and B (hex)
 // Printed: draft steps scored against the committed tokens; per position r = 1..7 the share of steps where A and B
 // draft the same token; accepted-length histograms; tokens per round 1 + mean(min(accepted, k)) for k = 1..7, which
 // with the verify table (ms at M = k + 1) and the drafter's step time gives committed tokens per ms; A == dump (a check of
@@ -262,6 +263,11 @@ int main(int argc, char** argv)
                     {
                         fputc('\t', of);
                         for (int r = 1; r < dfl::B; ++r) fprintf(of, "%s%.4f", r > 1 ? "," : "", o->lp[r]);
+                    }
+                    for (const DflOut* o : {&x.a, &x.b})   // the lp bits, for a byte comparison between builds (TP4 vs TP6)
+                    {
+                        fputc('\t', of);
+                        for (int r = 1; r < dfl::B; ++r) { uint32_t u; memcpy(&u, &o->lp[r], 4); fprintf(of, "%s%08x", r > 1 ? "," : "", u); }
                     }
                     fputc('\n', of);
                 }
