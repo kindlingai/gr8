@@ -314,6 +314,16 @@ class CanonicalTests(unittest.TestCase):
         self.digest('--model', '/some/model', '--kvb', 'fp8')   # a --model may be a release (the engine checks)
         with self.assertRaises(opt.OptionError):
             self.digest(*rel, '--kvb', 'int4')
+    def test_mtp_kstopb_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_MTP_KSTOPB', text)
+        _, text, _ = self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau', '0.6,0.88',
+                                 '--mtp-kstopb-tau-s', '1:0.7,0.7/2:0.7,0.8/4:0.7,0.75')
+        self.assertIn(' G6_MTP_KSTOPB=1 G6_MTP_KSTOPB_TAU=0.6,0.88 G6_MTP_KSTOPB_TAU_S1=0.7,0.7 G6_MTP_KSTOPB_TAU_S2=0.7,0.8'
+                      ' G6_MTP_KSTOPB_TAU_S4=0.7,0.75', text)
+        for bad in ('0.7,0.7', '9:0.7', '1:', '1:0.7/x'):
+            with self.assertRaises(opt.OptionError):
+                self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau-s', bad)
 
     def test_tp3_is_s2_without_drafter(self):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})
