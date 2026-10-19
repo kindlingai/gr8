@@ -285,12 +285,16 @@ __global__ void __launch_bounds__(128) context_pk(Input input,int start,const fl
 // read-only 16-bit load from the row index, no pointer test) loaded before the current batch is used. Per (row, head, dim)
 // chain: the same fmaf operands in the same slot order as context_parts_heads, the same skips of unread slots and of
 // p == 0 (-0 and NaN p as there) -> parts bit-identical. D = dims per CTA: 256 (two CTAs per partition, as
-// context_parts_heads) or 512 (one, the prologue once per partition). grid dim3(PART*512/D, ceil(heads/HG), n), block D/2.
+// context_parts_heads) or 512 (one, the prologue once per partition). grid dim3(P*512/D, ceil(heads/HG), n), block D/2.
 // Rows are 32-bit: the dispatch (use_ctx3) needs page_count * page_size <= INT_MAX.
-template<int HG,int PB,int D,class Input>
+// SP = slots per partition, P = TOP/SP partitions: 256 (P = PART, the bytes above); 64 / 128 (G6_ATTN_CTX3_SP, run_body
+// only, E1): every (row, head, dim) chain runs over SP slots in slot order and merge_parts<P> sums the P partials in
+// partition order, so the 2048-slot sum is regrouped (deterministic, not the same bits).
+template<int HG,int PB,int D,int SP=256,class Input>
 __global__ void __launch_bounds__(D/2) context_pk3(Input input,int start,const float* probs,float* parts){
  static_assert((D==256||D==512)&&(PB==16||PB==32)&&(HG==2||HG%4==0),"D 256 / 512, PB 16 / 32, HG 2 or a multiple of 4");
- auto a=ga::resolve(input);if(!a.active)return;constexpr int THREADS=D/2,GROUPS=D/128,SP=256,NB=SP/PB;
+ static_assert(SP==64||SP==128||SP==256,"SP 64 / 128 / 256");
+ auto a=ga::resolve(input);if(!a.active)return;constexpr int THREADS=D/2,GROUPS=D/128,NB=SP/PB,P=ga::TOP/SP;
  const int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x,lane=t&31;FOR_ROW(a,input,r);
  const int nh=min(HG,a.heads-h0);
  __shared__ __align__(16) float pm[SP][HG];__shared__ float scl[GROUPS][SP];__shared__ int kv_row[SP];__shared__ uint8_t state[NB];
@@ -342,7 +346,7 @@ __global__ void __launch_bounds__(D/2) context_pk3(Input input,int start,const f
   load(ra,0);
   for(int b=0;b<nb;b+=2){if(b+1<nb)load(rb,b+1);use(ra,b);if(b+2<nb)load(ra,b+2);if(b+1<nb)use(rb,b+1);}}
  #pragma unroll
- for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
+ for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*P+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
 }
 // scores_tr = scores_heads with all HG head dot products held per lane (ILP across
 // heads), then ONE transpose reduction over xor offsets 16,8,4,2,1: each stage keeps half of the remaining heads, so every
@@ -511,21 +515,28 @@ static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cuda
 // Only while every KV row index fits in 32 bits (page() bounds a page by the fixed page_count).
 // Not with remote rows: their slots sit outside mla_cache.
 static bool use_ctx3(const G6Attn& a){return attn_ctx3()&&!a.rt_page&&(int64_t)a.page_count*a.page_size<=INT_MAX;}
-template<int HG,class Input>
-static void launch_ctx3_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
- const int y=(a.heads+HG-1)/HG;
+// SP slots per partition (sp, ctx_sp below): P = TOP/SP partitions; SP = 256 is PART, the launches as before
+template<int HG,int SP,class Input>
+static void launch_ctx3_sp(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ const int y=(a.heads+HG-1)/HG;constexpr int P=TOP/SP;
  switch(attn_ctx3()){
-  case 1:small_decode::context_pk3<HG,16,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
-  case 2:small_decode::context_pk3<HG,32,256><<<dim3(PART*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
-  case 3:small_decode::context_pk3<HG,16,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;
-  default:small_decode::context_pk3<HG,32,512><<<dim3(PART,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;}
+  case 1:small_decode::context_pk3<HG,16,256,SP><<<dim3(P*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
+  case 2:small_decode::context_pk3<HG,32,256,SP><<<dim3(P*2,y,n),128,0,st>>>(input,start,w.prob,w.parts);break;
+  case 3:small_decode::context_pk3<HG,16,512,SP><<<dim3(P,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;
+  default:small_decode::context_pk3<HG,32,512,SP><<<dim3(P,y,n),256,0,st>>>(input,start,w.prob,w.parts);break;}
+}
+template<int HG,class Input>
+static void launch_ctx3_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp){
+ if(sp==64)launch_ctx3_sp<HG,64>(a,input,w,start,n,st);
+ else if(sp==128)launch_ctx3_sp<HG,128>(a,input,w,start,n,st);
+ else launch_ctx3_sp<HG,256>(a,input,w,start,n,st);
 }
 template<class Input>
-static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
  switch(attn_ctx3_hg()?attn_ctx3_hg():n>=5?8:4){
-  case 2:launch_ctx3_hg<2>(a,input,w,start,n,st);break;
-  case 8:launch_ctx3_hg<8>(a,input,w,start,n,st);break;
-  default:launch_ctx3_hg<4>(a,input,w,start,n,st);break;}
+  case 2:launch_ctx3_hg<2>(a,input,w,start,n,st,sp);break;
+  case 8:launch_ctx3_hg<8>(a,input,w,start,n,st,sp);break;
+  default:launch_ctx3_hg<4>(a,input,w,start,n,st,sp);break;}
 }
 // G6_ATTN_P11 decode tile retune. Host-side, read once (set before graph
 // capture). G6_ATTN_P11=0 -> the old head-batched path (scores_heads<16>, context_parts_heads HG4/HG8 x D256), unchanged.
@@ -536,6 +547,16 @@ static bool attn_p11(){
  return false;
  #else
  static const bool on=getenv("G6_ATTN_P11")&&atoi(getenv("G6_ATTN_P11"))!=0;return on;
+ #endif
+}
+// G6_ATTN_CTX3_SP (attn.cu attn_ctx3_sp, E1): the slots per partition of a run_body call's context, 64 / 128 exactly when
+// launch_context_parts reaches launch_ctx3 (no FLIP, the head-batched kernels, no P11, use_ctx3); 256 otherwise. run_body
+// passes it to launch_context_parts and merges TOP/sp partials; the CP calls keep 256 (their merges assume PART).
+static int ctx_sp(const G6Attn& a,int n){
+ #if G6_KV4
+ (void)a;(void)n;return 256;
+ #else
+ return attn_ctx3_sp()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&use_ctx3(a)?attn_ctx3_sp():256;
  #endif
 }
 // Context length used to pick the tile. a.context at capture is the cell window, not the live length (live_context is
@@ -593,8 +614,9 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int 
  else if(use_fixed_k_decode(a))small_decode::scores_direct<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
 }
+// sp (run_body, ctx_sp): context_pk3's slots per partition; 256 = PART partitions (every other caller)
 template<class Input>
-static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
  #if G6_KV4
  if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
  else if(n>=5){constexpr int HG=8;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
@@ -618,7 +640,7 @@ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,i
  if(attn_heads()&&attn_p11()){launch_context_tile(a,input,w,start,n,st);return;}
  if(attn_heads()){
   // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
-  if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st);return;}
+  if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st,sp);return;}
   if(attn_ctx2()){if(n>=5)launch_ctx2<8>(a,input,w,start,n,st);else launch_ctx2<4>(a,input,w,start,n,st);return;}
   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
   else{constexpr int HG=4;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}

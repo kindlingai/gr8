@@ -89,6 +89,7 @@ the short version.
 | `G6_ATTN_CTX2` | 0 | decode attention context: 1 / 2 = the head-group kernel with 32 / 64 gathered pairs per batch (16 when off), 3 / 4 = a packed, branch-free kernel with 16 / 32, two batches in flight. FP8 KV only, same bits |
 | `G6_ATTN_CTX3` | 0 | decode attention context with one test per batch of slots instead of per slot: 1 / 2 = 16 / 32 pairs per batch over 256 dims per CTA, 3 / 4 = the same over 512. Overrides `G6_ATTN_CTX2`. FP8 KV only, same bits |
 | `G6_ATTN_CTX3_HG` | 0 | with `G6_ATTN_CTX3`: heads per CTA, 2, 4 or 8; 0 = 4 up to 4 rows, then 8 |
+| `G6_ATTN_CTX3_SP` | 0 | with `G6_ATTN_CTX3`: 64 or 128 key slots per context partition (32 or 16 partials, merged in order) instead of 256 (8): shorter chains, more CTAs. Replicated decode only (not the CP block). FP8 KV only. Deterministic, a different fp32 summation order (not the same bits) |
 | `G6_ATTN_SEL2` | 0 | decode index selection: the final sort as a rank by count over 8, 16, 32 or 64 CTAs per row. Same bits |
 | `G6_IDX_GRP` | 0 | S2 batched decode steps: the indexer reads each key tile once for up to G = 1..64 rows of one session. Same bits |
 | `G6_ATTN_QT` | 0 | 1 = decode absorb stores q and rope lane-transposed and the scores kernel reads them with 16 B loads. Needs `G6_ATTN_SC2` 2 or 4; not with `G6_AVP1`. FP8 KV only, same bits |
