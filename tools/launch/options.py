@@ -125,6 +125,8 @@ KEYS = {
     'K1_TLBW': ('cluster', None, "MoE decode: fc1 prefetches the routed weights' translations at this granule, KB (G6_K1_TLBW)"),
     'L2PF': ('cluster', None, "decode: paced L2 prefetch of the next weights in the step's idle-DRAM windows, window mask (G6_L2PF)"),
     'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
+    'DSEL_MODEL': ('cluster', None, 'drafter choice priced from a frozen cost table, MTP rounds as the confidence stop runs them (G6_S2_DSEL_MODEL)'),
+    'DSEL_TABLE': ('cluster', None, 'DSEL_MODEL: the cost table, key:value list or a file (G6_S2_DSEL_TABLE; tools/s2_dsel_table.py)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

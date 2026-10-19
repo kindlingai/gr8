@@ -104,6 +104,8 @@ manifest instead.
 | `K1_TLBW` | unset (0) | unset (0) | unset (0) | decode MoE: fc1 prefetches the routed slots' weight translations into L2 at this granule in KB, a power of two; 2048 = the huge page (`G6_K1_TLBW`; bit-exact). Measured at TP=4 only |
 | `L2PF` | unset (0) | unset (0) | unset (0) | decode: a paced L2 prefetch of the weights the step reads next, on a side stream in the windows where DRAM is idle; window mask 1 = MLP all-reduce wait, 2 = gather waits, 4 = attention, 8 = attention all-reduce wait (`G6_L2PF`; bit-exact). Measured at TP=4 only, as 15 |
 | `CP_ONECHAIN` | unset (0) | – | – | 1 = past `SHARE_LIMIT`, each rank runs the other ranks' head groups over its keys as one attention call instead of one per group (`G6_CP_ONECHAIN`; bit-exact). TP=4 only (the engine refuses it elsewhere), not with `G6_ATTN_FLIP` |
+| `DSEL_MODEL` | unset (0) | – | – | 1 = the drafter choice prices both drafters from `DSEL_TABLE` and a request's MTP rounds as the confidence stop runs them (`G6_S2_DSEL_MODEL`; drafts only: the target decides every token). Needs `DFLASH=1` |
+| `DSEL_TABLE` | unset | – | – | `DSEL_MODEL`: the cost table, a `key:value` list (`v1`..`v8`, `d`, `m`, `e`, `p`, optional `g`, `k`, `n`, `w`, `r`) or a file holding one, measured on the cluster with `tools/s2_dsel_table.py` (`G6_S2_DSEL_TABLE`) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
