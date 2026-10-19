@@ -608,6 +608,10 @@ int main(int argc, char** argv)
     // signature
     const bool mtp_last = mtp_lastrow_env();
     if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
+    // G6_DRAFT_HEAD2=1|2 (rank.cuh draft_head2_env; default 0): the MTP draft's head in two stages (2-bit screen, exact
+    // MXFP8 rescoring of its best). Drafts only. In the S2 runtime signature
+    const int dhead2 = draft_head2_env();
+    if (dhead2 && !mtp) die("G6_DRAFT_HEAD2 needs --mtp");
     // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
     // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
     std::string dfe;
@@ -848,6 +852,7 @@ int main(int argc, char** argv)
             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
         }
         build_draft_head_i4(D, dhead, st);
+        build_draft_head2(D, dhead2, st);
         D.d.route_last = mtp_last;
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
         DQ.P.attn_rows = pf_attn_rows(MP);
@@ -1526,7 +1531,7 @@ int main(int argc, char** argv)
                 (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (mtp_last ? " mtplast 1" : "") +
+                (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
                 (dsel_start_mtp ? " dselstart mtp" : "") +

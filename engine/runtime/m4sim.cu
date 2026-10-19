@@ -48,6 +48,7 @@
 //        residual> logits <fnv of the row's logits, the ranks' slices in rank order>". The part after "|" must not depend
 //        on the step's row count or on the other rows of the step (scripts/m4sim_split_check.sh compares it).
 // G6_MTP_LASTROW=1 (needs --mtp): as g6m4, a draft step routes only each session's last row (rank.cuh launch_mlp_block).
+// G6_DRAFT_HEAD2=1|2 (needs --mtp): as g6m4, the MTP draft's two-stage head (2: with the MXFP8 check lines).
 // G6_MTP_LASTROW_CHECK=1: after each draft step one "check" line per session: its last row's token, log-probability,
 //        head-input and residual rows, and a hash of every rank's whole layer-78 caches. With and without G6_MTP_LASTROW
 //        every line but the first-form "draft" lines (their other rows) must be the same (scripts/mtp_lastrow_check.sh).
@@ -250,6 +251,7 @@ int main(int argc, char** argv)
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
     const DraftHeadI4 dhead = draft_head_i4_env();   // G6_DRAFT_HEAD_I4 (rank.cuh), as g6m4: the MTP draft's INT4 head
     const bool mtp_last = mtp_lastrow_env();         // G6_MTP_LASTROW (rank.cuh), as g6m4: draft steps route only last rows
+    const int dhead2 = draft_head2_env();            // G6_DRAFT_HEAD2 (rank.cuh), as g6m4: the two-stage draft head
     std::string packs;
     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
     g6rt::CommonOpts co;                // every flag g6m4 takes too, parsed in engine_opts.h
@@ -326,6 +328,7 @@ int main(int argc, char** argv)
     else if (!minv_s.empty()) die("--minv-rows needs --minv");
     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
     if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
+    if (dhead2 && !mtp) die("G6_DRAFT_HEAD2 needs --mtp");
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
@@ -637,6 +640,7 @@ int main(int argc, char** argv)
             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
             qs_loop_attach(DR[r].d, qsl_d, stepp_d);
             build_draft_head_i4(DR[r], dhead, st);
+            build_draft_head2(DR[r], dhead2, st);
             DR[r].d.route_last = mtp_last;
             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
             loop_d.send[r] = fd.send;
