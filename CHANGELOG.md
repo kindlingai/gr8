@@ -78,6 +78,15 @@
   hand) byte-compares the decode layer sequence's outputs per arm and times it per layer.
 - Measured on four GB10 at TP=4 (`L2PF=15`): T=0 top-20 log-probabilities identical on 75 prompts; decode c1 +2.7 %
   prose, +2.3 % code, +2.7 % structured; `l2pf_bench` -10.1 us a layer at 3 rows, -38.6 us at 12.
+## 2026-10-18: decode buckets: nine slots, so a SHARE_LIMIT off the doubling keeps the 2048 bucket
+
+- The decode graphs are captured per context bucket (2048, 4096, ... below the capacity, the capacity, and CP's R when it
+  is not already a boundary). With eight slots a limit such as 98304 filled the list and `context_buckets` merged the
+  smallest bucket away, so every short-context step ran on the 4096 graph. `NBK` is now 9 and the doubling stops at
+  seven buckets, as it did when the list was full: at every TP default (R a power of two among the doublings) the list,
+  the graphs and the outputs are those of before; an R off the doubling takes the ninth slot (one more bucket of step
+  graphs). `test_context_buckets` checks both.
+
 ## 2026-10-18: --share-limit takes any multiple of 64 from 4096
 
 - The launcher refused a `SHARE_LIMIT` that is not a power of two. The engine does not need one: `context_buckets`
