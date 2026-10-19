@@ -96,6 +96,7 @@ struct S2Model
     int rt_window = 0;
     // the main model's tail entries of the run with this list (logical page -> page, -1 none), or null: all -1
     std::function<const std::vector<int>*(const std::vector<int>& list)> rt_tail;
+    unsigned* last_rows = nullptr;                           // draft model, G6_MTP_LASTROW: bit r = row r is its session's last
 };
 
 // pages base, base + 1, .., base + pages - 1: the contiguous run the allocator grants
@@ -256,6 +257,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     s->cat = dmalloc<__half>((size_t)MX * heads * 256);
     s->hcat = dmalloc<__half>((size_t)MX * HID);
     s->hprev_b = dmalloc<__half>((size_t)S2N * HID);
+    s->last_rows = dmalloc<unsigned>(1);
     s->sab.assign(m.nl, std::vector<G6AttnBinding*>(S2N, nullptr));
     s->bv.assign(m.nl, nullptr);
     std::vector<const int*> tabs((size_t)S2N * m.nl, nullptr);
@@ -792,6 +794,23 @@ inline void s2_draft_keep(Draft& D, cudaStream_t st)
 {
     S2Model& s = *D.d.s2;
     k_s2_draft_keep<<<S2N, 256, 0, st>>>(S2Keep{reinterpret_cast<const uint32_t*>(s.in), D.d.x, s.hprev_b});
+}
+// G6_MTP_LASTROW (rank.cuh launch_mlp_block): the rows of the step that are their session's last (S2In, device), as the
+// router plan's keep mask. grid 1, block 32
+__global__ void __launch_bounds__(32) k_s2_last_rows(const uint32_t* in, unsigned* out)
+{
+    if (threadIdx.x) return;
+    const int ns = (int)__ldcv(in + offsetof(S2In, ns) / 4);
+    unsigned b = 0u;
+    for (int j = 0; j < ns && j < S2N; ++j)
+        b |= 1u << ((int)__ldcv(in + offsetof(S2In, row0) / 4 + j) + (int)__ldcv(in + offsetof(S2In, rows) / 4 + j) - 1);
+    *out = b;
+}
+inline const unsigned* s2_last_rows(Model& m, cudaStream_t st)
+{
+    S2Model& s = *m.s2;
+    k_s2_last_rows<<<1, 32, 0, st>>>(reinterpret_cast<const uint32_t*>(s.in), s.last_rows);
+    return s.last_rows;
 }
 
 // after the step's stream is synchronized: step_line over the rows r0..r0+n-1 of a step (tokens, logprobs, target

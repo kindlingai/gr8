@@ -60,6 +60,10 @@
 //        "row q<seq> pos <p> M <M> s <step> | in <token fed> tok <sampled> lp <bits> lpt <bits> resid <fnv of the row's
 //        residual> logits <fnv of the row's logits, the ranks' slices in rank order>". The part after "|" must not depend
 //        on the step's row count or on the other rows of the step (scripts/m4sim_split_check.sh compares it).
+// G6_MTP_LASTROW=1 (needs --mtp): as g6m4, a draft step routes only each session's last row (rank.cuh launch_mlp_block).
+// G6_MTP_LASTROW_CHECK=1: after each draft step one "check" line per session: its last row's token, log-probability,
+//        head-input and residual rows, and a hash of every rank's whole layer-78 caches. With and without G6_MTP_LASTROW
+//        every line but the first-form "draft" lines (their other rows) must be the same (scripts/mtp_lastrow_check.sh).
 // [--minv B] [--minv-rows 1,2,..]: per --prompt, rows 0..B-1 in --chunk steps, then for every row count M of the list
 //        (default 1..MX then MX-1..1, each <= prompt - B) one step over prompt rows B..B+M-1 (teacher-forced) from that same
 //        state, with its row lines. Row B + j must print the same line at every M > j. No --mtp / --s2 / --serve / --prefill.
@@ -273,6 +277,7 @@ int main(int argc, char** argv)
     if (getenv("G6_PF_ROUTER_SPLIT"))
         die("G6_PF_ROUTER_SPLIT needs g6m4's dedicated route-table fabric; m4sim does not simulate it");
     const DraftHeadI4 dhead = draft_head_i4_env();   // G6_DRAFT_HEAD_I4 (rank.cuh), as g6m4: the MTP draft's INT4 head
+    const bool mtp_last = mtp_lastrow_env();         // G6_MTP_LASTROW (rank.cuh), as g6m4: draft steps route only last rows
     std::string packs;
     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
     g6rt::CommonOpts co;                // every flag g6m4 takes too, parsed in engine_opts.h
@@ -355,6 +360,7 @@ int main(int argc, char** argv)
     }
     else if (!minv_s.empty()) die("--minv-rows needs --minv");
     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+    if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
 #if G6_MODEL_FLASH
     // Flash: --mtp K is adaptive speculation (up to K drafts) unless --spec-fixed (as g6m4)
@@ -677,6 +683,7 @@ int main(int argc, char** argv)
             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
             qs_loop_attach(DR[r].d, qsl_d, stepp_d);
             build_draft_head_i4(DR[r], dhead, st);
+            DR[r].d.route_last = mtp_last;
             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
             loop_d.send[r] = fd.send;
             if (MP) DQ[r].P.attn_rows = pf_attn_rows(MP);   // DQ is empty without --prefill (was an out-of-bounds write)
@@ -1431,6 +1438,41 @@ int main(int argc, char** argv)
         printf("%s\n", line0.c_str());
         return last;
     };
+    // G6_MTP_LASTROW_CHECK=1 (header): after every draft step, per session, one line with what readers of a draft step take
+    // and the layer-78 caches: "<prefix> check <s> | rows <n> last <row> tok <t> lp <bits> x <fnv> resid <fnv> kv <fnv>":
+    // the last row's token and log-probability (rank 0), its head-input row (x, the shared_head_norm output) and residual
+    // over every rank, and every rank's whole draft-layer KV latent and indexer key caches. G6_MTP_LASTROW on and off must
+    // print the same lines (scripts/mtp_lastrow_check.sh)
+    const bool dcheck_on = getenv("G6_MTP_LASTROW_CHECK") && atoi(getenv("G6_MTP_LASTROW_CHECK")) != 0;
+    auto dcheck = [&](const std::string& prefix, int s, int r0, int n, const StepOut* so) {
+        if (!dcheck_on) return;
+        const int last = r0 + n - 1;
+        uint64_t hx = 0xcbf29ce484222325ull, hr = hx, hk = hx;
+        std::vector<uint8_t> h;
+        for (int r = 0; r < NR; ++r)
+        {
+            const G6Attn& a = DR[r].d.layers[0].ab.args;
+            const size_t kb = (size_t)a.page_count * 64 * g6kv::ROW, ib = (size_t)a.page_count * 64 * g6kv::IDX_ROW;
+            h.resize(kb);
+            G6RT_CK(cudaMemcpy(h.data(), a.mla_cache, kb, cudaMemcpyDeviceToHost));
+            hk = fnv(hk, h.data(), kb);
+            if (a.index_cache)
+            {
+                h.resize(ib);
+                G6RT_CK(cudaMemcpy(h.data(), a.index_cache, ib, cudaMemcpyDeviceToHost));
+                hk = fnv(hk, h.data(), ib);
+            }
+            h.resize(HID * 4);
+            G6RT_CK(cudaMemcpy(h.data(), DR[r].d.x + (size_t)last * HID, HID * 2, cudaMemcpyDeviceToHost));
+            hx = fnv(hx, h.data(), HID * 2);
+            G6RT_CK(cudaMemcpy(h.data(), DR[r].d.resid + (size_t)last * HID, HID * 4, cudaMemcpyDeviceToHost));
+            hr = fnv(hr, h.data(), HID * 4);
+        }
+        uint32_t ul;
+        memcpy(&ul, &so[0].lp[last], 4);
+        printf("%s check %d | rows %d last %d tok %d lp %08x x %016llx resid %016llx kv %016llx\n", prefix.c_str(), s, n, last, so[0].tok[last], ul,
+               (unsigned long long)hx, (unsigned long long)hr, (unsigned long long)hk);
+    };
     // G6_ROW_LINES (header): the target step's rows, one line each (rank 0); every rank's residual row must be rank 0's
     auto row_lines = [&](size_t q, int s, const StepIn& si, const StepOut* so) {
         const int M = si.M;
@@ -1606,6 +1648,7 @@ int main(int argc, char** argv)
                     else if (line != line0) { ++bad; printf("RANK %d DIFFERS: %s\n", r, line.c_str()); }
                 }
                 printf("%s\n", line0.c_str());
+                if (draft) dcheck(prefix, s, h.row0[j], h.rows[j], so);
                 if (rowhash && !draft)
                     for (int r = h.row0[j]; r < h.row0[j] + h.rows[j]; ++r)
                     {
@@ -2095,6 +2138,7 @@ int main(int argc, char** argv)
             auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
                 ms += run_draft(di, chain, sd);
                 const int t = lines(chain ? "chain" : "draft", true, sd, s, di.M);
+                dcheck(chain ? "chain" : "draft", s, 0, di.M, sd);
                 if (!mtp_dump.empty() && di.step == 1)               // the first prompt step's draft pass
                 {
                     const int M = di.M;

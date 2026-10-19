@@ -457,6 +457,8 @@ struct Model
                                       // rejection sampling (the glue.cuh _rs head kernels)
     QSplit qs;                        // G6_QA_SPLIT (main model only; mode 0 = today's replicated GEMVs)
     bind::K1Ovl ovl;                  // G6_ROUTE_OVL (route_ovl_init; mode 0 = off): the shared expert's side stream
+    bool route_last = false;          // G6_MTP_LASTROW (MTP draft model only, set before capture): only each session's last row
+                                      // of a step takes routed experts (launch_mlp_block, mtp_lastrow_env)
     int ncoll() const { return 2 * nl + 1; }
 #if defined(G6_CP) && G6_CP
     CpState cp;
@@ -1461,6 +1463,25 @@ inline void route_ovl_init(Model& m)
 }
 
 constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots (slots, an expert can take several), pad_[3], slot_expert[SMAX]
+#ifdef DEC_S2
+inline const unsigned* s2_last_rows(Model& m, cudaStream_t st);
+#endif
+// G6_MTP_LASTROW=1 (default 0; needs --mtp; every rank, read at boot before any capture): the MTP draft step routes only
+// the last row of each session (the step's last row on today's path; on the S2 path each session's last row, from S2In,
+// so a chain step routes all of its rows). Every reader of a draft step takes only those rows: d[1] and its log-probability
+// (s2_batch.h, mtp_sequence) and the kept hidden row (launch_draft_keep). The other rows of a first form are there to
+// write layer 78's caches, and those are written in the attention block from the layer input, before the experts. So
+// their experts are skipped (k_router_plan keep: no slot, the shared expert only; a row's K1 bytes do not depend on the
+// other rows' routes, as S2 sessions in one step rely on), and the caches, the last row's hidden, its token and its
+// log-probability are the bytes of the full step. The other rows' outputs (unread) change. A first form of a+1 rows reads
+// the routed experts of one row instead of a+1. In the S2 runtime signature.
+inline bool mtp_lastrow_env()
+{
+    std::string err;
+    const int v = env_choice("G6_MTP_LASTROW", 1, 0, &err);
+    if (v < 0) die(err);
+    return v != 0;
+}
 inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 {
 #if G6_MODEL_FLASH
@@ -1476,7 +1497,17 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
     if (y.moe)
     {
         bind::launch(b.router, st);
-        glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan);
+        unsigned keep = 0u;                    // G6_MTP_LASTROW: the rows that take routed experts (0 = all)
+        const unsigned* keep_dev = nullptr;
+        if (m.route_last)
+        {
+#ifdef DEC_S2
+            if (m.s2on) keep_dev = s2_last_rows(m, st);
+            else
+#endif
+            keep = 1u << (M - 1);
+        }
+        glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan, keep, keep_dev);
         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
     }
     dmark(DP_ROUTER, st);
