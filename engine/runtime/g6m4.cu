@@ -506,6 +506,10 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
         if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
     }
+    // G6_MTP_KSTOPB: a session alone in round_all (MTP only) verifies the rule's widths of one session; its first forms
+    // are within 1..mtp + 1 (draft_rows above)
+    for (int M : s2::kstopb_widths(kstop.b, 1, mtp))
+        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
         if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
 #if G6_MODEL_FLASH
@@ -2193,7 +2197,7 @@ int main(int argc, char** argv)
             // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
             try
             {
-                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step);
+                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step, kstop.solo ? kstop.kmax : 0);
                 m.dfl_tap = tap;
                 wcheck::seal(R);
                 int dev = 0;
