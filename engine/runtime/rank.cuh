@@ -40,6 +40,7 @@
 #include "../kernels/bind.cuh"
 #include "../kernels/l2pf.cuh"
 #include "../kernels/head_i4.cuh"
+#include "../kernels/head2.cuh"
 #include "../attn/bind.h"
 #if defined(G6_CP) && G6_CP
 #include "../kernels/cpglue.cuh"
@@ -403,6 +404,14 @@ struct Model
     // vocab slice instead of head_t.lm_head (build_draft_head_i4); dh_tpc / dh_ks = its CTA split. nullptr = MXFP8
     const uint8_t* dh_i4 = nullptr;
     int dh_tpc = 1, dh_ks = 32;
+    // G6_DRAFT_HEAD2 (MTP draft model only, set before prepare; build_draft_head2): steps of up to head2::MXM rows run the
+    // two-stage head (kernels/head2.cuh) instead of the head GEMV; dh2_mode 2 also runs the MXFP8 GEMV into dh2_ref and
+    // counts the rows whose MXFP8 argmax is not a candidate (dh2_cnt, measurement)
+    int dh2_mode = 0;
+    head2::Bufs dh2;
+    float* dh2_ref = nullptr;
+    unsigned* dh2_cnt = nullptr;
+    bind::Gv dh2_gv[MX + 1];
     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
@@ -1550,6 +1559,9 @@ inline const bind::Head& head_for(Model& m, int M)
                 die("rank " + std::to_string(m.rank) + " INT4 draft head: " + e);
             if (H.lm_head.O != H.vn || H.lm_head.K != HID) die("INT4 draft head is not this rank's vocab slice");
         }
+        if (m.dh2_mode == 2 && M <= head2::MXM)   // G6_DRAFT_HEAD2=2: the MXFP8 GEMV of the slice, as the target's head binds it
+            if (const char* e = bind::make_gv(m.head_t.lm_head, bind::MXFP8, 1, 32, M, m.sc.xf_head, m.dh2_ref, gv::O_F32, m.dh2_gv[M]))
+                die("rank " + std::to_string(m.rank) + " G6_DRAFT_HEAD2 check GEMV: " + e);
     }
     return H;
 }
@@ -1617,6 +1629,19 @@ inline void launch_step_out(Model& m, int M, cudaStream_t st)
 inline void launch_head_local(Model& m, int M, cudaStream_t st)
 {
     const bind::Head& H = head_for(m, M);
+    if (m.dh2_mode && M <= head2::MXM)        // G6_DRAFT_HEAD2: screen, its best SL rescored, the record over them
+    {
+        if (m.dh2_mode == 2)
+        {
+            bind::launch(H.xf_h, st);
+            bind::launch(m.dh2_gv[M], st);
+        }
+        head2::launch_front(m.dh2, m.x, HID, m.hlog, m.vn, m.vn, M, st);
+        if (m.dh2_mode == 2) head2::k_check<<<M, 256, 0, st>>>(m.dh2_ref, m.vn, m.vn, m.dh2.cand, m.dh2_cnt, m.rank);
+        head2::k_head_local_sl<<<M, 1024, 0, st>>>(head_args(m, M), m.dh2.cand, m.dh2.cl);
+        dmark(DP_HEAD_L, st);
+        return;
+    }
     bind::launch(H.xf_h, st);
     bind::launch(H.lm_head, st);
     if (m.rs) glue::k_head_local_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
@@ -1835,6 +1860,50 @@ inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
         if (d.head[M].M) die("G6_DRAFT_HEAD_I4: the draft head was bound before its INT4 records were made");
     d.dh_i4 = head_i4_records(d.head_t.lm_head, d.vn, c.ks, d.rank, "G6_DRAFT_HEAD_I4", st);
     d.dh_tpc = c.tpc; d.dh_ks = c.ks;
+}
+// G6_DRAFT_HEAD2=1|2 (default 0; needs --mtp; every rank, read at boot): the MTP draft's head in two stages (kernels/head2.cuh):
+// a 2-bit g32 screen of the rank's vocab slice (74.5 MB at TP4, made at boot from the MXFP8 head records), the exact
+// MXFP8 logits of the screen's best head2::SL rows (read out of the target's records), and the head record over those
+// candidates (the log-sum-exp over the whole row, screen logits outside them). Drafts only: the target's head and the
+// verify steps are unchanged. A draft is the MXFP8 head's argmax whenever that token is among its slice's SL screen best
+// (dhead2_test; an offline replay of 24k recorded draft-head inputs: no miss). Draft steps of more than
+// head2::MXM rows keep the head GEMV (INT4 with G6_DRAFT_HEAD_I4, else MXFP8). 2 = also the MXFP8 GEMV of the slice per
+// draft step and a count of the rows whose MXFP8 argmax is not a candidate (a line every 4096 rows; measurement only).
+// T > 0: a draft is sampled among the candidates (top_p and top-k lists over the whole row, as today). In the S2 runtime
+// signature.
+inline int draft_head2_env()
+{
+    std::string err;
+    const int v = env_choice("G6_DRAFT_HEAD2", 2, 0, &err);
+    if (v < 0) die(err);
+    return v;
+}
+// after build_draft, before prepare / any capture of a draft step
+inline void build_draft_head2(Draft& D, int mode, cudaStream_t st)
+{
+    Model& d = D.d;
+    if (!mode) return;
+    const bind::Tensor& mx = d.head_t.lm_head;
+    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != d.vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
+        die("G6_DRAFT_HEAD2: G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
+    if (const char* e = head2::init()) die(std::string("G6_DRAFT_HEAD2: ") + e);
+    uint4* codes = dmalloc<uint4>(head2::code_bytes(d.vn) / 16);
+    __half2* scales = dmalloc<__half2>(head2::scale_bytes(d.vn) / 4);
+    head2::convert(static_cast<const uint8_t*>(mx.p), codes, scales, d.vn, st);
+    G6RT_CK(cudaGetLastError());
+    d.dh2.codes = codes; d.dh2.scales = scales; d.dh2.mx = static_cast<const uint8_t*>(mx.p);
+    d.dh2.cand = dmalloc<int>((size_t)head2::MXM * head2::SL);
+    d.dh2.cl = dmalloc<float>((size_t)head2::MXM * head2::SL);
+    if (mode == 2)
+    {
+        d.dh2_ref = dmalloc<float>((size_t)head2::MXM * d.vn);
+        d.dh2_cnt = dmalloc<unsigned>(2);
+        G6RT_CK(cudaMemsetAsync(d.dh2_cnt, 0, 8, st));
+    }
+    G6RT_CK(cudaStreamSynchronize(st));
+    d.dh2_mode = mode;
+    fprintf(stderr, "# rank %d: G6_DRAFT_HEAD2=%d: 2-bit g32 screen records %.1f MB, %d candidates rescored on MXFP8, steps of <= %d rows\n",
+            d.rank, mode, head2::bytes(d.vn) / 1e6, head2::SL, head2::MXM);
 }
 #ifdef DEC_S2
 inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);
