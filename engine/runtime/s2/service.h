@@ -385,11 +385,15 @@ public:
             h.dfl = [&](Key, const s2::DflReq& r) { return dispatch_.dfl(r); };
             h.draft_lp = native_.dispatch.draft_lp;
         }
+        // MTP only (no drafter): the confidence stops of round_all read the draft log-probabilities too (g6m4 sets kstop)
+        const bool kstop_mtp = !native_.dispatch.dfl && (native_.kstop.mode || native_.kstop.b.mode || native_.kstop.log);
+        if (kstop_mtp) h.draft_lp = native_.dispatch.draft_lp;
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
         if (native_.dispatch.dfl) {
             driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
             driver_->dfl_reuse(native_.dfl_reuse);
         }
+        else if (kstop_mtp) driver_->kstop(native_.kstop);
         if (reuse()) {
             require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
             dispatch_.track_rows();
