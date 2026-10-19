@@ -89,6 +89,17 @@ manifest instead.
 | `PF_SELX_CTX` | 53248 | unset (0) | unset (0) | prefill index tiles at context >= this select with selx instead of SEL32, same ids in the same order (`G6_PF_SELX_CTX`; 0 = SEL32) |
 | `TR3_W2ALL` | 1 | unset (0) | unset (0) | 1 = the window-2 fc1 split (KS1x2, WG1) on every MoE layer at M > 1, not only the layers the k2 gate picks (`G6_TR3_W2ALL`; bit-exact). Measured at TP=4 only |
 | `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
+| `ROUTE_OVL` | unset (0) | unset (0) | unset (0) | decode MoE layers of 2+ rows: the trellis shared expert on a forked stream during the router, 1 = fc1 + fc2, 2 = fc1 (`G6_ROUTE_OVL`; bit-exact). Measured at TP=4 only |
+| `ATTN_SC2` | unset (0) | unset (0) | unset (0) | decode attention scores with S = 1, 2, 4 or 8 key slots per warp (`G6_ATTN_SC2`; bit-exact) |
+| `ATTN_SC2_TR` | unset (0) | unset (0) | unset (0) | with `ATTN_SC2`: the transpose reduction, 1 or 2 = eager (`G6_ATTN_SC2_TR`; bit-exact) |
+| `ATTN_CTX2` | unset (0) | unset (0) | unset (0) | decode attention context kernel variant 1..4 (`G6_ATTN_CTX2`; bit-exact) |
+| `ATTN_CTX3` | unset (0) | unset (0) | unset (0) | decode attention context with one test per batch of slots, 1..4 (`G6_ATTN_CTX3`; bit-exact) |
+| `ATTN_SEL2` | unset (0) | unset (0) | unset (0) | decode index selection's final sort as a rank by count over 8, 16, 32 or 64 CTAs per row (`G6_ATTN_SEL2`; bit-exact) |
+| `IDX_GRP` | unset (0) | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
+| `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
+| `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+| `CP_STEP_ROWS` | unset (0) | unset (0) | unset (0) | S2: a decode step past `SHARE_LIMIT` carries at most this many rows, and the CP fabric is sized for it instead of for the widest S2 step (`SESS` x (`MTP` + 1) = 24 rows, 1.358 GB pinned per rank at TP=4; 8 rows: 0.453 GB). While a session past the limit decodes and the sessions' rows do not fit, they take turns, each once per cycle. At least the rows of a solo step (the boot names the minimum, 8 with DFlash2) (`G6_CP_STEP_ROWS`) |
+| `CP_STEP_SEG` | unset (0) | unset (0) | unset (0) | with `CP_STEP_ROWS`: 1 = a round past `SHARE_LIMIT` takes only sessions past it, so a shorter session never runs the CP attention because a long one is resident (`G6_CP_STEP_SEG`) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |

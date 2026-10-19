@@ -138,6 +138,10 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${TR3_W2ALL:+ G6_TR3_W2ALL=$TR3_W2ALL}"
   # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
   ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
+  # the row cap for S2 steps past SHARE_LIMIT, which also sizes the CP fabric (CP_STEP_ROWS, CP_STEP_SEG;
+  # docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${CP_STEP_ROWS:+ G6_CP_STEP_ROWS=$CP_STEP_ROWS}"
+  ENGINE_ENV="$ENGINE_ENV${CP_STEP_SEG:+ G6_CP_STEP_SEG=$CP_STEP_SEG}"
   return 0
 }
 

@@ -3,6 +3,7 @@
 // EventGate all-rank fence; callbacks must fail the whole epoch on any error.
 #pragma once
 #include "scheduler.h"
+#include "cp_rows.h"
 #include "../s2_batch.h"
 
 namespace g6s2 {
@@ -51,6 +52,9 @@ class Driver {
     std::array<uint32_t, MAX_SESSIONS> emitted_{};
     std::array<bool, MAX_SESSIONS> initialized_{};
     s2::Batch batch_;
+    CpRound cp_round_;   // G6_CP_STEP_ROWS: the current cycle of capped rounds (cp_rows.h)
+    bool cp_capped_ = false;
+    uint64_t cp_rounds_ = 0;   // capped rounds so far
     s2::Hooks batch_hooks() {
         return {
             [this](const s2::Step& s) {
@@ -96,6 +100,7 @@ public:
         require(bool(hooks_.bind) && bool(hooks_.retire) && bool(hooks_.prefill) && bool(hooks_.run) && bool(hooks_.emit), "missing driver callback");
     }
     const Scheduler& state() const { return scheduler_; }
+    uint64_t cp_capped_rounds() const { return cp_rounds_; }
     const s2::Stats& stats(Key k) const {
         require(k.slot < MAX_SESSIONS && scheduler_.slots()[k.slot].key == k && initialized_[k.slot], "stats for stale/uninitialized slot");
         return batch_.stats(int(k.slot));
@@ -158,7 +163,35 @@ public:
                 }
             if (hooks_.settle) hooks_.settle();
         } catch (...) { scheduler_.fail(); throw; }
+        // G6_CP_STEP_ROWS: of the sessions that can decode, the ones this round takes (cp_rows.h); the rest sit it out like
+        // a grow stall. A session's verify context is at most its length + mtp, so `past` holds for every session whose
+        // main step can run past R. The pick is recorded only if the quantum is a decode round
+        const Config& cc = scheduler_.config();
+        std::vector<CpCand> cand;
+        CpPick pick;
+        if (cc.cp_step_rows) {
+            std::vector<unsigned> slot;
+            for (const Key& k : scheduler_.decoding())
+                if (!stalled[k.slot]) {
+                    const uint64_t ctx = uint64_t(batch_.length(int(k.slot))) + cc.mtp;
+                    cand.push_back({scheduler_.slots()[k.slot].req.id, ctx > cc.cp_after});
+                    slot.push_back(k.slot);
+                }
+            pick = cp_round_.pick(cand, cc.cp_step_rows, cc.mtp + 1, cc.cp_seg);
+            for (size_t i = 0; i < cand.size(); ++i) if (!pick.in[i]) stalled[slot[i]] = true;
+        }
         auto q = scheduler_.next(stalled);
+        if (cc.cp_step_rows && q.kind == Kind::Decode) {
+            cp_round_.commit(pick, cand);
+            if (pick.capped != cp_capped_) {   // one line per change, every rank (the fleet check reads it)
+                unsigned past = 0, in = 0;
+                for (size_t i = 0; i < cand.size(); ++i) { past += cand[i].past; in += pick.in[i]; }
+                std::fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%u: rounds %s at boundary %llu (%zu decoding, %u past R, %u in this round)\n",
+                             cc.cp_step_rows, pick.capped ? "capped" : "uncapped", (unsigned long long)q.boundary, cand.size(), past, in);
+                cp_capped_ = pick.capped;
+            }
+            cp_rounds_ += pick.capped;
+        }
         try {
             if (q.kind == Kind::Prefill) {
                 auto k = q.keys[0];

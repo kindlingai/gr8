@@ -215,6 +215,17 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
         self.assertEqual(da, self.digest('--cap', '310528', '--share-limit', '65536', '--sess', '8', '--dflash', '1')[2])
 
+    def test_cp_step_rows_reaches_every_rank(self):
+        _, text, d0 = self.digest()
+        self.assertNotIn('G6_CP_STEP_', text)
+        _, text, d8 = self.digest('--cp-step-rows', '8')
+        self.assertIn(' G6_CP_STEP_ROWS=8', text)
+        self.assertNotIn('G6_CP_STEP_SEG', text)
+        self.assertNotEqual(d0, d8)
+        _, text, _ = self.digest('--cp-step-rows', '8', '--cp-step-seg', '1')
+        self.assertIn(' G6_CP_STEP_ROWS=8', text)
+        self.assertIn(' G6_CP_STEP_SEG=1', text)
+
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
         self.assertIn('CAP=408832\n', text)              # 1,981 physical pages per rank at TP=4, as at 65536

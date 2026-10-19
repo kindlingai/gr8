@@ -25,6 +25,28 @@
   gate picks. Bit-exact (`row_budget_test --only k1`: the same FNV on all 54 K1 lines off and on). Launch knob
   `TR3_W2ALL`, 1 at TP=4, unset at TP=3 / TP=6; 0 turns it off. Measured on four GB10 at TP=4 (2000 MHz cap): prose
   decode +1.3%, code c4 +3.4%.
+## 2026-10-19: S2: a row cap for steps past SHARE_LIMIT that also sizes the CP fabric (G6_CP_STEP_ROWS, off by default)
+
+- Since #94 sessions past `SHARE_LIMIT` (R) share batched S2 steps, so the CP fabric and the CP graphs at every bucket
+  past R are sized for the widest S2 step: `SESS` x (`MTP` + 1) = 24 rows at 8 sessions / MTP 2, 1.358 GB pinned and
+  registered per rank at TP=4 (8 rows: 0.453 GB). `G6_CP_MMAX` can only raise that.
+- `G6_CP_STEP_ROWS=n` (launch knob `CP_STEP_ROWS`) sizes the fabric for n rows, and `Driver::step` forms rounds so
+  that no step past R carries more than n: while a session past R decodes and the decoding sessions' rows do not fit,
+  a round takes at most n / (`MTP` + 1) sessions, those past R first, and the others sit it out the way a grow stall
+  does (their state does not change); every decoding session gets one round per cycle. Rounds without a session past
+  R keep the full batch. n is at least the rows of a solo or prompt step past R (the boot names the minimum) and is
+  clamped to the widest S2 step. The boot does not capture the main widths above n at the buckets past R.
+- `G6_CP_STEP_SEG=1` (launch knob `CP_STEP_SEG`): a round past R takes only sessions past R, so a session below R
+  never runs the CP attention because a long session is resident.
+- Sessions past R give the same tokens as without the knob; a session below R left out of a past-R round runs that
+  round on the replicated path instead of the CP path (the LSE-merge difference #94 introduced, ~1e-5). Set, the
+  knob joins the scheduler digest, the bootstrap agreement and the S2 runtime signature; unset, nothing changes.
+- Host test `engine/runtime/s2/tests/cp_rows_test.cpp` (in `scripts/host_tests.sh`). Measured on four GB10 at TP=4
+  and the default CAP: with the 24-row fabric the head was down to ~0.5 GiB MemAvailable while serving and hit
+  NV_ERR_NO_MEMORY under load; with `CP_STEP_ROWS=8` it had 3.33 GiB (the other boxes 2.48-2.77). T=0 output
+  unchanged at short context; a ~71K-token request plus three short ones ran concurrently with the cap engaged,
+  without errors.
+
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)
