@@ -1087,16 +1087,69 @@ inline void qs_get(Model& m, int c, int M, cudaStream_t st)
 {
     k_qs_get<<<M <= 8 ? 1 : 4, 256, 0, st>>>(m.qs.geo[c], m.qs.g, m.stepp, c, M, (size_t)M * m.qs.geo[c].wmax * 2);
 }
+inline const bind::Head& head_for(Model& m, int M);
+// the MTP draft model (layer 78 as a one-layer Model with eh_proj): G6_MTP_L2PF's windows (kernels/l2pf.cuh)
+inline bool l2pf_is_draft(const Model& m) { return m.eh_out != nullptr; }
+// chained-window state ids (l2pf::State tag = step << 8 | id + 1): the main model's layers 0..nl-1, the draft's layer at
+// L2PF_DRAFT_ID, the head-merge tails at L2PF_TAIL_ID (+ 1 in a draft step), so no window resumes another queue's position
+constexpr int L2PF_DRAFT_ID = 200, L2PF_TAIL_ID = 250;
+// T_HEAD: the head records a step of M rows reads first. G6_DRAFT_HEAD2: the screen's codes and scales, which k_screen
+// sweeps from row 0 up together (an eighth of the rows of each first, then the rest); else the head GEMV's records.
+inline void l2pf_add_head(Model& m, int M, l2pf::Plan& P)
+{
+    if (m.dh2_mode && M <= head2::MXM)
+    {
+        const size_t r1 = (size_t)m.vn / 8, cb = (size_t)head2::NCH * 16, sb = (size_t)head2::NG * 2;
+        const uint8_t* codes = reinterpret_cast<const uint8_t*>(m.dh2.codes);
+        const uint8_t* scales = reinterpret_cast<const uint8_t*>(m.dh2.scales);
+        P.add(l2pf::T_HEAD, codes, r1 * cb);
+        P.add(l2pf::T_HEAD, scales, r1 * sb);
+        P.add(l2pf::T_HEAD, codes + r1 * cb, head2::code_bytes(m.vn) - r1 * cb);
+        P.add(l2pf::T_HEAD, scales + r1 * sb, head2::scale_bytes(m.vn) - r1 * sb);
+        return;
+    }
+    const bind::Head& H = head_for(m, M);
+    if (H.lm_head.on) P.add(l2pf::T_HEAD, H.lm_head.w, bind::gv_bytes(H.lm_head));
+}
+// layer i's queue: its weights in read order (l2pf::plan_layer); the MTP draft's also its eh_proj records first (this rank's
+// tiles under G6_MTP_SPLIT) and its head's last; the main model's last layer its head's under G6_L2PF bit 16 (W_H)
+inline l2pf::Plan l2pf_plan(Model& m, int i, int M)
+{
+    const Layer& y = m.layers[i];
+    l2pf::Plan P = l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv, y.ab.args.uks, y.ab.args.uvs);
+    if (l2pf_is_draft(m))
+    {
+        const bind::Head& H = head_for(m, M);
+        if (H.eh.on) P.add(l2pf::T_EH, H.eh.w, bind::gv_bytes(H.eh));
+        l2pf_add_head(m, M, P);
+    }
+    else if (i + 1 == m.nl && (l2pf::cfg().win >> l2pf::W_H & 1)) l2pf_add_head(m, M, P);
+    return P;
+}
 // G6_L2PF (kernels/l2pf.cuh): window w of layer i's prefetch queue, from target `from`, ending when collective c of f has
-// arrived (f = nullptr: the attention window, its budget only). Only between l2pf::arm and l2pf::join (launch_step).
+// arrived (f = nullptr: the attention window, its budget only). Only between l2pf::arm and l2pf::join (launch_step; the
+// MTP draft step with G6_MTP_L2PF, whose layer windows need its bit 1).
 inline void l2pf_window(Model& m, int w, int from, int i, int M, const g6::FabricDev* f, int c, size_t payload, cudaStream_t st)
 {
-    if (!l2pf::cfg().armed) return;
-    const Layer& y = m.layers[i];
+    const l2pf::Cfg& g = l2pf::cfg();
+    if (!g.armed || !(g.win >> w & 1)) return;
+    const bool draft = l2pf_is_draft(m);
+    if (draft && !(g.mtp & 1)) return;
     l2pf::Stop s;
     if (f) { s.f = *f; s.c = c; s.payload = payload; }
     s.stepp = m.stepp;
-    l2pf::window(w, from, i, l2pf::plan_layer(layer_for(m, i, M), y.ab.args.uk, y.ab.args.uv, y.ab.args.uks, y.ab.args.uvs), s, st);
+    l2pf::window(w, from, (draft ? L2PF_DRAFT_ID : 0) + i, l2pf_plan(m, i, M), s, st);
+}
+// G6_MTP_L2PF bit 2: in the head merge's wait (main step and draft step), the next draft step's front (l2pf::Cfg::front:
+// this rank's eh_proj records, then its x_in), budget G6_MTP_L2PF_US, ended by the head all-gather's arrival
+inline void l2pf_tail(Model& m, int M, cudaStream_t st)
+{
+    const l2pf::Cfg& g = l2pf::cfg();
+    if (!g.armed || !(g.mtp & 2) || !g.front_on) return;
+    l2pf::Stop s;
+    s.f = m.f; s.c = 2 * m.nl; s.stepp = m.stepp;
+    s.hrows = m.srow; s.htk = m.tk; s.hm = M; s.hnc = m.nc;        // as head_args: the merge waits for head_wait_bytes
+    l2pf::window_us(g.mtp_us, l2pf::T_EH, L2PF_TAIL_ID + (l2pf_is_draft(m) ? 1 : 0), g.front, s, st);
 }
 
 // G6_ATTN_POSIDX (attn.cu use_posidx, E1): layer i's attention call in this step takes the positional index (an indexer
@@ -1451,6 +1504,9 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     // G6_L2PF: this layer's router and shared expert (2i), the next layer's front (2i+1) while this rank waits
     if (c % 2 == 0) l2pf_window(m, l2pf::W_A, l2pf::T_ROUTER, c / 2, M, &m.f, c, (size_t)M * HID * 2, st);
     else if (c / 2 + 1 < m.nl) l2pf_window(m, l2pf::W_M, l2pf::T_XIN, c / 2 + 1, M, &m.f, c, (size_t)M * HID * 2, st);
+    // the last layer's MLP wait: the head's records (the MTP draft: its W_M under G6_MTP_L2PF 1; the main model: W_H)
+    else if (c / 2 + 1 == m.nl)
+        l2pf_window(m, l2pf_is_draft(m) ? l2pf::W_M : l2pf::W_H, l2pf::T_HEAD, c / 2, M, &m.f, c, (size_t)M * HID * 2, st);
     glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
     dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
@@ -1776,6 +1832,7 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
 }
 inline void launch_head_merge(Model& m, int M, cudaStream_t st)
 {
+    l2pf_tail(m, M, st);              // G6_MTP_L2PF 2 (a no-op unless armed)
     if (m.rs && m.nc > 0) glue::k_head_merge_tp_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
     else if (m.rs) glue::k_head_merge_rs<<<1, 32, 0, st>>>(head_args(m, M), m.tok);
     else if (m.nc > 0) glue::k_head_merge_tp<<<M, 1024, 0, st>>>(head_args(m, M));
@@ -2095,7 +2152,12 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
 #endif
         bind::launch(H.xf_eh, st);
         bind::launch(H.eh, st);
-        if (d.qs.eh) qs_put(d, d.qs.ceh, M, st);   // G6_MTP_SPLIT: every rank's eh_proj columns
+        if (d.qs.eh)
+        {
+            qs_put(d, d.qs.ceh, M, st);   // G6_MTP_SPLIT: every rank's eh_proj columns
+            // G6_MTP_L2PF 1: the gather's wait is layer 78's W_M (its queue from x_in)
+            l2pf_window(d, l2pf::W_M, l2pf::T_XIN, 0, M, &d.qs.g, d.qs.ceh, (size_t)M * d.qs.geo[d.qs.ceh].wmax * 2, st);
+        }
     }
     if (d.qs.eh) P.next();
     if (!P.on()) return;
@@ -2121,6 +2183,7 @@ inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStre
 #else
     if (const char* e = draft_shape_error(M, chain, false, 0)) die(e);
 #endif
+    l2pf::arm(true);                  // G6_MTP_L2PF (needs G6_L2PF): the windows below may fork; joined at the end
     launch_step_in(d, st);
     launch_draft_embed(D, M, chain, st);
     launch_attn_block(d, 0, M, context, st);
@@ -2131,6 +2194,28 @@ inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStre
     launch_head_merge(d, M, st);
     launch_step_out(d, M, st);
     launch_draft_keep(D, M, st);
+    l2pf::join(st);
+}
+// G6_MTP_L2PF bit 2: the draft's front for the head-merge tails (l2pf_tail), once at boot after prepare(D.d, 1) and before
+// any capture: this rank's eh_proj records (its tiles under G6_MTP_SPLIT), then layer 78's input GEMVs (x_in)
+inline void l2pf_set_front(Draft& D)
+{
+    Model& d = D.d;
+    l2pf::Plan P;
+    const bind::Head& H = head_for(d, 1);
+    if (H.eh.on) P.add(l2pf::T_EH, H.eh.w, bind::gv_bytes(H.eh));
+    const bind::Layer& b = G6RT_LAYER_BASE(d, 0, 1);
+    for (const bind::Gv* g : {&b.q_a, &b.kv_a, &b.idx_k, &b.idx_w})
+        if (g->on) P.add(l2pf::T_XIN, g->w, bind::gv_bytes(*g));
+    l2pf::Cfg& c = l2pf::cfg();
+    c.front = P;
+    c.front_on = true;
+    size_t n = 0;
+    for (int t = 0; t < l2pf::NTG; ++t)
+        for (int k = 0; k < 4; ++k) n += P.n[t][k];
+    if (d.rank == 0)
+        fprintf(stderr, "# rank 0: G6_MTP_L2PF=%d: head-merge tails prefetch the draft's front (%.1f MB: eh_proj %.1f, x_in), <= %.0f us\n",
+                c.mtp, n / 1e6, H.eh.on ? bind::gv_bytes(H.eh) / 1e6 : 0.0, c.mtp_us);
 }
 // StepIn of a draft step: rows at positions pos0.., next[r] = the token after row r, keyed to sample position + 2
 inline StepIn draft_inputs(u64 step, int M, int pos0, const int* next, float inv_temp, uint32_t seed, float top_p = 0.f)

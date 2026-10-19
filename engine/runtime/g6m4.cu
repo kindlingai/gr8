@@ -851,6 +851,29 @@ int main(int argc, char** argv)
 #endif
     G6RT_CK(bind::init());
     G6RT_CK(l2pf::init_env());     // G6_L2PF (kernels/l2pf.cuh); unset = off
+    // G6_MTP_L2PF=1|2|3 (kernels/l2pf.cuh; rank.cuh l2pf_window, l2pf_tail; default 0; needs G6_L2PF and --mtp): 1 = the MTP
+    // draft step arms the paced L2 prefetch (layer 78's windows, its eh_proj gather wait, its MLP wait: the draft head's
+    // records); 2 = the head merge wait of the main step and of each draft step prefetches the next draft step's front
+    // (this rank's eh_proj records, x_in), at most G6_MTP_L2PF_US (60) us, ended by the head all-gather's arrival. A
+    // prefetch writes nothing, so every output byte is unchanged; no collective is added (a window only reads the peers'
+    // tails), so the ranks need not agree on it (as G6_L2PF, not in the S2 runtime signature)
+    {
+        std::string le;
+        const int v = env_choice("G6_MTP_L2PF", 3, 0, &le);
+        if (v < 0) die(le);
+        if (v && !mtp) die("G6_MTP_L2PF needs --mtp");
+        if (v && !l2pf::cfg().win) die("G6_MTP_L2PF needs G6_L2PF (its side stream, pace and window bits)");
+        l2pf::cfg().mtp = v;
+        if (const char* u = getenv("G6_MTP_L2PF_US"))
+        {
+            char* end;
+            const double x = strtod(u, &end);
+            if (end == u || *end || !(x > 0) || x > 1000) die(std::string("G6_MTP_L2PF_US=") + u + ": want us, 0 < x <= 1000");
+            l2pf::cfg().mtp_us = (float)x;
+        }
+        if (v && R == 0) fprintf(stderr, "# rank 0: G6_MTP_L2PF=%d: %s%s\n", v, v & 1 ? "draft-step windows" : "",
+                                 v & 2 ? (v & 1 ? ", head-merge tails" : "head-merge tails") : "");
+    }
     pf_prof().on = getenv("G6_PF_PROF") != nullptr;
     if (getenv("G6_DEC_PROF") && graph) die("G6_DEC_PROF needs plain launches (no --graph)");
     cudaStream_t st;
@@ -1198,6 +1221,7 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
     if (mtp && MP) for (int M = 1; M <= MX; ++M) prepare(D.d, M, st);   // the draft prefill's MX-row chunks
 #endif
+    if (mtp && (l2pf::cfg().mtp & 2)) l2pf_set_front(D);   // before any capture: the head-merge tails read it
     G6RT_CK(cudaStreamSynchronize(st));
     boot("layers prepared");
     // Offline main-step dumps, compatible with m4sim after merging the rank logits.
