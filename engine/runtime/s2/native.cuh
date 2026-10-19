@@ -386,6 +386,7 @@ public:
     //   main : M in 1..chunk (prompt tails, class row_class(M)) U S*(k+1), S = 1..sessions, k = 1..K with G6_S2_ADAPT
     //          (else k = K), class row_class(K+1)                          -> two graphs (split A / B)
     //          U with G6_MTP_KSTOPB (kb) the shared rounds' widths s2::kstopb_widths, class row_class(K+1)
+    //          U with solo_kmax (KStop::solo, an MTP-only engine's G6_MTP_KSTOP=1) k+1, k = 1..solo_kmax, class row_class(k+1)
     //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
@@ -393,7 +394,7 @@ public:
     // cp_rows (G6_CP_STEP_ROWS, cp_rows.h; 0 = off): at a bucket whose steps run the CP block (s2_cp_bucket) no main step
     // is wider than cp_rows (Driver::step caps those rounds), so those widths are not captured; a launch of one would
     // fail as any uncaptured key does.
-    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}, int cp_rows = 0) {
+    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}, int cp_rows = 0, int solo_kmax = 0) {
         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
@@ -404,6 +405,7 @@ public:
         for (int S = 1; S <= N; ++S)
             for (int k = s2::adapt_env() ? 1 : K; k <= K; ++k) mains.insert({S * (k + 1), s2::row_class(K + 1)});
         for (int M : s2::kstopb_widths(kb, N, K)) mains.insert({M, s2::row_class(K + 1)});
+        for (int k = 1; k <= solo_kmax; ++k) mains.insert({k + 1, s2::row_class(k + 1)});   // s2_batch.h round_all, KStop::solo
         for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
         if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
         for (const auto& mc : mains) require(mc.first <= g6rt::MX, "main step rows exceed G6_MX");
