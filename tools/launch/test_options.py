@@ -261,6 +261,12 @@ class CanonicalTests(unittest.TestCase):
         # a knob set to its default, or one this TP does not read, changes nothing
         self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '310528', '--reuse', '1', '--g6args-x', '--top 5')[2])
 
+    def test_cp_onechain_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_CP_ONECHAIN', text)
+        _, text, _ = self.digest('--cp-onechain', '1')
+        self.assertIn(' G6_CP_ONECHAIN=1', text)
+
     def test_template_has_no_paths(self):
         _, text, _ = self.digest('--g6-home', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
         self.assertNotIn('/very/own/home', text)

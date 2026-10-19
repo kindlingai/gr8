@@ -124,6 +124,7 @@ KEYS = {
     'K1_SPLIT': ('cluster', None, 'MoE decode: fc1 shape / fc2 n-split per step row count, M:KS1xWG/NS2,... (G6_K1_SPLIT)'),
     'K1_TLBW': ('cluster', None, "MoE decode: fc1 prefetches the routed weights' translations at this granule, KB (G6_K1_TLBW)"),
     'L2PF': ('cluster', None, "decode: paced L2 prefetch of the next weights in the step's idle-DRAM windows, window mask (G6_L2PF)"),
+    'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

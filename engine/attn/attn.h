@@ -62,6 +62,13 @@ extern "C" int g6_attn_cp_index(const G6Attn*,const G6AttnStepCell* cell,void* s
 extern "C" int g6_attn_cp_merge_index(const G6Attn*,const G6AttnStepCell* cell,const uint64_t* cand_all,void* stream);
 // split-K partial of one head group over my score-owned keys of the merged list: unnormalized (m, l, c)
 extern "C" int g6_attn_cp_group(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* stream);
+// G6_CP_ONECHAIN: g6_attn_cp_group of G head groups of gh heads in ONE call (a->heads = G * gh): q / rope [M][G gh][512] /
+// [M][G gh][64] (group g's heads at g * gh), group g's partial into part + g * gblk floats (gblk >= M * gh * 514). The same bits
+// as G calls when g6_attn_cp_groups_ok(gh). buf: device, g6_attn_cp_groups_bytes(G * gh, M) bytes (its own scratch)
+extern "C" int g6_attn_cp_groups_ok(int gh);
+extern "C" size_t g6_attn_cp_groups_bytes(int heads,int rows);
+extern "C" int g6_attn_cp_groups(const G6Attn*,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,float* part,
+                                 int gh,int64_t gblk,void* stream);
 // LSE merge of part_all in shard order 0..cp_nr-1 -> context -> value_project -> a->output
 extern "C" int g6_attn_cp_finish(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* stream);
 // my absorbed query in the scratch workspace (valid after g6_attn_cp_front)
