@@ -302,6 +302,13 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--s2-sessions', p['args'])
         self.assertNotIn('--spec-adaptive', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
+        # --dflash 1: the drafter (its body replicated on every rank), adaptive draft count as at TP=4
+        o = opt.parse(['--no-config', '--peers', peers, '--dflash', '1'], {})
+        opt.validate(o)
+        p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
+        self.assertIn('/a/dflash.r2.manifest.json', p['args'])
+        self.assertIn('/a/dflash.r2.pack', p['args'])
+        self.assertIn('--spec-adaptive', p['args'])
         # PF_OWN=1 is the fallback: no QO pack
         o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], {})
         opt.validate(o)

@@ -379,17 +379,19 @@ class Release:
 
 
 class Drafter:
-    """The DFlash2 drafter at one commit, and this box's converted rank at TP=4:
+    """The DFlash2 drafter at one commit, and this box's converted rank at TP=4 or TP=6 (the replicated layout: every
+    rank's pack holds the whole drafter, tools/convert/dflash2.py):
 
         <cache>/hf/<org>--<repo>/<commit>/config.json, model.safetensors
-        <cache>/hf/<org>--<repo>/<commit>/tp4/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE (written last)
+        <cache>/hf/<org>--<repo>/<commit>/tp<TP>/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE (written last)
     """
 
-    def __init__(self, cache, repo, rev, refresh=False, log=print):
+    def __init__(self, cache, repo, rev, refresh=False, log=print, tp=4):
         self.repo = Repo(cache, repo, rev, refresh, log)
         self.log = log
+        self.tp = tp
         self.dir = os.path.join(self.repo.root, self.repo.commit)
-        self.out = os.path.join(self.dir, 'tp4')
+        self.out = os.path.join(self.dir, f'tp{tp}')
 
     @property
     def commit(self):
@@ -425,8 +427,8 @@ class Drafter:
         tmp = os.path.join(self.dir, f'tmp.rank{rank}.{os.getpid()}')
         shutil.rmtree(tmp, ignore_errors=True)
         os.makedirs(tmp)
-        self.log(f'converting the drafter {self} for rank {rank} of TP=4')
-        r = subprocess.run(convert + ['--src', self.dir, '--out', tmp, '--nr', '4', '--ranks', str(rank)], cwd=REPO,
+        self.log(f'converting the drafter {self} for rank {rank} of TP={self.tp}')
+        r = subprocess.run(convert + ['--src', self.dir, '--out', tmp, '--nr', str(self.tp), '--ranks', str(rank)], cwd=REPO,
                            capture_output=True, text=True)
         names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
         if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):

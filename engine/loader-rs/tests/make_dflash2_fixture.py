@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Writes tests/data/dflash2/: a small synthetic DFlash2 drafter (src/config.json + src/model.safetensors, hidden 64,
 2 layers) and what tools/convert/dflash2.py makes of it at TP=4: every rank's manifest and pack sha256 with the
-default MXFP8 records, and rank 2's with the attn and sel classes kept in BF16. tests/dflash2.rs converts the same
+default MXFP8 records, and rank 2's with the attn and sel classes kept in BF16; and at TP=6 (the replicated layout, the
+4 KV heads do not split six ways) ranks 0 and 5 with MXFP8 records. tests/dflash2.rs converts the same
 drafter with src/dflash2.rs and compares. The weights mix scales from 2**-20 to 2**10 per row and carry zero groups,
 -0.0, BF16 subnormals, values near the BF16 maximum and E4M3 rounding ties. Needs numpy. Run from the repo root:
 
@@ -94,11 +95,12 @@ def main():
     tmp = tempfile.mkdtemp()
     try:
         st = ST(os.path.join(OUT, 'src', 'model.safetensors'))
-        for sub, ranks, classes in (('mxfp8', range(NR), set()), ('bf16-attn-sel', [2], {'attn', 'sel'})):
+        for sub, nr, ranks, classes in (('mxfp8', NR, range(NR), set()), ('bf16-attn-sel', NR, [2], {'attn', 'sel'}),
+                                        ('mxfp8-tp6', 6, [0, 5], set())):
             os.makedirs(os.path.join(OUT, sub))
             sums = {}
             for r in ranks:
-                dflash2.convert_rank(st, cfg, NR, r, tmp, classes, False)
+                dflash2.convert_rank(st, cfg, nr, r, tmp, classes, False)
                 shutil.copy(os.path.join(tmp, f'dflash.r{r}.manifest.json'), os.path.join(OUT, sub))
                 with open(os.path.join(tmp, f'dflash.r{r}.pack'), 'rb') as f:
                     sums[f'dflash.r{r}.pack'] = hashlib.sha256(f.read()).hexdigest()

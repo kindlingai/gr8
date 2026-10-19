@@ -122,7 +122,7 @@ int main(int argc, char** argv)
         for (int p = 0; p < (query ? dfl::NPH : 2); ++p)
         {
             for (Dfl& x : D) dfl_phase(x, p, st, query);
-            if (p < dfl::NC && (query || p == 0))
+            if (dfl_delivered(p, query))
             {
                 DLoop a = loop;
                 a.c = p; a.n16 = (int)(dfl_payload(D[0], p) / 16);
@@ -138,9 +138,12 @@ int main(int argc, char** argv)
     std::vector<DflOut> o(NR);
     for (int r = 0; r < NR; ++r) G6RT_CK(cudaMemcpy(&o[r], out[r], sizeof(DflOut), cudaMemcpyDeviceToHost));
     for (int r = 1; r < NR; ++r)
-        if (memcmp(o[r].tok + 1, o[0].tok + 1, sizeof(int) * dfl::K)) die("ranks disagree on the drafts");
+        if (memcmp(o[r].tok + 1, o[0].tok + 1, sizeof(int) * dfl::K) || memcmp(o[r].lp + 1, o[0].lp + 1, sizeof(float) * dfl::K))
+            die("ranks disagree on the drafts or their log-probabilities");
     printf("drafts");
     for (int r = 1; r < dfl::B; ++r) printf(" %d", o[0].tok[r]);
+    printf("\nlp");                  // the bits, for a byte comparison between builds (TP4 vs the replicated TP6 body)
+    for (int r = 1; r < dfl::B; ++r) { uint32_t b; memcpy(&b, &o[0].lp[r], 4); printf(" %08x", b); }
     printf("\n");
     // outputs
     const std::string of = dir + "/out." + std::to_string(sel) + ".bin";
@@ -151,11 +154,12 @@ int main(int argc, char** argv)
     std::vector<float> xh((size_t)dfl::B * HID);
     G6RT_CK(cudaMemcpy(xh.data(), xf, xh.size() * 4, cudaMemcpyDeviceToHost));
     fwrite(xh.data(), 4, xh.size(), f);
-    // the ring at the last chunk's context positions: [L][k, v][NKV][rows][HD], the KV heads from their ranks
+    // the ring at the last chunk's context positions: [L][k, v][NKV][rows][HD], the KV heads from their ranks (REP: rank 0
+    // holds all eight)
     const int last = n - (nch - 1) * dfl::B, pos0 = p0 + (nch - 1) * dfl::B;
     std::vector<__half> ring((size_t)dfl::L * dfl::NKR * dfl::RING * dfl::HD);
     std::vector<float> kv((size_t)dfl::L * 2 * dfl::NKV * last * dfl::HD);
-    for (int r = 0; r < NR; ++r)
+    for (int r = 0; r < (dfl::REP ? 1 : NR); ++r)
         for (int w = 0; w < 2; ++w)
         {
             G6RT_CK(cudaMemcpy(ring.data(), w ? D[r].vring : D[r].kring, ring.size() * 2, cudaMemcpyDeviceToHost));

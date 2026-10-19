@@ -83,7 +83,7 @@ static void run_var(Var& v, bool query, cudaStream_t st)
     for (int p = 0; p < (query ? dfl::NPH : 2); ++p)
     {
         for (Dfl& x : v.D) dfl_phase(x, p, st, query);
-        if (p < dfl::NC && (query || p == 0))
+        if (dfl_delivered(p, query))
         {
             DLoop a = v.loop;
             a.c = p; a.n16 = (int)(dfl_payload(v.D[0], p) / 16);
@@ -99,7 +99,8 @@ static DflOut out_of(Var& v, const char* name)
     std::vector<DflOut> o(NR);
     for (int r = 0; r < NR; ++r) G6RT_CK(cudaMemcpy(&o[r], v.out[r], sizeof(DflOut), cudaMemcpyDeviceToHost));
     for (int r = 1; r < NR; ++r)
-        if (memcmp(o[r].tok + 1, o[0].tok + 1, sizeof(int) * dfl::K)) die(std::string(name) + ": ranks disagree on the drafts");
+        if (memcmp(o[r].tok + 1, o[0].tok + 1, sizeof(int) * dfl::K) || memcmp(o[r].lp + 1, o[0].lp + 1, sizeof(float) * dfl::K))
+            die(std::string(name) + ": ranks disagree on the drafts or their log-probabilities");
     return o[0];
 }
 // rank 0's body GEMVs of one draft step, captured, timed over n replays -> ms per step
@@ -113,8 +114,12 @@ static double bench_var(Var& v, int n, cudaStream_t st)
     for (const DLayer& y : D.ly) bind::launch(y.kvc, st);
     for (const DLayer& y : D.ly)
     {
-        bind::launch(y.ac, st); bind::launch(y.q, st); bind::launch(y.kv, st); bind::launch(y.o, st);
-        bind::launch(y.mc, st); bind::launch(y.gu, st); bind::launch(y.down, st);
+        bind::launch(y.ac, st); bind::launch(y.q, st); bind::launch(y.kv, st);
+        if constexpr (dfl::REP) for (int k = 0; k < dfl::KS; ++k) bind::launch(y.ok[k], st);
+        else bind::launch(y.o, st);
+        bind::launch(y.mc, st); bind::launch(y.gu, st);
+        if constexpr (dfl::REP) for (int k = 0; k < dfl::KS; ++k) bind::launch(y.dk[k], st);
+        else bind::launch(y.down, st);
     }
     G6RT_CK(cudaStreamEndCapture(st, &g));
     G6RT_CK(cudaGraphInstantiate(&ge, g, 0));
@@ -340,6 +345,9 @@ int main(int argc, char** argv)
             s += bind::gv_bytes(D.fc);
             for (const DLayer& y : D.ly) s += bind::gv_bytes(y.kvc) + bind::gv_bytes(y.ac) + bind::gv_bytes(y.q) + bind::gv_bytes(y.kv) +
                                               bind::gv_bytes(y.o) + bind::gv_bytes(y.mc) + bind::gv_bytes(y.gu) + bind::gv_bytes(y.down);
+            if constexpr (dfl::REP)
+                for (const DLayer& y : D.ly)
+                    for (int k = 0; k < dfl::KS; ++k) s += bind::gv_bytes(y.ok[k]) + bind::gv_bytes(y.dk[k]);
         };
         add(ba, A.D[0]);
         add(bb, B.D[0]);
