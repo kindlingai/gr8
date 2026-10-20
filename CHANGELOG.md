@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-20: remote attention rows
+
+- `--kv-rows STORE,size=N` (experimental, off by default) puts each rank's attention rows past `SHARE_LIMIT` in a rows
+  store, a KV node (`remote:auto`) or memory, as their pages fill. After each indexer selection the rows it picked are
+  fetched into resident slots, under the candidate merge, so decode reads them as if they were local.
+- `local=PAGES` releases a page once its rows are in the store: a session's tail cycles through that many local pages a
+  rank, and the S2 pool gives the MTP drafter its own tail pages so none is ever released under it. A prefill chunk
+  reads the released pages it needs from the store. A session with released pages is not retained for prefix reuse;
+  block stores (`--kv-store`) copy at most its first `SHARE_LIMIT` tokens.
+- `place=PAGES` caps the main model's KV pages a rank, so `--cap` may pass the context they would hold. `size=` is the
+  per-rank lease, and a session waits until its tail fits it. `fmt=int4` stores 416 B rows for 656.
+- On the TP=4 cluster: a 41,399-token request with 40 local pages a rank finished in 39 s with the same output as
+  without release; 35 pages were released and at most 32 of the 40 were in use.
+
 ## 2026-10-20: each KV store can keep its own kind (`keep=`)
 
 - `--kv-store STORE,size=N,keep=system|sessions|all` sets what that store keeps; a store without `keep=` takes

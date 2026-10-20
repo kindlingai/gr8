@@ -101,6 +101,24 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ G6_IDX_GRP=$IDX_GRP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ G6_ATTN_QT=$ATTN_QT}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ G6_ATTN_FRONT=$ATTN_FRONT}"
+  # KV_ROWS (remote attention rows): STORE,size=N(M|G|T)[,local=P][,pool=S][,place=P][,fmt=F] -> the engine's G6_RT_*
+  # (docs/SETTINGS.md). size is each rank's lease in bytes; options.py has checked the form
+  if [ -n "${KV_ROWS:-}" ] && [ "$KV_ROWS" != off ]; then
+    local f n u parts IFS=','
+    read -ra parts <<< "$KV_ROWS"
+    unset IFS
+    ENGINE_ENV="$ENGINE_ENV G6_RT_STORE=${parts[0]}"
+    for f in "${parts[@]:1}"; do
+      case $f in
+        size=*) n=${f#size=}; u=${n: -1}; n=${n%?}
+                ENGINE_ENV="$ENGINE_ENV G6_RT_SIZE=$(awk -v n="$n" -v u="$u" 'BEGIN { e = u == "M" ? 20 : u == "G" ? 30 : 40; printf "%.0f", n * 2 ^ e }')";;
+        local=*) ENGINE_ENV="$ENGINE_ENV G6_RT_LOCAL=${f#local=}";;
+        pool=*) ENGINE_ENV="$ENGINE_ENV G6_RT_POOL=${f#pool=}";;
+        place=*) ENGINE_ENV="$ENGINE_ENV G6_RT_PLACE=${f#place=}";;
+        fmt=*) ENGINE_ENV="$ENGINE_ENV G6_RT_FMT=${f#fmt=}";;
+      esac
+    done
+  fi
   return 0
 }
 

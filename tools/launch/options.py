@@ -81,6 +81,11 @@ KEYS = {
                                  '(every eviction). Default system'),
     'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
     'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
+    'KV_ROWS': ('cluster', None, 'experimental: remote attention rows: the rows past SHARE_LIMIT in a rows store, read back '
+                                 'as decode selects them. STORE,size=N(M|G|T)[,local=PAGES][,pool=SLOTS][,place=PAGES]'
+                                 '[,fmt=fp8|int4]. STORE: remote:auto (the KV node from the mentat group), remote:HOST:PORT '
+                                 'or mem:. size: each rank\'s lease. local: release, a session\'s tail cycles through that '
+                                 'many local pages a rank (G6_RT_*, docs/SETTINGS.md)'),
     'KV_TIER': ('cluster', None, 'deprecated: KV_STORE with keep=evicted|shared|all per tier (any evicted or all maps to '
                                  'KV_KEEP=all, else system)'),
     'KV_SHARED_AFTER': ('cluster', None, 'deprecated: KV_SYSTEM_AFTER'),
@@ -391,6 +396,11 @@ def validate(o):
             raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
+    rows = kv_rows(o)
+    if rows and rows['host'] == 'auto' and mode(o) == 'peers':
+        raise OptionError('--kv-rows remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
+    if rows and rows['fmt'] == 'int4' and o.get('KV_FORMAT') == 'int4':
+        raise OptionError('--kv-rows fmt=int4: the int4 KV build\'s rows are INT4 already')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
@@ -460,6 +470,46 @@ def kv_stores(o):
     return out
 
 
+def kv_rows(o):
+    """KV_ROWS parsed: {'text', 'store', 'kind': 'remote' | 'mem', 'host', 'port', 'size', 'local', 'pool', 'place',
+    'fmt'}, or None when unset or off. Raises OptionError naming the bad part."""
+    v = o.get('KV_ROWS')
+    if v in (None, 'off'):
+        return None
+    text = v.strip()
+    store, *kvs = text.split(',')
+    m = re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', store)
+    if store != 'mem:' and (not m or (m.group(1) == 'auto' and m.group(2))):
+        raise OptionError(f'--kv-rows {text}: the store is remote:auto, remote:HOST:PORT or mem:')
+    t = {'text': text, 'store': store, 'kind': 'mem' if store == 'mem:' else 'remote', 'host': m.group(1) if m else None,
+         'port': m.group(2) if m else None, 'size': None, 'local': None, 'pool': None, 'place': None, 'fmt': None}
+    for kv in kvs:
+        k, _, x = kv.partition('=')
+        if k == 'size' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
+            t['size'] = x
+        elif k in ('local', 'pool', 'place') and x.isdigit() and int(x) > 0:
+            t[k] = int(x)
+        elif k == 'fmt' and x in ('fp8', 'int4'):
+            t['fmt'] = x
+        else:
+            raise OptionError(f'--kv-rows {text}: {kv}: want size=N(M|G|T), local=PAGES, pool=SLOTS, place=PAGES or fmt=fp8|int4')
+    if not t['size']:
+        raise OptionError(f'--kv-rows {text}: size=N(M|G|T) is needed (each rank\'s lease)')
+    if t['place'] and not t['local']:
+        raise OptionError(f'--kv-rows {text}: place= needs local= (the pages past it are reached through the rows store only)')
+    if t['kind'] == 'remote' and t['host'] != 'auto' and not t['port']:
+        raise OptionError(f'--kv-rows {text}: remote:HOST:PORT names the port')
+    return t
+
+
+def kv_rows_with(o, target):
+    """KV_ROWS with remote:auto replaced by the KV node host:port this box uses (None: as written)."""
+    t = kv_rows(o)
+    if not t or t['host'] != 'auto' or not target:
+        return t and t['text']
+    return t['text'].replace('remote:auto', f'remote:{target}', 1)
+
+
 def split_list(v):
     return [x for x in re.split(r'[,\s]+', v or '') if x]
 
@@ -483,10 +533,10 @@ def resolve_peers(o):
 
 # ---- the engine plan: scripts/engine_args.sh, so the ssh launchers and the supervisor start the same engine ---------
 def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
-                kv_store=None):
+                kv_store=None, kv_rows=None):
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
-    The defaults give the canonical template, with every per-box value as a placeholder. kv_store: this box's KV_STORE
-    with the KV node resolved (remote:GB names none)."""
+    The defaults give the canonical template, with every per-box value as a placeholder. kv_store, kv_rows: this box's
+    KV_STORE and KV_ROWS with the KV node resolved (remote:GB names none)."""
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'TP': o.get('TP'), 'SET_ID': set_id}
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
@@ -499,6 +549,8 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
         env['STEERING_CHAT_TEMPLATE'] = '@STEERING_CHAT_TEMPLATE'
     if kv_store:
         env['KV_STORE'] = kv_store
+    if kv_rows:
+        env['KV_ROWS'] = kv_rows
     if rank == '@R':   # the template: v2 paths are per box
         for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE'):
             if env.get(k):

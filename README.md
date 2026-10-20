@@ -178,6 +178,12 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 
 ### Options worth knowing
 
+![KV tiers](docs/kv-tiers.svg)
+
+The first `SHARE_LIMIT` tokens of a session are on every rank and later pages are spread across the ranks; below that
+pool, block stores keep evicted prefixes. With `--kv-rows` the rows past `SHARE_LIMIT` can also live in a rows store,
+read back as decode selects them.
+
 - `--cap` is the KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory.
 - `--sess` is how many requests decode at once (1-8). Each one adds step graphs: about 2.5 GiB at 8.
 - `--reuse 0` turns prefix reuse off.
@@ -185,6 +191,9 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
   blocks below the KV pool, so a request whose prefix the pool let go reads it back instead of prefilling it. An SSD
   store starts empty at every boot unless it has `persist=on`
   ([engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md)).
+- `--kv-rows STORE,size=N` (experimental, off by default) keeps the attention rows past `SHARE_LIMIT` in a rows store
+  and fetches the rows each decode step selects; with `local=PAGES` a long session's tail no longer needs local KV
+  pages ([KNOBS.md](KNOBS.md)).
 - `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 513,536 against
   408,832) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
