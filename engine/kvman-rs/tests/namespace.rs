@@ -260,3 +260,34 @@ fn keep_sessions_stores_a_continued_non_stock_run_and_refuses_a_one_turn_one() {
     assert_eq!(e[0].namespace, namespace(1));
     assert!(e[0].hits >= 1);
 }
+
+#[test]
+fn the_write_limit_earns_the_same_credit_for_a_steered_prompt() {
+    use g6kvman::stash::Keep;
+    let first: Vec<i32> = (0..192).collect();
+    let other: Vec<i32> = (1000..1192).collect();
+    let credit = |ns: Namespace| {
+        let mut p = pool();
+        p.stores(2);
+        p.add_tier(16, Keep::All, None).unwrap();
+        p.write_limit(500);
+        // a spill charges the credit below its cap, so what the next grant earns shows
+        p.count(&first, None);
+        let r = p.reserve(192, 256).unwrap();
+        p.retain(&r, finished(&first)).unwrap();
+        p.count(&other, None);
+        let all = p.reserve(512, 512).unwrap();
+        p.io();
+        p.io_done().unwrap();
+        p.release(&all).unwrap();
+        let before = p.stash().unwrap().stats(0).unwrap().credit;
+        p.count_namespaced(&other, None, ns);
+        // a grant past its prompt (decode room): only the prompt's pages are computed by the prefill
+        let r = p.reserve(448, 512).unwrap();
+        p.release(&r).unwrap();
+        (before, p.stash().unwrap().stats(0).unwrap().credit)
+    };
+    let (stock, steered) = (credit(STOCK_NAMESPACE), credit(namespace(1)));
+    assert!(stock.1 > stock.0, "{stock:?}: the grant earned below the cap");
+    assert_eq!(stock, steered);
+}
