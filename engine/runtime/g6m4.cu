@@ -93,6 +93,7 @@
 #include "s2/cp_rows.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
+#include "s2/kv_share.h"
 #include "host_reclaim.h"
 #include <filesystem>
 #include <fstream>
@@ -1087,7 +1088,10 @@ int main(int argc, char** argv)
                         spec = "ssd:" + dir + "/blocks";
                         if (t.persist && !set_id.empty()) index = dir;
                     }
-                    const uint64_t slots = kvt->add(spec, name + "-t" + std::to_string(i), t.bytes);
+                    // group=: a lease that shares its node with other clusters (s2/kv_share.h); it starts at size=
+                    const uint64_t slots = t.group.empty() ? kvt->add(spec, name + "-t" + std::to_string(i), t.bytes)
+                                                           : kvt->add_group(spec, name + "-t" + std::to_string(i), t.group, (uint32_t)g6nr::NR,
+                                                                            (uint32_t)R, t.bytes, t.cap, t.weight);
                     // what makes stored blocks this engine's: the model, the layout, the block format, and the engine binary
                     // itself (another build may compute other KV bits); an index with another line starts empty
                     static const std::string exe = g6s2::exe_stamp();
@@ -1356,6 +1360,34 @@ int main(int argc, char** argv)
             h.retire = [&](const g6s2::Slot& old) { nd.retire(old); };
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
+            // a tier on a group lease (--kv-store group=): every rank resizes it at the Resize commit; the head reports
+            // to the node, asking for 2 segments more a rank when the tier filled since its last report (as
+            // kvman-share-bench does), and announces what the node grants or asks back
+            std::vector<uint32_t> kv_groups;
+            for (size_t i = 0; kvt && i < kvt->size(); ++i) if (kvt->group(i)) kv_groups.push_back((uint32_t)i);
+            std::vector<uint64_t> kv_full_seen(kv_groups.size(), 0);
+            size_t kv_next_group = 0;
+            if (!kv_groups.empty())
+            {
+                h.resize = [&](const g6s2::Resize& r) {
+                    if (!g6s2::share_apply(pool, kvt->store(r.tier), r, kv_drain))
+                        fprintf(stderr, "# rank %d: s2 share: tier %u refused to shrink to %llu blocks, the lease keeps its size\n", R, r.tier,
+                                (unsigned long long)r.slots);
+                    else
+                        fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
+                                (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
+                };
+                if (R == 0)
+                    h.share = [&]() -> std::optional<g6s2::Resize> {
+                        // one group tier a report, in turn: one Resize in flight at a time
+                        const size_t k = kv_next_group++ % kv_groups.size();
+                        const uint32_t t = kv_groups[k];
+                        const uint64_t full = pool.tiers().at(t).full;
+                        const uint64_t want = full > kv_full_seen[k] ? 2 : 0;
+                        kv_full_seen[k] = full;
+                        return g6s2::share_poll(pool, t, kvt->store(t), want);
+                    };
+            }
             h.dispatch = nd.hooks();
             if (dfl)
             {
