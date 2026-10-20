@@ -1463,6 +1463,11 @@ int main(int argc, char** argv)
                     if (rtt->hold)
                         fprintf(stderr, "# rank %d: G6_RT_CHECK: %llu released group pages read back, %llu differed\n", R,
                                 (unsigned long long)rtt->readback, (unsigned long long)rtt->readback_bad);
+                    if (rtt->hold && rtt->stage_ck.rows)
+                    {
+                        rt_check_print(("staged prefill rows, rank " + std::to_string(R)).c_str(), rtt->stage_ck);
+                        fprintf(stderr, "# rank %d: G6_RT_CHECK: %llu staged pages under 10 dB or with a rope byte off\n", R, (unsigned long long)rtt->stage_bad);
+                    }
                     rt_end(*rtt, q, st);
                     if (rt_layers == q) rt_layers = -1;
                 }

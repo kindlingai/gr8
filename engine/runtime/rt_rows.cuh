@@ -35,6 +35,7 @@
 #include <cuda_fp8.h>
 #include <cfloat>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -85,6 +86,11 @@ struct RtTier
     uint64_t released = 0;
     bool hold = false;                // release with G6_RT_CHECK=1: rt_check after every change (one holder per record)
     uint64_t readback = 0, readback_bad = 0;   // with hold: released pages' records read back after the write, and how many differed
+    // with hold: each released id's FP8 rows of every main layer as they were ([layer][64][g6kv::ROW]), and how the rows a
+    // prefill staged from the store compare with them (fp8 records: exact; int4: about 20 dB, the rope exact)
+    std::map<int, std::vector<uint8_t>> orig;
+    Check stage_ck;
+    uint64_t stage_bad = 0;           // staged pages under 10 dB or with a rope byte off
     uint8_t* stage = nullptr;         // pinned: one layer's rows of the released pages a prefill gathers
     size_t stage_bytes = 0;
     ~RtTier() { if (store) g6kv_rows_free(store); }
@@ -236,7 +242,7 @@ inline void rt_end(RtTier& t, int q, cudaStream_t st)
     for (int v = 0; v < t.V; ++v)
         if (t.vslot[v] == q) ids.push_back(t.pages + v);
     rt_drop(t, ids, st);
-    for (int k : ids) { const int v = k - t.pages; t.vlp[v] = t.vslot[v] = -1; t.vfree.push_back(v); }
+    for (int k : ids) { const int v = k - t.pages; t.vlp[v] = t.vslot[v] = -1; t.vfree.push_back(v); t.orig.erase(v); }
     s = RtTier::Seq{};
     rt_check(t, "end");
 }
@@ -378,6 +384,14 @@ inline RtSpillSeen rt_spill(Model& m, RtTier& t, const std::vector<int>& map, in
 // one released page's records: page p of every layer of each group -> the records of id v
 inline void rt_write_page(Model& m, RtTier& t, int p, int v, std::vector<uint8_t>& buf, cudaStream_t st)
 {
+    if (t.hold)   // G6_RT_CHECK: the rows as they were, to hold a staged prefill's rows against
+    {
+        std::vector<uint8_t>& o = t.orig[v];
+        o.resize((size_t)m.nl * 64 * g6kv::ROW);
+        for (int i = 0; i < m.nl; ++i)
+            G6RT_CK(cudaMemcpy(o.data() + (size_t)i * 64 * g6kv::ROW, (const uint8_t*)m.layers[i].ab.args.mla_cache + (size_t)p * 64 * g6kv::ROW,
+                               64 * g6kv::ROW, cudaMemcpyDeviceToHost));
+    }
     for (RtTier::Group& G : t.g)
     {
         const size_t rec = G.h.rec;
@@ -486,6 +500,24 @@ inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<st
                 G6RT_CK(cudaMemcpyAsync(pool + ixoff + (size_t)lp * 64 * g6kv::IDX_ROW, G.ix + (size_t)ids[n] * 64 * g6kv::IDX_ROW,
                                         64 * g6kv::IDX_ROW, cudaMemcpyDeviceToDevice, st));
             }
+        }
+    if (!t.hold) return;
+    // G6_RT_CHECK: every staged page of this layer against the rows it was released with
+    G6RT_CK(cudaStreamSynchronize(st));
+    std::vector<uint8_t> got(64 * g6kv::ROW);
+    for (const auto& [pool, ixoff] : pools)
+        for (int v : ids)
+        {
+            const auto it = t.orig.find(v);
+            if (it == t.orig.end()) continue;
+            G6RT_CK(cudaMemcpy(got.data(), pool + (size_t)t.vlp[v] * 64 * g6kv::ROW, got.size(), cudaMemcpyDeviceToHost));
+            RtTier::Check c;
+            rt_cmp(it->second.data() + (size_t)i * 64 * g6kv::ROW, got.data(), 64, c);
+            t.stage_ck.sig += c.sig; t.stage_ck.err += c.err; t.stage_ck.rows += c.rows; t.stage_ck.rope_bad += c.rope_bad;
+            const double db = 10 * log10(c.sig / std::max(c.err, 1e-300));
+            if ((db < 10 || c.rope_bad) && t.stage_bad++ < 8)
+                fprintf(stderr, "# rank %d: G6_RT_CHECK staged layer %d page %d (id %d, start %d): latent %.2f dB, rope differs in %llu of 64 rows\n",
+                        t.rank, i, t.vlp[v], v, start, db, (unsigned long long)c.rope_bad);
         }
 }
 

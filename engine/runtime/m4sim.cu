@@ -2043,6 +2043,12 @@ int main(int argc, char** argv)
         for (int r = 0; r < NR; ++r)
             fprintf(stderr, "# G6_RT_CHECK rank %d: every record had one holder after every change; %llu group pages read back, %llu differed\n", r,
                     (unsigned long long)rt[r]->readback, (unsigned long long)rt[r]->readback_bad);
+    for (int r = 0; r < NR && rt[0]; ++r)
+        if (rt[r]->hold && rt[r]->stage_ck.rows)
+        {
+            rt_check_print(("staged prefill rows, rank " + std::to_string(r)).c_str(), rt[r]->stage_ck);
+            fprintf(stderr, "# G6_RT_CHECK rank %d: %llu staged pages under 10 dB or with a rope byte off\n", r, (unsigned long long)rt[r]->stage_bad);
+        }
     if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);
