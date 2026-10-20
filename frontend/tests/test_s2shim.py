@@ -612,3 +612,16 @@ class SlowBoot(S2Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SlowPrefill(S2Base):
+    """A prefill longer than the shim's stall timeout: the engine's "f" lines keep the request alive."""
+    FAKE = ('--prefill-ms', '1500', '--progress-ms', '100')
+    SHIM = ('--stall-timeout', '0.5')
+
+    async def test_progress_lines_keep_a_long_prefill_alive(self):
+        c = await self.client()
+        c.send(gen('long', [5, 6, 7], max_tokens=10))
+        ids, fin, _ = await c.wait('long')
+        self.assertEqual((fin['reason'], ids), ('length', self.expect([5, 6, 7], 10)))
+

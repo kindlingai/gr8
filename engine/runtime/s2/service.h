@@ -373,7 +373,10 @@ public:
             if (c_.rank && old.phase != Phase::Retiring) retire_run(old);   // a cancelled live session (finished ones: below)
             native_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
         };
-        h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) { dispatch_.prefill(s,p,first,rows); };
+        h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) {
+            dispatch_.prefill(s,p,first,rows);
+            sessions_.progress(s.key,first + rows);   // rank 0: a long prefill tells the front end it is alive
+        };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
         h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };

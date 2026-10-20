@@ -262,6 +262,7 @@ class Req:
         self.t_first = None      # its first tokens line
         self.t_tok = None        # its latest tokens line
         self.reused = None       # prompt rows the engine took from its prefix reuse: the "a" line's last field, if it has one
+        self.prefilled = 0       # the engine's last "f" line: prompt rows prefilled so far
 
 
 class Shim:
@@ -521,6 +522,8 @@ class Shim:
                 c = self.c
                 c['cached'] = (c['cached'] or 0) + r.reused
                 c['pc_queries'] += len(r.f['prompt'])
+        elif w[0] == 'f':   # prompt rows prefilled so far: life during a long prefill (pump stamps r.last), no text
+            r.prefilled = int(w[1])
         elif w[0] == 'l':
             r.lps.append(lp_entry(w[1:]))
         elif w[0] == 'p':

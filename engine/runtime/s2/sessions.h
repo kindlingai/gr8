@@ -130,6 +130,13 @@ public:
             s.emitter.push_prompt(pos0 + r + 1, logprob(r, true, s.sampling.plp));
         output_ok(s.emitter);
     }
+    // after a prefill quantum: "f <rows>", the prompt rows prefilled so far (the front end takes it as life, not text)
+    void progress(Key k, uint32_t rows) {
+        auto& s = get(k);
+        if (!s.emitter.f) return;
+        fprintf(s.emitter.f, "f %u\n", rows);
+        require(!fflush(s.emitter.f), "S2 progress output failed"); output_ok(s.emitter);
+    }
     // row: the row of ids[0] in the last main step
     Emission emit(Key k, const int* ids, int count, int row, const Logprob& logprob) {
         auto& s = get(k); require(!s.ended && count > 0, "emit after terminal/empty emission");
