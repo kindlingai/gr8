@@ -513,12 +513,21 @@ def kv_stores(o):
                 if t['kind'] != 'ssd' and x == 'on':
                     raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
                 t['persist'] = x == 'on'
+            elif k == 'group' and re.fullmatch(r'[A-Za-z0-9_.-]+', x):   # B3 shared node: g6m4 parses it
+                if t['kind'] != 'remote':
+                    raise OptionError(f'--kv-store {text}: group= is for remote: stores')
+                t['group'] = x
+            elif k == 'cap' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
+                t['cap'] = x
+            elif k == 'weight' and re.fullmatch(r'\d+', x) and 1 <= int(x) <= 1000000:
+                t['weight'] = int(x)
             elif k == 'keep':
                 if x not in ('system', 'sessions', 'all'):
                     raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
                 t['keep'] = x
             else:
-                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off or keep=RULE')
+                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off, keep=RULE, '
+                                  'or group=NAME[,cap=N(M|G|T)][,weight=N] on remote:')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
         out.append(t)
