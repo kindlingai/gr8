@@ -52,6 +52,10 @@ extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_row
 // ext_scratch / ext_bytes as g6_attn_bind_create_ext (nullptr, 0 = own scratch).
 extern "C" int g6_attn_bind_create_cp(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,
     int max_rows, int query_tile, int cp_R, int cp_nr, void* stream, void* ext_scratch, size_t ext_bytes);
+// cp_phys > 0: at most cp_phys physical pages (>= cp_R / 64); this rank's tail pages past them have -1 in the table as
+// built, and the driver maps them (remote rows release, runtime/rt_rows.cuh). 0 = every tail page, as above.
+extern "C" int g6_attn_bind_create_cp_phys(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,
+    int max_rows, int query_tile, int cp_R, int cp_nr, int cp_phys, void* stream, void* ext_scratch, size_t ext_bytes);
 #endif
 // Validate step, populate args and clear only its error word; preserve KV history.
 // Full-index layers may also reuse (MTP later iterations). Shared layers MUST reuse.

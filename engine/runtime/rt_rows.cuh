@@ -9,22 +9,32 @@
 // the tier. Only the main model's CP bindings carry the flags: the MTP layer, the DFlash2 drafter and the staged
 // prefill views never read the slots.
 //
+// Release (local > 0, G6_RT_LOCAL): each session's tail pages past L on this rank come from its window of `local`
+// physical pages, taken as rows reach them (ensure) and given back once spilled (release). In g6m4 the S2 pool grants
+// the window with the run (kvman-rs Pool::window) and the drafter's tail apart from it (s2_cp_map). A released logical page's table entry
+// becomes page_count + v, where v (0..V-1) names its records in the store; its rows read only from the slots (attention
+// error 0x40000 when one has none), its index keys move to the group's arena (G6Attn::rt_ix), and a prefill gathers it
+// from the store (rt_pf_stage). The pool then holds the pages between R and L, plus the tail pages not yet whole: a
+// context past L needs `local` >= the pages a prefill chunk or step spans per rank, plus one.
+//
 // Store layout, one store per rank: the layout header (G6KV_ROWS_HEADER bytes), then group after group in layer order,
-// one record per physical row (page * 64 + pos % 64) of this rank's attention cache. A record is the row of every layer
-// of the group, in layer order, g6kv::ROW bytes each. A group is a full-index layer and the shared-index layers that
-// reuse its list.
+// one record per row (page * 64 + pos % 64: the physical page, or under release the released id v) of this rank's
+// attention cache. A record is the row of every layer of the group, in layer order, g6kv::ROW bytes each. A group is a
+// full-index layer and the shared-index layers that reuse its list.
 //
 // G6_RT_FMT=int4 (int4 here): a record holds each row in the INT4 layout (kvfmt.h int4row, 416 B for 656), so a lease
 // holds 0.63x the bytes and a fetch moves 0.63x; the pages and the slots stay FP8, so no attention kernel changes. The
 // spill packs each page's rows on the GPU (attn.cu g6_rt_pack_int4); the helper reads records into a stage at the
 // slot's place, and after the wait rt_unpack (attn/rt.cuh) requantizes them into the slot as append_kv's FP8 path
 // would. The rope key goes through exactly. check (G6_RT_CHECK=1): a round trip of random rows at build, and of every
-// spilled row, against the FP8 rows (latent SQNR, rope bytes), printed by rt_check_print.
+// spilled row, against the FP8 rows (latent SQNR, rope bytes), printed by rt_check_print. A released page's records
+// are packed the same way, and a prefill turns them back into FP8 rows on the GPU (rt_pf_stage).
 #pragma once
 #include "rank.cuh"
 #include "../kvman-rs/g6kvman.h"
 #include <cuda_fp8.h>
 #include <cfloat>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -42,17 +52,40 @@ struct RtTier
         uint8_t* stage = nullptr;     // int4: mapped pinned [slots][rec], what the helper reads into
         void* req = nullptr;          // mapped pinned ring
         uint64_t* done = nullptr;     // mapped pinned
+        uint8_t* ix = nullptr;        // release: [V] pages of the full-index layer's index keys (device)
     };
     int L = 0, S = 0, nr = 0, rank = 0, pages = 0;
+    int V = 0, local = 0;             // release: ids for released pages, window pages per session (0 = no release)
     bool poison = false, int4 = false, check = false;
     uint8_t *pack = nullptr, *back = nullptr;   // int4: device [64][rec] for the spill; check: [64][rec of FP8] back
     struct Check { double sig = 0, err = 0; uint64_t rows = 0, rope_bad = 0; } spill_ck;
     g6kv_rows* store = nullptr;
     std::vector<Group> g;
-    uint8_t* d_flag = nullptr;        // [pages] device: the page is in the store
-    std::vector<int> owner;           // [pages] the session slot whose spill flagged it, -1 = not flagged
-    int* d_list = nullptr;            // [pages] device scratch: the pages a drop clears
+    std::vector<std::pair<int, int>> at;   // [layer] its group and place in it
+    uint8_t* d_flag = nullptr;        // [pages + V] device: the page is in the store
+    std::vector<int> owner;           // [pages + V] the session slot whose spill flagged it, -1 = not flagged
+    int* d_list = nullptr;            // [pages + V] device scratch: the pages a drop clears
     uint64_t spilled = 0, dropped = 0;
+    // release only, per session slot: its run's list (to find it from its CP map), its tail entries (logical page past
+    // L this rank holds -> its local page, page_count + id, or -1), its window's free pages, local pages in use now and
+    // at most, pages released. `write` puts slot q's tables, with its tail entries, where attention reads them (the
+    // driver: the layers' tables, the S2 slot table, or both).
+    struct Seq
+    {
+        bool on = false;
+        std::vector<int> list, tail, pfree;
+        int window = 0, in_use = 0, peak = 0;
+        uint64_t released = 0;
+    };
+    Seq seq[8];
+    std::function<void(int q)> write;
+    int tsize = 0;                    // the table entries (logical pages) of a binding
+    std::vector<int> vfree, vlp, vslot;   // free ids; each id's logical page and slot (-1 = free)
+    int peak = 0;                     // the most local tail pages of one session at once, over all sessions
+    uint64_t released = 0;
+    bool hold = false;                // release with G6_RT_CHECK=1: rt_check after every change (one holder per record)
+    uint8_t* stage = nullptr;         // pinned: one layer's rows of the released pages a prefill gathers
+    size_t stage_bytes = 0;
     ~RtTier() { if (store) g6kv_rows_free(store); }
 };
 
@@ -137,7 +170,7 @@ inline void rt_drop(RtTier& t, const std::vector<int>& list, cudaStream_t st)
 {
     std::vector<int> v;
     for (int p : list)
-        if (p >= 0 && p < t.pages && t.owner[p] >= 0) v.push_back(p);
+        if (p >= 0 && p < t.pages + t.V && t.owner[p] >= 0) v.push_back(p);
     if (v.empty()) return;
     G6RT_CK(cudaStreamSynchronize(st));
     G6RT_CK(cudaMemcpy(t.d_list, v.data(), v.size() * sizeof(int), cudaMemcpyHostToDevice));
@@ -151,7 +184,7 @@ inline void rt_drop(RtTier& t, const std::vector<int>& list, cudaStream_t st)
 inline void rt_drop_slot(RtTier& t, int q, cudaStream_t st)
 {
     std::vector<int> v;
-    for (int p = 0; p < t.pages; ++p) if (t.owner[p] == q) v.push_back(p);
+    for (int p = 0; p < t.pages + t.V; ++p) if (t.owner[p] == q) v.push_back(p);
     rt_drop(t, v, st);
 }
 
@@ -164,11 +197,148 @@ struct RtSpillSeen
     int owned = 0;                    // already in the store
     int spilled = 0;
 };
+// release: a logical page past L that this rank holds (the CP map's rule)
+inline bool rt_mine(const RtTier& t, int lp) { return lp >= t.L / 64 && lp < t.tsize && lp % t.nr == t.rank; }
+// release, G6_RT_CHECK=1: every record has exactly one holder (its slot's tail entry for its logical page), every tail
+// entry past the physical pages names a record its slot holds, and the free ids are the rest, each once
+inline void rt_check(const RtTier& t, const char* where)
+{
+    if (!t.hold) return;
+    auto bad = [&](const std::string& why) { die(std::string("G6_RT_CHECK after ") + where + ": " + why); };
+    std::vector<int> seen(t.V, 0);
+    for (int v : t.vfree)
+    {
+        if (v < 0 || v >= t.V || seen[v]++) bad("id " + std::to_string(v) + " free twice or out of range");
+        if (t.vlp[v] >= 0) bad("free id " + std::to_string(v) + " still names a page");
+    }
+    for (int q = 0; q < 8; ++q)
+    {
+        const RtTier::Seq& s = t.seq[q];
+        for (int lp = 0; lp < (int)s.tail.size(); ++lp)
+        {
+            const int e = s.tail[lp];
+            if (e < t.pages) continue;
+            const int v = e - t.pages;
+            if (!s.on || v >= t.V || t.vlp[v] != lp || t.vslot[v] != q || seen[v]++)
+                bad("slot " + std::to_string(q) + " page " + std::to_string(lp) + " -> id " + std::to_string(v) + " held twice or not its own");
+        }
+    }
+    for (int v = 0; v < t.V; ++v)
+        if (!seen[v]) bad("id " + std::to_string(v) + " has no holder and is not free");
+}
+// release: slot q's records back to the free ids, their rows out of the slots. Between steps.
+inline void rt_end(RtTier& t, int q, cudaStream_t st)
+{
+    RtTier::Seq& s = t.seq[q];
+    if (!s.on) return;
+    std::vector<int> ids;
+    for (int v = 0; v < t.V; ++v)
+        if (t.vslot[v] == q) ids.push_back(t.pages + v);
+    rt_drop(t, ids, st);
+    for (int k : ids) { const int v = k - t.pages; t.vlp[v] = t.vslot[v] = -1; t.vfree.push_back(v); }
+    s = RtTier::Seq{};
+    rt_check(t, "end");
+}
+// release: slot q starts a run (list: its pages, to find it by; window: the local pages its tail cycles through), its
+// tail pages past L unmapped (-1). The caller then writes its tables. Between steps.
+inline void rt_begin(RtTier& t, int q, const std::vector<int>& window, const std::vector<int>& list, cudaStream_t st)
+{
+    rt_end(t, q, st);
+    if ((int)window.size() < t.local) die("G6_RT_LOCAL: slot " + std::to_string(q) + " has " + std::to_string(window.size()) + " window pages, wants " + std::to_string(t.local));
+    RtTier::Seq& s = t.seq[q];
+    s.on = true;
+    s.list = list;
+    s.window = (int)window.size();
+    s.tail.assign(t.tsize, -1);
+    s.pfree.assign(window.rbegin(), window.rend());   // the first window page is taken first (pop_back)
+    for (int p : window) if (p < 0 || p >= t.pages) die("G6_RT_LOCAL: window page " + std::to_string(p) + " is not a local page");
+}
+// release: the tail entries of the slot whose run has this list (S2Model::rt_tail), or null
+inline const std::vector<int>* rt_tail_of(const RtTier& t, const std::vector<int>& list)
+{
+    for (const RtTier::Seq& s : t.seq)
+        if (s.on && s.list == list) return &s.tail;
+    return nullptr;
+}
+// release: a window page for every page of slot q's past L with rows below `end` that has none yet, cleared as reset()
+// clears a new sequence's. Between steps, before the step or prefill chunk that writes those rows.
+inline void rt_ensure(Model& m, RtTier& t, int q, int end, cudaStream_t st)
+{
+    if (!t.local) return;
+    RtTier::Seq& s = t.seq[q];
+    if (!s.on) return;
+    bool any = false;
+    for (int lp = t.L / 64; lp < std::min((end + 63) / 64, t.tsize); ++lp)
+    {
+        if (!rt_mine(t, lp) || s.tail[lp] != -1) continue;
+        if (s.pfree.empty())
+            die("G6_RT_LOCAL: rank " + std::to_string(t.rank) + " slot " + std::to_string(q) + " needs a page for logical page " + std::to_string(lp) +
+                " and all " + std::to_string(s.window) + " window pages hold rows not yet whole (raise G6_RT_LOCAL)");
+        if (!any) G6RT_CK(cudaStreamSynchronize(st));
+        any = true;
+        const int p = s.pfree.back();
+        s.pfree.pop_back();
+        for (const Layer& y : m.layers)
+        {
+            const G6Attn& a = y.ab.args;
+            G6RT_CK(cudaMemset((uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW, 0, 64 * g6kv::ROW));
+            if (a.index_cache) G6RT_CK(cudaMemset((uint8_t*)a.index_cache + (size_t)p * 64 * g6kv::IDX_ROW, 0, 64 * g6kv::IDX_ROW));
+        }
+        s.tail[lp] = p;
+        s.peak = std::max(s.peak, ++s.in_use);
+        t.peak = std::max(t.peak, s.peak);
+    }
+    if (!any) return;
+    if (t.write) t.write(q);
+    rt_check(t, "ensure");
+}
+// group G's records of physical page p into buf (64 records; G6_RT_FMT=int4: packed on the GPU, and under check
+// compared with the FP8 rows after a round trip)
+inline void rt_page_record(Model& m, RtTier& t, const RtTier::Group& G, int p, std::vector<uint8_t>& buf, cudaStream_t st)
+{
+    const size_t rec = G.h.rec, srec = G.layers.size() * g6kv::ROW;
+    buf.resize(64 * rec);
+    if (t.int4)
+    {
+        for (size_t j = 0; j < G.layers.size(); ++j)
+        {
+            const G6Attn& a = m.layers[G.layers[j]].ab.args;
+            G6RT_CK((cudaError_t)g6_rt_pack_int4((const uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW, g6kv::ROW,
+                                                 t.pack + j * g6kv::int4row::ROW, rec, 64, st));
+        }
+        G6RT_CK(cudaMemcpyAsync(buf.data(), t.pack, 64 * rec, cudaMemcpyDeviceToHost, st));
+        if (t.check)
+        {
+            G6RT_CK((cudaError_t)g6_rt_unpack_int4(t.pack, g6kv::int4row::ROW, t.back, g6kv::ROW, 64 * (int)G.layers.size(), st));
+            std::vector<uint8_t> was(64 * srec), back(64 * srec);
+            for (size_t j = 0; j < G.layers.size(); ++j)   // [pos][layer], as the packed records
+            {
+                const G6Attn& a = m.layers[G.layers[j]].ab.args;
+                G6RT_CK(cudaMemcpy2DAsync(was.data() + j * g6kv::ROW, srec, (const uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW,
+                                          g6kv::ROW, g6kv::ROW, 64, cudaMemcpyDeviceToHost, st));
+            }
+            G6RT_CK(cudaMemcpyAsync(back.data(), t.back, back.size(), cudaMemcpyDeviceToHost, st));
+            G6RT_CK(cudaStreamSynchronize(st));
+            rt_cmp(was.data(), back.data(), 64 * G.layers.size(), t.spill_ck);
+        }
+        G6RT_CK(cudaStreamSynchronize(st));
+    }
+    else
+        for (size_t j = 0; j < G.layers.size(); ++j)
+        {
+            const G6Attn& a = m.layers[G.layers[j]].ab.args;
+            G6RT_CK(cudaMemcpy2D(buf.data() + j * g6kv::ROW, rec, (const uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW,
+                                 g6kv::ROW, g6kv::ROW, 64, cudaMemcpyDeviceToHost));
+        }
+}
 // slot q's whole pages past L below `committed` (the first row its next step writes), through `map` (logical page ->
 // this rank's physical page, < 0 = another rank's or none: the table attention reads): into the store, then flagged.
-// Between steps.
+// Release: the pages through slot q's tail instead; each goes to the store under a free id, its index keys to the
+// arena, its table entry to the id, and its window page back once the write has returned. Between steps.
+inline RtSpillSeen rt_release(Model& m, RtTier& t, int q, int committed, cudaStream_t st);
 inline RtSpillSeen rt_spill(Model& m, RtTier& t, const std::vector<int>& map, int committed, int q, cudaStream_t st)
 {
+    if (t.local) return rt_release(m, t, q, committed, st);
     RtSpillSeen seen;
     const int end = std::min(committed / 64, (int)map.size());
     std::vector<int> v;
@@ -189,40 +359,8 @@ inline RtSpillSeen rt_spill(Model& m, RtTier& t, const std::vector<int>& map, in
     {
         for (RtTier::Group& G : t.g)
         {
-            const size_t rec = G.h.rec, srec = G.layers.size() * g6kv::ROW;
-            buf.resize(64 * rec);
-            if (t.int4)
-            {
-                for (size_t j = 0; j < G.layers.size(); ++j)
-                {
-                    const G6Attn& a = m.layers[G.layers[j]].ab.args;
-                    G6RT_CK((cudaError_t)g6_rt_pack_int4((const uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW, g6kv::ROW,
-                                                         t.pack + j * g6kv::int4row::ROW, rec, 64, st));
-                }
-                G6RT_CK(cudaMemcpyAsync(buf.data(), t.pack, 64 * rec, cudaMemcpyDeviceToHost, st));
-                if (t.check)
-                {
-                    G6RT_CK((cudaError_t)g6_rt_unpack_int4(t.pack, g6kv::int4row::ROW, t.back, g6kv::ROW, 64 * (int)G.layers.size(), st));
-                    std::vector<uint8_t> was(64 * srec), back(64 * srec);
-                    for (size_t j = 0; j < G.layers.size(); ++j)   // [pos][layer], as the packed records
-                    {
-                        const G6Attn& a = m.layers[G.layers[j]].ab.args;
-                        G6RT_CK(cudaMemcpy2DAsync(was.data() + j * g6kv::ROW, srec, (const uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW,
-                                                  g6kv::ROW, g6kv::ROW, 64, cudaMemcpyDeviceToHost, st));
-                    }
-                    G6RT_CK(cudaMemcpyAsync(back.data(), t.back, back.size(), cudaMemcpyDeviceToHost, st));
-                    G6RT_CK(cudaStreamSynchronize(st));
-                    rt_cmp(was.data(), back.data(), 64 * G.layers.size(), t.spill_ck);
-                }
-                G6RT_CK(cudaStreamSynchronize(st));
-            }
-            else
-                for (size_t j = 0; j < G.layers.size(); ++j)
-                {
-                    const G6Attn& a = m.layers[G.layers[j]].ab.args;
-                    G6RT_CK(cudaMemcpy2D(buf.data() + j * g6kv::ROW, rec, (const uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW,
-                                         g6kv::ROW, g6kv::ROW, 64, cudaMemcpyDeviceToHost));
-                }
+            const size_t rec = G.h.rec;
+            rt_page_record(m, t, G, p, buf, st);
             if (g6kv_rows_write(t.store, G.h.base + (uint64_t)p * 64 * rec, buf.data(), buf.size()))
                 die(std::string("G6_RT_STORE write: ") + g6kv_tier_error());
         }
@@ -236,21 +374,133 @@ inline RtSpillSeen rt_spill(Model& m, RtTier& t, const std::vector<int>& map, in
     return seen;
 }
 
+// one released page's records: page p of every layer of each group -> the records of id v
+inline void rt_write_page(Model& m, RtTier& t, int p, int v, std::vector<uint8_t>& buf, cudaStream_t st)
+{
+    for (RtTier::Group& G : t.g)
+    {
+        const size_t rec = G.h.rec;
+        rt_page_record(m, t, G, p, buf, st);
+        if (g6kv_rows_write(t.store, G.h.base + (uint64_t)v * 64 * rec, buf.data(), buf.size()))
+            die(std::string("G6_RT_STORE write: ") + g6kv_tier_error());
+        const G6Attn& a = m.layers[G.layers[0]].ab.args;
+        if (G.ix && a.index_cache)
+            G6RT_CK(cudaMemcpy(G.ix + (size_t)v * 64 * g6kv::IDX_ROW, (const uint8_t*)a.index_cache + (size_t)p * 64 * g6kv::IDX_ROW,
+                               64 * g6kv::IDX_ROW, cudaMemcpyDeviceToDevice));
+    }
+}
+inline RtSpillSeen rt_release(Model& m, RtTier& t, int q, int committed, cudaStream_t st)
+{
+    RtSpillSeen seen;
+    RtTier::Seq& s = t.seq[q];
+    if (!s.on) return seen;
+    const int end = std::min(committed / 64, t.tsize);
+    std::vector<uint8_t> buf;
+    std::vector<int> freed;
+    for (int lp = t.L / 64; lp < end; ++lp)
+    {
+        if (!rt_mine(t, lp)) continue;
+        ++seen.pages;
+        const int p = s.tail[lp];
+        if (p >= t.pages) { ++seen.owned; continue; }
+        if (p < 0) die("G6_RT_LOCAL: slot " + std::to_string(q) + " page " + std::to_string(lp) + " was committed without a local page");
+        if (t.vfree.empty()) die("G6_RT_LOCAL: rank " + std::to_string(t.rank) + ": every id of the rows store is in use");
+        if (freed.empty()) G6RT_CK(cudaStreamSynchronize(st));
+        const int v = t.vfree.back();
+        t.vfree.pop_back();
+        rt_write_page(m, t, p, v, buf, st);
+        G6RT_CK(cudaMemset(t.d_flag + t.pages + v, 1, 1));
+        t.owner[t.pages + v] = q;
+        t.vlp[v] = lp; t.vslot[v] = q;
+        s.tail[lp] = t.pages + v;
+        s.pfree.push_back(p);
+        freed.push_back(p);
+        --s.in_use;
+        ++seen.spilled; ++s.released; ++t.released;
+        t.spilled += 64;
+    }
+    if (freed.empty()) return seen;
+    if (t.write) t.write(q);
+    if (t.poison)   // the freed pages as the next row would find them: no read may reach them
+        for (int p : freed)
+            for (const Layer& y : m.layers)
+                G6RT_CK(cudaMemset((uint8_t*)y.ab.args.mla_cache + (size_t)p * 64 * g6kv::ROW, 0x7f, 64 * g6kv::ROW));
+    rt_check(t, "release");
+    return seen;
+}
+// release: layer i's rows and index keys of every page slot q released below `start` into the staged prefill pools
+// (each {pool, its index offset or 0}, logical page lp at lp), which k_cp_pf_gather / k_cp_pf_fill leave to this.
+// Plain launches on st (synchronizes it first, only when there is something to stage: the pinned stage is reused).
+inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<std::pair<char*, size_t>>& pools, cudaStream_t st)
+{
+    if (!t.local) return;
+    const int np = (start + 63) / 64;
+    std::vector<int> ids;
+    for (int v = 0; v < t.V; ++v) if (t.vslot[v] == q && t.vlp[v] < np) ids.push_back(v);
+    if (ids.empty()) return;
+    const RtTier::Group& G = t.g[t.at[i].first];
+    const int j = t.at[i].second;
+    const size_t row = t.int4 ? g6kv::int4row::ROW : g6kv::ROW, need = ids.size() * 64 * row;   // a record's bytes per layer
+    G6RT_CK(cudaStreamSynchronize(st));
+    if (t.stage_bytes < need)
+    {
+        if (t.stage) G6RT_CK(cudaFreeHost(t.stage));
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&t.stage), need, cudaHostAllocMapped));   // int4: the unpack reads it
+        t.stage_bytes = need;
+    }
+    std::vector<uint64_t> offs;
+    for (int v : ids)
+        for (int k = 0; k < 64; ++k) offs.push_back(G.h.base + ((uint64_t)v * 64 + k) * G.h.rec + (uint64_t)j * row);
+    if (g6kv_rows_gather(t.store, offs.data(), offs.size(), row, t.stage))
+        die(std::string("G6_RT_STORE prefill read: ") + g6kv_tier_error());
+    void* dstage = nullptr;
+    if (t.int4) G6RT_CK(cudaHostGetDevicePointer(&dstage, t.stage, 0));
+    for (const auto& [pool, ixoff] : pools)
+        for (size_t n = 0; n < ids.size(); ++n)
+        {
+            const int lp = t.vlp[ids[n]];
+            char* dst = pool + (size_t)lp * 64 * g6kv::ROW;
+            if (t.int4)   // back into FP8 rows, as a fetch's rt_unpack does
+                G6RT_CK((cudaError_t)g6_rt_unpack_int4(static_cast<uint8_t*>(dstage) + n * 64 * row, row, dst, g6kv::ROW, 64, st));
+            else
+                G6RT_CK(cudaMemcpyAsync(dst, t.stage + n * 64 * row, 64 * row, cudaMemcpyHostToDevice, st));
+            if (ixoff && j == 0)
+            {
+                if (!G.ix) die("G6_RT_LOCAL: a staged layer's index keys without an arena");
+                G6RT_CK(cudaMemcpyAsync(pool + ixoff + (size_t)lp * 64 * g6kv::IDX_ROW, G.ix + (size_t)ids[n] * 64 * g6kv::IDX_ROW,
+                                        64 * g6kv::IDX_ROW, cudaMemcpyDeviceToDevice, st));
+            }
+        }
+}
+
 // L: tokens (multiple of 64, >= the CP map's R); S: slots per group; layout: the store's header, so records are only
-// read under the layout that wrote them; lease: the store's name without the rank; int4: INT4 records (G6_RT_FMT);
-// check: G6_RT_CHECK. Before s2_init and any prepare:
-// the views and replay entries copy the bindings' arguments.
+// read under the layout that wrote them; lease: the store's name without the rank; local > 0: release, each session
+// with that many window pages past L, the store holding released ids only: ids of them (0 = one per page past L this
+// rank could hold in one table); step_rows: the most rows one step carries (release: S must hold every row each of them
+// selects); int4: INT4 records (G6_RT_FMT); check: G6_RT_CHECK. Before s2_init and any prepare: the views and replay
+// entries copy the bindings' arguments.
 inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const std::string& lease, const std::string& layout,
-                                        int L, int S, bool poison, bool int4, bool check, cudaStream_t st)
+                                        int L, int S, int local, int ids, int step_rows, bool poison, bool int4, bool check,
+                                        cudaStream_t st)
 {
 #if defined(G6_CP) && G6_CP
     if (!m.cp.on) die("G6_RT_STORE needs G6_CP on (the rows past R)");
     if (L < m.cp.R || L % 64) die("G6_RT_L must be a multiple of 64 and at least G6_CP_R");
     if (L != m.cp.R && std::find(m.bk, m.bk + m.nbk, L) == m.bk + m.nbk) die("G6_RT_L must be a context bucket boundary (G6_DEC_BK)");
     if (S < 2048) die("G6_RT_POOL must be at least 2048 slots (one row's selection)");
+    // a released row has no local copy: every row one step selects must find a slot
+    if (step_rows < 1 || step_rows > MX) die("rt_build: step rows " + std::to_string(step_rows) + " outside 1..MX");
+    if (local && S < step_rows * 2048)
+        die("G6_RT_LOCAL needs G6_RT_POOL >= " + std::to_string(step_rows * 2048) + " (2048 selected rows for each of a step's " +
+            std::to_string(step_rows) + " rows)");
     auto t = std::make_unique<RtTier>();
-    t->L = L; t->S = S; t->nr = g6nr::NR; t->rank = m.rank; t->poison = poison; t->int4 = int4; t->check = check && int4;
+    t->L = L; t->S = S; t->nr = g6nr::NR; t->rank = m.rank; t->poison = poison; t->local = local;
+    t->int4 = int4; t->check = check && int4; t->hold = check && local;
     t->pages = m.layers[0].ab.args.page_count;
+    t->tsize = m.layers[0].ab.args.table_size;
+    if (local && ids > 0) t->V = ids;
+    else if (local)
+        for (int lp = L / 64; lp < t->tsize; ++lp) t->V += lp % t->nr == m.rank;
     for (int i = 0; i < m.nl; ++i)
     {
         const G6Attn& a = m.layers[i].ab.args;
@@ -260,17 +510,38 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
             for (RtTier::Group& G : t->g)
                 if (G.layers[0] == m.layers[i].index_src) G.layers.push_back(i);
     }
-    const int rows = t->pages * 64;
+    t->at.assign(m.nl, {-1, -1});
+    for (size_t k = 0; k < t->g.size(); ++k)
+        for (size_t j = 0; j < t->g[k].layers.size(); ++j) t->at[t->g[k].layers[j]] = {(int)k, (int)j};
+    for (int i = 0; i < m.nl; ++i)
+        if (local && t->at[i].first < 0) die("G6_RT_LOCAL: layer " + std::to_string(m.layers[i].l) + " has no full-index layer before it to read released rows through");
     const size_t row = int4 ? g6kv::int4row::ROW : g6kv::ROW;   // a record's bytes per layer
+    size_t most = 0, page_bytes = 0;   // the most layers of a group; one page's records over every group
+    for (RtTier::Group& G : t->g) { page_bytes += 64 * G.layers.size() * row; most = std::max(most, G.layers.size()); }
+    // G6_RT_SIZE (the launcher's KV_ROWS size=): this rank's lease budget in bytes. Release sizes its ids from it (the pool
+    // then admits a tail only when its records fit, kvman-rs Pool::window); the layout keyed by physical page must fit it
+    if (const char* e = getenv("G6_RT_SIZE"))
+    {
+        const uint64_t budget = strtoull(e, nullptr, 10), keyed = (uint64_t)t->pages * page_bytes;
+        if (budget <= G6KV_ROWS_HEADER) die("G6_RT_SIZE " + std::string(e) + ": not even the store's header");
+        if (local) t->V = std::min<uint64_t>(t->V, (budget - G6KV_ROWS_HEADER) / page_bytes);
+        else if (budget < G6KV_ROWS_HEADER + keyed)
+            die("G6_RT_SIZE " + std::string(e) + ": the store keyed by local page needs " + std::to_string(G6KV_ROWS_HEADER + keyed) +
+                " B a rank; release (G6_RT_LOCAL) sizes it by released pages instead");
+        if (local && t->V < 1) die("G6_RT_SIZE " + std::string(e) + ": less than one page of records (" + std::to_string(page_bytes) + " B)");
+    }
+    const int rows = (t->pages + t->V) * 64, recs = local ? t->V * 64 : rows;   // pos2slot rows, store records
     uint64_t bytes = G6KV_ROWS_HEADER;
-    size_t most = 0;
-    for (RtTier::Group& G : t->g) { bytes += (uint64_t)rows * G.layers.size() * row; most = std::max(most, G.layers.size()); }
+    for (RtTier::Group& G : t->g) bytes += (uint64_t)recs * G.layers.size() * row;
     const std::string name = lease + "-r" + std::to_string(m.rank);
     if (g6kv_rows_open(spec.c_str(), name.c_str(), layout.c_str(), bytes, &t->store))
         die("G6_RT_STORE " + spec + " (" + name + "): " + g6kv_tier_error());
-    t->d_flag = dmalloc<uint8_t>(t->pages);
-    t->d_list = dmalloc<int>(t->pages);
-    t->owner.assign(t->pages, -1);
+    t->d_flag = dmalloc<uint8_t>(t->pages + t->V);
+    t->d_list = dmalloc<int>(t->pages + t->V);
+    t->owner.assign(t->pages + t->V, -1);
+    t->vlp.assign(t->V, -1);
+    t->vslot.assign(t->V, -1);
+    for (int v = t->V - 1; v >= 0; --v) t->vfree.push_back(v);
     if (int4) t->pack = dmalloc<uint8_t>(64 * most * row);
     if (t->check) t->back = dmalloc<uint8_t>(64 * most * g6kv::ROW);
     const int cap = MX * 2048;
@@ -287,8 +558,9 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
         G6RT_CK(cudaMemset(h.slot2pos, 0xff, S * sizeof(int)));
         G6RT_CK(cudaMemset(h.last, 0xff, S * sizeof(unsigned long long)));
         h.step = reinterpret_cast<const unsigned long long*>(m.stepp);
-        h.base = base; h.rec = rec; h.slots = S; h.rows = rows; h.cap = cap;
-        base += (uint64_t)rows * rec;
+        h.base = base; h.rec = rec; h.slots = S; h.rows = rows; h.cap = cap; h.kbase = local ? t->pages * 64 : 0;
+        base += (uint64_t)recs * rec;
+        if (local && m.layers[G.layers[0]].ab.args.index_cache) G.ix = dmalloc<uint8_t>((size_t)t->V * 64 * g6kv::IDX_ROW);
         const size_t ring = sizeof(g6kv_rows_req) + (size_t)cap * sizeof(g6kv_rows_ent);
         G6RT_CK(cudaHostAlloc(&G.req, ring, cudaHostAllocMapped));
         memset(G.req, 0, ring);
@@ -325,6 +597,8 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
             a.rt_stride = (int)srec;
             a.rt_group = j == 0 ? G.dev : nullptr;
             a.rt_int4 = j == 0 && int4;
+            a.rt_vpages = t->V;
+            a.rt_ix = j == 0 ? G.ix : nullptr;
         }
     }
     G6RT_CK(cudaDeviceSynchronize());
@@ -332,7 +606,7 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
     char d[256];
     g6kv_rows_describe(t->store, d, sizeof d);
     // fp8 keeps its line as it was
-    const double rec_all = (double)(bytes - G6KV_ROWS_HEADER) / rows;   // every group's record of one row
+    const double rec_all = (double)(bytes - G6KV_ROWS_HEADER) / recs;   // every group's record of one row
     if (int4)
         fprintf(stderr, "# rank %d: G6_RT_STORE %s (%s): int4 records (%.0f B a token), rows past %d, %zu groups, %d slots each (%.3f GB "
                 "pinned with the stage), %.3f GB of records\n",
@@ -340,11 +614,15 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
                 (bytes - G6KV_ROWS_HEADER) / 1e9);
     else
         fprintf(stderr, "# rank %d: G6_RT_STORE %s (%s): rows past %d, %zu groups, %d slots each (%.3f GB pinned), %.3f GB of records\n",
-                m.rank, spec.c_str(), d, L, t->g.size(), S, (double)S * (bytes - G6KV_ROWS_HEADER) / rows / 1e9, (bytes - G6KV_ROWS_HEADER) / 1e9);
+                m.rank, spec.c_str(), d, L, t->g.size(), S, (double)S * (bytes - G6KV_ROWS_HEADER) / recs / 1e9, (bytes - G6KV_ROWS_HEADER) / 1e9);
+    if (local)
+        fprintf(stderr, "# rank %d: G6_RT_LOCAL %d local pages past L, %d released ids (%.3f GB of index keys kept)\n", m.rank, local, t->V,
+                (double)t->V * 64 * g6kv::IDX_ROW * t->g.size() / 1e9);
     if (t->check && m.rank == 0) rt_selftest(4096, st);
     return t;
 #else
-    (void)m; (void)spec; (void)lease; (void)layout; (void)L; (void)S; (void)poison; (void)int4; (void)check; (void)st;
+    (void)m; (void)spec; (void)lease; (void)layout; (void)L; (void)S; (void)local; (void)ids; (void)step_rows; (void)poison; (void)int4;
+    (void)check; (void)st;
     die("G6_RT_STORE needs a G6_CP build");
 #endif
 }

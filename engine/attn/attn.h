@@ -5,11 +5,13 @@
 // All tensor pointers are device addresses. Scalar metadata is host-readable.
 // Remote attention rows (runtime/rt_rows.cuh): a physical page flagged in G6Attn::rt_page has its latent rows in the
 // resident slots of the layer's indexer group too; the local copy stays valid, so a row without a slot reads it.
+// A released page (table entry page_count + v, v < rt_vpages) has no local copy: its rows read only from the slots,
+// and its index keys sit in rt_ix.
 // One indexer group's resident slots (device memory). The group's full-index layer runs the resolve after its own
 // selection: hits stamp their slot, misses take slots (clock order from hand, never one used this step) and go to the
 // request ring, which the host helper serves (kvman-rs src/rows.rs). Its wait sits before the first scores.
 struct G6RtGroup {
-    int *pos2slot;                  // [rows] row (physical page * 64 + pos % 64) -> slot, -1 absent, -2 claimed in a resolve
+    int *pos2slot;                  // [rows] row (table page * 64 + pos % 64) -> slot, -1 absent, -2 claimed in a resolve
     int *slot2pos;                  // [slots] -> row index, -1 free
     unsigned long long *last;       // [slots] the step that last used the slot
     int *miss;                      // [cap] scratch: the row indices one resolve missed
@@ -19,6 +21,7 @@ struct G6RtGroup {
     unsigned long long seq;         // requests rung so far
     unsigned long long base, rec;   // the group's first record in the store, record bytes
     int slots, rows, cap, hand, n;  // n: misses of the last resolve (the wait skips at 0)
+    int kbase;                      // the row of the store's first record (released pages only: page_count * 64)
     unsigned long long local;       // misses the pool had no room for: read from the local copy
     // G6_RT_FMT=int4: the store's records hold INT4 rows (kvfmt.h int4row), and the helper reads them into stage + slot
     // * rec; after the wait, rt_unpack turns them into the FP8 rows of slot (out + slot * nl * 656). nullptr: FP8 records,
@@ -54,15 +57,18 @@ struct G6Attn {
     // G6AttnStep::s2_batched. Host-side dispatch only (the cell is device data): picks the fixed-K decode kernels.
     int s2_batched;
 #endif
-    // Remote rows: physical page p with rt_page[p] != 0 reads row p * 64 + pos % 64 from its slot rt_table[row] (>= 0),
-    // at rt_rows + slot * rt_stride; -1 = the local row. rt_page nullptr = off. rt_group: set on the group's full-index
-    // layer, which runs the resolve and the wait (CP decode).
+    // Remote rows: page p with rt_page[p] != 0 reads row p * 64 + pos % 64 from its slot rt_table[row] (>= 0),
+    // at rt_rows + slot * rt_stride; -1 = the local row, or for a released page (p >= page_count) error 0x40000.
+    // rt_page nullptr = off. rt_group: set on the group's full-index layer, which runs the resolve and the wait (CP
+    // decode). Released pages: rt_vpages of them after the physical ones, their index keys at rt_ix (full-index layers).
     const unsigned char *rt_page;
     const int *rt_table;
     const unsigned char *rt_rows;
     G6RtGroup *rt_group;
     int rt_stride;
     int rt_int4;                    // on rt_group's layer: its G6RtGroup has a stage (host-side dispatch of rt_unpack)
+    int rt_vpages;
+    const unsigned char *rt_ix;
 };
 // Remote rows, G6_RT_FMT=int4 (runtime/rt_rows.cuh): n FP8 rows -> INT4 rows (spill) and back (tests); warp per row,
 // strides in bytes. cudaErrorNotSupported in a G6_KV4 build, whose rows are INT4 already.

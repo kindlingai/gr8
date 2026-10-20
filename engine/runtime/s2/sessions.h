@@ -102,7 +102,7 @@ public:
         auto req = request(g.req.id, r);
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
                 req.steering == g.req.steering &&
-                (grant_pages(config_, req) == g.run.pages || reserve_pages(config_, req) == g.run.pages), "session payload/grant mismatch");
+                grant_pages_ok(config_, req, g.run.pages), "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;

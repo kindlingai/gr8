@@ -1778,7 +1778,9 @@ inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
 constexpr int CP_KVB = g6kv::ROW;     // attn.cu KV_BYTES: one latent record (kvfmt.h)
 constexpr int CP_IXB = g6kv::IDX_ROW; // attn.cu IDX_BYTES: one index key; a page is 64 x 128 codes, then 64 FP32 scales
 constexpr int CP_PF_MAXNR = 8;
-struct CpPfSrc { const char* kv[CP_PF_MAXNR]; const int* table[CP_PF_MAXNR]; const char* ix[CP_PF_MAXNR]; };
+// np: each rank's physical pages; a table entry at or past it is a page the rows tier released (rt_rows.cuh rt_pf_stage
+// fills it)
+struct CpPfSrc { const char* kv[CP_PF_MAXNR]; const int* table[CP_PF_MAXNR]; const char* ix[CP_PF_MAXNR]; int np[CP_PF_MAXNR]; };
 // one page of 64 index keys, src -> dst (uint4 pieces of 64 x 132 B = 528), by the block's threads
 __device__ __forceinline__ void cp_pf_ix_page(const char* src, char* dst, int ps)
 {
@@ -1787,12 +1789,13 @@ __device__ __forceinline__ void cp_pf_ix_page(const char* src, char* dst, int ps
     for (size_t k = threadIdx.x; k < (size_t)ps * CP_IXB / 16; k += blockDim.x) d[k] = a[k];
 }
 // grid npages, block 256: logical page lp of a layer -> dst page lp, from rank (lp < Rp ? me : lp % nr) at its table;
-// ixoff != 0: its index keys too (s.ix[o], page pg) -> dst + ixoff, page lp
+// ixoff != 0: its index keys too (s.ix[o], page pg) -> dst + ixoff, page lp. A released page (pg >= np) is skipped
 __global__ void __launch_bounds__(256) k_cp_pf_gather(CpPfSrc s, char* dst, int nr, int me, int Rp, int ps, unsigned* err, size_t ixoff)
 {
     const int lp = blockIdx.x, o = lp < Rp ? me : lp % nr;
     const int pg = s.table[o][lp];
     if (pg < 0) { if (threadIdx.x == 0) atomicOr(err, 0x63000400u); return; }
+    if (pg >= s.np[o]) return;
     const size_t n = (size_t)ps * CP_KVB / 16;
     const uint4* a = reinterpret_cast<const uint4*>(s.kv[o] + (size_t)pg * ps * CP_KVB);
     uint4* d = reinterpret_cast<uint4*>(dst + (size_t)lp * ps * CP_KVB);
@@ -1898,6 +1901,7 @@ inline CpPfSrc cp_pf_src(const std::vector<Model>& R, int i)
         if (!m.cp.pf_staged) die("G6_CP prefill: gather outside the staged view");
         s.kv[m.rank] = (const char*)m.cp.pf_saved[i].mla_cache; s.table[m.rank] = m.cp.pf_saved[i].block_table;
         s.ix[m.rank] = (const char*)m.cp.pf_saved[i].index_cache;
+        s.np[m.rank] = m.cp.pf_saved[i].page_count;
     }
     return s;
 }
@@ -1935,14 +1939,15 @@ struct CpPfNet
 #endif
 };
 // grid npages, block 256: pages this rank holds (lp < Rp or lp % nr == me) of its store -> pool (ixoff != 0: and their
-// index keys, ix -> dst + ixoff)
+// index keys, ix -> dst + ixoff). A page at or past npg was released by the rows tier (CpState::rt_stage fills it)
 __global__ void __launch_bounds__(256) k_cp_pf_fill(const char* kv, const int* table, char* dst, int nr, int me, int Rp, int ps, unsigned* err,
-                                                    const char* ix, size_t ixoff)
+                                                    const char* ix, size_t ixoff, int npg)
 {
     const int lp = blockIdx.x;
     if (lp >= Rp && lp % nr != me) return;
     const int pg = table[lp];
     if (pg < 0) { if (threadIdx.x == 0) atomicOr(err, 0x63000400u); return; }
+    if (pg >= npg) return;
     const size_t n = (size_t)ps * CP_KVB / 16;
     const uint4* a = reinterpret_cast<const uint4*>(kv + (size_t)pg * ps * CP_KVB);
     uint4* d = reinterpret_cast<uint4*>(dst + (size_t)lp * ps * CP_KVB);
@@ -2078,7 +2083,8 @@ inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
     G6RT_CK(cudaStreamWaitEvent(st, n.done[k], 0));    // my previous use of pool k (g - 2) is over (both lanes)
     const size_t ixoff = cp_pf_ixoff(m, i);
     if (np) k_cp_pf_fill<<<np, 256, 0, st>>>((const char*)a.mla_cache, a.block_table, m.cp.pf_pool[k], nr, m.rank, Rp, ps, n.bd.error,
-                                             (const char*)a.index_cache, ixoff);
+                                             (const char*)a.index_cache, ixoff, a.page_count);
+    if (m.cp.rt_stage) m.cp.rt_stage(i, start, m.cp.pf_pool[k], ixoff, st);   // before the hash and the doorbell read the pool
 #if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
     if (n.verify && n.hash2)
     {

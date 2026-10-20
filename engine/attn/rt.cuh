@@ -15,7 +15,7 @@ __device__ __forceinline__ void rt_st_release(unsigned long long* p,unsigned lon
 // grid 1, block 1024: rows 0..n-1 of a.indices (this layer's own selection), each with its own table (S2). Hits stamp
 // their slot; each missed row takes a slot not used this step, in clock order from the group's hand (its old row, if
 // any, is evicted), and goes to the request ring. Then the doorbell (seq), only when something missed. Misses past
-// the pool's room stay absent (their reads take the local copy) and count in g.local.
+// the pool's room stay absent (their reads take the local copy, or fail on a released page) and count in g.local.
 template<class Input>
 __global__ void __launch_bounds__(1024) rt_resolve(Input input,int n){
     auto a=resolve(input);G6RtGroup& g=*a.rt_group;const int t=threadIdx.x;
@@ -31,7 +31,7 @@ __global__ void __launch_bounds__(1024) rt_resolve(Input input,int n){
         DeviceAttn ar=a;FOR_ROW(ar,input,r);
         if(id<0||id>a.positions[r]||id>=ar.live_context||id/ar.page_size>=ar.table_size)continue;
         const int p=ar.block_table[id/ar.page_size];
-        if(p<0||p>=ar.page_count||!a.rt_page[p])continue;
+        if(p<0||p>=ar.page_count+a.rt_vpages||!a.rt_page[p])continue;
         const int k=p*ar.page_size+id%ar.page_size,s=g.pos2slot[k];
         if(s>=0){g.last[s]=cur;continue;}
         if(s==-1&&atomicCAS(&g.pos2slot[k],-1,-2)==-1){const int m=atomicAdd(&nm,1);if(m<g.cap)g.miss[m]=k;else g.pos2slot[k]=-1;}
@@ -48,7 +48,7 @@ __global__ void __launch_bounds__(1024) rt_resolve(Input input,int n){
             const int k=g.miss[j],old=g.slot2pos[s];
             if(old>=0)g.pos2slot[old]=-1;
             g.slot2pos[s]=k;g.pos2slot[k]=s;g.last[s]=cur;
-            ent[j]=RtEnt{g.base+(unsigned long long)k*g.rec,(unsigned)s,0u};
+            ent[j]=RtEnt{g.base+(unsigned long long)(k-g.kbase)*g.rec,(unsigned)s,0u};
             atomicMax(&adv,b+t+1);
         }
         __syncthreads();

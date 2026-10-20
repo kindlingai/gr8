@@ -38,6 +38,10 @@
 //                     layout, and CP decode reads them through G6_RT_POOL (default 4096) resident slots per indexer group.
 //                     A prefill of the session (a later turn) and its retirement drop them back to the local copies.
 //                     G6_RT_FMT=int4: the lease holds the rows as INT4 (416 B for 656), turned back into FP8 after each fetch.
+//                     G6_RT_LOCAL=N: release: a split run holds its prefix and N window pages per rank, its tail pages
+//                     go back to the window once in the store, and the pool grants the drafter's whole tail apart from
+//                     them. Such a run is never retained. G6_RT_PLACE=P: the main model's physical pages per rank, so
+//                     --cap may pass what they hold (the longest tail is then the drafter class, --cap / 64 - place pages)
 //      [--kv-store STORE,size=N(G|T)[,keep=RULE]]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
 //                     (s2/kv_tier.cuh, kvman-rs src/stash.rs). A request that continues a stored entry reads its pages
 //                     back and skips their prefill. STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id
@@ -257,6 +261,16 @@ int main(int argc, char** argv)
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
     if (getenv("G6_RT_STORE") && !s2mode) die("G6_RT_STORE needs --serve (S2 below R with G6_CP on)");
     if (getenv("G6_RT_POISON")) die("G6_RT_POISON is an m4sim test: g6m4 reads the local copy of a row without a slot");
+    // G6_RT_LOCAL (release): each split run's tail cycles through that many window pages per rank; the pool grants the
+    // drafter's whole tail apart from them (kvman-rs Pool::window, s2_cp_map). G6_RT_PLACE: the main model's physical
+    // pages per rank (m.cp.phys), so --cap (the logical length) may pass what the local pages hold
+    const int rt_win = getenv("G6_RT_LOCAL") ? atoi(getenv("G6_RT_LOCAL")) : 0;
+    if (getenv("G6_RT_LOCAL") && (rt_win < 1 || !getenv("G6_RT_STORE"))) die("G6_RT_LOCAL needs G6_RT_STORE and a page count >= 1");
+    if (getenv("G6_RT_PLACE") && !rt_win) die("G6_RT_PLACE needs G6_RT_LOCAL (the pages past it are reached through the rows tier only)");
+    // --kv-store with it: the pool never retains a window run (kvman-rs Pool::window), so the block stores copy at most
+    // its prefix, which stays on pool pages; runs below R are as without the tier
+    if (rt_win && getenv("G6_RT_L") && getenv("G6_CP_R") && atoi(getenv("G6_RT_L")) != atoi(getenv("G6_CP_R")))
+        die("G6_RT_LOCAL needs G6_RT_L = G6_CP_R (the window holds every tail page past R)");
     steering::PreparedBoot steering_prepared;
     try {
         if (!steering_dir.empty() && !hash) die("--steering-profile requires weight hash checks");
@@ -650,6 +664,12 @@ int main(int argc, char** argv)
     m.qs.iq = iq_split == 1;
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
+    if (const char* e = getenv("G6_RT_PLACE"))
+    {
+        m.cp.phys = atoi(e);
+        if (m.cp.phys < cp_R / 64 + rt_win) die("G6_RT_PLACE must hold the prefix (G6_CP_R / 64 pages) and one window");
+        if (R == 0) fprintf(stderr, "# rank 0: G6_RT_PLACE: %d physical pages per rank for the main model (--cap %d is the logical length)\n", m.cp.phys, cap);
+    }
 #endif
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
@@ -814,11 +834,34 @@ int main(int argc, char** argv)
                                        g6kv::NAME + rt_fmt_layout(int4) + " model=" + rt_name_part(set_id) + " pages=" +
                                        std::to_string(m.layers[0].ab.args.page_count) + " layers=" + std::to_string(m.nl);
             if (set_id.empty() && R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE without --set-id: the lease names no model set\n");
-            rtt = rt_build(m, rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag, layout, L, S, false, int4,
-                           getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK")), st);
+            // release: a session's owned tail pages sum to at most the drafter class (the pages past place) over nr,
+            // plus one partial page each
+            int ids = 0;
+            if (rt_win)
+            {
+                const G6Attn& a0 = m.layers[0].ab.args;
+                // place as every rank computes it (the tail split differs by a page between ranks): the ids, and so the
+                // pool's digest, must agree
+                const int rp = cp_R / 64, fair = rp + (a0.table_size - rp) / g6nr::NR, place = m.cp.phys ? std::min(fair, m.cp.phys) : fair;
+                ids = (a0.table_size - place + g6nr::NR - 1) / g6nr::NR + s2sess;
+                const int need = 2 * ((MP + 63) / 64 + g6nr::NR - 1) / g6nr::NR + 2;   // a two-lane quantum's pages per rank, its partial ones, a decode page
+                if (rt_win < need) die("G6_RT_LOCAL " + std::to_string(rt_win) + ": a prefill quantum of --prefill " + std::to_string(MP) +
+                                         " rows needs at least " + std::to_string(need) + " window pages");
+                if (rp + rt_win > place) die("G6_RT_LOCAL: the window does not fit the main model's pages past the prefix");
+            }
+            rtt = rt_build(m, rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag + (rt_win ? "-rel" : ""),
+                           layout + (rt_win ? " released" : ""), L, S, rt_win, ids,
+                           std::min<int>(MX, std::max(s2sess * (mtp + 1), plan.chunk)), false, int4,
+                           getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK")), st);   // sc.max_rows: a step's rows at most
         }
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
+        if (rtt && rtt->local)
+        {
+            m.s2->rt_window = D.d.s2->rt_window = rtt->local;
+            RtTier* t = rtt.get();
+            m.s2->rt_tail = [t](const std::vector<int>& list) { return rt_tail_of(*t, list); };
+        }
         m.s2on = D.d.s2on = false;
     }
     u64 ls0 = 1;
@@ -949,12 +992,21 @@ int main(int argc, char** argv)
             sc.decode_rounds = (uint32_t)v;
         }
         sc.steering = steering_boot;
+        if (rtt && rtt->local) sc.window_pages = (uint32_t)rtt->local;   // a window run lists its worst case and the window
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
         // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
         // drafter's tail copy above it — instead of the whole pool, and retained runs keep their pages through a long
         // turn. The stores' tail blocks (per_slot) come with --kv-store below.
         if (m.cp.on && s2_below == m.cp.R) pool.tail((uint32_t)g6nr::NR, 0);
+        if (rtt && rtt->local)
+        {
+            if (!pool.split()) die("G6_RT_LOCAL needs the pool's page classes (G6_S2_BELOW = G6_CP_R)");
+            pool.window((uint32_t)rtt->local, (uint32_t)rtt->V);   // a tail waits until its records fit every rank's lease
+            if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL: a run past R holds %d prefix + %d window pages below place %d, its whole tail above "
+                                        "(%d pages: the longest tail one run can have, %d rows); %d record ids per rank\n", cp_R / 64, rtt->local, place,
+                                cap / 64 - place, (cap / 64 - place) * 64, rtt->V);
+        }
         int reuse_grid = 0;
         // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
         // and NOEND (G6_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
@@ -1226,12 +1278,52 @@ int main(int argc, char** argv)
                 }
             };
             // a later turn's prefill writes and reads the session's KV on the paths that read the local pages
-            nx.before_prefill = [&](const g6s2::Slot& sl) {
+            nx.before_prefill = [&](const g6s2::Slot& sl, uint32_t, uint32_t) {
                 const int q = (int)sl.key.slot;
                 bool any = false;
                 for (int o : rtt->owner) any = any || o == q;
                 rt_drop_slot(*rtt, q, st);
                 if (any) rt_log("prefill of", q);
+            };
+        }
+        // G6_RT_LOCAL: slot q's tables with its tail entries (s2_cp_map reads them through S2Model::rt_tail): its slot
+        // table always (the batched steps), the layers' tables while they hold its run (its prefill, or it runs alone)
+        int rt_layers = -1;                // the slot whose run the layers' tables hold
+        int rt_pf = -1;                    // the slot of the prefill quantum in flight
+        if (rtt && rtt->local)
+        {
+            const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+            rtt->write = [&, most](int q) {
+                const S2Model& s = *m.s2;
+                if (!s.ex_split[q]) return;
+                const std::vector<int> t = s2_cp_map(s, s.pool[0]->args, s.run[q], m.s2_below / 64, (size_t)s.table_cap);
+                G6RT_CK(g6h2d::copy(s.table[q], t.data(), t.size() * 4));
+                if (rt_layers == q) s2_solo_cp_pages(m, s.run[q], most);
+            };
+            nx.before_main = [&](const StepIn& in, const S2In& h) {
+                for (int j = 0; j < h.ns; ++j)
+                {
+                    const int q = h.sess[j];
+                    if (q < 0 || q >= m.s2->nslots || !rtt->seq[q].on) continue;
+                    if (!m.s2on) rt_layers = q;   // alone: the mode switch wrote its run into the layers' tables
+                    int end = 0;
+                    for (int r = h.row0[j]; r < h.row0[j] + h.rows[j]; ++r) end = std::max(end, in.pos[r] + 1);
+                    rt_spill(m, *rtt, {}, in.pos[h.row0[j]], q, st);
+                    rt_ensure(m, *rtt, q, end, st);
+                }
+            };
+            // the quantum writes rows first.. through the layers' tables, which begin_prefill rewrites right after this
+            nx.before_prefill = [&](const g6s2::Slot& sl, uint32_t first, uint32_t rows) {
+                const int q = (int)sl.key.slot;
+                rt_layers = q;
+                rt_pf = rtt->seq[q].on ? q : -1;
+                if (rt_pf < 0) return;
+                rt_spill(m, *rtt, {}, (int)first, q, st);
+                rt_ensure(m, *rtt, q, (int)(first + rows), st);
+            };
+            // the real-fabric fill of a staged layer: the quantum's session's released pages, from the store
+            m.cp.rt_stage = [&](int i, int start, char* pool_k, size_t ixoff, cudaStream_t s) {
+                if (rt_pf >= 0) rt_pf_stage(*rtt, rt_pf, i, start, {{pool_k, ixoff}}, s);
             };
         }
         try
@@ -1244,6 +1336,22 @@ int main(int argc, char** argv)
             h.pool.digest = [&] { return pool.digest(); };
             h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
             h.pool.fits = [&](uint64_t rows, uint64_t worst) { return pool.fits(rows, worst); };
+            if (rtt && rtt->local)
+                h.pool.refusal = [&](uint64_t worst) -> std::string {
+                    const auto v = pool.split_view(worst);
+                    if (!v) return "";
+                    const auto [lo, hi, lofree, hifree] = *v;
+                    std::string why = "it takes " + std::to_string(lo) + " pages below place (" + std::to_string(lofree) + " free) and its tail of " +
+                                      std::to_string(hi) + " above (" + std::to_string(hifree) + " free)";
+                    if (hi > (uint64_t)(cap / 64 - std::min(m.s2->pool_pages, D.d.s2->pool_pages))) why += ": the tail is longer than the drafter class, it never fits";
+                    if (const auto iv = pool.ids_view(worst))
+                    {
+                        why += "; its tail needs " + std::to_string((*iv)[0]) + " records a rank, " + std::to_string((*iv)[1]) + " of the lease's " +
+                               std::to_string((*iv)[2]) + " are free";
+                        if ((*iv)[0] > (*iv)[2]) why += ": more than the lease holds (KV_ROWS size=), it never fits";
+                    }
+                    return why;
+                };
             h.pool.stats = [&] { return pool.stats(); };
             h.pool.runs = [&] { return pool.runs(); };
             // G6_S2_GROW=0: every run holds its worst case (prompt + max_tokens + guard) from admission, as before growth
@@ -1275,7 +1383,20 @@ int main(int argc, char** argv)
                     std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
                 }
                 const int q = (int)g.key.slot;
-                if (rtt) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); rt_told[q] = false; }   // a new run's pages are local
+                if (rtt && !rtt->local) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); rt_told[q] = false; }   // a new run's pages are local
+                // release: a split run's tail starts unmapped, cycling through its window (list[R/64 ..], kvman-rs Pool::window)
+                if (rtt && rtt->local)
+                {
+                    if (rt_layers == q) rt_layers = -1;
+                    rt_end(*rtt, q, st);
+                    if (pool.exclusive_run(g.run))
+                    {
+                        const std::vector<int> l = pool.list(g.run);
+                        const int rp = cp_R / 64;
+                        if (g.reuse > cp_R) die("G6_RT_LOCAL: a hit past R (window runs are never retained)");
+                        rt_begin(*rtt, q, std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local), l, st);
+                    }
+                }
                 slot_prompt[q] = g.req.prompt_tokens;
                 slot_whole[q] = dfl_reuse && g.reuse + 1 == g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
@@ -1330,7 +1451,19 @@ int main(int argc, char** argv)
                 G6RT_CK(cudaStreamSynchronize(st));
             };
             h.retire = [&](const g6s2::Slot& old) {
-                if (rtt) { rt_drop_slot(*rtt, (int)old.key.slot, st); rt_log("retire of", (int)old.key.slot); }   // retained runs stay local
+                if (rtt && rtt->local)   // its records die with it: the pool releases a window run instead of retaining it
+                {
+                    const int q = (int)old.key.slot;
+                    const RtTier::Seq& sq = rtt->seq[q];
+                    if (R == 0 && sq.on)
+                        fprintf(stderr, "# rank 0: G6_RT_LOCAL retire of slot %d: %llu pages released, at most %d of %d window pages in use; all sessions: "
+                                        "%llu released, peak %d local tail pages; %llu rows fetched, %zu of %d record ids free\n", q,
+                                (unsigned long long)sq.released, sq.peak, sq.window, (unsigned long long)rtt->released, rtt->peak,
+                                (unsigned long long)rt_fetched(*rtt), rtt->vfree.size(), rtt->V);
+                    rt_end(*rtt, q, st);
+                    if (rt_layers == q) rt_layers = -1;
+                }
+                else if (rtt) { rt_drop_slot(*rtt, (int)old.key.slot, st); rt_log("retire of", (int)old.key.slot); }   // retained runs stay local
                 nd.retire(old);
             };
             h.fence = [&] { nd.synchronize(); };

@@ -160,11 +160,20 @@ __device__ int page(const DeviceAttn& a,int pos){
     if(pos<0 || pos>=a.live_context || pos/a.page_size>=a.table_size){error(a,1);return -1;}
     int p=a.block_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;
 }
-// page()'s checks and errors; a page flagged remote reads its row from the group's resident slot when it has one
+// page() for reads: a released page of the rows tier (page_count .. page_count + rt_vpages - 1) is valid too. Writes
+// keep page(): a row is only appended to a page that is still local.
+__device__ __forceinline__ int page_rd(const DeviceAttn& a,int pos){
+    if(pos<0 || pos>=a.live_context || pos/a.page_size>=a.table_size){error(a,1);return -1;}
+    int p=a.block_table[pos/a.page_size];
+    if(p<0||p>=a.page_count+(a.rt_page?a.rt_vpages:0)){error(a,2);return -1;}return p;
+}
+// page()'s checks and errors; a page flagged remote reads its row from the group's resident slot when it has one. A
+// released page has no local row to fall back on: no slot is error 0x40000 (the resolve had no room).
 __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
-    int p=page(a,pos);if(p<0)return nullptr;
+    int p=page_rd(a,pos);if(p<0)return nullptr;
     const int64_t row=(int64_t)p*a.page_size+pos%a.page_size;
     if(a.rt_page&&a.rt_page[p]){const int s=a.rt_table[row];if(s>=0)return a.rt_rows+(int64_t)s*a.rt_stride;}
+    if(p>=a.page_count){error(a,0x40000);return nullptr;}
     return (const uint8_t*)a.mla_cache+row*KV_BYTES;
 }
 #if defined(G6_CP) && G6_CP
@@ -174,14 +183,17 @@ __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
 __device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){
     if(a.index_table){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}
         const int p=a.index_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;}
-    return page(a,pos);
+    return page_rd(a,pos);
 }
 #else
-__device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){return page(a,pos);}
+__device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){return page_rd(a,pos);}
 #endif
+// a released page's index keys stay on this rank, in the rows tier's arena (rt_ix)
 __device__ const uint8_t* ik_at(const DeviceAttn& a,int pos,float& scale){
     int p=ipage(a,pos);if(p<0){scale=0;return nullptr;}
-    const uint8_t* base=(const uint8_t*)a.index_cache+(int64_t)p*a.page_size*IDX_BYTES;
+    const uint8_t* base=p<a.page_count?(const uint8_t*)a.index_cache+(int64_t)p*a.page_size*IDX_BYTES:
+        a.rt_ix?a.rt_ix+(int64_t)(p-a.page_count)*a.page_size*IDX_BYTES:nullptr;
+    if(!base){error(a,0x40000);scale=0;return nullptr;}
     scale=((const float*)(base+a.page_size*128))[pos%a.page_size];return base+(pos%a.page_size)*128;
 }
 // x[k] = element lane + 32 k of a 512-vector held by one warp -> H x, unscaled (Sylvester order: bits 0-4 are the lane,
@@ -269,6 +281,7 @@ template<int NH,class Input>
 __device__ __forceinline__ void append_index_row(Input input,int r,int t,int hf){
     auto a=resolve(input);if(!a.active)return;
     int pos=a.positions[r];FOR_ROW(a,input,r);CP_REMOTE_ROW(a,pos)int pg=ipage(a,pos);if(pg<0)return;   // CP: the page's owner appends it, as append_kv
+    if(pg>=a.page_count){error(a,2);return;}   // a released page (rows tier) is never written
     __shared__ float v_[NH][128],sum_[NH][4],scale_[NH];float* v=v_[hf];float* sum=sum_[hf];float& scale=scale_[hf];
     float x=hfloat(a.index_k,(int64_t)r*128+t),s=warp_sum(x);if((t&31)==0)sum[t/32]=s;__syncthreads();
     float mean=(sum[0]+sum[1]+sum[2]+sum[3])/128;

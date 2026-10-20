@@ -590,6 +590,55 @@ pub unsafe extern "C" fn g6kv_tail(p: *mut Pool, nr: u32, per_slot: u32) {
     (*p).tail(nr, per_slot);
 }
 
+/// Remote rows release: a split run's main pages past its prefix, and the records of each rank's rows store (0 = no
+/// limit) (src/pool.rs Pool::window). Before any reservation.
+///
+/// # Safety
+/// `p` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_window(p: *mut Pool, pages: u32, ids: u32) -> i32 {
+    match (*p).window(pages, ids) {
+        Ok(()) => 0,
+        Err(e) => e.code(),
+    }
+}
+
+/// For a window request of `worst` rows past R with a lease limit: 1 and {records its tail needs per rank, records
+/// free, records in all} in out[0..3]; 0 otherwise.
+///
+/// # Safety
+/// `p` must be live, `out` valid for 3 writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ids_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
+    match (*p).ids_view(worst) {
+        Some((a, b, c)) => {
+            for (k, v) in [a, b, c].into_iter().enumerate() {
+                *out.add(k) = v;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// For a request of `worst` rows past R with the page classes on: 1 and its pages below / above place and what those
+/// classes have free in out[0..4]; 0 otherwise.
+///
+/// # Safety
+/// `p` must be live, `out` valid for 4 writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_split_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
+    match (*p).split_view(worst) {
+        Some((a, b, c, d)) => {
+            for (k, v) in [a, b, c as u64, d as u64].into_iter().enumerate() {
+                *out.add(k) = v;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
 /// Whether g6kv_tail set the CP map's ranks: a run past R carries its own page list (1) or holds the pool as pages
 /// 0, 1, .. (0).
 ///
@@ -738,6 +787,29 @@ pub unsafe extern "C" fn g6kv_rows_free(r: *mut crate::rows::Rows) {
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_rows_write(r: *const crate::rows::Rows, off: u64, buf: *const u8, len: usize) -> i32 {
     match (*r).store.write(off, std::slice::from_raw_parts(buf, len)) {
+        Ok(()) => 0,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// Reads `n` pieces of `len` bytes, piece k at store byte `offs[k]`, into `dst + k * len`.
+///
+/// # Safety
+/// `r` must be live, `offs` valid for `n` reads, `dst` for `n * len` writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_gather(
+    r: *const crate::rows::Rows,
+    offs: *const u64,
+    n: usize,
+    len: usize,
+    dst: *mut u8,
+) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    let ops: Vec<(u64, *mut u8, usize)> =
+        std::slice::from_raw_parts(offs, n).iter().enumerate().map(|(k, &o)| (o, dst.add(k * len), len)).collect();
+    match (*r).store.read_scatter(&ops) {
         Ok(()) => 0,
         Err(e) => crate::blocks::fail(e),
     }

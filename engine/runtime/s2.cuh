@@ -90,6 +90,12 @@ struct S2Model
     std::vector<std::unique_ptr<G6AttnBinding>> views;       // shallow views of a pool binding (never released / reset)
     std::map<std::tuple<int, int, int>, std::unique_ptr<bind::Layer>> L;              // (layer, M, cls)
     __half *hcat = nullptr, *hprev_b = nullptr;              // draft model: [MX][HID], [S2N][HID]
+    // remote rows release (rt_rows.cuh), set on the main and the draft model alike: a split run's list is its prefix,
+    // rt_window pages below place for the main model's tail (the rows tier maps them, through rt_tail), then the
+    // drafter's whole tail above place, so no page of the drafter is one the main model releases. 0 = off
+    int rt_window = 0;
+    // the main model's tail entries of the run with this list (logical page -> page, -1 none), or null: all -1
+    std::function<const std::vector<int>*(const std::vector<int>& list)> rt_tail;
 };
 
 // pages base, base + 1, .., base + pages - 1: the contiguous run the allocator grants
@@ -130,6 +136,18 @@ inline std::vector<int> s2_cp_map(const S2Model& s, const G6Attn& a, const std::
 {
     std::vector<int> t(n, -1);
 #if defined(G6_CP) && G6_CP
+    if (s.rt_window)   // release: the prefix as below, the main tail from the rows tier, the drafter's past the window
+    {
+        const std::vector<int>* tail = a.cp_nr && s.rt_tail ? s.rt_tail(list) : nullptr;
+        for (size_t lp = 0; lp < t.size(); ++lp)
+        {
+            if ((int)lp < rp) t[lp] = lp < list.size() ? list[lp] : -1;
+            else if (!a.cp_nr) t[lp] = lp + s.rt_window < list.size() ? list[lp + s.rt_window] : -1;
+            else if ((int)lp % a.cp_nr == a.cp_rank) t[lp] = tail && lp < tail->size() ? (*tail)[lp] : -1;
+            else t[lp] = G6_CP_REMOTE;
+        }
+        return t;
+    }
     if (a.cp_nr)
     {
         int j = 0;
@@ -257,7 +275,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         {
             if (m.s2_below > m.cp.R) die("s2: s2_below > G6_CP_R (the runs must stay on the replicated path)");
             const int rp = m.cp.R / 64;
-            s->pool_pages = rp + (a0.table_size - rp) / a0.cp_nr;
+            s->pool_pages = std::min(rp + (a0.table_size - rp) / a0.cp_nr, a0.page_count);   // m.cp.phys may cap it
         }
 #endif
     }

@@ -11,6 +11,7 @@
 #include "scheduler.h"
 #include "../prefix_reuse.h"
 #include "../../kvman-rs/g6kvman.h"
+#include <array>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -122,6 +123,19 @@ public:
     // whether tail() set the CP map's ranks: a run past R carries its own page list, and the engine builds its tables
     // from it (true), or it holds the pool as pages 0, 1, .. on the tables as built (false)
     bool split() const { Lock l(mu_); return g6kv_split(p_) != 0; }
+    // remote rows release (G6_RT_LOCAL): a split run takes its prefix and `pages` main pages, its whole tail above place
+    // ids: the records of each rank's rows store (0 = no limit): a request whose tail needs more waits
+    void window(uint32_t pages, uint32_t ids) { Lock l(mu_); check(g6kv_window(p_, pages, ids)); }
+    // a window request of `worst` rows with a record limit: {records per rank it needs, free, in all}, or nothing
+    std::optional<std::array<uint64_t, 3>> ids_view(uint64_t worst) const {
+        Lock l(mu_); std::array<uint64_t, 3> v{};
+        return g6kv_ids_view(p_, worst, v.data()) ? std::optional<std::array<uint64_t, 3>>(v) : std::nullopt;
+    }
+    // a past-R request of `worst` rows: {pages below place, above, free below, free above}, or nothing
+    std::optional<std::array<uint64_t, 4>> split_view(uint64_t worst) const {
+        Lock l(mu_); std::array<uint64_t, 4> v{};
+        return g6kv_split_view(p_, worst, v.data()) ? std::optional<std::array<uint64_t, 4>>(v) : std::nullopt;
+    }
     // the stores write at most milli / 1000 blocks per page of KV computed (0 = no limit)
     void write_limit(uint64_t milli) { Lock l(mu_); g6kv_write_limit(p_, milli); }
     // the copies queued since the last io(), in the order to run them. Then io_done()

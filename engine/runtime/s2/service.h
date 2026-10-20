@@ -21,6 +21,8 @@ struct PoolHooks {
     // shares the pool, kvman-rs pool.rs), and every live run still able to reach its worst case (pool.h fits). false is
     // counted as an admission stall
     std::function<bool(uint64_t rows, uint64_t worst)> fits;
+    // optional (remote rows release): why a stalled request past R does not fit its page classes; empty = no reason
+    std::function<std::string(uint64_t worst)> refusal;
     // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
     std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
     // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
@@ -103,6 +105,7 @@ class Service {
     // burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each behind
     // 8,192-row prefill quanta). Default off: one admission per notice, as before.
     const bool admit_hold_ = ::getenv("G6_S2_ADMIT_HOLD") && *::getenv("G6_S2_ADMIT_HOLD") == '1';
+    uint64_t refused_ = UINT64_MAX;   // the last request the refusal line named (head)
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
         stopping_.store(true); endpoint_->fail();
@@ -192,6 +195,12 @@ class Service {
                 const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
                 const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.fits(rows, worst), native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
+                if (fit->why == Stall::Capacity && native_.pool.refusal && refused_ != request->id)
+                    if (const std::string why = native_.pool.refusal(worst); !why.empty()) {
+                        refused_ = request->id;   // once per request
+                        fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
+                                (unsigned long long)worst, why.c_str());
+                    }
                 if (fit->why == Stall::None) {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
@@ -205,8 +214,17 @@ class Service {
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
                                 h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
-                    if (!skip) run = native_.pool.reserve(rows, worst);
-                    cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
+                    // a pool that said it fits and then refuses is a bug, but one request's: it waits, the epoch goes on
+                    bool got = true;
+                    if (!skip) {
+                        try { run = native_.pool.reserve(rows, worst); }
+                        catch (const std::exception& e) {
+                            got = false;
+                            fprintf(stderr, "# s2: request %llu (%llu rows): the pool refused its reservation after fits(): %s; it waits\n",
+                                    (unsigned long long)request->id, (unsigned long long)worst, e.what());
+                        }
+                    }
+                    if (got) cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
                 if (cm.admit) {

@@ -197,9 +197,19 @@ struct g6kv_rows;
 struct g6kv_rows_ent { uint64_t off; uint32_t slot, pad; };
 struct g6kv_rows_req { uint64_t seq; uint32_t n, pad; };   // cap g6kv_rows_ent follow it
 #define G6KV_ROWS_HEADER 4096
+// (pool) remote rows release: a split run's main pages past its prefix (0 = off; needs g6kv_tail, before any grant),
+// and the records of each rank's rows store (0 = no limit): a window request whose tail needs more waits
+int g6kv_window(g6kv_pool* p, uint32_t pages, uint32_t ids);
+// (pool) a window request of `worst` rows with a record limit: 1 and {records per rank it needs, free, in all} in out
+int g6kv_ids_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
+// (pool) a request of `worst` rows past R: 1 and {pages below place, pages above, free below, free above} in out
+int g6kv_split_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
 int g6kv_rows_open(const char* spec, const char* name, const char* layout, uint64_t bytes, g6kv_rows** out);
 void g6kv_rows_free(g6kv_rows* r);
 int g6kv_rows_write(const g6kv_rows* r, uint64_t off, const void* buf, size_t len);
+// n pieces of len bytes, piece k at store byte offs[k], into dst + k * len (the engine's prefill staging of released
+// pages; not while a decode request is in flight)
+int g6kv_rows_gather(const g6kv_rows* r, const uint64_t* offs, size_t n, size_t len, void* dst);
 int g6kv_rows_register(const g6kv_rows* r, void* p, size_t len);
 // before g6kv_rows_start; returns the group's index
 int g6kv_rows_group(g6kv_rows* r, g6kv_rows_req* req, uint64_t* done, void* slots, size_t rec, uint32_t nslots, uint32_t cap);

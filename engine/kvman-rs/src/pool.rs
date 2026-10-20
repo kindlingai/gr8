@@ -151,6 +151,14 @@ pub struct Pool {
     // built); above 0 it takes its own pages in two classes: the prefix (R/64 pages) and its shard (ceil of the tail
     // pages / nr) from [0, place), the rest (the drafter's copy of the tail) from [place, pages)
     nr: u32,
+    // remote rows release (the engine's G6_RT_LOCAL, with nr > 0): a split run's main class is its prefix and `window`
+    // pages (the rows tier cycles its tail through them), and its drafter class the whole tail, so the drafter never
+    // holds a page the main model releases. Such a run is never retained: its tail rows are in its own rows store
+    // records, which live only as long as the run. 0 = off
+    window: u32,
+    // with window: the records each rank's rows store holds (its lease), 0 = no limit. A window run takes the most
+    // records one rank can need for its tail, ceil(tail pages / nr), at its grant, as it takes its pages
+    ids: u32,
     version: u32,
     live: u32,
     live_hi: u32, // of live: the pages at or above place (the drafter's tail copies of split runs)
@@ -191,6 +199,8 @@ impl Pool {
             place: place_pages,
             below_rows,
             nr: 0,
+            window: 0,
+            ids: 0,
             version: 0,
             live: 0,
             live_hi: 0,
@@ -423,6 +433,51 @@ impl Pool {
         }
     }
 
+    /// Remote rows release: the main pages of a split run past its prefix (0 = off). Before any reservation.
+    /// `ids`: the records of each rank's rows store (0 = no limit); a request whose tail needs more than are free waits.
+    pub fn window(&mut self, pages: u32, ids: u32) -> Result<(), Error> {
+        if self.nr == 0 || self.live != 0 || !self.kept.is_empty() || (pages == 0 && ids != 0) {
+            return Err(Error::BadArgument);
+        }
+        self.window = pages;
+        self.ids = ids;
+        Ok(())
+    }
+
+    // a live window run's records on the rank that holds the most of its tail
+    fn ids_of(&self, h: &Held) -> u64 {
+        if !h.exclusive || self.window == 0 {
+            return 0;
+        }
+        let tail = (h.list.len() as u64).saturating_sub(self.below_rows as u64 / PAGE + self.window as u64);
+        tail.div_ceil(self.nr.max(1) as u64)
+    }
+
+    /// With window and a lease limit: the records no live window run holds.
+    pub fn ids_free(&self) -> Option<u64> {
+        (self.ids > 0).then(|| (self.ids as u64).saturating_sub(self.held.values().map(|h| self.ids_of(h)).sum::<u64>()))
+    }
+
+    /// For a request of `worst` rows past R: the pages it takes below place and above it, and what those classes have
+    /// free now (retained runs count as free). None below R or without page classes.
+    pub fn split_view(&self, worst: u64) -> Option<(u64, u64, u32, u32)> {
+        if self.nr == 0 || !self.exclusive(worst) {
+            return None;
+        }
+        let (main, draft) = self.exclusive_pages(worst);
+        Some((main, draft, self.lo_free(), self.hi_free()))
+    }
+
+    /// For a window request of `worst` rows past R with a lease limit: the records its tail needs per rank, and the
+    /// records free now and in all. None otherwise.
+    pub fn ids_view(&self, worst: u64) -> Option<(u64, u64, u64)> {
+        if self.window == 0 || self.ids == 0 || !self.exclusive(worst) {
+            return None;
+        }
+        let (_, draft) = self.exclusive_pages(worst);
+        Some((draft.div_ceil(self.nr as u64), self.ids_free().unwrap_or(0), self.ids as u64))
+    }
+
     /// Whether a run past R takes its own pages (tail() set the CP map's ranks): the engine builds its tables from
     /// its list instead of using the layers' tables as built.
     pub fn split(&self) -> bool {
@@ -548,10 +603,14 @@ impl Pool {
     fn exclusive_pages(&self, worst: u64) -> (u64, u64) {
         let rp = self.below_rows as u64 / PAGE;
         let t = pages_for(worst).saturating_sub(rp);
+        if self.window > 0 {
+            return (rp + self.window as u64, t);
+        }
         let own = t.div_ceil(self.nr.max(1) as u64).min(t);
         (rp + own, t - own)
     }
 
+    // (a window run's list is its prefix, window and tail: `window` pages longer than its worst case)
     pub fn free_pages(&self) -> u32 {
         if self.exclusive {
             0
@@ -718,8 +777,14 @@ impl Pool {
         let rows_max = if exclusive { self.below_rows as u64 } else { u64::MAX };
         if namespace == STOCK_NAMESPACE {
             if let Some(s) = &mut self.stash {
+                // a run past R promotes at most its prefix (rows_max), which is on pool pages even in a window run
                 s.promote(&list, &st, rows_max, span);
             }
+        }
+        // a window run's tail rows sit in its rows store records, which die with it, and its list past the prefix is
+        // its window: nothing to retain or adopt
+        if exclusive && self.window > 0 {
+            return Ok(());
         }
         self.age += 1;
         self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace });
@@ -745,7 +810,7 @@ impl Pool {
             return best;
         }
         let w = pages_for(worst);
-        let n = if self.exclusive(worst) { w } else { pages_for(rows) };
+        let n = if self.exclusive(worst) { w + self.window as u64 } else { pages_for(rows) };
         for k in &self.kept {
             if k.namespace != namespace {
                 if best.skip == 0 {
@@ -835,7 +900,8 @@ impl Pool {
             let room = (self.live == 0 || self.nr > 0)
                 && !self.exclusive
                 && n <= self.pages as u64
-                && (tail || a * PAGE <= self.below_rows as u64);
+                // a window run's list past its prefix is its window, not its logical tail: only the prefix restores
+                && ((tail && self.window == 0) || a * PAGE <= self.below_rows as u64);
             if self.nr == 0 || !room {
                 return room && n <= self.prefix_online() as u64;
             }
@@ -851,7 +917,7 @@ impl Pool {
     fn take_stored(&mut self, skip: i32, id: u64, tier: usize, rows: u64, worst: u64) -> Result<Run, Error> {
         let e = self.stash.as_ref().and_then(|s| s.find(tier, id)).ok_or(Error::NotRetained)?;
         let w = pages_for(worst);
-        let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w } else { pages_for(rows) });
+        let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w + self.window as u64 } else { pages_for(rows) });
         if a > self.restorable(e, worst) || !self.restore_room(a, n, w, worst, e.tail.is_some()) {
             return Err(Error::NoRoom);
         }
@@ -932,7 +998,7 @@ impl Pool {
         }
         let i = self.kept.iter().position(|k| k.age == age).ok_or(Error::NotRetained)?;
         let w = pages_for(worst);
-        let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w } else { pages_for(rows) });
+        let (a, n) = (pages_for(skip as u64), if self.exclusive(worst) { w + self.window as u64 } else { pages_for(rows) });
         // checks the C++ pool left to match(): a hit from match() on this state always passes them
         let k = &self.kept[i];
         if a > k.list.len() as u64 || a > n {
@@ -990,6 +1056,10 @@ impl Pool {
     /// Every rank's pool must agree: folded into Scheduler::digest at each event boundary.
     pub fn digest(&self) -> u64 {
         let mut h = mix(mix(mix(FNV_OFFSET, self.version as u64), self.age), self.exclusive as u64);
+        if self.window > 0 {
+            h = mix(h, 0x7274_0000_0000_0000 | self.window as u64);   // a pool without the window hashes as before
+            h = mix(h, self.ids as u64);
+        }
         for (p, _) in self.used.iter().enumerate().filter(|(_, &u)| u) {
             h = mix(h, p as u64);
         }
@@ -1236,7 +1306,10 @@ impl Pool {
     // whether a split run holding `low` pages below place and `high` above it fits beside the live runs, with every
     // run below R still able to reach its worst case (safe_with)
     fn split_room(&self, low: u64, high: u64) -> bool {
+        // a window run's tail also needs its records in every rank's lease (high = its tail pages)
+        let ids_ok = self.window == 0 || self.ids_free().map_or(true, |f| high.div_ceil(self.nr as u64) <= f);
         !self.exclusive
+            && ids_ok
             && low <= self.lo_free() as u64
             && high <= self.hi_free() as u64
             && self.safe_with(self.place_online(), None, None, Some(low))
