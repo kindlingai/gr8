@@ -6,6 +6,7 @@
 #include "dispatch.h"
 #include "pool.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <thread>
@@ -361,7 +362,15 @@ public:
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
         h.finished = [&](const Slot& s) { retire_run(s); };
         if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
-            h.settle = [&] { if (native_.drained()) endpoint_->sync(++sync_); };
+            h.settle = [&] {
+                if (!native_.drained()) return;
+                // the barrier after a drain: every rank waits here for the slowest rank's drain (the drain trace's other
+                // half: the tier io lines carry the same ranks' drains)
+                auto wall = [] { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); };
+                const long long b0 = wall();
+                endpoint_->sync(++sync_);
+                fprintf(stderr, "# rank %u: s2 drain barrier %llu: in %lld ms, out %lld ms\n", (unsigned)c_.rank, (unsigned long long)sync_, b0, wall());
+            };
         if (native_.pool.grow)
             h.grow = [&](const Slot& s, uint64_t rows) {
                 const auto r = native_.pool.grow(s.run, rows);
