@@ -1460,6 +1460,9 @@ int main(int argc, char** argv)
                                         "%llu released, peak %d local tail pages; %llu rows fetched, %zu of %d record ids free\n", q,
                                 (unsigned long long)sq.released, sq.peak, sq.window, (unsigned long long)rtt->released, rtt->peak,
                                 (unsigned long long)rt_fetched(*rtt), rtt->vfree.size(), rtt->V);
+                    if (rtt->hold)
+                        fprintf(stderr, "# rank %d: G6_RT_CHECK: %llu released group pages read back, %llu differed\n", R,
+                                (unsigned long long)rtt->readback, (unsigned long long)rtt->readback_bad);
                     rt_end(*rtt, q, st);
                     if (rt_layers == q) rt_layers = -1;
                 }

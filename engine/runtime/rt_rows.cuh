@@ -84,6 +84,7 @@ struct RtTier
     int peak = 0;                     // the most local tail pages of one session at once, over all sessions
     uint64_t released = 0;
     bool hold = false;                // release with G6_RT_CHECK=1: rt_check after every change (one holder per record)
+    uint64_t readback = 0, readback_bad = 0;   // with hold: released pages' records read back after the write, and how many differed
     uint8_t* stage = nullptr;         // pinned: one layer's rows of the released pages a prefill gathers
     size_t stage_bytes = 0;
     ~RtTier() { if (store) g6kv_rows_free(store); }
@@ -383,6 +384,21 @@ inline void rt_write_page(Model& m, RtTier& t, int p, int v, std::vector<uint8_t
         rt_page_record(m, t, G, p, buf, st);
         if (g6kv_rows_write(t.store, G.h.base + (uint64_t)v * 64 * rec, buf.data(), buf.size()))
             die(std::string("G6_RT_STORE write: ") + g6kv_tier_error());
+        if (t.hold)   // G6_RT_CHECK: the records read back as written, on the path a staged prefill reads them by
+        {
+            std::vector<uint8_t> back(buf.size());
+            const uint64_t off = G.h.base + (uint64_t)v * 64 * rec;
+            if (g6kv_rows_gather(t.store, &off, 1, back.size(), back.data())) die(std::string("G6_RT_CHECK read-back: ") + g6kv_tier_error());
+            ++t.readback;
+            if (back != buf)
+            {
+                size_t k = 0;
+                while (back[k] == buf[k]) ++k;
+                fprintf(stderr, "# rank %d: G6_RT_CHECK read-back of id %d group %zu differs from byte %zu (record %zu) on\n", t.rank, v,
+                        (size_t)(&G - t.g.data()), k, k / rec);
+                ++t.readback_bad;
+            }
+        }
         const G6Attn& a = m.layers[G.layers[0]].ab.args;
         if (G.ix && a.index_cache)
             G6RT_CK(cudaMemcpy(G.ix + (size_t)v * 64 * g6kv::IDX_ROW, (const uint8_t*)a.index_cache + (size_t)p * 64 * g6kv::IDX_ROW,

@@ -2073,6 +2073,18 @@ inline unsigned long long cp_pf_mismatches(Model& m)
     if (m.cp.pf_net) G6RT_CK(cudaMemcpy(&c, cp_pf_net(m).vcount, 8, cudaMemcpyDeviceToHost));
     return c;
 }
+// the local half of begin(layer i): the pages below start this rank holds -> its pool k, the ones the rows tier released
+// from the store (CpState::rt_stage). m4sim's G6_CP_PF_NET runs it too, then copies each rank's tail pages as the proxy
+// would, so the staging code it tests is this one.
+inline void cp_pf_fill_local(Model& m, int i, int start, unsigned* err, cudaStream_t st)
+{
+    const G6Attn& a = m.cp.pf_saved[i];
+    const int k = cp_pf_k(m, i), ps = a.page_size, Rp = m.cp.R / ps, np = (start + ps - 1) / ps, nr = g6nr::NR;
+    const size_t ixoff = cp_pf_ixoff(m, i);
+    if (np) k_cp_pf_fill<<<np, 256, 0, st>>>((const char*)a.mla_cache, a.block_table, m.cp.pf_pool[k], nr, m.rank, Rp, ps, err,
+                                             (const char*)a.index_cache, ixoff, a.page_count);
+    if (m.cp.rt_stage) m.cp.rt_stage(i, start, m.cp.pf_pool[k], ixoff, st);
+}
 // begin(layer i): local fill of pool k, (verify) my hash -> aux_out[k], doorbell k; proxy job S(g)
 inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
 {
@@ -2082,9 +2094,7 @@ inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
     const unsigned long long g = m.cp.pf_g0 + i;
     G6RT_CK(cudaStreamWaitEvent(st, n.done[k], 0));    // my previous use of pool k (g - 2) is over (both lanes)
     const size_t ixoff = cp_pf_ixoff(m, i);
-    if (np) k_cp_pf_fill<<<np, 256, 0, st>>>((const char*)a.mla_cache, a.block_table, m.cp.pf_pool[k], nr, m.rank, Rp, ps, n.bd.error,
-                                             (const char*)a.index_cache, ixoff, a.page_count);
-    if (m.cp.rt_stage) m.cp.rt_stage(i, start, m.cp.pf_pool[k], ixoff, st);   // before the hash and the doorbell read the pool
+    cp_pf_fill_local(m, i, start, n.bd.error, st);   // before the hash and the doorbell read the pool
 #if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
     if (n.verify && n.hash2)
     {

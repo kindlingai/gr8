@@ -668,6 +668,13 @@ int main(int argc, char** argv)
         for (Model& m : R)
             rt[m.rank] = rt_build(m, rs, "m4sim-rt-" + tag + (local ? "-rel" : ""), layout + (local ? " released" : ""), L, S, local, 0, MX, poison,
                                   int4, check, st);
+        // G6_CP_PF_NET: the fill stages each rank's released pages, as g6m4's cp_pf_begin
+        if (local)
+            for (Model& m : R)
+            {
+                RtTier* t = rt[m.rank].get();
+                m.cp.rt_stage = [t](int i, int start, char* pool, size_t ixoff, cudaStream_t s) { rt_pf_stage(*t, 0, i, start, {{pool, ixoff}}, s); };
+            }
 #else
         (void)rs;
         die("G6_RT_STORE needs a G6_CP build");
@@ -1046,8 +1053,34 @@ int main(int argc, char** argv)
     const std::string cp_break = getenv("G6_CP_PF_BREAK") ? getenv("G6_CP_PF_BREAK") : "";
     auto cp_enter = [&]() { if (cp_pf) for (Model& m : R) cp_pf_enter(m); };
     auto cp_exit = [&]() { if (cp_pf) for (Model& m : R) cp_pf_exit(m); };
+    // G6_CP_PF_NET=1: the gather as g6m4's real fabric does it: each rank fills its own pool (cp_pf_fill_local, which
+    // stages the pages the rows tier released through CpState::rt_stage), then every rank's tail pages, the rows below
+    // start, go to every other pool as the proxy's RDMA writes would. The lines must equal the loopback gather's
+    const bool pf_net = getenv("G6_CP_PF_NET") && atoi(getenv("G6_CP_PF_NET")) == 1;
+    auto cp_gather_net = [&](int i, int start) {
+        for (Model& m : R) cp_pf_fill_local(m, i, start, err, st);
+        const G6Attn& a = R[0].cp.pf_saved[i];
+        const int ps = a.page_size, Rp = R[0].cp.R / ps, np = (start + ps - 1) / ps;
+        for (int lp = Rp; lp < np; ++lp)
+        {
+            const Model& o = R[lp % NR];
+            const int rows = std::min(ps, start - lp * ps);
+            const char* src = o.cp.pf_pool[cp_pf_k(o, i)];
+            const size_t ixo = cp_pf_ixoff(o, i), ib = ixo + (size_t)lp * ps * CP_IXB;
+            for (Model& m : R)
+            {
+                if (&m == &o) continue;
+                char* dst = m.cp.pf_pool[cp_pf_k(m, i)];
+                G6RT_CK(cudaMemcpyAsync(dst + (size_t)lp * ps * CP_KVB, src + (size_t)lp * ps * CP_KVB, (size_t)rows * CP_KVB, cudaMemcpyDeviceToDevice, st));
+                if (!ixo) continue;
+                G6RT_CK(cudaMemcpyAsync(dst + ib, src + ib, (size_t)rows * 128, cudaMemcpyDeviceToDevice, st));
+                G6RT_CK(cudaMemcpyAsync(dst + ib + (size_t)ps * 128, src + ib + (size_t)ps * 128, (size_t)rows * 4, cudaMemcpyDeviceToDevice, st));
+            }
+        }
+    };
     auto cp_gather = [&](int i, int start) {
         if (!cp_pf || cp_break == "gather") return;
+        if (pf_net) { cp_gather_net(i, start); return; }
         const CpPfSrc s = cp_pf_src(R, i);
         for (Model& m : R) cp_pf_gather(m, s, i, start, st);
         if (!rt[0] || !rt[0]->local) return;
@@ -2006,7 +2039,10 @@ int main(int argc, char** argv)
                 (unsigned long long)rt_local(*rt[r]), (unsigned long long)rt[r]->released, rt[r]->peak, rt[r]->local);
     for (int r = 0; r < NR && rt[0]; ++r)
         if (rt[r]->check) rt_check_print(("spilled rows, rank " + std::to_string(r)).c_str(), rt[r]->spill_ck);
-    if (rt[0] && rt[0]->hold) fprintf(stderr, "# G6_RT_CHECK: every record had one holder after every change\n");
+    if (rt[0] && rt[0]->hold)
+        for (int r = 0; r < NR; ++r)
+            fprintf(stderr, "# G6_RT_CHECK rank %d: every record had one holder after every change; %llu group pages read back, %llu differed\n", r,
+                    (unsigned long long)rt[r]->readback, (unsigned long long)rt[r]->readback_bad);
     if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);
