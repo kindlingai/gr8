@@ -18,8 +18,8 @@ inline void require(bool ok, const char* what) { if (!ok) throw std::runtime_err
 constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
 // The control link's version: the frame magic is "G6S2E" + this digit (control_protocol.h) and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
-// 6 adds Commit::hold.
-constexpr unsigned CONTROL_VERSION = 6;
+// 6 adds Commit::hold. 7 adds the Resize event (Commit::resize).
+constexpr unsigned CONTROL_VERSION = 7;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -156,6 +156,13 @@ inline bool prefill_first(const Slot& a, const Slot& b) {
 // reuse: rows the prefill skips. restored: 0, or 1 + the tier those rows come from (pool.h add_tier). counted: the
 // prefixes the request counted toward (pool.h count)
 struct Grant { Key key; Request req; Run run; uint32_t reuse = 0, restored = 0, counted = 0; };
+// a Resize event: every rank takes pool tier `tier` to `segs` segments of its group lease on a KV node, `slots` blocks
+// (s2/kv_share.h share_apply), at the commit, so every rank's pool queues the same copies
+struct Resize {
+    uint32_t tier = 0;
+    uint64_t segs = 0, slots = 0;
+    bool operator==(const Resize& r) const { return tier == r.tier && segs == r.segs && slots == r.slots; }
+};
 struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;
     std::optional<Key> cancel;
@@ -164,6 +171,8 @@ struct Commit {
     // the SAME boundary (event_gate.h EventGate::applied), so queued admissions land one after another at one boundary
     // instead of one per NOTICE_MIN boundaries. A commit without hold releases the boundary. Never read by apply().
     bool hold = false;
+    // a Resize event's change (no cancel, grant or hold); Driver::apply passes it to DriverHooks::resize
+    std::optional<Resize> resize;
 };
 struct Changes {
     std::vector<Run> freed;
