@@ -788,13 +788,17 @@ impl Pool {
                 best = Hit { skip: t.skip, lcp: t.lcp, why: Why::Hit, age: k.age, stored: false, tier: 0 };
             }
         }
-        // the tiers in order. A stored hit must reuse more rows than the pool's best, since a pool hit is free of copies
-        if namespace != STOCK_NAMESPACE {
-            return best;
-        }
+        // the tiers in order. A stored hit must reuse more rows than the pool's best, since a pool hit is free of copies.
+        // A stored entry matches only its own namespace
         let Some(stash) = &self.stash else { return best };
         for t in 0..stash.tiers() {
             for e in stash.entries(t) {
+                if e.namespace != namespace {
+                    if best.skip == 0 {
+                        best.why = Why::Namespace;
+                    }
+                    continue;
+                }
                 let b = reuse::begin(&self.rules, &e.st, prompt, limit, true);
                 if b.skip <= 0 {
                     if best.skip == 0 && b.lcp >= best.lcp {

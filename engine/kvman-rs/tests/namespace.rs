@@ -126,10 +126,62 @@ fn non_stock_admissions_do_not_count_or_leave_live_stock_metadata() {
     p.retain_namespaced(&run, finished(&prompt), namespace(1)).unwrap();
     assert_eq!(p.io_pending(), 0, "no shared promotion");
     let all = p.reserve(512, 512).unwrap();
-    assert_eq!(p.io_pending(), 0, "no eviction spill");
+    // the evicted non-stock run is stored whole, under its namespace
+    assert!(p.io_pending() > 0, "eviction spills the non-stock run");
     p.release(&all).unwrap();
-    assert!(p.stash().unwrap().entries(0).is_empty());
+    p.io();
+    p.io_done().unwrap();
+    let e = &p.stash().unwrap().entries(0)[0];
+    assert_eq!(e.namespace, namespace(1));
+    assert_eq!(e.base, None);
     assert_eq!(p.count(&prompt, Some(128)), 1, "non-stock eviction cannot remember a stock continuation head");
+}
+
+#[test]
+fn a_stored_non_stock_run_restores_only_in_its_namespace() {
+    let prompt: Vec<i32> = (0..192).collect();
+    let mut p = pool();
+    p.stores(2);
+    p.add_tier(16, g6kvman::stash::Keep::All, None).unwrap();
+    let run = p.reserve(192, 256).unwrap();
+    p.retain_namespaced(&run, finished(&prompt), namespace(1)).unwrap();
+    let all = p.reserve(512, 512).unwrap();
+    p.release(&all).unwrap();
+    p.io();
+    p.io_done().unwrap();
+    for wrong in [STOCK_NAMESPACE, namespace(2)] {
+        let miss = p.match_prefix_namespaced(&prompt, 192, 256, 191, wrong);
+        assert_eq!(miss.skip, 0);
+        assert!(!miss.stored);
+        assert_eq!(miss.why, Why::Namespace);
+    }
+    let hit = p.match_prefix_namespaced(&prompt, 192, 256, 191, namespace(1));
+    assert!(hit.stored);
+    assert_eq!(hit.skip, 128);
+    let before = p.digest();
+    p.take_hit(hit.skip, hit.age, Some(hit.tier), 192, 256).unwrap();
+    assert_ne!(p.digest(), before);
+    assert!(p.io_pending() > 0, "the restore copies are queued");
+    assert!(p.stash().unwrap().entries(0).is_empty(), "an evicted entry leaves its tier on restore");
+}
+
+#[test]
+fn non_stock_entries_differ_in_the_digest_by_namespace() {
+    let prompt: Vec<i32> = (0..192).collect();
+    let digest = |ns: Namespace| {
+        let mut p = pool();
+        p.stores(2);
+        p.add_tier(16, g6kvman::stash::Keep::All, None).unwrap();
+        let run = p.reserve(192, 256).unwrap();
+        p.retain_namespaced(&run, finished(&prompt), ns).unwrap();
+        let all = p.reserve(512, 512).unwrap();
+        p.release(&all).unwrap();
+        p.io();
+        p.io_done().unwrap();
+        assert_eq!(p.stash().unwrap().entries(0).len(), 1);
+        p.digest()
+    };
+    assert_ne!(digest(namespace(1)), digest(namespace(2)));
 }
 
 #[test]
@@ -146,17 +198,19 @@ fn non_stock_prefixes_never_enter_or_restore_a_persistent_tier() {
             assert_eq!(p.count_namespaced(&prompt, Some(128), namespace(tag)), 0);
             let r = p.reserve(192, 256).unwrap();
             p.retain_namespaced(&r, finished(&prompt), namespace(tag)).unwrap();
-            assert_eq!(p.io_pending(), 0);
+            assert_eq!(p.io_pending(), 0, "no shared promotion");
             let all = p.reserve(512, 512).unwrap();
-            assert_eq!(p.io_pending(), 0);
             p.release(&all).unwrap();
+            p.io();
             p.io_done().unwrap();
-            assert!(p.stash().unwrap().entries(0).is_empty());
+            // stored as evicted runs only: never a prefix kind, never in the index
+            assert!(p.stash().unwrap().entries(0).iter().all(|e| !e.kind.prefix() && e.namespace != STOCK_NAMESPACE));
         }
     }
     let mut reopened = pool();
     reopened.stores(2);
     reopened.add_tier(16, Keep::All, Some((&dir, "namespace-test"))).unwrap();
+    assert!(reopened.stash().unwrap().entries(0).is_empty());
     for ns in [STOCK_NAMESPACE, namespace(1), namespace(2)] {
         let hit = reopened.match_prefix_namespaced(&prompt, 192, 256, 191, ns);
         assert_eq!(hit.skip, 0);

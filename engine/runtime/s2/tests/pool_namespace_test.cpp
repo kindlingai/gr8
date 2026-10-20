@@ -114,8 +114,16 @@ static void store(const char* spec) {
     CHECK(pool.count(p, 128, ns) == 0);
     auto r = pool.reserve(192, 256); write(r, 10000); pool.retain(r, finished(p, ns));
     CHECK(copies() == 0 && pool.tiers()[0].free_slots == 16);
-    auto all = pool.reserve(512); CHECK(copies() == 0); pool.release(all);
+    // A non-stock run spills under its namespace and restores its own bytes, only for that namespace.
+    auto all = pool.reserve(512); CHECK(copies() > 0); pool.release(all);
     CHECK(pool.match(p, 192, 256, 191).skip == 0);
+    const auto hn = pool.match(p, 192, 256, 191, ns); CHECK(hn.stored && hn.skip == 128);
+    r = pool.take(hn, 192, 256); CHECK(copies() > 0);
+    {
+        const auto list = pool.list(r);
+        for (int i = 0; i < hn.skip; ++i) CHECK(dev[list[i / 64]][i % 64] == p[i] + 10000);
+    }
+    pool.release(r);
     CHECK(pool.match(p, 192, 256, 191, ns).skip == 0);
 
     // Stock spill/restore still works through the same memory/file/remote backend.
