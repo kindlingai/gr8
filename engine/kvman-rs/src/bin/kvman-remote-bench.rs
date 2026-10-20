@@ -88,7 +88,13 @@ fn main() {
     }
     if let Some(gb) = local {
         let n = Node::new(
-            &Config { bytes: (gb * (1u64 << 30) as f64) as usize, lock: false, rdma: true, qp_timeout: 14 },
+            &Config {
+                bytes: (gb * (1u64 << 30) as f64) as usize,
+                lock: false,
+                rdma: true,
+                qp_timeout: 14,
+                share: Default::default(),
+            },
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap_or_else(|e| panic!("local node: {e}"));

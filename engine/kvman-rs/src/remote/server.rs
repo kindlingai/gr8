@@ -1,11 +1,21 @@
 //! The KV node: locked memory cut into leases, served over TCP and, where the connection arrived on an address with a
 //! RoCE v2 GID, to one-sided RDMA from the client.
 //!
-//! A lease is a contiguous range of the arena, named by its client. Only one live lease holds a name, so two ranks (or a
-//! test and a live engine) that name themselves apart can never write into each other's blocks: the TCP path checks
-//! every offset against the lease, and for RDMA each lease has its own protection domain holding one memory region over
-//! exactly its range, with its clients' QPs. The NIC refuses a QP of one lease that presents another lease's rkey, or an
-//! address outside its region. A lease is zeroed when it is granted and freed when its last connection closes.
+//! A lease is named by its client. Only one live lease holds a name, so two ranks (or a test and a live engine) that
+//! name themselves apart can never write into each other's blocks: the TCP path checks every offset against the lease,
+//! and for RDMA each lease has its own protection domain holding one memory region per segment of the lease, with its
+//! clients' QPs. The NIC refuses a QP of one lease that presents another lease's rkey, or an address outside its
+//! regions. A lease's memory is zeroed when it is granted and freed when its last connection closes.
+//!
+//! Two kinds of lease. OPEN takes one contiguous range of a fixed size (one segment the size of the lease). GOPEN
+//! joins a GROUP: the leases of one cluster's ranks (same block size, same rank count). A group lease is a list of
+//! fixed-size segments, each holding a whole number of blocks; it starts at the group's floor and grows (GROW) or
+//! shrinks (SHRINK) by segments between floor and cap. The group's head REPORTs its demand and how long ago its coldest
+//! blocks were used. The node answers with a grant (segments held for every rank of the group, which each rank then
+//! GROWs into) or with a request to give segments back. When the node is short, it asks the group whose coldest blocks
+//! are the oldest (by more than the margin, weighted) to give: the coldest chat across all the models on the node. The
+//! node never takes a segment back on its own: a cluster's ranks hold their blocks in lock step, so only the cluster
+//! can drop them, at one event on every rank (stash.rs resize_tier). REMOTE-TIER.md, "Sharing a node".
 
 use super::proto::{self, Header};
 use super::sys::{self, Arena};
@@ -15,12 +25,42 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 /// Leases start and end on 2 MiB boundaries of the arena.
 pub const LEASE_ALIGN: usize = 2 << 20;
 const GATHER_CHUNK: usize = 1 << 20;
+/// Ages a REPORT carries at most.
+pub const MAX_AGES: u64 = 64;
+
+/// How group leases share the node.
+#[derive(Clone, Debug)]
+pub struct Share {
+    /// Bytes of one segment, the unit a group lease grows and shrinks by (rounded up to LEASE_ALIGN).
+    pub seg_bytes: usize,
+    /// A group is asked to give only when its coldest blocks are this much older than the asking group's coldest.
+    pub margin: Duration,
+    /// A grant no rank grew into goes back to free after this.
+    pub grant_ttl: Duration,
+    /// A group that has not given what it was asked within this is marked stalled, and not asked again until it
+    /// shrinks.
+    pub stall: Duration,
+    /// A group that gave is not asked again for this long.
+    pub cooldown: Duration,
+}
+
+impl Default for Share {
+    fn default() -> Share {
+        Share {
+            seg_bytes: 1 << 30,
+            margin: Duration::from_secs(60),
+            grant_ttl: Duration::from_secs(30),
+            stall: Duration::from_secs(10),
+            cooldown: Duration::from_secs(10),
+        }
+    }
+}
 
 pub struct Config {
     pub bytes: usize,
@@ -30,13 +70,113 @@ pub struct Config {
     pub rdma: bool,
     /// The ack timeout exponent for the node's QPs (verbs::Qp::connect).
     pub qp_timeout: u8,
+    pub share: Share,
+}
+
+struct Member {
+    lease: u64,
+    segs: u64,
+}
+
+struct Group {
+    nr: u32,
+    block_bytes: usize,
+    floor: u64,
+    cap: u64,
+    weight: u64,
+    members: BTreeMap<u32, Member>,
+    // segments held for ranks that have not opened yet (their floors), and granted ones no rank grew into yet
+    boot: u64,
+    grant: u64,
+    grant_at: Instant,
+    // every rank down to this many segments, asked then
+    give: Option<(u64, Instant)>,
+    stalled: bool,
+    calm_until: Option<Instant>,
+    ages: Vec<u64>,
+    demand: u64,
+    reports: u64,
+    granted: u64,
+    gave: u64,
+    asked: u64,
+}
+
+impl Group {
+    // segments per rank: the most any rank holds
+    fn segs(&self) -> u64 {
+        self.members.values().map(|m| m.segs).max().unwrap_or(self.floor)
+    }
+    fn reserved(&self) -> u64 {
+        self.boot + self.grant
+    }
+    fn complete(&self) -> bool {
+        self.members.len() == self.nr as usize
+    }
+    // the age of its coldest blocks as the node compares them: weight 1000 is 1x, 2000 counts them half as old
+    fn cold(&self) -> u64 {
+        self.ages.first().map_or(0, |&a| a.saturating_mul(1000) / self.weight.max(1))
+    }
 }
 
 struct State {
     free: BTreeMap<usize, usize>,
     leases: BTreeMap<u64, Weak<Lease>>,
     names: BTreeMap<String, u64>,
+    groups: BTreeMap<String, Group>,
     next_id: u64,
+}
+
+impl State {
+    fn free_segs(&self, seg: usize) -> u64 {
+        self.free.values().map(|&l| (l / seg) as u64).sum()
+    }
+    fn reserved(&self) -> u64 {
+        self.groups.values().map(Group::reserved).sum()
+    }
+    // segments nobody holds or has been promised
+    fn unclaimed(&self, seg: usize) -> u64 {
+        self.free_segs(seg).saturating_sub(self.reserved())
+    }
+    fn tick(&mut self, now: Instant, sh: &Share) {
+        for g in self.groups.values_mut() {
+            if g.grant > 0 && now.duration_since(g.grant_at) > sh.grant_ttl {
+                g.grant = 0;
+            }
+            if let Some((_, at)) = g.give {
+                if now.duration_since(at) > sh.stall {
+                    g.give = None;
+                    g.stalled = true;
+                }
+            }
+        }
+    }
+    // the group `req` is `short` segments short: ask the group with the coldest blocks to give them, if any is colder
+    // than `req`'s own coldest by the margin
+    fn ask(&mut self, req: &str, short: u64, now: Instant, sh: &Share) {
+        let mine = self.groups[req].cold();
+        let margin = sh.margin.as_millis() as u64;
+        let pick = self
+            .groups
+            .iter()
+            .filter(|(n, v)| {
+                *n != req
+                    && v.complete()
+                    && v.give.is_none()
+                    && !v.stalled
+                    && v.calm_until.is_none_or(|t| now >= t)
+                    && v.segs() > v.floor
+                    && !v.ages.is_empty()
+                    && v.cold() > mine.saturating_add(margin)
+            })
+            .max_by_key(|(_, v)| v.cold())
+            .map(|(n, _)| n.clone());
+        if let Some(n) = pick {
+            let v = self.groups.get_mut(&n).expect("picked");
+            let k = short.div_ceil(v.nr as u64).min(v.segs() - v.floor);
+            v.give = Some((v.segs() - k, now));
+            v.asked += 1;
+        }
+    }
 }
 
 pub struct Shared {
@@ -45,19 +185,25 @@ pub struct Shared {
     devices: Mutex<HashMap<Ipv4Addr, Arc<Device>>>,
     cfg_rdma: bool,
     qp_timeout: u8,
+    share: Share,
     started: Instant,
     opened: AtomicU64,
 }
 
-/// A lease's protection domain and memory region on one device.
-type Region = (Arc<Pd>, Arc<Mr>);
+/// A lease's protection domain and one memory region per segment, on one device.
+type Region = (Arc<Pd>, Vec<Arc<Mr>>);
 
 pub struct Lease {
     pub id: u64,
     pub name: String,
-    off: usize,
-    pub len: usize,
     pub block_bytes: usize,
+    // lease bytes per segment: the whole lease (OPEN), or a whole number of blocks (GOPEN)
+    span: usize,
+    // arena bytes per segment
+    seg_len: usize,
+    // each segment's offset in the arena, in lease order. Lock order: regions, then segs, then the node's state
+    segs: RwLock<Vec<usize>>,
+    group: Option<(String, u32)>,
     token: [u8; 16],
     regions: Mutex<HashMap<String, Region>>,
     conns: AtomicU64,
@@ -68,41 +214,77 @@ pub struct Lease {
 }
 
 impl Lease {
-    fn ptr(&self, off: u64) -> *mut u8 {
-        unsafe { self.shared.arena.base().add(self.off + off as usize) }
+    /// Bytes of the lease now.
+    pub fn len(&self) -> usize {
+        self.segs.read().unwrap().len() * self.span
     }
-    fn check(&self, off: u64, len: u64) -> bool {
-        off.checked_add(len).is_some_and(|end| end <= self.len as u64)
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
-    /// This lease's region on `dev`, registered on first use.
+    // the memory of lease bytes off..off + len, which must lie in one segment
+    fn addr(&self, segs: &[usize], off: u64, len: u64) -> Option<*mut u8> {
+        let span = self.span as u64;
+        let (i, at) = ((off / span) as usize, off % span);
+        if i >= segs.len() || len > span - at {
+            return None;
+        }
+        Some(unsafe { self.shared.arena.base().add(segs[i] + at as usize) })
+    }
+    /// This lease's region on `dev`, registered on first use; a segment added since gets its region now.
     fn region(&self, dev: &Arc<Device>) -> io::Result<Region> {
         let mut r = self.regions.lock().unwrap();
-        if let Some(x) = r.get(&dev.name) {
-            return Ok(x.clone());
+        let segs = self.segs.read().unwrap();
+        let (pd, mrs) = match r.get_mut(&dev.name) {
+            Some(x) => x,
+            None => {
+                let pd = Pd::new(dev)?;
+                r.entry(dev.name.clone()).or_insert((pd, Vec::new()))
+            }
+        };
+        while mrs.len() < segs.len() {
+            let p = unsafe { self.shared.arena.base().add(segs[mrs.len()]) };
+            mrs.push(Arc::new(Mr::new(
+                pd,
+                p,
+                self.span,
+                verbs::ACCESS_LOCAL_WRITE | verbs::ACCESS_REMOTE_READ | verbs::ACCESS_REMOTE_WRITE,
+            )?));
         }
-        let pd = Pd::new(dev)?;
-        let mr = Arc::new(Mr::new(
-            &pd,
-            self.ptr(0),
-            self.len,
-            verbs::ACCESS_LOCAL_WRITE | verbs::ACCESS_REMOTE_READ | verbs::ACCESS_REMOTE_WRITE,
-        )?);
-        r.insert(dev.name.clone(), (pd.clone(), mr.clone()));
-        Ok((pd, mr))
+        Ok((pd.clone(), mrs.clone()))
+    }
+    fn zero(&self, offs: &[usize]) {
+        for &o in offs {
+            unsafe { std::ptr::write_bytes(self.shared.arena.base().add(o), 0, self.seg_len) };
+        }
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
         // no QP of this lease is left (each connection holds the lease until its QPs are gone); deregister before the
-        // range can be granted again
+        // ranges can be granted again
         self.regions.lock().unwrap().clear();
+        let segs = std::mem::take(self.segs.get_mut().unwrap());
         let mut st = self.shared.state.lock().unwrap();
         st.leases.remove(&self.id);
         if st.names.get(&self.name) == Some(&self.id) {
             st.names.remove(&self.name);
         }
-        release(&mut st.free, self.off, self.len);
+        for o in segs {
+            release(&mut st.free, o, self.seg_len);
+        }
+        if let Some((g, rank)) = &self.group {
+            let gone = st.groups.get_mut(g).is_some_and(|x| {
+                if x.members.get(rank).is_some_and(|m| m.lease == self.id) {
+                    x.members.remove(rank);
+                }
+                x.members.is_empty()
+            });
+            // the last rank of a group took the group with it, and what it held for the others
+            if gone {
+                st.groups.remove(g);
+            }
+        }
     }
 }
 
@@ -131,6 +313,23 @@ fn alloc(free: &mut BTreeMap<usize, usize>, len: usize) -> Option<usize> {
     Some(off)
 }
 
+// n segments of `seg` bytes, or none (nothing taken)
+fn alloc_segs(free: &mut BTreeMap<usize, usize>, seg: usize, n: u64) -> Option<Vec<usize>> {
+    let mut got = Vec::new();
+    for _ in 0..n {
+        match alloc(free, seg) {
+            Some(o) => got.push(o),
+            None => {
+                for o in got {
+                    release(free, o, seg);
+                }
+                return None;
+            }
+        }
+    }
+    Some(got)
+}
+
 pub struct Node {
     pub shared: Arc<Shared>,
     listener: TcpListener,
@@ -142,16 +341,25 @@ impl Node {
         if bytes == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "the node needs at least 2 MiB"));
         }
+        let mut share = cfg.share.clone();
+        share.seg_bytes = share.seg_bytes.max(1).div_ceil(LEASE_ALIGN) * LEASE_ALIGN;
         let listener = TcpListener::bind(listen)?;
         let arena = Arena::new(bytes, cfg.lock)?;
         let mut free = BTreeMap::new();
         free.insert(0, bytes);
         let shared = Arc::new(Shared {
             arena,
-            state: Mutex::new(State { free, leases: BTreeMap::new(), names: BTreeMap::new(), next_id: 1 }),
+            state: Mutex::new(State {
+                free,
+                leases: BTreeMap::new(),
+                names: BTreeMap::new(),
+                groups: BTreeMap::new(),
+                next_id: 1,
+            }),
             devices: Mutex::new(HashMap::new()),
             cfg_rdma: cfg.rdma,
             qp_timeout: cfg.qp_timeout,
+            share,
             started: Instant::now(),
             opened: AtomicU64::new(0),
         });
@@ -197,6 +405,9 @@ impl Shared {
     pub fn locked(&self) -> bool {
         self.arena.locked
     }
+    pub fn seg_bytes(&self) -> usize {
+        self.share.seg_bytes
+    }
     fn device(&self, ip: Ipv4Addr) -> io::Result<Arc<Device>> {
         let mut d = self.devices.lock().unwrap();
         if let Some(x) = d.get(&ip) {
@@ -207,22 +418,66 @@ impl Shared {
         Ok(dev)
     }
 
-    /// The node's state as JSON: its size, what is free, and each lease.
+    /// The node's state as JSON: its size, what is free, each group and each lease.
     pub fn stats_json(&self) -> String {
         // a lease upgraded here may be the last reference, and its drop takes the state lock: collect, then unlock
-        let (free, largest, leases) = {
-            let st = self.state.lock().unwrap();
+        let seg = self.share.seg_bytes;
+        let (free, largest, free_segs, unclaimed, groups, leases) = {
+            let mut st = self.state.lock().unwrap();
+            st.tick(Instant::now(), &self.share);
             let leases: Vec<Arc<Lease>> = st.leases.values().filter_map(Weak::upgrade).collect();
-            (st.free.values().sum::<usize>(), st.free.values().copied().max().unwrap_or(0), leases)
+            let groups: Vec<String> = st
+                .groups
+                .iter()
+                .map(|(n, g)| {
+                    let segs: Vec<String> = g.members.iter().map(|(r, m)| format!("\"{r}\":{}", m.segs)).collect();
+                    let ages: Vec<String> = g.ages.iter().map(u64::to_string).collect();
+                    format!(
+                        "{{\"name\":\"{}\",\"nr\":{},\"block\":{},\"floor\":{},\"cap\":{},\"weight\":{},\"segs\":{{{}}},\
+                         \"boot\":{},\"grant\":{},\"give\":{},\"stalled\":{},\"demand\":{},\"ages_ms\":[{}],\
+                         \"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
+                        json_escape(n),
+                        g.nr,
+                        g.block_bytes,
+                        g.floor,
+                        g.cap,
+                        g.weight,
+                        segs.join(","),
+                        g.boot,
+                        g.grant,
+                        g.give.map_or(-1, |x| x.0 as i64),
+                        g.stalled,
+                        g.demand,
+                        ages.join(","),
+                        g.reports,
+                        g.granted,
+                        g.gave,
+                        g.asked
+                    )
+                })
+                .collect();
+            (
+                st.free.values().sum::<usize>(),
+                st.free.values().copied().max().unwrap_or(0),
+                st.free_segs(seg),
+                st.unclaimed(seg),
+                groups,
+                leases,
+            )
         };
         let mut s = format!(
-            "{{\"bytes\":{},\"free\":{},\"largest_free\":{},\"locked\":{},\"uptime_s\":{},\"opened\":{},\"leases\":[",
+            "{{\"bytes\":{},\"free\":{},\"largest_free\":{},\"seg_bytes\":{},\"free_segs\":{},\"unclaimed_segs\":{},\
+             \"locked\":{},\"uptime_s\":{},\"opened\":{},\"groups\":[{}],\"leases\":[",
             self.arena.len(),
             free,
             largest,
+            seg,
+            free_segs,
+            unclaimed,
             self.arena.locked,
             self.started.elapsed().as_secs(),
-            self.opened.load(Ordering::Relaxed)
+            self.opened.load(Ordering::Relaxed),
+            groups.join(",")
         );
         let mut first = true;
         for l in &leases {
@@ -232,12 +487,17 @@ impl Shared {
             first = false;
             let devs: Vec<String> =
                 l.regions.lock().unwrap().keys().map(|k| format!("\"{}\"", json_escape(k))).collect();
+            let group = l
+                .group
+                .as_ref()
+                .map_or(String::new(), |(g, r)| format!(",\"group\":\"{}\",\"rank\":{r}", json_escape(g)));
             s += &format!(
-                "{{\"id\":{},\"name\":\"{}\",\"bytes\":{},\"block\":{},\"conns\":{},\"read\":{},\"written\":{},\
-                 \"rdma\":[{}],\"age_s\":{}}}",
+                "{{\"id\":{},\"name\":\"{}\",\"bytes\":{},\"segs\":{},\"block\":{},\"conns\":{},\"read\":{},\
+                 \"written\":{},\"rdma\":[{}],\"age_s\":{}{group}}}",
                 l.id,
                 json_escape(&l.name),
-                l.len,
+                l.len(),
+                l.segs.read().unwrap().len(),
                 l.block_bytes,
                 l.conns.load(Ordering::Relaxed),
                 l.read.load(Ordering::Relaxed),
@@ -265,6 +525,14 @@ fn read_vec(s: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
     Ok(v)
 }
 
+fn u64_at(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+}
+
+fn u32_at(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+}
+
 struct Attached(Arc<Lease>);
 
 impl Drop for Attached {
@@ -279,6 +547,7 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
     // declared before the lease, so this connection's QPs go first
     let mut lease: Option<Attached> = None;
     let mut qps: Vec<Qp> = Vec::new();
+    let mut dev: Option<Arc<Device>> = None;
     loop {
         let h = match Header::read(&mut s) {
             Ok(h) => h,
@@ -291,7 +560,7 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                 Header::new(proto::OK, j.len() as u64, 0, 0).write(&mut s)?;
                 s.write_all(j.as_bytes())?;
             }
-            proto::OPEN | proto::ATTACH if lease.is_some() => {
+            proto::OPEN | proto::ATTACH | proto::GOPEN if lease.is_some() => {
                 fail(&mut s, proto::E_PROTO, "this connection already holds a lease")?;
                 break;
             }
@@ -308,7 +577,44 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                 let name = String::from_utf8(name).expect("ASCII");
                 match open(sh, &name, h.a, h.b) {
                     Ok(l) => {
-                        Header::new(proto::OK, l.id, l.len as u64, 0).write(&mut s)?;
+                        Header::new(proto::OK, l.id, l.len() as u64, 0).write(&mut s)?;
+                        s.write_all(&l.token)?;
+                        l.conns.fetch_add(1, Ordering::Relaxed);
+                        lease = Some(Attached(l));
+                    }
+                    Err((code, msg)) => fail(&mut s, code, &msg)?,
+                }
+            }
+            proto::GOPEN => {
+                if h.a < proto::GOPEN_FIXED as u64 || h.a as usize > proto::GOPEN_FIXED + 2 * proto::NAME_MAX + 1 {
+                    fail(&mut s, proto::E_PROTO, "bad GOPEN length")?;
+                    break;
+                }
+                let b = read_vec(&mut s, h.a as usize)?;
+                let names = &b[proto::GOPEN_FIXED..];
+                let Some(sp) = names.iter().position(|&c| c == b' ') else {
+                    fail(&mut s, proto::E_PROTO, "GOPEN names: \"<group> <lease>\"")?;
+                    continue;
+                };
+                let (group, name) = (&names[..sp], &names[sp + 1..]);
+                if !proto::valid_name(group) || !proto::valid_name(name) {
+                    fail(&mut s, proto::E_PROTO, "a group or lease name is 1-128 printable ASCII characters")?;
+                    continue;
+                }
+                let want = Want {
+                    group: String::from_utf8(group.to_vec()).expect("ASCII"),
+                    name: String::from_utf8(name.to_vec()).expect("ASCII"),
+                    block_bytes: u64_at(&b, 0),
+                    floor_bytes: u64_at(&b, 8),
+                    cap_bytes: u64_at(&b, 16),
+                    nr: u32_at(&b, 24),
+                    rank: u32_at(&b, 28),
+                    weight: u32_at(&b, 32),
+                };
+                match gopen(sh, &want) {
+                    Ok((l, bps)) => {
+                        let n = l.segs.read().unwrap().len() as u64;
+                        Header::new(proto::OK, l.id, n, bps).write(&mut s)?;
                         s.write_all(&l.token)?;
                         l.conns.fetch_add(1, Ordering::Relaxed);
                         lease = Some(Attached(l));
@@ -321,7 +627,7 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                 let l = sh.state.lock().unwrap().leases.get(&h.a).and_then(Weak::upgrade);
                 match l {
                     Some(l) if l.token[..] == token[..] => {
-                        Header::new(proto::OK, l.id, l.len as u64, 0).write(&mut s)?;
+                        Header::new(proto::OK, l.id, l.len() as u64, 0).write(&mut s)?;
                         l.conns.fetch_add(1, Ordering::Relaxed);
                         lease = Some(Attached(l));
                     }
@@ -348,10 +654,10 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                     })
                     .collect();
                 match rdma(sh, &l, &s, &gid, &ends, h.b as u32, h.c as u32) {
-                    Ok((dev, mr, mine)) => {
-                        let c = dev.mtu as u64 | (dev.max_rd_atom as u64) << 32;
+                    Ok((d, mr, mine)) => {
+                        let c = d.mtu as u64 | (d.max_rd_atom as u64) << 32;
                         Header::new(proto::OK, mr.addr(), mr.rkey() as u64, c).write(&mut s)?;
-                        let mut b = dev.gid.to_vec();
+                        let mut b = d.gid.to_vec();
                         for q in &mine {
                             let e = q.end();
                             b.extend_from_slice(&e.qpn.to_le_bytes());
@@ -359,28 +665,82 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                         }
                         s.write_all(&b)?;
                         qps = mine;
+                        dev = Some(d);
                     }
                     Err(e) => fail(&mut s, proto::E_RDMA, &e.to_string())?,
                 }
             }
+            proto::SEGS => {
+                let l = lease.as_ref().unwrap().0.clone();
+                let Some(d) = &dev else {
+                    fail(&mut s, proto::E_PROTO, "SEGS needs RDMA set up on this connection")?;
+                    continue;
+                };
+                match l.region(d) {
+                    Ok((_, mrs)) => {
+                        Header::new(proto::OK, mrs.len() as u64, l.span as u64, 0).write(&mut s)?;
+                        let mut b = Vec::with_capacity(mrs.len() * 16);
+                        for m in &mrs {
+                            b.extend_from_slice(&m.addr().to_le_bytes());
+                            b.extend_from_slice(&(m.rkey() as u64).to_le_bytes());
+                        }
+                        s.write_all(&b)?;
+                    }
+                    Err(e) => fail(&mut s, proto::E_RDMA, &e.to_string())?,
+                }
+            }
+            proto::REPORT => {
+                let l = lease.as_ref().unwrap().0.clone();
+                if h.b > MAX_AGES {
+                    fail(&mut s, proto::E_PROTO, "too many ages")?;
+                    break;
+                }
+                let b = read_vec(&mut s, h.b as usize * 8)?;
+                let ages: Vec<u64> = b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+                match report(sh, &l, h.a, ages) {
+                    Ok((grant, give, unclaimed)) => Header::new(proto::OK, grant, give, unclaimed).write(&mut s)?,
+                    Err((code, msg)) => fail(&mut s, code, &msg)?,
+                }
+            }
+            proto::GROW => {
+                let l = lease.as_ref().unwrap().0.clone();
+                match grow(sh, &l, h.a) {
+                    Ok(n) => Header::new(proto::OK, n, 0, 0).write(&mut s)?,
+                    Err((code, msg)) => fail(&mut s, code, &msg)?,
+                }
+            }
+            proto::SHRINK => {
+                let l = lease.as_ref().unwrap().0.clone();
+                match shrink(sh, &l, h.a) {
+                    Ok(n) => Header::new(proto::OK, n, 0, 0).write(&mut s)?,
+                    Err((code, msg)) => fail(&mut s, code, &msg)?,
+                }
+            }
             proto::READ => {
                 let l = &lease.as_ref().unwrap().0;
-                if !l.check(h.a, h.b) {
-                    fail(&mut s, proto::E_RANGE, &format!("read of {} at {} past the lease ({})", h.b, h.a, l.len))?;
+                let segs = l.segs.read().unwrap();
+                let Some(p) = l.addr(&segs, h.a, h.b) else {
+                    let n = segs.len() * l.span;
+                    drop(segs);
+                    fail(&mut s, proto::E_RANGE, &format!("read of {} at {} past the lease ({n})", h.b, h.a))?;
                     continue;
-                }
+                };
                 Header::new(proto::OK, h.b, 0, 0).write(&mut s)?;
-                unsafe { sys::send_all(fd, l.ptr(h.a), h.b as usize)? };
+                unsafe { sys::send_all(fd, p, h.b as usize)? };
                 l.read.fetch_add(h.b, Ordering::Relaxed);
             }
             proto::WRITE => {
                 let l = &lease.as_ref().unwrap().0;
-                if !l.check(h.a, h.b) {
+                let segs = l.segs.read().unwrap();
+                let Some(p) = l.addr(&segs, h.a, h.b) else {
                     // the payload is on its way: the stream is out of step, so this connection ends
-                    fail(&mut s, proto::E_RANGE, &format!("write of {} at {} past the lease ({})", h.b, h.a, l.len))?;
+                    let n = segs.len() * l.span;
+                    drop(segs);
+                    fail(&mut s, proto::E_RANGE, &format!("write of {} at {} past the lease ({n})", h.b, h.a))?;
                     break;
-                }
-                unsafe { sys::recv_exact(fd, l.ptr(h.a), h.b as usize)? };
+                };
+                unsafe { sys::recv_exact(fd, p, h.b as usize)? };
+                drop(segs);
                 l.written.fetch_add(h.b, Ordering::Relaxed);
                 Header::new(proto::OK, 0, 0, 0).write(&mut s)?;
             }
@@ -391,35 +751,34 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                     break;
                 }
                 let r = read_vec(&mut s, h.a as usize * 16)?;
-                let ranges: Vec<(u64, u64)> = r
-                    .chunks(16)
-                    .map(|c| {
-                        (
-                            u64::from_le_bytes(c[0..8].try_into().unwrap()),
-                            u64::from_le_bytes(c[8..16].try_into().unwrap()),
-                        )
-                    })
-                    .collect();
-                if let Some(&(o, n)) = ranges.iter().find(|&&(o, n)| !l.check(o, n)) {
-                    fail(&mut s, proto::E_RANGE, &format!("gather of {n} at {o} past the lease ({})", l.len))?;
+                let ranges: Vec<(u64, u64)> = r.chunks(16).map(|c| (u64_at(c, 0), u64_at(c, 8))).collect();
+                let segs = l.segs.read().unwrap();
+                let ptrs: Vec<Option<*mut u8>> = ranges.iter().map(|&(o, n)| l.addr(&segs, o, n)).collect();
+                if let Some(i) = ptrs.iter().position(Option::is_none) {
+                    let (o, n) = ranges[i];
+                    let len = segs.len() * l.span;
+                    drop(segs);
+                    fail(&mut s, proto::E_RANGE, &format!("gather of {n} at {o} past the lease ({len})"))?;
                     continue;
                 }
                 let total: u64 = ranges.iter().map(|r| r.1).sum();
                 Header::new(proto::OK, total, 0, 0).write(&mut s)?;
                 // rows are small: one send per row costs more than copying them together
                 let mut buf = Vec::with_capacity(GATHER_CHUNK);
-                for &(o, n) in &ranges {
+                for (&(_, n), p) in ranges.iter().zip(ptrs) {
+                    let p = p.expect("checked");
                     if buf.len() + n as usize > GATHER_CHUNK && !buf.is_empty() {
                         s.write_all(&buf)?;
                         buf.clear();
                     }
                     if n as usize >= GATHER_CHUNK {
-                        unsafe { sys::send_all(fd, l.ptr(o), n as usize)? };
+                        unsafe { sys::send_all(fd, p, n as usize)? };
                     } else {
-                        buf.extend_from_slice(unsafe { std::slice::from_raw_parts(l.ptr(o), n as usize) });
+                        buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n as usize) });
                     }
                 }
                 s.write_all(&buf)?;
+                drop(segs);
                 l.read.fetch_add(total, Ordering::Relaxed);
             }
             op => {
@@ -433,7 +792,43 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
     Ok(())
 }
 
-fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<Arc<Lease>, (u32, String)> {
+type Refusal = (u32, String);
+
+fn new_lease(
+    sh: &Arc<Shared>,
+    st: &mut State,
+    name: &str,
+    block_bytes: usize,
+    span: usize,
+    seg_len: usize,
+    segs: Vec<usize>,
+    group: Option<(String, u32)>,
+) -> Result<Arc<Lease>, Refusal> {
+    let id = st.next_id;
+    st.next_id += 1;
+    let token = sys::random16().map_err(|e| (proto::E_PROTO, e.to_string()))?;
+    let l = Arc::new(Lease {
+        id,
+        name: name.to_string(),
+        block_bytes,
+        span,
+        seg_len,
+        segs: RwLock::new(segs),
+        group,
+        token,
+        regions: Mutex::new(HashMap::new()),
+        conns: AtomicU64::new(0),
+        read: AtomicU64::new(0),
+        written: AtomicU64::new(0),
+        since: Instant::now(),
+        shared: sh.clone(),
+    });
+    st.leases.insert(id, Arc::downgrade(&l));
+    st.names.insert(name.to_string(), id);
+    Ok(l)
+}
+
+fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<Arc<Lease>, Refusal> {
     let len = block_bytes
         .checked_mul(blocks)
         .filter(|&n| block_bytes > 0 && n > 0 && n <= sh.arena.len() as u64)
@@ -442,42 +837,248 @@ fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<A
     let len_al = len.div_ceil(LEASE_ALIGN) * LEASE_ALIGN;
     let l = {
         let mut st = sh.state.lock().unwrap();
+        st.tick(Instant::now(), &sh.share);
         if let Some(id) = st.names.get(name) {
             return Err((proto::E_BUSY, format!("lease {name} is held (id {id}); a name has one holder at a time")));
         }
-        let Some(off) = alloc(&mut st.free, len_al) else {
+        let no_room = |st: &State| {
             let free: usize = st.free.values().sum();
             let largest = st.free.values().copied().max().unwrap_or(0);
-            return Err((
-                proto::E_NOROOM,
-                format!("no room for {len} bytes: {free} free, the largest range {largest}"),
-            ));
+            (proto::E_NOROOM, format!("no room for {len} bytes: {free} free, the largest range {largest}"))
         };
-        let id = st.next_id;
-        st.next_id += 1;
-        let token = sys::random16().map_err(|e| (proto::E_PROTO, e.to_string()))?;
-        let l = Arc::new(Lease {
-            id,
-            name: name.to_string(),
-            off,
-            len: len_al,
-            block_bytes: block_bytes as usize,
-            token,
-            regions: Mutex::new(HashMap::new()),
-            conns: AtomicU64::new(0),
-            read: AtomicU64::new(0),
-            written: AtomicU64::new(0),
-            since: Instant::now(),
-            shared: sh.clone(),
-        });
-        st.leases.insert(id, Arc::downgrade(&l));
-        st.names.insert(name.to_string(), id);
-        l
+        let Some(off) = alloc(&mut st.free, len_al) else { return Err(no_room(&st)) };
+        // what groups were promised stays theirs
+        if st.free_segs(sh.share.seg_bytes) < st.reserved() {
+            release(&mut st.free, off, len_al);
+            return Err(no_room(&st));
+        }
+        new_lease(sh, &mut st, name, block_bytes as usize, len_al, len_al, vec![off], None)?
     };
     // what the last holder of these bytes left is not this client's
-    unsafe { std::ptr::write_bytes(l.ptr(0), 0, l.len) };
+    l.zero(&[l.segs.read().unwrap()[0]]);
     sh.opened.fetch_add(1, Ordering::Relaxed);
     Ok(l)
+}
+
+/// What a rank asks for when it joins a group (GOPEN).
+pub struct Want {
+    pub group: String,
+    pub name: String,
+    pub block_bytes: u64,
+    pub floor_bytes: u64,
+    pub cap_bytes: u64,
+    pub nr: u32,
+    pub rank: u32,
+    /// 1000 = 1x. A group of weight 2000 is asked to give as if its blocks were half as old.
+    pub weight: u32,
+}
+
+// the lease and its blocks per segment
+fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
+    let seg = sh.share.seg_bytes;
+    if w.block_bytes == 0 || w.block_bytes > seg as u64 {
+        return Err((proto::E_NOROOM, format!("a block of {} bytes does not fit a segment of {seg}", w.block_bytes)));
+    }
+    if w.nr == 0 || w.rank >= w.nr {
+        return Err((proto::E_PROTO, format!("rank {} of {}", w.rank, w.nr)));
+    }
+    let bps = seg as u64 / w.block_bytes;
+    let span = bps * w.block_bytes;
+    let floor = w.floor_bytes.div_ceil(span).max(1);
+    let cap = w.cap_bytes.div_ceil(span).max(floor);
+    let weight = if w.weight == 0 { 1000 } else { w.weight as u64 };
+    let l = {
+        let mut st = sh.state.lock().unwrap();
+        let now = Instant::now();
+        st.tick(now, &sh.share);
+        if let Some(id) = st.names.get(&w.name) {
+            return Err((proto::E_BUSY, format!("lease {} is held (id {id}); a name has one holder", w.name)));
+        }
+        let have = st.free_segs(seg);
+        let reserved = st.reserved();
+        match st.groups.get_mut(&w.group) {
+            Some(g) => {
+                if (g.nr, g.block_bytes as u64, g.floor, g.cap) != (w.nr, w.block_bytes, floor, cap) {
+                    return Err((
+                        proto::E_PROTO,
+                        format!(
+                            "group {} has {} ranks, blocks of {}, floor {} and cap {} segments; this rank asks {}, {}, \
+                             {} and {}",
+                            w.group, g.nr, g.block_bytes, g.floor, g.cap, w.nr, w.block_bytes, floor, cap
+                        ),
+                    ));
+                }
+                if g.members.contains_key(&w.rank) {
+                    return Err((proto::E_BUSY, format!("rank {} of group {} is held", w.rank, w.group)));
+                }
+                // a rank's floor comes out of what the group's first rank held for it
+                let from_boot = floor.min(g.boot);
+                if floor - from_boot > have.saturating_sub(reserved) {
+                    return Err((proto::E_NOROOM, format!("no room for {floor} segments of {seg} bytes")));
+                }
+                g.boot -= from_boot;
+            }
+            None => {
+                let need = floor * w.nr as u64;
+                if need > have.saturating_sub(reserved) {
+                    return Err((
+                        proto::E_NOROOM,
+                        format!(
+                            "no room for group {}: {} ranks x {floor} segments of {seg} bytes, {} unclaimed",
+                            w.group,
+                            w.nr,
+                            have.saturating_sub(reserved)
+                        ),
+                    ));
+                }
+                st.groups.insert(
+                    w.group.clone(),
+                    Group {
+                        nr: w.nr,
+                        block_bytes: w.block_bytes as usize,
+                        floor,
+                        cap,
+                        weight,
+                        members: BTreeMap::new(),
+                        boot: floor * (w.nr as u64 - 1),
+                        grant: 0,
+                        grant_at: now,
+                        give: None,
+                        stalled: false,
+                        calm_until: None,
+                        ages: Vec::new(),
+                        demand: 0,
+                        reports: 0,
+                        granted: 0,
+                        gave: 0,
+                        asked: 0,
+                    },
+                );
+            }
+        }
+        let segs = alloc_segs(&mut st.free, seg, floor).ok_or((proto::E_NOROOM, "no room".to_string()))?;
+        let l = new_lease(
+            sh,
+            &mut st,
+            &w.name,
+            w.block_bytes as usize,
+            span as usize,
+            seg,
+            segs,
+            Some((w.group.clone(), w.rank)),
+        )?;
+        st.groups.get_mut(&w.group).expect("made").members.insert(w.rank, Member { lease: l.id, segs: floor });
+        l
+    };
+    l.zero(&l.segs.read().unwrap());
+    sh.opened.fetch_add(1, Ordering::Relaxed);
+    Ok((l, bps))
+}
+
+fn group_of(l: &Lease) -> Result<&(String, u32), Refusal> {
+    l.group.as_ref().ok_or((proto::E_PROTO, "this lease is not in a group (GOPEN)".to_string()))
+}
+
+// (segments per rank granted now, segments per rank asked back, unclaimed segments)
+fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u64, u64, u64), Refusal> {
+    let (name, _) = group_of(l)?;
+    let seg = sh.share.seg_bytes;
+    let mut st = sh.state.lock().unwrap();
+    let now = Instant::now();
+    st.tick(now, &sh.share);
+    let unclaimed = st.unclaimed(seg);
+    let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
+    g.ages = ages;
+    g.demand = demand;
+    g.reports += 1;
+    let mut grant = 0;
+    let mut short = 0;
+    if demand > 0 && g.give.is_none() && g.complete() {
+        let want = demand.min(g.cap.saturating_sub(g.segs()));
+        let nr = g.nr as u64;
+        grant = (unclaimed / nr).min(want);
+        if grant > 0 {
+            g.grant += grant * nr;
+            g.grant_at = now;
+            g.granted += grant;
+        }
+        short = (want - grant) * nr - (unclaimed - grant * nr).min((want - grant) * nr);
+    }
+    if short > 0 {
+        st.ask(name, short, now, &sh.share);
+    }
+    let g = &st.groups[name];
+    let give = g.give.map_or(0, |(t, _)| g.segs().saturating_sub(t));
+    Ok((grant, give, st.unclaimed(seg)))
+}
+
+// the lease's segments after growing by n
+fn grow(sh: &Arc<Shared>, l: &Lease, n: u64) -> Result<u64, Refusal> {
+    let (name, rank) = group_of(l)?;
+    let seg = sh.share.seg_bytes;
+    let new = {
+        let mut st = sh.state.lock().unwrap();
+        st.tick(Instant::now(), &sh.share);
+        let spare = st.free_segs(seg).saturating_sub(st.reserved());
+        let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
+        let m = g.members.get(rank).ok_or((proto::E_NOLEASE, "not a member".to_string()))?;
+        if m.segs + n > g.cap {
+            return Err((proto::E_NOROOM, format!("{} + {n} segments is past the group's cap {}", m.segs, g.cap)));
+        }
+        // from the group's grant, or else from what nobody was promised
+        let from_grant = n.min(g.grant);
+        if n - from_grant > spare {
+            return Err((proto::E_NOROOM, format!("no room for {n} segments: {} granted, {spare} spare", g.grant)));
+        }
+        g.grant -= from_grant;
+        g.members.get_mut(rank).expect("member").segs += n;
+        alloc_segs(&mut st.free, seg, n).ok_or((proto::E_NOROOM, "no room".to_string()))?
+    };
+    l.zero(&new);
+    let mut segs = l.segs.write().unwrap();
+    segs.extend(new);
+    Ok(segs.len() as u64)
+}
+
+// the lease's segments after shrinking to `to`. The client sends nothing to the segments that go after it asks.
+fn shrink(sh: &Arc<Shared>, l: &Lease, to: u64) -> Result<u64, Refusal> {
+    let (name, rank) = group_of(l)?;
+    let floor = sh.state.lock().unwrap().groups.get(name).map_or(1, |g| g.floor);
+    if to < floor {
+        return Err((proto::E_RANGE, format!("{to} segments is below the group's floor {floor}")));
+    }
+    let gone = {
+        let mut r = l.regions.lock().unwrap();
+        let mut segs = l.segs.write().unwrap();
+        if to as usize >= segs.len() {
+            return Ok(segs.len() as u64);
+        }
+        for (_, mrs) in r.values_mut() {
+            mrs.truncate(to as usize);
+        }
+        segs.split_off(to as usize)
+    };
+    let mut st = sh.state.lock().unwrap();
+    for &o in &gone {
+        release(&mut st.free, o, l.seg_len);
+    }
+    let now = Instant::now();
+    if let Some(g) = st.groups.get_mut(name) {
+        if let Some(m) = g.members.get_mut(rank) {
+            m.segs = to;
+        }
+        g.stalled = false;
+        if rank == &0 {
+            g.gave += gone.len() as u64;
+        }
+        if let Some((t, _)) = g.give {
+            if g.members.values().all(|m| m.segs <= t) {
+                g.give = None;
+                g.calm_until = Some(now + sh.share.cooldown);
+            }
+        }
+    }
+    Ok(to)
 }
 
 type RdmaSetup = (Arc<Device>, Arc<Mr>, Vec<Qp>);
@@ -498,7 +1099,8 @@ fn rdma(
         return Err(io::Error::new(io::ErrorKind::Unsupported, "RDMA needs an IPv4 connection"));
     };
     let dev = sh.device(ip)?;
-    let (pd, mr) = l.region(&dev)?;
+    let (pd, mrs) = l.region(&dev)?;
+    let mr = mrs.first().cloned().ok_or_else(|| io::Error::other("a lease without memory"))?;
     let cq = Cq::new(&dev, ends.len() as u32 * 2 + 4)?;
     let mtu = mtu.min(dev.mtu);
     let mut qps = Vec::new();
@@ -526,5 +1128,119 @@ mod tests {
         release(&mut f, 30, 30);
         release(&mut f, 60, 40);
         assert_eq!(f.into_iter().collect::<Vec<_>>(), vec![(0, 100)]);
+    }
+
+    #[test]
+    fn segments_are_all_or_none() {
+        let mut f = BTreeMap::new();
+        f.insert(0, 100);
+        f.insert(200, 40);
+        assert_eq!(alloc_segs(&mut f, 25, 6), None);
+        assert_eq!(f.values().sum::<usize>(), 140, "a failed allocation takes nothing");
+        assert_eq!(alloc_segs(&mut f, 25, 5), Some(vec![0, 25, 50, 75, 200]));
+    }
+
+    fn group(nr: u32, floor: u64, segs: u64, age: Option<u64>, weight: u64) -> Group {
+        let now = Instant::now();
+        Group {
+            nr,
+            block_bytes: 1,
+            floor,
+            cap: 100,
+            weight,
+            members: (0..nr).map(|r| (r, Member { lease: r as u64, segs })).collect(),
+            boot: 0,
+            grant: 0,
+            grant_at: now,
+            give: None,
+            stalled: false,
+            calm_until: None,
+            ages: age.into_iter().collect(),
+            demand: 0,
+            reports: 0,
+            granted: 0,
+            gave: 0,
+            asked: 0,
+        }
+    }
+
+    fn state(groups: Vec<(&str, Group)>) -> State {
+        State {
+            free: BTreeMap::new(),
+            leases: BTreeMap::new(),
+            names: BTreeMap::new(),
+            groups: groups.into_iter().map(|(n, g)| (n.to_string(), g)).collect(),
+            next_id: 1,
+        }
+    }
+
+    fn sh() -> Share {
+        Share { margin: Duration::from_millis(60_000), ..Share::default() }
+    }
+
+    #[test]
+    fn the_coldest_group_gives_by_more_than_the_margin_and_never_below_its_floor() {
+        let now = Instant::now();
+        // b's coldest is 10 min old, c's 5 min; a asks with its own coldest 1 min old
+        let mut st = state(vec![
+            ("a", group(2, 1, 1, Some(60_000), 1000)),
+            ("b", group(4, 2, 5, Some(600_000), 1000)),
+            ("c", group(4, 2, 5, Some(300_000), 1000)),
+        ]);
+        st.ask("a", 6, now, &sh());
+        assert_eq!(st.groups["b"].give.map(|g| g.0), Some(3), "6 segments from 4 ranks: 2 each, from 5 to 3");
+        assert!(st.groups["c"].give.is_none());
+        // b is already giving: the next ask goes to c
+        st.ask("a", 100, now, &sh());
+        assert_eq!(st.groups["c"].give.map(|g| g.0), Some(2), "never below the floor of 2");
+        // nobody is colder than a by the margin: nobody is asked
+        let mut st = state(vec![("a", group(2, 1, 1, Some(60_000), 1000)), ("b", group(2, 1, 5, Some(100_000), 1000))]);
+        st.ask("a", 2, now, &sh());
+        assert!(st.groups["b"].give.is_none(), "40 s colder is inside the 60 s margin");
+        // weight: b's blocks count half as old
+        let mut st = state(vec![("a", group(2, 1, 1, Some(0), 1000)), ("b", group(2, 1, 5, Some(100_000), 2000))]);
+        st.ask("a", 2, now, &sh());
+        assert!(st.groups["b"].give.is_none(), "weight 2: 100 s counts as 50 s");
+        st.groups.get_mut("b").unwrap().weight = 1000;
+        st.ask("a", 2, now, &sh());
+        assert_eq!(st.groups["b"].give.map(|g| g.0), Some(4));
+    }
+
+    #[test]
+    fn stalled_calm_incomplete_and_empty_groups_are_not_asked() {
+        let now = Instant::now();
+        let mut st = state(vec![("a", group(1, 1, 1, None, 1000)), ("b", group(2, 1, 5, Some(600_000), 1000))]);
+        st.groups.get_mut("b").unwrap().stalled = true;
+        st.ask("a", 1, now, &sh());
+        assert!(st.groups["b"].give.is_none());
+        let b = st.groups.get_mut("b").unwrap();
+        b.stalled = false;
+        b.calm_until = Some(now + Duration::from_secs(5));
+        st.ask("a", 1, now, &sh());
+        assert!(st.groups["b"].give.is_none());
+        let b = st.groups.get_mut("b").unwrap();
+        b.calm_until = None;
+        b.members.remove(&1);
+        st.ask("a", 1, now, &sh());
+        assert!(st.groups["b"].give.is_none(), "a group whose ranks have not all joined");
+        let b = st.groups.get_mut("b").unwrap();
+        b.members.insert(1, Member { lease: 9, segs: 5 });
+        b.ages.clear();
+        st.ask("a", 1, now, &sh());
+        assert!(st.groups["b"].give.is_none(), "a group that reported no blocks");
+    }
+
+    #[test]
+    fn an_unclaimed_grant_expires_and_an_unanswered_ask_stalls() {
+        let t0 = Instant::now();
+        let mut st = state(vec![("a", group(2, 1, 1, None, 1000)), ("b", group(2, 1, 3, Some(1), 1000))]);
+        let s = Share { grant_ttl: Duration::from_secs(30), stall: Duration::from_secs(10), ..sh() };
+        st.groups.get_mut("a").unwrap().grant = 4;
+        st.groups.get_mut("b").unwrap().give = Some((2, t0));
+        st.tick(t0 + Duration::from_secs(11), &s);
+        assert_eq!(st.groups["a"].grant, 4);
+        assert!(st.groups["b"].give.is_none() && st.groups["b"].stalled);
+        st.tick(t0 + Duration::from_secs(31), &s);
+        assert_eq!(st.groups["a"].grant, 0);
     }
 }
