@@ -81,6 +81,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 # G6_CP_STEP_ROWS / G6_CP_STEP_SEG (s2/cp_rows.h, Driver::step): steps past R capped at n rows, solo-exact tokens, fair cycles
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/cp_rows_test.cpp" -o "$T/cp_rows_test"
 "$T/cp_rows_test" 2> >(grep -v '^# s2 G6_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
+# KvTiers::run's copy batches (s2/kv_plan.h): a batch of 1 advances, a slot spilled twice ends with the second page,
+# batched copies = one at a time: no pool, no CUDA
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_plan_test.cpp" -o "$T/kv_plan_test"
+"$T/kv_plan_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
 NODE=$REPO/engine/kvman-rs/target/release/kvman-remote

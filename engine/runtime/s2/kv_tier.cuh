@@ -16,6 +16,7 @@
 #pragma once
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
+#include "kv_plan.h"
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -48,8 +49,6 @@ constexpr size_t MLA16 = 64 * g6kv::ROW / 16, IDX16 = 64 * g6kv::IDX_ROW / 16;
 // off16: the binding's place in a page block; rep16: in a replicated record. phys: its attention cache's pages (the
 // last physical page differs by rank past R). cp: its attention cache is sharded past R
 struct Piece { uint4* mla; uint4* idx; unsigned long long off16, rep16; int phys; int cp; };
-// one copy of a batch: page, part (g6kv_io), sub (part 2), and the host slot it goes to or comes from
-struct Item { int page, part, sub, hslot; };
 __device__ __forceinline__ void move16(uint4* h, uint4* d, size_t n, int out)
 {
     for (size_t k = threadIdx.x; k < n; k += blockDim.x) { if (out) h[k] = d[k]; else d[k] = h[k]; }
@@ -204,29 +203,10 @@ public:
             dev += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
         };
         while (i < io.size()) {
-            const uint32_t kind = io[i].kind;
-            std::vector<kvt::Item> items;   // spills and restores: each copy and its host slot
-            std::vector<uint32_t> from, to; std::vector<uint64_t> slots, to_slots;   // per host slot
-            while (i < io.size() && io[i].kind == kind) {
-                const g6kv_io& x = io[i];
-                // an entry passed on twice in one call: the first move writes a block, then the second move reads it. A
-                // batch reads before it writes, so the second move starts the next batch
-                if (kind == 1) {
-                    bool dep = false;
-                    for (size_t j = 0; j < slots.size() && !dep; ++j) dep = to[j] == x.tier && to_slots[j] == x.slot;
-                    if (dep || (int)slots.size() == pb_.batch()) break;
-                    from.push_back(x.tier); to.push_back(x.to); slots.push_back(x.slot); to_slots.push_back(x.to_slot); ++i;
-                    continue;
-                }
-                // a block's copies are next to each other: one host slot for them all
-                const bool same = !slots.empty() && from.back() == x.tier && slots.back() == x.slot;
-                if (!same && ((int)slots.size() == pb_.batch() || (int)items.size() + (int)pb_.per_slot() + 1 > pb_.items())) break;
-                if (!same) { from.push_back(x.tier); slots.push_back(x.slot); }
-                items.push_back({(int)x.page, (int)x.part, (int)x.sub, (int)slots.size() - 1}); ++i;
-            }
-            if (kind == 0) { device(items, true); many(from, slots, true); spilled += slots.size(); }
-            else if (kind == 1) { many(from, slots, false); many(to, to_slots, true); moved += slots.size(); }
-            else { many(from, slots, false); device(items, false); restored += slots.size(); }
+            const kvt::Batch x = kvt::next_batch(io, i, pb_.batch(), pb_.per_slot(), pb_.items());
+            if (x.kind == 0) { device(x.items, true); many(x.from, x.slots, true); spilled += x.slots.size(); }
+            else if (x.kind == 1) { many(x.from, x.slots, false); many(x.to, x.to_slots, true); moved += x.slots.size(); }
+            else { many(x.from, x.slots, false); device(x.items, false); restored += x.slots.size(); }
         }
         const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ms += t;
