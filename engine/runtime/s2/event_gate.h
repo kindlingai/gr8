@@ -9,7 +9,7 @@
 #include <mutex>
 
 namespace g6s2 {
-enum class EventKind : uint32_t { Admit = 1, Cancel = 2 };
+enum class EventKind : uint32_t { Admit = 1, Cancel = 2, Resize = 3 };
 struct Notice {
     uint64_t epoch = 0, event = 0, boundary = 0, request = 0, payload_hash = 0;
     EventKind kind = EventKind::Admit;
@@ -53,7 +53,8 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         require(!failed_ && !n_, "pending event or failed epoch");
         require(n.epoch == epoch_ && n.event == next_event_ &&
-                (n.kind == EventKind::Admit || n.kind == EventKind::Cancel), "notice epoch/sequence/kind mismatch");
+                (n.kind == EventKind::Admit || n.kind == EventKind::Cancel || n.kind == EventKind::Resize),
+                "notice epoch/sequence/kind mismatch");
         require(n.boundary <= uint64_t(INT64_MAX) && int64_t(n.boundary) > passed_.load(), "late event notice");
         require(!held_ || n.boundary == due_.load(), "notice does not name the held boundary");
         n_ = n; arrived_ = committed_ = held_ = false;
