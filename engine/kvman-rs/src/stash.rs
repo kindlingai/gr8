@@ -351,6 +351,46 @@ impl Stash {
         })
     }
 
+    /// Tier t to `slots` blocks, at an event every rank sees (a KV node lease that grew or shrank: REMOTE-TIER.md,
+    /// "Sharing a node"). Growing adds free slots at the top. Shrinking evicts the tier's least recently used entries
+    /// (each moves on to the next tier that takes it, or is dropped, as when the tier is full) until enough slots are
+    /// free, then moves every entry block at or past `slots` into the lowest free slot below it (Io::Move within the
+    /// tier). The engine runs those copies before the store gives the top blocks back. Every rank makes the same call,
+    /// so every rank queues the same copies. A tier with an index keeps its size (its records name slots): false.
+    pub fn resize_tier(&mut self, t: usize, slots: u64) -> bool {
+        if t >= self.tiers.len() || self.tiers[t].index.is_some() {
+            return false;
+        }
+        let old = self.tiers[t].slots;
+        if slots < old {
+            let need = old - slots;
+            while self.tiers[t].alloc.free() < need {
+                let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else { return false };
+                let e = self.tiers[t].entries.remove(i);
+                self.evict(t, e);
+            }
+            let mut low = self.tiers[t].alloc.free_below(slots).into_iter();
+            let tier = &mut self.tiers[t];
+            for e in &mut tier.entries {
+                for s in e.slots.iter_mut().filter(|s| **s >= slots) {
+                    let to = low.next().expect("as many free slots below the new size as blocks above it");
+                    self.io.push(Io::Move { tier: t as u32, slot: *s, to: t as u32, to_slot: to });
+                    assert!(tier.alloc.claim(&[to]));
+                    tier.alloc.release(&[*s]);
+                    *s = to;
+                }
+            }
+        }
+        assert!(self.tiers[t].alloc.resize(slots), "the slots past the new size are free");
+        self.tiers[t].slots = slots;
+        true
+    }
+
+    /// Tier t's entries as (id, blocks), least recently used first: what a KV node's head reports as its coldest.
+    pub fn lru(&self, t: usize) -> Vec<(u64, usize)> {
+        self.tiers.get(t).map_or_else(Vec::new, |x| x.entries.iter().map(|e| (e.id, e.slots.len())).collect())
+    }
+
     pub fn entries(&self, t: usize) -> &[Entry] {
         &self.tiers[t].entries
     }

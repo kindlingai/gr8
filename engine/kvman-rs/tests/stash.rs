@@ -89,7 +89,8 @@ impl Rank {
                 .map(|x| match *x {
                     Io::Spill { page, .. } => self.dev[page as usize],
                     Io::Move { tier, slot, to, .. } => {
-                        assert!(to > tier, "a move goes to a later tier");
+                        // a later tier, or the same tier when it shrinks (resize_tier)
+                        assert!(to >= tier, "a move goes to a later tier");
                         self.tiers[tier as usize][slot as usize]
                     }
                     Io::Restore { tier, slot, .. } => self.tiers[tier as usize][slot as usize],
@@ -143,6 +144,17 @@ fn finished(tokens: &[i32]) -> Finished {
 
 #[test]
 fn restored_rows_hold_the_prompt_and_ranks_agree() {
+    random_traces(false);
+}
+
+// the same traces, where every so often a tier grows or shrinks on both ranks at once (a KV node lease that moved)
+#[test]
+fn restored_rows_hold_the_prompt_while_tiers_resize() {
+    random_traces(true);
+}
+
+fn random_traces(resize: bool) {
+    let mut resized = (0, 0, 0);
     let (mut evicted_hits, mut shared_hits, mut moves, mut spills, mut exclusive, mut refused) = (0, 0, 0, 0, 0, 0);
     for seed in 1..=60u64 {
         let mut rng = Rng(seed * 104_729);
@@ -175,6 +187,31 @@ fn restored_rows_hold_the_prompt_and_ranks_agree() {
         let mut live: Vec<Live> = Vec::new();
         let mut histories: Vec<Vec<i32>> = Vec::new();
         for _ in 0..400 {
+            if resize && rng.one_in(12) {
+                let t = rng.range(0, tiers.len() as u64 - 1) as usize;
+                let old = ranks[0].pool.tier_stats(t).unwrap().slots;
+                let to = rng.range(1, old * 2);
+                let mut io = Vec::new();
+                for r in &mut ranks {
+                    if to > old {
+                        r.tiers[t].resize(to as usize, [-2; ROWS]);
+                    }
+                    assert!(r.pool.resize_tier(t, to).unwrap());
+                    io.push(r.run_io());
+                    // the blocks past the new size go: poison them first, so a copy that still read one would show
+                    for b in r.tiers[t].iter_mut().skip(to as usize) {
+                        *b = [-3; ROWS];
+                    }
+                    r.tiers[t].truncate(to as usize);
+                    r.check_slots();
+                    assert_eq!(r.pool.tier_stats(t).unwrap().slots, to);
+                }
+                assert_eq!(io[0], io[1], "the ranks queue other copies for a resize");
+                assert_eq!(ranks[0].pool.digest(), ranks[1].pool.digest());
+                let inner = io[0].iter().filter(|x| matches!(x, Io::Move { tier, to, .. } if tier == to)).count();
+                resized = (resized.0 + (to > old) as u32, resized.1 + (to < old) as u32, resized.2 + inner);
+                continue;
+            }
             if !live.is_empty() && (rng.one_in(2) || live.len() > 3) {
                 let s = live.remove(rng.range(0, live.len() as u64 - 1) as usize);
                 let mut io = Vec::new();
@@ -259,6 +296,9 @@ fn restored_rows_hold_the_prompt_and_ranks_agree() {
         }
         let s = ranks[0].pool.stash().unwrap();
         refused += (0..s.tiers()).map(|t| s.stats(t).unwrap().refused).sum::<u64>();
+    }
+    if resize {
+        assert!(resized.0 > 50 && resized.1 > 50 && resized.2 > 50, "grown, shrunk, moves inside a tier: {resized:?}");
     }
     assert!(
         evicted_hits > 20 && shared_hits > 20 && moves > 50 && spills > 100 && exclusive > 0 && refused > 20,
