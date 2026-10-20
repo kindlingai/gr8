@@ -188,8 +188,10 @@ pub struct Pool {
     chunk: u32,
     offline: Vec<bool>,
     // when each stored entry was last used, by this process's clock (coldest_ages: what a KV node's head reports).
-    // Advice to the node only: never in the digest, and no pool decision reads it
+    // Advice to the node only: never in the digest, and no pool decision reads it. Kept only once coldest_ages ran
+    // (a group head): a pool that never reports does no work for it and holds nothing
     seen: HashMap<u64, Instant>,
+    ages_on: bool,
 }
 
 impl Pool {
@@ -233,6 +235,7 @@ impl Pool {
             chunk: 0,
             offline: Vec::new(),
             seen: HashMap::new(),
+            ages_on: false,
         })
     }
 
@@ -631,7 +634,7 @@ impl Pool {
 
     // a prompt that starts with a stored prefix reads its blocks when it is admitted (or will, on a hit): used now
     fn touch_prefixes(&mut self, prompt: &[i32]) {
-        let Some(s) = &self.stash else { return };
+        let Some(s) = self.stash.as_ref().filter(|_| self.ages_on) else { return };
         let now = Instant::now();
         for t in 0..s.tiers() {
             for e in s.entries(t).iter().filter(|e| e.kind.prefix()) {
@@ -642,14 +645,16 @@ impl Pool {
         }
     }
 
-    /// The ages a KV node's head REPORTs for tier t (remote::coldest_ages): ms since the use of the entry holding each
-    /// (i x per_seg)-th coldest block, at most `most`. An entry was used when it was stored, restored, or a prompt
+    /// The ages a KV node's head REPORTs for tier t (remote::coldest_ages): for each i, ms since the use of the most
+    /// recently used entry a give of i + 1 segments would evict (the shrink's order, stash.rs give_order), at most
+    /// `most`; they never rise. An entry was used when it was stored, restored, or a prompt
     /// started with it (a prefix); a prefix base counts as used as recently as the newest run stored on it.
     pub fn coldest_ages(&mut self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
         let Some(s) = &self.stash else { return Vec::new() };
         if t >= s.tiers() {
             return Vec::new();
         }
+        self.ages_on = true;
         let now = Instant::now();
         let mut live = std::collections::HashSet::new();
         for x in 0..s.tiers() {
@@ -671,7 +676,7 @@ impl Pool {
             }
         }
         crate::remote::coldest_ages(
-            &s.lru(t),
+            &s.give_order(t),
             |id| at.get(&id).map_or(0, |u| now.duration_since(*u).as_millis() as u64),
             per_seg,
             most,
@@ -706,14 +711,17 @@ impl Pool {
     /// After the copies from io(): commits the index records of the entries they wrote. An error leaves the pool as it
     /// is. The entries stay, and only a restart misses them.
     pub fn io_done(&mut self) -> std::io::Result<()> {
-        if let Some(s) = &self.stash {
-            // entries the copies stored were used now
+        if let Some(s) = self.stash.as_ref().filter(|_| self.ages_on) {
+            // entries the copies stored were used now; the ones that left are forgotten
             let now = Instant::now();
+            let mut live = std::collections::HashSet::new();
             for t in 0..s.tiers() {
                 for e in s.entries(t) {
                     self.seen.entry(e.id).or_insert(now);
+                    live.insert(e.id);
                 }
             }
+            self.seen.retain(|id, _| live.contains(id));
         }
         self.stash.as_mut().map_or(Ok(()), Stash::io_done)
     }
@@ -1177,7 +1185,7 @@ impl Pool {
         }
         if let Some(t) = from {
             let r = self.take_stored(skip, age, t as usize, rows, worst);
-            if r.is_ok() {
+            if r.is_ok() && self.ages_on {
                 self.seen.insert(age, Instant::now());
             }
             return r;

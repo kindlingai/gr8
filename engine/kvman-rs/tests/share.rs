@@ -194,7 +194,9 @@ fn a_dead_cluster_frees_everything_it_held() {
 fn ages_are_one_per_segment_of_blocks_coldest_first() {
     // entries of 3, 1, 5 and 2 blocks, 4 blocks a segment: blocks 0, 4 and 8 sit in entries 10, 30 and 30
     let lru = [(10, 3), (20, 1), (30, 5), (40, 2)];
-    assert_eq!(coldest_ages(&lru, |id| id * 100, 4, 8), vec![1000, 3000, 3000]);
+    assert_eq!(coldest_ages(&lru, |id| id * 100, 4, 8), vec![1000, 1000, 1000]);
+    // the head's clock disagrees with the order (entry 20 used last): the ages never rise
+    assert_eq!(coldest_ages(&lru, |id| if id == 20 { 5 } else { 5000 - id }, 4, 8), vec![4990, 5, 5]);
     assert_eq!(coldest_ages(&lru, |id| id, 4, 1), vec![10]);
     assert!(coldest_ages(&[], |id| id, 4, 8).is_empty());
 }

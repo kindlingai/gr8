@@ -99,11 +99,11 @@ class Service {
     std::mutex failure_mu_; std::exception_ptr failure_;
     uint64_t attempted_head_ = UINT64_MAX, attempted_revision_ = UINT64_MAX;
     uint64_t event_ = 1;
-    uint64_t sync_ = 0;
+    uint64_t sync_ = 0;   // compute thread: barriers passed (native_.drained)
     // head: a Resize announced and not yet applied on this rank (no second report until then: it would ask again for
     // segments already granted)
     std::atomic<bool> resizing_{false};
-    const long share_ms_ = ::getenv("G6_S2_SHARE_MS") ? std::max(1L, std::atol(::getenv("G6_S2_SHARE_MS"))) : 1000;   // compute thread: barriers passed (native_.drained)
+    const long share_ms_ = ::getenv("G6_S2_SHARE_MS") ? std::max(1L, std::atol(::getenv("G6_S2_SHARE_MS"))) : 1000;
     // G6_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
     // boundary it read and the future boundary it chose), one "commit" line when that notice lands on each rank, and one
     // "step" line per prefill quantum. Together they say whether a cancel was installed while a long prefill was still

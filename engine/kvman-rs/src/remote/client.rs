@@ -663,17 +663,20 @@ impl BlockStore for RemoteStore {
     }
 }
 
-/// The ages a head REPORTs: `lru` is its tier's entries as (id, blocks), least recently used first (stash.rs lru), and
-/// `age_ms(id)` how long ago an entry was last used. The i-th age is that of the entry holding the tier's (i x per_seg)-th
-/// coldest block, so ages[0] is the coldest entry's and ages[i] what giving i + 1 segments would cost. At most `most`.
-pub fn coldest_ages(lru: &[(u64, usize)], age_ms: impl Fn(u64) -> u64, per_seg: u64, most: usize) -> Vec<u64> {
+/// The ages a head REPORTs: `order` is its tier's entries as (id, blocks) in the order a shrink evicts them (stash.rs
+/// give_order), and `age_ms(id)` how long ago an entry was last used. ages[i] is what giving i + 1 segments costs: the
+/// age of the most recently used entry among those up to the one holding the (i x per_seg)-th block, so the ages never
+/// rise (the head's clock need not agree with the eviction order). At most `most`.
+pub fn coldest_ages(order: &[(u64, usize)], age_ms: impl Fn(u64) -> u64, per_seg: u64, most: usize) -> Vec<u64> {
     let mut out = Vec::new();
     let mut seen = 0u64;
-    for &(id, n) in lru {
+    let mut youngest = u64::MAX;
+    for &(id, n) in order {
         let end = seen + n as u64;
+        youngest = youngest.min(age_ms(id));
         // every segment boundary i x per_seg in [seen, end) falls in this entry
         while out.len() < most && (out.len() as u64) * per_seg.max(1) < end {
-            out.push(age_ms(id));
+            out.push(youngest);
         }
         seen = end;
     }

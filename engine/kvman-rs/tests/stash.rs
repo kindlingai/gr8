@@ -574,6 +574,42 @@ fn a_shrinking_tier_keeps_the_prefix_its_runs_are_based_on_and_moves_them_down()
 }
 
 #[test]
+fn the_ages_a_head_reports_follow_the_shrink_and_never_rise() {
+    // a shared prefix (the least recently used entry, the base of every run) and ten runs on it
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::All)], 3);
+    let system = toks(1, 300);
+    for c in 2..12 {
+        let mut p = system.clone();
+        p.extend(toks(c, 140));
+        session(&mut r, &p, 10);
+    }
+    flush(&mut r);
+    let s = r.pool.stash().unwrap();
+    let shared = s.entries(0).iter().find(|e| e.kind.prefix()).map(|e| e.id).unwrap();
+    assert_eq!(s.lru(0)[0].0, shared);
+    let order = s.give_order(0);
+    assert_eq!(order.len(), s.lru(0).len());
+    assert_eq!(order.last().unwrap().0, shared, "a shrink takes the base last");
+    let first = order[0].0;
+    r.pool.coldest_ages(0, 4, 8); // the pool's clock learns every entry now
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    // a new conversation starts with the prefix: the base is used now, every run stays cold
+    let mut p = system.clone();
+    p.extend(toks(90, 10));
+    r.pool.count(&p, None);
+    let ages = r.pool.coldest_ages(0, 4, 8);
+    // before: ages[0] was the base's (~0 ms), so the node saw a hot group and never asked it to give
+    assert!(ages[0] >= 60, "{ages:?}");
+    assert!(ages.windows(2).all(|w| w[0] >= w[1]), "{ages:?}");
+    // and the entry the report starts from is the one a shrink evicts first
+    let used = 64 - r.pool.tier_stats(0).unwrap().free_slots;
+    assert!(r.pool.resize_tier(0, used - 1).unwrap());
+    let s = r.pool.stash().unwrap();
+    assert!(!s.entries(0).iter().any(|e| e.id == first), "the first entry of give_order went first");
+    assert!(s.entries(0).iter().any(|e| e.id == shared));
+}
+
+#[test]
 fn a_system_span_counts_once_per_conversation_and_is_stored_cut_to_the_grid() {
     let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::Shared)], 2);
     let system = toks(1, 300); // the front end's span: 300 tokens, 256 rows on a grid of 128
