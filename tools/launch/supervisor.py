@@ -683,7 +683,7 @@ class Supervisor:
             nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
         except (OSError, RuntimeError, ValueError) as e:
             raise Stop(1, f'--kv-store remote:auto: mentat: {e}')
-        target = mentat.kv_target(nodes, self.rails)
+        target = mentat.kv_target(nodes, self.rails, self.rank)
         if not target:
             raise Stop(1, f'--kv-store remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
         log(f'KV store: the KV node at {target}')

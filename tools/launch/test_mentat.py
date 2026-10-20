@@ -151,7 +151,11 @@ class MembershipTests(unittest.TestCase):
 class KvTargetTests(unittest.TestCase):
     def test_rdma_on_a_rail_subnet_first_else_the_lan(self):
         nodes = [('192.0.2.10', 7350, {'gr8.kv.rdma': '10.9.0.10'}), ('192.0.2.20', 7351, {'gr8.kv.rdma': '10.2.0.20,10.1.0.20'})]
-        self.assertEqual(M.kv_target(nodes, ('10.1.0.3', '10.2.0.3')), '10.2.0.20:7351')
+        self.assertEqual(M.kv_target(nodes, ('10.1.0.3', '10.2.0.3')), '10.1.0.20:7351')
+        # odd ranks start on the second rail, so the node's two PCIe roots each serve half the ranks
+        self.assertEqual([M.kv_target(nodes, ('10.1.0.3', '10.2.0.3'), r) for r in range(4)],
+                         ['10.1.0.20:7351', '10.2.0.20:7351', '10.1.0.20:7351', '10.2.0.20:7351'])
+        self.assertEqual(M.kv_target(nodes, ('10.1.0.3', ''), 1), '10.1.0.20:7351')
         self.assertEqual(M.kv_target(nodes, ('10.5.0.3', '10.6.0.3')), '192.0.2.10:7350')
         self.assertEqual(M.kv_target([('192.0.2.10', 7350, {})], ('', '')), '192.0.2.10:7350')
         self.assertIsNone(M.kv_target([], ('10.1.0.3', '10.2.0.3')))
