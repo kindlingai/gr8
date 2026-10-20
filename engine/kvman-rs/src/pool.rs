@@ -415,6 +415,17 @@ impl Pool {
         }
     }
 
+    /// Tier t to `slots` blocks (stash.rs resize_tier): a store whose size changed at this event, on every rank. The
+    /// copies it queues (moves out of the blocks that go) run like any call's, before the store shrinks. Ok(false):
+    /// nothing changed (a tier with an index, or entries that cannot leave).
+    pub fn resize_tier(&mut self, t: usize, slots: u64) -> Result<bool, Error> {
+        self.pending()?;
+        match &mut self.stash {
+            Some(s) if t < s.tiers() => Ok(s.resize_tier(t, slots)),
+            _ => Err(Error::BadArgument),
+        }
+    }
+
     /// Runs past R keep their tails in the stores (stash.rs set_tail): nr ranks, per_slot replicated parts a block.
     /// nr > 0 also turns the page classes on for the pool itself (see Pool::nr), so this is set whenever the pool's R
     /// is the CP map's, stores or not.
