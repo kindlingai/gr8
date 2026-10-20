@@ -407,6 +407,15 @@ impl Stash {
         }) || self.continues_head(prompt)
     }
 
+    /// Whether `prompt` continues a stored evicted run of `namespace` (no heads: they are stock-only).
+    pub(crate) fn continues_stored_in(&self, prompt: &[i32], namespace: crate::pool::Namespace) -> bool {
+        self.tiers.iter().flat_map(|t| &t.entries).any(|e| {
+            e.kind == Kind::Evicted
+                && e.namespace == namespace
+                && continues(prompt, &e.st.history, e.st.pf_end.max(0) as usize)
+        })
+    }
+
     // one pass over the prompt: does a remembered head's hash match the prompt's first rows?
     fn continues_head(&self, prompt: &[i32]) -> bool {
         if self.heads.is_empty() {

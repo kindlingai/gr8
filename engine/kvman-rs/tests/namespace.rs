@@ -218,3 +218,45 @@ fn non_stock_prefixes_never_enter_or_restore_a_persistent_tier() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn keep_sessions_stores_a_continued_non_stock_run_and_refuses_a_one_turn_one() {
+    use g6kvman::stash::{Keep, Policy};
+    let first: Vec<i32> = (0..192).collect();
+    let second: Vec<i32> = (0..260).collect();
+    let sessions = |p: &mut Pool| {
+        p.stores(2);
+        p.add_tier(16, Keep::Evicted, None).unwrap();
+        p.set_policy(0, Policy { min_rows: 0, min_hits: 1, block_bytes: 0 }).unwrap();
+    };
+    let evict = |p: &mut Pool| {
+        let all = p.reserve(512, 512).unwrap();
+        p.release(&all).unwrap();
+        p.io();
+        p.io_done().unwrap();
+    };
+    // one turn: refused by the policy
+    let mut p = pool();
+    sessions(&mut p);
+    assert_eq!(p.count_namespaced(&first, None, namespace(1)), 0);
+    let r = p.reserve(192, 256).unwrap();
+    p.retain_namespaced(&r, finished(&first), namespace(1)).unwrap();
+    evict(&mut p);
+    assert!(p.stash().unwrap().entries(0).is_empty());
+    // two turns: the second continues the first in its namespace, so the tier takes it
+    let mut p = pool();
+    sessions(&mut p);
+    p.count_namespaced(&first, None, namespace(1));
+    let r = p.reserve(192, 256).unwrap();
+    p.retain_namespaced(&r, finished(&first), namespace(1)).unwrap();
+    p.count_namespaced(&second, None, namespace(1));
+    let hit = p.match_prefix_namespaced(&second, 260, 320, 259, namespace(1));
+    assert!(hit.skip > 0);
+    let r = p.take(hit.skip, hit.age, 260, 320).unwrap();
+    p.retain_namespaced(&r, finished(&second), namespace(1)).unwrap();
+    evict(&mut p);
+    let e = &p.stash().unwrap().entries(0);
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].namespace, namespace(1));
+    assert!(e[0].hits >= 1);
+}

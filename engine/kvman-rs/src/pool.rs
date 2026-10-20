@@ -484,7 +484,14 @@ impl Pool {
         }
         self.next_tokens = None;
         self.next_span = None;
-        self.next_continues = false;
+        // a non-stock prompt that continues a run of its own namespace (retained or stored) counts as continued, so a
+        // keep-sessions tier takes its run later; it never counts toward stock promotion
+        self.next_continues = self.stash.as_ref().is_some_and(|s| {
+            self.kept
+                .iter()
+                .any(|k| k.namespace == namespace && continues(prompt, &k.st.history, k.st.pf_end.max(0) as usize))
+                || s.continues_stored_in(prompt, namespace)
+        });
         0
     }
 
