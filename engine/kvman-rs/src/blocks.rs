@@ -37,7 +37,15 @@ impl Blocks {
             "remote" if !rest.is_empty() => {
                 // four ranks share one switch port without PFC: a dropped packet costs one ack timeout, and 4.096 us *
                 // 2^17 (0.5 s) leaves room for the retries before a lane fails
-                let o = Opts { lanes: THREADS, qp_timeout: 17, ..Opts::new(name, slot, blocks) };
+                // KVMAN_TRANSPORT=tcp|rdma|auto (default auto) per box: a rank whose path to the node is routed
+                // through another box sets up RDMA but cannot write, and auto does not fall back after setup
+                let want = match std::env::var("KVMAN_TRANSPORT") {
+                    Ok(s) if !s.is_empty() => {
+                        s.parse().map_err(|e: String| io::Error::new(io::ErrorKind::InvalidInput, e))?
+                    }
+                    _ => crate::remote::Want::Auto,
+                };
+                let o = Opts { lanes: THREADS, qp_timeout: 17, want, ..Opts::new(name, slot, blocks) };
                 Ok(Blocks::Remote(Box::new(RemoteStore::open(&node_addr(rest), &o)?)))
             }
             "mem" => Ok(Blocks::Mem(Mutex::new(vec![0u8; slot * blocks as usize]), slot, blocks)),
