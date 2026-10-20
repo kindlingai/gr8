@@ -355,7 +355,8 @@ impl Stash {
     /// "Sharing a node"). Growing adds free slots at the top. Shrinking evicts the tier's least recently used entries
     /// (each moves on to the next tier that takes it, or is dropped, as when the tier is full) until enough slots are
     /// free, then moves every entry block at or past `slots` into the lowest free slot below it (Io::Move within the
-    /// tier). The engine runs those copies before the store gives the top blocks back. Every rank makes the same call,
+    /// tier). Entries that stored runs are based on go last. The engine runs those copies before the store gives the
+    /// top blocks back. Every rank makes the same call,
     /// so every rank queues the same copies. A tier with an index keeps its size (its records name slots): false.
     pub fn resize_tier(&mut self, t: usize, slots: u64) -> bool {
         if t >= self.tiers.len() || self.tiers[t].index.is_some() {
@@ -365,7 +366,15 @@ impl Stash {
         if slots < old {
             let need = old - slots;
             while self.tiers[t].alloc.free() < need {
-                let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else {
+                // the least recently used entry that no stored run is based on, before any base: a base's runs go
+                // with it, and a base of many runs is a prefix many conversations still use
+                let bases: Vec<u64> =
+                    self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+                let free = |e: &Entry| !self.pin.contains(&e.id);
+                let es = &self.tiers[t].entries;
+                let Some(i) =
+                    es.iter().position(|e| free(e) && !bases.contains(&e.id)).or_else(|| es.iter().position(free))
+                else {
                     return false;
                 };
                 let e = self.tiers[t].entries.remove(i);

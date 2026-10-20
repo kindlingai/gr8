@@ -534,6 +534,46 @@ fn a_run_on_a_stored_shared_prefix_spills_only_its_own_pages() {
 }
 
 #[test]
+fn a_shrinking_tier_keeps_the_prefix_its_runs_are_based_on_and_moves_them_down() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::All)], 3);
+    let system = toks(1, 300);
+    let mut hists = Vec::new();
+    for c in 2..12 {
+        let mut p = system.clone();
+        p.extend(toks(c, 140));
+        hists.push(session(&mut r, &p, 10).2);
+    }
+    flush(&mut r);
+    let s = r.pool.stash().unwrap();
+    let shared = s.entries(0).iter().find(|e| e.kind.prefix()).map(|e| e.id).unwrap();
+    assert_eq!(s.lru(0)[0].0, shared, "the shared prefix is the least recently used");
+    let used = 64 - r.pool.tier_stats(0).unwrap().free_slots;
+    // shrink to a few slots more than half of what is used: some runs go, the base stays, the rest move down
+    let to = used / 2 + 4;
+    assert!(r.pool.resize_tier(0, to).unwrap());
+    let io = r.run_io();
+    assert!(io.iter().any(|x| matches!(x, Io::Move { tier: 0, to: 0, .. })), "{io:?}");
+    r.tiers[0].truncate(to as usize);
+    r.check_slots();
+    let s = r.pool.stash().unwrap();
+    assert!(s.entries(0).iter().any(|e| e.id == shared), "the base stays");
+    let kept: Vec<_> = s.entries(0).iter().filter(|e| e.base.is_some()).map(|e| e.st.history.clone()).collect();
+    assert!(!kept.is_empty() && kept.len() < hists.len(), "{} of {} runs kept", kept.len(), hists.len());
+    // a kept run comes back whole from its new slots
+    let mut p2 = kept[kept.len() - 1].clone();
+    p2.extend(toks(50, 5));
+    let n = p2.len() as u64 + 5;
+    let h = r.pool.match_prefix(&p2, n, n, p2.len() as i32 - 1);
+    assert!(h.stored, "{h:?}");
+    let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), n, n).unwrap();
+    r.run_io();
+    let list = r.pool.list(&run).unwrap().to_vec();
+    for row in 0..h.skip as usize {
+        assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], p2[row]);
+    }
+}
+
+#[test]
 fn a_system_span_counts_once_per_conversation_and_is_stored_cut_to_the_grid() {
     let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::Shared)], 2);
     let system = toks(1, 300); // the front end's span: 300 tokens, 256 rows on a grid of 128
