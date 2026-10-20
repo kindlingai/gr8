@@ -7,6 +7,7 @@
 //!
 //!   kvman-share-bench [--server HOST:PORT] [--gb 4] [--seg-mb 128] [--margin-s 60] [--poll-ms 1000]
 //!                     [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE]
+//!                     [--clock pool|bench] [--seed N]
 //!
 //! Without --server it runs a node in this process (TCP on loopback). The run is four phases: A busy and B idle, B busy
 //! and A idle, both busy, A busy and B idle. A busy cluster runs agent conversations whose KV does not fit its pool, so
@@ -31,7 +32,7 @@ const POOL_PAGES: u32 = 48;
 fn usage() -> ! {
     eprintln!(
         "usage: kvman-share-bench [--server HOST:PORT] [--gb 4] [--seg-mb 128] [--margin-s 60] [--poll-ms 1000] \
-         [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE]"
+         [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE] [--clock pool|bench] [--seed N]"
     );
     std::process::exit(2)
 }
@@ -86,7 +87,10 @@ fn decode(cluster: u64, rank: u64, buf: &[u8]) -> Result<[i32; ROWS], String> {
     }
     for i in 3 + ROWS..buf.len() / 8 {
         if r(i) != h ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15) {
-            return Err(format!("filler word {i}"));
+            let n = buf.len() / 8;
+            let zeros = (i..n).filter(|&j| r(j) == 0).count();
+            let bad = (i..n).filter(|&j| r(j) != h ^ (j as u64).wrapping_mul(0x9E3779B97F4A7C15)).count();
+            return Err(format!("filler word {i} of {n} is {:x}: {bad} words after it wrong, {zeros} zero", r(i)));
         }
     }
     Ok(page)
@@ -98,6 +102,46 @@ struct Rank {
     store: RemoteStore,
     buf: Vec<u8>,
     buf2: Vec<u8>,
+    // the last copies that touched each slot, and the lease's last resizes: named in the message of a wrong block
+    hist: HashMap<u64, Vec<String>>,
+    resizes: Vec<String>,
+}
+
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn ms() -> u128 {
+    START.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+impl Rank {
+    fn note(&mut self, slot: u64, what: String) {
+        let h = self.hist.entry(slot).or_default();
+        h.push(format!("{} ms {what}", ms()));
+        if h.len() > 8 {
+            h.remove(0);
+        }
+    }
+    // a wrong block: what touched the slot, the lease's resizes, and whether a second read of it is right
+    fn wrong(&mut self, cluster: u64, name: &str, ri: usize, slot: u64, e: String) -> ! {
+        let mut again = vec![0u8; self.buf.len()];
+        let second = match self.store.read_block(slot, &mut again) {
+            Ok(()) => match decode(cluster, ri as u64, &again) {
+                Ok(_) => "right on a second read (changed during the first)".to_string(),
+                Err(e2) => format!("wrong again: {e2}"),
+            },
+            Err(x) => format!("second read failed: {x}"),
+        };
+        die(format!(
+            "{name} rank {ri}: block {slot} is wrong at {} ms: {e}; {second}; lease {} segs {} blocks; slot history: {:?}; \
+             resizes: {:?}; node: {}",
+            ms(),
+            self.store.segs(),
+            self.store.blocks(),
+            self.hist.get(&slot),
+            self.resizes,
+            g6kvman::remote::client::stats(&self.store.server.to_string()).unwrap_or_default()
+        ))
+    }
 }
 
 #[derive(Default, Clone)]
@@ -122,6 +166,8 @@ struct Cluster {
     agents: Vec<Vec<i32>>,
     system: Vec<i32>,
     rng: Rng,
+    // --clock bench: the head's own record of when each entry was last used; pool: the pool's (pool.rs coldest_ages)
+    pool_clock: bool,
     last_use: HashMap<u64, Instant>,
     full_seen: u64,
     c: Counts,
@@ -142,21 +188,27 @@ impl Cluster {
             for x in &io {
                 match *x {
                     Io::Spill { page, slot, .. } => {
+                        r.note(slot, format!("spill page {page}"));
                         encode(self.id, ri as u64, &r.dev[page as usize], &mut r.buf);
                         r.store.write_block(slot, &r.buf).unwrap_or_else(|e| die(format!("spill: {e}")));
                     }
                     Io::Move { slot, to_slot, .. } => {
                         // one tier: a move is the tier shrinking (resize_tier) or a no-op tier change
+                        r.note(slot, format!("move out to {to_slot}"));
+                        r.note(to_slot, format!("move in from {slot}"));
                         r.store.read_block(slot, &mut r.buf2).unwrap_or_else(|e| die(format!("move read: {e}")));
-                        decode(self.id, ri as u64, &r.buf2)
-                            .unwrap_or_else(|e| die(format!("{} rank {ri}: moved block {slot}: {e}", self.name)));
+                        if let Err(e) = decode(self.id, ri as u64, &r.buf2) {
+                            r.wrong(self.id, self.name, ri, slot, format!("moved: {e}"));
+                        }
                         r.store.write_block(to_slot, &r.buf2).unwrap_or_else(|e| die(format!("move write: {e}")));
                     }
                     Io::Restore { slot, page, .. } => {
+                        r.note(slot, format!("restore page {page}"));
                         r.store.read_block(slot, &mut r.buf).unwrap_or_else(|e| die(format!("restore: {e}")));
-                        r.dev[page as usize] = decode(self.id, ri as u64, &r.buf).unwrap_or_else(|e| {
-                            die(format!("{} rank {ri}: restored block {slot} is wrong: {e}", self.name))
-                        });
+                        match decode(self.id, ri as u64, &r.buf) {
+                            Ok(p) => r.dev[page as usize] = p,
+                            Err(e) => r.wrong(self.id, self.name, ri, slot, format!("restored: {e}")),
+                        }
                     }
                 }
             }
@@ -179,20 +231,22 @@ impl Cluster {
                 Io::Restore { .. } => self.c.restored_blocks += 1,
             }
         }
-        // entries new to the tier were used now
-        let now = Instant::now();
-        let s = self.ranks[0].pool.stash().unwrap();
-        let ids: Vec<u64> = s.lru(0).iter().map(|e| e.0).collect();
-        for id in &ids {
-            self.last_use.entry(*id).or_insert(now);
-        }
-        self.last_use.retain(|id, _| ids.contains(id));
-        // a prefix entry is as recently used as the newest run stored on it: hits on those runs read its blocks
-        for e in s.entries(0) {
-            if let Some((b, _)) = e.base {
-                let t = self.last_use[&e.id];
-                if let Some(x) = self.last_use.get_mut(&b) {
-                    *x = (*x).max(t);
+        if !self.pool_clock {
+            // entries new to the tier were used now
+            let now = Instant::now();
+            let s = self.ranks[0].pool.stash().unwrap();
+            let ids: Vec<u64> = s.lru(0).iter().map(|e| e.0).collect();
+            for id in &ids {
+                self.last_use.entry(*id).or_insert(now);
+            }
+            self.last_use.retain(|id, _| ids.contains(id));
+            // a prefix entry is as recently used as the newest run stored on it: hits on those runs read its blocks
+            for e in s.entries(0) {
+                if let Some((b, _)) = e.base {
+                    let t = self.last_use[&e.id];
+                    if let Some(x) = self.last_use.get_mut(&b) {
+                        *x = (*x).max(t);
+                    }
                 }
             }
         }
@@ -238,14 +292,18 @@ impl Cluster {
         self.run_io();
         if h.stored {
             self.c.stored_hits += 1;
-            self.last_use.insert(h.age, Instant::now());
         }
-        // a hit that reuses a stored prefix through a pool run still read it: every prefix entry the prompt starts with
-        let now = Instant::now();
-        let s = self.ranks[0].pool.stash().unwrap();
-        for e in s.entries(0).iter().filter(|e| e.kind.prefix()) {
-            if prompt.starts_with(&e.st.history[..(e.st.valid.max(0) as usize).min(e.st.history.len())]) {
-                self.last_use.insert(e.id, now);
+        if !self.pool_clock {
+            if h.stored {
+                self.last_use.insert(h.age, Instant::now());
+            }
+            // a hit that reuses a stored prefix through a pool run still read it: every prefix entry the prompt starts with
+            let now = Instant::now();
+            let s = self.ranks[0].pool.stash().unwrap();
+            for e in s.entries(0).iter().filter(|e| e.kind.prefix()) {
+                if prompt.starts_with(&e.st.history[..(e.st.valid.max(0) as usize).min(e.st.history.len())]) {
+                    self.last_use.insert(e.id, now);
+                }
             }
         }
         // the reused rows hold the prompt's tokens, on every rank; the rest is computed
@@ -284,20 +342,26 @@ impl Cluster {
         let s0 = self.ranks[0].pool.tier_stats(0).unwrap();
         let wants = busy && s0.full > self.full_seen && self.ranks[0].store.segs() < self.cap;
         self.full_seen = s0.full;
-        let now = Instant::now();
-        let lru = self.ranks[0].pool.stash().unwrap().lru(0);
-        let lu = &self.last_use;
-        let ages = coldest_ages(
-            &lru,
-            |id| lu.get(&id).map_or(0, |t| now.duration_since(*t).as_millis() as u64),
-            self.per_seg,
-            8,
-        );
+        let ages = if self.pool_clock {
+            // the pool's own clock (pool.rs coldest_ages), as the engine's head reports it
+            self.ranks[0].pool.coldest_ages(0, self.per_seg, 8)
+        } else {
+            let now = Instant::now();
+            let lru = self.ranks[0].pool.stash().unwrap().lru(0);
+            let lu = &self.last_use;
+            coldest_ages(
+                &lru,
+                |id| lu.get(&id).map_or(0, |t| now.duration_since(*t).as_millis() as u64),
+                self.per_seg,
+                8,
+            )
+        };
         let rep = self.ranks[0].store.report(if wants { 2 } else { 0 }, &ages).unwrap_or_else(|e| die(e.to_string()));
         let mut act = String::new();
         if rep.grant > 0 {
             for r in &mut self.ranks {
                 let b = r.store.grow(rep.grant).unwrap_or_else(|e| die(format!("grow: {e}")));
+                r.resizes.push(format!("{} ms grow +{} to {b} blocks", ms(), rep.grant));
                 if !r.pool.resize_tier(0, b).unwrap() {
                     die("resize_tier refused a grow".into());
                 }
@@ -315,8 +379,9 @@ impl Cluster {
             // the moves into the blocks that stay, on every rank, before any rank gives its top segments back
             let io = self.run_io();
             self.c.give_moves += io.iter().filter(|x| matches!(x, Io::Move { .. })).count() as u64;
-            for r in &self.ranks {
+            for r in &mut self.ranks {
                 r.store.shrink(to).unwrap_or_else(|e| die(format!("shrink: {e}")));
+                r.resizes.push(format!("{} ms shrink to {to} segs", ms()));
             }
             self.c.shrinks += 1;
             act = format!("give-{}", rep.give);
@@ -354,6 +419,8 @@ struct Args {
     agents: usize,
     want: Want,
     json: Option<String>,
+    pool_clock: bool,
+    seed: u64,
 }
 
 fn cluster(a: &Args, addr: &str, id: u64, name: &'static str, mla_row: usize, floor: u64, cap: u64) -> Cluster {
@@ -380,10 +447,18 @@ fn cluster(a: &Args, addr: &str, id: u64, name: &'static str, mla_row: usize, fl
             pool.stores(2);
             pool.add_tier(store.blocks(), Keep::All, None).unwrap();
             pool.set_policy(0, Policy { block_bytes: block as u64, ..Policy::default() }).unwrap();
-            Rank { pool, dev: vec![[-1; ROWS]; POOL_PAGES as usize], store, buf: vec![0; block], buf2: vec![0; block] }
+            Rank {
+                pool,
+                dev: vec![[-1; ROWS]; POOL_PAGES as usize],
+                store,
+                buf: vec![0; block],
+                buf2: vec![0; block],
+                hist: HashMap::new(),
+                resizes: Vec::new(),
+            }
         })
         .collect::<Vec<_>>();
-    let mut rng = Rng(id * 7919 + 13);
+    let mut rng = Rng(id * 7919 + 13 + a.seed * 104_729);
     let system: Vec<i32> = (0..300).map(|_| rng.range(0, 1 << 30) as i32).collect();
     Cluster {
         id,
@@ -394,6 +469,7 @@ fn cluster(a: &Args, addr: &str, id: u64, name: &'static str, mla_row: usize, fl
         agents: vec![Vec::new(); a.agents],
         system,
         rng,
+        pool_clock: a.pool_clock,
         last_use: HashMap::new(),
         full_seen: 0,
         c: Counts::default(),
@@ -412,6 +488,8 @@ fn main() {
         agents: 24,
         want: Want::Tcp,
         json: None,
+        pool_clock: true,
+        seed: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -427,6 +505,14 @@ fn main() {
             "--agents" => a.agents = v().parse().unwrap_or_else(|_| usage()),
             "--transport" => a.want = v().parse().unwrap_or_else(|_| usage()),
             "--json" => a.json = Some(v()),
+            "--clock" => {
+                a.pool_clock = match v().as_str() {
+                    "pool" => true,
+                    "bench" => false,
+                    _ => usage(),
+                }
+            }
+            "--seed" => a.seed = v().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }

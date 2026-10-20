@@ -198,3 +198,47 @@ fn ages_are_one_per_segment_of_blocks_coldest_first() {
     assert_eq!(coldest_ages(&lru, |id| id, 4, 1), vec![10]);
     assert!(coldest_ages(&[], |id| id, 4, 8).is_empty());
 }
+
+// Two clusters grow and shrink against each other as fast as they can, each from its own thread, and after every
+// change write a fresh pattern into every block they hold and read it all back, twice. A segment the node handed to two
+// leases at once (or zeroed while a rank still held it) shows up as a block that does not read back.
+#[test]
+fn segments_that_change_hands_under_load_never_mix() {
+    let addr = node(12, 60_000);
+    let run = |group: &'static str, block: usize, seed: u64| {
+        let addr = addr.clone();
+        std::thread::spawn(move || {
+            let c = cluster(&addr, group, 2, block, 1, 8);
+            let mut x = seed;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            for i in 0..120u64 {
+                let segs = c[0].segs();
+                if next() % 2 == 0 {
+                    let r = c[0].report(1 + next() % 3, &[]).unwrap();
+                    for s in &c {
+                        s.grow(r.grant).unwrap();
+                    }
+                } else if segs > 1 {
+                    let to = segs - 1 - next() % segs.min(2).max(1).min(segs - 1);
+                    for s in &c {
+                        s.shrink(to.max(1)).unwrap();
+                    }
+                }
+                let tag = seed * 1000 + i * 4;
+                write_all(&c, tag);
+                check(&c, tag, c[0].blocks());
+                std::thread::yield_now();
+                check(&c, tag, c[0].blocks());
+            }
+        })
+    };
+    let a = run("a", 100_000, 0x9e3779b97f4a7c15);
+    let b = run("b", 70_000, 0x2545f4914f6cdd1d);
+    a.join().unwrap();
+    b.join().unwrap();
+}

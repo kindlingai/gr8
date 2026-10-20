@@ -2,9 +2,10 @@
 
 use crate::reuse::{self, Finished, Rules, Why};
 use crate::stash::{continues, Index, Io, Keep, Policy, Stash, TierStats};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::time::Instant;
 
 /// Rows per page.
 pub const PAGE: u64 = 64;
@@ -173,6 +174,9 @@ pub struct Pool {
     // or retained run and are not counted anywhere, so the engine may release their memory.
     chunk: u32,
     offline: Vec<bool>,
+    // when each stored entry was last used, by this process's clock (coldest_ages: what a KV node's head reports).
+    // Advice to the node only: never in the digest, and no pool decision reads it
+    seen: HashMap<u64, Instant>,
 }
 
 impl Pool {
@@ -212,6 +216,7 @@ impl Pool {
             next_len: None,
             chunk: 0,
             offline: Vec::new(),
+            seen: HashMap::new(),
         })
     }
 
@@ -487,7 +492,57 @@ impl Pool {
             || s.continues_stored(prompt);
         self.next_continues = continuing;
         let span = self.next_span;
+        self.touch_prefixes(prompt);
         self.stash.as_mut().expect("checked").count(prompt, continuing, span)
+    }
+
+    // a prompt that starts with a stored prefix reads its blocks when it is admitted (or will, on a hit): used now
+    fn touch_prefixes(&mut self, prompt: &[i32]) {
+        let Some(s) = &self.stash else { return };
+        let now = Instant::now();
+        for t in 0..s.tiers() {
+            for e in s.entries(t).iter().filter(|e| e.kind.prefix()) {
+                if prompt.starts_with(&e.st.history[..(e.st.valid.max(0) as usize).min(e.st.history.len())]) {
+                    self.seen.insert(e.id, now);
+                }
+            }
+        }
+    }
+
+    /// The ages a KV node's head REPORTs for tier t (remote::coldest_ages): ms since the use of the entry holding each
+    /// (i x per_seg)-th coldest block, at most `most`. An entry was used when it was stored, restored, or a prompt
+    /// started with it (a prefix); a prefix base counts as used as recently as the newest run stored on it.
+    pub fn coldest_ages(&mut self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
+        let Some(s) = &self.stash else { return Vec::new() };
+        if t >= s.tiers() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let mut live = std::collections::HashSet::new();
+        for x in 0..s.tiers() {
+            for e in s.entries(x) {
+                self.seen.entry(e.id).or_insert(now);
+                live.insert(e.id);
+            }
+        }
+        self.seen.retain(|id, _| live.contains(id));
+        let mut at = self.seen.clone();
+        for x in 0..s.tiers() {
+            for e in s.entries(x) {
+                if let Some((b, _)) = e.base {
+                    let u = self.seen[&e.id];
+                    if let Some(v) = at.get_mut(&b) {
+                        *v = (*v).max(u);
+                    }
+                }
+            }
+        }
+        crate::remote::coldest_ages(
+            &s.lru(t),
+            |id| at.get(&id).map_or(0, |u| now.duration_since(*u).as_millis() as u64),
+            per_seg,
+            most,
+        )
     }
 
     /// Prepare an admission without counting non-stock prompts toward stock promotion. Call before its grant,
@@ -518,6 +573,15 @@ impl Pool {
     /// After the copies from io(): commits the index records of the entries they wrote. An error leaves the pool as it
     /// is. The entries stay, and only a restart misses them.
     pub fn io_done(&mut self) -> std::io::Result<()> {
+        if let Some(s) = &self.stash {
+            // entries the copies stored were used now
+            let now = Instant::now();
+            for t in 0..s.tiers() {
+                for e in s.entries(t) {
+                    self.seen.entry(e.id).or_insert(now);
+                }
+            }
+        }
         self.stash.as_mut().map_or(Ok(()), Stash::io_done)
     }
 
@@ -954,7 +1018,11 @@ impl Pool {
             return Err(Error::NoHit);
         }
         if let Some(t) = from {
-            return self.take_stored(skip, age, t as usize, rows, worst);
+            let r = self.take_stored(skip, age, t as usize, rows, worst);
+            if r.is_ok() {
+                self.seen.insert(age, Instant::now());
+            }
+            return r;
         }
         let i = self.kept.iter().position(|k| k.age == age).ok_or(Error::NotRetained)?;
         let w = pages_for(worst);
