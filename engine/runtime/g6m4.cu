@@ -808,6 +808,7 @@ int main(int argc, char** argv)
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
     int s2_below = 0;
     std::unique_ptr<RtTier> rtt;       // G6_RT_STORE (rt_rows.cuh); null = off
+    int rt_rows = 0, rt_runs = 0;      // release: rows a session past R puts in one step, such sessions the slots cover
     if (s2mode)
     {
 #if defined(G6_CP) && G6_CP
@@ -822,7 +823,7 @@ int main(int argc, char** argv)
         if (const char* rs = getenv("G6_RT_STORE"))
         {
             const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
-            const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
+            int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
             if (s2_below != cp_R) die("G6_RT_STORE needs G6_S2_BELOW = G6_CP_R (runs past R on the pool's page classes)");
             char host[64] = "host";
             gethostname(host, sizeof host - 1);
@@ -848,11 +849,22 @@ int main(int argc, char** argv)
                 if (rt_win < need) die("G6_RT_LOCAL " + std::to_string(rt_win) + ": a prefill quantum of --prefill " + std::to_string(MP) +
                                          " rows needs at least " + std::to_string(need) + " window pages");
                 if (rp + rt_win > place) die("G6_RT_LOCAL: the window does not fit the main model's pages past the prefix");
+                // the slot pool: only sessions past R read released rows, each at most rt_rows rows a step (an MTP
+                // verify, a DFlash2 verify, or a prompt chunk), and the window layout holds at most rt_runs of them
+                // below place. Every row of theirs a step selects needs a slot: 2048 x rt_rows x rt_runs. A smaller
+                // G6_RT_POOL lowers rt_runs, and the pool then admits fewer sessions past R at once
+                rt_rows = std::min<int>(MX, std::max({mtp + 1, dfl ? dfl::K + 1 : 0, plan.chunk}));   // DFlash2: its widest verify
+                rt_runs = std::min(s2sess, place / (rp + rt_win));
+                if (getenv("G6_RT_POOL")) rt_runs = std::min(rt_runs, S / (2048 * rt_rows));
+                else S = 2048 * rt_rows * rt_runs;
+                if (rt_runs < 1) die("G6_RT_POOL " + std::to_string(S) + ": less than one session past R (2048 x " + std::to_string(rt_rows) + " rows)");
+                if (R == 0)
+                    fprintf(stderr, "# rank 0: G6_RT_LOCAL slot pool %d = 2048 x %d rows a session x %d sessions past R at once (place %d, %d prefix + "
+                                    "%d window pages each)\n", S, rt_rows, rt_runs, place, rp, rt_win);
             }
             rtt = rt_build(m, rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag + (rt_win ? "-rel" : ""),
-                           layout + (rt_win ? " released" : ""), L, S, rt_win, ids,
-                           std::min<int>(MX, std::max(s2sess * (mtp + 1), plan.chunk)), false, int4,
-                           getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK")), st);   // sc.max_rows: a step's rows at most
+                           layout + (rt_win ? " released" : ""), L, S, rt_win, ids, rt_win ? rt_rows : 1, false, int4,
+                           getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK")), st);
         }
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
@@ -1002,7 +1014,8 @@ int main(int argc, char** argv)
         if (rtt && rtt->local)
         {
             if (!pool.split()) die("G6_RT_LOCAL needs the pool's page classes (G6_S2_BELOW = G6_CP_R)");
-            pool.window((uint32_t)rtt->local, (uint32_t)rtt->V);   // a tail waits until its records fit every rank's lease
+            // a tail waits until its records fit every rank's lease, a session past R until the slots cover it
+            pool.window((uint32_t)rtt->local, (uint32_t)rtt->V, (uint32_t)rt_runs);
             if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL: a run past R holds %d prefix + %d window pages below place %d, its whole tail above "
                                         "(%d pages: the longest tail one run can have, %d rows); %d record ids per rank\n", cp_R / 64, rtt->local, place,
                                 cap / 64 - place, (cap / 64 - place) * 64, rtt->V);
@@ -1344,6 +1357,8 @@ int main(int argc, char** argv)
                     std::string why = "it takes " + std::to_string(lo) + " pages below place (" + std::to_string(lofree) + " free) and its tail of " +
                                       std::to_string(hi) + " above (" + std::to_string(hifree) + " free)";
                     if (hi > (uint64_t)(cap / 64 - std::min(m.s2->pool_pages, D.d.s2->pool_pages))) why += ": the tail is longer than the drafter class, it never fits";
+                    if ((int)pool.window_runs() >= rt_runs)
+                        why += "; the slot pool covers " + std::to_string(rt_runs) + " session(s) past R at once (G6_RT_POOL), all in use";
                     if (const auto iv = pool.ids_view(worst))
                     {
                         why += "; its tail needs " + std::to_string((*iv)[0]) + " records a rank, " + std::to_string((*iv)[1]) + " of the lease's " +

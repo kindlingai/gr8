@@ -159,6 +159,9 @@ pub struct Pool {
     // with window: the records each rank's rows store holds (its lease), 0 = no limit. A window run takes the most
     // records one rank can need for its tail, ceil(tail pages / nr), at its grant, as it takes its pages
     ids: u32,
+    // with window: the most window runs live at once (the engine's slot pool covers that many sessions' rows of one
+    // step), 0 = no limit
+    runs: u32,
     version: u32,
     live: u32,
     live_hi: u32, // of live: the pages at or above place (the drafter's tail copies of split runs)
@@ -201,6 +204,7 @@ impl Pool {
             nr: 0,
             window: 0,
             ids: 0,
+            runs: 0,
             version: 0,
             live: 0,
             live_hi: 0,
@@ -435,13 +439,23 @@ impl Pool {
 
     /// Remote rows release: the main pages of a split run past its prefix (0 = off). Before any reservation.
     /// `ids`: the records of each rank's rows store (0 = no limit); a request whose tail needs more than are free waits.
-    pub fn window(&mut self, pages: u32, ids: u32) -> Result<(), Error> {
-        if self.nr == 0 || self.live != 0 || !self.kept.is_empty() || (pages == 0 && ids != 0) {
+    /// `runs`: the most window runs live at once (0 = no limit); one more waits.
+    pub fn window(&mut self, pages: u32, ids: u32, runs: u32) -> Result<(), Error> {
+        if self.nr == 0 || self.live != 0 || !self.kept.is_empty() || (pages == 0 && (ids != 0 || runs != 0)) {
             return Err(Error::BadArgument);
         }
         self.window = pages;
         self.ids = ids;
+        self.runs = runs;
         Ok(())
+    }
+
+    /// With window: the window runs live now.
+    pub fn window_runs(&self) -> u32 {
+        if self.window == 0 {
+            return 0;
+        }
+        self.held.values().filter(|h| h.exclusive).count() as u32
     }
 
     // a live window run's records on the rank that holds the most of its tail
@@ -1059,6 +1073,7 @@ impl Pool {
         if self.window > 0 {
             h = mix(h, 0x7274_0000_0000_0000 | self.window as u64);   // a pool without the window hashes as before
             h = mix(h, self.ids as u64);
+            h = mix(h, self.runs as u64);
         }
         for (p, _) in self.used.iter().enumerate().filter(|(_, &u)| u) {
             h = mix(h, p as u64);
@@ -1308,8 +1323,11 @@ impl Pool {
     fn split_room(&self, low: u64, high: u64) -> bool {
         // a window run's tail also needs its records in every rank's lease (high = its tail pages)
         let ids_ok = self.window == 0 || self.ids_free().map_or(true, |f| high.div_ceil(self.nr as u64) <= f);
+        // and a share of the slot pool: the engine sized it for `runs` sessions past R in one step
+        let runs_ok = self.window == 0 || self.runs == 0 || self.window_runs() < self.runs;
         !self.exclusive
             && ids_ok
+            && runs_ok
             && low <= self.lo_free() as u64
             && high <= self.hi_free() as u64
             && self.safe_with(self.place_online(), None, None, Some(low))

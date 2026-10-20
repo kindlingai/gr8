@@ -13,7 +13,7 @@ fn pool(pages: u32, place: u32, rp: u32, nr: u32, window: u32) -> Pool {
     p.keep(RULES);
     p.tail(nr, 0);
     if window > 0 {
-        p.window(window, 0).unwrap();
+        p.window(window, 0, 0).unwrap();
     }
     p
 }
@@ -46,7 +46,7 @@ fn a_window_run_takes_its_prefix_window_and_whole_tail() {
     assert_eq!(p.reserve(44 * PAGE, 44 * PAGE), Err(Error::NoRoom));
     assert_eq!(p.digest(), d);
     // the window is fixed while runs are live
-    assert_eq!(p.window(2, 0), Err(Error::BadArgument));
+    assert_eq!(p.window(2, 0, 0), Err(Error::BadArgument));
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn the_digest_names_the_window() {
     assert_ne!(a.digest(), b.digest());
     assert_ne!(b.digest(), c.digest());
     let mut d = Pool::new(160, 64, 8 * 64).unwrap();
-    assert_eq!(d.window(4, 0), Err(Error::BadArgument), "a window needs the page classes");
+    assert_eq!(d.window(4, 0, 0), Err(Error::BadArgument), "a window needs the page classes");
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn the_stores_never_read_a_window_runs_tail() {
     p.stores(1);
     p.add_tier(256, Keep::All, None).unwrap();
     p.tail(4, 3);
-    p.window(4, 0).unwrap();
+    p.window(4, 0, 0).unwrap();
     let worst = 40 * PAGE;
     for turn in 0..3 {
         let a = p.reserve(worst, worst).unwrap();
@@ -165,7 +165,7 @@ fn a_tail_waits_for_records_in_the_lease() {
     let mut p = Pool::new(160, 64, 8 * 64).unwrap();
     p.keep(RULES);
     p.tail(4, 0);
-    p.window(4, 12).unwrap();
+    p.window(4, 12, 0).unwrap();
     let worst = 40 * PAGE;
     assert_eq!(p.ids_view(worst), Some((8, 12, 12)));
     let a = p.reserve(worst, worst).unwrap();
@@ -180,4 +180,28 @@ fn a_tail_waits_for_records_in_the_lease() {
     p.release(&a).unwrap();
     assert!(p.fits(worst, worst) && !p.fits(60 * PAGE, 60 * PAGE));
     assert_eq!(p.ids_free(), Some(12));
+}
+
+#[test]
+fn a_session_past_r_waits_for_its_share_of_the_slots() {
+    // the slot pool covers two sessions past R at once: a third waits until one leaves; runs below R are not counted
+    let mut p = Pool::new(400, 200, 8 * 64).unwrap();
+    p.keep(RULES);
+    p.tail(4, 0);
+    p.window(4, 0, 2).unwrap();
+    let worst = 20 * PAGE;
+    let a = p.reserve(worst, worst).unwrap();
+    let _b = p.reserve(worst, worst).unwrap();
+    assert_eq!(p.window_runs(), 2);
+    assert!(!p.fits(worst, worst), "a third session past R waits");
+    assert_eq!(p.reserve(worst, worst), Err(Error::NoRoom));
+    assert!(p.fits(3 * PAGE, 3 * PAGE), "a run below R does not take a share");
+    p.release(&a).unwrap();
+    assert!(p.fits(worst, worst));
+    let d = pool(400, 200, 8, 4, 4).digest();
+    let mut e = Pool::new(400, 200, 8 * 64).unwrap();
+    e.keep(RULES);
+    e.tail(4, 0);
+    e.window(4, 0, 2).unwrap();
+    assert_ne!(d, e.digest(), "the digest names the limit");
 }

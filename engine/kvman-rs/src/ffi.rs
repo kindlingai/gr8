@@ -590,17 +590,26 @@ pub unsafe extern "C" fn g6kv_tail(p: *mut Pool, nr: u32, per_slot: u32) {
     (*p).tail(nr, per_slot);
 }
 
-/// Remote rows release: a split run's main pages past its prefix, and the records of each rank's rows store (0 = no
-/// limit) (src/pool.rs Pool::window). Before any reservation.
+/// Remote rows release: a split run's main pages past its prefix, the records of each rank's rows store and the most
+/// window runs live at once (0 = no limit for either) (src/pool.rs Pool::window). Before any reservation.
 ///
 /// # Safety
 /// `p` must be live.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_window(p: *mut Pool, pages: u32, ids: u32) -> i32 {
-    match (*p).window(pages, ids) {
+pub unsafe extern "C" fn g6kv_window(p: *mut Pool, pages: u32, ids: u32, runs: u32) -> i32 {
+    match (*p).window(pages, ids, runs) {
         Ok(()) => 0,
         Err(e) => e.code(),
     }
+}
+
+/// The window runs live now.
+///
+/// # Safety
+/// `p` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_window_runs(p: *const Pool) -> u32 {
+    (*p).window_runs()
 }
 
 /// For a window request of `worst` rows past R with a lease limit: 1 and {records its tail needs per rank, records
@@ -828,7 +837,8 @@ pub unsafe extern "C" fn g6kv_rows_register(r: *const crate::rows::Rows, p: *mut
 }
 
 /// Adds a group before g6kv_rows_start: its request ring (a g6kv_rows_req and `cap` entries), done word and `nslots`
-/// slots of `rec` bytes each. Returns the group's index, or -1 with g6kv_tier_error.
+/// slots of `stride` bytes each; a record of `rec` bytes goes at byte `off` of its slot. Returns the group's index, or
+/// -1 with g6kv_tier_error.
 ///
 /// # Safety
 /// `r` must be live; the buffers must outlive it and stay mapped while its thread runs.
@@ -839,10 +849,12 @@ pub unsafe extern "C" fn g6kv_rows_group(
     done: *mut u64,
     slots: *mut u8,
     rec: usize,
+    stride: usize,
+    off: usize,
     nslots: u32,
     cap: u32,
 ) -> i32 {
-    match (*r).add_group(req, done, slots, rec, nslots, cap) {
+    match (*r).add_group(req, done, slots, rec, stride, off, nslots, cap) {
         Ok(i) => i as i32,
         Err(e) => crate::blocks::fail(e),
     }

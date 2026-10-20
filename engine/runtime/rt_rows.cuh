@@ -24,8 +24,8 @@
 //
 // G6_RT_FMT=int4 (int4 here): a record holds each row in the INT4 layout (kvfmt.h int4row, 416 B for 656), so a lease
 // holds 0.63x the bytes and a fetch moves 0.63x; the pages and the slots stay FP8, so no attention kernel changes. The
-// spill packs each page's rows on the GPU (attn.cu g6_rt_pack_int4); the helper reads records into a stage at the
-// slot's place, and after the wait rt_unpack (attn/rt.cuh) requantizes them into the slot as append_kv's FP8 path
+// spill packs each page's rows on the GPU (attn.cu g6_rt_pack_int4); the helper reads each record into the tail of its
+// FP8 slot, and after the wait rt_unpack (attn/rt.cuh) requantizes it into the slot in place, as append_kv's FP8 path
 // would. The rope key goes through exactly. check (G6_RT_CHECK=1): a round trip of random rows at build, and of every
 // spilled row, against the FP8 rows (latent SQNR, rope bytes), printed by rt_check_print. A released page's records
 // are packed the same way, and a prefill turns them back into FP8 rows on the GPU (rt_pf_stage).
@@ -50,7 +50,6 @@ struct RtTier
         G6RtGroup h{};                // host copy of the device struct (its addresses)
         G6RtGroup* dev = nullptr;
         uint8_t* slots = nullptr;     // mapped pinned [slots][layers][g6kv::ROW]
-        uint8_t* stage = nullptr;     // int4: mapped pinned [slots][rec], what the helper reads into
         void* req = nullptr;          // mapped pinned ring
         uint64_t* done = nullptr;     // mapped pinned
         uint8_t* ix = nullptr;        // release: [V] pages of the full-index layer's index keys (device)
@@ -524,8 +523,8 @@ inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<st
 // L: tokens (multiple of 64, >= the CP map's R); S: slots per group; layout: the store's header, so records are only
 // read under the layout that wrote them; lease: the store's name without the rank; local > 0: release, each session
 // with that many window pages past L, the store holding released ids only: ids of them (0 = one per page past L this
-// rank could hold in one table); step_rows: the most rows one step carries (release: S must hold every row each of them
-// selects); int4: INT4 records (G6_RT_FMT); check: G6_RT_CHECK. Before s2_init and any prepare: the views and replay
+// rank could hold in one table); step_rows: the most rows one session past R puts in a step (release: S must hold
+// every row of one such session's selection; the driver admits as many sessions past R as S covers); int4: INT4 records (G6_RT_FMT); check: G6_RT_CHECK. Before s2_init and any prepare: the views and replay
 // entries copy the bindings' arguments.
 inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const std::string& lease, const std::string& layout,
                                         int L, int S, int local, int ids, int step_rows, bool poison, bool int4, bool check,
@@ -539,8 +538,8 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
     // a released row has no local copy: every row one step selects must find a slot
     if (step_rows < 1 || step_rows > MX) die("rt_build: step rows " + std::to_string(step_rows) + " outside 1..MX");
     if (local && S < step_rows * 2048)
-        die("G6_RT_LOCAL needs G6_RT_POOL >= " + std::to_string(step_rows * 2048) + " (2048 selected rows for each of a step's " +
-            std::to_string(step_rows) + " rows)");
+        die("G6_RT_LOCAL needs G6_RT_POOL >= " + std::to_string(step_rows * 2048) + " (2048 selected rows for each of a session's " +
+            std::to_string(step_rows) + " rows in a step)");
     auto t = std::make_unique<RtTier>();
     t->L = L; t->S = S; t->nr = g6nr::NR; t->rank = m.rank; t->poison = poison; t->local = local;
     t->int4 = int4; t->check = check && int4; t->hold = check && local;
@@ -616,25 +615,24 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
         *G.done = 0;
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&G.slots), (size_t)S * srec, cudaHostAllocMapped));
         memset(G.slots, 0, (size_t)S * srec);
-        void *rq = nullptr, *dn = nullptr, *sl = nullptr, *sg = nullptr;
+        void *rq = nullptr, *dn = nullptr, *sl = nullptr;
         G6RT_CK(cudaHostGetDevicePointer(&rq, G.req, 0));
         G6RT_CK(cudaHostGetDevicePointer(&dn, G.done, 0));
         G6RT_CK(cudaHostGetDevicePointer(&sl, G.slots, 0));
         h.req = rq; h.done = static_cast<const unsigned long long*>(dn);
         h.nl = (int)G.layers.size();
+        // int4: the helper reads a record into its slot's tail, and rt_unpack turns it into the slot's FP8 rows in place
         if (int4)
         {
-            G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&G.stage), (size_t)S * rec, cudaHostAllocMapped));
-            memset(G.stage, 0, (size_t)S * rec);
-            G6RT_CK(cudaHostGetDevicePointer(&sg, G.stage, 0));
-            h.stage = static_cast<const unsigned char*>(sg);
+            if (G.layers.size() > 8) die("G6_RT_FMT=int4: a group of more than 8 layers (attn/rt.cuh RT_NLMAX)");
             h.out = static_cast<unsigned char*>(sl);
+            h.soff = (int)(srec - rec);
         }
-        uint8_t* into = int4 ? G.stage : G.slots;   // what the helper reads records into
         G.dev = dmalloc<G6RtGroup>(1);
         G6RT_CK(cudaMemcpy(G.dev, &h, sizeof h, cudaMemcpyHostToDevice));
-        if (g6kv_rows_register(t->store, into, (size_t)S * rec)) die(std::string("G6_RT_STORE register: ") + g6kv_tier_error());
-        if (g6kv_rows_group(t->store, static_cast<g6kv_rows_req*>(G.req), G.done, into, rec, (uint32_t)S, (uint32_t)cap) < 0)
+        if (g6kv_rows_register(t->store, G.slots, (size_t)S * srec)) die(std::string("G6_RT_STORE register: ") + g6kv_tier_error());
+        if (g6kv_rows_group(t->store, static_cast<g6kv_rows_req*>(G.req), G.done, G.slots, rec, srec, int4 ? srec - rec : 0, (uint32_t)S,
+                            (uint32_t)cap) < 0)
             die(std::string("G6_RT_STORE group: ") + g6kv_tier_error());
         for (size_t j = 0; j < G.layers.size(); ++j)
         {
@@ -657,8 +655,8 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
     const double rec_all = (double)(bytes - G6KV_ROWS_HEADER) / recs;   // every group's record of one row
     if (int4)
         fprintf(stderr, "# rank %d: G6_RT_STORE %s (%s): int4 records (%.0f B a token), rows past %d, %zu groups, %d slots each (%.3f GB "
-                "pinned with the stage), %.3f GB of records\n",
-                m.rank, spec.c_str(), d, rec_all, L, t->g.size(), S, (double)S * (rec_all / row * g6kv::ROW + rec_all) / 1e9,
+                "pinned), %.3f GB of records\n",
+                m.rank, spec.c_str(), d, rec_all, L, t->g.size(), S, (double)S * (rec_all / row * g6kv::ROW) / 1e9,
                 (bytes - G6KV_ROWS_HEADER) / 1e9);
     else
         fprintf(stderr, "# rank %d: G6_RT_STORE %s (%s): rows past %d, %zu groups, %d slots each (%.3f GB pinned), %.3f GB of records\n",

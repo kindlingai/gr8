@@ -23,12 +23,11 @@ struct G6RtGroup {
     int slots, rows, cap, hand, n;  // n: misses of the last resolve (the wait skips at 0)
     int kbase;                      // the row of the store's first record (released pages only: page_count * 64)
     unsigned long long local;       // misses the pool had no room for: read from the local copy
-    // G6_RT_FMT=int4: the store's records hold INT4 rows (kvfmt.h int4row), and the helper reads them into stage + slot
-    // * rec; after the wait, rt_unpack turns them into the FP8 rows of slot (out + slot * nl * 656). nullptr: FP8 records,
-    // read straight into the slots
-    const unsigned char *stage;
+    // G6_RT_FMT=int4: the store's records hold INT4 rows (kvfmt.h int4row), and the helper reads each into the tail of
+    // its FP8 slot (out + slot * nl * 656 + soff); after the wait, rt_unpack turns it into that slot's FP8 rows in place.
+    // out nullptr: FP8 records, read straight into the slots
     unsigned char *out;
-    int nl;                         // layers in the group
+    int nl, soff;                   // layers in the group, the record's place in its slot
 };
 struct G6Attn {
     int rows, heads, context, page_size, page_count, table_size, query_tile;

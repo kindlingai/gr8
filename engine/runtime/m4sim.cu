@@ -651,7 +651,8 @@ int main(int argc, char** argv)
         if (!cp_on || s2mode || reuse || !serve.empty() || minv >= 0)
             die("G6_RT_STORE needs G6_CP on, and no --s2, --reuse-prefix, --serve or --minv");
         const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
-        const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
+        const int local0 = getenv("G6_RT_LOCAL") ? atoi(getenv("G6_RT_LOCAL")) : 0;
+        const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : local0 > 0 ? MX * 2048 : 4096;   // release: one sequence's step
         const bool poison = getenv("G6_RT_POISON") && atoi(getenv("G6_RT_POISON"));
         const bool int4 = rt_fmt_int4();
         const bool check = getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK"));

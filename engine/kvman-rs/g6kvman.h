@@ -199,7 +199,9 @@ struct g6kv_rows_req { uint64_t seq; uint32_t n, pad; };   // cap g6kv_rows_ent 
 #define G6KV_ROWS_HEADER 4096
 // (pool) remote rows release: a split run's main pages past its prefix (0 = off; needs g6kv_tail, before any grant),
 // and the records of each rank's rows store (0 = no limit): a window request whose tail needs more waits
-int g6kv_window(g6kv_pool* p, uint32_t pages, uint32_t ids);
+// runs: the most window runs live at once (0 = no limit): the engine's slot pool covers that many sessions past R
+int g6kv_window(g6kv_pool* p, uint32_t pages, uint32_t ids, uint32_t runs);
+uint32_t g6kv_window_runs(const g6kv_pool* p);
 // (pool) a window request of `worst` rows with a record limit: 1 and {records per rank it needs, free, in all} in out
 int g6kv_ids_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
 // (pool) a request of `worst` rows past R: 1 and {pages below place, pages above, free below, free above} in out
@@ -212,7 +214,10 @@ int g6kv_rows_write(const g6kv_rows* r, uint64_t off, const void* buf, size_t le
 int g6kv_rows_gather(const g6kv_rows* r, const uint64_t* offs, size_t n, size_t len, void* dst);
 int g6kv_rows_register(const g6kv_rows* r, void* p, size_t len);
 // before g6kv_rows_start; returns the group's index
-int g6kv_rows_group(g6kv_rows* r, g6kv_rows_req* req, uint64_t* done, void* slots, size_t rec, uint32_t nslots, uint32_t cap);
+// slots: nslots of `stride` bytes; a record of `rec` bytes lands at byte `off` of its slot (an INT4 record at the tail of
+// its FP8 slot, unpacked in place)
+int g6kv_rows_group(g6kv_rows* r, g6kv_rows_req* req, uint64_t* done, void* slots, size_t rec, size_t stride, size_t off,
+                    uint32_t nslots, uint32_t cap);
 void g6kv_rows_start(g6kv_rows* r);
 uint64_t g6kv_rows_fetched(const g6kv_rows* r);
 void g6kv_rows_describe(const g6kv_rows* r, char* buf, size_t cap);

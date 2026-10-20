@@ -11,7 +11,8 @@
 //!
 //! Each group has a request ring the GPU writes and this thread reads, both in mapped pinned memory (g6kv_rows_req):
 //! the GPU fills n entries {record offset, slot}, then stores seq with a system-scope release. The thread sees the new
-//! seq, reads every record into slots + slot * rec_bytes (the group's resident slots, also mapped pinned memory), then
+//! seq, reads every record into its slot (slots + slot * stride + off: the group's resident slots, also mapped pinned
+//! memory; an INT4 record at its FP8 slot's tail), then
 //! stores done = seq, which the GPU's wait kernel spins on. On a failed read it stores done = u64::MAX and the wait
 //! reports an error. The thread makes no CUDA calls.
 //!
@@ -149,13 +150,16 @@ impl Store {
     }
 }
 
-/// A group's ring, done word and slots, as addresses the helper thread owns while it runs.
+/// A group's ring, done word and slots, as addresses the helper thread owns while it runs. A record (rec bytes) lands
+/// at slots + slot * stride + off: an INT4 record at the tail of its FP8 slot, which the engine unpacks in place.
 #[derive(Clone, Copy)]
 struct Group {
     req: usize,
     done: usize,
     slots: usize,
     rec: usize,
+    stride: usize,
+    off: usize,
     cap: u32,
     nslots: u32,
 }
@@ -188,21 +192,24 @@ impl Rows {
         }
     }
 
-    /// Adds a group before start. `req` holds a Req and `cap` entries, `done` a u64, `slots` `nslots` slots of `rec`
-    /// bytes.
+    /// Adds a group before start. `req` holds a Req and `cap` entries, `done` a u64, `slots` `nslots` slots of `stride`
+    /// bytes; a record of `rec` bytes goes at byte `off` of its slot.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_group(
         &mut self,
         req: *mut Req,
         done: *mut u64,
         slots: *mut u8,
         rec: usize,
+        stride: usize,
+        off: usize,
         nslots: u32,
         cap: u32,
     ) -> io::Result<usize> {
-        if self.thread.is_some() || req.is_null() || done.is_null() || slots.is_null() || rec == 0 || nslots == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "rows group after start or with a null buffer"));
+        if self.thread.is_some() || req.is_null() || done.is_null() || slots.is_null() || rec == 0 || nslots == 0 || off + rec > stride {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "rows group after start, with a null buffer, or a record past its slot"));
         }
-        self.groups.push(Group { req: req as usize, done: done as usize, slots: slots as usize, rec, cap, nslots });
+        self.groups.push(Group { req: req as usize, done: done as usize, slots: slots as usize, rec, stride, off, cap, nslots });
         Ok(self.groups.len() - 1)
     }
 
@@ -269,7 +276,7 @@ fn serve(groups: &[Group], mut seen: Vec<u64>, store: &Store, stop: &AtomicBool,
             ops.clear();
             ops.extend(ents.iter().map(|e| {
                 let e = unsafe { std::ptr::read_volatile(e) };
-                (e.off, (g.slots + e.slot as usize * g.rec) as *mut u8, g.rec)
+                (e.off, (g.slots + e.slot as usize * g.stride + g.off) as *mut u8, g.rec)
             }));
             match unsafe { store.read_scatter(&ops) } {
                 Ok(()) => {
@@ -335,7 +342,7 @@ mod tests {
             Box::new(Ring { h: Req { seq: AtomicU64::new(0), n: 0, pad: 0 }, e: [Ent { off: 0, slot: 0, pad: 0 }; 4] });
         let done = Box::new(AtomicU64::new(0));
         let mut slots = vec![0u8; 3 * rec];
-        rows.add_group(&mut ring.h, done.as_ptr(), slots.as_mut_ptr(), rec, 3, 4).unwrap();
+        rows.add_group(&mut ring.h, done.as_ptr(), slots.as_mut_ptr(), rec, rec, 0, 3, 4).unwrap();
         rows.start();
         ring.e[0] = Ent { off: 7 * rec as u64, slot: 2, pad: 0 };
         ring.e[1] = Ent { off: 3 * rec as u64, slot: 0, pad: 0 };
@@ -354,6 +361,32 @@ mod tests {
             std::hint::spin_loop();
         }
         assert_eq!(done.load(Ordering::Acquire), u64::MAX);
+        drop(rows);
+    }
+
+    #[test]
+    fn a_record_lands_at_its_slots_tail() {
+        // records of 24 bytes into slots of 40, at byte 16: the INT4 record at the tail of its FP8 slot
+        let (rec, stride, off) = (24, 40, 16);
+        let mut rows = Rows::new(Store::open("mem:", "t", 4 * rec as u64).unwrap());
+        for p in 0..4u8 {
+            rows.store.write(p as u64 * rec as u64, &vec![p + 1; rec]).unwrap();
+        }
+        let mut ring =
+            Box::new(Ring { h: Req { seq: AtomicU64::new(0), n: 0, pad: 0 }, e: [Ent { off: 0, slot: 0, pad: 0 }; 4] });
+        let done = Box::new(AtomicU64::new(0));
+        let mut slots = vec![0u8; 2 * stride];
+        assert!(rows.add_group(&mut ring.h, done.as_ptr(), slots.as_mut_ptr(), rec, stride, 17, 2, 4).is_err());
+        rows.add_group(&mut ring.h, done.as_ptr(), slots.as_mut_ptr(), rec, stride, off, 2, 4).unwrap();
+        rows.start();
+        ring.e[0] = Ent { off: 2 * rec as u64, slot: 1, pad: 0 };
+        ring.h.n = 1;
+        ring.h.seq.store(1, Ordering::Release);
+        while done.load(Ordering::Acquire) != 1 {
+            std::hint::spin_loop();
+        }
+        assert!(slots[..stride + off].iter().all(|&x| x == 0));
+        assert!(slots[stride + off..].iter().all(|&x| x == 3));
         drop(rows);
     }
 }

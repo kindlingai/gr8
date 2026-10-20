@@ -125,7 +125,9 @@ public:
     bool split() const { Lock l(mu_); return g6kv_split(p_) != 0; }
     // remote rows release (G6_RT_LOCAL): a split run takes its prefix and `pages` main pages, its whole tail above place
     // ids: the records of each rank's rows store (0 = no limit): a request whose tail needs more waits
-    void window(uint32_t pages, uint32_t ids) { Lock l(mu_); check(g6kv_window(p_, pages, ids)); }
+    // runs: the most window runs live at once, what the slot pool covers (0 = no limit)
+    void window(uint32_t pages, uint32_t ids, uint32_t runs) { Lock l(mu_); check(g6kv_window(p_, pages, ids, runs)); }
+    uint32_t window_runs() const { Lock l(mu_); return g6kv_window_runs(p_); }
     // a window request of `worst` rows with a record limit: {records per rank it needs, free, in all}, or nothing
     std::optional<std::array<uint64_t, 3>> ids_view(uint64_t worst) const {
         Lock l(mu_); std::array<uint64_t, 3> v{};

@@ -120,15 +120,23 @@ __global__ void __launch_bounds__(256) rt_convert(const uint8_t* src,size_t ss,u
     const int r=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(r>=n)return;
     if(PACK)rt_pack_row(src+r*ss,dst+r*ds,lane);else rt_unpack_row(src+r*ss,dst+r*ds,lane);
 }
-// after rt_wait, before any scores: every row of the group's last request, stage -> slot (a fixed grid, for capture;
-// nothing to do when the resolve missed nothing)
+// after rt_wait, before any scores: every slot of the group's last request, its INT4 record (at the slot's tail) -> its
+// FP8 rows, in place. A block per slot at a time: the record goes to shared memory first, since the FP8 rows it becomes
+// cover it. A fixed grid, for capture; nothing to do when the resolve missed nothing.
+constexpr int RT_NLMAX=8;   // layers of a group the shared record holds (rt_rows.cuh rt_build checks)
 __global__ void __launch_bounds__(256) rt_unpack(const G6RtGroup* gp){
     const G6RtGroup& g=*gp;const int n=g.n;if(!n)return;
+    __shared__ __align__(16) uint8_t rec[RT_NLMAX*i4::ROW];
     const RtEnt* ent=(const RtEnt*)((const RtReq*)g.req+1);
-    const int lane=threadIdx.x&31,nw=gridDim.x*8;
-    for(int w=blockIdx.x*8+threadIdx.x/32;w<n*g.nl;w+=nw){
-        const int j=w/g.nl,l=w%g.nl;const size_t s=ent[j].slot;
-        rt_unpack_row(g.stage+s*g.rec+l*i4::ROW,g.out+(s*g.nl+l)*f8::ROW,lane);
+    const int lane=threadIdx.x&31,w=threadIdx.x/32;
+    const size_t srec=(size_t)g.nl*f8::ROW;
+    for(int j=blockIdx.x;j<n;j+=gridDim.x){
+        uint8_t* slot=g.out+ent[j].slot*srec;
+        const uint4* src=(const uint4*)(slot+g.soff);
+        for(int k=threadIdx.x;k<g.nl*i4::ROW/16;k+=blockDim.x)((uint4*)rec)[k]=src[k];
+        __syncthreads();
+        for(int l=w;l<g.nl;l+=blockDim.x/32)rt_unpack_row(rec+l*i4::ROW,slot+l*f8::ROW,lane);
+        __syncthreads();
     }
 }
 #endif
