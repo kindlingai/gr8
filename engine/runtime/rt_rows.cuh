@@ -34,6 +34,7 @@
 #include "../kvman-rs/g6kvman.h"
 #include <cuda_fp8.h>
 #include <cfloat>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -90,8 +91,15 @@ struct RtTier
     std::map<int, std::vector<uint8_t>> orig;
     Check stage_ck;
     uint64_t stage_bad = 0;           // staged pages under 10 dB or with a rope byte off
-    uint8_t* stage = nullptr;         // pinned: one layer's rows of the released pages a prefill gathers
-    size_t stage_bytes = 0;
+    // release: the prefill stage, two registered pinned buffers of PF_CHUNK bytes (whole pages' records), their device
+    // addresses, the events of the copies that read them, the next one; and what it moved (pages, bytes, host ms)
+    static constexpr size_t PF_CHUNK = 16u << 20;
+    uint8_t* pf_buf[2] = {};
+    const uint8_t* pf_dev[2] = {};
+    cudaEvent_t pf_ev[2] = {};
+    int pf_k = 0;
+    uint64_t pf_pages = 0, pf_bytes = 0;
+    double pf_ms = 0;
     ~RtTier() { if (store) g6kv_rows_free(store); }
 };
 
@@ -459,7 +467,10 @@ inline RtSpillSeen rt_release(Model& m, RtTier& t, int q, int committed, cudaStr
 }
 // release: layer i's rows and index keys of every page slot q released below `start` into the staged prefill pools
 // (each {pool, its index offset or 0}, logical page lp at lp), which k_cp_pf_gather / k_cp_pf_fill leave to this.
-// Plain launches on st (synchronizes it first, only when there is something to stage: the pinned stage is reused).
+// A page's records are one contiguous block in the store (64 x the group's record), so each page is one read, in
+// chunks of whole blocks into two registered pinned buffers (one RDMA chain a chunk), and the layer's rows go from
+// there into the pools by strided copies (int4: unpacked on the GPU). A buffer is reused once the copies that read it
+// are done (its event), so the stream never waits on the host; only the host waits, for the reads and that event.
 inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<std::pair<char*, size_t>>& pools, cudaStream_t st)
 {
     if (!t.local) return;
@@ -469,37 +480,42 @@ inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<st
     if (ids.empty()) return;
     const RtTier::Group& G = t.g[t.at[i].first];
     const int j = t.at[i].second;
-    const size_t row = t.int4 ? g6kv::int4row::ROW : g6kv::ROW, need = ids.size() * 64 * row;   // a record's bytes per layer
-    G6RT_CK(cudaStreamSynchronize(st));
-    if (t.stage_bytes < need)
-    {
-        if (t.stage) G6RT_CK(cudaFreeHost(t.stage));
-        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&t.stage), need, cudaHostAllocMapped));   // int4: the unpack reads it
-        t.stage_bytes = need;
-    }
+    const size_t row = t.int4 ? g6kv::int4row::ROW : g6kv::ROW, block = 64 * G.h.rec;   // a layer's row in a record; a page's records
+    const size_t per = std::max<size_t>(1, RtTier::PF_CHUNK / block);
+    const auto t0 = std::chrono::steady_clock::now();
     std::vector<uint64_t> offs;
-    for (int v : ids)
-        for (int k = 0; k < 64; ++k) offs.push_back(G.h.base + ((uint64_t)v * 64 + k) * G.h.rec + (uint64_t)j * row);
-    if (g6kv_rows_gather(t.store, offs.data(), offs.size(), row, t.stage))
-        die(std::string("G6_RT_STORE prefill read: ") + g6kv_tier_error());
-    void* dstage = nullptr;
-    if (t.int4) G6RT_CK(cudaHostGetDevicePointer(&dstage, t.stage, 0));
-    for (const auto& [pool, ixoff] : pools)
-        for (size_t n = 0; n < ids.size(); ++n)
-        {
-            const int lp = t.vlp[ids[n]];
-            char* dst = pool + (size_t)lp * 64 * g6kv::ROW;
-            if (t.int4)   // back into FP8 rows, as a fetch's rt_unpack does
-                G6RT_CK((cudaError_t)g6_rt_unpack_int4(static_cast<uint8_t*>(dstage) + n * 64 * row, row, dst, g6kv::ROW, 64, st));
-            else
-                G6RT_CK(cudaMemcpyAsync(dst, t.stage + n * 64 * row, 64 * row, cudaMemcpyHostToDevice, st));
-            if (ixoff && j == 0)
+    for (size_t c0 = 0; c0 < ids.size(); c0 += per)
+    {
+        const size_t c1 = std::min(ids.size(), c0 + per);
+        const int k = t.pf_k;
+        t.pf_k ^= 1;
+        G6RT_CK(cudaEventSynchronize(t.pf_ev[k]));   // the copies that last read this buffer are done
+        offs.clear();
+        for (size_t n = c0; n < c1; ++n) offs.push_back(G.h.base + (uint64_t)ids[n] * block);
+        if (g6kv_rows_gather(t.store, offs.data(), offs.size(), block, t.pf_buf[k]))
+            die(std::string("G6_RT_STORE prefill read: ") + g6kv_tier_error());
+        for (const auto& [pool, ixoff] : pools)
+            for (size_t n = c0; n < c1; ++n)
             {
-                if (!G.ix) die("G6_RT_LOCAL: a staged layer's index keys without an arena");
-                G6RT_CK(cudaMemcpyAsync(pool + ixoff + (size_t)lp * 64 * g6kv::IDX_ROW, G.ix + (size_t)ids[n] * 64 * g6kv::IDX_ROW,
-                                        64 * g6kv::IDX_ROW, cudaMemcpyDeviceToDevice, st));
+                const int lp = t.vlp[ids[n]];
+                char* dst = pool + (size_t)lp * 64 * g6kv::ROW;
+                const uint8_t* src = t.pf_dev[k] + (n - c0) * block + (size_t)j * row;
+                if (t.int4)   // back into FP8 rows, as a fetch's rt_unpack does
+                    G6RT_CK((cudaError_t)g6_rt_unpack_int4(src, G.h.rec, dst, g6kv::ROW, 64, st));
+                else
+                    G6RT_CK(cudaMemcpy2DAsync(dst, g6kv::ROW, src, G.h.rec, g6kv::ROW, 64, cudaMemcpyDefault, st));
+                if (ixoff && j == 0)
+                {
+                    if (!G.ix) die("G6_RT_LOCAL: a staged layer's index keys without an arena");
+                    G6RT_CK(cudaMemcpyAsync(pool + ixoff + (size_t)lp * 64 * g6kv::IDX_ROW, G.ix + (size_t)ids[n] * 64 * g6kv::IDX_ROW,
+                                            64 * g6kv::IDX_ROW, cudaMemcpyDeviceToDevice, st));
+                }
             }
-        }
+        G6RT_CK(cudaEventRecord(t.pf_ev[k], st));
+    }
+    t.pf_pages += ids.size();
+    t.pf_bytes += ids.size() * block;
+    t.pf_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (!t.hold) return;
     // G6_RT_CHECK: every staged page of this layer against the rows it was released with
     G6RT_CK(cudaStreamSynchronize(st));
@@ -647,6 +663,16 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
             a.rt_ix = j == 0 ? G.ix : nullptr;
         }
     }
+    if (local)   // the prefill stage (rt_pf_stage)
+        for (int k = 0; k < 2; ++k)
+        {
+            G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&t->pf_buf[k]), RtTier::PF_CHUNK, cudaHostAllocMapped));
+            void* dv = nullptr;
+            G6RT_CK(cudaHostGetDevicePointer(&dv, t->pf_buf[k], 0));
+            t->pf_dev[k] = static_cast<const uint8_t*>(dv);
+            if (g6kv_rows_register(t->store, t->pf_buf[k], RtTier::PF_CHUNK)) die(std::string("G6_RT_STORE register: ") + g6kv_tier_error());
+            G6RT_CK(cudaEventCreateWithFlags(&t->pf_ev[k], cudaEventDisableTiming));
+        }
     G6RT_CK(cudaDeviceSynchronize());
     g6kv_rows_start(t->store);
     char d[256];

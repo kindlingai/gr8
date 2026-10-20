@@ -1328,6 +1328,14 @@ int main(int argc, char** argv)
             // the quantum writes rows first.. through the layers' tables, which begin_prefill rewrites right after this
             nx.before_prefill = [&](const g6s2::Slot& sl, uint32_t first, uint32_t rows) {
                 const int q = (int)sl.key.slot;
+                // what the last quantum staged from the store: every quantum with G6_RT_CHECK, else every 8th that staged
+                static uint64_t pf_n = 0, pf_p0 = 0, pf_b0 = 0;
+                static double pf_t0 = 0;
+                if (R == 0 && rtt->pf_pages > pf_p0 && (rtt->hold || ++pf_n % 8 == 1))
+                    fprintf(stderr, "# rank 0: G6_RT_LOCAL prefill staging since the last line: %llu released pages a layer summed, %.3f GB read, "
+                                    "%.1f ms on the host; next quantum rows %u..\n", (unsigned long long)(rtt->pf_pages - pf_p0),
+                            (rtt->pf_bytes - pf_b0) / 1e9, rtt->pf_ms - pf_t0, first);
+                if (rtt->pf_pages > pf_p0 && (rtt->hold || pf_n % 8 == 1)) { pf_p0 = rtt->pf_pages; pf_b0 = rtt->pf_bytes; pf_t0 = rtt->pf_ms; }
                 rt_layers = q;
                 rt_pf = rtt->seq[q].on ? q : -1;
                 if (rt_pf < 0) return;
