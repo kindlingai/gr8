@@ -289,6 +289,10 @@ impl Drop for Lease {
 }
 
 fn release(free: &mut BTreeMap<usize, usize>, mut off: usize, mut len: usize) {
+    // a range freed twice would be granted twice: two leases on the same bytes
+    let prev_end = free.range(..=off).next_back().map_or(0, |(&po, &pl)| po + pl);
+    let next = free.range(off..).next().map_or(usize::MAX, |(&no, _)| no);
+    assert!(prev_end <= off && off + len <= next, "range {off}+{len} freed while part of it is free");
     if let Some((&po, &pl)) = free.range(..off).next_back() {
         if po + pl == off {
             free.remove(&po);
@@ -493,7 +497,7 @@ impl Shared {
                 .map_or(String::new(), |(g, r)| format!(",\"group\":\"{}\",\"rank\":{r}", json_escape(g)));
             s += &format!(
                 "{{\"id\":{},\"name\":\"{}\",\"bytes\":{},\"segs\":{},\"block\":{},\"conns\":{},\"read\":{},\
-                 \"written\":{},\"rdma\":[{}],\"age_s\":{}{group}}}",
+                 \"written\":{},\"rdma\":[{}],\"age_s\":{},\"at\":[{}]{group}}}",
                 l.id,
                 json_escape(&l.name),
                 l.len(),
@@ -503,7 +507,9 @@ impl Shared {
                 l.read.load(Ordering::Relaxed),
                 l.written.load(Ordering::Relaxed),
                 devs.join(","),
-                l.since.elapsed().as_secs()
+                l.since.elapsed().as_secs(),
+                // each segment's place in the arena, in segments of seg_len
+                l.segs.read().unwrap().iter().map(|o| (o / l.seg_len).to_string()).collect::<Vec<_>>().join(",")
             );
         }
         s + "]}"
@@ -1128,6 +1134,16 @@ mod tests {
         release(&mut f, 30, 30);
         release(&mut f, 60, 40);
         assert_eq!(f.into_iter().collect::<Vec<_>>(), vec![(0, 100)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "freed while part of it is free")]
+    fn a_range_freed_twice_stops_the_node() {
+        let mut f = BTreeMap::new();
+        f.insert(0, 100);
+        assert_eq!(alloc(&mut f, 30), Some(0));
+        release(&mut f, 0, 30);
+        release(&mut f, 10, 10);
     }
 
     #[test]
