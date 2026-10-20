@@ -109,6 +109,7 @@ pub struct Stats {
 }
 
 /// A retired run: its pages count as free until a reservation evicts it or a hit adopts its start.
+#[derive(Clone)]
 pub struct Kept {
     pub list: Vec<u32>,
     pub st: Finished,
@@ -153,8 +154,9 @@ pub struct Pool {
     nr: u32,
     // remote rows release (the engine's G6_RT_LOCAL, with nr > 0): a split run's main class is its prefix and `window`
     // pages (the rows tier cycles its tail through them), and its drafter class the whole tail, so the drafter never
-    // holds a page the main model releases. Such a run is never retained: its tail rows are in its own rows store
-    // records, which live only as long as the run. 0 = off
+    // holds a page the main model releases. Retained, such a run keeps its list, and the engine keeps its rows store
+    // records with it: a hit adopts its prefix, window and drafter pages below the hit (window_adopt), an eviction lets
+    // them go, and the block stores never take one. 0 = off
     window: u32,
     // with window: the records each rank's rows store holds (its lease), 0 = no limit. A window run takes the most
     // records one rank can need for its tail, ceil(tail pages / nr), at its grant, as it takes its pages
@@ -469,7 +471,53 @@ impl Pool {
 
     /// With window and a lease limit: the records no live window run holds.
     pub fn ids_free(&self) -> Option<u64> {
-        (self.ids > 0).then(|| (self.ids as u64).saturating_sub(self.held.values().map(|h| self.ids_of(h)).sum::<u64>()))
+        let kept: u64 = self.kept.iter().map(|k| self.kept_ids(k)).sum();
+        (self.ids > 0).then(|| (self.ids as u64).saturating_sub(self.held.values().map(|h| self.ids_of(h)).sum::<u64>() + kept))
+    }
+
+    // a retained window run: the records it keeps, as ids_of counts a live one
+    fn kept_ids(&self, k: &Kept) -> u64 {
+        if !k.exclusive || self.window == 0 {
+            return 0;
+        }
+        let tail = (k.list.len() as u64).saturating_sub(self.below_rows as u64 / PAGE + self.window as u64);
+        tail.div_ceil(self.nr.max(1) as u64)
+    }
+
+    /// Whether a retained run holds exactly this list (the engine asks at a retire: it keeps a window run's records
+    /// only while the pool keeps the run).
+    pub fn is_kept(&self, list: &[u32]) -> bool {
+        self.kept.iter().any(|k| k.list == list)
+    }
+
+    // a past-R grant adopting retained window run k at a = ceil(skip / 64) logical pages: its prefix and window, and its
+    // drafter pages of the logical pages below a (the drafter's tail is in list order past the window)
+    fn window_adopt(&self, k: &Kept, a: u64) -> Option<Vec<u32>> {
+        let (rp, w) = ((self.below_rows as u64 / PAGE) as usize, self.window as usize);
+        let d = (a as usize).saturating_sub(rp);
+        if k.list.len() < rp + w + d {
+            return None;
+        }
+        Some(k.list[..rp + w].iter().chain(&k.list[rp + w..rp + w + d]).copied().collect())
+    }
+
+    // whether that grant (worst rows) fits: the drafter's fresh pages above place, the adopted ones leaving the free
+    // classes, its records (the kept run's own are counted free for it) and its share of the slots
+    fn window_hit_room(&self, k: &Kept, a: u64, worst: u64) -> bool {
+        let Some(adopted) = self.window_adopt(k, a) else { return false };
+        let (main, draft) = self.exclusive_pages(worst);
+        let d = adopted.len() as u64 - main;
+        if !self.exclusive(worst) || d > draft {
+            return false;
+        }
+        let ids_ok = self.ids_free().map_or(true, |f| draft.div_ceil(self.nr as u64) <= f + self.kept_ids(k));
+        let runs_ok = self.runs == 0 || self.window_runs() < self.runs;
+        !self.exclusive
+            && ids_ok
+            && runs_ok
+            && main <= self.lo_free() as u64
+            && draft <= self.hi_free() as u64
+            && self.safe_with(self.place_online(), None, None, Some(main))
     }
 
     /// For a request of `worst` rows past R: the pages it takes below place and above it, and what those classes have
@@ -583,6 +631,14 @@ impl Pool {
     // evicted retained runs go to the store, when there is one. The prompts of the live runs, the retained runs and the
     // request being granted are what a prefix base is shared with
     fn spill(&mut self, gone: &[Kept]) {
+        // a window run's tail is in its rows store records, not in pool memory: the stores never take one
+        let kept: Vec<Kept>;
+        let gone = if self.window > 0 && gone.iter().any(|k| k.exclusive) {
+            kept = gone.iter().filter(|k| !k.exclusive).cloned().collect();
+            &kept[..]
+        } else {
+            gone
+        };
         let below = (self.below_rows as u64 / PAGE) as usize;
         let Some(s) = &mut self.stash else { return };
         if gone.is_empty() {
@@ -795,11 +851,8 @@ impl Pool {
                 s.promote(&list, &st, rows_max, span);
             }
         }
-        // a window run's tail rows sit in its rows store records, which die with it, and its list past the prefix is
-        // its window: nothing to retain or adopt
-        if exclusive && self.window > 0 {
-            return Ok(());
-        }
+        // a window run is retained with its list (prefix, window, drafter tail): the engine keeps its rows store records
+        // for it, and a hit adopts them with the pages (take_hit), or they go when the pool evicts it
         self.age += 1;
         self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace });
         Ok(())
@@ -849,6 +902,9 @@ impl Pool {
                     room = room && n <= self.prefix_online() as u64;
                     // an exclusive run is pages 0, 1, ..: the adopted ones must be its start
                     room = room && adopted.iter().enumerate().all(|(i, &p)| p as usize == i);
+                } else if k.exclusive && self.window > 0 {
+                    // a retained window run: its prefix, window and drafter pages below the hit, with its records
+                    room = room && self.window_hit_room(k, a, worst);
                 } else {
                     // its own pages: the adopted ones and fresh ones of both classes must fit
                     room = room && self.hit_room(adopted, a, n, worst);
@@ -1028,6 +1084,10 @@ impl Pool {
                 if adopted.iter().enumerate().any(|(i, &p)| p as usize != i) {
                     return Err(Error::NoRoom);
                 }
+            } else if k.exclusive && self.window > 0 {
+                if !self.window_hit_room(k, a, worst) {
+                    return Err(Error::NoRoom);
+                }
             } else if !self.hit_room(adopted, a, n, worst) {
                 return Err(Error::NoRoom);
             }
@@ -1046,6 +1106,15 @@ impl Pool {
         // tier, read before the grant writes
         if k.st.valid > skip {
             self.spill(std::slice::from_ref(&k));
+        }
+        if self.exclusive(worst) && k.exclusive && self.window > 0 {
+            // a retained window run: its prefix, window and drafter pages below the hit, then the drafter's fresh ones
+            let mut list = self.window_adopt(&k, a).expect("window_hit_room checked it");
+            let (main, draft) = self.exclusive_pages(worst);
+            let fresh = (draft - (list.len() as u64 - main)) as usize;
+            let gone = self.fill_range(&mut list, fresh, self.place, self.pages);
+            self.spill(&gone);
+            return Ok(self.grant(list, true, w as u32, worst, "hit", &gone, hits));
         }
         let mut list = k.list;
         list.truncate(a as usize);

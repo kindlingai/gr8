@@ -74,11 +74,13 @@ struct RtTier
     struct Seq
     {
         bool on = false;
-        std::vector<int> list, tail, pfree;
+        std::vector<int> list, tail, pfree, win;   // win: its window pages, in order
         int window = 0, in_use = 0, peak = 0;
         uint64_t released = 0;
     };
-    Seq seq[8];
+    // [0, 8): the session slots; past them, the runs the pool retains (rt_park), each with its records until a later
+    // turn adopts it (rt_adopt) or the pool lets it go (rt_gc)
+    std::vector<Seq> seq = std::vector<Seq>(8);
     std::function<void(int q)> write;
     int tsize = 0;                    // the table entries (logical pages) of a binding
     std::vector<int> vfree, vlp, vslot;   // free ids; each id's logical page and slot (-1 = free)
@@ -225,7 +227,7 @@ inline void rt_check(const RtTier& t, const char* where)
         if (v < 0 || v >= t.V || seen[v]++) bad("id " + std::to_string(v) + " free twice or out of range");
         if (t.vlp[v] >= 0) bad("free id " + std::to_string(v) + " still names a page");
     }
-    for (int q = 0; q < 8; ++q)
+    for (int q = 0; q < (int)t.seq.size(); ++q)
     {
         const RtTier::Seq& s = t.seq[q];
         for (int lp = 0; lp < (int)s.tail.size(); ++lp)
@@ -263,6 +265,7 @@ inline void rt_begin(RtTier& t, int q, const std::vector<int>& window, const std
     s.on = true;
     s.list = list;
     s.window = (int)window.size();
+    s.win = window;
     s.tail.assign(t.tsize, -1);
     s.pfree.assign(window.rbegin(), window.rend());   // the first window page is taken first (pop_back)
     for (int p : window) if (p < 0 || p >= t.pages) die("G6_RT_LOCAL: window page " + std::to_string(p) + " is not a local page");
@@ -273,6 +276,118 @@ inline const std::vector<int>* rt_tail_of(const RtTier& t, const std::vector<int
     for (const RtTier::Seq& s : t.seq)
         if (s.on && s.list == list) return &s.tail;
     return nullptr;
+}
+// release, a run the pool retains (pool.h is_kept): slot q's records, window and tail entries move to a parked entry,
+// which keeps them for a later turn. Between steps.
+inline void rt_park(RtTier& t, int q)
+{
+    if (!t.seq[q].on) return;
+    size_t p = 8;
+    while (p < t.seq.size() && t.seq[p].on) ++p;
+    if (p == t.seq.size()) t.seq.emplace_back();
+    t.seq[p] = std::move(t.seq[q]);
+    t.seq[q] = RtTier::Seq{};
+    for (int v = 0; v < t.V; ++v)
+        if (t.vslot[v] == q) { t.vslot[v] = (int)p; t.owner[t.pages + v] = (int)p; }
+    rt_check(t, "park");
+}
+// release: every parked run the pool no longer retains (keep: pool.h is_kept) lets its records go. Before a grant
+// that may hold its pages takes its records' ids.
+inline void rt_gc(RtTier& t, const std::function<bool(const std::vector<int>&)>& keep, cudaStream_t st)
+{
+    for (size_t p = 8; p < t.seq.size(); ++p)
+        if (t.seq[p].on && !keep(t.seq[p].list)) rt_end(t, (int)p, st);
+}
+// release: the parked run whose window is these pages, or -1
+inline int rt_parked(const RtTier& t, const std::vector<int>& window)
+{
+    for (size_t p = 8; p < t.seq.size(); ++p)
+        if (t.seq[p].on && t.seq[p].win == window) return (int)p;
+    return -1;
+}
+// release: a released page's records back into local page p of every layer (fp8 rows copied, int4 unpacked), and its
+// index keys from the arena. Synchronous.
+inline void rt_unrelease(Model& m, RtTier& t, int v, int p, cudaStream_t st)
+{
+    const size_t row = t.int4 ? g6kv::int4row::ROW : g6kv::ROW;
+    for (const RtTier::Group& G : t.g)
+    {
+        const int k = t.pf_k;
+        t.pf_k ^= 1;
+        G6RT_CK(cudaEventSynchronize(t.pf_ev[k]));
+        const uint64_t off = G.h.base + (uint64_t)v * 64 * G.h.rec;
+        if (g6kv_rows_gather(t.store, &off, 1, 64 * G.h.rec, t.pf_buf[k])) die(std::string("G6_RT_STORE read-in: ") + g6kv_tier_error());
+        for (size_t j = 0; j < G.layers.size(); ++j)
+        {
+            const G6Attn& a = m.layers[G.layers[j]].ab.args;
+            uint8_t* dst = (uint8_t*)a.mla_cache + (size_t)p * 64 * g6kv::ROW;
+            const uint8_t* src = t.pf_dev[k] + j * row;
+            if (t.int4) G6RT_CK((cudaError_t)g6_rt_unpack_int4(src, G.h.rec, dst, g6kv::ROW, 64, st));
+            else G6RT_CK(cudaMemcpy2DAsync(dst, g6kv::ROW, src, G.h.rec, g6kv::ROW, 64, cudaMemcpyDefault, st));
+        }
+        const G6Attn& a = m.layers[G.layers[0]].ab.args;
+        if (G.ix && a.index_cache)
+            G6RT_CK(cudaMemcpyAsync((uint8_t*)a.index_cache + (size_t)p * 64 * g6kv::IDX_ROW, G.ix + (size_t)v * 64 * g6kv::IDX_ROW,
+                                    64 * g6kv::IDX_ROW, cudaMemcpyDeviceToDevice, st));
+        G6RT_CK(cudaEventRecord(t.pf_ev[k], st));
+    }
+    G6RT_CK(cudaStreamSynchronize(st));
+}
+// release, a later turn that keeps slot q's rows below skip: every tail page from skip's page on goes (its record
+// freed, its window page back), except the page skip falls inside, which a released page brings back local first (the
+// turn writes its rows past skip; the rows below it must be there). Then the slot's tables. Between steps.
+inline void rt_trim(Model& m, RtTier& t, int q, int skip, cudaStream_t st)
+{
+    RtTier::Seq& s = t.seq[q];
+    if (!s.on) return;
+    G6RT_CK(cudaStreamSynchronize(st));
+    const int first = skip / 64;
+    std::vector<int> drop;
+    for (int lp = std::max(first, t.L / 64); lp < t.tsize; ++lp)
+    {
+        if (!rt_mine(t, lp)) continue;
+        const int e = s.tail[lp];
+        const bool keep = lp == first && skip % 64;   // rows below skip on this page stay
+        if (e >= t.pages)
+        {
+            const int v = e - t.pages;
+            if (keep)
+            {
+                if (s.pfree.empty()) die("G6_RT_LOCAL: slot " + std::to_string(q) + ": no window page to bring page " + std::to_string(lp) + " back into");
+                const int p = s.pfree.back();
+                s.pfree.pop_back();
+                rt_unrelease(m, t, v, p, st);
+                s.tail[lp] = p;
+                s.peak = std::max(s.peak, ++s.in_use);
+            }
+            else s.tail[lp] = -1;
+            drop.push_back(e);
+            t.vlp[v] = t.vslot[v] = -1;
+            t.vfree.push_back(v);
+            t.orig.erase(v);
+        }
+        else if (e >= 0 && !keep)
+        {
+            s.pfree.push_back(e);
+            s.tail[lp] = -1;
+            --s.in_use;
+        }
+    }
+    rt_drop(t, drop, st);
+    if (t.write) t.write(q);
+    rt_check(t, "trim");
+}
+// release: a later turn in slot q adopts parked run p (the pool's take_hit kept its prefix, window and drafter pages
+// below skip): its records and window move to q, under the new run's list, trimmed to skip
+inline void rt_adopt(Model& m, RtTier& t, int p, int q, const std::vector<int>& list, int skip, cudaStream_t st)
+{
+    rt_end(t, q, st);
+    t.seq[q] = std::move(t.seq[p]);
+    t.seq[p] = RtTier::Seq{};
+    t.seq[q].list = list;
+    for (int v = 0; v < t.V; ++v)
+        if (t.vslot[v] == p) { t.vslot[v] = q; t.owner[t.pages + v] = q; }
+    rt_trim(m, t, q, skip, st);
 }
 // release: a window page for every page of slot q's past L with rows below `end` that has none yet, cleared as reset()
 // clears a new sequence's. Between steps, before the step or prefill chunk that writes those rows.

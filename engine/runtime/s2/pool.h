@@ -128,6 +128,10 @@ public:
     // runs: the most window runs live at once, what the slot pool covers (0 = no limit)
     void window(uint32_t pages, uint32_t ids, uint32_t runs) { Lock l(mu_); check(g6kv_window(p_, pages, ids, runs)); }
     uint32_t window_runs() const { Lock l(mu_); return g6kv_window_runs(p_); }
+    // whether a retained run holds exactly this list (a window run's records stay while it does)
+    bool is_kept(const std::vector<int>& list) const {
+        Lock l(mu_); std::vector<uint32_t> v(list.begin(), list.end()); return g6kv_is_kept(p_, v.data(), v.size()) != 0;
+    }
     // a window request of `worst` rows with a record limit: {records per rank it needs, free, in all}, or nothing
     std::optional<std::array<uint64_t, 3>> ids_view(uint64_t worst) const {
         Lock l(mu_); std::array<uint64_t, 3> v{};

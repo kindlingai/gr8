@@ -603,6 +603,15 @@ pub unsafe extern "C" fn g6kv_window(p: *mut Pool, pages: u32, ids: u32, runs: u
     }
 }
 
+/// Whether a retained run holds exactly these `n` pages.
+///
+/// # Safety
+/// `p` must be live, `pages` valid for `n` reads.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_is_kept(p: *const Pool, pages: *const u32, n: usize) -> i32 {
+    (*p).is_kept(std::slice::from_raw_parts(pages, n)) as i32
+}
+
 /// The window runs live now.
 ///
 /// # Safety

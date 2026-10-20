@@ -40,7 +40,7 @@
 //                     G6_RT_FMT=int4: the lease holds the rows as INT4 (416 B for 656), turned back into FP8 after each fetch.
 //                     G6_RT_LOCAL=N: release: a split run holds its prefix and N window pages per rank, its tail pages
 //                     go back to the window once in the store, and the pool grants the drafter's whole tail apart from
-//                     them. Such a run is never retained. G6_RT_PLACE=P: the main model's physical pages per rank, so
+//                     them; retained, it keeps its records for its next turn. G6_RT_PLACE=P: the main model's physical pages per rank, so
 //                     --cap may pass what they hold (the longest tail is then the drafter class, --cap / 64 - place pages)
 //      [--kv-store STORE,size=N(G|T)[,keep=RULE]]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
 //                     (s2/kv_tier.cuh, kvman-rs src/stash.rs). A request that continues a stored entry reads its pages
@@ -1412,12 +1412,22 @@ int main(int argc, char** argv)
                 {
                     if (rt_layers == q) rt_layers = -1;
                     rt_end(*rtt, q, st);
+                    // the runs the pool let go (evicted, or adopted only in part below R) free their records first
+                    rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
                     if (pool.exclusive_run(g.run))
                     {
                         const std::vector<int> l = pool.list(g.run);
                         const int rp = cp_R / 64;
-                        if (g.reuse > cp_R) die("G6_RT_LOCAL: a hit past R (window runs are never retained)");
-                        rt_begin(*rtt, q, std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local), l, st);
+                        const std::vector<int> win(l.begin() + rp, l.begin() + rp + rtt->local);
+                        // a hit on a retained window run takes its window pages: its records come with them
+                        const int pk = g.reuse ? rt_parked(*rtt, win) : -1;
+                        if (pk >= 0)
+                        {
+                            rt_adopt(m, *rtt, pk, q, l, (int)g.reuse, st);
+                            if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL slot %d adopts a retained run's records at row %u\n", q, g.reuse);
+                        }
+                        else if (g.reuse > cp_R) die("G6_RT_LOCAL: a hit past R without the retained run's records");
+                        else rt_begin(*rtt, q, win, l, st);
                     }
                 }
                 slot_prompt[q] = g.req.prompt_tokens;
@@ -1460,6 +1470,7 @@ int main(int argc, char** argv)
             // table, and into the layers' own tables when q runs alone on today's path
             h.grown = [&](unsigned q, const g6s2::Run& r) {
                 kv_drain();   // runs the growth evicted, out before the zeroing below
+                if (rtt && rtt->local) rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
                 const std::vector<int> list = pool.list(r);
                 if (rtt && list.size() > m.s2->run[q].size())   // the new pages are cleared: none may stay flagged
                     rt_drop(*rtt, std::vector<int>(list.begin() + m.s2->run[q].size(), list.end()), st);
@@ -1486,6 +1497,12 @@ int main(int argc, char** argv)
                     if (rtt->hold)
                         fprintf(stderr, "# rank %d: G6_RT_CHECK: %llu released group pages read back, %llu differed\n", R,
                                 (unsigned long long)rtt->readback, (unsigned long long)rtt->readback_bad);
+                    // a run the pool retained keeps its records for the conversation's next turn
+                    if (sq.on && pool.is_kept(m.s2->run[q]))
+                    {
+                        if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL slot %d retained with its records\n", q);
+                        rt_park(*rtt, q);
+                    }
                     if (rtt->hold && rtt->stage_ck.rows)
                     {
                         rt_check_print(("staged prefill rows, rank " + std::to_string(R)).c_str(), rtt->stage_ck);

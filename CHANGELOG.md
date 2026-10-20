@@ -7,8 +7,9 @@
   fetched into resident slots, under the candidate merge, so decode reads them as if they were local.
 - `local=PAGES` releases a page once its rows are in the store: a session's tail cycles through that many local pages a
   rank, and the S2 pool gives the MTP drafter its own tail pages so none is ever released under it. A prefill chunk
-  reads the released pages it needs from the store. A session with released pages is not retained for prefix reuse;
-  block stores (`--kv-store`) copy at most its first `SHARE_LIMIT` tokens.
+  reads the released pages it needs from the store. A finished session with released pages is retained with its store
+  records, so its next turn adopts them and prefills only the new rows; block stores (`--kv-store`) copy at most its
+  first `SHARE_LIMIT` tokens, and an evicted one's records are freed.
 - `place=PAGES` caps the main model's KV pages a rank, so `--cap` may pass the context they would hold. `size=` is the
   per-rank lease, and a session waits until its tail fits it. `fmt=int4` stores 416 B rows for 656.
 - A long prefill no longer trips the shim's stall timeout: rank 0 writes an `f` line after every prefill quantum, which

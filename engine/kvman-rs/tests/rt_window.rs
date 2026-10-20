@@ -50,32 +50,67 @@ fn a_window_run_takes_its_prefix_window_and_whole_tail() {
 }
 
 #[test]
-fn a_window_run_is_never_retained_nor_adopted() {
+fn a_retained_window_run_is_adopted_with_its_pages() {
+    // R/64 = 8, window 4, place 64: a 40-page run is 8 + 4 below place and 32 tail pages above it
     let mut p = pool(160, 64, 8, 4, 4);
     let worst = 40 * PAGE;
     let a = p.reserve(worst, worst).unwrap();
+    let old = p.list(&a).unwrap().to_vec();
     p.retain(&a, done(40, 1)).unwrap();
-    assert_eq!(p.kept_runs(), 0, "released, not retained");
-    assert_eq!(p.live_pages(), 0);
-    // its next turn misses: nothing to adopt, so no record of the old run can be read or shared
+    assert_eq!(p.kept_runs(), 1, "retained, with its list");
+    assert!(p.is_kept(&old));
+    // its next turn continues it: a hit that adopts the prefix, the window and the drafter pages below the hit
     let mut prompt = hist(40 * 64 - 1, 1);
     prompt.extend([5, 6, 7]);
     let w2 = 44 * PAGE;
     let h = p.match_prefix(&prompt, w2, w2, prompt.len() as i32 - 1);
-    assert_ne!(h.why, Why::Hit, "{h:?}");
-    assert_eq!(h.skip, 0);
-    // a run below R is still retained and its prefix adopted by a window run's grant (its pages are never released)
-    let c = p.reserve(5 * PAGE, 5 * PAGE).unwrap();
-    p.retain(&c, done(5, 2)).unwrap();
-    assert_eq!(p.kept_runs(), 1);
-    let mut prompt = hist(5 * 64 - 1, 2);
-    prompt.extend([1, 2]);
-    let h = p.match_prefix(&prompt, w2, w2, prompt.len() as i32 - 1);
     assert_eq!(h.why, Why::Hit, "{h:?}");
     let r = p.take_hit(h.skip, h.age, None, w2, w2).unwrap();
-    let l = p.list(&r).unwrap();
+    let l = p.list(&r).unwrap().to_vec();
+    let d = (h.skip as u64).div_ceil(PAGE) as usize - 8;   // drafter pages below the hit
     assert_eq!(l.len(), 8 + 4 + 36);
-    assert!(l[..12].iter().all(|&q| q < 64) && l[12..].iter().all(|&q| q >= 64), "{l:?}");
+    assert_eq!(&l[..12 + d], &old[..12 + d], "prefix, window and the drafter's pages below the hit adopted");
+    assert!(l[12..].iter().all(|&q| q >= 64), "the drafter's tail stays above place: {l:?}");
+    assert!(!p.is_kept(&old) && p.kept_runs() == 0);
+    // the old run's other drafter pages are free again, none held twice
+    let mut seen = std::collections::HashSet::new();
+    assert!(l.iter().all(|q| seen.insert(*q)));
+}
+
+#[test]
+fn a_retained_window_run_is_evicted_whole() {
+    // the drafter class holds 48 pages, one 32-page tail and change: a second run needs the retained one's pages,
+    // so the pool evicts it whole (and the engine frees its records when it sees it gone)
+    let mut p = pool(112, 64, 8, 4, 4);
+    let worst = 40 * PAGE;
+    let a = p.reserve(worst, worst).unwrap();
+    let old = p.list(&a).unwrap().to_vec();
+    p.retain(&a, done(40, 2)).unwrap();
+    assert!(p.is_kept(&old));
+    let b = p.reserve(worst, worst).unwrap();   // a fresh conversation: no hit
+    assert!(!p.is_kept(&old) && p.kept_runs() == 0);
+    assert!(p.list(&b).unwrap().iter().any(|q| old.contains(q)));
+}
+
+#[test]
+fn the_lease_counts_a_retained_window_runs_records() {
+    let mut p = Pool::new(400, 200, 8 * 64).unwrap();
+    p.keep(RULES);
+    p.tail(4, 0);
+    p.window(4, 12, 0).unwrap();
+    let worst = 40 * PAGE;   // a tail of 32 pages: 8 records a rank
+    let a = p.reserve(worst, worst).unwrap();
+    p.retain(&a, done(40, 3)).unwrap();
+    assert_eq!(p.ids_free(), Some(4), "a retained window run keeps its records");
+    assert!(!p.fits(worst, worst), "a fresh 40-page run needs 8 more than the 4 free");
+    // its own next turn takes them over: 8 of its own plus 1 of the free
+    let mut prompt = hist(40 * 64 - 1, 3);
+    prompt.extend([5, 6, 7]);
+    let w2 = 44 * PAGE;
+    let h = p.match_prefix(&prompt, w2, w2, prompt.len() as i32 - 1);
+    assert_eq!(h.why, Why::Hit, "{h:?}");
+    p.take_hit(h.skip, h.age, None, w2, w2).unwrap();
+    assert_eq!(p.ids_free(), Some(3));
 }
 
 #[test]
@@ -126,11 +161,11 @@ fn the_stores_never_read_a_window_runs_tail() {
     p.tail(4, 3);
     p.window(4, 0, 0).unwrap();
     let worst = 40 * PAGE;
-    for turn in 0..3 {
+    for turn in 0..3i32 {
         let a = p.reserve(worst, worst).unwrap();
         let prefix: Vec<u32> = p.list(&a).unwrap()[..8].to_vec();
-        p.retain(&a, done(40, 9)).unwrap();
-        assert_eq!(p.kept_runs(), 0, "turn {turn}: never retained");
+        p.retain(&a, done(40, 9 + turn)).unwrap();
+        assert!(p.kept_runs() <= turn as u32 + 1, "turn {turn}");
         for io in p.io() {
             match io {
                 Io::Spill { page, .. } | Io::Restore { page, .. } => {
@@ -141,12 +176,13 @@ fn the_stores_never_read_a_window_runs_tail() {
         }
         p.io_done().unwrap();
     }
-    // a later turn of the same conversation: a stored hit restores at most the prefix
+    // a later turn of the first conversation: a pool hit while its run is retained, else a stored hit, which restores
+    // at most the prefix
     let mut prompt = hist(40 * 64 - 1, 9);
     prompt.push(1);
     let w2 = 41 * PAGE;
     let h = p.match_prefix(&prompt, w2, w2, prompt.len() as i32 - 1);
-    assert!(h.skip <= 8 * 64, "{h:?}");
+    assert!(!h.stored || h.skip <= 8 * 64, "{h:?}");
     if h.skip > 0 {
         let r = p.take_hit(h.skip, h.age, h.stored.then_some(h.tier), w2, w2).unwrap();
         let prefix: Vec<u32> = p.list(&r).unwrap()[..8].to_vec();

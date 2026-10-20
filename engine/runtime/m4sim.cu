@@ -50,7 +50,8 @@
 //        G6_RT_LOCAL=N: release (rt_rows.cuh): each rank's pages past L come from N local pages, a page goes back once
 //        it is in the store, and its rows read only from the slots (decode) or the staged prefill pool (rt_pf_stage),
 //        so a sequence longer than the local pages hold runs. Needs G6_RT_POOL >= MX x 2048; no G6_KV_HASH.
-//        G6_RT_POISON=1 then overwrites every freed page; G6_RT_CHECK=1 checks every record has one holder.
+//        G6_RT_POISON=1 then overwrites every freed page; G6_RT_CHECK=1 checks every record has one holder. With
+//        --reuse-prefix a sequence that continues the last keeps its records past the rows it shares (rt_trim).
 // G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (needs --mtp): the split replicated GEMVs as g6m4 runs them (rank.cuh
 //        QSplit), each model's gathers on a loopback of their own: every rank's attention block (and the draft's eh_proj)
 //        runs in gather phases (rank.cuh QsPh) with the delivery between them. The lines must equal the run without them.
@@ -648,10 +649,12 @@ int main(int argc, char** argv)
     if (const char* rs = getenv("G6_RT_STORE"))
     {
 #if defined(G6_CP) && G6_CP
-        if (!cp_on || s2mode || reuse || !serve.empty() || minv >= 0)
-            die("G6_RT_STORE needs G6_CP on, and no --s2, --reuse-prefix, --serve or --minv");
-        const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
         const int local0 = getenv("G6_RT_LOCAL") ? atoi(getenv("G6_RT_LOCAL")) : 0;
+        // --reuse-prefix with release: a sequence that continues the last keeps its records (rt_trim), as g6m4 adopts a
+        // retained run's
+        if (!cp_on || s2mode || (reuse && local0 <= 0) || !serve.empty() || minv >= 0)
+            die("G6_RT_STORE needs G6_CP on, and no --s2, --serve or --minv; --reuse-prefix only with G6_RT_LOCAL");
+        const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
         const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : local0 > 0 ? MX * 2048 : 4096;   // release: one sequence's step
         const bool poison = getenv("G6_RT_POISON") && atoi(getenv("G6_RT_POISON"));
         const bool int4 = rt_fmt_int4();
@@ -1748,6 +1751,8 @@ int main(int argc, char** argv)
                 for (Draft& D : DR) reset(D.d, st);
             }
         }
+        if (skip && rt[0] && rt[0]->local)   // release: the rows below skip stay, the tail past it goes
+            for (Model& m : R) rt_trim(m, *rt[m.rank], 0, skip, st);
         if (p.first < skip) p.first = skip;
         if (serve.empty()) pt.start("");
         else pt.lap("open");
