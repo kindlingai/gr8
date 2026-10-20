@@ -11,6 +11,9 @@
   block stores (`--kv-store`) copy at most its first `SHARE_LIMIT` tokens.
 - `place=PAGES` caps the main model's KV pages a rank, so `--cap` may pass the context they would hold. `size=` is the
   per-rank lease, and a session waits until its tail fits it. `fmt=int4` stores 416 B rows for 656.
+- A long prefill no longer trips the shim's stall timeout: rank 0 writes an `f` line after every prefill quantum, which
+  the shim takes as life. When the shim does give up on a request (engine silent, unreadable resp), it now CANCELs it
+  instead of leaving the engine to prefill and decode it to the end.
 - On the TP=4 cluster: a 41,399-token request with 40 local pages a rank finished in 39 s with the same output as
   without release; 35 pages were released and at most 32 of the 40 were in use.
 

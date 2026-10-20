@@ -625,3 +625,26 @@ class SlowPrefill(S2Base):
         ids, fin, _ = await c.wait('long')
         self.assertEqual((fin['reason'], ids), ('length', self.expect([5, 6, 7], 10)))
 
+
+class SilentEngine(S2Base):
+    """An engine silent past the stall timeout: the shim answers error and CANCELs the request, so the engine does not
+    go on with it, and keeps it tracked until the engine's end line."""
+    FAKE = ('--prefill-ms', '1500')
+    SHIM = ('--stall-timeout', '0.5')
+
+    async def test_a_stall_cancels_the_request(self):
+        c = await self.client()
+        c.send(gen('quiet', [5, 6, 7], max_tokens=10))
+        ids, fin, _ = await c.wait('quiet')
+        self.assertEqual((fin['reason'], ids), ('error', []))
+        self.assertIn('engine silent', fin['message'])
+        for _ in range(100):
+            if 'CANCEL' in self.fake_log():
+                break
+            await asyncio.sleep(0.05)
+        self.assertRegex(self.fake_log(), r'CANCEL \d+ resident after 0 tokens')
+        # the shim no longer counts it as running; the engine ended it on the CANCEL
+        c.send({'type': 'metrics', 'seq': 1})
+        m = await asyncio.wait_for(c.metrics.get(), 5)
+        self.assertEqual(m['requests']['running'], 0)
+        self.assertEqual(m['requests']['finished'], {'error': 1})
