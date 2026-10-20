@@ -1179,20 +1179,16 @@ int main(int argc, char** argv)
                 return c | p;
             },
             [&](unsigned long long step, int rows) { qsd_enqueue(step, rows); }};
-        // G6_RT_STORE: slot q's logical page -> this rank's physical page while it holds a run past R (its CP map over
-        // its list, or the tables as built), cached per run; nullptr = no run past R
-        std::vector<int> rt_run[g6s2::MAX_SESSIONS], rt_map[g6s2::MAX_SESSIONS];
-        bool rt_split[g6s2::MAX_SESSIONS] = {};
-        auto rt_slot_map = [&](int q) -> const std::vector<int>* {
+        // G6_RT_STORE: slot q's table as the attention reads it: the layers' own tables while it runs alone (solo), its
+        // slot table in batched steps
+        std::vector<int> rt_tab;
+        bool rt_told[g6s2::MAX_SESSIONS] = {};   // rank 0 described the session's first spill past L
+        auto rt_slot_map = [&](int q) -> const std::vector<int>& {
             const S2Model& s = *m.s2;
-            if (q < 0 || q >= s.nslots || !s.exclusive[q]) return nullptr;
-            if (!s.ex_split[q]) return &s.tab0[0];
-            if (!rt_split[q] || rt_run[q] != s.run[q])
-            {
-                rt_map[q] = s2_cp_map(s, s.pool[0]->args, s.run[q], m.s2_below / 64, (size_t)s.table_cap);
-                rt_run[q] = s.run[q]; rt_split[q] = true;
-            }
-            return &rt_map[q];
+            const int* tab = m.s2on ? s.table[q] : m.layers[0].ab.args.block_table;
+            rt_tab.resize(m.s2on ? (size_t)s.table_cap : (size_t)m.layers[0].ab.args.table_size);
+            G6RT_CK(cudaMemcpy(rt_tab.data(), tab, rt_tab.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            return rt_tab;
         };
         auto rt_log = [&](const char* why, int q) {
             if (R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE %s slot %d: %llu rows spilled, %llu dropped pages, %llu fetched, %llu read locally (no slot)\n",
@@ -1202,8 +1198,27 @@ int main(int argc, char** argv)
         if (rtt)
         {
             nx.before_main = [&](const StepIn& in, const S2In& h) {
+                static bool first = true;
+                if (R == 0 && first)
+                {
+                    first = false;
+                    fprintf(stderr, "# rank 0: G6_RT_STORE first main step: %d sessions, slot %d committed %d (%s), L %d\n", h.ns, h.sess[0],
+                            in.pos[h.row0[0]], m.s2on ? "batched" : "solo", rtt->L);
+                }
                 for (int j = 0; j < h.ns; ++j)
-                    if (const std::vector<int>* mp = rt_slot_map(h.sess[j])) rt_spill(m, *rtt, *mp, in.pos[h.row0[j]], h.sess[j], st);
+                {
+                    const int q = h.sess[j], committed = in.pos[h.row0[j]];
+                    if (q < 0 || q >= m.s2->nslots || committed / 64 <= rtt->L / 64) continue;
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    const RtSpillSeen x = rt_spill(m, *rtt, rt_slot_map(q), committed, q, st);
+                    if (R == 0 && !rt_told[q])
+                    {
+                        rt_told[q] = true;
+                        fprintf(stderr, "# rank 0: G6_RT_STORE slot %d first spill (%s, committed %d, exclusive %d split %d): %d pages past L %d: %d spilled, "
+                                        "%d another rank's or none, %d past the pool, %d already stored\n", q, m.s2on ? "batched" : "solo", committed,
+                                (int)m.s2->exclusive[q], (int)m.s2->ex_split[q], x.pages, rtt->L, x.spilled, x.other, x.range, x.owned);
+                    }
+                }
             };
             // a later turn's prefill writes and reads the session's KV on the paths that read the local pages
             nx.before_prefill = [&](const g6s2::Slot& sl) {
@@ -1255,7 +1270,7 @@ int main(int argc, char** argv)
                     std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
                 }
                 const int q = (int)g.key.slot;
-                if (rtt) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); }   // a new run's pages are local
+                if (rtt) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); rt_told[q] = false; }   // a new run's pages are local
                 slot_prompt[q] = g.req.prompt_tokens;
                 slot_whole[q] = dfl_reuse && g.reuse + 1 == g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps

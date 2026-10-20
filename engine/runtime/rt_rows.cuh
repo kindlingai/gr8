@@ -75,19 +75,34 @@ inline void rt_drop_slot(RtTier& t, int q, cudaStream_t st)
     rt_drop(t, v, st);
 }
 
-// slot q's whole pages past L below `committed` (the first row its next step writes), through `map` (logical page ->
-// this rank's physical page, < 0 = another rank's or none): into the store, then flagged. Between steps.
-inline void rt_spill(Model& m, RtTier& t, const std::vector<int>& map, int committed, int q, cudaStream_t st)
+// what one spill call saw of the pages past L below `committed`
+struct RtSpillSeen
 {
+    int pages = 0;                    // logical pages past L the session has committed
+    int other = 0;                    // another rank's (or no) physical page
+    int range = 0;                    // a physical page past this rank's pool
+    int owned = 0;                    // already in the store
+    int spilled = 0;
+};
+// slot q's whole pages past L below `committed` (the first row its next step writes), through `map` (logical page ->
+// this rank's physical page, < 0 = another rank's or none: the table attention reads): into the store, then flagged.
+// Between steps.
+inline RtSpillSeen rt_spill(Model& m, RtTier& t, const std::vector<int>& map, int committed, int q, cudaStream_t st)
+{
+    RtSpillSeen seen;
     const int end = std::min(committed / 64, (int)map.size());
     std::vector<int> v;
     for (int lp = t.L / 64; lp < end; ++lp)
     {
         const int p = map[lp];
-        if (p < 0 || p >= t.pages || t.owner[p] >= 0) continue;
-        v.push_back(p);
+        ++seen.pages;
+        if (p < 0) ++seen.other;
+        else if (p >= t.pages) ++seen.range;
+        else if (t.owner[p] >= 0) ++seen.owned;
+        else v.push_back(p);
     }
-    if (v.empty()) return;
+    seen.spilled = (int)v.size();
+    if (v.empty()) return seen;
     G6RT_CK(cudaStreamSynchronize(st));
     std::vector<uint8_t> buf;
     for (int p : v)
@@ -112,6 +127,7 @@ inline void rt_spill(Model& m, RtTier& t, const std::vector<int>& map, int commi
                 G6RT_CK(cudaMemset((uint8_t*)y.ab.args.mla_cache + (size_t)p * 64 * g6kv::ROW, 0x7f, 64 * g6kv::ROW));
         t.spilled += 64;
     }
+    return seen;
 }
 
 // L: tokens (multiple of 64, >= the CP map's R); S: slots per group; layout: the store's header, so records are only
