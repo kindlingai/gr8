@@ -140,6 +140,9 @@ pub struct Entry {
     /// times the conversation continued a run before this one was stored
     pub hits: u32,
     pub tail: Option<Tail>,
+    /// the cache identity of the run (pool::Namespace). Prefix kinds and index entries are always stock; an evicted
+    /// non-stock run is stored whole (no base) and matches only its own namespace
+    pub namespace: crate::pool::Namespace,
 }
 
 impl Entry {
@@ -397,11 +400,11 @@ impl Stash {
 
     /// Whether `prompt` continues a stored evicted run, or a run the pool let go (heads).
     pub(crate) fn continues_stored(&self, prompt: &[i32]) -> bool {
-        self.tiers
-            .iter()
-            .flat_map(|t| &t.entries)
-            .any(|e| e.kind == Kind::Evicted && continues(prompt, &e.st.history, e.st.pf_end.max(0) as usize))
-            || self.continues_head(prompt)
+        self.tiers.iter().flat_map(|t| &t.entries).any(|e| {
+            e.kind == Kind::Evicted
+                && e.namespace == crate::pool::STOCK_NAMESPACE
+                && continues(prompt, &e.st.history, e.st.pf_end.max(0) as usize)
+        }) || self.continues_head(prompt)
     }
 
     // one pass over the prompt: does a remembered head's hash match the prompt's first rows?
@@ -507,12 +510,11 @@ impl Stash {
     /// resident: the token histories of the runs still in the pool (live and retained), for prefix bases.
     pub(crate) fn put_evicted(&mut self, gone: &[Kept], below_pages: usize, resident: &[&[i32]]) {
         for k in gone {
-            // The stored-tier format has no namespace. Non-stock prefixes support resident reuse only;
-            // never serialize them or remember their histories as stock entries.
-            if k.namespace != crate::pool::STOCK_NAMESPACE {
-                continue;
+            // a non-stock run is stored whole under its namespace: no prefix base, no stock continuation head
+            let stock = k.namespace == crate::pool::STOCK_NAMESPACE;
+            if stock {
+                self.forget(&k.st);
             }
-            self.forget(&k.st);
             if k.st.valid <= 0 {
                 continue;
             }
@@ -530,7 +532,7 @@ impl Stash {
             if n == 0 {
                 continue;
             }
-            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32);
+            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32, k.namespace);
         }
     }
 
@@ -560,7 +562,7 @@ impl Stash {
     }
 
     fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32, resident: &[&[i32]]) {
-        self.store_tail(kind, key, st, pages, pages, hits, resident, 0)
+        self.store_tail(kind, key, st, pages, pages, hits, resident, 0, crate::pool::STOCK_NAMESPACE)
     }
 
     // store() for a run past R whose tail is `tail` logical pages after `pages` (the pages below R). `full` is the
@@ -577,6 +579,7 @@ impl Stash {
         hits: u32,
         resident: &[&[i32]],
         tail: u32,
+        namespace: crate::pool::Namespace,
     ) {
         // a run that starts with a stored prefix stores only the pages after it. Else a prefix another run in the pool
         // holds becomes one, stored once, when a tier takes it
@@ -588,8 +591,9 @@ impl Stash {
             }
             return;
         }
-        let mut base = if kind == Kind::Evicted { self.shared_base(&st.history, pages.len()) } else { None };
-        if kind == Kind::Evicted && base.is_none() && self.dedupe {
+        let stock = namespace == crate::pool::STOCK_NAMESPACE;
+        let mut base = if kind == Kind::Evicted && stock { self.shared_base(&st.history, pages.len()) } else { None };
+        if kind == Kind::Evicted && stock && base.is_none() && self.dedupe {
             let s = self.resident_prefix(&st, pages.len(), resident);
             if s > 0 {
                 let fin = Finished {
@@ -627,13 +631,8 @@ impl Stash {
             let (below, per, place) = (pages.len() as u32, self.tail.expect("set").1, self.tail_place);
             let own_slots = &slots[own.len()..own.len() + x.own as usize];
             let rep_slots = &slots[own.len() + x.own as usize..];
-            let shard: Vec<u32> = full
-                .iter()
-                .filter(|&&p| p < place)
-                .skip(below as usize)
-                .take(x.own as usize)
-                .copied()
-                .collect();
+            let shard: Vec<u32> =
+                full.iter().filter(|&&p| p < place).skip(below as usize).take(x.own as usize).copied().collect();
             self.io.extend(shard.into_iter().zip(own_slots).map(|(page, &slot)| Io::Spill {
                 tier,
                 page,
@@ -651,7 +650,7 @@ impl Stash {
         self.next_id += 1;
         let tier = &mut self.tiers[t];
         tier.stats.spilled_pages += n as u64;
-        tier.entries.push(Entry { id, kind, key, st, slots, base, hits, tail });
+        tier.entries.push(Entry { id, kind, key, st, slots, base, hits, tail, namespace });
         if kind.prefix() && tier.index.is_some() {
             self.commits.push((t, id));
         }
@@ -666,7 +665,17 @@ impl Stash {
         self.next_id += 1;
         let tier = &mut self.tiers[t];
         tier.stats.spilled_pages += pages.len() as u64;
-        tier.entries.push(Entry { id, kind, key, st, slots, base: None, hits, tail: None });
+        tier.entries.push(Entry {
+            id,
+            kind,
+            key,
+            st,
+            slots,
+            base: None,
+            hits,
+            tail: None,
+            namespace: crate::pool::STOCK_NAMESPACE,
+        });
         if tier.index.is_some() {
             self.commits.push((t, id));
         }
@@ -831,13 +840,8 @@ impl Stash {
             let rep_slots = &e.slots[below + x.own as usize..];
             // the grant's shard: the (first + j)-th page of its list below place; the drafter's pages at the list's
             // tail positions
-            let shard: Vec<u32> = pages
-                .iter()
-                .filter(|&&p| p < place)
-                .skip(first as usize)
-                .take(x.own as usize)
-                .copied()
-                .collect();
+            let shard: Vec<u32> =
+                pages.iter().filter(|&&p| p < place).skip(first as usize).take(x.own as usize).copied().collect();
             self.io.extend(shard.iter().zip(own_slots).map(|(&page, &slot)| Io::Restore {
                 tier,
                 slot,
@@ -917,6 +921,12 @@ impl Stash {
                 h = mix(mix(h, e.kind as u64), e.hits as u64);
                 if let Some((id, n)) = e.base {
                     h = mix(mix(h, id), n as u64);
+                }
+                // stock entries keep the pre-namespace digest; a non-stock one folds in every namespace byte
+                if e.namespace != crate::pool::STOCK_NAMESPACE {
+                    for c in e.namespace.chunks(8) {
+                        h = mix(h, c.iter().fold(0u64, |x, &b| x << 8 | b as u64));
+                    }
                 }
             }
         }
@@ -1052,6 +1062,7 @@ fn decode(p: &[u8]) -> Option<Record> {
                 base: None,
                 hits: 0,
                 tail: None,
+                namespace: crate::pool::STOCK_NAMESPACE,
             }))
         }
         2 => Some(Record::Drop(c.u64()?)),
