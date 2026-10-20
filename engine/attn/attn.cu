@@ -160,8 +160,19 @@ __device__ int page(const DeviceAttn& a,int pos){
     if(pos<0 || pos>=a.live_context || pos/a.page_size>=a.table_size){error(a,1);return -1;}
     int p=a.block_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;
 }
+// remote rows (G6_RT_REMOTE): a page's row index in its group's tables
+__device__ __forceinline__ int rt_index(const G6Attn& a,int pos){
+    const int lp=pos/a.page_size-a.rt_L/a.page_size;return (a.cp_nr?lp/a.cp_nr:lp)*a.page_size+pos%a.page_size;
+}
+// page()'s checks and errors, except that a G6_RT_REMOTE page reads its row from the group's resident slot (error 64:
+// the row is not resident)
 __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
-    int p=page(a,pos);return p<0?nullptr:(const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*KV_BYTES;
+    if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return nullptr;}
+    const int p=a.block_table[pos/a.page_size];
+    if(p>=0&&p<a.page_count)return (const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*KV_BYTES;
+    if(p==G6_RT_REMOTE&&a.rt_table){const int s=a.rt_table[rt_index(a,pos)];
+        if(s>=0)return a.rt_rows+(int64_t)s*a.rt_stride;error(a,64);return nullptr;}
+    error(a,2);return nullptr;
 }
 #if defined(G6_CP) && G6_CP
 // CP: index keys are stored as the latent: on the pages of the block table (the replicated prefix, then this rank's
@@ -639,6 +650,7 @@ static Work workspace(const G6Attn& a,void* base){
 }
 #include "kv4.cuh"
 #include "decode-small.cuh"
+#include "rt.cuh"
 template<class Input>
 static void threshold_compact(const G6Attn& a,Input input,Work& w,int count,cudaStream_t stream){
     const int chunks=(a.context+RADIX_CHUNK-1)/RADIX_CHUNK;
@@ -887,12 +899,15 @@ static cudaError_t cp_index_body(const G6Attn& a,Input input,Work& w,uint64_t* c
     // J5 select paths (make_index): <= 32768 scores in w.si; > 32768 one row: scores in w.s1 (1 x T); > 32768 several
     // rows: chunked, the last chunk_merge leaves the merged keys (chunk_key == cp_key) in w.carry
     cudaError_t e=make_index(a,input,w,0,n,stream,nullptr);if(e!=cudaSuccess)return e;
+    if(a.rt_group)rt_resolve<<<1,1024,0,stream>>>(input,n);
     if(a.context>32768&&n>1){cudaError_t c=cudaMemcpyAsync(mine,w.carry,(size_t)n*TOP*8,cudaMemcpyDeviceToDevice,stream);return c!=cudaSuccess?c:cudaGetLastError();}
     cp_cand_pack<<<n,256,0,stream>>>(input,0,a.context>32768?w.s1:w.si,mine);
 #else
     prep_index<<<dim3(n,32),128,0,stream>>>(input,0,w.iq,w.weights);
     LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
     cudaError_t e=SELECT_INDEX(a,input,w,0,n,stream);if(e!=cudaSuccess)return e;
+    // remote rows: my local list holds every key of mine the merge can keep, so the fetch runs under the all-gather
+    if(a.rt_group)rt_resolve<<<1,1024,0,stream>>>(input,n);
     cp_cand_pack<<<n,256,0,stream>>>(input,0,w.si,mine);
 #endif
     return cudaGetLastError();
@@ -1017,6 +1032,7 @@ extern "C" int g6_attn_cp_index(const G6Attn* a,const G6AttnStepCell* cell,void*
 extern "C" int g6_attn_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell,const uint64_t* cand_all,void* s){
     if(!ga::cp_ok(a)||!cand_all||a->reuse_indices)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
+    if(a->rt_group)ga::rt_wait<<<1,32,0,stream>>>(a->rt_group,a->error);   // every scores launch of the layer follows
     if(cell)ga::cp_merge<<<a->rows,256,0,stream>>>(ga::ReplayInput{*a,cell},0,cand_all);
     else ga::cp_merge<<<a->rows,256,0,stream>>>(*a,0,cand_all);
     return (int)cudaGetLastError();

@@ -117,6 +117,10 @@ the short version.
 | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
 | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |
+| `G6_RT_STORE` | unset | m4sim only so far (g6m4 refuses it): remote attention rows (#10). `mem:` or `remote:HOST:PORT` (a KV node, `./gr8 kv`). With `G6_CP` on, each rank's rows past `G6_RT_L` go to the store once their page is whole, and CP decode reads them through resident slots, fetched by a helper thread after each group's selection (`engine/runtime/rt_rows.cuh`). The store's header names the layout (R, L, ranks, row format, model set), and a store written under another layout is refused. Output is the same as without it |
+| `G6_RT_L` | `G6_CP_R` | `G6_RT_STORE`: the first position in the store, a multiple of 64, at least `G6_CP_R`, and a context bucket boundary |
+| `G6_RT_POOL` | 4096 | `G6_RT_STORE`: resident slots per indexer group, at least 2048 (one row's selection) |
+| `G6_RT_POISON` | unset | `G6_RT_STORE` test: 1 = overwrite the local copy of every row sent to the store |
 | `G6_DFL_DUMP` | unset | `--dflash` measurement, rank 0: a file that gets every draft step's context features, drafts and the committed tokens (`engine/ref/dflash2_replay.py` replays it through the reference drafter) |
 
 The decode attention variables from `G6_ATTN_SC2` to `G6_ATTN_FRONT` are read once, before graph capture, so set them

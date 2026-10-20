@@ -187,6 +187,25 @@ int g6kv_tier_write_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, v
 int g6kv_tier_read_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, void* const* bufs);
 // staging memory a KV node's RDMA device may read and write directly (a no-op for the other stores)
 int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
+// Remote attention rows (src/rows.rs, the engine's G6_RT_STORE tier): a store of `bytes` ("mem:" or "remote:HOST:PORT",
+// a lease named `name`), and a helper thread that serves each group's request ring. Its first G6KV_ROWS_HEADER bytes
+// hold the layout the records were written under: open writes `layout` into an empty store and refuses a store that
+// names another one. The GPU fills a ring's entries,
+// then stores seq (system-scope release); the thread reads each entry's record (rec bytes at off) into
+// slots + slot * rec, then stores *done = seq (u64 max: a read failed). Errors: -1 with g6kv_tier_error.
+struct g6kv_rows;
+struct g6kv_rows_ent { uint64_t off; uint32_t slot, pad; };
+struct g6kv_rows_req { uint64_t seq; uint32_t n, pad; };   // cap g6kv_rows_ent follow it
+#define G6KV_ROWS_HEADER 4096
+int g6kv_rows_open(const char* spec, const char* name, const char* layout, uint64_t bytes, g6kv_rows** out);
+void g6kv_rows_free(g6kv_rows* r);
+int g6kv_rows_write(const g6kv_rows* r, uint64_t off, const void* buf, size_t len);
+int g6kv_rows_register(const g6kv_rows* r, void* p, size_t len);
+// before g6kv_rows_start; returns the group's index
+int g6kv_rows_group(g6kv_rows* r, g6kv_rows_req* req, uint64_t* done, void* slots, size_t rec, uint32_t cap);
+void g6kv_rows_start(g6kv_rows* r);
+uint64_t g6kv_rows_fetched(const g6kv_rows* r);
+void g6kv_rows_describe(const g6kv_rows* r, char* buf, size_t cap);
 // A session's KV in a form independent of the layout (src/canon.rs, #152): per binding and token, in order, the MLA
 // latent row and, on full-index layers, the indexer key row (128 codes, then its FP32 scale). Host memory only: the
 // caller copies the pages between the device and the buffers. flags[b]: 1 = binding b has index keys, 2 = its cache is

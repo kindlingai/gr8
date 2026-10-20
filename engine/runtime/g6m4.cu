@@ -117,6 +117,7 @@ int main(int argc, char** argv)
     };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+    if (getenv("G6_RT_STORE")) die("G6_RT_STORE: remote attention rows run in m4sim only so far");
     std::string progress_err;          // G6_PROGRESS_ISOLATE: other threads stay off the proxy CPUs (progress_cpus.h)
     const int progress_isolate = env_choice("G6_PROGRESS_ISOLATE", 1, 1, &progress_err);
     if (progress_isolate < 0) die(progress_err);

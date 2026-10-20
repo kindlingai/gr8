@@ -40,6 +40,10 @@
 //        poisoned, and come back. The lines printed must be the run's without it. Past G6_CP_R the reused rows go as the
 //        pool stores a run's tail: each rank's shard of the attention caches, and every logical page's replicated parts
 //   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
+// G6_RT_STORE=mem:|remote:HOST:PORT (G6_CP on; no --mtp, --s2, --reuse-prefix, --serve, --minv): every rank's rows
+//        past G6_RT_L (default G6_CP_R) go to a rows store once their page is whole (before each decode step), and
+//        attention reads them back through G6_RT_POOL (default 4096) resident slots per indexer group (rt_rows.cuh).
+//        The lines printed must be the run's without it. G6_RT_POISON=1 overwrites the local copies of those rows.
 // G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (needs --mtp): the split replicated GEMVs as g6m4 runs them (rank.cuh
 //        QSplit), each model's gathers on a loopback of their own: every rank's attention block (and the draft's eh_proj)
 //        runs in gather phases (rank.cuh QsPh) with the delivery between them. The lines must equal the run without them.
@@ -57,6 +61,7 @@
 #include "prefill.cuh"
 #include "serve.h"
 #include "s2/kv_tier.cuh"
+#include "rt_rows.cuh"
 #ifdef DEC_S2
 #include <map>
 #include <set>
@@ -617,6 +622,29 @@ int main(int argc, char** argv)
     }
     for (Model& m : R) { m.nc = nc; m.rs = plan.rs; }   // before any capture: the head kernels take them by value
     for (Draft& D : DR) D.d.nc = nc;
+    // G6_RT_STORE (header): before any prepare, which copies the bindings' arguments into the replay entries
+    std::vector<std::unique_ptr<RtTier>> rt(NR);
+    if (const char* rs = getenv("G6_RT_STORE"))
+    {
+#if defined(G6_CP) && G6_CP
+        if (!cp_on || mtp || s2mode || reuse || !serve.empty() || minv >= 0)
+            die("G6_RT_STORE needs G6_CP on, and no --mtp, --s2, --reuse-prefix, --serve or --minv");
+        const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
+        const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
+        const bool poison = getenv("G6_RT_POISON") && atoi(getenv("G6_RT_POISON"));
+        // the model set: where the weights come from and which layers run
+        const std::string src = packs + "|" + v2src.dense + "|" + v2src.dir + "|" + v2src.widths + "|" + layers_s;
+        char model[17];
+        snprintf(model, sizeof model, "%016llx", (unsigned long long)fnv(0xcbf29ce484222325ull, src.data(), src.size()));
+        const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(NR) + "-" + g6kv::NAME + "-" + model;
+        const std::string layout = "R=" + std::to_string(cp_R) + " L=" + std::to_string(L) + " nr=" + std::to_string(NR) + " row=" + g6kv::NAME +
+                                   " model=" + model;
+        for (Model& m : R) rt[m.rank] = rt_build(m, rs, "m4sim-rt-" + tag, layout, L, S, poison, st);
+#else
+        (void)rs;
+        die("G6_RT_STORE needs a G6_CP build");
+#endif
+    }
 #ifdef DEC_S2
     S2In* in_s2 = dmalloc<S2In>(1);     // --s2: the step's session layout, target and draft steps
     S2In* in_s2d = dmalloc<S2In>(1);
@@ -1598,6 +1626,7 @@ int main(int argc, char** argv)
             {
                 for (Model& m : R) reset(m, st);
                 for (Draft& D : DR) reset(D.d, st);
+                if (rt[0]) for (Model& m : R) rt_reset(m, *rt[m.rank], st);
             }
         }
         if (p.first < skip) p.first = skip;
@@ -1814,6 +1843,7 @@ int main(int argc, char** argv)
         {
             const int M = step_rows(p, s);
             const StepIn si = step_inputs(p, s, last_tok, step0);
+            if (rt[0]) for (Model& m : R) rt_spill(m, *rt[m.rank], si.pos[0], st);
             const int k = bucket(si.context, false);
             if (!ready[k][M])
             {
@@ -1882,6 +1912,9 @@ int main(int argc, char** argv)
                 graph ? "one graph" : "plain launches", t1[t1.size() / 2], t1[0], t1[t1.size() / 2] * 1000 / NR / NL, NL);
     }
     if (mtp) mtp_stats.print(mtp, "six ranks in turn");
+    for (int r = 0; r < NR && rt[0]; ++r)
+        fprintf(stderr, "# G6_RT_STORE rank %d: %llu rows spilled, %llu fetched\n", r, (unsigned long long)rt[r]->spilled,
+                (unsigned long long)rt_fetched(*rt[r]));
     if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);
