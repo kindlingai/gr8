@@ -32,7 +32,10 @@ const POOL_PAGES: u32 = 48;
 fn usage() -> ! {
     eprintln!(
         "usage: kvman-share-bench [--server HOST:PORT] [--gb 4] [--seg-mb 128] [--margin-s 60] [--poll-ms 1000] \
-         [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE] [--clock pool|bench] [--seed N]"
+         [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE] [--clock pool|bench] [--seed N] \
+         [--only A|B] [--busy phases|always|idle]\n\
+         --only: run that cluster alone (the other group is another process, e.g. vLLM, on --server);\n\
+         --busy: phases (the 4 phases), always or idle"
     );
     std::process::exit(2)
 }
@@ -421,6 +424,10 @@ struct Args {
     json: Option<String>,
     pool_clock: bool,
     seed: u64,
+    // run only cluster 0 (A) or 1 (B)
+    only: Option<usize>,
+    // None: the phases; Some(b): busy (or idle) all the time
+    busy: Option<bool>,
 }
 
 fn cluster(a: &Args, addr: &str, id: u64, name: &'static str, mla_row: usize, floor: u64, cap: u64) -> Cluster {
@@ -490,6 +497,8 @@ fn main() {
         json: None,
         pool_clock: true,
         seed: 0,
+        only: None,
+        busy: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -513,6 +522,21 @@ fn main() {
                 }
             }
             "--seed" => a.seed = v().parse().unwrap_or_else(|_| usage()),
+            "--only" => {
+                a.only = Some(match v().as_str() {
+                    "A" => 0,
+                    "B" => 1,
+                    _ => usage(),
+                })
+            }
+            "--busy" => {
+                a.busy = match v().as_str() {
+                    "phases" => None,
+                    "always" => Some(true),
+                    "idle" => Some(false),
+                    _ => usage(),
+                }
+            }
             _ => usage(),
         }
     }
@@ -547,11 +571,25 @@ fn main() {
         None => Box::new(std::io::stdout()),
     }));
     // A: GLM 5.3 full, FP8 rows. B: the INT4-row build. Floor 2 segments a rank each, cap 24
-    let clusters = [cluster(&a, &addr, 1, "A", MLA_ROW, 2, 24), cluster(&a, &addr, 2, "B", MLA_ROW_KV4, 2, 24)];
+    let specs = [(1, "A", MLA_ROW), (2, "B", MLA_ROW_KV4)];
+    let clusters: Vec<Cluster> = specs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| a.only.is_none_or(|o| o == *i))
+        .map(|(_, &(id, name, row))| cluster(&a, &addr, id, name, row, 2, 24))
+        .collect();
+    let per: Vec<String> = clusters.iter().map(|c| format!("{} {}", c.name, c.per_seg)).collect();
     eprintln!(
-        "# node {addr}: {} GiB, segments of {} MiB; A {} blocks a segment, B {}; {} ranks each; margin {} s, poll {} ms, \
-         phases of {} s",
-        a.gb, a.seg_mb, clusters[0].per_seg, clusters[1].per_seg, a.ranks, a.margin_s, a.poll_ms, a.phase_s
+        "# node {addr}: {}, segments of {} MiB; blocks a segment: {}; {} ranks each; margin {} s, poll {} ms, \
+         phases of {} s, busy {}",
+        if a.server.is_some() { "size: the node's".to_string() } else { format!("{} GiB", a.gb) },
+        a.seg_mb,
+        per.join(", "),
+        a.ranks,
+        a.margin_s,
+        a.poll_ms,
+        a.phase_s,
+        a.busy.map_or("by phase", |b| if b { "always" } else { "never" })
     );
     // phase -> (A busy, B busy)
     let phases = [(true, false), (false, true), (true, true), (true, false)];
@@ -559,11 +597,13 @@ fn main() {
     let phase_len = Duration::from_secs_f64(a.phase_s);
     let poll = Duration::from_millis(a.poll_ms);
     let end = phase_len * phases.len() as u32;
+    let names: Vec<&str> = clusters.iter().map(|c| c.name).collect();
+    let busy_all = a.busy;
     let results: Vec<Counts> = std::thread::scope(|sc| {
         let hs: Vec<_> = clusters
             .into_iter()
-            .enumerate()
-            .map(|(i, mut c)| {
+            .map(|mut c| {
+                let i = (c.id - 1) as usize;
                 let out = out.clone();
                 sc.spawn(move || {
                     let mut next_poll = t0;
@@ -573,7 +613,7 @@ fn main() {
                             break;
                         }
                         let p = (t.as_secs_f64() / phase_len.as_secs_f64()) as usize;
-                        let busy = if i == 0 { phases[p].0 } else { phases[p].1 };
+                        let busy = busy_all.unwrap_or(if i == 0 { phases[p].0 } else { phases[p].1 });
                         if Instant::now() >= next_poll {
                             let line = c.head(busy);
                             writeln!(
@@ -597,7 +637,7 @@ fn main() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    for (n, c) in ["A", "B"].iter().zip(&results) {
+    for (n, c) in names.iter().zip(&results) {
         eprintln!(
             "# {n}: {} requests, {} stored hits, {} blocks restored and checked whole, {} reused rows checked, {} spilled, \
              {} moved ({} in gives), {} grows, {} gives; no wrong block",

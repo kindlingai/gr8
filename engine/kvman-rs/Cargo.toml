@@ -5,6 +5,9 @@ edition = "2021"
 description = "gr8 S2 KV page allocator: every rank's pool of KV pages, the page list of each live and retained run"
 
 [lib]
+# no cdylib here: it shares the libg6kvman.* output name with the rlib, and `cargo test --release` then links an
+# unwind test against the abort rlib (cargo#6313). The vLLM tier's libg6kvman.so:
+#   cargo rustc --release --lib --crate-type cdylib
 crate-type = ["staticlib", "rlib"]
 
 [profile.release]

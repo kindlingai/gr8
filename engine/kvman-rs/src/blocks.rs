@@ -17,6 +17,15 @@ pub enum Blocks {
     Mem(Mutex<Vec<u8>>, usize, u64),
 }
 
+// KVMAN_TRANSPORT=tcp|rdma|auto (default auto) per box: a rank whose path to the node is routed through another box
+// sets up RDMA but cannot write, and auto does not fall back after setup
+fn transport() -> io::Result<crate::remote::Want> {
+    match std::env::var("KVMAN_TRANSPORT") {
+        Ok(s) if !s.is_empty() => s.parse().map_err(|e: String| io::Error::new(io::ErrorKind::InvalidInput, e)),
+        _ => Ok(crate::remote::Want::Auto),
+    }
+}
+
 impl Blocks {
     /// `spec` as above, `name` the lease name on a KV node, `block_bytes` before rounding.
     pub fn open(spec: &str, name: &str, block_bytes: usize, blocks: u64) -> io::Result<Blocks> {
@@ -37,7 +46,7 @@ impl Blocks {
             "remote" if !rest.is_empty() => {
                 // four ranks share one switch port without PFC: a dropped packet costs one ack timeout, and 4.096 us *
                 // 2^17 (0.5 s) leaves room for the retries before a lane fails
-                let o = Opts { lanes: THREADS, qp_timeout: 17, ..Opts::new(name, slot, blocks) };
+                let o = Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, ..Opts::new(name, slot, blocks) };
                 Ok(Blocks::Remote(Box::new(RemoteStore::open(&node_addr(rest), &o)?)))
             }
             "mem" => Ok(Blocks::Mem(Mutex::new(vec![0u8; slot * blocks as usize]), slot, blocks)),
@@ -52,7 +61,7 @@ impl Blocks {
         let rest = spec.strip_prefix("remote:").filter(|r| !r.is_empty()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("store {spec}: a group lease is remote:HOST:PORT"))
         })?;
-        let o = Opts { lanes: THREADS, qp_timeout: 17, group: Some(g), ..Opts::new(name, slot, 0) };
+        let o = Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, group: Some(g), ..Opts::new(name, slot, 0) };
         Ok(Blocks::Remote(Box::new(RemoteStore::open(&node_addr(rest), &o)?)))
     }
 
