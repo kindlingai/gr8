@@ -365,7 +365,9 @@ impl Stash {
         if slots < old {
             let need = old - slots;
             while self.tiers[t].alloc.free() < need {
-                let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else { return false };
+                let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else {
+                    return false;
+                };
                 let e = self.tiers[t].entries.remove(i);
                 self.evict(t, e);
             }

@@ -360,9 +360,24 @@ fn a_chain_of_layouts_loses_nothing() {
     }
     // back at TP6 with R 1024, on another page list: the same rows on the pages that list names
     let cs: Vec<Vec<Cache>> = ranks.iter().map(caches).collect();
-    assert_eq!(&canon::export(row, &bs, &chain[chain.len() - 1], &views, &cs, 0, n as u64, true).unwrap(), c0.as_ref().unwrap());
+    assert_eq!(
+        &canon::export(row, &bs, &chain[chain.len() - 1], &views, &cs, 0, n as u64, true).unwrap(),
+        c0.as_ref().unwrap()
+    );
     let fresh: Vec<Rank> = (0..views.len())
-        .map(|r| write(&t, &bs, row, &chain[chain.len() - 1], &views[r], r as u32, ranks[r].mla[0].len() / (PAGE * row), n, 0))
+        .map(|r| {
+            write(
+                &t,
+                &bs,
+                row,
+                &chain[chain.len() - 1],
+                &views[r],
+                r as u32,
+                ranks[r].mla[0].len() / (PAGE * row),
+                n,
+                0,
+            )
+        })
         .collect();
     for r in 0..views.len() {
         assert!(ranks[r].mla == fresh[r].mla && ranks[r].idx == fresh[r].idx, "rank {r} after the chain");

@@ -14,7 +14,7 @@ const MIB: usize = 1 << 20;
 
 fn node(mib: usize) -> String {
     let n = Node::new(
-        &Config { bytes: mib * MIB, lock: false, rdma: false, qp_timeout: 14 },
+        &Config { bytes: mib * MIB, lock: false, rdma: false, qp_timeout: 14, share: Default::default() },
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();

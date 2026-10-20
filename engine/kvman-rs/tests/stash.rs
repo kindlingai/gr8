@@ -816,9 +816,7 @@ fn a_long_run_spills_the_runs_it_evicts_for_either_class() {
     // drafter's class is what evicts it, and it must spill — its tail as every rank's shard and the drafter's
     // copy — and reach the claim log, not vanish with its pages freed.
     let (pages, place, bp) = (56u32, 22u32, 4usize);
-    let mut ranks: Vec<CpRank> = (0..NR)
-        .map(|r| CpRank::new(r, pages, place, bp as u32 * 64, 256))
-        .collect();
+    let mut ranks: Vec<CpRank> = (0..NR).map(|r| CpRank::new(r, pages, place, bp as u32 * 64, 256)).collect();
     type Got = (Run, Vec<Io>, u64);
     let all = |ranks: &mut [CpRank], f: &mut dyn FnMut(&mut CpRank) -> Got| {
         let got: Vec<Got> = ranks.iter_mut().map(&mut *f).collect();
@@ -914,9 +912,11 @@ fn non_stock_resident_rows_cannot_supply_a_stored_stock_base() {
     use g6kvman::pool::NAMESPACE_BYTES;
     let mut r = Rank::new(24, 24, 24 * 64, &[(64, Keep::Evicted)], 3);
     let system = toks(1, 300);
-    let mut a = system.clone(); a.extend(toks(2, 200));
+    let mut a = system.clone();
+    a.extend(toks(2, 200));
     let (_, _, a_hist) = session(&mut r, &a, 20);
-    let mut b = system.clone(); b.extend(toks(3, 200));
+    let mut b = system.clone();
+    b.extend(toks(3, 200));
     session(&mut r, &b, 20);
     flush(&mut r);
     let stored = r.pool.stash().unwrap().entries(0).iter().find(|e| e.st.history == a_hist).unwrap().clone();
@@ -924,11 +924,14 @@ fn non_stock_resident_rows_cannot_supply_a_stored_stock_base() {
     // Same tokens, deliberately different KV bytes in the non-stock resident run.
     let ns = [1; NAMESPACE_BYTES];
     r.pool.count_namespaced(&b, None, ns);
-    let run = r.pool.reserve(550, 550).unwrap(); r.run_io();
+    let run = r.pool.reserve(550, 550).unwrap();
+    r.run_io();
     let list = r.pool.list(&run).unwrap().to_vec();
     r.write(&list, 0, &vec![-999; b.len()]);
-    r.pool.retain_namespaced(&run, finished(&b), ns).unwrap(); r.run_io();
-    let mut next = a_hist.clone(); next.extend(toks(4, 20));
+    r.pool.retain_namespaced(&run, finished(&b), ns).unwrap();
+    r.run_io();
+    let mut next = a_hist.clone();
+    next.extend(toks(4, 20));
     r.pool.count(&next, None);
     let rows = next.len() as u64 + 5;
     let h = r.pool.match_prefix(&next, rows, rows, next.len() as i32 - 1);
@@ -946,15 +949,19 @@ fn non_stock_resident_rows_cannot_supply_a_stored_stock_base() {
 fn non_stock_resident_history_cannot_create_a_stock_prefix_base() {
     let mut r = Rank::new(24, 24, 24 * 64, &[(64, Keep::Evicted)], 3);
     let system = toks(1, 300);
-    let mut a = system.clone(); a.extend(toks(2, 200));
+    let mut a = system.clone();
+    a.extend(toks(2, 200));
     let (_, _, a_hist) = session(&mut r, &a, 20);
-    let mut b = system; b.extend(toks(3, 200));
+    let mut b = system;
+    b.extend(toks(3, 200));
     let ns = [1; g6kvman::pool::NAMESPACE_BYTES];
     r.pool.count_namespaced(&b, None, ns);
-    let run = r.pool.reserve(550, 550).unwrap(); r.run_io();
+    let run = r.pool.reserve(550, 550).unwrap();
+    r.run_io();
     r.pool.retain_namespaced(&run, finished(&b), ns).unwrap();
     // Evict the older stock run while its only matching resident prefix is non-stock.
-    let fresh = r.pool.reserve(550, 550).unwrap(); r.run_io();
+    let fresh = r.pool.reserve(550, 550).unwrap();
+    r.run_io();
     let entries = r.pool.stash().unwrap().entries(0);
     let stored = entries.iter().find(|e| e.st.history == a_hist).unwrap();
     assert!(stored.base.is_none(), "a non-stock history cannot establish a stock base");

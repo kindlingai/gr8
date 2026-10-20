@@ -81,7 +81,7 @@ impl BlockStore for Blocks {
     fn blocks(&self) -> u64 {
         match self {
             Blocks::Ssd(f) => f.slots(),
-            Blocks::Remote(r) => r.blocks,
+            Blocks::Remote(r) => r.blocks(),
             Blocks::Mem(_, _, n) => *n,
         }
     }

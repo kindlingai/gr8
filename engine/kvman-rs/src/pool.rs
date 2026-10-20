@@ -167,7 +167,7 @@ pub struct Pool {
     stash: Option<Stash>,
     next_tokens: Option<Vec<i32>>,
     next_span: Option<u64>,
-    next_continues: bool, // count() found the next grant continues a conversation
+    next_continues: bool,    // count() found the next grant continues a conversation
     next_len: Option<usize>, // the next grant's prompt length (any namespace), for the write limit's credit
     // resize (#153): pages [0, place) come in chunks of `chunk` pages (0 = off). An offline chunk's pages hold no live
     // or retained run and are not counted anywhere, so the engine may release their memory.
