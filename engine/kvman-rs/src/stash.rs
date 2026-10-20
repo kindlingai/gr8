@@ -397,7 +397,20 @@ impl Stash {
         true
     }
 
-    /// Tier t's entries as (id, blocks), least recently used first: what a KV node's head reports as its coldest.
+    /// Tier t's entries as (id, blocks) in the order a shrink (resize_tier) evicts them: unpinned entries no stored run
+    /// is based on, least recently used first, then unpinned bases, then pinned ones (a shrink stops there). What a KV
+    /// node's head reports its coldest from (pool.rs coldest_ages), so the ages it reports are those of the blocks a
+    /// give costs. resize_tier takes the same rule again after each eviction (a base whose runs all went is no base).
+    pub fn give_order(&self, t: usize) -> Vec<(u64, usize)> {
+        let Some(x) = self.tiers.get(t) else { return Vec::new() };
+        let bases: Vec<u64> = self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+        let rank = |e: &Entry| if self.pin.contains(&e.id) { 2 } else if bases.contains(&e.id) { 1 } else { 0 };
+        let mut v: Vec<(u8, u64, usize)> = x.entries.iter().map(|e| (rank(e), e.id, e.slots.len())).collect();
+        v.sort_by_key(|e| e.0); // stable: LRU order within each class
+        v.into_iter().map(|(_, id, n)| (id, n)).collect()
+    }
+
+    /// Tier t's entries as (id, blocks), least recently used first.
     pub fn lru(&self, t: usize) -> Vec<(u64, usize)> {
         self.tiers.get(t).map_or_else(Vec::new, |x| x.entries.iter().map(|e| (e.id, e.slots.len())).collect())
     }

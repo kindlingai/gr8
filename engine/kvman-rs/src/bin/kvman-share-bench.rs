@@ -347,7 +347,7 @@ impl Cluster {
             self.ranks[0].pool.coldest_ages(0, self.per_seg, 8)
         } else {
             let now = Instant::now();
-            let lru = self.ranks[0].pool.stash().unwrap().lru(0);
+            let lru = self.ranks[0].pool.stash().unwrap().give_order(0);
             let lu = &self.last_use;
             coldest_ages(
                 &lru,
