@@ -184,10 +184,8 @@ __device__ const uint8_t* ik_at(const DeviceAttn& a,int pos,float& scale){
     const uint8_t* base=(const uint8_t*)a.index_cache+(int64_t)p*a.page_size*IDX_BYTES;
     scale=((const float*)(base+a.page_size*128))[pos%a.page_size];return base+(pos%a.page_size)*128;
 }
-#if G6_KV4
-__device__ float latent(const uint8_t* v,int d){return (float)(((v[d>>1]>>((d&1)*4))&15)-8)*__half2float(((const half*)(v+g6kv::SCALE_OFF))[d>>5]);}
 // x[k] = element lane + 32 k of a 512-vector held by one warp -> H x, unscaled (Sylvester order: bits 0-4 are the lane,
-// bits 5-8 are k). Every lane of the warp must call it.
+// bits 5-8 are k). Every lane of the warp must call it. Also in an FP8 build: the remote rows' INT4 records (rt.cuh).
 __device__ __forceinline__ void fwht16(float (&x)[16],int lane){
     #pragma unroll
     for(int h=1;h<16;h<<=1){
@@ -199,6 +197,16 @@ __device__ __forceinline__ void fwht16(float (&x)[16],int lane){
         for(int k=0;k<16;k++){const float y=__shfl_xor_sync(0xffffffff,x[k],o);x[k]=(lane&o)?y-x[k]:x[k]+y;}}
 }
 constexpr float HSCALE=0.04419417382415922f;   // 1/sqrt(512): H is orthonormal, so H^-1 = H
+// the INT4 row's quantizer, one 32-dim group, a dim a lane: s := the group's FP16 scale amax / 7, returns the lane's
+// code q + 8, q in -7..7
+__device__ __forceinline__ int kv4_code(float x,half& s){
+    s=__float2half_rn(warp_max(fabsf(x))*(1.f/7.f));const float sf=__half2float(s);
+    return (sf>0.f?(int)fminf(fmaxf(rintf(x/sf),-7.f),7.f):0)+8;
+}
+// the FP8 row's scale of one 128-dim group
+__device__ __forceinline__ float fp8_scale(float amax){return fmaxf(amax/448.f,FLT_MIN);}
+#if G6_KV4
+__device__ float latent(const uint8_t* v,int d){return (float)(((v[d>>1]>>((d&1)*4))&15)-8)*__half2float(((const half*)(v+g6kv::SCALE_OFF))[d>>5]);}
 // rows of 512 floats := H x (decode: the absorbed query before scores, the context before value_project). Warp per row.
 __global__ void fwht_rows(float* p,int rows){
     const int row=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(row>=rows)return;
@@ -240,13 +248,12 @@ __device__ __forceinline__ void append_kv_row(Input input,int row){
     uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
     {const int w=t>>5,l=t&31;
      for(int g=2*w;g<2*w+2;g++){const float x=v[g*32+l];if(!isfinite(x))error(a,4);
-        const half s=__float2half_rn(warp_max(fabsf(x))*(1.f/7.f));const float sf=__half2float(s);
-        const int q=sf>0.f?(int)fminf(fmaxf(rintf(x/sf),-7.f),7.f):0;code[g*32+l]=(uint8_t)(q+8);
+        half s;code[g*32+l]=(uint8_t)kv4_code(x,s);
         if(l==0)((half*)(dst+g6kv::SCALE_OFF))[g]=s;}}
     __syncthreads();
     dst[t]=(uint8_t)(code[2*t]|(code[2*t+1]<<4));
 #else
-    if(t<4){float mx=0;for(int d=t*128;d<(t+1)*128;d++)mx=fmaxf(mx,fabsf(v[d]));sc[t]=fmaxf(mx/448.f,FLT_MIN);}
+    if(t<4){float mx=0;for(int d=t*128;d<(t+1)*128;d++)mx=fmaxf(mx,fabsf(v[d]));sc[t]=fp8_scale(mx);}
     __syncthreads();
     uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
     for(int d=t;d<512;d+=256){if(!isfinite(v[d]))error(a,4);dst[d]=q4(v[d]/sc[d/128]);}
@@ -1026,6 +1033,9 @@ extern "C" int g6_attn_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell
     if(!ga::cp_ok(a)||!cand_all||a->reuse_indices)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     if(a->rt_group)ga::rt_wait<<<1,32,0,stream>>>(a->rt_group,a->error);   // every scores launch of the layer follows
+#if !G6_KV4
+    if(a->rt_group&&a->rt_int4)ga::rt_unpack<<<64,256,0,stream>>>(a->rt_group);
+#endif
     if(cell)ga::cp_merge<<<a->rows,256,0,stream>>>(ga::ReplayInput{*a,cell},0,cand_all);
     else ga::cp_merge<<<a->rows,256,0,stream>>>(*a,0,cand_all);
     return (int)cudaGetLastError();
@@ -1046,3 +1056,19 @@ extern "C" int g6_attn_cp_qabs(const G6Attn* a,void* scratch,const float** q,con
     *q=w.q;*rope=w.rope;return 0;
 }
 #endif
+extern "C" int g6_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+#if G6_KV4
+    (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
+#else
+    if(n<=0)return 0;
+    ga::rt_convert<true><<<(n+7)/8,256,0,(cudaStream_t)s>>>((const uint8_t*)src,ss,(uint8_t*)dst,ds,n);return (int)cudaGetLastError();
+#endif
+}
+extern "C" int g6_rt_unpack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+#if G6_KV4
+    (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
+#else
+    if(n<=0)return 0;
+    ga::rt_convert<false><<<(n+7)/8,256,0,(cudaStream_t)s>>>((const uint8_t*)src,ss,(uint8_t*)dst,ds,n);return (int)cudaGetLastError();
+#endif
+}

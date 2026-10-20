@@ -37,6 +37,7 @@
 //                     session's whole pages past G6_RT_L (default G6_CP_R) go to a lease named after the boot and the
 //                     layout, and CP decode reads them through G6_RT_POOL (default 4096) resident slots per indexer group.
 //                     A prefill of the session (a later turn) and its retirement drop them back to the local copies.
+//                     G6_RT_FMT=int4: the lease holds the rows as INT4 (416 B for 656), turned back into FP8 after each fetch.
 //      [--kv-store STORE,size=N(G|T)[,keep=RULE]]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
 //                     (s2/kv_tier.cuh, kvman-rs src/stash.rs). A request that continues a stored entry reads its pages
 //                     back and skips their prefill. STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id
@@ -806,13 +807,15 @@ int main(int argc, char** argv)
             char host[64] = "host";
             gethostname(host, sizeof host - 1);
             const std::string fmt = kv_format.empty() ? g6kv::NAME : kv_format;
-            const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(g6nr::NR) + "-" + fmt + "-" +
-                                    rt_name_part(set_id);
+            const bool int4 = rt_fmt_int4();
+            const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(g6nr::NR) + "-" + fmt +
+                                    rt_fmt_name(int4) + "-" + rt_name_part(set_id);
             const std::string layout = "R=" + std::to_string(cp_R) + " L=" + std::to_string(L) + " nr=" + std::to_string(g6nr::NR) + " row=" +
-                                       g6kv::NAME + " model=" + rt_name_part(set_id) + " pages=" + std::to_string(m.layers[0].ab.args.page_count) +
-                                       " layers=" + std::to_string(m.nl);
+                                       g6kv::NAME + rt_fmt_layout(int4) + " model=" + rt_name_part(set_id) + " pages=" +
+                                       std::to_string(m.layers[0].ab.args.page_count) + " layers=" + std::to_string(m.nl);
             if (set_id.empty() && R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE without --set-id: the lease names no model set\n");
-            rtt = rt_build(m, rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag, layout, L, S, false, st);
+            rtt = rt_build(m, rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag, layout, L, S, false, int4,
+                           getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK")), st);
         }
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
@@ -1195,6 +1198,7 @@ int main(int argc, char** argv)
             if (R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE %s slot %d: %llu rows spilled, %llu dropped pages, %llu fetched, %llu read locally (no slot)\n",
                                 why, q, (unsigned long long)rtt->spilled, (unsigned long long)rtt->dropped,
                                 (unsigned long long)rt_fetched(*rtt), (unsigned long long)rt_local(*rtt));
+            if (R == 0 && rtt->check) rt_check_print("spilled rows, rank 0", rtt->spill_ck);
         };
         if (rtt)
         {

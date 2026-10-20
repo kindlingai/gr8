@@ -45,6 +45,8 @@
 //        attention reads them back through G6_RT_POOL (default 4096) resident slots per indexer group (rt_rows.cuh).
 //        The MTP layer keeps its own pages. With G6_S2_XLIST the run's pages are a shuffled pool list.
 //        The lines printed must be the run's without it. G6_RT_POISON=1 overwrites the local copies of those rows.
+//        G6_RT_FMT=int4: the records hold INT4 rows (416 B for 656; the lines then differ a little); G6_RT_CHECK=1 with
+//        it prints the latent SQNR of the FP8 -> INT4 -> FP8 round trip, of random rows and of every spilled row.
 // G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (needs --mtp): the split replicated GEMVs as g6m4 runs them (rank.cuh
 //        QSplit), each model's gathers on a loopback of their own: every rank's attention block (and the draft's eh_proj)
 //        runs in gather phases (rank.cuh QsPh) with the delivery between them. The lines must equal the run without them.
@@ -644,14 +646,17 @@ int main(int argc, char** argv)
         const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
         const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
         const bool poison = getenv("G6_RT_POISON") && atoi(getenv("G6_RT_POISON"));
+        const bool int4 = rt_fmt_int4();
+        const bool check = getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK"));
         // the model set: where the weights come from and which layers run
         const std::string src = packs + "|" + v2src.dense + "|" + v2src.dir + "|" + v2src.widths + "|" + layers_s;
         char model[17];
         snprintf(model, sizeof model, "%016llx", (unsigned long long)fnv(0xcbf29ce484222325ull, src.data(), src.size()));
-        const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(NR) + "-" + g6kv::NAME + "-" + model;
+        const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(NR) + "-" + g6kv::NAME +
+                                rt_fmt_name(int4) + "-" + model;
         const std::string layout = "R=" + std::to_string(cp_R) + " L=" + std::to_string(L) + " nr=" + std::to_string(NR) + " row=" + g6kv::NAME +
-                                   " model=" + model;
-        for (Model& m : R) rt[m.rank] = rt_build(m, rs, "m4sim-rt-" + tag, layout, L, S, poison, st);
+                                   rt_fmt_layout(int4) + " model=" + model;
+        for (Model& m : R) rt[m.rank] = rt_build(m, rs, "m4sim-rt-" + tag, layout, L, S, poison, int4, check, st);
 #else
         (void)rs;
         die("G6_RT_STORE needs a G6_CP build");
@@ -1928,6 +1933,8 @@ int main(int argc, char** argv)
     for (int r = 0; r < NR && rt[0]; ++r)
         fprintf(stderr, "# G6_RT_STORE rank %d: %llu rows spilled, %llu fetched, %llu read locally (no slot)\n", r,
                 (unsigned long long)rt[r]->spilled, (unsigned long long)rt_fetched(*rt[r]), (unsigned long long)rt_local(*rt[r]));
+    for (int r = 0; r < NR && rt[0]; ++r)
+        if (rt[r]->check) rt_check_print(("spilled rows, rank " + std::to_string(r)).c_str(), rt[r]->spill_ck);
     if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);

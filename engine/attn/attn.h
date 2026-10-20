@@ -20,6 +20,12 @@ struct G6RtGroup {
     unsigned long long base, rec;   // the group's first record in the store, record bytes
     int slots, rows, cap, hand, n;  // n: misses of the last resolve (the wait skips at 0)
     unsigned long long local;       // misses the pool had no room for: read from the local copy
+    // G6_RT_FMT=int4: the store's records hold INT4 rows (kvfmt.h int4row), and the helper reads them into stage + slot
+    // * rec; after the wait, rt_unpack turns them into the FP8 rows of slot (out + slot * nl * 656). nullptr: FP8 records,
+    // read straight into the slots
+    const unsigned char *stage;
+    unsigned char *out;
+    int nl;                         // layers in the group
 };
 struct G6Attn {
     int rows, heads, context, page_size, page_count, table_size, query_tile;
@@ -56,7 +62,12 @@ struct G6Attn {
     const unsigned char *rt_rows;
     G6RtGroup *rt_group;
     int rt_stride;
+    int rt_int4;                    // on rt_group's layer: its G6RtGroup has a stage (host-side dispatch of rt_unpack)
 };
+// Remote rows, G6_RT_FMT=int4 (runtime/rt_rows.cuh): n FP8 rows -> INT4 rows (spill) and back (tests); warp per row,
+// strides in bytes. cudaErrorNotSupported in a G6_KV4 build, whose rows are INT4 already.
+extern "C" int g6_rt_pack_int4(const void* src,size_t src_stride,void* dst,size_t dst_stride,int n,void* stream);
+extern "C" int g6_rt_unpack_int4(const void* src,size_t src_stride,void* dst,size_t dst_stride,int n,void* stream);
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
 extern "C" void (*g6_attn_mark)(int stage,void* stream);
 extern "C" int g6_attn_rope_init(int cap,void* stream);   // decode RoPE table when no QO attention builds it   // decode profile hook (attn.cu AMARK); null = off

@@ -317,6 +317,11 @@ mod tests {
         assert!(e.to_string().contains("R=1024 nr=4 row=fp8 model=a"), "{e}");
         assert!(s.layout("R=1024 nr=3 row=fp8 model=a").is_err());
         assert!(s.layout("R=1024 nr=4 row=int4g32h model=a").is_err());
+        assert!(s.layout("R=1024 nr=4 row=fp8 fmt=int4 model=a").is_err());
+        // G6_RT_FMT=int4 records: refused by an fp8 boot as well
+        let s = Store::open("mem:", "t", 2 * HEADER as u64).unwrap();
+        s.layout("R=1024 nr=4 row=fp8 fmt=int4 model=a").unwrap();
+        assert!(s.layout("R=1024 nr=4 row=fp8 model=a").is_err());
     }
 
     #[test]

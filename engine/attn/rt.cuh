@@ -78,3 +78,57 @@ __global__ void __launch_bounds__(32) rt_wait(const G6RtGroup* gp,unsigned* err)
         if((it&1023u)==0&&clock64()-t0>20000000000LL){atomicOr(err,0x20000u);return;}
     }
 }
+#if !G6_KV4
+// G6_RT_FMT=int4: the store's records hold rows in the INT4 layout (kvfmt.h int4row), while the pages and the slots stay
+// FP8, so no attention kernel changes. Warp per row; x[k] is dim lane + 32 k (fwht16's order), so a lane's x[k] has INT4
+// scale k and FP8 scale k / 4. The rope key is copied, 4 B a lane.
+namespace f8=g6kv::fp8row;namespace i4=g6kv::int4row;
+// FP8 -> f32 -> H x -> INT4 per 32 dims, as append_kv's G6_KV4 branch quantizes
+__device__ __forceinline__ void rt_pack_row(const uint8_t* s,uint8_t* d,int lane){
+    const float* sc=(const float*)(s+f8::SCALE_OFF);float x[16];
+    #pragma unroll
+    for(int k=0;k<16;k++)x[k]=e4(s[lane+32*k])*sc[k>>2];
+    fwht16(x,lane);
+    #pragma unroll
+    for(int k=0;k<16;k++){
+        half h;const int c=kv4_code(x[k]*HSCALE,h),hi=__shfl_down_sync(0xffffffff,c,1);
+        if(!(lane&1))d[(lane>>1)+16*k]=(uint8_t)(c|(hi<<4));
+        if(lane==0)((half*)(d+i4::SCALE_OFF))[k]=h;
+    }
+    ((uint32_t*)(d+i4::ROPE_OFF))[lane]=((const uint32_t*)(s+f8::ROPE_OFF))[lane];
+}
+// INT4 -> f32 -> H x (H is its own inverse) -> FP8 per 128 dims, as append_kv's FP8 branch quantizes
+__device__ __forceinline__ void rt_unpack_row(const uint8_t* s,uint8_t* d,int lane){
+    float x[16];
+    #pragma unroll
+    for(int k=0;k<16;k++){const int dd=lane+32*k;
+        x[k]=(float)(((s[dd>>1]>>((dd&1)*4))&15)-8)*__half2float(((const half*)(s+i4::SCALE_OFF))[k]);}
+    fwht16(x,lane);
+    float sc[4];
+    #pragma unroll
+    for(int g=0;g<4;g++){float m=0;
+        #pragma unroll
+        for(int k=4*g;k<4*g+4;k++){x[k]*=HSCALE;m=fmaxf(m,fabsf(x[k]));}
+        sc[g]=fp8_scale(warp_max(m));}
+    #pragma unroll
+    for(int k=0;k<16;k++)d[lane+32*k]=q4(x[k]/sc[k>>2]);
+    if(lane<4)((float*)(d+f8::SCALE_OFF))[lane]=lane==0?sc[0]:lane==1?sc[1]:lane==2?sc[2]:sc[3];
+    ((uint32_t*)(d+f8::ROPE_OFF))[lane]=((const uint32_t*)(s+i4::ROPE_OFF))[lane];
+}
+template<bool PACK>
+__global__ void __launch_bounds__(256) rt_convert(const uint8_t* src,size_t ss,uint8_t* dst,size_t ds,int n){
+    const int r=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(r>=n)return;
+    if(PACK)rt_pack_row(src+r*ss,dst+r*ds,lane);else rt_unpack_row(src+r*ss,dst+r*ds,lane);
+}
+// after rt_wait, before any scores: every row of the group's last request, stage -> slot (a fixed grid, for capture;
+// nothing to do when the resolve missed nothing)
+__global__ void __launch_bounds__(256) rt_unpack(const G6RtGroup* gp){
+    const G6RtGroup& g=*gp;const int n=g.n;if(!n)return;
+    const RtEnt* ent=(const RtEnt*)((const RtReq*)g.req+1);
+    const int lane=threadIdx.x&31,nw=gridDim.x*8;
+    for(int w=blockIdx.x*8+threadIdx.x/32;w<n*g.nl;w+=nw){
+        const int j=w/g.nl,l=w%g.nl;const size_t s=ent[j].slot;
+        rt_unpack_row(g.stage+s*g.rec+l*i4::ROW,g.out+(s*g.nl+l)*f8::ROW,lane);
+    }
+}
+#endif
