@@ -23,6 +23,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// One entry of a request ring (g6kv_rows_ent).
 #[repr(C)]
@@ -156,6 +157,16 @@ struct Group {
     slots: usize,
     rec: usize,
     cap: u32,
+    nslots: u32,
+}
+
+// an entry names a slot past the group's slots
+fn ents_bad(g: &Group, n: u32) -> bool {
+    if n > g.cap {
+        return true;
+    }
+    let ents = unsafe { std::slice::from_raw_parts((g.req + std::mem::size_of::<Req>()) as *const Ent, n as usize) };
+    ents.iter().any(|e| unsafe { std::ptr::read_volatile(e) }.slot >= g.nslots)
 }
 
 pub struct Rows {
@@ -177,19 +188,21 @@ impl Rows {
         }
     }
 
-    /// Adds a group before start. `req` holds a Req and `cap` entries, `done` a u64, `slots` the slots of `rec` bytes.
+    /// Adds a group before start. `req` holds a Req and `cap` entries, `done` a u64, `slots` `nslots` slots of `rec`
+    /// bytes.
     pub fn add_group(
         &mut self,
         req: *mut Req,
         done: *mut u64,
         slots: *mut u8,
         rec: usize,
+        nslots: u32,
         cap: u32,
     ) -> io::Result<usize> {
-        if self.thread.is_some() || req.is_null() || done.is_null() || slots.is_null() || rec == 0 {
+        if self.thread.is_some() || req.is_null() || done.is_null() || slots.is_null() || rec == 0 || nslots == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "rows group after start or with a null buffer"));
         }
-        self.groups.push(Group { req: req as usize, done: done as usize, slots: slots as usize, rec, cap });
+        self.groups.push(Group { req: req as usize, done: done as usize, slots: slots as usize, rec, cap, nslots });
         Ok(self.groups.len() - 1)
     }
 
@@ -223,9 +236,14 @@ impl Drop for Rows {
     }
 }
 
+/// How long the helper spins after its last request: longer than the gaps between one decode step's groups.
+const SPIN: Duration = Duration::from_millis(5);
+/// After this long without a request it sleeps 1 ms at a time instead of 50 us.
+const NAP_AFTER: Duration = Duration::from_secs(1);
+
 fn serve(groups: &[Group], mut seen: Vec<u64>, store: &Store, stop: &AtomicBool, fetched: &AtomicU64) {
     let mut ops: Vec<(u64, *mut u8, usize)> = Vec::new();
-    let mut idle = 0u32;
+    let mut last = Instant::now();
     while !stop.load(Ordering::Acquire) {
         let mut any = false;
         for (g, s) in groups.iter().zip(seen.iter_mut()) {
@@ -238,8 +256,11 @@ fn serve(groups: &[Group], mut seen: Vec<u64>, store: &Store, stop: &AtomicBool,
             *s = seq;
             let n = unsafe { std::ptr::read_volatile(&req.n) };
             let done = unsafe { &*(g.done as *const AtomicU64) };
-            if n > g.cap {
-                eprintln!("g6kv rows: a request of {n} entries, the ring holds {}", g.cap);
+            if n > g.cap || ents_bad(g, n) {
+                eprintln!(
+                    "g6kv rows: a request of {n} entries (the ring holds {}) or one past the {} slots",
+                    g.cap, g.nslots
+                );
                 done.store(u64::MAX, Ordering::Release);
                 continue;
             }
@@ -261,14 +282,17 @@ fn serve(groups: &[Group], mut seen: Vec<u64>, store: &Store, stop: &AtomicBool,
                 }
             }
         }
+        // spin through the gaps between one step's groups, then sleep: an idle engine costs no core
         if any {
-            idle = 0;
+            last = Instant::now();
         } else {
-            idle = idle.saturating_add(1);
-            if idle < 1 << 16 {
+            let quiet = last.elapsed();
+            if quiet < SPIN {
                 std::hint::spin_loop();
+            } else if quiet < NAP_AFTER {
+                std::thread::sleep(Duration::from_micros(50));
             } else {
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -306,7 +330,7 @@ mod tests {
             Box::new(Ring { h: Req { seq: AtomicU64::new(0), n: 0, pad: 0 }, e: [Ent { off: 0, slot: 0, pad: 0 }; 4] });
         let done = Box::new(AtomicU64::new(0));
         let mut slots = vec![0u8; 3 * rec];
-        rows.add_group(&mut ring.h, done.as_ptr(), slots.as_mut_ptr(), rec, 4).unwrap();
+        rows.add_group(&mut ring.h, done.as_ptr(), slots.as_mut_ptr(), rec, 3, 4).unwrap();
         rows.start();
         ring.e[0] = Ent { off: 7 * rec as u64, slot: 2, pad: 0 };
         ring.e[1] = Ent { off: 3 * rec as u64, slot: 0, pad: 0 };

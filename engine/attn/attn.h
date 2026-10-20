@@ -3,15 +3,13 @@
 #include <stdint.h>
 // C ABI for the rank driver and independent Python correctness harness.
 // All tensor pointers are device addresses. Scalar metadata is host-readable.
-// Remote attention rows (runtime/rt_rows.cuh): a block-table entry G6_RT_REMOTE is a page whose latent rows are read
-// from the resident slots of the layer's indexer group (G6Attn::rt_*), not from mla_cache. Index keys stay local and
-// are read through index_table.
-#define G6_RT_REMOTE (-3)
+// Remote attention rows (runtime/rt_rows.cuh): a physical page flagged in G6Attn::rt_page has its latent rows in the
+// resident slots of the layer's indexer group too; the local copy stays valid, so a row without a slot reads it.
 // One indexer group's resident slots (device memory). The group's full-index layer runs the resolve after its own
 // selection: hits stamp their slot, misses take slots (clock order from hand, never one used this step) and go to the
 // request ring, which the host helper serves (kvman-rs src/rows.rs). Its wait sits before the first scores.
 struct G6RtGroup {
-    int *pos2slot;                  // [rows] row index (rt index) -> slot, -1 absent, -2 claimed during a resolve
+    int *pos2slot;                  // [rows] row (physical page * 64 + pos % 64) -> slot, -1 absent, -2 claimed in a resolve
     int *slot2pos;                  // [slots] -> row index, -1 free
     unsigned long long *last;       // [slots] the step that last used the slot
     int *miss;                      // [cap] scratch: the row indices one resolve missed
@@ -21,6 +19,7 @@ struct G6RtGroup {
     unsigned long long seq;         // requests rung so far
     unsigned long long base, rec;   // the group's first record in the store, record bytes
     int slots, rows, cap, hand, n;  // n: misses of the last resolve (the wait skips at 0)
+    unsigned long long local;       // misses the pool had no room for: read from the local copy
 };
 struct G6Attn {
     int rows, heads, context, page_size, page_count, table_size, query_tile;
@@ -49,13 +48,14 @@ struct G6Attn {
     // G6AttnStep::s2_batched. Host-side dispatch only (the cell is device data): picks the fixed-K decode kernels.
     int s2_batched;
 #endif
-    // Remote rows (G6_RT_REMOTE pages): row index of pos = ((pos / 64 - rt_L / 64) / max(cp_nr, 1)) * 64 + pos % 64,
-    // rt_table[row index] = its slot, the slot's row at rt_rows + slot * rt_stride. rt_table nullptr = off. rt_group: set
-    // on the group's full-index layer, which runs the resolve and the wait (CP decode).
+    // Remote rows: physical page p with rt_page[p] != 0 reads row p * 64 + pos % 64 from its slot rt_table[row] (>= 0),
+    // at rt_rows + slot * rt_stride; -1 = the local row. rt_page nullptr = off. rt_group: set on the group's full-index
+    // layer, which runs the resolve and the wait (CP decode).
+    const unsigned char *rt_page;
     const int *rt_table;
     const unsigned char *rt_rows;
     G6RtGroup *rt_group;
-    int rt_L, rt_stride;
+    int rt_stride;
 };
 extern "C" size_t g6_attn_scratch_bytes(const G6Attn*);
 extern "C" void (*g6_attn_mark)(int stage,void* stream);

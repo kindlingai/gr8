@@ -1872,6 +1872,7 @@ inline void cp_pf_enter(Model& m)
         G6Attn& a = m.layers[i].ab.args;
         m.cp.pf_saved.push_back(a);
         a.mla_cache = m.cp.pf_pool[(m.cp.pf_g0 + i) % 2]; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
+        a.rt_page = nullptr; a.rt_group = nullptr;   // the staging pool's pages are not the pool's: no remote rows here
         if (m.cp.pf_ixon && a.index_cache) a.index_cache = (char*)a.mla_cache + m.cp.pf_ixoff;   // the staged index keys
 #ifdef DEC_S2
         // S2 below R: the decode views read the run's index keys through its table, so the staged view does too

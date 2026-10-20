@@ -40,9 +40,10 @@
 //        poisoned, and come back. The lines printed must be the run's without it. Past G6_CP_R the reused rows go as the
 //        pool stores a run's tail: each rank's shard of the attention caches, and every logical page's replicated parts
 //   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
-// G6_RT_STORE=mem:|remote:HOST:PORT (G6_CP on; no --mtp, --s2, --reuse-prefix, --serve, --minv): every rank's rows
-//        past G6_RT_L (default G6_CP_R) go to a rows store once their page is whole (before each decode step), and
+// G6_RT_STORE=mem:|remote:HOST:PORT (G6_CP on; no --s2, --reuse-prefix, --serve, --minv): every rank's rows
+//        past G6_RT_L (default G6_CP_R) go to a rows store once their page is whole (before each target step), and
 //        attention reads them back through G6_RT_POOL (default 4096) resident slots per indexer group (rt_rows.cuh).
+//        The MTP layer keeps its own pages. With G6_S2_XLIST the run's pages are a shuffled pool list.
 //        The lines printed must be the run's without it. G6_RT_POISON=1 overwrites the local copies of those rows.
 // G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (needs --mtp): the split replicated GEMVs as g6m4 runs them (rank.cuh
 //        QSplit), each model's gathers on a loopback of their own: every rank's attention block (and the draft's eh_proj)
@@ -624,11 +625,22 @@ int main(int argc, char** argv)
     for (Draft& D : DR) D.d.nc = nc;
     // G6_RT_STORE (header): before any prepare, which copies the bindings' arguments into the replay entries
     std::vector<std::unique_ptr<RtTier>> rt(NR);
+    // one sequence on the layers' own tables (the CP map as built, or G6_S2_XLIST's): read them before each spill
+    auto rt_spill_all = [&](int committed) {
+        if (!rt[0]) return;
+        for (Model& m : R)
+        {
+            std::vector<int> map(m.layers[0].ab.args.table_size);
+            G6RT_CK(cudaStreamSynchronize(st));
+            G6RT_CK(cudaMemcpy(map.data(), m.layers[0].ab.args.block_table, map.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            rt_spill(m, *rt[m.rank], map, committed, 0, st);
+        }
+    };
     if (const char* rs = getenv("G6_RT_STORE"))
     {
 #if defined(G6_CP) && G6_CP
-        if (!cp_on || mtp || s2mode || reuse || !serve.empty() || minv >= 0)
-            die("G6_RT_STORE needs G6_CP on, and no --mtp, --s2, --reuse-prefix, --serve or --minv");
+        if (!cp_on || s2mode || reuse || !serve.empty() || minv >= 0)
+            die("G6_RT_STORE needs G6_CP on, and no --s2, --reuse-prefix, --serve or --minv");
         const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
         const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
         const bool poison = getenv("G6_RT_POISON") && atoi(getenv("G6_RT_POISON"));
@@ -1608,6 +1620,7 @@ int main(int argc, char** argv)
         }
         if (!skip)
         {
+            if (rt[0]) for (Model& m : R) rt_drop_slot(*rt[m.rank], 0, st);
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
             if (getenv("G6_S2_XLIST"))            // xlist gate: clear the run only (s2_reset_pages, its classes)
             {
@@ -1626,7 +1639,6 @@ int main(int argc, char** argv)
             {
                 for (Model& m : R) reset(m, st);
                 for (Draft& D : DR) reset(D.d, st);
-                if (rt[0]) for (Model& m : R) rt_reset(m, *rt[m.rank], st);
             }
         }
         if (p.first < skip) p.first = skip;
@@ -1798,6 +1810,7 @@ int main(int argc, char** argv)
         {
             StepOut so[NR], sd[NR];
             auto rm = [&](const StepIn& si, int s, double& ms) {
+                rt_spill_all(si.pos[0]);
                 ms += run_main(si, so);
                 if (rlf) route_log_line(rlf, R[0], layers, q, s, si.M, si.pos[0], p.prompt.size());
                 lines("step", false, so, s, si.M);
@@ -1843,7 +1856,7 @@ int main(int argc, char** argv)
         {
             const int M = step_rows(p, s);
             const StepIn si = step_inputs(p, s, last_tok, step0);
-            if (rt[0]) for (Model& m : R) rt_spill(m, *rt[m.rank], si.pos[0], st);
+            rt_spill_all(si.pos[0]);
             const int k = bucket(si.context, false);
             if (!ready[k][M])
             {
@@ -1913,8 +1926,8 @@ int main(int argc, char** argv)
     }
     if (mtp) mtp_stats.print(mtp, "six ranks in turn");
     for (int r = 0; r < NR && rt[0]; ++r)
-        fprintf(stderr, "# G6_RT_STORE rank %d: %llu rows spilled, %llu fetched\n", r, (unsigned long long)rt[r]->spilled,
-                (unsigned long long)rt_fetched(*rt[r]));
+        fprintf(stderr, "# G6_RT_STORE rank %d: %llu rows spilled, %llu fetched, %llu read locally (no slot)\n", r,
+                (unsigned long long)rt[r]->spilled, (unsigned long long)rt_fetched(*rt[r]), (unsigned long long)rt_local(*rt[r]));
     if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);

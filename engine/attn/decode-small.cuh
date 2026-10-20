@@ -509,8 +509,8 @@ static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cuda
 }
 // G6_ATTN_CTX3 (attn.cu attn_ctx3): context_pk3 on the context_parts_heads calls; head group G6_ATTN_CTX3_HG, else as there.
 // Only while every KV row index fits in 32 bits (page() bounds a page by the fixed page_count).
-// Not with remote rows: their rows sit outside mla_cache.
-static bool use_ctx3(const G6Attn& a){return attn_ctx3()&&!a.rt_table&&(int64_t)a.page_count*a.page_size<=INT_MAX;}
+// Not with remote rows: their slots sit outside mla_cache.
+static bool use_ctx3(const G6Attn& a){return attn_ctx3()&&!a.rt_page&&(int64_t)a.page_count*a.page_size<=INT_MAX;}
 template<int HG,class Input>
 static void launch_ctx3_hg(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
  const int y=(a.heads+HG-1)/HG;

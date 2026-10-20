@@ -755,8 +755,8 @@ pub unsafe extern "C" fn g6kv_rows_register(r: *const crate::rows::Rows, p: *mut
     }
 }
 
-/// Adds a group before g6kv_rows_start: its request ring (a g6kv_rows_req and `cap` entries), done word and slots of
-/// `rec` bytes each. Returns the group's index, or -1 with g6kv_tier_error.
+/// Adds a group before g6kv_rows_start: its request ring (a g6kv_rows_req and `cap` entries), done word and `nslots`
+/// slots of `rec` bytes each. Returns the group's index, or -1 with g6kv_tier_error.
 ///
 /// # Safety
 /// `r` must be live; the buffers must outlive it and stay mapped while its thread runs.
@@ -767,9 +767,10 @@ pub unsafe extern "C" fn g6kv_rows_group(
     done: *mut u64,
     slots: *mut u8,
     rec: usize,
+    nslots: u32,
     cap: u32,
 ) -> i32 {
-    match (*r).add_group(req, done, slots, rec, cap) {
+    match (*r).add_group(req, done, slots, rec, nslots, cap) {
         Ok(i) => i as i32,
         Err(e) => crate::blocks::fail(e),
     }

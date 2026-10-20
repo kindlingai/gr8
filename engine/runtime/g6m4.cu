@@ -33,6 +33,10 @@
 //                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
 //                     Under S2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
+//      G6_RT_STORE=mem:|remote:HOST:PORT (environment; --serve with G6_CP): remote attention rows (rt_rows.cuh). A
+//                     session's whole pages past G6_RT_L (default G6_CP_R) go to a lease named after the boot and the
+//                     layout, and CP decode reads them through G6_RT_POOL (default 4096) resident slots per indexer group.
+//                     A prefill of the session (a later turn) and its retirement drop them back to the local copies.
 //      [--kv-store STORE,size=N(G|T)]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
 //                     (s2/kv_tier.cuh, kvman-rs src/stash.rs). A request that continues a stored entry reads its pages
 //                     back and skips their prefill. STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id
@@ -92,6 +96,7 @@
 #include "s2/native.cuh"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
+#include "rt_rows.cuh"
 #include "host_reclaim.h"
 #include <filesystem>
 #include <unistd.h>
@@ -117,7 +122,6 @@ int main(int argc, char** argv)
     };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
-    if (getenv("G6_RT_STORE")) die("G6_RT_STORE: remote attention rows run in m4sim only so far");
     std::string progress_err;          // G6_PROGRESS_ISOLATE: other threads stay off the proxy CPUs (progress_cpus.h)
     const int progress_isolate = env_choice("G6_PROGRESS_ISOLATE", 1, 1, &progress_err);
     if (progress_isolate < 0) die(progress_err);
@@ -248,6 +252,8 @@ int main(int argc, char** argv)
     }
     if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    if (getenv("G6_RT_STORE") && !s2mode) die("G6_RT_STORE needs --serve (S2 below R with G6_CP on)");
+    if (getenv("G6_RT_POISON")) die("G6_RT_POISON is an m4sim test: g6m4 reads the local copy of a row without a slot");
     steering::PreparedBoot steering_prepared;
     try {
         if (!steering_dir.empty() && !hash) die("--steering-profile requires weight hash checks");
@@ -778,6 +784,7 @@ int main(int argc, char** argv)
     // S2: below R on the CP binding. Session views on the pool, main and draft; today's graphs below
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
     int s2_below = 0;
+    std::unique_ptr<RtTier> rtt;       // G6_RT_STORE (rt_rows.cuh); null = off
     if (s2mode)
     {
 #if defined(G6_CP) && G6_CP
@@ -788,6 +795,23 @@ int main(int argc, char** argv)
         die("S2: serving needs the CP binding (a G6_CP build)");
 #endif
         m.s2_below = D.d.s2_below = s2_below;
+        // G6_RT_STORE: on the main model's bindings before s2_init and any prepare copy their arguments
+        if (const char* rs = getenv("G6_RT_STORE"))
+        {
+            const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
+            const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
+            if (s2_below != cp_R) die("G6_RT_STORE needs G6_S2_BELOW = G6_CP_R (runs past R on the pool's page classes)");
+            char host[64] = "host";
+            gethostname(host, sizeof host - 1);
+            const std::string fmt = kv_format.empty() ? g6kv::NAME : kv_format;
+            const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(g6nr::NR) + "-" + fmt + "-" +
+                                    rt_name_part(set_id);
+            const std::string layout = "R=" + std::to_string(cp_R) + " L=" + std::to_string(L) + " nr=" + std::to_string(g6nr::NR) + " row=" +
+                                       g6kv::NAME + " model=" + rt_name_part(set_id) + " pages=" + std::to_string(m.layers[0].ab.args.page_count) +
+                                       " layers=" + std::to_string(m.nl);
+            if (set_id.empty() && R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE without --set-id: the lease names no model set\n");
+            rtt = rt_build(m, rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag, layout, L, S, false, st);
+        }
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
         m.s2on = D.d.s2on = false;
@@ -1155,6 +1179,41 @@ int main(int argc, char** argv)
                 return c | p;
             },
             [&](unsigned long long step, int rows) { qsd_enqueue(step, rows); }};
+        // G6_RT_STORE: slot q's logical page -> this rank's physical page while it holds a run past R (its CP map over
+        // its list, or the tables as built), cached per run; nullptr = no run past R
+        std::vector<int> rt_run[g6s2::MAX_SESSIONS], rt_map[g6s2::MAX_SESSIONS];
+        bool rt_split[g6s2::MAX_SESSIONS] = {};
+        auto rt_slot_map = [&](int q) -> const std::vector<int>* {
+            const S2Model& s = *m.s2;
+            if (q < 0 || q >= s.nslots || !s.exclusive[q]) return nullptr;
+            if (!s.ex_split[q]) return &s.tab0[0];
+            if (!rt_split[q] || rt_run[q] != s.run[q])
+            {
+                rt_map[q] = s2_cp_map(s, s.pool[0]->args, s.run[q], m.s2_below / 64, (size_t)s.table_cap);
+                rt_run[q] = s.run[q]; rt_split[q] = true;
+            }
+            return &rt_map[q];
+        };
+        auto rt_log = [&](const char* why, int q) {
+            if (R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE %s slot %d: %llu rows spilled, %llu dropped pages, %llu fetched, %llu read locally (no slot)\n",
+                                why, q, (unsigned long long)rtt->spilled, (unsigned long long)rtt->dropped,
+                                (unsigned long long)rt_fetched(*rtt), (unsigned long long)rt_local(*rtt));
+        };
+        if (rtt)
+        {
+            nx.before_main = [&](const StepIn& in, const S2In& h) {
+                for (int j = 0; j < h.ns; ++j)
+                    if (const std::vector<int>* mp = rt_slot_map(h.sess[j])) rt_spill(m, *rtt, *mp, in.pos[h.row0[j]], h.sess[j], st);
+            };
+            // a later turn's prefill writes and reads the session's KV on the paths that read the local pages
+            nx.before_prefill = [&](const g6s2::Slot& sl) {
+                const int q = (int)sl.key.slot;
+                bool any = false;
+                for (int o : rtt->owner) any = any || o == q;
+                rt_drop_slot(*rtt, q, st);
+                if (any) rt_log("prefill of", q);
+            };
+        }
         try
         {
             g6s2::NativeDispatch nd(nx, sc);
@@ -1196,6 +1255,7 @@ int main(int argc, char** argv)
                     std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
                 }
                 const int q = (int)g.key.slot;
+                if (rtt) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); }   // a new run's pages are local
                 slot_prompt[q] = g.req.prompt_tokens;
                 slot_whole[q] = dfl_reuse && g.reuse + 1 == g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
@@ -1237,6 +1297,8 @@ int main(int argc, char** argv)
             h.grown = [&](unsigned q, const g6s2::Run& r) {
                 kv_drain();   // runs the growth evicted, out before the zeroing below
                 const std::vector<int> list = pool.list(r);
+                if (rtt && list.size() > m.s2->run[q].size())   // the new pages are cleared: none may stay flagged
+                    rt_drop(*rtt, std::vector<int>(list.begin() + m.s2->run[q].size(), list.end()), st);
                 for (Model* x : {&m, &D.d})
                 {
                     const std::vector<int> old = x->s2->run[q];
@@ -1247,7 +1309,10 @@ int main(int argc, char** argv)
                 }
                 G6RT_CK(cudaStreamSynchronize(st));
             };
-            h.retire = [&](const g6s2::Slot& old) { nd.retire(old); };
+            h.retire = [&](const g6s2::Slot& old) {
+                if (rtt) { rt_drop_slot(*rtt, (int)old.key.slot, st); rt_log("retire of", (int)old.key.slot); }   // retained runs stay local
+                nd.retire(old);
+            };
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
             h.dispatch = nd.hooks();

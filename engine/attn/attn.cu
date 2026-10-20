@@ -160,19 +160,12 @@ __device__ int page(const DeviceAttn& a,int pos){
     if(pos<0 || pos>=a.live_context || pos/a.page_size>=a.table_size){error(a,1);return -1;}
     int p=a.block_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;
 }
-// remote rows (G6_RT_REMOTE): a page's row index in its group's tables
-__device__ __forceinline__ int rt_index(const G6Attn& a,int pos){
-    const int lp=pos/a.page_size-a.rt_L/a.page_size;return (a.cp_nr?lp/a.cp_nr:lp)*a.page_size+pos%a.page_size;
-}
-// page()'s checks and errors, except that a G6_RT_REMOTE page reads its row from the group's resident slot (error 64:
-// the row is not resident)
+// page()'s checks and errors; a page flagged remote reads its row from the group's resident slot when it has one
 __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
-    if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return nullptr;}
-    const int p=a.block_table[pos/a.page_size];
-    if(p>=0&&p<a.page_count)return (const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*KV_BYTES;
-    if(p==G6_RT_REMOTE&&a.rt_table){const int s=a.rt_table[rt_index(a,pos)];
-        if(s>=0)return a.rt_rows+(int64_t)s*a.rt_stride;error(a,64);return nullptr;}
-    error(a,2);return nullptr;
+    int p=page(a,pos);if(p<0)return nullptr;
+    const int64_t row=(int64_t)p*a.page_size+pos%a.page_size;
+    if(a.rt_page&&a.rt_page[p]){const int s=a.rt_table[row];if(s>=0)return a.rt_rows+(int64_t)s*a.rt_stride;}
+    return (const uint8_t*)a.mla_cache+row*KV_BYTES;
 }
 #if defined(G6_CP) && G6_CP
 // CP: index keys are stored as the latent: on the pages of the block table (the replicated prefix, then this rank's
