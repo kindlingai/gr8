@@ -322,6 +322,10 @@ class KvStoreTests(unittest.TestCase):
                          [('ssd', '/nvme/gr8kv', None, None, '200G'), ('remote', None, '192.0.2.5', '7350', '8G')])
         self.assertEqual([x['persist'] for x in t], [False, False], 'an SSD store starts empty unless persist=on')
         self.assertTrue(opt.kv_stores(self.plan('--kv-store', a + ',persist=on')[0])[0]['persist'])
+        # a store's own keep= reaches the engine as written; the others take --kv-keep
+        o, p = self.plan('--kv-store', a + ',persist=on,keep=system', '--kv-store', b + ',keep=all')
+        self.assertEqual(self.stores(p), [a + ',persist=on,keep=system', b + ',keep=all'])
+        self.assertEqual([x['keep'] for x in opt.kv_stores(o)], ['system', 'all'])
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
@@ -347,7 +351,7 @@ class KvStoreTests(unittest.TestCase):
     def test_refusals(self):
         v = ValidateTests()
         for argv, want in ((['--kv-store', 'nvme:/x,size=8G'], 'the store is'), (['--kv-store', 'ssd:/x'], 'size=N'),
-                           (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=all'], '--kv-keep'),
+                           (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=most'], 'keep=system, sessions or all'),
                            (['--kv-store', 'remote:192.0.2.5:7350,size=8G,persist=on'], 'for ssd:'),
                            (['--kv-store', 'ssd:/x,size=8G,persist=yes'], 'persist=on|off'),
                            (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),

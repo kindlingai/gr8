@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-20: each KV store can keep its own kind (`keep=`)
+
+- `--kv-store STORE,size=N,keep=system|sessions|all` sets what that store keeps; a store without `keep=` takes
+  `--kv-keep`. Placement already went to the first store that takes an entry's kind, so
+  `ssd:...,persist=on,keep=system;remote:auto,size=4G,keep=all` keeps system prompts on the SSD across restarts and
+  every other evicted run on the KV node. Before, every store took `--kv-keep`, and the deprecated `--kv-tier`'s
+  per-tier `keep=` was parsed and then ignored.
+- On the TP=4 cluster with that config: a 153,580-token session evicted to the KV node came back in 4.1 s (136 s
+  cold), each rank restoring 2,872 pages (its first 32,768 tokens and its shard of the tail) in 0.55 s.
+- `docs/kv-tiers.svg` draws the tiers: replicated below `SHARE_LIMIT`, sharded past it, and the stores below the pool.
+
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)

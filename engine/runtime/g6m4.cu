@@ -37,7 +37,7 @@
 //                     session's whole pages past G6_RT_L (default G6_CP_R) go to a lease named after the boot and the
 //                     layout, and CP decode reads them through G6_RT_POOL (default 4096) resident slots per indexer group.
 //                     A prefill of the session (a later turn) and its retirement drop them back to the local copies.
-//      [--kv-store STORE,size=N(G|T)]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
+//      [--kv-store STORE,size=N(G|T)[,keep=RULE]]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
 //                     (s2/kv_tier.cuh, kvman-rs src/stash.rs). A request that continues a stored entry reads its pages
 //                     back and skips their prefill. STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id
 //                     its system prefixes and their counts survive restarts) or remote:HOST:PORT (a lease on a KV node,
@@ -46,7 +46,9 @@
 //                     definitions (the span the front end sends, else every grid cell) that --kv-system-after N
 //                     conversations started with (default 2), once each. sessions: those, plus the runs the pool evicts
 //                     that continued their conversation at least once, stored on the system prefix they start with.
-//                     all: every run the pool evicts (benchmarks)
+//                     all: every run the pool evicts (benchmarks). A store's keep=system|sessions|all overrides it for
+//                     that store: ssd:...,keep=system then remote:...,keep=all puts system prefixes on the SSD and
+//                     evicted runs on the KV node
 //      [--kv-write-limit F]  the stores write at most F page blocks per page of KV the engine computes (off by default)
 //      [--kv-tier STORE,size=N[,keep=evicted|shared|all]] [--kv-shared-after N]  deprecated: --kv-store, with --kv-keep
 //                     all when any keep is evicted or all, else system; --kv-system-after N
@@ -969,11 +971,9 @@ int main(int argc, char** argv)
         }
         // --kv-store: block stores below the pool, in flag order, the same number of blocks on every rank. An SSD store lives in
         // PATH/r<rank>; its system prefixes and the counts survive restarts (their index needs --set-id: the blocks belong to
-        // one model). --kv-keep sets each store's keep rule and policy (kvman-rs stash.rs Keep, Policy)
+        // one model). A store's keep=, else --kv-keep, sets its keep rule and policy (kvman-rs stash.rs Keep, Policy)
         std::unique_ptr<g6s2::KvTiers> kvt;
         bool kv_index = false;
-        const int kv_keep_rule = kv_keep == "system" ? 1 : 2;           // shared prefixes, or those and evicted runs
-        const uint32_t kv_min_hits = kv_keep == "sessions" ? 1 : 0;
         if (!kv_tiers.empty())
         {
             std::vector<const G6AttnBinding*> bs;
@@ -1020,11 +1020,12 @@ int main(int argc, char** argv)
                         + " kv " + g6kv::NAME   // the latent row's layout (kvfmt.h); the FP8 row keeps the old key
 #endif
                         ;
-                    pool.add_tier(slots, kv_keep_rule, index, compat);
-                    pool.policy((uint32_t)i, 0, kv_min_hits, kvt->blocks().slot_bytes());
+                    const std::string& keep = t.rule.empty() ? kv_keep : t.rule;
+                    pool.add_tier(slots, keep == "system" ? 1 : 2, index, compat);   // shared prefixes, or those and evicted runs
+                    pool.policy((uint32_t)i, 0, keep == "sessions" ? 1 : 0, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();
-                    fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B%s\n", R, i, kvt->describe(i).c_str(),
-                            (unsigned long long)slots, kvt->blocks().slot_bytes(), index.empty() ? "" : ", indexed");
+                    fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B, keep %s%s\n", R, i, kvt->describe(i).c_str(),
+                            (unsigned long long)slots, kvt->blocks().slot_bytes(), keep.c_str(), index.empty() ? "" : ", indexed");
                 }
                 pool.write_limit((uint64_t)std::llround(kv_write_limit * 1000));
                 // a run past R keeps its tail: each rank's shard and the replicated parts (only when the pool's R is the CP
@@ -1033,7 +1034,7 @@ int main(int argc, char** argv)
             }
             catch (const std::exception& e) { die(std::string("--kv-store: ") + e.what()); }
             if (R == 0)
-                fprintf(stderr, "# s2 stores keep %s: a system prefix is stored after %d conversations%s\n", kv_keep.c_str(), kv_system_after,
+                fprintf(stderr, "# s2 stores: keep %s where a store sets none, a system prefix is stored after %d conversations%s\n", kv_keep.c_str(), kv_system_after,
                         kv_write_limit > 0 ? (", write limit " + std::to_string(kv_write_limit) + " blocks per page computed").c_str() : "");
         }
         // the copies the pool queued: run them before anything writes those pages, then commit what they wrote

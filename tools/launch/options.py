@@ -424,7 +424,7 @@ def deprecated_kv(values, origin, warnings):
 
 def kv_stores(o):
     """KV_STORE parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size',
-    'persist'}] ([] when unset or off). Raises OptionError naming the bad store."""
+    'persist', 'keep'}] ([] when unset or off; keep None = KV_KEEP). Raises OptionError naming the bad store."""
     v = o.get('KV_STORE')
     if v in (None, 'off'):
         return []
@@ -435,7 +435,7 @@ def kv_stores(o):
         if not m or (store.startswith('remote:auto') and m.group(2)):
             raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
         t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
-             'host': None, 'port': None, 'size': None, 'persist': False}
+             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
         else:
@@ -449,9 +449,11 @@ def kv_stores(o):
                     raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
                 t['persist'] = x == 'on'
             elif k == 'keep':
-                raise OptionError(f'--kv-store {text}: what the stores keep is --kv-keep system|sessions|all')
+                if x not in ('system', 'sessions', 'all'):
+                    raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
+                t['keep'] = x
             else:
-                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T) or persist=on|off')
+                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off or keep=RULE')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
         out.append(t)
