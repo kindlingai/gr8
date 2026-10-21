@@ -193,14 +193,26 @@ class Service {
                 const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
                 unsigned live = s.resident();
                 const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
-                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.fits(rows, worst), native_.pool.room());
+                // a prompt that continues a retained run fits when the hit does (match checks the room the hit needs, with
+                // the run's own pages and records counted as its own), even when a fresh run of it would not
+                const auto pr0 = prompts_.find(request->id);
+                PoolHit pre{};
+                if (reuse() && pr0 != prompts_.end())
+                    pre = native_.pool.match(pr0->second, rows, worst, int(request->prompt_tokens) - 1,
+                                             g6rt::steering::cache_namespace(request->steering));
+                const bool fits = pre.skip > 0 || native_.pool.fits(rows, worst);
+                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
-                if (fit->why == Stall::Capacity && native_.pool.refusal && refused_ != request->id)
-                    if (const std::string why = native_.pool.refusal(worst); !why.empty()) {
-                        refused_ = request->id;   // once per request
-                        fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
-                                (unsigned long long)worst, why.c_str());
-                    }
+                if (fit->why == Stall::Capacity && refused_ != request->id) {
+                    refused_ = request->id;   // once per request
+                    if (reuse() && pr0 != prompts_.end())
+                        fprintf(stderr, "# s2 reuse request %llu waits: %s retained %d lcp %d prompt %u\n", (unsigned long long)request->id,
+                                pre.why, pre.skip, pre.lcp, request->prompt_tokens);
+                    if (native_.pool.refusal)
+                        if (const std::string why = native_.pool.refusal(worst); !why.empty())
+                            fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
+                                    (unsigned long long)worst, why.c_str());
+                }
                 if (fit->why == Stall::None) {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);

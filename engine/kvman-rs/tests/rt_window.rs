@@ -102,7 +102,7 @@ fn the_lease_counts_a_retained_window_runs_records() {
     let a = p.reserve(worst, worst).unwrap();
     p.retain(&a, done(40, 3)).unwrap();
     assert_eq!(p.ids_free(), Some(4), "a retained window run keeps its records");
-    assert!(!p.fits(worst, worst), "a fresh 40-page run needs 8 more than the 4 free");
+    assert_eq!(p.ids_room(), Some(12), "which a grant that needs them may evict");
     // its own next turn takes them over: 8 of its own plus 1 of the free
     let mut prompt = hist(40 * 64 - 1, 3);
     prompt.extend([5, 6, 7]);
@@ -240,4 +240,60 @@ fn a_session_past_r_waits_for_its_share_of_the_slots() {
     e.tail(4, 0);
     e.window(4, 0, 2).unwrap();
     assert_ne!(d, e.digest(), "the digest names the limit");
+}
+
+// the cluster's two-turn conversation: --cap 655360 (10,240 pages), place 900, R = 32,768 (512 pages), window 40, a
+// lease of 2,343 records a rank, 4 ranks
+fn cluster() -> Pool {
+    let mut p = Pool::new(655_360 / 64, 900, 512 * 64).unwrap();
+    p.keep(RULES);
+    p.tail(4, 0);
+    p.window(40, 2343, 1).unwrap();
+    p
+}
+
+fn turn(rows: usize, salt: i32) -> Finished {
+    Finished { history: hist(rows, salt), valid: (rows - 1) as i32, written_end: rows as i32, pf_end: (rows - 1) as i32 }
+}
+
+#[test]
+fn the_cluster_second_turn_adopts_the_first() {
+    let mut p = cluster();
+    // turn 1: a 444,913-token prompt and 32 tokens, its worst case with the guard
+    let w1 = 444_913 + 32 + 16;
+    let a = p.reserve(w1, w1).unwrap();
+    assert_eq!(p.ids_room(), Some(2343 - (w1.div_ceil(PAGE) - 512).div_ceil(4)));
+    p.retain(&a, turn(444_913 + 32, 7)).unwrap();
+    assert_eq!(p.kept_runs(), 1);
+    // turn 2: that prompt, its reply and a new line, 445,007 rows at worst. A fresh run of it would need 1,611
+    // records a rank of the 732 free; the hit counts the retained run's as its own, so it is admitted
+    let mut prompt = hist(444_913 + 32, 7);
+    prompt.extend([9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+    let w2 = 445_007u64;
+    assert_eq!(p.ids_free(), Some(732), "the log's count: the retained run holds the rest");
+    let h = p.match_prefix(&prompt, w2, w2, prompt.len() as i32 - 1);
+    assert_eq!(h.why, Why::Hit, "{h:?}");
+    assert!(h.skip as usize >= 444_913 + 31 - 64, "{h:?}");
+    let r = p.take_hit(h.skip, h.age, None, w2, w2).unwrap();
+    assert_eq!(r.pages as u64, w2.div_ceil(PAGE) + 40);
+    assert_eq!(p.kept_runs(), 0);
+    assert_eq!(p.ids_free(), Some(2343 - (w2.div_ceil(PAGE) - 512).div_ceil(4)));
+}
+
+#[test]
+fn a_fresh_request_evicts_retained_runs_for_their_records() {
+    let mut p = cluster();
+    let w1 = 444_913 + 32 + 16;
+    let a = p.reserve(w1, w1).unwrap();
+    let old = p.list(&a).unwrap().to_vec();
+    p.retain(&a, turn(444_913 + 32, 7)).unwrap();
+    // a different long conversation: its records are free only if the retained run goes, so it fits, and its grant
+    // evicts the retained run (which nothing else would ever evict: its pages are not needed)
+    let w2 = 445_007u64;
+    assert!(p.fits(w2, w2));
+    assert_eq!(p.split_view(w2).map(|v| v.0), Some(552));
+    let b = p.reserve(w2, w2).unwrap();
+    assert!(!p.is_kept(&old) && p.kept_runs() == 0, "the retained run was evicted for its records");
+    assert_eq!(p.ids_free(), Some(2343 - (w2.div_ceil(PAGE) - 512).div_ceil(4)));
+    p.release(&b).unwrap();
 }

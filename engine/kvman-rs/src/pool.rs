@@ -475,6 +475,22 @@ impl Pool {
         (self.ids > 0).then(|| (self.ids as u64).saturating_sub(self.held.values().map(|h| self.ids_of(h)).sum::<u64>() + kept))
     }
 
+    /// With window and a lease limit: the records no live window run holds. Retained window runs' records count as
+    /// free here, as their pages do: a grant that needs them evicts those runs, the least recently retired first.
+    pub fn ids_room(&self) -> Option<u64> {
+        (self.ids > 0).then(|| (self.ids as u64).saturating_sub(self.held.values().map(|h| self.ids_of(h)).sum::<u64>()))
+    }
+
+    // a grant whose tail needs `need` records a rank: the retained window runs to evict, oldest first, so they fit
+    fn evict_for_ids(&mut self, need: u64) -> Vec<Kept> {
+        let mut gone = Vec::new();
+        while self.ids_free().is_some_and(|f| f < need) {
+            let Some(i) = self.kept.iter().position(|k| self.kept_ids(k) > 0) else { break };
+            gone.push(self.kept.remove(i));
+        }
+        gone
+    }
+
     // a retained window run: the records it keeps, as ids_of counts a live one
     fn kept_ids(&self, k: &Kept) -> u64 {
         if !k.exclusive || self.window == 0 {
@@ -510,7 +526,7 @@ impl Pool {
         if !self.exclusive(worst) || d > draft {
             return false;
         }
-        let ids_ok = self.ids_free().map_or(true, |f| draft.div_ceil(self.nr as u64) <= f + self.kept_ids(k));
+        let ids_ok = self.ids_room().map_or(true, |f| draft.div_ceil(self.nr as u64) <= f);
         let runs_ok = self.runs == 0 || self.window_runs() < self.runs;
         !self.exclusive
             && ids_ok
@@ -531,13 +547,13 @@ impl Pool {
     }
 
     /// For a window request of `worst` rows past R with a lease limit: the records its tail needs per rank, and the
-    /// records free now and in all. None otherwise.
+    /// records it can have (free, or held by retained runs it would evict) and in all. None otherwise.
     pub fn ids_view(&self, worst: u64) -> Option<(u64, u64, u64)> {
         if self.window == 0 || self.ids == 0 || !self.exclusive(worst) {
             return None;
         }
         let (_, draft) = self.exclusive_pages(worst);
-        Some((draft.div_ceil(self.nr as u64), self.ids_free().unwrap_or(0), self.ids as u64))
+        Some((draft.div_ceil(self.nr as u64), self.ids_room().unwrap_or(0), self.ids as u64))
     }
 
     /// Whether a run past R takes its own pages (tail() set the CP map's ranks): the engine builds its tables from
@@ -761,6 +777,9 @@ impl Pool {
             let mut list = Vec::with_capacity(w as usize);
             let mut gone = self.fill_range(&mut list, main as usize, 0, self.place);
             gone.extend(self.fill_range(&mut list, draft as usize, self.place, self.pages));
+            if self.window > 0 {
+                gone.extend(self.evict_for_ids(draft.div_ceil(self.nr as u64)));
+            }
             self.spill(&gone);
             return Ok(self.grant(list, true, w, worst, "exclusive", &gone, 0));
         }
@@ -1007,6 +1026,9 @@ impl Pool {
                 let mut list = Vec::with_capacity(n as usize);
                 let mut gone = self.fill_range(&mut list, main as usize, 0, self.place);
                 gone.extend(self.fill_range(&mut list, draft as usize, self.place, self.pages));
+                if self.window > 0 {
+                    gone.extend(self.evict_for_ids(draft.div_ceil(self.nr as u64)));
+                }
                 self.spill(&gone);
                 (list, gone, true, false)
             }
@@ -1112,7 +1134,8 @@ impl Pool {
             let mut list = self.window_adopt(&k, a).expect("window_hit_room checked it");
             let (main, draft) = self.exclusive_pages(worst);
             let fresh = (draft - (list.len() as u64 - main)) as usize;
-            let gone = self.fill_range(&mut list, fresh, self.place, self.pages);
+            let mut gone = self.fill_range(&mut list, fresh, self.place, self.pages);
+            gone.extend(self.evict_for_ids(draft.div_ceil(self.nr as u64)));
             self.spill(&gone);
             return Ok(self.grant(list, true, w as u32, worst, "hit", &gone, hits));
         }
@@ -1391,7 +1414,7 @@ impl Pool {
     // run below R still able to reach its worst case (safe_with)
     fn split_room(&self, low: u64, high: u64) -> bool {
         // a window run's tail also needs its records in every rank's lease (high = its tail pages)
-        let ids_ok = self.window == 0 || self.ids_free().map_or(true, |f| high.div_ceil(self.nr as u64) <= f);
+        let ids_ok = self.window == 0 || self.ids_room().map_or(true, |f| high.div_ceil(self.nr as u64) <= f);
         // and a share of the slot pool: the engine sized it for `runs` sessions past R in one step
         let runs_ok = self.window == 0 || self.runs == 0 || self.window_runs() < self.runs;
         !self.exclusive
