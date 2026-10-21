@@ -1972,11 +1972,12 @@ int main(int argc, char** argv)
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
             // a tier on a group lease (--kv-store group=): every rank resizes it at the Resize commit; the head reports
-            // to the node, asking for 2 segments more a rank when the tier filled since its last report (as
-            // kvman-share-bench does), and announces what the node grants or asks back
+            // to the node, asking for 2 segments more a rank when the tier filled since its last report or a spill
+            // left less free than an entry holds (s2/kv_share.h share_want: ask before the next spill drops an entry),
+            // and announces what the node grants or asks back
             std::vector<uint32_t> kv_groups;
             for (size_t i = 0; kvt && i < kvt->size(); ++i) if (kvt->group(i)) kv_groups.push_back((uint32_t)i);
-            std::vector<uint64_t> kv_full_seen(kv_groups.size(), 0);
+            std::vector<g6kv_tier_totals> kv_seen(kv_groups.size(), g6kv_tier_totals{});
             size_t kv_next_group = 0;
             if (!kv_groups.empty())
             {
@@ -1993,9 +1994,9 @@ int main(int argc, char** argv)
                         // one group tier a report, in turn: one Resize in flight at a time
                         const size_t k = kv_next_group++ % kv_groups.size();
                         const uint32_t t = kv_groups[k];
-                        const uint64_t full = pool.tiers().at(t).full;
-                        const uint64_t want = full > kv_full_seen[k] ? 2 : 0;
-                        kv_full_seen[k] = full;
+                        const g6kv_tier_totals now = pool.tiers().at(t);
+                        const uint64_t want = g6s2::share_want(kv_seen[k], now);
+                        kv_seen[k] = now;
                         return g6s2::share_poll(pool, t, kvt->store(t), want);
                     };
             }

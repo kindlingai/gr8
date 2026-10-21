@@ -149,6 +149,20 @@ int main(int argc, char** argv)
 {
     if (argc != 2) { std::printf("usage: kv_share_test remote:HOST:PORT\n"); return 2; }
     const char* spec = argv[1];
+    // share_want: what the head asks for from the counters at the last report and now
+    {
+        g6kv_tier_totals l{}, n{};
+        n.slots = 612; n.free_slots = 612;
+        CHECK(share_want(l, n) == 0);                       // empty, no spill
+        n.free_slots = 233; n.entries = 1; n.spilled_pages = 379;
+        CHECK(share_want(l, n) == 2);                       // one 379-block entry, 233 free: the next would evict
+        n.free_slots = 400;
+        CHECK(share_want(l, n) == 0);                       // room for another of that size
+        l = n; n.free_slots = 100;
+        CHECK(share_want(l, n) == 0);                       // low but no spill since the last report: an idle tier asks nothing
+        n.full = 1;
+        CHECK(share_want(l, n) == 2);                       // it filled since the last report
+    }
     // B first: one rank at its floor of one segment
     g6kv_tier* b = nullptr;
     require(g6kv_tier_open_group(spec, "kv-share-test-b0", "kv-share-test-b", 1, 0, SEG, 4 * SEG, 1000, BLOCK, &b) == 0, g6kv_tier_error());
@@ -157,7 +171,21 @@ int main(int argc, char** argv)
     const uint64_t per = g6kv_store_seg_blocks(a.r[0]->store);
     CHECK(per == SEG / BLOCK && g6kv_store_segs(a.r[0]->store) == 1 && a.slots(0) == per);
 
-    a.steps(150);
+    // the head reports after every step as the engine does between rounds: it asks (share_want) before the tier
+    // first fills. The node is not asked here (A stays at its floor for the checks below), only the want is read.
+    long asked_at = -1, full_at = -1;
+    {
+        g6kv_tier_totals seen{};
+        for (long i = 0; i < 150; ++i) {
+            a.step();
+            const g6kv_tier_totals now = a.r[0]->pool.tiers().at(0);
+            if (asked_at < 0 && share_want(seen, now) && now.full == 0) asked_at = i;
+            if (full_at < 0 && now.full > 0) full_at = i;
+            seen = now;
+        }
+    }
+    std::printf("kv_share_test: first ask ahead of a drop at step %ld, tier first full at step %ld\n", asked_at, full_at);
+    CHECK(asked_at >= 0 && (full_at < 0 || asked_at <= full_at));
     const auto full = a.r[0]->pool.tiers().at(0);
     CHECK(full.full > 0);   // the tier had to make room
     const long hits0 = a.hits, stored0 = a.stored;
