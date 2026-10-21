@@ -30,7 +30,7 @@ constexpr int invalid = (int)cudaErrorInvalidValue;
 
 #if defined(G6_CP) && G6_CP
 static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity, int max_rows,
-    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr);
+    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys);
 #endif
 extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile) {
     if (capacity <= 0 || max_rows <= 0 || query_tile <= 0 || query_tile > 64 || capacity > INT_MAX / query_tile) return 0;
@@ -47,15 +47,19 @@ extern "C" int g6_attn_bind_create(G6AttnBinding* out, const G6AttnPack* p,
 #if defined(G6_CP) && G6_CP
 extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
-    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, 0, 0);
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, 0, 0, 0);
 }
 extern "C" int g6_attn_bind_create_cp(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
     int max_rows, int query_tile, int cp_R, int cp_nr, void* s, void* ext_scratch, size_t ext_bytes) {
-    if (cp_nr < 2 || cp_nr > 8 || rank >= cp_nr || cp_R < 0 || cp_R % 64) return invalid;
-    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, cp_R, cp_nr);
+    return g6_attn_bind_create_cp_phys(out, p, rank, layer, capacity, max_rows, query_tile, cp_R, cp_nr, 0, s, ext_scratch, ext_bytes);
+}
+extern "C" int g6_attn_bind_create_cp_phys(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
+    int max_rows, int query_tile, int cp_R, int cp_nr, int cp_phys, void* s, void* ext_scratch, size_t ext_bytes) {
+    if (cp_nr < 2 || cp_nr > 8 || rank >= cp_nr || cp_R < 0 || cp_R % 64 || cp_phys < 0 || (cp_phys && cp_phys < cp_R / 64)) return invalid;
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, cp_R, cp_nr, cp_phys);
 }
 static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity, int max_rows,
-    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr) {
+    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys) {
 #else
 extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
@@ -88,8 +92,8 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
         cp_table.resize(a.table_size);
         int phys = 0;
         for (int lp = 0; lp < a.table_size; ++lp)
-            cp_table[lp] = (lp < cp_R / 64 || lp % cp_nr == rank) ? phys++ : G6_CP_REMOTE;
-        a.page_count = phys;
+            cp_table[lp] = (lp < cp_R / 64 || lp % cp_nr == rank) ? (cp_phys && phys >= cp_phys ? -1 : phys++) : G6_CP_REMOTE;
+        a.page_count = phys;   // cp_phys: at most that many; the pages past it have none in the table as built
     }
 #endif
     a.query_tile = query_tile;

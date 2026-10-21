@@ -590,6 +590,73 @@ pub unsafe extern "C" fn g6kv_tail(p: *mut Pool, nr: u32, per_slot: u32) {
     (*p).tail(nr, per_slot);
 }
 
+/// Remote rows release: a split run's main pages past its prefix, the records of each rank's rows store and the most
+/// window runs live at once (0 = no limit for either) (src/pool.rs Pool::window). Before any reservation.
+///
+/// # Safety
+/// `p` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_window(p: *mut Pool, pages: u32, ids: u32, runs: u32) -> i32 {
+    match (*p).window(pages, ids, runs) {
+        Ok(()) => 0,
+        Err(e) => e.code(),
+    }
+}
+
+/// Whether a retained run holds exactly these `n` pages.
+///
+/// # Safety
+/// `p` must be live, `pages` valid for `n` reads.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_is_kept(p: *const Pool, pages: *const u32, n: usize) -> i32 {
+    (*p).is_kept(std::slice::from_raw_parts(pages, n)) as i32
+}
+
+/// The window runs live now.
+///
+/// # Safety
+/// `p` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_window_runs(p: *const Pool) -> u32 {
+    (*p).window_runs()
+}
+
+/// For a window request of `worst` rows past R with a lease limit: 1 and {records its tail needs per rank, records
+/// free, records in all} in out[0..3]; 0 otherwise.
+///
+/// # Safety
+/// `p` must be live, `out` valid for 3 writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ids_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
+    match (*p).ids_view(worst) {
+        Some((a, b, c)) => {
+            for (k, v) in [a, b, c].into_iter().enumerate() {
+                *out.add(k) = v;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// For a request of `worst` rows past R with the page classes on: 1 and its pages below / above place and what those
+/// classes have free in out[0..4]; 0 otherwise.
+///
+/// # Safety
+/// `p` must be live, `out` valid for 4 writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_split_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
+    match (*p).split_view(worst) {
+        Some((a, b, c, d)) => {
+            for (k, v) in [a, b, c as u64, d as u64].into_iter().enumerate() {
+                *out.add(k) = v;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
 /// Whether g6kv_tail set the CP map's ranks: a run past R carries its own page list (1) or holds the pool as pages
 /// 0, 1, .. (0).
 ///
@@ -691,4 +758,146 @@ pub unsafe extern "C" fn g6kv_keep_agreed(p: *mut Pool, agreed: *const c_char) {
     if !agreed.is_null() {
         (*p).keep_agreed(&CStr::from_ptr(agreed).to_string_lossy());
     }
+}
+
+/// Remote attention rows (src/rows.rs): opens `spec` ("mem:" or "remote:HOST:PORT", a lease named `name`) of `bytes`
+/// (the header included), and writes or checks its layout header. 0, or -1 with g6kv_tier_error.
+///
+/// # Safety
+/// `spec`, `name` and `layout` must be NUL-terminated strings, `out` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_open(
+    spec: *const c_char,
+    name: *const c_char,
+    layout: *const c_char,
+    bytes: u64,
+    out: *mut *mut crate::rows::Rows,
+) -> i32 {
+    if spec.is_null() || name.is_null() || layout.is_null() || out.is_null() {
+        return crate::blocks::fail(std::io::Error::new(std::io::ErrorKind::InvalidInput, "null argument"));
+    }
+    let (spec, name) = (CStr::from_ptr(spec).to_string_lossy(), CStr::from_ptr(name).to_string_lossy());
+    let layout = CStr::from_ptr(layout).to_string_lossy();
+    match crate::rows::Store::open(&spec, &name, bytes).and_then(|s| s.layout(&layout).map(|()| s)) {
+        Ok(s) => {
+            *out = Box::into_raw(Box::new(crate::rows::Rows::new(s)));
+            0
+        }
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// Stops the helper thread and closes the store.
+///
+/// # Safety
+/// `r` must come from g6kv_rows_open (or be NULL) and must not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_free(r: *mut crate::rows::Rows) {
+    if !r.is_null() {
+        drop(Box::from_raw(r));
+    }
+}
+
+/// Writes `len` bytes at byte `off` of the store. Not while a request is in flight on the mem: store.
+///
+/// # Safety
+/// `r` must be live, `buf` valid for `len` reads.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_write(r: *const crate::rows::Rows, off: u64, buf: *const u8, len: usize) -> i32 {
+    match (*r).store.write(off, std::slice::from_raw_parts(buf, len)) {
+        Ok(()) => 0,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// Reads `n` pieces of `len` bytes, piece k at store byte `offs[k]`, into `dst + k * len`.
+///
+/// # Safety
+/// `r` must be live, `offs` valid for `n` reads, `dst` for `n * len` writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_gather(
+    r: *const crate::rows::Rows,
+    offs: *const u64,
+    n: usize,
+    len: usize,
+    dst: *mut u8,
+) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    let ops: Vec<(u64, *mut u8, usize)> =
+        std::slice::from_raw_parts(offs, n).iter().enumerate().map(|(k, &o)| (o, dst.add(k * len), len)).collect();
+    match (*r).store.read_scatter(&ops) {
+        Ok(()) => 0,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// Memory the store's RDMA device may write into (the slots); a no-op without RDMA.
+///
+/// # Safety
+/// `r` must be live, the memory must outlive it.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_register(r: *const crate::rows::Rows, p: *mut u8, len: usize) -> i32 {
+    match (*r).register(p, len) {
+        Ok(()) => 0,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// Adds a group before g6kv_rows_start: its request ring (a g6kv_rows_req and `cap` entries), done word and `nslots`
+/// slots of `stride` bytes each; a record of `rec` bytes goes at byte `off` of its slot. Returns the group's index, or
+/// -1 with g6kv_tier_error.
+///
+/// # Safety
+/// `r` must be live; the buffers must outlive it and stay mapped while its thread runs.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_group(
+    r: *mut crate::rows::Rows,
+    req: *mut crate::rows::Req,
+    done: *mut u64,
+    slots: *mut u8,
+    rec: usize,
+    stride: usize,
+    off: usize,
+    nslots: u32,
+    cap: u32,
+) -> i32 {
+    match (*r).add_group(req, done, slots, rec, stride, off, nslots, cap) {
+        Ok(i) => i as i32,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// Starts the helper thread.
+///
+/// # Safety
+/// `r` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_start(r: *mut crate::rows::Rows) {
+    (*r).start();
+}
+
+/// Records fetched so far.
+///
+/// # Safety
+/// `r` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_fetched(r: *const crate::rows::Rows) -> u64 {
+    (*r).fetched.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Writes the store's description into `buf`, NUL-terminated and cut to `cap`.
+///
+/// # Safety
+/// `r` must be live and `buf` hold `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_rows_describe(r: *const crate::rows::Rows, buf: *mut c_char, cap: usize) {
+    if buf.is_null() || cap == 0 {
+        return;
+    }
+    let d = (*r).store.describe();
+    let n = d.len().min(cap - 1);
+    std::ptr::copy_nonoverlapping(d.as_ptr() as *const c_char, buf, n);
+    *buf.add(n) = 0;
 }

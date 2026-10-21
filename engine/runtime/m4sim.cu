@@ -40,6 +40,18 @@
 //        poisoned, and come back. The lines printed must be the run's without it. Past G6_CP_R the reused rows go as the
 //        pool stores a run's tail: each rank's shard of the attention caches, and every logical page's replicated parts
 //   G6_KV_RANKS_CMP=1: prints whether every rank's page blocks of those pages are byte for byte rank 0's
+// G6_RT_STORE=mem:|remote:HOST:PORT (G6_CP on; no --s2, --reuse-prefix, --serve, --minv): every rank's rows
+//        past G6_RT_L (default G6_CP_R) go to a rows store once their page is whole (before each target step), and
+//        attention reads them back through G6_RT_POOL (default 4096) resident slots per indexer group (rt_rows.cuh).
+//        The MTP layer keeps its own pages. With G6_S2_XLIST the run's pages are a shuffled pool list.
+//        The lines printed must be the run's without it. G6_RT_POISON=1 overwrites the local copies of those rows.
+//        G6_RT_FMT=int4: the records hold INT4 rows (416 B for 656; the lines then differ a little); G6_RT_CHECK=1 with
+//        it prints the latent SQNR of the FP8 -> INT4 -> FP8 round trip, of random rows and of every spilled row.
+//        G6_RT_LOCAL=N: release (rt_rows.cuh): each rank's pages past L come from N local pages, a page goes back once
+//        it is in the store, and its rows read only from the slots (decode) or the staged prefill pool (rt_pf_stage),
+//        so a sequence longer than the local pages hold runs. Needs G6_RT_POOL >= MX x 2048; no G6_KV_HASH.
+//        G6_RT_POISON=1 then overwrites every freed page; G6_RT_CHECK=1 checks every record has one holder. With
+//        --reuse-prefix a sequence that continues the last keeps its records past the rows it shares (rt_trim).
 // G6_QA_SPLIT=1|2, G6_IDXQ_SPLIT=1, G6_MTP_SPLIT=1 (needs --mtp): the split replicated GEMVs as g6m4 runs them (rank.cuh
 //        QSplit), each model's gathers on a loopback of their own: every rank's attention block (and the draft's eh_proj)
 //        runs in gather phases (rank.cuh QsPh) with the delivery between them. The lines must equal the run without them.
@@ -57,6 +69,7 @@
 #include "prefill.cuh"
 #include "serve.h"
 #include "s2/kv_tier.cuh"
+#include "rt_rows.cuh"
 #ifdef DEC_S2
 #include <map>
 #include <set>
@@ -617,6 +630,61 @@ int main(int argc, char** argv)
     }
     for (Model& m : R) { m.nc = nc; m.rs = plan.rs; }   // before any capture: the head kernels take them by value
     for (Draft& D : DR) D.d.nc = nc;
+    // G6_RT_STORE (header): before any prepare, which copies the bindings' arguments into the replay entries
+    std::vector<std::unique_ptr<RtTier>> rt(NR);
+    int rt_q = 0;                       // release: the slot the sequence's records are in (G6_RT_ADOPT_SLOT moves them)
+    // one sequence on the layers' own tables (the CP map as built, or G6_S2_XLIST's): read them before each spill.
+    // Rows below `committed` are written; the next step or chunk writes rows below `end` (release: their local pages)
+    auto rt_spill_all = [&](int committed, int end) {
+        if (!rt[0]) return;
+        for (Model& m : R)
+        {
+            std::vector<int> map(m.layers[0].ab.args.table_size);
+            G6RT_CK(cudaStreamSynchronize(st));
+            if (!rt[m.rank]->local)
+                G6RT_CK(cudaMemcpy(map.data(), m.layers[0].ab.args.block_table, map.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            rt_spill(m, *rt[m.rank], map, committed, rt_q, st);
+            rt_ensure(m, *rt[m.rank], rt_q, end, st);
+        }
+    };
+    if (const char* rs = getenv("G6_RT_STORE"))
+    {
+#if defined(G6_CP) && G6_CP
+        const int local0 = getenv("G6_RT_LOCAL") ? atoi(getenv("G6_RT_LOCAL")) : 0;
+        // --reuse-prefix with release: a sequence that continues the last keeps its records (rt_trim), as g6m4 adopts a
+        // retained run's
+        if (!cp_on || s2mode || (reuse && local0 <= 0) || !serve.empty() || minv >= 0)
+            die("G6_RT_STORE needs G6_CP on, and no --s2, --serve or --minv; --reuse-prefix only with G6_RT_LOCAL");
+        const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
+        const int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : local0 > 0 ? MX * 2048 : 4096;   // release: one sequence's step
+        const bool poison = getenv("G6_RT_POISON") && atoi(getenv("G6_RT_POISON"));
+        const bool int4 = rt_fmt_int4();
+        const bool check = getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK"));
+        const int local = getenv("G6_RT_LOCAL") ? atoi(getenv("G6_RT_LOCAL")) : 0;
+        if (local < 0 || (local && getenv("G6_KV_HASH"))) die("G6_RT_LOCAL: a page count >= 0, and no G6_KV_HASH (it reads the local pages)");
+        // the model set: where the weights come from and which layers run
+        const std::string src = packs + "|" + v2src.dense + "|" + v2src.dir + "|" + v2src.widths + "|" + layers_s;
+        char model[17];
+        snprintf(model, sizeof model, "%016llx", (unsigned long long)fnv(0xcbf29ce484222325ull, src.data(), src.size()));
+        const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(NR) + "-" + g6kv::NAME +
+                                rt_fmt_name(int4) + "-" + model;
+        const std::string layout = "R=" + std::to_string(cp_R) + " L=" + std::to_string(L) + " nr=" + std::to_string(NR) + " row=" + g6kv::NAME +
+                                   rt_fmt_layout(int4) + " model=" + model;
+        for (Model& m : R)
+            rt[m.rank] = rt_build(m, rs, "m4sim-rt-" + tag + (local ? "-rel" : ""), layout + (local ? " released" : ""), L, S, local, 0, MX, poison,
+                                  int4, check, st);
+        // G6_CP_PF_NET: the fill stages each rank's released pages, as g6m4's cp_pf_begin
+        if (local)
+            for (Model& m : R)
+            {
+                RtTier* t = rt[m.rank].get();
+                m.cp.rt_stage = [t, &rt_q](int i, int start, char* pool, size_t ixoff, cudaStream_t s) { rt_pf_stage(*t, rt_q, i, start, {{pool, ixoff}}, s); };
+            }
+#else
+        (void)rs;
+        die("G6_RT_STORE needs a G6_CP build");
+#endif
+    }
 #ifdef DEC_S2
     S2In* in_s2 = dmalloc<S2In>(1);     // --s2: the step's session layout, target and draft steps
     S2In* in_s2d = dmalloc<S2In>(1);
@@ -726,8 +794,12 @@ int main(int argc, char** argv)
         for (const Draft& D : DR) most = std::max(most, D.d.s2->pool_pages);
         const int rp = cp_R / 64;
         const int n = v.size() > 1 ? v[1] : std::min(most, rp + (place - rp) * g6nr::NR);
-        const int shard = (n - rp + g6nr::NR - 1) / g6nr::NR;
-        if (n <= rp || rp + shard > place || n - rp - shard > most - place)
+        // G6_RT_LOCAL: the release layout (s2.cuh S2Model::rt_window): the prefix, the window, then the drafter's whole tail
+        const int win = rt[0] ? rt[0]->local : 0;
+        if (win && rt[0]->L != cp_R) die("G6_S2_XLIST with G6_RT_LOCAL needs G6_RT_L = G6_CP_R");
+        const int shard = win ? win : (n - rp + g6nr::NR - 1) / g6nr::NR;
+        const int high = win ? n - rp : n - rp - shard;
+        if (n <= rp || rp + shard > place || high > most - place)
             die("G6_S2_XLIST: pages must leave the run's prefix and shard below place");
         for (const Plan& p : plans)
             if ((int)p.prompt.size() + p.n_gen > n * 64)
@@ -743,9 +815,9 @@ int main(int argc, char** argv)
             return v;
         };
         std::vector<int> low = shuffle(s2_run_list(0, place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 1),
-                          high = shuffle(s2_run_list(place, most - place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 0x517CC1B727220A95ull);
+                          hi = shuffle(s2_run_list(place, most - place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 0x517CC1B727220A95ull);
         pf_xlist_pages.insert(pf_xlist_pages.end(), low.begin(), low.begin() + (rp + shard));
-        pf_xlist_pages.insert(pf_xlist_pages.end(), high.begin(), high.begin() + (n - rp - shard));
+        pf_xlist_pages.insert(pf_xlist_pages.end(), hi.begin(), hi.begin() + high);
         if (getenv("G6_S2_PFPOISON"))
         {
             auto poison = [&](Model& m) {
@@ -759,11 +831,21 @@ int main(int argc, char** argv)
             for (Model& m : R) poison(m);
             for (Draft& D : DR) poison(D.d);
         }
+        if (win)
+        {
+            for (Model& m : R)
+            {
+                m.s2->rt_window = win;
+                RtTier* t = rt[m.rank].get();
+                m.s2->rt_tail = [t](const std::vector<int>& list) { return rt_tail_of(*t, list); };
+            }
+            for (Draft& D : DR) D.d.s2->rt_window = win;
+        }
         for (Model& m : R) s2_solo_cp_pages(m, pf_xlist_pages, most);
         for (Draft& D : DR) s2_solo_cp_pages(D.d, pf_xlist_pages, most);
         G6RT_CK(cudaStreamSynchronize(st));
-        fprintf(stderr, "# s2 xlist gate: every sequence past R on %d shuffled pages (prefix %d + shard %d below place %d, %d above)%s\n",
-                n, rp, shard, place, n - rp - shard, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "");
+        fprintf(stderr, "# s2 xlist gate: every sequence past R on %zu shuffled pages (prefix %d + %s %d below place %d, %d above)%s\n",
+                pf_xlist_pages.size(), rp, win ? "window" : "shard", shard, place, high, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "");
     }
 #endif
     // StepIn to the device; G6_S2_PFBASE / G6_S2_XLIST: the pool's page bound
@@ -773,6 +855,47 @@ int main(int argc, char** argv)
         if (pf_base || pf_xlist) x.page_bound = (dst == in ? R[0] : DR[0].d).s2->pool_pages;
 #endif
         G6RT_CK(g6h2d::copy(dst, &x, sizeof x));
+    };
+    // G6_RT_STORE at a new sequence: release starts slot 0's run (on G6_S2_XLIST's list, or the tables as built, whose
+    // first G6_RT_LOCAL tail pages past L are its window); otherwise the flags drop
+    std::vector<std::vector<int>> rt_built(NR);
+    auto rt_start = [&]() {
+        for (Model& m : R)
+        {
+            RtTier& t = *rt[m.rank];
+            if (!t.local) { rt_drop_slot(t, 0, st); continue; }
+            rt_end(t, 1, st);   // a G6_RT_ADOPT_SLOT sequence's
+#ifdef DEC_S2
+            if (pf_xlist)
+            {
+                const int rp = cp_R / 64, most = std::max(R[0].s2->pool_pages, DR.empty() ? 0 : DR[0].d.s2->pool_pages);
+                rt_begin(t, 0, std::vector<int>(pf_xlist_pages.begin() + rp, pf_xlist_pages.begin() + rp + t.local), pf_xlist_pages, st);
+                Model* mm = &m;
+                t.write = [this_list = &pf_xlist_pages, mm, most](int) { s2_solo_cp_pages(*mm, *this_list, most); };
+                t.write(0);
+                continue;
+            }
+#endif
+            std::vector<int>& b = rt_built[m.rank];
+            if (b.empty())
+            {
+                b.resize(m.layers[0].ab.args.table_size);
+                G6RT_CK(cudaMemcpy(b.data(), m.layers[0].ab.args.block_table, b.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            }
+            std::vector<int> win;
+            for (int lp = 0; lp < (int)b.size() && (int)win.size() < t.local; ++lp)
+                if (rt_mine(t, lp)) win.push_back(b[lp]);
+            rt_begin(t, 0, win, {}, st);
+            Model* mm = &m;
+            t.write = [&b, mm, &t](int qq) {
+                std::vector<int> tab = b;
+                for (int lp = 0; lp < (int)tab.size(); ++lp) if (rt_mine(t, lp)) tab[lp] = t.seq[qq].tail[lp];
+                for (Layer& y : mm->layers)
+                    G6RT_CK(cudaMemcpy(const_cast<int*>(y.ab.args.block_table), tab.data(), tab.size() * sizeof(int), cudaMemcpyHostToDevice));
+            };
+            t.write(0);
+        }
+        rt_q = 0;
     };
     loop_d.recv = recv_d; loop_d.stepp = stepp_d; loop_d.ncoll = NCD; loop_d.stride = stride;
     loop.recv = recv; loop.stepp = stepp; loop.ncoll = NC; loop.stride = stride;
@@ -937,10 +1060,48 @@ int main(int argc, char** argv)
     const std::string cp_break = getenv("G6_CP_PF_BREAK") ? getenv("G6_CP_PF_BREAK") : "";
     auto cp_enter = [&]() { if (cp_pf) for (Model& m : R) cp_pf_enter(m); };
     auto cp_exit = [&]() { if (cp_pf) for (Model& m : R) cp_pf_exit(m); };
+    // G6_CP_PF_NET=1: the gather as g6m4's real fabric does it: each rank fills its own pool (cp_pf_fill_local, which
+    // stages the pages the rows tier released through CpState::rt_stage), then every rank's tail pages, the rows below
+    // start, go to every other pool as the proxy's RDMA writes would. The lines must equal the loopback gather's
+    const bool pf_net = getenv("G6_CP_PF_NET") && atoi(getenv("G6_CP_PF_NET")) == 1;
+    auto cp_gather_net = [&](int i, int start) {
+        for (Model& m : R) cp_pf_fill_local(m, i, start, err, st);
+        const G6Attn& a = R[0].cp.pf_saved[i];
+        const int ps = a.page_size, Rp = R[0].cp.R / ps, np = (start + ps - 1) / ps;
+        for (int lp = Rp; lp < np; ++lp)
+        {
+            const Model& o = R[lp % NR];
+            const int rows = std::min(ps, start - lp * ps);
+            const char* src = o.cp.pf_pool[cp_pf_k(o, i)];
+            const size_t ixo = cp_pf_ixoff(o, i), ib = ixo + (size_t)lp * ps * CP_IXB;
+            for (Model& m : R)
+            {
+                if (&m == &o) continue;
+                char* dst = m.cp.pf_pool[cp_pf_k(m, i)];
+                G6RT_CK(cudaMemcpyAsync(dst + (size_t)lp * ps * CP_KVB, src + (size_t)lp * ps * CP_KVB, (size_t)rows * CP_KVB, cudaMemcpyDeviceToDevice, st));
+                if (!ixo) continue;
+                G6RT_CK(cudaMemcpyAsync(dst + ib, src + ib, (size_t)rows * 128, cudaMemcpyDeviceToDevice, st));
+                G6RT_CK(cudaMemcpyAsync(dst + ib + (size_t)ps * 128, src + ib + (size_t)ps * 128, (size_t)rows * 4, cudaMemcpyDeviceToDevice, st));
+            }
+        }
+    };
+    // G6_RT_SELSTAT=1 (rank 0's tier, G6_PF_OWN=2 lists): what a prefill reading only the selected released rows would read
+    static const bool selstat = getenv("G6_RT_SELSTAT") && atoi(getenv("G6_RT_SELSTAT")) == 1;
+    int sel_ma = 0, sel_mb = 0;
+    auto cp_selstat = [&](int i, int start) {
+        if (selstat && rt[0] && rt[0]->local && R[0].layers[i].indexer && PF[0].idx_all)
+            rt_selstat(*rt[0], {{PF[0].idx_all, sel_ma}, {two ? PF2[0].idx_all : nullptr, sel_mb}}, start / 64 * 64, st);
+    };
     auto cp_gather = [&](int i, int start) {
         if (!cp_pf || cp_break == "gather") return;
+        cp_selstat(i, start);
+        if (pf_net) { cp_gather_net(i, start); return; }
         const CpPfSrc s = cp_pf_src(R, i);
         for (Model& m : R) cp_pf_gather(m, s, i, start, st);
+        if (!rt[0] || !rt[0]->local) return;
+        std::vector<std::pair<char*, size_t>> pools;     // G6_RT_LOCAL: the released pages, from their owners' stores
+        for (Model& m : R) pools.push_back({m.cp.pf_pool[cp_pf_k(m, i)], cp_pf_ixoff(m, i)});
+        for (Model& m : R) rt_pf_stage(*rt[m.rank], rt_q, i, start, pools, st);
     };
     auto cp_back = [&](int i, int a0, int n) { if (cp_pf && cp_break != "back") for (Model& m : R) cp_pf_back(m, i, a0, n, st); };
 #else
@@ -950,6 +1111,7 @@ int main(int argc, char** argv)
     auto cp_back = [&](int, int, int) {};
 #endif
     auto enqueue_pf = [&](int M, int context, u64 ls0) {
+        sel_ma = M; sel_mb = 0;
         cp_enter();
         for (Model& m : R) pf_embed(m, PF[m.rank], M, st);
         for (int i = 0; i < NL; ++i)
@@ -982,6 +1144,7 @@ int main(int argc, char** argv)
         auto fin = [&](std::vector<Prefill>& L, const Loop& l, int i, int M, int ctx) {
             pf_deliver_consume_x(L, l, i, M, ctx);
         };
+        sel_ma = MA; sel_mb = MB;
         cp_enter();
         for (Model& m : R) pf_embed(m, PF[m.rank], MA, st);
         pf_stagger(st);                  // G6_PF_STAGGER: one stream here, so only proves the delay changes no output
@@ -1580,6 +1743,7 @@ int main(int argc, char** argv)
         }
         if (!skip)
         {
+            if (rt[0]) rt_start();
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
             if (getenv("G6_S2_XLIST"))            // xlist gate: clear the run only (s2_reset_pages, its classes)
             {
@@ -1600,6 +1764,20 @@ int main(int argc, char** argv)
                 for (Draft& D : DR) reset(D.d, st);
             }
         }
+        if (skip && rt[0] && rt[0]->local)   // release: the rows below skip stay, the tail past it goes
+        {
+            // G6_RT_ADOPT_SLOT=1: the next sequence takes the records over in another slot, as a g6m4 grant at the
+            // boundary its run retires on does (rt_adopt from the retiring slot); the old slot's retirement then finds
+            // nothing. Else in place
+            const int to = getenv("G6_RT_ADOPT_SLOT") && atoi(getenv("G6_RT_ADOPT_SLOT")) == 1 ? 1 - rt_q : rt_q;
+            for (Model& m : R)
+            {
+                RtTier& t = *rt[m.rank];
+                rt_adopt(m, t, rt_q, to, t.seq[rt_q].list, skip, st);
+                rt_end(t, rt_q == to ? 2 : rt_q, st);   // the old slot's retirement
+            }
+            rt_q = to;
+        }
         if (p.first < skip) p.first = skip;
         if (serve.empty()) pt.start("");
         else pt.lap("open");
@@ -1617,6 +1795,7 @@ int main(int argc, char** argv)
                 const int MA = MP, MB = npf - a - MP < MP ? npf - a - MP : MP;
                 std::vector<int> pos(MA + MB);
                 for (int r = 0; r < MA + MB; ++r) pos[r] = a + r;
+                rt_spill_all(a, a + MA + MB);
                 for (Model& m : R)
                 {
                     pf_inputs(PF[m.rank], MA, p.prompt.data() + a, pos.data());
@@ -1699,6 +1878,7 @@ int main(int argc, char** argv)
             const int M = npf - a < MP ? npf - a : MP;
             std::vector<int> pos(M);
             for (int r = 0; r < M; ++r) pos[r] = a + r;
+            rt_spill_all(a, a + M);
             for (Model& m : R) pf_inputs(PF[m.rank], M, p.prompt.data() + a, pos.data());
             const auto t0 = std::chrono::steady_clock::now();
             enqueue_pf(M, a + M, ls0);
@@ -1769,6 +1949,7 @@ int main(int argc, char** argv)
         {
             StepOut so[NR], sd[NR];
             auto rm = [&](const StepIn& si, int s, double& ms) {
+                rt_spill_all(si.pos[0], si.context);
                 ms += run_main(si, so);
                 if (rlf) route_log_line(rlf, R[0], layers, q, s, si.M, si.pos[0], p.prompt.size());
                 lines("step", false, so, s, si.M);
@@ -1814,6 +1995,7 @@ int main(int argc, char** argv)
         {
             const int M = step_rows(p, s);
             const StepIn si = step_inputs(p, s, last_tok, step0);
+            rt_spill_all(si.pos[0], si.context);
             const int k = bucket(si.context, false);
             if (!ready[k][M])
             {
@@ -1882,6 +2064,26 @@ int main(int argc, char** argv)
                 graph ? "one graph" : "plain launches", t1[t1.size() / 2], t1[0], t1[t1.size() / 2] * 1000 / NR / NL, NL);
     }
     if (mtp) mtp_stats.print(mtp, "six ranks in turn");
+    for (int r = 0; r < NR && rt[0]; ++r)
+        fprintf(stderr, "# G6_RT_STORE rank %d: %llu rows spilled, %llu fetched, %llu read locally (no slot); %llu pages released, "
+                        "%d of %d local pages at most\n", r, (unsigned long long)rt[r]->spilled, (unsigned long long)rt_fetched(*rt[r]),
+                (unsigned long long)rt_local(*rt[r]), (unsigned long long)rt[r]->released, rt[r]->peak, rt[r]->local);
+    for (int r = 0; r < NR && rt[0]; ++r)
+        if (rt[r]->check) rt_check_print(("spilled rows, rank " + std::to_string(r)).c_str(), rt[r]->spill_ck);
+    if (rt[0] && rt[0]->sel_layers)
+        fprintf(stderr, "# G6_RT_SELSTAT: %llu sampled layer fills selected %llu of %llu released rows (%.1f%%)\n",
+                (unsigned long long)rt[0]->sel_layers, (unsigned long long)rt[0]->sel_rows, (unsigned long long)rt[0]->sel_rel,
+                100.0 * rt[0]->sel_rows / std::max<uint64_t>(1, rt[0]->sel_rel));
+    if (rt[0] && rt[0]->hold)
+        for (int r = 0; r < NR; ++r)
+            fprintf(stderr, "# G6_RT_CHECK rank %d: every record had one holder after every change; %llu group pages read back, %llu differed\n", r,
+                    (unsigned long long)rt[r]->readback, (unsigned long long)rt[r]->readback_bad);
+    for (int r = 0; r < NR && rt[0]; ++r)
+        if (rt[r]->hold && rt[r]->stage_ck.rows)
+        {
+            rt_check_print(("staged prefill rows, rank " + std::to_string(r)).c_str(), rt[r]->stage_ck);
+            fprintf(stderr, "# G6_RT_CHECK rank %d: %llu staged pages under 10 dB or with a rope byte off\n", r, (unsigned long long)rt[r]->stage_bad);
+        }
     if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);

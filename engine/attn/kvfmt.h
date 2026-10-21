@@ -23,5 +23,9 @@ constexpr int ROW = 656, SCALE_OFF = 512, ROPE_OFF = 528;
 constexpr const char* NAME = "fp8";
 #endif
 constexpr int IDX_ROW = 132;
+// both latent rows by name, whatever the build's row is, for code that converts one to the other (the remote rows
+// tier's G6_RT_FMT=int4 records, runtime/rt_rows.cuh)
+namespace fp8row { constexpr int ROW = 656, SCALE_OFF = 512, ROPE_OFF = 528; }
+namespace int4row { constexpr int ROW = 416, SCALE_OFF = 256, ROPE_OFF = 288; }
 static_assert(ROW % 16 == 0, "rows are gathered in 16-byte pieces");
 }

@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 600" width="880" height="600" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+<title id="t">gr8 KV tiers</title>
+<desc id="d">Top: a live session's KV by token position. Below SHARE_LIMIT every rank holds every page; past it each rank holds every fourth page, on the GPU up to L and on the KV node past L. Bottom: when the pool lets a run go, system prompts go to the local SSD store and every other run to the KV node.</desc>
+<style>
+  :root { --bg:#ffffff; --fg:#1f2328; --muted:#59636e; --line:#d1d9e0; --rep:#4c8bf5; --cp:#2da44e; --empty:#eef1f4; --remote:#9a6700; --ssd:#8250df; --pool:#0969da; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#3d444d; --rep:#4c8bf5; --cp:#3fb950; --empty:#21262d; --remote:#d29922; --ssd:#a371f7; --pool:#4c8bf5; }
+  }
+  .bg { fill: var(--bg); }
+  .h { fill: var(--fg); font-size: 16px; font-weight: 600; }
+  .t { fill: var(--fg); font-size: 13px; }
+  .b { fill: var(--fg); font-size: 13px; font-weight: 600; }
+  .s { fill: var(--muted); font-size: 12px; }
+  .rep { fill: var(--rep); }
+  .cp { fill: var(--cp); }
+  .empty { fill: var(--empty); }
+  .rule { stroke: var(--line); stroke-width: 1; }
+  .mark { stroke: var(--fg); stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .rt { fill: var(--remote); }
+  .remote { fill: none; stroke: var(--remote); stroke-width: 1.5; stroke-dasharray: 6 4; }
+  .rtxt { fill: var(--remote); font-size: 13px; font-weight: 600; }
+  .ssd { fill: none; stroke: var(--ssd); stroke-width: 2; }
+  .ssdt { fill: var(--ssd); font-size: 13px; font-weight: 600; }
+  .node { fill: none; stroke: var(--remote); stroke-width: 2; }
+  .nodet { fill: var(--remote); font-size: 13px; font-weight: 600; }
+  .pool { fill: none; stroke: var(--pool); stroke-width: 2; }
+  .poolt { fill: var(--pool); font-size: 13px; font-weight: 600; }
+  .arrow { stroke: var(--muted); stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+  .ahead { fill: var(--muted); }
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ahead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="bg" width="880" height="600"/>
+<text class="h" x="24" y="32">A live session, by token position</text>
+<text class="s" x="84" y="81" text-anchor="end">rank 0</text>
+<rect class="rep" x="96" y="68" width="19" height="18" rx="3"/>
+<rect class="rep" x="118" y="68" width="19" height="18" rx="3"/>
+<rect class="rep" x="140" y="68" width="19" height="18" rx="3"/>
+<rect class="rep" x="162" y="68" width="19" height="18" rx="3"/>
+<rect class="rep" x="184" y="68" width="19" height="18" rx="3"/>
+<rect class="rep" x="206" y="68" width="19" height="18" rx="3"/>
+<rect class="rep" x="228" y="68" width="19" height="18" rx="3"/>
+<rect class="rep" x="250" y="68" width="19" height="18" rx="3"/>
+<rect class="cp" x="287" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="309" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="331" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="353" y="68" width="19" height="18" rx="3"/>
+<rect class="cp" x="375" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="397" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="419" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="441" y="68" width="19" height="18" rx="3"/>
+<rect class="rt" x="475" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="497" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="519" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="541" y="68" width="19" height="18" rx="3"/>
+<rect class="rt" x="563" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="585" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="607" y="68" width="19" height="18" rx="3"/>
+<rect class="empty" x="629" y="68" width="19" height="18" rx="3"/>
+<text class="s" x="84" y="107" text-anchor="end">rank 1</text>
+<rect class="rep" x="96" y="94" width="19" height="18" rx="3"/>
+<rect class="rep" x="118" y="94" width="19" height="18" rx="3"/>
+<rect class="rep" x="140" y="94" width="19" height="18" rx="3"/>
+<rect class="rep" x="162" y="94" width="19" height="18" rx="3"/>
+<rect class="rep" x="184" y="94" width="19" height="18" rx="3"/>
+<rect class="rep" x="206" y="94" width="19" height="18" rx="3"/>
+<rect class="rep" x="228" y="94" width="19" height="18" rx="3"/>
+<rect class="rep" x="250" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="287" y="94" width="19" height="18" rx="3"/>
+<rect class="cp" x="309" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="331" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="353" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="375" y="94" width="19" height="18" rx="3"/>
+<rect class="cp" x="397" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="419" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="441" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="475" y="94" width="19" height="18" rx="3"/>
+<rect class="rt" x="497" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="519" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="541" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="563" y="94" width="19" height="18" rx="3"/>
+<rect class="rt" x="585" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="607" y="94" width="19" height="18" rx="3"/>
+<rect class="empty" x="629" y="94" width="19" height="18" rx="3"/>
+<text class="s" x="84" y="133" text-anchor="end">rank 2</text>
+<rect class="rep" x="96" y="120" width="19" height="18" rx="3"/>
+<rect class="rep" x="118" y="120" width="19" height="18" rx="3"/>
+<rect class="rep" x="140" y="120" width="19" height="18" rx="3"/>
+<rect class="rep" x="162" y="120" width="19" height="18" rx="3"/>
+<rect class="rep" x="184" y="120" width="19" height="18" rx="3"/>
+<rect class="rep" x="206" y="120" width="19" height="18" rx="3"/>
+<rect class="rep" x="228" y="120" width="19" height="18" rx="3"/>
+<rect class="rep" x="250" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="287" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="309" y="120" width="19" height="18" rx="3"/>
+<rect class="cp" x="331" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="353" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="375" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="397" y="120" width="19" height="18" rx="3"/>
+<rect class="cp" x="419" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="441" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="475" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="497" y="120" width="19" height="18" rx="3"/>
+<rect class="rt" x="519" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="541" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="563" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="585" y="120" width="19" height="18" rx="3"/>
+<rect class="rt" x="607" y="120" width="19" height="18" rx="3"/>
+<rect class="empty" x="629" y="120" width="19" height="18" rx="3"/>
+<text class="s" x="84" y="159" text-anchor="end">rank 3</text>
+<rect class="rep" x="96" y="146" width="19" height="18" rx="3"/>
+<rect class="rep" x="118" y="146" width="19" height="18" rx="3"/>
+<rect class="rep" x="140" y="146" width="19" height="18" rx="3"/>
+<rect class="rep" x="162" y="146" width="19" height="18" rx="3"/>
+<rect class="rep" x="184" y="146" width="19" height="18" rx="3"/>
+<rect class="rep" x="206" y="146" width="19" height="18" rx="3"/>
+<rect class="rep" x="228" y="146" width="19" height="18" rx="3"/>
+<rect class="rep" x="250" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="287" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="309" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="331" y="146" width="19" height="18" rx="3"/>
+<rect class="cp" x="353" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="375" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="397" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="419" y="146" width="19" height="18" rx="3"/>
+<rect class="cp" x="441" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="475" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="497" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="519" y="146" width="19" height="18" rx="3"/>
+<rect class="rt" x="541" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="563" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="585" y="146" width="19" height="18" rx="3"/>
+<rect class="empty" x="607" y="146" width="19" height="18" rx="3"/>
+<rect class="rt" x="629" y="146" width="19" height="18" rx="3"/>
+<line class="mark" x1="278" y1="58" x2="278" y2="172"/>
+<text class="s" x="96" y="52">token 0</text>
+<text class="b" x="278" y="52" text-anchor="middle">SHARE_LIMIT (R)</text>
+<line class="mark" x1="466" y1="58" x2="466" y2="172"/>
+<text class="b" x="466" y="52" text-anchor="middle">L</text>
+<text class="s" x="648" y="52" text-anchor="end">end →</text>
+<rect class="rep" x="674" y="68" width="12" height="12" rx="2"/><text class="b" x="692" y="79">Replicated</text>
+<text class="s" x="692" y="96">every rank holds every page</text>
+<rect class="cp" x="674" y="112" width="12" height="12" rx="2"/><text class="b" x="692" y="123">CP-sharded</text>
+<text class="s" x="692" y="140">rank r holds pages p mod 4 = r</text>
+<rect class="rt" x="674" y="156" width="12" height="12" rx="2"/><text class="rtxt" x="692" y="167">CP-sharded, on KV node</text>
+<text class="s" x="692" y="184">hot rows cached (in progress)</text>
+<text class="b" x="24" y="202">Below R:</text>
+<text class="s" x="120" y="202">every rank reads every page locally, and requests that fit share decode steps.</text>
+<text class="b" x="24" y="221">Past R:</text>
+<text class="s" x="120" y="221">each rank attends over its own pages; the top-2048 candidates merge across ranks.</text>
+<text class="b" x="24" y="240">Past L:</text>
+<text class="s" x="120" y="240">the same shards live on the KV node. Hot rows stay in a GPU resident pool; a selected row that is</text>
+<text class="s" x="120" y="259">not resident is read over RDMA before attention. L defaults to R, drawn apart here for clarity.</text>
+<text class="s" x="120" y="278">Indexer keys and the MTP layer stay on the GPU at every position.</text>
+<line class="rule" x1="24" y1="305" x2="856" y2="305"/>
+<text class="h" x="24" y="339">When the pool lets a run go</text>
+<rect class="pool" x="24" y="361" width="230" height="104" rx="10"/>
+<text class="poolt" x="38" y="387">GPU KV pool</text>
+<text class="s" x="38" y="409">live sessions and retained runs;</text>
+<text class="s" x="38" y="426">a request that continues a run</text>
+<text class="s" x="38" y="443">reuses its pages</text>
+<rect class="ssd" x="318" y="361" width="246" height="104" rx="10"/>
+<text class="ssdt" x="332" y="387">Store 0: local SSD</text>
+<text class="s" x="332" y="409">keep=system, persist=on</text>
+<text class="s" x="332" y="426">system prompts and tools, once</text>
+<text class="s" x="332" y="443">each; kept across restarts</text>
+<rect class="node" x="636" y="361" width="220" height="104" rx="10"/>
+<text class="nodet" x="650" y="387">Store 1: KV node RAM</text>
+<text class="s" x="650" y="409">keep=all, over RDMA</text>
+<text class="s" x="650" y="426">every other evicted run, with</text>
+<text class="s" x="650" y="443">each rank's shard past R</text>
+<path class="arrow" d="M258,407 L312,407"/>
+<text class="s" x="286.0" y="399" text-anchor="middle">system</text>
+<text class="s" x="286.0" y="423" text-anchor="middle">prefix</text>
+<path class="arrow" d="M568,407 L630,407"/>
+<text class="s" x="600.0" y="399" text-anchor="middle">full: oldest</text>
+<text class="s" x="600.0" y="423" text-anchor="middle">move on</text>
+<path class="arrow" d="M139.0,469 C139.0,511 746.0,511 746.0,471"/>
+<text class="s" x="442.5" y="517" text-anchor="middle">any other run the pool evicts</text>
+<text class="s" x="24" y="547">A request that continues a stored entry reads its pages back into the pool and skips their prefill. Stores are tried</text>
+<text class="s" x="24" y="564">in order. A stored block is valid only for the R, rank count, block format and engine build that wrote it.</text>
+</svg>

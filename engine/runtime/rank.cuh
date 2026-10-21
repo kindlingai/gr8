@@ -249,6 +249,10 @@ struct CpState
     unsigned long long pf_g = 0;      // global pool-use counter: layer i of a sub-batch is use pf_g0 + i, pool (use % 2)
     unsigned long long pf_g0 = 0;     //   (not i % 2: 79 layers is odd); pf_g0 = pf_g at cp_pf_enter, pf_g += nl at exit
     void* pf_net = nullptr;           // g6m4: CpPfNet (prefill.cuh), the real-fabric gather; null = loopback (m4sim)
+    int phys = 0;                     // remote rows release: physical pages of each CP binding (0 = every tail page)
+    // remote rows release (rt_rows.cuh): after the real-fabric fill of layer i's pool (the pages below start this rank
+    // holds), the pages it released, from the rows store; null = none
+    std::function<void(int i, int start, char* pool, size_t ixoff, cudaStream_t st)> rt_stage;
 };
 // binder rule (engine/attn/bind.cu): the layers that run their own indexer
 inline bool cp_full_index(int l) { return l == 78 || l <= 2 || (l - 2) % 4 == 0; }
@@ -647,7 +651,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         {
             if (y.indexer != cp_full_index(y.l)) die("G6_CP: layer " + std::to_string(y.l) + " indexer flag disagrees with the binder rule");
             if (m.cp.colls.q.size() != (size_t)m.nl || (m.cp.colls.cand[i] >= 0) != y.indexer) die("G6_CP: colls do not match the layer list");
-            G6RT_CK(g6_attn_bind_create_cp(&y.ab, &y.ap, rank, y.l, capacity, attn_rows, ATT_QT, m.cp.R, g6nr::NR, st, m.dscratch, m.dscratch_bytes));
+            G6RT_CK(g6_attn_bind_create_cp_phys(&y.ab, &y.ap, rank, y.l, capacity, attn_rows, ATT_QT, m.cp.R, g6nr::NR, m.cp.phys, st, m.dscratch, m.dscratch_bytes));
         }
         else
 #endif

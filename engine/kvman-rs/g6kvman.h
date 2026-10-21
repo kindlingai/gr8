@@ -187,6 +187,42 @@ int g6kv_tier_write_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, v
 int g6kv_tier_read_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, void* const* bufs);
 // staging memory a KV node's RDMA device may read and write directly (a no-op for the other stores)
 int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
+// Remote attention rows (src/rows.rs, the engine's G6_RT_STORE tier): a store of `bytes` ("mem:" or "remote:HOST:PORT",
+// a lease named `name`), and a helper thread that serves each group's request ring. Its first G6KV_ROWS_HEADER bytes
+// hold the layout the records were written under: open writes `layout` into an empty store and refuses a store that
+// names another one. The GPU fills a ring's entries, then stores seq (system-scope release); the thread reads each
+// entry's record (rec bytes at off) into slots + slot * rec, then stores *done = seq (u64 max: a read failed or an
+// entry was out of range). Errors: -1 with g6kv_tier_error.
+struct g6kv_rows;
+struct g6kv_rows_ent { uint64_t off; uint32_t slot, pad; };
+struct g6kv_rows_req { uint64_t seq; uint32_t n, pad; };   // cap g6kv_rows_ent follow it
+#define G6KV_ROWS_HEADER 4096
+// (pool) remote rows release: a split run's main pages past its prefix (0 = off; needs g6kv_tail, before any grant),
+// and the records of each rank's rows store (0 = no limit): a window request whose tail needs more waits
+// runs: the most window runs live at once (0 = no limit): the engine's slot pool covers that many sessions past R
+int g6kv_window(g6kv_pool* p, uint32_t pages, uint32_t ids, uint32_t runs);
+uint32_t g6kv_window_runs(const g6kv_pool* p);
+// (pool) whether a retained run holds exactly these pages (a window run's records live while it does)
+int g6kv_is_kept(const g6kv_pool* p, const uint32_t* pages, size_t n);
+// (pool) a window request of `worst` rows with a record limit: 1 and {records per rank it needs, free, in all} in out
+int g6kv_ids_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
+// (pool) a request of `worst` rows past R: 1 and {pages below place, pages above, free below, free above} in out
+int g6kv_split_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
+int g6kv_rows_open(const char* spec, const char* name, const char* layout, uint64_t bytes, g6kv_rows** out);
+void g6kv_rows_free(g6kv_rows* r);
+int g6kv_rows_write(const g6kv_rows* r, uint64_t off, const void* buf, size_t len);
+// n pieces of len bytes, piece k at store byte offs[k], into dst + k * len (the engine's prefill staging of released
+// pages; not while a decode request is in flight)
+int g6kv_rows_gather(const g6kv_rows* r, const uint64_t* offs, size_t n, size_t len, void* dst);
+int g6kv_rows_register(const g6kv_rows* r, void* p, size_t len);
+// before g6kv_rows_start; returns the group's index
+// slots: nslots of `stride` bytes; a record of `rec` bytes lands at byte `off` of its slot (an INT4 record at the tail of
+// its FP8 slot, unpacked in place)
+int g6kv_rows_group(g6kv_rows* r, g6kv_rows_req* req, uint64_t* done, void* slots, size_t rec, size_t stride, size_t off,
+                    uint32_t nslots, uint32_t cap);
+void g6kv_rows_start(g6kv_rows* r);
+uint64_t g6kv_rows_fetched(const g6kv_rows* r);
+void g6kv_rows_describe(const g6kv_rows* r, char* buf, size_t cap);
 // A session's KV in a form independent of the layout (src/canon.rs, #152): per binding and token, in order, the MLA
 // latent row and, on full-index layers, the indexer key row (128 codes, then its FP32 scale). Host memory only: the
 // caller copies the pages between the device and the buffers. flags[b]: 1 = binding b has index keys, 2 = its cache is

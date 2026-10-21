@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-10-20: remote attention rows
+
+- `--kv-rows STORE,size=N` (experimental, off by default) puts each rank's attention rows past `SHARE_LIMIT` in a rows
+  store, a KV node (`remote:auto`) or memory, as their pages fill. After each indexer selection the rows it picked are
+  fetched into resident slots, under the candidate merge, so decode reads them as if they were local.
+- `local=PAGES` releases a page once its rows are in the store: a session's tail cycles through that many local pages a
+  rank, and the S2 pool gives the MTP drafter its own tail pages so none is ever released under it. A prefill chunk
+  reads the released pages it needs from the store. A finished session with released pages is retained with its store
+  records, so its next turn adopts them and prefills only the new rows; block stores (`--kv-store`) copy at most its
+  first `SHARE_LIMIT` tokens, and an evicted one's records are freed.
+- `place=PAGES` caps the main model's KV pages a rank, so `--cap` may pass the context they would hold. `size=` is the
+  per-rank lease, and a session waits until its tail fits it. `fmt=int4` stores 416 B rows for 656.
+- A long prefill no longer trips the shim's stall timeout: rank 0 writes an `f` line after every prefill quantum, which
+  the shim takes as life. When the shim does give up on a request (engine silent, unreadable resp), it now CANCELs it
+  instead of leaving the engine to prefill and decode it to the end.
+- A prefill reads only the staged layer's rows of each released page (`G6_RT_PF_SLICE=0`: the group's whole block).
+- The MTP draft prefill borrows the target prefill's tensor-core scratch by default (`G6_PF_DRAFT_SHARE`; 0 = its own
+  root), about 2 GB a rank at a 655,360-token pool, output unchanged. With it, `place=1600` at `--cap 655360` leaves
+  stock serving's headroom on TP=4.
+- On the TP=4 cluster: a 41,399-token request with 40 local pages a rank finished in 39 s with the same output as
+  without release; 35 pages were released and at most 32 of the 40 were in use. A 445,855-token prompt prefills in
+  613 s, and its next turn answers in 11 s from the retained records.
+
+## 2026-10-20: each KV store can keep its own kind (`keep=`)
+
+- `--kv-store STORE,size=N,keep=system|sessions|all` sets what that store keeps; a store without `keep=` takes
+  `--kv-keep`. Placement already went to the first store that takes an entry's kind, so
+  `ssd:...,persist=on,keep=system;remote:auto,size=4G,keep=all` keeps system prompts on the SSD across restarts and
+  every other evicted run on the KV node. Before, every store took `--kv-keep`, and the deprecated `--kv-tier`'s
+  per-tier `keep=` was parsed and then ignored.
+- On the TP=4 cluster with that config: a 153,580-token session evicted to the KV node came back in 4.1 s (136 s
+  cold), each rank restoring 2,872 pages (its first 32,768 tokens and its shard of the tail) in 0.55 s.
+- `docs/kv-tiers.svg` draws the tiers: replicated below `SHARE_LIMIT`, sharded past it, and the stores below the pool.
+
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)

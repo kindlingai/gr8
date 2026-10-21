@@ -102,7 +102,7 @@ public:
         auto req = request(g.req.id, r);
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
                 req.steering == g.req.steering &&
-                (grant_pages(config_, req) == g.run.pages || reserve_pages(config_, req) == g.run.pages), "session payload/grant mismatch");
+                grant_pages_ok(config_, req, g.run.pages), "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
@@ -129,6 +129,13 @@ public:
         for (int r = 0; r < M && pos0 + r + 1 < int(s.payload.prompt.size()); ++r)
             s.emitter.push_prompt(pos0 + r + 1, logprob(r, true, s.sampling.plp));
         output_ok(s.emitter);
+    }
+    // after a prefill quantum: "f <rows>", the prompt rows prefilled so far (the front end takes it as life, not text)
+    void progress(Key k, uint32_t rows) {
+        auto& s = get(k);
+        if (!s.emitter.f) return;
+        fprintf(s.emitter.f, "f %u\n", rows);
+        require(!fflush(s.emitter.f), "S2 progress output failed"); output_ok(s.emitter);
     }
     // row: the row of ids[0] in the last main step
     Emission emit(Key k, const int* ids, int count, int row, const Logprob& logprob) {

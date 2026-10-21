@@ -40,6 +40,9 @@
 //! src/tier.rs is a proof of concept of an SSD store for retained runs (SSD-TIER.md), and src/remote a KV node that
 //! serves the same blocks from another box's locked memory over RDMA or TCP (REMOTE-TIER.md). The engine uses
 //! neither.
+//!
+//! src/rows.rs is the remote attention rows tier (the engine's G6_RT_STORE): a group's latent rows past L in a
+//! store, and a helper thread that fetches the rows a decode step selects into the engine's resident slots.
 
 pub mod blocks;
 pub mod canon;
@@ -47,6 +50,7 @@ pub mod ffi;
 pub mod pool;
 pub mod remote;
 pub mod reuse;
+pub mod rows;
 pub mod stash;
 pub mod tier;
 

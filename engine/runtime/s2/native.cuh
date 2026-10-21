@@ -134,6 +134,11 @@ struct NativeContext {
     std::function<unsigned()> extra_error;
     // optional: a draft step's extra fabric work after its draft fabric enqueue (G6_MTP_SPLIT: the draft gathers)
     std::function<void(unsigned long long step, int rows)> enqueue_draft_extra;
+    // optional (G6_RT_STORE): before a main step's launch, with its inputs (spills its sessions' committed pages), and
+    // before a prefill quantum of a slot, rows first .. first + rows - 1 (M1: drops its remote pages; release: spills
+    // the pages before first and maps the quantum's)
+    std::function<void(const g6rt::StepIn&, const g6rt::S2In&)> before_main;
+    std::function<void(const Slot&, uint32_t first, uint32_t rows)> before_prefill;
 };
 class NativeDispatch {
     NativeContext c_;
@@ -245,6 +250,7 @@ class NativeDispatch {
         const int rows = l.step.M();
         S2Timeline& tl = s2_tl(); tl.enter();
         g6rt::StepIn input{}; g6rt::S2In layout{}; native_inputs(l,input,layout);
+        if (!draft && c_.before_main) c_.before_main(input,layout);
         if (l.solo >= 0) input.page_bound = model.s2->pool_pages;   // the solo tables hold -1 past the session's pages
         if (draft && c_.main.rs) for (int r = 0; r < rows; ++r) input.srow[r].inv_temp = 0.f;   // rejection sampling: greedy drafts
         require(model.s2on == (l.solo < 0), "native solo mode differs from host");
@@ -299,6 +305,7 @@ class NativeDispatch {
         const auto t0 = std::chrono::steady_clock::now();   // for the error-word line: a ~10 s quantum is a GPU wait timeout
         s2_tl().cut();
         require(rows <= uint64_t(c_.prefill_rows)*(c_.two_lanes?2:1), "prefill quantum exceeds native lanes");
+        if (c_.before_prefill) c_.before_prefill(slot,first,rows);
         c_.begin_prefill(slot); // real run/view selector supplied by TP4/fc2
         const int a = int(first), ma = std::min(int(rows),c_.prefill_rows), mb = int(rows)-ma;
         std::vector<int> pos(rows); for (unsigned r=0;r<rows;++r) pos[r]=a+int(r);

@@ -160,8 +160,21 @@ __device__ int page(const DeviceAttn& a,int pos){
     if(pos<0 || pos>=a.live_context || pos/a.page_size>=a.table_size){error(a,1);return -1;}
     int p=a.block_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;
 }
+// page() for reads: a released page of the rows tier (page_count .. page_count + rt_vpages - 1) is valid too. Writes
+// keep page(): a row is only appended to a page that is still local.
+__device__ __forceinline__ int page_rd(const DeviceAttn& a,int pos){
+    if(pos<0 || pos>=a.live_context || pos/a.page_size>=a.table_size){error(a,1);return -1;}
+    int p=a.block_table[pos/a.page_size];
+    if(p<0||p>=a.page_count+(a.rt_page?a.rt_vpages:0)){error(a,2);return -1;}return p;
+}
+// page()'s checks and errors; a page flagged remote reads its row from the group's resident slot when it has one. A
+// released page has no local row to fall back on: no slot is error 0x40000 (the resolve had no room).
 __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
-    int p=page(a,pos);return p<0?nullptr:(const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*KV_BYTES;
+    int p=page_rd(a,pos);if(p<0)return nullptr;
+    const int64_t row=(int64_t)p*a.page_size+pos%a.page_size;
+    if(a.rt_page&&a.rt_page[p]){const int s=a.rt_table[row];if(s>=0)return a.rt_rows+(int64_t)s*a.rt_stride;}
+    if(p>=a.page_count){error(a,0x40000);return nullptr;}
+    return (const uint8_t*)a.mla_cache+row*KV_BYTES;
 }
 #if defined(G6_CP) && G6_CP
 // CP: index keys are stored as the latent: on the pages of the block table (the replicated prefix, then this rank's
@@ -170,20 +183,21 @@ __device__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
 __device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){
     if(a.index_table){if(pos<0||pos>=a.live_context||pos/a.page_size>=a.table_size){error(a,1);return -1;}
         const int p=a.index_table[pos/a.page_size];if(p<0||p>=a.page_count){error(a,2);return -1;}return p;}
-    return page(a,pos);
+    return page_rd(a,pos);
 }
 #else
-__device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){return page(a,pos);}
+__device__ __forceinline__ int ipage(const DeviceAttn& a,int pos){return page_rd(a,pos);}
 #endif
+// a released page's index keys stay on this rank, in the rows tier's arena (rt_ix)
 __device__ const uint8_t* ik_at(const DeviceAttn& a,int pos,float& scale){
     int p=ipage(a,pos);if(p<0){scale=0;return nullptr;}
-    const uint8_t* base=(const uint8_t*)a.index_cache+(int64_t)p*a.page_size*IDX_BYTES;
+    const uint8_t* base=p<a.page_count?(const uint8_t*)a.index_cache+(int64_t)p*a.page_size*IDX_BYTES:
+        a.rt_ix?a.rt_ix+(int64_t)(p-a.page_count)*a.page_size*IDX_BYTES:nullptr;
+    if(!base){error(a,0x40000);scale=0;return nullptr;}
     scale=((const float*)(base+a.page_size*128))[pos%a.page_size];return base+(pos%a.page_size)*128;
 }
-#if G6_KV4
-__device__ float latent(const uint8_t* v,int d){return (float)(((v[d>>1]>>((d&1)*4))&15)-8)*__half2float(((const half*)(v+g6kv::SCALE_OFF))[d>>5]);}
 // x[k] = element lane + 32 k of a 512-vector held by one warp -> H x, unscaled (Sylvester order: bits 0-4 are the lane,
-// bits 5-8 are k). Every lane of the warp must call it.
+// bits 5-8 are k). Every lane of the warp must call it. Also in an FP8 build: the remote rows' INT4 records (rt.cuh).
 __device__ __forceinline__ void fwht16(float (&x)[16],int lane){
     #pragma unroll
     for(int h=1;h<16;h<<=1){
@@ -195,6 +209,16 @@ __device__ __forceinline__ void fwht16(float (&x)[16],int lane){
         for(int k=0;k<16;k++){const float y=__shfl_xor_sync(0xffffffff,x[k],o);x[k]=(lane&o)?y-x[k]:x[k]+y;}}
 }
 constexpr float HSCALE=0.04419417382415922f;   // 1/sqrt(512): H is orthonormal, so H^-1 = H
+// the INT4 row's quantizer, one 32-dim group, a dim a lane: s := the group's FP16 scale amax / 7, returns the lane's
+// code q + 8, q in -7..7
+__device__ __forceinline__ int kv4_code(float x,half& s){
+    s=__float2half_rn(warp_max(fabsf(x))*(1.f/7.f));const float sf=__half2float(s);
+    return (sf>0.f?(int)fminf(fmaxf(rintf(x/sf),-7.f),7.f):0)+8;
+}
+// the FP8 row's scale of one 128-dim group
+__device__ __forceinline__ float fp8_scale(float amax){return fmaxf(amax/448.f,FLT_MIN);}
+#if G6_KV4
+__device__ float latent(const uint8_t* v,int d){return (float)(((v[d>>1]>>((d&1)*4))&15)-8)*__half2float(((const half*)(v+g6kv::SCALE_OFF))[d>>5]);}
 // rows of 512 floats := H x (decode: the absorbed query before scores, the context before value_project). Warp per row.
 __global__ void fwht_rows(float* p,int rows){
     const int row=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(row>=rows)return;
@@ -236,13 +260,12 @@ __device__ __forceinline__ void append_kv_row(Input input,int row){
     uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
     {const int w=t>>5,l=t&31;
      for(int g=2*w;g<2*w+2;g++){const float x=v[g*32+l];if(!isfinite(x))error(a,4);
-        const half s=__float2half_rn(warp_max(fabsf(x))*(1.f/7.f));const float sf=__half2float(s);
-        const int q=sf>0.f?(int)fminf(fmaxf(rintf(x/sf),-7.f),7.f):0;code[g*32+l]=(uint8_t)(q+8);
+        half s;code[g*32+l]=(uint8_t)kv4_code(x,s);
         if(l==0)((half*)(dst+g6kv::SCALE_OFF))[g]=s;}}
     __syncthreads();
     dst[t]=(uint8_t)(code[2*t]|(code[2*t+1]<<4));
 #else
-    if(t<4){float mx=0;for(int d=t*128;d<(t+1)*128;d++)mx=fmaxf(mx,fabsf(v[d]));sc[t]=fmaxf(mx/448.f,FLT_MIN);}
+    if(t<4){float mx=0;for(int d=t*128;d<(t+1)*128;d++)mx=fmaxf(mx,fabsf(v[d]));sc[t]=fp8_scale(mx);}
     __syncthreads();
     uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
     for(int d=t;d<512;d+=256){if(!isfinite(v[d]))error(a,4);dst[d]=q4(v[d]/sc[d/128]);}
@@ -258,6 +281,7 @@ template<int NH,class Input>
 __device__ __forceinline__ void append_index_row(Input input,int r,int t,int hf){
     auto a=resolve(input);if(!a.active)return;
     int pos=a.positions[r];FOR_ROW(a,input,r);CP_REMOTE_ROW(a,pos)int pg=ipage(a,pos);if(pg<0)return;   // CP: the page's owner appends it, as append_kv
+    if(pg>=a.page_count){error(a,2);return;}   // a released page (rows tier) is never written
     __shared__ float v_[NH][128],sum_[NH][4],scale_[NH];float* v=v_[hf];float* sum=sum_[hf];float& scale=scale_[hf];
     float x=hfloat(a.index_k,(int64_t)r*128+t),s=warp_sum(x);if((t&31)==0)sum[t/32]=s;__syncthreads();
     float mean=(sum[0]+sum[1]+sum[2]+sum[3])/128;
@@ -639,6 +663,7 @@ static Work workspace(const G6Attn& a,void* base){
 }
 #include "kv4.cuh"
 #include "decode-small.cuh"
+#include "rt.cuh"
 template<class Input>
 static void threshold_compact(const G6Attn& a,Input input,Work& w,int count,cudaStream_t stream){
     const int chunks=(a.context+RADIX_CHUNK-1)/RADIX_CHUNK;
@@ -887,12 +912,15 @@ static cudaError_t cp_index_body(const G6Attn& a,Input input,Work& w,uint64_t* c
     // J5 select paths (make_index): <= 32768 scores in w.si; > 32768 one row: scores in w.s1 (1 x T); > 32768 several
     // rows: chunked, the last chunk_merge leaves the merged keys (chunk_key == cp_key) in w.carry
     cudaError_t e=make_index(a,input,w,0,n,stream,nullptr);if(e!=cudaSuccess)return e;
+    if(a.rt_group)rt_resolve<<<1,1024,0,stream>>>(input,n);
     if(a.context>32768&&n>1){cudaError_t c=cudaMemcpyAsync(mine,w.carry,(size_t)n*TOP*8,cudaMemcpyDeviceToDevice,stream);return c!=cudaSuccess?c:cudaGetLastError();}
     cp_cand_pack<<<n,256,0,stream>>>(input,0,a.context>32768?w.s1:w.si,mine);
 #else
     prep_index<<<dim3(n,32),128,0,stream>>>(input,0,w.iq,w.weights);
     LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
     cudaError_t e=SELECT_INDEX(a,input,w,0,n,stream);if(e!=cudaSuccess)return e;
+    // remote rows: my local list holds every key of mine the merge can keep, so the fetch runs under the all-gather
+    if(a.rt_group)rt_resolve<<<1,1024,0,stream>>>(input,n);
     cp_cand_pack<<<n,256,0,stream>>>(input,0,w.si,mine);
 #endif
     return cudaGetLastError();
@@ -1017,6 +1045,10 @@ extern "C" int g6_attn_cp_index(const G6Attn* a,const G6AttnStepCell* cell,void*
 extern "C" int g6_attn_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell,const uint64_t* cand_all,void* s){
     if(!ga::cp_ok(a)||!cand_all||a->reuse_indices)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
+    if(a->rt_group)ga::rt_wait<<<1,32,0,stream>>>(a->rt_group,a->error);   // every scores launch of the layer follows
+#if !G6_KV4
+    if(a->rt_group&&a->rt_int4)ga::rt_unpack<<<64,256,0,stream>>>(a->rt_group);
+#endif
     if(cell)ga::cp_merge<<<a->rows,256,0,stream>>>(ga::ReplayInput{*a,cell},0,cand_all);
     else ga::cp_merge<<<a->rows,256,0,stream>>>(*a,0,cand_all);
     return (int)cudaGetLastError();
@@ -1037,3 +1069,19 @@ extern "C" int g6_attn_cp_qabs(const G6Attn* a,void* scratch,const float** q,con
     *q=w.q;*rope=w.rope;return 0;
 }
 #endif
+extern "C" int g6_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+#if G6_KV4
+    (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
+#else
+    if(n<=0)return 0;
+    ga::rt_convert<true><<<(n+7)/8,256,0,(cudaStream_t)s>>>((const uint8_t*)src,ss,(uint8_t*)dst,ds,n);return (int)cudaGetLastError();
+#endif
+}
+extern "C" int g6_rt_unpack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+#if G6_KV4
+    (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
+#else
+    if(n<=0)return 0;
+    ga::rt_convert<false><<<(n+7)/8,256,0,(cudaStream_t)s>>>((const uint8_t*)src,ss,(uint8_t*)dst,ds,n);return (int)cudaGetLastError();
+#endif
+}

@@ -341,6 +341,46 @@ impl RemoteStore {
         }
     }
 
+    /// Reads each (lease offset, destination, bytes) into its own destination. Over TCP one GATHER round trip, over
+    /// RDMA one chain of reads on one lane when every destination is inside a registered region, else one gather per
+    /// destination through the staging buffer.
+    ///
+    /// # Safety
+    /// Each destination must be valid for its bytes and no other thread may touch it during the call.
+    pub unsafe fn read_scatter(&self, ops: &[(u64, *mut u8, usize)]) -> io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let keys: Option<Vec<u32>> = ops.iter().map(|&(_, p, n)| self.lkey(p as usize, n)).collect();
+        if let (Some(keys), Some(r)) = (keys, self.rdma.as_ref()) {
+            let mut g = self.lane();
+            if let Lane::Rdma(l) = &mut *g {
+                let v: Vec<_> = ops.iter().zip(&keys).map(|(&(o, p, n), &k)| (o, p as u64, n as u32, k)).collect();
+                return post_wait(l, r, verbs::WR_RDMA_READ, &v);
+            }
+        }
+        if self.rdma.is_none() {
+            let mut g = self.lane();
+            if let Lane::Tcp(s) = &mut *g {
+                let mut b = Header::new(proto::GATHER, ops.len() as u64, 0, 0).bytes().to_vec();
+                for &(o, _, n) in ops {
+                    b.extend_from_slice(&o.to_le_bytes());
+                    b.extend_from_slice(&(n as u64).to_le_bytes());
+                }
+                s.write_all(&b)?;
+                proto::reply(s)?;
+                for &(_, p, n) in ops {
+                    s.read_exact(std::slice::from_raw_parts_mut(p, n))?;
+                }
+                return Ok(());
+            }
+        }
+        for &(o, p, n) in ops {
+            self.read_at_off(o, std::slice::from_raw_parts_mut(p, n))?;
+        }
+        Ok(())
+    }
+
     /// RDMA only: one read at any remote address and rkey, with no check here. The isolation check uses it to show
     /// that the NIC refuses another lease's region. A refused read breaks its lane.
     pub fn raw_read(&self, raddr: u64, rkey: u32, len: usize) -> io::Result<()> {

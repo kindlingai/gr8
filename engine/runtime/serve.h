@@ -13,6 +13,8 @@
 //                                                        (lp: logprob of the token; rank: 1 = best, -1 = beyond the top 20;
 //                                                        then n top entries, best first)
 //       p <j> <lp> <rank> <n> <id>:<lp> ..               with plp: prompt token j (1 <= j < prompt length), before the first t
+//       f <rows>                                         S2 (--serve): rows of the prompt prefilled so far, after each prefill
+//                                                        quantum; a long prefill's sign of life, before the first t
 //       t <id> <id> ..                                   newly committed tokens
 //       m <rounds> <draft_tokens> <accepted> <acc_pos0> ..   cumulative MTP counters since start
 //       end <stop|length|error> <stop_id|-1> <completion_tokens>

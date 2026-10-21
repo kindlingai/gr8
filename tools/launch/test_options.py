@@ -322,6 +322,10 @@ class KvStoreTests(unittest.TestCase):
                          [('ssd', '/nvme/gr8kv', None, None, '200G'), ('remote', None, '192.0.2.5', '7350', '8G')])
         self.assertEqual([x['persist'] for x in t], [False, False], 'an SSD store starts empty unless persist=on')
         self.assertTrue(opt.kv_stores(self.plan('--kv-store', a + ',persist=on')[0])[0]['persist'])
+        # a store's own keep= reaches the engine as written; the others take --kv-keep
+        o, p = self.plan('--kv-store', a + ',persist=on,keep=system', '--kv-store', b + ',keep=all')
+        self.assertEqual(self.stores(p), [a + ',persist=on,keep=system', b + ',keep=all'])
+        self.assertEqual([x['keep'] for x in opt.kv_stores(o)], ['system', 'all'])
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
@@ -347,13 +351,62 @@ class KvStoreTests(unittest.TestCase):
     def test_refusals(self):
         v = ValidateTests()
         for argv, want in ((['--kv-store', 'nvme:/x,size=8G'], 'the store is'), (['--kv-store', 'ssd:/x'], 'size=N'),
-                           (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=all'], '--kv-keep'),
+                           (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=most'], 'keep=system, sessions or all'),
                            (['--kv-store', 'remote:192.0.2.5:7350,size=8G,persist=on'], 'for ssd:'),
                            (['--kv-store', 'ssd:/x,size=8G,persist=yes'], 'persist=on|off'),
                            (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-system-after', '0'], 'from 1'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-write-limit', 'lots'], 'per page computed')):
+            v.check(['--peers', PEERS, *argv], want)
+
+
+class KvRowsTests(unittest.TestCase):
+    def plan(self, *argv, kv_rows=None, env=None):
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        opt.validate(o)
+        return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_rows=kv_rows)
+
+    def rt(self, p):
+        return {k: v for k, _, v in (e.partition('=') for e in p['env']) if k.startswith('G6_RT_')}
+
+    def test_off_by_default(self):
+        o, p = self.plan()
+        self.assertIsNone(opt.kv_rows(o))
+        self.assertEqual(self.rt(p), {})
+        self.assertEqual(self.rt(self.plan('--kv-rows', 'off')[1]), {})
+
+    def test_every_part_reaches_the_engine(self):
+        o, p = self.plan('--kv-rows', 'remote:192.0.2.5:7350,size=12G,local=40,pool=49152,place=900,fmt=int4')
+        self.assertEqual(self.rt(p), {'G6_RT_STORE': 'remote:192.0.2.5:7350', 'G6_RT_SIZE': str(12 << 30), 'G6_RT_LOCAL': '40',
+                                      'G6_RT_POOL': '49152', 'G6_RT_PLACE': '900', 'G6_RT_FMT': 'int4'})
+        t = opt.kv_rows(o)
+        self.assertEqual((t['kind'], t['host'], t['port'], t['size'], t['local']), ('remote', '192.0.2.5', '7350', '12G', 40))
+        # mem: (one box's memory, a test) and a fractional size
+        self.assertEqual(self.rt(self.plan('--kv-rows', 'mem:,size=1.5M')[1]), {'G6_RT_STORE': 'mem:', 'G6_RT_SIZE': str(3 << 19)})
+        # the environment form
+        self.assertEqual(self.rt(self.plan(env={'KV_ROWS': 'mem:,size=1G,local=8'})[1]),
+                         {'G6_RT_STORE': 'mem:', 'G6_RT_SIZE': str(1 << 30), 'G6_RT_LOCAL': '8'})
+
+    def test_remote_auto_is_resolved_per_box(self):
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], {})
+        opt.validate(o)
+        self.assertEqual(opt.kv_rows(o)['host'], 'auto')
+        rows = opt.kv_rows_with(o, '10.1.0.20:7351')
+        self.assertEqual(rows, 'remote:10.1.0.20:7351,size=8G,local=40')
+        p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_rows=rows)
+        self.assertEqual(self.rt(p)['G6_RT_STORE'], 'remote:10.1.0.20:7351')
+        self.assertIn('G6_RT_STORE=remote:auto', opt.canonical(o, opt.engine_plan(o), None)[1])
+
+    def test_refusals(self):
+        v = ValidateTests()
+        for argv, want in ((['--kv-rows', 'ssd:/x,size=8G'], 'the store is'), (['--kv-rows', 'remote:auto:7350,size=8G'], 'the store is'),
+                           (['--kv-rows', 'mem:'], 'size=N'), (['--kv-rows', 'mem:,size=8'], 'want size='),
+                           (['--kv-rows', 'mem:,size=8G,local=0'], 'want size='), (['--kv-rows', 'mem:,size=8G,fmt=fp4'], 'fmt=fp8|int4'),
+                           (['--kv-rows', 'mem:,size=8G,place=900'], 'place= needs local='),
+                           (['--kv-rows', 'remote:192.0.2.5,size=8G'], 'names the port'),
+                           (['--kv-rows', 'remote:auto,size=8G'], 'name it'),
+                           (['--kv-rows', 'mem:,size=8G,fmt=int4', '--kv-format', 'int4'], 'INT4 already')):
             v.check(['--peers', PEERS, *argv], want)
 
 

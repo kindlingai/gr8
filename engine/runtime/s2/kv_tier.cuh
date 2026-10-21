@@ -245,14 +245,15 @@ public:
     }
 };
 
-// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off]. STORE is ssd:PATH (a folder) or remote:HOST:PORT
+// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off][,keep=system|sessions|all]. STORE is ssd:PATH (a folder) or remote:HOST:PORT
 // (remote:auto is the launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40. persist=on (SSD only) keeps the
-// folder's system prefixes and counts across restarts; off (the default) clears it at boot. The deprecated --kv-tier
-// (old) also takes keep=evicted|shared|all, which g6m4 maps to --kv-keep.
+// folder's system prefixes and counts across restarts; off (the default) clears it at boot. keep= is this store's
+// --kv-keep. The deprecated --kv-tier (old) takes keep=evicted|shared|all instead, which g6m4 maps to --kv-keep.
 struct TierSpec {
     std::string store;
     uint64_t bytes = 0;
-    int keep = 0;   // --kv-tier only: 0 evicted, 1 shared, 2 all
+    int keep = 0;       // --kv-tier only: 0 evicted, 1 shared, 2 all
+    std::string rule;   // --kv-store keep=: system, sessions or all; empty = --kv-keep
     bool persist = false;
     static TierSpec parse(const std::string& v, bool old = false) {
         TierSpec t;
@@ -274,7 +275,9 @@ struct TierSpec {
                 if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": persist=on or off");
                 t.persist = x == "on";
             } else if (k == "keep" && !old) {
-                throw std::runtime_error("--kv-store " + v + ": what the stores keep is --kv-keep system|sessions|all");
+                if (x != "system" && x != "sessions" && x != "all")
+                    throw std::runtime_error("--kv-store " + v + ": keep=system, sessions or all");
+                t.rule = x;
             } else if (k == "keep") {
                 if (x == "evicted") t.keep = 0; else if (x == "shared") t.keep = 1; else if (x == "all") t.keep = 2;
                 else throw std::runtime_error("--kv-tier " + v + ": keep=evicted, shared or all");

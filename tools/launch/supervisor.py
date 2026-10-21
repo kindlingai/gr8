@@ -673,27 +673,43 @@ class Supervisor:
         self.helpers[name] = p
         return p
 
+    def kv_node(self, flag):
+        """host:port of the KV node mentat announces that this box uses, by its rails and rank (mentat.kv_target)."""
+        g = self.o.get('GROUP')
+        try:
+            nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
+        except (OSError, RuntimeError, ValueError) as e:
+            raise Stop(1, f'{flag} remote:auto: mentat: {e}')
+        target = mentat.kv_target(nodes, self.rails, self.rank)
+        if not target:
+            raise Stop(1, f'{flag} remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
+        return target
+
     def kv_store(self):
         """KV_STORE for this box's engine: each remote:auto becomes the KV node mentat announces, by this box's rails."""
         stores = opt.kv_stores(self.o)
         if not any(t['host'] == 'auto' for t in stores):
             return None
-        g = self.o.get('GROUP')
-        try:
-            nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
-        except (OSError, RuntimeError, ValueError) as e:
-            raise Stop(1, f'--kv-store remote:auto: mentat: {e}')
-        target = mentat.kv_target(nodes, self.rails)
-        if not target:
-            raise Stop(1, f'--kv-store remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
+        target = self.kv_node('--kv-store')
         log(f'KV store: the KV node at {target}')
         return ';'.join(t['text'].replace('remote:auto', f'remote:{target}', 1) if t['host'] == 'auto' else t['text']
                         for t in stores)
 
+    def kv_rows(self):
+        """KV_ROWS for this box's engine: remote:auto becomes the KV node by this box's rails, as for KV_STORE (odd ranks
+        on the node's second root)."""
+        t = opt.kv_rows(self.o)
+        if not t or t['host'] != 'auto':
+            return None
+        target = self.kv_node('--kv-rows')
+        log(f'KV rows: the KV node at {target}')
+        return opt.kv_rows_with(self.o, target)
+
     def boot(self):
         o, hs, r = self.o, self.hs, self.rank
         plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.rank_dir(r), aux_dir=self.ms.rank_dir(r), home=self.home,
-                               epoch=hs['epoch'], set_id=self.model_id, kv_store=self.kv_store())
+                               epoch=hs['epoch'], set_id=self.model_id, kv_store=self.kv_store(),
+                               kv_rows=self.kv_rows())
         work = os.path.join(self.home, 's2')
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)

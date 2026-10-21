@@ -10,6 +10,7 @@ It follows the engine code (engine/runtime/s2/ingress.h, sessions.h, service.h, 
     an "a" line, then decodes together with the other sessions: every round (--round-ms, the same for any number of
     sessions) each session commits 1 + accepted tokens ("t" lines); at the end an "m" line and "end"
   - CANCEL: queued -> only "end abort -1 0"; resident -> "m ..." + "end abort -1 <emitted>", slot and run freed;
+  - with --progress-ms, "f <rows>" lines while a resident request prefills (--prefill-ms);
     unknown (already ended) -> nothing
   - anything the real engine would reject (bad header, epoch, duplicate/decreasing id, hash mismatch, request over the
     pool) ends the epoch: DIR/abort.s2, exit 3. DIR/quit = clean exit 0.
@@ -207,6 +208,10 @@ class Fake:
         now = time.monotonic()
         for slot, s in list(self.res.items()):
             if s['ready_at'] > now:
+                if self.a.progress_ms and now >= s.get('next_f', 0):   # the real engine's "f" line after each prefill quantum
+                    s['next_f'] = now + self.a.progress_ms / 1e3
+                    left = (s['ready_at'] - now) / (self.a.prefill_ms / 1e3)
+                    s['f'].write(f'f {int(len(s["prompt"]) * (1 - left))}\n')
                 continue
             acc = ACC[(s['rounds'] + s['id']) % len(ACC)]
             req, ids, done = s['req'], [], False
@@ -293,6 +298,7 @@ if __name__ == '__main__':
     ap.add_argument('--max-rows', type=int, default=8)
     ap.add_argument('--round-ms', type=float, default=20.0)
     ap.add_argument('--prefill-ms', type=float, default=30.0)
+    ap.add_argument('--progress-ms', type=float, default=0.0, help='write an "f" (prefill progress) line this often while a request prefills (0 = never)')
     ap.add_argument('--ready-delay', type=float, default=0.0)
     ap.add_argument('--ready-version', type=int, default=3, help='2: an engine without the insert rule')
     ap.add_argument('--report-reuse', type=int, default=None, help='end every "a" line with this many reused prompt rows (an engine that reports its prefix reuse)')
