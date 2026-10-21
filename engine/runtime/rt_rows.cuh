@@ -102,6 +102,12 @@ struct RtTier
     int pf_k = 0;
     uint64_t pf_pages = 0, pf_bytes = 0;
     double pf_ms = 0;
+    // G6_RT_SELSTAT=1 (measurement, synchronizes the stream): what a prefill that read only the selected rows of
+    // released pages would read: per sampled full-index layer, the distinct selected positions on released pages (every
+    // rank's) against all released rows below the quantum
+    uint8_t* sel_flag = nullptr;      // device [table_size * 64]
+    unsigned long long* sel_n = nullptr;
+    uint64_t sel_rows = 0, sel_rel = 0, sel_layers = 0;
     ~RtTier() { if (store) g6kv_rows_free(store); }
 };
 
@@ -584,6 +590,36 @@ inline RtSpillSeen rt_release(Model& m, RtTier& t, int q, int committed, cudaStr
                 G6RT_CK(cudaMemset((uint8_t*)y.ab.args.mla_cache + (size_t)p * 64 * g6kv::ROW, 0x7f, 64 * g6kv::ROW));
     rt_check(t, "release");
     return seen;
+}
+__global__ void k_rt_selmark(const int* ids, size_t n, int lo, int hi, uint8_t* flag)
+{
+    for (size_t k = (size_t)blockIdx.x * blockDim.x + threadIdx.x; k < n; k += (size_t)gridDim.x * blockDim.x)
+    {
+        const int p = ids[k];
+        if (p >= lo && p < hi) flag[p - lo] = 1;
+    }
+}
+__global__ void k_rt_selcount(const uint8_t* flag, int n, unsigned long long* out)
+{
+    unsigned c = 0;
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) c += flag[k];
+    if (c) atomicAdd(out, (unsigned long long)c);
+}
+// G6_RT_SELSTAT: the prefill lists ids [rows][2048] of this quantum (every lane's) against the released rows [L, rel_end)
+inline void rt_selstat(RtTier& t, const std::vector<std::pair<const int*, int>>& lists, int rel_end, cudaStream_t st)
+{
+    const int lo = t.L, n = rel_end - lo;
+    if (n <= 0) return;
+    if (!t.sel_flag) { t.sel_flag = dmalloc<uint8_t>((size_t)t.tsize * 64); t.sel_n = dmalloc<unsigned long long>(1); }
+    G6RT_CK(cudaMemsetAsync(t.sel_flag, 0, n, st));
+    G6RT_CK(cudaMemsetAsync(t.sel_n, 0, 8, st));
+    for (const auto& [ids, rows] : lists)
+        if (ids && rows > 0) k_rt_selmark<<<1024, 256, 0, st>>>(ids, (size_t)rows * 2048, lo, rel_end, t.sel_flag);
+    k_rt_selcount<<<256, 256, 0, st>>>(t.sel_flag, n, t.sel_n);
+    unsigned long long c = 0;
+    G6RT_CK(cudaMemcpyAsync(&c, t.sel_n, 8, cudaMemcpyDeviceToHost, st));
+    G6RT_CK(cudaStreamSynchronize(st));
+    t.sel_rows += c; t.sel_rel += n; ++t.sel_layers;
 }
 // release: layer i's rows and index keys of every page slot q released below `start` into the staged prefill pools
 // (each {pool, its index offset or 0}, logical page lp at lp), which k_cp_pf_gather / k_cp_pf_fill leave to this.

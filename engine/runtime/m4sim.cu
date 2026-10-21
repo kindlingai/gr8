@@ -1085,8 +1085,16 @@ int main(int argc, char** argv)
             }
         }
     };
+    // G6_RT_SELSTAT=1 (rank 0's tier, G6_PF_OWN=2 lists): what a prefill reading only the selected released rows would read
+    static const bool selstat = getenv("G6_RT_SELSTAT") && atoi(getenv("G6_RT_SELSTAT")) == 1;
+    int sel_ma = 0, sel_mb = 0;
+    auto cp_selstat = [&](int i, int start) {
+        if (selstat && rt[0] && rt[0]->local && R[0].layers[i].indexer && PF[0].idx_all)
+            rt_selstat(*rt[0], {{PF[0].idx_all, sel_ma}, {two ? PF2[0].idx_all : nullptr, sel_mb}}, start / 64 * 64, st);
+    };
     auto cp_gather = [&](int i, int start) {
         if (!cp_pf || cp_break == "gather") return;
+        cp_selstat(i, start);
         if (pf_net) { cp_gather_net(i, start); return; }
         const CpPfSrc s = cp_pf_src(R, i);
         for (Model& m : R) cp_pf_gather(m, s, i, start, st);
@@ -1103,6 +1111,7 @@ int main(int argc, char** argv)
     auto cp_back = [&](int, int, int) {};
 #endif
     auto enqueue_pf = [&](int M, int context, u64 ls0) {
+        sel_ma = M; sel_mb = 0;
         cp_enter();
         for (Model& m : R) pf_embed(m, PF[m.rank], M, st);
         for (int i = 0; i < NL; ++i)
@@ -1135,6 +1144,7 @@ int main(int argc, char** argv)
         auto fin = [&](std::vector<Prefill>& L, const Loop& l, int i, int M, int ctx) {
             pf_deliver_consume_x(L, l, i, M, ctx);
         };
+        sel_ma = MA; sel_mb = MB;
         cp_enter();
         for (Model& m : R) pf_embed(m, PF[m.rank], MA, st);
         pf_stagger(st);                  // G6_PF_STAGGER: one stream here, so only proves the delay changes no output
@@ -2060,6 +2070,10 @@ int main(int argc, char** argv)
                 (unsigned long long)rt_local(*rt[r]), (unsigned long long)rt[r]->released, rt[r]->peak, rt[r]->local);
     for (int r = 0; r < NR && rt[0]; ++r)
         if (rt[r]->check) rt_check_print(("spilled rows, rank " + std::to_string(r)).c_str(), rt[r]->spill_ck);
+    if (rt[0] && rt[0]->sel_layers)
+        fprintf(stderr, "# G6_RT_SELSTAT: %llu sampled layer fills selected %llu of %llu released rows (%.1f%%)\n",
+                (unsigned long long)rt[0]->sel_layers, (unsigned long long)rt[0]->sel_rows, (unsigned long long)rt[0]->sel_rel,
+                100.0 * rt[0]->sel_rows / std::max<uint64_t>(1, rt[0]->sel_rel));
     if (rt[0] && rt[0]->hold)
         for (int r = 0; r < NR; ++r)
             fprintf(stderr, "# G6_RT_CHECK rank %d: every record had one holder after every change; %llu group pages read back, %llu differed\n", r,

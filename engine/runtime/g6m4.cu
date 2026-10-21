@@ -1304,6 +1304,7 @@ int main(int argc, char** argv)
         int rt_layers = -1;                // the slot whose run the layers' tables hold
         std::array<uint32_t, g6s2::MAX_SESSIONS> rt_gen{};   // the generation of the session bound to each slot
         int rt_pf = -1;                    // the slot of the prefill quantum in flight
+        int rt_ma = 0, rt_mb = 0;          // its rows on lane A and B
         if (rtt && rtt->local)
         {
             const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
@@ -1336,16 +1337,30 @@ int main(int argc, char** argv)
                     fprintf(stderr, "# rank 0: G6_RT_LOCAL prefill staging since the last line: %llu released pages a layer summed, %.3f GB read, "
                                     "%.1f ms on the host; next quantum rows %u..\n", (unsigned long long)(rtt->pf_pages - pf_p0),
                             (rtt->pf_bytes - pf_b0) / 1e9, rtt->pf_ms - pf_t0, first);
+                if (R == 0 && rtt->sel_layers)
+                {
+                    fprintf(stderr, "# rank 0: G6_RT_SELSTAT: %llu sampled layer fills selected %llu of %llu released rows (%.1f%%); next quantum rows %u..\n",
+                            (unsigned long long)rtt->sel_layers, (unsigned long long)rtt->sel_rows, (unsigned long long)rtt->sel_rel,
+                            100.0 * rtt->sel_rows / std::max<uint64_t>(1, rtt->sel_rel), first);
+                    rtt->sel_layers = rtt->sel_rows = rtt->sel_rel = 0;
+                }
                 if (rtt->pf_pages > pf_p0 && (rtt->hold || pf_n % 8 == 1)) { pf_p0 = rtt->pf_pages; pf_b0 = rtt->pf_bytes; pf_t0 = rtt->pf_ms; }
                 rt_layers = q;
                 rt_pf = rtt->seq[q].on ? q : -1;
                 if (rt_pf < 0) return;
                 rt_spill(m, *rtt, {}, (int)first, q, st);
                 rt_ensure(m, *rtt, q, (int)(first + rows), st);
+                rt_ma = std::min<int>((int)rows, MP); rt_mb = (int)rows - rt_ma;
             };
             // the real-fabric fill of a staged layer: the quantum's session's released pages, from the store
+            static const bool selstat = getenv("G6_RT_SELSTAT") && atoi(getenv("G6_RT_SELSTAT")) == 1;
             m.cp.rt_stage = [&](int i, int start, char* pool_k, size_t ixoff, cudaStream_t s) {
-                if (rt_pf >= 0) rt_pf_stage(*rtt, rt_pf, i, start, {{pool_k, ixoff}}, s);
+                if (rt_pf < 0) return;
+                rt_pf_stage(*rtt, rt_pf, i, start, {{pool_k, ixoff}}, s);
+                // G6_RT_SELSTAT: at each full-index layer's fill, the lanes' latest lists (the previous full-index
+                // layer's: G6_PF_OWN=2/4 keep them in idx_all) against the released rows below the quantum
+                if (selstat && m.layers[i].indexer && P.idx_all)
+                    rt_selstat(*rtt, {{P.idx_all, rt_ma}, {two ? P2.idx_all : nullptr, rt_mb}}, start / 64 * 64, s);
             };
         }
         try
