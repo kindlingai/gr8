@@ -82,7 +82,7 @@ __global__ void __launch_bounds__(128) k_put_publish_n(const uint4* src, g6::Fab
 inline void pf_env_check()
 {
     std::string e;
-    if (env_choice("G6_PF_DRAFT_SHARE", 1, 0, &e) < 0) die(e);
+    if (env_choice("G6_PF_DRAFT_SHARE", 1, 1, &e) < 0) die(e);
     if (env_choice("G6_PF_QP_EARLY", 2, 0, &e) < 0) die(e);          // G6_PF_OWN=4 (qp.cuh)
     if (env_choice("G6_PF_QP_WARM", 1, 0, &e) < 0) die(e);
     const int roll = env_choice("G6_PF_QP_ROLL", 4, 0, &e);       // 0 = resident pair pack, 2..4 = rolling slots
@@ -93,14 +93,15 @@ inline void pf_env_check()
     if (env_choice("G6_CP_PF_HASH2", 1, 1, &e) < 0) die(e);   // HASH2 build: unset / 1 = hash2, 0 = k_cp_pf_hash, else exit
 #endif
 }
-// G6_PF_DRAFT_SHARE=1: the MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of
-// allocating a second root of the same size. Unset / 0 = today's behaviour exactly.
-inline bool pf_draft_share()
+// G6_PF_DRAFT_SHARE: the MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of
+// allocating a second root of the same size (about 2 GB at a 655,360-token pool). Unset: when the target has one;
+// 1: required (exits without it); 0: a root of its own.
+inline int pf_draft_share()
 {
     std::string e;
-    const int v = env_choice("G6_PF_DRAFT_SHARE", 1, 0, &e);
+    const int v = env_choice("G6_PF_DRAFT_SHARE", 1, 1, &e);
     if (v < 0) die(e);
-    return v == 1;
+    return v == 1 ? (getenv("G6_PF_DRAFT_SHARE") ? 1 : 2) : 0;   // 2: the default, falls back quietly
 }
 __host__ __device__ inline int pf_r0(int M, int p, int nr) { return p * M / nr; }          // first row of rank p
 __host__ __device__ inline int pf_rows(int M, int p, int nr) { return pf_r0(M, p + 1, nr) - pf_r0(M, p, nr); }
@@ -1650,7 +1651,7 @@ struct DraftPrefill
     std::map<int, bindp::Gemm> eh;    // by row count
 };
 // D.d must have been built with max_rows >= Mmax (build_draft(..., max_rows)). f: any prefill-sized region (unused).
-// tc: the target model's prefill of the same rank. With G6_PF_DRAFT_SHARE=1 the draft layer's tensor-core prefill
+// tc: the target model's prefill of the same rank. With G6_PF_DRAFT_SHARE the draft layer's tensor-core prefill
 // state borrows that prefill's scratch root (-1 root allocation) instead of allocating a second identical one; the
 // draft pass runs on the stream the target prefill was joined and synchronized on, so the uses stay serialized.
 inline void build_draft_prefill(DraftPrefill& Q, Draft& D, const Find& find, int Mmax, const g6::FabricDev& f, bool v2, cudaStream_t st,
@@ -1658,12 +1659,14 @@ inline void build_draft_prefill(DraftPrefill& Q, Draft& D, const Find& find, int
 {
     Q.P.v2 = v2;
     G6AttnPrefill* root = nullptr;
-    if (pf_draft_share())
+    const int share = pf_draft_share();
+    const bool can = v2 && tc && !tc->av.empty();
+    if (share == 1 && !v2) die("G6_PF_DRAFT_SHARE=1 needs --pfv2 (without it there is no tensor-core prefill scratch to share)");
+    if (share == 1 && !can) die("G6_PF_DRAFT_SHARE=1: the target prefill has no tensor-core attention states to share");
+    if (share && can)
     {
-        if (!v2) die("G6_PF_DRAFT_SHARE=1 needs --pfv2 (without it there is no tensor-core prefill scratch to share)");
-        if (!tc || tc->av.empty()) die("G6_PF_DRAFT_SHARE=1: the target prefill has no tensor-core attention states to share");
         root = tc->av.front();
-        fprintf(stderr, "# rank %d: G6_PF_DRAFT_SHARE=1: MTP draft prefill borrows the target prefill's tensor-core scratch\n", D.d.rank);
+        fprintf(stderr, "# rank %d: G6_PF_DRAFT_SHARE: MTP draft prefill borrows the target prefill's tensor-core scratch\n", D.d.rank);
     }
     build_prefill(Q.P, D.d, find, Mmax, f, dmalloc<u64>(1), st, nullptr, root);
     const size_t n = (size_t)Mmax;

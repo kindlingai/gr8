@@ -15,8 +15,13 @@
 - A long prefill no longer trips the shim's stall timeout: rank 0 writes an `f` line after every prefill quantum, which
   the shim takes as life. When the shim does give up on a request (engine silent, unreadable resp), it now CANCELs it
   instead of leaving the engine to prefill and decode it to the end.
+- A prefill reads only the staged layer's rows of each released page (`G6_RT_PF_SLICE=0`: the group's whole block).
+- The MTP draft prefill borrows the target prefill's tensor-core scratch by default (`G6_PF_DRAFT_SHARE`; 0 = its own
+  root), about 2 GB a rank at a 655,360-token pool, output unchanged. With it, `place=1600` at `--cap 655360` leaves
+  stock serving's headroom on TP=4.
 - On the TP=4 cluster: a 41,399-token request with 40 local pages a rank finished in 39 s with the same output as
-  without release; 35 pages were released and at most 32 of the 40 were in use.
+  without release; 35 pages were released and at most 32 of the 40 were in use. A 445,855-token prompt prefills in
+  613 s, and its next turn answers in 11 s from the retained records.
 
 ## 2026-10-20: each KV store can keep its own kind (`keep=`)
 

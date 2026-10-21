@@ -58,6 +58,7 @@ the short version.
 | `G6_PF_QP_LAYERS` | all | `G6_PF_OWN=4`: model layers (0-77, list and ranges) that run pair-owner attention; the others run OWN=2 |
 | `G6_PF_QP_MIN` | 768 | `G6_PF_OWN=4`: a prompt shorter than this many tokens runs OWN=2 (OWN=4's fixed per-request cost loses below ~770 tokens); 0 = every request that fits `G6_PF_QP_CTX` runs OWN=4 |
 | `G6_PF_QP_EARLY` | TP4: 1 | `G6_PF_OWN=4`: 1 = send the counterpart's partial before the own rows' o_proj; 2 = also split the QO call in two |
+| `G6_PF_DRAFT_SHARE` | on when the target has tensor-core prefill states | the MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of a second root of the same size (about 2 GB a rank at a 655,360-token pool); the draft pass runs on the stream the target prefill joined, so the uses stay serialized. 1 = required (exits without `--pfv2`), 0 = a root of its own |
 | `G6_PF_QP_WARM` | 0 | `G6_PF_OWN=4`: warm the pair cuBLAS and MXFP8 GEMM shapes at load |
 | `G6_PF_QP_WIRE_E` | 1 | `G6_PF_OWN=4` with `G6_PF_QP_ROLL`: entries (1..4) in the RDMA ring of half images |
 | `G6_PF_QP_ROLL_SER` | 0 | measurement: 1 = build rolling slots on the prefill stream (fully exposed) |
