@@ -19,7 +19,7 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 | aggregate\*, 2 / 4 streams | 53.7 / 67.8 tok/s | 47.9 / 62.2 tok/s | 57.6 / 79.0 tok/s‡ |
 | prefill, 8K prompt, cold | 1,315 tok/s | 654 tok/s | 1,953 tok/s‡ |
 | prefill, 8K prompt, cached | 60,006 tok/s | 57,086 tok/s | – |
-| KV pool (longest context) | 408,832 tokens (513,536 with int4§) | 307,136 tokens (410,624 with int4§) | 614,400 tokens (857,600 with int4§) |
+| KV pool (longest context) | 485,376 tokens (513,536 with int4§) | 307,136 tokens (410,624 with int4§) | 614,400 tokens (857,600 with int4§) |
 | requests that share decode steps | up to 32,768 tokens | up to 32,768 tokens | up to 32,768 tokens |
 | requests decoding at once | 8 | 8 | 8 |
 
@@ -195,7 +195,7 @@ read back as decode selects them.
   and fetches the rows each decode step selects; with `local=PAGES` a long session's tail no longer needs local KV
   pages ([KNOBS.md](KNOBS.md)).
 - `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 513,536 against
-  408,832) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
+  408,832; the fp8 default has since grown to 485,376 and int4 is not re-measured) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
 - `--steering-profile DIR` loads a local schema-v1 profile; with an HF model, `hf:default` or `hf:NAME` explicitly
   selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select the loaded profile with
@@ -235,8 +235,8 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
   each. Its size is the prompt plus `max_tokens`; a chat request without `max_tokens` gets what keeps it within the
   limit, but at least 8,192 tokens, so a prompt past about 57,000 tokens is such a request. Several of them share
   decode steps when the pool has room for each one's replicated prefix: at TP=4's default `SHARE_LIMIT` (32,768 tokens,
-  512 of a rank's 1,981 pages each) two or three stay resident together; `--share-limit 65536` replicates more per
-  session (one resident, faster 32K-64K-context decode) at a shorter longest context (310,528 at TP=4) and shares the replicated
+  512 of a rank's 2,280 pages each) two or three stay resident together; `--share-limit 65536` replicates more per
+  session (one resident, faster 32K-64K-context decode) at a shorter longest context (387,072 at TP=4) and shares the replicated
   prefix only up to 32,768 tokens.
 - A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
   meanwhile. The shim caps those prompts at 1,024 tokens.
