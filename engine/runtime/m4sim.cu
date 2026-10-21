@@ -632,6 +632,7 @@ int main(int argc, char** argv)
     for (Draft& D : DR) D.d.nc = nc;
     // G6_RT_STORE (header): before any prepare, which copies the bindings' arguments into the replay entries
     std::vector<std::unique_ptr<RtTier>> rt(NR);
+    int rt_q = 0;                       // release: the slot the sequence's records are in (G6_RT_ADOPT_SLOT moves them)
     // one sequence on the layers' own tables (the CP map as built, or G6_S2_XLIST's): read them before each spill.
     // Rows below `committed` are written; the next step or chunk writes rows below `end` (release: their local pages)
     auto rt_spill_all = [&](int committed, int end) {
@@ -642,8 +643,8 @@ int main(int argc, char** argv)
             G6RT_CK(cudaStreamSynchronize(st));
             if (!rt[m.rank]->local)
                 G6RT_CK(cudaMemcpy(map.data(), m.layers[0].ab.args.block_table, map.size() * sizeof(int), cudaMemcpyDeviceToHost));
-            rt_spill(m, *rt[m.rank], map, committed, 0, st);
-            rt_ensure(m, *rt[m.rank], 0, end, st);
+            rt_spill(m, *rt[m.rank], map, committed, rt_q, st);
+            rt_ensure(m, *rt[m.rank], rt_q, end, st);
         }
     };
     if (const char* rs = getenv("G6_RT_STORE"))
@@ -677,7 +678,7 @@ int main(int argc, char** argv)
             for (Model& m : R)
             {
                 RtTier* t = rt[m.rank].get();
-                m.cp.rt_stage = [t](int i, int start, char* pool, size_t ixoff, cudaStream_t s) { rt_pf_stage(*t, 0, i, start, {{pool, ixoff}}, s); };
+                m.cp.rt_stage = [t, &rt_q](int i, int start, char* pool, size_t ixoff, cudaStream_t s) { rt_pf_stage(*t, rt_q, i, start, {{pool, ixoff}}, s); };
             }
 #else
         (void)rs;
@@ -863,6 +864,7 @@ int main(int argc, char** argv)
         {
             RtTier& t = *rt[m.rank];
             if (!t.local) { rt_drop_slot(t, 0, st); continue; }
+            rt_end(t, 1, st);   // a G6_RT_ADOPT_SLOT sequence's
 #ifdef DEC_S2
             if (pf_xlist)
             {
@@ -885,14 +887,15 @@ int main(int argc, char** argv)
                 if (rt_mine(t, lp)) win.push_back(b[lp]);
             rt_begin(t, 0, win, {}, st);
             Model* mm = &m;
-            t.write = [&b, mm, &t](int) {
+            t.write = [&b, mm, &t](int qq) {
                 std::vector<int> tab = b;
-                for (int lp = 0; lp < (int)tab.size(); ++lp) if (rt_mine(t, lp)) tab[lp] = t.seq[0].tail[lp];
+                for (int lp = 0; lp < (int)tab.size(); ++lp) if (rt_mine(t, lp)) tab[lp] = t.seq[qq].tail[lp];
                 for (Layer& y : mm->layers)
                     G6RT_CK(cudaMemcpy(const_cast<int*>(y.ab.args.block_table), tab.data(), tab.size() * sizeof(int), cudaMemcpyHostToDevice));
             };
             t.write(0);
         }
+        rt_q = 0;
     };
     loop_d.recv = recv_d; loop_d.stepp = stepp_d; loop_d.ncoll = NCD; loop_d.stride = stride;
     loop.recv = recv; loop.stepp = stepp; loop.ncoll = NC; loop.stride = stride;
@@ -1090,7 +1093,7 @@ int main(int argc, char** argv)
         if (!rt[0] || !rt[0]->local) return;
         std::vector<std::pair<char*, size_t>> pools;     // G6_RT_LOCAL: the released pages, from their owners' stores
         for (Model& m : R) pools.push_back({m.cp.pf_pool[cp_pf_k(m, i)], cp_pf_ixoff(m, i)});
-        for (Model& m : R) rt_pf_stage(*rt[m.rank], 0, i, start, pools, st);
+        for (Model& m : R) rt_pf_stage(*rt[m.rank], rt_q, i, start, pools, st);
     };
     auto cp_back = [&](int i, int a0, int n) { if (cp_pf && cp_break != "back") for (Model& m : R) cp_pf_back(m, i, a0, n, st); };
 #else
@@ -1752,7 +1755,19 @@ int main(int argc, char** argv)
             }
         }
         if (skip && rt[0] && rt[0]->local)   // release: the rows below skip stay, the tail past it goes
-            for (Model& m : R) rt_trim(m, *rt[m.rank], 0, skip, st);
+        {
+            // G6_RT_ADOPT_SLOT=1: the next sequence takes the records over in another slot, as a g6m4 grant at the
+            // boundary its run retires on does (rt_adopt from the retiring slot); the old slot's retirement then finds
+            // nothing. Else in place
+            const int to = getenv("G6_RT_ADOPT_SLOT") && atoi(getenv("G6_RT_ADOPT_SLOT")) == 1 ? 1 - rt_q : rt_q;
+            for (Model& m : R)
+            {
+                RtTier& t = *rt[m.rank];
+                rt_adopt(m, t, rt_q, to, t.seq[rt_q].list, skip, st);
+                rt_end(t, rt_q == to ? 2 : rt_q, st);   // the old slot's retirement
+            }
+            rt_q = to;
+        }
         if (p.first < skip) p.first = skip;
         if (serve.empty()) pt.start("");
         else pt.lap("open");

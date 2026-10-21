@@ -298,10 +298,12 @@ inline void rt_gc(RtTier& t, const std::function<bool(const std::vector<int>&)>&
     for (size_t p = 8; p < t.seq.size(); ++p)
         if (t.seq[p].on && !keep(t.seq[p].list)) rt_end(t, (int)p, st);
 }
-// release: the parked run whose window is these pages, or -1
+// release: the entry holding the run whose window is these pages, or -1: parked, or still in its session slot when
+// its retirement and the grant that adopts it fall at one event boundary and the grant is bound first (pages are held
+// once, so at most one entry has them)
 inline int rt_parked(const RtTier& t, const std::vector<int>& window)
 {
-    for (size_t p = 8; p < t.seq.size(); ++p)
+    for (size_t p = 0; p < t.seq.size(); ++p)
         if (t.seq[p].on && t.seq[p].win == window) return (int)p;
     return -1;
 }
@@ -381,9 +383,12 @@ inline void rt_trim(Model& m, RtTier& t, int q, int skip, cudaStream_t st)
 // below skip): its records and window move to q, under the new run's list, trimmed to skip
 inline void rt_adopt(Model& m, RtTier& t, int p, int q, const std::vector<int>& list, int skip, cudaStream_t st)
 {
-    rt_end(t, q, st);
-    t.seq[q] = std::move(t.seq[p]);
-    t.seq[p] = RtTier::Seq{};
+    if (p != q)   // p == q: the slot's own retiring run, adopted in place
+    {
+        rt_end(t, q, st);
+        t.seq[q] = std::move(t.seq[p]);
+        t.seq[p] = RtTier::Seq{};
+    }
     t.seq[q].list = list;
     for (int v = 0; v < t.V; ++v)
         if (t.vslot[v] == p) { t.vslot[v] = q; t.owner[t.pages + v] = q; }

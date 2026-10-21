@@ -1302,6 +1302,7 @@ int main(int argc, char** argv)
         // G6_RT_LOCAL: slot q's tables with its tail entries (s2_cp_map reads them through S2Model::rt_tail): its slot
         // table always (the batched steps), the layers' tables while they hold its run (its prefill, or it runs alone)
         int rt_layers = -1;                // the slot whose run the layers' tables hold
+        std::array<uint32_t, g6s2::MAX_SESSIONS> rt_gen{};   // the generation of the session bound to each slot
         int rt_pf = -1;                    // the slot of the prefill quantum in flight
         if (rtt && rtt->local)
         {
@@ -1411,22 +1412,27 @@ int main(int argc, char** argv)
                 if (rtt && rtt->local)
                 {
                     if (rt_layers == q) rt_layers = -1;
-                    rt_end(*rtt, q, st);
+                    rt_gen[q] = g.key.generation;
+                    // a hit on a retained window run takes its window pages, and its records come with them: from its
+                    // parked entry, or from its slot when its retirement is at this boundary and not bound yet (the
+                    // slot's own included), so it is found before anything ends that slot
+                    const bool ex = pool.exclusive_run(g.run);
+                    const std::vector<int> l = ex ? pool.list(g.run) : std::vector<int>{};
+                    const int rp = cp_R / 64;
+                    const std::vector<int> win = ex ? std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local) : std::vector<int>{};
+                    const int pk = ex && g.reuse ? rt_parked(*rtt, win) : -1;
+                    if (pk != q) rt_end(*rtt, q, st);
                     // the runs the pool let go (evicted, or adopted only in part below R) free their records first
-                    rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
-                    if (pool.exclusive_run(g.run))
+                    rt_gc(*rtt, [&](const std::vector<int>& kl) { return pool.is_kept(kl); }, st);
+                    if (ex)
                     {
-                        const std::vector<int> l = pool.list(g.run);
-                        const int rp = cp_R / 64;
-                        const std::vector<int> win(l.begin() + rp, l.begin() + rp + rtt->local);
-                        // a hit on a retained window run takes its window pages: its records come with them
-                        const int pk = g.reuse ? rt_parked(*rtt, win) : -1;
                         if (pk >= 0)
                         {
                             rt_adopt(m, *rtt, pk, q, l, (int)g.reuse, st);
                             if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL slot %d adopts a retained run's records at row %u\n", q, g.reuse);
                         }
-                        else if (g.reuse > cp_R) die("G6_RT_LOCAL: a hit past R without the retained run's records");
+                        else if (g.reuse > cp_R)   // every rank holds the same entries, so they all stop here alike
+                            die("G6_RT_LOCAL: a hit past R on a run whose records no slot or parked entry holds");
                         else rt_begin(*rtt, q, win, l, st);
                     }
                 }
@@ -1485,7 +1491,13 @@ int main(int argc, char** argv)
                 G6RT_CK(cudaStreamSynchronize(st));
             };
             h.retire = [&](const g6s2::Slot& old) {
-                if (rtt && rtt->local)   // its records die with it: the pool releases a window run instead of retaining it
+                // a grant at the same boundary may have bound the slot again (or adopted its records) first: then the
+                // slot is that session's, and the retirement leaves it alone
+                if (rtt && rtt->local && rt_gen[old.key.slot] != old.key.generation)
+                {
+                    if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL retire of slot %u after its next grant: nothing to do\n", old.key.slot);
+                }
+                else if (rtt && rtt->local)   // a retained run keeps its records (parked), else they go
                 {
                     const int q = (int)old.key.slot;
                     const RtTier::Seq& sq = rtt->seq[q];
