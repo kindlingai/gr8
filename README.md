@@ -182,18 +182,13 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 
 The first `SHARE_LIMIT` tokens of a session are on every rank and later pages are spread across the ranks; below that
 pool, block stores keep evicted prefixes. With `--kv-rows` the rows past `SHARE_LIMIT` can also live in a rows store,
-read back as decode selects them.
+read back as decode selects them ([Remote KV](#remote-kv)).
 
 - `--cap` is the KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory.
 - `--sess` is how many requests decode at once (1-8). Each one adds step graphs: about 2.5 GiB at 8.
 - `--reuse 0` turns prefix reuse off.
-- `--kv-store ssd:PATH,size=N` (experimental, off by default) keeps system prompts, or more with `--kv-keep`, in
-  blocks below the KV pool, so a request whose prefix the pool let go reads it back instead of prefilling it. An SSD
-  store starts empty at every boot unless it has `persist=on`
-  ([engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md)).
-- `--kv-rows STORE,size=N` (experimental, off by default) keeps the attention rows past `SHARE_LIMIT` in a rows store
-  and fetches the rows each decode step selects; with `local=PAGES` a long session's tail no longer needs local KV
-  pages ([KNOBS.md](KNOBS.md)).
+- `--kv-store` and `--kv-rows` (experimental, off by default) put KV below the pool, on an SSD or a KV node: see
+  [Remote KV](#remote-kv) below.
 - `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 513,536 against
   408,832; the fp8 default has since grown to 485,376 and int4 is not re-measured) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
@@ -202,6 +197,60 @@ read back as decode selects them.
   `steering_profile` and `steering_scale`; `--steering-force SCALE` is the process-wide qualification mode.
 - `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.
+
+### Remote KV
+
+A KV node is a box with spare memory that serves it to the cluster over RDMA: `./gr8 kv up --gb N` on that box, and
+`remote:auto` in the options below finds it through the mentat group. The cluster can use it in two ways. Both are
+experimental and off by default.
+
+| | block stores (`--kv-store`) | rows store (`--kv-rows`) |
+|---|---|---|
+| holds | sessions and prefixes the pool evicted | a live session's rows past `SHARE_LIMIT` |
+| gives | a later turn or a shared prefix reads its KV back instead of prefilling it | with `local=`, one request can run past what local memory holds |
+| longest context | unchanged (`--cap`) | about 600K tokens at TP=4 (`--cap 655360`) |
+| stores | `ssd:PATH`, `remote:auto`, `remote:HOST:PORT` | `remote:auto`, `remote:HOST:PORT`, `mem:` |
+
+Block stores alone do not extend a single request: a request still needs local pages for all of its context. They
+keep the KV of finished turns, so an agent's next turn after its session left the pool costs a read instead of a
+prefill. `--kv-keep` (or `keep=` per store) picks what they keep: `system` prompts, `sessions`, or `all`.
+
+The rows store does extend it. Each session's first `SHARE_LIMIT` tokens stay on every rank. The rows past that are
+spread across the ranks, and the rows store puts each rank's share on the KV node as its pages fill. With `local=PAGES`
+a rank keeps only the last PAGES pages of each long session's tail and gives the rest back to the pool. After each
+indexer selection, decode reads the rows it picked from the node. `place=PAGES` caps the pages a rank holds, so
+`--cap` may pass what local memory holds. A finished session keeps its records on the node, and its next turn
+prefills only the new tokens.
+
+The TP=4 long-context setup, in `cluster.env`:
+
+```
+KV_STORE=ssd:/data/gr8kv,size=4G,persist=on,keep=system;remote:auto,size=4G,keep=all
+KV_ROWS=remote:auto,size=12G,local=40,place=1600
+CAP=655360
+```
+
+The SSD store sits on each box. The KV node needs at least every rank's `remote:` sizes together: here 4 x (4G + 12G) = 64G.
+
+Measured on four GB10 boxes and a KV node on 200G RoCE:
+
+- A 445,855-token prompt prefilled in 613 s, and the next turn answered in 11.4 s from the records the node kept.
+- With `fmt=int4` (416-byte rows instead of 656), a 445,255-token prompt prefilled in 581 s and its next turn took 8.8 s.
+- RigMark decode is the same with the rows store on as off.
+
+The limits:
+
+- With the rows store, a session past `SHARE_LIMIT` runs alone and other long requests wait for it. Without it, two or
+  three such requests can share decode steps.
+- Buffers that grow with `--cap` (prefill staging, attention states, drafter caches: about 2.6 GB a rank at 655,360)
+  take memory that would otherwise be KV pages. At `place=1600` a 4-agent replay took 1,408-1,691 s against about
+  1,060 s with the rows store off. Choose `--cap` for the longest session you need.
+- Without `local=`, the rows store keeps a copy of the tail and every local page stays in use, so the longest
+  context is still `--cap`.
+
+[engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md) covers the block stores, their transports and
+measurements. [KNOBS.md](KNOBS.md) lists every `KV_STORE` and `KV_ROWS` field, and
+[docs/SETTINGS.md](docs/SETTINGS.md) the engine's `G6_RT_*` settings.
 
 ### Thinking
 
