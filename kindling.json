@@ -36,8 +36,8 @@
           "aggregate_tps": 67.8
         }
       ],
-      "max_context": 408832,
-      "kv_pool_tokens": 408832,
+      "max_context": 485376,
+      "kv_pool_tokens": 485376,
       "max_concurrent": 8,
       "quality": [],
       "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks uncapped (full application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release. Code varies between boots (51.2 to 52.2 on one build). The faster decode options are on by default in the serving config. Structured output is not reported: it measures predictable output, not agent speed. With --kv-format int4 (experimental, about 3% slower decode) the KV pool is 415,232 tokens."

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-21: the TP=4 fp8 KV pool grows to 2,280 pages a rank (CAP 485,376)
+
+- The default TP=4 `CAP` is now 485,376 (was 408,832): 2,280 physical pages a rank, up from 1,981. The memory comes
+  from the MTP draft prefill sharing the target prefill's scratch (`G6_PF_DRAFT_SHARE`, on since 2026-10-20). With
+  `--share-limit 65536` it is 387,072. `KV_FORMAT=int4` keeps its 2,390 pages (CAP 513,536) until it is re-measured.
+- Measured on the TP=4 cluster, same build, three 4-agent replays each: 1,011 / 1,109 / 1,174 s and 39.6-41.8 completion
+  tok/s, against 1,084 / 1,100 / 1,171 s and 38.1-38.9 at 1,981 pages; TTFT median 16.8-20.2 s against 14.5-18.7 s.
+  MemAvailable at serving is 1.1-1.5 GiB a box (2.8-3.1 GiB before), with no swap or OOM kill in any run.
+- Set `CAP=408832` for the old pool.
+
 ## 2026-10-21: G6_DFL_REUSE defaults on when serving DFlash2 with MTP
 
 - `G6_DFL_REUSE` now defaults to 2 when the engine serves DFlash2 with MTP (off elsewhere, and any explicit value still
