@@ -10,6 +10,19 @@
 
 namespace g6s2 {
 
+// Segments more a rank the head asks for in this report, from the tier's counters at the last report and now: 2 when
+// the tier filled since (a spill had to evict to make room), or when it took a spill since and the blocks left free are
+// fewer than its entries hold on average, so the next spill of that size would evict. That second case asks BEFORE
+// the tier is full, so the grant can land before the next spill drops an entry; the node refuses at the group's cap.
+// A tier that took no spill asks for nothing, so an idle group never takes room from a busy one.
+inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals& now) {
+    if (now.full > last.full) return 2;
+    if (now.spilled_pages > last.spilled_pages && now.entries > 0 &&
+        now.free_slots < (now.slots - now.free_slots) / now.entries)
+        return 2;
+    return 0;
+}
+
 // The head's report: `want` segments more per rank (0 = none; the tier filled since the last report, say) and the
 // ages of the tier's coldest blocks. The resize to announce, or nothing.
 inline std::optional<Resize> share_poll(RunPool& pool, uint32_t tier, const g6kv_tier* store, uint64_t want,
