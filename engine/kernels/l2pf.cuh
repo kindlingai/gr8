@@ -85,13 +85,27 @@ __device__ __forceinline__ unsigned long long gtimer()
     return t;
 }
 
+// stop/fin cross the kernel's two warps. One lane performs a shared-memory
+// RMW atomic and broadcasts loads within its warp; volatile loads/stores are
+// not inter-thread synchronization.
+__device__ __forceinline__ int flag_load_warp(int& flag, int lane)
+{
+    int value = 0;
+    if (lane == 0) value = atomicAdd(&flag, 0);
+    return __shfl_sync(0xffffffffu, value, 0);
+}
+__device__ __forceinline__ void flag_set(int& flag)
+{
+    atomicExch(&flag, 1);
+}
+
 // block 64: warp 0 issues chunks [max(first, where the layer's last window ended), + budget) at one per ns_chunk ns
 // (a poll issues those due, at most wave <= 32); warp 1 polls the collective's tails and stops warp 0 once all arrived.
 __global__ void __launch_bounds__(64) k_l2pf(const __grid_constant__ Queue q, int layer, uint32_t first, uint32_t budget,
                                              uint32_t ns_chunk, int wave, Stop s, State* st)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    __shared__ volatile int stop, fin;
+    __shared__ int stop, fin;
     const int lane = threadIdx.x & 31;
     if (threadIdx.x == 0) { stop = 0; fin = 0; }
     __syncthreads();
@@ -110,9 +124,10 @@ __global__ void __launch_bounds__(64) k_l2pf(const __grid_constant__ Queue q, in
         }
         const bool peer = lane < s.f.nr && lane != s.f.rank;
         const u64* tail = peer ? reinterpret_cast<const u64*>(glue::peer_slot(s.f, step, s.c, lane) + payload) : nullptr;
-        while (!fin)
+        while (!flag_load_warp(fin, lane))
         {
-            if (__all_sync(~0u, !peer || glue::ld_acquire_sys(tail) == seq)) { stop = 1; break; }
+            if (__all_sync(~0u, !peer || glue::ld_acquire_sys(tail) == seq))
+                { if (lane == 0) flag_set(stop); break; }
             __nanosleep(128);
         }
         return;
@@ -124,7 +139,7 @@ __global__ void __launch_bounds__(64) k_l2pf(const __grid_constant__ Queue q, in
     const uint32_t total = q.count ? q.end[q.count - 1] : 0, last = min(total, c0 + budget);
     const unsigned long long t0 = __shfl_sync(~0u, gtimer(), 0);
     uint32_t done = min(c0, last);
-    while (done < last && !stop)
+    while (done < last && !flag_load_warp(stop, lane))
     {
         const unsigned long long t = __shfl_sync(~0u, gtimer(), 0), by_now = c0 + (t - t0) / ns_chunk + 1;
         const uint32_t cap = min(last, done + static_cast<uint32_t>(wave)), due = by_now < cap ? static_cast<uint32_t>(by_now) : cap;
@@ -139,8 +154,12 @@ __global__ void __launch_bounds__(64) k_l2pf(const __grid_constant__ Queue q, in
         if (due > done) done = due;
         else __nanosleep(64);
     }
-    if (lane == 0) { st->tag = tag; st->chunk = max(done, c0); }
-    fin = 1;
+    if (lane == 0)
+    {
+        st->tag = tag;
+        st->chunk = max(done, c0);
+        flag_set(fin);
+    }
 #endif
 }
 
