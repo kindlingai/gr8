@@ -210,10 +210,10 @@ class CanonicalTests(unittest.TestCase):
 
     def test_defaults_resolved_and_equal_to_explicit(self):
         a, text, da = self.digest()
-        self.assertIn('CAP=310528\n', text)
+        self.assertIn('CAP=408832\n', text)
         self.assertIn('--s2-sessions 8 ', text)
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
-        self.assertEqual(da, self.digest('--cap', '310528', '--share-limit', '65536', '--sess', '8', '--dflash', '1')[2])
+        self.assertEqual(da, self.digest('--cap', '408832', '--share-limit', '32768', '--sess', '8', '--dflash', '1')[2])
 
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
@@ -233,7 +233,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(base, self.digest('--g6env-x', 'G6_X=1')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
-        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '310528', '--reuse', '1', '--g6args-x', '--top 5')[2])
+        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '408832', '--reuse', '1', '--g6args-x', '--top 5')[2])
 
     def test_template_has_no_paths(self):
         _, text, _ = self.digest('--g6-home', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
@@ -368,14 +368,14 @@ class KvFormatTests(unittest.TestCase):
         o, p = self.plan()
         _, p8 = self.plan('--kv-format', 'fp8')
         self.assertNotIn('--kv-format', p['args'])
-        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '310528'))
+        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '408832'))
 
     def test_int4_runs_its_own_engine_with_its_own_pool(self):
         o, p = self.plan('--kv-format', 'int4')
         self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
-        self.assertEqual(p['knobs']['CAP'], str(65536 + (2390 - 1024) * 64 * 4), '2,390 pages a rank at TP=4')
+        self.assertEqual(p['knobs']['CAP'], str(32768 + (2390 - 512) * 64 * 4), '2,390 pages a rank at TP=4')
         self.assertEqual(self.plan('--kv-format', 'int4', '--cap', '300000')[1]['knobs']['CAP'], '300000', 'CAP wins')
-        self.assertEqual(self.plan('--kv-format', 'int4', tp='3')[1]['knobs']['CAP'], str(65536 + (2480 - 1024) * 64 * 3))
+        self.assertEqual(self.plan('--kv-format', 'int4', tp='3')[1]['knobs']['CAP'], str(32768 + (2480 - 512) * 64 * 3))
         self.assertEqual(self.plan('--kv-format', 'int4', tp='6')[1]['knobs']['CAP'], str(131072 + (3940 - 2048) * 64 * 6))
 
     def test_refusal(self):
