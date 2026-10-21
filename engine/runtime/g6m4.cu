@@ -1437,8 +1437,9 @@ int main(int argc, char** argv)
                     const std::vector<int> win = ex ? std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local) : std::vector<int>{};
                     const int pk = ex && g.reuse ? rt_parked(*rtt, win) : -1;
                     if (pk != q) rt_end(*rtt, q, st);
-                    // the runs the pool let go (evicted, or adopted only in part below R) free their records first
-                    rt_gc(*rtt, [&](const std::vector<int>& kl) { return pool.is_kept(kl); }, st);
+                    // the runs the pool let go (evicted, or adopted only in part below R) free their records first. The
+                    // head's take already moved this grant's run out of the kept list, so its entry stays.
+                    rt_gc(*rtt, [&](const std::vector<int>& kl) { return (pk >= 0 && kl == rtt->seq[pk].list) || pool.is_kept(kl); }, st);
                     if (ex)
                     {
                         if (pk >= 0)
@@ -1512,7 +1513,7 @@ int main(int argc, char** argv)
                 {
                     if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL retire of slot %u after its next grant: nothing to do\n", old.key.slot);
                 }
-                else if (rtt && rtt->local)   // a retained run keeps its records (parked), else they go
+                else if (rtt && rtt->local)   // a run with released pages parks its records
                 {
                     const int q = (int)old.key.slot;
                     const RtTier::Seq& sq = rtt->seq[q];
@@ -1524,10 +1525,12 @@ int main(int argc, char** argv)
                     if (rtt->hold)
                         fprintf(stderr, "# rank %d: G6_RT_CHECK: %llu released group pages read back, %llu differed\n", R,
                                 (unsigned long long)rtt->readback, (unsigned long long)rtt->readback_bad);
-                    // a run the pool retained keeps its records for the conversation's next turn
-                    if (sq.on && pool.is_kept(m.s2->run[q]))
+                    // records park for the conversation's next turn whether or not the pool kept the run: on the head a
+                    // grant at this boundary has already taken it out of the kept list, on the workers it has not. The
+                    // next bind's rt_gc frees them if no grant adopts them.
+                    if (sq.on)
                     {
-                        if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL slot %d retained with its records\n", q);
+                        if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL slot %d parks its records (kept by the pool: %d)\n", q, (int)pool.is_kept(m.s2->run[q]));
                         rt_park(*rtt, q);
                     }
                     if (rtt->hold && rtt->stage_ck.rows)
