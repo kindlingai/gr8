@@ -181,6 +181,7 @@ pub struct Pool {
     next_tokens: Option<Vec<i32>>,
     next_span: Option<u64>,
     next_continues: bool, // count() found the next grant continues a conversation
+    next_len: Option<usize>, // the next grant's prompt length (any namespace), for the write limit's credit
     // resize (#153): pages [0, place) come in chunks of `chunk` pages (0 = off). An offline chunk's pages hold no live
     // or retained run and are not counted anywhere, so the engine may release their memory.
     chunk: u32,
@@ -224,6 +225,7 @@ impl Pool {
             next_tokens: None,
             next_span: None,
             next_continues: false,
+            next_len: None,
             chunk: 0,
             offline: Vec::new(),
         })
@@ -572,7 +574,7 @@ impl Pool {
     // a grant of n pages whose first `reused` came from the pool or a tier: the rest of its prompt is computed
     fn earn(&mut self, n: u64, reused: u64) {
         if let Some(s) = &mut self.stash {
-            let prompt = self.next_tokens.as_ref().map_or(n, |t| pages_for(t.len() as u64).min(n));
+            let prompt = self.next_len.map_or(n, |t| pages_for(t as u64).min(n));
             s.earn(prompt.saturating_sub(reused));
         }
     }
@@ -595,6 +597,7 @@ impl Pool {
     pub fn count(&mut self, prompt: &[i32], span: Option<u32>) -> u32 {
         let Some(s) = &self.stash else { return 0 };
         self.next_tokens = Some(prompt.to_vec());
+        self.next_len = Some(prompt.len());
         self.next_span = span.map(|x| s.span_rows(x, prompt.len()));
         if !s.counting() {
             return 0;
@@ -616,8 +619,16 @@ impl Pool {
             return self.count(prompt, span);
         }
         self.next_tokens = None;
+        self.next_len = Some(prompt.len());
         self.next_span = None;
-        self.next_continues = false;
+        // a non-stock prompt that continues a run of its own namespace (retained or stored) counts as continued, so a
+        // keep-sessions tier takes its run later; it never counts toward stock promotion
+        self.next_continues = self.stash.as_ref().is_some_and(|s| {
+            self.kept
+                .iter()
+                .any(|k| k.namespace == namespace && continues(prompt, &k.st.history, k.st.pf_end.max(0) as usize))
+                || s.continues_stored_in(prompt, namespace)
+        });
         0
     }
 
@@ -942,13 +953,17 @@ impl Pool {
                 best = Hit { skip: t.skip, lcp: t.lcp, why: Why::Hit, age: k.age, stored: false, tier: 0 };
             }
         }
-        // the tiers in order. A stored hit must reuse more rows than the pool's best, since a pool hit is free of copies
-        if namespace != STOCK_NAMESPACE {
-            return best;
-        }
+        // the tiers in order. A stored hit must reuse more rows than the pool's best, since a pool hit is free of copies.
+        // A stored entry matches only its own namespace
         let Some(stash) = &self.stash else { return best };
         for t in 0..stash.tiers() {
             for e in stash.entries(t) {
+                if e.namespace != namespace {
+                    if best.skip == 0 {
+                        best.why = Why::Namespace;
+                    }
+                    continue;
+                }
                 let b = reuse::begin(&self.rules, &e.st, prompt, limit, true);
                 if b.skip <= 0 {
                     if best.skip == 0 && b.lcp >= best.lcp {
@@ -1460,6 +1475,7 @@ impl Pool {
         };
         self.log_claim(how, &r, rows, gone);
         let tokens = self.next_tokens.take().unwrap_or_default();
+        self.next_len = None;
         let span = self.next_span.take();
         // a run that continues its conversation counts as continued once, even when it found nothing to reuse
         let hits = hits.max(std::mem::take(&mut self.next_continues) as u32);

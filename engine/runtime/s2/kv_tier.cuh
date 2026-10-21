@@ -16,6 +16,7 @@
 #pragma once
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
+#include "kv_plan.h"
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -48,8 +49,6 @@ constexpr size_t MLA16 = 64 * g6kv::ROW / 16, IDX16 = 64 * g6kv::IDX_ROW / 16;
 // off16: the binding's place in a page block; rep16: in a replicated record. phys: its attention cache's pages (the
 // last physical page differs by rank past R). cp: its attention cache is sharded past R
 struct Piece { uint4* mla; uint4* idx; unsigned long long off16, rep16; int phys; int cp; };
-// one copy of a batch: page, part (g6kv_io), sub (part 2), and the host slot it goes to or comes from
-struct Item { int page, part, sub, hslot; };
 __device__ __forceinline__ void move16(uint4* h, uint4* d, size_t n, int out)
 {
     for (size_t k = threadIdx.x; k < n; k += blockDim.x) { if (out) h[k] = d[k]; else d[k] = h[k]; }
@@ -161,6 +160,24 @@ class KvTiers {
 public:
     uint64_t spilled = 0, moved = 0, restored = 0;
     double ms = 0, last_ms = 0, last_device_ms = 0;
+    // the last run's store calls, per tier: blocks written and read, and the time in the calls (the drain trace; the
+    // engine's own byte count of a store: a KV node cannot see its clients' one-sided RDMA traffic)
+    struct Io { uint64_t wblocks = 0, rblocks = 0, calls = 0; double wms = 0, rms = 0; };
+    std::vector<Io> last_io;
+    // the last run's tiers that did anything: "t0 w 200 (700.1 MB) 712.3 ms r 0 (0.0 MB) 0.0 ms, 7 calls; t1 ..."
+    std::string last_io_text() const {
+        std::string out;
+        for (size_t t = 0; t < last_io.size(); ++t) {
+            const Io& x = last_io[t];
+            if (!x.calls) continue;
+            char b[160];
+            snprintf(b, sizeof b, "%st%zu w %llu (%.1f MB) %.1f ms r %llu (%.1f MB) %.1f ms, %llu calls", out.empty() ? "" : "; ", t,
+                     (unsigned long long)x.wblocks, x.wblocks * pb_.slot_bytes() / 1e6, x.wms, (unsigned long long)x.rblocks,
+                     x.rblocks * pb_.slot_bytes() / 1e6, x.rms, (unsigned long long)x.calls);
+            out += b;
+        }
+        return out;
+    }
     explicit KvTiers(const std::vector<const G6AttnBinding*>& bindings) : pb_(bindings) {}
     ~KvTiers() { for (auto* t : t_) g6kv_tier_free(t); }
     KvTiers(const KvTiers&) = delete;
@@ -187,6 +204,7 @@ public:
         if (io.empty()) return;
         const auto t0 = std::chrono::steady_clock::now();
         double dev = 0;
+        last_io.assign(t_.size(), Io{});
         size_t i = 0;
         // blocks[j] of tier t[j] from or into host(j)
         auto many = [&](const std::vector<uint32_t>& t, const std::vector<uint64_t>& blocks, bool write) {
@@ -194,8 +212,13 @@ public:
                 std::vector<uint64_t> b; std::vector<void*> p;
                 for (size_t j = 0; j < t.size(); ++j) if (t[j] == tier) { b.push_back(blocks[j]); p.push_back(pb_.host((int)j)); }
                 if (b.empty()) continue;
+                const auto c0 = std::chrono::steady_clock::now();
                 ck(write ? g6kv_tier_write_many(t_[tier], b.size(), b.data(), p.data())
                          : g6kv_tier_read_many(t_[tier], b.size(), b.data(), p.data()), write ? "write" : "read");
+                const double c = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+                Io& x = last_io[tier];
+                ++x.calls;
+                if (write) { x.wblocks += b.size(); x.wms += c; } else { x.rblocks += b.size(); x.rms += c; }
             }
         };
         auto device = [&](const std::vector<kvt::Item>& items, bool out) {
@@ -204,29 +227,10 @@ public:
             dev += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
         };
         while (i < io.size()) {
-            const uint32_t kind = io[i].kind;
-            std::vector<kvt::Item> items;   // spills and restores: each copy and its host slot
-            std::vector<uint32_t> from, to; std::vector<uint64_t> slots, to_slots;   // per host slot
-            while (i < io.size() && io[i].kind == kind) {
-                const g6kv_io& x = io[i];
-                // an entry passed on twice in one call: the first move writes a block, then the second move reads it. A
-                // batch reads before it writes, so the second move starts the next batch
-                if (kind == 1) {
-                    bool dep = false;
-                    for (size_t j = 0; j < slots.size() && !dep; ++j) dep = to[j] == x.tier && to_slots[j] == x.slot;
-                    if (dep || (int)slots.size() == pb_.batch()) break;
-                    from.push_back(x.tier); to.push_back(x.to); slots.push_back(x.slot); to_slots.push_back(x.to_slot); ++i;
-                    continue;
-                }
-                // a block's copies are next to each other: one host slot for them all
-                const bool same = !slots.empty() && from.back() == x.tier && slots.back() == x.slot;
-                if (!same && ((int)slots.size() == pb_.batch() || (int)items.size() + (int)pb_.per_slot() + 1 > pb_.items())) break;
-                if (!same) { from.push_back(x.tier); slots.push_back(x.slot); }
-                items.push_back({(int)x.page, (int)x.part, (int)x.sub, (int)slots.size() - 1}); ++i;
-            }
-            if (kind == 0) { device(items, true); many(from, slots, true); spilled += slots.size(); }
-            else if (kind == 1) { many(from, slots, false); many(to, to_slots, true); moved += slots.size(); }
-            else { many(from, slots, false); device(items, false); restored += slots.size(); }
+            const kvt::Batch x = kvt::next_batch(io, i, pb_.batch(), pb_.per_slot(), pb_.items());
+            if (x.kind == 0) { device(x.items, true); many(x.from, x.slots, true); spilled += x.slots.size(); }
+            else if (x.kind == 1) { many(x.from, x.slots, false); many(x.to, x.to_slots, true); moved += x.slots.size(); }
+            else { many(x.from, x.slots, false); device(x.items, false); restored += x.slots.size(); }
         }
         const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ms += t;

@@ -1115,7 +1115,7 @@ int main(int argc, char** argv)
         // copies anything (default every one), as a drain stalled on its store would. Reproduces the rank skew the
         // barrier after a drain (NativeHooks::drained) has to absorb.
         int kv_delay_rank = -1, kv_delay_ms = 0, kv_delay_every = 1;
-        long kv_delay_n = 0;
+        long kv_delay_n = 0, kv_drain_n = 0;   // kv_drain_n: this rank's drains that copied anything (the same count on every rank)
         if (const char* e = getenv("G6_KV_DRAIN_DELAY"))
             if (sscanf(e, "%d:%d:%d", &kv_delay_rank, &kv_delay_ms, &kv_delay_every) < 2 || kv_delay_ms < 0 || kv_delay_every < 1)
                 die("G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]");
@@ -1151,6 +1151,7 @@ int main(int argc, char** argv)
         auto kv_drain = [&] {
             if (!kvt) return;
             const auto io = pool.io();
+            const long long kv_t0 = g6s2::s2_wall_ms();
             kvt->run(io, st);
             kv_log();
             if (!io.empty())
@@ -1164,8 +1165,9 @@ int main(int argc, char** argv)
                 }
                 size_t n[3] = {0, 0, 0};
                 for (const auto& x : io) ++n[x.kind];
-                fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s\n", R,
-                        n[0], n[1], n[2], kvt->last_ms, kvt->last_device_ms, (long long)g6s2::s2_wall_ms(), kvt->last_ms > 2000 ? " SLOW" : "");
+                fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s; drain %ld from %lld ms: %s\n", R,
+                        n[0], n[1], n[2], kvt->last_ms, kvt->last_device_ms, (long long)g6s2::s2_wall_ms(), kvt->last_ms > 2000 ? " SLOW" : "",
+                        ++kv_drain_n, kv_t0, kvt->last_io_text().c_str());
             }
             if (const char* e = pool.io_done()) fprintf(stderr, "# rank %d: s2 tier index: %s\n", R, e);
         };
