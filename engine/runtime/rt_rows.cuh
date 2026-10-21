@@ -623,8 +623,8 @@ inline void rt_selstat(RtTier& t, const std::vector<std::pair<const int*, int>>&
 }
 // release: layer i's rows and index keys of every page slot q released below `start` into the staged prefill pools
 // (each {pool, its index offset or 0}, logical page lp at lp), which k_cp_pf_gather / k_cp_pf_fill leave to this.
-// A page's records are one contiguous block in the store (64 x the group's record), so each page is one read, in
-// chunks of whole blocks into two registered pinned buffers (one RDMA chain a chunk), and the layer's rows go from
+// A page's records are one contiguous block in the store (64 x the group's record); this layer's row of each record is
+// one read, in chunks into two registered pinned buffers (one RDMA chain a chunk), and the layer's rows go from
 // there into the pools by strided copies (int4: unpacked on the GPU). A buffer is reused once the copies that read it
 // are done (its event), so the stream never waits on the host; only the host waits, for the reads and that event.
 inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<std::pair<char*, size_t>>& pools, cudaStream_t st)
@@ -637,7 +637,10 @@ inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<st
     const RtTier::Group& G = t.g[t.at[i].first];
     const int j = t.at[i].second;
     const size_t row = t.int4 ? g6kv::int4row::ROW : g6kv::ROW, block = 64 * G.h.rec;   // a layer's row in a record; a page's records
-    const size_t per = std::max<size_t>(1, RtTier::PF_CHUNK / block);
+    // only this layer's 64 rows of each page (64 reads of one row); G6_RT_PF_SLICE=0 reads the group's whole block
+    static const bool slice = !(getenv("G6_RT_PF_SLICE") && atoi(getenv("G6_RT_PF_SLICE")) == 0);
+    const size_t pg = slice ? 64 * row : block, srow = slice ? row : G.h.rec, sat = slice ? 0 : (size_t)j * row;
+    const size_t per = std::max<size_t>(1, RtTier::PF_CHUNK / pg);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<uint64_t> offs;
     for (size_t c0 = 0; c0 < ids.size(); c0 += per)
@@ -647,19 +650,22 @@ inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<st
         t.pf_k ^= 1;
         G6RT_CK(cudaEventSynchronize(t.pf_ev[k]));   // the copies that last read this buffer are done
         offs.clear();
-        for (size_t n = c0; n < c1; ++n) offs.push_back(G.h.base + (uint64_t)ids[n] * block);
-        if (g6kv_rows_gather(t.store, offs.data(), offs.size(), block, t.pf_buf[k]))
+        for (size_t n = c0; n < c1; ++n)
+            if (slice)
+                for (int r = 0; r < 64; ++r) offs.push_back(G.h.base + (uint64_t)ids[n] * block + (uint64_t)r * G.h.rec + (uint64_t)j * row);
+            else offs.push_back(G.h.base + (uint64_t)ids[n] * block);
+        if (g6kv_rows_gather(t.store, offs.data(), offs.size(), slice ? row : block, t.pf_buf[k]))
             die(std::string("G6_RT_STORE prefill read: ") + g6kv_tier_error());
         for (const auto& [pool, ixoff] : pools)
             for (size_t n = c0; n < c1; ++n)
             {
                 const int lp = t.vlp[ids[n]];
                 char* dst = pool + (size_t)lp * 64 * g6kv::ROW;
-                const uint8_t* src = t.pf_dev[k] + (n - c0) * block + (size_t)j * row;
+                const uint8_t* src = t.pf_dev[k] + (n - c0) * pg + sat;
                 if (t.int4)   // back into FP8 rows, as a fetch's rt_unpack does
-                    G6RT_CK((cudaError_t)g6_rt_unpack_int4(src, G.h.rec, dst, g6kv::ROW, 64, st));
+                    G6RT_CK((cudaError_t)g6_rt_unpack_int4(src, srow, dst, g6kv::ROW, 64, st));
                 else
-                    G6RT_CK(cudaMemcpy2DAsync(dst, g6kv::ROW, src, G.h.rec, g6kv::ROW, 64, cudaMemcpyDefault, st));
+                    G6RT_CK(cudaMemcpy2DAsync(dst, g6kv::ROW, src, srow, g6kv::ROW, 64, cudaMemcpyDefault, st));
                 if (ixoff && j == 0)
                 {
                     if (!G.ix) die("G6_RT_LOCAL: a staged layer's index keys without an arena");
@@ -670,7 +676,7 @@ inline void rt_pf_stage(RtTier& t, int q, int i, int start, const std::vector<st
         G6RT_CK(cudaEventRecord(t.pf_ev[k], st));
     }
     t.pf_pages += ids.size();
-    t.pf_bytes += ids.size() * block;
+    t.pf_bytes += ids.size() * pg;
     t.pf_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (!t.hold) return;
     // G6_RT_CHECK: every staged page of this layer against the rows it was released with
