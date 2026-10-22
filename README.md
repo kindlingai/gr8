@@ -15,7 +15,7 @@ their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 |---|---|---|---|
 | experts | `home`, 3.25 bpw | `bit225`, 2.25 bpw | `home`, 3.25 bpw |
 | drafting | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 51.7 / 32.5 tok/s | 40.3 / 30.2 tok/s | 38.2 / –‡ tok/s |
+| decode\*, code / prose | 51.7 / 32.5 tok/s | 40.3 / 30.2 tok/s | 54.6 / 40.9 tok/s‖ |
 | aggregate\*, 2 / 4 streams | 53.7 / 67.8 tok/s | 47.9 / 62.2 tok/s | 57.6 / 79.0 tok/s‡ |
 | prefill, 8K prompt, cold | 1,315 tok/s | 654 tok/s | 1,953 tok/s‡ |
 | prefill, 8K prompt, cached | 60,006 tok/s | 57,086 tok/s | – |
@@ -34,6 +34,9 @@ cap on an older build; its re-measurement is pending.
 ‡ TP=6, MTP only (the DFlash2 drafter's 8 KV heads do not split six ways), on an earlier build. Decode is a
 concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; it is not
 RigMark. One test window on one cluster.
+‖ TP=6 decode: RigMark 1.0.0 (`reasoning_effort` low), MTP only, booted at c53b5b8 with the launcher's defaults
+(`home`), GPU clocks capped at 2200 MHz, unlike the other columns, so this cell is lower than an uncapped run would be.
+One run per fresh boot, the mean of two boots (prose 40.5 / 41.3, code 54.4 / 54.7 tok/s); six boxes on one switch.
 § `--kv-format int4` (experimental): 4-bit KV latent, about 3% slower decode at TP=4; TP=3 and TP=6 int4 figures are
 estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [docs/KV4.md](docs/KV4.md)
 
