@@ -4,8 +4,10 @@
 // Today both run as MXFP8 GV records (densev.cuh Mxfp8): E4M3 weight codes decoded to fp16, fp16 activation fragments,
 // fp16 MMA with fp32 accumulate, one E8M0 scale per (row, 32 inputs) multiplying the group's fp32 partial (exact, a
 // power of two). This arm decodes each record once, at bind, into a plain fp16 matrix W'[O][K] = code * s / R with one
-// power-of-two R per matrix (R = s_max * 2^-7), and runs cublasGemmEx (fp16 x fp16, fp32 compute, alpha = R, fp16 out)
-// on the plain fp16 activation rows that hold the fragment tables' values (q_a: P.x, idx_q: q_a_n).
+// power-of-two R per matrix (R = s_max * 2^-7), and runs cublasGemmEx (fp16 x fp16, fp32 compute, alpha = R) on the
+// plain fp16 activation rows that hold the fragment tables' values (q_a: P.x, idx_q: q_a_n). cuBLAS writes fp32, and a
+// second pass rounds to fp16: with fp16 output, cuBLAS's split-K kernels (it picks them for some row counts) keep
+// partial sums in fp16 before alpha, and the first token's partials overflow.
 // W' is exact when every product code * s / R is an fp16 value (scale spread within a matrix <= 2^22); the bind
 // counts the elements where it is not and keeps that matrix on the GV kernel. Operands are then the same numbers as
 // the GV kernel's; only the fp32 summation order differs (near-byte, not byte-equal).
@@ -186,14 +188,17 @@ inline void gemm_bf_split(cublasHandle_t h, const Mat& w, const u32* xb_frag, in
     k_split_f16<<<static_cast<unsigned>((outs + 255) / 256), 256, 0, st>>>(y32, M, w.O, w.Oa, ya, lda, yb, ldb);
 }
 
-// y[M][ldy] (fp16) = alpha * x[M][ldx] (fp16) @ W'^T
-inline void gemm(cublasHandle_t h, const Mat& w, const __half* x, int ldx, int M, __half* y, int ldy, cudaStream_t st)
+// y[M][ldy] (fp16) = alpha * x[M][ldx] (fp16) @ W'^T, through y32 [M][O] fp32
+inline void gemm(cublasHandle_t h, const Mat& w, const __half* x, int ldx, int M, float* y32, __half* y, int ldy,
+                 cudaStream_t st)
 {
     const float zero = 0.f;
     if (cublasSetStream(h, st) != CUBLAS_STATUS_SUCCESS) die("flash_dsa_f16: cublasSetStream failed");
     if (cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, w.O, M, w.K, &w.alpha, w.w, CUDA_R_16F, w.K, x, CUDA_R_16F, ldx, &zero,
-                     y, CUDA_R_16F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+                     y32, CUDA_R_32F, w.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
         die("flash_dsa_f16: cublasGemmEx failed");
+    const size_t outs = static_cast<size_t>(M) * w.O;
+    k_split_f16<<<static_cast<unsigned>((outs + 255) / 256), 256, 0, st>>>(y32, M, w.O, w.O, y, ldy, nullptr, 0);
 }
 
 }   // namespace flash_dsa_f16

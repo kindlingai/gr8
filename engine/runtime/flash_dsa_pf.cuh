@@ -184,7 +184,7 @@ struct F16Lane
     cublasHandle_t blas = nullptr;
     void* ws = nullptr;
     __nv_bfloat16* rows = nullptr;   // [MP][HID] bf16
-    float* y32 = nullptr;            // [MP][wg.O] fp32
+    float* y32 = nullptr;            // [MP][widest decoded matrix's O] fp32 cuBLAS output
     int MP = 0;
 };
 struct F16Set
@@ -224,7 +224,7 @@ inline F16Set* f16_prepare(Model& m, const void* lane, int MP, cudaStream_t st)
     size_t free0 = 0, free1 = 0, total = 0;
     G6RT_CK(cudaStreamSynchronize(st));
     G6RT_CK(cudaMemGetInfo(&free0, &total));
-    int wg_o = 0;
+    int wg_o = 0, o32 = 0;
     if (!f.built)
     {
         f.built = true;
@@ -243,7 +243,11 @@ inline F16Set* f16_prepare(Model& m, const void* lane, int MP, cudaStream_t st)
             f.total += 5;
         }
     }
-    for (const F16Layer& d : f.L) wg_o = std::max(wg_o, d.wg.w ? d.wg.O : 0);
+    for (const F16Layer& d : f.L) {
+        wg_o = std::max(wg_o, d.wg.w ? d.wg.O : 0);
+        for (const flash_dsa_f16::Mat* w : {&d.qa, &d.kva, &d.ik, &d.iq, &d.wg})
+            o32 = std::max(o32, w->w ? w->O : 0);
+    }
     F16Lane& ln = f.lanes[lane];
     if (!ln.blas)
     {
@@ -251,12 +255,12 @@ inline F16Set* f16_prepare(Model& m, const void* lane, int MP, cudaStream_t st)
         ln.ws = dmalloc<uint8_t>(F16_WS);
         if (cublasSetWorkspace(ln.blas, ln.ws, F16_WS) != CUBLAS_STATUS_SUCCESS) die("flash_dsa_f16: cublasSetWorkspace failed");
     }
-    if (wg_o && ln.MP < MP)
+    if (o32 && ln.MP < MP)
     {
         if (ln.rows) cudaFree(ln.rows);
         if (ln.y32) cudaFree(ln.y32);
-        ln.rows = dmalloc<__nv_bfloat16>(static_cast<size_t>(MP) * HID);
-        ln.y32 = dmalloc<float>(static_cast<size_t>(MP) * wg_o);
+        ln.rows = wg_o ? dmalloc<__nv_bfloat16>(static_cast<size_t>(MP) * HID) : nullptr;
+        ln.y32 = dmalloc<float>(static_cast<size_t>(MP) * o32);
     }
     ln.MP = std::max(ln.MP, MP);
     G6RT_CK(cudaStreamSynchronize(st));
@@ -361,7 +365,7 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         }
         // MXFP8 on cuBLAS: P.x holds the same fp16 values as the f16 fragment table
         auto proj = [&](const flash_dsa_f16::Mat& w, const bind::Gv& g, __half* y) {
-            if (w.w) flash_dsa_f16::gemm(fn->blas, w, P.x, HID, M, y, g.ld, st);
+            if (w.w) flash_dsa_f16::gemm(fn->blas, w, P.x, HID, M, fn->y32, y, g.ld, st);
             else flash_dsa_pf::launch_gv_full(g, g.codec == bind::MXFP8 ? xf : xb, M, y, st);
         };
         proj(fl.qa, b1.q_a, S.q_a);
@@ -397,7 +401,7 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
     glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(S.q_a, QA, QA, y.q_a_norm, geom::RMS_EPS_FLASH, S.q_a_n, QA, nullptr, nullptr);
 
     if (full_gv && b1.idx_q.on && fl.iq.w)
-        flash_dsa_f16::gemm(fn->blas, fl.iq, S.q_a_n, QA, M, S.idx_q, b1.idx_q.ld, st);
+        flash_dsa_f16::gemm(fn->blas, fl.iq, S.q_a_n, QA, M, fn->y32, S.idx_q, b1.idx_q.ld, st);
     else if (full_gv && b1.idx_q.on) {
         const bool mx = b1.idx_q.codec == bind::MXFP8;
         flash_dsa_pf::launch_xfrag(S.q_a_n, QA, M, mx ? S.xq_full : nullptr, mx ? nullptr : S.xq_full, st);

@@ -4,7 +4,7 @@
 //       tests/flash_dsa_f16_test.cu -o flash_dsa_f16_test -lcublas
 //   ./flash_dsa_f16_test --self-test   host only: MXFP8 and BF16W record offset maps (no CUDA calls)
 //   ./flash_dsa_f16_test               GPU: q_a, kv_a, idx_k, idx_q (MXFP8) and idx_w + idx_g (BF16W) at the engine
-//                                      shapes, M 8192 and 1000; inexact fallback
+//                                      shapes, M 8192 and 1000; idx_k with a large row 0 at M 255; inexact fallback
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -77,7 +77,8 @@ static float e4m3(uint8_t b)
 }
 static float h2f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
 
-struct Case { const char* name; int O, K, tpc, ks, M, spread; bool expect_exact; };
+// row0: row 0's activations scaled by this, as the first token's are in the model
+struct Case { const char* name; int O, K, tpc, ks, M, spread; bool expect_exact; float row0 = 1.f; };
 
 static int run(const Case& c, cublasHandle_t, cudaStream_t st, std::mt19937& rng)
 {
@@ -94,7 +95,11 @@ static int run(const Case& c, cublasHandle_t, cudaStream_t st, std::mt19937& rng
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> x32(static_cast<size_t>(c.M) * c.K);
     std::vector<__half> x16(x32.size());
-    for (size_t i = 0; i < x32.size(); ++i) { x16[i] = __float2half_rn(nd(rng)); x32[i] = __half2float(x16[i]); }
+    for (size_t i = 0; i < x32.size(); ++i)
+    {
+        x16[i] = __float2half_rn(nd(rng) * (i < static_cast<size_t>(c.K) ? c.row0 : 1.f));
+        x32[i] = __half2float(x16[i]);
+    }
 
     uint8_t* d_rec = dmalloc<uint8_t>(rb);
     float* d_x32 = dmalloc<float>(static_cast<size_t>((c.M + 7) / 8 * 8) * c.K);
@@ -102,6 +107,7 @@ static int run(const Case& c, cublasHandle_t, cudaStream_t st, std::mt19937& rng
     u32* d_xf = dmalloc<u32>(flash_dsa_full_schedule::full_fragment_words(c.M, c.K));
     __half* d_ygv = dmalloc<__half>(static_cast<size_t>(c.M) * c.O);
     __half* d_yf = dmalloc<__half>(static_cast<size_t>(c.M) * c.O);
+    float* d_y32 = dmalloc<float>(static_cast<size_t>(c.M) * c.O);
     G6RT_CK(cudaMemcpy(d_rec, rec.data(), rb, cudaMemcpyHostToDevice));
     G6RT_CK(cudaMemcpy(d_x32, x32.data(), x32.size() * 4, cudaMemcpyHostToDevice));
     G6RT_CK(cudaMemcpy(d_x16, x16.data(), x16.size() * 2, cudaMemcpyHostToDevice));
@@ -124,7 +130,7 @@ static int run(const Case& c, cublasHandle_t, cudaStream_t st, std::mt19937& rng
     if (!built) { std::printf("%s M=%d spread=%d: fallback as expected OK\n", c.name, c.M, c.spread); return 0; }
     cublasHandle_t h;
     if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) die("cublasCreate");
-    flash_dsa_f16::gemm(h, w, d_x16, c.K, c.M, d_yf, c.O, st);
+    flash_dsa_f16::gemm(h, w, d_x16, c.K, c.M, d_y32, d_yf, c.O, st);
     G6RT_CK(cudaStreamSynchronize(st));
     std::vector<uint16_t> ygv(static_cast<size_t>(c.M) * c.O), yf(ygv.size());
     G6RT_CK(cudaMemcpy(ygv.data(), d_ygv, ygv.size() * 2, cudaMemcpyDeviceToHost));
@@ -163,7 +169,7 @@ static int run(const Case& c, cublasHandle_t, cudaStream_t st, std::mt19937& rng
     std::printf("%s O=%d K=%d tpc=%d ks=%d M=%d alpha=2^%d: equal %.4f, 1-ulp %.4f, >1-ulp %zu; fp64 ref max abs err gv %.3g f16 %.3g (max |y| %.3g) %s\n",
                 c.name, c.O, c.K, tpc, ks, c.M, static_cast<int>(std::log2(w.alpha)), equal / n, ulp1 / n, worse, egv, ef, mag, ok ? "OK" : "FAIL");
     cublasDestroy(h);
-    cudaFree(w.w); cudaFree(d_rec); cudaFree(d_x32); cudaFree(d_x16); cudaFree(d_xf); cudaFree(d_ygv); cudaFree(d_yf);
+    cudaFree(w.w); cudaFree(d_rec); cudaFree(d_x32); cudaFree(d_x16); cudaFree(d_xf); cudaFree(d_ygv); cudaFree(d_yf); cudaFree(d_y32);
     return ok ? 0 : 1;
 }
 
@@ -282,6 +288,9 @@ int main(int argc, char** argv)
         {"kv_a", 576, 4096, 1, 32, 1000, 12, true},
         {"idx_k", 128, 4096, 1, 32, 8192, 12, true},
         {"idx_k", 128, 4096, 1, 32, 1000, 12, true},
+        // a large row 0 at a row count where cuBLAS splits K: the unscaled partial sums leave the fp16 range
+        {"idx_k_row0", 128, 4096, 1, 32, 255, 12, true, 1024.f},
+        {"idx_k_row0", 128, 4096, 1, 32, 1000, 12, true, 1024.f},
         {"q_a_wide_spread", 1536, 4096, 2, 16, 64, 40, false},
     };
     int fails = 0;
