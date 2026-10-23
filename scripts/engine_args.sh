@@ -72,6 +72,7 @@ engine_defaults() {
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
     8) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-65536}; READY_TMO=${READY_TMO:-3600}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=8: no int4 page count at TP=8 (fp8 only)" >&2; return 2; }
+       KV_FORMAT=fp8
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=8: no TP8 drafter packs" >&2; return 2; }
        DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 8" >&2; return 2 ;;
