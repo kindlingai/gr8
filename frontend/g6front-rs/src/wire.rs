@@ -136,6 +136,35 @@ pub struct Finish {
     pub message: Option<String>,
 }
 
+/// A `finish` frame's per-request counters (PROTOCOL.md `spec`, `timing`), read only for a request that asked for
+/// them (`return_step_stats`), so a malformed field never fails a request that did not.
+#[derive(Deserialize)]
+pub struct FinishStats {
+    #[serde(default)]
+    pub completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub spec: Option<FinishSpec>,
+    #[serde(default)]
+    pub timing: Option<FinishTiming>,
+}
+
+#[derive(Deserialize)]
+pub struct FinishSpec {
+    pub drafts: u64,
+    pub draft_tokens: u64,
+    pub accepted: u64,
+    #[serde(default)]
+    pub accepted_per_pos: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct FinishTiming {
+    #[serde(default)]
+    pub prefill_s: Option<f64>,
+    #[serde(default)]
+    pub decode_s: Option<f64>,
+}
+
 /// One frame with a fixed shape; the length prefix is patched in `finish()`.
 pub struct FrameWriter {
     pub b: Vec<u8>,

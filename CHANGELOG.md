@@ -82,6 +82,16 @@
 - A limit off the doubling trades longest context for decode speed between the two limits: at TP=4, 98304 gives CAP
   212,224 (at the default 1,981 pages a rank), and on four GB10 it decoded +8.3 .. +13.6 % faster than 65536 at 70K-90K
   token prompts (those sessions keep their KV replicated and skip the CP attention path); short prompts level.
+## 2026-10-19: per-request step counters in usage (`return_step_stats`, opt-in)
+
+- A chat or completions request with `"return_step_stats": true` gets `usage.step_stats`: its verify rounds, draft and
+  accepted tokens (and per draft position), the tokens the engine generated, and its server-side prefill and decode
+  time. These are the numbers the request added to `/metrics` (`vllm:spec_decode_*`, `vllm:request_prefill_time_seconds`,
+  `vllm:request_decode_time_seconds`), so a benchmark client can split decode speed into steps and acceptance per
+  request at any concurrency instead of differencing `/metrics` around one request at a time. Streaming: in the last
+  chunk (`stream_options.include_usage`). Without the field the responses are unchanged.
+- The S2 shim adds each request's counters to its `finish` frame (`spec`, `timing`: optional, PROTOCOL.md); the engine
+  is unchanged.
 
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 

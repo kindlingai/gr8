@@ -104,6 +104,37 @@ the mock with S2's reuse rule and TP=4's cold prefill rate (`--reuse-block 4096 
 The front end logs each continuation's cached tokens (`thinking budget: the continuation took N of its M prompt
 tokens from the cache`).
 
+## Per-request step counters (`return_step_stats`)
+
+A chat or completions request with `"return_step_stats": true` gets its share of the `/metrics` speculative-decoding
+counters and request times in `usage.step_stats`: in the response, or, streaming, in the last chunk (so it needs
+`stream_options.include_usage`; without it there is no usage chunk to carry them). A request without the field gets the
+same response as before. It is a gr8 extension, opt-in in the manner of `return_token_ids`: vLLM exports these counters
+only on `/metrics`; SGLang returns them per request when asked (`return_spec_tokens_details`, as
+`sglext.spec_tokens_details`).
+
+```json
+"usage": {"prompt_tokens": 30, "total_tokens": 242, "completion_tokens": 212,
+          "step_stats": {"steps": 85, "draft_tokens": 255, "accepted_tokens": 126, "accepted_per_pos": [70, 38, 18],
+                         "generated_tokens": 212, "prefill_s": 0.081, "decode_s": 2.21}}
+```
+
+| field | meaning | `/metrics` series it is the request's share of |
+|---|---|---|
+| `steps` | verify rounds (decode steps) | `vllm:spec_decode_num_drafts_total` |
+| `draft_tokens` / `accepted_tokens` | draft tokens proposed / accepted | `vllm:spec_decode_num_draft_tokens_total` / `_num_accepted_tokens_total` |
+| `accepted_per_pos[i]` | rounds whose draft at position i was accepted | `vllm:spec_decode_num_accepted_tokens_per_pos_total{position="i"}` |
+| `generated_tokens` | tokens the engine generated | the engine's `completion_tokens` |
+| `prefill_s` / `decode_s` | admission to the first token / the first token to the end, on the shim's clock | `vllm:request_prefill_time_seconds_sum` / `vllm:request_decode_time_seconds_sum` |
+
+The numbers are the ones the request added to `/metrics` (the `finish` frame's `spec` and `timing`, PROTOCOL.md), so
+the sum over a block of requests equals the `/metrics` delta around it, at any concurrency, and `decode_s / steps` is
+the request's step time. `generated_tokens` exceeds `completion_tokens` when a stop string ends the reply before the
+engine stops: the front end then cancels the run and, for a request with the field, waits for its `finish` (about one
+engine step) before it writes the usage. With a thinking budget on an engine without insert rules, the counters are
+the sum of both runs. The times are left out when the engine does not report them, and `step_stats` is left out when a
+run did not report its counters (the mock engine reports both).
+
 ## Metrics mapping
 
 Engine `metrics` frame → Prometheus names (the same names vLLM uses, so the existing scrapers work):
@@ -194,6 +225,8 @@ streaming, tools, thinking); and `bench/pbench.py` runs against it unchanged.
 - A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [lp <k>] [plp <k>] [ins <after>:<unless or -1>:<ids>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
 - Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `f <rows>` (prompt rows prefilled so far, after each prefill quantum: life for the stall timeout, no text), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics`), `end <reason> <stop_id> <n>` (finish frame).
 - `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice. The same CANCEL goes out when the shim gives up on a request itself (engine silent past `--stall-timeout`, an unreadable or unusable resp file): the client gets its `error` finish at once, and the shim keeps tracking the request until the engine's `end` line (or `--cancel-timeout`), so its slot and pages are known to be free. A CANCEL lands at the second event boundary after the head reads it (`NOTICE_MIN` = 2, `engine/runtime/s2/scheduler.h`): during a long prefill each quantum is a boundary, so the request runs at most about two more quanta. One boundary would race the quantum in flight, whose end no rank can know in advance, so it stays at two.
+- Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics` and sent with the request's `finish` frame), `end <reason> <stop_id> <n>` (finish frame).
+- `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice.
 - The engine ends the whole epoch on a request it cannot parse or fit, so the shim checks prompt, ids (0 to 154879: the engine does not bound-check the embedding index), `max_tokens`, `top_p` (must be in (0, 1]; 0 is an error, not off), and the length first and answers `error` itself. `logprobs` / `prompt_logprobs` (k = 0..min(`--max-logprobs`, the ready line's `<max_lp>`)) go to the engine as `lp <k>` / `plp <k>`. A `prompt_logprobs` request runs its whole prompt as 8-row decode steps, and every other session waits until that is done: an 813-token prompt held a decoding session for 10.9 s (TP4, about 13.4 ms per prompt token). `--max-plp-prompt` defaults to 1,024 tokens here (about 14 s). `top_k`/`min_p` are ignored with a warning (`top_p` and `min_tokens` go to the engine).
 - `DIR/abort.s2` (epoch lost) turns every open request into `error` and every later request too; restart the engine and the shim. SIGTERM writes `DIR/quit`, and the head engine passes it to the other ranks. A restarted shim continues the `req`/`cmd` numbers from the files in DIR. Every rank's DIR must be fresh for a new engine start.
 
