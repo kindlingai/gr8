@@ -646,6 +646,11 @@ static int& attn_ctx3(){static int v=[]{
 static int& attn_ctx3_hg(){static int v=[]{const char* e=getenv("G6_ATTN_CTX3_HG");const int x=e?atoi(e):0;return x==2||x==4||x==8?x:0;}();return v;}
 static int& attn_sel2(){static int v=[]{const char* e=getenv("G6_ATTN_SEL2");const int x=e?atoi(e):0;return x==8||x==16||x==32||x==64?x:0;}();return v;}
 static int& attn_idx_grp(){static int v=[]{const char* e=getenv("G6_IDX_GRP");const int x=e?atoi(e):0;return x>=1&&x<=64?x:0;}();return v;}
+// G6_CP_IDXLIVE=1 (default 0 = off; host-side, read once before graph capture; tests may assign it): the CP indexer of a
+// batched S2 step (cp_index_body when the keys are not shared) runs index_scores_g (G = G6_IDX_GRP, else 16) with skip:
+// tiles at or past the live chunks (RADIX_CHUNK rounded) are not written and foreign tiles (another CP rank's page) write
+// index_scores' -inf / id without loading keys; then select_index31's live-chunk select. Bit-identical selection.
+static int& cp_idxlive(){static int v=[]{const char* e=getenv("G6_CP_IDXLIVE");return e&&atoi(e)?1:0;}();return v;}
 // Round 3 (default 0 = off, bit-identical, host-side, read once before graph capture; tests may assign them):
 // G6_ATTN_QT=1 (run_body, use_qt: absorb_m2 above stores q / rope lane-transposed and scores_sc reads them with 16 B loads;
 // FP8 KV only), G6_ATTN_FRONT=1 (g6_attn_replay_run: attn_front).
@@ -974,8 +979,18 @@ static cudaError_t cp_index_body(const G6Attn& a,Input input,Work& w,uint64_t* c
     cp_cand_pack<<<n,256,0,stream>>>(input,0,a.context>32768?w.s1:w.si,mine);
 #else
     prep_index<<<dim3(n,32),128,0,stream>>>(input,0,w.iq,w.weights);
-    LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
+#if defined(DEC_IDX31) && DEC_IDX31 && defined(SEL32)
+    const bool live=cp_idxlive()&&!idx_keys_shared(a,n);
+#else
+    const bool live=false;
+#endif
+    if(live)launch_index_scores_g(a,input,w,0,n,attn_idx_grp()?attn_idx_grp():16,stream,1);
+    else LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
+#if defined(DEC_IDX31) && DEC_IDX31 && defined(SEL32)
+    cudaError_t e=live?select_index31(a,input,w,0,n,stream):SELECT_INDEX(a,input,w,0,n,stream);if(e!=cudaSuccess)return e;
+#else
     cudaError_t e=SELECT_INDEX(a,input,w,0,n,stream);if(e!=cudaSuccess)return e;
+#endif
     cp_cand_pack<<<n,256,0,stream>>>(input,0,w.si,mine);
 #endif
     return cudaGetLastError();
