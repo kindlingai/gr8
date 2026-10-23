@@ -58,6 +58,7 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     m.logits=dmalloc<float>((size_t)MX*geom::NEXP); m.plan=dmalloc<glue::RoutePlan>(1);
     m.srow=dmalloc<glue::SampleRow>(MX); m.tk=dmalloc<glue::TkRes>(1); m.topp_miss=dmalloc<unsigned>(1);
     m.tok=dmalloc<int>(MX); m.pos=dmalloc<int>(MX); m.tok_out=dmalloc<int>(MX); m.tgt=dmalloc<int>(MX);
+    m.steering_scale=dmalloc<float>(MX);   // k_step_in copies StepIn::steering_scale here every step
     m.lp=dmalloc<float>(MX); m.lpt=dmalloc<float>(MX);
     m.scratch=dmalloc<char>(bind::scratch_bytes()); m.sc=bind::scratch_at(m.scratch);
     m.flash_mlp_sc=flash_mlp::workspace_at(dmalloc<char>(flash_mlp::workspace_bytes(MX)),MX);
