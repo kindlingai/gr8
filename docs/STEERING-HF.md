@@ -9,7 +9,7 @@ does not fetch its steering index or artifacts. To select one explicitly, add th
 ```
 
 `hf:default` selects the release index's `default_profile`; `hf:NAME` selects its named record. The model must be a
-self-contained HF exlr8 release, without `--base-packs`. A local directory still uses the
+Hugging Face exlr8 release. A local directory still uses the
 [local-profile interface](STEERING-LOCAL.md). `--steering-force` has the same explicit qualification semantics for
 both sources. Keep weight hash checks enabled.
 

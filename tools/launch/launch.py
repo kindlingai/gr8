@@ -9,9 +9,9 @@
     check [OPTIONS]            this box's checks
     show-config [OPTIONS]      the effective options, the cluster options the handshake compares, their digest, the
                                model set id
-    prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part of the model, without booting: the
-                               shard of a pack directory, and with an https:// --model the release's files for
-                               this rank (it asks the hub for the revision's commit again)
+    prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part of the model, without booting: with an
+                               https:// --model the release's files for this rank (it asks the hub for the
+                               revision's commit again), and the drafter
 
 OPTIONS are --key value (or KEY=value lines in a config file, or KEY in the environment); options.py lists them.
 --foreground runs the supervisor in this process. Exit status: 0 serving (or done), 1 failed, 2 bad options, 4 the
@@ -332,16 +332,14 @@ def cmd_prepare(argv):
               'boot', file=sys.stderr)
         return 2
     if not o.get('MODEL_CACHE'):
-        print('gr8: prepare copies into --model-cache; there is none', file=sys.stderr)
+        print('gr8: prepare fetches into --model-cache; there is none', file=sys.stderr)
         return 2
     ms, variant, err = sv.resolve_model(o, refresh=True)
     if err:
         print(f'gr8: {err}', file=sys.stderr)
         return 1
-    tp, plan = int(o.get('TP')), opt.engine_plan(o)
+    tp, bad = int(o.get('TP')), []
     try:
-        modelset.prepare(ms, rank, plan, log=sv.log)
-        bad = modelset.validate_rank(ms, rank, plan)
         if ms.release:
             if ms.release.check(tp, rank, variant):
                 ms.release.fetch_rank(tp, rank, variant)
