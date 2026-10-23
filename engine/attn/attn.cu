@@ -1134,7 +1134,7 @@ extern "C" int g6_attn_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_finish_body(*a,in,w,part_all,stream);});
 }
-extern "C" int g6_attn_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
+extern "C" int g6_attn_cp_groups_ok(int gh){return gh>0&&gh%8==0&&ga::attn_flip_min()<0;}
 // prob, parts, ml of cp_groups_body, each 256-B aligned
 static size_t cp_groups_at(int heads,int rows,int k){
     const size_t nh=(size_t)heads*rows,b[3]={nh*ga::TOP*4,nh*ga::PART*512*4,nh*2*4};

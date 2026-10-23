@@ -759,7 +759,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         {
             // equal groups (TP=4: 16 heads each) whose head batches line up with the H-head calls'
             if (g6nr::HMIN != g6nr::HMAX || !g6_attn_cp_groups_ok(H))
-                die("G6_CP_ONECHAIN=1 needs equal head groups of a multiple of 16 heads (TP=4) and G6_ATTN_FLIP off");
+                die("G6_CP_ONECHAIN=1 needs equal head groups of a multiple of 8 heads (TP=4, TP=8) and G6_ATTN_FLIP off");
             m.cp.one_rows = std::min(MX, m.cp.colls.mmax);   // a CP step carries <= colls.mmax rows (its fabric size)
             m.cp.qall = dmalloc<float>((size_t)m.cp.one_rows * (NR - 1) * H * 576);
             m.cp.one_bytes = g6_attn_cp_groups_bytes((NR - 1) * H, m.cp.one_rows);

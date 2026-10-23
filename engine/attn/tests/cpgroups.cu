@@ -66,7 +66,7 @@ static float run_us(cudaGraphExec_t x,cudaStream_t st,int reps){   // us per gra
     cudaEventDestroy(a);cudaEventDestroy(b);return ms*1000.f/reps;
 }
 struct Arm{int sc,tr,ctx2,ctx3,hg,ctx4;};
-static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;ga::attn_ctx4()=x.ctx4;}
+static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;(void)x.ctx4;}
 static bool parse_arm(const std::string& s,Arm& x){
     x=Arm{0,0,0,0,0,0};if(s=="stock")return true;
     size_t i=0;while(i<s.size()){size_t e=s.find(',',i);if(e==std::string::npos)e=s.size();const std::string kv=s.substr(i,e-i);i=e+1;
@@ -82,7 +82,7 @@ int main(int argc,char** argv){
         K=argc>6?atoi(argv[6]):16,TR=argc>7?atoi(argv[7]):7,CHK=argc>8?atoi(argv[8]):3;
     const int NR=g6nr::NR,H=g6nr::HMAX,NG=NR-1,HA=NG*H,QT=32,PS=64;
     if(L>T||L<ga::TOP||M<1||M>QT||M>L||CPR<0||CPR%PS||CPR>=L){fprintf(stderr,"bad sizes (M <= 32, 2048 <= L <= T, R < L, R %% 64 == 0)\n");return 2;}
-    if(g6nr::HMIN!=H||!g6_attn_cp_groups_ok(H)){fprintf(stderr,"needs equal head groups of a multiple of 16 heads (G6_NR=4) and G6_ATTN_FLIP off\n");return 2;}
+    if(g6nr::HMIN!=H||!g6_attn_cp_groups_ok(H)){fprintf(stderr,"needs equal head groups of a multiple of 8 heads (G6_NR=4, 8) and G6_ATTN_FLIP off\n");return 2;}
     std::vector<Arm> arms;std::vector<std::string> specs={"SC2=4,TR=2,CTX2=4,CTX3=2","stock"};
     if(const char* e=getenv("CPG_ARMS")){specs.clear();std::string s=e;size_t i=0;
         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
