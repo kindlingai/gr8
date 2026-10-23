@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import modelset as M  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as S  # noqa: E402
-from test_modelset import make_packs  # noqa: E402
+from test_modelset import make_release  # noqa: E402
 
 PEERS = '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'
 
@@ -70,7 +70,7 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual((v.name, v.path, v.sha256), ('home', None, None))
 
     def test_model_id(self):
-        ms = M.resolve(make_packs(os.path.join(self.t, 'set')), None, 4)
+        ms = M.release_set(make_release(os.path.join(self.t, 'set')), 4)
         home, down1 = M.resolve_variant('home', self.v2, []), M.resolve_variant('down1', self.v2, [])
         self.assertEqual(M.model_id(ms, M.Variant('home')), ms.id)            # no v2: the set id
         ids = {M.model_id(ms, home), M.model_id(ms, down1), ms.id}
@@ -92,10 +92,10 @@ class OptionTests(unittest.TestCase):
         self.v2 = os.path.join(self.t, 'v2')
         for name, w in (('home', 3), ('down1', 2)):
             manifest(os.path.join(self.v2, f'exlr8-manifest-{name}.json'), name, w)
-        self.packs = make_packs(os.path.join(self.t, 'packs'))
+        self.rel = make_release(os.path.join(self.t, 'rel'), variants=('base',))
 
     def opts(self, *argv):
-        o = opt.parse(['--no-config', '--peers', PEERS, '--model', self.packs, *argv], {})
+        o = opt.parse(['--no-config', '--peers', PEERS, '--model', self.rel, *argv], {})
         opt.validate(o)
         return o
 
@@ -120,7 +120,7 @@ class OptionTests(unittest.TestCase):
         o = self.opts('--v2', self.v2, '--v2-slices', self.v2, '--v2-widths', os.path.join(self.v2, 'exlr8-manifest-down1.json'))
         self.assertEqual(S.resolve_model(o)[1].name, 'down1')          # --v2-widths names the same manifest
         _, v, err = S.resolve_model(self.opts('--variant', 'up1'))
-        self.assertIn('needs the exlr8 v2 width files', err)
+        self.assertIn('no exlr8-manifest-up1.json in', err)
 
 
 if __name__ == '__main__':
