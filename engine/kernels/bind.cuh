@@ -762,7 +762,7 @@ inline K1Split k1_split(int M, int k2 = 0)
 #endif
     if (const char* ev = getenv(M == 1 ? "G6_K1_SPLIT_M1" : M <= 3 ? "G6_K1_SPLIT_M2" : "G6_K1_SPLIT_M4"))
         sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
-    else if (const char* ev = getenv("G6_K1_SPLIT"))
+    else if (const char* ev = getenv("G6_K1_SPLIT"); ev && !strpbrk(ev, ":="))   // "KS1,WG,NS2"; a table: k1_split_env
         sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
     return s;
 }
@@ -788,6 +788,7 @@ inline const K1SplitEnv& k1_split_env(const char* set = nullptr)
     done = true;
     t = K1SplitEnv();
     const char* v = set ? set : getenv("G6_K1_SPLIT");
+    if (v && !strpbrk(v, ":=")) v = nullptr;      // the "KS1,WG,NS2" form (every row count) is k1_split's, not a table
     for (const char* p = v; p && *p;)
     {
         char* q;
