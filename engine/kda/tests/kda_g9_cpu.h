@@ -1,4 +1,4 @@
-// CPU emulation of the G9 ON path (docs/FLASH-G9-KDA-SCAN.md, CH16 bf16-MMA scan) for ONE head, plus an fp64
+// CPU emulation of the G9 ON path (the CH16 bf16-MMA scan) for ONE head, plus an fp64
 // reference of the exact gated delta rule. The ON emulation rounds to bf16 at the doc's rounding points (RNE),
 // accumulates in fp32 in a fixed order (MMA sum order is unspecified on the GPU; this is one valid order), keeps the
 // state fp32, and flushes exp results / products below FLT_MIN to zero (ex2.approx.ftz).

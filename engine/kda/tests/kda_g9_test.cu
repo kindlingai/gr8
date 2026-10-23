@@ -1,4 +1,4 @@
-// T2 of docs/FLASH-G9-KDA-SCAN.md: the G9 ON kernels (kda_g9.cuh) against the OFF kernels / host math on synthetic input.
+// The G9 ON kernels (kda_g9.cuh) against the OFF kernels / host math on synthetic input.
 // Stage 1: conv16 and out16 against host math. Stage 2 (run_e2e): the whole ON path (kda::g9::launch, VS 1/2/4) against the
 // OFF path (launch_core_prefill) from the same inputs and start state, with the scratch beyond M filled with NaN patterns.
 //   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_FLASH=1 -o kda_g9_test kda_g9_test.cu

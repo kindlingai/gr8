@@ -64,10 +64,6 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 
 A kernel or anything else that changes numerics gets an exactness or tolerance test against the path it replaces, and
 the PR says which and why a tolerance is safe.
-Removing a shared-memory or global store can let nvcc contract separate FP32 products and sums into FMAs. FP32 types
-and the same source order are not enough: use `__fmul_rn` and `__fadd_rn` (or equivalent no-contract operations) at
-each intermediate boundary that must match the former store.
-Byte-check early output rows as well as final output; matching final state can hide differences in earlier rows.
 
 ## Launch
 

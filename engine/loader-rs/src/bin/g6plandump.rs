@@ -27,7 +27,6 @@ fn run() -> Result<(), String> {
     let num = |i: usize| a[i].parse::<usize>().map_err(|_| format!("{}: not a number", a[i]));
     let (nr, rank, out) = (num(5)?, num(6)?, &a[7]);
     let (mut layers, mut globals, mut experts, mut qo, mut rounded, mut sizes) = (Vec::new(), false, false, false, false, false);
-    let (mut partial, mut experts_only) = (false, false);
     let mut i = 8;
     while i < a.len() {
         match a[i].as_str() {
@@ -36,8 +35,6 @@ fn run() -> Result<(), String> {
                 layers = v.split(',').map(|x| x.parse::<usize>().map_err(|_| format!("--layers {v}"))).collect::<Result<_, _>>()?;
                 i += 2;
             }
-            "--partial" => { partial = true; i += 1; }
-            "--experts-only" => { partial = true; experts_only = true; experts = true; i += 1; }
             "--globals" => { globals = true; i += 1; }
             "--experts" => { experts = true; i += 1; }
             "--qo" => { qo = true; i += 1; }
@@ -48,8 +45,7 @@ fn run() -> Result<(), String> {
     }
     let t0 = std::time::Instant::now();
     let opts = g6load::release::Opts { qo, trellis: !rounded };
-    let (img, table) = g6load::release::plan_selected(&a[1], &a[2], &a[3], &a[4], nr, rank, opts,
-        if partial { Some(&layers) } else { None }, !partial || globals, !experts_only)?;
+    let (img, table) = g6load::release::plan(&a[1], &a[2], &a[3], &a[4], nr, rank, opts)?;
     eprint!("{table}");
     if sizes {
         // bytes by tensor kind over the whole image: the name without its layer, or tr3.* for every expert tensor

@@ -1,6 +1,6 @@
 // GLM 5.3 Flash DSA attention: paged NoPE MLA over the 512-d latent + the kpool indexer (kpool.cuh). Replaces attn.cu in
 // the G6_MODEL_FLASH build (runtime/build_m4.sh) behind the same C ABI (attn.h, bind.h, replay.h), so the rank driver
-// binds, runs and replays it as the GLM attention. Reference: engine/ref/flash/flash_ref.py FlashRef.dsa / indexer.
+// binds, runs and replays it as the GLM attention.
 // Per row r at position pos (decode or verify rows; rows of one call may hold several positions of one sequence):
 //   append   latent[pos] = RMSNorm(kv_a, kv_a_norm) (eps 1e-5) as the kvfmt.h row; index raw slot; pool key at pos%4==3
 //   select   indices[r] = kpool selection (kpool.cuh), or a copy of reuse_indices

@@ -23,7 +23,6 @@
 // --v2-dense (Rust loader build): each simulated rank's image is planned from the exlr8 release as g6m4 --v2-dense plans
 //        it, and each tensor is read from the release when a rank first binds it (only the --layers' tensors are read).
 //        --v2-dense-form trellis|rounded as in g6m4
-// --v2-partial: TEST ONLY, plan the --layers subset + globals instead of the full model; needs --v2-dense.
 // [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 // [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                (0 = top_p off; 256 is the served setting; misses printed at the end)
@@ -277,7 +276,6 @@ int main(int argc, char** argv)
     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
     g6rt::CommonOpts co;                // every flag g6m4 takes too, parsed in engine_opts.h
     Plan plan;
-    bool v2partial = false;             // --v2-partial
     bool reuse = false;                 // --reuse-prefix: keep the caches of the rows a prompt shares with the previous one
     std::string serve;
     std::string mtp_dump;               // --mtp-dump PREFIX: rank 0 draft buffers of seq 0 (tools/m6/check_draft.py)
@@ -294,7 +292,6 @@ int main(int argc, char** argv)
         std::string oerr;
         if (g6rt::common_arg(a, next, co, oerr)) { if (!oerr.empty()) die(oerr); continue; }
         if (a == "--packs") packs = next();
-        else if (a == "--v2-partial") v2partial = true;
         else if (a == "--reuse-prefix") reuse = true;
         else if (a == "--mtp-dump") mtp_dump = next();
         else if (a == "--serve") serve = next();
@@ -321,8 +318,6 @@ int main(int argc, char** argv)
     if (co.top_p) plan.top_p = *co.top_p;
     if (co.rs) plan.rs = *co.rs;
     const bool release = !v2src.dense.empty();
-    if (v2partial && (!release || mtp || s2mode || !serve.empty()))
-        die("--v2-partial is a subset test: needs --v2-dense, no --mtp/--s2/--serve");
     if (packs.empty() == !release || (release && (v2src.dir.empty() || v2src.slices.empty() || v2src.widths.empty())))
         die("usage: m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
 #ifndef G6_RS_LOADER
@@ -466,7 +461,7 @@ int main(int argc, char** argv)
     // rank r's pack (or, with --v2-dense, its planned image)
     auto rload = [&](int r) {
 #ifdef G6_RS_LOADER
-        if (release) { pstore.plans[r] = rs_plan_release(pack[r], r, v2src, v2partial ? &layers : nullptr); return; }
+        if (release) { pstore.plans[r] = rs_plan_release(pack[r], r, v2src); return; }
 #endif
         load_pack(pack[r], packs + "/rank" + std::to_string(r) + ".manifest.json", packs + "/rank" + std::to_string(r) + ".pack", r);
     };
@@ -602,7 +597,7 @@ int main(int argc, char** argv)
 #endif
         R[r].qs.mode = qs_mode; R[r].qs.iq = iq_split == 1;
 #if G6_MODEL_FLASH
-        if (mtp) R[r].kda_ring = mtp + 1;   // KDA state slots for the verify ring (FLASH-STEP.md)
+        if (mtp) R[r].kda_ring = mtp + 1;   // KDA state slots for the verify ring
 #endif
         build(R[r], r, layers, rfind(r), cap, f, stepp, st, pf_attn_rows(MP));
         qs_loop_attach(R[r], qsl, stepp);

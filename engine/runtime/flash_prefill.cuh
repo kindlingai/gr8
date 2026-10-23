@@ -553,7 +553,7 @@ inline void pf_kda_oproj_gemm(Model& m, FlashPrefill& P, const kda::KdaLayer& w,
     bindp::launch(g, st);
 }
 
-// G9_KDA_SCAN (default 0 = the base KDA scan, untouched): 1 = the CH16 bf16-MMA scan kda::g9::launch (docs/FLASH-G9-KDA-SCAN.md),
+// G9_KDA_SCAN (default 0 = the base KDA scan, untouched): 1 = the CH16 bf16-MMA scan kda::g9::launch,
 // a precision arm (not byte-exact). G9_KDA_VS in {1, 2, 4} (default 2) is read only when the scan is on.
 inline int pf_g9_scan()
 {

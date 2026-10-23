@@ -543,48 +543,34 @@ pub struct Opts {
 /// the width manifest. Returns the image and the exactness table (markdown).
 pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, nr: usize, rank: usize, opts: Opts)
             -> Result<(V2Image, String), String> {
-    plan_selected(dense_dir, v2_dir, slices_dir, widths_path, nr, rank, opts, None, true, true)
-}
-
-/// Partial images are for CPU component tests, never for a full model boot.
-#[allow(clippy::too_many_arguments)]
-pub fn plan_selected(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str,
-                     nr: usize, rank: usize, opts: Opts, selected: Option<&[usize]>,
-                     globals: bool, dense: bool) -> Result<(V2Image, String), String> {
     let shard = Shard::new(nr, rank)?;
     let man: Json = v2plan::width_manifest(widths_path)?;
     let slices = v2plan::open_slices(slices_dir, nr, rank)?;
     let wfile = |l: usize, k: u8| v2plan::width_file(v2_dir, l, k);
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16);
-    let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(16);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(8);
     let mut p = Planner { b: Builder::new(), shard, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis };
-    // the model is the release's (its files' metadata), not the width manifest's: manifests have one format for every model
+    // the release's files name the model (their metadata); the width manifest has one format for every model
     let model = flash::model_meta(dense_dir)?;
     let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
     if model.is_some() && !is_flash { return Err(format!("{dense_dir}: model metadata of an unsupported model")); }
     let model = model.unwrap_or(Json::Null);
     if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
     let last = if is_flash { 45 } else { L_MTP };
-    if globals {
-        if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
-    }
-    let layers: Vec<usize> = selected.map(|ls| ls.to_vec()).unwrap_or_else(|| (0..=last).collect());
+    if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     let mut moe = 0;
-    for l in layers {
-        if l > last { return Err(format!("layer {l} exceeds MTP layer {last}")); }
-        if dense {
-            if is_flash { flash::layer(&mut p, l, dense_dir, &model)?; } else { p.layer(l, dense_dir)?; }
-        }
+    for l in 0..=last {
+        if is_flash { flash::layer(&mut p, l, dense_dir, &model)?; } else { p.layer(l, dense_dir)?; }
         if let Some(w) = v2plan::widths(&man, l)? {
             v2plan::v2_layer(&mut p.b, l, &w, &slices, &wfile, nr, rank)?;
             moe += 1;
-        } else if l >= 3 && selected.is_none() {
+        } else if l >= 3 {
             return Err(format!("{widths_path} has no widths for MoE layer {l}"));
         }
     }
     let listed = man.get("layers").and_then(Json::obj).map(|m| m.len()).unwrap_or(0);
-    if selected.is_none() && moe != listed {
+    if moe != listed {
         return Err(format!("{widths_path} lists {listed} layers, the model has {moe} MoE layers"));
     }
     let bytes = p.b.cur.div_ceil(4096) * 4096;

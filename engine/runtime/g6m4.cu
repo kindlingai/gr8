@@ -19,7 +19,6 @@
 //                     vocab files in DIR (or DIR/dense), planned at load (engine/loader-rs/src/release.rs). Rank 0
 //                     prints which form each matrix took. G6_PF_OWN=3 takes its full-head tensors from the same image
 //                     (no --qo-manifest / --qo-pack)
-//      [--v2-partial] TEST ONLY, with --v2-dense: plan the --layers subset + globals instead of the full model (as m4sim)
 //      [--v2-dense-form trellis|rounded]  trellis (default): q_b, o_proj and the dense MLP stored as trellis stay the
 //                     release's entries for the dense trellis kernels (kernels/dtr.cuh). rounded: the fallback, which
 //                     rounds them to the MXFP8 and int4 forms of a converted pack (not the release's weights)
@@ -105,7 +104,6 @@
 #include "reuse_hdump.cuh"
 #include "steering_boot.cuh"
 #if G6_MODEL_FLASH
-#include "draft_head_dump.h"
 #endif
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
@@ -132,15 +130,10 @@ static std::vector<std::string> split(const std::string& s, char c)
 int main(int argc, char** argv)
 {
     const auto boot_t0 = std::chrono::steady_clock::now();
-    auto boot_prev = boot_t0;
     int boot_rank = -1;
     auto boot = [&](const char* phase) {
-        const auto now = std::chrono::steady_clock::now();
-        const double tot = std::chrono::duration<double>(now - boot_t0).count();
-        const double dt = std::chrono::duration<double>(now - boot_prev).count();
-        boot_prev = now;
-        fprintf(stderr, "# rank %d: boot %.1f s %s\n", boot_rank, tot, phase);
-        fprintf(stderr, "# rank %d: boot-prof %.3f s (+%.3f s) %s\n", boot_rank, tot, dt, phase);
+        fprintf(stderr, "# rank %d: boot %.1f s %s\n", boot_rank,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_t0).count(), phase);
     };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
@@ -168,7 +161,6 @@ int main(int argc, char** argv)
     std::string manifest, packfile;
     V2Src v2src;
     g6rt::CommonOpts co;                // every flag m4sim takes too, parsed in engine_opts.h
-    bool v2partial = false;             // --v2-partial
     std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
     std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
     int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
@@ -208,7 +200,6 @@ int main(int argc, char** argv)
         else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
         else if (a == "--manifest") manifest = next();
         else if (a == "--pack") packfile = next();
-        else if (a == "--v2-partial") v2partial = true;
         else if (a == "--qp-manifest") qp_man = next();
         else if (a == "--qp-pack") qp_file = next();
         else if (a == "--dflash-manifest") dfl_man = next();
@@ -295,17 +286,6 @@ int main(int argc, char** argv)
     if (!lanes_explicit && MP > 0 && MP <= 8192) lanes = 2;
 #endif
     const bool s2mode = !s2dir.empty();
-    const char* draft_head_path = getenv("G6_DRAFT_HEAD_DUMP");
-    if (draft_head_path && *draft_head_path) {
-#if G6_MODEL_FLASH
-        if (!mtp || s2mode || !dfl_man.empty()) die("G6_DRAFT_HEAD_DUMP needs offline Flash --mtp");
-#else
-        die("G6_DRAFT_HEAD_DUMP needs a Flash build");
-#endif
-    }
-    if (v2partial && (!release || mtp || s2mode))
-        die("--v2-partial is a subset test: needs --v2-dense, no --mtp/--serve");
-    if (v2partial) v2src.partial = &layers;
     const bool dfl = !dfl_man.empty();
     if (s2mode && (getenv("G6_RESID_DUMP") || getenv("G6_LOGIT_DUMP")))
         die("G6_RESID_DUMP / G6_LOGIT_DUMP support offline main steps, not --serve");
@@ -834,7 +814,7 @@ int main(int argc, char** argv)
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
 #if G6_MODEL_FLASH
-    if (mtp) m.kda_ring = mtp + 1;      // KDA state slots for the verify ring (FLASH-STEP.md)
+    if (mtp) m.kda_ring = mtp + 1;      // KDA state slots for the verify ring
 #endif
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
@@ -1131,12 +1111,9 @@ int main(int argc, char** argv)
         dump_write(ldump, hdr, sizeof hdr);
     }
 #if G6_MODEL_FLASH
-    // MTP first draft passes only, as m4sim (docs/FLASH-MTP.md "Draft dumps"): rank 0 writes G6_DRAFT_IN_DUMP; every
+    // MTP first draft passes only, as m4sim: rank 0 writes G6_DRAFT_IN_DUMP; every
     // rank writes its vocab slice to G6_DRAFT_LOGIT_DUMP.rank<R> in the G6_LOGIT_DUMP rank format (the step field is
     // the first-pass counter), so tools/cp/merge_logits.py gives m4sim's draft logit framing.
-    draft_head_dump::Writer dhdump;
-    if (draft_head_path && *draft_head_path)
-        dhdump.open(draft_head_path, g6nr::NR, R, HID, geom::VOCAB, MX, mtp, adapt);
     FILE* didump = nullptr;
     FILE* dldump = nullptr;
     int dd_step = 0;
@@ -2427,17 +2404,6 @@ int main(int argc, char** argv)
                 if (so.attn_err) { fprintf(stderr, "g6m4: rank %d draft attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
 #if G6_MODEL_FLASH
                 if (!chain) draft_dump(di);
-                // Host-only diagnostic, AFTER the existing stream sync; never changes graph/head math.
-                if (dhdump.on()) {
-                    std::vector<float> xn((size_t)M * HID);
-                    G6RT_CK(cudaMemcpy(xn.data(), D.d.xn, xn.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                    draft_head_dump::Row rows[MX];
-                    for (int r = 0; r < M; ++r)
-                        rows[r] = {di.pos[r], di.tok[r], so.tok[r], di.srow[r].pos, di.srow[r].seed_lo,
-                                   di.srow[r].seed_hi, di.srow[r].draw,
-                                   di.srow[r].inv_temp, di.srow[r].top_p, so.lp[r]};
-                    dhdump.call(q, di.step, s, M, chain, di.context, rows, xn.data());
-                }
 #endif
                 std::string line;
                 if (reuse_prefix) reuse.draft_rows(di.pos[0], M, chain);
@@ -2594,7 +2560,6 @@ int main(int argc, char** argv)
     if (rdf && fclose(rdf)) die("G6_RESID_DUMP: close failed");
     if (ldump && fclose(ldump)) die("G6_LOGIT_DUMP: close failed");
 #if G6_MODEL_FLASH
-    dhdump.finish();
     if (didump && fclose(didump)) die("G6_DRAFT_IN_DUMP: close failed");
     if (dldump && fclose(dldump)) die("G6_DRAFT_LOGIT_DUMP: close failed");
 #endif

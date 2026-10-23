@@ -49,11 +49,6 @@ void* g6l_v2_plan(const char* base_manifest, const char* base_pack, const char* 
 // with a message in err.
 void* g6l_release_plan(const char* dense_dir, const char* v2_dir, const char* slices_dir, const char* widths, uint32_t nr,
                        uint32_t rank, int qo, int trellis, const char* out_manifest, char* err, size_t errlen);
-// Test-only m4sim subset of the release. Requires a nonempty list of layer IDs.
-// Production callers continue to use g6l_release_plan and its full-model validation.
-void* g6l_release_plan_selected(const char* dense_dir, const char* v2_dir, const char* slices_dir,
-    const char* widths, uint32_t nr, uint32_t rank, int qo, int trellis, const uint32_t* layers,
-    size_t n_layers, const char* out_manifest, char* err, size_t errlen);
 // Fills dst with image bytes off .. off + n of a planned image, without a sink (one tensor at a time, for m4sim).
 // Returns 0, or 1 with a message in err.
 int g6l_plan_read(void* plan, uint64_t off, uint64_t n, void* dst, char* err, size_t errlen);

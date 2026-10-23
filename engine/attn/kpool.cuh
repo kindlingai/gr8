@@ -1,5 +1,5 @@
 // kpool indexer of GLM 5.3 Flash (included by flash_attn.cu, inside namespace fa, after the cache helpers).
-// Cache layout: attn/kvfmt.h (g6kv IDX_*). Reference: engine/ref/flash/flash_ref.py FlashRef.indexer.
+// Cache layout: attn/kvfmt.h (g6kv IDX_*).
 //   append  kp_append   every row writes its raw key (wk x, FP16, before k_norm) and pool gate (FP16) to its slot
 //           kp_pool     the row that completes pool p (pos % 4 == 3) forms pooled_key[p] in FP32
 //   select  kp_scores   score[p] = 1/64 * sum_h w_h * relu(q_h . pooled_key[p]) for the pools visible to the row

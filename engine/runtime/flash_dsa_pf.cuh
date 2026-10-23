@@ -28,7 +28,6 @@
 #include <type_traits>
 #include <vector>
 #include "rank.cuh"
-#include "flash_index_capture.h"
 #include "../attn/prefill.h"
 #include "flash_pool_owner.cuh"
 #include "flash_dsa_full_schedule.h"
@@ -484,23 +483,6 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             G6FlashPoolOwner owner{m.rank, transport, flash_pool_publish, flash_pool_receive};
             G6RT_CK(g6_attn_bind_prefill_run_owned(S.pf[i], &y.ab, &s, st, &owner));
         } else G6RT_CK(g6_attn_bind_prefill_run(S.pf[i], &y.ab, &s, st));
-        // First-step TP2 ownership falsifier: observe selection only; do not change it.
-        if (const char* prefix = getenv("G6_PF_POOL_CAPTURE"); prefix && *prefix) {
-            static_assert(g6kv::TOP_POOLS == flash_index_capture::POOLS &&
-                          g6kv::KPOOL == flash_index_capture::KP &&
-                          g6kv::SEL == flash_index_capture::STRIDE, "pool capture geometry");
-            const int* selected = g6_attn_bind_prefill_indices(S.pf[i], &y.ab, M);
-            if (!selected) die("Flash pool capture: missing selected indices");
-            std::vector<int> positions(M), ids(static_cast<size_t>(M) * g6kv::SEL);
-            G6RT_CK(cudaStreamSynchronize(st));
-            G6RT_CK(cudaMemcpy(positions.data(), P.pos, positions.size() * sizeof(int), cudaMemcpyDeviceToHost));
-            G6RT_CK(cudaMemcpy(ids.data(), selected, ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
-            static flash_index_capture::Writer writer;
-            try {
-                writer.write(std::string(prefix) + ".rank" + std::to_string(m.rank), y.l, context, M,
-                             positions.data(), ids.data());
-            } catch (const std::exception& e) { die(std::string("Flash pool capture: ") + e.what()); }
-        }
         attn_out = static_cast<const __half*>(g6_attn_bind_prefill_output(S.pf[i], &y.ab, M));
     }
     mark(4, st);

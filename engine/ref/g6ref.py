@@ -325,16 +325,6 @@ def mxfp8_record(codes, scales):
     return np.ascontiguousarray(np.concatenate([t, pairs], axis=2))
 
 
-def fp8_record(codes):
-    """codes u8 [16T, K] (E4M3FN) -> stream u8 [T][K/32][512]: 2 tiles of [32 lanes][8 B] in lane order (paired with per-row f32 scale)."""
-    T, S = codes.shape[0] // 16, codes.shape[1] // 16
-    b = codes.reshape(T, 16, S, 16).transpose(0, 2, 1, 3)  # [T,S,row,k]
-    r, c = _gv_lane()
-    t = np.stack([b[..., r, 2 * c], b[..., r, 2 * c + 1], b[..., r + 8, 2 * c], b[..., r + 8, 2 * c + 1],
-                  b[..., r, 2 * c + 8], b[..., r, 2 * c + 9], b[..., r + 8, 2 * c + 8], b[..., r + 8, 2 * c + 9]], axis=-1)
-    return np.ascontiguousarray(t.reshape(T, S // 2, 512))
-
-
 def mxfp8_unrecord(rec):
     T, ng, _ = rec.shape
     t = rec[:, :, :512].reshape(T, ng * 2, 32, 8)

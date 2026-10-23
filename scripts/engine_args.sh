@@ -43,7 +43,7 @@ pool_cap() {
 
 # GLM-5.3-Flash under --serve takes one session and no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu
 # refuses them). CAP is a 32K context plus one prefill chunk until the pool is measured on Flash. MTP=1: --serve needs
-# a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH-MTP.md).
+# a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
 flash_defaults() {
   case $TP in 4|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4 or 2" >&2; return 2 ;; esac
   local k
@@ -82,7 +82,7 @@ engine_defaults() {
 # TP=4 defaults G6_PF_OWN to 4. OWN=3 needs the 13 GB full-head QO pack on every rank, and that pack does not fit next to
 # a 90 GB TP=4 rank pack. OWN=4 runs the same attention over two head pairs, with the pair weights rolled in per layer
 # (about 1.3-1.4 GB of device memory plus 84 MB pinned per rank). About 1.4 KB per position of it scales with QP_CTX.
-# GLM-5.3-Flash: docs/FLASH-STATUS.md's speed stack at top-k 8. G6_PF_RS, G6_PF_OWN and CP stay off.
+# GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). G6_PF_RS, G6_PF_OWN and CP stay off.
 flash_env() {
   ENGINE_BIN=g6m4_flash
   ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_PF_STRIPE=0 G6_FPF_P1=0 G6_FPF_DSA_P1=0 \

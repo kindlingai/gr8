@@ -235,10 +235,6 @@ def check(records, baseline, noise=0.03, required=REQUIRED):
             verdict = 'NO THRESHOLD' if thr is None else ('PASS' if v <= thr else 'FAIL')
             if thr is None:
                 reasons.append('kl.mean: no threshold yet (needs three boots in the baseline)')
-        elif base == 0:
-            # Relative noise has no scale at zero. Compare direction without dividing by zero.
-            improvement = v if b['better'] == HIGHER else -v
-            verdict = 'better' if improvement > 0 else ('FAIL' if improvement < 0 else 'PASS')
         else:
             worse = (base - v) / abs(base) if b['better'] == HIGHER else (v - base) / abs(base)
             verdict = 'FAIL' if worse > tol else ('better' if worse < -tol else 'PASS')

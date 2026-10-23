@@ -1,4 +1,4 @@
-// G9: KDA scan + conv prefill on CH16 tensor cores (docs/FLASH-G9-KDA-SCAN.md). ON path, opt-in (G9_KDA_SCAN != 0);
+// G9: KDA scan + conv prefill on CH16 tensor cores. ON path, opt-in (G9_KDA_SCAN != 0);
 // the OFF path (kda_prefill.cuh) is untouched. Everything here lives in kda::g9: templates, inline functions and
 // kernels only, no __device__ globals, no macros.
 //
