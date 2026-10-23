@@ -22,8 +22,8 @@ template <class F> static bool rejects(F f) { try { f(); } catch (const std::exc
 static void guards() {
     Config c;
     CHECK(capability(c, 8).find("G6S2 3 1 8 ") == 0);
-    for (unsigned n : {3u, 4u, 6u, 8u}) CHECK(!rejects([&] { capability(c, n); }));
-    for (unsigned n : {0u, 1u, 2u, 5u, 7u, 9u, 16u}) CHECK(rejects([&] { capability(c, n); }));
+    for (unsigned n : {2u, 3u, 4u, 6u, 8u}) CHECK(!rejects([&] { capability(c, n); }));
+    for (unsigned n : {0u, 1u, 5u, 7u, 9u, 16u}) CHECK(rejects([&] { capability(c, n); }));
     BootstrapConfig b; b.ranks = 8; b.rank = 7; b.head_ip = "127.0.0.1"; b.port = 1; b.directory = "/x"; b.runtime_signature = "s";
     CHECK(!rejects([&] { b.validate(); }));
     b.rank = 8; CHECK(rejects([&] { b.validate(); }));
