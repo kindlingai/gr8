@@ -321,6 +321,37 @@ fn quant_entries(f: &StFile) -> Result<Vec<(String, String, Vec<usize>)>, String
     Ok(out)
 }
 
+/// KDA matrices the engine reads in BF16 only (kda/kda.cuh bind_kda): q/k/v and b as BF16 decode records (.gv), f_b /
+/// g_b as the BF16 matrix itself. A quantized release stores them in MXFP8, whose values BF16 holds exactly (a 3-bit
+/// mantissa and a power-of-two scale), so they are decoded at load, as kv_b's FP8 blocks are.
+const KDA_BF16: [&str; 6] = ["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+    "self_attn.b_proj.weight", "self_attn.f_b_proj.weight", "self_attn.g_b_proj.weight"];
+
+fn kda_bf16(p: &mut Planner, l: usize, label: String, f: &Arc<StFile>, local: &str, name: &str) -> Result<(), String> {
+    let m = Matrix::open(f, local)?;
+    let (o, k, threads) = (m.rec.out, m.rec.inp, p.threads);
+    let decode = {
+        let (f, local) = (f.clone(), local.to_string());
+        move || -> Result<Vec<u16>, String> {
+            let m = Matrix::open(&f, &local)?;
+            Ok(exlr8::decode_par(&m, 0..o, 0..k, threads)?.into_iter().map(exlr8::bf16_bits).collect())
+        }
+    };
+    p.note(l, Form { what: "KDA projection", src: fmt_name(&m), form: "BF16", exact: BF16_OF });
+    if name.ends_with("f_b_proj.weight") || name.ends_with("g_b_proj.weight") {
+        p.gen(label.clone(), vec![(label, "bf16", vec![o as i64, k as i64])], move || {
+            Ok(vec![decode()?.iter().flat_map(|v| v.to_le_bytes()).collect()])
+        });
+    } else {
+        if o % 16 != 0 || k % 16 != 0 { return Err(format!("{local}: {o}x{k} is not in 16-row tiles")); }
+        let gv = format!("{label}.gv");
+        p.gen(gv.clone(), vec![(gv, "u8", vec![(o / 16) as i64, (k / 16) as i64, 512])], move || {
+            Ok(vec![records::bf16_record(&decode()?, k)])
+        });
+    }
+    Ok(())
+}
+
 fn quant_layer(p: &mut Planner, l: usize, f: Arc<StFile>) -> Result<(), String> {
     let prefix = format!("model.language_model.layers.{l}.");
     let (h0, nh) = p.shard.heads(l);
@@ -359,6 +390,7 @@ fn quant_layer(p: &mut Planner, l: usize, f: Arc<StFile>) -> Result<(), String> 
                 }
                 p.trellis(l, name, &format!("L{l:03}"), &m, ch)?;
             },
+            MXFP8 if KDA_BF16.contains(&name) => kda_bf16(p, l, label, &f, &local, name)?,
             MXFP8 => p.mxfp8(l, "Flash MXFP8", &label, &f, &local, false)?,
             FP8_BLOCK if hf == "self_attn.kv_b_proj.weight" => {
                 if shape != [64*512,512] { return Err("Flash kv_b must be [32768,512]".into()); }
