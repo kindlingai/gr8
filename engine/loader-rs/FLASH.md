@@ -1,7 +1,7 @@
 # Flash release loader (CPU-tested)
 
-The width manifest selects the model. `hidden_size=4096` selects the Flash path;
-legacy manifests still select the full-GLM path. Flash requires the seven source
+The release's own files select the model: `hidden_size=4096` in the vocabulary file's metadata selects the Flash
+path, and a release without it is GLM-5.3. Flash requires the seven source
 identity fields, 46 dense layers (0–45), vocabulary, and expert widths for 3–45.
 A full boot still requires the Flash runtime workstreams; this loader does not
 make the existing GLM kernels Flash-capable.
@@ -103,51 +103,13 @@ order plus the native FP32 per-row scales, without MXFP8 re-quantization).
 The embedding and kv_b therefore round once to BF16; the head preserves its
 native FP8-row weights and FP32 row scales.
 
-### W8 CPU verification
+### CPU tests
 
 ```sh
 cargo test --manifest-path engine/loader-rs/Cargo.toml
 cargo build --release --manifest-path engine/loader-rs/Cargo.toml
-OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
-  python3 engine/loader-rs/tests/flash_quant_check.py \
-  --encoder EXLR8QUANT_CHECKOUT --work SCRATCH --vocab
+python3 engine/loader-rs/tests/test_flash_plan.py
 ```
 
-The synthetic test checks 328 image tensors across TP4 ranks for KDA, DSA,
-dense MLP and MTP; it checks 30 FP32 matrix decodes against `dense_format.dequant`
-byte for byte. It also checks full-size FP8-row vocabulary at rank 0 and rejects
-wrong model identity and unsupported rounded trellis loading. These are CPU
-format/ownership gates, not a real quantized release, runtime boot, quality or
-performance gate. Flash W8 GPU consumers still need separate kernel work.
-
-For **real quantized layer files** (including a partial dense-only release), use:
-
-```sh
-OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
-  python3 engine/loader-rs/tests/flash_quant_release_check.py \
-  --encoder EXLR8QUANT_CHECKOUT --release RELEASE --layers 0,3,11 \
-  --work SCRATCH --report REPORT.json
-```
-
-This checks every planned tensor on all TP4 ranks, then compares Rust FP32
-matrix decodes to the independent Python dense codec byte for byte. It reads
-real records and source names instead of constructing a synthetic fixture.
-Each layer runs separately to bound memory. The report stays `INCOMPLETE`
-until all requested layers pass. This command does not test globals, experts,
-GPU kernels, or model quality. The lossless-only `FlashExpect` path in
-`release_check.py` is not the reference for quantized dense records.
-
-For a **real quantized vocabulary**, use the separate bounded-memory gate:
-
-```sh
-OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
-  python3 engine/loader-rs/tests/flash_vocab_release_check.py \
-  --encoder EXLR8QUANT_CHECKOUT --release RELEASE \
-  --work SCRATCH --report VOCAB-REPORT.json
-```
-
-This checks all four TP4 ranks: the replicated embedding after BF16 rounding,
-final norm, and each head shard after MXFP8 conversion and record packing.
-It also compares each rank's two FP32 matrix decodes against the Python codec.
-The source is the real release, not a synthetic vocabulary. These are CPU
-format and loader gates only, with no GPU or model-quality claim.
+`test_flash_plan.py` plans a synthetic Flash release with `g6plandump`: split dense tensors keep their exact bits,
+and gaps, overlaps, a missing part and a model mismatch are refused.

@@ -26,8 +26,6 @@ python3 -m tools.convert.v2slices --v2 DIR --out DIR [--tp 3-7] [--widths 2,3,4]
     FILE: JSON {"set_id": ..., "index_sha256": {"exlr8-layer-LLL.index.safetensors": sha256, ...}}
 """
 import argparse
-import hashlib
-from pathlib import Path
 import json
 import os
 import struct
@@ -69,19 +67,18 @@ def write_safetensors(path, tensors, meta):
 
 def layer_tensors(idx, L, k, n):
     """{rank: {name: array}} for layer L at width k, TP n (idx: the layer's index file, an ST)."""
-    H, N_EXP = v2.geometry(idx.meta)
     shared = f'shared.k{k}.index' in idx
-    E = N_EXP + (1 if shared else 0)
+    E = v2.N_EXP + (1 if shared else 0)
     get = lambda name, sh: idx.get(f'shared.k{k}.{name}' if sh else f'k{k}.{name}')
     index = np.concatenate([get('index', False)] + ([get('index', True)] if shared else []))       # [E, 3, 16, 2]
     check = np.concatenate([get('checksum', False)] + ([get('checksum', True)] if shared else []))  # [E, 3, 16]
     chan = np.stack([np.concatenate([get(c, False)] + ([get(c, True)] if shared else [])) for c in CHAN], 1)   # [E,3,2048]
     block = np.stack([np.concatenate([get(b, False)] + ([get(b, True)] if shared else [])) for b in BLOCK], 1)  # [E,3,48]
     signs = np.stack([idx.get('signs.in'), idx.get('signs.out')]).astype(np.int8)
-    hb = v2.half_bytes(k, H)
+    hb = v2.half_bytes(k)
     e_, p_, h_ = np.meshgrid(np.arange(E), np.arange(3), np.arange(16), indexing='ij')
-    want = np.where(e_ < N_EXP, 65536 + ((p_ * N_EXP + e_) * 16 + h_) * hb,     # routed: [proj][expert][half]
-                    65536 + (3 * N_EXP * 16 + p_ * 16 + h_) * hb)                    # shared: after all routed halves
+    want = np.where(e_ < v2.N_EXP, 65536 + ((p_ * v2.N_EXP + e_) * 16 + h_) * hb,     # routed: [proj][expert][half]
+                    65536 + (3 * v2.N_EXP * 16 + p_ * 16 + h_) * hb)                    # shared: after all routed halves
     if not (index[..., 0] == want).all() or not (index[..., 1] == hb).all():
         raise ValueError(f'L{L} k{k}: half offsets do not follow the published layout')
     owner = (16 * np.arange(E)[:, None] + np.arange(16)[None, :] + L) % n                            # [E, 16]
@@ -98,31 +95,6 @@ def layer_tensors(idx, L, k, n):
     return out
 
 
-def stamp_release(root):
-    """Identity of the actual local weights, not of manifests or slices. No completeness claim."""
-    root = Path(root)
-    files = sorted([*root.glob('experts/*.safetensors'), *root.glob('dense/*.safetensors')])
-    if not files:
-        raise ValueError('release has no weight files')
-    lines, indexes = [], {}
-    for p in files:
-        with p.open('rb') as f:
-            digest = hashlib.file_digest(f, 'sha256').hexdigest()
-        lines.append(f'{p.relative_to(root).as_posix()} {p.stat().st_size} {digest}\n')
-        if p.name.endswith('.index.safetensors'):
-            indexes[p.name] = digest
-    sid = hashlib.sha256(''.join(lines).encode()).hexdigest()
-    for p in sorted(root.glob('manifests/exlr8-manifest-*.json')):
-        m = json.loads(p.read_text())
-        if m.get('format') != 'exlr8-v2-manifest':
-            raise ValueError(f'{p}: not a width manifest')
-        m.update(set_id=sid, set_id_rule=SET_ID_RULE)
-        tmp = p.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps(m, indent=2, sort_keys=True) + '\n')
-        os.replace(tmp, p)
-    return dict(set_id=sid, index_sha256=indexes)
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--v2', required=True)
@@ -131,7 +103,6 @@ def main(argv=None):
     ap.add_argument('--widths', default='2,3,4')
     ap.add_argument('--layers', default='auto')
     ap.add_argument('--source', default='', help='provenance for the metadata (repo@revision)')
-    ap.add_argument('--stamp-release', help='hash weight files and stamp width manifests in this release')
     ap.add_argument('--set-id', help='JSON file with set_id and index_sha256 (file name -> sha256)')
     a = ap.parse_args(argv)
     lo, _, hi = a.tp.partition('-')
@@ -139,16 +110,11 @@ def main(argv=None):
     widths = [int(x) for x in a.widths.split(',')]
     layers = [l for l in range(79) if os.path.exists(os.path.join(a.v2, v2.INDEX_FILE.format(l=l)))] \
         if a.layers == 'auto' else [int(x) for x in a.layers.split(',')]
-    sid = stamp_release(a.stamp_release) if a.stamp_release else json.load(open(a.set_id)) if a.set_id else None
-    geom = None
+    sid = json.load(open(a.set_id)) if a.set_id else None
     acc = {(n, k, r): {} for n in tps for k in widths for r in range(n)}
     have = {k: [] for k in widths}
     for L in layers:
         idx = ST(os.path.join(a.v2, v2.INDEX_FILE.format(l=L)))
-        current = v2.geometry(idx.meta)
-        if geom is not None and geom != current:
-            raise ValueError('mixed model geometry in slices')
-        geom = current
         for k in widths:
             if f'k{k}.index' not in idx:
                 continue
@@ -162,7 +128,7 @@ def main(argv=None):
         d = os.path.join(a.out, f'tp{n}', f'k{k}')
         os.makedirs(d, exist_ok=True)
         meta = dict(format=FORMAT, version=1, tp=n, rank=r, k=k, layers=','.join(map(str, have[k])),
-                    hidden_size=geom[0], n_routed_experts=geom[1], half_bytes=v2.half_bytes(k, geom[0]), rule='(16 * expert + half + layer) mod tp',
+                    half_bytes=v2.half_bytes(k), rule='(16 * expert + half + layer) mod tp',
                     files=f'experts/exlr8-layer-LLL.k{k}.safetensors', source=a.source)
         if sid:
             meta.update(set_id=sid['set_id'], set_id_rule=SET_ID_RULE, index_sha256=json.dumps(

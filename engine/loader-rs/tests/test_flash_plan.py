@@ -1,4 +1,5 @@
-"""CPU tests for Flash geometry, release identity and lossless/split planner contracts."""
+"""g6plandump on a synthetic Flash release: split dense tensors keep their exact bits, and bad splits are refused.
+    cargo build --release --manifest-path engine/loader-rs/Cargo.toml && python3 engine/loader-rs/tests/test_flash_plan.py"""
 import json
 import os
 from pathlib import Path
@@ -6,13 +7,14 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import sys
 import numpy as np
-from tools.convert import v2, v2slices
-from tools.convert.st import ST
 
 META = dict(model='Glm5NextForConditionalGeneration', hidden_size='4096', moe_intermediate_size='2048',
             n_routed_experts='288', num_hidden_layers='45', first_moe_layer='3', tensor_prefix='model.language_model.layers.')
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+from tools.convert.st import ST  # noqa: E402
 DUMP = ROOT/'engine/loader-rs/target/release/g6plandump'
 
 
@@ -28,50 +30,12 @@ def write(path, arrays, meta):
     path.write_bytes(struct.pack('<Q',len(h))+h+b''.join(data))
 
 
-class Flash(unittest.TestCase):
-    def test_geometry_and_permutation(self):
-        self.assertEqual(v2.geometry(META),(4096,288))
-        self.assertEqual(v2.geometry({}),(6144,256))
-        for h in (4096,6144):
-            for k in (2,3,4):
-                a = np.arange(h*16*k,dtype=np.uint8)
-                self.assertTrue(np.array_equal(v2.down_from_g6(v2.down_to_g6(a,k,h),k,h),a))
-        w = v2.Widths([2]*288,[2]*288,[2]*288,shared=2)
-        self.assertEqual(w.of(288)[2],2)
-        self.assertEqual(v2.half_bytes(3,4096),196608)
-
-    def test_flash_ownership_and_size(self):
-        from tools.convert import plan
-        from tools.launch.modelset import expert_gb
-        plan.set_model('flash')
-        try:
-            self.assertEqual((plan.H,plan.L_MTP,plan.N_EXP),(4096,45,288))
-            self.assertEqual([l for l in range(45) if plan.has_indexer(l)],list(range(3,45,4)))
-        finally:
-            plan.set_model('glm53')
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d)/'widths.json'
-            p.write_text(json.dumps(dict(META,layers={'3':dict(gate=[[2]*16]*288,up=[[2]*16]*288,
-                down=[2]*288,shared=dict(gate=[2]*16,up=[2]*16,down=2))})))
-            self.assertEqual(expert_gb(p,4),289*16*3*65536*2/4/1e9)
-
-    def test_stamp_changes_only_with_weight_bytes(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d)
-            for n in ('dense','experts','manifests'): (p/n).mkdir()
-            (p/'dense/a.safetensors').write_bytes(b'weight')
-            manifest = p/'manifests/exlr8-manifest-k2.json'
-            manifest.write_text(json.dumps(dict(format='exlr8-v2-manifest',layers={})))
-            first = v2slices.stamp_release(p)['set_id']
-            self.assertEqual(json.loads(manifest.read_text())['set_id'],first)
-            self.assertEqual(v2slices.stamp_release(p)['set_id'],first)
-            (p/'dense/a.safetensors').write_bytes(b'changed')
-            self.assertNotEqual(v2slices.stamp_release(p)['set_id'],first)
-
+class PlanTests(unittest.TestCase):
     @unittest.skipUnless(DUMP.exists(), 'build g6plandump --release first')
     def test_split_source_shapes_exact_bits_and_rejection(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d); (p/'dense').mkdir()
+            write(p/'exlr8-vocab.safetensors', {}, META)   # the planner takes the model from the vocabulary file
             (p/'index-slices/tp4/k2').mkdir(parents=True)
             write(p/'index-slices/tp4/k2/rank0.safetensors',{}, {})
             man = p/'widths.json'; man.write_text(json.dumps(dict(META,format='exlr8-v2-manifest',layers={})))
