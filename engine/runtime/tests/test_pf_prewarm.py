@@ -43,8 +43,8 @@ class PrewarmTest(unittest.TestCase):
     def test_headroom_after_pool_and_nothing_later_sizes_from_free_memory(self):
         step = (RT / 'flash_step.cuh').read_text()
         self.assertIn('check_headroom(rank,capacity,true);', step)      # the KV pool gate, built before FP
-        g = (RT / 'g6m4.cu').read_text()
-        self.assertNotIn('MemAvailable', g)
+        code = [ln.split('//', 1)[0] for ln in (RT / 'g6m4.cu').read_text().splitlines()]   # comments may name it
+        self.assertNotIn('MemAvailable', '\n'.join(code))
 
 
 if __name__ == '__main__':
