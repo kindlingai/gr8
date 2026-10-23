@@ -49,15 +49,18 @@ struct CpPick {
     std::vector<bool> in;   // per candidate: in this round
     bool capped = false;    // a cycle round (the others sit it out); false = everyone, and the cycle resets
     bool fresh = false;     // capped: this round starts a new cycle
+    int kcap = -1;          // G6_CP_STEP_KFIT: every session in, each verifying at most kcap drafts (-1 = no cap)
 };
 class CpRound {
     std::vector<uint64_t> served_;   // ids served in the current cycle
     bool served(uint64_t id) const { return std::find(served_.begin(), served_.end(), id) != served_.end(); }
 public:
     // The round's sessions among cand (the decoding sessions that are not stalled, in request-id order). rows = n (0 =
-    // off: everyone), per = the most rows one session's verify takes (mtp + 1), seg = G6_CP_STEP_SEG. Pure: commit()
+    // off: everyone), per = the most rows one session's verify takes (mtp + 1), seg = G6_CP_STEP_SEG. kfit =
+    // G6_CP_STEP_KFIT: when every session does not fit at per rows but does at 2 or more, the round takes every session
+    // and each verifies at most rows / sessions - 1 drafts (kcap) instead of a cycle of capped rounds. Pure: commit()
     // records it once the round really runs.
-    CpPick pick(const std::vector<CpCand>& cand, uint32_t rows, uint32_t per, bool seg) const {
+    CpPick pick(const std::vector<CpCand>& cand, uint32_t rows, uint32_t per, bool seg, bool kfit = false) const {
         CpPick p;
         p.in.assign(cand.size(), true);
         if (!rows || cand.empty()) return p;
@@ -66,6 +69,7 @@ public:
         if (!past) return p;
         const bool mixed = past < cand.size();
         if (uint64_t(cand.size()) * per <= rows && !(seg && mixed)) return p;   // everyone fits in one step past R
+        if (kfit && !(seg && mixed) && rows / cand.size() >= 2) { p.kcap = int(rows / cand.size()) - 1; return p; }
         p.capped = true;
         std::vector<size_t> open;
         for (size_t i = 0; i < cand.size(); ++i) if (!served(cand[i].id)) open.push_back(i);

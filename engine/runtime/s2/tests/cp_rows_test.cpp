@@ -116,6 +116,19 @@ static void pick_tests()
         CHECK(cycle(r, mixed, 12, false, 1) == (VV{{1, 2, 3, 4}}));              // 12 rows <= 12
         CHECK(!r.pick(mixed, 12, 3, false).capped && r.cycle().empty());
     }
+    {   // G6_CP_STEP_KFIT: every session in one round when each gets >= 2 rows; kcap = rows / sessions - 1
+        CpRound r;
+        const std::vector<CpCand> four{L(1), L(2), L(3), L(4)};
+        const CpPick a = r.pick(four, 8, 4, false, true);
+        CHECK(!a.capped && a.kcap == 1 && a.in == std::vector<bool>(4, true));
+        CHECK(r.pick(four, 8, 4, false, false).kcap == -1 && r.pick(four, 8, 4, false, false).capped);   // off: unchanged
+        CHECK(r.pick({L(1), L(2)}, 8, 4, false, true).kcap == -1);                                          // fits: no cap
+        const CpPick b = r.pick({L(1), L(2), L(3)}, 8, 4, false, true);                                     // 8 / 3 = 2 rows
+        CHECK(!b.capped && b.kcap == 1);
+        const CpPick c = r.pick({L(1), L(2), L(3), L(4), L(5)}, 8, 4, false, true);                         // 1 row: cycle
+        CHECK(c.capped && c.kcap == -1);
+        CHECK(r.pick({L(1), S(2), L(3), S(4)}, 8, 4, true, true).capped);                                   // SEG mixed: cycle
+    }
     {   // n = 8 (two sessions a round): the design note's examples
         CpRound r;
         CHECK(cycle(r, {L(1), S(2), S(3), S(4)}, 8, false, 4) == (VV{{1, 2}, {3, 4}, {1, 2}, {3, 4}}));
