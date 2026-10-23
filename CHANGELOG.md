@@ -65,6 +65,15 @@
 - With the block-8 DFlash2 drafter nothing changes: the captured widths, the row bound and the histogram are those of
   before. A drafter with a wider block (a block-12 one was served with these fixes) boots and serves; serving one also
   needs drafter-side changes that are not part of this.
+## 2026-10-18: decode buckets: nine slots, so a SHARE_LIMIT off the doubling keeps the 2048 bucket
+
+- The decode graphs are captured per context bucket (2048, 4096, ... below the capacity, the capacity, and CP's R when it
+  is not already a boundary). With eight slots a limit such as 98304 filled the list and `context_buckets` merged the
+  smallest bucket away, so every short-context step ran on the 4096 graph. `NBK` is now 9 and the doubling stops at
+  seven buckets, as it did when the list was full: at every TP default (R a power of two among the doublings) the list,
+  the graphs and the outputs are those of before; an R off the doubling takes the ninth slot (one more bucket of step
+  graphs). `test_context_buckets` checks both.
+
 ## 2026-10-18: --share-limit takes any multiple of 64 from 4096
 
 - The launcher refused a `SHARE_LIMIT` that is not a power of two. The engine does not need one: `context_buckets`
