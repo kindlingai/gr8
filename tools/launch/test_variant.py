@@ -61,7 +61,7 @@ class ResolveTests(unittest.TestCase):
         self.assertIn('no exlr8-manifest-up1.json in ' + self.v2, str(e.exception))
         with self.assertRaises(M.ModelError) as e:
             M.resolve_variant('k5', self.v2, [])
-        self.assertIn('not home, down1 or up1', str(e.exception))
+        self.assertIn('not one of home, down1, up1', str(e.exception))
         for spec in ('down1', os.path.join(self.t, 'mine.json')):
             with self.assertRaises(M.ModelError) as e:
                 M.resolve_variant(spec, None, [self.model])
