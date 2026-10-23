@@ -61,8 +61,6 @@ struct FlashPrefill
     __nv_bfloat16* peer_dev = nullptr;           // NR == 2 (unless G6_PF_MHC_STAGE=0): [MP][HID] the peer's partial, copy engine
     PfPeerStage peer_stage;                       // G6_PF_STAGE_ASYNC=1 only; one stream and storage per lane
     u64 cur_step = 0;                            // host copy of the layer step pf_step_flash set (for the staging copy)
-    bool sp = false;                             // G6_PF_RS=2: sequence-parallel mHC (owner rows, BF16 RS + FP32 AG, 5 collectives)
-    unsigned long long* sp_xt = nullptr;         // SP + G6_PF_XTRACE=1: [pxt::PX_STEPS][2][SPX_W] (logical c), else null
 };
 inline bool pf_mhc_stage()
 {
@@ -133,25 +131,6 @@ inline void pf_comm_xt(FlashPrefill& P, int c, int field, cudaStream_t st)
 {
     if (P.comm_xt) k_pf_comm_stamp<<<1, 1, 0, st>>>(P.comm_xt, P.stepp, c, field);
 }
-// SP (G6_PF_RS=2) boundary marks, stream-ordered, one record per (step % PX_STEPS, logical c = 0 attention / 1 MLP):
-// end of RS put, RS wait, owner mHC, AG put(s), AG wait, AG copy, FP16 reconstruction, final residual gather (c4, last
-// layer only). SPX_RS_PUT opens the record. Fabric collective numbers (0..4) never index this or pxt / comm_xt.
-enum { SPX_RS_PUT, SPX_RS_WAIT, SPX_MHC, SPX_AG_PUT, SPX_AG_WAIT, SPX_AG_COPY, SPX_F2H, SPX_RESID, SPX_STEP, SPX_W };
-__global__ void k_pf_sp_stamp(unsigned long long* p, const u64* stepp, int c, int field)
-{
-    const u64 step = *stepp;
-    unsigned long long* r = p + ((size_t)(step % pxt::PX_STEPS) * 2 + c) * SPX_W;
-    if (field == SPX_RS_PUT)
-    {
-        for (int k = 0; k < SPX_W; ++k) r[k] = 0;
-        r[SPX_STEP] = step + 1;
-    }
-    r[field] = pxt::now();
-}
-inline void pf_sp_xt(FlashPrefill& P, int c, int field, cudaStream_t st)
-{
-    if (P.sp_xt) k_pf_sp_stamp<<<1, 1, 0, st>>>(P.sp_xt, P.stepp, c, field);
-}
 __global__ void k_pxt_clock(const volatile unsigned* go, volatile unsigned long long* out)
 {
     while (!*go) {}
@@ -221,20 +200,6 @@ inline void pf_xt_dump(FlashPrefill& P, int rank)
                                (int)(slot % 2), q[0], q[1], q[2]);
         }
     }
-    if (P.sp_xt)
-    {
-        std::vector<unsigned long long> sh((size_t)pxt::PX_STEPS * 2 * SPX_W);
-        G6RT_CK(cudaMemcpy(sh.data(), P.sp_xt, sh.size() * 8, cudaMemcpyDeviceToHost));
-        std::vector<const unsigned long long*> ss;
-        for (size_t i = 0; i < (size_t)pxt::PX_STEPS * 2; ++i)
-            if (sh[i * SPX_W + SPX_STEP]) ss.push_back(&sh[i * SPX_W]);
-        std::sort(ss.begin(), ss.end(), [](const unsigned long long* a, const unsigned long long* b) { return a[SPX_RS_PUT] < b[SPX_RS_PUT]; });
-        fprintf(stderr, "# PFSP rank %d: step c rs_put rs_wait mhc ag_put ag_wait ag_copy f2h resid (globaltimer ns, end of each stage; "
-                "resid 0 = not the last layer)\n", rank);
-        for (const unsigned long long* r : ss)
-            fprintf(stderr, "PFSP %llu %d %llu %llu %llu %llu %llu %llu %llu %llu\n", r[SPX_STEP] - 1, (int)(((r - sh.data()) / SPX_W) % 2),
-                    r[SPX_RS_PUT], r[SPX_RS_WAIT], r[SPX_MHC], r[SPX_AG_PUT], r[SPX_AG_WAIT], r[SPX_AG_COPY], r[SPX_F2H], r[SPX_RESID]);
-    }
     pf_xt_clock("end", rank);
 }
 
@@ -289,30 +254,15 @@ inline flash_mhc::Buffers mhc_buffers(FlashPrefill& P)
     return b;
 }
 
-inline bool pf_xfrag_env();
-// sp (G6_PF_RS=2, g6m4 admits it on TP4 only): the five-collective SP fabric (pf_layout.h), its tickets and trace
-inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::FabricDev& f, u64* stepp, cudaStream_t st,
-                                bool sp = false)
+inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::FabricDev& f, u64* stepp, cudaStream_t st)
 {
     if (!m.resid4 || m.flash_draft) die("Flash prefill: main model only (the MTP draft prefill is P1b)");
     if (MP < 1 || MP % 64) die("Flash prefill: --prefill must be a positive multiple of 64");
-    if (!sp)
-    {
-        if (f.ncoll != 2 || f.nr != g6nr::NR) die("Flash prefill: the prefill fabric needs 2 collectives");
-        if (f.stride < pf_slot_bytes(MP, false, f.nr) + 8) die("Flash prefill: fabric slots are smaller than MP rows");
-    }
-    else
-    {
-        if (f.ncoll != sp_ncoll || f.nr != g6nr::NR || f.nr != 4) die("Flash SP prefill (G6_PF_RS=2): needs TP4 and 5 collectives");
-        if (f.stride < pf_slot_bytes(MP, true, f.nr) + 8) die("Flash SP prefill: fabric slots are smaller than the RS form of MP rows");
-        if (pf_ss(f) < pf_ss_min(MP, f.nr)) die("Flash SP prefill: RS slice stride smaller than an owner's MP rows + tail");
-        if ((size_t)(MP + f.nr - 1) / f.nr * HID * 4 + 8 > f.stride) die("Flash SP prefill: slot smaller than an owner's FP32 AG rows");
-        if (HID != 4096 || !pf_mhc_pk()) die("Flash SP prefill: needs HID 4096 and the packed mHC fn (G6_PF_MHC_PK on)");
-        if (pf_xfrag_env()) die("Flash SP prefill: G6_PF_XFRAG=1 is not supported (fragment-backed P.xn is not FP32 rows)");
-    }
+    if (f.ncoll != 2 || f.nr != g6nr::NR) die("Flash prefill: the prefill fabric needs 2 collectives");
+    if (f.stride < pf_slot_bytes(MP, false, f.nr) + 8) die("Flash prefill: fabric slots are smaller than MP rows");
     P = FlashPrefill();
-    P.MP = MP; P.f = f; P.stepp = stepp; P.sp = sp;
-    P.tickets = dmalloc<unsigned>(sp ? sp_ncoll : 2);
+    P.MP = MP; P.f = f; P.stepp = stepp;
+    P.tickets = dmalloc<unsigned>(2);
     P.tok = dmalloc<int>(MP); P.pos = dmalloc<int>(MP); P.row_slot = dmalloc<int>(MP);
     P.resid4 = dmalloc<float>((size_t)MP * geom::HC * HID);
     P.hc_inv = dmalloc<float>(MP); P.hc_mix = dmalloc<float>((size_t)MP * geom::HC_MIX);
@@ -365,16 +315,8 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
     {
         P.pxt = dmalloc<unsigned long long>((size_t)pxt::PX_STEPS * 2 * pxt::PX_W);
         G6RT_CK(cudaMemset(P.pxt, 0, (size_t)pxt::PX_STEPS * 2 * pxt::PX_W * 8));
-        if (!sp)
-        {
-            P.comm_xt = dmalloc<unsigned long long>((size_t)pxt::PX_STEPS * 2 * 3);
-            G6RT_CK(cudaMemset(P.comm_xt, 0, (size_t)pxt::PX_STEPS * 2 * 3 * 8));
-        }
-        else
-        {
-            P.sp_xt = dmalloc<unsigned long long>((size_t)pxt::PX_STEPS * 2 * SPX_W);
-            G6RT_CK(cudaMemset(P.sp_xt, 0, (size_t)pxt::PX_STEPS * 2 * SPX_W * 8));
-        }
+        P.comm_xt = dmalloc<unsigned long long>((size_t)pxt::PX_STEPS * 2 * 3);
+        G6RT_CK(cudaMemset(P.comm_xt, 0, (size_t)pxt::PX_STEPS * 2 * 3 * 8));
         pf_xt_clock("start", f.rank);
     }
     if (P.any_kda)
@@ -428,19 +370,6 @@ inline void pf_enqueue_flash(Fab& fab, u64 ls0, int nl, int M)
 {
     const std::vector<uint32_t> sizes(2, (uint32_t)(M * HID * 2));
     for (int i = 0; i < nl; ++i) fab.enqueue_step(ls0 + i, sizes);
-}
-// host, SP (G6_PF_RS=2): per layer-step c0 / c2 = Rs slices of pf_rows(M, p) BF16 rows, c1 / c3 = this rank's FP32
-// AG rows, plus c4 = its FP32 residual rows on the last layer-step only (pf_layout.h sp_sizes)
-template <class Fab>
-inline void pf_enqueue_flash_sp(Fab& fab, const FlashPrefill& P, u64 ls0, int nl, int M)
-{
-    if (!P.sp) die("pf_enqueue_flash_sp: the lane was not built for SP");
-    const int nr = P.f.nr, me = P.f.rank;
-    typename Fab::Rs rs;
-    rs.mask = sp_rs_mask;
-    rs.ss = pf_ss(P.f);
-    for (int p = 0; p < nr; ++p) rs.bytes.push_back(sp_rs_bytes(M, p, nr, HID));
-    for (int i = 0; i < nl; ++i) fab.enqueue_step(ls0 + i, sp_sizes(M, me, nr, HID, i == nl - 1), rs);
 }
 
 // ---------------------------------------------------------------------------------------------- P1 block bodies
@@ -787,148 +716,16 @@ inline void pf_stage_issue(FlashPrefill& P, int c, int M, cudaStream_t st)
 inline void pf_put_flash(FlashPrefill& P, int c, int M, cudaStream_t st)
 {
     static const int ncta = getenv("G6_PF_PUT_CTA") ? atoi(getenv("G6_PF_PUT_CTA")) : 96;
-    if (P.sp)   // SP: every rank's BF16 partial rows of owner p -> send slice p of RS collective 2c (k_put_rs)
-    {
-        k_put_rs<<<ncta, 128, 0, st>>>(reinterpret_cast<const uint4*>(P.part[c]), P.f, P.stepp, 2 * c, M, P.tickets + 2 * c);
-        pf_sp_xt(P, c, SPX_RS_PUT, st);
-        return;
-    }
     k_put_publish_n<<<ncta, 128, 0, st>>>(reinterpret_cast<const uint4*>(P.part[c]), P.f, P.stepp, c, M * (HID * 2 / 16),
                                           P.tickets + c);
     if (P.peer_stage.on) pf_stage_issue(P, c, M, st);
 }
-// ---------------------------------------------------------------------------------------------- SP (G6_PF_RS=2)
-// The owner's rank-ordered sum over the four BF16 RS slices of collective c (= 2 * logical c), MhcFabricBlock's
-// arithmetic (flash_step.cuh): loads p = 0, 1, 2, 3, then sum = 0.f; sum += bf16_to_float(v[p]) in that order. Index k
-// is owner-local, (m - first) * HID + h. Self rows come from this rank's own BF16 partial in device memory (the bytes
-// k_put_rs copied into send slice `rank`), peers' from their slices at offset 0 of recv[c][p] (rs_slice). wait() is
-// empty: k_wait_rs ran before the launch.
-struct MhcRsBlock
-{
-    g6::FabricDev f;
-    const u64* stepp;
-    int c;                                       // the fabric RS collective (0 or 2)
-    const __nv_bfloat16* local_part;             // P.part[c / 2] + first * HID: this rank's owner rows
-    const unsigned short* base[g6nr::NR] = {};
-    __device__ __forceinline__ u64 init()
-    {
-        const u64 step = *stepp;
-#pragma unroll
-        for (int p = 0; p < g6nr::NR; ++p)
-            base[p] = p == f.rank ? reinterpret_cast<const unsigned short*>(local_part)
-                                  : reinterpret_cast<const unsigned short*>(rs_slice(f, step, c, p, false));
-        return step;
-    }
-    __device__ __forceinline__ void wait(u64) const {}
-    __device__ __forceinline__ unsigned seq32(u64 step) const { return (unsigned)g6::coll_seq(step, c, f.ncoll); }
-    __device__ __forceinline__ float operator()(size_t k) const
-    {
-        unsigned short v[g6nr::NR];
-#pragma unroll
-        for (int p = 0; p < g6nr::NR; ++p) v[p] = p == f.rank ? __ldg(base[p] + k) : __ldcv(base[p] + k);
-        float sum = 0.f;
-#pragma unroll
-        for (int p = 0; p < g6nr::NR; ++p) sum += __uint_as_float((unsigned)v[p] << 16);
-        return sum;
-    }
-};
-// all n (multiple of 4) FP32 values -> FP16 by __float2half_rn, the conversion the mHC kernels use for `out`
-// (collapse_norm_row and the fused bodies), so an owner row rewrites its own bytes and a gathered row gets the bytes its
-// owner's kernel wrote. grid <= 4096, block 256.
-__global__ void __launch_bounds__(256) k_f2h_rows(const float4* __restrict__ src, ushort4* __restrict__ dst, size_t n4)
-{
-    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n4; i += (size_t)gridDim.x * 256)
-    {
-        const float4 v = src[i];
-        dst[i] = make_ushort4(__half_as_ushort(__float2half_rn(v.x)), __half_as_ushort(__float2half_rn(v.y)),
-                              __half_as_ushort(__float2half_rn(v.z)), __half_as_ushort(__float2half_rn(v.w)));
-    }
-}
-inline void pf_f2h_rows(const float* src, __half* dst, int M, cudaStream_t st)
-{
-    const size_t n4 = (size_t)M * HID / 4;
-    const int grid = (int)std::min<size_t>((n4 + 255) / 256, 4096);
-    k_f2h_rows<<<grid, 256, 0, st>>>(reinterpret_cast<const float4*>(src), reinterpret_cast<ushort4*>(dst), n4);
-}
-// this rank's FP32 rows [first, first + rows) of src -> offset 0 of its send slot of collective c, then the doorbell
-// (also with rows == 0: every rank publishes every AG collective of a step, pf_layout.h)
-inline void pf_put_ag_sp(FlashPrefill& P, int c, const float* src, int first, int rows, cudaStream_t st)
-{
-    static const int ncta = getenv("G6_PF_PUT_CTA") ? atoi(getenv("G6_PF_PUT_CTA")) : 96;
-    k_put_publish_n<<<ncta, 128, 0, st>>>(reinterpret_cast<const uint4*>(src + (size_t)first * HID), P.f, P.stepp, c,
-                                          rows * (HID * 4 / 16), P.tickets + c);
-}
-
 inline void pf_mhc_input(Model& m, FlashPrefill& P, int i, bool ffn, int M, cudaStream_t st)
 {
     const bool frag = !ffn && pf_attn_frag_ok(m, i);
     if (!ffn) P.attn_frag = frag;
     flash_mhc::prepare(mhc_buffers(P), m.layers[i].hc[ffn ? 1 : 0], M, HID, geom::RMS_EPS_FLASH, ffn ? P.x2 : P.x, st,
                        ffn ? P.xn2 : frag ? nullptr : P.xn, frag ? pf_attn_f16(P) : nullptr, frag ? pf_attn_bf16(P) : nullptr);
-}
-// SP consume of logical boundary c (0 = attention, 1 = MLP) of layer i, all in stream order: wait for the four RS
-// slices of collective 2c -> owner mHC over this rank's GLOBAL rows [first, mend) (the same kernel variant the OFF
-// path selects: G6_PF_MHC_FUSE >= 1 -> _rr_sp unless G6_PF_MHC_RR=0 (then _pk_sp), 0 -> out_inv_sp + prepare_range. The wait is
-// already in stream order, as the OFF peer-stage path (wp == 0): the STACK default (STAGE_ASYNC=1) runs _rr, so SP default = _rr_sp;
-// the OFF path without a stage (STAGE_ASYNC=0, wp == payload) runs _pk, so G6_PF_MHC_RR=0 gives the matching _pk_sp) -> put
-// + publish the owner's FP32 normalized rows on AG collective 2c + 1 (after the last MLP also the FP32 residual rows
-// on c4) -> wait for every peer's AG rows, copy them to their global rows of P.xn2 / P.xn -> P.x2 / P.x for all M
-// rows by __float2half_rn -> (last MLP) gather P.resid. The next full-row block reads only after these.
-// A zero-row owner (M < 4) launches no mHC grid but still waits, publishes and gathers.
-inline void pf_consume_flash_sp(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream_t st)
-{
-    const int pf_fuse = pf_fuse_level();
-    const int cr = 2 * c, ca = 2 * c + 1, nr = P.f.nr, me = P.f.rank;
-    const int first = pf_r0(M, me, nr), rows = pf_rows(M, me, nr), mend = first + rows;
-    const bool last = c == 1 && i + 1 == m.nl;
-    k_wait_rs<<<1, 32, 0, st>>>(P.f, P.stepp, cr, M, false);
-    pf_sp_xt(P, c, SPX_RS_WAIT, st);
-    const MhcRsBlock blk{P.f, P.stepp, cr, P.part[c] + (size_t)first * HID};
-    __half* out = c == 0 ? P.x2 : P.x;
-    float* nrm = c == 0 ? P.xn2 : P.xn;
-    P.attn_frag = false;   // SP rejects G6_PF_XFRAG: P.xn always holds FP32 rows
-    if (rows > 0)
-    {
-        if (last)
-            flash_mhc::k_mhc_out_inv_final_sp<<<rows, flash_mhc::THREADS, 0, st>>>(
-                flash_mhc::side(mhc_buffers(P), c), blk, m.final_norm, first, HID, geom::RMS_EPS_FLASH, P.x, P.xn, P.resid);
-        else
-        {
-            const int wl = c == 0 ? i : i + 1, wh = c == 0 ? 1 : 0;
-            const flash_mhc::Weights& w = m.layers[wl].hc[wh];
-            if (pf_fuse >= 1)
-            {
-                if (pf_mhc_rr())   // _rr_sp = the kernel of the STACK OFF peer-stage path (wp == 0); G6_PF_MHC_RR=0 = _pk_sp = the OFF kernel at STAGE_ASYNC=0
-                    flash_mhc::k_mhc_out_inv_prepare_rr_sp<MhcRsBlock, 2, 1><<<(rows + 1) / 2, flash_mhc::THREADS, 0, st>>>(
-                        flash_mhc::side(mhc_buffers(P), c), blk, w, P.fnp[wl * 2 + wh], first, mend, M, geom::RMS_EPS_FLASH, out,
-                        nrm, nullptr, nullptr);
-                else
-                    flash_mhc::k_mhc_out_inv_prepare_pk_sp<MhcRsBlock, 2><<<(rows + 1) / 2, flash_mhc::THREADS, 0, st>>>(
-                        flash_mhc::side(mhc_buffers(P), c), blk, w, P.fnp[wl * 2 + wh], first, mend, geom::RMS_EPS_FLASH, out, nrm);
-            }
-            else
-            {
-                flash_mhc::k_mhc_out_inv_sp<<<rows, flash_mhc::THREADS, 0, st>>>(flash_mhc::side(mhc_buffers(P), c), blk, first, HID,
-                                                                                geom::RMS_EPS_FLASH);
-                flash_mhc::prepare_range(mhc_buffers(P), w, first, mend, M, HID, geom::RMS_EPS_FLASH, out, st, nrm);
-            }
-        }
-    }
-    pf_sp_xt(P, c, SPX_MHC, st);
-    pf_put_ag_sp(P, ca, nrm, first, rows, st);
-    if (last) pf_put_ag_sp(P, sp_c_resid_ag, P.resid, first, rows, st);
-    pf_sp_xt(P, c, SPX_AG_PUT, st);
-    k_wait_ag<<<1, 32, 0, st>>>(P.f, P.stepp, ca, M, HID * 4);
-    pf_sp_xt(P, c, SPX_AG_WAIT, st);
-    k_ag_copy<<<dim3(PF_AG, nr), 256, 0, st>>>(P.f, P.stepp, ca, M, HID * 4, reinterpret_cast<char*>(nrm));
-    pf_sp_xt(P, c, SPX_AG_COPY, st);
-    pf_f2h_rows(nrm, out, M, st);
-    pf_sp_xt(P, c, SPX_F2H, st);
-    if (last)
-    {
-        pf_ag(P.f, P.stepp, sp_c_resid_ag, M, HID * 4, reinterpret_cast<char*>(P.resid), st);
-        pf_sp_xt(P, c, SPX_RESID, st);
-    }
 }
 // the mHC kernels that read the rank partials through blk (MhcFabricBlock: the code before G6_PF_STAGE_ASYNC;
 // MhcFabricPeerBlock: every peer partial already in device memory). wp != 0 only for MhcFabricBlock.
@@ -975,7 +772,6 @@ inline void pf_consume_launch(Model& m, FlashPrefill& P, int i, int c, int M, cu
 // input (c = 0: mHC(hc_ffn) of layer i; c = 1: mHC(hc_attn) of layer i + 1, or the final norm rows after the last layer)
 inline void pf_consume_flash(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream_t st)
 {
-    if (P.sp) { pf_consume_flash_sp(m, P, i, c, M, st); return; }
     const int pf_fuse = pf_fuse_level();
     if (P.peer_stage.on)   // the wait and the copies were issued at the put: wait for them, read the device copies
     {
@@ -1015,7 +811,6 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
                           const std::function<void(int, int)>& residual_copy = {})
 {
     if (M < 1 || M > P.MP) die("pf_step_flash: M outside 1..MP");
-    if (P.sp && residual_copy) die("pf_step_flash: G6_RESID_DUMP reads all four FP32 streams of every row; SP holds owner rows only");
     FlashPfProf& pr = flash_pf_prof();
     pr.last = 0;
     pr.mark(-1, st);

@@ -44,7 +44,6 @@
 #pragma once
 #include <algorithm>
 #include "envparse.h"
-#include "pf_layout.h"
 #include <ctime>
 #include <array>
 #include <map>
@@ -104,13 +103,15 @@ inline int pf_draft_share()
     if (v < 0) die(e);
     return v == 1 ? (getenv("G6_PF_DRAFT_SHARE") ? 1 : 2) : 0;   // 2: the default, falls back quietly
 }
-// row-owner layout math (pf_r0 / pf_rows / pf_ss / pf_owner_of) and the Flash SP plan live in pf_layout.h,
-// shared with the CPU gates; the HID-sized wrappers stay here.
-inline size_t pf_ss_min(int Mmax, int nr) { return pf_ss_min_rb(Mmax, nr, (size_t)HID * 2); }
+__host__ __device__ inline int pf_r0(int M, int p, int nr) { return p * M / nr; }          // first row of rank p
+__host__ __device__ inline int pf_rows(int M, int p, int nr) { return pf_r0(M, p + 1, nr) - pf_r0(M, p, nr); }
+__host__ __device__ inline size_t pf_ss(const g6::FabricDev& f) { return (f.stride / f.nr) & ~size_t(255); }
+inline size_t pf_ss_min(int Mmax, int nr) { return ((size_t)(Mmax + nr - 1) / nr * HID * 2 + 8 + 255) & ~size_t(255); }
 // FabricConfig::slot_bytes of a prefill region
 inline size_t pf_slot_bytes(int Mmax, bool rs, int nr = g6nr::NR)
 {
-    return pf_slot_bytes_rb(Mmax, rs, nr, (size_t)HID * 2);
+    const size_t ar = (size_t)Mmax * HID * 2;
+    return rs ? std::max(ar, nr * pf_ss_min(Mmax, nr)) : ar;
 }
 
 // partial [M][6144] BF16 -> slice p of the send slot of collective c (rows of rank p at p * ss), then the doorbell.
@@ -125,7 +126,7 @@ __global__ void __launch_bounds__(128) k_put_rs(const uint4* src, g6::FabricDev 
     for (int i = blockIdx.x * 128 + threadIdx.x; i < n16; i += gridDim.x * 128)
     {
         const int row = i / R16;
-        const int p = pf_owner_of(M, row, f.nr);                  // the owner: largest p with pf_r0(M, p) <= row
+        const int p = ((row + 1) * f.nr - 1) / M;                 // the owner: largest p with pf_r0(M, p) <= row
         reinterpret_cast<uint4*>(dst + p * ss)[(size_t)(row - pf_r0(M, p, f.nr)) * R16 + i % R16] = src[i];
     }
     glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);

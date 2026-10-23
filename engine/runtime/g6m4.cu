@@ -507,27 +507,8 @@ int main(int argc, char** argv)
     const g6::FabricDev f = fab.dev();
     fab.start_proxy();
     g6::Fabric fabp;                    // prefill region
-    const int pf_rs_env = getenv("G6_PF_RS") ? atoi(getenv("G6_PF_RS")) : 0;
-    const bool pf_rs = pf_rs_env == 1;                                          // reduce-scatter form (prefill.cuh)
-    const bool pf_sp = MP && pf_rs_env == 2;   // Flash sequence-parallel mHC (flash_prefill.cuh): owner rows, BF16 RS + FP32 AG
+    const bool pf_rs = getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) == 1;     // reduce-scatter form (prefill.cuh)
     const int pf_own = getenv("G6_PF_OWN") ? atoi(getenv("G6_PF_OWN")) : 0;   // 1: row-owner projections, 2: + index (prefill.cuh)
-    if (pf_sp)   // first SP stage: everything it does not support stops here, before any fabric is mapped
-    {
-#if !G6_MODEL_FLASH
-        die("G6_PF_RS=2 is the Flash SP prefill (G6_MODEL_FLASH build); this build has G6_PF_RS=1 only");
-#endif
-        if (g6nr::NR != 4) die("G6_PF_RS=2 (Flash SP prefill): TP4 only (G6_NR=4)");
-        if (pf_own) die("G6_PF_RS=2 (Flash SP prefill): not with G6_PF_OWN");
-        if (getenv("G6_PF_XFRAG") && atoi(getenv("G6_PF_XFRAG")) == 1) die("G6_PF_RS=2 (Flash SP prefill): not with G6_PF_XFRAG=1");
-        if (getenv("G6_RESID_DUMP")) die("G6_PF_RS=2 (Flash SP prefill): G6_RESID_DUMP reads every FP32 stream row; SP keeps owner rows only");
-        if (s2mode) die("G6_PF_RS=2 (Flash SP prefill): offline only, not --serve");
-        if (dfl || reuse_prefix || !qo_man.empty() || !qp_man.empty())
-            die("G6_PF_RS=2 (Flash SP prefill): not with --dflash, --reuse-prefix or --qo- / --qp- packs");
-        if (getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2) die("G6_PF_RS=2 (Flash SP prefill): one compute stream (not G6_PF_STREAMS=2)");
-#if defined(G6_CP) && G6_CP
-        if (!getenv("G6_CP") || atoi(getenv("G6_CP")) != 0) die("G6_PF_RS=2 (Flash SP prefill): not with CP (set G6_CP=0)");
-#endif
-    }
     const bool pf_qo = MP && pf_own == 3;                                        // 3: row-owner QO attention (QO-INTEGRATION.md)
     const bool pf_qp = own4;                                                     // 4: pair-owner QO attention (TP4, qp.cuh)
     if (pf_qo && !release && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
@@ -550,8 +531,8 @@ int main(int argc, char** argv)
     if (MP)
     {
         g6::FabricConfig cp = cfg;
-        cp.slot_bytes = pf_slot_bytes(MP, pf_rs || pf_sp, (int)cfg.ips.size());
-        cp.ncoll = pf_rs || pf_sp ? 5 : 2;
+        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
+        cp.ncoll = pf_rs ? 5 : 2;
         cp.port = cfg.port + 8;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
@@ -564,8 +545,8 @@ int main(int argc, char** argv)
     if (two)
     {
         g6::FabricConfig cp = cfg;
-        cp.slot_bytes = pf_slot_bytes(MP, pf_rs || pf_sp, (int)cfg.ips.size());
-        cp.ncoll = pf_rs || pf_sp ? 5 : 2;
+        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
+        cp.ncoll = pf_rs ? 5 : 2;
         cp.port = cfg.port + 24;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
@@ -946,7 +927,7 @@ int main(int argc, char** argv)
     }
 #if G6_MODEL_FLASH
     FlashPrefill FP, FP2;
-    if (MP) build_flash_prefill(m, FP, MP, fp, dmalloc<u64>(1), st, pf_sp);
+    if (MP) build_flash_prefill(m, FP, MP, fp, dmalloc<u64>(1), st);
     if (MP) pf_prewarm_flash(m, FP, st);
 #endif
     Prefill P2;
@@ -961,7 +942,7 @@ int main(int argc, char** argv)
         P2.qp = pf_qp; P2.qpw = &qpw; P2.qpl = qpl; P2.roll = qp_roll;
 #endif
 #if G6_MODEL_FLASH
-        build_flash_prefill(m, FP2, MP, fp2, dmalloc<u64>(1), st, pf_sp);
+        build_flash_prefill(m, FP2, MP, fp2, dmalloc<u64>(1), st);
         pf_prewarm_flash(m, FP2, st);
 #else
         build_prefill(P2, m, find, MP, fp2, dmalloc<u64>(1), st, &P);
@@ -1288,13 +1269,6 @@ int main(int argc, char** argv)
         pf_lanes_init(lanes2, m.nl);
         fprintf(stderr, "# rank %d: prefill lanes on two streams\n", R);
     }
-    if (pf_sp) fprintf(stderr, "# rank %d: Flash SP prefill (G6_PF_RS=2): owner-row mHC, BF16 RS + FP32 AG, 5 collectives, slice %zu B, %s, mHC kernel %s\n",
-                       R, pf_ss(fp), two ? "two lanes" : "one lane",
-#if G6_MODEL_FLASH
-                       pf_fuse_level() < 1 ? "out_inv_sp" : pf_mhc_rr() ? "rr_sp" : "pk_sp");
-#else
-                       "none");
-#endif
     if (MP && pf_rs) fprintf(stderr, "# rank %d: prefill reduce-scatter form (5 collectives, slice %zu B)%s\n", R, pf_ss(fp),
                              pf_own >= 4 ? ", pair-owner QO attention (G6_PF_OWN=4)" : pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
     {   // every proxy thread is running: keep all other threads of this process off their CPUs (G6_PROGRESS_ISOLATE=0 turns it off)
@@ -2210,16 +2184,14 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
             {
                 pf_inputs_flash(FP, M, p.prompt.data() + a, pos.data());
-                if (pf_sp) pf_enqueue_flash_sp(fabp, FP, ls0, NL, M);
-                else pf_enqueue_flash(fabp, ls0, NL, M);
+                pf_enqueue_flash(fabp, ls0, NL, M);
                 const int MB = two && p.first - a > MP ? std::min(MP, p.first - a - MP) : 0;
                 if (MB)
                 {
                     std::vector<int> posB(MB);
                     for (int r = 0; r < MB; ++r) posB[r] = a + M + r;
                     pf_inputs_flash(FP2, MB, p.prompt.data() + a + M, posB.data());
-                    if (pf_sp) pf_enqueue_flash_sp(fabp2, FP2, ls0b, NL, MB);
-                    else pf_enqueue_flash(fabp2, ls0b, NL, MB);
+                    pf_enqueue_flash(fabp2, ls0b, NL, MB);
                 }
                 // G6_RESID_DUMP: one record per sub-batch (step field 0), every slot copied out as it is reached
                 std::function<void(int, int)> pf_copy;
