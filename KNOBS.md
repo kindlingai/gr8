@@ -91,6 +91,15 @@ manifest instead.
 | `CP_ONECHAIN` | unset (0) | – | – | 1 = past `SHARE_LIMIT`, each rank runs the other ranks' head groups over its keys as one attention call instead of one per group (`G6_CP_ONECHAIN`; bit-exact). TP=4 only (the engine refuses it elsewhere), not with `G6_ATTN_FLIP` |
 | `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
 | `TR3_W2ALL` | 1 | unset (0) | unset (0) | 1 = the window-2 fc1 split (KS1x2, WG1) on every MoE layer at M > 1, not only the layers the k2 gate picks (`G6_TR3_W2ALL`; bit-exact). Measured at TP=4 only |
+| `PF_GEMMF32` | unset (0) | unset (0) | unset (0) | 1 = with `PF_OWN=3`, prefill's row-owner QO o_proj on the FP32-epilogue GEMM (`G6_PF_GEMMF32`; byte-exact). TP=6 K3: +1.0 % cold prefill (1693.6 -> 1710.4, one point, inside the 2 % band). Set for the boot |
+| `MTP_KSTOPB_WIDTHS` | unset | unset | unset | with `G6_MTP_KSTOPB`: the main widths captured besides the multiples of `MTP` + 1, `w1,w2,...` (`G6_MTP_KSTOPB_WIDTHS`); fewer widths = less graph memory (about 115 MiB a width a rank at TP=4) and a shorter boot. |
+| `QO_CACHE` | unset | unset | unset | `PF_OWN=3`: a directory; the first boot writes each layer's full-head q_b / o_proj / UK / UV tensors to it and later boots read them (`G6_QO_CACHE`; same bits). TP=5: second boot /health at 46 s against 199 s without; 13 GB of disk a box. In the TP=5 T5X recipe |
+| `PF_ISGRT_RG` | unset (8) | unset (8) | unset (8) | prefill index scores: rows per CTA, a multiple of 8 (`G6_PF_ISGRT_RG`; same bits). TP=5: 16 = 157K TTFT about -2 %; 32 with `PF_ATTN_ROWS=512` = 32K prefill +2.2 %, 157K TTFT -2.8 %. In the TP=5 T5X recipe (32) |
+| `PF_ATTN_ROWS` | 1024 | 1024 | 1024 | prefill attention chunk rows inside a sub-batch (`G6_PF_ATTN_ROWS`). TP=5: 512 = about 0.5 GB more free memory. In the TP=5 T5X recipe (512) |
+| `PF_F12` | unset (1 when built with `PF_F12`) | unset | unset | 0 = the stock prefill fc1 instead of the fat-CTA `k_pf_fc1f` (`G6_PF_F12`; byte-exact) |
+| `ATTN_P11` | unset (0) | unset (0) | unset (0) | 1 = the P11 decode attention tile retune; takes precedence over `ATTN_SC2`, `ATTN_CTX2`, `ATTN_CTX3` (`G6_ATTN_P11`; read before graph capture) |
+| `DTR` | unset (1) | unset (1) | unset (1) | 0 = the int4 / MXFP8 records instead of the exlr8 release's dense trellis matrices, where the layer has both (`G6_DTR`; A/B) |
+| `PF_AOP` | unset (1 when built with `PF_AOP`) | unset | unset | 0 = no fc1 A-operand share in prefill (`G6_PF_AOP`; byte-exact) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
