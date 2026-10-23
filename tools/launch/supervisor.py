@@ -1013,7 +1013,7 @@ def signal_pid(pid, sig, name, log=log):
 
 
 def stop_local(home, log=log):
-    """What scripts/stop.sh does, on this box: shim and front end, then quit files, then the engine."""
+    """Stop this box: shim and front end, then quit files, then the engine."""
     out = os.path.join(home, 'out')
     for p in ('front', 'shim'):
         pid = recorded(os.path.join(out, f'{p}.pid'))

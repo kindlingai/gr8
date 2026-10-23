@@ -1,7 +1,7 @@
 //! A rank's whole image from the exlr8 v2 release alone, planned at boot: no gr8 rank pack. Every non-expert tensor
 //! comes from the release's dense and vocabulary files (src/exlr8.rs), the routed and shared experts from the width
 //! files at the index slices' offsets (src/v2plan.rs, as `--v2` plans them). The tensors and their names are the ones
-//! the engine binds from a converted pack (tools/convert/convert.py), in the forms it reads today:
+//! the engine binds from a converted pack, in the forms it reads today:
 //!
 //!   exact (the release's bytes, or a re-layout of them):
 //!     norms, router weight and bias, indexer weights_proj and k_norm: as stored (+ BF16 decode records)
@@ -408,7 +408,7 @@ impl Planner {
         self.copy(format!("{p}.{what}.svh"), "f16", vec![svh.len() as i64], m.f, &format!("{}.svh", m.name), 2 * svh.start as u64)
     }
 
-    /// G6_PF_OWN=3's full-head weights of layer l, the tensors tools/convert/qopack.py assembles from the rank packs:
+    /// G6_PF_OWN=3's full-head weights of layer l, the full-head QO tensors:
     /// q_b and o_proj as MXFP8 for all 64 heads, UK and UV in BF16. MXFP8 scales cover 32 inputs of one row, so the
     /// whole matrix rounds to the concatenation of the rank slices.
     fn full_heads(&mut self, l: usize, p: &str, f: &Arc<StFile>) {

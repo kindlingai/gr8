@@ -70,12 +70,10 @@ the PR says which and why a tolerance is safe.
 `./gr8 glm53 up` is how the cluster starts: the same command on every box, which starts that box's supervisor
 (`tools/launch/`). The supervisors find each other (`--peers`, or the mentat group), compare their options, model set
 and engine build, and each starts its own rank; `status`, `logs` and `down` work from any box (README, "Running it").
-The engine command line lives in `scripts/engine_args.sh`. The supervisor and the deprecated ssh launchers
-(`./gr8 glm53 --ssh up`) both build it from there, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
+The engine command line lives in `scripts/engine_args.sh`, which the supervisor reads, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
 
 S2 is the only served path. `scripts/build.sh` builds every TP with DEC_S2, which g6m4 needs. `g6m4 --serve` serves up
 to `SESS` requests at once, and at TP=4 the DFlash2 drafter for a request that runs alone (TP=3 and TP=6 are MTP only).
-`scripts/launch_tp4.sh`, `launch_tp3.sh` and `launch_tp6.sh` run `scripts/launch_s2.sh` with four, three or six ranks.
 A change to decode, prefill or the scheduler is measured under S2. Its output must stay byte-identical to the build
 before it for the same requests in the same order, alone and sharing steps (m4sim prints every session's lines, so
 compare its stdout between the two builds). Sharing steps can change a request's output against its solo run, so
@@ -102,10 +100,9 @@ The light gates, on the target topology:
         --kl-ref bench/gate/refs/tp4.json --health $G6_HOME/out/rank_health.json
     python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp4.json
 
-`--health` wants the rank health probe's result for this boot. `./gr8 glm53 --ssh up` at TP=6 writes it. Otherwise
-run `scripts/rank_health.sh` before `./gr8 glm53 up` (the probe refuses a box with a model booted). The probe is still
-the ssh launchers' tool, at every TP: it needs `config/cluster.env` with `HOSTS`, `IPS`, `IPS2`, `G6_HOME` and
-`PROXY_CPU`, and passwordless ssh from the head to every box. Without them, `gate.py run --no-health` runs, but its
+`--health` wants the rank health probe's result for this boot: run `scripts/rank_health.sh` with `./gr8`'s options
+before `./gr8 glm53 up` (the probe refuses a box with a model booted). It needs `PEERS`, `IPS` and `IPS2` set, and
+passwordless ssh from the head to every box. Without them, `gate.py run --no-health` runs, but its
 records do not count for `baseline` or `check`.
 
 `./gr8 glm53 bench --tag <name>` runs pbench alone. Numbers for the README come from RigMark 1.0.0 at `reasoning_effort`

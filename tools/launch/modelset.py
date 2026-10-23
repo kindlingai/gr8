@@ -80,8 +80,8 @@ def describe(model, tp, model_dir=None):
     ranks = [_pack(model, f'rank{r}') for r in range(tp)]
     if any(x is None for x in ranks):
         if any(n.endswith('.safetensors') for n in os.listdir(model)):
-            raise ModelError(f'{model} is a raw checkpoint, not packs. Preparing one is not in this version: build the '
-                             'packs with ./gr8 glm53 packs, then --model <the pack dir>')
+            raise ModelError(f'{model} is a raw checkpoint: boot from an exlr8 release instead (--model '
+                             'https://huggingface.co/<org>/<repo>, or a local copy of one)')
         missing = [f'rank{r}.manifest.json' for r in range(tp) if ranks[r] is None]
         raise ModelError(f'{model} lacks {", ".join(missing)}: a model set needs every rank\'s manifest at TP={tp}')
     if _pack(model, f'rank{tp}'):

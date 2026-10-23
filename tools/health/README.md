@@ -6,14 +6,14 @@ no clock, link, driver or power setting, and it refuses a node where a model is 
 recovery is out of scope: the probe says what is wrong, a person fixes it.
 
 ```bash
-scripts/rank_health.sh [OUT_JSON]      # on the head, no model booted; exit 0 admitted, 3 refused
-./gr8 glm53 up                         # after the probe; the TP=6 ssh launcher runs it itself (RANK_HEALTH=0 skips it)
+scripts/rank_health.sh [OUT_JSON] [OPTIONS]   # on the head, no model booted; ./gr8's options; exit 0 admitted, 3 refused
+./gr8 glm53 up                         # after the probe
 python3 bench/gate/gate.py run ... --health $G6_HOME/out/rank_health.json     # stores the result in the run records
 python3 tools/health/rank_probe.py local --proxy-cpu 19 --rail-ips 10.0.1.1,10.0.2.1    # one node, JSON
 ```
 
-`scripts/build.sh` builds `bin/gpuprobe`, `scripts/stage.sh` copies it to every node. The nodes also need `ib_write_bw`
-(package `perftest`) and `nvidia-smi`. `rank_probe.py` ships itself over ssh, so only `bin/gpuprobe` is staged.
+`scripts/build.sh` builds `bin/gpuprobe`; every box needs it in `$G6_HOME/bin`, as `./gr8 glm53 build` leaves it. The
+boxes also need `ib_write_bw` (package `perftest`) and `nvidia-smi`. `rank_probe.py` ships itself over ssh.
 
 ## What is measured
 

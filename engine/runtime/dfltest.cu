@@ -2,7 +2,7 @@
 // check against engine/ref/dflash2_ref.py (engine/ref/dflash2_check.py writes the case and compares).
 //
 // dfltest DIR [--sel 0|1] [--temp T --seed S]
-//   DIR/dflash.r<r>.manifest.json + .pack   drafter packs (tools/convert/dflash2.py)
+//   DIR/dflash.r<r>.manifest.json + .pack   drafter packs (engine/loader-rs/src/dflash2.rs)
 //   DIR/head.r<r>.manifest.json + .pack     the target lm_head slice of rank r, G.lm_head.mx.gv (dflash2.py --head)
 //   DIR/case.bin   int32 n (context rows), p0 (first position), bonus (token), lo (first position the sequence wrote);
 //                  float32 feat [n][6 x 6144] (the target residual rows), float32 emb [8][6144] (embedding rows of the

@@ -65,10 +65,10 @@
 //                     (s2/service.h, head = rank 0 on the bootstrap address, port N); DIR is this rank's fresh S2 directory
 //                     (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2). Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3.
 //                     Without --serve the --prompt sequences run once and the process exits.
-//      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident from tools/convert/pairpack.py; or
+//      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident; or
 //                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
 //      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
-//                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from tools/convert/dflash2.py. --dflash-sel 1 =
+//                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from engine/loader-rs/src/dflash2.rs. --dflash-sel 1 =
 //                     the DFlash2 selector walk (default when the pack has it), 0 = argmax drafts; --dflash-k K = verify
 //                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, except under S2: there a
 //                     session alone at its prompt tail drafts with DFlash2 and goes to MTP when a second one arrives (s2_batch.h).
@@ -161,8 +161,8 @@ int main(int argc, char** argv)
     std::string manifest, packfile;
     V2Src v2src;
     g6rt::CommonOpts co;                // every flag m4sim takes too, parsed in engine_opts.h
-    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
-    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
+    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights, G6_PF_OWN=4
+    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (engine/loader-rs/src/dflash2.rs)
     int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
     int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
 #if G6_MODEL_FLASH

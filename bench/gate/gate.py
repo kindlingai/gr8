@@ -97,7 +97,7 @@ def load_health(a):
     age_min = (time.time() - ts) / 60
     if age_min > a.health_max_age_min:
         sys.exit(f'--health {a.health}: the probe is {age_min:.0f} min old (limit {a.health_max_age_min:g}); it may belong to an '
-                 'earlier boot. Probe again before this boot (scripts/launch_tp6.sh does)')
+                 'earlier boot. Probe again before this boot (scripts/rank_health.sh)')
     h['file'] = Path(a.health).name
     if not h['admitted']:
         why = '; '.join(f'rank {b["rank"]} {b["code"]}' for b in h.get('refusals', [])) or 'no reason recorded'

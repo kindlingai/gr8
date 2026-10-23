@@ -16,9 +16,7 @@ the full-index layers; vocab 154,880.
 | weight format | `engine/kernels/tr3.cuh`, `tr3_gemm.cuh`, `tr3_wide.cuh` | routed experts are EXL3 trellis codes (3.25 bpw, Hadamard-128 rotations, K3/K4 per-expert bit widths), decoded inside the expert kernels. Two encodes with one layout: TR3, and exlr8-e4m3, whose codebook values are rounded to FP8 E4M3 (decode rounds them too, chosen per layer from the pack manifest) |
 | | `engine/kernels/dtr.cuh`, `densev.cuh`, `gemm_x.cuh`, `rowtile.cuh` | dense weights as the exlr8 release stores them: trellis q_b, o_proj and the MLP of layers 0-2 (decoded in `dtr.cuh`), int4 g32 and MXFP8 records for the rest, lm_head in MXFP8 |
 | loader | `engine/loader-rs/src/release.rs`, `records.rs` | the release's file names and forms, and how each rank's image is planned from them |
-| converter (packs) | `tools/convert/plan.py` | `H = 6144`, 78 + 1 layers, 256 experts, the rank map: TP6 head groups `(11,11,11,11,10,10)`, expert 128-column blocks `(3,3,3,3,2,2)`, vocab tiles, rotated per layer (TP4: 16 heads, 4 blocks, dense 3072 channels, vocab tiles `(303,303,302,302)`) |
-| | `tools/convert/convert.py` | checkpoint tensor names (`model.layers.N.self_attn.q_a_proj.weight`, ...), MLA reshapes (`q_b` -> 64 x 256 x 2048, `kv_b` -> 64 x 448 x 512), dense layers 0-2, the MTP layer's extra tensors (`eh`) |
-| | `tools/convert/qopack.py` | `qo_edges` head-group edges for the full-head QO pack (64 heads) |
+| rank map | `tools/convert/plan.py` | `H = 6144`, 78 + 1 layers, 256 experts, the rank map: TP6 head groups `(11,11,11,11,10,10)`, expert 128-column blocks `(3,3,3,3,2,2)`, vocab tiles, rotated per layer (TP4: 16 heads, 4 blocks, dense 3072 channels, vocab tiles `(303,303,302,302)`) |
 | | `engine/ref/g6ref.py` | record layouts the kernels read (rt_record, GEMV records) |
 | kernels | `engine/kernels/common.cuh` | `HID = 6144` |
 | | `engine/kernels/k1args.cuh` | `SMAX = 72` distinct experts per step, `ACTW` routed columns per rank (`g6nr::EB * 128`), `SACTW` shared/dense columns (`g6nr::DENSE_CH`) |
@@ -26,7 +24,7 @@ the full-index layers; vocab 154,880.
 | attention | `engine/attn/` | MLA latent attention (kv_a 576 = 512 + 64 rope, UK/UV absorb), the DSA-style sparse indexer and its exact top-2048 selector (`select.cuh`), value head dim 256 in decode (`decode-small.cuh`) |
 | | `engine/runtime/rank.cuh` | `QA = 2048`, `KVA = 576`, `IDXQ = 4096`, `IDXK = 128`, `IDXW = 32`; the layer sequence (dense / MoE / MTP) |
 | | `engine/runtime/qo_weights.cuh`, `attn/prefill-qo-*` | full-head QO attention shapes |
-| drafter | `engine/runtime/dflash.cuh`, `tools/convert/dflash2.py` | the GLM 5.3 DFlash2 drafter: 6 layers, 64 q / 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), target layers 5..75 (from the pack), selector rank 256 / top 16; TP must divide the 8 KV heads |
+| drafter | `engine/runtime/dflash.cuh`, `engine/loader-rs/src/dflash2.rs` | the GLM 5.3 DFlash2 drafter: 6 layers, 64 q / 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), target layers 5..75 (from the pack), selector rank 256 / top 16; TP must divide the 8 KV heads |
 | front end | `frontend/g6s2shim.py` | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
 | | `frontend/g6front-rs/src/{parser,template,tok}.rs` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format, and it reads `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so those follow the model directory |
 
@@ -38,9 +36,7 @@ the full-index layers; vocab 154,880.
   the NR=6 values equal the old TP6 literals, so the TP6 build is SASS-identical. The engine also compiles for other
   divisors of 64; 6, 4 and 3 have been run.
 - `tools/convert/plan.py`: `set_nr(n)` picks the widths; they split n units the way `g6nr.h` does (larger chunks first).
-- Packs only: `tools/convert/convert.py --d8`: one GPTQ dir per rank (six for TP6, four for TP4), because the GPTQ codes are solved
-  per rank slice. The count of dirs sets the rank count of the packs. TP4 needs the TP4 codes.
-- `G6_PF_OWN=4` (`engine/runtime/qp.cuh`, `qp_wire.h`, the pair code in `qo_weights.cuh`, `tools/convert/pairpack.py`):
+- `G6_PF_OWN=4` (`engine/runtime/qp.cuh`, `qp_wire.h`, the pair code in `qo_weights.cuh`):
   TP4 only. It assumes four ranks in two head pairs of 16 heads each (64 heads, head group of rank m in layer l =
   (m - l) mod 4) and the q_b / o_proj / kv_b shapes of GLM 5.3.
 - `tools/launch/options.py` and `scripts/engine_args.sh`: the per-TP defaults (the KV pool, the prefill attention
@@ -51,7 +47,7 @@ the full-index layers; vocab 154,880.
 | part | where |
 |---|---|
 | RoCE v2 verbs fabric: device discovery by IP, two rails, all-reduce / reduce-scatter / all-gather with device doorbells, bulk proxy | `engine/comms/` |
-| pack format (sequential tensors, 4096-byte alignment, sha256 per tensor in a JSON manifest), writer, checker | `tools/convert/pack.py`, `checkpack.py`, `engine/loader/` |
+| pack format (sequential tensors, 4096-byte alignment, sha256 per tensor in a JSON manifest), writer, checker | `tools/convert/pack.py`, `engine/loader/` |
 | device image loader (whole pack into one allocation, optional hash check) | `engine/loader/devimage.*` |
 | multi-session scheduler (S2), the request and response files, step plan, CUDA graph capture per row count, MTP draft/verify loop | `engine/runtime/s2/`, `s2_batch.h`, `serve.h`, `rank.cuh` |
 | context-parallel KV layout and the staged-page hash check | `engine/comms/cplayout.h`, `engine/runtime/prefill.cuh` (CP sections) |
