@@ -75,25 +75,3 @@ pass counter starts at zero and is identical in both files.
 
 The reference comparator can replay the input dump through `FlashRef.mtp`
 with a separate MTP state. These diagnostic copies run outside graph capture.
-
-## Verified result
-
-The eight-row BF16 gate passed at batch sizes 1 and 8. The input fixture
-contains 56 distinct routed experts. Exact values and the source golden
-SHA256 are in `flash-mtp-gate.json`.
-
-| Check | Measured worst | Gate |
-|---|---:|---:|
-| FP32 MTP operations, relative L2 | 7.869e-7 | 1e-4 |
-| Router selection mismatches | 0 | 0 |
-| DSA attention, relative L2 (printed precision) | 2.20e-3 | 1e-2 |
-| Shared vocabulary projection, relative L2 | 1.212e-3 | 1e-2 |
-| Head top-1 agreement | 8/8 | >= 99% |
-| Head mean KL | 4.657e-6 | 1e-3 |
-
-DSA: 24/24 checks passed; all selections matched and replay was bit-identical.
-The host suite and tiny reference suite exited zero. Both Flash driver
-translation units compiled for the target architecture. In the GLM build,
-both preprocessed driver translation units match the base apart from
-changed diagnostic line numbers; this is not a GLM GPU regression run.
-No speed measurement is claimed.
