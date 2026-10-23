@@ -386,7 +386,7 @@ inline bool pf_force_p1()
 inline bool pf_kda_gemm_on(const kda::KdaLayer& w)
 {
     static const bool p1 = getenv("G6_FPF_KDA_P1") && atoi(getenv("G6_FPF_KDA_P1")) == 1;
-    return !p1 && !pf_force_p1() && w.qt.w && w.kt.w && w.vt.w;
+    return !p1 && !pf_force_p1() && ((w.qt.w && w.kt.w && w.vt.w) || (w.mxc[0] && w.mxc[1] && w.mxc[2]));
 }
 // KDA f_a / g_a / b projections after the q/k/v GEMMs: 0 = old MX-row host loop, 1 = full-M 32-row tiles, 2 = 64-row
 inline int pf_kda_tail()
@@ -451,22 +451,45 @@ inline void pf_kda_proj_gemm(Model& m, FlashPrefill& P, const kda::KdaLayer& w, 
     bindp::Scratch& sc = flash_mlp_pf::ensure_state(m, P, nullptr, st).sc;
     const kda::PLayout pl = a.pl();
     const int ld = pl.ld(), dl = a.dl();
-    const dtr::Mat* m3[3] = {&w.qt, &w.kt, &w.vt};
-    for (int s = 0; s < 3; ++s)
+    if (!w.qt.w)                        // MXFP8 q / k / v (the published release): one FP8 quantization of x feeds all three
     {
-        bindp::Gemm g;
-        if (const char* e = bindp::make_gemm_tr(*m3[s], M, sc.x8_big, P.ksc.P + pl.q() + s * dl, 2, g))
-            die(std::string("pf_kda_proj_gemm: ") + e);
-        if (m3[s]->N != dl || m3[s]->K != HID) die("pf_kda_proj_gemm: q/k/v trellis shape is not [nh * 128][HID]");
-        g.ldy = ld; g.osvh = m3[s]->svh;
-        if (s == 0 || m3[s]->suh != m3[s - 1]->suh)     // q, k, v share the input rotation in the Flash import
+        for (int s = 0; s < 3; ++s)
         {
-            bindp::Xq xq;
-            xq.on = 1; xq.src = P.x; xq.ld = HID; xq.K = HID; xq.M = M; xq.dst = sc.x8_big; xq.suh = m3[s]->suh; xq.h16 = g.h16;
-            g.pre = xq;
+            bind::Tensor c, z;
+            c.p = w.mxc[s]; c.nd = 2; c.shape[0] = dl; c.shape[1] = HID;
+            z.p = w.mxs[s]; z.nd = 2; z.shape[0] = dl; z.shape[1] = HID / 32;
+            bindp::Gemm g;
+            if (const char* e = bindp::make_gemm(c, z, M, sc.x8_big, P.ksc.P + pl.q() + s * dl, 2, g))
+                die(std::string("pf_kda_proj_gemm: ") + e);
+            g.ldy = ld;
+            if (s == 0)
+            {
+                bindp::Xq xq;
+                xq.on = 1; xq.src = P.x; xq.ld = HID; xq.K = HID; xq.M = M; xq.dst = sc.x8_big;
+                g.pre = xq;
+            }
+            bindp::launch(g, st);
         }
-        if (kda_proj_ws::enabled() && kda_proj_ws::supported(g)) G6RT_CK(kda_proj_ws::launch(g, st));
-        else bindp::launch(g, st);
+    }
+    else
+    {
+        const dtr::Mat* m3[3] = {&w.qt, &w.kt, &w.vt};
+        for (int s = 0; s < 3; ++s)
+        {
+            bindp::Gemm g;
+            if (const char* e = bindp::make_gemm_tr(*m3[s], M, sc.x8_big, P.ksc.P + pl.q() + s * dl, 2, g))
+                die(std::string("pf_kda_proj_gemm: ") + e);
+            if (m3[s]->N != dl || m3[s]->K != HID) die("pf_kda_proj_gemm: q/k/v trellis shape is not [nh * 128][HID]");
+            g.ldy = ld; g.osvh = m3[s]->svh;
+            if (s == 0 || m3[s]->suh != m3[s - 1]->suh)     // q, k, v share the input rotation in the Flash import
+            {
+                bindp::Xq xq;
+                xq.on = 1; xq.src = P.x; xq.ld = HID; xq.K = HID; xq.M = M; xq.dst = sc.x8_big; xq.suh = m3[s]->suh; xq.h16 = g.h16;
+                g.pre = xq;
+            }
+            if (kda_proj_ws::enabled() && kda_proj_ws::supported(g)) G6RT_CK(kda_proj_ws::launch(g, st));
+            else bindp::launch(g, st);
+        }
     }
     // Reuse prefill scratch after q/k/v: each buffer holds >= round_up(M,8)*HID*2 bytes.
     // 0 = old MX-row host loop, 1 = full-M 32-row tiles, 2 = full-M 64-row tiles.

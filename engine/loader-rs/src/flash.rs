@@ -344,6 +344,17 @@ fn kda_bf16(p: &mut Planner, l: usize, label: String, f: &Arc<StFile>, local: &s
         });
     } else {
         if o % 16 != 0 || k % 16 != 0 { return Err(format!("{local}: {o}x{k} is not in 16-row tiles")); }
+        if !name.ends_with("b_proj.weight") {
+            // q / k / v: also this rank's heads as MXFP8 as stored, for the prefill GEMM (flash_prefill.cuh pf_kda_proj_gemm)
+            let (h0, nh) = p.shard.heads(l);
+            let rows = h0 * 128..(h0 + nh) * 128;
+            let (n, f2, local2) = (rows.len() as i64, f.clone(), local.to_string());
+            p.gen(format!("{label}.mx.codes"), vec![(format!("{label}.mx.codes"), "u8", vec![n, k as i64]),
+                                                   (format!("{label}.mx.scales"), "u8", vec![n, (k / 32) as i64])], move || {
+                let (c, s) = Matrix::open(&f2, &local2)?.mxfp8(&rows)?;
+                Ok(vec![c, s])
+            });
+        }
         let gv = format!("{label}.gv");
         p.gen(gv.clone(), vec![(gv, "u8", vec![(o / 16) as i64, (k / 16) as i64, 512])], move || {
             Ok(vec![records::bf16_record(&decode()?, k)])
