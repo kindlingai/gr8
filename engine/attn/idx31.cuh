@@ -74,12 +74,20 @@ __device__ __forceinline__ bool same_session(const ReplayInput& in,int r1,int r2
 template<class Input> __device__ __forceinline__ bool same_session(const Input&,int,int){return true;}
 #endif
 template<class Input>
-__global__ void __launch_bounds__(128) index_scores_g(Input input,int start,int n,int G,const half* q,const float* weights,float* scores,int* ids){
+__global__ void __launch_bounds__(128) index_scores_g(Input input,int start,int n,int G,const half* q,const float* weights,float* scores,int* ids,int skip=0){
     auto a=resolve(input);if(!a.active)return;
     using namespace nvcuda;
     const int t0=blockIdx.x*32,row0=blockIdx.y,r0=start+row0,t=threadIdx.x,warp=t/32,lane=t&31;
     if(row0%G&&same_session(input,r0-1,r0))return;   // not the first row of its group
     int g=1;while(row0+g<n&&(row0+g)%G&&same_session(input,r0,r0+g))g++;
+    if(skip){   // G6_CP_IDXLIVE: a.live_context is still the step's (every row's bound), before FOR_ROW
+        const int lend=(a.live_context+RADIX_CHUNK-1)/RADIX_CHUNK*RADIX_CHUNK;
+        if(t0>=lend)return;   // select_index31 reads no chunk here
+        if(a.page_size>=32&&!CP_MINE(a,t0)){   // index_scores' values for a foreign tile (and for a tile past a row)
+            for(int k=warp;k<g;k+=4){const int row=row0+k;
+                if(t0+lane<a.context){scores[(int64_t)row*a.context+t0+lane]=-INFINITY;ids[(int64_t)row*a.context+t0+lane]=t0+lane;}}
+            return;}
+    }
     FOR_ROW(a,input,r0);   // the group's bounds and table
     __shared__ __align__(32) half key[32*128];
     __shared__ __align__(32) float products[4][32*32];
@@ -130,8 +138,8 @@ __global__ void __launch_bounds__(128) index_scores_g(Input input,int start,int 
     }
 }
 template<class Input>
-static void launch_index_scores_g(const G6Attn& a,Input input,Work& w,int start,int n,int G,cudaStream_t st){
-    index_scores_g<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,n,G,w.iq,w.weights,w.si,w.ii);
+static void launch_index_scores_g(const G6Attn& a,Input input,Work& w,int start,int n,int G,cudaStream_t st,int skip=0){
+    index_scores_g<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,n,G,w.iq,w.weights,w.si,w.ii,skip);
 }
 #ifdef SEL32
 template<class Input>
