@@ -14,6 +14,7 @@
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
 # (see docs/SETTINGS.md). Dropping one builds an older, slower or less-checked path, not a broken one.
 set -eu
+[ "${MODEL:-glm}" = glm ] || { echo "scripts/build.sh: MODEL=$MODEL: this tree builds the GLM-5.3 engine only (MODEL=glm)" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)
 K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \

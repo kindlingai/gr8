@@ -16,17 +16,21 @@ import socket
 import struct
 import subprocess
 
+import models
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'TP': ('cluster', None, 'tensor-parallel size: 4, 6 or 3'),
+    'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
+                                      '<model> sets it'),
+    'TP': ('cluster', None, 'tensor-parallel size: 4, 6 or 3 (glm53f: 4 or 2)'),
     'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
                                  "cabled to the f1 port of the next box in --peers order, the last to the first)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
-    'GROUP': ('cluster', 'gr8-glm53', 'mentat group the boxes join'),
+    'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
     'HEAD': ('cluster', None, 'mentat mode: the head LAN address, instead of the lowest one'),
     'IPS': ('cluster', None, 'rail-0 fabric address of every rank (skips fabric discovery)'),
     'IPS2': ('cluster', None, 'rail-1 fabric address of every rank'),
@@ -283,6 +287,10 @@ def parse(argv, environ=None):
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
     deprecated_kv(values, origin, warnings)
+    if values['GR8_MODEL'] not in models.MODELS:
+        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {" or ".join(models.MODELS)}')
+    if not values['GROUP']:
+        values['GROUP'] = models.MODELS[values['GR8_MODEL']].group
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
@@ -307,13 +315,14 @@ def mode(o):
 
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
+    model = models.of(o)
     tp = o.get('TP')
     if tp is None:
         if mode(o) == 'peers':
             tp = str(len(split_list(o.get('PEERS'))))
             o.values['TP'], o.origin['TP'] = tp, 'the number of peers'
         else:
-            raise OptionError('--tp is needed with --mentat (4, 6 or 3)')
+            raise OptionError(f'--tp is needed with --mentat ({model.tp_sizes})')
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
                           'them with --g6env-x "NAME=value ..." so every box compares them')
@@ -321,12 +330,14 @@ def validate(o):
         raise OptionError('--variant and --v2-widths both name the width manifest: give one')
     if o.get('DRAFTER') and not o.get('DRAFTER').startswith('https://'):
         raise OptionError(f'--drafter {o.get("DRAFTER")}: want https://huggingface.co/<org>/<repo>[@rev]')
+    if not model.drafter and (o.get('DRAFTER') or o.get('DFLASH') == '1'):
+        raise OptionError(f'--drafter, --dflash 1: {model.name} has no DFlash2 drafter')
     if o.get('DRAFTER') and tp != '4':
         raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
     effort = o.get('DEFAULT_REASONING_EFFORT')
-    if effort == 'none':
+    if effort == 'none' and not model.thinking_off:
         raise OptionError('--default-reasoning-effort none: GLM 5.3 cannot turn thinking off (use low, or '
                           '--default-thinking-budget)')
     if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
@@ -367,8 +378,8 @@ def validate(o):
                 force = 0.0
             if not (0.0 < force <= 4.0) or struct.unpack('<f', struct.pack('<f', force))[0] == 0:
                 raise OptionError('--steering-force: want a finite number in (0, 4]')
-    if tp not in ('3', '4', '6'):
-        raise OptionError(f'--tp {tp}: want 4, 6 or 3')
+    if tp not in model.tp:
+        raise OptionError(f'--tp {tp}: want {model.tp_sizes} ({model.name})')
     if o.get('SHAPE') not in ('mesh', 'ring'):
         raise OptionError(f'--shape {o.get("SHAPE")}: want mesh or ring')
     if o.get('SHAPE') == 'ring':
@@ -401,6 +412,8 @@ def validate(o):
         raise OptionError('--kv-rows remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
     if rows and rows['fmt'] == 'int4' and o.get('KV_FORMAT') == 'int4':
         raise OptionError('--kv-rows fmt=int4: the int4 KV build\'s rows are INT4 already')
+    if o.get('KV_FORMAT') == 'int4' and not model.int4_kv:
+        raise OptionError(f'--kv-format int4: {model.name} has an fp8 KV build only')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
@@ -537,7 +550,8 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
     The defaults give the canonical template, with every per-box value as a placeholder. kv_store, kv_rows: this box's
     KV_STORE and KV_ROWS with the KV node resolved (remote:GB names none)."""
-    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'TP': o.get('TP'), 'SET_ID': set_id}
+    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'GR8_MODEL': models.of(o).name, 'TP': o.get('TP'),
+           'SET_ID': set_id}
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
             env[k] = o.get(k)
@@ -588,6 +602,8 @@ def canonical(o, plan, members, variant=None):
     """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None.
     variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
+    if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
+        c['model'] = models.of(o).name
     if members:
         c['peers'] = ','.join(members)
     else:
