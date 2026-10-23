@@ -56,6 +56,8 @@ class OptionTests(unittest.TestCase):
             for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
+            self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
+            self.assertFalse(any(e.startswith('G6_PF_DSA_F16GEMM') for e in plan['env']))
 
     def test_model_counts_in_the_canonical_options(self):
         glm = opt.parse(['--no-config', '--peers', PEERS], {})
