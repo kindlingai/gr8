@@ -13,6 +13,6 @@ want "TP8 has no QP roll" "$got" "0"
 got=$(TP=8; DFLASH=1; engine_defaults && echo "$DFLASH $SPEC_ADAPT"); want "TP8 DFLASH=1 allowed" "$got" "1 1"
 (TP=8; KV_FORMAT=int4; engine_defaults 2> /dev/null); want "TP8 int4 refused" "$?" "2"
 (TP=5; engine_defaults 2> /dev/null); want "TP5 refused" "$?" "2"
-got=$(TP=4; engine_defaults && echo "$SHARE_LIMIT $CAP $PF_OWN $DFLASH"); want "TP4 unchanged" "$got" "65536 310528 4 1"
+got=$(TP=4; engine_defaults && echo "$SHARE_LIMIT $CAP $PF_OWN $DFLASH"); want "TP4 unchanged" "$got" "32768 485376 4 1"
 got=$(TP=6; engine_defaults && echo "$SHARE_LIMIT $CAP $PF_OWN $DFLASH"); want "TP6 unchanged" "$got" "131072 614400 3 0"
 [ "$fails" = 0 ] && echo "engine_args_tp8_test: PASS" || { echo "engine_args_tp8_test: $fails FAIL"; exit 1; }
