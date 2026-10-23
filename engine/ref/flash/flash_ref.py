@@ -1,8 +1,8 @@
 """GLM-5.3-Flash reference forward, op by op, in fp32 (or another dtype), for one sequence. The golden source for
 the gr8 Flash kernels (W0 in ENGINE-PLAN.md).
 
-It follows transformers 5.19.0 models/glm5_next/modeling_glm5_next.py for layers 0-44 and vLLM's glm5_next MTP (as
-exlr8quant requant/calib_forward.py documents it) for layer 45. It is written the way the engine computes, not the way
+It follows transformers 5.19.0 models/glm5_next/modeling_glm5_next.py for layers 0-44 and vLLM's glm5_next MTP for
+layer 45. It is written the way the engine computes, not the way
 transformers does: decode is token by token with a fixed KDA state per layer, MLA attention is absorbed (q @ UK
 against the 512-d latent, UV after), and the indexer works on a growing cache. test_flash_ref.py proves it equals the
 transformers model on a small random config.
