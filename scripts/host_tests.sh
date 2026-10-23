@@ -118,6 +118,22 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$T/host_reclaim_test"
 "$T/host_reclaim_test"
 
+# Flash SP prefill (G6_PF_RS=2) CPU gates: static layout bytes, per-rank stream schedule + hazards + negatives, arithmetic
+for t in layout sched arith; do
+  g++ -std=c++17 -O2 -Wall -ffp-contract=off -I "$REPO/engine/runtime" "$REPO/engine/tests/test_flash_sp_$t.cpp" -o "$T/sp_${t}_test"
+  "$T/sp_${t}_test" > "$T/sp_${t}.log" || { cat "$T/sp_${t}.log"; exit 1; }
+  tail -n 1 "$T/sp_${t}.log"
+done
+# sp4_test.cpp (the four-rank real-fabric gate, run on Sparks) against a loopback proxy model: its checks must pass on a
+# correct transport and fail on a corrupt byte, a guard overrun and a write to the own RS slice
+g++ -std=c++17 -O2 -Wall -DSP4_LOOP -I "$REPO/engine/comms" -I "$REPO/engine/runtime" "$REPO/engine/comms/tests/sp4_test.cpp" -o "$T/sp4_loop" -lpthread
+"$T/sp4_loop" > "$T/sp4_loop.log" || { grep -v doorbell "$T/sp4_loop.log"; exit 1; }
+tail -n 1 "$T/sp4_loop.log"
+for fault in corrupt overrun selftail; do
+  if SP4_TIMEOUT_S=3 SP4_LOOP_FAULT=$fault "$T/sp4_loop" > "$T/sp4_$fault.log" 2>&1; then echo "sp4_loop: fault $fault not detected"; exit 1; fi
+done
+echo "sp4_loop: corrupt / overrun / selftail faults detected"
+
 # Offline distributed logit dump framing and merge validation.
 (cd "$REPO" && python3 -m unittest tools.cp.test_merge_logits)
 # Flash single-session KDA state rollback across accepted prefixes.
@@ -131,6 +147,6 @@ g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_co
 "$T/test_full_s2_cost"
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash prefill non-kernel span (NK): G6_PF_PREWARM source check, G6_PF_STAGE_ASYNC source check + schedule hazard model.
-python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
+python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py" "$REPO/engine/runtime/tests/test_flash_sp_dispatch.py"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test"
 "$T/pf_peer_stage_test"

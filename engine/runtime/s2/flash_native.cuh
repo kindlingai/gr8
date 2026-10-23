@@ -100,6 +100,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         const auto start = std::chrono::steady_clock::now();
         const int a = int(first), ma = std::min(int(rows), int(sc.prefill_rows)), mb = int(rows) - ma;
         require(!mb || (sc.two_lanes && mb <= int(sc.prefill_rows)), "Flash prefill exceeds lanes");
+        require(!c.prefill.sp && !c.prefill2.sp, "Flash S2 prefill: the SP lane (G6_PF_RS=2) is offline-only");
         std::vector<int> pos(rows);
         for (unsigned r = 0; r < rows; ++r) pos[r] = a + int(r);
         pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data());

@@ -40,7 +40,7 @@ class StageAsyncTest(unittest.TestCase):
         order = [issue.index(x) for x in ('cudaEventRecord(S.put, st)', 'cudaStreamWaitEvent(S.stream, S.put', 'cudaStreamWaitEvent(S.stream, S.used',
                                          'k_wait_peers<<<1, 32, 0, S.stream>>>', 'cudaMemcpyAsync', 'cudaEventRecord(S.ready, S.stream)')]
         self.assertEqual(order, sorted(order))
-        cons = body(PF, 'inline void pf_consume_flash')
+        cons = body(PF, 'inline void pf_consume_flash(')
         on = cons.split('if (P.peer_stage.on)', 1)[1].split('return;', 1)[0]
         self.assertLess(on.index('cudaStreamWaitEvent(st, S.ready'), on.index('pf_consume_launch'))
         self.assertLess(on.index('pf_consume_launch'), on.index('cudaEventRecord(S.used, st)'))
@@ -57,7 +57,7 @@ class StageAsyncTest(unittest.TestCase):
             return s.split('struct MhcFabricBlock {', 1)[1].split('\n};\n', 1)[0]
         self.assertEqual(blk(base.stdout), blk(ST))
         # the OFF consume still launches MhcFabricBlock kernels with the same arguments
-        cons = body(PF, 'inline void pf_consume_flash')
+        cons = body(PF, 'inline void pf_consume_flash(')
         self.assertIn('MhcFabricBlock blk{P.f, P.stepp, c, wp, pf_fuse >= 1 ? P.part[c] : nullptr};', cons)
         self.assertIn('if (stage) blk.peer_part = P.peer_dev;', cons)
 

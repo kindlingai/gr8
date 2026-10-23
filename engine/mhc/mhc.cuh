@@ -1,6 +1,7 @@
 // Flash mHC kernels. No effect on the legacy GLM build unless included.
 #pragma once
 #include <cstdlib>
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -186,12 +187,14 @@ __device__ inline void write_frag_pair_nozero(int m, int H, int h, float a, floa
     if (bf16) bf16[dst] = (unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(a)) |
                           ((unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(b))<<16);
 }
-__global__ void __launch_bounds__(THREADS) k_mhc_prepare_fused(Buffers b, Weights w, int H, float eps,
-                                    __half* out, float* normalized=nullptr,
-                                    unsigned* f16=nullptr, unsigned* bf16=nullptr) {
+// row body shared by k_mhc_prepare_fused and its owner-range (Flash SP, G6_PF_RS=2) entry point: blockIdx.y indexes
+// rows of the LAUNCHED range, m is the GLOBAL row (first + blockIdx.y); M_lane is the FULL lane row count (gridDim.y
+// on the OFF entry, M on the SP entry), used only by the fragment zero pad and the non-4096 collapse path.
+__device__ __forceinline__ void mhc_prepare_fused_body(Buffers b, Weights w, int first, int M_lane, int H, float eps,
+                                                       __half* out, float* normalized, unsigned* f16, unsigned* bf16) {
     __shared__ float sh_pre[4];
     __shared__ int sh_last;
-    const int o=blockIdx.x, m=blockIdx.y, M=gridDim.y;
+    const int o=blockIdx.x, m=first+blockIdx.y, M=M_lane;
     const float inv=b.inv[m];
     const float* __restrict__ s=b.streams+(size_t)m*4*H;
     const __nv_bfloat16* __restrict__ fn=w.fn+(size_t)o*4*H;
@@ -267,6 +270,17 @@ __global__ void __launch_bounds__(THREADS) k_mhc_prepare_fused(Buffers b, Weight
         collapse_norm_row(b,w,m,M,H,eps,sh_pre,row,out,nullptr,normalized,f16,bf16);
     }
 }
+__global__ void __launch_bounds__(THREADS) k_mhc_prepare_fused(Buffers b, Weights w, int H, float eps,
+                                    __half* out, float* normalized=nullptr,
+                                    unsigned* f16=nullptr, unsigned* bf16=nullptr) {
+    mhc_prepare_fused_body(b, w, 0, gridDim.y, H, eps, out, normalized, f16, bf16);
+}
+// owner-range entry (Flash SP, G6_PF_RS=2): grid dim3(MIX, rows) over GLOBAL rows [first, mend). Fragment tables
+// are not built on the SP path (it rejects G6_PF_XFRAG), so f16/bf16 are always null; M_lane stays the full-lane M.
+__global__ void __launch_bounds__(THREADS) k_mhc_prepare_fused_sp(Buffers b, Weights w, int first, int M_lane, int H, float eps,
+                                    __half* out, float* normalized) {
+    mhc_prepare_fused_body(b, w, first, M_lane, H, eps, out, normalized, nullptr, nullptr);
+}
 // Getter reads a reduced block output. Its rank-order reduction can read fabric
 // slots directly, so no intermediate reduced [M,H] allocation is necessary.
 struct Fp32Block {
@@ -288,8 +302,10 @@ struct Bf16Partials {
         return v;
     }
 };
-template<class Block> __global__ void __launch_bounds__(THREADS) k_mhc_out_inv(Buffers b, Block block, int H, float eps) {
-    const int m=blockIdx.x;
+// row body shared by k_mhc_out_inv and its owner-range (Flash SP) entry point: m is the GLOBAL lane row, first the
+// first row of the launched range (block index k is owner-local: (m - first) * H + h). OFF passes first = 0.
+template<class Block>
+__device__ __forceinline__ void mhc_out_inv_body(Buffers b, Block& block, int m, int first, int H, float eps) {
     const unsigned long long step = block.init();
     float post[4], comb[16];
     #pragma unroll
@@ -318,7 +334,7 @@ template<class Block> __global__ void __launch_bounds__(THREADS) k_mhc_out_inv(B
         float y_all[16];
         #pragma unroll
         for (int idx=0; idx<16; ++idx)
-            y_all[idx] = block((size_t)m*4096 + threadIdx.x + idx*THREADS);
+            y_all[idx] = block((size_t)(m-first)*4096 + threadIdx.x + idx*THREADS);
         #pragma unroll
         for (int idx=0; idx<16; ++idx) {
             const int h = threadIdx.x + idx*THREADS;
@@ -335,7 +351,7 @@ template<class Block> __global__ void __launch_bounds__(THREADS) k_mhc_out_inv(B
             float old[4];
             #pragma unroll
             for (int j=0; j<4; ++j) old[j]=streams[j*H+h];
-            const float y=block((size_t)m*H+h);
+            const float y=block((size_t)(m-first)*H+h);
             #pragma unroll
             for (int i=0; i<4; ++i) {
                 float mix=0.f;
@@ -348,6 +364,14 @@ template<class Block> __global__ void __launch_bounds__(THREADS) k_mhc_out_inv(B
     }
     const float inv=rsqrtf(sum_block(sq)/(4*H)+eps);
     if (!threadIdx.x) b.inv[m]=inv;
+}
+template<class Block> __global__ void __launch_bounds__(THREADS) k_mhc_out_inv(Buffers b, Block block, int H, float eps) {
+    mhc_out_inv_body(b, block, blockIdx.x, 0, H, eps);
+}
+// owner-range entry (Flash SP, G6_PF_RS=2): one CTA per GLOBAL row [first, mend); grid = mend - first (>= 1).
+// All stream/scratch/output addressing stays by the global row m; the block reads owner-local elements.
+template<class Block> __global__ void __launch_bounds__(THREADS) k_mhc_out_inv_sp(Buffers b, Block block, int first, int H, float eps) {
+    mhc_out_inv_body(b, block, first + blockIdx.x, first, H, eps);
 }
 // Single-CTA-per-row fused wait_peers + out_inv + mix + coefficients + collapse_norm + fragments for H==4096.
 // Keeps updated streams[m] in registers (mix_all[16][4]) across all 24 mix dot products and collapse_norm,
@@ -478,17 +502,20 @@ __global__ void k_mhc_pack_fn(const __nv_bfloat16* __restrict__ fn, uint4* __res
     o.z = v[4] | ((unsigned)v[5] << 16); o.w = v[6] | ((unsigned)v[7] << 16);
     fnp[q] = o;
 }
-// k_mhc_out_inv_prepare with the packed fn (k_mhc_pack_fn) and R rows per CTA (rows blockIdx.x * R ..; grid
-// ceil(M / R)): each 16-B fn load serves 8 c and R rows. Same arithmetic in the same order per row -> bit-identical.
+// k_mhc_out_inv_prepare with the packed fn (k_mhc_pack_fn) and R rows per CTA (rows m0 .. m0 + R - 1 of the
+// LAUNCHED range; grid ceil(rows / R)): each 16-B fn load serves 8 c and R rows. Same arithmetic in the same order
+// per row -> bit-identical. The row body is shared with the owner-range (Flash SP) entry point below: m0 = first +
+// blockIdx.x * R over GLOBAL rows [first, mend) of a full lane, the block index is owner-local ((m - first) * 4096),
+// and every stream/scratch/output address uses the global row m. OFF passes first = 0, mend = M.
 template<class Block, int R>
-__global__ void __launch_bounds__(THREADS, 1) k_mhc_out_inv_prepare_pk(
-    Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
-    __half* out, float* normalized=nullptr) {
+__device__ __forceinline__ void mhc_out_inv_prepare_pk_body(
+    Buffers b, Block& block, Weights w, const uint4* __restrict__ fnp, int first, int mend, float eps,
+    __half* out, float* normalized) {
     __shared__ float sh_sums[R][8][8];
     __shared__ float sh_mix[R][24];
     __shared__ float sh_pre[R][4];
-    const int m0 = blockIdx.x * R;
-    const int rr = M - m0 < R ? M - m0 : R;   // uniform over the CTA
+    const int m0 = first + blockIdx.x * R;
+    const int rr = mend - m0 < R ? mend - m0 : R;   // owner-end guard, uniform over the CTA
     const unsigned long long step = block.init();
     float mix_all[R][16][4];
     #pragma unroll
@@ -528,7 +555,7 @@ __global__ void __launch_bounds__(THREADS, 1) k_mhc_out_inv_prepare_pk(
         #pragma unroll
         for (int idx=0; idx<16; ++idx) {
             const int h = threadIdx.x + idx*THREADS;
-            const float y = block((size_t)m*4096 + h);
+            const float y = block((size_t)(m-first)*4096 + h);
             #pragma unroll
             for (int i=0; i<4; ++i) {
                 const float v=narrow(b, post[i]*y+mix_all[r][idx][i]);
@@ -621,20 +648,38 @@ __global__ void __launch_bounds__(THREADS, 1) k_mhc_out_inv_prepare_pk(
         }
     }
 }
+template<class Block, int R>
+__global__ void __launch_bounds__(THREADS, 1) k_mhc_out_inv_prepare_pk(
+    Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
+    __half* out, float* normalized=nullptr)
+{
+    mhc_out_inv_prepare_pk_body<Block, R>(b, block, w, fnp, 0, M, eps, out, normalized);
+}
+// owner-range entry (Flash SP, G6_PF_RS=2): rows [first, mend) of the full lane, grid ceil(rows / R).
+template<class Block, int R>
+__global__ void __launch_bounds__(THREADS, 1) k_mhc_out_inv_prepare_pk_sp(
+    Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int first, int mend, float eps,
+    __half* out, float* normalized)
+{
+    mhc_out_inv_prepare_pk_body<Block, R>(b, block, w, fnp, first, mend, eps, out, normalized);
+}
 // k_mhc_out_inv_prepare_pk without the register-resident rows: wait first, one pass writes the new streams, then
 // the 24 fn sums (all 3 passes in one sweep, each sum still in (i, idx) order) and the collapse re-read the row
 // from L2. Same values, same order per thread, same reduction trees -> bit-identical. Low register use lets MINB
 // CTAs share an SM, so the DRAM phase of one row overlaps the L2/FMA phase of another. f16 / bf16: optional
 // fragment tables (bind::Xfrag layout, rows 0..M) of the normalized rows, as k_mhc_fragments would build them.
+// Row body shared by k_mhc_out_inv_prepare_rr and its owner-range (Flash SP) entry point, as _pk above: the
+// range is global rows [first, mend), the block index owner-local, fragment padding uses the FULL lane M_lane
+// (SP rejects G6_PF_XFRAG, so f16/bf16 are null there; the parameter keeps the entry points one shape).
 template<class Block, int R, int MINB>
-__global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
-    Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
-    __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr) {
+__device__ __forceinline__ void mhc_out_inv_prepare_rr_body(
+    Buffers b, Block& block, Weights w, const uint4* __restrict__ fnp, int first, int mend, int M_lane, float eps,
+    __half* out, float* normalized, unsigned* f16, unsigned* bf16) {
     __shared__ float sh_sums[R][24][8];
     __shared__ float sh_mix[R][24];
     __shared__ float sh_pre[R][4];
-    const int m0 = blockIdx.x * R;
-    const int rr = M - m0 < R ? M - m0 : R;   // uniform over the CTA
+    const int m0 = first + blockIdx.x * R;
+    const int rr = mend - m0 < R ? mend - m0 : R;   // owner-end guard, uniform over the CTA
     const unsigned long long step = block.init();
     block.wait(step);
     float inv[R];
@@ -656,7 +701,7 @@ __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
             float old[4];
             #pragma unroll
             for (int j=0; j<4; ++j) old[j]=__ldg(streams+j*4096+h);
-            const float y = block((size_t)m*4096 + h);
+            const float y = block((size_t)(m-first)*4096 + h);
             #pragma unroll
             for (int i=0; i<4; ++i) {
                 float mix=0.f;
@@ -758,10 +803,25 @@ __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
             if (normalized) normalized[(size_t)m * 4096 + h] = val;
             if (f16 || bf16) {   // fragment tables of all M rows (zero pad rows after the last), as k_mhc_fragments
                 const float b_val = __shfl_xor_sync(0xffffffffu, val, 1);
-                if (!(threadIdx.x & 1)) write_frag_pair(m, M, 4096, h, val, b_val, f16, bf16);
+                if (!(threadIdx.x & 1)) write_frag_pair(m, M_lane, 4096, h, val, b_val, f16, bf16);
             }
         }
     }
+}
+template<class Block, int R, int MINB>
+__global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
+    Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
+    __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr)
+{
+    mhc_out_inv_prepare_rr_body<Block, R, MINB>(b, block, w, fnp, 0, M, M, eps, out, normalized, f16, bf16);
+}
+// owner-range entry (Flash SP, G6_PF_RS=2): rows [first, mend) of the full lane, grid ceil(rows / R).
+template<class Block, int R, int MINB>
+__global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr_sp(
+    Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int first, int mend, int M, float eps,
+    __half* out, float* normalized, unsigned* f16, unsigned* bf16)
+{
+    mhc_out_inv_prepare_rr_body<Block, R, MINB>(b, block, w, fnp, first, mend, M, eps, out, normalized, f16, bf16);
 }
 template<class Block>
 __global__ void __launch_bounds__(THREADS, 2) k_mhc_consume_fused(
@@ -928,11 +988,13 @@ __global__ void __launch_bounds__(THREADS) k_mhc_final(Buffers b, const __nv_bfl
         }
     }
 }
+// row body shared by k_mhc_out_inv_final and its owner-range (Flash SP, G6_PF_RS=2) entry point: m is the GLOBAL
+// lane row, first the first row of the launched range (block index k is owner-local: (m - first) * 4096 + h).
+// M_lane is the FULL lane row count (write_frag_pair shape); OFF passes first = 0, M_lane = gridDim.x.
 template<class Block>
-__global__ void __launch_bounds__(THREADS) k_mhc_out_inv_final(Buffers b, Block block, const __nv_bfloat16* norm, int H, float eps,
-                                                               __half* out, float* normalized=nullptr, float* mean=nullptr,
-                                                               unsigned* f16=nullptr, unsigned* bf16=nullptr) {
-    const int m=blockIdx.x, M=gridDim.x;
+__device__ __forceinline__ void mhc_out_inv_final_body(Buffers b, Block& block, const __nv_bfloat16* norm, int m, int first, int M_lane,
+                                                       int H, float eps, __half* out, float* normalized, float* mean,
+                                                       unsigned* f16, unsigned* bf16) {
     const unsigned long long step = block.init();
     float post[4], comb[16];
     #pragma unroll
@@ -961,7 +1023,7 @@ __global__ void __launch_bounds__(THREADS) k_mhc_out_inv_final(Buffers b, Block 
     float y_all[16];
     #pragma unroll
     for (int idx=0; idx<16; ++idx)
-        y_all[idx] = block((size_t)m*4096 + threadIdx.x + idx*THREADS);
+        y_all[idx] = block((size_t)(m-first)*4096 + threadIdx.x + idx*THREADS);
     #pragma unroll
     for (int idx=0; idx<16; ++idx) {
         const int h = threadIdx.x + idx*THREADS;
@@ -987,9 +1049,24 @@ __global__ void __launch_bounds__(THREADS) k_mhc_out_inv_final(Buffers b, Block 
         if (normalized) normalized[(size_t)m*4096+h]=v;
         if (f16 || bf16) {
             const float b_val = __shfl_xor_sync(0xffffffffu, v, 1);
-            if (!(threadIdx.x & 1)) write_frag_pair(m, M, 4096, h, v, b_val, f16, bf16);
+            if (!(threadIdx.x & 1)) write_frag_pair(m, M_lane, 4096, h, v, b_val, f16, bf16);
         }
     }
+}
+template<class Block>
+__global__ void __launch_bounds__(THREADS) k_mhc_out_inv_final(Buffers b, Block block, const __nv_bfloat16* norm, int H, float eps,
+                                                               __half* out, float* normalized=nullptr, float* mean=nullptr,
+                                                               unsigned* f16=nullptr, unsigned* bf16=nullptr) {
+    mhc_out_inv_final_body(b, block, norm, blockIdx.x, 0, gridDim.x, H, eps, out, normalized, mean, f16, bf16);
+}
+// owner-range entry (Flash SP, G6_PF_RS=2): one CTA per GLOBAL row [first, mend); grid = mend - first (>= 1).
+// Fragment tables are not built on the SP path (it rejects G6_PF_XFRAG); mean stays (the final residual rows).
+// M_lane is only the write_frag_pair shape, and f16/bf16 are null here, so the owner row count (gridDim.x) is
+// passed; it is NOT the full lane M. A fragment-building SP entry would have to take the full lane M.
+template<class Block>
+__global__ void __launch_bounds__(THREADS) k_mhc_out_inv_final_sp(Buffers b, Block block, const __nv_bfloat16* norm, int first, int H, float eps,
+                                                                  __half* out, float* normalized, float* mean) {
+    mhc_out_inv_final_body(b, block, norm, first + blockIdx.x, first, gridDim.x, H, eps, out, normalized, mean, nullptr, nullptr);
 }
 // Write both fragment tables directly from FP32 (do not round through FP16
 // before BF16). Layout is bind::Xfrag: [tile8][K/16][32][2] words.
@@ -1016,5 +1093,15 @@ inline void prepare(Buffers b, Weights w, int M, int H, float eps, __half* out, 
         k_mhc_mix<<<dim3(MIX,M),THREADS,0,st>>>(b,w,H);
         k_mhc_collapse_norm<<<M,THREADS,H*sizeof(float),st>>>(b,w,H,eps,out,nullptr,normalized,f16,bf16,true);
     }
+}
+// Owner-range fused prepare for the Flash SP path (G6_PF_RS=2): GLOBAL rows [first, mend) of a full M_lane-row
+// lane. Fused path only (FlashPrefill always allocates hc_done); fragment tables are not built (SP rejects
+// G6_PF_XFRAG). A zero-row owner launches nothing (a 0 grid is invalid) but still publishes its AG lane.
+inline void prepare_range(Buffers b, Weights w, int first, int mend, int M_lane, int H, float eps,
+                          __half* out, cudaStream_t st, float* normalized=nullptr) {
+    if (!b.done) { fprintf(stderr, "g6: prepare_range: fused path only (hc_done == 0)\n"); exit(2); }
+    const int rows = mend - first;
+    if (rows < 1) return;
+    k_mhc_prepare_fused_sp<<<dim3(MIX,rows),THREADS,H==4096?0:H*sizeof(float),st>>>(b,w,first,M_lane,H,eps,out,normalized);
 }
 } // namespace flash_mhc
