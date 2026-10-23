@@ -41,6 +41,7 @@ struct KdaLayer
     const uint8_t *fa_mx = nullptr, *ga_mx = nullptr;         // .mx.gv records, whole: [8][HID/32][528]
     const uint8_t *o = nullptr;                               // o_proj shard .gv [HID/16][nh*8][512]
     dtr::Mat qt, kt, vt, ot;                                  // W8 trellis q, k, v (SIDE_OUT) and o_proj (SIDE_IN)
+    const uint8_t *mxc[3] = {}, *mxs[3] = {};                 // q, k, v own rows as MXFP8 (prefill GEMM): [nh*128][HID], [..][HID/32]
     const uint16_t *conv[3] = {};                             // [own ch][4]
     const uint16_t *fb = nullptr, *gb = nullptr;              // [own ch][128]
     const float *A_log = nullptr, *dt_bias = nullptr;         // [own heads], [own ch]
@@ -115,6 +116,13 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
         const size_t off = static_cast<size_t>(w.h0) * (DK / 16) * row16;
         w.q = q ? q + off : nullptr; w.k = k ? k + off : nullptr; w.v = v ? v + off : nullptr;
     }
+    const char* qkv[3] = {"q_proj", "k_proj", "v_proj"};
+    for (int i = 0; i < 3; ++i)
+        if (find(A + qkv[i] + ".weight.mx.codes").p)
+        {
+            w.mxc[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.codes", {dl, HID}));
+            w.mxs[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.scales", {dl, HID / 32}));
+        }
     if (find(A + "f_a_proj.weight.mx.gv").p)
         w.fa_mx = static_cast<const uint8_t*>(get(A + "f_a_proj.weight.mx.gv", {DK / 16, HID / 32, 528}));
     else
