@@ -920,6 +920,8 @@ class Supervisor:
                 '--sessions', self.o.get('SESS') or '8']
         if self.o.get('TP') in ('6', '8'):
             argv += ['--stall-timeout', '2400']
+        if self.o.get('MAX_PLP_PROMPT'):
+            argv += ['--max-plp-prompt', self.o.get('MAX_PLP_PROMPT')]
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
         for _ in range(150):
             if os.path.exists(sock):

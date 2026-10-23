@@ -63,6 +63,8 @@ KEYS = {
                                               'names); unset = the template\'s own default'),
     'DEFAULT_THINKING_BUDGET': ('box', '0', 'thinking_budget for a chat request that names none: reply tokens before '
                                             'the front end closes the think block; 0 = no limit'),
+    'MAX_PLP_PROMPT': ('box', None, 'the front end: longest prompt of a request with prompt_logprobs (shim '
+                                    '--max-plp-prompt; default 1024). The NLL harness rows are 2048'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
