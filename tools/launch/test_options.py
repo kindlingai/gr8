@@ -390,10 +390,14 @@ class HybridTests(unittest.TestCase):
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
         self.assertNotIn('--spec-adaptive', p['args'])
         self.assertIn('/a/qo.pack', p['args'])          # PF_OWN=3 without a release: the QO pack
-        for argv, why in ((['--dflash', '1'], 'DFLASH=1 at TP=8'), (['--kv-format', 'int4'], 'KV_FORMAT=int4 at TP=8')):
-            o = self.parse(*HYB, *argv)
-            with self.assertRaisesRegex(opt.OptionError, why):
-                opt.engine_plan(o)
+        o = self.parse(*HYB, '--kv-format', 'int4')
+        with self.assertRaisesRegex(opt.OptionError, 'KV_FORMAT=int4 at TP=8'):
+            opt.engine_plan(o)
+        # --dflash 1: the drafter, its body split one KV head a rank (packs from dflash2 --nr 8)
+        o = self.parse(*HYB, '--dflash', '1')
+        p = opt.engine_plan(o, rank=7, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
+        self.assertEqual((p['knobs']['DFLASH'], p['knobs']['SPEC_ADAPT']), ('1', '1'))
+        self.assertIn('/a/dflash.r7.pack', p['args'])
         self.refuse([*HYB, '--drafter', 'https://huggingface.co/a/b'], 'not TP=8')
 
 
