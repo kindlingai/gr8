@@ -101,7 +101,9 @@ pub struct GlmParser {
 }
 
 impl GlmParser {
-    pub fn new(tools: Option<&Value>, tool_choice: &Value, include_reasoning: bool) -> GlmParser {
+    /// `start_in_content`: the prompt closed its think block (no-think request), so the reply starts on content.
+    pub fn new(tools: Option<&Value>, tool_choice: &Value, include_reasoning: bool,
+               start_in_content: bool) -> GlmParser {
         let mut map = Map::new();
         let mut any = false;
         if let Some(Value::Array(ts)) = tools {
@@ -118,12 +120,12 @@ impl GlmParser {
             tools: map,
             parse_tools: any && tool_choice.as_str() != Some("none"),
             include_reasoning,
-            state: State::Reasoning,
+            state: if start_in_content { State::Content } else { State::Reasoning },
             buf: String::new(),
             slots: Vec::new(),
             region: None,
             last: None,
-            reasoning_ended: false,
+            reasoning_ended: start_in_content,
             deferred_reasoning: String::new(),
             deferred_content: String::new(),
             content_has_nonws: false,
@@ -770,7 +772,7 @@ mod tests {
     }
 
     fn full(text: &str) -> FullParse {
-        GlmParser::new(Some(&tools()), &json!("auto"), true).parse_full(text)
+        GlmParser::new(Some(&tools()), &json!("auto"), true, false).parse_full(text)
     }
 
     #[test]
@@ -798,7 +800,7 @@ mod tests {
         let text = "Think a bit.</think>Sure.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
                     <arg_key>days</arg_key><arg_value>3</arg_value></tool_call>";
         let f = full(text);
-        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true);
+        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true, false);
         let chars: Vec<char> = text.chars().collect();
         let (mut args, mut reasoning, mut content) = (String::new(), String::new(), String::new());
         for (i, ch) in chars.chunks(3).enumerate() {
@@ -843,7 +845,7 @@ mod tests {
     /// Feed `text` in `chunk`-sized pieces and accumulate what a client would (ids differ per run, so compare names and
     /// arguments, as `stream_equals_full` does).
     fn streamed(text: &str, chunk: usize) -> FullParse {
-        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true);
+        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true, false);
         let chars: Vec<char> = text.chars().collect();
         let (mut reasoning, mut content) = (String::new(), String::new());
         let mut calls: Vec<(String, String, String)> = Vec::new();

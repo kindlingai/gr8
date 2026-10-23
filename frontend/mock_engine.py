@@ -77,6 +77,11 @@ class Mock:
         if 'describe the call format' in last_user:  # a reply *about* a call: prose, not one (front end tests)
             return head + enc('Call it like <tool_call>get_weather<arg_key>city</arg_key>'
                               '<arg_value>Paris</arg_value></tool_call> in your code.'), self.stop_user
+        if 'Respond with only a JSON object' in last_user:
+            # response_format json mode: the front end asked for JSON, so the mock emits fenced JSON. The
+            # 'invalid-json-please' marker makes the reply violate the schema, for the warnings path.
+            payload = '{"a": "x"}' if 'invalid-json-please' in last_user else '{"city": "Paris", "days": 3}'
+            return head + enc('Here you are:\n```json\n' + payload + '\n```'), self.stop_user
         tool = self.first_tool(text)
         if tool:
             return head + enc('I will call a tool.') + enc(f'{TOOL_OPEN}{tool["name"]}{self.tool_args(tool)}'

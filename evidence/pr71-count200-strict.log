@@ -1,0 +1,9 @@
+run 1: PASS  (lines=200, digit-only=200/200)
+run 2: PASS  (lines=200, digit-only=200/200)
+run 3: PASS  (lines=200, digit-only=200/200)
+run 4: PASS  (lines=200, digit-only=200/200)
+run 5: PASS  (lines=200, digit-only=200/200)
+run 6: PASS  (lines=200, digit-only=200/200)
+run 7: PASS  (lines=200, digit-only=200/200)
+run 8: PASS  (lines=200, digit-only=200/200)
+8/8 clean
