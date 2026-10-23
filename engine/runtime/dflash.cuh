@@ -1,6 +1,6 @@
 // DFlash2 block drafter: one rank's draft step, as launch helpers in fabric phases.
 //
-// The drafter (a separate pack per rank, tools/convert/dflash2.py) drafts a block of K = 7 tokens in one forward:
+// The drafter (a separate pack per rank, engine/loader-rs/src/dflash2.rs) drafts a block of K = 7 tokens in one forward:
 //   context  for every accepted row of the last target step: the target residual after the layers in
 //            target_layer_ids (6), concatenated -> fc (this rank's 6144/NR columns) -> all-gather (collective 0) ->
 //            hidden_norm -> per drafter layer j: k_norm(k_proj) with RoPE and v_proj of this rank's KV heads, stored in
@@ -540,15 +540,15 @@ __global__ void __launch_bounds__(32) k_out(OutArgs a)
 }   // namespace dflk
 
 // ---------------------------------------------------------------- build
-// find: the drafter pack (tools/convert/dflash2.py); main: the built target model (embedding, lm_head, vocab slice).
+// find: the drafter pack (engine/loader-rs/src/dflash2.rs); main: the built target model (embedding, lm_head, vocab slice).
 // meta: manifest values (mask id, target layers, theta, eps). f: a fabric region with dfl::NC collectives and slots of at
 // least B x 6144 BF16. sel: the DFlash2 selector (needs D.sel.* in the pack).
 struct DflMeta { int mask_id = 0, nr = 0, block = 0, layers = 0, window = 0; int tl[dfl::NT] = {}; float theta = 0, eps = 0; bool sel = false; };
-// D.meta (tools/convert/dflash2.py META): int32 [17]
+// D.meta (engine/loader-rs/src/dflash2.rs META): int32 [17]
 inline DflMeta dfl_read_meta(const Find& find)
 {
     const TensorRef t = find("D.meta");
-    if (!t.p || t.nd != 1 || t.shape[0] != 17) die("dflash pack has no D.meta [17] (tools/convert/dflash2.py)");
+    if (!t.p || t.nd != 1 || t.shape[0] != 17) die("dflash pack has no D.meta [17] (engine/loader-rs/src/dflash2.rs)");
     int v[17];
     G6RT_CK(cudaMemcpy(v, t.p, sizeof v, cudaMemcpyDeviceToHost));
     DflMeta m;

@@ -2,7 +2,7 @@
 the reference loader's decode (loader/exlr8.py), the converter's record layouts (engine/ref/g6ref.py), its MXFP8
 equation (tools/convert/mxfp8.py, here on fp32 inputs), a NumPy int4 round-to-nearest and the converter's ownership
 rules (tools/convert/plan.py). Every non-expert tensor must match byte for byte, and the planned image must hold
-exactly the names a converted pack has (tools/convert/convert.py), less the ones no engine path reads.
+exactly the names a converted pack has, less the ones no engine path reads.
 
     python3 engine/loader-rs/tests/release_check.py --release DIR --widths FILE --ref EXLR8_REPO \
         --dump engine/loader-rs/target/release/g6plandump --tp 4 --ranks 0,1,2,3 --layers 0,3,4,6,78 [--qo]

@@ -1,5 +1,5 @@
-//! src/dflash2.rs against tests/data/dflash2 (tests/make_dflash2_fixture.py): a small synthetic drafter converted at
-//! TP=4 gives the manifests and packs tools/convert/dflash2.py wrote, byte for byte.
+//! src/dflash2.rs against tests/data/dflash2: a small synthetic drafter converted at TP=4 gives the checked-in manifests
+//! and packs byte for byte.
 
 use g6load::dflash2::{self, Dims, St};
 use g6load::json::{self, Json};

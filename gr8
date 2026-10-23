@@ -7,9 +7,8 @@
 #   ./gr8 glm53 up [OPTIONS] [@FILE]  start this box's supervisor and follow it until the cluster serves
 #        --tp 4|6|3 --peers A,B,C,D   the boxes' LAN addresses, the same list on every box, head first
 #        --mentat localhost           or: find the other boxes through the local mentat daemon (the default)
-#        --model URL|DIR              the release, https://huggingface.co/<org>/<repo>[@rev] or a local copy of it,
-#                                     or a prepared pack directory (every rank's manifests). A release is the whole
-#                                     model: the engine plans every rank's weights from its files
+#        --model URL|DIR              the exlr8 release, https://huggingface.co/<org>/<repo>[@rev] or a local copy of
+#                                     it. The engine plans every rank's weights from its files
 #        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
 #        --drafter URL                TP=4: the DFlash2 drafter's repo, fetched and converted on each box
 #        --cap 262144, --sess 4, ...  every knob in KNOBS.md, as --<knob> VALUE
@@ -24,9 +23,6 @@
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
-#   ./gr8 glm53 stage [PACK_DIR]      scripts/stage.sh bin/ PACK_DIR, and the head's front end venv if it is missing
-#   ./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]   scripts/build_packs.sh, at TP=4 the drafter packs, and
-#                                     the tokenizer files in OUT_DIR/tokenizer
 #
 #   ./gr8 kv up --gb N [OPTIONS]      lock N GiB of this box's memory and serve it as KV page blocks to the cluster
 #                                     (engine/kvman-rs/REMOTE-TIER.md), announced in the mentat group; ./gr8 kv --help
@@ -35,16 +31,12 @@
 # Options come from the command line, then one config file (@FILE, else ./cluster.env, else config/cluster.env, which
 # ./gr8 parses and does not source), then the environment, then the defaults. An old config file works: HOSTS is read as PEERS. KNOBS.md
 # lists every option.
-#
-# --ssh (deprecated): check, up, down, restart, status and logs from the head over ssh, through scripts/launch_*.sh and
-# scripts/stop.sh, as before. There the config file wins over the environment, because every script sources it.
 # --no-check (or CHECK=0) boots without the checks.
 set -eu
 REPO=$(cd "$(dirname "$0")" && pwd)
 SCRIPTS=$REPO/scripts
 check=1
 [ "${CHECK:-1}" = 0 ] && check=0
-ssh=0
 
 usage() { sed -n '2,/^set -eu$/{/^set -eu$/d;s/^# \{0,1\}//;p;}' "$0"; }
 
@@ -52,7 +44,6 @@ options() {
   while [ $# -gt 0 ]; do
     case $1 in
       --no-check) check=0; shift ;;
-      --ssh) ssh=1; shift ;;
       -h|--help|help) usage; exit 0 ;;
       *) break ;;
     esac
@@ -76,214 +67,16 @@ cmd=$1; shift
 args=()
 for a in "$@"; do
   case $a in
-    --ssh) ssh=1 ;;
     --no-check) check=0 ;;
     *) args+=("$a") ;;
   esac
 done
 set -- ${args[@]+"${args[@]}"}
+api() { echo "http://127.0.0.1:$PORT"; }
 case $cmd in
   up|down|restart|status|logs|check|show-config|prepare)
-    if [ $ssh = 0 ]; then
-      [ $check = 0 ] && set -- "$@" --no-check
-      exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@"
-    fi
-    [ "$model" = glm53 ] || { echo "gr8: --ssh: the ssh launchers start GLM-5.3 only" >&2; exit 2; }
-    echo "gr8: --ssh is deprecated; the ssh launchers stay for one release. Without --ssh, ./gr8 $model $cmd runs on" >&2
-    echo "     every box instead (README, Running it)." >&2 ;;
-esac
-
-# glm53_only: stage and packs build GLM-5.3 packs; glm53f boots from its release (--model).
-glm53_only() {
-  [ "$model" = glm53 ] || { echo "gr8: $cmd: GLM-5.3 packs only; glm53f boots from its release (--model)" >&2; exit 2; }
-}
-# config: the cluster file, through common.sh, so every value means what it means to the launchers.
-config() {
-  # shellcheck disable=SC1091
-  . "$SCRIPTS/common.sh"
-  TP=${TP:-$NRANK}
-  PORT=${PORT:-8100}
-  PY=${PY:-$G6_HOME/venv/bin/python}
-}
-# launcher: the script `up` runs for this TP.
-launcher() {
-  case $TP in
-    4) echo "$SCRIPTS/launch_tp4.sh" ;;
-    6) echo "$SCRIPTS/launch_tp6.sh" ;;
-    3) echo "$SCRIPTS/launch_tp3.sh" ;;
-    *) return 1 ;;
-  esac
-}
-api() { echo "http://127.0.0.1:$PORT"; }
-# dflash: whether the TP=4 launcher loads the DFlash2 drafter (DFLASH, default 1).
-dflash() {
-  [ "$TP" = 4 ] || return 1
-  [ "${DFLASH:-1}" = 1 ]
-}
-
-# --- check: what would stop a boot, before any engine starts -------------------------------------------------------
-# FAIL rows are things a boot cannot survive; WARN rows are not. One ssh call per box.
-do_check() {
-  local fails=0 warns=0 r out line k v want packs
-  ok()   { printf '  ok    %-16s %s\n' "$1" "$2"; }
-  warn() { printf '  WARN  %-16s %s\n' "$1" "$2"; warns=$((warns + 1)); }
-  fail() { printf '  FAIL  %-16s %s\n' "$1" "$2"; fails=$((fails + 1)); }
-  echo "check (TP=$TP, $NRANK hosts, config $CFG)"
-
-  if [ "$TP" != "$NRANK" ]; then fail TP "TP=$TP but HOSTS names $NRANK boxes"
-  elif ! launcher > /dev/null; then fail TP "no launcher for TP=$TP (4, 6 or 3)"
-  else ok TP "$(basename "$(launcher)")"; fi
-  for k in IPS IPS2; do
-    v=${!k:-}
-    if [ -z "$v" ]; then fail "$k" "not set in the config"
-    elif [ "$(echo "$v" | tr ',' '\n' | grep -c .)" != "$NRANK" ]; then fail "$k" "$(echo "$v" | tr ',' '\n' | grep -c .) addresses for $NRANK hosts"
-    else ok "$k" "$NRANK addresses"; fi
-  done
-  for k in G6_HOME MODEL_DIR PROXY_CPU; do [ -n "${!k:-}" ] || fail "$k" "not set in the config"; done
-
-  # the head: tokenizer files, front end, the shim's python, nothing left running
-  missing=""
-  for f in tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do
-    [ -f "${MODEL_DIR:-}/$f" ] || missing="$missing $f"
-  done
-  [ -z "$missing" ] && ok MODEL_DIR "${MODEL_DIR}" || fail MODEL_DIR "${MODEL_DIR:-unset} lacks$missing (the TR3 checkpoint dir has all four)"
-  if [ -x "${FRONT_BIN:-$REPO/bin/g6front-rs}" ]; then ok "front end" "${FRONT_BIN:-$REPO/bin/g6front-rs}"
-  else fail "front end" "no ${FRONT_BIN:-$REPO/bin/g6front-rs}: ./gr8 $model build (or scripts/build_front.sh bin/)"; fi
-  if [ -x "$PY" ]; then ok python "$PY"
-  else fail python "no $PY for the shim: ./gr8 $model stage creates it (python3 -m venv $G6_HOME/venv && $G6_HOME/venv/bin/pip install -r frontend/requirements.txt)"; fi
-  for p in front shim; do
-    if [ -f "$G6_HOME/out/$p.pid" ] && kill -0 "$(cat "$G6_HOME/out/$p.pid")" 2>/dev/null; then
-      fail "$p" "already running (pid $(cat "$G6_HOME/out/$p.pid")): ./gr8 $model down first"
-    fi
-  done
-
-  # every box, one ssh call each: reachable, binary, packs, RDMA devices, an engine left running, memory
-  # PACKS moves the rank packs (launch_s2.sh: every TP).
-  packs=${PACKS:-packs}
-  case $packs in /*) ;; *) packs=$G6_HOME/$packs ;; esac
-  for ((r = 0; r < NRANK; r++)); do
-    want="$packs/rank$r.pack $packs/rank$r.manifest.json"
-    [ "$TP" = 6 ] && [ "${PF_OWN:-3}" = 3 ] && want="$want $G6_HOME/packs/qo.pack $G6_HOME/packs/qo.manifest.json"
-    [ "$TP" = 3 ] && [ "${PF_OWN:-1}" = 3 ] && want="$want $G6_HOME/packs/qo.pack $G6_HOME/packs/qo.manifest.json"
-    [ "$TP" = 4 ] && [ "${PF_OWN:-4}" = 3 ] && want="$want $G6_HOME/packs/qo.pack $G6_HOME/packs/qo.manifest.json"
-    if dflash; then
-      want="$want $G6_HOME/packs/dflash.r$r.pack $G6_HOME/packs/dflash.r$r.manifest.json"
-    fi
-    if ! out=$(on "$r" "cd $G6_HOME 2>/dev/null || { echo nohome; exit 0; }
-      for f in bin/g6m4 $want; do [ -e \$f ] || echo missing \$f; done
-      [ -x bin/g6m4 ] && echo md5 \$(md5sum bin/g6m4 | cut -c1-12)
-      [ -d /dev/infiniband ] || echo noib
-      p=\$(cat out/g6m4.pid 2>/dev/null); [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null && echo running \$p
-      echo mem \$(awk '/MemAvailable/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo 2>/dev/null)
-      if command -v nvidia-smi > /dev/null; then echo gpu \$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | tr '\n' ' '); fi
-      true" 2>&1); then
-      fail "rank $r" "${HOST[$r]}: ssh failed ($(echo "$out" | tail -n 1)). Passwordless ssh from the head (or ssh -A)"
-      continue
-    fi
-    local miss="" md5="" running="" mem="" gpu="" noib="" nohome=""
-    while read -r k v; do
-      case $k in
-        nohome) nohome=1 ;;
-        missing) miss="$miss ${v#$G6_HOME/}" ;;
-        md5) md5=$v ;;
-        noib) noib=1 ;;
-        running) running=$v ;;
-        mem) mem=$v ;;
-        gpu) gpu=$v ;;
-      esac
-    done <<< "$out"
-    if [ -n "$nohome" ]; then fail "rank $r" "${HOST[$r]}: no $G6_HOME (./gr8 $model stage)"; continue; fi
-    [ -z "$miss" ] || fail "rank $r" "${HOST[$r]}: missing$miss (./gr8 $model stage$([ "$TP" = 4 ] && echo '; drafter packs: ./gr8 glm53 packs ... DRAFTER_DIR, or DFLASH=0'))"
-    [ -z "$noib" ] || fail "rank $r" "${HOST[$r]}: no /dev/infiniband"
-    [ -z "$running" ] || fail "rank $r" "${HOST[$r]}: an engine is already running (pid $running): ./gr8 $model down first"
-    if [ -z "$running" ] && [ -n "$gpu" ]; then warn "rank $r" "${HOST[$r]}: other GPU processes: $gpu"; fi
-    if [ -z "$miss$noib$running" ]; then ok "rank $r" "${HOST[$r]}: g6m4 $md5, MemAvailable ${mem:-?} GiB"; fi
-    eval "md5_$r=\$md5"
-  done
-  local first="" diff=""
-  for ((r = 0; r < NRANK; r++)); do
-    eval "v=\${md5_$r:-}"
-    [ -n "$v" ] || continue
-    [ -z "$first" ] && first=$v
-    [ "$v" = "$first" ] || diff=1
-  done
-  [ -z "$diff" ] || warn binary "the ranks run different g6m4 builds (md5 above): ./gr8 $model stage"
-
-  echo "check: $fails failed, $warns warnings"
-  [ "$fails" = 0 ]
-}
-
-# --- status: what the cluster is doing now ------------------------------------------------------------------------
-do_status() {
-  local r out code rdy
-  echo "TP=$TP, $NRANK hosts"
-  for ((r = 0; r < NRANK; r++)); do
-    # The engine writes its ready file on rank 0 only.
-    rdy=1; if [ "$r" != 0 ]; then rdy=0; fi
-    out=$(on "$r" "cd $G6_HOME 2>/dev/null || exit 0
-      p=\$(cat out/g6m4.pid 2>/dev/null)
-      if [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null; then
-        echo -n \"engine running (pid \$p)\"
-        if [ $rdy = 0 ]; then :; elif [ -e s2/ready.s2 ]; then echo -n ', ready'; else echo -n ', loading'; fi
-      else echo -n 'engine stopped'; fi
-      echo -n \", MemAvailable \$(awk '/MemAvailable/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo 2>/dev/null) GiB\"
-      if ! { [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null; } && [ -s out/g6m4.r$r.err ]; then echo; echo -n \"        last log line: \$(tail -n 1 out/g6m4.r$r.err)\"; fi
-      true" 2>&1) \
-      || out="ssh failed: $(echo "$out" | tail -n 1)"
-    printf '%-8s%s\n' "rank $r" "${HOST[$r]}: ${out:-no $G6_HOME}"
-  done
-  for p in shim front; do
-    if [ -f "$G6_HOME/out/$p.pid" ] && kill -0 "$(cat "$G6_HOME/out/$p.pid")" 2>/dev/null; then
-      printf '%-8s%s\n' "$p" "running (pid $(cat "$G6_HOME/out/$p.pid"))"
-    else
-      printf '%-8s%s\n' "$p" stopped
-    fi
-  done
-  code=$(curl -s -o /dev/null --max-time 3 -w '%{http_code}' "$(api)/health" || true)
-  case $code in
-    200) echo "API     $(api)/v1 answers (/health 200). ./gr8 $model smoke checks the answers" ;;
-    000|"") echo "API     nothing on :$PORT" ;;
-    *) echo "API     /health $code: the front end is up, the engine is not ready yet" ;;
-  esac
-}
-
-# --- logs ---------------------------------------------------------------------------------------------------------
-do_logs() {
-  local which=${1:-0} follow="" r
-  if [ "${1:-}" = -f ] || [ "${2:-}" = -f ]; then follow=1; fi
-  if [ "$which" = -f ]; then which=${2:-0}; fi
-  case $which in
-    shim|front) if [ -n "$follow" ]; then exec tail -n 50 -f "$G6_HOME/out/$which.log"; else tail -n 50 "$G6_HOME/out/$which.log"; fi ;;
-    all)
-      for ((r = 0; r < NRANK; r++)); do echo "== rank $r (${HOST[$r]})"; on "$r" "tail -n 10 $G6_HOME/out/g6m4.r$r.err" || true; done
-      for p in shim front; do echo "== $p"; tail -n 10 "$G6_HOME/out/$p.log" 2>/dev/null || true; done ;;
-    *)
-      [ "$which" -ge 0 ] 2>/dev/null && [ "$which" -lt "$NRANK" ] || { echo "logs: rank 0..$((NRANK - 1)), shim, front or all" >&2; return 2; }
-      if [ -n "$follow" ]; then on "$which" "tail -n 50 -f $G6_HOME/out/g6m4.r$which.err"
-      else on "$which" "tail -n 50 $G6_HOME/out/g6m4.r$which.err"; fi ;;
-  esac
-}
-
-case $cmd in
-  check) config; if do_check; then exit 0; else exit 1; fi ;;
-  up)
-    config
-    if [ $check = 1 ]; then
-      do_check || { echo "fix the FAIL rows, or boot anyway with ./gr8 $model --no-check up" >&2; exit 1; }
-    fi
-    l=$(launcher) || { echo "no launcher for TP=$TP (4, 6 or 3)" >&2; exit 2; }
-    exec "$l" ;;
-  down) exec "$SCRIPTS/stop.sh" ;;
-  restart)
-    config
-    "$SCRIPTS/stop.sh"
-    if [ $check = 1 ]; then
-      do_check || { echo "fix the FAIL rows, or boot anyway with ./gr8 $model --no-check up" >&2; exit 1; }
-    fi
-    l=$(launcher) || { echo "no launcher for TP=$TP (4, 6 or 3)" >&2; exit 2; }
-    exec "$l" ;;
-  status) config; do_status ;;
-  logs) config; do_logs "$@" ;;
+    [ $check = 0 ] && set -- "$@" --no-check
+    exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@" ;;
   smoke)
     PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT) || exit 2   # the port as up reads it, from the same file
     url=${1:-$(api)}; [ $# -gt 0 ] && shift
@@ -299,30 +92,6 @@ case $cmd in
     # the int4 KV engine (--kv-format int4) only when asked: it is a second full g6m4 build
     if [ "$KV_FORMAT" = int4 ]; then MODEL=$build_model KV_FORMAT=int4 "$SCRIPTS/build.sh" "$out"; fi
     exec "$SCRIPTS/build_front.sh" "$out" ;;
-  stage)
-    glm53_only
-    config
-    pack_dir=${1:-${PACK_DIR:-}}
-    [ -n "$pack_dir" ] || { echo "usage: ./gr8 $model stage PACK_DIR (or PACK_DIR= in the config)" >&2; exit 2; }
-    "$SCRIPTS/stage.sh" "${BIN_DIR:-$REPO/bin}" "$pack_dir"
-    if [ ! -x "$PY" ]; then
-      echo "creating the front end venv: $G6_HOME/venv"
-      python3 -m venv "$G6_HOME/venv"
-      "$G6_HOME/venv/bin/pip" install -r "$REPO/frontend/requirements.txt"
-    fi ;;
-  packs)
-    glm53_only
-    [ $# -ge 3 ] || { echo "usage: ./gr8 $model packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]" >&2; exit 2; }
-    "$SCRIPTS/build_packs.sh" "$1" "$2" "$3"
-    # The tokenizer files go next to the packs, so the pack directory holds a whole model set (tools/launch/modelset.py).
-    mkdir -p "$3/tokenizer"
-    for f in tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do cp "$1/$f" "$3/tokenizer/"; done
-    if [ -n "${4:-}" ]; then
-      if [ -d "$2/r4" ]; then echo "DRAFTER_DIR: the DFlash2 drafter runs at TP=4 only; not built for these TP=6 packs"
-      else (cd "$REPO" && python3 -m tools.convert.dflash2 --src "$4" --out "$3" --nr 4); fi
-    elif [ ! -d "$2/r4" ]; then
-      echo "TP=4: the launcher also wants the DFlash2 drafter packs: ./gr8 $model packs ... DRAFTER_DIR, or boot with DFLASH=0"
-    fi ;;
   *)
     echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;
 esac

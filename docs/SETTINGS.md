@@ -20,8 +20,8 @@ the short version.
 | `--image` | on | load the whole pack into one device image (required for full packs) |
 | `--layers all` | all | all 78 layers + the MTP layer |
 | `--qo-manifest` / `--qo-pack` | `packs/qo.*` | full-head attention weights for `G6_PF_OWN=3` (identical file on every node) |
-| `--qp-manifest` / `--qp-pack` | (TP4, not used) | resident pair weights for `G6_PF_OWN=4` (`tools/convert/pairpack.py`, one file per rank); the TP4 launcher uses `G6_PF_QP_ROLL` instead |
-| `--dflash-manifest` / `--dflash-pack` | TP4 launcher default (`DFLASH=1`; `DFLASH=0` for MTP) | replaces MTP with the DFlash2 block drafter (`engine/runtime/dflash.cuh`), packs from `tools/convert/dflash2.py` (one per rank, about 0.86 GB). It drafts 7 tokens per round in one forward. Offline (`--prompt`) it replaces `--mtp`. Served, `--mtp` stays on: a request alone at its prompt tail drafts with DFlash2, the others with MTP. TP4 builds (the rank count must divide the drafter's 8 KV heads) |
+| `--qp-manifest` / `--qp-pack` | (TP4, not used) | resident pair weights for `G6_PF_OWN=4`, one file per rank; the TP4 launcher uses `G6_PF_QP_ROLL` instead |
+| `--dflash-manifest` / `--dflash-pack` | TP4 launcher default (`DFLASH=1`; `DFLASH=0` for MTP) | replaces MTP with the DFlash2 block drafter (`engine/runtime/dflash.cuh`), packs from `bin/g6load dflash2` (`engine/loader-rs/src/dflash2.rs`, one per rank, about 0.86 GB). It drafts 7 tokens per round in one forward. Offline (`--prompt`) it replaces `--mtp`. Served, `--mtp` stays on: a request alone at its prompt tail drafts with DFlash2, the others with MTP. TP4 builds (the rank count must divide the drafter's 8 KV heads) |
 | `--dflash-sel 0\|1` | 1 (`DFLASH_SEL`) | 1 = the DFlash2 selector walk over the top-16 candidates of each position, 0 = the drafter's argmax (sampled with the target's position keys) |
 | `--dflash-k K` | 7 (`DFLASH_K`) | the drafts a round verifies (1..7); a verify step carries K + 1 rows. The drafter always drafts the whole block |
 | `--spec-accept coupled\|rejection` | coupled (`SPEC_ACCEPT`) | how verify steps accept drafts at temperature > 0, for MTP and the DFlash2 drafter. coupled: drafts are sampled with the target's position-keyed noise and kept when they equal the target's sample, so a seed gives the same text with or without speculation. rejection: greedy drafts, each kept with probability p(draft) under the request's temperature and top_p (the engine has no top_k or min_p), else replaced by a sample of p without it. The output distribution is the target's in both modes, but rejection gives other text for a seed. Which mode keeps more drafts depends on how close the drafter's distribution is to the target's. Temperature 0 is the same in both. Needs a drafter |
@@ -77,7 +77,7 @@ the short version.
 | `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
 | `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
 | `G6_PROGRESS_ISOLATE` | 1 | just before the first fabric barrier, move every thread that is not a fabric proxy thread off the proxy CPUs (the cores of the proxies this rank started, see `--proxy-cpu`) so no worker thread can preempt a progress thread. 0 = off (the A/B switch). Anything but 0/1 is rejected at startup. A thread that cannot be moved is named in the log |
-| `G6_XTRACE` | 0 | 1 = transport trace (measurement only): GPU globaltimer stamps per collective (publish, doorbell, each peer's tail, reduce end), proxy tick stamps per rail, per-QP WC retry/RNR counters. Dumped outside the timed loop, at proxy stop or when `G6_XTRACE_QUIT` appears. `tools/xtrace_driver.sh` wraps a run and samples the NIC counters per rail |
+| `G6_XTRACE` | 0 | 1 = transport trace (measurement only): GPU globaltimer stamps per collective (publish, doorbell, each peer's tail, reduce end), proxy tick stamps per rail, per-QP WC retry/RNR counters. Dumped outside the timed loop, at proxy stop or when `G6_XTRACE_QUIT` appears. |
 | `G6_XTRACE_OUT` | /tmp | directory for the dumps, `g6xtrace.r<rank>.f<n>.txt` |
 | `G6_XTRACE_QUIT` | unset | path of a file; when it appears, each fabric dumps once |
 | `G6_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
@@ -141,12 +141,7 @@ the attnk bench (`engine/attn/tests/attnk.cu`) checked the measured set, with an
 `G6ENV_X="NAME=value ..."` adds more variables on every rank. The engine rejects bad `G6_PF_*` values at startup
 (`engine/runtime/envparse.h`).
 
-## Launch knobs
-
-| variable | default | meaning |
-|---|---|---|
-| `RANK_HEALTH` | 1 | probe every rank before any engine starts (`scripts/rank_health.sh`, `tools/health/`) and refuse to boot, exit 3, with one named reason per refused rank. 0 = skip. The result is written to `$G6_HOME/out/rank_health.json` |
-| `PROBE_ARGS` | empty | thresholds for the probe, e.g. `--min-clock-mhz 1800 --min-link-gbps 90` (list in `tools/health/README.md`) |
+## The head's shim and front end
 
 The shim and the front end run under `taskset` on CPUs `0..PROXY_CPU-8`, away from the proxy CPUs. At TP=6 the shim is
 `g6s2shim.py` with `--stall-timeout $STALL_TMO` (default 2400 s).

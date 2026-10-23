@@ -839,7 +839,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.emb = (const __nv_bfloat16*)need(find, "G.embed");
     m.final_norm = (const __nv_bfloat16*)need(find, "G.final_norm");
     m.head_t = bind::head_tensors([&](const char* n) { return as_bind(find(n)); });
-    if (!m.head_t.lm_head.p) die("pack has no G.lm_head.mx.gv (run tools/convert/addgv.py)");
+    if (!m.head_t.lm_head.p) die("pack has no G.lm_head.mx.gv");
     if (!bind::vocab_slice(rank, m.vlo, m.vn)) die("rank must be 0.." + std::to_string(g6nr::NR - 1));
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
 }

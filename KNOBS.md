@@ -13,9 +13,7 @@ Where a value comes from, strongest first:
 3. the environment: `CAP=262144 ./gr8 glm53 up`;
 4. the default.
 
-This is the other way round from the ssh launchers (`./gr8 glm53 --ssh up`, deprecated), where every script sources the
-config file, so a value there wins over the environment. `./gr8 glm53 up` prints every value and where it came from,
-and `./gr8 glm53 show-config` prints them without booting.
+`./gr8 glm53 up` prints every value and where it came from, and `./gr8 glm53 show-config` prints them without booting.
 
 The handshake before the engines start compares the cluster options on every box: the TP, the shape, the peer list or
 mentat group, the ports, every knob in the launch table below that reaches the engine, and the engine environment and
@@ -25,8 +23,7 @@ box, with the option and each box's value.
 The engine does not inherit `G6_*` variables from the environment, and `./gr8 glm53 up` refuses to start while one is
 set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box compares them.
 
-The defaults in the launch table come from `scripts/engine_args.sh`. The supervisor and the ssh launchers both read
-it. Every TP runs the multi-session engine (`--serve`). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
+The defaults in the launch table come from `scripts/engine_args.sh`, which the supervisor reads. Every TP runs the multi-session engine (`--serve`). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
 `V2_WIDTHS` are paths, so each box may have its own. The handshake compares the variant's name and the sha256 of its
 manifest instead.
 
@@ -56,8 +53,7 @@ manifest instead.
 | `QP_ROLL` | 2 | – | – | `PF_OWN=4`: rolling pair-weight slots (`G6_PF_QP_ROLL`) |
 | `QP_CTX` | `CAP` | – | – | `PF_OWN=4`: QO key-table size; a longer request runs OWN=2 |
 | `QP_EARLY` | 1 | – | – | `PF_OWN=4`: send the counterpart's partial before the own rows' o_proj |
-| `PACKS` | `packs` | `packs` | `packs` | where the rank packs are, relative to `G6_HOME` or absolute |
-| `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
+| `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files: the width files and the index slices |
 | `VARIANT` (`--variant`) | `home` | `home` | `bit225` | the exlr8 v2 width manifest: `bit225`, `bit243`, `bit260`, `bit325`, `bit338` (routed experts at about 2.25-3.38 bpw, spent where they lower KL against bf16 the most), `home` (3.25 bpw), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). At TP=3, a release without `bit225` boots `down1`. Without `V2`, only `home` |
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
 | `DFL_REUSE` | 2 | – | – | 1 = a request whose prefix-reuse hit skipped into the DFlash2 drafter's window keeps the drafter; 2 = also a request alone on MTP takes it (`G6_DFL_REUSE`). Defaults to 2 when serving DFlash2 with MTP. Needs `DFLASH=1` |
@@ -88,8 +84,6 @@ manifest instead.
 | `FRONT_BIN` | `bin/g6front-rs` | same | same | the Rust front end binary |
 | `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim |
 | `S2PORT` | 7341 | 7341 | 7341 | the multi-session control port on the head |
-| `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
-| `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
 
 ## `./gr8 glm53`
 
@@ -127,11 +121,9 @@ manifest instead.
 | `JOIN_TIMEOUT` | `--join-timeout` | 600 | run | seconds for the mentat group to fill, for a worker to reach the head, and on the head from the first hello to the last (0 = forever) |
 | `CHECK` | `--no-check` | 1 | run | 0 = skip this box's checks (the model files are checked anyway) |
 | `G6_CLUSTER` | | none | | the config file when there is no `@FILE` |
-| `PACK_DIR` | | none | | `./gr8 glm53 stage` with no argument copies from here |
-| `BIN_DIR` | | `bin` | | what `./gr8 glm53 stage` copies the engine from |
 
-`PACKS`, `RANK_HEALTH` and `PROBE_ARGS` work with `--ssh` only. The symmetric launch takes the packs from `MODEL`, and it
-does not run the rank health probe yet: run `scripts/rank_health.sh` first if you want it.
+The launcher does not run the rank health probe: run `scripts/rank_health.sh` with the same options before a boot if
+you want it (`PROBE_ARGS` sets its thresholds, `tools/health/README.md`).
 
 ## `./gr8 kv`
 
@@ -155,7 +147,7 @@ file is read for these keys only.
 | `NODE_IP` | `--node-ip` | mentat's | the LAN address to announce |
 | `G6_HOME` | `--g6-home` | the repo checkout | the node keeps `out/kv/` here: `kv.log`, `state.json`, `ready.json` |
 
-## Build and stage
+## Build
 
 | variable | script | meaning |
 |---|---|---|
@@ -166,7 +158,6 @@ file is read for these keys only.
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |
 | `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine when `KV_FORMAT=int4` |
-| `SHARED` | `stage.sh` | 1 = `PACK_DIR` is a shared mount at the same path on every box; each box copies its own files |
 
 ## Local steering profile
 

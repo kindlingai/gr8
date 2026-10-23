@@ -226,7 +226,6 @@ jobs:
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
             done
             python3 -c "import g6s2shim"
-            python3 -c "import tools.convert.convert, tools.convert.dflash2"
             PYTHONPATH=tools/launch python3 -c "import supervisor, steering_hf; from steering import release"
             python3 tools/steering/release.py --help > /dev/null
             python3 tools/steering/evaluate.py --help > /dev/null

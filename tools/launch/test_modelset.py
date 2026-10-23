@@ -13,7 +13,7 @@ import modelset as M  # noqa: E402
 
 
 def make_packs(d, tp=4, dflash=True, qo=False, tokenizer=True, size=4096):
-    """A pack directory shaped like build_packs.sh output: rank<r>.{pack,manifest.json}, the drafter packs, and the
+    """A pack directory: rank<r>.{pack,manifest.json}, the drafter packs, and the
     tokenizer files in tokenizer/."""
     os.makedirs(d, exist_ok=True)
     stems = [f'rank{r}' for r in range(tp)] + ([f'dflash.r{r}' for r in range(tp)] if dflash else []) + (['qo'] if qo else [])

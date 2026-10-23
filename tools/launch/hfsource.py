@@ -7,7 +7,7 @@ Each box fetches only its part of the exlr8 release into --model-cache, and noth
         manifests/                             the width manifests (home, down1, up1, bit*)
         tokenizer/                             config, generation config, tokenizer and chat template
         experts/                               this rank's expert halves at their file offsets (sparse files), and
-                                               every layer's index file (tools/tune/fetch_ranks.py)
+                                               every layer's index file (fetch_ranks.py)
         index-slices/tp<N>/k<K>/rank<r>.safetensors
         dense/                                 the dense and vocab files
         complete/tp<N>.rank<r>.<variant>.json  written last, once everything above is verified
@@ -35,8 +35,8 @@ import modelset
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # The DFlash2 drafter for GLM 5.3. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
-# fetches the drafter from its own repo and converts its rank with bin/g6load dflash2 (the same bytes as
-# tools/convert/dflash2.py, without numpy).
+# fetches the drafter from its own repo and converts its rank with bin/g6load dflash2
+# (engine/loader-rs/src/dflash2.rs).
 DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-DFlash2'
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
 CHUNK = 64 << 20
@@ -66,10 +66,8 @@ def converter():
 
 
 def fetch_ranks():
-    """tools/tune/fetch_ranks.py: the range GETs, with bin/g6load planning and checking them."""
-    if REPO not in sys.path:
-        sys.path.insert(0, REPO)
-    from tools.tune import fetch_ranks as fr
+    """fetch_ranks.py: the range GETs, with bin/g6load planning and checking them."""
+    import fetch_ranks as fr
     return fr
 
 

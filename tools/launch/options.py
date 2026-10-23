@@ -544,7 +544,7 @@ def resolve_peers(o):
     return out
 
 
-# ---- the engine plan: scripts/engine_args.sh, so the ssh launchers and the supervisor start the same engine ---------
+# ---- the engine plan: scripts/engine_args.sh --------------------------------------------------------------------------
 def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
                 kv_store=None, kv_rows=None):
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
