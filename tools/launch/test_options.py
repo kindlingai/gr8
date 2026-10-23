@@ -394,7 +394,7 @@ class HybridTests(unittest.TestCase):
             o = self.parse(*HYB, *argv)
             with self.assertRaisesRegex(opt.OptionError, why):
                 opt.engine_plan(o)
-        self.refuse([*HYB, '--drafter', 'https://huggingface.co/a/b'], 'TP=4 only')
+        self.refuse([*HYB, '--drafter', 'https://huggingface.co/a/b'], 'not TP=8')
 
 
 class KvStoreTests(unittest.TestCase):
