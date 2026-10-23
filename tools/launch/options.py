@@ -128,6 +128,9 @@ KEYS = {
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
+    'CP_STEP_ROWS': ('cluster', None, 'S2: a step past SHARE_LIMIT carries at most this many rows; the CP fabric is sized for it (G6_CP_STEP_ROWS)'),
+    'CP_STEP_SEG': ('cluster', None, 'S2 with CP_STEP_ROWS: a round past SHARE_LIMIT takes only sessions past it (G6_CP_STEP_SEG)'),
+    'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
     'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
                              'needs V2_DENSE)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
