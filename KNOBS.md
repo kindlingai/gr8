@@ -93,13 +93,17 @@ manifest instead.
 
 ## `./gr8 glm53`
 
+`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, one session, an fp8 KV build, no drafter
+(`tools/launch/models.py`, `flash_defaults` in `scripts/engine_args.sh`).
+
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|
-| `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3; needed with mentat |
+| `GR8_MODEL` | `--gr8-model` | `glm53` | cluster | the model: `glm53` or `glm53f`. `./gr8 <model>` sets it |
+| `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3 (glm53f: 4 or 2); needed with mentat |
 | `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch): each box's f0 port cabled to the next box's f1 port, in `--peers` order. Needs `--peers`, takes no `--ips` |
 | `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
 | `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
-| `GROUP` | `--group` | `gr8-glm53` | cluster | the mentat group the boxes join |
+| `GROUP` | `--group` | `gr8-<model>` | cluster | the mentat group the boxes join |
 | `HEAD` | `--head` | the lowest address | cluster | mentat mode: the head's LAN address |
 | `IPS`, `IPS2` | `--ips`, `--ips2` | discovered | cluster | each rank's rail-0 and rail-1 fabric address. Without them each box finds its own two RoCE v2 addresses |
 | `MODEL` | `--model` | none | box | the exlr8 release, `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`) or a local copy of it (`dense/`, `experts/`, `index-slices/`, `manifests/`, the tokenizer files), or a prepared pack directory with every rank's manifest. A release is the whole model: the engine plans every rank's weights from its files (`V2_DENSE`). Without `MODEL_CACHE` the engine loads a pack directory in place |

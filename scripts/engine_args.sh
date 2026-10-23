@@ -2,6 +2,8 @@
 # the per-box supervisor (tools/launch) source this file, so the ssh launchers and `./gr8 glm53 up` start the same engine. KNOBS.md lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
+# GR8_MODEL picks the model: glm53 (unset) or glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2).
+#
 #   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words), and ENGINE_BIN, the
@@ -39,7 +41,22 @@ pool_cap() {
   share_cap "$p"
 }
 
+# GLM-5.3-Flash under --serve takes one session and no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu
+# refuses them). CAP is a 32K context plus one prefill chunk until the pool is measured on Flash. MTP=1: --serve needs
+# a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH-MTP.md).
+flash_defaults() {
+  case $TP in 4|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4 or 2" >&2; return 2 ;; esac
+  local k
+  for k in DFLASH REUSE PF_OWN SPEC_ADAPT; do
+    [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
+  done
+  [ "${SESS:-1}" = 1 ] || { echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves one session" >&2; return 2; }
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-33280}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=1
+  S2PORT=${S2PORT:-7341}; DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+}
+
 engine_defaults() {
+  [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
@@ -65,7 +82,20 @@ engine_defaults() {
 # TP=4 defaults G6_PF_OWN to 4. OWN=3 needs the 13 GB full-head QO pack on every rank, and that pack does not fit next to
 # a 90 GB TP=4 rank pack. OWN=4 runs the same attention over two head pairs, with the pair weights rolled in per layer
 # (about 1.3-1.4 GB of device memory plus 84 MB pinned per rank). About 1.4 KB per position of it scales with QP_CTX.
+# GLM-5.3-Flash: docs/FLASH-STATUS.md's speed stack at top-k 8. G6_PF_RS, G6_PF_OWN and CP stay off.
+flash_env() {
+  ENGINE_BIN=g6m4_flash
+  ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_PF_STRIPE=0 G6_FPF_P1=0 G6_FPF_DSA_P1=0 \
+G6_FPF_ATTN_P1=0 G6_PF_SPARSE_MLA_P1=0 G6_PF_SPARSE_MLA_HYBRID=0 G6_PF_SPARSE_MLA=1 G6_PF_SPARSE_MLA_512=1 \
+G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_FC2V2=1 G6_PF_KDA_WS=1 \
+G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
+G6_PF_TIMES=1"
+  if [ "$TP" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_STAGE_ASYNC=1"; else ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"; fi
+  ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
+}
+
 engine_env() {
+  [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
   ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4   # bin/ENGINE_BIN, for scripts/launch_s2.sh
   ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
 G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
@@ -134,6 +164,14 @@ engine_args() {
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
+  if [ "${GR8_MODEL:-glm53}" = glm53f ]; then   # a release only, one session (flash_defaults)
+    a="--image --layers all $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --prefill 4096 \
+--pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions 1 --s2-epoch $epoch"
+    [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
+    [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    (set -f; echo $a)
+    return
+  fi
   a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
   [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"

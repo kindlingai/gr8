@@ -24,6 +24,7 @@ import fabric
 import handshake
 import hfsource
 import mentat
+import models
 import modelset
 import options as opt
 import steering_local
@@ -174,21 +175,22 @@ def resolve_model(o, refresh=False, log=log):
         search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
                               release.dir if release else None) if d and os.path.isdir(d)]
         spec = o.get('VARIANT') or o.get('V2_WIDTHS')
-        variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')))
+        variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')), models.of(o))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
+        models.check_config(models.of(o), ms.tokenizer)
         steering_hf.bind(o, release)
         steering_local.prepare(o, ms)
         ms.drafter = drafter_of(o, ms, refresh, log)
         return ms, variant, ''
-    except modelset.ModelError as e:
+    except (modelset.ModelError, models.ModelMismatch) as e:
         return ms, variant, f'model: {e}'
 
 
 def drafter_of(o, ms, refresh, log):
     """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter at all
     (none in the model set either), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused."""
-    if o.get('TP') != '4':
+    if o.get('TP') != '4' or not models.of(o).drafter:
         return None
     if o.get('DRAFTER'):
         if not o.get('MODEL_CACHE'):
@@ -208,6 +210,9 @@ def drafter_of(o, ms, refresh, log):
     return None
 
 
+ENGINES = {n.encode() for m in models.MODELS.values() for n in (m.engine, m.engine + '-int4')}
+
+
 def running_engines(proc='/proc'):
     """[(pid, cwd)] of every `g6m4 --rank` process on this box, wherever it was started from."""
     out = []
@@ -220,7 +225,7 @@ def running_engines(proc='/proc'):
             cwd = os.readlink(os.path.join(proc, pid, 'cwd'))
         except OSError:
             continue
-        if b'--rank' in argv and any(os.path.basename(a) in (b'g6m4', b'g6m4-int4') for a in argv[:2]):
+        if b'--rank' in argv and any(os.path.basename(a) in ENGINES for a in argv[:2]):
             out.append((int(pid), cwd))
     return out
 
@@ -576,7 +581,8 @@ class Supervisor:
             return fails
         if self.build == 'missing':
             name = engine_bin(o)
-            fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name != 'g6m4' else '') + './gr8 glm53 build')
+            fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name.endswith('-int4') else '') +
+                         f'./gr8 {models.of(o).name} build')
         if not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
@@ -715,7 +721,9 @@ class Supervisor:
         os.makedirs(work)
         self.check_n = 0
         env = self.engine_env(plan)
-        argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
+        # Flash takes the second rail for prefill only
+        ips2 = '--ips2' if models.of(o).name == 'glm53' else '--pf-ips2'
+        argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
         if o.get('SHAPE') == 'ring':
             argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
@@ -912,8 +920,10 @@ class Supervisor:
 
 
 def engine_bin(o):
-    """The engine binary under bin/ for KV_FORMAT: g6m4 (the fp8 KV row) or g6m4-int4 (docs/KV4.md)."""
-    return 'g6m4-int4' if o.get('KV_FORMAT') == 'int4' else 'g6m4'
+    """The model's engine binary under bin/ for KV_FORMAT: g6m4 (the fp8 KV row) or g6m4-int4 (docs/KV4.md) for
+    GLM-5.3, g6m4_flash for GLM-5.3-Flash."""
+    name = models.of(o).engine
+    return name + '-int4' if o.get('KV_FORMAT') == 'int4' else name
 
 
 def engine_build(home, name='g6m4'):

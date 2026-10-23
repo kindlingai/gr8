@@ -28,6 +28,8 @@ import re
 import shutil
 import time
 
+import models
+
 FORMAT = 'gr8-set-1'
 TOKENIZER = ('chat_template.jinja', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json')
 
@@ -232,16 +234,9 @@ def offers(ms, plan):
     return None if len(ok) == tp else ok
 
 
-# The exlr8 v2 variants a release ships, and their mean routed-expert bits per weight. home, down1 and up1 follow
-# the TR3 checkpoint's per-expert widths. The bitNNN profiles spend their bits by tensor type, then by layer, in the
-# order that lowered full-vocabulary KL against bf16 the most per byte.
-VARIANTS = {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
-            'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38}
-# The default for a TP: the first of these the model set has. bit225 is down1's size with 5-10% lower KL against
-# bf16, at par on code and ~2% slower on prose. A release from before it boots down1. home's experts take 99.8 GB of a
-# rank at TP=3, which leaves no room for the KV pool on a 128 GB box. At TP=4 home stays: bit325 lowers KL by 1.5-7%
-# at home's size but decoded ~2.5% slower in three boots each.
-DEFAULT_VARIANT = {3: ('bit225', 'down1')}
+# GLM-5.3's exlr8 v2 variants (models.py has each model's)
+VARIANTS = models.GLM53.variants
+DEFAULT_VARIANT = models.GLM53.default_variant
 HALF_BYTES = {k: 384 * 8 * 32 * k for k in (2, 3, 4)}     # one 128-channel half of one projection (tools/convert/v2.py)
 
 
@@ -256,24 +251,24 @@ class Variant:
         return self.name + (f' ({self.path}, sha256 {self.sha256[:16]})' if self.path else '')
 
 
-def resolve_variant(spec, v2_dir, search, tp=None):
-    """spec: a name in VARIANTS or a manifest path (None: the first of DEFAULT_VARIANT[tp] the model set has when there
-    are v2 widths, else home). v2_dir: the V2 width files, or None for packs without them. search: the directories
+def resolve_variant(spec, v2_dir, search, tp=None, model=models.GLM53):
+    """spec: a name in model.variants or a manifest path (None: the first of model.default_variant[tp] the model set
+    has when there are v2 widths, else home). v2_dir: the V2 width files, or None for packs without them. search: the directories
     that hold the model set; exlr8-manifest-<name>.json is looked for in each of them, then in v2_dir, directly or
     under manifests/."""
     def found(n):
         return any(os.path.isfile(os.path.join(d, sub, f'exlr8-manifest-{n}.json'))
                    for d in [*search, v2_dir] for sub in ('', 'manifests'))
-    defaults = DEFAULT_VARIANT.get(tp, ()) if v2_dir else ()
+    defaults = model.default_variant.get(tp, ()) if v2_dir else ()
     name = spec or next((n for n in defaults if found(n)), defaults[-1] if defaults else 'home')
     if not v2_dir:
         if name == 'home':
             return Variant('home')
         raise ModelError(f'--variant {name} needs the exlr8 v2 width files (--v2 DIR --v2-slices DIR): these packs '
                          'carry one set of expert widths, home')
-    if name not in VARIANTS:
+    if name not in model.variants:
         if not os.path.isfile(name):
-            raise ModelError(f'--variant {name}: not home, down1 or up1, and no such manifest file')
+            raise ModelError(f'--variant {name}: not one of {", ".join(model.variants)}, and no such manifest file')
         with open(name) as f:
             label = json.load(f).get('name') or os.path.basename(name)
         return Variant(label, name)

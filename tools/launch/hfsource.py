@@ -261,14 +261,16 @@ class Release:
         os.replace(done + '.tmp', done)
 
     def whole_files(self, tp, rank):
-        """The release files this rank loads whole: its index slices, and the dense and vocab files."""
+        """The release files this rank loads whole: its index slices, and the dense and vocab files. The vision tower
+        (dense/vision-*) stays on the hub: the engine serves text."""
         t = self.repo.tree()
         slices = sorted(p for p in t if re.fullmatch(rf'index-slices/tp{tp}/k\d/rank{rank}\.safetensors', p))
         if not slices:
             raise modelset.ModelError(f'{self} has no index slices for TP={tp}')
         # TODO: every rank fetches every dense and vocab file (about 11 GB). Once the dense loader says which
         # sharding units a rank reads, fetch only those byte ranges here.
-        dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors'))
+        dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors')
+                       and not p.startswith('dense/vision-'))
         return slices + dense
 
     def reuse(self):
