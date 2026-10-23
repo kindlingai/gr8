@@ -675,10 +675,12 @@ int main(int argc, char** argv)
     // both (main and draft steps never run at once; inside the shim / front end's taskset range 0..N-8;
     // G6_QA_SPLIT_CPU moves it). Every rank must run the same values (the S2 runtime signature carries them).
     std::string qse;
-    const bool qs_def = g6nr::NR > 1;   // replicated-GEMV split needs peers to gather across; pointless at TP1
+    // replicated-GEMV split needs peers to gather across (pointless at TP1); the Flash build plans no gathers
+    const bool qs_def = g6nr::NR > 1 && !G6_MODEL_FLASH;
     const int qs_mode = env_choice("G6_QA_SPLIT", 2, qs_def ? 2 : 0, &qse), iq_split = env_choice("G6_IDXQ_SPLIT", 1, qs_def ? 1 : 0, &qse),
               mtp_split = env_choice("G6_MTP_SPLIT", 1, (qs_def && mtp) ? 1 : 0, &qse);
     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
+    if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die("G6_QA_SPLIT, G6_IDXQ_SPLIT and G6_MTP_SPLIT are GLM-5.3 paths");
     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
