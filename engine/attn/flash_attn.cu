@@ -1663,3 +1663,6 @@ extern "C" int g6_attn_qo_warm(G6AttnQo*,int,void*){return NOTSUP;}
 extern "C" int g6_attn_qo_release(G6AttnQo*){return 0;}
 extern "C" int g6_attn_qo_load(G6AttnQo*,const G6AttnTensor*,const G6AttnTensor*,void*){return NOTSUP;}
 extern "C" void g6_attn_qo_cap(int){}
+// the remote rows tier (runtime/rt_rows.cuh) moves GLM's MLA latent rows, not Flash's: unsupported, as in a G6_KV4 build
+extern "C" int g6_rt_pack_int4(const void*,size_t,void*,size_t,int,void*){return NOTSUP;}
+extern "C" int g6_rt_unpack_int4(const void*,size_t,void*,size_t,int,void*){return NOTSUP;}
