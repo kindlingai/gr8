@@ -122,6 +122,11 @@ KEYS = {
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
     'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
                              'needs V2_DENSE)'),
+    'PF_GEMMF32': ('cluster', None, 'prefill: the row-owner QO o_proj with an FP32 epilogue, PF_OWN=3 (G6_PF_GEMMF32)'),
+    'MTP_LASTROW': ('cluster', None, "MTP draft steps: only each session's last row through layer 78's routed experts (G6_MTP_LASTROW)"),
+    'DRAFT_HEAD2': ('cluster', None, "MTP draft head in two stages, 1, or 2 = with a check, experimental (G6_DRAFT_HEAD2)"),
+    'MTP_L2PF': ('cluster', None, 'MTP draft steps: the paced L2 prefetch, 1 draft step, 2 head waits, 3 both; needs L2PF (G6_MTP_L2PF)'),
+    'MTP_KSTOPB_WIDTHS': ('cluster', None, 'MTP_KSTOPB: the shared-round widths with captured graphs, w1,w2,... (G6_MTP_KSTOPB_WIDTHS)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

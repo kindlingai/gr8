@@ -151,12 +151,18 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
       esac
     done
   fi
-  # deterministic fp-order attention variants (ATTN_CTX3_SP; E1, docs/SETTINGS.md): off unless set
   # deterministic fp-order attention variants (ATTN_CTX3_SP, ATTN_POSIDX; E1, docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX3_SP:+ G6_ATTN_CTX3_SP=$ATTN_CTX3_SP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_POSIDX:+ G6_ATTN_POSIDX=$ATTN_POSIDX}"
   # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
   ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
+  # prefill o_proj FP32 epilogue, MTP draft-step speed-ups (PF_GEMMF32, MTP_LASTROW, DRAFT_HEAD2, MTP_L2PF,
+  # MTP_KSTOPB_WIDTHS; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${PF_GEMMF32:+ G6_PF_GEMMF32=$PF_GEMMF32}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_LASTROW:+ G6_MTP_LASTROW=$MTP_LASTROW}"
+  ENGINE_ENV="$ENGINE_ENV${DRAFT_HEAD2:+ G6_DRAFT_HEAD2=$DRAFT_HEAD2}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_L2PF:+ G6_MTP_L2PF=$MTP_L2PF}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB_WIDTHS:+ G6_MTP_KSTOPB_WIDTHS=$MTP_KSTOPB_WIDTHS}"
   return 0
 }
 

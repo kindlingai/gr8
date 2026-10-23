@@ -396,7 +396,7 @@ int main(int argc, char** argv)
         kstop.solo = kstop.mode == 1 && !dfl;
         // G6_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
         // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least G6_MTP_KSTOPB_KMIN (0|1, default 0).
-        // G6_MTP_KSTOPB_TAU=t1[,t2[,...]] (default 0.6,0.88; past the last entry there is no stop - the remaining drafts all verify) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n sessions.
+        // G6_MTP_KSTOPB_TAU=t1[,t2[,...]] (default 0.6,0.88,0.95; past the last entry there is no stop - the remaining drafts all verify) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n sessions.
         // G6_MTP_KSTOPB_WIDTHS=M,..: the main widths captured besides the multiples of K + 1 (default every width the rule reaches;
         // a width outside them takes the next most likely drafts). G6_MTP_KSTOPB_EXPLORE=n (measurement): every n-th
         // round's shared sessions verify a hashed k_q instead. In the S2 runtime signature
