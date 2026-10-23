@@ -40,6 +40,13 @@
 #include "../kernels/bind.cuh"
 #include "../kernels/head_i4.cuh"
 #include "../attn/bind.h"
+#if G6_MODEL_FLASH
+#include "../mhc/mhc.cuh"
+#include "../kda/kda.cuh"
+#include "../kda/proj_prefill.cuh"
+#include "../kernels/flash_mlp.cuh"
+#include "../kernels/flash_mtp.cuh"
+#endif
 #if defined(G6_CP) && G6_CP
 #include "../kernels/cpglue.cuh"
 #endif
@@ -80,7 +87,7 @@ inline void check_headroom(int rank, int capacity, bool log)
 }
 
 constexpr int NBK = 8;              // decode context buckets (graph form), at most
-constexpr int MX = G6_MX, QA = 2048, KVA = 576, IDXQ = 4096, IDXK = 128, IDXW = 32;
+constexpr int MX = G6_MX, QA = geom::QA, KVA = geom::KVA, IDXQ = geom::IDX_HEADS * geom::IDX_DIM, IDXK = geom::IDX_DIM, IDXW = geom::IDX_HEADS;
 static_assert(MX <= 32, "k_head_merge: one warp, one row per lane");
 constexpr int ATT_QT = MX > 8 ? 32 : 16;    // decode attention query tile (CP decode needs rows <= tile; attn allows <= 64); 16 = today's
 
@@ -90,6 +97,7 @@ struct TensorRef
     int nd = 0;
     long long shape[4] = {0, 0, 0, 0};
     bool bf16 = false;
+    bool fp32 = false;               // explicit F32, not merely non-BF16
     int fmt = 0;                      // routed-expert format of the manifest entry (g6::Entry::expert_format = bind::FMT_*)
 };
 using Find = std::function<TensorRef(const std::string&)>;
@@ -144,6 +152,10 @@ struct StepIn
 #ifdef DEC_S2
     int page_bound, pad_s2;           // S2 solo run: the pool's pages, the cells' page_count (0 = the context's pages, today)
 #endif
+#if G6_MODEL_FLASH
+    int kda_src;                      // KDA ring (Model::kda_ring > 1): the slot that holds the committed state
+    int kslot[MX];                    // KDA slot of each row (the verify step: row r -> slot r; else kda_src). Zeros = slot 0
+#endif
 };
 struct StepOut
 {
@@ -162,6 +174,9 @@ struct StepCtl
     G6AttnStepCell* cells;            // [nl] attention step cells (graph form)
     const int* shared;                // [nl] 1 = the layer reuses another layer's index list
     int nl;
+#if G6_MODEL_FLASH
+    int *row_slot, *kda_src;          // Flash KDA: StepIn::kslot -> row_slot, kda_src (nullptr = none)
+#endif
 };
 // grid 1, block 128
 __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
@@ -173,6 +188,10 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
     if (t == 0) *c.stepp = sh.step;
     for (int i = t; i < MX; i += 128) { c.tok[i] = sh.tok[i]; c.pos[i] = sh.pos[i]; c.srow[i] = sh.srow[i]; c.tgt[i] = sh.tgt[i];
                                          c.steering_scale[i] = sh.steering_scale[i]; }
+#if G6_MODEL_FLASH
+    if (c.row_slot) for (int i = t; i < MX; i += 128) c.row_slot[i] = sh.kslot[i];
+    if (c.kda_src && t == 0) *c.kda_src = sh.kda_src;
+#endif
     const int pages = (sh.context + 63) / 64;
     for (int l = t; l < c.nl; l += 128)
     {
@@ -213,6 +232,13 @@ struct Layer
 {
     int l = 0, index_src = -1;        // index_src: position in Model::layers of the full-index layer whose list is reused
     bool moe = false, indexer = false;
+#if G6_MODEL_FLASH
+    bool kda = false;
+    kda::KdaLayer kda_w;
+    flash_mhc::Weights hc[2];
+    flash_mlp::Weights flash_mlp_w;
+    flash_mlp::Block flash_mlp[MX + 1];
+#endif
     bind::LayerTensors T;
     bind::Layer L[MX + 1];
     bool built[MX + 1] = {};
@@ -255,7 +281,7 @@ struct CpState
     std::function<void(int i, int start, char* pool, size_t ixoff, cudaStream_t st)> rt_stage;
 };
 // binder rule (engine/attn/bind.cu): the layers that run their own indexer
-inline bool cp_full_index(int l) { return l == 78 || l <= 2 || (l - 2) % 4 == 0; }
+inline bool cp_full_index(int l) { return geom::full_index(l); }
 // floats of one partial block (c [M][H][512], m [M][H], l [M][H]), padded to 16 B as cp_lse (attn.cu) indexes it
 inline size_t cp_blk(int M, int H) { return ((size_t)M * H * 514 + 3) & ~(size_t)3; }
 // heads of rank d's group at model layer l (bind.cu: group (d - l) % NR, larger groups first)
@@ -371,13 +397,30 @@ struct Model
     g6::FabricDev f{};
     u64* stepp = nullptr;             // device step counter
     unsigned* tickets = nullptr;      // [2*nl+1] publish tickets, device, zero
-    float* resid = nullptr;           // [MX][6144]
+    float* resid = nullptr;           // [MX][HID]; Flash: final stream mean for diagnostics
     float* steering_scale = nullptr;  // [MX], refreshed by the existing k_step_in launch
     std::vector<const float*> steering_dir; // [nl], empty until verified boot activation
     std::vector<float> steering_alpha;      // [nl], immutable profile alphas
     steering::Scope steering_scope = steering::Scope::Full;
     float* steering_part = nullptr;         // [MX][48], deterministic shared-scope finalize reductions
     unsigned* steering_count = nullptr;     // [MX], shared across stream-ordered layer finalizers
+#if G6_MODEL_FLASH
+    float *resid4 = nullptr, *hc_inv = nullptr, *hc_mix = nullptr, *hc_pre = nullptr;
+    float *hc_post = nullptr, *hc_comb = nullptr, *xn = nullptr, *xn2 = nullptr;
+    unsigned* hc_done = nullptr;
+    bool flash_draft = false;
+    float *mtp_cat = nullptr;
+    const uint16_t* mtp_eh = nullptr;     // BF16 eh [HID][2*HID] (lossless dense), or
+    bind::Gv mtp_eh_mx;                   // the MXFP8 eh records (quantized dense) on the fp16 fragments of mtp_cat
+    u32* mtp_cat_f = nullptr;
+    int* row_slot = nullptr;          // [MX], single-session decode uses slot zero (MTP ring: StepIn::kslot)
+    int* kda_src = nullptr;           // device [1], StepIn::kda_src
+    int kda_ring = 0;                 // set before build: > 1 = KDA state slots for the MTP verify ring (--mtp K: K + 1)
+    __half* idx_g = nullptr;
+    kda::KdaState kda_st;
+    kda::KdaScratch kda_sc;
+    flash_mlp::Workspace flash_mlp_sc;
+#endif
     __half *x = nullptr, *x2 = nullptr, *q_a = nullptr, *q_a_n = nullptr, *kv_a = nullptr, *q_b = nullptr;
     __half *idx_q = nullptr, *idx_k = nullptr, *idx_w = nullptr;
     float *logits = nullptr, *hlog = nullptr, *lp = nullptr, *lpt = nullptr;
@@ -411,18 +454,41 @@ struct Model
 #endif
 };
 
+#if G6_MODEL_FLASH
+inline void build_flash(Model&,int,const std::vector<int>&,const Find&,int,const g6::FabricDev&,u64*,cudaStream_t,int);
+inline void prepare_flash(Model&,int,cudaStream_t);
+inline void bind_dsa_layer(Model&,int,const Find&,int,cudaStream_t);
+inline void prepare_dsa_layer(Model&,int,int,cudaStream_t);
+inline void launch_embed_flash(Model&,int,cudaStream_t);
+inline void launch_consume_flash_draft(Model&,int,int,cudaStream_t);
+inline void launch_consume_mhc(Model&,int,int,cudaStream_t);
+inline void launch_kda_block(Model&,int,int,cudaStream_t);
+inline void launch_dsa_block(Model&,int,int,int,cudaStream_t);
+inline void launch_moe_block(Model&,int,int,cudaStream_t);
+inline void launch_dense_block(Model&,int,int,cudaStream_t);
+inline void launch_step_flash(Model&,int,int,cudaStream_t,int,int,const std::function<void(int,int)>&);
+#endif
+
 // Decode stage profile marks. A mark ends a stage: the time since the previous mark goes to its stage.
 // DP_A_*: inside the attention call (attn.cu g6_attn_mark), stages 0..8 of its replay form.
+// DP_K_*/DP_M_*/DP_D_*/DP_MHC_OI: the Flash decode path only (kda.cuh / flash_mlp.cuh via g6_flash_mark,
+// launch_consume_mhc); set nowhere in the GLM path, whose stages keep their meaning.
 enum DecStage { DP_OTHER, DP_QA, DP_IDXKW, DP_QB, DP_ATTN, DP_OPROJ, DP_WAIT_A, DP_NORM_A, DP_ROUTER, DP_EXPERTS, DP_PUT_M,
                 DP_WAIT_M, DP_NORM_M, DP_HEAD_L, DP_HEAD_M, DP_STEP, DP_A_APPEND, DP_A_INDEX, DP_A_SELECT, DP_A_ABSORB,
-                DP_A_SCORES, DP_A_NORMALIZE, DP_A_CONTEXT, DP_A_MERGE, DP_A_VPROJ, DP_QAG, DP_GAP, NDP };
+                DP_A_SCORES, DP_A_NORMALIZE, DP_A_CONTEXT, DP_A_MERGE, DP_A_VPROJ, DP_QAG,
+                DP_K_PROJ, DP_K_PREP, DP_K_STEP, DP_K_OUT, DP_K_OPROJ,
+                DP_M_ROUTER, DP_M_PLAN, DP_M_XHALF, DP_M_XFRAG, DP_M_FC1, DP_M_FC2, DP_M_FIN,
+                DP_D_GATE, DP_D_DOWN, DP_D_OUT, DP_DSA_OPROJ, DP_MHC_OI, DP_GAP, NDP };
 inline const char* dp_name(int k)
 {
     static const char* n[NDP] = {"other", "q_a+kv_a", "idx_k+idx_w", "q_b+idx_q", "attention", "o_proj+put", "wait(attn)",
                                  "reduce+norm(attn)", "router+plan", "experts", "put(mlp)", "wait(mlp)", "reduce+norm(mlp)",
                                  "head local", "head merge", "step in/out+embed", "attn append", "attn index scores",
                                  "attn select/reuse", "attn absorb", "attn mla scores", "attn normalize", "attn context",
-                                 "attn merge", "attn value project", "q_a gather+norm", "gap between main steps"};
+                                 "attn merge", "attn value project", "q_a gather+norm", "kda proj", "kda prep",
+                                 "kda step", "kda out", "kda oproj", "moe router", "moe plan", "moe xhalf", "moe xfrag",
+                                 "k1 fc1 (fused)", "k1 fc2", "k1 fin", "dense gate", "dense down", "dense out",
+                                 "dsa oproj", "mhc out_inv", "gap between main steps"};
     return n[k];
 }
 inline void dp_print(const char* tag, const char* how, const double (*t)[NDP], const long* steps)
@@ -540,6 +606,9 @@ inline bind::Tensor as_bind(const TensorRef& r)
 inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& find, int capacity, const g6::FabricDev& f,
                   u64* stepp, cudaStream_t st, int max_rows = MX)
 {
+#if G6_MODEL_FLASH
+    build_flash(m,rank,ids,find,capacity,f,stepp,st,max_rows); return;
+#endif
     m.rank = rank; m.nl = (int)ids.size(); m.f = f; m.stepp = stepp;
     {
         const char* e = getenv("G6_DEC_BK");
@@ -599,7 +668,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
 #endif
     {
         const char* e = getenv("G6_DEC_SHARED_SCRATCH");
-        if (e && atoi(e) == 1 && !(m.nl == 1 && ids[0] == 78))
+        if (e && atoi(e) == 1 && !(m.nl == 1 && ids[0] == geom::MTP_LAYER))
         {
             m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap_ab, attn_rows, ATT_QT),
                                         g6_attn_bind_scratch_need(g6nr::HMAX, cap_ab, attn_rows, ATT_QT));
@@ -720,7 +789,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         const int H = g6nr::HMAX, NR = g6nr::NR;
         m.cp.tickets = dmalloc<unsigned>(m.cp.colls.ncoll());
         m.cp.cand = dmalloc<uint64_t>((size_t)NR * MX * 2048);
-        m.cp.qbuf = dmalloc<float>((size_t)MX * H * 576);
+        m.cp.qbuf = dmalloc<float>((size_t)MX * H * KVA);
         m.cp.part_all = dmalloc<float>((size_t)NR * cp_blk(MX, H));
         m.cp.part_tmp = dmalloc<float>((size_t)(NR - 1) * cp_blk(MX, H));
         fprintf(stderr, "# rank %d: G6_CP on, R %d, %s order, %d CP collectives (mmax %d)\n", rank, m.cp.R, m.cp.s3 ? "S3" : "S1",
@@ -870,6 +939,9 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
 
 inline void launch_embed(Model& m, int M, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    if(m.resid4) { launch_embed_flash(m,M,st); return; }
+#endif
     glue::EmbedArgs a{m.tok, m.emb, m.layers[0].attn_norm, m.resid, m.x, glue::RMS_EPS};
     glue::k_embed_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
 }
@@ -1190,6 +1262,9 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 // qph (QsPh): the gather phase the loopback driver wants (-1 = the whole block, as the real fabric runs it)
 inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t st, int qph = -1)
 {
+#if G6_MODEL_FLASH
+    if(m.resid4 || m.flash_draft) { if(m.layers[i].kda) launch_kda_block(m,i,M,st); else launch_dsa_block(m,i,M,context,st); return; }
+#endif
 #if defined(G6_CP) && G6_CP
     if (cp_block(m, context))
     {
@@ -1241,6 +1316,10 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
 
 inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    if(m.flash_draft) { launch_consume_flash_draft(m,c,M,st); return; }
+    if(m.resid4) { launch_consume_mhc(m,c,M,st); return; }
+#endif
     glue::ArNormArgs a{m.f, m.stepp, c, M, m.resid, w, out, glue::RMS_EPS};
     const int i = c / 2;
     if (i < (int)m.steering_dir.size() &&
@@ -1285,6 +1364,9 @@ inline void route_ovl_init(Model& m)
 constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots (slots, an expert can take several), pad_[3], slot_expert[SMAX]
 inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    if(m.resid4 || m.flash_draft) { if(m.layers[i].moe) launch_moe_block(m,i,M,st); else launch_dense_block(m,i,M,st); return; }
+#endif
     Layer& y = m.layers[i];
     const bind::Layer& b = layer_for(m, i, M);
 #ifndef DEC_SLOT
@@ -1295,7 +1377,7 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
     if (y.moe)
     {
         bind::launch(b.router, st);
-        glue::k_router_plan<<<1, 256, 0, st>>>(m.logits, y.router_bias, M, m.plan);
+        glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan);
         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
     }
     dmark(DP_ROUTER, st);
@@ -1402,6 +1484,18 @@ inline glue::HeadArgs head_args(Model& m, int M)
 inline const bind::Head& head_for(Model& m, int M)
 {
     bind::Head& H = m.head[M];
+#if G6_MODEL_FLASH
+    if(m.resid4 || m.flash_draft) {
+        if(!H.M) {
+            H.M=M; H.vlo=m.vlo; H.vn=m.vn;
+            const int codec = m.head_t.lm_head_scale.p ? bind::FP8R : (m.head_t.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W);
+            const float* rscale = static_cast<const float*>(m.head_t.lm_head_scale.p);
+            if(const char* e=bind::make_gv(m.head_t.lm_head,codec,1,32,M,m.sc.xf_head,m.hlog,gv::O_F32,H.lm_head,rscale)) die(e);
+            if(!H.lm_head.on || H.lm_head.K!=HID || H.lm_head.O!=m.vn) die("Flash head: bad G.lm_head shape");
+        }
+        return H;
+    }
+#endif
     if (!H.M)
     {
         bind::HeadIo io;
@@ -1430,6 +1524,9 @@ inline const bind::Head& head_for(Model& m, int M)
 // once per row count, outside any capture: kernel arguments and (graph form) the attention replay entries
 inline void prepare(Model& m, int M, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    if(m.resid4 || m.flash_draft) { prepare_flash(m,M,st); return; }
+#endif
     route_ovl_init(m);
     head_for(m, M);
     for (int i = 0; i < m.nl; ++i)
@@ -1469,12 +1566,29 @@ inline unsigned attn_errors(Model& m) { return attn_errors_at(m, nullptr); }
 // new sequence: clear every layer's attention caches (load time / between requests, not inside a capture)
 inline void reset(Model& m, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    if(m.resid4 || m.flash_draft) {
+        if(m.kda_st.S) kda::reset(m.kda_st,0,st);
+        for(Layer& y:m.layers) if(!y.kda) G6RT_CK(g6_attn_bind_reset(&y.ab,st));
+        return;
+    }
+#endif
     for (Layer& y : m.layers) G6RT_CK(g6_attn_bind_reset(&y.ab, st));
 }
 inline void launch_step_in(Model& m, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    if(m.resid4 || m.flash_draft) {
+#ifdef DEC_S2
+        if(m.s2on) die("Flash mHC: S2 state slots are not integrated yet");
+#endif
+    }
+    k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
+                                         m.steering_scale, m.srow, m.cells, m.shared, m.nl, m.row_slot, m.kda_src});
+#else
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
                                          m.steering_scale, m.srow, m.cells, m.shared, m.nl});
+#endif
 #ifdef DEC_S2
     if (m.s2on) s2_launch_cells(m, st);
 #endif
@@ -1491,6 +1605,14 @@ inline void launch_step_out(Model& m, int M, cudaStream_t st)
 inline void launch_head_local(Model& m, int M, cudaStream_t st)
 {
     const bind::Head& H = head_for(m, M);
+#if G6_MODEL_FLASH
+    if(m.resid4 || m.flash_draft) {
+        if(m.flash_draft) {
+            const bool f16_in = H.lm_head.codec == bind::MXFP8 || H.lm_head.codec == bind::FP8R;
+            flash_mhc::fragments(m.xn,M,HID,f16_in?m.sc.xf_head:nullptr,f16_in?nullptr:m.sc.xf_head,st);
+        }
+    } else
+#endif
     bind::launch(H.xf_h, st);
     bind::launch(H.lm_head, st);
     if (m.rs) glue::k_head_local_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
@@ -1516,8 +1638,12 @@ inline unsigned topp_misses(const Model& m)
 // the whole step of one rank in stream order (real fabric: the peers' partials arrive while this rank works).
 // DEC_GSPLIT (G6_DEC_SPLIT=ls): part 0 = step_in, embed, layers [0, ls); part 1 = layers [ls, nl), head, step_out; the two
 // parts are captured as two graphs and launched back to back on one stream (part -1 = the whole step, as before)
-inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part = -1, int ls = 0)
+inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part = -1, int ls = 0,
+                        const std::function<void(int,int)>& residual_copy = {})
 {
+#if G6_MODEL_FLASH
+    if(m.resid4) { launch_step_flash(m,M,context,st,part,ls,residual_copy); return; }
+#endif
     EvProf& ep = ev_prof();
     if (part != 1) ep.n = 0;
     ep.rec = ep.every > 0;
@@ -1527,6 +1653,7 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
         dmark(DP_OTHER, st);
         launch_step_in(m, st);
         launch_embed(m, M, st);
+        if (residual_copy) residual_copy(0, M);
         dmark(DP_STEP, st);
     }
     const int l0 = part == 1 ? ls : 0, l1 = part == 0 ? ls : m.nl;
@@ -1534,8 +1661,10 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
     {
         launch_attn_block(m, i, M, context, st);
         launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st);
+        if (residual_copy) residual_copy(2 * i + 1, M);
         launch_mlp_block(m, i, M, st);
         launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st);
+        if (residual_copy) residual_copy(2 * i + 2, M);
         if (m.dfl_tap) m.dfl_tap(m, i, M, st);
     }
     if (part != 0)
@@ -1565,6 +1694,10 @@ struct Draft
     Model d;                          // layers = {78}; final_norm = L078.shared_head_norm
     const __half* main_x = nullptr;   // the target model's x (final-norm output rows of its last step)
     const __nv_bfloat16 *enorm = nullptr, *hnorm = nullptr;
+    #if G6_MODEL_FLASH
+    const float* main_xn = nullptr;
+    float* hprevn = nullptr;
+    #endif
     __half* hprev = nullptr;          // [6144] shared_head_norm output of the last row of the previous draft step
 };
 
@@ -1632,19 +1765,34 @@ __global__ void __launch_bounds__(256) k_mtp_keep(const __half* src, __half* dst
 inline void build_draft(Draft& D, const Model& main, const Find& find, int capacity, const g6::FabricDev& f, u64* stepp,
                         cudaStream_t st, int max_rows = MX)
 {
-    if (!find("L078.eh.mx.gv").p) die("pack has no L078.eh.mx.gv (MTP)");
+    #if !G6_MODEL_FLASH
+    if (!find(G6_MTP_L ".eh.mx.gv").p) die("pack has no " G6_MTP_L ".eh.mx.gv (MTP)");
+    #endif
     D.d.wide = main.wide;
     D.d.eh_in = dmalloc<__half>((size_t)MX * 2 * HID);
     D.d.eh_out = dmalloc<__half>((size_t)MX * HID);
-    build(D.d, main.rank, std::vector<int>{78}, find, capacity, f, stepp, st, max_rows);
+    build(D.d, main.rank, std::vector<int>{geom::MTP_LAYER}, find, capacity, f, stepp, st, max_rows);
     // The draft has no CP binding, but its graph indices must use the target context buckets.
     D.d.nbk = main.nbk;
     std::copy(main.bk, main.bk + main.nbk, D.d.bk);
-    D.d.final_norm = (const __nv_bfloat16*)need(find, "L078.shared_head_norm");
-    D.enorm = (const __nv_bfloat16*)need(find, "L078.enorm");
-    D.hnorm = (const __nv_bfloat16*)need(find, "L078.hnorm");
+    D.d.final_norm = (const __nv_bfloat16*)need(find, G6_MTP_L ".shared_head_norm");
+    D.enorm = (const __nv_bfloat16*)need(find, G6_MTP_L ".enorm");
+    D.hnorm = (const __nv_bfloat16*)need(find, G6_MTP_L ".hnorm");
     D.hprev = dmalloc<__half>(HID);
     D.main_x = main.x;
+#if G6_MODEL_FLASH
+    D.main_xn = main.xn;
+    D.hprevn = dmalloc<float>(HID);
+    D.d.mtp_cat = dmalloc<float>((size_t)MX*2*HID);
+    const auto eh=find(G6_MTP_L ".eh"), ehmx=find(G6_MTP_L ".eh.mx.gv");
+    if(eh.p && eh.bf16 && eh.nd==2 && eh.shape[0]==HID && eh.shape[1]==2*HID) D.d.mtp_eh=(const uint16_t*)eh.p;
+    else if(ehmx.p) {
+        D.d.mtp_cat_f=dmalloc<u32>((size_t)(MX+7)/8*2*HID*4);
+        if(const char* e=bind::make_gv(as_bind(ehmx),bind::MXFP8,2,16,MX,D.d.mtp_cat_f,D.d.resid,gv::O_F32,D.d.mtp_eh_mx)) die(e);
+        if(D.d.mtp_eh_mx.K!=2*HID || D.d.mtp_eh_mx.O!=HID) die("Flash MTP eh.mx.gv must be [HID/16][2*HID/32][528]");
+    }
+    else die("Flash MTP eh must be BF16 [HID,2*HID] or MXFP8 records (eh.mx.gv)");
+#endif
 }
 
 // G6_DRAFT_HEAD_I4=1 (default 0; needs --mtp): the MTP draft's head GEMV reads INT4 g32 records of this rank's vocab slice,
@@ -1718,6 +1866,21 @@ inline int s2_sessions(const Model& m);
 inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int qph = -1)
 {
     Model& d = D.d;
+#if G6_MODEL_FLASH
+    #ifdef DEC_S2
+    if(d.s2on) die("Flash MTP currently supports single-session decode only");
+    #endif
+    flash_mtp::input(d.tok,d.pos,d.emb,D.enorm,D.hnorm,chain?D.hprevn:D.main_xn,d.mtp_cat,M,st);
+    if(d.mtp_eh) flash_mlp::k_linear<<<dim3((HID+7)/8,M),256,0,st>>>(d.mtp_cat,d.mtp_eh,d.resid,2*HID,HID);
+    else {
+        flash_mhc::fragments(d.mtp_cat,M,2*HID,d.mtp_cat_f,nullptr,st);
+        bind::Gv g=d.mtp_eh_mx; g.M=M;
+        bind::launch(g,st);
+    }
+    flash_mtp::norm(d.resid,d.layers[0].attn_norm,d.xn,d.x,M,st);
+    flash_mhc::fragments(d.xn,M,HID,d.sc.xf_x,d.sc.xb_x,st);
+    return;
+#endif
     const bind::Head& H = head_for(d, M);
     if (!H.eh.on) die("the head binder has no eh_proj");
     QsPh P{qph};
@@ -1740,6 +1903,9 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
 }
 inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    G6RT_CK(cudaMemcpyAsync(D.hprevn,D.d.xn+(size_t)(M-1)*HID,HID*sizeof(float),cudaMemcpyDeviceToDevice,st));
+#endif
 #ifdef DEC_S2
     if (D.d.s2on) { s2_draft_keep(D, st); return; }
 #endif
@@ -1983,6 +2149,18 @@ struct DraftOut
     int tok;
     float lp;
 };
+#if G6_MODEL_FLASH
+// rows of a main step that the MTP loop commits (G6_RESID_DUMP / G6_LOGIT_DUMP keep only these, so the dump rows are the
+// committed positions in order): every row of a prompt step; of a verify step rows 0..a, a = the accepted drafts (the
+// equality rule of mtp_sequence; on = --mtp with coupled acceptance)
+inline int mtp_rows(const StepIn& si, const StepOut& so, int n_prompt, bool on)
+{
+    if (!on || si.pos[0] < n_prompt) return si.M;
+    int a = 0;
+    while (a < si.M - 1 && si.tok[a + 1] == so.tok[a]) ++a;
+    return a + 1;
+}
+#endif
 template <class RunMain, class RunDraft>
 inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& draft_step, RunMain&& run_main, RunDraft&& run_draft,
                                      MtpStats& S, int& steps, const std::function<bool(const int*, int, int)>& emit = {},
@@ -1999,6 +2177,9 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
     std::vector<int> d(K + 1, 0);                // d[j]: draft of position base + j
     std::vector<float> dl(K + 1, NAN);           // dl[j]: d[j]'s log-probability under the MTP head
     int nd = K;                                  // drafts made this round
+#if G6_MODEL_FLASH
+    int kcur = 0;                                // KDA ring: the slot with the committed state (prompt steps: slot 0)
+#endif
     const float dtemp = p.rs ? 0.f : p.inv_temp; // rejection sampling: greedy drafts (they must not use the target's noise)
     auto chain_steps = [&](int base) {           // fills d[2..nd] from d[1]
         double ms = 0;
@@ -2048,13 +2229,22 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
             si.steering_scale[r] = p.steering_scale;
+#if G6_MODEL_FLASH
+            si.kslot[r] = r;                     // slot r ends with the state after rows 0..r (Model::kda_ring > k)
+#endif
         }
+#if G6_MODEL_FLASH
+        si.kda_src = kcur;
+#endif
         si.context = base + k + 1;
         double tv = 0, tf = 0;
         const StepOut so = run_main(si, s, tv);
         int a = 0;
         while (a < k && d[a + 1] == so.tok[a]) ++a;
         for (int r = 0; r <= a; ++r) tokens.push_back(so.tok[r]);
+#if G6_MODEL_FLASH
+        kcur = a;
+#endif
         if (ad) sl->observe(k, a, dl.data(), pe);
         if (ad) printf("round %ld base %d accepted %d of %d (drafted %d, expected %.2f tokens, hash %08x)\n", S.rounds, base, a, k, nd, pe,
                        SpecLen::hash(dl.data(), nd, k));
@@ -2080,6 +2270,11 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
     steps += s;
     return std::vector<int>(tokens.begin() + n, tokens.begin() + n + p.n_gen);
 }
+
+#if G6_MODEL_FLASH
+#include "flash_dsa.cuh"
+#include "flash_step.cuh"
+#endif
 
 }   // namespace g6rt
 #ifdef DEC_S2

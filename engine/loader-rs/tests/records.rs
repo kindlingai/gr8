@@ -16,7 +16,12 @@ fn u16s(b: Vec<u8>) -> Vec<u16> {
 fn decode_records_match_g6ref() {
     let f = fx();
     let r = |n: &str| f.read_all(n).unwrap();
-    assert_eq!(records::mxfp8_record(&r("mx.codes"), &r("mx.scales"), 64), r("mx.record"));
+    let mx_rec = r("mx.record");
+    assert_eq!(records::mxfp8_record(&r("mx.codes"), &r("mx.scales"), 64), mx_rec);
+    let fp8_rec = records::fp8_record(&r("mx.codes"), 64);
+    for (g, grp) in mx_rec.chunks_exact(528).enumerate() {
+        assert_eq!(&fp8_rec[g * 512..(g + 1) * 512], &grp[..512]);
+    }
     assert_eq!(records::bf16_record(&u16s(r("bf.w")), 48), r("bf.record"));
     assert_eq!(records::rt_record(&r("rt.q"), &u16s(r("rt.s")), 64), r("rt.record"));
     let (gs, us, ds) = (u16s(r("ex.gs")), u16s(r("ex.us")), u16s(r("ex.ds")));

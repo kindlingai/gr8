@@ -142,10 +142,10 @@ impl Loader<'_> {
                         .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
                     g.used(y - x);
                 }
-                Op::Item128 => {
+                Op::Item128 { hidden } => {
                     let n = s.nbytes as usize;
                     self.read(s.file, s.file_off, half.slice(n))?;
-                    plan::item128_to_g6(half.slice(n), perm.slice(n));
+                    plan::item128_to_g6_geometry(half.slice(n), perm.slice(n), hidden);
                     buf[(x - a) as usize..(y - a) as usize]
                         .copy_from_slice(&perm.slice(n)[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
                     read += s.nbytes;
@@ -380,11 +380,11 @@ pub fn read_range(plan: &Plan, a: u64, buf: &mut [u8]) -> Result<(), String> {
             Op::Copy => read_exact_at(&file()?, dst, s.file_off + lo as u64).map_err(|e| format!("{}: {e}", plan.files[s.file]))?,
             Op::Mem => dst.copy_from_slice(&plan.mems[s.file][lo..hi]),
             Op::Gen => dst.copy_from_slice(&plan.gens[s.file].compute()?[lo..hi]),
-            Op::Item128 => {
+            Op::Item128 { hidden } => {
                 let n = s.nbytes as usize;
                 let (mut half, mut perm) = (vec![0u8; n], vec![0u8; n]);
                 read_exact_at(&file()?, &mut half, s.file_off).map_err(|e| format!("{}: {e}", plan.files[s.file]))?;
-                plan::item128_to_g6(&half, &mut perm);
+                plan::item128_to_g6_geometry(&half, &mut perm, hidden);
                 dst.copy_from_slice(&perm[lo..hi]);
             }
         }

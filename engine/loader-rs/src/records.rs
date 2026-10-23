@@ -4,7 +4,7 @@
 //!   MXFP8: the D2 equation of tools/convert/mxfp8.py, one E8M0 scale per 32 inputs, on fp32 inputs;
 //!   int4 g32: symmetric, scale = fp16(amax / 7) per 32 inputs, code = clamp(rint(x / scale), -8, 7) + 8.
 
-use crate::exlr8::e4m3_round;
+use crate::exlr8::{e4m3_round, pow2_f64};
 
 /// f32 -> f16 bits, round to nearest even (subnormals kept, overflow to inf).
 pub fn f16_bits(x: f32) -> u16 {
@@ -13,11 +13,11 @@ pub fn f16_bits(x: f32) -> u16 {
     if a.is_nan() {
         return s | 0x7e00;
     }
-    if a < f64::powi(2.0, -14) {
-        return s | (a * f64::powi(2.0, 24)).round_ties_even() as u16;   // 0x400 rounds up into the first normal
+    if a < pow2_f64(-14) {
+        return s | (a * pow2_f64(24)).round_ties_even() as u16;   // 0x400 rounds up into the first normal
     }
     let e = ((a.to_bits() >> 52) & 0x7ff) as i32 - 1023;
-    let m = (a / f64::powi(2.0, e) * 1024.0).round_ties_even() as u32;   // 1024..=2048
+    let m = (a / pow2_f64(e) * 1024.0).round_ties_even() as u32;   // 1024..=2048
     let (e, m) = if m == 2048 { (e + 1, 1024) } else { (e, m) };
     if e > 15 {
         return s | 0x7c00;
@@ -29,11 +29,11 @@ pub fn f16_bits(x: f32) -> u16 {
 pub fn e4m3_byte(v: f32) -> u8 {
     let s = if v.is_sign_negative() { 0x80u8 } else { 0 };
     let a = v.abs() as f64;
-    if a < f64::powi(2.0, -6) {
+    if a < pow2_f64(-6) {
         return s | (a * 512.0) as u8;
     }
     let e = ((a.to_bits() >> 52) & 0x7ff) as i32 - 1023;
-    let m = (a / f64::powi(2.0, e) * 8.0) as u8 - 8;
+    let m = (a / pow2_f64(e) * 8.0) as u8 - 8;
     s | (((e + 7) as u8) << 3) | m
 }
 
@@ -52,7 +52,7 @@ pub fn mxfp8_quantize(w: &[f32], k: usize) -> (Vec<u8>, Vec<u8>) {
         let ceil = if frac == 0 { e } else { e + 1 };
         let s = (ceil + 127).clamp(0, 254);
         scales[g] = s as u8;
-        let mul = f64::powi(2.0, 127 - s);
+        let mul = pow2_f64(127 - s);
         for (o, &v) in c.iter_mut().zip(x) {
             *o = e4m3_byte(e4m3_round(((v as f64) * mul) as f32));
         }
@@ -85,17 +85,26 @@ pub fn int4_quantize(w: &[f32], k: usize) -> (Vec<u8>, Vec<u16>) {
 
 /// The 32 lanes' (row, k) pairs of a 16x16 tile in the GEMV record order: lane l = (r, c), r = l / 4, c = l % 4,
 /// eight elements (r, 2c), (r, 2c+1), (r+8, 2c), (r+8, 2c+1), (r, 2c+8), (r, 2c+9), (r+8, 2c+8), (r+8, 2c+9).
-fn gv_order() -> [(usize, usize); 256] {
+const GV_ORDER: [(usize, usize); 256] = {
     let mut o = [(0, 0); 256];
-    for l in 0..32 {
+    let mut l = 0;
+    while l < 32 {
         let (r, c) = (l / 4, l % 4);
         let e = [(r, 2 * c), (r, 2 * c + 1), (r + 8, 2 * c), (r + 8, 2 * c + 1),
                  (r, 2 * c + 8), (r, 2 * c + 9), (r + 8, 2 * c + 8), (r + 8, 2 * c + 9)];
-        for (i, p) in e.iter().enumerate() {
-            o[l * 8 + i] = *p;
+        let mut i = 0;
+        while i < 8 {
+            o[l * 8 + i] = e[i];
+            i += 1;
         }
+        l += 1;
     }
     o
+};
+
+#[inline(always)]
+fn gv_order() -> &'static [(usize, usize); 256] {
+    &GV_ORDER
 }
 
 /// MXFP8 decode record: codes [16T][K], scales [16T][K/32] -> [T][K/32][528] (two 16x16 tiles in lane order, then
@@ -117,6 +126,27 @@ pub fn mxfp8_record(codes: &[u8], scales: &[u8], k: usize) -> Vec<u8> {
             for i in 0..8 {
                 rec[512 + 2 * i] = scales[(16 * t + i) * ng + g];
                 rec[512 + 2 * i + 1] = scales[(16 * t + i + 8) * ng + g];
+            }
+        }
+    }
+    out
+}
+
+/// FP8 decode record without block scales (paired with a per-row f32 scale vector): codes [16T][K] -> [T][K/32][512]
+/// (two 16x16 tiles in lane order).
+pub fn fp8_record(codes: &[u8], k: usize) -> Vec<u8> {
+    let n = codes.len() / k;
+    assert!(n.is_multiple_of(16) && k.is_multiple_of(32));
+    let ord = gv_order();
+    let ng = k / 32;
+    let mut out = vec![0u8; n / 16 * ng * 512];
+    for t in 0..n / 16 {
+        for g in 0..ng {
+            let rec = &mut out[(t * ng + g) * 512..][..512];
+            for h in 0..2 {
+                for (i, &(r, c)) in ord.iter().enumerate() {
+                    rec[h * 256 + i] = codes[(16 * t + r) * k + 32 * g + 16 * h + c];
+                }
             }
         }
     }

@@ -10,9 +10,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 
 const ALIGN: u64 = 4096;
-pub(crate) const HALF_PER_BIT: u64 = 98304;
 pub(crate) const NH: usize = 16;
-const SHARED: usize = 256;
 const XF_EXLR8: &str = "exlr8-e4m3";
 
 /// A manifest entry (tools/convert/pack.py): dtype is the manifest label (u8, f16, i64, ...).
@@ -94,7 +92,8 @@ struct LayerSlice {
     offset: Vec<i64>,   // [M][3]
     chan: Vec<u8>,      // [M][3][128] f16
     block: Vec<u8>,     // [E][3][48] f16
-    signs: Vec<u8>,     // [2][6144] i8
+    signs: Vec<u8>,     // [2][hidden] i8
+    hidden: usize,
 }
 
 fn layer_slice(s: &Slice, l: usize) -> Result<Option<LayerSlice>, String> {
@@ -113,6 +112,7 @@ fn layer_slice(s: &Slice, l: usize) -> Result<Option<LayerSlice>, String> {
         chan: s.get(&format!("{p}chan"))?.0,
         block: s.get(&format!("{p}block"))?.0,
         signs: s.get(&format!("{p}signs"))?.0,
+        hidden: s.get(&format!("{p}signs"))?.1.get(1).copied().ok_or("bad signs shape")?,
     }))
 }
 
@@ -323,12 +323,30 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
         }
     }
     let nroute = w.down.len();
+    let shared = nroute;
+    let hidden = ls.values().next().ok_or("no layer slices")?.hidden;
+    if ![4096, 6144].contains(&hidden) || (hidden == 4096 && nroute != 288) || w.gate.len() != nroute || w.up.len() != nroute {
+        return Err(format!("layer {l}: invalid geometry or widths"));
+    }
+    let blocks = hidden / 128;
+    for s in ls.values() {
+        let rows = s.row.len();
+        if s.hidden != hidden || s.signs.len() != 2 * hidden
+            || s.block.len() < nroute * 3 * blocks * 2
+            || s.offset.len() != rows * 3 || s.chan.len() != rows * 3 * 256 {
+            return Err(format!("layer {l}: inconsistent slice shapes"));
+        }
+    }
+    if w.down.iter().chain(w.gate.iter().flatten()).chain(w.up.iter().flatten()).any(|k| !(2..=4).contains(k))
+        || (w.sdown > 0 && (!(2..=4).contains(&w.sdown) || w.sgate.iter().chain(&w.sup).any(|k| !(2..=4).contains(k)))) {
+        return Err(format!("layer {l}: invalid width"));
+    }
     let mut experts: Vec<usize> = (0..nroute).collect();
     if w.sdown > 0 {
-        experts.push(SHARED);
+        experts.push(shared);
     }
     let of = |e: usize| -> ([u8; NH], [u8; NH], u8) {
-        if e == SHARED { (w.sgate, w.sup, w.sdown) } else { (w.gate[e], w.up[e], w.down[e]) }
+        if e == shared { (w.sgate, w.sup, w.sdown) } else { (w.gate[e], w.up[e], w.down[e]) }
     };
     let own: Vec<Vec<usize>> = experts.iter().map(|&e| (0..NH).filter(|&h| (16 * e + h + l) % nr == rank).collect()).collect();
     let nblk: usize = own.iter().map(Vec::len).sum();
@@ -336,22 +354,22 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
     let get = |k: u8| ls.get(&k).ok_or(format!("layer {l}: no index slice at K{k}"));
     let row_of = |s: &LayerSlice, e: usize, h: usize| s.row.get(&(e, h)).copied().ok_or(format!("layer {l}: expert {e} half {h} not in the slice"));
     // block row of expert e: routed e, the shared expert after the routed ones
-    let brow = |e: usize| if e == SHARED { nroute } else { e };
-    let hb = |k: u8| HALF_PER_BIT * k as u64;
+    let brow = |e: usize| if e == shared { nroute } else { e };
+    let hb = |k: u8| (hidden as u64 * 16) * k as u64;
     let ne = experts.len();
     let mut table = vec![[0i64; 6]; ne];
     let mut kmix = vec![0i64; ne];
-    let nb = if bs { 48 } else { 6144 };
+    let nb = if bs { blocks } else { hidden };
     let mut v1 = vec![0u8; nblk * 2 * nb * 2];
     let mut v2 = vec![0u8; nblk * 3 * 128 * 2];
     let mut v3 = vec![0u8; nblk * nb * 2];
-    let hidden = |s: &LayerSlice, e: usize, proj: usize, dst: &mut [u8]| {
-        let blk = &s.block[(brow(e) * 3 + proj) * 96..(brow(e) * 3 + proj + 1) * 96];
+    let put_hidden = |s: &LayerSlice, e: usize, proj: usize, dst: &mut [u8]| {
+        let blk = &s.block[(brow(e) * 3 + proj) * blocks * 2..(brow(e) * 3 + proj + 1) * blocks * 2];
         if bs {
             dst.copy_from_slice(blk);
         } else {
-            let sign = &s.signs[if proj == 2 { 6144 } else { 0 }..][..6144];
-            for c in 0..6144 {
+            let sign = &s.signs[if proj == 2 { hidden } else { 0 }..][..hidden];
+            for c in 0..hidden {
                 let v = f16_signed([blk[c / 128 * 2], blk[c / 128 * 2 + 1]], sign[c] as i8);
                 dst[c * 2..c * 2 + 2].copy_from_slice(&v);
             }
@@ -373,7 +391,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
                 let f = b.file(wfile(l, k));
                 b.seg(fc1 + off, hb(k), Op::Copy, f, s.offset[j * 3 + proj] as u64);
                 off += hb(k);
-                hidden(s, e, proj, &mut v1[(row * 2 + proj) * nb * 2..(row * 2 + proj + 1) * nb * 2]);
+                put_hidden(s, e, proj, &mut v1[(row * 2 + proj) * nb * 2..(row * 2 + proj + 1) * nb * 2]);
                 v2[(row * 3 + proj) * 256..(row * 3 + proj + 1) * 256].copy_from_slice(&s.chan[(j * 3 + proj) * 256..(j * 3 + proj + 1) * 256]);
             }
             row += 1;
@@ -390,10 +408,10 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
             let s = get(dk)?;
             let j = row_of(s, e, h)?;
             let f = b.file(wfile(l, dk));
-            b.seg(fc2 + off, hb(dk), Op::Item128, f, s.offset[j * 3 + 2] as u64);
+            b.seg(fc2 + off, hb(dk), Op::Item128 { hidden }, f, s.offset[j * 3 + 2] as u64);
             off += hb(dk);
             v2[(row * 3 + 2) * 256..(row * 3 + 3) * 256].copy_from_slice(&s.chan[(j * 3 + 2) * 256..(j * 3 + 3) * 256]);
-            hidden(s, e, 2, &mut v3[row * nb * 2..(row + 1) * nb * 2]);
+            put_hidden(s, e, 2, &mut v3[row * nb * 2..(row + 1) * nb * 2]);
             row += 1;
         }
     }
@@ -401,16 +419,16 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
     if bs {
         let s = ls.values().next().ok_or(format!("layer {l}: no index slice"))?;
         let sg: Vec<u8> = s.signs.iter().flat_map(|&x| if (x as i8) < 0 { [0x00, 0xBC] } else { [0x00, 0x3C] }).collect();
-        b.mem(format!("{p}.tr3.sg"), "f16", vec![2, 6144], sg);
-        b.mem(format!("{p}.tr3.v1b"), "f16", vec![n, 2, 48], v1);
+        b.mem(format!("{p}.tr3.sg"), "f16", vec![2, hidden as i64], sg);
+        b.mem(format!("{p}.tr3.v1b"), "f16", vec![n, 2, blocks as i64], v1);
     } else {
-        b.mem(format!("{p}.tr3.v1"), "f16", vec![n, 2, 6144], v1);
+        b.mem(format!("{p}.tr3.v1"), "f16", vec![n, 2, hidden as i64], v1);
     }
     b.mem(format!("{p}.tr3.v2"), "f16", vec![n, 3, 128], v2);
     if bs {
-        b.mem(format!("{p}.tr3.v3b"), "f16", vec![n, 48], v3);
+        b.mem(format!("{p}.tr3.v3b"), "f16", vec![n, blocks as i64], v3);
     } else {
-        b.mem(format!("{p}.tr3.v3"), "f16", vec![n, 6144], v3);
+        b.mem(format!("{p}.tr3.v3"), "f16", vec![n, hidden as i64], v3);
     }
     b.mem(format!("{p}.tr3.table"), "i64", vec![ne as i64, 6], table.iter().flatten().flat_map(|v| v.to_le_bytes()).collect());
     b.mem(format!("{p}.tr3.kmix"), "i64", vec![ne as i64], kmix.iter().flat_map(|v| v.to_le_bytes()).collect());

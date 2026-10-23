@@ -380,7 +380,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let tools = normalize_tools(body.get("tools"))?;
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     thinking::check_response_format(body.get("response_format"))?;
-    let th = thinking::resolve(body, &st.template.levels, st.thinking)?;
+    let th = st.template.resolve_thinking(body, st.thinking)?;
     let kw = build_template_kwargs(
         body.get("chat_template_kwargs"),
         body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
@@ -498,7 +498,12 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let rid = new_id("chatcmpl");
     let include_reasoning = body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
     let choice_value = cr.choice.as_value();
-    let parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
+    let mut parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
+    if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
+        if !think_open(&cr.prompt, start, end) {
+            parser = parser.content_first();
+        }
+    }
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
@@ -1089,7 +1094,7 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 ));
             }
             // the same effort and the same refusals as a chat request, so the counts agree
-            let th = thinking::resolve(&body, &st.template.levels, st.thinking)?;
+            let th = st.template.resolve_thinking(&body, st.thinking)?;
             let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
             let tools = normalize_tools(body.get("tools"))?;
             let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;

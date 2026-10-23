@@ -184,10 +184,10 @@ __device__ __forceinline__ void rt_fc1_cta(const uint8_t* gate, const uint8_t* u
     for (int t = 0; t < NT; ++t)
     {
         __half* a0 = act + (8 * t + 2 * c) * aw + chunk * 16 + r;
-        a0[0] = __float2half_rn(silu_f(alpha_g * ag[t][0]) * (alpha_u * au[t][0]));
-        a0[aw] = __float2half_rn(silu_f(alpha_g * ag[t][1]) * (alpha_u * au[t][1]));
-        a0[8] = __float2half_rn(silu_f(alpha_g * ag[t][2]) * (alpha_u * au[t][2]));
-        a0[aw + 8] = __float2half_rn(silu_f(alpha_g * ag[t][3]) * (alpha_u * au[t][3]));
+        a0[0] = __float2half_rn(swiglu_f(alpha_g * ag[t][0], alpha_u * au[t][0]));
+        a0[aw] = __float2half_rn(swiglu_f(alpha_g * ag[t][1], alpha_u * au[t][1]));
+        a0[8] = __float2half_rn(swiglu_f(alpha_g * ag[t][2], alpha_u * au[t][2]));
+        a0[aw + 8] = __float2half_rn(swiglu_f(alpha_g * ag[t][3], alpha_u * au[t][3]));
     }
 }
 

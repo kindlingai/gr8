@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[path = "flash.rs"]
+mod flash;
+
 const H: usize = 6144;
 const L_MTP: usize = 78;
 const VOCAB: usize = 154880;
@@ -165,6 +168,27 @@ impl Planner {
             Ok(v)
         })));
         self.b.segs.push(crate::plan::Seg { pack_off: a, nbytes: span, op: Op::Gen, file_off: 0, file: gi });
+    }
+
+    /// A single manifest tensor split into contiguous `Op::Gen` segments so loader worker threads compute stripes in parallel.
+    fn gen_striped(
+        &mut self,
+        what: &str,
+        name: String,
+        dtype: &'static str,
+        shape: Vec<i64>,
+        stripes: Vec<(u64, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>)>,
+    ) {
+        let total = nbytes(dtype, &shape);
+        let base = self.b.begin(name, dtype, shape, total, None);
+        let mut off = 0u64;
+        for (span, make) in stripes {
+            let gi = self.b.gens.len();
+            self.b.gens.push(Gen::new(what.to_string(), span, make));
+            self.b.segs.push(crate::plan::Seg { pack_off: base + off, nbytes: span, op: Op::Gen, file_off: 0, file: gi });
+            off += span;
+        }
+        assert_eq!(off, total);
     }
 
     /// A vector (norm, bias) as stored, under its gr8 name.
@@ -370,9 +394,9 @@ impl Planner {
 
     /// A trellis matrix as the dense trellis kernels read it (engine/kernels/dtr.cuh layer_mats): the rank's entries of
     /// M.trellis as stored, `ch` on the sharded side (128-channel entries), and suh / svh sliced on that side.
-    fn trellis(&mut self, l: usize, what: &'static str, p: &str, m: &Matrix, ch: Range<usize>) -> Result<(), String> {
+    fn trellis(&mut self, l: usize, what: &str, p: &str, m: &Matrix, ch: Range<usize>) -> Result<(), String> {
         let r = m.rec;
-        self.note(l, Form { what: if what.starts_with("dense.") { "dense MLP" } else { what }, src: fmt_name(m),
+        self.note(l, Form { what: match what { "q_b" => "q_b", "o_proj" => "o_proj", w if w.starts_with("dense.") => "dense MLP", _ => "KDA projection" }, src: fmt_name(m),
                             form: "trellis entries (dense trellis kernels)", exact: EXACT });
         let ents = ch.start / 128..ch.end / 128;
         let (off, eb) = m.trellis_entries(&ents)?;
@@ -527,10 +551,17 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(8);
     let mut p = Planner { b: Builder::new(), shard, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis };
-    p.vocab(dense_dir)?;
+    // the release's files name the model (their metadata); the width manifest has one format for every model
+    let model = flash::model_meta(dense_dir)?;
+    let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
+    if model.is_some() && !is_flash { return Err(format!("{dense_dir}: model metadata of an unsupported model")); }
+    let model = model.unwrap_or(Json::Null);
+    if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
+    let last = if is_flash { 45 } else { L_MTP };
+    if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     let mut moe = 0;
-    for l in 0..=L_MTP {
-        p.layer(l, dense_dir)?;
+    for l in 0..=last {
+        if is_flash { flash::layer(&mut p, l, dense_dir, &model)?; } else { p.layer(l, dense_dir)?; }
         if let Some(w) = v2plan::widths(&man, l)? {
             v2plan::v2_layer(&mut p.b, l, &w, &slices, &wfile, nr, rank)?;
             moe += 1;

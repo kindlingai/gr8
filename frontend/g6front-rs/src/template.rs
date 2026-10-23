@@ -35,6 +35,8 @@ pub struct ChatTemplate {
     env: Environment<'static>,
     special: Vec<(&'static str, Value)>,
     supports_developer: bool,
+    /// Flash-only explicit empty think block; never changes the full-GLM template.
+    pub flash_thinking_off: bool,
     /// the reasoning efforts the template names (`thinking::template_levels`), highest first
     pub levels: Vec<&'static str>,
 }
@@ -46,7 +48,12 @@ impl ChatTemplate {
     pub fn load(dir: &Path, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
         let p = dir.join("chat_template.jinja");
         let source = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        Self::from_source(source, eos_token, pad_token)
+        let mut template = Self::from_source(source, eos_token, pad_token)?;
+        let config = std::fs::read_to_string(dir.join("config.json")).ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        template.flash_thinking_off = config.as_ref().and_then(|c| c.get("model_type"))
+            .and_then(Value::as_str) == Some("glm5_next");
+        Ok(template)
     }
 
     pub fn from_source(source: String, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
@@ -69,8 +76,24 @@ impl ChatTemplate {
             env,
             special: vec![("eos_token", eos_token), ("pad_token", pad_token)],
             supports_developer,
+            flash_thinking_off: false,
             levels,
         })
+    }
+
+    pub fn resolve_thinking(&self, body: &Map<String, Value>, defaults: crate::thinking::Defaults)
+        -> Result<crate::thinking::Thinking, crate::api::ApiError>
+    {
+        if self.flash_thinking_off && body.get("chat_template_kwargs")
+            .and_then(|k| k.get("enable_thinking")) == Some(&Value::Bool(false))
+        {
+            let mut checked = body.clone();
+            checked.get_mut("chat_template_kwargs").and_then(Value::as_object_mut)
+                .unwrap().remove("enable_thinking");
+            crate::thinking::resolve(&checked, &self.levels, defaults)
+        } else {
+            crate::thinking::resolve(body, &self.levels, defaults)
+        }
     }
 
     /// `kw` is the output of `build_template_kwargs()`.
@@ -87,6 +110,8 @@ impl ChatTemplate {
         if continue_final_message && add_generation_prompt {
             return Err("Cannot set both `continue_final_message` and `add_generation_prompt` to True.".into());
         }
+        let close_think = self.flash_thinking_off && add_generation_prompt
+            && kw.get("enable_thinking") == Some(&Value::Bool(false));
         let conv = normalize_messages(messages, self.supports_developer)?;
         // render(messages=, tools=, documents=, add_generation_prompt=, continue_final_message=, **special, **kw)
         let mut ctx = Map::new();
@@ -106,7 +131,7 @@ impl ChatTemplate {
         let ctx = Value::Object(ctx);
         let tmpl = self.env.get_template("chat").map_err(|e| TemplateError(e.to_string()))?;
         RAISED.with(|r| *r.borrow_mut() = None);
-        let text = match tmpl.render(J::from_serialize(&ctx)) {
+        let mut text = match tmpl.render(J::from_serialize(&ctx)) {
             Ok(t) => t,
             Err(e) => {
                 if let Some(msg) = RAISED.with(|r| r.borrow_mut().take()) {
@@ -115,6 +140,12 @@ impl ChatTemplate {
                 return Err(TemplateError(format!("chat template error: {}", e.detail().unwrap_or(&e.to_string()))));
             }
         };
+        if close_think {
+            if !text.ends_with("<think>") {
+                return Err("Flash thinking-off needs a template ending in <think>".into());
+            }
+            text.push_str("</think>\n\n");
+        }
         if continue_final_message {
             let conv = ctx.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
             return trim_to_final_message(text, conv);
@@ -637,6 +668,23 @@ pub fn build_template_kwargs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn flash_thinking_off_is_model_scoped() {
+        let source = "{% if add_generation_prompt %}<|assistant|><think>{% endif %}";
+        let mut t = ChatTemplate::from_source(source.into(), Value::Null, Value::Null).unwrap();
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": false}});
+        let body = body.as_object().unwrap();
+        assert!(t.resolve_thinking(body, Defaults::default()).is_err());
+        t.flash_thinking_off = true;
+        assert!(t.resolve_thinking(body, Defaults::default()).is_ok());
+        let kw = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
+        assert_eq!(t.render(body.get("messages"), None, kw).unwrap(), "<|assistant|><think></think>\n\n");
+        assert_eq!(t.render(body.get("messages"), None, Map::new()).unwrap(), "<|assistant|><think>");
+        t.flash_thinking_off = false;
+        let kw = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
+        assert_eq!(t.render(body.get("messages"), None, kw).unwrap(), "<|assistant|><think>");
+    }
     use crate::thinking::{resolve, Defaults};
     use serde_json::json;
 

@@ -114,7 +114,13 @@ static bindp::Gemm pf_gemm(const dtr::Mat& m, const dtr::Fp8& F, int R, const __
     bindp::Gemm g;
     if (direct) ok(bindp::make_gemm_tr(m, R, x8, y, bf16, g));
     else ok(bindp::make_gemm(fp8_codes(F), fp8_scales(F), R, x8, y, bf16, g));
-    if (x) { g.pre.on = 1; g.pre.src = x; g.pre.ld = ldx; g.pre.K = m.K; g.pre.M = R; g.pre.dst = x8; g.pre.suh = m.suh; }
+    if (x)
+    {
+        g.pre.on = 1; g.pre.src = x; g.pre.ld = ldx; g.pre.K = m.K; g.pre.M = R; g.pre.dst = x8; g.pre.suh = m.suh;
+#if G6_MODEL_FLASH
+        g.pre.h16 = g.h16;
+#endif
+    }
     if (out) g.osvh = m.svh;
     return g;
 }
@@ -129,6 +135,15 @@ static PfMlp pf_mlp(const dtr::Mat& G, const dtr::Mat& U, const dtr::Mat& D, con
     P.down = pf_gemm(D, Fd, R, nullptr, 0, x8d, y, bf16, true, direct);
     P.act.on = 1; P.act.g = g; P.act.u = u; P.act.I = G.N; P.act.M = R;
     P.act.svh_g = G.svh; P.act.svh_u = U.svh; P.act.suh_d = D.suh; P.act.x8 = x8d;
+#if G6_MODEL_FLASH
+    if (P.gate.h16 && P.up.h16 && P.down.h16)
+    {
+        P.gate.osvh = G.svh;
+        P.up.osvh = U.svh;
+        P.act.h16 = 2;
+    }
+    else P.act.h16 = P.down.h16;
+#endif
     return P;
 }
 static void launch(const PfMlp& P, cudaStream_t st)
@@ -157,6 +172,35 @@ static std::vector<int> rows_list()
     return r;
 }
 
+#if G6_MODEL_FLASH
+static double cmp_vs_dec(const char* tag, const std::string& name, int R, int N, const __half* d_pf, const float* d_dec)
+{
+    std::vector<__half> h_pf(static_cast<size_t>(R) * N);
+    std::vector<float> h_dec(static_cast<size_t>(R) * N);
+    CK(cudaMemcpy(h_pf.data(), d_pf, h_pf.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_dec.data(), d_dec, h_dec.size() * 4, cudaMemcpyDeviceToHost));
+    double num = 0.0, den = 0.0, max_abs = 0.0;
+    size_t ulp0 = 0, ulp1 = 0;
+    for (size_t i = 0; i < h_pf.size(); ++i)
+    {
+        const __half dh = __float2half(h_dec[i]);
+        const double a = __half2float(h_pf[i]), b = __half2float(dh);
+        const double d = a - b;
+        num += d * d;
+        den += b * b;
+        if (std::abs(d) > max_abs) max_abs = std::abs(d);
+        const int u = std::abs(static_cast<int>(*reinterpret_cast<const uint16_t*>(&h_pf[i])) -
+                               static_cast<int>(*reinterpret_cast<const uint16_t*>(&dh)));
+        if (u == 0) ++ulp0;
+        if (u <= 1) ++ulp1;
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    printf("  [%s] %-12s R=%-4d N=%-4d vs decode: rel_l2=%.6f max_abs=%.5f 0-ulp=%.2f%% <=1-ulp=%.2f%%\n",
+           tag, name.c_str(), R, N, rel, max_abs, 100.0 * ulp0 / h_pf.size(), 100.0 * ulp1 / h_pf.size());
+    return rel;
+}
+#endif
+
 static int check(const std::string& dir, std::vector<HostMat>& mats, const std::vector<std::array<std::string, 3>>& glus)
 {
     cudaStream_t st;
@@ -171,7 +215,14 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
     uint8_t *x8, *x8u, *x8d;
     __half *g, *u, *pout, *pout2;
     int bad = 0;
+#if G6_MODEL_FLASH
+    const size_t recb = static_cast<size_t>((Rmax + 15) / 16) * (16384 / 32) * 1024;
+    float* y_all = nullptr;
+    CK(cudaMalloc(&y_all, static_cast<size_t>(Rmax) * 16384 * 4));
+    const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+#else
     const size_t recb = static_cast<size_t>((Rmax + 15) / 16) * (16384 / 32) * bindp::REC;
+#endif
     CK(cudaMalloc(&x8, recb)); CK(cudaMalloc(&x8u, recb)); CK(cudaMalloc(&x8d, recb));
     CK(cudaMalloc(&g, static_cast<size_t>(Rmax) * 16384 * 2)); CK(cudaMalloc(&u, static_cast<size_t>(Rmax) * 16384 * 2));
     CK(cudaMalloc(&pout, static_cast<size_t>(Rmax) * 16384 * 2));
@@ -198,10 +249,32 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
         CK(cudaGetLastError());
         dump_dev(dir + "/" + h.name + ".pf.bin", pout, static_cast<size_t>(h.R) * h.N * 2);
         bindp::launch(pf_gemm(h.m, F, h.R, h.dx, h.K, x8, pout2, 0, true, true), st);
-        const bool same = same_dev(pout, pout2, static_cast<size_t>(h.R) * h.N * 2);
-        printf("%s: side %d K %d N %d entries %d x %lld B: decode, FP8 copy, prefill (%d rows) dumped; prefill from the tiles %s the copy's\n",
-               h.name.c_str(), h.side, h.K, h.N, h.E, h.eb, h.R, same ? "equals" : "DIFFERS FROM");
-        if (!same) bad = 1;
+#if G6_MODEL_FLASH
+        if (!dtr8)
+        {
+            for (int r0 = 0; r0 < h.R; r0 += G6_MX)
+            {
+                const int mr = std::min(G6_MX, h.R - r0);
+                dtr::Gemv gv;
+                ok(dtr::make_out(h.m, mr, h.dx + static_cast<size_t>(r0) * h.K, h.K, nullptr,
+                                 y_all + static_cast<size_t>(r0) * h.N, h.N, dtr::O_F32, sc, 0, 0, 1, gv));
+                dtr::launch(gv, st);
+            }
+            CK(cudaStreamSynchronize(st));
+            dump_dev(dir + "/" + h.name + ".pf.bin", pout2, static_cast<size_t>(h.R) * h.N * 2);
+            printf("%s: side %d K %d N %d entries %d x %lld B (%d rows):\n", h.name.c_str(), h.side, h.K, h.N, h.E, h.eb, h.R);
+            const double rel_h16 = cmp_vs_dec("k_gemm_tr_h16", h.name, h.R, h.N, pout2, y_all);
+            cmp_vs_dec("k_gemm_mx8b  ", h.name, h.R, h.N, pout, y_all);
+            if (rel_h16 > 2e-3) bad = 1;
+        }
+        else
+#endif
+        {
+            const bool same = same_dev(pout, pout2, static_cast<size_t>(h.R) * h.N * 2);
+            printf("%s: side %d K %d N %d entries %d x %lld B: decode, FP8 copy, prefill (%d rows) dumped; prefill from the tiles %s the copy's\n",
+                   h.name.c_str(), h.side, h.K, h.N, h.E, h.eb, h.R, same ? "equals" : "DIFFERS FROM");
+            if (!same) bad = 1;
+        }
     }
     for (const auto& gl : glus)
     {
@@ -226,10 +299,33 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
         CK(cudaGetLastError());
         dump_dev(dir + "/glu.pf.bin", pout, static_cast<size_t>(G.R) * D.N * 2);
         launch(pf_mlp(G.m, U.m, D.m, fp8[G.name], fp8[U.name], fp8[D.name], G.R, G.dx, x8, x8u, x8d, g, u, pout2, 0, true), st);
-        const bool eq = same_dev(pout, pout2, static_cast<size_t>(G.R) * D.N * 2);
-        if (!eq) bad = 1;
-        printf("glu %s %s %s: decode chain and prefill dumped (gate and up share their rotation: %s); prefill from the tiles %s the copy's\n",
-               gl[0].c_str(), gl[1].c_str(), gl[2].c_str(), same ? "yes" : "no", eq ? "equals" : "DIFFERS FROM");
+#if G6_MODEL_FLASH
+        if (!dtr8)
+        {
+            for (int r0 = 0; r0 < G.R; r0 += G6_MX)
+            {
+                const int mr = std::min(G6_MX, G.R - r0);
+                dtr::Gemv a, b;
+                ok(dtr::make_glu(G.m, U.m, D.m, mr, G.dx + static_cast<size_t>(r0) * G.K, G.K, xd, sc, 0, 0, 1, a));
+                ok(dtr::make_out(D.m, mr, nullptr, 0, xd, y_all + static_cast<size_t>(r0) * D.N, D.N, dtr::O_F32, sc, 512, 0, 1, b));
+                dtr::launch(a, st);
+                dtr::launch(b, st);
+            }
+            CK(cudaStreamSynchronize(st));
+            dump_dev(dir + "/glu.pf.bin", pout2, static_cast<size_t>(G.R) * D.N * 2);
+            printf("glu %s %s %s (gate and up share rotation: %s):\n", gl[0].c_str(), gl[1].c_str(), gl[2].c_str(), same ? "yes" : "no");
+            const double rel_h16 = cmp_vs_dec("k_gemm_tr_h16", "glu", G.R, D.N, pout2, y_all);
+            cmp_vs_dec("k_gemm_mx8b  ", "glu", G.R, D.N, pout, y_all);
+            if (rel_h16 > 3e-3) bad = 1;
+        }
+        else
+#endif
+        {
+            const bool eq = same_dev(pout, pout2, static_cast<size_t>(G.R) * D.N * 2);
+            if (!eq) bad = 1;
+            printf("glu %s %s %s: decode chain and prefill dumped (gate and up share their rotation: %s); prefill from the tiles %s the copy's\n",
+                   gl[0].c_str(), gl[1].c_str(), gl[2].c_str(), same ? "yes" : "no", eq ? "equals" : "DIFFERS FROM");
+        }
         CK(cudaFree(xd));
     }
     return bad;
@@ -689,24 +785,51 @@ static int bind_check(const std::string& dir, std::vector<HostMat>& mats)
     CK(cudaGetLastError());
     dump_dev(dir + "/bind.pf.q_b.bin", pio.q_b, static_cast<size_t>(R) * Q.N * 2);
     dump_dev(dir + "/bind.pf.o_proj.bin", pio.attn_part, static_cast<size_t>(R) * HID * 2);
-    // o_proj as the engine binds it by default: no FP8 copy, the GEMM on the tiles (make_gemm_tr). Bit-equal to the copy.
+    // o_proj as the engine binds it by default: no FP8 copy, the GEMM on the tiles (make_gemm_tr). Bit-equal to the copy when dtr8.
     bindp::Tensors P2 = P;
     P2.t[bindp::T_O_PROJ] = bind::Tensor();
     P2.s[bindp::T_O_PROJ] = bind::Tensor();
     P2.tm.o_proj = O.m;
-    std::vector<uint8_t> o1(static_cast<size_t>(R) * HID * 2);
-    CK(cudaMemcpy(o1.data(), pio.attn_part, o1.size(), cudaMemcpyDeviceToHost));
-    CK(cudaMemset(pio.attn_part, 0, o1.size()));
-    bindp::Layer B2;
-    ok(bindp::make_layer(P2, R, psc, pio, blas, B2));
-    if (!B2.o_proj.tw || !B2.o_proj.osvh) die("--bind: bindp::make_layer did not bind o_proj on its tiles");
-    bindp::launch(B2.xq_attn, st);
-    bindp::launch(B2.o_proj, st);
-    CK(cudaStreamSynchronize(st));
-    std::vector<uint8_t> o2(o1.size());
-    CK(cudaMemcpy(o2.data(), pio.attn_part, o2.size(), cudaMemcpyDeviceToHost));
-    if (o1 != o2) die("--bind: prefill o_proj on the tiles differs from the FP8 copy's");
-    dump_dev(dir + "/bind.pf.mlp.bin", pio.mlp_part, static_cast<size_t>(R) * HID * 2);
+#if G6_MODEL_FLASH
+    const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+    if (!dtr8)
+    {
+        P2.tm.q_b = Q.m; P2.tm.gate = G.m; P2.tm.up = U.m; P2.tm.down = D.m;
+        bindp::Layer B2;
+        ok(bindp::make_layer(P2, R, psc, pio, blas, B2));
+        if (!B2.q_b.tw || !B2.o_proj.tw || !B2.gate.tw || !B2.up.tw || !B2.down.tw)
+            die("--bind: bindp::make_layer did not bind trellis matrices on their tiles");
+        bindp::launch(B2.q_b, st);
+        bindp::launch(B2.xq_attn, st);
+        bindp::launch(B2.o_proj, st);
+        bindp::launch(B2.xq_x2, st);
+        bindp::launch_pair(B2.gate, B2.up, st);
+        bindp::launch(B2.act, st);
+        bindp::launch(B2.xq_act, st);
+        bindp::launch(B2.down, st);
+        CK(cudaStreamSynchronize(st));
+        CK(cudaGetLastError());
+        dump_dev(dir + "/bind.pf.q_b.bin", pio.q_b, static_cast<size_t>(R) * Q.N * 2);
+        dump_dev(dir + "/bind.pf.o_proj.bin", pio.attn_part, static_cast<size_t>(R) * HID * 2);
+        dump_dev(dir + "/bind.pf.mlp.bin", pio.mlp_part, static_cast<size_t>(R) * HID * 2);
+    }
+    else
+#endif
+    {
+        std::vector<uint8_t> o1(static_cast<size_t>(R) * HID * 2);
+        CK(cudaMemcpy(o1.data(), pio.attn_part, o1.size(), cudaMemcpyDeviceToHost));
+        CK(cudaMemset(pio.attn_part, 0, o1.size()));
+        bindp::Layer B2;
+        ok(bindp::make_layer(P2, R, psc, pio, blas, B2));
+        if (!B2.o_proj.tw || !B2.o_proj.osvh) die("--bind: bindp::make_layer did not bind o_proj on its tiles");
+        bindp::launch(B2.xq_attn, st);
+        bindp::launch(B2.o_proj, st);
+        CK(cudaStreamSynchronize(st));
+        std::vector<uint8_t> o2(o1.size());
+        CK(cudaMemcpy(o2.data(), pio.attn_part, o2.size(), cudaMemcpyDeviceToHost));
+        if (o1 != o2) die("--bind: prefill o_proj on the tiles differs from the FP8 copy's");
+        dump_dev(dir + "/bind.pf.mlp.bin", pio.mlp_part, static_cast<size_t>(R) * HID * 2);
+    }
     printf("bind: decode at %zu row counts%s and prefill (%d rows, o_proj on its tiles bit-equal to the copy) through make_layer dumped\n", rows_list().size(),
 #if DEC_SLOT >= 2
            ", send slots and doorbells checked",

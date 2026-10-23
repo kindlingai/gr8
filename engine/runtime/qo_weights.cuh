@@ -31,7 +31,7 @@ inline bool qo_check(const QoW& w)
 {
     auto is = [](const bind::Tensor& t, long long a, long long b) { return t.p && t.nd == 2 && t.shape[0] == a && t.shape[1] == b; };
     auto is3 = [](const G6AttnTensor& t, long long a, long long b, long long c) { return t.data && t.ndim == 3 && t.shape[0] == a && t.shape[1] == b && t.shape[2] == c; };
-    return is(w.qb_c, 16384, 2048) && is(w.qb_s, 16384, 64) && is(w.o_c, HID, 16384) && is(w.o_s, HID, 512) &&
+    return is(w.qb_c, 16384, geom::QA) && is(w.qb_s, 16384, geom::QA / 32) && is(w.o_c, HID, 16384) && is(w.o_s, HID, 512) &&
            is3(w.uk, 64, 192, 512) && is3(w.uv, 64, 256, 512);
 }
 inline bool qo_from_pack(const Find& find, int l, QoW& w)
@@ -57,7 +57,7 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
     auto alloc3 = [](G6AttnTensor& t, long long a, long long b, long long c) {
         t.data = dmalloc<char>((size_t)a * b * c * 2); t.ndim = 3; t.shape[0] = a; t.shape[1] = b; t.shape[2] = c;
     };
-    alloc2(w.qb_c, 16384, 2048, 1); alloc2(w.qb_s, 16384, 64, 1);
+    alloc2(w.qb_c, 16384, geom::QA, 1); alloc2(w.qb_s, 16384, geom::QA / 32, 1);
     alloc2(w.o_c, HID, 16384, 1); alloc2(w.o_s, HID, 512, 1);
     alloc3(w.uk, 64, 192, 512); alloc3(w.uv, 64, 256, 512);
     char n[80];
@@ -72,12 +72,12 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
         };
         const TensorRef qc = get("q_b.mx.codes"), qs = get("q_b.mx.scales"), oc = get("o_proj.mx.codes"), os = get("o_proj.mx.scales");
         const TensorRef uk = get("kv_b.uk"), uv = get("kv_b.uv");
-        if (qc.shape[0] != h * 256 || qc.shape[1] != 2048 || qs.shape[1] != 64 || oc.shape[0] != HID || oc.shape[1] != h * 256 ||
+        if (qc.shape[0] != h * 256 || qc.shape[1] != geom::QA || qs.shape[1] != geom::QA / 32 || oc.shape[0] != HID || oc.shape[1] != h * 256 ||
             os.shape[1] != h * 8 || uk.shape[0] != h || uv.shape[0] != h)
             die("qo_from_ranks: layer " + std::to_string(l) + " rank " + std::to_string(r) + " slice shapes are not head group " + std::to_string(g));
         char* qbc = (char*)w.qb_c.p; char* qbs = (char*)w.qb_s.p; char* oc_ = (char*)w.o_c.p; char* os_ = (char*)w.o_s.p;
-        G6RT_CK(cudaMemcpy(qbc + (size_t)h0 * 256 * 2048, qc.p, (size_t)h * 256 * 2048, cudaMemcpyDeviceToDevice));
-        G6RT_CK(cudaMemcpy(qbs + (size_t)h0 * 256 * 64, qs.p, (size_t)h * 256 * 64, cudaMemcpyDeviceToDevice));
+        G6RT_CK(cudaMemcpy(qbc + (size_t)h0 * 256 * geom::QA, qc.p, (size_t)h * 256 * geom::QA, cudaMemcpyDeviceToDevice));
+        G6RT_CK(cudaMemcpy(qbs + (size_t)h0 * 256 * (geom::QA / 32), qs.p, (size_t)h * 256 * (geom::QA / 32), cudaMemcpyDeviceToDevice));
         G6RT_CK(cudaMemcpy2D(oc_ + (size_t)h0 * 256, 16384, oc.p, (size_t)h * 256, (size_t)h * 256, HID, cudaMemcpyDeviceToDevice));
         G6RT_CK(cudaMemcpy2D(os_ + (size_t)h0 * 8, 512, os.p, (size_t)h * 8, (size_t)h * 8, HID, cudaMemcpyDeviceToDevice));
         G6RT_CK(cudaMemcpy((char*)w.uk.data + (size_t)h0 * 192 * 512 * 2, uk.p, (size_t)h * 192 * 512 * 2, cudaMemcpyDeviceToDevice));
@@ -122,7 +122,7 @@ inline bool qp_check(const QpW& w)
 {
     auto is = [](const bind::Tensor& t, long long a, long long b) { return t.p && t.nd == 2 && t.shape[0] == a && t.shape[1] == b; };
     auto is3 = [](const G6AttnTensor& t, long long a, long long b, long long c) { return t.data && t.ndim == 3 && t.shape[0] == a && t.shape[1] == b && t.shape[2] == c; };
-    return is(w.qb_c, 8192, 2048) && is(w.qb_s, 8192, 64) && is(w.o_c, HID, 8192) && is(w.o_s, HID, 256) &&
+    return is(w.qb_c, 8192, geom::QA) && is(w.qb_s, 8192, geom::QA / 32) && is(w.o_c, HID, 8192) && is(w.o_s, HID, 256) &&
            is3(w.uk, QP_HEADS, 192, 512) && is3(w.uv, QP_HEADS, 256, 512);
 }
 inline void qp_alloc2(bind::Tensor& t, long long a, long long b)
@@ -206,7 +206,7 @@ inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
     }
     else if (h.oc.shape[0] != HID || h.oc.shape[1] != 16 * 256 || h.os.shape[1] != 16 * 8)
         die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " o_proj slice is not 16 heads");
-    if (h.qc.shape[0] != 16 * 256 || h.qc.shape[1] != 2048 || h.qs.shape[1] != 64 || h.uk.nd != 3 || h.uk.shape[0] != 16 ||
+    if (h.qc.shape[0] != 16 * 256 || h.qc.shape[1] != geom::QA || h.qs.shape[1] != geom::QA / 32 || h.uk.nd != 3 || h.uk.shape[0] != 16 ||
         h.uk.shape[1] != 192 || h.uv.nd != 3 || h.uv.shape[0] != 16 || h.uv.shape[1] != 256)
         die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " slice shapes are not 16 heads");
     return h;
@@ -221,8 +221,8 @@ inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const voi
     if ((qv || ov) && !w.qb_svh) die("qp: a dense trellis half for a slot without vector buffers");
     if (qv) G6RT_CK(cudaMemcpyAsync(w.qb_svh + (size_t)k * 4096, qv, (size_t)4096 * 2, cudaMemcpyDefault, b));
     if (ov) G6RT_CK(cudaMemcpyAsync(w.o_suh + (size_t)k * 4096, ov, (size_t)4096 * 2, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync((char*)w.qb_c.p + (size_t)k * 4096 * 2048, qc, (size_t)4096 * 2048, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync((char*)w.qb_s.p + (size_t)k * 4096 * 64, qs, (size_t)4096 * 64, cudaMemcpyDefault, b));
+    G6RT_CK(cudaMemcpyAsync((char*)w.qb_c.p + (size_t)k * 4096 * geom::QA, qc, (size_t)4096 * geom::QA, cudaMemcpyDefault, b));
+    G6RT_CK(cudaMemcpyAsync((char*)w.qb_s.p + (size_t)k * 4096 * (geom::QA / 32), qs, (size_t)4096 * (geom::QA / 32), cudaMemcpyDefault, b));
     if (ov) G6RT_CK(cudaMemcpyAsync((char*)w.o_c.p + (size_t)k * qw::OT, oc, qw::OT, cudaMemcpyDefault, b));
     else
     {
@@ -234,7 +234,7 @@ inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const voi
 }
 inline void qp_alloc(QpW& w)
 {
-    qp_alloc2(w.qb_c, 8192, 2048); qp_alloc2(w.qb_s, 8192, 64); qp_alloc2(w.o_c, HID, 8192); qp_alloc2(w.o_s, HID, 256);
+    qp_alloc2(w.qb_c, 8192, geom::QA); qp_alloc2(w.qb_s, 8192, geom::QA / 32); qp_alloc2(w.o_c, HID, 8192); qp_alloc2(w.o_s, HID, 256);
     qp_alloc_kvb(w);
 }
 // finds[m] = rank m's tensors; rank r's pair weights of layer l. Device allocations of q_b / o_proj are never freed.

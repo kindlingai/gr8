@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "../model_geom.h"
 
 namespace g6 {
 
@@ -84,7 +85,7 @@ struct VLayout
 // Capacities scale with mmax (the most verify rows a step may carry); a step with M rows sends M x row bytes.
 struct CpColls
 {
-    static constexpr int HEADS = 64, KV_RANK = 512, QK_DIM = 576, TOPK = 2048;
+    static constexpr int HEADS = geom::HEADS, KV_RANK = geom::KV_LORA, QK_DIM = geom::KVA, TOPK = 2048;
     int nr = 0, nl = 0, mmax = 0;
     uint32_t q_row = 0, cand_row = 0, part_row = 0;   // payload bytes per verify row
     std::vector<int> q, cand, part;                   // [layer], [layer] (-1 = none), [layer * (nr - 1) + k - 1]

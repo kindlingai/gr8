@@ -35,6 +35,7 @@
 //        leave the pool unsafe, and gives its pages back when it finishes (cleared when another session takes them)
 // [--spec-accept coupled|rejection]  as g6m4 (needs --mtp, no --s2): rejection = greedy drafts, accepted by rejection sampling
 // [--spec-adaptive [--spec-levels 1,2,4]]  as g6m4 (needs --mtp, no --s2): the drafts each round verifies (spec_len.h)
+// [--spec-fixed]  as g6m4 (Flash: the adaptive default off)
 // With --reuse-prefix, before each hit's prefill (s2/kv_tier.cuh):
 //   G6_KV_TIER_CHECK=STORE (mem:, ssd:PATH, remote:HOST:PORT): every rank's reused pages go to a block store, are
 //        poisoned, and come back. The lines printed must be the run's without it. Past G6_CP_R the reused rows go as the
@@ -256,6 +257,20 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+#if G6_MODEL_FLASH
+    {   // G6_MOE_TOPK (model change, screen arm): unset = the model's top-k; a bad value dies before any load
+        std::string e;
+        const int tk = env_digit("G6_MOE_TOPK", 1, geom::TOPK, geom::TOPK, &e);
+        if (tk < 0) die(e);
+        if (tk < geom::TOPK)
+            fprintf(stderr, "# G6_MOE_TOPK=%d: routed experts per token cut %d -> %d, weights renormalized (screen arm)\n",
+                    tk, geom::TOPK, tk);
+    }
+#else
+    if (getenv("G6_MOE_TOPK")) die("G6_MOE_TOPK is a Flash-model option (this build is the GLM model)");
+#endif
+    if (getenv("G6_PF_ROUTER_SPLIT"))
+        die("G6_PF_ROUTER_SPLIT needs g6m4's dedicated route-table fabric; m4sim does not simulate it");
     const DraftHeadI4 dhead = draft_head_i4_env();   // G6_DRAFT_HEAD_I4 (rank.cuh), as g6m4: the MTP draft's INT4 head
     std::string packs;
     V2Src v2src;                        // --v2-dense: every rank's image from the exlr8 release (no packs)
@@ -267,6 +282,9 @@ int main(int argc, char** argv)
     bool s2mode = false;                // --s2: the prompts as sessions of one batched decode (DEC_S2)
     int minv = -1;                      // --minv B: the row-count sweep from prompt row B (header)
     std::string minv_s;                 // --minv-rows
+#if G6_MODEL_FLASH
+    bool spec_fixed = false;            // --spec-fixed: as g6m4
+#endif
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -280,12 +298,16 @@ int main(int argc, char** argv)
         else if (a == "--s2") s2mode = true;
         else if (a == "--minv") minv = atoi(next().c_str());
         else if (a == "--minv-rows") minv_s = next();
+#if G6_MODEL_FLASH
+        else if (a == "--spec-fixed") spec_fixed = true;
+#endif
         else die("unknown argument " + a);
     }
     // the shared flags, under the names the rest of this file uses
     const int cap = co.cap, top = co.top, pfrows = co.pfrows, lanes = co.lanes, nc = co.nc, mtp = co.mtp, MP = co.MP;
     const float temp = co.temp;
-    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2, adapt = co.adapt;
+    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2;
+    bool adapt = co.adapt;              // Flash: --mtp turns it on unless --spec-fixed (below)
     const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
     std::vector<std::string>& prompts = co.prompts;
     v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
@@ -328,6 +350,11 @@ int main(int argc, char** argv)
     else if (!minv_s.empty()) die("--minv-rows needs --minv");
     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
     if (plan.rs && (s2mode || !mtp)) die("--spec-accept rejection needs --mtp, and not --s2");
+#if G6_MODEL_FLASH
+    // Flash: --mtp K is adaptive speculation (up to K drafts) unless --spec-fixed (as g6m4)
+    if (spec_fixed && (adapt || !levels_s.empty() || !mtp)) die("--spec-fixed needs --mtp, and not --spec-adaptive / --spec-levels");
+    if (mtp && !spec_fixed && !s2mode) adapt = true;
+#endif
     if ((adapt || !levels_s.empty()) && (s2mode || !mtp || (!levels_s.empty() && !adapt))) die("--spec-adaptive needs --mtp, and not --s2; --spec-levels needs it");
     SpecLen spec;                       // --spec-adaptive (graphs are captured per row count on first use here)
     if (adapt)
@@ -340,6 +367,9 @@ int main(int argc, char** argv)
         if (!spec.set_levels(lv)) die("--spec-levels: no level");
         spec.draft_round = 2.5;
         spec.draft_each = 2.1;
+#if G6_MODEL_FLASH
+        spec.flash_tp2();
+#endif
     }
     if (nc < 0 || nc * NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / NR));
 #ifdef DEC_S2
@@ -566,6 +596,9 @@ int main(int argc, char** argv)
         if (s2mode && !s2_below && getenv("G6_S2_POOL")) R[r].s2_pool_pages = atoi(getenv("G6_S2_POOL"));   // pool pages (variable runs)
 #endif
         R[r].qs.mode = qs_mode; R[r].qs.iq = iq_split == 1;
+#if G6_MODEL_FLASH
+        if (mtp) R[r].kda_ring = mtp + 1;   // KDA state slots for the verify ring
+#endif
         build(R[r], r, layers, rfind(r), cap, f, stepp, st, pf_attn_rows(MP));
         qs_loop_attach(R[r], qsl, stepp);
 #if defined(G6_CP) && G6_CP
@@ -971,16 +1004,30 @@ int main(int argc, char** argv)
 #endif
     // triage: G6_RESID_DUMP=FILE — rank 0's residual stream after the embedding and after every consume c
     // (slot c + 1: 2i = after layer i's attention, 2i + 1 = after its MLP), per main step: int32 s, M, slots, HID, then
-    // slots x M x HID float32. tools/cp/gateB_layers.py compares two dumps per sublayer.
+    // slots x M x HID float32 (Flash: width = HC*HID, four stream-major rows).
+    // tools/cp/gateB_layers.py compares two dumps per sublayer.
     const bool rd_on = getenv("G6_RESID_DUMP") != nullptr;
     const int rd_slots = 2 * NL + 1;
-    float* rdump = rd_on ? dmalloc<float>((size_t)rd_slots * MX * HID) : nullptr;
+#if G6_MODEL_FLASH
+    const int rd_hid = R[0].resid4 ? geom::HC * HID : HID; // main-model streams; MTP stays single-stream
+#else
+    const int rd_hid = HID;
+#endif
+    float* rdump = rd_on ? dmalloc<float>((size_t)rd_slots * MX * rd_hid) : nullptr;
     auto rd_copy = [&](int slot, int M) {
-        if (rdump) G6RT_CK(cudaMemcpyAsync(rdump + (size_t)slot * MX * HID, R[0].resid, (size_t)M * HID * 4, cudaMemcpyDeviceToDevice, st));
+#if G6_MODEL_FLASH
+        const float* source = R[0].resid4 ? R[0].resid4 : R[0].resid;
+#else
+        const float* source = R[0].resid;
+#endif
+        if (rdump) G6RT_CK(cudaMemcpyAsync(rdump + (size_t)slot * MX * rd_hid, source, (size_t)M * rd_hid * 4, cudaMemcpyDeviceToDevice, st));
     };
     // noise floor: G6_PERTURB=eps (replicated runs): after layer 0's attention consume, every rank's residual
     // x *= 1 + eps * u, u in [-1, 1) from a hash of (position row, element) — the same on every rank, deterministic.
     const float perturb = getenv("G6_PERTURB") ? (float)atof(getenv("G6_PERTURB")) : 0.f;
+#if G6_MODEL_FLASH
+    if(R[0].resid4 && perturb!=0.f) die("G6_PERTURB does not support the four-stream Flash residual");
+#endif
     // one step of the six ranks, M rows, in stream order
     // DEC_GSPLIT (G6_DEC_SPLIT=ls): pc 0 = step_in, embed, layers [0, ls); pc 1 = layers [ls, NL), head, step_out (-1 = all)
     auto enqueue = [&](int M, int context, int pc = -1, int ls = 0) {
@@ -1258,6 +1305,19 @@ int main(int argc, char** argv)
         G6RT_CK(cudaMemcpy(so, out, NR * sizeof(StepOut), cudaMemcpyDeviceToHost));
         return ms;
     };
+#if G6_MODEL_FLASH
+    // First passes only. Hidden is the exact FP32 final-norm output read by MTP.
+    auto open_draft_dump=[&](const char* name) -> FILE* {
+        const char* path=getenv(name); if(!path) return nullptr;
+        FILE* f=fopen(path,"wb"); if(!f) die(std::string(name)+": cannot open file"); return f;
+    };
+    FILE* draft_in_dump=open_draft_dump("G6_DRAFT_IN_DUMP");
+    FILE* draft_logit_dump=open_draft_dump("G6_DRAFT_LOGIT_DUMP");
+    int draft_dump_step=0;
+    auto write_draft=[&](FILE* f,const void* p,size_t n) {
+        if(fwrite(p,1,n,f)!=n) die("draft dump write failed");
+    };
+#endif
     auto run_draft = [&](const StepIn& si, bool chain, StepOut* so) {
         const int M = si.M, k = bucket(si.context, true);
         if (!ready_d[k][chain][M])
@@ -1275,6 +1335,28 @@ int main(int argc, char** argv)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         check_fabric("draft");
         G6RT_CK(cudaMemcpy(so, out_d, NR * sizeof(StepOut), cudaMemcpyDeviceToHost));
+#if G6_MODEL_FLASH
+        if(!chain) {
+            const int hdr[2]={draft_dump_step++,M};
+            if(draft_in_dump) {
+                write_draft(draft_in_dump,hdr,sizeof hdr);
+                write_draft(draft_in_dump,si.pos,M*sizeof(int));
+                write_draft(draft_in_dump,si.tok,M*sizeof(int));
+                std::vector<float> h((size_t)M*HID);
+                G6RT_CK(cudaMemcpy(h.data(),DR[0].main_xn,h.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                write_draft(draft_in_dump,h.data(),h.size()*sizeof(float));
+            }
+            if(draft_logit_dump) {
+                write_draft(draft_logit_dump,hdr,sizeof hdr);
+                for(Draft& D:DR) {
+                    Model& m=D.d; std::vector<float> lg((size_t)M*m.vn);
+                    G6RT_CK(cudaMemcpy(lg.data(),m.hlog,lg.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                    write_draft(draft_logit_dump,&m.vn,sizeof(int));
+                    write_draft(draft_logit_dump,lg.data(),lg.size()*sizeof(float));
+                }
+            }
+        }
+#endif
         return ms;
     };
     // prints rank 0's line of a step (prefix replaces "step"), counts ranks that differ; returns the last row's token
@@ -1289,10 +1371,10 @@ int main(int argc, char** argv)
     auto logit_dump = [&](int s, int M) {
         if (rdf && s >= ldump_from)
         {
-            std::vector<float> h((size_t)rd_slots * M * HID);
+            std::vector<float> h((size_t)rd_slots * M * rd_hid);
             for (int k = 0; k < rd_slots; ++k)
-                G6RT_CK(cudaMemcpy(h.data() + (size_t)k * M * HID, rdump + (size_t)k * MX * HID, (size_t)M * HID * 4, cudaMemcpyDeviceToHost));
-            const int hdr[4] = {s, M, rd_slots, HID};
+                G6RT_CK(cudaMemcpy(h.data() + (size_t)k * M * rd_hid, rdump + (size_t)k * MX * rd_hid, (size_t)M * rd_hid * 4, cudaMemcpyDeviceToHost));
+            const int hdr[4] = {s, M, rd_slots, rd_hid};
             fwrite(hdr, 4, 4, rdf); fwrite(h.data(), 4, h.size(), rdf);
         }
         if (idf && s >= ldump_from)   // G6_IDX_DUMP: rank 0's selected ids of the first --layers layer, int32 s, M, M x 2048
@@ -1955,7 +2037,11 @@ int main(int argc, char** argv)
                 lines("step", false, so, s, si.M);
                 if (row_lines_on) row_lines(q, s, si, so);
                 if (top > 0) for (Model& m : R) { std::string tl; top_lines(m, s, si.M, top, tl); fputs(tl.c_str(), stdout); }
+#if G6_MODEL_FLASH
+                logit_dump(s, mtp_rows(si, so[0], (int)p.prompt.size(), mtp > 0 && !p.rs));
+#else
                 logit_dump(s, si.M);
+#endif
                 return so[0];
             };
             auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
@@ -2087,6 +2173,10 @@ int main(int argc, char** argv)
     if (spec.on) fprintf(stderr, "%s\n", spec.summary().c_str());
     if (rlf) fclose(rlf);
     if (ldump) fclose(ldump);
+#if G6_MODEL_FLASH
+    if(draft_in_dump && fclose(draft_in_dump)) die("draft input dump close failed");
+    if(draft_logit_dump && fclose(draft_logit_dump)) die("draft logit dump close failed");
+#endif
     if (rdf) fclose(rdf);
     if (idf) fclose(idf);
     if (nc) fprintf(stderr, "# top_p misses %u (target, rank 0) %u (draft, rank 0)\n", topp_misses(R[0]), mtp ? topp_misses(DR[0].d) : 0u);

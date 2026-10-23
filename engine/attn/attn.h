@@ -1,6 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "../model_geom.h"
 // C ABI for the rank driver and independent Python correctness harness.
 // All tensor pointers are device addresses. Scalar metadata is host-readable.
 // Remote attention rows (runtime/rt_rows.cuh): a physical page flagged in G6Attn::rt_page has its latent rows in the
@@ -41,6 +42,11 @@ struct G6Attn {
     int reuse_rows;
     void *output;                 // fp16 [rows,heads,256]
     unsigned *error;              // initialize to zero before a step; asynchronous device diagnostics
+#if G6_MODEL_FLASH
+    // kpool indexer (attn/flash_attn.cu): the pool gate projection of the rows, FP16 [rows,128] = x @ compress_gate^T,
+    // and the pool position bias, BF16 [4,128] (index_kpool_compress_ape). indices is [rows,g6kv::SEL] (kvfmt.h).
+    const void *index_gate, *index_ape;
+#endif
 #if defined(G6_CP) && G6_CP
     // context-parallel KV. cp_nr = 0: replicated (today's semantics). cp_nr > 0: this rank SCORES only
     // keys whose page (pos / page_size) % cp_nr == cp_rank, block_table holds G6_CP_REMOTE for pages stored elsewhere,

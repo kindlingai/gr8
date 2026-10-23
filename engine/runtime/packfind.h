@@ -50,6 +50,7 @@ inline Find pack_find(const g6::Pack& pack, DevStore& store)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fp32 = e->dtype == g6::DType::F32;
         t.fmt = e->expert_format;
         return t;
     };
@@ -67,6 +68,7 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fp32 = e->dtype == g6::DType::F32;
         t.fmt = e->expert_format;
         return t;
     };
@@ -261,6 +263,7 @@ inline Find plan_find(const g6::Pack& pack, PlanStore& store, int r)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fp32 = e->dtype == g6::DType::F32;
         t.fmt = e->expert_format;
         return t;
     };
@@ -310,7 +313,7 @@ inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::st
 inline std::vector<int> parse_ints(std::string s)
 {
     std::vector<int> v;
-    if (s == "all") { for (int i = 0; i < 78; ++i) v.push_back(i); return v; }
+    if (s == "all") { for (int i = 0; i < geom::L_MAIN; ++i) v.push_back(i); return v; }
     if (!s.empty() && s[0] == '@')
     {
         FILE* f = fopen(s.c_str() + 1, "r");

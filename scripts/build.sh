@@ -9,12 +9,14 @@
 #   JOBS=N                                compiles at once (default: the CPU count)
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
 #                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
+#   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
+#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
+#                                         G6_WIDTHS or G6_NR says otherwise
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (the engine finds it there at any TP)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
 # (see docs/SETTINGS.md). Dropping one builds an older, slower or less-checked path, not a broken one.
 set -eu
-[ "${MODEL:-glm}" = glm ] || { echo "scripts/build.sh: MODEL=$MODEL: this tree builds the GLM-5.3 engine only (MODEL=glm)" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)
 K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \
@@ -60,6 +62,20 @@ case "${KV_FORMAT:-fp8}" in
     widths_ok "$OUT/g6m4-int4"
     exit 0 ;;
   *) echo "KV_FORMAT=$KV_FORMAT: fp8 or int4"; exit 2 ;;
+esac
+case "${MODEL:-glm}" in
+  glm) ;;
+  flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build
+    [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=flash: KV_FORMAT=fp8 only"; exit 2; }
+    WIDTHS=${G6_WIDTHS:-${G6_NR:-2 4}}
+    # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
+    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 ${EXTRA:-}" OUT="$OUT/flash" \
+      bash build_m4.sh "${ARCH:-121a}" all
+    mv "$OUT/flash/m4sim" "$OUT/m4sim_flash" && mv "$OUT/flash/g6m4" "$OUT/g6m4_flash" && rm -rf "$OUT/flash"
+    md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
+    widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"
+    exit 0 ;;
+  *) echo "MODEL=$MODEL: glm or flash"; exit 2 ;;
 esac
 WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
 if [ "${BUNDLE_LIBS:-0}" = 1 ]; then

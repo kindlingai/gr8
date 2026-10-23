@@ -10,6 +10,7 @@ exactly the names a converted pack has (tools/convert/convert.py), less the ones
 Run from the repo root. Needs torch and NumPy.
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -170,6 +171,63 @@ class Expect:
                 'G.lm_head.mx.gv': g6ref.mxfp8_record(c, s)}
 
 
+class FlashExpect:
+    """Independent derivation from the Python lossless loader, including split-only groups."""
+    ALIAS = dict(zip(
+        ['input_layernorm.weight','post_attention_layernorm.weight','self_attn.q_a_proj.weight',
+         'self_attn.q_a_layernorm.weight','self_attn.q_b_proj.weight','self_attn.kv_a_proj_with_mqa.weight',
+         'self_attn.kv_a_layernorm.weight','self_attn.o_proj.weight','self_attn.indexer.wq_b.weight',
+         'self_attn.indexer.wk.weight','self_attn.indexer.weights_proj.weight','self_attn.indexer.k_norm.weight',
+         'self_attn.indexer.k_norm.bias','mlp.gate.weight','mlp.gate.e_score_correction_bias','mlp.gate_proj.weight',
+         'mlp.up_proj.weight','mlp.down_proj.weight','eh_proj.weight','enorm.weight','hnorm.weight','shared_head.norm.weight'],
+        ['attn_norm','mlp_norm','q_a','q_a_norm','q_b','kv_a','kv_a_norm','o_proj','idx.wq_b','idx.wk',
+         'idx.weights_proj','idx.k_norm.w','idx.k_norm.b','router.w','router.bias','dense.gate','dense.up',
+         'dense.down','eh','enorm','hnorm','shared_head_norm']))
+
+    def __init__(self, X, release, r, trellis):
+        self.X, self.release, self.r = X, release, r
+
+    def put(self, T, name, t, gv=True):
+        T[name] = np_of(t.contiguous())
+        if gv and t.dtype == torch.bfloat16 and t.ndim == 2 and all(n % 16 == 0 for n in t.shape):
+            T[name + '.gv'] = g6ref.bf16_record(T[name])
+
+    def layer(self, l, qo=False):
+        X, T = self.X, {}
+        files = X.dense_files(self.release, 'dense', l)
+        values = X.load_dense_files(files, lambda n: n, torch.bfloat16, 'cpu', False)
+        h0, nh = plan.heads(l)[self.r]
+        g0, ng = plan.dense_groups(l)[self.r]
+        for name, value in values.items():
+            local = name.removeprefix(f'model.language_model.layers.{l}.')
+            short = self.ALIAS.get(local, local)
+            label = f'L{l:03d}.{short}'
+            if local == 'self_attn.kv_b_proj.weight':
+                w = value.reshape(64,512,512)[h0:h0+nh]
+                self.put(T, f'L{l:03d}.kv_b.uk', w[:,:256], False)
+                self.put(T, f'L{l:03d}.kv_b.uv', w[:,256:], False)
+                continue
+            if short == 'q_b': value = value[h0*256:(h0+nh)*256]
+            elif short == 'o_proj':
+                head = value.shape[1]//64
+                value = value[:,h0*head:(h0+nh)*head]
+            elif short in ('dense.gate','dense.up'): value = value[g0*32:(g0+ng)*32]
+            elif short == 'dense.down': value = value[:,g0*32:(g0+ng)*32]
+            self.put(T, label, value)
+        return T
+
+    def globals(self):
+        X, T = self.X, {}
+        values = X.load_vocab(self.release)
+        a, n = plan.vocab_rows(self.r)
+        for name, value in values.items():
+            if name.endswith('embed_tokens.weight'): self.put(T, 'G.embed', value, False)
+            elif name.endswith('lm_head.weight'): self.put(T, 'G.lm_head', value[a:a+n])
+            elif name.endswith('norm.weight'): self.put(T, 'G.final_norm', value, False)
+            else: raise ValueError(name)
+        return T
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--release', required=True)
@@ -179,6 +237,9 @@ def main():
     ap.add_argument('--tp', type=int, required=True)
     ap.add_argument('--ranks', required=True)
     ap.add_argument('--layers', required=True)
+    ap.add_argument('--partial', action='store_true', help='component test: only plan the requested layers')
+    ap.add_argument('--no-globals', action='store_true')
+    ap.add_argument('--no-experts', action='store_true', help='dense-only check: do not materialize expert payloads')
     ap.add_argument('--qo', action='store_true', help='plan and check the G6_PF_OWN=3 full-head tensors too')
     ap.add_argument('--rounded', action='store_true', help='plan and check the rounded form of the trellis matrices')
     ap.add_argument('--work', default='/tmp/release-check')
@@ -186,6 +247,7 @@ def main():
     sys.path.insert(0, a.ref)
     from loader import exlr8 as X
     plan.set_nr(a.tp)
+    flash = int(json.load(open(a.widths)).get('hidden_size', 6144)) == 4096
     os.makedirs(a.work, exist_ok=True)
     layers = [int(x) for x in a.layers.split(',')]
     fails, n_t, n_b = [], 0, 0
@@ -193,18 +255,19 @@ def main():
         out = os.path.join(a.work, f'tp{a.tp}.r{r}.safetensors')
         rel = a.release
         subprocess.run([a.dump, rel, os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'), a.widths, str(a.tp),
-                        str(r), out, '--layers', a.layers, '--globals', '--experts'] + (['--qo'] if a.qo else [])
+                        str(r), out, '--layers', a.layers] + ([] if a.no_experts else ['--experts']) + ([] if a.no_globals else ['--globals'])
+                       + (['--partial'] if a.partial else []) + (['--qo'] if a.qo else [])
                        + (['--rounded'] if a.rounded else []),
                        check=True, stderr=subprocess.DEVNULL)
         got = X.SafeFile(out)
-        e = Expect(X, a.release, r, not a.rounded)
-        want = e.globals()
+        e = (FlashExpect if flash else Expect)(X, a.release, r, not a.rounded)
+        want = {} if a.no_globals else e.globals()
         for l in layers:
             want.update(e.layer(l, a.qo))
         names = set(got.names())
         experts = {n for n in names if n[5:].startswith('tr3.')}
         for l in layers:
-            if plan.is_moe(l) and not {f'L{l:03d}.tr3.{t}' for t in ('fc1', 'fc2', 'table', 'kmix', 'v2')} <= experts:
+            if not a.no_experts and str(l) in json.load(open(a.widths))['layers'] and not {f'L{l:03d}.tr3.{t}' for t in ('fc1', 'fc2', 'table', 'kmix', 'v2')} <= experts:
                 fails.append((r, f'L{l:03d}', 'expert tensors missing'))
         if names - experts != set(want):
             fails.append((r, 'names', sorted((names - experts) ^ set(want))))
