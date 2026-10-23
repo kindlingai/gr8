@@ -15,7 +15,7 @@ build (T5S2): prefill KL against it 0.0 (max).
 ## Files
 | file | what |
 |---|---|
-| `T5X.env` | the launcher env file of the measured serve; values identical to the deployed file (md5 `139ef131...`) |
+| `T5X.env` | the launcher env file of the measured serve; values of the deployed file (md5 `139ef131...`); its G6ENV_X entries with a launcher option are option lines |
 | `boot.sh` | boot on all five boxes with `./gr8 glm53 up @ENV` under systemd-run, wait for `/health` 200 and max_model_len 617532 |
 | `down.sh` | `./gr8 glm53 down @ENV`, then wait until no g6m4 is left on each box |
 | `T5XR.env` | OPTION ONLY, NEVER RUN AS A SERVE: T5X plus a remote KV store on a sixth Spark (see below) |

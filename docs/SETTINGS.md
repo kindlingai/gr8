@@ -62,6 +62,8 @@ the short version.
 | `G6_PF_QP_WARM` | 0 | `G6_PF_OWN=4`: warm the pair cuBLAS and MXFP8 GEMM shapes at load |
 | `G6_PF_QP_WIRE_E` | 1 | `G6_PF_OWN=4` with `G6_PF_QP_ROLL`: entries (1..4) in the RDMA ring of half images |
 | `G6_PF_QP_ROLL_SER` | 0 | measurement: 1 = build rolling slots on the prefill stream (fully exposed) |
+| `G6_PF_ISGRT_RG` | 8 | prefill index scores: rows per CTA, rounded down to a multiple of 8 (below 8 = 8; `engine/attn/prefill.cuh`). Same bits. TP=5: 16 = 157K TTFT about -2 %; 32 with `G6_PF_ATTN_ROWS=512` = 32K prefill +2.2 %, 157K TTFT -2.8 % |
+| `G6_QO_CACHE` | unset | `G6_PF_OWN=3`: a directory. The first boot writes each layer's full-head q_b / o_proj / UK / UV tensors to `DIR/<layer>.qo.bin`; later boots read them instead of decoding them again. Keyed on the source path, size and mtime; a missing, short or other file is ignored and written again (`engine/loader-rs/src/release.rs`). Same bits. TP=5: /health at 46 s against 199 s without; 13 GB of disk a box |
 | `G6_PF_BLAS_ROWS` | 1024 | prefill cuBLAS calls in chunks of this many rows (multiple of 16) |
 | `G6_PF_TIMES` | 1 | `m4sim --serve`: per-request timing lines on stderr, from the request file to the first token. g6m4 does not read it |
 | `G6_PF_HASH_GPU` | 1 | the per-sub-batch residual hash (rank agreement check) is computed on the GPU |
