@@ -505,6 +505,8 @@ public:
 
     // one decode round of every active session: one main step (all rows), one first-form draft step, K-1 chain steps.
     // A session's rows and steps do not depend on which other sessions are in the round (row invariance, A1).
+    // G6_CP_STEP_KFIT (driver.h): the next shared round verifies at most kcap drafts a session (-1 = no cap)
+    void set_kcap(int kcap) { kcap_ = kcap; }
     bool round(const std::vector<int>& order)
     {
         std::vector<int> act;
@@ -536,6 +538,7 @@ private:
         std::vector<int> base(S2N_SLOTS, 0);
         int k = K_;                                               // drafts verified: the fewest any session holds
         for (int q : act) k = std::min(k, st_[q].k);
+        if (kcap_ >= 0 && act.size() > 1) k = std::min(k, kcap_);   // G6_CP_STEP_KFIT
         std::vector<int> kq(S2N_SLOTS, k), aq(S2N_SLOTS, -1), nd(S2N_SLOTS, 0);   // KStopB: per session; log: accepted, drafts held
         const bool xr = ks_.b.mode && ks_.b.explore && cur_round_ % ks_.b.explore == 0;
         const bool solo = ksolo(act.size());       // KStop::solo: the session alone verifies kverify of its drafts
@@ -998,6 +1001,7 @@ private:
         return best;
     }
     int K_, max_rows_;
+    int kcap_ = -1;   // set_kcap
     bool adapt_ = false;
     int dkv_ = DFL_B - 1;
     bool par_ = draft_par_env() != 0;

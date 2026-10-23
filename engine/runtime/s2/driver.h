@@ -177,7 +177,7 @@ public:
                     cand.push_back({scheduler_.slots()[k.slot].req.id, ctx > cc.cp_after});
                     slot.push_back(k.slot);
                 }
-            pick = cp_round_.pick(cand, cc.cp_step_rows, cc.mtp + 1, cc.cp_seg);
+            pick = cp_round_.pick(cand, cc.cp_step_rows, cc.mtp + 1, cc.cp_seg, cc.cp_kfit);
             for (size_t i = 0; i < cand.size(); ++i) if (!pick.in[i]) stalled[slot[i]] = true;
         }
         auto q = scheduler_.next(stalled);
@@ -213,7 +213,10 @@ public:
                 }
                 if (live() > 1) batch_.demote();   // another session is resident (perhaps still prefilling): the shared path
                 else if (q.count == 1 && !payload_[q.keys[0].slot].decode_prompt) batch_.promote(int(q.keys[0].slot));   // G6_DFL_REUSE=2
-                require(batch_.round(order), "empty scheduled decode round");
+                batch_.set_kcap(pick.kcap);   // G6_CP_STEP_KFIT (-1 = no cap)
+                const bool ran = batch_.round(order);
+                batch_.set_kcap(-1);
+                require(ran, "empty scheduled decode round");
                 std::vector<Completion> results;
                 for (unsigned i = 0; i < q.count; ++i) results.push_back(completion(q.keys[i]));
                 scheduler_.complete_decode(results);

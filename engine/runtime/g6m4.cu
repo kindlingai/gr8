@@ -1487,6 +1487,11 @@ int main(int argc, char** argv)
             if (seg && !cp_step) die("G6_CP_STEP_SEG=1 needs G6_CP_STEP_ROWS");
             sc.cp_step_rows = (uint32_t)cp_step;
             sc.cp_seg = seg == 1;
+            const int kfit = env_choice("G6_CP_STEP_KFIT", 1, 0, &ce);
+            if (kfit < 0) die(ce);
+            if (kfit && !cp_step) die("G6_CP_STEP_KFIT=1 needs G6_CP_STEP_ROWS");
+            sc.cp_kfit = kfit == 1;
+            if (kfit && R == 0) fprintf(stderr, "# s2 G6_CP_STEP_KFIT=1: a round past R that does not fit takes every session at %d / sessions rows each (drafts capped)\n", cp_step);
             sc.cp_after = g6s2::cp_after(m.bk, m.nbk, m.cp.on ? m.cp.R : -1);
             if (cp_step && R == 0)
                 fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%d: a step past R (context > %llu) carries at most %d rows = %d sessions of %d%s; "
