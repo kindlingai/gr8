@@ -1318,7 +1318,10 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         launch_qb_idxq(m, i, b, M, st, P);
         if (!P.on()) return;                  // an earlier gather phase of phase 0
         dmark(DP_QB, st);
-        for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
+        // the replicated path's attention marks, in its order, at CP stage ends (every main-step graph carries one mark
+        // sequence): APPEND = cp_front, INDEX = cp_index (+ the S3 own group of a reuse layer), SELECT = candidates wait +
+        // get, ABSORB = candidate merge, SCORES = own group, NORMALIZE = q all-gather wait, CONTEXT = remote groups + puts,
+        // MERGE = partials wait + get, VPROJ = cp_finish (LSE merge + value project)
         if (!srp && !m.graph)
         {
             const G6AttnStep s = attn_step(m, i, M, context);
@@ -1327,9 +1330,11 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         G6RT_CK(g6_attn_cp_front(a, cell, scr, sb, st));
         G6RT_CK(g6_attn_cp_qabs(a, scr, &q, &rope));
         cpglue::k_vput<<<G, 256, 0, st>>>(q, qn, rope, rn, C.vs[cq], m.stepp, C.tickets + cq);
+        dmark(DP_A_APPEND, st);
         G6RT_CK(g6_attn_cp_index(a, cell, scr, sb, C.cand, st));
         if (cc >= 0) cpglue::k_vput<<<G, 256, 0, st>>>(C.cand + (size_t)r * M * 2048, cb, nullptr, 0, C.vs[cc], m.stepp, C.tickets + cc);
         if (C.s3 && cc < 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
+        dmark(DP_A_INDEX, st);
     }
     if (phase == 0) return;
     if (phase <= 1)
@@ -1341,11 +1346,16 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
             cpglue::k_vwait<<<1, 32, 0, st>>>(v, m.stepp, cb, -1, cpglue::ERR_CP);
             for (int j = 0; j < v.nsrc; ++j)
                 cpglue::k_vget<<<G, 256, 0, st>>>(v, j, m.stepp, C.cand + (size_t)v.src[j] * M * 2048, cb);
+            dmark(DP_A_SELECT, st);
             G6RT_CK(g6_attn_cp_merge_index(a, cell, C.cand, st));
         }
+        else dmark(DP_A_SELECT, st);
+        dmark(DP_A_ABSORB, st);
         if (!C.s3 || cc >= 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
+        dmark(DP_A_SCORES, st);
         const g6::VSlotDev& vq = C.vs[cq];
         cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
+        dmark(DP_A_NORMALIZE, st);
         if (C.one)
         {
             // G6_CP_ONECHAIN: remote group k (rank (r + k) % nr) = heads (k - 1) H .. kH - 1 of one call; its partial goes
@@ -1381,6 +1391,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
             for (int k = 1; k < nr; ++k)
                 cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + (size_t)(k - 1) * tblk, (size_t)M * cp_heads((r + k) % nr, y.l) * 514 * 4,
                                                    nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+        dmark(DP_A_CONTEXT, st);
     }
     if (phase == 1) return;
 #ifdef CP_F1A
@@ -1403,7 +1414,9 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         cpglue::k_vget<<<G, 256, 0, st>>>(v, 0, m.stepp, part_of(v.src[0]), (size_t)M * H * 514 * 4);   // partials of MY heads
     }
 #endif
+    dmark(DP_A_MERGE, st);
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
+    dmark(DP_A_VPROJ, st);
     dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
     bind::launch_o_proj(b, st);
