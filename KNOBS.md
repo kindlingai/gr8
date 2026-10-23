@@ -83,7 +83,9 @@ manifest instead.
 | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
 | `CP_STEP_ROWS` | unset (0) | unset (0) | unset (0) | S2: a decode step past `SHARE_LIMIT` carries at most this many rows, and the CP fabric is sized for it instead of for the widest S2 step (`SESS` x (`MTP` + 1) = 24 rows, 1.358 GB pinned per rank at TP=4; 8 rows: 0.453 GB). While a session past the limit decodes and the sessions' rows do not fit, they take turns, each once per cycle. At least the rows of a solo step (the boot names the minimum, 8 with DFlash2) (`G6_CP_STEP_ROWS`) |
 | `CP_STEP_SEG` | unset (0) | unset (0) | unset (0) | with `CP_STEP_ROWS`: 1 = a round past `SHARE_LIMIT` takes only sessions past it, so a shorter session never runs the CP attention because a long one is resident (`G6_CP_STEP_SEG`) |
-| `CP_ONECHAIN` | unset (0) | – | – | 1 = past `SHARE_LIMIT`, each rank runs the other ranks' head groups over its keys as one attention call instead of one per group (`G6_CP_ONECHAIN`; bit-exact). TP=4 only (the engine refuses it elsewhere), not with `G6_ATTN_FLIP` |
+| `CP_ONECHAIN` | unset (0) | – | – | 1 = past `SHARE_LIMIT`, each rank runs the other ranks' head groups over its keys as one attention call instead of one per group (`G6_CP_ONECHAIN`; bit-exact). TP=4 or 8 (the engine refuses it elsewhere; TP=8 default 1), not with `G6_ATTN_FLIP` |
+| `CP_STEP_KFIT` | unset (0) | unset (0) | unset (0) | with `CP_STEP_ROWS`: 1 = a round past `SHARE_LIMIT` whose sessions do not fit at `MTP` + 1 rows each takes every session anyway, each verifying fewer drafts, instead of a cycle of capped rounds (`G6_CP_STEP_KFIT`; drafts only, the same tokens). TP=8 default 1. Turn on with several long sessions at once |
+| `CP_IDXLIVE` | unset (0) | unset (0) | unset (0) | 1 = past `SHARE_LIMIT`, the batched CP indexer skips key tiles past the live context and tiles of other ranks, then selects over the live chunks only (`G6_CP_IDXLIVE`; bit-exact). TP=8 default 1. Turn on with several long sessions at once. Off by itself while remote KV rows (`KV_ROWS`) are on |
 | `ATTN_CTX3_SP` | unset (0) | unset (0) | unset (0) | with `ATTN_CTX3`: 64 or 128 key slots per context partition instead of 256 (`G6_ATTN_CTX3_SP`; deterministic, not bit-exact) |
 | `ATTN_POSIDX` | unset (0) | unset (0) | unset (0) | 1 = decode steps in the buckets up to 2048 list the keys by position instead of running the indexer, which selects all of them there (`G6_ATTN_POSIDX`; deterministic, not bit-exact) |
 | `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
@@ -96,6 +98,12 @@ manifest instead.
 | `S2PORT` | 7341 | 7341 | 7341 | the multi-session control port on the head |
 | `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
 | `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
+
+TP=8 (`--tp 8 --shape hybrid`) takes the TP=4 column except `SHARE_LIMIT` 32768, `CAP` 65536, `READY_TMO` 3600,
+`DFLASH` 0, `PF_OWN` 3, `KV_FORMAT` fp8 only, and the CP levers on: `CP_STEP_ROWS` 8, `CP_ONECHAIN` 1, `CP_STEP_KFIT` 1,
+`CP_IDXLIVE` 1 (`scripts/engine_args.sh`). Each lever is its own option; `--cp-idxlive 0` (or 0 for any of them) turns
+one off. Measured at TP=8, 4 sessions of 200K, 2000 MHz: 29.4 tok/s without `CP_ONECHAIN` / `CP_STEP_KFIT` /
+`CP_IDXLIVE`, 35.95 with the first two, 45.5 with all three; one session at 8K is 53 tok/s with or without them (`recipes/tp8-aocki/README.md`).
 
 ## `./gr8 glm53`
 

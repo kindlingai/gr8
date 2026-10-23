@@ -232,6 +232,15 @@ class CanonicalTests(unittest.TestCase):
         _, text, _ = self.digest('--cp-onechain', '1')
         self.assertIn(' G6_CP_ONECHAIN=1', text)
 
+    def test_cp_step_kfit_and_cp_idxlive_reach_every_rank(self):
+        _, text, d0 = self.digest()
+        self.assertNotIn('G6_CP_STEP_KFIT', text)
+        self.assertNotIn('G6_CP_IDXLIVE', text)
+        _, text, d1 = self.digest('--cp-step-rows', '8', '--cp-step-kfit', '1', '--cp-idxlive', '1')
+        self.assertIn(' G6_CP_STEP_KFIT=1', text)
+        self.assertIn(' G6_CP_IDXLIVE=1', text)
+        self.assertNotEqual(d0, d1)
+
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
         self.assertIn('CAP=485376\n', text)              # 2,280 physical pages per rank at TP=4, as at 65536
@@ -392,6 +401,19 @@ class HybridTests(unittest.TestCase):
         other = list(HYB)
         other[other.index('--fab-ports') + 1] = '192.0.2.9/24'   # a box option: the route sha carries it, not this
         self.assertEqual(d, digest(*other)[2])
+
+    def test_tp8_cp_levers_on_by_default_and_each_one_off(self):
+        def env(*argv):
+            o = self.parse(*HYB, *argv)
+            return opt.engine_plan(o, rank=7, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')['env']
+        on = ['G6_CP_STEP_ROWS=8', 'G6_CP_ONECHAIN=1', 'G6_CP_STEP_KFIT=1', 'G6_CP_IDXLIVE=1']
+        for e in on:
+            self.assertIn(e, env())
+        for k in ('cp-step-rows', 'cp-onechain', 'cp-step-kfit', 'cp-idxlive'):
+            e = env('--' + k, '0')
+            want = 'G6_' + k.upper().replace('-', '_') + '=0'
+            self.assertIn(want, e)
+            self.assertEqual([x for x in on if x not in e], [x for x in on if x.startswith(want[:-1])])
 
     def test_tp8_arm_knobs(self):
         o = self.parse(*HYB)

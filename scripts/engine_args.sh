@@ -75,7 +75,9 @@ engine_defaults() {
        KV_FORMAT=fp8
        # DFLASH=1: the DFlash2 drafter's body split one KV head a rank (dflash.cuh OK_NR; drafter packs converted
        # with --nr 8). Off unless set
-       DFLASH=${DFLASH:-0}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
+       DFLASH=${DFLASH:-0}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1}
+       # the CP levers past SHARE_LIMIT, measured on TP8 (recipes/tp8-aocki): on unless set; 0 turns one off
+       CP_STEP_ROWS=${CP_STEP_ROWS:-8}; CP_ONECHAIN=${CP_ONECHAIN:-1}; CP_STEP_KFIT=${CP_STEP_KFIT:-1}; CP_IDXLIVE=${CP_IDXLIVE:-1} ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 8" >&2; return 2 ;;
   esac
 }
@@ -145,6 +147,10 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${CP_STEP_SEG:+ G6_CP_STEP_SEG=$CP_STEP_SEG}"
   # CP decode's remote head groups as one attention call (CP_ONECHAIN; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${CP_ONECHAIN:+ G6_CP_ONECHAIN=$CP_ONECHAIN}"
+  # S2 rounds past SHARE_LIMIT take every session with capped drafts, and the CP indexer skips dead and foreign key
+  # tiles (CP_STEP_KFIT, CP_IDXLIVE; docs/SETTINGS.md): off unless set; TP=8 sets them (engine_defaults)
+  ENGINE_ENV="$ENGINE_ENV${CP_STEP_KFIT:+ G6_CP_STEP_KFIT=$CP_STEP_KFIT}"
+  ENGINE_ENV="$ENGINE_ENV${CP_IDXLIVE:+ G6_CP_IDXLIVE=$CP_IDXLIVE}"
   # KV_ROWS (remote attention rows): STORE,size=N(M|G|T)[,local=P][,pool=S][,place=P][,fmt=F] -> the engine's G6_RT_*
   # (docs/SETTINGS.md). size is each rank's lease in bytes; options.py has checked the form
   if [ -n "${KV_ROWS:-}" ] && [ "$KV_ROWS" != off ]; then
