@@ -498,7 +498,12 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let rid = new_id("chatcmpl");
     let include_reasoning = body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
     let choice_value = cr.choice.as_value();
-    let parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
+    let mut parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
+    if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
+        if !think_open(&cr.prompt, start, end) {
+            parser = parser.content_first();
+        }
+    }
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);

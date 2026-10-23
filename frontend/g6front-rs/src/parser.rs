@@ -130,6 +130,13 @@ impl GlmParser {
         }
     }
 
+    /// The reply starts as content: its prompt closed the think block (thinking turned off).
+    pub fn content_first(mut self) -> GlmParser {
+        self.state = State::Content;
+        self.reasoning_ended = true;
+        self
+    }
+
     fn terms(&self) -> &'static [&'static str] {
         match self.parse_tools {
             true => &[THINK_START, THINK_END, TOOL_START],
@@ -779,6 +786,13 @@ mod tests {
         assert_eq!(r.reasoning.as_deref(), Some("Let me think."));
         assert_eq!(r.content.as_deref(), Some("\n\nThe answer."));
         assert!(r.calls.is_empty());
+    }
+
+    #[test]
+    fn content_first_has_no_reasoning() {
+        let r = GlmParser::new(Some(&tools()), &json!("auto"), true).content_first().parse_full("Hi there!");
+        assert!(r.reasoning.is_none());
+        assert_eq!(r.content.as_deref(), Some("Hi there!"));
     }
 
     #[test]
