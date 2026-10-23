@@ -559,18 +559,22 @@ pub fn plan_selected(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_pat
     let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(16);
     let mut p = Planner { b: Builder::new(), shard, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis };
-    let is_flash = man.get("hidden_size").and_then(|x| x.str().and_then(|s| s.parse::<usize>().ok()).or_else(|| x.int().map(|v| v as usize))) == Some(4096);
+    // the model is the release's (its files' metadata), not the width manifest's: manifests have one format for every model
+    let model = flash::model_meta(dense_dir)?;
+    let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
+    if model.is_some() && !is_flash { return Err(format!("{dense_dir}: model metadata of an unsupported model")); }
+    let model = model.unwrap_or(Json::Null);
     if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
     let last = if is_flash { 45 } else { L_MTP };
     if globals {
-        if is_flash { flash::globals(&mut p, dense_dir, &man)?; } else { p.vocab(dense_dir)?; }
+        if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     }
     let layers: Vec<usize> = selected.map(|ls| ls.to_vec()).unwrap_or_else(|| (0..=last).collect());
     let mut moe = 0;
     for l in layers {
         if l > last { return Err(format!("layer {l} exceeds MTP layer {last}")); }
         if dense {
-            if is_flash { flash::layer(&mut p, l, dense_dir, &man)?; } else { p.layer(l, dense_dir)?; }
+            if is_flash { flash::layer(&mut p, l, dense_dir, &model)?; } else { p.layer(l, dense_dir)?; }
         }
         if let Some(w) = v2plan::widths(&man, l)? {
             v2plan::v2_layer(&mut p.b, l, &w, &slices, &wfile, nr, rank)?;

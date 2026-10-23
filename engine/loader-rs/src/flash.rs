@@ -17,10 +17,22 @@ fn meta_json(f: &StFile, key: &str) -> Result<Json, String> {
 fn dtype(d: &str) -> Result<&'static str, String> {
     match d { "BF16" => Ok("bf16"), "F32" => Ok("f32"), "F16" => Ok("f16"), _ => Err(format!("unsupported lossless dtype {d}")) }
 }
-fn identity(f: &StFile, man: &Json) -> Result<(), String> {
+/// The release's model metadata (FORMAT.md "Model metadata"), from its vocabulary file: None for GLM-5.3, whose files
+/// leave the keys out. Every dense file of the release must carry the same values (identity below).
+pub(super) fn model_meta(dir: &str) -> Result<Option<Json>, String> {
+    let f = StFile::open(&exlr8::dense_path(dir, None))?;
+    if f.meta.get("hidden_size").is_none() { return Ok(None); }
+    let mut m = std::collections::BTreeMap::new();
+    for k in KEYS {
+        let v = f.meta.get(k).and_then(Json::str).ok_or(format!("{}: no {k}", f.path))?;
+        m.insert(k.to_string(), Json::Str(v.to_string()));
+    }
+    Ok(Some(Json::Obj(m)))
+}
+fn identity(f: &StFile, model: &Json) -> Result<(), String> {
     for k in KEYS {
         let a = f.meta.get(k).and_then(Json::str).ok_or(format!("{}: no {k}", f.path))?;
-        let b = man.get(k).ok_or(format!("manifest: no {k}"))?;
+        let b = model.get(k).ok_or(format!("release model metadata: no {k}"))?;
         if b.str().map(str::to_string).or_else(|| b.int().map(|v| v.to_string())).as_deref() != Some(a) {
             return Err(format!("{}: model identity mismatch: {k}", f.path));
         }
@@ -29,7 +41,7 @@ fn identity(f: &StFile, man: &Json) -> Result<(), String> {
 }
 
 /// group = layer number, or None for vocabulary. Extras are preserved separately by the release, not executed.
-fn sources(dir: &str, group: Option<usize>, man: &Json) -> Result<BTreeMap<String, Source>, String> {
+fn sources(dir: &str, group: Option<usize>, model: &Json) -> Result<BTreeMap<String, Source>, String> {
     let nested = std::path::Path::new(dir).join("dense");
     let root = if nested.is_dir() { nested } else { dir.into() };
     let mut paths = std::fs::read_dir(&root).map_err(|e| format!("{}: {e}", root.display()))?
@@ -46,7 +58,7 @@ fn sources(dir: &str, group: Option<usize>, man: &Json) -> Result<BTreeMap<Strin
         let names = meta_json(&f, "source_names")?;
         let names = names.obj().ok_or("source_names is not an object")?;
         if group.is_none() && !names.keys().all(|n| ["embed_tokens", "lm_head", "norm.weight"].contains(&n.as_str())) { continue; }
-        identity(&f, man)?;
+        identity(&f, model)?;
         let shapes = meta_json(&f, "source_shapes")?;
         let rows = f.meta.get("rows").and_then(Json::str);
         let count = if rows.is_some() { f.meta.get("parts").and_then(Json::str).and_then(|s| s.parse().ok()).ok_or("invalid split parts")? } else { 1 };
@@ -168,9 +180,9 @@ fn alias(local: &str) -> &str {
     }
 }
 
-pub(super) fn layer(p: &mut Planner, l: usize, dir: &str, man: &Json) -> Result<(), String> {
-    if let Some(f) = quant_file(dir, Some(l), man)? { return quant_layer(p, l, f); }
-    let all = sources(dir, Some(l), man)?;
+pub(super) fn layer(p: &mut Planner, l: usize, dir: &str, model: &Json) -> Result<(), String> {
+    if let Some(f) = quant_file(dir, Some(l), model)? { return quant_layer(p, l, f); }
+    let all = sources(dir, Some(l), model)?;
     let prefix = format!("model.language_model.layers.{l}.");
     let (h0, nh) = p.shard.heads(l);
     for (full, s) in all {
@@ -204,9 +216,9 @@ pub(super) fn layer(p: &mut Planner, l: usize, dir: &str, man: &Json) -> Result<
     Ok(())
 }
 
-pub(super) fn globals(p: &mut Planner, dir: &str, man: &Json) -> Result<(), String> {
-    if let Some(f) = quant_file(dir, None, man)? { return quant_globals(p, f); }
-    let all = sources(dir, None, man)?;
+pub(super) fn globals(p: &mut Planner, dir: &str, model: &Json) -> Result<(), String> {
+    if let Some(f) = quant_file(dir, None, model)? { return quant_globals(p, f); }
+    let all = sources(dir, None, model)?;
     let mut seen = std::collections::BTreeSet::new();
     for (full, s) in all {
         let name = match full.as_str() {
@@ -227,16 +239,28 @@ pub(super) fn globals(p: &mut Planner, dir: &str, man: &Json) -> Result<(), Stri
 
 // Quantized records use the existing exlr8 decoder and record builders. The
 // separate dispatch preserves the lossless split-file validation above.
-fn quant_file(dir: &str, l: Option<usize>, man: &Json) -> Result<Option<Arc<StFile>>, String> {
+fn quant_file(dir: &str, l: Option<usize>, model: &Json) -> Result<Option<Arc<StFile>>, String> {
     let path = exlr8::dense_path(dir, l);
     if !std::path::Path::new(&path).exists() { return Ok(None); }
     let f = Arc::new(StFile::open(&path)?);
-    if f.meta.get("dense_model").and_then(Json::str) != Some("flash") { return Ok(None); }
-    identity(&f, man)?;
+    if f.meta.get("dense_model").and_then(Json::str) != Some("flash") && !quantized(&f)? { return Ok(None); }
+    identity(&f, model)?;
     let layer = f.meta.get("layer").and_then(Json::str).and_then(|v| v.parse::<usize>().ok());
     if layer != l { return Err(format!("{path}: quantized layer mismatch")); }
     if f.meta.get("rows").is_some() { return Err("quantized Flash split records are unsupported".into()); }
     Ok(Some(f))
+}
+
+/// A dense file holds quantized records when any matrix record names a format other than BF16 / FP32 (the lossless
+/// release's two).
+fn quantized(f: &StFile) -> Result<bool, String> {
+    for name in f.names().iter().filter(|n| n.ends_with(".record")) {
+        let r = f.read_all(name)?;
+        if r.len() != 64 { return Err(format!("{}: {name}: bad record", f.path)); }
+        let fmt = i64::from_le_bytes(r[..8].try_into().unwrap());
+        if fmt != exlr8::BF16 && fmt != exlr8::FP32 { return Ok(true); }
+    }
+    Ok(false)
 }
 
 fn copied(p: &mut Planner, f: &Arc<StFile>, local: &str, label: String, shape: &[usize]) -> Result<(), String> {
