@@ -195,6 +195,22 @@ public:
         ck(g6kv_tier_register(t, pb_.host(0), pb_.host_bytes()), "register");
         return n;
     }
+    // a group lease on a KV node (TierSpec group=): starts at `floor` bytes, grows up to `cap` (0 = the node's limit)
+    // as the node grants segments (s2/kv_share.h). Returns the number of blocks now.
+    uint64_t add_group(const std::string& spec, const std::string& name, const std::string& group, uint32_t nr, uint32_t rank,
+                       uint64_t floor, uint64_t cap, uint32_t weight) {
+        g6kv_tier* t = nullptr;
+        ck(g6kv_tier_open_group(spec.c_str(), name.c_str(), group.c_str(), nr, rank, floor, cap, weight, pb_.block_bytes(), &t),
+           "open group");
+        const uint64_t n = g6kv_store_blocks(t);
+        t_.push_back(t); slots_.push_back(n);
+        if (g6kv_tier_block_bytes(t) != pb_.slot_bytes()) throw std::runtime_error("KV store block size differs from the page block's");
+        ck(g6kv_tier_register(t, pb_.host(0), pb_.host_bytes()), "register");
+        return n;
+    }
+    const g6kv_tier* store(size_t i) const { return t_.at(i); }
+    // a group lease's segment size, 0 for any other store
+    bool group(size_t i) const { return g6kv_store_seg_blocks(t_.at(i)) != 0; }
     size_t size() const { return t_.size(); }
     std::string describe(size_t i) const { char b[256]; g6kv_tier_describe(t_[i], b, sizeof b); return b; }
     // the pool's copies, in order: runs of spills (pages -> blocks), moves (block -> block) and restores (blocks ->
@@ -249,16 +265,22 @@ public:
     }
 };
 
-// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off][,keep=system|sessions|all]. STORE is ssd:PATH (a folder) or remote:HOST:PORT
-// (remote:auto is the launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40. persist=on (SSD only) keeps the
-// folder's system prefixes and counts across restarts; off (the default) clears it at boot. keep= is this store's
-// --kv-keep. The deprecated --kv-tier (old) takes keep=evicted|shared|all instead, which g6m4 maps to --kv-keep.
+// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off][,keep=system|sessions|all][,group=NAME[,cap=N(M|G|T)]
+// [,weight=N]]. STORE is ssd:PATH (a folder) or remote:HOST:PORT (remote:auto is the launcher's to resolve). Sizes are
+// binary: G = 2^30, T = 2^40. persist=on (SSD only) keeps the folder's system prefixes and counts across restarts; off
+// (the default) clears it at boot. keep= is this store's --kv-keep. group= (remote only): the lease joins that group on
+// the node and its size moves between size (the floor) and cap (0 or none: as far as the node gives) by whole segments;
+// weight (1000 = 1x, the default) is its share against the other groups (kvman-rs REMOTE-TIER.md "Sharing a node").
+// The deprecated --kv-tier (old) takes keep=evicted|shared|all instead, which g6m4 maps to --kv-keep.
 struct TierSpec {
     std::string store;
     uint64_t bytes = 0;
     int keep = 0;       // --kv-tier only: 0 evicted, 1 shared, 2 all
     std::string rule;   // --kv-store keep=: system, sessions or all; empty = --kv-keep
     bool persist = false;
+    std::string group;
+    uint64_t cap = 0;
+    uint32_t weight = 0;
     static TierSpec parse(const std::string& v, bool old = false) {
         TierSpec t;
         size_t at = v.find(',');
@@ -268,13 +290,26 @@ struct TierSpec {
             const std::string kv = v.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
             const size_t eq = kv.find('=');
             const std::string k = kv.substr(0, eq), x = eq == std::string::npos ? "" : kv.substr(eq + 1);
-            if (k == "size") {
+            auto bytes = [&] {
                 char* end = nullptr;
                 const double n = strtod(x.c_str(), &end);
                 const std::string unit = end ? end : "";
                 const double mul = unit == "T" ? 1099511627776.0 : unit == "G" ? 1073741824.0 : unit == "M" ? 1048576.0 : 0.0;
-                if (!(n > 0) || !mul) throw std::runtime_error("--kv-store " + v + ": size=N with M, G or T");
-                t.bytes = uint64_t(n * mul);
+                if (!(n > 0) || !mul) throw std::runtime_error("--kv-store " + v + ": " + k + "=N with M, G or T");
+                return uint64_t(n * mul);
+            };
+            if (k == "size") {
+                t.bytes = bytes();
+            } else if (k == "cap") {
+                t.cap = bytes();
+            } else if (k == "group") {
+                if (x.empty()) throw std::runtime_error("--kv-store " + v + ": group=NAME");
+                t.group = x;
+            } else if (k == "weight") {
+                char* end = nullptr;
+                const long w = strtol(x.c_str(), &end, 10);
+                if (x.empty() || *end || w < 1 || w > 1000000) throw std::runtime_error("--kv-store " + v + ": weight=N, 1000 = 1x");
+                t.weight = uint32_t(w);
             } else if (k == "persist") {
                 if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": persist=on or off");
                 t.persist = x == "on";
@@ -294,6 +329,9 @@ struct TierSpec {
             throw std::runtime_error("--kv-store " + v + ": the store is ssd:PATH or remote:HOST:PORT (remote:auto needs the launcher)");
         if (!t.bytes) throw std::runtime_error("--kv-store " + v + ": size=N(G|T) is needed");
         if (t.persist && !ssd) throw std::runtime_error("--kv-store " + v + ": persist=on is for ssd: stores");
+        if (!t.group.empty() && !remote) throw std::runtime_error("--kv-store " + v + ": group= is for remote: stores");
+        if (t.group.empty() && (t.cap || t.weight)) throw std::runtime_error("--kv-store " + v + ": cap= and weight= need group=");
+        if (t.cap && t.cap < t.bytes) throw std::runtime_error("--kv-store " + v + ": cap= is below size=");
         return t;
     }
     bool ssd() const { return store.rfind("ssd:", 0) == 0; }

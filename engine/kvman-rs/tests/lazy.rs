@@ -2,7 +2,7 @@
 //! where RLIMIT_MEMLOCK allows) only while the lease lives, MemAvailable comes back when it ends, a new lease reads
 //! zeros under load on the others, and a grant that would leave the box under --min-free-gb is refused with E_NOROOM.
 
-use g6kvman::remote::{client, sys, Config, Node, Opts, RemoteStore, Want};
+use g6kvman::remote::{client, sys, Config, GroupOpts, Node, Opts, RemoteStore, Share, Want};
 use g6kvman::tier::BlockStore;
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
@@ -236,5 +236,78 @@ fn with_a_ledger_the_node_holds_no_more_than_it_is_credited() {
     // a node without --lazy-lock cannot take a ledger
     let cfg = Config { bytes: 16 * MIB, ledger: Some(file), ..Default::default() };
     assert_eq!(Node::new(&cfg, "127.0.0.1:0".parse().unwrap()).err().unwrap().kind(), ErrorKind::InvalidInput);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_group_lease_backs_the_segments_it_grows_into_and_gives_back_the_ones_it_gives() {
+    use g6kvman::ledger::{Book, Ledger, Side};
+    let _one = one();
+    let (seg, m) = (4 * MIB, MIB as u64);
+    let d = std::env::temp_dir().join(format!("kvman-lazy-group-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let file = d.join("ledger");
+    let led = Ledger::at(&file);
+    led.init(&Book::new(64 * m, 40 * m, 24 * m, 0).unwrap()).unwrap();
+    let share = Share { seg_bytes: seg, margin: Duration::from_secs(60), ..Share::default() };
+    let cfg = Config { bytes: 64 * MIB, lazy: true, ledger: Some(file), share, ..Default::default() };
+    let addr = Node::new(&cfg, "127.0.0.1:0".parse().unwrap()).unwrap().spawn().to_string();
+    let rank = |r: u32| {
+        let group = Some(GroupOpts {
+            group: "g".into(),
+            nr: 2,
+            rank: r,
+            floor_bytes: seg as u64,
+            cap_bytes: 8 * seg as u64,
+            weight: 1000,
+        });
+        RemoteStore::open(&addr, &Opts { want: Want::Tcp, lanes: 2, group, ..Opts::new(&format!("g-r{r}"), MIB, 0) })
+            .unwrap()
+    };
+    let c = [rank(0), rank(1)];
+    let per = c[0].per_seg;
+    assert_eq!(field(&client::stats(&addr).unwrap(), "held"), 8 * m, "each rank's floor");
+    let r = c[0].report(3, &[]).unwrap();
+    assert_eq!(r.grant, 3);
+    assert_eq!(c[0].grow(4, r.txn).unwrap(), 4 * per);
+    assert_eq!(field(&client::stats(&addr).unwrap(), "held"), 20 * m);
+    // the ledger credits the node 24 MiB: the second rank's 12 MiB wait for the GPU to give
+    let e = c[1].grow(4, r.txn).unwrap_err();
+    assert!(e.to_string().contains("ledger credits the node"), "{e}");
+    assert_eq!(field(&client::stats(&addr).unwrap(), "held"), 20 * m, "a refused grow holds nothing more");
+    let g = led.apply(|b| b.begin(Side::Gpu, Side::Node, 8 * m, 0)).unwrap();
+    led.apply(|b| b.released(g, 8 * m)).unwrap();
+    led.apply(|b| b.commit(g, 8 * m)).unwrap();
+    assert_eq!(c[1].grow(4, r.txn).unwrap(), 4 * per);
+    assert_eq!(field(&client::stats(&addr).unwrap(), "held"), 32 * m);
+    let mut got = vec![1u8; MIB];
+    c[1].read_block(4 * per - 1, &mut got).unwrap();
+    assert!(got.iter().all(|&x| x == 0), "a grown segment comes zeroed");
+    for (t, s) in c.iter().enumerate() {
+        for b in 0..s.blocks() {
+            s.write_block(b, &fill(t as u8, b, MIB)).unwrap();
+        }
+    }
+    // a give to the floor: each rank's 3 segments go back to the kernel as it gives them
+    c[0].shrink(1, 0).unwrap();
+    assert_eq!(field(&client::stats(&addr).unwrap(), "held"), 20 * m);
+    c[1].shrink(1, 0).unwrap();
+    assert_eq!(field(&client::stats(&addr).unwrap(), "held"), 8 * m);
+    for (t, s) in c.iter().enumerate() {
+        for b in 0..per {
+            s.read_block(b, &mut got).unwrap();
+            assert!(got == fill(t as u8, b, MIB), "rank {t} block {b} kept");
+        }
+    }
+    // grown again, the segments read zeros: what the group wrote there went back with them
+    let r = c[0].report(1, &[]).unwrap();
+    assert_eq!(r.grant, 1);
+    for s in &c {
+        assert_eq!(s.grow(2, r.txn).unwrap(), 2 * per);
+        s.read_block(2 * per - 1, &mut got).unwrap();
+        assert!(got.iter().all(|&x| x == 0), "a segment given and grown again comes zeroed");
+    }
+    drop(c);
+    until_held(&addr, 0);
     let _ = std::fs::remove_dir_all(&d);
 }

@@ -109,6 +109,17 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 "$T/pool_namespace_test" "${STORES[@]}"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 [ -n "${LAZY_PID:-}" ] && kill "$LAZY_PID"
+# a pool tier on a group lease that grows into the node's grant, gives a segment back when another cluster asks, and
+# shrinks to its floor, through the C interface (s2/kv_share.h): a second node with 2 MiB segments and no margin
+if [ -x "$NODE" ]; then
+  g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_share_test.cpp" "${KVLIB[@]}" -o "$T/kv_share_test"
+  "$NODE" --gb 0.05 --seg-mb 2 --margin-s 0 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma --ready "$T/share.json" > "$T/share.log" 2>&1 &
+  SHARE_PID=$!
+  for _ in $(seq 50); do [ -s "$T/share.json" ] && break; sleep 0.1; done
+  SPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/share.json")
+  "$T/kv_share_test" "remote:127.0.0.1:$SPORT"
+  kill "$SHARE_PID"
+fi
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
 # a held event boundary (Commit::hold): queued admissions chained at one boundary, three ranks on socket pairs

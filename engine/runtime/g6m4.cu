@@ -113,6 +113,7 @@
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
 #include "rt_rows.cuh"
+#include "s2/kv_share.h"
 #include "host_reclaim.h"
 #include <filesystem>
 #include <fstream>
@@ -1494,7 +1495,10 @@ int main(int argc, char** argv)
                         spec = "ssd:" + dir + "/blocks";
                         if (t.persist && !set_id.empty()) index = dir;
                     }
-                    const uint64_t slots = kvt->add(spec, name + "-t" + std::to_string(i), t.bytes);
+                    // group=: a lease that shares its node with other clusters (s2/kv_share.h); it starts at size=
+                    const uint64_t slots = t.group.empty() ? kvt->add(spec, name + "-t" + std::to_string(i), t.bytes)
+                                                           : kvt->add_group(spec, name + "-t" + std::to_string(i), t.group, (uint32_t)g6nr::NR,
+                                                                            (uint32_t)R, t.bytes, t.cap, t.weight);
                     // what makes stored blocks this engine's: the model, the layout, the block format, and the engine binary
                     // itself (another build may compute other KV bits); an index with another line starts empty
                     static const std::string exe = g6s2::exe_stamp();
@@ -1967,6 +1971,40 @@ int main(int argc, char** argv)
             };
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
+            // a tier on a group lease (--kv-store group=): every rank resizes it at the Resize commit; the head reports
+            // to the node, asking for the segments an oversize entry, the pages the tier pushed out since its last
+            // report, or the next spill would need (s2/kv_share.h share_want: ask before the next spill drops an entry),
+            // and announces what the node grants or asks back
+            std::vector<uint32_t> kv_groups;
+            for (size_t i = 0; kvt && i < kvt->size(); ++i) if (kvt->group(i)) kv_groups.push_back((uint32_t)i);
+            std::vector<g6kv_tier_totals> kv_seen(kv_groups.size(), g6kv_tier_totals{});
+            size_t kv_next_group = 0;
+            if (!kv_groups.empty())
+            {
+                h.resize = [&](const g6s2::Resize& r) {
+                    if (!g6s2::share_apply(pool, kvt->store(r.tier), r, kv_drain))
+                        fprintf(stderr, "# rank %d: s2 share: tier %u to %llu blocks refused (transaction %llu), the lease keeps its size: %s\n", R,
+                                r.tier, (unsigned long long)r.slots, (unsigned long long)r.txn, g6kv_tier_error());
+                    else
+                        fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
+                                (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
+                };
+                // G6_KV_SHARE_WHEN=idle (default): the head offers its blocks to other groups only while the engine is
+                // idle, so a give's compaction never pauses a turn; always: whenever the node asks
+                const char* when = getenv("G6_KV_SHARE_WHEN");
+                if (when && strcmp(when, "idle") && strcmp(when, "always")) die("G6_KV_SHARE_WHEN is idle or always");
+                const bool share_always = when && !strcmp(when, "always");
+                if (R == 0)
+                    h.share = [&, share_always](bool idle) -> std::optional<g6s2::Resize> {
+                        // one group tier a report, in turn: one Resize in flight at a time
+                        const size_t k = kv_next_group++ % kv_groups.size();
+                        const uint32_t t = kv_groups[k];
+                        const g6kv_tier_totals now = pool.tiers().at(t);
+                        const uint64_t want = g6s2::share_want(kv_seen[k], now, g6kv_store_seg_blocks(kvt->store(t)));
+                        kv_seen[k] = now;
+                        return g6s2::share_poll(pool, t, kvt->store(t), want, share_always || idle);
+                    };
+            }
             h.dispatch = nd.hooks();
             if (dfl)
             {

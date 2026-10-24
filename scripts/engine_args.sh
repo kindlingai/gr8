@@ -141,6 +141,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   fi
   # DFlash2 after a prefix-reuse hit (DFL_REUSE, DFL_REUSE_MIN; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${DFL_REUSE:+ G6_DFL_REUSE=$DFL_REUSE}"
+  # a KV_STORE group= lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
+  ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ G6_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
   ENGINE_ENV="$ENGINE_ENV${DFL_REUSE_MIN:+ G6_DFL_REUSE_MIN=$DFL_REUSE_MIN}"
   # the MTP confidence stop for solo MTP rounds (MTP_KSTOP, MTP_KSTOP_KMAX, MTP_KSTOP_TAU; docs/SETTINGS.md): off
   # unless set. G6_MTP_KSTOP_SEED3 and the round log G6_MTP_LPLOG stay engine environment (G6ENV_X)

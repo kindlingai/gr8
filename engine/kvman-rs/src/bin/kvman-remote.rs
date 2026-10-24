@@ -2,6 +2,10 @@
 //! REMOTE-TIER.md), over TCP and, on addresses with a RoCE v2 GID, RDMA.
 //!   kvman-remote --gb N [--port 7350] [--bind 0.0.0.0] [--min-free-gb 10] [--no-rdma] [--qp-timeout 14] [--ready FILE]
 //!                [--lazy-lock] [--guard-every-s 1] [--ledger FILE]
+//!                [--seg-mb 1024] [--margin-s 60] [--stall-s 10] [--cooldown-s 10] [--group-plan FILE]
+//! The --seg-mb .. --group-plan flags set how group leases share the node (server.rs Share, REMOTE-TIER.md).
+//! --group-plan reserves each planned group's floors from the start (lines `NAME nr=RANKS floor=SEGS`); the floors
+//! must fit the node.
 //! It refuses to start when locking N GiB would leave less than --min-free-gb of MemAvailable, and when RLIMIT_MEMLOCK
 //! is below N GiB. --lazy-lock (for a node on a box that also serves): nothing is locked at start, and a lease's range
 //! is locked when it is granted and given back to the kernel when it ends. A grant that would leave less than
@@ -11,12 +15,13 @@
 //! SIGTERM stops it. The memory goes back with the process.
 
 use g6kvman::remote::server::json_escape;
-use g6kvman::remote::{sys, verbs, Config, Node};
+use g6kvman::remote::{parse_plan, sys, verbs, Config, Node, Share};
 
 fn usage() -> ! {
     eprintln!(
         "usage: kvman-remote --gb N [--port 7350] [--bind 0.0.0.0] [--min-free-gb 10] [--no-rdma] [--qp-timeout 14] \
-         [--ready FILE] [--lazy-lock] [--guard-every-s 1] [--ledger FILE]"
+         [--ready FILE] [--lazy-lock] [--guard-every-s 1] [--ledger FILE] [--seg-mb 1024] [--margin-s 60] \
+         [--stall-s 10] [--cooldown-s 10] [--group-plan FILE]"
     );
     std::process::exit(2)
 }
@@ -32,6 +37,8 @@ fn main() {
     let (mut gb, mut port, mut bind, mut min_free, mut rdma, mut qp_timeout, mut ready, mut lock) =
         (0.0f64, 7350u16, "0.0.0.0".to_string(), 10.0f64, true, 14u8, None::<String>, true);
     let (mut lazy, mut guard_every, mut ledger) = (false, 1.0f64, None);
+    let mut share = Share::default();
+    let secs = |v: String| std::time::Duration::from_secs_f64(v.parse().unwrap_or_else(|_| usage()));
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| usage());
@@ -48,6 +55,15 @@ fn main() {
             // with --lazy-lock: the host ledger of a box shared with a Flash rank (src/ledger.rs, kvman-ledger). The
             // bytes held never pass what it credits to the node
             "--ledger" => ledger = Some(std::path::PathBuf::from(v())),
+            "--seg-mb" => share.seg_bytes = v().parse::<usize>().unwrap_or_else(|_| usage()) << 20,
+            "--margin-s" => share.margin = secs(v()),
+            "--stall-s" => share.stall = secs(v()),
+            "--cooldown-s" => share.cooldown = secs(v()),
+            "--group-plan" => {
+                let p = v();
+                let text = std::fs::read_to_string(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+                share.plan = parse_plan(&text).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+            }
             // tests only: RLIMIT_MEMLOCK in a container is usually 8 MiB
             "--no-lock" => lock = false,
             _ => usage(),
@@ -80,6 +96,7 @@ fn main() {
         min_free: (min_free * GIB) as u64,
         guard_every: std::time::Duration::from_secs_f64(guard_every),
         ledger,
+        share,
     };
     let node = Node::new(&cfg, listen).unwrap_or_else(|e| die(&e.to_string()));
     let addrs = if rdma { verbs::roce_v2_addrs(verbs::SYSFS) } else { Vec::new() };
@@ -93,9 +110,10 @@ fn main() {
         Vec::new()
     };
     let line = format!(
-        "{{\"port\":{},\"bytes\":{},\"locked\":{},\"lazy\":{lazy},\"rdma\":[{}],\"libibverbs\":{},\"pid\":{},\"setup_s\":{:.2}}}",
+        "{{\"port\":{},\"bytes\":{},\"seg_bytes\":{},\"locked\":{},\"lazy\":{lazy},\"rdma\":[{}],\"libibverbs\":{},\"pid\":{},\"setup_s\":{:.2}}}",
         node.local_addr().map(|a| a.port()).unwrap_or(port),
         node.shared.bytes(),
+        node.shared.seg_bytes(),
         node.shared.locked(),
         rd.join(","),
         lib,

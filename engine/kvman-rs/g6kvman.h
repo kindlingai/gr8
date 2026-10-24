@@ -162,12 +162,21 @@ struct g6kv_tier_totals
     uint64_t full;                       // times the tier had to make room
     uint64_t block_bytes;
     int64_t credit;                      // write limit credit left, blocks (0 without a limit)
+    uint64_t oversize, oversize_last;    // entries bigger than the whole tier, and the last one's pages
 };
 // tier t's counters, or an error when there is no such tier
 int g6kv_tier_stats(const g6kv_pool* p, uint32_t t, g6kv_tier_totals* out);
 // writes into buf the entries loaded from indexes, one line each. The ranks compare these lines at boot. Returns the
 // length of the whole text plus its NUL.
 size_t g6kv_stored_summary(const g6kv_pool* p, char* buf, size_t cap);
+// A tier whose store is a group lease on a KV node (g6kv_tier_open_group) changes size at a point every rank sees:
+// grow = g6kv_store_grow, then g6kv_tier_resize to its blocks, then run the copies; shrink = g6kv_tier_resize to the
+// kept segments' blocks, run the copies (g6kv_io_take, g6kv_io_done), then g6kv_store_shrink. resized = 0: the tier
+// refuses (an indexed tier, or entries it may not evict).
+int g6kv_tier_resize(g6kv_pool* p, uint32_t t, uint64_t slots, int32_t* resized);
+// the ages in ms of tier t's coldest blocks, one per per_seg blocks, coldest first (what a head reports). Returns how
+// many it wrote, at most cap.
+size_t g6kv_tier_coldest(g6kv_pool* p, uint32_t t, uint64_t per_seg, uint64_t* out, size_t cap);
 // keeps the entries the agreed text lists (the head's intersection of every rank's summary), in its order
 void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 
@@ -223,6 +232,29 @@ int g6kv_rows_group(g6kv_rows* r, g6kv_rows_req* req, uint64_t* done, void* slot
 void g6kv_rows_start(g6kv_rows* r);
 uint64_t g6kv_rows_fetched(const g6kv_rows* r);
 void g6kv_rows_describe(const g6kv_rows* r, char* buf, size_t cap);
+// This rank's lease in a group on a KV node (spec remote:HOST:PORT): clusters share the node and capacity moves
+// between them by whole segments. Every rank of a cluster gives the same group, nr, floor, cap and weight (1000 = 1x,
+// 0 = 1000). The lease starts at the floor.
+int g6kv_tier_open_group(const char* spec, const char* name, const char* group, uint32_t nr, uint32_t rank,
+                         uint64_t floor_bytes, uint64_t cap_bytes, uint32_t weight, uint64_t block_bytes, g6kv_tier** out);
+uint64_t g6kv_store_blocks(const g6kv_tier* t);
+// a group lease's blocks per segment and segments now; 0 for any other store
+uint64_t g6kv_store_seg_blocks(const g6kv_tier* t);
+uint64_t g6kv_store_segs(const g6kv_tier* t);
+// the node's answer to a report, in segments per rank: every rank grows by grant, or shrinks by give, under txn
+struct g6kv_report
+{
+    uint64_t grant, give, unclaimed;
+    uint64_t txn;   // the transaction every rank names in g6kv_store_grow / g6kv_store_shrink; 0 = nothing to do
+};
+// rank 0 only: want = segments more per rank (0 = none), ages = g6kv_tier_coldest's
+int g6kv_store_report(const g6kv_tier* t, uint64_t want, const uint64_t* ages, size_t n, g6kv_report* out);
+// grow to segs segments / shrink to segs segments, under the report's transaction txn; the store's blocks after it in
+// *blocks (or NULL). 0; G6KV_STORE_REFUSED: the node refused (a transaction no longer open, or no room), every rank
+// alike, and the store keeps its size; -1 with g6kv_tier_error: a fault
+#define G6KV_STORE_REFUSED 1
+int g6kv_store_grow(const g6kv_tier* t, uint64_t segs, uint64_t txn, uint64_t* blocks);
+int g6kv_store_shrink(const g6kv_tier* t, uint64_t segs, uint64_t txn, uint64_t* blocks);
 // A session's KV in a form independent of the layout (src/canon.rs, #152): per binding and token, in order, the MLA
 // latent row and, on full-index layers, the indexer key row (128 codes, then its FP32 scale). Host memory only: the
 // caller copies the pages between the device and the buffers. flags[b]: 1 = binding b has index keys, 2 = its cache is

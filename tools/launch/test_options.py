@@ -379,6 +379,15 @@ class KvStoreTests(unittest.TestCase):
             self.assertNotIn(a, p['args'])
         self.assertNotIn('--kv-store', self.plan('--kv-store', 'off')[1]['args'])
 
+    def test_a_group_lease_gives_when_idle_or_always(self):
+        b = 'remote:192.0.2.5:7350,size=8G,group=glm,cap=32G,weight=2000'
+        o, p = self.plan('--kv-store', b, '--kv-share-when', 'always')
+        self.assertEqual(self.stores(p), [b])
+        self.assertIn('G6_KV_SHARE_WHEN=always', p['env'])
+        self.assertNotIn('G6_KV_SHARE_WHEN', ' '.join(self.plan('--kv-store', b)[1]['env']))
+        with self.assertRaises(opt.OptionError):
+            self.plan('--kv-store', b, '--kv-share-when', 'busy')
+
     def test_stores_in_flag_order_and_what_they_keep(self):
         a, b = 'ssd:/nvme/gr8kv,size=200G', 'remote:192.0.2.5:7350,size=8G'
         o, p = self.plan('--kv-store', a, '--kv-store', b, '--kv-keep', 'sessions', '--kv-system-after', '3',
