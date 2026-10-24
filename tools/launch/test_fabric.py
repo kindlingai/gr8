@@ -67,6 +67,23 @@ class RailTests(unittest.TestCase):
         self.assertIsNone(F.gid_ipv4('nonsense'))
 
 
+class RingPortTests(unittest.TestCase):
+    def test_addresses_map_to_their_device_and_pcie_root(self):
+        root = make_sys(tempfile.mkdtemp(), {
+            ('rocep1s0f0', '1'): ('4: ACTIVE', [(LINKLOCAL, V2), (gid('10.11.0.1'), V1), (gid('10.11.0.1'), V2)]),
+            ('roceP2p1s0f0', '1'): ('4: ACTIVE', [(gid('10.21.0.1'), V2)]),
+            ('rocep1s0f1', '1'): ('4: ACTIVE', [(gid('10.13.0.1'), V2)]),
+            ('roceP2p1s0f1', '1'): ('1: DOWN', [(gid('10.23.0.1'), V2)])})
+        pci = tempfile.mkdtemp()
+        for dev, bdf in (('rocep1s0f0', '0000:01:00.0'), ('rocep1s0f1', '0000:01:00.1'),
+                         ('roceP2p1s0f0', '0002:01:00.0'), ('roceP2p1s0f1', '0002:01:00.1')):
+            os.makedirs(os.path.join(pci, bdf))
+            os.symlink(os.path.join(pci, bdf), os.path.join(root, dev, 'device'))
+        self.assertEqual(F.ring_ports(root), {'10.11.0.1': ('rocep1s0f0', 0), '10.13.0.1': ('rocep1s0f1', 0),
+                                              '10.21.0.1': ('roceP2p1s0f0', 1)})
+        self.assertEqual(F.ring_ports(tempfile.mkdtemp()), {})
+
+
 class OwnIndexTests(unittest.TestCase):
     def test_own_index(self):
         self.assertEqual(F.own_index(['192.0.2.1', '127.0.0.1']), 1)       # 192.0.2.1 is TEST-NET and is on no box

@@ -110,10 +110,17 @@ class ValidateTests(unittest.TestCase):
             opt.validate(o)
         self.assertIn(want, str(e.exception))
 
+    def test_a_ring_with_mentat(self):
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '3', '--shape', 'ring'], {})
+        opt.validate(o)
+        self.assertEqual((opt.mode(o), o.get('SHAPE')), ('mentat', 'ring'))
+
     def test_refusals(self):
         self.check(['--peers', PEERS, '--shape', 'star'], 'want mesh or ring')
         self.check(['--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--shape', 'ring'], 'TP=3 or 4')
-        self.check(['--mentat', 'localhost', '--tp', '4', '--shape', 'ring'], 'needs --peers')
+        self.check(['--mentat', 'localhost', '--tp', '6', '--shape', 'ring'], 'TP=3 or 4')
+        self.check(['--mentat', 'localhost', '--tp', '4', '--shape', 'ring', '--ips', 'a,b,c,d', '--ips2', 'a,b,c,d'],
+                   'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ips', 'a,b,c,d', '--ips2', 'a,b,c,d'], 'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ring-devs', 'a,b'], 'want four devices')
         self.check(['--peers', PEERS, '--tp', '7'], 'want 4, 6, 3 or 5')

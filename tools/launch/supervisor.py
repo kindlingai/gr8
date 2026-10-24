@@ -267,6 +267,7 @@ class Supervisor:
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
+        self.ring, self.ring_devs, self.ring_ports = '', None, {}   # --shape ring with mentat: the plan, this box's devices
         self.offers = self.variant = self.model_id = None
         self.lingered = False
         self.check_n, self.check_lock = 0, threading.Lock()   # the engine's DIR/check.<n>, numbered per boot
@@ -459,7 +460,8 @@ class Supervisor:
         self.offers = None if self.ms else []     # a release serves any rank; a box without a model serves none
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
-        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant)
+        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant,
+                                        ring=self.ring)
         self.opts, self.digest = c, digest
         log(f'rank {self.rank} of {tp} ({self.lan}, rails {self.rails[0]} {self.rails[1]}), cluster options '
             f'{digest[:16]}, engine {self.build[:16]}')
@@ -513,10 +515,12 @@ class Supervisor:
             self.agent = mentat.Agent(self.daemon, group, f'{group}@gr8@{node_ip}', node_ip, log=log)
             self.agent.set_meta(**{'gr8.version': version(self.home), 'gr8.tp': tp, 'gr8.shape': o.get('SHAPE'),
                                    'gr8.state': 'joining', 'gr8.offers': mentat.format_offers(self.offers)})
+            ring = self.ring_publisher() if o.get('SHAPE') == 'ring' else None
             self.agent.start()
             self.set_state('joining')
             try:
-                ranks, _ = mentat.elect(self.daemon, group, tp, o.get('HEAD'), o.int('JOIN_TIMEOUT'), log=log)
+                ranks, _ = mentat.elect(self.daemon, group, tp, o.get('HEAD'), o.int('JOIN_TIMEOUT'), log=log,
+                                        ring=ring)
             except mentat.NoAssignment as e:
                 raise Stop(4, str(e))
             except RuntimeError as e:
@@ -526,6 +530,8 @@ class Supervisor:
                 raise Stop(1, f'this box ({node_ip}) is not among the members {",".join(self.members)}')
             self.rank, self.lan = self.members.index(node_ip), node_ip
             log(f'mentat group {group}: {",".join(self.members)}; this box is rank {self.rank}')
+            if ring:
+                self.ring_from(ranks)
             if not o.get('IPS') and o.get('SHAPE') != 'ring':
                 self.rails = ranks[self.rank][2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
@@ -540,6 +546,65 @@ class Supervisor:
             except RuntimeError as e:
                 self.fabric_error = f'fabric: {e}'
                 log(self.fabric_error)
+
+    def ring_publisher(self):
+        """--shape ring in mentat mode: a callable that publishes this box's gr8.ring meta (its RoCE addresses and the
+        peer addresses its daemon's probes reach) when it changes. Stop(1) when this box has no RoCE v2 address."""
+        def read_ports():
+            try:
+                return fabric.ring_ports()
+            except OSError as e:
+                raise Stop(1, f'--shape ring: cannot read /sys/class/infiniband ({e})')
+        self.ring_ports = read_ports()
+        if not self.ring_ports:
+            raise Stop(1, '--shape ring: no ACTIVE RoCE v2 address under /sys/class/infiniband: are the ring cables '
+                          'in and addressed?')
+        said, failed = [None], [-60.0]
+
+        def publish():
+            # read again each time: a port that finishes link training during the wait joins the ring
+            self.ring_ports = read_ports()
+            roots = {a: r for a, (_, r) in self.ring_ports.items()}
+            try:
+                text = mentat.own_links(self.daemon.local_status(), roots)
+            except (OSError, ValueError) as e:
+                if time.monotonic() - failed[0] >= 60:
+                    failed[0] = time.monotonic()
+                    log(f'mentat: cannot read this box\'s probes: {e}')
+                return
+            except RuntimeError as e:
+                raise Stop(1, str(e))
+            if text != said[0]:
+                said[0] = text
+                self.agent.set_meta(**{mentat.LINKS_META: text})
+        return publish
+
+    def ring_from(self, ranks):
+        """This box's --ring-devs from the ring mentat's probes form: its four addresses, mapped to device names. An
+        explicit --ring-devs wins."""
+        ports = ranks[self.rank][2]
+        self.ring = mentat.ring_text([lan for lan, _, _ in ranks], [p for _, _, p in ranks])
+        log(f'ring: {" -> ".join(lan for lan, _, _ in ranks)} -> {ranks[0][0]}; this box\'s relay-out, next, '
+            f'relay-in, prev: {",".join(ports)}')
+        devs = [self.ring_ports[a][0] for a in ports]
+        for a, d in zip(ports, devs):
+            others = sorted(x for x, (dd, _) in self.ring_ports.items() if dd == d and x != a)
+            if others:   # the engine takes the device's first RoCE v2 IPv4 GID (fabric.cpp ring_gid_index)
+                log(f'warning: --shape ring: {d} carries {a} and {", ".join(others)}; the engine uses its first RoCE '
+                    'v2 address, which may not be the one on the cable')
+        if self.o.get('RING_DEVS'):
+            if opt.split_list(self.o.get('RING_DEVS')) != devs:
+                log(f'warning: --ring-devs {self.o.get("RING_DEVS")} overrides the cabling mentat found '
+                    f'({",".join(devs)})')
+        else:
+            self.ring_devs = ','.join(devs)
+
+    def ring_args(self):
+        """The engine's ring flags: --ring, and --ring-devs from the option or else from mentat's probes."""
+        if self.o.get('SHAPE') != 'ring':
+            return []
+        devs = self.o.get('RING_DEVS') or self.ring_devs
+        return ['--ring', *(['--ring-devs', devs] if devs else [])]
 
     def checks(self, copy=True):
         """What would stop this box's boot, as text. copy: fetch this rank's model files first. The rank's files are
@@ -717,8 +782,7 @@ class Supervisor:
         ips2 = '--ips2' if models.of(o).name == 'glm53' else '--pf-ips2'
         argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
-        if o.get('SHAPE') == 'ring':
-            argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
+        argv[1:1] = self.ring_args()
         log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
         rotate_logs(self.out, [f'g6m4.r{r}.txt', f'g6m4.r{r}.err'])
         with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \

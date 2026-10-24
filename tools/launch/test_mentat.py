@@ -148,6 +148,210 @@ class MembershipTests(unittest.TestCase):
         self.assertFalse(M.major_ok('2.0') or M.major_ok('x') or M.major_ok('1'))
 
 
+def cabled(n, cables, broken=()):
+    """Local /status snapshots of n switchless boxes. Box i's LAN address is 10.0.0.<i+1>. cables: [(box, port, box,
+    port)] with port 0 (f0) or 1 (f1). Each port shows two RoCE addresses, one per PCIe root, and the two ends of a
+    cable share a /24 per root: root 0 on 10.<10+c>.0.x, root 1 on 10.<20+c>.0.x for cable c. A probe is bound to its
+    address, so it reaches only the far end of its own cable on its own root (mentat's PROTOCOL.md, "Probes").
+    broken: cable indices that answer no probe. Returns (snaps, roots): snaps[i] is box i's local status, roots[i]
+    its {address: root}, as fabric.ring_ports gives them."""
+    addr = {}      # (box, port, root) -> address
+    for c, (a, pa, b, pb) in enumerate(cables):
+        for root in (0, 1):
+            net = 10 + c if root == 0 else 20 + c
+            addr[(a, pa, root)] = f'10.{net}.0.{a + 1}'
+            addr[(b, pb, root)] = f'10.{net}.0.{b + 1}'
+    snaps, roots = [], []
+    for i in range(n):
+        mine = {a: k[2] for k, a in addr.items() if k[0] == i}
+        tags = {f'10.0.0.{i + 1}': ['lan'], **{a: ['connectx', 'rdma'] for a in mine}}
+        peers = {}
+        for j in range(n):
+            if j == i:
+                continue
+            theirs = {a for k, a in addr.items() if k[0] == j}
+            probes = {}
+            for x in mine:
+                row = {}
+                for y in theirs:
+                    if x.rsplit('.', 1)[0] != y.rsplit('.', 1)[0]:
+                        continue             # a bound probe stays in its own subnet
+                    cable = int(x.split('.')[1]) % 10
+                    row[y] = {'ok': cable not in broken, 'rtt_ms': 0, 'direct': True if cable not in broken else None}
+                if row:
+                    probes[x] = row
+            peers[f'n{j + 1}'] = {'node_ip': f'10.0.0.{j + 1}', 'probes': probes}
+        snaps.append({'node_id': f'n{i + 1}', 'node_ip': f'10.0.0.{i + 1}', 'addr_tags': tags, 'peers': peers})
+        roots.append(mine)
+    return snaps, roots, addr
+
+
+def ring_meta(snaps, roots):
+    return {s['node_ip']: M.own_links(s, r) for s, r in zip(snaps, roots)}
+
+
+def ring(order):
+    """The cables of a ring in this order, each box's f0 to the next box's f1 (the --peers convention)."""
+    return [(a, 0, b, 1) for a, b in zip(order, order[1:] + order[:1])]
+
+
+def flipped(order):
+    """The other direction: each box's f1 to the next box's f0."""
+    return [(a, 1, b, 0) for a, b in zip(order, order[1:] + order[:1])]
+
+
+class RingPlanTests(unittest.TestCase):
+    def engine_view(self, order, ports, addr, tp):
+        """Check what engine/comms/fabric.cpp's ring needs of --ring-devs: rank r's direct-next device is cabled to
+        rank r+1's direct-prev one, and (TP=4) its relay-out to rank r+1's relay-in, on other ports of the same cable."""
+        where = {a: k for k, a in addr.items()}
+        for r in range(tp):
+            ro, dn, ri, dp = ports[r]
+            nro, ndn, nri, ndp = ports[(r + 1) % tp]
+            me, nxt = int(order[r].rsplit('.', 1)[1]) - 1, int(order[(r + 1) % tp].rsplit('.', 1)[1]) - 1
+            self.assertEqual((where[dn][0], where[ndp][0]), (me, nxt))
+            self.assertEqual(dn.rsplit('.', 1)[0], ndp.rsplit('.', 1)[0], f'rank {r}: next is not on its cable')
+            self.assertNotEqual(where[dn][1], where[dp][1], f'rank {r}: next and prev on one port')
+            if tp == 4:
+                self.assertEqual(ro.rsplit('.', 1)[0], nri.rsplit('.', 1)[0], f'rank {r}: relay is not on its cable')
+                self.assertNotEqual(ro, dn)
+                self.assertEqual(where[ro][1], where[dn][1], f'rank {r}: relay-out on another port than next')
+                self.assertEqual(where[ri][1], where[dp][1], f'rank {r}: relay-in on another port than prev')
+                # the direct writes take root 1 and the relay root 0, as the GB10 default --ring-devs does
+                self.assertEqual((where[dn][2], where[ro][2]), (1, 0))
+
+    def plan(self, n, cables, offers=None, head=None, broken=()):
+        snaps, roots, addr = cabled(n, cables, broken)
+        meta = ring_meta(snaps, roots)
+        order, ports = M.ring_plan(meta, n, offers or dict.fromkeys(meta), head)
+        return order, ports, addr
+
+    def test_a_partial_probe_table_gives_the_same_tp3_plan(self):
+        """mentat fills its table a round at a time. At TP=3 the relay pair is unused, so a box whose root-0 rows are
+        not in yet derives the same plan (the handshake compares it) as one with the full table."""
+        snaps, roots, addr = cabled(3, ring([0, 2, 1]))
+        full = M.ring_text(*M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in (1, 2, 3))))
+        for s in snaps:
+            for p in s['peers'].values():
+                for x in [x for x in p['probes'] if x.split('.')[1].startswith('1')]:
+                    del p['probes'][x]          # root 0 (10.1x.*) not probed yet
+        order, ports = M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in (1, 2, 3)))
+        self.assertEqual(M.ring_text(order, ports), full)
+        for ro, dn, ri, dp in ports:
+            self.assertEqual((ro, ri), (dn, dp))
+            self.assertTrue(dn.startswith('10.2') and dp.startswith('10.2'))     # root 1
+
+    def test_fewer_boxes_or_a_stranger_head(self):
+        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
+        meta = ring_meta(snaps, roots)
+        with self.assertRaises(M.NoAssignment) as e:
+            M.ring_plan(meta, 4, dict.fromkeys(meta))
+        self.assertIn('links of 3 boxes form no ring of 4', str(e.exception))
+        with self.assertRaises(M.NoAssignment) as e:
+            M.ring_plan(meta, 3, dict.fromkeys(meta), head='10.0.0.9')
+        self.assertIn('--head 10.0.0.9 is not a member', str(e.exception))
+
+    def test_three_and_four_box_rings_in_both_directions(self):
+        for n, cable_order in ((3, [0, 1, 2]), (3, [0, 2, 1]), (4, [0, 1, 2, 3]), (4, [0, 2, 1, 3]), (4, [0, 3, 1, 2])):
+            for cables in (ring(cable_order), flipped(cable_order)):
+                with self.subTest(n=n, cables=cables):
+                    order, ports, addr = self.plan(n, cables)
+                    lan = [f'10.0.0.{i + 1}' for i in range(n)]
+                    want = [lan[i] for i in cable_order]
+                    self.assertEqual(order[0], '10.0.0.1')                           # the lowest address leads
+                    self.assertIn(order, (want, [want[0]] + want[1:][::-1]))          # along the cables
+                    self.assertLess(M.ip_key(order[1]), M.ip_key(order[-1]))         # toward the lower neighbour
+                    self.engine_view(order, ports, addr, n)
+
+    def test_four_boxes_out_of_address_order(self):
+        """LeaderWorkerSet places the pods anywhere: box 3 sits between 1 and 2 on the cables."""
+        order, ports, addr = self.plan(4, ring([0, 2, 1, 3]))
+        self.assertEqual(order, ['10.0.0.1', '10.0.0.3', '10.0.0.2', '10.0.0.4'])
+        # rank 0's next cable is its f0 here: relay-out root 0, direct root 1
+        self.assertEqual(ports[0], (addr[(0, 0, 0)], addr[(0, 0, 1)], addr[(0, 1, 0)], addr[(0, 1, 1)]))
+        order, ports, addr = self.plan(4, flipped([0, 2, 1, 3]))
+        self.assertEqual(order, ['10.0.0.1', '10.0.0.3', '10.0.0.2', '10.0.0.4'])
+        self.assertEqual(ports[0], (addr[(0, 1, 0)], addr[(0, 1, 1)], addr[(0, 0, 0)], addr[(0, 0, 1)]))
+
+    def test_every_box_derives_the_same_plan(self):
+        snaps, roots, _ = cabled(4, ring([0, 3, 1, 2]))
+        meta = ring_meta(snaps, roots)
+        plans = {M.ring_text(*M.ring_plan(dict(reversed(list(meta.items()))), 4, dict.fromkeys(meta)))}
+        plans.add(M.ring_text(*M.ring_plan(meta, 4, dict.fromkeys(meta))))
+        self.assertEqual(len(plans), 1)
+
+    def test_head_and_offers_turn_the_ring(self):
+        order, _, _ = self.plan(4, ring([0, 1, 2, 3]), head='10.0.0.3')
+        self.assertEqual(order, ['10.0.0.3', '10.0.0.2', '10.0.0.1', '10.0.0.4'])
+        held = {'10.0.0.1': [2], '10.0.0.2': None, '10.0.0.3': [0], '10.0.0.4': None}
+        order, ports, addr = self.plan(4, ring([0, 1, 2, 3]), offers=held)
+        self.assertEqual(order, ['10.0.0.3', '10.0.0.2', '10.0.0.1', '10.0.0.4'])
+        self.engine_view(order, ports, addr, 4)
+        with self.assertRaises(M.NoAssignment) as e:     # rank 0 and rank 1 cannot both sit on 10.0.0.1's cables
+            self.plan(4, ring([0, 1, 2, 3]), offers={'10.0.0.1': [0], '10.0.0.2': None, '10.0.0.3': [1],
+                                                     '10.0.0.4': None})
+        self.assertIn('no rank order along the ring (10.0.0.1 - 10.0.0.2 - 10.0.0.3 - 10.0.0.4)', str(e.exception))
+        self.assertIn('10.0.0.3 1', str(e.exception))
+
+    def test_a_broken_cable_is_refused_naming_the_pair(self):
+        for n, cables in ((4, ring([0, 2, 1, 3])), (3, ring([0, 1, 2]))):
+            with self.subTest(n=n):
+                with self.assertRaises(M.NoAssignment) as e:
+                    self.plan(n, cables, broken={1})
+                a, b = cables[1][0] + 1, cables[1][2] + 1
+                self.assertIn(f'no cable works between 10.0.0.{min(a, b)} and 10.0.0.{max(a, b)}', str(e.exception))
+                self.assertIn('Ports that reach no box: ', str(e.exception))
+                self.assertIn(f'10.11.0.{a} on 10.0.0.{a}', str(e.exception))
+
+    def test_a_port_that_reaches_no_box_and_a_missing_box(self):
+        # box 4 is cabled to nothing: a ring of 3 and an idle box
+        snaps, roots, _ = cabled(4, ring([0, 1, 2]))
+        with self.assertRaises(M.NoAssignment) as e:
+            M.ring_plan(ring_meta(snaps, roots), 4, dict.fromkeys(f'10.0.0.{i}' for i in range(1, 5)))
+        self.assertIn('10.0.0.4 reaches no box', str(e.exception))
+
+    def test_four_boxes_need_both_roots_on_a_cable(self):
+        snaps, roots, addr = cabled(4, ring([0, 1, 2, 3]))
+        for s, r in zip(snaps, roots):                      # root 0 of every port unaddressed
+            for a in [a for a, k in r.items() if k == 0]:
+                del r[a]
+        with self.assertRaises(M.NoAssignment) as e:
+            M.ring_plan(ring_meta(snaps, roots), 4, dict.fromkeys(f'10.0.0.{i}' for i in range(1, 5)))
+        self.assertIn('link on one port pair only', str(e.exception))
+        # three boxes write their neighbours directly and need no relay pair
+        snaps, roots, addr = cabled(3, ring([0, 1, 2]))
+        for r in roots:
+            for a in [a for a, k in r.items() if k == 0]:
+                del r[a]
+        order, ports = M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in range(1, 4)))
+        self.assertEqual(order, ['10.0.0.1', '10.0.0.2', '10.0.0.3'])
+        self.assertEqual(ports[0], (addr[(0, 0, 1)], addr[(0, 0, 1)], addr[(0, 1, 1)], addr[(0, 1, 1)]))
+        self.engine_view(order, ports, addr, 3)
+
+    def test_forwarded_and_failed_probes_are_not_links(self):
+        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
+        for p in snaps[0]['peers'].values():
+            for row in p['probes'].values():
+                for y in row:
+                    row[y]['direct'] = False
+        roots_, links = M.parse_links(M.own_links(snaps[0], roots[0]))
+        self.assertEqual((sorted(roots_), links), (sorted(roots[0]), set()))
+        self.assertEqual(M.parse_links(M.own_links({'peers': {}}, {})), ({}, set()))
+        # an IPv6 far end, a null direct (kept: the MAC is unknown) and an address this box cannot use
+        x = sorted(roots[0])[0]
+        local = {'addr_tags': {x: ['rdma'], '10.99.0.1': ['rdma']}, 'peers': {'n2': {'probes': {
+            x: {'fe80::2': {'ok': True, 'direct': True}, '10.11.0.2': {'ok': True, 'direct': None}},
+            '10.99.0.1': {'10.99.0.2': {'ok': True, 'direct': True}}}}}}
+        self.assertEqual(M.parse_links(M.own_links(local, {x: 0}))[1], {(x, '10.11.0.2')})
+
+    def test_meta_fits_mentat(self):
+        snaps, roots, _ = cabled(4, ring([0, 1, 2, 3]))
+        self.assertLess(len(M.own_links(snaps[0], roots[0])), M.META_MAX)
+        big = {f'10.{i}.{j}.1': 0 for i in range(12) for j in range(12)}
+        with self.assertRaises(RuntimeError):
+            M.own_links({'addr_tags': {a: ['rdma'] for a in big}, 'peers': {}}, big)
+
+
 class KvTargetTests(unittest.TestCase):
     def test_rdma_on_a_rail_subnet_first_else_the_lan(self):
         nodes = [('192.0.2.10', 7350, {'gr8.kv.rdma': '10.9.0.10'}), ('192.0.2.20', 7351, {'gr8.kv.rdma': '10.2.0.20,10.1.0.20'})]
@@ -208,6 +412,45 @@ class DaemonTests(unittest.TestCase):
         with self.assertRaises(M.NoAssignment) as e:
             M.elect(self.d, GROUP, 4, sleep=lambda _: None, log=lambda s: None)
         self.assertIn('10.0.0.1 1, 10.0.0.2 1, 10.0.0.3 any, 10.0.0.4 any', str(e.exception))
+
+    def test_a_ring_election_waits_for_links_that_hold(self):
+        rows = {f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in (1, 2, 3)}
+        snaps, roots, _ = cabled(3, ring([0, 2, 1]))
+        meta = ring_meta(snaps, roots)
+        partial = {ip: t.split(';')[0] + ';' for ip, t in meta.items()}   # no links probed yet
+        for i in (1, 2, 3):
+            rows[f'a{i}']['meta'][M.LINKS_META] = partial[f'10.0.0.{i}']
+        self.fake.snap = snapshot(rows)
+        t, reads = [0.0], []
+
+        def sleep(s):
+            t[0] += s
+            reads.append(t[0])
+            if len(reads) == 3:      # the probes come in
+                for i in (1, 2, 3):
+                    rows[f'a{i}']['meta'][M.LINKS_META] = meta[f'10.0.0.{i}']
+        ranks, _ = M.elect(self.d, GROUP, 3, sleep=sleep, log=lambda s: None, clock=lambda: t[0], ring=lambda: None,
+                           ring_stable=20, ring_settle=45)
+        self.assertEqual([r[0] for r in ranks], ['10.0.0.1', '10.0.0.2', '10.0.0.3'])
+        self.assertGreaterEqual(t[0] - reads[2], 20)        # the full links held a probe round first
+
+    def test_a_ring_election_whose_links_keep_changing_times_out(self):
+        rows = {f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in (1, 2, 3)}
+        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
+        meta = ring_meta(snaps, roots)
+        self.fake.snap = snapshot(rows)
+        t, n = [0.0], [0]
+
+        def flap():
+            n[0] += 1
+            for i in (1, 2, 3):
+                rows[f'a{i}']['meta'][M.LINKS_META] = meta[f'10.0.0.{i}'] if n[0] % 2 else ';'
+
+        def sleep(s):
+            t[0] += s
+        with self.assertRaises(RuntimeError) as e:
+            M.elect(self.d, GROUP, 3, timeout=60, sleep=sleep, log=lambda s: None, clock=lambda: t[0], ring=flap)
+        self.assertIn('ring links kept changing', str(e.exception))
 
     def test_election_refusals(self):
         self.fake.snap = snapshot({f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in range(1, 6)})
