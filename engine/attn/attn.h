@@ -35,6 +35,11 @@ struct G6Attn {
     const void *q_b, *kv_a, *kv_norm;
     const void *index_q, *index_k, *index_weight, *index_norm, *index_bias;
     const void *uk, *uv;
+    // uks / uvs non-null (#50, G6_KVB=fp8): uk / uv hold the release's E4M3 kv_b bytes in the BF16 layouts (uk [h][512][192],
+    // transposed by the binder; uv [h][256][512]), and these the release's 128x128-block scales, one per weight row and
+    // 128-column block: uks [h][4][192] (latent block d / 128, then UK row k; transposed by the binder), uvs [h][256][4].
+    // A weight reads as BF16(e4m3 x scale), the value the BF16 loader stores, so outputs are byte-identical to it.
+    const float *uks, *uvs;
     const int *positions, *block_table;
     void *mla_cache, *index_cache;
     int *indices;                 // [rows,2048], logical positions, -1 padding

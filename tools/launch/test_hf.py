@@ -330,6 +330,18 @@ class HFTests(unittest.TestCase):
         self.assertNotIn('--manifest', plan['args'])
         self.assertEqual(str(ms.release), ms.source)
 
+    def test_kvb_fp8_with_the_release_as_the_model(self):
+        import options as opt
+        import supervisor as S
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], {})
+        opt.validate(o)                                          # V2_DENSE is set later, by resolve_model
+        ms, v, err = S.resolve_model(o, log=self.logs.append)
+        self.assertEqual(err, '')
+        plan = opt.engine_plan(o, rank=2, rank_dir=ms.rank_dir(2), aux_dir=ms.rank_dir(2), home='/h')
+        self.assertIn('G6_KVB=fp8', plan['env'])
+        self.assertIn('--v2-dense', plan['args'])
+
     def test_commit_is_recorded_and_refreshed(self):
         r = self.release()
         with open(os.path.join(r.repo.root, 'refs', 'main')) as f:
