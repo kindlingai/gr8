@@ -41,8 +41,10 @@ pool_cap() {
 }
 
 # GLM-5.3-Flash under --serve takes one session and no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu
-# refuses them). CAP is a 32K context plus one prefill chunk until the pool is measured on Flash. MTP=1: --serve needs
-# a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
+# refuses them). MTP=1: --serve needs a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
+# CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and the MTP layer
+# keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at any TP
+# (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
   case $TP in 4|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4 or 2" >&2; return 2 ;; esac
   local k
@@ -50,7 +52,7 @@ flash_defaults() {
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
   [ "${SESS:-1}" = 1 ] || { echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves one session" >&2; return 2; }
-  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-33280}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=1
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=1
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
 }
 
