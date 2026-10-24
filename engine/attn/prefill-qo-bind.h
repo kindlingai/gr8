@@ -19,22 +19,22 @@ struct G6AttnQoStep {
 // max_rows: owner rows per call.
 // Kernel read once at create: G6_PF_QO=b (default: FP16 key-view prepass + core_b) | v1 (prototype, records direct) |
 // r1 (the R1 variant, compiled in when engine/attn/prefill-qo-r1.cuh exists). No persisting-L2 window is set here.
-extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
+extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
                                  int max_rows, void* stream, G6AttnQo* storage_owner);
-extern "C" int g6_attn_qo_run(G6AttnQo*, G6AttnBinding*, const G6AttnQoStep*, void* stream);
-extern "C" size_t g6_attn_qo_bytes(const G6AttnQo*);
+extern "C" int g6a_qo_run(G6AttnQo*, G6AttnBinding*, const G6AttnQoStep*, void* stream);
+extern "C" size_t g6a_qo_bytes(const G6AttnQo*);
 // measurement (gate b): while on, run synchronizes the stream between its stages and adds their wall ms to
 // ms[0] absorb (+ pack_q), ms[1] prepass (B only), ms[2] core, ms[3] cast + UV. Off by default; no effect on results.
-extern "C" void g6_attn_qo_prof(int on, double* ms);
+extern "C" void g6a_qo_prof(int on, double* ms);
 // load-time warm-up: the absorb and UV strided-batched GEMMs once at `rows` (<= max_rows) on the state's workspace
 // (contents are scratch), then a stream sync. cuBLAS's first call per (handle, shape) costs ~0.1-0.4 s on the host.
-extern "C" int g6_attn_qo_warm(G6AttnQo*, int rows, void* stream);     // private weights + workspace (root only)
-extern "C" int g6_attn_qo_release(G6AttnQo*);
+extern "C" int g6a_qo_warm(G6AttnQo*, int rows, void* stream);     // private weights + workspace (root only)
+extern "C" int g6a_qo_release(G6AttnQo*);
 // G6_PF_QP_ROLL (rolling pair pack): reconvert a state's FP16 UK / UV from new BF16 uk / uv of the same head count, on
 // `stream`, with create's kernels (so the FP16 bytes equal a state created from those tensors). The caller orders it
 // after every run that read the old weights.
-extern "C" int g6_attn_qo_load(G6AttnQo*, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream);
+extern "C" int g6a_qo_load(G6AttnQo*, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream);
 // key-table / RoPE-table capacity limit (positions) for states created after this call; 0 = none (the binding's
 // capacity, as before). run refuses a context above the state's capacity. Decode and prefill kernels read positions
 // past a shorter PF_ROPE2 table from ga::cs itself, the same values the table holds.
-extern "C" void g6_attn_qo_cap(int cap);
+extern "C" void g6a_qo_cap(int cap);

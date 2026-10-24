@@ -325,26 +325,26 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
     if(e!=cudaSuccess){profile_release(p->profile);cudaFree(p->storage);release_scratch(p->workspace);delete p;return int(e);}*out=p;return 0;
 }
 }
-extern "C" int g6_attn_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding* b,void* s){return gp::create_state(out,b,s,nullptr,false);}
-extern "C" int g6_attn_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefill* owner){return gp::create_state(out,b,s,owner,true);}
-extern "C" int g6_attn_bind_prefill_release(G6AttnPrefill* p){
+extern "C" int g6a_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding* b,void* s){return gp::create_state(out,b,s,nullptr,false);}
+extern "C" int g6a_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefill* owner){return gp::create_state(out,b,s,owner,true);}
+extern "C" int g6a_bind_prefill_release(G6AttnPrefill* p){
     if(!p)return 0;auto pe=gp::profile_release(p->profile);auto e=cudaFree(p->storage);auto w=gp::release_scratch(p->workspace);delete p;
     return pe!=cudaSuccess?int(pe):(e!=cudaSuccess?int(e):int(w));
 }
-extern "C" int g6_attn_bind_prefill_get_config(const G6AttnPrefill* p,int* tile,int* dense_limit){
+extern "C" int g6a_bind_prefill_get_config(const G6AttnPrefill* p,int* tile,int* dense_limit){
     if(!p)return int(cudaErrorInvalidValue);if(tile)*tile=p->R;if(dense_limit)*dense_limit=p->dense_limit;return 0;
 }
-extern "C" int g6_attn_bind_prefill_profile_read(G6AttnPrefill* p,G6AttnPrefillProfile* out){
+extern "C" int g6a_bind_prefill_profile_read(G6AttnPrefill* p,G6AttnPrefillProfile* out){
     if(!p||!out)return int(cudaErrorInvalidValue);return int(gp::profile_read(p->profile,*out));
 }
-extern "C" size_t g6_attn_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
-extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){
+extern "C" size_t g6a_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
+extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){
     if(!p)return int(cudaErrorInvalidValue);gp::profile_reset(p->profile);
-    if(p->owner!=b||!step)return int(cudaErrorInvalidValue);int rc=g6_attn_bind_prepare(b,step,s);if(rc)return rc;G6Attn a=b->args;if(a.rows>p->maxrows||a.context>p->cap)return int(cudaErrorInvalidValue);
+    if(p->owner!=b||!step)return int(cudaErrorInvalidValue);int rc=g6a_bind_prepare(b,step,s);if(rc)return rc;G6Attn a=b->args;if(a.rows>p->maxrows||a.context>p->cap)return int(cudaErrorInvalidValue);
     cudaStream_t st=(cudaStream_t)s;rc=gp::blas_status(cublasSetStream(p->blas,st));if(rc)return rc;
     bool profiling=false;rc=int(gp::profile_begin(p->profile,st,a.rows,a.context,a.heads,p->R,!a.reuse_indices,trace!=nullptr,profiling));if(rc)return rc;
 #define GP_PROFILE() do{if(profiling){rc=int(gp::profile_mark(p->profile,st));if(rc)return rc;}}while(0)
-    G6_PF_MARK(0,st);rc=g6_attn_append(&a,s);if(rc)return rc;
+    G6_PF_MARK(0,st);rc=g6a_append(&a,s);if(rc)return rc;
     // Append validates the public <=64 decode scratch tile. Only the private
     // prefill workspace below uses the larger tile; no decode ABI is widened.
     a.query_tile=p->R;int expanded=(a.context+31)&~31;
@@ -386,8 +386,8 @@ extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,cons
 #undef GP_PROFILE
     rc=int(cudaGetLastError());if(!rc&&profiling)p->profile.report.status=G6_PF_PROFILE_READY;return rc;
 }
-extern "C" int g6_attn_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){return g6_attn_bind_prefill_trace(p,b,step,nullptr,s);}
-extern "C" int g6_attn_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){int rc=g6_attn_bind_prepare(b,step,s);if(rc)return rc;auto a=b->args;auto st=(cudaStream_t)s;auto w=ga::workspace(a,b->scratch);rc=g6_attn_append(&a,s);if(rc)return rc;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
+extern "C" int g6a_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){return g6a_bind_prefill_trace(p,b,step,nullptr,s);}
+extern "C" int g6a_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){int rc=g6a_bind_prepare(b,step,s);if(rc)return rc;auto a=b->args;auto st=(cudaStream_t)s;auto w=ga::workspace(a,b->scratch);rc=g6a_append(&a,s);if(rc)return rc;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile),H=a.heads;
         if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);ga::launch_index_scores(a,a,w,start,n,st);if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);}
         ga::launch_absorb(a,a,w,start,n,st);gp::trace_copy(tr.q,w.q,start,n,H,512,st);ga::launch_mla_scores(a,a,w,start,n,st);gp::trace_copy(tr.scores,w.prob,start,n,H,ga::TOP,st);

@@ -51,6 +51,7 @@
 #include "../kernels/bind_prefill.cuh"
 #include "../attn/prefill.h"
 #include "../attn/prefill-qo-bind.h"
+#include "../attn/ops.h"
 #include "qo_weights.cuh"
 #include "dtr_find.h"
 #include "cp_pf_tail.h"
