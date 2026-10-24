@@ -18,10 +18,14 @@ python3 fetch_ranks.py --out DIR --nr 6 --ranks 0,1,2 --widths MANIFEST.json|all
   sit on disk in file order. Written in arrival order they scatter, and a loader reading them in order gets about
   3.3 GB/s from a GB10 node's NVMe instead of about 4.1.
 - HF_TOKEN is sent when set (a private repo needs it); the published repo is public.
+- The range GETs reuse kept-alive connections (Hub.send), so a fetch makes about one DNS lookup and TLS handshake
+  per worker, not one per range: a connection a range, with 64 workers, flooded a Kubernetes cluster's DNS and the
+  nodes' conntrack tables (#147).
 
 fetch_layers() is the same fetch as a function: tools/launch (./gr8 glm53 up --model <hf url>) calls it.
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -30,6 +34,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -56,6 +61,8 @@ class Hub:
         self.urls, self.lock = {}, threading.Lock()
         self.noredir = urllib.request.build_opener(NoRedirect)
         self.entries = {}                   # path -> the tree entry (size, oid, lfs), filled by tree()
+        self.idle, self.idle_lock = {}, threading.Lock()   # (scheme, host) -> kept-alive connections not in use
+        self.proxies = urllib.request.getproxies()
 
     def tree(self):
         out, url = {}, f'{self.base}/api/models/{self.repo}/tree/{self.rev}?recursive=true'
@@ -90,19 +97,54 @@ class Hub:
                 self.urls[path] = loc
             return self.urls[path]
 
+    def send(self, u, h):
+        """(response, body) of a GET of u, on a kept-alive connection to its host that goes back to the pool once the
+        body is read. Through urllib, which opens a connection a request, when a proxy is set for the host."""
+        p = urllib.parse.urlsplit(u)
+        if self.proxies.get(p.scheme) and not urllib.request.proxy_bypass(p.hostname):
+            with urllib.request.urlopen(urllib.request.Request(u, headers=h), timeout=120) as r:
+                return r, r.read()
+        key, target = (p.scheme, p.netloc), p.path + ('?' + p.query if p.query else '')
+        with self.idle_lock:
+            conn = self.idle[key].pop() if self.idle.get(key) else None
+        for fresh in (conn is None, True):
+            if fresh:
+                conn = (http.client.HTTPSConnection if p.scheme == 'https' else http.client.HTTPConnection)(
+                    p.netloc, timeout=120)
+            try:
+                conn.request('GET', target, headers=h)
+                r = conn.getresponse()
+                b = r.read()
+                break
+            except ConnectionError:
+                conn.close()
+                if fresh:
+                    raise                       # an idle connection the server closed: once more on a new one
+            except BaseException:
+                conn.close()
+                raise
+        if r.will_close:
+            conn.close()
+        else:
+            with self.idle_lock:
+                self.idle.setdefault(key, []).append(conn)
+        return r, b
+
     def get(self, path, lo, n):
         """Bytes [lo, lo + n) of a repo file, with retries."""
         for attempt in range(8):
             try:
                 u = self.url(path, fresh=attempt > 0)
-                h = {'Range': f'bytes={lo}-{lo + n - 1}'}
-                if u.startswith(self.base):
-                    h.update(self.auth())                          # direct hub URL (non-LFS): the token, if any
-                req = urllib.request.Request(u, headers=h)
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    if r.status != 206 and not (lo == 0 and r.status == 200):
-                        raise RuntimeError(f'{path}: HTTP {r.status} for a range')
-                    b = r.read()
+                for _ in range(5):                                 # redirects, as urlopen followed them
+                    h = {'Range': f'bytes={lo}-{lo + n - 1}'}
+                    if u.startswith(self.base):
+                        h.update(self.auth())                      # direct hub URL (non-LFS): the token, if any
+                    r, b = self.send(u, h)
+                    if r.status not in (301, 302, 303, 307, 308):
+                        break
+                    u = urllib.parse.urljoin(u, r.headers['Location'])
+                if r.status != 206 and not (lo == 0 and r.status == 200):
+                    raise RuntimeError(f'{path}: HTTP {r.status} for a range')
                 if len(b) != n:
                     raise RuntimeError(f'{path} [{lo}, +{n}): got {len(b)} bytes')
                 return b

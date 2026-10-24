@@ -436,6 +436,68 @@ class NoNumpyFetchTests(unittest.TestCase):
         same_halves(self.root, r.v2, 3, 4, 0, lambda p: 3)
 
 
+class KeepAliveTests(unittest.TestCase):
+    """Hub.get's range GETs reuse kept-alive connections (#147): one connection for many ranges, a redirect to another
+    host followed on that host's connection, and an idle connection the server closed replaced without a retry."""
+
+    def setUp(self):
+        self.data, self.conns, self.close_next = bytes(range(256)) * 64, [], [False]
+        t = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def log_message(self, *_):
+                pass
+
+            def setup(self):
+                super().setup()
+                t.conns.append(self.client_address)
+
+            def do_GET(self):
+                if self.path.startswith('/hop/'):
+                    self.send_response(302)
+                    self.send_header('Location', f'http://localhost:{t.port}/f/{self.path[5:]}')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                a, b = (int(x) for x in self.headers['Range'].split('=')[1].split('-'))
+                body = t.data[a:b + 1]
+                self.send_response(206)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                if t.close_next[0]:
+                    t.close_next[0], self.close_connection = False, True
+
+        self.srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+        self.srv.daemon_threads = True
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.hub = hfsource.fetch_ranks().Hub('o/r', base=f'http://127.0.0.1:{self.port}')
+        self.hub.proxies = {}
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_one_connection_for_many_ranges(self):
+        self.hub.urls['x'] = f'http://127.0.0.1:{self.port}/f/x'
+        for i in range(50):
+            self.assertEqual(self.hub.get('x', i * 100, 100), self.data[i * 100:i * 100 + 100])
+        self.assertEqual(len(self.conns), 1)
+
+    def test_a_redirect_and_a_closed_idle_connection(self):
+        self.hub.urls['x'] = f'http://127.0.0.1:{self.port}/hop/x'
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for i in range(10):
+                self.close_next[0] = i == 4      # the server drops the connection after the fifth range
+                self.assertEqual(self.hub.get('x', i * 7, 7), self.data[i * 7:i * 7 + 7])
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(len(self.conns), 3)    # 127.0.0.1 and localhost, then localhost again after the close
+
+
 STUB_CONVERT = """import json, os, sys
 a = sys.argv[1:]
 out, r = a[a.index('--out') + 1], int(a[a.index('--ranks') + 1])
