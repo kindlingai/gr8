@@ -290,9 +290,10 @@ canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve
   newline, in reasoning, in a fence) arrives only when the reply ends with it, because nothing in the text says whether
   the model is making a call or writing about one (`g6front-rs/src/parser.rs`). A streamed call stays a call if prose
   follows it, and a streamed call cut off by `max_tokens` is closed with the arguments it had.
-- `response_format` `json_object` / `json_schema` are enforced after generation (the engine does not constrain decoding
-  yet). The reply's JSON object or array is extracted: inside a ```` ```json ```` fence if it has one, else the first
-  top-level value. A value cut off by `max_tokens` yields nothing, rather than a complete value nested inside it. For
+- `response_format` `json_object` / `json_schema` are enforced after generation. With an engine whose hello says
+  `"grammar": true` (`GRAMMAR=1`) and no tools in the request, the engine also constrains decoding to the grammar
+  (PROTOCOL.md `grammar`), so the check below finds what it asked for. The reply's JSON object or array is extracted:
+  inside a ```` ```json ```` fence if it has one, else the first top-level value. A value cut off by `max_tokens` yields nothing, rather than a complete value nested inside it. For
   `json_schema` the value is checked with the schema's XGrammar grammar, keys in any order. Required and duplicate
   keys are checked on the parsed value, because XGrammar does not check them in any order. Undeclared keys pass unless
   `json_schema.strict` is `true`. A schema whose root type is neither object nor array is a 400. No JSON, or a value

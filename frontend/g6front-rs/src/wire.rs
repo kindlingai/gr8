@@ -201,6 +201,8 @@ pub struct GenParams {
     pub system_tokens: Option<u64>,
     /// the engine's insert rule (PROTOCOL.md `insert`); only sent when set
     pub insert: Option<InsertRule>,
+    /// the reply's grammar (PROTOCOL.md `grammar`); only sent when set, to an engine whose hello says `"grammar": true`
+    pub grammar: Option<GrammarReq>,
     /// Only sent after validation against hello.steering. None preserves stock frame bytes.
     pub steering_profile: Option<String>,
     /// Canonical FP32 widened to f64 for lossless JSON serialization.
@@ -214,6 +216,17 @@ pub struct InsertRule {
     pub after_tokens: u64,
     pub unless_emitted: Option<u32>,
     pub tokens: Vec<u32>,
+}
+
+/// The engine masks the reply's tokens with this grammar from the token after `after_token` (the think close) on, or
+/// from the first when it is None.
+#[derive(Clone, Debug)]
+pub struct GrammarReq {
+    /// `json` (any JSON value) or `json_schema`
+    pub kind: &'static str,
+    pub schema: Option<String>,
+    pub strict: bool,
+    pub after_token: Option<u32>,
 }
 
 fn opt_int(b: &mut Vec<u8>, v: Option<i64>) {
@@ -263,6 +276,17 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     if let Some(n) = p.system_tokens {
         b.extend_from_slice(b",\"system_tokens\":");
         pyjson::int(b, n);
+    }
+    if let Some(g) = &p.grammar {
+        b.extend_from_slice(b",\"grammar\":{\"kind\":");
+        pyjson::string(b, g.kind);
+        if let Some(s) = &g.schema {
+            b.extend_from_slice(b",\"schema\":");
+            pyjson::string(b, s);
+        }
+        b.extend_from_slice(if g.strict { b",\"strict\":true,\"after_token\":" } else { b",\"strict\":false,\"after_token\":" });
+        opt_int(b, g.after_token.map(i64::from));
+        b.push(b'}');
     }
     if let Some(r) = &p.insert {
         b.extend_from_slice(b",\"insert\":[{\"after_tokens\":");
@@ -323,6 +347,7 @@ mod tests {
             prompt_logprobs: None,
             system_tokens: Some(2),
             insert: None,
+            grammar: None,
             steering_profile: None,
             steering_scale: None,
         };

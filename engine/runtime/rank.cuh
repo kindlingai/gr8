@@ -440,6 +440,14 @@ struct Model
     glue::RoutePlan* plan = nullptr;
     int* rlog = nullptr;              // G6_ROUTE_LOG (measurement): pinned [nl][RLOG] copies of plan n_slots / pad / slot_expert
     glue::SampleRow* srow = nullptr;
+    // grammar masks (grammar.h; the main model only, set before any capture, so the S = 1 and the S2 graphs both carry
+    // the kernel): row r with gm_on[r] samples only the ids whose bit is set in gm_bits[r * gm_words ..]. Mapped host
+    // memory, rewritten before each step by s2/dispatch.h through the host addresses
+    const int* gm_on = nullptr;
+    const uint32_t* gm_bits = nullptr;
+    int gm_words = 0;
+    int* gm_on_host = nullptr;
+    uint32_t* gm_bits_host = nullptr;
     glue::TkRes* tk = nullptr;        // top lists of the step's rows with SampleRow::topk > 0 (main model only; null = none)
     int *tok = nullptr, *pos = nullptr, *tok_out = nullptr, *tgt = nullptr;
     void* scratch = nullptr;
@@ -1797,6 +1805,22 @@ inline void launch_step_out(Model& m, int M, cudaStream_t st)
     k_step_out<<<1, 128, 0, st>>>(StepEnd{m.tok_out, m.lp, m.lpt, m.errs, m.nl, M, m.out});
 }
 
+// grid M, block 256: row m's logits of the ids its grammar refuses become -inf, so every sampling path (greedy, top_p,
+// the rejection sampling of drafts) and every logprob sees the grammar's distribution
+__global__ void __launch_bounds__(256) k_grammar_mask(float* logits, int ldl, int vlo, int vn, const int* on, const uint32_t* bits,
+                                                      int words)
+{
+    const int m = blockIdx.x;
+    if (!on[m]) return;
+    const uint32_t* b = bits + (size_t)m * words;
+    float* row = logits + (size_t)m * ldl;
+    for (int i = threadIdx.x; i < vn; i += 256)
+    {
+        const int v = vlo + i;
+        if (!((b[v >> 5] >> (v & 31)) & 1u)) row[i] = -INFINITY;
+    }
+}
+
 // m.x holds the final-norm output of the last layer's second consume
 inline void launch_head_local(Model& m, int M, cudaStream_t st)
 {
@@ -1824,6 +1848,7 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
 #endif
     bind::launch(H.xf_h, st);
     bind::launch(H.lm_head, st);
+    if (m.gm_on) k_grammar_mask<<<M, 256, 0, st>>>(m.hlog, m.vn, m.vlo, m.vn, m.gm_on, m.gm_bits, m.gm_words);
     if (m.rs) glue::k_head_local_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);
     else glue::k_head_local<<<M, 1024, 0, st>>>(head_args(m, M));
     dmark(DP_HEAD_L, st);

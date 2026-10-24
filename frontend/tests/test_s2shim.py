@@ -127,6 +127,16 @@ class UnitTests(unittest.TestCase):
         self.assertIn(b' top_p 1.0 sys 2\n', g6s2shim.build_request({'prompt': [1, 2, 3], 'max_tokens': 4, 'system_tokens': 2}, 0)[0])
         self.assertEqual(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'system_tokens': 5}, 0)[1],
                          'system_tokens must be 0..len(prompt)')
+        # a grammar (engine/runtime/grammar.h): gram <kind>:<strict>:<arm>:<schema hex>, after ins and before steer
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'grammar': {
+            'kind': 'json_schema', 'schema': '{}', 'strict': True, 'after_token': 154842}}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 gram 2:1:154842:7b7d\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'grammar': {'kind': 'json', 'after_token': None}}, 0)
+        self.assertIn(b' top_p 1.0 gram 1:0:-1:\n', body)
+        for bad, why in (({'kind': 'regex'}, 'grammar must be'), ({'kind': 'json_schema'}, 'needs the schema'),
+                         ({'kind': 'json', 'strict': 1}, 'strict must be'), ({'kind': 'json', 'after_token': -1}, 'after_token')):
+            self.assertIn(why, g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'grammar': bad}, 0)[1])
         cap = {'profile': 'example', 'forced': False, 'forced_scale': 0.0}
         body, err = g6s2shim.build_request(
             {'prompt': [1], 'max_tokens': 4, 'steering_profile': 'example'}, 0, cap)

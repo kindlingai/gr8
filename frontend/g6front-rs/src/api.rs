@@ -497,6 +497,20 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     };
     let force = choice.forced_ids(&st.tok, close)?;
     params.gen.system_tokens = system;
+    // a JSON mode with no tools: the engine masks the reply to the grammar (after the think close while the prompt leaves
+    // the think block open); the extraction after generation still runs. With tools the grammar would forbid a call
+    if rf.kind != "text" && tools.is_none() && st.engine.grammars() {
+        let after_token = match (st.tok.think_start, st.tok.think_end) {
+            (Some(start), Some(end)) if think_open(&prompt, start, end) => Some(end),
+            _ => None,
+        };
+        params.gen.grammar = Some(crate::wire::GrammarReq {
+            kind: if rf.kind == "json_schema" { "json_schema" } else { "json" },
+            schema: rf.schema.as_ref().map(Value::to_string),
+            strict: rf.strict,
+            after_token,
+        });
+    }
     (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(body, st.steering().as_ref())?;
     Ok(ChatReq { tools, choice, force, prompt, params, budget, rf })
 }

@@ -172,6 +172,10 @@ def resolve_model(o, refresh=False, log=log):
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
         models.check_config(models.of(o), ms.tokenizer)
+        if o.get('GRAMMAR') == '1' and not o.get('GRAMMAR_DIR'):
+            o.values['GRAMMAR_DIR'] = ms.tokenizer
+        if o.get('GRAMMAR') != '1':
+            o.values['GRAMMAR_DIR'] = None
         steering_hf.bind(o, release)
         steering_local.prepare(o, ms)
         ms.drafter = drafter_of(o, ms, refresh, log)
