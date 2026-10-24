@@ -198,11 +198,64 @@ int main(int argc, char** argv) {
     CHECK(!apply(Resize{FLASH_CKPT_TIER, 3, 3 * per, 999999}));
     CHECK(a[0]->segments() == 2 && restores() == 2 * 2);
 
+    // 6. D-331 M8 E(c) defect A: a cycle of K prompts through a lease that holds fewer than K entries restores nothing
+    // (each capture drops the least recently used, the one the cycle needs next: eviction, by design). Fixed two ways:
+    // (a) with no cap= (cap 0, "the node's limit") the lease asks, the node grants and the cycle restores. Before the
+    // node took cap 0 as no cap it took it as cap = floor and never granted. (b) a floor that holds K entries restores
+    // with no Resize.
+    {
+        constexpr int K = 3;   // 4-page prompts; the 2-segment floor holds 2
+        std::vector<std::vector<std::vector<uint8_t>>> want(K);
+        // one request as serve runs it: a hit restores (bit for bit), a miss fills the state and keeps it
+        const auto lap = [&](FlashCheckpoints& c) {
+            int hits = 0;
+            for (int i = 0; i < K; ++i) {
+                const auto prompt = toks(4 * 64 + 100, 40 + i);
+                const FlashHit h = c.index().match(prompt, int(prompt.size()) - 1, {});
+                if (h.hit) {
+                    d.poison();
+                    c.restore(h.generation, 0, st);
+                    CHECK(h.position == 4 * 64 && same(d, want[i], 4));
+                    ++hits;
+                } else {
+                    d.fill(40 + i);
+                    want[i] = d.snap();
+                    CHECK(c.capture(4 * 64, 0, std::vector<int>(prompt.begin(), prompt.begin() + 4 * 64 + 1), {}, st));
+                }
+            }
+            return hits;
+        };
+        const FlashGroup gc{"fckg-c-" + tag, 1, 0, 0, 1000};   // cap 0: no cap=
+        FlashCheckpoints c(v, spec, "fckg-c0-" + tag, 2 * sg, "test compat", &gc);
+        CHECK(c.segments() == 2 && 2 * blocks(4) <= c.blocks() && K * blocks(4) > c.blocks());
+        int h0 = lap(c), h1 = lap(c);
+        printf("cap 0 at the floor (%llu blocks, %d prompts of %llu blocks): laps hit %d, %d\n", (unsigned long long)c.blocks(), K,
+               (unsigned long long)blocks(4), h0, h1);
+        CHECK(h0 == 0 && h1 == 0 && c.index().size() == 2);
+        const auto a6 = c.share_ask(false);
+        CHECK(a6.first > 0);
+        const auto g6 = c.share_report(FLASH_CKPT_TIER, a6.first, a6.second);
+        CHECK(g6 && g6->segs > 2);   // fails when the node takes cap 0 as cap = floor
+        if (g6) CHECK(c.apply(*g6));
+        CHECK(c.blocks() >= K * blocks(4));
+        h0 = lap(c); h1 = lap(c);
+        printf("cap 0 after the grant (%llu segments, %llu blocks): laps hit %d, %d\n", (unsigned long long)c.segments(),
+               (unsigned long long)c.blocks(), h0, h1);
+        CHECK(h0 == K - 1 && h1 == K);
+        // (b) the floor sized for the cycle: 3 segments, no Resize
+        const FlashGroup gf{"fckg-f-" + tag, 1, 0, 3 * sg, 1000};
+        FlashCheckpoints f(v, spec, "fckg-f0-" + tag, 3 * sg, "test compat", &gf);
+        CHECK(f.segments() == 3 && K * blocks(4) <= f.blocks());
+        h0 = lap(f); h1 = lap(f);
+        printf("floor of 3 segments (%llu blocks): laps hit %d, %d\n", (unsigned long long)f.blocks(), h0, h1);
+        CHECK(h0 == 0 && h1 == K && f.segments() == 3);
+    }
+
     g6kv_tier_free(b);
     a[0].reset(); a[1].reset();
     CK(cudaStreamDestroy(st));
     for (auto& [p, n] : d.all()) cudaFree(p);
     printf("flash_ckpt_group: %s (ask before a drop, grant, grow, oversize fits, give with ages, LRU drop + pack, restores "
-           "bit for bit after moves, floor, refused transaction)\n", fails ? "FAIL" : "PASS");
+           "bit for bit after moves, floor, refused transaction, cap 0 grows a cycling lease, a floor sized for the cycle)\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

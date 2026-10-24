@@ -116,6 +116,13 @@ or give is a Resize event every rank applies at the same commit: a grow adds blo
 used checkpoints until the rest fit, copies the ones above the new end down, then gives the top segments back. The log
 prints `# rank R: flash ckpt share: now S segments, B blocks (N entries, D dropped) in T ms`. Not measured on a box.
 
+Size the floor for the prompts that come back. The node rounds `size=` up to whole segments of whole blocks, and
+a 1 GiB segment holds 840 blocks of Flash's TP=2 block (1,277,952 B), which is just under 1 GiB. So `size=1G` is 2
+segments (2.00 GiB, 1,680 blocks) and `size=2G` is 3 (3.00 GiB, 2,520 blocks). One checkpoint at 16,384 rows is 317
+blocks, so `size=1G` holds 5 and `size=2G` holds 7. A cycle of more prompts than the lease holds restores nothing: each
+capture drops the least recently used, the one the cycle needs next. With no `cap=` the lease asks and grows past
+the floor, as far as the node has room.
+
 The boot log prints `# rank R: flash ckpt aligned: ...`, and each request prints `flash ckpt request ... kept ...` or
 `... restored ...` with the time.
 

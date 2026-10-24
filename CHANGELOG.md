@@ -1,6 +1,16 @@
 # Changelog
 
 
+## 2026-10-24: Flash checkpoints on a group lease: a cycle bigger than the lease restores nothing (D-331 M8 defect A)
+
+- M8 E(c) on the box kept 18 Flash checkpoints and restored 0. That was eviction, not a lookup bug. `size=1G` with 1 GiB
+  segments is a 2-segment, 1,680-block lease, so it holds 5 checkpoints of 317 blocks. The trace cycles 6 prompts, so
+  each capture dropped the one the cycle needed next. The lease never grew, because the node took no `cap=` as
+  cap = floor (fixed above). `docs/FLASH.md` now says how to size the floor (`size=2G` is 3 segments, 7 checkpoints).
+- Test: `engine/runtime/tests/flash_ckpt_group_test.cu` section 6. A 3-prompt cycle through a 2-entry floor hits 0.
+  With no `cap=`, the lease is granted segments and then hits 2 and 3. A floor that holds the cycle hits 3 with no
+  Resize. The grant check fails on the node before the fix above and passes after it. Not measured on a box.
+
 ## 2026-10-24: a group lease with no `cap=` grows past its floor (D-331 M8 fix)
 
 - kvman-remote GOPEN: `cap_bytes` 0 (no `cap=` on `--kv-store ...,group=G`) now means no cap, so the group grows as far
