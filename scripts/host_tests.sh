@@ -12,7 +12,8 @@
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
 # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
 # the pool's block
-# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
+# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the same with
+# failed store calls under --kv-store-fail soft (pool_fault_test), the commit
 # frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
 # after load (engine/runtime/host_reclaim.h), and steering profile contracts/validation.
 #   scripts/host_tests.sh
@@ -96,6 +97,21 @@ if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in
   [ -n "$PORT" ] && STORES+=("remote:127.0.0.1:$PORT")
 fi
 "$T/pool_stash_test" "${STORES[@]}"
+# --kv-store-fail soft (s2/kv_fault.h): injected store failures on one rank, then a real KV node killed and one frozen
+# under rank 1 (each its own node)
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_fault_test.cpp" "${KVLIB[@]}" -o "$T/pool_fault_test"
+"$T/pool_fault_test" "${STORES[@]}" 2> >(grep -v '^# rank [01]: s2 store' >&2)
+if [ -x "$NODE" ]; then
+  for SIG in kill stop; do
+    : > "$T/fnode.json"
+    "$NODE" --gb 0.05 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --ready "$T/fnode.json" > "$T/fnode.log" 2>&1 &
+    FPID=$!
+    for _ in $(seq 50); do [ -s "$T/fnode.json" ] && break; sleep 0.1; done
+    FPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/fnode.json")
+    "$T/pool_fault_test" --$SIG $FPID "remote:127.0.0.1:$FPORT"
+    kill -CONT $FPID 2>/dev/null || true; kill $FPID 2>/dev/null || true; wait $FPID 2>/dev/null || true
+  done
+fi
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_namespace_test.cpp" "${KVLIB[@]}" -o "$T/pool_namespace_test"
 "$T/pool_namespace_test" "${STORES[@]}"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"

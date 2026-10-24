@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-23: a failed KV store no longer stops the serve (`--kv-store-fail soft`, `--kv-store-timeout`)
+
+- A store call that fails (a KV node killed, a node frozen past `--kv-store-timeout`, an SSD error) marks that store
+  dead on the rank that saw it. Its later calls on that rank are skipped, so a frozen node costs one timeout. The ranks
+  OR their dead stores at the barrier after each drain (the barrier's Sync and Go frames carry the word), and every rank
+  drops those stores from the pool alike (`g6kv_tier_dead`): their entries, the runs stored on their prefixes, and
+  entries moved out of them since the last barrier. A request whose rows were being restored from them prefills from
+  row 0 again. The status JSON marks the store `"dead":1`, and the store log line says DEAD.
+- `--kv-store-fail hard` keeps the old behaviour (the serve stops). A store that fails at boot stops the boot either
+  way. Launch knobs `KV_STORE_FAIL` (soft) and `KV_STORE_TIMEOUT_S` (30, at most 100: the control timeout is 120 s).
+- KV node calls time out: TCP reads and writes on the control socket and the lanes wait `--kv-store-timeout` (30 s),
+  an RDMA completion at most 10 s, and TCP keepalive sees a silent node box. A lane that failed on a socket error
+  stays failed.
+- The control version is 8 (`G6S2E8`, bootstrap agreement ` ctl 8`): deploy the same build on every rank.
+- Tested on the dev box only (host tests: `pool_fault_test` with injected failures and a loopback node killed and
+  frozen, `control_sync_test`, `driver_grow_test`, kvman-rs `tests/remote.rs` and `tests/stash.rs`). Not measured on
+  the boxes.
+
 ## 2026-10-23: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
 
 - `G6_TR3_W2ALL=1` applies the window-2 fc1 split (KS1x2, WG1) to every MoE layer at M > 1, not only the layers the k2

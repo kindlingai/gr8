@@ -54,7 +54,7 @@ struct NativeHooks {
     // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
     std::function<bool()> drained;
     // optional, --kv-store-fail soft (kv_fault.h): this rank's failed store tiers since the last call (bit t), and the
-    // tiers every rank agreed on at the barrier after a drain, to drop alike on every rank
+    // tiers every rank agreed on at the barrier after a drain (0: none failed), to drop alike on every rank
     std::function<uint64_t()> store_faults;
     std::function<void(uint64_t)> stores_dead;
     DispatchHooks dispatch;
@@ -408,10 +408,10 @@ public:
                 const long long b0 = wall();
                 const uint64_t dead = endpoint_->sync(++sync_, native_.store_faults ? native_.store_faults() : 0);
                 fprintf(stderr, "# rank %u: s2 drain barrier %llu: in %lld ms, out %lld ms\n", (unsigned)c_.rank, (unsigned long long)sync_, b0, wall());
-                if (!dead) return false;
-                require(bool(native_.stores_dead), "a failed store without --kv-store-fail soft");
-                native_.stores_dead(dead);
-                return true;
+                // soft: every barrier, with 0 when every store did well (the pool settles the moves since the last one)
+                if (native_.stores_dead) native_.stores_dead(dead);
+                else require(!dead, "a failed store without --kv-store-fail soft");
+                return dead != 0;
             };
         // a grant whose restore a failed store spoiled: the same session, its rows from 0 (Driver::step, every rank)
         h.rebind = [&](const Grant& g) {

@@ -215,8 +215,11 @@ pub struct Stash {
     tiers: Vec<Tier>,
     pub(crate) io: Vec<Io>,
     taken: bool,
-    // the moves of the copies last taken (tier, slot, to, to_slot): a tier that failed under them left garbage there
+    // the moves of the copies taken since the last tier_dead (tier, slot, to, to_slot): a tier that failed under them
+    // left garbage there. Kept across take_io calls once tier_dead runs at each barrier (--kv-store-fail soft: several
+    // drains can fall between two barriers); without it only the last take_io's
     moved: Vec<(u32, u64, u32, u64)>,
+    settles: bool,
     commits: Vec<(usize, u64)>,
     counts: BTreeMap<u64, (u32, u64)>,
     counted: Vec<(u64, u32, u64)>, // counts since the last io_done, for the index
@@ -257,6 +260,7 @@ impl Stash {
             io: Vec::new(),
             taken: false,
             moved: Vec::new(),
+            settles: false,
             commits: Vec::new(),
             counts: BTreeMap::new(),
             counted: Vec::new(),
@@ -378,7 +382,9 @@ impl Stash {
 
     pub(crate) fn take_io(&mut self) -> Vec<Io> {
         self.taken = !self.io.is_empty() || !self.commits.is_empty();
-        self.moved.clear();
+        if !self.settles {
+            self.moved.clear();
+        }
         for x in &self.io {
             if let Io::Move { tier, slot, to, to_slot } = *x {
                 self.moved.push((tier, slot, to, to_slot));
@@ -392,7 +398,13 @@ impl Stash {
     /// its prefixes in other tiers, and takes nothing from then on. An entry the last copies moved out of a dead tier
     /// holds whatever the failed read left: it goes too. Restores from those copies are the engine's to redo.
     /// Returns the entries dropped.
+    /// A mask of 0 drops nothing: the barrier passed with every store well, and the moves so far are settled.
     pub(crate) fn tier_dead(&mut self, mask: u64) -> u64 {
+        self.settles = true;
+        if mask == 0 {
+            self.moved.clear();
+            return 0;
+        }
         let dead = |t: usize| t < 64 && mask >> t & 1 == 1;
         let mut gone: Vec<(usize, u64)> = Vec::new();
         for &(from, _, to, to_slot) in &self.moved {
@@ -428,7 +440,6 @@ impl Stash {
             }
         }
         self.moved.clear();
-        self.pin.clear();
         let after: usize = self.tiers.iter().map(|t| t.entries.len()).sum();
         (before - after) as u64
     }

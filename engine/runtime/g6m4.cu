@@ -1985,6 +1985,7 @@ int main(int argc, char** argv)
                 h.stores_dead = [&](uint64_t mask) {
                     kvt->faults.agreed(mask);
                     const uint64_t n = pool.tier_dead(mask);
+                    if (!mask) return;
                     fprintf(stderr, "# rank %d: s2 stores dead (mask 0x%llx): %llu entries dropped; %llu failed store calls here, %llu timed out\n", R,
                             (unsigned long long)mask, (unsigned long long)n, (unsigned long long)kvt->faults.failed.load(),
                             (unsigned long long)kvt->faults.timeouts.load());

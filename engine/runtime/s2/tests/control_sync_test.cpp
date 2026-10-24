@@ -1,5 +1,5 @@
 // The barrier between rounds (EventEndpoint::sync) on three ranks over socket pairs: no rank leaves a barrier before
-// every rank has reached it; a worker's barrier arrival and its event ACK share one link, in either thread's read; a
+// every rank has reached it, and each leaves with the OR of every rank's word; a worker's barrier arrival and its event ACK share one link, in either thread's read; a
 // failed head wakes a worker that waits at a barrier.
 // Build: g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_sync_test.cpp -o /tmp/control_sync_test
 #include "control_channel.h"
@@ -32,6 +32,7 @@ int main() {
 
     // every rank arrives late by a different random time at each barrier: nobody leaves before the last one arrives
     Clock::time_point arrive[3][N], leave[3][N];
+    uint64_t got[3][N] = {};
     {
         std::thread t[3];
         for (int r = 0; r < 3; ++r)
@@ -39,7 +40,9 @@ int main() {
                 std::mt19937 g(unsigned(r) * 7 + 1);
                 for (int k = 0; k < N; ++k) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(g() % 20));
-                    arrive[r][k] = Clock::now(); ep[r]->sync(uint64_t(k + 1)); leave[r][k] = Clock::now();
+                    // a rank's word (its failed store tiers, service.h settle) at some barriers: every rank gets the OR
+                    const uint64_t mask = k % 4 == r ? 1ull << (r + k % 7) : k == N - 1 ? 1ull << 63 : 0;
+                    arrive[r][k] = Clock::now(); got[r][k] = ep[r]->sync(uint64_t(k + 1), mask); leave[r][k] = Clock::now();
                 }
             });
         for (auto& x : t) x.join();
@@ -47,6 +50,11 @@ int main() {
     for (int k = 0; k < N; ++k)
         for (int r = 0; r < 3; ++r)
             for (int q = 0; q < 3; ++q) CHECK(leave[r][k] >= arrive[q][k]);
+    for (int k = 0; k < N; ++k) {
+        uint64_t want = 0;
+        for (int r = 0; r < 3; ++r) want |= k % 4 == r ? 1ull << (r + k % 7) : k == N - 1 ? 1ull << 63 : 0;
+        for (int r = 0; r < 3; ++r) CHECK(got[r][k] == want);
+    }
 
     // an event while the workers pass a barrier first: each worker's link carries its barrier arrival, then its ACK. The
     // control thread waits for the ACKs and the head's barrier waits for the arrivals, both reading the same links

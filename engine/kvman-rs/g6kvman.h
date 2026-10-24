@@ -167,7 +167,8 @@ struct g6kv_tier_totals
 // the tiers in mask (bit t = tier t) failed on some rank under the last copies: every rank calls this alike, after
 // g6kv_io_done. A dead tier drops its entries (and the runs stored on its prefixes elsewhere) and takes nothing from
 // then on; an entry the last copies moved out of it goes too. The restores of those copies are the engine's to redo.
-// Returns the entries dropped, or a negative error.
+// A mask of 0 at every barrier (soft mode) settles the copies so far: the moves tracked for a dead tier are kept from one
+// barrier to the next, not only the last copies'. Returns the entries dropped, or a negative error.
 int64_t g6kv_tier_dead(g6kv_pool* p, uint64_t mask);
 // tier t's counters, or an error when there is no such tier
 int g6kv_tier_stats(const g6kv_pool* p, uint32_t t, g6kv_tier_totals* out);
