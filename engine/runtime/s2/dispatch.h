@@ -44,6 +44,14 @@ struct DispatchHooks {
     // optional, grammars (Dispatch::set_grammar): the host side of the mask arena the main head reads
     int* gm_on = nullptr; uint32_t* gm_bits = nullptr; int gm_words = 0;
 };
+// The row of the step's j-th session that samples its next reply token: the one whose input is the last committed token,
+// at position `last` (the prompt's length + the tokens emitted - 1). -1 when the step holds none (a prompt step before
+// the prompt's last token). The session's rows after it hold drafts.
+inline int grammar_row0(const s2::Step& sp, size_t j, int last) {
+    for (int r = sp.row0[j]; r < sp.row0[j] + sp.rows[j]; ++r)
+        if (sp.r[r].pos == last) return r;
+    return -1;
+}
 // the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
 inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
 class Dispatch {
@@ -133,21 +141,16 @@ public:
         }
         return ids;
     }
-    // Row i0 of a session samples its next reply token when its input is the last committed one (the reply's, or the
-    // prompt's last token before the first): position prompt + emitted - 1. The session's rows after it hold drafts.
     void grammar_masks(const s2::Step& sp, bool draft) {
         for (int r = 0; r < sp.M(); ++r) gm_on_[r] = 0;
         if (draft) return;
         for (size_t j = 0; j < sp.sess.size(); ++j) {
             const auto& s = sessions_.at(unsigned(sp.sess[j]));
             if (!s.grammar) continue;
-            const int last = int(s.payload.prompt.size()) + s.emitter.emitted - 1;
-            const int r0 = sp.row0[j], end = r0 + sp.rows[j];
-            int i0 = r0;
-            while (i0 < end && sp.r[i0].pos != last) ++i0;
-            if (i0 == end) continue;          // a prompt step before the last prompt token: nothing samples a reply
+            const int i0 = grammar_row0(sp, j, int(s.payload.prompt.size()) + s.emitter.emitted - 1);
+            if (i0 < 0) continue;
             std::vector<int> drafts;
-            for (int r = i0 + 1; r < end; ++r) drafts.push_back(sp.r[r].tok);
+            for (int r = i0 + 1; r < sp.row0[j] + sp.rows[j]; ++r) drafts.push_back(sp.r[r].tok);
             g6rt::grammar_masks(*s.grammar, drafts.data(), int(drafts.size()), gm_on_ + i0, gm_bits_ + size_t(i0) * gm_words_);
         }
     }

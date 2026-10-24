@@ -13,7 +13,7 @@ namespace g6rt
 {
 struct GrammarSpec
 {
-    enum Kind { OFF = 0, JSON = 1, SCHEMA = 2 } kind = OFF;
+    enum Kind { OFF = 0, JSON = 1, SCHEMA = 2 } kind = OFF;   // JSON: any JSON object (response_format json_object)
     bool strict = false;              // SCHEMA: properties and items the schema does not name are refused
     int arm = -1;                     // the token after which the grammar applies (the think close); -1: from the start
     std::string schema;               // SCHEMA: the JSON schema

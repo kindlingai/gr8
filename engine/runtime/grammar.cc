@@ -96,9 +96,11 @@ Grammar grammar_open(const GrammarSpec& spec)
 {
     auto& b = boot();
     if (!b.compiler) throw std::runtime_error("the engine was started without --grammar-dir");
-    const xgrammar::CompiledGrammar g = spec.kind == GrammarSpec::JSON
-        ? b.compiler->CompileBuiltinJSONGrammar()
-        : b.compiler->CompileJSONSchema(spec.schema, true, std::nullopt, std::nullopt, spec.strict, std::nullopt, true);
+    // json_object is any JSON object. Whitespace is JSON's usual (", ", ": "), not any run of it, so the model cannot pad
+    // a value with tabs and newlines that a free grammar allows; keys in any order (the front end checks required ones)
+    const std::string& schema = spec.kind == GrammarSpec::JSON ? std::string(R"({"type": "object"})") : spec.schema;
+    const xgrammar::CompiledGrammar g =
+        b.compiler->CompileJSONSchema(schema, false, std::nullopt, std::nullopt, spec.strict, std::nullopt, true);
     return Grammar(new GrammarState(g, spec.arm));
 }
 

@@ -541,6 +541,9 @@ int main(int argc, char** argv)
     if (!grammar_dir.empty())
     {
         if (!s2mode) die("--grammar-dir needs --serve");
+#if G6_MODEL_FLASH
+        die("--grammar-dir: request grammars are GLM-5.3 only for now (Flash serves outside the S2 dispatch)");
+#endif
         const std::string e = g6rt::grammar_init(grammar_dir, geom::VOCAB);
         if (!e.empty()) die("--grammar-dir " + grammar_dir + ": " + e);
         if (R == 0)

@@ -57,17 +57,26 @@ RSLIB=../loader-rs/target/release/libg6load.a
 RSDEF=""
 RSLINK=""
 if [ -f "$RSLIB" ]; then RSDEF="-DG6_RS_LOADER"; RSLINK="$RSLIB -ldl -lm"; fi
-# request grammars (grammar.h): G6_XGRAMMAR=DIR, an XGrammar source tree at DIR/src built as DIR/build/libxgrammar.a
-# (CMake with XGRAMMAR_BUILD_PYTHON_BINDINGS off). g6m4 then takes --grammar-dir; without it a gram request is refused
+# request grammars (grammar.h): G6_XGRAMMAR=DIR, an XGrammar source tree (scripts/build.sh finds the one the front end's
+# xgrammar crate pins). Built once per object directory with CMake, Python bindings off. g6m4 then takes --grammar-dir;
+# without G6_XGRAMMAR a gram request is refused
 GRDEF=""
 GRLINK=""
 if [ -n "${G6_XGRAMMAR:-}" ] && [ "$WHAT" != sim ]; then
-  X=$G6_XGRAMMAR/src
-  [ -f "$G6_XGRAMMAR/build/libxgrammar.a" ] || { echo "G6_XGRAMMAR: no $G6_XGRAMMAR/build/libxgrammar.a"; exit 1; }
+  XB=$O/xgrammar
+  if [ ! -f "$XB/libxgrammar.a" ]; then
+    mkdir -p "$XB"
+    echo 'set(XGRAMMAR_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)' > "$XB/config.cmake"   # the tree reads it from -B
+    { cmake -S "$G6_XGRAMMAR" -B "$XB" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++ \
+          -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations -DCMAKE_POSITION_INDEPENDENT_CODE=ON &&
+      cmake --build "$XB" -j "$(nproc)" --target xgrammar; } > "$XB/build.log" 2>&1 || { echo "XGrammar: $XB/build.log"; exit 1; }
+  fi
   GRDEF="-DG6_GRAMMAR=1"
-  g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I"$X/include" -I"$X/3rdparty/dlpack/include" -I"$X/3rdparty/picojson" \
-      -c grammar.cc -o $O/grammar.o || exit 1
-  GRLINK="$O/grammar.o $G6_XGRAMMAR/build/libxgrammar.a"
+  g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I"$G6_XGRAMMAR/include" -I"$G6_XGRAMMAR/3rdparty/dlpack/include" \
+      -I"$G6_XGRAMMAR/3rdparty/picojson" -c grammar.cc -o $O/grammar.o || exit 1
+  GRLINK="$O/grammar.o $XB/libxgrammar.a"
+  g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I. -o $OUT/grammar_test tests/grammar_test.cc $GRLINK -lpthread || exit 1
+  $OUT/grammar_test || exit 1
 fi
 # the S2 page allocator (engine/kvman-rs, wrapped by s2/pool.h): g6m4 and m4sim link it. scripts/build.sh builds it with cargo
 KVLIB=../kvman-rs/target/release/libg6kvman.a
