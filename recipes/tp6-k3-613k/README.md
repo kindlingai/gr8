@@ -25,15 +25,18 @@ At TP=6 these are close to the launcher's defaults (614400 / 131072); the earlie
 steps removed). They were syntax-checked, not re-run in this form.
 
 ## Boot
-On the head box, as root, with the same gr8 checkout path `H` on all six boxes and the packs at `MODEL`:
+On the head box, as root, with the same gr8 checkout path `H` on all six boxes and the exlr8 release at `MODEL`:
 ```
 BOXES="<head> <box2> <box3> <box4> <box5> <box6>" H=/path/to/gr8 bash recipes/tp6-k3-613k/handboot.sh /path/to/K3-cap613-sl131k.env K3C613
 curl -s localhost:8000/v1/models    # max_model_len 612986; boot log line "G6_CP on, R 131072"
 BOXES="..." H=/path/to/gr8 bash recipes/tp6-k3-613k/down.sh /path/to/K3-cap613-sl131k.env
 ```
-`MODEL` points at converted rank packs (`rank<r>.pack` + manifests, plus `qo.pack` for `PF_OWN=3`), `MODEL_DIR` at the
-EXLR8 release directory. The recipe's release-path boot (KVB fp8 straight from the HF release) failed on our fleet with
-non-finite attention at layer 37 on the first request, so every number below uses converted packs.
+`MODEL` is the exlr8 release (a local copy on every box, or the Hugging Face URL with `MODEL_CACHE`): main boots from
+the release only (#144). Every number below was measured with converted rank packs instead (`rank<r>.pack` + manifests,
+plus `qo.pack` for `PF_OWN=3`; `MODEL_DIR` the release), at tag `tp6-k3-613k-measured` (dd67022). An earlier release-path
+boot (KVB fp8 straight from the HF release) failed on our fleet with non-finite attention at layer 37 on the first
+request. The release boot of this file is checked at the box gate before merge: smoke, gate0, 8K prefill / decode spot
+check.
 
 ## Numbers (GPU clock capped at 2000 MHz unless noted, MTP=3, one request unless noted)
 | measure | value |
