@@ -1,7 +1,7 @@
 {
   "version": 1,
   "title": "GLM-5.3",
-  "variant": "exlr8 experts: home (3.25 bpw) at TP=4 and TP=6, bit225 (2.25 bpw) at TP=3",
+  "variant": "exlr8 experts: home (3.25 bpw) at TP=4, TP=5 and TP=6, bit225 (2.25 bpw) at TP=3",
   "summary": "Full GLM 5.3 on gr8, a from-scratch CUDA engine with no vLLM, PyTorch or NCCL at serve time. Up to 8 requests decode at once, with DFlash2 or MTP drafting chosen each round at TP=4, prefix reuse, and context-parallel KV. Boots from one Hugging Face release.",
   "model": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
   "hardware": "DGX Spark (GB10)",
@@ -17,88 +17,120 @@
       "label": "TP=4",
       "nodes": 4,
       "decode": {
-        "code": 51.7,
-        "prose": 32.5
+        "code": 52.1,
+        "prose": 34.2
       },
       "prefill": [
         {
           "context": 8192,
-          "tps": 1315
+          "tps": 1357
         }
       ],
       "concurrency": [
         {
           "streams": 2,
-          "aggregate_tps": 53.7
+          "aggregate_tps": 54.0
         },
         {
           "streams": 4,
-          "aggregate_tps": 67.8
+          "aggregate_tps": 69.0
         }
       ],
       "max_context": 485376,
       "kv_pool_tokens": 485376,
       "max_concurrent": 8,
       "quality": [],
-      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks uncapped (full application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release. Code varies between boots (51.2 to 52.2 on one build). The faster decode options are on by default in the serving config. Structured output is not reported: it measures predictable output, not agent speed. With --kv-format int4 (experimental, about 3% slower decode) the KV pool is 415,232 tokens."
+      "notes": "RigMark 1.0.0, reasoning_effort low, GPU clocks uncapped (full application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release with the launcher defaults. Mean of two fresh boots on 2026-10-24; temperature-0 replies identical across the two, smoke 14/14. Structured output is not reported: it measures predictable output, not agent speed. DFlash2 drafter (--drafter). With --kv-format int4 (experimental, about 3% slower decode) the KV pool is 513,536 tokens."
     },
     {
       "id": "tp3",
       "label": "TP=3",
       "nodes": 3,
       "decode": {
-        "code": 38.6,
-        "prose": 29.0
+        "code": 41.1,
+        "prose": 31.7
       },
       "prefill": [
         {
           "context": 8192,
-          "tps": 628
+          "tps": 635
         }
       ],
       "concurrency": [
         {
           "streams": 2,
-          "aggregate_tps": 47.9
+          "aggregate_tps": 50.6
         },
         {
           "streams": 4,
-          "aggregate_tps": 62.2
+          "aggregate_tps": 63.8
         }
       ],
       "max_context": 307136,
       "kv_pool_tokens": 307136,
       "max_concurrent": 8,
       "quality": [],
-      "notes": "bit225 experts (about 2.25 bpw), MTP only. Mean of two boots. RigMark 1.0.0, reasoning_effort low, GPU clocks capped at 2200 MHz, booted from the Hugging Face release. With --kv-format int4 (experimental) the KV pool is 345,088 tokens, an estimate not yet booted."
+      "notes": "bit225 experts (about 2.25 bpw), MTP only. RigMark 1.0.0, reasoning_effort low, GPU clocks uncapped (full application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release with the launcher defaults. Mean of two fresh boots on 2026-10-24; temperature-0 replies identical across the two, smoke 14/14. Structured output is not reported: it measures predictable output, not agent speed. With --kv-format int4 (experimental) the KV pool is 410,624 tokens, an estimate not yet booted."
+    },
+    {
+      "id": "tp5",
+      "label": "TP=5",
+      "nodes": 5,
+      "decode": {
+        "code": 51.0,
+        "prose": 38.0
+      },
+      "prefill": [
+        {
+          "context": 8192,
+          "tps": 1554
+        }
+      ],
+      "concurrency": [
+        {
+          "streams": 2,
+          "aggregate_tps": 61.8
+        },
+        {
+          "streams": 4,
+          "aggregate_tps": 76.3
+        }
+      ],
+      "max_context": 502848,
+      "kv_pool_tokens": 502848,
+      "max_concurrent": 8,
+      "quality": [],
+      "notes": "MTP only, PF_OWN=3. RigMark 1.0.0, reasoning_effort low, GPU clocks uncapped (full application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release with the launcher defaults. Mean of two fresh boots on 2026-10-24; temperature-0 replies identical across the two, smoke 14/14. Structured output is not reported: it measures predictable output, not agent speed."
     },
     {
       "id": "tp6",
       "label": "TP=6",
       "nodes": 6,
       "decode": {
-        "code": 38.2
+        "code": 57.4,
+        "prose": 43.1
       },
       "prefill": [
         {
           "context": 8192,
-          "tps": 1953
+          "tps": 1808
         }
       ],
       "concurrency": [
         {
           "streams": 2,
-          "aggregate_tps": 57.6
+          "aggregate_tps": 67.6
         },
         {
           "streams": 4,
-          "aggregate_tps": 79.0
+          "aggregate_tps": 85.5
         }
       ],
       "max_context": 614400,
       "kv_pool_tokens": 614400,
       "max_concurrent": 8,
-      "notes": "Served through S2, MTP only. GPU clocks uncapped, on an earlier build. Decode is a concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; not RigMark. One test window on one cluster. With --kv-format int4 (experimental) the KV pool is 857,600 tokens at the default SHARE_LIMIT of 131,072, an estimate not yet booted."
+      "quality": [],
+      "notes": "MTP only. RigMark 1.0.0, reasoning_effort low, GPU clocks uncapped (full application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release with the launcher defaults. Mean of two fresh boots on 2026-10-24; temperature-0 replies identical across the two, smoke 14/14. Structured output is not reported: it measures predictable output, not agent speed. One of the six boxes was capped at 2200 MHz. Requests up to 131,072 tokens share decode steps. With --kv-format int4 (experimental) the KV pool is 857,600 tokens at the default SHARE_LIMIT of 131,072, an estimate not yet booted."
     }
   ]
 }

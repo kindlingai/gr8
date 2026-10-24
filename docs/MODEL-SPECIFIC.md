@@ -1,6 +1,6 @@
 # What is GLM 5.3-specific, and what is not
 
-gr8 was written for one model, GLM 5.3 (full), on GB10 boxes: three, four or six ranks. Nothing here is a plug-in model
+gr8 was written for one model, GLM 5.3 (full), on GB10 boxes: three to six ranks. Nothing here is a plug-in model
 interface. This page is a map for porting: it lists every place the model is baked in, roughly in the order you would
 meet them. It also lists the parts that do not depend on the model.
 
