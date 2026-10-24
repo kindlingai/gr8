@@ -75,7 +75,8 @@ Read as TensorFold 0.6.1 reads them (`server/request_options.py`). The code is `
 | `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold), or the front end runs with `--allow-thinking-off` (Thinking off, below) |
 | `chat_template_kwargs.enable_thinking` | `true`, or unset; `false` with `--allow-thinking-off` | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. With `--allow-thinking-off` it turns thinking off (below). The front end adds no `enable_thinking` kwarg of its own |
 | `thinking_budget` (top level) | an integer, an integral float, a string holding an integer, or null. Anything else is a 400 | 0, null or unset: `--default-thinking-budget` (TensorFold's `int(budget or default)`). Negative: no limit. N: while the think block is open, the reply's Nth token is replaced by `\n</think>\n\n`, even when it is `</think>` itself, so N-1 reasoning tokens come first (TensorFold's ThinkBudget). `max_tokens` may cut the close short. It applies to a chat prompt that leaves a think block open. The close has no logprobs, so naming both `thinking_budget` and `logprobs` is a 400 |
-| `response_format` (chat and completions) | absent, null, `{"type": "text"}` | `json_object`, `json_schema` and any other type are a 400 until the engine has constrained decoding |
+| `response_format` (chat) | absent, null, `{"type": "text"}`, `{"type": "json_object"}`, `{"type": "json_schema", "json_schema": {"name": str, "schema": object}}` | `json_object`/`json_schema` are enforced after generation (the engine has no constrained decoding yet): a prompt hint asks for JSON, content is withheld in the stream until the end, the first JSON value in the reply is extracted, and `json_schema` is checked against the schema. No JSON found, or a schema mismatch: the reply is returned unchanged with a `warnings` entry (stream: on the last choice). Anything else is a 400 |
+| `response_format` (`/v1/completions`) | absent, null, `{"type": "text"}` | any other type is a 400: the legacy route has no JSON handling |
 
 ### Thinking off
 
@@ -282,13 +283,23 @@ canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve
 
 ## Deviations from vLLM
 
-- These return 400: `n>1`, batched prompts, `echo`, `suffix`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off without `--allow-thinking-off` (above).
+- These return 400: `n>1`, batched prompts, `echo`, `suffix`, presence/frequency/repetition penalties, a custom `chat_template`, a `response_format` type other than text, `json_object` and `json_schema`, a schema the grammar compiler cannot take, and a request to turn thinking off without `--allow-thinking-off` (above).
 - A tool call streams as it is written when it sits in the answer outside a code fence and either starts the answer or
   follows text with no space between (the chat template writes a call straight after the content): its name goes out
   once read, string arguments as they arrive, other arguments once each value ends. Any other call (after a space or a
   newline, in reasoning, in a fence) arrives only when the reply ends with it, because nothing in the text says whether
   the model is making a call or writing about one (`g6front-rs/src/parser.rs`). A streamed call stays a call if prose
   follows it, and a streamed call cut off by `max_tokens` is closed with the arguments it had.
+- `response_format` `json_object` / `json_schema` are enforced after generation (the engine does not constrain decoding
+  yet). The reply's JSON object or array is extracted: inside a ```` ```json ```` fence if it has one, else the first
+  top-level value. A value cut off by `max_tokens` yields nothing, rather than a complete value nested inside it. For
+  `json_schema` the value is checked with the schema's XGrammar grammar, keys in any order. Required and duplicate
+  keys are checked on the parsed value, because XGrammar does not check them in any order. Undeclared keys pass unless
+  `json_schema.strict` is `true`. A schema whose root type is neither object nor array is a 400. No JSON, or a value
+  that fails, returns the reply unchanged with a `warnings` entry (stream: on the last chunk). `warnings` is not an
+  OpenAI field: a client that asked for JSON and got prose plus a warning still got no JSON. A JSON-mode stream
+  withholds its content until the end, so it has no incremental output. When the reply makes a tool call, the withheld
+  text goes out with the call, unextracted, as the whole reply keeps it.
 - Tool-call tags are parsed only when the request has `tools` and `tool_choice` is not `none`.
 - `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. The close leads because the template leaves `<think>` open at the end of a chat prompt, so without it the forced call would be reasoning text and the parser would read the reply as prose. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text, and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (the inserted close ends the block before any reasoning is written), its inserted tokens count toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request).
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).

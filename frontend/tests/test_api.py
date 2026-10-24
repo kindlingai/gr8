@@ -260,12 +260,87 @@ class Thinking(unittest.TestCase):
                              'thinking_budget must be an integer or null')
         self.assertIn('logprobs', bad('/v1/chat/completions', dict(CHAT, thinking_budget=5, logprobs=True)))
 
-    def test_response_format(self):
+    def test_response_format_json_object_extracts(self):
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'Give me JSON.'}],
+                    response_format={'type': 'json_object'})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertEqual(json.loads(msg['content']), {'city': 'Paris', 'days': 3})
+        self.assertNotIn('warnings', r)
+        chunks = sse('/v1/chat/completions', body)
+        contents = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
+        self.assertEqual(json.loads(contents), {'city': 'Paris', 'days': 3})
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'stop')
+
+    def test_response_format_json_schema_rejects_invalid(self):
+        schema = {'type': 'object', 'required': ['a'], 'properties': {'a': {'type': 'integer'}}}
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'emit invalid-json-please'}],
+                    response_format={'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': schema}})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        # policy: a schema violation returns the content unchanged with a warning, never a 500
+        self.assertIn('{"a": "x"}', msg['content'])
+        self.assertEqual(len(r['warnings']), 1)
+        self.assertIn('does not match the schema', r['warnings'][0])
+        chunks = sse('/v1/chat/completions', body)
+        # stream warnings ride on the final choice, matching the Python front end
+        warned = [c['choices'][0] for c in chunks if c['choices'] and c['choices'][0].get('warnings')]
+        self.assertEqual(len(warned), 1)
+        self.assertIn('does not match the schema', warned[0]['warnings'][0])
+
+    def test_response_format_json_schema_accepts_valid(self):
+        schema = {'type': 'object', 'required': ['city', 'days'],
+                  'properties': {'city': {'type': 'string'}, 'days': {'type': 'integer'}}}
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'Give me JSON.'}],
+                    response_format={'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': schema}})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertEqual(json.loads(msg['content']), {'city': 'Paris', 'days': 3})
+        self.assertNotIn('warnings', r)
+        chunks = sse('/v1/chat/completions', body)
+        contents = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
+        self.assertEqual(json.loads(contents), {'city': 'Paris', 'days': 3})
+
+    def test_response_format_null_is_text(self):
+        self.assertEqual(post('/v1/chat/completions', dict(CHAT, response_format=None))[0], 200)
+        self.assertEqual(post('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4,
+                                                  'response_format': None})[0], 200)
+
+    def test_json_mode_stream_keeps_the_text_before_a_tool_call(self):
+        tools = [{'type': 'function', 'function': {'name': 'get_weather', 'parameters': {
+            'type': 'object', 'properties': {'city': {'type': 'string'}}}}}]
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'use-a-tool-please'}], tools=tools,
+                    response_format={'type': 'json_object'})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertEqual(msg['tool_calls'][0]['function']['name'], 'get_weather')
+        self.assertNotIn('warnings', r)
+        chunks = sse('/v1/chat/completions', body)
+        content = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
+        calls = [t for c in chunks if c['choices'] for t in c['choices'][0]['delta'].get('tool_calls') or []]
+        self.assertEqual(content, msg['content'] or '')
+        self.assertEqual(calls[0]['function']['name'], 'get_weather')
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
+
+    def test_response_format_ignored_when_absent(self):
+        s, r = post('/v1/chat/completions', CHAT)
+        self.assertEqual(s, 200)
+        self.assertNotIn('warnings', r)
+        self.assertEqual(r['choices'][0]['message']['content'], post('/v1/chat/completions', CHAT)[1]['choices'][0]['message']['content'])
+
+    def test_response_format_errors(self):
         self.assertEqual(post('/v1/chat/completions', dict(CHAT, response_format={'type': 'text'}))[0], 200)
+        for rf in ({'type': 'nope'}, {'type': 'json_schema', 'json_schema': {'name': 'x'}}, 'json_object'):
+            self.assertIn('response_format', bad('/v1/chat/completions', dict(CHAT, response_format=rf)))
+        # completions still refuses JSON modes (no constrained decoding)
         for rf in ({'type': 'json_object'}, {'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': {}}}):
-            for path, body in (('/v1/chat/completions', CHAT),
-                               ('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4})):
-                self.assertIn('is not supported by the gr8 front end yet', bad(path, dict(body, response_format=rf)))
+            self.assertIn('is not supported by the gr8 front end yet',
+                          bad('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4,
+                                                  'response_format': rf}))
 
 
 class Completions(unittest.TestCase):

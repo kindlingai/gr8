@@ -76,7 +76,7 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
       echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-gr8-no-proactive-compaction.conf
       sysctl -w vm.compaction_proactiveness=0
 
-- To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev, Rust through
+- To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, CMake, clang and libclang-dev (the front end builds XGrammar), rdma-core / libibverbs-dev, Rust through
   [rustup](https://rustup.rs) (the front end needs Rust 1.85 or later; Ubuntu 24.04's `cargo` package is 1.75), and
   Python 3 with venv. The stock DGX OS (Ubuntu 24.04) has all of them except Rust. Or, in place of all of these, Docker
   with the NVIDIA container toolkit (DGX OS has both): see [In Docker](#in-docker).
@@ -259,8 +259,8 @@ with these fields:
 |---|---|---|
 | `reasoning_effort` (top level, or in `chat_template_kwargs`) | `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | The template names `low`, `high` and `max`. Another value becomes the nearest of those, ties going higher: `minimal` is `low`, `medium` is `high`, `xhigh` is `max`. Unset is `max`. `none` and any other value are a 400 |
 | `thinking_budget` | an integer, or null | While the think block is open, the front end puts `\n</think>\n\n` in place of the reply's Nth token (so N-1 reasoning tokens come first), and the answer follows. 0, null or unset takes the server default, as in TensorFold. A negative number is no limit |
-| `chat_template_kwargs.enable_thinking` | `true` | `false` is a 400 that names `reasoning_effort` `low` and `thinking_budget` instead |
-| `response_format` | `{"type": "text"}` | `json_object` and `json_schema` are a 400 for now |
+| `chat_template_kwargs.enable_thinking` | `true`; `false` with `--allow-thinking-off 1` | `false` is a 400 that names `reasoning_effort` `low`, `thinking_budget` and `--allow-thinking-off` instead |
+| `response_format` | `{"type": "text"}`, `json_object`, `json_schema` (chat) | JSON modes are checked after generation, not constrained: the reply's first JSON value, and for `json_schema` the schema's XGrammar grammar ([frontend/README.md](frontend/README.md)) |
 
 `usage.completion_tokens_details.reasoning_tokens` counts the reply's tokens through its `</think>`.
 `--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (KNOBS.md).
