@@ -182,6 +182,10 @@ pub struct TierStats {
     pub block_bytes: u64,
     /// write limit credit left, blocks (0 without a limit; the same on every tier)
     pub credit: i64,
+    /// entries this tier keeps that were bigger than the whole tier (they went to a later tier, or nowhere), and the
+    /// pages of the last one: a group lease's head asks to grow by that much (s2/kv_share.h share_want)
+    pub oversize: u64,
+    pub oversize_last: u64,
 }
 
 pub struct Tier {
@@ -190,6 +194,8 @@ pub struct Tier {
     slots: u64,
     entries: Vec<Entry>, // least recently used first
     index: Option<Index>,
+    // the index records every entry, not only prefixes (a KV-node lease that outlives a restart, persist=lease)
+    whole: bool,
     stats: TierStats,
     policy: Policy,
 }
@@ -277,12 +283,19 @@ impl Stash {
             slots,
             entries: Vec::new(),
             index: None,
+            whole: false,
             stats: TierStats::default(),
             policy: Policy::default(),
         };
         if let Some((ix, loaded)) = index {
+            // a run stored on a prefix comes back only with its prefix (in this tier or one before it)
+            let mut ids: Vec<u64> = self.tiers.iter().flat_map(|x| &x.entries).map(|e| e.id).collect();
             for e in loaded {
+                if e.base.is_some_and(|b| !ids.contains(&b.0)) {
+                    continue;
+                }
                 if e.slots.iter().all(|&s| s < slots) && t.alloc.claim(&e.slots) {
+                    ids.push(e.id);
                     self.next_id = self.next_id.max(e.id + 1);
                     t.entries.push(e);
                 }
@@ -301,6 +314,14 @@ impl Stash {
 
     pub fn tiers(&self) -> usize {
         self.tiers.len()
+    }
+
+    /// Tier t's index records every entry it stores (evicted runs too, with their base and tail), so a KV-node lease
+    /// that the node held over a restart comes back with its sessions. Prefixes only by default.
+    pub fn index_whole(&mut self, t: usize) {
+        if let Some(x) = self.tiers.get_mut(t) {
+            x.whole = x.index.is_some();
+        }
     }
 
     pub fn set_policy(&mut self, t: usize, p: Policy) {
@@ -349,6 +370,70 @@ impl Stash {
             credit: if self.limit_milli > 0 { self.credit / 1000 } else { 0 },
             ..x.stats
         })
+    }
+
+    /// Tier t to `slots` blocks, at an event every rank sees (a KV node lease that grew or shrank: REMOTE-TIER.md,
+    /// "Sharing a node"). Growing adds free slots at the top. Shrinking evicts the tier's least recently used entries
+    /// (each moves on to the next tier that takes it, or is dropped, as when the tier is full) until enough slots are
+    /// free, then moves every entry block at or past `slots` into the lowest free slot below it (Io::Move within the
+    /// tier). Entries that stored runs are based on go last. The engine runs those copies before the store gives the
+    /// top blocks back. Every rank makes the same call,
+    /// so every rank queues the same copies. A tier with an index keeps its size (its records name slots): false.
+    pub fn resize_tier(&mut self, t: usize, slots: u64) -> bool {
+        if t >= self.tiers.len() || self.tiers[t].index.is_some() {
+            return false;
+        }
+        let old = self.tiers[t].slots;
+        if slots < old {
+            let need = old - slots;
+            while self.tiers[t].alloc.free() < need {
+                // the least recently used entry that no stored run is based on, before any base: a base's runs go
+                // with it, and a base of many runs is a prefix many conversations still use
+                let bases: Vec<u64> =
+                    self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+                let free = |e: &Entry| !self.pin.contains(&e.id);
+                let es = &self.tiers[t].entries;
+                let Some(i) =
+                    es.iter().position(|e| free(e) && !bases.contains(&e.id)).or_else(|| es.iter().position(free))
+                else {
+                    return false;
+                };
+                let e = self.tiers[t].entries.remove(i);
+                self.evict(t, e);
+            }
+            let mut low = self.tiers[t].alloc.free_below(slots).into_iter();
+            let tier = &mut self.tiers[t];
+            for e in &mut tier.entries {
+                for s in e.slots.iter_mut().filter(|s| **s >= slots) {
+                    let to = low.next().expect("as many free slots below the new size as blocks above it");
+                    self.io.push(Io::Move { tier: t as u32, slot: *s, to: t as u32, to_slot: to });
+                    assert!(tier.alloc.claim(&[to]));
+                    tier.alloc.release(&[*s]);
+                    *s = to;
+                }
+            }
+        }
+        assert!(self.tiers[t].alloc.resize(slots), "the slots past the new size are free");
+        self.tiers[t].slots = slots;
+        true
+    }
+
+    /// Tier t's entries as (id, blocks) in the order a shrink (resize_tier) evicts them: unpinned entries no stored run
+    /// is based on, least recently used first, then unpinned bases, then pinned ones (a shrink stops there). What a KV
+    /// node's head reports its coldest from (pool.rs coldest_ages), so the ages it reports are those of the blocks a
+    /// give costs. resize_tier takes the same rule again after each eviction (a base whose runs all went is no base).
+    pub fn give_order(&self, t: usize) -> Vec<(u64, usize)> {
+        let Some(x) = self.tiers.get(t) else { return Vec::new() };
+        let bases: Vec<u64> = self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+        let rank = |e: &Entry| if self.pin.contains(&e.id) { 2 } else if bases.contains(&e.id) { 1 } else { 0 };
+        let mut v: Vec<(u8, u64, usize)> = x.entries.iter().map(|e| (rank(e), e.id, e.slots.len())).collect();
+        v.sort_by_key(|e| e.0); // stable: LRU order within each class
+        v.into_iter().map(|(_, id, n)| (id, n)).collect()
+    }
+
+    /// Tier t's entries as (id, blocks), least recently used first.
+    pub fn lru(&self, t: usize) -> Vec<(u64, usize)> {
+        self.tiers.get(t).map_or_else(Vec::new, |x| x.entries.iter().map(|e| (e.id, e.slots.len())).collect())
     }
 
     pub fn entries(&self, t: usize) -> &[Entry] {
@@ -660,7 +745,7 @@ impl Stash {
         let tier = &mut self.tiers[t];
         tier.stats.spilled_pages += n as u64;
         tier.entries.push(Entry { id, kind, key, st, slots, base, hits, tail, namespace });
-        if kind.prefix() && tier.index.is_some() {
+        if tier.index.is_some() && (kind.prefix() || (tier.whole && namespace == crate::pool::STOCK_NAMESPACE)) {
             self.commits.push((t, id));
         }
     }
@@ -696,7 +781,12 @@ impl Stash {
     fn place(&mut self, start: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Option<(usize, Vec<u64>)> {
         let mut refused = None;
         for t in start..self.tiers.len() {
-            if !self.tiers[t].keep.takes(kind) || n as u64 > self.tiers[t].slots {
+            if !self.tiers[t].keep.takes(kind) {
+                continue;
+            }
+            if n as u64 > self.tiers[t].slots {
+                self.tiers[t].stats.oversize += 1;
+                self.tiers[t].stats.oversize_last = n as u64;
                 continue;
             }
             if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {
@@ -729,8 +819,9 @@ impl Stash {
 
     // e leaves tier t for the next tier that keeps its kind, or is dropped. Tier t frees e's slots after queueing the move.
     fn evict(&mut self, t: usize, e: Entry) {
+        let whole = self.tiers[t].whole;
         if let Some(ix) = &mut self.tiers[t].index {
-            if e.kind.prefix() && ix.drop(e.id).is_err() {
+            if (e.kind.prefix() || whole) && ix.drop(e.id).is_err() {
                 self.index_errors += 1;
             }
         }
@@ -750,7 +841,7 @@ impl Stash {
                 }));
                 let to = &mut self.tiers[u];
                 to.stats.moved_in_pages += new.len() as u64;
-                if e.kind.prefix() && to.index.is_some() {
+                if to.index.is_some() && (e.kind.prefix() || (to.whole && e.namespace == crate::pool::STOCK_NAMESPACE)) {
                     self.commits.push((u, e.id));
                 }
                 self.tiers[u].entries.insert(0, Entry { slots: new, ..e.clone() });
@@ -776,6 +867,11 @@ impl Stash {
                 all.into_iter().partition(|e| e.base.is_some_and(|b| b.0 == id));
             self.tiers[t].entries = keep;
             for e in gone {
+                if let (true, Some(ix)) = (self.tiers[t].whole, &mut self.tiers[t].index) {
+                    if ix.drop(e.id).is_err() {
+                        self.index_errors += 1;
+                    }
+                }
                 self.tiers[t].alloc.release(&e.slots);
                 self.tiers[t].stats.dropped += 1;
                 self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
@@ -807,6 +903,12 @@ impl Stash {
         let i = tier.entries.iter().position(|e| e.id == id).expect("found by the caller");
         let e = tier.entries.remove(i);
         tier.stats.hits += 1;
+        // an evicted run leaves the store: its record goes before its slots can be reused
+        if let (false, true, Some(ix)) = (e.kind.prefix(), tier.whole, &mut tier.index) {
+            if ix.drop(e.id).is_err() {
+                self.index_errors += 1;
+            }
+        }
         if e.kind.prefix() {
             tier.entries.push(e.clone());
             self.pin.push(id);
@@ -1046,6 +1148,27 @@ fn encode_add(e: &Entry) -> Vec<u8> {
     p
 }
 
+// record 4: every field of an entry (an index that keeps evicted runs, Stash::index_whole)
+fn encode_entry(e: &Entry) -> Vec<u8> {
+    let mut p = encode_add(e);
+    p[0] = 4;
+    p.push(match e.kind {
+        Kind::Evicted => 0,
+        Kind::Shared => 1,
+        Kind::Prefix => 2,
+    });
+    let (b, bp) = e.base.map_or((u64::MAX, 0), |b| (b.0, b.1 as u64));
+    put_u64(&mut p, b);
+    put_u64(&mut p, bp);
+    put_u32(&mut p, e.hits);
+    let t = e.tail.unwrap_or(Tail { logical: 0, own: 0, rep: 0 });
+    for x in [t.logical, t.own, t.rep] {
+        put_u32(&mut p, x);
+    }
+    p.extend_from_slice(&e.namespace);
+    p
+}
+
 enum Record {
     Add(Entry),
     Drop(u64),
@@ -1054,15 +1177,16 @@ enum Record {
 
 fn decode(p: &[u8]) -> Option<Record> {
     let mut c = Cursor(p);
-    match c.take(1)?[0] {
-        1 => {
+    let tag = c.take(1)?[0];
+    match tag {
+        1 | 4 => {
             let (id, key) = (c.u64()?, c.u64()?);
             let (valid, written_end, pf_end) = (c.u32()? as i32, c.u32()? as i32, c.u32()? as i32);
             let n = c.u32()? as usize;
             let history = (0..n).map(|_| c.u32().map(|t| t as i32)).collect::<Option<Vec<_>>>()?;
             let n = c.u32()? as usize;
             let slots = (0..n).map(|_| c.u64()).collect::<Option<Vec<_>>>()?;
-            Some(Record::Add(Entry {
+            let mut e = Entry {
                 id,
                 kind: Kind::Shared,
                 key,
@@ -1072,7 +1196,22 @@ fn decode(p: &[u8]) -> Option<Record> {
                 hits: 0,
                 tail: None,
                 namespace: crate::pool::STOCK_NAMESPACE,
-            }))
+            };
+            if tag == 4 {
+                e.kind = match c.take(1)?[0] {
+                    0 => Kind::Evicted,
+                    1 => Kind::Shared,
+                    2 => Kind::Prefix,
+                    _ => return None,
+                };
+                let (b, bp, hits) = (c.u64()?, c.u64()?, c.u32()?);
+                e.base = (b != u64::MAX).then_some((b, bp as usize));
+                e.hits = hits;
+                let (logical, own, rep) = (c.u32()?, c.u32()?, c.u32()?);
+                e.tail = (logical > 0).then_some(Tail { logical, own, rep });
+                e.namespace.copy_from_slice(c.take(crate::pool::NAMESPACE_BYTES)?);
+            }
+            Some(Record::Add(e))
         }
         2 => Some(Record::Drop(c.u64()?)),
         3 => Some(Record::Count(c.u64()?, c.u32()?, c.u64()?)),
@@ -1181,7 +1320,7 @@ impl Index {
 
     pub fn add(&mut self, e: &Entry) -> io::Result<()> {
         self.live.insert(e.id, e.clone());
-        self.append(&encode_add(e))
+        self.append(&encode_entry(e))
     }
 
     pub fn drop(&mut self, id: u64) -> io::Result<()> {
@@ -1199,7 +1338,7 @@ impl Index {
         let mut f = File::create(&tmp)?;
         f.write_all(format!("{MAGIC} {}\n", self.compat).as_bytes())?;
         for e in self.live.values() {
-            f.write_all(&frame(&encode_add(e)))?;
+            f.write_all(&frame(&encode_entry(e)))?;
         }
         for (&k, &(n, clock)) in &self.counts {
             f.write_all(&frame(&encode_count(k, n, clock)))?;
