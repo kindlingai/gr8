@@ -133,6 +133,16 @@ pub extern "C" fn g6kv_tier_error() -> *const c_char {
     LAST.with(|l| l.borrow().as_ptr())
 }
 
+/// How long a call on a KV node lease opened after this waits for the node (--kv-store-timeout): a TCP read or write,
+/// an RDMA completion (at most 10 s, remote::RDMA_WAIT). A call past it fails ("KV node timed out") and its lane is
+/// done. 30 s until set.
+#[no_mangle]
+pub extern "C" fn g6kv_tier_timeout(seconds: f64) {
+    if seconds.is_finite() && seconds > 0.0 {
+        crate::remote::client::TIMEOUT_MS.store((seconds * 1000.0).ceil() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Opens a store of `blocks` blocks of `block_bytes` (rounded up to 4 KiB) into `*out`. 0, or -1 with
 /// g6kv_tier_error.
 ///

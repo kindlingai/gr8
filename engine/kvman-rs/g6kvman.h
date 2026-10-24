@@ -176,6 +176,9 @@ void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 // write moves one whole block. Calls return 0, or -1 with the reason in g6kv_tier_error (this thread's last).
 struct g6kv_tier;
 int g6kv_tier_open(const char* spec, const char* name, uint64_t block_bytes, uint64_t blocks, g6kv_tier** out);
+// how long a call on a KV node lease opened after this waits for the node: a TCP read or write, an RDMA completion (at
+// most 10 s). Past it the call fails with "KV node timed out" and its lane is done. 30 s until set.
+void g6kv_tier_timeout(double seconds);
 void g6kv_tier_free(g6kv_tier* t);
 const char* g6kv_tier_error();
 uint64_t g6kv_tier_block_bytes(const g6kv_tier* t);

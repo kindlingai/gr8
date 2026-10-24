@@ -13,6 +13,7 @@ extern "C" {
     fn geteuid() -> u32;
     fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
     fn send(fd: c_int, buf: *const c_void, len: usize, flags: c_int) -> isize;
+    fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: u32) -> c_int;
     pub fn dlopen(name: *const c_char, flags: c_int) -> *mut c_void;
     pub fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     pub fn dlerror() -> *const c_char;
@@ -34,6 +35,23 @@ const MSG_NOSIGNAL: c_int = 0x4000;
 #[cfg(not(target_os = "linux"))]
 const MSG_NOSIGNAL: c_int = 0;
 const RLIM_INFINITY: u64 = u64::MAX;
+
+/// TCP keepalive on `fd`: the first probe after `idle` s of silence, then every `intvl` s, the peer dead after `cnt`
+/// unanswered (a node box that lost power, which no read or write timeout sees while the link is idle).
+pub fn keepalive(fd: c_int, idle: c_int, intvl: c_int, cnt: c_int) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    const OPTS: [(c_int, c_int); 4] = [(1, 9), (6, 4), (6, 5), (6, 6)]; // SO_KEEPALIVE, TCP_KEEPIDLE, _KEEPINTVL, _KEEPCNT
+    #[cfg(not(target_os = "linux"))]
+    const OPTS: [(c_int, c_int); 1] = [(0xffff, 0x8)];
+    let vals = [1, idle, intvl, cnt];
+    for (i, &(level, name)) in OPTS.iter().enumerate() {
+        let v: c_int = vals[i];
+        if unsafe { setsockopt(fd, level, name, &v as *const c_int as *const c_void, 4) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 /// RLIMIT_MEMLOCK's soft limit in bytes, None for unlimited.
 pub fn memlock_limit() -> Option<u64> {
