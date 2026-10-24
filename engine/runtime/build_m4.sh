@@ -67,11 +67,11 @@ WIDTHS=${WIDTHS:-6}
 # divide the expert blocks per rank: 4 at TP4, 3 at TP6) at 4, except in the Flash build, whose fp16 MoE refuses it
 wflags() {
   local f="-DG6_NR=$1 -DDEC_S2"
-  if [ "$1" = 4 ] && [ "$ATTN_CU" = ../attn/attn.cu ]; then f="$f -DPF_F12"; fi
+  case " ${F12_WIDTHS:-4} " in *" $1 "*) [ "$ATTN_CU" = ../attn/attn.cu ] && f="$f -DPF_F12" ;; esac   # PF_F12 (fat-CTA prefill fc1): TP4 by default; F12_WIDTHS="4 5" adds TP5; never in the Flash build
   echo "$f"
 }
 for n in $WIDTHS; do
-  case $n in 1|2|3|4|6|8) ;; *) echo "WIDTHS: $n is not a TP width (1, 2, 3, 4, 6 or 8)"; exit 2 ;; esac
+  case $n in 1|2|3|4|5|6|8) ;; *) echo "WIDTHS: $n is not a TP width (1, 2, 3, 4, 5, 6 or 8)"; exit 2 ;; esac
 done
 J=${JOBS:-$(nproc)}
 rm -f $O/*.log $O/*.failed

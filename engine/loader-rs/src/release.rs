@@ -54,11 +54,8 @@ pub struct Shard {
 
 impl Shard {
     pub fn new(nr: usize, rank: usize) -> Result<Shard, String> {
-        if !(nr == 3 || nr == 6 || (nr > 0 && 64 % nr == 0)) || rank >= nr {
-            return Err(format!("TP {nr} rank {rank}: gr8 builds TP 3, 6 or a divisor of 64"));
-        }
-        if !(384 / nr).is_multiple_of(4) {
-            return Err(format!("TP {nr}: the dense MLP's rank slices do not fall on the release's 128-channel blocks"));
+        if !(nr == 3 || nr == 5 || nr == 6 || (nr > 0 && 64 % nr == 0)) || rank >= nr {
+            return Err(format!("TP {nr} rank {rank}: gr8 builds TP 3, 5, 6 or a divisor of 64"));
         }
         Ok(Shard { nr, rank })
     }
@@ -66,10 +63,11 @@ impl Shard {
     pub fn heads(&self, l: usize) -> (usize, usize) {
         chunk(&widths(64, self.nr), l, self.rank)
     }
-    /// dense MLP channels of layer l (g32 groups x 32)
+    /// dense MLP channels of layer l, whole 128-channel blocks of the release (96 blocks; at TP 3/4/6/8 the same
+    /// ranges as 384 g32 groups)
     pub fn dense(&self, l: usize) -> Range<usize> {
-        let (a, n) = chunk(&widths(384, self.nr), l, self.rank);
-        a * 32..(a + n) * 32
+        let (a, n) = chunk(&widths(96, self.nr), l, self.rank);
+        a * 128..(a + n) * 128
     }
     pub fn vocab(&self) -> Range<usize> {
         let (a, n) = chunk(&widths(1210, self.nr), 0, self.rank);
@@ -451,6 +449,7 @@ impl Planner {
     fn full_heads(&mut self, l: usize, p: &str, f: &Arc<StFile>) {
         self.note(l, Form { what: "q_b, o_proj all heads (G6_PF_OWN=3)", src: "as above".into(), form: "MXFP8", exact: ROUNDED });
         let (f2, t) = (f.clone(), self.threads);
+        let cache = qo_cache_path(p);
         self.gen(format!("{p}.qo"), vec![
             (format!("{p}.qo.q_b.mx.codes"), "u8", vec![16384, 2048]),
             (format!("{p}.qo.q_b.mx.scales"), "u8", vec![16384, 64]),
@@ -458,21 +457,106 @@ impl Planner {
             (format!("{p}.qo.o_proj.mx.scales"), "u8", vec![H as i64, 512]),
             (format!("{p}.qo.kv_b.uk"), "bf16", vec![64, 192, 512]),
             (format!("{p}.qo.kv_b.uv"), "bf16", vec![64, 256, 512])], move || {
-            let q = exlr8::decode_par(&Matrix::open(&f2, "self_attn.q_b_proj")?, 0..16384, 0..2048, t)?;
+            let key = qo_cache_key(&f2.path);
+            if let (Some(c), Some(k)) = (&cache, &key) {
+                if let Some(parts) = qo_cache_read(c, k, 6) {
+                    return Ok(parts);
+                }
+            }
+            let parts = full_heads_make(&f2, t)?;
+            if let (Some(c), Some(k)) = (&cache, &key) {
+                qo_cache_write(c, k, &parts);
+            }
+            Ok(parts)
+        });
+    }
+}
+
+/// G6_QO_CACHE=DIR: the full-head G6_PF_OWN=3 tensors of a layer are the same bytes on every rank and every boot
+/// (decoded from the release and rounded to MXFP8 by the same code), so the first boot stores them under DIR and later
+/// boots read them back instead of decoding the whole q_b / o_proj / kv_b again. Key = source file path, size and
+/// mtime; a missing, short or mismatched file is ignored (the tensors are made and the file rewritten).
+fn qo_cache_path(p: &str) -> Option<String> {
+    let d = std::env::var("G6_QO_CACHE").ok().filter(|d| !d.is_empty())?;
+    Some(format!("{d}/{}.qo.bin", p.replace('/', "_")))
+}
+
+fn qo_cache_key(src: &str) -> Option<String> {
+    let m = std::fs::metadata(src).ok()?;
+    let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(format!("{src}|{}|{}.{:09}", m.len(), t.as_secs(), t.subsec_nanos()))
+}
+
+const QO_MAGIC: &[u8; 8] = b"G6QOC001";
+
+fn qo_cache_read(path: &str, key: &str, nparts: usize) -> Option<Vec<Vec<u8>>> {
+    let b = std::fs::read(path).ok()?;
+    let u64at = |o: usize| -> Option<u64> { Some(u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?)) };
+    if b.get(..8)? != QO_MAGIC {
+        return None;
+    }
+    let kl = u64at(8)? as usize;
+    if b.get(16..16 + kl)? != key.as_bytes() {
+        return None;
+    }
+    let mut o = 16 + kl;
+    let mut lens = Vec::with_capacity(nparts);
+    for _ in 0..nparts {
+        lens.push(u64at(o)? as usize);
+        o += 8;
+    }
+    let mut parts = Vec::with_capacity(nparts);
+    for n in lens {
+        parts.push(b.get(o..o + n)?.to_vec());
+        o += n;
+    }
+    if o != b.len() {
+        return None;
+    }
+    Some(parts)
+}
+
+fn qo_cache_write(path: &str, key: &str, parts: &[Vec<u8>]) {
+    let mut b = Vec::with_capacity(16 + key.len() + parts.iter().map(|p| 8 + p.len()).sum::<usize>());
+    b.extend_from_slice(QO_MAGIC);
+    b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    b.extend_from_slice(key.as_bytes());
+    for p in parts {
+        b.extend_from_slice(&(p.len() as u64).to_le_bytes());
+    }
+    for p in parts {
+        b.extend_from_slice(p);
+    }
+    let tmp = format!("{path}.tmp{}", std::process::id());
+    if std::fs::write(&tmp, &b).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// G6_PF_OWN=3's full-head tensors of one layer: [q_b codes, q_b scales, o_proj codes, o_proj scales, UK, UV].
+fn full_heads_make(f2: &StFile, t: usize) -> Result<Vec<Vec<u8>>, String> {
+    {
+        {
+            let q = exlr8::decode_par(&Matrix::open(f2, "self_attn.q_b_proj")?, 0..16384, 0..2048, t)?;
             let (qc, qs) = records::mxfp8_quantize(&q, 2048);
             drop(q);
-            let o = exlr8::decode_par(&Matrix::open(&f2, "self_attn.o_proj")?, 0..H, 0..16384, t)?;
+            let o = exlr8::decode_par(&Matrix::open(f2, "self_attn.o_proj")?, 0..H, 0..16384, t)?;
             let (oc, os) = records::mxfp8_quantize(&o, 16384);
             drop(o);
-            let w = bf16v(&exlr8::decode_par(&Matrix::open(&f2, "self_attn.kv_b_proj")?, 0..64 * 448, 0..512, t)?);
+            let w = bf16v(&exlr8::decode_par(&Matrix::open(f2, "self_attn.kv_b_proj")?, 0..64 * 448, 0..512, t)?);
             let (mut uk, mut uv) = (Vec::new(), Vec::new());
             for h in 0..64 {
                 uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
                 uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
             }
             Ok(vec![qc, qs, oc, os, le16(&uk), le16(&uv)])
-        });
+        }
     }
+}
+
+impl Planner {
 
     /// Layers 0-2: this rank's channels of gate/up (rows) and down (columns), int4 records for decode and MXFP8
     /// copies for prefill, both rounded from the decoded weights.
@@ -622,6 +706,23 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qo_cache_roundtrip_and_rejects() {
+        let d = std::env::temp_dir().join(format!("qoc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("L003.qo.bin").to_string_lossy().into_owned();
+        let parts = vec![vec![1u8, 2, 3], vec![], vec![9u8; 1000], vec![4u8], vec![5u8; 7], vec![6u8; 2]];
+        super::qo_cache_write(&p, "src|1|2.0", &parts);
+        assert_eq!(super::qo_cache_read(&p, "src|1|2.0", 6), Some(parts.clone()));
+        assert_eq!(super::qo_cache_read(&p, "src|1|3.0", 6), None); // other source mtime
+        let mut b = std::fs::read(&p).unwrap();
+        b.pop();
+        std::fs::write(&p, &b).unwrap();
+        assert_eq!(super::qo_cache_read(&p, "src|1|2.0", 6), None); // short file
+        assert_eq!(super::qo_cache_read(&d.join("none").to_string_lossy(), "src|1|2.0", 6), None);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     use super::*;
 
     #[test]
@@ -642,7 +743,28 @@ mod tests {
         assert_eq!(s.vocab(), 0..51712);
         // TP6: 11, 11, 11, 11, 10, 10
         assert_eq!(Shard::new(6, 5).unwrap().heads(0), (54, 10));
-        assert!(Shard::new(5, 0).is_err());
+        // TP5: 13, 13, 13, 13, 12 heads; dense 20, 19, 19, 19, 19 blocks of 128 (rotating); vocab 242 tiles each
+        let s = Shard::new(5, 4).unwrap();
+        assert_eq!(s.heads(0), (52, 12));
+        assert_eq!(s.dense(0), 77 * 128..96 * 128);
+        for l in 0..3 {
+            let mut v: Vec<_> = (0..5).map(|r| Shard::new(5, r).unwrap().dense(l)).collect();
+            v.sort_by_key(|x| x.start);
+            assert!(v.windows(2).all(|w| w[0].end == w[1].start) && v[0].start == 0 && v[4].end == 12288);
+            assert!(v.iter().all(|x| x.start % 128 == 0 && x.len() % 128 == 0 && x.len() <= 2560));
+        }
+        assert_eq!(s.vocab(), 968 * 128..1210 * 128);
+        assert_eq!(Shard::new(5, 0).unwrap().dense(0), 0..2560);
+        for nr in [3, 4, 6, 8] {
+            for r in 0..nr {
+                for l in 0..3 {
+                    let s = Shard::new(nr, r).unwrap();
+                    let (a, n) = chunk(&widths(384, nr), l, r);
+                    assert_eq!(s.dense(l), a * 32..(a + n) * 32);
+                }
+            }
+        }
+        assert!(Shard::new(7, 0).is_err());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 #
 # GR8_MODEL picks the model: glm53 (unset) or glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2).
 #
-#   engine_defaults          needs TP (4, 6 or 3); sets every knob that is unset to its default for this TP. An unset CAP
+#   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words), and ENGINE_BIN, the
 #                            engine under bin/ for KV_FORMAT (g6m4, or g6m4-int4 for int4)
@@ -74,7 +74,12 @@ engine_defaults() {
     3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
-    *) echo "engine_defaults: TP=$TP; want 4, 6 or 3" >&2; return 2 ;;
+    5) [ "${KV_FORMAT:-fp8}" = fp8 ] || [ -n "${CAP:-}" ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=5: no TP5 int4 page count; set CAP" >&2; return 2; }
+       SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+       # 1,981 pages a rank = TP4's default (not boot-proven at TP5; a rank holds about 1/5 of the experts, so more fit)
+       [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=5: the drafter's 8 KV heads do not split five ways" >&2; return 2; }
+       DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
+    *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 5" >&2; return 2 ;;
   esac
 }
 
@@ -102,7 +107,7 @@ G6_PF_TIMES=1"
 engine_env() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
   ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
-  ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
+  ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} G6_PF_OWN=$PF_OWN \
 G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
 G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
   if [ "$TP" = 4 ] && [ "$PF_OWN" = 4 ]; then
@@ -118,7 +123,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${MTP_KSTOP_TAU:+ G6_MTP_KSTOP_TAU=$MTP_KSTOP_TAU}"
   # the DFlash2 drafter step under MTP's first form on its own stream (DRAFT_PAR; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${DRAFT_PAR:+ G6_DRAFT_PAR=$DRAFT_PAR}"
-  # the replicated decode GEMVs split across the ranks (QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT; docs/SETTINGS.md): off unless set
+  # the replicated decode GEMVs split across the ranks (QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT; docs/SETTINGS.md): unset = the
+  # engine's default, which at TP > 1 is on (QA_SPLIT 2, IDXQ_SPLIT 1, MTP_SPLIT 1 with --mtp; g6m4.cu); 0 turns one off
   ENGINE_ENV="$ENGINE_ENV${QA_SPLIT:+ G6_QA_SPLIT=$QA_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${IDXQ_SPLIT:+ G6_IDXQ_SPLIT=$IDXQ_SPLIT}"
   ENGINE_ENV="$ENGINE_ENV${MTP_SPLIT:+ G6_MTP_SPLIT=$MTP_SPLIT}"
@@ -196,6 +202,14 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB_WIDTHS:+ G6_MTP_KSTOPB_WIDTHS=$MTP_KSTOPB_WIDTHS}"
   # the window-2 fc1 split on every MoE layer at M > 1 (TR3_W2ALL; docs/SETTINGS.md): off unless set; on at TP=4
   ENGINE_ENV="$ENGINE_ENV${TR3_W2ALL:+ G6_TR3_W2ALL=$TR3_W2ALL}"
+  # QO cache, prefill index-score rows, fc1 kernels, P11 attention, dense trellis (QO_CACHE, PF_ISGRT_RG, PF_F12,
+  # ATTN_P11, DTR, PF_AOP; docs/SETTINGS.md): the engine default unless set
+  ENGINE_ENV="$ENGINE_ENV${QO_CACHE:+ G6_QO_CACHE=$QO_CACHE}"
+  ENGINE_ENV="$ENGINE_ENV${PF_ISGRT_RG:+ G6_PF_ISGRT_RG=$PF_ISGRT_RG}"
+  ENGINE_ENV="$ENGINE_ENV${PF_F12:+ G6_PF_F12=$PF_F12}"
+  ENGINE_ENV="$ENGINE_ENV${ATTN_P11:+ G6_ATTN_P11=$ATTN_P11}"
+  ENGINE_ENV="$ENGINE_ENV${DTR:+ G6_DTR=$DTR}"
+  ENGINE_ENV="$ENGINE_ENV${PF_AOP:+ G6_PF_AOP=$PF_AOP}"
   return 0
 }
 

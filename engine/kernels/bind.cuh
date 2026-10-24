@@ -1178,7 +1178,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     if (tm)
     {
         if (L.moe) return "dense trellis MLP tensors in a MoE layer";
-        if (D.gate.N != g6nr::DENSE_CH) return "dense trellis MLP width is not DENSE_CH";
+        if (D.gate.N > g6nr::DENSE_CH || D.gate.N % 128) return "dense trellis MLP width is not 128-blocks within DENSE_CH";
         if ((e = dtr::make_glu(D.gate, D.up, D.down, M, io.x2, HID, sc.dxd, sc.dt, 128, 0, 1, L.glu_t))) return e;
         if ((e = dtr::make_out(D.down, M, nullptr, 0, sc.dxd, io.mlp_part, HID, dtr::O_BF16, sc.dt, 192, 0, 1, L.down_t))) return e;
         L.xf_x2.on = 0;

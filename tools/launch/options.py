@@ -25,7 +25,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 KEYS = {
     'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
                                       '<model> sets it'),
-    'TP': ('cluster', None, 'tensor-parallel size: 4, 6 or 3 (glm53f: 4 or 2)'),
+    'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4 or 2)'),
     'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
                                  "cabled to the f1 port of the next box in --peers order, the last to the first)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
@@ -141,6 +141,13 @@ KEYS = {
     'MTP_L2PF': ('cluster', None, 'MTP draft steps: the paced L2 prefetch, 1 draft step, 2 head waits, 3 both; needs L2PF (G6_MTP_L2PF)'),
     'MTP_KSTOPB_WIDTHS': ('cluster', None, 'MTP_KSTOPB: the shared-round widths with captured graphs, w1,w2,... (G6_MTP_KSTOPB_WIDTHS)'),
     'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
+    'QO_CACHE': ('cluster', None, 'PF_OWN=3: a directory for the full-head q_b / o_proj / UK / UV tensors, written at the first boot and read at the next (G6_QO_CACHE)'),
+    'PF_ISGRT_RG': ('cluster', None, 'prefill index scores: rows per CTA, a multiple of 8 (G6_PF_ISGRT_RG)'),
+    'PF_ATTN_ROWS': ('cluster', None, 'prefill attention chunk rows inside a sub-batch, default 1024 (G6_PF_ATTN_ROWS)'),
+    'PF_F12': ('cluster', None, 'prefill fc1 on the fat-CTA kernel when built with PF_F12, 0 = the stock fc1 (G6_PF_F12)'),
+    'ATTN_P11': ('cluster', None, 'decode attention: the P11 tile retune, takes precedence over ATTN_SC2 / CTX2 / CTX3 (G6_ATTN_P11)'),
+    'DTR': ('cluster', None, 'the dense trellis matrices of the exlr8 release, 0 = the int4 / MXFP8 records (G6_DTR)'),
+    'PF_AOP': ('cluster', None, 'prefill fc1 A-operand share when built with PF_AOP, 0 = off (G6_PF_AOP)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

@@ -4,8 +4,9 @@
 # One g6m4 and one m4sim run every TP width: g6m4 takes its width from --ips, m4sim from --tp N or --packs DIR. Each
 # width is compiled as its own build was (engine/runtime/build_m4.sh): DEC_S2 (the multi-session path) at every width,
 # and PF_F12 (the fat-CTA prefill fc1) at 4.
-#   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin; TP = 1, 2, 3, 4, 6 and 8
+#   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin; TP = 1, 2, 3, 4, 5, 6 and 8
 #   G6_WIDTHS="3 4" scripts/build.sh bin  only those widths (a shorter build); G6_NR=4 is G6_WIDTHS=4
+#   F12_WIDTHS="4 5" scripts/build.sh bin  PF_F12 (fat-CTA prefill fc1, on unless G6_PF_F12=0) at TP5 too; default TP4 only
 #   JOBS=N                                compiles at once (default: the CPU count)
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
 #                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
@@ -38,7 +39,7 @@ KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
 if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
-WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 6 8}}
+WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 5 6 8}}
 # each width runs its own instance: the --top-p-cands bound is TP_SORT (2048) / NR, checked before any CUDA work
 widths_ok() {   # widths_ok <g6m4> [<m4sim>]
   local n ips want
