@@ -338,7 +338,7 @@ class HFTests(unittest.TestCase):
         opt.validate(o)                                          # V2_DENSE is set later, by resolve_model
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
-        plan = opt.engine_plan(o, rank=2, rank_dir=ms.rank_dir(2), aux_dir=ms.rank_dir(2), home='/h')
+        plan = opt.engine_plan(o, rank=2, rank_dir=ms.dir, aux_dir=ms.dir, home='/h')
         self.assertIn('G6_KVB=fp8', plan['env'])
         self.assertIn('--v2-dense', plan['args'])
 
