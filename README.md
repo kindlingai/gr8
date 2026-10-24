@@ -321,7 +321,7 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 | `engine/kvman-rs/` | the Rust S2 page allocator: every rank's KV pages, live and retained runs, prefix-reuse matches |
 | `frontend/` | the HTTP front end (`g6front-rs`) and the shim that drives the ranks |
 | `scripts/` | build, tests and `engine_args.sh` (the engine command line) |
-| `tools/convert/` | the readers, writers and test fixtures behind the exlr8 release |
+| `tools/convert/` | the DFlash2 drafter's conversion, the QO weight pack, and the writers and test fixtures behind the release |
 | `smoketest/`, `bench/` | the smoke test, benchmarks and the quality gate |
 | `docs/` | engine settings, the prefill attention design, the model-specific parts |
 | [KNOBS.md](KNOBS.md), [CHANGELOG.md](CHANGELOG.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | every option; what changed and the measurements behind it; open bugs; the front end to engine protocol; how to build, test and land a change |

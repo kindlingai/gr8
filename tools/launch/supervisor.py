@@ -132,10 +132,11 @@ def version(home):
 
 def resolve_model(o, refresh=False, log=log):
     """(model set, variant, error): the model set and its exlr8 v2 variant, either None with the reason in error. The
-    variant's manifest becomes V2_WIDTHS, which the engine arguments take. --model is the release: an https:// URL,
-    whose experts, index slices, manifests and dense files each box fetches into --model-cache (ms.release), or a local
-    copy used in place. The release is the whole model (V2_DENSE: the engine plans every weight from its files).
-    refresh: ask the hub what the revision is now (prepare), instead of the commit recorded at the last resolve."""
+    variant's manifest becomes V2_WIDTHS, which the engine arguments take. With an https:// --model the experts, index
+    slices and manifests come from the release (ms.release), and V2 and V2_SLICES point into the cache. The release is
+    the whole model (V2_DENSE: the engine plans every weight from its files), unless --base-packs names packs for the
+    non-expert weights. A local --model that holds the release's dense/ is used the same way. refresh: ask the hub
+    what the revision is now (prepare), instead of the commit recorded at the last resolve."""
     ms = variant = release = None
     g6load = os.path.join(os.path.abspath(o.get('G6_HOME')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
     if os.access(g6load, os.X_OK):
@@ -144,8 +145,8 @@ def resolve_model(o, refresh=False, log=log):
         model = o.get('MODEL')
         hf = hfsource.parse_url(model)
         steering = steering_hf.request(o)
-        if steering and not hf:
-            raise modelset.ModelError('--steering-profile hf:... requires an HF release (--model https://...)')
+        if steering and (not hf or o.get('BASE_PACKS')):
+            raise modelset.ModelError('--steering-profile hf:... requires an HF release without --base-packs')
         if hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
@@ -153,20 +154,26 @@ def resolve_model(o, refresh=False, log=log):
             release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
-            model = release.dir
-            ms = modelset.release_set(model, int(o.get('TP')), o.get('MODEL_DIR') or release.tokenizer, str(release))
+            if o.get('BASE_PACKS'):
+                model = o.get('BASE_PACKS')
+            else:
+                o.values['V2_DENSE'] = release.dir
+                ms = modelset.release_set(release.dir, int(o.get('TP')), o.get('MODEL_DIR') or release.tokenizer,
+                                          str(release))
         elif modelset.is_release(model):
             experts = os.path.join(model, 'experts')
             o.values['V2'] = o.get('V2') or (experts if os.path.isdir(experts) else model)
             o.values['V2_SLICES'] = o.get('V2_SLICES') or os.path.join(model, 'index-slices')
+            o.values['V2_DENSE'] = model
             ms = modelset.release_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
-        else:
-            raise modelset.ModelError(f'--model {model}: want an exlr8 release, https://huggingface.co/<org>/<repo>[@rev] '
-                                      'or a local copy of one (dense/, experts/, index-slices/, manifests/)'
-                                      if model else 'no model: pass --model <exlr8 release URL or directory>')
-        o.values['V2_DENSE'] = model
+        if ms is None:
+            ms = modelset.resolve(model, o.get('MODEL_CACHE'), int(o.get('TP')),
+                                  o.get('MODEL_DIR') or (release.tokenizer if release else None))
+            if release:
+                ms.source = f'{release}, base packs {ms.source}'
         ms.release = release
-        search = [model]
+        search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
+                              release.dir if release else None) if d and os.path.isdir(d)]
         spec = o.get('VARIANT') or o.get('V2_WIDTHS')
         variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')), models.of(o))
         if variant.path:
@@ -181,8 +188,8 @@ def resolve_model(o, refresh=False, log=log):
 
 
 def drafter_of(o, ms, refresh, log):
-    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter (no
-    --drafter, no DFLASH_DIR), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused."""
+    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter at all
+    (none in the model set either), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused."""
     if o.get('TP') != '4' or not models.of(o).drafter:
         return None
     if o.get('DRAFTER'):
@@ -193,7 +200,7 @@ def drafter_of(o, ms, refresh, log):
         d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log)
         o.values['DFLASH_DIR'] = d.out
         return d
-    if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
+    if ms.set['dflash'] or o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
         return None
     hint = f'--drafter {hfsource.DRAFTER_URL} (CC BY-NC-ND 4.0: each box fetches and converts it)'
     if o.get('DFLASH') == '1':
@@ -450,7 +457,7 @@ class Supervisor:
                     f'on the busiest rank at TP={tp}')
         self.tmpl = opt.engine_plan(o)
         self.build = engine_build(self.home, engine_bin(o))
-        self.offers = None if self.ms else []     # a release serves any rank; a box without a model serves none
+        self.offers = modelset.offers(self.ms, self.tmpl) if self.ms else []
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
         c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant)
@@ -536,19 +543,26 @@ class Supervisor:
                 log(self.fabric_error)
 
     def checks(self, copy=True):
-        """What would stop this box's boot, as text. copy: fetch this rank's model files first. The rank's files are
-        checked only once the rank is known, and the front end only on rank 0."""
-        o, fails = self.o, [e for e in (self.model_error, self.fabric_error) if e]
+        """What would stop this box's boot, as text. copy: make this rank's model files ready first. The rank's files
+        are checked only once the rank is known, and the front end only on rank 0."""
+        o, fails, plan = self.o, [e for e in (self.model_error, self.fabric_error) if e], self.tmpl
+        held = self.offers is not None and self.rank is not None and self.rank not in self.offers
+        if held:
+            fails.append(f'this box holds rank {mentat.format_offers(self.offers) or "none"} of the model set, but it is '
+                         f'rank {self.rank} ({self.lan}) in the member list'
+                         + (f': list it at position {self.offers[0] + 1} of --peers' if self.offers else ''))
         try:
-            if not self.ms or self.rank is None:
+            if not self.ms or held:
                 pass
             elif copy:
+                modelset.prepare(self.ms, self.rank, plan, log=log)
                 rel = self.ms.release
                 if rel and rel.check(int(o.get('TP')), self.rank, self.variant):
                     rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
                 if self.ms.drafter and self.ms.drafter.check(self.rank):
                     self.ms.drafter.fetch_rank(self.rank)
-            if self.ms and self.rank is not None:
+            if self.ms and self.rank is not None and not held:
+                fails += modelset.validate_rank(self.ms, self.rank, plan)
                 if self.ms.release:
                     fails += self.ms.release.check(int(o.get('TP')), self.rank, self.variant)
                 if self.ms.drafter:
@@ -699,7 +713,7 @@ class Supervisor:
 
     def boot(self):
         o, hs, r = self.o, self.hs, self.rank
-        plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.dir, aux_dir=self.ms.dir, home=self.home,
+        plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.rank_dir(r), aux_dir=self.ms.rank_dir(r), home=self.home,
                                epoch=hs['epoch'], set_id=self.model_id, kv_store=self.kv_store(),
                                kv_rows=self.kv_rows())
         work = os.path.join(self.home, 's2')
