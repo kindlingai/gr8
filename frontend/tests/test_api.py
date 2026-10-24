@@ -304,6 +304,28 @@ class Thinking(unittest.TestCase):
         contents = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
         self.assertEqual(json.loads(contents), {'city': 'Paris', 'days': 3})
 
+    def test_response_format_null_is_text(self):
+        self.assertEqual(post('/v1/chat/completions', dict(CHAT, response_format=None))[0], 200)
+        self.assertEqual(post('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4,
+                                                  'response_format': None})[0], 200)
+
+    def test_json_mode_stream_keeps_the_text_before_a_tool_call(self):
+        tools = [{'type': 'function', 'function': {'name': 'get_weather', 'parameters': {
+            'type': 'object', 'properties': {'city': {'type': 'string'}}}}}]
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'use-a-tool-please'}], tools=tools,
+                    response_format={'type': 'json_object'})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertEqual(msg['tool_calls'][0]['function']['name'], 'get_weather')
+        self.assertNotIn('warnings', r)
+        chunks = sse('/v1/chat/completions', body)
+        content = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
+        calls = [t for c in chunks if c['choices'] for t in c['choices'][0]['delta'].get('tool_calls') or []]
+        self.assertEqual(content, msg['content'] or '')
+        self.assertEqual(calls[0]['function']['name'], 'get_weather')
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
+
     def test_response_format_ignored_when_absent(self):
         s, r = post('/v1/chat/completions', CHAT)
         self.assertEqual(s, 200)

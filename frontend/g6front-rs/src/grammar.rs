@@ -14,10 +14,12 @@ impl Grammars {
         Ok(Grammars(GrammarCompiler::new(&info)))
     }
 
-    /// A JSON schema's grammar. Err: the compiler's reason it cannot take the schema.
-    pub fn json_schema(&self, schema: &str) -> Result<CompiledGrammar, String> {
+    /// A JSON schema's grammar, keys in any order. `strict`: properties and items the schema does not name are refused
+    /// (OpenAI's `json_schema.strict`). The grammar does not check required or duplicate keys in any order:
+    /// `jsonmode::check_value` does. Err: the compiler's reason it cannot take the schema.
+    pub fn json_schema(&self, schema: &str, strict: bool) -> Result<CompiledGrammar, String> {
         self.0
-            .compile_json_schema(schema, None, None, None, None, None, None)
+            .compile_json_schema(schema, None, None, None, Some(strict), None, Some(true))
             .map_err(|e| reason(&e.to_string()).into())
     }
 }

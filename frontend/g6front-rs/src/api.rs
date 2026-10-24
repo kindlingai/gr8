@@ -899,8 +899,13 @@ async fn chat_step(
 ) -> Result<(), ()> {
     let finished = step.finish_reason.is_some();
     let mut delta = parser.delta(&step.text, finished);
-    if delta.as_ref().is_some_and(|d| !d.tool_calls.is_empty()) {
+    let first_call = !*tools_streamed && delta.as_ref().is_some_and(|d| !d.tool_calls.is_empty());
+    if first_call {
         *tools_streamed = true;
+        // a call ends JSON mode: the withheld text goes out ahead of it unextracted, as chat_full keeps it
+        if let Some(d) = delta.as_mut().filter(|_| json_mode && !held_content.is_empty()) {
+            d.content = Some(std::mem::take(held_content) + d.content.as_deref().unwrap_or(""));
+        }
     }
     let mut warnings: Option<Vec<String>> = None;
     if json_mode && !*tools_streamed {
