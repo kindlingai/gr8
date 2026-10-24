@@ -209,6 +209,8 @@ public:
         return n;
     }
     const g6kv_tier* store(size_t i) const { return t_.at(i); }
+    // the node gave back the lease it parked for this store's name (spec remote:HOST:PORT?persist)
+    bool reattached(size_t i) const { return g6kv_tier_reattached(t_.at(i)) == 1; }
     // a group lease's segment size, 0 for any other store
     bool group(size_t i) const { return g6kv_store_seg_blocks(t_.at(i)) != 0; }
     size_t size() const { return t_.size(); }
@@ -265,10 +267,11 @@ public:
     }
 };
 
-// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off][,keep=system|sessions|all][,group=NAME[,cap=N(M|G|T)]
-// [,weight=N]]. STORE is ssd:PATH (a folder) or remote:HOST:PORT (remote:auto is the launcher's to resolve). Sizes are
-// binary: G = 2^30, T = 2^40. persist=on (SSD only) keeps the folder's system prefixes and counts across restarts; off
-// (the default) clears it at boot. keep= is this store's --kv-keep. group= (remote only): the lease joins that group on
+// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off|lease][,keep=system|sessions|all][,group=NAME
+// [,cap=N(M|G|T)][,weight=N]]. STORE is ssd:PATH (a folder) or remote:HOST:PORT (remote:auto is the launcher's to
+// resolve). Sizes are binary: G = 2^30, T = 2^40. persist=on (SSD only) keeps the folder's system prefixes and counts
+// across restarts; off (the default) clears it at boot. persist=lease (remote, no group=): the node parks the lease
+// over a restart (kvman-remote --holdover-s) and the engine keeps its index, sessions too, in /dev/shm. keep= is this store's --kv-keep. group= (remote only): the lease joins that group on
 // the node and its size moves between size (the floor) and cap (0 or none: as far as the node gives) by whole segments;
 // weight (1000 = 1x, the default) is its share against the other groups (kvman-rs REMOTE-TIER.md "Sharing a node").
 // The deprecated --kv-tier (old) takes keep=evicted|shared|all instead, which g6m4 maps to --kv-keep.
@@ -278,6 +281,7 @@ struct TierSpec {
     int keep = 0;       // --kv-tier only: 0 evicted, 1 shared, 2 all
     std::string rule;   // --kv-store keep=: system, sessions or all; empty = --kv-keep
     bool persist = false;
+    bool lease = false;
     std::string group;
     uint64_t cap = 0;
     uint32_t weight = 0;
@@ -311,8 +315,9 @@ struct TierSpec {
                 if (x.empty() || *end || w < 1 || w > 1000000) throw std::runtime_error("--kv-store " + v + ": weight=N, 1000 = 1x");
                 t.weight = uint32_t(w);
             } else if (k == "persist") {
-                if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": persist=on or off");
+                if (x != "on" && x != "off" && x != "lease") throw std::runtime_error("--kv-store " + v + ": persist=on, off or lease");
                 t.persist = x == "on";
+                t.lease = x == "lease";
             } else if (k == "keep" && !old) {
                 if (x != "system" && x != "sessions" && x != "all")
                     throw std::runtime_error("--kv-store " + v + ": keep=system, sessions or all");
@@ -329,6 +334,9 @@ struct TierSpec {
             throw std::runtime_error("--kv-store " + v + ": the store is ssd:PATH or remote:HOST:PORT (remote:auto needs the launcher)");
         if (!t.bytes) throw std::runtime_error("--kv-store " + v + ": size=N(G|T) is needed");
         if (t.persist && !ssd) throw std::runtime_error("--kv-store " + v + ": persist=on is for ssd: stores");
+        if (t.lease && !remote) throw std::runtime_error("--kv-store " + v + ": persist=lease is for remote: stores");
+        // an indexed tier keeps its size (stash.rs resize_tier), and a group lease changes size
+        if (t.lease && !t.group.empty()) throw std::runtime_error("--kv-store " + v + ": persist=lease does not take group= yet");
         if (!t.group.empty() && !remote) throw std::runtime_error("--kv-store " + v + ": group= is for remote: stores");
         if (t.group.empty() && (t.cap || t.weight)) throw std::runtime_error("--kv-store " + v + ": cap= and weight= need group=");
         if (t.cap && t.cap < t.bytes) throw std::runtime_error("--kv-store " + v + ": cap= is below size=");

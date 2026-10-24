@@ -1461,7 +1461,7 @@ int main(int argc, char** argv)
         // PATH/r<rank>; its system prefixes and the counts survive restarts (their index needs --set-id: the blocks belong to
         // one model). A store's keep=, else --kv-keep, sets its keep rule and policy (kvman-rs stash.rs Keep, Policy)
         std::unique_ptr<g6s2::KvTiers> kvt;
-        bool kv_index = false;
+        bool kv_index = false, kv_lease = false;
         if (!kv_tiers.empty())
         {
             std::vector<const G6AttnBinding*> bs;
@@ -1480,7 +1480,15 @@ int main(int argc, char** argv)
                 for (size_t i = 0; i < kv_tiers.size(); ++i)
                 {
                     const g6s2::TierSpec t = g6s2::TierSpec::parse(kv_tiers[i], kv_old);
-                    std::string spec = t.store, index;
+                    std::string spec = t.store, index, tname = name + "-t" + std::to_string(i);
+                    // persist=lease: a name without the epoch, so the restarted engine asks the node for the same lease
+                    if (t.lease)
+                    {
+                        if (set_id.empty()) throw std::runtime_error(t.store + ": persist=lease needs --set-id (the blocks belong to one model)");
+                        tname = std::string("g6m4-") + set_id + "-" + host + "-r" + std::to_string(R) +
+                                (kv_format == "fp8" ? "" : "-" + kv_format) + "-t" + std::to_string(i);
+                        spec += "?persist";
+                    }
                     if (t.ssd())
                     {
                         // without persist=on the folder starts empty: a boot that served wrong output (a degenerate boot)
@@ -1496,23 +1504,38 @@ int main(int argc, char** argv)
                         if (t.persist && !set_id.empty()) index = dir;
                     }
                     // group=: a lease that shares its node with other clusters (s2/kv_share.h); it starts at size=
-                    const uint64_t slots = t.group.empty() ? kvt->add(spec, name + "-t" + std::to_string(i), t.bytes)
-                                                           : kvt->add_group(spec, name + "-t" + std::to_string(i), t.group, (uint32_t)g6nr::NR,
+                    const uint64_t slots = t.group.empty() ? kvt->add(spec, tname, t.bytes)
+                                                           : kvt->add_group(spec, tname, t.group, (uint32_t)g6nr::NR,
                                                                             (uint32_t)R, t.bytes, t.cap, t.weight);
+                    if (t.lease)
+                    {
+                        // the index lives as long as the box (tmpfs) and names the lease's blocks: a fresh lease (the node
+                        // had none parked, or the holdover ran out) starts it empty
+                        index = "/dev/shm/g6kv-" + tname;
+                        const bool back = kvt->reattached(kvt->size() - 1);
+                        if (!back && std::filesystem::exists(index)) std::filesystem::remove_all(index);
+                        fprintf(stderr, "# rank %d: s2 store %zu: lease %s %s\n", R, i, tname.c_str(),
+                                back ? "taken back from the node, its index kept" : "new, its index starts empty");
+                        kv_lease = true;
+                    }
                     // what makes stored blocks this engine's: the model, the layout, the block format, and the engine binary
                     // itself (another build may compute other KV bits); an index with another line starts empty
                     static const std::string exe = g6s2::exe_stamp();
+                    // persist=lease: a resize changes the pool (place) and may change the store's size, so neither is in
+                    // the line (entries past the new size are not loaded); a run's tail past R is laid out by place, so
+                    // with tails place stays in
+                    const bool tails = m.cp.on && s2_below == m.cp.R;
                     const std::string compat = "set " + set_id + " nr " + std::to_string(g6nr::NR) + " below " + std::to_string(s2_below) +
-                        " place " + std::to_string(place) + " grid " + std::to_string(reuse_grid) + " block " +
+                        (t.lease && !tails ? "" : " place " + std::to_string(place)) + " grid " + std::to_string(reuse_grid) + " block " +
                         std::to_string(kvt->blocks().slot_bytes()) + " bindings " + std::to_string(bs.size()) + "/" +
-                        std::to_string(nidx) + " slots " + std::to_string(slots) + " format " + std::to_string(g6s2::KV_BLOCK_FORMAT) +
+                        std::to_string(nidx) + (t.lease ? "" : " slots " + std::to_string(slots)) + " format " + std::to_string(g6s2::KV_BLOCK_FORMAT) +
                         " engine " + exe
 #if G6_KV4
                         + " kv " + g6kv::NAME   // the latent row's layout (kvfmt.h); the FP8 row keeps the old key
 #endif
                         ;
                     const std::string& keep = t.rule.empty() ? kv_keep : t.rule;
-                    pool.add_tier(slots, keep == "system" ? 1 : 2, index, compat);   // shared prefixes, or those and evicted runs
+                    pool.add_tier(slots, (keep == "system" ? 1 : 2) | (t.lease ? 4 : 0), index, compat);   // + 4: sessions in the index too   // shared prefixes, or those and evicted runs
                     pool.policy((uint32_t)i, 0, keep == "sessions" ? 1 : 0, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();
                     fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B, keep %s%s\n", R, i, kvt->describe(i).c_str(),
@@ -2185,6 +2208,22 @@ int main(int argc, char** argv)
             catch (...) { links.shutdown(); throw; }
             g6s2::Service service(bc, links, std::move(h), plan.chunk);
             service.run();               // returns on DIR/quit
+            // persist=lease: an orderly quit (an idle engine) stores the runs the pool still holds, the same calls on every
+            // rank, so the engine that takes the lease back finds them (a resize, a reload)
+            if (kv_lease)
+            {
+                try
+                {
+                    const auto all = pool.reserve((uint64_t)cap, (uint64_t)cap);
+                    kv_drain();
+                    pool.release(all);
+                    kv_drain();
+                    size_t n = 0;
+                    for (const auto& t : pool.tiers()) n += t.entries;
+                    fprintf(stderr, "# rank %d: s2 stores: quit stored the pool's runs, %zu entries kept for the next engine\n", R, n);
+                }
+                catch (const std::exception& e) { fprintf(stderr, "# rank %d: s2 stores: drain at quit failed: %s\n", R, e.what()); }
+            }
             links.shutdown();
         }
         catch (const std::exception& e)
