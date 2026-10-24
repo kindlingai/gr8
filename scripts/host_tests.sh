@@ -142,3 +142,10 @@ python3 "$REPO/engine/tests/test_flash_serve_check.py"
 python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test"
 "$T/pf_peer_stage_test"
+# Flash prefill router row split (G6_PF_ROUTER_SPLIT): every rank count 2..8 ends with byte-equal route tables, the kernels'
+# word maps included; the strict env parse; the source checks of its boot and order.
+for t in test_flash_route_split test_flash_route_split_tp4 test_flash_route_split_env; do
+  g++ -std=c++17 -O1 -Wall "$REPO/engine/tests/$t.cpp" -o "$T/$t"
+  "$T/$t"
+done
+python3 "$REPO/engine/tests/test_flash_route_split_source.py"

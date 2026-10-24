@@ -609,15 +609,15 @@ int main(int argc, char** argv)
         init_ids(fabix, 64, 9);
         if (two) init_ids(fabix2, 72, 10);
     }
-    // G6_PF_ROUTER_SPLIT=1 (opt-in): one ncoll = 1 route-table fabric per prefill lane.
-    // TP4 uses its own four-peer unpack instance; its 4-rank byte gate is required before a TP4 speed row.
+    // G6_PF_ROUTER_SPLIT=1 (opt-in): one ncoll = 1 route-table fabric per prefill lane, at any rank count and on a
+    // switched mesh or the switchless ring (the fabric relays the diagonal, as it does for the prefill fabric).
     // Ports +80 / +88 and proxy CPU offsets 11 / 12 (taken: ports 8 16 24 32 40 48 56 64 72, offsets 1..10).
     g6::Fabric fabrs, fabrs2;
     const bool route_split = route_split_mode == 1;
     if (route_split)
     {
-        if (!(MP && (g6nr::NR == 2 || g6nr::NR == 4) && cfg.ips.size() == (size_t)g6nr::NR && !cfg.ring))
-            die("G6_PF_ROUTER_SPLIT=1 needs TP2 or TP4 Flash prefill (not ring)");
+        if (!(MP && g6nr::NR >= 2 && g6nr::NR <= flash_route_split::MAX_NR && cfg.ips.size() == (size_t)g6nr::NR))
+            die("G6_PF_ROUTER_SPLIT=1 needs Flash prefill (--prefill) on 2 to 8 ranks");
         auto init_rs = [&](g6::Fabric& rs, int port, int cpu_offset) {
             g6::FabricConfig cp = cfg;
             cp.ncoll = 1; cp.slot_bytes = flash_route_split::payload(MP, (int)cfg.ips.size());

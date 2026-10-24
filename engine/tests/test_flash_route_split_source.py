@@ -9,7 +9,10 @@
    launch_router on all M exactly as before.
 2. ON order: router on own rows -> own-row route -> publish -> hx -> shared -> receive -> pre_routed -> experts.
 3. K < TOPK: k_pf_route writes all TOPK slots of a row (dropped = -1 / 0.0f) and the exchange moves all of them.
-4. Boot: strict env, m4sim fails closed, TP2/TP4 non-ring, ports / proxy CPU offsets disjoint from every other fabric of g6m4.cu.
+4. Boot: strict env, m4sim fails closed, any rank count 2..8 on a mesh or the ring, one unpack instance for every rank count,
+   ports / proxy CPU offsets disjoint from every other fabric of a Flash g6m4.
+
+OffSurface compares with the commit that added the split (BASE); a checkout without it (a shallow CI clone) skips those cases.
 """
 import os
 import re
@@ -29,12 +32,18 @@ def base(name):
     return subprocess.check_output(['git', '-C', ROOT, 'show', f'{BASE}:{name}']).decode()
 
 
+def have_base():
+    return subprocess.run(['git', '-C', ROOT, 'cat-file', '-e', f'{BASE}^{{commit}}'],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
 def between(text, start, end):
     i = text.index(start)
     return text[i:text.index(end, i)]
 
 
 class OffSurface(unittest.TestCase):
+    @unittest.skipUnless(have_base(), f'commit {BASE} is not in this checkout')
     def test_decode_router_is_base_bytes(self):
         for name in ['engine/kernels/glue.cuh', 'engine/kernels/flash_mlp.cuh', 'engine/runtime/rank.cuh',
                      'engine/model_geom.h', 'engine/runtime/envparse.h']:
@@ -45,6 +54,7 @@ class OffSurface(unittest.TestCase):
         self.assertIn('struct MhcFabricPeerBlock : MhcFabricBlock', added)
         self.assertEqual(base(name), step.replace(added, ''))
 
+    @unittest.skipUnless(have_base(), f'commit {BASE} is not in this checkout')
     def test_router_kernels_are_base_bytes(self):
         a, b = src('engine/runtime/flash_mlp_pf.cuh'), base('engine/runtime/flash_mlp_pf.cuh')
         for start, end in [('template <int MR = 4>\n__global__', '// Register-tiled router GEMM'),
@@ -61,6 +71,11 @@ class OffSurface(unittest.TestCase):
         decl = [l for l in body.split('\n') if re.match(r'    (int|const|float|__half|uint|long)', l)]
         self.assertTrue(decl[-1].startswith('    int pre_routed = 0;'), decl[-1])
         self.assertEqual(body.count('pre_routed'), 1)
+
+    @unittest.skipUnless(have_base(), f'commit {BASE} is not in this checkout')
+    def test_pre_routed_base_members(self):
+        s = src('engine/kernels/bind_prefill.cuh')
+        body = between(s, 'struct Expert\n{', '\n};\n')
         b = between(base('engine/kernels/bind_prefill.cuh'), 'struct Expert\n{', '\n};\n')
         # Compare the pre-existing declarations exactly; only their explanatory comment changed.
         no_comments = lambda s: re.sub(r'//[^\n]*', '', s)
@@ -130,14 +145,20 @@ class Boot(unittest.TestCase):
         self.assertIn('if (v < 0) die(e);', c)
         g = src('engine/runtime/g6m4.cu')
         self.assertIn('if (getenv("G6_PF_ROUTER_SPLIT")) die("G6_PF_ROUTER_SPLIT is a Flash-model option', g)
-        self.assertIn('(g6nr::NR == 2 || g6nr::NR == 4)', g)
-        self.assertIn('!cfg.ring', g)
+        rs = between(g, 'const bool route_split = route_split_mode == 1;', 'auto init_rs')
+        self.assertIn('g6nr::NR >= 2 && g6nr::NR <= flash_route_split::MAX_NR', rs)
+        self.assertIn('cfg.ips.size() == (size_t)g6nr::NR', rs)
+        self.assertNotIn('ring', rs)          # the ring fabric relays the slot as it does the prefill fabric's
+        self.assertNotIn('NR == 4', rs)
         self.assertIn('if (getenv("G6_PF_ROUTER_SPLIT"))', src('engine/runtime/m4sim.cu'))
 
-    def test_tp4_has_own_unpack_instance(self):
+    def test_one_unpack_for_every_rank_count(self):
         c = src('engine/runtime/flash_route_split.cuh')
-        self.assertIn('k_rs_unpack<2><<<dim3(RS_UNPACK_CTA, 2)', c)
-        self.assertIn('k_rs_unpack<4><<<dim3(RS_UNPACK_CTA, 4)', c)
+        self.assertIn('k_rs_unpack<<<dim3(RS_UNPACK_CTA, p.f.nr), 256, 0, st>>>', c)
+        self.assertIn('if (p >= f.nr || p == f.rank', c)
+        self.assertNotIn('template <int NR>', c)
+        self.assertIn('p.f.nr < 2 || p.f.nr > MAX_NR', c)
+        self.assertIn('constexpr int MAX_NR = 8;', src('engine/runtime/flash_route_split.h'))
 
     def test_ports_and_cpus_disjoint(self):
         g = src('engine/runtime/g6m4.cu')
@@ -145,7 +166,11 @@ class Boot(unittest.TestCase):
         self.assertEqual(sorted(ports).count(80), 1)
         self.assertEqual(sorted(ports).count(88), 1)
         self.assertEqual(len(ports), len(set(ports)), sorted(ports))
-        cpus = [int(x) for x in re.findall(r'proxy_cpu - (\d+)', g)] + [int(x) for x in re.findall(r'init_(?:ids|rs)\(\w+, \d+, (\d+)\)', g)]
+        # the replicated-GEMV gather fabric (gc, offset 9) is GLM-5.3 only: a Flash build dies on G6_QA_SPLIT and friends,
+        # and the pool-ID fabric takes offset 9 there
+        self.assertIn('if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die(', g)
+        flash = '\n'.join(l for l in g.split('\n') if 'gc.proxy_cpu' not in l)
+        cpus = [int(x) for x in re.findall(r'proxy_cpu - (\d+)', flash)] + [int(x) for x in re.findall(r'init_(?:ids|rs)\(\w+, \d+, (\d+)\)', flash)]
         self.assertEqual(len(cpus), len(set(cpus)), sorted(cpus))
         self.assertTrue({11, 12} <= set(cpus))
 
