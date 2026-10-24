@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-23: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
+
+- `G6_TR3_W2ALL=1` applies the window-2 fc1 split (KS1x2, WG1) to every MoE layer at M > 1, not only the layers the k2
+  gate picks. Bit-exact (`row_budget_test --only k1`: the same FNV on all 54 K1 lines off and on). Launch knob
+  `TR3_W2ALL`, 1 at TP=4, unset at TP=3 / TP=6; 0 turns it off. Measured on four GB10 at TP=4 (2000 MHz cap): prose
+  decode +1.3%, code c4 +3.4%.
+
 ## 2026-10-23: GLM-5.3-Flash defaults to a 262,144-token context (CAP 262,208)
 
 - `./gr8 glm53f` now defaults `CAP` to 262,208 (was 33,280) at TP=4 and TP=2: a 262,144-token request plus a page for
