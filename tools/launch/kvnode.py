@@ -43,7 +43,8 @@ KEYS = {
     'KV_RDMA': ('1', '0 = serve over TCP only'),
     'KV_BIN': (None, 'the kvman-remote binary (default bin/kvman-remote, else the crate\'s target/release)'),
     'KV_SHARE_VALUE': ('age', 'which group gives segments to a group that is short: age (the coldest blocks) or '
-                              'cost-shadow (still age, and the node logs what the value-weighted policy would pick)'),
+                              'cost-shadow (still age, and the node logs what the value-weighted policy would pick) or '
+                              'cost (the value-weighted policy picks)'),
     'KV_SHARE_SPG': (None, 'GROUP=SECONDS,...: recompute seconds a GiB of each group\'s KV costs (GLM 5.3 Full 15.6); '
                            'a group not listed is of unknown cost'),
     'KV_SHARE_MARGIN': ('1.25', 'a give that loses rows needs this many times their cost in benefit'),
@@ -131,8 +132,8 @@ def validate(o):
             float(o.get(k))
         except (TypeError, ValueError):
             raise opt.OptionError(f'{k}={o.get(k)!r}: want a number')
-    if o.get('KV_SHARE_VALUE') not in ('age', 'cost-shadow'):
-        raise opt.OptionError(f'KV_SHARE_VALUE={o.get("KV_SHARE_VALUE")!r}: want age or cost-shadow')
+    if o.get('KV_SHARE_VALUE') not in ('age', 'cost-shadow', 'cost'):
+        raise opt.OptionError(f'KV_SHARE_VALUE={o.get("KV_SHARE_VALUE")!r}: want age, cost-shadow or cost')
     for kv in (o.get('KV_SHARE_SPG') or '').split(','):
         g, _, sec = kv.partition('=')
         try:

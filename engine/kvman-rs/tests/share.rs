@@ -492,3 +492,59 @@ fn the_shadow_prices_what_the_age_rule_gives_beside_what_the_cost_policy_would()
     // the age rule acted: chat gives
     assert_eq!(chat[0].report(0, &[9_000], &[]).unwrap().give, 1);
 }
+
+#[test]
+fn the_cost_policy_picks_the_giver_live_and_the_age_rule_is_only_counted() {
+    let spg = ["chat", "batch", "req"].iter().map(|n| (n.to_string(), 15_600)).collect();
+    let addr = node_with(
+        10,
+        Share { margin: Duration::from_millis(1_000), value: Value::Cost, spg_ms: spg, ..Share::default() },
+    );
+    let chat = cluster(&addr, "chat", 2, 100_000, 1, 4);
+    let batch = cluster(&addr, "batch", 2, 100_000, 1, 4);
+    let req = cluster(&addr, "req", 2, 100_000, 1, 4);
+    for c in [&chat, &batch] {
+        let r = c[0].report(1, &[0], &[]).unwrap();
+        assert_eq!(r.grant, 1);
+        for s in c {
+            s.grow(2, r.txn).unwrap();
+        }
+    }
+    // the same picture as the shadow test: the age rule would ask chat (colder, a give loses its rows); batch's
+    // first segment a rank is empty
+    chat[0].report_ghosts(0, &[9_000], &[500, 900], [10, 1, 0]).unwrap();
+    batch[0].report_ghosts(0, &[3_000], &[0, 400], [10, 1, 0]).unwrap();
+    assert_eq!(req[0].report_ghosts(1, &[0], &[], [10, 9, 0]).unwrap().grant, 0);
+    let st = stats(&addr);
+    assert!(st.contains("\"shadow\":{\"value\":\"cost\",\"short\":1,\"gives\":1,"), "{st}");
+    assert!(st.contains("\"agree\":0,\"age_gives\":1,"), "{st}");
+    // the policy acted: batch gives its empty segment, chat keeps its rows
+    assert_eq!(chat[0].report(0, &[9_000], &[]).unwrap().give, 0);
+    assert_eq!(batch[0].report(0, &[3_000], &[]).unwrap().give, 1);
+}
+
+#[test]
+fn the_cost_policy_gives_nothing_when_no_give_pays() {
+    // only chat can give, its give loses rows, and req never reads back what it drops: the age rule would ask chat
+    let spg = ["chat", "req"].iter().map(|n| (n.to_string(), 15_600)).collect();
+    let addr = node_with(
+        10,
+        Share { margin: Duration::from_millis(1_000), value: Value::Cost, spg_ms: spg, ..Share::default() },
+    );
+    let chat = cluster(&addr, "chat", 2, 100_000, 1, 4);
+    let req = cluster(&addr, "req", 2, 100_000, 1, 4);
+    // chat takes the rest of the node: 4 segments a rank
+    let r = chat[0].report(3, &[0], &[]).unwrap();
+    assert_eq!(r.grant, 3);
+    for s in &chat {
+        s.grow(4, r.txn).unwrap();
+    }
+    chat[0].report_ghosts(0, &[9_000], &[500, 900, 1_300], [10, 5, 0]).unwrap();
+    for _ in 0..3 {
+        assert_eq!(req[0].report_ghosts(1, &[0], &[], [10, 0, 0]).unwrap().grant, 0);
+    }
+    let st = stats(&addr);
+    assert!(st.contains("\"value\":\"cost\",\"short\":3,\"gives\":0,"), "{st}");
+    assert!(st.contains("\"age_gives\":3,"), "the age rule would have asked chat each time: {st}");
+    assert_eq!(chat[0].report(0, &[9_000], &[]).unwrap().give, 0);
+}

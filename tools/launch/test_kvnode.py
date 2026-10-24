@@ -56,7 +56,10 @@ class OptionTests(unittest.TestCase):
         o = K.parse(['--no-config', '--gb', '8', '--share-value', 'cost-shadow', '--share-spg', 'gr8-glm53=15.6'], {})
         K.validate(o)
         self.assertEqual(K.share_args(o), ['--value', 'cost-shadow', '--value-margin', '1.25', '--value-spg', 'gr8-glm53=15.6'])
-        for a in (['--share-value', 'cost'], ['--share-spg', 'g'], ['--share-spg', 'g=0'], ['--share-margin', 'x']):
+        o = K.parse(['--no-config', '--gb', '8', '--share-value', 'cost', '--share-spg', 'gr8-glm53=15.6'], {})
+        K.validate(o)
+        self.assertEqual(K.share_args(o), ['--value', 'cost', '--value-margin', '1.25', '--value-spg', 'gr8-glm53=15.6'])
+        for a in (['--share-value', 'costly'], ['--share-spg', 'g'], ['--share-spg', 'g=0'], ['--share-margin', 'x']):
             with self.assertRaises(opt.OptionError):
                 K.validate(K.parse(['--no-config', '--gb', '8', *a], {}))
 
