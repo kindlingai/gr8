@@ -74,12 +74,10 @@ KEYS = {
     'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
-    'KV_OFFLOAD': ('cluster', None, 'experimental: offload KV to this box\'s own SSD: PATH,size=N(M|G|T)[,persist=on|off]'
-                                   '[,keep=RULE], one folder per box (rank r uses PATH/r<r>; --kv-offload given again for '
-                                   'more). The same store as KV_STORE=ssd:PATH,..., tried before the KV_STORE stores'),
     'KV_STORE': ('cluster', None, 'experimental: block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, '
-                                  'separated by ; (or --kv-store given again). STORE: ssd:PATH, remote:HOST:PORT or remote:auto '
-                                  '(a KV node from the mentat group). Sizes per rank. An SSD store starts empty at every boot; '
+                                  'separated by ; (or --kv-store given again). STORE: ssd:PATH (a folder on each box\'s own SSD), '
+                                  'remote:HOST:PORT or remote:auto (a KV node on another machine; auto = the one the mentat '
+                                  'group announces). Sizes per rank. An SSD store starts empty at every boot; '
                                   ',persist=on keeps it across restarts'),
     'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
@@ -272,7 +270,7 @@ def parse(argv, environ=None):
                 if i >= len(argv):
                     raise OptionError(f'{name} needs a value')
                 val = argv[i]
-            if key in ('KV_STORE', 'KV_OFFLOAD', 'KV_TIER') and cmd.get(key):   # one store per --kv-store / --kv-offload
+            if key in ('KV_STORE', 'KV_TIER') and cmd.get(key):   # one store per --kv-store
                 val = cmd[key] + ';' + val
             cmd[key] = val
         else:
@@ -315,7 +313,6 @@ def parse(argv, environ=None):
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
     deprecated_kv(values, origin, warnings)
-    kv_offload(values, origin)
     if values['GR8_MODEL'] not in models.MODELS:
         raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {" or ".join(models.MODELS)}')
     if not values['GROUP']:
@@ -478,27 +475,6 @@ def deprecated_kv(values, origin, warnings):
             values['KV_SYSTEM_AFTER'], origin['KV_SYSTEM_AFTER'] = values['KV_SHARED_AFTER'], origin['KV_SHARED_AFTER']
         warnings.append(f'KV_SHARED_AFTER (--kv-shared-after) is deprecated: KV_SYSTEM_AFTER={values["KV_SYSTEM_AFTER"]}')
     values['KV_TIER'] = values['KV_SHARED_AFTER'] = None
-
-
-def kv_offload(values, origin):
-    """KV_OFFLOAD (local SSD offload) becomes the ssd: stores at the front of KV_STORE; KV_STORE=ssd:PATH,... stays the
-    same store. Raises OptionError for a remote store, which is KV_STORE's."""
-    v = values.get('KV_OFFLOAD')
-    if v in (None, 'off'):
-        values['KV_OFFLOAD'] = None
-        return
-    texts = []
-    for text in [t.strip() for t in v.split(';') if t.strip()]:
-        if text.startswith(('remote:', 'mem:')):
-            raise OptionError(f'--kv-offload {text}: a folder on this box (PATH,size=...); a KV node is --kv-store remote:...')
-        texts.append(text if text.startswith('ssd:') else 'ssd:' + text)
-    rest = values.get('KV_STORE')
-    values['KV_STORE'] = ';'.join(texts + ([rest] if rest not in (None, 'off') else []))
-    if rest in (None, 'off') or origin['KV_STORE'] == origin['KV_OFFLOAD']:
-        origin['KV_STORE'] = origin['KV_OFFLOAD']
-    else:
-        origin['KV_STORE'] = f"{origin['KV_OFFLOAD']} + {origin['KV_STORE']}"
-    values['KV_OFFLOAD'] = None
 
 
 def kv_stores(o):

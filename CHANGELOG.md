@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-24: one key for the block stores again (KV_OFFLOAD removed)
+
+- `KV_OFFLOAD` (#145) was a second spelling of `KV_STORE=ssd:PATH,...` that always put its SSD stores first. Stores
+  are tried in the order given, for lookups and for placement, so a hidden reorder changed where entries went.
+  `KV_STORE` is the one key again. Its help and `KNOBS.md` row now say what each kind is: `ssd:PATH` is local SSD
+  offload, a folder on each box, and `remote:` is a KV node on another machine.
+
 ## 2026-10-24: the launcher boots from the exlr8 release only, again
 
 - #172 brought back the boot from converted rank packs, because a TP=6 boot from the release had stopped at layer 37

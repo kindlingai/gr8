@@ -228,8 +228,7 @@ KV_ROWS=remote:auto,size=12G,local=40,place=1600
 CAP=655360
 ```
 
-The SSD store sits on each box (`KV_OFFLOAD=/data/gr8kv,size=4G,persist=on,keep=system` is the same store under its own
-key: local SSD offload, not a remote store). The KV node needs at least every rank's `remote:` sizes together: here 4 x (4G + 12G) = 64G.
+The SSD store sits on each box. The KV node needs at least every rank's `remote:` sizes together: here 4 x (4G + 12G) = 64G.
 
 Measured on four GB10 boxes and a KV node on 200G RoCE:
 
