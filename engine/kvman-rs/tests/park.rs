@@ -131,7 +131,7 @@ fn a_parked_lease_of_another_shape_is_freed_not_handed_out() {
 fn a_group_comes_back_with_its_segments_and_blocks() {
     let addr = node(8, 2_000);
     let g = [rank(&addr, 0, true), rank(&addr, 1, true)];
-    let r = g[0].report(2, &[]).unwrap();
+    let r = g[0].report(2, &[], &[]).unwrap();
     for s in &g {
         s.grow(3, r.txn).unwrap();
     }
@@ -148,6 +148,6 @@ fn a_group_comes_back_with_its_segments_and_blocks() {
         assert!(holds(s, 10 + i as u64), "rank {i}");
     }
     // still one group: it grows and gives as before
-    let r = g[0].report(1, &[]).unwrap();
+    let r = g[0].report(1, &[], &[]).unwrap();
     assert_eq!(r.grant, 1);
 }

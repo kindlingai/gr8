@@ -156,7 +156,9 @@ fn restored_rows_hold_the_prompt_while_tiers_resize() {
 // a resize quote (Stash::quote_resize) names the entries that resize then evicts, and the ones no tier keeps after
 #[test]
 fn quotes_match_resizes() {
-    assert!(random_traces(true, 1001..=1360) >= 10_000);
+    let n = random_traces(true, 1001..=1360);
+    eprintln!("quoted resizes: {n}");
+    assert!(n >= 10_000, "{n} resizes");
 }
 
 fn random_traces(resize: bool, seeds: std::ops::RangeInclusive<u64>) -> u64 {
