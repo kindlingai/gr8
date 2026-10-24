@@ -770,6 +770,15 @@ inline K1Split k1_split(int M, int k2 = 0)
         sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
     return s;
 }
+// The fused path's 512-thread CTAs: the fc1 split (KS1, WG) becomes (KS1*WG/2, 2), which keeps every k range only
+// where KS1 x WG is 2 or more. KS1 x WG = 1 (e.g. G6_K1_SPLIT_M1=1,1,2) would give KS1 = 0: no fc1 items, wrong output.
+inline const char* k1_fuse_split(K1Split& s)
+{
+    if (s.KS1 * s.WG < 2) return "G6_K1_SPLIT: KS1 x WG must be 2 or more with fused fc1 / fc2 (G6_FUSE=1|2); set G6_FUSE=0";
+    s.KS1 = s.KS1 * s.WG / 2;
+    s.WG = 2;
+    return nullptr;
+}
 constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: only WG, s_ks, s_ns2 matter. Not tuned.
 
 // G6_K1_SPLIT (A/B, exact): per step row count M, the fc1 CTA shape KS1 x WG and / or the routed fc2 n-split NS2 of
@@ -887,7 +896,8 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         if (o.ks1[M] && o.ks1[M] * o.wg[M] == s.KS1 * s.WG) { s.KS1 = o.ks1[M]; s.WG = o.wg[M]; }
         if (o.ns2[M]) s.NS2 = o.ns2[M];
     }
-    if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
+    if (fuse)                                              // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
+        if (const char* e = k1_fuse_split(s)) return e;
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently.
     if (fuse == 2 && s.KS1 == 1) s.KS1 = 2;
