@@ -388,6 +388,22 @@ class KvStoreTests(unittest.TestCase):
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
+    def test_kv_offload_is_the_local_ssd_store(self):
+        # KV_OFFLOAD (local SSD offload) and KV_STORE=ssd: give the same engine plan
+        _, old = self.plan('--kv-store', 'ssd:/data/kv,size=4G,persist=on,keep=system')
+        o, new = self.plan('--kv-offload', '/data/kv,size=4G,persist=on,keep=system')
+        self.assertEqual(new, old)
+        self.assertEqual(opt.kv_stores(o)[0]['kind'], 'ssd')
+        self.assertEqual(self.plan('--kv-offload', 'ssd:/data/kv,size=4G')[1], self.plan('--kv-store', 'ssd:/data/kv,size=4G')[1])
+        self.assertEqual(self.plan(env={'KV_OFFLOAD': '/data/kv,size=4G'})[1], self.plan('--kv-store', 'ssd:/data/kv,size=4G')[1])
+        # the offload stores come first, then the KV_STORE stores
+        _, p = self.plan('--kv-offload', '/a,size=4G', '--kv-offload', '/b,size=2G', '--kv-store', 'remote:192.0.2.5:7350,size=8G')
+        self.assertEqual(self.stores(p), ['ssd:/a,size=4G', 'ssd:/b,size=2G', 'remote:192.0.2.5:7350,size=8G'])
+        self.assertNotIn('--kv-offload', p['args'])
+        for bad in ('remote:192.0.2.5:7350,size=8G', '/a', '/a,size=4G,persist=maybe'):
+            with self.assertRaises(opt.OptionError):
+                self.plan('--kv-offload', bad)
+
     def test_the_deprecated_tier_options_map_to_the_nearest_policy(self):
         o, p = self.plan('--kv-tier', 'ssd:/x,size=200G,keep=shared', '--kv-shared-after', '5')
         self.assertEqual((self.stores(p), self.arg(p, '--kv-keep'), self.arg(p, '--kv-system-after')),
