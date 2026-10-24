@@ -6,10 +6,10 @@
 # GPU needed to compile. The image job assembles the runtime image from both of their artifacts, and only it can write
 # packages: it pushes from main and from tags, never from a pull request.
 #
-# On a pull request every job waits for the merge queue's ready flag: the `ready` job reads the PR's labels and the
-# others run only if it carries queue:ready (pr-ready.yml: a maintainer's /ready). A push to the PR clears the flag, so
-# a run started by a push always skips. /ready re-runs the PR's latest run, which then goes through. Pushes to main,
-# tags and manual runs always build.
+# On a pull request every job waits for a maintainer: the `ready` job reads the PR's labels and the others run only if
+# it carries queue:ready (/ready, which also queues the PR) or ci:requested (/ci, CI only; pr-ready.yml). A push to the
+# PR clears both, so a run started by a push always skips. Either command re-runs the PR's latest run, which then goes
+# through. Pushes to main, tags and manual runs always build.
 name: ci
 
 on:
@@ -49,8 +49,9 @@ jobs:
               const pr = context.payload.pull_request;
               const labels = (await github.rest.issues.listLabelsOnIssue(
                 { ...context.repo, issue_number: pr.number, per_page: 100 })).data.map(l => l.name);
-              go = context.payload.action !== "synchronize" && labels.includes("queue:ready");
-              if (!go) core.notice("CI waits for a maintainer's /ready on this PR (the queue:ready label).");
+              go = context.payload.action !== "synchronize" &&
+                (labels.includes("queue:ready") || labels.includes("ci:requested"));
+              if (!go) core.notice("CI waits for a maintainer's /ci or /ready on this PR.");
             }
             core.setOutput("go", go ? "true" : "false");
 

@@ -8,4 +8,5 @@
 - [ ] **Front end only**: `frontend/` and launcher changes that do not touch the engine
 - [ ] **Docs or tests only**: no change to shipped code
 
-A maintainer marks the PR ready for the merge queue by commenting `/ready` (`/unready` to undo). A new push clears it.
+CI runs once a maintainer comments `/ci` (CI only) or `/ready` (CI, and ready for the merge queue; `/unready` to
+undo). A new push clears both.
