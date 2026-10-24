@@ -803,7 +803,10 @@ class Supervisor:
             for argv in ([lb, ledger, 'init', '--total', str((gib << 30) + gpu), '--node', n, '--gpu', str(gpu)],
                          [sys.executable, kvnode.HERE, 'up', '--g6-home', self.home, '--gb', str(gib + (gpu >> 30)),
                           '--lazy-lock',
-                          '--ledger', ledger, '--group', knobs['FLASH_KV_GROUP']]):
+                          '--ledger', ledger, '--group', knobs['FLASH_KV_GROUP'],
+                          # this serve's mentat, or none when it finds its boxes by PEERS (kv up announces through
+                          # localhost otherwise, and fails on a box without mentatd)
+                          '--mentat', self.o.get('MENTAT') or 'none']):
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
                 if p.returncode:
                     raise RuntimeError(f'{os.path.basename(argv[1] if argv[0] == sys.executable else argv[0])}: '

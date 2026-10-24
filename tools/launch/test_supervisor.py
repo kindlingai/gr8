@@ -269,7 +269,8 @@ class DonorTests(unittest.TestCase):
         s = supervisor('--gr8-model', model, '--tp', '2' if flash else '4', members=MEMBERS[:2] if flash else MEMBERS)
         cfg = os.path.join(s.home, 'empty.env')
         open(cfg, 'w').close()
-        env = {'G6_CLUSTER': cfg, 'KV_BIN': STUB_KV, 'MENTAT': 'none', 'KV_PORT': str(free_port()),
+        # no MENTAT here: a PEERS serve's donor must not need a mentat daemon
+        env = {'G6_CLUSTER': cfg, 'KV_BIN': STUB_KV, 'KV_PORT': str(free_port()),
                'KV_BIND': '127.0.0.1', 'KV_MIN_FREE_GB': '0'}
         s.kv_port = int(env['KV_PORT'])
         if gpu is not None:   # what the engine wrote at boot under borrow-idle
@@ -277,6 +278,7 @@ class DonorTests(unittest.TestCase):
             with open(os.path.join(s.home, 'out', 'kv', 'ledger.gpu'), 'w') as f:
                 f.write(f'{gpu}\n')
         with mock.patch.dict(os.environ, env), mock.patch.object(S, 'log') as logged:
+            os.environ.pop('MENTAT', None)
             s.donate(knobs)
         return s, ' '.join(str(c.args[0]) for c in logged.call_args_list)
 
@@ -296,6 +298,8 @@ class DonorTests(unittest.TestCase):
             with open(f'/proc/{st["pid"]}/cmdline', 'rb') as f:
                 sup = f.read().decode().split('\0')
             self.assertEqual(sup[sup.index('--group') + 1], 'gr8-full')
+            # this serve finds its boxes by PEERS: the node announces nowhere
+            self.assertEqual(sup[sup.index('--mentat') + 1], 'none')
             book = subprocess.run([S.ledger_bin(opt.REPO), ledger, 'show'], capture_output=True, text=True).stdout
             self.assertIn(f'"total":{1 << 30},"gpu":0,"node":{1 << 30}', book)
         finally:
