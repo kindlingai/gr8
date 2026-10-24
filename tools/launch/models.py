@@ -38,8 +38,8 @@ GLM53 = Model('glm53', 'g6m4', 'glm', ('4', '6', '3'),
                'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38},
               {3: ('bit225', 'down1')}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, False)
 # GLM-5.3-Flash: uniform-width releases, K4 by default.
-GLM53F = Model('glm53f', 'g6m4_flash', 'flash', ('4', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
-               {2: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
+GLM53F = Model('glm53f', 'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
+               {2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
 MODELS = {m.name: m for m in (GLM53, GLM53F)}
 
 

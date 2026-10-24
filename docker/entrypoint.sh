@@ -22,8 +22,9 @@ except options.OptionError:
 print(o.get("TP") or len(options.split_list(o.get("PEERS"))) or "")
 EOF
 )
+model=${GR8_MODEL:-glm53}
 case ${tp:-4} in
-  4) bin=bin ;;
+  4|2) bin=bin ;;
   3) bin=bin3 ;;
   6) bin=bin6 ;;
   *) echo "gr8: TP=$tp: want 4, 3 or 6" >&2; exit 2 ;;
@@ -44,6 +45,6 @@ ln -sfn "/opt/gr8/$bin" "$home/bin"
 
 if [ "$cmd" = up ]; then
   exec > >(tee -a "$home/out/supervisor.log") 2>&1
-  exec /opt/gr8/gr8 glm53 up --foreground "$@"
+  exec /opt/gr8/gr8 "$model" up --foreground "$@"
 fi
-exec /opt/gr8/gr8 glm53 "$cmd" "$@"
+exec /opt/gr8/gr8 "$model" "$cmd" "$@"

@@ -67,7 +67,7 @@ case "${MODEL:-glm}" in
   glm) ;;
   flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build
     [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=flash: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${G6_WIDTHS:-${G6_NR:-2 4}}
+    WIDTHS=${G6_WIDTHS:-${G6_NR:-2 3 4}}
     # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
     WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 ${EXTRA:-}" OUT="$OUT/flash" \
       bash build_m4.sh "${ARCH:-121a}" all
