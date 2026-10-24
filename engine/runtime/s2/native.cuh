@@ -178,6 +178,7 @@ class NativeDispatch {
     }
     g6rt::S2In *layout_ = nullptr, *draft_layout_ = nullptr;
     const g6rt::S2In *previous_layout_ = nullptr, *previous_draft_layout_ = nullptr;
+    int* gm_on_ = nullptr; uint32_t* gm_bits_ = nullptr; int gm_words_ = 0;   // grammar masks (host side, mapped)
     uint64_t prefill_sequence_ = 1, prefill_sequence2_ = 1;
     g6rt::LpStep lp_{};   // logprobs of the last main step, fetched when a session in it asked (lp_rows_ rows; 0 = none)
     int lp_rows_ = 0;
@@ -378,6 +379,17 @@ public:
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&layout_),sizeof(g6rt::S2In),cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&draft_layout_),sizeof(g6rt::S2In),cudaHostAllocMapped));
         *layout_ = {}; *draft_layout_ = {};
+        if (g6rt::grammar_ready()) {
+            // the grammar mask arena, mapped: Dispatch writes it before each launch (synchronous), the main head reads it
+            gm_words_ = g6rt::grammar_words();
+            G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&gm_on_), sizeof(int) * g6rt::MX, cudaHostAllocMapped));
+            G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&gm_bits_), sizeof(uint32_t) * g6rt::MX * gm_words_, cudaHostAllocMapped));
+            memset(gm_on_, 0, sizeof(int) * g6rt::MX);
+            int* on; uint32_t* bits;
+            G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&on), gm_on_, 0));
+            G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&bits), gm_bits_, 0));
+            c_.main.gm_on = on; c_.main.gm_bits = bits; c_.main.gm_words = gm_words_;
+        }
         previous_layout_ = c_.main.s2->in; previous_draft_layout_ = c_.draft.d.s2->in;
         c_.main.s2->in = layout_; c_.draft.d.s2->in = draft_layout_;
     }
@@ -385,6 +397,7 @@ public:
         for (auto& item:graphs_) destroy(item.second);
         c_.main.s2->in = previous_layout_; c_.draft.d.s2->in = previous_draft_layout_;
         cudaFreeHost(layout_); cudaFreeHost(draft_layout_);
+        if (gm_on_) { c_.main.gm_on = nullptr; c_.main.gm_bits = nullptr; cudaFreeHost(gm_on_); cudaFreeHost(gm_bits_); }
     }
     NativeDispatch(const NativeDispatch&) = delete; NativeDispatch& operator=(const NativeDispatch&) = delete;
     // graphs are keyed by (kind, M, bucket), not by session: a retired session leaves them valid
@@ -474,6 +487,7 @@ public:
                 return g6rt::lp_row(lp_,row,target,k);
             }
         };
+        h.gm_on = gm_on_; h.gm_bits = gm_bits_; h.gm_words = gm_words_;
         h.draft_lp = [&](int row) {
             require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
             return dlp_[row];

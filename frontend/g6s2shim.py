@@ -123,6 +123,26 @@ def insert_field(rules):
     return f" ins {after}:{-1 if unless is None else unless}:{','.join(map(str, tokens))}", None
 
 
+def grammar_field(g):
+    """The generate frame's `grammar` {kind: json | json_schema, schema, strict, after_token} -> (the request line's gram
+    field or '', error or None). The engine compiles it (engine/runtime/grammar.h) and masks the reply's tokens with it
+    from the token after `after_token` on (the think close), or from the first token when that is null."""
+    if g is None:
+        return '', None
+    if not isinstance(g, dict) or g.get('kind') not in ('json', 'json_schema'):
+        return '', 'grammar must be {"kind": "json" | "json_schema", ...}'
+    schema, strict, after = g.get('schema'), g.get('strict', False), g.get('after_token')
+    if g['kind'] == 'json_schema' and not isinstance(schema, str):
+        return '', 'grammar json_schema needs the schema as a JSON string'
+    if not isinstance(strict, bool):
+        return '', 'grammar strict must be a boolean'
+    if after is not None and (not isinstance(after, int) or isinstance(after, bool) or not 0 <= after < VOCAB):
+        return '', f'grammar after_token must be a token id (0..{VOCAB - 1}) or null'
+    kind = 1 if g['kind'] == 'json' else 2
+    hexed = schema.encode().hex() if kind == 2 else ''
+    return f" gram {kind}:{int(strict)}:{-1 if after is None else after}:{hexed}", None
+
+
 def lp_entry(w):
     """engine logprob fields <lp> <rank> <n> <id>:<lp> ... -> a PROTOCOL.md entry {lp, rank, top}"""
     def num(x):
@@ -220,12 +240,16 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
         return None, err
     if ins and 'lp' in lps:
         return None, 'insert cannot be combined with logprobs: an inserted token has none'
+    gram, err = grammar_field(f.get('grammar'))
+    if err:
+        return None, err
     steer, err = _steering_header(f, steering)
     if err:
         return None, err
 
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + steer + '\n' + ','.join(map(str, prompt)) + '\n').encode()
+            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + '\n' + ','.join(map(str, prompt))
+            + '\n').encode()
     return body, None
 
 
@@ -403,6 +427,8 @@ class Shim:
                  'eos_ids': EOS_IDS, 'max_logprobs': self.max_logprobs()}
         if self.cfg['insert']:
             hello['insert'] = True
+        if self.cfg.get('grammar'):
+            hello['grammar'] = True
         if self.cfg['steering']:
             hello['steering'] = self.cfg['steering']
         wire.write_frame(writer, hello)
@@ -453,6 +479,8 @@ class Shim:
                 return self.finish(r, 'error', message=f'{k} must be 0..{self.max_logprobs()}')
         if f.get('insert') not in (None, []) and not self.cfg['insert']:   # a version-2 engine would end the epoch
             return self.finish(r, 'error', message='not supported by this engine: insert')
+        if f.get('grammar') is not None and not self.cfg.get('grammar'):   # the engine would refuse the gram field
+            return self.finish(r, 'error', message='not supported by this engine: grammar')
         if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
             return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
@@ -673,6 +701,8 @@ class Shim:
                         text = fh.read()
                     if text.endswith('\n'):
                         self.cfg = parse_ready(text)
+                        # g6m4 --grammar-dir: the head writes grammar.s2 before ready.s2
+                        self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
                         break
                 except ValueError as e:
                     log.error('%s', e)

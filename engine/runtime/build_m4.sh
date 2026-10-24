@@ -57,6 +57,18 @@ RSLIB=../loader-rs/target/release/libg6load.a
 RSDEF=""
 RSLINK=""
 if [ -f "$RSLIB" ]; then RSDEF="-DG6_RS_LOADER"; RSLINK="$RSLIB -ldl -lm"; fi
+# request grammars (grammar.h): G6_XGRAMMAR=DIR, an XGrammar source tree at DIR/src built as DIR/build/libxgrammar.a
+# (CMake with XGRAMMAR_BUILD_PYTHON_BINDINGS off). g6m4 then takes --grammar-dir; without it a gram request is refused
+GRDEF=""
+GRLINK=""
+if [ -n "${G6_XGRAMMAR:-}" ] && [ "$WHAT" != sim ]; then
+  X=$G6_XGRAMMAR/src
+  [ -f "$G6_XGRAMMAR/build/libxgrammar.a" ] || { echo "G6_XGRAMMAR: no $G6_XGRAMMAR/build/libxgrammar.a"; exit 1; }
+  GRDEF="-DG6_GRAMMAR=1"
+  g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I"$X/include" -I"$X/3rdparty/dlpack/include" -I"$X/3rdparty/picojson" \
+      -c grammar.cc -o $O/grammar.o || exit 1
+  GRLINK="$O/grammar.o $G6_XGRAMMAR/build/libxgrammar.a"
+fi
 # the S2 page allocator (engine/kvman-rs, wrapped by s2/pool.h): g6m4 and m4sim link it. scripts/build.sh builds it with cargo
 KVLIB=../kvman-rs/target/release/libg6kvman.a
 [ -f "$KVLIB" ] || { echo "g6m4 and m4sim need $KVLIB: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
@@ -93,7 +105,7 @@ for n in $WIDTHS; do
   job $O/attn.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_CU -o $O/attn.w$n.o
   job $O/attn_bind.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_BIND_CU -o $O/attn_bind.w$n.o
   if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c m4sim.cu -o $O/m4sim.w$n.o; fi
-  if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c g6m4.cu -o $O/g6m4.w$n.o; fi
+  if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF $GRDEF -c g6m4.cu -o $O/g6m4.w$n.o; fi
   # dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
   if [ "$WHAT" = all ]; then
     job $O/dtr_test.w$n.log $NVCC -O2 -std=c++17 $F -I ../kernels -o $OUT/dtr_test_tp$n ../kernels/tests/dtr_test.cu -lcublas
@@ -123,7 +135,8 @@ fi
 if [ "$WHAT" != sim ]; then
   I=""
   for n in $WIDTHS; do inst g6m4 $n; I="$I $O/g6m4.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $RSLINK $KVLIB -ldl -lm -lcublas -libverbs -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -libverbs -lpthread
+  if [ -n "$GRDEF" ]; then echo "g6m4: request grammars (XGrammar) linked"; fi
   if [ -n "$RSDEF" ]; then echo "g6m4: Rust pack loader linked"; else echo "g6m4: no $RSLIB, C++ pack loader only"; fi
   ls -la $OUT/g6m4
 fi
