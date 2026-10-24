@@ -12,6 +12,7 @@
 #include "rank.cuh"
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
+#include "../vmm.h"
 #ifdef G6_RS_LOADER
 #include "weight_check.cuh"
 #endif
@@ -50,6 +51,7 @@ inline Find pack_find(const g6::Pack& pack, DevStore& store)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fp32 = e->dtype == g6::DType::F32;
         t.fmt = e->expert_format;
         return t;
     };
@@ -67,6 +69,7 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fp32 = e->dtype == g6::DType::F32;
         t.fmt = e->expert_format;
         return t;
     };
@@ -74,10 +77,11 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
 // exlr8 v2 experts from the raw width files (--v2 DIR --v2-slices DIR --v2-widths FILE). With dense (--v2-dense DIR),
 // every other tensor comes from the release's dense and vocab files too, with no base pack. trellis keeps the trellis
 // matrices as the release's entries (engine/kernels/dtr.cuh, --v2-dense-form trellis); false rounds them to a
-// converted pack's MXFP8 / int4 forms. qo adds the G6_PF_OWN=3 full-head tensors to the image.
+// converted pack's MXFP8 / int4 forms. qo adds the G6_PF_OWN=3 full-head tensors to the image. layout (--layout FILE)
+// says which pieces each rank holds (engine/loader-rs/src/layout.rs); empty: the formulas.
 struct V2Src
 {
-    std::string dir, slices, widths, dense;
+    std::string dir, slices, widths, dense, layout;
     bool trellis = true, qo = false;
 };
 
@@ -126,7 +130,25 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
 {
     RsSink sink;
     void* dev = nullptr;
-    if (cudaMalloc(&dev, pack.bytes()) != cudaSuccess) die("cudaMalloc of " + std::to_string(pack.bytes()) + " bytes failed");
+    // G6_IMG_VMM=1 (A/B): the image as cuMemCreate chunks of the recommended granularity mapped into one range
+    // (engine/vmm.h; k1_audit --alloc vmm), =N: chunks of N MB. Same bytes at the same offsets; only the physical
+    // backing (the GPU's page size) can differ. Falls back to cudaMalloc, with a line saying why.
+    static const long vmm = getenv("G6_IMG_VMM") ? atol(getenv("G6_IMG_VMM")) : 0;
+    void (*release)(void*) = nullptr;
+    if (vmm > 0)
+    {
+        int d = 0;
+        size_t gmin = 0, grec = 0;
+        cudaGetDevice(&d);
+        g6vmm::granularity(d, gmin, grec);
+        std::string why;
+        const size_t chunk = vmm > 1 ? (size_t)vmm << 20 : 0;
+        if ((dev = g6vmm::alloc(pack.bytes(), chunk, why))) release = [](void* p) { g6vmm::release(p); };
+        fprintf(stderr, "# rank %d: G6_IMG_VMM=%ld: %s (granularity min %zu KB, recommended %zu KB)\n", rank, vmm,
+                dev ? ("image in chunks of " + std::to_string((chunk ? (chunk + gmin - 1) / gmin * gmin : grec) >> 20) + " MB").c_str()
+                    : ("cudaMalloc instead: " + why).c_str(), gmin >> 10, grec >> 10);
+    }
+    if (!dev && cudaMalloc(&dev, pack.bytes()) != cudaSuccess) die("cudaMalloc of " + std::to_string(pack.bytes()) + " bytes failed");
     sink.dev = (uint8_t*)dev;
     sink.check = wcheck::enabled();
     if (sink.check) sink.sums.begin(pack.bytes());
@@ -135,7 +157,7 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
     char err[1024] = "";
     if (load(&s, &st, err, sizeof err)) die(std::string("Rust loader: ") + err);
     for (cudaStream_t x : sink.streams) cudaStreamDestroy(x);
-    img.adopt(pack, (uint8_t*)dev, pack.bytes());
+    img.adopt(pack, (uint8_t*)dev, pack.bytes(), release);
     fprintf(stderr, "# rank %d: %s %.2f GB -> device image (Rust loader, %s, %u threads, %llu ranges, %.2f GB read)"
             " in %.1f s (%.2f GB/s)\n", rank, what, st.image_bytes / 1e9, st.mode ? "read" : "mmap", st.threads,
             (unsigned long long)st.ranges, st.read_bytes / 1e9, st.seconds, st.image_bytes / 1e9 / st.seconds);
@@ -199,7 +221,7 @@ inline void* rs_plan_release(g6::Pack& pack, int rank, const V2Src& v2)
     const std::string planned = planned_manifest(rank, "release");
     char err[1024] = "";
     void* h = g6l_release_plan(v2.dense.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(), g6nr::NR, rank,
-                               v2.qo, v2.trellis, planned.c_str(), err, sizeof err);
+                               v2.qo, v2.trellis, v2.layout.c_str(), planned.c_str(), err, sizeof err);
     if (!h) { unlink(planned.c_str()); die(std::string("release plan: ") + err); }
     std::string e;
     const bool opened = pack.open_manifest(planned, e);
@@ -261,6 +283,7 @@ inline Find plan_find(const g6::Pack& pack, PlanStore& store, int r)
         t.nd = (int)e->shape.size();
         for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
         t.bf16 = e->dtype == g6::DType::BF16;
+        t.fp32 = e->dtype == g6::DType::F32;
         t.fmt = e->expert_format;
         return t;
     };
@@ -310,7 +333,7 @@ inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::st
 inline std::vector<int> parse_ints(std::string s)
 {
     std::vector<int> v;
-    if (s == "all") { for (int i = 0; i < 78; ++i) v.push_back(i); return v; }
+    if (s == "all") { for (int i = 0; i < geom::L_MAIN; ++i) v.push_back(i); return v; }
     if (!s.empty() && s[0] == '@')
     {
         FILE* f = fopen(s.c_str() + 1, "r");

@@ -43,6 +43,7 @@ struct K1Args
     const __half* t_v3;        // [block row][6144]     svh down
     int xc;                    // TR3_XCOMP builds: fc1 x table compact (separate fc1 only, M <= 3; bind.cuh make_k1)
     int B, KS1, WG, NS2;       // max 128-blocks per expert (grid and scratch stride), fc1 k-splits per CTA grid, warp groups, fc2 n-splits
+    int tlbw;                  // G6_K1_TLBW: log2 of the translation-warm granule (k1.cuh k1_tlbw), 0 = off
     const __half *t_sg, *t_v1b, *t_v3b;   // block-scale form (exlr8 v2 layers, the SH kernels): layer signs [2][6144]
                                // (in, out) as fp16 +-1, tr3.v1 as [block row][2][48] scales, tr3.v3 as [block row][48]
     int sh_e;                  // trellis shared expert (exlr8 v2; the SH kernels): its tr3.table row (256). It runs

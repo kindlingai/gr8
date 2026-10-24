@@ -7,7 +7,7 @@ Each box fetches only its part of the exlr8 release into --model-cache, and noth
         manifests/                             the width manifests (home, down1, up1, bit*)
         tokenizer/                             config, generation config, tokenizer and chat template
         experts/                               this rank's expert halves at their file offsets (sparse files), and
-                                               every layer's index file (tools/tune/fetch_ranks.py)
+                                               every layer's index file (fetch_ranks.py)
         index-slices/tp<N>/k<K>/rank<r>.safetensors
         dense/                                 the dense and vocab files
         complete/tp<N>.rank<r>.<variant>.json  written last, once everything above is verified
@@ -35,8 +35,8 @@ import modelset
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # The DFlash2 drafter for GLM 5.3. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
-# fetches the drafter from its own repo and converts its rank with bin/g6load dflash2 (the same bytes as
-# tools/convert/dflash2.py, without numpy).
+# fetches the drafter from its own repo and converts its rank with bin/g6load dflash2
+# (engine/loader-rs/src/dflash2.rs).
 DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-DFlash2'
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
 CHUNK = 64 << 20
@@ -66,10 +66,8 @@ def converter():
 
 
 def fetch_ranks():
-    """tools/tune/fetch_ranks.py: the range GETs, with bin/g6load planning and checking them."""
-    if REPO not in sys.path:
-        sys.path.insert(0, REPO)
-    from tools.tune import fetch_ranks as fr
+    """fetch_ranks.py: the range GETs, with bin/g6load planning and checking them."""
+    import fetch_ranks as fr
     return fr
 
 
@@ -261,14 +259,16 @@ class Release:
         os.replace(done + '.tmp', done)
 
     def whole_files(self, tp, rank):
-        """The release files this rank loads whole: its index slices, and the dense and vocab files."""
+        """The release files this rank loads whole: its index slices, and the dense and vocab files. The vision tower
+        (dense/vision-*) stays on the hub: the engine serves text."""
         t = self.repo.tree()
         slices = sorted(p for p in t if re.fullmatch(rf'index-slices/tp{tp}/k\d/rank{rank}\.safetensors', p))
         if not slices:
             raise modelset.ModelError(f'{self} has no index slices for TP={tp}')
         # TODO: every rank fetches every dense and vocab file (about 11 GB). Once the dense loader says which
         # sharding units a rank reads, fetch only those byte ranges here.
-        dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors'))
+        dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors')
+                       and not p.startswith('dense/vision-'))
         return slices + dense
 
     def reuse(self):
@@ -377,17 +377,19 @@ class Release:
 
 
 class Drafter:
-    """The DFlash2 drafter at one commit, and this box's converted rank at TP=4:
+    """The DFlash2 drafter at one commit, and this box's converted rank at TP=4 or TP=6 (the replicated layout: every
+    rank's pack holds the whole drafter, tools/convert/dflash2.py):
 
         <cache>/hf/<org>--<repo>/<commit>/config.json, model.safetensors
-        <cache>/hf/<org>--<repo>/<commit>/tp4/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE (written last)
+        <cache>/hf/<org>--<repo>/<commit>/tp<TP>/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE (written last)
     """
 
-    def __init__(self, cache, repo, rev, refresh=False, log=print):
+    def __init__(self, cache, repo, rev, refresh=False, log=print, tp=4):
         self.repo = Repo(cache, repo, rev, refresh, log)
         self.log = log
+        self.tp = tp
         self.dir = os.path.join(self.repo.root, self.repo.commit)
-        self.out = os.path.join(self.dir, 'tp4')
+        self.out = os.path.join(self.dir, f'tp{tp}')
 
     @property
     def commit(self):
@@ -423,8 +425,8 @@ class Drafter:
         tmp = os.path.join(self.dir, f'tmp.rank{rank}.{os.getpid()}')
         shutil.rmtree(tmp, ignore_errors=True)
         os.makedirs(tmp)
-        self.log(f'converting the drafter {self} for rank {rank} of TP=4')
-        r = subprocess.run(convert + ['--src', self.dir, '--out', tmp, '--nr', '4', '--ranks', str(rank)], cwd=REPO,
+        self.log(f'converting the drafter {self} for rank {rank} of TP={self.tp}')
+        r = subprocess.run(convert + ['--src', self.dir, '--out', tmp, '--nr', str(self.tp), '--ranks', str(rank)], cwd=REPO,
                            capture_output=True, text=True)
         names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
         if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):

@@ -1,17 +1,25 @@
 # CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# Every job runs on GitHub's hosted runners, for every pull request, forks included. The engine job builds the
-# Dockerfile's binaries on arm64 runners, one per KV format, no GPU needed to compile. The image job assembles the
-# runtime image from both of their artifacts, and only it can write packages: it pushes from main and from tags, never
-# from a pull request.
+# Every job runs on GitHub's hosted runners, for every pull request, forks included, except a pull request or push that
+# changes only Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
+# GPU needed to compile. The image job assembles the runtime image from both of their artifacts, and only it can write
+# packages: it pushes from main and from tags, never from a pull request.
+#
+# On a pull request every job waits for a maintainer: the `ready` job reads the PR's labels and the others run only if
+# it carries queue:ready (/ready, which also queues the PR) or ci:requested (/ci, CI only; pr-ready.yml). Until then the
+# gate fails, so the PR shows red. A push to the PR clears both labels, so a run started by a push skips. Either command
+# re-runs the PR's latest run, which then goes through. Pushes to main, tags and manual runs always build. The gate is a
+# cost control, not a security boundary: a fork PR runs its own copy of this file, with a read-only token.
 name: ci
 
 on:
   push:
     branches: [main]
     tags: ['v*', 'beta-*']
+    paths-ignore: ['**.md']
   pull_request:
+    paths-ignore: ['**.md']
   workflow_dispatch:
 
 permissions:
@@ -22,8 +30,40 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  ready:
+    name: Ready gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      - id: check
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            // Labels are read live, not from the event: a re-run carries the original event's labels and action. A
+            // run started by a push skips (the push cleared the labels), unless it is a re-run, which the bot starts
+            // after a maintainer's /ci or /ready.
+            let go = true;
+            if (context.eventName === "pull_request") {
+              const pr = context.payload.pull_request;
+              const labels = (await github.rest.issues.listLabelsOnIssue(
+                { ...context.repo, issue_number: pr.number, per_page: 100 })).data.map(l => l.name);
+              const rerun = Number(process.env.GITHUB_RUN_ATTEMPT) > 1;
+              go = (context.payload.action !== "synchronize" || rerun) &&
+                (labels.includes("queue:ready") || labels.includes("ci:requested"));
+            }
+            core.setOutput("go", go ? "true" : "false");
+            // Red, not green: jobs skipped by a condition count as passed.
+            if (!go) core.setFailed("CI has not run: it waits for a maintainer's /ci or /ready on this PR.");
+
   cpu:
     name: CPU tests
+    needs: ready
+    if: needs.ready.outputs.go == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -49,6 +89,8 @@ jobs:
 
   rust:
     name: Rust binaries (arm64)
+    needs: ready
+    if: needs.ready.outputs.go == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -75,6 +117,8 @@ jobs:
     # so they get a runner each: on one runner they spent most of their lives
     # competing for its four cores (fp8 ~1,000 s, int4 ~551 s, job 1,187 s).
     name: Engine build (${{ matrix.kv }} KV, arm64, CUDA 13, sm_121a)
+    needs: ready
+    if: needs.ready.outputs.go == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     strategy:
@@ -226,7 +270,6 @@ jobs:
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
             done
             python3 -c "import g6s2shim"
-            python3 -c "import tools.convert.convert, tools.convert.dflash2"
             PYTHONPATH=tools/launch python3 -c "import supervisor, steering_hf; from steering import release"
             python3 tools/steering/release.py --help > /dev/null
             python3 tools/steering/evaluate.py --help > /dev/null

@@ -55,6 +55,15 @@ struct Config {
     // While a prefill waits and sessions decode, this many decode rounds run per prefill quantum, so the decoders get
     // K rounds per quantum's wait instead of one (Scheduler::alternate). 0 or 1 = off: one round per quantum, as before.
     uint32_t decode_rounds = 0;         // after decode_prefill_rows, for the same reason
+    // remote rows release (pool.h window, kvman-rs Pool::window): a run past R lists its worst case and this many window
+    // pages besides. 0 = off
+    uint32_t window_pages = 0;          // last, for the same reason
+    // G6_CP_STEP_ROWS (cp_rows.h): a step past R carries at most cp_step_rows rows (0 = off: every decoding session in
+    // every round, as before). cp_after: contexts above it run the CP block (cp_after()). cp_seg: G6_CP_STEP_SEG. Read by
+    // Driver::step only; the scheduler's quanta keep their kinds (a capped round is a Decode quantum with fewer sessions)
+    uint32_t cp_step_rows = 0;          // after window_pages, for the same reason
+    uint64_t cp_after = UINT64_MAX;
+    bool cp_seg = false;
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
@@ -65,6 +74,8 @@ struct Config {
         require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
                 "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");
         require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
+        require(!cp_step_rows || cp_step_rows >= mtp + 1, "cp_step_rows must be 0 or at least one session's verify (mtp + 1)");
+        require(!cp_seg || cp_step_rows, "cp_seg needs cp_step_rows");
         require(!steering.loaded || (g6rt::steering::valid_profile_name(steering.profile_name) && steering.active_layers &&
                 (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full)),
                 "invalid loaded steering receipt");
@@ -104,6 +115,10 @@ inline uint64_t grant_rows(const Config& c, const Request& r) {
     return std::min(reserve_rows(c, r), round_rows(c, uint64_t(r.prompt_tokens) + 1));
 }
 inline uint32_t grant_pages(const Config& c, const Request& r) { return uint32_t((grant_rows(c, r) + PAGE - 1) / PAGE); }
+// the pages a grant may list: what it needs now, its worst case, or (window runs past R) its worst case and the window
+inline bool grant_pages_ok(const Config& c, const Request& r, uint32_t pages) {
+    return pages == grant_pages(c, r) || pages == reserve_pages(c, r) || (c.window_pages && pages == reserve_pages(c, r) + c.window_pages);
+}
 // a session's pages, as the control link carries them. Each rank's pool (pool.h) holds the list and fills it the same
 // way. list_hash names the list, so a rank whose list differs fails at its grant. A run grows (Scheduler::grow) between
 // events on every rank alike: same table version, more pages, a new hash.
@@ -239,6 +254,8 @@ public:
         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
         add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
         if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
+        if (c_.window_pages) add(c_.window_pages);
+        if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
@@ -266,7 +283,7 @@ public:
             auto& target = after[g.key.slot];
             require(target.phase == Phase::Free && target.key.generation != UINT32_MAX && g.key.generation == target.key.generation + 1, "grant slot generation mismatch");
             // the pool rejects a page two runs hold. A run past R holds its worst case (reserve_pages) from the start
-            require((g.run.pages == grant_pages(c_, g.req) || g.run.pages == reserve_pages(c_, g.req)) &&
+            require(grant_pages_ok(c_, g.req, g.run.pages) &&
                     g.run.first_page < c_.pool_rows/PAGE && g.run.table_version, "bad reservation");
             unsigned live = 0;
             for (const auto& s : after) if (s.phase != Phase::Free) {

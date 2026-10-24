@@ -16,28 +16,30 @@ import socket
 import struct
 import subprocess
 
+import models
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'TP': ('cluster', None, 'tensor-parallel size: 4, 6 or 3'),
+    'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
+                                      '<model> sets it'),
+    'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2)'),
     'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
                                  "cabled to the f1 port of the next box in --peers order, the last to the first)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
-    'GROUP': ('cluster', 'gr8-glm53', 'mentat group the boxes join'),
+    'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
     'HEAD': ('cluster', None, 'mentat mode: the head LAN address, instead of the lowest one'),
     'IPS': ('cluster', None, 'rail-0 fabric address of every rank (skips fabric discovery)'),
     'IPS2': ('cluster', None, 'rail-1 fabric address of every rank'),
     'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
     'PORT': ('cluster', '8100', 'the OpenAI API port on the head'),
     'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
-    'MODEL': ('box', None, 'the exlr8 release (https://huggingface.co/<org>/<repo>[@rev], or a local copy), or a '
-                           'prepared pack directory'),
-    'BASE_PACKS': ('box', None, 'with an https:// --model: take the non-expert weights from this prepared pack directory '
-                                'instead of the release'),
-    'MODEL_CACHE': ('box', None, "this box's local directory for its shard of the model set"),
+    'MODEL': ('box', None, 'the exlr8 release: https://huggingface.co/<org>/<repo>[@rev], or a local copy (an NFS '
+                           'mount works) used in place'),
+    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
@@ -53,6 +55,8 @@ KEYS = {
                                               'names); unset = the template\'s own default'),
     'DEFAULT_THINKING_BUDGET': ('box', '0', 'thinking_budget for a chat request that names none: reply tokens before '
                                             'the front end closes the think block; 0 = no limit'),
+    'ALLOW_THINKING_OFF': ('box', '0', '1 = the front end takes enable_thinking false / reasoning_effort none: the prompt '
+                                       'drops its effort header and closes the think block (GLM 5.3; experimental)'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
@@ -73,14 +77,20 @@ KEYS = {
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
     'KV_STORE': ('cluster', None, 'experimental: block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, '
-                                  'separated by ; (or --kv-store given again). STORE: ssd:PATH, remote:HOST:PORT or remote:auto '
-                                  '(a KV node from the mentat group). Sizes per rank. An SSD store starts empty at every boot; '
+                                  'separated by ; (or --kv-store given again). STORE: ssd:PATH (a folder on each box\'s own SSD), '
+                                  'remote:HOST:PORT or remote:auto (a KV node on another machine; auto = the one the mentat '
+                                  'group announces). Sizes per rank. An SSD store starts empty at every boot; '
                                   ',persist=on keeps it across restarts'),
     'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
     'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
     'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
+    'KV_ROWS': ('cluster', None, 'experimental: remote attention rows: the rows past SHARE_LIMIT in a rows store, read back '
+                                 'as decode selects them. STORE,size=N(M|G|T)[,local=PAGES][,pool=SLOTS][,place=PAGES]'
+                                 '[,fmt=fp8|int4]. STORE: remote:auto (the KV node from the mentat group), remote:HOST:PORT '
+                                 'or mem:. size: each rank\'s lease. local: release, a session\'s tail cycles through that '
+                                 'many local pages a rank (G6_RT_*, docs/SETTINGS.md)'),
     'KV_TIER': ('cluster', None, 'deprecated: KV_STORE with keep=evicted|shared|all per tier (any evicted or all maps to '
                                  'KV_KEEP=all, else system)'),
     'KV_SHARED_AFTER': ('cluster', None, 'deprecated: KV_SYSTEM_AFTER'),
@@ -105,6 +115,8 @@ KEYS = {
     'ATTN_SC2_TR': ('cluster', None, 'ATTN_SC2 transpose reduction (G6_ATTN_SC2_TR)'),
     'ATTN_CTX2': ('cluster', None, 'decode attention context variant (G6_ATTN_CTX2)'),
     'ATTN_CTX3': ('cluster', None, 'decode attention context, per-batch states (G6_ATTN_CTX3)'),
+    'ATTN_CTX3_SP': ('cluster', None, 'ATTN_CTX3 slots per context partition, 64 or 128 (G6_ATTN_CTX3_SP; E1)'),
+    'ATTN_POSIDX': ('cluster', None, 'positional index at decode buckets <= 2048 (G6_ATTN_POSIDX; E1)'),
     'ATTN_SEL2': ('cluster', None, 'decode index selection by rank (G6_ATTN_SEL2)'),
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
@@ -115,6 +127,31 @@ KEYS = {
     'S2_DECODE_PF': ('cluster', None, 'S2 prefill quantum rows while sessions decode (G6_S2_DECODE_PF)'),
     'S2_ADMIT_HOLD': ('cluster', None, 'S2 burst admissions at one boundary (G6_S2_ADMIT_HOLD)'),
     'PF_SELX_CTX': ('cluster', None, 'prefill selx at context >= this; 0 = SEL32 (G6_PF_SELX_CTX)'),
+    'DSEL_MODEL': ('cluster', None, 'drafter choice priced from a frozen cost table, MTP rounds as the confidence stop runs them (G6_S2_DSEL_MODEL)'),
+    'DSEL_TABLE': ('cluster', None, 'DSEL_MODEL: the cost table, key:value list or a file (G6_S2_DSEL_TABLE; tools/s2_dsel_table.py)'),
+    'MTP_KSTOPB': ('cluster', None, 'shared rounds: each session verifies its own count of the MTP drafts (G6_MTP_KSTOPB)'),
+    'MTP_KSTOPB_KMIN': ('cluster', None, 'MTP_KSTOPB: the least drafts a session verifies, 0 or 1 (G6_MTP_KSTOPB_KMIN)'),
+    'MTP_KSTOPB_TAU': ('cluster', None, 'MTP_KSTOPB thresholds t1,t2,... at every session count (G6_MTP_KSTOPB_TAU)'),
+    'MTP_KSTOPB_TAU_S': ('cluster', None, 'MTP_KSTOPB thresholds per session count, n:t1,t2/n:t1,t2... (G6_MTP_KSTOPB_TAU_S<n>)'),
+    'L2PF': ('cluster', None, "decode: paced L2 prefetch of the next weights in the step's idle-DRAM windows, window mask (G6_L2PF)"),
+    'CP_STEP_ROWS': ('cluster', None, 'S2: a step past SHARE_LIMIT carries at most this many rows; the CP fabric is sized for it (G6_CP_STEP_ROWS)'),
+    'CP_STEP_SEG': ('cluster', None, 'S2 with CP_STEP_ROWS: a round past SHARE_LIMIT takes only sessions past it (G6_CP_STEP_SEG)'),
+    'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
+    'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
+                             'needs V2_DENSE)'),
+    'PF_GEMMF32': ('cluster', None, 'prefill: the row-owner QO o_proj with an FP32 epilogue, PF_OWN=3 (G6_PF_GEMMF32)'),
+    'MTP_LASTROW': ('cluster', None, "MTP draft steps: only each session's last row through layer 78's routed experts (G6_MTP_LASTROW)"),
+    'DRAFT_HEAD2': ('cluster', None, "MTP draft head in two stages, 1, or 2 = with a check, experimental (G6_DRAFT_HEAD2)"),
+    'MTP_L2PF': ('cluster', None, 'MTP draft steps: the paced L2 prefetch, 1 draft step, 2 head waits, 3 both; needs L2PF (G6_MTP_L2PF)'),
+    'MTP_KSTOPB_WIDTHS': ('cluster', None, 'MTP_KSTOPB: the shared-round widths with captured graphs, w1,w2,... (G6_MTP_KSTOPB_WIDTHS)'),
+    'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
+    'QO_CACHE': ('cluster', None, 'PF_OWN=3: a directory for the full-head q_b / o_proj / UK / UV tensors, written at the first boot and read at the next (G6_QO_CACHE)'),
+    'PF_ISGRT_RG': ('cluster', None, 'prefill index scores: rows per CTA, a multiple of 8 (G6_PF_ISGRT_RG)'),
+    'PF_ATTN_ROWS': ('cluster', None, 'prefill attention chunk rows inside a sub-batch, default 1024 (G6_PF_ATTN_ROWS)'),
+    'PF_F12': ('cluster', None, 'prefill fc1 on the fat-CTA kernel when built with PF_F12, 0 = the stock fc1 (G6_PF_F12)'),
+    'ATTN_P11': ('cluster', None, 'decode attention: the P11 tile retune, takes precedence over ATTN_SC2 / CTX2 / CTX3 (G6_ATTN_P11)'),
+    'DTR': ('cluster', None, 'the dense trellis matrices of the exlr8 release, 0 = the int4 / MXFP8 records (G6_DTR)'),
+    'PF_AOP': ('cluster', None, 'prefill fc1 A-operand share when built with PF_AOP, 0 = off (G6_PF_AOP)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
@@ -126,7 +163,9 @@ KEYS = {
     'V2_DENSE': ('box', None, 'the exlr8 release directory whose dense/ files give every non-expert weight (no rank packs)'),
     'V2_DENSE_FORM': ('cluster', None, 'with V2_DENSE: trellis (the release\'s entries, the default) or rounded (MXFP8 / '
                                        'int4, the fallback)'),
-    'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
+    'LAYOUT': ('box', None, 'with V2_DENSE: a layout file (bin/g6layout) that says which pieces each rank holds, instead '
+                            'of the formulas. The handshake compares its sha256'),
+    'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
     'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory, or hf:default / hf:NAME from the model release'),
@@ -284,11 +323,15 @@ def parse(argv, environ=None):
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
     deprecated_kv(values, origin, warnings)
+    if values['GR8_MODEL'] not in models.MODELS:
+        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {" or ".join(models.MODELS)}')
+    if not values['GROUP']:
+        values['GROUP'] = models.MODELS[values['GR8_MODEL']].group
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
-    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT', 'BASE_PACKS',
-              'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE'):
+    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
+              'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or \
                 (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
                 (k == 'VARIANT' and '/' not in values[k] and not values[k].endswith('.json')):
@@ -308,13 +351,14 @@ def mode(o):
 
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
+    model = models.of(o)
     tp = o.get('TP')
     if tp is None:
         if mode(o) == 'peers':
             tp = str(len(split_list(o.get('PEERS'))))
             o.values['TP'], o.origin['TP'] = tp, 'the number of peers'
         else:
-            raise OptionError('--tp is needed with --mentat (4, 6 or 3)')
+            raise OptionError(f'--tp is needed with --mentat ({model.tp_sizes})')
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
                           'them with --g6env-x "NAME=value ..." so every box compares them')
@@ -322,27 +366,42 @@ def validate(o):
         raise OptionError('--variant and --v2-widths both name the width manifest: give one')
     if o.get('DRAFTER') and not o.get('DRAFTER').startswith('https://'):
         raise OptionError(f'--drafter {o.get("DRAFTER")}: want https://huggingface.co/<org>/<repo>[@rev]')
-    if o.get('DRAFTER') and tp != '4':
-        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
+    if not model.drafter and (o.get('DRAFTER') or o.get('DFLASH') == '1'):
+        raise OptionError(f'--drafter, --dflash 1: {model.name} has no DFlash2 drafter')
+    if o.get('DRAFTER') and tp not in ('4', '6'):
+        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 (split) and TP=6 (replicated) only, not TP={tp}')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
     effort = o.get('DEFAULT_REASONING_EFFORT')
-    if effort == 'none':
+    if effort == 'none' and not model.thinking_off:
         raise OptionError('--default-reasoning-effort none: GLM 5.3 cannot turn thinking off (use low, or '
                           '--default-thinking-budget)')
     if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
         raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
+    if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
+        raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')
     share = o.get('SHARE_LIMIT')
-    if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) & (int(share) - 1) == 0):
-        # the engine needs the limit to be one of its decode buckets (2048 doubling)
-        raise OptionError(f'--share-limit {share}: want a power of two from 4096')
+    if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) % 64 == 0):
+        # the engine takes any multiple of a KV page (64 tokens) and makes it a decode bucket boundary (context_buckets.h)
+        raise OptionError(f'--share-limit {share}: want a multiple of 64 from 4096')
     if o.get('V2') and not o.get('V2_SLICES'):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+    if o.get('KVB') not in (None, 'bf16', 'fp8'):
+        raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
+    # a release boot sets V2_DENSE, or --model names a release (resolve_model sets V2_DENSE after this); the engine refuses
+    # KVB=fp8 on a pack boot at start
+    if o.get('KVB') == 'fp8' and not (o.get('V2_DENSE') or o.get('MODEL')):
+        raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
+    if o.get('LAYOUT') and not os.path.isfile(o.get('LAYOUT')):
+        raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
+    if o.get('LAYOUT') and looks_remote(o.get('MODEL') or ''):
+        raise OptionError('--layout needs a local copy of the release (--model DIR): a box\'s cache holds only the '
+                          'pieces the formulas give its rank')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')
@@ -368,8 +427,8 @@ def validate(o):
                 force = 0.0
             if not (0.0 < force <= 4.0) or struct.unpack('<f', struct.pack('<f', force))[0] == 0:
                 raise OptionError('--steering-force: want a finite number in (0, 4]')
-    if tp not in ('3', '4', '6'):
-        raise OptionError(f'--tp {tp}: want 4, 6 or 3')
+    if tp not in model.tp:
+        raise OptionError(f'--tp {tp}: want {model.tp_sizes} ({model.name})')
     if o.get('SHAPE') not in ('mesh', 'ring'):
         raise OptionError(f'--shape {o.get("SHAPE")}: want mesh or ring')
     if o.get('SHAPE') == 'ring':
@@ -397,6 +456,13 @@ def validate(o):
             raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
+    rows = kv_rows(o)
+    if rows and rows['host'] == 'auto' and mode(o) == 'peers':
+        raise OptionError('--kv-rows remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
+    if rows and rows['fmt'] == 'int4' and o.get('KV_FORMAT') == 'int4':
+        raise OptionError('--kv-rows fmt=int4: the int4 KV build\'s rows are INT4 already')
+    if o.get('KV_FORMAT') == 'int4' and not model.int4_kv:
+        raise OptionError(f'--kv-format int4: {model.name} has an fp8 KV build only')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
@@ -430,7 +496,7 @@ def deprecated_kv(values, origin, warnings):
 
 def kv_stores(o):
     """KV_STORE parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size',
-    'persist'}] ([] when unset or off). Raises OptionError naming the bad store."""
+    'persist', 'keep'}] ([] when unset or off; keep None = KV_KEEP). Raises OptionError naming the bad store."""
     v = o.get('KV_STORE')
     if v in (None, 'off'):
         return []
@@ -441,7 +507,7 @@ def kv_stores(o):
         if not m or (store.startswith('remote:auto') and m.group(2)):
             raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
         t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
-             'host': None, 'port': None, 'size': None, 'persist': False}
+             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
         else:
@@ -455,13 +521,55 @@ def kv_stores(o):
                     raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
                 t['persist'] = x == 'on'
             elif k == 'keep':
-                raise OptionError(f'--kv-store {text}: what the stores keep is --kv-keep system|sessions|all')
+                if x not in ('system', 'sessions', 'all'):
+                    raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
+                t['keep'] = x
             else:
-                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T) or persist=on|off')
+                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off or keep=RULE')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
         out.append(t)
     return out
+
+
+def kv_rows(o):
+    """KV_ROWS parsed: {'text', 'store', 'kind': 'remote' | 'mem', 'host', 'port', 'size', 'local', 'pool', 'place',
+    'fmt'}, or None when unset or off. Raises OptionError naming the bad part."""
+    v = o.get('KV_ROWS')
+    if v in (None, 'off'):
+        return None
+    text = v.strip()
+    store, *kvs = text.split(',')
+    m = re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', store)
+    if store != 'mem:' and (not m or (m.group(1) == 'auto' and m.group(2))):
+        raise OptionError(f'--kv-rows {text}: the store is remote:auto, remote:HOST:PORT or mem:')
+    t = {'text': text, 'store': store, 'kind': 'mem' if store == 'mem:' else 'remote', 'host': m.group(1) if m else None,
+         'port': m.group(2) if m else None, 'size': None, 'local': None, 'pool': None, 'place': None, 'fmt': None}
+    for kv in kvs:
+        k, _, x = kv.partition('=')
+        if k == 'size' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
+            t['size'] = x
+        elif k in ('local', 'pool', 'place') and x.isdigit() and int(x) > 0:
+            t[k] = int(x)
+        elif k == 'fmt' and x in ('fp8', 'int4'):
+            t['fmt'] = x
+        else:
+            raise OptionError(f'--kv-rows {text}: {kv}: want size=N(M|G|T), local=PAGES, pool=SLOTS, place=PAGES or fmt=fp8|int4')
+    if not t['size']:
+        raise OptionError(f'--kv-rows {text}: size=N(M|G|T) is needed (each rank\'s lease)')
+    if t['place'] and not t['local']:
+        raise OptionError(f'--kv-rows {text}: place= needs local= (the pages past it are reached through the rows store only)')
+    if t['kind'] == 'remote' and t['host'] != 'auto' and not t['port']:
+        raise OptionError(f'--kv-rows {text}: remote:HOST:PORT names the port')
+    return t
+
+
+def kv_rows_with(o, target):
+    """KV_ROWS with remote:auto replaced by the KV node host:port this box uses (None: as written)."""
+    t = kv_rows(o)
+    if not t or t['host'] != 'auto' or not target:
+        return t and t['text']
+    return t['text'].replace('remote:auto', f'remote:{target}', 1)
 
 
 def split_list(v):
@@ -485,13 +593,14 @@ def resolve_peers(o):
     return out
 
 
-# ---- the engine plan: scripts/engine_args.sh, so the ssh launchers and the supervisor start the same engine ---------
+# ---- the engine plan: scripts/engine_args.sh --------------------------------------------------------------------------
 def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
-                kv_store=None):
+                kv_store=None, kv_rows=None):
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
-    The defaults give the canonical template, with every per-box value as a placeholder. kv_store: this box's KV_STORE
-    with the KV node resolved (remote:GB names none)."""
-    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'TP': o.get('TP'), 'SET_ID': set_id}
+    The defaults give the canonical template, with every per-box value as a placeholder. kv_store, kv_rows: this box's
+    KV_STORE and KV_ROWS with the KV node resolved (remote:GB names none)."""
+    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'GR8_MODEL': models.of(o).name, 'TP': o.get('TP'),
+           'SET_ID': set_id}
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
             env[k] = o.get(k)
@@ -503,8 +612,10 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
         env['STEERING_CHAT_TEMPLATE'] = '@STEERING_CHAT_TEMPLATE'
     if kv_store:
         env['KV_STORE'] = kv_store
+    if kv_rows:
+        env['KV_ROWS'] = kv_rows
     if rank == '@R':   # the template: v2 paths are per box
-        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE'):
+        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT'):
             if env.get(k):
                 env[k] = '@' + k
     names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO'])
@@ -540,6 +651,8 @@ def canonical(o, plan, members, variant=None):
     """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None.
     variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
+    if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
+        c['model'] = models.of(o).name
     if members:
         c['peers'] = ','.join(members)
     else:
@@ -554,6 +667,8 @@ def canonical(o, plan, members, variant=None):
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''
+    if o.get('LAYOUT'):   # a path per box: its bytes are what every rank must agree on
+        c['layout.sha256'] = file_sha256(o.get('LAYOUT'))
     c['engine.env'] = ' '.join(sorted(plan['env']))
     c['engine.args'] = ' '.join(plan['args'])
     text = ''.join(f'{k}={c[k]}\n' for k in sorted(c))

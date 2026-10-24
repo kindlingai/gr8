@@ -24,6 +24,7 @@ import fabric
 import handshake
 import hfsource
 import mentat
+import models
 import modelset
 import options as opt
 import steering_local
@@ -131,11 +132,10 @@ def version(home):
 
 def resolve_model(o, refresh=False, log=log):
     """(model set, variant, error): the model set and its exlr8 v2 variant, either None with the reason in error. The
-    variant's manifest becomes V2_WIDTHS, which the engine arguments take. With an https:// --model the experts, index
-    slices and manifests come from the release (ms.release), and V2 and V2_SLICES point into the cache. The release is
-    the whole model (V2_DENSE: the engine plans every weight from its files), unless --base-packs names packs for the
-    non-expert weights. A local --model that holds the release's dense/ is used the same way. refresh: ask the hub
-    what the revision is now (prepare), instead of the commit recorded at the last resolve."""
+    variant's manifest becomes V2_WIDTHS, which the engine arguments take. --model is the release: an https:// URL,
+    whose experts, index slices, manifests and dense files each box fetches into --model-cache (ms.release), or a local
+    copy used in place. The release is the whole model (V2_DENSE: the engine plans every weight from its files).
+    refresh: ask the hub what the revision is now (prepare), instead of the commit recorded at the last resolve."""
     ms = variant = release = None
     g6load = os.path.join(os.path.abspath(o.get('G6_HOME')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
     if os.access(g6load, os.X_OK):
@@ -144,8 +144,8 @@ def resolve_model(o, refresh=False, log=log):
         model = o.get('MODEL')
         hf = hfsource.parse_url(model)
         steering = steering_hf.request(o)
-        if steering and (not hf or o.get('BASE_PACKS')):
-            raise modelset.ModelError('--steering-profile hf:... requires an HF release without --base-packs')
+        if steering and not hf:
+            raise modelset.ModelError('--steering-profile hf:... requires an HF release (--model https://...)')
         if hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
@@ -153,52 +153,53 @@ def resolve_model(o, refresh=False, log=log):
             release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
-            if o.get('BASE_PACKS'):
-                model = o.get('BASE_PACKS')
-            else:
-                o.values['V2_DENSE'] = release.dir
-                ms = modelset.release_set(release.dir, int(o.get('TP')), o.get('MODEL_DIR') or release.tokenizer,
-                                          str(release))
+            model = release.dir
+            ms = modelset.release_set(model, int(o.get('TP')), o.get('MODEL_DIR') or release.tokenizer, str(release))
         elif modelset.is_release(model):
             experts = os.path.join(model, 'experts')
             o.values['V2'] = o.get('V2') or (experts if os.path.isdir(experts) else model)
             o.values['V2_SLICES'] = o.get('V2_SLICES') or os.path.join(model, 'index-slices')
-            o.values['V2_DENSE'] = model
             ms = modelset.release_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
-        if ms is None:
-            ms = modelset.resolve(model, o.get('MODEL_CACHE'), int(o.get('TP')),
-                                  o.get('MODEL_DIR') or (release.tokenizer if release else None))
-            if release:
-                ms.source = f'{release}, base packs {ms.source}'
+        else:
+            raise modelset.ModelError(f'--model {model}: want an exlr8 release, https://huggingface.co/<org>/<repo>[@rev] '
+                                      'or a local copy of one (dense/, experts/, index-slices/, manifests/)'
+                                      if model else 'no model: pass --model <exlr8 release URL or directory>')
+        o.values['V2_DENSE'] = model
         ms.release = release
-        search = [d for d in (model, os.path.join(ms.cache, 'sets', ms.id) if ms.cache else None,
-                              release.dir if release else None) if d and os.path.isdir(d)]
+        search = [model]
         spec = o.get('VARIANT') or o.get('V2_WIDTHS')
-        variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')))
+        variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')), models.of(o))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
+        models.check_config(models.of(o), ms.tokenizer)
         steering_hf.bind(o, release)
         steering_local.prepare(o, ms)
         ms.drafter = drafter_of(o, ms, refresh, log)
         return ms, variant, ''
-    except modelset.ModelError as e:
+    except (modelset.ModelError, models.ModelMismatch) as e:
         return ms, variant, f'model: {e}'
 
 
 def drafter_of(o, ms, refresh, log):
-    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter at all
-    (none in the model set either), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused."""
-    if o.get('TP') != '4':
+    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter (no
+    --drafter, no DFLASH_DIR), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused. TP=6 (the
+    drafter's body replicated on every rank) the same, except that DFLASH defaults to 0 there: --dflash 1 turns it on."""
+    if o.get('TP') not in ('4', '6') or not models.of(o).drafter:
+        return None
+    if o.get('TP') == '6' and o.get('DFLASH') != '1':
+        if o.get('DRAFTER'):
+            log('--drafter at TP=6 is used with --dflash 1 only: MTP only')
         return None
     if o.get('DRAFTER'):
         if not o.get('MODEL_CACHE'):
             raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
         if o.get('DFLASH') == '0':
             return None
-        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log)
+        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log,
+                             tp=int(o.get('TP')))
         o.values['DFLASH_DIR'] = d.out
         return d
-    if ms.set['dflash'] or o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
+    if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
         return None
     hint = f'--drafter {hfsource.DRAFTER_URL} (CC BY-NC-ND 4.0: each box fetches and converts it)'
     if o.get('DFLASH') == '1':
@@ -206,6 +207,9 @@ def drafter_of(o, ms, refresh, log):
     log(f'no DFlash2 drafter: MTP only. For DFlash2, add {hint}')
     o.values['DFLASH'] = '0'
     return None
+
+
+ENGINES = {n.encode() for m in models.MODELS.values() for n in (m.engine, m.engine + '-int4')}
 
 
 def running_engines(proc='/proc'):
@@ -220,7 +224,7 @@ def running_engines(proc='/proc'):
             cwd = os.readlink(os.path.join(proc, pid, 'cwd'))
         except OSError:
             continue
-        if b'--rank' in argv and any(os.path.basename(a) in (b'g6m4', b'g6m4-int4') for a in argv[:2]):
+        if b'--rank' in argv and any(os.path.basename(a) in ENGINES for a in argv[:2]):
             out.append((int(pid), cwd))
     return out
 
@@ -452,7 +456,7 @@ class Supervisor:
                     f'on the busiest rank at TP={tp}')
         self.tmpl = opt.engine_plan(o)
         self.build = engine_build(self.home, engine_bin(o))
-        self.offers = modelset.offers(self.ms, self.tmpl) if self.ms else []
+        self.offers = None if self.ms else []     # a release serves any rank; a box without a model serves none
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
         c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant)
@@ -538,26 +542,19 @@ class Supervisor:
                 log(self.fabric_error)
 
     def checks(self, copy=True):
-        """What would stop this box's boot, as text. copy: make this rank's model files ready first. The rank's files
-        are checked only once the rank is known, and the front end only on rank 0."""
-        o, fails, plan = self.o, [e for e in (self.model_error, self.fabric_error) if e], self.tmpl
-        held = self.offers is not None and self.rank is not None and self.rank not in self.offers
-        if held:
-            fails.append(f'this box holds rank {mentat.format_offers(self.offers) or "none"} of the model set, but it is '
-                         f'rank {self.rank} ({self.lan}) in the member list'
-                         + (f': list it at position {self.offers[0] + 1} of --peers' if self.offers else ''))
+        """What would stop this box's boot, as text. copy: fetch this rank's model files first. The rank's files are
+        checked only once the rank is known, and the front end only on rank 0."""
+        o, fails = self.o, [e for e in (self.model_error, self.fabric_error) if e]
         try:
-            if not self.ms or held:
+            if not self.ms or self.rank is None:
                 pass
             elif copy:
-                modelset.prepare(self.ms, self.rank, plan, log=log)
                 rel = self.ms.release
                 if rel and rel.check(int(o.get('TP')), self.rank, self.variant):
                     rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
                 if self.ms.drafter and self.ms.drafter.check(self.rank):
                     self.ms.drafter.fetch_rank(self.rank)
-            if self.ms and self.rank is not None and not held:
-                fails += modelset.validate_rank(self.ms, self.rank, plan)
+            if self.ms and self.rank is not None:
                 if self.ms.release:
                     fails += self.ms.release.check(int(o.get('TP')), self.rank, self.variant)
                 if self.ms.drafter:
@@ -576,7 +573,8 @@ class Supervisor:
             return fails
         if self.build == 'missing':
             name = engine_bin(o)
-            fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name != 'g6m4' else '') + './gr8 glm53 build')
+            fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name.endswith('-int4') else '') +
+                         f'./gr8 {models.of(o).name} build')
         if not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
@@ -673,33 +671,51 @@ class Supervisor:
         self.helpers[name] = p
         return p
 
+    def kv_node(self, flag):
+        """host:port of the KV node mentat announces that this box uses, by its rails and rank (mentat.kv_target)."""
+        g = self.o.get('GROUP')
+        try:
+            nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
+        except (OSError, RuntimeError, ValueError) as e:
+            raise Stop(1, f'{flag} remote:auto: mentat: {e}')
+        target = mentat.kv_target(nodes, self.rails, self.rank)
+        if not target:
+            raise Stop(1, f'{flag} remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
+        return target
+
     def kv_store(self):
         """KV_STORE for this box's engine: each remote:auto becomes the KV node mentat announces, by this box's rails."""
         stores = opt.kv_stores(self.o)
         if not any(t['host'] == 'auto' for t in stores):
             return None
-        g = self.o.get('GROUP')
-        try:
-            nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
-        except (OSError, RuntimeError, ValueError) as e:
-            raise Stop(1, f'--kv-store remote:auto: mentat: {e}')
-        target = mentat.kv_target(nodes, self.rails)
-        if not target:
-            raise Stop(1, f'--kv-store remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
+        target = self.kv_node('--kv-store')
         log(f'KV store: the KV node at {target}')
         return ';'.join(t['text'].replace('remote:auto', f'remote:{target}', 1) if t['host'] == 'auto' else t['text']
                         for t in stores)
 
+    def kv_rows(self):
+        """KV_ROWS for this box's engine: remote:auto becomes the KV node by this box's rails, as for KV_STORE (odd ranks
+        on the node's second root)."""
+        t = opt.kv_rows(self.o)
+        if not t or t['host'] != 'auto':
+            return None
+        target = self.kv_node('--kv-rows')
+        log(f'KV rows: the KV node at {target}')
+        return opt.kv_rows_with(self.o, target)
+
     def boot(self):
         o, hs, r = self.o, self.hs, self.rank
-        plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.rank_dir(r), aux_dir=self.ms.rank_dir(r), home=self.home,
-                               epoch=hs['epoch'], set_id=self.model_id, kv_store=self.kv_store())
+        plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.dir, aux_dir=self.ms.dir, home=self.home,
+                               epoch=hs['epoch'], set_id=self.model_id, kv_store=self.kv_store(),
+                               kv_rows=self.kv_rows())
         work = os.path.join(self.home, 's2')
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
         self.check_n = 0
         env = self.engine_env(plan)
-        argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
+        # Flash takes the second rail for prefill only
+        ips2 = '--ips2' if models.of(o).name == 'glm53' else '--pf-ips2'
+        argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
         if o.get('SHAPE') == 'ring':
             argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
@@ -757,6 +773,8 @@ class Supervisor:
             front += ['--default-reasoning-effort', o.get('DEFAULT_REASONING_EFFORT')]
         if o.get('DEFAULT_THINKING_BUDGET') != '0':
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
+        if o.get('ALLOW_THINKING_OFF') == '1':
+            front += ['--allow-thinking-off']
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT'), '--supervisor', f'{self.lan}:{self.port}'],
                    os.path.join(REPO, 'frontend'))
@@ -896,8 +914,10 @@ class Supervisor:
 
 
 def engine_bin(o):
-    """The engine binary under bin/ for KV_FORMAT: g6m4 (the fp8 KV row) or g6m4-int4 (docs/KV4.md)."""
-    return 'g6m4-int4' if o.get('KV_FORMAT') == 'int4' else 'g6m4'
+    """The model's engine binary under bin/ for KV_FORMAT: g6m4 (the fp8 KV row) or g6m4-int4 (docs/KV4.md) for
+    GLM-5.3, g6m4_flash for GLM-5.3-Flash."""
+    name = models.of(o).engine
+    return name + '-int4' if o.get('KV_FORMAT') == 'int4' else name
 
 
 def engine_build(home, name='g6m4'):
@@ -987,7 +1007,7 @@ def signal_pid(pid, sig, name, log=log):
 
 
 def stop_local(home, log=log):
-    """What scripts/stop.sh does, on this box: shim and front end, then quit files, then the engine."""
+    """Stop this box: shim and front end, then quit files, then the engine."""
     out = os.path.join(home, 'out')
     for p in ('front', 'shim'):
         pid = recorded(os.path.join(out, f'{p}.pid'))

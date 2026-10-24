@@ -22,6 +22,8 @@
 //      [--v2-dense-form trellis|rounded]  trellis (default): q_b, o_proj and the dense MLP stored as trellis stay the
 //                     release's entries for the dense trellis kernels (kernels/dtr.cuh). rounded: the fallback, which
 //                     rounds them to the MXFP8 and int4 forms of a converted pack (not the release's weights)
+//      [--layout FILE]  with --v2-dense: the pieces each rank holds come from a layout file (bin/g6layout,
+//                     engine/loader-rs/src/layout.rs) instead of the formulas
 //      [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234] [--cap 64] [--chunk 4]
 //      [--graph]      one captured graph per row count instead of plain launches (same lines)
 //      [--prefill MP] every prompt token but the last goes through the prefill path in sub-batches of up to MP rows,
@@ -33,7 +35,16 @@
 //                     G6_REUSE_ALIGN=1: a hit retains only whole cold prefill grid cells, prefix_reuse.h.
 //                     Under S2: every retired session's caches stay in the pool (s2/pool.h), ALIGN and NOEND default 1.
 //                     No --dflash-manifest (the drafter's prompt-context taps are written by the prefill a hit skips)
-//      [--kv-store STORE,size=N(G|T)]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
+//      G6_RT_STORE=mem:|remote:HOST:PORT (environment; --serve with G6_CP): remote attention rows (rt_rows.cuh). A
+//                     session's whole pages past G6_RT_L (default G6_CP_R) go to a lease named after the boot and the
+//                     layout, and CP decode reads them through G6_RT_POOL (default 4096) resident slots per indexer group.
+//                     A prefill of the session (a later turn) and its retirement drop them back to the local copies.
+//                     G6_RT_FMT=int4: the lease holds the rows as INT4 (416 B for 656), turned back into FP8 after each fetch.
+//                     G6_RT_LOCAL=N: release: a split run holds its prefix and N window pages per rank, its tail pages
+//                     go back to the window once in the store, and the pool grants the drafter's whole tail apart from
+//                     them; retained, it keeps its records for its next turn. G6_RT_PLACE=P: the main model's physical pages per rank, so
+//                     --cap may pass what they hold (the longest tail is then the drafter class, --cap / 64 - place pages)
+//      [--kv-store STORE,size=N(G|T)[,keep=RULE]]...  under S2 with --reuse-prefix: block stores below the pool, tried in flag order
 //                     (s2/kv_tier.cuh, kvman-rs src/stash.rs). A request that continues a stored entry reads its pages
 //                     back and skips their prefill. STORE: ssd:PATH (a folder on this box: PATH/r<rank>; with --set-id
 //                     its system prefixes and their counts survive restarts) or remote:HOST:PORT (a lease on a KV node,
@@ -42,7 +53,9 @@
 //                     definitions (the span the front end sends, else every grid cell) that --kv-system-after N
 //                     conversations started with (default 2), once each. sessions: those, plus the runs the pool evicts
 //                     that continued their conversation at least once, stored on the system prefix they start with.
-//                     all: every run the pool evicts (benchmarks)
+//                     all: every run the pool evicts (benchmarks). A store's keep=system|sessions|all overrides it for
+//                     that store: ssd:...,keep=system then remote:...,keep=all puts system prefixes on the SSD and
+//                     evicted runs on the KV node
 //      [--kv-write-limit F]  the stores write at most F page blocks per page of KV the engine computes (off by default)
 //      [--kv-tier STORE,size=N[,keep=evicted|shared|all]] [--kv-shared-after N]  deprecated: --kv-store, with --kv-keep
 //                     all when any keep is evicted or all, else system; --kv-system-after N
@@ -54,10 +67,10 @@
 //                     (s2/service.h, head = rank 0 on the bootstrap address, port N); DIR is this rank's fresh S2 directory
 //                     (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2). Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3.
 //                     Without --serve the --prompt sequences run once and the process exits.
-//      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident from tools/convert/pairpack.py; or
+//      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident; or
 //                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
 //      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
-//                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from tools/convert/dflash2.py. --dflash-sel 1 =
+//                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from engine/loader-rs/src/dflash2.rs. --dflash-sel 1 =
 //                     the DFlash2 selector walk (default when the pack has it), 0 = argmax drafts; --dflash-k K = verify
 //                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, except under S2: there a
 //                     session alone at its prompt tail drafts with DFlash2 and goes to MTP when a second one arrives (s2_batch.h).
@@ -71,6 +84,10 @@
 //                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
 //                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
 //                     Needs --mtp or --dflash-manifest. Under S2: the DFlash2 sessions' policy (needs --dflash-manifest).
+//                     Flash: on by default with --mtp K (Flash TP2 verify cost table, spec_len.h flash_tp2).
+//      [--spec-reset-per-request]  Flash offline: restore the configured adaptive policy before each request (default off).
+//                     Does not reset transport counters or cumulative MTP statistics; no effect with --spec-fixed.
+//      [--spec-fixed]  Flash: --mtp K verifies all K drafts every round (the adaptive default off).
 //      [--set-id HEX]  the model set id from ./gr8 glm53 up (tools/launch/modelset.py). Under S2 it joins the bootstrap
 //                     agreement, so ranks loaded from different model sets refuse to start. Otherwise unused.
 #ifndef DEC_S2
@@ -82,18 +99,26 @@
 #include "packfind.h"
 #include "weight_check.cuh"
 #include "prefill.cuh"
+#include "flash_prefill.cuh"
 #include "dflash.cuh"
 #include "prefix_reuse.h"
 #include "reuse_poison.cuh"
 #include "reuse_hdump.cuh"
 #include "steering_boot.cuh"
+#if G6_MODEL_FLASH
+#endif
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
+#include "s2/flash_native.cuh"
+#include "s2/cp_rows.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
+#include "rt_rows.cuh"
 #include "host_reclaim.h"
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <unistd.h>
 
 using namespace g6rt;
@@ -117,19 +142,41 @@ int main(int argc, char** argv)
     };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+#if G6_MODEL_FLASH
+    {   // G6_MOE_TOPK (model change, screen arm): unset = the model's top-k; a bad value dies before any load
+        std::string e;
+        const int tk = env_digit("G6_MOE_TOPK", 1, geom::TOPK, geom::TOPK, &e);
+        if (tk < 0) die(e);
+        if (tk < geom::TOPK)
+            fprintf(stderr, "# G6_MOE_TOPK=%d: routed experts per token cut %d -> %d, weights renormalized (screen arm)\n",
+                    tk, geom::TOPK, tk);
+    }
+#else
+    if (getenv("G6_MOE_TOPK")) die("G6_MOE_TOPK is a Flash-model option (this build is the GLM model)");
+    if (getenv("G6_PF_ROUTER_SPLIT")) die("G6_PF_ROUTER_SPLIT is a Flash-model option (this build is the GLM model)");
+#endif
+#if G6_MODEL_FLASH
+    const int route_split_mode = flash_route_split_mode();     // G6_PF_ROUTER_SPLIT: strict 0/1, a bad value dies before any load
+#endif
     std::string progress_err;          // G6_PROGRESS_ISOLATE: other threads stay off the proxy CPUs (progress_cpus.h)
     const int progress_isolate = env_choice("G6_PROGRESS_ISOLATE", 1, 1, &progress_err);
     if (progress_isolate < 0) die(progress_err);
     g6::FabricConfig cfg;
+    std::vector<std::string> pf_ips2;   // --pf-ips2: rail-1 addresses of the prefill fabrics only (G6_PF_STRIPE dual-rail)
     std::string manifest, packfile;
     V2Src v2src;
     g6rt::CommonOpts co;                // every flag m4sim takes too, parsed in engine_opts.h
-    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
-    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
+    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights, G6_PF_OWN=4
+    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (engine/loader-rs/src/dflash2.rs)
     int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
     int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
+#if G6_MODEL_FLASH
+    bool spec_reset_per_request = false; // offline evaluation: no adaptive history from earlier requests
+    bool spec_fixed = false;            // --spec-fixed: Flash --mtp K verifies all K drafts every round
+#endif
     Plan plan;
     bool image = false, hash = true, reuse_prefix = false;
+    bool lanes_explicit = false;        // --pf-lanes given (common_arg parses it)
     std::string s2dir;                  // --serve DIR: serve through S2 (below R)
     std::vector<std::string> kv_tiers;  // --kv-store (and the deprecated --kv-tier), in flag order
     std::string kv_keep;                // --kv-keep system|sessions|all
@@ -140,17 +187,19 @@ int main(int argc, char** argv)
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
     std::string steering_dir, steering_force_s;
     std::string steering_model_revision, steering_tokenizer_revision, steering_template_digest, steering_weight_set, steering_template_file;
-    int s2port = 0, s2sess = 8;
+    int s2port = 0, s2sess = G6_MODEL_FLASH ? 1 : 8;
     unsigned long long s2epoch = 1;
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) die("missing value for " + a); return std::string(argv[++i]); };
         std::string oerr;
+        if (a == "--pf-lanes") lanes_explicit = true;
         if (g6rt::common_arg(a, next, co, oerr)) { if (!oerr.empty()) die(oerr); continue; }
         if (a == "--rank") cfg.rank = atoi(next().c_str());
         else if (a == "--ips") cfg.ips = split(next(), ',');
         else if (a == "--ips2") cfg.ips2 = split(next(), ',');
+        else if (a == "--pf-ips2") pf_ips2 = split(next(), ',');
         else if (a == "--ring") cfg.ring = true;
         else if (a == "--ring-devs") cfg.ring_devs = split(next(), ',');
         else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
@@ -162,6 +211,10 @@ int main(int argc, char** argv)
         else if (a == "--dflash-pack") dfl_file = next();
         else if (a == "--dflash-sel") dfl_sel = atoi(next().c_str());
         else if (a == "--dflash-k") dfl_k = atoi(next().c_str());
+#if G6_MODEL_FLASH
+        else if (a == "--spec-fixed") spec_fixed = true;
+        else if (a == "--spec-reset-per-request") spec_reset_per_request = true;
+#endif
         else if (a == "--image") image = true;
         else if (a == "--no-hash") hash = false;
         else if (a == "--reuse-prefix") reuse_prefix = true;
@@ -199,40 +252,70 @@ int main(int argc, char** argv)
         else die("unknown argument " + a);
     }
     // the shared flags, under the names the rest of this file uses
-    const int cap = co.cap, top = co.top, pfrows = co.pfrows, lanes = co.lanes, nc = co.nc, mtp = co.mtp, MP = co.MP;
+    const int cap = co.cap, top = co.top, pfrows = co.pfrows, nc = co.nc, mtp = co.mtp, MP = co.MP;
+    int lanes = co.lanes;               // Flash: two lanes for a prefill of up to 8192 rows unless --pf-lanes (below)
     const float temp = co.temp;
-    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2, adapt = co.adapt;
+    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2;
+    bool adapt = co.adapt;              // Flash: --mtp turns it on unless --spec-fixed (below)
     const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
     std::vector<std::string>& prompts = co.prompts;
     v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
-    v2src.trellis = co.v2_trellis;
+    v2src.trellis = co.v2_trellis; v2src.layout = co.v2_layout;
     if (co.n_gen) plan.n_gen = *co.n_gen;          // Plan owns these defaults; apply only what the command line set
     if (co.seed) plan.seed = *co.seed;
     if (co.chunk) plan.chunk = *co.chunk;
     if (co.top_p) plan.top_p = *co.top_p;
     if (co.rs) plan.rs = *co.rs;
     const bool release = !v2src.dense.empty();
+    if (const char* kvb = getenv("G6_KVB"); kvb && *kvb && strcmp(kvb, "bf16"))   // #50: read by the release planner only
+    {
+        if (strcmp(kvb, "fp8")) die(std::string("G6_KVB=") + kvb + ": use bf16 or fp8");
+        if (!release) die("G6_KVB=fp8 needs --v2-dense: packs hold kv_b in BF16");
+    }
     if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || (!release && (manifest.empty() || packfile.empty())))
         die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
     if (release && (!manifest.empty() || !packfile.empty() || v2src.dir.empty()))
         die("--v2-dense replaces --manifest / --pack and needs --v2 (the image comes from the release alone)");
+    if (!release && !v2src.layout.empty()) die("--layout needs --v2-dense (it places the release's pieces)");
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
+#if G6_MODEL_FLASH
+    if (layers_s == "all") {
+        if (layers.size() != (size_t)geom::L_MAIN) die("Flash --layers all did not select every main layer");
+        for (int i = 0; i < geom::L_MAIN; ++i)
+            if (layers[i] != i) die("Flash --layers all selected an unexpected layer");
+    }
+    fprintf(stderr, "# rank %d: Flash actual main layers %zu first %d last %d\n", cfg.rank, layers.size(),
+            layers.empty() ? -1 : layers.front(), layers.empty() ? -1 : layers.back());
+#endif
     if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
     plan.inv_temp = g6rt::inv_temp(temp);
     if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);
     if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
+    // Flash lane default: the MP8192 memory gate passed; larger MPs remain opt-in.
+#if G6_MODEL_FLASH
+    if (!lanes_explicit && MP > 0 && MP <= 8192) lanes = 2;
+#endif
     const bool s2mode = !s2dir.empty();
     const bool dfl = !dfl_man.empty();
+    if (s2mode && (getenv("G6_RESID_DUMP") || getenv("G6_LOGIT_DUMP")))
+        die("G6_RESID_DUMP / G6_LOGIT_DUMP support offline main steps, not --serve");
     // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
     if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
         die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except under S2; --dflash-sel 0|1; --dflash-k 1..7");
-    if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
+    // TP=6 runs the drafter body replicated (dflash.cuh dfl::REP); TP=3 would too, but is not built or measured for it
+    if (dfl && dfl::REP && g6nr::NR != 6) die("--dflash: TP=" + std::to_string(g6nr::NR) + " has no DFlash2 drafter (TP=4 splits it, TP=6 replicates it)");
     if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
+#if G6_MODEL_FLASH
+    if (spec_reset_per_request && s2mode) die("--spec-reset-per-request is offline only (no --serve)");
+    // Flash: --mtp K is adaptive speculation (up to K drafts) unless --spec-fixed
+    if (spec_fixed && (adapt || !levels_s.empty() || !mtp)) die("--spec-fixed needs --mtp, and not --spec-adaptive / --spec-levels");
+    if (mtp && !spec_fixed && !s2mode && !dfl) adapt = true;
+#endif
     if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; under S2 it is the DFlash2 sessions' policy");
     if (!levels_s.empty() && !adapt) die("--spec-levels needs --spec-adaptive");
-    SpecLen spec;                       // --spec-adaptive. Its estimates persist across requests
+    SpecLen spec;                       // --spec-adaptive. Estimates persist unless the offline reset option is on
     if (adapt)
     {
         const int kmax = dfl ? dfl_k : mtp;
@@ -244,9 +327,27 @@ int main(int argc, char** argv)
         if (!spec.set_levels(lv)) die("--spec-levels: no level");
         spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
         spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
+#if G6_MODEL_FLASH
+        if (!dfl) spec.flash_tp2();
+#endif
     }
+#if G6_MODEL_FLASH
+    const SpecLen spec_initial = spec;  // fully configured, before any observations; includes Flash costs and levels
+#endif
     if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    if (getenv("G6_RT_STORE") && !s2mode) die("G6_RT_STORE needs --serve (S2 below R with G6_CP on)");
+    if (getenv("G6_RT_POISON")) die("G6_RT_POISON is an m4sim test: g6m4 reads the local copy of a row without a slot");
+    // G6_RT_LOCAL (release): each split run's tail cycles through that many window pages per rank; the pool grants the
+    // drafter's whole tail apart from them (kvman-rs Pool::window, s2_cp_map). G6_RT_PLACE: the main model's physical
+    // pages per rank (m.cp.phys), so --cap (the logical length) may pass what the local pages hold
+    const int rt_win = getenv("G6_RT_LOCAL") ? atoi(getenv("G6_RT_LOCAL")) : 0;
+    if (getenv("G6_RT_LOCAL") && (rt_win < 1 || !getenv("G6_RT_STORE"))) die("G6_RT_LOCAL needs G6_RT_STORE and a page count >= 1");
+    if (getenv("G6_RT_PLACE") && !rt_win) die("G6_RT_PLACE needs G6_RT_LOCAL (the pages past it are reached through the rows tier only)");
+    // --kv-store with it: the pool never retains a window run (kvman-rs Pool::window), so the block stores copy at most
+    // its prefix, which stays on pool pages; runs below R are as without the tier
+    if (rt_win && getenv("G6_RT_L") && getenv("G6_CP_R") && atoi(getenv("G6_RT_L")) != atoi(getenv("G6_CP_R")))
+        die("G6_RT_LOCAL needs G6_RT_L = G6_CP_R (the window holds every tail page past R)");
     steering::PreparedBoot steering_prepared;
     try {
         if (!steering_dir.empty() && !hash) die("--steering-profile requires weight hash checks");
@@ -288,12 +389,66 @@ int main(int argc, char** argv)
             for (size_t j = 0; j < t.size(); ++j) kstop.tau[j + 1] = t[j];
         }
         if (const char* e = getenv("G6_MTP_KSTOP_SEED3")) kstop.seed3 = atof(e);
-        if (kstop.mode && (!s2mode || !dfl || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 || !(kstop.seed3 > 0 && kstop.seed3 < 1) ||
-                           kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
-            die("G6_MTP_KSTOP needs --serve, --dflash-manifest and --mtp 2+; G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), "
-                "G6_MTP_KSTOP_SEED3 in (0, 1)");
+        // Without --dflash-manifest (TP=6 / TP=3, MTP only): mode 1 stops the chain of a session that decodes alone
+        // (s2_batch.h KStop::solo), with G6_MTP_KSTOP_KMAX <= --mtp; mode 2 needs the drafter choice's estimates
+        if (kstop.mode && (!s2mode || (!dfl && (kstop.mode != 1 || kstop.kmax > mtp)) || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 ||
+                           !(kstop.seed3 > 0 && kstop.seed3 < 1) || kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
+            die("G6_MTP_KSTOP needs --serve and --mtp 2+ (without --dflash-manifest: mode 1 and G6_MTP_KSTOP_KMAX <= --mtp); "
+                "G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), G6_MTP_KSTOP_SEED3 in (0, 1)");
         if (!kstop.mode) kstop.kmax = 0;
+        kstop.solo = kstop.mode == 1 && !dfl;
+        // G6_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
+        // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least G6_MTP_KSTOPB_KMIN (0|1, default 0).
+        // G6_MTP_KSTOPB_TAU=t1[,t2[,...]] (up to 7; default 0.6,0.88) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n
+        // sessions; past the configured entries there is no stop (the remaining drafts all verify).
+        // G6_MTP_KSTOPB_WIDTHS=M,..: the main widths captured besides the multiples of K + 1 (default every width the rule reaches;
+        // a width outside them takes the next most likely drafts). G6_MTP_KSTOPB_EXPLORE=n (measurement): every n-th
+        // round's shared sessions verify a hashed k_q instead. In the S2 runtime signature
+        kstop.b.mode = env_choice("G6_MTP_KSTOPB", 1, 0, &ke);
+        kstop.b.kmin = env_choice("G6_MTP_KSTOPB_KMIN", 1, 0, &ke);
+        if (kstop.b.mode < 0 || kstop.b.kmin < 0) die(ke);
+        auto nums = [](const char* name, size_t most) {
+            std::vector<double> t;
+            const std::string v = getenv(name);
+            for (size_t a = 0; a <= v.size();)
+            {
+                const size_t b = std::min(v.find(',', a), v.size());
+                char* end = nullptr;
+                const std::string f = v.substr(a, b - a);
+                t.push_back(strtod(f.c_str(), &end));
+                if (f.empty() || *end || !std::isfinite(t.back()) || t.size() > most)
+                    die(std::string(name) + ": at most " + std::to_string(most) + " comma-separated numbers");
+                a = b + 1;
+            }
+            return t;
+        };
+        double bt[8] = {0, 0.6, 0.88, 0.95, 0, 0, 0, 0};   // tau 0 past the entries: no stop there
+        if (getenv("G6_MTP_KSTOPB_TAU")) { const auto t = nums("G6_MTP_KSTOPB_TAU", 7); std::copy(t.begin(), t.end(), bt + 1); }
+        for (int S = 1; S <= s2::S2N_SLOTS; ++S)
+        {
+            std::copy(bt, bt + 8, kstop.b.tau[S]);
+            const std::string n = "G6_MTP_KSTOPB_TAU_S" + std::to_string(S);
+            if (getenv(n.c_str())) { const auto t = nums(n.c_str(), 7); std::copy(t.begin(), t.end(), kstop.b.tau[S] + 1); }
+        }
+        if (getenv("G6_MTP_KSTOPB_WIDTHS"))
+            for (double w : nums("G6_MTP_KSTOPB_WIDTHS", 64))
+            {
+                if (w != (int)w || w < 1 || w > s2sess * (mtp + 1)) die("G6_MTP_KSTOPB_WIDTHS: whole widths 1..sessions x (mtp + 1)");
+                kstop.b.widths.push_back((int)w);
+            }
+        if (getenv("G6_MTP_KSTOPB_EXPLORE")) kstop.b.explore = atoi(getenv("G6_MTP_KSTOPB_EXPLORE"));
+        // the draft log-probabilities come from every MTP draft step (StepOut::lp), with or without the DFlash2 drafter
+        if (kstop.b.mode && (!s2mode || kstop.b.explore < 0))
+            die("G6_MTP_KSTOPB needs --serve; G6_MTP_KSTOPB_EXPLORE >= 0");
+        if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
+#if G6_MODEL_FLASH
+    // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
+    if (s2mode && (reuse_prefix || dfl || plan.rs))
+        die("Flash serve supports no prefix reuse, DFlash or rejection sampling");
+    if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
+        die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
+#endif
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
@@ -353,13 +508,30 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
     }
     if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
+    // a DFlash2 round's MTP first form runs on the accepted prefix + 1 rows (1 .. dfl_k + 1): capture every one of them
+    // (the prompt chunk and the verify widths above cover them for a block-8 drafter, not for a wider one)
+    if (dfl && mtp)
+        for (int M = 1; M <= dfl_k + 1; ++M)
+            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
     for (int M = 2; M <= kstop.kmax + 1; ++M)   // G6_MTP_KSTOP: solo MTP verifies of 2..kmax + 1 rows, first forms of as many
     {
         if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
         if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
     }
+    // G6_MTP_KSTOPB: a session alone in round_all (MTP only) verifies the rule's widths of one session; its first forms
+    // are within 1..mtp + 1 (draft_rows above)
+    for (int M : s2::kstopb_widths(kstop.b, 1, mtp))
+        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+    // G6_S2_ADAPT: a session alone may verify any k <= mtp, also outside limited G6_MTP_KSTOPB_WIDTHS (s2_batch.h kshared)
+    if (s2mode && s2::adapt_env())
+        for (int M = 2; M <= mtp + 1; ++M)
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
         if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
+#if G6_MODEL_FLASH
+    if (s2mode) for (int n = 1; n <= mtp + 1; ++n)
+        if (std::find(row_counts.begin(), row_counts.end(), n) == row_counts.end()) row_counts.push_back(n);
+#endif
     const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
     // G6_PF_OWN=4 (TP4) env refusals before any CUDA / fabric work (qp_wire.h roll_env_refusal)
     const bool own4 = MP && getenv("G6_PF_OWN") && atoi(getenv("G6_PF_OWN")) == 4;
@@ -397,12 +569,27 @@ int main(int argc, char** argv)
     if (pf_qo && !release && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
     if (release && (!qo_man.empty() || !qp_man.empty())) die("--v2-dense: the QO weights come from the release (no --qo- / --qp- packs)");
     v2src.qo = pf_qo;
+    // G6_PF_STRIPE=1 (needs --pf-ips2 or --ips2): prefill payload writes >= G6_PF_STRIPE_MIN bytes (default 1 MiB) go
+    // out half on each rail (FabricConfig::stripe_min). Unset = on when --pf-ips2 is given, else one rail as before;
+    // 0 = one rail.
+    auto pf_stripe_cfg = [&](g6::FabricConfig& cp, const std::vector<std::string>& ips2) {
+        std::string e;
+        const int on = env_choice("G6_PF_STRIPE", 1, ips2.empty() ? 0 : 1, &e);
+        if (on < 0) die(e);
+        if (!ips2.empty()) cp.ips2 = ips2;
+        if (on != 1) return;
+        if (cp.ips2.size() != cp.ips.size()) die("G6_PF_STRIPE=1 needs --pf-ips2 (or --ips2) with one address per rank");
+        const char* m = getenv("G6_PF_STRIPE_MIN");
+        cp.stripe_min = m ? (size_t)atoll(m) : (size_t)1 << 20;
+        if (cp.stripe_min < 8192) die("G6_PF_STRIPE_MIN must be >= 8192");
+    };
     if (MP)
     {
         g6::FabricConfig cp = cfg;
         cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
         cp.ncoll = pf_rs ? 5 : 2;
         cp.port = cfg.port + 8;
+        pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
         fabp.init(cp);
         fabp.start_proxy();
@@ -416,10 +603,59 @@ int main(int argc, char** argv)
         cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
         cp.ncoll = pf_rs ? 5 : 2;
         cp.port = cfg.port + 24;
+        pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
         fabp2.init(cp);
         fabp2.start_proxy();
     }
+#if G6_MODEL_FLASH
+    // Independent pool-ID exchange: default on for TP2 Flash prefill (G6_PF_POOL_OWNER unset = auto, 0 = off,
+    // 1 = on and die if unsupported). Existing fabp/fabp2 are unchanged.
+    g6::Fabric fabix, fabix2;
+    const int pool_mode = flash_pool_owner_mode();
+    const bool pool_fits = MP && g6nr::NR == 2 && cfg.ips.size() == 2 && !cfg.ring;
+    const char* pool_conflict = nullptr;
+    for (const char* key : {"G6_FPF_P1", "G6_FPF_DSA_P1", "G6_FPF_ATTN_P1"})
+        if (getenv(key) && atoi(getenv(key)) == 1) pool_conflict = key;
+    if (pool_mode == 1 && !pool_fits) die("G6_PF_POOL_OWNER=1 needs TP2 Flash prefill (not ring)");
+    if (pool_mode == 1 && pool_conflict) die(std::string("G6_PF_POOL_OWNER=1 conflicts with ") + pool_conflict);
+    const bool pool_owner = pool_mode == 1 || (pool_mode == 2 && pool_fits && !pool_conflict);
+    if (pool_owner)
+    {
+        auto init_ids = [&](g6::Fabric& ids, int port, int cpu_offset) {
+            g6::FabricConfig cp = cfg;
+            cp.ncoll = 1; cp.slot_bytes = flash_pool_owner::payload(MP);
+            cp.port = cfg.port + port;
+            cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
+            pf_stripe_cfg(cp, pf_ips2);
+            ids.init(cp); ids.start_proxy();
+        };
+        init_ids(fabix, 64, 9);
+        if (two) init_ids(fabix2, 72, 10);
+    }
+    // G6_PF_ROUTER_SPLIT=1 (opt-in): one ncoll = 1 route-table fabric per prefill lane, at any rank count and on a
+    // switched mesh or the switchless ring (the fabric relays the diagonal, as it does for the prefill fabric).
+    // Ports +80 / +88 and proxy CPU offsets 11 / 12 (taken: ports 8 16 24 32 40 48 56 64 72, offsets 1..10).
+    g6::Fabric fabrs, fabrs2;
+    const bool route_split = route_split_mode == 1;
+    if (route_split)
+    {
+        if (!(MP && g6nr::NR >= 2 && g6nr::NR <= flash_route_split::MAX_NR && cfg.ips.size() == (size_t)g6nr::NR))
+            die("G6_PF_ROUTER_SPLIT=1 needs Flash prefill (--prefill) on 2 to 8 ranks");
+        auto init_rs = [&](g6::Fabric& rs, int port, int cpu_offset) {
+            g6::FabricConfig cp = cfg;
+            cp.ncoll = 1; cp.slot_bytes = flash_route_split::payload(MP, (int)cfg.ips.size());
+            cp.port = cfg.port + port;
+            cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
+            pf_stripe_cfg(cp, pf_ips2);
+            rs.init(cp); rs.start_proxy();
+        };
+        init_rs(fabrs, 80, 11);
+        if (two) init_rs(fabrs2, 88, 12);
+        fprintf(stderr, "# rank %d: G6_PF_ROUTER_SPLIT=1: prefill MoE router row-split, route tables over a dedicated fabric%s\n",
+                cfg.rank, two ? " per lane" : "");
+    }
+#endif
     g6::Fabric fabd;                    // MTP draft region: 3 collectives, decode-sized slots
     if (mtp)
     {
@@ -462,12 +698,13 @@ int main(int argc, char** argv)
 #else
     auto qp_err = [&]() -> unsigned { return 0u; };
 #endif
-    // G6_DFL_REUSE=1|2 (s2_batch.h DflReuse; default 0): 1 = a DFlash2 session whose prefill a prefix-reuse hit cut into
-    // the drafter's window keeps the drafter (the rows the prefill taps, and the ring's rows of the last DFlash2 session
-    // with the same tokens); 2 = also a session alone on MTP takes it. G6_DFL_REUSE_MIN=<rows> (0..2048, default 256): MTP
-    // rounds until the drafter holds that many context rows. Drafts only. In the S2 runtime signature
+    // G6_DFL_REUSE=1|2 (s2_batch.h DflReuse; default 2 when serving DFlash2 with MTP, else 0): 1 = a DFlash2 session whose
+    // prefill a prefix-reuse hit cut into the drafter's window keeps the drafter (the rows the prefill taps, and the ring's
+    // rows of the last DFlash2 session with the same tokens); 2 = also a session alone on MTP takes it. G6_DFL_REUSE_MIN=
+    // <rows> (0..2048, default 256): MTP rounds until the drafter holds that many context rows. Drafts only. In the S2
+    // runtime signature
     std::string dre;
-    const int dfl_reuse = env_choice("G6_DFL_REUSE", 2, 0, &dre);
+    const int dfl_reuse = env_choice("G6_DFL_REUSE", 2, (dfl && s2mode && mtp) ? 2 : 0, &dre);
     if (dfl_reuse < 0) die(dre);
     if (dfl_reuse && !(dfl && s2mode)) die("G6_DFL_REUSE needs --dflash-manifest and --serve");
     int dfl_reuse_min = 256;
@@ -493,11 +730,38 @@ int main(int argc, char** argv)
     // both (main and draft steps never run at once; inside the shim / front end's taskset range 0..N-8;
     // G6_QA_SPLIT_CPU moves it). Every rank must run the same values (the S2 runtime signature carries them).
     std::string qse;
-    const bool qs_def = g6nr::NR > 1;   // replicated-GEMV split needs peers to gather across; pointless at TP1
+    // replicated-GEMV split needs peers to gather across (pointless at TP1); the Flash build plans no gathers
+    const bool qs_def = g6nr::NR > 1 && !G6_MODEL_FLASH;
     const int qs_mode = env_choice("G6_QA_SPLIT", 2, qs_def ? 2 : 0, &qse), iq_split = env_choice("G6_IDXQ_SPLIT", 1, qs_def ? 1 : 0, &qse),
               mtp_split = env_choice("G6_MTP_SPLIT", 1, (qs_def && mtp) ? 1 : 0, &qse);
     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
+    if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die("G6_QA_SPLIT, G6_IDXQ_SPLIT and G6_MTP_SPLIT are GLM-5.3 paths");
     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
+    // G6_S2_DSEL_MODEL=1 + G6_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
+    // choice prices both drafters from one frozen cost table and MTP rounds under the confidence stop. Every rank reads
+    // the same table; its canonical form is in the S2 runtime signature
+    std::string pce;
+    const int dsel_model = env_choice("G6_S2_DSEL_MODEL", 1, 0, &pce);
+    if (dsel_model < 0) die(pce);
+    s2::DSelTable dsel_tab;
+    if (dsel_model)
+    {
+        const char* e = getenv("G6_S2_DSEL_TABLE");
+        if (!e || !*e || !dfl || !s2mode) die("G6_S2_DSEL_MODEL needs G6_S2_DSEL_TABLE, --serve and --dflash-manifest");
+        std::string text = e, err;
+        if (text.find(':') == std::string::npos)    // no key:value: the path of a file holding the table
+        {
+            std::ifstream f(text);
+            if (!f) die("G6_S2_DSEL_TABLE: cannot read " + text);
+            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        if (!dsel_tab.parse(text, &err)) die(err);
+    }
+    // G6_DFL_SEL_ALPHA=<a> (dflash.cuh k_walk; default 1): the DFlash2 selector walk scores logit + a * correction. Drafts
+    // only: the verify is unchanged. In the S2 runtime signature
+    const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
+    if (!std::isfinite(dfl_alpha)) die("G6_DFL_SEL_ALPHA: not a finite number");
+    if (dfl_alpha != 1.f && !dfl) die("G6_DFL_SEL_ALPHA needs --dflash-manifest");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -518,6 +782,15 @@ int main(int argc, char** argv)
     // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature.
     const DraftHeadI4 dhead = draft_head_i4_env();
     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+    // G6_MTP_LASTROW=1 (rank.cuh mtp_lastrow_env; default 0): a first-form draft step routes only each session's last
+    // row (the rows before it only write layer 78's caches). Same caches, drafts and log-probabilities. In the S2 runtime
+    // signature
+    const bool mtp_last = mtp_lastrow_env();
+    if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
+    // G6_DRAFT_HEAD2=1|2 (rank.cuh draft_head2_env; default 0): the MTP draft's head in two stages (2-bit screen, exact
+    // MXFP8 rescoring of its best). Drafts only. In the S2 runtime signature
+    const int dhead2 = draft_head2_env();
+    if (dhead2 && !mtp) die("G6_DRAFT_HEAD2 needs --mtp");
     // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
     // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
     std::string dfe;
@@ -529,6 +802,7 @@ int main(int argc, char** argv)
     const int dfl_body_i4_on = env_choice("G6_DFL_BODY_I4", 1, 0, &dfe);
     if (dfl_body_i4_on < 0) die(dfe);
     if (dfl_body_i4_on && !dfl) die("G6_DFL_BODY_I4=1 needs --dflash-manifest");
+    int cp_step = 0;                    // G6_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
 #if defined(G6_CP) && G6_CP
     // CP: env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
@@ -537,8 +811,18 @@ int main(int argc, char** argv)
     const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
     int cp_mmax = K + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
-    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block
-    if (s2mode) cp_mmax = std::max(cp_mmax, std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk)));
+    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block.
+    // G6_CP_STEP_ROWS=n: S2 steps past R carry at most n rows (Driver::step caps their rounds, cp_rows.h), so the fabric
+    // is sized for n: at least the rows before #94 (cp_mmax here), at most the widest S2 step
+    if (s2mode)
+    {
+        const int full = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));
+        std::string ce;
+        cp_step = g6s2::cp_step_rows_env(getenv("G6_CP_STEP_ROWS"), cp_mmax, full, &ce);
+        if (cp_step < 0) die(ce);
+        cp_mmax = std::max(cp_mmax, cp_step ? cp_step : full);
+    }
+    else if (getenv("G6_CP_STEP_ROWS") && atoi(getenv("G6_CP_STEP_ROWS"))) die("G6_CP_STEP_ROWS needs --serve");
     if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
     if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
     g6::CpColls cp_colls;
@@ -568,6 +852,30 @@ int main(int argc, char** argv)
     auto cp_error = [&]() -> unsigned { return qs_err(); };   // the G6_QA_SPLIT proxy
 #endif
     G6RT_CK(bind::init());
+    G6RT_CK(l2pf::init_env());     // G6_L2PF (kernels/l2pf.cuh); unset = off
+    // G6_MTP_L2PF=1|2|3 (kernels/l2pf.cuh; rank.cuh l2pf_window, l2pf_tail; default 0; needs G6_L2PF and --mtp): 1 = the MTP
+    // draft step arms the paced L2 prefetch (layer 78's windows, its eh_proj gather wait, its MLP wait: the draft head's
+    // records); 2 = the head merge wait of the main step and of each draft step prefetches the next draft step's front
+    // (this rank's eh_proj records, x_in), at most G6_MTP_L2PF_US (60) us, ended by the head all-gather's arrival. A
+    // prefetch writes nothing, so every output byte is unchanged; no collective is added (a window only reads the peers'
+    // tails), so the ranks need not agree on it (as G6_L2PF, not in the S2 runtime signature)
+    {
+        std::string le;
+        const int v = env_choice("G6_MTP_L2PF", 3, 0, &le);
+        if (v < 0) die(le);
+        if (v && !mtp) die("G6_MTP_L2PF needs --mtp");
+        if (v && !l2pf::cfg().win) die("G6_MTP_L2PF needs G6_L2PF (its side stream, pace and window bits)");
+        l2pf::cfg().mtp = v;
+        if (const char* u = getenv("G6_MTP_L2PF_US"))
+        {
+            char* end;
+            const double x = strtod(u, &end);
+            if (end == u || *end || !(x > 0) || x > 1000) die(std::string("G6_MTP_L2PF_US=") + u + ": want us, 0 < x <= 1000");
+            l2pf::cfg().mtp_us = (float)x;
+        }
+        if (v && R == 0) fprintf(stderr, "# rank 0: G6_MTP_L2PF=%d: %s%s\n", v, v & 1 ? "draft-step windows" : "",
+                                 v & 2 ? (v & 1 ? ", head-merge tails" : "head-merge tails") : "");
+    }
     pf_prof().on = getenv("G6_PF_PROF") != nullptr;
     if (getenv("G6_DEC_PROF") && graph) die("G6_DEC_PROF needs plain launches (no --graph)");
     cudaStream_t st;
@@ -640,10 +948,36 @@ int main(int argc, char** argv)
     m.qs.iq = iq_split == 1;
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
+    if (const char* e = getenv("G6_RT_PLACE"))
+    {
+        m.cp.phys = atoi(e);
+        if (m.cp.phys < cp_R / 64 + rt_win) die("G6_RT_PLACE must hold the prefix (G6_CP_R / 64 pages) and one window");
+        if (R == 0) fprintf(stderr, "# rank 0: G6_RT_PLACE: %d physical pages per rank for the main model (--cap %d is the logical length)\n", m.cp.phys, cap);
+    }
 #endif
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
+#if G6_MODEL_FLASH
+    if (mtp) m.kda_ring = mtp + 1;      // KDA state slots for the verify ring
+    if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
+#endif
+#if G6_MODEL_FLASH
+    // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
+    // stay decode-sized. Combinations the Flash prefill does not support yet stop here.
+    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || dfl || reuse_prefix
+#if defined(G6_CP) && G6_CP
+               || cp_on
+#endif
+               ))
+        die("Flash --prefill: not with G6_PF_RS, G6_PF_OWN, --qo-/--qp- packs, --dflash, --reuse-prefix or CP (P1)");
+    if (two && getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2)
+        die("Flash --pf-lanes 2 uses one compute stream; G6_PF_STREAMS=2 is not supported");
+    if (two && getenv("G6_RESID_DUMP"))
+        die("Flash --pf-lanes 2: G6_RESID_DUMP is not supported (use G6_PF_HASH / G6_LOGIT_DUMP)");
+    build(m, R, layers, find, cap, f, stepp, st, MX);
+#else
     build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
+#endif
     if (steering_boot.loaded)
     {
         try { materialize_steering(m, steering_profile, st); }
@@ -712,8 +1046,15 @@ int main(int argc, char** argv)
         P.qp = pf_qp; P.qpw = &qpw; P.qpl = qpl; P.roll = qp_roll;
 #endif
         P.attn_rows = pf_attn_rows(MP);
+#if !G6_MODEL_FLASH
         build_prefill(P, m, find, MP, fp, dmalloc<u64>(1), st);
+#endif
     }
+#if G6_MODEL_FLASH
+    FlashPrefill FP, FP2;
+    if (MP) build_flash_prefill(m, FP, MP, fp, dmalloc<u64>(1), st);
+    if (MP) pf_prewarm_flash(m, FP, st);
+#endif
     Prefill P2;
     g6::FabricDev fp2{};
     if (two)
@@ -725,8 +1066,23 @@ int main(int argc, char** argv)
 #if G6_NR == 4
         P2.qp = pf_qp; P2.qpw = &qpw; P2.qpl = qpl; P2.roll = qp_roll;
 #endif
+#if G6_MODEL_FLASH
+        build_flash_prefill(m, FP2, MP, fp2, dmalloc<u64>(1), st);
+        pf_prewarm_flash(m, FP2, st);
+#else
         build_prefill(P2, m, find, MP, fp2, dmalloc<u64>(1), st, &P);
+#endif
     }
+#if G6_MODEL_FLASH
+    if (pool_owner) {
+        init_flash_pool_transport(FP.pool_transport, fabix, MP);
+        if (two) init_flash_pool_transport(FP2.pool_transport, fabix2, MP);
+    }
+    if (route_split) {
+        init_flash_route_split(FP.route_split, fabrs, MP);
+        if (two) init_flash_route_split(FP2.route_split, fabrs2, MP);
+    }
+#endif
     u64 ls0b = 1;
     DraftPrefill DQ;
     g6::FabricDev fd{};
@@ -737,6 +1093,10 @@ int main(int argc, char** argv)
         fd = fabd.dev();
         G6RT_CK(cudaHostAlloc((void**)&in_d, sizeof(StepIn), cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
+#if G6_MODEL_FLASH
+        build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MX);   // Flash draft prefill: decode draft steps (flash_prefill.cuh)
+        D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
+#else
         if (mtp_split) { D.d.qs.mode = 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // G6_MTP_SPLIT: eh_proj, q_a / kv_a / idx, idx_q
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
         if (D.d.qs.on())
@@ -746,9 +1106,12 @@ int main(int argc, char** argv)
             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
         }
         build_draft_head_i4(D, dhead, st);
+        build_draft_head2(D, dhead2, st);
+        D.d.route_last = mtp_last;
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
+#endif
     }
     Dfl DF;                             // --dflash
     g6::Pack dpack;
@@ -771,13 +1134,17 @@ int main(int argc, char** argv)
             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
                         dhead.tpc, dhead.ks);
         if (dfl_body_i4_on) dfl_body_i4(DF, st);
+        if (dfl_alpha != 1.f && !DF.sel) die("G6_DFL_SEL_ALPHA needs the selector walk");
+        DF.sel_alpha = dfl_alpha;
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
     }
     // S2: below R on the CP binding. Session views on the pool, main and draft; today's graphs below
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
     int s2_below = 0;
-    if (s2mode)
+    std::unique_ptr<RtTier> rtt;       // G6_RT_STORE (rt_rows.cuh); null = off
+    int rt_rows = 0, rt_runs = 0;      // release: rows a session past R puts in one step, such sessions the slots cover
+    if (s2mode && !G6_MODEL_FLASH)
     {
 #if defined(G6_CP) && G6_CP
         if (!cp_on || !cp_R) die("S2: serving below R needs G6_CP on and G6_CP_R");
@@ -787,10 +1154,73 @@ int main(int argc, char** argv)
         die("S2: serving needs the CP binding (a G6_CP build)");
 #endif
         m.s2_below = D.d.s2_below = s2_below;
+        // G6_RT_STORE: on the main model's bindings before s2_init and any prepare copy their arguments
+        if (const char* rs = getenv("G6_RT_STORE"))
+        {
+            const int L = getenv("G6_RT_L") ? atoi(getenv("G6_RT_L")) : cp_R;
+            int S = getenv("G6_RT_POOL") ? atoi(getenv("G6_RT_POOL")) : 4096;
+            if (s2_below != cp_R) die("G6_RT_STORE needs G6_S2_BELOW = G6_CP_R (runs past R on the pool's page classes)");
+            char host[64] = "host";
+            gethostname(host, sizeof host - 1);
+            const std::string fmt = kv_format.empty() ? g6kv::NAME : kv_format;
+            const bool int4 = rt_fmt_int4();
+            const std::string tag = "R" + std::to_string(cp_R) + "-L" + std::to_string(L) + "-nr" + std::to_string(g6nr::NR) + "-" + fmt +
+                                    rt_fmt_name(int4) + "-" + rt_name_part(set_id);
+            const std::string layout = "R=" + std::to_string(cp_R) + " L=" + std::to_string(L) + " nr=" + std::to_string(g6nr::NR) + " row=" +
+                                       g6kv::NAME + rt_fmt_layout(int4) + " model=" + rt_name_part(set_id) + " pages=" +
+                                       std::to_string(m.layers[0].ab.args.page_count) + " layers=" + std::to_string(m.nl);
+            if (set_id.empty() && R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE without --set-id: the lease names no model set\n");
+            // release: a session's owned tail pages sum to at most the drafter class (the pages past place) over nr,
+            // plus one partial page each
+            int ids = 0;
+            if (rt_win)
+            {
+                const G6Attn& a0 = m.layers[0].ab.args;
+                // place as every rank computes it (the tail split differs by a page between ranks): the ids, and so the
+                // pool's digest, must agree
+                const int rp = cp_R / 64, fair = rp + (a0.table_size - rp) / g6nr::NR, place = m.cp.phys ? std::min(fair, m.cp.phys) : fair;
+                ids = (a0.table_size - place + g6nr::NR - 1) / g6nr::NR + s2sess;
+                const int need = 2 * ((MP + 63) / 64 + g6nr::NR - 1) / g6nr::NR + 2;   // a two-lane quantum's pages per rank, its partial ones, a decode page
+                if (rt_win < need) die("G6_RT_LOCAL " + std::to_string(rt_win) + ": a prefill quantum of --prefill " + std::to_string(MP) +
+                                         " rows needs at least " + std::to_string(need) + " window pages");
+                if (rp + rt_win > place) die("G6_RT_LOCAL: the window does not fit the main model's pages past the prefix");
+                // the slot pool: only sessions past R read released rows, each at most rt_rows rows a step (an MTP
+                // verify, a DFlash2 verify, or a prompt chunk), and the window layout holds at most rt_runs of them
+                // below place. Every row of theirs a step selects needs a slot: 2048 x rt_rows x rt_runs. A smaller
+                // G6_RT_POOL lowers rt_runs, and the pool then admits fewer sessions past R at once
+                rt_rows = std::min<int>(MX, std::max({mtp + 1, dfl ? dfl::K + 1 : 0, plan.chunk}));   // DFlash2: its widest verify
+                rt_runs = std::min(s2sess, place / (rp + rt_win));
+                if (getenv("G6_RT_POOL")) rt_runs = std::min(rt_runs, S / (2048 * rt_rows));
+                else S = 2048 * rt_rows * rt_runs;
+                if (rt_runs < 1) die("G6_RT_POOL " + std::to_string(S) + ": less than one session past R (2048 x " + std::to_string(rt_rows) + " rows)");
+                if (R == 0)
+                    fprintf(stderr, "# rank 0: G6_RT_LOCAL slot pool %d = 2048 x %d rows a session x %d sessions past R at once (place %d, %d prefix + "
+                                    "%d window pages each)\n", S, rt_rows, rt_runs, place, rp, rt_win);
+            }
+            rtt = rt_build(m, rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag + (rt_win ? "-rel" : ""),
+                           layout + (rt_win ? " released" : ""), L, S, rt_win, ids, rt_win ? rt_rows : 1, false, int4,
+                           getenv("G6_RT_CHECK") && atoi(getenv("G6_RT_CHECK")), st);
+        }
+        s2_init(m, s2sess, st);
+        s2_init(D.d, s2sess, st);
+        if (rtt && rtt->local)
+        {
+            m.s2->rt_window = D.d.s2->rt_window = rtt->local;
+            RtTier* t = rtt.get();
+            m.s2->rt_tail = [t](const std::vector<int>& list) { return rt_tail_of(*t, list); };
+        }
+        m.s2on = D.d.s2on = false;
+    }
+#if G6_MODEL_FLASH
+    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (no S2 below R). The solo graphs below
+    // are captured with s2on off, the batched ones by s2/flash_native.cuh with s2on on
+    if (s2mode && s2sess > 1)
+    {
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
         m.s2on = D.d.s2on = false;
     }
+#endif
     u64 ls0 = 1;
     double pf_ms = 0;
     long pf_rows = 0;
@@ -801,13 +1231,116 @@ int main(int argc, char** argv)
     boot("prefill and draft built");
     for (int M : row_counts) prepare(m, M, st);
     for (int M : draft_rows) prepare(D.d, M, st);
+#if G6_MODEL_FLASH
+    if (mtp && MP) for (int M = 1; M <= MX; ++M) prepare(D.d, M, st);   // the draft prefill's MX-row chunks
+#endif
+    if (mtp && (l2pf::cfg().mtp & 2)) l2pf_set_front(D);   // before any capture: the head-merge tails read it
     G6RT_CK(cudaStreamSynchronize(st));
+    boot("layers prepared");
+    // Offline main-step dumps, compatible with m4sim after merging the rank logits.
+    // The callback only enqueues D2D copies, so it also works inside split graphs.
+    const bool rd_on = R == 0 && getenv("G6_RESID_DUMP");
+    const int rd_slots = 2 * NL + 1;
+#if G6_MODEL_FLASH
+    const int rd_hid = m.resid4 ? geom::HC * HID : HID;
+    const float* rd_source = m.resid4 ? m.resid4 : m.resid;
+#else
+    const int rd_hid = HID;
+    const float* rd_source = m.resid;
+#endif
+    float* rdump = rd_on ? dmalloc<float>((size_t)rd_slots * MX * rd_hid) : nullptr;
+    std::function<void(int,int)> residual_copy;
+    if (rd_on) residual_copy = [&](int slot, int M) {
+        G6RT_CK(cudaMemcpyAsync(rdump + (size_t)slot * MX * rd_hid, rd_source,
+                               (size_t)M * rd_hid * sizeof(float), cudaMemcpyDeviceToDevice, st));
+    };
+    FILE* rdf = rd_on ? fopen(getenv("G6_RESID_DUMP"), "wb") : nullptr;
+    if (rd_on && !rdf) die("G6_RESID_DUMP: cannot open the file");
+    FILE* ldump = nullptr;
+    auto dump_write = [&](FILE* f, const void* data, size_t bytes) {
+        if (fwrite(data, 1, bytes, f) != bytes) die("main-step dump: write failed");
+    };
+    if (const char* path = getenv("G6_LOGIT_DUMP")) {
+        const std::string name = std::string(path) + ".rank" + std::to_string(R);
+        ldump = fopen(name.c_str(), "wb");
+        if (!ldump) die("G6_LOGIT_DUMP: cannot open " + name);
+        // Versioned rank header: magic, NR, rank, vocab, first vocab row, vocab rows.
+        // bind::vocab_slice is contiguous and unrotated, including uneven TP widths.
+        dump_write(ldump, "G6LGR001", 8);
+        const int32_t hdr[] = {g6nr::NR, R, geom::VOCAB, m.vlo, m.vn};
+        dump_write(ldump, hdr, sizeof hdr);
+    }
+#if G6_MODEL_FLASH
+    // MTP first draft passes only, as m4sim: rank 0 writes G6_DRAFT_IN_DUMP; every
+    // rank writes its vocab slice to G6_DRAFT_LOGIT_DUMP.rank<R> in the G6_LOGIT_DUMP rank format (the step field is
+    // the first-pass counter), so tools/cp/merge_logits.py gives m4sim's draft logit framing.
+    FILE* didump = nullptr;
+    FILE* dldump = nullptr;
+    int dd_step = 0;
+    if ((getenv("G6_DRAFT_IN_DUMP") || getenv("G6_DRAFT_LOGIT_DUMP")) && (!mtp || s2mode))
+        die("G6_DRAFT_IN_DUMP / G6_DRAFT_LOGIT_DUMP need --mtp and no --serve");
+    if (const char* path = getenv("G6_DRAFT_IN_DUMP"); path && R == 0) {
+        didump = fopen(path, "wb");
+        if (!didump) die("G6_DRAFT_IN_DUMP: cannot open the file");
+    }
+    if (const char* path = getenv("G6_DRAFT_LOGIT_DUMP")) {
+        const std::string name = std::string(path) + ".rank" + std::to_string(R);
+        dldump = fopen(name.c_str(), "wb");
+        if (!dldump) die("G6_DRAFT_LOGIT_DUMP: cannot open " + name);
+        dump_write(dldump, "G6LGR001", 8);
+        const int32_t hdr[] = {g6nr::NR, R, geom::VOCAB, D.d.vlo, D.d.vn};
+        dump_write(dldump, hdr, sizeof hdr);
+    }
+    auto draft_dump = [&](const StepIn& di) {
+        const int M = di.M;
+        const int32_t hdr[] = {dd_step++, M};
+        if (didump) {
+            dump_write(didump, hdr, sizeof hdr);
+            dump_write(didump, di.pos, M * sizeof(int));
+            dump_write(didump, di.tok, M * sizeof(int));
+            std::vector<float> h((size_t)M * HID);
+            G6RT_CK(cudaMemcpy(h.data(), D.main_xn, h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            dump_write(didump, h.data(), h.size() * sizeof(float));
+            if (fflush(didump)) die("G6_DRAFT_IN_DUMP: flush failed");
+        }
+        if (dldump) {
+            dump_write(dldump, hdr, sizeof hdr);
+            std::vector<float> lg((size_t)M * D.d.vn);
+            G6RT_CK(cudaMemcpy(lg.data(), D.d.hlog, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            dump_write(dldump, lg.data(), lg.size() * sizeof(float));
+            if (fflush(dldump)) die("G6_DRAFT_LOGIT_DUMP: flush failed");
+        }
+    };
+#endif
+    const int dump_from = getenv("G6_LOGIT_DUMP_FROM") ? atoi(getenv("G6_LOGIT_DUMP_FROM")) : 0;
+    auto main_dump = [&](int s, int M) {
+        if (s < dump_from) return;
+        if (rdf) {
+            const int32_t hdr[] = {s, M, rd_slots, rd_hid};
+            dump_write(rdf, hdr, sizeof hdr);
+            std::vector<float> h((size_t)M * rd_hid);
+            for (int k = 0; k < rd_slots; ++k) {
+                G6RT_CK(cudaMemcpy(h.data(), rdump + (size_t)k * MX * rd_hid,
+                                  h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                dump_write(rdf, h.data(), h.size() * sizeof(float));
+            }
+            if (fflush(rdf)) die("G6_RESID_DUMP: flush failed");
+        }
+        if (ldump) {
+            const int32_t hdr[] = {s, M};
+            dump_write(ldump, hdr, sizeof hdr);
+            std::vector<float> h((size_t)M * m.vn);
+            G6RT_CK(cudaMemcpy(h.data(), m.hlog, h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            dump_write(ldump, h.data(), h.size() * sizeof(float));
+            if (fflush(ldump)) die("G6_LOGIT_DUMP: flush failed");
+        }
+    };
     cudaGraphExec_t exec[NBK][MX + 1] = {}, exec_d[NBK][2][MX + 1] = {};      // [context bucket][...]
     // DEC_GSPLIT: G6_DEC_SPLIT=ls (1..nl-1) captures the target step as two graphs, exec = step_in, embed, layers [0, ls) and
     // exec2 = the rest; launched back to back, the second graph's submission overlaps the first one's GPU time (0 = one graph)
     const int gsplit = getenv("G6_DEC_SPLIT") ? atoi(getenv("G6_DEC_SPLIT")) : 0;
     if (gsplit < 0 || gsplit >= NL || (gsplit && !graph)) die("G6_DEC_SPLIT must be 0..layers-1 and needs --graph");
-    if (s2mode && gsplit != 3) die("serving needs G6_DEC_SPLIT=3 (the production split3 graphs)");
+    if (s2mode && !G6_MODEL_FLASH && gsplit != 3) die("serving needs G6_DEC_SPLIT=3 (the production split3 graphs)");
     cudaGraphExec_t exec2[NBK][MX + 1] = {};
     auto launch_main = [&](int k, int M) {
         G6RT_CK(cudaGraphLaunch(exec[k][M], st));
@@ -832,10 +1365,10 @@ int main(int argc, char** argv)
             for (int M : row_counts)
                 if (gsplit)
                 {
-                    capture([&] { launch_step(m, M, 0, st, 0, gsplit); }, &exec[k][M], "split part A ", M);
-                    capture([&] { launch_step(m, M, 0, st, 1, gsplit); }, &exec2[k][M], "split part B ", M);
+                    capture([&] { launch_step(m, M, 0, st, 0, gsplit, residual_copy); }, &exec[k][M], "split part A ", M);
+                    capture([&] { launch_step(m, M, 0, st, 1, gsplit, residual_copy); }, &exec2[k][M], "split part B ", M);
                 }
-                else capture([&] { launch_step(m, M, 0, st); }, &exec[k][M], "", M);
+                else capture([&] { launch_step(m, M, 0, st, -1, 0, residual_copy); }, &exec[k][M], "", M);
         }
         if (mtp && D.d.nbk != m.nbk) die("draft and target context buckets differ");
         for (int k = 0; mtp && k < D.d.nbk; ++k)
@@ -890,6 +1423,34 @@ int main(int argc, char** argv)
     if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u%s\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed,
                       plan.rs ? ", spec-accept rejection" : "");
 
+#if G6_MODEL_FLASH
+    if (s2mode)
+    {
+        g6s2::BootstrapConfig bc;
+        auto& sc = bc.scheduler;
+        sc.epoch = s2epoch; sc.pool_rows = cap / 64 * 64;
+        sc.max_rows = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));   // a round of every session, a prompt chunk
+        sc.max_sessions = s2sess; sc.mtp = mtp; sc.prefill_rows = MP; sc.two_lanes = two;
+        bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
+        bc.directory = s2dir; bc.port = s2port;
+        bc.timeout = getenv("G6_S2_TIMEOUT") ? (unsigned)atoi(getenv("G6_S2_TIMEOUT")) : 120;
+        bc.runtime_signature = "flash solo cap " + std::to_string(cap) + " layers " + layers_s +
+            " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
+            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
+            (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string());
+        g6s2::FlashContext fc{m, D, FP, FP2, fab, fabd, fabp, fabp2, st, in, in_d, out, out_d,
+            [&](int k, int rows) {
+                g6s2::require(k >= 0 && k < m.nbk && rows > 0 && rows <= MX && exec[k][rows], "Flash main graph missing");
+                launch_main(k, rows);
+            },
+            [&](int k, bool chain, int rows) {
+                g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
+                G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
+            }, gsplit};
+        try { g6s2::serve_flash(fc, bc, plan.chunk); }
+        catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
+    }
+#else
     if (s2mode)
     {
         // S2 below R served loop. Pool: logical capacity = cap (a past-R request alone at base 0 reads the table as
@@ -897,8 +1458,10 @@ int main(int argc, char** argv)
         g6s2::Config sc;
         sc.epoch = s2epoch;
         sc.pool_rows = (uint32_t)(cap / 64 * 64);
-        // one step bounds: a round (every session's mtp + 1 rows) and a prompt chunk (sessions.h: chunk <= max_rows)
-        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>((uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk));
+        // one step bounds: a round (every session's mtp + 1 rows), a prompt chunk (sessions.h: chunk <= max_rows) and a
+        // DFlash2 verify (dfl_k + 1 rows)
+        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>({(uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk,
+                                                                  dfl ? (uint32_t)(dfl_k + 1) : 0u}));
         sc.max_sessions = (uint32_t)s2sess;
         sc.mtp = (uint32_t)mtp;
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the offline loop's cap rule
@@ -919,12 +1482,36 @@ int main(int argc, char** argv)
             sc.decode_rounds = (uint32_t)v;
         }
         sc.steering = steering_boot;
+        if (rtt && rtt->local) sc.window_pages = (uint32_t)rtt->local;   // a window run lists its worst case and the window
+        // G6_CP_STEP_ROWS (sized the CP fabric above) and G6_CP_STEP_SEG=1: Driver::step's rounds past R (cp_rows.h)
+        {
+            std::string ce;
+            const int seg = env_choice("G6_CP_STEP_SEG", 1, 0, &ce);
+            if (seg < 0) die(ce);
+            if (seg && !cp_step) die("G6_CP_STEP_SEG=1 needs G6_CP_STEP_ROWS");
+            sc.cp_step_rows = (uint32_t)cp_step;
+            sc.cp_seg = seg == 1;
+            sc.cp_after = g6s2::cp_after(m.bk, m.nbk, m.cp.on ? m.cp.R : -1);
+            if (cp_step && R == 0)
+                fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%d: a step past R (context > %llu) carries at most %d rows = %d sessions of %d%s; "
+                        "the CP fabric is sized for it\n", cp_step, (unsigned long long)sc.cp_after, cp_step, cp_step / (mtp + 1), mtp + 1,
+                        sc.cp_seg ? ", and no session below R (G6_CP_STEP_SEG)" : "");
+        }
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
         // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
         // drafter's tail copy above it — instead of the whole pool, and retained runs keep their pages through a long
         // turn. The stores' tail blocks (per_slot) come with --kv-store below.
         if (m.cp.on && s2_below == m.cp.R) pool.tail((uint32_t)g6nr::NR, 0);
+        if (rtt && rtt->local)
+        {
+            if (!pool.split()) die("G6_RT_LOCAL needs the pool's page classes (G6_S2_BELOW = G6_CP_R)");
+            // a tail waits until its records fit every rank's lease, a session past R until the slots cover it
+            pool.window((uint32_t)rtt->local, (uint32_t)rtt->V, (uint32_t)rt_runs);
+            if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL: a run past R holds %d prefix + %d window pages below place %d, its whole tail above "
+                                        "(%d pages: the longest tail one run can have, %d rows); %d record ids per rank\n", cp_R / 64, rtt->local, place,
+                                cap / 64 - place, (cap / 64 - place) * 64, rtt->V);
+        }
         int reuse_grid = 0;
         // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; G6_REUSE_ALIGN=0 drops it)
         // and NOEND (G6_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
@@ -944,11 +1531,9 @@ int main(int argc, char** argv)
         }
         // --kv-store: block stores below the pool, in flag order, the same number of blocks on every rank. An SSD store lives in
         // PATH/r<rank>; its system prefixes and the counts survive restarts (their index needs --set-id: the blocks belong to
-        // one model). --kv-keep sets each store's keep rule and policy (kvman-rs stash.rs Keep, Policy)
+        // one model). A store's keep=, else --kv-keep, sets its keep rule and policy (kvman-rs stash.rs Keep, Policy)
         std::unique_ptr<g6s2::KvTiers> kvt;
         bool kv_index = false;
-        const int kv_keep_rule = kv_keep == "system" ? 1 : 2;           // shared prefixes, or those and evicted runs
-        const uint32_t kv_min_hits = kv_keep == "sessions" ? 1 : 0;
         if (!kv_tiers.empty())
         {
             std::vector<const G6AttnBinding*> bs;
@@ -995,11 +1580,12 @@ int main(int argc, char** argv)
                         + " kv " + g6kv::NAME   // the latent row's layout (kvfmt.h); the FP8 row keeps the old key
 #endif
                         ;
-                    pool.add_tier(slots, kv_keep_rule, index, compat);
-                    pool.policy((uint32_t)i, 0, kv_min_hits, kvt->blocks().slot_bytes());
+                    const std::string& keep = t.rule.empty() ? kv_keep : t.rule;
+                    pool.add_tier(slots, keep == "system" ? 1 : 2, index, compat);   // shared prefixes, or those and evicted runs
+                    pool.policy((uint32_t)i, 0, keep == "sessions" ? 1 : 0, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();
-                    fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B%s\n", R, i, kvt->describe(i).c_str(),
-                            (unsigned long long)slots, kvt->blocks().slot_bytes(), index.empty() ? "" : ", indexed");
+                    fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B, keep %s%s\n", R, i, kvt->describe(i).c_str(),
+                            (unsigned long long)slots, kvt->blocks().slot_bytes(), keep.c_str(), index.empty() ? "" : ", indexed");
                 }
                 pool.write_limit((uint64_t)std::llround(kv_write_limit * 1000));
                 // a run past R keeps its tail: each rank's shard and the replicated parts (only when the pool's R is the CP
@@ -1008,7 +1594,7 @@ int main(int argc, char** argv)
             }
             catch (const std::exception& e) { die(std::string("--kv-store: ") + e.what()); }
             if (R == 0)
-                fprintf(stderr, "# s2 stores keep %s: a system prefix is stored after %d conversations%s\n", kv_keep.c_str(), kv_system_after,
+                fprintf(stderr, "# s2 stores: keep %s where a store sets none, a system prefix is stored after %d conversations%s\n", kv_keep.c_str(), kv_system_after,
                         kv_write_limit > 0 ? (", write limit " + std::to_string(kv_write_limit) + " blocks per page computed").c_str() : "");
         }
         // the copies the pool queued: run them before anything writes those pages, then commit what they wrote
@@ -1020,7 +1606,7 @@ int main(int argc, char** argv)
         // copies anything (default every one), as a drain stalled on its store would. Reproduces the rank skew the
         // barrier after a drain (NativeHooks::drained) has to absorb.
         int kv_delay_rank = -1, kv_delay_ms = 0, kv_delay_every = 1;
-        long kv_delay_n = 0;
+        long kv_delay_n = 0, kv_drain_n = 0;   // kv_drain_n: this rank's drains that copied anything (the same count on every rank)
         if (const char* e = getenv("G6_KV_DRAIN_DELAY"))
             if (sscanf(e, "%d:%d:%d", &kv_delay_rank, &kv_delay_ms, &kv_delay_every) < 2 || kv_delay_ms < 0 || kv_delay_every < 1)
                 die("G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]");
@@ -1056,6 +1642,7 @@ int main(int argc, char** argv)
         auto kv_drain = [&] {
             if (!kvt) return;
             const auto io = pool.io();
+            const long long kv_t0 = g6s2::s2_wall_ms();
             kvt->run(io, st);
             kv_log();
             if (!io.empty())
@@ -1069,8 +1656,9 @@ int main(int argc, char** argv)
                 }
                 size_t n[3] = {0, 0, 0};
                 for (const auto& x : io) ++n[x.kind];
-                fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s\n", R,
-                        n[0], n[1], n[2], kvt->last_ms, kvt->last_device_ms, (long long)g6s2::s2_wall_ms(), kvt->last_ms > 2000 ? " SLOW" : "");
+                fprintf(stderr, "# rank %d: s2 tier io: %zu spilled, %zu moved, %zu restored pages in %.1f ms (device %.1f ms) at %lld ms%s; drain %ld from %lld ms: %s\n", R,
+                        n[0], n[1], n[2], kvt->last_ms, kvt->last_device_ms, (long long)g6s2::s2_wall_ms(), kvt->last_ms > 2000 ? " SLOW" : "",
+                        ++kv_drain_n, kv_t0, kvt->last_io_text().c_str());
             }
             if (const char* e = pool.io_done()) fprintf(stderr, "# rank %d: s2 tier index: %s\n", R, e);
         };
@@ -1154,6 +1742,121 @@ int main(int argc, char** argv)
                 return c | p;
             },
             [&](unsigned long long step, int rows) { qsd_enqueue(step, rows); }};
+        // G6_RT_STORE: slot q's table as the attention reads it: the layers' own tables while it runs alone (solo), its
+        // slot table in batched steps
+        std::vector<int> rt_tab;
+        bool rt_told[g6s2::MAX_SESSIONS] = {};   // rank 0 described the session's first spill past L
+        auto rt_slot_map = [&](int q) -> const std::vector<int>& {
+            const S2Model& s = *m.s2;
+            const int* tab = m.s2on ? s.table[q] : m.layers[0].ab.args.block_table;
+            rt_tab.resize(m.s2on ? (size_t)s.table_cap : (size_t)m.layers[0].ab.args.table_size);
+            G6RT_CK(cudaMemcpy(rt_tab.data(), tab, rt_tab.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            return rt_tab;
+        };
+        auto rt_log = [&](const char* why, int q) {
+            if (R == 0) fprintf(stderr, "# rank 0: G6_RT_STORE %s slot %d: %llu rows spilled, %llu dropped pages, %llu fetched, %llu read locally (no slot)\n",
+                                why, q, (unsigned long long)rtt->spilled, (unsigned long long)rtt->dropped,
+                                (unsigned long long)rt_fetched(*rtt), (unsigned long long)rt_local(*rtt));
+            if (R == 0 && rtt->check) rt_check_print("spilled rows, rank 0", rtt->spill_ck);
+        };
+        if (rtt)
+        {
+            nx.before_main = [&](const StepIn& in, const S2In& h) {
+                static bool first = true;
+                if (R == 0 && first)
+                {
+                    first = false;
+                    fprintf(stderr, "# rank 0: G6_RT_STORE first main step: %d sessions, slot %d committed %d (%s), L %d\n", h.ns, h.sess[0],
+                            in.pos[h.row0[0]], m.s2on ? "batched" : "solo", rtt->L);
+                }
+                for (int j = 0; j < h.ns; ++j)
+                {
+                    const int q = h.sess[j], committed = in.pos[h.row0[j]];
+                    if (q < 0 || q >= m.s2->nslots || committed / 64 <= rtt->L / 64) continue;
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    const RtSpillSeen x = rt_spill(m, *rtt, rt_slot_map(q), committed, q, st);
+                    if (R == 0 && !rt_told[q])
+                    {
+                        rt_told[q] = true;
+                        fprintf(stderr, "# rank 0: G6_RT_STORE slot %d first spill (%s, committed %d, exclusive %d split %d): %d pages past L %d: %d spilled, "
+                                        "%d another rank's or none, %d past the pool, %d already stored\n", q, m.s2on ? "batched" : "solo", committed,
+                                (int)m.s2->exclusive[q], (int)m.s2->ex_split[q], x.pages, rtt->L, x.spilled, x.other, x.range, x.owned);
+                    }
+                }
+            };
+            // a later turn's prefill writes and reads the session's KV on the paths that read the local pages
+            nx.before_prefill = [&](const g6s2::Slot& sl, uint32_t, uint32_t) {
+                const int q = (int)sl.key.slot;
+                bool any = false;
+                for (int o : rtt->owner) any = any || o == q;
+                rt_drop_slot(*rtt, q, st);
+                if (any) rt_log("prefill of", q);
+            };
+        }
+        // G6_RT_LOCAL: slot q's tables with its tail entries (s2_cp_map reads them through S2Model::rt_tail): its slot
+        // table always (the batched steps), the layers' tables while they hold its run (its prefill, or it runs alone)
+        int rt_layers = -1;                // the slot whose run the layers' tables hold
+        std::array<uint32_t, g6s2::MAX_SESSIONS> rt_gen{};   // the generation of the session bound to each slot
+        int rt_pf = -1;                    // the slot of the prefill quantum in flight
+        int rt_ma = 0, rt_mb = 0;          // its rows on lane A and B
+        if (rtt && rtt->local)
+        {
+            const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+            rtt->write = [&, most](int q) {
+                const S2Model& s = *m.s2;
+                if (!s.ex_split[q]) return;
+                const std::vector<int> t = s2_cp_map(s, s.pool[0]->args, s.run[q], m.s2_below / 64, (size_t)s.table_cap);
+                G6RT_CK(g6h2d::copy(s.table[q], t.data(), t.size() * 4));
+                if (rt_layers == q) s2_solo_cp_pages(m, s.run[q], most);
+            };
+            nx.before_main = [&](const StepIn& in, const S2In& h) {
+                for (int j = 0; j < h.ns; ++j)
+                {
+                    const int q = h.sess[j];
+                    if (q < 0 || q >= m.s2->nslots || !rtt->seq[q].on) continue;
+                    if (!m.s2on) rt_layers = q;   // alone: the mode switch wrote its run into the layers' tables
+                    int end = 0;
+                    for (int r = h.row0[j]; r < h.row0[j] + h.rows[j]; ++r) end = std::max(end, in.pos[r] + 1);
+                    rt_spill(m, *rtt, {}, in.pos[h.row0[j]], q, st);
+                    rt_ensure(m, *rtt, q, end, st);
+                }
+            };
+            // the quantum writes rows first.. through the layers' tables, which begin_prefill rewrites right after this
+            nx.before_prefill = [&](const g6s2::Slot& sl, uint32_t first, uint32_t rows) {
+                const int q = (int)sl.key.slot;
+                // what the last quantum staged from the store: every quantum with G6_RT_CHECK, else every 8th that staged
+                static uint64_t pf_n = 0, pf_p0 = 0, pf_b0 = 0;
+                static double pf_t0 = 0;
+                if (R == 0 && rtt->pf_pages > pf_p0 && (rtt->hold || ++pf_n % 8 == 1))
+                    fprintf(stderr, "# rank 0: G6_RT_LOCAL prefill staging since the last line: %llu released pages a layer summed, %.3f GB read, "
+                                    "%.1f ms on the host; next quantum rows %u..\n", (unsigned long long)(rtt->pf_pages - pf_p0),
+                            (rtt->pf_bytes - pf_b0) / 1e9, rtt->pf_ms - pf_t0, first);
+                if (R == 0 && rtt->sel_layers)
+                {
+                    fprintf(stderr, "# rank 0: G6_RT_SELSTAT: %llu sampled layer fills selected %llu of %llu released rows (%.1f%%); next quantum rows %u..\n",
+                            (unsigned long long)rtt->sel_layers, (unsigned long long)rtt->sel_rows, (unsigned long long)rtt->sel_rel,
+                            100.0 * rtt->sel_rows / std::max<uint64_t>(1, rtt->sel_rel), first);
+                    rtt->sel_layers = rtt->sel_rows = rtt->sel_rel = 0;
+                }
+                if (rtt->pf_pages > pf_p0 && (rtt->hold || pf_n % 8 == 1)) { pf_p0 = rtt->pf_pages; pf_b0 = rtt->pf_bytes; pf_t0 = rtt->pf_ms; }
+                rt_layers = q;
+                rt_pf = rtt->seq[q].on ? q : -1;
+                if (rt_pf < 0) return;
+                rt_spill(m, *rtt, {}, (int)first, q, st);
+                rt_ensure(m, *rtt, q, (int)(first + rows), st);
+                rt_ma = std::min<int>((int)rows, MP); rt_mb = (int)rows - rt_ma;
+            };
+            // the real-fabric fill of a staged layer: the quantum's session's released pages, from the store
+            static const bool selstat = getenv("G6_RT_SELSTAT") && atoi(getenv("G6_RT_SELSTAT")) == 1;
+            m.cp.rt_stage = [&](int i, int start, char* pool_k, size_t ixoff, cudaStream_t s) {
+                if (rt_pf < 0) return;
+                rt_pf_stage(*rtt, rt_pf, i, start, {{pool_k, ixoff}}, s);
+                // G6_RT_SELSTAT: at each full-index layer's fill, the lanes' latest lists (the previous full-index
+                // layer's: G6_PF_OWN=2/4 keep them in idx_all) against the released rows below the quantum
+                if (selstat && m.layers[i].indexer && P.idx_all)
+                    rt_selstat(*rtt, {{P.idx_all, rt_ma}, {two ? P2.idx_all : nullptr, rt_mb}}, start / 64 * 64, s);
+            };
+        }
         try
         {
             g6s2::NativeDispatch nd(nx, sc);
@@ -1164,6 +1867,24 @@ int main(int argc, char** argv)
             h.pool.digest = [&] { return pool.digest(); };
             h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
             h.pool.fits = [&](uint64_t rows, uint64_t worst) { return pool.fits(rows, worst); };
+            if (rtt && rtt->local)
+                h.pool.refusal = [&](uint64_t worst) -> std::string {
+                    const auto v = pool.split_view(worst);
+                    if (!v) return "";
+                    const auto [lo, hi, lofree, hifree] = *v;
+                    std::string why = "it takes " + std::to_string(lo) + " pages below place (" + std::to_string(lofree) + " free) and its tail of " +
+                                      std::to_string(hi) + " above (" + std::to_string(hifree) + " free)";
+                    if (hi > (uint64_t)(cap / 64 - std::min(m.s2->pool_pages, D.d.s2->pool_pages))) why += ": the tail is longer than the drafter class, it never fits";
+                    if ((int)pool.window_runs() >= rt_runs)
+                        why += "; the slot pool covers " + std::to_string(rt_runs) + " session(s) past R at once (G6_RT_POOL), all in use";
+                    if (const auto iv = pool.ids_view(worst))
+                    {
+                        why += "; its tail needs " + std::to_string((*iv)[0]) + " records a rank, " + std::to_string((*iv)[1]) + " of the lease's " +
+                               std::to_string((*iv)[2]) + " are free";
+                        if ((*iv)[0] > (*iv)[2]) why += ": more than the lease holds (KV_ROWS size=), it never fits";
+                    }
+                    return why;
+                };
             h.pool.stats = [&] { return pool.stats(); };
             h.pool.runs = [&] { return pool.runs(); };
             // G6_S2_GROW=0: every run holds its worst case (prompt + max_tokens + guard) from admission, as before growth
@@ -1195,6 +1916,36 @@ int main(int argc, char** argv)
                     std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
                 }
                 const int q = (int)g.key.slot;
+                if (rtt && !rtt->local) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); rt_told[q] = false; }   // a new run's pages are local
+                // release: a split run's tail starts unmapped, cycling through its window (list[R/64 ..], kvman-rs Pool::window)
+                if (rtt && rtt->local)
+                {
+                    if (rt_layers == q) rt_layers = -1;
+                    rt_gen[q] = g.key.generation;
+                    // a hit on a retained window run takes its window pages, and its records come with them: from its
+                    // parked entry, or from its slot when its retirement is at this boundary and not bound yet (the
+                    // slot's own included), so it is found before anything ends that slot
+                    const bool ex = pool.exclusive_run(g.run);
+                    const std::vector<int> l = ex ? pool.list(g.run) : std::vector<int>{};
+                    const int rp = cp_R / 64;
+                    const std::vector<int> win = ex ? std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local) : std::vector<int>{};
+                    const int pk = ex && g.reuse ? rt_parked(*rtt, win) : -1;
+                    if (pk != q) rt_end(*rtt, q, st);
+                    // the runs the pool let go (evicted, or adopted only in part below R) free their records first. The
+                    // head's take already moved this grant's run out of the kept list, so its entry stays.
+                    rt_gc(*rtt, [&](const std::vector<int>& kl) { return (pk >= 0 && kl == rtt->seq[pk].list) || pool.is_kept(kl); }, st);
+                    if (ex)
+                    {
+                        if (pk >= 0)
+                        {
+                            rt_adopt(m, *rtt, pk, q, l, (int)g.reuse, st);
+                            if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL slot %d adopts a retained run's records at row %u\n", q, g.reuse);
+                        }
+                        else if (g.reuse > cp_R)   // every rank holds the same entries, so they all stop here alike
+                            die("G6_RT_LOCAL: a hit past R on a run whose records no slot or parked entry holds");
+                        else rt_begin(*rtt, q, win, l, st);
+                    }
+                }
                 slot_prompt[q] = g.req.prompt_tokens;
                 slot_whole[q] = dfl_reuse && g.reuse + 1 == g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
@@ -1235,7 +1986,10 @@ int main(int argc, char** argv)
             // table, and into the layers' own tables when q runs alone on today's path
             h.grown = [&](unsigned q, const g6s2::Run& r) {
                 kv_drain();   // runs the growth evicted, out before the zeroing below
+                if (rtt && rtt->local) rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
                 const std::vector<int> list = pool.list(r);
+                if (rtt && list.size() > m.s2->run[q].size())   // the new pages are cleared: none may stay flagged
+                    rt_drop(*rtt, std::vector<int>(list.begin() + m.s2->run[q].size(), list.end()), st);
                 for (Model* x : {&m, &D.d})
                 {
                     const std::vector<int> old = x->s2->run[q];
@@ -1246,7 +2000,44 @@ int main(int argc, char** argv)
                 }
                 G6RT_CK(cudaStreamSynchronize(st));
             };
-            h.retire = [&](const g6s2::Slot& old) { nd.retire(old); };
+            h.retire = [&](const g6s2::Slot& old) {
+                // a grant at the same boundary may have bound the slot again (or adopted its records) first: then the
+                // slot is that session's, and the retirement leaves it alone
+                if (rtt && rtt->local && rt_gen[old.key.slot] != old.key.generation)
+                {
+                    if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL retire of slot %u after its next grant: nothing to do\n", old.key.slot);
+                }
+                else if (rtt && rtt->local)   // a run with released pages parks its records
+                {
+                    const int q = (int)old.key.slot;
+                    const RtTier::Seq& sq = rtt->seq[q];
+                    if (R == 0 && sq.on)
+                        fprintf(stderr, "# rank 0: G6_RT_LOCAL retire of slot %d: %llu pages released, at most %d of %d window pages in use; all sessions: "
+                                        "%llu released, peak %d local tail pages; %llu rows fetched, %zu of %d record ids free\n", q,
+                                (unsigned long long)sq.released, sq.peak, sq.window, (unsigned long long)rtt->released, rtt->peak,
+                                (unsigned long long)rt_fetched(*rtt), rtt->vfree.size(), rtt->V);
+                    if (rtt->hold)
+                        fprintf(stderr, "# rank %d: G6_RT_CHECK: %llu released group pages read back, %llu differed\n", R,
+                                (unsigned long long)rtt->readback, (unsigned long long)rtt->readback_bad);
+                    // records park for the conversation's next turn whether or not the pool kept the run: on the head a
+                    // grant at this boundary has already taken it out of the kept list, on the workers it has not. The
+                    // next bind's rt_gc frees them if no grant adopts them.
+                    if (sq.on)
+                    {
+                        if (R == 0) fprintf(stderr, "# rank 0: G6_RT_LOCAL slot %d parks its records (kept by the pool: %d)\n", q, (int)pool.is_kept(m.s2->run[q]));
+                        rt_park(*rtt, q);
+                    }
+                    if (rtt->hold && rtt->stage_ck.rows)
+                    {
+                        rt_check_print(("staged prefill rows, rank " + std::to_string(R)).c_str(), rtt->stage_ck);
+                        fprintf(stderr, "# rank %d: G6_RT_CHECK: %llu staged pages under 10 dB or with a rope byte off\n", R, (unsigned long long)rtt->stage_bad);
+                    }
+                    rt_end(*rtt, q, st);
+                    if (rt_layers == q) rt_layers = -1;
+                }
+                else if (rtt) { rt_drop_slot(*rtt, (int)old.key.slot, st); rt_log("retire of", (int)old.key.slot); }   // retained runs stay local
+                nd.retire(old);
+            };
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
             h.dispatch = nd.hooks();
@@ -1281,6 +2072,15 @@ int main(int argc, char** argv)
                     h.dsel.d.draft_round = d[0]; h.dsel.m.draft_round = d[1]; h.dsel.m.draft_each = d[2];
                     if (R == 0) fprintf(stderr, "# spec: drafting ms from G6_SPEC_DRAFT: %s\n", e);
                 }
+                h.dsel.model = dsel_model;    // the table replaces the drafter choice's verify table and drafting ms above (Batch::dsel)
+                h.dsel.tab = dsel_tab;
+                if (R == 0 && dsel_model)
+                {
+                    fprintf(stderr, "# s2 drafter choice cost model %d: table %s\n", dsel_model, dsel_tab.str().c_str());
+                    if (getenv("G6_SPEC_TABLE") || getenv("G6_SPEC_DRAFT"))
+                        fprintf(stderr, "# note: the drafter choice reads the table's v1..v8, d, m, e, not G6_SPEC_TABLE / G6_SPEC_DRAFT; "
+                                        "G6_SPEC_TABLE still prices the DFlash2 rounds' own draft count\n");
+                }
                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe);
                 h.kstop = kstop;
@@ -1290,6 +2090,17 @@ int main(int argc, char** argv)
                                                std::to_string(kstop.tau[3])).c_str()
                                             : ("MTP estimates, seed3 " + std::to_string(kstop.seed3)).c_str(),
                             h.dsel.on ? "" : dfl_reuse ? "; the drafter choice is off: G6_DFL_REUSE warm-up rounds only" : "; the drafter choice is off, so no MTP rounds");
+                if (R == 0 && kstop.b.mode)
+                {
+                    std::string t, w;
+                    for (int S = 1; S <= s2sess; ++S)
+                        t += (S > 1 ? " " : "") + std::to_string(S) + ":" + std::to_string(kstop.b.tau[S][1]).substr(0, 5) + "," +
+                             std::to_string(kstop.b.tau[S][2]).substr(0, 5) + "," + std::to_string(kstop.b.tau[S][3]).substr(0, 5);
+                    for (int M : s2::kstopb_widths(kstop.b, s2sess, mtp)) w += (w.empty() ? "" : ",") + std::to_string(M);
+                    fprintf(stderr, "# s2 MTP shared-round stop: each session verifies %d..%d drafts, tau by sessions %s; main widths %s%s\n",
+                            kstop.b.kmin, mtp, t.c_str(), w.c_str(),
+                            kstop.b.explore ? (", explore every " + std::to_string(kstop.b.explore) + " rounds").c_str() : "");
+                }
                 h.dfl_reuse.mode = dfl_reuse;
                 h.dfl_reuse.min = dfl_reuse_min;
                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
@@ -1307,7 +2118,7 @@ int main(int argc, char** argv)
                         di.step = ++s2_dstep;
                         di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
                         *in_f = di;
-                        fabf.enqueue_step(di.step, dfl_fill_sizes());
+                        dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
                         G6RT_CK(cudaGraphLaunch(exec_f[2], st));
                         G6RT_CK(cudaStreamSynchronize(st));
                         g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
@@ -1333,7 +2144,7 @@ int main(int argc, char** argv)
                         const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
                         for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
                         *in_f = di;
-                        fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                        dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
                         ds = r.phase ? st_par[di.query ? 1 : 0] : st;
                         if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
                         if (r.phase) tl.par_pre(ds); else tl.pre(ds);
@@ -1354,6 +2165,23 @@ int main(int argc, char** argv)
                     return o;
                 };
             }
+            else if (kstop.mode || kstop.b.mode || kstop.log)
+            {   // MTP only (TP=6 / TP=3): the confidence stops of round_all (KStop::solo, KStopB) and their log (s2/service.h)
+                h.kstop = kstop;
+                if (R == 0 && kstop.mode)
+                    fprintf(stderr, "# s2 MTP confidence stop (MTP only): mode %d, a session alone verifies 1..%d drafts (tau %s,%s,%s)\n",
+                            kstop.mode, kstop.kmax, std::to_string(kstop.tau[1]).c_str(), std::to_string(kstop.tau[2]).c_str(),
+                            std::to_string(kstop.tau[3]).c_str());
+                if (R == 0 && kstop.b.mode)
+                {
+                    std::string t;
+                    for (int S = 1; S <= s2sess; ++S)
+                        t += (S > 1 ? " " : "") + std::to_string(S) + ":" + std::to_string(kstop.b.tau[S][1]).substr(0, 5) + "," +
+                             std::to_string(kstop.b.tau[S][2]).substr(0, 5) + "," + std::to_string(kstop.b.tau[S][3]).substr(0, 5);
+                    fprintf(stderr, "# s2 MTP shared-round stop (MTP only): each session verifies %d..%d drafts, tau by sessions %s\n",
+                            kstop.b.kmin, mtp, t.c_str());
+                }
+            }
             g6s2::BootstrapConfig bc;
             bc.scheduler = sc;
             bc.rank = (unsigned)R;
@@ -1362,6 +2190,8 @@ int main(int argc, char** argv)
             bc.head_ip = cfg.ips[0];
             bc.directory = s2dir;
             bc.port = (uint16_t)s2port;
+            if (g6_attn_ctx_sp() || g6_attn_posidx())   // round 10 E1 attention flags (attn.cu), read once before the bindings
+                fprintf(stderr, "# rank %d: decode attention E1: G6_ATTN_CTX3_SP %d G6_ATTN_POSIDX %d\n", R, g6_attn_ctx_sp(), g6_attn_posidx());
             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
@@ -1374,9 +2204,13 @@ int main(int argc, char** argv)
                 (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dfl_body_i4_on ? " dflbodyi4 1" : "");
-
+                (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
+                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
+                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
+                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -1395,7 +2229,7 @@ int main(int argc, char** argv)
             // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
             try
             {
-                nd.capture_all(sc.limit(), mtp, plan.chunk);
+                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step, kstop.solo ? kstop.kmax : 0);
                 m.dfl_tap = tap;
                 wcheck::seal(R);
                 int dev = 0;
@@ -1415,6 +2249,7 @@ int main(int argc, char** argv)
             exit(3);
         }
     }
+ #endif
     u64 step0 = 0, dstep = 0;
     MtpStats mtp_stats;
     int mtp_steps = 0;
@@ -1448,6 +2283,9 @@ int main(int argc, char** argv)
     boot("ready");
     for (size_t q = 0; !s2mode && q < plans.size(); ++q)   // offline: each --prompt once
     {
+#if G6_MODEL_FLASH
+        if (spec_reset_per_request) spec = spec_initial;
+#endif
         Plan sp = plans[q];
         // Never skip into a teacher-forced scoring tail (--pf-rows). Without tensor prefill, the decode prompt steps
         // start directly at skip.
@@ -1488,6 +2326,7 @@ int main(int argc, char** argv)
             if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
         }
         G6RT_CK(cudaStreamSynchronize(st));
+        if (q == 0) boot("first reset");
         printf("seq %zu prompt %zu tokens\n", q, p.prompt.size());
         if (reuse_prefix && R == 0)         // every miss with its reason (first / strict / no-lcp / short), counted by the gate
             fprintf(stderr, "# reuse seq %zu %s retained %d lcp %d history %zu prompt %zu written_end %d dirty_end %d\n", q, reuse.why, skip,
@@ -1497,6 +2336,7 @@ int main(int argc, char** argv)
         if (skip) printf("reuse rows 0..%d\n", skip - 1);  // real hit evidence (every rank), NOT a freshly computed hash
         for (int a = skip; a < p.first; a += MP)
         {
+#if !G6_MODEL_FLASH
             if (two && p.first - a > MP)         // two sub-batches as two lanes (prefill.cuh pf_step2)
             {
                 const int MA = MP, MB = p.first - a - MP < MP ? p.first - a - MP : MP;
@@ -1534,9 +2374,113 @@ int main(int argc, char** argv)
                 a += MP;
                 continue;
             }
+#endif
             const int M = p.first - a < MP ? p.first - a : MP;
             std::vector<int> pos(M);
             for (int r = 0; r < M; ++r) pos[r] = a + r;
+#if G6_MODEL_FLASH
+            {
+                pf_inputs_flash(FP, M, p.prompt.data() + a, pos.data());
+                pf_enqueue_flash(fabp, ls0, NL, M);
+                const int MB = two && p.first - a > MP ? std::min(MP, p.first - a - MP) : 0;
+                if (MB)
+                {
+                    std::vector<int> posB(MB);
+                    for (int r = 0; r < MB; ++r) posB[r] = a + M + r;
+                    pf_inputs_flash(FP2, MB, p.prompt.data() + a + M, posB.data());
+                    pf_enqueue_flash(fabp2, ls0b, NL, MB);
+                }
+                // G6_RESID_DUMP: one record per sub-batch (step field 0), every slot copied out as it is reached
+                std::function<void(int, int)> pf_copy;
+                std::vector<float> pf_h;
+                if (rdf)
+                {
+                    const int32_t hdr[] = {0, M, rd_slots, rd_hid};
+                    dump_write(rdf, hdr, sizeof hdr);
+                    pf_h.resize((size_t)M * rd_hid);
+                    pf_copy = [&](int, int Mr) {
+                        G6RT_CK(cudaStreamSynchronize(st));
+                        G6RT_CK(cudaMemcpy(pf_h.data(), FP.resid4, (size_t)Mr * rd_hid * sizeof(float), cudaMemcpyDeviceToHost));
+                        dump_write(rdf, pf_h.data(), pf_h.size() * sizeof(float));
+                    };
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                if (MB) pf_step2_flash(m, FP, FP2, M, MB, a + M, a + M + MB, ls0, ls0b, st);
+                else pf_step_flash(m, FP, M, a + M, ls0, st, pf_copy);
+                G6RT_CK(cudaStreamSynchronize(st));
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                ls0 += NL;
+                if (MB) ls0b += NL;
+                if (rdf && fflush(rdf)) die("G6_RESID_DUMP: flush failed");
+                if (pool_owner && (*fabix.dev().error || (MB && *fabix2.dev().error))) {
+                    fprintf(stderr, "g6m4: rank %d pool-ID fabric error %08x / %08x\n", R,
+                            *fabix.dev().error, MB ? *fabix2.dev().error : 0u); return 3;
+                }
+                if (route_split && (*fabrs.dev().error || (MB && *fabrs2.dev().error))) {
+                    fprintf(stderr, "g6m4: rank %d route-table fabric error %08x / %08x\n", R,
+                            *fabrs.dev().error, MB ? *fabrs2.dev().error : 0u); return 3;
+                }
+                if (MB && *fp2.error) { fprintf(stderr, "g6m4: rank %d second prefill lane fabric error %08x\n", R, *fp2.error); return 3; }
+                if (*fp.error) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x, seq %zu rows %d..\n", R, *fp.error, q, a); return 3; }
+                if (const unsigned ae = attn_errors(m)) { fprintf(stderr, "g6m4: rank %d attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
+                auto finish_lane = [&](FlashPrefill& FP, int M, int a) {
+                if (ldump && getenv("G6_PF_HEAD") && atoi(getenv("G6_PF_HEAD")) == 1)   // logit dump rows of the prefill (MX-row records, step 0: merge_logits.py needs >= 0)
+                    pf_head_flash(m, FP, M, st, [&](int r) {
+                        const int32_t hdr[] = {0, r};
+                        dump_write(ldump, hdr, sizeof hdr);
+                        std::vector<float> h((size_t)r * m.vn);
+                        G6RT_CK(cudaMemcpy(h.data(), m.hlog, h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        dump_write(ldump, h.data(), h.size() * sizeof(float));
+                        if (fflush(ldump)) die("G6_LOGIT_DUMP: flush failed");
+                    });
+                // G6_PF_HASH=1 (gate jobs that compare hashes): the resid hash (stream sync + D2H + CPU FNV of M x HID words)
+                static const bool pf_hash = getenv("G6_PF_HASH") && atoi(getenv("G6_PF_HASH")) == 1;
+                if (pf_hash) printf("prefill rows %d..%d resid %016llx\n", a, a + M - 1, pf_hash_flash(FP, M, st));
+                else printf("prefill rows %d..%d\n", a, a + M - 1);
+                if (mtp)
+                {
+                    const auto td = std::chrono::steady_clock::now();
+                    pf_draft_flash(D, FP, M, a, p.prompt.data() + a + 1, dstep, [&](const StepIn& di) {
+                        *in_d = di;
+                        // A draft-logit dump explicitly requests the otherwise unused prompt outputs.
+                        const bool cache_only = !dldump && (!getenv("G6_FLASH_DRAFT_KV") || atoi(getenv("G6_FLASH_DRAFT_KV")));
+                        if (cache_only)
+                        {
+                            pf_draft_cache_flash(D, di.M, di.context, st);
+                            G6RT_CK(cudaStreamSynchronize(st));
+                            if (const unsigned ae = attn_errors(D.d))
+                            {
+                                fprintf(stderr, "g6m4: rank %d draft cache error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a);
+                                exit(3);
+                            }
+                            draft_dump(di);
+                            return;
+                        }
+                        std::vector<uint32_t> sizes(3, (uint32_t)(di.M * HID * 2));
+                        sizes[2] = (uint32_t)glue::head_bytes(di.M, nc);
+                        fabd.enqueue_step(di.step, sizes);
+                        const int cur = D.d.cur;            // --graph: the attention replay of the context's bucket (not a captured graph:
+                        D.d.cur = bucket_of(D.d, di.context);   // those read the main model's own rows)
+                        launch_draft_step(D, di.M, di.context, false, st);
+                        D.d.cur = cur;
+                        G6RT_CK(cudaStreamSynchronize(st));
+                        if (*fd.error) { fprintf(stderr, "g6m4: rank %d draft fabric error word %08x, seq %zu prefill rows %d..\n", R, *fd.error, q, a); exit(3); }
+                        if (out_d->attn_err) { fprintf(stderr, "g6m4: rank %d draft attention error word %08x, seq %zu prefill rows %d..\n", R, out_d->attn_err, q, a); exit(3); }
+                        draft_dump(di);
+                    });
+                    fprintf(stderr, "# seq %zu prefill draft %d rows: %.3f ms\n", q, M,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count());
+                }
+                };
+                finish_lane(FP, M, a);
+                if (MB) finish_lane(FP2, MB, a + M);
+                fprintf(stderr, "# seq %zu prefill %d rows%s: %.3f ms (%.0f tok/s)\n", q, M + MB,
+                        MB ? " (two lanes)" : "", ms, (M + MB) * 1000.0 / ms);
+                if (q > 0 || a > 0) { pf_ms += ms; pf_rows += M + MB; }
+                if (MB) a += MP;
+                continue;
+            }
+#endif
             pf_inputs(P, M, p.prompt.data() + a, pos.data());
             pf_enqueue(fabp, P, ls0, NL, M);
             const auto t0 = std::chrono::steady_clock::now();
@@ -1560,6 +2504,19 @@ int main(int argc, char** argv)
             if (reuse_prefix) reuse.prefill_rows(a, M, mtp > 0);
             if (q > 0 || a > 0) { pf_ms += ms; pf_rows += M; }      // the very first sub-batch carries first-launch costs
         }
+#if G6_MODEL_FLASH
+        // Test-only: draft cache pages before the first live draft. Includes latent, raw key/gate and pooled keys.
+        if (const char* path = getenv("G6_FLASH_DRAFT_CACHE_DUMP"); path && mtp)
+        {
+            G6RT_CK(cudaStreamSynchronize(st));
+            const std::string name = std::string(path) + ".s" + std::to_string(q) + ".r" + std::to_string(R) + ".bin";
+            FILE* f = fopen(name.c_str(), "wb");
+            if (!f) die("G6_FLASH_DRAFT_CACHE_DUMP: cannot open " + name);
+            const size_t bytes = hdump_model(f, D.d, 'd', p.first);
+            if (fclose(f)) die("G6_FLASH_DRAFT_CACHE_DUMP: close failed " + name);
+            fprintf(stderr, "# draft cache dump seq %zu rank %d rows %d bytes %zu file %s\n", q, R, p.first, bytes, name.c_str());
+        }
+#endif
         if (hd.listed(q)) hdump_seq(hd, m, mtp ? &D.d : nullptr, q, R, p.first, st);   // reuse diag: rows [0, p.first)
         int dfl_lo = p.first;           // --dflash: the lowest position the drafter holds context for
         if (dfl && DF.pf_feat && DF.pf_hi > DF.pf_lo)
@@ -1572,7 +2529,7 @@ int main(int argc, char** argv)
                 di.step = ++dstep;
                 di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
                 *in_f = di;
-                fabf.enqueue_step(di.step, dfl_fill_sizes());
+                dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_f[2], st));
                 else dfl_fill_step(DF, st);
                 G6RT_CK(cudaStreamSynchronize(st));
@@ -1594,7 +2551,7 @@ int main(int argc, char** argv)
             qs_enqueue(si.step, M);
             const auto t0 = std::chrono::steady_clock::now();
             if (graph) launch_main(bucket_of(m, si.context), M);
-            else launch_step(m, M, si.context, st);
+            else launch_step(m, M, si.context, st, -1, 0, residual_copy);
             G6RT_CK(cudaStreamSynchronize(st));
             const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             evprof_read(M, st, R);
@@ -1602,6 +2559,11 @@ int main(int argc, char** argv)
             if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); exit(3); }
             const StepOut so = *out;
             if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
+#if G6_MODEL_FLASH
+            main_dump(s, mtp_rows(si, so, (int)p.prompt.size(), mtp > 0 && !p.rs));
+#else
+            main_dump(s, M);
+#endif
             if (reuse_prefix) reuse.main_rows(si.pos[0], M);
             if (rlf) route_log_line(rlf, m, layers, q, s, M, si.pos[0], p.prompt.size());
             std::string line;
@@ -1609,13 +2571,14 @@ int main(int argc, char** argv)
             printf("%s\n", line.c_str());
             if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
             fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, dt);
+            if (q == 0 && s == 0) boot("first token ready");
             return so;
         };
         if (dfl)
         {
             auto rf = [&](const DflIn& di, int s, double& ms) {
                 *in_f = di;
-                fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
                 const auto t0 = std::chrono::steady_clock::now();
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));
                 else dfl_step(DF, st, di.query);
@@ -1659,10 +2622,22 @@ int main(int argc, char** argv)
                 if (*fd.error) { fprintf(stderr, "g6m4: rank %d draft fabric error word %08x at seq %zu step %d\n", R, *fd.error, q, s); exit(3); }
                 const StepOut so = *out_d;
                 if (so.attn_err) { fprintf(stderr, "g6m4: rank %d draft attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
+#if G6_MODEL_FLASH
+                if (!chain) draft_dump(di);
+#endif
                 std::string line;
                 if (reuse_prefix) reuse.draft_rows(di.pos[0], M, chain);
                 const int t = step_line(D.d, so, s, M, line);
                 printf("%s%s\n", chain ? "chain" : "draft", line.c_str() + 4);
+#if G6_MODEL_FLASH
+                if (top > 0)                // --top K: the draft head's top-K per row, as "dtop" (first form) / "ctop" (chain) lines
+                {
+                    std::string tl;
+                    top_lines(D.d, s, M, top, tl);
+                    for (size_t i = 0; (i = tl.find("top ", i)) != std::string::npos; i += 5) tl.replace(i, 4, chain ? "ctop " : "dtop ");
+                    fputs(tl.c_str(), stdout);
+                }
+#endif
                 fprintf(stderr, "# seq %zu %s %d M %d: %.3f ms\n", q, chain ? "chain" : "draft", s, M, dt);
                 return DraftOut{t, so.lp[M - 1]};
             };
@@ -1688,7 +2663,7 @@ int main(int argc, char** argv)
             dec_prof().M = M; dec_prof().last = 0;
             const auto t0 = std::chrono::steady_clock::now();
             if (graph) launch_main(bucket_of(m, in->context), M);
-            else launch_step(m, M, in->context, st);
+            else launch_step(m, M, in->context, st, -1, 0, residual_copy);
             G6RT_CK(cudaStreamSynchronize(st));
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             evprof_read(M, st, R);
@@ -1699,14 +2674,32 @@ int main(int argc, char** argv)
             if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); return 3; }
             std::string line;
             if (reuse_prefix) reuse.main_rows(in->pos[0], M);
+            main_dump(s, M);
+            if (rlf) route_log_line(rlf, m, layers, q, s, M, in->pos[0], p.prompt.size());
             last_tok = step_line(m, so, s, M, line);
             printf("%s\n", line.c_str());
             if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
             if (s >= PS - 1) gen.push_back(last_tok);
             fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, ms);
+            if (q == 0 && s == 0) boot("first token ready");
             if (s >= PS + 2) t1.push_back(ms);
         }
         step0 += NS;
+#if G6_MODEL_FLASH
+        if (const char* kd = getenv("G6_KDA_STATE_DUMP"); kd && m.kda_st.S)   // gates: KDA S + conv of every layer after the sequence
+        {
+            const std::string name = std::string(kd) + ".rank" + std::to_string(R);
+            FILE* kf = fopen(name.c_str(), "wb");
+            if (!kf) die("G6_KDA_STATE_DUMP: cannot open " + name);
+            std::vector<float> h(kda::N_KDA * m.kda_st.s_layer());
+            G6RT_CK(cudaMemcpy(h.data(), m.kda_st.S, h.size() * 4, cudaMemcpyDeviceToHost));
+            dump_write(kf, h.data(), h.size() * 4);
+            h.resize(kda::N_KDA * m.kda_st.c_layer());
+            G6RT_CK(cudaMemcpy(h.data(), m.kda_st.conv, h.size() * 4, cudaMemcpyDeviceToHost));
+            dump_write(kf, h.data(), h.size() * 4);
+            fclose(kf);
+        }
+#endif
         if (reuse_prefix) reuse.finish(p.prompt, gen, (int)gen.size(), false);
         printf("generated");
         for (int t : gen) printf(" %d", t);
@@ -1731,6 +2724,32 @@ int main(int argc, char** argv)
         if (dfl) { fabf.wait_proxy_idle(); fabf.stop_proxy(); }
     }
     if (nc && !mtp) fprintf(stderr, "# rank %d: top_p misses %u\n", R, topp_misses(m));
+#if G6_MODEL_FLASH
+    if (pool_owner) {
+        bool ok = fabix.wait_proxy_idle();
+        if (two) ok = fabix2.wait_proxy_idle() && ok;
+        fabix.stop_proxy();
+        if (two) fabix2.stop_proxy();
+        if (!ok || *fabix.dev().error || (two && *fabix2.dev().error)) {
+            fprintf(stderr, "g6m4: rank %d pool-ID fabric drain failed\n", R); return 3;
+        }
+        release_flash_pool_transport(FP.pool_transport);
+        if (two) release_flash_pool_transport(FP2.pool_transport);
+    }
+#endif
+#if G6_MODEL_FLASH
+    if (route_split) {
+        bool ok = fabrs.wait_proxy_idle();
+        if (two) ok = fabrs2.wait_proxy_idle() && ok;
+        fabrs.stop_proxy();
+        if (two) fabrs2.stop_proxy();
+        if (!ok || *fabrs.dev().error || (two && *fabrs2.dev().error)) {
+            fprintf(stderr, "g6m4: rank %d route-table fabric drain failed\n", R); return 3;
+        }
+        release_flash_route_split(FP.route_split);
+        if (two) release_flash_route_split(FP2.route_split);
+    }
+#endif
     if (two) { fabp2.wait_proxy_idle(); fabp2.stop_proxy(); }
     if (MP) { fabp.wait_proxy_idle(); fabp.stop_proxy(); }
 #if G6_NR == 4
@@ -1751,7 +2770,20 @@ int main(int argc, char** argv)
         if (cp_pf_net(m).verify) printf("# rank %d: G6_CP_PF_VERIFY staged-page hash mismatches %llu\n", R, cp_pf_mismatches(m));
     }
 #endif
+#if G6_MODEL_FLASH
+    if (pf_prof().on) flash_pf_prof().print("this rank,");
+    pf_xt_dump(FP, R);
+    if (two) { fprintf(stderr, "# PXT second lane\n"); pf_xt_dump(FP2, R); }
+#else
     if (pf_prof().on) pf_prof().print("this rank,");
+#endif
+    if (rdf && fclose(rdf)) die("G6_RESID_DUMP: close failed");
+    if (ldump && fclose(ldump)) die("G6_LOGIT_DUMP: close failed");
+#if G6_MODEL_FLASH
+    if (didump && fclose(didump)) die("G6_DRAFT_IN_DUMP: close failed");
+    if (dldump && fclose(dldump)) die("G6_DRAFT_LOGIT_DUMP: close failed");
+#endif
+    if (rdump) G6RT_CK(cudaFree(rdump));
     if (rlf) fclose(rlf);
     if (getenv("G6_DEC_PROF")) { char tag[32]; snprintf(tag, sizeof tag, "rank %d", R); dp_print(tag, "synchronized", dec_prof().t, dec_prof().steps); }
     if (fabdg_on) { fabdg.wait_proxy_idle(); fabdg.stop_proxy(); }

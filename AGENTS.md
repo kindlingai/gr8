@@ -57,7 +57,8 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
 | the rank health probe | anywhere | `python3 -m unittest discover tools/health` |
 | the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |
-| a rank image planned from the release (`--v2-dense`) against an independent derivation | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py` |
+| a rank image planned from the release (`--v2-dense`) against an independent derivation, from the formulas or a layout file | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py`, with `--layout FILE` for a layout |
+| the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved | anywhere | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
 | m4sim from the release against a PyTorch forward of the same weights | one GB10, transformers with `glm_moe_dsa` | `engine/ref/release_forward.py` |
 | the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`) | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
 | the launch end to end (four supervisors, stub engines) | Linux (it needs 127.0.0.2-4) | the line above runs it, and skips it elsewhere |
@@ -70,12 +71,10 @@ the PR says which and why a tolerance is safe.
 `./gr8 glm53 up` is how the cluster starts: the same command on every box, which starts that box's supervisor
 (`tools/launch/`). The supervisors find each other (`--peers`, or the mentat group), compare their options, model set
 and engine build, and each starts its own rank; `status`, `logs` and `down` work from any box (README, "Running it").
-The engine command line lives in `scripts/engine_args.sh`. The supervisor and the deprecated ssh launchers
-(`./gr8 glm53 --ssh up`) both build it from there, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
+The engine command line lives in `scripts/engine_args.sh`, which the supervisor reads, so change it there. Every knob in [KNOBS.md](KNOBS.md) is a flag and a config key.
 
 S2 is the only served path. `scripts/build.sh` builds every TP with DEC_S2, which g6m4 needs. `g6m4 --serve` serves up
-to `SESS` requests at once, and at TP=4 the DFlash2 drafter for a request that runs alone (TP=3 and TP=6 are MTP only).
-`scripts/launch_tp4.sh`, `launch_tp3.sh` and `launch_tp6.sh` run `scripts/launch_s2.sh` with four, three or six ranks.
+to `SESS` requests at once, and at TP=4 (and TP=6 with `DFLASH=1`, the drafter's body replicated) the DFlash2 drafter for a request that runs alone (TP=3 is MTP only).
 A change to decode, prefill or the scheduler is measured under S2. Its output must stay byte-identical to the build
 before it for the same requests in the same order, alone and sharing steps (m4sim prints every session's lines, so
 compare its stdout between the two builds). Sharing steps can change a request's output against its solo run, so
@@ -102,10 +101,9 @@ The light gates, on the target topology:
         --kl-ref bench/gate/refs/tp4.json --health $G6_HOME/out/rank_health.json
     python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp4.json
 
-`--health` wants the rank health probe's result for this boot. `./gr8 glm53 --ssh up` at TP=6 writes it. Otherwise
-run `scripts/rank_health.sh` before `./gr8 glm53 up` (the probe refuses a box with a model booted). The probe is still
-the ssh launchers' tool, at every TP: it needs `config/cluster.env` with `HOSTS`, `IPS`, `IPS2`, `G6_HOME` and
-`PROXY_CPU`, and passwordless ssh from the head to every box. Without them, `gate.py run --no-health` runs, but its
+`--health` wants the rank health probe's result for this boot: run `scripts/rank_health.sh` with `./gr8`'s options
+before `./gr8 glm53 up` (the probe refuses a box with a model booted). It needs `PEERS`, `IPS` and `IPS2` set, and
+passwordless ssh from the head to every box. Without them, `gate.py run --no-health` runs, but its
 records do not count for `baseline` or `check`.
 
 `./gr8 glm53 bench --tag <name>` runs pbench alone. Numbers for the README come from RigMark 1.0.0 at `reasoning_effort`

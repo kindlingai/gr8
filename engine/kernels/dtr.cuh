@@ -62,7 +62,7 @@ struct Args
     float* part = nullptr;            // [N/128][matrices][ks][M][128] fp32 partials
     int* cnt = nullptr;               // [N/128] arrivals per output block, zero between launches
     void* y = nullptr;                // EPI_OUT: [M][ldy] of odt
-    int ldy = 0, odt = O_F16;
+    int ldy = 0, odt = O_F16, nb_fast = 1;
     const __half* suh_d = nullptr;    // EPI_GLU: down's input-side vector [N]
     u32* xd = nullptr;                // EPI_GLU: down's input fragment tables [ceil(M/8)][N/16][32][2]
 #ifdef DEC_SLOT
@@ -78,39 +78,67 @@ __device__ __forceinline__ void ld4h(const __half* p, float (&v)[4])
 }
 
 template <int NT, int SUB, bool ROT, int EPI>
-__global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
+__global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_dtr(Args a)
 {
-    constexpr int TB = 32 * BITS, NM = EPI == EPI_GLU ? 2 : 1, NW = 8 * SUB;
+    constexpr int TB = 32 * BITS, NM = EPI == EPI_GLU ? 2 : 1, NW = 8 * SUB, DTR_UNR = 8;
     extern __shared__ __align__(16) u32 sm[];
-    __shared__ int last;
+    const int nblk = a.N >> 7;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, j = warp & 7, q = warp >> 3;
-    const int p = blockIdx.x % a.ks, mat = NM == 2 ? (blockIdx.x / a.ks) & 1 : 0, nb = blockIdx.x / (a.ks * NM);
+    const bool nb_fast = (NM == 1) && (a.nb_fast != 0);
+    const int nb = nb_fast ? ((nblk == 32) ? (blockIdx.x & 31) : ((nblk == 64) ? (blockIdx.x & 63) : (blockIdx.x % nblk)))
+                           : (blockIdx.x / (a.ks * NM));
+    const int p  = nb_fast ? ((nblk == 32) ? (blockIdx.x >> 5) : ((nblk == 64) ? (blockIdx.x >> 6) : (blockIdx.x / nblk)))
+                           : (blockIdx.x % a.ks);
+    const int mat = NM == 2 ? (blockIdx.x / a.ks) & 1 : 0;
     const int K16 = a.K / 16, sc = K16 / a.ks, sw = sc / SUB, s0c = p * sc, s0 = s0c + q * sw;
+    const int g0 = s0 >> 3, ng = sw >> 3;
     const uint8_t* wb = a.w[mat] + nb * a.sB + j * TB;
-    auto tile = [&](int s) { return wb + (s >> 3) * a.sG + (s & 7) * 8 * TB; };
+    const uint8_t* gb = wb + g0 * a.sG;
     Tr3Lane<BITS, true> ld;
     ld.init(lane);
-    // the first weight bytes are requested before the prologue, so their DRAM latency overlaps it
-    u32 na[UNR];
+    // the first 8-tile group is requested before the prologue, so its DRAM latency overlaps it
+    u32 na[DTR_UNR];
     #pragma unroll
-    for (int u = 0; u < UNR; ++u) na[u] = u < sw ? ld.loadw(tile(s0 + u), lane) : 0u;
+    for (int u = 0; u < DTR_UNR; ++u) na[u] = ld.loadw(gb + u * (8 * TB), lane);
 
     const int tabw = ROT ? NT * sc * 64 : 0;          // u32 of the prologue's fragment tables
     if constexpr (ROT)
     {
-        // xa = f16(H128(x * suh)) for k = 16 s0c .. 16 (s0c + sc), task = (row, 128 block), one warp each. Rows >= M of a
-        // tile stay unwritten: an mma output column depends only on its own row's column.
+        // xa = f16(H128(x * suh)) for k = 16 s0c .. 16 (s0c + sc). Reuse suh across rows m of the same 128-block.
         const __half* suh = a.suh[mat];
-        const int ntask = a.M * (sc / 8);
-        for (int t = warp; t < ntask; t += NW)
+        const int nblk_k = sc >> 3;
+        if (nblk_k >= NW)
         {
-            const int m = t % a.M, blk = t / a.M, k = s0c * 16 + blk * 128 + lane * 4;
-            float x[4], s[4];
-            ld4h(a.x + static_cast<size_t>(m) * a.ldx + k, x);
-            ld4h(suh + k, s);
-            float v[4] = {x[0] * s[0], x[1] * s[1], x[2] * s[2], x[3] * s[3]};
-            had128(v, lane);
-            store_frag_row(sm + (m >> 3) * sc * 64, blk * 8, m & 7, lane, v);
+            for (int blk = warp; blk < nblk_k; blk += NW)
+            {
+                const int k = s0c * 16 + blk * 128 + lane * 4;
+                float s[4];
+                ld4h(suh + k, s);
+                for (int m = 0; m < a.M; ++m)
+                {
+                    float x[4];
+                    ld4h(a.x + static_cast<size_t>(m) * a.ldx + k, x);
+                    float v[4] = {x[0] * s[0], x[1] * s[1], x[2] * s[2], x[3] * s[3]};
+                    had128(v, lane);
+                    store_frag_row(sm + (m >> 3) * sc * 64, blk * 8, m & 7, lane, v);
+                }
+            }
+        }
+        else
+        {
+            const int ntask = a.M * nblk_k;
+            for (int t = warp; t < ntask; t += NW)
+            {
+                const int m = (a.M == 1) ? 0 : ((a.M == 4) ? (t & 3) : (t % a.M));
+                const int blk = (a.M == 1) ? t : ((a.M == 4) ? (t >> 2) : (t / a.M));
+                const int k = s0c * 16 + blk * 128 + lane * 4;
+                float x[4], s[4];
+                ld4h(a.x + static_cast<size_t>(m) * a.ldx + k, x);
+                ld4h(suh + k, s);
+                float v[4] = {x[0] * s[0], x[1] * s[1], x[2] * s[2], x[3] * s[3]};
+                had128(v, lane);
+                store_frag_row(sm + (m >> 3) * sc * 64, blk * 8, m & 7, lane, v);
+            }
         }
         __syncthreads();
     }
@@ -120,29 +148,49 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
     float acc[NT][4];
     #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
-    for (int s = 0; s < sw; s += UNR)
+    if (ng == 1)
     {
-        u32 wa[UNR];
         #pragma unroll
-        for (int u = 0; u < UNR; ++u) wa[u] = na[u];
-        #pragma unroll
-        for (int u = 0; u < UNR; ++u)
-            if (s + UNR + u < sw) na[u] = ld.loadw(tile(s0 + s + UNR + u), lane);
-        #pragma unroll
-        for (int u = 0; u < UNR; ++u)
+        for (int u = 0; u < DTR_UNR; ++u)
         {
-            if (s + u >= sw) break;
             u32 f0[2], f1[2];
-            ld.decodew(wa[u], f0, f1);
+            ld.decodew(na[u], f0, f1);
             #pragma unroll
             for (int t = 0; t < NT; ++t)
             {
-                const u32* xg = xb + t * xts + (s + u) * 64;
-                u32 b0, b1;
-                if (ROT) { b0 = xg[0]; b1 = xg[1]; }
-                else { b0 = __ldcg(xg); b1 = __ldcg(xg + 1); }
-                mma16816(acc[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                const u32* xg = xb + t * xts + u * 64;
+                const uint2 b = ROT ? *reinterpret_cast<const uint2*>(xg) : __ldg(reinterpret_cast<const uint2*>(xg));
+                mma16816(acc[t], f0[0], f1[0], f0[1], f1[1], b.x, b.y);
             }
+        }
+    }
+    else
+    {
+        for (int g = 0; g < ng; ++g)
+        {
+            u32 wa[DTR_UNR];
+            #pragma unroll
+            for (int u = 0; u < DTR_UNR; ++u) wa[u] = na[u];
+            if (g + 1 < ng)
+            {
+                gb += a.sG;
+                #pragma unroll
+                for (int u = 0; u < DTR_UNR; ++u) na[u] = ld.loadw(gb + u * (8 * TB), lane);
+            }
+            #pragma unroll
+            for (int u = 0; u < DTR_UNR; ++u)
+            {
+                u32 f0[2], f1[2];
+                ld.decodew(wa[u], f0, f1);
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    const u32* xg = xb + t * xts + u * 64;
+                    const uint2 b = ROT ? *reinterpret_cast<const uint2*>(xg) : __ldg(reinterpret_cast<const uint2*>(xg));
+                    mma16816(acc[t], f0[0], f1[0], f0[1], f1[1], b.x, b.y);
+                }
+            }
+            xb += DTR_UNR * 64;
         }
     }
 
@@ -180,18 +228,13 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
     const int arrivals = NM * a.ks;
     if (arrivals > 1) __threadfence();
     __syncthreads();
-    if (threadIdx.x == 0) last = arrivals == 1 || atomicAdd(a.cnt + nb, 1) == arrivals - 1;
+    int* last_p = reinterpret_cast<int*>(sm);
+    if (threadIdx.x == 0) *last_p = arrivals == 1 || atomicAdd(a.cnt + nb, 1) == arrivals - 1;
     __syncthreads();
 #if DEC_SLOT >= 2
     const bool pub = EPI == EPI_OUT && a.slot.send;
 #endif
-    if (!last)
-    {
-#if DEC_SLOT >= 2
-        if (pub) dslot::publish(a.slot, false);
-#endif
-        return;
-    }
+    if (!*last_p) return;
     if (arrivals > 1) __threadfence();
 #ifdef DEC_SLOT
     void* const yo = EPI == EPI_OUT && a.slot.send ? dslot::ptr(a.slot) : a.y;
@@ -205,6 +248,7 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
     auto sum = [&](int mt, int m, float (&v)[4]) {
         const float* pb = a.part + (static_cast<size_t>(nb) * NM + mt) * a.ks * M * 128 + m * 128 + lane * 4;
         v[0] = v[1] = v[2] = v[3] = 0.f;
+        #pragma unroll 4
         for (int r = 0; r < a.ks; ++r)
         {
             const float4 w = __ldcg(reinterpret_cast<const float4*>(pb + static_cast<size_t>(r) * M * 128));
@@ -216,9 +260,9 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
         if constexpr (EPI == EPI_OUT)
         {
             float v[4], s[4];
+            ld4h(a.svh[0] + n0, s);
             sum(0, m, v);
             had128(v, lane);
-            ld4h(a.svh[0] + n0, s);
             #pragma unroll
             for (int e = 0; e < 4; ++e) v[e] *= s[e];
             const size_t o = static_cast<size_t>(m) * a.ldy + n0;
@@ -233,24 +277,49 @@ __global__ void __launch_bounds__(256 * SUB) k_dtr(Args a)
             for (int mt = 0; mt < 2; ++mt)
             {
                 float s[4];
+                ld4h(a.svh[mt] + n0, s);
                 sum(mt, m, gu[mt]);
                 had128(gu[mt], lane);
-                ld4h(a.svh[mt] + n0, s);
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) gu[mt][e] = rnd_h(gu[mt][e] * s[e]);
             }
             float sd[4], v[4];
             ld4h(a.suh_d + n0, sd);
             #pragma unroll
-            for (int e = 0; e < 4; ++e) v[e] = rnd_h(silu_f(gu[0][e]) * gu[1][e]) * sd[e];
+            for (int e = 0; e < 4; ++e) v[e] = rnd_h(swiglu_f(gu[0][e], gu[1][e])) * sd[e];
             had128(v, lane);
             store_frag_row(a.xd + static_cast<size_t>(m >> 3) * (a.N / 16) * 64, nb * 8, m & 7, lane, v);
         }
     }
     if (arrivals > 1 && threadIdx.x == 0) a.cnt[nb] = 0;
 #if DEC_SLOT >= 2
-    if (pub) dslot::publish(a.slot, true);
+    if (pub) dslot::publish(a.slot, warp < M, nblk);
 #endif
+}
+
+// Pre-rotate x [M][ldx] * suh [K] with H128 into fragment table xa [ceil(M/8)][K/16][32][2].
+// Grid: (K / 128) / 8 CTAs of 256 threads (8 warps, 1 warp per 128-channel block).
+__global__ void __launch_bounds__(256) k_dtr_rot(const __half* x, int ldx, const __half* suh, u32* xa, int K, int M)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int blk = blockIdx.x * 8 + warp;
+    if (blk >= (K >> 7)) return;
+    const int k = blk * 128 + lane * 4, K16 = K >> 4;
+    float s[4];
+    ld4h(suh + k, s);
+    for (int m = 0; m < M; ++m)
+    {
+        float xv[4];
+        ld4h(x + static_cast<size_t>(m) * ldx + k, xv);
+        float v[4] = {xv[0] * s[0], xv[1] * s[1], xv[2] * s[2], xv[3] * s[3]};
+        had128(v, lane);
+        store_frag_row(xa + static_cast<size_t>(m >> 3) * K16 * 64, blk * 8, m & 7, lane, v);
+    }
+}
+inline void launch_rot(const __half* x, int ldx, const __half* suh, u32* xa, int K, int M, cudaStream_t st)
+{
+    if (x && suh && xa && K > 0 && M > 0)
+        k_dtr_rot<<<static_cast<unsigned>(((K >> 7) + 7) >> 3), 256, 0, st>>>(x, ldx, suh, xa, K, M);
 }
 
 // ------------------------------------------------------------------------------------------ binding
@@ -378,15 +447,43 @@ inline cudaError_t init()
 inline void split_for(int K, int side, int epi, int rot, int M, int& ks, int& sub)
 {
     ks = 4; sub = 1;
-    if (epi == EPI_GLU) { ks = 16; sub = M <= 3 ? 2 : 1; }                    // mlp gate + up, K 6144
-    else if (!rot) { ks = M <= 3 ? 24 : 12; sub = M <= 3 ? 1 : 2; }          // mlp down on the GLU's tables, K 3072
-    else if (side == SIDE_OUT && K == 2048) ks = 16;                         // q_b
-    else if (side == SIDE_OUT) ks = 6;                                       // gate or up alone, K 6144
-    else if (K >= 4096) ks = M == 1 ? 32 : 4;                                // o_proj
-    else ks = M <= 3 ? 24 : 3;                                               // down with its own rotation
+    if (epi == EPI_GLU) { ks = (K == 4096 && M <= 3) ? 32 : 16; sub = (K != 4096 && M <= 3) ? 2 : 1; }
+    else if (side == SIDE_OUT && K == geom::QA)
+    {
+        ks = geom::QA / 128;         // q_b (16 on GLM, 12 on Flash)
+        if (const char* eq = getenv("G6_DSA_QB_SPLIT"))
+        {
+            int k1 = ks, s1 = 1, k4 = ks, s4 = 1;
+            if (sscanf(eq, "%d,%d,%d,%d", &k1, &s1, &k4, &s4) >= 2) { ks = (M == 1) ? k1 : k4; sub = (M == 1) ? s1 : s4; }
+        }
+    }
+    else if (side == SIDE_IN && K == 8192 && geom::HID == 4096)
+    {
+        ks = 4;
+        if (const char* ed = getenv("G6_DSA_OPROJ_SPLIT"))
+        {
+            int k1 = 4, s1 = 1, k4 = 4, s4 = 1;
+            if (sscanf(ed, "%d,%d,%d,%d", &k1, &s1, &k4, &s4) >= 2) { ks = (M == 1) ? k1 : k4; sub = (M == 1) ? s1 : s4; }
+        }
+    }
+    else if (!rot) { ks = M <= 3 ? K / 128 : K / 256; sub = M <= 3 ? 1 : 2; }
+    else if (side == SIDE_OUT) ks = K % 3 == 0 ? 6 : 16;                     // gate/up alone (K 6144) or Flash KDA q/k/v (K 4096)
+    else if (K >= 4096)
+    {
+        ks = M == 1 ? (K == 8192 ? 4 : (geom::HID == 4096 ? 8 : 32)) : 4;
+        if (K == 4096 && geom::HID == 4096)
+        {
+            if (const char* eo = getenv("G6_KDA_OPROJ_SPLIT"))
+            {
+                int k1 = 8, s1 = 1, k4 = 4, s4 = 1;
+                if (sscanf(eo, "%d,%d,%d,%d", &k1, &s1, &k4, &s4) >= 2) { ks = (M == 1) ? k1 : k4; sub = (M == 1) ? s1 : s4; }
+            }
+        }
+    }
+    else ks = K % 3 == 0 ? (M <= 3 ? 24 : 3) : (M <= 3 ? 16 : 4);            // down with its own rotation or Flash TP4 KDA o_proj
 }
 
-// k parts and sub-parts (ks <= 0: split_for): ks is halved until the CTA's k range is whole 128 blocks per sub-part pair and fits SMEM_MAX
+// k parts and sub-parts (ks <= 0: split_for): ks is halved until the CTA's k range is whole 128 blocks per sub-part and fits SMEM_MAX
 inline const char* fill(Gemv& g, int nm, int M, int ks, int sub, int rot, const Scratch& sc, int cnt_off)
 {
     const int K16 = g.a.K / 16, NT = g6mx::tiles(M);
@@ -394,21 +491,31 @@ inline const char* fill(Gemv& g, int nm, int M, int ks, int sub, int rot, const 
     if (M < 1 || M > G6_MX) return "dense trellis GEMV: M must be 1..G6_MX";
     if (sub != 1 && sub != 2) return "dense trellis GEMV: sub must be 1 or 2";
     auto smem = [&](int k) { return static_cast<size_t>(rot ? NT * (K16 / k) * 256 : 0) + static_cast<size_t>(sub - 1) * 8 * NT * 32 * 16; };
-    auto fits = [&](int k) { return K16 % k == 0 && (K16 / k) % 8 == 0 && (K16 / k) % sub == 0 && smem(k) <= SMEM_MAX; };
-    while (ks > 1 && (K16 % ks || (K16 / ks) % 8 || (K16 / ks) % sub)) ks >>= 1;
-    while (smem(ks) > SMEM_MAX && ks * 2 <= K16 / 8 && K16 % (ks * 2) == 0) ks *= 2;
-    // TP3 shapes (K16 = 336 for 21 heads) at S2's rows may have no power-of-two split: take the smallest divisor that fits
-    for (int k = 1; !fits(ks) && k <= K16 / 8; ++k)
-        if (fits(k)) ks = k;
+    auto fits = [&](int k) { return K16 % k == 0 && (K16 / k) % (8 * sub) == 0 && smem(k) <= SMEM_MAX; };
+    const int ks0 = ks;
+    for (;;)
+    {
+        while (ks > 1 && (K16 % ks || (K16 / ks) % (8 * sub))) ks >>= 1;
+        while (smem(ks) > SMEM_MAX && ks * 2 <= K16 / (8 * sub) && K16 % (ks * 2) == 0) ks *= 2;
+        // TP3 shapes (K16 = 336 for 21 heads) at S2's rows may have no power-of-two split: take the smallest divisor that fits
+        for (int k = 1; !fits(ks) && k <= K16 / (8 * sub); ++k)
+            if (fits(k)) ks = k;
+        // an odd count of 128 blocks (TP5's 19-block dense ranks, K16 = 152) has no whole-block pair of sub-parts
+        if (fits(ks) || sub == 1) break;
+        sub = 1; ks = ks0;
+    }
     if (!fits(ks)) return "dense trellis GEMV: no k split fits this shape";
     const int nblk = g.a.N / 128;
     if (part_floats(g.a.N, nm, ks, M) > sc.part_n) return "dense trellis GEMV: scratch partials too small";
     if (cnt_off + nblk > sc.cnt_n) return "dense trellis GEMV: scratch counters too few";
+    static const int dtr_nbfast = !getenv("G6_DTR_NBFAST") || atoi(getenv("G6_DTR_NBFAST"));
+    static const int dtr_nbfast_out = !getenv("G6_DTR_NBFAST_OUT") || atoi(getenv("G6_DTR_NBFAST_OUT"));
     g.a.ks = ks; g.a.M = M;
+    g.a.nb_fast = (nm == 1 && (g.a.sG > g.a.sB ? dtr_nbfast : dtr_nbfast_out)) ? 1 : 0;
     g.a.part = sc.part; g.a.cnt = sc.cnt + cnt_off;
     g.nt = NT; g.sub = sub; g.rot = rot;
     g.grid = static_cast<unsigned>(nblk * nm * ks);
-    g.smem = smem(ks);
+    g.smem = smem(ks) < 16 ? 16 : smem(ks);
     g.on = 1;
     return nullptr;
 }

@@ -26,10 +26,10 @@ namespace glue {
 
 namespace cg = cooperative_groups;
 
-constexpr int VOCAB = 154880;
-constexpr int NEXP = 256, TOPK = 8, MMAX = G6_MX;   // MMAX: decode rows per step at most (8, or 32 under DEC_S2)
-constexpr float RMS_EPS = 1e-5f;
-constexpr float ROUTE_SCALE = 2.5f;
+constexpr int VOCAB = geom::VOCAB;
+constexpr int NEXP = geom::NEXP, TOPK = geom::TOPK, MMAX = G6_MX;   // MMAX: decode rows per step at most (8, or 32 under DEC_S2)
+constexpr float RMS_EPS = geom::RMS_EPS;
+constexpr float ROUTE_SCALE = geom::ROUTE_SCALE;
 constexpr double ROPE_THETA = 8000000.0;
 constexpr int ROPE_DIM = 64;
 
@@ -340,12 +340,13 @@ struct ArNormArgs
 #endif
 };
 
-#ifdef DEC_SLOT
 __device__ __forceinline__ u32 h2w_to_bf2(u32 w)
 {
     const float2 f = __half22float2(as_h2(w));
     return pack_bf2(f.x, f.y);
 }
+
+#ifdef DEC_SLOT
 // This thread's 8 normed halves o (columns col0..col0+7, col0 % 8 == 0) of row m -> fragment table words
 // [((ks * 32 + m * 4 + c) * 2 + r)], ks = col0 / 16, r = col0 / 8 % 2: threads 2j (r = 0) and 2j+1 (r = 1) hold the two
 // halves of one k16 step and swap words, then store the two 16-byte quads k_xfrag stores. Rows 8 t .. 8 t + 7 are the
@@ -442,7 +443,9 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
 // grid M, block 256. in row m at in + m*ld_in, width <= 4096. fp32 math, fixed order.
 template <typename TIn>
 __global__ void __launch_bounds__(256) k_rmsnorm_rows(const TIn* in, int ld_in, int width, const __nv_bfloat16* w,
-                                                      float eps, __half* out, int ld_out)
+                                                      float eps, __half* out, int ld_out,
+                                                      u32* xf16 = nullptr, u32* xbf16 = nullptr,
+                                                      const __half* suh_qb = nullptr, u32* xa_qb = nullptr)
 {
     __shared__ float wsum[8];
     const TIn* row = in + (size_t)blockIdx.x * ld_in;
@@ -462,6 +465,64 @@ __global__ void __launch_bounds__(256) k_rmsnorm_rows(const TIn* in, int ld_in, 
     const float inv = rsqrtf(tot / width + eps);
     for (int i = threadIdx.x; i < width; i += 256)
         out[(size_t)blockIdx.x * ld_out + i] = __float2half_rn((float)row[i] * inv * __bfloat162float(w[i]));
+    if (xf16 || xbf16 || xa_qb)
+    {
+        __syncthreads();
+        const int M = gridDim.x, m = blockIdx.x, tile = m >> 3, r = m & 7, nks = width >> 4;
+        if (xf16 || xbf16)
+        {
+            for (int ks = threadIdx.x; ks < nks; ks += 256)
+            {
+                const uint4* s = reinterpret_cast<const uint4*>(out + (size_t)m * ld_out + ks * 16);
+                const uint4 lo = s[0], hi = s[1];
+                const size_t o = (size_t)tile * nks * 64 + ((size_t)ks * 32 + r * 4) * 2;
+                if (xf16)
+                {
+                    uint4* d = reinterpret_cast<uint4*>(xf16 + o);
+                    d[0] = make_uint4(lo.x, hi.x, lo.y, hi.y);
+                    d[1] = make_uint4(lo.z, hi.z, lo.w, hi.w);
+                }
+                if (xbf16)
+                {
+                    uint4* d = reinterpret_cast<uint4*>(xbf16 + o);
+                    d[0] = make_uint4(h2w_to_bf2(lo.x), h2w_to_bf2(hi.x), h2w_to_bf2(lo.y), h2w_to_bf2(hi.y));
+                    d[1] = make_uint4(h2w_to_bf2(lo.z), h2w_to_bf2(hi.z), h2w_to_bf2(lo.w), h2w_to_bf2(hi.w));
+                }
+                if (m == M - 1)
+                    for (int z = r + 1; z < 8; ++z)
+                    {
+                        const size_t oz = (size_t)tile * nks * 64 + ((size_t)ks * 32 + z * 4) * 2;
+                        if (xf16)
+                        {
+                            uint4* d = reinterpret_cast<uint4*>(xf16 + oz);
+                            d[0] = make_uint4(0u, 0u, 0u, 0u);
+                            d[1] = make_uint4(0u, 0u, 0u, 0u);
+                        }
+                        if (xbf16)
+                        {
+                            uint4* d = reinterpret_cast<uint4*>(xbf16 + oz);
+                            d[0] = make_uint4(0u, 0u, 0u, 0u);
+                            d[1] = make_uint4(0u, 0u, 0u, 0u);
+                        }
+                    }
+            }
+        }
+        if (suh_qb && xa_qb)
+        {
+            const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nblk_k = width >> 7;
+            for (int blk = warp; blk < nblk_k; blk += 8)
+            {
+                const int k = blk * 128 + lane * 4;
+                const uint2 rx = *reinterpret_cast<const uint2*>(out + (size_t)m * ld_out + k);
+                const uint2 rs = *reinterpret_cast<const uint2*>(suh_qb + k);
+                const float2 ax = __half22float2(as_h2(rx.x)), bx = __half22float2(as_h2(rx.y));
+                const float2 as = __half22float2(as_h2(rs.x)), bs = __half22float2(as_h2(rs.y));
+                float v[4] = {ax.x * as.x, ax.y * as.y, bx.x * bs.x, bx.y * bs.y};
+                had128(v, lane);
+                store_frag_row(xa_qb + (size_t)tile * nks * 64, blk * 8, r, lane, v);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- router: sigmoid top-8 -> K1 plan
@@ -485,43 +546,102 @@ struct RoutePlan
     int tok_expert[MMAX][8];      // selected expert ids in selection order (checks / debug)
 };
 
-// grid 1, block 256 (warp w = tokens w, w + 8, ...; M <= MMAX). logits [M][256] fp32, bias [256] fp32 (e_score_correction_bias).
+// grid 1, block NEXP (warp w = tokens w, w + RW, ...; M <= MMAX). logits [M][NEXP] fp32, bias [NEXP] fp32 (e_score_correction_bias).
 // Selection key = sigmoid(logit) + bias, ties -> lowest expert id. Weights = unbiased sigmoid of the
 // selected experts / their sum * 2.5 (FACTS-M0 2(c)).
-__global__ void __launch_bounds__(256) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P)
+// keep / keep_dev (G6_MTP_LASTROW, rank.cuh launch_mlp_block): bit m = token m is routed; a token outside the mask takes no
+// route (no expert slot, tok_slot -1, as tokens m >= M), so the finalize gives it the shared expert only. keep_dev (device
+// word, read at launch) wins over keep; both 0 / nullptr = every token, today's plan. A routed token's selection, weights,
+// slot order (ascending expert id) and column (M <= 8: column m; above: its rank among the expert's routed tokens) do not
+// depend on the other tokens, and an mma column depends only on its own token: its K1 output bytes are the same.
+// K (template) = routed experts kept per token (G6_MOE_TOPK cut; default TOPK = the model's): the sum renormalizes over
+// the K kept, and routes k >= K carry the plan's no-route encoding (tok_slot -1), which the K1 consumers already skip.
+// K = TOPK compiles to the pre-cut source (same init loop, same unrolls): the OFF instance is SASS-identical to a5edf0a.
+constexpr int RW = NEXP / 32;   // k_router_plan warps; each lane holds RW experts in the top-k
+static_assert(NEXP % 32 == 0 && RW <= 32, "k_router_plan: one thread per expert, one taken bit per lane expert");
+template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P,
+                                                                                   unsigned keep = 0u, const unsigned* keep_dev = nullptr)
 {
+    static_assert(K >= 1 && K <= TOPK, "k_router_plan: K outside 1..TOPK");
     __shared__ unsigned emask[NEXP];              // bit m = token m selected the expert
     __shared__ int sel_e[MMAX][TOPK];
     __shared__ float sel_w[MMAX][TOPK];
     __shared__ int slot_of[NEXP];                 // first slot of the expert
-    __shared__ int wcount[8];
+    __shared__ int wcount[RW];
+    __shared__ float s_m[8][NEXP], k_m[8][NEXP];
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
     const bool dense = M > 8;
-    emask[t] = 0u;
-    for (int i = t; i < SMAX * 8; i += 256)
+    const unsigned on = keep_dev ? *keep_dev : keep ? keep : 0xffffffffu;
+    if (M > 1) emask[t] = 0u;
+    if (!dense)
+    {
+        const float bt = bias[t];
+        for (int m = 0; m < M; ++m)
+        {
+            const float st = 1.f / (1.f + expf(-logits[m * NEXP + t]));
+            s_m[m][t] = st;
+            k_m[m][t] = st + bt;
+        }
+    }
+    for (int i = t; i < M * TOPK * 8; i += NEXP)
     {
         (&P->slot_w[0][0])[i] = 0.f;
         (&P->slot_tok[0][0])[i] = -1;
     }
-    __syncthreads();
-    for (int m = w; m < M; m += 8)
+    constexpr bool CUT = K < TOPK;
+    for (int i = (CUT ? 0 : M * TOPK) + t; i < MMAX * TOPK; i += NEXP)
     {
-        float s[8], key[8];
+        const int m = i >> 3, k = i & 7;
+        if constexpr (CUT)
+            if (m < M && k < K) continue;  // live route: the scatter below fills it
+        P->tok_slot[m][k] = -1;
+        P->tok_col[m][k] = 0;
+        P->tok_w[m][k] = 0.f;
+        P->tok_expert[m][k] = -1;
+    }
+    __syncthreads();
+    for (int m = w; m < M; m += RW)
+    {
+        float s[RW], key[RW];
+        if (!(on >> m & 1u))                      // the whole warp (m depends on w only): no route for token m
+        {
+            if (M == 1)
+            {
+                if (l < TOPK)
+                {
+                    P->tok_slot[0][l] = -1;
+                    P->tok_col[0][l] = 0;
+                    P->tok_w[0][l] = 0.f;
+                    P->tok_expert[0][l] = -1;
+                }
+                if (l == 0) P->n_slots = 0;
+            }
+            continue;
+        }
         #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < RW; ++i)
         {
             const int e = l + 32 * i;
-            s[i] = 1.f / (1.f + expf(-logits[m * NEXP + e]));
-            key[i] = s[i] + bias[e];
+            if (!dense)
+            {
+                key[i] = k_m[m][e];
+            }
+            else
+            {
+                s[i] = 1.f / (1.f + expf(-logits[m * NEXP + e]));
+                key[i] = s[i] + bias[e];
+            }
         }
         unsigned taken = 0;
-        for (int k = 0; k < TOPK; ++k)
+        float my_k = key[0];
+        int my_e = l;
+        #pragma unroll
+        for (int i = 1; i < RW; ++i)
+            if (key[i] > my_k) { my_k = key[i]; my_e = l + 32 * i; }
+        for (int k = 0; k < K; ++k)
         {
-            float bk = -INFINITY;
-            int be = 0x7fffffff;
-            #pragma unroll
-            for (int i = 0; i < 8; ++i)
-                if (!(taken >> i & 1) && key[i] > bk) { bk = key[i]; be = l + 32 * i; }   // i ascending = id ascending
+            float bk = my_k;
+            int be = my_e;
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)
             {
@@ -529,76 +649,151 @@ __global__ void __launch_bounds__(256) k_router_plan(const float* logits, const 
                 const int oe = __shfl_xor_sync(0xffffffffu, be, o);
                 if (ok > bk || (ok == bk && oe < be)) { bk = ok; be = oe; }
             }
-            float sv = 0.f;
-            if ((be & 31) == l) { taken |= 1u << (be >> 5); sv = s[be >> 5]; }
-            sv = __shfl_sync(0xffffffffu, sv, be & 31);
-            if (l == 0) { sel_e[m][k] = be; sel_w[m][k] = sv; }
+            if (!dense)
+            {
+                if (l == 0) { sel_e[m][k] = be; sel_w[m][k] = s_m[m][be]; }
+                if (k + 1 < K && (be & 31) == l)
+                {
+                    taken |= 1u << (be >> 5);
+                    my_k = -INFINITY;
+                    my_e = 0x7fffffff;
+                    #pragma unroll
+                    for (int i = 0; i < RW; ++i)
+                        if (!(taken >> i & 1) && key[i] > my_k) { my_k = key[i]; my_e = l + 32 * i; }
+                }
+            }
+            else
+            {
+                float sv = 0.f;
+                if ((be & 31) == l)
+                {
+                    taken |= 1u << (be >> 5);
+                    sv = s[be >> 5];
+                    my_k = -INFINITY;
+                    my_e = 0x7fffffff;
+                    #pragma unroll
+                    for (int i = 0; i < RW; ++i)
+                        if (!(taken >> i & 1) && key[i] > my_k) { my_k = key[i]; my_e = l + 32 * i; }
+                }
+                sv = __shfl_sync(0xffffffffu, sv, be & 31);
+                if (l == 0) { sel_e[m][k] = be; sel_w[m][k] = sv; }
+            }
         }
         __syncwarp();
         float sum = 0.f;
         #pragma unroll
-        for (int k = 0; k < TOPK; ++k) sum += sel_w[m][k];
+        for (int k = 0; k < K; ++k) sum += sel_w[m][k];
         __syncwarp();
-        if (l < TOPK)
+        if (l < K)
         {
-            sel_w[m][l] = sel_w[m][l] / sum * ROUTE_SCALE;
-            atomicOr(&emask[sel_e[m][l]], 1u << m);
+#if G6_MODEL_FLASH
+            const float wv = sel_w[m][l] / (sum + 1e-20f) * ROUTE_SCALE;
+#else
+            const float wv = sel_w[m][l] / sum * ROUTE_SCALE;
+#endif
+            sel_w[m][l] = wv;
+            if (M == 1)
+            {
+                const int e = sel_e[0][l];
+                int s2 = 0;
+                #pragma unroll
+                for (int j = 0; j < K; ++j) s2 += (sel_e[0][j] < e);
+                P->slot_expert[s2] = e;
+                P->slot_mask[s2] = 1;
+                P->tok_slot[0][l] = s2;
+                P->tok_col[0][l] = 0;
+                P->tok_w[0][l] = wv;
+                P->tok_expert[0][l] = e;
+                P->slot_w[s2][0] = wv;
+                P->slot_tok[s2][0] = 0;
+                if (l == 0) P->n_slots = K;
+            }
+            else
+            {
+                atomicOr(&emask[sel_e[m][l]], 1u << m);
+            }
         }
         __syncwarp();
     }
+    if (M == 1) return;
     __syncthreads();
     // thread t = expert t: cnt tokens -> ceil(cnt / 8) slots (one when M <= 8); first slot = exclusive prefix over experts
-    const int cnt = __popc(emask[t]), nsl = (cnt + 7) >> 3;
-    int scan = nsl;
-    #pragma unroll
-    for (int o = 1; o < 32; o <<= 1)
+    const unsigned em = emask[t];
+    int nsl, exc;
+    if (!dense)
     {
-        const int v = __shfl_up_sync(0xffffffffu, scan, o);
-        if (l >= o) scan += v;
+        nsl = em != 0u;
+        const unsigned wm = __ballot_sync(0xffffffffu, nsl);
+        exc = __popc(wm & ((1u << l) - 1u));
+        if (l == 0) wcount[w] = __popc(wm);
     }
-    if (l == 31) wcount[w] = scan;
+    else
+    {
+        const int cnt = __popc(em);
+        nsl = (cnt + 7) >> 3;
+        int scan = nsl;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1)
+        {
+            const int v = __shfl_up_sync(0xffffffffu, scan, o);
+            if (l >= o) scan += v;
+        }
+        exc = scan - nsl;
+        if (l == 31) wcount[w] = scan;
+    }
     __syncthreads();
     int base = 0;
-    for (int i = 0; i < w; ++i) base += wcount[i];
-    const int slot0 = base + scan - nsl;
+    #pragma unroll
+    for (int i = 0; i < RW; ++i) if (i < w) base += wcount[i];
+    const int slot0 = base + exc;
     if (nsl)
     {
         slot_of[t] = slot0;
-        for (int j = 0; j < nsl; ++j)
+        if (!dense)
         {
-            P->slot_expert[slot0 + j] = t;
-            P->slot_mask[slot0 + j] = dense ? static_cast<int>((1u << (cnt - 8 * j < 8 ? cnt - 8 * j : 8)) - 1u) : static_cast<int>(emask[t]);
+            P->slot_expert[slot0] = t;
+            P->slot_mask[slot0] = static_cast<int>(em);
+        }
+        else
+        {
+            const int cnt = __popc(em);
+            for (int j = 0; j < nsl; ++j)
+            {
+                P->slot_expert[slot0 + j] = t;
+                P->slot_mask[slot0 + j] = static_cast<int>((1u << (cnt - 8 * j < 8 ? cnt - 8 * j : 8)) - 1u);
+            }
         }
     }
     if (t == 0)
     {
         int n = 0;
-        for (int i = 0; i < 8; ++i) n += wcount[i];
+        #pragma unroll
+        for (int i = 0; i < RW; ++i) n += wcount[i];
         P->n_slots = n;
     }
     __syncthreads();
-    for (int i = t; i < MMAX * TOPK; i += 256)
+    for (int i = t; i < M * TOPK; i += NEXP)
     {
         const int m = i >> 3, k = i & 7;
-        if (m < M)
-        {
-            const int e = sel_e[m][k];
-            const int r = __popc(emask[e] & ((1u << m) - 1u));      // rank of token m among the expert's tokens
-            const int s2 = slot_of[e] + (dense ? r >> 3 : 0), col = dense ? (r & 7) : m;
-            P->tok_slot[m][k] = s2;
-            P->tok_col[m][k] = col;
-            P->tok_w[m][k] = sel_w[m][k];
-            P->tok_expert[m][k] = e;
-            P->slot_w[s2][col] = sel_w[m][k];
-            P->slot_tok[s2][col] = m;
-        }
-        else
+        if constexpr (CUT)
+            if (k >= K) continue;          // dropped route (G6_MOE_TOPK): tok_* stay -1 from the init above
+        if (!(on >> m & 1u))                      // G6_MTP_LASTROW: token outside the mask takes no route
         {
             P->tok_slot[m][k] = -1;
             P->tok_col[m][k] = 0;
             P->tok_w[m][k] = 0.f;
             P->tok_expert[m][k] = -1;
+            continue;
         }
+        const int e = sel_e[m][k];
+        const int r = __popc(emask[e] & ((1u << m) - 1u));      // rank of token m among the expert's tokens
+        const int s2 = slot_of[e] + (dense ? r >> 3 : 0), col = dense ? (r & 7) : m;
+        P->tok_slot[m][k] = s2;
+        P->tok_col[m][k] = col;
+        P->tok_w[m][k] = sel_w[m][k];
+        P->tok_expert[m][k] = e;
+        P->slot_w[s2][col] = sel_w[m][k];
+        P->slot_tok[s2][col] = m;
     }
 }
 

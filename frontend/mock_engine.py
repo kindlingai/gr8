@@ -29,6 +29,7 @@ import math
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wire  # noqa: E402
@@ -78,6 +79,14 @@ class Mock:
             return head + enc('Call it like <tool_call>get_weather<arg_key>city</arg_key>'
                               '<arg_value>Paris</arg_value></tool_call> in your code.'), self.stop_user
         tool = self.first_tool(text)
+        if tool and 'use-a-tool-please' in last_user:  # a JSON-mode request answered with a call (front end tests)
+            return head + enc('I will call a tool.') + enc(f'{TOOL_OPEN}{tool["name"]}{self.tool_args(tool)}'
+                                                           f'{TOOL_CLOSE}'), self.stop_obs
+        if 'Respond with only a JSON object' in last_user:
+            # response_format json mode: the front end asked for JSON, so the mock emits fenced JSON. The
+            # 'invalid-json-please' marker makes the reply violate the schema, for the warnings path.
+            payload = '{"a": "x"}' if 'invalid-json-please' in last_user else '{"city": "Paris", "days": 3}'
+            return head + enc('Here you are:\n```json\n' + payload + '\n```'), self.stop_user
         if tool:
             return head + enc('I will call a tool.') + enc(f'{TOOL_OPEN}{tool["name"]}{self.tool_args(tool)}'
                                                            f'{TOOL_CLOSE}'), self.stop_obs
@@ -213,12 +222,16 @@ class Mock:
                 task.cancel()
             writer.close()
 
-    def _finish(self, rid, reason, pt, cached, ct, stop_id=None, message=None):
+    def _finish(self, rid, reason, pt, cached, ct, stop_id=None, message=None, spec=None, timing=None):
         self.c['fin'][reason] += 1
         f = {'type': 'finish', 'id': rid, 'reason': reason, 'stop_id': stop_id, 'prompt_tokens': pt,
              'cached_tokens': cached, 'completion_tokens': ct}
         if message:
             f['message'] = message
+        if spec is not None:   # the request's share of the metrics frame's counters (PROTOCOL.md `finish`)
+            f['spec'] = spec
+        if timing is not None:
+            f['timing'] = timing
         return f
 
     async def generate(self, f, writer):
@@ -229,6 +242,11 @@ class Mock:
             return
         self.running += 1
         emitted, cached = 0, 0
+        spec = {'drafts': 0, 'draft_tokens': 0, 'accepted': 0, 'accepted_per_pos': [0] * K_DRAFT}
+        t0, t_first = time.monotonic(), None
+
+        def timing():
+            return None if t_first is None else {'prefill_s': t_first - t0, 'decode_s': time.monotonic() - t_first}
         try:
             cached = self.cached(prompt)
             self.c['pc_q'] += len(prompt)
@@ -246,11 +264,13 @@ class Mock:
                 acc = ACCEPT_CYCLE[rnd % len(ACCEPT_CYCLE)]
                 n = min(1 + acc, len(ids) - emitted)
                 if len(ids) - emitted > 1:  # a verify round with drafts
-                    self.c['drafts'] += 1
-                    self.c['draft_tokens'] += K_DRAFT
-                    self.c['accepted'] += n - 1
+                    for c in (self.c, spec):
+                        c['drafts'] += 1
+                        c['draft_tokens'] += K_DRAFT
+                        c['accepted'] += n - 1
                     for i in range(n - 1):
                         self.c['per_pos'][i] += 1
+                        spec['accepted_per_pos'][i] += 1
                 chunk = ids[emitted:emitted + n]
                 fr = {'type': 'tokens', 'id': rid, 'ids': chunk}
                 if k is not None:
@@ -265,14 +285,17 @@ class Mock:
                 else:
                     await asyncio.sleep(1 / self.a.rounds_per_s)
                 wire.write_frame(writer, fr)
+                if t_first is None:
+                    t_first = time.monotonic()
                 emitted += n
                 self.c['gen'] += n
                 rnd += 1
             wire.write_frame(writer, self._finish(rid, 'stop' if stop is not None else 'length', len(prompt), cached,
-                                                  emitted, stop_id=stop))
+                                                  emitted, stop_id=stop, spec=spec, timing=timing()))
         except asyncio.CancelledError:
             if not writer.is_closing():
-                wire.write_frame(writer, self._finish(rid, 'abort', len(prompt), cached, emitted))
+                wire.write_frame(writer, self._finish(rid, 'abort', len(prompt), cached, emitted, spec=spec,
+                                                      timing=timing()))
         except Exception as e:  # never leave a request without a finish frame
             log.exception('generate %s failed', rid)
             if not writer.is_closing():

@@ -26,7 +26,8 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
         l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line, before it
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
         m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
-        end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame
+        end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame (with the request's
+                                                             `spec` and `timing`: what it added to the metrics frame)
       A request cancelled while still queued gets only "end abort -1 0".
 A request the engine cannot parse or fit ends the whole epoch (the engine writes DIR/abort.s2 and exits), so the shim
 checks every field before it writes a file. SIGTERM/SIGINT writes DIR/quit (quit an idle engine).
@@ -249,9 +250,12 @@ class Req:
         self.admitted = False    # an "a" line was seen: the engine gave it a slot
         self.cancelled = False   # the front end cancelled it
         self.cancel_at = 0.0     # when CANCEL went to the engine
-        self.done = False        # a finish frame went out
+        self.done = False        # no longer tracked: the engine's end line came, or it never had the request
+        self.answered = False    # a finish frame went out (an abandoned request stays tracked until its end line)
         self.emitted = 0
         self.m = None            # this request's last "m" line
+        self.spec = None         # its counters as added to the metrics frame's `spec` (the finish frame's `spec`)
+        self.timing = None       # its times as added to the metrics frame's `latency` (the finish frame's `timing`)
         self.lps = []            # "l" entries for the next "t" line
         self.plps = {}           # "p" entries by prompt position
         self.plp_sent = False    # the prompt_logprobs frame went out
@@ -262,6 +266,7 @@ class Req:
         self.t_first = None      # its first tokens line
         self.t_tok = None        # its latest tokens line
         self.reused = None       # prompt rows the engine took from its prefix reuse: the "a" line's last field, if it has one
+        self.prefilled = 0       # the engine's last "f" line: prompt rows prefilled so far
 
 
 class Shim:
@@ -295,19 +300,47 @@ class Shim:
         if r.done:
             return
         r.done = True
-        self.live.pop(r.rid, None)
         if r.ordinal is not None:
             self.active.pop(r.ordinal, None)
         if r.fh:
             r.fh.close()
             r.fh = None
+        self.answer(r, reason, ct, stop_id, message)
+
+    def answer(self, r: Req, reason, ct=0, stop_id=None, message=None):
+        """The finish frame, once per request."""
+        if r.answered:
+            return
+        r.answered = True
+        self.live.pop(r.rid, None)
         self.c['fin'][reason] += 1
         self.account(r, reason)
         f = {'type': 'finish', 'id': r.rid, 'reason': reason, 'stop_id': stop_id,
              'prompt_tokens': len(r.f.get('prompt') or []), 'cached_tokens': r.reused or 0, 'completion_tokens': ct}
         if message:
             f['message'] = message
+        # this request's share of the metrics frame's counters, the same numbers, when it added any
+        if r.spec is not None:
+            f['spec'] = r.spec
+        if r.timing is not None:
+            f['timing'] = r.timing
         self.send(r, f)
+
+    def abandon(self, r: Req, reason, ct=0, message=None):
+        """Answer an admitted request without its end line (the engine went silent on it, its resp could not be read,
+        or what it sent is unusable), and CANCEL it, so the engine does not go on prefilling and decoding it. It stays
+        tracked until the engine's end line, or cancel_timeout, so its slot and pages are known to be free again."""
+        if r.done or r.answered:
+            return
+        self.answer(r, reason, ct, message=message)
+        r.writer = _Closed()            # nobody to tell any more
+        if r.ordinal is None:
+            r.cancelled = True          # the admit task sees it and never writes the ADMIT
+            r.done = True
+            return
+        if not r.cancel_at:
+            r.cancel_at = time.monotonic()
+            asyncio.get_running_loop().create_task(self.send_cancel(r))
 
     def account(self, r: Req, reason):
         """Per-request timing, added once when the request ends (as vLLM's request_*_time histograms): prefill is the
@@ -316,8 +349,10 @@ class Shim:
         if r.t_first is None or reason == 'error':
             return
         c = self.c
-        c['prefill_sum'] += r.t_first - (r.t_admit if r.t_admit is not None else r.t_arrive)
-        c['decode_sum'] += time.monotonic() - r.t_first
+        r.timing = {'prefill_s': r.t_first - (r.t_admit if r.t_admit is not None else r.t_arrive),
+                    'decode_s': time.monotonic() - r.t_first}
+        c['prefill_sum'] += r.timing['prefill_s']
+        c['decode_sum'] += r.timing['decode_s']
         # tokens the prefill computed: the whole prompt, less the rows the engine took from its prefix reuse (when it says)
         c['prefill_tokens'] += max(len(r.f.get('prompt') or []) - (r.reused or 0), 0)
         c['gen_tokens'] += r.emitted
@@ -521,6 +556,8 @@ class Shim:
                 c = self.c
                 c['cached'] = (c['cached'] or 0) + r.reused
                 c['pc_queries'] += len(r.f['prompt'])
+        elif w[0] == 'f':   # prompt rows prefilled so far: life during a long prefill (pump stamps r.last), no text
+            r.prefilled = int(w[1])
         elif w[0] == 'l':
             r.lps.append(lp_entry(w[1:]))
         elif w[0] == 'p':
@@ -535,7 +572,7 @@ class Shim:
                 n = len(r.f['prompt'])
                 if any(j not in r.plps for j in range(1, n)):
                     log.error('req.%s: engine sent %d of %d prompt logprobs', r.ordinal, len(r.plps), n - 1)
-                    return self.finish(r, 'error', ct=r.emitted, message='engine returned incomplete prompt logprobs')
+                    return self.abandon(r, 'error', ct=r.emitted, message='engine returned incomplete prompt logprobs')
                 self.send(r, {'type': 'prompt_logprobs', 'id': r.rid, 'lps': [None] + [r.plps[j] for j in range(1, n)]})
             if ids:
                 now = time.monotonic()
@@ -569,6 +606,7 @@ class Shim:
                 cur, pp = self.c['per_pos'], v[3:]
                 self.c['per_pos'] = [(cur[i] if i < len(cur) else 0) + (pp[i] if i < len(pp) else 0)
                                      for i in range(max(len(cur), len(pp)))]
+                r.spec = {'drafts': v[0], 'draft_tokens': v[1], 'accepted': v[2], 'accepted_per_pos': pp}
             if reason not in ('stop', 'length', 'error', 'abort'):
                 reason = 'error'
             self.finish(r, reason, ct=ct, stop_id=sid if sid >= 0 else None,
@@ -608,15 +646,17 @@ class Shim:
                     self.pump(r)
                 except Exception as e:
                     log.exception('resp read of %s failed', r.rid)
-                    self.finish(r, 'error', ct=r.emitted, message=repr(e))
+                    self.abandon(r, 'error', ct=r.emitted, message=repr(e))   # tracked until its end line or cancel_timeout
                     continue
                 if r.done:
                     continue
                 if r.cancel_at and now - r.cancel_at > self.a.cancel_timeout:
-                    log.error('req.%s: no end line %.0fs after CANCEL; answering abort', r.ordinal, self.a.cancel_timeout)
+                    log.error('req.%s: no end line %.0fs after CANCEL; %s', r.ordinal, self.a.cancel_timeout,
+                              'no longer tracked' if r.answered else 'answering abort')
                     self.finish(r, 'abort', ct=r.emitted)
-                elif r.admitted and now - r.last > self.a.stall_timeout:
-                    self.finish(r, 'error', ct=r.emitted, message=f'engine silent {self.a.stall_timeout:.0f}s on req.{r.ordinal}')
+                elif r.admitted and not r.answered and now - r.last > self.a.stall_timeout:
+                    log.error('req.%s: engine silent %.0fs; answering error and cancelling it', r.ordinal, self.a.stall_timeout)
+                    self.abandon(r, 'error', ct=r.emitted, message=f'engine silent {self.a.stall_timeout:.0f}s on req.{r.ordinal}')
             if now >= next_abort_check:
                 next_abort_check = now + 0.1
                 if os.path.exists(f'{self.a.dir}/abort.s2'):

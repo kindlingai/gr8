@@ -54,15 +54,15 @@ static void every_shared_flag_lands()
     CommonOpts o;
     std::string err;
     const auto rest = parse({"--v2", "/w", "--v2-slices", "/s", "--v2-widths", "/m.json", "--v2-dense", "/r",
-                             "--v2-dense-form", "rounded", "--qo-manifest", "/q.json", "--qo-pack", "/q.pack",
+                             "--layout", "/l.json", "--v2-dense-form", "rounded", "--qo-manifest", "/q.json", "--qo-pack", "/q.pack",
                              "--spec-adaptive", "--spec-levels", "2,3,5", "--layers", "0,3", "--prompt", "1,2",
                              "--prompt", "3,4", "--gen", "7", "--temp", "0.7", "--seed", "99", "--cap", "4096",
                              "--chunk", "8", "--graph", "--prefill", "4096", "--top", "5", "--wide", "--pfv2",
                              "--pf-rows", "-2", "--mtp", "3", "--pf-lanes", "2", "--top-p", "0.9",
                              "--top-p-cands", "256", "--spec-accept", "rejection"}, o, err);
     CHECK(err.empty());
-    CHECK(rest.empty());                          // all 29 belong to the shared set
-    CHECK(o.v2_dir == "/w" && o.v2_slices == "/s" && o.v2_widths == "/m.json" && o.v2_dense == "/r");
+    CHECK(rest.empty());                          // all 30 belong to the shared set
+    CHECK(o.v2_dir == "/w" && o.v2_slices == "/s" && o.v2_widths == "/m.json" && o.v2_dense == "/r" && o.v2_layout == "/l.json");
     CHECK(!o.v2_trellis);                         // "rounded"
     CHECK(o.qo_man == "/q.json" && o.qo_file == "/q.pack");
     CHECK(o.adapt && o.levels_s == "2,3,5" && o.layers_s == "0,3");
@@ -157,6 +157,6 @@ int main()
     the_bounds_are_the_ones_the_mains_checked();
     inv_temp_is_the_reciprocal_or_zero();
     if (fails) { fprintf(stderr, "engine_opts_test: %d FAILED\n", fails); return 1; }
-    printf("engine_opts_test: ok (29 shared flags, bounds, and the two bad values)\n");
+    printf("engine_opts_test: ok (30 shared flags, bounds, and the two bad values)\n");
     return 0;
 }

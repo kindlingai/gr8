@@ -17,8 +17,7 @@ python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp6.json
 
 `run` needs `--health FILE`, the rank health probe result of the boot (`scripts/rank_health.sh`, run it on the head before
 `./gr8 glm53 up`; it writes `$G6_HOME/out/rank_health.json`). It is stored in every record of the run as `rank_health`. A result older than
-`--health-max-age-min` (default 360) is refused, and `launch_tp6.sh` deletes the file when `RANK_HEALTH=0`, so a result
-from an earlier boot is not reused. A boot the probe refused is not measured unless `--allow-unhealthy`. `--no-health` measures
+`--health-max-age-min` (default 360) is refused, so a result from an earlier boot is not reused. A boot the probe refused is not measured unless `--allow-unhealthy`. `--no-health` measures
 without a result. `baseline` and `check` refuse any record that has no admitted probe result (`--no-health`,
 `--allow-unhealthy` records, or records without the field). See `tools/health/README.md`.
 
@@ -78,6 +77,32 @@ the gate set; a baseline built from runs with it gates these metrics like any ot
   flags, engine environment, measurement settings (sizes, effort, temperature, token counts, pbench arguments) and KL reference, and all
   have the same metrics. `check` refuses (exit 1, "check refused") a run of another topology, other engine environment, other measurement
   settings, or a KL reference other than the baseline's. `run` refuses a `--kl-ref` taken on another topology.
+
+## Paired A/B (#32)
+
+`check` compares one build with a baseline of main measured earlier, so drift between the two days (clocks, thermals,
+a node that degrades) shows up as a delta. `paired` takes boots of main and of the change measured back to back: each
+**pair** is one boot of each side, labelled with the same `run --pair ID` (each side keeps its own `--boot`). Drift
+between pairs cancels in the per-pair difference.
+
+```bash
+# per pair: boot main, run; boot the change, run (alternate the order between pairs: a b, b a, a b, ...)
+python3 bench/gate/gate.py run ... --commit <main sha> --boot m1 --pair p1
+python3 bench/gate/gate.py run ... --commit <pr sha>   --boot c1 --pair p1
+python3 bench/gate/gate.py paired --topology tp4 --a <main sha> --b <pr sha>
+```
+
+Per pair and metric it takes d = (b - a) / |a| on the medians of each side's repeats, then over the pairs the mean
+of d, its 95% Student t interval, and how many pairs went each way. Verdicts: `worse` (the whole interval is on the
+worse side of 0 and the mean is past `--noise`, default 3%), `better` (likewise the other way), `within noise` (the
+interval lies inside +-noise), `unresolved` (more pairs would settle it), `one pair` (no interval). Needles and every
+KL number stay `info`: `check` gates `kl.mean` on its absolute threshold, and a relative change between two values at
+the 1e-6 floor means nothing. It exits 1 if any metric is `worse`. Pairs must share measurement settings and topology;
+the two sides may differ in build flags and engine environment (that may be the change), each side within itself may
+not. A pair is exactly one boot of each side. Records without an admitted rank health probe are refused, as in
+`check`; a pair with only one side is listed and left out.
+
+`paired` is an extra view for a PR's gates table, not a replacement for `check`: the light gates still run `check`.
 
 ## Notes
 

@@ -146,8 +146,14 @@ The last frame for a request; the id may be reused after it.
 | `cached_tokens` | prompt tokens served from the prefix cache (0 if none) |
 | `completion_tokens` | ids emitted in `tokens` frames for this request |
 | `message` | only with `reason: error`: human-readable cause (e.g. `"prompt too long"`, `"KV cache full"`) |
+| `spec` | optional: this request's share of the `metrics` frame's `spec` counters, the same numbers added there when it ended: `{"drafts", "draft_tokens", "accepted", "accepted_per_pos"}` (verify rounds, draft tokens, accepted draft tokens, accepted per draft position) |
+| `timing` | optional: this request's share of the `metrics` frame's `latency` times, in seconds: `{"prefill_s", "decode_s"}` (added to `prefill_sum` / `decode_sum`) |
 
 A request that fails validation in the engine gets `finish` with `reason: error` directly (no `tokens`).
+`spec` and `timing` follow the `metrics` frame's rule: absent when the engine did not count the request (a request it
+never started, a failed one, an engine that does not measure them), never zeros in their place. A cancelled request
+that ran reports what it did until the cancel. The front end passes them to a client only on request
+(`return_step_stats`, frontend/README.md).
 
 ### `metrics` (reply)
 

@@ -17,7 +17,8 @@ use hyper::{header, Method, Request, Response, StatusCode};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use crate::gen::{think_open, Budget, Generation, Res, Step, StopReason};
+use crate::gen::{think_open, Budget, Generation, Res, Step, StepStats, StopReason};
+use crate::jsonmode;
 use crate::parser::{Delta, GlmParser};
 use crate::pyjson::{self, truthy};
 use crate::template::{build_template_kwargs, normalize_tools};
@@ -224,7 +225,8 @@ fn stop_reason_json(o: &mut Vec<u8>, s: &Option<StopReason>) {
 }
 
 /// `reasoning`: a chat reply's reasoning tokens, as `completion_tokens_details.reasoning_tokens` (OpenAI's field), so
-/// a client can tell visible output from reasoning.
+/// a client can tell visible output from reasoning. `stats`: `step_stats`, for a request that asked for it.
+#[allow(clippy::too_many_arguments)]
 fn usage(
     o: &mut Vec<u8>,
     prompt: usize,
@@ -233,6 +235,7 @@ fn usage(
     details: bool,
     full: bool,
     reasoning: Option<usize>,
+    stats: Option<&StepStats>,
 ) {
     let mut u = Obj::new(o);
     u.int("prompt_tokens", prompt);
@@ -252,7 +255,36 @@ fn usage(
         pyjson::int(d, r);
         d.push(b'}');
     }
+    if let Some(s) = stats {
+        step_stats_json(u.key("step_stats"), s);
+    }
     u.end();
+}
+
+/// `usage.step_stats` (`return_step_stats`): the request's share of the `/metrics` speculative-decoding counters and
+/// request times. The times are left out when the engine did not report them.
+fn step_stats_json(o: &mut Vec<u8>, s: &StepStats) {
+    let mut x = Obj::new(o);
+    x.int("steps", s.steps);
+    x.int("draft_tokens", s.draft_tokens);
+    x.int("accepted_tokens", s.accepted_tokens);
+    let p = x.key("accepted_per_pos");
+    p.push(b'[');
+    for (i, n) in s.accepted_per_pos.iter().enumerate() {
+        if i > 0 {
+            p.push(b',');
+        }
+        pyjson::int(p, *n);
+    }
+    p.push(b']');
+    x.int("generated_tokens", s.generated_tokens);
+    if let Some(t) = s.prefill_s {
+        pyjson::float(x.key("prefill_s"), t);
+    }
+    if let Some(t) = s.decode_s {
+        pyjson::float(x.key("decode_s"), t);
+    }
+    x.end();
 }
 
 /// `{"id", "object", "created", "model"` -- the shared head of every chunk/response (object left open).
@@ -369,6 +401,8 @@ struct ChatReq {
     params: sampling::Params,
     /// the thinking budget in reply tokens; 0: none
     budget: u64,
+    /// the validated response_format ('text' enforces nothing)
+    rf: jsonmode::Rf,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
@@ -379,8 +413,8 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     }
     let tools = normalize_tools(body.get("tools"))?;
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
-    thinking::check_response_format(body.get("response_format"))?;
-    let th = thinking::resolve(body, &st.template.levels, st.thinking)?;
+    let rf = jsonmode::parse_response_format(body.get("response_format"), &st.grammars)?;
+    let th = st.template.resolve_thinking(body, st.thinking)?;
     let kw = build_template_kwargs(
         body.get("chat_template_kwargs"),
         body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
@@ -391,14 +425,22 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     if truthy(body.get("chat_template")) {
         return Err(ApiError::bad("custom chat_template is not supported", Some("chat_template")));
     }
+    // a JSON mode asks the model for JSON up front (post-hoc extraction stays the enforcement)
+    let messages = match jsonmode::response_format_hint(&rf) {
+        Some(h) => append_hint(body.get("messages"), &h)?,
+        None => body.get("messages").cloned().unwrap_or(Value::Array(Vec::new())),
+    };
     let t0 = std::time::Instant::now();
     let kw_system = kw.clone();
-    let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+    let mut text = st.template.render(Some(&messages), tools.as_ref(), kw)?;
+    if th.off {
+        text = st.template.thinking_off(text, body.get("add_generation_prompt").is_none_or(|v| truthy(Some(v))));
+    }
     let (t1, chars) = (std::time::Instant::now(), text.len());
     let add_special = truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
     let t2 = std::time::Instant::now();
-    let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await;
+    let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, th.off, &prompt).await;
     log::debug!(
         "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms, system span {system:?} tokens {:.2} ms",
         prompt.len(),
@@ -456,7 +498,37 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let force = choice.forced_ids(&st.tok, close)?;
     params.gen.system_tokens = system;
     (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(body, st.steering().as_ref())?;
-    Ok(ChatReq { tools, choice, force, prompt, params, budget })
+    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf })
+}
+
+/// Append a one-line instruction after the last user or tool message (vLLM's chat-ml injection shape).
+fn append_hint(messages: Option<&Value>, hint: &str) -> Result<Value, ApiError> {
+    let Some(Value::Array(items)) = messages else {
+        return Err(ApiError::bad("response_format needs at least one message", Some("response_format")));
+    };
+    let mut out = items.clone();
+    for m in out.iter_mut().rev() {
+        let role = m.get("role").and_then(Value::as_str);
+        if !matches!(role, Some("user" | "tool")) {
+            continue;
+        }
+        let Some(o) = m.as_object_mut() else { break };
+        match o.get_mut("content") {
+            Some(Value::String(s)) => *s = format!("{s}\n\n{hint}"),
+            Some(Value::Array(parts)) => {
+                let mut p = Map::new();
+                p.insert("type".into(), Value::from("text"));
+                p.insert("text".into(), Value::from(hint));
+                parts.push(Value::Object(p));
+            }
+            None | Some(Value::Null) => {
+                o.insert("content".into(), Value::from(hint));
+            }
+            _ => break, // a non-text content form the hint cannot join; render unchanged
+        }
+        return Ok(Value::Array(out));
+    }
+    Ok(Value::Array(out))
 }
 
 /// The prompt's system span (PROTOCOL.md `system_tokens`): its tokens up to where the first message after the leading
@@ -468,6 +540,7 @@ async fn system_span(
     tools: Option<&Value>,
     mut kw: Map<String, Value>,
     add_special: bool,
+    thinking_off: bool,
     prompt: &[u32],
 ) -> Option<u64> {
     let lead: Vec<Value> = messages?
@@ -481,7 +554,10 @@ async fn system_span(
     }
     kw.insert("add_generation_prompt".into(), Value::Bool(false));
     kw.insert("continue_final_message".into(), Value::Bool(false));
-    let text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    let mut text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    if thinking_off {
+        text = st.template.thinking_off(text, false);
+    }
     let ids = st.tok.aencode(text, add_special).await.ok()?;
     Some(ids.iter().zip(prompt).take_while(|(a, b)| a == b).count() as u64)
 }
@@ -498,10 +574,19 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let rid = new_id("chatcmpl");
     let include_reasoning = body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
     let choice_value = cr.choice.as_value();
-    let parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
+    let mut parser = GlmParser::new(cr.tools.as_ref(), &choice_value, include_reasoning);
+    if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
+        if !think_open(&cr.prompt, start, end) {
+            parser = parser.content_first();
+        }
+    }
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
+    if truthy(body.get("return_step_stats")) {
+        gen.want_step_stats();
+    }
+    let rf = cr.rf;
     if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
         if think_open(&gen.prompt, start, end) {
             let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
@@ -531,19 +616,20 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     }
     if stream {
         let (sse, resp) = Sse::open();
-        tokio::spawn(async move { chat_stream(st, body, gen, parser, sse).await });
+        tokio::spawn(async move { chat_stream(st, body, gen, parser, rf, sse).await });
         return resp;
     }
     let created = now_secs();
     if let Err(e) = run_to_end(st, &mut gen).await {
         return e.response();
     }
-    chat_full(st, &body, &gen, parser, created)
+    chat_full(st, &body, &gen, parser, &rf, created)
 }
 
 async fn run_to_end(st: &State, gen: &mut Generation) -> Result<(), ApiError> {
     gen.start(&st.engine)?;
     while gen.next().await?.is_some() {}
+    gen.finish_stats().await;
     Ok(())
 }
 
@@ -558,10 +644,17 @@ fn chat_full(
     body: &Map<String, Value>,
     gen: &Generation,
     mut parser: GlmParser,
+    rf: &jsonmode::Rf,
     created: u64,
 ) -> Response<HttpBody> {
     let res = &gen.res;
-    let p = parser.parse_full(&res.text);
+    let mut p = parser.parse_full(&res.text);
+    let mut warnings: Vec<String> = Vec::new();
+    if p.calls.is_empty() {
+        let (content, warns) = jsonmode::enforce(p.content.as_deref(), rf);
+        p.content = content;
+        warnings = warns;
+    }
     let reasoning = if parser.include_reasoning { p.reasoning } else { None };
     let mut o = Vec::with_capacity(1024 + res.text.len() * 2);
     let mut c = head(&mut o, &gen.id, "chat.completion", created, &st.model_name);
@@ -607,7 +700,7 @@ fn chat_full(
             }
             None => x.raw("logprobs", b"null"),
         }
-        x.str("finish_reason", if p.calls.is_empty() { res.finish_reason.unwrap_or("stop") } else { "tool_calls" });
+        x.str("finish_reason", finish_with_calls(!p.calls.is_empty(), res.finish_reason.unwrap_or("stop")));
         stop_reason_json(x.key("stop_reason"), &res.stop_reason);
         let ret_ids = truthy(body.get("return_token_ids"));
         if ret_ids {
@@ -628,6 +721,7 @@ fn chat_full(
         st.prompt_tokens_details,
         true,
         Some(res.reasoning_tokens),
+        res.step_stats.as_ref(),
     );
     if let Err(e) = L::prompt_logprobs(c.key("prompt_logprobs"), res.prompt_logprobs.as_deref(), &gen.prompt, &st.tok) {
         return ApiError::new(500, &e, None).response();
@@ -638,6 +732,17 @@ fn chat_full(
         c.raw("prompt_token_ids", b"null");
     }
     c.raw("kv_transfer_params", b"null");
+    if !warnings.is_empty() {
+        let w = c.key("warnings");
+        w.push(b'[');
+        for (i, s) in warnings.iter().enumerate() {
+            if i > 0 {
+                w.push(b',');
+            }
+            pyjson::string(w, s);
+        }
+        w.push(b']');
+    }
     c.end();
     json_response(200, o)
 }
@@ -688,6 +793,7 @@ async fn chat_stream(
     body: Map<String, Value>,
     mut gen: Generation,
     mut parser: GlmParser,
+    rf: jsonmode::Rf,
     sse: Sse,
 ) {
     let created = now_secs();
@@ -699,6 +805,8 @@ async fn chat_stream(
     let lp_k = gen.params.gen.logprobs;
     let mut first = true;
     let mut tools_streamed = false;
+    let json_mode = rf.kind != "text";
+    let mut held_content = String::new(); // JSON mode: content is withheld until the end, then extracted
     let r: Result<(), ApiError> = async {
         gen.start(&st.engine)?;
         loop {
@@ -721,14 +829,15 @@ async fn chat_stream(
                     ids_json(c.key("prompt_token_ids"), &gen.prompt);
                 }
                 if continuous {
-                    usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false, None);
+                    usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false, None, None);
                 }
                 c.end();
                 if sse.json(o).await.is_err() {
                     return Ok(());
                 }
             }
-            if chat_step(st, &gen, &mut parser, &step, &sse, created, lp_k, ret_ids, as_ids, continuous, &mut tools_streamed)
+            if chat_step(st, &gen, &mut parser, &step, &sse, created, lp_k, ret_ids, as_ids, continuous,
+                         &mut tools_streamed, json_mode, &mut held_content, &rf)
                 .await
                 .is_err()
             {
@@ -736,6 +845,7 @@ async fn chat_stream(
             }
         }
         if include_usage {
+            gen.finish_stats().await;
             let res = &gen.res;
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "chat.completion.chunk", created, &st.model_name);
@@ -748,6 +858,7 @@ async fn chat_stream(
                 st.prompt_tokens_details,
                 false,
                 Some(res.reasoning_tokens),
+                res.step_stats.as_ref(),
             );
             c.end();
             if sse.json(o).await.is_err() {
@@ -782,11 +893,45 @@ async fn chat_step(
     as_ids: bool,
     continuous: bool,
     tools_streamed: &mut bool,
+    json_mode: bool,
+    held_content: &mut String,
+    rf: &jsonmode::Rf,
 ) -> Result<(), ()> {
     let finished = step.finish_reason.is_some();
-    let delta = parser.delta(&step.text, finished);
-    if delta.as_ref().is_some_and(|d| !d.tool_calls.is_empty()) {
+    let mut delta = parser.delta(&step.text, finished);
+    let first_call = !*tools_streamed && delta.as_ref().is_some_and(|d| !d.tool_calls.is_empty());
+    if first_call {
         *tools_streamed = true;
+        // a call ends JSON mode: the withheld text goes out ahead of it unextracted, as chat_full keeps it
+        if let Some(d) = delta.as_mut().filter(|_| json_mode && !held_content.is_empty()) {
+            d.content = Some(std::mem::take(held_content) + d.content.as_deref().unwrap_or(""));
+        }
+    }
+    let mut warnings: Option<Vec<String>> = None;
+    if json_mode && !*tools_streamed {
+        // response_format JSON mode: content is withheld until the end, then extracted once
+        if let Some(d) = &mut delta {
+            if let Some(c) = d.content.take() {
+                held_content.push_str(&c);
+            }
+            // an all-buffered step leaves nothing to stream; skip the chunk like the Python front end
+            if d.reasoning.is_none() && d.tool_calls.is_empty() && !finished {
+                delta = None;
+            }
+        }
+        if finished {
+            let (content, w): (Option<String>, Vec<String>) = jsonmode::enforce(
+                (!held_content.is_empty()).then_some(held_content.as_str()),
+                rf,
+            );
+            if let Some(c) = content {
+                let d = delta.get_or_insert_with(crate::parser::Delta::default);
+                d.content = Some(c);
+            }
+            if !w.is_empty() {
+                warnings = Some(w);
+            }
+        }
     }
     let want_lp = lp_k.is_some() && !step.ids.is_empty() && parser.include_reasoning;
     if delta.is_none() && !finished && !want_lp && !ret_ids {
@@ -806,7 +951,7 @@ async fn chat_step(
             x.raw("logprobs", b"null");
         }
         match step.finish_reason {
-            Some(fr) => x.str("finish_reason", if *tools_streamed && fr == "stop" { "tool_calls" } else { fr }),
+            Some(fr) => x.str("finish_reason", finish_with_calls(*tools_streamed, fr)),
             None => x.raw("finish_reason", b"null"),
         }
         if ret_ids {
@@ -817,11 +962,22 @@ async fn chat_step(
         if finished {
             stop_reason_json(x.key("stop_reason"), &step.stop_reason);
         }
+        if let Some(ws) = &warnings {
+            let w = x.key("warnings");
+            w.push(b'[');
+            for (i, s) in ws.iter().enumerate() {
+                if i > 0 {
+                    w.push(b',');
+                }
+                pyjson::string(w, s);
+            }
+            w.push(b']');
+        }
         x.end();
         ch.push(b']');
     }
     if continuous {
-        usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None);
+        usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None, None);
     }
     c.end();
     sse.json(o).await
@@ -899,6 +1055,9 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
     let skip_special = body.get("skip_special_tokens").is_none_or(|v| truthy(Some(v)));
     let stream = truthy(body.get("stream"));
     let mut gen = Generation::new(&st.tok, rid, prompt, params, skip_special, !stream);
+    if truthy(body.get("return_step_stats")) {
+        gen.want_step_stats();
+    }
     if stream {
         let (sse, resp) = Sse::open();
         tokio::spawn(async move { completions_stream(st, body, gen, sse).await });
@@ -959,6 +1118,7 @@ fn completions_full(st: &State, body: &Map<String, Value>, gen: &Generation, cre
         st.prompt_tokens_details,
         true,
         None,
+        res.step_stats.as_ref(),
     );
     c.raw("kv_transfer_params", b"null");
     c.end();
@@ -1032,7 +1192,7 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
             }
             first = false;
             if continuous {
-                usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None);
+                usage(c.key("usage"), gen.res.prompt_tokens, gen.res.completion_tokens, None, false, false, None, None);
             }
             c.end();
             if sse.json(o).await.is_err() {
@@ -1040,6 +1200,7 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
             }
         }
         if include_usage {
+            gen.finish_stats().await;
             let res = &gen.res;
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "text_completion", created, &st.model_name);
@@ -1052,6 +1213,7 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
                 st.prompt_tokens_details,
                 false,
                 None,
+                res.step_stats.as_ref(),
             );
             c.end();
             if sse.json(o).await.is_err() {
@@ -1089,10 +1251,14 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 ));
             }
             // the same effort and the same refusals as a chat request, so the counts agree
-            let th = thinking::resolve(&body, &st.template.levels, st.thinking)?;
+            let th = st.template.resolve_thinking(&body, st.thinking)?;
+            let agp_on = truthy(Some(&agp));
             let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
             let tools = normalize_tools(body.get("tools"))?;
-            let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+            let mut text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+            if th.off {
+                text = st.template.thinking_off(text, agp_on);
+            }
             st.tok
                 .aencode(text, truthy(body.get("add_special_tokens")))
                 .await
@@ -1249,6 +1415,56 @@ async fn metrics_route(st: &State) -> Response<HttpBody> {
         Err(e) => {
             response(503, "text/plain; charset=utf-8", format!("engine metrics unavailable: {}\n", e.0).into_bytes())
         }
+    }
+}
+
+/// A reply that ends normally with a tool call finishes as `tool_calls`. Any other reason stays: a call that
+/// `max_tokens` cut off finishes as `length`, so a client does not run its truncated arguments.
+fn finish_with_calls(has_calls: bool, reason: &'static str) -> &'static str {
+    if has_calls && reason == "stop" { "tool_calls" } else { reason }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::finish_with_calls;
+
+    #[test]
+    fn a_cut_off_call_finishes_as_length() {
+        assert_eq!(finish_with_calls(true, "stop"), "tool_calls");
+        assert_eq!(finish_with_calls(true, "length"), "length");
+        assert_eq!(finish_with_calls(false, "stop"), "stop");
+        assert_eq!(finish_with_calls(false, "length"), "length");
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn step_stats_are_in_usage_only_when_given() {
+        let mut o = Vec::new();
+        usage(&mut o, 10, 5, Some(4), true, true, None, None);
+        let v: Value = serde_json::from_slice(&o).unwrap();
+        assert!(v.get("step_stats").is_none());
+        let s = StepStats {
+            steps: 3,
+            draft_tokens: 9,
+            accepted_tokens: 4,
+            accepted_per_pos: vec![2, 1, 1],
+            generated_tokens: 7,
+            prefill_s: Some(0.125),
+            decode_s: None,
+        };
+        let mut o = Vec::new();
+        usage(&mut o, 10, 5, Some(4), true, true, None, Some(&s));
+        let v: Value = serde_json::from_slice(&o).unwrap();
+        assert_eq!(v["completion_tokens"], 5);
+        assert_eq!(
+            v["step_stats"],
+            serde_json::json!({"steps": 3, "draft_tokens": 9, "accepted_tokens": 4, "accepted_per_pos": [2, 1, 1],
+                               "generated_tokens": 7, "prefill_s": 0.125})
+        );
     }
 }
 

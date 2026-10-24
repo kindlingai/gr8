@@ -6,6 +6,7 @@
 mod api;
 mod engine;
 mod gen;
+mod jsonmode;
 mod logprobs;
 mod metrics;
 mod parser;
@@ -13,6 +14,7 @@ mod pyjson;
 mod sampling;
 mod template;
 mod thinking;
+mod grammar;
 mod tok;
 mod tool_choice;
 mod util;
@@ -47,6 +49,8 @@ pub struct State {
     pub share_tokens: u64,
     /// reasoning_effort and thinking_budget for a request that names none
     pub thinking: thinking::Defaults,
+    /// the grammar compiler for response_format json_schema
+    pub grammars: grammar::Grammars,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
@@ -69,6 +73,7 @@ struct Args {
     max_connections: usize,
     default_effort: Option<&'static str>,
     default_budget: u64,
+    allow_thinking_off: bool,
     supervisor: Option<String>,
 }
 
@@ -79,7 +84,8 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max]
-                  [--default-thinking-budget N] [--supervisor HOST:PORT]";
+                  [--default-thinking-budget N] [--allow-thinking-off]
+                  [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -99,6 +105,7 @@ fn parse_args() -> Result<Args, String> {
         max_connections: 512,
         default_effort: None,
         default_budget: 0,
+        allow_thinking_off: false,
         supervisor: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -145,6 +152,7 @@ fn parse_args() -> Result<Args, String> {
                 a.default_budget =
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
+            "--allow-thinking-off" => a.allow_thinking_off = true,
             "--supervisor" => a.supervisor = Some(next(&mut i, &flag, inline)?),
             "--encode-threads" => {
                 a.encode_threads = next(&mut i, &flag, inline)?.parse().map_err(|_| "--encode-threads: not a number")?
@@ -231,12 +239,14 @@ async fn serve(args: Args) -> Result<(), String> {
         template::ChatTemplate::load(&PathBuf::from(&args.model_dir), tok.eos_token.clone(), tok.pad_token.clone())?;
     log::info!("tokenizer + template loaded in {:.0} ms (vocab {})", t0.elapsed().as_secs_f64() * 1e3, tok.vocab_size);
     log::info!(
-        "reasoning efforts the template names: {:?}; default effort {:?}, default thinking budget {}",
+        "reasoning efforts the template names: {:?}; default effort {:?}, default thinking budget {}, thinking off {}",
         template.levels,
         args.default_effort,
-        args.default_budget
+        args.default_budget,
+        if args.allow_thinking_off { "allowed" } else { "refused" }
     );
     let engine = engine::Engine::new(args.engine_sock.clone());
+    let grammars = grammar::Grammars::load(&PathBuf::from(&args.model_dir), tok.vocab_size)?;
     let st: &'static State = Box::leak(Box::new(State {
         tok,
         template,
@@ -249,7 +259,12 @@ async fn serve(args: Args) -> Result<(), String> {
         max_model_len_override: args.max_model_len,
         default_max_tokens: args.default_max_tokens,
         share_tokens: args.share_tokens,
-        thinking: thinking::Defaults { effort: args.default_effort, budget: args.default_budget },
+        thinking: thinking::Defaults {
+            effort: args.default_effort,
+            budget: args.default_budget,
+            allow_off: args.allow_thinking_off,
+        },
+        grammars,
         started: util::now_secs(),
         supervisor: args.supervisor,
     }));

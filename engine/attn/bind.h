@@ -2,8 +2,8 @@
 #include "attn.h"
 #include "replay.h"
 
-// Every weight below is contiguous BF16 device storage. Shape is copied from
-// the manifest, NOT inferred from a pointer. No dependency on the pack loader.
+// Every weight below is contiguous BF16 device storage, except UK / UV when uks / uvs are set (#50: E4M3 bytes + f32
+// scales). Shape is copied from the manifest, NOT inferred from a pointer. No dependency on the pack loader.
 struct G6AttnTensor {
     const void* data;
     int ndim;
@@ -15,6 +15,13 @@ struct G6AttnPack {
     G6AttnTensor kv_norm;     // Lnnn.kv_a_norm [512]
     G6AttnTensor index_norm;  // Lnnn.idx.k_norm.w [128], only full-index layers
     G6AttnTensor index_bias;  // Lnnn.idx.k_norm.b [128], only full-index layers
+#if G6_MODEL_FLASH
+    G6AttnTensor index_ape;   // Lnnn.self_attn.indexer.index_kpool_compress_ape [4,128]; uk is [H,256,512], not transposed
+#endif
+    // #50 (G6_KVB=fp8): uk / uv are u8 E4M3 [H,192,512] / [H,256,512] and these their f32 scales, the release's 128x128
+    // block scale of every weight row and 128-column block. Both null: uk / uv are BF16.
+    G6AttnTensor uks;         // Lnnn.kv_b.uk.scale [H,192,4]; transposed once by binder to [H,4,192]
+    G6AttnTensor uvs;         // Lnnn.kv_b.uv.scale [H,256,4]; borrowed unchanged
 };
 struct G6AttnStep {
     int rows, context;        // current logical context, NOT allocated capacity
@@ -23,6 +30,9 @@ struct G6AttnStep {
     const int *positions;    // device int32 [rows], absolute positions
     const int *reuse_indices, *reuse_row_map; // device [reuse_rows,2048], [rows]
     int reuse_rows;
+#if G6_MODEL_FLASH
+    const void* index_gate;   // FP16 [rows,128] x @ index_kpool_compress_gate^T, full-index steps only
+#endif
 #ifdef DEC_S2
     int s2_batched;           // the step is replayed with a batched cell (G6AttnStepCell::rows): rows of several sessions
 #endif
@@ -52,6 +62,10 @@ extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_row
 // ext_scratch / ext_bytes as g6_attn_bind_create_ext (nullptr, 0 = own scratch).
 extern "C" int g6_attn_bind_create_cp(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,
     int max_rows, int query_tile, int cp_R, int cp_nr, void* stream, void* ext_scratch, size_t ext_bytes);
+// cp_phys > 0: at most cp_phys physical pages (>= cp_R / 64); this rank's tail pages past them have -1 in the table as
+// built, and the driver maps them (remote rows release, runtime/rt_rows.cuh). 0 = every tail page, as above.
+extern "C" int g6_attn_bind_create_cp_phys(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,
+    int max_rows, int query_tile, int cp_R, int cp_nr, int cp_phys, void* stream, void* ext_scratch, size_t ext_bytes);
 #endif
 // Validate step, populate args and clear only its error word; preserve KV history.
 // Full-index layers may also reuse (MTP later iterations). Shared layers MUST reuse.
@@ -66,5 +80,8 @@ extern "C" int g6_attn_bind_replay_init(G6AttnBinding*, const G6AttnStep*,
     G6AttnStepCell*, int captured_capacity, G6AttnReplay*, void* stream);
 // Explicit new-sequence reset: clear caches/output/error and set indices to -1.
 extern "C" int g6_attn_bind_reset(G6AttnBinding*, void* stream);
+// #50: rows x 512 E4M3 weights with f32 scales [rows][4] (one per row and 128-column block) -> BF16 [rows][512], each
+// BF16(e4m3 x scale): the bytes the BF16 loader stores for the same weights (engine/loader-rs/src/release.rs).
+extern "C" int g6_attn_kvb_bf16(const void* fp8, const float* scale, void* bf16, int rows, void* stream);
 // Complete outstanding uses before release; frees ONLY binder-owned storage.
 extern "C" int g6_attn_bind_release(G6AttnBinding*);

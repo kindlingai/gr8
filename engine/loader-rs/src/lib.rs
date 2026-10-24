@@ -1,5 +1,5 @@
 //! gr8 pack loader. Builds a rank's device image (the pack's bytes at the manifest's offsets) from the pack file and,
-//! for a sparse pack (tools/convert/convert.py --v2-refs, tools/convert/v2pack.py), the ranges its rank<r>.sources
+//! for a sparse pack (--v2-refs), the ranges its rank<r>.sources
 //! names. Worker threads fill fixed-size chunks of the image in parallel, each into its own pinned staging buffer, and
 //! hand every chunk to the caller's copy callback (cudaMemcpy in g6m4). The image is byte for byte the one
 //! engine/loader/devimage.cpp builds. Nothing is hashed: checking the files is an offline step.
@@ -20,6 +20,7 @@ pub mod dflash2;
 pub mod exlr8;
 pub mod fetch;
 pub mod json;
+pub mod layout;
 mod plan;
 pub mod records;
 pub mod release;
@@ -142,10 +143,10 @@ impl Loader<'_> {
                         .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
                     g.used(y - x);
                 }
-                Op::Item128 => {
+                Op::Item128 { hidden } => {
                     let n = s.nbytes as usize;
                     self.read(s.file, s.file_off, half.slice(n))?;
-                    plan::item128_to_g6(half.slice(n), perm.slice(n));
+                    plan::item128_to_g6_geometry(half.slice(n), perm.slice(n), hidden);
                     buf[(x - a) as usize..(y - a) as usize]
                         .copy_from_slice(&perm.slice(n)[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
                     read += s.nbytes;
@@ -169,6 +170,15 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<
         }
     }
     Ok(())
+}
+
+/// G6_KVB (#50): `fp8` plans kv_b (UK / UV) as the release's block FP8 bytes and scales, unset or `bf16` as BF16.
+fn kvb_fp8() -> Result<bool, String> {
+    match std::env::var("G6_KVB").as_deref() {
+        Err(_) | Ok("") | Ok("bf16") => Ok(false),
+        Ok("fp8") => Ok(true),
+        Ok(v) => Err(format!("G6_KVB={v}: use bf16 or fp8")),
+    }
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -311,7 +321,8 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
 
 /// Plans rank `rank`'s image at TP `nr` from the exlr8 v2 release alone (src/release.rs): the dense and vocabulary
 /// files under `dense_dir`, the experts from the width files under `v2_dir` at the offsets of the index slices under
-/// `slices_dir`, at the widths of the width manifest. Writes the image's manifest to `out_manifest`. On rank 0 it also
+/// `slices_dir`, at the widths of the width manifest. The rank holds the pieces the layout file `layout` gives it
+/// (src/layout.rs), or with NULL or "" the formulas'. Writes the image's manifest to `out_manifest`. On rank 0 it also
 /// prints the form of each matrix to stderr. Returns a handle for g6l_plan_load and g6l_plan_free, or
 /// NULL with a message in `err`.
 ///
@@ -320,14 +331,15 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
 #[no_mangle]
 pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *const c_char, slices_dir: *const c_char,
                                           widths: *const c_char, nr: u32, rank: u32, qo: i32, trellis: i32,
-                                          out_manifest: *const c_char,
+                                          layout: *const c_char, out_manifest: *const c_char,
                                           err: *mut c_char, errlen: usize) -> *mut c_void {
     let t0 = Instant::now();
     let arg = |p, what| cstr(p).ok_or(format!("g6l_release_plan: no {what}"));
     let r = (|| {
+        let layout = cstr(layout).map(|p| layout::Layout::read(&p)).transpose()?;
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
-                                         &arg(widths, "width manifest")?, nr as usize, rank as usize,
-                                         release::Opts { qo: qo != 0, trellis: trellis != 0 })?;
+                                         &arg(widths, "width manifest")?, nr as usize, rank as usize, layout.as_ref(),
+                                         release::Opts { qo: qo != 0, trellis: trellis != 0, kvb_fp8: kvb_fp8()? })?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
         if rank == 0 {
@@ -380,11 +392,11 @@ pub fn read_range(plan: &Plan, a: u64, buf: &mut [u8]) -> Result<(), String> {
             Op::Copy => read_exact_at(&file()?, dst, s.file_off + lo as u64).map_err(|e| format!("{}: {e}", plan.files[s.file]))?,
             Op::Mem => dst.copy_from_slice(&plan.mems[s.file][lo..hi]),
             Op::Gen => dst.copy_from_slice(&plan.gens[s.file].compute()?[lo..hi]),
-            Op::Item128 => {
+            Op::Item128 { hidden } => {
                 let n = s.nbytes as usize;
                 let (mut half, mut perm) = (vec![0u8; n], vec![0u8; n]);
                 read_exact_at(&file()?, &mut half, s.file_off).map_err(|e| format!("{}: {e}", plan.files[s.file]))?;
-                plan::item128_to_g6(&half, &mut perm);
+                plan::item128_to_g6_geometry(&half, &mut perm, hidden);
                 dst.copy_from_slice(&perm[lo..hi]);
             }
         }

@@ -31,7 +31,7 @@ inline bool qo_check(const QoW& w)
 {
     auto is = [](const bind::Tensor& t, long long a, long long b) { return t.p && t.nd == 2 && t.shape[0] == a && t.shape[1] == b; };
     auto is3 = [](const G6AttnTensor& t, long long a, long long b, long long c) { return t.data && t.ndim == 3 && t.shape[0] == a && t.shape[1] == b && t.shape[2] == c; };
-    return is(w.qb_c, 16384, 2048) && is(w.qb_s, 16384, 64) && is(w.o_c, HID, 16384) && is(w.o_s, HID, 512) &&
+    return is(w.qb_c, 16384, geom::QA) && is(w.qb_s, 16384, geom::QA / 32) && is(w.o_c, HID, 16384) && is(w.o_s, HID, 512) &&
            is3(w.uk, 64, 192, 512) && is3(w.uv, 64, 256, 512);
 }
 inline bool qo_from_pack(const Find& find, int l, QoW& w)
@@ -40,8 +40,33 @@ inline bool qo_from_pack(const Find& find, int l, QoW& w)
     auto get = [&](const char* s) { snprintf(n, sizeof n, "L%03d.qo.%s", l, s); return find(n); };
     w.qb_c = as_bind(get("q_b.mx.codes")); w.qb_s = as_bind(get("q_b.mx.scales"));
     w.o_c = as_bind(get("o_proj.mx.codes")); w.o_s = as_bind(get("o_proj.mx.scales"));
-    w.uk = qo_attn_tensor(get("kv_b.uk")); w.uv = qo_attn_tensor(get("kv_b.uv"));
+    const TensorRef uk = get("kv_b.uk"), uv = get("kv_b.uv");
+    if ((uk.p && !uk.bf16) || (uv.p && !uv.bf16)) die("L" + std::to_string(l) + ".qo.kv_b: the QO pack's UK / UV must be BF16");
+    w.uk = qo_attn_tensor(uk); w.uv = qo_attn_tensor(uv);
     return qo_check(w);
+}
+// #50 (G6_KVB=fp8): a rank's kv_b.uk / kv_b.uv may be E4M3 with f32 scales (kv_b.uk.scale / kv_b.uv.scale). Every QO and
+// pair-owner path keeps its BF16 UK / UV staging: kvb_put writes `rows` rows of 512 BF16 weights into dst from a BF16
+// tensor (a copy) or from an FP8 one (g6_attn_kvb_bf16: the BF16 bytes the BF16 loader stores), on stream b. sync: a BF16
+// copy is a synchronous cudaMemcpy (the load-time assemblers' copies on main) and an FP8 expansion is waited for.
+inline void kvb_put(void* dst, const void* w, const void* scale, size_t rows, cudaStream_t b, bool sync = false)
+{
+    if (scale)
+    {
+        if (int e = g6_attn_kvb_bf16(w, (const float*)scale, dst, (int)rows, b)) die("g6_attn_kvb_bf16 failed (" + std::to_string(e) + ")");
+        if (sync) G6RT_CK(cudaStreamSynchronize(b));
+    }
+    else if (sync) G6RT_CK(cudaMemcpy(dst, w, rows * 512 * 2, cudaMemcpyDeviceToDevice));
+    else G6RT_CK(cudaMemcpyAsync(dst, w, rows * 512 * 2, cudaMemcpyDefault, b));
+}
+// the scale tensor of an FP8 kv_b.uk / kv_b.uv (nullptr for a BF16 one); dies on an FP8 tensor without one
+inline const void* kvb_scale(const Find& f, const std::string& name, const TensorRef& t)
+{
+    if (!t.p || t.bf16) return nullptr;
+    const TensorRef s = f(name + ".scale");
+    if (!s.p || s.nd != 3 || s.shape[0] != t.shape[0] || s.shape[1] != t.shape[1] || s.shape[2] != 4)
+        die(name + " is not BF16 and has no [h][d][4] .scale (G6_KVB=fp8 form)");
+    return s.p;
 }
 // finds[r] = rank r's tensors. Device allocations are never freed (load-time, like the packs).
 inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
@@ -57,7 +82,7 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
     auto alloc3 = [](G6AttnTensor& t, long long a, long long b, long long c) {
         t.data = dmalloc<char>((size_t)a * b * c * 2); t.ndim = 3; t.shape[0] = a; t.shape[1] = b; t.shape[2] = c;
     };
-    alloc2(w.qb_c, 16384, 2048, 1); alloc2(w.qb_s, 16384, 64, 1);
+    alloc2(w.qb_c, 16384, geom::QA, 1); alloc2(w.qb_s, 16384, geom::QA / 32, 1);
     alloc2(w.o_c, HID, 16384, 1); alloc2(w.o_s, HID, 512, 1);
     alloc3(w.uk, 64, 192, 512); alloc3(w.uv, 64, 256, 512);
     char n[80];
@@ -72,16 +97,20 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
         };
         const TensorRef qc = get("q_b.mx.codes"), qs = get("q_b.mx.scales"), oc = get("o_proj.mx.codes"), os = get("o_proj.mx.scales");
         const TensorRef uk = get("kv_b.uk"), uv = get("kv_b.uv");
-        if (qc.shape[0] != h * 256 || qc.shape[1] != 2048 || qs.shape[1] != 64 || oc.shape[0] != HID || oc.shape[1] != h * 256 ||
+        snprintf(n, sizeof n, "L%03d.kv_b.uk", l);
+        const void* uks = kvb_scale(finds[r], n, uk);
+        snprintf(n, sizeof n, "L%03d.kv_b.uv", l);
+        const void* uvs = kvb_scale(finds[r], n, uv);
+        if (qc.shape[0] != h * 256 || qc.shape[1] != geom::QA || qs.shape[1] != geom::QA / 32 || oc.shape[0] != HID || oc.shape[1] != h * 256 ||
             os.shape[1] != h * 8 || uk.shape[0] != h || uv.shape[0] != h)
             die("qo_from_ranks: layer " + std::to_string(l) + " rank " + std::to_string(r) + " slice shapes are not head group " + std::to_string(g));
         char* qbc = (char*)w.qb_c.p; char* qbs = (char*)w.qb_s.p; char* oc_ = (char*)w.o_c.p; char* os_ = (char*)w.o_s.p;
-        G6RT_CK(cudaMemcpy(qbc + (size_t)h0 * 256 * 2048, qc.p, (size_t)h * 256 * 2048, cudaMemcpyDeviceToDevice));
-        G6RT_CK(cudaMemcpy(qbs + (size_t)h0 * 256 * 64, qs.p, (size_t)h * 256 * 64, cudaMemcpyDeviceToDevice));
+        G6RT_CK(cudaMemcpy(qbc + (size_t)h0 * 256 * geom::QA, qc.p, (size_t)h * 256 * geom::QA, cudaMemcpyDeviceToDevice));
+        G6RT_CK(cudaMemcpy(qbs + (size_t)h0 * 256 * (geom::QA / 32), qs.p, (size_t)h * 256 * (geom::QA / 32), cudaMemcpyDeviceToDevice));
         G6RT_CK(cudaMemcpy2D(oc_ + (size_t)h0 * 256, 16384, oc.p, (size_t)h * 256, (size_t)h * 256, HID, cudaMemcpyDeviceToDevice));
         G6RT_CK(cudaMemcpy2D(os_ + (size_t)h0 * 8, 512, os.p, (size_t)h * 8, (size_t)h * 8, HID, cudaMemcpyDeviceToDevice));
-        G6RT_CK(cudaMemcpy((char*)w.uk.data + (size_t)h0 * 192 * 512 * 2, uk.p, (size_t)h * 192 * 512 * 2, cudaMemcpyDeviceToDevice));
-        G6RT_CK(cudaMemcpy((char*)w.uv.data + (size_t)h0 * 256 * 512 * 2, uv.p, (size_t)h * 256 * 512 * 2, cudaMemcpyDeviceToDevice));
+        kvb_put((char*)w.uk.data + (size_t)h0 * 192 * 512 * 2, uk.p, uks, (size_t)h * 192, nullptr, true);
+        kvb_put((char*)w.uv.data + (size_t)h0 * 256 * 512 * 2, uv.p, uvs, (size_t)h * 256, nullptr, true);
     }
     if (!qo_check(w)) die("qo_from_ranks: assembled shapes wrong");
     return w;
@@ -91,7 +120,7 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
 // holds 32 heads of layer l, the two groups g(m) = (m - l) mod 4 in logical order (lower group first): q_b [8192][2048]
 // (+ [8192][64]), o_proj [6144][8192] (+ [6144][256]), UK / UV [32][192][512] / [32][256][512] BF16. Byte-identical on
 // both pair members.
-//   qp_from_pack:  L%03d.qp.{q_b.mx.codes, q_b.mx.scales, o_proj.mx.codes, o_proj.mx.scales} of tools/convert/pairpack.py's
+//   qp_from_pack:  L%03d.qp.{q_b.mx.codes, q_b.mx.scales, o_proj.mx.codes, o_proj.mx.scales} of a resident pair pack's
 //                  qp.rank<r>.pack, UK / UV assembled on the device from the rank's own L%03d.kv_b.{uk,uv} and the pack's
 //                  L%03d.qp.kv_b.{uk,uv} (the partner's 16 heads)
 //   qp_from_ranks: everything assembled on the device from the two pair members' head slices (m4sim holds all packs)
@@ -122,7 +151,7 @@ inline bool qp_check(const QpW& w)
 {
     auto is = [](const bind::Tensor& t, long long a, long long b) { return t.p && t.nd == 2 && t.shape[0] == a && t.shape[1] == b; };
     auto is3 = [](const G6AttnTensor& t, long long a, long long b, long long c) { return t.data && t.ndim == 3 && t.shape[0] == a && t.shape[1] == b && t.shape[2] == c; };
-    return is(w.qb_c, 8192, 2048) && is(w.qb_s, 8192, 64) && is(w.o_c, HID, 8192) && is(w.o_s, HID, 256) &&
+    return is(w.qb_c, 8192, geom::QA) && is(w.qb_s, 8192, geom::QA / 32) && is(w.o_c, HID, 8192) && is(w.o_s, HID, 256) &&
            is3(w.uk, QP_HEADS, 192, 512) && is3(w.uv, QP_HEADS, 256, 512);
 }
 inline void qp_alloc2(bind::Tensor& t, long long a, long long b)
@@ -141,13 +170,16 @@ inline void qp_alloc_vec(QpW& w)
     if (!w.qb_svh) { w.qb_svh = dmalloc<__half>(8192); w.o_suh = dmalloc<__half>(8192); }
 }
 // half k (0 = lower group, 1 = upper) of the pair's UK / UV <- a 16-head slice [16][d][512] BF16
-inline void qp_put_kvb(QpW& w, int k, const TensorRef& uk, const TensorRef& uv, const std::string& what)
+// uks / uvs: the slice's FP8 scales (kvb_scale; nullptr = BF16 slice)
+inline void qp_put_kvb(QpW& w, int k, const TensorRef& uk, const TensorRef& uv, const std::string& what,
+                       const void* uks = nullptr, const void* uvs = nullptr)
 {
     if (uk.nd != 3 || uk.shape[0] != 16 || uk.shape[1] != 192 || uk.shape[2] != 512 || uv.nd != 3 || uv.shape[0] != 16 ||
         uv.shape[1] != 256 || uv.shape[2] != 512)
         die("qp: " + what + " kv_b.uk / kv_b.uv are not [16][192|256][512]");
-    G6RT_CK(cudaMemcpy((char*)w.uk.data + (size_t)k * 16 * 192 * 512 * 2, uk.p, (size_t)16 * 192 * 512 * 2, cudaMemcpyDeviceToDevice));
-    G6RT_CK(cudaMemcpy((char*)w.uv.data + (size_t)k * 16 * 256 * 512 * 2, uv.p, (size_t)16 * 256 * 512 * 2, cudaMemcpyDeviceToDevice));
+    if ((!uk.bf16 && !uks) || (!uv.bf16 && !uvs)) die("qp: " + what + " kv_b.uk / kv_b.uv are not BF16 and have no scales");
+    kvb_put((char*)w.uk.data + (size_t)k * 16 * 192 * 512 * 2, uk.p, uks, (size_t)16 * 192, nullptr, true);
+    kvb_put((char*)w.uv.data + (size_t)k * 16 * 256 * 512 * 2, uv.p, uvs, (size_t)16 * 256, nullptr, true);
 }
 inline void qp_free_kvb(QpW& w)
 {
@@ -166,14 +198,19 @@ inline bool qp_from_pack(const Find& qfind, const Find& find, int r, int l, QpW&
     if (!puk.p || !puv.p || !ouk.p || !ouv.p) return false;
     qp_alloc_kvb(w);
     const bool own_lo = qp_order(r, l).first == r;
-    qp_put_kvb(w, own_lo ? 0 : 1, ouk, ouv, "layer " + std::to_string(l) + " own");
+    snprintf(n, sizeof n, "L%03d.kv_b.uk", l);
+    const void* ouks = kvb_scale(find, n, ouk);
+    snprintf(n, sizeof n, "L%03d.kv_b.uv", l);
+    const void* ouvs = kvb_scale(find, n, ouv);
+    qp_put_kvb(w, own_lo ? 0 : 1, ouk, ouv, "layer " + std::to_string(l) + " own", ouks, ouvs);
     qp_put_kvb(w, own_lo ? 1 : 0, puk, puv, "layer " + std::to_string(l) + " partner (qp pack)");
     return qp_check(w);
 }
 // the 16-head slice of pair member m: q_b / o_proj codes and scales, UK / UV (shape-checked); qv / ov: a dense trellis
 // q_b's svh slice and o_proj's suh slice [4096] (p = nullptr: that matrix is MXFP8). The two can differ: the release
 // keeps layer 3's o_proj in int4 next to a trellis q_b.
-struct QpHalf { TensorRef qc, qs, oc, os, uk, uv, qv, ov; };
+// uks / uvs: the FP8 kv_b's scales (G6_KVB=fp8, kvb_scale); nullptr = BF16 uk / uv
+struct QpHalf { TensorRef qc, qs, oc, os, uk, uv, qv, ov; const void *uks = nullptr, *uvs = nullptr; };
 inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
 {
     char n[80];
@@ -206,35 +243,47 @@ inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
     }
     else if (h.oc.shape[0] != HID || h.oc.shape[1] != 16 * 256 || h.os.shape[1] != 16 * 8)
         die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " o_proj slice is not 16 heads");
-    if (h.qc.shape[0] != 16 * 256 || h.qc.shape[1] != 2048 || h.qs.shape[1] != 64 || h.uk.nd != 3 || h.uk.shape[0] != 16 ||
+    snprintf(n, sizeof n, "L%03d.kv_b.uk", l);
+    h.uks = kvb_scale(f, n, h.uk);
+    snprintf(n, sizeof n, "L%03d.kv_b.uv", l);
+    h.uvs = kvb_scale(f, n, h.uv);
+    if (h.qc.shape[0] != 16 * 256 || h.qc.shape[1] != geom::QA || h.qs.shape[1] != geom::QA / 32 || h.uk.nd != 3 || h.uk.shape[0] != 16 ||
         h.uk.shape[1] != 192 || h.uv.nd != 3 || h.uv.shape[0] != 16 || h.uv.shape[1] != 256)
         die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " slice shapes are not 16 heads");
     return h;
 }
-// slot half k <- the six tensors at qc .. uv (device or pinned), on stream b. The same bytes and layout as pairpack.py.
+// slot half k <- the six tensors at qc .. uv (device or pinned), on stream b. The same bytes and layout as a resident pair pack.
 // qv / ov: the dense trellis vectors of q_b / o_proj (nullptr: that matrix is MXFP8). With ov, oc is the half's raw
 // o_proj entries, which go to byte k * OT of o_c (64 entries of the pair back to back, k_gemm_tr's side-2 layout), and os
 // is unused. A rolling slot holds layers of every form, and the reader picks by each matrix's form (qp.cuh).
-inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const void* oc, const void* os, const void* uk, const void* uv,
-                        cudaStream_t b, const void* qv = nullptr, const void* ov = nullptr)
+// qp_put_half without UK / UV (the q_b / o_proj codes, scales and trellis vectors)
+inline void qp_put_half_nokvb(const QpW& w, int k, const void* qc, const void* qs, const void* oc, const void* os,
+                              cudaStream_t b, const void* qv = nullptr, const void* ov = nullptr)
 {
     if ((qv || ov) && !w.qb_svh) die("qp: a dense trellis half for a slot without vector buffers");
     if (qv) G6RT_CK(cudaMemcpyAsync(w.qb_svh + (size_t)k * 4096, qv, (size_t)4096 * 2, cudaMemcpyDefault, b));
     if (ov) G6RT_CK(cudaMemcpyAsync(w.o_suh + (size_t)k * 4096, ov, (size_t)4096 * 2, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync((char*)w.qb_c.p + (size_t)k * 4096 * 2048, qc, (size_t)4096 * 2048, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync((char*)w.qb_s.p + (size_t)k * 4096 * 64, qs, (size_t)4096 * 64, cudaMemcpyDefault, b));
+    G6RT_CK(cudaMemcpyAsync((char*)w.qb_c.p + (size_t)k * 4096 * geom::QA, qc, (size_t)4096 * geom::QA, cudaMemcpyDefault, b));
+    G6RT_CK(cudaMemcpyAsync((char*)w.qb_s.p + (size_t)k * 4096 * (geom::QA / 32), qs, (size_t)4096 * (geom::QA / 32), cudaMemcpyDefault, b));
     if (ov) G6RT_CK(cudaMemcpyAsync((char*)w.o_c.p + (size_t)k * qw::OT, oc, qw::OT, cudaMemcpyDefault, b));
     else
     {
         G6RT_CK(cudaMemcpy2DAsync((char*)w.o_c.p + (size_t)k * 4096, 8192, oc, 4096, 4096, HID, cudaMemcpyDefault, b));
         G6RT_CK(cudaMemcpy2DAsync((char*)w.o_s.p + (size_t)k * 128, 256, os, 128, 128, HID, cudaMemcpyDefault, b));
     }
-    G6RT_CK(cudaMemcpyAsync((char*)w.uk.data + (size_t)k * 16 * 192 * 512 * 2, uk, (size_t)16 * 192 * 512 * 2, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync((char*)w.uv.data + (size_t)k * 16 * 256 * 512 * 2, uv, (size_t)16 * 256 * 512 * 2, cudaMemcpyDefault, b));
+}
+// uks / uvs (G6_KVB=fp8): uk / uv are the half's E4M3 kv_b and these its scales; the slot gets their BF16 (kvb_put).
+inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const void* oc, const void* os, const void* uk, const void* uv,
+                        cudaStream_t b, const void* qv = nullptr, const void* ov = nullptr, const void* uks = nullptr,
+                        const void* uvs = nullptr)
+{
+    qp_put_half_nokvb(w, k, qc, qs, oc, os, b, qv, ov);
+    kvb_put((char*)w.uk.data + (size_t)k * 16 * 192 * 512 * 2, uk, uks, (size_t)16 * 192, b);
+    kvb_put((char*)w.uv.data + (size_t)k * 16 * 256 * 512 * 2, uv, uvs, (size_t)16 * 256, b);
 }
 inline void qp_alloc(QpW& w)
 {
-    qp_alloc2(w.qb_c, 8192, 2048); qp_alloc2(w.qb_s, 8192, 64); qp_alloc2(w.o_c, HID, 8192); qp_alloc2(w.o_s, HID, 256);
+    qp_alloc2(w.qb_c, 8192, geom::QA); qp_alloc2(w.qb_s, 8192, geom::QA / 32); qp_alloc2(w.o_c, HID, 8192); qp_alloc2(w.o_s, HID, 256);
     qp_alloc_kvb(w);
 }
 // finds[m] = rank m's tensors; rank r's pair weights of layer l. Device allocations of q_b / o_proj are never freed.
@@ -249,7 +298,7 @@ inline QpW qp_from_ranks(const std::vector<Find>& finds, int r, int l)
         const int m = k ? ord.second : ord.first;
         const QpHalf h = qp_half(finds[m], m, l, "qp_from_ranks");
         if (h.qv.p || h.ov.p) qp_alloc_vec(w);
-        qp_put_half(w, k, h.qc.p, h.qs.p, h.oc.p, h.os.p, h.uk.p, h.uv.p, nullptr, h.qv.p, h.ov.p);
+        qp_put_half(w, k, h.qc.p, h.qs.p, h.oc.p, h.os.p, h.uk.p, h.uv.p, nullptr, h.qv.p, h.ov.p, h.uks, h.uvs);
     }
     G6RT_CK(cudaDeviceSynchronize());
     if (!qp_check(w)) die("qp_from_ranks: assembled shapes wrong");
@@ -399,6 +448,15 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     const unsigned pe = (unsigned)(e << 4) | (unsigned)x.peer;
     const unsigned long long tg = qw::tag(q.layer, x.S, x.E, x.ctx, q.form);
     const QpHalf& o = q.h[oh];
+    // G6_KVB=fp8: the wire carries BF16 UK / UV (qp_wire.h layout, both members alike), so my half's are expanded into my
+    // half of the slot first (it needs only the slot's `used` events, waited by qp_roll_build) and sent from there
+    const void *wuk = o.uk.p, *wuv = o.uv.p;
+    if (o.uks)
+    {
+        wuk = (char*)w.uk.data + (size_t)oh * 16 * 192 * 512 * 2; wuv = (char*)w.uv.data + (size_t)oh * 16 * 256 * 512 * 2;
+        kvb_put(const_cast<void*>(wuk), o.uk.p, o.uks, (size_t)16 * 192, b);
+        kvb_put(const_cast<void*>(wuv), o.uv.p, o.uvs, (size_t)16 * 256, b);
+    }
     k_qp_wait<<<1, 32, 0, b>>>(x.bd, qw::f_consumed(e), x.peer, qw::consumed_min(n, x.E), qw::ERR_WAIT_CONSUMED | pe, 0ull, 0u);
     G6RT_CK(cudaGetLastError());
     char* tx = x.bd.bulk + qw::pos_off(e, oh);
@@ -406,8 +464,8 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QS, o.qs.p, qw::QS, cudaMemcpyDefault, b));
     G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OC, o.oc.p, q.form & 2 ? qw::OT : qw::OC, cudaMemcpyDefault, b));
     if (!(q.form & 2)) G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OS, o.os.p, qw::OS, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UK, o.uk.p, qw::UK, cudaMemcpyDefault, b));
-    G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UV, o.uv.p, qw::UV, cudaMemcpyDefault, b));
+    G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UK, wuk, qw::UK, cudaMemcpyDefault, b));
+    G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_UV, wuv, qw::UV, cudaMemcpyDefault, b));
     if (q.form & 1) G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_QV, o.qv.p, qw::QV, cudaMemcpyDefault, b));
     if (q.form & 2) G6RT_CK(cudaMemcpyAsync(tx + qw::OFF_OV, o.ov.p, qw::OV, cudaMemcpyDefault, b));
     k_qp_bell<<<1, 32, 0, b>>>(x.bd.doorbell + qw::f_ready(e), qw::val(n), x.bd.aux_out + qw::f_ready(e), tg);
@@ -424,7 +482,11 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
         c.post_flag = qw::f_consumed(e); c.post_val = qw::val(n); c.peer = x.peer;
         x.enqueue(std::move(c));
     }
-    qp_put_half(w, oh, o.qc.p, o.qs.p, o.oc.p, o.os.p, o.uk.p, o.uv.p, b, o.qv.p, o.ov.p);
+    if (o.uks)   // UK / UV are in the slot already: put the rest of the half (uk / uv onto themselves skipped)
+    {
+        qp_put_half_nokvb(w, oh, o.qc.p, o.qs.p, o.oc.p, o.os.p, b, o.qv.p, o.ov.p);
+    }
+    else qp_put_half(w, oh, o.qc.p, o.qs.p, o.oc.p, o.os.p, o.uk.p, o.uv.p, b, o.qv.p, o.ov.p);
     R.bytes_own += (double)qw::HALF;
     k_qp_wait<<<1, 32, 0, b>>>(x.bd, qw::f_ready(e), x.peer, qw::val(n), qw::ERR_WAIT_READY | pe, tg, qw::ERR_TAG | pe);
     G6RT_CK(cudaGetLastError());
@@ -452,7 +514,7 @@ inline void qp_roll_build(QpRoll& R, int i, cudaStream_t st)
         for (int h = 0; h < 2; ++h)                    // m4sim: qp_from_ranks' copies, async on b
         {
             const QpHalf& x = q.h[h];
-            qp_put_half(w, h, x.qc.p, x.qs.p, x.oc.p, x.os.p, x.uk.p, x.uv.p, b, x.qv.p, x.ov.p);
+            qp_put_half(w, h, x.qc.p, x.qs.p, x.oc.p, x.os.p, x.uk.p, x.uv.p, b, x.qv.p, x.ov.p, x.uks, x.uvs);
             (h == q.partner_half ? R.bytes_partner : R.bytes_own) += (double)qw::HALF;
         }
     if (int e = g6_attn_qo_load(R.qa[s], &w.uk, &w.uv, b)) die("G6_PF_QP_ROLL: g6_attn_qo_load failed (" + std::to_string(e) + ")");

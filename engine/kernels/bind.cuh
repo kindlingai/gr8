@@ -95,6 +95,7 @@ struct LayerTensors
     int e4m3 = 0;                     // routed experts are exlr8-e4m3 (tr3.table's format): K1 decodes with E4M3 rounding
     int k2 = 1;                       // some routed fc1 / fc2 unit has width 2 (exlr8 v2): the K2 instantiations.
                                       // 1 until scan_widths ran (correct for any pack); scan_widths sets the real value
+    int k3 = 1;                       // some routed fc1 / fc2 unit has width 3 (scan_widths)
     int k2_pct = 0;                   // share of the rank's routed trellis bytes at width 2, percent (scan_widths)
     int sh_trellis = 0;               // tr3.table has row 256: the shared expert as trellis (exlr8 v2); scan_widths
                                       // sets it, a caller may clear it to run the s_* records instead (the A/B)
@@ -164,11 +165,12 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &km = T.t[T_TR3_KMIX];
     T.k2 = 0;
+    T.k3 = 0;
     T.sh_trellis = 0;
     if (!tab.p) return nullptr;
-    if (tab.nd != 2 || tab.shape[1] != 6 || (tab.shape[0] != 256 && tab.shape[0] != 257)) return "tr3.table is not [256 or 257][6]";
-    if (tab.shape[0] == 257 && !T.e4m3) return "a trellis shared expert (tr3.table row 256) needs an exlr8-e4m3 layer";
-    T.sh_trellis = tab.shape[0] == 257;
+    if (tab.nd != 2 || tab.shape[1] != 6 || (tab.shape[0] != geom::NEXP && tab.shape[0] != geom::NEXP + 1)) return "tr3.table is not [NEXP or NEXP + 1][6]";
+    if (tab.shape[0] == geom::NEXP + 1 && !T.e4m3) return "a trellis shared expert (tr3.table row NEXP) needs an exlr8-e4m3 layer";
+    T.sh_trellis = tab.shape[0] == geom::NEXP + 1;
     const size_t n = static_cast<size_t>(tab.shape[0]);
     long long* h = new long long[n * 7];
     long long* k = h + n * 6;
@@ -183,7 +185,7 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
         const long long kmi = km.p ? k[i] : 0;
         if (tr[3] <= 0)
         {
-            if (!allow_empty && i < 256) err = "a routed expert has no blocks on this rank (a partial test pack)";
+            if (!allow_empty && i < geom::NEXP) err = "a routed expert has no blocks on this rank (a partial test pack)";
             continue;
         }
         if (tr[3] > g6nr::EB) err = "an expert has more blocks than this build's EB";
@@ -191,6 +193,7 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
             if (w < 2 || w > 4) err = "routed expert width outside 2..4";
             all += w;
             if (w == 2) { T.k2 = 1; two += w; }
+            if (w == 3) T.k3 = 1;
         };
         for (long long b = 0; b < tr[3]; ++b) chk(tr[4]);                            // down blocks
         for (int u = 0; u < 2 * tr[3]; ++u) chk(kmi ? (kmi >> (4 * u)) & 15 : tr[4]);   // gate / up units
@@ -198,8 +201,8 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
     T.k2_pct = all > 0 ? static_cast<int>(100 * two / all) : 0;
     if (T.sh_trellis)
     {
-        for (int i = 0; i < 6; ++i) T.sh_tr[i] = h[256 * 6 + i];
-        T.sh_kmix = km.p ? k[256] : 0;
+        for (int i = 0; i < 6; ++i) T.sh_tr[i] = h[geom::NEXP * 6 + i];
+        T.sh_kmix = km.p ? k[geom::NEXP] : 0;
         T.sh_uniform = T.sh_kmix == 0;
     }
     delete[] h;
@@ -384,8 +387,9 @@ inline int scratch_ysh(int rows) { return rows <= 8 ? SMAX8 * 8 : 0; }
 inline size_t dtr_part_floats(int rows)
 {
     struct S { int K, N, side, epi, rot, nm; };
-    const S sh[4] = {{2048, g6nr::QBW, dtr::SIDE_OUT, dtr::EPI_OUT, 1, 1}, {g6nr::QBW, HID, dtr::SIDE_IN, dtr::EPI_OUT, 1, 1},
-                     {HID, g6nr::DENSE_CH, dtr::SIDE_OUT, dtr::EPI_GLU, 1, 2}, {g6nr::DENSE_CH, HID, dtr::SIDE_IN, dtr::EPI_OUT, 0, 1}};
+    const S sh[5] = {{geom::QA, g6nr::QBW, dtr::SIDE_OUT, dtr::EPI_OUT, 1, 1}, {g6nr::QBW, HID, dtr::SIDE_IN, dtr::EPI_OUT, 1, 1},
+                     {HID, g6nr::DENSE_CH, dtr::SIDE_OUT, dtr::EPI_GLU, 1, 2}, {g6nr::DENSE_CH, HID, dtr::SIDE_IN, dtr::EPI_OUT, 0, 1},
+                     {HID, HID, dtr::SIDE_OUT, dtr::EPI_OUT, 1, 3}};
     size_t n = 0;
     for (int M = 1; M <= rows; ++M)
         for (const S& x : sh)
@@ -499,13 +503,14 @@ inline void launch(const Xfrag& a, cudaStream_t st)
 }
 
 // ------------------------------------------------------------------------------------------ K2 + dense GEMVs
-enum { INT4 = 0, MXFP8 = 1, BF16W = 2 };
+enum { INT4 = 0, MXFP8 = 1, BF16W = 2, FP8R = 3 };
 
 struct Gv
 {
     int on = 0;
     int codec = 0;
     const uint8_t* w = nullptr;       // records [O/16][NG][GR]
+    const float* rscale = nullptr;    // [O] fp32 row scales for codec FP8R
     const u32* xfrag = nullptr;       // [K/16][32][2], BF16 fragments for codec BF16W
     int K = 0, O = 0, tpc = 1, ks = 1, M = 0;
     void* y = nullptr;                // [8][ld] of odt
@@ -539,13 +544,15 @@ inline void launch(const Gv& g, cudaStream_t st)
         if (g.slot.send)
         {
             if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int4v, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
+            else if (g.codec == BF16W) { if constexpr (NTv == 1) go(gv_gemv_slot<Bf16w, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Bf16w, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Bf16w, NTv>, g.ld, g.slot); }
             else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Mxfp8, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
             return;
         }
 #endif
-        if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt); else if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt); }
-        else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt); }
-        else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt); }
+        if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else if (g.codec == FP8R) { if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); }
     });
 }
 
@@ -573,17 +580,20 @@ inline void launch(const GvMulti& a, cudaStream_t st) { gv_multi<<<a.ctas, 1024,
 
 // tpc (output tiles per CTA) and ks (k parts per tile, one warp each): best split per shape on the GB10
 // (time is flat in M). ks is halved until it divides the tensor's group count.
-inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, const u32* xfrag, void* y, int odt, Gv& g)
+inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, const u32* xfrag, void* y, int odt, Gv& g,
+                           const float* rscale = nullptr)
 {
     g = Gv();
     if (!t.p) return nullptr;
     const int GR = codec == INT4 ? 288 : codec == MXFP8 ? 528 : 512, gk = codec == BF16W ? 16 : 32;
     if (t.nd != 3 || t.shape[2] != GR) return "GEMV tensor is not a [O/16][NG][GR] record of its codec";
+    if (codec == FP8R && !rscale) return "FP8R GEMV requires row scales";
     const int ng = static_cast<int>(t.shape[1]);
     while (ks > 1 && ng % ks) ks >>= 1;
     while (tpc * ks > 32) tpc >>= 1;
     g.on = 1; g.codec = codec;
     g.w = static_cast<const uint8_t*>(t.p);
+    g.rscale = rscale;
     g.xfrag = xfrag;
     g.K = ng * gk; g.O = static_cast<int>(t.shape[0]) * 16;
     g.tpc = tpc; g.ks = ks; g.M = M;
@@ -750,9 +760,74 @@ inline K1Split k1_split(int M, int k2 = 0)
     // Baked, no env (harness K1_KW). NS2 = 2 at M 2..3 is the W1b rule above (k2 layers). Non-k2 layers keep release.
     if (k2 && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
 #endif
+    // G6_TR3_W2ALL=1: the same window2 rule on every MoE layer, not only k2 layers (A/B, default 0 = the rule above).
+    // Same k ranges and partial order, so the same bits; only the CTA shape changes (S2 c4 runs class 3, s2_batch.h).
+    static const bool w2all = getenv("G6_TR3_W2ALL") && atoi(getenv("G6_TR3_W2ALL"));
+    if (w2all && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
+    if (const char* ev = getenv(M == 1 ? "G6_K1_SPLIT_M1" : M <= 3 ? "G6_K1_SPLIT_M2" : "G6_K1_SPLIT_M4"))
+        sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
+    else if (const char* ev = getenv("G6_K1_SPLIT"); ev && !strpbrk(ev, ":="))   // "KS1,WG,NS2"; a table: k1_split_env
+        sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
     return s;
 }
+// The fused path's 512-thread CTAs: the fc1 split (KS1, WG) becomes (KS1*WG/2, 2), which keeps every k range only
+// where KS1 x WG is 2 or more. KS1 x WG = 1 (e.g. G6_K1_SPLIT_M1=1,1,2) would give KS1 = 0: no fc1 items, wrong output.
+inline const char* k1_fuse_split(K1Split& s)
+{
+    if (s.KS1 * s.WG < 2) return "G6_K1_SPLIT: KS1 x WG must be 2 or more with fused fc1 / fc2 (G6_FUSE=1|2); set G6_FUSE=0";
+    s.KS1 = s.KS1 * s.WG / 2;
+    s.WG = 2;
+    return nullptr;
+}
 constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: only WG, s_ks, s_ns2 matter. Not tuned.
+
+// G6_K1_SPLIT (A/B, exact): per step row count M, the fc1 CTA shape KS1 x WG and / or the routed fc2 n-split NS2 of
+// the trellis-shared MoE layers, "M:KS1xWG/NS2" entries, M a row count or a range a-b, either part optional:
+// "3:2x1,1:/4,4-32:/4" = k1_audit's "fc1 2x1" arm at 3 rows and "ns2=4" at 1 and 4+ rows. Same bytes at any entry:
+// an fc1 shape is taken only where KS1 * WG equals the split's (partial p = h * WG + q covers the same k range and fc2
+// sums the same partials in the same order, tr3.cuh); a z tile is one warp's sum over its block's 8 k-tiles at any NS2
+// (tr3_fc2_body). M is the step's rows, also for an S2 batched step (its class keeps the partial count). Read once
+// per process (k1_audit passes its own table to set).
+struct K1SplitEnv
+{
+    signed char ks1[G6_MX + 1] = {}, wg[G6_MX + 1] = {}, ns2[G6_MX + 1] = {};
+    const char* err = nullptr;
+};
+inline const K1SplitEnv& k1_split_env(const char* set = nullptr)
+{
+    static K1SplitEnv t;
+    static bool done = false;
+    if (done && !set) return t;
+    done = true;
+    t = K1SplitEnv();
+    const char* v = set ? set : getenv("G6_K1_SPLIT");
+    if (v && !strpbrk(v, ":=")) v = nullptr;      // the "KS1,WG,NS2" form (every row count) is k1_split's, not a table
+    for (const char* p = v; p && *p;)
+    {
+        char* q;
+        const long a = strtol(p, &q, 10);
+        const long b = *q == '-' ? strtol(q + 1, &q, 10) : a;
+        long ks = 0, wg = 0, ns = 0;
+        if ((*q != ':' && *q != '=') || a < 1 || b < a || b > G6_MX) { t.err = "G6_K1_SPLIT: entries are M:KS1xWG/NS2 or a-b:..., M in 1..G6_MX"; break; }
+        ++q;
+        if (*q != '/') { ks = strtol(q, &q, 10); if (*q++ != 'x') { t.err = "G6_K1_SPLIT: fc1 shape is KS1xWG"; break; } wg = strtol(q, &q, 10); }
+        if (*q == '/') ns = strtol(q + 1, &q, 10);
+        if (*q && *q != ',') { t.err = "G6_K1_SPLIT: entries are separated by ','"; break; }
+        // tr3.cuh splits by shifts and masks (__ffs(KS1), __ffs(NS2), unit & (NS2 - 1)): powers of two only
+        if (ks && (ks < 0 || ks > 16 || (ks & (ks - 1)) || (wg != 1 && wg != 2 && wg != 4) || (KSH / ks) % (8 * wg)))
+        { t.err = "G6_K1_SPLIT: KS1 is 1, 2, 4, 8 or 16 and WG 1, 2 or 4"; break; }
+        if (ns && (ns < 0 || ns > 16 || (ns & (ns - 1)))) { t.err = "G6_K1_SPLIT: NS2 is 1, 2, 4, 8 or 16"; break; }
+        if (!ks && !ns) { t.err = "G6_K1_SPLIT: an entry sets KS1xWG, /NS2 or both"; break; }
+        for (long m = a; m <= b; ++m)
+        {
+            if (ks) { t.ks1[m] = static_cast<signed char>(ks); t.wg[m] = static_cast<signed char>(wg); }
+            if (ns) t.ns2[m] = static_cast<signed char>(ns);
+        }
+        p = *q ? q + 1 : q;
+    }
+    if (v && *v && !set) fprintf(stderr, "# G6_K1_SPLIT=%s%s%s\n", v, t.err ? ": " : "", t.err ? t.err : "");
+    return t;
+}
 
 // The route plan of the call (glue::RoutePlan or any struct with the same members), device memory.
 struct PlanPtrs
@@ -795,11 +870,11 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     if (sh) {}
     else if (mx)
     {
-        if (f1.nd != 3 || f1.shape[1] != 192 || f1.shape[2] != 528 || fu.nd != 3 || fu.shape[0] != s_nch || fu.shape[1] != 192 ||
+        if (f1.nd != 3 || f1.shape[1] != HID / 32 || f1.shape[2] != 528 || fu.nd != 3 || fu.shape[0] != s_nch || fu.shape[1] != HID / 32 ||
             fu.shape[2] != 528 || f2.nd != 3 || f2.shape[0] != KSH || f2.shape[1] * 2 != s_nch || f2.shape[2] != 528 || s_nch * 16 > SACTW)
             return "shared MXFP8 records are not gate, up [I/16][192][528] + down [384][I/32][528] with I <= SACTW";
     }
-    else if (f1.nd != 3 || f1.shape[1] != 192 || f1.shape[2] != 576 || f2.nd != 3 || f2.shape[0] != KSH || f2.shape[1] * 2 != s_nch ||
+    else if (f1.nd != 3 || f1.shape[1] != HID / 32 || f1.shape[2] != 576 || f2.nd != 3 || f2.shape[0] != KSH || f2.shape[1] * 2 != s_nch ||
              f2.shape[2] != 288 || s_nch * 16 > SACTW)
         return "shared / dense MLP records are not [I/16][192][576] + [384][I/32][288] with I <= SACTW";
     if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
@@ -815,7 +890,15 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // 16+ rows in the step (S2 batches; split_m keeps rows at the session's class): separate launches, 2-3.5% faster at
     // 24-32 rows (row_budget_test --time-v2, GB10 2200 MHz: M=24 1551 vs 1577 us, M=32 1752 vs 1812 us)
     if (policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
-    if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
+    if (sh)
+    {
+        const K1SplitEnv& o = k1_split_env();
+        if (o.err) return o.err;
+        if (o.ks1[M] && o.ks1[M] * o.wg[M] == s.KS1 * s.WG) { s.KS1 = o.ks1[M]; s.WG = o.wg[M]; }
+        if (o.ns2[M]) s.NS2 = o.ns2[M];
+    }
+    if (fuse)                                              // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
+        if (const char* e = k1_fuse_split(s)) return e;
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently.
     if (fuse == 2 && s.KS1 == 1) s.KS1 = 2;
@@ -826,6 +909,11 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     a.x = x2; a.xfrag = xf_x2;
     a.ctl = sc.ctl; a.n_plans = 1; a.M = M;
     a.B = g6nr::EB; a.KS1 = s.KS1; a.WG = s.WG; a.NS2 = s.NS2;
+    // G6_K1_TLBW = granule in KB, a power of 2 (A/B, no output change): fc1 prefetches the routed slots' weight
+    // translations into L2 at that granule (k1.cuh k1_tlbw); 64 / 2048 = the GPU's big / huge page. 0 = off.
+    static const long tlbw_kb = getenv("G6_K1_TLBW") ? atol(getenv("G6_K1_TLBW")) : 0;
+    if (tlbw_kb && (tlbw_kb < 1 || tlbw_kb > (1 << 20) || (tlbw_kb & (tlbw_kb - 1)))) return "G6_K1_TLBW must be a power of 2 KB (1 .. 1048576)";
+    if (moe && tlbw_kb) a.tlbw = 10 + __builtin_ctzl(static_cast<unsigned long>(tlbw_kb));
     a.s_fc1 = static_cast<const uint8_t*>(f1.p); a.s_fc2 = static_cast<const uint8_t*>(f2.p);
     a.s_up = mx ? static_cast<const uint8_t*>(fu.p) : nullptr; a.s_mx = mx;
     a.s_nch = s_nch; a.s_ks = s.s_ks; a.s_cw = w1 / s.s_ks; a.s_ns2 = s.s_ns2;
@@ -853,11 +941,11 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         const Tensor& km = T.t[T_TR3_KMIX];
         if (km.p && (km.nd != 1 || km.shape[0] != tab.shape[0])) return "tr3.kmix is not one entry per tr3.table row";
         k.e4 = T.e4m3;
-        k.k2 = T.k2;
+        k.k2 = sh ? (T.k2 || T.k3) : T.k2;
         k.sh = sh;
         if (sh && !k.e4) return "trellis shared expert in a layer that is not exlr8-e4m3";
-        if (sh && T.t[T_TR3_TAB].shape[0] != 257) return "trellis shared expert without tr3.table row 256";
-        a.sh_e = 256;
+        if (sh && T.t[T_TR3_TAB].shape[0] != geom::NEXP + 1) return "trellis shared expert without tr3.table row NEXP";
+        a.sh_e = geom::NEXP;
         if (!plan.n_slots || !plan.slot_expert || !plan.slot_mask || !plan.slot_w || !plan.slot_tok || !plan.tok_slot || !plan.tok_col || !plan.tok_w) return "MoE layer needs the route plan";
         a.n_slots = M * 8;
         // routed slots, then the trellis shared expert's (one per 8 rows): scratch_smax leaves room for both
@@ -895,7 +983,8 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     const int fit = KSH * 256 / s_tab;
     a.s_ntp = ntot < fit ? ntot : (fit < 1 ? 1 : fit);
     k.sm2 = static_cast<size_t>(s_tab) * a.s_ntp;
-    k.g3 = M * 48; k.b3 = sh ? 160 : 128;            // SH: a fifth finalize warp sums the trellis shared expert
+    if (k.sm2 < 6144) k.sm2 = 6144;
+    k.g3 = M * geom::HB; k.b3 = sh ? 288 : 256;            // SH: 8 routed warps + warp 8 for the trellis shared expert
     if (fuse)
     {
         k.fuse = fuse;
@@ -948,6 +1037,9 @@ struct Layer
     int w8 = 0;                       // bit 0: q_a, bit 1: o_proj, bit 2: shared expert run from MXFP8 records (draft layer: 7)
     Xfrag xf_x, xf_qa, xf_attn, xf_x2;
     Gv q_a, kv_a, q_b, idx_q, idx_k, idx_w, o_proj, router;
+#if G6_MODEL_FLASH
+    Gv idx_g;                         // Flash DSA: x @ index_kpool_compress_gate^T (runtime/flash_dsa.cuh)
+#endif
     GvMulti x_in;                     // q_a, kv_a, idx_k, idx_w as one launch (n = 0: one launch each)
     GvMulti x_rest;                   // G6_QA_SPLIT=2 only: kv_a, idx_k, idx_w (full) as one launch after the q_a slice
     K1 k1;
@@ -1052,7 +1144,10 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     else if (omx) e = make_gv(T.t[T_O_PROJ_MX], MXFP8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     else     e = make_gv(T.t[T_O_PROJ],    INT4,  2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     if (e) return e;
-    if ((e = make_gv(T.t[T_ROUTER],    BF16W, 2,  16, M, sc.xb_x2,   io.logits,    gv::O_F32,  L.router))) return e;
+    // G6_ROUTER_TPC=1: the router's 16 output tiles one per CTA (16 CTAs of 512 threads, not 8 of 1024); same tiles,
+    // k parts and reduction order, so the same bits
+    static const int rtpc = getenv("G6_ROUTER_TPC") && atoi(getenv("G6_ROUTER_TPC")) == 1 ? 1 : 2;
+    if ((e = make_gv(T.t[T_ROUTER],    BF16W, rtpc, 16, M, sc.xb_x2,  io.logits,    gv::O_F32,  L.router))) return e;
     if (!L.q_a.on || !L.kv_a.on || !(L.q_b.on || tq) || !(L.o_proj.on || to))
         return "layer without q_a.gptq (or q_a.mx.gv) / kv_a.mx.gv / q_b (trellis, q_b.gptq or q_b.mx.gv) / o_proj (trellis, o_proj.gptq or o_proj.mx.gv)";
     if (L.moe != L.router.on) return "router.w.gv and tr3.table must come together";
@@ -1083,7 +1178,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     if (tm)
     {
         if (L.moe) return "dense trellis MLP tensors in a MoE layer";
-        if (D.gate.N != g6nr::DENSE_CH) return "dense trellis MLP width is not DENSE_CH";
+        if (D.gate.N > g6nr::DENSE_CH || D.gate.N % 128) return "dense trellis MLP width is not 128-blocks within DENSE_CH";
         if ((e = dtr::make_glu(D.gate, D.up, D.down, M, io.x2, HID, sc.dxd, sc.dt, 128, 0, 1, L.glu_t))) return e;
         if ((e = dtr::make_out(D.down, M, nullptr, 0, sc.dxd, io.mlp_part, HID, dtr::O_BF16, sc.dt, 192, 0, 1, L.down_t))) return e;
         L.xf_x2.on = 0;
@@ -1105,13 +1200,14 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
 struct HeadTensors
 {
     Tensor lm_head;                   // G.lm_head.mx.gv   [vn/16][192][528]  this rank's vocab rows
+    Tensor lm_head_scale;             // G.lm_head.scale   [vn] fp32          (Flash FP8-row head)
     Tensor eh;                        // L078.eh.mx.gv     [384][384][528]    MTP eh_proj, O = 6144, K = 12288 (p = nullptr: no MTP)
 };
 template <class F> inline HeadTensors head_tensors(F find)
 {
     HeadTensors T;
     T.lm_head = find("G.lm_head.mx.gv");
-    T.eh = find("L078.eh.mx.gv");
+    T.eh = find(G6_MTP_L ".eh.mx.gv");
     return T;
 }
 

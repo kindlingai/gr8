@@ -24,7 +24,8 @@ inline long long s2_wall_ms() {
 // the main stream; host = the previous
 // fence to this launch's entry: accept, emit, drafter choice, step planning). Prints them every N main steps. The gap is
 // bounded by the main stream's events: with G6_DRAFT_PAR the drafter's side stream can run inside it, so it is an upper
-// bound on what launching the next step from the GPU could remove; the spans stay. Unset: no events, no stamps.
+// bound on what launching the next step from the GPU could remove; the spans stay. Also the mean span per kind and row
+// count (tools/s2_dsel_table.py turns them into the drafter choice's cost table). Unset: no events, no stamps.
 // G6_DRAFT_PAR: a solo DFlash2 round's drafter step (launched before the first form on its own stream, waited for after
 // the first form and the chain) counts as dfl_ctx_par / dfl_query_par through par_*, with its own event pair: span = its
 // GPU start to end on its stream (under the first form and chain, so it overlaps their spans), prep and launch as above,
@@ -43,6 +44,9 @@ struct S2Timeline {
     clk::time_point p_enter, p_pre, p_post, p_wait;
     long n[NK] = {}, rows[NK] = {}, tn[NK][NK] = {}, mains = 0, breaks = 0;
     double span[NK] = {}, prep[NK] = {}, call[NK] = {}, wait[NK] = {}, idle[NK][NK] = {}, host[NK][NK] = {};
+    static constexpr int MR = 16;       // per row count too, rows 1..MR (the drafter choice's cost table, s2_dsel_table.py)
+    long nm[NK][MR + 1] = {};
+    double sm[NK][MR + 1] = {};
     static const char* name(int k) { static const char* s[NK] = {"main", "draft", "chain", "dfl_ctx", "dfl_query", "dfl_ctx_par", "dfl_query_par"}; return s[k]; }
     static double ms(clk::time_point a, clk::time_point b) { return std::chrono::duration<double,std::milli>(b - a).count(); }
     S2Timeline() {
@@ -65,6 +69,7 @@ struct S2Timeline {
         const auto t = clk::now();
         float s = 0; G6RT_CK(cudaEventElapsedTime(&s, evp[0], evp[1]));
         ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(p_enter, p_pre); call[kind] += ms(p_pre, p_post); wait[kind] += ms(p_wait, t);
+        if (M >= 1 && M <= MR) { ++nm[kind][M]; sm[kind][M] += s; }
     }
     // not a decode transition: a prefill quantum, a mode switch, the drafter's prompt fill
     void cut() { have_prev = false; }
@@ -74,6 +79,7 @@ struct S2Timeline {
         const auto t = clk::now();
         float s = 0; G6RT_CK(cudaEventElapsedTime(&s, ev[cur][0], ev[cur][1]));
         ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(t_enter, t_pre); call[kind] += ms(t_pre, t_post); wait[kind] += ms(t_post, t);
+        if (M >= 1 && M <= MR) { ++nm[kind][M]; sm[kind][M] += s; }
         if (have_prev) {
             // the between-steps gap is bounded by events on the MAIN stream only: with G6_DRAFT_PAR the drafter's
             // side stream can run inside it, so idle[] is a main-stream gap, not necessarily GPU idle time
@@ -95,6 +101,9 @@ struct S2Timeline {
             if (n[k])
                 fprintf(stderr, "# s2_tl rank %d step %s n %ld rows %.2f span %.3f prep %.3f launch %.3f wait %.3f ms\n", rank, name(k), n[k],
                         double(rows[k]) / n[k], span[k] / n[k], prep[k] / n[k], call[k] / n[k], wait[k] / n[k]);
+        for (int k = 0; k < NK; ++k)
+            for (int M = 1; M <= MR; ++M)
+                if (nm[k][M]) fprintf(stderr, "# s2_tl rank %d rows %s M %d n %ld span %.3f ms\n", rank, name(k), M, nm[k][M], sm[k][M] / nm[k][M]);
         for (int a = 0; a < NK; ++a)
             for (int b = 0; b < NK; ++b)
                 if (tn[a][b])
@@ -134,6 +143,11 @@ struct NativeContext {
     std::function<unsigned()> extra_error;
     // optional: a draft step's extra fabric work after its draft fabric enqueue (G6_MTP_SPLIT: the draft gathers)
     std::function<void(unsigned long long step, int rows)> enqueue_draft_extra;
+    // optional (G6_RT_STORE): before a main step's launch, with its inputs (spills its sessions' committed pages), and
+    // before a prefill quantum of a slot, rows first .. first + rows - 1 (M1: drops its remote pages; release: spills
+    // the pages before first and maps the quantum's)
+    std::function<void(const g6rt::StepIn&, const g6rt::S2In&)> before_main;
+    std::function<void(const Slot&, uint32_t first, uint32_t rows)> before_prefill;
 };
 class NativeDispatch {
     NativeContext c_;
@@ -245,6 +259,7 @@ class NativeDispatch {
         const int rows = l.step.M();
         S2Timeline& tl = s2_tl(); tl.enter();
         g6rt::StepIn input{}; g6rt::S2In layout{}; native_inputs(l,input,layout);
+        if (!draft && c_.before_main) c_.before_main(input,layout);
         if (l.solo >= 0) input.page_bound = model.s2->pool_pages;   // the solo tables hold -1 past the session's pages
         if (draft && c_.main.rs) for (int r = 0; r < rows; ++r) input.srow[r].inv_temp = 0.f;   // rejection sampling: greedy drafts
         require(model.s2on == (l.solo < 0), "native solo mode differs from host");
@@ -299,6 +314,7 @@ class NativeDispatch {
         const auto t0 = std::chrono::steady_clock::now();   // for the error-word line: a ~10 s quantum is a GPU wait timeout
         s2_tl().cut();
         require(rows <= uint64_t(c_.prefill_rows)*(c_.two_lanes?2:1), "prefill quantum exceeds native lanes");
+        if (c_.before_prefill) c_.before_prefill(slot,first,rows);
         c_.begin_prefill(slot); // real run/view selector supplied by TP4/fc2
         const int a = int(first), ma = std::min(int(rows),c_.prefill_rows), mb = int(rows)-ma;
         std::vector<int> pos(rows); for (unsigned r=0;r<rows;++r) pos[r]=a+int(r);
@@ -376,11 +392,16 @@ public:
     // Boot capture of every graph key a decode step can reach, before serving (a launch of any other key fails):
     //   main : M in 1..chunk (prompt tails, class row_class(M)) U S*(k+1), S = 1..sessions, k = 1..K with G6_S2_ADAPT
     //          (else k = K), class row_class(K+1)                          -> two graphs (split A / B)
+    //          U with G6_MTP_KSTOPB (kb) the shared rounds' widths s2::kstopb_widths, class row_class(K+1)
+    //          U with solo_kmax (KStop::solo, an MTP-only engine's G6_MTP_KSTOP=1) k+1, k = 1..solo_kmax, class row_class(k+1)
     //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
     // contexts and source rows are read from S2In at launch. Call before the first launch / before connecting.
-    void capture_all(unsigned sessions, int mtp, int chunk) {
+    // cp_rows (G6_CP_STEP_ROWS, cp_rows.h; 0 = off): at a bucket whose steps run the CP block (s2_cp_bucket) no main step
+    // is wider than cp_rows (Driver::step caps those rounds), so those widths are not captured; a launch of one would
+    // fail as any uncaptured key does.
+    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}, int cp_rows = 0, int solo_kmax = 0) {
         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
@@ -390,6 +411,8 @@ public:
         for (int M = 1; M <= chunk; ++M) { mains.insert({M, s2::row_class(M)}); drafts.insert(M); }
         for (int S = 1; S <= N; ++S)
             for (int k = s2::adapt_env() ? 1 : K; k <= K; ++k) mains.insert({S * (k + 1), s2::row_class(K + 1)});
+        for (int M : s2::kstopb_widths(kb, N, K)) mains.insert({M, s2::row_class(K + 1)});
+        for (int k = 1; k <= solo_kmax; ++k) mains.insert({k + 1, s2::row_class(k + 1)});   // s2_batch.h round_all, KStop::solo
         for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
         if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
         for (const auto& mc : mains) require(mc.first <= g6rt::MX, "main step rows exceed G6_MX");
@@ -398,7 +421,7 @@ public:
         size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0,&total));
         const bool on_main = c_.main.s2on, on_draft = c_.draft.d.s2on;
         c_.main.s2on = c_.draft.d.s2on = true; fence();
-        size_t keys = 0, graphs = 0;
+        size_t keys = 0, graphs = 0, cp_skipped = 0;
         // one synthetic step: ns sessions of rows each (first form: one session of M rows; chain: M sessions of one row)
         auto one = [&](bool draft, bool chain, int M, int k, int cls) {
             auto& model = draft ? c_.draft.d : c_.main;
@@ -422,7 +445,10 @@ public:
             graphs_.emplace(key,std::move(g));
         };
         for (int k = 0; k < nbk; ++k) {
-            for (const auto& mc : mains) one(false,false,mc.first,k,mc.second);
+            for (const auto& mc : mains) {
+                if (cp_rows && mc.first > cp_rows && g6rt::s2_cp_bucket(c_.main,k)) { ++cp_skipped; continue; }
+                one(false,false,mc.first,k,mc.second);
+            }
             for (int M : drafts) one(true,false,M,k,s2::row_class(M));
             for (int M : chains) one(true,true,M,k,s2::row_class(M));
         }
@@ -433,6 +459,9 @@ public:
                 keys,graphs,nbk,mains.size(),drafts.size(),chains.size(),N,K,chunk,
                 std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(),
                 (double(free0)-double(free1))/(1024.0*1024.0));
+        if (c_.main.rank == 0 && cp_rows)
+            fprintf(stderr,"# s2 boot capture: G6_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",
+                cp_rows,cp_skipped);
     }
     DispatchHooks hooks() {
         DispatchHooks h{

@@ -40,6 +40,7 @@
 #include <cublas_v2.h>
 #include "bind.cuh"
 #include "gemm_x.cuh"
+#include "../runtime/envparse.h"
 
 namespace bindp
 {
@@ -48,21 +49,51 @@ using bind::Tensor;
 constexpr int MB = 4;                 // 16-row blocks per CTA
 constexpr int RS = MB * 16;           // rows per expert segment
 constexpr int REC = 528;              // MXFP8 activation record of (16 rows, 32 k): [32 lanes][16 B] A fragments + 16 scale bytes
-constexpr int NEXP = 256, TOPK = 8;
+constexpr int NEXP = geom::NEXP, TOPK = geom::TOPK;
+constexpr int EPL = NEXP / 32;       // k_pf_route: experts per lane
+#if G6_MODEL_FLASH
+// Flash MoE expert passes in fp16 (Expert::h16, the Flash default; G6_PF_MOE8=1 = the MXFP8 passes): fc1 A = the fp16
+// H128(x * suh) rows, fc2 A = the fp16 mid output, B = the fp16 trellis-decoded fragments, mma m16n8k16 fp32 accumulate.
+#define PF_H16P , bool H16 = false
+#define PF_H16A , false, H16
+#define PF_H16V H16
+#define PF_H16X , H16
+#else
+#define PF_H16X
+#define PF_H16P
+#define PF_H16A
+#define PF_H16V false
+#endif
 
 enum
 {
+#if G6_MODEL_FLASH
+    T_Q_A, T_KV_A, T_Q_B, T_O_PROJ, T_IDX_WQ_B, T_S_GATE, T_S_UP, T_S_DOWN, T_D_GATE, T_D_UP, T_D_DOWN,
+    T_IDX_WK_MX, T_KDA_Q, T_KDA_K, T_KDA_V, T_KDA_FA, T_KDA_GA, T_MTP_EH, NMX,    // .mx.codes + .mx.scales
+#else
     T_Q_A, T_KV_A, T_Q_B, T_O_PROJ, T_IDX_WQ_B, T_S_GATE, T_S_UP, T_S_DOWN, T_D_GATE, T_D_UP, T_D_DOWN, NMX,    // .mx.codes + .mx.scales
+#endif
     T_IDX_WK = NMX, T_IDX_WPROJ, T_ROUTER, T_ROUTER_BIAS, T_TR3_FC1, T_TR3_FC2, T_TR3_V1, T_TR3_V2, T_TR3_V3, T_TR3_TAB,
     T_TR3_KMIX,                       // exlr8 v2 packs only
     T_TR3_SG, T_TR3_V1B, T_TR3_V3B,   // v2 layers with the trellis shared expert: hidden-side signs + block scales
+#if G6_MODEL_FLASH
+    T_IDX_G, T_KDA_B,
+#endif
     NT
 };
 static const char* const NAMES[NT] = {
     "q_a.mx", "kv_a.mx", "q_b.mx", "o_proj.mx", "idx.wq_b.mx", "shared.gate.mx", "shared.up.mx", "shared.down.mx",
     "dense.gate.mx", "dense.up.mx", "dense.down.mx",
+#if G6_MODEL_FLASH
+    "idx.wk.mx", "self_attn.q_proj.weight.mx", "self_attn.k_proj.weight.mx", "self_attn.v_proj.weight.mx",
+    "self_attn.f_a_proj.weight.mx", "self_attn.g_a_proj.weight.mx", "eh.mx",
+#endif
     "idx.wk", "idx.weights_proj", "router.w", "router.bias", "tr3.fc1", "tr3.fc2", "tr3.v1", "tr3.v2", "tr3.v3", "tr3.table",
+#if G6_MODEL_FLASH
+    "tr3.kmix", "tr3.sg", "tr3.v1b", "tr3.v3b", "self_attn.indexer.index_kpool_compress_gate", "self_attn.b_proj.weight"};
+#else
     "tr3.kmix", "tr3.sg", "tr3.v1b", "tr3.v3b"};
+#endif
 
 struct Tensors
 {
@@ -71,8 +102,12 @@ struct Tensors
     int fc1_wide = 0;                 // set if bind::widen_fc1 ran on this tr3.fc1 (K3 experts in the wide order, tr3_wide.cuh)
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
     int k2 = 1;                       // 2-bit units in the layer (bind::LayerTensors::k2 after bind::scan_widths)
+    int k3 = 1;                       // 3-bit units in the layer (bind::LayerTensors::k3 after bind::scan_widths)
     int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis)
     int sh_fp8 = 0;                   // t/s[T_S_GATE, T_S_UP, T_S_DOWN] hold its FP8 copy (bind::make_shared_fp8)
+#if G6_MODEL_FLASH
+    int e4m3 = 0;                     // routed experts are exlr8-e4m3 (bind::LayerTensors::e4m3): codebook values rounded to E4M3
+#endif
     long long sh_tr[6] = {};          // tr3.table row 256
     int qo_cover = 0;                 // G6_PF_OWN=3: q_b / o_proj of this layer are prefilled from the QO pack (never from these tensors)
     int heads = 0;                    // attention head count, used in place of q_b.N / 256 when the q_b tensor is deduplicated away
@@ -83,6 +118,11 @@ struct Tensors
     const __half* tsvh[dtr::NMAT] = {};
     // the matrices themselves (dtr::layer_mats): o_proj without an FP8 copy runs on its tiles (make_gemm_tr, k_gemm_tr)
     dtr::LayerMats tm;
+#if G6_MODEL_FLASH
+    const __half* kda_suh[3] = {};
+    const __half* kda_svh[3] = {};
+    dtr::Mat kda_tm[3] = {};
+#endif
 };
 
 template <class F> inline Tensors layer_tensors(int layer, F find)
@@ -109,6 +149,22 @@ template <class F> inline Tensors layer_tensors(int layer, F find)
         T.tsvh[i] = static_cast<const __half*>(find(n).p);
     }
     if (dtr::layer_mats(layer, find, T.tm)) T.tm = dtr::LayerMats();   // make_layer reports a bad matrix by its missing codes
+#if G6_MODEL_FLASH
+    static const char* const kda_names[3] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"};
+    for (int i = 0; i < 3; ++i)
+    {
+        snprintf(n, sizeof n, "L%03d.%s.trellis", layer, kda_names[i]);
+        const Tensor tr = find(n);
+        if (!tr.p) continue;
+        snprintf(n, sizeof n, "L%03d.%s.suh", layer, kda_names[i]);
+        const Tensor su = find(n);
+        T.kda_suh[i] = static_cast<const __half*>(su.p);
+        snprintf(n, sizeof n, "L%03d.%s.svh", layer, kda_names[i]);
+        const Tensor sv = find(n);
+        T.kda_svh[i] = static_cast<const __half*>(sv.p);
+        if (dtr::make_mat(tr, su, sv, dtr::SIDE_OUT, T.kda_tm[i])) T.kda_tm[i] = dtr::Mat();
+    }
+#endif
     return T;
 }
 
@@ -169,6 +225,9 @@ struct Xq
     int ld = 0, K = 0, M = 0;
     uint8_t* dst = nullptr;
     const __half* suh = nullptr;      // dense trellis input (dtr.cuh): records of H128(src * suh) per 128 block (k_xq8_rot)
+#if G6_MODEL_FLASH
+    int h16 = 0;                      // 1: dst holds FP16 m16n8k16 A-fragments [ceil(M/16)][K/16][512B] (shx_store_h16)
+#endif
 };
 
 #ifdef PF_XQ8C
@@ -260,6 +319,9 @@ __global__ void __launch_bounds__(256) k_xq8(Xq a)
 // Xq::suh: x [M][ld] -> the k_xq8 records of H128(x * suh), quantized from fp32 (the rule of k_shx_rotq).
 // grid ceil(ceil(M/16)*16 * K/128 / 8), block 256: warp = (row, 128 block)
 __device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int row, int M, int S, int s, uint8_t* x8);
+#if G6_MODEL_FLASH
+__device__ __forceinline__ void shx_store_h16(const float (&v)[4], int lane, int row, int M, int K16, int ks_base, uint8_t* x8);
+#endif
 __global__ void __launch_bounds__(256) k_xq8_rot(Xq a)
 {
     const int lane = threadIdx.x & 31, nbk = a.K / 128;
@@ -276,6 +338,9 @@ __global__ void __launch_bounds__(256) k_xq8_rot(Xq a)
         v[0] = __fmul_rn(x01.x, s01.x); v[1] = __fmul_rn(x01.y, s01.y); v[2] = __fmul_rn(x23.x, s23.x); v[3] = __fmul_rn(x23.y, s23.y);
     }
     had128(v, lane);
+#if G6_MODEL_FLASH
+    if (a.h16) { shx_store_h16(v, lane, row, a.M, a.K / 16, blk * 8, a.dst); return; }
+#endif
     shx_store_mx8(v, lane, row, a.M, a.K / 32, blk * 4 + (lane >> 3), a.dst);
 }
 
@@ -339,6 +404,9 @@ struct Gemm
     // w / ws unused. The bits equal the GEMM on the matrix's FP8 copy (dtr::make_fp8).
     const uint8_t* tw = nullptr;
     long long tsB = 0, tsG = 0;
+#if G6_MODEL_FLASH
+    int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
+#endif
 };
 
 // Gemm::osvh: the CTA's 128 output columns of each row go through H128 and svh before the store. The input is the sums
@@ -1199,7 +1267,11 @@ template <int BM> struct GT
     static constexpr int A = G2_KS * BM * REC, RAW = 32 * 128, STG = A + RAW, B = 128 * G2_KS * 32;
     static constexpr int ST = BM == 16 ? 4 : 3, SMEM = ST * STG + 2 * B;     // BM = 16: 98.3 KB, 1 CTA per SM
 };
+#if G6_MODEL_FLASH
+template <int BM, bool RS, bool F32 = false> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm_tr(Gemm g, RsOut rs)
+#else
 template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm_tr(Gemm g, RsOut rs)
+#endif
 {
     using T = GT<BM>;
     constexpr int NT = T::NT, ST = T::ST;
@@ -1313,6 +1385,10 @@ template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm
     if (g.osvh)
     {
         gemm_rot_store<BM, NT, T::NW>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
+#if G6_MODEL_FLASH
+            if constexpr (F32) *reinterpret_cast<float4*>(static_cast<float*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = make_float4(v[0], v[1], v[2], v[3]);
+            else
+#endif
             if constexpr (RS) *reinterpret_cast<uint2*>(rs_row(rs, row, g.ldy) + col) = pack_o4(v, g.bf16);
             else *reinterpret_cast<uint2*>(static_cast<uint16_t*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = pack_o4(v, g.bf16);
         });
@@ -1327,11 +1403,217 @@ template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm
             const int m = wm * 4 + mb;
             if (m >= nb) continue;
             const int col = c0 + colw + nt * 8 + 2 * c, row = (rb0 + m) * 16 + r;
+#if G6_MODEL_FLASH
+            if constexpr (F32)
+            {
+                float* yf = static_cast<float*>(g.y);
+                if (row < g.M) *reinterpret_cast<float2*>(yf + static_cast<size_t>(row) * g.ldy + col) = make_float2(acc[mb][nt][0], acc[mb][nt][1]);
+                if (row + 8 < g.M) *reinterpret_cast<float2*>(yf + static_cast<size_t>(row + 8) * g.ldy + col) = make_float2(acc[mb][nt][2], acc[mb][nt][3]);
+            }
+            else
+            {
+                auto out = [&](int rw) { return RS ? rs_row(rs, rw, g.ldy) + col : static_cast<uint16_t*>(g.y) + static_cast<size_t>(rw) * g.ldy + col; };
+                if (row < g.M) *reinterpret_cast<u32*>(out(row)) = pack_o2(acc[mb][nt][0], acc[mb][nt][1], g.bf16);
+                if (row + 8 < g.M) *reinterpret_cast<u32*>(out(row + 8)) = pack_o2(acc[mb][nt][2], acc[mb][nt][3], g.bf16);
+            }
+#else
             auto out = [&](int rw) { return RS ? rs_row(rs, rw, g.ldy) + col : static_cast<uint16_t*>(g.y) + static_cast<size_t>(rw) * g.ldy + col; };
             if (row < g.M) *reinterpret_cast<u32*>(out(row)) = pack_o2(acc[mb][nt][0], acc[mb][nt][1], g.bf16);
             if (row + 8 < g.M) *reinterpret_cast<u32*>(out(row + 8)) = pack_o2(acc[mb][nt][2], acc[mb][nt][3], g.bf16);
+#endif
         }
 }
+#if G6_MODEL_FLASH
+// Pure-fp32 rotation epilogue for k_gemm_tr_h16: stages 64-row passes in sm (64 * 136 * 4 = 34.8 KB <= GTH16<4>::SMEM)
+// so H128 runs in fp32 before multiplying by svh, matching dtr::k_dtr / kda::k_kda_tr in decode.
+template <int BM, int NT, int NW, class St>
+__device__ __forceinline__ void gemm_rot_store_f32(const float (&acc)[4][NT][4], unsigned char* sm, const __half* svh, int c0, int rb0,
+                                                   int nb, int M, int wm, int colw, St store)
+{
+    constexpr int LD = 136;
+    float* tile = reinterpret_cast<float*>(sm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, c = lane & 3, r = lane >> 2;
+    const uint2 sr = *reinterpret_cast<const uint2*>(svh + c0 + lane * 4);
+    const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+    #pragma unroll
+    for (int p = 0; p < BM; p += 4)
+    {
+        __syncthreads();
+        if (wm * 4 == p && p < nb)
+        {
+            #pragma unroll
+            for (int mb = 0; mb < 4; ++mb)
+            {
+                if (p + mb >= nb) continue;
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt)
+                {
+                    const int rr = mb * 16 + r, col = colw + nt * 8 + 2 * c;
+                    *reinterpret_cast<float2*>(tile + rr * LD + col) = make_float2(acc[mb][nt][0], acc[mb][nt][1]);
+                    *reinterpret_cast<float2*>(tile + (rr + 8) * LD + col) = make_float2(acc[mb][nt][2], acc[mb][nt][3]);
+                }
+            }
+        }
+        __syncthreads();
+        const int nrows = min(64, max(0, (nb - p) * 16));
+        for (int rr = warp; rr < nrows; rr += NW)
+        {
+            const int row = (rb0 + p) * 16 + rr;
+            if (row >= M) break;
+            const float2 a = *reinterpret_cast<const float2*>(tile + rr * LD + lane * 4);
+            const float2 b = *reinterpret_cast<const float2*>(tile + rr * LD + lane * 4 + 2);
+            float v[4] = {a.x, a.y, b.x, b.y};
+            had128(v, lane);
+            v[0] = __fmul_rn(v[0], s01.x); v[1] = __fmul_rn(v[1], s01.y); v[2] = __fmul_rn(v[2], s23.x); v[3] = __fmul_rn(v[3], s23.y);
+            store(row, c0 + lane * 4, v);
+        }
+    }
+}
+
+template <int BM> struct GTH16
+{
+    static constexpr int WM = BM / 4, WN = BM >= 8 ? 4 : 8, NW = WM * WN, NTH = 32 * NW;
+    static constexpr int WC = 128 / WN, NT = WC / 8;
+    static constexpr int A = 4 * BM * 512, RAW = 32 * 128, STG = A + RAW;
+    static constexpr int ST = BM == 16 ? 2 : 3, SMEM = ST * STG;
+};
+
+template <int BM, bool RS = false, bool F32 = false>
+__global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs = RsOut())
+{
+    using C = GTH16<BM>;
+    constexpr int NT = C::NT;
+    extern __shared__ __align__(16) unsigned char sm[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int wm = warp / C::WN, wn = warp % C::WN;
+    const int K16 = g.K / 16, KG = g.K / 64, RB = (g.M + 15) / 16;
+    const int c0 = blockIdx.x * 128, rb0 = blockIdx.y * BM;
+    const int nb = min(BM, RB - rb0), colw = wn * C::WC;
+    const bool full = nb == BM;
+
+    Tr3Lane<4, true> tl;
+    tl.init(lane);
+
+    auto loadAB = [&](int slot, int kb)
+    {
+        unsigned char* a = sm + slot * C::STG;
+        for (int c = t; c < 4 * BM * 32; c += C::NTH)
+        {
+            const int j = c / (BM * 32), rem = c % (BM * 32), mb = rem >> 5, ch = rem & 31;
+            if (mb < nb && kb * 4 + j < K16)
+                pf::cp16(a + c * 16, g.x8 + (static_cast<size_t>(rb0 + mb) * K16 + kb * 4 + j) * 512 + ch * 16);
+        }
+        for (int c = t; c < 256; c += C::NTH)
+        {
+            const int ti = c >> 3, ks = kb * 4 + (ti >> 3);
+            if (ks < K16)
+                pf::cp16(a + C::A + c * 16, g.tw + blockIdx.x * g.tsB + (ks >> 3) * g.tsG + ((ks & 7) * 8 + (ti & 7)) * 128 + (c & 7) * 16);
+        }
+    };
+
+    #pragma unroll
+    for (int p = 0; p < C::ST - 1; ++p)
+    {
+        if (p < KG) loadAB(p, p);
+        pf::cp_commit();
+    }
+    float acc[4][NT][4];
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][nt][i] = 0.f;
+
+    for (int kb = 0; kb < KG; ++kb)
+    {
+        pf::cp_wait<C::ST - 2>();
+        __syncthreads();
+        if (kb + C::ST - 1 < KG) loadAB((kb + C::ST - 1) % C::ST, kb + C::ST - 1);
+        pf::cp_commit();
+        const unsigned char* a = sm + (kb % C::ST) * C::STG;
+        const unsigned char* raw = a + C::A;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            if (kb * 4 + j >= K16) continue;
+            u32 bf[NT][2];
+            #pragma unroll
+            for (int pr = 0; pr < NT / 2; ++pr)
+            {
+                const int ti = j * 8 + wn * (NT / 2) + pr;
+                const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
+                tl.decode(tile[tl.i0], tile[tl.i1], bf[2 * pr], bf[2 * pr + 1]);
+            }
+            #pragma unroll
+            for (int mb = 0; mb < 4; ++mb)
+            {
+                const int m = wm * 4 + mb;
+                if (!full && m >= nb) continue;
+                const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + m) * 512 + lane * 16);
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
+            }
+        }
+    }
+    pf::cp_wait<0>();
+    if (g.osvh)
+    {
+        gemm_rot_store_f32<BM, NT, C::NW>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
+            if constexpr (F32) *reinterpret_cast<float4*>(static_cast<float*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = make_float4(v[0], v[1], v[2], v[3]);
+            else if constexpr (RS) *reinterpret_cast<uint2*>(rs_row(rs, row, g.ldy) + col) = pack_o4(v, g.bf16);
+            else *reinterpret_cast<uint2*>(static_cast<uint16_t*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = pack_o4(v, g.bf16);
+        });
+        return;
+    }
+    const int c = lane & 3, r = lane >> 2;
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+        {
+            const int m = wm * 4 + mb;
+            if (m >= nb) continue;
+            const int col = c0 + colw + nt * 8 + 2 * c, row = (rb0 + m) * 16 + r;
+            if constexpr (F32)
+            {
+                float* yf = static_cast<float*>(g.y);
+                if (row < g.M) *reinterpret_cast<float2*>(yf + static_cast<size_t>(row) * g.ldy + col) = make_float2(acc[mb][nt][0], acc[mb][nt][1]);
+                if (row + 8 < g.M) *reinterpret_cast<float2*>(yf + static_cast<size_t>(row + 8) * g.ldy + col) = make_float2(acc[mb][nt][2], acc[mb][nt][3]);
+            }
+            else
+            {
+                auto out = [&](int rw) { return RS ? rs_row(rs, rw, g.ldy) + col : static_cast<uint16_t*>(g.y) + static_cast<size_t>(rw) * g.ldy + col; };
+                if (row < g.M) *reinterpret_cast<u32*>(out(row)) = pack_o2(acc[mb][nt][0], acc[mb][nt][1], g.bf16);
+                if (row + 8 < g.M) *reinterpret_cast<u32*>(out(row + 8)) = pack_o2(acc[mb][nt][2], acc[mb][nt][3], g.bf16);
+            }
+        }
+}
+
+template <int BM, bool RS, bool F32 = false> inline void launch_tr_bm(const Gemm& g, const RsOut& rs, cudaStream_t st)
+{
+    const int RB = (g.M + 15) / 16;
+    const dim3 grid((g.N + 127) / 128, (RB + BM - 1) / BM);
+    if (g.h16)
+    {
+        static bool attr_h16 = false;
+        if (!attr_h16)
+        {
+            cudaFuncSetAttribute(k_gemm_tr_h16<BM, RS, F32>, cudaFuncAttributeMaxDynamicSharedMemorySize, GTH16<BM>::SMEM);
+            attr_h16 = true;
+        }
+        k_gemm_tr_h16<BM, RS, F32><<<grid, GTH16<BM>::NTH, GTH16<BM>::SMEM, st>>>(g, rs);
+        return;
+    }
+    static bool attr = false;
+    if (!attr)
+    {
+        cudaFuncSetAttribute(k_gemm_tr<BM, RS, F32>, cudaFuncAttributeMaxDynamicSharedMemorySize, GT<BM>::SMEM);
+        attr = true;
+    }
+    k_gemm_tr<BM, RS, F32><<<grid, GT<BM>::NTH, GT<BM>::SMEM, st>>>(g, rs);
+}
+#else
 template <int BM, bool RS> inline void launch_tr_bm(const Gemm& g, const RsOut& rs, cudaStream_t st)
 {
     static bool attr = false;
@@ -1343,12 +1625,16 @@ template <int BM, bool RS> inline void launch_tr_bm(const Gemm& g, const RsOut& 
     const int RB = (g.M + 15) / 16;
     k_gemm_tr<BM, RS><<<dim3((g.N + 127) / 128, (RB + BM - 1) / BM), GT<BM>::NTH, GT<BM>::SMEM, st>>>(g, rs);
 }
+#endif
 // G6_PF_TR_BM (default 16): the row blocks of a large launch's CTA (8 or 16); small launches take 4, as k_gemm_mx8b
 inline void launch_tr(const Gemm& g, const RsOut& rs, bool big, cudaStream_t st)
 {
     static const int bmw = getenv("G6_PF_TR_BM") ? atoi(getenv("G6_PF_TR_BM")) : 16;
     const int bm = !big ? 4 : bmw == 8 ? 8 : 16;
     if (rs.base) { if (bm == 16) launch_tr_bm<16, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, true>(g, rs, st); else launch_tr_bm<4, true>(g, rs, st); }
+#if G6_MODEL_FLASH
+    else if (g.bf16 == 2) { if (bm == 16) launch_tr_bm<16, false, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, false, true>(g, rs, st); else launch_tr_bm<4, false, true>(g, rs, st); }
+#endif
     else if (bm == 16) launch_tr_bm<16, false>(g, rs, st);
     else if (bm == 8) launch_tr_bm<8, false>(g, rs, st);
     else launch_tr_bm<4, false>(g, rs, st);
@@ -1397,7 +1683,11 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
     const bool big = mode == 2 || (mode != 3 && NB * ((RB + 7) / 8) >= 2 * nsm);
     if (g.tw)                         // dense trellis tiles (k_gemm_tr): never paired, fp16 / BF16 out
     {
+#if G6_MODEL_FLASH
+        if (g.w2) { fprintf(stderr, "bindp: a trellis Gemm is unpaired\n"); exit(1); }
+#else
         if (g.w2 || f32) { fprintf(stderr, "bindp: a trellis Gemm is unpaired with fp16 / BF16 output\n"); exit(1); }
+#endif
         launch_tr(g, rs, big, st);
         return;
     }
@@ -1490,6 +1780,10 @@ inline const char* make_gemm_tr(const dtr::Mat& m, int M, const uint8_t* x8, voi
     g.tw = m.w; g.tsB = m.sB; g.tsG = m.sG;
     g.N = m.N; g.K = m.K; g.M = M;
     g.y = y; g.ldy = g.N; g.bf16 = bf16;
+#if G6_MODEL_FLASH
+    static const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+    g.h16 = dtr8 ? 0 : 1;
+#endif
     return nullptr;
 }
 
@@ -1526,6 +1820,9 @@ struct Act
     int I = 0, M = 0;
     const __half *svh_g = nullptr, *svh_u = nullptr, *suh_d = nullptr;
     uint8_t* x8 = nullptr;
+#if G6_MODEL_FLASH
+    int h16 = 0;
+#endif
 };
 __global__ void __launch_bounds__(256) k_pf_act(Act a)
 {
@@ -1533,7 +1830,7 @@ __global__ void __launch_bounds__(256) k_pf_act(Act a)
     if (i >= static_cast<long long>(a.M) * (a.I / 2)) return;
     const float2 g = __half22float2(*reinterpret_cast<const __half2*>(a.g + 2 * i));
     const float2 u = __half22float2(*reinterpret_cast<const __half2*>(a.u + 2 * i));
-    *reinterpret_cast<u32*>(a.act + 2 * i) = pack_h2(silu_f(g.x) * u.x, silu_f(g.y) * u.y);
+    *reinterpret_cast<u32*>(a.act + 2 * i) = pack_h2(swiglu_f(g.x, u.x), swiglu_f(g.y, u.y));
 }
 // grid ceil(ceil(M/16)*16 * I/128 / 8), block 256: warp = (row, 128 block)
 __global__ void __launch_bounds__(256) k_pf_dtr_mid(Act a)
@@ -1552,6 +1849,26 @@ __global__ void __launch_bounds__(256) k_pf_dtr_mid(Act a)
             r[0] = x.x; r[1] = x.y; r[2] = y.x; r[3] = y.y;
         };
         float gv[4], uv[4], sg[4], su[4], sd[4];
+#if G6_MODEL_FLASH
+        if (a.h16 == 2)
+        {
+            f4(a.g + o, gv); f4(a.u + o, uv); f4(a.suh_d + c0, sd);
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) v[e] = __fmul_rn(rnd_h(swiglu_f(gv[e], uv[e])), sd[e]);
+        }
+        else
+        {
+            f4(a.g + o, gv); f4(a.u + o, uv); f4(a.svh_g + c0, sg); f4(a.svh_u + c0, su); f4(a.suh_d + c0, sd);
+            had128(gv, lane);
+            had128(uv, lane);
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const float gg = rnd_h(__fmul_rn(gv[e], sg[e])), uu = rnd_h(__fmul_rn(uv[e], su[e]));
+                v[e] = __fmul_rn(rnd_h(swiglu_f(gg, uu)), sd[e]);
+            }
+        }
+#else
         f4(a.g + o, gv); f4(a.u + o, uv); f4(a.svh_g + c0, sg); f4(a.svh_u + c0, su); f4(a.suh_d + c0, sd);
         had128(gv, lane);
         had128(uv, lane);
@@ -1559,12 +1876,16 @@ __global__ void __launch_bounds__(256) k_pf_dtr_mid(Act a)
         for (int e = 0; e < 4; ++e)
         {
             const float gg = rnd_h(__fmul_rn(gv[e], sg[e])), uu = rnd_h(__fmul_rn(uv[e], su[e]));
-            v[e] = __fmul_rn(rnd_h(silu_f(gg) * uu), sd[e]);
+            v[e] = __fmul_rn(rnd_h(swiglu_f(gg, uu)), sd[e]);
         }
+#endif
         had128(v, lane);
         #pragma unroll
         for (int e = 0; e < 4; ++e) v[e] = rnd_h(v[e]);
     }
+#if G6_MODEL_FLASH
+    if (a.h16) { shx_store_h16(v, lane, row, a.M, a.I / 16, b * 8, a.x8); return; }
+#endif
     shx_store_mx8(v, lane, row, a.M, a.I / 32, b * 4 + (lane >> 3), a.x8);
 }
 inline void launch(const Act& a, cudaStream_t st)
@@ -1585,6 +1906,9 @@ struct Blas
     int K = 0, O = 0, M = 0;
     float* y32 = nullptr;
     __half* y16 = nullptr;
+#if G6_MODEL_FLASH
+    int ldy = 0;
+#endif
 };
 inline cublasStatus_t launch(const Blas& b, cudaStream_t st)
 {
@@ -1593,8 +1917,14 @@ inline cublasStatus_t launch(const Blas& b, cudaStream_t st)
     cublasStatus_t s = cublasSetStream(b.h, st);
     if (s != CUBLAS_STATUS_SUCCESS) return s;
     // row-major Y = X W^T is column-major Y' = W'^T X' with W' (K x O), X' (K x M), Y' (O x M)
+#if G6_MODEL_FLASH
+    const int ldc = b.ldy > 0 ? b.ldy : b.O;
+    s = cublasGemmEx(b.h, CUBLAS_OP_T, CUBLAS_OP_N, b.O, b.M, b.K, &one, b.w, CUDA_R_16BF, b.K, b.xb, CUDA_R_16BF, b.K, &zero,
+                     b.y32, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+#else
     s = cublasGemmEx(b.h, CUBLAS_OP_T, CUBLAS_OP_N, b.O, b.M, b.K, &one, b.w, CUDA_R_16BF, b.K, b.xb, CUDA_R_16BF, b.K, &zero,
                      b.y32, CUDA_R_32F, b.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+#endif
     if (s != CUBLAS_STATUS_SUCCESS) return s;
     const long long n = static_cast<long long>(b.M) * b.O;
     if (b.y16) k_f32_f16<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(b.y32, n, b.y16);
@@ -1616,7 +1946,21 @@ inline const char* make_blas(const Tensor& w, int K, int M, cublasHandle_t h, co
 struct Expert
 {
     int on = 0, M = 0, maxseg = 0;
-    int nroutes = 0;                  // routes of the pass: 0 = M * TOPK; the trellis shared pass has M (one per row)
+#if G6_MODEL_FLASH
+    int h16 = 0;                      // 1: fp16 fc1 / mid / fc2 (x2 then holds fp16 A fragments: [seg][MB][EB][8 k16][32 lanes][4] u32)
+    int e4 = 0;                       // h16 on an exlr8-e4m3 layer: the fp16 weight fragments get the E4M3 round trip of decode (tr3_cb2<true>)
+    int fc2one = 0;                   // h16 + bs: fc2 runs one output Hadamard per 128-col group (G6_PF_FC2ONE=0: one per block)
+    int fc2v2 = 0;                    // fc2one: k_pf_fc2v (A + weights staged in smem, row blocks as a template; G6_PF_FC2V2=0: k_pf_fc2g)
+    const __half* hx = nullptr;       // h16 + bs: [M][HID] f16(H128(x * t_sg)) per token row (k_pf_hx); fc1 stages these rows and
+                                      // scales each 128-k block by its t_v1b entry instead of rotating x per CTA (G6_PF_HX=0: off)
+    int wm = 0;                       // hx set: routed fc1 runs as k_pf_fc1w over the wtiles (unless G6_PF_WM=0; M >= G6_PF_WM_MIN; 0 = k_pf_fc1)
+    int wm2 = 0;                      // wm + fc2v2: fc2 runs as k_pf_fc2w over half wtiles (G6_PF_WM2=1; 0 = k_pf_fc2v)
+    int* wt = nullptr;                // [max_wtiles][3] expert, first route, rows (<= WM_R): k_pf_fill writes it when set
+    int* n_wt = nullptr;              // [1]
+#endif
+    int nroutes = 0;                 // routes of the pass: 0 = M * TOPK; the trellis shared pass has M (one per row)
+    int shr = 0;                      // 1: the trellis shared expert rides in this pass as M more routes of expert NEXP after the
+                                      // M * TOPK routed ones (k_pf_fill block NEXP, weight 1); their fc2 rows are the yw tail = ysh
     const __half* sh_svh = nullptr;   // set: ysh holds the trellis shared expert's down output before its output rotation;
                                       // k_pf_fin adds f16(H128(ysh) x sh_svh) (bindp::ShX)
     const __half* sh_sc = nullptr;    // block-scale form: sh_svh holds the output signs and these the 48 scales
@@ -1664,19 +2008,30 @@ struct Expert
 #ifdef PF_F12
     int f12 = 0;                      // PF_F12: 1 = fc1 runs as k_pf_fc1f (fat CTA: F12_NE adjacent expert blocks share one quantized A record); the host sets it (G6_PF_F12, default 1)
 #endif
+    int topk = TOPK;                  // routed experts kept per token (G6_MOE_TOPK cut, host-set in make; default = the model's):
+                                      // dropped routes get tok_e -1, weights renormalize over the kept (k_pf_route). Host-side
+                                      // only; kept after the pre-cut fields so their kernel offsets stay unchanged
+    int pre_routed = 0;               // 1: tok_e / tok_w already hold every row (G6_PF_ROUTER_SPLIT: own rows routed here, the
+                                      // peers' rows copied in), so launch_route skips k_pf_route. Host-side only, LAST member
 };
 
 inline int max_segments(int M) { return (M * TOPK + RS - 1) / RS + NEXP; }
+#if G6_MODEL_FLASH
+constexpr int WM_R = 256;             // rows (routes of one expert) of a k_pf_fc1w tile
+inline int max_wtiles(int M) { return (M * TOPK + WM_R - 1) / WM_R + NEXP; }
+inline int pass_wtiles(const Expert& A) { return max_wtiles(A.M) + (A.shr ? (A.M + WM_R - 1) / WM_R : 0); }
+#endif
 
 // grid ceil(M/8), block 256: warp = one token. Rule of glue::k_router_plan: key = sigmoid(logit) + bias, ties ->
 // lowest expert id; weights = sigmoid of the selected / their sum * route_scale.
-__global__ void __launch_bounds__(256) k_pf_route(Expert A)
+template <int K = TOPK> __global__ void __launch_bounds__(256) k_pf_route(Expert A)
 {
+    static_assert(K >= 1 && K <= TOPK, "k_pf_route: K outside 1..TOPK");
     const int l = threadIdx.x & 31, m = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (m >= A.M) return;
-    float s[8], key[8];
+    float s[EPL], key[EPL];
     #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < EPL; ++i)
     {
         const int e = l + 32 * i;
         s[i] = 1.f / (1.f + expf(-A.logits[static_cast<size_t>(m) * NEXP + e]));
@@ -1686,12 +2041,12 @@ __global__ void __launch_bounds__(256) k_pf_route(Expert A)
     int se[TOPK];
     float sw[TOPK], sum = 0.f;
     #pragma unroll
-    for (int k = 0; k < TOPK; ++k)
+    for (int k = 0; k < K; ++k)
     {
         float bk = -INFINITY;
         int be = 0x7fffffff;
         #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < EPL; ++i)
             if (!(taken >> i & 1) && key[i] > bk) { bk = key[i]; be = l + 32 * i; }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1)
@@ -1708,12 +2063,33 @@ __global__ void __launch_bounds__(256) k_pf_route(Expert A)
     }
     if (l < TOPK)
     {
-        A.tok_e[m * TOPK + l] = se[l];
-        A.tok_w[m * TOPK + l] = sw[l] / sum * A.route_scale;
+        if constexpr (K == TOPK)
+        {
+            A.tok_e[m * TOPK + l] = se[l];
+            #if G6_MODEL_FLASH
+            A.tok_w[m * TOPK + l] = sw[l] / (sum + 1e-20f) * A.route_scale;
+#else
+            A.tok_w[m * TOPK + l] = sw[l] / sum * A.route_scale;
+#endif
+        }
+        else if (l < K)
+        {
+            A.tok_e[m * TOPK + l] = se[l];
+            #if G6_MODEL_FLASH
+            A.tok_w[m * TOPK + l] = sw[l] / (sum + 1e-20f) * A.route_scale;
+#else
+            A.tok_w[m * TOPK + l] = sw[l] / sum * A.route_scale;
+#endif
+        }
+        else
+        {
+            A.tok_e[m * TOPK + l] = -1;     // dropped route (G6_MOE_TOPK): no expert; count / fill / fin skip -1
+            A.tok_w[m * TOPK + l] = 0.f;
+        }
     }
 }
 
-// grid 256 (expert), block 256
+// grid NEXP (expert), block 256
 __global__ void __launch_bounds__(256) k_pf_count(Expert A)
 {
     __shared__ int tot;
@@ -1727,11 +2103,54 @@ __global__ void __launch_bounds__(256) k_pf_count(Expert A)
     if (t == 0) A.cnt[e] = tot;
 }
 
-// grid 256 (expert), block 256: the expert's routes in token order, its segments, the inverse map.
-__global__ void __launch_bounds__(256) k_pf_fill(Expert A)
+// grid NEXP (expert), block 256: the expert's routes in token order, its segments, the inverse map.
+template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Expert A)
 {
     __shared__ int c[256], base, segb;
+#if G6_MODEL_FLASH
+    __shared__ int wtb;
+#endif
     const int e = blockIdx.x, t = threadIdx.x;
+    if (e == NEXP)                    // Expert::shr: the shared expert, one route per row in row order, after every routed route
+    {
+        if (t == 0)
+        {
+            int off = 0, sb = 0;
+            for (int i = 0; i < NEXP; ++i) { off += A.cnt[i]; sb += (A.cnt[i] + RS - 1) / RS; }
+            base = off; segb = sb;
+            *A.n_seg = sb + (A.M + RS - 1) / RS;
+#if G6_MODEL_FLASH
+            if (A.wt)
+            {
+                int wb = 0;
+                for (int i = 0; i < NEXP; ++i) wb += (A.cnt[i] + WM_R - 1) / WM_R;
+                wtb = wb;
+                *A.n_wt = wb + (A.M + WM_R - 1) / WM_R;
+            }
+#endif
+        }
+        __syncthreads();
+        for (int i = t; i < A.M; i += 256)
+        {
+            const int idx = base + i;
+            A.rr_row[idx] = i; A.rr_e[idx] = NEXP; A.rr_w[idx] = 1.f;
+            A.rr_sp[idx] = (segb + i / RS) * RS + i % RS;
+        }
+        for (int i = t; i < (A.M + RS - 1) / RS; i += 256)
+        {
+            int* sg = A.segs + static_cast<size_t>(segb + i) * 3;
+            sg[0] = NEXP; sg[1] = base + i * RS; sg[2] = min(RS, A.M - i * RS);
+        }
+#if G6_MODEL_FLASH
+        if (A.wt)
+            for (int i = t; i < (A.M + WM_R - 1) / WM_R; i += 256)
+            {
+                int* w = A.wt + static_cast<size_t>(wtb + i) * 3;
+                w[0] = NEXP; w[1] = base + i * WM_R; w[2] = min(WM_R, A.M - i * WM_R);
+            }
+#endif
+        return;
+    }
     const int C = (A.M + 255) / 256, m0 = min(A.M, t * C), m1 = min(A.M, m0 + C);
     int n = 0;
     for (int i = m0 * TOPK; i < m1 * TOPK; ++i) n += A.tok_e[i] == e;
@@ -1741,7 +2160,16 @@ __global__ void __launch_bounds__(256) k_pf_fill(Expert A)
         int off = 0, sb = 0;
         for (int i = 0; i < e; ++i) { off += A.cnt[i]; sb += (A.cnt[i] + RS - 1) / RS; }
         base = off; segb = sb;
-        if (e == NEXP - 1) *A.n_seg = sb + (A.cnt[e] + RS - 1) / RS;
+        if (e == NEXP - 1 && !A.shr) *A.n_seg = sb + (A.cnt[e] + RS - 1) / RS;
+#if G6_MODEL_FLASH
+        if (A.wt)
+        {
+            int wb = 0;
+            for (int i = 0; i < e; ++i) wb += (A.cnt[i] + WM_R - 1) / WM_R;
+            wtb = wb;
+            if (e == NEXP - 1 && !A.shr) *A.n_wt = wb + (A.cnt[e] + WM_R - 1) / WM_R;
+        }
+#endif
     }
     __syncthreads();
     int p = 0;
@@ -1755,12 +2183,23 @@ __global__ void __launch_bounds__(256) k_pf_fill(Expert A)
             A.pos[i] = idx;
             ++p;
         }
+        else if constexpr (CUT)
+            if (A.tok_e[i] < 0)
+                A.pos[i] = -1;             // dropped route (G6_MOE_TOPK): no route index, k_pf_fin skips it
     const int ne = A.cnt[e], nseg = (ne + RS - 1) / RS;
     for (int i = t; i < nseg; i += 256)
     {
         int* sg = A.segs + static_cast<size_t>(segb + i) * 3;
         sg[0] = e; sg[1] = base + i * RS; sg[2] = min(RS, ne - i * RS);
     }
+#if G6_MODEL_FLASH
+    if (A.wt)
+        for (int i = t; i < (ne + WM_R - 1) / WM_R; i += 256)
+        {
+            int* w = A.wt + static_cast<size_t>(wtb + i) * 3;
+            w[0] = e; w[1] = base + i * WM_R; w[2] = min(WM_R, ne - i * WM_R);
+        }
+#endif
 }
 
 // One row of a 128 block, 4 consecutive values per lane (k = lane*4 + e): MXFP8-quantize (scale per 32 k = 8 lanes)
@@ -1860,6 +2299,25 @@ __device__ __forceinline__ void had128_l16(float (&v)[16], int lane)
 // 16 B chunk c (0..15) of a 256 B smem row r -> its swizzled slot: the 8 lanes of a 128-bit access (rows r, r + 1, q = 0..3,
 // chunk q * 4 + j) hit 8 different bank groups. Bit 3 of c is kept, so a slot stays inside the row.
 __device__ __forceinline__ int swz16(int c, int r) { return c ^ (r & 7) ^ ((c >> 3) << 1); }
+#if G6_MODEL_FLASH
+// fp16 trellis fragments of a k32 step -> the decode values of an exlr8-e4m3 layer (tr3_cb2<true>: E4M3 RN-even, satfinite)
+__device__ __forceinline__ u32 pf_e4r(u32 r)
+{
+    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(r));
+    return r;
+}
+__device__ __forceinline__ void pf_e4r4(bool on, u32 (&p0)[2], u32 (&p1)[2], u32 (&q0)[2], u32 (&q1)[2])
+{
+    if (!on) return;
+    p0[0] = pf_e4r(p0[0]); p0[1] = pf_e4r(p0[1]); p1[0] = pf_e4r(p1[0]); p1[1] = pf_e4r(p1[1]);
+    q0[0] = pf_e4r(q0[0]); q0[1] = pf_e4r(q0[1]); q1[0] = pf_e4r(q1[0]); q1[1] = pf_e4r(q1[1]);
+}
+__device__ __forceinline__ void pf_ldsm4(u32 (&r)[4], const void* p)
+{
+    const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+#endif
 
 // A lane holds 32 consecutive k (one k32 step) of one row of a 128 block as fp32: round to fp16 (packed pairs),
 // MXFP8-quantize (amax of the rounded values in the lane) and store the row's 32 codes into the step's record `rec`
@@ -2010,7 +2468,7 @@ __device__ unsigned g_pf_done;
 // would, so z1 is byte-equal. sW: TR3W_GROUP bytes per group.
 // mw = the first tile of the unit's matrix (tr3_unit) when NBL == 1; NBL > 1 computes it from the table width (one
 // width per expert: k_pf_fc1h refuses tr3.kmix experts).
-template <int BITS, int G, int EB, int NBL = 1, bool BS = false, bool AOP = false>
+template <int BITS, int G, int EB, int NBL = 1, bool BS = false, bool AOP = false PF_H16P>
 __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, int b, int mat, int r0, int rows, unsigned char* sA,
                                          unsigned char* sX, unsigned char* sW, const int* sRow PF_PRO_ARG, const uint8_t* mw, int nbg = 1,
                                          const uint8_t* ga = nullptr)
@@ -2077,13 +2535,19 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
     // (halves; rows * HID < 2^32).
     const int sc = t & 15, sr0 = t >> 4;
     const int sofs = sr0 * 256 + swz16(sc, sr0) * 16;
+#if G6_MODEL_FLASH
+    const bool hxs = H16 && BS && A.hx;          // stage the pre-rotated rows (k_pf_hx); the prologue only scales them
+    const __half* xsrc = hxs ? A.hx : A.x;
+#else
+    const __half* xsrc = A.x;
+#endif
     auto stage = [&](int hg) {
         #pragma unroll
         for (int j = 0; j < RS * 16 / 256; ++j)
         {
             const int R = sr0 + 16 * j, g = R >> rsh, r = R & ((1 << rsh) - 1);
             if (r < rows)
-                pf::cp16(sX + (hg & 1) * FC1_XS + sofs + j * 4096, A.x + (static_cast<u32>(sRow[r]) * static_cast<u32>(A.ldx) + static_cast<u32>((hg * G + g) * 128 + sc * 8)));
+                pf::cp16(sX + (hg & 1) * FC1_XS + sofs + j * 4096, xsrc + (static_cast<u32>(sRow[r]) * static_cast<u32>(A.ldx) + static_cast<u32>((hg * G + g) * 128 + sc * 8)));
         }
         pf::cp_commit();
     };
@@ -2112,6 +2576,32 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
         if (AOP) { if (hg + 1 < NG) stage_a(hg + 1); }
         else if (PF_PRO && lead && hg + 1 < NG) stage(hg + 1);
         PF_CK(2)
+#if G6_MODEL_FLASH
+        if (!AOP && PF_PRO && hxs && lead && pg < G && pw * 8 < rows)      // pre-rotated rows: f16(fp32(hx) * v1b scale of the 128-k block), in place
+        {
+            const int R = (pg << rsh) + pr;
+            const float c = __half2float(A.t_v1b[(brow * 2 + mat) * (HID / 128) + hg * G + pg]);
+            if (pact)
+            {
+                unsigned char* xw = sX + (hg & 1) * FC1_XS + R * 256;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    uint4* p = reinterpret_cast<uint4*>(xw + swz16(q * 4 + j, R) * 16);
+                    uint4 o = *p;
+                    u32* w4 = reinterpret_cast<u32*>(&o);
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        const float2 f = __half22float2(as_h2(w4[e]));
+                        w4[e] = pack_h2(__fmul_rn(f.x, c), __fmul_rn(f.y, c));
+                    }
+                    *p = o;
+                }
+            }
+        }
+        else
+#endif
         if (!AOP && PF_PRO && lead && pg < G && pw * 8 < rows)            // warp-uniform: block pg, lane = (row pr, k32 step q)
         {
             const int R = (pg << rsh) + pr;
@@ -2141,6 +2631,24 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
             PF_CK(3)
             had128_l32(v, lane);
             PF_CK(4)
+#if G6_MODEL_FLASH
+            if constexpr (H16)        // fp16 rows back into the stage, in place (the lane rewrites the 4 chunks it read)
+            {
+                if (pact)
+                {
+                    unsigned char* xw = sX + (hg & 1) * FC1_XS + R * 256;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                    {
+                        uint4 o;
+                        o.x = pack_h2(v[j * 8], v[j * 8 + 1]); o.y = pack_h2(v[j * 8 + 2], v[j * 8 + 3]);
+                        o.z = pack_h2(v[j * 8 + 4], v[j * 8 + 5]); o.w = pack_h2(v[j * 8 + 6], v[j * 8 + 7]);
+                        *reinterpret_cast<uint4*>(xw + swz16(q * 4 + j, R) * 16) = o;
+                    }
+                }
+            }
+            else
+#endif
             if (pact) store_mx8_l32(v, lane, pr & 15, sA + ((pg * 4 + q) * rst + (pr >> 4)) * REC);
             PF_CK(5)
         }
@@ -2186,6 +2694,42 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
         #pragma unroll
         for (int s = 0; s < 4; ++s)
         {
+#if G6_MODEL_FLASH
+            if constexpr (H16)
+            {
+                u32 p0[2], p1[2], q0[2], q1[2];
+                if (wide)
+                {
+                    const u32 c0 = trw_chunk<BITS>(cw, 2 * s), c1 = trw_chunk<BITS>(cw, 2 * s + 1);
+                    const u32 b0 = __shfl_sync(0xffffffffu, c0, (lane + 31) & 31), b1 = __shfl_sync(0xffffffffu, c1, (lane + 31) & 31);
+                    Tr3Lane<BITS>::decode_m((static_cast<u64>(b0) << (8 * BITS)) | c0, 7 * BITS, p0, p1);
+                    Tr3Lane<BITS>::decode_m((static_cast<u64>(b1) << (8 * BITS)) | c1, 7 * BITS, q0, q1);
+                }
+                else
+                {
+                    ld.decode(cv[2 * s][0], cv[2 * s][1], p0, p1);
+                    ld.decode(cv[2 * s + 1][0], cv[2 * s + 1][1], q0, q1);
+                }
+                pf_e4r4(A.e4, p0, p1, q0, q1);
+                const unsigned char* xsb = sX + (hg & 1) * FC1_XS;
+                #pragma unroll
+                for (int mb = 0; mb < MB; ++mb)
+                {
+                    if (mb >= nmb) continue;
+                    const int Rl = (g << rsh) + mb * 16 + (lane & 15);     // ldmatrix x4: rows 0-15 at k 0-7, then k 8-15
+                    #pragma unroll
+                    for (int hk = 0; hk < 2; ++hk)
+                    {
+                        const int t16 = 2 * s + hk;
+                        u32 a[4];
+                        pf_ldsm4(a, xsb + Rl * 256 + swz16(2 * t16 + (lane >> 4), Rl) * 16);
+                        mma16816(acc[mb][0], a[0], a[1], a[2], a[3], hk ? q0[0] : p0[0], hk ? q0[1] : p0[1]);
+                        mma16816(acc[mb][1], a[0], a[1], a[2], a[3], hk ? q1[0] : p1[0], hk ? q1[1] : p1[1]);
+                    }
+                }
+                continue;
+            }
+#endif
             u32 bf[4];
             if (wide)
             {
@@ -2387,7 +2931,7 @@ __global__ void __launch_bounds__(256, PF_AOP_MINB) k_pf_aop(Expert A)
 
 // grid (2 EB = block * 2 + matrix, maxseg), block 256. EB = blocks per expert the scratch and grid are laid out for
 // (g6nr::EB: 3 = the TP6 packs, 4 = TP4; every expert of the table must have tr[3] <= EB).
-template <int EB = g6nr::EB, bool K2 = false, bool BS = false, bool AOPK = false>
+template <int EB = g6nr::EB, bool K2 = false, bool BS = false, bool AOPK = false PF_H16P>
 __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[4 * MB * REC];
@@ -2470,15 +3014,15 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
 #endif
     if (rows <= 32)                       // G = 2: two 128-k blocks per group
     {
-        if (k == 3) fc1_body<3, 2, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else if (!K2 || k == 4) fc1_body<4, 2, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else fc1_body<K2 ? 2 : 4, 2, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        if (k == 3) fc1_body<3, 2, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else if (!K2 || k == 4) fc1_body<4, 2, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else fc1_body<K2 ? 2 : 4, 2, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
     }
     else
     {
-        if (k == 3) fc1_body<3, 1, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else if (!K2 || k == 4) fc1_body<4, 1, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
-        else fc1_body<K2 ? 2 : 4, 1, EB, 1, BS>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        if (k == 3) fc1_body<3, 1, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else if (!K2 || k == 4) fc1_body<4, 1, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+        else fc1_body<K2 ? 2 : 4, 1, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
     }
 #ifdef PF_CLK
     pf_clk_end(true);
@@ -2814,9 +3358,439 @@ __global__ void __launch_bounds__(512, 1) k_pf_fc1h(Expert A)
 }
 #endif
 
+#if G6_MODEL_FLASH
+// hx[r] = f16(H128(x[r] * t_sg)) per 128-k block, the lane code of the fc1 prologue without the per-expert block scale:
+// warp = (8 rows, 128-k block), lane = (row lane / 4, k32 step lane % 4). grid ceil(ceil(M / 8) * HID / 128 / 8), block 256
+__global__ void __launch_bounds__(256) k_pf_hx(Expert A)
+{
+    constexpr int NB = HID / 128;
+    const int w = (blockIdx.x * 256 + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    const int rb = w / NB, kb = w - rb * NB, r = rb * 8 + (lane >> 2), q = lane & 3;
+    if (rb * 8 >= A.M) return;                   // warp-uniform
+    const bool on = r < A.M;
+    const __half* xr = A.x + static_cast<size_t>(on ? r : 0) * A.ldx + kb * 128 + q * 32;
+    const __half* sp = A.t_sg + kb * 128 + q * 32;
+    float v[32];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const uint4 xv = on ? *reinterpret_cast<const uint4*>(xr + j * 8) : make_uint4(0u, 0u, 0u, 0u);
+        const uint4 sv = *reinterpret_cast<const uint4*>(sp + j * 8);
+        const u32 xw[4] = {xv.x, xv.y, xv.z, xv.w}, sw[4] = {sv.x, sv.y, sv.z, sv.w};
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float2 x2 = __half22float2(as_h2(xw[e])), s2 = __half22float2(as_h2(sw[e]));
+            v[j * 8 + e * 2] = __fmul_rn(x2.x, s2.x);
+            v[j * 8 + e * 2 + 1] = __fmul_rn(x2.y, s2.y);
+        }
+    }
+    had128_l32(v, lane);
+    if (!on) return;
+    __half* o = const_cast<__half*>(A.hx) + static_cast<size_t>(r) * HID + kb * 128 + q * 32;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        uint4 u;
+        u.x = pack_h2(v[j * 8], v[j * 8 + 1]); u.y = pack_h2(v[j * 8 + 2], v[j * 8 + 3]);
+        u.z = pack_h2(v[j * 8 + 4], v[j * 8 + 5]); u.w = pack_h2(v[j * 8 + 6], v[j * 8 + 7]);
+        *reinterpret_cast<uint4*>(o + j * 8) = u;
+    }
+}
+inline void launch_hx(const Expert& A, cudaStream_t st)     // once per layer, before the shared and the routed fc1
+{
+    if (!A.on || !A.hx) return;
+    const long long warps = static_cast<long long>((A.M + 7) / 8) * (HID / 128);
+    k_pf_hx<<<static_cast<unsigned>((warps + 7) / 8), 256, 0, st>>>(A);
+}
+
+// Weight-major fc1 (Expert::wm, G6_PF_WM=1; h16 + bs + hx layers, non-wide units). CTA = (wtile = up to WM_R consecutive
+// routes of one expert (k_pf_fill), x = mat * EB + b as k_pf_fc1), 16 warps: warp (wr = warp / 4, wc = warp % 4) owns rows
+// wr * 64 .. + 63 and cols wc * 32 .. + 31 of the 128-col block. Per k32 step the CTA stages by cp.async (WM_ST stages) the
+// hx rows of the tile (64 B per row, 16 B chunks swizzled by row / 2) and the step's 16 weight tiles (16 TB contiguous bytes,
+// warp j copies tile j = k16 j / 8, col tile j % 8); a thread scales the A chunks it copied by the block's t_v1b entry (the
+// fc1_body HX prologue: f16(fp32(hx) * fp32(v1b))); warp j decodes tile j one step ahead into sB (lane fragments, 16 B per
+// lane, the E4M3 round trip on e4 layers); each warp runs 4 row blocks x 4 n8 x 2 k16 mma per step. Every acc sums the k16
+// steps in increasing order with the fragments of fc1_body H16: z1 is byte-equal to k_pf_fc1 (HX). A weight tile is read
+// and decoded once per wtile (k_pf_fc1: once per 64-row segment and its 8 warps each feed 8 mma per decode, here 32).
+#ifndef PF_WM_ST
+#define PF_WM_ST 4
+#endif
+constexpr int WM_ST = PF_WM_ST;                // cp.async stages
+constexpr int WM_SA = WM_R * 64;               // A stage: WM_R rows x 32 k fp16
+constexpr int WM_SW = 16 * 128;                // weight stage: 16 tiles, TB <= 128
+constexpr int WM_SB = 16 * 512;                // decoded B: 16 tiles x 32 lanes x 16 B
+constexpr int WM_SMEM = WM_ST * (WM_SA + WM_SW) + 2 * WM_SB + WM_R * 4;
+template <int BITS, int EB>
+__device__ __forceinline__ void fc1w_body(const Expert& A, const long long* tr, int b, int mat, int r0, int rows, const uint8_t* mw,
+                                          unsigned char* sm)
+{
+    constexpr int TB = 32 * BITS, NK = KSH / 2;
+    unsigned char* sA = sm;
+    unsigned char* sW = sA + WM_ST * WM_SA;
+    unsigned char* sB = sW + WM_ST * WM_SW;
+    const int* sRow = reinterpret_cast<const int*>(sB + 2 * WM_SB);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, wr = warp >> 2, wc = warp & 3;
+    const __half* v1b = A.t_v1b + ((static_cast<size_t>(tr[2]) + b) * 2 + mat) * (HID / 128);
+    const int nmw = min(4, max(0, (rows - wr * 64 + 15) / 16));       // the warp's row blocks with rows (warp-uniform)
+    // thread t copies A chunks c = t + 512 j: row c / 4, k chunk c % 4
+    auto stage = [&](int k) {
+        unsigned char* a = sA + (k % WM_ST) * WM_SA;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const int c = t + 512 * j, R = c >> 2, ch = c & 3;
+            if (R < rows)
+                pf::cp16(a + R * 64 + ((ch ^ ((R >> 1) & 3)) << 4),
+                         A.hx + (static_cast<u32>(sRow[R]) * static_cast<u32>(A.ldx) + static_cast<u32>(k * 32 + ch * 8)));
+        }
+        if (lane < TB / 16) pf::cp16(sW + (k % WM_ST) * WM_SW + warp * TB + lane * 16, mw + (static_cast<size_t>(k) * 16 + warp) * TB + lane * 16);
+        pf::cp_commit();
+    };
+    // packed fp16 multiply = f16(fp32(hx) * fp32(v1b)) of fc1_body: the fp32 product of two fp16 values is exact (22
+    // significant bits, exponent >= -48), so both round the exact product once to fp16
+    auto scale = [&](int k, __half sc) {
+        unsigned char* a = sA + (k % WM_ST) * WM_SA;
+        const __half2 c = __half2half2(sc);
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const int cc = t + 512 * j, R = cc >> 2, ch = cc & 3;
+            if (R >= rows) continue;
+            uint4* p = reinterpret_cast<uint4*>(a + R * 64 + ((ch ^ ((R >> 1) & 3)) << 4));
+            uint4 o = *p;
+            o.x = as_u32(__hmul2(as_h2(o.x), c)); o.y = as_u32(__hmul2(as_h2(o.y), c));
+            o.z = as_u32(__hmul2(as_h2(o.z), c)); o.w = as_u32(__hmul2(as_h2(o.w), c));
+            *p = o;
+        }
+    };
+    Tr3Lane<BITS> ld;
+    ld.init(lane);
+    auto decode = [&](int k) {
+        __syncwarp();          // the tile's cp.async bytes of lanes 0 .. TB / 16 - 1 (landed by their cp_wait) -> every lane
+        const u32* w = reinterpret_cast<const u32*>(sW + (k % WM_ST) * WM_SW + warp * TB);
+        u32 f0[2], f1[2];
+        ld.decode(w[ld.i0], w[ld.i1], f0, f1);
+        if (A.e4) { f0[0] = pf_e4r(f0[0]); f0[1] = pf_e4r(f0[1]); f1[0] = pf_e4r(f1[0]); f1[1] = pf_e4r(f1[1]); }
+        *reinterpret_cast<uint4*>(sB + (k & 1) * WM_SB + warp * 512 + lane * 16) = make_uint4(f0[0], f0[1], f1[0], f1[1]);
+    };
+    float acc[4][4][4];
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int n = 0; n < 4; ++n)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][n][i] = 0.f;
+    #pragma unroll
+    for (int k = 0; k < WM_ST - 1; ++k) stage(k);
+    pf::cp_wait<WM_ST - 2>();
+    scale(0, v1b[0]);
+    decode(0);
+    for (int k = 0; k < NK; ++k)
+    {
+        // the next step's block scale: an L1 load issued here lands before scale(k + 1) (k < NK - 1 reads in range)
+        const __half sc1 = v1b[min(k + 1, NK - 1) >> 2];
+        __syncthreads();       // A stage k scaled and sB[k & 1] written by every thread; the buffers of step k - 1 are free
+        if (k + WM_ST - 1 < NK) stage(k + WM_ST - 1);
+        else pf::cp_commit();
+        const unsigned char* a = sA + (k % WM_ST) * WM_SA;
+        const unsigned char* bb = sB + (k & 1) * WM_SB;
+        #pragma unroll
+        for (int kk = 0; kk < 2; ++kk)
+        {
+            if (kk == 1 && k + 1 < NK)          // the next step's scale and decode between the two k16 halves: the tensor
+            {                                   // pipe works on the queued first half meanwhile
+                pf::cp_wait<WM_ST - 2>();
+                scale(k + 1, sc1);
+                decode(k + 1);
+            }
+            if (nmw > 0)
+            {
+                const uint4 f0 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2) * 512 + lane * 16);
+                const uint4 f1 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2 + 1) * 512 + lane * 16);
+                #pragma unroll
+                for (int mb = 0; mb < 4; ++mb)
+                {
+                    if (mb >= nmw) continue;
+                    u32 av[4][4];
+                    const int Rl = wr * 64 + mb * 16 + (lane & 15), ch = 2 * kk + (lane >> 4);
+                    pf_ldsm4(av[mb], a + Rl * 64 + ((ch ^ ((Rl >> 1) & 3)) << 4));
+                    mma16816(acc[mb][0], av[mb][0], av[mb][1], av[mb][2], av[mb][3], f0.x, f0.y);
+                    mma16816(acc[mb][1], av[mb][0], av[mb][1], av[mb][2], av[mb][3], f0.z, f0.w);
+                    mma16816(acc[mb][2], av[mb][0], av[mb][1], av[mb][2], av[mb][3], f1.x, f1.y);
+                    mma16816(acc[mb][3], av[mb][0], av[mb][1], av[mb][2], av[mb][3], f1.z, f1.w);
+                }
+            }
+        }
+    }
+    const int c = lane & 3, r = lane >> 2;
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int n = 0; n < 4; ++n)
+        {
+            if (mb >= nmw) continue;
+            const int col = (wc * 2 + (n >> 1)) * 16 + (n & 1) * 8 + 2 * c, row = wr * 64 + mb * 16 + r;
+            __half* z = A.z1 + (static_cast<size_t>(r0 + row) * (2 * EB) + b * 2 + mat) * 128 + col;
+            if (row < rows) *reinterpret_cast<u32*>(z) = pack_h2(acc[mb][n][0], acc[mb][n][1]);
+            if (row + 8 < rows) *reinterpret_cast<u32*>(z + 8 * (2 * EB) * 128) = pack_h2(acc[mb][n][2], acc[mb][n][3]);
+        }
+}
+// grid (2 EB, max_wtiles), block 512, WM_SMEM dynamic smem
+template <int EB>
+__global__ void __launch_bounds__(512, 1) k_pf_fc1w(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char wm_sm[];
+    if (static_cast<int>(blockIdx.y) >= *A.n_wt) return;
+    const int* w = A.wt + static_cast<size_t>(blockIdx.y) * 3;
+    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
+    const int mat = blockIdx.x / EB, b = blockIdx.x - mat * EB;
+    if (b >= static_cast<int>(tr[3])) return;
+    const int r0 = w[1], rows = w[2];
+    int* sRow = reinterpret_cast<int*>(wm_sm + WM_ST * (WM_SA + WM_SW) + 2 * WM_SB);
+    if (threadIdx.x < WM_R) sRow[threadIdx.x] = threadIdx.x < rows ? A.rr_row[r0 + threadIdx.x] : 0;
+    __syncthreads();
+    size_t off;
+    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
+    if (k == 4) fc1w_body<4, EB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+    else if (k == 3) fc1w_body<3, EB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+    else fc1w_body<2, EB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+}
+// Warp-specialized weight-major fc1 (PF_WM_WS, default on): the same wtile CTA and the same z1 bytes as k_pf_fc1w, but
+// warps 0-3 (producers) only copy (cp.async), scale and decode, and warps 4-11 (consumers) only run ldmatrix + mma: the
+// tensor pipe is not drained by a CTA-wide barrier per k32 step. Rings: A (hx rows, scaled in place) WS_NA stages, raw
+// weight tiles WS_NA stages, decoded B 2 stages. Named barriers: FULL[s] (ids 1, 2) = step data of B stage s ready
+// (producers arrive, consumers sync), EMPTY[s] (ids 3, 4) = consumers are done with the step in B stage s (consumers
+// arrive, producers sync before they reuse that B stage and the A stage two steps ahead). Producer step j: wait EMPTY
+// of step j - 2, issue the cp.async of step j + 2, wait the group of step j, scale A(j) (own chunks), decode the warp's 4
+// tiles of step j, arrive FULL. Consumer warp (wr = cw / 4, wc = cw % 4) owns rows wr * 128 .. + 127 (8 row blocks) and
+// cols wc * 32 .. + 31: acc[8][4][4], each k16 step in increasing order with the fragments of fc1w_body.
+#ifndef PF_WM_WS
+#define PF_WM_WS 1
+#endif
+#ifndef PF_WS_NOMMA
+#define PF_WS_NOMMA 0                          // timing probes only (z1 wrong): consumers skip the mma
+#endif
+#ifndef PF_WS_NOA
+#define PF_WS_NOA 0                            // timing probes only (z1 wrong): producers skip the hx copies
+#endif
+#ifndef PF_WS_NODEC
+#define PF_WS_NODEC 0                          // timing probes only (z1 wrong): producers skip scale + decode
+#endif
+#ifndef PF_WS_NA
+#define PF_WS_NA 4
+#endif
+#ifndef PF_WS_NB
+#define PF_WS_NB 2
+#endif
+#ifndef PF_WS_NW
+#define PF_WS_NW 8
+#endif
+constexpr int WS_NA = PF_WS_NA;                // A stages
+constexpr int WS_NB = PF_WS_NB;                // decoded B stages (producers run up to WS_NB - 1 steps ahead)
+constexpr int WS_LA = WS_NA - WS_NB;           // A cp.async lookahead (hx rows mostly hit L2)
+constexpr int WS_NW = PF_WS_NW;                // raw weight stages
+constexpr int WS_LW = WS_NW - 2;               // weight cp.async lookahead (weight tiles come from DRAM)
+static_assert(WS_LA >= 1 && WS_LW >= WS_LA && 2 * WS_NB <= 15, "fc1ws rings");
+constexpr int WS_SMEM = WS_NA * WM_SA + WS_NW * WM_SW + WS_NB * WM_SB + WM_R * 4;
+__device__ __forceinline__ void nb_sync(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void nb_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
+// consumer k loop of fc1ws_body for a warp with NMW row blocks
+template <int NMW>
+__device__ __forceinline__ void fc1ws_cons(float (&acc)[8][4][4], const unsigned char* sA, const unsigned char* sB, int wr, int wc, int lane)
+{
+    constexpr int NK = KSH / 2, NT = 384;
+    for (int k = 0; k < NK; ++k)
+    {
+        nb_sync(1 + k % WS_NB, NT);
+        const unsigned char* a = sA + (k % WS_NA) * WM_SA;
+        const unsigned char* bb = sB + (k % WS_NB) * WM_SB;
+        if (NMW > 0 && !PF_WS_NOMMA)
+        {
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk)
+            {
+                const uint4 f0 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2) * 512 + lane * 16);
+                const uint4 f1 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2 + 1) * 512 + lane * 16);
+                // A fragments one row block ahead (ping-pong registers)
+                const int ch = 2 * kk + (lane >> 4);
+                auto lda = [&](u32 (&av)[4], int mb) {
+                    const int Rl = wr * 128 + mb * 16 + (lane & 15);
+                    pf_ldsm4(av, a + Rl * 64 + ((ch ^ ((Rl >> 1) & 3)) << 4));
+                };
+                u32 av[2][4];
+                lda(av[0], 0);
+                #pragma unroll
+                for (int mb = 0; mb < NMW; ++mb)
+                {
+                    if (mb + 1 < NMW) lda(av[(mb + 1) & 1], mb + 1);
+                    const u32* q = av[mb & 1];
+                    mma16816(acc[mb][0], q[0], q[1], q[2], q[3], f0.x, f0.y);
+                    mma16816(acc[mb][1], q[0], q[1], q[2], q[3], f0.z, f0.w);
+                    mma16816(acc[mb][2], q[0], q[1], q[2], q[3], f1.x, f1.y);
+                    mma16816(acc[mb][3], q[0], q[1], q[2], q[3], f1.z, f1.w);
+                }
+            }
+        }
+        if (k + WS_NB < NK) nb_arrive(1 + WS_NB + k % WS_NB, NT);
+    }
+}
+template <int BITS, int EB>
+__device__ __forceinline__ void fc1ws_body(const Expert& A, const long long* tr, int b, int mat, int r0, int rows, const uint8_t* mw,
+                                           unsigned char* sm)
+{
+    constexpr int TB = 32 * BITS, NK = KSH / 2, NT = 384;
+    unsigned char* sA = sm;
+    unsigned char* sW = sA + WS_NA * WM_SA;
+    unsigned char* sB = sW + WS_NW * WM_SW;
+    const int* sRow = reinterpret_cast<const int*>(sB + WS_NB * WM_SB);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    if (warp < 4)
+    {
+        // producer: thread t copies and scales A chunks c = t + 128 i (row c / 4, k chunk c % 4); warp copies and decodes
+        // tiles 4 warp .. + 3 of each step (contiguous 4 TB bytes: lane l < TB / 4 copies bytes l * 16 .. + 15)
+        const __half* v1b = A.t_v1b + ((static_cast<size_t>(tr[2]) + b) * 2 + mat) * (HID / 128);
+        u32 gx[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            const int c = t + 128 * i, R = c >> 2;
+            gx[i] = R < rows ? static_cast<u32>(sRow[R]) * static_cast<u32>(A.ldx) + static_cast<u32>((c & 3) * 8) : 0xffffffffu;
+        }
+        auto soff = [&](int i) { const int c = t + 128 * i, R = c >> 2; return R * 64 + (((c & 3) ^ ((R >> 1) & 3)) << 4); };
+        // cp.async groups: P0 = {A(0), W(0) .. W(WS_LW - 1)}, P(i) = {A(i)} (i < WS_LA), then iteration j commits
+        // G(j) = {A(j + WS_LA), W(j + WS_LW)}; after committing G(j), cp_wait<WS_LA> completes G(j - WS_LA) (or P(j)) and
+        // every older group: A(j) and W(j) landed
+        auto stage_a = [&](int k) {
+            unsigned char* a = sA + (k % WS_NA) * WM_SA;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (gx[i] != 0xffffffffu && !PF_WS_NOA) pf::cp16(a + soff(i), A.hx + (gx[i] + static_cast<u32>(k * 32)));
+        };
+        auto stage_w = [&](int k) {      // the warp's own tiles: slot k % WS_NW was last read by this warp at step k - WS_NW
+            if (lane < TB / 4) pf::cp16(sW + (k % WS_NW) * WM_SW + warp * 4 * TB + lane * 16, mw + (static_cast<size_t>(k) * 16 + warp * 4) * TB + lane * 16);
+        };
+        Tr3Lane<BITS> ld;
+        ld.init(lane);
+        #pragma unroll
+        for (int k = 0; k < WS_LA; ++k)
+        {
+            stage_a(k);
+            if (k == 0)
+            {
+                #pragma unroll
+                for (int i = 0; i < WS_LW; ++i) stage_w(i);
+            }
+            pf::cp_commit();
+        }
+        for (int j = 0; j < NK; ++j)
+        {
+            // consumers done with step j - WS_NB: B stage j % WS_NB and A stage (j + WS_LA) % WS_NA are free
+            if (j >= WS_NB) nb_sync(1 + WS_NB + j % WS_NB, NT);
+            if (j + WS_LA < NK) stage_a(j + WS_LA);
+            if (j + WS_LW < NK) stage_w(j + WS_LW);
+            pf::cp_commit();
+            pf::cp_wait<WS_LA>();
+            const __half2 c = __half2half2(v1b[j >> 2]);
+            unsigned char* a = sA + (j % WS_NA) * WM_SA;
+            if (!PF_WS_NODEC) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+            {
+                if (gx[i] == 0xffffffffu) continue;
+                uint4* q = reinterpret_cast<uint4*>(a + soff(i));
+                uint4 o = *q;
+                o.x = as_u32(__hmul2(as_h2(o.x), c)); o.y = as_u32(__hmul2(as_h2(o.y), c));
+                o.z = as_u32(__hmul2(as_h2(o.z), c)); o.w = as_u32(__hmul2(as_h2(o.w), c));
+                *q = o;
+            }
+            __syncwarp();      // the warp's raw tile bytes (cp_wait of lanes 0 .. TB / 4 - 1) -> every lane
+            #pragma unroll
+            for (int jj = 0; jj < 4; ++jj)
+            {
+                const u32* w = reinterpret_cast<const u32*>(sW + (j % WS_NW) * WM_SW + (warp * 4 + jj) * TB);
+                u32 f0[2], f1[2];
+                ld.decode(w[ld.i0], w[ld.i1], f0, f1);
+                if (A.e4) { f0[0] = pf_e4r(f0[0]); f0[1] = pf_e4r(f0[1]); f1[0] = pf_e4r(f1[0]); f1[1] = pf_e4r(f1[1]); }
+                *reinterpret_cast<uint4*>(sB + (j % WS_NB) * WM_SB + (warp * 4 + jj) * 512 + lane * 16) = make_uint4(f0[0], f0[1], f1[0], f1[1]);
+            }
+            }
+            nb_arrive(1 + j % WS_NB, NT);
+        }
+        return;
+    }
+    const int cw = warp - 4, wr = cw >> 2, wc = cw & 3;
+    const int nmw = min(8, max(0, (rows - wr * 128 + 15) / 16));       // the warp's row blocks with rows (warp-uniform)
+    float acc[8][4][4];
+    #pragma unroll
+    for (int mb = 0; mb < 8; ++mb)
+        #pragma unroll
+        for (int n = 0; n < 4; ++n)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][n][i] = 0.f;
+    // the k loop is instantiated per row-block count: no per-row-block branch between the mma (each mma costs the warp
+    // a fixed 16-cycle issue stall, the branches added ~30 dead cycles per 4 mma)
+    switch (nmw)
+    {
+        case 8: fc1ws_cons<8>(acc, sA, sB, wr, wc, lane); break;
+        case 7: fc1ws_cons<7>(acc, sA, sB, wr, wc, lane); break;
+        case 6: fc1ws_cons<6>(acc, sA, sB, wr, wc, lane); break;
+        case 5: fc1ws_cons<5>(acc, sA, sB, wr, wc, lane); break;
+        case 4: fc1ws_cons<4>(acc, sA, sB, wr, wc, lane); break;
+        case 3: fc1ws_cons<3>(acc, sA, sB, wr, wc, lane); break;
+        case 2: fc1ws_cons<2>(acc, sA, sB, wr, wc, lane); break;
+        case 1: fc1ws_cons<1>(acc, sA, sB, wr, wc, lane); break;
+        default: fc1ws_cons<0>(acc, sA, sB, wr, wc, lane); break;
+    }
+    const int c = lane & 3, r = lane >> 2;
+    #pragma unroll
+    for (int mb = 0; mb < 8; ++mb)
+        #pragma unroll
+        for (int n = 0; n < 4; ++n)
+        {
+            if (mb >= nmw) continue;
+            const int col = (wc * 2 + (n >> 1)) * 16 + (n & 1) * 8 + 2 * c, row = wr * 128 + mb * 16 + r;
+            __half* z = A.z1 + (static_cast<size_t>(r0 + row) * (2 * EB) + b * 2 + mat) * 128 + col;
+            if (row < rows) *reinterpret_cast<u32*>(z) = pack_h2(acc[mb][n][0], acc[mb][n][1]);
+            if (row + 8 < rows) *reinterpret_cast<u32*>(z + 8 * (2 * EB) * 128) = pack_h2(acc[mb][n][2], acc[mb][n][3]);
+        }
+}
+// grid (2 EB, max_wtiles), block 384, WS_SMEM dynamic smem
+template <int EB>
+__global__ void __launch_bounds__(384, 1) k_pf_fc1ws(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char wm_sm[];
+    if (static_cast<int>(blockIdx.y) >= *A.n_wt) return;
+    const int* w = A.wt + static_cast<size_t>(blockIdx.y) * 3;
+    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
+    const int mat = blockIdx.x / EB, b = blockIdx.x - mat * EB;
+    if (b >= static_cast<int>(tr[3])) return;
+    const int r0 = w[1], rows = w[2];
+    int* sRow = reinterpret_cast<int*>(wm_sm + WS_NA * WM_SA + WS_NW * WM_SW + WS_NB * WM_SB);
+    if (threadIdx.x < WM_R) sRow[threadIdx.x] = threadIdx.x < rows ? A.rr_row[r0 + threadIdx.x] : 0;
+    __syncthreads();
+    size_t off;
+    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
+    if (k == 4) fc1ws_body<4, EB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+    else if (k == 3) fc1ws_body<3, EB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+    else fc1ws_body<2, EB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+}
+template <int EB = g6nr::EB> inline void launch_fc1w(const Expert& A, cudaStream_t st)
+{
+    static bool attr = false;
+#if PF_WM_WS
+    if (!attr) { cudaFuncSetAttribute(k_pf_fc1ws<EB>, cudaFuncAttributeMaxDynamicSharedMemorySize, WS_SMEM); attr = true; }
+    k_pf_fc1ws<EB><<<dim3(2 * EB, pass_wtiles(A)), 384, WS_SMEM, st>>>(A);
+#else
+    if (!attr) { cudaFuncSetAttribute(k_pf_fc1w<EB>, cudaFuncAttributeMaxDynamicSharedMemorySize, WM_SMEM); attr = true; }
+    k_pf_fc1w<EB><<<dim3(2 * EB, pass_wtiles(A)), 512, WM_SMEM, st>>>(A);
+#endif
+}
+#endif
+
 // mid: warp = (route, block): g, u from z1 -> act -> rotated, quantized fc2 input record.
 // grid ceil(8M * EB / 8), block 256
-template <int EB = g6nr::EB>
+template <int EB = g6nr::EB PF_H16P>
 __global__ void __launch_bounds__(256) k_pf_mid(Expert A)
 {
     const int lane = threadIdx.x & 31;
@@ -2841,12 +3815,23 @@ __global__ void __launch_bounds__(256) k_pf_mid(Expert A)
     for (int e = 0; e < 4; ++e)
     {
         const float gg = rnd_h(__fmul_rn(gv[e], svg[e])), uu = rnd_h(__fmul_rn(uv[e], svu[e]));
-        v[e] = __fmul_rn(rnd_h(silu_f(gg) * uu), sud[e]);
+        v[e] = __fmul_rn(rnd_h(swiglu_f(gg, uu)), sud[e]);
     }
     had128(v, lane);
     #pragma unroll
     for (int e = 0; e < 4; ++e) v[e] = rnd_h(v[e]);
     const int sp = A.rr_sp[route], p = sp % RS;
+#if G6_MODEL_FLASH
+    if constexpr (H16)        // the lane's 4 k (lane * 4 ..) of row p & 15 -> two u32 of the fc2 A fragments of k16 step lane / 4
+    {
+        const int rr = p & 15, kk = (lane * 4) & 15;
+        u32* fr = reinterpret_cast<u32*>(A.x2) + (((static_cast<size_t>(sp / RS) * MB + (p >> 4)) * EB + b) * 8 + (lane >> 2)) * 128;
+        const int fl = (rr & 7) * 4 + ((kk & 7) >> 1), reg = ((kk >> 3) << 1) | (rr >> 3);
+        fr[fl * 4 + reg] = pack_h2(v[0], v[1]);
+        fr[(fl + 1) * 4 + reg] = pack_h2(v[2], v[3]);
+        return;
+    }
+#endif
     uint8_t* rec = A.x2 + ((static_cast<size_t>(sp / RS) * MB + (p >> 4)) * EB + b) * 4 * REC;
     store_mx8_tr3(v, lane, p & 15, [&](int s) { return rec + s * REC; });
 }
@@ -3047,8 +4032,8 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2(Expert A)
 // cold first loads happen once per CTA instead of once per group. Per group the arithmetic and its order are those
 // of fc2_body (byte-equal yw). Measurement build; the default build does not compile this.
 constexpr int FC2GL = PF_FC2GL;
-static_assert(HID / 128 % FC2GL == 0, "PF_FC2GL must divide 48");
-template <int BITS, int EB, bool BS = false>
+static_assert(HID / 128 % FC2GL == 0, "PF_FC2GL must divide HID / 128 (48; Flash 32)");
+template <int BITS, int EB, bool BS = false, bool ONE = false PF_H16P>
 __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr, int seg, int r0, int rows, unsigned char* sA, __half* sZ,
                                             unsigned char* sV)
 {
@@ -3068,11 +4053,21 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
     for (int p = 0; p < 2; ++p)
         #pragma unroll
         for (int j = 0; j < 16; ++j) ys[p][j] = 0.f;
+    float tot[ONE ? MB : 1][2][4];        // ONE: sum over the blocks of the group of v3b scale x block output, fp32
+    #pragma unroll
+    for (int mb = 0; mb < (ONE ? MB : 1); ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) tot[mb][h][i] = 0.f;
     auto wptr = [&](int G, int b) {
         return A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
     };
     // X2 records of block b and the svh slice of (block b, group G) -> stage it & 1
     auto stage = [&](int it, int G, int b) {
+#if G6_MODEL_FLASH
+        if (!H16)             // fp16: the mma reads the A fragments from global
+#endif
         for (int ch = t; ch < MB * 4 * 33; ch += 256)
         {
             const int mb = ch / (4 * 33), rem = ch % (4 * 33);
@@ -3119,6 +4114,37 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
         #pragma unroll
         for (int s = 0; s < 4; ++s)
         {
+#if G6_MODEL_FLASH
+            if constexpr (H16)
+            {
+                u32 p0[2], p1[2], q0[2], q1[2];
+                if (wide)
+                {
+                    const u32 c0 = trw_chunk<BITS>(cw, 2 * s), c1 = trw_chunk<BITS>(cw, 2 * s + 1);
+                    const u32 b0 = __shfl_sync(0xffffffffu, c0, (lane + 31) & 31), b1 = __shfl_sync(0xffffffffu, c1, (lane + 31) & 31);
+                    Tr3Lane<BITS>::decode_m((static_cast<u64>(b0) << (8 * BITS)) | c0, 7 * BITS, p0, p1);
+                    Tr3Lane<BITS>::decode_m((static_cast<u64>(b1) << (8 * BITS)) | c1, 7 * BITS, q0, q1);
+                }
+                else
+                {
+                    ld.decode(cv[2 * s][0], cv[2 * s][1], p0, p1);
+                    ld.decode(cv[2 * s + 1][0], cv[2 * s + 1][1], q0, q1);
+                }
+                pf_e4r4(A.e4, p0, p1, q0, q1);
+                #pragma unroll
+                for (int mb = 0; mb < MB; ++mb)
+                {
+                    if (mb >= nmb) continue;
+                    const uint4* xa = reinterpret_cast<const uint4*>(A.x2) + (((static_cast<size_t>(seg) * MB + mb) * EB + b) * 8 + 2 * s) * 32 + lane;
+                    const uint4 a0 = __ldg(xa), a1 = __ldg(xa + 32);
+                    mma16816(acc[mb][0], a0.x, a0.y, a0.z, a0.w, p0[0], p0[1]);
+                    mma16816(acc[mb][1], a0.x, a0.y, a0.z, a0.w, p1[0], p1[1]);
+                    mma16816(acc[mb][0], a1.x, a1.y, a1.z, a1.w, q0[0], q0[1]);
+                    mma16816(acc[mb][1], a1.x, a1.y, a1.z, a1.w, q1[0], q1[1]);
+                }
+                continue;
+            }
+#endif
             u32 bf[4];
             if (wide)
             {
@@ -3141,6 +4167,90 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
                 mma_mx8(acc[mb][1], fa, bf[2], bf[3], sa, 127u);
             }
         }
+#if G6_MODEL_FLASH
+        if constexpr (ONE)        // H16 + BS: H(sum_b scl_b z_b) * sign = sum_b H(z_b) * sign * scl_b, one Hadamard per group
+        {
+            const float scl = __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]);
+            #pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h)
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) tot[mb][h][i] = fmaf(scl, acc[mb][h][i], tot[mb][h][i]);
+            if (b + 1 == nb)
+            {
+                #pragma unroll
+                for (int mb = 0; mb < MB; ++mb)
+                    #pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                    {
+                        if (mb < nmb)
+                        {
+                            const int row = mb * 16 + r, ch = warp * 2 + h;
+                            *reinterpret_cast<u32*>(sZb + row * 256 + swz16(ch, row) * 16 + 4 * c) = pack_h2(tot[mb][h][0], tot[mb][h][1]);
+                            *reinterpret_cast<u32*>(sZb + (row + 8) * 256 + swz16(ch, row + 8) * 16 + 4 * c) = pack_h2(tot[mb][h][2], tot[mb][h][3]);
+                        }
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) tot[mb][h][i] = 0.f;
+                    }
+                __syncthreads();
+                const __half* svp = reinterpret_cast<const __half*>(sV + (it & 1) * 256) + q * 16;
+                float sv[16];
+                #pragma unroll
+                for (int j = 0; j < 2; ++j)
+                {
+                    const uint4 sr = *reinterpret_cast<const uint4*>(svp + j * 8);
+                    const u32 sw[4] = {sr.x, sr.y, sr.z, sr.w};
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        const float2 s2 = __half22float2(as_h2(sw[e]));
+                        sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y;
+                    }
+                }
+                #pragma unroll
+                for (int p = 0; p < 2; ++p)
+                {
+                    if (p >= np || warp * 4 + p * 32 >= rows) continue;      // warp-uniform
+                    const int rp = pr + p * 32;
+                    const bool act = rp < rows;
+                    float v[16];
+                    #pragma unroll
+                    for (int j = 0; j < 2; ++j)
+                    {
+                        const uint4 zr = act ? *reinterpret_cast<const uint4*>(sZb + rp * 256 + swz16(q * 2 + j, rp) * 16) : make_uint4(0u, 0u, 0u, 0u);
+                        const u32 zw[4] = {zr.x, zr.y, zr.z, zr.w};
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                        {
+                            const float2 z2 = __half22float2(as_h2(zw[e]));
+                            v[j * 8 + e * 2] = z2.x; v[j * 8 + e * 2 + 1] = z2.y;
+                        }
+                    }
+                    had128_l16(v, lane);
+                    if (act)
+                    {
+                        const float w = A.rr_w[r0 + rp];
+                        __half* yp = A.yw + static_cast<size_t>(r0 + rp) * HID + G * 128 + q * 16;
+                        #pragma unroll
+                        for (int j = 0; j < 2; ++j)
+                        {
+                            uint4 o;
+                            o.x = pack_h2(w * (v[j * 8] * sv[j * 8]), w * (v[j * 8 + 1] * sv[j * 8 + 1]));
+                            o.y = pack_h2(w * (v[j * 8 + 2] * sv[j * 8 + 2]), w * (v[j * 8 + 3] * sv[j * 8 + 3]));
+                            o.z = pack_h2(w * (v[j * 8 + 4] * sv[j * 8 + 4]), w * (v[j * 8 + 5] * sv[j * 8 + 5]));
+                            o.w = pack_h2(w * (v[j * 8 + 6] * sv[j * 8 + 6]), w * (v[j * 8 + 7] * sv[j * 8 + 7]));
+                            *reinterpret_cast<uint4*>(yp + j * 8) = o;
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (int n = 0; n < 3; ++n) cw[n] = nw[n];
+            G = Gn; b = bn;
+            continue;
+        }
+#endif
         #pragma unroll
         for (int mb = 0; mb < MB; ++mb)
             #pragma unroll
@@ -3223,7 +4333,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
 }
 
 // grid (48 / GL, maxseg), block 256
-template <int EB = g6nr::EB, bool K2 = false, bool BS = false>
+template <int EB = g6nr::EB, bool K2 = false, bool BS = false, bool ONE = false PF_H16P>
 __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[2 * MB * 4 * REC];
@@ -3233,14 +4343,528 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
     if (seg >= *A.n_seg) return;
     const int* sg = A.segs + static_cast<size_t>(seg) * 3;
     const long long* tr = A.t_tab + static_cast<size_t>(sg[0]) * 6;
-    if (tr[4] == 3) fc2_body_gl<3, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
-    else if (!K2 || tr[4] == 4) fc2_body_gl<4, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
-    else fc2_body_gl<K2 ? 2 : 4, EB, BS>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    if (tr[4] == 3) fc2_body_gl<3, EB, BS, ONE PF_H16X>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    else if (!K2 || tr[4] == 4) fc2_body_gl<4, EB, BS, ONE PF_H16X>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+    else fc2_body_gl<K2 ? 2 : 4, EB, BS, ONE PF_H16X>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
 }
+#if G6_MODEL_FLASH
+// fc2 v2 (h16 + bs + one, the Flash default; G6_PF_FC2V2=0 = k_pf_fc2g). Per iteration (group G, block b) the CTA
+// copies the fp16 A fragments of its row blocks (x2, 4 KB per 16-row block) and the weight words of the 8 warps
+// (64 TB bytes) to shared memory by cp.async, one iteration ahead (k_pf_fc2g reads A by __ldg at the mma and the K4
+// words at the top of the same iteration). NM = 16-row blocks of the segment is a template parameter, so no HMMA is
+// issued for empty row blocks (k_pf_fc2g predicates all MB of them). The group-end sZ tile aliases the A stage of
+// the iteration. Arithmetic and its order = fc2_body_gl ONE: yw is byte-equal.
+constexpr int F2V_SA = MB * 4096;              // A stage: MB x (16 rows x 128 k) fp16 fragments
+constexpr int F2V_SW = 64 * 128;               // weight stage: 8 warps x 8 tiles x TB, TB <= 128
+constexpr int F2V_SMEM = 2 * F2V_SA + 2 * F2V_SW + 2 * 256;
+static_assert(RS * 128 * 2 <= F2V_SA, "sZ must fit in one A stage");
+// NMX = row blocks of an A stage: MB (k_pf_fc2v, one segment) or 2 MB (k_pf_fc2w, two consecutive segments of one expert:
+// their x2 fragments are contiguous, so row block mb of the pair is at (mb * EB + b) * 4096 from the first segment).
+template <int BITS, int EB, int NM, int NMX = MB>
+__device__ __forceinline__ void fc2_body_v2(const Expert& A, const long long* tr, int seg, int r0, int rows, unsigned char* sm)
+{
+    constexpr int TB = 32 * BITS;
+    constexpr int F2V_SA = NMX * 4096;
+    static_assert(NM <= NMX && NMX * 16 * 128 * 2 <= F2V_SA, "fc2 v2 stages");
+    unsigned char* sA = sm;
+    unsigned char* sW = sm + 2 * F2V_SA;
+    unsigned char* sV = sW + 2 * F2V_SW;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int G0 = blockIdx.x * FC2GL, nb = static_cast<int>(tr[3]), nit = FC2GL * nb;
+    const int c = lane & 3, r = lane >> 2;
+    Tr3Lane<BITS> ld;
+    ld.init(lane);
+    const bool wide = trw_ok<BITS>() && A.t_wide2;
+    const int pr = warp * 4 + (lane >> 3), q = lane & 7;
+    const int np = (rows + 31) / 32;
+    float tot[NM][2][4];
+    #pragma unroll
+    for (int mb = 0; mb < NM; ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) tot[mb][h][i] = 0.f;
+    const unsigned char* xb = A.x2 + static_cast<size_t>(seg) * MB * EB * 4096;
+    auto stage = [&](int it, int G, int b) {
+        #pragma unroll
+        for (int mb = 0; mb < NM; ++mb) pf::cp16(sA + (it & 1) * F2V_SA + mb * 4096 + t * 16, xb + (static_cast<size_t>(mb) * EB + b) * 4096 + t * 16);
+        const uint8_t* ws = A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8) * 8 * TB;
+        #pragma unroll
+        for (int ch = t; ch < 4 * TB; ch += 256) pf::cp16(sW + (it & 1) * F2V_SW + ch * 16, ws + ch * 16);
+        if (t < 16) pf::cp16(sV + (it & 1) * 256 + t * 16, A.t_sg + HID + G * 128 + t * 8);
+        pf::cp_commit();
+    };
+    stage(0, G0, 0);
+    int G = G0, b = 0;
+    for (int it = 0; it < nit; ++it)
+    {
+        const int Gn = b + 1 < nb ? G : G + 1, bn = b + 1 < nb ? b + 1 : 0;
+        pf::cp_wait<0>();
+        __syncthreads();
+        if (it + 1 < nit) stage(it + 1, Gn, bn);
+        unsigned char* sAb = sA + (it & 1) * F2V_SA;
+        const unsigned char* sWb = sW + (it & 1) * F2V_SW + warp * 8 * TB;
+        u64 cw[3] = {0, 0, 0};
+        if (wide)
+        {
+            #pragma unroll
+            for (int n = 0; n < trw_nw<BITS>(); ++n) cw[n] = *reinterpret_cast<const u64*>(sWb + n * 256 + lane * 8);
+        }
+        float acc[NM][2][4];
+        #pragma unroll
+        for (int mb = 0; mb < NM; ++mb)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
+        #pragma unroll
+        for (int s = 0; s < 4; ++s)
+        {
+            u32 p0[2], p1[2], q0[2], q1[2];
+            if (wide)
+            {
+                const u32 c0 = trw_chunk<BITS>(cw, 2 * s), c1 = trw_chunk<BITS>(cw, 2 * s + 1);
+                const u32 b0 = __shfl_sync(0xffffffffu, c0, (lane + 31) & 31), b1 = __shfl_sync(0xffffffffu, c1, (lane + 31) & 31);
+                Tr3Lane<BITS>::decode_m((static_cast<u64>(b0) << (8 * BITS)) | c0, 7 * BITS, p0, p1);
+                Tr3Lane<BITS>::decode_m((static_cast<u64>(b1) << (8 * BITS)) | c1, 7 * BITS, q0, q1);
+            }
+            else
+            {
+                const u32* w0 = reinterpret_cast<const u32*>(sWb + 2 * s * TB);
+                const u32* w1 = reinterpret_cast<const u32*>(sWb + (2 * s + 1) * TB);
+                ld.decode(w0[ld.i0], w0[ld.i1], p0, p1);
+                ld.decode(w1[ld.i0], w1[ld.i1], q0, q1);
+            }
+            pf_e4r4(A.e4, p0, p1, q0, q1);
+            #pragma unroll
+            for (int mb = 0; mb < NM; ++mb)
+            {
+                const uint4* xa = reinterpret_cast<const uint4*>(sAb + mb * 4096) + 2 * s * 32 + lane;
+                const uint4 a0 = xa[0], a1 = xa[32];
+                mma16816(acc[mb][0], a0.x, a0.y, a0.z, a0.w, p0[0], p0[1]);
+                mma16816(acc[mb][1], a0.x, a0.y, a0.z, a0.w, p1[0], p1[1]);
+                mma16816(acc[mb][0], a1.x, a1.y, a1.z, a1.w, q0[0], q0[1]);
+                mma16816(acc[mb][1], a1.x, a1.y, a1.z, a1.w, q1[0], q1[1]);
+            }
+        }
+        const float scl = __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]);
+        #pragma unroll
+        for (int mb = 0; mb < NM; ++mb)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) tot[mb][h][i] = fmaf(scl, acc[mb][h][i], tot[mb][h][i]);
+        if (b + 1 == nb)
+        {
+            unsigned char* sZb = sAb;           // every warp is past its mma reads of sAb after this barrier
+            __syncthreads();
+            #pragma unroll
+            for (int mb = 0; mb < NM; ++mb)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h)
+                {
+                    const int row = mb * 16 + r, ch = warp * 2 + h;
+                    *reinterpret_cast<u32*>(sZb + row * 256 + swz16(ch, row) * 16 + 4 * c) = pack_h2(tot[mb][h][0], tot[mb][h][1]);
+                    *reinterpret_cast<u32*>(sZb + (row + 8) * 256 + swz16(ch, row + 8) * 16 + 4 * c) = pack_h2(tot[mb][h][2], tot[mb][h][3]);
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) tot[mb][h][i] = 0.f;
+                }
+            __syncthreads();
+            const __half* svp = reinterpret_cast<const __half*>(sV + (it & 1) * 256) + q * 16;
+            float sv[16];
+            #pragma unroll
+            for (int j = 0; j < 2; ++j)
+            {
+                const uint4 sr = *reinterpret_cast<const uint4*>(svp + j * 8);
+                const u32 sw[4] = {sr.x, sr.y, sr.z, sr.w};
+                #pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    const float2 s2 = __half22float2(as_h2(sw[e]));
+                    sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y;
+                }
+            }
+            #pragma unroll
+            for (int p = 0; p < (NM + 1) / 2; ++p)
+            {
+                if (p >= np || warp * 4 + p * 32 >= rows) continue;      // warp-uniform
+                const int rp = pr + p * 32;
+                const bool act = rp < rows;
+                float v[16];
+                #pragma unroll
+                for (int j = 0; j < 2; ++j)
+                {
+                    const uint4 zr = act ? *reinterpret_cast<const uint4*>(sZb + rp * 256 + swz16(q * 2 + j, rp) * 16) : make_uint4(0u, 0u, 0u, 0u);
+                    const u32 zw[4] = {zr.x, zr.y, zr.z, zr.w};
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        const float2 z2 = __half22float2(as_h2(zw[e]));
+                        v[j * 8 + e * 2] = z2.x; v[j * 8 + e * 2 + 1] = z2.y;
+                    }
+                }
+                had128_l16(v, lane);
+                if (act)
+                {
+                    const float w = A.rr_w[r0 + rp];
+                    __half* yp = A.yw + static_cast<size_t>(r0 + rp) * HID + G * 128 + q * 16;
+                    #pragma unroll
+                    for (int j = 0; j < 2; ++j)
+                    {
+                        uint4 o;
+                        o.x = pack_h2(w * (v[j * 8] * sv[j * 8]), w * (v[j * 8 + 1] * sv[j * 8 + 1]));
+                        o.y = pack_h2(w * (v[j * 8 + 2] * sv[j * 8 + 2]), w * (v[j * 8 + 3] * sv[j * 8 + 3]));
+                        o.z = pack_h2(w * (v[j * 8 + 4] * sv[j * 8 + 4]), w * (v[j * 8 + 5] * sv[j * 8 + 5]));
+                        o.w = pack_h2(w * (v[j * 8 + 6] * sv[j * 8 + 6]), w * (v[j * 8 + 7] * sv[j * 8 + 7]));
+                        *reinterpret_cast<uint4*>(yp + j * 8) = o;
+                    }
+                }
+            }
+        }
+        G = Gn; b = bn;
+    }
+}
+template <int BITS, int EB>
+__device__ __forceinline__ void fc2_v2_nm(const Expert& A, const long long* tr, int seg, int r0, int rows, unsigned char* sm)
+{
+    const int nmb = (rows + 15) / 16;     // CTA-uniform
+    if (nmb == 4) fc2_body_v2<BITS, EB, 4>(A, tr, seg, r0, rows, sm);
+    else if (nmb == 3) fc2_body_v2<BITS, EB, 3>(A, tr, seg, r0, rows, sm);
+    else if (nmb == 2) fc2_body_v2<BITS, EB, 2>(A, tr, seg, r0, rows, sm);
+    else if (nmb == 1) fc2_body_v2<BITS, EB, 1>(A, tr, seg, r0, rows, sm);
+}
+// grid (48 / GL, maxseg), block 256, dynamic smem F2V_SMEM
+template <int EB = g6nr::EB, bool K2 = false>
+__global__ void __launch_bounds__(256, 2) k_pf_fc2v(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char smv[];
+    const int seg = blockIdx.y;
+    if (seg >= *A.n_seg) return;
+    const int* sg = A.segs + static_cast<size_t>(seg) * 3;
+    const long long* tr = A.t_tab + static_cast<size_t>(sg[0]) * 6;
+    if (tr[4] == 3) fc2_v2_nm<3, EB>(A, tr, seg, sg[1], sg[2], smv);
+    else if (!K2 || tr[4] == 4) fc2_v2_nm<4, EB>(A, tr, seg, sg[1], sg[2], smv);
+    else fc2_v2_nm<K2 ? 2 : 4, EB>(A, tr, seg, sg[1], sg[2], smv);
+}
+template <int EB, bool K2> inline void launch_fc2v(const Expert& A, dim3 g, cudaStream_t st)
+{
+    static bool attr = false;
+    if (!attr)
+    {
+        cudaFuncSetAttribute(k_pf_fc2v<EB, K2>, cudaFuncAttributeMaxDynamicSharedMemorySize, F2V_SMEM);
+        cudaFuncSetAttribute(k_pf_fc2v<EB, K2>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        attr = true;
+    }
+    k_pf_fc2v<EB, K2><<<g, 256, F2V_SMEM, st>>>(A);
+}
+// Weight-major fc2 (Expert::wm): CTA = (GL groups, half of a wtile = up to 128 rows = two consecutive segments of one
+// expert), fc2_body_v2 with NMX = 2 MB: each decoded weight tile serves up to 128 rows instead of 64. yw bytes = k_pf_fc2v.
+constexpr int F2W_SMEM = 2 * (2 * MB * 4096) + 2 * F2V_SW + 2 * 256;
+template <int BITS, int EB>
+__device__ __forceinline__ void fc2_w_nm(const Expert& A, const long long* tr, int seg, int r0, int rows, unsigned char* sm)
+{
+    switch ((rows + 15) / 16)         // CTA-uniform
+    {
+    case 8: fc2_body_v2<BITS, EB, 8, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    case 7: fc2_body_v2<BITS, EB, 7, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    case 6: fc2_body_v2<BITS, EB, 6, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    case 5: fc2_body_v2<BITS, EB, 5, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    case 4: fc2_body_v2<BITS, EB, 4, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    case 3: fc2_body_v2<BITS, EB, 3, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    case 2: fc2_body_v2<BITS, EB, 2, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    case 1: fc2_body_v2<BITS, EB, 1, 2 * MB>(A, tr, seg, r0, rows, sm); break;
+    default: break;
+    }
+}
+// grid (48 / GL, 2 max_wtiles), block 256, dynamic smem F2W_SMEM
+template <int EB = g6nr::EB, bool K2 = false>
+__global__ void __launch_bounds__(256, 1) k_pf_fc2w(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char smv[];
+    const int y = blockIdx.y >> 1, h = blockIdx.y & 1;
+    if (y >= *A.n_wt) return;
+    const int* w = A.wt + static_cast<size_t>(y) * 3;
+    const int rows = min(2 * RS, w[2] - h * 2 * RS), r0 = w[1] + h * 2 * RS;
+    if (rows <= 0) return;
+    const int seg = A.rr_sp[r0] / RS;
+    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
+    if (tr[4] == 3) fc2_w_nm<3, EB>(A, tr, seg, r0, rows, smv);
+    else if (!K2 || tr[4] == 4) fc2_w_nm<4, EB>(A, tr, seg, r0, rows, smv);
+    else fc2_w_nm<K2 ? 2 : 4, EB>(A, tr, seg, r0, rows, smv);
+}
+// Warp-specialized weight-major fc2 (Expert::wm2, PF_F2WS=1): CTA = (GL groups, half wtile = up to 128 rows = two
+// consecutive segments of one expert), 12 warps. Warps 0-3 (producers) run k32 steps j = it * 4 + s over the flattened
+// (group, block) loop of fc2_body_v2: cp.async of the step's A slices (row block mb: bytes s * 1 KB .. + 1 KB of its
+// 4 KB fragment block) and of the warp's raw weight tiles (col blocks 2 pw, 2 pw + 1 x k16 chunks 2 s, 2 s + 1), then
+// decode (+ E4) into the decoded B stage, FULL / EMPTY named barriers as k_pf_fc1ws. Warps 4-11 (consumers, wr = cw / 4,
+// wc = cw % 4) own rows wr * 64 .. + 63 and cols wc * 32 .. + 31: acc[4][4][4] per block, tot += scl * acc after each
+// block, group end: sZ + Hadamard + yw exactly as fc2_body_v2. Per accumulator the k16 order is that of fc2_body_v2:
+// yw is byte-equal to k_pf_fc2v. Non-wide weight order only (wm2 requires !fc2_wide or a K4-only layer).
+#ifndef PF_F2WS
+#define PF_F2WS 0           // parked: byte-equal but slower than k_pf_fc2v (9.19 vs 7.99 ms, M 8192); 1 = launch_fc2w runs it
+#endif
+#ifndef PF_F2S_GL
+#define PF_F2S_GL FC2GL
+#endif
+#ifndef PF_F2S_NA
+#define PF_F2S_NA 4
+#endif
+#ifndef PF_F2S_NB
+#define PF_F2S_NB 2
+#endif
+#ifndef PF_F2S_PROBE
+#define PF_F2S_PROBE 0      // timing probes only (yw wrong): 1 no mma, 2 no decode, 4 no group-end readout, 8 no A copy
+#endif
+constexpr int F2S_GL = PF_F2S_GL;                      // 128-col groups per CTA
+static_assert(HID / 128 % F2S_GL == 0, "PF_F2S_GL must divide HID / 128");
+constexpr int F2S_NA = PF_F2S_NA, F2S_NB = PF_F2S_NB, F2S_NW = 8;     // A / decoded B / raw weight stages (k32 steps)
+constexpr int F2S_LA = F2S_NA - F2S_NB, F2S_LW = F2S_NW - 2;
+constexpr int F2S_SA = 2 * MB * 1024;                  // A stage: 8 row blocks x (16 rows x 32 k) fp16 fragments
+constexpr int F2S_SW = 16 * 128;                       // raw weights: 16 tiles, TB <= 128
+constexpr int F2S_SB = 16 * 512;                       // decoded B: 16 tiles x 32 lanes x 16 B
+constexpr int F2S_SZ = 2 * RS * 256;                   // group-end tile: 128 rows x 128 cols fp16
+constexpr int F2S_SMEM = F2S_NA * F2S_SA + F2S_NW * F2S_SW + F2S_NB * F2S_SB + F2S_SZ;
+static_assert(F2S_LA >= 1 && F2S_LW >= F2S_LA && 2 * F2S_NB + 1 <= 15, "fc2ws rings");
+template <int NMW, int EB>
+__device__ __forceinline__ void fc2ws_cons(const Expert& A, const long long* tr, int r0, int rows, const unsigned char* sA,
+                                           const unsigned char* sB, unsigned char* sZ, int cw, int lane)
+{
+    constexpr int NT = 384;
+    const int wr = cw >> 2, wc = cw & 3, c = lane & 3, r = lane >> 2;
+    const int G0 = blockIdx.x * F2S_GL, nb = static_cast<int>(tr[3]), ns = 4 * F2S_GL * nb;
+    const int pr = cw * 4 + (lane >> 3), q = lane & 7, np = (rows + 31) / 32;
+    float acc[4][4][4], tot[4][4][4];
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int n = 0; n < 4; ++n)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) { acc[mb][n][i] = 0.f; tot[mb][n][i] = 0.f; }
+    // group-end readout pass p of group Gp from sZ: Hadamard, scales, yw rows pr + 32 p. (Deferring the passes into the
+    // next group's blocks, staggered by warp half, was slower: 9.67 vs 9.19 ms at M 8192; the per-step FULL barrier
+    // couples all consumer warps, so one warp's pass stalls them all.)
+    auto pass = [&](int p, int Gp) {
+        if (PF_F2S_PROBE & 4) return;
+        const __half* svp = A.t_sg + HID + Gp * 128 + q * 16;
+        float sv[16];
+        #pragma unroll
+        for (int jj = 0; jj < 2; ++jj)
+        {
+            const uint4 sr = __ldg(reinterpret_cast<const uint4*>(svp + jj * 8));
+            const u32 sw[4] = {sr.x, sr.y, sr.z, sr.w};
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const float2 s2 = __half22float2(as_h2(sw[e]));
+                sv[jj * 8 + e * 2] = s2.x; sv[jj * 8 + e * 2 + 1] = s2.y;
+            }
+        }
+            if (p >= np || cw * 4 + p * 32 >= rows) return;       // warp-uniform
+            const int rp = pr + p * 32;
+            const bool act = rp < rows;
+            float v[16];
+            #pragma unroll
+            for (int jj = 0; jj < 2; ++jj)
+            {
+                const uint4 zr = act ? *reinterpret_cast<const uint4*>(sZ + rp * 256 + swz16(q * 2 + jj, rp) * 16) : make_uint4(0u, 0u, 0u, 0u);
+                const u32 zw[4] = {zr.x, zr.y, zr.z, zr.w};
+                #pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    const float2 z2 = __half22float2(as_h2(zw[e]));
+                    v[jj * 8 + e * 2] = z2.x; v[jj * 8 + e * 2 + 1] = z2.y;
+                }
+            }
+            had128_l16(v, lane);
+            if (act)
+            {
+                const float w = A.rr_w[r0 + rp];
+                __half* yp = A.yw + static_cast<size_t>(r0 + rp) * HID + Gp * 128 + q * 16;
+                #pragma unroll
+                for (int jj = 0; jj < 2; ++jj)
+                {
+                    uint4 o;
+                    o.x = pack_h2(w * (v[jj * 8] * sv[jj * 8]), w * (v[jj * 8 + 1] * sv[jj * 8 + 1]));
+                    o.y = pack_h2(w * (v[jj * 8 + 2] * sv[jj * 8 + 2]), w * (v[jj * 8 + 3] * sv[jj * 8 + 3]));
+                    o.z = pack_h2(w * (v[jj * 8 + 4] * sv[jj * 8 + 4]), w * (v[jj * 8 + 5] * sv[jj * 8 + 5]));
+                    o.w = pack_h2(w * (v[jj * 8 + 6] * sv[jj * 8 + 6]), w * (v[jj * 8 + 7] * sv[jj * 8 + 7]));
+                    *reinterpret_cast<uint4*>(yp + jj * 8) = o;
+                }
+            }
+    };
+    int G = G0, b = 0;
+    for (int j = 0; j < ns; ++j)
+    {
+        nb_sync(1 + j % F2S_NB, NT);
+        const unsigned char* a = sA + (j % F2S_NA) * F2S_SA;
+        const unsigned char* bb = sB + (j % F2S_NB) * F2S_SB;
+        #pragma unroll
+        for (int kk = 0; kk < 2; ++kk)
+        {
+            const uint4 f0 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2) * 512 + lane * 16);
+            const uint4 f1 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2 + 1) * 512 + lane * 16);
+            #pragma unroll
+            for (int mb = 0; mb < ((PF_F2S_PROBE & 1) ? 0 : NMW); ++mb)
+            {
+                const uint4 q4 = reinterpret_cast<const uint4*>(a + (wr * 4 + mb) * 1024)[kk * 32 + lane];
+                mma16816(acc[mb][0], q4.x, q4.y, q4.z, q4.w, f0.x, f0.y);
+                mma16816(acc[mb][1], q4.x, q4.y, q4.z, q4.w, f0.z, f0.w);
+                mma16816(acc[mb][2], q4.x, q4.y, q4.z, q4.w, f1.x, f1.y);
+                mma16816(acc[mb][3], q4.x, q4.y, q4.z, q4.w, f1.z, f1.w);
+            }
+        }
+        if (j + F2S_NB < ns) nb_arrive(1 + F2S_NB + j % F2S_NB, NT);
+        if ((j & 3) != 3) continue;
+        const float scl = __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]);
+        #pragma unroll
+        for (int mb = 0; mb < NMW; ++mb)
+            #pragma unroll
+            for (int n = 0; n < 4; ++n)
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) { tot[mb][n][i] = fmaf(scl, acc[mb][n][i], tot[mb][n][i]); acc[mb][n][i] = 0.f; }
+        if (b + 1 < nb) { ++b; continue; }
+        nb_sync(1 + 2 * F2S_NB, 256);          // every consumer is done reading sZ of the previous group
+        #pragma unroll
+        for (int mb = 0; mb < NMW; ++mb)
+            #pragma unroll
+            for (int n = 0; n < 4; ++n)
+            {
+                const int row = wr * 64 + mb * 16 + r, ch = wc * 4 + n;
+                *reinterpret_cast<u32*>(sZ + row * 256 + swz16(ch, row) * 16 + 4 * c) = pack_h2(tot[mb][n][0], tot[mb][n][1]);
+                *reinterpret_cast<u32*>(sZ + (row + 8) * 256 + swz16(ch, row + 8) * 16 + 4 * c) = pack_h2(tot[mb][n][2], tot[mb][n][3]);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) tot[mb][n][i] = 0.f;
+            }
+        nb_sync(1 + 2 * F2S_NB, 256);
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) pass(p, G);
+        b = 0; ++G;
+    }
+}
+template <int BITS, int EB>
+__device__ __forceinline__ void fc2ws_body(const Expert& A, const long long* tr, int seg, int r0, int rows, unsigned char* sm)
+{
+    constexpr int TB = 32 * BITS, NT = 384;
+    unsigned char* sA = sm;
+    unsigned char* sW = sA + F2S_NA * F2S_SA;
+    unsigned char* sB = sW + F2S_NW * F2S_SW;
+    unsigned char* sZ = sB + F2S_NB * F2S_SB;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int G0 = blockIdx.x * F2S_GL, nb = static_cast<int>(tr[3]), ns = 4 * F2S_GL * nb;
+    if (warp < 4)
+    {
+        const int nmb = (rows + 15) / 16;
+        const unsigned char* xb = A.x2 + static_cast<size_t>(seg) * MB * EB * 4096;
+        const uint8_t* wbase = A.t_fc2 + tr[1];
+        // step j -> (group G, block b, k32 slice s)
+        auto stage_a = [&](int j) {
+            const int it = j >> 2, s = j & 3, gi = it / nb, b = it - gi * nb;
+            (void)gi;
+            unsigned char* a = sA + (j % F2S_NA) * F2S_SA;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+                const int ch = t + 128 * i, mb = ch >> 6, pc = ch & 63;
+                if (mb < nmb && !(PF_F2S_PROBE & 8)) pf::cp16(a + mb * 1024 + pc * 16, xb + (static_cast<size_t>(mb) * EB + b) * 4096 + s * 1024 + pc * 16);
+            }
+        };
+        auto stage_w = [&](int j) {      // the warp's tiles (col blocks 2 warp + l / (TB / 8), chunks 2 s, 2 s + 1: 2 TB contiguous)
+            const int it = j >> 2, s = j & 3, gi = it / nb, b = it - gi * nb;
+            if (lane < TB / 4)
+            {
+                const int pc = lane / (TB / 8), off = (lane - pc * (TB / 8)) * 16, cb = warp * 2 + pc;
+                const uint8_t* ws = wbase + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>((G0 + gi) * 8) * 8 * TB;
+                pf::cp16(sW + (j % F2S_NW) * F2S_SW + warp * 4 * TB + pc * 2 * TB + off, ws + (cb * 8 + 2 * s) * TB + off);
+            }
+        };
+        Tr3Lane<BITS> ld;
+        ld.init(lane);
+        #pragma unroll
+        for (int k = 0; k < F2S_LA; ++k)
+        {
+            if (k < ns) stage_a(k);
+            if (k == 0)
+            {
+                #pragma unroll
+                for (int i = 0; i < F2S_LW; ++i) if (i < ns) stage_w(i);
+            }
+            pf::cp_commit();
+        }
+        for (int j = 0; j < ns; ++j)
+        {
+            if (j >= F2S_NB) nb_sync(1 + F2S_NB + j % F2S_NB, NT);
+            if (j + F2S_LA < ns) stage_a(j + F2S_LA);
+            if (j + F2S_LW < ns) stage_w(j + F2S_LW);
+            pf::cp_commit();
+            pf::cp_wait<F2S_LA>();
+            __syncwarp();
+            #pragma unroll
+            for (int jj = 0; jj < ((PF_F2S_PROBE & 2) ? 0 : 4); ++jj)
+            {
+                // tile jj = (col block 2 warp + jj / 2, k16 chunk 2 s + jj % 2)
+                const u32* w = reinterpret_cast<const u32*>(sW + (j % F2S_NW) * F2S_SW + warp * 4 * TB + jj * TB);
+                u32 f0[2], f1[2];
+                ld.decode(w[ld.i0], w[ld.i1], f0, f1);
+                if (A.e4) { f0[0] = pf_e4r(f0[0]); f0[1] = pf_e4r(f0[1]); f1[0] = pf_e4r(f1[0]); f1[1] = pf_e4r(f1[1]); }
+                const int cb = warp * 2 + (jj >> 1), kk = jj & 1;
+                *reinterpret_cast<uint4*>(sB + (j % F2S_NB) * F2S_SB + (kk * 8 + cb) * 512 + lane * 16) = make_uint4(f0[0], f0[1], f1[0], f1[1]);
+            }
+            nb_arrive(1 + j % F2S_NB, NT);
+        }
+        return;
+    }
+    const int cw = warp - 4, nmw = min(4, max(0, (rows - (cw >> 2) * 64 + 15) / 16));     // warp-uniform
+    switch (nmw)
+    {
+        case 4: fc2ws_cons<4, EB>(A, tr, r0, rows, sA, sB, sZ, cw, lane); break;
+        case 3: fc2ws_cons<3, EB>(A, tr, r0, rows, sA, sB, sZ, cw, lane); break;
+        case 2: fc2ws_cons<2, EB>(A, tr, r0, rows, sA, sB, sZ, cw, lane); break;
+        case 1: fc2ws_cons<1, EB>(A, tr, r0, rows, sA, sB, sZ, cw, lane); break;
+        default: fc2ws_cons<0, EB>(A, tr, r0, rows, sA, sB, sZ, cw, lane); break;
+    }
+}
+// grid (48 / GL, 2 max_wtiles), block 384, dynamic smem F2S_SMEM
+template <int EB = g6nr::EB, bool K2 = false>
+__global__ void __launch_bounds__(384, 1) k_pf_fc2ws(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char smv[];
+    const int y = blockIdx.y >> 1, h = blockIdx.y & 1;
+    if (y >= *A.n_wt) return;
+    const int* w = A.wt + static_cast<size_t>(y) * 3;
+    const int rows = min(2 * RS, w[2] - h * 2 * RS), r0 = w[1] + h * 2 * RS;
+    if (rows <= 0) return;
+    const int seg = A.rr_sp[r0] / RS;
+    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
+    if (tr[4] == 3) fc2ws_body<3, EB>(A, tr, seg, r0, rows, smv);
+    else if (!K2 || tr[4] == 4) fc2ws_body<4, EB>(A, tr, seg, r0, rows, smv);
+    else fc2ws_body<K2 ? 2 : 4, EB>(A, tr, seg, r0, rows, smv);
+}
+template <int EB, bool K2> inline void launch_fc2w(const Expert& A, cudaStream_t st)
+{
+    static bool attr = false;
+#if PF_F2WS
+    if (!attr)
+    {
+        cudaFuncSetAttribute(k_pf_fc2ws<EB, K2>, cudaFuncAttributeMaxDynamicSharedMemorySize, F2S_SMEM);
+        cudaFuncSetAttribute(k_pf_fc2ws<EB, K2>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        attr = true;
+    }
+    k_pf_fc2ws<EB, K2><<<dim3(HID / 128 / F2S_GL, 2 * pass_wtiles(A)), 384, F2S_SMEM, st>>>(A);
+#else
+    if (!attr)
+    {
+        cudaFuncSetAttribute(k_pf_fc2w<EB, K2>, cudaFuncAttributeMaxDynamicSharedMemorySize, F2W_SMEM);
+        cudaFuncSetAttribute(k_pf_fc2w<EB, K2>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        attr = true;
+    }
+    k_pf_fc2w<EB, K2><<<dim3(HID / 128 / FC2GL, 2 * pass_wtiles(A)), 256, F2W_SMEM, st>>>(A);
+#endif
+}
+#endif
 #endif
 
 // out[m] = bf16(sum_k yw[pos[m][k]] (k = 0..7 in order) + ysh[m]), fp32 sum. grid M, block 256.
-template <bool RS = false, bool SHX = false> __global__ void __launch_bounds__(256) k_pf_fin(Expert A)
+template <bool RS = false, bool SHX = false, bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fin(Expert A)
 {
     const int m = blockIdx.x;
     __shared__ float steer_warp[8], steer_kappa;
@@ -3309,10 +4933,17 @@ template <bool RS = false, bool SHX = false> __global__ void __launch_bounds__(2
         };
         #pragma unroll
         for (int k = 0; k < TOPK; ++k)
+        {
+            if constexpr (CUT)      // G6_MOE_TOPK cut: pos -1 = dropped route
+            {
+                if (p[k] >= 0) add(A.yw + static_cast<size_t>(p[k]) * HID);
+            }
+            else                    // OFF instance: the pre-cut loop
 #ifdef PF_FINLOCAL
-            if (p[k] >= 0)        // measurement build: an expert-parallel rank sums only its own routes (pos < 0 = not here)
+                if (p[k] >= 0)        // measurement build: an expert-parallel rank sums only its own routes (pos < 0 = not here)
 #endif
-            add(A.yw + static_cast<size_t>(p[k]) * HID);
+                add(A.yw + static_cast<size_t>(p[k]) * HID);
+        }
         if constexpr (SHX)
         {
             const uint4 q = *reinterpret_cast<const uint4*>(A.ysh + static_cast<size_t>(m) * HID + i * 8);
@@ -3358,12 +4989,39 @@ template <bool RS = false, bool SHX = false> __global__ void __launch_bounds__(2
     }
 }
 
+inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits -> tok_e, tok_w of the A.M rows of A
+{
+    switch (A.topk)                 // G6_MOE_TOPK cut: one instance per K; K = TOPK is the pre-cut kernel
+    {
+        case 1: k_pf_route<1><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+        case 2: k_pf_route<2><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+        case 3: k_pf_route<3><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+        case 4: k_pf_route<4><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+        case 5: k_pf_route<5><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+        case 6: k_pf_route<6><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+        case 7: k_pf_route<7><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+        default: k_pf_route<TOPK><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+    }
+}
+// G6_PF_ROUTER_SPLIT: route rows [r0, r0 + rows) only, from logits / tok_e / tok_w of the same rows (the pointers are per-row
+// views of the full tables, so a row's bytes are those of the whole-M launch)
+inline void launch_route_slice(const Expert& A, int r0, int rows, cudaStream_t st)
+{
+    if (!A.on || rows < 1) return;
+    Expert B = A;
+    B.M = rows;
+    B.logits = A.logits + static_cast<size_t>(r0) * NEXP;
+    B.tok_e = A.tok_e + static_cast<size_t>(r0) * TOPK;
+    B.tok_w = A.tok_w + static_cast<size_t>(r0) * TOPK;
+    launch_route_rows(B, st);
+}
 inline void launch_route(const Expert& A, cudaStream_t st)     // logits -> tok_e, tok_w, the grouped route list, segments
 {
     if (!A.on) return;
-    k_pf_route<<<(A.M + 7) / 8, 256, 0, st>>>(A);
+    if (!A.pre_routed) launch_route_rows(A, st);    // pre_routed: the rows were routed and exchanged (G6_PF_ROUTER_SPLIT)
     k_pf_count<<<NEXP, 256, 0, st>>>(A);
-    k_pf_fill<<<NEXP, 256, 0, st>>>(A);
+    if (A.topk < TOPK) k_pf_fill<true><<<NEXP + (A.shr ? 1 : 0), 256, 0, st>>>(A);
+    else k_pf_fill<<<NEXP + (A.shr ? 1 : 0), 256, 0, st>>>(A);
 }
 // EB: blocks per expert of the scratch layout (scratch_bytes / scratch_at with the same eb); g6nr::EB = 3 (TP6) / 4 (TP4)
 #ifdef PF_HOIST
@@ -3413,6 +5071,16 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
         return;
     }
 #endif
+#if G6_MODEL_FLASH
+    if (A.h16 && A.bs && A.hx && A.wm && A.wt) { launch_fc1w<EB>(A, st); return; }        // make_layer: wm only on K4-order units
+    if (A.h16)
+    {
+        if (A.bs) { if (A.k2) k_pf_fc1<EB, true, true, false, true><<<g, 256, 0, st>>>(A); else k_pf_fc1<EB, false, true, false, true><<<g, 256, 0, st>>>(A); }
+        else if (A.k2) k_pf_fc1<EB, true, false, false, true><<<g, 256, 0, st>>>(A);
+        else k_pf_fc1<EB, false, false, false, true><<<g, 256, 0, st>>>(A);
+        return;
+    }
+#endif
     if (A.bs) { if (A.k2) k_pf_fc1<EB, true, true><<<g, 256, 0, st>>>(A); else k_pf_fc1<EB, false, true><<<g, 256, 0, st>>>(A); }
     else if (A.k2) k_pf_fc1<EB, true><<<g, 256, 0, st>>>(A);
     else k_pf_fc1<EB><<<g, 256, 0, st>>>(A);
@@ -3420,6 +5088,9 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
 #endif
 template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    if (A.on && A.h16) { k_pf_mid<EB, true><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A); return; }
+#endif
     if (A.on) k_pf_mid<EB><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A);
 }
 #ifdef PF_FC2GL
@@ -3427,6 +5098,18 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
 {
     if (!A.on) return;
     const dim3 g(HID / 128 / FC2GL, A.maxseg);
+#if G6_MODEL_FLASH
+    if (A.h16)
+    {
+        if (A.bs && A.fc2one && A.fc2v2 && A.wm2 && A.wt) { if (A.k2) launch_fc2w<EB, true>(A, st); else launch_fc2w<EB, false>(A, st); }
+        else if (A.bs && A.fc2one && A.fc2v2) { if (A.k2) launch_fc2v<EB, true>(A, g, st); else launch_fc2v<EB, false>(A, g, st); }
+        else if (A.bs && A.fc2one) { if (A.k2) k_pf_fc2g<EB, true, true, true, true><<<g, 256, 0, st>>>(A); else k_pf_fc2g<EB, false, true, true, true><<<g, 256, 0, st>>>(A); }
+        else if (A.bs) { if (A.k2) k_pf_fc2g<EB, true, true, false, true><<<g, 256, 0, st>>>(A); else k_pf_fc2g<EB, false, true, false, true><<<g, 256, 0, st>>>(A); }
+        else if (A.k2) k_pf_fc2g<EB, true, false, false, true><<<g, 256, 0, st>>>(A);
+        else k_pf_fc2g<EB, false, false, false, true><<<g, 256, 0, st>>>(A);
+        return;
+    }
+#endif
     if (A.bs) { if (A.k2) k_pf_fc2g<EB, true, true><<<g, 256, 0, st>>>(A); else k_pf_fc2g<EB, false, true><<<g, 256, 0, st>>>(A); }
     else if (A.k2) k_pf_fc2g<EB, true><<<g, 256, 0, st>>>(A);
     else k_pf_fc2g<EB><<<g, 256, 0, st>>>(A);
@@ -3444,6 +5127,17 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
 inline void launch_fin(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
+    if (A.topk < TOPK)              // G6_MOE_TOPK cut: the fin skips pos -1 (dropped routes)
+    {
+        if (A.sh_svh)
+        {
+            if (A.rs.base) k_pf_fin<true, true, true><<<A.M, 256, 0, st>>>(A);
+            else k_pf_fin<false, true, true><<<A.M, 256, 0, st>>>(A);
+        }
+        else if (A.rs.base) k_pf_fin<true, false, true><<<A.M, 256, 0, st>>>(A);
+        else k_pf_fin<false, false, true><<<A.M, 256, 0, st>>>(A);
+        return;
+    }
     if (A.sh_svh)
     {
         if (A.rs.base) k_pf_fin<true, true><<<A.M, 256, 0, st>>>(A);
@@ -3486,6 +5180,21 @@ __device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int
     *reinterpret_cast<u32*>(rec + ((rr & 7) * 4 + (j & 3)) * 16 + ((j >> 2) * 2 + (rr >> 3)) * 4) = c;
     if (j == 0) rec[512 + rr] = static_cast<uint8_t>(code);
 }
+#if G6_MODEL_FLASH
+// Store 128 rotated fp32 channels (v[4] per lane) as 8 fp16 m16n8k16 A-fragments at x8[(row >> 4) * K16 + ks_base + s][512].
+// Layout matches mma16816 A-fragment: lane fl = (r8 & 7) * 4 + ((k & 7) >> 1), reg = ((k >> 3) << 1) | (r8 >> 3).
+__device__ __forceinline__ void shx_store_h16(const float (&v)[4], int lane, int row, int M, int K16, int ks_base, uint8_t* x8)
+{
+    const u32 p0 = (row < M) ? as_u32(__floats2half2_rn(v[0], v[1])) : 0u;
+    const u32 p1 = (row < M) ? as_u32(__floats2half2_rn(v[2], v[3])) : 0u;
+    const int rr = row & 15, ks = ks_base + (lane >> 2), kk = (lane & 3) * 4;
+    const int fl = (rr & 7) * 4 + ((kk & 7) >> 1);
+    const int reg = ((kk >> 3) << 1) | (rr >> 3);
+    u32* dst = reinterpret_cast<u32*>(x8 + (static_cast<size_t>(row >> 4) * K16 + ks) * 512);
+    dst[fl * 4 + reg] = p0;
+    dst[(fl + 1) * 4 + reg] = p1;
+}
+#endif
 
 // x -> MXFP8 records of H128(x * suh_g) and H128(x * suh_u), quantized from fp32 with k_xq8's scale rule. The trellis
 // fc1 prologue quantizes from fp16 values with its own rule, so the two paths differ by FP8 activation rounding
@@ -3494,7 +5203,7 @@ __device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int
 __global__ void __launch_bounds__(256) k_shx_rotq(ShX a)
 {
     const int lane = threadIdx.x & 31;
-    const int w = blockIdx.x * 8 + (threadIdx.x >> 5), row = w / 48, blk = w % 48;
+    const int w = blockIdx.x * 8 + (threadIdx.x >> 5), row = w / geom::HB, blk = w % geom::HB;
     if (row >= (a.M + 15) / 16 * 16) return;
     const int k0 = blk * 128 + lane * 4;
     float x[4] = {0.f, 0.f, 0.f, 0.f};
@@ -3545,7 +5254,7 @@ __global__ void __launch_bounds__(256) k_shx_mid(ShX a)
         for (int e = 0; e < 4; ++e)
         {
             const float gg = rnd_h(__fmul_rn(gv[e], svg[e])), uu = rnd_h(__fmul_rn(uv[e], svu[e]));
-            v[e] = __fmul_rn(rnd_h(silu_f(gg) * uu), sud[e]);
+            v[e] = __fmul_rn(rnd_h(swiglu_f(gg, uu)), sud[e]);
         }
         had128(v, lane);
         #pragma unroll
@@ -3608,32 +5317,51 @@ struct Scratch
 #ifdef PF_AOP
     uint8_t* aop;                     // [maxseg][AOP_NS][2][AOPS] (Expert::aop)
 #endif
+#if G6_MODEL_FLASH
+    __half* hx;                       // [M][HID] Expert::hx
+    int *wt, *n_wt;                   // Expert::wt, n_wt
+#endif
 };
 
 inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)     // eb = blocks per expert (EB of the launches)
 {
     size_t o = 0;
     auto take = [&](size_t bytes) { char* p = base ? base + o : nullptr; o += (bytes + 255) / 256 * 256; return p; };
+#if G6_MODEL_FLASH
+    // Expert::shr: the shared expert's M routes follow the M * TOPK routed ones (R routes, their segments and wtiles); ysh is
+    // the yw tail (sc.ysh = route Mmax * TOPK; make_layer points Expert::ysh at route M * TOPK of the pass)
+    const size_t RB = (static_cast<size_t>(M) + 15) / 16, m = static_cast<size_t>(M), R0 = m * TOPK, R = R0 + m,
+                 ms = static_cast<size_t>(max_segments(M)) + (m + RS - 1) / RS;
+#else
     const size_t RB = (static_cast<size_t>(M) + 15) / 16, m = static_cast<size_t>(M), R = m * TOPK, ms = static_cast<size_t>(max_segments(M));
+#endif
     Scratch t;
     t.Mmax = M;
+#if G6_MODEL_FLASH
+    t.x8_big = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * 1024));
+    t.x8_up = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * 1024));
+    t.x8_small = reinterpret_cast<uint8_t*>(take(RB * (g6nr::SMALLW / 32) * 1024));
+#else
     t.x8_big = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * REC));
     t.x8_up = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * REC));
     t.x8_small = reinterpret_cast<uint8_t*>(take(RB * (g6nr::SMALLW / 32) * REC));
+#endif
     t.xb = reinterpret_cast<uint16_t*>(take(m * HID * 2));
     t.y32 = reinterpret_cast<float*>(take(m * 256 * 4));
     t.g = reinterpret_cast<__half*>(take(m * SACTW * 2));
     t.u = reinterpret_cast<__half*>(take(m * SACTW * 2));
     t.act = reinterpret_cast<__half*>(take(m * SACTW * 2));
+#if !G6_MODEL_FLASH
     t.ysh = reinterpret_cast<__half*>(take(m * HID * 2));
-    t.tok_e = reinterpret_cast<int*>(take(R * 4));
-    t.tok_w = reinterpret_cast<float*>(take(R * 4));
+#endif
+    t.tok_e = reinterpret_cast<int*>(take(m * TOPK * 4));
+    t.tok_w = reinterpret_cast<float*>(take(m * TOPK * 4));
     t.cnt = reinterpret_cast<int*>(take(NEXP * 4));
     t.rr_row = reinterpret_cast<int*>(take(R * 4));
     t.rr_e = reinterpret_cast<int*>(take(R * 4));
     t.rr_sp = reinterpret_cast<int*>(take(R * 4));
     t.rr_w = reinterpret_cast<float*>(take(R * 4));
-    t.pos = reinterpret_cast<int*>(take(R * 4));
+    t.pos = reinterpret_cast<int*>(take(m * TOPK * 4));
     t.segs = reinterpret_cast<int*>(take(ms * 3 * 4));
     t.n_seg = reinterpret_cast<int*>(take(4));
     t.sh_rr_row = reinterpret_cast<int*>(take(m * 4));
@@ -3643,8 +5371,18 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
     t.sh_segs = reinterpret_cast<int*>(take((m + RS - 1) / RS * 3 * 4));
     t.sh_n_seg = reinterpret_cast<int*>(take(4));
     t.z1 = reinterpret_cast<__half*>(take(R * 2 * eb * 128 * 2));
+#if G6_MODEL_FLASH
+    t.x2 = reinterpret_cast<uint8_t*>(take(ms * MB * eb * 4096));       // >= 4 * REC: also the fp16 A fragments (Expert::h16)
+#else
     t.x2 = reinterpret_cast<uint8_t*>(take(ms * MB * eb * 4 * REC));
+#endif
     t.yw = reinterpret_cast<__half*>(take(R * HID * 2));
+#if G6_MODEL_FLASH
+    t.ysh = t.yw + R0 * HID;
+    t.hx = reinterpret_cast<__half*>(take(m * HID * 2));
+    t.wt = reinterpret_cast<int*>(take((static_cast<size_t>(max_wtiles(M)) + (m + WM_R - 1) / WM_R) * 3 * 4));
+    t.n_wt = reinterpret_cast<int*>(take(4));
+#endif
 #ifdef PF_AOP
     t.aop = reinterpret_cast<uint8_t*>(take(ms * AOP_NS * 2 * AOPS));
 #endif
@@ -3676,6 +5414,16 @@ struct Io                             // step buffers of one rank, device memory
     const __half* x2 = nullptr;       // in  [M][6144] mlp_norm output
     float* logits = nullptr;          // out [M][256] fp32 router logits (MoE layers)
     uint16_t* mlp_part = nullptr;     // out [M][6144] BF16   MLP partial
+#if G6_MODEL_FLASH
+    const float* xn = nullptr;        // in  [M][4096] fp32 attn_norm output
+    const float* xn2 = nullptr;       // in  [M][4096] fp32 mlp_norm output
+    __half* idx_g = nullptr;          // out [M][128]  self_attn.indexer.index_kpool_compress_gate
+    void *kda_q = nullptr, *kda_k = nullptr, *kda_v = nullptr, *kda_fa = nullptr, *kda_ga = nullptr;
+    __half* kda_b = nullptr;          // out [M][64]   self_attn.b_proj.weight (fp16)
+    float* kda_b_f32 = nullptr;       // out [M][ldy]  self_attn.b_proj.weight (fp32, overrides sc.y32 when set)
+    int kda_bf16 = 0;                 // 0 = fp16, 1 = bf16, 2 = fp32 for kda_{q,k,v,fa,ga}
+    int kda_ldy = 0;                  // >0: row stride (elements) for kda_{q,k,v,fa,ga} and kda_b
+#endif
 };
 
 struct Layer
@@ -3690,6 +5438,12 @@ struct Layer
     Expert ex;
     Expert exs;                       // trellis shared expert pass (launch_shared); on = 0 otherwise
     ShX shx;                          // the same from its FP8 copy on the MXFP8 GEMMs (gate, up, down above); on = 0 otherwise
+#if G6_MODEL_FLASH
+    int kda = 0;
+    Xq xq_x_unrot;                    // KDA: unrotated x records for f_a / g_a when xq_x rotates for q/k/v
+    Gemm idx_k_mx, kda_q, kda_k, kda_v, kda_fa, kda_ga, kda_o;
+    Blas idx_g, kda_b;
+#endif
 };
 
 // the shared expert of an exlr8 v2 layer: FP8 copy on the GEMMs, or the trellis pass. No-op for other layers.
@@ -3700,7 +5454,7 @@ template <int EB = g6nr::EB> inline void launch_shared(const Layer& L, cudaStrea
     {
         const ShX& a = L.shx;
         const int rows = (a.M + 15) / 16 * 16;
-        k_shx_rotq<<<(rows * 48 + 7) / 8, 256, 0, st>>>(a);
+        k_shx_rotq<<<(rows * geom::HB + 7) / 8, 256, 0, st>>>(a);
         launch_pair(L.gate, L.up, st);    // up reads its own records (Gemm::x8_2)
         k_shx_mid<<<(rows * (a.I / 128) + 7) / 8, 256, 0, st>>>(a);
         launch(L.down, st);           // -> ysh, which k_pf_fin rotates and scales (Expert::sh_svh)
@@ -3713,7 +5467,11 @@ template <int EB = g6nr::EB> inline void launch_shared(const Layer& L, cudaStrea
 // records, up on its own (x8_up), the mid pass writes down's records (Act::svh_g), down rotates its output.
 inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, const Io& io, Layer& L)
 {
+#if G6_MODEL_FLASH
+    const bool any = T.tsuh[0] || T.tsuh[1] || T.tsuh[2] || T.tsuh[3] || T.tsuh[4] || T.kda_suh[0] || T.kda_suh[1] || T.kda_suh[2];
+#else
     const bool any = T.tsuh[0] || T.tsuh[1] || T.tsuh[2] || T.tsuh[3] || T.tsuh[4];
+#endif
     if (!any) return nullptr;
     for (int i = 0; i < dtr::NMAT; ++i)
         if (!T.tsuh[i] != !T.tsvh[i]) return "dense trellis matrix without its suh / svh";
@@ -3725,6 +5483,9 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
     {
         if (L.q_b.N % 128 || L.q_b.K % 128) return "dense trellis q_b: widths must be multiples of 128";
         L.q_b.pre = rot(io.q_a_n, L.q_b.K, L.q_b.K, sc.x8_up, T.tsuh[0]);
+#if G6_MODEL_FLASH
+        L.q_b.pre.h16 = L.q_b.h16;
+#endif
         L.q_b.x8 = sc.x8_up;
         L.q_b.osvh = T.tsvh[0];
     }
@@ -3732,17 +5493,56 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
     {
         if (L.o_proj.N % 128 || L.o_proj.K % 128) return "dense trellis o_proj: widths must be multiples of 128";
         L.xq_attn.suh = T.tsuh[1];
+#if G6_MODEL_FLASH
+        L.xq_attn.h16 = L.o_proj.h16;
+#endif
         L.o_proj.osvh = T.tsvh[1];
     }
+#if G6_MODEL_FLASH
+    if (T.kda_suh[0] || T.kda_suh[1] || T.kda_suh[2])
+    {
+        for (int i = 0; i < 3; ++i)
+            if (!T.kda_suh[i] || !T.kda_svh[i]) return "Flash KDA trellis matrix without its suh / svh";
+        if (L.kda_q.on) { L.xq_x.suh = T.kda_suh[0]; L.xq_x.h16 = L.kda_q.h16; L.kda_q.osvh = T.kda_svh[0]; }
+        if (L.kda_k.on) { L.kda_k.osvh = T.kda_svh[1]; }
+        if (L.kda_v.on) { L.kda_v.osvh = T.kda_svh[2]; }
+    }
+#endif
     if (T.tsuh[2] || T.tsuh[3] || T.tsuh[4])
     {
         if (L.moe || !T.tsuh[2] || !T.tsuh[3] || !T.tsuh[4] || !L.gate.on || !L.up.on || !L.down.on)
             return "dense trellis MLP: gate, up and down together, on a dense layer";
         if (L.inter % 128) return "dense trellis MLP: width must be a multiple of 128";
         L.xq_x2.suh = T.tsuh[2];
+#if G6_MODEL_FLASH
+        L.xq_x2.h16 = L.gate.h16;
+        // dense.gate and dense.up have distinct suh vectors in W8d: rotate up into sc.x8_up unless pointers match or G6_DTR_PF_SHARE_SUH=1
+        static const bool share_suh = getenv("G6_DTR_PF_SHARE_SUH") && atoi(getenv("G6_DTR_PF_SHARE_SUH")) == 1;
+        if (share_suh || T.tsuh[2] == T.tsuh[3])
+        {
+            L.up.pre = Xq();
+            L.up.x8 = sc.x8_big;
+        }
+        else
+        {
+            L.up.pre = rot(io.x2, HID, HID, sc.x8_up, T.tsuh[3]);
+            L.up.pre.h16 = L.up.h16;
+            L.up.x8 = sc.x8_up;
+        }
+#else
         L.up.pre = rot(io.x2, HID, HID, sc.x8_up, T.tsuh[3]);
         L.up.x8 = sc.x8_up;
+#endif
         L.act.svh_g = T.tsvh[2]; L.act.svh_u = T.tsvh[3]; L.act.suh_d = T.tsuh[4]; L.act.x8 = sc.x8_small;
+#if G6_MODEL_FLASH
+        if (L.gate.h16 && L.up.h16 && L.down.h16)
+        {
+            L.gate.osvh = T.tsvh[2];
+            L.up.osvh = T.tsvh[3];
+            L.act.h16 = 2;
+        }
+        else L.act.h16 = L.down.h16;
+#endif
         L.xq_act.on = 0;
         L.down.osvh = T.tsvh[4];
     }
@@ -3769,27 +5569,83 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if ((e = make_gemm(T.t[GT],         T.s[GT],         M, sc.x8_big,   sc.g,                               0, L.gate))) return e;
     if ((e = make_gemm(T.t[UT],         T.s[UT],         M, sc.x8_big,   sc.u,                               0, L.up))) return e;
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
+#if G6_MODEL_FLASH
+    static const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+    if ((!L.o_proj.on || !dtr8) && T.tm.o_proj.w && (e = make_gemm_tr(T.tm.o_proj, M, sc.x8_small, io.attn_part, 1, L.o_proj))) return e;
+    if ((!L.q_b.on || !dtr8) && T.tm.q_b.w && (e = make_gemm_tr(T.tm.q_b, M, sc.x8_small, io.q_b, 0, L.q_b))) return e;
+    if (!L.moe)
+    {
+        if ((!L.gate.on || !dtr8) && T.tm.gate.w && (e = make_gemm_tr(T.tm.gate, M, sc.x8_big, sc.g, 0, L.gate))) return e;
+        if ((!L.up.on || !dtr8) && T.tm.up.w && (e = make_gemm_tr(T.tm.up, M, sc.x8_big, sc.u, 0, L.up))) return e;
+        if ((!L.down.on || !dtr8) && T.tm.down.w && (e = make_gemm_tr(T.tm.down, M, sc.x8_small, io.mlp_part, 1, L.down))) return e;
+    }
+    if ((e = make_gemm(T.t[T_IDX_WK_MX], T.s[T_IDX_WK_MX], M, sc.x8_big, io.idx_k, 0, L.idx_k_mx))) return e;
+    L.kda = (T.t[T_KDA_FA].p != nullptr || T.t[T_KDA_Q].p != nullptr || T.kda_tm[0].w != nullptr) ? 1 : 0;
+    if (L.kda)
+    {
+        const uint8_t* x8_fg = (T.kda_suh[0] != nullptr) ? sc.x8_up : sc.x8_big;
+        if ((e = make_gemm(T.t[T_KDA_Q],  T.s[T_KDA_Q],  M, sc.x8_big, io.kda_q,  io.kda_bf16, L.kda_q))) return e;
+        if ((e = make_gemm(T.t[T_KDA_K],  T.s[T_KDA_K],  M, sc.x8_big, io.kda_k,  io.kda_bf16, L.kda_k))) return e;
+        if ((e = make_gemm(T.t[T_KDA_V],  T.s[T_KDA_V],  M, sc.x8_big, io.kda_v,  io.kda_bf16, L.kda_v))) return e;
+        if ((!L.kda_q.on || !dtr8) && T.kda_tm[0].w && (e = make_gemm_tr(T.kda_tm[0], M, sc.x8_big, io.kda_q, io.kda_bf16, L.kda_q))) return e;
+        if ((!L.kda_k.on || !dtr8) && T.kda_tm[1].w && (e = make_gemm_tr(T.kda_tm[1], M, sc.x8_big, io.kda_k, io.kda_bf16, L.kda_k))) return e;
+        if ((!L.kda_v.on || !dtr8) && T.kda_tm[2].w && (e = make_gemm_tr(T.kda_tm[2], M, sc.x8_big, io.kda_v, io.kda_bf16, L.kda_v))) return e;
+        if ((e = make_gemm(T.t[T_KDA_FA], T.s[T_KDA_FA], M, x8_fg,     io.kda_fa, io.kda_bf16, L.kda_fa))) return e;
+        if ((e = make_gemm(T.t[T_KDA_GA], T.s[T_KDA_GA], M, x8_fg,     io.kda_ga, io.kda_bf16, L.kda_ga))) return e;
+        if (io.kda_ldy > 0)
+        {
+            L.kda_q.ldy = L.kda_k.ldy = L.kda_v.ldy = L.kda_fa.ldy = L.kda_ga.ldy = io.kda_ldy;
+        }
+    }
+    const bool has_dsa = L.q_a.on || L.kv_a.on || L.q_b.on || L.indexer;
+#endif
 #if PF_QO_DEDUP
-    // slim pack (tools/convert/slimpack.py): q_b / o_proj .mx.codes + .scales are left out where the QO pack covers the layer.
+    // slim pack: q_b / o_proj .mx.codes + .scales are left out where the QO pack covers the layer.
     // Both absent together is fine only then; anything else fails loud.
     const bool qo_dedup = !L.q_b.on && !L.o_proj.on && T.qo_cover && T.heads > 0;
+#if G6_MODEL_FLASH
+    if (has_dsa && (!L.q_a.on || !L.kv_a.on || (!qo_dedup && (!L.q_b.on || !L.o_proj.on))))
+#else
     if (!L.q_a.on || !L.kv_a.on || (!qo_dedup && (!L.q_b.on || !L.o_proj.on)))
+#endif
         return !L.q_b.on && !L.o_proj.on && !T.qo_cover
                    ? "layer without q_b / o_proj .mx.codes and no QO pack covers it (slim pack booted without G6_PF_OWN=3 / qo pack?)"
                    : "layer without q_a / kv_a / q_b / o_proj .mx.codes";
 #else
     const bool qo_dedup = false;
+#if G6_MODEL_FLASH
+    if (has_dsa && (!L.q_a.on || !L.kv_a.on || !L.q_b.on || !L.o_proj.on)) return "layer without q_a / kv_a / q_b / o_proj .mx.codes";
+#else
     if (!L.q_a.on || !L.kv_a.on || !L.q_b.on || !L.o_proj.on) return "layer without q_a / kv_a / q_b / o_proj .mx.codes";
 #endif
+#endif
     const bool shtr = L.moe && T.sh_trellis;          // shared expert as trellis row 256: gate / up / down may be absent
+#if G6_MODEL_FLASH
+    const bool has_mlp = L.moe || L.gate.on || L.up.on || L.down.on;
+    if ((!has_dsa && !L.kda && !has_mlp) || (has_mlp && (!L.gate.on || !L.up.on || !L.down.on) && !shtr))
+#else
     if ((!L.gate.on || !L.up.on || !L.down.on) && !shtr)
+#endif
         return L.moe ? "MoE layer without shared.gate/up/down.mx" : "layer has neither tr3.table nor dense.gate/up/down.mx";
+#if G6_MODEL_FLASH
+    if (has_dsa)
+    {
+        if (L.q_a.K != HID || L.kv_a.K != HID || L.q_a.N > g6nr::SMALLW)
+            return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
+        if (!qo_dedup && (L.q_b.K != L.q_a.N || L.o_proj.N != HID || L.o_proj.K != L.q_b.N || L.q_b.N % 256 || L.q_b.N > g6nr::QBW))
+            return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
+        if (L.indexer && L.idx_q.K != L.q_a.N) return "idx.wq_b input width is not the q_a width";
+        L.heads = qo_dedup ? T.heads : L.q_b.N / 256;
+    }
+    else if (L.kda && L.o_proj.on) L.heads = L.o_proj.K / 128;
+#else
     if (L.q_a.K != HID || L.kv_a.K != HID || L.q_a.N > g6nr::SMALLW)
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
     if (!qo_dedup && (L.q_b.K != L.q_a.N || L.o_proj.N != HID || L.o_proj.K != L.q_b.N || L.q_b.N % 256 || L.q_b.N > g6nr::QBW))
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
     if (L.indexer && L.idx_q.K != L.q_a.N) return "idx.wq_b input width is not the q_a width";
     L.heads = qo_dedup ? T.heads : L.q_b.N / 256;
+#endif
     L.inter = L.gate.N;
     if (L.gate.on && (L.gate.K != HID || L.up.K != HID || L.up.N != L.inter || L.down.K != L.inter || L.down.N != HID || L.inter > SACTW ||
                       L.inter % 32))
@@ -3801,17 +5657,37 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     xq(L.xq_attn, io.attn, qo_dedup ? T.heads * 256 : L.o_proj.K, sc.x8_small);   // not launched on the QO path
     xq(L.xq_x2, io.x2, HID, sc.x8_big);
     xq(L.xq_act, sc.act, L.inter, sc.x8_small);
+#if G6_MODEL_FLASH
+    if (L.kda && T.kda_suh[0]) xq(L.xq_x_unrot, io.x, HID, sc.x8_up);
+#endif
     L.act.on = 1; L.act.g = sc.g; L.act.u = sc.u; L.act.act = sc.act; L.act.I = L.inter; L.act.M = M;
     if (const char* e = dense_trellis(T, M, sc, io, L)) return e;
+#if G6_MODEL_FLASH
+    if (L.kda && L.o_proj.on) { L.kda_o = L.o_proj; L.kda_o.pre = L.xq_attn; }
+#endif
 
     if ((e = make_blas(T.t[T_IDX_WK],    HID, M, blas, sc.xb, sc.y32,                         io.idx_k, L.idx_k))) return e;
     if ((e = make_blas(T.t[T_IDX_WPROJ], HID, M, blas, sc.xb, sc.y32 + static_cast<size_t>(M) * 128, io.idx_w, L.idx_w))) return e;
     if ((e = make_blas(T.t[T_ROUTER],    HID, M, blas, sc.xb, io.logits,                      nullptr,  L.router))) return e;
+#if G6_MODEL_FLASH
+    if ((e = make_blas(T.t[T_IDX_G],     HID, M, blas, sc.xb, sc.y32 + static_cast<size_t>(M) * 128, io.idx_g, L.idx_g))) return e;
+    if ((e = make_blas(T.t[T_KDA_B],     HID, M, blas, sc.xb, io.kda_b_f32 ? io.kda_b_f32 : sc.y32, io.kda_b, L.kda_b))) return e;
+    if (io.kda_ldy > 0) L.kda_b.ldy = io.kda_ldy;
+    if (L.moe != L.router.on) return "router.w and tr3.table must come together";
+    if ((L.idx_k.on || L.idx_k_mx.on) && ((L.idx_k.on && L.idx_k.O != 128) || (L.idx_k_mx.on && L.idx_k_mx.N != 128) || !L.idx_w.on || L.idx_w.O != 32))
+        return "idx.wk / idx.weights_proj are not [128][HID] + [32][HID]";
+    if (L.router.on && L.router.O != NEXP) return "router.w is not [NEXP][HID]";
+    L.xb_x.on = L.idx_k.on || L.idx_w.on || L.idx_g.on || L.kda_b.on;
+    L.xb_x.src = io.x; L.xb_x.ld = HID; L.xb_x.K = HID; L.xb_x.M = M; L.xb_x.dst = sc.xb;
+    L.xb_x2.on = L.moe && blas != nullptr;
+    L.xb_x2.src = io.x2; L.xb_x2.ld = HID; L.xb_x2.K = HID; L.xb_x2.M = M; L.xb_x2.dst = sc.xb;
+#else
     if (L.moe != L.router.on) return "router.w and tr3.table must come together";
     if (L.idx_k.on && (L.idx_k.O != 128 || !L.idx_w.on || L.idx_w.O != 32)) return "idx.wk / idx.weights_proj are not [128][6144] + [32][6144]";
-    if (L.router.on && L.router.O != NEXP) return "router.w is not [256][6144]";
+    if (L.router.on && L.router.O != NEXP) return "router.w is not [NEXP][HID]";
     L.xb_x.on = L.idx_k.on;  L.xb_x.src = io.x;   L.xb_x.ld = HID;  L.xb_x.K = HID;  L.xb_x.M = M;  L.xb_x.dst = sc.xb;
     L.xb_x2.on = L.moe;      L.xb_x2.src = io.x2; L.xb_x2.ld = HID; L.xb_x2.K = HID; L.xb_x2.M = M; L.xb_x2.dst = sc.xb;
+#endif
 
     if (L.moe)
     {
@@ -3837,6 +5713,15 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             return "tr3 table / v1 / v2 / v3 (or sg / v1b / v3b) / router.bias shapes do not match the pack layout";
         Expert& A = L.ex;
         A.on = 1; A.M = M; A.maxseg = max_segments(M);
+        A.topk = moe_topk_cut(TOPK);     // G6_MOE_TOPK (validated at boot); nroutes = the exact live count (sum of cnt)
+        A.nroutes = M * A.topk;          // (0-sentinel would expand to M * TOPK and overshoot the route grids)
+#if G6_MODEL_FLASH
+        { const char* ev = getenv("G6_PF_MOE8"); A.h16 = (ev && atoi(ev) == 1) ? 0 : 1; }
+        A.e4 = T.e4m3;
+#if defined(PF_F12) || defined(PF_AOP) || defined(PF_HOIST) || !defined(PF_FC2GL)
+        if (A.h16) return "fp16 MoE passes (the Flash default; G6_PF_MOE8=1 = MXFP8) need PF_FC2GL and no PF_F12 / PF_AOP / PF_HOIST";
+#endif
+#endif
         A.logits = io.logits; A.bias = static_cast<const float*>(bias.p);
         A.tok_e = sc.tok_e; A.tok_w = sc.tok_w; A.cnt = sc.cnt;
         A.rr_row = sc.rr_row; A.rr_e = sc.rr_e; A.rr_sp = sc.rr_sp; A.rr_w = sc.rr_w; A.pos = sc.pos; A.segs = sc.segs; A.n_seg = sc.n_seg;
@@ -3848,6 +5733,22 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.bs = bsf;
         A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);
         A.x = io.x2; A.ldx = HID;
+#if G6_MODEL_FLASH
+        { const char* ev = getenv("G6_PF_HX"); if (A.h16 && bsf && !(ev && atoi(ev) == 0)) A.hx = sc.hx; }
+        { const char* ev = getenv("G6_PF_FC2ONE"); A.fc2one = A.h16 && bsf && !(ev && atoi(ev) == 0); }
+        { const char* ev = getenv("G6_PF_FC2V2"); A.fc2v2 = A.fc2one && !(ev && atoi(ev) == 0); }
+        {   // weight-major fc1 (default on, G6_PF_WM=0 = k_pf_fc1): k_pf_fc1ws only for passes of >= G6_PF_WM_MIN rows
+            // (default 6144; slower than k_pf_fc1 below ~5000). Byte-equal to k_pf_fc1.
+            const char* ev = getenv("G6_PF_WM");
+            const char* em = getenv("G6_PF_WM_MIN");
+            // the WM kernels read K4 order only: the widened order (fc1_wide / fc2_wide) differs only for K2 and K3 units
+            const bool k4 = !T.k2 && !T.k3;
+            A.wm = A.hx && !(ev && atoi(ev) == 0) && M >= (em ? atoi(em) : 6144) && (!T.fc1_wide || k4);
+            const char* e2 = getenv("G6_PF_WM2");      // k_pf_fc2w: byte-equal, ~4% slower than k_pf_fc2v at M 8192 (bench): off
+            A.wm2 = A.wm && A.fc2v2 && e2 && atoi(e2) == 1 && (!T.fc2_wide || k4);
+        }
+        if (A.wm) { A.wt = sc.wt; A.n_wt = sc.n_wt; }
+#endif
         A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.ysh = sc.ysh; A.out = io.mlp_part;
 #ifdef PF_AOP
         { const char* ev = getenv("G6_PF_AOP"); A.aop = (ev && atoi(ev) == 0) ? nullptr : sc.aop; }   // compiled in: on unless G6_PF_AOP=0
@@ -3857,7 +5758,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #endif
         if (T.sh_trellis && T.sh_fp8)
         {
-            if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row 256";
+            if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row NEXP";
             if (!L.gate.on || L.inter != static_cast<int>(T.sh_tr[3]) * 128) return "shared FP8 copy does not match tr3.table row 256";
             ShX& X = L.shx;
             X.on = 1; X.M = M; X.I = L.inter;
@@ -3880,12 +5781,29 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         }
         else if (T.sh_trellis)
         {
-            if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row 256";
+            if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row NEXP";
+#if G6_MODEL_FLASH
+            // G6_PF_SHR=1 (default off: ~-0.05 s at 45L 32K): the shared expert rides in the routed pass (Expert::shr):
+            // one route list, one fc1 / mid / fc2 launch set; its rows run the routed kernels (k_pf_fc1ws when wm) -> same
+            // bytes. Default = its own pass.
+            static const bool shr = [] { const char* e = getenv("G6_PF_SHR"); return e && atoi(e) == 1; }();
+            if (shr)
+            {
+                A.shr = 1; A.nroutes = M * A.topk + M; A.maxseg = max_segments(M) + (M + RS - 1) / RS;
+                A.ysh = sc.yw + static_cast<size_t>(M) * A.topk * HID;     // route M * topk + row (sc.ysh is at the Mmax tail)
+                L.exs.on = 0;
+                L.xq_x2.on = 0; L.gate.on = 0; L.up.on = 0; L.act.on = 0; L.xq_act.on = 0; L.down.on = 0;
+                return nullptr;
+            }
+#endif
             Expert& S = L.exs;
             S = A;
             S.nroutes = M; S.maxseg = (M + RS - 1) / RS;
             S.rr_row = sc.sh_rr_row; S.rr_e = sc.sh_rr_e; S.rr_sp = sc.sh_rr_sp; S.rr_w = sc.sh_rr_w;
             S.segs = sc.sh_segs; S.n_seg = sc.sh_n_seg; S.pos = nullptr;
+#if G6_MODEL_FLASH
+            S.wm = 0; S.wm2 = 0; S.wt = nullptr; S.n_wt = nullptr;
+#endif
 #ifdef PF_AOP
             S.aop = nullptr;          // the trellis shared pass keeps the in-CTA prologue (no shared scratch slot)
 #endif

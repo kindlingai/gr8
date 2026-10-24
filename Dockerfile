@@ -44,6 +44,11 @@ RUN mkdir -p /out \
 
 # the slowest step (fat LTO); it runs beside the engine builds
 FROM rust AS front
+# the xgrammar crate builds XGrammar's C++ (json_schema grammars) with CMake and clang, and binds it through libclang
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake clang libclang-dev \
+ && rm -rf /var/lib/apt/lists/*
 COPY frontend/g6front-rs frontend/g6front-rs
 # from the crate's directory, so rustup reads its rust-toolchain.toml
 WORKDIR /src/frontend/g6front-rs
@@ -68,6 +73,10 @@ COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
 FROM engine-src AS engine
 ARG G6_WIDTHS=
 RUN G6_WIDTHS="$G6_WIDTHS" scripts/build.sh /out/bin
+
+# GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 2, 3 and 4
+FROM engine-src AS engine-flash
+RUN MODEL=flash scripts/build.sh /out/bin
 
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
@@ -94,6 +103,7 @@ COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /out/bin/gpuprobe /out/bin/tr3_e
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
 COPY --from=kvman /out/kvman-remote /bin/
+COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
 
 FROM scratch AS dist-int4
 COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/
@@ -103,13 +113,13 @@ COPY --from=dist-fp8 / /
 COPY --from=dist-int4 / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
-# libibverbs1 + ibverbs-providers (mlx5) for the fabric, ibverbs-utils for ibv_devinfo, python3 for the shims,
-# python3-numpy + libxxhash0 for tools/convert, curl + jq for smoketest/run.sh (./gr8 glm53 smoke). Every engine here
+# libibverbs1 + ibverbs-providers (mlx5) for the fabric, ibverbs-utils for ibv_devinfo, python3 for the shims and
+# the launcher, curl + jq for smoketest/run.sh (./gr8 glm53 smoke). Every engine here
 # serves through S2, so nothing in the container uses ssh. The runtime base already has cuBLAS.
 # hadolint ignore=DL3008
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils python3 python3-numpy \
-      libxxhash0 curl jq \
+ && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils python3 \
+      curl jq \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/gr8
 COPY . .

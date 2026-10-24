@@ -3,6 +3,8 @@
 #include "../h2d.h"
 #include "kvfmt.h"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <climits>
 #include <initializer_list>
 #include <vector>
@@ -21,6 +23,29 @@ __global__ void transpose_uk(const uint16_t* src, uint16_t* dst, int n) {
         dst[i] = src[(h * 192 + d) * 512 + k];
     }
 }
+// #50: the FP8 UK and its scales, transposed as transpose_uk does the BF16 one: [h][192][512] -> [h][512][192] (bytes),
+// scales [h][192][4] -> [h][4][192]
+__global__ void transpose_uk8(const uint8_t* src, uint8_t* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        int h = i / (512 * 192), k = (i / 192) % 512, d = i % 192;
+        dst[i] = src[(h * 192 + d) * 512 + k];
+    }
+}
+__global__ void transpose_uks(const float* src, float* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        int h = i / (4 * 192), c = (i / 192) % 4, d = i % 192;
+        dst[i] = src[(h * 192 + d) * 4 + c];
+    }
+}
+__global__ void kvb_bf16(const uint8_t* src, const float* scale, __nv_bfloat16* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        __nv_fp8_e4m3 b; b.__x = src[i];
+        dst[i] = __float2bfloat16_rn((float)b * scale[(i / 512) * 4 + (i % 512) / 128]);
+    }
+}
 __global__ void identity_pages(int* table, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) table[i] = i;
@@ -30,7 +55,7 @@ constexpr int invalid = (int)cudaErrorInvalidValue;
 
 #if defined(G6_CP) && G6_CP
 static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity, int max_rows,
-    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr);
+    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys);
 #endif
 extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile) {
     if (capacity <= 0 || max_rows <= 0 || query_tile <= 0 || query_tile > 64 || capacity > INT_MAX / query_tile) return 0;
@@ -47,28 +72,34 @@ extern "C" int g6_attn_bind_create(G6AttnBinding* out, const G6AttnPack* p,
 #if defined(G6_CP) && G6_CP
 extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
-    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, 0, 0);
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, 0, 0, 0);
 }
 extern "C" int g6_attn_bind_create_cp(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
     int max_rows, int query_tile, int cp_R, int cp_nr, void* s, void* ext_scratch, size_t ext_bytes) {
-    if (cp_nr < 2 || cp_nr > 8 || rank >= cp_nr || cp_R < 0 || cp_R % 64) return invalid;
-    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, cp_R, cp_nr);
+    return g6_attn_bind_create_cp_phys(out, p, rank, layer, capacity, max_rows, query_tile, cp_R, cp_nr, 0, s, ext_scratch, ext_bytes);
+}
+extern "C" int g6_attn_bind_create_cp_phys(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
+    int max_rows, int query_tile, int cp_R, int cp_nr, int cp_phys, void* s, void* ext_scratch, size_t ext_bytes) {
+    if (cp_nr < 2 || cp_nr > 8 || rank >= cp_nr || cp_R < 0 || cp_R % 64 || cp_phys < 0 || (cp_phys && cp_phys < cp_R / 64)) return invalid;
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, cp_R, cp_nr, cp_phys);
 }
 static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity, int max_rows,
-    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr) {
+    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys) {
 #else
 extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
 #endif
-    if (!out || out->storage || !p || rank < 0 || rank >= g6nr::NR || layer < 0 || layer > 78 ||
+    if (!out || out->storage || !p || rank < 0 || rank >= g6nr::NR || layer < 0 || layer > geom::MTP_LAYER ||
         capacity <= 0 || max_rows <= 0 || max_rows > capacity || query_tile <= 0 ||
         query_tile > 64 || capacity > INT_MAX / query_tile) return invalid;
     // head group of this rank at this layer: (rank - layer) % NR, the larger groups first (TP6 edges
     // 0,11,22,33,44,54,64; TP4 16 heads each)
     const int group = (rank - layer % g6nr::NR + g6nr::NR) % g6nr::NR;
     const int h = g6nr::width(g6nr::HEADS, group);
-    const bool full = layer == 78 || layer <= 2 || (layer - 2) % 4 == 0;
+    const bool full = geom::full_index(layer);
+    const bool fp8 = p->uks.data || p->uvs.data;   // #50: E4M3 UK / UV with block scales
     if (!shape(p->uk, {h,192,512}) || !shape(p->uv, {h,256,512}) ||
+        (fp8 && (!shape(p->uks, {h,192,4}) || !shape(p->uvs, {h,256,4}))) ||
         !shape(p->kv_norm, {512}) ||
         (full && (!shape(p->index_norm, {128}) || !shape(p->index_bias, {128})))) return invalid;
 
@@ -88,12 +119,12 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
         cp_table.resize(a.table_size);
         int phys = 0;
         for (int lp = 0; lp < a.table_size; ++lp)
-            cp_table[lp] = (lp < cp_R / 64 || lp % cp_nr == rank) ? phys++ : G6_CP_REMOTE;
-        a.page_count = phys;
+            cp_table[lp] = (lp < cp_R / 64 || lp % cp_nr == rank) ? (cp_phys && phys >= cp_phys ? -1 : phys++) : G6_CP_REMOTE;
+        a.page_count = phys;   // cp_phys: at most that many; the pages past it have none in the table as built
     }
 #endif
     a.query_tile = query_tile;
-    a.kv_norm = p->kv_norm.data; a.uv = p->uv.data;
+    a.kv_norm = p->kv_norm.data; a.uv = p->uv.data; a.uvs = fp8 ? (const float*)p->uvs.data : nullptr;
     a.index_norm = full ? p->index_norm.data : nullptr;
     a.index_bias = full ? p->index_bias.data : nullptr;
 #if defined(G6_CP) && G6_CP
@@ -107,7 +138,8 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     if (!b.scratch_bytes || (ext_scratch && ext_bytes < b.scratch_bytes)) return invalid;
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
-    const size_t uk = take((size_t)h * 512 * 192 * 2);
+    const size_t uk = take((size_t)h * 512 * 192 * (fp8 ? 1 : 2));
+    const size_t uks = take(fp8 ? (size_t)h * 4 * 192 * sizeof(float) : 0);
     const size_t kv = take((size_t)a.page_count * 64 * g6kv::ROW);
     // Shared layers never append/index their own indexer cache. Index keys sit on the same pages as the latent (under
     // CP: the replicated prefix and this rank's pages past R), so the index cache has the latent's page count.
@@ -122,7 +154,7 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     cudaError_t e = cudaMalloc(&b.storage, used);
     if (e != cudaSuccess) return (int)e;
     char* base = (char*)b.storage;
-    a.uk = base + uk; a.mla_cache = base + kv;
+    a.uk = base + uk; a.uks = fp8 ? (const float*)(base + uks) : nullptr; a.mla_cache = base + kv;
     a.index_cache = full ? base + ix : nullptr;
     a.block_table = (int*)(base + table); a.indices = (int*)(base + ids);
     a.output = base + output; a.error = (unsigned*)(base + error);
@@ -130,6 +162,12 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     cudaStream_t stream = (cudaStream_t)s;
     e = cudaMemsetAsync(b.storage, 0, used, stream);
     if (e == cudaSuccess) {
+        if (fp8) {
+            transpose_uk8<<<(h * 512 * 192 + 255) / 256,256,0,stream>>>(
+                (const uint8_t*)p->uk.data, (uint8_t*)const_cast<void*>(a.uk), h * 512 * 192);
+            transpose_uks<<<(h * 4 * 192 + 255) / 256,256,0,stream>>>(
+                (const float*)p->uks.data, const_cast<float*>(a.uks), h * 4 * 192);
+        } else
         transpose_uk<<<(h * 512 * 192 + 255) / 256,256,0,stream>>>(
             (const uint16_t*)p->uk.data, (uint16_t*)const_cast<void*>(a.uk), h * 512 * 192);
 #if defined(G6_CP) && G6_CP
@@ -200,6 +238,12 @@ extern "C" int g6_attn_bind_reset(G6AttnBinding* b, void* s) {
     if (e == cudaSuccess) e = cudaMemsetAsync(a.output, 0, (size_t)b->max_rows * a.heads * 256 * 2, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
     return (int)e;
+}
+extern "C" int g6_attn_kvb_bf16(const void* fp8, const float* scale, void* bf16, int rows, void* s) {
+    if (!fp8 || !scale || !bf16 || rows <= 0 || rows > INT_MAX / 512) return invalid;
+    const int n = rows * 512;
+    kvb_bf16<<<(n + 255) / 256,256,0,(cudaStream_t)s>>>((const uint8_t*)fp8, scale, (__nv_bfloat16*)bf16, n);
+    return (int)cudaGetLastError();
 }
 extern "C" int g6_attn_bind_release(G6AttnBinding* b) {
     if (!b) return invalid;

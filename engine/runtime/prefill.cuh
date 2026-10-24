@@ -82,7 +82,7 @@ __global__ void __launch_bounds__(128) k_put_publish_n(const uint4* src, g6::Fab
 inline void pf_env_check()
 {
     std::string e;
-    if (env_choice("G6_PF_DRAFT_SHARE", 1, 0, &e) < 0) die(e);
+    if (env_choice("G6_PF_DRAFT_SHARE", 1, 1, &e) < 0) die(e);
     if (env_choice("G6_PF_QP_EARLY", 2, 0, &e) < 0) die(e);          // G6_PF_OWN=4 (qp.cuh)
     if (env_choice("G6_PF_QP_WARM", 1, 0, &e) < 0) die(e);
     const int roll = env_choice("G6_PF_QP_ROLL", 4, 0, &e);       // 0 = resident pair pack, 2..4 = rolling slots
@@ -93,14 +93,15 @@ inline void pf_env_check()
     if (env_choice("G6_CP_PF_HASH2", 1, 1, &e) < 0) die(e);   // HASH2 build: unset / 1 = hash2, 0 = k_cp_pf_hash, else exit
 #endif
 }
-// G6_PF_DRAFT_SHARE=1: the MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of
-// allocating a second root of the same size. Unset / 0 = today's behaviour exactly.
-inline bool pf_draft_share()
+// G6_PF_DRAFT_SHARE: the MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of
+// allocating a second root of the same size (about 2 GB at a 655,360-token pool). Unset: when the target has one;
+// 1: required (exits without it); 0: a root of its own.
+inline int pf_draft_share()
 {
     std::string e;
-    const int v = env_choice("G6_PF_DRAFT_SHARE", 1, 0, &e);
+    const int v = env_choice("G6_PF_DRAFT_SHARE", 1, 1, &e);
     if (v < 0) die(e);
-    return v == 1;
+    return v == 1 ? (getenv("G6_PF_DRAFT_SHARE") ? 1 : 2) : 0;   // 2: the default, falls back quietly
 }
 __host__ __device__ inline int pf_r0(int M, int p, int nr) { return p * M / nr; }          // first row of rank p
 __host__ __device__ inline int pf_rows(int M, int p, int nr) { return pf_r0(M, p + 1, nr) - pf_r0(M, p, nr); }
@@ -644,6 +645,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.back().fc1_wide = y.T.fc1_wide;      // decode widened tr3.fc1 in place: prefill must read the same order
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
         P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths)
+        P.T.back().k3 = y.T.k3;                  // 3-bit units (scan_widths)
         P.T.back().sh_trellis = y.T.sh_trellis;  // the shared expert as trellis row 256
         if (y.T.shfp8.codes[0])                  // ... and its FP8 copy for the prefill GEMMs (bind::make_shared_fp8)
         {
@@ -1650,7 +1652,7 @@ struct DraftPrefill
     std::map<int, bindp::Gemm> eh;    // by row count
 };
 // D.d must have been built with max_rows >= Mmax (build_draft(..., max_rows)). f: any prefill-sized region (unused).
-// tc: the target model's prefill of the same rank. With G6_PF_DRAFT_SHARE=1 the draft layer's tensor-core prefill
+// tc: the target model's prefill of the same rank. With G6_PF_DRAFT_SHARE the draft layer's tensor-core prefill
 // state borrows that prefill's scratch root (-1 root allocation) instead of allocating a second identical one; the
 // draft pass runs on the stream the target prefill was joined and synchronized on, so the uses stay serialized.
 inline void build_draft_prefill(DraftPrefill& Q, Draft& D, const Find& find, int Mmax, const g6::FabricDev& f, bool v2, cudaStream_t st,
@@ -1658,21 +1660,23 @@ inline void build_draft_prefill(DraftPrefill& Q, Draft& D, const Find& find, int
 {
     Q.P.v2 = v2;
     G6AttnPrefill* root = nullptr;
-    if (pf_draft_share())
+    const int share = pf_draft_share();
+    const bool can = v2 && tc && !tc->av.empty();
+    if (share == 1 && !v2) die("G6_PF_DRAFT_SHARE=1 needs --pfv2 (without it there is no tensor-core prefill scratch to share)");
+    if (share == 1 && !can) die("G6_PF_DRAFT_SHARE=1: the target prefill has no tensor-core attention states to share");
+    if (share && can)
     {
-        if (!v2) die("G6_PF_DRAFT_SHARE=1 needs --pfv2 (without it there is no tensor-core prefill scratch to share)");
-        if (!tc || tc->av.empty()) die("G6_PF_DRAFT_SHARE=1: the target prefill has no tensor-core attention states to share");
         root = tc->av.front();
-        fprintf(stderr, "# rank %d: G6_PF_DRAFT_SHARE=1: MTP draft prefill borrows the target prefill's tensor-core scratch\n", D.d.rank);
+        fprintf(stderr, "# rank %d: G6_PF_DRAFT_SHARE: MTP draft prefill borrows the target prefill's tensor-core scratch\n", D.d.rank);
     }
     build_prefill(Q.P, D.d, find, Mmax, f, dmalloc<u64>(1), st, nullptr, root);
     const size_t n = (size_t)Mmax;
     Q.eh_in = dmalloc<__half>(n * 2 * HID);
     Q.eh_out = dmalloc<__half>(n * HID);
     Q.x8 = dmalloc<uint8_t>((n + 15) / 16 * (2 * HID / 32) * bindp::REC);
-    Q.codes = as_bind(find("L078.eh.mx.codes"));
-    Q.scales = as_bind(find("L078.eh.mx.scales"));
-    if (!Q.codes.p || !Q.scales.p) die("pack has no L078.eh.mx.codes / .scales (MTP prefill)");
+    Q.codes = as_bind(find(G6_MTP_L ".eh.mx.codes"));
+    Q.scales = as_bind(find(G6_MTP_L ".eh.mx.scales"));
+    if (!Q.codes.p || !Q.scales.p) die("pack has no " G6_MTP_L ".eh.mx.codes / .scales (MTP prefill)");
 }
 // host -> device: the rows' NEXT tokens and positions (the stream must be idle)
 inline void pf_draft_inputs(DraftPrefill& Q, int M, const int* next_tok, const int* pos) { pf_inputs(Q.P, M, next_tok, pos); }
@@ -1717,7 +1721,7 @@ inline void pf_draft(Draft& D, DraftPrefill& Q, const __half* hid, int M, int co
     if (!g.on)
     {
         if (const char* e = bindp::make_gemm(Q.codes, Q.scales, M, Q.x8, Q.eh_out, 0, g)) die(std::string("MTP prefill eh_proj: ") + e);
-        if (g.K != 2 * HID || g.N != HID) die("L078.eh.mx.codes is not [6144][12288]");
+        if (g.K != 2 * HID || g.N != HID) die(G6_MTP_L ".eh.mx.codes is not [HID][2 * HID]");
     }
     k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{P.tok, P.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, Q.eh_in});
     bindp::Xq xq;
@@ -1778,7 +1782,11 @@ inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
 constexpr int CP_KVB = g6kv::ROW;     // attn.cu KV_BYTES: one latent record (kvfmt.h)
 constexpr int CP_IXB = g6kv::IDX_ROW; // attn.cu IDX_BYTES: one index key; a page is 64 x 128 codes, then 64 FP32 scales
 constexpr int CP_PF_MAXNR = 8;
-struct CpPfSrc { const char* kv[CP_PF_MAXNR]; const int* table[CP_PF_MAXNR]; const char* ix[CP_PF_MAXNR]; };
+// Keep the GLM launch unchanged; the BF16 Flash record needs 64 + 9 lanes.
+constexpr int CP_BACK_THREADS = CP_KVB / 16 + 9 <= 64 ? 64 : 128;
+// np: each rank's physical pages; a table entry at or past it is a page the rows tier released (rt_rows.cuh rt_pf_stage
+// fills it)
+struct CpPfSrc { const char* kv[CP_PF_MAXNR]; const int* table[CP_PF_MAXNR]; const char* ix[CP_PF_MAXNR]; int np[CP_PF_MAXNR]; };
 // one page of 64 index keys, src -> dst (uint4 pieces of 64 x 132 B = 528), by the block's threads
 __device__ __forceinline__ void cp_pf_ix_page(const char* src, char* dst, int ps)
 {
@@ -1787,12 +1795,13 @@ __device__ __forceinline__ void cp_pf_ix_page(const char* src, char* dst, int ps
     for (size_t k = threadIdx.x; k < (size_t)ps * CP_IXB / 16; k += blockDim.x) d[k] = a[k];
 }
 // grid npages, block 256: logical page lp of a layer -> dst page lp, from rank (lp < Rp ? me : lp % nr) at its table;
-// ixoff != 0: its index keys too (s.ix[o], page pg) -> dst + ixoff, page lp
+// ixoff != 0: its index keys too (s.ix[o], page pg) -> dst + ixoff, page lp. A released page (pg >= np) is skipped
 __global__ void __launch_bounds__(256) k_cp_pf_gather(CpPfSrc s, char* dst, int nr, int me, int Rp, int ps, unsigned* err, size_t ixoff)
 {
     const int lp = blockIdx.x, o = lp < Rp ? me : lp % nr;
     const int pg = s.table[o][lp];
     if (pg < 0) { if (threadIdx.x == 0) atomicOr(err, 0x63000400u); return; }
+    if (pg >= s.np[o]) return;
     const size_t n = (size_t)ps * CP_KVB / 16;
     const uint4* a = reinterpret_cast<const uint4*>(s.kv[o] + (size_t)pg * ps * CP_KVB);
     uint4* d = reinterpret_cast<uint4*>(dst + (size_t)lp * ps * CP_KVB);
@@ -1801,7 +1810,7 @@ __global__ void __launch_bounds__(256) k_cp_pf_gather(CpPfSrc s, char* dst, int 
 }
 // grid n, block 64: row pos = a0 + blockIdx.x of the pool -> this rank's store, if it stores that page; ixoff != 0: the
 // row's index key too (128 B of codes, then its FP32 scale in the page's scale block) -> ix
-__global__ void __launch_bounds__(64) k_cp_pf_back(const char* pool, char* kv, const int* table, int a0, int ps, char* ix, size_t ixoff)
+__global__ void __launch_bounds__(CP_BACK_THREADS) k_cp_pf_back(const char* pool, char* kv, const int* table, int a0, int ps, char* ix, size_t ixoff)
 {
     const int pos = a0 + blockIdx.x, pg = table[pos / ps];
     if (pg == G6_CP_REMOTE) return;
@@ -1815,7 +1824,7 @@ __global__ void __launch_bounds__(64) k_cp_pf_back(const char* pool, char* kv, c
     if (t >= 0 && t < 8) reinterpret_cast<uint4*>(dp + off * 128)[t] = reinterpret_cast<const uint4*>(sp + off * 128)[t];
     if (t == 8) reinterpret_cast<float*>(dp + ps * 128)[off] = reinterpret_cast<const float*>(sp + ps * 128)[off];
 }
-static_assert(CP_KVB / 16 + 9 <= 64, "k_cp_pf_back: one thread per 16 B of a row and its index key");
+static_assert(CP_KVB / 16 + 9 <= CP_BACK_THREADS, "k_cp_pf_back: one thread per 16 B of a row and its index key");
 inline size_t cp_pf_mla_bytes(const Model& m)
 {
     const G6Attn& a = m.layers[0].ab.args;
@@ -1872,6 +1881,7 @@ inline void cp_pf_enter(Model& m)
         G6Attn& a = m.layers[i].ab.args;
         m.cp.pf_saved.push_back(a);
         a.mla_cache = m.cp.pf_pool[(m.cp.pf_g0 + i) % 2]; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
+        a.rt_page = nullptr; a.rt_group = nullptr;   // the staging pool's pages are not the pool's: no remote rows here
         if (m.cp.pf_ixon && a.index_cache) a.index_cache = (char*)a.mla_cache + m.cp.pf_ixoff;   // the staged index keys
 #ifdef DEC_S2
         // S2 below R: the decode views read the run's index keys through its table, so the staged view does too
@@ -1897,6 +1907,7 @@ inline CpPfSrc cp_pf_src(const std::vector<Model>& R, int i)
         if (!m.cp.pf_staged) die("G6_CP prefill: gather outside the staged view");
         s.kv[m.rank] = (const char*)m.cp.pf_saved[i].mla_cache; s.table[m.rank] = m.cp.pf_saved[i].block_table;
         s.ix[m.rank] = (const char*)m.cp.pf_saved[i].index_cache;
+        s.np[m.rank] = m.cp.pf_saved[i].page_count;
     }
     return s;
 }
@@ -1912,7 +1923,7 @@ inline void cp_pf_gather(Model& m, const CpPfSrc& s, int i, int start, cudaStrea
 inline void cp_pf_back(Model& m, int i, int a0, int n, cudaStream_t st)
 {
     const G6Attn& a = m.cp.pf_saved[i];
-    if (n > 0) k_cp_pf_back<<<n, 64, 0, st>>>(m.cp.pf_pool[cp_pf_k(m, i)], (char*)a.mla_cache, a.block_table, a0, a.page_size, (char*)a.index_cache, cp_pf_ixoff(m, i));
+    if (n > 0) k_cp_pf_back<<<n, CP_BACK_THREADS, 0, st>>>(m.cp.pf_pool[cp_pf_k(m, i)], (char*)a.mla_cache, a.block_table, a0, a.page_size, (char*)a.index_cache, cp_pf_ixoff(m, i));
 }
 // ---- real fabric (g6m4): the pools are the registered area of a bulk-mode Fabric, identical layout on
 // every rank. Use g of pool k = g % 2: begin(g) = local fill of the pages I hold (lp < R/64 or my pages) + doorbell k;
@@ -1934,14 +1945,15 @@ struct CpPfNet
 #endif
 };
 // grid npages, block 256: pages this rank holds (lp < Rp or lp % nr == me) of its store -> pool (ixoff != 0: and their
-// index keys, ix -> dst + ixoff)
+// index keys, ix -> dst + ixoff). A page at or past npg was released by the rows tier (CpState::rt_stage fills it)
 __global__ void __launch_bounds__(256) k_cp_pf_fill(const char* kv, const int* table, char* dst, int nr, int me, int Rp, int ps, unsigned* err,
-                                                    const char* ix, size_t ixoff)
+                                                    const char* ix, size_t ixoff, int npg)
 {
     const int lp = blockIdx.x;
     if (lp >= Rp && lp % nr != me) return;
     const int pg = table[lp];
     if (pg < 0) { if (threadIdx.x == 0) atomicOr(err, 0x63000400u); return; }
+    if (pg >= npg) return;
     const size_t n = (size_t)ps * CP_KVB / 16;
     const uint4* a = reinterpret_cast<const uint4*>(kv + (size_t)pg * ps * CP_KVB);
     uint4* d = reinterpret_cast<uint4*>(dst + (size_t)lp * ps * CP_KVB);
@@ -2067,6 +2079,18 @@ inline unsigned long long cp_pf_mismatches(Model& m)
     if (m.cp.pf_net) G6RT_CK(cudaMemcpy(&c, cp_pf_net(m).vcount, 8, cudaMemcpyDeviceToHost));
     return c;
 }
+// the local half of begin(layer i): the pages below start this rank holds -> its pool k, the ones the rows tier released
+// from the store (CpState::rt_stage). m4sim's G6_CP_PF_NET runs it too, then copies each rank's tail pages as the proxy
+// would, so the staging code it tests is this one.
+inline void cp_pf_fill_local(Model& m, int i, int start, unsigned* err, cudaStream_t st)
+{
+    const G6Attn& a = m.cp.pf_saved[i];
+    const int k = cp_pf_k(m, i), ps = a.page_size, Rp = m.cp.R / ps, np = (start + ps - 1) / ps, nr = g6nr::NR;
+    const size_t ixoff = cp_pf_ixoff(m, i);
+    if (np) k_cp_pf_fill<<<np, 256, 0, st>>>((const char*)a.mla_cache, a.block_table, m.cp.pf_pool[k], nr, m.rank, Rp, ps, err,
+                                             (const char*)a.index_cache, ixoff, a.page_count);
+    if (m.cp.rt_stage) m.cp.rt_stage(i, start, m.cp.pf_pool[k], ixoff, st);
+}
 // begin(layer i): local fill of pool k, (verify) my hash -> aux_out[k], doorbell k; proxy job S(g)
 inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
 {
@@ -2076,8 +2100,7 @@ inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
     const unsigned long long g = m.cp.pf_g0 + i;
     G6RT_CK(cudaStreamWaitEvent(st, n.done[k], 0));    // my previous use of pool k (g - 2) is over (both lanes)
     const size_t ixoff = cp_pf_ixoff(m, i);
-    if (np) k_cp_pf_fill<<<np, 256, 0, st>>>((const char*)a.mla_cache, a.block_table, m.cp.pf_pool[k], nr, m.rank, Rp, ps, n.bd.error,
-                                             (const char*)a.index_cache, ixoff);
+    cp_pf_fill_local(m, i, start, n.bd.error, st);   // before the hash and the doorbell read the pool
 #if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
     if (n.verify && n.hash2)
     {

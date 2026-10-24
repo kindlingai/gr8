@@ -97,6 +97,17 @@ struct SpecLen
         const double pool = (k + prior * r) / (n + prior);
         return (bk[j][b] + prior * pool) / (bn[j][b] + prior);
     }
+#if G6_MODEL_FLASH
+    // Flash TP2, 45 layers: verify ms by rows 1..8 (median main step at M rows, full clock) and the MTP draft costs
+    // (first-form pass, chain step). Replaces the TP4 table, which is about 1.5x slower at 1-2 rows.
+    void flash_tp2()
+    {
+        static const double t[KX + 2] = {0, 28.7, 37.9, 45.7, 52.3, 59.0, 65.6, 71.7, 77.5};
+        std::copy(t, t + KX + 2, table);
+        draft_round = 2.8;
+        draft_each = 2.2;
+    }
+#endif
     double verify_ms(int rows) const { return table[std::min(std::max(rows, 1), KX + 1)]; }
     double draft_ms(int drafted) const { return draft_round + draft_each * std::max(0, drafted - 1); }
 

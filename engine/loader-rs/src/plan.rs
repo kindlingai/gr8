@@ -11,7 +11,7 @@ const HALF_PER_BIT: u64 = 98304;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Op {
     Copy,
-    Item128,
+    Item128 { hidden: usize },
     /// bytes from Plan::mems[file]; file_off is unused
     Mem,
     /// bytes Plan::gens[file] computes at load. file_off is unused
@@ -23,27 +23,43 @@ pub enum Op {
 /// computed once.
 pub struct Gen {
     pub what: String,
-    nbytes: u64,
+    pub nbytes: u64,
     make: Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>,
     state: Mutex<Option<Arc<Vec<u8>>>>,
     left: AtomicU64,
+    pub compute_ns: AtomicU64,
+    pub wait_ns: AtomicU64,
 }
 
 impl Gen {
     pub fn new(what: String, nbytes: u64, make: Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>) -> Gen {
-        Gen { what, nbytes, make, state: Mutex::new(None), left: AtomicU64::new(nbytes) }
+        Gen {
+            what,
+            nbytes,
+            make,
+            state: Mutex::new(None),
+            left: AtomicU64::new(nbytes),
+            compute_ns: AtomicU64::new(0),
+            wait_ns: AtomicU64::new(0),
+        }
     }
 
     /// The bytes, computing them on first use.
     pub fn get(&self) -> Result<Arc<Vec<u8>>, String> {
+        let t_lock = std::time::Instant::now();
         let mut s = self.state.lock().unwrap();
+        let lock_ns = t_lock.elapsed().as_nanos() as u64;
         if let Some(a) = &*s {
+            self.wait_ns.fetch_add(lock_ns, Ordering::Relaxed);
             return Ok(a.clone());
         }
+        self.wait_ns.fetch_add(lock_ns, Ordering::Relaxed);
         if self.left.load(Ordering::Relaxed) < self.nbytes {
             return Err(format!("{}: computed twice", self.what));
         }
+        let t_comp = std::time::Instant::now();
         let v = (self.make)().map_err(|e| format!("{}: {e}", self.what))?;
+        self.compute_ns.store(t_comp.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if v.len() as u64 != self.nbytes {
             return Err(format!("{}: {} bytes computed, {} planned", self.what, v.len(), self.nbytes));
         }
@@ -166,7 +182,7 @@ impl Plan {
     }
 
     pub fn max_item128(&self) -> u64 {
-        self.segs.iter().filter(|s| s.op == Op::Item128).map(|s| s.nbytes).max().unwrap_or(0)
+        self.segs.iter().filter(|s| matches!(s.op, Op::Item128 { .. })).map(|s| s.nbytes).max().unwrap_or(0)
     }
 }
 
@@ -191,10 +207,10 @@ fn parse_sources(path: &str, root: Option<&str>, pack_bytes: u64, files: &mut Ve
         let (pack_off, nbytes, file_off, file_nbytes) = (num(0)?, num(1)?, num(3)?, num(4)?);
         let op = match f[2] {
             "copy" => Op::Copy,
-            "item128" => Op::Item128,
+            "item128" => Op::Item128 { hidden: 6144 },
             o => return Err(format!("{path}:{}: unknown op {o}", n + 2)),
         };
-        if nbytes == 0 || nbytes != file_nbytes || (op == Op::Item128 && nbytes % HALF_PER_BIT != 0) {
+        if nbytes == 0 || nbytes != file_nbytes || (matches!(op, Op::Item128 { .. }) && nbytes % HALF_PER_BIT != 0) {
             return Err(format!("{path}:{}: bad range size", n + 2));
         }
         if pack_off < end || pack_off.checked_add(nbytes).map_or(true, |e| e > pack_bytes) {
@@ -212,9 +228,15 @@ fn parse_sources(path: &str, root: Option<&str>, pack_bytes: u64, files: &mut Ve
 
 /// v2 item128 down half -> gr8 fc2 order: out[a][c][b] = in[a][b][c] for a < 48 and b, c < 8, tiles of n / 3072 bytes
 /// (tools/convert/v2.py down_to_g6).
+#[cfg(test)]
 pub fn item128_to_g6(src: &[u8], dst: &mut [u8]) {
-    let tb = src.len() / 3072;
-    for a in 0..48 {
+    item128_to_g6_geometry(src, dst, 6144);
+}
+
+pub fn item128_to_g6_geometry(src: &[u8], dst: &mut [u8], hidden: usize) {
+    let groups = hidden / 128;
+    let tb = src.len() / (groups * 64);
+    for a in 0..groups {
         for b in 0..8 {
             for c in 0..8 {
                 let (o, i) = (((a * 8 + c) * 8 + b) * tb, ((a * 8 + b) * 8 + c) * tb);

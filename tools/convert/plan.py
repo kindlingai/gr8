@@ -29,13 +29,13 @@ def widths(n, nr):
 def set_nr(nr):
     """Pick the rank count. The engine build must match (-DG6_NR=nr)."""
     global NR, W_HEADS, WB, VOCAB_TILES, W_DENSE
-    if nr not in (3, 6) and (nr <= 0 or 64 % nr):
-        raise ValueError(f'rank count {nr}: 6 or a divisor of 64 (engine/g6nr.h)')
+    if nr not in (3, 5, 6) and (nr <= 0 or 64 % nr):
+        raise ValueError(f'rank count {nr}: 3, 5, 6 or a divisor of 64 (engine/g6nr.h)')
     NR = nr
     W_HEADS = widths(N_HEADS, nr)        # heads / shared-expert groups
     WB = widths(N_BLOCKS, nr)            # expert 128-blocks
     VOCAB_TILES = widths(N_VTILES, nr)
-    W_DENSE = widths(N_DENSE_G, nr)
+    W_DENSE = tuple(4 * w for w in widths(N_DENSE_G // 4, nr))   # whole 128-channel blocks (same as g32 at 3/4/6/8)
 
 
 set_nr(6)

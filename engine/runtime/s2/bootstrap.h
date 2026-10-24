@@ -92,7 +92,7 @@ struct BootstrapConfig {
     uint16_t port = 0;
     void validate() const {
         scheduler.validate();
-        require((ranks == 3 || ranks == 4 || ranks == 6) && rank < ranks, "invalid control rank count");
+        require((ranks == 2 || ranks == 3 || ranks == 4 || ranks == 5 || ranks == 6) && rank < ranks, "invalid control rank count");
         (void)address(head_ip, port); (void)deadline(timeout);
         require(!directory.empty() && !runtime_signature.empty(), "missing bootstrap directory/runtime signature");
     }
@@ -101,6 +101,8 @@ struct BootstrapConfig {
             std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) +
             (scheduler.decode_prefill_rows ? " dpf " + std::to_string(scheduler.decode_prefill_rows) : std::string()) +
             (scheduler.decode_rounds > 1 ? " dr " + std::to_string(scheduler.decode_rounds) : std::string()) +
+            (scheduler.cp_step_rows ? " cpsr " + std::to_string(scheduler.cp_step_rows) + (scheduler.cp_seg ? " seg" : "") +
+                                      " after " + std::to_string(scheduler.cp_after) : std::string()) +
             " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
     }
 };

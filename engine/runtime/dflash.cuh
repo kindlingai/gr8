@@ -1,6 +1,6 @@
 // DFlash2 block drafter: one rank's draft step, as launch helpers in fabric phases.
 //
-// The drafter (a separate pack per rank, tools/convert/dflash2.py) drafts a block of K = 7 tokens in one forward:
+// The drafter (a separate pack per rank, engine/loader-rs/src/dflash2.rs) drafts a block of K = 7 tokens in one forward:
 //   context  for every accepted row of the last target step: the target residual after the layers in
 //            target_layer_ids (6), concatenated -> fc (this rank's 6144/NR columns) -> all-gather (collective 0) ->
 //            hidden_norm -> per drafter layer j: k_norm(k_proj) with RoPE and v_proj of this rank's KV heads, stored in
@@ -21,6 +21,15 @@
 // so a step reads at most 2055 positions; DflIn::lo is the lowest position written for this sequence.
 // The draft step has its own fabric region (NC collectives, decode-sized slots), step counter and DflIn / DflOut, and
 // runs as one captured graph (dfl_step), or phase by phase with a loopback driver delivering between phases (dfl_phase).
+// Replicated body (dfl::REP: a width whose ranks cannot split the 8 KV heads, TP=6): every rank runs the whole body on
+// the target residual taps, which are already the same on every rank, so the body has no collective. fc, q, kv and gu
+// are full-width; o_proj and down_proj stay TP4's four K-slices (D<j>.o<v>.gv, D<j>.down<v>.gv), each into its own BF16
+// partial, summed p = 0..3 by the same consume kernel through a local fabric view (rank -1, ncoll 0: peer p's slot is
+// recv + p x stride). A GEMV output tile's bits depend only on its record tile, K, ks and the input (densev.cuh
+// gv_gemv_body), so every row and the drafts are TP4's (selector mode: tokens and lp; argmax mode: tokens, its lp is
+// summed per vocab slice). Real collectives left: the head (2L + 1) and the fill's NT feature gathers, plus the fill's
+// collective NT with no payload (a barrier: a rank publishes the next fill's gathers only after every peer received
+// this one's, so the proxy never misses a doorbell). Two query steps of a rank are always separated by a target step.
 // The target step writes its residual rows after the tapped layers into Dfl::feat (Model::dfl_tap, inside its graph).
 // Prompt context: the prefill sub-batches write the owner rows of the last WIN prompt positions into Dfl::pf_feat
 // (Prefill::dfl_tap); after the prefill, fill steps gather them 8 rows at a time (collectives 0..NT-1: every rank's rows,
@@ -35,9 +44,13 @@ namespace dfl
 constexpr int B = 8, K = B - 1;               // block rows (bonus + drafts) = verify rows
 constexpr int L = 6, NT = 6;                  // drafter layers, tapped target layers
 constexpr int HD = 128, NH = 64, NKV = 8, INTER = 12288;
-constexpr bool OK_NR = NKV % g6nr::NR == 0;   // TP4 (and TP1/2/8); a TP6 build compiles but refuses --dflash
-constexpr int NHR = OK_NR ? NH / g6nr::NR : 1, NKR = OK_NR ? NKV / g6nr::NR : 1;
-constexpr int NIR = OK_NR ? INTER / g6nr::NR : 16, NFR = OK_NR ? HID / g6nr::NR : 16;
+constexpr bool OK_NR = NKV % g6nr::NR == 0;   // TP4 (and TP1/2/8): the body split across the ranks
+constexpr bool REP = !OK_NR;                  // TP6 (TP3 builds, g6m4 refuses it): the replicated body (header)
+constexpr int DNR = REP ? 1 : g6nr::NR;       // the body's split
+constexpr int NHR = NH / DNR, NKR = NKV / DNR;
+constexpr int NIR = INTER / DNR, NFR = HID / DNR;
+constexpr int KS = REP ? 4 : 1;               // REP: o_proj / down_proj K-slices (TP4's ranks), each its own partial
+constexpr int KO = NH * HD / 4, KD = INTER / 4;   // REP: their K (2048, 3072)
 constexpr int RING = 4096, WIN = 2048;
 constexpr int GS = 16, NG = HID / GS, CPO = 4 * NG;    // conv group size, groups, kernel_projection outputs (2 sides x 2 taps)
 constexpr int TOPK = 16, SELR = 256;
@@ -71,6 +84,7 @@ struct DflOut
 struct DLayer
 {
     bind::Gv kvc, ac, q, kv, o, mc, gu, down;
+    bind::Gv ok[dfl::KS], dk[dfl::KS];   // REP: o_proj / down_proj K-slice v (o and down unused)
     const __nv_bfloat16 *in_norm = nullptr, *post_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
     const __nv_bfloat16 *abase = nullptr, *mbase = nullptr;   // [2 sides][2 taps][6144]
 };
@@ -79,10 +93,12 @@ struct Dfl
 {
     int rank = -1;
     bool sel = false;                 // DFlash2 selector walk (else argmax / gr8's sampler)
+    float sel_alpha = 1.f;            // G6_DFL_SEL_ALPHA: the walk's correction coefficient (draft tokens and lp only)
     int mask_id = 0;
     float theta = 1e6f, eps = 1e-5f;
     int tlayer[dfl::NT] = {};         // target_layer_ids
     g6::FabricDev f{};
+    g6::FabricDev lfc{}, lpart{};     // REP: local views of fco (nr 1) and the KS partials in part (nr KS); consumed at c = 0
     u64* stepp = nullptr;
     unsigned* tickets = nullptr;      // [NC]
     const DflIn* in = nullptr;        // pinned (real fabric) or device (loopback)
@@ -114,7 +130,7 @@ struct Dfl
     float* apart = nullptr;           // [NHR][SPLIT][B][HD + 4]
     __half* ao = nullptr;             // [B][NHR HD]
     u32 *xf_ao = nullptr, *xb_ao = nullptr;
-    uint16_t* part = nullptr;         // [B][6144] BF16 partial staging
+    uint16_t* part = nullptr;         // [B][6144] BF16 partial staging (REP: [KS][B][6144], slice v's partial at v)
     __half *guo = nullptr, *act = nullptr;      // [B][2 NIR], [B][NIR]
     u32 *xf_act = nullptr, *xb_act = nullptr;
     // head
@@ -416,7 +432,7 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
     glue::publish(a.f, a.c, g6::coll_seq(*a.stepp, a.c, a.f.ncoll), a.ticket);
 }
 // merge every rank's candidates -> global top-16 per row, then the walk, with prev = the bonus token at s = 1:
-//   score(c) = logit(c) + sum_i pred[prev][i] hp[s][i] succ[c][i]
+//   score(c) = logit(c) + alpha * sum_i pred[prev][i] hp[s][i] succ[c][i]   (alpha = Dfl::sel_alpha, 1 by default)
 //   pick = argmax of score * inv_temp + gumbel(row s's key, c), or of score when greedy
 //   prev = pick, s = s + 1, up to s = 7. lp_out = log-probability of the pick in softmax(score) over the 16
 // grid 1, block 256. Warp w < 7 merges row w + 1, then warp w scores candidates w and w + 8.
@@ -429,6 +445,7 @@ struct WalkArgs
     const glue::SampleRow* srow;
     int* tok_out;
     float* lp_out;
+    float alpha;                      // the correction's coefficient (1: the trained selector, exactly)
 };
 __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
 {
@@ -472,7 +489,7 @@ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
                 acc += __bfloat162float(a.pred[(size_t)prev * SELR + i]) * hp[i] * __bfloat162float(a.succ[(size_t)id * SELR + i]);
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-            if (l == 0) s_sc[cc] = s_l[s][cc] + acc;
+            if (l == 0) s_sc[cc] = s_l[s][cc] + a.alpha * acc;
         }
         __syncthreads();
         if (t == 0)
@@ -540,15 +557,24 @@ __global__ void __launch_bounds__(32) k_out(OutArgs a)
 }   // namespace dflk
 
 // ---------------------------------------------------------------- build
-// find: the drafter pack (tools/convert/dflash2.py); main: the built target model (embedding, lm_head, vocab slice).
+// find: the drafter pack (engine/loader-rs/src/dflash2.rs); main: the built target model (embedding, lm_head, vocab slice).
 // meta: manifest values (mask id, target layers, theta, eps). f: a fabric region with dfl::NC collectives and slots of at
 // least B x 6144 BF16. sel: the DFlash2 selector (needs D.sel.* in the pack).
+// REP: a kernel view of a local buffer as a fabric (rank -1, ncoll 0): peer_slot(f, step, 0, p) = base + p x stride, for
+// the consume kernels (k_ctx_norm, k_ar_conv_norm) at c = 0. Never published to or waited on.
+inline g6::FabricDev dfl_local(void* base, int nr, size_t stride)
+{
+    g6::FabricDev f{};
+    f.recv = static_cast<char*>(base);
+    f.rank = -1; f.nr = nr; f.ncoll = 0; f.stride = stride;
+    return f;
+}
 struct DflMeta { int mask_id = 0, nr = 0, block = 0, layers = 0, window = 0; int tl[dfl::NT] = {}; float theta = 0, eps = 0; bool sel = false; };
-// D.meta (tools/convert/dflash2.py META): int32 [17]
+// D.meta (engine/loader-rs/src/dflash2.rs META): int32 [17]
 inline DflMeta dfl_read_meta(const Find& find)
 {
     const TensorRef t = find("D.meta");
-    if (!t.p || t.nd != 1 || t.shape[0] != 17) die("dflash pack has no D.meta [17] (tools/convert/dflash2.py)");
+    if (!t.p || t.nd != 1 || t.shape[0] != 17) die("dflash pack has no D.meta [17] (engine/loader-rs/src/dflash2.rs)");
     int v[17];
     G6RT_CK(cudaMemcpy(v, t.p, sizeof v, cudaMemcpyDeviceToHost));
     DflMeta m;
@@ -604,7 +630,12 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     D.apart = dmalloc<float>((size_t)NHR * SPLIT * B * (HD + 4));
     D.ao = dmalloc<__half>((size_t)B * NHR * HD);
     D.xf_ao = frag(NHR * HD); D.xb_ao = frag(NHR * HD);
-    D.part = dmalloc<uint16_t>((size_t)B * HID);
+    D.part = dmalloc<uint16_t>((size_t)KS * B * HID);
+    if constexpr (REP)
+    {
+        D.lfc = dfl_local(D.fco, 1, (size_t)B * NFR * 4);
+        D.lpart = dfl_local(D.part, KS, (size_t)B * HID * 2);
+    }
     D.guo = dmalloc<__half>((size_t)B * 2 * NIR);
     D.act = dmalloc<__half>((size_t)B * NIR);
     D.xf_act = frag(NIR); D.xb_act = frag(NIR);
@@ -644,10 +675,18 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
         gv(p + "aconv.gv", 1, 16, D.xf_x, D.xb_x, D.dlt_a, gv::O_F32, HID, CPO, y.ac);
         gv(p + "q.gv", 1, 16, D.xf_xc, D.xb_xc, D.q, gv::O_F16, HID, NHR * HD, y.q);
         gv(p + "kv.gv", 1, 32, D.xf_xc, D.xb_xc, D.kvq, gv::O_F16, HID, 2 * NKR * HD, y.kv);
-        gv(p + "o.gv", 2, 8, D.xf_ao, D.xb_ao, D.part, gv::O_BF16, NHR * HD, HID, y.o);
+        if constexpr (REP)            // TP4's o_proj of rank v: K-slice v of ao (the M <= 8 fragment table is [K/16][64] u32)
+            for (int v = 0; v < KS; ++v)
+                gv(p + "o" + std::to_string(v) + ".gv", 2, 8, D.xf_ao + (size_t)v * KO / 16 * 64, D.xb_ao + (size_t)v * KO / 16 * 64,
+                   D.part + (size_t)v * B * HID, gv::O_BF16, KO, HID, y.ok[v]);
+        else gv(p + "o.gv", 2, 8, D.xf_ao, D.xb_ao, D.part, gv::O_BF16, NHR * HD, HID, y.o);
         gv(p + "mconv.gv", 1, 16, D.xf_x, D.xb_x, D.dlt_m, gv::O_F32, HID, CPO, y.mc);
         gv(p + "gu.gv", 2, 16, D.xf_xc, D.xb_xc, D.guo, gv::O_F16, HID, 2 * NIR, y.gu);
-        gv(p + "down.gv", 2, 8, D.xf_act, D.xb_act, D.part, gv::O_BF16, NIR, HID, y.down);
+        if constexpr (REP)
+            for (int v = 0; v < KS; ++v)
+                gv(p + "down" + std::to_string(v) + ".gv", 2, 8, D.xf_act + (size_t)v * KD / 16 * 64, D.xb_act + (size_t)v * KD / 16 * 64,
+                   D.part + (size_t)v * B * HID, gv::O_BF16, KD, HID, y.dk[v]);
+        else gv(p + "down.gv", 2, 8, D.xf_act, D.xb_act, D.part, gv::O_BF16, NIR, HID, y.down);
         y.in_norm = vec(p + "in_norm", HID);
         y.post_norm = vec(p + "post_norm", HID);
         y.q_norm = vec(p + "q_norm", HD);
@@ -673,9 +712,13 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     size_t wb = 0;
     auto gvb = [&](const bind::Gv& g) { wb += bind::gv_bytes(g); };
     gvb(D.fc);
-    for (const DLayer& y : D.ly) { gvb(y.kvc); gvb(y.ac); gvb(y.q); gvb(y.o); gvb(y.mc); gvb(y.gu); gvb(y.down); }
-    fprintf(stderr, "# rank %d: dflash drafter %s, records %.3f GB, ring %.1f MB, prompt taps %.1f MB, %s\n", D.rank,
-            sel ? "DFlash2 selector" : "argmax", wb / 1e9, 2.0 * L * NKR * RING * HD * 2 / 1e6, pf ? (double)WIN * NT * HID * 2 / 1e6 : 0.0,
+    for (const DLayer& y : D.ly)
+    {
+        gvb(y.kvc); gvb(y.ac); gvb(y.q); gvb(y.o); gvb(y.mc); gvb(y.gu); gvb(y.down);
+        if constexpr (REP) for (int v = 0; v < KS; ++v) { gvb(y.ok[v]); gvb(y.dk[v]); }
+    }
+    fprintf(stderr, "# rank %d: dflash drafter %s%s, records %.3f GB, ring %.1f MB, prompt taps %.1f MB, %s\n", D.rank,
+            sel ? "DFlash2 selector" : "argmax", REP ? " (replicated body)" : "", wb / 1e9, 2.0 * L * NKR * RING * HD * 2 / 1e6, pf ? (double)WIN * NT * HID * 2 / 1e6 : 0.0,
             D.fc.codec == bind::MXFP8 ? "MXFP8" : "BF16");
 }
 
@@ -711,7 +754,11 @@ inline void dfl_body_i4(Dfl& D, cudaStream_t st)
         if (n) { mx += b; i4 += n; }
     };
     cv(D.fc);
-    for (DLayer& y : D.ly) { cv(y.kvc); cv(y.kv); cv(y.ac); cv(y.q); cv(y.o); cv(y.mc); cv(y.gu); cv(y.down); }
+    for (DLayer& y : D.ly)
+    {
+        cv(y.kvc); cv(y.kv); cv(y.ac); cv(y.q); cv(y.o); cv(y.mc); cv(y.gu); cv(y.down);
+        if constexpr (dfl::REP) for (int v = 0; v < dfl::KS; ++v) { cv(y.ok[v]); cv(y.dk[v]); }
+    }
     fprintf(stderr, "# rank %d: G6_DFL_BODY_I4: drafter body INT4 g32 records, %.1f MB (MXFP8 %.1f MB)\n", D.rank, i4 / 1e6, mx / 1e6);
 }
 
@@ -724,6 +771,7 @@ inline void dfl_xfrag(const __half* src, int K_, u32* f16, u32* b16, cudaStream_
 }
 inline void dfl_put(Dfl& D, int c, cudaStream_t st)
 {
+    if constexpr (dfl::REP) return;   // the partials stay in part (Dfl::lpart)
     k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.part), D.f, D.stepp, c, dfl::B * (HID * 2 / 16), D.tickets + c);
 }
 inline void dfl_wait(Dfl& D, int c, size_t bytes, cudaStream_t st)
@@ -733,6 +781,7 @@ inline void dfl_wait(Dfl& D, int c, size_t bytes, cudaStream_t st)
 inline size_t dfl_payload(const Dfl& D, int c)
 {
     using namespace dfl;
+    if (REP && c < NC - 1) return 0;  // local: no bytes on the fabric (dfl_enqueue skips it)
     if (c == 0) return (size_t)B * NFR * 4;
     if (c == NC - 1) return D.sel ? (size_t)K * TOPK * sizeof(dflk::Cand) : glue::head_bytes(B, D.nc);
     return (size_t)B * HID * 2;
@@ -747,8 +796,24 @@ inline std::vector<uint32_t> dfl_sizes(const Dfl& D, bool query)
 inline std::vector<uint32_t> dfl_fill_sizes()
 {
     std::vector<uint32_t> v(dfl::NT, (uint32_t)(dfl::B * HID * 2));
-    v.push_back((uint32_t)(dfl::B * dfl::NFR * 4));
+    v.push_back(dfl::REP ? 0u : (uint32_t)(dfl::B * dfl::NFR * 4));   // REP: the barrier, no payload
     return v;
+}
+// hand the proxy a drafter step: sizes from dfl_sizes / dfl_fill_sizes. REP: the local collectives of a draft step
+// (0 .. NC-2; a fill step has none) are skipped, so the proxy neither waits for their doorbells nor sends them
+inline void dfl_enqueue(g6::Fabric& f, u64 step, const std::vector<uint32_t>& sizes, bool fill)
+{
+    if constexpr (dfl::REP)
+    {
+        g6::Fabric::Rs rs;
+        if (!fill) rs.skip = (1u << (dfl::NC - 1)) - 1u;
+        f.enqueue_step(step, sizes, rs);
+    }
+    else
+    {
+        (void)fill;
+        f.enqueue_step(step, sizes);
+    }
 }
 inline glue::HeadArgs dfl_head_args(Dfl& D)
 {
@@ -777,7 +842,8 @@ inline void dfl_attn(Dfl& D, int j, cudaStream_t st)
     dflk::k_attn<<<dim3(NHR, SPLIT), 256, 0, st>>>(dflk::AttnArgs{D.qf, ka.kr[0], ka.vr[0], D.cell, D.apart});
     dflk::k_attn_comb<<<dim3(NHR, B), 128, 0, st>>>(D.apart, D.ao);
     dfl_xfrag(D.ao, NHR * HD, D.xf_ao, D.xb_ao, st);
-    bind::launch(y.o, st);
+    if constexpr (REP) for (int v = 0; v < KS; ++v) bind::launch(y.ok[v], st);
+    else bind::launch(y.o, st);
     dfl_put(D, 1 + 2 * j, st);
 }
 // MLP block of layer j (from x = post_norm output) up to the publish of collective 2 + 2j
@@ -792,12 +858,19 @@ inline void dfl_mlp(Dfl& D, int j, cudaStream_t st)
     bind::launch(y.gu, st);
     dflk::k_silu<<<dim3(NIR / 256, B), 256, 0, st>>>(D.guo, D.act);
     dfl_xfrag(D.act, NIR, D.xf_act, D.xb_act, st);
-    bind::launch(y.down, st);
+    if constexpr (REP) for (int v = 0; v < KS; ++v) bind::launch(y.dk[v], st);
+    else bind::launch(y.down, st);
     dfl_put(D, 2 + 2 * j, st);
 }
 // consume collective c (a layer partial): conv finish with dlt / base side 1, residual, norm w -> x
 inline void dfl_consume(Dfl& D, int c, const float* dlt, const __nv_bfloat16* base, const __nv_bfloat16* w, cudaStream_t st)
 {
+    if constexpr (dfl::REP)           // the KS partials in part, summed p = 0..KS-1 as the all-reduce sums TP4's ranks
+    {
+        (void)c;
+        dflk::k_ar_conv_norm<<<dim3(glue::RN_CL, dfl::B), glue::RN_T, 0, st>>>(dflk::ArArgs{D.lpart, D.stepp, 0, dlt, base, D.resid, w, D.x, D.eps});
+        return;
+    }
     dfl_wait(D, c, dfl_payload(D, c), st);
     dflk::k_ar_conv_norm<<<dim3(glue::RN_CL, dfl::B), glue::RN_T, 0, st>>>(dflk::ArArgs{D.f, D.stepp, c, dlt, base, D.resid, w, D.x, D.eps});
 }
@@ -805,8 +878,16 @@ inline void dfl_consume(Dfl& D, int c, const float* dlt, const __nv_bfloat16* ba
 inline void dfl_ctx_store(Dfl& D, int c, cudaStream_t st)
 {
     using namespace dfl;
-    dfl_wait(D, c, (size_t)B * NFR * 4, st);
-    dflk::k_ctx_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(dflk::CtxArgs{D.f, D.stepp, c, D.hnorm, D.ctxn, D.eps});
+    if constexpr (REP)                // fco is local (Dfl::lfc). A fill step (c = NT) first waits for the barrier
+    {
+        if (c) dfl_wait(D, c, 0, st);
+        dflk::k_ctx_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(dflk::CtxArgs{D.lfc, D.stepp, 0, D.hnorm, D.ctxn, D.eps});
+    }
+    else
+    {
+        dfl_wait(D, c, (size_t)B * NFR * 4, st);
+        dflk::k_ctx_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(dflk::CtxArgs{D.f, D.stepp, c, D.hnorm, D.ctxn, D.eps});
+    }
     dfl_xfrag(D.ctxn, HID, D.xf_ctxn, D.xb_ctxn, st);
     dflk::KvArgs ka{};
     for (int j = 0; j < L; ++j)
@@ -831,7 +912,7 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
         dfl_in(D, st);
         dfl_xfrag(D.feat, NT * HID, D.xf_feat, D.xb_feat, st);
         bind::launch(D.fc, st);
-        k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.fco), D.f, D.stepp, 0, (int)(dfl_payload(D, 0) / 16), D.tickets);
+        if constexpr (!REP) k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.fco), D.f, D.stepp, 0, (int)(dfl_payload(D, 0) / 16), D.tickets);
         return;
     }
     if (p == 1)
@@ -873,7 +954,7 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
     }
     // p == NC: the merge (gr8's head merge in argmax mode, the walk in selector mode), StepOut
     if (D.sel)
-        dflk::k_walk<<<1, 256, 0, st>>>(dflk::WalkArgs{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp});
+        dflk::k_walk<<<1, 256, 0, st>>>(dflk::WalkArgs{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp, D.sel_alpha});
     else if (D.nc > 0) glue::k_head_merge_tp<<<B, 1024, 0, st>>>(dfl_head_args(D));
     else glue::k_head_merge<<<1, 32, 0, st>>>(dfl_head_args(D));
     dflk::k_out<<<1, 32, 0, st>>>(dflk::OutArgs{D.tok_out, D.lp, D.out});
@@ -882,6 +963,12 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
 inline void dfl_step(Dfl& D, cudaStream_t st, bool query = true)
 {
     for (int p = 0; p < (query ? dfl::NPH : 2); ++p) dfl_phase(D, p, st, query);
+}
+// a loopback driver (dfltest, dflreplay): whether phase p of a draft step ends with a collective to deliver
+// (REP: only the head's, 2L + 1)
+constexpr bool dfl_delivered(int p, bool query)
+{
+    return dfl::REP ? query && p == dfl::NC - 1 : p < dfl::NC && (query || p == 0);
 }
 // a fill step (prompt context from Dfl::pf_feat), phases 0..2: 0 = the NT feature gathers out; 1 = in, fc slices out
 // (collective NT); 2 = the context part. DflIn: ctx_rows, ctx_pos0 (a position in [pf_lo, pf_hi)), lo = pf_lo.
@@ -901,7 +988,8 @@ inline void dfl_fill_phase(Dfl& D, int p, cudaStream_t st)
         dflk::k_fill_get<<<dim3(HID / 256, B, NT), 256, 0, st>>>(D.f, D.stepp, D.feat);
         dfl_xfrag(D.feat, NT * HID, D.xf_feat, D.xb_feat, st);
         bind::launch(D.fc, st);
-        k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.fco), D.f, D.stepp, NT, (int)((size_t)B * NFR * 4 / 16), D.tickets + NT);
+        // REP: no payload (fco stays here), the publish is the barrier dfl_ctx_store waits for
+        k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.fco), D.f, D.stepp, NT, REP ? 0 : (int)((size_t)B * NFR * 4 / 16), D.tickets + NT);
         return;
     }
     dfl_ctx_store(D, NT, st);

@@ -285,7 +285,7 @@ def parse_gpuprobe(text):
 def gpu_load(h, th, tool, taskset_cpus):
     """Run gpuprobe and sample the GPU while its read kernels run. -> dict"""
     if not tool or not os.path.exists(h.path(tool)):
-        return {'error': f'gpuprobe not found at {tool} (scripts/build.sh builds it, scripts/stage.sh copies it)'}
+        return {'error': f'gpuprobe not found at {tool} (scripts/build.sh builds it)'}
     argv = [tool, '--seconds', f'{th.load_seconds:g}']
     if taskset_cpus and shutil.which('taskset'):
         argv = ['taskset', '-c', ','.join(map(str, taskset_cpus))] + argv

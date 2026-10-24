@@ -1,5 +1,6 @@
 """Run records (one JSON line per run), spread between runs, baseline files and the check against a baseline."""
 import json
+import math
 import statistics
 
 KL_FLOOR = 1e-6  # a threshold never below this: boots that reproduce the reference exactly would otherwise fail on rounding
@@ -249,4 +250,119 @@ def gates_table(rows):
     for k, base, v, d, verdict in rows:
         out.append(f'| {k} | {"-" if base is None else format(base, "g")} | {"-" if v is None else format(v, "g")} | '
                    f'{"-" if d is None else format(d, "+.1f")} | {verdict} |')
+    return '\n'.join(out)
+
+
+# Two-sided 95% Student t quantiles by degrees of freedom (stdlib has no t distribution); past 30, the normal 1.96.
+T975 = [None, 12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131,
+        2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042]
+
+
+def t975(df):
+    return T975[df] if df < len(T975) else 1.96
+
+
+def paired(runs, topology, a, b, noise=0.03):
+    """Paired A/B of two commits (#32). Each pair is a `pair` label shared by one boot of `a` and one of `b`, measured
+    back to back (a then b, or b then a), so slow drift between pairs (clock, thermals, a node that degrades) cancels in
+    the difference. Per pair and metric: d = (b - a) / |a| on the medians of each side's repeats. Over the pairs: mean d,
+    its 95% t interval, and how many pairs went each way. -> (rows, info). rows: (metric, better, n, mean %, lo %, hi %,
+    b better, a better, verdict). verdict: 'worse' when the whole interval lies on the worse side of 0 and its mean is
+    past `noise`, 'better' likewise, 'within noise' when the interval sits inside +-noise, else 'unresolved' (more pairs
+    would settle it). One pair gives a delta and no interval. Pairs must agree on measurement settings and topology; build
+    flags and engine environment may differ between a and b (that may be what is under test), not within a side.
+    KL stays info here: `check` gates kl.mean on an absolute threshold with a floor, and a relative change of numbers
+    at that floor means nothing. Only pairs with both sides count; their records must pass `ineligible`."""
+    runs = [r for r in runs if r['topology'] == topology and r.get('pair') is not None and r['commit'] in (a, b)]
+    if a == b:
+        raise ValueError('paired needs two different commits')
+    if not runs:
+        raise ValueError(f'no paired runs of {a} and {b} on {topology} (run --pair ID)')
+    by = {}
+    for r in runs:
+        by.setdefault(r['pair'], {}).setdefault(r['commit'], []).append(r)
+    whole = {p: v for p, v in by.items() if a in v and b in v}
+    lone = sorted(set(by) - set(whole))
+    if not whole:
+        raise ValueError(f'no pair has runs of both {a} and {b}')
+    seen = {}
+    for p, v in whole.items():
+        boots = {c: {r['boot'] for r in v[c]} for c in (a, b)}
+        if boots[a] & boots[b]:
+            raise ValueError(f'pair {p!r}: {a} and {b} share boot {sorted(boots[a] & boots[b])}; each side is its own boot')
+        for c in (a, b):
+            if len(boots[c]) > 1:
+                raise ValueError(f'pair {p!r} has {len(boots[c])} boots of {c} ({sorted(boots[c])}); a pair is one boot '
+                                 'of each side')
+            bt = next(iter(boots[c]))
+            if seen.setdefault(bt, p) != p:
+                raise ValueError(f'boot {bt!r} is in pairs {seen[bt]!r} and {p!r}; each boot belongs to one pair')
+        for r in v[a] + v[b]:
+            why = ineligible(r)
+            if why:
+                raise ValueError(f'boot {r["boot"]!r} cannot be compared: {why}')
+    runs = [r for v in whole.values() for r in v[a] + v[b]]
+    _same(runs, lambda r: {k: r['settings'].get(k) for k in MEASURE_KEYS}, 'measurement settings')
+    side = {}
+    for c in (a, b):
+        rs = [r for r in runs if r['commit'] == c]
+        side[c] = {'build_flags': _same(rs, lambda r: r['build_flags'], f'build flags of {c}'),
+                   'engine_env': _same(rs, lambda r: norm_env(r.get('engine_env')), f'engine environment of {c}')}
+
+    def med(rs, k):
+        vals = [r['metrics'][k]['value'] for r in rs if k in r['metrics']]
+        return statistics.median(vals) if vals else None
+    direction = {}
+    for r in runs:
+        for k, m in r['metrics'].items():
+            direction.setdefault(k, m['better'])
+    rows = []
+    for k in sorted(direction):
+        ds = []
+        for p in sorted(whole):
+            va, vb = med(whole[p][a], k), med(whole[p][b], k)
+            if va is None or vb is None or va == 0:
+                continue
+            ds.append((vb - va) / abs(va))
+        if not ds:
+            continue
+        d = direction[k]
+        n = len(ds)
+        mean = statistics.fmean(ds)
+        if n > 1:
+            h = t975(n - 1) * statistics.stdev(ds) / math.sqrt(n)
+            lo, hi = mean - h, mean + h
+        else:
+            lo = hi = None
+        sign = 1 if d == HIGHER else -1 if d == LOWER else 0
+        b_better = sum(1 for x in ds if sign * x > 0)
+        a_better = sum(1 for x in ds if sign * x < 0)
+        if d == INFO or k.endswith('.pass') or k.startswith('kl.'):
+            verdict = 'info'
+        elif lo is None:
+            verdict = 'one pair'
+        else:
+            wlo, whi = sorted((sign * lo, sign * hi))  # in "better" units: > 0 is b better
+            if whi < 0 and -sign * mean > noise:
+                verdict = 'worse'
+            elif wlo > 0 and sign * mean > noise:
+                verdict = 'better'
+            elif wlo >= -noise and whi <= noise:
+                verdict = 'within noise'
+            else:
+                verdict = 'unresolved'
+        pct = lambda x: None if x is None else round(100 * x, 2)
+        rows.append((k, d, n, pct(mean), pct(lo), pct(hi), b_better, a_better, verdict))
+    info = {'a': a, 'b': b, 'topology': topology, 'pairs': sorted(whole), 'unpaired': lone, 'sides': side,
+            'noise': noise}
+    return rows, info
+
+
+def paired_table(rows, info):
+    a, b = info['a'], info['b']
+    out = [f'| metric | pairs | {b} vs {a}, mean % | 95% interval % | {b} better | {a} better | verdict |',
+           '|---|---|---|---|---|---|---|']
+    for k, d, n, mean, lo, hi, nb, na, v in rows:
+        ci = '-' if lo is None else f'{lo:+.2f} .. {hi:+.2f}'
+        out.append(f'| {k} | {n} | {mean:+.2f} | {ci} | {nb} | {na} | {v} |')
     return '\n'.join(out)

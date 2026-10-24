@@ -546,6 +546,7 @@ static void run_k1(const std::string& name, const bind::LayerTensors& T, bool mo
     const size_t row_bytes = static_cast<size_t>(HID) * 2;
     std::string fails;
     int ncase = 0, maxsl = 0;
+    unsigned long long fnv = 1469598103934665603ull;   // FNV-1a over the full runs' rows: equal across A/B envs = same bits
     for (int M : Ms)
     {
         ++ncase;
@@ -593,8 +594,10 @@ static void run_k1(const std::string& name, const bind::LayerTensors& T, bool mo
         CK(cudaMemcpy(hc.data(), E.oc, hc.size(), cudaMemcpyDeviceToHost));
         const std::string r = cmp_out(hf, hc, M, row_bytes, odt);
         if (!r.empty()) fails += fmt_s("M=%d %s; ", M, r.c_str());
+        for (size_t i = 0; i < row_bytes * M; ++i) fnv = (fnv ^ hf[i]) * 1099511628211ull;
     }
-    report(fails.empty(), "k1 %s: %d row counts, max slots %d%s%s", name.c_str(), ncase, maxsl, fails.empty() ? "" : " | ", fails.c_str());
+    report(fails.empty(), "k1 %s: %d row counts, max slots %d, out fnv %016llx%s%s", name.c_str(), ncase, maxsl, fnv,
+           fails.empty() ? "" : " | ", fails.c_str());
 }
 
 static void test_k1(const std::vector<int>& Ms)
@@ -659,14 +662,18 @@ static void test_k1(const std::vector<int>& Ms)
                        true, fuse, 1, E2, false, Ms2, sr, true);
             }
     }
+    // both dense widths: when 96 blocks do not divide by NR (TP5: 20 and 19 blocks) the narrower ranks run too
+    const int nch_dense_lo = 96 / g6nr::NR * 128 / 16;
+    for (const int nd : {nch_dense, nch_dense_lo})
     {
+        if (nd == nch_dense_lo && nd == nch_dense) continue;
         Arena A;
-        const ShW d = build_shared(A, nch_dense, 0, 300u);
+        const ShW d = build_shared(A, nd, 0, 300u);
         Env E = make_env(A, false);
         const bind::LayerTensors T = make_T(nullptr, d);
         for (int fuse = 0; fuse < 3; ++fuse)
             for (int bf = 0; bf < 2; ++bf)
-                run_k1(fmt_s("dense fuse=%d out_bf16=%d", fuse, bf), T, false, fuse, bf, E, false, Ms);
+                run_k1(fmt_s("dense ch=%d fuse=%d out_bf16=%d", nd * 16, fuse, bf), T, false, fuse, bf, E, false, Ms);
     }
 }
 

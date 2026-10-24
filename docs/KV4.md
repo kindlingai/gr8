@@ -5,7 +5,7 @@ The KV cache spends most of its bytes on the MLA latent: 512 dims per token per 
 indexer keys stay FP8.
 
 **The trade at TP=4** (measured on the cluster, below): about 1.4x the tokens in the same memory (CAP 415,232, against 294,912 for
-fp8 at the same 1,920-page memory; the fp8 default has since grown to 1,981 pages, CAP 310,528), decode about 3% slower, 8K prefill about 6% faster, speculative acceptance about 2% lower, and needles found
+fp8 at the same 1,920-page memory; the fp8 default has since grown to 2,280 pages, CAP 387,072 at that share limit), decode about 3% slower, 8K prefill about 6% faster, speculative acceptance about 2% lower, and needles found
 12/12 from 32K to 200K tokens (and at 400K with a larger CAP), as with fp8.
 
 The row is fixed when the engine is compiled (`-DG6_KV4=1`, `attn/kvfmt.h`), so there are two engines: `bin/g6m4` (fp8,

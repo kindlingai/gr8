@@ -43,6 +43,29 @@ pub struct Res {
     pub text: String,
     pub finish_reason: Option<&'static str>,
     pub stop_reason: Option<StopReason>,
+    /// `return_step_stats`: the request's counters, once `finish_stats` has read them (None: not asked, or unknown)
+    pub step_stats: Option<StepStats>,
+}
+
+/// A request's speculative-decoding counters and server-side times (`return_step_stats`), summed over its engine runs:
+/// the numbers its runs added to `/metrics`, from their `finish` frames (PROTOCOL.md `spec`, `timing`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StepStats {
+    /// verify rounds (decode steps), `vllm:spec_decode_num_drafts_total`
+    pub steps: u64,
+    /// `vllm:spec_decode_num_draft_tokens_total`
+    pub draft_tokens: u64,
+    /// `vllm:spec_decode_num_accepted_tokens_total`
+    pub accepted_tokens: u64,
+    /// `vllm:spec_decode_num_accepted_tokens_per_pos_total`, by position
+    pub accepted_per_pos: Vec<u64>,
+    /// tokens the engine generated (its runs' `completion_tokens`): more than the reply's when a stop string ends it
+    /// before the engine stops
+    pub generated_tokens: u64,
+    /// `vllm:request_prefill_time_seconds`, None when a run did not report it
+    pub prefill_s: Option<f64>,
+    /// `vllm:request_decode_time_seconds`, None when a run did not report it
+    pub decode_s: Option<f64>,
 }
 
 /// A thinking budget, as TensorFold's ThinkBudget: while the think block is open, the reply's `limit`-th token is
@@ -92,6 +115,10 @@ pub struct Generation {
     runs: u32,
     /// the continuation's prompt length, for its log line
     cont_prompt: usize,
+    /// `return_step_stats`: the counters of the runs so far (None once a run's `finish` did not carry them)
+    stats: Option<StepStats>,
+    /// with `return_step_stats`, the run a stop string ended: cancelled, its `finish` (and counters) not read yet
+    ended: Option<Stream>,
 }
 
 /// A finish reason PROTOCOL.md does not list, passed through as Python does; each distinct string is stored once.
@@ -154,7 +181,61 @@ impl Generation {
             cut: false,
             runs: 0,
             cont_prompt: 0,
+            stats: None,
+            ended: None,
         }
+    }
+
+    /// Collect the request's step counters (`return_step_stats`); `finish_stats` puts them in `res.step_stats`.
+    pub fn want_step_stats(&mut self) {
+        self.stats = Some(StepStats { prefill_s: Some(0.0), decode_s: Some(0.0), ..Default::default() });
+    }
+
+    /// Add one run's `finish` frame to the counters; a run without them makes them unknown.
+    fn add_stats(&mut self, f: &[u8]) {
+        let Some(s) = self.stats.as_mut() else { return };
+        let Ok(fin) = serde_json::from_slice::<wire::FinishStats>(f) else {
+            self.stats = None;
+            return;
+        };
+        let Some(sp) = fin.spec else {
+            self.stats = None;
+            return;
+        };
+        s.steps += sp.drafts;
+        s.draft_tokens += sp.draft_tokens;
+        s.accepted_tokens += sp.accepted;
+        if s.accepted_per_pos.len() < sp.accepted_per_pos.len() {
+            s.accepted_per_pos.resize(sp.accepted_per_pos.len(), 0);
+        }
+        for (a, b) in s.accepted_per_pos.iter_mut().zip(&sp.accepted_per_pos) {
+            *a += b;
+        }
+        s.generated_tokens += fin.completion_tokens.unwrap_or(0);
+        let t = fin.timing.as_ref();
+        s.prefill_s = s.prefill_s.zip(t.and_then(|t| t.prefill_s)).map(|(a, b)| a + b);
+        s.decode_s = s.decode_s.zip(t.and_then(|t| t.decode_s)).map(|(a, b)| a + b);
+    }
+
+    /// After the last step: with `return_step_stats`, read the counters into `res.step_stats`. A run a stop string
+    /// ended was cancelled; its `finish` comes once the engine has stopped it, so this waits for that.
+    pub async fn finish_stats(&mut self) {
+        if let Some(mut s) = self.ended.take() {
+            loop {
+                match s.next().await {
+                    Some(Msg::Frame(Kind::Finish, f)) => {
+                        self.add_stats(&f);
+                        break;
+                    }
+                    Some(Msg::Frame(..)) => {}
+                    Some(Msg::Lost(_)) | None => {
+                        self.stats = None;
+                        break;
+                    }
+                }
+            }
+        }
+        self.res.step_stats = self.stats.take();
     }
 
     /// The reply starts inside a think block (the chat prompt opened one): count its reasoning tokens, and with a
@@ -206,9 +287,16 @@ impl Generation {
                     let step = self.on_tokens(t);
                     if step.finish_reason.is_some() {
                         // the reply ended here (a stop string, or a budget's close that reached max_tokens):
-                        // dropping the stream cancels the engine request
+                        // dropping the stream cancels the engine request; with step stats it is cancelled and kept,
+                        // so `finish_stats` can read its counters
                         self.done = true;
-                        self.stream = None;
+                        let s = self.stream.take();
+                        if self.stats.is_some() {
+                            if let Some(s) = s {
+                                s.cancel();
+                                self.ended = Some(s);
+                            }
+                        }
                         return Ok(Some(step));
                     }
                     if self.cut || !step.text.is_empty() || !step.ids.is_empty() {
@@ -217,6 +305,7 @@ impl Generation {
                 }
                 Kind::Finish => {
                     self.done = true;
+                    self.add_stats(&f);
                     let fin: wire::Finish = serde_json::from_slice(&f)
                         .map_err(|e| ApiError::new(500, &format!("bad finish frame: {e}"), None))?;
                     if self.runs == 0 {
@@ -276,6 +365,7 @@ impl Generation {
                     if let Ok(fin) = serde_json::from_slice::<wire::Finish>(&f) {
                         self.res.cached_tokens = fin.cached_tokens.unwrap_or(0);
                     }
+                    self.add_stats(&f);
                     break;
                 }
                 Some(Msg::Frame(..)) => {}
@@ -449,6 +539,7 @@ mod tests {
     // </think> (11) and <|endoftext|> (12)
     const A: u32 = 0;
     const Y: u32 = 7;
+    const Z: u32 = 8;
     const NL: u32 = 4;
     const NLNL: u32 = 5;
     const THINK: u32 = 10;
@@ -486,7 +577,9 @@ mod tests {
 
     /// A PROTOCOL.md engine: each `generate` gets `script(its frame)`'s ids, three per `tokens` frame, cut at
     /// max_tokens. It ends `stop` on a stop id, `length` at the end, `abort` on `cancel`. cached_tokens is the run's
-    /// ordinal + 100 (abort: + 200), so a test can tell which run's finish it reports.
+    /// ordinal + 100 (abort: + 200), so a test can tell which run's finish it reports. Its `finish` reports one verify
+    /// round per `tokens` frame (2 drafts each, the rest of the frame accepted), prefill 0.5 s and decode 0.25 s,
+    /// unless the prompt starts with Z (an engine that does not report them).
     struct FakeEngine {
         gens: Arc<Mutex<Vec<Value>>>,
         engine: Arc<Engine>,
@@ -543,8 +636,22 @@ mod tests {
                         let stops: Vec<u32> =
                             v["stop_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
                         let min = v["min_tokens"].as_u64().unwrap() as usize;
+                        let report = v["prompt"][0] != json!(Z);
                         let tx = tx.clone();
                         tokio::spawn(async move {
+                            // the counters of the frames sent so far, added to a finish frame
+                            let stats = |mut f: Value, sent: &[&[u32]]| {
+                                if report {
+                                    let n = sent.len() as u64;
+                                    let acc: u64 = sent.iter().map(|c| c.len() as u64 - 1).sum();
+                                    let pos1 = sent.iter().filter(|c| c.len() > 2).count();
+                                    f["spec"] = json!({"drafts": n, "draft_tokens": 2 * n, "accepted": acc,
+                                                       "accepted_per_pos": [acc as usize - pos1, pos1]});
+                                    f["timing"] = json!({"prefill_s": 0.5, "decode_s": 0.25});
+                                }
+                                f["completion_tokens"] = json!(sent.iter().map(|c| c.len()).sum::<usize>());
+                                f
+                            };
                             let mut out: Vec<u32> = Vec::new();
                             let mut end = (json!("length"), json!(null));
                             for &t in ids.iter().take(max) {
@@ -554,20 +661,22 @@ mod tests {
                                     break;
                                 }
                             }
+                            let mut sent: Vec<&[u32]> = Vec::new();
                             for chunk in out.chunks(3) {
                                 tokio::time::sleep(Duration::from_millis(2)).await;
                                 if cancel.load(Ordering::Relaxed) {
                                     let f = json!({"type": "finish", "id": id, "reason": "abort", "stop_id": null,
                                                    "cached_tokens": 200 + run});
-                                    let _ = tx.send(frame(f));
+                                    let _ = tx.send(frame(stats(f, &sent)));
                                     return;
                                 }
                                 let _ = tx.send(frame(json!({"type": "tokens", "id": id, "ids": chunk})));
+                                sent.push(chunk);
                             }
                             // a cancel that comes after the last tokens frame finds the run finished
                             let f = json!({"type": "finish", "id": id, "reason": end.0, "stop_id": end.1,
                                            "cached_tokens": 100 + run});
-                            let _ = tx.send(frame(f));
+                            let _ = tx.send(frame(stats(f, &sent)));
                         });
                     }
                     _ => {}
@@ -633,15 +742,31 @@ mod tests {
 
     /// (steps, the generation) for one request; `budget` 0 = none.
     async fn run(fake: &FakeEngine, p: Params, budget: usize, keep: bool) -> (Vec<Step>, Generation) {
+        run_with(fake, &PROMPT, p, budget, keep, false).await
+    }
+
+    /// `run` with a prompt (it must leave a think block open), and with `stats` asking for the step counters.
+    async fn run_with(
+        fake: &FakeEngine,
+        prompt: &[u32],
+        p: Params,
+        budget: usize,
+        keep: bool,
+        stats: bool,
+    ) -> (Vec<Step>, Generation) {
         let t = tok();
-        let mut g = Generation::new(t, format!("chatcmpl-{}", crate::util::hex_id()), PROMPT.to_vec(), p, false, keep);
+        let mut g = Generation::new(t, format!("chatcmpl-{}", crate::util::hex_id()), prompt.to_vec(), p, false, keep);
         assert!(think_open(&g.prompt, THINK, END));
         g.thinking(END, (budget > 0).then_some(Budget { limit: budget, close: &t.think_close }));
+        if stats {
+            g.want_step_stats();
+        }
         g.start(&fake.engine).unwrap();
         let mut steps = Vec::new();
         while let Some(s) = g.next().await.unwrap() {
             steps.push(s);
         }
+        g.finish_stats().await;
         (steps, g)
     }
 
@@ -770,5 +895,60 @@ mod tests {
         assert_eq!((gens[0]["min_tokens"].clone(), gens[1]["min_tokens"].clone()), (json!(9), json!(2)));
         // the continuation's EOS comes at reply token 10, past min_tokens
         assert_eq!(g.res.finish_reason, Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn step_stats_only_when_asked() {
+        let fake = fake_engine(endless_thinking).await;
+        let (_, g) = run(&fake, params(20, 0), 0, true).await;
+        assert_eq!(g.res.step_stats, None);
+        let (_, g) = run_with(&fake, &PROMPT, params(20, 0), 0, false, true).await;
+        // 20 tokens in frames of 3: 7 rounds, 2 drafts each, 13 accepted (6 frames of 3 and one of 2)
+        let want = StepStats {
+            steps: 7,
+            draft_tokens: 14,
+            accepted_tokens: 13,
+            accepted_per_pos: vec![7, 6],
+            generated_tokens: 20,
+            prefill_s: Some(0.5),
+            decode_s: Some(0.25),
+        };
+        assert_eq!(g.res.step_stats, Some(want));
+        assert_eq!(g.res.completion_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn step_stats_add_up_the_runs_of_a_budget_continuation() {
+        let fake = fake_engine(endless_thinking).await;
+        let (_, g) = run_with(&fake, &PROMPT, params(50, 0), 5, true, true).await;
+        let s = g.res.step_stats.unwrap();
+        assert_eq!(fake.gens.lock().unwrap().len(), 2);
+        // the second run: Y Y EOS in one frame. The first ran until the cancel landed: at least the 5 tokens of the cut
+        assert_eq!((s.prefill_s, s.decode_s), (Some(1.0), Some(0.5)));
+        assert!(s.steps >= 3, "{s:?}");
+        assert_eq!(s.draft_tokens, 2 * s.steps);
+        assert_eq!(s.accepted_tokens, s.generated_tokens - s.steps);
+        assert!(s.generated_tokens >= 5 + 3, "{s:?}");
+    }
+
+    #[tokio::test]
+    async fn step_stats_read_the_run_a_stop_string_ended() {
+        let fake = fake_engine(closes_early).await;
+        let mut p = params(50, 0);
+        p.stop = vec!["y".into()];
+        let (steps, g) = run_with(&fake, &PROMPT, p, 0, true, true).await;
+        assert_eq!(steps.last().unwrap().finish_reason, Some("stop"));
+        assert_eq!(g.res.completion_tokens, 4); // a a </think> y: the stop string's token counts, its text does not
+        let s = g.res.step_stats.unwrap();
+        // the engine generated the whole frame the stop string was found in (and ended on its EOS)
+        assert_eq!((s.steps, s.generated_tokens, s.accepted_tokens), (2, 6, 4));
+    }
+
+    #[tokio::test]
+    async fn step_stats_are_unknown_when_a_run_does_not_report_them() {
+        let fake = fake_engine(endless_thinking).await;
+        let (_, g) = run_with(&fake, &[Z, THINK], params(20, 0), 0, true, true).await;
+        assert_eq!(g.res.completion_tokens, 20);
+        assert_eq!(g.res.step_stats, None);
     }
 }

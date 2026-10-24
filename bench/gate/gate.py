@@ -7,6 +7,7 @@
   gate.py spread   [--runs runs.jsonl] [--session S]                         # spread between runs of one boot
   gate.py baseline --topology tp6 --commit SHA --out baselines/tp6.json [--runs runs.jsonl]  # runs of SHA, several boots
   gate.py check    --baseline baselines/tp6.json [--runs runs.jsonl] [--session S]   # gates table, exit 1 on FAIL
+  gate.py paired   --topology tp6 --a SHA_A --b SHA_B [--runs runs.jsonl]    # paired A/B over run --pair P boots
 
 Each run appends one JSON line to --runs (default runs.jsonl next to this file). Stdlib only."""
 import argparse
@@ -97,7 +98,7 @@ def load_health(a):
     age_min = (time.time() - ts) / 60
     if age_min > a.health_max_age_min:
         sys.exit(f'--health {a.health}: the probe is {age_min:.0f} min old (limit {a.health_max_age_min:g}); it may belong to an '
-                 'earlier boot. Probe again before this boot (scripts/launch_tp6.sh does)')
+                 'earlier boot. Probe again before this boot (scripts/rank_health.sh)')
     h['file'] = Path(a.health).name
     if not h['admitted']:
         why = '; '.join(f'rank {b["rank"]} {b["code"]}' for b in h.get('refusals', [])) or 'no reason recorded'
@@ -124,8 +125,10 @@ def cmd_run(a):
         res = one_run(cl, a, parts, seed)
         rec = {'format': 1, 'session': session, 'repeat': i + 1, 'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                'commit': a.commit, 'harness_commit': git_rev(), 'topology': a.topology, 'boot': a.boot or session,
+               'pair': a.pair,
                'build_flags': a.build_flags, 'engine_env': a.engine_env,
-               'settings': {k: v for k, v in vars(a).items() if k not in ('func', 'cmd', 'health', 'no_health', 'health_max_age_min', 'allow_unhealthy')}
+               'settings': {k: v for k, v in vars(a).items() if k not in ('func', 'cmd', 'health', 'no_health', 'health_max_age_min', 'allow_unhealthy',
+                                                                 'pair')}
                | {'seed': seed},
                'results': res,
                'metrics': {k: {'value': v, 'better': d} for k, (v, d) in record.flatten(res).items()}}
@@ -182,6 +185,29 @@ def cmd_check(a):
     sys.exit(0 if status == 'PASS' or (status == 'PARTIAL' and a.allow_partial) else 1)
 
 
+def cmd_paired(a):
+    try:
+        rows, info = record.paired(record.read_runs(a.runs), a.topology, a.a, a.b, a.noise)
+    except ValueError as e:
+        sys.exit(f'paired refused: {e}')
+    print(f'{info["b"]} against {info["a"]} on {info["topology"]}: {len(info["pairs"])} pair(s) '
+          f'({", ".join(map(str, info["pairs"]))}); noise {100 * info["noise"]:g}%')
+    if info['unpaired']:
+        print('left out (one side only):', ', '.join(map(str, info['unpaired'])))
+    for c in (info['a'], info['b']):
+        s = info['sides'][c]
+        print(f'  {c}: build flags {s["build_flags"]!r}, engine env {s["engine_env"]!r}')
+    print(record.paired_table(rows, info))
+    worse = [r[0] for r in rows if r[8] == 'worse']
+    unresolved = [r[0] for r in rows if r[8] in ('unresolved', 'one pair')]
+    print(f'\nPAIRED: {"WORSE" if worse else "UNRESOLVED" if unresolved else "OK"}')
+    if worse:
+        print('  worse:', ', '.join(worse))
+    if unresolved:
+        print('  not settled by these pairs:', ', '.join(unresolved))
+    sys.exit(1 if worse else 0)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -190,7 +216,7 @@ def main():
     def common(p, build=True):
         p.add_argument('--url', default='http://127.0.0.1:8100')
         p.add_argument('--model', default=C.MODEL)
-        p.add_argument('--topology', required=True, choices=['tp6', 'tp4', 'tp3'])
+        p.add_argument('--topology', required=True, choices=['tp6', 'tp5', 'tp4', 'tp3'])
         if build:
             p.add_argument('--commit', required=True, help='gr8 commit of the build under test')
 
@@ -208,6 +234,7 @@ def main():
     p.add_argument('--engine-env', default='', help='engine environment, recorded as given')
     p.add_argument('--boot', help='label of this boot (runs against one boot share it)')
     p.add_argument('--session')
+    p.add_argument('--pair', help='label shared by one boot of each of two builds measured back to back (`paired`)')
     p.add_argument('--repeat', type=int, default=2, help='runs against this boot; the spread is reported')
     p.add_argument('--kl-ref')
     p.add_argument('--only', help=f'comma list of {PARTS}')
@@ -246,7 +273,7 @@ def main():
     p.set_defaults(func=cmd_spread)
 
     p = sub.add_parser('baseline', help='baseline file from the run records of several boots')
-    p.add_argument('--topology', required=True, choices=['tp6', 'tp4', 'tp3'])
+    p.add_argument('--topology', required=True, choices=['tp6', 'tp5', 'tp4', 'tp3'])
     p.add_argument('--runs', default=runs_default)
     p.add_argument('--out', required=True)
     p.add_argument('--commit', required=True, help='only runs of this build commit go into the baseline')
@@ -261,6 +288,14 @@ def main():
                    help='exit 0 on PARTIAL (nothing failed, part of the gate set not checked); the table still says PARTIAL')
     p.add_argument('--noise', type=float, default=0.03, help='allowed regression (fraction), at least the baseline spread')
     p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser('paired', help='paired A/B of two commits over boots labelled with run --pair; exit 1 if b is worse')
+    p.add_argument('--topology', required=True, choices=['tp6', 'tp4', 'tp3'])
+    p.add_argument('--runs', default=runs_default)
+    p.add_argument('--a', required=True, help='commit A (usually main)')
+    p.add_argument('--b', required=True, help='commit B (the change)')
+    p.add_argument('--noise', type=float, default=0.03, help='a shift smaller than this (fraction) is within noise')
+    p.set_defaults(func=cmd_paired)
 
     a = ap.parse_args()
     a.func(a)

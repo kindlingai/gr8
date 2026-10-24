@@ -6,6 +6,7 @@
 #include "dispatch.h"
 #include "pool.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <thread>
@@ -21,6 +22,8 @@ struct PoolHooks {
     // shares the pool, kvman-rs pool.rs), and every live run still able to reach its worst case (pool.h fits). false is
     // counted as an admission stall
     std::function<bool(uint64_t rows, uint64_t worst)> fits;
+    // optional (remote rows release): why a stalled request past R does not fit its page classes; empty = no reason
+    std::function<std::string(uint64_t worst)> refusal;
     // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
     std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
     // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
@@ -103,6 +106,7 @@ class Service {
     // burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each behind
     // 8,192-row prefill quanta). Default off: one admission per notice, as before.
     const bool admit_hold_ = ::getenv("G6_S2_ADMIT_HOLD") && *::getenv("G6_S2_ADMIT_HOLD") == '1';
+    uint64_t refused_ = UINT64_MAX;   // the last request the refusal line named (head)
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
         stopping_.store(true); endpoint_->fail();
@@ -190,8 +194,26 @@ class Service {
                 const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
                 unsigned live = s.resident();
                 const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
-                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), native_.pool.fits(rows, worst), native_.pool.room());
+                // a prompt that continues a retained run fits when the hit does (match checks the room the hit needs, with
+                // the run's own pages and records counted as its own), even when a fresh run of it would not
+                const auto pr0 = prompts_.find(request->id);
+                PoolHit pre{};
+                if (reuse() && pr0 != prompts_.end())
+                    pre = native_.pool.match(pr0->second, rows, worst, int(request->prompt_tokens) - 1,
+                                             g6rt::steering::cache_namespace(request->steering));
+                const bool fits = pre.skip > 0 || native_.pool.fits(rows, worst);
+                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
+                if (fit->why == Stall::Capacity && refused_ != request->id) {
+                    refused_ = request->id;   // once per request
+                    if (reuse() && pr0 != prompts_.end())
+                        fprintf(stderr, "# s2 reuse request %llu waits: %s retained %d lcp %d prompt %u\n", (unsigned long long)request->id,
+                                pre.why, pre.skip, pre.lcp, request->prompt_tokens);
+                    if (native_.pool.refusal)
+                        if (const std::string why = native_.pool.refusal(worst); !why.empty())
+                            fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
+                                    (unsigned long long)worst, why.c_str());
+                }
                 if (fit->why == Stall::None) {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
@@ -205,8 +227,17 @@ class Service {
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
                                 h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
-                    if (!skip) run = native_.pool.reserve(rows, worst);
-                    cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
+                    // a pool that said it fits and then refuses is a bug, but one request's: it waits, the epoch goes on
+                    bool got = true;
+                    if (!skip) {
+                        try { run = native_.pool.reserve(rows, worst); }
+                        catch (const std::exception& e) {
+                            got = false;
+                            fprintf(stderr, "# s2: request %llu (%llu rows): the pool refused its reservation after fits(): %s; it waits\n",
+                                    (unsigned long long)request->id, (unsigned long long)worst, e.what());
+                        }
+                    }
+                    if (got) cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
                 if (cm.admit) {
@@ -355,13 +386,24 @@ public:
             if (c_.rank && old.phase != Phase::Retiring) retire_run(old);   // a cancelled live session (finished ones: below)
             native_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
         };
-        h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) { dispatch_.prefill(s,p,first,rows); };
+        h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) {
+            dispatch_.prefill(s,p,first,rows);
+            sessions_.progress(s.key,first + rows);   // rank 0: a long prefill tells the front end it is alive
+        };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
         h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
         h.finished = [&](const Slot& s) { retire_run(s); };
         if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
-            h.settle = [&] { if (native_.drained()) endpoint_->sync(++sync_); };
+            h.settle = [&] {
+                if (!native_.drained()) return;
+                // the barrier after a drain: every rank waits here for the slowest rank's drain (the drain trace's other
+                // half: the tier io lines carry the same ranks' drains)
+                auto wall = [] { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); };
+                const long long b0 = wall();
+                endpoint_->sync(++sync_);
+                fprintf(stderr, "# rank %u: s2 drain barrier %llu: in %lld ms, out %lld ms\n", (unsigned)c_.rank, (unsigned long long)sync_, b0, wall());
+            };
         if (native_.pool.grow)
             h.grow = [&](const Slot& s, uint64_t rows) {
                 const auto r = native_.pool.grow(s.run, rows);
@@ -385,11 +427,15 @@ public:
             h.dfl = [&](Key, const s2::DflReq& r) { return dispatch_.dfl(r); };
             h.draft_lp = native_.dispatch.draft_lp;
         }
+        // MTP only (no drafter): the confidence stops of round_all read the draft log-probabilities too (g6m4 sets kstop)
+        const bool kstop_mtp = !native_.dispatch.dfl && (native_.kstop.mode || native_.kstop.b.mode || native_.kstop.log);
+        if (kstop_mtp) h.draft_lp = native_.dispatch.draft_lp;
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
         if (native_.dispatch.dfl) {
             driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
             driver_->dfl_reuse(native_.dfl_reuse);
         }
+        else if (kstop_mtp) driver_->kstop(native_.kstop);
         if (reuse()) {
             require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
             dispatch_.track_rows();

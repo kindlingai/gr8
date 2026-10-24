@@ -4,11 +4,15 @@
 # One g6m4 and one m4sim run every TP width: g6m4 takes its width from --ips, m4sim from --tp N or --packs DIR. Each
 # width is compiled as its own build was (engine/runtime/build_m4.sh): DEC_S2 (the multi-session path) at every width,
 # and PF_F12 (the fat-CTA prefill fc1) at 4.
-#   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin; TP = 1, 2, 3, 4, 6 and 8
+#   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin; TP = 1, 2, 3, 4, 5, 6 and 8
 #   G6_WIDTHS="3 4" scripts/build.sh bin  only those widths (a shorter build); G6_NR=4 is G6_WIDTHS=4
+#   F12_WIDTHS="4 5" scripts/build.sh bin  PF_F12 (fat-CTA prefill fc1, on unless G6_PF_F12=0) at TP5 too; default TP4 only
 #   JOBS=N                                compiles at once (default: the CPU count)
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
 #                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
+#   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
+#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
+#                                         G6_WIDTHS or G6_NR says otherwise
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (the engine finds it there at any TP)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
@@ -35,7 +39,7 @@ KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
 if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
-WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 6 8}}
+WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 5 6 8}}
 # each width runs its own instance: the --top-p-cands bound is TP_SORT (2048) / NR, checked before any CUDA work
 widths_ok() {   # widths_ok <g6m4> [<m4sim>]
   local n ips want
@@ -60,6 +64,20 @@ case "${KV_FORMAT:-fp8}" in
     exit 0 ;;
   *) echo "KV_FORMAT=$KV_FORMAT: fp8 or int4"; exit 2 ;;
 esac
+case "${MODEL:-glm}" in
+  glm) ;;
+  flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build
+    [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=flash: KV_FORMAT=fp8 only"; exit 2; }
+    WIDTHS=${G6_WIDTHS:-${G6_NR:-2 3 4}}
+    # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
+    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 ${EXTRA:-}" OUT="$OUT/flash" \
+      bash build_m4.sh "${ARCH:-121a}" all
+    mv "$OUT/flash/m4sim" "$OUT/m4sim_flash" && mv "$OUT/flash/g6m4" "$OUT/g6m4_flash" && rm -rf "$OUT/flash"
+    md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
+    widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"
+    exit 0 ;;
+  *) echo "MODEL=$MODEL: glm or flash"; exit 2 ;;
+esac
 WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
 if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
   mkdir -p "$OUT/lib"
@@ -69,19 +87,35 @@ strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker
 md5sum "$OUT/g6m4" "$OUT/m4sim"
 widths_ok "$OUT/g6m4" "$OUT/m4sim"
 export PATH=/usr/local/cuda/bin:$PATH
+# the compiles below go through the same object cache as build_m4.sh (#32); G6_NVCC_CACHE=0 runs plain nvcc / g++
+CACHE="$REPO/engine/runtime/nvcc_cache.sh"
+if [ "${G6_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="$CACHE nvcc"; GXX="$CACHE g++"; fi
+export G6_NVCC_CACHE_LOG="$OUT/obj/nvcc_cache.tests.calls"
+rm -f "$G6_NVCC_CACHE_LOG"
 # the adaptive draft length decision, CPU
-g++ -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
+$GXX -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
 t=$("$OUT/test_spec_len") || { echo "$t"; echo "test_spec_len FAILED"; exit 1; }
 echo "test_spec_len: $(echo "$t" | tail -1)"
 # the prefix-reuse state machine (--reuse-prefix and its grid rules), CPU
-g++ -O2 -std=c++17 -I "$REPO/engine/runtime" -o "$OUT/test_prefix_reuse" "$REPO/engine/tests/test_prefix_reuse.cpp"
+$GXX -O2 -std=c++17 -I "$REPO/engine/runtime" -o "$OUT/test_prefix_reuse" "$REPO/engine/tests/test_prefix_reuse.cpp"
 t=$("$OUT/test_prefix_reuse") || { echo "$t"; echo "test_prefix_reuse FAILED"; exit 1; }
 echo "test_prefix_reuse: $(echo "$t" | tail -1)"
-# gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py); stage.sh copies it to every node
-nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
+# gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py)
+$NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
 # TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
-nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
+$NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
   "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" -lcublas
+# G6_L2PF (paced side-stream L2 prefetch in the step's idle-DRAM windows): byte-exact check + per-layer timing of the
+# decode layer sequence (real attention, x_in / q_b / o_proj / router GEMVs, wait and MoE stand-ins); build only (needs
+# an idle GPU and ~3-5 GB): $OUT/l2pf_bench (file header)
+$NVCC -O3 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
+  -I "$REPO/engine/kernels" -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
+  "$REPO/engine/attn/bind.cu" -lcublas
+# the prefetch queues (G6_L2PF targets, G6_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
+  -I "$REPO/engine/kernels" -o "$OUT/l2pf_queue_test" "$REPO/engine/kernels/tests/l2pf_queue_test.cu"
+t=$("$OUT/l2pf_queue_test") || { echo "$t"; echo "l2pf_queue_test FAILED"; exit 1; }
+echo "$t"
 if nvidia-smi -L > /dev/null 2>&1; then
   t=$("$OUT/tr3_e4m3_test") || { echo "$t"; echo "tr3_e4m3_test FAILED"; exit 1; }
   echo "tr3_e4m3_test: $(echo "$t" | tail -1)"
@@ -92,7 +126,7 @@ fi
 # Steering projection/consume/finalizer fixtures: compile in CI even without a GPU. No model or fabric service needed.
 for test in steering_cuda_test steering_consume_test steering_shared_test steering_boot_cuda_test; do
   # shellcheck disable=SC2086
-  nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} \
+  $NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} \
     $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 -o "$OUT/$test" "$REPO/engine/runtime/tests/$test.cu" -lcublas
   if nvidia-smi -L > /dev/null 2>&1; then
     "$OUT/$test"
@@ -104,9 +138,17 @@ done
 # G6_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
 # + bench on a synthetic TP4 layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
 # shellcheck disable=SC2086
-nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 \
+$NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 \
   -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" "$REPO/engine/kernels/tests/k1_ovl_test.cu"
+# K1 split choice (G6_K1_SPLIT table vs triple, the fused remap's KS1 x WG >= 2 guard): host only, runs everywhere
+# shellcheck disable=SC2086
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 \
+  -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" "$REPO/engine/kernels/tests/k1_split_test.cu"
+t=$("$OUT/k1_split_test") || { echo "$t"; echo "k1_split_test FAILED"; exit 1; }
+echo "$t"
 # fabric groups over real verbs (#154): built here, run by hand on the cluster (one process per box; see its header)
-nvcc -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" "$REPO/engine/comms/tests/fabric_group_test.cpp" \
+$NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" "$REPO/engine/comms/tests/fabric_group_test.cpp" \
   "$REPO/engine/comms/fabric.cpp" -libverbs -lpthread
 echo "fabric_group_test: built (cluster test, not run here)"
+[ -f "$G6_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$G6_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$G6_NVCC_CACHE_LOG") miss"
+exit 0

@@ -126,7 +126,7 @@ class LeaderChannel : public EventEndpoint {
     void send_all(const std::vector<uint8_t>& frame) {std::lock_guard<std::mutex> l(send_mu_);for(auto p:peers_)p->send(frame);}
 public:
     LeaderChannel(uint64_t epoch,const std::vector<ControlIO*>& peers):EventEndpoint(epoch,0),peers_(peers),epoch_(epoch),
-        acks_(peers.size()),synced_(peers.size(),0),reading_(peers.size(),0){require(peers.size()==2||peers.size()==3||peers.size()==5,"expected TP3/TP4/TP6 peers");}
+        acks_(peers.size()),synced_(peers.size(),0),reading_(peers.size(),0){require(peers.size()==1||peers.size()==2||peers.size()==3||peers.size()==4||peers.size()==5,"expected TP2/TP3/TP4/TP5/TP6 peers");}
     void fail() override {EventEndpoint::fail();for(auto p:peers_)p->shutdown();}
     // Control thread: announce caller-chosen FUTURE boundary, collect event ACKs,
     // then make one canonical allocator/scheduler commit while compute is paused.

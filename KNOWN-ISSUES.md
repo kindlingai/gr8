@@ -1,31 +1,18 @@
 # Known issues
 
-Bugs we are still working out. Fixed ones move to CHANGELOG.md.
+Bugs we are still working out. The PR that fixes one removes its entry.
 
-## 1. TP=4: which requests get the DFlash2 drafter depends on timing - Open
-
-- A request drafts with DFlash2 only if it is alone at its prompt tail and prefix reuse did not skip into the last 2,048
-  prompt positions; otherwise it runs MTP-only for its whole life. With prefix reuse on, that depends on what the pool
-  holds and on whether the previous request has finished.
-- Effect: RigMark code on one TP=4 build ranged from 41.5 to 49.3 tok/s between boots. Prose and the multi-stream rows
-  are not hurt.
-- The drafter-choice log line only appears when a request switched drafters or ran MTP rounds, so a request that never
-  had DFlash2 is hard to tell apart from one that ran it throughout.
-- `G6_DFL_REUSE=1` (off by default) lets a request whose prefix-reuse hit skipped into the window keep the drafter, and
-  `G6_DFL_REUSE=2` also gives it to a request that runs alone on MTP (docs/SETTINGS.md). With it on, rank 0 prints a
-  `# s2 dflash reuse` line for every request, including one that never had DFlash2.
-
-## 2. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open
+## 1. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open
 
 - A request that should reuse a ~786K-token resident prefix misses and does a full re-prefill.
 - Next step: log a reason code for each miss and return the longest valid resident prefix, not all-or-nothing.
 
-## 3. Aggregate decode stays flat past S=4 (TP=6, six Sparks) - Open
+## 2. Aggregate decode stays flat past S=4 (TP=6, six Sparks) - Open
 
 - Aggregate decode, tok/s: S1 39.7, S2 53.1, S4 52.1, S6 52.8 (2200 MHz cap).
 - We do not know yet if the cause is the scheduler or weight bandwidth.
 
-## 4. One first-request output mismatch after a boot - Open (not reproduced)
+## 3. One first-request output mismatch after a boot - Open (not reproduced)
 
 - **Symptom:** once, on a fresh TP6 boot (engine started with `--top 20`), the first-request check did not repeat itself.
   The check sends the same 8,203-row prompt twice and decodes 32 tokens greedily (A1, A2). A1 and A2 differed (text hash

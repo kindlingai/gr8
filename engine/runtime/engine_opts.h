@@ -23,6 +23,7 @@ inline const char* const DEFAULT_PROMPT = "154822,154824,154826,25062";
 struct CommonOpts
 {
     std::string v2_dir, v2_slices, v2_widths, v2_dense;   // --v2, --v2-slices, --v2-widths, --v2-dense
+    std::string v2_layout;                                // --layout: which pieces each rank holds (loader-rs layout.rs)
     bool v2_trellis = true;                               // --v2-dense-form
     std::string qo_man, qo_file;                          // --qo-manifest, --qo-pack
     std::string layers_s = "0,3,40,77";                   // --layers: the mini model both mains default to
@@ -47,6 +48,7 @@ bool common_arg(const std::string& a, Next&& next, CommonOpts& o, std::string& e
     else if (a == "--v2-slices") o.v2_slices = next();
     else if (a == "--v2-widths") o.v2_widths = next();
     else if (a == "--v2-dense") o.v2_dense = next();
+    else if (a == "--layout") o.v2_layout = next();
     else if (a == "--v2-dense-form")
     {
         const std::string f = next();

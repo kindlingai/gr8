@@ -5,12 +5,13 @@
 #include <cuda_fp16.h>
 #include "../g6nr.h"
 #include "../g6mx.h"
+#include "activation.cuh"
 
 typedef uint32_t u32;
 typedef uint64_t u64;
 
-constexpr int HID = 6144;            // hidden size
-constexpr int KSH = HID / 16;        // 384 k16 steps over hidden
+constexpr int HID = geom::HID;       // hidden size (../model_geom.h)
+constexpr int KSH = geom::KSH;       // k16 steps over hidden: 384 / 256
 constexpr float SQ128 = 0.088388347648f;
 
 // streaming loads: weights are read once, keep them out of L1
@@ -100,7 +101,6 @@ __device__ __forceinline__ void put16(__half* y, float v, int bf16)   // one 16-
     else *y = __float2half_rn(v);
 }
 __device__ __forceinline__ float rnd_h(float x) { return __half2float(__float2half_rn(x)); }
-__device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
 
 // 128-point Hadamard (Sylvester order), one row held by a warp as 4 consecutive floats per lane,
 // scaled by 1/sqrt(128).

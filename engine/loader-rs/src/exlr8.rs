@@ -73,6 +73,7 @@ pub struct Info {
 /// A safetensors file: header parsed at open, tensor bytes read on demand.
 pub struct StFile {
     pub path: String,
+    pub meta: Json,
     f: File,
     names: Vec<String>,
     infos: std::collections::HashMap<String, Info>,
@@ -103,7 +104,7 @@ impl StFile {
             names.push(k.clone());
             infos.insert(k.clone(), Info { dtype, shape, start: 8 + n + a, end: 8 + n + b });
         }
-        Ok(StFile { path: path.to_string(), f, names, infos })
+        Ok(StFile { path: path.to_string(), meta: head.get("__metadata__").cloned().unwrap_or(Json::Null), f, names, infos })
     }
 
     /// Tensor names, sorted, without `__pad.*`.
@@ -153,12 +154,17 @@ fn exponent(x: f32) -> i32 {
     ((x.to_bits() >> 23) & 0xff) as i32 - 127
 }
 
+#[inline(always)]
+pub fn pow2_f64(exp: i32) -> f64 {
+    f64::from_bits(((exp + 1023) as u64) << 52)
+}
+
 /// |x| rounded to nearest even on a grid with `mant` fraction bits and exponents from `emin` up, sign kept.
 fn round_to(x: f32, mant: i32, emin: i32) -> f32 {
     if x == 0.0 {
         return x;
     }
-    let step = f64::powi(2.0, exponent(x).max(emin) - mant);
+    let step = pow2_f64(exponent(x).max(emin) - mant);
     ((x.abs() as f64 / step).round_ties_even() * step).copysign(x as f64) as f32
 }
 
@@ -172,12 +178,33 @@ pub fn e4m3_round(x: f32) -> f32 {
     round_to(x.clamp(-448.0, 448.0), 3, -6).clamp(-448.0, 448.0)
 }
 
-/// E4M3FN byte -> f32 (exact).
-pub fn e4m3_to_f32(b: u8) -> f32 {
-    let e = ((b >> 3) & 15) as i32;
-    let m = (b & 7) as f32;
-    let v = if e == 0 { m * (1.0 / 512.0) } else if e == 15 && (b & 7) == 7 { f32::NAN } else { (1.0 + m / 8.0) * f32::powi(2.0, e - 7) };
+const fn e4m3_to_f32_const(b: u8) -> f32 {
+    let e = ((b >> 3) & 15) as u32;
+    let m = (b & 7) as u32;
+    let v = if e == 0 {
+        (m as f32) * (1.0 / 512.0)
+    } else if e == 15 && m == 7 {
+        f32::NAN
+    } else {
+        f32::from_bits(((e + 120) << 23) | (m << 20))
+    };
     if b & 0x80 != 0 { -v } else { v }
+}
+
+const E4M3_LUT: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = e4m3_to_f32_const(i as u8);
+        i += 1;
+    }
+    t
+};
+
+/// E4M3FN byte -> f32 (exact).
+#[inline(always)]
+pub fn e4m3_to_f32(b: u8) -> f32 {
+    E4M3_LUT[b as usize]
 }
 
 /// 2^(code - 127) as f32, the E8M0 scale. Code 0 gives an f32 subnormal, exactly.
@@ -531,6 +558,29 @@ impl<'a> Matrix<'a> {
         Ok((q, s))
     }
 
+    /// A block-FP8 matrix's E4M3 bytes of rows `rows` as stored ([rows][in]), and each row's scales: the scale of its
+    /// 128-row block for every 128-input block ([rows][in / 128], f32). Weight (i, j) = e4m3(byte) x scale[i][j / 128],
+    /// which is what decode() returns for it.
+    pub fn fp8_rows(&self, rows: &Range<usize>) -> Result<(Vec<u8>, Vec<f32>), String> {
+        let r = self.rec;
+        if r.fmt != FP8_BLOCK {
+            return Err(format!("{}: {} is not block FP8", self.f.path, self.name));
+        }
+        if rows.end > r.out || rows.is_empty() {
+            return Err(format!("{}: {} rows {rows:?} are outside {}", self.f.path, self.name, r.out));
+        }
+        let (bo, bi) = (r.out.div_ceil(128), r.inp.div_ceil(128));
+        self.check_shape("fp8", &[r.out, r.inp])?;
+        self.check_shape("scale", &[bo, bi])?;
+        let w = self.rows_of("fp8", rows, r.inp, 1)?;
+        let s = f32s(&self.f.read_all(&self.t("scale"))?);
+        let mut rs = Vec::with_capacity(rows.len() * bi);
+        for i in rows.clone() {
+            rs.extend_from_slice(&s[i / 128 * bi..][..bi]);
+        }
+        Ok((w, rs))
+    }
+
     /// MXFP8 codes and E8M0 scales of rows `rows`, as stored ([rows][in], [rows][in / 32]).
     pub fn mxfp8(&self, rows: &Range<usize>) -> Result<(Vec<u8>, Vec<u8>), String> {
         let r = self.rec;
@@ -540,6 +590,79 @@ impl<'a> Matrix<'a> {
         self.check_shape("fp8", &[r.out, r.inp])?;
         self.check_shape("e8m0", &[r.out, r.inp / 32])?;
         Ok((self.rows_of("fp8", rows, r.inp, 1)?, self.rows_of("e8m0", rows, r.inp / 32, 1)?))
+    }
+
+    /// FP8-row codes of rows `rows`, as stored ([rows][in]).
+    pub fn fp8_row_codes(&self, rows: &Range<usize>) -> Result<Vec<u8>, String> {
+        let r = self.rec;
+        if r.fmt != FP8_ROW {
+            return Err(format!("{}: {} is not FP8-row", self.f.path, self.name));
+        }
+        self.check_shape("fp8", &[r.out, r.inp])?;
+        self.check_shape("scale", &[r.out])?;
+        self.rows_of("fp8", rows, r.inp, 1)
+    }
+
+    /// FP8-row rows `rows` decoded directly to BF16 little-endian bytes ([rows][in] x 2 B) without intermediate f32/u16 Vecs.
+    pub fn fp8_row_bf16_le(&self, rows: &Range<usize>) -> Result<Vec<u8>, String> {
+        let r = self.rec;
+        if r.fmt != FP8_ROW {
+            return Err(format!("{}: {} is not FP8-row", self.f.path, self.name));
+        }
+        self.check_shape("fp8", &[r.out, r.inp])?;
+        self.check_shape("scale", &[r.out])?;
+        let w = self.rows_of("fp8", rows, r.inp, 1)?;
+        let sb = self.rows_of("scale", rows, 1, 4)?;
+        let mut out = vec![0u8; rows.len() * r.inp * 2];
+        for (i, (row_w, sc_bytes)) in w.chunks_exact(r.inp).zip(sb.chunks_exact(4)).enumerate() {
+            let s = f32::from_le_bytes(sc_bytes.try_into().unwrap());
+            let dst = &mut out[i * r.inp * 2..(i + 1) * r.inp * 2];
+            for (b, d) in row_w.iter().zip(dst.chunks_exact_mut(2)) {
+                d.copy_from_slice(&bf16_bits(e4m3_to_f32(*b) * s).to_le_bytes());
+            }
+        }
+        Ok(out)
+    }
+
+    /// FP8-block `kv_b` heads `h0..h0+nh` (each `head_rows` rows = `uk_rows` UK + `head_rows - uk_rows` UV) decoded
+    /// directly to `(uk, uv)` BF16 little-endian bytes without intermediate f32/u16 Vecs.
+    pub fn fp8_block_kv_b_bf16_le(&self, h0: usize, nh: usize, head_rows: usize, uk_rows: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let r = self.rec;
+        if r.fmt != FP8_BLOCK {
+            return Err(format!("{}: {} is not FP8-block", self.f.path, self.name));
+        }
+        let (bo, bi) = (r.out.div_ceil(128), r.inp.div_ceil(128));
+        self.check_shape("fp8", &[r.out, r.inp])?;
+        self.check_shape("scale", &[bo, bi])?;
+        let rows = h0 * head_rows..(h0 + nh) * head_rows;
+        let w = self.rows_of("fp8", &rows, r.inp, 1)?;
+        let s = f32s(&self.f.read_all(&self.t("scale"))?);
+        let uv_rows = head_rows - uk_rows;
+        let mut uk = vec![0u8; nh * uk_rows * r.inp * 2];
+        let mut uv = vec![0u8; nh * uv_rows * r.inp * 2];
+        for h in 0..nh {
+            for hr in 0..head_rows {
+                let i = h * head_rows + hr;
+                let sb_row = (rows.start + i) / 128 * bi;
+                let src = &w[i * r.inp..(i + 1) * r.inp];
+                let dst = if hr < uk_rows {
+                    let dr = h * uk_rows + hr;
+                    &mut uk[dr * r.inp * 2..(dr + 1) * r.inp * 2]
+                } else {
+                    let dr = h * uv_rows + (hr - uk_rows);
+                    &mut uv[dr * r.inp * 2..(dr + 1) * r.inp * 2]
+                };
+                for cb in 0..bi {
+                    let c0 = cb * 128;
+                    let c1 = (c0 + 128).min(r.inp);
+                    let sc = s[sb_row + cb];
+                    for (b, d) in src[c0..c1].iter().zip(dst[c0 * 2..c1 * 2].chunks_exact_mut(2)) {
+                        d.copy_from_slice(&bf16_bits(e4m3_to_f32(*b) * sc).to_le_bytes());
+                    }
+                }
+            }
+        }
+        Ok((uk, uv))
     }
 
     /// Byte range (in the file) of trellis entries `entries` and the entry size: raw tiles, no re-layout.

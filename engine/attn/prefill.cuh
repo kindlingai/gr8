@@ -36,6 +36,12 @@ constexpr int DEFAULT_DENSE_LIMIT=8192;
 constexpr int DEFAULT_QUERY_TILE=256;
 static int blas_status(cublasStatus_t s){if(s==CUBLAS_STATUS_SUCCESS)return 0;fprintf(stderr,"gr8 prefill cuBLAS status %d\n",int(s));return int(cudaErrorUnknown);}
 __global__ void weight_half(const void* src,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[i]=__float2half_rn(ga::bfloat(src,i));}
+// #50: the FP16 UK / UV copies from a binding's E4M3 weights (attn.h uks / uvs): each FP16 value is weight_half's of the BF16
+// weight the BF16 loader stores (ga::wuk / ga::wuv), so the copies are byte-identical. UK keeps the binder's [h][512][192].
+__global__ void weight_half_uk(G6Attn a,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n){const int h=i/(512*192),d=(i/192)%512,k=i%192;dst[i]=__float2half_rn(ga::wuk<true>(a,h,d,k));}}
+__global__ void weight_half_uv(G6Attn a,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n){const int h=i/(256*512),e=(i/512)%256,k=i%512;dst[i]=__float2half_rn(ga::wuv<true>(a,h,e,k));}}
 __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int count){
     auto a=ga::resolve(fixed);int pos=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(pos>=count)return;
     const uint8_t* v=pos<a.context?ga::kv_at(a,pos):nullptr;
@@ -245,9 +251,9 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
 // cand scratch = w.so .. w.io (2 * R * T * 4 B, present for T > 32768, used by SEL32 only as its histogram) -> min(CAPG, T) keys/row.
 static constexpr int SELX_MINN=32;   // our gate: selx 1.6-2.0x SEL32 from 53K at n >= 33
 static int selx_ctx(){
-    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 0;
+    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 53248;   // default: SELX at 53248 context (v0.7)
         char* e=nullptr;errno=0;const long x=strtol(s,&e,10);
-        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = SEL32)\n",s);exit(2);}
+        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = 53248)\n",s);exit(2);}
         fprintf(stderr,"# G6_PF_SELX_CTX %ld: prefill index tiles with n >= %d and context >= %ld select with selx\n",x,SELX_MINN,x);return (int)x;}();
     return v;
 }
@@ -312,7 +318,10 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
     // One handle follows the shared workspace lifetime. All calls are serialized
     // and use the same math mode; no per-layer cuBLAS state is required.
     p->blas=p->workspace->blas;
-    cudaStream_t st=(cudaStream_t)s;weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);e=cudaGetLastError();
+    cudaStream_t st=(cudaStream_t)s;
+    if(b->args.uks){weight_half_uk<<<(p->H*512*192+255)/256,256,0,st>>>(b->args,p->uk,p->H*512*192);weight_half_uv<<<(p->H*256*512+255)/256,256,0,st>>>(b->args,p->uv,p->H*256*512);}
+    else{weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);}
+    e=cudaGetLastError();
     if(e!=cudaSuccess){profile_release(p->profile);cudaFree(p->storage);release_scratch(p->workspace);delete p;return int(e);}*out=p;return 0;
 }
 }
@@ -381,8 +390,8 @@ extern "C" int g6_attn_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const 
 extern "C" int g6_attn_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){int rc=g6_attn_bind_prepare(b,step,s);if(rc)return rc;auto a=b->args;auto st=(cudaStream_t)s;auto w=ga::workspace(a,b->scratch);rc=g6_attn_append(&a,s);if(rc)return rc;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile),H=a.heads;
         if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);ga::launch_index_scores(a,a,w,start,n,st);if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);}
-        ga::absorb<<<dim3(64,H,n),256,0,st>>>(a,start,w.q,w.rope);gp::trace_copy(tr.q,w.q,start,n,H,512,st);ga::launch_mla_scores(a,a,w,start,n,st);gp::trace_copy(tr.scores,w.prob,start,n,H,ga::TOP,st);
-        ga::normalize<<<n*H,256,0,st>>>(a,w.prob);gp::trace_copy(tr.probs,w.prob,start,n,H,ga::TOP,st);ga::launch_context_parts(a,a,w,start,n,st);ga::merge_parts<<<n*H,256,0,st>>>(a,w.parts,w.context);gp::trace_copy(tr.context,w.context,start,n,H,512,st);ga::value_project<<<dim3(32,H,n),256,0,st>>>(a,start,w.context);
+        ga::launch_absorb(a,a,w,start,n,st);gp::trace_copy(tr.q,w.q,start,n,H,512,st);ga::launch_mla_scores(a,a,w,start,n,st);gp::trace_copy(tr.scores,w.prob,start,n,H,ga::TOP,st);
+        ga::normalize<<<n*H,256,0,st>>>(a,w.prob);gp::trace_copy(tr.probs,w.prob,start,n,H,ga::TOP,st);ga::launch_context_parts(a,a,w,start,n,st);ga::merge_parts<<<n*H,256,0,st>>>(a,w.parts,w.context);gp::trace_copy(tr.context,w.context,start,n,H,512,st);ga::launch_value_project(a,a,w,start,n,st);
     }return int(cudaGetLastError());
 }
 

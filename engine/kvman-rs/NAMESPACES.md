@@ -36,10 +36,12 @@ must refer to valid objects. The C++ adapter links the new symbols, so build it 
 
 ## Stored tiers
 
-**Nonzero namespaces support resident reuse only.** They never promote shared prefixes, spill to a stored tier,
-remember stock continuation heads, provide a resident base for stored stock data, or restore from a stored tier.
-This applies to memory, file and remote block stores. The direct prototype `Tier::spill` also refuses non-stock runs
-without reading pages or allocating slots. A persistent index keeps its existing stock format.
+An evicted non-stock run is stored whole as an evicted entry that carries its namespace (`stash::Entry::namespace`),
+and only a lookup with the same 70 bytes can hit it (memory, file and remote block stores alike). A non-stock run
+never promotes a shared prefix, never gets or becomes a prefix base (no dedupe), and never leaves a stock
+continuation head. Prefix kinds, and so the persistent index, stay stock-only: its format is unchanged, and a
+restart keeps no non-stock entry. The direct prototype `Tier::spill` still refuses non-stock runs. A stock lookup
+never sees a non-stock entry, and a non-stock entry folds all its namespace bytes into the replicated digest.
 
 Non-stock requests must use namespace-aware admission counting so their live metadata is excluded from stock
 promotion. The pool never infers a namespace from token IDs. Equal tokens alone do not establish equal cache state.
@@ -56,7 +58,7 @@ scripts/host_tests.sh
 ```
 
 Rust tests cover exact-byte matching, digests, LRU selection, stock wrappers, promotion/counting, persistent reopen,
-and isolation of stock prefix bases. The host suite runs `pool_namespace_test` against memory, an SSD-format file
+isolation of stock prefix bases, and non-stock store/restore by namespace. The host suite runs `pool_namespace_test` against memory, an SSD-format file
 and a loopback KV node when that binary is available. It tests both original and new C symbols, malformed buffer
-lengths/null pointers, C++ prefix state, resident misses, and stock spill/restore bytes. `pool_diff_test` compares
+lengths/null pointers, C++ prefix state, resident misses, and stock and non-stock spill/restore bytes. `pool_diff_test` compares
 stock page lists, decisions and digests against the prior C++ allocator across random traces.

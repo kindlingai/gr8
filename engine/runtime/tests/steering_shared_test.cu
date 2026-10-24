@@ -44,6 +44,7 @@ __global__ void observe(const unsigned long long* bell,unsigned long long seq,co
 }
 #endif
 
+// k1_tr3_fin launches as bind.cuh's make_k1 does: one CTA per (row, 128-column block), 8 routed warps + warp 8 for SH.
 static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FILE* dump) {
     Arena mem;
     constexpr int B=2, E=3, plans=2;
@@ -118,7 +119,7 @@ static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FIL
 #ifdef DEC_SLOT
         reference.slot.send=nullptr;
 #endif
-        if(sh) k1_tr3_fin<true><<<M*48,160,0,producer>>>(reference); else k1_tr3_fin<false><<<M*48,128,0,producer>>>(reference);
+        if(sh) k1_tr3_fin<true><<<M*geom::HB,288,0,producer>>>(reference); else k1_tr3_fin<false><<<M*geom::HB,256,0,producer>>>(reference);
         CK(cudaGetLastError()); CK(cudaStreamSynchronize(producer));
         const auto stock_output=get(reinterpret_cast<unsigned short*>(a.out),N);
         put(a.ctl,ctl); CK(cudaMemsetAsync(a.out,0x5a,guarded*2,producer));
@@ -129,7 +130,7 @@ static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FIL
             observe<<<1,256,0,watcher>>>(bell+1,value*2+2,target,snapshot,N,timeout);
         }
 #endif
-        if(sh) k1_tr3_fin<true><<<M*48,160,0,producer>>>(a); else k1_tr3_fin<false><<<M*48,128,0,producer>>>(a);
+        if(sh) k1_tr3_fin<true><<<M*geom::HB,288,0,producer>>>(a); else k1_tr3_fin<false><<<M*geom::HB,256,0,producer>>>(a);
         CK(cudaGetLastError()); CK(cudaStreamSynchronize(producer));
 #ifdef DEC_SLOT
         if(slot) {
@@ -267,7 +268,9 @@ int main(int argc,char** argv) {
     FILE* dump=nullptr;
     if(argc==3 && !std::strcmp(argv[1],"--stock-dump")) { dump=std::fopen(argv[2],"wb"); if(!dump) return 2; }
     else if(argc!=1) return 2;
-    for(int M:{1,8,9,G6_MX}) for(bool sh:{false,true}) for(bool bf:{false,true}) for(bool slot:{false,true}) {
+    // M = 9 and G6_MX need the 32-row build (-DDEC_S2): the 8-row build sizes the token plans for G6_MX = 8 rows.
+    const std::vector<int> rows=G6_MX>8 ? std::vector<int>{1,8,9,G6_MX}:std::vector<int>{1,8};
+    for(int M:rows) for(bool sh:{false,true}) for(bool bf:{false,true}) for(bool slot:{false,true}) {
 #ifndef DEC_SLOT
         if(slot) continue;
 #endif

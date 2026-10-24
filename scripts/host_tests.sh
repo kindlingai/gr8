@@ -19,6 +19,8 @@
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+# the build's object cache (engine/runtime/nvcc_cache.sh, #32), with g++ standing in for nvcc
+bash "$REPO/engine/runtime/tests/nvcc_cache_test.sh"
 # Inactive steering contracts/profile loader: CPU only, no CUDA or Rust dependencies.
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
@@ -52,6 +54,13 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_draftpar_test.cpp" -o "$T/batch_draftpar_test"
 "$T/batch_draftpar_test"
 "$T/batch_kstop_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dselmodel_test.cpp" -o "$T/batch_dselmodel_test"
+"$T/batch_dselmodel_test"
+python3 "$REPO/tools/s2_dsel_table.py" --selftest
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstopb_test.cpp" -o "$T/batch_kstopb_test"
+"$T/batch_kstopb_test" 2>/dev/null
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_mtp_test.cpp" -o "$T/batch_kstop_mtp_test"
+"$T/batch_kstop_mtp_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test"
 "$T/capture_barrier_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_reuse_test.cpp" "${KVLIB[@]}" -o "$T/pool_reuse_test"
@@ -73,6 +82,13 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # Config::decode_rounds (G6_S2_DECODE_ROUNDS): K decode rounds per prefill quantum, its notice target, default off
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rounds_test.cpp" -o "$T/scheduler_rounds_test"
 "$T/scheduler_rounds_test"
+# KvTiers::run's copy batches (s2/kv_plan.h): a batch of 1 advances, a slot spilled twice ends with the second page,
+# batched copies = one at a time: no pool, no CUDA
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_plan_test.cpp" -o "$T/kv_plan_test"
+"$T/kv_plan_test"
+# G6_CP_STEP_ROWS / G6_CP_STEP_SEG (s2/cp_rows.h, Driver::step): steps past R capped at n rows, solo-exact tokens, fair cycles
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/cp_rows_test.cpp" -o "$T/cp_rows_test"
+"$T/cp_rows_test" 2> >(grep -v '^# s2 G6_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
 NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
@@ -113,3 +129,33 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 # host memory after load (#4): the /proc parser and malloc_trim (glibc)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$T/host_reclaim_test"
 "$T/host_reclaim_test"
+
+# Offline distributed logit dump framing and merge validation.
+(cd "$REPO" && python3 -m unittest tools.cp.test_merge_logits)
+# Flash KDA state rollback across accepted prefixes, and each session's slots and ring (s2/flash_ring.h).
+g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_ring.cpp" -o "$T/test_flash_ring"
+"$T/test_flash_ring"
+# the KDA carry mode (Args::src per row: the ring, and several sessions in one step) on the CPU model of k_kda_core.
+# Bit for bit across the kernel's M paths, so no FMA contraction (the host compiler would contract each path its own way).
+g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_carry_cpu_test.cpp" -o "$T/kda_carry_cpu_test"
+"$T/kda_carry_cpu_test"
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test"
+"$T/control_tp2_test"
+g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost"
+"$T/test_flash_s2_cost"
+g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost"
+"$T/test_full_s2_cost"
+python3 "$REPO/engine/tests/test_flash_serve_check.py"
+# Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
+python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
+# Flash prefill non-kernel span (NK): G6_PF_PREWARM source check, G6_PF_STAGE_ASYNC source check + schedule hazard model.
+python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
+g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test"
+"$T/pf_peer_stage_test"
+# Flash prefill router row split (G6_PF_ROUTER_SPLIT): every rank count 2..8 ends with byte-equal route tables, the kernels'
+# word maps included; the strict env parse; the source checks of its boot and order.
+for t in test_flash_route_split test_flash_route_split_tp4 test_flash_route_split_env; do
+  g++ -std=c++17 -O1 -Wall "$REPO/engine/tests/$t.cpp" -o "$T/$t"
+  "$T/$t"
+done
+python3 "$REPO/engine/tests/test_flash_route_split_source.py"

@@ -2,14 +2,18 @@
 the reference loader's decode (loader/exlr8.py), the converter's record layouts (engine/ref/g6ref.py), its MXFP8
 equation (tools/convert/mxfp8.py, here on fp32 inputs), a NumPy int4 round-to-nearest and the converter's ownership
 rules (tools/convert/plan.py). Every non-expert tensor must match byte for byte, and the planned image must hold
-exactly the names a converted pack has (tools/convert/convert.py), less the ones no engine path reads.
+exactly the names a converted pack has, less the ones no engine path reads.
 
     python3 engine/loader-rs/tests/release_check.py --release DIR --widths FILE --ref EXLR8_REPO \
-        --dump engine/loader-rs/target/release/g6plandump --tp 4 --ranks 0,1,2,3 --layers 0,3,4,6,78 [--qo]
+        --dump engine/loader-rs/target/release/g6plandump --tp 4 --ranks 0,1,2,3 --layers 0,3,4,6,78 [--qo] [--layout FILE]
+
+--layout plans the ranks from a layout file (bin/g6layout) and takes each rank's heads and dense blocks from it, in
+ascending order, instead of the converter's ownership rules.
 
 Run from the repo root. Needs torch and NumPy.
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -57,11 +61,23 @@ def bf16(w):
     return torch.from_numpy(np.ascontiguousarray(w, np.float32)).to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
 
 
+def rows_of(pieces, n):
+    """The rows (or columns) of pieces of n channels each, in piece order."""
+    return np.concatenate([np.arange(p * n, (p + 1) * n) for p in pieces])
+
+
 class Expect:
     """The tensors one rank's image should hold, layer by layer, from the reference decode."""
 
-    def __init__(self, X, release, r, trellis):
-        self.X, self.release, self.r, self.trellis = X, release, r, trellis
+    def __init__(self, X, release, r, trellis, layout=None):
+        self.X, self.release, self.r, self.trellis, self.layout = X, release, r, trellis, layout
+
+    def owned(self, key, rule):
+        """The rank's pieces of a layout group, or the converter's (first, count) chunk."""
+        if self.layout:
+            return [i for i, o in enumerate(self.layout['groups'][key]) if o == self.r]
+        a, n = rule
+        return list(range(a, a + n))
 
     def layer(self, l, qo=False):
         X, r = self.X, self.r
@@ -70,7 +86,7 @@ class Expect:
         raw = lambda m, s: np_of(f.get(f'{m}.{s}'))
         dec = lambda m: X.decode_dense(rec[m], {s: f.get(f'{m}.{s}') for s in X.DATA[int(rec[m][0])]}).numpy()
         P, mtp = f'L{l:03d}', l == plan.L_MTP
-        h0, nh = plan.heads(l)[r]
+        heads = self.owned(f'heads {l}', plan.heads(l)[r])
         T = {}
 
         def mx_copy(name, m, gv=True, copy=True):
@@ -95,7 +111,7 @@ class Expect:
         def entries(name, m, ch):
             """the dense trellis kernels' form: the rank's entries as stored, suh / svh sliced on the sharded side"""
             side = int(rec[m][4])
-            T[f'{P}.{name}.trellis'] = raw(m, 'trellis')[ch.start // 128:ch.stop // 128]
+            T[f'{P}.{name}.trellis'] = raw(m, 'trellis')[ch[::128] // 128]
             T[f'{P}.{name}.suh'] = raw(m, 'suh')[ch] if side == X.IN else raw(m, 'suh')
             T[f'{P}.{name}.svh'] = raw(m, 'svh') if side == X.IN else raw(m, 'svh')[ch]
         tr = lambda m: self.trellis and int(rec[m][0]) == X.TRELLIS
@@ -105,23 +121,24 @@ class Expect:
         mx_copy('kv_a', 'self_attn.kv_a_proj_with_mqa')
         vec('kv_a_norm', 'self_attn.kv_a_layernorm.weight')
         qb = dec('self_attn.q_b_proj')
-        heads = slice(h0 * 256, (h0 + nh) * 256)
+        hrows = rows_of(heads, 256)
         if tr('self_attn.q_b_proj'):
-            entries('q_b', 'self_attn.q_b_proj', heads)
+            entries('q_b', 'self_attn.q_b_proj', hrows)
         else:
-            mx_round('q_b', qb[heads], True)
+            mx_round('q_b', qb[hrows], True)
             if int(rec['self_attn.q_b_proj'][0]) == X.INT4:
-                T[f'{P}.q_b.gptq'] = g6ref.rt_record(g6ref.RT('int4'), raw('self_attn.q_b_proj', 'q4')[heads],
-                                                     raw('self_attn.q_b_proj', 's4')[heads])
+                T[f'{P}.q_b.gptq'] = g6ref.rt_record(g6ref.RT('int4'), raw('self_attn.q_b_proj', 'q4')[hrows],
+                                                     raw('self_attn.q_b_proj', 's4')[hrows])
         kvb = bf16(dec('self_attn.kv_b_proj')).reshape(64, 448, 512)
-        T[f'{P}.kv_b.uk'], T[f'{P}.kv_b.uv'] = kvb[h0:h0 + nh, :192], kvb[h0:h0 + nh, 192:]
-        op = dec('self_attn.o_proj')[:, heads]
+        T[f'{P}.kv_b.uk'], T[f'{P}.kv_b.uv'] = kvb[heads, :192], kvb[heads, 192:]
+        op = dec('self_attn.o_proj')[:, hrows]
         if tr('self_attn.o_proj'):
-            entries('o_proj', 'self_attn.o_proj', heads)
+            entries('o_proj', 'self_attn.o_proj', hrows)
         elif not mtp:
             if int(rec['self_attn.o_proj'][0]) == X.INT4:   # the release's own codes, side-2 storage transposed back
-                q4 = raw('self_attn.o_proj', 'q4')[2 * h0:2 * (h0 + nh)].transpose(1, 0, 2).reshape(H, -1)
-                s4 = raw('self_attn.o_proj', 's4')[2 * h0:2 * (h0 + nh)].transpose(1, 0, 2).reshape(H, -1)
+                blk = rows_of(heads, 2)                       # two 128-input blocks a head
+                q4 = raw('self_attn.o_proj', 'q4')[blk].transpose(1, 0, 2).reshape(H, -1)
+                s4 = raw('self_attn.o_proj', 's4')[blk].transpose(1, 0, 2).reshape(H, -1)
             else:
                 q4, s4 = int4_quantize(op)
             T[f'{P}.o_proj.gptq'] = g6ref.rt_record(g6ref.RT('int4'), q4, s4)
@@ -138,13 +155,13 @@ class Expect:
             with_gv('router.w', dec('mlp.gate'))
             vec('router.bias', 'mlp.gate.e_score_correction_bias')
         else:
-            g0, ng = plan.dense_groups(l)[r]
-            a, b = g0 * 32, (g0 + ng) * 32
+            g0, ng = plan.dense_groups(l)[r]                  # g32 groups, four to a 128-channel block
+            ch = rows_of(self.owned(f'dense {l}', (g0 // 4, ng // 4)), 128)
         if not plan.is_moe(l) and all(tr(f'mlp.{n}_proj') for n in ('gate', 'up', 'down')):
             for n in ('gate', 'up', 'down'):
-                entries(f'dense.{n}', f'mlp.{n}_proj', slice(a, b))
+                entries(f'dense.{n}', f'mlp.{n}_proj', ch)
         elif not plan.is_moe(l):
-            g, u, d = dec('mlp.gate_proj')[a:b], dec('mlp.up_proj')[a:b], dec('mlp.down_proj')[:, a:b]
+            g, u, d = dec('mlp.gate_proj')[ch], dec('mlp.up_proj')[ch], dec('mlp.down_proj')[:, ch]
             f1, f2 = g6ref.rt_expert_record(g6ref.RT('int4'), *int4_quantize(g), *int4_quantize(u), *int4_quantize(d))
             T[f'{P}.dense.gptq.fc1'], T[f'{P}.dense.gptq.fc2'] = f1, f2
             for n, w in (('gate', g), ('up', u), ('down', d)):
@@ -170,6 +187,63 @@ class Expect:
                 'G.lm_head.mx.gv': g6ref.mxfp8_record(c, s)}
 
 
+class FlashExpect:
+    """Independent derivation from the Python lossless loader, including split-only groups."""
+    ALIAS = dict(zip(
+        ['input_layernorm.weight','post_attention_layernorm.weight','self_attn.q_a_proj.weight',
+         'self_attn.q_a_layernorm.weight','self_attn.q_b_proj.weight','self_attn.kv_a_proj_with_mqa.weight',
+         'self_attn.kv_a_layernorm.weight','self_attn.o_proj.weight','self_attn.indexer.wq_b.weight',
+         'self_attn.indexer.wk.weight','self_attn.indexer.weights_proj.weight','self_attn.indexer.k_norm.weight',
+         'self_attn.indexer.k_norm.bias','mlp.gate.weight','mlp.gate.e_score_correction_bias','mlp.gate_proj.weight',
+         'mlp.up_proj.weight','mlp.down_proj.weight','eh_proj.weight','enorm.weight','hnorm.weight','shared_head.norm.weight'],
+        ['attn_norm','mlp_norm','q_a','q_a_norm','q_b','kv_a','kv_a_norm','o_proj','idx.wq_b','idx.wk',
+         'idx.weights_proj','idx.k_norm.w','idx.k_norm.b','router.w','router.bias','dense.gate','dense.up',
+         'dense.down','eh','enorm','hnorm','shared_head_norm']))
+
+    def __init__(self, X, release, r, trellis):
+        self.X, self.release, self.r = X, release, r
+
+    def put(self, T, name, t, gv=True):
+        T[name] = np_of(t.contiguous())
+        if gv and t.dtype == torch.bfloat16 and t.ndim == 2 and all(n % 16 == 0 for n in t.shape):
+            T[name + '.gv'] = g6ref.bf16_record(T[name])
+
+    def layer(self, l, qo=False):
+        X, T = self.X, {}
+        files = X.dense_files(self.release, 'dense', l)
+        values = X.load_dense_files(files, lambda n: n, torch.bfloat16, 'cpu', False)
+        h0, nh = plan.heads(l)[self.r]
+        g0, ng = plan.dense_groups(l)[self.r]
+        for name, value in values.items():
+            local = name.removeprefix(f'model.language_model.layers.{l}.')
+            short = self.ALIAS.get(local, local)
+            label = f'L{l:03d}.{short}'
+            if local == 'self_attn.kv_b_proj.weight':
+                w = value.reshape(64,512,512)[h0:h0+nh]
+                self.put(T, f'L{l:03d}.kv_b.uk', w[:,:256], False)
+                self.put(T, f'L{l:03d}.kv_b.uv', w[:,256:], False)
+                continue
+            if short == 'q_b': value = value[h0*256:(h0+nh)*256]
+            elif short == 'o_proj':
+                head = value.shape[1]//64
+                value = value[:,h0*head:(h0+nh)*head]
+            elif short in ('dense.gate','dense.up'): value = value[g0*32:(g0+ng)*32]
+            elif short == 'dense.down': value = value[:,g0*32:(g0+ng)*32]
+            self.put(T, label, value)
+        return T
+
+    def globals(self):
+        X, T = self.X, {}
+        values = X.load_vocab(self.release)
+        a, n = plan.vocab_rows(self.r)
+        for name, value in values.items():
+            if name.endswith('embed_tokens.weight'): self.put(T, 'G.embed', value, False)
+            elif name.endswith('lm_head.weight'): self.put(T, 'G.lm_head', value[a:a+n])
+            elif name.endswith('norm.weight'): self.put(T, 'G.final_norm', value, False)
+            else: raise ValueError(name)
+        return T
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--release', required=True)
@@ -179,32 +253,44 @@ def main():
     ap.add_argument('--tp', type=int, required=True)
     ap.add_argument('--ranks', required=True)
     ap.add_argument('--layers', required=True)
+    ap.add_argument('--partial', action='store_true', help='component test: only plan the requested layers')
+    ap.add_argument('--no-globals', action='store_true')
+    ap.add_argument('--no-experts', action='store_true', help='dense-only check: do not materialize expert payloads')
     ap.add_argument('--qo', action='store_true', help='plan and check the G6_PF_OWN=3 full-head tensors too')
     ap.add_argument('--rounded', action='store_true', help='plan and check the rounded form of the trellis matrices')
+    ap.add_argument('--layout', help='plan the ranks from this layout file (bin/g6layout)')
     ap.add_argument('--work', default='/tmp/release-check')
     a = ap.parse_args()
     sys.path.insert(0, a.ref)
     from loader import exlr8 as X
     plan.set_nr(a.tp)
+    flash = int(json.load(open(a.widths)).get('hidden_size', 6144)) == 4096
     os.makedirs(a.work, exist_ok=True)
     layers = [int(x) for x in a.layers.split(',')]
+    layout = None
+    if a.layout and flash:
+        sys.exit('--layout: GLM-5.3-Flash plans the formulas only')
+    if a.layout:
+        with open(a.layout) as f:
+            layout = json.load(f)
     fails, n_t, n_b = [], 0, 0
     for r in [int(x) for x in a.ranks.split(',')]:
         out = os.path.join(a.work, f'tp{a.tp}.r{r}.safetensors')
         rel = a.release
         subprocess.run([a.dump, rel, os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'), a.widths, str(a.tp),
-                        str(r), out, '--layers', a.layers, '--globals', '--experts'] + (['--qo'] if a.qo else [])
-                       + (['--rounded'] if a.rounded else []),
+                        str(r), out, '--layers', a.layers] + ([] if a.no_experts else ['--experts']) + ([] if a.no_globals else ['--globals'])
+                       + (['--partial'] if a.partial else []) + (['--qo'] if a.qo else [])
+                       + (['--rounded'] if a.rounded else []) + (['--layout', a.layout] if a.layout else []),
                        check=True, stderr=subprocess.DEVNULL)
         got = X.SafeFile(out)
-        e = Expect(X, a.release, r, not a.rounded)
-        want = e.globals()
+        e = FlashExpect(X, a.release, r, not a.rounded) if flash else Expect(X, a.release, r, not a.rounded, layout)
+        want = {} if a.no_globals else e.globals()
         for l in layers:
             want.update(e.layer(l, a.qo))
         names = set(got.names())
         experts = {n for n in names if n[5:].startswith('tr3.')}
         for l in layers:
-            if plan.is_moe(l) and not {f'L{l:03d}.tr3.{t}' for t in ('fc1', 'fc2', 'table', 'kmix', 'v2')} <= experts:
+            if not a.no_experts and str(l) in json.load(open(a.widths))['layers'] and not {f'L{l:03d}.tr3.{t}' for t in ('fc1', 'fc2', 'table', 'kmix', 'v2')} <= experts:
                 fails.append((r, f'L{l:03d}', 'expert tensors missing'))
         if names - experts != set(want):
             fails.append((r, 'names', sorted((names - experts) ^ set(want))))

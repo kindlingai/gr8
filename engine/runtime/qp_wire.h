@@ -31,17 +31,20 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include "../model_geom.h"
 
 namespace g6rt
 {
 namespace qw
 {
-constexpr size_t QC = (size_t)4096 * 2048, QS = (size_t)4096 * 64, OC = (size_t)6144 * 4096, OS = (size_t)6144 * 128,
+constexpr size_t QC = (size_t)4096 * geom::QA, QS = (size_t)4096 * (geom::QA / 32), OC = (size_t)geom::HID * 4096, OS = (size_t)geom::HID * 128,
                  UK = (size_t)16 * 192 * 512 * 2, UV = (size_t)16 * 256 * 512 * 2, QV = (size_t)4096 * 2, OV = (size_t)4096 * 2;
 constexpr size_t OFF_QC = 0, OFF_QS = OFF_QC + QC, OFF_OC = OFF_QS + QS, OFF_OS = OFF_OC + OC, OFF_UK = OFF_OS + OS,
                  OFF_UV = OFF_UK + UK, OFF_QV = OFF_UV + UV, OFF_OV = OFF_QV + QV, HALF = OFF_OV + OV;
+#if !G6_MODEL_FLASH   // the QO pair still carries the GLM MLA UK [16][192][512] (rope part); Flash NoPE is ENGINE-PLAN W5/W9
 static_assert(HALF == 41943040 + 16384, "half image: 40 MiB + 16 KiB per pair member and layer");
-constexpr size_t OT = (size_t)32 * 393216;          // a dense trellis o_proj half: 32 K4 entries of 128 input rows x 6144
+#endif
+constexpr size_t OT = (size_t)32 * 128 * geom::HID / 2;   // a dense trellis o_proj half: 32 K4 entries of 128 input rows x HID
 static_assert(OT <= OC, "the trellis o_proj half fits the o_proj codes range");
 static_assert(OFF_QS % 8 == 0 && OFF_OC % 8 == 0 && OFF_OS % 8 == 0 && OFF_UK % 8 == 0 && OFF_UV % 8 == 0 && OFF_QV % 8 == 0 &&
               OFF_OV % 8 == 0, "8-B ranges");
