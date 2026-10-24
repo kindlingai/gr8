@@ -96,11 +96,13 @@ Grammar grammar_open(const GrammarSpec& spec)
 {
     auto& b = boot();
     if (!b.compiler) throw std::runtime_error("the engine was started without --grammar-dir");
-    // json_object is any JSON object. Whitespace is JSON's usual (", ", ": "), not any run of it, so the model cannot pad
-    // a value with tabs and newlines that a free grammar allows; keys in any order (the front end checks required ones)
-    const std::string& schema = spec.kind == GrammarSpec::JSON ? std::string(R"({"type": "object"})") : spec.schema;
+    // json_object is any JSON object. The layout is a 2-space pretty print, the one GLM-5.3 writes unasked: then the
+    // drafters' drafts (which see no grammar) mostly fit, where a compact layout cost 13% of decode in rejected drafts,
+    // and the model cannot pad a value with the tabs and newlines a free-whitespace grammar allows. Keys in any order
+    // (the front end checks the required ones)
+    const std::string schema = spec.kind == GrammarSpec::JSON ? std::string(R"({"type": "object"})") : spec.schema;
     const xgrammar::CompiledGrammar g =
-        b.compiler->CompileJSONSchema(schema, false, std::nullopt, std::nullopt, spec.strict, std::nullopt, true);
+        b.compiler->CompileJSONSchema(schema, false, 2, std::nullopt, spec.strict, std::nullopt, true);
     return Grammar(new GrammarState(g, spec.arm));
 }
 

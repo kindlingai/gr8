@@ -15,11 +15,11 @@ using namespace g6rt;
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-// ids: 0..12 single characters, 13 = "<think>", 14 = "</think>", 15 = "<eos>"
-static const std::vector<std::string> TOK = {"{", "}", "\"", ":", ",", "a", "b", "1", "2", "Ġ", "x", "[", "]"};
-constexpr int THINK = 13, ARM = 14, EOS = 15, V = 16;
+// ids: 0..13 single characters (byte-level: Ġ is a space, Ċ a newline), 14 = "<think>", 15 = "</think>", 16 = "<eos>"
+static const std::vector<std::string> TOK = {"{", "}", "\"", ":", ",", "a", "b", "1", "2", "Ġ", "x", "[", "]", "Ċ"};
+constexpr int THINK = 14, ARM = 15, EOS = 16, V = 17;
 static int id(char c) {
-    const std::string t = c == ' ' ? "Ġ" : std::string(1, c);    // byte-level: a space is U+0120
+    const std::string t = c == ' ' ? "Ġ" : c == '\n' ? "Ċ" : std::string(1, c);    // byte-level: U+0120, U+010A
     for (size_t i = 0; i < TOK.size(); ++i) if (TOK[i] == t) return int(i);
     throw std::runtime_error("no token");
 }
@@ -35,9 +35,9 @@ int main() {
             std::string k = TOK[i] == "\"" ? "\\\"" : TOK[i];
             t << (i ? ", " : "") << '"' << k << "\": " << i;
         }
-        t << R"(}, "merges": []}, "added_tokens": [{"id": 13, "content": "<think>"}, {"id": 14, "content": "</think>"},
-               {"id": 15, "content": "<eos>"}], "pre_tokenizer": {"type": "ByteLevel"}, "decoder": {"type": "ByteLevel"}})";
-        std::ofstream(std::string(dir) + "/generation_config.json") << R"({"eos_token_id": 15})";
+        t << R"(}, "merges": []}, "added_tokens": [{"id": 14, "content": "<think>"}, {"id": 15, "content": "</think>"},
+               {"id": 16, "content": "<eos>"}], "pre_tokenizer": {"type": "ByteLevel"}, "decoder": {"type": "ByteLevel"}})";
+        std::ofstream(std::string(dir) + "/generation_config.json") << R"({"eos_token_id": 16})";
     }
     const std::string err = grammar_init(dir, V);
     if (!err.empty()) { std::printf("grammar_init: %s\n", err.c_str()); return 1; }
@@ -57,23 +57,26 @@ int main() {
     grammar_masks(*g, drafts1, 2, on.data(), bits.data());
     CHECK(on[0] == 0 && on[1] == 1 && on[2] == 1);
     CHECK(allows(&bits[1 * W], id('{')) && !allows(&bits[1 * W], id('x')) && !allows(&bits[1 * W], id('[')));
-    CHECK(allows(&bits[2 * W], id('"')) && !allows(&bits[2 * W], id('}')));   // "a" is required: no empty object
+    // a 2-space pretty print: a newline after the brace, and "a" is required, so no empty object
+    CHECK(allows(&bits[2 * W], id('\n')) && !allows(&bits[2 * W], id('"')) && !allows(&bits[2 * W], id('}')));
 
     // the reply so far: thinking, then the close
     const int think[] = {THINK, id('x'), ARM};
     grammar_commit(*g, think, 3);
-    // row 0 samples after the committed reply; drafts {"a" are good, then 'x' where only ':' fits turns the rest off
-    const int drafts2[] = {id('{'), id('"'), id('a'), id('"'), id('x')};
-    grammar_masks(*g, drafts2, 5, on.data(), bits.data());
-    CHECK(on[0] == 1 && on[1] == 1 && on[2] == 1 && on[3] == 1 && on[4] == 1 && on[5] == 0);
+    // row 0 samples after the committed reply; the drafts {\n  "a" are good, then 'x' where only ':' fits turns the rest off
+    std::vector<int> drafts2;
+    for (char c : std::string("{\n  \"a\"x")) drafts2.push_back(id(c));
+    grammar_masks(*g, drafts2.data(), int(drafts2.size()), on.data(), bits.data());
+    for (int i = 0; i <= 7; ++i) CHECK(on[i] == 1);
+    CHECK(on[8] == 0);
     CHECK(allows(&bits[0], id('{')) && !allows(&bits[0], EOS));
-    CHECK(allows(&bits[4 * W], id(':')) && !allows(&bits[4 * W], id('x')));
+    CHECK(allows(&bits[7 * W], id(':')) && !allows(&bits[7 * W], id('x')));
     // the masks left the matcher where it was
     grammar_masks(*g, nullptr, 0, on.data(), bits.data());
     CHECK(on[0] == 1 && allows(&bits[0], id('{')) && !allows(&bits[0], id('"')));
 
-    // commit a whole valid object (JSON's usual separators): then only the stop id
-    const std::string obj = "{\"a\": 12}";
+    // commit a whole valid object, pretty-printed: then only the stop id
+    const std::string obj = "{\n  \"a\": 12\n}";
     std::vector<int> ids;
     for (char c : obj) ids.push_back(id(c));
     grammar_commit(*g, ids.data(), int(ids.size()));
