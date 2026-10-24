@@ -138,6 +138,7 @@ KEYS = {
     'DRAFT_HEAD2': ('cluster', None, "MTP draft head in two stages, 1, or 2 = with a check, experimental (G6_DRAFT_HEAD2)"),
     'MTP_L2PF': ('cluster', None, 'MTP draft steps: the paced L2 prefetch, 1 draft step, 2 head waits, 3 both; needs L2PF (G6_MTP_L2PF)'),
     'MTP_KSTOPB_WIDTHS': ('cluster', None, 'MTP_KSTOPB: the shared-round widths with captured graphs, w1,w2,... (G6_MTP_KSTOPB_WIDTHS)'),
+    'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
     'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),

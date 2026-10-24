@@ -97,6 +97,7 @@ manifest instead.
 | `DRAFT_HEAD2` | unset (0) | unset (0) | unset (0) | experimental: 1 = the MTP draft head in two stages, a 2-bit screen then the exact MXFP8 logits of its best 64 (`G6_DRAFT_HEAD2`; drafts only, +74.5 MB a rank at TP=4); 2 = also the MXFP8 check (measurement). No end-to-end number. In the TP=6 K3 recipe |
 | `MTP_L2PF` | unset (0) | unset (0) | unset (0) | with `G6_L2PF`: the paced L2 prefetch in MTP draft steps, 1 = the draft step, 2 = the head waits, 3 = both (`G6_MTP_L2PF`; same bytes). TP=6: about 0.1 ms per ~39 ms round, below speedbench resolution. In the TP=6 K3 recipe (3) |
 | `MTP_KSTOPB_WIDTHS` | unset | unset | unset | with `G6_MTP_KSTOPB`: the main widths captured besides the multiples of `MTP` + 1, `w1,w2,...` (`G6_MTP_KSTOPB_WIDTHS`); fewer widths = less graph memory (about 115 MiB a width a rank at TP=4) and a shorter boot. |
+| `TR3_W2ALL` | 1 | unset (0) | unset (0) | 1 = the window-2 fc1 split (KS1x2, WG1) on every MoE layer at M > 1, not only the layers the k2 gate picks (`G6_TR3_W2ALL`; bit-exact). Measured at TP=4 only |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
