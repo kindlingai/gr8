@@ -318,7 +318,7 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 | `tools/convert/` | the readers, writers and test fixtures behind the exlr8 release |
 | `smoketest/`, `bench/` | the smoke test, benchmarks and the quality gate |
 | `docs/` | engine settings, the prefill attention design, the model-specific parts |
-| [KNOBS.md](KNOBS.md), [CHANGELOG.md](CHANGELOG.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | every option; what changed and the measurements behind it; open bugs; the front end to engine protocol; how to build, test and land a change |
+| [KNOBS.md](KNOBS.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | every option; open bugs; the front end to engine protocol; how to build, test and land a change |
 
 gr8 is written for GLM 5.3's shapes, not as a general engine. [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every
 place the model is built in, and what would carry over to another model.

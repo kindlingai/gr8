@@ -1,6 +1,6 @@
 # Model descriptor, so a cluster can be planned without reading the launchers. Nothing reads it at run time except
 # smoketest/run.sh, which takes the served name from it. Where it repeats a value (the KV pool), tools/launch/options.py
-# and scripts/engine_args.sh are the ones that take effect, and CHANGELOG.md holds the measurement behind each number.
+# and scripts/engine_args.sh are the ones that take effect; the measurement behind each number is in the PR that set it.
 # The front end's first --served-model-name; it also answers to glm53.
 name: glm-5.3
 checkpoints:
@@ -19,7 +19,7 @@ tp:
 per_rank:
   tp4:
     variant: home               # 3.25 bpw routed experts
-    weights_gb: 83              # the device image from the release (CHANGELOG 2026-10-10)
+    weights_gb: 83              # the device image from the release (measured 2026-10-10)
     s2_step_graphs_gib: 2.5     # SESS=8
     kv_pool_tokens: 393216      # CAP
     memavailable_after_boot_gib: 5.6-6.2   # S2 with DFlash2, 8 sessions

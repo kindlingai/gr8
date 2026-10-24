@@ -27,7 +27,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Shipped. The engine sources and their tests stay in: scripts/build.sh compiles engine/tests/test_spec_len.cpp and
 # test_prefix_reuse.cpp on every build, scripts/host_tests.sh and c1_tests.sh build the s2 and runtime tests, and
 # tools/convert imports engine/ref/g6ref.py. A tester can rebuild from the zip with the README's own commands.
-SHIP = {'README.md', 'LICENSE', 'CHANGELOG.md', 'KNOWN-ISSUES.md', 'PROTOCOL.md', 'bench', 'config', 'docs', 'engine',
+SHIP = {'README.md', 'LICENSE', 'KNOWN-ISSUES.md', 'PROTOCOL.md', 'bench', 'config', 'docs', 'engine',
         'frontend', 'scripts', 'tools', 'Dockerfile', '.dockerignore', 'docker', 'gr8', 'KNOBS.md', 'AGENTS.md',
         'model.yaml', 'kindling.json', 'smoketest'}
 # Not shipped: repo plumbing.
