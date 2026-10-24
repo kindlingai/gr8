@@ -128,9 +128,13 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/h
 
 # Offline distributed logit dump framing and merge validation.
 (cd "$REPO" && python3 -m unittest tools.cp.test_merge_logits)
-# Flash single-session KDA state rollback across accepted prefixes.
+# Flash KDA state rollback across accepted prefixes, and each session's slots and ring (s2/flash_ring.h).
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_ring.cpp" -o "$T/test_flash_ring"
 "$T/test_flash_ring"
+# the KDA carry mode (Args::src per row: the ring, and several sessions in one step) on the CPU model of k_kda_core.
+# Bit for bit across the kernel's M paths, so no FMA contraction (the host compiler would contract each path its own way).
+g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_carry_cpu_test.cpp" -o "$T/kda_carry_cpu_test"
+"$T/kda_carry_cpu_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test"
 "$T/control_tp2_test"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost"
