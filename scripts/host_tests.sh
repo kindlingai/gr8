@@ -176,3 +176,6 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/tests/t
 "$T/test_flash_ckpt_index"
 # G6_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
 python3 "$REPO/engine/tests/test_flash_terminal_retain.py"
+# G6_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
+# the real Service on two ranks; the entry stays aligned and a longer prompt keeps its own aligned checkpoint
+python3 "$REPO/engine/tests/test_flash_terminal_cancel.py"

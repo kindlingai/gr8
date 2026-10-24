@@ -40,6 +40,15 @@
   Cost with no sharing: one empty-function check per boundary. The ~65 ms capture moves out of the quantum's
   `prefill ... ms` line into the gap before the next step (same thread, same total). The prompt's tokens (64 KiB at
   16,384) are held for one boundary. Not measured on a box.
+- G6_FLASH_CACHE=terminal, a session cancelled at the boundary its aligned capture waits for: the terminal retain
+  (flash_native.cuh h.pool.retain) now takes the pending aligned capture first. At that boundary the two have the
+  same tokens, and capture() keeps the first and only touches the second, so before this the entry was terminal and
+  a later prompt on that prefix restored it as not cold-exact and kept no aligned checkpoint of its own (#174 review,
+  Assayer cd20a51). The bytes were the same; the flag and the reuse it allows are now as before cd20a51. Test:
+  `engine/tests/test_flash_terminal_cancel.py` (host_tests.sh) compiles flash_native.cuh's own checkpoint hooks into
+  `engine/runtime/s2/tests/flash_terminal_cancel_test.cpp` and runs them on two ranks through the real Service: the
+  entry is aligned and the longer prompt keeps an aligned entry at 8,192. On cd20a51's flash_native.cuh: terminal,
+  NOT exact, no 8,192 entry.
 - Tests: `engine/runtime/s2/tests/flash_capture_order_test.cpp` (host_tests.sh). Two ranks run the real Service loop
   with a stand-in store that is full at 5 entries. The head announces a grow during quantum 0, the grow commits at the
   boundary quantum 1 ends on, and the capture there keeps 6 entries with none dropped. On cbdcf54 the same test keeps

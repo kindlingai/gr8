@@ -87,8 +87,11 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     if (ck) {
         // a retiring run goes back to the pool: its aligned checkpoint, if any, was taken during its prefill. terminal:
         // first keep rows [0, p), p = the rows it consumed (its last output token is pending: token p), with the KDA
-        // state the ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step.
+        // state the ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step. A session
+        // cancelled at the boundary its aligned capture waits for: that capture first, so the entry for those tokens is
+        // the aligned one (a terminal capture of the same tokens then only touches it)
         h.pool.retain = [&](const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
+            take_capture();
             if (c.terminal && st.history.size() > 1) {
                 const uint32_t p = uint32_t(std::min<int>(st.main_end, int(st.history.size()) - 1));
                 int slot = -1;

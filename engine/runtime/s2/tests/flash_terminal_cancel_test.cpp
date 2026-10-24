@@ -1,16 +1,17 @@
 // G6_FLASH_CACHE=terminal and a cancel at the boundary the prefill checkpoint waits for (#174 cd20a51 follow-up 1,
 // Assayer reports/assayer-pr174/cd20a51/report.md). The cancel commits at that boundary: the terminal retain keeps
-// rows [0, p) at the event (s2/service.h retire_run, flash_native.cuh h.pool.retain), then the native retire takes the
-// pending aligned capture (flash_native.cuh h.retire). For a cancel right at the grid point p is the grid point and
-// the two have the same tokens, so the second is deduplicated (flash_checkpoint.cuh capture: index_.same) and the
-// entry keeps the FIRST capture's flag. Terminal first: the entry is terminal; a later prompt that starts with it
-// restores it as not cold-exact (flash_native.cuh bind: exact = !x->terminal) and keeps no aligned checkpoint.
-// Before cd20a51 the aligned capture ran inside the quantum, first, and the entry was aligned.
-// Asserted here, the pre-cd20a51 outcome: the entry is aligned (terminal=false) and the next prompt keeps its aligned
-// checkpoint at its own grid point. Real Service, Driver, scheduler, event gate and reuse state (Dispatch rows) on two
-// ranks over socket pairs; the store is the real FlashIndex with capture()'s dedup rule, the ring the real FlashRing;
-// the hooks follow flash_native.cuh at cd20a51 (retain, bind, prefill, retire, before_work). No GPU.
-// -DBEFORE_CD20A51: the control, the capture inside the quantum as before cd20a51 (the test passes).
+// rows [0, p) at the event (s2/service.h retire_run, flash_native.cuh h.pool.retain) and the native retire takes the
+// pending aligned capture (flash_native.cuh h.retire). For a cancel right at the grid point the two have the same
+// tokens, so the second is deduplicated (flash_checkpoint.cuh capture: index_.same) and the entry keeps the FIRST
+// capture's flag. Terminal first: the entry is terminal, and a later prompt that starts with it restores it as not
+// cold-exact (flash_native.cuh bind: exact = !x->terminal) and keeps no aligned checkpoint (cd20a51). Asserted: the
+// entry is aligned and the next prompt keeps its aligned checkpoint at its own grid point (before cd20a51, and with
+// the retain flushing the pending capture first).
+// Real Service, Driver, scheduler, event gate and reuse state (Dispatch rows) on two ranks over socket pairs. The
+// Flash hooks are flash_native.cuh's own source -- take_capture, h.pool.retain, the prefill's capture block, h.retire,
+// h.before_work -- pasted in at the @...@ markers by engine/tests/test_flash_terminal_cancel.py, over a store that is
+// the real FlashIndex with capture()'s dedup rule and the real FlashRing. bind is this file's copy of the checkpoint
+// part of flash_native.cuh h.bind (the rest is GPU). No GPU. Run: python3 engine/tests/test_flash_terminal_cancel.py
 #include "s2/service.h"
 #include "s2/flash_checkpoint.h"
 #include "s2/flash_ring.h"
@@ -23,88 +24,94 @@ static int fails = 0;
 
 constexpr uint32_t GRID = 2048, P1 = 2 * GRID + 4, P2 = 4 * GRID + 4;   // request 1 checkpoints at 4096, request 2 at 8192
 
+// the FlashCheckpoints calls the hooks make, over the real index (flash_checkpoint.cuh capture: dedup, then a new entry)
+struct Ckpt {
+    FlashIndex ix{100000};
+    struct Last { uint64_t blocks = 0; double ms = 0; } last;
+    std::vector<std::string> log;
+    FlashIndex& index() { return ix; }
+    uint64_t blocks() const { return ix.blocks(); }
+    uint64_t capture(uint32_t position, int, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, int,
+                     bool terminal = false) {
+        if (const FlashEntry* x = ix.same(tokens, ns)) {
+            ix.touch(x->generation);
+            log.push_back((terminal ? "terminal " : "aligned ") + std::to_string(position) + " dedup -> entry " +
+                          std::to_string(x->generation) + (x->terminal ? " (terminal)" : " (aligned)"));
+            return x->generation;
+        }
+        uint64_t base = 0;
+        const uint64_t need = 1 + (position + 63) / 64;
+        if (!ix.reserve(need, base)) return 0;
+        FlashEntry x;
+        x.generation = ix.next_generation(); x.base = base; x.blocks = need; x.position = position; x.terminal = terminal;
+        x.tokens = tokens; x.ns = ns;
+        log.push_back((terminal ? "terminal " : "aligned ") + std::to_string(position) + " new entry " + std::to_string(x.generation));
+        const uint64_t g = x.generation;
+        ix.add(std::move(x));
+        return g;
+    }
+};
 struct Rank {
-    std::mutex mu;
-    FlashIndex index{100000};
+    struct { bool terminal = true; int stream = 0; } c;   // G6_FLASH_CACHE=terminal
+    Ckpt real; Ckpt* ck = &real;
+    struct { void release(const Run&) {} } pool;
     FlashRing ring;
+    std::mutex ck_mu;
     uint32_t capture_at = 0;
+    g6rt::CacheNamespace capture_ns{};
     std::vector<int> capture_tokens;
+    uint64_t capture_req = 0;
+    std::function<void()> take_capture;
+    void fence() {}
     std::atomic<bool> in_q0{false};
     std::atomic<uint32_t> pf_end{0};       // request 2: the end of its last prefill quantum
     std::atomic<long> steps{0};
-    std::atomic<int> binds{0};
     bool exact2 = true; uint32_t reuse2 = 0;
-    std::vector<std::string> log;
-    // flash_checkpoint.cuh FlashCheckpoints::capture: the same tokens already kept -> touch, nothing written
-    void capture(uint32_t position, const std::vector<int>& tokens, bool terminal) {
-        std::lock_guard<std::mutex> l(mu);
-        if (const FlashEntry* x = index.same(tokens, {})) {
-            index.touch(x->generation);
-            log.push_back((terminal ? "terminal " : "aligned ") + std::to_string(position) + " dedup -> entry " +
-                          std::to_string(x->generation) + (x->terminal ? " (terminal)" : " (aligned)"));
-            return;
-        }
-        uint64_t base = 0;
-        require(index.reserve(1 + (position + 63) / 64, base), "stand-in store full");
-        FlashEntry x;
-        x.generation = index.next_generation(); x.base = base; x.blocks = 1 + (position + 63) / 64;
-        x.position = position; x.terminal = terminal; x.tokens = tokens;
-        log.push_back((terminal ? "terminal " : "aligned ") + std::to_string(position) + " new entry " + std::to_string(x.generation));
-        index.add(std::move(x));
-    }
-    void take_capture() {
-        if (capture_tokens.empty()) return;
-        capture(uint32_t(capture_tokens.size() - 1), capture_tokens, false);
-        capture_tokens.clear();
-    }
     NativeHooks hooks() {
         NativeHooks h;
+        // flash_native.cuh take_capture
+@TAKE_CAPTURE@
         h.pool.free_pages = [] { return uint32_t(1024); };
         h.pool.room = [] { return uint32_t(1024); };
         h.pool.reserve = [](uint64_t, uint64_t worst) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
         h.pool.release = [](const Run&) {};
         h.pool.fits = [](uint64_t, uint64_t) { return true; };
-        // flash_native.cuh h.pool.retain (terminal), h.pool.match, h.pool.take
-        h.pool.retain = [this](const Run&, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace&) {
-            if (st.history.size() > 1) {
-                const uint32_t p = uint32_t(std::min<int>(st.main_end, int(st.history.size()) - 1));
-                int slot = -1;
-                try { slot = ring.source(int(p)); } catch (const std::exception&) {}
-                if (p > 0 && slot >= 0) capture(p, std::vector<int>(st.history.begin(), st.history.begin() + p + 1), true);
-            }
-        };
+        // flash_native.cuh h.pool.retain
+@RETAIN@
         h.pool.match = [this](const std::vector<int>& prompt, uint64_t, uint64_t, int limit, const g6rt::CacheNamespace& ns) {
-            std::lock_guard<std::mutex> l(mu);
-            const FlashHit f = index.match(prompt, limit, ns);
+            std::lock_guard<std::mutex> l(ck_mu);
+            const FlashHit f = ck->index().match(prompt, limit, ns);
             PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
             if (f.hit) { hit.skip = int(f.position); hit.age = f.generation; }
             return hit;
         };
         h.pool.take = [](const PoolHit&, uint64_t, uint64_t worst) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
-        // flash_native.cuh h.bind (the checkpoint part)
+        // the checkpoint part of flash_native.cuh h.bind
         h.bind = [this](const Grant& g) {
             ring.reset(); capture_at = 0; capture_tokens.clear();
+            capture_ns = g6rt::steering::cache_namespace(g.req.steering);
             bool exact = true;
             if (g.reuse) {
-                std::lock_guard<std::mutex> l(mu);
-                const FlashEntry* x = index.find(match_gen(g));
+                std::lock_guard<std::mutex> l(ck_mu);
+                const FlashEntry* x = nullptr;   // the newest entry at the hit's position (the one match picks)
+                for (const auto& e : ck->index().entries()) if (e.position == g.reuse && (!x || e.generation > x->generation)) x = &e;
                 require(x && x->position == g.reuse, "hit differs from its entry");
                 exact = !x->terminal;
             }
             const uint32_t at = aligned_point(g.req.prompt_tokens, GRID);
             if (exact && at > g.reuse) capture_at = at;
             if (g.req.prompt_tokens == P2) { exact2 = exact; reuse2 = g.reuse; }
-            ++binds;
         };
-        h.retire = [this](const Slot&) { take_capture(); };
-        h.before_work = [this] { take_capture(); };
-        h.fence = [] {};
+        // flash_native.cuh h.retire, h.before_work
+@RETIRE@
+@BEFORE_WORK@
         h.dispatch.bucket = [](bool, int) { return 0; };
         h.dispatch.mode = [](int, int) {};
         h.dispatch.launch = [this](const Launch& l) {
             ++steps;   // the ring is not recorded: only request 2's end-of-request retain reads it after a step
             return std::vector<int>(size_t(l.step.M()), 7);
         };
+        h.fence = [] {};
         h.dispatch.prefill = [this](const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {
             if (first == 0 && slot.req.prompt_tokens == P1) {   // request 1's quantum 0: long enough to cancel in
                 in_q0.store(true);
@@ -112,22 +119,11 @@ struct Rank {
                 in_q0.store(false);
             }
             ++steps;
-            if (capture_at && first + rows == capture_at) {
-                capture_tokens.assign(p.prompt.begin(), p.prompt.begin() + capture_at + 1);
-                capture_at = 0;
-#ifdef BEFORE_CD20A51
-                take_capture();   // the control: inside the quantum, as cbdcf54 and before
-#endif
-            }
+            // flash_native.cuh h.dispatch.prefill: the capture block
+@PREFILL_CAPTURE@
             if (slot.req.prompt_tokens == P2) pf_end.store(first + rows);
         };
         return h;
-    }
-    // the generation the head's take() claimed: the newest entry whose tokens start request 2 (match picks it)
-    uint64_t match_gen(const Grant& g) {
-        uint64_t best = 0;
-        for (const auto& x : index.entries()) if (x.position == g.reuse && x.generation > best) best = x.generation;
-        return best;
     }
 };
 
@@ -176,7 +172,7 @@ int main() {
     atomic_file(b0.directory + "/cmd.0", "ADMIT 1 1 " + std::to_string(payload_hash(q1)) + "\n");
     CHECK(wait([&] { return r[0].in_q0.load(); }));
     atomic_file(b0.directory + "/cmd.1", "CANCEL 1 1 0\n");
-    CHECK(wait([&] { std::lock_guard<std::mutex> a(r[0].mu), b(r[1].mu); return r[0].index.size() && r[1].index.size(); }));
+    CHECK(wait([&] { std::lock_guard<std::mutex> a(r[0].ck_mu), b(r[1].ck_mu); return r[0].real.ix.size() && r[1].real.ix.size(); }));
     // request 2 (P2 tokens) starts with request 1's first 4097 tokens: it restores the 4096 entry and should keep 8192
     const std::string q2 = "n_gen 2 temp 0 seed 1 min 0 stop -\n" + ids(P2) + "\n";
     atomic_file(b0.directory + "/req.2", q2);
@@ -192,9 +188,9 @@ int main() {
         }
     for (int i = 0; i < 2; ++i) {
         auto& x = r[i];
-        for (const auto& l : x.log) std::printf("rank %d: %s\n", i, l.c_str());
+        for (const auto& l : x.real.log) std::printf("rank %d: %s\n", i, l.c_str());
         const FlashEntry* e1 = nullptr; const FlashEntry* e2 = nullptr;
-        for (const auto& e : x.index.entries()) { if (e.position == 2 * GRID) e1 = &e; if (e.position == 4 * GRID) e2 = &e; }
+        for (const auto& e : x.real.ix.entries()) { if (e.position == 2 * GRID) e1 = &e; if (e.position == 4 * GRID) e2 = &e; }
         std::printf("rank %d: entry at %u %s; request 2 restored %u rows, %s, %s an aligned entry at %u\n", i, 2 * GRID,
                     e1 ? (e1->terminal ? "terminal" : "aligned") : "missing", x.reuse2, x.exact2 ? "exact" : "NOT exact",
                     e2 ? "kept" : "did NOT keep", 4 * GRID);

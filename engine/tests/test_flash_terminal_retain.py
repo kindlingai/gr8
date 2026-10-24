@@ -48,6 +48,8 @@ int main() {
     Ckpt real; Ckpt* ck = &real;
     Pool pool; FlashRing ring; std::mutex ck_mu;
     struct { struct { std::function<void(const Run&, const g6rt::PrefixReuse&, const g6rt::CacheNamespace&)> retain; } pool; } h;
+    int flushed = 0;   // the pending aligned capture, taken before the terminal one (a cancel at its boundary)
+    auto take_capture = [&] { ++flushed; };
 ''' + hook + r'''
     std::vector<int> seq(100);
     for (int i = 0; i < 100; ++i) seq[i] = 1000 + i;
@@ -83,6 +85,7 @@ int main() {
     c.terminal = false; real.full = false;
     h.pool.retain(Run{8}, st(43, 42), {});
     assert(real.got.size() == 4 && pool.released.back() == 8); ++cases;
+    assert(flushed == 8);   // every retain flushed the pending aligned capture first
     printf("flash_terminal_retain: PASS %d CPU mock cases (actual retain hook)\n", cases);
 }
 '''
