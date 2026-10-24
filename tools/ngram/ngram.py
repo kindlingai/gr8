@@ -38,8 +38,14 @@ def verify_ms(rows):
 
 # ---------------------------------------------------------------- traces
 
+def trace_key(t):
+    """Traces of the same prompt fall in the same fold (greedy reruns of a prompt are near copies)."""
+    return tuple(t['prompt'])
+
+
 def load_traces(path):
-    out = []
+    """One trace per line; an exact repeat of an earlier line (prompt and generation) is dropped."""
+    out, seen = [], set()
     with open(path) as f:
         for ln, line in enumerate(f, 1):
             line = line.strip()
@@ -48,6 +54,10 @@ def load_traces(path):
             t = json.loads(line)
             if len(t['top']) != len(t['gen']):
                 raise ValueError(f'{path}:{ln}: {len(t["gen"])} gen tokens but {len(t["top"])} top lists')
+            k = (tuple(t['prompt']), tuple(t['gen']))
+            if k in seen:
+                continue
+            seen.add(k)
             out.append(t)
     return out
 
@@ -127,8 +137,9 @@ class Table:
         return {n: len(self.t[n]) for n in self.ns}
 
     def bytes(self):
-        """Host bytes in a packed layout: an 8-byte key hash and a 1-byte count per entry, then 8 bytes per candidate
-        (a 4-byte token id, a 2-byte probability, a 2-byte count). An estimate for sizing, not this object's size."""
+        """Host bytes in a packed layout: an 8-byte key hash and a 1-byte candidate count per entry, then 8 bytes per
+        candidate (a 4-byte token id, a 2-byte probability, a 2-byte saturating position count). An estimate for
+        sizing, not this object's size."""
         return sum(9 * len(t) + 8 * sum(len(c) for c in t.values()) for t in self.t.values())
 
 
@@ -180,7 +191,7 @@ def tree(table, ctx, k):
 
 def prompt_lookup(ctx, k, nmax=4, nmin=2):
     """#34's draft source: the tokens after the latest earlier occurrence of the context's last n tokens (n from nmax
-    down to nmin), in the prompt and the generation so far. No probabilities: path probability is set to 1."""
+    down to nmin), in the prompt and the generation so far. It has no probabilities: path probability is None."""
     L = len(ctx)
     for n in range(nmax, nmin - 1, -1):
         if L <= n:
@@ -189,7 +200,7 @@ def prompt_lookup(ctx, k, nmax=4, nmin=2):
         for s in range(L - n - 1, -1, -1):
             if ctx[s:s + n] == pat:
                 run = ctx[s + n:s + n + k]
-                return [(i - 1, t, 1.0) for i, t in enumerate(run)]
+                return [(i - 1, t, None) for i, t in enumerate(run)]
     return []
 
 
@@ -222,44 +233,66 @@ SOURCES = ('prompt', 'chain', 'tree', 'chain+prompt', 'tree+prompt')
 
 
 def propose(source, table, ctx, rows, adaptive):
+    """-> (offered, nodes): whether the source had a proposal for this context (the table an entry, prompt lookup a
+    match), and the nodes to verify (after the adaptive trim; the +prompt sources fall back to prompt lookup)."""
     k = rows - 1
     if source == 'prompt':
-        return prompt_lookup(ctx, k)
+        nodes = prompt_lookup(ctx, k)
+        return bool(nodes), nodes
     fn = chain if source.startswith('chain') else tree
     nodes = fn(table, ctx, k)
+    offered = bool(nodes)
     if adaptive:
         nodes = trim(nodes, rows)
     if not nodes and source.endswith('+prompt'):
         nodes = prompt_lookup(ctx, k)
-    return nodes
+        offered = offered or bool(nodes)
+    return offered, nodes
 
 
 class Stats:
-    def __init__(self):
-        self.rounds = self.hits = self.tokens = self.acc = self.rows = self.drafted = 0
-        self.ms = self.expected = 0.0
+    """hits: rounds where the source had a proposal (before the row trim). used: rounds that verified drafts.
+    t_*: the rounds whose verified nodes all carry the table's probabilities (every round of chain and tree; prompt
+    lookup's nodes have none), for the calibration columns."""
+    FIELDS = ('rounds', 'hits', 'used', 'tokens', 'acc', 'rows', 'drafted', 'ms',
+              't_rounds', 't_acc', 't_rows', 't_tokens', 't_expected')
 
-    def add(self, nodes, a, commit):
+    def __init__(self):
+        for f in self.FIELDS:
+            setattr(self, f, 0)
+
+    def add(self, offered, nodes, a, commit):
         self.rounds += 1
-        self.hits += bool(nodes)
+        self.hits += bool(offered)
+        self.used += bool(nodes)
         self.drafted += len(nodes)
         self.acc += a
         self.tokens += commit
         self.rows += len(nodes) + 1
         self.ms += verify_ms(len(nodes) + 1)
-        self.expected += sum(p for _, _, p in nodes)
+        if all(p is not None for _, _, p in nodes):
+            self.t_rounds += 1
+            self.t_acc += a
+            self.t_tokens += commit
+            self.t_rows += len(nodes) + 1
+            self.t_expected += sum(p for _, _, p in nodes)
 
     def merge(self, o):
-        for f in ('rounds', 'hits', 'tokens', 'acc', 'rows', 'drafted', 'ms', 'expected'):
+        for f in self.FIELDS:
             setattr(self, f, getattr(self, f) + getattr(o, f))
 
     def row(self):
         r = max(self.rounds, 1)
-        hit = max(self.hits, 1)
-        return {'tokens': self.tokens, 'rounds': self.rounds, 'hit_rate': self.hits / r,
-                'acc_per_hit': self.acc / hit, 'acc_per_round': self.acc / r, 'tokens_per_round': self.tokens / r,
-                'rows_per_round': self.rows / r, 'tokens_per_row': self.tokens / max(self.rows, 1),
-                'draft_precision': self.acc / max(self.drafted, 1), 'expected_acc_per_round': self.expected / r,
+        tr = self.t_rounds
+        return {'tokens': self.tokens, 'rounds': self.rounds, 'hit_rate': self.hits / r, 'used_rate': self.used / r,
+                'acc_per_used': self.acc / max(self.used, 1), 'acc_per_round': self.acc / r,
+                'tokens_per_round': self.tokens / r, 'rows_per_round': self.rows / r,
+                'tokens_per_row': self.tokens / max(self.rows, 1), 'draft_precision': self.acc / max(self.drafted, 1),
+                # calibration, over the rounds whose nodes came from the table: predicted against actual
+                'table_rounds': tr,
+                'expected_acc_per_round': self.t_expected / tr if tr else None,
+                'actual_acc_per_round': self.t_acc / tr if tr else None,
+                'expected_tokens_per_row': (tr + self.t_expected) / self.t_rows if tr else None,
                 'tok_per_s': 1000.0 * self.tokens / max(self.ms, 1e-9),
                 'speedup': (self.tokens / max(self.ms, 1e-9)) * verify_ms(1)}
 
@@ -268,22 +301,26 @@ def replay_trace(trace, table, source, rows, adaptive):
     st = Stats()
     gen, ctx, pos = trace['gen'], list(trace['prompt']), 0
     while pos < len(gen):
-        nodes = propose(source, table, ctx, rows, adaptive)
+        offered, nodes = propose(source, table, ctx, rows, adaptive)
         a = accept(nodes, gen[pos:])
         commit = min(a + 1, len(gen) - pos)
-        st.add(nodes, a, commit)
+        st.add(offered, nodes, a, commit)
         ctx.extend(gen[pos:pos + commit])
         pos += commit
     return st
 
 
 def folds(traces, k, seed=0):
-    """k splits by trace: each holds out about 1/k of the traces (k=5: build on 80%, replay 20%)."""
-    idx = list(range(len(traces)))
-    random.Random(seed).shuffle(idx)
+    """k splits by prompt: each holds out about 1/k of the prompts with all their traces (k=5: build on 80%, replay
+    20%). A prompt's traces never sit on both sides."""
+    groups = {}
+    for i, t in enumerate(traces):
+        groups.setdefault(trace_key(t), []).append(i)
+    keys = sorted(groups, key=lambda g: groups[g][0])
+    random.Random(seed).shuffle(keys)
     for f in range(k):
-        test = set(idx[f::k])
-        yield [traces[i] for i in idx if i not in test], [traces[i] for i in sorted(test)]
+        test = {i for g in keys[f::k] for i in groups[g]}
+        yield [t for i, t in enumerate(traces) if i not in test], [t for i, t in enumerate(traces) if i in test]
 
 
 def replay(traces, k=5, seed=0, budgets=BUDGETS, sources=SOURCES, adaptive=True, **table_kw):
@@ -303,8 +340,9 @@ def replay(traces, k=5, seed=0, budgets=BUDGETS, sources=SOURCES, adaptive=True,
 
 def table_md(res, budgets=BUDGETS, sources=SOURCES):
     ws = sorted({w for _, _, w in res}, key=lambda w: (w == 'all', w))
-    lines = ['| workload | source | rows | hit % | accepted / hit | tokens / round | rows / round | tokens / row '
-             '| expected acc / round | speedup vs 1 row |', '|---|---|---|---|---|---|---|---|---|---|']
+    lines = ['| workload | source | rows | hit % | used % | accepted / used | tokens / round | rows / round '
+             '| tokens / row | expected tokens / row | table acc / round: expected (actual) | speedup vs 1 row |',
+             '|---|---|---|---|---|---|---|---|---|---|---|---|']
     for w in ws:
         for src in sources:
             for b in budgets:
@@ -312,10 +350,14 @@ def table_md(res, budgets=BUDGETS, sources=SOURCES):
                 if not s:
                     continue
                 r = s.row()
-                exp = '-' if src == 'prompt' else f'{r["expected_acc_per_round"]:.2f}'
-                lines.append(f'| {w} | {src} | {b} | {100 * r["hit_rate"]:.1f} | {r["acc_per_hit"]:.2f} | '
-                             f'{r["tokens_per_round"]:.3f} | {r["rows_per_round"]:.2f} | {r["tokens_per_row"]:.3f} | '
-                             f'{exp} | {r["speedup"]:.3f} |')
+                if src == 'prompt' or r['table_rounds'] == 0:
+                    ept = exp = '-'
+                else:
+                    ept = f'{r["expected_tokens_per_row"]:.3f}'
+                    exp = f'{r["expected_acc_per_round"]:.3f} ({r["actual_acc_per_round"]:.3f})'
+                lines.append(f'| {w} | {src} | {b} | {100 * r["hit_rate"]:.1f} | {100 * r["used_rate"]:.1f} | '
+                             f'{r["acc_per_used"]:.2f} | {r["tokens_per_round"]:.3f} | {r["rows_per_round"]:.2f} | '
+                             f'{r["tokens_per_row"]:.3f} | {ept} | {exp} | {r["speedup"]:.3f} |')
     return '\n'.join(lines)
 
 
@@ -340,6 +382,8 @@ def main(argv=None):
     p.add_argument('--fill', action='store_true', help='always use the whole row budget (default: adaptive rows)')
     p.add_argument('--json', help='also write the results here')
     sub.choices['sizes'].add_argument('--floors', default='0.1,0.3,0.5,0.7,0.9')
+    sub.choices['sizes'].add_argument('--widths', default='', help='also sweep these widths (at --floor)')
+    sub.choices['sizes'].add_argument('--ns-list', default='', help='also sweep these ns sets, e.g. "8,6,4,3;4,3;3"')
     a = ap.parse_args(argv)
 
     if a.cmd == 'import-kl-ref':
@@ -354,14 +398,20 @@ def main(argv=None):
     kw = dict(ns=ns, width=a.width, min_count=a.min_count)
     print(f'{len(traces)} traces, {sum(len(t["gen"]) for t in traces)} generated positions, {a.folds} folds')
     if a.cmd == 'sizes':
-        print('| floor | entries (mean per fold) | packed MB | chain hit % (8 rows) | tokens / round (chain, 8 rows) |')
-        print('|---|---|---|---|---|')
-        for fl in (float(x) for x in a.floors.split(',')):
-            res, sizes = replay(traces, a.folds, a.seed, budgets=(8,), sources=('chain',), floor=fl, **kw)
+        print('| ns | width | floor | entries (mean per fold) | packed MB | chain hit % (8 rows) '
+              '| tokens / round (chain, 8 rows) |')
+        print('|---|---|---|---|---|---|---|')
+        points = [(ns, a.width, float(x)) for x in a.floors.split(',')]
+        points += [(ns, int(w), a.floor) for w in a.widths.split(',') if w]
+        points += [(tuple(int(x) for x in n.split(',')), a.width, a.floor) for n in a.ns_list.split(';') if n]
+        for pns, pw, fl in points:
+            res, sizes = replay(traces, a.folds, a.seed, budgets=(8,), sources=('chain',), ns=pns, width=pw,
+                                floor=fl, min_count=a.min_count)
             r = res[('chain', 8, 'all')].row()
             ent = sum(s['entries'] for s in sizes) / len(sizes)
             mb = sum(s['bytes'] for s in sizes) / len(sizes) / 1e6
-            print(f'| {fl} | {ent:.0f} | {mb:.3f} | {100 * r["hit_rate"]:.1f} | {r["tokens_per_round"]:.3f} |')
+            print(f'| {",".join(map(str, pns))} | {pw} | {fl} | {ent:.0f} | {mb:.3f} | {100 * r["hit_rate"]:.1f} | '
+                  f'{r["tokens_per_round"]:.3f} |')
         return 0
 
     budgets = tuple(int(x) for x in a.budgets.split(','))
