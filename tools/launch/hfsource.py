@@ -230,6 +230,10 @@ class Release:
     def commit(self):
         return self.repo.commit
 
+    @property
+    def label(self):
+        return self.repo.repo
+
     def __str__(self):
         return f'{self.repo.repo}@{self.commit[:12]}'
 
