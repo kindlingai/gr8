@@ -52,7 +52,7 @@ struct KdaState
 {
     float *S = nullptr, *conv = nullptr;
     int slots = 0, nhmax = 0;
-    const int* src = nullptr;           // device [1]: carry-mode source slot (Args::src), nullptr = off
+    const int* src = nullptr;           // device [MX]: carry-mode source slot per row (Args::src), nullptr = off
     size_t s_layer() const { return static_cast<size_t>(slots) * nhmax * DK * DV; }
     size_t c_layer() const { return static_cast<size_t>(slots) * NHIST * 3 * nhmax * DK; }
 };

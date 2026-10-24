@@ -129,9 +129,10 @@ struct Args
     float *S = nullptr, *cst = nullptr;
     int nhmax = 0;
     const int* row_slot = nullptr;      // [M]
-    // carry mode (MTP verify ring; k_kda_core only): row 0 loads the state of slot *src; a slot change between rows
-    // stores the state to the old slot and keeps it in registers, so slot row_slot[m] ends with the state after rows
-    // 0..m. nullptr: a slot change stores the old slot and loads the new one (independent sessions).
+    // carry mode (MTP verify ring; k_kda_core only), per row [M]: a row with src[m] >= 0 starts a run and loads the
+    // state of slot src[m] (row 0 always does); a slot change at a row with src[m] < 0 stores the state to the old slot
+    // and keeps it in registers, so slot row_slot[m] ends with the state after the run's rows up to m. Several
+    // sessions in one step are one run each. nullptr: a slot change stores the old slot and loads the new one.
     const int* src = nullptr;
     // scratch
     const float* P = nullptr;           // [M][pld]
@@ -143,6 +144,9 @@ struct Args
     uint16_t *OF = nullptr;             // BF16 fragment table of gated o, K = dl (BF16W o_proj input)
     uint16_t *OH = nullptr;             // FP16 row-major [M][dl] of gated o (trellis o_proj input)
     KDA_HD int dl() const { return nh * DK; }
+    // carry mode: does row m load a state, and from which slot (slot: the row's own)
+    KDA_HD bool loads(int m) const { return !src || src[m] >= 0; }
+    KDA_HD int from(int m, int slot) const { return src && src[m] >= 0 ? src[m] : slot; }
     KDA_HD PLayout pl() const { PLayout p; p.dl = nh * DK; return p; }
     KDA_HD size_t s_off(int slot, int h) const { return (static_cast<size_t>(slot) * nhmax + h) * DK * DV; }
     KDA_HD size_t c_off(int slot, int hist, int stream, int ch) const
@@ -443,7 +447,7 @@ KDA_HD void core_row_1(const Args& a, CoreSmem& s, CoreThread& th, int m, int h,
     if constexpr (M_MODE == 1)
     {
         const int slot0 = a.row_slot[0];
-        const int from0 = a.src ? *a.src : slot0;
+        const int from0 = a.from(0, slot0);
         if (t >= 2 * DK)
         {
             if (t < 5 * DK)
@@ -568,7 +572,7 @@ KDA_HD void core_row_1(const Args& a, CoreSmem& s, CoreThread& th, int m, int h,
             {
                 const float w0 = bf2f(cw[0]), w1 = bf2f(cw[1]), w2 = bf2f(cw[2]), w3 = bf2f(cw[3]);
                 int cur_c = a.row_slot[0];
-                const int from0 = a.src ? *a.src : cur_c;
+                const int from0 = a.from(0, cur_c);
                 float h0 = a.cst[a.c_off(from0, 0, stream, ch)];
                 float h1 = a.cst[a.c_off(from0, 1, stream, ch)];
                 float h2 = a.cst[a.c_off(from0, 2, stream, ch)];
@@ -581,11 +585,12 @@ KDA_HD void core_row_1(const Args& a, CoreSmem& s, CoreThread& th, int m, int h,
                         a.cst[a.c_off(cur_c, 0, stream, ch)] = h0;
                         a.cst[a.c_off(cur_c, 1, stream, ch)] = h1;
                         a.cst[a.c_off(cur_c, 2, stream, ch)] = h2;
-                        if (!a.src)
+                        if (a.loads(mi))
                         {
-                            h0 = a.cst[a.c_off(sl, 0, stream, ch)];
-                            h1 = a.cst[a.c_off(sl, 1, stream, ch)];
-                            h2 = a.cst[a.c_off(sl, 2, stream, ch)];
+                            const int from = a.from(mi, sl);
+                            h0 = a.cst[a.c_off(from, 0, stream, ch)];
+                            h1 = a.cst[a.c_off(from, 1, stream, ch)];
+                            h2 = a.cst[a.c_off(from, 2, stream, ch)];
                         }
                         cur_c = sl;
                     }
@@ -615,7 +620,7 @@ KDA_HD void core_row_1(const Args& a, CoreSmem& s, CoreThread& th, int m, int h,
                 float h0, h1, h2;
                 if (m == 0)
                 {
-                    const int from = a.src ? *a.src : slot;
+                    const int from = a.from(0, slot);
                     h0 = a.cst[a.c_off(from, 0, stream, ch)];
                     h1 = a.cst[a.c_off(from, 1, stream, ch)];
                     h2 = a.cst[a.c_off(from, 2, stream, ch)];
@@ -630,11 +635,12 @@ KDA_HD void core_row_1(const Args& a, CoreSmem& s, CoreThread& th, int m, int h,
                         a.cst[a.c_off(prev_c, 0, stream, ch)] = h0;
                         a.cst[a.c_off(prev_c, 1, stream, ch)] = h1;
                         a.cst[a.c_off(prev_c, 2, stream, ch)] = h2;
-                        if (!a.src)
+                        if (a.loads(m))
                         {
-                            h0 = a.cst[a.c_off(slot, 0, stream, ch)];
-                            h1 = a.cst[a.c_off(slot, 1, stream, ch)];
-                            h2 = a.cst[a.c_off(slot, 2, stream, ch)];
+                            const int from = a.from(m, slot);
+                            h0 = a.cst[a.c_off(from, 0, stream, ch)];
+                            h1 = a.cst[a.c_off(from, 1, stream, ch)];
+                            h2 = a.cst[a.c_off(from, 2, stream, ch)];
                         }
                     }
                 }
@@ -696,7 +702,7 @@ KDA_HD void core_row_1(const Args& a, CoreSmem& s, CoreThread& th, int m, int h,
         if (M_MODE == 4 || m == 0)
         {
             const int slot0 = a.row_slot[0];
-            const int from0 = a.src ? *a.src : slot0;
+            const int from0 = a.from(0, slot0);
             KDA_UNROLL
             for (int i = 0; i < KW; ++i)
             {
@@ -849,7 +855,7 @@ KDA_HD void core_row_23(const Args& a, CoreSmem& s, CoreThread& th, int m, int h
     {
         if (t < 2 * DK)
         {
-            const int from = a.src ? *a.src : a.row_slot[0];
+            const int from = a.from(0, a.row_slot[0]);
             KDA_UNROLL
             for (int i = 0; i < KW; ++i)
             {
@@ -871,9 +877,9 @@ KDA_HD void core_row_23(const Args& a, CoreSmem& s, CoreThread& th, int m, int h
                 KDA_UNROLL
                 for (int i = 0; i < KW; ++i) *core_step_cell(a, th.cur_s, h, t, i) = th.s[i];
             }
-            if (th.cur_s < 0 || !a.src)
+            if (th.cur_s < 0 || a.loads(m))
             {
-                const int from = th.cur_s < 0 && a.src ? *a.src : slot;
+                const int from = a.from(th.cur_s < 0 ? 0 : m, slot);
                 KDA_UNROLL
                 for (int i = 0; i < KW; ++i)
                 {
