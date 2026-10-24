@@ -69,10 +69,7 @@ fn check(p: &Pool, live: &[Live], nr: u32, below: u32) {
             let main = rp + (n - rp).div_ceil(nr as u64).min(n - rp);
             let low = l.list.iter().filter(|&&q| q < p.place_pages()).count() as u64;
             assert!(low >= main, "the run holds {low} pages below place, wants {main}");
-            assert!(
-                l.list.iter().take(rp as usize).all(|&q| q < p.place_pages()),
-                "the prefix pages are below place"
-            );
+            assert!(l.list.iter().take(rp as usize).all(|&q| q < p.place_pages()), "the prefix pages are below place");
         }
         live_pages += l.list.len();
     }
@@ -267,11 +264,8 @@ fn a_past_r_run_leaves_the_short_runs_retained() {
     p.tail(2, 0);
     let short = p.reserve(4 * PAGE, 4 * PAGE).unwrap();
     let prompt: Vec<i32> = (0..4 * 64 - 1).map(|i| i as i32).collect();
-    p.retain(
-        &short,
-        Finished { history: prompt, valid: 4 * 64 - 2, written_end: 4 * 64 - 1, pf_end: 4 * 64 - 2 },
-    )
-    .unwrap();
+    p.retain(&short, Finished { history: prompt, valid: 4 * 64 - 2, written_end: 4 * 64 - 1, pf_end: 4 * 64 - 2 })
+        .unwrap();
     // 1,024 rows: 16 pages, its tail 8 logical pages, its shard 4: 12 pages below place, 4 above
     let big = p.reserve(1024, 1024).unwrap();
     assert!(p.exclusive_run(&big).unwrap());

@@ -49,6 +49,17 @@ class OptionTests(unittest.TestCase):
         self.assertEqual((o.get('GROUP'), o.get('KV_GB')), ('gr8-test', '3'))
         os.unlink(f.name)
 
+    def test_share_policy_flags(self):
+        o = K.parse(['--no-config', '--gb', '8'], {})
+        K.validate(o)
+        self.assertEqual(K.share_args(o), ['--value', 'age', '--value-margin', '1.25'])
+        o = K.parse(['--no-config', '--gb', '8', '--share-value', 'cost-shadow', '--share-spg', 'gr8-glm53=15.6'], {})
+        K.validate(o)
+        self.assertEqual(K.share_args(o), ['--value', 'cost-shadow', '--value-margin', '1.25', '--value-spg', 'gr8-glm53=15.6'])
+        for a in (['--share-value', 'cost'], ['--share-spg', 'g'], ['--share-spg', 'g=0'], ['--share-margin', 'x']):
+            with self.assertRaises(opt.OptionError):
+                K.validate(K.parse(['--no-config', '--gb', '8', *a], {}))
+
     def test_up_needs_a_size(self):
         for a in ([], ['--gb', '0'], ['--gb', 'lots']):
             with self.assertRaises(opt.OptionError):

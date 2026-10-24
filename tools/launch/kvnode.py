@@ -42,6 +42,11 @@ KEYS = {
     'KV_MIN_FREE_GB': ('10', 'refuse to start when locking KV_GB would leave less MemAvailable than this'),
     'KV_RDMA': ('1', '0 = serve over TCP only'),
     'KV_BIN': (None, 'the kvman-remote binary (default bin/kvman-remote, else the crate\'s target/release)'),
+    'KV_SHARE_VALUE': ('age', 'which group gives segments to a group that is short: age (the coldest blocks) or '
+                              'cost-shadow (still age, and the node logs what the value-weighted policy would pick)'),
+    'KV_SHARE_SPG': (None, 'GROUP=SECONDS,...: recompute seconds a GiB of each group\'s KV costs (GLM 5.3 Full 15.6); '
+                           'a group not listed is of unknown cost'),
+    'KV_SHARE_MARGIN': ('1.25', 'a give that loses rows needs this many times their cost in benefit'),
     'MENTAT': ('localhost', 'the local mentat daemon to announce through; none = do not announce'),
     'GROUP': ('gr8-glm53', 'mentat group the node joins'),
     'NODE_IP': (None, "this box's LAN address, when mentat cannot say"),
@@ -121,11 +126,29 @@ def validate(o):
         gb = float('nan')
     if not gb > 0:
         raise opt.OptionError('name the memory to lock: ./gr8 kv up --gb N (GiB)')
-    for k in ('KV_PORT', 'KV_MIN_FREE_GB'):
+    for k in ('KV_PORT', 'KV_MIN_FREE_GB', 'KV_SHARE_MARGIN'):
         try:
             float(o.get(k))
         except (TypeError, ValueError):
             raise opt.OptionError(f'{k}={o.get(k)!r}: want a number')
+    if o.get('KV_SHARE_VALUE') not in ('age', 'cost-shadow'):
+        raise opt.OptionError(f'KV_SHARE_VALUE={o.get("KV_SHARE_VALUE")!r}: want age or cost-shadow')
+    for kv in (o.get('KV_SHARE_SPG') or '').split(','):
+        g, _, sec = kv.partition('=')
+        try:
+            ok = kv == '' or (g != '' and float(sec) > 0)
+        except ValueError:
+            ok = False
+        if not ok:
+            raise opt.OptionError(f'KV_SHARE_SPG: {kv!r}: want GROUP=SECONDS')
+
+
+def share_args(o):
+    """kvman-remote's share policy flags (KV_SHARE_*; D-331 M6 step 2)."""
+    a = ['--value', o.get('KV_SHARE_VALUE'), '--value-margin', o.get('KV_SHARE_MARGIN')]
+    if o.get('KV_SHARE_SPG'):
+        a += ['--value-spg', o.get('KV_SHARE_SPG')]
+    return a
 
 
 def out_dir(o):
@@ -253,7 +276,7 @@ class Supervisor:
         except FileNotFoundError:
             pass
         argv = [b, '--gb', o.get('KV_GB'), '--port', o.get('KV_PORT'), '--bind', o.get('KV_BIND'),
-                '--min-free-gb', o.get('KV_MIN_FREE_GB'), '--ready', ready_path]
+                '--min-free-gb', o.get('KV_MIN_FREE_GB'), '--ready', ready_path, *share_args(o)]
         if o.get('KV_RDMA') == '0':
             argv.append('--no-rdma')
         log(f'starting {" ".join(argv)}')

@@ -213,6 +213,7 @@ pub fn par_for<F: Fn(usize, usize) -> io::Result<()> + Sync>(threads: usize, n: 
 }
 
 /// Lowest-free-first slot allocator.
+#[derive(Clone)]
 pub struct SlotAlloc {
     used: Vec<bool>,
     free: u64,
@@ -248,6 +249,21 @@ impl SlotAlloc {
         }
         self.free -= slots.len() as u64;
         true
+    }
+    /// Slots in all: `n` at least (new ones free) or exactly `n` when the slots at and past `n` are free; false and
+    /// unchanged when one of them is used.
+    pub fn resize(&mut self, n: u64) -> bool {
+        let old = self.used.len() as u64;
+        if n < old && self.used[n as usize..].iter().any(|&u| u) {
+            return false;
+        }
+        self.used.resize(n as usize, false);
+        self.free = self.free + n.saturating_sub(old) - old.saturating_sub(n);
+        true
+    }
+    /// The free slots below `n`, lowest first.
+    pub fn free_below(&self, n: u64) -> Vec<u64> {
+        (0..n.min(self.used.len() as u64)).filter(|&s| !self.used[s as usize]).collect()
     }
     pub fn release(&mut self, slots: &[u64]) {
         for &s in slots {

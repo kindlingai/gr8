@@ -4,6 +4,9 @@
     up [OPTIONS] [@FILE]       start this box's supervisor in the background and follow it until the cluster serves
     down                       stop every box of the last boot (or this box alone)
     restart [OPTIONS]          down, then up
+    resize [OPTIONS]           with RESTART=idle and a persist=lease KV store: wait until no request runs, down (the
+                               engine stores its pool on the KV node), then up with OPTIONS (a new --cap, say); the
+                               next turn of a session restores from the node instead of a prefill
     status                     every box: its state, the engine, MemAvailable; the head's shim, front end and /health
     logs [RANK|shim|front|supervisor] [-f]   a log, from any box
     check [OPTIONS]            this box's checks
@@ -20,6 +23,7 @@ handshake refused the boot.
 import fcntl
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -165,7 +169,7 @@ def cmd_down(argv):
         else:
             print(f'the supervisor (pid {pid}) did not stop; killing it')
             os.kill(pid, signal.SIGKILL)
-    stopped = sv.stop_local(home, lambda s: print(s))
+    stopped = sv.stop_local(home, lambda s: print(s), sv.quit_wait(o))
     print(f'this box: {"stopped" if pid or stopped else "nothing was running"}')
     return 0
 
@@ -356,6 +360,58 @@ def cmd_prepare(argv):
     return 1 if bad else 0
 
 
+def running_requests(port):
+    """vllm:num_requests_running from the head's front end, or None when it does not answer."""
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/metrics', timeout=5) as r:
+            text = r.read().decode('utf-8', 'replace')
+    except OSError:
+        return None
+    m = re.search(r'^vllm:num_requests_running(?:\{[^}]*\})? ([0-9.e+]+)$', text, re.M)
+    return int(float(m.group(1))) if m else None
+
+
+def cmd_resize(argv, wait=time.sleep, running=running_requests):
+    """Down and up again with new options, keeping the sessions: the engine's orderly quit stores the pool's runs on
+    each persist=lease store, the KV node parks the lease (kvman-remote --holdover-s), and the new engine takes it back."""
+    o = parse(argv)
+    mode = o.get('RESTART') or 'off'
+    if mode == 'off':
+        print('gr8: resize needs --restart idle (RESTART=off, the default, refuses); restart without it re-prefills every '
+              'session', file=sys.stderr)
+        return 2
+    if mode == 'checkpoint':
+        print('gr8: RESTART=checkpoint (mid-turn) needs the Flash checkpoint, not built yet: use --restart idle',
+              file=sys.stderr)
+        return 2
+    if mode != 'idle':
+        print(f'gr8: --restart {mode}: want off, idle or checkpoint', file=sys.stderr)
+        return 2
+    if not any(t['lease'] for t in opt.kv_stores(o)):
+        print('gr8: resize keeps sessions on a --kv-store remote:...,persist=lease store; there is none (restart '
+              'without one)', file=sys.stderr)
+        return 2
+    port, limit = o.get('PORT') or '8100', float(o.get('RESIZE_WAIT') or 600)
+    waited, idle = 0.0, 0
+    while idle < 2:
+        n = running(port)
+        if n is None:
+            print(f'gr8: resize: the front end on port {port} does not answer /metrics: is this the head?',
+                  file=sys.stderr)
+            return 1
+        idle = idle + 1 if n == 0 else 0
+        if idle < 2:
+            if waited >= limit:
+                print(f'gr8: resize: {n} requests still run after {limit:.0f} s (--resize-wait); nothing changed',
+                      file=sys.stderr)
+                return 1
+            wait(1)
+            waited += 1
+    print('resize: no request runs: down (the engines store their pools), then up')
+    cmd_down(argv)
+    return cmd_up(argv)
+
+
 def main(argv):
     if not argv:
         print(__doc__)
@@ -367,6 +423,11 @@ def main(argv):
         o = parse(rest[1:], check=rest[0] == 'TP')
         print(o.get(rest[0]) or '')
         return 0 if o.get(rest[0]) else 1
+    if cmd == 'resize':
+        if os.environ.get('GR8_CONTAINER') == '1':
+            print('gr8: resize does not work inside the container, as restart', file=sys.stderr)
+            return 2
+        return cmd_resize(rest)
     if cmd == 'restart':
         if os.environ.get('GR8_CONTAINER') == '1':
             # down ends this container's supervisor, and with it the container this restart runs in

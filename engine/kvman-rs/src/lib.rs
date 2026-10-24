@@ -51,6 +51,7 @@ pub mod pool;
 pub mod remote;
 pub mod reuse;
 pub mod rows;
+pub mod share_policy;
 pub mod stash;
 pub mod tier;
 

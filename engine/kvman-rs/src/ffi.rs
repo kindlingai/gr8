@@ -487,16 +487,23 @@ pub unsafe extern "C" fn g6kv_add_tier(
     index_dir: *const c_char,
     compat: *const c_char,
 ) -> i32 {
-    let keep = match keep {
+    // + 4: the index records every entry, evicted runs too (a KV-node lease kept over a restart, persist=lease)
+    let whole = keep & 4 != 0 && !index_dir.is_null();
+    let keep = match keep & !4 {
         0 => Keep::Evicted,
         1 => Keep::Shared,
         2 => Keep::All,
-        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2")),
+        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2, + 4 for a whole index")),
     };
     let text = |c: *const c_char| (!c.is_null()).then(|| CStr::from_ptr(c).to_string_lossy().into_owned());
     let (dir, compat) = (text(index_dir), text(compat).unwrap_or_default());
     match (*p).add_tier(slots, keep, dir.as_deref().map(|d| (std::path::Path::new(d), compat.as_str()))) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if let (true, Some(st)) = (whole, (*p).stash_mut()) {
+                st.index_whole(st.tiers() - 1);
+            }
+            0
+        }
         Err(e) => crate::blocks::fail(e),
     }
 }
@@ -900,4 +907,68 @@ pub unsafe extern "C" fn g6kv_rows_describe(r: *const crate::rows::Rows, buf: *m
     let n = d.len().min(cap - 1);
     std::ptr::copy_nonoverlapping(d.as_ptr() as *const c_char, buf, n);
     *buf.add(n) = 0;
+}
+
+/// Resizes tier t to `slots` (its store grew, or is about to shrink; stash.rs resize_tier) at a point every rank
+/// sees: *resized = 1, or 0 when the tier refuses (an indexed tier, or entries it may not evict). A shrink evicts the
+/// least recently used entries and queues the moves into the slots that stay: run them (g6kv_io_take, g6kv_io_done)
+/// before the store gives its top back (g6kv_store_shrink).
+///
+/// # Safety
+/// `p` must be a live pool, `resized` valid for a write (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_resize(p: *mut Pool, t: u32, slots: u64, resized: *mut i32) -> i32 {
+    match (*p).resize_tier(t as usize, slots) {
+        Ok(ok) => {
+            if !resized.is_null() {
+                *resized = ok as i32;
+            }
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// The head's ghost ledger (Pool::ghosts) into out[0..3]: runs no tier kept, of them returned, still pending.
+///
+/// # Safety
+/// `p` must be a live pool and `out` hold 3 values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_pool_ghosts(p: *mut Pool, out: *mut u64) {
+    let (d, r, n) = (*p).ghosts();
+    for (i, v) in [d, r, n].into_iter().enumerate() {
+        *out.add(i) = v;
+    }
+}
+
+/// The resize quotes a head reports (g6kv_store_report): out[i] = the rows a give of i + 1 segments of `per_seg` blocks
+/// loses (Pool::quote_points; u64::MAX = the tier would refuse it). Writes up to `cap` and returns how many.
+///
+/// # Safety
+/// `p` must be a live pool and `out` hold `cap` values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_quotes(p: *mut Pool, t: u32, per_seg: u64, out: *mut u64, cap: usize) -> usize {
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let a = (*p).quote_points(t as usize, per_seg, cap);
+    let n = a.len().min(cap);
+    std::ptr::copy_nonoverlapping(a.as_ptr(), out, n);
+    n
+}
+
+/// The ages in ms a head reports (g6kv_store_report): ages[i] is that of the entry holding tier t's (i x per_seg)-th
+/// coldest block, coldest first. Writes up to `cap` and returns how many.
+///
+/// # Safety
+/// `p` must be a live pool and `out` hold `cap` values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_coldest(p: *mut Pool, t: u32, per_seg: u64, out: *mut u64, cap: usize) -> usize {
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let a = (*p).coldest_ages(t as usize, per_seg, cap);
+    let n = a.len().min(cap);
+    std::ptr::copy_nonoverlapping(a.as_ptr(), out, n);
+    n
 }

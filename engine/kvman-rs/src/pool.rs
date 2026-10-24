@@ -2,9 +2,10 @@
 
 use crate::reuse::{self, Finished, Rules, Why};
 use crate::stash::{continues, Index, Io, Keep, Policy, Stash, TierStats};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::time::Instant;
 
 /// Rows per page.
 pub const PAGE: u64 = 64;
@@ -180,12 +181,17 @@ pub struct Pool {
     stash: Option<Stash>,
     next_tokens: Option<Vec<i32>>,
     next_span: Option<u64>,
-    next_continues: bool, // count() found the next grant continues a conversation
+    next_continues: bool,    // count() found the next grant continues a conversation
     next_len: Option<usize>, // the next grant's prompt length (any namespace), for the write limit's credit
     // resize (#153): pages [0, place) come in chunks of `chunk` pages (0 = off). An offline chunk's pages hold no live
     // or retained run and are not counted anywhere, so the engine may release their memory.
     chunk: u32,
     offline: Vec<bool>,
+    // when each stored entry was last used, by this process's clock (coldest_ages: what a KV node's head reports).
+    // Advice to the node only: never in the digest, and no pool decision reads it. Kept only once coldest_ages ran
+    // (a group head): a pool that never reports does no work for it and holds nothing
+    seen: HashMap<u64, Instant>,
+    ages_on: bool,
 }
 
 impl Pool {
@@ -228,6 +234,8 @@ impl Pool {
             next_len: None,
             chunk: 0,
             offline: Vec::new(),
+            seen: HashMap::new(),
+            ages_on: false,
         })
     }
 
@@ -431,6 +439,17 @@ impl Pool {
         }
     }
 
+    /// Tier t to `slots` blocks (stash.rs resize_tier): a store whose size changed at this event, on every rank. The
+    /// copies it queues (moves out of the blocks that go) run like any call's, before the store shrinks. Ok(false):
+    /// nothing changed (a tier with an index, or entries that cannot leave).
+    pub fn resize_tier(&mut self, t: usize, slots: u64) -> Result<bool, Error> {
+        self.pending()?;
+        match &mut self.stash {
+            Some(s) if t < s.tiers() => Ok(s.resize_tier(t, slots)),
+            _ => Err(Error::BadArgument),
+        }
+    }
+
     /// Runs past R keep their tails in the stores (stash.rs set_tail): nr ranks, per_slot replicated parts a block.
     /// nr > 0 also turns the page classes on for the pool itself (see Pool::nr), so this is set whenever the pool's R
     /// is the CP map's, stores or not.
@@ -595,7 +614,9 @@ impl Pool {
     /// `span`: the tokens of the prompt's system span (system message and tool definitions as templated), when the
     /// front end sent it.
     pub fn count(&mut self, prompt: &[i32], span: Option<u32>) -> u32 {
-        let Some(s) = &self.stash else { return 0 };
+        let Some(s) = &mut self.stash else { return 0 };
+        s.note_prompt(prompt);
+        let s = &*s;
         self.next_tokens = Some(prompt.to_vec());
         self.next_len = Some(prompt.len());
         self.next_span = span.map(|x| s.span_rows(x, prompt.len()));
@@ -609,7 +630,84 @@ impl Pool {
             || s.continues_stored(prompt);
         self.next_continues = continuing;
         let span = self.next_span;
+        self.touch_prefixes(prompt);
         self.stash.as_mut().expect("checked").count(prompt, continuing, span)
+    }
+
+    // a prompt that starts with a stored prefix reads its blocks when it is admitted (or will, on a hit): used now
+    fn touch_prefixes(&mut self, prompt: &[i32]) {
+        let Some(s) = self.stash.as_ref().filter(|_| self.ages_on) else { return };
+        let now = Instant::now();
+        for t in 0..s.tiers() {
+            for e in s.entries(t).iter().filter(|e| e.kind.prefix()) {
+                if prompt.starts_with(&e.st.history[..(e.st.valid.max(0) as usize).min(e.st.history.len())]) {
+                    self.seen.insert(e.id, now);
+                }
+            }
+        }
+    }
+
+    /// The ages a KV node's head REPORTs for tier t (remote::coldest_ages): for each i, u64::MAX while the tier's free
+    /// slots cover a give of i + 1 segments, then ms since the use of the most recently used entry that give would
+    /// evict (the shrink's order, stash.rs give_order), at most `most`; they never rise. An entry was used when it was
+    /// stored, restored, or a prompt started with it (a prefix); a prefix base counts as used as recently as the
+    /// newest run stored on it.
+    pub fn coldest_ages(&mut self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
+        let Some(s) = &self.stash else { return Vec::new() };
+        if t >= s.tiers() {
+            return Vec::new();
+        }
+        self.ages_on = true;
+        let now = Instant::now();
+        let mut live = std::collections::HashSet::new();
+        for x in 0..s.tiers() {
+            for e in s.entries(x) {
+                self.seen.entry(e.id).or_insert(now);
+                live.insert(e.id);
+            }
+        }
+        self.seen.retain(|id, _| live.contains(id));
+        let mut at = self.seen.clone();
+        for x in 0..s.tiers() {
+            for e in s.entries(x) {
+                if let Some((b, _)) = e.base {
+                    let u = self.seen[&e.id];
+                    if let Some(v) = at.get_mut(&b) {
+                        *v = (*v).max(u);
+                    }
+                }
+            }
+        }
+        crate::remote::coldest_ages(
+            &s.give_order(t),
+            |id| at.get(&id).map_or(0, |u| now.duration_since(*u).as_millis() as u64),
+            per_seg,
+            s.stats(t).map_or(0, |x| x.free_slots),
+            most,
+        )
+    }
+
+    /// The head's ghost ledger (stash.rs Ghosts): (runs no tier kept, of them continued within the horizon, still
+    /// within it). A KV node's head REPORTs it beside its quotes (share_policy.rs).
+    pub fn ghosts(&self) -> (u64, u64, u64) {
+        self.stash.as_ref().map_or((0, 0, 0), |s| (s.ghosts.dropped, s.ghosts.returned, s.ghosts.pending()))
+    }
+
+    /// The resize quotes a KV node's head REPORTs for tier t beside its ages (stash.rs quote_resize): for each i, the
+    /// blocks a rank a give of i + 1 segments of `per_seg` blocks loses (the prefill requests pay to compute again), at most
+    /// `most`; u64::MAX from the first give the tier would refuse (pinned entries, an index, past its size).
+    pub fn quote_points(&self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
+        let Some(s) = &self.stash else { return Vec::new() };
+        let Some(slots) = s.stats(t).map(|x| x.slots) else { return Vec::new() };
+        let mut v = Vec::with_capacity(most);
+        for i in 1..=most as u64 {
+            let q = slots.checked_sub(i * per_seg).and_then(|to| s.quote_resize(t, to));
+            v.push(q.as_ref().map_or(u64::MAX, |q| q.lost_blocks));
+            if q.is_none() {
+                break;
+            }
+        }
+        v
     }
 
     /// Prepare an admission without counting non-stock prompts toward stock promotion. Call before its grant,
@@ -640,6 +738,18 @@ impl Pool {
     /// After the copies from io(): commits the index records of the entries they wrote. An error leaves the pool as it
     /// is. The entries stay, and only a restart misses them.
     pub fn io_done(&mut self) -> std::io::Result<()> {
+        if let Some(s) = self.stash.as_ref().filter(|_| self.ages_on) {
+            // entries the copies stored were used now; the ones that left are forgotten
+            let now = Instant::now();
+            let mut live = std::collections::HashSet::new();
+            for t in 0..s.tiers() {
+                for e in s.entries(t) {
+                    self.seen.entry(e.id).or_insert(now);
+                    live.insert(e.id);
+                }
+            }
+            self.seen.retain(|id, _| live.contains(id));
+        }
         self.stash.as_mut().map_or(Ok(()), Stash::io_done)
     }
 
@@ -1101,7 +1211,11 @@ impl Pool {
             return Err(Error::NoHit);
         }
         if let Some(t) = from {
-            return self.take_stored(skip, age, t as usize, rows, worst);
+            let r = self.take_stored(skip, age, t as usize, rows, worst);
+            if r.is_ok() && self.ages_on {
+                self.seen.insert(age, Instant::now());
+            }
+            return r;
         }
         let i = self.kept.iter().position(|k| k.age == age).ok_or(Error::NotRetained)?;
         let w = pages_for(worst);
