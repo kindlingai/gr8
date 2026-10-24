@@ -29,6 +29,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import threading
@@ -63,6 +64,7 @@ class Hub:
         self.entries = {}                   # path -> the tree entry (size, oid, lfs), filled by tree()
         self.idle, self.idle_lock = {}, threading.Lock()   # (scheme, host) -> kept-alive connections not in use
         self.proxies = urllib.request.getproxies()
+        self.hub_at = urllib.parse.urlsplit(base)[:2]      # (scheme, host[:port]): the only place the token goes
 
     def tree(self):
         out, url = {}, f'{self.base}/api/models/{self.repo}/tree/{self.rev}?recursive=true'
@@ -116,10 +118,11 @@ class Hub:
                 r = conn.getresponse()
                 b = r.read()
                 break
-            except ConnectionError:
+            except (ConnectionError, ssl.SSLError):
                 conn.close()
                 if fresh:
-                    raise                       # an idle connection the server closed: once more on a new one
+                    raise                       # a new connection failed: a real error, get() retries it
+                # else an idle connection the server closed: once more on a new one
             except BaseException:
                 conn.close()
                 raise
@@ -135,9 +138,9 @@ class Hub:
         for attempt in range(8):
             try:
                 u = self.url(path, fresh=attempt > 0)
-                for _ in range(5):                                 # redirects, as urlopen followed them
+                for _ in range(5):                                 # up to 5 redirects
                     h = {'Range': f'bytes={lo}-{lo + n - 1}'}
-                    if u.startswith(self.base):
+                    if urllib.parse.urlsplit(u)[:2] == self.hub_at:
                         h.update(self.auth())                      # direct hub URL (non-LFS): the token, if any
                     r, b = self.send(u, h)
                     if r.status not in (301, 302, 303, 307, 308):

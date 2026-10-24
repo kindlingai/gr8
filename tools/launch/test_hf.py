@@ -12,6 +12,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -438,10 +440,11 @@ class NoNumpyFetchTests(unittest.TestCase):
 
 class KeepAliveTests(unittest.TestCase):
     """Hub.get's range GETs reuse kept-alive connections (#147): one connection for many ranges, a redirect to another
-    host followed on that host's connection, and an idle connection the server closed replaced without a retry."""
+    host followed on that host's connection, an idle connection the server closed (in clear or over TLS) replaced
+    without a retry, and the token sent only to the hub's own scheme and host."""
 
     def setUp(self):
-        self.data, self.conns, self.close_next = bytes(range(256)) * 64, [], [False]
+        self.data, self.conns, self.close_next, self.auth = bytes(range(256)) * 64, [], [False], []
         t = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -455,6 +458,7 @@ class KeepAliveTests(unittest.TestCase):
                 t.conns.append(self.client_address)
 
             def do_GET(self):
+                t.auth.append(self.headers.get('Authorization'))
                 if self.path.startswith('/hop/'):
                     self.send_response(302)
                     self.send_header('Location', f'http://localhost:{t.port}/f/{self.path[5:]}')
@@ -496,6 +500,68 @@ class KeepAliveTests(unittest.TestCase):
                 self.assertEqual(self.hub.get('x', i * 7, 7), self.data[i * 7:i * 7 + 7])
         self.assertEqual(err.getvalue(), '')
         self.assertEqual(len(self.conns), 3)    # 127.0.0.1 and localhost, then localhost again after the close
+
+    def test_the_token_goes_to_the_hub_host_only(self):
+        here = f'http://127.0.0.1:{self.port}'
+        with mock.patch.dict(os.environ, {'HF_TOKEN': 'tok'}):
+            lookalike = hfsource.fetch_ranks().Hub('o/r', base=here[:-1])     # the same URL prefix, another port
+            hub = hfsource.fetch_ranks().Hub('o/r', base=here)
+        for h in (lookalike, hub):
+            h.proxies, h.urls['x'] = {}, f'{here}/f/x'
+            h.get('x', 0, 10)
+        self.assertEqual(self.auth, [None, 'Bearer tok'])
+
+    @unittest.skipUnless(shutil.which('openssl'), 'needs openssl to make a test certificate')
+    def test_a_tls_connection_dropped_without_close_notify(self):
+        d = tempfile.mkdtemp(prefix='gr8tls-')
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', f'{d}/k.pem', '-out',
+                        f'{d}/c.pem', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost'],
+                       check=True, capture_output=True)
+        sc = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sc.load_cert_chain(f'{d}/c.pem', f'{d}/k.pem')
+        ls, conns = socket.create_server(('127.0.0.1', 0)), []
+        self.addCleanup(lambda: [c.close() for c in [ls] + conns])
+
+        def one(c, drop):
+            buf = b''
+            try:
+                while True:
+                    while b'\r\n\r\n' not in buf:
+                        chunk = c.recv(65536)
+                        if not chunk:
+                            return
+                        buf += chunk
+                    head, buf = buf.split(b'\r\n\r\n', 1)
+                    if drop is None:                # FIN without close_notify after the first range, no RST
+                        continue
+                    a, b = (int(x) for x in re.search(rb'bytes=(\d+)-(\d+)', head).groups())
+                    body = self.data[a:b + 1]
+                    c.sendall(b'HTTP/1.1 206 Partial Content\r\nContent-Length: %d\r\n\r\n' % len(body) + body)
+                    if drop:
+                        socket.socket.shutdown(c, socket.SHUT_WR)
+                        drop = None
+            except OSError:
+                return
+
+        def serve():
+            while True:
+                try:
+                    s, _ = ls.accept()
+                    c = sc.wrap_socket(s, server_side=True)
+                except OSError:
+                    return
+                conns.append(c)
+                threading.Thread(target=one, args=(c, len(conns) == 1), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        hub = hfsource.fetch_ranks().Hub('o/r', base=f'https://localhost:{ls.getsockname()[1]}')
+        hub.proxies, hub.urls['x'] = {}, f'https://localhost:{ls.getsockname()[1]}/f/x'
+        err = io.StringIO()
+        with mock.patch('ssl._create_default_https_context', lambda: ssl.create_default_context(cafile=f'{d}/c.pem')), \
+                contextlib.redirect_stderr(err):
+            for i in range(4):
+                self.assertEqual(hub.get('x', i * 9, 9), self.data[i * 9:i * 9 + 9])
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(len(conns), 2)
 
 
 STUB_CONVERT = """import json, os, sys
