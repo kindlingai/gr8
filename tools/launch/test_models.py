@@ -59,6 +59,20 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('G6_PF_DSA_F16GEMM=1', plan['env'])
 
+    def test_cap(self):
+        """CAP: a 262,144-token request and a page for the guard rows (2 at MTP=1) at either TP, as no CP leaves every
+        rank the whole context; a set CAP wins."""
+        for peers in (PEERS, '10.0.0.1,10.0.0.2'):
+            plan = opt.engine_plan(flash(peers=peers))
+            cap = int(plan['knobs']['CAP'])
+            self.assertEqual(cap, 262208)
+            self.assertEqual(cap % 64, 0)   # the engine's pool_rows: CAP rounded down to the page
+            self.assertGreaterEqual(cap - 2 * int(plan['knobs']['MTP']), 262144)   # the shim's max_model_len
+            self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '262208')
+            self.assertEqual(plan['knobs']['SHARE_LIMIT'], '32768')
+            plan = opt.engine_plan(flash('--cap', '131072', peers=peers))
+            self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
+
     def test_model_counts_in_the_canonical_options(self):
         glm = opt.parse(['--no-config', '--peers', PEERS], {})
         opt.validate(glm)

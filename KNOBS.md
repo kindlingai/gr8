@@ -94,8 +94,9 @@ manifest instead.
 
 ## `./gr8 glm53`
 
-`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, one session, an fp8 KV build, no drafter
-(`tools/launch/models.py`, `flash_defaults` in `scripts/engine_args.sh`).
+`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, one session, an fp8 KV build, no drafter, and
+`CAP` 262208 at either TP, a 262,144-token request (`tools/launch/models.py`, `flash_defaults` in
+`scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)).
 
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|

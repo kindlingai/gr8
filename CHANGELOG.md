@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-23: GLM-5.3-Flash defaults to a 262,144-token context (CAP 262,208)
+
+- `./gr8 glm53f` now defaults `CAP` to 262,208 (was 33,280) at TP=4 and TP=2: a 262,144-token request plus a page for
+  the guard rows, so `max_model_len` is 262,206. Only Flash's 11 DSA layers and the MTP layer keep KV, 19,968 B a token
+  a rank, and without CP every rank holds the whole context: about 5.2 GB a rank, computed from `engine/attn/kvfmt.h`
+  (docs/FLASH.md, Context).
+- Not measured yet: the boot's memory headroom at this `CAP`, and the time of a 262K prefill. A prefill that runs past
+  the shim's 900 s `--stall-timeout` fails. Set `CAP=33280` for the old pool.
+
 ## 2026-10-21: the TP=4 fp8 KV pool grows to 2,280 pages a rank (CAP 485,376)
 
 - The default TP=4 `CAP` is now 485,376 (was 408,832): 2,280 physical pages a rank, up from 1,981. The memory comes
