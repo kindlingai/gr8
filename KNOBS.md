@@ -80,6 +80,10 @@ manifest instead.
 | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
 | `DSEL_MODEL` | unset (0) | – | – | 1 = the drafter choice prices both drafters from `DSEL_TABLE` and a request's MTP rounds as the confidence stop runs them (`G6_S2_DSEL_MODEL`; drafts only: the target decides every token). Needs `DFLASH=1` |
 | `DSEL_TABLE` | unset | – | – | `DSEL_MODEL`: the cost table, a `key:value` list (`v1`..`v8`, `d`, `m`, `e`, `p`, optional `g`, `k`, `n`, `w`, `r`) or a file holding one, measured on the cluster with `tools/s2_dsel_table.py` (`G6_S2_DSEL_TABLE`) |
+| `MTP_KSTOPB` | unset (0) | unset (0) | unset (0) | 1 = in rounds that several sessions share, each session verifies its own count of the `MTP` drafts, from the MTP head's confidence (`G6_MTP_KSTOPB`; drafts only: the target decides every token). Captures a main graph per width the rule reaches |
+| `MTP_KSTOPB_KMIN` | unset (0) | unset (0) | unset (0) | `MTP_KSTOPB`: the least drafts a session verifies, 0 or 1 (`G6_MTP_KSTOPB_KMIN`) |
+| `MTP_KSTOPB_TAU` | unset (`0.6,0.88`) | same | same | `MTP_KSTOPB`: thresholds t1,t2,... (up to 7) on each session's cumulative draft probability, at every session count (`G6_MTP_KSTOPB_TAU`) |
+| `MTP_KSTOPB_TAU_S` | unset | unset | unset | `MTP_KSTOPB`: thresholds per session count, `n:t1,t2,...` entries separated by `/`, e.g. `1:0.7,0.7/2:0.7,0.8` (`G6_MTP_KSTOPB_TAU_S<n>`) |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
