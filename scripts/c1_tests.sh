@@ -104,6 +104,18 @@ if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
     echo "SKIP kv_resize_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
   fi
 fi
+if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
+  # the Flash KV caches in chunks (G6_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
+  [ "$TEST" = all ] && ARGS=()
+  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  if [ -f "$KVLIB" ]; then
+    GLM_FLAGS="$FLAGS"; FLAGS="$FLAGS -DG6_MODEL_FLASH=1"
+    KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    FLAGS="$GLM_FLAGS"
+  else
+    echo "SKIP flash_kv_chunks_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+  fi
+fi
 if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run weight_check_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }

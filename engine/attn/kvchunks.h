@@ -17,9 +17,19 @@ struct G6KvChunks;
 
 // A region of `bytes` on `device`, every granule backed (zeroed). 0 or a CUDA driver error code.
 int g6_kvc_create(G6KvChunks** out, size_t bytes, int device);
+// The same region with only the granules g6_kvc_sync(page_bytes, chunk_pages, place, online, chunks) would back
+// (zeroed): a region larger than what is online at boot needs no more memory than that.
+int g6_kvc_create_masked(G6KvChunks** out, size_t bytes, int device, size_t page_bytes, uint32_t chunk_pages,
+                         uint32_t place, const uint8_t* online, uint32_t chunks);
 void g6_kvc_free(G6KvChunks* c);
+// Zeroes every backed granule on `stream` (asynchronous); a granule not backed is left alone.
+int g6_kvc_zero(G6KvChunks* c, void* stream);
 void* g6_kvc_ptr(const G6KvChunks* c);
+// the bytes it was created with
+size_t g6_kvc_bytes(const G6KvChunks* c);
 size_t g6_kvc_granule(const G6KvChunks* c);
+// the granule a region on `device` would have (0 on an error)
+size_t g6_kvc_device_granule(int device);
 // bytes backed now
 size_t g6_kvc_backed(const G6KvChunks* c);
 // Pages of page_bytes from the region's start; chunk k is pages [k * chunk_pages, min((k + 1) * chunk_pages, place)),

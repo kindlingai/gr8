@@ -159,6 +159,9 @@ struct Grant { Key key; Request req; Run run; uint32_t reuse = 0, restored = 0, 
 // a Resize event: every rank takes pool tier `tier` to `segs` segments of its group lease on a KV node, `slots` blocks
 // (s2/kv_share.h share_apply), at the commit, so every rank's pool queues the same copies. txn: the node's transaction
 // for it (each rank names it in its GROW or SHRINK)
+// tier FLASH_KV_TIER (G6_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash rank's GPU KV chunks instead, `segs` = the chunks
+// online (slots and txn unused)
+constexpr uint32_t FLASH_KV_TIER = 0xFFFFFFFFu;
 struct Resize {
     uint32_t tier = 0;
     uint64_t segs = 0, slots = 0, txn = 0;

@@ -311,3 +311,43 @@ fn a_group_lease_backs_the_segments_it_grows_into_and_gives_back_the_ones_it_giv
     until_held(&addr, 0);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn a_transfer_from_the_node_waits_until_its_leases_fit_what_is_left() {
+    use g6kvman::ledger::{Book, Ledger, Phase, Side};
+    let _one = one();
+    let m = MIB as u64;
+    let d = std::env::temp_dir().join(format!("kvman-lazy-give-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let file = d.join("ledger");
+    let led = Ledger::at(&file);
+    led.init(&Book::new(16 * m, 8 * m, 8 * m, 0).unwrap()).unwrap();
+    let cfg = Config {
+        bytes: 16 * MIB,
+        lazy: true,
+        ledger: Some(file),
+        guard_every: Duration::from_millis(10),
+        ..Default::default()
+    };
+    let addr = Node::new(&cfg, "127.0.0.1:0".parse().unwrap()).unwrap().spawn().to_string();
+    let a = RemoteStore::open(&addr, &opts("give/a", MIB, 4, 1)).unwrap();
+    // the GPU asks 6 MiB of the node's 8: 4 are held, so the node cannot release yet, and grants no more
+    let g = led.apply(|b| b.begin(Side::Node, Side::Gpu, 6 * m, 0)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(led.show().unwrap().pending.unwrap().phase, Phase::Begun, "4 MiB held, 2 left to the node");
+    let e = RemoteStore::open(&addr, &opts("give/b", MIB, 2, 1)).err().unwrap();
+    assert!(e.to_string().contains("ledger credits the node 2097152"), "{e}");
+    // the lease ends: the node releases the 6 MiB, and the GPU takes them
+    drop(a);
+    let t = Instant::now();
+    while led.show().unwrap().pending.unwrap().phase != Phase::Released {
+        assert!(t.elapsed() < Duration::from_secs(2), "not released: {:?}", led.show().unwrap());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    led.apply(|b| b.commit(g, 6 * m)).unwrap();
+    let b = led.show().unwrap();
+    assert_eq!((b.gpu, b.node, b.free), (14 * m, 2 * m, 0));
+    let _c = RemoteStore::open(&addr, &opts("give/c", MIB, 2, 1)).unwrap();
+    assert!(RemoteStore::open(&addr, &opts("give/d", MIB, 1, 1)).is_err(), "2 MiB credited, 2 held");
+    let _ = std::fs::remove_dir_all(&d);
+}

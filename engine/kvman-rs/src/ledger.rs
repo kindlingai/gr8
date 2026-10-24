@@ -95,6 +95,18 @@ impl Book {
         }
         Ok(Book { gen: 0, total, gpu, node, free: total - used, floor, pending: None })
     }
+    /// What `side` may hold now: its count less what a transfer begun from it (not yet released) takes away.
+    pub fn credit(&self, side: Side) -> u64 {
+        let n = match side {
+            Side::Gpu => self.gpu,
+            Side::Node => self.node,
+            Side::Free => self.free,
+        };
+        match self.pending {
+            Some(t) if t.from == side && t.phase == Phase::Begun => n.saturating_sub(t.bytes),
+            _ => n,
+        }
+    }
     pub fn inflight(&self) -> u64 {
         match self.pending {
             Some(t) if t.phase == Phase::Released => t.bytes,
@@ -333,5 +345,94 @@ impl Ledger {
         let r = f(&mut b).map_err(io::Error::other)?;
         self.write(&b)?;
         Ok(r)
+    }
+}
+
+// The C interface (g6kvman.h), for the engine's side of a transfer (a Flash rank's KV chunks): sides 0 gpu, 1 node,
+// 2 free. Each call is one locked, durable step. 0, or -1 with g6kv_tier_error.
+
+fn side_of(v: u32) -> Option<Side> {
+    [Side::Gpu, Side::Node, Side::Free].get(v as usize).copied()
+}
+
+unsafe fn ledger_at(path: *const std::os::raw::c_char) -> Option<Ledger> {
+    if path.is_null() {
+        return None;
+    }
+    std::ffi::CStr::from_ptr(path).to_str().ok().map(Ledger::at)
+}
+
+fn step<T>(path: Option<Ledger>, f: impl FnOnce(&Ledger) -> io::Result<T>) -> Result<T, i32> {
+    let l = path.ok_or_else(|| crate::blocks::fail(io::Error::other("the ledger path is not a string")))?;
+    f(&l).map_err(crate::blocks::fail)
+}
+
+/// Begins a transfer of `bytes` from side `from` to side `to`; its generation into `*gen`.
+///
+/// # Safety
+/// `path` must be a NUL-terminated string, `gen` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ledger_begin(
+    path: *const std::os::raw::c_char,
+    from: u32,
+    to: u32,
+    bytes: u64,
+    gen: *mut u64,
+) -> i32 {
+    let (Some(f), Some(t)) = (side_of(from), side_of(to)) else {
+        return crate::blocks::fail(io::Error::other(format!("sides {from} -> {to}: 0 gpu, 1 node, 2 free")));
+    };
+    match step(ledger_at(path), |l| l.apply(|b| b.begin(f, t, bytes, now_s()))) {
+        Ok(g) => {
+            *gen = g;
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+/// The `from` side let go of `bytes` (at most what was begun) of transfer `gen`.
+///
+/// # Safety
+/// `path` must be a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ledger_released(path: *const std::os::raw::c_char, gen: u64, bytes: u64) -> i32 {
+    step(ledger_at(path), |l| l.apply(|b| b.released(gen, bytes))).map_or_else(|e| e, |_| 0)
+}
+
+/// The `to` side holds `bytes` (at most what was released) of transfer `gen`; the rest goes to free.
+///
+/// # Safety
+/// `path` must be a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ledger_commit(path: *const std::os::raw::c_char, gen: u64, bytes: u64) -> i32 {
+    step(ledger_at(path), |l| l.apply(|b| b.commit(gen, bytes))).map_or_else(|e| e, |_| 0)
+}
+
+/// Ends transfer `gen` without moving anything: what was released goes to free.
+///
+/// # Safety
+/// `path` must be a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ledger_abort(path: *const std::os::raw::c_char, gen: u64) -> i32 {
+    step(ledger_at(path), |l| l.apply(|b| b.abort(gen))).map_or_else(|e| e, |_| 0)
+}
+
+/// The book: out[0..6] = gen, total, gpu, node, free, floor; out[6..9] = the pending transfer's gen (0: none), phase
+/// (1 begun, 2 released) and bytes.
+///
+/// # Safety
+/// `path` must be a NUL-terminated string, `out` valid for 9 writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ledger_show(path: *const std::os::raw::c_char, out: *mut u64) -> i32 {
+    match step(ledger_at(path), |l| l.show()) {
+        Ok(b) => {
+            let (g, ph, by) =
+                b.pending.map_or((0, 0, 0), |t| (t.gen, if t.phase == Phase::Begun { 1 } else { 2 }, t.bytes));
+            let v = [b.gen, b.total, b.gpu, b.node, b.free, b.floor, g, ph, by];
+            std::ptr::copy_nonoverlapping(v.as_ptr(), out, v.len());
+            0
+        }
+        Err(e) => e,
     }
 }

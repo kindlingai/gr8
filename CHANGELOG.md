@@ -1,5 +1,22 @@
 # Changelog
 
+
+## 2026-10-24: the Flash KV caches in chunks (`G6_FLASH_KV_CHUNKS`, D-331 M7 part B-1)
+
+- `G6_FLASH_KV_CHUNKS=1` (Flash build; default 0 = one cudaMalloc per binding, unchanged): each DSA binding's MLA and
+  index caches live in kvchunks regions (`g6_attn_bind_create_chunked`) under one chunk map per model
+  (`engine/runtime/flash_kv.h`). A chunk is the fewest pages whose MLA and index bytes are whole granules (256 pages
+  at 2 MiB), online in every binding or in none, so an offline chunk gives back all its bytes. `g6_kvc_create_masked`
+  backs only the chunks online at create; `g6_kvc_zero` zeroes what is backed (binding reset).
+- An S2 Resize event on tier `FLASH_KV_TIER` (M3's event) takes the chunks online to its count at the commit on every
+  rank. With `G6_FLASH_KV_LEDGER`, a shrink moves the released bytes GPU -> node and a grow waits for the node to
+  release them (`kvman-remote --ledger` releases a node -> GPU transfer once its leases fit the rest of its credit;
+  a transfer begun from the node takes its bytes out of the node's credit at once). Ledger C calls `g6kv_ledger_*`.
+- Nothing announces a Flash Resize yet (`FLASH_CAP_POLICY=protected`); B-2 (borrow-idle) does.
+- Tested on the dev box only (`flash_kv_chunks_test`, RTX 5090: same output bits, index lists and cache bytes as the
+  plain bindings at every count of chunks online, through a live session's shrink and grow, ledger moves, and a crash at
+  every point of both directions; kvman-rs `tests/lazy.rs`). Not measured on the boxes.
+
 ## 2026-10-24: a Flash box can lend its spare memory to a KV node beside it (`FLASH_KV_DONATE_GIB`), and a host ledger
 
 - `FLASH_KV_DONATE_GIB=N` (`./gr8 glm53f --flash-kv-donate-gib N`, default 0 = off): once the Flash serve has booted,

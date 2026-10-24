@@ -275,4 +275,14 @@ int g6kv_canon_import(const uint8_t* blob, size_t n, uint32_t mla_row, uint32_t 
                       uint32_t below_rows, const uint32_t* list, size_t n_list, uint32_t place, uint32_t rank,
                       uint8_t* const* mla, const size_t* mla_bytes, uint8_t* const* idx, const size_t* idx_bytes,
                       uint64_t* written);
+// The host ledger of a box a Flash rank shares with a KV node (src/ledger.rs, kvman-ledger): bytes move between the
+// GPU (side 0), the node (1) and free (2) as one transfer at a time, begin -> released (the giver let go) -> commit
+// (the taker holds them) or abort. Each call is one locked, durable step. 0, or -1 with g6kv_tier_error.
+int g6kv_ledger_begin(const char* path, uint32_t from, uint32_t to, uint64_t bytes, uint64_t* gen);
+int g6kv_ledger_released(const char* path, uint64_t gen, uint64_t bytes);
+int g6kv_ledger_commit(const char* path, uint64_t gen, uint64_t bytes);
+int g6kv_ledger_abort(const char* path, uint64_t gen);
+// out[0..6]: gen, total, gpu, node, free, floor; out[6..9]: the pending transfer's gen (0: none), phase (1 begun,
+// 2 released), bytes
+int g6kv_ledger_show(const char* path, uint64_t* out);
 }

@@ -534,12 +534,15 @@ impl Node {
             grant: Mutex::new(()),
             ledger: cfg.ledger.as_ref().map(crate::ledger::Ledger::at),
         });
-        if cfg.lazy && cfg.min_free > 0 && !cfg.guard_every.is_zero() {
+        if cfg.lazy && (cfg.min_free > 0 || cfg.ledger.is_some()) && !cfg.guard_every.is_zero() {
             let w = Arc::downgrade(&shared);
             let every = cfg.guard_every;
             std::thread::spawn(move || {
                 while let Some(sh) = w.upgrade() {
-                    sh.guard();
+                    if sh.min_free > 0 {
+                        sh.guard();
+                    }
+                    sh.give_to_ledger();
                     drop(sh);
                     std::thread::sleep(every);
                 }
@@ -612,7 +615,11 @@ impl Shared {
             }
         }
         if let Some(led) = &self.ledger {
-            let credit = led.show().map(|b| b.node).map_err(|e| (proto::E_NOROOM, format!("the host ledger: {e}")))?;
+            // a transfer begun from the node takes its bytes out of the credit at once
+            let credit = led
+                .show()
+                .map(|b| b.credit(crate::ledger::Side::Node))
+                .map_err(|e| (proto::E_NOROOM, format!("the host ledger: {e}")))?;
             let held = self.arena.held() as u64;
             if held + bytes > credit {
                 self.refused.fetch_add(1, Ordering::Relaxed);
@@ -649,6 +656,23 @@ impl Shared {
             for &o in offs {
                 self.arena.give(o, len);
             }
+        }
+    }
+    // with a ledger: a transfer begun from the node (node -> GPU) is released once the bytes held fit what is left of
+    // the credit, so the other side may take them. Leases end or give (SHRINK) on their own; nothing is taken back here
+    fn give_to_ledger(&self) {
+        use crate::ledger::{Phase, Side};
+        let Some(led) = &self.ledger else { return };
+        let _one = self.one_grant();
+        let held = self.arena.held() as u64;
+        let r = led.apply(|b| match b.pending {
+            Some(t) if t.from == Side::Node && t.phase == Phase::Begun && held <= b.credit(Side::Node) => {
+                b.released(t.gen, t.bytes).map(|_| t)
+            }
+            _ => Err(String::new()),
+        });
+        if let Ok(t) = r {
+            eprintln!("kvman-remote: ledger transfer {} released {} bytes ({} held)", t.gen, t.bytes, held);
         }
     }
     fn guard(&self) -> bool {

@@ -2005,6 +2005,30 @@ int main(int argc, char** argv)
                         return g6s2::share_poll(pool, t, kvt->store(t), want, share_always || idle);
                     };
             }
+#if G6_MODEL_FLASH
+            // G6_FLASH_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
+            // online, on every rank at the commit (flash_kv.h; with G6_FLASH_KV_LEDGER the bytes move through the box's
+            // host ledger). Under FLASH_CAP_POLICY=protected (the default) nothing announces one
+            if (m.fkv.pages)
+            {
+                if (const char* l = getenv("G6_FLASH_KV_LEDGER")) for (Model* x : {&m, &D.d}) x->fkv.ledger = l;
+                auto other = h.resize;
+                h.resize = [&, other](const g6s2::Resize& r) {
+                    if (r.tier != g6s2::FLASH_KV_TIER) { if (other) other(r); return; }
+                    for (Model* x : {&m, &D.d})
+                    {
+                        if (!x->fkv.pages) continue;
+                        if (int e = x->fkv.resize((uint32_t)r.segs, st))
+                            fprintf(stderr, "# rank %d: flash kv: to %llu chunks failed (%d): %s; %u online\n", R,
+                                    (unsigned long long)r.segs, e, x->fkv.err.c_str(), x->fkv.online);
+                        else
+                            fprintf(stderr, "# rank %d: flash kv: %u of %u chunks online (%llu tokens) at %lld ms\n", R,
+                                    x->fkv.online, x->fkv.chunks, (unsigned long long)x->fkv.tokens(),
+                                    (long long)g6s2::s2_wall_ms());
+                    }
+                };
+            }
+#endif
             h.dispatch = nd.hooks();
             if (dfl)
             {

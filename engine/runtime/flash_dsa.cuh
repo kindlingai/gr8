@@ -49,8 +49,24 @@ inline void bind_dsa_layer(Model& m, int i, const Find& find, int capacity, cuda
     y.ap = G6AttnPack{at("kv_b.uk"), at("kv_b.uv"), at("kv_a_norm"), at("idx.k_norm.w"), at("idx.k_norm.b")};
     y.ap.index_ape = at("self_attn.indexer.index_kpool_compress_ape");
     // decode only (build_flash: max_rows <= MX); the GLM attention scratch sharing (G6_DEC_SHARED_SCRATCH) is not wired here
-    if (int e = g6_attn_bind_create_ext(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, nullptr, 0))
-        die("Flash DSA layer " + std::to_string(y.l) + ": attention binding failed (" + std::to_string(e) + ")");
+    // G6_FLASH_KV_CHUNKS=1: the MLA and index caches in kvchunks regions under the model's chunk map (flash_kv.h), every
+    // chunk online at boot (FLASH_CAP_POLICY=protected: the capacity is never lent); 0 (default): one cudaMalloc
+    const int chunked = flashkv::env_mode();
+    if (chunked < 0) die("G6_FLASH_KV_CHUNKS is 0 or 1");
+    int e = 0;
+    if (chunked)
+    {
+        const uint32_t pages = (uint32_t)((capacity + g6kv::PAGE - 1) / g6kv::PAGE);
+        int dev = 0;
+        G6RT_CK(cudaGetDevice(&dev));
+        if (!m.fkv.pages && m.fkv.init(pages, UINT32_MAX, dev)) die("G6_FLASH_KV_CHUNKS: " + m.fkv.err);
+        if (m.fkv.pages != pages) die("G6_FLASH_KV_CHUNKS: the DSA layers' capacities differ");
+        G6KvChunks *mla = nullptr, *idx = nullptr;
+        if (m.fkv.add(&mla, &idx)) die("G6_FLASH_KV_CHUNKS layer " + std::to_string(y.l) + ": " + m.fkv.err);
+        e = g6_attn_bind_create_chunked(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, mla, idx);
+    }
+    else e = g6_attn_bind_create_ext(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, nullptr, 0);
+    if (e) die("Flash DSA layer " + std::to_string(y.l) + ": attention binding failed (" + std::to_string(e) + ")");
     y.q_a_norm = (const __nv_bfloat16*)need(find, lname(y.l, "q_a_norm"));
     const TensorRef qn = find(lname(y.l, "q_a_norm"));
     if (!qn.bf16 || qn.nd != 1 || qn.shape[0] != QA) die("Flash DSA: q_a_norm must be BF16 [1536]");
@@ -281,6 +297,10 @@ inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t s
     }
     else
     {
+        // G6_FLASH_KV_CHUNKS: no step reaches a page whose chunk is offline (admission keeps contexts inside)
+        if (m.fkv.pages && (uint64_t)context > m.fkv.tokens())
+            die("Flash DSA: context " + std::to_string(context) + " passes the " + std::to_string(m.fkv.tokens()) +
+                " tokens online (G6_FLASH_KV_CHUNKS)");
         const G6AttnStep s = dsa_step(m, M, context);
         G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
     }
