@@ -894,7 +894,7 @@ class Supervisor:
         elif self.hs and self.rank and code and not self.stop_failed:
             self.tell_head({'t': 'abort', 'rank': self.rank, 'why': first})
         if self.started:
-            stop_local(self.home, log)
+            stop_local(self.home, log, quit_wait(self.o))
         if self.agent:
             self.agent.stop()
         if self.api_agent:
@@ -998,8 +998,17 @@ def signal_pid(pid, sig, name, log=log):
         log(f'{name} (pid {pid}) belongs to another account: not stopped')
 
 
-def stop_local(home, log=log):
-    """Stop this box: shim and front end, then quit files, then the engine."""
+def quit_wait(o):
+    """Seconds an engine gets for its orderly quit before SIGTERM: 120 with a persist=lease store (the quit stores the
+    pool's runs on the KV node), else 10."""
+    try:
+        return 120 if any(t['lease'] for t in opt.kv_stores(o)) else 10
+    except opt.OptionError:
+        return 10
+
+
+def stop_local(home, log=log, quit_s=10):
+    """Stop this box: shim and front end, then quit files, then the engine (quit_s seconds for an orderly quit)."""
     out = os.path.join(home, 'out')
     for p in ('front', 'shim'):
         pid = recorded(os.path.join(out, f'{p}.pid'))
@@ -1010,7 +1019,7 @@ def stop_local(home, log=log):
         return False
     if os.path.isdir(os.path.join(home, 's2')):
         open(os.path.join(home, 's2', 'quit'), 'w').close()
-    for _ in range(100):
+    for _ in range(int(quit_s * 10)):
         if not alive(pid):
             break
         try:

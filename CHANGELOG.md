@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-24: KV-node leases that outlive a restart (persist=lease) and ./gr8 <model> resize (D-331 M4)
+
+- `--kv-store remote:HOST:PORT,size=N,persist=lease`: the KV node, run with `--holdover-s S`, parks the lease for S
+  seconds when the engine closes it, and the next engine takes it back with its blocks. The engine's index of that
+  store (sessions too) lives in `/dev/shm`, and an orderly quit stores the pool's runs first. Off by default; not with
+  `group=` yet.
+- `./gr8 <model> resize --restart idle [OPTIONS]`: waits for no running request, then down and up with OPTIONS (a new
+  `--cap`), so the next turn of a session restores from the node. `RESTART=off` (the default) refuses.
+- Tested on loopback only (engine/kvman-rs/REMOTE-TIER.md, Persistence (KV-node leases)). Not measured on a cluster.
+
 ## 2026-10-24: a KV node shared by clusters (group leases, D-331 M3)
 
 - `--kv-store remote:...,group=NAME[,cap=N][,weight=N]`: the stores of one cluster form a group lease on a KV node,

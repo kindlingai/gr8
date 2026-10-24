@@ -110,6 +110,17 @@ if [ -x "$NODE" ]; then
   "$T/kv_share_test" "remote:127.0.0.1:$SPORT"
   kill "$SHARE_PID"
 fi
+# persist=lease (D-331 M4): a session stored on a KV-node lease, an orderly quit, a restart with a larger pool within
+# the node's holdover: the lease and its whole index come back, and the next turn restores from them (kv_lease_test)
+if [ -x "$NODE" ]; then
+  g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_lease_test.cpp" "${KVLIB[@]}" -o "$T/kv_lease_test"
+  "$NODE" --gb 0.05 --holdover-s 30 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma --ready "$T/lease.json" > "$T/lease.log" 2>&1 &
+  LEASE_PID=$!
+  for _ in $(seq 50); do [ -s "$T/lease.json" ] && break; sleep 0.1; done
+  LPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/lease.json")
+  "$T/kv_lease_test" "remote:127.0.0.1:$LPORT" "$T/lease-index"
+  kill "$LEASE_PID"
+fi
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
 # a held event boundary (Commit::hold): queued admissions chained at one boundary, three ranks on socket pairs

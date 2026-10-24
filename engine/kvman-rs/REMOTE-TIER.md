@@ -305,8 +305,34 @@ entry's blocks before `io_done` appends its add record. A drop record is synced 
 A record that fails its checksum ends the log, and the file is cut there, so a torn write never names blocks that hold
 anything else. Entries load in commit order. After boot, every worker sends the head its loaded entries. The head keeps
 those every rank has, in its own order, and every rank keeps exactly that list, so the ranks start in lock-step. The log
-is rewritten from the live entries when it holds four times as many records. Evicted runs are not persisted, and neither
-are KV node leases.
+is rewritten from the live entries when it holds four times as many records. Evicted runs are not persisted on an
+SSD store (a KV-node lease with `persist=lease` keeps them: next section).
+
+### Persistence (KV-node leases: `persist=lease`, `./gr8 <model> resize`)
+
+A KV-node store with `persist=lease` (`remote:HOST:PORT,size=N,persist=lease`, not with `group=` yet) keeps its
+sessions over an engine restart, for a resize of `CAP` or a reload that keeps the model. Three parts:
+
+- The node: `kvman-remote --holdover-s S` (default 0: off) parks a lease opened with persist when its last
+  connection closes, for S seconds, instead of freeing it. An OPEN (or GOPEN) of the same name and shape within S
+  takes it back with its bytes as they were (the reply says reattached); another shape, or a parked lease past S,
+  is freed and the new lease is zeroed as always.
+- The engine: the lease's name has no epoch (`g6m4-<set id>-<host>-r<R>[-<format>]-t<i>`), so the next engine asks
+  for the same lease. Its index (the SSD index format, plus record 4: every field of an entry, so evicted runs come
+  back with their base prefix, hits, tail and namespace; non-stock runs are never written) lives in
+  `/dev/shm/g6kv-<name>`, as long as the box. A lease the node did not give back starts its index empty. The compat
+  line leaves out the pool's placement pages and the store's size, which a resize changes (entries past the store's
+  size are not loaded); with tails past R (CP) the placement stays in. At an orderly quit (`DIR/quit`, an idle
+  engine) every rank stores the runs its pool still holds, the same calls on every rank, before it closes the lease.
+- The launcher: `./gr8 <model> resize --restart idle [OPTIONS]` waits until the head's front end reports no running
+  request (`vllm:num_requests_running` 0 on two polls, at most `--resize-wait` seconds, 600), runs `down` (the engine
+  gets 120 s for its quit with a lease store, else 10) and then `up` with OPTIONS. `RESTART=off` (the default)
+  refuses; `checkpoint` (mid-turn) needs the Flash checkpoint and is not built.
+
+Not measured on a cluster yet. Tested on loopback: `tests/park.rs` (the node), `tests/stash.rs`
+`a_whole_index_brings_back_evicted_runs_after_a_restart`, and `engine/runtime/s2/tests/kv_lease_test.cpp` (C
+interface: a session stored, a quit, a restart with a larger pool, the next turn restores 256 of 410 prompt rows from
+the lease; with no holdover it restores none). A request that arrives between resize's last poll and the quit fails.
 
 ### Tested on a single GB10 build box
 

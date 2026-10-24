@@ -388,6 +388,15 @@ class KvStoreTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError):
             self.plan('--kv-store', b, '--kv-share-when', 'busy')
 
+    def test_a_lease_store_outlives_a_restart(self):
+        b = 'remote:192.0.2.5:7350,size=8G,persist=lease'
+        o, p = self.plan('--kv-store', b)
+        self.assertEqual(self.stores(p), [b], 'g6m4 reads persist=lease from the store text')
+        self.assertEqual([(t['lease'], t['persist']) for t in opt.kv_stores(o)], [(True, False)])
+        for bad in ('ssd:/nvme/kv,size=8G,persist=lease', b + ',group=glm'):
+            with self.assertRaises(opt.OptionError):
+                self.plan('--kv-store', bad)
+
     def test_stores_in_flag_order_and_what_they_keep(self):
         a, b = 'ssd:/nvme/gr8kv,size=200G', 'remote:192.0.2.5:7350,size=8G'
         o, p = self.plan('--kv-store', a, '--kv-store', b, '--kv-keep', 'sessions', '--kv-system-after', '3',

@@ -85,6 +85,10 @@ KEYS = {
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
     'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
+    'RESTART': ('box', None, 'what ./gr8 <model> resize may do: off (the default: resize refuses), idle (wait until no '
+                             'request runs, then an orderly quit that stores the pool on a persist=lease store, and up), '
+                             'or checkpoint (mid-turn, needs the Flash checkpoint: not built yet)'),
+    'RESIZE_WAIT': ('box', None, 'resize: seconds to wait for no running request before it gives up (600)'),
     'KV_SHARE_WHEN': ('cluster', None, 'a KV_STORE group= lease gives segments to other groups only while the engine is '
                                        'idle (idle, default) or whenever the node asks (always) (G6_KV_SHARE_WHEN)'),
     'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
@@ -504,7 +508,7 @@ def kv_stores(o):
         if not m or (store.startswith('remote:auto') and m.group(2)):
             raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
         t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
-             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None}
+             'host': None, 'port': None, 'size': None, 'persist': False, 'lease': False, 'keep': None}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
         else:
@@ -513,10 +517,12 @@ def kv_stores(o):
             k, _, x = kv.partition('=')
             if k == 'size' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
                 t['size'] = x
-            elif k == 'persist' and x in ('on', 'off'):
+            elif k == 'persist' and x in ('on', 'off', 'lease'):
                 if t['kind'] != 'ssd' and x == 'on':
                     raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
-                t['persist'] = x == 'on'
+                if t['kind'] != 'remote' and x == 'lease':
+                    raise OptionError(f'--kv-store {text}: persist=lease is for remote: stores')
+                t['persist'], t['lease'] = x == 'on', x == 'lease'
             elif k == 'group' and re.fullmatch(r'[A-Za-z0-9_.-]+', x):   # B3 shared node: g6m4 parses it
                 if t['kind'] != 'remote':
                     raise OptionError(f'--kv-store {text}: group= is for remote: stores')
@@ -530,10 +536,12 @@ def kv_stores(o):
                     raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
                 t['keep'] = x
             else:
-                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off, keep=RULE, '
+                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off|lease, keep=RULE, '
                                   'or group=NAME[,cap=N(M|G|T)][,weight=N] on remote:')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
+        if t['lease'] and t.get('group'):
+            raise OptionError(f'--kv-store {text}: persist=lease does not take group= yet')
         out.append(t)
     return out
 
