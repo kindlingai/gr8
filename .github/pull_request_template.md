@@ -7,3 +7,5 @@
 - [ ] **Changes defaults or performance**: default behaviour, speed or memory changes (needs its own A/B gate)
 - [ ] **Front end only**: `frontend/` and launcher changes that do not touch the engine
 - [ ] **Docs or tests only**: no change to shipped code
+
+A maintainer marks the PR ready for the merge queue by commenting `/ready` (`/unready` to undo). A new push clears it.
