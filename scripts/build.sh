@@ -77,6 +77,11 @@ case "${MODEL:-glm}" in
     mv "$OUT/flash/m4sim" "$OUT/m4sim_flash" && mv "$OUT/flash/g6m4" "$OUT/g6m4_flash" && rm -rf "$OUT/flash"
     md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
     widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"
+    # the Flash serve's own hooks are in the binary (borrow-idle lived in GLM-only code once and no unit test saw it)
+    for m in "flash kv: borrow-idle, %u of"; do
+      grep -c -a -F "$m" "$OUT/g6m4_flash" > /dev/null || { echo "$OUT/g6m4_flash lacks '$m'"; exit 1; }
+    done
+    echo "g6m4_flash has its serve hooks"
     exit 0 ;;
   *) echo "MODEL=$MODEL: glm or flash"; exit 2 ;;
 esac

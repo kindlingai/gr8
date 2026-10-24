@@ -24,6 +24,9 @@ struct FlashContext {
     std::function<void(int, bool, int)> draft_graph;
     FlashCheckpoints* ckpt = nullptr;   // G6_FLASH_CACHE on: the checkpoint store, else none
     bool terminal = false;              // G6_FLASH_CACHE=terminal: also a checkpoint at the end of every request
+    // optional: the engine's own hooks (G6_FLASH_KV_CHUNKS borrow-idle: resize on FLASH_KV_TIER, flash_room, flash),
+    // added after serve_flash's; a resize hook chains to the one already set for any other tier
+    std::function<void(NativeHooks&)> install;
 };
 inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     using namespace g6rt;
@@ -219,6 +222,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 (unsigned long long)slot.req.id, rows, first,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     };
+    if (c.install) c.install(h);
     ControlLinks links = bootstrap(bc);
     try {
         wcheck::seal(c.main.rank);
