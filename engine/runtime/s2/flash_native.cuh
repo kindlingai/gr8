@@ -111,11 +111,16 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             pfseq2 += c.main.nl;
         } else pf_step_flash(c.main, c.prefill, ma, a + ma, pfseq, c.stream);
         pfseq += c.main.nl;
-        fence(); check();
+        // The cache fill (the default) touches no fabric and no main layer, and leaves its own error word set, so every
+        // word check() reads stays set until the next request's reset: one check after the last chunk sees what one per
+        // chunk saw, without check()'s blocking copy per layer each MX rows. The fence per chunk stays (k_step_in reads
+        // *c.draft_input, which the next chunk rewrites).
+        const bool cache = !getenv("G6_FLASH_DRAFT_KV") || atoi(getenv("G6_FLASH_DRAFT_KV"));
+        fence();
+        if (!cache) check();
         auto draft = [&](FlashPrefill& fp, int n, int base) {
             pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
                 *c.draft_input = di;
-                const bool cache = !getenv("G6_FLASH_DRAFT_KV") || atoi(getenv("G6_FLASH_DRAFT_KV"));
                 if (cache) pf_draft_cache_flash(c.draft, di.M, di.context, c.stream);
                 else {
                     std::vector<uint32_t> sizes(3, uint32_t(di.M * HID * 2));
@@ -126,11 +131,13 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                     launch_draft_step(c.draft, di.M, di.context, false, c.stream);
                     c.draft.d.cur = old;
                 }
-                fence(); check();
+                fence();
+                if (!cache) check();
             });
         };
         draft(c.prefill, ma, a);
         if (mb) draft(c.prefill2, mb, a + ma);
+        if (cache) check();
         fprintf(stderr, "# flash serve request %llu prefill %u rows at %u (main + draft): %.3f ms\n",
                 (unsigned long long)slot.req.id, rows, first,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());

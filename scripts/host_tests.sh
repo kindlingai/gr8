@@ -140,6 +140,8 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost"
 "$T/test_full_s2_cost"
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
+# Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
+python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
 # Flash prefill non-kernel span (NK): G6_PF_PREWARM source check, G6_PF_STAGE_ASYNC source check + schedule hazard model.
 python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test"
