@@ -438,26 +438,26 @@ static bool run_ok(const G6Attn& a){
 }   // namespace fa
 
 constexpr int NOTSUP=(int)cudaErrorNotSupported, INVAL=(int)cudaErrorInvalidValue;
-extern "C" size_t g6_attn_scratch_bytes(const G6Attn* a){if(!a||!fa::valid(*a))return 0;return fa::workspace(*a,nullptr).total;}
-extern "C" int g6_attn_append(const G6Attn* a,void* s){
+extern "C" size_t g6a_scratch_bytes(const G6Attn* a){if(!a||!fa::valid(*a))return 0;return fa::workspace(*a,nullptr).total;}
+extern "C" int g6a_append(const G6Attn* a,void* s){
     if(!a||!fa::valid(*a)||!fa::append_ok(*a))return INVAL;
     fa::append(*a,*a,(cudaStream_t)s);return (int)cudaGetLastError();
 }
 // tests: the pool scores (kpool.cuh kp_scores), FP32 [rows][pool_stride(context)] (pools not visible to a row: untouched)
-extern "C" int g6_attn_index_scores(const G6Attn* a,void* scratch,size_t bytes,float* scores,void* s){
+extern "C" int g6a_index_scores(const G6Attn* a,void* scratch,size_t bytes,float* scores,void* s){
     if(!a||!fa::valid(*a)||!scratch||!scores||a->reuse_indices||!a->index_q||!a->index_weight)return INVAL;
     auto w=fa::workspace(*a,scratch);if(!w.total||bytes<w.total)return INVAL;
     fa::kp_scores<<<dim3(w.pstride/32,a->rows),256,0,(cudaStream_t)s>>>(*a,0,scores,w.pstride);
     return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_run(const G6Attn* a,void* scratch,size_t bytes,void* s){
+extern "C" int g6a_run(const G6Attn* a,void* scratch,size_t bytes,void* s){
     if(!a||!fa::valid(*a)||!scratch||!fa::append_ok(*a)||!fa::run_ok(*a))return INVAL;
     auto w=fa::workspace(*a,scratch);if(!w.total||bytes<w.total)return INVAL;
     cudaStream_t stream=(cudaStream_t)s;
     fa::append(*a,*a,stream);
     return (int)fa::run_body(*a,*a,w,stream);
 }
-extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
+extern "C" int g6a_replay_run(const G6AttnReplay* r,void* s){
     if(!r||!r->cell)return INVAL;
     const G6Attn& a=r->fixed;
     if(!fa::valid(a)||!r->scratch||!fa::append_ok(a)||!fa::run_ok(a))return INVAL;
@@ -470,22 +470,8 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
     AMARK(0);
     return (int)fa::run_body(a,input,w,stream);
 }
-extern "C" int g6_attn_rope_init(int,void*){return 0;}   // no RoPE in Flash
-extern "C" int g6_attn_ctx_sp(void){return 0;}           // the E1 decode attention variants (#135) are GLM-5.3 only
-extern "C" int g6_attn_posidx(void){return 0;}
-extern "C" int g6_attn_posidx_takes(const G6Attn*){return 0;}
 
 #if defined(G6_CP) && G6_CP
-extern "C" int g6_attn_cp_front(const G6Attn*,const G6AttnStepCell*,void*,size_t,void*){return NOTSUP;}
-extern "C" int g6_attn_cp_index(const G6Attn*,const G6AttnStepCell*,void*,size_t,uint64_t*,void*){return NOTSUP;}
-extern "C" int g6_attn_cp_merge_index(const G6Attn*,const G6AttnStepCell*,const uint64_t*,void*){return NOTSUP;}
-extern "C" int g6_attn_cp_group(const G6Attn*,const G6AttnStepCell*,void*,size_t,const float*,const float*,float*,void*){return NOTSUP;}
-extern "C" int g6_attn_kvb_bf16(const void*,const float*,void*,int,void*){return NOTSUP;}
-extern "C" int g6_attn_cp_groups_ok(int){return 0;}
-extern "C" size_t g6_attn_cp_groups_bytes(int,int){return 0;}
-extern "C" int g6_attn_cp_groups(const G6Attn*,const G6AttnStepCell*,void*,size_t,const float*,const float*,float*,int,int64_t,void*){return NOTSUP;}
-extern "C" int g6_attn_cp_finish(const G6Attn*,const G6AttnStepCell*,void*,size_t,const float*,void*){return NOTSUP;}
-extern "C" int g6_attn_cp_qabs(const G6Attn*,void*,const float**,const float**){return NOTSUP;}
 #endif
 
 // ---- prefill: Tensor-Core WMMA attention (absorb_tc, sparse_qk_pf, sparse_pv_pf, value_project_tc) + multi-row kpool
@@ -1511,20 +1497,20 @@ static int create_prefill(G6AttnPrefill** out,G6AttnBinding* b,G6AttnPrefill* ow
 }
 }   // namespace fa_pf
 
-extern "C" int g6_attn_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding* b,void*){
+extern "C" int g6a_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding* b,void*){
     return fa_pf::create_prefill(out,b,nullptr,false);
 }
-extern "C" int g6_attn_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding* b,void*,G6AttnPrefill* owner){
+extern "C" int g6a_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding* b,void*,G6AttnPrefill* owner){
     return fa_pf::create_prefill(out,b,owner,true);
 }
-extern "C" int g6_attn_bind_prefill_release(G6AttnPrefill* p){
+extern "C" int g6a_bind_prefill_release(G6AttnPrefill* p){
     if(!p)return 0;
     cudaError_t e=fa_pf::release_scratch(p->workspace);
     delete p;
     return (int)e;
 }
-extern "C" size_t g6_attn_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
-extern "C" int g6_attn_bind_prefill_get_config(const G6AttnPrefill* p,int* query_tile,int* dense_limit){
+extern "C" size_t g6a_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
+extern "C" int g6a_bind_prefill_get_config(const G6AttnPrefill* p,int* query_tile,int* dense_limit){
     if(!p)return INVAL;if(query_tile)*query_tile=p->R;if(dense_limit)*dense_limit=0;return 0;
 }
 extern "C" void* g6_attn_bind_prefill_output(const G6AttnPrefill* p,const G6AttnBinding* b,int rows){
@@ -1541,7 +1527,7 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
     static const bool force_p1=getenv("G6_FPF_ATTN_P1")&&atoi(getenv("G6_FPF_ATTN_P1"))==1;
     if(owner && (g6nr::NR!=2 || owner->rank!=b->rank || !owner->opaque || !owner->publish ||
                  !owner->receive || step->reuse_indices || force_p1)) return INVAL;
-    if(force_p1&&step->rows<=b->max_rows)return g6_attn_bind_run(b,step,s);
+    if(force_p1&&step->rows<=b->max_rows)return g6a_bind_run(b,step,s);
     if(step->rows<=0||step->rows>p->maxrows||step->context<=0||step->context>b->capacity||
        step->rows>step->context||!step->q_b||!step->kv_a||!step->positions)return INVAL;
     if(step->reuse_indices){
@@ -1645,31 +1631,18 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
     }
     return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){
+extern "C" int g6a_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){
     return flash_prefill_run(p,b,step,s,nullptr);
 }
-extern "C" int g6_attn_bind_prefill_run_owned(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s,
+extern "C" int g6a_bind_prefill_run_owned(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s,
                                            const G6FlashPoolOwner* owner){
     return owner ? flash_prefill_run(p,b,step,s,owner) : INVAL;
 }
-extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,const G6AttnTrace*,void*){return NOTSUP;}
-extern "C" int g6_attn_bind_baseline_trace(G6AttnBinding*,const G6AttnStep*,const G6AttnTrace*,void*){return NOTSUP;}
-extern "C" int g6_attn_bind_prefill_profile_read(G6AttnPrefill*,G6AttnPrefillProfile* out){
+extern "C" int g6a_bind_prefill_profile_read(G6AttnPrefill*,G6AttnPrefillProfile* out){
     if(out){*out=G6AttnPrefillProfile{};out->status=G6_PF_PROFILE_OFF;}return 0;
 }
 // append only (latent + index keys) of a full-index step
-extern "C" int g6_attn_bind_index_append(G6AttnBinding* b,const G6AttnStep* step,void* s){
-    int e=g6_attn_bind_prepare(b,step,s);return e?e:g6_attn_append(&b->args,s);
+extern "C" int g6a_bind_index_append(G6AttnBinding* b,const G6AttnStep* step,void* s){
+    int e=g6a_bind_prepare(b,step,s);return e?e:g6a_append(&b->args,s);
 }
-extern "C" int g6_attn_bind_prefill_index_rows(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,int*,float*,void*){return NOTSUP;}
-extern "C" int g6_attn_qo_create(G6AttnQo**,const G6AttnBinding*,const G6AttnTensor*,const G6AttnTensor*,int,void*,G6AttnQo*){return NOTSUP;}
-extern "C" int g6_attn_qo_run(G6AttnQo*,G6AttnBinding*,const G6AttnQoStep*,void*){return NOTSUP;}
-extern "C" size_t g6_attn_qo_bytes(const G6AttnQo*){return 0;}
-extern "C" void g6_attn_qo_prof(int,double*){}
-extern "C" int g6_attn_qo_warm(G6AttnQo*,int,void*){return NOTSUP;}
-extern "C" int g6_attn_qo_release(G6AttnQo*){return 0;}
-extern "C" int g6_attn_qo_load(G6AttnQo*,const G6AttnTensor*,const G6AttnTensor*,void*){return NOTSUP;}
-extern "C" void g6_attn_qo_cap(int){}
 // the remote rows tier (runtime/rt_rows.cuh) moves GLM's MLA latent rows, not Flash's: unsupported, as in a G6_KV4 build
-extern "C" int g6_rt_pack_int4(const void*,size_t,void*,size_t,int,void*){return NOTSUP;}
-extern "C" int g6_rt_unpack_int4(const void*,size_t,void*,size_t,int,void*){return NOTSUP;}

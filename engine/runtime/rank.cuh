@@ -42,6 +42,7 @@
 #include "../kernels/head_i4.cuh"
 #include "../kernels/head2.cuh"
 #include "../attn/bind.h"
+#include "../attn/ops.h"
 #if G6_MODEL_FLASH
 #include "../mhc/mhc.cuh"
 #include "../kda/kda.cuh"

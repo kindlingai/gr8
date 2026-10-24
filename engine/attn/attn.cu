@@ -1048,21 +1048,21 @@ static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const floa
 static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8&&a->cp_rank>=0&&a->cp_rank<a->cp_nr&&a->rows<=a->query_tile;}
 #endif
 }
-extern "C" size_t g6_attn_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
-extern "C" int g6_attn_ctx_sp(void){return ga::attn_ctx3_sp();}
-extern "C" int g6_attn_posidx(void){return ga::attn_posidx();}
-extern "C" int g6_attn_posidx_takes(const G6Attn* a){return a&&ga::use_posidx(*a)?1:0;}
-extern "C" int g6_attn_append(const G6Attn* a,void* s){
+extern "C" size_t g6a_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
+extern "C" int g6a_ctx_sp(void){return ga::attn_ctx3_sp();}
+extern "C" int g6a_posidx(void){return ga::attn_posidx();}
+extern "C" int g6a_posidx_takes(const G6Attn* a){return a&&ga::use_posidx(*a)?1:0;}
+extern "C" int g6a_append(const G6Attn* a,void* s){
     if(!a||!ga::valid(*a)||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;ga::append_kv<<<a->rows,256,0,stream>>>(*a);
     if(!a->reuse_indices){if(!a->index_k||!a->index_norm||!a->index_bias||!a->index_cache)return (int)cudaErrorInvalidValue;ga::append_index<<<a->rows,128,0,stream>>>(*a);}
     return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_index_scores(const G6Attn* a,void* scratch,size_t bytes,float* scores,void* s){
+extern "C" int g6a_index_scores(const G6Attn* a,void* scratch,size_t bytes,float* scores,void* s){
     if(!a||!ga::valid(*a)||!scratch||!scores)return (int)cudaErrorInvalidValue;auto w=ga::workspace(*a,scratch);if(!w.total||bytes<w.total)return (int)cudaErrorInvalidValue;
     for(int start=0;start<a->rows;start+=a->query_tile){auto e=ga::make_index(*a,w,start,std::min(a->rows-start,a->query_tile),(cudaStream_t)s,scores);if(e!=cudaSuccess)return (int)e;}return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_run(const G6Attn* a_in,void* scratch,size_t bytes,void* s){
+extern "C" int g6a_run(const G6Attn* a_in,void* scratch,size_t bytes,void* s){
 #if defined(G6_CP) && G6_CP
     // a CP binding at context <= R (every page replicated, physical == logical on the prefix): today's replicated path
     G6Attn rep;if(a_in){rep=*a_in;rep.cp_nr=0;rep.cp_rank=0;}const G6Attn* a=a_in?&rep:nullptr;
@@ -1072,10 +1072,10 @@ extern "C" int g6_attn_run(const G6Attn* a_in,void* scratch,size_t bytes,void* s
     if(!a||!ga::valid(*a)||!scratch||!a->q_b||!a->uk||!a->uv||!a->indices||!a->output)return (int)cudaErrorInvalidValue;
     if(!a->reuse_indices&&(!a->index_q||!a->index_weight))return (int)cudaErrorInvalidValue;
     if(a->reuse_row_map&&a->reuse_indices==a->indices)return (int)cudaErrorInvalidValue;
-    auto w=ga::workspace(*a,scratch);if(!w.total||bytes<w.total)return (int)cudaErrorInvalidValue;auto e=(cudaError_t)g6_attn_append(a,s);if(e!=cudaSuccess)return (int)e;
+    auto w=ga::workspace(*a,scratch);if(!w.total||bytes<w.total)return (int)cudaErrorInvalidValue;auto e=(cudaError_t)g6a_append(a,s);if(e!=cudaSuccess)return (int)e;
     return (int)ga::run_body(*a,*a,w,(cudaStream_t)s);
 }
-extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
+extern "C" int g6a_replay_run(const G6AttnReplay* r,void* s){
     if(!r||!r->cell)return (int)cudaErrorInvalidValue;
 #if defined(G6_CP) && G6_CP
     G6Attn rep=r->fixed;rep.cp_nr=0;rep.cp_rank=0;const G6Attn& a=rep;   // CP binding below R: replicated, as g6_attn_run
@@ -1106,7 +1106,7 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
 
 // The decode RoPE table (ga::cs_t) for boots without QO attention, where g6_attn_qo_create never builds it: the same
 // {cos, sin} per (pos, j) from ga::cs (rope_table), so decode output is unchanged and absorb skips the FP64 sincos.
-extern "C" int g6_attn_rope_init(int cap,void* s){
+extern "C" int g6a_rope_init(int cap,void* s){
 #if PF_QOROPE && PF_ROPE2
     cudaStream_t st=(cudaStream_t)s;float2* t=nullptr;
     cudaError_t e=cudaMalloc(&t,(size_t)cap*32*sizeof(float2));if(e!=cudaSuccess)return (int)e;
@@ -1129,7 +1129,7 @@ static int cp_call(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size
     if(cell){ga::ReplayInput in{*a,cell};return (int)body(in,w);}
     return (int)body(*a,w);
 }
-extern "C" int g6_attn_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,void* s){
+extern "C" int g6a_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,void* s){
     if(!a||!a->q_b||!a->uk||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error||!a->indices)return (int)cudaErrorInvalidValue;
     if(!a->reuse_indices&&(!a->index_q||!a->index_weight||!a->index_k||!a->index_norm||!a->index_bias||!a->index_cache))return (int)cudaErrorInvalidValue;
     if(a->reuse_row_map&&a->reuse_indices==a->indices)return (int)cudaErrorInvalidValue;
@@ -1140,12 +1140,12 @@ extern "C" int g6_attn_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void*
         if(!a->reuse_indices)ga::append_index<<<a->rows,128,0,stream>>>(in);
         return ga::cp_front_body(*a,in,w,stream);});
 }
-extern "C" int g6_attn_cp_index(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,uint64_t* cand_all,void* s){
+extern "C" int g6a_cp_index(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,uint64_t* cand_all,void* s){
     if(!a||(!a->reuse_indices&&!cand_all))return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_index_body(*a,in,w,cand_all,stream);});
 }
-extern "C" int g6_attn_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell,const uint64_t* cand_all,void* s){
+extern "C" int g6a_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell,const uint64_t* cand_all,void* s){
     if(!ga::cp_ok(a)||!cand_all||a->reuse_indices)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     if(a->rt_group)ga::rt_wait<<<1,32,0,stream>>>(a->rt_group,a->error);   // every scores launch of the layer follows
@@ -1156,29 +1156,29 @@ extern "C" int g6_attn_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell
     else ga::cp_merge<<<a->rows,256,0,stream>>>(*a,0,cand_all);
     return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_cp_group(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* s){
+extern "C" int g6a_cp_group(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* s){
     if(!a||!a->indices||!a->mla_cache||!a->block_table||!q||!rope||!part)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_group_body(*a,in,w,q,rope,part,stream);});
 }
-extern "C" int g6_attn_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* s){
+extern "C" int g6a_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* s){
     if(!a||!a->uv||!a->output||!part_all)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_finish_body(*a,in,w,part_all,stream);});
 }
-extern "C" int g6_attn_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
+extern "C" int g6a_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
 // prob, parts, ml of cp_groups_body, each 256-B aligned
 static size_t cp_groups_at(int heads,int rows,int k){
     const size_t nh=(size_t)heads*rows,b[3]={nh*ga::TOP*4,nh*ga::PART*512*4,nh*2*4};
     size_t o=0;for(int i=0;i<k;i++)o+=(b[i]+255)&~size_t(255);return o;
 }
-extern "C" size_t g6_attn_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
-extern "C" int g6_attn_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,
+extern "C" size_t g6a_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
+extern "C" int g6a_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,
                                  float* part,int gh,int64_t gblk,void* s){
-    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!rope||!part||!g6_attn_cp_groups_ok(gh)||a->heads%gh||
+    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!rope||!part||!g6a_cp_groups_ok(gh)||a->heads%gh||
        a->heads/gh>7)return (int)cudaErrorInvalidValue;
     G6Attn one=*a;one.heads=gh;   // the call's shape is that of each group's call
-    if(!ga::cp_ok(&one)||bytes<g6_attn_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*514)return (int)cudaErrorInvalidValue;
+    if(!ga::cp_ok(&one)||bytes<g6a_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*514)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     ga::Work w{};char* b=(char*)buf;
     w.prob=(float*)(b+cp_groups_at(a->heads,a->rows,0));w.parts=(float*)(b+cp_groups_at(a->heads,a->rows,1));
@@ -1186,13 +1186,13 @@ extern "C" int g6_attn_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void
     if(cell)return (int)ga::cp_groups_body(*a,ga::ReplayInput{*a,cell},w,ml,q,rope,part,gh,gblk,stream);
     return (int)ga::cp_groups_body(*a,*a,w,ml,q,rope,part,gh,gblk,stream);
 }
-extern "C" int g6_attn_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
+extern "C" int g6a_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
     if(!ga::cp_ok(a)||!scratch||!q||!rope)return (int)cudaErrorInvalidValue;
     auto w=ga::workspace(*a,scratch);if(!w.total)return (int)cudaErrorInvalidValue;
     *q=w.q;*rope=w.rope;return 0;
 }
 #endif
-extern "C" int g6_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+extern "C" int g6a_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
 #if G6_KV4
     (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
 #else
@@ -1200,7 +1200,7 @@ extern "C" int g6_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int
     ga::rt_convert<true><<<(n+7)/8,256,0,(cudaStream_t)s>>>((const uint8_t*)src,ss,(uint8_t*)dst,ds,n);return (int)cudaGetLastError();
 #endif
 }
-extern "C" int g6_rt_unpack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+extern "C" int g6a_rt_unpack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
 #if G6_KV4
     (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
 #else

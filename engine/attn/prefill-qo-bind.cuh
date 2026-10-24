@@ -189,7 +189,7 @@ inline int cap_limit = 0;   // g6_attn_qo_cap
 inline bool heads_ok(int h) { return h == 64 || (G6_NR == 4 && h == 32); }
 }   // namespace gqi
 
-extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
+extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
                                  int max_rows, void* s, G6AttnQo* owner) {
     if (!out || *out || !b || !b->storage || !uk || !uv || max_rows <= 0) return int(cudaErrorInvalidValue);
     auto shape = [](const G6AttnTensor* t, int64_t a, int64_t c, int64_t d) { return t->data && t->ndim == 3 && t->shape[0] == a && t->shape[1] == c && t->shape[2] == d; };
@@ -278,8 +278,8 @@ inline void prof_tick(cudaStream_t st, int k) {
     prof_last = n;
 }
 }   // namespace gqi
-extern "C" void g6_attn_qo_prof(int on, double* ms) { gqi::prof_ms = on ? ms : nullptr; }
-extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep* s, void* stream) {
+extern "C" void g6a_qo_prof(int on, double* ms) { gqi::prof_ms = on ? ms : nullptr; }
+extern "C" int g6a_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep* s, void* stream) {
     if (!p || !b || !b->storage || !s) return int(cudaErrorInvalidValue);
     if (s->rows == 0) return 0;
     if (s->rows < 0 || s->rows > p->max_rows || s->context <= 0 || s->context > b->capacity || s->context > p->cap || !s->q_b ||
@@ -369,7 +369,7 @@ extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep*
     gqi::prof_tick(st, 3);
     return int(cudaGetLastError());
 }
-extern "C" int g6_attn_qo_warm(G6AttnQo* p, int rows, void* stream) {
+extern "C" int g6a_qo_warm(G6AttnQo* p, int rows, void* stream) {
     if (!p || rows <= 0 || rows > p->max_rows) return int(cudaErrorInvalidValue);
     cudaStream_t st = (cudaStream_t)stream;
     const int R = rows, H = p->heads;
@@ -393,9 +393,9 @@ extern "C" int g6_attn_qo_warm(G6AttnQo* p, int rows, void* stream) {
     if (rc) return rc;
     return int(cudaStreamSynchronize(st));
 }
-extern "C" size_t g6_attn_qo_bytes(const G6AttnQo* p) { return p ? p->bytes : 0; }
-extern "C" void g6_attn_qo_cap(int cap) { gqi::cap_limit = cap > 0 ? cap : 0; }
-extern "C" int g6_attn_qo_load(G6AttnQo* p, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream) {
+extern "C" size_t g6a_qo_bytes(const G6AttnQo* p) { return p ? p->bytes : 0; }
+extern "C" void g6a_qo_cap(int cap) { gqi::cap_limit = cap > 0 ? cap : 0; }
+extern "C" int g6a_qo_load(G6AttnQo* p, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream) {
     if (!p || !p->storage || !uk || !uv) return int(cudaErrorInvalidValue);
     auto shape = [](const G6AttnTensor* t, int64_t a, int64_t c, int64_t d) { return t->data && t->ndim == 3 && t->shape[0] == a && t->shape[1] == c && t->shape[2] == d; };
     const int heads = p->heads;
@@ -406,7 +406,7 @@ extern "C" int g6_attn_qo_load(G6AttnQo* p, const G6AttnTensor* uk, const G6Attn
     gp::weight_half<<<(heads * 256 * 512 + 255) / 256, 256, 0, st>>>(uv->data, p->uv, heads * 256 * 512);
     return int(cudaGetLastError());
 }
-extern "C" int g6_attn_qo_release(G6AttnQo* p) {
+extern "C" int g6a_qo_release(G6AttnQo* p) {
     if (!p) return 0;
     auto e = cudaFree(p->storage); auto w = gqi::release_work(p->w); delete p;
     return e != cudaSuccess ? int(e) : int(w);

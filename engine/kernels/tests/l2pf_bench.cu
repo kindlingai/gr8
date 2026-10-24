@@ -39,6 +39,7 @@
 #include <cuda_bf16.h>
 #include "../l2pf.cuh"
 #include "../../attn/replay.h"
+#include "../../attn/ops.h"
 #include "../../attn/kvfmt.h"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)

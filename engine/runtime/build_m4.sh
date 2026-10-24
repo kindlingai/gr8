@@ -25,12 +25,13 @@ if [ "${G6_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="./nvcc_cac
 export G6_NVCC_CACHE_LOG=$O/nvcc_cache.calls
 rm -f $G6_NVCC_CACHE_LOG
 cache_counts() { [ -f $G6_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit' $G6_NVCC_CACHE_LOG) hit, $(grep -c '^miss' $G6_NVCC_CACHE_LOG) miss, $(grep -c '^pass' $G6_NVCC_CACHE_LOG) not cacheable"; return 0; }
-# the attention TU and its binder: attn.cu + bind.cu (GLM), flash_attn.cu + flash_bind.cu (Flash: NoPE MLA + kpool indexer)
-ATTN_CU=../attn/attn.cu; ATTN_BIND_CU=../attn/bind.cu
-case " $EXTRA " in *" -DG6_MODEL_FLASH=1 "*) ATTN_CU=../attn/flash_attn.cu; ATTN_BIND_CU=../attn/flash_bind.cu ;; esac
+# the attention TU, its binder and its op table (attn/ops.h): attn.cu + bind.cu + ops_glm.cu (GLM), flash_attn.cu +
+# flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer)
+ATTN_CU=../attn/attn.cu; ATTN_BIND_CU=../attn/bind.cu; ATTN_OPS_CU=../attn/ops_glm.cu
+case " $EXTRA " in *" -DG6_MODEL_FLASH=1 "*) ATTN_CU=../attn/flash_attn.cu; ATTN_BIND_CU=../attn/flash_bind.cu; ATTN_OPS_CU=../attn/ops_flash.cu ;; esac
 if [ "$WHAT" = tests ]; then
   nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/row_budget_test tests/row_budget_test.cu
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/s2_attn_test tests/s2_attn_test.cu $ATTN_CU $ATTN_BIND_CU -lcublas
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/s2_attn_test tests/s2_attn_test.cu $ATTN_CU $ATTN_BIND_CU $ATTN_OPS_CU -lcublas
   ls -la $OUT/row_budget_test $OUT/s2_attn_test
   cache_counts
   exit 0
@@ -46,8 +47,9 @@ nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loa
 if [ "$WHAT" = dfl ]; then
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_CU -o $O/attn.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_BIND_CU -o $O/attn_bind.o
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_OPS_CU -o $O/attn_ops.o
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
   ls -la $OUT/dfltest $OUT/dflreplay
   cache_counts
   exit 0
@@ -92,6 +94,7 @@ for n in $WIDTHS; do
   F="$GEN $(wflags $n) -Xcompiler -fno-gnu-unique"
   job $O/attn.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_CU -o $O/attn.w$n.o
   job $O/attn_bind.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_BIND_CU -o $O/attn_bind.w$n.o
+  job $O/attn_ops.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_OPS_CU -o $O/attn_ops.w$n.o
   if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c m4sim.cu -o $O/m4sim.w$n.o; fi
   if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c g6m4.cu -o $O/g6m4.w$n.o; fi
   # dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
@@ -108,7 +111,7 @@ if [ -n "$RSDEF" ]; then SHARED="$SHARED $RSLIB"; fi
 nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u > $O/shared.syms
 inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of <bin>
   local b=$O/$1.w$2
-  ld -r --force-group-allocation -o $b.r.o $b.o $O/attn.w$2.o $O/attn_bind.w$2.o
+  ld -r --force-group-allocation -o $b.r.o $b.o $O/attn.w$2.o $O/attn_bind.w$2.o $O/attn_ops.w$2.o
   objcopy --redefine-sym main=g6w$2_main $b.r.o
   nm --defined-only -g $b.r.o | awk 'NF == 3 { print $3 }' | sort -u | comm -12 - $O/shared.syms > $b.weak
   { echo g6w$2_main; cat $b.weak; } > $b.keep
