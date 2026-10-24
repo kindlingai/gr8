@@ -522,8 +522,12 @@ impl RemoteStore {
         if let (Some(keys), Some(r)) = (keys, self.rdma.as_ref()) {
             let mut g = self.lane();
             if let Lane::Rdma(l) = &mut *g {
-                let v: Vec<_> = ops.iter().zip(&keys).map(|(&(o, p, n), &k)| (o, p as u64, n as u32, k)).collect();
-                return post_wait(l, r, verbs::WR_RDMA_READ, &v);
+                let mut v = Vec::with_capacity(ops.len());
+                for (&(o, p, n), &k) in ops.iter().zip(&keys) {
+                    let (ra, rk) = r.target(o, n)?;
+                    v.push((ra, p as u64, n as u32, k, rk));
+                }
+                return post_wait(l, verbs::WR_RDMA_READ, &v);
             }
         }
         if self.rdma.is_none() {
