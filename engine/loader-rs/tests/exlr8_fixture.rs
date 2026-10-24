@@ -102,3 +102,22 @@ fn int4_codes_come_back_in_the_hf_orientation() {
         assert_eq!(&s[o * 8 + b * 4..][..4], &sb[..]);
     }
 }
+
+#[test]
+fn fp8_rows_give_what_decode_gives() {
+    // #50: the block-FP8 bytes and per-row scales the loader stores for G6_KVB=fp8 (fb: 200 x 160, scale blocks 2 x 2,
+    // so the rows and the inputs both end inside a partial block)
+    let f = fixture();
+    let m = Matrix::open(&f, "fb").unwrap();
+    let (o, i) = (m.rec.out, m.rec.inp);
+    let bi = i.div_ceil(128);
+    for rows in [0..o, 100..200, 127..129, 3..17] {
+        let (w, s) = m.fp8_rows(&rows).unwrap();
+        assert_eq!((w.len(), s.len()), (rows.len() * i, rows.len() * bi));
+        let want = m.decode(rows.clone(), 0..i).unwrap();
+        let got: Vec<f32> = (0..rows.len() * i).map(|x| exlr8::e4m3_to_f32(w[x]) * s[x / i * bi + x % i / 128]).collect();
+        assert!(same_bits(&got, &want), "fb rows {rows:?}: e4m3 x scale differs from decode");
+    }
+    assert!(m.fp8_rows(&(o - 1..o + 1)).is_err());
+    assert!(Matrix::open(&f, "mx").unwrap().fp8_rows(&(0..4)).is_err());
+}

@@ -9,7 +9,8 @@
 //!     indexer wk: MXFP8 -> BF16 (exact: E4M3 times a power of two) + BF16 decode record
 //!     q_b and o_proj stored as int4 g32 (layers 0, 2, 3): int4 decode records from the release's codes and scales
 //!   BF16 of the release's value (what loader/exlr8.py --dtype bf16 gives):
-//!     kv_b (FP8 128x128 blocks) -> UK / UV; the embedding (FP8 per row)
+//!     kv_b (FP8 128x128 blocks) -> UK / UV (G6_KVB=fp8: the FP8 bytes and block scales as stored, #50); the embedding
+//!     (FP8 per row)
 //!   the trellis matrices (q_b, o_proj, the dense MLP of layers 0-2), by Opts::trellis:
 //!     trellis: the rank's entries as stored + suh / svh, for the dense trellis kernels (engine/kernels/dtr.cuh) - exact
 //!     rounded: MXFP8 (q_b, and every prefill copy) and int4 g32 decode records (o_proj, dense MLP) of the decoded weight
@@ -118,6 +119,8 @@ struct Planner {
     qo: bool,
     /// trellis matrices as the release's entries (the dense trellis kernels); false: rounded to MXFP8 / int4
     trellis: bool,
+    /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50); false: BF16
+    kvb_fp8: bool,
 }
 
 /// A tensor of a planned group: name, manifest dtype, shape, bytes.
@@ -272,20 +275,24 @@ impl Planner {
 
         // kv_b: heads' rows of [64 x 448][512]; per head the first 192 rows are UK, the other 256 UV
         let kvb = Matrix::open(&f, "self_attn.kv_b_proj")?;
-        self.note(l, Form { what: "kv_b", src: fmt_name(&kvb), form: "BF16 (UK, UV)",
-                            exact: if kvb.rec.fmt == FP8_BLOCK { BF16_OF } else { ROUNDED } });
-        let f2 = f.clone();
-        self.gen(format!("{p}.kv_b"), vec![
-            (format!("{p}.kv_b.uk"), "bf16", vec![nh as i64, 192, 512]),
-            (format!("{p}.kv_b.uv"), "bf16", vec![nh as i64, 256, 512])], move || {
-            let w = bf16v(&exlr8::decode_par(&Matrix::open(&f2, "self_attn.kv_b_proj")?, h0 * 448..(h0 + nh) * 448, 0..512, t)?);
-            let (mut uk, mut uv) = (Vec::new(), Vec::new());
-            for h in 0..nh {
-                uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
-                uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
-            }
-            Ok(vec![le16(&uk), le16(&uv)])
-        });
+        if self.kvb_fp8 {
+            self.kv_b_fp8(l, &p, &f, &kvb, h0, nh)?;
+        } else {
+            self.note(l, Form { what: "kv_b", src: fmt_name(&kvb), form: "BF16 (UK, UV)",
+                                exact: if kvb.rec.fmt == FP8_BLOCK { BF16_OF } else { ROUNDED } });
+            let f2 = f.clone();
+            self.gen(format!("{p}.kv_b"), vec![
+                (format!("{p}.kv_b.uk"), "bf16", vec![nh as i64, 192, 512]),
+                (format!("{p}.kv_b.uv"), "bf16", vec![nh as i64, 256, 512])], move || {
+                let w = bf16v(&exlr8::decode_par(&Matrix::open(&f2, "self_attn.kv_b_proj")?, h0 * 448..(h0 + nh) * 448, 0..512, t)?);
+                let (mut uk, mut uv) = (Vec::new(), Vec::new());
+                for h in 0..nh {
+                    uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
+                    uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
+                }
+                Ok(vec![le16(&uk), le16(&uv)])
+            });
+        }
 
         // o_proj: this rank's heads' input columns
         let op = Matrix::open(&f, "self_attn.o_proj")?;
@@ -406,6 +413,36 @@ impl Planner {
         let (suh, svh) = if r.side == exlr8::SIDE_IN { (ch.clone(), 0..r.out) } else { (0..r.inp, ch.clone()) };
         self.copy(format!("{p}.{what}.suh"), "f16", vec![suh.len() as i64], m.f, &format!("{}.suh", m.name), 2 * suh.start as u64)?;
         self.copy(format!("{p}.{what}.svh"), "f16", vec![svh.len() as i64], m.f, &format!("{}.svh", m.name), 2 * svh.start as u64)
+    }
+
+    /// kv_b of heads h0 .. h0 + nh as the release's block FP8 (#50, Opts::kvb_fp8): L.kv_b.uk / .uv hold the E4M3 bytes of
+    /// the UK / UV rows ([nh][192][512] / [nh][256][512], the BF16 tensors' layout) and L.kv_b.uk.scale / .uv.scale each
+    /// row's scales ([nh][192][4] / [nh][256][4] f32: its 128-row block's scale for each 128-input block). The engine reads
+    /// weight (i, j) as BF16(e4m3 x scale), the value of the BF16 form, so the two forms give the same outputs.
+    fn kv_b_fp8(&mut self, l: usize, p: &str, f: &Arc<StFile>, kvb: &Matrix, h0: usize, nh: usize) -> Result<(), String> {
+        if kvb.rec.fmt != FP8_BLOCK || kvb.rec.out != 64 * 448 || kvb.rec.inp != 512 {
+            return Err(format!("{}: kv_b is {} [{} x {}]: G6_KVB=fp8 needs the release's block FP8 [28672 x 512]",
+                               f.path, fmt_name(kvb), kvb.rec.out, kvb.rec.inp));
+        }
+        self.note(l, Form { what: "kv_b", src: fmt_name(kvb), form: "FP8 + block scales (UK, UV; G6_KVB=fp8)", exact: EXACT });
+        let f2 = f.clone();
+        self.gen(format!("{p}.kv_b"), vec![
+            (format!("{p}.kv_b.uk"), "u8", vec![nh as i64, 192, 512]),
+            (format!("{p}.kv_b.uv"), "u8", vec![nh as i64, 256, 512]),
+            (format!("{p}.kv_b.uk.scale"), "f32", vec![nh as i64, 192, 4]),
+            (format!("{p}.kv_b.uv.scale"), "f32", vec![nh as i64, 256, 4])], move || {
+            let (w, s) = Matrix::open(&f2, "self_attn.kv_b_proj")?.fp8_rows(&(h0 * 448..(h0 + nh) * 448))?;
+            let (mut uk, mut uv, mut uks, mut uvs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for h in 0..nh {
+                uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
+                uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
+                uks.extend_from_slice(&s[h * 448 * 4..][..192 * 4]);
+                uvs.extend_from_slice(&s[(h * 448 + 192) * 4..][..256 * 4]);
+            }
+            let le32 = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            Ok(vec![uk, uv, le32(&uks), le32(&uvs)])
+        });
+        Ok(())
     }
 
     /// G6_PF_OWN=3's full-head weights of layer l, the full-head QO tensors:
@@ -536,6 +573,8 @@ pub struct Opts {
     pub qo: bool,
     /// trellis matrices as the release's entries for the dense trellis kernels. false rounds the matrices to MXFP8 / int4
     pub trellis: bool,
+    /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50, G6_KVB=fp8); false: BF16 of them
+    pub kvb_fp8: bool,
 }
 
 /// Plans rank `rank`'s image at TP `nr` from the release: dense and vocabulary files under `dense_dir` (or its
@@ -550,13 +589,14 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(8);
     let mut p = Planner { b: Builder::new(), shard, threads: (cores / workers).max(1), forms: BTreeMap::new(),
-                         qo: opts.qo, trellis: opts.trellis };
+                         qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8 };
     // the release's files name the model (their metadata); the width manifest has one format for every model
     let model = flash::model_meta(dense_dir)?;
     let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
     if model.is_some() && !is_flash { return Err(format!("{dense_dir}: model metadata of an unsupported model")); }
     let model = model.unwrap_or(Json::Null);
     if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
+    if is_flash && opts.kvb_fp8 { return Err("G6_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
     let last = if is_flash { 45 } else { L_MTP };
     if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     let mut moe = 0;
