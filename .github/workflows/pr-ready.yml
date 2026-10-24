@@ -2,6 +2,8 @@
 #   /ready or /unready, commented on a PR by a maintainer in READY_USERS, adds or removes it. Commands need no write
 #   access, so a maintainer with read access can use them. /ready needs a risk:* category label (pr-category.yml).
 #   The label added by anyone else is removed again, and a push to the PR clears it: ready means the reviewed commits.
+#   ci.yml's jobs run on a PR only while it is ready: setting the flag re-runs the PR's latest CI run, which a push or
+#   an earlier skip left with its jobs skipped.
 #   /ready on a PR labelled risk:docs-tests whose every changed file is Markdown squash-merges it: ci.yml skips such
 #   PRs, and the maintainer's /ready stands in for the review. The bot also approves it as github-actions[bot] when
 #   "Allow GitHub Actions to create and approve pull requests" is on (org and repo), which a required review needs.
@@ -16,6 +18,7 @@ on:
     types: [labeled, synchronize]
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
   issues: write
@@ -45,6 +48,29 @@ jobs:
             await github.rest.issues.createLabel({ owner, repo, name: label, color: "5319e7",
               description: "Marked ready for the merge queue by a maintainer (/ready)" }).catch(() => {});
 
+            // Re-run the PR head's latest ci.yml run once its ready gate has skipped the jobs. A run whose gate has not
+            // decided yet is waited for (up to 3 minutes); one already building, or no run (a Markdown-only PR), is left.
+            const rerunCI = async () => {
+              const head = (await github.rest.pulls.get({ owner, repo, pull_number: issue_number })).data.head.sha;
+              for (let i = 0; i < 18; i++) {
+                const runs = (await github.rest.actions.listWorkflowRuns(
+                  { owner, repo, workflow_id: "ci.yml", head_sha: head, event: "pull_request", per_page: 1 })).data.workflow_runs;
+                if (!runs.length) return;
+                const run = runs[0];
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                  { owner, repo, run_id: run.id, filter: "latest" });
+                const gate = jobs.find(j => j.name === "Ready gate");
+                if (gate && gate.status === "completed") {
+                  if (jobs.some(j => j !== gate && j.conclusion !== "skipped")) return;
+                  if (run.status === "completed") {
+                    await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+                    return;
+                  }
+                }
+                await new Promise(r => setTimeout(r, 10000));
+              }
+            };
+
             if (ev === "issue_comment") {
               const cmd = (context.payload.comment.body || "").trim().split(/\s+/)[0];
               if (cmd !== "/ready" && cmd !== "/unready") return;
@@ -67,11 +93,17 @@ jobs:
               }
               await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [label] });
               await react("+1");
-              if (!labels.includes("risk:docs-tests")) return;
+              if (!labels.includes("risk:docs-tests")) {
+                await rerunCI();
+                return;
+              }
               const head = (await github.rest.pulls.get({ owner, repo, pull_number: issue_number })).data.head.sha;
               const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: issue_number });
               const md = f => /\.md$/i.test(f);
-              if (!files.length || !files.every(f => md(f.filename) && (!f.previous_filename || md(f.previous_filename)))) return;
+              if (!files.length || !files.every(f => md(f.filename) && (!f.previous_filename || md(f.previous_filename)))) {
+                await rerunCI();
+                return;
+              }
               // Approval is best effort: it needs "Allow GitHub Actions to create and approve pull requests", and the merge
               // only needs it while the ruleset requires a review.
               let note = "";
@@ -94,6 +126,8 @@ jobs:
             if (act === "labeled" && context.payload.label.name === label && !allowed.includes(sender)) {
               await drop();
               await say(`@${sender}, \`${label}\` is set by a maintainer commenting \`/ready\`; removed.`);
+            } else if (act === "labeled" && context.payload.label.name === label) {
+              await rerunCI();
             } else if (act === "synchronize" && labels.includes(label)) {
               await drop();
               await say(`New commits since this PR was marked ready: \`${label}\` cleared. A maintainer can comment \`/ready\` again.`);
