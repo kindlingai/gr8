@@ -44,6 +44,9 @@ pub struct Config {
     pub min_free: u64,
     /// --guard-every-s: how often the guard reads MemAvailable (lazy only; zero: at grants only)
     pub guard_every: Duration,
+    /// --ledger FILE (lazy only): the host ledger (src/ledger.rs). A grant must keep the bytes held at or below what it
+    /// credits to the node
+    pub ledger: Option<std::path::PathBuf>,
 }
 
 struct State {
@@ -68,6 +71,7 @@ pub struct Shared {
     refused: AtomicU64,
     // lazy grants one at a time: each one's MemAvailable check sees the memory the one before it locked
     grant: Mutex<()>,
+    ledger: Option<crate::ledger::Ledger>,
 }
 
 /// A lease's protection domain and memory region on one device.
@@ -172,6 +176,9 @@ impl Node {
         if bytes == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "the node needs at least 2 MiB"));
         }
+        if cfg.ledger.is_some() && !cfg.lazy {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "--ledger needs --lazy-lock"));
+        }
         let listener = TcpListener::bind(listen)?;
         let arena = Arena::with(bytes, cfg.lock, cfg.lazy)?;
         let mut free = BTreeMap::new();
@@ -189,6 +196,7 @@ impl Node {
             low: AtomicBool::new(false),
             refused: AtomicU64::new(0),
             grant: Mutex::new(()),
+            ledger: cfg.ledger.as_ref().map(crate::ledger::Ledger::at),
         });
         if cfg.lazy && cfg.min_free > 0 && !cfg.guard_every.is_zero() {
             let w = Arc::downgrade(&shared);
@@ -531,6 +539,19 @@ fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<A
                     g(avail),
                     g(len_al as u64),
                     g(sh.min_free)
+                ),
+            ));
+        }
+    }
+    if let (true, Some(led)) = (lazy, &sh.ledger) {
+        let credit = led.show().map(|b| b.node).map_err(|e| (proto::E_NOROOM, format!("the host ledger: {e}")))?;
+        let held = sh.arena.held() as u64;
+        if held + len_al as u64 > credit {
+            sh.refused.fetch_add(1, Ordering::Relaxed);
+            return Err((
+                proto::E_NOROOM,
+                format!(
+                    "the host ledger credits the node {credit} bytes: {held} are held, and a lease of {len_al} needs more"
                 ),
             ));
         }

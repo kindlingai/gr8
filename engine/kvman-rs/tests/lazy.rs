@@ -208,3 +208,33 @@ fn without_lazy_lock_the_floor_is_only_the_start_check() {
     let st = client::stats(&addr).unwrap();
     assert_eq!((field(&st, "lazy"), field(&st, "held"), field(&st, "refused")), (0, 16 * MIB as u64, 0), "{st}");
 }
+
+#[test]
+fn with_a_ledger_the_node_holds_no_more_than_it_is_credited() {
+    use g6kvman::ledger::{Book, Ledger, Side};
+    let _one = one();
+    let d = std::env::temp_dir().join(format!("kvman-lazy-ledger-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let file = d.join("ledger");
+    let led = Ledger::at(&file);
+    let m = MIB as u64;
+    led.init(&Book::new(16 * m, 12 * m, 4 * m, 0).unwrap()).unwrap();
+    let cfg = Config { bytes: 16 * MIB, lazy: true, ledger: Some(file.clone()), ..Default::default() };
+    let addr = Node::new(&cfg, "127.0.0.1:0".parse().unwrap()).unwrap().spawn().to_string();
+    let a = RemoteStore::open(&addr, &opts("led/a", MIB, 4, 1)).unwrap();
+    // the arena has room, the ledger does not
+    let e = RemoteStore::open(&addr, &opts("led/b", MIB, 2, 1)).err().unwrap();
+    assert!(e.to_string().contains("ledger credits the node"), "{e}");
+    // the GPU gives 2 MiB to the node: the next lease fits
+    let g = led.apply(|b| b.begin(Side::Gpu, Side::Node, 2 * m, 0)).unwrap();
+    led.apply(|b| b.released(g, 2 * m)).unwrap();
+    led.apply(|b| b.commit(g, 2 * m)).unwrap();
+    let b = RemoteStore::open(&addr, &opts("led/b", MIB, 2, 1)).unwrap();
+    assert_eq!(field(&client::stats(&addr).unwrap(), "held"), 6 * m);
+    drop((a, b));
+    until_held(&addr, 0);
+    // a node without --lazy-lock cannot take a ledger
+    let cfg = Config { bytes: 16 * MIB, ledger: Some(file), ..Default::default() };
+    assert_eq!(Node::new(&cfg, "127.0.0.1:0".parse().unwrap()).err().unwrap().kind(), ErrorKind::InvalidInput);
+    let _ = std::fs::remove_dir_all(&d);
+}

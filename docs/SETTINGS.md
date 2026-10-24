@@ -161,6 +161,19 @@ The shim and the front end run under `taskset` on CPUs `0..PROXY_CPU-8`, away fr
 | `--min-free-gb G` | 10 (`KV_MIN_FREE_GB`) | the node refuses to start when locking `--gb` would leave less MemAvailable than this. With `--lazy-lock` it refuses to start below G, and refuses each lease that would leave less than G (E_NOROOM) |
 | `--lazy-lock` | off (`KV_LAZY_LOCK=0`) | the arena is only mapped at start. A lease's range is locked when the lease is granted (after the MemAvailable check), and when the lease ends its memory regions are deregistered and the range is given back (munlock, MADV_DONTNEED). For a node on a box that also serves. Off: the whole arena is locked at start, as before. Not measured |
 | `--guard-every-s S` | 1 (`KV_GUARD_EVERY_S`) | with `--lazy-lock`: how often the node reads MemAvailable. While it is under `--min-free-gb` the node refuses new leases, and it logs each change. Leases it already granted stay. 0 = only at each lease. Not measured |
+| `--ledger FILE` | none (`KV_LEDGER`) | with `--lazy-lock`: the host ledger (below). A lease is refused (E_NOROOM, "the host ledger credits the node ...") when the bytes held would pass what the ledger credits to the node |
+
+### The host ledger (`kvman-ledger`, D-331 M7)
+
+One file per box that runs a Flash rank and a KV node (`out/kv/ledger` when `FLASH_KV_DONATE_GIB` starts the node).
+It says who may count each exchangeable byte: `gpu` (the rank's KV pool above what `FLASH_CAP_POLICY` protects),
+`node`, `free` (neither), or the one pending transfer's in-flight bytes, and they always sum to `total`. A transfer
+is `begin FROM TO B` (nothing moves, prints its generation), `released GEN B` (after the source has let the memory
+go), `commit GEN B` (after the destination has backed it; the rest goes to `free`) or `abort GEN`. One transfer at a
+time; a finished one moves the generation on, so a late call from a party whose transfer was aborted is refused.
+`recover --stale-s S` aborts a transfer pending S seconds (30): its released bytes go to `free`, never to both sides.
+Every change is one fsynced rename under flock. Today only the node uses it (the Flash pool does not resize yet), so
+`gpu` is 0 and the node is credited the whole donation. Not measured
 
 ## Build flags (`scripts/build.sh`)
 

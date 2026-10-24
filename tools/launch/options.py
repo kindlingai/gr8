@@ -94,6 +94,14 @@ KEYS = {
     'KV_TIER': ('cluster', None, 'deprecated: KV_STORE with keep=evicted|shared|all per tier (any evicted or all maps to '
                                  'KV_KEEP=all, else system)'),
     'KV_SHARED_AFTER': ('cluster', None, 'deprecated: KV_SYSTEM_AFTER'),
+    'FLASH_KV_DONATE_GIB': ('box', None, 'GLM-5.3-Flash: once the serve booted, lend at most this many GiB of this '
+                                        'box to a KV node beside it (./gr8 kv up --lazy-lock --ledger), less when '
+                                        'MemAvailable - FLASH_KV_GROWTH_GIB - KV_MIN_FREE_GB is less. 0 (default) = '
+                                        'none'),
+    'FLASH_KV_GROWTH_GIB': ('box', None, 'with FLASH_KV_DONATE_GIB: the GiB the Flash serve may still allocate after '
+                                        'boot (no default: not measured yet)'),
+    'FLASH_CAP_POLICY': ('cluster', None, "protected (default): the configured CAP's memory is never lent. borrow-idle "
+                                         'is refused until the Flash KV pool comes in chunks'),
     'PF_OWN': ('cluster', None, 'prefill attention ownership'),
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),

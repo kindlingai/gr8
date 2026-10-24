@@ -23,6 +23,7 @@ import urllib.request
 import fabric
 import handshake
 import hfsource
+import kvnode
 import mentat
 import models
 import modelset
@@ -255,6 +256,7 @@ class Supervisor:
         self.head_ready = threading.Event()
         self.engine = None
         self.helpers = {}             # the head's front end and shim: name -> Popen
+        self.donor = False            # a KV node beside a Flash serve runs (donate)
         self.agent = self.api_agent = None
         self.rank, self.lan, self.members, self.hs = None, None, [], {}
         self.state = 'starting'
@@ -748,7 +750,49 @@ class Supervisor:
         if r == 0:
             log(f'engines ready after {time.monotonic() - t0:.0f}s')
             self.start_shim(work)
+        self.donate(plan['knobs'])
         self.run_forever()
+
+    def donate(self, knobs):
+        """GLM-5.3-Flash with FLASH_KV_DONATE_GIB > 0: lend this box's spare memory, measured now that the serve has
+        booted, to a KV node beside it (D-331 M7): flash_donor_budget GiB, a host ledger crediting them to the node,
+        and ./gr8 kv up --lazy-lock --ledger. The node is its own supervisor: its failure, or no budget, leaves the
+        serve as it is."""
+        if models.of(self.o).name != 'glm53f' or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:
+            return
+        ko = kvnode.parse(['--g6-home', self.home], dict(os.environ))
+        env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'KV_MIN_FREE_GB': ko.get('KV_MIN_FREE_GB'),
+               **{k: knobs.get(k) or '' for k in ('FLASH_KV_DONATE_GIB', 'FLASH_KV_GROWTH_GIB')}}
+        script = os.path.join(opt.REPO, 'scripts', 'engine_args.sh')
+        r = subprocess.run(['bash', '-c', '. "$0"; flash_donor_budget', script], env=env, capture_output=True,
+                           text=True)
+        gib = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
+        if gib <= 0:
+            why = r.stderr.strip() or 'MemAvailable leaves nothing above FLASH_KV_GROWTH_GIB + KV_MIN_FREE_GB'
+            log(f'KV donation: none ({why})')
+            return
+        out = kvnode.out_dir(ko)
+        os.makedirs(out, exist_ok=True)
+        ledger = os.path.join(out, 'ledger')
+        lb = ledger_bin(self.home)
+        try:
+            if not lb:
+                raise RuntimeError('no kvman-ledger: ./gr8 glm53 build')
+            # a transfer left pending by a node or rank that died with its memory: its bytes go to free
+            subprocess.run([lb, ledger, 'recover', '--stale-s', '0'], capture_output=True, text=True)
+            n = str(gib << 30)
+            for argv in ([lb, ledger, 'init', '--total', n, '--node', n],
+                         [sys.executable, kvnode.HERE, 'up', '--g6-home', self.home, '--gb', str(gib), '--lazy-lock',
+                          '--ledger', ledger]):
+                p = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                if p.returncode:
+                    raise RuntimeError(f'{os.path.basename(argv[1] if argv[0] == sys.executable else argv[0])}: '
+                                       f'{(p.stderr or p.stdout).strip()[-400:]}')
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+            log(f'KV donation of {gib} GiB failed; the serve goes on without it: {e}')
+            return
+        self.donor = True
+        log(f'KV donation: a KV node beside the serve, {gib} GiB, locked lease by lease (ledger {ledger})')
 
     def start_front(self, plan):
         o = self.o
@@ -893,6 +937,10 @@ class Supervisor:
                               'epoch': self.hs['epoch']})
         elif self.hs and self.rank and code and not self.stop_failed:
             self.tell_head({'t': 'abort', 'rank': self.rank, 'why': first})
+        if self.donor:
+            subprocess.run([sys.executable, kvnode.HERE, 'down', '--g6-home', self.home], capture_output=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+            self.donor = False
         if self.started:
             stop_local(self.home, log)
         if self.agent:
@@ -903,6 +951,14 @@ class Supervisor:
             self.set_state('stopped')
         for s in self.servers:
             s.shutdown()
+
+
+def ledger_bin(home):
+    for p in (os.path.join(home, 'bin', 'kvman-ledger'),
+              os.path.join(opt.REPO, 'engine', 'kvman-rs', 'target', 'release', 'kvman-ledger')):
+        if os.access(p, os.X_OK):
+            return p
+    return None
 
 
 def engine_bin(o):

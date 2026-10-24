@@ -200,6 +200,88 @@ class EngineTests(unittest.TestCase):
         self.assertNotEqual(S.engine_build(home, 'g6m4-int4'), S.engine_build(home, 'g6m4'))
 
 
+STUB_KV = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stubs', 'kvman-remote')
+ENGINE_ARGS = os.path.join(opt.REPO, 'scripts', 'engine_args.sh')
+GIB_KIB = 1 << 20
+
+
+def donor_budget(kib, **env):
+    r = subprocess.run(['bash', '-c', '. "$0"; flash_donor_budget "$1"', ENGINE_ARGS, str(kib)],
+                       env={'PATH': os.environ['PATH'], **env}, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else 'error: ' + r.stderr.strip()
+
+
+class DonorTests(unittest.TestCase):
+    """D-331 M7: a Flash box lends what its serve leaves to a KV node beside it."""
+
+    def test_the_budget_is_memavailable_less_growth_and_reserve_capped_by_the_ask(self):
+        w = {'FLASH_KV_GROWTH_GIB': '8', 'KV_MIN_FREE_GB': '10'}
+        self.assertEqual(donor_budget(60 * GIB_KIB, FLASH_KV_DONATE_GIB='30', **w), '30')
+        self.assertEqual(donor_budget(60 * GIB_KIB, FLASH_KV_DONATE_GIB='50', **w), '42')
+        self.assertEqual(donor_budget(int(40.9 * GIB_KIB), FLASH_KV_DONATE_GIB='50', **w), '22')   # whole GiB, down
+        self.assertEqual(donor_budget(15 * GIB_KIB, FLASH_KV_DONATE_GIB='50', **w), '0')
+        self.assertEqual(donor_budget(60 * GIB_KIB, FLASH_KV_DONATE_GIB='0', **w), '0')
+        # the node's floor, 10, when KV_MIN_FREE_GB is not set
+        self.assertEqual(donor_budget(51 * GIB_KIB, FLASH_KV_DONATE_GIB='40', FLASH_KV_GROWTH_GIB='8'), '33')
+        self.assertTrue(donor_budget('lots', FLASH_KV_DONATE_GIB='30', **w).startswith('error'))
+
+    def flash_plan(self, *argv):
+        o = opt.parse(['--no-config', '--gr8-model', 'glm53f', '--tp', '2', *argv], {})
+        return opt.engine_plan(o)['knobs']
+
+    def test_the_knobs_are_checked_at_boot(self):
+        k = self.flash_plan()
+        self.assertEqual((k['FLASH_KV_DONATE_GIB'], k['FLASH_CAP_POLICY']), ('0', 'protected'))
+        with self.assertRaisesRegex(opt.OptionError, 'FLASH_KV_GROWTH_GIB'):
+            self.flash_plan('--flash-kv-donate-gib', '20')
+        with self.assertRaisesRegex(opt.OptionError, 'borrow-idle needs'):
+            self.flash_plan('--flash-cap-policy', 'borrow-idle')
+        with self.assertRaisesRegex(opt.OptionError, 'want protected'):
+            self.flash_plan('--flash-cap-policy', 'lend')
+        k = self.flash_plan('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6')
+        self.assertEqual((k['FLASH_KV_DONATE_GIB'], k['FLASH_KV_GROWTH_GIB']), ('20', '6'))
+
+    def donor(self, knobs, model='glm53f'):
+        flash = model == 'glm53f'
+        s = supervisor('--gr8-model', model, '--tp', '2' if flash else '4', members=MEMBERS[:2] if flash else MEMBERS)
+        cfg = os.path.join(s.home, 'empty.env')
+        open(cfg, 'w').close()
+        env = {'G6_CLUSTER': cfg, 'KV_BIN': STUB_KV, 'MENTAT': 'none', 'KV_PORT': str(free_port()),
+               'KV_BIND': '127.0.0.1', 'KV_MIN_FREE_GB': '0'}
+        s.kv_port = int(env['KV_PORT'])
+        with mock.patch.dict(os.environ, env), mock.patch.object(S, 'log') as logged:
+            s.donate(knobs)
+        return s, ' '.join(str(c.args[0]) for c in logged.call_args_list)
+
+    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine/kvman-rs)')
+    def test_a_flash_box_starts_a_lazy_node_with_a_ledger_and_stops_it(self):
+        s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0'})
+        try:
+            self.assertTrue(s.donor, said)
+            st = S.kvnode.read_json(os.path.join(s.home, 'out', 'kv', 'state.json'))
+            self.assertEqual(st.get('state'), 'serving', st)
+            ledger = os.path.join(s.home, 'out', 'kv', 'ledger')
+            argv = S.kvnode.stats('127.0.0.1', s.kv_port)['argv']
+            self.assertEqual(argv[argv.index('--gb') + 1], '1')
+            self.assertEqual(argv[argv.index('--ledger') + 1], ledger)
+            self.assertIn('--lazy-lock', argv)
+            book = subprocess.run([S.ledger_bin(opt.REPO), ledger, 'show'], capture_output=True, text=True).stdout
+            self.assertIn(f'"total":{1 << 30},"gpu":0,"node":{1 << 30}', book)
+        finally:
+            s.locked = True
+            s.shutdown(0, '')
+        self.assertFalse(s.donor)
+        self.assertFalse(S.kvnode.running(os.path.join(s.home, 'out', 'kv')))
+
+    def test_no_budget_or_another_model_starts_nothing(self):
+        s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '100000'})
+        self.assertFalse(s.donor)
+        self.assertIn('KV donation: none', said)
+        s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0'}, model='glm53')
+        self.assertFalse(s.donor)
+        self.assertEqual(said, '')
+
+
 class PidFileTests(unittest.TestCase):
     """out/g6m4.pid, shim.pid and front.pid outlive their processes; a number taken later is not ours."""
     def pid_file(self, pid, age=0):

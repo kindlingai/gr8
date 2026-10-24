@@ -44,6 +44,8 @@ KEYS = {
     'KV_RDMA': ('1', '0 = serve over TCP only'),
     'KV_LAZY_LOCK': ('0', '1 = lock each lease\'s memory when it is granted and give it back when the lease ends, and '
                           'refuse leases while the box is under KV_MIN_FREE_GB (a node on a box that also serves)'),
+    'KV_LEDGER': (None, 'with KV_LAZY_LOCK=1: the host ledger file of a box shared with a Flash rank (kvman-ledger): '
+                        'the node never holds more than it credits to the node'),
     'KV_GUARD_EVERY_S': ('1', 'with KV_LAZY_LOCK=1: how often the node reads MemAvailable (0 = at each lease only)'),
     'KV_BIN': (None, 'the kvman-remote binary (default bin/kvman-remote, else the crate\'s target/release)'),
     'MENTAT': ('localhost', 'the local mentat daemon to announce through; none = do not announce'),
@@ -134,6 +136,8 @@ def validate(o):
             raise opt.OptionError(f'{k}={o.get(k)!r}: want a number')
     if o.get('KV_LAZY_LOCK') not in ('0', '1'):
         raise opt.OptionError(f'KV_LAZY_LOCK={o.get("KV_LAZY_LOCK")!r}: want 0 or 1')
+    if o.get('KV_LEDGER') and o.get('KV_LAZY_LOCK') != '1':
+        raise opt.OptionError('KV_LEDGER needs KV_LAZY_LOCK=1 (--lazy-lock)')
     if not 0 <= float(o.get('KV_GUARD_EVERY_S')) <= 3600:
         raise opt.OptionError(f'KV_GUARD_EVERY_S={o.get("KV_GUARD_EVERY_S")!r}: want 0 to 3600 seconds')
 
@@ -145,6 +149,8 @@ def node_argv(o, b, ready_path):
         argv.append('--no-rdma')
     if o.get('KV_LAZY_LOCK') == '1':
         argv += ['--lazy-lock', '--guard-every-s', o.get('KV_GUARD_EVERY_S')]
+        if o.get('KV_LEDGER'):
+            argv += ['--ledger', o.get('KV_LEDGER')]
     return argv
 
 

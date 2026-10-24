@@ -12,6 +12,7 @@
 #                            rank<R>.{manifest.json,pack} (unused with V2_DENSE: the release is the model), AUX_PACKS
 #                            the drafter and QO packs, HOME is G6_HOME
 #                            (the s2/ directory), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
+#   flash_donor_budget [KIB] GLM-5.3-Flash: the whole GiB this box lends a KV node next to the serve (below)
 
 # share_cap P: the CAP that gives P physical KV pages per rank at this SHARE_LIMIT. Each rank holds the first
 # SHARE_LIMIT tokens of a session (64 per page) and 1/TP of the rest.
@@ -54,6 +55,35 @@ flash_defaults() {
   [ "${SESS:-1}" = 1 ] || { echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves one session" >&2; return 2; }
   SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=1
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+  flash_donor_defaults
+}
+
+# A KV node next to the Flash serve (D-331 M7): FLASH_KV_DONATE_GIB > 0 lends at most that many GiB of this box to a
+# ./gr8 kv up --lazy-lock node once the serve has booted. FLASH_KV_GROWTH_GIB is what the serve may still allocate after
+# boot; it has no default because it is not measured yet. FLASH_CAP_POLICY=protected: the configured CAP's memory is
+# never lent (borrow-idle, lending it while idle, needs the GPU pool in chunks, which the engine does not have yet).
+num_ok() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+flash_donor_defaults() {
+  FLASH_KV_DONATE_GIB=${FLASH_KV_DONATE_GIB:-0}; FLASH_CAP_POLICY=${FLASH_CAP_POLICY:-protected}
+  num_ok "$FLASH_KV_DONATE_GIB" || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB: want GiB" >&2; return 2; }
+  case $FLASH_CAP_POLICY in
+    protected) ;;
+    borrow-idle) echo "engine_defaults: FLASH_CAP_POLICY=borrow-idle needs the Flash KV pool in chunks (not built yet); use protected" >&2; return 2 ;;
+    *) echo "engine_defaults: FLASH_CAP_POLICY=$FLASH_CAP_POLICY: want protected or borrow-idle" >&2; return 2 ;;
+  esac
+  [ "$FLASH_KV_DONATE_GIB" = 0 ] && return 0
+  num_ok "${FLASH_KV_GROWTH_GIB:-}" || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB needs FLASH_KV_GROWTH_GIB, the GiB the serve may still allocate after boot (not measured yet)" >&2; return 2; }
+  return 0
+}
+# flash_donor_budget [KIB]: FLASH_KV_DONATE_GIB, or less when MemAvailable (KIB, else /proc/meminfo, read after the
+# serve booted) - FLASH_KV_GROWTH_GIB - KV_MIN_FREE_GB (the node's own floor, 10) is less; whole GiB, 0 = no node.
+flash_donor_budget() {
+  local kib=${1:-}
+  [ "${FLASH_KV_DONATE_GIB:-0}" = 0 ] && { echo 0; return 0; }
+  [ -n "$kib" ] || kib=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+  num_ok "$kib" || { echo "flash_donor_budget: MemAvailable $kib: want KiB" >&2; return 2; }
+  awk -v kib="$kib" -v g="${FLASH_KV_GROWTH_GIB:-0}" -v r="${KV_MIN_FREE_GB:-10}" -v w="$FLASH_KV_DONATE_GIB" \
+    'BEGIN { b = kib / 1048576 - g - r; if (b > w) b = w; if (b < 0) b = 0; printf "%d\n", b }'
 }
 
 engine_defaults() {

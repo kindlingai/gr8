@@ -105,6 +105,14 @@ manifest instead.
 `CAP` 262208 at either TP, a 262,144-token request (`tools/launch/models.py`, `flash_defaults` in
 `scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)).
 
+A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `donate` in `tools/launch/supervisor.py`):
+
+| name | flag | default | meaning |
+|---|---|---|---|
+| `FLASH_KV_DONATE_GIB` | `--flash-kv-donate-gib` | 0 | once the serve has booted, each Flash box starts `./gr8 kv up --gb N --lazy-lock --ledger out/kv/ledger` with N = this, or less when MemAvailable then - `FLASH_KV_GROWTH_GIB` - `KV_MIN_FREE_GB` is less (`flash_donor_budget`, whole GiB). No budget, or a node that fails, leaves the serve as it is; the serve's stop stops the node. 0 = no node. Measured effect: not measured |
+| `FLASH_KV_GROWTH_GIB` | `--flash-kv-growth-gib` | none | with `FLASH_KV_DONATE_GIB`: the GiB the serve may still allocate after boot. Required: the Flash serve's growth after boot is not measured yet |
+| `FLASH_CAP_POLICY` | `--flash-cap-policy` | `protected` | `protected`: the configured `CAP`'s memory is never lent; the host ledger counts only what is lent. `borrow-idle` (lend it while the serve is idle) is refused until the Flash KV pool comes in chunks |
+
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|
 | `GR8_MODEL` | `--gr8-model` | `glm53` | cluster | the model: `glm53` or `glm53f`. `./gr8 <model>` sets it |
@@ -156,6 +164,7 @@ file is read for these keys only.
 | `KV_MIN_FREE_GB` | `--min-free-gb` | 10 | refuse to start when locking `KV_GB` would leave less MemAvailable than this; with `KV_LAZY_LOCK=1`, refuse each lease that would |
 | `KV_LAZY_LOCK` | `--lazy-lock` | 0 | 1 = lock a lease's memory only while the lease lives (given back to the box when it ends), and refuse leases while MemAvailable is under `KV_MIN_FREE_GB`: a node on a box that also serves. 0 = the whole `KV_GB` is locked at start. Measured effect: not measured |
 | `KV_GUARD_EVERY_S` | `--guard-every-s` | 1 | with `KV_LAZY_LOCK=1`: how often the node reads MemAvailable (0 = at each lease only). Measured effect: not measured |
+| `KV_LEDGER` | `--ledger` | none | with `KV_LAZY_LOCK=1`: the host ledger of a box shared with a Flash rank (`kvman-ledger`, `engine/kvman-rs/src/ledger.rs`). A lease is refused when the node would hold more than the ledger credits it. `FLASH_KV_DONATE_GIB` sets it |
 | `KV_RDMA` | `--no-rdma` | 1 | 0 = TCP only |
 | `KV_BIN` | `--bin` | `bin/kvman-remote` | the node binary (`./gr8 glm53 build` puts it in `bin/`) |
 | `MENTAT` | `--mentat` | `localhost` | the daemon to announce through; `none` = do not announce |

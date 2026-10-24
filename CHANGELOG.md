@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-24: a Flash box can lend its spare memory to a KV node beside it (`FLASH_KV_DONATE_GIB`), and a host ledger
+
+- `FLASH_KV_DONATE_GIB=N` (`./gr8 glm53f --flash-kv-donate-gib N`, default 0 = off): once the Flash serve has booted,
+  each box starts `./gr8 kv up --lazy-lock` with N GiB, or less when MemAvailable then - `FLASH_KV_GROWTH_GIB` -
+  `KV_MIN_FREE_GB` is less (`flash_donor_budget` in `scripts/engine_args.sh`). `FLASH_KV_GROWTH_GIB` is required with
+  it: the serve's growth after boot is not measured. A node that fails, or no budget, leaves the serve as it is; the
+  serve's stop stops the node. `FLASH_CAP_POLICY=protected` (default) never lends the configured CAP's memory;
+  `borrow-idle` is refused until the Flash KV pool comes in chunks.
+- `kvman-ledger` (`engine/kvman-rs/src/ledger.rs`): the host ledger of such a box (generation, GPU-backed, node,
+  free and in-flight bytes, floor). GPU -> node and node -> GPU are transactions (begin, released, commit, abort,
+  recover) that never count a byte twice. `kvman-remote --ledger FILE` (`KV_LEDGER`, with `--lazy-lock`) refuses a
+  lease that would pass what the ledger credits the node. `scripts/build.sh` puts `kvman-ledger` in `bin/`.
+- Tested on the dev box only (kvman-rs `tests/ledger.rs`: a crash before and after the write of every phase of both
+  directions leaves a book that balances and recovers; a stalled borrower is aborted and its late commit refused;
+  8 parties and a recoverer at once never credit a byte twice; `tests/lazy.rs`: the node's ledger cap;
+  `tools/launch/test_supervisor.py` DonorTests: the budget, the knob checks, and a Flash box that starts a lazy node
+  with a ledger and stops it). Not measured on the boxes.
+
 ## 2026-10-23: a KV node can share its box with a serve (`--lazy-lock`, `--guard-every-s`)
 
 - `kvman-remote --lazy-lock` (`./gr8 kv up --lazy-lock`, `KV_LAZY_LOCK=1`) maps the arena at start and locks
