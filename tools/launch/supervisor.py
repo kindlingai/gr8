@@ -773,6 +773,8 @@ class Supervisor:
             front += ['--default-reasoning-effort', o.get('DEFAULT_REASONING_EFFORT')]
         if o.get('DEFAULT_THINKING_BUDGET') != '0':
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
+        if o.get('ALLOW_THINKING_OFF') == '1':
+            front += ['--allow-thinking-off']
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT'), '--supervisor', f'{self.lan}:{self.port}'],
                    os.path.join(REPO, 'frontend'))

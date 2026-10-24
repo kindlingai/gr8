@@ -424,12 +424,15 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     }
     let t0 = std::time::Instant::now();
     let kw_system = kw.clone();
-    let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+    let mut text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+    if th.off {
+        text = st.template.thinking_off(text, body.get("add_generation_prompt").is_none_or(|v| truthy(Some(v))));
+    }
     let (t1, chars) = (std::time::Instant::now(), text.len());
     let add_special = truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
     let t2 = std::time::Instant::now();
-    let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await;
+    let system = system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, th.off, &prompt).await;
     log::debug!(
         "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms, system span {system:?} tokens {:.2} ms",
         prompt.len(),
@@ -499,6 +502,7 @@ async fn system_span(
     tools: Option<&Value>,
     mut kw: Map<String, Value>,
     add_special: bool,
+    thinking_off: bool,
     prompt: &[u32],
 ) -> Option<u64> {
     let lead: Vec<Value> = messages?
@@ -512,7 +516,10 @@ async fn system_span(
     }
     kw.insert("add_generation_prompt".into(), Value::Bool(false));
     kw.insert("continue_final_message".into(), Value::Bool(false));
-    let text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    let mut text = st.template.render(Some(&Value::Array(lead)), tools, kw).ok()?;
+    if thinking_off {
+        text = st.template.thinking_off(text, false);
+    }
     let ids = st.tok.aencode(text, add_special).await.ok()?;
     Some(ids.iter().zip(prompt).take_while(|(a, b)| a == b).count() as u64)
 }
@@ -1139,9 +1146,13 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
             }
             // the same effort and the same refusals as a chat request, so the counts agree
             let th = st.template.resolve_thinking(&body, st.thinking)?;
+            let agp_on = truthy(Some(&agp));
             let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
             let tools = normalize_tools(body.get("tools"))?;
-            let text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+            let mut text = st.template.render(body.get("messages"), tools.as_ref(), kw)?;
+            if th.off {
+                text = st.template.thinking_off(text, agp_on);
+            }
             st.tok
                 .aencode(text, truthy(body.get("add_special_tokens")))
                 .await

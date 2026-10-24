@@ -55,6 +55,8 @@ KEYS = {
                                               'names); unset = the template\'s own default'),
     'DEFAULT_THINKING_BUDGET': ('box', '0', 'thinking_budget for a chat request that names none: reply tokens before '
                                             'the front end closes the think block; 0 = no limit'),
+    'ALLOW_THINKING_OFF': ('box', '0', '1 = the front end takes enable_thinking false / reasoning_effort none: the prompt '
+                                       'drops its effort header and closes the think block (GLM 5.3; experimental)'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
@@ -368,6 +370,8 @@ def validate(o):
                           '--default-thinking-budget)')
     if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
         raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
+    if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
+        raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')
