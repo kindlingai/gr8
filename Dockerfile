@@ -69,6 +69,10 @@ FROM engine-src AS engine
 ARG G6_WIDTHS=
 RUN G6_WIDTHS="$G6_WIDTHS" scripts/build.sh /out/bin
 
+# GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 2, 3 and 4
+FROM engine-src AS engine-flash
+RUN MODEL=flash scripts/build.sh /out/bin
+
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src AS engine-int4
@@ -94,6 +98,7 @@ COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /out/bin/gpuprobe /out/bin/tr3_e
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
 COPY --from=kvman /out/kvman-remote /bin/
+COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
 
 FROM scratch AS dist-int4
 COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/

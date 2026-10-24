@@ -32,7 +32,7 @@ class OptionTests(unittest.TestCase):
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
 
     def test_refusals(self):
-        for argv, want in ((['--tp', '3'], 'want 4 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
+        for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
                            (['--dflash', '1'], 'no DFlash2 drafter'),
                            (['--drafter', 'https://huggingface.co/a/b'], 'no DFlash2 drafter')):
             with self.assertRaises(opt.OptionError) as e:
@@ -52,7 +52,8 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['knobs']['SESS'], '1')
             self.assertIn('G6_CP=0', plan['env'])
             self.assertIn('G6_PF_RS=0', plan['env'])
-            self.assertIn('G6_PF_STAGE_ASYNC=1' if tp == '4' else 'G9_KDA_SCAN=1', plan['env'])
+            self.assertIn('G6_PF_STAGE_ASYNC=1', plan['env'])
+            (self.assertNotIn if tp == '4' else self.assertIn)('G9_KDA_SCAN=1', plan['env'])
             for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')

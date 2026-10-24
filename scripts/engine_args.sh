@@ -46,7 +46,7 @@ pool_cap() {
 # keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at any TP
 # (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
-  case $TP in 4|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4 or 2" >&2; return 2 ;; esac
+  case $TP in 4|3|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3 or 2" >&2; return 2 ;; esac
   local k
   for k in DFLASH REUSE PF_OWN SPEC_ADAPT; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
@@ -99,8 +99,10 @@ flash_env() {
 G6_FPF_ATTN_P1=0 G6_PF_SPARSE_MLA_P1=0 G6_PF_SPARSE_MLA_HYBRID=0 G6_PF_SPARSE_MLA=1 G6_PF_SPARSE_MLA_512=1 \
 G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_FC2V2=1 G6_PF_KDA_WS=1 \
 G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
-G6_PF_TIMES=1"
-  if [ "$TP" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_STAGE_ASYNC=1"; else ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"; fi
+G6_PF_TIMES=1 G6_PF_STAGE_ASYNC=1"
+  # the peer-partial staging (G6_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
+  # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
+  [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"
   ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
 }
 
