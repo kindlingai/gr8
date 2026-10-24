@@ -154,6 +154,14 @@ the attnk bench (`engine/attn/tests/attnk.cu`) checked the measured set, with an
 The shim and the front end run under `taskset` on CPUs `0..PROXY_CPU-8`, away from the proxy CPUs. At TP=6 the shim is
 `g6s2shim.py` with `--stall-timeout $STALL_TMO` (default 2400 s).
 
+## KV node (`kvman-remote`, `./gr8 kv up`)
+
+| flag | default (knob) | what it does |
+|---|---|---|
+| `--min-free-gb G` | 10 (`KV_MIN_FREE_GB`) | the node refuses to start when locking `--gb` would leave less MemAvailable than this. With `--lazy-lock` it refuses to start below G, and refuses each lease that would leave less than G (E_NOROOM) |
+| `--lazy-lock` | off (`KV_LAZY_LOCK=0`) | the arena is only mapped at start. A lease's range is locked when the lease is granted (after the MemAvailable check), and when the lease ends its memory regions are deregistered and the range is given back (munlock, MADV_DONTNEED). For a node on a box that also serves. Off: the whole arena is locked at start, as before. Not measured |
+| `--guard-every-s S` | 1 (`KV_GUARD_EVERY_S`) | with `--lazy-lock`: how often the node reads MemAvailable. While it is under `--min-free-gb` the node refuses new leases, and it logs each change. Leases it already granted stay. 0 = only at each lease. Not measured |
+
 ## Build flags (`scripts/build.sh`)
 
 Each `-D` selects a kernel or host-path variant that won an A/B on our cluster. Without it the build uses the earlier

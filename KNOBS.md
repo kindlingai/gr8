@@ -153,7 +153,9 @@ file is read for these keys only.
 | `KV_GB` | `--gb` | none | GiB of this box's memory to lock and serve. RLIMIT_MEMLOCK must allow it (`ulimit -l`; root, or `systemd-run -p LimitMEMLOCK=infinity`) |
 | `KV_PORT` | `--port` | 7350 | the node's TCP port; RDMA connections are set up through it |
 | `KV_BIND` | `--bind` | `0.0.0.0` | the address it listens on |
-| `KV_MIN_FREE_GB` | `--min-free-gb` | 10 | refuse to start when locking `KV_GB` would leave less MemAvailable than this |
+| `KV_MIN_FREE_GB` | `--min-free-gb` | 10 | refuse to start when locking `KV_GB` would leave less MemAvailable than this; with `KV_LAZY_LOCK=1`, refuse each lease that would |
+| `KV_LAZY_LOCK` | `--lazy-lock` | 0 | 1 = lock a lease's memory only while the lease lives (given back to the box when it ends), and refuse leases while MemAvailable is under `KV_MIN_FREE_GB`: a node on a box that also serves. 0 = the whole `KV_GB` is locked at start. Measured effect: not measured |
+| `KV_GUARD_EVERY_S` | `--guard-every-s` | 1 | with `KV_LAZY_LOCK=1`: how often the node reads MemAvailable (0 = at each lease only). Measured effect: not measured |
 | `KV_RDMA` | `--no-rdma` | 1 | 0 = TCP only |
 | `KV_BIN` | `--bin` | `bin/kvman-remote` | the node binary (`./gr8 glm53 build` puts it in `bin/`) |
 | `MENTAT` | `--mentat` | `localhost` | the daemon to announce through; `none` = do not announce |

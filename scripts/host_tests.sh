@@ -12,7 +12,8 @@
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
 # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
 # the pool's block
-# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
+# store in lock-step with its copies run through memory, a file and a loopback KV node, eager and --lazy-lock
+# (pool_stash_test), the commit
 # frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
 # after load (engine/runtime/host_reclaim.h), and steering profile contracts/validation.
 #   scripts/host_tests.sh
@@ -94,11 +95,20 @@ if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in
   for _ in $(seq 50); do [ -s "$T/node.json" ] && break; sleep 0.1; done
   PORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/node.json")
   [ -n "$PORT" ] && STORES+=("remote:127.0.0.1:$PORT")
+  # the same node with --lazy-lock: each lease's range is backed only while it lives (it locks where RLIMIT_MEMLOCK
+  # allows the lease, and runs unlocked otherwise)
+  LOCK=--no-lock; [ "$(ulimit -l)" = unlimited ] || [ "$(ulimit -l)" -ge 131072 ] && LOCK=
+  "$NODE" --gb 0.05 --port 0 --bind 127.0.0.1 --min-free-gb 0 $LOCK --lazy-lock --ready "$T/lazy.json" > "$T/lazy.log" 2>&1 &
+  LAZY_PID=$!
+  for _ in $(seq 50); do [ -s "$T/lazy.json" ] && break; sleep 0.1; done
+  LPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/lazy.json")
+  [ -n "$LPORT" ] && STORES+=("remote:127.0.0.1:$LPORT")
 fi
 "$T/pool_stash_test" "${STORES[@]}"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_namespace_test.cpp" "${KVLIB[@]}" -o "$T/pool_namespace_test"
 "$T/pool_namespace_test" "${STORES[@]}"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
+[ -n "${LAZY_PID:-}" ] && kill "$LAZY_PID"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
 # a held event boundary (Commit::hold): queued admissions chained at one boundary, three ranks on socket pairs

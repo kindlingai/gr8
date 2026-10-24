@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-23: a KV node can share its box with a serve (`--lazy-lock`, `--guard-every-s`)
+
+- `kvman-remote --lazy-lock` (`./gr8 kv up --lazy-lock`, `KV_LAZY_LOCK=1`) maps the arena at start and locks
+  nothing. A lease's range is locked when the lease is granted. When the lease ends, its RDMA regions are
+  deregistered and the range goes back to the box (munlock, MADV_DONTNEED), so the box keeps the memory no lease
+  holds.
+- With it, `--min-free-gb` is checked at every grant: a lease that would leave less MemAvailable is refused
+  (E_NOROOM, "the box is short of memory"). A guard reads MemAvailable every `--guard-every-s` (1 s,
+  `KV_GUARD_EVERY_S`), refuses new leases while the box is under the floor, and logs each change. Leases already
+  granted stay. STATS adds `lazy`, `held`, `min_free`, `mem_available`, `low` and `refused`.
+- Off by default: without `--lazy-lock` the whole arena is locked at start and only the start check applies, as before.
+- Tested on the dev box only (kvman-rs `tests/lazy.rs`: a 512 MiB lease is backed and locked only while it lives,
+  and the process memory and most of MemAvailable come back within a second of its end; a new lease reads zeros
+  while a lease is granted and ended 20 times beside two leases under 8 lanes of load; the refusals; and eager mode
+  is unchanged. `host_tests.sh` runs `pool_stash_test` on a lazy node too). Not measured on the boxes.
+
 ## 2026-10-23: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
 
 - `G6_TR3_W2ALL=1` applies the window-2 fc1 split (KS1x2, WG1) to every MoE layer at M > 1, not only the layers the k2

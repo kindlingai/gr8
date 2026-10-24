@@ -6,6 +6,12 @@
 //! every offset against the lease, and for RDMA each lease has its own protection domain holding one memory region over
 //! exactly its range, with its clients' QPs. The NIC refuses a QP of one lease that presents another lease's rkey, or an
 //! address outside its region. A lease is zeroed when it is granted and freed when its last connection closes.
+//!
+//! --lazy-lock (Config::lazy): the arena is backed and locked lease by lease. A grant first checks the box's
+//! MemAvailable (it must stay at --min-free-gb or more after the grant), then locks the lease's range; the range goes
+//! back to the kernel when the lease ends. A guard thread reads MemAvailable every --guard-every-s, and while it is
+//! below --min-free-gb the node refuses new grants (E_NOROOM), so a node that shares its box with a serve stops
+//! growing when the box runs short. Leases already granted stay.
 
 use super::proto::{self, Header};
 use super::sys::{self, Arena};
@@ -14,14 +20,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Leases start and end on 2 MiB boundaries of the arena.
 pub const LEASE_ALIGN: usize = 2 << 20;
 const GATHER_CHUNK: usize = 1 << 20;
 
+#[derive(Clone, Default)]
 pub struct Config {
     pub bytes: usize,
     /// mlock the arena (always, outside tests).
@@ -30,6 +37,13 @@ pub struct Config {
     pub rdma: bool,
     /// The ack timeout exponent for the node's QPs (verbs::Qp::connect).
     pub qp_timeout: u8,
+    /// --lazy-lock: back and lock each lease's range only while it lives (sys::Arena::take, give)
+    pub lazy: bool,
+    /// --min-free-gb, bytes: with lazy, a grant must leave this much MemAvailable, and none is made while the box has
+    /// less (0: no check)
+    pub min_free: u64,
+    /// --guard-every-s: how often the guard reads MemAvailable (lazy only; zero: at grants only)
+    pub guard_every: Duration,
 }
 
 struct State {
@@ -47,6 +61,13 @@ pub struct Shared {
     qp_timeout: u8,
     started: Instant,
     opened: AtomicU64,
+    min_free: u64,
+    // the guard's last reading: MemAvailable, and whether it was below min_free
+    avail: AtomicU64,
+    low: AtomicBool,
+    refused: AtomicU64,
+    // lazy grants one at a time: each one's MemAvailable check sees the memory the one before it locked
+    grant: Mutex<()>,
 }
 
 /// A lease's protection domain and memory region on one device.
@@ -64,6 +85,8 @@ pub struct Lease {
     read: AtomicU64,
     written: AtomicU64,
     since: Instant,
+    // a lazy arena's range is backed and locked (Arena::take)
+    held: AtomicBool,
     shared: Arc<Shared>,
 }
 
@@ -97,12 +120,19 @@ impl Drop for Lease {
         // no QP of this lease is left (each connection holds the lease until its QPs are gone); deregister before the
         // range can be granted again
         self.regions.lock().unwrap().clear();
-        let mut st = self.shared.state.lock().unwrap();
-        st.leases.remove(&self.id);
-        if st.names.get(&self.name) == Some(&self.id) {
-            st.names.remove(&self.name);
+        {
+            let mut st = self.shared.state.lock().unwrap();
+            st.leases.remove(&self.id);
+            if st.names.get(&self.name) == Some(&self.id) {
+                st.names.remove(&self.name);
+            }
         }
-        release(&mut st.free, self.off, self.len);
+        if self.shared.arena.lazy && self.held.load(Ordering::Relaxed) {
+            // no memory region covers the range now: it goes back to the kernel (munlock, MADV_DONTNEED) before it
+            // is free to grant
+            self.shared.arena.give(self.off, self.len);
+        }
+        release(&mut self.shared.state.lock().unwrap().free, self.off, self.len);
     }
 }
 
@@ -143,7 +173,7 @@ impl Node {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "the node needs at least 2 MiB"));
         }
         let listener = TcpListener::bind(listen)?;
-        let arena = Arena::new(bytes, cfg.lock)?;
+        let arena = Arena::with(bytes, cfg.lock, cfg.lazy)?;
         let mut free = BTreeMap::new();
         free.insert(0, bytes);
         let shared = Arc::new(Shared {
@@ -154,7 +184,23 @@ impl Node {
             qp_timeout: cfg.qp_timeout,
             started: Instant::now(),
             opened: AtomicU64::new(0),
+            min_free: cfg.min_free,
+            avail: AtomicU64::new(sys::mem_available().unwrap_or(0)),
+            low: AtomicBool::new(false),
+            refused: AtomicU64::new(0),
+            grant: Mutex::new(()),
         });
+        if cfg.lazy && cfg.min_free > 0 && !cfg.guard_every.is_zero() {
+            let w = Arc::downgrade(&shared);
+            let every = cfg.guard_every;
+            std::thread::spawn(move || {
+                while let Some(sh) = w.upgrade() {
+                    sh.guard();
+                    drop(sh);
+                    std::thread::sleep(every);
+                }
+            });
+        }
         Ok(Node { shared, listener })
     }
 
@@ -191,8 +237,29 @@ impl Node {
 }
 
 impl Shared {
+    /// One reading of MemAvailable against min_free: true when the box is short. A change is logged.
+    fn guard(&self) -> bool {
+        let Some(avail) = sys::mem_available() else { return false };
+        self.avail.store(avail, Ordering::Relaxed);
+        let low = avail < self.min_free;
+        if self.low.swap(low, Ordering::Relaxed) != low {
+            let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "kvman-remote: MemAvailable {:.1} GiB is {} --min-free-gb {:.1}: {}",
+                g(avail),
+                if low { "below" } else { "back at or above" },
+                g(self.min_free),
+                if low { "new leases are refused" } else { "leases are granted again" }
+            );
+        }
+        low
+    }
     pub fn bytes(&self) -> usize {
         self.arena.len()
+    }
+    /// Bytes backed for leases now (all of the arena unless --lazy-lock).
+    pub fn held(&self) -> usize {
+        self.arena.held()
     }
     pub fn locked(&self) -> bool {
         self.arena.locked
@@ -216,13 +283,20 @@ impl Shared {
             (st.free.values().sum::<usize>(), st.free.values().copied().max().unwrap_or(0), leases)
         };
         let mut s = format!(
-            "{{\"bytes\":{},\"free\":{},\"largest_free\":{},\"locked\":{},\"uptime_s\":{},\"opened\":{},\"leases\":[",
+            "{{\"bytes\":{},\"free\":{},\"largest_free\":{},\"locked\":{},\"uptime_s\":{},\"opened\":{},\"lazy\":{},\
+             \"held\":{},\"min_free\":{},\"mem_available\":{},\"low\":{},\"refused\":{},\"leases\":[",
             self.arena.len(),
             free,
             largest,
             self.arena.locked,
             self.started.elapsed().as_secs(),
-            self.opened.load(Ordering::Relaxed)
+            self.opened.load(Ordering::Relaxed),
+            self.arena.lazy,
+            self.arena.held(),
+            self.min_free,
+            self.avail.load(Ordering::Relaxed),
+            self.low.load(Ordering::Relaxed),
+            self.refused.load(Ordering::Relaxed)
         );
         let mut first = true;
         for l in &leases {
@@ -440,6 +514,27 @@ fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<A
         .ok_or((proto::E_NOROOM, format!("{blocks} blocks of {block_bytes} bytes do not fit the node")))?
         as usize;
     let len_al = len.div_ceil(LEASE_ALIGN) * LEASE_ALIGN;
+    let lazy = sh.arena.lazy;
+    let _one = if lazy { Some(sh.grant.lock().unwrap()) } else { None };
+    if lazy && sh.min_free > 0 {
+        // the guard's state, and a fresh reading: this grant must leave min_free
+        let low = sh.guard();
+        let avail = sh.avail.load(Ordering::Relaxed);
+        if low || avail < len_al as u64 + sh.min_free {
+            sh.refused.fetch_add(1, Ordering::Relaxed);
+            let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+            return Err((
+                proto::E_NOROOM,
+                format!(
+                    "the box is short of memory: MemAvailable {:.2} GiB, a lease of {:.2} GiB would leave less than \
+                     --min-free-gb {:.2}",
+                    g(avail),
+                    g(len_al as u64),
+                    g(sh.min_free)
+                ),
+            ));
+        }
+    }
     let l = {
         let mut st = sh.state.lock().unwrap();
         if let Some(id) = st.names.get(name) {
@@ -468,14 +563,25 @@ fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<A
             read: AtomicU64::new(0),
             written: AtomicU64::new(0),
             since: Instant::now(),
+            held: AtomicBool::new(false),
             shared: sh.clone(),
         });
         st.leases.insert(id, Arc::downgrade(&l));
         st.names.insert(name.to_string(), id);
         l
     };
-    // what the last holder of these bytes left is not this client's
-    unsafe { std::ptr::write_bytes(l.ptr(0), 0, l.len) };
+    if lazy {
+        // backed now, zeroed by the kernel (the range went back with MADV_DONTNEED, or was never touched). On a
+        // failure the lease drops here: its range goes back to the free list
+        sh.arena.take(l.off, l.len).map_err(|e| {
+            sh.refused.fetch_add(1, Ordering::Relaxed);
+            (proto::E_NOROOM, e.to_string())
+        })?;
+        l.held.store(true, Ordering::Relaxed);
+    } else {
+        // what the last holder of these bytes left is not this client's
+        unsafe { std::ptr::write_bytes(l.ptr(0), 0, l.len) };
+    }
     sh.opened.fetch_add(1, Ordering::Relaxed);
     Ok(l)
 }
