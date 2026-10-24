@@ -1,6 +1,7 @@
 //! The value-weighted share policy (D-331 M6 step 2): which group on a KV node gives segments to a group that is short,
 //! priced in request-seconds instead of by the age of the coldest blocks alone. Pure: the node (remote/server.rs) feeds
-//! it what the heads REPORTed, and in KV_SHARE_VALUE=cost-shadow only logs what it would do beside the age rule.
+//! it what the heads REPORTed, and in KV_SHARE_VALUE=cost-shadow only logs what it would do beside the age rule; in
+//! KV_SHARE_VALUE=cost the node acts on it (M6 step 3).
 //!
 //! For a give of `j` segments a rank by donor d to requester r, short `short` segments in all:
 //!   benefit = p_low(r) x GiB r gets x seconds_per_GiB(r) x weight(r)

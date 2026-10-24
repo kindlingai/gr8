@@ -62,7 +62,9 @@ pub struct Share {
     /// OPEN or GOPEN of the same name and shape in that time gets it back as it was, bytes and all. 0 = never parked.
     pub holdover: Duration,
     /// KV_SHARE_VALUE (kvman-remote --value): age = the age rule picks the giver; cost-shadow = it still does, and the
-    /// value-weighted policy (share_policy.rs) logs and counts in STATS what it would pick (D-331 M6 step 2)
+    /// value-weighted policy (share_policy.rs) logs and counts in STATS what it would pick (D-331 M6 step 2); cost = the
+    /// policy picks, and the age rule is only counted (D-331 M6 step 3). A group starting gets its floor by the age
+    /// rule in every mode
     pub value: Value,
     /// recompute ms a GiB of each group's KV costs (--value-spg GROUP=SECONDS; KV_SHARE_SPG_*). A group not listed is
     /// unknown: the policy never takes rows from it, nor gives it rows of another
@@ -77,6 +79,17 @@ pub enum Value {
     #[default]
     Age,
     CostShadow,
+    Cost,
+}
+
+impl Value {
+    pub fn name(self) -> &'static str {
+        match self {
+            Value::Age => "age",
+            Value::CostShadow => "cost-shadow",
+            Value::Cost => "cost",
+        }
+    }
 }
 
 impl Default for Share {
@@ -218,7 +231,7 @@ struct State {
     waiting: BTreeMap<String, u64>,
     // persist leases no connection holds, by name, until the deadline (Share::holdover)
     parked: BTreeMap<String, (Arc<Lease>, Instant)>,
-    // Value::CostShadow: the policy's memory, and what it decided against the age rule
+    // Value::CostShadow and Cost: the policy's memory, and what it decided against the age rule
     shadow: Shadow,
     shadowed: Shadowed,
 }
@@ -374,9 +387,9 @@ impl State {
                 && g.calm_until.is_none_or(|t| now >= t),
         }
     }
-    // Value::CostShadow: `req` is `short` segments short; before the age rule acts, what the policy would do, beside
-    // what the age rule does
-    fn shadow(&mut self, req: &str, short: u64, now: Instant, sh: &Share, started: Instant) {
+    // Value::CostShadow and Cost: `req` is `short` segments short; what the policy decides, beside what the age rule
+    // would do. In Cost the caller acts on the decision
+    fn shadow(&mut self, req: &str, short: u64, now: Instant, sh: &Share, started: Instant) -> Decision {
         let r = self.view(req, now, sh);
         let others: Vec<View> = self.groups.keys().filter(|n| *n != req).map(|n| self.view(n, now, sh)).collect();
         let age = self.age_pick(req, now, sh, false);
@@ -425,9 +438,21 @@ impl State {
             }
         };
         eprintln!(
-            "kvman-remote: share shadow: {req} short {short}: the age rule asks {}, the cost policy would {what}",
-            age.as_deref().unwrap_or("nobody")
+            "kvman-remote: share {}: {req} short {short}: the age rule asks {}, the cost policy {} {what}",
+            if sh.value == Value::Cost { "cost" } else { "shadow" },
+            age.as_deref().unwrap_or("nobody"),
+            if sh.value == Value::Cost { "does" } else { "would" }
         );
+        d
+    }
+    // Value::Cost: the policy's give of `per_rank` segments a rank from `n`. The segments it frees in all
+    fn give_from(&mut self, n: &str, per_rank: u64, now: Instant) -> u64 {
+        let v = self.groups.get_mut(n).expect("policy pick");
+        let k = per_rank.min(v.segs() - v.floor);
+        let target = v.segs() - k;
+        State::open_txn(v, false, target, 0, now, false);
+        v.asked += 1;
+        k * v.nr as u64
     }
 }
 
@@ -762,7 +787,7 @@ impl Shared {
                         "{{\"value\":\"{}\",\"short\":{},\"gives\":{},\"waits\":{},\"held\":{},\"none\":{},\"agree\":{},\
                          \"age_gives\":{},\"age_unpriced\":{},\"age_loss_ms\":{:.0},\"cost_loss_ms\":{:.0},\
                          \"age_benefit_ms\":{:.0},\"cost_benefit_ms\":{:.0}}}",
-                        if self.share.value == Value::CostShadow { "cost-shadow" } else { "age" },
+                        self.share.value.name(),
                         x.short,
                         x.gives,
                         x.waits,
@@ -1440,10 +1465,17 @@ fn report(
     if let Some((k, need, left)) = short {
         // the giver gives whole segments on each of its ranks: what that frees past this group's need, a whole
         // segment on each of its ranks, it takes with its next grant
-        if sh.share.value == Value::CostShadow {
-            st.shadow(name, k, now, &sh.share, sh.started);
-        }
-        let freed = st.ask(name, k, now, &sh.share, false);
+        let freed = match sh.share.value {
+            Value::Age => st.ask(name, k, now, &sh.share, false),
+            Value::CostShadow => {
+                st.shadow(name, k, now, &sh.share, sh.started);
+                st.ask(name, k, now, &sh.share, false)
+            }
+            Value::Cost => match st.shadow(name, k, now, &sh.share, sh.started) {
+                Decision::Give(n, s) => st.give_from(&n, s.give, now),
+                _ => 0,
+            },
+        };
         if freed > 0 {
             st.groups.get_mut(name).expect("reported").bonus = (left + freed).saturating_sub(need) / nr;
         }

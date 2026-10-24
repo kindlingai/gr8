@@ -486,6 +486,10 @@ moves between groups by whole segments (server.rs):
   minute. A group of unknown cost neither gains nor gives rows. The node logs each decision beside the age rule's
   (`share shadow:`) and counts both in STATS `shadow`, with the loss and gain each would cost, priced the same way.
   The age rule still acts: the shadow changes nothing. Transfer cost is 0 in the price until it is measured.
+- `kvman-remote --value cost` (D-331 M6 step 3): the same policy picks the giver, and the age rule is only counted in
+  STATS `shadow` (`value` "cost"; the log says `share cost:`). When no give pays, nobody gives. A group starting still
+  gets its floor by the age rule. Measured with kvman-share-bench on recorded bursty traces (`--record`, `--trace`,
+  `--fixed SA,SB` for the fixed split it must beat): see the bench's header.
 - The node answers with a grant or a give, as a transaction: an id and an absolute target in segments a rank. The head
   announces it as a Resize event, and every rank applies it at that one point of the call sequence with the id
   (`GROW target txn`, `SHRINK target txn`). A GROW or SHRINK under any id but the group's open one is refused

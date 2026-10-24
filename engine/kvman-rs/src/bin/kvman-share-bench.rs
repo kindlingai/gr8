@@ -7,7 +7,8 @@
 //!
 //!   kvman-share-bench [--server HOST:PORT] [--gb 4] [--seg-mb 128] [--margin-s 60] [--poll-ms 1000]
 //!                     [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE]
-//!                     [--clock pool|bench] [--seed N] [--value age|cost-shadow] [--spg-s 15.6]
+//!                     [--clock pool|bench] [--seed N] [--value age|cost-shadow|cost] [--spg-s 15.6]
+//!                     [--trace FILE] [--fixed SA,SB] [--record FILE --dur-s 300 --rate 20]
 //!
 //! Without --server it runs a node in this process (TCP on loopback). The run is four phases: A busy and B idle, B busy
 //! and A idle, both busy, A busy and B idle. A busy cluster runs agent conversations whose KV does not fit its pool, so
@@ -15,6 +16,13 @@
 //! the tokens of its page, with a filler derived from them: every block read back is checked whole, and every reused row
 //! must hold its prompt's token. The ranks of a cluster must queue the same copies and agree on the pool digest after
 //! every call. One line of JSON per head poll (the timeline), and a summary at the end.
+//!
+//! Recorded traces (D-331 M6 step 3): --record FILE writes a bursty two-cluster trace from --seed and exits: each
+//! cluster switches between busy and idle at random every 10-60 s, and sends --rate requests a second while busy; one
+//! line a request, `T_MS CLUSTER AGENT NEW GEN SEED`. --trace FILE replays one at its own pace in place of the phases,
+//! so every mode sees the same requests. The summary then counts the recompute waiting: rows of a prompt's earlier
+//! history the pool could not reuse, priced at --spg-s seconds a GiB of each cluster's KV. --fixed SA,SB: no sharing,
+//! cluster A holds SA segments a rank and B holds SB (the fixed split the value policy must beat).
 
 use g6kvman::remote::server::Value;
 use g6kvman::remote::{coldest_ages, Config, GroupOpts, Node, Opts, RemoteStore, Share, Want};
@@ -34,7 +42,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: kvman-share-bench [--server HOST:PORT] [--gb 4] [--seg-mb 128] [--margin-s 60] [--poll-ms 1000] \
          [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE] [--clock pool|bench] [--seed N] \
-         [--only A|B] [--busy phases|always|idle] [--value age|cost-shadow] [--spg-s 15.6]\n\
+         [--only A|B] [--busy phases|always|idle] [--value age|cost-shadow|cost] [--spg-s 15.6] [--trace FILE] \
+         [--fixed SA,SB] [--record FILE --dur-s 300 --rate 20]\n\
          --only: run that cluster alone (the other group is another process, e.g. vLLM, on --server);\n\
          --busy: phases (the 4 phases), always or idle"
     );
@@ -54,6 +63,56 @@ impl Rng {
     fn range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.next() % (hi - lo + 1)
     }
+}
+
+// one request of a recorded trace: when (ms from the start), which cluster, which agent continues, the new prompt
+// tokens and the generated ones, and the seed of their token values
+#[derive(Clone, Copy, Debug)]
+struct Ev {
+    t_ms: u64,
+    cluster: usize,
+    agent: usize,
+    new: u64,
+    gen: u64,
+    seed: u64,
+}
+
+// --record: busy and idle spells of 10-60 s for each cluster, `rate` requests a second while busy
+fn record(seed: u64, dur_s: f64, rate: f64, agents: usize) -> Vec<Ev> {
+    let mut evs = Vec::new();
+    for c in 0..2 {
+        let mut rng = Rng(seed * 6_364_136_223 + c as u64 * 1_442_695 + 1);
+        let mut t = 0.0;
+        let mut busy = rng.next() % 2 == 0;
+        while t < dur_s {
+            let end = (t + rng.range(10, 60) as f64).min(dur_s);
+            while busy && t < end {
+                let (agent, new, gen) =
+                    (rng.range(0, agents as u64 - 1) as usize, rng.range(64, 320), rng.range(16, 64));
+                evs.push(Ev { t_ms: (t * 1000.0) as u64, cluster: c, agent, new, gen, seed: rng.next() });
+                t += 1.0 / rate;
+            }
+            t = t.max(end);
+            busy = !busy;
+        }
+    }
+    evs.sort_by_key(|e| (e.t_ms, e.cluster));
+    evs
+}
+
+fn read_trace(p: &str) -> Vec<Ev> {
+    let text = std::fs::read_to_string(p).unwrap_or_else(|e| die(format!("{p}: {e}")));
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let f: Vec<u64> =
+                l.split_whitespace().map(|x| x.parse().unwrap_or_else(|_| die(format!("{p}: {l}")))).collect();
+            if f.len() != 6 || f[1] > 1 {
+                die(format!("{p}: bad line {l}"));
+            }
+            Ev { t_ms: f[0], cluster: f[1] as usize, agent: f[2] as usize, new: f[3], gen: f[4], seed: f[5] }
+        })
+        .collect()
 }
 
 fn mix(h: u64, x: u64) -> u64 {
@@ -159,6 +218,11 @@ struct Counts {
     grows: u64,
     shrinks: u64,
     give_moves: u64,
+    // rows of a prompt's earlier history the pool did not reuse (computed again)
+    missed_rows: u64,
+    // a trace's requests started late: the most, and in all
+    lag_max_ms: u64,
+    lag_ms: u64,
 }
 
 struct Cluster {
@@ -174,6 +238,8 @@ struct Cluster {
     pool_clock: bool,
     last_use: HashMap<u64, Instant>,
     full_seen: u64,
+    // KV bytes a row
+    row_bytes: u64,
     c: Counts,
 }
 
@@ -258,16 +324,19 @@ impl Cluster {
     }
 
     // one agent turn: its conversation so far plus a new message, reusing what the pool or the store holds
-    fn request(&mut self) {
-        let a = self.rng.range(0, self.agents.len() as u64 - 1) as usize;
+    // one request: the next of a trace, or else a random one
+    fn request(&mut self, ev: Option<Ev>) {
+        let saved = ev.map(|e| std::mem::replace(&mut self.rng, Rng(e.seed)));
+        let a = ev.map_or_else(|| self.rng.range(0, self.agents.len() as u64 - 1) as usize, |e| e.agent);
         let max_rows = (POOL_PAGES as usize - 2) * ROWS;
         let mut prompt = self.agents[a].clone();
         if prompt.len() + 400 > max_rows || prompt.is_empty() {
             prompt = self.system.clone();
         }
-        let n = self.rng.range(64, 320);
+        let history = prompt.len() as u64;
+        let n = ev.map_or_else(|| self.rng.range(64, 320), |e| e.new);
         prompt.extend((0..n).map(|_| self.rng.range(0, 1 << 30) as i32));
-        let gen = self.rng.range(16, 64) as usize;
+        let gen = ev.map_or_else(|| self.rng.range(16, 64), |e| e.gen) as usize;
         let worst = (prompt.len() + gen + 1) as u64;
         let now_rows = prompt.len() as u64 + 1;
         let limit = prompt.len() as i32 - 1;
@@ -297,6 +366,7 @@ impl Cluster {
         if h.stored {
             self.c.stored_hits += 1;
         }
+        self.c.missed_rows += history.saturating_sub(h.skip.max(0) as u64);
         if !self.pool_clock {
             if h.stored {
                 self.last_use.insert(h.age, Instant::now());
@@ -339,6 +409,9 @@ impl Cluster {
         self.run_io();
         self.agents[a] = tokens;
         self.c.requests += 1;
+        if let Some(r) = saved {
+            self.rng = r;
+        }
     }
 
     // the head: report to the node, then grow or shrink every rank at this point of the call sequence
@@ -440,6 +513,12 @@ struct Args {
     // --value cost-shadow: the in-process node shadows the age rule with the cost policy, both groups at --spg-s
     value: Value,
     spg_s: f64,
+    trace: Option<String>,
+    // --fixed: segments a rank of A and of B, no sharing
+    fixed: Option<(u64, u64)>,
+    record: Option<String>,
+    dur_s: f64,
+    rate: f64,
 }
 
 fn cluster(a: &Args, addr: &str, id: u64, name: &'static str, mla_row: usize, floor: u64, cap: u64) -> Cluster {
@@ -491,6 +570,7 @@ fn cluster(a: &Args, addr: &str, id: u64, name: &'static str, mla_row: usize, fl
         pool_clock: a.pool_clock,
         last_use: HashMap::new(),
         full_seen: 0,
+        row_bytes: (block / ROWS) as u64,
         c: Counts::default(),
     }
 }
@@ -513,6 +593,11 @@ fn main() {
         busy: None,
         value: Value::Age,
         spg_s: 15.6,
+        trace: None,
+        fixed: None,
+        record: None,
+        dur_s: 300.0,
+        rate: 20.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -555,13 +640,44 @@ fn main() {
                 a.value = match v().as_str() {
                     "age" => Value::Age,
                     "cost-shadow" => Value::CostShadow,
+                    "cost" => Value::Cost,
                     _ => usage(),
                 }
             }
             "--spg-s" => a.spg_s = v().parse().unwrap_or_else(|_| usage()),
+            "--trace" => a.trace = Some(v()),
+            "--fixed" => {
+                let x = v();
+                let (sa, sb) = x.split_once(',').unwrap_or_else(|| usage());
+                a.fixed = Some((sa.parse().unwrap_or_else(|_| usage()), sb.parse().unwrap_or_else(|_| usage())));
+            }
+            "--record" => a.record = Some(v()),
+            "--dur-s" => a.dur_s = v().parse().unwrap_or_else(|_| usage()),
+            "--rate" => a.rate = v().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }
+    if let Some(p) = &a.record {
+        let evs = record(a.seed, a.dur_s, a.rate, a.agents);
+        let mut f = std::fs::File::create(p).unwrap_or_else(|e| die(format!("{p}: {e}")));
+        writeln!(
+            f,
+            "# kvman-share-bench --record seed {} dur {} s rate {}/s agents {}",
+            a.seed, a.dur_s, a.rate, a.agents
+        )
+        .unwrap();
+        for e in &evs {
+            writeln!(f, "{} {} {} {} {} {}", e.t_ms, e.cluster, e.agent, e.new, e.gen, e.seed).unwrap();
+        }
+        eprintln!(
+            "# {p}: {} requests (A {}, B {})",
+            evs.len(),
+            evs.iter().filter(|e| e.cluster == 0).count(),
+            evs.iter().filter(|e| e.cluster == 1).count()
+        );
+        return;
+    }
+    let trace = a.trace.as_deref().map(read_trace);
     let margin = Duration::from_secs_f64(a.margin_s);
     let addr = match &a.server {
         Some(s) => s.clone(),
@@ -597,13 +713,22 @@ fn main() {
         Some(p) => Box::new(std::fs::File::create(p).unwrap_or_else(|e| die(format!("{p}: {e}")))),
         None => Box::new(std::io::stdout()),
     }));
-    // A: GLM 5.3 full, FP8 rows. B: the INT4-row build. Floor 2 segments a rank each, cap 24
+    // A: GLM 5.3 full, FP8 rows. B: the INT4-row build. Floor 2 segments a rank each, cap 24; --fixed: floor = cap
     let specs = [(1, "A", MLA_ROW), (2, "B", MLA_ROW_KV4)];
     let clusters: Vec<Cluster> = specs
         .iter()
         .enumerate()
         .filter(|(i, _)| a.only.is_none_or(|o| o == *i))
-        .map(|(_, &(id, name, row))| cluster(&a, &addr, id, name, row, 2, 24))
+        .map(|(i, &(id, name, row))| {
+            let (floor, cap) = match a.fixed {
+                Some((sa, sb)) => {
+                    let s = if i == 0 { sa } else { sb };
+                    (s, s)
+                }
+                None => (2, 24),
+            };
+            cluster(&a, &addr, id, name, row, floor, cap)
+        })
         .collect();
     let per: Vec<String> = clusters.iter().map(|c| format!("{} {}", c.name, c.per_seg)).collect();
     eprintln!(
@@ -623,10 +748,14 @@ fn main() {
     let t0 = Instant::now();
     let phase_len = Duration::from_secs_f64(a.phase_s);
     let poll = Duration::from_millis(a.poll_ms);
-    let end = phase_len * phases.len() as u32;
+    let end = match &trace {
+        Some(t) => Duration::from_millis(t.iter().map(|e| e.t_ms).max().unwrap_or(0) + 1000),
+        None => phase_len * phases.len() as u32,
+    };
+    let trace = &trace;
     let names: Vec<&str> = clusters.iter().map(|c| c.name).collect();
     let busy_all = a.busy;
-    let results: Vec<Counts> = std::thread::scope(|sc| {
+    let results: Vec<(Counts, u64)> = std::thread::scope(|sc| {
         let hs: Vec<_> = clusters
             .into_iter()
             .map(|mut c| {
@@ -634,6 +763,42 @@ fn main() {
                 let out = out.clone();
                 sc.spawn(move || {
                     let mut next_poll = t0;
+                    if let Some(tr) = trace {
+                        // replay: the cluster's requests at their times; busy while its next request is due within a
+                        // second
+                        let mine: Vec<Ev> = tr.iter().filter(|e| e.cluster == i).copied().collect();
+                        let mut k = 0;
+                        while t0.elapsed() < end {
+                            let now = Instant::now();
+                            let due = mine.get(k).map(|e| t0 + Duration::from_millis(e.t_ms));
+                            if now >= next_poll {
+                                let busy = due.is_some_and(|d| d <= now + Duration::from_secs(1));
+                                let line = c.head(busy);
+                                writeln!(
+                                    out.lock().unwrap(),
+                                    "{{\"t\":{:.2},\"phase\":0,{line}}}",
+                                    t0.elapsed().as_secs_f64()
+                                )
+                                .unwrap();
+                                next_poll += poll;
+                                continue;
+                            }
+                            match due {
+                                Some(d) if d <= now => {
+                                    let lag = now.duration_since(d).as_millis() as u64;
+                                    c.c.lag_max_ms = c.c.lag_max_ms.max(lag);
+                                    c.c.lag_ms += lag;
+                                    c.request(Some(mine[k]));
+                                    k += 1;
+                                }
+                                _ => {
+                                    let wake = due.map_or(next_poll, |d| d.min(next_poll)).min(t0 + end);
+                                    std::thread::sleep(wake.saturating_duration_since(now));
+                                }
+                            }
+                        }
+                        return (c.c.clone(), c.row_bytes);
+                    }
                     loop {
                         let t = t0.elapsed();
                         if t >= end {
@@ -653,18 +818,31 @@ fn main() {
                             next_poll += poll;
                         }
                         if busy {
-                            c.request();
+                            c.request(None);
                         } else {
                             std::thread::sleep(Duration::from_millis(20));
                         }
                     }
-                    c.c.clone()
+                    (c.c.clone(), c.row_bytes)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    for (n, c) in names.iter().zip(&results) {
+    let mut total_ms = 0.0;
+    let mut per = Vec::new();
+    for (n, (c, row_bytes)) in names.iter().zip(&results) {
+        let rc_ms = (c.missed_rows * row_bytes) as f64 / (1u64 << 30) as f64 * a.spg_s * 1000.0;
+        total_ms += rc_ms;
+        per.push(format!(
+            "\"{n}\":{{\"requests\":{},\"missed_rows\":{},\"recompute_ms\":{rc_ms:.0},\"lag_max_ms\":{},\"lag_ms\":{}}}",
+            c.requests, c.missed_rows, c.lag_max_ms, c.lag_ms
+        ));
+        eprintln!(
+            "# {n}: recompute waiting {rc_ms:.0} ms ({} rows of earlier history not reused); late by {} ms at most, {} ms \
+             in all",
+            c.missed_rows, c.lag_max_ms, c.lag_ms
+        );
         eprintln!(
             "# {n}: {} requests, {} stored hits, {} blocks restored and checked whole, {} reused rows checked, {} spilled, \
              {} moved ({} in gives), {} grows, {} gives; no wrong block",
@@ -679,5 +857,17 @@ fn main() {
             c.shrinks
         );
     }
+    let mode = match a.fixed {
+        Some((sa, sb)) => format!("fixed {sa},{sb}"),
+        None => a.value.name().to_string(),
+    };
+    eprintln!("# recompute waiting, {mode}: {total_ms:.0} ms");
+    writeln!(
+        out.lock().unwrap(),
+        "{{\"summary\":{{\"mode\":\"{mode}\",\"trace\":\"{}\",{},\"recompute_ms\":{total_ms:.0}}}}}",
+        a.trace.as_deref().unwrap_or(""),
+        per.join(",")
+    )
+    .unwrap();
     eprintln!("# node: {}", g6kvman::remote::client::stats(&addr).unwrap_or_default());
 }
