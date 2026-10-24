@@ -41,6 +41,9 @@ struct DriverHooks {
     // optional: a session finished at this step (now Retiring): its pages go back to the pool now, on every rank, so
     // the sessions still decoding can grow before the next event fence frees the slot
     std::function<void(const Slot&)> finished;
+    // optional: a Resize event's change (Commit::resize), every rank at the commit: the tier and its group lease change
+    // size (s2/kv_share.h share_apply). Required when a resize commit arrives
+    std::function<void(const Resize&)> resize;
     // optional: after the growth and before the round, every rank (the host work since the last round may have taken a
     // different time on each rank: the round's fabric waits time out)
     std::function<void()> settle;
@@ -147,6 +150,10 @@ public:
                 payload_[c.admit->key.slot] = *p;
                 hooks_.bind(*c.admit);
                 if (p->decode_prompt) scheduler_.skip_prefill(c.admit->key);
+            }
+            if (c.resize) {
+                require(bool(hooks_.resize), "a resize commit without the resize hook");
+                hooks_.resize(*c.resize);
             }
         } catch (...) { scheduler_.fail(); throw; }
         return changes;

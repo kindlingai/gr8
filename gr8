@@ -74,7 +74,7 @@ done
 set -- ${args[@]+"${args[@]}"}
 api() { echo "http://127.0.0.1:$PORT"; }
 case $cmd in
-  up|down|restart|status|logs|check|show-config|prepare)
+  up|down|restart|resize|status|logs|check|show-config|prepare)
     [ $check = 0 ] && set -- "$@" --no-check
     exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@" ;;
   smoke)

@@ -3,16 +3,22 @@
 //!
 //! | op | request | reply |
 //! |---|---|---|
-//! | OPEN | a = block bytes, b = blocks, c = name length, then the name | a = lease id, b = lease bytes, then a 16-byte token for ATTACH |
+//! | OPEN | a = block bytes, b = blocks, c = name length \| OPEN_PERSIST, then the name | a = lease id, b = lease bytes, c = 1 if it is a parked lease back (its bytes as they were), then a 16-byte token for ATTACH |
 //! | ATTACH | a = lease id, then the token: another lane of the same lease | status |
 //! | RDMA | a = QPs, b = this end's active MTU, c = its initiator read depth, then its GID (16 bytes) and each QP's (qpn, psn) as two u32 | a = the lease's remote address, b = rkey, c = MTU \| read depth << 32, then the node's GID and its QPs' (qpn, psn). The QPs live as long as the connection |
 //! | READ | a = offset in the lease, b = bytes | a = bytes, then the data |
 //! | WRITE | a = offset, b = bytes, then the data | status |
 //! | GATHER | a = ranges, then (offset, bytes) per range as two u64 | a = total bytes, then each range's data in order |
 //! | STATS | (any connection, with or without a lease) | a = bytes of JSON, then the JSON |
+//! | GOPEN | a = bytes that follow: block bytes, floor bytes, cap bytes (u64 each), ranks, rank, weight (1000 = 1x), flags (GOPEN_PERSIST) (u32 each), then "<group> <lease>" | a = lease id, b = segments, c = blocks a segment, then the token, then a u64: 1 if it is a parked lease back |
+//! | REPORT | a = segments a rank wants, b = ages, c = quotes, then each age (u64, ms since the use of the coldest block of each segment's worth, coldest first), then each quote (u64, rows a give of 1, 2, ... segments loses; u64::MAX = refused) | a = segments a rank was granted now, b = segments a rank is asked to give back, c = segments nobody holds or was promised, then the transaction (u64; 0 = none) every rank names in its GROW or SHRINK |
+//! | GROW | a = segments the lease grows to (the grant's target), b = the transaction | a = the lease's segments |
+//! | SHRINK | a = segments to keep (the last ones go; nothing may use them after this), b = the transaction | a = the lease's segments |
+//! | SEGS | (after RDMA on this connection) | a = segments, b = lease bytes a segment, then each segment's (remote address, rkey) as two u64 |
 //!
 //! A failed request replies with a nonzero status and c = the length of a message that follows. A lease ends when the
-//! last connection that opened or attached it closes.
+//! last connection that opened or attached it closes, unless it was opened with persist on a node with a holdover
+//! (kvman-remote --holdover-s): then it is parked that long for an OPEN or GOPEN of the same name to take back.
 
 use std::io::{self, Read, Write};
 
@@ -25,6 +31,17 @@ pub const READ: u32 = 4;
 pub const WRITE: u32 = 5;
 pub const GATHER: u32 = 6;
 pub const STATS: u32 = 7;
+pub const GOPEN: u32 = 8;
+pub const REPORT: u32 = 9;
+pub const GROW: u32 = 10;
+pub const SHRINK: u32 = 11;
+pub const SEGS: u32 = 12;
+/// OPEN's c: park the lease when its last connection closes.
+pub const OPEN_PERSIST: u64 = 1 << 32;
+/// GOPEN's flags: the same.
+pub const GOPEN_PERSIST: u32 = 1;
+/// GOPEN's fixed part before the names.
+pub const GOPEN_FIXED: usize = 40;
 pub const HEADER: usize = 32;
 pub const NAME_MAX: usize = 128;
 pub const MAX_QPS: u64 = 256;
@@ -40,6 +57,8 @@ pub const E_NOROOM: u32 = 4;
 pub const E_BUSY: u32 = 5;
 pub const E_TOKEN: u32 = 6;
 pub const E_RDMA: u32 = 7;
+/// A GROW or SHRINK that names a transaction the group no longer (or never) had open.
+pub const E_STALE: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Header {
@@ -92,6 +111,7 @@ pub fn reply(r: &mut impl Read) -> io::Result<Header> {
             E_BUSY => io::ErrorKind::AddrInUse,
             E_TOKEN | E_NOLEASE => io::ErrorKind::PermissionDenied,
             E_RDMA => io::ErrorKind::Unsupported,
+            E_STALE => io::ErrorKind::StaleNetworkFileHandle,
             _ => io::ErrorKind::InvalidData,
         };
         return Err(io::Error::new(kind, format!("KV node: {}", String::from_utf8_lossy(&m))));

@@ -305,8 +305,34 @@ entry's blocks before `io_done` appends its add record. A drop record is synced 
 A record that fails its checksum ends the log, and the file is cut there, so a torn write never names blocks that hold
 anything else. Entries load in commit order. After boot, every worker sends the head its loaded entries. The head keeps
 those every rank has, in its own order, and every rank keeps exactly that list, so the ranks start in lock-step. The log
-is rewritten from the live entries when it holds four times as many records. Evicted runs are not persisted, and neither
-are KV node leases.
+is rewritten from the live entries when it holds four times as many records. Evicted runs are not persisted on an
+SSD store (a KV-node lease with `persist=lease` keeps them: next section).
+
+### Persistence (KV-node leases: `persist=lease`, `./gr8 <model> resize`)
+
+A KV-node store with `persist=lease` (`remote:HOST:PORT,size=N,persist=lease`, not with `group=` yet) keeps its
+sessions over an engine restart, for a resize of `CAP` or a reload that keeps the model. Three parts:
+
+- The node: `kvman-remote --holdover-s S` (default 0: off) parks a lease opened with persist when its last
+  connection closes, for S seconds, instead of freeing it. An OPEN (or GOPEN) of the same name and shape within S
+  takes it back with its bytes as they were (the reply says reattached); another shape, or a parked lease past S,
+  is freed and the new lease is zeroed as always.
+- The engine: the lease's name has no epoch (`g6m4-<set id>-<host>-r<R>[-<format>]-t<i>`), so the next engine asks
+  for the same lease. Its index (the SSD index format, plus record 4: every field of an entry, so evicted runs come
+  back with their base prefix, hits, tail and namespace; non-stock runs are never written) lives in
+  `/dev/shm/g6kv-<name>`, as long as the box. A lease the node did not give back starts its index empty. The compat
+  line leaves out the pool's placement pages and the store's size, which a resize changes (entries past the store's
+  size are not loaded); with tails past R (CP) the placement stays in. At an orderly quit (`DIR/quit`, an idle
+  engine) every rank stores the runs its pool still holds, the same calls on every rank, before it closes the lease.
+- The launcher: `./gr8 <model> resize --restart idle [OPTIONS]` waits until the head's front end reports no running
+  request (`vllm:num_requests_running` 0 on two polls, at most `--resize-wait` seconds, 600), runs `down` (the engine
+  gets 120 s for its quit with a lease store, else 10) and then `up` with OPTIONS. `RESTART=off` (the default)
+  refuses; `checkpoint` (mid-turn) needs the Flash checkpoint and is not built.
+
+Not measured on a cluster yet. Tested on loopback: `tests/park.rs` (the node), `tests/stash.rs`
+`a_whole_index_brings_back_evicted_runs_after_a_restart`, and `engine/runtime/s2/tests/kv_lease_test.cpp` (C
+interface: a session stored, a quit, a restart with a larger pool, the next turn restores 256 of 410 prompt rows from
+the lease; with no holdover it restores none). A request that arrives between resize's last poll and the quit fails.
 
 ### Tested on a single GB10 build box
 
@@ -431,6 +457,47 @@ rank could reuse a slot (a spill at its next growth) that a slow rank has yet to
 would wait one event fence, when the head has every rank's ACK, before reuse. That needs a pool call at each event,
 deterministic like the others. The writes could be split across ranks (page i by rank i mod TP), and every rank would
 read the whole run. Until the cluster check, each rank keeps its own store.
+
+### Sharing a node: group leases
+
+Two clusters (GLM and Flash, say) can share one KV node. Each store opened with `group=NAME[,cap=N][,weight=N]`
+(`--kv-store remote:...,size=FLOOR,group=glm,cap=32G`) is one rank's lease in group NAME. A group lease holds whole
+segments (`kvman-remote --seg-mb`, 1 GiB by default), starts at its floor (`size=`), and grows up to `cap=`. Capacity
+moves between groups by whole segments (server.rs):
+
+- The head (rank 0) REPORTs to the node now and then (`G6_S2_SHARE_MS`, 1000 ms): the segments a rank it wants more
+  (s2/kv_share.h `share_want`: room for an entry too big for the tier, the pages the tier pushed out since the last
+  report, or the next spill) and the ages of its coldest blocks, one per segment, in the order a shrink evicts
+  (`coldest_ages`). A segment the tier holds empty reports as u64::MAX, so the node takes empty segments first and at
+  once. Beside the ages it sends resize quotes (`Pool::quote_points`, `g6kv_tier_quotes`): for a give of 1, 2, ...
+  segments, the rows that no tier keeps after it, which requests compute again (u64::MAX: the tier would refuse that
+  shrink). A quote is a dry run of the shrink on a copy of the stash (`Stash::quote_resize`: the entries that leave
+  the tier in eviction order, the entries lost, their rows and blocks, the blocks a later tier takes), and
+  `apply_resize_plan` does the shrink only when a fresh quote still equals it. The node keeps the last quotes per group
+  and shows them in STATS (`quote_rows`); it still picks the group to give by its ages (D-331 M6 step 1).
+- The node answers with a grant or a give, as a transaction: an id and an absolute target in segments a rank. The head
+  announces it as a Resize event, and every rank applies it at that one point of the call sequence with the id
+  (`GROW target txn`, `SHRINK target txn`). A GROW or SHRINK under any id but the group's open one is refused
+  (`E_STALE`); the same one again is a no-op. A rank may give on its own (`SHRINK target 0`): the first rank opens the
+  give, the others join it.
+- A grant is held for each rank until it grows. One no rank took goes back after `grant_ttl` (30 s); once one rank took
+  its part, the rest stay held for the others.
+- A rank's given segments go free only once every rank of its group gave. Until then the slower ranks may still write
+  them.
+- A group short of room asks the group whose coldest blocks are older than its own by `--margin-s` (60 s), weighted by
+  `weight=` (2000 counts the blocks half as old), never below that group's floor and not within `--cooldown-s` (10 s)
+  of its last give. A give no rank started within `--stall-s` (10 s) marks the group stalled until it shrinks. A give
+  frees whole segments on each of the giver's ranks; what that frees past the asker's need, the asker takes with its
+  next grant (a group of 4 ranks giving to one of 2 strands nothing).
+- A group that opens on a full node asks the others down toward their floors (the margin and the cooldown do not apply)
+  and waits up to `--stall-s` for them. `kvman-remote --group-plan FILE` (lines `NAME nr=RANKS floor=SEGS`) keeps a
+  planned group's floors free from the start, however full the node is; the floors must fit the node.
+- `KV_SHARE_WHEN=idle` (the default, engine `G6_KV_SHARE_WHEN`): the head offers its blocks to other groups only while
+  the engine is idle, so a give's compaction never pauses a turn. A group starting below its floor is still served.
+  `always`: whenever the node asks.
+
+`tests/share.rs` drives each of these over TCP on loopback; `s2/tests/kv_share_test.cpp` runs two ranks of a pool
+through a grant, a give and a voluntary give to the floor.
 
 ### Still to do
 

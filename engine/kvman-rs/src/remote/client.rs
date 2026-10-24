@@ -4,13 +4,17 @@
 //! connection. A call takes a free lane. Over RDMA the client reads and writes the node's memory itself, and the node's
 //! CPU does nothing per request. A buffer inside a region the caller registered (register) goes to the wire as it is;
 //! anything else goes through the lane's registered staging buffer, one memcpy.
+//!
+//! A store opened with a group (Opts::group) is one rank's lease in a group on the node (server.rs): it has a number of
+//! segments, each a whole number of blocks, and grows and shrinks by segments. Over RDMA each segment has its own
+//! address and rkey.
 
 use super::proto::{self, Header};
 use super::verbs::{self, Cq, Device, Mr, Pd, Qp, QpEnd, SendWr, Sge, Wc};
 use crate::tier::{AlignedBuf, BlockStore};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -53,20 +57,74 @@ pub struct Opts {
     pub qp_timeout: u8,
     /// Work requests in flight per RDMA lane.
     pub depth: u32,
+    /// Join a group on the node (a cluster's ranks sharing it with other clusters) instead of a fixed lease.
+    pub group: Option<GroupOpts>,
+    /// Ask the node to park the lease when this store closes (a node with --holdover-s keeps it that long), so a
+    /// restarted client of the same name and shape finds its blocks as it left them (RemoteStore::reattached).
+    pub persist: bool,
+}
+
+/// One rank's place in a group (server.rs GOPEN). Every rank of a cluster gives the same group, ranks, sizes and
+/// weight.
+#[derive(Clone, Debug)]
+pub struct GroupOpts {
+    pub group: String,
+    pub nr: u32,
+    pub rank: u32,
+    /// The lease never shrinks below this, nor grows past cap (rounded up to whole segments).
+    pub floor_bytes: u64,
+    pub cap_bytes: u64,
+    /// 1000 = 1x; 2000 is asked to give as if its blocks were half as old.
+    pub weight: u32,
+}
+
+/// The node's answer to a REPORT, in segments per rank.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    /// held for every rank of the group now: each rank grows by this many
+    pub grant: u64,
+    /// asked back: each rank shrinks by this many
+    pub give: u64,
+    /// segments nobody holds or was promised
+    pub unclaimed: u64,
+    /// the transaction every rank names in grow or shrink (0 = nothing to do)
+    pub txn: u64,
 }
 
 impl Opts {
     pub fn new(name: &str, block_bytes: usize, blocks: u64) -> Opts {
-        Opts { name: name.into(), block_bytes, blocks, lanes: 4, want: Want::Auto, qp_timeout: 14, depth: 256 }
+        Opts {
+            name: name.into(),
+            block_bytes,
+            blocks,
+            lanes: 4,
+            want: Want::Auto,
+            qp_timeout: 14,
+            depth: 256,
+            group: None,
+            persist: false,
+        }
     }
 }
 
 struct Rdma {
     dev: Arc<Device>,
     pd: Arc<Pd>,
-    raddr: u64,
-    rkey: u32,
+    // lease bytes a segment, and each segment's (remote address, rkey). A fixed lease is one segment
+    span: u64,
+    segs: RwLock<Vec<(u64, u32)>>,
     regions: RwLock<Vec<(usize, usize, Arc<Mr>)>>,
+}
+
+impl Rdma {
+    // the remote address and rkey of lease bytes off..off + len, which lie in one segment
+    fn target(&self, off: u64, len: usize) -> io::Result<(u64, u32)> {
+        let (i, at) = ((off / self.span) as usize, off % self.span);
+        match self.segs.read().unwrap().get(i) {
+            Some(&(a, k)) if len as u64 <= self.span - at => Ok((a + at, k)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "past the lease, or across a segment")),
+        }
+    }
 }
 
 struct RdmaLane {
@@ -82,13 +140,15 @@ enum Lane {
 }
 
 pub struct RemoteStore {
-    _ctl: Mutex<TcpStream>,
+    ctl: Mutex<TcpStream>,
     lanes: Vec<Mutex<Lane>>,
     next: AtomicUsize,
     rdma: Option<Rdma>,
     pub transport: Transport,
     pub block_bytes: usize,
-    pub blocks: u64,
+    blocks: AtomicU64,
+    /// Blocks a segment (a group lease), 0 for a fixed lease.
+    pub per_seg: u64,
     pub lease_id: u64,
     pub lease_bytes: u64,
     pub local: SocketAddr,
@@ -97,6 +157,8 @@ pub struct RemoteStore {
     pub fallback: Option<String>,
     /// The RDMA device and GID index this end uses.
     pub device: Option<(String, u32)>,
+    /// The node gave back a parked lease (Opts::persist): its blocks hold what the last holder wrote.
+    pub reattached: bool,
 }
 
 fn connect(addr: &str) -> io::Result<TcpStream> {
@@ -124,12 +186,36 @@ impl RemoteStore {
     pub fn open(addr: &str, o: &Opts) -> io::Result<RemoteStore> {
         let mut ctl = connect(addr)?;
         let (local, server) = (ctl.local_addr()?, ctl.peer_addr()?);
-        Header::new(proto::OPEN, o.block_bytes as u64, o.blocks, o.name.len() as u64).write(&mut ctl)?;
-        ctl.write_all(o.name.as_bytes())?;
-        let h = proto::reply(&mut ctl)?;
-        let (lease_id, lease_bytes) = (h.a, h.b);
+        let persist = if o.persist { proto::OPEN_PERSIST } else { 0 };
+        let (lease_id, lease_bytes, blocks, per_seg, mut reattached) = match &o.group {
+            None => {
+                Header::new(proto::OPEN, o.block_bytes as u64, o.blocks, o.name.len() as u64 | persist).write(&mut ctl)?;
+                ctl.write_all(o.name.as_bytes())?;
+                let h = proto::reply(&mut ctl)?;
+                (h.a, h.b, o.blocks, 0, h.c == 1)
+            }
+            Some(g) => {
+                let mut b = Vec::with_capacity(proto::GOPEN_FIXED + g.group.len() + 1 + o.name.len());
+                for x in [o.block_bytes as u64, g.floor_bytes, g.cap_bytes] {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                for x in [g.nr, g.rank, g.weight, if o.persist { proto::GOPEN_PERSIST } else { 0 }] {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                b.extend_from_slice(format!("{} {}", g.group, o.name).as_bytes());
+                Header::new(proto::GOPEN, b.len() as u64, 0, 0).write(&mut ctl)?;
+                ctl.write_all(&b)?;
+                let h = proto::reply(&mut ctl)?;
+                (h.a, h.b * h.c * o.block_bytes as u64, h.b * h.c, h.c, false)
+            }
+        };
         let mut token = [0u8; 16];
         ctl.read_exact(&mut token)?;
+        if o.group.is_some() {
+            let mut b = [0u8; 8];
+            ctl.read_exact(&mut b)?;
+            reattached = u64::from_le_bytes(b) == 1;
+        }
         let n = o.lanes.max(1);
         let mut fallback = None;
         let rdma = match o.want {
@@ -138,7 +224,14 @@ impl RemoteStore {
             Want::Auto => Self::rdma_setup(&mut ctl, o, n, local).map_err(|e| fallback = Some(e.to_string())).ok(),
         };
         let (rdma, lanes) = match rdma {
-            Some((r, ls)) => (Some(r), ls.into_iter().map(|l| Mutex::new(Lane::Rdma(l))).collect()),
+            Some((mut r, ls)) => {
+                if per_seg > 0 {
+                    let (span, segs) = Self::segs_of(&mut ctl)?;
+                    r.span = span;
+                    r.segs = RwLock::new(segs);
+                }
+                (Some(r), ls.into_iter().map(|l| Mutex::new(Lane::Rdma(l))).collect())
+            }
             None => {
                 let mut ls = Vec::new();
                 for _ in 0..n {
@@ -152,19 +245,21 @@ impl RemoteStore {
             }
         };
         Ok(RemoteStore {
-            _ctl: Mutex::new(ctl),
+            ctl: Mutex::new(ctl),
             lanes,
             next: AtomicUsize::new(0),
             transport: if rdma.is_some() { Transport::Rdma } else { Transport::Tcp },
             device: rdma.as_ref().map(|r| (r.dev.name.clone(), r.dev.gid_index)),
             rdma,
             block_bytes: o.block_bytes,
-            blocks: o.blocks,
+            blocks: AtomicU64::new(blocks),
+            per_seg,
             lease_id,
             lease_bytes,
             local,
             server,
             fallback,
+            reattached,
         })
     }
 
@@ -208,7 +303,99 @@ impl RemoteStore {
             };
             l.qp.connect(end, &gid, mtu.min(dev.mtu), dev.max_init_rd_atom.min(rd).max(1), 0, o.qp_timeout)?;
         }
-        Ok((Rdma { dev, pd, raddr: h.a, rkey: h.b as u32, regions: RwLock::new(Vec::new()) }, ls))
+        let segs = RwLock::new(vec![(h.a, h.b as u32)]);
+        Ok((Rdma { dev, pd, span: u64::MAX, segs, regions: RwLock::new(Vec::new()) }, ls))
+    }
+
+    // each segment's (remote address, rkey), registered on the node for this connection's device
+    fn segs_of(ctl: &mut TcpStream) -> io::Result<(u64, Vec<(u64, u32)>)> {
+        Header::new(proto::SEGS, 0, 0, 0).write(ctl)?;
+        let h = proto::reply(ctl)?;
+        let mut b = vec![0u8; h.a as usize * 16];
+        ctl.read_exact(&mut b)?;
+        let segs = b
+            .chunks(16)
+            .map(|c| {
+                (
+                    u64::from_le_bytes(c[0..8].try_into().unwrap()),
+                    u64::from_le_bytes(c[8..16].try_into().unwrap()) as u32,
+                )
+            })
+            .collect();
+        Ok((h.b, segs))
+    }
+
+    /// Blocks in the store now.
+    pub fn blocks(&self) -> u64 {
+        self.blocks.load(Ordering::Acquire)
+    }
+
+    /// Segments in the store now (a group lease).
+    pub fn segs(&self) -> u64 {
+        self.blocks() / self.per_seg.max(1)
+    }
+
+    fn group_only(&self) -> io::Result<()> {
+        if self.per_seg == 0 {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "a fixed lease does not grow or shrink"));
+        }
+        Ok(())
+    }
+
+    /// The group's head: what this cluster wants (segments a rank) and how long ago its coldest blocks were used (ms,
+    /// one age a segment's worth, coldest first: coldest_ages), and the rows a give of 1, 2, ... segments loses
+    /// (quotes: Pool::quote_points). The node answers with a grant or a request to give.
+    pub fn report(&self, want: u64, ages_ms: &[u64], quotes: &[u64]) -> io::Result<Report> {
+        self.group_only()?;
+        let mut ctl = self.ctl.lock().unwrap();
+        let n = ages_ms.len().min(super::server::MAX_AGES as usize);
+        let nq = quotes.len().min(super::server::MAX_AGES as usize);
+        let mut b = Header::new(proto::REPORT, want, n as u64, nq as u64).bytes().to_vec();
+        for a in ages_ms[..n].iter().chain(&quotes[..nq]) {
+            b.extend_from_slice(&a.to_le_bytes());
+        }
+        ctl.write_all(&b)?;
+        let h = proto::reply(&mut *ctl)?;
+        let mut t = [0u8; 8];
+        ctl.read_exact(&mut t)?;
+        Ok(Report { grant: h.a, give: h.b, unclaimed: h.c, txn: u64::from_le_bytes(t) })
+    }
+
+    /// Grows to `segs` segments (each rank, under the transaction `txn` its head's report named). Growing again under
+    /// the same transaction does nothing. Returns the blocks now.
+    pub fn grow(&self, segs: u64, txn: u64) -> io::Result<u64> {
+        self.group_only()?;
+        let mut ctl = self.ctl.lock().unwrap();
+        if segs <= self.segs() {
+            return Ok(self.blocks());
+        }
+        Header::new(proto::GROW, segs, txn, 0).write(&mut *ctl)?;
+        let segs = proto::reply(&mut *ctl)?.a;
+        if let Some(r) = &self.rdma {
+            *r.segs.write().unwrap() = Self::segs_of(&mut ctl)?.1;
+        }
+        self.blocks.store(segs * self.per_seg, Ordering::Release);
+        Ok(segs * self.per_seg)
+    }
+
+    /// Keeps the first `segs` segments and gives the rest back, under the give `txn` its head's report named. Nothing
+    /// may read or write the blocks past them once this is called (the tier moved what it kept below them first:
+    /// stash.rs resize_tier). Returns the blocks now.
+    pub fn shrink(&self, segs: u64, txn: u64) -> io::Result<u64> {
+        self.group_only()?;
+        let mut ctl = self.ctl.lock().unwrap();
+        if segs >= self.segs() {
+            return Ok(self.blocks());
+        }
+        // the node checks every TCP offset and deregisters the segments' regions, so a stray copy fails rather than
+        // reaching memory the node granted to someone else
+        Header::new(proto::SHRINK, segs, txn, 0).write(&mut *ctl)?;
+        proto::reply(&mut *ctl)?;
+        self.blocks.store(segs * self.per_seg, Ordering::Release);
+        if let Some(r) = &self.rdma {
+            r.segs.write().unwrap().truncate(segs as usize);
+        }
+        Ok(self.blocks())
     }
 
     /// Registers `len` bytes at `ptr` with this store's RDMA device, so buffers inside it skip the staging copy. The
@@ -239,7 +426,7 @@ impl RemoteStore {
     }
 
     fn check(&self, block: u64, off: usize, len: usize) -> io::Result<u64> {
-        if block >= self.blocks || off + len > self.block_bytes {
+        if block >= self.blocks() || off + len > self.block_bytes {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "block out of range or too long"));
         }
         Ok(block * self.block_bytes as u64 + off as u64)
@@ -257,7 +444,8 @@ impl RemoteStore {
             Lane::Rdma(l) => {
                 let r = self.rdma.as_ref().expect("an RDMA lane has RDMA");
                 if let Some(k) = self.lkey(buf.as_ptr() as usize, buf.len()) {
-                    return post_wait(l, r, verbs::WR_RDMA_WRITE, &[(off, buf.as_ptr() as u64, buf.len() as u32, k)]);
+                    let (ra, rk) = r.target(off, buf.len())?;
+                    return post_wait(l, verbs::WR_RDMA_WRITE, &[(ra, buf.as_ptr() as u64, buf.len() as u32, k, rk)]);
                 }
                 let k = l.staging_mr.lkey();
                 let mut done = 0;
@@ -265,7 +453,8 @@ impl RemoteStore {
                     let n = (buf.len() - done).min(l.staging.as_slice().len());
                     l.staging.as_mut_slice()[..n].copy_from_slice(&buf[done..done + n]);
                     let p = l.staging.as_slice().as_ptr() as u64;
-                    post_wait(l, r, verbs::WR_RDMA_WRITE, &[(off + done as u64, p, n as u32, k)])?;
+                    let (ra, rk) = r.target(off + done as u64, n)?;
+                    post_wait(l, verbs::WR_RDMA_WRITE, &[(ra, p, n as u32, k, rk)])?;
                     done += n;
                 }
                 Ok(())
@@ -302,15 +491,16 @@ impl RemoteStore {
                 if let Some(k) = self.lkey(out.as_ptr() as usize, out.len()) {
                     let base = out.as_mut_ptr() as u64;
                     let mut at = 0u64;
-                    let ops: Vec<_> = ranges
+                    let ops = ranges
                         .iter()
                         .map(|&(o, n)| {
-                            let op = (o, base + at, n as u32, k);
+                            let (ra, rk) = r.target(o, n)?;
+                            let op = (ra, base + at, n as u32, k, rk);
                             at += n as u64;
-                            op
+                            Ok(op)
                         })
-                        .collect();
-                    return post_wait(l, r, verbs::WR_RDMA_READ, &ops);
+                        .collect::<io::Result<Vec<_>>>()?;
+                    return post_wait(l, verbs::WR_RDMA_READ, &ops);
                 }
                 // in staging-sized batches, each copied out
                 let (cap, k) = (l.staging.as_slice().len(), l.staging_mr.lkey());
@@ -328,11 +518,12 @@ impl RemoteStore {
                 while i < parts.len() {
                     let (mut ops, mut fill) = (Vec::new(), 0usize);
                     while i < parts.len() && fill + parts[i].1 <= cap {
-                        ops.push((parts[i].0, p + fill as u64, parts[i].1 as u32, k));
+                        let (ra, rk) = r.target(parts[i].0, parts[i].1)?;
+                        ops.push((ra, p + fill as u64, parts[i].1 as u32, k, rk));
                         fill += parts[i].1;
                         i += 1;
                     }
-                    post_wait(l, r, verbs::WR_RDMA_READ, &ops)?;
+                    post_wait(l, verbs::WR_RDMA_READ, &ops)?;
                     out[put..put + fill].copy_from_slice(&l.staging.as_slice()[..fill]);
                     put += fill;
                 }
@@ -355,8 +546,12 @@ impl RemoteStore {
         if let (Some(keys), Some(r)) = (keys, self.rdma.as_ref()) {
             let mut g = self.lane();
             if let Lane::Rdma(l) = &mut *g {
-                let v: Vec<_> = ops.iter().zip(&keys).map(|(&(o, p, n), &k)| (o, p as u64, n as u32, k)).collect();
-                return post_wait(l, r, verbs::WR_RDMA_READ, &v);
+                let mut v = Vec::with_capacity(ops.len());
+                for (&(o, p, n), &k) in ops.iter().zip(&keys) {
+                    let (ra, rk) = r.target(o, n)?;
+                    v.push((ra, p as u64, n as u32, k, rk));
+                }
+                return post_wait(l, verbs::WR_RDMA_READ, &v);
             }
         }
         if self.rdma.is_none() {
@@ -386,16 +581,14 @@ impl RemoteStore {
     pub fn raw_read(&self, raddr: u64, rkey: u32, len: usize) -> io::Result<()> {
         let mut g = self.lane();
         let Lane::Rdma(l) = &mut *g else { return Err(io::Error::new(io::ErrorKind::Unsupported, "not RDMA")) };
-        let r = self.rdma.as_ref().expect("RDMA");
         let k = l.staging_mr.lkey();
         let p = l.staging.as_slice().as_ptr() as u64;
-        let fake = Rdma { dev: r.dev.clone(), pd: r.pd.clone(), raddr: 0, rkey, regions: RwLock::new(Vec::new()) };
-        post_wait(l, &fake, verbs::WR_RDMA_READ, &[(raddr, p, len.min(l.staging.as_slice().len()) as u32, k)])
+        post_wait(l, verbs::WR_RDMA_READ, &[(raddr, p, len.min(l.staging.as_slice().len()) as u32, k, rkey)])
     }
 
-    /// (remote address, rkey) of this lease's region on the node.
+    /// (remote address, rkey) of this lease's (first segment's) region on the node.
     pub fn rdma_target(&self) -> Option<(u64, u32)> {
-        self.rdma.as_ref().map(|r| (r.raddr, r.rkey))
+        self.rdma.as_ref().map(|r| r.segs.read().unwrap()[0])
     }
 
     /// `buf.len()` bytes at byte `off` of block `block`: one row of a page block.
@@ -409,9 +602,10 @@ impl RemoteStore {
     }
 }
 
-/// Posts reads or writes of (remote offset, local address, bytes, lkey) on one lane, chained, at most the QP's depth
-/// in flight, and waits for all of them. Each chain signals its last request alone: RC completes a send queue in order.
-fn post_wait(l: &mut RdmaLane, r: &Rdma, opcode: u32, ops: &[(u64, u64, u32, u32)]) -> io::Result<()> {
+/// Posts reads or writes of (remote address, local address, bytes, lkey, rkey) on one lane, chained, at most the QP's
+/// depth in flight, and waits for all of them. Each chain signals its last request alone: RC completes a send queue in
+/// order.
+fn post_wait(l: &mut RdmaLane, opcode: u32, ops: &[(u64, u64, u32, u32, u32)]) -> io::Result<()> {
     if l.broken {
         return Err(io::Error::other("this RDMA lane failed earlier"));
     }
@@ -427,7 +621,7 @@ fn post_wait(l: &mut RdmaLane, r: &Rdma, opcode: u32, ops: &[(u64, u64, u32, u32
             let n = CHAIN.min(depth - inflight).min(ops.len() - next);
             let (wp, sp) = (wrs.as_mut_ptr(), sges.as_mut_ptr());
             for j in 0..n {
-                let (ro, la, len, lkey) = ops[next + j];
+                let (ra, la, len, lkey, rkey) = ops[next + j];
                 let last = j == n - 1;
                 // The driver follows `next` and `sg_list` through these pointers. Writes go through the same pointers.
                 unsafe {
@@ -439,8 +633,8 @@ fn post_wait(l: &mut RdmaLane, r: &Rdma, opcode: u32, ops: &[(u64, u64, u32, u32
                         num_sge: 1,
                         opcode,
                         send_flags: if last { verbs::SEND_SIGNALED } else { 0 },
-                        remote_addr: r.raddr + ro,
-                        rkey: r.rkey,
+                        remote_addr: ra,
+                        rkey,
                         ..SendWr::default()
                     };
                 }
@@ -485,7 +679,7 @@ impl BlockStore for RemoteStore {
         self.block_bytes
     }
     fn blocks(&self) -> u64 {
-        self.blocks
+        RemoteStore::blocks(self)
     }
     fn write_block(&self, block: u64, buf: &[u8]) -> io::Result<()> {
         let off = self.check(block, 0, buf.len())?;
@@ -495,4 +689,31 @@ impl BlockStore for RemoteStore {
         let off = self.check(block, 0, buf.len())?;
         self.read_at_off(off, buf)
     }
+}
+
+/// The ages a head REPORTs: `order` is its tier's entries as (id, blocks) in the order a shrink evicts them (stash.rs
+/// give_order), `age_ms(id)` how long ago an entry was last used, and `free` the tier's free blocks. ages[i] is what
+/// giving i + 1 segments costs: u64::MAX while the free blocks cover it (an empty segment costs nothing, so the node
+/// takes it first and at once, not after the margin), then the age of the most recently used entry among those up to
+/// the one a give that size must evict, so the ages never rise (the head's clock need not agree with the eviction
+/// order). At most `most`.
+pub fn coldest_ages(order: &[(u64, usize)], age_ms: impl Fn(u64) -> u64, per_seg: u64, free: u64, most: usize) -> Vec<u64> {
+    let per = per_seg.max(1);
+    let mut out = Vec::new();
+    while out.len() < most && (out.len() as u64 + 1) * per <= free {
+        out.push(u64::MAX);
+    }
+    // a give of i + 1 segments evicts (i + 1) x per - free blocks: entries count from the free blocks on
+    let mut seen = free;
+    let mut youngest = u64::MAX;
+    for &(id, n) in order {
+        let end = seen + n as u64;
+        youngest = youngest.min(age_ms(id));
+        // every segment boundary i x per_seg in [seen, end) falls in this entry
+        while out.len() < most && (out.len() as u64) * per < end {
+            out.push(youngest);
+        }
+        seen = end;
+    }
+    out
 }

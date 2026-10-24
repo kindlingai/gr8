@@ -168,6 +168,19 @@ public:
         return s;
     }
     void keep_agreed(const std::string& agreed) { Lock l(mu_); g6kv_keep_agreed(p_, agreed.c_str()); }
+    // tier t to `slots` blocks (its store, a group lease, grew or is about to shrink; s2/kv_share.h). false: the tier
+    // refuses. A shrink queues moves into the slots that stay: run io() before the store gives its top back
+    bool resize_tier(uint32_t t, uint64_t slots) {
+        Lock l(mu_); int32_t ok = 0; check(g6kv_tier_resize(p_, t, slots, &ok)); return ok != 0;
+    }
+    // the ages in ms a head reports for tier t: one per per_seg blocks, coldest first, at most `most`
+    std::vector<uint64_t> coldest(uint32_t t, uint64_t per_seg, size_t most) {
+        Lock l(mu_); std::vector<uint64_t> v(most); v.resize(g6kv_tier_coldest(p_, t, per_seg, v.data(), v.size())); return v;
+    }
+    // the rows a give of 1, 2, ... segments loses (g6kv_tier_quotes), what the head reports beside the ages
+    std::vector<uint64_t> quotes(uint32_t t, uint64_t per_seg, size_t most) {
+        Lock l(mu_); std::vector<uint64_t> v(most); v.resize(g6kv_tier_quotes(p_, t, per_seg, v.data(), v.size())); return v;
+    }
     // resize (#153): chunks of pages below place (kvman-rs g6kvman.h). shrink: the chunks now offline, or nothing while
     // the pool must wait for sessions to finish. grow: the chunks back online, after their memory is mapped
     void chunks(uint32_t pages_per_chunk) { Lock l(mu_); check(g6kv_chunks(p_, pages_per_chunk)); }
