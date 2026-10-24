@@ -50,6 +50,12 @@ namespace g6rt
 // promise holds in the batched form (default). The per-session form (G6_S2_ATTN_PERSESSION=1) bakes the layout into its
 // replay entries: it is for runs without graphs only (s2_init refuses it with graphs).
 constexpr bool S2_ATTN_LAYOUT_FREE = true;
+// selected positions per row of a view's index list (Flash: the kpool selection, kvfmt.h)
+#if G6_MODEL_FLASH
+constexpr int S2_SEL = g6kv::SEL;
+#else
+constexpr int S2_SEL = 2048;
+#endif
 
 struct S2Model
 {
@@ -90,6 +96,9 @@ struct S2Model
     std::vector<std::unique_ptr<G6AttnBinding>> views;       // shallow views of a pool binding (never released / reset)
     std::map<std::tuple<int, int, int>, std::unique_ptr<bind::Layer>> L;              // (layer, M, cls)
     __half *hcat = nullptr, *hprev_b = nullptr;              // draft model: [MX][HID], [S2N][HID]
+#if G6_MODEL_FLASH
+    float *hcatn = nullptr, *hprevn_b = nullptr;             // Flash draft model: the FP32 hidden rows, [MX][HID], [S2N][HID]
+#endif
     // remote rows release (rt_rows.cuh), set on the main and the draft model alike: a split run's list is its prefix,
     // rt_window pages below place for the main model's tail (the rows tier maps them, through rt_tail), then the
     // drafter's whole tail above place, so no page of the drafter is one the main model releases. 0 = off
@@ -249,6 +258,10 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         const char* e = getenv("G6_S2_ATTN_PERSESSION");
         s->batch = !(e && atoi(e));
         if (!s->batch && s->graph) die("s2: G6_S2_ATTN_PERSESSION=1 bakes the session layout into replay entries; use it without graphs");
+#if G6_MODEL_FLASH
+        if (!s->batch) die("s2: Flash runs batched attention only (G6_S2_ATTN_PERSESSION=1 is GLM's)");
+        if (m.s2_below) die("s2: Flash has no S2 below R");
+#endif
     }
     s->errs = dmalloc<unsigned*>((size_t)S2N * m.nl);
     s->zero = dmalloc<unsigned>(1);
@@ -258,6 +271,10 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     s->hcat = dmalloc<__half>((size_t)MX * HID);
     s->hprev_b = dmalloc<__half>((size_t)S2N * HID);
     s->last_rows = dmalloc<unsigned>(1);
+#if G6_MODEL_FLASH
+    s->hcatn = dmalloc<float>((size_t)MX * HID);
+    s->hprevn_b = dmalloc<float>((size_t)S2N * HID);
+#endif
     s->sab.assign(m.nl, std::vector<G6AttnBinding*>(S2N, nullptr));
     s->bv.assign(m.nl, nullptr);
     std::vector<const int*> tabs((size_t)S2N * m.nl, nullptr);
@@ -283,9 +300,17 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     }
     else
     {
+#if !G6_MODEL_FLASH
+        // Flash: the sessions share the --cap pool (build_flash), each run at most all of it; the page allocator decides
         if (m.s2_pool_slots < nslots) die("s2: set Model::s2_pool_slots >= the session slots before build");
+#endif
         s->run_pages = m.s2_run_pages;
         s->pool_pages = m.layers[0].ab.args.page_count;
+#if G6_MODEL_FLASH
+        // Flash: the KDA layers have no KV binding; the pool is the DSA layers'
+        for (const Layer& y : m.layers)
+            if (y.ab.storage) { s->pool_pages = y.ab.args.page_count; break; }
+#endif
     }
     // S2 below R: a slot's table spans the layers' tables (a split run past R holds its CP map there, s2_set_exclusive)
     s->table_cap = m.s2_below ? m.layers[0].ab.args.table_size : s->run_pages;
@@ -301,6 +326,9 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     for (int i = 0; i < m.nl; ++i)
     {
         Layer& y = m.layers[i];
+#if G6_MODEL_FLASH
+        if (!y.ab.storage) continue;   // a KDA layer: no pool, views or error word (er stays zero, tabs null)
+#endif
         if ((m.s2_below ? y.ab.args.page_count < s->pool_pages : y.ab.args.page_count != s->pool_pages) || s->pool_pages < s->run_pages)
             die("s2: pool bindings differ or are smaller than one run");
         if (m.s2_below && y.ab.args.table_size != s->table_cap) die("s2: the layers' table sizes differ");
@@ -312,6 +340,10 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         }
         G6AttnBinding* p = &y.ab;
         bytes += p->storage_bytes;
+#if G6_MODEL_FLASH
+        // Flash: batched attention only, so no per-slot view; the rows' tables are the slots'
+        for (int q = 0; q < nslots; ++q) tabs[(size_t)q * m.nl + i] = s->table[q];
+#else
         for (int q = 0; q < nslots; ++q)
         {
             s->views.emplace_back(new G6AttnBinding());
@@ -328,18 +360,19 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
             a.table_size = s->table_cap;
             a.page_count = p->args.page_count;
             a.block_table = s->table[q];
-            a.indices = dmalloc<int>((size_t)MX * 2048);
+            a.indices = dmalloc<int>((size_t)MX * S2_SEL);
             a.output = dmalloc<__half>((size_t)MX * a.heads * 256);
             a.error = dmalloc<unsigned>(1);
-            vbytes += (size_t)MX * 2048 * 4 + (size_t)MX * a.heads * 256 * 2 + 4;
+            vbytes += (size_t)MX * S2_SEL * 4 + (size_t)MX * a.heads * 256 * 2 + 4;
 #if defined(G6_CP) && G6_CP
             a.cp_nr = 0; a.cp_rank = 0;   // S2 below R: replicated path (a no-op on non-CP bindings)
 #endif
-            G6RT_CK(cudaMemset(a.indices, 0xff, (size_t)MX * 2048 * 4));
+            G6RT_CK(cudaMemset(a.indices, 0xff, (size_t)MX * S2_SEL * 4));
             s->sab[i][q] = v;
             tabs[(size_t)q * m.nl + i] = a.block_table;
             if (!s->batch) er[(size_t)q * m.nl + i] = a.error;
         }
+#endif
         if (s->batch)   // the layer's batch view: all rows of a step, output straight into cat, error word of slot 0's entry
         {
             s->views.emplace_back(new G6AttnBinding());
@@ -354,14 +387,18 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
             a.table_size = s->table_cap;
             a.page_count = p->args.page_count;
             a.block_table = s->table[0];   // never read: every row has its own table (G6AttnRow)
-            a.indices = dmalloc<int>((size_t)MX * 2048);
+            a.indices = dmalloc<int>((size_t)MX * S2_SEL);
+#if G6_MODEL_FLASH
+            a.output = p->args.output;     // Flash o_proj reads the layer's own output (flash_dsa.cuh make_dsa)
+#else
             a.output = s->cat;
+#endif
             a.error = dmalloc<unsigned>(1);
-            vbytes += (size_t)MX * 2048 * 4 + 4;
+            vbytes += (size_t)MX * S2_SEL * 4 + 4;
 #if defined(G6_CP) && G6_CP
             a.cp_nr = 0; a.cp_rank = 0;
 #endif
-            G6RT_CK(cudaMemset(a.indices, 0xff, (size_t)MX * 2048 * 4));
+            G6RT_CK(cudaMemset(a.indices, 0xff, (size_t)MX * S2_SEL * 4));
             s->bv[i] = v;
             er[i] = a.error;
 #if defined(G6_CP) && G6_CP
@@ -379,9 +416,9 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
                 G6Attn& ca = c->args;
                 ca.cp_nr = p->args.cp_nr; ca.cp_rank = p->args.cp_rank;
                 ca.index_table = nullptr;      // index keys sit on the rows' tables' pages
-                ca.indices = dmalloc<int>((size_t)MX * 2048);
-                vbytes += (size_t)MX * 2048 * 4;
-                G6RT_CK(cudaMemset(ca.indices, 0xff, (size_t)MX * 2048 * 4));
+                ca.indices = dmalloc<int>((size_t)MX * S2_SEL);
+                vbytes += (size_t)MX * S2_SEL * 4;
+                G6RT_CK(cudaMemset(ca.indices, 0xff, (size_t)MX * S2_SEL * 4));
                 s->cbv[i] = c;
             }
             else if (!s->cbv.empty()) die("s2: CP and non-CP layers in one model");
@@ -420,7 +457,7 @@ inline void s2_reset(Model& m, cudaStream_t st)
     for (auto& v : m.s2->views)
     {
         const G6Attn& a = v->args;
-        G6RT_CK(cudaMemsetAsync(a.indices, 0xff, (size_t)v->max_rows * 2048 * 4, st));
+        G6RT_CK(cudaMemsetAsync(a.indices, 0xff, (size_t)v->max_rows * S2_SEL * 4, st));
         G6RT_CK(cudaMemsetAsync(a.output, 0, (size_t)v->max_rows * a.heads * 256 * 2, st));
         G6RT_CK(cudaMemsetAsync(a.error, 0, 4, st));
     }
@@ -458,7 +495,7 @@ inline void s2_reset_pages(Model& m, const std::vector<int>& list, cudaStream_t 
         const G6Attn& a = p->args;
         k_zero_pages<<<(unsigned)mine.size(), 256, 0, st>>>(s.zero_list, static_cast<uint4*>(a.mla_cache), static_cast<uint4*>(a.index_cache));
         G6RT_CK(cudaGetLastError());
-        G6RT_CK(cudaMemsetAsync(a.indices, 0xff, (size_t)p->max_rows * 2048 * 4, st));
+        G6RT_CK(cudaMemsetAsync(a.indices, 0xff, (size_t)p->max_rows * S2_SEL * 4, st));
         G6RT_CK(cudaMemsetAsync(a.output, 0, (size_t)p->max_rows * a.heads * 256 * 2, st));
         G6RT_CK(cudaMemsetAsync(a.error, 0, 4, st));
     }
@@ -555,11 +592,19 @@ inline void s2_relocate(Model& m, int q, int pages, cudaStream_t st)
 // the draft kept row across the S=1 <-> S2 transitions: S2 keeps it per slot (hprev_b), today's path in Draft::hprev
 inline void s2_hprev_to_solo(Draft& D, int q, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    G6RT_CK(cudaMemcpyAsync(D.hprevn, D.d.s2->hprevn_b + (size_t)q * HID, HID * 4, cudaMemcpyDeviceToDevice, st));
+#else
     G6RT_CK(cudaMemcpyAsync(D.hprev, D.d.s2->hprev_b + (size_t)q * HID, HID * 2, cudaMemcpyDeviceToDevice, st));
+#endif
 }
 inline void s2_hprev_from_solo(Draft& D, int q, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    G6RT_CK(cudaMemcpyAsync(D.d.s2->hprevn_b + (size_t)q * HID, D.hprevn, HID * 4, cudaMemcpyDeviceToDevice, st));
+#else
     G6RT_CK(cudaMemcpyAsync(D.d.s2->hprev_b + (size_t)q * HID, D.hprev, HID * 2, cudaMemcpyDeviceToDevice, st));
+#endif
 }
 
 // the bound layer of the step's row class (A1): today's arguments except the k1 split (split_m = cls) and o_proj's
@@ -699,6 +744,24 @@ inline void s2_attention(Model& m, int i, int M, cudaStream_t st)
 inline void s2_prepare(Model& m, int M, cudaStream_t st)
 {
     S2Model& s = *m.s2;
+#if G6_MODEL_FLASH
+    // Flash: today's bound layers of M rows (no row class) and one replay entry per DSA layer on its batch view; the
+    // step's rows and the kpool indexer inputs as dsa_step has them, the rows' bounds and tables in the batched cell
+    prepare_flash(m, M, st);
+    const int bk = s2_bucket(s);
+    for (int i = 0; i < m.nl; ++i)
+    {
+        if (!s.bv[i]) continue;
+        const auto key = std::make_tuple(bk, i, M);
+        if (s.brp.count(key)) continue;
+        std::unique_ptr<G6AttnReplay> r(new G6AttnReplay());
+        memset(r.get(), 0, sizeof *r);
+        G6AttnStep a = dsa_step(m, M, M);
+        a.s2_batched = 1;
+        G6RT_CK(g6_attn_bind_replay_init(s.bv[i], &a, s.bcells + i, m.bk[bk], r.get(), st));
+        s.brp[key] = std::move(r);
+    }
+#else
     route_ovl_init(m);
     head_for(m, M);
     for (int i = 0; i < m.nl; ++i)
@@ -722,6 +785,7 @@ inline void s2_prepare(Model& m, int M, cudaStream_t st)
             map[key] = std::move(r);
         }
     }
+#endif
 }
 
 inline void s2_launch_cells(Model& m, cudaStream_t st)
@@ -741,16 +805,19 @@ inline StepEnd s2_step_end(Model& m, StepEnd e)
 inline int s2_sessions(const Model& m) { return m.s2->h.ns; }
 // draft model: the eh_proj hidden rows of the step, gathered into hcat. Device-driven (S2In), so a captured graph holds
 // for any layout: output row b of hcat = the main model's x row src0[j] + (b - row0[j]) (first form) or session j's kept
-// row (chain: one row per session). grid MX, one block per row, rows past the step's last row return.
+// row (chain: one row per session). grid MX, one block per row, rows past the step's last row return. T: __half (GLM's x
+// rows), float (Flash's normalized rows, Draft::main_xn / hprevn)
+template <class T>
 struct S2Hid
 {
     const uint32_t* in;
-    __half* hcat;
-    const __half* hprev_b;
-    const __half* main_x;
+    T* hcat;
+    const T* hprev_b;
+    const T* main_x;
     int chain;
 };
-__global__ void __launch_bounds__(256) k_s2_draft_hid(S2Hid a)
+template <class T>
+__global__ void __launch_bounds__(256) k_s2_draft_hid(S2Hid<T> a)
 {
     __shared__ S2In sh;
     const int t = threadIdx.x;
@@ -760,25 +827,36 @@ __global__ void __launch_bounds__(256) k_s2_draft_hid(S2Hid a)
     int j = 0;
     while (j < sh.ns && b >= sh.row0[j] + sh.rows[j]) ++j;
     if (j >= sh.ns) return;
-    const __half* src = a.chain ? a.hprev_b + (size_t)sh.sess[j] * HID : a.main_x + (size_t)(sh.src0[j] + b - sh.row0[j]) * HID;
+    const T* src = a.chain ? a.hprev_b + (size_t)sh.sess[j] * HID : a.main_x + (size_t)(sh.src0[j] + b - sh.row0[j]) * HID;
     const uint4* s4 = reinterpret_cast<const uint4*>(src);
     uint4* d4 = reinterpret_cast<uint4*>(a.hcat + (size_t)b * HID);
-    for (int i = t; i < HID / 8; i += 256) d4[i] = s4[i];
+    for (int i = t; i < HID * (int)sizeof(T) / 16; i += 256) d4[i] = s4[i];
 }
 inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st)
 {
     S2Model& s = *D.d.s2;
-    k_s2_draft_hid<<<MX, 256, 0, st>>>(S2Hid{reinterpret_cast<const uint32_t*>(s.in), s.hcat, s.hprev_b, D.main_x, chain ? 1 : 0});
+    k_s2_draft_hid<<<MX, 256, 0, st>>>(S2Hid<__half>{reinterpret_cast<const uint32_t*>(s.in), s.hcat, s.hprev_b, D.main_x, chain ? 1 : 0});
     return s.hcat;
 }
+#if G6_MODEL_FLASH
+// Flash: the FP32 rows flash_mtp::input reads (the main model's normalized rows, or the session's kept row)
+inline const float* s2_draft_hidn(Draft& D, bool chain, cudaStream_t st)
+{
+    S2Model& s = *D.d.s2;
+    k_s2_draft_hid<<<MX, 256, 0, st>>>(S2Hid<float>{reinterpret_cast<const uint32_t*>(s.in), s.hcatn, s.hprevn_b, D.main_xn, chain ? 1 : 0});
+    return s.hcatn;
+}
+#endif
 // draft model: every session keeps its last row (the next chain step's hidden). grid S2N, block j = the j-th session
+template <class T>
 struct S2Keep
 {
     const uint32_t* in;
-    const __half* x;
-    __half* hprev_b;
+    const T* x;
+    T* hprev_b;
 };
-__global__ void __launch_bounds__(256) k_s2_draft_keep(S2Keep a)
+template <class T>
+__global__ void __launch_bounds__(256) k_s2_draft_keep(S2Keep<T> a)
 {
     __shared__ S2In sh;
     const int t = threadIdx.x;
@@ -788,12 +866,17 @@ __global__ void __launch_bounds__(256) k_s2_draft_keep(S2Keep a)
     if (j >= sh.ns) return;
     const uint4* s4 = reinterpret_cast<const uint4*>(a.x + (size_t)(sh.row0[j] + sh.rows[j] - 1) * HID);
     uint4* d4 = reinterpret_cast<uint4*>(a.hprev_b + (size_t)sh.sess[j] * HID);
-    for (int i = t; i < HID / 8; i += 256) d4[i] = s4[i];
+    for (int i = t; i < HID * (int)sizeof(T) / 16; i += 256) d4[i] = s4[i];
 }
 inline void s2_draft_keep(Draft& D, cudaStream_t st)
 {
     S2Model& s = *D.d.s2;
-    k_s2_draft_keep<<<S2N, 256, 0, st>>>(S2Keep{reinterpret_cast<const uint32_t*>(s.in), D.d.x, s.hprev_b});
+#if G6_MODEL_FLASH
+    // Flash keeps the FP32 normalized row (Draft::hprevn on the solo path)
+    k_s2_draft_keep<<<S2N, 256, 0, st>>>(S2Keep<float>{reinterpret_cast<const uint32_t*>(s.in), D.d.xn, s.hprevn_b});
+#else
+    k_s2_draft_keep<<<S2N, 256, 0, st>>>(S2Keep<__half>{reinterpret_cast<const uint32_t*>(s.in), D.d.x, s.hprev_b});
+#endif
 }
 // G6_MTP_LASTROW (rank.cuh launch_mlp_block): the rows of the step that are their session's last (S2In, device), as the
 // router plan's keep mask. grid 1, block 32

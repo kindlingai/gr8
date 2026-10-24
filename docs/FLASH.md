@@ -57,16 +57,36 @@ Nothing else in the engine limits the context to less than `CAP`:
 - Prefill runs in chunks of 4,096 rows a lane, two lanes, at any context. Decode captures nine buckets, 2048 to 262144
   by doubling, and `CAP`.
 
-With one session `SHARE_LIMIT` (32768) shares nothing: it only sets the `max_tokens` a chat request without one gets,
-`SHARE_LIMIT - 64 - prompt` but at least 8192, capped by the room left.
+With one session (`SESS=1`, the default) `SHARE_LIMIT` (32768) shares nothing: it only sets the `max_tokens` a chat
+request without one gets, `SHARE_LIMIT - 64 - prompt` but at least 8192, capped by the room left. With several (below)
+it also decides which requests share decode steps, as on GLM-5.3: a longer one waits for the others and runs alone.
 
 Prefill time grows faster than the prompt because the indexer scores every earlier key for each row. The time of a
 262K prefill has not been measured. The shim errors a request after 900 s with no output (`--stall-timeout`), and a
 prefill sends none, so a prefill longer than that fails.
 
+## Several sessions
+
+`--sess N` (`SESS`, 2 to 8; the default stays 1) serves up to N requests at once on S2, as GLM-5.3 does: their decode
+rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`).
+
+- KDA state: session q owns slots `q x (MTP + 1)` up to `(q + 1) x (MTP + 1)` (`FlashSlots` in
+  `engine/runtime/s2/flash_ring.h`), reset when a request starts on q. In a main step each session's first row loads its
+  own committed slot (`StepIn::krun`, `Args::src` per row in `engine/kda`), and its verify rows write its own ring, so
+  sessions sharing a step never read each other's state. The engine allocates `SESS x (MTP + 1)` slots.
+- Prefill runs a request alone on its own slots and KV run.
+- Every main and draft width a round can take is captured as a graph per context bucket at boot
+  (`flash_shapes`, `engine/runtime/s2/flash_native.cuh`); a step outside the set is an error, not a capture.
+- A round of every session, `SESS x (MTP + 1)` rows, must fit a step's 32 (`G6_MX`); the launcher and the engine refuse
+  more.
+- With `SESS=1` the engine runs the one-session path as before.
+
+The memory these take (slots and graphs), the speed of shared steps and the output of sessions sharing steps have not
+been measured on Flash yet.
+
 ## Not yet
 
-- Several sessions, CP, prefix reuse and DFlash2: the engine refuses them under `--serve`.
+- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`.
 - MTP drafts beyond the first: the KDA state does not roll back a rejected draft yet, so the launcher runs MTP=1.
 - The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.

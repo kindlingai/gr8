@@ -443,8 +443,11 @@ int main(int argc, char** argv)
         if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
 #if G6_MODEL_FLASH
-    if (s2mode && (s2sess != 1 || reuse_prefix || dfl || plan.rs))
-        die("Flash serve supports one session, no prefix reuse, DFlash or rejection sampling");
+    // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
+    if (s2mode && (reuse_prefix || dfl || plan.rs))
+        die("Flash serve supports no prefix reuse, DFlash or rejection sampling");
+    if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
+        die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
 #endif
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
@@ -956,6 +959,7 @@ int main(int argc, char** argv)
     boot("pack loaded");
 #if G6_MODEL_FLASH
     if (mtp) m.kda_ring = mtp + 1;      // KDA state slots for the verify ring
+    if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
 #endif
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
@@ -1207,6 +1211,16 @@ int main(int argc, char** argv)
         }
         m.s2on = D.d.s2on = false;
     }
+#if G6_MODEL_FLASH
+    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (no S2 below R). The solo graphs below
+    // are captured with s2on off, the batched ones by s2/flash_native.cuh with s2on on
+    if (s2mode && s2sess > 1)
+    {
+        s2_init(m, s2sess, st);
+        s2_init(D.d, s2sess, st);
+        m.s2on = D.d.s2on = false;
+    }
+#endif
     u64 ls0 = 1;
     double pf_ms = 0;
     long pf_rows = 0;
@@ -1415,14 +1429,15 @@ int main(int argc, char** argv)
         g6s2::BootstrapConfig bc;
         auto& sc = bc.scheduler;
         sc.epoch = s2epoch; sc.pool_rows = cap / 64 * 64;
-        sc.max_rows = std::min(MX, std::max(mtp + 1, plan.chunk));
-        sc.max_sessions = 1; sc.mtp = mtp; sc.prefill_rows = MP; sc.two_lanes = two;
+        sc.max_rows = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));   // a round of every session, a prompt chunk
+        sc.max_sessions = s2sess; sc.mtp = mtp; sc.prefill_rows = MP; sc.two_lanes = two;
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = getenv("G6_S2_TIMEOUT") ? (unsigned)atoi(getenv("G6_S2_TIMEOUT")) : 120;
         bc.runtime_signature = "flash solo cap " + std::to_string(cap) + " layers " + layers_s +
             " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
-            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id;
+            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
+            (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string());
         g6s2::FlashContext fc{m, D, FP, FP2, fab, fabd, fabp, fabp2, st, in, in_d, out, out_d,
             [&](int k, int rows) {
                 g6s2::require(k >= 0 && k < m.nbk && rows > 0 && rows <= MX && exec[k][rows], "Flash main graph missing");
@@ -1431,7 +1446,7 @@ int main(int argc, char** argv)
             [&](int k, bool chain, int rows) {
                 g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
-            }};
+            }, gsplit};
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }

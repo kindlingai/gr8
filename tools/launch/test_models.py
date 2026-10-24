@@ -41,10 +41,12 @@ class OptionTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError) as e:
             opt.parse(['--no-config', '--gr8-model', 'glm9'], {})
         self.assertIn('want glm53 or glm53f', str(e.exception))
-        for knob in ('--reuse', '--sess'):
+        for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
+                           (['--sess', '0'], 'serves 1 to 8 sessions'),
+                           (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
             with self.assertRaises(opt.OptionError) as e:
-                opt.engine_plan(flash(knob, '2' if knob == '--sess' else '1'))
-            self.assertIn('GLM-5.3-Flash', str(e.exception))
+                opt.engine_plan(flash(*argv))
+            self.assertIn(want, str(e.exception))
 
     def test_engine_plan(self):
         for tp, peers in (('4', PEERS), ('2', '10.0.0.1,10.0.0.2')):
@@ -73,6 +75,16 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['knobs']['SHARE_LIMIT'], '32768')
             plan = opt.engine_plan(flash('--cap', '131072', peers=peers))
             self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
+
+    def test_sessions(self):
+        # SESS 2..8 share decode steps (each session its own KDA slots); a round of every session fits 32 rows
+        for argv, sess in ((['--sess', '4'], '4'), (['--sess', '8'], '8'), (['--sess', '8', '--mtp', '3'], '8'),
+                           (['--sess', '1', '--mtp', '7'], '1')):
+            plan = opt.engine_plan(flash(*argv))
+            self.assertEqual(plan['knobs']['SESS'], sess)
+            self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], sess)
+            self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
+            self.assertNotIn('--reuse-prefix', plan['args'])
 
     def test_model_counts_in_the_canonical_options(self):
         glm = opt.parse(['--no-config', '--peers', PEERS], {})

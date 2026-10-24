@@ -157,6 +157,8 @@ struct StepIn
 #if G6_MODEL_FLASH
     int kda_src;                      // KDA ring (Model::kda_ring > 1): the slot that holds the committed state
     int kslot[MX];                    // KDA slot of each row (the verify step: row r -> slot r; else kda_src). Zeros = slot 0
+    int krun[MX];                     // KDA ring, several sessions in one step: at a session's first row m > 0, 1 + the
+                                      // slot its state loads from (kda_src is row 0's); 0 = the row carries (Args::src)
 #endif
 };
 struct StepOut
@@ -192,7 +194,7 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
                                          c.steering_scale[i] = sh.steering_scale[i]; }
 #if G6_MODEL_FLASH
     if (c.row_slot) for (int i = t; i < MX; i += 128) c.row_slot[i] = sh.kslot[i];
-    if (c.kda_src && t == 0) *c.kda_src = sh.kda_src;
+    if (c.kda_src) for (int i = t; i < MX; i += 128) c.kda_src[i] = i ? sh.krun[i] - 1 : sh.kda_src;
 #endif
     const int pages = (sh.context + 63) / 64;
     for (int l = t; l < c.nl; l += 128)
@@ -424,8 +426,9 @@ struct Model
     bind::Gv mtp_eh_mx;                   // the MXFP8 eh records (quantized dense) on the fp16 fragments of mtp_cat
     u32* mtp_cat_f = nullptr;
     int* row_slot = nullptr;          // [MX], single-session decode uses slot zero (MTP ring: StepIn::kslot)
-    int* kda_src = nullptr;           // device [1], StepIn::kda_src
+    int* kda_src = nullptr;           // device [MX], Args::src: StepIn::kda_src at row 0, StepIn::krun - 1 after it
     int kda_ring = 0;                 // set before build: > 1 = KDA state slots for the MTP verify ring (--mtp K: K + 1)
+    int kda_sessions = 1;             // set before build: S2 sessions, each with its own kda_ring slots (FlashSlots)
     __half* idx_g = nullptr;
     kda::KdaState kda_st;
     kda::KdaScratch kda_sc;
@@ -1776,11 +1779,6 @@ inline void reset(Model& m, cudaStream_t st)
 inline void launch_step_in(Model& m, cudaStream_t st)
 {
 #if G6_MODEL_FLASH
-    if(m.resid4 || m.flash_draft) {
-#ifdef DEC_S2
-        if(m.s2on) die("Flash mHC: S2 state slots are not integrated yet");
-#endif
-    }
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
                                          m.steering_scale, m.srow, m.cells, m.shared, m.nl, m.row_slot, m.kda_src});
 #else
@@ -2116,6 +2114,9 @@ inline void build_draft_head2(Draft& D, int mode, cudaStream_t st)
 }
 #ifdef DEC_S2
 inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);
+#if G6_MODEL_FLASH
+inline const float* s2_draft_hidn(Draft& D, bool chain, cudaStream_t st);
+#endif
 inline void s2_draft_keep(Draft& D, cudaStream_t st);
 inline int s2_sessions(const Model& m);
 #endif
@@ -2126,9 +2127,11 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
     Model& d = D.d;
 #if G6_MODEL_FLASH
     #ifdef DEC_S2
-    if(d.s2on) die("Flash MTP currently supports single-session decode only");
+    const float* hid=d.s2on?s2_draft_hidn(D,chain,st):chain?D.hprevn:D.main_xn;
+    #else
+    const float* hid=chain?D.hprevn:D.main_xn;
     #endif
-    flash_mtp::input(d.tok,d.pos,d.emb,D.enorm,D.hnorm,chain?D.hprevn:D.main_xn,d.mtp_cat,M,st);
+    flash_mtp::input(d.tok,d.pos,d.emb,D.enorm,D.hnorm,hid,d.mtp_cat,M,st);
     if(d.mtp_eh) flash_mlp::k_linear<<<dim3((HID+7)/8,M),256,0,st>>>(d.mtp_cat,d.mtp_eh,d.resid,2*HID,HID);
     else {
         flash_mhc::fragments(d.mtp_cat,M,2*HID,d.mtp_cat_f,nullptr,st);
@@ -2166,11 +2169,11 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
 }
 inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
 {
-#if G6_MODEL_FLASH
-    G6RT_CK(cudaMemcpyAsync(D.hprevn,D.d.xn+(size_t)(M-1)*HID,HID*sizeof(float),cudaMemcpyDeviceToDevice,st));
-#endif
 #ifdef DEC_S2
     if (D.d.s2on) { s2_draft_keep(D, st); return; }
+#endif
+#if G6_MODEL_FLASH
+    G6RT_CK(cudaMemcpyAsync(D.hprevn,D.d.xn+(size_t)(M-1)*HID,HID*sizeof(float),cudaMemcpyDeviceToDevice,st));
 #endif
     k_mtp_keep<<<1, 256, 0, st>>>(D.d.x + (size_t)(M - 1) * HID, D.hprev);
 }
