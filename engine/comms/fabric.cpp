@@ -175,7 +175,7 @@ void check_qp_mtu(ibv_qp* qp, const Rail& R, const QPInfo& peer, ibv_mtu selecte
 // bulk ranges ahead of their flags. Writes of up to kRelayInline bytes (the bulk flags) travel inside the SEND.
 struct RelayHdr { uint64_t off, pos; uint32_t len, kind; };   // kind 0: len bytes at ring position pos; 1: inline
 constexpr int kRelayRecv = 4096, kRelayBuf = 64, kRelayInline = kRelayBuf - (int)sizeof(RelayHdr);
-struct RingInfo { QPInfo dn, dp, orq, ri, fwd, fin; };        // my QPs; addr/rkey = where the paired QP writes
+struct RingInfo { QPInfo dn, dp, orq, ri, fwd, fin, dn2, dp2; };  // dn2/dp2: TP=3 stripe QPs (other PCIe root)        // my QPs; addr/rkey = where the paired QP writes
 struct RelayCtx {
   ibv_qp* ri = nullptr; ibv_cq* ri_cq = nullptr; ibv_qp* fwd = nullptr; ibv_cq* fwd_cq = nullptr;
   char* rbuf = nullptr; char* ring = nullptr; uint32_t ring_lkey = 0;
@@ -298,7 +298,7 @@ struct Fabric::Impl {
   Rail rails[4];
   std::vector<ibv_qp*> qp;
   std::vector<QPInfo> peer;  // peer[p] = p's QP toward me (its addr/rkey are for its recv region)
-  bool stripe = false;       // FabricConfig::stripe_min > 0 and two rails: qp2[p] on the other rail (1 - rail_of(p))
+  bool stripe = false;       // FabricConfig::stripe_min > 0 and two rails: qp2[p] on the other rail (rail2_of(p))
   std::vector<ibv_qp*> qp2;
   std::vector<QPInfo> peer2;
   char* region = nullptr; size_t region_bytes = 0;  // one pinned region: send | recv | doorbell | error
@@ -315,6 +315,9 @@ struct Fabric::Impl {
   std::atomic<int> proxy_tid{0};                     // thread id of the running proxy, registered with progress_cpus.h (0 = none)
   std::atomic<bool> proxy_started{false};            // the proxy thread has pinned itself and registered its tid
   int rail_of(int p, int me) const { return ring ? ring_rail[p] : nrails == 1 ? 0 : (p + me) % 2; }
+  // the stripe QP's rail: the other rail (two-rail), or at a three-rank ring the same port's device on the other PCIe
+  // root (rails 2 / 3, the TP=4 relay devices), so the two halves of a write take separate PCIe x4 links
+  int rail2_of(int p, int me) const { return ring ? ring_rail[p] + 2 : 1 - rail_of(p, me); }
   // ring mode: rails[0] direct-next, [1] direct-prev, [2] relay-out (also carries the diagonal's QP), [3] relay-in
   bool ring = false; int nxt = -1, prv = -1, dia = -1; int ring_rail[8] = {};
   RelayCtx relay;
@@ -376,6 +379,7 @@ struct Fabric::Impl {
   int bump = 1;                                      // barrier port rotation (per fabric: groups run their own barriers)
   std::thread xquit;                                 // G6_XTRACE_QUIT watcher
   void wc_count(int r, int peer, int st) {
+    if (r > 1) r -= 2;                               // ring stripe rails 2 / 3 count with the port's direct rail
     if (peer < 0 || peer >= 8 || r < 0 || r > 1) return;
     xwc[r][peer][st == IBV_WC_RETRY_EXC_ERR ? 0 : st == IBV_WC_RNR_RETRY_EXC_ERR ? 1 : 2]++;
   }
@@ -507,12 +511,15 @@ void Fabric::init(const FabricConfig& cfg) {
     const int me = cfg.rank;
     I.ring = true; I.nxt = (me + 1) % nr; I.prv = (me + nr - 1) % nr; I.dia = nr == 4 ? (me + 2) % nr : -1;
     I.ring_rail[I.nxt] = 0; I.ring_rail[I.prv] = 1; if (I.dia >= 0) I.ring_rail[I.dia] = 2;
-    I.nrails = nr == 4 ? 3 : 2;                         // the rails whose CQs the proxy polls
+    // TP=3: both directs sit on one PCIe root (one x4 link carries both peers' traffic). With stripe_min set, a second
+    // QP per neighbour on the same port's device on the other root carries half of each large write (rail2_of).
+    const bool rstripe = nr == 3 && cfg.stripe_min > 0 && !I.var && !I.bulk;
+    I.nrails = nr == 4 ? 3 : rstripe ? 4 : 2;           // the rails whose CQs the proxy polls
     const std::vector<std::string> dn = cfg.ring_devs.empty()
         ? std::vector<std::string>{"rocep1s0f0", "roceP2p1s0f0", "rocep1s0f1", "roceP2p1s0f1"} : cfg.ring_devs;
     FCHECK(dn.size() == 4);
     const int map[4] = {2, 0, 3, 1};                    // ring_devs order -> rails index
-    const int nopen = nr == 4 ? 4 : 2;
+    const int nopen = nr == 4 || rstripe ? 4 : 2;
     for (int k = 0; k < 4; k++) {
       const int r = map[k]; if (r >= nopen) continue;
       Rail& R = I.rails[r]; R.di.dev = dn[k]; R.di.gid_index = ring_gid_index(dn[k]); FCHECK(R.di.gid_index >= 0);
@@ -556,6 +563,13 @@ void Fabric::init(const FabricConfig& cfg) {
     ibv_qp* qdp = mkqp(I.rails[1], nullptr, 2048, 1, 1, inl, nullptr);
     mi.dn = info(qdn, I.rails[0], I.rails[0].mr->rkey, recv, 1);
     mi.dp = info(qdp, I.rails[1], I.rails[1].mr->rkey, recv, 2);
+    ibv_qp *qdn2 = nullptr, *qdp2 = nullptr;
+    if (rstripe) {
+      qdn2 = mkqp(I.rails[2], nullptr, 2048, 1, 1, inl, nullptr);
+      qdp2 = mkqp(I.rails[3], nullptr, 2048, 1, 1, inl, nullptr);
+      mi.dn2 = info(qdn2, I.rails[2], I.rails[2].mr->rkey, recv, 7);
+      mi.dp2 = info(qdp2, I.rails[3], I.rails[3].mr->rkey, recv, 8);
+    }
     ibv_qp *qor = nullptr, *qri = nullptr, *qfwd = nullptr, *qfin = nullptr;
     RelayCtx& X = I.relay;
     if (I.dia >= 0) {
@@ -598,6 +612,14 @@ void Fabric::init(const FabricConfig& cfg) {
     const RingInfo* A = (const RingInfo*)all.data();
     connect(qdn, I.rails[0], mi.dn, A[I.nxt].dp); I.qp[I.nxt] = qdn; I.peer[I.nxt] = A[I.nxt].dp;
     connect(qdp, I.rails[1], mi.dp, A[I.prv].dn); I.qp[I.prv] = qdp; I.peer[I.prv] = A[I.prv].dn;
+    if (rstripe) {
+      I.qp2.assign(nr, nullptr); I.peer2.resize(nr);
+      connect(qdn2, I.rails[2], mi.dn2, A[I.nxt].dp2); I.qp2[I.nxt] = qdn2; I.peer2[I.nxt] = A[I.nxt].dp2;
+      connect(qdp2, I.rails[3], mi.dp2, A[I.prv].dn2); I.qp2[I.prv] = qdp2; I.peer2[I.prv] = A[I.prv].dn2;
+      I.stripe = true;
+      fprintf(stderr, "[fabric r%d port %d] ring stripe: writes >= %zu B split over %s+%s (next) and %s+%s (prev)\n", me, cfg.port,
+              cfg.stripe_min, I.rails[0].di.dev.c_str(), I.rails[2].di.dev.c_str(), I.rails[1].di.dev.c_str(), I.rails[3].di.dev.c_str());
+    }
     if (I.dia >= 0) {
       connect(qor, I.rails[2], mi.orq, A[I.nxt].ri); I.qp[I.dia] = qor; I.peer[I.dia] = A[I.nxt].ri;
       connect(qri, I.rails[3], mi.ri, A[I.prv].orq);
@@ -826,7 +848,7 @@ void Fabric::start_proxy() {
     auto stripe_write = [&](int p, char* sp, uint32_t nb, size_t roff, uint64_t* xr) -> bool {
       const uint32_t h = (nb / 2) & ~4095u;
       Rail& R = I.rails[I.rail_of(p, me)];
-      Rail& R2 = I.rails[1 - I.rail_of(p, me)];
+      Rail& R2 = I.rails[I.rail2_of(p, me)];
       const uint64_t tag = 0x100u + (uint64_t)p;        // wc_count ignores peer ids >= 8
       ibv_send_wr* bad = nullptr;
       ibv_sge s1{(uint64_t)sp, h, R2.mr->lkey};
@@ -840,7 +862,7 @@ void Fabric::start_proxy() {
       if (xr) { xr[2] = xr[6] = xt_tick(); }
       FCHECK(ibv_post_send(I.qp2[p], &w1, &bad) == 0);
       FCHECK(ibv_post_send(I.qp[p], &w2, &bad) == 0);
-      const int r2 = 1 - I.rail_of(p, me);
+      const int r2 = I.rail2_of(p, me);
       const auto t0 = std::chrono::steady_clock::now();
       for (bool done = false; !done;) {
         ibv_wc wc[32]; const int n = ibv_poll_cq(R2.cq, 32, wc);
