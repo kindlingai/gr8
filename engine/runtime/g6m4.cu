@@ -22,6 +22,8 @@
 //      [--v2-dense-form trellis|rounded]  trellis (default): q_b, o_proj and the dense MLP stored as trellis stay the
 //                     release's entries for the dense trellis kernels (kernels/dtr.cuh). rounded: the fallback, which
 //                     rounds them to the MXFP8 and int4 forms of a converted pack (not the release's weights)
+//      [--layout FILE]  with --v2-dense: the pieces each rank holds come from a layout file (bin/g6layout,
+//                     engine/loader-rs/src/layout.rs) instead of the formulas
 //      [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234] [--cap 64] [--chunk 4]
 //      [--graph]      one captured graph per row count instead of plain launches (same lines)
 //      [--prefill MP] every prompt token but the last goes through the prefill path in sub-batches of up to MP rows,
@@ -258,7 +260,7 @@ int main(int argc, char** argv)
     const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
     std::vector<std::string>& prompts = co.prompts;
     v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
-    v2src.trellis = co.v2_trellis;
+    v2src.trellis = co.v2_trellis; v2src.layout = co.v2_layout;
     if (co.n_gen) plan.n_gen = *co.n_gen;          // Plan owns these defaults; apply only what the command line set
     if (co.seed) plan.seed = *co.seed;
     if (co.chunk) plan.chunk = *co.chunk;
@@ -274,6 +276,7 @@ int main(int argc, char** argv)
         die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
     if (release && (!manifest.empty() || !packfile.empty() || v2src.dir.empty()))
         die("--v2-dense replaces --manifest / --pack and needs --v2 (the image comes from the release alone)");
+    if (!release && !v2src.layout.empty()) die("--layout needs --v2-dense (it places the release's pieces)");
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
 #if G6_MODEL_FLASH

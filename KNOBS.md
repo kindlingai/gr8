@@ -25,7 +25,7 @@ set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box c
 
 The defaults in the launch table come from `scripts/engine_args.sh`, which the supervisor reads. Every TP runs the multi-session engine (`--serve`). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
 `V2_WIDTHS` are paths, so each box may have its own. The handshake compares the variant's name and the sha256 of its
-manifest instead.
+manifest instead. `LAYOUT` is a path too: the handshake compares the sha256 of the file.
 
 ## Launch
 
@@ -131,6 +131,7 @@ manifest instead.
 | `MODEL` | `--model` | none | box | the exlr8 release: `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`), or a local copy of it (`dense/`, `experts/`, `index-slices/`, `manifests/`, the tokenizer files) used in place, on a local disk or a shared mount such as NFS. The engine plans every rank's weights from the release's files (`V2_DENSE`) |
 | `V2_DENSE` | `--v2-dense` | the release | box | the exlr8 release directory whose `dense/` files give every non-expert weight (`g6m4 --v2-dense`) |
 | `V2_DENSE_FORM` | `--v2-dense-form` | `trellis` | cluster | with `V2_DENSE`: `trellis` keeps q_b, o_proj and the dense MLP as the release's trellis entries for the dense trellis kernels, so the weights are the release's own. `rounded` is the fallback: it rounds them to the MXFP8 and int4 forms of a converted pack |
+| `LAYOUT` | `--layout` | the formulas | box | experimental. With `V2_DENSE`: a layout file that says which pieces each rank holds (`bin/g6layout`, `engine/loader-rs/src/layout.rs`). Rank r holds what the layout gives its r-th member, so list `PEERS` in the layout's member order. `bin/g6layout plan` makes one from the current layout, keeping each box's pieces where it can. Needs a local copy of the release (`--model DIR`) with every rank's index slices at the target TP (`index-slices/tp<N>/k<K>/rank*.safetensors`): a box reads the slice rows of halves the formulas give other ranks, and its cache holds only its own rank's. GLM 5.3 only: GLM-5.3-Flash plans the formulas |
 | `DRAFTER` | `--drafter` | none | box | TP=4: the DFlash2 drafter's repo, `https://huggingface.co/incoai/GLM-5.3-DFlash2`. Each box fetches it and converts its rank into `MODEL_CACHE`. Its repo and commit go into the id the boxes compare |
 | `DFLASH_DIR` | `--dflash-dir` | none | box | a directory holding `dflash.r<r>.*`, when it is not the model set's |
 | `RANK` | `--rank` | none | run | `prepare`: the rank to fetch, when this box cannot tell (mentat mode) |

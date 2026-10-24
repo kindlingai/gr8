@@ -5,7 +5,10 @@ rules (tools/convert/plan.py). Every non-expert tensor must match byte for byte,
 exactly the names a converted pack has, less the ones no engine path reads.
 
     python3 engine/loader-rs/tests/release_check.py --release DIR --widths FILE --ref EXLR8_REPO \
-        --dump engine/loader-rs/target/release/g6plandump --tp 4 --ranks 0,1,2,3 --layers 0,3,4,6,78 [--qo]
+        --dump engine/loader-rs/target/release/g6plandump --tp 4 --ranks 0,1,2,3 --layers 0,3,4,6,78 [--qo] [--layout FILE]
+
+--layout plans the ranks from a layout file (bin/g6layout) and takes each rank's heads and dense blocks from it, in
+ascending order, instead of the converter's ownership rules.
 
 Run from the repo root. Needs torch and NumPy.
 """
@@ -58,11 +61,23 @@ def bf16(w):
     return torch.from_numpy(np.ascontiguousarray(w, np.float32)).to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
 
 
+def rows_of(pieces, n):
+    """The rows (or columns) of pieces of n channels each, in piece order."""
+    return np.concatenate([np.arange(p * n, (p + 1) * n) for p in pieces])
+
+
 class Expect:
     """The tensors one rank's image should hold, layer by layer, from the reference decode."""
 
-    def __init__(self, X, release, r, trellis):
-        self.X, self.release, self.r, self.trellis = X, release, r, trellis
+    def __init__(self, X, release, r, trellis, layout=None):
+        self.X, self.release, self.r, self.trellis, self.layout = X, release, r, trellis, layout
+
+    def owned(self, key, rule):
+        """The rank's pieces of a layout group, or the converter's (first, count) chunk."""
+        if self.layout:
+            return [i for i, o in enumerate(self.layout['groups'][key]) if o == self.r]
+        a, n = rule
+        return list(range(a, a + n))
 
     def layer(self, l, qo=False):
         X, r = self.X, self.r
@@ -71,7 +86,7 @@ class Expect:
         raw = lambda m, s: np_of(f.get(f'{m}.{s}'))
         dec = lambda m: X.decode_dense(rec[m], {s: f.get(f'{m}.{s}') for s in X.DATA[int(rec[m][0])]}).numpy()
         P, mtp = f'L{l:03d}', l == plan.L_MTP
-        h0, nh = plan.heads(l)[r]
+        heads = self.owned(f'heads {l}', plan.heads(l)[r])
         T = {}
 
         def mx_copy(name, m, gv=True, copy=True):
@@ -96,7 +111,7 @@ class Expect:
         def entries(name, m, ch):
             """the dense trellis kernels' form: the rank's entries as stored, suh / svh sliced on the sharded side"""
             side = int(rec[m][4])
-            T[f'{P}.{name}.trellis'] = raw(m, 'trellis')[ch.start // 128:ch.stop // 128]
+            T[f'{P}.{name}.trellis'] = raw(m, 'trellis')[ch[::128] // 128]
             T[f'{P}.{name}.suh'] = raw(m, 'suh')[ch] if side == X.IN else raw(m, 'suh')
             T[f'{P}.{name}.svh'] = raw(m, 'svh') if side == X.IN else raw(m, 'svh')[ch]
         tr = lambda m: self.trellis and int(rec[m][0]) == X.TRELLIS
@@ -106,23 +121,24 @@ class Expect:
         mx_copy('kv_a', 'self_attn.kv_a_proj_with_mqa')
         vec('kv_a_norm', 'self_attn.kv_a_layernorm.weight')
         qb = dec('self_attn.q_b_proj')
-        heads = slice(h0 * 256, (h0 + nh) * 256)
+        hrows = rows_of(heads, 256)
         if tr('self_attn.q_b_proj'):
-            entries('q_b', 'self_attn.q_b_proj', heads)
+            entries('q_b', 'self_attn.q_b_proj', hrows)
         else:
-            mx_round('q_b', qb[heads], True)
+            mx_round('q_b', qb[hrows], True)
             if int(rec['self_attn.q_b_proj'][0]) == X.INT4:
-                T[f'{P}.q_b.gptq'] = g6ref.rt_record(g6ref.RT('int4'), raw('self_attn.q_b_proj', 'q4')[heads],
-                                                     raw('self_attn.q_b_proj', 's4')[heads])
+                T[f'{P}.q_b.gptq'] = g6ref.rt_record(g6ref.RT('int4'), raw('self_attn.q_b_proj', 'q4')[hrows],
+                                                     raw('self_attn.q_b_proj', 's4')[hrows])
         kvb = bf16(dec('self_attn.kv_b_proj')).reshape(64, 448, 512)
-        T[f'{P}.kv_b.uk'], T[f'{P}.kv_b.uv'] = kvb[h0:h0 + nh, :192], kvb[h0:h0 + nh, 192:]
-        op = dec('self_attn.o_proj')[:, heads]
+        T[f'{P}.kv_b.uk'], T[f'{P}.kv_b.uv'] = kvb[heads, :192], kvb[heads, 192:]
+        op = dec('self_attn.o_proj')[:, hrows]
         if tr('self_attn.o_proj'):
-            entries('o_proj', 'self_attn.o_proj', heads)
+            entries('o_proj', 'self_attn.o_proj', hrows)
         elif not mtp:
             if int(rec['self_attn.o_proj'][0]) == X.INT4:   # the release's own codes, side-2 storage transposed back
-                q4 = raw('self_attn.o_proj', 'q4')[2 * h0:2 * (h0 + nh)].transpose(1, 0, 2).reshape(H, -1)
-                s4 = raw('self_attn.o_proj', 's4')[2 * h0:2 * (h0 + nh)].transpose(1, 0, 2).reshape(H, -1)
+                blk = rows_of(heads, 2)                       # two 128-input blocks a head
+                q4 = raw('self_attn.o_proj', 'q4')[blk].transpose(1, 0, 2).reshape(H, -1)
+                s4 = raw('self_attn.o_proj', 's4')[blk].transpose(1, 0, 2).reshape(H, -1)
             else:
                 q4, s4 = int4_quantize(op)
             T[f'{P}.o_proj.gptq'] = g6ref.rt_record(g6ref.RT('int4'), q4, s4)
@@ -139,13 +155,13 @@ class Expect:
             with_gv('router.w', dec('mlp.gate'))
             vec('router.bias', 'mlp.gate.e_score_correction_bias')
         else:
-            g0, ng = plan.dense_groups(l)[r]
-            a, b = g0 * 32, (g0 + ng) * 32
+            g0, ng = plan.dense_groups(l)[r]                  # g32 groups, four to a 128-channel block
+            ch = rows_of(self.owned(f'dense {l}', (g0 // 4, ng // 4)), 128)
         if not plan.is_moe(l) and all(tr(f'mlp.{n}_proj') for n in ('gate', 'up', 'down')):
             for n in ('gate', 'up', 'down'):
-                entries(f'dense.{n}', f'mlp.{n}_proj', slice(a, b))
+                entries(f'dense.{n}', f'mlp.{n}_proj', ch)
         elif not plan.is_moe(l):
-            g, u, d = dec('mlp.gate_proj')[a:b], dec('mlp.up_proj')[a:b], dec('mlp.down_proj')[:, a:b]
+            g, u, d = dec('mlp.gate_proj')[ch], dec('mlp.up_proj')[ch], dec('mlp.down_proj')[:, ch]
             f1, f2 = g6ref.rt_expert_record(g6ref.RT('int4'), *int4_quantize(g), *int4_quantize(u), *int4_quantize(d))
             T[f'{P}.dense.gptq.fc1'], T[f'{P}.dense.gptq.fc2'] = f1, f2
             for n, w in (('gate', g), ('up', u), ('down', d)):
@@ -242,6 +258,7 @@ def main():
     ap.add_argument('--no-experts', action='store_true', help='dense-only check: do not materialize expert payloads')
     ap.add_argument('--qo', action='store_true', help='plan and check the G6_PF_OWN=3 full-head tensors too')
     ap.add_argument('--rounded', action='store_true', help='plan and check the rounded form of the trellis matrices')
+    ap.add_argument('--layout', help='plan the ranks from this layout file (bin/g6layout)')
     ap.add_argument('--work', default='/tmp/release-check')
     a = ap.parse_args()
     sys.path.insert(0, a.ref)
@@ -250,6 +267,12 @@ def main():
     flash = int(json.load(open(a.widths)).get('hidden_size', 6144)) == 4096
     os.makedirs(a.work, exist_ok=True)
     layers = [int(x) for x in a.layers.split(',')]
+    layout = None
+    if a.layout and flash:
+        sys.exit('--layout: GLM-5.3-Flash plans the formulas only')
+    if a.layout:
+        with open(a.layout) as f:
+            layout = json.load(f)
     fails, n_t, n_b = [], 0, 0
     for r in [int(x) for x in a.ranks.split(',')]:
         out = os.path.join(a.work, f'tp{a.tp}.r{r}.safetensors')
@@ -257,10 +280,10 @@ def main():
         subprocess.run([a.dump, rel, os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'), a.widths, str(a.tp),
                         str(r), out, '--layers', a.layers] + ([] if a.no_experts else ['--experts']) + ([] if a.no_globals else ['--globals'])
                        + (['--partial'] if a.partial else []) + (['--qo'] if a.qo else [])
-                       + (['--rounded'] if a.rounded else []),
+                       + (['--rounded'] if a.rounded else []) + (['--layout', a.layout] if a.layout else []),
                        check=True, stderr=subprocess.DEVNULL)
         got = X.SafeFile(out)
-        e = (FlashExpect if flash else Expect)(X, a.release, r, not a.rounded)
+        e = FlashExpect(X, a.release, r, not a.rounded) if flash else Expect(X, a.release, r, not a.rounded, layout)
         want = {} if a.no_globals else e.globals()
         for l in layers:
             want.update(e.layer(l, a.qo))

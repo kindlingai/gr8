@@ -57,7 +57,8 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
 | the rank health probe | anywhere | `python3 -m unittest discover tools/health` |
 | the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |
-| a rank image planned from the release (`--v2-dense`) against an independent derivation | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py` |
+| a rank image planned from the release (`--v2-dense`) against an independent derivation, from the formulas or a layout file | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py`, with `--layout FILE` for a layout |
+| the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved | anywhere | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
 | m4sim from the release against a PyTorch forward of the same weights | one GB10, transformers with `glm_moe_dsa` | `engine/ref/release_forward.py` |
 | the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`) | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
 | the launch end to end (four supervisors, stub engines) | Linux (it needs 127.0.0.2-4) | the line above runs it, and skips it elsewhere |
