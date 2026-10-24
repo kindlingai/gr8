@@ -177,6 +177,10 @@ public:
     std::vector<uint64_t> coldest(uint32_t t, uint64_t per_seg, size_t most) {
         Lock l(mu_); std::vector<uint64_t> v(most); v.resize(g6kv_tier_coldest(p_, t, per_seg, v.data(), v.size())); return v;
     }
+    // the rows a give of 1, 2, ... segments loses (g6kv_tier_quotes), what the head reports beside the ages
+    std::vector<uint64_t> quotes(uint32_t t, uint64_t per_seg, size_t most) {
+        Lock l(mu_); std::vector<uint64_t> v(most); v.resize(g6kv_tier_quotes(p_, t, per_seg, v.data(), v.size())); return v;
+    }
     // resize (#153): chunks of pages below place (kvman-rs g6kvman.h). shrink: the chunks now offline, or nothing while
     // the pool must wait for sessions to finish. grow: the chunks back online, after their memory is mapped
     void chunks(uint32_t pages_per_chunk) { Lock l(mu_); check(g6kv_chunks(p_, pages_per_chunk)); }

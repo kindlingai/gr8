@@ -178,6 +178,8 @@ int g6kv_tier_resize(g6kv_pool* p, uint32_t t, uint64_t slots, int32_t* resized)
 // the ages in ms of tier t's coldest blocks, one per per_seg blocks, coldest first (what a head reports). Returns how
 // many it wrote, at most cap.
 size_t g6kv_tier_coldest(g6kv_pool* p, uint32_t t, uint64_t per_seg, uint64_t* out, size_t cap);
+// out[i] = the rows a give of i + 1 segments of per_seg blocks loses (UINT64_MAX = the tier refuses it); returns how many
+size_t g6kv_tier_quotes(g6kv_pool* p, uint32_t t, uint64_t per_seg, uint64_t* out, size_t cap);
 // keeps the entries the agreed text lists (the head's intersection of every rank's summary), in its order
 void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 
@@ -252,7 +254,9 @@ struct g6kv_report
     uint64_t txn;   // the transaction every rank names in g6kv_store_grow / g6kv_store_shrink; 0 = nothing to do
 };
 // rank 0 only: want = segments more per rank (0 = none), ages = g6kv_tier_coldest's
-int g6kv_store_report(const g6kv_tier* t, uint64_t want, const uint64_t* ages, size_t n, g6kv_report* out);
+// quotes = g6kv_tier_quotes's (the rows a give of 1, 2, ... segments loses; the node shows them in STATS)
+int g6kv_store_report(const g6kv_tier* t, uint64_t want, const uint64_t* ages, size_t n, const uint64_t* quotes,
+                      size_t nq, g6kv_report* out);
 // grow to segs segments / shrink to segs segments, under the report's transaction txn; the store's blocks after it in
 // *blocks (or NULL). 0; G6KV_STORE_REFUSED: the node refused (a transaction no longer open, or no room), every rank
 // alike, and the store keeps its size; -1 with g6kv_tier_error: a fault

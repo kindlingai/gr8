@@ -198,7 +198,13 @@ fn random_traces(resize: bool, seeds: std::ops::RangeInclusive<u64>) -> u64 {
                 let t = rng.range(0, tiers.len() as u64 - 1) as usize;
                 let old = ranks[0].pool.tier_stats(t).unwrap().slots;
                 let to = rng.range(1, old * 2);
+                // the points a head reports: a give of i segments (of 1 block here) quotes the rows that resize loses
+                let points = ranks[0].pool.quote_points(t, 1, 3);
                 let s = ranks[0].pool.stash().unwrap();
+                for (i, p) in points.iter().enumerate() {
+                    let q = (old > i as u64).then(|| s.quote_resize(t, old - i as u64 - 1)).flatten();
+                    assert_eq!(*p, q.map_or(u64::MAX, |q| q.lost_rows), "seed {seed}: quote point {i}");
+                }
                 let q = s.quote_resize(t, to).expect("a tier with no index resizes");
                 let ids = |s: &g6kvman::stash::Stash, only: Option<usize>| -> Vec<u64> {
                     (0..tiers.len()).filter(|x| only.is_none_or(|o| o == *x)).flat_map(|x| s.entries(x).iter().map(|e| e.id)).collect()

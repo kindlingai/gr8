@@ -469,7 +469,12 @@ moves between groups by whole segments (server.rs):
   (s2/kv_share.h `share_want`: room for an entry too big for the tier, the pages the tier pushed out since the last
   report, or the next spill) and the ages of its coldest blocks, one per segment, in the order a shrink evicts
   (`coldest_ages`). A segment the tier holds empty reports as u64::MAX, so the node takes empty segments first and at
-  once.
+  once. Beside the ages it sends resize quotes (`Pool::quote_points`, `g6kv_tier_quotes`): for a give of 1, 2, ...
+  segments, the rows that no tier keeps after it, which requests compute again (u64::MAX: the tier would refuse that
+  shrink). A quote is a dry run of the shrink on a copy of the stash (`Stash::quote_resize`: the entries that leave
+  the tier in eviction order, the entries lost, their rows and blocks, the blocks a later tier takes), and
+  `apply_resize_plan` does the shrink only when a fresh quote still equals it. The node keeps the last quotes per group
+  and shows them in STATS (`quote_rows`); it still picks the group to give by its ages (D-331 M6 step 1).
 - The node answers with a grant or a give, as a transaction: an id and an absolute target in segments a rank. The head
   announces it as a Resize event, and every rank applies it at that one point of the call sequence with the id
   (`GROW target txn`, `SHRINK target txn`). A GROW or SHRINK under any id but the group's open one is refused

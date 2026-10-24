@@ -929,6 +929,22 @@ pub unsafe extern "C" fn g6kv_tier_resize(p: *mut Pool, t: u32, slots: u64, resi
     }
 }
 
+/// The resize quotes a head reports (g6kv_store_report): out[i] = the rows a give of i + 1 segments of `per_seg` blocks
+/// loses (Pool::quote_points; u64::MAX = the tier would refuse it). Writes up to `cap` and returns how many.
+///
+/// # Safety
+/// `p` must be a live pool and `out` hold `cap` values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_quotes(p: *mut Pool, t: u32, per_seg: u64, out: *mut u64, cap: usize) -> usize {
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let a = (*p).quote_points(t as usize, per_seg, cap);
+    let n = a.len().min(cap);
+    std::ptr::copy_nonoverlapping(a.as_ptr(), out, n);
+    n
+}
+
 /// The ages in ms a head reports (g6kv_store_report): ages[i] is that of the entry holding tier t's (i x per_seg)-th
 /// coldest block, coldest first. Writes up to `cap` and returns how many.
 ///

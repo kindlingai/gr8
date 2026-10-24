@@ -685,6 +685,23 @@ impl Pool {
         )
     }
 
+    /// The resize quotes a KV node's head REPORTs for tier t beside its ages (stash.rs quote_resize): for each i, the
+    /// rows a give of i + 1 segments of `per_seg` blocks loses (the prefill requests pay to compute them again), at most
+    /// `most`; u64::MAX from the first give the tier would refuse (pinned entries, an index, past its size).
+    pub fn quote_points(&self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
+        let Some(s) = &self.stash else { return Vec::new() };
+        let Some(slots) = s.stats(t).map(|x| x.slots) else { return Vec::new() };
+        let mut v = Vec::with_capacity(most);
+        for i in 1..=most as u64 {
+            let q = slots.checked_sub(i * per_seg).and_then(|to| s.quote_resize(t, to));
+            v.push(q.as_ref().map_or(u64::MAX, |q| q.lost_rows));
+            if q.is_none() {
+                break;
+            }
+        }
+        v
+    }
+
     /// Prepare an admission without counting non-stock prompts toward stock promotion. Call before its grant,
     /// including after an abandoned stock admission, so no pending stock metadata is inherited.
     pub fn count_namespaced(&mut self, prompt: &[i32], span: Option<u32>, namespace: Namespace) -> u32 {

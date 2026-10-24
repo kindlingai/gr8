@@ -157,6 +157,9 @@ struct Group {
     stalled: bool,
     calm_until: Option<Instant>,
     ages: Vec<u64>,
+    // the rows a give of 1, 2, ... segments would lose, from the last report (Pool::quote_points). Shown in STATS only:
+    // the node still picks the group to give by its ages
+    quotes: Vec<u64>,
     demand: u64,
     reports: u64,
     granted: u64,
@@ -585,10 +588,11 @@ impl Shared {
                 .map(|(n, g)| {
                     let segs: Vec<String> = g.members.iter().map(|(r, m)| format!("\"{r}\":{}", m.segs)).collect();
                     let ages: Vec<String> = g.ages.iter().map(u64::to_string).collect();
+                    let quotes: Vec<String> = g.quotes.iter().map(u64::to_string).collect();
                     format!(
                         "{{\"name\":\"{}\",\"nr\":{},\"block\":{},\"floor\":{},\"cap\":{},\"weight\":{},\"segs\":{{{}}},\
                          \"boot\":{},\"txn\":{},\"grant\":{},\"give\":{},\"retired\":{},\"bonus\":{},\"stalled\":{},\
-                         \"demand\":{},\"ages_ms\":[{}],\"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
+                         \"demand\":{},\"ages_ms\":[{}],\"quote_rows\":[{}],\"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
                         json_escape(n),
                         g.nr,
                         g.block_bytes,
@@ -605,6 +609,7 @@ impl Shared {
                         g.stalled,
                         g.demand,
                         ages.join(","),
+                        quotes.join(","),
                         g.reports,
                         g.granted,
                         g.gave,
@@ -885,13 +890,14 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
             }
             proto::REPORT => {
                 let l = lease.as_ref().unwrap().0.clone();
-                if h.b > MAX_AGES {
-                    fail(&mut s, proto::E_PROTO, "too many ages")?;
+                if h.b > MAX_AGES || h.c > MAX_AGES {
+                    fail(&mut s, proto::E_PROTO, "too many ages or quotes")?;
                     break;
                 }
-                let b = read_vec(&mut s, h.b as usize * 8)?;
-                let ages: Vec<u64> = b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
-                match report(sh, &l, h.a, ages) {
+                let b = read_vec(&mut s, (h.b + h.c) as usize * 8)?;
+                let mut ages: Vec<u64> = b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+                let quotes = ages.split_off(h.b as usize);
+                match report(sh, &l, h.a, ages, quotes) {
                     Ok((grant, give, unclaimed, txn)) => {
                         let mut b = Header::new(proto::OK, grant, give, unclaimed).bytes().to_vec();
                         b.extend_from_slice(&txn.to_le_bytes());
@@ -1180,6 +1186,7 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64, bool), Refusal>
                         stalled: false,
                         calm_until: None,
                         ages: Vec::new(),
+                        quotes: Vec::new(),
                         demand: 0,
                         reports: 0,
                         granted: 0,
@@ -1215,7 +1222,7 @@ fn group_of(l: &Lease) -> Result<&(String, u32), Refusal> {
 
 // (segments a rank grows by now, segments a rank gives back, unclaimed segments, the transaction to name in GROW or
 // SHRINK; 0 = nothing to do). A transaction in progress is told once, to the first report after it opened
-fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u64, u64, u64, u64), Refusal> {
+fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>, quotes: Vec<u64>) -> Result<(u64, u64, u64, u64), Refusal> {
     let (name, rank) = group_of(l)?;
     let seg = sh.share.seg_bytes;
     let mut st = sh.state.lock().unwrap();
@@ -1224,6 +1231,7 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
     let unclaimed = st.unclaimed(seg);
     let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
     g.ages = ages;
+    g.quotes = quotes;
     g.demand = demand;
     g.reports += 1;
     let mine = g.members.get(rank).map_or(g.floor, |m| m.segs);
@@ -1487,6 +1495,7 @@ mod tests {
             stalled: false,
             calm_until: None,
             ages: age.into_iter().collect(),
+            quotes: Vec::new(),
             demand: 0,
             reports: 0,
             granted: 0,
@@ -1565,6 +1574,7 @@ mod tests {
         let b = st.groups.get_mut("b").unwrap();
         b.members.insert(1, Member { lease: 9, segs: 5 });
         b.ages.clear();
+        b.quotes.clear();
         st.ask("a", 1, now, &sh(), false);
         assert!(give(&st, "b").is_none(), "a group that reported no blocks");
     }

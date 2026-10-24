@@ -343,13 +343,15 @@ impl RemoteStore {
     }
 
     /// The group's head: what this cluster wants (segments a rank) and how long ago its coldest blocks were used (ms,
-    /// one age a segment's worth, coldest first: coldest_ages). The node answers with a grant or a request to give.
-    pub fn report(&self, want: u64, ages_ms: &[u64]) -> io::Result<Report> {
+    /// one age a segment's worth, coldest first: coldest_ages), and the rows a give of 1, 2, ... segments loses
+    /// (quotes: Pool::quote_points). The node answers with a grant or a request to give.
+    pub fn report(&self, want: u64, ages_ms: &[u64], quotes: &[u64]) -> io::Result<Report> {
         self.group_only()?;
         let mut ctl = self.ctl.lock().unwrap();
         let n = ages_ms.len().min(super::server::MAX_AGES as usize);
-        let mut b = Header::new(proto::REPORT, want, n as u64, 0).bytes().to_vec();
-        for a in &ages_ms[..n] {
+        let nq = quotes.len().min(super::server::MAX_AGES as usize);
+        let mut b = Header::new(proto::REPORT, want, n as u64, nq as u64).bytes().to_vec();
+        for a in ages_ms[..n].iter().chain(&quotes[..nq]) {
             b.extend_from_slice(&a.to_le_bytes());
         }
         ctl.write_all(&b)?;

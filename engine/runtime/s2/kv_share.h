@@ -34,7 +34,8 @@ inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals&
     return want;
 }
 
-// The head's report: `want` segments more per rank (0 = none; share_want) and the ages of the tier's coldest blocks.
+// The head's report: `want` segments more per rank (0 = none; share_want), the ages of the tier's coldest blocks, and the
+// rows a give of 1, 2, ... segments would lose (quotes; the node shows them in STATS, its choice still reads the ages).
 // offer = false (G6_KV_SHARE_WHEN=idle while the engine is busy): no ages, so the node asks this group to give only for a
 // group starting below its floor, never for another group's growth. The resize to announce (it carries the node's
 // transaction), or nothing.
@@ -43,8 +44,10 @@ inline std::optional<Resize> share_poll(RunPool& pool, uint32_t tier, const g6kv
     const uint64_t per = g6kv_store_seg_blocks(store), segs = g6kv_store_segs(store);
     require(per > 0, "share_poll: the store is not a group lease");
     const std::vector<uint64_t> ages = offer ? pool.coldest(tier, per, most) : std::vector<uint64_t>{};
+    const std::vector<uint64_t> quotes = offer ? pool.quotes(tier, per, most) : std::vector<uint64_t>{};
     g6kv_report r{};
-    require(g6kv_store_report(store, want, ages.data(), ages.size(), &r) == 0, g6kv_tier_error());
+    require(g6kv_store_report(store, want, ages.data(), ages.size(), quotes.data(), quotes.size(), &r) == 0,
+            g6kv_tier_error());
     if (r.grant) return Resize{tier, segs + r.grant, (segs + r.grant) * per, r.txn};
     if (r.give && r.give < segs) return Resize{tier, segs - r.give, (segs - r.give) * per, r.txn};
     return std::nullopt;

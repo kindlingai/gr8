@@ -81,7 +81,7 @@ fn a_group_grows_into_its_grant_and_shrinks_without_touching_what_it_keeps() {
     assert_eq!(a[0].blocks(), per);
     // a new segment reads zeros
     write_all(&a, 10);
-    let r = a[0].report(3, &[]).unwrap();
+    let r = a[0].report(3, &[], &[]).unwrap();
     assert_eq!((r.grant, r.give), (3, 0));
     assert!(r.txn > 0);
     for s in &a {
@@ -108,7 +108,7 @@ fn a_group_grows_into_its_grant_and_shrinks_without_touching_what_it_keeps() {
     assert_eq!(e.kind(), ErrorKind::StaleNetworkFileHandle, "{e}");
     assert!(a[0].shrink(0, 0).is_err());
     // past the cap: the grant stops at it
-    let r = a[0].report(9, &[]).unwrap();
+    let r = a[0].report(9, &[], &[]).unwrap();
     assert_eq!(r.grant, 4, "cap 6, at 2");
     assert!(stats(&addr).contains("\"name\":\"a\""), "{}", stats(&addr));
 }
@@ -150,7 +150,7 @@ fn the_colder_group_gives_and_the_other_grows_into_it() {
     let a = cluster(&addr, "glm", 2, 100_000, 1, 8);
     let b = cluster(&addr, "flash", 2, 70_000, 1, 8);
     // glm takes everything that is left: 2 more segments a rank
-    let r = a[0].report(9, &[0]).unwrap();
+    let r = a[0].report(9, &[0], &[]).unwrap();
     assert_eq!(r.grant, 2);
     for s in &a {
         s.grow(3, r.txn).unwrap();
@@ -158,32 +158,34 @@ fn the_colder_group_gives_and_the_other_grows_into_it() {
     write_all(&a, 1);
     write_all(&b, 5);
     // flash wants a segment. glm's coldest block is 0.5 s old, flash's 0 s: inside the 1 s margin, nobody gives
-    let r = b[0].report(1, &[0]).unwrap();
+    let r = b[0].report(1, &[0], &[]).unwrap();
     assert_eq!((r.grant, r.give, r.unclaimed), (0, 0, 0));
-    assert_eq!(a[0].report(0, &[500, 400]).unwrap().give, 0);
+    assert_eq!(a[0].report(0, &[500, 400], &[]).unwrap().give, 0);
     // glm's blocks get colder: 5 s. flash asks again, and glm is asked for one segment a rank
-    a[0].report(0, &coldest_ages(&[(1, 1), (2, 2 * a[0].per_seg as usize)], |id| 6_000 - id * 500, a[0].per_seg, 0, 4))
+    a[0].report(0, &coldest_ages(&[(1, 1), (2, 2 * a[0].per_seg as usize)], |id| 6_000 - id * 500, a[0].per_seg, 0, 4), &[])
         .unwrap();
-    assert_eq!(b[0].report(1, &[0]).unwrap().grant, 0);
-    let r = a[0].report(0, &[5_500]).unwrap();
+    assert_eq!(b[0].report(1, &[0], &[]).unwrap().grant, 0);
+    let r = a[0].report(0, &[5_500], &[]).unwrap();
     assert_eq!(r.give, 1);
     // glm shrinks every rank (its tier evicted and moved down first); its kept blocks are intact
     for s in &a {
         s.shrink(2, r.txn).unwrap();
     }
     check(&a, 1, 2 * a[0].per_seg);
-    assert_eq!(a[0].report(0, &[5_500]).unwrap().give, 0, "given");
-    let r = b[0].report(1, &[0]).unwrap();
+    assert_eq!(a[0].report(0, &[5_500], &[]).unwrap().give, 0, "given");
+    let r = b[0].report(1, &[0], &[]).unwrap();
     assert_eq!(r.grant, 1);
     for s in &b {
         s.grow(2, r.txn).unwrap();
     }
     check(&b, 5, b[0].per_seg);
     // glm just gave: it is not asked again inside the cooldown, even when colder
-    assert_eq!(b[0].report(1, &[0]).unwrap().grant, 0);
-    assert_eq!(a[0].report(0, &[60_000]).unwrap().give, 0);
+    assert_eq!(b[0].report(1, &[0], &[]).unwrap().grant, 0);
+    assert_eq!(a[0].report(0, &[60_000], &[0, 700, u64::MAX]).unwrap().give, 0);
     let st = stats(&addr);
     assert!(st.contains("\"gave\":1") && st.contains("\"granted\":1"), "{st}");
+    // the quotes a head sends show in STATS, beside its ages
+    assert!(st.contains(&format!("\"ages_ms\":[60000],\"quote_rows\":[0,700,{}]", u64::MAX)), "{st}");
 }
 
 #[test]
@@ -240,7 +242,7 @@ fn segments_that_change_hands_under_load_never_mix() {
             for i in 0..120u64 {
                 let segs = c[0].segs();
                 if next() % 2 == 0 {
-                    let r = c[0].report(1 + next() % 3, &[]).unwrap();
+                    let r = c[0].report(1 + next() % 3, &[], &[]).unwrap();
                     for s in &c {
                         s.grow(segs + r.grant, r.txn).unwrap();
                     }
@@ -289,7 +291,7 @@ fn grow_all(c: &[RemoteStore], to: u64, txn: u64) {
 fn new_group_preempts_full_node_on_gopen() {
     let addr = node(16, 60_000);
     let a = cluster(&addr, "a", 2, 100_000, 1, 8);
-    let r = a[0].report(9, &[0]).unwrap();
+    let r = a[0].report(9, &[0], &[]).unwrap();
     assert_eq!(r.grant, 7);
     grow_all(&a, 8, r.txn);
     write_all(&a, 3);
@@ -299,7 +301,7 @@ fn new_group_preempts_full_node_on_gopen() {
     // a's head hears the give at its next report (a hot group: the margin does not apply to a floor)
     let mut gave = false;
     for _ in 0..250 {
-        let r = a[0].report(0, &[0]).unwrap();
+        let r = a[0].report(0, &[0], &[]).unwrap();
         if r.give > 0 {
             assert_eq!(r.give, 1, "2 segments from 2 ranks");
             shrink_all(&a, 7, r.txn);
@@ -329,7 +331,7 @@ fn a_planned_group_starts_on_a_full_node() {
     .is_err());
     let addr = node_with(8, Share { plan, ..Share::default() });
     let a = cluster(&addr, "a", 1, 100_000, 1, 8);
-    let r = a[0].report(9, &[]).unwrap();
+    let r = a[0].report(9, &[], &[]).unwrap();
     assert_eq!(r.grant, 5, "8 less a's floor less p's planned 2");
     grow_all(&a, 6, r.txn);
     let p = rank(&addr, "p", 1, 0, 100_000, 2, 2).unwrap();
@@ -341,25 +343,25 @@ fn a_planned_group_starts_on_a_full_node() {
 fn free_segments_given_without_margin() {
     let addr = node(8, 60_000);
     let a = cluster(&addr, "a", 1, 100_000, 1, 6);
-    let r = a[0].report(5, &[]).unwrap();
+    let r = a[0].report(5, &[], &[]).unwrap();
     grow_all(&a, 6, r.txn);
     let b = cluster(&addr, "b", 1, 100_000, 1, 8);
     let per = a[0].per_seg;
     // a holds 6 segments, 3 of them stored blocks used just now: a hot group, not asked
     let hot = coldest_ages(&[(1, 3 * per as usize)], |_| 0, per, 3 * per, 8);
     assert_eq!(hot, vec![u64::MAX, u64::MAX, u64::MAX, 0, 0, 0]);
-    a[0].report(0, &[0]).unwrap();
-    let r = b[0].report(3, &[0]).unwrap();
+    a[0].report(0, &[0], &[]).unwrap();
+    let r = b[0].report(3, &[0], &[]).unwrap();
     assert_eq!(r.grant, 1, "the one segment nobody holds");
     grow_all(&b, 2, r.txn);
-    assert_eq!(a[0].report(0, &[0]).unwrap().give, 0, "inside the margin");
+    assert_eq!(a[0].report(0, &[0], &[]).unwrap().give, 0, "inside the margin");
     // the same group reporting its free blocks: the node asks it for 2 at once
-    a[0].report(0, &hot).unwrap();
-    assert_eq!(b[0].report(2, &[0]).unwrap().grant, 0);
-    let r = a[0].report(0, &hot).unwrap();
+    a[0].report(0, &hot, &[]).unwrap();
+    assert_eq!(b[0].report(2, &[0], &[]).unwrap().grant, 0);
+    let r = a[0].report(0, &hot, &[]).unwrap();
     assert_eq!(r.give, 2);
     shrink_all(&a, 4, r.txn);
-    let r = b[0].report(2, &[0]).unwrap();
+    let r = b[0].report(2, &[0], &[]).unwrap();
     assert_eq!(r.grant, 2);
 }
 
@@ -369,18 +371,18 @@ fn free_segments_given_without_margin() {
 fn nr4_vs_nr2_no_strand() {
     let addr = node(12, 1_000);
     let a = cluster(&addr, "a", 4, 100_000, 1, 2);
-    let r = a[0].report(1, &[]).unwrap();
+    let r = a[0].report(1, &[], &[]).unwrap();
     grow_all(&a, 2, r.txn);
-    a[0].report(0, &[600_000]).unwrap();
+    a[0].report(0, &[600_000], &[]).unwrap();
     let b = cluster(&addr, "b", 2, 100_000, 1, 4);
-    let r = b[0].report(2, &[0]).unwrap();
+    let r = b[0].report(2, &[0], &[]).unwrap();
     assert_eq!(r.grant, 1, "2 free: one a rank, and a is asked for the rest");
     grow_all(&b, 2, r.txn);
-    let r = a[0].report(0, &[600_000]).unwrap();
+    let r = a[0].report(0, &[600_000], &[]).unwrap();
     assert_eq!(r.give, 1, "1 a rank of 4 ranks: 4 freed, 2 needed");
     shrink_all(&a, 1, r.txn);
     assert_eq!(unclaimed(&addr), 4);
-    let r = b[0].report(1, &[0]).unwrap();
+    let r = b[0].report(1, &[0], &[]).unwrap();
     assert_eq!(r.grant, 2, "the 1 it asked for and the 1 the give left over");
     grow_all(&b, 4, r.txn);
     assert_eq!(unclaimed(&addr), 0, "{}", stats(&addr));
@@ -391,21 +393,21 @@ fn nr4_vs_nr2_no_strand() {
 fn early_group_reuse() {
     let addr = node(8, 1_000);
     let a = cluster(&addr, "a", 2, 100_000, 1, 8);
-    let r = a[0].report(2, &[]).unwrap();
+    let r = a[0].report(2, &[], &[]).unwrap();
     grow_all(&a, 3, r.txn);
     let b = cluster(&addr, "b", 2, 100_000, 1, 8);
-    a[0].report(0, &[600_000]).unwrap();
-    assert_eq!(b[0].report(1, &[0]).unwrap().grant, 0);
-    let r = a[0].report(0, &[600_000]).unwrap();
+    a[0].report(0, &[600_000], &[]).unwrap();
+    assert_eq!(b[0].report(1, &[0], &[]).unwrap().grant, 0);
+    let r = a[0].report(0, &[600_000], &[]).unwrap();
     assert_eq!(r.give, 1);
     a[0].shrink(2, r.txn).unwrap();
     // rank 1 still holds its third segment and may write it: the one rank 0 gave is not free yet
     assert_eq!(unclaimed(&addr), 0);
-    assert_eq!(b[0].report(1, &[0]).unwrap().grant, 0);
+    assert_eq!(b[0].report(1, &[0], &[]).unwrap().grant, 0);
     write_all(&a[1..], 9);
     a[1].shrink(2, r.txn).unwrap();
     assert_eq!(unclaimed(&addr), 2);
-    let r = b[0].report(1, &[0]).unwrap();
+    let r = b[0].report(1, &[0], &[]).unwrap();
     assert_eq!(r.grant, 1);
     grow_all(&b, 2, r.txn);
 }
@@ -415,17 +417,17 @@ fn early_group_reuse() {
 fn partial_grant_survives_ttl() {
     let addr = node_with(8, Share { grant_ttl: Duration::from_millis(200), ..Share::default() });
     let a = cluster(&addr, "a", 2, 100_000, 1, 8);
-    let r = a[0].report(2, &[]).unwrap();
+    let r = a[0].report(2, &[], &[]).unwrap();
     assert_eq!(r.grant, 2);
     a[0].grow(3, r.txn).unwrap();
     std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(a[0].report(0, &[]).unwrap().unclaimed, 2, "4 free, rank 1's part of 2 still held");
+    assert_eq!(a[0].report(0, &[], &[]).unwrap().unclaimed, 2, "4 free, rank 1's part of 2 still held");
     a[1].grow(3, r.txn).unwrap();
     // nobody took this one: it lapses, and growing under it is stale
-    let r = a[0].report(1, &[]).unwrap();
+    let r = a[0].report(1, &[], &[]).unwrap();
     assert_eq!(r.grant, 1);
     std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(a[0].report(0, &[]).unwrap().unclaimed, 2);
+    assert_eq!(a[0].report(0, &[], &[]).unwrap().unclaimed, 2);
     let e = a[0].grow(4, r.txn).unwrap_err();
     assert_eq!(e.kind(), ErrorKind::StaleNetworkFileHandle, "{e}");
 }
@@ -435,12 +437,12 @@ fn partial_grant_survives_ttl() {
 fn stale_shrink_refused() {
     let addr = node(8, 1_000);
     let a = cluster(&addr, "a", 2, 100_000, 1, 8);
-    let g = a[0].report(2, &[]).unwrap();
+    let g = a[0].report(2, &[], &[]).unwrap();
     grow_all(&a, 3, g.txn);
     let b = cluster(&addr, "b", 2, 100_000, 1, 8);
-    a[0].report(0, &[600_000]).unwrap();
-    b[0].report(1, &[0]).unwrap();
-    let r = a[0].report(0, &[600_000]).unwrap();
+    a[0].report(0, &[600_000], &[]).unwrap();
+    b[0].report(1, &[0], &[]).unwrap();
+    let r = a[0].report(0, &[600_000], &[]).unwrap();
     assert_eq!(r.give, 1);
     // under the grow's transaction, or past the give's target
     assert_eq!(a[0].shrink(2, g.txn).unwrap_err().kind(), ErrorKind::StaleNetworkFileHandle);

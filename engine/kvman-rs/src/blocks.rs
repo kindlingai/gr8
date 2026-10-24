@@ -431,13 +431,16 @@ pub unsafe extern "C" fn g6kv_store_report(
     want: u64,
     ages: *const u64,
     n: usize,
+    quotes: *const u64,
+    nq: usize,
     out: *mut G6kvReport,
 ) -> i32 {
-    if out.is_null() || (n > 0 && ages.is_null()) {
+    if out.is_null() || (n > 0 && ages.is_null()) || (nq > 0 && quotes.is_null()) {
         return fail(io::Error::new(io::ErrorKind::InvalidInput, "null argument"));
     }
     let ages = if n == 0 { &[][..] } else { std::slice::from_raw_parts(ages, n) };
-    match (*t).remote().and_then(|r| r.report(want, ages)) {
+    let quotes = if nq == 0 { &[][..] } else { std::slice::from_raw_parts(quotes, nq) };
+    match (*t).remote().and_then(|r| r.report(want, ages, quotes)) {
         Ok(x) => {
             *out = G6kvReport { grant: x.grant, give: x.give, unclaimed: x.unclaimed, txn: x.txn };
             0

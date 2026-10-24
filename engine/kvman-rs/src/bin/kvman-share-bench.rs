@@ -360,7 +360,7 @@ impl Cluster {
                 8,
             )
         };
-        let rep = self.ranks[0].store.report(if wants { 2 } else { 0 }, &ages).unwrap_or_else(|e| die(e.to_string()));
+        let rep = self.ranks[0].store.report(if wants { 2 } else { 0 }, &ages, &[]).unwrap_or_else(|e| die(e.to_string()));
         let mut act = String::new();
         if rep.grant > 0 {
             let target = self.ranks[0].store.segs() + rep.grant;
