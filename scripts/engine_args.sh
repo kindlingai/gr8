@@ -136,6 +136,11 @@ G6_PF_TIMES=1"
   if [ "${FLASH_CAP_POLICY:-protected}" = borrow-idle ]; then
     ENGINE_ENV="$ENGINE_ENV G6_FLASH_KV_CHUNKS=1 G6_FLASH_KV_LEND_MS=$((${FLASH_KV_IDLE_S:-60} * 1000))"
   fi
+  # FLASH_CACHE: session checkpoints at prefill quantum boundaries (docs/FLASH.md), off unless set
+  if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ]; then
+    ENGINE_ENV="$ENGINE_ENV G6_FLASH_CACHE=$FLASH_CACHE"
+    [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV G6_FLASH_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
+  fi
   ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
 }
 
@@ -248,6 +253,12 @@ engine_args() {
 --pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions 1 --s2-epoch $epoch"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    # FLASH_CACHE keeps its checkpoints in the KV_STORE store (one at most), else in memory
+    if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ] && [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+    fi
     (set -f; echo $a)
     return
   fi

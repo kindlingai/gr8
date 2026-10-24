@@ -81,6 +81,28 @@
 - `KV_SHARE_WHEN=idle` (default) gives only while the engine is idle; `always` whenever asked.
 - Wire change: REPORT replies carry the transaction id, GROW / SHRINK take it (`E_STALE` = 8). Both sides of a node
   must run this build.
+## 2026-10-23: `FLASH_CACHE=terminal`, Flash checkpoints at the end of every request (experimental, NOT cold-exact)
+
+- `./gr8 glm53f --flash-cache terminal` (`G6_FLASH_CACHE=terminal`): aligned's checkpoints, and one more when a request
+  ends, at the rows it consumed, so an agent's next turn sent as raw tokens is prefilled from the end of the last one.
+  Not cold-exact by construction: the KDA state comes from decode (per row, `kda.cuh`), not the prefill (64-row chunks,
+  `kda_prefill.cuh`). The output difference against no cache is to be measured on the box; aligned stays the exact mode.
+- Tested on the dev box: a partial last page captured and restored bit for bit through memory, SSD and a loopback KV
+  node (`engine/tests/test_flash_ckpt.cu`), and the actual retain hook against CPU mocks
+  (`engine/tests/test_flash_terminal_retain.py`).
+
+## 2026-10-23: GLM-5.3-Flash session checkpoints, `FLASH_CACHE=aligned` (experimental, off by default)
+
+- `./gr8 glm53f --flash-cache aligned` (`G6_FLASH_CACHE=aligned`): a prompt's prefill keeps its pages and KDA state at
+  its last cold prefill grid point (8,192 rows), and a later prompt that starts with the same tokens is prefilled from
+  there. Bit-exact against no cache by construction: the warm prefill runs the same quanta on the same state
+  (docs/FLASH.md). The store is the one `--kv-store` (memory, SSD or a KV node, on a lease of its own), else memory,
+  `--flash-state-budget-mib` (8192) a rank.
+- Tested: the index and manifest on the host (`scripts/host_tests.sh`), and capture/restore bit for bit, overwrite,
+  drops and corrupted blocks refused on one RTX 5090 through all three stores (`engine/tests/test_flash_ckpt.cu`). Not
+  yet run end to end on a cluster.
+- Not stash entries: the pool stash's share and resize do not see Flash checkpoints. No terminal checkpoint: decode's
+  per-row KDA update and the prefill's 64-row chunks give different fp32 state.
 
 ## 2026-10-23: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
 

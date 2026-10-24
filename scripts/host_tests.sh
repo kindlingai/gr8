@@ -167,3 +167,8 @@ python3 "$REPO/engine/tests/test_flash_serve_check.py"
 python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test"
 "$T/pf_peer_stage_test"
+# Flash session checkpoints (G6_FLASH_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/tests/test_flash_ckpt_index.cpp" -o "$T/test_flash_ckpt_index"
+"$T/test_flash_ckpt_index"
+# G6_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
+python3 "$REPO/engine/tests/test_flash_terminal_retain.py"

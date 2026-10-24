@@ -64,9 +64,67 @@ Prefill time grows faster than the prompt because the indexer scores every earli
 262K prefill has not been measured. The shim errors a request after 900 s with no output (`--stall-timeout`), and a
 prefill sends none, so a prefill longer than that fails.
 
+## Session checkpoints (`G6_FLASH_CACHE=aligned`, experimental)
+
+Off by default. With `FLASH_CACHE=aligned` (`G6_FLASH_CACHE=aligned`), a prompt's prefill keeps a checkpoint at its last
+cold prefill grid point, and a later prompt that starts with the same tokens is prefilled from that point, not from 0.
+This is the Flash form of prefix reuse for an agent's next turn. The code is `engine/runtime/s2/flash_checkpoint.h` (the
+index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), hooked into `s2/flash_native.cuh`.
+
+- The grid is the prefill quantum: `--prefill` rows times the lanes, 4,096 x 2 = 8,192 rows. A prompt of N tokens keeps
+  a checkpoint at `p = floor((N - 1) / 8192) * 8192`, so prompts of 8,192 tokens or fewer keep none.
+- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the indexer keys), KDA slot 0's
+  state and conv history, and the prompt's tokens `[0, p]`. A later prompt hits it when it starts with those `p + 1`
+  tokens under the same cache namespace (the steering profile); the longest entry wins, then the newest.
+- A hit restores the checkpoint at bind, after the cold reset, and prefills from `p`.
+
+Why the output is bit-exact against no cache: a cold prefill runs its quanta as `[kG, (k+1)G)`, and the KDA prefill is
+chunked by quantum, so a warm prefill from `p = kG` runs the same quanta on the same KDA state and the same pages. The
+MTP layer's row `p - 1` reads token `p`, which is why the match runs through token `p`. The indexer's pools are
+recomputed from the raw rows (`engine/attn/kpool.cuh`), so no other state is kept. Rows past `p` and the other KDA slots
+are as a cold bind leaves them.
+
+Why a checkpoint is not taken at the end of the prompt: decode advances the KDA state one row at a time
+(`engine/kda/kda.cuh`), and the prefill runs it in chunks of 64 rows (`engine/kda/kda_prefill.cuh`). The two orders of
+fp32 arithmetic give different state, so a state taken after decode is not the state a cold prefill of the same tokens
+gives. A terminal checkpoint is not cold-exact by construction.
+
+`FLASH_CACHE=terminal` (`G6_FLASH_CACHE=terminal`, experimental, **NOT cold-exact**) keeps aligned's checkpoints and
+one more at the end of every request: `p` = the rows the request consumed (prompt and output; its last output token is
+still pending and becomes token `p`), with the KDA state the verify ring holds for `p` and the pages through `p`, the
+last one partial. A later prompt that starts with those `p + 1` tokens (an agent's next turn sent as raw tokens) is
+prefilled from `p`. Its output differs from a cold prefill's: the KDA state comes from decode, and the prefill from `p`
+runs quanta a cold prefill does not. How much is measured (token diff against no cache on the same trace, NLL delta,
+needles), not argued. After a terminal hit the request keeps no aligned checkpoint (its rows are not cold rows), so
+aligned entries stay exact. The MTP layer's row `p - 1` may not hold the last token's draft row; that changes only
+which drafts are accepted. The boot and request log lines say `terminal`. Aligned stays the mode to use when the output
+must match no cache.
+
+The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:PORT`, `persist=on` refused), else
+this process's memory, `FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot. On a KV node
+the lease is `g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one contiguous range of
+blocks with a manifest and GPU checksums of every extent; a restore that does not match its checksums stops the engine.
+A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
+digest the ranks compare.
+
+The boot log prints `# rank R: flash ckpt aligned: ...`, and each request prints `flash ckpt request ... kept ...` or
+`... restored ...` with the time.
+
+Measured on one RTX 5090 (`engine/tests/test_flash_ckpt.cu`, Flash's TP=2 geometry, 100 pages, 161 blocks): a capture
+(161 blocks) takes 26-50 ms and a restore 21-25 ms through memory, an SSD file and a loopback KV node. Not measured on GB10, and the
+end-to-end bit-exact check against no cache on a cluster has not run yet.
+
+Limits:
+
+- Checkpoints are not entries of the pool's block stash (`engine/kvman-rs` `stash.rs`), so the stash's share and resize
+  do not see them.
+- Each capture writes the whole prefix `[0, p)`, not only the rows past the entry it started from.
+- `terminal` is not cold-exact (above).
+
 ## Not yet
 
-- Several sessions, CP, prefix reuse and DFlash2: the engine refuses them under `--serve`.
+- Several sessions, CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `G6_FLASH_CACHE=aligned`
+  (above) is the experimental Flash form of prefix reuse.
 - MTP drafts beyond the first: the KDA state does not roll back a rejected draft yet, so the launcher runs MTP=1.
 - The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
