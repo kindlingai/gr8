@@ -59,6 +59,9 @@ pub struct Opts {
     pub depth: u32,
     /// Join a group on the node (a cluster's ranks sharing it with other clusters) instead of a fixed lease.
     pub group: Option<GroupOpts>,
+    /// Ask the node to park the lease when this store closes (a node with --holdover-s keeps it that long), so a
+    /// restarted client of the same name and shape finds its blocks as it left them (RemoteStore::reattached).
+    pub persist: bool,
 }
 
 /// One rank's place in a group (server.rs GOPEN). Every rank of a cluster gives the same group, ranks, sizes and
@@ -99,6 +102,7 @@ impl Opts {
             qp_timeout: 14,
             depth: 256,
             group: None,
+            persist: false,
         }
     }
 }
@@ -153,6 +157,8 @@ pub struct RemoteStore {
     pub fallback: Option<String>,
     /// The RDMA device and GID index this end uses.
     pub device: Option<(String, u32)>,
+    /// The node gave back a parked lease (Opts::persist): its blocks hold what the last holder wrote.
+    pub reattached: bool,
 }
 
 fn connect(addr: &str) -> io::Result<TcpStream> {
@@ -180,30 +186,36 @@ impl RemoteStore {
     pub fn open(addr: &str, o: &Opts) -> io::Result<RemoteStore> {
         let mut ctl = connect(addr)?;
         let (local, server) = (ctl.local_addr()?, ctl.peer_addr()?);
-        let (lease_id, lease_bytes, blocks, per_seg) = match &o.group {
+        let persist = if o.persist { proto::OPEN_PERSIST } else { 0 };
+        let (lease_id, lease_bytes, blocks, per_seg, mut reattached) = match &o.group {
             None => {
-                Header::new(proto::OPEN, o.block_bytes as u64, o.blocks, o.name.len() as u64).write(&mut ctl)?;
+                Header::new(proto::OPEN, o.block_bytes as u64, o.blocks, o.name.len() as u64 | persist).write(&mut ctl)?;
                 ctl.write_all(o.name.as_bytes())?;
                 let h = proto::reply(&mut ctl)?;
-                (h.a, h.b, o.blocks, 0)
+                (h.a, h.b, o.blocks, 0, h.c == 1)
             }
             Some(g) => {
                 let mut b = Vec::with_capacity(proto::GOPEN_FIXED + g.group.len() + 1 + o.name.len());
                 for x in [o.block_bytes as u64, g.floor_bytes, g.cap_bytes] {
                     b.extend_from_slice(&x.to_le_bytes());
                 }
-                for x in [g.nr, g.rank, g.weight, 0] {
+                for x in [g.nr, g.rank, g.weight, if o.persist { proto::GOPEN_PERSIST } else { 0 }] {
                     b.extend_from_slice(&x.to_le_bytes());
                 }
                 b.extend_from_slice(format!("{} {}", g.group, o.name).as_bytes());
                 Header::new(proto::GOPEN, b.len() as u64, 0, 0).write(&mut ctl)?;
                 ctl.write_all(&b)?;
                 let h = proto::reply(&mut ctl)?;
-                (h.a, h.b * h.c * o.block_bytes as u64, h.b * h.c, h.c)
+                (h.a, h.b * h.c * o.block_bytes as u64, h.b * h.c, h.c, false)
             }
         };
         let mut token = [0u8; 16];
         ctl.read_exact(&mut token)?;
+        if o.group.is_some() {
+            let mut b = [0u8; 8];
+            ctl.read_exact(&mut b)?;
+            reattached = u64::from_le_bytes(b) == 1;
+        }
         let n = o.lanes.max(1);
         let mut fallback = None;
         let rdma = match o.want {
@@ -247,6 +259,7 @@ impl RemoteStore {
             local,
             server,
             fallback,
+            reattached,
         })
     }
 

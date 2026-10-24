@@ -57,6 +57,9 @@ pub struct Share {
     /// Floors reserved from the start (kvman-remote --group-plan): group name -> (ranks, floor segments a rank). A
     /// planned group can start (or restart) whatever the other groups hold; its floor is kept for it while it is away.
     pub plan: BTreeMap<String, (u32, u64)>,
+    /// A lease opened with persist whose last connection closes is parked this long (kvman-remote --holdover-s): an
+    /// OPEN or GOPEN of the same name and shape in that time gets it back as it was, bytes and all. 0 = never parked.
+    pub holdover: Duration,
 }
 
 impl Default for Share {
@@ -68,6 +71,7 @@ impl Default for Share {
             stall: Duration::from_secs(10),
             cooldown: Duration::from_secs(10),
             plan: BTreeMap::new(),
+            holdover: Duration::ZERO,
         }
     }
 }
@@ -187,6 +191,8 @@ struct State {
     plan: BTreeMap<String, (u32, u64)>,
     // segments earmarked for a rank waiting in GOPEN while other groups give
     waiting: BTreeMap<String, u64>,
+    // persist leases no connection holds, by name, until the deadline (Share::holdover)
+    parked: BTreeMap<String, (Arc<Lease>, Instant)>,
 }
 
 impl State {
@@ -203,6 +209,12 @@ impl State {
         self.groups.values().map(Group::reserved).sum::<u64>()
             + self.plan.keys().map(|n| self.planned(n)).sum::<u64>()
             + self.waiting.values().sum::<u64>()
+    }
+    // the parked leases past their deadline, out of the map. The caller drops them after it lets go of the state (a
+    // lease's drop takes the state lock)
+    fn expired(&mut self, now: Instant) -> Vec<Arc<Lease>> {
+        let gone: Vec<String> = self.parked.iter().filter(|(_, (_, t))| now >= *t).map(|(n, _)| n.clone()).collect();
+        gone.into_iter().filter_map(|n| self.parked.remove(&n)).map(|(l, _)| l).collect()
     }
     // segments the gives in progress will free
     fn coming(&self) -> u64 {
@@ -314,6 +326,8 @@ pub struct Lease {
     // each segment's offset in the arena, in lease order. Lock order: regions, then segs, then the node's state
     segs: RwLock<Vec<usize>>,
     group: Option<(String, u32)>,
+    // parked, not freed, when its last connection closes (Share::holdover)
+    persist: bool,
     token: [u8; 16],
     regions: Mutex<HashMap<String, Region>>,
     conns: AtomicU64,
@@ -488,6 +502,7 @@ impl Node {
                 next_id: 1,
                 plan: share.plan.clone(),
                 waiting: BTreeMap::new(),
+                parked: BTreeMap::new(),
             }),
             devices: Mutex::new(HashMap::new()),
             cfg_rdma: cfg.rdma,
@@ -505,6 +520,11 @@ impl Node {
 
     /// Accepts connections until the listener fails, a thread each.
     pub fn serve(&self) -> io::Result<()> {
+        let h = self.shared.share.holdover;
+        if !h.is_zero() {
+            let sh = self.shared.clone();
+            std::thread::spawn(move || sweeper(sh, (h / 4).clamp(Duration::from_millis(50), Duration::from_secs(1))));
+        }
         loop {
             let (s, _) = match self.listener.accept() {
                 Ok(x) => x,
@@ -675,7 +695,40 @@ struct Attached(Arc<Lease>);
 
 impl Drop for Attached {
     fn drop(&mut self) {
-        self.0.conns.fetch_sub(1, Ordering::Relaxed);
+        let l = &self.0;
+        if l.conns.fetch_sub(1, Ordering::AcqRel) == 1 && l.persist && !l.shared.share.holdover.is_zero() {
+            let until = Instant::now() + l.shared.share.holdover;
+            l.shared.state.lock().unwrap().parked.insert(l.name.clone(), (l.clone(), until));
+        }
+    }
+}
+
+// a parked lease named `name`: Some(lease) if `fits` it (it leaves the park), else it goes for good. Expired ones go
+// first, so an OPEN past the holdover gets fresh, zeroed memory
+fn unpark(sh: &Arc<Shared>, name: &str, fits: impl Fn(&Lease) -> bool) -> Option<Arc<Lease>> {
+    let (gone, l) = {
+        let mut st = sh.state.lock().unwrap();
+        let mut gone = st.expired(Instant::now());
+        let l = st.parked.remove(name).map(|(l, _)| l);
+        match l {
+            Some(l) if fits(&l) => (gone, Some(l)),
+            Some(l) => {
+                gone.push(l);
+                (gone, None)
+            }
+            None => (gone, None),
+        }
+    };
+    drop(gone);
+    l
+}
+
+/// Frees the parked leases past their holdover, every `every`, while the node lives.
+fn sweeper(sh: Arc<Shared>, every: Duration) {
+    loop {
+        std::thread::sleep(every);
+        let gone = sh.state.lock().unwrap().expired(Instant::now());
+        drop(gone);
     }
 }
 
@@ -703,19 +756,20 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                 break;
             }
             proto::OPEN => {
-                if h.c as usize > proto::NAME_MAX {
+                let (nlen, persist) = ((h.c & 0xffff_ffff) as usize, h.c & proto::OPEN_PERSIST != 0);
+                if nlen > proto::NAME_MAX {
                     fail(&mut s, proto::E_PROTO, "lease name too long")?;
                     break;
                 }
-                let name = read_vec(&mut s, h.c as usize)?;
+                let name = read_vec(&mut s, nlen)?;
                 if !proto::valid_name(&name) {
                     fail(&mut s, proto::E_PROTO, "a lease name is 1-128 printable ASCII characters, no spaces")?;
                     continue;
                 }
                 let name = String::from_utf8(name).expect("ASCII");
-                match open(sh, &name, h.a, h.b) {
-                    Ok(l) => {
-                        Header::new(proto::OK, l.id, l.len() as u64, 0).write(&mut s)?;
+                match open(sh, &name, h.a, h.b, persist) {
+                    Ok((l, back)) => {
+                        Header::new(proto::OK, l.id, l.len() as u64, back as u64).write(&mut s)?;
                         s.write_all(&l.token)?;
                         l.conns.fetch_add(1, Ordering::Relaxed);
                         lease = Some(Attached(l));
@@ -748,12 +802,14 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                     nr: u32_at(&b, 24),
                     rank: u32_at(&b, 28),
                     weight: u32_at(&b, 32),
+                    persist: u32_at(&b, 36) & proto::GOPEN_PERSIST != 0,
                 };
                 match gopen(sh, &want) {
-                    Ok((l, bps)) => {
+                    Ok((l, bps, back)) => {
                         let n = l.segs.read().unwrap().len() as u64;
                         Header::new(proto::OK, l.id, n, bps).write(&mut s)?;
                         s.write_all(&l.token)?;
+                        s.write_all(&(back as u64).to_le_bytes())?;
                         l.conns.fetch_add(1, Ordering::Relaxed);
                         lease = Some(Attached(l));
                     }
@@ -945,6 +1001,7 @@ fn new_lease(
     seg_len: usize,
     segs: Vec<usize>,
     group: Option<(String, u32)>,
+    persist: bool,
 ) -> Result<Arc<Lease>, Refusal> {
     let id = st.next_id;
     st.next_id += 1;
@@ -957,6 +1014,7 @@ fn new_lease(
         seg_len,
         segs: RwLock::new(segs),
         group,
+        persist,
         token,
         regions: Mutex::new(HashMap::new()),
         conns: AtomicU64::new(0),
@@ -970,7 +1028,13 @@ fn new_lease(
     Ok(l)
 }
 
-fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<Arc<Lease>, Refusal> {
+// the lease, and whether it is a parked one back (its bytes as they were)
+fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64, persist: bool) -> Result<(Arc<Lease>, bool), Refusal> {
+    if let Some(l) = unpark(sh, name, |l| {
+        l.group.is_none() && l.block_bytes as u64 == block_bytes && l.len() as u64 >= block_bytes * blocks
+    }) {
+        return Ok((l, true));
+    }
     let len = block_bytes
         .checked_mul(blocks)
         .filter(|&n| block_bytes > 0 && n > 0 && n <= sh.arena.len() as u64)
@@ -994,12 +1058,12 @@ fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64) -> Result<A
             release(&mut st.free, off, len_al);
             return Err(no_room(&st));
         }
-        new_lease(sh, &mut st, name, block_bytes as usize, len_al, len_al, vec![off], None)?
+        new_lease(sh, &mut st, name, block_bytes as usize, len_al, len_al, vec![off], None, persist)?
     };
     // what the last holder of these bytes left is not this client's
     l.zero(&[l.segs.read().unwrap()[0]]);
     sh.opened.fetch_add(1, Ordering::Relaxed);
-    Ok(l)
+    Ok((l, false))
 }
 
 /// What a rank asks for when it joins a group (GOPEN).
@@ -1013,14 +1077,23 @@ pub struct Want {
     pub rank: u32,
     /// 1000 = 1x. A group of weight 2000 is asked to give as if its blocks were half as old.
     pub weight: u32,
+    /// Park the lease when its last connection closes (Share::holdover).
+    pub persist: bool,
 }
 
 // the lease and its blocks per segment. A group's first rank needs room for every rank's floor, a later rank its own
 // floor beyond what the first held for it. Short of room, the rank asks the other groups to give down to their
 // floors (the margin does not apply: a floor is the group's right) and waits up to Share::stall for them, the room
 // earmarked for it meanwhile; a planned group (Share::plan) finds its floors reserved
-fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
+fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64, bool), Refusal> {
     let seg = sh.share.seg_bytes;
+    // the same rank of the same group back within the holdover: its lease as it was, still the group's member
+    if let Some(l) = unpark(sh, &w.name, |l| {
+        l.group.as_ref() == Some(&(w.group.clone(), w.rank)) && l.block_bytes as u64 == w.block_bytes
+    }) {
+        let bps = l.span as u64 / w.block_bytes;
+        return Ok((l, bps, true));
+    }
     if w.block_bytes == 0 || w.block_bytes > seg as u64 {
         return Err((proto::E_NOROOM, format!("a block of {} bytes does not fit a segment of {seg}", w.block_bytes)));
     }
@@ -1126,13 +1199,14 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
             seg,
             segs,
             Some((w.group.clone(), w.rank)),
+            w.persist,
         )?;
         st.groups.get_mut(&w.group).expect("made").members.insert(w.rank, Member { lease: l.id, segs: floor });
         break l;
     };
     l.zero(&l.segs.read().unwrap());
     sh.opened.fetch_add(1, Ordering::Relaxed);
-    Ok((l, bps))
+    Ok((l, bps, false))
 }
 
 fn group_of(l: &Lease) -> Result<&(String, u32), Refusal> {

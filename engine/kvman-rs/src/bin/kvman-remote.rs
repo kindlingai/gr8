@@ -2,9 +2,11 @@
 //! REMOTE-TIER.md), over TCP and, on addresses with a RoCE v2 GID, RDMA.
 //!   kvman-remote --gb N [--port 7350] [--bind 0.0.0.0] [--min-free-gb 10] [--no-rdma] [--qp-timeout 14] [--ready FILE]
 //!                [--seg-mb 1024] [--margin-s 60] [--stall-s 10] [--cooldown-s 10] [--group-plan FILE]
+//!                [--holdover-s 0]
 //! The --seg-mb .. --group-plan flags set how group leases share the node (server.rs Share, REMOTE-TIER.md).
 //! --group-plan reserves each planned group's floors from the start (lines `NAME nr=RANKS floor=SEGS`); the floors
-//! must fit the node.
+//! must fit the node. --holdover-s parks a lease opened with persist (a store's persist=lease) that long after its last
+//! connection closes, so a restarted engine of the same lease name finds its blocks as it left them.
 //! It refuses to start when locking N GiB would leave less than --min-free-gb of MemAvailable, and when RLIMIT_MEMLOCK
 //! is below N GiB (run it under `systemd-run -p LimitMEMLOCK=infinity`, or as root). Once it serves, it prints one JSON
 //! line (and writes it to --ready): the port, the bytes locked, and each address a client can reach it on over RDMA.
@@ -16,7 +18,8 @@ use g6kvman::remote::{parse_plan, sys, verbs, Config, Node, Share};
 fn usage() -> ! {
     eprintln!(
         "usage: kvman-remote --gb N [--port 7350] [--bind 0.0.0.0] [--min-free-gb 10] [--no-rdma] [--qp-timeout 14] \
-         [--ready FILE] [--seg-mb 1024] [--margin-s 60] [--stall-s 10] [--cooldown-s 10] [--group-plan FILE]"
+         [--ready FILE] [--seg-mb 1024] [--margin-s 60] [--stall-s 10] [--cooldown-s 10] [--group-plan FILE] \
+         [--holdover-s 0]"
     );
     std::process::exit(2)
 }
@@ -48,6 +51,7 @@ fn main() {
             "--margin-s" => share.margin = secs(v()),
             "--stall-s" => share.stall = secs(v()),
             "--cooldown-s" => share.cooldown = secs(v()),
+            "--holdover-s" => share.holdover = secs(v()),
             "--group-plan" => {
                 let p = v();
                 let text = std::fs::read_to_string(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
