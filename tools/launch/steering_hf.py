@@ -126,8 +126,8 @@ def bind(o, source):
     selected = request(o)
     if not selected:
         return
-    if source is None:
-        raise modelset.ModelError('--steering-profile hf:... requires an HF release (--model https://...)')
+    if source is None or o.get('BASE_PACKS'):
+        raise modelset.ModelError('--steering-profile hf:... requires an HF release without --base-packs')
     directory, manifest = source.steering_profile
     for key, field in IDENTITY.items():
         value = manifest['model'][field]

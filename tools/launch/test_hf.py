@@ -325,9 +325,10 @@ class HFTests(unittest.TestCase):
         self.assertEqual((o.get('V2_DENSE'), o.get('V2')), (ms.release.dir, ms.release.v2))
         self.assertEqual(ms.set['source'], {'kind': 'exlr8-release', 'weights': '5e' * 32})
         self.assertEqual(ms.tokenizer, ms.release.tokenizer)
-        plan = opt.engine_plan(o, rank=2, rank_dir=ms.dir, aux_dir=ms.dir, home='/h')
+        plan = opt.engine_plan(o, rank=2, rank_dir=ms.rank_dir(2), aux_dir=ms.rank_dir(2), home='/h')
         self.assertIn(ms.release.dir, plan['args'][plan['args'].index('--v2-dense') + 1])
         self.assertNotIn('--manifest', plan['args'])
+        self.assertEqual(modelset.needed(ms.set, 2, plan), {})
         self.assertEqual(str(ms.release), ms.source)
 
     def test_kvb_fp8_with_the_release_as_the_model(self):
@@ -338,7 +339,7 @@ class HFTests(unittest.TestCase):
         opt.validate(o)                                          # V2_DENSE is set later, by resolve_model
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
-        plan = opt.engine_plan(o, rank=2, rank_dir=ms.dir, aux_dir=ms.dir, home='/h')
+        plan = opt.engine_plan(o, rank=2, rank_dir=ms.rank_dir(2), aux_dir=ms.rank_dir(2), home='/h')
         self.assertIn('G6_KVB=fp8', plan['env'])
         self.assertIn('--v2-dense', plan['args'])
 
@@ -539,9 +540,9 @@ class DrafterTests(unittest.TestCase):
     def test_the_boot_without_a_drafter_and_with_one(self):
         import options as opt
         import supervisor as S
-        from test_modelset import make_release as local_release
-        rel = local_release(os.path.join(self.t, 'local'))
-        base = ['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model', rel]
+        from test_modelset import make_packs
+        packs = make_packs(os.path.join(self.t, 'packs'), dflash=False)
+        base = ['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model', packs]
         logs = []
 
         def boot(*argv):
@@ -559,6 +560,7 @@ class DrafterTests(unittest.TestCase):
         plan = opt.engine_plan(o, rank=3, rank_dir='/r', aux_dir='/a', home='/h', epoch=1)
         self.assertIn(os.path.join(ms.drafter.out, 'dflash.r3.pack'), plan['args'])
         self.assertIn('--dflash-pack @DFLASH_DIR/dflash.r@R.pack', ' '.join(opt.engine_plan(o)['args']))
+        self.assertEqual(sorted(modelset.needed(ms.set, 3, plan)), ['rank3.manifest.json', 'rank3.pack'])   # no dflash
         self.assertNotEqual(modelset.model_id(ms, v), ms.id)
         with self.assertRaises(opt.OptionError):
             opt.validate(opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter',
