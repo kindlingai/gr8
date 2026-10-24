@@ -7,7 +7,7 @@
 //   (3) the fabric slot: copy(c, n) is ordered before put(c, n+1) of the lane (the peer's rewrite of the slot needs that put)
 //   (5) k_wait_peers(n) is ordered after this lane's put(n) (the step cell and the doorbell are ours to read)
 //   (4) consume(n) kernel is ordered after copy(n), issue count == consume count, one outstanding issue per lane
-// mutations (a put moved before the consume, no used-wait) must be caught. NR = 2 and 4; 1 and 2 lanes; ON and OFF.
+// mutations (a put moved before the consume, no used-wait) must be caught. NR = 2, 3 and 4; 1 and 2 lanes; ON and OFF.
 //   g++ -std=c++17 -O2 -Wall engine/runtime/tests/pf_peer_stage_test.cpp -o /tmp/pf_peer_stage_test && /tmp/pf_peer_stage_test
 #include <cstdio>
 #include <cstdlib>
@@ -188,7 +188,7 @@ static void expect(const Cfg& cfg, bool ok, const char* name)
 
 int main()
 {
-    for (int nr : {2, 4})
+    for (int nr : {2, 3, 4})
         for (int lanes : {1, 2})
             for (int layers : {1, 2, 5})
             {

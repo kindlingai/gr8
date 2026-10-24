@@ -99,8 +99,10 @@ flash_env() {
 G6_FPF_ATTN_P1=0 G6_PF_SPARSE_MLA_P1=0 G6_PF_SPARSE_MLA_HYBRID=0 G6_PF_SPARSE_MLA=1 G6_PF_SPARSE_MLA_512=1 \
 G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_FC2V2=1 G6_PF_KDA_WS=1 \
 G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
-G6_PF_TIMES=1"
-  if [ "$TP" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_STAGE_ASYNC=1"; else ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"; fi
+G6_PF_TIMES=1 G6_PF_STAGE_ASYNC=1"
+  # the peer-partial staging (G6_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
+  # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
+  [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"
   ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
 }
 
