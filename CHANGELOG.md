@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-24: TP=5 boots its 19-block dense ranks, and prefills with PF_OWN=3
+
+- At TP=5 two ranks hold 19 of the 96 dense blocks (K 2,432). The dense trellis GEMV needs whole 128-channel blocks
+  per sub-part, so the down projection's two sub-parts at M > 3 had no k split, and those ranks stopped at layer 0
+  ("dense trellis GEMV: no k split fits this shape"). A shape with no split at two sub-parts now runs one.
+- The TP=5 default `PF_OWN` is 3 (was 1). On five GB10 from the HF release (`home`), the mean of two boots each: cold 8K
+  prefill 1,554 tok/s against 935, code 51.0 / 51.2, prose 38.0 / 38.3, C4 76.3 / 77.9 tok/s, at the same 502,848-token
+  pool. The boot takes about 130 s instead of 40 s while it builds the full-head weights (`QO_CACHE` keeps them for the
+  next boot). `--pf-own 1` restores the old behaviour.
+
 ## 2026-10-23: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
 
 - `G6_TR3_W2ALL=1` applies the window-2 fc1 split (KS1x2, WG1) to every MoE layer at M > 1, not only the layers the k2

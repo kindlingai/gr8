@@ -330,6 +330,14 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--reuse-prefix', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
 
+    def test_tp5_prefills_with_pf_own_3(self):
+        def env(*argv):
+            o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], {})
+            opt.validate(o)
+            return opt.engine_plan(o, rank=4, rank_dir='/r', aux_dir='/a', home='/h')['env']
+        self.assertIn('G6_PF_OWN=3', env())
+        self.assertIn('G6_PF_OWN=1', env('--pf-own', '1'))
+
     def test_tp4_tr3_w2all_default_on_and_override(self):
         def env(peers, *argv):
             o = opt.parse(['--no-config', '--peers', peers, *argv], {})

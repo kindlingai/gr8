@@ -51,7 +51,7 @@ manifest instead.
 | `SPEC_LEVELS` | all | – | – | the draft counts `SPEC_ADAPT` may choose, e.g. `7,5,3,2` |
 | `SPEC_ACCEPT` | coupled | coupled | coupled | `rejection` = rejection sampling of drafts at temperature > 0 |
 | `MTP` | 2 | 2 | 2 | MTP draft count (TP=4: for sessions that share steps, or with `DFLASH=0`; TP=6 and TP=3: every round) |
-| `PF_OWN` | 4 | 3 | 1 | prefill attention ownership (`G6_PF_OWN`); 3 also loads `packs/qo.pack`. TP=6 with `PF_OWN=1` needs no QO pack |
+| `PF_OWN` | 4 | 3 | 1 | prefill attention ownership (`G6_PF_OWN`); 3 also loads `packs/qo.pack`. TP=6 with `PF_OWN=1` needs no QO pack. TP=5: 3 |
 | `QP_ROLL` | 2 | – | – | `PF_OWN=4`: rolling pair-weight slots (`G6_PF_QP_ROLL`) |
 | `QP_CTX` | `CAP` | – | – | `PF_OWN=4`: QO key-table size; a longer request runs OWN=2 |
 | `QP_EARLY` | 1 | – | – | `PF_OWN=4`: send the counterpart's partial before the own rows' o_proj |
