@@ -35,6 +35,11 @@ if [ "$WHAT" = rs ]; then
   exit 0
 fi
 nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack.o
+# Flash: the kvchunks regions of G6_FLASH_KV_CHUNKS (runtime/flash_kv.h), one object for every width
+KVC=
+if [ "$ATTN_CU" = ../attn/flash_attn.cu ]; then
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -c ../attn/kvchunks.cu -o $O/kvchunks.o; KVC="$O/kvchunks.o -lcuda"
+fi
 nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
 if [ "$WHAT" = dfl ]; then
   nice -n 19 nvcc -O3 -std=c++17 $GEN -c $ATTN_CU -o $O/attn.o
@@ -94,7 +99,7 @@ done
 wait
 cat $O/*.log
 if ls $O/*.failed > /dev/null 2>&1; then echo "build_m4.sh failed: $(cd $O && ls *.failed | sed 's/\.log\.failed//')"; exit 1; fi
-SHARED="$O/g6pack.o $O/devimage.o $KVLIB"
+SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KVLIB"
 if [ "$WHAT" != sim ]; then SHARED="$SHARED $O/fabric.o"; fi
 if [ -n "$RSDEF" ]; then SHARED="$SHARED $RSLIB"; fi
 nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u > $O/shared.syms
@@ -109,13 +114,13 @@ inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of 
 if [ "$WHAT" != g6 ]; then
   I=""
   for n in $WIDTHS; do inst m4sim $n; I="$I $O/m4sim.w$n.i.o"; done
-  nice -n 19 nvcc -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $RSLINK $KVLIB -ldl -lm -lcublas -lpthread
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -lpthread
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
   I=""
   for n in $WIDTHS; do inst g6m4 $n; I="$I $O/g6m4.w$n.i.o"; done
-  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $RSLINK $KVLIB -ldl -lm -lcublas -libverbs -lpthread
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -libverbs -lpthread
   if [ -n "$RSDEF" ]; then echo "g6m4: Rust pack loader linked"; else echo "g6m4: no $RSLIB, C++ pack loader only"; fi
   ls -la $OUT/g6m4
 fi
