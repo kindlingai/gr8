@@ -768,7 +768,8 @@ fn main() {
                         // second
                         let mine: Vec<Ev> = tr.iter().filter(|e| e.cluster == i).copied().collect();
                         let mut k = 0;
-                        while t0.elapsed() < end {
+                        // every request runs, however late: each mode sees the same ones
+                        while k < mine.len() || t0.elapsed() < end {
                             let now = Instant::now();
                             let due = mine.get(k).map(|e| t0 + Duration::from_millis(e.t_ms));
                             if now >= next_poll {
@@ -792,7 +793,7 @@ fn main() {
                                     k += 1;
                                 }
                                 _ => {
-                                    let wake = due.map_or(next_poll, |d| d.min(next_poll)).min(t0 + end);
+                                    let wake = due.map_or(next_poll, |d| d.min(next_poll));
                                     std::thread::sleep(wake.saturating_duration_since(now));
                                 }
                             }
