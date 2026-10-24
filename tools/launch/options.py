@@ -74,6 +74,11 @@ KEYS = {
     'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
+    'FLASH_CACHE': ('cluster', None, 'glm53f, experimental: Flash session checkpoints, off (default) or aligned: a prompt '
+                                     'keeps its pages and KDA state at its last cold prefill grid point, and a later prompt '
+                                     'that starts with those tokens is prefilled from there, bit-exact (docs/FLASH.md)'),
+    'FLASH_STATE_BUDGET_MIB': ('cluster', None, 'glm53f, FLASH_CACHE: the checkpoint store in MiB a rank, in memory, '
+                                                'when no KV_STORE names one (8192)'),
     'KV_OFFLOAD': ('cluster', None, 'experimental: offload KV to this box\'s own SSD: PATH,size=N(M|G|T)[,persist=on|off]'
                                    '[,keep=RULE], one folder per box (rank r uses PATH/r<r>; --kv-offload given again for '
                                    'more). The same store as KV_STORE=ssd:PATH,..., tried before the KV_STORE stores'),
@@ -423,9 +428,24 @@ def validate(o):
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
     stores = kv_stores(o)
+    cache = o.get('FLASH_CACHE')
+    if cache not in (None, 'off', 'aligned'):
+        raise OptionError(f'--flash-cache {cache}: want off or aligned')
+    if cache not in (None, 'off') and model.name != 'glm53f':
+        raise OptionError(f'--flash-cache: Flash session checkpoints are glm53f only, not {model.name}')
+    budget = o.get('FLASH_STATE_BUDGET_MIB')
+    if budget is not None and not (str(budget).isdigit() and int(budget) >= 1):
+        raise OptionError(f'--flash-state-budget-mib {budget}: want a whole number of MiB from 1')
+    if model.name == 'glm53f' and stores:
+        if cache in (None, 'off'):
+            raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned')
+        if len(stores) > 1:
+            raise OptionError('--flash-cache keeps its checkpoints in one store: give one --kv-store')
+        if any(t['persist'] for t in stores):
+            raise OptionError('--flash-cache: Flash checkpoints do not persist across boots (persist=on)')
+    elif stores and o.get('REUSE') == '0':
+        raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
     if stores:
-        if o.get('REUSE') == '0':
-            raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
     rows = kv_rows(o)

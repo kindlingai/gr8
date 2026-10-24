@@ -95,6 +95,11 @@ G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_F
 G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
 G6_PF_TIMES=1"
   if [ "$TP" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_STAGE_ASYNC=1"; else ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"; fi
+  # FLASH_CACHE: session checkpoints at prefill quantum boundaries (docs/FLASH.md), off unless set
+  if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ]; then
+    ENGINE_ENV="$ENGINE_ENV G6_FLASH_CACHE=$FLASH_CACHE"
+    [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV G6_FLASH_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
+  fi
   ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
 }
 
@@ -205,6 +210,12 @@ engine_args() {
 --pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions 1 --s2-epoch $epoch"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    # FLASH_CACHE keeps its checkpoints in the KV_STORE store (one at most), else in memory
+    if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ] && [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+    fi
     (set -f; echo $a)
     return
   fi

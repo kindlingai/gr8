@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-23: GLM-5.3-Flash session checkpoints, `FLASH_CACHE=aligned` (experimental, off by default)
+
+- `./gr8 glm53f --flash-cache aligned` (`G6_FLASH_CACHE=aligned`): a prompt's prefill keeps its pages and KDA state at
+  its last cold prefill grid point (8,192 rows), and a later prompt that starts with the same tokens is prefilled from
+  there. Bit-exact against no cache by construction: the warm prefill runs the same quanta on the same state
+  (docs/FLASH.md). The store is the one `--kv-store` (memory, SSD or a KV node, on a lease of its own), else memory,
+  `--flash-state-budget-mib` (8192) a rank.
+- Tested: the index and manifest on the host (`scripts/host_tests.sh`), and capture/restore bit for bit, overwrite,
+  drops and corrupted blocks refused on one RTX 5090 through all three stores (`engine/tests/test_flash_ckpt.cu`). Not
+  yet run end to end on a cluster.
+- Not stash entries: the pool stash's share and resize do not see Flash checkpoints. No terminal checkpoint: decode's
+  per-row KDA update and the prefill's 64-row chunks give different fp32 state.
+
 ## 2026-10-23: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
 
 - `G6_TR3_W2ALL=1` applies the window-2 fc1 split (KS1x2, WG1) to every MoE layer at M > 1, not only the layers the k2

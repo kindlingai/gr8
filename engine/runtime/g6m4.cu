@@ -109,6 +109,7 @@
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
+#include "s2/flash_checkpoint.h"   // G6_FLASH_CACHE parsed in every build, refused outside Flash
 #include "s2/cp_rows.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
@@ -434,13 +435,26 @@ int main(int argc, char** argv)
             die("G6_MTP_KSTOPB needs --serve and --dflash-manifest (the draft log-probabilities); G6_MTP_KSTOPB_EXPLORE >= 0");
         if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
+    // G6_FLASH_CACHE (s2/flash_checkpoint.h): Flash session checkpoints under --serve, in place of prefix reuse. Its
+    // store is the one --kv-store (a lease of its own), else this process's memory, G6_FLASH_STATE_BUDGET_MIB a rank
+    g6s2::FlashCache flash_cache = g6s2::FlashCache::Off;
+    try { flash_cache = g6s2::flash_cache_mode(getenv("G6_FLASH_CACHE")); } catch (const std::exception& e) { die(e.what()); }
+    const long long flash_budget_mib = getenv("G6_FLASH_STATE_BUDGET_MIB") ? atoll(getenv("G6_FLASH_STATE_BUDGET_MIB")) : 8192;
 #if G6_MODEL_FLASH
     if (s2mode && (s2sess != 1 || reuse_prefix || dfl || plan.rs))
         die("Flash serve supports one session, no prefix reuse, DFlash or rejection sampling");
-#endif
+    if (flash_cache != g6s2::FlashCache::Off) {
+        if (!s2mode || !MP) die("G6_FLASH_CACHE needs --serve and tensor prefill (--prefill N)");
+        if (kv_tiers.size() > 1) die("G6_FLASH_CACHE: one --kv-store at most (its checkpoint store)");
+        if (kv_tiers.empty() && flash_budget_mib < 1) die("G6_FLASH_STATE_BUDGET_MIB: >= 1");
+    }
+    if (!kv_tiers.empty() && flash_cache == g6s2::FlashCache::Off) die("--kv-store on Flash needs G6_FLASH_CACHE (its checkpoint store)");
+#else
+    if (flash_cache != g6s2::FlashCache::Off) die("G6_FLASH_CACHE is GLM-5.3-Flash only (bin/g6m4_flash)");
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
+#endif
     if (kv_old)
     {
         if (kv_keep.empty()) kv_keep = kv_old_all ? "all" : "system";
@@ -1365,6 +1379,51 @@ int main(int argc, char** argv)
         bc.runtime_signature = "flash solo cap " + std::to_string(cap) + " layers " + layers_s +
             " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
             " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id;
+        // G6_FLASH_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
+        // store's blocks and the grid join the signature
+        std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
+        if (flash_cache != g6s2::FlashCache::Off)
+        {
+            g6s2::FlashStateView v;
+            for (g6rt::Model* x : {&m, &D.d})
+                for (g6rt::Layer& y : x->layers)
+                    if (!y.kda && y.ab.storage)
+                        v.bindings.push_back({static_cast<uint4*>(y.ab.args.mla_cache), static_cast<uint4*>(y.ab.args.index_cache),
+                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16)});
+            v.S = m.kda_st.S; v.conv = m.kda_st.conv; v.layers = kda::N_KDA; v.slots = m.kda_st.slots;
+            v.s_slot = m.kda_st.s_layer() / std::max(1, m.kda_st.slots); v.c_slot = m.kda_st.c_layer() / std::max(1, m.kda_st.slots);
+            std::string spec = "mem:";
+            uint64_t bytes = (uint64_t)flash_budget_mib << 20;
+            if (!kv_tiers.empty())
+            {
+                g6s2::TierSpec t;
+                try { t = g6s2::TierSpec::parse(kv_tiers[0], false); } catch (const std::exception& e) { die(std::string("G6_FLASH_CACHE: ") + e.what()); }
+                if (t.persist) die("G6_FLASH_CACHE: persist=on is not supported (checkpoints live for one boot)");
+                spec = t.store; bytes = t.bytes;
+                if (t.ssd())
+                {   // as the pool's stores: the folder starts empty at every boot
+                    const std::string dir = t.store.substr(4) + "/r" + std::to_string(R);
+                    if (std::filesystem::exists(dir)) std::filesystem::remove_all(dir);
+                    std::filesystem::create_directories(dir);
+                    spec = "ssd:" + dir + "/flash-ckpt";
+                }
+            }
+            char host[64] = "host";
+            gethostname(host, sizeof host - 1);
+            // its own lease name on a KV node: never the pool stash's (g6m4-...)
+            const std::string name = std::string("g6m4f-ckpt-") + host + "-" + std::to_string(s2epoch) + "-r" + std::to_string(R);
+            static const std::string exe = g6s2::exe_stamp();
+            const std::string compat = "flash set " + set_id + " nr " + std::to_string(g6nr::NR) + " rank " + std::to_string(R) +
+                " cap " + std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
+                std::to_string(v.bindings.size()) + " state " + std::to_string(v.state_bytes()) + " format " +
+                std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
+            try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat)); }
+            catch (const std::exception& e) { die(std::string("G6_FLASH_CACHE: ") + e.what()); }
+            fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows\n",
+                    R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
+                    v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1));
+            bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks());
+        }
         g6s2::FlashContext fc{m, D, FP, FP2, fab, fabd, fabp, fabp2, st, in, in_d, out, out_d,
             [&](int k, int rows) {
                 g6s2::require(k >= 0 && k < m.nbk && rows > 0 && rows <= MX && exec[k][rows], "Flash main graph missing");
@@ -1373,7 +1432,7 @@ int main(int argc, char** argv)
             [&](int k, bool chain, int rows) {
                 g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
-            }};
+            }, ckpt.get()};
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }

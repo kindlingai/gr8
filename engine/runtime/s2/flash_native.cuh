@@ -1,10 +1,16 @@
 // Flash's single resident request uses the existing S2 host service, but not the
 // full-GLM paged/multi-session bindings. KDA state is not a paged KV cache.
+// G6_FLASH_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h): the pool's prefix-reuse hooks serve Flash
+// checkpoints. A prompt's prefill keeps one at its last cold-grid point; a later prompt that starts with its tokens is
+// granted the skip, restored at bind and prefilled from there.
 #pragma once
 #if G6_MODEL_FLASH
 #include "service.h"
 #include "flash_ring.h"
+#include "flash_checkpoint.cuh"
 #include "../flash_prefill.cuh"
+#include <atomic>
+#include <mutex>
 namespace g6s2 {
 struct FlashContext {
     g6rt::Model& main;
@@ -16,6 +22,7 @@ struct FlashContext {
     g6rt::StepOut *output, *draft_output;
     std::function<void(int, int)> main_graph;
     std::function<void(int, bool, int)> draft_graph;
+    FlashCheckpoints* ckpt = nullptr;   // G6_FLASH_CACHE on: the checkpoint store, else none
 };
 inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     using namespace g6rt;
@@ -38,20 +45,62 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 !*c.prefill_fabric.dev().error && (!sc.two_lanes || !*c.prefill_fabric2.dev().error) &&
                 !attn_errors(c.main) && !attn_errors(c.draft.d), "Flash serve fabric/attention error");
     };
+    // checkpoints: the index is read by the head's admission and written by the prefill, under ck_mu
+    FlashCheckpoints* const ck = c.ckpt;
+    const uint32_t grid = sc.prefill_rows * (sc.two_lanes ? 2 : 1);
+    std::mutex ck_mu;
+    std::atomic<uint64_t> claimed{0};   // the entry take() granted, restored by the bind that follows
+    uint32_t capture_at = 0;            // the live request's checkpoint point (0: none)
+    g6rt::CacheNamespace capture_ns{};
     NativeHooks h;
     h.pool.free_pages = [&] { return pool.free_pages(); };
     h.pool.room = [&] { return pool.room(); };
     h.pool.reserve = [&](uint64_t n, uint64_t worst) { return pool.reserve(n, worst); };
     h.pool.release = [&](const Run& r) { pool.release(r); };
     h.pool.fits = [&](uint64_t n, uint64_t worst) { return pool.fits(n, worst); };
-    h.pool.digest = [&] { return pool.digest(); };
+    h.pool.digest = [&]() -> uint64_t {
+        if (!ck) return pool.digest();
+        std::lock_guard<std::mutex> l(ck_mu);
+        return pool.digest() ^ (ck->index().digest() * 0x9E3779B97F4A7C15ull);
+    };
+    if (ck) {
+        // a retiring run goes back to the pool: its checkpoint, if any, was taken during its prefill
+        h.pool.retain = [&](const Run& r, const g6rt::PrefixReuse&, const g6rt::CacheNamespace&) { pool.release(r); };
+        h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const g6rt::CacheNamespace& ns) {
+            std::lock_guard<std::mutex> l(ck_mu);
+            const FlashHit f = ck->index().match(prompt, limit, ns);
+            PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
+            if (f.hit && pool.fits(rows, worst)) { hit.skip = int(f.position); hit.age = f.generation; }
+            else if (f.hit) hit.why = "room";
+            return hit;
+        };
+        h.pool.take = [&](const PoolHit& hit, uint64_t rows, uint64_t worst) {
+            claimed.store(hit.age);
+            return pool.reserve(rows, worst);
+        };
+    }
     h.bind = [&](const Grant& g) {
-        require(g.key.slot == 0 && !g.reuse && g.run.first_page == 0,
+        require(g.key.slot == 0 && (!g.reuse || ck) && g.run.first_page == 0,
                 "Flash serve requires a fresh identity run");
         const auto list = pool.list(g.run);
         for (size_t i = 0; i < list.size(); ++i) require(list[i] == int(i), "Flash run is not contiguous");
         reset(c.main, c.stream); reset(c.draft.d, c.stream);
         ring.reset(); lp_rows = 0; fence();
+        capture_at = 0;
+        if (!ck) return;
+        capture_ns = g6rt::steering::cache_namespace(g.req.steering);
+        if (g.reuse) {   // the cold bind's state, then rows [0, reuse) and KDA slot 0 from the entry
+            const uint64_t gen = claimed.exchange(0);
+            require(gen != 0, "Flash checkpoint hit without a claimed entry");
+            std::lock_guard<std::mutex> l(ck_mu);
+            const FlashEntry* x = ck->index().find(gen);
+            require(x && x->position == g.reuse, "Flash checkpoint hit differs from its entry");
+            ck->restore(gen, 0, c.stream);
+            fprintf(stderr, "# flash ckpt request %llu restored %u rows (entry %llu, %llu blocks) in %.1f ms\n",
+                    (unsigned long long)g.req.id, g.reuse, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms);
+        }
+        const uint32_t at = aligned_point(g.req.prompt_tokens, grid);
+        if (at > g.reuse) capture_at = at;   // at == reuse: the entry that was hit holds these tokens
     };
     h.retire = [&](const Slot&) { fence(); };
     h.fence = fence;
@@ -131,6 +180,18 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         };
         draft(c.prefill, ma, a);
         if (mb) draft(c.prefill2, mb, a + ma);
+        if (capture_at && first + rows == capture_at) {   // the quantum that ends at the prompt's last grid point
+            require(p.prompt.size() > capture_at, "Flash checkpoint past the prompt");
+            const std::vector<int> tokens(p.prompt.begin(), p.prompt.begin() + capture_at + 1);
+            std::lock_guard<std::mutex> l(ck_mu);
+            const uint64_t gen = ck->capture(capture_at, 0, tokens, capture_ns, c.stream);
+            if (gen) fprintf(stderr, "# flash ckpt request %llu kept %u rows as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
+                             (unsigned long long)slot.req.id, capture_at, (unsigned long long)gen,
+                             (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
+            else fprintf(stderr, "# flash ckpt request %llu: %u rows do not fit the store (%llu blocks)\n",
+                         (unsigned long long)slot.req.id, capture_at, (unsigned long long)ck->blocks());
+            capture_at = 0;
+        }
         fprintf(stderr, "# flash serve request %llu prefill %u rows at %u (main + draft): %.3f ms\n",
                 (unsigned long long)slot.req.id, rows, first,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());

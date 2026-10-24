@@ -109,6 +109,8 @@ manifest instead.
 |---|---|---|---|---|
 | `GR8_MODEL` | `--gr8-model` | `glm53` | cluster | the model: `glm53` or `glm53f`. `./gr8 <model>` sets it |
 | `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3 (glm53f: 4 or 2); needed with mentat |
+| `FLASH_CACHE` | `--flash-cache` | `off` | cluster | glm53f, experimental: `aligned` = session checkpoints, so a prompt that starts with an earlier prompt's tokens is prefilled from that prompt's last 8,192-row grid point, bit-exact (`G6_FLASH_CACHE`, [docs/FLASH.md](docs/FLASH.md)). The store is the one `KV_STORE` (no `persist=on`), else memory. On glm53f, `KV_STORE` needs it |
+| `FLASH_STATE_BUDGET_MIB` | `--flash-state-budget-mib` | 8192 | cluster | `FLASH_CACHE` with no `KV_STORE`: the in-memory checkpoint store a rank, in MiB (`G6_FLASH_STATE_BUDGET_MIB`) |
 | `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch): each box's f0 port cabled to the next box's f1 port, in `--peers` order. Needs `--peers`, takes no `--ips` |
 | `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
 | `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
