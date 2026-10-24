@@ -1504,6 +1504,7 @@ mod tests {
             next_id: 1,
             plan: BTreeMap::new(),
             waiting: BTreeMap::new(),
+            parked: BTreeMap::new(),
         }
     }
 
