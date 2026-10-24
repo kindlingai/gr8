@@ -197,21 +197,24 @@ public:
     FlashIndex& index() { return index_; }
     uint64_t blocks() const { return index_.blocks(); }
     size_t slot_bytes() const { return slot_; }
-    uint64_t entry_blocks(uint32_t position) const { return 1 + position / 64 + state_blocks_; }
+    uint64_t entry_blocks(uint32_t position) const { return 1 + (position + 63) / 64 + state_blocks_; }
     std::string describe() const { char b[256]; g6kv_tier_describe(t_, b, sizeof b); return b; }
     // keep rows [0, position) of the live sequence and KDA slot `slot` (the state after them) as an entry for `tokens`
     // (position + 1 of them). Returns the entry's generation, or 0: the store cannot hold it. The same tokens already
-    // kept: that entry is marked used and nothing is written.
-    uint64_t capture(uint32_t position, int slot, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st) {
-        if (position % 64 || tokens.size() != size_t(position) + 1 || slot < 0 || slot >= v_.slots)
+    // kept: that entry is marked used and nothing is written. terminal: position may end mid-page (the whole last page
+    // is kept); otherwise it must be on the page grid.
+    uint64_t capture(uint32_t position, int slot, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st,
+                     bool terminal = false) {
+        if (!position || (!terminal && position % 64) || tokens.size() != size_t(position) + 1 || slot < 0 || slot >= v_.slots)
             throw std::runtime_error("Flash checkpoint: capture at " + std::to_string(position) + " with " + std::to_string(tokens.size()) + " tokens");
         if (const FlashEntry* x = index_.same(tokens, ns)) { index_.touch(x->generation); return x->generation; }
         const auto t0 = std::chrono::steady_clock::now();
-        const uint64_t np = position / 64, need = entry_blocks(position);
+        const uint64_t np = (position + 63) / 64, need = entry_blocks(position);
         uint64_t base = 0;
         if (!index_.reserve(need, base)) return 0;
         FlashEntry x;
-        x.generation = index_.next_generation(); x.base = base; x.blocks = need; x.position = position; x.tokens = tokens; x.ns = ns;
+        x.generation = index_.next_generation(); x.base = base; x.blocks = need; x.position = position; x.terminal = terminal;
+        x.tokens = tokens; x.ns = ns;
         x.manifest = flash_manifest(x.generation, compat_, position, tokens, ns, np, block_, v_.state_bytes());
         const auto sx = v_.state(slot);
         x.manifest.page_sum = sum(page_extents(np), st);
@@ -242,7 +245,7 @@ public:
         FlashManifest m;
         std::memcpy(&m, host_, sizeof m);
         if (const char* why = m.differs(x->manifest)) throw std::runtime_error(std::string("Flash checkpoint ") + std::to_string(generation) + ": " + why);
-        const uint64_t np = x->position / 64;
+        const uint64_t np = (x->position + 63) / 64;
         for (uint64_t p = 0; p < np; p += batch_) {
             const int n = (int)std::min<uint64_t>(batch_, np - p);
             io(x->base + 1 + p, n, false);

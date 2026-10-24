@@ -89,6 +89,17 @@ Why a checkpoint is not taken at the end of the prompt: decode advances the KDA 
 fp32 arithmetic give different state, so a state taken after decode is not the state a cold prefill of the same tokens
 gives. A terminal checkpoint is not cold-exact by construction.
 
+`FLASH_CACHE=terminal` (`G6_FLASH_CACHE=terminal`, experimental, **NOT cold-exact**) keeps aligned's checkpoints and
+one more at the end of every request: `p` = the rows the request consumed (prompt and output; its last output token is
+still pending and becomes token `p`), with the KDA state the verify ring holds for `p` and the pages through `p`, the
+last one partial. A later prompt that starts with those `p + 1` tokens (an agent's next turn sent as raw tokens) is
+prefilled from `p`. Its output differs from a cold prefill's: the KDA state comes from decode, and the prefill from `p`
+runs quanta a cold prefill does not. How much is measured (token diff against no cache on the same trace, NLL delta,
+needles), not argued. After a terminal hit the request keeps no aligned checkpoint (its rows are not cold rows), so
+aligned entries stay exact. The MTP layer's row `p - 1` may not hold the last token's draft row; that changes only
+which drafts are accepted. The boot and request log lines say `terminal`. Aligned stays the mode to use when the output
+must match no cache.
+
 The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:PORT`, `persist=on` refused), else
 this process's memory, `FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot. On a KV node
 the lease is `g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one contiguous range of
@@ -108,7 +119,7 @@ Limits:
 - Checkpoints are not entries of the pool's block stash (`engine/kvman-rs` `stash.rs`), so the stash's share and resize
   do not see them.
 - Each capture writes the whole prefix `[0, p)`, not only the rows past the entry it started from.
-- No terminal checkpoint (above).
+- `terminal` is not cold-exact (above).
 
 ## Not yet
 

@@ -1432,7 +1432,7 @@ int main(int argc, char** argv)
             [&](int k, bool chain, int rows) {
                 g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
-            }, ckpt.get()};
+            }, ckpt.get(), flash_cache == g6s2::FlashCache::Terminal};
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }

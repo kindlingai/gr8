@@ -3,7 +3,7 @@
 // GLM-5.3-Flash keeps two kinds of state for a sequence: the paged KV of its 12 attention bindings (11 DSA layers and
 // the MTP layer, rows by position) and the KDA state of its 34 linear-attention layers (fp32 S and the conv history,
 // one value after the last row consumed, the same size at any context). A page-only hit is not a hit: the KDA state
-// after p rows cannot be rebuilt from the pages. So a checkpoint is one object: the pages [0, p / 64), the KDA state
+// after p rows cannot be rebuilt from the pages. So a checkpoint is one object: the pages [0, ceil(p / 64)), the KDA state
 // after rows [0, p) and a manifest, stored in one contiguous block range of one store and dropped as one.
 //
 // aligned (the mode this file serves first): p is a point of the cold prefill grid, G = --prefill rows x lanes (the
@@ -14,6 +14,14 @@
 // conditions make that true: the KDA prefill is chunked by quantum (engine/kda/prefill.h), so p must be a quantum
 // boundary; and the MTP layer's row p - 1 reads token p, so the prompt must match through token p (the MTP rule of
 // prefix_reuse.h), which is why an entry keeps p + 1 tokens.
+//
+// terminal (G6_FLASH_CACHE=terminal, NOT cold-exact): aligned's checkpoints, and at the end of every request one more at
+// p = the rows the request consumed (prompt + output, the last output token still pending), with that pending token as
+// token p. Its pages may end mid-page (the whole last page is kept). The KDA state is the one decode left: decode
+// advances it one row at a time (engine/kda/kda.cuh) and the prefill in chunks of 64 rows (engine/kda/kda_prefill.cuh),
+// two orders of fp32 arithmetic, so it is not the state a cold prefill of the same tokens gives, and the prefill from p
+// runs quanta a cold prefill does not. Its effect on the output is measured, not argued. The MTP layer's row p - 1 may
+// be the one decode wrote before the last token or none: it changes only which drafts are accepted.
 //
 // Not the full DESIGN M5: checkpoints are not entries of the pool's block stash (kvman-rs stash.rs), so B3 share and
 // resize do not see them. Every rank keeps the same index (the same captures in the same order, the same sizes), and
@@ -29,14 +37,18 @@
 #include <vector>
 
 namespace g6s2 {
-enum class FlashCache { Off, Aligned };
+// terminal: aligned, and also a checkpoint at the end of every request (below). Not cold-exact.
+enum class FlashCache { Off, Aligned, Terminal };
 inline FlashCache flash_cache_mode(const char* v) {
     const std::string s = v ? v : "off";
     if (s == "off" || s == "0") return FlashCache::Off;
     if (s == "aligned") return FlashCache::Aligned;
-    throw std::runtime_error("G6_FLASH_CACHE=" + s + ": off or aligned");
+    if (s == "terminal") return FlashCache::Terminal;
+    throw std::runtime_error("G6_FLASH_CACHE=" + s + ": off, aligned or terminal");
 }
-inline const char* flash_cache_name(FlashCache m) { return m == FlashCache::Aligned ? "aligned" : "off"; }
+inline const char* flash_cache_name(FlashCache m) {
+    return m == FlashCache::Terminal ? "terminal" : m == FlashCache::Aligned ? "aligned" : "off";
+}
 
 // the last cold prefill quantum boundary at or before the prompt's prefilled rows (prompt_tokens - 1: the last prompt
 // token runs as the prompt-tail step). 0 = none. A quantum is full only while more than one lane's rows are left, so
@@ -100,6 +112,7 @@ struct FlashEntry {
     uint64_t generation = 0, used = 0;   // used: the index clock at capture or the last hit (least recently used goes first)
     uint64_t base = 0, blocks = 0;       // the store's blocks [base, base + blocks): manifest, pages, state
     uint32_t position = 0;
+    bool terminal = false;               // kept at the end of a request (G6_FLASH_CACHE=terminal), not on the grid
     std::vector<int> tokens;             // position + 1
     g6rt::CacheNamespace ns{};
     FlashManifest manifest;              // what the entry's first block must hold (sealed)

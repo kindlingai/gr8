@@ -23,6 +23,7 @@ struct FlashContext {
     std::function<void(int, int)> main_graph;
     std::function<void(int, bool, int)> draft_graph;
     FlashCheckpoints* ckpt = nullptr;   // G6_FLASH_CACHE on: the checkpoint store, else none
+    bool terminal = false;              // G6_FLASH_CACHE=terminal: also a checkpoint at the end of every request
 };
 inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     using namespace g6rt;
@@ -64,8 +65,25 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         return pool.digest() ^ (ck->index().digest() * 0x9E3779B97F4A7C15ull);
     };
     if (ck) {
-        // a retiring run goes back to the pool: its checkpoint, if any, was taken during its prefill
-        h.pool.retain = [&](const Run& r, const g6rt::PrefixReuse&, const g6rt::CacheNamespace&) { pool.release(r); };
+        // a retiring run goes back to the pool: its aligned checkpoint, if any, was taken during its prefill. terminal:
+        // first keep rows [0, p), p = the rows it consumed (its last output token is pending: token p), with the KDA
+        // state the ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step.
+        h.pool.retain = [&](const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
+            if (c.terminal && st.history.size() > 1) {
+                const uint32_t p = uint32_t(std::min<int>(st.main_end, int(st.history.size()) - 1));
+                int slot = -1;
+                try { slot = ring.source(int(p)); } catch (const std::exception&) {}
+                if (p > 0 && slot >= 0) {
+                    const std::vector<int> tokens(st.history.begin(), st.history.begin() + p + 1);
+                    std::lock_guard<std::mutex> l(ck_mu);
+                    const uint64_t gen = ck->capture(p, slot, tokens, ns, c.stream, true);
+                    if (gen) fprintf(stderr, "# flash ckpt terminal kept %u rows (KDA slot %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
+                                     p, slot, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
+                    else fprintf(stderr, "# flash ckpt terminal: %u rows do not fit the store (%llu blocks)\n", p, (unsigned long long)ck->blocks());
+                } else fprintf(stderr, "# flash ckpt terminal: no state for %u rows (ring %d+%d)\n", p, ring.first, ring.rows);
+            }
+            pool.release(r);
+        };
         h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const g6rt::CacheNamespace& ns) {
             std::lock_guard<std::mutex> l(ck_mu);
             const FlashHit f = ck->index().match(prompt, limit, ns);
@@ -89,18 +107,23 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         capture_at = 0;
         if (!ck) return;
         capture_ns = g6rt::steering::cache_namespace(g.req.steering);
+        bool exact = true;   // the rows this request starts from are cold rows (no hit, or an aligned entry)
         if (g.reuse) {   // the cold bind's state, then rows [0, reuse) and KDA slot 0 from the entry
             const uint64_t gen = claimed.exchange(0);
             require(gen != 0, "Flash checkpoint hit without a claimed entry");
             std::lock_guard<std::mutex> l(ck_mu);
             const FlashEntry* x = ck->index().find(gen);
             require(x && x->position == g.reuse, "Flash checkpoint hit differs from its entry");
+            exact = !x->terminal;
             ck->restore(gen, 0, c.stream);
-            fprintf(stderr, "# flash ckpt request %llu restored %u rows (entry %llu, %llu blocks) in %.1f ms\n",
-                    (unsigned long long)g.req.id, g.reuse, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms);
+            fprintf(stderr, "# flash ckpt request %llu restored %u rows (%s entry %llu, %llu blocks) in %.1f ms\n",
+                    (unsigned long long)g.req.id, g.reuse, exact ? "aligned" : "terminal", (unsigned long long)gen,
+                    (unsigned long long)ck->last.blocks, ck->last.ms);
         }
+        // at == reuse: the entry that was hit holds these tokens. After a terminal hit no aligned entry is kept: its
+        // rows would not be cold rows
         const uint32_t at = aligned_point(g.req.prompt_tokens, grid);
-        if (at > g.reuse) capture_at = at;   // at == reuse: the entry that was hit holds these tokens
+        if (exact && at > g.reuse) capture_at = at;
     };
     h.retire = [&](const Slot&) { fence(); };
     h.fence = fence;

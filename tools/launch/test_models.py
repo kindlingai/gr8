@@ -69,9 +69,11 @@ class OptionTests(unittest.TestCase):
         self.assertNotIn('--kv-store', plan['args'])
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G'))
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G')
-        for argv, want in ((['--flash-cache', 'terminal'], 'want off or aligned'),
+        plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
+        self.assertIn('G6_FLASH_CACHE=terminal', plan['env'])
+        for argv, want in ((['--flash-cache', 'sessions'], 'want off, aligned or terminal'),
                            (['--flash-state-budget-mib', '0'], 'whole number of MiB'),
-                           (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned'),
+                           (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned or terminal'),
                            (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G', '--kv-store',
                              'ssd:/tmp/b,size=1G'], 'give one --kv-store'),
                            (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],

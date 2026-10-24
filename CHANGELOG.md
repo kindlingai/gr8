@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-23: `FLASH_CACHE=terminal`, Flash checkpoints at the end of every request (experimental, NOT cold-exact)
+
+- `./gr8 glm53f --flash-cache terminal` (`G6_FLASH_CACHE=terminal`): aligned's checkpoints, and one more when a request
+  ends, at the rows it consumed, so an agent's next turn sent as raw tokens is prefilled from the end of the last one.
+  Not cold-exact by construction: the KDA state comes from decode (per row, `kda.cuh`), not the prefill (64-row chunks,
+  `kda_prefill.cuh`). The output difference against no cache is to be measured on the box; aligned stays the exact mode.
+- Tested on the dev box: a partial last page captured and restored bit for bit through memory, SSD and a loopback KV
+  node (`engine/tests/test_flash_ckpt.cu`), and the actual retain hook against CPU mocks
+  (`engine/tests/test_flash_terminal_retain.py`).
+
 ## 2026-10-23: GLM-5.3-Flash session checkpoints, `FLASH_CACHE=aligned` (experimental, off by default)
 
 - `./gr8 glm53f --flash-cache aligned` (`G6_FLASH_CACHE=aligned`): a prompt's prefill keeps its pages and KDA state at

@@ -3,7 +3,8 @@
 //   usage: test_flash_ckpt STORE...   (mem:, ssd:FILE, remote:HOST:PORT; the corruption cases need ssd:)
 // For each store: a checkpoint survives poisoning every device byte (pages and KDA state come back bit for bit, the rows
 // and slots it does not own stay as they were), A -> B -> overwrite -> A at short and long context, more pages than one
-// copy batch, a slot other than 0, a capture off the page grid refused, least-recently-used drops, and (ssd:) a torn
+// copy batch, a slot other than 0, a capture off the page grid refused unless terminal (a
+// partial last page), least-recently-used drops, and (ssd:) a torn
 // manifest, a changed page byte and a changed state byte refused.
 #include "../runtime/s2/flash_checkpoint.cuh"
 #include <cassert>
@@ -152,6 +153,20 @@ static void run(const std::string& spec, int n_store) {
     const auto P3 = d.snap();
     ck.restore(gA, 0, st);   // the survivor still restores after the store moved around it
     assert(check(d, A, P3, 40, 0, 0));
+    // 4b. terminal: a position mid-page (10 pages + 37 rows, the whole 11th page kept) from ring slot 1 into slot 0. The
+    // store drops L (least recently used: A was restored after it); A stays
+    d.fill(7);
+    const auto T = d.snap();
+    const auto tT = toks(10 * 64 + 37 + 1, 7);
+    assert(!throws([&] { ck.capture(10 * 64 + 37, 1, tT, {}, st); }).empty());   // not terminal: refused
+    const uint64_t gT = ck.capture(10 * 64 + 37, 1, tT, {}, st, true);
+    assert(gT && ck.index().find(gT)->terminal && ck.index().find(gT)->blocks == 1 + 11 + sb);
+    assert(ck.index().find(gA) && !ck.index().find(gL));
+    d.poison();
+    const auto P4 = d.snap();
+    ck.restore(gT, 0, st);
+    printf("  terminal 10 pages + 37 rows: %llu blocks, restore %.1f ms\n", (unsigned long long)ck.last.blocks, ck.last.ms);
+    assert(check(d, T, P4, 11, 1, 0));
     // 5. the bytes in the store must be the entry's (ssd: the file is ours to change)
     if (spec.rfind("ssd:", 0) == 0) {
         const std::string file = spec.substr(4);
@@ -183,5 +198,5 @@ static void run(const std::string& spec, int n_store) {
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: test_flash_ckpt STORE...\n"); return 2; }
     for (int i = 1; i < argc; ++i) run(argv[i], i);
-    puts("flash_ckpt: PASS (poison and restore bit for bit, A->B->overwrite->A, batches, slots, grid refusal, drops, corruption refused)");
+    puts("flash_ckpt: PASS (poison and restore bit for bit, A->B->overwrite->A, batches, slots, grid refusal, terminal partial page, drops, corruption refused)");
 }

@@ -25,6 +25,11 @@ static FlashEntry entry(FlashIndex& ix, uint32_t p, const std::vector<int>& prom
 }
 int main() {
     // the aligned point: the last full-quantum end at or before prompt_tokens - 1 rows
+    // the modes
+    assert(flash_cache_mode(nullptr) == FlashCache::Off && flash_cache_mode("off") == FlashCache::Off);
+    assert(flash_cache_mode("aligned") == FlashCache::Aligned && flash_cache_mode("terminal") == FlashCache::Terminal);
+    assert(std::string(flash_cache_name(FlashCache::Terminal)) == "terminal");
+    try { flash_cache_mode("sessions"); assert(false); } catch (const std::runtime_error&) {}
     assert(aligned_point(8193, 8192) == 8192);   // 8192 prefill rows + the prompt tail
     assert(aligned_point(8192, 8192) == 0);      // 8191 rows: one partial quantum
     assert(aligned_point(20000, 8192) == 16384);
