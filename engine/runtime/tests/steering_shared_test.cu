@@ -268,7 +268,9 @@ int main(int argc,char** argv) {
     FILE* dump=nullptr;
     if(argc==3 && !std::strcmp(argv[1],"--stock-dump")) { dump=std::fopen(argv[2],"wb"); if(!dump) return 2; }
     else if(argc!=1) return 2;
-    for(int M:{1,8,9,G6_MX}) for(bool sh:{false,true}) for(bool bf:{false,true}) for(bool slot:{false,true}) {
+    // M = 9 and G6_MX need the 32-row build (-DDEC_S2): the 8-row build sizes the token plans for G6_MX = 8 rows.
+    const std::vector<int> rows=G6_MX>8 ? std::vector<int>{1,8,9,G6_MX}:std::vector<int>{1,8};
+    for(int M:rows) for(bool sh:{false,true}) for(bool bf:{false,true}) for(bool slot:{false,true}) {
 #ifndef DEC_SLOT
         if(slot) continue;
 #endif
