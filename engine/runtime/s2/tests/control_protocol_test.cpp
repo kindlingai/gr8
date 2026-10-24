@@ -20,6 +20,22 @@ int main()
     CHECK(d.commit.admit && d.commit.admit->run == e.commit.admit->run && d.commit.admit->reuse == 4096 && d.commit.admit->restored == 2 &&
           d.commit.admit->counted == 3);
     CHECK(d.commit.admit->key == e.commit.admit->key && d.commit.admit->req.id == 99 && d.commit.admit->req.prompt_tokens == 5000);
+    // a Resize event: its commit carries the change and nothing else, and needs a RESIZE notice
+    EventCommit r;
+    r.notice = Notice{7, 13, 3500, 0, 0, EventKind::Resize};
+    r.commit.epoch = 7; r.commit.event = 13; r.commit.boundary = 3500; r.commit.before_hash = 42;
+    r.commit.resize = Resize{1, 12, 12 * 38, 5};
+    const EventCommit rd = decode_commit(encode(r));
+    CHECK(rd.notice.kind == EventKind::Resize && rd.commit.resize && *rd.commit.resize == *r.commit.resize && !rd.commit.admit &&
+          !rd.commit.cancel && !rd.commit.hold);
+    bool mixed = false;
+    r.commit.cancel = Key{7, 2, 5};
+    try { (void)encode(r); } catch (const std::exception&) { mixed = true; }
+    CHECK(mixed);
+    bool unannounced = false;
+    r.commit.cancel.reset(); r.notice.kind = EventKind::Cancel;
+    try { (void)encode(r); } catch (const std::exception&) { unannounced = true; }
+    CHECK(unannounced);
     b[7] ^= 1;                                               // another frame version
     bool refused = false;
     try { decode_commit(b); } catch (const std::exception&) { refused = true; }

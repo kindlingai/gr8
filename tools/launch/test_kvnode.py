@@ -49,6 +49,19 @@ class OptionTests(unittest.TestCase):
         self.assertEqual((o.get('GROUP'), o.get('KV_GB')), ('gr8-test', '3'))
         os.unlink(f.name)
 
+    def test_lazy_lock_and_its_guard(self):
+        o = K.parse(['--no-config', '--gb', '8'], {})
+        K.validate(o)
+        self.assertNotIn('--lazy-lock', K.node_argv(o, 'kvman-remote', 'r.json'), 'off by default: the node as before')
+        for a in (['--lazy-lock'], ['KV_LAZY_LOCK=1', '--guard-every-s', '0.5']):
+            o = K.parse(['--no-config', '--gb', '8', *a], {})
+            K.validate(o)
+            v = K.node_argv(o, 'kvman-remote', 'r.json')
+            self.assertEqual(v[v.index('--lazy-lock'):], ['--lazy-lock', '--guard-every-s', '0.5' if len(a) > 1 else '1'])
+        for bad in (['KV_LAZY_LOCK=yes'], ['--guard-every-s', '-1'], ['--guard-every-s', 'often']):
+            with self.assertRaises(opt.OptionError):
+                K.validate(K.parse(['--no-config', '--gb', '8', *bad], {}))
+
     def test_up_needs_a_size(self):
         for a in ([], ['--gb', '0'], ['--gb', 'lots']):
             with self.assertRaises(opt.OptionError):

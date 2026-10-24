@@ -37,6 +37,9 @@ if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 # the KV node ./gr8 kv up runs
 KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
 if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
+# the host ledger of a Flash box that lends memory to a KV node (FLASH_KV_DONATE_GIB)
+LEDGER_BIN=$REPO/engine/kvman-rs/target/release/kvman-ledger
+if [ -x "$LEDGER_BIN" ]; then cp "$LEDGER_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
 WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 5 6 8}}
@@ -75,6 +78,11 @@ case "${MODEL:-glm}" in
     mv "$OUT/flash/m4sim" "$OUT/m4sim_flash" && mv "$OUT/flash/g6m4" "$OUT/g6m4_flash" && rm -rf "$OUT/flash"
     md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
     widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"
+    # the Flash serve's own hooks are in the binary (borrow-idle lived in GLM-only code once and no unit test saw it)
+    for m in "flash kv: borrow-idle, %u of" "flash ckpt share: now"; do
+      grep -c -a -F "$m" "$OUT/g6m4_flash" > /dev/null || { echo "$OUT/g6m4_flash lacks '$m'"; exit 1; }
+    done
+    echo "g6m4_flash has its serve hooks"
     exit 0 ;;
   *) echo "MODEL=$MODEL: glm or flash"; exit 2 ;;
 esac

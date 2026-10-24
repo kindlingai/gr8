@@ -42,6 +42,8 @@ struct G6AttnBinding {
     void *storage, *scratch;
     size_t storage_bytes, scratch_bytes;
     int rank, layer, head_begin, capacity, max_rows, full_index;
+    // Flash, G6_FLASH_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
+    void* kv_chunks[2];
 };
 
 // Binding must initially be zero-initialized and must NOT be copied after create.
@@ -54,6 +56,16 @@ extern "C" int g6_attn_bind_create(G6AttnBinding*, const G6AttnPack*, int rank,
 // instead of a slice of storage. Bindings may share one ext_scratch only if their runs never overlap (one stream).
 extern "C" int g6_attn_bind_create_ext(G6AttnBinding*, const G6AttnPack*, int rank,
     int layer, int capacity, int max_rows, int query_tile, void* stream, void* ext_scratch, size_t ext_bytes);
+#if G6_MODEL_FLASH
+struct G6KvChunks;
+// Flash (G6_FLASH_KV_CHUNKS): the MLA and index caches are the two regions (kvchunks.h, each at least the capacity's
+// pages; the caller frees them after release), the rest is storage as g6_attn_bind_create. Kernels see the same
+// pointers; no step may reach a page whose chunk is offline. Reset zeroes only what the regions back.
+extern "C" int g6_attn_bind_create_chunked(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,
+    int max_rows, int query_tile, void* stream, G6KvChunks* mla, G6KvChunks* idx);
+// Pages of the smallest chunk that gives back all its bytes: its MLA and index bytes are whole granules (0: none).
+extern "C" uint32_t g6_flash_kv_chunk_pages(size_t granule);
+#endif
 // Decode scratch bytes a binding with these heads / capacity / max_rows / query_tile needs (0: invalid).
 extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile);
 #if defined(G6_CP) && G6_CP

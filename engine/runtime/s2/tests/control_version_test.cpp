@@ -1,7 +1,7 @@
 // Ranks of different control builds refuse each other at bootstrap (s2/bootstrap.h agreement carries CONTROL_VERSION,
 // scheduler.h) and a commit frame of another version is refused (control_protocol.h magic "G6S2E" + the version). Three
-// ranks on loopback: all at CONTROL_VERSION boot; a worker acting as the previous build (control_version 5, the frame
-// before Commit::hold) makes the head refuse with "bootstrap config mismatch". Host only.
+// ranks on loopback: all at CONTROL_VERSION boot; a worker acting as the previous build (control_version 6, the frame
+// before Commit::resize) makes the head refuse with "bootstrap config mismatch". Host only.
 // Build: g++ -std=c++17 -O2 -pthread -I engine/runtime engine/runtime/s2/tests/control_version_test.cpp -o /tmp/control_version_test
 #include "s2/bootstrap.h"
 #include "s2/control_protocol.h"
@@ -40,20 +40,20 @@ static bool boot(uint16_t port, const std::string& dir, unsigned version, std::s
 }
 
 int main() {
-    CHECK(CONTROL_VERSION == 6);
+    CHECK(CONTROL_VERSION == 9);
     BootstrapConfig c; c.runtime_signature = "x";
-    CHECK(c.agreement().find(" ctl 6\n") != std::string::npos);
+    CHECK(c.agreement().find(" ctl 9\n") != std::string::npos);
 
     char tmpl[] = "/tmp/ctlverXXXXXX"; const std::string dir = mkdtemp(tmpl);
     const uint16_t port = uint16_t(20000 + getpid() % 20000);
     std::string why;
     CHECK(boot(port, dir + "/same", CONTROL_VERSION, why));
-    const bool mixed = boot(uint16_t(port + 1), dir + "/mixed", 5, why);
+    const bool mixed = boot(uint16_t(port + 1), dir + "/mixed", 6, why);
     CHECK(!mixed);
     CHECK(why.find("bootstrap config mismatch") != std::string::npos);
     std::printf("control_version_test: mixed boot refused: %s\n", why.c_str());
 
-    // a frame with the previous magic (G6S2E5) is refused before any field is read
+    // a frame with the previous magic (G6S2E6) is refused before any field is read
     auto b = encode(Notice{9, 1, 5, 11, 0, EventKind::Admit});
     b[7] = uint8_t(b[7] - 1);
     bool threw = false;

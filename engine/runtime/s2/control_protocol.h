@@ -23,7 +23,7 @@ struct Decoder {
     uint64_t u64(){require(b.size()-i>=8,"truncated control metadata");uint64_t x=0;for(unsigned n=0;n<8;++n)x=x*256+b[i++];return x;}
     uint32_t u32(){auto x=u64();require(x<=UINT32_MAX,"control integer overflow");return uint32_t(x);}
     explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324530ull+CONTROL_VERSION,"control version mismatch");auto t=u64();require(t>=1&&t<=7,"unknown control tag");tag=Tag(t);}
-    Notice notice(){Notice n;n.epoch=u64();n.event=u64();n.boundary=u64();n.request=u64();n.payload_hash=u64();auto k=u64();require(k==1||k==2,"unknown event kind");n.kind=EventKind(k);return n;}
+    Notice notice(){Notice n;n.epoch=u64();n.event=u64();n.boundary=u64();n.request=u64();n.payload_hash=u64();auto k=u64();require(k>=1&&k<=3,"unknown event kind");n.kind=EventKind(k);return n;}
     Key key(){Key k;k.epoch=u64();k.slot=u32();k.generation=u32();return k;}
     g6rt::steering::Identity steering(){
         g6rt::steering::Identity s;auto on=u64();require(on<=1,"invalid steering enabled bit");s.enabled=on;
@@ -37,28 +37,33 @@ struct Decoder {
     void end(){require(i==b.size(),"trailing control metadata");}
 };
 inline std::vector<uint8_t> encode(const Notice& n){Encoder e(Tag::Notice);e.notice(n);return e.b;}
-inline std::vector<uint8_t> encode(const Ack& a){Encoder e(Tag::Ack);e.notice(a.notice);e.u64(a.rank);e.u64(a.state_hash);return e.b;}
+inline std::vector<uint8_t> encode(const Ack& a){Encoder e(Tag::Ack);e.notice(a.notice);e.u64(a.rank);e.u64(a.state_hash);e.u64(a.room);return e.b;}
 struct EventCommit { Notice notice; Commit commit; };
 inline void match(const EventCommit& e){
     require(e.notice.epoch==e.commit.epoch && e.notice.event==e.commit.event && e.notice.boundary==e.commit.boundary,"commit/notice mismatch");
     if(e.commit.admit) require(e.notice.kind==EventKind::Admit && e.commit.admit->req.id==e.notice.request,"grant does not match announced request");
     require(!e.commit.hold || e.commit.admit,"a held boundary needs a grant");
+    require((e.notice.kind==EventKind::Resize)==e.commit.resize.has_value(),"a resize commit needs a RESIZE notice and back");
+    if(e.commit.resize) require(!e.commit.admit && !e.commit.cancel && !e.commit.hold,"a resize commit changes nothing else");
 }
 inline std::vector<uint8_t> encode(const EventCommit& x){
     match(x);Encoder e(Tag::Commit);e.notice(x.notice);const auto& c=x.commit;
     e.u64(c.before_hash);e.u64(c.cancel.has_value());if(c.cancel)e.key(*c.cancel);
     e.u64(c.admit.has_value());if(c.admit){const auto&g=*c.admit;e.key(g.key);e.u64(g.req.id);e.u64(g.req.prompt_tokens);e.u64(g.req.max_tokens);e.steering(g.req.steering);e.u64(g.run.first_page);e.u64(g.run.pages);e.u64(g.run.table_version);e.u64(g.run.list_hash);e.u64(g.reuse);e.u64(g.restored);e.u64(g.counted);}
     e.u64(c.hold);
+    e.u64(c.resize.has_value());if(c.resize){e.u64(c.resize->tier);e.u64(c.resize->segs);e.u64(c.resize->slots);e.u64(c.resize->txn);}
     return e.b;
 }
 inline Notice decode_notice(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Notice,"expected notice");auto n=d.notice();d.end();return n;}
-inline Ack decode_ack(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Ack,"expected ACK");Ack a;a.notice=d.notice();a.rank=d.u32();a.state_hash=d.u64();d.end();return a;}
+inline Ack decode_ack(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Ack,"expected ACK");Ack a;a.notice=d.notice();a.rank=d.u32();a.state_hash=d.u64();a.room=d.u32();d.end();return a;}
 inline EventCommit decode_commit(const std::vector<uint8_t>& b){
     Decoder d(b);require(d.tag==Tag::Commit,"expected commit");EventCommit e;e.notice=d.notice();auto&c=e.commit;
     c.epoch=e.notice.epoch;c.event=e.notice.event;c.boundary=e.notice.boundary;c.before_hash=d.u64();
     auto has=d.u64();require(has<=1,"invalid optional cancel");if(has)c.cancel=d.key();
     has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.req.steering=d.steering();g.run.first_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();g.run.list_hash=d.u64();g.reuse=d.u32();g.restored=d.u32();g.counted=d.u32();require(!g.restored||g.reuse,"invalid restored grant");c.admit=g;}
-    has=d.u64();require(has<=1,"invalid hold flag");c.hold=has!=0;match(e);
+    has=d.u64();require(has<=1,"invalid hold flag");c.hold=has!=0;
+    has=d.u64();require(has<=1,"invalid optional resize");if(has){Resize r;r.tier=d.u32();r.segs=d.u64();r.slots=d.u64();r.txn=d.u64();c.resize=r;}
+    match(e);
     d.end();return e;
 }
 // The head sends a request's bytes (the shim's req.<id>) to every worker just before each ADMIT notice for it, on

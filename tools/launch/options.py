@@ -76,6 +76,13 @@ KEYS = {
     'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
+    'FLASH_CACHE': ('cluster', None, 'glm53f, experimental: Flash session checkpoints, off (default), aligned or terminal. '
+                                     'aligned: a prompt keeps its pages and KDA state at its last cold prefill grid point, '
+                                     'and a later prompt that starts with those tokens is prefilled from there, bit-exact. '
+                                     'terminal: aligned, and also a checkpoint at the end of every request; NOT cold-exact '
+                                     '(docs/FLASH.md)'),
+    'FLASH_STATE_BUDGET_MIB': ('cluster', None, 'glm53f, FLASH_CACHE: the checkpoint store in MiB a rank, in memory, '
+                                                'when no KV_STORE names one (8192)'),
     'KV_STORE': ('cluster', None, 'experimental: block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, '
                                   'separated by ; (or --kv-store given again). STORE: ssd:PATH (a folder on each box\'s own SSD), '
                                   'remote:HOST:PORT or remote:auto (a KV node on another machine; auto = the one the mentat '
@@ -85,6 +92,8 @@ KEYS = {
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
     'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
+    'KV_SHARE_WHEN': ('cluster', None, 'a KV_STORE group= lease gives segments to other groups only while the engine is '
+                                       'idle (idle, default) or whenever the node asks (always) (G6_KV_SHARE_WHEN)'),
     'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
     'KV_ROWS': ('cluster', None, 'experimental: remote attention rows: the rows past SHARE_LIMIT in a rows store, read back '
                                  'as decode selects them. STORE,size=N(M|G|T)[,local=PAGES][,pool=SLOTS][,place=PAGES]'
@@ -94,6 +103,20 @@ KEYS = {
     'KV_TIER': ('cluster', None, 'deprecated: KV_STORE with keep=evicted|shared|all per tier (any evicted or all maps to '
                                  'KV_KEEP=all, else system)'),
     'KV_SHARED_AFTER': ('cluster', None, 'deprecated: KV_SYSTEM_AFTER'),
+    'FLASH_KV_DONATE_GIB': ('box', None, 'GLM-5.3-Flash: once the serve booted, lend at most this many GiB of this '
+                                        'box to a KV node beside it (./gr8 kv up --lazy-lock --ledger), less when '
+                                        'MemAvailable - FLASH_KV_GROWTH_GIB - KV_MIN_FREE_GB is less. 0 (default) = '
+                                        'none'),
+    'FLASH_KV_GROWTH_GIB': ('box', None, 'with FLASH_KV_DONATE_GIB: the GiB the Flash serve may still allocate after '
+                                        'boot (no default: not measured yet)'),
+    'FLASH_KV_GROUP': ('box', None, 'with FLASH_KV_DONATE_GIB: the mentat group the KV node joins, the cluster that '
+                                   'borrows from it (e.g. the GLM-5.3 serve\'s), not this serve\'s. No default'),
+    'FLASH_CAP_POLICY': ('cluster', None, "protected (default): the configured CAP's memory is never lent. "
+                                         'borrow-idle: with FLASH_KV_DONATE_GIB, the Flash KV pool in chunks '
+                                         '(G6_FLASH_KV_CHUNKS=1) lends all but one chunk to the KV node once idle '
+                                         'FLASH_KV_IDLE_S, and a request that needs them waits for their recall'),
+    'FLASH_KV_IDLE_S': ('cluster', None, 'with FLASH_CAP_POLICY=borrow-idle: idle seconds before a lend (default 60, '
+                                        'not measured)'),
     'PF_OWN': ('cluster', None, 'prefill attention ownership'),
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),
@@ -445,9 +468,24 @@ def validate(o):
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
     stores = kv_stores(o)
+    cache = o.get('FLASH_CACHE')
+    if cache not in (None, 'off', 'aligned', 'terminal'):
+        raise OptionError(f'--flash-cache {cache}: want off, aligned or terminal')
+    if cache not in (None, 'off') and model.name != 'glm53f':
+        raise OptionError(f'--flash-cache: Flash session checkpoints are glm53f only, not {model.name}')
+    budget = o.get('FLASH_STATE_BUDGET_MIB')
+    if budget is not None and not (str(budget).isdigit() and int(budget) >= 1):
+        raise OptionError(f'--flash-state-budget-mib {budget}: want a whole number of MiB from 1')
+    if model.name == 'glm53f' and stores:
+        if cache in (None, 'off'):
+            raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')
+        if len(stores) > 1:
+            raise OptionError('--flash-cache keeps its checkpoints in one store: give one --kv-store')
+        if any(t['persist'] for t in stores):
+            raise OptionError('--flash-cache: Flash checkpoints do not persist across boots (persist=on)')
+    elif stores and o.get('REUSE') == '0':
+        raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
     if stores:
-        if o.get('REUSE') == '0':
-            raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
     rows = kv_rows(o)
@@ -459,6 +497,8 @@ def validate(o):
         raise OptionError(f'--kv-format int4: {model.name} has an fp8 KV build only')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
+    if o.get('KV_SHARE_WHEN') not in (None, 'idle', 'always'):
+        raise OptionError(f'--kv-share-when {o.get("KV_SHARE_WHEN")}: want idle or always')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
         raise OptionError(f'--kv-keep {o.get("KV_KEEP")}: want system, sessions or all')
     sa = o.get('KV_SYSTEM_AFTER')
@@ -514,12 +554,21 @@ def kv_stores(o):
                 if t['kind'] != 'ssd' and x == 'on':
                     raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
                 t['persist'] = x == 'on'
+            elif k == 'group' and re.fullmatch(r'[A-Za-z0-9_.-]+', x):   # B3 shared node: g6m4 parses it
+                if t['kind'] != 'remote':
+                    raise OptionError(f'--kv-store {text}: group= is for remote: stores')
+                t['group'] = x
+            elif k == 'cap' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
+                t['cap'] = x
+            elif k == 'weight' and re.fullmatch(r'\d+', x) and 1 <= int(x) <= 1000000:
+                t['weight'] = int(x)
             elif k == 'keep':
                 if x not in ('system', 'sessions', 'all'):
                     raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
                 t['keep'] = x
             else:
-                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off or keep=RULE')
+                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off, keep=RULE, '
+                                  'or group=NAME[,cap=N(M|G|T)][,weight=N] on remote:')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
         out.append(t)

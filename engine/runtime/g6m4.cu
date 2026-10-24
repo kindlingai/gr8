@@ -111,10 +111,12 @@
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
+#include "s2/flash_checkpoint.h"   // G6_FLASH_CACHE parsed in every build, refused outside Flash
 #include "s2/cp_rows.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
 #include "rt_rows.cuh"
+#include "s2/kv_share.h"
 #include "host_reclaim.h"
 #include <filesystem>
 #include <fstream>
@@ -442,16 +444,33 @@ int main(int argc, char** argv)
             die("G6_MTP_KSTOPB needs --serve; G6_MTP_KSTOPB_EXPLORE >= 0");
         if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
+    // G6_FLASH_CACHE (s2/flash_checkpoint.h): Flash session checkpoints under --serve, in place of prefix reuse. Its
+    // store is the one --kv-store (a lease of its own), else this process's memory, G6_FLASH_STATE_BUDGET_MIB a rank
+    g6s2::FlashCache flash_cache = g6s2::FlashCache::Off;
+    try { flash_cache = g6s2::flash_cache_mode(getenv("G6_FLASH_CACHE")); } catch (const std::exception& e) { die(e.what()); }
+    const long long flash_budget_mib = getenv("G6_FLASH_STATE_BUDGET_MIB") ? atoll(getenv("G6_FLASH_STATE_BUDGET_MIB")) : 8192;
 #if G6_MODEL_FLASH
     // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
     if (s2mode && (reuse_prefix || dfl || plan.rs))
         die("Flash serve supports no prefix reuse, DFlash or rejection sampling");
     if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
         die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
-#endif
+    if (flash_cache != g6s2::FlashCache::Off) {
+        if (!s2mode || !MP) die("G6_FLASH_CACHE needs --serve and tensor prefill (--prefill N)");
+        if (kv_tiers.size() > 1) die("G6_FLASH_CACHE: one --kv-store at most (its checkpoint store)");
+        if (kv_tiers.empty() && flash_budget_mib < 1) die("G6_FLASH_STATE_BUDGET_MIB: >= 1");
+        // the checkpoints keep one live request's state (session 0's KDA ring): one session only
+        if (s2sess != 1) die("G6_FLASH_CACHE needs --s2-sessions 1");
+    }
+    if (!kv_tiers.empty() && flash_cache == g6s2::FlashCache::Off) die("--kv-store on Flash needs G6_FLASH_CACHE (its checkpoint store)");
+    if (s2mode && s2sess != 1 && flashkv::env_mode() == 1)
+        die("G6_FLASH_KV_CHUNKS needs --s2-sessions 1");
+#else
+    if (flash_cache != g6s2::FlashCache::Off) die("G6_FLASH_CACHE is GLM-5.3-Flash only (bin/g6m4_flash)");
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
+#endif
     if (kv_old)
     {
         if (kv_keep.empty()) kv_keep = kv_old_all ? "all" : "system";
@@ -1438,6 +1457,120 @@ int main(int argc, char** argv)
             " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
             " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
             (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string());
+        // G6_FLASH_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
+        // store's blocks and the grid join the signature
+        std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
+        if (flash_cache != g6s2::FlashCache::Off)
+        {
+            g6s2::FlashStateView v;
+            for (g6rt::Model* x : {&m, &D.d})
+                for (g6rt::Layer& y : x->layers)
+                    if (!y.kda && y.ab.storage)
+                        v.bindings.push_back({static_cast<uint4*>(y.ab.args.mla_cache), static_cast<uint4*>(y.ab.args.index_cache),
+                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16)});
+            v.S = m.kda_st.S; v.conv = m.kda_st.conv; v.layers = kda::N_KDA; v.slots = m.kda_st.slots;
+            v.s_slot = m.kda_st.s_layer() / std::max(1, m.kda_st.slots); v.c_slot = m.kda_st.c_layer() / std::max(1, m.kda_st.slots);
+            std::string spec = "mem:";
+            uint64_t bytes = (uint64_t)flash_budget_mib << 20;
+            std::optional<g6s2::FlashGroup> group;
+            if (!kv_tiers.empty())
+            {
+                g6s2::TierSpec t;
+                try { t = g6s2::TierSpec::parse(kv_tiers[0], false); } catch (const std::exception& e) { die(std::string("G6_FLASH_CACHE: ") + e.what()); }
+                if (t.persist) die("G6_FLASH_CACHE: persist=on is not supported (checkpoints live for one boot)");
+                spec = t.store; bytes = t.bytes;
+                // group=: the lease shares its KV node with other clusters (s2/flash_checkpoint.h); it starts at size=
+                if (!t.group.empty()) group = g6s2::FlashGroup{t.group, (uint32_t)g6nr::NR, (uint32_t)R, t.cap, t.weight};
+                if (t.ssd())
+                {   // as the pool's stores: the folder starts empty at every boot
+                    const std::string dir = t.store.substr(4) + "/r" + std::to_string(R);
+                    if (std::filesystem::exists(dir)) std::filesystem::remove_all(dir);
+                    std::filesystem::create_directories(dir);
+                    spec = "ssd:" + dir + "/flash-ckpt";
+                }
+            }
+            char host[64] = "host";
+            gethostname(host, sizeof host - 1);
+            // its own lease name on a KV node: never the pool stash's (g6m4-...)
+            const std::string name = std::string("g6m4f-ckpt-") + host + "-" + std::to_string(s2epoch) + "-r" + std::to_string(R);
+            static const std::string exe = g6s2::exe_stamp();
+            const std::string compat = "flash set " + set_id + " nr " + std::to_string(g6nr::NR) + " rank " + std::to_string(R) +
+                " cap " + std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
+                std::to_string(v.bindings.size()) + " state " + std::to_string(v.state_bytes()) + " format " +
+                std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
+            try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr)); }
+            catch (const std::exception& e) { die(std::string("G6_FLASH_CACHE: ") + e.what()); }
+            fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows%s\n",
+                    R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
+                    v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1),
+                    group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
+            bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks());
+        }
+        // G6_FLASH_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts
+        auto flash_install = [&](g6s2::NativeHooks& h) {
+            // G6_FLASH_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
+            // online, on every rank at the commit (flash_kv.h; with G6_FLASH_KV_LEDGER the bytes move through the box's
+            // host ledger). The head announces them under FLASH_CAP_POLICY=borrow-idle (G6_FLASH_KV_LEND_MS > 0, s2/flash_lend.h):
+            // a lend down to G6_FLASH_KV_IDLE_CHUNKS once idle that long, a recall before a request that needs more. Every
+            // rank's ACK carries its chunks online, and the head admits only within the least of them
+            if (m.fkv.pages)
+            {
+                if (const char* l = getenv("G6_FLASH_KV_LEDGER")) for (g6rt::Model* x : {&m, &D.d}) x->fkv.ledger = l;
+                auto env_count = [](const char* n, long dflt) {
+                    const char* e = getenv(n);
+                    if (!e) return dflt;
+                    char* end = nullptr;
+                    const long v = strtol(e, &end, 10);
+                    if (!*e || *end || v < 0) die(std::string(n) + "=" + e + ": want a whole number >= 0");
+                    return v;
+                };
+                const long lend_ms = env_count("G6_FLASH_KV_LEND_MS", 0), keep = env_count("G6_FLASH_KV_IDLE_CHUNKS", 1);
+                if (keep < 1) die("G6_FLASH_KV_IDLE_CHUNKS: at least 1");
+                h.flash_room = [&] {
+                    uint32_t n = UINT32_MAX;
+                    for (g6rt::Model* x : {&m, &D.d}) if (x->fkv.pages) n = std::min(n, x->fkv.online);
+                    return n;
+                };
+                h.flash.idle_ms = lend_ms;
+                h.flash.keep = (uint32_t)std::min<long>(keep, m.fkv.chunks);
+                h.flash.chunk_rows = (uint64_t)m.fkv.chunk_pages * g6kv::PAGE;
+                h.flash.chunks = m.fkv.chunks;
+                // the bytes this rank may lend (every chunk above keep, all models): the launcher books them as the GPU's
+                // in the host ledger (G6_FLASH_KV_LEDGER.gpu, one line), so a lend has them to give
+                if (lend_ms && !m.fkv.ledger.empty())
+                {
+                    uint64_t lendable = 0;
+                    for (g6rt::Model* x : {&m, &D.d})
+                        if (x->fkv.pages) lendable += x->fkv.bytes_at(x->fkv.chunks) - x->fkv.bytes_at(h.flash.keep);
+                    const std::string gp = m.fkv.ledger + ".gpu", tmp = gp + ".tmp";
+                    if (FILE* f = fopen(tmp.c_str(), "w"))
+                    {
+                        fprintf(f, "%llu\n", (unsigned long long)lendable);
+                        if (fclose(f) || rename(tmp.c_str(), gp.c_str()))
+                            fprintf(stderr, "# rank %d: flash kv: could not write %s\n", R, gp.c_str());
+                    }
+                    else fprintf(stderr, "# rank %d: flash kv: could not write %s\n", R, gp.c_str());
+                    fprintf(stderr, "# rank %d: flash kv: borrow-idle, %u of %u chunks lent after %ld ms idle, %llu bytes "
+                                    "lendable\n", R, m.fkv.chunks - h.flash.keep, m.fkv.chunks, lend_ms,
+                            (unsigned long long)lendable);
+                }
+                auto other = h.resize;
+                h.resize = [&, other](const g6s2::Resize& r) {
+                    if (r.tier != g6s2::FLASH_KV_TIER) { if (other) other(r); return; }
+                    for (g6rt::Model* x : {&m, &D.d})
+                    {
+                        if (!x->fkv.pages) continue;
+                        if (int e = x->fkv.resize((uint32_t)r.segs, st))
+                            fprintf(stderr, "# rank %d: flash kv: to %llu chunks failed (%d): %s; %u online\n", R,
+                                    (unsigned long long)r.segs, e, x->fkv.err.c_str(), x->fkv.online);
+                        else
+                            fprintf(stderr, "# rank %d: flash kv: %u of %u chunks online (%llu tokens) at %lld ms\n", R,
+                                    x->fkv.online, x->fkv.chunks, (unsigned long long)x->fkv.tokens(),
+                                    (long long)g6s2::s2_wall_ms());
+                    }
+                };
+            }
+        };
         g6s2::FlashContext fc{m, D, FP, FP2, fab, fabd, fabp, fabp2, st, in, in_d, out, out_d,
             [&](int k, int rows) {
                 g6s2::require(k >= 0 && k < m.nbk && rows > 0 && rows <= MX && exec[k][rows], "Flash main graph missing");
@@ -1446,7 +1579,7 @@ int main(int argc, char** argv)
             [&](int k, bool chain, int rows) {
                 g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
-            }, gsplit};
+            }, gsplit, ckpt.get(), flash_cache == g6s2::FlashCache::Terminal, flash_install};
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }
@@ -1567,7 +1700,10 @@ int main(int argc, char** argv)
                         spec = "ssd:" + dir + "/blocks";
                         if (t.persist && !set_id.empty()) index = dir;
                     }
-                    const uint64_t slots = kvt->add(spec, name + "-t" + std::to_string(i), t.bytes);
+                    // group=: a lease that shares its node with other clusters (s2/kv_share.h); it starts at size=
+                    const uint64_t slots = t.group.empty() ? kvt->add(spec, name + "-t" + std::to_string(i), t.bytes)
+                                                           : kvt->add_group(spec, name + "-t" + std::to_string(i), t.group, (uint32_t)g6nr::NR,
+                                                                            (uint32_t)R, t.bytes, t.cap, t.weight);
                     // what makes stored blocks this engine's: the model, the layout, the block format, and the engine binary
                     // itself (another build may compute other KV bits); an index with another line starts empty
                     static const std::string exe = g6s2::exe_stamp();
@@ -2040,6 +2176,40 @@ int main(int argc, char** argv)
             };
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
+            // a tier on a group lease (--kv-store group=): every rank resizes it at the Resize commit; the head reports
+            // to the node, asking for the segments an oversize entry, the pages the tier pushed out since its last
+            // report, or the next spill would need (s2/kv_share.h share_want: ask before the next spill drops an entry),
+            // and announces what the node grants or asks back
+            std::vector<uint32_t> kv_groups;
+            for (size_t i = 0; kvt && i < kvt->size(); ++i) if (kvt->group(i)) kv_groups.push_back((uint32_t)i);
+            std::vector<g6kv_tier_totals> kv_seen(kv_groups.size(), g6kv_tier_totals{});
+            size_t kv_next_group = 0;
+            if (!kv_groups.empty())
+            {
+                h.resize = [&](const g6s2::Resize& r) {
+                    if (!g6s2::share_apply(pool, kvt->store(r.tier), r, kv_drain))
+                        fprintf(stderr, "# rank %d: s2 share: tier %u to %llu blocks refused (transaction %llu), the lease keeps its size: %s\n", R,
+                                r.tier, (unsigned long long)r.slots, (unsigned long long)r.txn, g6kv_tier_error());
+                    else
+                        fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
+                                (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
+                };
+                // G6_KV_SHARE_WHEN=idle (default): the head offers its blocks to other groups only while the engine is
+                // idle, so a give's compaction never pauses a turn; always: whenever the node asks
+                const char* when = getenv("G6_KV_SHARE_WHEN");
+                if (when && strcmp(when, "idle") && strcmp(when, "always")) die("G6_KV_SHARE_WHEN is idle or always");
+                const bool share_always = when && !strcmp(when, "always");
+                if (R == 0)
+                    h.share = [&, share_always](bool idle) -> std::optional<g6s2::Resize> {
+                        // one group tier a report, in turn: one Resize in flight at a time
+                        const size_t k = kv_next_group++ % kv_groups.size();
+                        const uint32_t t = kv_groups[k];
+                        const g6kv_tier_totals now = pool.tiers().at(t);
+                        const uint64_t want = g6s2::share_want(kv_seen[k], now, g6kv_store_seg_blocks(kvt->store(t)));
+                        kv_seen[k] = now;
+                        return g6s2::share_poll(pool, t, kvt->store(t), want, share_always || idle);
+                    };
+            }
             h.dispatch = nd.hooks();
             if (dfl)
             {

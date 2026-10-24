@@ -79,7 +79,11 @@ DevInfo find_dev(const std::string& ip) {
 }
 
 int tcp_connect(const std::string& ip, int port) {
-  for (int tries = 0; tries < 1200; tries++) {
+  // G6_FABRIC_CONNECT_TRIES: connect attempts 100 ms apart (default 1200 = 120 s). Raise it when the ranks load at
+  // different speeds (one slow disk shared by two ranks): a rank that loads first waits here for the others.
+  const char* t = getenv("G6_FABRIC_CONNECT_TRIES");
+  const int ntries = t && atoi(t) > 0 ? atoi(t) : 1200;
+  for (int tries = 0; tries < ntries; tries++) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(port); inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
     if (connect(s, (sockaddr*)&sa, sizeof sa) == 0) { int one = 1; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); return s; }
