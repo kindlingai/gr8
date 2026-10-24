@@ -35,6 +35,28 @@ struct PfPeerStage {
     cudaEvent_t put = nullptr, ready = nullptr, used = nullptr;
     __nv_bfloat16* peer[g6nr::NR] = {};
 };
+// G6_PF_SP=1: sequence-parallel mHC. Per block output, the rank partials go reduce-scatter (collective 2c: rank p
+// gets rows pf_r0(M, p).. of every partial), the owner runs the same mHC kernel on its rows only (same per-row op
+// order, the partials summed in rank order: bit-identical rows), then all-gathers its FP32 normalized rows
+// (collective 2c + 1) and every rank rounds them to the FP16 block input. The wire bytes per rank equal the
+// all-gather form (2/3 M BF16 rows out + 1/3 M FP32 rows to each peer at TP3); the mHC work drops to M / nr rows.
+inline bool pf_sp()
+{
+    static const bool on = getenv("G6_PF_SP") && atoi(getenv("G6_PF_SP")) == 1;
+    return on;
+}
+// G6_PF_SP_X16=1 (with G6_PF_SP and G6_PF_ROUTER_SPLIT): an MoE layer's MLP input travels as the FP16 rows its
+// consumers read (x2) instead of the FP32 rows (xn2): the router reads only this rank's FP32 rows (route split), the
+// experts the FP16 ones. Half the bytes of that all-gather, and no FP16 conversion of the peers' rows. Byte-equal.
+inline bool pf_sp_x16()
+{
+    static const bool on = getenv("G6_PF_SP_X16") && atoi(getenv("G6_PF_SP_X16")) == 1;
+    return on;
+}
+inline size_t pf_sp_slot_bytes(int MP, int nr)
+{
+    return std::max(pf_slot_bytes(MP, true, nr), ((size_t)(MP + nr - 1) / nr * HID * 4 + 8 + 255) & ~size_t(255));
+}
 struct FlashPrefill
 {
     FlashPoolTransport pool_transport;           // set up by g6m4 when the pool owner is on; independent of partial fabrics
@@ -48,6 +70,10 @@ struct FlashPrefill
     float *hc_inv = nullptr, *hc_mix = nullptr, *hc_pre = nullptr, *hc_post = nullptr, *hc_comb = nullptr;
     unsigned* hc_done = nullptr;
     float *xn = nullptr, *xn2 = nullptr;         // [MP][HID] (xn: round_up(MP, 8) rows, see attn_frag)
+    __nv_bfloat16* sp_peer[g6nr::NR] = {};       // G6_PF_SP: device copies of the peers' reduce-scatter slices (ceil(MP / nr) rows)
+    cudaStream_t sp_st = nullptr;                // G6_PF_SP: per-lane copy stream (wait + copy-engine staging off the compute stream)
+    cudaEvent_t sp_put[4] = {}, sp_ready[4] = {};
+    bool sp_view = false;                        // G6_PF_SP owner-row view: no fragment tables (rows are a slice of M)
     bool attn_frag = false;                      // xn holds the attention input as f16 + bf16 fragment tables (G6_PF_XFRAG)
     __half *x = nullptr, *x2 = nullptr;          // [MP][HID]
     __nv_bfloat16* part[2] = {};                 // [MP][HID]
@@ -60,6 +86,8 @@ struct FlashPrefill
     std::vector<uint4*> fnp;                     // [layer * 2 + hc]: mHC fn packed for k_mhc_out_inv_prepare_pk (unless G6_PF_MHC_PK=0)
     __nv_bfloat16* peer_dev = nullptr;           // NR == 2 (unless G6_PF_MHC_STAGE=0): [MP][HID] the peer's partial, copy engine
     PfPeerStage peer_stage;                       // G6_PF_STAGE_ASYNC=1 only; one stream and storage per lane
+    bindp::RsOut fin_rs;                         // G6_PF_SP_FIND: the MoE final sum's send-slot target (base null = off)
+    const char* fin_own = nullptr;               // G6_PF_SP_FIND: this rank's own rows of that slot (set = layer used it)
     u64 cur_step = 0;                            // host copy of the layer step pf_step_flash set (for the staging copy)
 };
 inline bool pf_mhc_stage()
@@ -72,6 +100,9 @@ inline bool pf_mhc_pk()
     static const bool on = !(getenv("G6_PF_MHC_PK") && atoi(getenv("G6_PF_MHC_PK")) == 0);
     return on;
 }
+#ifndef PF_MHC_RR_R
+#define PF_MHC_RR_R 2   // rows per CTA of k_mhc_out_inv_prepare_rr: each CTA streams the 786 KB packed fn once for R rows
+#endif
 inline bool pf_mhc_rr()   // k_mhc_out_inv_prepare_rr when the peer partial is staged; G6_PF_MHC_RR=0 = _pk
 {
     static const bool on = !(getenv("G6_PF_MHC_RR") && atoi(getenv("G6_PF_MHC_RR")) == 0);
@@ -258,11 +289,13 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
 {
     if (!m.resid4 || m.flash_draft) die("Flash prefill: main model only (the MTP draft prefill is P1b)");
     if (MP < 1 || MP % 64) die("Flash prefill: --prefill must be a positive multiple of 64");
-    if (f.ncoll != 2 || f.nr != g6nr::NR) die("Flash prefill: the prefill fabric needs 2 collectives");
+    if (f.ncoll != (pf_sp() ? 4 : 2) || f.nr != g6nr::NR) die("Flash prefill: the prefill fabric needs 2 collectives (4 with G6_PF_SP=1)");
+    if (pf_sp() && f.stride < pf_sp_slot_bytes(MP, f.nr)) die("Flash prefill: G6_PF_SP fabric slots are too small");
     if (f.stride < pf_slot_bytes(MP, false, f.nr) + 8) die("Flash prefill: fabric slots are smaller than MP rows");
     P = FlashPrefill();
     P.MP = MP; P.f = f; P.stepp = stepp;
-    P.tickets = dmalloc<unsigned>(2);
+    P.tickets = dmalloc<unsigned>(4);
+    G6RT_CK(cudaMemset(P.tickets, 0, 4 * sizeof(unsigned)));
     P.tok = dmalloc<int>(MP); P.pos = dmalloc<int>(MP); P.row_slot = dmalloc<int>(MP);
     P.resid4 = dmalloc<float>((size_t)MP * geom::HC * HID);
     P.hc_inv = dmalloc<float>(MP); P.hc_mix = dmalloc<float>((size_t)MP * geom::HC_MIX);
@@ -272,6 +305,19 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
     P.x = dmalloc<__half>((size_t)MP * HID); P.x2 = dmalloc<__half>((size_t)MP * HID);
     P.part[0] = dmalloc<__nv_bfloat16>((size_t)MP * HID); P.part[1] = dmalloc<__nv_bfloat16>((size_t)MP * HID);
     P.resid = dmalloc<float>((size_t)MP * HID);
+    if (pf_sp())
+    {
+        for (int p = 0; p < g6nr::NR; ++p)
+            if (p != f.rank) P.sp_peer[p] = dmalloc<__nv_bfloat16>((size_t)(MP + f.nr - 1) / f.nr * HID);
+        int lo = 0, hi = 0;
+        G6RT_CK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+        G6RT_CK(cudaStreamCreateWithPriority(&P.sp_st, cudaStreamNonBlocking, hi));
+        for (int c = 0; c < 4; ++c)
+        {
+            G6RT_CK(cudaEventCreateWithFlags(&P.sp_put[c], cudaEventDisableTiming));
+            G6RT_CK(cudaEventCreateWithFlags(&P.sp_ready[c], cudaEventDisableTiming));
+        }
+    }
     for (const Layer& y : m.layers) P.any_kda |= y.kda;
     if (pf_mhc_pk() && HID == 4096)
         for (const Layer& y : m.layers)
@@ -286,7 +332,8 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
     {
         const char* no = !pf_mhc_stage() ? "G6_PF_MHC_STAGE=0" : pf_fuse_level() < 1 ? "G6_PF_MHC_FUSE < 1"
                        : pf_xtrace_env() ? "G6_PF_XTRACE=1 (the stamps need one stream)"
-                       : (getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) != 0) ? "G6_PF_RS (SP / reduce-scatter prefill: owner-only consume, not uniform slots)" : nullptr;
+                       : (getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) != 0) ? "G6_PF_RS (SP / reduce-scatter prefill: owner-only consume, not uniform slots)"
+                       : pf_sp() ? "G6_PF_SP (owner rows read their reduce-scatter slices in place)" : nullptr;
         if (no && mode == 2)
         {
             char msg[256];
@@ -369,6 +416,23 @@ inline void pf_inputs_flash(FlashPrefill& P, int M, const int* tok, const int* p
 template <class Fab>
 inline void pf_enqueue_flash(Fab& fab, u64 ls0, int nl, int M)
 {
+    if (pf_sp())
+    {
+        const g6::FabricDev f = fab.dev();
+        std::vector<uint32_t> sizes(4, 0);
+        sizes[1] = sizes[3] = (uint32_t)((size_t)pf_rows(M, f.rank, f.nr) * HID * 4);
+        g6::Fabric::Rs rs;
+        rs.mask = 0x5u;   // collectives 0 and 2
+        rs.ss = pf_ss(f);
+        for (int p = 0; p < f.nr; ++p) rs.bytes.push_back((uint32_t)((size_t)pf_rows(M, p, f.nr) * HID * 2));
+        // G6_PF_SP_X16: an MoE layer's collective 1 carries FP16 rows (pf_sp_x16_layer; route split on at this M)
+        const char* rse = getenv("G6_PF_ROUTER_SPLIT");
+        const bool x16 = pf_sp_x16() && rse && atoi(rse) == 1 && flash_route_split::active(M, f.nr);
+        std::vector<uint32_t> s16 = sizes;
+        s16[1] = (uint32_t)((size_t)pf_rows(M, f.rank, f.nr) * HID * 2);
+        for (int i = 0; i < nl; ++i) fab.enqueue_step(ls0 + i, x16 && geom::is_moe(i) ? s16 : sizes, rs);
+        return;
+    }
     const std::vector<uint32_t> sizes(2, (uint32_t)(M * HID * 2));
     for (int i = 0; i < nl; ++i) fab.enqueue_step(ls0 + i, sizes);
 }
@@ -675,12 +739,29 @@ inline void pf_dsa_block(Model& m, FlashPrefill& P, int i, int M, int context, c
     else
         pf_dsa_block_p1(m, P, i, M, context, st);
 }
+// G6_PF_SP_FIND=1 (with G6_PF_SP): an MoE layer's final sum (k_pf_fin RS form) writes every row into its owner's slice
+// of the collective-2 send slot, so the put only rings the doorbell and the owner pass reads its own rows from the slot.
+// Byte-equal (the same values, one copy fewer).
+inline bool pf_sp_find()
+{
+    static const bool on = getenv("G6_PF_SP_FIND") && atoi(getenv("G6_PF_SP_FIND")) == 1;
+    return on;
+}
 inline void pf_mlp_block(Model& m, FlashPrefill& P, int i, int M, cudaStream_t st)
 {
     static const bool dense_p1 = getenv("G6_FPF_DENSE_P1") && atoi(getenv("G6_FPF_DENSE_P1")) == 1;
     if (!pf_force_p1() && (m.layers[i].moe || !dense_p1))
     {
+        P.fin_own = nullptr;
+        if (pf_sp() && pf_sp_find() && m.layers[i].moe)
+        {
+            const int c2 = 2;
+            P.fin_rs.base = P.f.send + (size_t)c2 * P.f.stride; P.fin_rs.pstride = (size_t)P.f.ncoll * P.f.stride;
+            P.fin_rs.ss = pf_ss(P.f); P.fin_rs.stepp = P.stepp; P.fin_rs.M = M; P.fin_rs.nr = P.f.nr;
+            P.fin_own = P.fin_rs.base + (size_t)(P.cur_step & 1) * P.fin_rs.pstride + (size_t)P.f.rank * P.fin_rs.ss;
+        }
         pf_mlp_block_gemm(m, P, i, M, st);
+        P.fin_rs.base = nullptr;
         flash_pf_prof().mark(m.layers[i].moe ? 7 : 6, st);
     }
     else pf_mlp_block_p1(m, P, i, M, st);
@@ -714,8 +795,16 @@ inline void pf_stage_issue(FlashPrefill& P, int c, int M, cudaStream_t st)
     }
     G6RT_CK(cudaEventRecord(S.ready, S.stream));
 }
+inline void pf_sp_issue(FlashPrefill& P, int c, int M, cudaStream_t st, bool x16 = false);
 inline void pf_put_flash(FlashPrefill& P, int c, int M, cudaStream_t st)
 {
+    if (pf_sp())
+    {
+        if (c == 1 && P.fin_own) k_publish<<<1, 32, 0, st>>>(P.f, P.stepp, 2, P.tickets + 2);   // G6_PF_SP_FIND
+        else k_put_rs<<<PF_PUT, 128, 0, st>>>(reinterpret_cast<const uint4*>(P.part[c]), P.f, P.stepp, 2 * c, M, P.tickets + 2 * c);
+        pf_sp_issue(P, 2 * c, M, st);
+        return;
+    }
     static const int ncta = getenv("G6_PF_PUT_CTA") ? atoi(getenv("G6_PF_PUT_CTA")) : 96;
     k_put_publish_n<<<ncta, 128, 0, st>>>(reinterpret_cast<const uint4*>(P.part[c]), P.f, P.stepp, c, M * (HID * 2 / 16),
                                           P.tickets + c);
@@ -723,7 +812,7 @@ inline void pf_put_flash(FlashPrefill& P, int c, int M, cudaStream_t st)
 }
 inline void pf_mhc_input(Model& m, FlashPrefill& P, int i, bool ffn, int M, cudaStream_t st)
 {
-    const bool frag = !ffn && pf_attn_frag_ok(m, i);
+    const bool frag = !ffn && !P.sp_view && pf_attn_frag_ok(m, i);
     if (!ffn) P.attn_frag = frag;
     flash_mhc::prepare(mhc_buffers(P), m.layers[i].hc[ffn ? 1 : 0], M, HID, geom::RMS_EPS_FLASH, ffn ? P.x2 : P.x, st,
                        ffn ? P.xn2 : frag ? nullptr : P.xn, frag ? pf_attn_f16(P) : nullptr, frag ? pf_attn_bf16(P) : nullptr);
@@ -741,10 +830,10 @@ inline void pf_consume_launch(Model& m, FlashPrefill& P, int i, int c, int M, cu
             const int wl = c == 0 ? i : i + 1, wh = c == 0 ? 1 : 0;
             const flash_mhc::Weights& w = m.layers[wl].hc[wh];
             const bool rr = !P.fnp.empty() && !wp && pf_mhc_rr();
-            const bool frag = c == 1 && rr && pf_attn_frag_ok(m, i + 1);
+            const bool frag = c == 1 && rr && !P.sp_view && pf_attn_frag_ok(m, i + 1);
             if (c == 1) P.attn_frag = frag;
             if (rr)   // nothing to wait for: re-read rows, bit-identical
-                flash_mhc::k_mhc_out_inv_prepare_rr<Blk, 2, 1><<<(M + 1) / 2, flash_mhc::THREADS, 0, st>>>(
+                flash_mhc::k_mhc_out_inv_prepare_rr<Blk, PF_MHC_RR_R, 1><<<(M + PF_MHC_RR_R - 1) / PF_MHC_RR_R, flash_mhc::THREADS, 0, st>>>(
                     flash_mhc::side(mhc_buffers(P), c), blk, w, P.fnp[wl * 2 + wh], M, geom::RMS_EPS_FLASH, c == 0 ? P.x2 : P.x,
                     c == 0 ? P.xn2 : frag ? nullptr : P.xn, frag ? pf_attn_f16(P) : nullptr, frag ? pf_attn_bf16(P) : nullptr);
             else if (!P.fnp.empty())   // packed fn, 2 rows per CTA: bit-identical to k_mhc_out_inv_prepare
@@ -769,10 +858,114 @@ inline void pf_consume_launch(Model& m, FlashPrefill& P, int i, int c, int M, cu
                                                                          P.x, P.xn, P.resid);
     }
 }
+// recv slot of collective c from rank p, this lane's current layer-step parity (host address of the pinned region)
+inline const char* pf_sp_slot(const FlashPrefill& P, int c, int p)
+{
+    return P.f.recv + (((size_t)(P.cur_step & 1) * P.f.ncoll + c) * P.f.nr + p) * P.f.stride;
+}
+// on the lane's copy stream, ordered after what st has queued: wait for collective c's peer data, copy it to device
+// memory (RS: this rank's slices -> sp_peer; AG: peer rows -> xn2 / xn at their row offsets), then sp_ready[c].
+// The compute stream runs the other lane's block meanwhile. Every buffer written here was last read by a kernel that
+// st queued before this put, so the sp_put wait also orders the reuse.
+inline void pf_sp_issue(FlashPrefill& P, int c, int M, cudaStream_t st, bool x16)
+{
+    const int nr = P.f.nr, me = P.f.rank;
+    G6RT_CK(cudaEventRecord(P.sp_put[c], st));
+    G6RT_CK(cudaStreamWaitEvent(P.sp_st, P.sp_put[c], 0));
+    if (!(c & 1))
+    {
+        k_wait_rs<<<1, 32, 0, P.sp_st>>>(P.f, P.stepp, c, M, false);
+        const int rows = pf_rows(M, me, nr);
+        if (rows)
+            for (int p = 0; p < nr; ++p)
+                if (p != me) G6RT_CK(cudaMemcpyAsync(P.sp_peer[p], pf_sp_slot(P, c, p), (size_t)rows * HID * 2, cudaMemcpyDefault, P.sp_st));
+    }
+    else if (x16)   // G6_PF_SP_X16: the peers' FP16 MLP-input rows straight into x2
+    {
+        k_wait_ag<<<1, 32, 0, P.sp_st>>>(P.f, P.stepp, c, M, HID * 2);
+        for (int p = 0; p < nr; ++p)
+        {
+            const int r0 = pf_r0(M, p, nr), rows = pf_rows(M, p, nr);
+            if (p != me && rows) G6RT_CK(cudaMemcpyAsync(P.x2 + (size_t)r0 * HID, pf_sp_slot(P, c, p), (size_t)rows * HID * 2, cudaMemcpyDefault, P.sp_st));
+        }
+    }
+    else
+    {
+        float* xn = c == 1 ? P.xn2 : P.xn;
+        k_wait_ag<<<1, 32, 0, P.sp_st>>>(P.f, P.stepp, c, M, HID * 4);
+        for (int p = 0; p < nr; ++p)
+        {
+            const int r0 = pf_r0(M, p, nr), rows = pf_rows(M, p, nr);
+            if (p != me && rows) G6RT_CK(cudaMemcpyAsync(xn + (size_t)r0 * HID, pf_sp_slot(P, c, p), (size_t)rows * HID * 4, cudaMemcpyDefault, P.sp_st));
+        }
+    }
+    G6RT_CK(cudaEventRecord(P.sp_ready[c], P.sp_st));
+}
+__global__ void k_sp_f16(const float* __restrict__ src, __half* __restrict__ dst, size_t n)
+{
+    for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < n; i += (size_t)gridDim.x * 256) dst[i] = __float2half_rn(src[i]);
+}
+// G6_PF_SP_X16 applies to collective 1 (the MLP input) of an MoE layer whose router runs row-split
+inline bool pf_sp_x16_layer(const Model& m, const FlashPrefill& P, int i, int c, int M)
+{
+    return pf_sp_x16() && c == 0 && m.layers[i].moe && P.route_split.fabric && flash_route_split::active(M, P.route_split.f.nr);
+}
+// G6_PF_SP, first half of a consume: this rank's rows of every partial have landed (collective 2c), mHC on them,
+// then the FP32 normalized rows (xn2 after attention, xn after the MLP / the final norm) into collective 2c + 1
+inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream_t st)
+{
+    const int crs = 2 * c, cag = crs + 1, nr = P.f.nr, me = P.f.rank;
+    const int r0 = pf_r0(M, me, nr), rows = pf_rows(M, me, nr);
+    G6RT_CK(cudaStreamWaitEvent(st, P.sp_ready[crs], 0));   // the peers' slices are in sp_peer (pf_sp_issue)
+    if (rows)
+    {
+        FlashPrefill Q = P;   // the owner rows as a sub-batch of their own
+        const size_t r = (size_t)r0;
+        Q.resid4 += r * geom::HC * HID; Q.hc_inv += r; Q.hc_mix += r * geom::HC_MIX; Q.hc_pre += r * geom::HC;
+        Q.hc_post += r * geom::HC; Q.hc_comb += r * geom::HC * geom::HC; Q.hc_done += r;
+        Q.xn += r * HID; Q.xn2 += r * HID; Q.x += r * HID; Q.x2 += r * HID; Q.resid += r * HID;
+        Q.sp_view = true;
+        __nv_bfloat16* own = c == 1 && P.fin_own ? reinterpret_cast<__nv_bfloat16*>(const_cast<char*>(P.fin_own)) : P.part[c] + r * HID;
+        MhcFabricPeerBlock blk{MhcFabricBlock{P.f, P.stepp, crs, 0, own}};
+        for (int p = 0; p < nr; ++p) blk.peers[p] = P.sp_peer[p];
+        pf_consume_launch(m, Q, i, c, rows, st, blk, 0);
+    }
+    P.attn_frag = false;
+    if (pf_sp_x16_layer(m, P, i, c, M))
+    {
+        k_put_publish_n<<<PF_PUT, 128, 0, st>>>(reinterpret_cast<const uint4*>(P.x2 + (size_t)r0 * HID), P.f, P.stepp, cag, rows * (HID * 2 / 16), P.tickets + cag);
+        pf_sp_issue(P, cag, M, st, true);
+        return;
+    }
+    const float* src = (c == 0 ? P.xn2 : P.xn) + (size_t)r0 * HID;
+    k_put_publish_n<<<PF_PUT, 128, 0, st>>>(reinterpret_cast<const uint4*>(src), P.f, P.stepp, cag, rows * (HID * 4 / 16), P.tickets + cag);
+    pf_sp_issue(P, cag, M, st);
+}
+// second half: every owner's rows (collective 2c + 1) into xn2 / xn, then the FP16 block input of all M rows
+inline void pf_sp_gather(FlashPrefill& P, int c, int M, cudaStream_t st, bool x16 = false)
+{
+    if (x16) { G6RT_CK(cudaStreamWaitEvent(st, P.sp_ready[2 * c + 1], 0)); return; }   // the peers' x2 rows are in place
+    float* xn = c == 0 ? P.xn2 : P.xn;
+    __half* x = c == 0 ? P.x2 : P.x;
+    const int cag = 2 * c + 1;
+    G6RT_CK(cudaStreamWaitEvent(st, P.sp_ready[cag], 0));   // the peers' rows are in xn (pf_sp_issue)
+    for (int p = 0; p < P.f.nr; ++p)   // peer rows only: the owner pass wrote this rank's xn / x rows
+    {
+        const int r0 = pf_r0(M, p, P.f.nr), rows = pf_rows(M, p, P.f.nr);
+        if (p == P.f.rank || !rows) continue;
+        k_sp_f16<<<256, 256, 0, st>>>(xn + (size_t)r0 * HID, x + (size_t)r0 * HID, (size_t)rows * HID);
+    }
+}
 // wait for every rank's partial of collective c, sum in rank order (FP32), update the streams, then the next block's
 // input (c = 0: mHC(hc_ffn) of layer i; c = 1: mHC(hc_attn) of layer i + 1, or the final norm rows after the last layer)
 inline void pf_consume_flash(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream_t st)
 {
+    if (pf_sp())
+    {
+        pf_sp_own(m, P, i, c, M, st);
+        pf_sp_gather(P, c, M, st, pf_sp_x16_layer(m, P, i, c, M));
+        return;
+    }
     const int pf_fuse = pf_fuse_level();
     if (P.peer_stage.on)   // the wait and the copies were issued at the put: wait for them, read the device copies
     {
@@ -882,6 +1075,33 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     };
     embed(A, MA);
     embed(B, MB);
+    if (pf_sp())
+    {
+        // each lane: attn -RS-> own0 -AG-> gather0, mlp -RS-> own1 -AG-> gather1, attn ... Every wire hop of one lane
+        // is covered by a block of the other: RS by an owner pass, AG by an attention or MLP block.
+        auto own = [&](FlashPrefill& P, int i, int c, int M) { pf_sp_own(m, P, i, c, M, st); pr.mark(9, st); };
+        auto gather = [&](FlashPrefill& P, int c, int M, int i = -1) { pf_sp_gather(P, c, M, st, i >= 0 && pf_sp_x16_layer(m, P, i, c, M)); pr.mark(9, st); };
+        for (int i = 0; i < m.nl; ++i)
+        {
+            attn(A, i, MA, ctxA, lsA + i);
+            if (i > 0) own(B, i - 1, 1, MB);
+            own(A, i, 0, MA);
+            if (i > 0) gather(B, 1, MB);
+            attn(B, i, MB, ctxB, lsB + i);
+            gather(A, 0, MA, i);
+            pf_mlp_block(m, A, i, MA, st);
+            put(A, 1, MA);
+            own(B, i, 0, MB);
+            own(A, i, 1, MA);
+            gather(B, 0, MB, i);
+            pf_mlp_block(m, B, i, MB, st);
+            put(B, 1, MB);
+            gather(A, 1, MA);
+        }
+        own(B, m.nl - 1, 1, MB);
+        gather(B, 1, MB);
+        return;
+    }
     for (int i = 0; i < m.nl; ++i)
     {
         attn(A, i, MA, ctxA, lsA + i);

@@ -843,46 +843,59 @@ void Fabric::start_proxy() {
       }
       return true;
     };
-    // striped write to peer p (FabricConfig::stripe_min): [0, h) on qp2 (other rail, signaled), [h, nb) on qp, wait for the
-    // qp2 completion, then the 8-B tail [nb, nb + 8) on qp (ordered after [h, nb) on that QP). false = error (set).
-    auto stripe_write = [&](int p, char* sp, uint32_t nb, size_t roff, uint64_t* xr) -> bool {
+    // striped write to peer p (FabricConfig::stripe_min): [0, h) on qp2 (other rail, signaled), [h, nb) on qp. Every
+    // striped peer's halves are posted first (stripe_post), then stripe_finish waits for all the qp2 completions and posts
+    // each peer's 8-B tail [nb, nb + 8) on qp (ordered after [h, nb) on that QP), so both peers' writes are in flight at once.
+    struct StripeW { int p; char* sp; uint32_t nb; size_t roff; };
+    auto stripe_post = [&](int p, char* sp, uint32_t nb, size_t roff, uint64_t* xr) {
       const uint32_t h = (nb / 2) & ~4095u;
       Rail& R = I.rails[I.rail_of(p, me)];
       Rail& R2 = I.rails[I.rail2_of(p, me)];
-      const uint64_t tag = 0x100u + (uint64_t)p;        // wc_count ignores peer ids >= 8
       ibv_send_wr* bad = nullptr;
       ibv_sge s1{(uint64_t)sp, h, R2.mr->lkey};
       ibv_send_wr w1{}; w1.sg_list = &s1; w1.num_sge = 1; w1.opcode = IBV_WR_RDMA_WRITE; w1.send_flags = IBV_SEND_SIGNALED;
-      w1.wr_id = tag; w1.wr.rdma.remote_addr = I.peer2[p].addr + roff; w1.wr.rdma.rkey = I.peer2[p].rkey;
+      w1.wr_id = 0x100u + (uint64_t)p; w1.wr.rdma.remote_addr = I.peer2[p].addr + roff; w1.wr.rdma.rkey = I.peer2[p].rkey;
       ibv_sge s2{(uint64_t)sp + h, nb - h, R.mr->lkey};
       ibv_send_wr w2{}; w2.sg_list = &s2; w2.num_sge = 1; w2.opcode = IBV_WR_RDMA_WRITE; w2.wr_id = (uint64_t)p;
       w2.wr.rdma.remote_addr = I.peer[p].addr + roff + h; w2.wr.rdma.rkey = I.peer[p].rkey;
       bool sig = (I.unsignaled[p] += 2) >= 256; if (sig) I.unsignaled[p] = 0;
       w2.send_flags = sig ? IBV_SEND_SIGNALED : 0;
-      if (xr) { xr[2] = xr[6] = xt_tick(); }
+      if (xr && !xr[2]) { xr[2] = xr[6] = xt_tick(); }
       FCHECK(ibv_post_send(I.qp2[p], &w1, &bad) == 0);
       FCHECK(ibv_post_send(I.qp[p], &w2, &bad) == 0);
-      const int r2 = I.rail2_of(p, me);
+    };
+    // false = error (set)
+    auto stripe_finish = [&](const StripeW* sw, int ns, uint64_t* xr) -> bool {
+      unsigned want = 0;
+      for (int i = 0; i < ns; i++) want |= 1u << sw[i].p;
       const auto t0 = std::chrono::steady_clock::now();
-      for (bool done = false; !done;) {
-        ibv_wc wc[32]; const int n = ibv_poll_cq(R2.cq, 32, wc);
-        if (n < 0) { fprintf(stderr, "[fabric r%d] ibv_poll_cq failed (%d)\n", me, n); *dev_.error = kBulkCqError; return false; }
-        for (int i = 0; i < n; i++) {
-          if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r2, (int)(wc[i].wr_id & 0xff), wc[i].status); fprintf(stderr, "[fabric r%d] WC error %s (stripe)\n", me, ibv_wc_status_str(wc[i].status)); *dev_.error = 0x71000000u; return false; }
-          if (wc[i].wr_id == tag) done = true;
+      while (want) {
+        for (int i = 0; i < ns && want; i++) {
+          const int r2 = I.rail2_of(sw[i].p, me);
+          ibv_wc wc[32]; const int n = ibv_poll_cq(I.rails[r2].cq, 32, wc);
+          if (n < 0) { fprintf(stderr, "[fabric r%d] ibv_poll_cq failed (%d)\n", me, n); *dev_.error = kBulkCqError; return false; }
+          for (int k = 0; k < n; k++) {
+            if (wc[k].status != IBV_WC_SUCCESS) { I.wc_count(r2, (int)(wc[k].wr_id & 0xff), wc[k].status); fprintf(stderr, "[fabric r%d] WC error %s (stripe)\n", me, ibv_wc_status_str(wc[k].status)); *dev_.error = kBulkCqError; return false; }
+            if (wc[k].wr_id >= 0x100u && wc[k].wr_id < 0x100u + 32) want &= ~(1u << (wc[k].wr_id - 0x100u));
+          }
         }
-        if (!done && (I.stop.load(std::memory_order_relaxed) || *dev_.error)) return false;
-        if (!done && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
-          fprintf(stderr, "[fabric r%d] stripe: no completion of the rail-%d half for 30 s\n", me, r2);
+        if (want && (I.stop.load(std::memory_order_relaxed) || *dev_.error)) return false;
+        if (want && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+          fprintf(stderr, "[fabric r%d] stripe: no completion of the other-rail half for 30 s\n", me);
           *dev_.error = 0x72000000u; return false;
         }
       }
-      ibv_sge s3{(uint64_t)sp + nb, 8, R.mr->lkey};
-      ibv_send_wr w3{}; w3.sg_list = &s3; w3.num_sge = 1; w3.opcode = IBV_WR_RDMA_WRITE; w3.wr_id = (uint64_t)p;
-      w3.wr.rdma.remote_addr = I.peer[p].addr + roff + nb; w3.wr.rdma.rkey = I.peer[p].rkey;
-      sig = (I.unsignaled[p] += 1) >= 256; if (sig) I.unsignaled[p] = 0;
-      w3.send_flags = sig ? IBV_SEND_SIGNALED : 0;
-      FCHECK(ibv_post_send(I.qp[p], &w3, &bad) == 0);
+      for (int i = 0; i < ns; i++) {
+        const int p = sw[i].p;
+        Rail& R = I.rails[I.rail_of(p, me)];
+        ibv_send_wr* bad = nullptr;
+        ibv_sge s3{(uint64_t)sw[i].sp + sw[i].nb, 8, R.mr->lkey};
+        ibv_send_wr w3{}; w3.sg_list = &s3; w3.num_sge = 1; w3.opcode = IBV_WR_RDMA_WRITE; w3.wr_id = (uint64_t)p;
+        w3.wr.rdma.remote_addr = I.peer[p].addr + sw[i].roff + sw[i].nb; w3.wr.rdma.rkey = I.peer[p].rkey;
+        bool sig = (I.unsignaled[p] += 1) >= 256; if (sig) I.unsignaled[p] = 0;
+        w3.send_flags = sig ? IBV_SEND_SIGNALED : 0;
+        FCHECK(ibv_post_send(I.qp[p], &w3, &bad) == 0);
+      }
       if (xr) { xr[3] = xr[7] = xt_tick(); }
       return true;
     };
@@ -940,6 +953,7 @@ void Fabric::start_proxy() {
         char* src = dev_.send + ((size_t)par * cfg_.ncoll + c) * dev_.stride;
         if (!rs) *(volatile unsigned long long*)(src + bytes) = seq;  // tail travels with the payload in one write
         if (xr) xr[1] = xr[5] = xt_tick();
+        StripeW sw[8]; int ns = 0;
         for (int p = 0; p < nr; p++) {
           if (p == me || (rs && bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
           Rail& R = I.rails[I.rail_of(p, me)];
@@ -948,7 +962,8 @@ void Fabric::start_proxy() {
           if (rs) *(volatile unsigned long long*)(sp + nb) = seq;
           const size_t roff = (((size_t)par * cfg_.ncoll + c) * nr + me) * dev_.stride;
           if (I.stripe && nb >= cfg_.stripe_min && nb >= 8192) {
-            if (!stripe_write(p, sp, nb, roff, xr)) return;
+            stripe_post(p, sp, nb, roff, xr);
+            sw[ns++] = StripeW{p, sp, nb, roff};
             continue;
           }
           ibv_sge sge{(uint64_t)sp, nb + 8, R.mr->lkey};
@@ -963,6 +978,7 @@ void Fabric::start_proxy() {
           (void)bad; I.post(p, wr);
           if (xr) xr[xrl * 4 + 3] = xt_tick();
         }
+        if (ns && !stripe_finish(sw, ns, xr)) return;
         }
         for (int r = 0; r < I.nrails; r++) {
           ibv_wc wc[32]; int n;

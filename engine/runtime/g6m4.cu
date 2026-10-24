@@ -601,7 +601,7 @@ int main(int argc, char** argv)
     boot_rank = cfg.rank;
     mem_min_gib();                      // a bad G6_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
-    cfg.xtrace = 1;                    // G6_XTRACE=1: stage-0 trace on the decode fabric only (xtrace.h); off by default
+    cfg.xtrace = getenv("G6_XTRACE_PF") ? 0 : 1;   // G6_XTRACE=1: stage-0 trace on the decode fabric only (xtrace.h); off by default
     fab.init(cfg);
     cfg.xtrace = 0;
     const g6::FabricDev f = fab.dev();
@@ -635,9 +635,13 @@ int main(int argc, char** argv)
         g6::FabricConfig cp = cfg;
         cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
         cp.ncoll = pf_rs ? 5 : 2;
+#if G6_MODEL_FLASH
+        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
+#endif
         cp.port = cfg.port + 8;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
+        cp.xtrace = getenv("G6_XTRACE_PF") ? 1 : 0;
         fabp.init(cp);
         fabp.start_proxy();
     }
@@ -649,9 +653,13 @@ int main(int argc, char** argv)
         g6::FabricConfig cp = cfg;
         cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
         cp.ncoll = pf_rs ? 5 : 2;
+#if G6_MODEL_FLASH
+        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
+#endif
         cp.port = cfg.port + 24;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
+        cp.xtrace = getenv("G6_XTRACE_PF") ? 1 : 0;
         fabp2.init(cp);
         fabp2.start_proxy();
     }
