@@ -157,7 +157,7 @@ class Boot(unittest.TestCase):
         self.assertIn('k_rs_unpack<<<dim3(RS_UNPACK_CTA, p.f.nr), 256, 0, st>>>', c)
         self.assertIn('if (p >= f.nr || p == f.rank', c)
         self.assertNotIn('template <int NR>', c)
-        self.assertIn('p.f.nr < 2 || p.f.nr > MAX_NR', c)
+        self.assertIn('p.f.nr < 2 || p.f.nr > flash_route_split::MAX_NR', c)
         self.assertIn('constexpr int MAX_NR = 8;', src('engine/runtime/flash_route_split.h'))
 
     def test_ports_and_cpus_disjoint(self):

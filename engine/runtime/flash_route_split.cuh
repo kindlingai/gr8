@@ -62,7 +62,7 @@ __global__ void __launch_bounds__(256) k_rs_unpack(g6::FabricDev f, const u64* s
 inline void init_flash_route_split(FlashRouteSplit& p, g6::Fabric& fabric, int max_rows)
 {
     p.fabric = &fabric; p.f = fabric.dev(); p.max_rows = max_rows;
-    if (p.f.ncoll != 1 || p.f.nr < 2 || p.f.nr > MAX_NR ||
+    if (p.f.ncoll != 1 || p.f.nr < 2 || p.f.nr > flash_route_split::MAX_NR ||
         p.f.stride < flash_route_split::payload(max_rows, p.f.nr) + 8)
         die("G6_PF_ROUTER_SPLIT: invalid dedicated fabric geometry");
     p.step = dmalloc<u64>(1); p.ticket = dmalloc<unsigned>(1);
