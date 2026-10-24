@@ -88,6 +88,13 @@ pub fn int<I: itoa::Integer>(out: &mut Vec<u8>, i: I) {
 pub fn string(out: &mut Vec<u8>, s: &str) {
     out.reserve(s.len() + 2);
     out.push(b'"');
+    string_body(out, s);
+    out.push(b'"');
+}
+
+/// The inside of `string`'s literal. Escaping is per character, so the bodies of consecutive pieces of a string join
+/// to the body of the whole.
+pub fn string_body(out: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     let mut start = 0;
     for (i, &c) in b.iter().enumerate() {
@@ -114,7 +121,6 @@ pub fn string(out: &mut Vec<u8>, s: &str) {
         start = i + 1;
     }
     out.extend_from_slice(&b[start..]);
-    out.push(b'"');
 }
 
 pub fn number(out: &mut Vec<u8>, n: &serde_json::Number) {

@@ -6,6 +6,9 @@
 //!   coerced by the tool's JSON schema (null > integer > number > boolean > object > array > string).
 //! - Streaming: partial tags held back; trailing whitespace of reasoning held until more reasoning arrives;
 //!   whitespace-only content held until non-whitespace content arrives.
+//! - A call in the answer, outside a code fence, that follows text directly or starts the answer is live: once its
+//!   name is read and names a tool, its name and then its arguments stream as they are generated. Any other call is
+//!   held until the reply ends.
 //!
 //! Tags are ASCII, so all scanning is on bytes; text is only ever cut at tag boundaries.
 
@@ -32,6 +35,7 @@ enum Step {
     Hold,
     Text,
     Calls,
+    Done,
 }
 
 /// A run of the reply that might be tool calls: from a `<tool_call>` on, held until it is decided either way.
@@ -42,12 +46,18 @@ enum Step {
 /// So the run is text unless the reply ends with it, and when it is text its raw bytes go back where they came from
 /// instead of being dropped. That is also why a call's deltas are emitted when the run is decided rather than as it is
 /// read: a call that turns out to be prose cannot be taken back from the client.
+///
+/// A live run is the exception: an opener in the answer, outside a code fence, that starts the answer or follows text
+/// with no space between (the chat template writes a call straight after the content) is taken at its word once it
+/// names a tool. Prose about a call almost always follows a space or a newline, sits in a fence or in the reasoning;
+/// a live call's tokens reach the client as the model writes them, and text after it is ordinary content.
 struct Region {
-    state: State,  // the state at the opener: where the raw text goes if the run is not a call
-    text: String,  // the raw reply text from the opener on
-    at: usize,     // how much of `text` the scan has consumed
-    slot0: usize,  // the first slot this run pushed
-    open: bool,    // an opener whose closer has not been seen
+    state: State, // the state at the opener: where the raw text goes if the run is not a call
+    text: String, // the raw reply text from the opener on
+    at: usize,    // how much of `text` the scan has consumed
+    slot0: usize, // the first slot this run pushed
+    open: bool,   // an opener whose closer has not been seen
+    live: bool,   // the opener may start a live call
 }
 
 #[derive(Default)]
@@ -57,6 +67,21 @@ struct Slot {
     id: Option<String>,
     streamed: String,
     valid: bool,
+    args: Option<ArgStream>, // set once the call is live
+}
+
+/// How far a live call's arguments have streamed, in bytes of its body.
+#[derive(Default)]
+struct ArgStream {
+    at: usize, // the end of the last complete pair
+    keys: usize,
+    value: Option<OpenValue>,
+}
+
+struct OpenValue {
+    start: usize,
+    types: Option<Vec<String>>, // None: a JSON string, streamed as it arrives; else coerced once it ends
+    sent: usize,
 }
 
 /// One tool-call delta, fields in the order Python's coalesced dict has them.
@@ -98,6 +123,9 @@ pub struct GlmParser {
     deferred_reasoning: String,
     deferred_content: String,
     content_has_nonws: bool,
+    fresh: bool,  // only whitespace since the reply start, a think tag or a live call
+    fence: bool,  // the answer is inside a ``` fence
+    ticks: usize, // backticks in a row
 }
 
 impl GlmParser {
@@ -127,6 +155,9 @@ impl GlmParser {
             deferred_reasoning: String::new(),
             deferred_content: String::new(),
             content_has_nonws: false,
+            fresh: true,
+            fence: false,
+            ticks: 0,
         }
     }
 
@@ -156,6 +187,15 @@ impl GlmParser {
             State::Reasoning => reasoning.push_str(t),
             State::Content => content.push_str(t),
         }
+        for c in t.chars() {
+            self.ticks = if c == '`' { self.ticks + 1 } else { 0 };
+            if self.ticks == 3 && state == State::Content {
+                self.fence = !self.fence;
+            }
+            if !is_py_space(c) {
+                self.fresh = false;
+            }
+        }
         self.last = t.chars().next_back();
     }
 
@@ -168,7 +208,7 @@ impl GlmParser {
                 // a pending run absorbs what arrives; nothing about it is emitted until it is decided
                 reg.text.push_str(&self.buf);
                 self.buf.clear();
-                match self.region_step(&mut reg, final_) {
+                match self.region_step(&mut reg, final_, &mut tools) {
                     Step::Hold => {
                         self.region = Some(reg);
                         break;
@@ -193,6 +233,14 @@ impl GlmParser {
                         }
                         self.state = State::Content;
                         break;
+                    }
+                    Step::Done => {
+                        // a live call ended: what follows it is ordinary text
+                        let rest = reg.text.split_off(reg.at);
+                        self.fresh = true;
+                        self.buf.push_str(&rest);
+                        pos = 0;
+                        continue;
                     }
                 }
             }
@@ -231,6 +279,9 @@ impl GlmParser {
                             at: TOOL_START.len(),
                             slot0: self.slots.len() - 1,
                             open: true,
+                            live: self.state == State::Content
+                                && !self.fence
+                                && (self.fresh || !self.last.is_some_and(is_py_space)),
                         });
                         self.last = Some('>');
                     }
@@ -239,19 +290,10 @@ impl GlmParser {
                 }
                 continue;
             }
-            let mut keep = 0;
-            if !final_ {
-                let rb = rest.as_bytes();
-                for &tag in terms {
-                    let tb = tag.as_bytes();
-                    for n in (1..=(tb.len() - 1).min(rb.len())).rev() {
-                        if rb.ends_with(&tb[..n]) {
-                            keep = keep.max(n);
-                            break;
-                        }
-                    }
-                }
-            }
+            let keep = match final_ {
+                true => 0,
+                false => terms.iter().map(|t| partial_tag(rest, t)).max().unwrap_or(0),
+            };
             let end = self.buf.len().saturating_sub(keep).max(pos);
             if end > pos {
                 let t = self.buf[pos..end].to_string();
@@ -267,11 +309,28 @@ impl GlmParser {
 
     /// Advance a pending run as far as its text allows: `Hold` (more input may still decide it), `Text` (it was never a
     /// call: prose the model wrote about one, or a call it left unfinished or named a non-tool in), or `Calls` (it was,
-    /// decided only when the reply ends with it).
-    fn region_step(&mut self, reg: &mut Region, final_: bool) -> Step {
+    /// decided only when the reply ends with it). A live call streams instead and gives `Done` at its closer.
+    fn region_step(&mut self, reg: &mut Region, final_: bool, deltas: &mut Vec<ToolDelta>) -> Step {
         loop {
             if reg.open {
                 let closer = find_tag(&reg.text, reg.at, TOOL_END);
+                let idx = self.slots.len() - 1;
+                if reg.live && self.slots[idx].args.is_none() {
+                    self.go_live(idx, &reg.text[reg.at..closer.unwrap_or(reg.text.len())], closer.is_some(), deltas);
+                }
+                if self.slots[idx].args.is_some() {
+                    let end = closer.unwrap_or(reg.text.len());
+                    let done = closer.is_some() || final_;
+                    self.stream_args(idx, &reg.text[reg.at..end], done, deltas);
+                    if !done {
+                        return Step::Hold;
+                    }
+                    self.slots[idx].body = reg.text[reg.at..end].to_string();
+                    reg.at = closer.map_or(end, |c| c + TOOL_END.len());
+                    reg.open = false;
+                    self.last = Some('>');
+                    return Step::Done;
+                }
                 let think = {
                     let a = find_tag(&reg.text, reg.at, THINK_START);
                     let b = find_tag(&reg.text, reg.at, THINK_END);
@@ -338,6 +397,109 @@ impl GlmParser {
         valid
     }
 
+    /// Make a live run's open call live once its name is complete and names a tool: send the name and the arguments'
+    /// opening brace. `body` is the call's text so far, `closed` whether it ends at the closer.
+    fn go_live(&mut self, idx: usize, body: &str, closed: bool, deltas: &mut Vec<ToolDelta>) {
+        let Some(end) = body.find(ARG_KEY).or(closed.then_some(body.len())) else { return };
+        let name = py_strip(&body[..end]);
+        if name.contains(THINK_START) || name.contains(THINK_END) || !self.name_valid(name) {
+            return; // the held rules decide it
+        }
+        let id = tool_call_id();
+        let s = &mut self.slots[idx];
+        s.name = Some(name.to_string());
+        s.id = Some(id.clone());
+        s.valid = true;
+        s.args = Some(ArgStream::default());
+        s.streamed = "{".to_string();
+        deltas.push(ToolDelta { index: idx, id: Some(id), name: Some(name.to_string()), arguments: Some("{".into()) });
+    }
+
+    /// Send what `body`, a live call's text so far, settles of its arguments: each key once it is complete, a string
+    /// value as it arrives, any other value once it ends, and the closing brace when `done`. The pieces join to
+    /// `args_json` of the whole body, except that a repeated key is sent twice (JSON readers keep the last, as
+    /// `args_json` does) and a value cut off by the end of the reply is closed rather than dropped.
+    fn stream_args(&mut self, idx: usize, body: &str, done: bool, deltas: &mut Vec<ToolDelta>) {
+        let mut st = self.slots[idx].args.take().unwrap_or_default();
+        let mut out = Vec::new();
+        loop {
+            if let Some(v) = st.value.as_mut() {
+                let text = &body[v.start..];
+                let (end, closed) = match text.find(ARG_VALUE_END) {
+                    Some(e) => (e, true),
+                    None if done => (text.len(), true),
+                    None => (text.len() - partial_tag(text, ARG_VALUE_END), false),
+                };
+                match &v.types {
+                    None => {
+                        pyjson::string_body(&mut out, &text[v.sent..end]);
+                        v.sent = end;
+                        if closed {
+                            out.push(b'"');
+                        }
+                    }
+                    Some(types) if closed => coerce_str(&mut out, &text[..end], types),
+                    Some(_) => {}
+                }
+                if !closed {
+                    break;
+                }
+                st.at = (v.start + end + ARG_VALUE_END.len()).min(body.len());
+                st.value = None;
+            }
+            let Some(i) = body[st.at..].find(ARG_KEY) else { break };
+            let kstart = st.at + i + ARG_KEY.len();
+            match value_start(body, kstart, done) {
+                Err(()) => break,
+                Ok(None) => st.at = kstart - ARG_KEY.len() + 1,
+                Ok(Some((kend, vstart))) => {
+                    if st.keys > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    st.keys += 1;
+                    let key = py_strip(&body[kstart..kend]);
+                    pyjson::string(&mut out, key);
+                    out.extend_from_slice(b": ");
+                    let types = self.coerced_types(idx, key);
+                    if types.is_none() {
+                        out.push(b'"');
+                    }
+                    st.value = Some(OpenValue { start: vstart, types, sent: 0 });
+                }
+            }
+        }
+        if done {
+            out.push(b'}');
+        }
+        self.slots[idx].args = Some(st);
+        if out.is_empty() {
+            return;
+        }
+        let piece = String::from_utf8(out).unwrap();
+        self.slots[idx].streamed.push_str(&piece);
+        deltas.push(ToolDelta { index: idx, id: None, name: None, arguments: Some(piece) });
+    }
+
+    /// The schema types `coerce_str` reads for `key` of slot `idx`'s tool, or None when any value comes out as a JSON
+    /// string.
+    fn coerced_types(&self, idx: usize, key: &str) -> Option<Vec<String>> {
+        let name = self.slots[idx].name.as_deref()?;
+        let schema = self.properties(name)?.get(key).filter(|s| s.is_object())?;
+        let types = schema_types(schema);
+        let other =
+            |t: &String| matches!(alias(t).as_str(), "null" | "integer" | "number" | "boolean" | "object" | "array");
+        types.iter().any(other).then_some(types)
+    }
+
+    fn properties(&self, name: &str) -> Option<&Map<String, Value>> {
+        self.tools
+            .get(name)
+            .and_then(|f| f.get("parameters"))
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("properties"))
+            .and_then(Value::as_object)
+    }
+
     /// The deltas for a run's calls, one each: nothing about them was streamed while the run was pending.
     fn emit_calls(&mut self, slot0: usize, deltas: &mut Vec<ToolDelta>) {
         for i in slot0..self.slots.len() {
@@ -357,6 +519,7 @@ impl GlmParser {
     fn on_think(&mut self, tag: &str) {
         // A think tag separates the next opener from any preceding backtick in the raw reply.
         self.last = Some('>');
+        self.fresh = true;
         match self.state {
             State::Reasoning => {
                 if tag == THINK_END {
@@ -380,13 +543,7 @@ impl GlmParser {
         for (k, v) in pairs {
             params.insert(k.clone(), Value::from(v.as_str()));
         }
-        let props = self
-            .tools
-            .get(name)
-            .and_then(|f| f.get("parameters"))
-            .and_then(Value::as_object)
-            .and_then(|p| p.get("properties"))
-            .and_then(Value::as_object);
+        let props = self.properties(name);
         let mut out = Vec::with_capacity(64);
         out.push(b'{');
         for (i, (k, v)) in params.iter().enumerate() {
@@ -409,8 +566,9 @@ impl GlmParser {
     /// Feed newly decoded text; returns the DeltaMessage fields (None if empty).
     pub fn delta(&mut self, text: &str, finished: bool) -> Option<Delta> {
         let (mut reasoning, content, tools) = self.feed(text, finished);
-        // a run still pending is not a call yet: only a decided one trims the whitespace-only content before it
-        let valid_tools = self.region.is_none() && self.slots.iter().any(|s| s.valid);
+        // a run still pending is not a call yet: only a decided or live one trims the whitespace-only content before it
+        let valid_tools = self.slots.iter().any(|s| s.args.is_some())
+            || (self.region.is_none() && self.slots.iter().any(|s| s.valid));
         if !reasoning.is_empty() {
             let comb = std::mem::take(&mut self.deferred_reasoning) + &reasoning;
             let trimmed = py_rstrip(&comb).len();
@@ -450,7 +608,11 @@ impl GlmParser {
         for s in &self.slots {
             if let (true, Some(name)) = (s.valid, s.name.as_deref().filter(|n| !n.is_empty())) {
                 let id = s.id.clone().unwrap_or_else(tool_call_id);
-                calls.push((id, name.to_string(), self.args_json(name, &pairs(&s.body))));
+                let args = match s.args {
+                    Some(_) => s.streamed.clone(),
+                    None => self.args_json(name, &pairs(&s.body)),
+                };
+                calls.push((id, name.to_string(), args));
             }
         }
         let reasoning = py_rstrip(&r);
@@ -477,6 +639,36 @@ fn find_tag(text: &str, from: usize, tag: &str) -> Option<usize> {
         at = abs + tag.len();
     }
     None
+}
+
+/// The length of the longest proper prefix of `tag` that `text` ends with: bytes that may be the start of the tag.
+fn partial_tag(text: &str, tag: &str) -> usize {
+    let (t, g) = (text.as_bytes(), tag.as_bytes());
+    (1..g.len().min(t.len() + 1)).rev().find(|&n| t.ends_with(&g[..n])).unwrap_or(0)
+}
+
+/// For a key whose text starts at `kstart`: where the key ends and its value starts, by `pairs`' rule (the first
+/// `</arg_key>` followed by whitespace and `<arg_value>`). `Ok(None)` if no value follows the key, `Err` while more
+/// text could still decide it.
+fn value_start(body: &str, kstart: usize, done: bool) -> Result<Option<(usize, usize)>, ()> {
+    const K1: &str = "</arg_key>";
+    let mut search = kstart;
+    while let Some(j) = body[search..].find(K1) {
+        let kend = search + j;
+        let rest = body[kend + K1.len()..].trim_start_matches(is_py_space);
+        if rest.starts_with(ARG_VALUE) {
+            return Ok(Some((kend, body.len() - rest.len() + ARG_VALUE.len())));
+        }
+        if !done && ARG_VALUE.starts_with(rest) {
+            return Err(());
+        }
+        search = kend + 1;
+    }
+    if done {
+        Ok(None)
+    } else {
+        Err(())
+    }
 }
 
 /// Whether `before` ends inside an `<arg_value>` that no `</arg_value>` has closed yet.
@@ -902,16 +1094,20 @@ mod tests {
         assert_eq!(r.reasoning, None);
         assert_eq!(
             r.content.as_deref(),
-            Some("Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
-                  in your code.")
+            Some(
+                "Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
+                  in your code."
+            )
         );
     }
 
     /// The same inside reasoning: the raw text goes back to the reasoning, which the later `</think>` still closes.
     #[test]
     fn prose_example_in_reasoning_stays_reasoning() {
-        let r = full("Think about <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
-                      a bit.</think>Here.");
+        let r = full(
+            "Think about <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
+                      a bit.</think>Here.",
+        );
         assert!(r.calls.is_empty());
         assert_eq!(
             r.reasoning.as_deref(),
@@ -976,17 +1172,72 @@ mod tests {
         );
     }
 
-    /// A call followed by prose is prose too (the model writes about the call, then goes on).
+    /// A held call followed by prose is prose too (the model writes about the call, then goes on).
     #[test]
-    fn a_call_followed_by_prose_is_prose() {
-        let r = full("</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
-                      and that is how you ask.");
+    fn a_held_call_followed_by_prose_is_prose() {
+        let r = full(
+            "</think>See <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
+                      and that is how you ask.",
+        );
         assert!(r.calls.is_empty());
         assert_eq!(
             r.content.as_deref(),
-            Some("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> and that is how \
-                  you ask.")
+            Some(
+                "See <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> and that \
+                  is how you ask."
+            )
         );
+    }
+
+    /// A live call stays a call when prose follows it: the prose is content.
+    #[test]
+    fn a_live_call_followed_by_prose_is_a_call() {
+        let r = full(
+            "</think>\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> \
+                      and that is how you ask.",
+        );
+        assert_eq!(r.calls[0].2, r#"{"city": "Paris"}"#);
+        assert_eq!(r.content.as_deref(), Some("and that is how you ask."));
+    }
+
+    /// A live call's name goes out once it is read, a string value as it arrives, any other value once it ends.
+    #[test]
+    fn live_call_streams_as_it_is_generated() {
+        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true);
+        let mut step = |text: &str| {
+            let d = p.delta(text, false).unwrap_or_default();
+            let t = d.tool_calls.first();
+            (t.and_then(|t| t.name.clone()), t.and_then(|t| t.arguments.clone()), d.content)
+        };
+        assert_eq!(step("Checking.</think>\n<tool_call>get_wea"), (None, None, None));
+        assert_eq!(step("ther<arg_key>ci"), (Some("get_weather".into()), Some("{".into()), None));
+        assert_eq!(step("ty</arg_key><arg_value>Par"), (None, Some(r#""city": "Par"#.into()), None));
+        assert_eq!(step("is \"x\"</arg_val"), (None, Some(r#"is \"x\""#.into()), None));
+        assert_eq!(step("ue><arg_key>days</arg_key><arg_value>3"), (None, Some(r#"", "days": "#.into()), None));
+        assert_eq!(step("</arg_value></tool_call>"), (None, Some("3}".into()), None));
+    }
+
+    /// Calls after a space or newline in the answer, in reasoning or in a fence are held until the reply ends.
+    #[test]
+    fn other_calls_are_held() {
+        for text in [
+            "</think>Sure. <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+            "</think>Sure:\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+            "Plan.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+            "</think>```\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+        ] {
+            let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true);
+            let d = p.delta(text, false).unwrap_or_default();
+            assert!(d.tool_calls.is_empty(), "{text:?}");
+        }
+    }
+
+    /// A live call cut off by the end of the reply keeps the arguments it streamed, closed.
+    #[test]
+    fn cut_off_live_call_is_closed() {
+        let r = full("</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par");
+        assert_eq!(r.calls[0].2, r#"{"city": "Par"}"#);
+        assert_eq!(r.content, None);
     }
 
     /// A fenced example: the closing fence is text after the call, so the run is prose.
@@ -1002,8 +1253,10 @@ mod tests {
     /// The format has no escape, so an argument value may hold the closing tag: it is part of the value, not the end.
     #[test]
     fn closer_inside_an_argument_value() {
-        let r = full("</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> \
-                      b</arg_value></tool_call>");
+        let r = full(
+            "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> \
+                      b</arg_value></tool_call>",
+        );
         assert_eq!(r.calls.len(), 1);
         assert_eq!(r.calls[0].2, r#"{"city": "a </tool_call> b"}"#);
         assert_eq!(r.content, None);
@@ -1021,8 +1274,10 @@ mod tests {
     /// Two real calls in a row are both calls (a zero-argument one included).
     #[test]
     fn trailing_calls_are_all_reported() {
-        let r = full("</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>\
-                      <tool_call>get_current_date</tool_call>");
+        let r = full(
+            "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>\
+                      <tool_call>get_current_date</tool_call>",
+        );
         assert_eq!(r.calls.len(), 2);
         assert_eq!(r.calls[0].1, "get_weather");
         assert_eq!(r.calls[0].2, r#"{"city": "Paris"}"#);
@@ -1043,18 +1298,31 @@ mod tests {
             "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
             "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>get_current_date</tool_call>",
             "</think>Like this:\n```\n<tool_call>get_current_date</tool_call>\n```\n",
+            "hmm</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Pa<ris</arg_value>\
+             <arg_key>days</arg_key>\n<arg_value>3</arg_value><arg_key>metric</arg_key><arg_value>True</arg_value></tool_call>",
+            "</think>\n<tool_call>get_weather<arg_key>a</arg_key>x</arg_key> <arg_value>1</arg_value></tool_call>",
+            "</think>\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris",
         ];
+        // streamed content after a call keeps whitespace that a whole reply strips
+        let strip = |c: Option<String>| c.map(|c| py_strip(&c).to_string()).filter(|c| !c.is_empty());
         for text in cases {
             let f = full(text);
             for chunk in [1usize, 2, 3, 5, 11] {
                 let s = streamed(text, chunk);
                 assert_eq!(
-                    (s.reasoning, s.content, s.calls.iter().map(|c| (c.1.clone(), c.2.clone())).collect::<Vec<_>>()),
-                    (f.reasoning.clone(), f.content.clone(), f.calls.iter().map(|c| (c.1.clone(), c.2.clone())).collect()),
+                    (
+                        s.reasoning,
+                        strip(s.content),
+                        s.calls.iter().map(|c| (c.1.clone(), c.2.clone())).collect::<Vec<_>>()
+                    ),
+                    (
+                        f.reasoning.clone(),
+                        strip(f.content.clone()),
+                        f.calls.iter().map(|c| (c.1.clone(), c.2.clone())).collect()
+                    ),
                     "chunk {chunk} of {text:?}"
                 );
             }
         }
     }
-
 }

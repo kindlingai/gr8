@@ -195,6 +195,14 @@
   unchanged at short context; a ~71K-token request plus three short ones ran concurrently with the cap engaged,
   without errors.
 
+## 2026-10-20: tool calls stream as they are written
+
+- The front end streams a tool call's name and arguments while the model writes them, instead of sending the whole call
+  once the reply ends. This applies to a call in the answer, outside a code fence, that starts the answer or follows text
+  with no space between, which is how GLM-5.3 places a call. String arguments (file contents, commands) stream as
+  generated; typed ones (integers, booleans, objects) go out once each value ends. Other calls (after a space or
+  newline, in reasoning, in a fence) are held until the reply ends, as before, so a call quoted in prose stays prose.
+  A streamed call is a call even if prose follows it.
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)
