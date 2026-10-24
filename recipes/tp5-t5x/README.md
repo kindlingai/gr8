@@ -81,5 +81,5 @@ Measured on 2026-10-20 only as test arms, never as a serve:
 ## Sources
 Every number above comes from our run logs and reports: `reports/tp5/SERVE.md` (T5X rows 11:13Z / 11:24Z, the
 full-clock row 12:06Z, the mixed / coresident / decode-gate rows), `reports/tp5/t2-t5s2.md` (needles),
-`reports/tp5/kv4.md` (int4), `reports/remote-kv-tp5/RESULTS.md` and `BOOT-OPTION.md` (T5XR). Raw logs are on the
-head box: `/root/tp5/t5q2.log`, `arms.log`, `arms-fullclk.log`, `runs/1019T120604Z-T5Xfullclk`.
+`reports/tp5/kv4.md` (int4), `reports/remote-kv-tp5/RESULTS.md` and `BOOT-OPTION.md` (T5XR), and the raw run logs on our
+head box.
