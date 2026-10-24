@@ -451,3 +451,20 @@ fn stale_shrink_refused() {
     assert_eq!(a[0].segs(), 2);
     assert_eq!(a[0].shrink(1, r.txn).unwrap_err().kind(), ErrorKind::StaleNetworkFileHandle);
 }
+
+// D-331 M8 E(c): a group opened with no cap= (cap_bytes 0, the engine's "the node's limit", kv_tier.cuh add_group)
+// grows past its floor under demand, as far as the node has room
+#[test]
+fn no_cap_grows_past_the_floor() {
+    let addr = node(16, 60_000);
+    let a = cluster(&addr, "a", 2, 100_000, 2, 0);
+    let per = a[0].per_seg;
+    assert_eq!(a[0].blocks(), 2 * per);
+    let r = a[0].report(3, &[]).unwrap();
+    assert_eq!((r.grant, r.give), (3, 0), "no cap: the floor is not the cap");
+    grow_all(&a, 5, r.txn);
+    assert_eq!(a[1].blocks(), 5 * per);
+    // the node's room is the limit: 16 segments, 10 held, 3 a rank left
+    let r = a[0].report(9, &[]).unwrap();
+    assert_eq!(r.grant, 3, "16 segments on the node, 2 ranks at 5");
+}

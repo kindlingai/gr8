@@ -1,6 +1,14 @@
 # Changelog
 
 
+## 2026-10-24: a group lease with no `cap=` grows past its floor (D-331 M8 fix)
+
+- kvman-remote GOPEN: `cap_bytes` 0 (no `cap=` on `--kv-store ...,group=G`) now means no cap, so the group grows as far
+  as the node has room, as `s2/kv_tier.cuh` `add_group` and the docs describe. Before, the node set the cap to the
+  floor, so a group without `cap=` was never granted a segment and no Resize ever ran (M8 E(c) on the box: share logs
+  empty, full and Flash leases stuck at their floors). The node's stats print `"cap":0` for no cap. Test:
+  `tests/share.rs` `no_cap_grows_past_the_floor` (fails before: grant 0; passes after). Not measured on a box.
+
 ## 2026-10-24: the Flash checkpoint store can be a group lease, so Flash and the full model share one KV node (D-331 M8 (c))
 
 - `--kv-store remote:HOST:PORT,size=N,group=G` on glm53f (with `FLASH_CACHE`, experimental): the checkpoint lease is a

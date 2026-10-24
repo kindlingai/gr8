@@ -436,7 +436,7 @@ read the whole run. Until the cluster check, each rank keeps its own store.
 
 Two clusters (GLM and Flash, say) can share one KV node. Each store opened with `group=NAME[,cap=N][,weight=N]`
 (`--kv-store remote:...,size=FLOOR,group=glm,cap=32G`) is one rank's lease in group NAME. A group lease holds whole
-segments (`kvman-remote --seg-mb`, 1 GiB by default), starts at its floor (`size=`), and grows up to `cap=`. Capacity
+segments (`kvman-remote --seg-mb`, 1 GiB by default), starts at its floor (`size=`), and grows up to `cap=` (no `cap=`: as far as the node has room). Capacity
 moves between groups by whole segments (server.rs):
 
 - The head (rank 0) REPORTs to the node now and then (`G6_S2_SHARE_MS`, 1000 ms): the segments a rank it wants more

@@ -154,7 +154,7 @@ struct Group {
     nr: u32,
     block_bytes: usize,
     floor: u64,
-    cap: u64,
+    cap: u64, // u64::MAX: no cap (GOPEN cap_bytes 0)
     weight: u64,
     members: BTreeMap<u32, Member>,
     // segments held for ranks that have not opened yet (their floors)
@@ -736,7 +736,7 @@ impl Shared {
                         g.nr,
                         g.block_bytes,
                         g.floor,
-                        g.cap,
+                        if g.cap == u64::MAX { 0 } else { g.cap },
                         g.weight,
                         segs.join(","),
                         g.boot,
@@ -1205,7 +1205,8 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
     let bps = seg as u64 / w.block_bytes;
     let span = bps * w.block_bytes;
     let floor = w.floor_bytes.div_ceil(span).max(1);
-    let cap = w.cap_bytes.div_ceil(span).max(floor);
+    // cap_bytes 0 = no cap (cap= not given): the group grows as far as the node has room
+    let cap = if w.cap_bytes == 0 { u64::MAX } else { w.cap_bytes.div_ceil(span).max(floor) };
     let weight = if w.weight == 0 { 1000 } else { w.weight as u64 };
     let deadline = Instant::now() + sh.share.stall;
     let l = loop {
