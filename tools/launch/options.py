@@ -159,8 +159,10 @@ KEYS = {
                                        'int4, the fallback)'),
     'LAYOUT': ('box', None, 'with V2_DENSE: a layout file (bin/g6layout) that says which pieces each rank holds, instead '
                             'of the formulas. The handshake compares its sha256'),
-    'GRAMMAR_DIR': ('box', None, 'experimental: request grammars (an engine built with G6_XGRAMMAR): the directory with the '
-                                 'tokenizer.json and generation_config.json they compile against, the model set\'s'),
+    'GRAMMAR': ('cluster', '0', 'experimental: 1 = the engine masks response_format JSON replies with their grammar '
+                                '(XGrammar; an engine build with it, GLM-5.3 only); the front end checks them either way'),
+    'GRAMMAR_DIR': ('box', None, 'GRAMMAR=1: the directory with the tokenizer.json and generation_config.json the grammars '
+                                 'compile against (default: the model set\'s tokenizer)'),
     'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
@@ -374,6 +376,8 @@ def validate(o):
                           '--default-thinking-budget)')
     if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
         raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
+    if o.get('GRAMMAR') not in ('0', '1'):
+        raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
     if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
