@@ -1400,6 +1400,7 @@ int main(int argc, char** argv)
                 g6s2::TierSpec t;
                 try { t = g6s2::TierSpec::parse(kv_tiers[0], false); } catch (const std::exception& e) { die(std::string("G6_FLASH_CACHE: ") + e.what()); }
                 if (t.persist) die("G6_FLASH_CACHE: persist=on is not supported (checkpoints live for one boot)");
+                if (!t.group.empty()) die("G6_FLASH_CACHE: group= is not supported (the checkpoint lease is not a group lease)");
                 spec = t.store; bytes = t.bytes;
                 if (t.ssd())
                 {   // as the pool's stores: the folder starts empty at every boot
