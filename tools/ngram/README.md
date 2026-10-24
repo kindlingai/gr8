@@ -15,7 +15,7 @@ near-certain continuations would propose drafts that the target accepts. Python 
     # 1. traces, on a booted cluster (any TP): one line per prompt
     python3 tools/ngram/capture.py --url http://127.0.0.1:8100 --prompts tools/ngram/data/prompts.json \
         --out traces.jsonl --max-tokens 1024 --top 8
-    # 2. replay: 5 folds by trace (table from 80%, replay the other 20%), chain and tree, rows 3/5/8
+    # 2. replay: 5 folds by prompt (table from 80%, replay the other 20%), chain and tree, rows 3/5/8
     python3 tools/ngram/ngram.py replay traces.jsonl --folds 5 --json replay.json
     # 3. table size against hit rate
     python3 tools/ngram/ngram.py sizes traces.jsonl --floors 0.1,0.3,0.5,0.7,0.9
@@ -38,8 +38,9 @@ in `refs/tp4.json` 108 of 4,096 positions have the generated token outside first
   so this is a valid tree and, for the stored probabilities, the one with the most expected accepted tokens. Trees
   need tree verification (#57).
 - **Rows.** By default a table proposal is cut to the prefix with the most expected tokens per ms (`--fill` keeps every
-  row). Prompt lookup has no probabilities, so its proposals are never cut: it always fills the budget. Cost per round is the verify time of rows = drafts + 1 from `engine/runtime/spec_len.h` (TP4, 2200 MHz);
-  lookups cost no GPU time.
+  row). Prompt lookup has no probabilities, so its proposals are never cut: it always fills the budget. Cost per
+  round is the verify time of rows = drafts + 1 from `engine/runtime/spec_len.h` (TP4, 2200 MHz); lookups cost no
+  GPU time.
 - **Acceptance.** Greedy: the longest proposed path equal to GLM's own tokens, plus the one token the verify step
   always commits.
 - **Sources.** `prompt` (#34's prompt lookup alone: the tokens after the latest earlier match of the last 4..2
@@ -53,7 +54,7 @@ in `refs/tp4.json` 108 of 4,096 positions have the generated token outside first
 `used %`: rounds that verified drafts. `accepted / used`: draft tokens accepted per round that verified drafts.
 `tokens / round`: committed per verify step. `rows / round`, `tokens / row`: verify rows and tokens per row.
 `expected tokens / row` and `table acc / round: expected (actual)`: what the table's own probabilities predicted, over
-the rounds whose drafts came from the table (prompt lookup's rounds are left out), against what happened.
+the rounds not served by prompt lookup, against what happened.
 `speedup vs 1 row`: tokens per ms against plain decoding with the same verify table. It ignores the MTP or DFlash2
 drafts the engine would otherwise make, so compare a source's tokens per round with theirs from the engine's log, not
 the speedup with 1.
