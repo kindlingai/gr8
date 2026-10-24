@@ -129,15 +129,14 @@ manifest instead.
 | `GROUP` | `--group` | `gr8-<model>` | cluster | the mentat group the boxes join |
 | `HEAD` | `--head` | the lowest address | cluster | mentat mode: the head's LAN address |
 | `IPS`, `IPS2` | `--ips`, `--ips2` | discovered | cluster | each rank's rail-0 and rail-1 fabric address. Without them each box finds its own two RoCE v2 addresses |
-| `MODEL` | `--model` | none | box | the exlr8 release, `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`) or a local copy of it (`dense/`, `experts/`, `index-slices/`, `manifests/`, the tokenizer files), or a prepared pack directory with every rank's manifest. A release is the whole model: the engine plans every rank's weights from its files (`V2_DENSE`). Without `MODEL_CACHE` the engine loads a pack directory in place |
-| `BASE_PACKS` | `--base-packs` | none | box | with an https:// `MODEL`: the non-expert weights come from this prepared pack directory, and the release gives only the experts |
-| `V2_DENSE` | `--v2-dense` | the release, when `MODEL` is one | box | the exlr8 release directory whose `dense/` files give every non-expert weight: no rank packs (`g6m4 --v2-dense`) |
+| `MODEL` | `--model` | none | box | the exlr8 release: `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`), or a local copy of it (`dense/`, `experts/`, `index-slices/`, `manifests/`, the tokenizer files) used in place, on a local disk or a shared mount such as NFS. The engine plans every rank's weights from the release's files (`V2_DENSE`) |
+| `V2_DENSE` | `--v2-dense` | the release | box | the exlr8 release directory whose `dense/` files give every non-expert weight (`g6m4 --v2-dense`) |
 | `V2_DENSE_FORM` | `--v2-dense-form` | `trellis` | cluster | with `V2_DENSE`: `trellis` keeps q_b, o_proj and the dense MLP as the release's trellis entries for the dense trellis kernels, so the weights are the release's own. `rounded` is the fallback: it rounds them to the MXFP8 and int4 forms of a converted pack |
 | `DRAFTER` | `--drafter` | none | box | TP=4: the DFlash2 drafter's repo, `https://huggingface.co/incoai/GLM-5.3-DFlash2`. Each box fetches it and converts its rank into `MODEL_CACHE`. Its repo and commit go into the id the boxes compare |
 | `DFLASH_DIR` | `--dflash-dir` | none | box | a directory holding `dflash.r<r>.*`, when it is not the model set's |
 | `RANK` | `--rank` | none | run | `prepare`: the rank to fetch, when this box cannot tell (mentat mode) |
-| `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
-| `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |
+| `MODEL_CACHE` | `--model-cache` | none | box | with an https:// `MODEL`: this box's local directory for its rank's part of the release, and for the converted drafter |
+| `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the release directory has none |
 | `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `run/` |
 | `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
 | `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
