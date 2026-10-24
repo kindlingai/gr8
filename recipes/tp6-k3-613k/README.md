@@ -25,18 +25,21 @@ At TP=6 these are close to the launcher's defaults (614400 / 131072); the earlie
 steps removed). They were syntax-checked, not re-run in this form.
 
 ## Boot
-On the head box, as root, with the same gr8 checkout path `H` on all six boxes and the exlr8 release at `MODEL`:
+On the head box, as root, with the same gr8 checkout path `H` on all six boxes, the converted rank packs at `MODEL` and the exlr8 release at `MODEL_DIR`:
 ```
 BOXES="<head> <box2> <box3> <box4> <box5> <box6>" H=/path/to/gr8 bash recipes/tp6-k3-613k/handboot.sh /path/to/K3-cap613-sl131k.env K3C613
 curl -s localhost:8000/v1/models    # max_model_len 612986; boot log line "G6_CP on, R 131072"
 BOXES="..." H=/path/to/gr8 bash recipes/tp6-k3-613k/down.sh /path/to/K3-cap613-sl131k.env
 ```
-`MODEL` is the exlr8 release (a local copy on every box, or the Hugging Face URL with `MODEL_CACHE`): main boots from
-the release only (#144). Every number below was measured with converted rank packs instead (`rank<r>.pack` + manifests,
-plus `qo.pack` for `PF_OWN=3`; `MODEL_DIR` the release), at tag `tp6-k3-613k-measured` (dd67022). An earlier release-path
-boot (KVB fp8 straight from the HF release) failed on our fleet with non-finite attention at layer 37 on the first
-request. The release boot of this file is checked at the box gate before merge: smoke, gate0, 8K prefill / decode spot
-check.
+TP6 boots from packs: `MODEL` is the directory of converted rank packs (`rank<r>.pack` + `rank<r>.manifest.json`, plus
+`qo.pack` + `qo.manifest.json` for `PF_OWN=3`; a box needs its own rank's pack, the manifests and qo.pack), and `MODEL_DIR` the exlr8 release (tokenizer and
+config). Every number below was measured this way, at tag `tp6-k3-613k-measured` (dd67022). The launcher's pack boot is
+#172 (it brings back what #144 removed).
+
+The boot from the release (`MODEL` = the release) fails at TP=6: the serve reaches `/health` 200, then the first request
+stops with non-finite attention at layer 37 (S2 epoch abort). This is known (seen 10-21 with the recipe engine, again
+at the box gate of this PR) and tracked separately; KVB bf16 does not fix it. A TP6 release boot also needs
+`index-slices/tp6` in the release: a release with tp4 slices only stops at boot with `no index slices for TP 6`.
 
 ## Numbers (GPU clock capped at 2000 MHz unless noted, MTP=3, one request unless noted)
 | measure | value |
