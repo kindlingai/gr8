@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-24: KV_SHARE_VALUE=cost acts on the value-weighted share policy (D-331 M6 step 3)
+
+- `./gr8 kv up --share-value cost` (kvman-remote `--value cost`): the policy of step 2 picks the group that gives; the
+  age rule is only counted in STATS `shadow`. A starting group still gets its floor by age. Default stays `age`.
+- kvman-share-bench records and replays bursty two-cluster traces (`--record`, `--trace`), runs a no-sharing fixed
+  split (`--fixed SA,SB`) and reports recompute waiting. On 3 held-out bench traces the cost policy waited 1.8% less
+  than the best fixed split in all (-4.7%, -1.7%, +1.3%): it does NOT meet the >= 10% bar, so it is not the default.
+
 ## 2026-10-24: the KV node's value-weighted share policy, in shadow (D-331 M6 step 2)
 
 - `./gr8 kv up --share-value cost-shadow --share-spg GROUP=SECONDS,...`: the node still picks the group that gives by
