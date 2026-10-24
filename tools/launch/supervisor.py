@@ -782,8 +782,8 @@ class Supervisor:
         out = kvnode.out_dir(ko)
         os.makedirs(out, exist_ok=True)
         ledger = os.path.join(out, 'ledger')
-        # FLASH_CAP_POLICY=borrow-idle: the GPU's lendable KV chunks (the engine wrote their bytes at boot) are booked as
-        # the GPU's, and the node may grow into them once lent
+        # FLASH_CAP_POLICY=borrow-idle: the GPU's lendable KV chunks (the engine wrote their bytes at boot) are booked
+        # as the GPU's, and the node may grow into them once lent
         gpu = gpu_lendable(ledger) if self.borrow_idle(knobs) else 0
         if self.borrow_idle(knobs) and not gpu:
             log(f'KV donation: no {ledger}.gpu from the engine; it lends no GPU chunks')
