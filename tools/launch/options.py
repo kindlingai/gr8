@@ -26,8 +26,9 @@ KEYS = {
     'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
                                       '<model> sets it'),
     'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2)'),
-    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
-                                 "cabled to the f1 port of the next box in --peers order, the last to the first)"),
+    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: with --peers, each box's "
+                                 "f0 port cabled to the f1 port of the next box in --peers order, the last to the "
+                                 "first; with mentat, the order and the devices follow the probed cables)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
     'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
@@ -43,8 +44,8 @@ KEYS = {
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
-    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
-                               'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
+    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default: from "
+                               "mentat's probes, or with --peers rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)"),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
@@ -465,8 +466,6 @@ def validate(o):
     if o.get('SHAPE') == 'ring':
         if tp not in ('3', '4'):
             raise OptionError(f'--shape ring: TP=3 or 4, not {tp}')
-        if mode(o) != 'peers':
-            raise OptionError('--shape ring needs --peers: their order is the cable order')
         if o.get('IPS'):
             raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
                               'and bootstraps over the LAN')
@@ -705,9 +704,10 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def canonical(o, plan, members, variant=None):
+def canonical(o, plan, members, variant=None, ring=''):
     """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None.
-    variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count."""
+    variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count. ring: --shape ring
+    with mentat, the ring this box derived from the probes (mentat.ring_text), so every box must have found the same."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
     if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
         c['model'] = models.of(o).name
@@ -725,6 +725,8 @@ def canonical(o, plan, members, variant=None):
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''
+    if ring:
+        c['ring'] = ring
     if o.get('LAYOUT'):   # a path per box: its bytes are what every rank must agree on
         c['layout.sha256'] = file_sha256(o.get('LAYOUT'))
     c['engine.env'] = ' '.join(sorted(plan['env']))
