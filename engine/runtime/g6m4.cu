@@ -1989,15 +1989,20 @@ int main(int argc, char** argv)
                         fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
                                 (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
                 };
+                // KV_SHARE_WHEN=idle (default): the head offers its blocks to other groups only while the engine is
+                // idle, so a give's compaction never pauses a turn; always: whenever the node asks
+                const char* when = getenv("KV_SHARE_WHEN");
+                if (when && strcmp(when, "idle") && strcmp(when, "always")) die("KV_SHARE_WHEN is idle or always");
+                const bool share_always = when && !strcmp(when, "always");
                 if (R == 0)
-                    h.share = [&]() -> std::optional<g6s2::Resize> {
+                    h.share = [&, share_always](bool idle) -> std::optional<g6s2::Resize> {
                         // one group tier a report, in turn: one Resize in flight at a time
                         const size_t k = kv_next_group++ % kv_groups.size();
                         const uint32_t t = kv_groups[k];
                         const g6kv_tier_totals now = pool.tiers().at(t);
                         const uint64_t want = g6s2::share_want(kv_seen[k], now, g6kv_store_seg_blocks(kvt->store(t)));
                         kv_seen[k] = now;
-                        return g6s2::share_poll(pool, t, kvt->store(t), want);
+                        return g6s2::share_poll(pool, t, kvt->store(t), want, share_always || idle);
                     };
             }
             h.dispatch = nd.hooks();

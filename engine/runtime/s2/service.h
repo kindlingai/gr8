@@ -54,9 +54,10 @@ struct NativeHooks {
     // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
     std::function<bool()> drained;
     // optional, a tier on a group lease of a KV node (s2/kv_share.h): share = the head's report to the node, on its
-    // control thread every G6_S2_SHARE_MS (default 1000) while no resize is in flight; the resize to announce, or
-    // nothing. resize = every rank's change at the Resize commit (share_apply with the tier drain)
-    std::function<std::optional<Resize>()> share;
+    // control thread every G6_S2_SHARE_MS (default 1000) while no resize is in flight, told whether the engine is idle
+    // (no resident session, none queued); the resize to announce, or nothing. resize = every rank's change at the
+    // Resize commit (share_apply with the tier drain)
+    std::function<std::optional<Resize>(bool idle)> share;
     std::function<void(const Resize&)> resize;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
@@ -273,7 +274,7 @@ class Service {
             bool changed = false;
             if (native_.share && !resizing_.load() && std::chrono::steady_clock::now() >= next_share) {
                 next_share = std::chrono::steady_clock::now() + std::chrono::milliseconds(share_ms_);
-                if (const auto r = native_.share()) {
+                if (const auto r = native_.share(progress_.resident.load() == 0 && queue_.size() == 0)) {
                     fprintf(stderr, "# s2 share: tier %u to %llu segments (%llu blocks)\n", r->tier, (unsigned long long)r->segs,
                             (unsigned long long)r->slots);
                     resizing_.store(true);

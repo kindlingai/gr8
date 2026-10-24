@@ -645,10 +645,11 @@ impl Pool {
         }
     }
 
-    /// The ages a KV node's head REPORTs for tier t (remote::coldest_ages): for each i, ms since the use of the most
-    /// recently used entry a give of i + 1 segments would evict (the shrink's order, stash.rs give_order), at most
-    /// `most`; they never rise. An entry was used when it was stored, restored, or a prompt
-    /// started with it (a prefix); a prefix base counts as used as recently as the newest run stored on it.
+    /// The ages a KV node's head REPORTs for tier t (remote::coldest_ages): for each i, u64::MAX while the tier's free
+    /// slots cover a give of i + 1 segments, then ms since the use of the most recently used entry that give would
+    /// evict (the shrink's order, stash.rs give_order), at most `most`; they never rise. An entry was used when it was
+    /// stored, restored, or a prompt started with it (a prefix); a prefix base counts as used as recently as the
+    /// newest run stored on it.
     pub fn coldest_ages(&mut self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
         let Some(s) = &self.stash else { return Vec::new() };
         if t >= s.tiers() {
@@ -679,6 +680,7 @@ impl Pool {
             &s.give_order(t),
             |id| at.get(&id).map_or(0, |u| now.duration_since(*u).as_millis() as u64),
             per_seg,
+            s.stats(t).map_or(0, |x| x.free_slots),
             most,
         )
     }

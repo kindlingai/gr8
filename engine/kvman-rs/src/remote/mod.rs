@@ -11,4 +11,4 @@ pub mod sys;
 pub mod verbs;
 
 pub use client::{coldest_ages, GroupOpts, Opts, RemoteStore, Report, Transport, Want};
-pub use server::{Config, Node, Share};
+pub use server::{parse_plan, Config, Node, Share};

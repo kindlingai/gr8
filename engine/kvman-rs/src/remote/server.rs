@@ -72,6 +72,37 @@ impl Default for Share {
     }
 }
 
+/// Parses a --group-plan file: one group a line, `NAME nr=RANKS floor=SEGS` (floor = segments a rank); `#` starts a
+/// comment.
+pub fn parse_plan(text: &str) -> Result<BTreeMap<String, (u32, u64)>, String> {
+    let mut plan = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bad = || format!("line {}: `{line}` is not `NAME nr=RANKS floor=SEGS`", i + 1);
+        let mut w = line.split_whitespace();
+        let name = w.next().ok_or_else(bad)?;
+        let (mut nr, mut floor) = (None, None);
+        for kv in w {
+            match kv.split_once('=') {
+                Some(("nr", v)) => nr = Some(v.parse::<u32>().map_err(|_| bad())?),
+                Some(("floor", v)) => floor = Some(v.parse::<u64>().map_err(|_| bad())?),
+                _ => return Err(bad()),
+            }
+        }
+        let (Some(nr), Some(floor)) = (nr, floor) else { return Err(bad()) };
+        if nr == 0 || floor == 0 {
+            return Err(bad());
+        }
+        if plan.insert(name.to_string(), (nr, floor)).is_some() {
+            return Err(format!("line {}: group {name} planned twice", i + 1));
+        }
+    }
+    Ok(plan)
+}
+
 pub struct Config {
     pub bytes: usize,
     /// mlock the arena (always, outside tests).
@@ -437,6 +468,13 @@ impl Node {
         let mut share = cfg.share.clone();
         share.seg_bytes = share.seg_bytes.max(1).div_ceil(LEASE_ALIGN) * LEASE_ALIGN;
         let listener = TcpListener::bind(listen)?;
+        let planned: u64 = share.plan.values().map(|&(nr, floor)| nr as u64 * floor).sum();
+        if planned > (bytes / share.seg_bytes) as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the group plan reserves {planned} segments; the node holds {}", bytes / share.seg_bytes),
+            ));
+        }
         let arena = Arena::new(bytes, cfg.lock)?;
         let mut free = BTreeMap::new();
         free.insert(0, bytes);
@@ -1179,7 +1217,7 @@ fn grow(sh: &Arc<Shared>, l: &Lease, target: u64, txn: u64) -> Result<u64, Refus
         let g = st.groups.get(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
         let have = g.members.get(rank).ok_or((proto::E_NOLEASE, "not a member".to_string()))?.segs;
         let Some(t) = g.txn.as_ref().filter(|t| t.id == txn && t.grow) else {
-            if have >= target && txn != 0 && txn <= g.last_txn {
+            if have >= target && txn <= g.last_txn {
                 return Ok(have);
             }
             return Err(stale(g, txn, true));
@@ -1231,17 +1269,26 @@ fn shrink(sh: &Arc<Shared>, l: &Lease, to: u64, txn: u64) -> Result<u64, Refusal
         let mut st = sh.state.lock().unwrap();
         let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
         let have = g.members.get(rank).map_or(0, |m| m.segs);
+        if to < g.floor {
+            return Err((proto::E_RANGE, format!("{to} segments is below the group's floor {}", g.floor)));
+        }
+        // txn 0: a give the group makes on its own (to its floor when idle). The first rank opens it, the others
+        // join it with the same target
+        if txn == 0 && to < have && g.txn.is_none() {
+            State::open_txn(g, false, to, 0, Instant::now(), true);
+        }
+        let txn = match &g.txn {
+            Some(t) if txn == 0 && !t.grow && t.target == to => t.id,
+            _ => txn,
+        };
         let Some(t) = g.txn.as_mut().filter(|t| t.id == txn && !t.grow) else {
-            if have <= to && txn != 0 && txn <= g.last_txn {
+            if have <= to && txn <= g.last_txn {
                 return Ok(have);
             }
             return Err(stale(g, txn, false));
         };
         if to != t.target {
             return Err((proto::E_PROTO, format!("transaction {txn} gives down to {} segments, not {to}", t.target)));
-        }
-        if to < g.floor {
-            return Err((proto::E_RANGE, format!("{to} segments is below the group's floor {}", g.floor)));
         }
         // from here the give completes: it never stalls or expires
         t.started = true;
@@ -1351,7 +1398,6 @@ mod tests {
     }
 
     fn group(nr: u32, floor: u64, segs: u64, age: Option<u64>, weight: u64) -> Group {
-        let now = Instant::now();
         Group {
             nr,
             block_bytes: 1,
@@ -1360,9 +1406,10 @@ mod tests {
             weight,
             members: (0..nr).map(|r| (r, Member { lease: r as u64, segs })).collect(),
             boot: 0,
-            grant: 0,
-            grant_at: now,
-            give: None,
+            txn: None,
+            last_txn: 0,
+            retired: Vec::new(),
+            bonus: 0,
             stalled: false,
             calm_until: None,
             ages: age.into_iter().collect(),
@@ -1381,7 +1428,14 @@ mod tests {
             names: BTreeMap::new(),
             groups: groups.into_iter().map(|(n, g)| (n.to_string(), g)).collect(),
             next_id: 1,
+            plan: BTreeMap::new(),
+            waiting: BTreeMap::new(),
         }
+    }
+
+    // the target of the give group `n` was asked for
+    fn give(st: &State, n: &str) -> Option<u64> {
+        st.groups[n].txn.as_ref().filter(|t| !t.grow).map(|t| t.target)
     }
 
     fn sh() -> Share {
@@ -1397,23 +1451,23 @@ mod tests {
             ("b", group(4, 2, 5, Some(600_000), 1000)),
             ("c", group(4, 2, 5, Some(300_000), 1000)),
         ]);
-        st.ask("a", 6, now, &sh());
-        assert_eq!(st.groups["b"].give.map(|g| g.0), Some(3), "6 segments from 4 ranks: 2 each, from 5 to 3");
-        assert!(st.groups["c"].give.is_none());
+        st.ask("a", 6, now, &sh(), false);
+        assert_eq!(give(&st, "b"), Some(3), "6 segments from 4 ranks: 2 each, from 5 to 3");
+        assert!(give(&st, "c").is_none());
         // b is already giving: the next ask goes to c
-        st.ask("a", 100, now, &sh());
-        assert_eq!(st.groups["c"].give.map(|g| g.0), Some(2), "never below the floor of 2");
+        st.ask("a", 100, now, &sh(), false);
+        assert_eq!(give(&st, "c"), Some(2), "never below the floor of 2");
         // nobody is colder than a by the margin: nobody is asked
         let mut st = state(vec![("a", group(2, 1, 1, Some(60_000), 1000)), ("b", group(2, 1, 5, Some(100_000), 1000))]);
-        st.ask("a", 2, now, &sh());
-        assert!(st.groups["b"].give.is_none(), "40 s colder is inside the 60 s margin");
+        st.ask("a", 2, now, &sh(), false);
+        assert!(give(&st, "b").is_none(), "40 s colder is inside the 60 s margin");
         // weight: b's blocks count half as old
         let mut st = state(vec![("a", group(2, 1, 1, Some(0), 1000)), ("b", group(2, 1, 5, Some(100_000), 2000))]);
-        st.ask("a", 2, now, &sh());
-        assert!(st.groups["b"].give.is_none(), "weight 2: 100 s counts as 50 s");
+        st.ask("a", 2, now, &sh(), false);
+        assert!(give(&st, "b").is_none(), "weight 2: 100 s counts as 50 s");
         st.groups.get_mut("b").unwrap().weight = 1000;
-        st.ask("a", 2, now, &sh());
-        assert_eq!(st.groups["b"].give.map(|g| g.0), Some(4));
+        st.ask("a", 2, now, &sh(), false);
+        assert_eq!(give(&st, "b"), Some(4));
     }
 
     #[test]
@@ -1421,36 +1475,47 @@ mod tests {
         let now = Instant::now();
         let mut st = state(vec![("a", group(1, 1, 1, None, 1000)), ("b", group(2, 1, 5, Some(600_000), 1000))]);
         st.groups.get_mut("b").unwrap().stalled = true;
-        st.ask("a", 1, now, &sh());
-        assert!(st.groups["b"].give.is_none());
+        st.ask("a", 1, now, &sh(), false);
+        assert!(give(&st, "b").is_none());
         let b = st.groups.get_mut("b").unwrap();
         b.stalled = false;
         b.calm_until = Some(now + Duration::from_secs(5));
-        st.ask("a", 1, now, &sh());
-        assert!(st.groups["b"].give.is_none());
+        st.ask("a", 1, now, &sh(), false);
+        assert!(give(&st, "b").is_none());
         let b = st.groups.get_mut("b").unwrap();
         b.calm_until = None;
         b.members.remove(&1);
-        st.ask("a", 1, now, &sh());
-        assert!(st.groups["b"].give.is_none(), "a group whose ranks have not all joined");
+        st.ask("a", 1, now, &sh(), false);
+        assert!(give(&st, "b").is_none(), "a group whose ranks have not all joined");
         let b = st.groups.get_mut("b").unwrap();
         b.members.insert(1, Member { lease: 9, segs: 5 });
         b.ages.clear();
-        st.ask("a", 1, now, &sh());
-        assert!(st.groups["b"].give.is_none(), "a group that reported no blocks");
+        st.ask("a", 1, now, &sh(), false);
+        assert!(give(&st, "b").is_none(), "a group that reported no blocks");
     }
 
     #[test]
-    fn an_unclaimed_grant_expires_and_an_unanswered_ask_stalls() {
+    fn an_untaken_grant_expires_and_an_unstarted_give_stalls_but_a_started_one_does_neither() {
         let t0 = Instant::now();
         let mut st = state(vec![("a", group(2, 1, 1, None, 1000)), ("b", group(2, 1, 3, Some(1), 1000))]);
         let s = Share { grant_ttl: Duration::from_secs(30), stall: Duration::from_secs(10), ..sh() };
-        st.groups.get_mut("a").unwrap().grant = 4;
-        st.groups.get_mut("b").unwrap().give = Some((2, t0));
+        State::open_txn(st.groups.get_mut("a").unwrap(), true, 3, 2, t0, true);
+        State::open_txn(st.groups.get_mut("b").unwrap(), false, 2, 0, t0, false);
         st.tick(t0 + Duration::from_secs(11), &s);
-        assert_eq!(st.groups["a"].grant, 4);
-        assert!(st.groups["b"].give.is_none() && st.groups["b"].stalled);
+        assert_eq!(st.groups["a"].reserved(), 4, "the grant is held for both ranks");
+        assert!(give(&st, "b").is_none() && st.groups["b"].stalled);
         st.tick(t0 + Duration::from_secs(31), &s);
-        assert_eq!(st.groups["a"].grant, 0);
+        assert_eq!(st.groups["a"].reserved(), 0);
+        // a rank took its part: the rest stays held for the other rank past the ttl
+        State::open_txn(st.groups.get_mut("a").unwrap(), true, 3, 2, t0, true);
+        let t = st.groups.get_mut("a").unwrap().txn.as_mut().unwrap();
+        t.started = true;
+        *t.held.get_mut(&0).unwrap() = 0;
+        st.tick(t0 + Duration::from_secs(300), &s);
+        assert_eq!(st.groups["a"].reserved(), 2);
+        State::open_txn(st.groups.get_mut("b").unwrap(), false, 2, 0, t0, true);
+        st.groups.get_mut("b").unwrap().txn.as_mut().unwrap().started = true;
+        st.tick(t0 + Duration::from_secs(300), &s);
+        assert_eq!(give(&st, "b"), Some(2));
     }
 }

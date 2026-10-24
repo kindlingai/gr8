@@ -152,16 +152,20 @@ int main(int argc, char** argv)
     // share_want: what the head asks for from the counters at the last report and now
     {
         g6kv_tier_totals l{}, n{};
+        const uint64_t p = 306;                             // blocks a segment
         n.slots = 612; n.free_slots = 612;
-        CHECK(share_want(l, n) == 0);                       // empty, no spill
+        CHECK(share_want(l, n, p) == 0);                    // empty, no spill
         n.free_slots = 233; n.entries = 1; n.spilled_pages = 379;
-        CHECK(share_want(l, n) == 2);                       // one 379-block entry, 233 free: the next would evict
+        CHECK(share_want(l, n, p) == 1);                    // one 379-block entry, 233 free: the next would evict
         n.free_slots = 400;
-        CHECK(share_want(l, n) == 0);                       // room for another of that size
+        CHECK(share_want(l, n, p) == 0);                    // room for another of that size
         l = n; n.free_slots = 100;
-        CHECK(share_want(l, n) == 0);                       // low but no spill since the last report: an idle tier asks nothing
-        n.full = 1;
-        CHECK(share_want(l, n) == 2);                       // it filled since the last report
+        CHECK(share_want(l, n, p) == 0);                    // low but no spill since the last report: an idle tier asks nothing
+        n.full = 1; n.dropped_pages = 400;
+        CHECK(share_want(l, n, p) == 2);                    // it filled since the last report: room for the 400 pages it dropped
+        l = n; n.oversize = 1; n.oversize_last = 1500;
+        CHECK(share_want(l, n, p) == 5);                    // a 1500-block entry did not fit 612 slots: 1400 more than free
+        CHECK(share_want(l, n, 0) == 0);                    // not a group lease
     }
     // B first: one rank at its floor of one segment
     g6kv_tier* b = nullptr;
@@ -179,7 +183,7 @@ int main(int argc, char** argv)
         for (long i = 0; i < 150; ++i) {
             a.step();
             const g6kv_tier_totals now = a.r[0]->pool.tiers().at(0);
-            if (asked_at < 0 && share_want(seen, now) && now.full == 0) asked_at = i;
+            if (asked_at < 0 && share_want(seen, now, per) && now.full == 0) asked_at = i;
             if (full_at < 0 && now.full > 0) full_at = i;
             seen = now;
         }
@@ -212,12 +216,13 @@ int main(int argc, char** argv)
     // the two segments A gave are B's to take now
     uint64_t bb = 0;
     CHECK(g6kv_store_report(b, 2, nullptr, 0, &rb) == 0 && rb.grant == 2);
-    CHECK(g6kv_store_grow(b, rb.grant, &bb) == 0 && bb == 3 * per);
+    CHECK(g6kv_store_grow(b, 1 + rb.grant, rb.txn, &bb) == 0 && bb == 3 * per);
     a.steps(300);
     const long hits2 = a.hits, stored2 = a.stored;
 
-    // back to the floor: the tier evicts its coldest entries and moves the rest below one segment
-    CHECK(a.apply(Resize{0, 1, per}));
+    // back to the floor on the group's own (transaction 0): the tier evicts its coldest entries and moves the rest
+    // below one segment
+    CHECK(a.apply(Resize{0, 1, per, 0}));
     CHECK(a.slots(0) == per && g6kv_store_segs(a.r[0]->store) == 1 && g6kv_store_blocks(a.r[1]->store) == per);
     a.steps(200);
     g6kv_tier_free(b);

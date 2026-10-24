@@ -356,14 +356,16 @@ impl Cluster {
                 &lru,
                 |id| lu.get(&id).map_or(0, |t| now.duration_since(*t).as_millis() as u64),
                 self.per_seg,
+                s0.free_slots,
                 8,
             )
         };
         let rep = self.ranks[0].store.report(if wants { 2 } else { 0 }, &ages).unwrap_or_else(|e| die(e.to_string()));
         let mut act = String::new();
         if rep.grant > 0 {
+            let target = self.ranks[0].store.segs() + rep.grant;
             for r in &mut self.ranks {
-                let b = r.store.grow(rep.grant).unwrap_or_else(|e| die(format!("grow: {e}")));
+                let b = r.store.grow(target, rep.txn).unwrap_or_else(|e| die(format!("grow: {e}")));
                 r.resizes.push(format!("{} ms grow +{} to {b} blocks", ms(), rep.grant));
                 if !r.pool.resize_tier(0, b).unwrap() {
                     die("resize_tier refused a grow".into());
@@ -383,7 +385,7 @@ impl Cluster {
             let io = self.run_io();
             self.c.give_moves += io.iter().filter(|x| matches!(x, Io::Move { .. })).count() as u64;
             for r in &mut self.ranks {
-                r.store.shrink(to).unwrap_or_else(|e| die(format!("shrink: {e}")));
+                r.store.shrink(to, rep.txn).unwrap_or_else(|e| die(format!("shrink: {e}")));
                 r.resizes.push(format!("{} ms shrink to {to} segs", ms()));
             }
             self.c.shrinks += 1;

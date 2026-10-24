@@ -1044,3 +1044,15 @@ fn non_stock_resident_history_cannot_create_a_stock_prefix_base() {
     assert!(entries.iter().all(|e| e.kind == Kind::Evicted));
     r.pool.release(&fresh).unwrap();
 }
+
+#[test]
+fn an_entry_too_big_for_the_tier_is_counted_with_its_size() {
+    // a 4-slot tier and a run of about 8 pages: the tier cannot hold it, and says so (the head asks for room for it,
+    // s2/kv_share.h share_want)
+    let mut r = Rank::new(16, 16, 16 * 64, &[(4, Keep::Evicted)], 3);
+    session(&mut r, &toks(1, 480), 30);
+    flush(&mut r);
+    let st = r.pool.tier_stats(0).unwrap();
+    assert_eq!((st.oversize, st.free_slots), (1, 4), "{st:?}");
+    assert!(st.oversize_last > 4, "{st:?}");
+}

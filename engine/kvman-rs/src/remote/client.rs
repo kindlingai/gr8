@@ -677,18 +677,25 @@ impl BlockStore for RemoteStore {
 }
 
 /// The ages a head REPORTs: `order` is its tier's entries as (id, blocks) in the order a shrink evicts them (stash.rs
-/// give_order), and `age_ms(id)` how long ago an entry was last used. ages[i] is what giving i + 1 segments costs: the
-/// age of the most recently used entry among those up to the one holding the (i x per_seg)-th block, so the ages never
-/// rise (the head's clock need not agree with the eviction order). At most `most`.
-pub fn coldest_ages(order: &[(u64, usize)], age_ms: impl Fn(u64) -> u64, per_seg: u64, most: usize) -> Vec<u64> {
+/// give_order), `age_ms(id)` how long ago an entry was last used, and `free` the tier's free blocks. ages[i] is what
+/// giving i + 1 segments costs: u64::MAX while the free blocks cover it (an empty segment costs nothing, so the node
+/// takes it first and at once, not after the margin), then the age of the most recently used entry among those up to
+/// the one a give that size must evict, so the ages never rise (the head's clock need not agree with the eviction
+/// order). At most `most`.
+pub fn coldest_ages(order: &[(u64, usize)], age_ms: impl Fn(u64) -> u64, per_seg: u64, free: u64, most: usize) -> Vec<u64> {
+    let per = per_seg.max(1);
     let mut out = Vec::new();
-    let mut seen = 0u64;
+    while out.len() < most && (out.len() as u64 + 1) * per <= free {
+        out.push(u64::MAX);
+    }
+    // a give of i + 1 segments evicts (i + 1) x per - free blocks: entries count from the free blocks on
+    let mut seen = free;
     let mut youngest = u64::MAX;
     for &(id, n) in order {
         let end = seen + n as u64;
         youngest = youngest.min(age_ms(id));
         // every segment boundary i x per_seg in [seen, end) falls in this entry
-        while out.len() < most && (out.len() as u64) * per_seg.max(1) < end {
+        while out.len() < most && (out.len() as u64) * per < end {
             out.push(youngest);
         }
         seen = end;
