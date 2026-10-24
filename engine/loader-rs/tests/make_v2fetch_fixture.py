@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Writes tests/data/v2fetch/: index slices of two synthetic exlr8 v2 layers (tools/convert/v2synth.py with 2 experts,
-then tools/convert/v2slices.py), a width manifest that mixes widths per unit, and the byte ranges rank 1 of TP=4 must
-fetch, worked out from the layer index files with tools/convert/v2.py. The layers have no shared expert: its slice row
-is 256 only when there are 256 routed experts. tests/v2fetch.rs checks src/fetch.rs against
-them. Needs numpy. Run from the repo root:
+then tools/convert/v2slices.py) for every rank of TP=4, a width manifest that mixes widths per unit, and the byte
+ranges rank 1 of TP=4 must fetch, worked out from the layer index files with tools/convert/v2.py. The layers have no
+shared expert: its slice row is 256 only when there are 256 routed experts. Their trellis bytes are zero, so a test
+can write width files whose halves match their checksums without shipping them. tests/v2fetch.rs checks src/fetch.rs
+against them. Needs numpy. Run from the repo root:
 
     python3 engine/loader-rs/tests/make_v2fetch_fixture.py
 """
@@ -26,14 +27,9 @@ def main():
     tmp = tempfile.mkdtemp()
     try:
         for l in LAYERS:
-            v2synth.make_layer(tmp, l, (2, 3, 4), NE, seed=l, shared=False)
+            v2synth.make_layer(tmp, l, (2, 3, 4), 0, seed=l, shared=False)
         shutil.rmtree(OUT, ignore_errors=True)
         v2slices.main(['--v2', tmp, '--out', os.path.join(OUT, 'slices'), '--tp', str(TP), '--widths', '2,3,4'])
-        for k in (2, 3, 4):                                  # keep only rank 1's slices: the test needs no more
-            d = os.path.join(OUT, 'slices', f'tp{TP}', f'k{k}')
-            for n in os.listdir(d):
-                if n != f'rank{RANK}.safetensors':
-                    os.unlink(os.path.join(d, n))
         man = {'format': 'exlr8-v2-manifest', 'name': 'fixture', 'layers': {}}
         for l in LAYERS:
             w = lambda e, h, p: (2, 3, 4)[(e + h + p + l) % 3]   # noqa: E731
