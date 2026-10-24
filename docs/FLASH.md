@@ -107,6 +107,15 @@ blocks with a manifest and GPU checksums of every extent; a restore that does no
 A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
 digest the ranks compare.
 
+`group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental, D-331 M8 (c)): the lease is a
+member of group `G` on the KV node, the way a full model's `--kv-store group=` tier is, so the two models share the
+node's memory. It starts at `size=`; the head reports to the node every `G6_S2_SHARE_MS` and asks for segments when
+captures drop entries, an entry does not fit at all, or the next capture would drop one, and offers what giving would
+drop (the least recently used checkpoints' ages) only while idle (`KV_SHARE_WHEN=idle`, default; `always`). A grant
+or give is a Resize event every rank applies at the same commit: a grow adds blocks; a shrink drops the least recently
+used checkpoints until the rest fit, copies the ones above the new end down, then gives the top segments back. The log
+prints `# rank R: flash ckpt share: now S segments, B blocks (N entries, D dropped) in T ms`. Not measured on a box.
+
 The boot log prints `# rank R: flash ckpt aligned: ...`, and each request prints `flash ckpt request ... kept ...` or
 `... restored ...` with the time.
 
@@ -116,8 +125,8 @@ end-to-end bit-exact check against no cache on a cluster has not run yet.
 
 Limits:
 
-- Checkpoints are not entries of the pool's block stash (`engine/kvman-rs` `stash.rs`), so the stash's share and resize
-  do not see them.
+- Checkpoints are not entries of the pool's block stash (`engine/kvman-rs` `stash.rs`); a `group=` store shares and
+  resizes through its own index (above), with the same report rule.
 - Each capture writes the whole prefix `[0, p)`, not only the rows past the entry it started from.
 - `terminal` is not cold-exact (above).
 

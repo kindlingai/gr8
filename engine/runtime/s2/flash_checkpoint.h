@@ -23,15 +23,25 @@
 // runs quanta a cold prefill does not. Its effect on the output is measured, not argued. The MTP layer's row p - 1 may
 // be the one decode wrote before the last token or none: it changes only which drafts are accepted.
 //
-// Not the full DESIGN M5: checkpoints are not entries of the pool's block stash (kvman-rs stash.rs), so B3 share and
-// resize do not see them. Every rank keeps the same index (the same captures in the same order, the same sizes), and
-// the index digest joins the pool digest every rank compares.
+// Not the full DESIGN M5: checkpoints are not entries of the pool's block stash (kvman-rs stash.rs). Every rank keeps
+// the same index (the same captures in the same order, the same sizes), and the index digest joins the pool digest
+// every rank compares.
+//
+// A group lease (--kv-store ...,group=, s2/kv_share.h, D-331 M8 (c)): the store shares its KV node with other clusters
+// (the full model's pool) and changes size by whole segments at a Resize event. The index reports what the pool stash
+// reports: its counters as g6kv_tier_totals (share_want asks from them) and the ages of what a give would drop
+// (coldest). A shrink drops the least recently used entries until the rest fit, then packs them below the new end:
+// the lease gives its top segments back.
 #pragma once
 #include "../cache_namespace.h"
+#include "../../kvman-rs/g6kvman.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -110,6 +120,7 @@ static_assert(sizeof(FlashManifest) % 8 == 0, "manifest words");
 
 struct FlashEntry {
     uint64_t generation = 0, used = 0;   // used: the index clock at capture or the last hit (least recently used goes first)
+    uint64_t used_ms = 0;                // FlashIndex::now_ms at the same moment: the ages a head reports (not digested)
     uint64_t base = 0, blocks = 0;       // the store's blocks [base, base + blocks): manifest, pages, state
     uint32_t position = 0;
     bool terminal = false;               // kept at the end of a request (G6_FLASH_CACHE=terminal), not on the grid
@@ -133,8 +144,21 @@ class FlashIndex {
         if (blocks_ - from >= need) { at = from; return true; }
         return false;
     }
+    void drop_lru(std::vector<uint64_t>* gone) {
+        auto lru = std::min_element(e_.begin(), e_.end(), [](const FlashEntry& a, const FlashEntry& b) { return a.used < b.used; });
+        if (gone) gone->push_back(lru->generation);
+        dropped_blocks += lru->blocks;
+        e_.erase(lru); ++dropped;
+    }
 public:
     uint64_t dropped = 0, hits = 0, captured = 0;
+    // for a group lease's report (totals): blocks dropped and captured, captures that had to drop (full), and entries
+    // bigger than the whole store (oversize, the last one's blocks)
+    uint64_t dropped_blocks = 0, captured_blocks = 0, full = 0, oversize = 0, oversize_last = 0;
+    // the clock of used_ms (tests set their own)
+    std::function<uint64_t()> now_ms = [] {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     explicit FlashIndex(uint64_t blocks = 0) : blocks_(blocks) {}
     uint64_t blocks() const { return blocks_; }
     size_t size() const { return e_.size(); }
@@ -163,37 +187,92 @@ public:
         return nullptr;
     }
     void touch(uint64_t generation) {
-        for (auto& x : e_) if (x.generation == generation) { x.used = ++clock_; ++hits; return; }
+        for (auto& x : e_) if (x.generation == generation) { x.used = ++clock_; x.used_ms = now_ms(); ++hits; return; }
         throw std::runtime_error("Flash checkpoint: no entry " + std::to_string(generation));
     }
     // room for `need` blocks, dropping the least recently used entries; the dropped generations in `gone`. false: the
     // store is smaller than `need` (nothing dropped)
     bool reserve(uint64_t need, uint64_t& at, std::vector<uint64_t>* gone = nullptr) {
+        if (need > blocks_) { ++oversize; oversize_last = need; }
         if (!need || need > blocks_) return false;
-        while (!gap(need, at)) {
-            auto lru = std::min_element(e_.begin(), e_.end(), [](const FlashEntry& a, const FlashEntry& b) { return a.used < b.used; });
-            if (gone) gone->push_back(lru->generation);
-            e_.erase(lru); ++dropped;
-        }
+        bool dropped_any = false;
+        while (!gap(need, at)) { drop_lru(gone); dropped_any = true; }
+        if (dropped_any) ++full;
         return true;
     }
     uint64_t next_generation() const { return next_; }
     // publish an entry whose blocks are written (reserve gave `base`)
     void add(FlashEntry x) {
         if (x.generation != next_) throw std::runtime_error("Flash checkpoint: generation out of order");
-        ++next_; x.used = ++clock_; ++captured;
+        ++next_; x.used = ++clock_; x.used_ms = now_ms(); ++captured; captured_blocks += x.blocks;
         auto at = std::lower_bound(e_.begin(), e_.end(), x.base, [](const FlashEntry& a, uint64_t b) { return a.base < b; });
         if ((at != e_.end() && x.base + x.blocks > at->base) || (at != e_.begin() && std::prev(at)->base + std::prev(at)->blocks > x.base))
             throw std::runtime_error("Flash checkpoint: overlapping entries");
         e_.insert(at, std::move(x));
     }
     void drop(uint64_t generation) {
-        for (auto it = e_.begin(); it != e_.end(); ++it) if (it->generation == generation) { e_.erase(it); ++dropped; return; }
+        for (auto it = e_.begin(); it != e_.end(); ++it)
+            if (it->generation == generation) { dropped_blocks += it->blocks; e_.erase(it); ++dropped; return; }
+    }
+    uint64_t used_blocks() const { uint64_t n = 0; for (const auto& x : e_) n += x.blocks; return n; }
+    // the counters a group lease's head reports from (s2/kv_share.h share_want), in the pool tier's form: a capture is
+    // a spill, a dropped entry dropped pages, a capture that had to drop one a full tier
+    g6kv_tier_totals totals() const {
+        g6kv_tier_totals t{};
+        t.slots = blocks_; t.free_slots = blocks_ - std::min(blocks_, used_blocks()); t.entries = (uint32_t)e_.size();
+        t.spilled_pages = captured_blocks; t.dropped = dropped; t.dropped_pages = dropped_blocks; t.full = full;
+        t.hits = hits; t.oversize = oversize; t.oversize_last = oversize_last;
+        return t;
+    }
+    // what giving i + 1 segments of `per` blocks costs, at most `most` (kvman-rs remote coldest_ages, the rule the pool
+    // stash reports by): UINT64_MAX while the free blocks cover it, then the age in ms of the most recently used entry a
+    // give that size drops (least recently used first, as shrink drops them), so the ages never rise
+    std::vector<uint64_t> coldest(uint64_t per, size_t most) const {
+        per = std::max<uint64_t>(per, 1);
+        const uint64_t free = blocks_ - std::min(blocks_, used_blocks()), now = now_ms();
+        std::vector<uint64_t> out;
+        while (out.size() < most && (out.size() + 1) * per <= free) out.push_back(std::numeric_limits<uint64_t>::max());
+        std::vector<const FlashEntry*> order;
+        for (const auto& x : e_) order.push_back(&x);
+        std::sort(order.begin(), order.end(), [](const FlashEntry* a, const FlashEntry* b) { return a->used < b->used; });
+        uint64_t seen = free, youngest = std::numeric_limits<uint64_t>::max();
+        for (const FlashEntry* x : order) {
+            const uint64_t end = seen + x->blocks;
+            youngest = std::min(youngest, now - std::min(now, x->used_ms));
+            while (out.size() < most && out.size() * per < end) out.push_back(youngest);
+            seen = end;
+        }
+        return out;
+    }
+    // a group lease grew to `blocks`
+    void grow(uint64_t blocks) {
+        if (blocks < blocks_) throw std::runtime_error("Flash checkpoint: grow to fewer blocks");
+        blocks_ = blocks;
+    }
+    // a group lease shrinks to `blocks`: drop the least recently used entries until the rest fit, then pack them
+    // (in base order, each to the lowest free block) when one ends past the new end. The copies to run, in order, before
+    // the lease gives its top blocks back (each moves its entry down, so copying a range from its first block on is safe)
+    struct Move { uint64_t from = 0, to = 0, blocks = 0; };
+    std::vector<Move> shrink(uint64_t blocks, std::vector<uint64_t>* gone = nullptr) {
+        std::vector<Move> moves;
+        if (blocks >= blocks_) { blocks_ = blocks; return moves; }
+        while (used_blocks() > blocks) drop_lru(gone);
+        const bool pack = std::any_of(e_.begin(), e_.end(), [&](const FlashEntry& x) { return x.base + x.blocks > blocks; });
+        if (pack) {
+            uint64_t at = 0;
+            for (auto& x : e_) {
+                if (x.base != at) { moves.push_back({x.base, at, x.blocks}); x.base = at; }
+                at += x.blocks;
+            }
+        }
+        blocks_ = blocks;
+        return moves;
     }
     // every rank's index must agree: folded into the pool digest
     uint64_t digest() const {
         uint64_t h = fnv64(&next_, sizeof next_);
         h = fnv64(&clock_, sizeof clock_, h);
+        h = fnv64(&blocks_, sizeof blocks_, h);   // a group lease's size: every rank applies the same Resize
         for (const auto& x : e_) {
             const uint64_t f[] = {x.generation, x.used, x.base, x.blocks, x.position, x.manifest.token_hash};
             h = fnv64(f, sizeof f, h);

@@ -130,6 +130,25 @@ if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
     echo "SKIP flash_kv_chunks_test: $why"
   fi
 fi
+if [ "$TEST" = all ] || [ "$TEST" = flash_ckpt_group_test ]; then
+  # Flash checkpoints on a group lease (D-331 M8 (c), s2/flash_checkpoint.cuh): a loopback KV node with 2 MiB segments
+  [ "$TEST" = all ] && ARGS=()
+  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  NODE="$REPO/engine/kvman-rs/target/release/kvman-remote"
+  if why=$(kvlib_ready) && [ -x "$NODE" ]; then
+    NJ="$OUT/flash_ckpt_group_node.json"
+    : > "$NJ"
+    "$NODE" --gb 0.05 --seg-mb 2 --margin-s 0 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma --ready "$NJ" \
+      > "$OUT/flash_ckpt_group_node.log" 2>&1 &
+    NODE_PID=$!
+    for _ in $(seq 50); do [ -s "$NJ" ] && break; sleep 0.1; done
+    [ ${#ARGS[@]} -gt 0 ] || ARGS=("remote:127.0.0.1:$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$NJ")")
+    build_run flash_ckpt_group_test "$KVLIB" -lpthread -ldl -lm || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    kill "$NODE_PID"
+  else
+    echo "SKIP flash_ckpt_group_test: ${why:-no kvman-remote: cargo build --release}"
+  fi
+fi
 if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run weight_check_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }

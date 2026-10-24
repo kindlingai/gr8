@@ -1395,13 +1395,15 @@ int main(int argc, char** argv)
             v.s_slot = m.kda_st.s_layer() / std::max(1, m.kda_st.slots); v.c_slot = m.kda_st.c_layer() / std::max(1, m.kda_st.slots);
             std::string spec = "mem:";
             uint64_t bytes = (uint64_t)flash_budget_mib << 20;
+            std::optional<g6s2::FlashGroup> group;
             if (!kv_tiers.empty())
             {
                 g6s2::TierSpec t;
                 try { t = g6s2::TierSpec::parse(kv_tiers[0], false); } catch (const std::exception& e) { die(std::string("G6_FLASH_CACHE: ") + e.what()); }
                 if (t.persist) die("G6_FLASH_CACHE: persist=on is not supported (checkpoints live for one boot)");
-                if (!t.group.empty()) die("G6_FLASH_CACHE: group= is not supported (the checkpoint lease is not a group lease)");
                 spec = t.store; bytes = t.bytes;
+                // group=: the lease shares its KV node with other clusters (s2/flash_checkpoint.h); it starts at size=
+                if (!t.group.empty()) group = g6s2::FlashGroup{t.group, (uint32_t)g6nr::NR, (uint32_t)R, t.cap, t.weight};
                 if (t.ssd())
                 {   // as the pool's stores: the folder starts empty at every boot
                     const std::string dir = t.store.substr(4) + "/r" + std::to_string(R);
@@ -1419,11 +1421,12 @@ int main(int argc, char** argv)
                 " cap " + std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
                 std::to_string(v.bindings.size()) + " state " + std::to_string(v.state_bytes()) + " format " +
                 std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
-            try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat)); }
+            try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr)); }
             catch (const std::exception& e) { die(std::string("G6_FLASH_CACHE: ") + e.what()); }
-            fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows\n",
+            fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows%s\n",
                     R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
-                    v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1));
+                    v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1),
+                    group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
             bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks());
         }
         // G6_FLASH_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts

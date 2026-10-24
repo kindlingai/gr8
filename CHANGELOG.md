@@ -1,6 +1,20 @@
 # Changelog
 
 
+## 2026-10-24: the Flash checkpoint store can be a group lease, so Flash and the full model share one KV node (D-331 M8 (c))
+
+- `--kv-store remote:HOST:PORT,size=N,group=G` on glm53f (with `FLASH_CACHE`, experimental): the checkpoint lease is a
+  member of group `G` on the node, as a full model's `group=` tier is, and capacity moves between the two by segments.
+  It starts at `size=`. The head reports every `G6_S2_SHARE_MS` with the pool stash's rule (`s2/kv_share.h`
+  `share_want` over the index's counters; ages of the least recently used checkpoints, offered only while idle under
+  `KV_SHARE_WHEN=idle`, the default). Every rank applies a grant or a give at the Resize commit (tier
+  `FLASH_CKPT_TIER`): a shrink drops the least recently used checkpoints until the rest fit, copies the ones above the
+  new end down, then gives the top segments back (`s2/flash_checkpoint.h` `FlashIndex::shrink`). The index digest now
+  covers its size. `KV_SHARE_WHEN` reaches the Flash engine (`scripts/engine_args.sh` flash_env).
+- Dev tests: `engine/tests/test_flash_ckpt_index.cpp` (totals, ages, grow, shrink and packing) and
+  `engine/runtime/tests/flash_ckpt_group_test.cu` (a loopback node, two ranks, `TEST=flash_ckpt_group_test
+  scripts/c1_tests.sh`). Not measured on a box.
+
 ## 2026-10-24: fix: the `FLASH_CAP_POLICY=borrow-idle` engine hooks are in `g6m4_flash` (D-331 M7 part B-2, #166)
 
 - The FLASH_KV_TIER resize hook, `flash_room`, the borrow-idle rule and the `LEDGER.gpu` line sat in GLM-only code

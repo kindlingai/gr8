@@ -13,10 +13,12 @@
 // the entry's. Both run on the serve stream, synchronously: the copies sit between prefill quanta or before a bind.
 #pragma once
 #include "flash_checkpoint.h"
+#include "kv_share.h"
 #include "../../kvman-rs/g6kvman.h"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,6 +81,10 @@ struct FlashStateView {
     }
 };
 
+// a checkpoint store on a group lease (--kv-store ...,group=): every rank of the cluster gives the same group, ranks,
+// cap and weight (g6kv_tier_open_group); the lease starts at the store's size=
+struct FlashGroup { std::string group; uint32_t ranks = 1, rank = 0; uint64_t cap = 0; uint32_t weight = 0; };
+
 class FlashCheckpoints {
     FlashStateView v_;
     g6kv_tier* t_ = nullptr;
@@ -86,6 +92,7 @@ class FlashCheckpoints {
     size_t block_ = 0, slot_ = 0, state_blocks_ = 0;
     int batch_ = 0;
     uint64_t compat_ = 0;
+    g6kv_tier_totals seen_{};   // a group lease, the head: the index counters at its last report
     uint8_t *host_ = nullptr, *host_dev_ = nullptr;   // mapped pinned: batch_ slots, registered with the store
     int* pages_ = nullptr; int* pages_dev_ = nullptr; // mapped pinned: batch_ page numbers
     fck::Binding* d_bind_ = nullptr;
@@ -161,15 +168,21 @@ public:
     bool log = true;
     // spec / name / bytes: as KvTiers::add (name: this rank's lease, never the pool stash's). compat: what makes an entry
     // this engine's (model set, TP, rank, layout, engine build)
+    // group: a group lease of `bytes` to start (FlashGroup), else a store of `bytes`
     FlashCheckpoints(FlashStateView v, const std::string& spec, const std::string& name, uint64_t bytes,
-                     const std::string& compat, int batch = 32) : v_(std::move(v)), batch_(batch) {
+                     const std::string& compat, const FlashGroup* group = nullptr, int batch = 32) : v_(std::move(v)), batch_(batch) {
         if (v_.bindings.empty() || !v_.S || !v_.conv || v_.layers <= 0 || v_.slots <= 0) throw std::runtime_error("Flash checkpoint: no state to keep");
         block_ = v_.page_bytes();
         slot_ = (block_ + 4095) / 4096 * 4096;
         state_blocks_ = (v_.state_bytes() + slot_ - 1) / slot_;
-        const uint64_t n = bytes / slot_;
+        uint64_t n = bytes / slot_;
         if (n < 2 + state_blocks_) throw std::runtime_error("Flash checkpoint store " + spec + " smaller than one entry's state");
-        tk(g6kv_tier_open(spec.c_str(), name.c_str(), block_, n, &t_), "open");
+        if (group) {
+            tk(g6kv_tier_open_group(spec.c_str(), name.c_str(), group->group.c_str(), group->ranks, group->rank, bytes, group->cap,
+                                    group->weight, block_, &t_), "open group");
+            n = g6kv_store_blocks(t_);
+            if (n < 2 + state_blocks_) throw std::runtime_error("Flash checkpoint group lease " + spec + " smaller than one entry's state");
+        } else tk(g6kv_tier_open(spec.c_str(), name.c_str(), block_, n, &t_), "open");
         if (g6kv_tier_block_bytes(t_) != slot_) throw std::runtime_error("Flash checkpoint store block size differs from the page block's");
         index_ = FlashIndex(n);
         compat_ = fnv64(compat.data(), compat.size());
@@ -199,6 +212,56 @@ public:
     size_t slot_bytes() const { return slot_; }
     uint64_t entry_blocks(uint32_t position) const { return 1 + (position + 63) / 64 + state_blocks_; }
     std::string describe() const { char b[256]; g6kv_tier_describe(t_, b, sizeof b); return b; }
+    // a group lease (its segments move between the clusters on its node)
+    bool group() const { return g6kv_store_seg_blocks(t_) != 0; }
+    uint64_t segments() const { return g6kv_store_segs(t_); }
+    // the head's report, in two halves so the index lock is not held over the node's round trip. ask (index locked):
+    // the segments to ask for (s2/kv_share.h share_want, from the counters since the last report) and, when the head
+    // offers (G6_KV_SHARE_WHEN), what giving would drop (FlashIndex::coldest)
+    std::pair<uint64_t, std::vector<uint64_t>> share_ask(bool offer, size_t most = 8) {
+        const uint64_t per = g6kv_store_seg_blocks(t_);
+        if (!per) throw std::runtime_error("Flash checkpoint: the store is not a group lease");
+        const g6kv_tier_totals now = index_.totals();
+        const uint64_t want = share_want(seen_, now, per);
+        seen_ = now;
+        return {want, offer ? index_.coldest(per, most) : std::vector<uint64_t>{}};
+    }
+    // report: the node's answer as the Resize to announce on `tier`, or nothing (kv_share.h share_poll)
+    std::optional<Resize> share_report(uint32_t tier, uint64_t want, const std::vector<uint64_t>& ages) {
+        const uint64_t per = g6kv_store_seg_blocks(t_), segs = g6kv_store_segs(t_);
+        g6kv_report r{};
+        tk(g6kv_store_report(t_, want, ages.data(), ages.size(), &r), "report");
+        if (r.grant) return Resize{tier, segs + r.grant, (segs + r.grant) * per, r.txn};
+        if (r.give && r.give < segs) return Resize{tier, segs - r.give, (segs - r.give) * per, r.txn};
+        return std::nullopt;
+    }
+    // every rank at the Resize commit, index locked (kv_share.h share_apply). Grow: the lease, then the index. Shrink:
+    // the index drops and packs (FlashIndex::shrink), the moves run, then the lease gives its top segments back. false:
+    // the node refused the transaction (G6KV_STORE_REFUSED, every rank alike) and the lease keeps its size; a refused
+    // shrink leaves the index smaller than the lease, which is safe. gone: the generations dropped
+    bool apply(const Resize& r, std::vector<uint64_t>* gone = nullptr) {
+        const uint64_t segs = g6kv_store_segs(t_);
+        uint64_t blocks = 0;
+        if (r.segs > segs) {
+            const int rc = g6kv_store_grow(t_, r.segs, r.txn, &blocks);
+            if (rc == G6KV_STORE_REFUSED) return false;
+            tk(rc, "grow");
+            if (blocks != r.slots) throw std::runtime_error("Flash checkpoint: the lease grew to a different size than the event's");
+            index_.grow(blocks);
+        } else if (r.segs < segs) {
+            for (const auto& m : index_.shrink(r.slots, gone))
+                for (uint64_t i = 0; i < m.blocks; i += batch_) {
+                    const int n = (int)std::min<uint64_t>(batch_, m.blocks - i);
+                    io(m.from + i, n, false);
+                    io(m.to + i, n, true);
+                }
+            const int rc = g6kv_store_shrink(t_, r.segs, r.txn, &blocks);
+            if (rc == G6KV_STORE_REFUSED) return false;
+            tk(rc, "shrink");
+            if (blocks != r.slots) throw std::runtime_error("Flash checkpoint: the lease shrank to a different size than the event's");
+        }
+        return true;
+    }
     // keep rows [0, position) of the live sequence and KDA slot `slot` (the state after them) as an entry for `tokens`
     // (position + 1 of them). Returns the entry's generation, or 0: the store cannot hold it. The same tokens already
     // kept: that entry is marked used and nothing is written. terminal: position may end mid-page (the whole last page

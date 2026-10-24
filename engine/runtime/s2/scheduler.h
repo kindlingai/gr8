@@ -162,6 +162,8 @@ struct Grant { Key key; Request req; Run run; uint32_t reuse = 0, restored = 0, 
 // tier FLASH_KV_TIER (G6_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash rank's GPU KV chunks instead, `segs` = the chunks
 // online (slots and txn unused)
 constexpr uint32_t FLASH_KV_TIER = 0xFFFFFFFFu;
+// tier FLASH_CKPT_TIER (G6_FLASH_CACHE on a group lease, s2/flash_checkpoint.cuh): the Flash checkpoint store's lease
+constexpr uint32_t FLASH_CKPT_TIER = 0xFFFFFFFEu;
 struct Resize {
     uint32_t tier = 0;
     uint64_t segs = 0, slots = 0, txn = 0;

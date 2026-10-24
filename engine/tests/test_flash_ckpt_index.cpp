@@ -116,9 +116,60 @@ int main() {
     FlashManifest compat = m; compat.compat = 10; compat.seal();
     assert(std::string(compat.differs(want)) == "another engine or layout");
 
+    // a group lease (D-331 M8 (c)): the counters in the pool tier's form, the ages a give costs, grow, and a shrink that
+    // drops the least recently used and packs the rest below the new end (moves down, in base order)
+    {
+        uint64_t t_ms = 1000;
+        FlashIndex g(100);
+        g.now_ms = [&] { return t_ms; };
+        const auto P = seq(20000, 9);
+        std::vector<uint64_t> gens;
+        for (int i = 0; i < 4; ++i) {   // bases 0, 20, 40, 60, used at 1000, 1010, 1020, 1030 ms
+            auto Pi = P; Pi[0] = 5000 + i;
+            FlashEntry x = entry(g, 64, Pi, 20);
+            gens.push_back(x.generation);
+            g.add(std::move(x));
+            t_ms += 10;
+        }
+        g6kv_tier_totals t = g.totals();
+        assert(t.slots == 100 && t.free_slots == 20 && t.entries == 4 && t.spilled_pages == 80 && t.full == 0 && t.dropped_pages == 0);
+        t_ms = 2000;
+        g.touch(gens[0]);   // gens[1] is now the least recently used
+        // segments of 10 blocks: 20 free cover 2, then gens[1] (age 990), gens[2] (980), gens[3] (970), gens[0] (0)
+        const auto ages = g.coldest(10, 8);
+        const std::vector<uint64_t> want_ages = {UINT64_MAX, UINT64_MAX, 990, 990, 980, 980, 970, 970};
+        assert(ages == want_ages);
+        uint64_t at = 0;
+        assert(!g.reserve(150, at) && g.oversize == 1 && g.oversize_last == 150);
+        {   // 30 contiguous blocks: gens[1] (20..40) and then gens[2] (40..60) go; one capture that had to drop
+            FlashIndex f = g;
+            assert(f.reserve(30, at) && at == 20 && f.full == 1 && f.dropped_blocks == 40 && f.totals().dropped_pages == 40);
+            assert(!f.find(gens[1]) && !f.find(gens[2]) && f.totals().full == 1);
+        }
+        // shrink to 50 blocks (80 held): gens[1] and gens[2] go (least recently used first), gens[0] at 0 stays and
+        // gens[3] moves from 60 to 20
+        FlashIndex h = g;
+        std::vector<uint64_t> gone;
+        const auto moves = g.shrink(50, &gone);
+        assert((gone == std::vector<uint64_t>{gens[1], gens[2]}) && g.blocks() == 50 && g.used_blocks() == 40);
+        assert(moves.size() == 1 && moves[0].from == 60 && moves[0].to == 20 && moves[0].blocks == 20);
+        assert(g.find(gens[0])->base == 0 && g.find(gens[3])->base == 20);
+        // the same shrink on another rank's copy: the same drops, moves and digest
+        std::vector<uint64_t> gone2;
+        assert(h.shrink(50, &gone2).size() == 1 && gone2 == gone && h.digest() == g.digest());
+        // a shrink that every entry fits below needs no moves; a grow keeps the entries and changes the digest
+        assert(g.shrink(40).empty() && g.blocks() == 40 && g.size() == 2);
+        const uint64_t before = g.digest();
+        g.grow(80);
+        assert(g.blocks() == 80 && g.size() == 2 && g.digest() != before);
+        assert(g.reserve(40, at) && at == 40);   // the grown blocks are used
+        try { g.grow(10); assert(false); } catch (const std::runtime_error&) {}
+    }
+
     // the checksum moves with the word's place
     uint64_t w[4] = {1, 2, 3, 4}, v[4] = {2, 1, 3, 4};
     assert(ckpt_sum_host(w, 32) != ckpt_sum_host(v, 32));
     assert(ckpt_sum_host(w, 16) + ckpt_sum_host(w + 2, 16, 2) == ckpt_sum_host(w, 32));
-    puts("flash_ckpt_index: PASS (aligned point, match rule, namespace, placement and drops, digest, manifest checks)");
+    puts("flash_ckpt_index: PASS (aligned point, match rule, namespace, placement and drops, digest, manifest checks, "
+         "group lease totals, ages, grow, shrink with drops and packing)");
 }

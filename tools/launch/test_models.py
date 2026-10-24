@@ -71,6 +71,12 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G')
         plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
         self.assertIn('G6_FLASH_CACHE=terminal', plan['env'])
+        # the checkpoint store on a group lease (D-331 M8 (c)): the store as given, KV_SHARE_WHEN reaches the engine
+        g = 'remote:192.0.2.5:7350,size=1G,group=flash'
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g, '--kv-share-when', 'always'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], g)
+        self.assertIn('G6_KV_SHARE_WHEN=always', plan['env'])
+        self.assertNotIn('G6_KV_SHARE_WHEN', ' '.join(opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g))['env']))
         for argv, want in ((['--flash-cache', 'sessions'], 'want off, aligned or terminal'),
                            (['--flash-state-budget-mib', '0'], 'whole number of MiB'),
                            (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned or terminal'),

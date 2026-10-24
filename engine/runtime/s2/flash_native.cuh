@@ -222,6 +222,34 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 (unsigned long long)slot.req.id, rows, first,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     };
+    // the checkpoint store on a group lease (D-331 M8 (c)): it shares its KV node with the full model's pool. Every rank
+    // resizes it at the Resize commit; the head reports to the node every G6_S2_SHARE_MS, offering what it holds only
+    // while idle (G6_KV_SHARE_WHEN=idle, default) or whenever the node asks (always), as the full model's pool does
+    if (ck && ck->group()) {
+        const char* when = getenv("G6_KV_SHARE_WHEN");
+        if (when && strcmp(when, "idle") && strcmp(when, "always")) throw std::runtime_error("G6_KV_SHARE_WHEN is idle or always");
+        const bool always = when && !strcmp(when, "always");
+        const int rank = c.main.rank;
+        h.resize = [&, rank](const Resize& r) {
+            if (r.tier != FLASH_CKPT_TIER) throw std::runtime_error("Flash serve: a Resize on tier " + std::to_string(r.tier));
+            std::lock_guard<std::mutex> l(ck_mu);
+            std::vector<uint64_t> gone;
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!ck->apply(r, &gone))
+                fprintf(stderr, "# rank %d: flash ckpt share: to %llu blocks refused (transaction %llu), the lease keeps its size: %s\n",
+                        rank, (unsigned long long)r.slots, (unsigned long long)r.txn, g6kv_tier_error());
+            else
+                fprintf(stderr, "# rank %d: flash ckpt share: now %llu segments, %llu blocks (%zu entries, %zu dropped) in %.1f ms at %lld ms\n",
+                        rank, (unsigned long long)r.segs, (unsigned long long)r.slots, ck->index().size(), gone.size(),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), (long long)s2_wall_ms());
+        };
+        if (bc.rank == 0)
+            h.share = [&, always](bool idle) -> std::optional<Resize> {
+                std::pair<uint64_t, std::vector<uint64_t>> a;
+                { std::lock_guard<std::mutex> l(ck_mu); a = ck->share_ask(always || idle); }
+                return ck->share_report(FLASH_CKPT_TIER, a.first, a.second);
+            };
+    }
     if (c.install) c.install(h);
     ControlLinks links = bootstrap(bc);
     try {

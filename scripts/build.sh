@@ -78,7 +78,7 @@ case "${MODEL:-glm}" in
     md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
     widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"
     # the Flash serve's own hooks are in the binary (borrow-idle lived in GLM-only code once and no unit test saw it)
-    for m in "flash kv: borrow-idle, %u of"; do
+    for m in "flash kv: borrow-idle, %u of" "flash ckpt share: now"; do
       grep -c -a -F "$m" "$OUT/g6m4_flash" > /dev/null || { echo "$OUT/g6m4_flash lacks '$m'"; exit 1; }
     done
     echo "g6m4_flash has its serve hooks"
