@@ -1239,6 +1239,19 @@ int main(int argc, char** argv)
     double pf_ms = 0;
     long pf_rows = 0;
     m.nc = nc; D.d.nc = nc;             // before any capture: the head kernels take it by value
+    if (grammar_ready())                // before any capture: the main head's grammar mask (rank.cuh k_grammar_mask)
+    {
+        m.gm_words = grammar_words();
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.gm_on_host), sizeof(int) * MX, cudaHostAllocMapped));
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.gm_bits_host), sizeof(uint32_t) * MX * m.gm_words, cudaHostAllocMapped));
+        memset(m.gm_on_host, 0, sizeof(int) * MX);
+        int* on;
+        uint32_t* bits;
+        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&on), m.gm_on_host, 0));
+        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&bits), m.gm_bits_host, 0));
+        m.gm_on = on;
+        m.gm_bits = bits;
+    }
     m.rs = plan.rs;                     // the target's verify steps only; the MTP layer's head stays as it is
     if (!pf_qo && !pf_qp)               // QO attention builds the decode RoPE table; without it absorb would take FP64 sincos
         if (int e = g6_attn_rope_init(cap, st)) die("g6_attn_rope_init failed (" + std::to_string(e) + ")");

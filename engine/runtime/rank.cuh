@@ -440,11 +440,14 @@ struct Model
     glue::RoutePlan* plan = nullptr;
     int* rlog = nullptr;              // G6_ROUTE_LOG (measurement): pinned [nl][RLOG] copies of plan n_slots / pad / slot_expert
     glue::SampleRow* srow = nullptr;
-    // grammar masks (grammar.h; set by the S2 adapter on the main model only, before capture): row r with gm_on[r]
-    // samples only the ids whose bit is set in gm_bits[r * gm_words ..]. Mapped host memory, rewritten each step
+    // grammar masks (grammar.h; the main model only, set before any capture, so the S = 1 and the S2 graphs both carry
+    // the kernel): row r with gm_on[r] samples only the ids whose bit is set in gm_bits[r * gm_words ..]. Mapped host
+    // memory, rewritten before each step by s2/dispatch.h through the host addresses
     const int* gm_on = nullptr;
     const uint32_t* gm_bits = nullptr;
     int gm_words = 0;
+    int* gm_on_host = nullptr;
+    uint32_t* gm_bits_host = nullptr;
     glue::TkRes* tk = nullptr;        // top lists of the step's rows with SampleRow::topk > 0 (main model only; null = none)
     int *tok = nullptr, *pos = nullptr, *tok_out = nullptr, *tgt = nullptr;
     void* scratch = nullptr;
