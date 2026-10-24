@@ -29,6 +29,23 @@
   idle head asks 0, a busy one asks, the idle group gives, the next capture drops nothing) and
   `engine/runtime/s2/tests/kv_share_test.cpp` (share_want busy). Each fails before its change and passes after. Not
   measured on a box.
+- The Flash prefill checkpoint is taken at the boundary after the quantum that reaches the prompt's last grid point,
+  after that boundary's commits and before the next step (s2/service.h `NativeHooks::before_work`, s2/flash_native.cuh).
+  Before, it was taken inside the quantum, before the boundary's events commit. A Resize lands NOTICE_MIN = 2
+  boundaries after the one in flight, and a Flash quantum is 8,192 rows (~5 s), so a grow the head announced in
+  quantum 0 landed exactly at the 16,384 boundary, just after the capture there had dropped an entry. Box3
+  (cbdcf54): p4's k0 capture dropped the entry k1 needed, so k1 missed. Nothing runs on the device between the quantum
+  and the capture (no step), so the rows and KDA slot 0 are the ones the quantum left and the entry is the same. A
+  session cancelled at that boundary is captured at its retire, before the next bind resets the state. No new knob.
+  Cost with no sharing: one empty-function check per boundary. The ~65 ms capture moves out of the quantum's
+  `prefill ... ms` line into the gap before the next step (same thread, same total). The prompt's tokens (64 KiB at
+  16,384) are held for one boundary. Not measured on a box.
+- Tests: `engine/runtime/s2/tests/flash_capture_order_test.cpp` (host_tests.sh). Two ranks run the real Service loop
+  with a stand-in store that is full at 5 entries. The head announces a grow during quantum 0, the grow commits at the
+  boundary quantum 1 ends on, and the capture there keeps 6 entries with none dropped. On cbdcf54 the same test keeps
+  5 and drops 1. `engine/runtime/tests/flash_ckpt_group_test.cu` section 9 uses the real store: the grow's apply
+  leaves the device state unchanged, a capture after it keeps 3 entries where one taken before keeps 2, and both
+  restore the same bytes.
 
 ## 2026-10-24: Flash checkpoints on a group lease: a cycle bigger than the lease restores nothing (D-331 M8 defect A)
 

@@ -368,11 +368,44 @@ int main(int argc, char** argv) {
         g6kv_tier_free(idle);
     }
 
+    // 9. (c) the capture at the boundary after the quantum (flash_native.cuh h.before_work): a grow the head announced
+    // during the prefill commits first (box3 p4 k0). Two stores alike, full at 2 entries, the same device state: one
+    // captures as before (inside the quantum, before the grow: an entry dropped), the other grows, then captures (none
+    // dropped). The grow's apply leaves the device state alone, and the two entries restore the same bytes.
+    {
+        const FlashGroup go{"fckg-o-" + tag, 1, 0, 0, 1000}, gn{"fckg-n-" + tag, 1, 0, 0, 1000};
+        FlashCheckpoints o(v, spec, "fckg-o0-" + tag, 2 * sg, "test compat", &go), n(v, spec, "fckg-n0-" + tag, 2 * sg, "test compat", &gn);
+        const auto prompt = [&](int i) { const auto p = toks(4 * 64 + 100, 90 + i); return std::vector<int>(p.begin(), p.begin() + 4 * 64 + 1); };
+        for (int i = 0; i < 2; ++i) {
+            d.fill(90 + i);
+            CHECK(o.capture(4 * 64, 0, prompt(i), {}, st) && n.capture(4 * 64, 0, prompt(i), {}, st));
+        }
+        CHECK(o.index().size() == 2 && n.index().size() == 2 && 3 * blocks(4) > o.blocks());
+        d.fill(92);
+        const auto x = d.snap();
+        const uint64_t eo = o.capture(4 * 64, 0, prompt(2), {}, st);   // before the grow
+        const auto q = n.share_ask(false);
+        const auto gr = n.share_report(FLASH_CKPT_TIER, q.first, q.second);
+        CHECK(q.first > 0 && gr && gr->segs > 2);
+        if (gr) CHECK(n.apply(*gr));
+        CHECK(same(d, x, PAGES));                                      // the commit did not touch the state
+        const uint64_t en = n.capture(4 * 64, 0, prompt(2), {}, st);   // after it
+        printf("capture in the quantum: %zu entries, %llu dropped; after the grow: %zu entries, %llu dropped\n",
+               o.index().size(), (unsigned long long)o.index().dropped, n.index().size(), (unsigned long long)n.index().dropped);
+        CHECK(eo && o.index().size() == 2 && o.index().dropped == 1);
+        CHECK(en && n.index().size() == 3 && n.index().dropped == 0);
+        d.poison(); o.restore(eo, 0, st);
+        const auto ro = d.snap();
+        CHECK(same(d, x, 4));
+        d.poison(); n.restore(en, 0, st);
+        CHECK(same(d, x, 4) && same(d, ro, 4));                        // byte-identical restores
+    }
+
     g6kv_tier_free(b);
     a[0].reset(); a[1].reset();
     CK(cudaStreamDestroy(st));
     for (auto& [p, n] : d.all()) cudaFree(p);
     printf("flash_ckpt_group: %s (ask before a drop, grant, grow, oversize fits, give with ages, LRU drop + pack, restores "
-           "bit for bit after moves, floor, refused transaction, cap 0 grows a cycling lease, a floor sized for the cycle, a grant before the drop, a busy store a give left full asks)\n", fails ? "FAIL" : "PASS");
+           "bit for bit after moves, floor, refused transaction, cap 0 grows a cycling lease, a floor sized for the cycle, a grant before the drop, a busy store a give left full asks, a capture after the grow restores the same bytes)\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

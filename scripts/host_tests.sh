@@ -158,6 +158,10 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 # request that needs the chunks, the head admits within the least room over the ranks
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/flash_lend_test.cpp" -o "$T/flash_lend_test"
 "$T/flash_lend_test"
+# the Flash prefill checkpoint waits for the boundary's commits (s2/flash_native.cuh h.before_work): a grow announced
+# during the prefill lands before the capture, on two ranks through the real Service loop
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_capture_order_test.cpp" "${KVLIB[@]}" -o "$T/flash_capture_order_test"
+(cd "$T" && "$T/flash_capture_order_test" 2>/dev/null)
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost"
 "$T/test_flash_s2_cost"
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost"

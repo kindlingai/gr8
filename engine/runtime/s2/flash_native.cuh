@@ -56,6 +56,23 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     std::atomic<uint64_t> claimed{0};   // the entry take() granted, restored by the bind that follows
     uint32_t capture_at = 0;            // the live request's checkpoint point (0: none)
     g6rt::CacheNamespace capture_ns{};
+    // the quantum that ends at capture_at has run: the capture waits for the next boundary's commits (h.before_work),
+    // so a Resize announced during the prefill and landing at that boundary sizes the store first. Until then no step
+    // runs: rows [0, capture_at) and KDA slot 0 are the ones the quantum left
+    std::vector<int> capture_tokens;
+    uint64_t capture_req = 0;
+    auto take_capture = [&] {
+        if (capture_tokens.empty()) return;
+        std::lock_guard<std::mutex> l(ck_mu);
+        const uint32_t at = uint32_t(capture_tokens.size() - 1);
+        const uint64_t gen = ck->capture(at, 0, capture_tokens, capture_ns, c.stream);
+        if (gen) fprintf(stderr, "# flash ckpt request %llu kept %u rows as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
+                         (unsigned long long)capture_req, at, (unsigned long long)gen,
+                         (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
+        else fprintf(stderr, "# flash ckpt request %llu: %u rows do not fit the store (%llu blocks)\n",
+                     (unsigned long long)capture_req, at, (unsigned long long)ck->blocks());
+        capture_tokens.clear();
+    };
     NativeHooks h;
     h.pool.free_pages = [&] { return pool.free_pages(); };
     h.pool.room = [&] { return pool.room(); };
@@ -107,7 +124,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         for (size_t i = 0; i < list.size(); ++i) require(list[i] == int(i), "Flash run is not contiguous");
         reset(c.main, c.stream); reset(c.draft.d, c.stream);
         ring.reset(); lp_rows = 0; fence();
-        capture_at = 0;
+        capture_at = 0; capture_tokens.clear();
         if (!ck) return;
         capture_ns = g6rt::steering::cache_namespace(g.req.steering);
         bool exact = true;   // the rows this request starts from are cold rows (no hit, or an aligned entry)
@@ -128,7 +145,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         const uint32_t at = aligned_point(g.req.prompt_tokens, grid);
         if (exact && at > g.reuse) capture_at = at;
     };
-    h.retire = [&](const Slot&) { fence(); };
+    // a session cancelled at the boundary its capture waits for: its rows are still in place (the next bind resets them)
+    h.retire = [&](const Slot&) { fence(); if (ck) take_capture(); };
+    if (ck) h.before_work = take_capture;
     h.fence = fence;
     h.dispatch.bucket = [&](bool d, int ctx) { return bucket_of(d ? c.draft.d : c.main, ctx); };
     h.dispatch.mode = [&](int, int next) { require(next == -1 || next == 0, "Flash non-solo mode"); fence(); };
@@ -208,15 +227,8 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         if (mb) draft(c.prefill2, mb, a + ma);
         if (capture_at && first + rows == capture_at) {   // the quantum that ends at the prompt's last grid point
             require(p.prompt.size() > capture_at, "Flash checkpoint past the prompt");
-            const std::vector<int> tokens(p.prompt.begin(), p.prompt.begin() + capture_at + 1);
-            std::lock_guard<std::mutex> l(ck_mu);
-            const uint64_t gen = ck->capture(capture_at, 0, tokens, capture_ns, c.stream);
-            if (gen) fprintf(stderr, "# flash ckpt request %llu kept %u rows as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
-                             (unsigned long long)slot.req.id, capture_at, (unsigned long long)gen,
-                             (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
-            else fprintf(stderr, "# flash ckpt request %llu: %u rows do not fit the store (%llu blocks)\n",
-                         (unsigned long long)slot.req.id, capture_at, (unsigned long long)ck->blocks());
-            capture_at = 0;
+            capture_tokens.assign(p.prompt.begin(), p.prompt.begin() + capture_at + 1);
+            capture_req = slot.req.id; capture_at = 0;
         }
         fprintf(stderr, "# flash serve request %llu prefill %u rows at %u (main + draft): %.3f ms\n",
                 (unsigned long long)slot.req.id, rows, first,

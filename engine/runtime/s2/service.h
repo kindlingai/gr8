@@ -50,6 +50,10 @@ struct NativeHooks {
     std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK
+    // optional: every rank, at each boundary after its last commit and before its work (compute thread). Flash takes a
+    // prefill's checkpoint here (flash_native.cuh), so a Resize that lands at the boundary the quantum ended on is in
+    // place before the capture
+    std::function<void()> before_work;
     // optional: did this rank run tier copies since the last call (the same answer on every rank: the copies are). Then
     // the ranks line up before the next round: one rank's copies can take seconds longer than another's, and a GPU wait
     // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
@@ -409,6 +413,7 @@ class Service {
                 dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
                 staged_.reset(); endpoint_->applied(); continue;
             }
+            if (native_.before_work) native_.before_work();
             const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
             if (elog_ && work.kind != Kind::Decode)
                 fprintf(stderr, "# s2_event step rank %u boundary %llu request %llu %s first %u rows %u\n", c_.rank,
