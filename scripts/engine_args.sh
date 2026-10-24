@@ -45,6 +45,8 @@ tp4_default() {
   [ -n "${!1:-}" ] && return 0
   case " ${G6ENV_X:-} " in *" G6_$1="*) return 0 ;; esac
   printf -v "$1" %s "$2"
+}
+
 # GLM-5.3-Flash under --serve takes no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu refuses them).
 # MTP=1: --serve needs a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
 # SESS: 1 (the default) serves one request at a time; 2..8 share decode steps and the CAP pool, each with its own KDA
@@ -68,8 +70,11 @@ flash_defaults() {
 engine_defaults() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
   case $TP in
-    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
-       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
+    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+       DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
+       # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
+       # G6_TR3_W2ALL in G6ENV_X keeps its own value
+       case " ${G6ENV_X:-} " in *" G6_TR3_W2ALL="*) ;; *) TR3_W2ALL=${TR3_W2ALL:-1} ;; esac
        # the decode options measured at TP=4 (#85 draft head, #86 shared-expert overlap, #87 attention set, the decode
        # buckets and indexer, S2 scheduling, prefill selx); 0 turns one off, and a G6_ name in G6ENV_X keeps its own value
        tp4_default ROUTE_OVL 1; [ "$MTP" = 0 ] || tp4_default DRAFT_HEAD_I4 1
@@ -77,11 +82,6 @@ engine_defaults() {
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
        tp4_default IDX_VEC 1; tp4_default DEC_BK 512; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
        tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248 ;;
-    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
-       DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
-       # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
-       # G6_TR3_W2ALL in G6ENV_X keeps its own value
-       case " ${G6ENV_X:-} " in *" G6_TR3_W2ALL="*) ;; *) TR3_W2ALL=${TR3_W2ALL:-1} ;; esac ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
          if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
