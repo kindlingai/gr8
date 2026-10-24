@@ -766,9 +766,18 @@ inline K1Split k1_split(int M, int k2 = 0)
     if (w2all && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
     if (const char* ev = getenv(M == 1 ? "G6_K1_SPLIT_M1" : M <= 3 ? "G6_K1_SPLIT_M2" : "G6_K1_SPLIT_M4"))
         sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
-    else if (const char* ev = getenv("G6_K1_SPLIT"))
+    else if (const char* ev = getenv("G6_K1_SPLIT"); ev && !strpbrk(ev, ":="))   // "KS1,WG,NS2"; not a per-M table (#107)
         sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
     return s;
+}
+// The fused path's 512-thread CTAs: the fc1 split (KS1, WG) becomes (KS1*WG/2, 2), which keeps every k range only
+// where KS1 x WG is 2 or more. KS1 x WG = 1 (e.g. G6_K1_SPLIT_M1=1,1,2) would give KS1 = 0: no fc1 items, wrong output.
+inline const char* k1_fuse_split(K1Split& s)
+{
+    if (s.KS1 * s.WG < 2) return "G6_K1_SPLIT: KS1 x WG must be 2 or more with fused fc1 / fc2 (G6_FUSE=1|2); set G6_FUSE=0";
+    s.KS1 = s.KS1 * s.WG / 2;
+    s.WG = 2;
+    return nullptr;
 }
 constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: only WG, s_ks, s_ns2 matter. Not tuned.
 
@@ -833,7 +842,8 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // 16+ rows in the step (S2 batches; split_m keeps rows at the session's class): separate launches, 2-3.5% faster at
     // 24-32 rows (row_budget_test --time-v2, GB10 2200 MHz: M=24 1551 vs 1577 us, M=32 1752 vs 1812 us)
     if (policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
-    if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
+    if (fuse)                                              // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
+        if (const char* e = k1_fuse_split(s)) return e;
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently.
     if (fuse == 2 && s.KS1 == 1) s.KS1 = 2;
