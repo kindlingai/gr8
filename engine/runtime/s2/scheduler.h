@@ -19,7 +19,7 @@ constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
 // The control link's version: the frame magic is "G6S2E" + this digit (control_protocol.h) and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold.
-constexpr unsigned CONTROL_VERSION = 6;
+constexpr unsigned CONTROL_VERSION = 8;   // 8: the barrier's Sync and Go carry a word (control_protocol.h); 7 is the B3 Resize event's
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -404,6 +404,12 @@ public:
             if (covered >= NOTICE_ROWS) return boundary_ + k;
         }
         return boundary_ + NOTICE_MAX;
+    }
+    // a session whose restored rows are not to be trusted (a store failed under the copies, kv_fault.h): its prefill
+    // starts again at row 0, before any of its rows ran (every rank alike, between events)
+    void restart_prefill(const Key& k) {
+        auto& s = slot(k); require(!busy_ && s.phase == Phase::Prefill, "restart_prefill outside a prefill");
+        s.prefilled = 0;
     }
     // a just-admitted session that runs its whole prompt as decode steps (prompt logprobs): straight to PromptTail
     void skip_prefill(const Key& k) {

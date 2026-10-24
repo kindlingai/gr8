@@ -220,6 +220,8 @@ engine_args() {
     [ -n "${KV_KEEP:-}" ] && a="$a --kv-keep $KV_KEEP"
     [ -n "${KV_SYSTEM_AFTER:-}" ] && a="$a --kv-system-after $KV_SYSTEM_AFTER"
     [ -n "${KV_WRITE_LIMIT:-}" ] && a="$a --kv-write-limit $KV_WRITE_LIMIT"
+    [ -n "${KV_STORE_FAIL:-}" ] && a="$a --kv-store-fail $KV_STORE_FAIL"
+    [ -n "${KV_STORE_TIMEOUT_S:-}" ] && a="$a --kv-store-timeout $KV_STORE_TIMEOUT_S"
   fi
   [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
   [ -n "${SPEC_ACCEPT:-}" ] && a="$a --spec-accept $SPEC_ACCEPT"

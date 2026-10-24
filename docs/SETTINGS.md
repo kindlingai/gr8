@@ -29,6 +29,8 @@ the short version.
 | `--spec-levels 7,5,3,2` | all of 1..K (`SPEC_LEVELS`) | `--spec-adaptive`: the draft counts it may choose, for example 7,5,3,2 with the drafter or 1,2,4 with `--mtp 4`. The MTP chain drafts up to the next allowed count, so gaps are fine |
 | `--serve DIR` | `$G6_HOME/s2` | serve requests through S2: the shim drives DIR (`cmd.<n>` / `req.<n>` / `resp.<n>`), `DIR/ready.s2` appears once loaded. Without it, g6m4 runs its `--prompt` sequences once and exits |
 | `--s2-port N` / `--s2-sessions S` / `--s2-epoch E` | 7341 (`S2PORT`) / 8 (`SESS`) / the boot epoch | S2: the head's control port, the sessions that decode at once (1-8), and the epoch every rank must share |
+| `--kv-store-fail soft\|hard` | soft (`KV_STORE_FAIL`) | a failed `--kv-store` call: soft marks the store dead on this rank (its later calls are skipped), the ranks OR their dead stores at the barrier after the drain, and every rank drops them from the pool alike (`g6kv_tier_dead`); a grant whose restore those copies were prefills from row 0 again. hard: the engine stops (before this flag). Not measured |
+| `--kv-store-timeout S` | 30 (`KV_STORE_TIMEOUT_S`) | how long a KV node call waits (`g6kv_tier_timeout`): TCP reads and writes, an RDMA completion at most 10 s. TCP keepalive sees a silent peer in about 30 s. Not measured |
 | `--cap N` | 614400 | KV pool in tokens (the longest context) |
 | `--mtp K` | 2 | MTP speculative draft length |
 | `--graph` | on | decode runs as captured CUDA graphs, one per row count |

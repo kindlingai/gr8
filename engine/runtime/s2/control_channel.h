@@ -55,7 +55,8 @@ public:
     }
     // Compute thread, every rank at the same point with the same seq (1, 2, ...): return once every rank has arrived. For
     // host work whose time differs by rank (a tier's copies) before GPU work that waits for peers with a timeout.
-    virtual void sync(uint64_t seq)=0;
+    // Returns the OR of every rank's mask (its failed store tiers), the same word on every rank.
+    virtual uint64_t sync(uint64_t seq,uint64_t mask=0)=0;
 };
 class WorkerChannel : public EventEndpoint {
     ControlIO& io_;
@@ -63,6 +64,7 @@ class WorkerChannel : public EventEndpoint {
     const unsigned rank_;
     std::map<uint64_t,std::string> requests_; // the latest bytes of each request the head has announced, under mu_
     uint64_t go_=0; // the last barrier the head released, under mu_
+    uint64_t go_mask_=0; // its word
     void send_ack(const Ack& a) override {io_.send(encode(a));}
 public:
     std::function<void()> on_quit; // the head quit in order; set before receive_events starts
@@ -76,8 +78,8 @@ public:
                 else if(d.tag==Tag::Request){auto r=decode_request(b);require(r.epoch==epoch_,"request from another epoch");
                     std::lock_guard<std::mutex> l(mu_);requests_[r.request]=std::move(r.bytes);}
                 else if(d.tag==Tag::Quit){require(decode_quit(b)==epoch_,"quit from another epoch");if(on_quit)on_quit();}
-                else if(d.tag==Tag::Go){auto g=decode_go(b);require(g.first==epoch_,"barrier from another epoch");
-                    std::lock_guard<std::mutex> l(mu_);require(g.second==go_+1,"barrier release out of order");go_=g.second;cv_.notify_all();}
+                else if(d.tag==Tag::Go){auto g=decode_go(b);require(g.epoch==epoch_,"barrier from another epoch");
+                    std::lock_guard<std::mutex> l(mu_);require(g.seq==go_+1,"barrier release out of order");go_=g.seq;go_mask_=g.mask;cv_.notify_all();}
                 else throw std::runtime_error("worker received non-event frame");}
         }catch(...){fail();throw;}
     }
@@ -87,11 +89,12 @@ public:
         require(it!=requests_.end(),"ADMIT notice without its request bytes");return it->second;
     }
     // compute sends (ACKs and these) are all on the compute thread
-    void sync(uint64_t seq) override {
+    uint64_t sync(uint64_t seq,uint64_t mask=0) override {
         try {
-            io_.send(encode(SyncFrame{epoch_,rank_,seq}));
+            io_.send(encode(SyncFrame{epoch_,rank_,seq,mask}));
             std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return go_>=seq||failed_;});
             require(!failed_,"control epoch failed");require(go_==seq,"barrier release out of order");
+            return go_mask_;
         }catch(...){fail();throw;}
     }
     // Admission is FIFO: once a request is admitted, it and every earlier one (admitted, or cancelled while queued)
@@ -106,6 +109,7 @@ class LeaderChannel : public EventEndpoint {
     // sync()), in the worker's order on one link. Whichever thread waits reads the link and files what it gets, under mu_.
     std::vector<std::optional<Ack>> acks_;
     std::vector<uint64_t> synced_;
+    std::vector<uint64_t> masks_; // each worker's word at its last barrier arrival
     std::vector<char> reading_;
     template<class Done> void await(unsigned i,Done&& done) {
         std::unique_lock<std::mutex> l(mu_);
@@ -118,7 +122,7 @@ class LeaderChannel : public EventEndpoint {
             l.lock();reading_[i]=0;cv_.notify_all();
             Decoder d(b);
             if(d.tag==Tag::Ack){auto a=decode_ack(b);require(a.rank==i+1,"ACK on wrong rank link");require(!acks_[i],"second ACK before the commit");acks_[i]=a;}
-            else if(d.tag==Tag::Sync){auto s=decode_sync(b);require(s.epoch==epoch_&&s.rank==i+1&&s.seq==synced_[i]+1,"barrier arrival out of order");synced_[i]=s.seq;}
+            else if(d.tag==Tag::Sync){auto s=decode_sync(b);require(s.epoch==epoch_&&s.rank==i+1&&s.seq==synced_[i]+1,"barrier arrival out of order");synced_[i]=s.seq;masks_[i]=s.mask;}
             else throw std::runtime_error("head received a frame that is not an ACK or a barrier arrival");
         }
     }
@@ -126,7 +130,7 @@ class LeaderChannel : public EventEndpoint {
     void send_all(const std::vector<uint8_t>& frame) {std::lock_guard<std::mutex> l(send_mu_);for(auto p:peers_)p->send(frame);}
 public:
     LeaderChannel(uint64_t epoch,const std::vector<ControlIO*>& peers):EventEndpoint(epoch,0),peers_(peers),epoch_(epoch),
-        acks_(peers.size()),synced_(peers.size(),0),reading_(peers.size(),0){require(peers.size()==1||peers.size()==2||peers.size()==3||peers.size()==5,"expected TP2/TP3/TP4/TP6 peers");}
+        acks_(peers.size()),synced_(peers.size(),0),masks_(peers.size(),0),reading_(peers.size(),0){require(peers.size()==1||peers.size()==2||peers.size()==3||peers.size()==5,"expected TP2/TP3/TP4/TP6 peers");}
     void fail() override {EventEndpoint::fail();for(auto p:peers_)p->shutdown();}
     // Control thread: announce caller-chosen FUTURE boundary, collect event ACKs,
     // then make one canonical allocator/scheduler commit while compute is paused.
@@ -152,11 +156,12 @@ public:
             std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return !notice_||failed_;});require(!failed_,"event apply failed");
         }catch(...){fail();throw;}
     }
-    void sync(uint64_t seq) override {
+    uint64_t sync(uint64_t seq,uint64_t mask=0) override {
         try {
             for(unsigned i=0;i<peers_.size();++i)await(i,[&]{return synced_[i]>=seq;});
-            {std::lock_guard<std::mutex> l(mu_);for(auto s:synced_)require(s==seq,"barrier arrival out of order");}
-            send_all(encode_go(epoch_,seq));
+            {std::lock_guard<std::mutex> l(mu_);for(auto s:synced_)require(s==seq,"barrier arrival out of order");for(auto m:masks_)mask|=m;}
+            send_all(encode_go(epoch_,seq,mask));
+            return mask;
         }catch(...){fail();throw;}
     }
     // Pass the head's orderly quit to every worker. A worker already gone is not an error here.

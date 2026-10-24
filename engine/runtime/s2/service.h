@@ -53,6 +53,10 @@ struct NativeHooks {
     // the ranks line up before the next round: one rank's copies can take seconds longer than another's, and a GPU wait
     // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
     std::function<bool()> drained;
+    // optional, --kv-store-fail soft (kv_fault.h): this rank's failed store tiers since the last call (bit t), and the
+    // tiers every rank agreed on at the barrier after a drain, to drop alike on every rank
+    std::function<uint64_t()> store_faults;
+    std::function<void(uint64_t)> stores_dead;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
@@ -150,6 +154,7 @@ class Service {
                   << ",\"moved_out_pages\":" << t.moved_out_pages << ",\"restored_pages\":" << t.restored_pages
                   << ",\"restored_bytes\":" << t.restored_pages * bb << ",\"hits\":" << t.hits << ",\"dropped\":" << t.dropped
                   << ",\"dropped_pages\":" << t.dropped_pages << ",\"refused\":" << t.refused << ",\"refused_pages\":" << t.refused_pages
+                  << (t.dead ? ",\"dead\":1" : "")   // --kv-store-fail soft: the tier failed and holds nothing
                   << ",\"full\":" << t.full << ",\"write_credit\":" << t.credit << "}";
             }
             o << "]";
@@ -396,14 +401,23 @@ public:
         h.finished = [&](const Slot& s) { retire_run(s); };
         if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
             h.settle = [&] {
-                if (!native_.drained()) return;
+                if (!native_.drained()) return false;
                 // the barrier after a drain: every rank waits here for the slowest rank's drain (the drain trace's other
                 // half: the tier io lines carry the same ranks' drains)
                 auto wall = [] { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); };
                 const long long b0 = wall();
-                endpoint_->sync(++sync_);
+                const uint64_t dead = endpoint_->sync(++sync_, native_.store_faults ? native_.store_faults() : 0);
                 fprintf(stderr, "# rank %u: s2 drain barrier %llu: in %lld ms, out %lld ms\n", (unsigned)c_.rank, (unsigned long long)sync_, b0, wall());
+                if (!dead) return false;
+                require(bool(native_.stores_dead), "a failed store without --kv-store-fail soft");
+                native_.stores_dead(dead);
+                return true;
             };
+        // a grant whose restore a failed store spoiled: the same session, its rows from 0 (Driver::step, every rank)
+        h.rebind = [&](const Grant& g) {
+            dispatch_.begin(g.key.slot, 0, g6rt::steering::cache_namespace(g.req.steering));
+            native_.bind(g);
+        };
         if (native_.pool.grow)
             h.grow = [&](const Slot& s, uint64_t rows) {
                 const auto r = native_.pool.grow(s.run, rows);

@@ -17,6 +17,7 @@
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
 #include "kv_plan.h"
+#include "kv_fault.h"
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -158,6 +159,8 @@ class KvTiers {
         if (rc) throw std::runtime_error(std::string("KV store ") + what + ": " + g6kv_tier_error());
     }
 public:
+    // --kv-store-fail: what a failed store call does (kv_fault.h). Hard until the engine sets it
+    kvt::Faults faults;
     uint64_t spilled = 0, moved = 0, restored = 0;
     double ms = 0, last_ms = 0, last_device_ms = 0;
     // the last run's store calls, per tier: blocks written and read, and the time in the calls (the drain trace; the
@@ -213,8 +216,10 @@ public:
                 for (size_t j = 0; j < t.size(); ++j) if (t[j] == tier) { b.push_back(blocks[j]); p.push_back(pb_.host((int)j)); }
                 if (b.empty()) continue;
                 const auto c0 = std::chrono::steady_clock::now();
-                ck(write ? g6kv_tier_write_many(t_[tier], b.size(), b.data(), p.data())
-                         : g6kv_tier_read_many(t_[tier], b.size(), b.data(), p.data()), write ? "write" : "read");
+                faults.call(tier, write ? "write" : "read", [&] {
+                    return write ? g6kv_tier_write_many(t_[tier], b.size(), b.data(), p.data())
+                                 : g6kv_tier_read_many(t_[tier], b.size(), b.data(), p.data());
+                }, g6kv_tier_error);
                 const double c = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
                 Io& x = last_io[tier];
                 ++x.calls;

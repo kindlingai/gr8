@@ -643,6 +643,13 @@ impl Pool {
         self.stash.as_mut().map_or(Ok(()), Stash::io_done)
     }
 
+    /// The tiers in `mask` (bit t = tier t) failed on some rank under the last io()'s copies (stash.rs tier_dead).
+    /// After io_done; every rank calls it alike. Returns the entries dropped.
+    pub fn tier_dead(&mut self, mask: u64) -> Result<u64, Error> {
+        self.pending()?;
+        Ok(self.stash.as_mut().map_or(0, |s| s.tier_dead(mask)))
+    }
+
     /// Copies queued since the last io().
     pub fn io_pending(&self) -> usize {
         self.stash.as_ref().map_or(0, |s| s.io.len())

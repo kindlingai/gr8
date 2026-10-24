@@ -43,7 +43,10 @@ struct DriverHooks {
     std::function<void(const Slot&)> finished;
     // optional: after the growth and before the round, every rank (the host work since the last round may have taken a
     // different time on each rank: the round's fabric waits time out)
-    std::function<void()> settle;
+    // returns true when a store failed under the copies (on any rank): every grant bound since the last settle that
+    // restored rows from a store then prefills from row 0 again, through rebind (the grant with reuse 0)
+    std::function<bool()> settle;
+    std::function<void(const Grant&)> rebind;
 };
 class Driver {
     Scheduler scheduler_;
@@ -51,6 +54,7 @@ class Driver {
     std::array<Payload, MAX_SESSIONS> payload_;
     std::array<uint32_t, MAX_SESSIONS> emitted_{};
     std::array<bool, MAX_SESSIONS> initialized_{};
+    std::vector<Grant> restored_;   // grants bound since the last settle whose rows came from a store
     s2::Batch batch_;
     CpRound cp_round_;   // G6_CP_STEP_ROWS: the current cycle of capped rounds (cp_rows.h)
     bool cp_capped_ = false;
@@ -146,6 +150,7 @@ public:
             if (c.admit) {
                 payload_[c.admit->key.slot] = *p;
                 hooks_.bind(*c.admit);
+                if (c.admit->restored) restored_.push_back(*c.admit);
                 if (p->decode_prompt) scheduler_.skip_prefill(c.admit->key);
             }
         } catch (...) { scheduler_.fail(); throw; }
@@ -161,7 +166,19 @@ public:
                     if (!r) stalled[k.slot] = true;
                     else if (*r != s.run) scheduler_.grow(k, *r);
                 }
-            if (hooks_.settle) hooks_.settle();
+            if (hooks_.settle && hooks_.settle()) {
+                require(bool(hooks_.rebind), "a failed store without a rebind hook");
+                for (Grant g : restored_) {
+                    const auto& s = scheduler_.slots()[g.key.slot];
+                    if (s.key != g.key || s.phase != Phase::Prefill || s.prefilled != g.reuse) continue;
+                    std::fprintf(stderr, "# s2 store failed under request %llu's restore: it prefills its %u reused rows again\n",
+                                 (unsigned long long)g.req.id, g.reuse);
+                    scheduler_.restart_prefill(g.key);
+                    g.reuse = 0; g.restored = 0;
+                    hooks_.rebind(g);
+                }
+            }
+            if (hooks_.settle) restored_.clear();
         } catch (...) { scheduler_.fail(); throw; }
         // G6_CP_STEP_ROWS: of the sessions that can decode, the ones this round takes (cp_rows.h); the rest sit it out like
         // a grow stall. A session's verify context is at most its length + mtp, so `past` holds for every session whose
