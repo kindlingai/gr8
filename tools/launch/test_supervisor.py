@@ -233,13 +233,18 @@ class DonorTests(unittest.TestCase):
         k = self.flash_plan()
         self.assertEqual((k['FLASH_KV_DONATE_GIB'], k['FLASH_CAP_POLICY']), ('0', 'protected'))
         with self.assertRaisesRegex(opt.OptionError, 'FLASH_KV_GROWTH_GIB'):
-            self.flash_plan('--flash-kv-donate-gib', '20')
+            self.flash_plan('--flash-kv-donate-gib', '20', '--flash-kv-group', 'gr8-glm53')
+        # the group is the borrowing cluster's, never this serve's by default
+        with self.assertRaisesRegex(opt.OptionError, 'FLASH_KV_GROUP'):
+            self.flash_plan('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6')
         with self.assertRaisesRegex(opt.OptionError, 'borrow-idle needs'):
             self.flash_plan('--flash-cap-policy', 'borrow-idle')
         with self.assertRaisesRegex(opt.OptionError, 'want protected'):
             self.flash_plan('--flash-cap-policy', 'lend')
-        k = self.flash_plan('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6')
-        self.assertEqual((k['FLASH_KV_DONATE_GIB'], k['FLASH_KV_GROWTH_GIB']), ('20', '6'))
+        k = self.flash_plan('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6',
+                            '--flash-kv-group', 'gr8-glm53')
+        self.assertEqual((k['FLASH_KV_DONATE_GIB'], k['FLASH_KV_GROWTH_GIB'], k['FLASH_KV_GROUP']),
+                         ('20', '6', 'gr8-glm53'))
 
     def donor(self, knobs, model='glm53f'):
         flash = model == 'glm53f'
@@ -255,7 +260,7 @@ class DonorTests(unittest.TestCase):
 
     @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine/kvman-rs)')
     def test_a_flash_box_starts_a_lazy_node_with_a_ledger_and_stops_it(self):
-        s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0'})
+        s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0', 'FLASH_KV_GROUP': 'gr8-full'})
         try:
             self.assertTrue(s.donor, said)
             st = S.kvnode.read_json(os.path.join(s.home, 'out', 'kv', 'state.json'))
@@ -265,6 +270,10 @@ class DonorTests(unittest.TestCase):
             self.assertEqual(argv[argv.index('--gb') + 1], '1')
             self.assertEqual(argv[argv.index('--ledger') + 1], ledger)
             self.assertIn('--lazy-lock', argv)
+            # the node joins the borrowing cluster's group, whatever this serve's config says
+            with open(f'/proc/{st["pid"]}/cmdline', 'rb') as f:
+                sup = f.read().decode().split('\0')
+            self.assertEqual(sup[sup.index('--group') + 1], 'gr8-full')
             book = subprocess.run([S.ledger_bin(opt.REPO), ledger, 'show'], capture_output=True, text=True).stdout
             self.assertIn(f'"total":{1 << 30},"gpu":0,"node":{1 << 30}', book)
         finally:

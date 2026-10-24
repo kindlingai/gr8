@@ -111,6 +111,7 @@ A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `do
 |---|---|---|---|
 | `FLASH_KV_DONATE_GIB` | `--flash-kv-donate-gib` | 0 | once the serve has booted, each Flash box starts `./gr8 kv up --gb N --lazy-lock --ledger out/kv/ledger` with N = this, or less when MemAvailable then - `FLASH_KV_GROWTH_GIB` - `KV_MIN_FREE_GB` is less (`flash_donor_budget`, whole GiB). No budget, or a node that fails, leaves the serve as it is; the serve's stop stops the node. 0 = no node. Measured effect: not measured |
 | `FLASH_KV_GROWTH_GIB` | `--flash-kv-growth-gib` | none | with `FLASH_KV_DONATE_GIB`: the GiB the serve may still allocate after boot. Required: the Flash serve's growth after boot is not measured yet |
+| `FLASH_KV_GROUP` | `--flash-kv-group` | none | with `FLASH_KV_DONATE_GIB`: the mentat group the KV node joins, the cluster that borrows from it (the GLM-5.3 serve's), not the Flash serve's. Required: a donation without it is refused at boot |
 | `FLASH_CAP_POLICY` | `--flash-cap-policy` | `protected` | `protected`: the configured `CAP`'s memory is never lent; the host ledger counts only what is lent. `borrow-idle` (lend it while the serve is idle) is refused until the Flash KV pool comes in chunks |
 
 | name | flag | default | scope | meaning |

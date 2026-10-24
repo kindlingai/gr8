@@ -5,7 +5,8 @@
 - `FLASH_KV_DONATE_GIB=N` (`./gr8 glm53f --flash-kv-donate-gib N`, default 0 = off): once the Flash serve has booted,
   each box starts `./gr8 kv up --lazy-lock` with N GiB, or less when MemAvailable then - `FLASH_KV_GROWTH_GIB` -
   `KV_MIN_FREE_GB` is less (`flash_donor_budget` in `scripts/engine_args.sh`). `FLASH_KV_GROWTH_GIB` is required with
-  it: the serve's growth after boot is not measured. A node that fails, or no budget, leaves the serve as it is; the
+  it: the serve's growth after boot is not measured. `FLASH_KV_GROUP` is required too: the mentat group the node
+  joins is the borrowing cluster's, never inherited from the Flash serve's config. A node that fails, or no budget, leaves the serve as it is; the
   serve's stop stops the node. `FLASH_CAP_POLICY=protected` (default) never lends the configured CAP's memory;
   `borrow-idle` is refused until the Flash KV pool comes in chunks.
 - `kvman-ledger` (`engine/kvman-rs/src/ledger.rs`): the host ledger of such a box (generation, GPU-backed, node,

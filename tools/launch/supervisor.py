@@ -783,7 +783,7 @@ class Supervisor:
             n = str(gib << 30)
             for argv in ([lb, ledger, 'init', '--total', n, '--node', n],
                          [sys.executable, kvnode.HERE, 'up', '--g6-home', self.home, '--gb', str(gib), '--lazy-lock',
-                          '--ledger', ledger]):
+                          '--ledger', ledger, '--group', knobs['FLASH_KV_GROUP']]):
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
                 if p.returncode:
                     raise RuntimeError(f'{os.path.basename(argv[1] if argv[0] == sys.executable else argv[0])}: '
@@ -792,7 +792,8 @@ class Supervisor:
             log(f'KV donation of {gib} GiB failed; the serve goes on without it: {e}')
             return
         self.donor = True
-        log(f'KV donation: a KV node beside the serve, {gib} GiB, locked lease by lease (ledger {ledger})')
+        log(f'KV donation: a KV node beside the serve for group {knobs["FLASH_KV_GROUP"]}, {gib} GiB, locked lease '
+            f'by lease (ledger {ledger})')
 
     def start_front(self, plan):
         o = self.o

@@ -60,7 +60,8 @@ flash_defaults() {
 
 # A KV node next to the Flash serve (D-331 M7): FLASH_KV_DONATE_GIB > 0 lends at most that many GiB of this box to a
 # ./gr8 kv up --lazy-lock node once the serve has booted. FLASH_KV_GROWTH_GIB is what the serve may still allocate after
-# boot; it has no default because it is not measured yet. FLASH_CAP_POLICY=protected: the configured CAP's memory is
+# boot; it has no default because it is not measured yet. FLASH_KV_GROUP is the mentat group the node serves (the cluster
+# that borrows from it, not this serve's), also without a default. FLASH_CAP_POLICY=protected: the configured CAP's memory is
 # never lent (borrow-idle, lending it while idle, needs the GPU pool in chunks, which the engine does not have yet).
 num_ok() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 flash_donor_defaults() {
@@ -73,6 +74,7 @@ flash_donor_defaults() {
   esac
   [ "$FLASH_KV_DONATE_GIB" = 0 ] && return 0
   num_ok "${FLASH_KV_GROWTH_GIB:-}" || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB needs FLASH_KV_GROWTH_GIB, the GiB the serve may still allocate after boot (not measured yet)" >&2; return 2; }
+  [ -n "${FLASH_KV_GROUP:-}" ] || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB needs FLASH_KV_GROUP, the mentat group of the cluster that borrows the node (not this serve's)" >&2; return 2; }
   return 0
 }
 # flash_donor_budget [KIB]: FLASH_KV_DONATE_GIB, or less when MemAvailable (KIB, else /proc/meminfo, read after the

@@ -100,6 +100,8 @@ KEYS = {
                                         'none'),
     'FLASH_KV_GROWTH_GIB': ('box', None, 'with FLASH_KV_DONATE_GIB: the GiB the Flash serve may still allocate after '
                                         'boot (no default: not measured yet)'),
+    'FLASH_KV_GROUP': ('box', None, 'with FLASH_KV_DONATE_GIB: the mentat group the KV node joins, the cluster that '
+                                   'borrows from it (e.g. the GLM-5.3 serve\'s), not this serve\'s. No default'),
     'FLASH_CAP_POLICY': ('cluster', None, "protected (default): the configured CAP's memory is never lent. borrow-idle "
                                          'is refused until the Flash KV pool comes in chunks'),
     'PF_OWN': ('cluster', None, 'prefill attention ownership'),
