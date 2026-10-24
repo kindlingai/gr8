@@ -471,6 +471,9 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
     return (int)fa::run_body(a,input,w,stream);
 }
 extern "C" int g6_attn_rope_init(int,void*){return 0;}   // no RoPE in Flash
+extern "C" int g6_attn_ctx_sp(void){return 0;}           // the E1 decode attention variants (#135) are GLM-5.3 only
+extern "C" int g6_attn_posidx(void){return 0;}
+extern "C" int g6_attn_posidx_takes(const G6Attn*){return 0;}
 
 #if defined(G6_CP) && G6_CP
 extern "C" int g6_attn_cp_front(const G6Attn*,const G6AttnStepCell*,void*,size_t,void*){return NOTSUP;}
