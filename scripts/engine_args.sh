@@ -176,6 +176,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   # docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${CP_STEP_ROWS:+ G6_CP_STEP_ROWS=$CP_STEP_ROWS}"
   ENGINE_ENV="$ENGINE_ENV${CP_STEP_SEG:+ G6_CP_STEP_SEG=$CP_STEP_SEG}"
+  # CP decode's remote head groups as one attention call (CP_ONECHAIN; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${CP_ONECHAIN:+ G6_CP_ONECHAIN=$CP_ONECHAIN}"
   return 0
 }
 
