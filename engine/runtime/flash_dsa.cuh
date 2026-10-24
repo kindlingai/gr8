@@ -17,6 +17,7 @@
 //                                              the GEMV bindings for every M = 1..MX (needs m.sc and the step buffers)
 //   prepare_dsa_layer(m, i, M, st)             outside capture: graph form, the attention replay entries for M rows
 //   launch_dsa_block(m, i, M, context, st)     the step: projections, attention, o_proj, publish of collective 2i
+//                                              (S2 with several sessions: s2_attention on the layer's batch view, s2.cuh)
 #pragma once
 #if G6_MODEL_FLASH
 
@@ -274,6 +275,10 @@ inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t s
         bind::launch(b.idx_q, st);
     }
     dmark(DP_QB, st);
+#ifdef DEC_S2
+    if (m.s2on) s2_attention(m, i, M, st);   // the step's rows of every session on the batch view (s2.cuh)
+    else
+#endif
     if (m.graph)
     {
         if (!y.rp_on[m.cur][M]) die("prepare_dsa_layer(m, i, M) was not called before a graph step");

@@ -353,14 +353,15 @@ inline void pf_prewarm_flash(Model& m, FlashPrefill& P, cudaStream_t st)
     fprintf(stderr, "# rank %d: G6_PF_PREWARM on (lane %d)\n", P.f.rank, lane_no++);
 }
 
-// host: tokens and positions of one sub-batch; every row in session slot 0 (one offline session)
-inline void pf_inputs_flash(FlashPrefill& P, int M, const int* tok, const int* pos)
+// host: tokens and positions of one sub-batch; every row in KDA state slot `slot` (0: one offline session; S2: the
+// session's first slot, FlashSlots::base)
+inline void pf_inputs_flash(FlashPrefill& P, int M, const int* tok, const int* pos, int slot_id = 0)
 {
     if (M < 1 || M > P.MP) die("Flash prefill: M outside 1..MP");
     for (int r = 1; r < M; ++r) if (pos[r] != pos[0] + r) die("Flash prefill: rows must be consecutive positions");
     G6RT_CK(g6h2d::copy(P.tok, tok, M * sizeof(int)));
     G6RT_CK(g6h2d::copy(P.pos, pos, M * sizeof(int)));
-    const std::vector<int> slot(M, 0);
+    const std::vector<int> slot(M, slot_id);
     G6RT_CK(g6h2d::copy(P.row_slot, slot.data(), M * sizeof(int)));
 }
 
@@ -570,7 +571,7 @@ inline int pf_g9_vs()
 // KDA: projections (GEMMs for trellis q/k/v, else the decode GEMVs per MX chunk on the chunk's fragment tables), the
 // chunked scan over all M rows (state of slot P.row_slot[0]), o_proj (GEMM for a trellis o_proj, else per MX chunk)
 // -> P.part[0]. With the --mtp verify ring the prefill rows use slot 0 = the committed slot of the prompt steps
-// (rank.cuh mtp_sequence: kcur 0), carry mode off.
+// (rank.cuh mtp_sequence: kcur 0; several S2 sessions: the session's first slot, pf_inputs_flash), carry mode off.
 inline void pf_kda_block(Model& m, FlashPrefill& P, int i, int M, cudaStream_t st)
 {
     const kda::KdaLayer& w = m.layers[i].kda_w;

@@ -40,19 +40,23 @@ pool_cap() {
   share_cap "$p"
 }
 
-# GLM-5.3-Flash under --serve takes one session and no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu
-# refuses them). MTP=1: --serve needs a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
-# CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and the MTP layer
-# keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at any TP
-# (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
+# GLM-5.3-Flash under --serve takes no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu refuses them).
+# MTP=1: --serve needs a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
+# SESS: 1 (the default) serves one request at a time; 2..8 share decode steps and the CAP pool, each with its own KDA
+# state slots (docs/FLASH.md, Several sessions), and a round of every session, SESS x (MTP + 1) rows, must fit the
+# engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
+# the MTP layer keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at
+# any TP (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
   case $TP in 4|3|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3 or 2" >&2; return 2 ;; esac
   local k
   for k in DFLASH REUSE PF_OWN SPEC_ADAPT; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
-  [ "${SESS:-1}" = 1 ] || { echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves one session" >&2; return 2; }
-  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=1
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=${SESS:-1}
+  case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves 1 to 8 sessions" >&2; return 2 ;; esac
+  [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
+    { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
 }
 
@@ -228,10 +232,11 @@ engine_args() {
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
-  # a release only, one session (flash_defaults). --chunk 1: a main step holds at most MTP + 1 rows, the KDA state ring
+  # a release only, SESS sessions (flash_defaults). --chunk 1: a prompt tail goes one row a step, and a session's rows
+  # in a main step stay within its KDA state ring (MTP + 1)
   if [ "${GR8_MODEL:-glm53}" = glm53f ]; then
     a="--image --layers all $src --top-p-cands 256 --chunk 1 --temp 0.7 --cap $CAP --graph --prefill 4096 \
---pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions 1 --s2-epoch $epoch"
+--pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
     (set -f; echo $a)

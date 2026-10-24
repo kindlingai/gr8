@@ -1,7 +1,9 @@
 #include "../runtime/s2/flash_ring.h"
 #include <cassert>
 #include <cstdio>
+#include <algorithm>
 #include <random>
+#include <set>
 #include <vector>
 namespace {
 constexpr int MX = 64;
@@ -125,9 +127,46 @@ void errors() {
     si.pos[0] = 13; assert(throws([&] { ks.inputs(si, {0}, {0}, {1}, {true}); }));  // past the last step's rows
     assert(ks.base(1) == 4 && throws([&] { ks.base(-1); }));
 }
+// FlashSlots::step from an s2::Step layout and its sessions' event classes is inputs() with verify = not the prompt tail
+struct Step { std::vector<unsigned> sess, row0, rows; };
+constexpr int TAIL = 3;
+void step() {
+    g6s2::FlashSlots a(3, 4), b(3, 4);
+    StepIn x, y;
+    const Step sp{{0, 2}, {0, 4}, {4, 1}};
+    for (int r = 0; r < 5; ++r) x.pos[r] = y.pos[r] = 20 + r;
+    a.step(x, sp, {1, TAIL}, TAIL);
+    b.inputs(y, {0, 2}, {0, 4}, {4, 1}, {true, false});
+    assert(x.kda_src == y.kda_src && x.kda_src == 0 && x.krun[4] == y.krun[4] && x.krun[4] == 8 + 1);
+    for (int r = 0; r < 5; ++r) assert(x.kslot[r] == y.kslot[r]);
+    assert(x.kslot[3] == 3 && x.kslot[4] == 8);
+    assert(throws([&] { a.step(x, sp, {1}, TAIL); }));               // an event per session
+}
+// The boot capture set: every main and draft width S2 can launch, and nothing past MX
+void shapes() {
+    for (int N : {1, 2, 8}) for (int K : {1, 2, 3}) for (bool adapt : {false, true}) for (int chunk : {1, 16}) {
+        const auto f = g6s2::flash_shapes(N, K, chunk, adapt, 64);
+        for (int M = 1; M <= chunk; ++M) assert(f.mains.count(M) && f.drafts.count(M));
+        for (int S = 1; S <= N; ++S) for (int k = adapt ? 1 : K; k <= K; ++k) assert(f.mains.count(S * (k + 1)));
+        for (int M : f.mains) {                                      // and no other width
+            bool round = M <= chunk;
+            for (int S = 1; S <= N; ++S) for (int k = adapt ? 1 : K; k <= K; ++k) round |= M == S * (k + 1);
+            assert(round);
+        }
+        assert(int(f.drafts.size()) == std::max(chunk, N * (K + 1)) && *f.drafts.rbegin() == std::max(chunk, N * (K + 1)));
+        assert(int(f.chains.size()) == (K >= 2 ? N : 0));
+    }
+    // the solo set: prompt tails and one round
+    const auto f = g6s2::flash_shapes(1, 3, 4, false, 64);
+    assert((f.mains == std::set<int>{1, 2, 3, 4}) && f.drafts.size() == 4 && (f.chains == std::set<int>{1}));
+    assert(throws([] { g6s2::flash_shapes(8, 3, 16, false, 31); }));   // 8 x 4 rows > MX
+    assert(!throws([] { g6s2::flash_shapes(8, 3, 16, false, 32); }));
+    assert(throws([] { g6s2::flash_shapes(0, 3, 16, false, 32); }) && throws([] { g6s2::flash_shapes(2, 0, 16, false, 32); }) &&
+           throws([] { g6s2::flash_shapes(2, 3, 33, false, 32); }));
+}
 }
 int main() {
-    ring(); solo(); sessions(); errors();
+    ring(); solo(); sessions(); errors(); step(); shapes();
     puts("flash_ring: PASS (all accepted lengths, insertion, reset, invalid positions; FlashSlots: one session as before, "
-         "sessions sharing steps in their own slots, reset, invalid layouts)");
+         "sessions sharing steps in their own slots, reset, invalid layouts, the s2::Step form; the capture set)");
 }

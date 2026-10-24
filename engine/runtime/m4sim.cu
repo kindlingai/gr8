@@ -390,6 +390,10 @@ int main(int argc, char** argv)
     if (nc < 0 || nc * NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / NR));
 #ifdef DEC_S2
     if (s2mode && (!mtp || MP || !serve.empty() || prompts.size() > (size_t)S2N)) die("--s2 needs --mtp, no --prefill / --serve, at most 8 --prompt");
+#if G6_MODEL_FLASH
+    // Flash sessions share steps only in g6m4 --serve (s2/flash_native.cuh: each its own KDA slots and ring)
+    if (s2mode) die("--s2: the Flash model batches sessions in g6m4 --serve only");
+#endif
 #else
     if (s2mode) die("--s2 needs a DEC_S2 build");
 #endif
