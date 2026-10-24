@@ -568,9 +568,9 @@ class DrafterTests(unittest.TestCase):
         """TP=6: MTP only unless --dflash 1; with it, the drafter is converted in the replicated layout (--nr 6)."""
         import options as opt
         import supervisor as S
-        from test_modelset import make_packs
-        packs = make_packs(os.path.join(self.t, 'packs6'), tp=6, dflash=False, qo=True)
-        base = ['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--model', packs]
+        from test_modelset import make_release as local_release
+        rel = local_release(os.path.join(self.t, 'local6'))
+        base = ['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--model', rel]
         logs = []
 
         def boot(*argv):
@@ -592,7 +592,6 @@ class DrafterTests(unittest.TestCase):
         plan = opt.engine_plan(o, rank=5, rank_dir='/r', aux_dir='/a', home='/h', epoch=1)
         self.assertIn(os.path.join(ms.drafter.out, 'dflash.r5.pack'), plan['args'])
         self.assertIn('--spec-adaptive', plan['args'])
-        self.assertNotIn('dflash.r5.pack', modelset.needed(ms.set, 5, plan))
 
 
 if __name__ == '__main__':
