@@ -198,9 +198,8 @@ class SteeringHFTests(unittest.TestCase):
         shutil.rmtree(self.cache)
         with self.assertRaisesRegex(modelset.ModelError, 'needs steering/index.json'):
             self.source()
-        for extra in (['--base-packs', str(self.model)], ['--model', str(self.model)]):
-            self.assertIn('requires an HF release without --base-packs',
-                          supervisor.resolve_model(self.opts(*extra), log=lambda _: None)[2])
+        self.assertIn('requires an HF release',
+                      supervisor.resolve_model(self.opts('--model', str(self.model)), log=lambda _: None)[2])
 
     def test_strict_index_schema_and_paths(self):
         original = copy.deepcopy(self.index)

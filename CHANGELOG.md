@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-24: the launcher boots from the exlr8 release only, again
+
+- #172 brought back the boot from converted rank packs, because a TP=6 boot from the release had stopped at layer 37
+  with non-finite attention. That doesn't reproduce on `main` from the Hugging Face release, with the launcher's TP=6
+  defaults or with the TP6 K3 recipe's env file: both serve, smoke 14/14. `release_check.py --tp 6 --qo` matches
+  every non-expert tensor of layers 0, 3, 36-38 and 78 on all six ranks byte for byte. So pack boot goes again, as in
+  #144, and `recipes/tp6-k3-613k` boots from the release.
+
 ## 2026-10-24: TP=5 boots its 19-block dense ranks, and prefills with PF_OWN=3
 
 - At TP=5 two ranks hold 19 of the 96 dense blocks (K 2,432). The dense trellis GEMV needs whole 128-channel blocks

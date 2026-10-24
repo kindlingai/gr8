@@ -16,9 +16,6 @@ def prepare(o, ms):
     if not directory:
         return
     try:
-        if o.get('BASE_PACKS') or (ms.set.get('source', {}).get('kind') != 'exlr8-release' and
-                                   (o.get('V2') or o.get('V2_DENSE'))):
-            raise ValueError('local profiles require a self-contained release or complete rank-pack set; mixed external weights are unsupported')
         template = os.path.join(ms.tokenizer, 'chat_template.jinja')
         actual_template = options.file_sha256(template)
         if actual_template != o.get('STEERING_CHAT_TEMPLATE_SHA256'):
@@ -26,9 +23,9 @@ def prepare(o, ms):
         weights = ms.set.get('source', {}).get('weights') or ms.id
         if o.get('STEERING_WEIGHT_SET') and o.get('STEERING_WEIGHT_SET') != weights:
             raise ValueError('profile identity does not match the resolved weight set')
-        # Packs can lack config.json. Where present, compare actual dimensions and revision metadata too.
+        # Where config.json is present, compare actual dimensions and revision metadata too.
         candidates = [os.path.join(ms.tokenizer, 'config.json')]
-        for config_root in (ms.src_dir, o.get('V2_DENSE')):
+        for config_root in (ms.dir, o.get('V2_DENSE')):
             if config_root:
                 candidates.append(os.path.join(config_root, 'config.json'))
         for path in candidates:

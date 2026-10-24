@@ -15,7 +15,7 @@ import modelset
 import options
 import steering_local
 import supervisor
-from test_modelset import make_packs
+from test_modelset import make_release
 
 PEERS = '192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4'
 
@@ -25,8 +25,9 @@ class FixtureTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        packs = make_packs(str(self.root / 'packs'))
-        self.ms = modelset.resolve(packs, None, 4)
+        rel = make_release(str(self.root / 'rel'))
+        self.ms = modelset.release_set(rel, 4)
+        self.weights = self.ms.set['source']['weights']
         self.template = Path(self.ms.tokenizer, 'chat_template.jinja')
         self.digest = options.file_sha256(self.template)
         self.profile = self.root / 'profile'
@@ -34,7 +35,7 @@ class FixtureTestCase(unittest.TestCase):
         payload = struct.pack('<' + 'f' * 6144, 1.0, *([0.] * 6143)) * 2
         self.manifest = {'schema_version': 1, 'profile_name': 'example', 'scope': 'shared',
                          'layers': [0, 3], 'alphas': [.5, 1.],
-                         'model': {'name': 'glm-5.3', 'revision': 'rev-1', 'weight_set': self.ms.id,
+                         'model': {'name': 'glm-5.3', 'revision': 'rev-1', 'weight_set': self.weights,
                                    'tokenizer_revision': 'tok-1', 'chat_template_sha256': self.digest,
                                    'hidden_size': 6144, 'layer_count': 78},
                          'directions': {'file': 'directions.f32', 'dtype': 'float32-le', 'byte_count': len(payload),
@@ -48,7 +49,7 @@ class FixtureTestCase(unittest.TestCase):
         (self.profile / 'manifest.json').write_text(json.dumps(self.manifest))
 
     def opts(self, *extra):
-        o = options.parse(['--no-config', '--peers', PEERS, '--model', str(self.root / 'packs'),
+        o = options.parse(['--no-config', '--peers', PEERS, '--model', str(self.root / 'rel'),
                            '--steering-profile', str(self.profile), '--steering-model-revision', 'rev-1',
                            '--steering-tokenizer-revision', 'tok-1', '--steering-chat-template-sha256', self.digest,
                            *extra], {})
@@ -59,10 +60,10 @@ class LocalTests(FixtureTestCase):
     def test_actual_template_and_weight_identity_reach_engine(self):
         o = self.opts('--steering-force', '1.25')
         self.assertEqual(steering_local.prepare(o, self.ms), self.manifest)
-        self.assertEqual(o.get('STEERING_WEIGHT_SET'), self.ms.id)
+        self.assertEqual(o.get('STEERING_WEIGHT_SET'), self.weights)
         args = options.engine_plan(o, rank=1, set_id=self.ms.id)['args']
         for flag, value in (('--steering-profile', str(self.profile)), ('--steering-chat-template', str(self.template)),
-                            ('--steering-weight-set', self.ms.id), ('--steering-force', '1.25')):
+                            ('--steering-weight-set', self.weights), ('--steering-force', '1.25')):
             self.assertEqual(args[args.index(flag) + 1], value)
 
     def test_no_profile_does_no_profile_io(self):
@@ -120,16 +121,8 @@ class LocalTests(FixtureTestCase):
         root_config.write_text('{"hidden_size":1,"num_hidden_layers":78}')
         o = self.opts()
         o.values['V2_DENSE'] = str(self.root)
-        self.ms.set['source'] = {'kind': 'exlr8-release', 'weights': self.ms.id}
         with self.assertRaises(modelset.ModelError):
             steering_local.prepare(o, self.ms)
-
-    def test_mixed_external_weights_refused(self):
-        for key in ('BASE_PACKS', 'V2', 'V2_DENSE'):
-            o = self.opts()
-            o.values[key] = '/external/weights'
-            with self.assertRaisesRegex(modelset.ModelError, 'mixed external weights'):
-                steering_local.prepare(o, self.ms)
 
     def test_force_and_selector_validation(self):
         with self.assertRaisesRegex(options.OptionError, 'weight hash checks'):
