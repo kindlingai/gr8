@@ -95,10 +95,12 @@ python3 bench/gate/gate.py paired --topology tp4 --a <main sha> --b <pr sha>
 Per pair and metric it takes d = (b - a) / |a| on the medians of each side's repeats, then over the pairs the mean
 of d, its 95% Student t interval, and how many pairs went each way. Verdicts: `worse` (the whole interval is on the
 worse side of 0 and the mean is past `--noise`, default 3%), `better` (likewise the other way), `within noise` (the
-interval lies inside +-noise), `unresolved` (more pairs would settle it), `one pair` (no interval). Needles and the
-KL p95 / top-1 stay `info`. It exits 1 if any metric is `worse`. Pairs must share measurement settings and topology;
+interval lies inside +-noise), `unresolved` (more pairs would settle it), `one pair` (no interval). Needles and every
+KL number stay `info`: `check` gates `kl.mean` on its absolute threshold, and a relative change between two values at
+the 1e-6 floor means nothing. It exits 1 if any metric is `worse`. Pairs must share measurement settings and topology;
 the two sides may differ in build flags and engine environment (that may be the change), each side within itself may
-not. Records without an admitted rank health probe are refused, as in `check`.
+not. A pair is exactly one boot of each side. Records without an admitted rank health probe are refused, as in
+`check`; a pair with only one side is listed and left out.
 
 `paired` is an extra view for a PR's gates table, not a replacement for `check`: the light gates still run `check`.
 

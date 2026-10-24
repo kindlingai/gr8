@@ -446,6 +446,23 @@ class Paired(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no paired runs'):
             record.paired(runs, 'tp4', 'main', 'pr')
 
+    def test_kl_is_info_even_at_the_floor(self):
+        runs = []
+        for i, (x, y) in enumerate([(1e-7, 2e-7), (1.2e-7, 2.1e-7), (0.9e-7, 1.9e-7)]):
+            runs += [prec(f'p{i}', 'main', {'kl.mean': x}), prec(f'p{i}', 'pr', {'kl.mean': y})]
+        row, _ = self.verdict(runs, key='kl.mean')
+        self.assertEqual(row[8], 'info')  # check gates KL on its absolute threshold
+
+    def test_two_boots_of_one_side_in_a_pair_are_refused(self):
+        runs = self.pairs([0.0]) + [prec('p0', 'pr', {'work.code.decode_tok_s': 40.0}, boot='pr-p0-again')]
+        with self.assertRaisesRegex(ValueError, 'one boot of each side'):
+            record.paired(runs, 'tp6', 'main', 'pr')
+
+    def test_a_lone_unhealthy_run_is_left_out_not_refused(self):
+        runs = self.pairs([0.0, 0.0]) + [prec('p9', 'main', {'work.code.decode_tok_s': 40.0}, health=SICK)]
+        _, info = record.paired(runs, 'tp6', 'main', 'pr')
+        self.assertEqual(info['unpaired'], ['p9'])
+
     def test_flags_may_differ_between_sides(self):
         runs = [prec('p0', 'main', {'m': 1.0}, flags='A'), prec('p0', 'pr', {'m': 1.0}, flags='B')]
         _, info = record.paired(runs, 'tp6', 'main', 'pr')

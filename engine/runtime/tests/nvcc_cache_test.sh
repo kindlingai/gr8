@@ -24,6 +24,22 @@ cmp -s a.o a.first && fail "an edited header gives the old object"
 printf '#pragma once\n#define V 1\n' > h.h
 "$C" g++ -O2 -c a.cpp -o a.o;            [ "$(last)" = hit ] || fail "the header back as it was is not a hit"
 cmp -s a.o a.first || fail "the header back as it was gives other bytes"
+# a header found through -I DIR (a separate argument), and one through -include FILE
+mkdir -p inc && printf '#define W 1\n' > inc/w.h && printf '#define P 1\n' > pre.h
+printf '#include "w.h"\nint g() { return W + P; }\n' > g.cpp
+"$C" g++ -O2 -I inc -include pre.h -c g.cpp -o g.o;  [ "$(last)" = miss ] || fail "-I / -include: not a miss"
+"$C" g++ -O2 -I inc -include pre.h -c g.cpp -o g.o;  [ "$(last)" = hit ] || fail "-I / -include: not a hit"
+printf '#define W 2\n' > inc/w.h
+"$C" g++ -O2 -I inc -include pre.h -c g.cpp -o g.o;  [ "$(last)" = miss ] || fail "an edited -I header hits"
+printf '#define P 2\n' > pre.h
+"$C" g++ -O2 -I inc -include pre.h -c g.cpp -o g.o;  [ "$(last)" = miss ] || fail "an edited -include file hits"
+# warnings come back on a hit
+printf 'int h() { int u; return 0; }\n' > w.cpp
+"$C" g++ -Wall -c w.cpp -o w.o 2> w1.err; "$C" g++ -Wall -c w.cpp -o w.o 2> w2.err
+[ "$(last)" = hit ] || fail "warning compile: not a hit"
+grep -q unused w1.err && cmp -s w1.err w2.err || fail "a hit does not replay the warnings"
+# the environment the compiler reads is in the key
+CPATH=inc "$C" g++ -O2 -c a.cpp -o a.o;  [ "$(last)" = miss ] || fail "a changed CPATH hits"
 # a link: the inputs are objects, so their bytes are in the key
 "$C" g++ -o m m.cpp a.o;                 [ "$(last)" = miss ] || fail "first link is not a miss"
 ./m || fail "linked binary does not run"
@@ -38,8 +54,18 @@ n=$(find "$G6_NVCC_CACHE_DIR" -type f | wc -l)
 printf 'int g( {\n' > bad.cpp
 if "$C" g++ -c bad.cpp -o bad.o 2> /dev/null; then fail "a failing compile succeeds"; fi
 [ "$(find "$G6_NVCC_CACHE_DIR" -type f | wc -l)" = "$n" ] || fail "a failing compile stored something"
-# not cacheable: no -o, or two
+# not cacheable: no -o, -x, a response file
 "$C" g++ -c a.cpp;                       [ "$(last)" = pass ] || fail "no -o is cached"
+cp a.cpp a.inl
+"$C" g++ -x c++ -c a.inl -o x.o;         [ "$(last)" = pass ] || fail "-x is cached"
+echo -O2 > rsp
+"$C" g++ @rsp -c a.cpp -o r.o;           [ "$(last)" = pass ] || fail "a response file is cached"
+# eight compiles of one key at once: one entry, the same bytes everywhere
+printf 'int k() { return 7; }\n' > k.cpp
+for j in 1 2 3 4 5 6 7 8; do "$C" g++ -O2 -c k.cpp -o k$j.o & done; wait
+for j in 2 3 4 5 6 7 8; do cmp -s k1.o k$j.o || fail "concurrent compiles of one key differ"; done
+"$C" g++ -O2 -c k.cpp -o k9.o;           [ "$(last)" = hit ] || fail "after concurrent compiles: not a hit"
+cmp -s k1.o k9.o || fail "concurrent compiles stored other bytes"
 # off: the compiler alone, nothing logged
 : > "$G6_NVCC_CACHE_LOG"
 G6_NVCC_CACHE=0 "$C" g++ -O2 -c a.cpp -o a.o

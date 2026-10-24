@@ -270,14 +270,12 @@ def paired(runs, topology, a, b, noise=0.03):
     b better, a better, verdict). verdict: 'worse' when the whole interval lies on the worse side of 0 and its mean is
     past `noise`, 'better' likewise, 'within noise' when the interval sits inside +-noise, else 'unresolved' (more pairs
     would settle it). One pair gives a delta and no interval. Pairs must agree on measurement settings and topology; build
-    flags and engine environment may differ between a and b (that may be what is under test), not within a side."""
+    flags and engine environment may differ between a and b (that may be what is under test), not within a side.
+    KL stays info here: `check` gates kl.mean on an absolute threshold with a floor, and a relative change of numbers
+    at that floor means nothing. Only pairs with both sides count; their records must pass `ineligible`."""
     runs = [r for r in runs if r['topology'] == topology and r.get('pair') is not None and r['commit'] in (a, b)]
     if a == b:
         raise ValueError('paired needs two different commits')
-    for r in runs:
-        why = ineligible(r)
-        if why:
-            raise ValueError(f'boot {r["boot"]!r} cannot be compared: {why}')
     if not runs:
         raise ValueError(f'no paired runs of {a} and {b} on {topology} (run --pair ID)')
     _same(runs, lambda r: {k: r['settings'].get(k) for k in MEASURE_KEYS}, 'measurement settings')
@@ -298,6 +296,15 @@ def paired(runs, topology, a, b, noise=0.03):
         boots = {c: {r['boot'] for r in v[c]} for c in (a, b)}
         if boots[a] & boots[b]:
             raise ValueError(f'pair {p!r}: {a} and {b} share boot {sorted(boots[a] & boots[b])}; each side is its own boot')
+        for c in (a, b):
+            if len(boots[c]) > 1:
+                raise ValueError(f'pair {p!r} has {len(boots[c])} boots of {c} ({sorted(boots[c])}); a pair is one boot '
+                                 'of each side')
+        for r in v[a] + v[b]:
+            why = ineligible(r)
+            if why:
+                raise ValueError(f'boot {r["boot"]!r} cannot be compared: {why}')
+    runs = [r for v in whole.values() for r in v[a] + v[b]]
 
     def med(rs, k):
         vals = [r['metrics'][k]['value'] for r in rs if k in r['metrics']]
@@ -327,7 +334,7 @@ def paired(runs, topology, a, b, noise=0.03):
         sign = 1 if d == HIGHER else -1 if d == LOWER else 0
         b_better = sum(1 for x in ds if sign * x > 0)
         a_better = sum(1 for x in ds if sign * x < 0)
-        if d == INFO or k.endswith('.pass') or k in ('kl.p95', 'kl.top1'):
+        if d == INFO or k.endswith('.pass') or k.startswith('kl.'):
             verdict = 'info'
         elif lo is None:
             verdict = 'one pair'
