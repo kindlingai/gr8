@@ -35,7 +35,7 @@ inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals&
 }
 
 // The head's report: `want` segments more per rank (0 = none; share_want) and the ages of the tier's coldest blocks.
-// offer = false (KV_SHARE_WHEN=idle while the engine is busy): no ages, so the node asks this group to give only for a
+// offer = false (G6_KV_SHARE_WHEN=idle while the engine is busy): no ages, so the node asks this group to give only for a
 // group starting below its floor, never for another group's growth. The resize to announce (it carries the node's
 // transaction), or nothing.
 inline std::optional<Resize> share_poll(RunPool& pool, uint32_t tier, const g6kv_tier* store, uint64_t want,

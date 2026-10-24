@@ -85,6 +85,8 @@ KEYS = {
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
     'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
+    'KV_SHARE_WHEN': ('cluster', None, 'a KV_STORE group= lease gives segments to other groups only while the engine is '
+                                       'idle (idle, default) or whenever the node asks (always) (G6_KV_SHARE_WHEN)'),
     'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
     'KV_ROWS': ('cluster', None, 'experimental: remote attention rows: the rows past SHARE_LIMIT in a rows store, read back '
                                  'as decode selects them. STORE,size=N(M|G|T)[,local=PAGES][,pool=SLOTS][,place=PAGES]'
@@ -437,6 +439,8 @@ def validate(o):
         raise OptionError(f'--kv-format int4: {model.name} has an fp8 KV build only')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
+    if o.get('KV_SHARE_WHEN') not in (None, 'idle', 'always'):
+        raise OptionError(f'--kv-share-when {o.get("KV_SHARE_WHEN")}: want idle or always')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
         raise OptionError(f'--kv-keep {o.get("KV_KEEP")}: want system, sessions or all')
     sa = o.get('KV_SYSTEM_AFTER')

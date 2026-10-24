@@ -1989,10 +1989,10 @@ int main(int argc, char** argv)
                         fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
                                 (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
                 };
-                // KV_SHARE_WHEN=idle (default): the head offers its blocks to other groups only while the engine is
+                // G6_KV_SHARE_WHEN=idle (default): the head offers its blocks to other groups only while the engine is
                 // idle, so a give's compaction never pauses a turn; always: whenever the node asks
-                const char* when = getenv("KV_SHARE_WHEN");
-                if (when && strcmp(when, "idle") && strcmp(when, "always")) die("KV_SHARE_WHEN is idle or always");
+                const char* when = getenv("G6_KV_SHARE_WHEN");
+                if (when && strcmp(when, "idle") && strcmp(when, "always")) die("G6_KV_SHARE_WHEN is idle or always");
                 const bool share_always = when && !strcmp(when, "always");
                 if (R == 0)
                     h.share = [&, share_always](bool idle) -> std::optional<g6s2::Resize> {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-24: a KV node shared by clusters (group leases, D-331 M3)
+
+- `--kv-store remote:...,group=NAME[,cap=N][,weight=N]`: the stores of one cluster form a group lease on a KV node,
+  and capacity moves between clusters by whole segments (B3, ported onto main). `engine/kvman-rs/REMOTE-TIER.md`,
+  Sharing a node.
+- Grants and gives are transactions with an id and an absolute target: a stale or repeated GROW / SHRINK is refused or
+  a no-op, a grant one rank took is held for the others, and given segments go free only once every rank gave.
+- A group opening on a full node asks the others down toward their floors and waits for them; `kvman-remote
+  --group-plan FILE` reserves planned floors. Empty segments are given at once. A give to a group of another rank
+  count strands nothing. A tier asks for room for an entry too big for it.
+- `KV_SHARE_WHEN=idle` (default) gives only while the engine is idle; `always` whenever asked.
+- Wire change: REPORT replies carry the transaction id, GROW / SHRINK take it (`E_STALE` = 8). Both sides of a node
+  must run this build.
+
 ## 2026-10-23: G6_TR3_W2ALL, the window-2 fc1 split on every MoE layer, default on at TP=4
 
 - `G6_TR3_W2ALL=1` applies the window-2 fc1 split (KS1x2, WG1) to every MoE layer at M > 1, not only the layers the k2
