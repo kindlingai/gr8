@@ -33,6 +33,10 @@
 // before a draft that could not be verified, and the verify takes the drafts that pass. The log-probabilities are the
 // same bytes on every rank (spec_len.h), so every rank chooses the same k. The verify's row count then varies 2..kmax+1
 // as a DFlash2 round's does. A demoted session's chain is completed to K before its first shared round.
+// MTP-only engine (no drafter, KStop::solo, G6_MTP_KSTOP=1 without --dflash-manifest: TP=6 / TP=3): a session that decodes
+// alone runs round_all, and the same stop applies there: its verify takes kverify of the drafts it holds (main class
+// row_class(k + 1), as the DFlash2 path's MTP rounds), its chain runs while kmore allows (kchain). Before a round of several
+// sessions, a session whose chain stopped short is chained to K, so shared rounds verify as without the stop.
 // Shared-round stop (KStop::b, G6_MTP_KSTOPB): in round_all each session verifies its own k_q <= k drafts from the same
 // log-probabilities, so the main step's width varies S..S * (K + 1); capture_all captures the widths the rule can reach.
 // Insert rule (Session::ins, insert_rule.h): the rule's tokens take the place of the reply's after+1-th token, when none
@@ -387,6 +391,7 @@ struct KStop
     double tau[4] = {0, 0, 0.2, 0.5};
     double seed3 = 0.55;              // mode 2: MTP's prior acceptance of a third draft (SpecLen::seed, 0.70 for DFlash2)
     bool log = false;
+    bool solo = false;                // mode 1 in an MTP-only engine: also a session alone in round_all (kmax <= K)
     KStopB b;                         // shared rounds (G6_MTP_KSTOPB)
 };
 // G6_DFL_REUSE (every rank, read at boot; g6m4): mode 1 = a DFlash2 session whose prefill a prefix-reuse hit cut short
@@ -416,7 +421,8 @@ public:
         }
         std::vector<int> all;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
-        { std::vector<int> evs; for (size_t k = 0; k < live.size(); ++k) evs.push_back(Step::TAIL);
+        if (ksolo(all.size()) && live.size() == 1) kchain(live[0], Step::TAIL);   // KStop::solo: the only session's chain stops early
+        else { std::vector<int> evs; for (size_t k = 0; k < live.size(); ++k) evs.push_back(Step::TAIL);
           chain(live, evs, choose(all)); } // first-step timer: post-admit chains follow the tail steps
     }
     bool active(int q) const { const St& x = st_[q]; return x.on && !x.done && (int)x.tokens.size() - x.n < x.s.n_gen; }
@@ -508,7 +514,7 @@ public:
         act.erase(std::remove_if(act.begin(), act.end(), [&](int q) { return !active(q); }), act.end());
         if (act.empty()) { cur_round_ = -1; cur_active_ = 0; return true; }
         if (act.size() == 1 && st_[act[0]].dfl) round_dfl(act[0]);
-        else { demote(); round_all(act); }
+        else { demote(); if (ks_.solo && act.size() > 1) complete(act); round_all(act); }
         cur_round_ = -1; cur_active_ = 0;
         return true;
     }
@@ -529,7 +535,10 @@ private:
         for (int q : act) k = std::min(k, st_[q].k);
         std::vector<int> kq(S2N_SLOTS, k), aq(S2N_SLOTS, -1), nd(S2N_SLOTS, 0);   // KStopB: per session; log: accepted, drafts held
         const bool xr = ks_.b.mode && ks_.b.explore && cur_round_ % ks_.b.explore == 0;
-        if (ks_.b.mode) kshared(act, k, xr, kq);
+        const bool solo = ksolo(act.size());       // KStop::solo: the session alone verifies kverify of its drafts
+        double pe = 0;
+        if (solo) kq[act[0]] = kverify(st_[act[0]], &pe);
+        else if (ks_.b.mode) kshared(act, k, xr, kq);
         using clk = std::chrono::steady_clock;                    // G6_MTP_LPLOG: the round's host ms per step kind
         const clk::time_point t0 = ks_.log ? clk::now() : clk::time_point{};
         double ms[3] = {};
@@ -543,7 +552,7 @@ private:
                 rows.push_back(Row{q, r ? x.d[r] : x.tokens[base[q]], base[q] + r, base[q] + r + 1, -1});
             add_rows(v, q, rows, x.rounds == 0 ? Step::DECODE1 : Step::ROUND); // first-step timer: per-session E2
         }
-        v.cls = row_class(K_ + 1);    // a session's own rows (K+1), as its solo step: the k1 split, so a row's bits do not depend on the batch
+        v.cls = row_class(solo ? kq[act[0]] + 1 : K_ + 1);    // a session's own rows (K+1), as its solo step: the k1 split, so a row's bits do not depend on the batch (KStop::solo: k+1, as round_dfl's MTP rounds)
         check(v);
         const std::vector<int> t = h_.run(v);
         if (ks_.log) ms[0] = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
@@ -598,15 +607,16 @@ private:
             for (int q : on) { size_t i = 0; while (i < v.sess.size() && v.sess[i] != q) ++i;
                 evs.push_back(i < v.sess.size() ? v.ev[i] : int(v.event)); }
             const clk::time_point t2 = ks_.log ? clk::now() : clk::time_point{};
-            const int kc = choose(on);
-            chain(on, evs, kc);
+            const int kc = solo && on.size() == 1 ? 0 : choose(on);
+            if (solo && on.size() == 1) kchain(on[0], evs[0]);   // KStop::solo: the chain stops where kmore says
+            else chain(on, evs, kc);
             if (ks_.log)
             {
                 const clk::time_point t3 = clk::now();
                 ms[1] = std::chrono::duration<double, std::milli>(t2 - t1).count();
                 ms[2] = std::chrono::duration<double, std::milli>(t3 - t2).count();
                 fprintf(stderr, "# kstopb_ms round %ld main %.3f draft %.3f dM %d chain %.3f nch %d cM %d round %.3f\n", cur_round_, ms[0], ms[1], dm,
-                        ms[2], on.empty() ? 0 : kc - 1, (int)on.size(), std::chrono::duration<double, std::milli>(t3 - t0).count());
+                        ms[2], on.empty() ? 0 : (solo && on.size() == 1 ? st_[on[0]].k : kc) - 1, (int)on.size(), std::chrono::duration<double, std::milli>(t3 - t0).count());
             }
         }
     }
@@ -801,6 +811,14 @@ private:
         x.k = n;
     }
     int kmax() const { return ks_.kmax ? ks_.kmax : K_; }
+    // KStop::solo: a round_all of n sessions is a solo MTP-only round (mode 1)
+    bool ksolo(size_t n) const { return ks_.solo && ks_.mode == 1 && n == 1; }
+    // KStop::solo, before a round of several sessions: a session whose chain stopped short drafts up to K (as demote)
+    void complete(const std::vector<int>& act)
+    {
+        for (int q : act)
+            if (st_[q].k < K_ && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_, st_[q].k);
+    }
     // KStop mode 1: the probability that drafts 1..j are all right, as the MTP head sees them (NaN, no lp hook: 1)
     double kprob(const St& x, int j) const
     {

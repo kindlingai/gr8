@@ -1,5 +1,5 @@
-//! src/dflash2.rs against tests/data/dflash2: a small synthetic drafter converted at TP=4 gives the checked-in manifests
-//! and packs byte for byte.
+//! src/dflash2.rs against tests/data/dflash2: a small synthetic drafter converted at TP=4, and at TP=6 in the replicated
+//! layout, gives the checked-in manifests and packs byte for byte.
 
 use g6load::dflash2::{self, Dims, St};
 use g6load::json::{self, Json};
@@ -12,7 +12,7 @@ fn config() -> Json {
     json::parse(&std::fs::read_to_string(format!("{D}/src/config.json")).unwrap()).unwrap()
 }
 
-fn same_as_python(sub: &str, ranks: &[usize], bf16: &[&str]) {
+fn same_as_python(sub: &str, nr: usize, ranks: &[usize], bf16: &[&str]) {
     let out = std::env::temp_dir().join(format!("g6load-dflash2-{sub}-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     let out_s = out.to_str().unwrap();
@@ -22,7 +22,7 @@ fn same_as_python(sub: &str, ranks: &[usize], bf16: &[&str]) {
     let want = json::parse(&std::fs::read_to_string(format!("{D}/{sub}/packs.json")).unwrap()).unwrap();
     let bf16: Vec<String> = bf16.iter().map(|s| s.to_string()).collect();
     for &r in ranks {
-        dflash2::convert_rank(&st, &cfg, &SMALL, 4, r, out_s, &bf16).unwrap();
+        dflash2::convert_rank(&st, &cfg, &SMALL, nr, r, out_s, &bf16).unwrap();
         let name = format!("dflash.r{r}.manifest.json");
         assert_eq!(std::fs::read_to_string(out.join(&name)).unwrap(),
                    std::fs::read_to_string(format!("{D}/{sub}/{name}")).unwrap(), "{sub} {name}");
@@ -35,12 +35,17 @@ fn same_as_python(sub: &str, ranks: &[usize], bf16: &[&str]) {
 
 #[test]
 fn every_rank_matches_the_python_converter() {
-    same_as_python("mxfp8", &[0, 1, 2, 3], &[]);
+    same_as_python("mxfp8", 4, &[0, 1, 2, 3], &[]);
+}
+
+#[test]
+fn replicated_tp6_matches_the_python_converter() {
+    same_as_python("mxfp8-tp6", 6, &[0, 5], &[]);
 }
 
 #[test]
 fn bf16_classes_match_the_python_converter() {
-    same_as_python("bf16-attn-sel", &[2], &["sel", "attn"]);
+    same_as_python("bf16-attn-sel", 4, &[2], &["sel", "attn"]);
 }
 
 #[test]

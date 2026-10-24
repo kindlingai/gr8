@@ -549,12 +549,18 @@ struct RoutePlan
 // grid 1, block NEXP (warp w = tokens w, w + RW, ...; M <= MMAX). logits [M][NEXP] fp32, bias [NEXP] fp32 (e_score_correction_bias).
 // Selection key = sigmoid(logit) + bias, ties -> lowest expert id. Weights = unbiased sigmoid of the
 // selected experts / their sum * 2.5 (FACTS-M0 2(c)).
+// keep / keep_dev (G6_MTP_LASTROW, rank.cuh launch_mlp_block): bit m = token m is routed; a token outside the mask takes no
+// route (no expert slot, tok_slot -1, as tokens m >= M), so the finalize gives it the shared expert only. keep_dev (device
+// word, read at launch) wins over keep; both 0 / nullptr = every token, today's plan. A routed token's selection, weights,
+// slot order (ascending expert id) and column (M <= 8: column m; above: its rank among the expert's routed tokens) do not
+// depend on the other tokens, and an mma column depends only on its own token: its K1 output bytes are the same.
 // K (template) = routed experts kept per token (G6_MOE_TOPK cut; default TOPK = the model's): the sum renormalizes over
 // the K kept, and routes k >= K carry the plan's no-route encoding (tok_slot -1), which the K1 consumers already skip.
 // K = TOPK compiles to the pre-cut source (same init loop, same unrolls): the OFF instance is SASS-identical to a5edf0a.
 constexpr int RW = NEXP / 32;   // k_router_plan warps; each lane holds RW experts in the top-k
 static_assert(NEXP % 32 == 0 && RW <= 32, "k_router_plan: one thread per expert, one taken bit per lane expert");
-template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P)
+template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P,
+                                                                                   unsigned keep = 0u, const unsigned* keep_dev = nullptr)
 {
     static_assert(K >= 1 && K <= TOPK, "k_router_plan: K outside 1..TOPK");
     __shared__ unsigned emask[NEXP];              // bit m = token m selected the expert
@@ -565,6 +571,7 @@ template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(co
     __shared__ float s_m[8][NEXP], k_m[8][NEXP];
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
     const bool dense = M > 8;
+    const unsigned on = keep_dev ? *keep_dev : keep ? keep : 0xffffffffu;
     if (M > 1) emask[t] = 0u;
     if (!dense)
     {
@@ -596,6 +603,21 @@ template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(co
     for (int m = w; m < M; m += RW)
     {
         float s[RW], key[RW];
+        if (!(on >> m & 1u))                      // the whole warp (m depends on w only): no route for token m
+        {
+            if (M == 1)
+            {
+                if (l < TOPK)
+                {
+                    P->tok_slot[0][l] = -1;
+                    P->tok_col[0][l] = 0;
+                    P->tok_w[0][l] = 0.f;
+                    P->tok_expert[0][l] = -1;
+                }
+                if (l == 0) P->n_slots = 0;
+            }
+            continue;
+        }
         #pragma unroll
         for (int i = 0; i < RW; ++i)
         {
@@ -755,6 +777,14 @@ template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(co
         const int m = i >> 3, k = i & 7;
         if constexpr (CUT)
             if (k >= K) continue;          // dropped route (G6_MOE_TOPK): tok_* stay -1 from the init above
+        if (!(on >> m & 1u))                      // G6_MTP_LASTROW: token outside the mask takes no route
+        {
+            P->tok_slot[m][k] = -1;
+            P->tok_col[m][k] = 0;
+            P->tok_w[m][k] = 0.f;
+            P->tok_expert[m][k] = -1;
+            continue;
+        }
         const int e = sel_e[m][k];
         const int r = __popc(emask[e] & ((1u << m) - 1u));      // rank of token m among the expert's tokens
         const int s2 = slot_of[e] + (dense ? r >> 3 : 0), col = dense ? (r & 7) : m;

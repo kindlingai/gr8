@@ -117,6 +117,8 @@ KEYS = {
     'ATTN_SC2_TR': ('cluster', None, 'ATTN_SC2 transpose reduction (G6_ATTN_SC2_TR)'),
     'ATTN_CTX2': ('cluster', None, 'decode attention context variant (G6_ATTN_CTX2)'),
     'ATTN_CTX3': ('cluster', None, 'decode attention context, per-batch states (G6_ATTN_CTX3)'),
+    'ATTN_CTX3_SP': ('cluster', None, 'ATTN_CTX3 slots per context partition, 64 or 128 (G6_ATTN_CTX3_SP; E1)'),
+    'ATTN_POSIDX': ('cluster', None, 'positional index at decode buckets <= 2048 (G6_ATTN_POSIDX; E1)'),
     'ATTN_SEL2': ('cluster', None, 'decode index selection by rank (G6_ATTN_SEL2)'),
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
@@ -133,6 +135,11 @@ KEYS = {
     'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
     'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
                              'needs V2_DENSE)'),
+    'PF_GEMMF32': ('cluster', None, 'prefill: the row-owner QO o_proj with an FP32 epilogue, PF_OWN=3 (G6_PF_GEMMF32)'),
+    'MTP_LASTROW': ('cluster', None, "MTP draft steps: only each session's last row through layer 78's routed experts (G6_MTP_LASTROW)"),
+    'DRAFT_HEAD2': ('cluster', None, "MTP draft head in two stages, 1, or 2 = with a check, experimental (G6_DRAFT_HEAD2)"),
+    'MTP_L2PF': ('cluster', None, 'MTP draft steps: the paced L2 prefetch, 1 draft step, 2 head waits, 3 both; needs L2PF (G6_MTP_L2PF)'),
+    'MTP_KSTOPB_WIDTHS': ('cluster', None, 'MTP_KSTOPB: the shared-round widths with captured graphs, w1,w2,... (G6_MTP_KSTOPB_WIDTHS)'),
     'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
     'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
     'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
@@ -145,7 +152,7 @@ KEYS = {
     'V2_DENSE': ('box', None, 'the exlr8 release directory whose dense/ files give every non-expert weight (no rank packs)'),
     'V2_DENSE_FORM': ('cluster', None, 'with V2_DENSE: trellis (the release\'s entries, the default) or rounded (MXFP8 / '
                                        'int4, the fallback)'),
-    'DRAFTER': ('box', None, 'TP=4: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
+    'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
     'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory, or hf:default / hf:NAME from the model release'),
@@ -349,8 +356,8 @@ def validate(o):
         raise OptionError(f'--drafter {o.get("DRAFTER")}: want https://huggingface.co/<org>/<repo>[@rev]')
     if not model.drafter and (o.get('DRAFTER') or o.get('DFLASH') == '1'):
         raise OptionError(f'--drafter, --dflash 1: {model.name} has no DFlash2 drafter')
-    if o.get('DRAFTER') and tp != '4':
-        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 only (its 8 KV heads do not split {tp} ways)')
+    if o.get('DRAFTER') and tp not in ('4', '6'):
+        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 (split) and TP=6 (replicated) only, not TP={tp}')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
     effort = o.get('DEFAULT_REASONING_EFFORT')

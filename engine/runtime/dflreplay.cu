@@ -15,7 +15,8 @@
 //                default under rejection sampling). Use the dumping run's values for the dump column to match A.
 //   --bench N    then time one rank's body GEMVs of a draft step (context fc + 6 kv, block 6 x aconv q kv o mconv gu
 //                down) for A and B as a captured graph, N replays, cold-ish (the 700 MB set does not fit the 25 MB L2)
-//   --out FILE   one TSV line per draft step: q0, accepted (dump, A, B), committed tokens, drafts and lp of A and B
+//   --out FILE   one TSV line per draft step: q0, accepted (dump, A, B), committed tokens, drafts and lp of A and B, then the
+//                lp bits of A and B (hex)
 // Printed: draft steps scored against the committed tokens; per position r = 1..7 the share of steps where A and B
 // draft the same token; accepted-length histograms; tokens per round 1 + mean(min(accepted, k)) for k = 1..7, which
 // with the verify table (ms at M = k + 1) and the drafter's step time gives committed tokens per ms; A == dump (a check of
@@ -83,7 +84,7 @@ static void run_var(Var& v, bool query, cudaStream_t st)
     for (int p = 0; p < (query ? dfl::NPH : 2); ++p)
     {
         for (Dfl& x : v.D) dfl_phase(x, p, st, query);
-        if (p < dfl::NC && (query || p == 0))
+        if (dfl_delivered(p, query))
         {
             DLoop a = v.loop;
             a.c = p; a.n16 = (int)(dfl_payload(v.D[0], p) / 16);
@@ -99,7 +100,8 @@ static DflOut out_of(Var& v, const char* name)
     std::vector<DflOut> o(NR);
     for (int r = 0; r < NR; ++r) G6RT_CK(cudaMemcpy(&o[r], v.out[r], sizeof(DflOut), cudaMemcpyDeviceToHost));
     for (int r = 1; r < NR; ++r)
-        if (memcmp(o[r].tok + 1, o[0].tok + 1, sizeof(int) * dfl::K)) die(std::string(name) + ": ranks disagree on the drafts");
+        if (memcmp(o[r].tok + 1, o[0].tok + 1, sizeof(int) * dfl::K) || memcmp(o[r].lp + 1, o[0].lp + 1, sizeof(float) * dfl::K))
+            die(std::string(name) + ": ranks disagree on the drafts or their log-probabilities");
     return o[0];
 }
 // rank 0's body GEMVs of one draft step, captured, timed over n replays -> ms per step
@@ -113,8 +115,12 @@ static double bench_var(Var& v, int n, cudaStream_t st)
     for (const DLayer& y : D.ly) bind::launch(y.kvc, st);
     for (const DLayer& y : D.ly)
     {
-        bind::launch(y.ac, st); bind::launch(y.q, st); bind::launch(y.kv, st); bind::launch(y.o, st);
-        bind::launch(y.mc, st); bind::launch(y.gu, st); bind::launch(y.down, st);
+        bind::launch(y.ac, st); bind::launch(y.q, st); bind::launch(y.kv, st);
+        if constexpr (dfl::REP) for (int k = 0; k < dfl::KS; ++k) bind::launch(y.ok[k], st);
+        else bind::launch(y.o, st);
+        bind::launch(y.mc, st); bind::launch(y.gu, st);
+        if constexpr (dfl::REP) for (int k = 0; k < dfl::KS; ++k) bind::launch(y.dk[k], st);
+        else bind::launch(y.down, st);
     }
     G6RT_CK(cudaStreamEndCapture(st, &g));
     G6RT_CK(cudaGraphInstantiate(&ge, g, 0));
@@ -215,7 +221,7 @@ int main(int argc, char** argv)
     FILE* df = fopen(dump.c_str(), "rb");
     if (!df) die("cannot open " + dump);
     FILE* of = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
-    if (of) fprintf(of, "q0\tacc_dump\tacc_a\tacc_b\tcommitted\tdrafts_a\tdrafts_b\tlp_a\tlp_b\n");
+    if (of) fprintf(of, "q0\tacc_dump\tacc_a\tacc_b\tcommitted\tdrafts_a\tdrafts_b\tlp_a\tlp_b\tlpbits_a\tlpbits_b\n");
     std::vector<Round> req;               // the request's draft steps, scored at its token record
     long n_steps = 0, n_rounds = 0, same_pos[dfl::B] = {}, same_all = 0, a_eq_dump = 0;
     long hist_d[dfl::B] = {}, hist_a[dfl::B] = {}, hist_b[dfl::B] = {};
@@ -257,6 +263,11 @@ int main(int argc, char** argv)
                     {
                         fputc('\t', of);
                         for (int r = 1; r < dfl::B; ++r) fprintf(of, "%s%.4f", r > 1 ? "," : "", o->lp[r]);
+                    }
+                    for (const DflOut* o : {&x.a, &x.b})   // the lp bits, for a byte comparison between builds (TP4 vs TP6)
+                    {
+                        fputc('\t', of);
+                        for (int r = 1; r < dfl::B; ++r) { uint32_t u; memcpy(&u, &o->lp[r], 4); fprintf(of, "%s%08x", r > 1 ? "," : "", u); }
                     }
                     fputc('\n', of);
                 }
@@ -340,6 +351,9 @@ int main(int argc, char** argv)
             s += bind::gv_bytes(D.fc);
             for (const DLayer& y : D.ly) s += bind::gv_bytes(y.kvc) + bind::gv_bytes(y.ac) + bind::gv_bytes(y.q) + bind::gv_bytes(y.kv) +
                                               bind::gv_bytes(y.o) + bind::gv_bytes(y.mc) + bind::gv_bytes(y.gu) + bind::gv_bytes(y.down);
+            if constexpr (dfl::REP)
+                for (const DLayer& y : D.ly)
+                    for (int k = 0; k < dfl::KS; ++k) s += bind::gv_bytes(y.ok[k]) + bind::gv_bytes(y.dk[k]);
         };
         add(ba, A.D[0]);
         add(bb, B.D[0]);

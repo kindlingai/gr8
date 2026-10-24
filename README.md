@@ -106,8 +106,9 @@ On every box:
     curl http://10.0.0.1:8100/v1/chat/completions -H 'Content-Type: application/json' \
       -d '{"model":"glm-5.3","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 
-For three or six boxes, build with `TP=3` or `TP=6`, pass `--tp 3` or `--tp 6` with as many peers, and leave out
-`--drafter`: the DFlash2 drafter's 8 KV heads do not split three or six ways. `BUNDLE_LIBS=1` copies cuBLAS next to the
+For three or six boxes, build with `TP=3` or `TP=6` and pass `--tp 3` or `--tp 6` with as many peers. At TP=3 leave
+out `--drafter`. At TP=6 the drafter is off unless `--drafter` comes with `--dflash 1`: then every box runs the whole
+drafter body (its 8 KV heads do not split six ways), which drafts what TP=4 drafts. `BUNDLE_LIBS=1` copies cuBLAS next to the
 engine, for boxes without the CUDA toolkit. Every box must run the same build: build on one and copy `bin/`, or build
 on each.
 

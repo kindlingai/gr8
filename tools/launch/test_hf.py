@@ -454,6 +454,8 @@ a = sys.argv[1:]
 out, r = a[a.index('--out') + 1], int(a[a.index('--ranks') + 1])
 if os.environ.get('STUB_CONVERT_FAIL'):
     sys.exit('config hidden_size = 1, this converter is written for 6144')
+if a[a.index('--nr') + 1] != os.environ.get('STUB_WANT_NR', '4'):
+    sys.exit('stub: --nr ' + a[a.index('--nr') + 1])
 open(os.path.join(out, 'args.json'), 'w').write(json.dumps(a))
 open(os.path.join(out, f'dflash.r{r}.pack'), 'wb').write(bytes(1000 + r))
 json.dump({'pack_bytes': 1000 + r}, open(os.path.join(out, f'dflash.r{r}.manifest.json'), 'w'))
@@ -497,6 +499,14 @@ class DrafterTests(unittest.TestCase):
         self.assertEqual(modelset.sha256_file(os.path.join(d.dir, 'model.safetensors')),
                          modelset.sha256_file(os.path.join(self.t, 'drafter', 'model.safetensors')))
         self.assertFalse([n for n in os.listdir(d.dir) if n.startswith('tmp.')])
+
+    def test_tp6_converts_the_replicated_layout(self):
+        d = hfsource.Drafter(self.cache, 'fakeorg/drafter', 'main', log=lambda m: None, tp=6)
+        self.assertEqual(d.out, os.path.join(d.dir, 'tp6'))
+        with mock.patch.dict(os.environ, {'STUB_WANT_NR': '6'}):
+            d.fetch_rank(5)
+        self.assertEqual(d.check(5), [])
+        self.assertEqual(sorted(os.listdir(d.out)), ['dflash.r5.manifest.json', 'dflash.r5.pack', 'rank5.COMPLETE'])
 
     def test_the_real_converter_runs(self):
         """bin/g6load dflash2 itself, on the small test drafter: it refuses the dimensions, and the error comes back."""
@@ -555,6 +565,35 @@ class DrafterTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError):
             opt.validate(opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter',
                                     'https://huggingface.co/fakeorg/drafter'], {}))
+
+    def test_the_tp6_boot(self):
+        """TP=6: MTP only unless --dflash 1; with it, the drafter is converted in the replicated layout (--nr 6)."""
+        import options as opt
+        import supervisor as S
+        from test_modelset import make_release as local_release
+        rel = local_release(os.path.join(self.t, 'local6'))
+        base = ['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--model', rel]
+        logs = []
+
+        def boot(*argv):
+            o = opt.parse([*base, *argv], {})
+            opt.validate(o)
+            return o, S.resolve_model(o, log=logs.append)
+        o, (ms, v, err) = boot()
+        self.assertEqual((err, ms.drafter), ('', None))
+        self.assertFalse(any('DFlash2' in m for m in logs), logs)                # the TP=6 default boot says nothing new
+        self.assertFalse(any(a.startswith('--dflash') for a in opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['args']))
+        o, (ms, v, err) = boot('--dflash', '1')
+        self.assertIn(f'add --drafter {hfsource.DRAFTER_URL}', err)
+        o, (ms, v, err) = boot('--drafter', 'https://huggingface.co/fakeorg/drafter', '--model-cache', self.cache)
+        self.assertEqual((err, ms.drafter), ('', None))
+        self.assertIn('--drafter at TP=6 is used with --dflash 1 only: MTP only', logs[-1])
+        o, (ms, v, err) = boot('--drafter', 'https://huggingface.co/fakeorg/drafter', '--model-cache', self.cache, '--dflash', '1')
+        self.assertEqual(err, '')
+        self.assertEqual(ms.drafter.out, os.path.join(ms.drafter.dir, 'tp6'))
+        plan = opt.engine_plan(o, rank=5, rank_dir='/r', aux_dir='/a', home='/h', epoch=1)
+        self.assertIn(os.path.join(ms.drafter.out, 'dflash.r5.pack'), plan['args'])
+        self.assertIn('--spec-adaptive', plan['args'])
 
 
 if __name__ == '__main__':

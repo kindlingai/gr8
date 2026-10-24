@@ -251,9 +251,9 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
 // cand scratch = w.so .. w.io (2 * R * T * 4 B, present for T > 32768, used by SEL32 only as its histogram) -> min(CAPG, T) keys/row.
 static constexpr int SELX_MINN=32;   // our gate: selx 1.6-2.0x SEL32 from 53K at n >= 33
 static int selx_ctx(){
-    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 0;
+    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 53248;   // default: SELX at 53248 context (v0.7)
         char* e=nullptr;errno=0;const long x=strtol(s,&e,10);
-        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = SEL32)\n",s);exit(2);}
+        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = 53248)\n",s);exit(2);}
         fprintf(stderr,"# G6_PF_SELX_CTX %ld: prefill index tiles with n >= %d and context >= %ld select with selx\n",x,SELX_MINN,x);return (int)x;}();
     return v;
 }

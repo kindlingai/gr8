@@ -10,7 +10,7 @@
 #        --model URL|DIR              the exlr8 release, https://huggingface.co/<org>/<repo>[@rev] or a local copy of
 #                                     it. The engine plans every rank's weights from its files
 #        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
-#        --drafter URL                TP=4: the DFlash2 drafter's repo, fetched and converted on each box
+#        --drafter URL                TP=4 or 6: the DFlash2 drafter's repo, fetched and converted on each box
 #        --cap 262144, --sess 4, ...  every knob in KNOBS.md, as --<knob> VALUE
 #   ./gr8 glm53 down                  stop every box of the last boot
 #   ./gr8 glm53 restart [OPTIONS]     down, then up

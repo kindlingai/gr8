@@ -300,7 +300,8 @@ int main(int argc, char** argv)
     // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
     if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
         die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except under S2; --dflash-sel 0|1; --dflash-k 1..7");
-    if (dfl && !dfl::OK_NR) die("--dflash needs a rank count that divides the drafter's 8 KV heads (TP4 build)");
+    // TP=6 runs the drafter body replicated (dflash.cuh dfl::REP); TP=3 would too, but is not built or measured for it
+    if (dfl && dfl::REP && g6nr::NR != 6) die("--dflash: TP=" + std::to_string(g6nr::NR) + " has no DFlash2 drafter (TP=4 splits it, TP=6 replicates it)");
     if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
 #if G6_MODEL_FLASH
@@ -385,11 +386,14 @@ int main(int argc, char** argv)
             for (size_t j = 0; j < t.size(); ++j) kstop.tau[j + 1] = t[j];
         }
         if (const char* e = getenv("G6_MTP_KSTOP_SEED3")) kstop.seed3 = atof(e);
-        if (kstop.mode && (!s2mode || !dfl || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 || !(kstop.seed3 > 0 && kstop.seed3 < 1) ||
-                           kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
-            die("G6_MTP_KSTOP needs --serve, --dflash-manifest and --mtp 2+; G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), "
-                "G6_MTP_KSTOP_SEED3 in (0, 1)");
+        // Without --dflash-manifest (TP=6 / TP=3, MTP only): mode 1 stops the chain of a session that decodes alone
+        // (s2_batch.h KStop::solo), with G6_MTP_KSTOP_KMAX <= --mtp; mode 2 needs the drafter choice's estimates
+        if (kstop.mode && (!s2mode || (!dfl && (kstop.mode != 1 || kstop.kmax > mtp)) || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 ||
+                           !(kstop.seed3 > 0 && kstop.seed3 < 1) || kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
+            die("G6_MTP_KSTOP needs --serve and --mtp 2+ (without --dflash-manifest: mode 1 and G6_MTP_KSTOP_KMAX <= --mtp); "
+                "G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), G6_MTP_KSTOP_SEED3 in (0, 1)");
         if (!kstop.mode) kstop.kmax = 0;
+        kstop.solo = kstop.mode == 1 && !dfl;
         // G6_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
         // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least G6_MTP_KSTOPB_KMIN (0|1, default 0).
         // G6_MTP_KSTOPB_TAU=t1[,t2[,...]] (up to 7; default 0.6,0.88) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n
@@ -430,8 +434,9 @@ int main(int argc, char** argv)
                 kstop.b.widths.push_back((int)w);
             }
         if (getenv("G6_MTP_KSTOPB_EXPLORE")) kstop.b.explore = atoi(getenv("G6_MTP_KSTOPB_EXPLORE"));
-        if (kstop.b.mode && (!s2mode || !dfl || kstop.b.explore < 0))
-            die("G6_MTP_KSTOPB needs --serve and --dflash-manifest (the draft log-probabilities); G6_MTP_KSTOPB_EXPLORE >= 0");
+        // the draft log-probabilities come from every MTP draft step (StepOut::lp), with or without the DFlash2 drafter
+        if (kstop.b.mode && (!s2mode || kstop.b.explore < 0))
+            die("G6_MTP_KSTOPB needs --serve; G6_MTP_KSTOPB_EXPLORE >= 0");
         if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
 #if G6_MODEL_FLASH
@@ -507,6 +512,14 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
         if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
     }
+    // G6_MTP_KSTOPB: a session alone in round_all (MTP only) verifies the rule's widths of one session; its first forms
+    // are within 1..mtp + 1 (draft_rows above)
+    for (int M : s2::kstopb_widths(kstop.b, 1, mtp))
+        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+    // G6_S2_ADAPT: a session alone may verify any k <= mtp, also outside limited G6_MTP_KSTOPB_WIDTHS (s2_batch.h kshared)
+    if (s2mode && s2::adapt_env())
+        for (int M = 2; M <= mtp + 1; ++M)
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
         if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
 #if G6_MODEL_FLASH
@@ -738,6 +751,11 @@ int main(int argc, char** argv)
         }
         if (!dsel_tab.parse(text, &err)) die(err);
     }
+    // G6_DFL_SEL_ALPHA=<a> (dflash.cuh k_walk; default 1): the DFlash2 selector walk scores logit + a * correction. Drafts
+    // only: the verify is unchanged. In the S2 runtime signature
+    const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
+    if (!std::isfinite(dfl_alpha)) die("G6_DFL_SEL_ALPHA: not a finite number");
+    if (dfl_alpha != 1.f && !dfl) die("G6_DFL_SEL_ALPHA needs --dflash-manifest");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -758,6 +776,15 @@ int main(int argc, char** argv)
     // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature.
     const DraftHeadI4 dhead = draft_head_i4_env();
     if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
+    // G6_MTP_LASTROW=1 (rank.cuh mtp_lastrow_env; default 0): a first-form draft step routes only each session's last
+    // row (the rows before it only write layer 78's caches). Same caches, drafts and log-probabilities. In the S2 runtime
+    // signature
+    const bool mtp_last = mtp_lastrow_env();
+    if (mtp_last && !mtp) die("G6_MTP_LASTROW=1 needs --mtp");
+    // G6_DRAFT_HEAD2=1|2 (rank.cuh draft_head2_env; default 0): the MTP draft's head in two stages (2-bit screen, exact
+    // MXFP8 rescoring of its best). Drafts only. In the S2 runtime signature
+    const int dhead2 = draft_head2_env();
+    if (dhead2 && !mtp) die("G6_DRAFT_HEAD2 needs --mtp");
     // G6_DFL_HEAD_I4=1 (dflash.cuh dfl_head_i4; default 0): the DFlash2 drafter's head reads the same INT4 records (the MTP
     // draft's copy when there is one), with G6_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
     std::string dfe;
@@ -820,6 +847,29 @@ int main(int argc, char** argv)
 #endif
     G6RT_CK(bind::init());
     G6RT_CK(l2pf::init_env());     // G6_L2PF (kernels/l2pf.cuh); unset = off
+    // G6_MTP_L2PF=1|2|3 (kernels/l2pf.cuh; rank.cuh l2pf_window, l2pf_tail; default 0; needs G6_L2PF and --mtp): 1 = the MTP
+    // draft step arms the paced L2 prefetch (layer 78's windows, its eh_proj gather wait, its MLP wait: the draft head's
+    // records); 2 = the head merge wait of the main step and of each draft step prefetches the next draft step's front
+    // (this rank's eh_proj records, x_in), at most G6_MTP_L2PF_US (60) us, ended by the head all-gather's arrival. A
+    // prefetch writes nothing, so every output byte is unchanged; no collective is added (a window only reads the peers'
+    // tails), so the ranks need not agree on it (as G6_L2PF, not in the S2 runtime signature)
+    {
+        std::string le;
+        const int v = env_choice("G6_MTP_L2PF", 3, 0, &le);
+        if (v < 0) die(le);
+        if (v && !mtp) die("G6_MTP_L2PF needs --mtp");
+        if (v && !l2pf::cfg().win) die("G6_MTP_L2PF needs G6_L2PF (its side stream, pace and window bits)");
+        l2pf::cfg().mtp = v;
+        if (const char* u = getenv("G6_MTP_L2PF_US"))
+        {
+            char* end;
+            const double x = strtod(u, &end);
+            if (end == u || *end || !(x > 0) || x > 1000) die(std::string("G6_MTP_L2PF_US=") + u + ": want us, 0 < x <= 1000");
+            l2pf::cfg().mtp_us = (float)x;
+        }
+        if (v && R == 0) fprintf(stderr, "# rank 0: G6_MTP_L2PF=%d: %s%s\n", v, v & 1 ? "draft-step windows" : "",
+                                 v & 2 ? (v & 1 ? ", head-merge tails" : "head-merge tails") : "");
+    }
     pf_prof().on = getenv("G6_PF_PROF") != nullptr;
     if (getenv("G6_DEC_PROF") && graph) die("G6_DEC_PROF needs plain launches (no --graph)");
     cudaStream_t st;
@@ -1049,6 +1099,8 @@ int main(int argc, char** argv)
             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
         }
         build_draft_head_i4(D, dhead, st);
+        build_draft_head2(D, dhead2, st);
+        D.d.route_last = mtp_last;
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
@@ -1075,6 +1127,8 @@ int main(int argc, char** argv)
             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
                         dhead.tpc, dhead.ks);
         if (dfl_body_i4_on) dfl_body_i4(DF, st);
+        if (dfl_alpha != 1.f && !DF.sel) die("G6_DFL_SEL_ALPHA needs the selector walk");
+        DF.sel_alpha = dfl_alpha;
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
     }
@@ -1163,6 +1217,7 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
     if (mtp && MP) for (int M = 1; M <= MX; ++M) prepare(D.d, M, st);   // the draft prefill's MX-row chunks
 #endif
+    if (mtp && (l2pf::cfg().mtp & 2)) l2pf_set_front(D);   // before any capture: the head-merge tails read it
     G6RT_CK(cudaStreamSynchronize(st));
     boot("layers prepared");
     // Offline main-step dumps, compatible with m4sim after merging the rank logits.
@@ -2045,7 +2100,7 @@ int main(int argc, char** argv)
                         di.step = ++s2_dstep;
                         di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
                         *in_f = di;
-                        fabf.enqueue_step(di.step, dfl_fill_sizes());
+                        dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
                         G6RT_CK(cudaGraphLaunch(exec_f[2], st));
                         G6RT_CK(cudaStreamSynchronize(st));
                         g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
@@ -2071,7 +2126,7 @@ int main(int argc, char** argv)
                         const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
                         for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
                         *in_f = di;
-                        fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                        dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
                         ds = r.phase ? st_par[di.query ? 1 : 0] : st;
                         if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
                         if (r.phase) tl.par_pre(ds); else tl.pre(ds);
@@ -2092,6 +2147,23 @@ int main(int argc, char** argv)
                     return o;
                 };
             }
+            else if (kstop.mode || kstop.b.mode || kstop.log)
+            {   // MTP only (TP=6 / TP=3): the confidence stops of round_all (KStop::solo, KStopB) and their log (s2/service.h)
+                h.kstop = kstop;
+                if (R == 0 && kstop.mode)
+                    fprintf(stderr, "# s2 MTP confidence stop (MTP only): mode %d, a session alone verifies 1..%d drafts (tau %s,%s,%s)\n",
+                            kstop.mode, kstop.kmax, std::to_string(kstop.tau[1]).c_str(), std::to_string(kstop.tau[2]).c_str(),
+                            std::to_string(kstop.tau[3]).c_str());
+                if (R == 0 && kstop.b.mode)
+                {
+                    std::string t;
+                    for (int S = 1; S <= s2sess; ++S)
+                        t += (S > 1 ? " " : "") + std::to_string(S) + ":" + std::to_string(kstop.b.tau[S][1]).substr(0, 5) + "," +
+                             std::to_string(kstop.b.tau[S][2]).substr(0, 5) + "," + std::to_string(kstop.b.tau[S][3]).substr(0, 5);
+                    fprintf(stderr, "# s2 MTP shared-round stop (MTP only): each session verifies %d..%d drafts, tau by sessions %s\n",
+                            kstop.b.kmin, mtp, t.c_str());
+                }
+            }
             g6s2::BootstrapConfig bc;
             bc.scheduler = sc;
             bc.rank = (unsigned)R;
@@ -2100,6 +2172,8 @@ int main(int argc, char** argv)
             bc.head_ip = cfg.ips[0];
             bc.directory = s2dir;
             bc.port = (uint16_t)s2port;
+            if (g6_attn_ctx_sp() || g6_attn_posidx())   // round 10 E1 attention flags (attn.cu), read once before the bindings
+                fprintf(stderr, "# rank %d: decode attention E1: G6_ATTN_CTX3_SP %d G6_ATTN_POSIDX %d\n", R, g6_attn_ctx_sp(), g6_attn_posidx());
             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
@@ -2112,11 +2186,13 @@ int main(int argc, char** argv)
                 (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
+                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
                 (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
-                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "");
-
+                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
+                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -2135,7 +2211,7 @@ int main(int argc, char** argv)
             // the weights are final once the graphs exist: seal them before the barrier, which absorbs the time it takes
             try
             {
-                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step);
+                nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step, kstop.solo ? kstop.kmax : 0);
                 m.dfl_tap = tap;
                 wcheck::seal(R);
                 int dev = 0;
@@ -2435,7 +2511,7 @@ int main(int argc, char** argv)
                 di.step = ++dstep;
                 di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
                 *in_f = di;
-                fabf.enqueue_step(di.step, dfl_fill_sizes());
+                dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_f[2], st));
                 else dfl_fill_step(DF, st);
                 G6RT_CK(cudaStreamSynchronize(st));
@@ -2484,7 +2560,7 @@ int main(int argc, char** argv)
         {
             auto rf = [&](const DflIn& di, int s, double& ms) {
                 *in_f = di;
-                fabf.enqueue_step(di.step, dfl_sizes(DF, di.query));
+                dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
                 const auto t0 = std::chrono::steady_clock::now();
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], st));
                 else dfl_step(DF, st, di.query);
