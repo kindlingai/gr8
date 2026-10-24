@@ -1,9 +1,11 @@
 //! The exlr8 v2 fetch helper for ./gr8 glm53 up --model https://... (tools/launch/hfsource.py and
 //! tools/launch/fetch_ranks.py keep the HTTP; this plans and checks). JSON on stdout.
 //!
-//!   g6load fetch-plan --slices DIR --tp N --rank R (--manifest FILE | --widths 2,3,4) [--layers 3-40,78]
-//!       the byte ranges of each width file rank R loads: {"units", "bytes", "files": [{"name", "ranges": [[off, n]]}]}
-//!   g6load verify --slices DIR --v2 DIR --tp N --rank R (--manifest FILE | --widths ...) [--layers ...]
+//!   g6load fetch-plan --slices DIR --tp N --rank R (--manifest FILE | --widths 2,3,4) [--layers 3-40,78] [--layout FILE]
+//!       the byte ranges of each width file rank R loads: {"units", "bytes", "files": [{"name", "ranges": [[off, n]]}]}.
+//!       With --layout (bin/g6layout, src/layout.rs) the halves the layout gives rank R, which reads every rank's
+//!       index slices at TP N.
+//!   g6load verify --slices DIR --v2 DIR --tp N --rank R (--manifest FILE | --widths ...) [--layers ...] [--layout FILE]
 //!       each of those halves' xxhash64 against the index slices: {"checked", "bad": [{"file", "offset", "nbytes",
 //!       "layer", "expert", "half", "proj"}]}. Exit 0 when every half matches, 3 when one does not, 1 on an error.
 //!
@@ -16,6 +18,7 @@
 
 use g6load::dflash2;
 use g6load::fetch::{self, Choice};
+use g6load::layout::Layout;
 use std::collections::BTreeMap;
 
 fn main() {
@@ -62,7 +65,8 @@ fn run() -> Result<i32, String> {
         _ => return Err("give one of --manifest and --widths".into()),
     };
     let ls = opt.get("--layers").map(|s| layers(s)).transpose()?;
-    let units = fetch::units(need("--slices")?, num("--tp")?, num("--rank")?, &choice, ls.as_deref())?;
+    let layout = opt.get("--layout").map(|p| Layout::read(p)).transpose()?;
+    let units = fetch::units(need("--slices")?, num("--tp")?, num("--rank")?, &choice, ls.as_deref(), layout.as_ref())?;
     match cmd.as_str() {
         "fetch-plan" => {
             let mut files: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
