@@ -237,7 +237,7 @@ class DonorTests(unittest.TestCase):
         # the group is the borrowing cluster's, never this serve's by default
         with self.assertRaisesRegex(opt.OptionError, 'FLASH_KV_GROUP'):
             self.flash_plan('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6')
-        with self.assertRaisesRegex(opt.OptionError, 'borrow-idle needs'):
+        with self.assertRaisesRegex(opt.OptionError, 'borrow-idle needs FLASH_KV_DONATE_GIB'):
             self.flash_plan('--flash-cap-policy', 'borrow-idle')
         with self.assertRaisesRegex(opt.OptionError, 'want protected'):
             self.flash_plan('--flash-cap-policy', 'lend')
@@ -246,7 +246,25 @@ class DonorTests(unittest.TestCase):
         self.assertEqual((k['FLASH_KV_DONATE_GIB'], k['FLASH_KV_GROWTH_GIB'], k['FLASH_KV_GROUP']),
                          ('20', '6', 'gr8-glm53'))
 
-    def donor(self, knobs, model='glm53f'):
+    def test_borrow_idle_puts_the_pool_in_chunks_and_lends_after_the_idle_time(self):
+        give = ('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6', '--flash-kv-group', 'gr8-glm53')
+        o = opt.parse(['--no-config', '--gr8-model', 'glm53f', '--tp', '2', *give], {})
+        self.assertNotIn('G6_FLASH_KV_CHUNKS=1', opt.engine_plan(o)['env'])   # protected: the pool as before
+        for idle, ms in ((None, '60000'), ('5', '5000')):
+            argv = ['--flash-cap-policy', 'borrow-idle'] + (['--flash-kv-idle-s', idle] if idle else [])
+            o = opt.parse(['--no-config', '--gr8-model', 'glm53f', '--tp', '2', *give, *argv], {})
+            env = opt.engine_plan(o)['env']
+            self.assertIn('G6_FLASH_KV_CHUNKS=1', env)
+            self.assertIn('G6_FLASH_KV_LEND_MS=' + ms, env)
+        with self.assertRaisesRegex(opt.OptionError, 'FLASH_KV_IDLE_S=0'):
+            self.flash_plan(*give, '--flash-cap-policy', 'borrow-idle', '--flash-kv-idle-s', '0')
+        # the engine gets this box's ledger
+        s = supervisor('--gr8-model', 'glm53f', '--tp', '2', members=MEMBERS[:2])
+        env = s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'borrow-idle'}})
+        self.assertEqual(env['G6_FLASH_KV_LEDGER'], os.path.join(s.home, 'out', 'kv', 'ledger'))
+        self.assertNotIn('G6_FLASH_KV_LEDGER', s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'protected'}}))
+
+    def donor(self, knobs, model='glm53f', gpu=None):
         flash = model == 'glm53f'
         s = supervisor('--gr8-model', model, '--tp', '2' if flash else '4', members=MEMBERS[:2] if flash else MEMBERS)
         cfg = os.path.join(s.home, 'empty.env')
@@ -254,6 +272,10 @@ class DonorTests(unittest.TestCase):
         env = {'G6_CLUSTER': cfg, 'KV_BIN': STUB_KV, 'MENTAT': 'none', 'KV_PORT': str(free_port()),
                'KV_BIND': '127.0.0.1', 'KV_MIN_FREE_GB': '0'}
         s.kv_port = int(env['KV_PORT'])
+        if gpu is not None:   # what the engine wrote at boot under borrow-idle
+            os.makedirs(os.path.join(s.home, 'out', 'kv'), exist_ok=True)
+            with open(os.path.join(s.home, 'out', 'kv', 'ledger.gpu'), 'w') as f:
+                f.write(f'{gpu}\n')
         with mock.patch.dict(os.environ, env), mock.patch.object(S, 'log') as logged:
             s.donate(knobs)
         return s, ' '.join(str(c.args[0]) for c in logged.call_args_list)
@@ -281,6 +303,23 @@ class DonorTests(unittest.TestCase):
             s.shutdown(0, '')
         self.assertFalse(s.donor)
         self.assertFalse(S.kvnode.running(os.path.join(s.home, 'out', 'kv')))
+
+    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine/kvman-rs)')
+    def test_borrow_idle_books_the_gpu_chunks_in_the_ledger(self):
+        g = 5 * (1 << 30) + 12345
+        s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0', 'FLASH_KV_GROUP': 'gr8-full',
+                              'FLASH_CAP_POLICY': 'borrow-idle'}, gpu=g)
+        try:
+            self.assertTrue(s.donor, said)
+            ledger = os.path.join(s.home, 'out', 'kv', 'ledger')
+            book = subprocess.run([S.ledger_bin(opt.REPO), ledger, 'show'], capture_output=True, text=True).stdout
+            self.assertIn(f'"total":{(1 << 30) + g},"gpu":{g},"node":{1 << 30}', book)
+            argv = S.kvnode.stats('127.0.0.1', s.kv_port)['argv']
+            self.assertEqual(argv[argv.index('--gb') + 1], '6')   # the node may grow into the lent chunks
+            self.assertIn(f'{g} bytes of GPU KV chunks', said)
+        finally:
+            s.locked = True
+            s.shutdown(0, '')
 
     def test_no_budget_or_another_model_starts_nothing(self):
         s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '100000'})

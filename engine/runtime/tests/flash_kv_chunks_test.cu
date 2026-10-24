@@ -11,6 +11,11 @@
 //      and moves them back; the book balances after each;
 //   5. a crash after begin, between the sync and released, and between released and commit (a child process,
 //      G6_FLASH_KV_CRASH_AT), in both directions: the book balances, no byte is counted on both sides, and it recovers.
+//   6. FLASH_CAP_POLICY=borrow-idle (s2/flash_lend.h) with the ledger booked as the launcher books it (the GPU's
+//      lendable chunks): after a session, idle, the lend takes the map to the kept chunk; a short request is admitted
+//      at once, a long one waits for a recall (timed); then a fresh session on the recalled chunks gives the same bits
+//      as the plain bindings. A recall the node does not release in time leaves the request waiting: the map stays at
+//      the kept chunk, and the rule still refuses it, so no step reaches an offline page.
 // Build and run: TEST=flash_kv_chunks_test scripts/c1_tests.sh <bin_dir>, or by hand (scripts/c1_tests.sh has the line)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
 #include <cstdint>
@@ -32,6 +37,8 @@
 #include "../../g6nr.h"
 #include "../../model_geom.h"
 #include "../flash_kv.h"
+#include "../s2/flash_lend.h"
+#include <chrono>
 
 #define CK(x)                                                                                                         \
     do {                                                                                                              \
@@ -398,6 +405,71 @@ int main(int argc, char** argv)
     b = book(path);
     report(e && map.online == 3 && !b.pend() && b.gpu() == map.bytes_at(3) && b.balanced(),
            "a grow the node does not release in time is aborted: " + map.err);
+    // 6. borrow-idle: lend while idle, recall before a request that needs the chunks
+    {
+        map.ledger.clear();
+        map.wait_ms = 10000;
+        CKI(map.resize(CHUNKS, st));
+        g6s2::FlashLend f;
+        f.idle_ms = 50; f.keep = 1; f.chunk_rows = (uint64_t)cpt; f.chunks = CHUNKS;
+        const uint64_t lendable = map.bytes_at(CHUNKS) - map.bytes_at(f.keep);
+        const std::string lp = std::string(dir) + "/ledger-borrow";
+        ledger_init(lp, lendable + (64ull << 20), lendable, 64ull << 20);   // as the supervisor: node n, gpu lendable
+        map.ledger = lp;
+        for (int k = 0; k < NB; ++k)
+        {
+            CKI(g6_attn_bind_reset(&plain.b[k], st));
+            CKI(g6_attn_bind_reset(&chunked.b[k], st));
+        }
+        bool same = decode(plain, chunked, ly, in, 0, cpt + 300, st, why);   // a session, then it ends: idle
+        const auto t0 = g6s2::FlashLend::Clock::now();
+        const bool early = !f.poll(true, t0) && !f.poll(true, t0 + std::chrono::milliseconds(49));
+        const std::optional<uint32_t> lend = f.poll(true, t0 + std::chrono::milliseconds(50));
+        CKI(map.resize(lend ? *lend : CHUNKS, st));
+        Bk b = book(lp);
+        report(early && lend == std::optional<uint32_t>(1) && map.online == 1 && map.backed() == map.bytes_at(1) &&
+                   b.gpu() == 0 && b.node() == (64ull << 20) + lendable && !b.pend() && b.balanced(),
+               "idle 50 ms: the lend takes the map to 1 chunk, " + std::to_string(lendable) + " bytes to the node");
+        const uint64_t worst = 3ull * cpt + 500;   // a request that may reach 3 chunks and 500 rows: needs 4
+        report(f.recall(1000, map.online) == 0 && f.recall(worst, map.online) == 4,
+               "a short request is admitted on the kept chunk; a long one waits for a recall to 4 chunks");
+        double recall_ms = 0;
+        {
+            FakeNode node(lp);
+            const auto r0 = std::chrono::steady_clock::now();
+            CKI(map.resize(f.recall(worst, map.online), st));
+            recall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+        }
+        b = book(lp);
+        const bool back = map.online == 4 && f.recall(worst, map.online) == 0 && b.node() == (64ull << 20) + lendable -
+                          (map.bytes_at(4) - map.bytes_at(1)) && !b.pend() && b.balanced() && zero_pages(chunked, cp, 4 * cp);
+        char ms[32];
+        snprintf(ms, sizeof ms, "%.1f", recall_ms);
+        report(back, std::string("the recall to 4 chunks took ") + ms + " ms (node released at once); the request is admitted");
+        for (int k = 0; k < NB; ++k)
+        {
+            CKI(g6_attn_bind_reset(&plain.b[k], st));
+            CKI(g6_attn_bind_reset(&chunked.b[k], st));
+        }
+        same = same && decode(plain, chunked, ly, in, 0, (int)worst, st, why);
+        report(same, std::string("idle lend -> request -> recall -> decode to ") + std::to_string(worst) +
+                         " tokens: same bits as G6_FLASH_KV_CHUNKS=0" + (same ? "" : " (differs: " + why + ")"));
+        // a recall the node does not release in time
+        CKI(map.resize(1, st));
+        map.wait_ms = 200;
+        const auto r1 = std::chrono::steady_clock::now();
+        const int e6 = map.resize(f.recall(worst, map.online), st);
+        const double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r1).count();
+        b = book(lp);
+        snprintf(ms, sizeof ms, "%.0f", waited);
+        report(e6 && map.online == 1 && map.backed() == map.bytes_at(1) && map.tokens() < worst &&
+                   f.recall(worst, map.online) == 4 && !b.pend() && b.balanced(),
+               std::string("a recall the node does not release in ") + ms + " ms: 1 chunk online, the request still waits (" +
+                   map.err + ")");
+        map.wait_ms = 10000;
+        map.ledger.clear();
+        CKI(map.resize(CHUNKS, st));
+    }
     // 5. crashes: a child process ends at each point; the parent reads the book and recovers
     const char* points[] = {"begun", "synced", "released"};
     for (int d = 0; d < 2; ++d)

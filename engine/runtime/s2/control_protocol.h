@@ -37,7 +37,7 @@ struct Decoder {
     void end(){require(i==b.size(),"trailing control metadata");}
 };
 inline std::vector<uint8_t> encode(const Notice& n){Encoder e(Tag::Notice);e.notice(n);return e.b;}
-inline std::vector<uint8_t> encode(const Ack& a){Encoder e(Tag::Ack);e.notice(a.notice);e.u64(a.rank);e.u64(a.state_hash);return e.b;}
+inline std::vector<uint8_t> encode(const Ack& a){Encoder e(Tag::Ack);e.notice(a.notice);e.u64(a.rank);e.u64(a.state_hash);e.u64(a.room);return e.b;}
 struct EventCommit { Notice notice; Commit commit; };
 inline void match(const EventCommit& e){
     require(e.notice.epoch==e.commit.epoch && e.notice.event==e.commit.event && e.notice.boundary==e.commit.boundary,"commit/notice mismatch");
@@ -55,7 +55,7 @@ inline std::vector<uint8_t> encode(const EventCommit& x){
     return e.b;
 }
 inline Notice decode_notice(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Notice,"expected notice");auto n=d.notice();d.end();return n;}
-inline Ack decode_ack(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Ack,"expected ACK");Ack a;a.notice=d.notice();a.rank=d.u32();a.state_hash=d.u64();d.end();return a;}
+inline Ack decode_ack(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Ack,"expected ACK");Ack a;a.notice=d.notice();a.rank=d.u32();a.state_hash=d.u64();a.room=d.u32();d.end();return a;}
 inline EventCommit decode_commit(const std::vector<uint8_t>& b){
     Decoder d(b);require(d.tag==Tag::Commit,"expected commit");EventCommit e;e.notice=d.notice();auto&c=e.commit;
     c.epoch=e.notice.epoch;c.event=e.notice.event;c.boundary=e.notice.boundary;c.before_hash=d.u64();

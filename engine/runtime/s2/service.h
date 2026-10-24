@@ -4,6 +4,7 @@
 #include "bootstrap.h"
 #include "control_channel.h"
 #include "dispatch.h"
+#include "flash_lend.h"
 #include "pool.h"
 #include <algorithm>
 #include <chrono>
@@ -59,6 +60,11 @@ struct NativeHooks {
     // Resize commit (share_apply with the tier drain)
     std::function<std::optional<Resize>(bool idle)> share;
     std::function<void(const Resize&)> resize;
+    // optional, G6_FLASH_KV_CHUNKS: flash_room = this rank's Flash KV chunks online (its ACKs carry it, Ack::room);
+    // flash = the head's borrow-idle rule (s2/flash_lend.h; chunk_rows 0 = no gate, idle_ms 0 = never lend). Its lends
+    // and recalls are Resize events on FLASH_KV_TIER, so they need the resize hook
+    std::function<uint32_t()> flash_room;
+    FlashLend flash;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
@@ -104,6 +110,11 @@ class Service {
     // head: a Resize announced and not yet applied on this rank (no second report until then: it would ask again for
     // segments already granted)
     std::atomic<bool> resizing_{false};
+    // head, borrow-idle: the chunks the FIFO head waits for (0 = none), when its first recall went out, the last
+    // request the wait line named
+    uint32_t recall_ = 0;
+    std::chrono::steady_clock::time_point recall_t0_{};
+    uint64_t recall_for_ = UINT64_MAX;
     const long share_ms_ = ::getenv("G6_S2_SHARE_MS") ? std::max(1L, std::atol(::getenv("G6_S2_SHARE_MS"))) : 1000;
     // G6_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
     // boundary it read and the future boundary it chose), one "commit" line when that notice lands on each rank, and one
@@ -226,7 +237,23 @@ class Service {
                             fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
                                     (unsigned long long)worst, why.c_str());
                 }
-                if (fit->why == Stall::None) {
+                // borrow-idle: a request whose worst case passes the chunks every rank has online waits for a recall
+                const uint32_t short_of = fit->why == Stall::None && native_.flash.chunk_rows
+                                              ? native_.flash.recall(worst, leader_->agreed_room()) : 0;
+                if (short_of) {
+                    if (recall_for_ != request->id) {
+                        recall_for_ = request->id; recall_t0_ = std::chrono::steady_clock::now();
+                        fprintf(stderr, "# s2 flash kv: request %llu (%llu rows) waits for a recall to %u chunks (%u online)\n",
+                                (unsigned long long)request->id, (unsigned long long)worst, short_of, leader_->agreed_room());
+                    }
+                    recall_ = short_of;
+                } else if (fit->why == Stall::None && recall_for_ == request->id) {
+                    fprintf(stderr, "# s2 flash kv: request %llu admitted %lld ms after its recall began\n",
+                            (unsigned long long)request->id, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - recall_t0_).count());
+                    recall_for_ = UINT64_MAX;
+                }
+                if (fit->why == Stall::None && !short_of) {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
@@ -266,6 +293,11 @@ class Service {
         // FIFO head there now. Its commit holds again or releases (no grant, or nothing left to chain), so the chain
         // ends within limit() admissions.
         if (hold) { const auto next = commands_.at(queue_.front()->id); event(next, n.boundary); }
+        // the FIFO head waits for lent chunks: recall them (every rank grows at the commit), then it is tried again
+        if (recall_ && !resizing_.load()) {
+            Command c; c.epoch = c_.scheduler.epoch; c.resize = Resize{FLASH_KV_TIER, recall_, 0, 0};
+            recall_ = 0; resizing_.store(true); event(c);
+        }
     }
     void controller() {
         uint64_t status_revision = UINT64_MAX;
@@ -282,6 +314,15 @@ class Service {
                     event(c); changed = true;
                 }
             }
+            // borrow-idle: lend the chunks above flash.keep once the engine has been idle flash.idle_ms
+            if (native_.flash.chunk_rows && !resizing_.load())
+                if (const auto n = native_.flash.poll(progress_.resident.load() == 0 && queue_.size() == 0 &&
+                                                      progress_.retiring.load() == 0, std::chrono::steady_clock::now())) {
+                    fprintf(stderr, "# s2 flash kv: idle, lending down to %u chunks\n", *n);
+                    resizing_.store(true);
+                    Command c; c.epoch = c_.scheduler.epoch; c.resize = Resize{FLASH_KV_TIER, *n, 0, 0};
+                    event(c); changed = true;
+                }
             while (auto command = ingress_.next()) {
                 changed = true;
                 if (command->admit) {
@@ -386,6 +427,7 @@ public:
                 bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
         require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
         require(!native_.share || bool(native_.resize), "a share report needs the resize hook");
+        require(!native_.flash.chunk_rows || bool(native_.resize), "borrow-idle needs the resize hook");
         DriverHooks h;
         h.resize = native_.resize;
         h.bind = [&](const Grant& g) {
@@ -470,6 +512,7 @@ public:
             worker_ = std::make_unique<WorkerChannel>(c_.scheduler.epoch,c_.rank,*links_.links[0]); endpoint_ = worker_.get();
             worker_->on_quit = [this] { atomic_file(c_.directory + "/quit", ""); };
         }
+        endpoint_->room = native_.flash_room;
     }
     // Blocking compute loop, with persistent control + abort/quit monitor threads.
     // Caller must use the runtime's all-rank failure path if this throws.

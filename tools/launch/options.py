@@ -104,8 +104,12 @@ KEYS = {
                                         'boot (no default: not measured yet)'),
     'FLASH_KV_GROUP': ('box', None, 'with FLASH_KV_DONATE_GIB: the mentat group the KV node joins, the cluster that '
                                    'borrows from it (e.g. the GLM-5.3 serve\'s), not this serve\'s. No default'),
-    'FLASH_CAP_POLICY': ('cluster', None, "protected (default): the configured CAP's memory is never lent. borrow-idle "
-                                         'is refused until the Flash KV pool comes in chunks'),
+    'FLASH_CAP_POLICY': ('cluster', None, "protected (default): the configured CAP's memory is never lent. borrow-idle: "
+                                         'with FLASH_KV_DONATE_GIB, the Flash KV pool in chunks (G6_FLASH_KV_CHUNKS=1) '
+                                         'lends all but one chunk to the KV node once idle FLASH_KV_IDLE_S, and a '
+                                         'request that needs them waits for their recall'),
+    'FLASH_KV_IDLE_S': ('cluster', None, 'with FLASH_CAP_POLICY=borrow-idle: idle seconds before a lend (default 60, '
+                                        'not measured)'),
     'PF_OWN': ('cluster', None, 'prefill attention ownership'),
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),

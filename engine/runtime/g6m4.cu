@@ -2008,10 +2008,50 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
             // G6_FLASH_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
             // online, on every rank at the commit (flash_kv.h; with G6_FLASH_KV_LEDGER the bytes move through the box's
-            // host ledger). Under FLASH_CAP_POLICY=protected (the default) nothing announces one
+            // host ledger). The head announces them under FLASH_CAP_POLICY=borrow-idle (G6_FLASH_KV_LEND_MS > 0, s2/flash_lend.h):
+            // a lend down to G6_FLASH_KV_IDLE_CHUNKS once idle that long, a recall before a request that needs more. Every
+            // rank's ACK carries its chunks online, and the head admits only within the least of them
             if (m.fkv.pages)
             {
                 if (const char* l = getenv("G6_FLASH_KV_LEDGER")) for (Model* x : {&m, &D.d}) x->fkv.ledger = l;
+                auto env_count = [](const char* n, long dflt) {
+                    const char* e = getenv(n);
+                    if (!e) return dflt;
+                    char* end = nullptr;
+                    const long v = strtol(e, &end, 10);
+                    if (!*e || *end || v < 0) die(std::string(n) + "=" + e + ": want a whole number >= 0");
+                    return v;
+                };
+                const long lend_ms = env_count("G6_FLASH_KV_LEND_MS", 0), keep = env_count("G6_FLASH_KV_IDLE_CHUNKS", 1);
+                if (keep < 1) die("G6_FLASH_KV_IDLE_CHUNKS: at least 1");
+                h.flash_room = [&] {
+                    uint32_t n = UINT32_MAX;
+                    for (Model* x : {&m, &D.d}) if (x->fkv.pages) n = std::min(n, x->fkv.online);
+                    return n;
+                };
+                h.flash.idle_ms = lend_ms;
+                h.flash.keep = (uint32_t)std::min<long>(keep, m.fkv.chunks);
+                h.flash.chunk_rows = (uint64_t)m.fkv.chunk_pages * g6kv::PAGE;
+                h.flash.chunks = m.fkv.chunks;
+                // the bytes this rank may lend (every chunk above keep, all models): the launcher books them as the GPU's
+                // in the host ledger (G6_FLASH_KV_LEDGER.gpu, one line), so a lend has them to give
+                if (lend_ms && !m.fkv.ledger.empty())
+                {
+                    uint64_t lendable = 0;
+                    for (Model* x : {&m, &D.d})
+                        if (x->fkv.pages) lendable += x->fkv.bytes_at(x->fkv.chunks) - x->fkv.bytes_at(h.flash.keep);
+                    const std::string gp = m.fkv.ledger + ".gpu", tmp = gp + ".tmp";
+                    if (FILE* f = fopen(tmp.c_str(), "w"))
+                    {
+                        fprintf(f, "%llu\n", (unsigned long long)lendable);
+                        if (fclose(f) || rename(tmp.c_str(), gp.c_str()))
+                            fprintf(stderr, "# rank %d: flash kv: could not write %s\n", R, gp.c_str());
+                    }
+                    else fprintf(stderr, "# rank %d: flash kv: could not write %s\n", R, gp.c_str());
+                    fprintf(stderr, "# rank %d: flash kv: borrow-idle, %u of %u chunks lent after %ld ms idle, %llu bytes "
+                                    "lendable\n", R, m.fkv.chunks - h.flash.keep, m.fkv.chunks, lend_ms,
+                            (unsigned long long)lendable);
+                }
                 auto other = h.resize;
                 h.resize = [&, other](const g6s2::Resize& r) {
                     if (r.tier != g6s2::FLASH_KV_TIER) { if (other) other(r); return; }

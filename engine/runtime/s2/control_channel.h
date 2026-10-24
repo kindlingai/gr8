@@ -29,7 +29,10 @@ protected:
         commit_=e.commit;gate_.commit(e.notice);
     }
     virtual void send_ack(const Ack&)=0;
+    uint32_t agreed_room_=UINT32_MAX; // head: the least room of the last event's ACKs
 public:
+    // optional, set before the first event: this rank's room for its ACKs (Ack::room), read on the compute thread
+    std::function<uint32_t()> room;
     EventEndpoint(uint64_t epoch,unsigned rank):gate_(epoch,rank){}
     virtual ~EventEndpoint()=default;
     virtual void fail() {
@@ -41,7 +44,7 @@ public:
     template<class Digest> std::optional<Commit> boundary(uint64_t b,Digest&& digest) {
         try {
             if(!gate_.before_work(b))return {};
-            auto a=gate_.arrive(b,digest());send_ack(a);gate_.wait_commit();
+            auto a=gate_.arrive(b,digest(),room?room():UINT32_MAX);send_ack(a);gate_.wait_commit();
             std::lock_guard<std::mutex> l(mu_);require(commit_.has_value(),"missing commit payload");return commit_;
         }catch(...){fail();throw;}
     }
@@ -145,6 +148,7 @@ public:
                 Ack a;{std::lock_guard<std::mutex> l(mu_);a=*acks_[i];acks_[i].reset();}
                 proof.ack(a);
             }
+            agreed_room_=proof.room();
             EventCommit e{n,make_commit(proof.agreed_hash())};match(e);
             require(e.commit.before_hash==proof.agreed_hash(),"commit not based on all-rank state");
             send_all(encode(e));
@@ -152,6 +156,8 @@ public:
             std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return !notice_||failed_;});require(!failed_,"event apply failed");
         }catch(...){fail();throw;}
     }
+    // inside make_commit: the least room every rank's ACK of this event reported (UINT32_MAX: no rank has a chunk map)
+    uint32_t agreed_room() const {return agreed_room_;}
     void sync(uint64_t seq) override {
         try {
             for(unsigned i=0;i<peers_.size();++i)await(i,[&]{return synced_[i]>=seq;});

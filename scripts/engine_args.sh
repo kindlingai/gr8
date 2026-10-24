@@ -62,14 +62,19 @@ flash_defaults() {
 # ./gr8 kv up --lazy-lock node once the serve has booted. FLASH_KV_GROWTH_GIB is what the serve may still allocate after
 # boot; it has no default because it is not measured yet. FLASH_KV_GROUP is the mentat group the node serves (the cluster
 # that borrows from it, not this serve's), also without a default. FLASH_CAP_POLICY=protected: the configured CAP's memory is
-# never lent (borrow-idle, lending it while idle, needs the GPU pool in chunks, which the engine does not have yet).
+# never lent. borrow-idle (needs a donation): the KV pool in chunks (G6_FLASH_KV_CHUNKS=1), every chunk but one lent to
+# the node once the serve has been idle FLASH_KV_IDLE_S (default 60), recalled before a request that needs it is
+# admitted (the request waits for the recall; s2/flash_lend.h).
 num_ok() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 flash_donor_defaults() {
   FLASH_KV_DONATE_GIB=${FLASH_KV_DONATE_GIB:-0}; FLASH_CAP_POLICY=${FLASH_CAP_POLICY:-protected}
   num_ok "$FLASH_KV_DONATE_GIB" || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB: want GiB" >&2; return 2; }
   case $FLASH_CAP_POLICY in
     protected) ;;
-    borrow-idle) echo "engine_defaults: FLASH_CAP_POLICY=borrow-idle needs the Flash KV pool in chunks (not built yet); use protected" >&2; return 2 ;;
+    borrow-idle)
+      [ "$FLASH_KV_DONATE_GIB" = 0 ] && { echo "engine_defaults: FLASH_CAP_POLICY=borrow-idle needs FLASH_KV_DONATE_GIB > 0 (a KV node to lend to)" >&2; return 2; }
+      FLASH_KV_IDLE_S=${FLASH_KV_IDLE_S:-60}
+      [[ $FLASH_KV_IDLE_S =~ ^[0-9]+$ ]] && [ "$FLASH_KV_IDLE_S" -ge 1 ] || { echo "engine_defaults: FLASH_KV_IDLE_S=$FLASH_KV_IDLE_S: want whole seconds >= 1" >&2; return 2; } ;;
     *) echo "engine_defaults: FLASH_CAP_POLICY=$FLASH_CAP_POLICY: want protected or borrow-idle" >&2; return 2 ;;
   esac
   [ "$FLASH_KV_DONATE_GIB" = 0 ] && return 0
@@ -127,6 +132,10 @@ G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_F
 G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
 G6_PF_TIMES=1"
   if [ "$TP" = 4 ]; then ENGINE_ENV="$ENGINE_ENV G6_PF_STAGE_ASYNC=1"; else ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"; fi
+  # FLASH_CAP_POLICY=borrow-idle: the KV pool in chunks, lent once idle (the supervisor adds G6_FLASH_KV_LEDGER, the box's)
+  if [ "${FLASH_CAP_POLICY:-protected}" = borrow-idle ]; then
+    ENGINE_ENV="$ENGINE_ENV G6_FLASH_KV_CHUNKS=1 G6_FLASH_KV_LEND_MS=$((${FLASH_KV_IDLE_S:-60} * 1000))"
+  fi
   ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
 }
 

@@ -648,7 +648,15 @@ class Supervisor:
         lib = os.path.join(self.home, 'bin', 'lib')
         if os.path.isdir(lib):        # cuBLAS from build.sh BUNDLE_LIBS=1, at any TP
             env['LD_LIBRARY_PATH'] = lib
+        if self.borrow_idle(plan.get('knobs') or {}):
+            # this box's host ledger (donate() creates it); the engine writes the bytes it may lend next to it (.gpu)
+            out = kvnode.out_dir(kvnode.parse(['--g6-home', self.home], dict(os.environ)))
+            os.makedirs(out, exist_ok=True)
+            env['G6_FLASH_KV_LEDGER'] = os.path.join(out, 'ledger')
         return env
+
+    def borrow_idle(self, knobs):
+        return models.of(self.o).name == 'glm53f' and knobs.get('FLASH_CAP_POLICY') == 'borrow-idle'
 
     # ---- after the handshake --------------------------------------------------------------------------------------
     def front_bin(self):
@@ -774,6 +782,11 @@ class Supervisor:
         out = kvnode.out_dir(ko)
         os.makedirs(out, exist_ok=True)
         ledger = os.path.join(out, 'ledger')
+        # FLASH_CAP_POLICY=borrow-idle: the GPU's lendable KV chunks (the engine wrote their bytes at boot) are booked as
+        # the GPU's, and the node may grow into them once lent
+        gpu = gpu_lendable(ledger) if self.borrow_idle(knobs) else 0
+        if self.borrow_idle(knobs) and not gpu:
+            log(f'KV donation: no {ledger}.gpu from the engine; it lends no GPU chunks')
         lb = ledger_bin(self.home)
         try:
             if not lb:
@@ -781,8 +794,9 @@ class Supervisor:
             # a transfer left pending by a node or rank that died with its memory: its bytes go to free
             subprocess.run([lb, ledger, 'recover', '--stale-s', '0'], capture_output=True, text=True)
             n = str(gib << 30)
-            for argv in ([lb, ledger, 'init', '--total', n, '--node', n],
-                         [sys.executable, kvnode.HERE, 'up', '--g6-home', self.home, '--gb', str(gib), '--lazy-lock',
+            for argv in ([lb, ledger, 'init', '--total', str((gib << 30) + gpu), '--node', n, '--gpu', str(gpu)],
+                         [sys.executable, kvnode.HERE, 'up', '--g6-home', self.home, '--gb', str(gib + (gpu >> 30)),
+                          '--lazy-lock',
                           '--ledger', ledger, '--group', knobs['FLASH_KV_GROUP']]):
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
                 if p.returncode:
@@ -793,7 +807,7 @@ class Supervisor:
             return
         self.donor = True
         log(f'KV donation: a KV node beside the serve for group {knobs["FLASH_KV_GROUP"]}, {gib} GiB, locked lease '
-            f'by lease (ledger {ledger})')
+            f'by lease (ledger {ledger})' + (f', and {gpu} bytes of GPU KV chunks lent while idle' if gpu else ''))
 
     def start_front(self, plan):
         o = self.o
@@ -952,6 +966,16 @@ class Supervisor:
             self.set_state('stopped')
         for s in self.servers:
             s.shutdown()
+
+
+def gpu_lendable(ledger):
+    """The bytes of KV chunks the Flash engine may lend (it writes LEDGER.gpu at boot under borrow-idle), or 0."""
+    try:
+        with open(ledger + '.gpu') as f:
+            v = f.read().strip()
+    except OSError:
+        return 0
+    return int(v) if v.isdigit() else 0
 
 
 def ledger_bin(home):

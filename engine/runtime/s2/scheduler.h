@@ -18,8 +18,8 @@ inline void require(bool ok, const char* what) { if (!ok) throw std::runtime_err
 constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
 // The control link's version: the frame magic is "G6S2E" + this digit (control_protocol.h) and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
-// 6 adds Commit::hold. 7 adds the Resize event (Commit::resize).
-constexpr unsigned CONTROL_VERSION = 7;
+// 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
+constexpr unsigned CONTROL_VERSION = 9;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first

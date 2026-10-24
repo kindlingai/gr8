@@ -1,6 +1,23 @@
 # Changelog
 
 
+## 2026-10-24: `FLASH_CAP_POLICY=borrow-idle` lends the idle Flash KV chunks to the KV node (D-331 M7 part B-2)
+
+- `FLASH_CAP_POLICY=borrow-idle` (with `FLASH_KV_DONATE_GIB`; default `protected`, unchanged) puts the Flash KV pool
+  in chunks (`G6_FLASH_KV_CHUNKS=1`). Once the serve has been idle `FLASH_KV_IDLE_S` (default 60, not measured), the
+  head lends every chunk but `G6_FLASH_KV_IDLE_CHUNKS` (1) to the node beside it: one Resize event on
+  `FLASH_KV_TIER`, so every rank applies it at the same commit. A request whose worst case needs more waits for a
+  recall (a Resize up to the chunks it needs) before its admission: the admission/TTFT contract changes for it.
+- Every rank's event ACK carries its chunks online (`Ack::room`, CONTROL_VERSION 9; 8 is the fail-soft store's), and
+  the head admits within the least of them, so a recall the node does not release in time on one box holds the
+  request back instead of running it on offline pages (`engine/runtime/s2/flash_lend.h`).
+- The engine writes its lendable bytes to `LEDGER.gpu` at boot; the supervisor books them as the GPU's in the host
+  ledger and sizes the node's arena to take them.
+- `scripts/c1_tests.sh` builds `libg6kvman.a` first (cargo on PATH) and skips with the reason when it is missing or
+  older than the crate's sources.
+- Tested on the dev box only (`flash_lend_test`; `flash_kv_chunks_test` section 6: idle lend, recall, same bits as
+  `G6_FLASH_KV_CHUNKS=0`, a recall that times out). Not measured on the boxes.
+
 ## 2026-10-24: the Flash KV caches in chunks (`G6_FLASH_KV_CHUNKS`, D-331 M7 part B-1)
 
 - `G6_FLASH_KV_CHUNKS=1` (Flash build; default 0 = one cudaMalloc per binding, unchanged): each DSA binding's MLA and
