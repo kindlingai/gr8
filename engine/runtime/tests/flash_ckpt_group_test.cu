@@ -251,11 +251,128 @@ int main(int argc, char** argv) {
         CHECK(h0 == 0 && h1 == K && f.segments() == 3);
     }
 
+    // 7. D-331 M8 Flash grow: the grant lands BEFORE the capture that would drop. The head asks once, one entry ahead
+    // (share_want: less than an average entry left), while the engine is busy (no ages); the node has no free segment,
+    // so it asks an idle group (old blocks) to give. That group gives; the Flash head's next report asks for nothing
+    // new (its counters did not change), and the node grants the room it asked for anyway, so the next capture fits
+    // without a drop. Before, the node granted only on a report that asked, so the given segments sat free until
+    // the capture dropped an entry and the head asked again (box run 10-24: a give at 11:37:06, the drop at ~11:37:18,
+    // the grow at 11:37:28).
+    {
+        constexpr int K = 3;   // 4-page prompts; the 2-segment floor holds 2
+        const FlashGroup g7{"fckg-g-" + tag, 1, 0, 0, 1000};
+        FlashCheckpoints c(v, spec, "fckg-g0-" + tag, 2 * sg, "test compat", &g7);
+        CHECK(c.segments() == 2 && 2 * blocks(4) <= c.blocks() && 3 * blocks(4) > c.blocks());
+        // an idle group holding every segment left, its blocks old
+        g6kv_tier* idle = nullptr;
+        require(g6kv_tier_open_group(spec.c_str(), ("fckg-i-" + tag).c_str(), ("fckg-i-" + tag).c_str(), 1, 0, sg, 0, 1000,
+                                     v.page_bytes(), &idle) == 0, g6kv_tier_error());
+        g6kv_report ri{};
+        CHECK(g6kv_store_report(idle, 0, nullptr, 0, &ri) == 0);
+        const uint64_t left = ri.unclaimed;
+        uint64_t ib = 0;
+        if (left) {
+            CHECK(g6kv_store_report(idle, left, nullptr, 0, &ri) == 0 && ri.grant == left);
+            CHECK(g6kv_store_grow(idle, 1 + left, ri.txn, &ib) == 0);
+        }
+        const std::vector<uint64_t> old(8, 600000);
+        CHECK(g6kv_store_report(idle, 0, old.data(), old.size(), &ri) == 0 && ri.unclaimed == 0);
+        std::vector<std::vector<std::vector<uint8_t>>> want(K);
+        uint64_t gens[K] = {};
+        const auto cap = [&](int i) {
+            const auto prompt = toks(4 * 64 + 100, 70 + i);
+            d.fill(70 + i);
+            want[i] = d.snap();
+            gens[i] = c.capture(4 * 64, 0, std::vector<int>(prompt.begin(), prompt.begin() + 4 * 64 + 1), {}, st);
+            CHECK(gens[i]);
+        };
+        cap(0); cap(1);
+        CHECK(c.index().dropped == 0 && c.index().size() == 2);
+        // the head, busy: it asks one entry ahead, the node asks the idle group to give
+        auto q = c.share_ask(false);
+        CHECK(q.first > 0 && q.second.empty());
+        CHECK(!c.share_report(FLASH_CKPT_TIER, q.first, q.second));
+        CHECK(g6kv_store_report(idle, 0, old.data(), old.size(), &ri) == 0 && ri.give > 0 && ri.txn);
+        CHECK(g6kv_store_shrink(idle, 1 + left - ri.give, ri.txn, &ib) == 0);
+        // the head's next report asks for nothing new; the node grants what the give made for it
+        q = c.share_ask(false);
+        CHECK(q.first == 0);
+        const auto gr = c.share_report(FLASH_CKPT_TIER, q.first, q.second);
+        printf("ask once, idle group gave %llu: next report %s\n", (unsigned long long)ri.give,
+               gr ? ("granted to " + std::to_string(gr->segs) + " segments").c_str() : "got nothing (the grant waits for a drop)");
+        CHECK(gr && gr->segs > 2);   // fails when the node grants only on a report that asks
+        if (gr) CHECK(c.apply(*gr));
+        // the capture that would have dropped the least recently used entry fits
+        cap(2);
+        printf("third capture: %zu entries, %llu dropped\n", c.index().size(), (unsigned long long)c.index().dropped);
+        CHECK(c.index().dropped == 0 && c.index().size() == K);
+        for (int i = 0; i < K; ++i) {
+            d.poison();
+            if (c.index().find(gens[i])) { c.restore(gens[i], 0, st); CHECK(same(d, want[i], 4)); }
+        }
+        g6kv_tier_free(idle);
+    }
+
+    // 8. the same when a give left the store full (box run 10-24, p3 -> p4: Flash gave back to 2 segments, 5 entries
+    // and 95 blocks free, and p4's first capture dropped an entry before the head asked). No capture since the last
+    // report, less than an average entry free: an idle head asks nothing (an idle group never takes room), a busy one
+    // (a request resident) asks one entry ahead, the idle group gives, and the next capture fits with no drop.
+    {
+        constexpr int K = 3;
+        const FlashGroup g8{"fckg-h-" + tag, 1, 0, 0, 1000};
+        FlashCheckpoints c(v, spec, "fckg-h0-" + tag, 2 * sg, "test compat", &g8);
+        g6kv_tier* idle = nullptr;
+        require(g6kv_tier_open_group(spec.c_str(), ("fckg-j-" + tag).c_str(), ("fckg-j-" + tag).c_str(), 1, 0, sg, 0, 1000,
+                                     v.page_bytes(), &idle) == 0, g6kv_tier_error());
+        // it takes every segment left (section 7's leases close as they go)
+        g6kv_report ri{};
+        uint64_t isegs = 1, ib = 0;
+        const std::vector<uint64_t> old(8, 600000);
+        for (int i = 0; i < 40; ++i) {
+            CHECK(g6kv_store_report(idle, 0, old.data(), old.size(), &ri) == 0);
+            if (!ri.unclaimed) break;
+            CHECK(g6kv_store_report(idle, ri.unclaimed, old.data(), old.size(), &ri) == 0);
+            if (ri.grant) { CHECK(g6kv_store_grow(idle, isegs + ri.grant, ri.txn, &ib) == 0); isegs += ri.grant; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        CHECK(ri.unclaimed == 0 && isegs > 1);
+        uint64_t gens[K] = {};
+        std::vector<std::vector<std::vector<uint8_t>>> want(K);
+        const auto cap = [&](int i) {
+            const auto prompt = toks(4 * 64 + 100, 80 + i);
+            d.fill(80 + i);
+            want[i] = d.snap();
+            gens[i] = c.capture(4 * 64, 0, std::vector<int>(prompt.begin(), prompt.begin() + 4 * 64 + 1), {}, st);
+            CHECK(gens[i]);
+        };
+        cap(0); cap(1);
+        c.share_ask(false);   // a report the node could not serve: the store is as a give leaves it, full, no capture since
+        CHECK(c.share_ask(true, false).first == 0);   // idle: nothing
+        auto q = c.share_ask(false, true);            // busy: one entry ahead
+        printf("store left full, no capture since: a busy head asks %llu\n", (unsigned long long)q.first);
+        CHECK(q.first > 0);   // fails when only a capture since the last report makes the head ask
+        CHECK(!c.share_report(FLASH_CKPT_TIER, q.first, q.second));
+        CHECK(g6kv_store_report(idle, 0, old.data(), old.size(), &ri) == 0 && ri.give > 0 && ri.txn);
+        CHECK(g6kv_store_shrink(idle, isegs - ri.give, ri.txn, &ib) == 0);
+        q = c.share_ask(false, true);
+        const auto gr = c.share_report(FLASH_CKPT_TIER, q.first, q.second);
+        CHECK(gr && gr->segs > 2);
+        if (gr) CHECK(c.apply(*gr));
+        cap(2);
+        printf("capture after the grant: %zu entries, %llu dropped\n", c.index().size(), (unsigned long long)c.index().dropped);
+        CHECK(c.index().dropped == 0 && c.index().size() == K);
+        for (int i = 0; i < K; ++i) {
+            d.poison();
+            if (c.index().find(gens[i])) { c.restore(gens[i], 0, st); CHECK(same(d, want[i], 4)); }
+        }
+        g6kv_tier_free(idle);
+    }
+
     g6kv_tier_free(b);
     a[0].reset(); a[1].reset();
     CK(cudaStreamDestroy(st));
     for (auto& [p, n] : d.all()) cudaFree(p);
     printf("flash_ckpt_group: %s (ask before a drop, grant, grow, oversize fits, give with ages, LRU drop + pack, restores "
-           "bit for bit after moves, floor, refused transaction, cap 0 grows a cycling lease, a floor sized for the cycle)\n", fails ? "FAIL" : "PASS");
+           "bit for bit after moves, floor, refused transaction, cap 0 grows a cycling lease, a floor sized for the cycle, a grant before the drop, a busy store a give left full asks)\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

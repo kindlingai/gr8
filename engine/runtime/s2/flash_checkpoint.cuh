@@ -217,12 +217,13 @@ public:
     uint64_t segments() const { return g6kv_store_segs(t_); }
     // the head's report, in two halves so the index lock is not held over the node's round trip. ask (index locked):
     // the segments to ask for (s2/kv_share.h share_want, from the counters since the last report) and, when the head
-    // offers (G6_KV_SHARE_WHEN), what giving would drop (FlashIndex::coldest)
-    std::pair<uint64_t, std::vector<uint64_t>> share_ask(bool offer, size_t most = 8) {
+    // offers (G6_KV_SHARE_WHEN), what giving would drop (FlashIndex::coldest). busy: the engine has a request resident
+    // or queued (share_want: it asks one entry ahead even with no capture since)
+    std::pair<uint64_t, std::vector<uint64_t>> share_ask(bool offer, bool busy = false, size_t most = 8) {
         const uint64_t per = g6kv_store_seg_blocks(t_);
         if (!per) throw std::runtime_error("Flash checkpoint: the store is not a group lease");
         const g6kv_tier_totals now = index_.totals();
-        const uint64_t want = share_want(seen_, now, per);
+        const uint64_t want = share_want(seen_, now, per, busy);
         seen_ = now;
         return {want, offer ? index_.coldest(per, most) : std::vector<uint64_t>{}};
     }

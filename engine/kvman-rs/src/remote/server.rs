@@ -167,6 +167,11 @@ struct Group {
     // segments a rank more than it asked that a give made for it left over (taken with its next grant, so the give's
     // rounding to the giver's rank count strands nothing)
     bonus: u64,
+    // segments a rank this group asked for that the node asked another group to give (owed_at: when): granted at the
+    // group's next reports even when they ask for nothing more (its head's want counts only what changed since its last
+    // report), until granted or grant_ttl
+    owed: u64,
+    owed_at: Option<Instant>,
     stalled: bool,
     calm_until: Option<Instant>,
     ages: Vec<u64>,
@@ -730,7 +735,7 @@ impl Shared {
                     let ages: Vec<String> = g.ages.iter().map(u64::to_string).collect();
                     format!(
                         "{{\"name\":\"{}\",\"nr\":{},\"block\":{},\"floor\":{},\"cap\":{},\"weight\":{},\"segs\":{{{}}},\
-                         \"boot\":{},\"txn\":{},\"grant\":{},\"give\":{},\"retired\":{},\"bonus\":{},\"stalled\":{},\
+                         \"boot\":{},\"txn\":{},\"grant\":{},\"give\":{},\"retired\":{},\"bonus\":{},\"owed\":{},\"stalled\":{},\
                          \"demand\":{},\"ages_ms\":[{}],\"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
                         json_escape(n),
                         g.nr,
@@ -745,6 +750,7 @@ impl Shared {
                         g.txn.as_ref().filter(|t| !t.grow).map_or(-1, |t| t.target as i64),
                         g.retired.len(),
                         g.bonus,
+                        g.owed,
                         g.stalled,
                         g.demand,
                         ages.join(","),
@@ -1280,6 +1286,8 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
                         last_txn: 0,
                         retired: Vec::new(),
                         bonus: 0,
+                        owed: 0,
+                        owed_at: None,
                         stalled: false,
                         calm_until: None,
                         ages: Vec::new(),
@@ -1336,6 +1344,7 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
     let mine = g.members.get(rank).map_or(g.floor, |m| m.segs);
     let nr = g.nr as u64;
     let (mut grant, mut give, mut txn) = (0, 0, 0);
+    let owed = if g.owed_at.is_some_and(|t| now.duration_since(t) < sh.share.grant_ttl) { g.owed } else { 0 };
     // (segments short, of segments needed, with these unclaimed left)
     let mut short = None;
     if let Some(t) = &mut g.txn {
@@ -1348,17 +1357,20 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
                 give = mine.saturating_sub(t.target);
             }
         }
-    } else if demand > 0 && g.complete() {
+    } else if g.complete() && demand.max(owed) > 0 {
         let room = g.cap.saturating_sub(g.segs());
-        let want = demand.min(room);
+        let want = demand.max(owed).min(room);
         grant = (unclaimed / nr).min((want + g.bonus).min(room));
         if grant > 0 {
             g.bonus = 0;
+            g.owed = 0;
+            g.owed_at = None;
             g.granted += grant;
             let target = g.segs() + grant;
             txn = State::open_txn(g, true, target, grant, now, true);
         }
-        if want > grant {
+        // only a new ask asks another group to give: a report on what is owed waits for the give already asked
+        if want > grant && demand > 0 {
             let need = (want - grant) * nr;
             let left = unclaimed - grant * nr;
             if need > left {
@@ -1371,7 +1383,10 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
         // segment on each of its ranks, it takes with its next grant
         let freed = st.ask(name, k, now, &sh.share, false);
         if freed > 0 {
-            st.groups.get_mut(name).expect("reported").bonus = (left + freed).saturating_sub(need) / nr;
+            let g = st.groups.get_mut(name).expect("reported");
+            g.bonus = (left + freed).saturating_sub(need) / nr;
+            g.owed = need.div_ceil(nr);
+            g.owed_at = Some(now);
         }
     }
     Ok((grant, give, st.unclaimed(seg), txn))
@@ -1607,6 +1622,8 @@ mod tests {
             last_txn: 0,
             retired: Vec::new(),
             bonus: 0,
+            owed: 0,
+            owed_at: None,
             stalled: false,
             calm_until: None,
             ages: age.into_iter().collect(),

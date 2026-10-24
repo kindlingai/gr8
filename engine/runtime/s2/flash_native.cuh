@@ -246,7 +246,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         if (bc.rank == 0)
             h.share = [&, always](bool idle) -> std::optional<Resize> {
                 std::pair<uint64_t, std::vector<uint64_t>> a;
-                { std::lock_guard<std::mutex> l(ck_mu); a = ck->share_ask(always || idle); }
+                { std::lock_guard<std::mutex> l(ck_mu); a = ck->share_ask(always || idle, !idle); }
                 return ck->share_report(FLASH_CKPT_TIER, a.first, a.second);
             };
     }

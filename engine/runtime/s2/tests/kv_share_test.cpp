@@ -161,6 +161,10 @@ int main(int argc, char** argv)
         CHECK(share_want(l, n, p) == 0);                    // room for another of that size
         l = n; n.free_slots = 100;
         CHECK(share_want(l, n, p) == 0);                    // low but no spill since the last report: an idle tier asks nothing
+        CHECK(share_want(l, n, p, true) == 2);              // the same while busy: a capture may come, ask one entry (512) ahead
+        n.free_slots = 400;
+        CHECK(share_want(l, n, p, true) == 0);              // busy with room for another entry: nothing
+        n.free_slots = 100;
         n.full = 1; n.dropped_pages = 400;
         CHECK(share_want(l, n, p) == 2);                    // it filled since the last report: room for the 400 pages it dropped
         l = n; n.oversize = 1; n.oversize_last = 1500;

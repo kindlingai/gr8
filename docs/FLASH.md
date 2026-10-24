@@ -110,7 +110,9 @@ digest the ranks compare.
 `group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental, D-331 M8 (c)): the lease is a
 member of group `G` on the KV node, the way a full model's `--kv-store group=` tier is, so the two models share the
 node's memory. It starts at `size=`; the head reports to the node every `G6_S2_SHARE_MS` and asks for segments when
-captures drop entries, an entry does not fit at all, or the next capture would drop one, and offers what giving would
+captures drop entries, an entry does not fit at all, or the next capture would drop one (after a capture, or at any
+report while a request is resident or queued; the node holds the room an ask made another group give and grants it at
+the next report, so the grow lands before the capture that would drop), and offers what giving would
 drop (the least recently used checkpoints' ages) only while idle (`KV_SHARE_WHEN=idle`, default; `always`). A grant
 or give is a Resize event every rank applies at the same commit: a grow adds blocks; a shrink drops the least recently
 used checkpoints until the rest fit, copies the ones above the new end down, then gives the top segments back. The log

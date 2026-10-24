@@ -16,10 +16,12 @@ namespace g6s2 {
 // - an entry too big for the whole tier was offered since (oversize): room for it beside what the tier holds;
 // - the tier filled since (it evicted to make room): the pages it pushed out (dropped, or moved to the next tier);
 // - it took a spill since and the blocks left free are fewer than its entries hold on average, so the next spill of
-//   that size would evict: ask BEFORE the tier is full, so the grant lands before an entry drops.
-// At least one segment when any of these holds. A tier that took no spill asks for nothing, so an idle group never
-// takes room from a busy one. The node grants up to the group's cap.
-inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals& now, uint64_t per) {
+//   that size would evict: ask BEFORE the tier is full, so the grant lands before an entry drops. busy (the engine
+//   has a request resident or queued; the Flash checkpoint store passes it): the same with no spill since, so a store
+//   a give left full (a shrink drops entries until the rest fit) asks before its next capture drops one, not after.
+// At least one segment when any of these holds. An idle tier that took no spill asks for nothing, so an idle group
+// never takes room from a busy one. The node grants up to the group's cap.
+inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals& now, uint64_t per, bool busy = false) {
     if (per == 0) return 0;
     const auto segs = [per](uint64_t blocks) { return std::max<uint64_t>(1, (blocks + per - 1) / per); };
     uint64_t want = 0;
@@ -27,7 +29,7 @@ inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals&
         want = std::max(want, segs(now.oversize_last - now.free_slots));
     if (now.full > last.full)
         want = std::max(want, segs(now.dropped_pages - last.dropped_pages + now.moved_out_pages - last.moved_out_pages));
-    else if (now.spilled_pages > last.spilled_pages && now.entries > 0) {
+    else if ((now.spilled_pages > last.spilled_pages || busy) && now.entries > 0) {
         const uint64_t avg = (now.slots - now.free_slots) / now.entries;
         if (now.free_slots < avg) want = std::max(want, segs(avg - now.free_slots));
     }

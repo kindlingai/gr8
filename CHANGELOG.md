@@ -1,6 +1,31 @@
 # Changelog
 
 
+## 2026-10-24: a group's lease grows before the capture that would drop, not after it (D-331 M8 Flash grow)
+
+- kvman-remote REPORT: when a group's ask makes the node ask another group to give, the node holds that room for the
+  asker and grants it at the asker's next report, even one that asks for nothing more (until granted or `grant_ttl`,
+  30 s). The node's stats show it as `owed`. Before, the node granted only on a report that asked. A head asks once,
+  for what changed since its last report (s2/kv_share.h `share_want`, one entry before the store is full), so the
+  given segments sat free until the store dropped an entry and asked again. On the box (M8.3 re-run, 10-24) the full
+  model gave at 11:37:06Z, Flash's 6th capture dropped entry 1 at about 11:37:18Z, and Flash grew at 11:37:28Z: the
+  next lap's first request missed. Both the Flash checkpoint store and the full model's pool tier report this way, so
+  both get the grant one entry ahead. No new knob.
+- The Flash checkpoint store's head also asks one entry ahead while the engine is busy (a request resident or queued)
+  with no capture since its last report (s2/kv_share.h `share_want` busy, `FlashCheckpoints::share_ask`). A give leaves
+  the store full (a shrink drops entries until the rest fit): on the box Flash gave back to 2 segments in p3 (5
+  entries, 95 blocks free) and p4's first capture dropped an entry before the head asked, so p4 missed 3. An idle
+  store still asks nothing, so an idle group never takes room. The full model's pool tier is unchanged here.
+- Not taken: a shorter `G6_S2_SHARE_MS` (more reports, each still asking 0 after the first, so still no grant), and
+  a reserve that waits for a grant before it drops (every rank must grow at the same Resize commit, so a wait inside
+  a capture would need a cross-rank step in the middle of a prefill).
+- Tests: `engine/kvman-rs/tests/share.rs` `an_ask_that_made_a_give_is_granted_without_asking_again`, and
+  `engine/runtime/tests/flash_ckpt_group_test.cu` section 7 (a Flash lease asks once, an idle group gives, the next
+  report is granted, and the capture that would drop fits with 0 dropped), section 8 (a store a give left full: an
+  idle head asks 0, a busy one asks, the idle group gives, the next capture drops nothing) and
+  `engine/runtime/s2/tests/kv_share_test.cpp` (share_want busy). Each fails before its change and passes after. Not
+  measured on a box.
+
 ## 2026-10-24: Flash checkpoints on a group lease: a cycle bigger than the lease restores nothing (D-331 M8 defect A)
 
 - M8 E(c) on the box kept 18 Flash checkpoints and restored 0. That was eviction, not a lookup bug. `size=1G` with 1 GiB

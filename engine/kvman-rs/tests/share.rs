@@ -468,3 +468,30 @@ fn no_cap_grows_past_the_floor() {
     let r = a[0].report(9, &[]).unwrap();
     assert_eq!(r.grant, 3, "16 segments on the node, 2 ranks at 5");
 }
+
+// D-331 M8 Flash grow: a group that asked once (its head asks ahead, one entry before the tier is full) and made the
+// node ask another group to give is granted that room at its next report, even when that report asks for nothing more
+// (the head's want counts only what changed since its last report). Before, the given segments sat free until the
+// asker's tier dropped an entry and asked again
+#[test]
+fn an_ask_that_made_a_give_is_granted_without_asking_again() {
+    let addr = node(10, 1_000);
+    let a = cluster(&addr, "a", 2, 100_000, 1, 8);
+    let r = a[0].report(3, &[]).unwrap();
+    grow_all(&a, 4, r.txn);
+    let b = cluster(&addr, "b", 2, 100_000, 1, 8);
+    assert_eq!(unclaimed(&addr), 0);
+    // a is idle with old blocks; b (busy, no ages) asks once: none free, so the node asks a to give one a rank
+    a[0].report(0, &[600_000]).unwrap();
+    assert_eq!(b[0].report(1, &[]).unwrap().grant, 0);
+    let r = a[0].report(0, &[600_000]).unwrap();
+    assert_eq!(r.give, 1);
+    shrink_all(&a, 3, r.txn);
+    // b's next report asks for nothing: the room the give made for it is granted
+    let r = b[0].report(0, &[]).unwrap();
+    assert_eq!(r.grant, 1, "the give made for b's ask");
+    grow_all(&b, 2, r.txn);
+    // granted once: a later report with no demand takes nothing more, and a is not asked again
+    assert_eq!(b[0].report(0, &[]).unwrap().grant, 0);
+    assert_eq!(a[0].report(0, &[600_000]).unwrap().give, 0);
+}
