@@ -397,7 +397,10 @@ public:
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
     // contexts and source rows are read from S2In at launch. Call before the first launch / before connecting.
-    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}) {
+    // cp_rows (G6_CP_STEP_ROWS, cp_rows.h; 0 = off): at a bucket whose steps run the CP block (s2_cp_bucket) no main step
+    // is wider than cp_rows (Driver::step caps those rounds), so those widths are not captured; a launch of one would
+    // fail as any uncaptured key does.
+    void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}, int cp_rows = 0) {
         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
         require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
@@ -416,7 +419,7 @@ public:
         size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0,&total));
         const bool on_main = c_.main.s2on, on_draft = c_.draft.d.s2on;
         c_.main.s2on = c_.draft.d.s2on = true; fence();
-        size_t keys = 0, graphs = 0;
+        size_t keys = 0, graphs = 0, cp_skipped = 0;
         // one synthetic step: ns sessions of rows each (first form: one session of M rows; chain: M sessions of one row)
         auto one = [&](bool draft, bool chain, int M, int k, int cls) {
             auto& model = draft ? c_.draft.d : c_.main;
@@ -440,7 +443,10 @@ public:
             graphs_.emplace(key,std::move(g));
         };
         for (int k = 0; k < nbk; ++k) {
-            for (const auto& mc : mains) one(false,false,mc.first,k,mc.second);
+            for (const auto& mc : mains) {
+                if (cp_rows && mc.first > cp_rows && g6rt::s2_cp_bucket(c_.main,k)) { ++cp_skipped; continue; }
+                one(false,false,mc.first,k,mc.second);
+            }
             for (int M : drafts) one(true,false,M,k,s2::row_class(M));
             for (int M : chains) one(true,true,M,k,s2::row_class(M));
         }
@@ -451,6 +457,9 @@ public:
                 keys,graphs,nbk,mains.size(),drafts.size(),chains.size(),N,K,chunk,
                 std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(),
                 (double(free0)-double(free1))/(1024.0*1024.0));
+        if (c_.main.rank == 0 && cp_rows)
+            fprintf(stderr,"# s2 boot capture: G6_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",
+                cp_rows,cp_skipped);
     }
     DispatchHooks hooks() {
         DispatchHooks h{
