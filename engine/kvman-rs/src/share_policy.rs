@@ -120,7 +120,8 @@ pub fn select_transfer(r: &View, others: &[View], short: u64, cfg: &Cfg) -> Opti
             if s.freed < short {
                 continue;
             }
-            let ok = s.loss_ms == 0.0 || (s.net_ms > 0.0 && s.benefit_ms * 1000.0 >= s.loss_ms * cfg.margin_milli as f64);
+            let ok =
+                s.loss_ms == 0.0 || (s.net_ms > 0.0 && s.benefit_ms * 1000.0 >= s.loss_ms * cfg.margin_milli as f64);
             if !ok {
                 continue;
             }

@@ -475,6 +475,17 @@ moves between groups by whole segments (server.rs):
   the tier in eviction order, the entries lost, their rows and blocks, the blocks a later tier takes), and
   `apply_resize_plan` does the shrink only when a fresh quote still equals it. The node keeps the last quotes per group
   and shows them in STATS (`quote_blocks`); it still picks the group to give by its ages (D-331 M6 step 1).
+- The head also REPORTs its ghost ledger (stash.rs `Ghosts`): stock runs no tier kept (by the hash of their rows up to
+  the last whole page), how many a later prompt continued within 300 s, and how many are still within it.
+- `kvman-remote --value cost-shadow` (`KV_SHARE_VALUE`; D-331 M6 step 2): before the age rule asks a group to give,
+  the value-weighted policy (src/share_policy.rs) prices each group's give in request-ms: the requester's gain =
+  returned / (dropped + 1) x the GiB it is short x its seconds per GiB (`--value-spg GROUP=S`); the donor's loss =
+  (returned + pending + 1) / (dropped + 1) x the GiB its quote loses x its seconds per GiB. A give buys something
+  only if it covers the shortfall. A free give (quote 0) goes first; a give that loses rows needs gain >= 1.25 x loss
+  (`--value-margin`) and two favourable reports in a row; no give back the other way within 60 s; at most 8 GiB a
+  minute. A group of unknown cost neither gains nor gives rows. The node logs each decision beside the age rule's
+  (`share shadow:`) and counts both in STATS `shadow`, with the loss and gain each would cost, priced the same way.
+  The age rule still acts: the shadow changes nothing. Transfer cost is 0 in the price until it is measured.
 - The node answers with a grant or a give, as a transaction: an id and an absolute target in segments a rank. The head
   announces it as a Resize event, and every rank applies it at that one point of the call sequence with the id
   (`GROW target txn`, `SHRINK target txn`). A GROW or SHRINK under any id but the group's open one is refused

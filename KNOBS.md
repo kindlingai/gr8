@@ -156,6 +156,9 @@ file is read for these keys only.
 | `KV_PORT` | `--port` | 7350 | the node's TCP port; RDMA connections are set up through it |
 | `KV_BIND` | `--bind` | `0.0.0.0` | the address it listens on |
 | `KV_MIN_FREE_GB` | `--min-free-gb` | 10 | refuse to start when locking `KV_GB` would leave less MemAvailable than this |
+| `KV_SHARE_VALUE` | `--share-value` | age | which group gives segments to a group that is short: `age` (the coldest blocks); `cost-shadow` = still age, and the node logs (`share shadow:`) and counts in STATS (`shadow`) what the value-weighted policy would pick (kvman-remote `--value`; `engine/kvman-rs/REMOTE-TIER.md` Sharing a node) |
+| `KV_SHARE_SPG` | `--share-spg` | | `GROUP=SECONDS,...`: recompute seconds a GiB of each group's KV costs (GLM 5.3 Full: 15.6, measured). A group not listed is of unknown cost: the policy takes no rows from it and gives it none of another's |
+| `KV_SHARE_MARGIN` | `--share-margin` | 1.25 | a give that loses rows needs this many times their priced cost in benefit |
 | `KV_RDMA` | `--no-rdma` | 1 | 0 = TCP only |
 | `KV_BIN` | `--bin` | `bin/kvman-remote` | the node binary (`./gr8 glm53 build` puts it in `bin/`) |
 | `MENTAT` | `--mentat` | `localhost` | the daemon to announce through; `none` = do not announce |

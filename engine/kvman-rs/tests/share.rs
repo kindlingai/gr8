@@ -163,8 +163,12 @@ fn the_colder_group_gives_and_the_other_grows_into_it() {
     assert_eq!((r.grant, r.give, r.unclaimed), (0, 0, 0));
     assert_eq!(a[0].report(0, &[500, 400], &[]).unwrap().give, 0);
     // glm's blocks get colder: 5 s. flash asks again, and glm is asked for one segment a rank
-    a[0].report(0, &coldest_ages(&[(1, 1), (2, 2 * a[0].per_seg as usize)], |id| 6_000 - id * 500, a[0].per_seg, 0, 4), &[])
-        .unwrap();
+    a[0].report(
+        0,
+        &coldest_ages(&[(1, 1), (2, 2 * a[0].per_seg as usize)], |id| 6_000 - id * 500, a[0].per_seg, 0, 4),
+        &[],
+    )
+    .unwrap();
     assert_eq!(b[0].report(1, &[0], &[]).unwrap().grant, 0);
     let r = a[0].report(0, &[5_500], &[]).unwrap();
     assert_eq!(r.give, 1);
@@ -458,7 +462,10 @@ fn stale_shrink_refused() {
 #[test]
 fn the_shadow_prices_what_the_age_rule_gives_beside_what_the_cost_policy_would() {
     let spg = ["chat", "batch", "req"].iter().map(|n| (n.to_string(), 15_600)).collect();
-    let addr = node_with(10, Share { margin: Duration::from_millis(1_000), value: Value::CostShadow, spg_ms: spg, ..Share::default() });
+    let addr = node_with(
+        10,
+        Share { margin: Duration::from_millis(1_000), value: Value::CostShadow, spg_ms: spg, ..Share::default() },
+    );
     let chat = cluster(&addr, "chat", 2, 100_000, 1, 4);
     let batch = cluster(&addr, "batch", 2, 100_000, 1, 4);
     let req = cluster(&addr, "req", 2, 100_000, 1, 4);
@@ -479,7 +486,7 @@ fn the_shadow_prices_what_the_age_rule_gives_beside_what_the_cost_policy_would()
         st.contains("\"shadow\":{\"value\":\"cost-shadow\",\"short\":1,\"gives\":1,\"waits\":0,\"held\":0,\"none\":0,\"agree\":0,\"age_gives\":1,\"age_unpriced\":0,"),
         "{st}"
     );
-    assert!(st.contains("\"cost_loss_ms\":0}"), "{st}");
+    assert!(st.contains("\"cost_loss_ms\":0,\"age_benefit_ms\":"), "{st}");
     assert!(!st.contains("\"age_loss_ms\":0,"), "the age rule's give loses chat's rows: {st}");
     assert!(st.contains("\"quote_blocks\":[500,900],\"ghosts\":[10,1,0]"), "{st}");
     // the age rule acted: chat gives

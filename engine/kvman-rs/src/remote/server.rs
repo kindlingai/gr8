@@ -24,9 +24,9 @@
 //! until every rank of the group has given, so no other group can take them while the group is between sizes.
 
 use super::proto::{self, Header};
-use crate::share_policy::{self, Decision, Shadow, View};
 use super::sys::{self, Arena};
 use super::verbs::{self, Cq, Device, Mr, Pd, Qp, QpEnd};
+use crate::share_policy::{self, Decision, Shadow, View};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -238,6 +238,9 @@ struct Shadowed {
     age_unpriced: u64,
     age_loss_ms: f64,
     cost_loss_ms: f64,
+    // what the requesters gain, priced the same way: net = benefit - loss
+    age_benefit_ms: f64,
+    cost_benefit_ms: f64,
 }
 
 impl State {
@@ -265,7 +268,9 @@ impl State {
     fn coming(&self) -> u64 {
         self.groups
             .values()
-            .filter_map(|g| g.txn.as_ref().filter(|t| !t.grow).map(|t| (g.segs().saturating_sub(t.target)) * g.nr as u64))
+            .filter_map(|g| {
+                g.txn.as_ref().filter(|t| !t.grow).map(|t| (g.segs().saturating_sub(t.target)) * g.nr as u64)
+            })
             .sum()
     }
     // segments nobody holds or has been promised
@@ -382,10 +387,12 @@ impl State {
         if let Some(a) = &age {
             let v = others.iter().find(|o| &o.name == a).expect("age pick");
             let k = short.div_ceil(v.nr).min(v.segs - v.floor);
-            let loss = share_policy::score_transfer(&r, v, k, short).map_or(f64::INFINITY, |s| s.loss_ms);
+            let sc = share_policy::score_transfer(&r, v, k, short);
+            let loss = sc.as_ref().map_or(f64::INFINITY, |s| s.loss_ms);
             x.age_gives += 1;
             if loss.is_finite() {
                 x.age_loss_ms += loss;
+                x.age_benefit_ms += sc.map_or(0.0, |s| s.benefit_ms);
             } else {
                 x.age_unpriced += 1;
             }
@@ -394,8 +401,15 @@ impl State {
             Decision::Give(n, s) => {
                 x.gives += 1;
                 x.cost_loss_ms += s.loss_ms;
+                x.cost_benefit_ms += s.benefit_ms;
                 x.agree += (age.as_deref() == Some(n.as_str())) as u64;
-                format!("give {} x {} from {n} (benefit {:.0} ms, loss {:.0} ms)", s.give, s.freed / s.give.max(1), s.benefit_ms, s.loss_ms)
+                format!(
+                    "give {} x {} from {n} (benefit {:.0} ms, loss {:.0} ms)",
+                    s.give,
+                    s.freed / s.give.max(1),
+                    s.benefit_ms,
+                    s.loss_ms
+                )
             }
             Decision::Wait(n, s) => {
                 x.waits += 1;
@@ -410,7 +424,10 @@ impl State {
                 "no give pays".to_string()
             }
         };
-        eprintln!("kvman-remote: share shadow: {req} short {short}: the age rule asks {}, the cost policy would {what}", age.as_deref().unwrap_or("nobody"));
+        eprintln!(
+            "kvman-remote: share shadow: {req} short {short}: the age rule asks {}, the cost policy would {what}",
+            age.as_deref().unwrap_or("nobody")
+        );
     }
 }
 
@@ -743,7 +760,8 @@ impl Shared {
                     let x = &st.shadowed;
                     format!(
                         "{{\"value\":\"{}\",\"short\":{},\"gives\":{},\"waits\":{},\"held\":{},\"none\":{},\"agree\":{},\
-                         \"age_gives\":{},\"age_unpriced\":{},\"age_loss_ms\":{:.0},\"cost_loss_ms\":{:.0}}}",
+                         \"age_gives\":{},\"age_unpriced\":{},\"age_loss_ms\":{:.0},\"cost_loss_ms\":{:.0},\
+                         \"age_benefit_ms\":{:.0},\"cost_benefit_ms\":{:.0}}}",
                         if self.share.value == Value::CostShadow { "cost-shadow" } else { "age" },
                         x.short,
                         x.gives,
@@ -754,7 +772,9 @@ impl Shared {
                         x.age_gives,
                         x.age_unpriced,
                         x.age_loss_ms,
-                        x.cost_loss_ms
+                        x.cost_loss_ms,
+                        x.age_benefit_ms,
+                        x.cost_benefit_ms
                     )
                 },
             )
@@ -1170,7 +1190,13 @@ fn new_lease(
 }
 
 // the lease, and whether it is a parked one back (its bytes as they were)
-fn open(sh: &Arc<Shared>, name: &str, block_bytes: u64, blocks: u64, persist: bool) -> Result<(Arc<Lease>, bool), Refusal> {
+fn open(
+    sh: &Arc<Shared>,
+    name: &str,
+    block_bytes: u64,
+    blocks: u64,
+    persist: bool,
+) -> Result<(Arc<Lease>, bool), Refusal> {
     if let Some(l) = unpark(sh, name, |l| {
         l.group.is_none() && l.block_bytes as u64 == block_bytes && l.len() as u64 >= block_bytes * blocks
     }) {
@@ -1426,10 +1452,14 @@ fn report(
 }
 
 fn stale(g: &Group, txn: u64, grow: bool) -> Refusal {
-    let open = g.txn.as_ref().map_or("none".to_string(), |t| format!("{} ({})", t.id, if t.grow { "grow" } else { "give" }));
+    let open =
+        g.txn.as_ref().map_or("none".to_string(), |t| format!("{} ({})", t.id, if t.grow { "grow" } else { "give" }));
     (
         proto::E_STALE,
-        format!("{} under transaction {txn}: the group's open transaction is {open}", if grow { "GROW" } else { "SHRINK" }),
+        format!(
+            "{} under transaction {txn}: the group's open transaction is {open}",
+            if grow { "GROW" } else { "SHRINK" }
+        ),
     )
 }
 

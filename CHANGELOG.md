@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-24: the KV node's value-weighted share policy, in shadow (D-331 M6 step 2)
+
+- `./gr8 kv up --share-value cost-shadow --share-spg GROUP=SECONDS,...`: the node still picks the group that gives by
+  the age of its coldest blocks, and logs and counts (STATS `shadow`) what a policy priced in request-seconds would
+  pick (engine/kvman-rs/src/share_policy.rs). Heads report resize quotes in lost blocks and a ghost ledger of dropped
+  runs that came back. `age` is the default; nothing acts on the shadow yet (that is step 3).
+- Tested on loopback and in kvman-share-bench (`--value cost-shadow`). Not run on a cluster.
+
 ## 2026-10-24: KV-node leases that outlive a restart (persist=lease) and ./gr8 <model> resize (D-331 M4)
 
 - `--kv-store remote:HOST:PORT,size=N,persist=lease`: the KV node, run with `--holdover-s S`, parks the lease for S
