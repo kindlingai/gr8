@@ -1056,3 +1056,72 @@ fn an_entry_too_big_for_the_tier_is_counted_with_its_size() {
     assert_eq!((st.oversize, st.free_slots), (1, 4), "{st:?}");
     assert!(st.oversize_last > 4, "{st:?}");
 }
+
+// persist=lease (D-331 M4): a KV-node lease the node parked over a restart keeps its blocks, and a whole index brings
+// back the evicted runs on them with their base, so the next turn of a session restores instead of prefilling again
+#[test]
+fn a_whole_index_brings_back_evicted_runs_after_a_restart() {
+    let dir = std::env::temp_dir().join(format!("g6kv-whole-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let open = |whole: bool| {
+        let mut p = pool(12, 12, 12 * 64, 2);
+        p.add_tier(64, Keep::All, Some((dir.as_path(), "whole-test"))).unwrap();
+        if whole {
+            p.stash_mut().unwrap().index_whole(0);
+        }
+        Rank::with(p, vec![64])
+    };
+    let system = toks(1, 200);
+    let (blocks, turn) = {
+        let mut r = open(true);
+        let mut t = Vec::new();
+        for c in 2..4 {
+            let mut p = system.clone();
+            p.extend(toks(c, 150));
+            t = session(&mut r, &p, 20).2;
+        }
+        flush(&mut r);
+        r.run_io();
+        r.pool.io_done().unwrap();
+        let e = r.pool.stash().unwrap().entries(0);
+        assert!(e.iter().any(|e| e.kind == Kind::Evicted && e.base.is_some()), "{e:?}");
+        (r.tiers.clone(), t)
+    };
+    let before: Vec<_> = {
+        let r = open(true);
+        r.pool.stash().unwrap().entries(0).to_vec()
+    };
+    assert!(before.iter().any(|e| e.kind == Kind::Evicted && e.base.is_some()), "the run came back with its base");
+    // the next turn of the last conversation: restored from the store, row for row (session checks the rows)
+    let mut r = open(true);
+    r.tiers = blocks.clone();
+    let mut next = turn.clone();
+    next.extend(toks(9, 40));
+    let h = r.pool.match_prefix(&next, next.len() as u64 + 6, next.len() as u64 + 6, next.len() as i32 - 1);
+    assert!(h.stored && h.skip as usize > system.len(), "{h:?}");
+    let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), next.len() as u64 + 6, next.len() as u64 + 6).unwrap();
+    r.run_io();
+    let list = r.pool.list(&run).unwrap().to_vec();
+    for row in 0..h.skip as usize {
+        assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], next[row], "row {row}");
+    }
+    r.pool.io_done().unwrap();
+    drop(r);
+    // the hit took the run out of the store, and the index says so
+    assert!(open(true).pool.stash().unwrap().entries(0).len() < before.len());
+    // a prefixes-only index (persist=on) never kept the run
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let mut r = open(false);
+        for c in 2..4 {
+            let mut p = system.clone();
+            p.extend(toks(c, 150));
+            session(&mut r, &p, 20);
+        }
+        flush(&mut r);
+        r.run_io();
+        r.pool.io_done().unwrap();
+    }
+    assert!(open(false).pool.stash().unwrap().entries(0).iter().all(|e| e.kind.prefix()));
+    let _ = std::fs::remove_dir_all(&dir);
+}

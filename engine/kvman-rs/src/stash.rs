@@ -194,6 +194,8 @@ pub struct Tier {
     slots: u64,
     entries: Vec<Entry>, // least recently used first
     index: Option<Index>,
+    // the index records every entry, not only prefixes (a KV-node lease that outlives a restart, persist=lease)
+    whole: bool,
     stats: TierStats,
     policy: Policy,
 }
@@ -281,12 +283,19 @@ impl Stash {
             slots,
             entries: Vec::new(),
             index: None,
+            whole: false,
             stats: TierStats::default(),
             policy: Policy::default(),
         };
         if let Some((ix, loaded)) = index {
+            // a run stored on a prefix comes back only with its prefix (in this tier or one before it)
+            let mut ids: Vec<u64> = self.tiers.iter().flat_map(|x| &x.entries).map(|e| e.id).collect();
             for e in loaded {
+                if e.base.is_some_and(|b| !ids.contains(&b.0)) {
+                    continue;
+                }
                 if e.slots.iter().all(|&s| s < slots) && t.alloc.claim(&e.slots) {
+                    ids.push(e.id);
                     self.next_id = self.next_id.max(e.id + 1);
                     t.entries.push(e);
                 }
@@ -305,6 +314,14 @@ impl Stash {
 
     pub fn tiers(&self) -> usize {
         self.tiers.len()
+    }
+
+    /// Tier t's index records every entry it stores (evicted runs too, with their base and tail), so a KV-node lease
+    /// that the node held over a restart comes back with its sessions. Prefixes only by default.
+    pub fn index_whole(&mut self, t: usize) {
+        if let Some(x) = self.tiers.get_mut(t) {
+            x.whole = x.index.is_some();
+        }
     }
 
     pub fn set_policy(&mut self, t: usize, p: Policy) {
@@ -728,7 +745,7 @@ impl Stash {
         let tier = &mut self.tiers[t];
         tier.stats.spilled_pages += n as u64;
         tier.entries.push(Entry { id, kind, key, st, slots, base, hits, tail, namespace });
-        if kind.prefix() && tier.index.is_some() {
+        if tier.index.is_some() && (kind.prefix() || (tier.whole && namespace == crate::pool::STOCK_NAMESPACE)) {
             self.commits.push((t, id));
         }
     }
@@ -802,8 +819,9 @@ impl Stash {
 
     // e leaves tier t for the next tier that keeps its kind, or is dropped. Tier t frees e's slots after queueing the move.
     fn evict(&mut self, t: usize, e: Entry) {
+        let whole = self.tiers[t].whole;
         if let Some(ix) = &mut self.tiers[t].index {
-            if e.kind.prefix() && ix.drop(e.id).is_err() {
+            if (e.kind.prefix() || whole) && ix.drop(e.id).is_err() {
                 self.index_errors += 1;
             }
         }
@@ -823,7 +841,7 @@ impl Stash {
                 }));
                 let to = &mut self.tiers[u];
                 to.stats.moved_in_pages += new.len() as u64;
-                if e.kind.prefix() && to.index.is_some() {
+                if to.index.is_some() && (e.kind.prefix() || (to.whole && e.namespace == crate::pool::STOCK_NAMESPACE)) {
                     self.commits.push((u, e.id));
                 }
                 self.tiers[u].entries.insert(0, Entry { slots: new, ..e.clone() });
@@ -849,6 +867,11 @@ impl Stash {
                 all.into_iter().partition(|e| e.base.is_some_and(|b| b.0 == id));
             self.tiers[t].entries = keep;
             for e in gone {
+                if let (true, Some(ix)) = (self.tiers[t].whole, &mut self.tiers[t].index) {
+                    if ix.drop(e.id).is_err() {
+                        self.index_errors += 1;
+                    }
+                }
                 self.tiers[t].alloc.release(&e.slots);
                 self.tiers[t].stats.dropped += 1;
                 self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
@@ -880,6 +903,12 @@ impl Stash {
         let i = tier.entries.iter().position(|e| e.id == id).expect("found by the caller");
         let e = tier.entries.remove(i);
         tier.stats.hits += 1;
+        // an evicted run leaves the store: its record goes before its slots can be reused
+        if let (false, true, Some(ix)) = (e.kind.prefix(), tier.whole, &mut tier.index) {
+            if ix.drop(e.id).is_err() {
+                self.index_errors += 1;
+            }
+        }
         if e.kind.prefix() {
             tier.entries.push(e.clone());
             self.pin.push(id);
@@ -1119,6 +1148,27 @@ fn encode_add(e: &Entry) -> Vec<u8> {
     p
 }
 
+// record 4: every field of an entry (an index that keeps evicted runs, Stash::index_whole)
+fn encode_entry(e: &Entry) -> Vec<u8> {
+    let mut p = encode_add(e);
+    p[0] = 4;
+    p.push(match e.kind {
+        Kind::Evicted => 0,
+        Kind::Shared => 1,
+        Kind::Prefix => 2,
+    });
+    let (b, bp) = e.base.map_or((u64::MAX, 0), |b| (b.0, b.1 as u64));
+    put_u64(&mut p, b);
+    put_u64(&mut p, bp);
+    put_u32(&mut p, e.hits);
+    let t = e.tail.unwrap_or(Tail { logical: 0, own: 0, rep: 0 });
+    for x in [t.logical, t.own, t.rep] {
+        put_u32(&mut p, x);
+    }
+    p.extend_from_slice(&e.namespace);
+    p
+}
+
 enum Record {
     Add(Entry),
     Drop(u64),
@@ -1127,15 +1177,16 @@ enum Record {
 
 fn decode(p: &[u8]) -> Option<Record> {
     let mut c = Cursor(p);
-    match c.take(1)?[0] {
-        1 => {
+    let tag = c.take(1)?[0];
+    match tag {
+        1 | 4 => {
             let (id, key) = (c.u64()?, c.u64()?);
             let (valid, written_end, pf_end) = (c.u32()? as i32, c.u32()? as i32, c.u32()? as i32);
             let n = c.u32()? as usize;
             let history = (0..n).map(|_| c.u32().map(|t| t as i32)).collect::<Option<Vec<_>>>()?;
             let n = c.u32()? as usize;
             let slots = (0..n).map(|_| c.u64()).collect::<Option<Vec<_>>>()?;
-            Some(Record::Add(Entry {
+            let mut e = Entry {
                 id,
                 kind: Kind::Shared,
                 key,
@@ -1145,7 +1196,22 @@ fn decode(p: &[u8]) -> Option<Record> {
                 hits: 0,
                 tail: None,
                 namespace: crate::pool::STOCK_NAMESPACE,
-            }))
+            };
+            if tag == 4 {
+                e.kind = match c.take(1)?[0] {
+                    0 => Kind::Evicted,
+                    1 => Kind::Shared,
+                    2 => Kind::Prefix,
+                    _ => return None,
+                };
+                let (b, bp, hits) = (c.u64()?, c.u64()?, c.u32()?);
+                e.base = (b != u64::MAX).then_some((b, bp as usize));
+                e.hits = hits;
+                let (logical, own, rep) = (c.u32()?, c.u32()?, c.u32()?);
+                e.tail = (logical > 0).then_some(Tail { logical, own, rep });
+                e.namespace.copy_from_slice(c.take(crate::pool::NAMESPACE_BYTES)?);
+            }
+            Some(Record::Add(e))
         }
         2 => Some(Record::Drop(c.u64()?)),
         3 => Some(Record::Count(c.u64()?, c.u32()?, c.u64()?)),
@@ -1254,7 +1320,7 @@ impl Index {
 
     pub fn add(&mut self, e: &Entry) -> io::Result<()> {
         self.live.insert(e.id, e.clone());
-        self.append(&encode_add(e))
+        self.append(&encode_entry(e))
     }
 
     pub fn drop(&mut self, id: u64) -> io::Result<()> {
@@ -1272,7 +1338,7 @@ impl Index {
         let mut f = File::create(&tmp)?;
         f.write_all(format!("{MAGIC} {}\n", self.compat).as_bytes())?;
         for e in self.live.values() {
-            f.write_all(&frame(&encode_add(e)))?;
+            f.write_all(&frame(&encode_entry(e)))?;
         }
         for (&k, &(n, clock)) in &self.counts {
             f.write_all(&frame(&encode_count(k, n, clock)))?;

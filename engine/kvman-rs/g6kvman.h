@@ -96,7 +96,8 @@ size_t g6kv_runs(const g6kv_pool* p, g6kv_use* out, size_t cap);
 // flag order. Each reserve, take, grow or retain may queue copies. The engine takes the copies (g6kv_io_take), runs
 // them in order before anything writes those pages, then calls g6kv_io_done. Until then reserve, take and grow fail.
 void g6kv_stores(g6kv_pool* p, uint32_t shared_after);
-// keep: 0 = evicted runs, 1 = shared prefixes, 2 = both. index_dir (or NULL): the tier's shared prefixes survive
+// keep: 0 = evicted runs, 1 = shared prefixes, 2 = both; + 4 = the index records every entry, evicted runs too (a
+// KV-node lease the node parks over a restart, persist=lease). index_dir (or NULL): the tier's shared prefixes survive
 // restarts while `compat` stays the same. 0, or -1 with g6kv_tier_error.
 int g6kv_add_tier(g6kv_pool* p, uint64_t slots, int32_t keep, const char* index_dir, const char* compat);
 // at admission, before the grant, on every rank: counts the prompt toward its prefixes and returns how many
@@ -186,6 +187,9 @@ void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 struct g6kv_tier;
 int g6kv_tier_open(const char* spec, const char* name, uint64_t block_bytes, uint64_t blocks, g6kv_tier** out);
 void g6kv_tier_free(g6kv_tier* t);
+// 1 when spec remote:HOST:PORT?persist got back the lease the node parked for this name (its blocks are as the last
+// holder left them; kvman-remote --holdover-s), else 0
+int g6kv_tier_reattached(const g6kv_tier* t);
 const char* g6kv_tier_error();
 uint64_t g6kv_tier_block_bytes(const g6kv_tier* t);
 void g6kv_tier_describe(const g6kv_tier* t, char* buf, size_t cap);

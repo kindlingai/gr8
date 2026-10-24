@@ -44,9 +44,10 @@ impl Blocks {
                 Ok(Blocks::Ssd(f))
             }
             "remote" if !rest.is_empty() => {
+                let (rest, persist) = lease_flag(rest);
                 // four ranks share one switch port without PFC: a dropped packet costs one ack timeout, and 4.096 us *
                 // 2^17 (0.5 s) leaves room for the retries before a lane fails
-                let o = Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, ..Opts::new(name, slot, blocks) };
+                let o = Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, persist, ..Opts::new(name, slot, blocks) };
                 Ok(Blocks::Remote(Box::new(RemoteStore::open(&node_addr(rest), &o)?)))
             }
             "mem" => Ok(Blocks::Mem(Mutex::new(vec![0u8; slot * blocks as usize]), slot, blocks)),
@@ -61,7 +62,9 @@ impl Blocks {
         let rest = spec.strip_prefix("remote:").filter(|r| !r.is_empty()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("store {spec}: a group lease is remote:HOST:PORT"))
         })?;
-        let o = Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, group: Some(g), ..Opts::new(name, slot, 0) };
+        let (rest, persist) = lease_flag(rest);
+        let o =
+            Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, group: Some(g), persist, ..Opts::new(name, slot, 0) };
         Ok(Blocks::Remote(Box::new(RemoteStore::open(&node_addr(rest), &o)?)))
     }
 
@@ -137,6 +140,19 @@ impl BlockStore for Blocks {
     }
 }
 
+// remote:HOST:PORT?persist: ask the node to park the lease when the store closes (a store's persist=lease)
+fn lease_flag(rest: &str) -> (&str, bool) {
+    match rest.strip_suffix("?persist") {
+        Some(r) => (r, true),
+        None => (rest, false),
+    }
+}
+
+/// Whether a KV-node store got back a lease the node had parked (its blocks hold what the last holder wrote).
+pub fn reattached(b: &Blocks) -> bool {
+    matches!(b, Blocks::Remote(r) if r.reattached)
+}
+
 fn node_addr(rest: &str) -> String {
     if rest.contains(':') {
         rest.to_string()
@@ -187,6 +203,16 @@ pub unsafe extern "C" fn g6kv_tier_open(
         }
         Err(e) => fail(e),
     }
+}
+
+/// 1 when a KV-node store got back the lease the node had parked for its name (spec remote:HOST:PORT?persist), so
+/// its blocks hold what the last holder wrote; else 0.
+///
+/// # Safety
+/// `t` must come from g6kv_tier_open or g6kv_tier_open_group.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_reattached(t: *const Blocks) -> i32 {
+    (!t.is_null() && reattached(&*t)) as i32
 }
 
 /// # Safety

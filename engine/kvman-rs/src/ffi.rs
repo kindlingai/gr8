@@ -487,16 +487,23 @@ pub unsafe extern "C" fn g6kv_add_tier(
     index_dir: *const c_char,
     compat: *const c_char,
 ) -> i32 {
-    let keep = match keep {
+    // + 4: the index records every entry, evicted runs too (a KV-node lease kept over a restart, persist=lease)
+    let whole = keep & 4 != 0 && !index_dir.is_null();
+    let keep = match keep & !4 {
         0 => Keep::Evicted,
         1 => Keep::Shared,
         2 => Keep::All,
-        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2")),
+        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2, + 4 for a whole index")),
     };
     let text = |c: *const c_char| (!c.is_null()).then(|| CStr::from_ptr(c).to_string_lossy().into_owned());
     let (dir, compat) = (text(index_dir), text(compat).unwrap_or_default());
     match (*p).add_tier(slots, keep, dir.as_deref().map(|d| (std::path::Path::new(d), compat.as_str()))) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if let (true, Some(st)) = (whole, (*p).stash_mut()) {
+                st.index_whole(st.tiers() - 1);
+            }
+            0
+        }
         Err(e) => crate::blocks::fail(e),
     }
 }
