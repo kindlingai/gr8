@@ -99,9 +99,10 @@ manifest instead.
 
 ## `./gr8 glm53`
 
-`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, one session, an fp8 KV build, no drafter, and
+`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, an fp8 KV build, no drafter, no prefix reuse, and
 `CAP` 262208 at either TP, a 262,144-token request (`tools/launch/models.py`, `flash_defaults` in
-`scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)).
+`scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)). `SESS` defaults to 1 there; 2 to 8 share decode steps and
+the `CAP` pool, each session with its own KDA state slots, while `SESS` x (`MTP` + 1) is at most 32.
 
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|

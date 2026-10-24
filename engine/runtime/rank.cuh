@@ -1656,11 +1656,6 @@ inline void reset(Model& m, cudaStream_t st)
 inline void launch_step_in(Model& m, cudaStream_t st)
 {
 #if G6_MODEL_FLASH
-    if(m.resid4 || m.flash_draft) {
-#ifdef DEC_S2
-        if(m.s2on) die("Flash mHC: S2 state slots are not integrated yet");
-#endif
-    }
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
                                          m.steering_scale, m.srow, m.cells, m.shared, m.nl, m.row_slot, m.kda_src});
 #else
@@ -1938,6 +1933,9 @@ inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
 }
 #ifdef DEC_S2
 inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);
+#if G6_MODEL_FLASH
+inline const float* s2_draft_hidn(Draft& D, bool chain, cudaStream_t st);
+#endif
 inline void s2_draft_keep(Draft& D, cudaStream_t st);
 inline int s2_sessions(const Model& m);
 #endif
@@ -1948,9 +1946,11 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
     Model& d = D.d;
 #if G6_MODEL_FLASH
     #ifdef DEC_S2
-    if(d.s2on) die("Flash MTP currently supports single-session decode only");
+    const float* hid=d.s2on?s2_draft_hidn(D,chain,st):chain?D.hprevn:D.main_xn;
+    #else
+    const float* hid=chain?D.hprevn:D.main_xn;
     #endif
-    flash_mtp::input(d.tok,d.pos,d.emb,D.enorm,D.hnorm,chain?D.hprevn:D.main_xn,d.mtp_cat,M,st);
+    flash_mtp::input(d.tok,d.pos,d.emb,D.enorm,D.hnorm,hid,d.mtp_cat,M,st);
     if(d.mtp_eh) flash_mlp::k_linear<<<dim3((HID+7)/8,M),256,0,st>>>(d.mtp_cat,d.mtp_eh,d.resid,2*HID,HID);
     else {
         flash_mhc::fragments(d.mtp_cat,M,2*HID,d.mtp_cat_f,nullptr,st);
@@ -1983,11 +1983,11 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
 }
 inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
 {
-#if G6_MODEL_FLASH
-    G6RT_CK(cudaMemcpyAsync(D.hprevn,D.d.xn+(size_t)(M-1)*HID,HID*sizeof(float),cudaMemcpyDeviceToDevice,st));
-#endif
 #ifdef DEC_S2
     if (D.d.s2on) { s2_draft_keep(D, st); return; }
+#endif
+#if G6_MODEL_FLASH
+    G6RT_CK(cudaMemcpyAsync(D.hprevn,D.d.xn+(size_t)(M-1)*HID,HID*sizeof(float),cudaMemcpyDeviceToDevice,st));
 #endif
     k_mtp_keep<<<1, 256, 0, st>>>(D.d.x + (size_t)(M - 1) * HID, D.hprev);
 }

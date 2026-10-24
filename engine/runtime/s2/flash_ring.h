@@ -1,5 +1,6 @@
 // KDA rollback per session, independent of CUDA and the acceptance policy.
 #pragma once
+#include <set>
 #include <stdexcept>
 #include <vector>
 namespace g6s2 {
@@ -55,10 +56,38 @@ struct FlashSlots {
             else si.kda_src = src;
         }
     }
+    // the same from a main step's layout (s2::Step: sess, row0, rows) and its sessions' event classes: a session verifies
+    // its rows unless they are its prompt tail (event == tail)
+    template <class StepIn, class Step>
+    void step(StepIn& si, const Step& sp, const std::vector<int>& events, int tail) {
+        if (events.size() != sp.sess.size()) throw std::runtime_error("Flash KDA inputs: an event per session");
+        std::vector<int> sess(sp.sess.begin(), sp.sess.end()), row0(sp.row0.begin(), sp.row0.end()),
+            n(sp.rows.begin(), sp.rows.end());
+        std::vector<bool> verify;
+        for (int e : events) verify.push_back(e != tail);
+        inputs(si, sess, row0, n, verify);
+    }
 private:
     void check(int q) const {
         if (q < 0 || q >= sessions()) throw std::runtime_error("Flash KDA slots: session out of range");
     }
     FlashRing& at(int q) { check(q); return rings[size_t(q)]; }
 };
+// The step shapes S2 can launch with several Flash sessions, each captured as a graph at every context bucket before
+// serving (flash_native.cuh; the same set as the full model's NativeDispatch::capture_all, without the row classes,
+// which Flash's bound layers do not have): main = prompt tails 1..chunk and rounds S x (k + 1), S = 1..sessions, k = 1..K
+// with G6_S2_ADAPT (else K); draft = 1..chunk and 1..sessions x (K + 1); chain = 1..sessions (K >= 2 only).
+struct FlashShapes { std::set<int> mains, drafts, chains; };
+inline FlashShapes flash_shapes(int sessions, int mtp, int chunk, bool adapt, int mx) {
+    if (sessions < 1 || mtp < 1 || chunk < 1 || chunk > mx) throw std::runtime_error("Flash capture set: invalid sessions, mtp or chunk");
+    FlashShapes f;
+    for (int M = 1; M <= chunk; ++M) { f.mains.insert(M); f.drafts.insert(M); }
+    for (int S = 1; S <= sessions; ++S)
+        for (int k = adapt ? 1 : mtp; k <= mtp; ++k) f.mains.insert(S * (k + 1));
+    for (int M = 1; M <= sessions * (mtp + 1); ++M) f.drafts.insert(M);
+    if (mtp >= 2) for (int M = 1; M <= sessions; ++M) f.chains.insert(M);
+    if (*f.mains.rbegin() > mx || *f.drafts.rbegin() > mx)
+        throw std::runtime_error("Flash capture set: sessions x (mtp + 1) rows exceed G6_MX");
+    return f;
+}
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-23: GLM-5.3-Flash can serve 2 to 8 sessions sharing steps (SESS, opt-in)
+
+- `./gr8 glm53f` accepts `SESS` 1 to 8 (it was 1 only), with `SESS x (MTP + 1)` at most 32 rows a round. Each S2
+  session owns its KDA slots and conv ring, its draft hidden row and its page tables; the batched step graphs are
+  captured at boot for every round width the scheduler can build. `SHARE_LIMIT` decides which requests share a step.
+- The default stays `SESS=1`, whose command line and output are unchanged. Not measured yet: the memory headroom of
+  several sessions' state, decode and prefill speed under sharing, and output against the solo build. docs/FLASH.md,
+  Several sessions, has the commands.
+
 ## 2026-10-23: GLM-5.3-Flash defaults to a 262,144-token context (CAP 262,208)
 
 - `./gr8 glm53f` now defaults `CAP` to 262,208 (was 33,280) at TP=4 and TP=2: a 262,144-token request plus a page for
