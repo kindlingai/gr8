@@ -432,6 +432,49 @@ would wait one event fence, when the head has every rank's ACK, before reuse. Th
 deterministic like the others. The writes could be split across ranks (page i by rank i mod TP), and every rank would
 read the whole run. Until the cluster check, each rank keeps its own store.
 
+### Sharing a node: group leases
+
+Two clusters (GLM and Flash, say) can share one KV node. Each store opened with `group=NAME[,cap=N][,weight=N]`
+(`--kv-store remote:...,size=FLOOR,group=glm,cap=32G`) is one rank's lease in group NAME. A group lease holds whole
+segments (`kvman-remote --seg-mb`, 1 GiB by default), starts at its floor (`size=`), and grows up to `cap=` (no `cap=`: as far as the node has room). Capacity
+moves between groups by whole segments (server.rs):
+
+- The head (rank 0) REPORTs to the node now and then (`G6_S2_SHARE_MS`, 1000 ms): the segments a rank it wants more
+  (s2/kv_share.h `share_want`: room for an entry too big for the tier, the pages the tier pushed out since the last
+  report, or the next spill) and the ages of its coldest blocks, one per segment, in the order a shrink evicts
+  (`coldest_ages`). A segment the tier holds empty reports as u64::MAX, so the node takes empty segments first and at
+  once.
+- The node answers with a grant or a give, as a transaction: an id and an absolute target in segments a rank. The head
+  announces it as a Resize event, and every rank applies it at that one point of the call sequence with the id
+  (`GROW target txn`, `SHRINK target txn`). A GROW or SHRINK under any id but the group's open one is refused
+  (`E_STALE`); the same one again is a no-op. A rank may give on its own (`SHRINK target 0`): the first rank opens the
+  give, the others join it.
+- A grant is held for each rank until it grows. One no rank took goes back after `grant_ttl` (30 s); once one rank took
+  its part, the rest stay held for the others.
+- A rank's given segments go free only once every rank of its group gave. Until then the slower ranks may still write
+  them.
+- A group short of room asks the group whose coldest blocks are older than its own by `--margin-s` (60 s), weighted by
+  `weight=` (2000 counts the blocks half as old), never below that group's floor and not within `--cooldown-s` (10 s)
+  of its last give. A give no rank started within `--stall-s` (10 s) marks the group stalled until it shrinks. A give
+  frees whole segments on each of the giver's ranks; what that frees past the asker's need, the asker takes with its
+  next grant (a group of 4 ranks giving to one of 2 strands nothing).
+- An ask that made the node ask another group to give is held for the asker (`owed` in the node's stats, segments a
+  rank): that room is reserved for it, as a grant is (no other group's grant and no plain lease takes it), and its next
+  reports are granted it even when they ask for nothing more. A grant smaller than what is owed takes its part off and
+  the rest stays owed; what is owed lapses `grant_ttl` after the last ask. A head asks once
+  for what changed since its last report (one entry ahead of a drop), and a give takes a report or more, so without
+  this the given segments sat free until the asker dropped an entry and asked again. A report asks another group to
+  give only for what no give asked already brings.
+- A group that opens on a full node asks the others down toward their floors (the margin and the cooldown do not apply)
+  and waits up to `--stall-s` for them. `kvman-remote --group-plan FILE` (lines `NAME nr=RANKS floor=SEGS`) keeps a
+  planned group's floors free from the start, however full the node is; the floors must fit the node.
+- `KV_SHARE_WHEN=idle` (the default, engine `G6_KV_SHARE_WHEN`): the head offers its blocks to other groups only while
+  the engine is idle, so a give's compaction never pauses a turn. A group starting below its floor is still served.
+  `always`: whenever the node asks.
+
+`tests/share.rs` drives each of these over TCP on loopback; `s2/tests/kv_share_test.cpp` runs two ranks of a pool
+through a grant, a give and a voluntary give to the floor.
+
 ### Still to do
 
 - A check that a stored block holds what a cold prefill computes (a sampled block verified at boot or on restore), so

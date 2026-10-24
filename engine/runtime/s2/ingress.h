@@ -22,7 +22,8 @@ inline uint64_t number(const std::string& s) {
     for (char c:s) { require(c>='0' && c<='9' && n <= (UINT64_MAX-unsigned(c-'0'))/10, "bad/overflow number"); n=n*10+unsigned(c-'0'); }
     return n;
 }
-struct Command { bool admit=false; uint64_t epoch=0, request=0, hash=0; };
+// resize: a Resize event the head makes itself (Service share poll), never from the ingress files
+struct Command { bool admit=false; uint64_t epoch=0, request=0, hash=0; std::optional<Resize> resize{}; };
 inline Command parse_command(const std::string& text, uint64_t epoch) {
     std::istringstream in(text); std::string kind,e,r,h,extra;
     require(bool(in>>kind>>e>>r>>h) && !(in>>extra), "invalid ingress command");

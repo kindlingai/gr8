@@ -43,6 +43,7 @@
 #include "../kernels/head2.cuh"
 #include "../attn/bind.h"
 #if G6_MODEL_FLASH
+#include "flash_kv.h"
 #include "../mhc/mhc.cuh"
 #include "../kda/kda.cuh"
 #include "../kda/proj_prefill.cuh"
@@ -421,6 +422,7 @@ struct Model
     float *hc_post = nullptr, *hc_comb = nullptr, *xn = nullptr, *xn2 = nullptr;
     unsigned* hc_done = nullptr;
     bool flash_draft = false;
+    flashkv::Map fkv;                     // G6_FLASH_KV_CHUNKS=1: the DSA bindings' caches in chunks (flash_kv.h)
     float *mtp_cat = nullptr;
     const uint16_t* mtp_eh = nullptr;     // BF16 eh [HID][2*HID] (lossless dense), or
     bind::Gv mtp_eh_mx;                   // the MXFP8 eh records (quantized dense) on the fp16 fragments of mtp_cat

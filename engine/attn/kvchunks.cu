@@ -49,7 +49,9 @@ int drop(G6KvChunks* c, size_t g) {
 }
 }
 
-extern "C" int g6_kvc_create(G6KvChunks** out, size_t bytes, int device) {
+namespace {
+// the region reserved; every granule backed (all) or none
+int create(G6KvChunks** out, size_t bytes, int device, bool all) {
     if (!out || !bytes) return (int)CUDA_ERROR_INVALID_VALUE;
     cudaFree(nullptr);   // the runtime's primary context, current on this thread
     G6KvChunks* c = new G6KvChunks;
@@ -65,13 +67,40 @@ extern "C" int g6_kvc_create(G6KvChunks** out, size_t bytes, int device) {
     const size_t n = c->reserved / c->gran;
     c->h.assign(n, 0);
     c->on.assign(n, 0);
-    for (size_t g = 0; g < n; ++g) {
+    for (size_t g = 0; all && g < n; ++g) {
         int e = back(c, g, 0);
         if (e) { g6_kvc_free(c); return e; }
     }
     r = cuStreamSynchronize(0);
     if (r != CUDA_SUCCESS) { g6_kvc_free(c); return (int)r; }
     *out = c;
+    return 0;
+}
+}
+
+extern "C" int g6_kvc_create(G6KvChunks** out, size_t bytes, int device) { return create(out, bytes, device, true); }
+
+extern "C" int g6_kvc_create_masked(G6KvChunks** out, size_t bytes, int device, size_t page_bytes, uint32_t chunk_pages,
+                                    uint32_t place, const uint8_t* online, uint32_t chunks) {
+    G6KvChunks* c = nullptr;
+    int e = create(&c, bytes, device, false);
+    if (!e) e = g6_kvc_sync(c, page_bytes, chunk_pages, place, online, chunks, nullptr, nullptr, nullptr);
+    if (e) { g6_kvc_free(c); return e; }
+    *out = c;
+    return 0;
+}
+
+extern "C" int g6_kvc_zero(G6KvChunks* c, void* stream) {
+    if (!c) return (int)CUDA_ERROR_INVALID_VALUE;
+    // runs of backed granules
+    for (size_t g = 0; g < c->on.size();) {
+        if (!c->on[g]) { ++g; continue; }
+        size_t e = g;
+        while (e < c->on.size() && c->on[e]) ++e;
+        CUresult r = cuMemsetD8Async(c->base + g * c->gran, 0, (e - g) * c->gran, (CUstream)stream);
+        if (r != CUDA_SUCCESS) return (int)r;
+        g = e;
+    }
     return 0;
 }
 
@@ -85,7 +114,14 @@ extern "C" void g6_kvc_free(G6KvChunks* c) {
 }
 
 extern "C" void* g6_kvc_ptr(const G6KvChunks* c) { return c ? (void*)c->base : nullptr; }
+extern "C" size_t g6_kvc_bytes(const G6KvChunks* c) { return c ? c->bytes : 0; }
 extern "C" size_t g6_kvc_granule(const G6KvChunks* c) { return c ? c->gran : 0; }
+extern "C" size_t g6_kvc_device_granule(int device) {
+    cudaFree(nullptr);
+    CUmemAllocationProp p = prop(device);
+    size_t g = 0;
+    return cuMemGetAllocationGranularity(&g, &p, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS ? g : 0;
+}
 extern "C" size_t g6_kvc_backed(const G6KvChunks* c) {
     size_t n = 0;
     if (c)

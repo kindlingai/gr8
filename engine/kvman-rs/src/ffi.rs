@@ -901,3 +901,39 @@ pub unsafe extern "C" fn g6kv_rows_describe(r: *const crate::rows::Rows, buf: *m
     std::ptr::copy_nonoverlapping(d.as_ptr() as *const c_char, buf, n);
     *buf.add(n) = 0;
 }
+
+/// Resizes tier t to `slots` (its store grew, or is about to shrink; stash.rs resize_tier) at a point every rank
+/// sees: *resized = 1, or 0 when the tier refuses (an indexed tier, or entries it may not evict). A shrink evicts the
+/// least recently used entries and queues the moves into the slots that stay: run them (g6kv_io_take, g6kv_io_done)
+/// before the store gives its top back (g6kv_store_shrink).
+///
+/// # Safety
+/// `p` must be a live pool, `resized` valid for a write (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_resize(p: *mut Pool, t: u32, slots: u64, resized: *mut i32) -> i32 {
+    match (*p).resize_tier(t as usize, slots) {
+        Ok(ok) => {
+            if !resized.is_null() {
+                *resized = ok as i32;
+            }
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// The ages in ms a head reports (g6kv_store_report): ages[i] is that of the entry holding tier t's (i x per_seg)-th
+/// coldest block, coldest first. Writes up to `cap` and returns how many.
+///
+/// # Safety
+/// `p` must be a live pool and `out` hold `cap` values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_coldest(p: *mut Pool, t: u32, per_seg: u64, out: *mut u64, cap: usize) -> usize {
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let a = (*p).coldest_ages(t as usize, per_seg, cap);
+    let n = a.len().min(cap);
+    std::ptr::copy_nonoverlapping(a.as_ptr(), out, n);
+    n
+}
