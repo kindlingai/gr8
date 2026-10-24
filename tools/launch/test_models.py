@@ -32,7 +32,7 @@ class OptionTests(unittest.TestCase):
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
 
     def test_refusals(self):
-        for argv, want in ((['--tp', '3'], 'want 4 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
+        for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
                            (['--dflash', '1'], 'no DFlash2 drafter'),
                            (['--drafter', 'https://huggingface.co/a/b'], 'no DFlash2 drafter')):
             with self.assertRaises(opt.OptionError) as e:

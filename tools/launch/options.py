@@ -25,7 +25,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 KEYS = {
     'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
                                       '<model> sets it'),
-    'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4 or 2)'),
+    'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2)'),
     'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
                                  "cabled to the f1 port of the next box in --peers order, the last to the first)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
