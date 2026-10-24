@@ -72,10 +72,19 @@ Read as TensorFold 0.6.1 reads them (`server/request_options.py`). The code is `
 
 | field | accepted | effect |
 |---|---|---|
-| `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold) |
-| `chat_template_kwargs.enable_thinking` | `true`, or unset | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. The front end adds no `enable_thinking` kwarg of its own |
+| `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold), or the front end runs with `--allow-thinking-off` (Thinking off, below) |
+| `chat_template_kwargs.enable_thinking` | `true`, or unset; `false` with `--allow-thinking-off` | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. With `--allow-thinking-off` it turns thinking off (below). The front end adds no `enable_thinking` kwarg of its own |
 | `thinking_budget` (top level) | an integer, an integral float, a string holding an integer, or null. Anything else is a 400 | 0, null or unset: `--default-thinking-budget` (TensorFold's `int(budget or default)`). Negative: no limit. N: while the think block is open, the reply's Nth token is replaced by `\n</think>\n\n`, even when it is `</think>` itself, so N-1 reasoning tokens come first (TensorFold's ThinkBudget). `max_tokens` may cut the close short. It applies to a chat prompt that leaves a think block open. The close has no logprobs, so naming both `thinking_budget` and `logprobs` is a 400 |
 | `response_format` (chat and completions) | absent, null, `{"type": "text"}` | `json_object`, `json_schema` and any other type are a 400 until the engine has constrained decoding |
+
+### Thinking off
+
+GLM 5.3's chat template always opens a think block. `--allow-thinking-off` (`./gr8 glm53 up --allow-thinking-off 1`)
+takes `enable_thinking: false` and `reasoning_effort: "none"` anyway: the prompt drops the template's
+`<|system|>Reasoning Effort: ...` turn and ends `<think></think>`, so the reply starts on content and carries no
+reasoning. The thinking budget does not apply. It is off by default. Rendering a closed think block gave degenerate
+output on this model on an earlier serving stack: counting to 200 with thinking off repeated and skipped numbers in 3 to
+8 of 8 runs there. `scripts/count200_probe.sh` runs that probe against a head, and must pass before you rely on the flag.
 
 `/tokenize` with `messages` applies the same effort and refusals, so its count matches the chat request's prompt.
 Chat usage carries `completion_tokens_details.reasoning_tokens`: the reply's tokens through its `</think>`, or all of
@@ -273,7 +282,7 @@ canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve
 
 ## Deviations from vLLM
 
-- These return 400: `n>1`, batched prompts, `echo`, `suffix`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off (above).
+- These return 400: `n>1`, batched prompts, `echo`, `suffix`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off without `--allow-thinking-off` (above).
 - A tool call streams as it is written when it sits in the answer outside a code fence and either starts the answer or
   follows text with no space between (the chat template writes a call straight after the content): its name goes out
   once read, string arguments as they arrive, other arguments once each value ends. Any other call (after a space or a

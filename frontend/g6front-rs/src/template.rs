@@ -96,6 +96,22 @@ impl ChatTemplate {
         }
     }
 
+    /// A GLM-5.3 prompt with thinking off (`Thinking::off`, `--allow-thinking-off`): without the template's
+    /// `<|system|>Reasoning Effort: ...` turn, and with the generation prompt's think block closed, so the reply starts
+    /// on content. Text without them is returned as it is.
+    pub fn thinking_off(&self, mut text: String, add_generation_prompt: bool) -> String {
+        const HEADER: &str = "<|system|>Reasoning Effort: ";
+        if let Some(i) = text.find(HEADER) {
+            let start = i + HEADER.len();
+            let end = text[start..].find(|c: char| !c.is_ascii_alphabetic()).map_or(text.len(), |n| start + n);
+            text.replace_range(i..end, "");
+        }
+        if add_generation_prompt && text.ends_with("<think>") {
+            text.push_str("</think>");
+        }
+        text
+    }
+
     /// `kw` is the output of `build_template_kwargs()`.
     pub fn render(
         &self,
@@ -707,6 +723,16 @@ mod tests {
         )
         .unwrap();
         t.render(Some(&json!([{"role": "user", "content": "hi"}])), None, kw).unwrap()
+    }
+
+    #[test]
+    fn thinking_off_drops_the_effort_turn_and_closes_the_think_block() {
+        let t = ChatTemplate::from_source(GLM_HEAD.into(), Value::Null, Value::Null).unwrap();
+        let text = render(&t, json!({}));
+        assert_eq!(text, "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>");
+        assert_eq!(t.thinking_off(text.clone(), true), "[gMASK]<sop><|user|>hi<|assistant|><think></think>");
+        assert_eq!(t.thinking_off(text, false), "[gMASK]<sop><|user|>hi<|assistant|><think>");
+        assert_eq!(t.thinking_off("<|user|>hi".into(), true), "<|user|>hi");
     }
 
     fn effort_lines(t: &ChatTemplate) {

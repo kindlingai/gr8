@@ -138,6 +138,7 @@ class EndToEnd(unittest.TestCase):
         # no --default-max-tokens unless DEFAULT_MAX_TOKENS is set: the front end keeps all the room
         front = json.loads(read(os.path.join(self.homes[0], 'out', 'front.json')))
         self.assertIsNone(front['default_max_tokens'])
+        self.assertFalse(front['allow_thinking_off'])   # thinking off stays refused unless ALLOW_THINKING_OFF=1
         # a request through the shim: req.<id> lands in the head's directory only (the head engine sends the bytes on)
         self.assertEqual(self.request(), 6)
         self.assertTrue(any(n.startswith('req.') for n in os.listdir(os.path.join(self.homes[0], 's2'))))

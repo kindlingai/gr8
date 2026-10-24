@@ -130,6 +130,10 @@ class ValidateTests(unittest.TestCase):
                        '--default-thinking-budget', '4096'], {})
         opt.validate(o)
         self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
+        self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
+        o = opt.parse(['--no-config', '--peers', PEERS, '--allow-thinking-off', '1'], {})
+        opt.validate(o)
+        self.assertEqual(o.get('ALLOW_THINKING_OFF'), '1')
 
     def test_peers_resolve(self):
         o = opt.parse(['--no-config', '--peers', '127.0.0.1,127.0.0.2'], {})
