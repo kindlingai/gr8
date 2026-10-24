@@ -21,7 +21,11 @@ near-certain continuations would propose drafts that the target accepts. Python 
     python3 tools/ngram/ngram.py sizes traces.jsonl --floors 0.1,0.3,0.5,0.7,0.9
 
 `import-kl-ref` turns a `bench/gate` KL reference (16 greedy continuations of 256 tokens, top 20) into traces, which
-is enough to check the tools but too little and too varied to judge the table.
+checks the tools but is too little and too varied to judge the table. Its top lists come from a separate scoring pass:
+in `refs/tp4.json` 108 of 4,096 positions have the generated token outside first place.
+
+`sizes` sweeps the confidence floor (`--floors`), and at `--floor` the width (`--widths 2,3,4`) and the context lengths
+(`--ns-list "8,6,4,3;4,3;3"`).
 
 ## What the replay does
 
@@ -33,18 +37,23 @@ is enough to check the tools but too little and too varied to judge the table.
 - **Tree.** The rows - 1 nodes with the highest path probability (best first). Path probability falls along each path,
   so this is a valid tree and, for the stored probabilities, the one with the most expected accepted tokens. Trees
   need tree verification (#57).
-- **Rows.** By default the proposal is cut to the prefix with the most expected tokens per ms (`--fill` keeps every
-  row). Cost per round is the verify time of rows = drafts + 1 from `engine/runtime/spec_len.h` (TP4, 2200 MHz);
+- **Rows.** By default a table proposal is cut to the prefix with the most expected tokens per ms (`--fill` keeps every
+  row). Prompt lookup has no probabilities, so its proposals are never cut: it always fills the budget. Cost per round is the verify time of rows = drafts + 1 from `engine/runtime/spec_len.h` (TP4, 2200 MHz);
   lookups cost no GPU time.
 - **Acceptance.** Greedy: the longest proposed path equal to GLM's own tokens, plus the one token the verify step
   always commits.
 - **Sources.** `prompt` (#34's prompt lookup alone: the tokens after the latest earlier match of the last 4..2
-  tokens), `chain`, `tree`, and `chain+prompt` / `tree+prompt` (prompt lookup when the table has nothing).
+  tokens), `chain`, `tree`, and `chain+prompt` / `tree+prompt` (prompt lookup when the table proposes nothing).
+- **Folds.** By prompt: a prompt's traces are all on one side, so a rerun of the same prompt cannot teach the table its
+  own held-out answer. Exact repeats of a line are dropped on load.
 
 ## Columns
 
-`hit %`: rounds with a proposal. `accepted / hit`: draft tokens accepted per round with a proposal. `tokens / round`:
-committed per verify step. `tokens / row`: committed per verify row. `expected acc / round`: what the table's own
-probabilities predicted (calibration check). `speedup vs 1 row`: tokens per ms against plain decoding with the same
-verify table; it ignores the MTP or DFlash2 drafts the engine would otherwise make, so compare it with their own
-tokens per round from the engine's log, not with 1.
+`hit %`: rounds where the source had a proposal (for the table: an entry for the context, before the row cut).
+`used %`: rounds that verified drafts. `accepted / used`: draft tokens accepted per round that verified drafts.
+`tokens / round`: committed per verify step. `rows / round`, `tokens / row`: verify rows and tokens per row.
+`expected tokens / row` and `table acc / round: expected (actual)`: what the table's own probabilities predicted, over
+the rounds whose drafts came from the table (prompt lookup's rounds are left out), against what happened.
+`speedup vs 1 row`: tokens per ms against plain decoding with the same verify table. It ignores the MTP or DFlash2
+drafts the engine would otherwise make, so compare a source's tokens per round with theirs from the engine's log, not
+the speedup with 1.

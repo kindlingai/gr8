@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Desk tests for the n-gram draft source replay (no GPU, no network). Run: python3 -m unittest discover -s tools/ngram"""
+"""Desk tests for the n-gram draft source replay (no GPU, no network). Run: python3 -m unittest discover -s tools/ngram/tests"""
 import contextlib
 import io
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -96,10 +97,29 @@ class ProposalTest(unittest.TestCase):
         unsure = [(-1, 0, 0.1)]
         self.assertEqual(ng.trim(unsure, 8), [])                # 1.1 tokens / 52.4 ms < 1 / 43 ms
 
+    def test_hit_counts_before_the_trim(self):
+        tr = [trace([1, 2], [3], [[(3, 0.15), (4, 0.1)]])] * 2
+        t = ng.build(tr, ns=(2,), floor=0.1)
+        offered, nodes = ng.propose('chain', t, [1, 2], 8, True)
+        self.assertTrue(offered)
+        self.assertEqual(nodes, [])                             # 0.15 does not pay for a row
+        st = ng.replay_trace(trace([1, 2], [3]), t, 'chain', 8, True)
+        r = st.row()
+        self.assertEqual((r['hit_rate'], r['used_rate']), (1.0, 0.0))
+
     def test_prompt_lookup(self):
         ctx = [5, 6, 7, 8, 9, 1, 6, 7]
         self.assertEqual([x[1] for x in ng.prompt_lookup(ctx, 3)], [8, 9, 1])
         self.assertEqual(ng.prompt_lookup([1, 2, 3], 3), [])
+        self.assertIsNone(ng.prompt_lookup(ctx, 3)[0][2])       # no probabilities
+
+    def test_prompt_nodes_stay_out_of_calibration(self):
+        t = ng.build([], ns=(2,))
+        st = ng.replay_trace(trace([5, 6, 7, 5, 6], [7, 9, 1]), t, 'chain+prompt', 3, True)
+        r = st.row()
+        self.assertEqual(r['used_rate'], 0.5)
+        self.assertEqual(r['table_rounds'], 1)                  # the round without a proposal
+        self.assertEqual(r['expected_acc_per_round'], 0)
 
 
 class ReplayTest(unittest.TestCase):
@@ -119,9 +139,10 @@ class ReplayTest(unittest.TestCase):
         self.assertGreater(st.row()['speedup'], 3)
 
     def test_replay_is_held_out_and_reports_workloads(self):
+        # distinct prompts that share the loop's n-grams: other folds' traces teach the held-out one
         g = [3, 4, 1, 2] * 8
-        traces = [trace([1, 2], g, workload='code') for _ in range(4)] + \
-                 [trace([5, 6], [7, 8, 9] * 5, workload='prose') for _ in range(4)]
+        traces = [trace([100 + i, 1, 2], g, workload='code') for i in range(4)] + \
+                 [trace([200 + i, 5, 6], [7, 8, 9] * 5, workload='prose') for i in range(4)]
         res, sizes = ng.replay(traces, k=4, budgets=(3,), sources=('chain', 'prompt'), ns=(2,), min_count=1)
         self.assertEqual(len(sizes), 4)
         self.assertEqual(res[('chain', 3, 'all')].tokens, sum(len(t['gen']) for t in traces))
@@ -131,19 +152,36 @@ class ReplayTest(unittest.TestCase):
         self.assertIn('| all | chain | 3 |', md)
 
     def test_folds_partition(self):
-        traces = [{'i': i} for i in range(11)]
+        traces = [{'i': i, 'prompt': [i]} for i in range(11)]
         seen = []
         for train, test in ng.folds(traces, 5):
             self.assertEqual(len(train) + len(test), 11)
             seen += [t['i'] for t in test]
         self.assertEqual(sorted(seen), list(range(11)))
 
+    def test_folds_keep_a_prompt_on_one_side(self):
+        traces = [{'i': i, 'prompt': [i % 3]} for i in range(9)]
+        for train, test in ng.folds(traces, 3):
+            self.assertFalse({tuple(t['prompt']) for t in train} & {tuple(t['prompt']) for t in test})
+
+    def test_a_unique_prompt_alone_learns_nothing(self):
+        g = [3, 4, 1, 2] * 8
+        res, _ = ng.replay([trace([1, 2], g)] * 4, k=4, budgets=(3,), sources=('chain',), ns=(2,), min_count=1)
+        self.assertEqual(res[('chain', 3, 'all')].hits, 0)
+
+    def test_verify_table_matches_spec_len(self):
+        h = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'engine', 'runtime',
+                         'spec_len.h')
+        with open(h) as f:
+            m = re.search(r'double table\[KX \+ 2\] = \{([^}]*)\}', f.read())
+        self.assertEqual([float(x) for x in m.group(1).split(',')], ng.VERIFY_MS)
+
 
 class CliTest(unittest.TestCase):
     def test_import_kl_ref_and_replay(self):
         ref = {'topology': 'tp4', 'commit': 'abc', 'sequences': [
-            {'prompt_len': 2, 'ids': [1, 2] + [3, 4] * 6, 'pos': [[[t, -0.01], [9, -5.0]] for t in [3, 4] * 6]}
-            for _ in range(5)]}
+            {'prompt_len': 2, 'ids': [50 + i, 2] + [3, 4] * 6, 'pos': [[[t, -0.01], [9, -5.0]] for t in [3, 4] * 6]}
+            for i in range(5)]}
         with tempfile.TemporaryDirectory() as d:
             rp, tp, jp = (os.path.join(d, x) for x in ('ref.json', 't.jsonl', 'r.json'))
             with open(rp, 'w') as f:
@@ -161,6 +199,12 @@ class CliTest(unittest.TestCase):
                 out = json.load(f)
             row = [r for r in out['results'] if r['source'] == 'chain' and r['rows'] == 8 and r['workload'] == 'all'][0]
             self.assertGreater(row['tokens_per_round'], 3)
+
+    def test_load_drops_exact_repeats(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 't.jsonl')
+            ng.save_traces(p, [trace([1], [2]), trace([1], [2]), trace([1], [3])])
+            self.assertEqual(len(ng.load_traces(p)), 2)
 
     def test_bad_trace(self):
         with tempfile.TemporaryDirectory() as d:

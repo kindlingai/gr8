@@ -4,12 +4,13 @@ fields). Each prompt is chat-templated by the server (/tokenize with messages, a
 then generated greedily on /v1/completions with the top-k log-probabilities of every generated token. Stdlib only.
 
     python3 tools/ngram/capture.py --url http://127.0.0.1:8100 --prompts tools/ngram/data/prompts.json \
-        --out traces.jsonl [--max-tokens 1024] [--top 8] [--repeat 1]
+        --out traces.jsonl [--max-tokens 1024] [--top 8] [--effort low]
 
 The prompts file is a list of {"workload": ..., "messages": [...], "tools": [...] (optional)}. Workloads in the bundled
 set: code (write code), edit (change given code), tool (tool-call turns), json, prose. The output is one trace per line
-in ngram.py's format, with the server's model and the request settings. Traces from real traffic must stay local and
-scrubbed; this tool only sends the prompts it is given.
+in ngram.py's format, with the request settings. --out is appended to, so a stopped run can go on; ngram.py drops
+exact repeats and keeps every prompt's traces in one fold. Traces from real traffic must stay local and scrubbed; this
+tool only sends the prompts it is given.
 """
 import argparse
 import json
@@ -57,8 +58,8 @@ def capture_one(c, item, max_tokens, top, effort):
     tops = []
     for tok, e in zip(gen, tl):
         t = top_of(e)
-        # the sampled token comes first in the server's dict; keep only the top-k by value, with the sampled token
-        # kept only if it is among them (greedy: it is the first)
+        # the server's dict holds the sampled token and the top-k (ranks 1..k); sorted by value, the first k are the
+        # top-k (greedy: the sampled token is rank 1)
         tops.append(t[:top])
     return {'workload': item.get('workload', 'other'), 'prompt': prompt, 'gen': gen, 'top': tops,
             'finish_reason': ch.get('finish_reason')}
@@ -86,6 +87,7 @@ def main(argv=None):
             except (OSError, RuntimeError, KeyError, ValueError, urllib.error.URLError) as e:
                 print(f'[{i}] {item.get("workload")}: failed: {e}', file=sys.stderr)
                 continue
+            # the template's default effort thinks first: the trace then holds reasoning text before the answer
             tr['settings'] = {'max_tokens': a.max_tokens, 'top': a.top, 'effort': a.effort or 'default',
                               'temperature': 0}
             out.write(json.dumps(tr, separators=(',', ':')) + '\n')
