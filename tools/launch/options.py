@@ -37,11 +37,9 @@ KEYS = {
     'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
     'PORT': ('cluster', '8100', 'the OpenAI API port on the head'),
     'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
-    'MODEL': ('box', None, 'the exlr8 release (https://huggingface.co/<org>/<repo>[@rev], or a local copy), or a '
-                           'prepared pack directory'),
-    'BASE_PACKS': ('box', None, 'with an https:// --model: take the non-expert weights from this prepared pack directory '
-                                'instead of the release'),
-    'MODEL_CACHE': ('box', None, "this box's local directory for its shard of the model set"),
+    'MODEL': ('box', None, 'the exlr8 release: https://huggingface.co/<org>/<repo>[@rev], or a local copy (an NFS '
+                           'mount works) used in place'),
+    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
@@ -120,6 +118,16 @@ KEYS = {
     'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
     'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
     'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
+    'DSEL_MODEL': ('cluster', None, 'drafter choice priced from a frozen cost table, MTP rounds as the confidence stop runs them (G6_S2_DSEL_MODEL)'),
+    'DSEL_TABLE': ('cluster', None, 'DSEL_MODEL: the cost table, key:value list or a file (G6_S2_DSEL_TABLE; tools/s2_dsel_table.py)'),
+    'MTP_KSTOPB': ('cluster', None, 'shared rounds: each session verifies its own count of the MTP drafts (G6_MTP_KSTOPB)'),
+    'MTP_KSTOPB_KMIN': ('cluster', None, 'MTP_KSTOPB: the least drafts a session verifies, 0 or 1 (G6_MTP_KSTOPB_KMIN)'),
+    'MTP_KSTOPB_TAU': ('cluster', None, 'MTP_KSTOPB thresholds t1,t2,... at every session count (G6_MTP_KSTOPB_TAU)'),
+    'MTP_KSTOPB_TAU_S': ('cluster', None, 'MTP_KSTOPB thresholds per session count, n:t1,t2/n:t1,t2... (G6_MTP_KSTOPB_TAU_S<n>)'),
+    'L2PF': ('cluster', None, "decode: paced L2 prefetch of the next weights in the step's idle-DRAM windows, window mask (G6_L2PF)"),
+    'CP_STEP_ROWS': ('cluster', None, 'S2: a step past SHARE_LIMIT carries at most this many rows; the CP fabric is sized for it (G6_CP_STEP_ROWS)'),
+    'CP_STEP_SEG': ('cluster', None, 'S2 with CP_STEP_ROWS: a round past SHARE_LIMIT takes only sessions past it (G6_CP_STEP_SEG)'),
+    'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
     'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
                              'needs V2_DENSE)'),
     'PF_GEMMF32': ('cluster', None, 'prefill: the row-owner QO o_proj with an FP32 epilogue, PF_OWN=3 (G6_PF_GEMMF32)'),
@@ -303,7 +311,7 @@ def parse(argv, environ=None):
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
-    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT', 'BASE_PACKS',
+    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
               'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or \
                 (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
@@ -559,7 +567,7 @@ def resolve_peers(o):
     return out
 
 
-# ---- the engine plan: scripts/engine_args.sh, so the ssh launchers and the supervisor start the same engine ---------
+# ---- the engine plan: scripts/engine_args.sh --------------------------------------------------------------------------
 def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
                 kv_store=None, kv_rows=None):
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.

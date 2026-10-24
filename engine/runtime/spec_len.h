@@ -71,10 +71,6 @@ struct SpecLen
     double pos_decay = 0.9;           // per round: the position rate follows the text within a few dozen rounds
     double bucket_decay = 0.998;      // the calibration of the drafter's probability changes slowly
     double prior = 4;                 // pseudo-rounds of the fallback in each estimate
-    // per-position clocks (G6_S2_DSEL_POSCLK, the drafter choice's estimates): a round decays only the positions it
-    // observes (1..min(k, a + 1)), so rounds that see position 1 alone (DSel's MTP score on DFlash2 rounds) leave the
-    // later positions' evidence as it was. Off: every round decays every position
-    bool posclk = false;
     long rounds = 0, chosen[KX + 1] = {};
     double pred_sum = 0, got_sum = 0; // predicted and actual tokens per round, summed (log line)
 
@@ -167,7 +163,7 @@ struct SpecLen
     // a round verified k drafts and accepted a of them. lp[1..k]: the drafts' log-probabilities (null: none)
     void observe(int k, int a, const float* lp, double predicted)
     {
-        for (int j = 1; j <= (posclk ? std::min(k, a + 1) : KX); ++j)
+        for (int j = 1; j <= KX; ++j)
         {
             pn[j] *= pos_decay; pk[j] *= pos_decay;
             for (int b = 0; b < NB; ++b) { bn[j][b] *= bucket_decay; bk[j][b] *= bucket_decay; }

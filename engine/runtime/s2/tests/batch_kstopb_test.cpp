@@ -233,7 +233,7 @@ int main()
         CHECK(bad == 0 && xr > 10 && xw.size() >= 4);
         for (int q = 0; q < N; ++q) CHECK(exact(b, q, ss[q]));
     }
-    // 5. a DFlash2 session (solo MTP rounds under G6_MTP_KSTOP, kmax 3) demoted into shared rounds with the stop, then
+    // 5. a DFlash2 session (with G6_MTP_KSTOP, kmax 3, or without) demoted into shared rounds with the stop, then
     // promoted back when alone (G6_DFL_REUSE=2): shared rounds follow the rule, every token is the target's
     for (int solo_kstop : {0, 1})
     {
@@ -241,7 +241,7 @@ int main()
         Batch b(K, 32, f.hooks(true));
         b.dflash(7, g6rt::SpecLen());
         DSel sel;
-        sel.on = true; sel.start_mtp = true;
+        sel.on = true;
         sel.d.draft_round = 8.1; sel.m.draft_round = 5.5; sel.m.draft_each = 2.1;
         b.dsel(sel);
         KStop ks; ks.b = rule_on(0.6, 0.88);

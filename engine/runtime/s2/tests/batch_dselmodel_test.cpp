@@ -75,11 +75,11 @@ static DSelTable table(const char* s)
 }
 static const char* TAB = "v2:49.6,v3:57,v4:64,v8:104,d:6.9,m:2,e:1.17,p:4.9,g:2,k:3,n:3";
 static const char* TABW = "v2:49.6,v3:57,v4:64,v8:104,d:6.9,m:2,e:1.17,p:4.9,g:2,k:3,n:3,w:1";   // the estimates' prior at 1 round
-static DSel dsel(int model, const DSelTable& t, bool start_mtp = false)
+static DSel dsel(int model, const DSelTable& t)
 {
     DSel sel;
-    sel.on = true; sel.start_mtp = start_mtp; sel.probe = 8;
-    sel.d.draft_round = 8.1; sel.m.draft_round = 2.9; sel.m.draft_each = 2.1;   // the fixed-K serving MCOST
+    sel.on = true; sel.probe = 8;
+    sel.d.draft_round = 8.1; sel.m.draft_round = 2.9; sel.m.draft_each = 2.1;   // fixed-K pricing: an MTP round at 2.9 ms
     sel.model = model; sel.tab = t;
     return sel;
 }
@@ -122,8 +122,8 @@ int main()
         }
     }
     // 2. MTP under the stop verifies three confident right drafts (4 tokens per ~68 ms) against DFlash2's 3 of 7 (4 per
-    //    ~111 ms): the model moves to MTP and stays; the fixed-K pricing (MTP's second position at its seed, MCOST
-    //    2.9) keeps DFlash2. Every committed token is the target's either way
+    //    ~111 ms): the model moves to MTP and stays; the fixed-K pricing (MTP's second position at its seed, an MTP
+    //    round at 2.9 ms) keeps DFlash2. Every committed token is the target's either way
     for (int model : {0, 1})
     {
         Fake f;
@@ -147,8 +147,8 @@ int main()
         }
     }
     // 3. MTP under the stop drafts d2 wrong and unsure (0.95 x 0.3 < 0.5), so it verifies one draft (2 tokens per ~53 ms)
-    //    against DFlash2's 5 of 7 (6 per ~111 ms): a request starting on MTP moves to DFlash2 and stays, although the
-    //    table's prior (g 2, three drafts) first prices MTP high
+    //    against DFlash2's 5 of 7 (6 per ~111 ms): MTP does not displace DFlash2, although the table's prior (g 2,
+    //    three drafts) first prices MTP high
     {
         Fake f;
         f.mtp_depth = 1;
@@ -156,7 +156,7 @@ int main()
         f.dright = 5;
         Batch b(2, 32, f.hooks());
         b.dflash(7, g6rt::SpecLen());
-        b.dsel(dsel(1, table(TAB), true));
+        b.dsel(dsel(1, table(TAB)));
         b.kstop(kstop3());
         b.admit({0}, {session()});
         for (int i = 0; i < 300; ++i) CHECK(b.round({0}));
@@ -248,9 +248,9 @@ int main()
             else CHECK(f.trace == ref);
         }
     }
-    // 7. model 2: the DFlash2 rounds' own draft count (--spec-adaptive) prices its verify from the table too. With an
-    //    8-row verify at 1000 ms it stops verifying seven drafts; model 1 keeps spec_len.h's table and verifies seven
-    for (int model : {1, 2})
+    // 7. the table is the drafter choice's only: the DFlash2 rounds' own draft count (--spec-adaptive) keeps spec_len.h's
+    //    verify table (G6_SPEC_TABLE prices that), so a table with an 8-row verify at 1000 ms still verifies seven
+    for (int model : {0, 1})
     {
         Fake f;
         f.dright = 7; f.mtp_depth = 0;              // DFlash2 drafts all right, MTP's first draft wrong: no MTP rounds
@@ -263,11 +263,10 @@ int main()
         b.admit({0}, {session()});
         for (int i = 0; i < 60; ++i) CHECK(b.round({0}));
         const int full = count(f, 8, 8, 20), seven = count(f, 7, 7, 20);
-        if (model == 1) CHECK(full == 40);
-        else CHECK(full == 0 && seven == 40);
+        CHECK(full == 40 && seven == 0);
         CHECK(exact(f.got));
     }
-    // 8. structured text (fleet 10-15: structured -21 % with the model). MTP verifies three confident right drafts (4
+    // 8. structured text (on four GB10: structured -21 % with the model and no r). MTP verifies three confident right drafts (4
     //    tokens per v4 + m + 2e = 68.3 ms), DFlash2 seven (8 per v8 + d = 104.1 ms), but for a stretch DFlash2 drafts one
     //    right. With the position-rate estimate the model moves to MTP in the stretch and never comes back: MTP is now
     //    priced at its real 0.057 tokens/ms, so coming back needs 0.066, more than a seven-for-seven block's estimate
@@ -302,7 +301,7 @@ int main()
             Batch b(2, 32, f.hooks());
             b.dflash(7, g6rt::SpecLen());
             DSel sel = dsel(arm ? 1 : 0, table(arm == 2 ? withr.c_str() : M0));
-            sel.probe = 32;                            // the serving setting
+            sel.probe = 32;                            // the probe interval the table was measured with
             b.dsel(sel);
             b.kstop(kstop3());
             b.admit({0}, {session()});
@@ -311,7 +310,7 @@ int main()
             tps[arm] = speed(f, b);
             CHECK(b.stats(0).switches >= 1 && exact(f.got));
         }
-        CHECK(tps[1] < 0.95 * tps[0]);                 // the model alone loses to fixed-K (fleet: -21 %)
+        CHECK(tps[1] < 0.95 * tps[0]);                 // the model alone loses to fixed-K (measured: -21 %)
         CHECK(tps[2] >= tps[0]);                       // r: at least fixed-K
         for (int arm = 0; arm < 2; ++arm)              // prose: model, model + r
         {

@@ -65,10 +65,10 @@
 //                     (s2/service.h, head = rank 0 on the bootstrap address, port N); DIR is this rank's fresh S2 directory
 //                     (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2). Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3.
 //                     Without --serve the --prompt sequences run once and the process exits.
-//      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident from tools/convert/pairpack.py; or
+//      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident; or
 //                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
 //      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
-//                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from tools/convert/dflash2.py. --dflash-sel 1 =
+//                     drafter (dflash.cuh): 7 drafts per round in one forward; DP from engine/loader-rs/src/dflash2.rs. --dflash-sel 1 =
 //                     the DFlash2 selector walk (default when the pack has it), 0 = argmax drafts; --dflash-k K = verify
 //                     only the first K drafts (verify steps of K + 1 rows, default 7). No --mtp, except under S2: there a
 //                     session alone at its prompt tail drafts with DFlash2 and goes to MTP when a second one arrives (s2_batch.h).
@@ -164,8 +164,8 @@ int main(int argc, char** argv)
     std::string manifest, packfile;
     V2Src v2src;
     g6rt::CommonOpts co;                // every flag m4sim takes too, parsed in engine_opts.h
-    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights (tools/convert/pairpack.py), G6_PF_OWN=4
-    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (tools/convert/dflash2.py)
+    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights, G6_PF_OWN=4
+    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (engine/loader-rs/src/dflash2.rs)
     int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
     int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
 #if G6_MODEL_FLASH
@@ -396,7 +396,8 @@ int main(int argc, char** argv)
         kstop.solo = kstop.mode == 1 && !dfl;
         // G6_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
         // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least G6_MTP_KSTOPB_KMIN (0|1, default 0).
-        // G6_MTP_KSTOPB_TAU=t1[,t2[,...]] (default 0.6,0.88,0.95; past the last entry there is no stop - the remaining drafts all verify) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n sessions.
+        // G6_MTP_KSTOPB_TAU=t1[,t2[,...]] (up to 7; default 0.6,0.88) at every session count, G6_MTP_KSTOPB_TAU_S<n> at n
+        // sessions; past the configured entries there is no stop (the remaining drafts all verify).
         // G6_MTP_KSTOPB_WIDTHS=M,..: the main widths captured besides the multiples of K + 1 (default every width the rule reaches;
         // a width outside them takes the next most likely drafts). G6_MTP_KSTOPB_EXPLORE=n (measurement): every n-th
         // round's shared sessions verify a hashed k_q instead. In the S2 runtime signature
@@ -418,7 +419,7 @@ int main(int argc, char** argv)
             }
             return t;
         };
-        double bt[8] = {0, 0.6, 0.88, 0.95, 0, 0, 0, 0};   // past the configured entries there is no stop: the remaining drafts all verify (tau = 0)
+        double bt[8] = {0, 0.6, 0.88, 0.95, 0, 0, 0, 0};   // tau 0 past the entries: no stop there
         if (getenv("G6_MTP_KSTOPB_TAU")) { const auto t = nums("G6_MTP_KSTOPB_TAU", 7); std::copy(t.begin(), t.end(), bt + 1); }
         for (int S = 1; S <= s2::S2N_SLOTS; ++S)
         {
@@ -501,7 +502,11 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
     }
     if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
-    if (dfl) for (int M = 1; M <= dfl_k + 1; ++M) if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);   // first-form: accepted-prefix a (0..dfl_k) -> M = a + 1
+    // a DFlash2 round's MTP first form runs on the accepted prefix + 1 rows (1 .. dfl_k + 1): capture every one of them
+    // (the prompt chunk and the verify widths above cover them for a block-8 drafter, not for a wider one)
+    if (dfl && mtp)
+        for (int M = 1; M <= dfl_k + 1; ++M)
+            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
     for (int M = 2; M <= kstop.kmax + 1; ++M)   // G6_MTP_KSTOP: solo MTP verifies of 2..kmax + 1 rows, first forms of as many
     {
         if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
@@ -726,20 +731,11 @@ int main(int argc, char** argv)
     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
     if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die("G6_QA_SPLIT, G6_IDXQ_SPLIT and G6_MTP_SPLIT are GLM-5.3 paths");
     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
-    // G6_S2_DSEL_START=mtp (s2_batch.h DSel::start_mtp; default dflash): a DFlash2 request starts on MTP. In the S2 runtime
-    // signature
-    const char* dse = getenv("G6_S2_DSEL_START");
-    const bool dsel_start_mtp = dse && !strcmp(dse, "mtp");
-    if (dse && *dse && !dsel_start_mtp && strcmp(dse, "dflash")) die("G6_S2_DSEL_START: mtp or dflash");
-    // G6_S2_DSEL_POSCLK=1 (spec_len.h SpecLen::posclk; default 0): the drafter choice's estimates decay a position only on
-    // rounds that observe it. In the S2 runtime signature
-    std::string pce;
-    const int dsel_posclk = env_choice("G6_S2_DSEL_POSCLK", 1, 0, &pce);
-    if (dsel_posclk < 0) die(pce);
-    // G6_S2_DSEL_MODEL=1|2 + G6_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
+    // G6_S2_DSEL_MODEL=1 + G6_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
     // choice prices both drafters from one frozen cost table and MTP rounds under the confidence stop. Every rank reads
     // the same table; its canonical form is in the S2 runtime signature
-    const int dsel_model = env_choice("G6_S2_DSEL_MODEL", 2, 0, &pce);
+    std::string pce;
+    const int dsel_model = env_choice("G6_S2_DSEL_MODEL", 1, 0, &pce);
     if (dsel_model < 0) die(pce);
     s2::DSelTable dsel_tab;
     if (dsel_model)
@@ -1444,9 +1440,10 @@ int main(int argc, char** argv)
         g6s2::Config sc;
         sc.epoch = s2epoch;
         sc.pool_rows = (uint32_t)(cap / 64 * 64);
-        // one step bounds: a round (every session's mtp + 1 rows) and a prompt chunk (sessions.h: chunk <= max_rows)
-        // one step bounds: a round (every session's mtp + 1 rows), a prompt chunk (sessions.h: chunk <= max_rows) and the DFlash2 verify width
-        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>({(uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk, dfl ? (uint32_t)(dfl_k + 1) : 0u}));
+        // one step bounds: a round (every session's mtp + 1 rows), a prompt chunk (sessions.h: chunk <= max_rows) and a
+        // DFlash2 verify (dfl_k + 1 rows)
+        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>({(uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk,
+                                                                  dfl ? (uint32_t)(dfl_k + 1) : 0u}));
         sc.max_sessions = (uint32_t)s2sess;
         sc.mtp = (uint32_t)mtp;
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the offline loop's cap rule
@@ -2036,8 +2033,6 @@ int main(int argc, char** argv)
                 if (const char* e = getenv("G6_S2_DSEL_MARGIN")) h.dsel.margin = atof(e);
                 if (const char* e = getenv("G6_S2_DSEL_DWELL")) h.dsel.dwell = std::max(1, atoi(e));
                 if (const char* e = getenv("G6_S2_DSEL_PROBE")) h.dsel.probe = std::max(1, atoi(e));
-                h.dsel.start_mtp = dsel_start_mtp;
-                h.dsel.posclk = dsel_posclk;
                 h.dsel.d.draft_round = 5.6 + 2.5;
                 h.dsel.m.draft_round = 2.5 + 3.0;
                 h.dsel.m.draft_each = 2.1;
@@ -2059,23 +2054,17 @@ int main(int argc, char** argv)
                     h.dsel.d.draft_round = d[0]; h.dsel.m.draft_round = d[1]; h.dsel.m.draft_each = d[2];
                     if (R == 0) fprintf(stderr, "# spec: drafting ms from G6_SPEC_DRAFT: %s\n", e);
                 }
-                // the drafting ms above, overridden (A/B of the cost model; every rank the same values)
-                if (const char* e = getenv("G6_S2_DSEL_DCOST")) h.dsel.d.draft_round = atof(e);
-                if (const char* e = getenv("G6_S2_DSEL_MCOST")) h.dsel.m.draft_round = atof(e);
-                if (const char* e = getenv("G6_S2_DSEL_MEACH")) h.dsel.m.draft_each = atof(e);
-                h.dsel.model = dsel_model;    // the table replaces the drafting ms above (Batch::dsel)
+                h.dsel.model = dsel_model;    // the table replaces the drafter choice's verify table and drafting ms above (Batch::dsel)
                 h.dsel.tab = dsel_tab;
                 if (R == 0 && dsel_model)
                 {
-                    fprintf(stderr, "# s2 drafter choice cost model %d: table %s%s\n", dsel_model, dsel_tab.str().c_str(),
-                            dsel_model > 1 ? " (also the DFlash2 draft count)" : "");
-                    for (const char* o : {"G6_S2_DSEL_DCOST", "G6_S2_DSEL_MCOST", "G6_S2_DSEL_MEACH"})
-                        if (getenv(o)) fprintf(stderr, "# warning: %s is ignored under G6_S2_DSEL_MODEL (the table's d, m, e)\n", o);
+                    fprintf(stderr, "# s2 drafter choice cost model %d: table %s\n", dsel_model, dsel_tab.str().c_str());
+                    if (getenv("G6_SPEC_TABLE") || getenv("G6_SPEC_DRAFT"))
+                        fprintf(stderr, "# note: the drafter choice reads the table's v1..v8, d, m, e, not G6_SPEC_TABLE / G6_SPEC_DRAFT; "
+                                        "G6_SPEC_TABLE still prices the DFlash2 rounds' own draft count\n");
                 }
-                if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d, "
-                                                    "drafting ms: DFlash2 %.2f, MTP %.2f + %.2f per chain step)\n",
-                                                    h.dsel.dwell, h.dsel.margin, h.dsel.probe, h.dsel.d.draft_round, h.dsel.m.draft_round,
-                                                    h.dsel.m.draft_each);
+                if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
+                                                    h.dsel.dwell, h.dsel.margin, h.dsel.probe);
                 h.kstop = kstop;
                 if (R == 0 && kstop.mode)
                     fprintf(stderr, "# s2 MTP confidence stop: mode %d, solo MTP rounds verify 1..%d drafts (%s)%s\n", kstop.mode, kstop.kmax,
@@ -2098,8 +2087,6 @@ int main(int argc, char** argv)
                 h.dfl_reuse.min = dfl_reuse_min;
                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
                                                  dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
-                if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
-                if (R == 0 && h.dsel.on && h.dsel.posclk) fprintf(stderr, "# s2 drafter choice: per-position clocks\n");
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 // G6_DFL_REUSE: also a hit into the window (the fill starts past its rows) and a hit with no prefill at all
                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1 || slot_whole[q]; };
@@ -2202,9 +2189,7 @@ int main(int argc, char** argv)
                 (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_body_i4_on ? " dflbodyi4 1" : "") +
-                (dsel_start_mtp ? " dselstart mtp" : "") +
                 (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
-                (dsel_posclk ? " dselposclk 1" : "") +
                 (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
                 (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
                 (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "");

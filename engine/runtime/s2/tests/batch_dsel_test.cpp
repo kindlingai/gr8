@@ -42,7 +42,6 @@ int main()
     sel.on = true;
     sel.d.draft_round = 8.1; sel.m.draft_round = 5.5; sel.m.draft_each = 2.1;
     b.dsel(sel);
-    const DSel sel0 = sel;   // the start_mtp case below uses these costs, not the reset case's MTP-cheap table
     Session s; s.prompt.assign(10, 5); s.first = 9; s.chunk = 8; s.n_gen = 4000; s.dflash = true;
     b.admit({0}, {s});
     for (int i = 0; i < 40; ++i) CHECK(b.round({0}));
@@ -81,23 +80,6 @@ int main()
         for (int i = 0; i < 40; ++i) CHECK(b.round({0}));
         CHECK(!rounds.empty() && rounds.back() == 'm');
         CHECK(b.stats(0).mtp_rounds > 0);
-    }
-    // DSel::start_mtp: the same request starts on MTP (first round 'm', its d[2..K] chained at admit), and the drafter's
-    // prompt-tail probe and later probes move it to DFlash2; every committed token is still the target's
-    {
-        Batch c(3, 32, h);
-        c.dflash(7, g6rt::SpecLen());
-        DSel s2 = sel0;
-        s2.start_mtp = true;
-        c.dsel(s2);
-        rounds.clear(); got.clear();
-        c.admit({0}, {s});
-        for (int i = 0; i < 60; ++i) CHECK(c.round({0}));
-        CHECK(rounds.size() == 60 && rounds[0] == 'm' && rounds.back() == 'd');
-        CHECK(c.stats(0).switches == 1 && c.stats(0).mtp_rounds >= 8);
-        bool ex = true;
-        for (size_t i = 0; i < got.size(); ++i) ex &= got[i] == target(9 + (int)i);
-        CHECK(ex && got.size() > 60);
     }
     std::printf("batch_dsel_test: %s (%ld rounds, %ld on MTP, %ld switches)\n", fails ? "FAIL" : "PASS", b.stats(0).rounds,
                 b.stats(0).mtp_rounds, b.stats(0).switches);

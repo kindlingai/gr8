@@ -45,23 +45,22 @@ static void after_tests()
 {
     long checked = 0;
     for (int cap : {4096, 65536 + 64, 212224, 262144})
-        for (int base : {0, 2048, 4096})
-            for (int R : {-1, 0, 64, 2048, 30016, 32768, 65536, 98304, 212224, 300000})
-                for (int doublings : {7, 8}) {
-                    int bk[9] = {};
-                    const int nbk = context_buckets(bk, base, cap, R > 0 ? R : 0, doublings);
-                    const uint64_t t = cp_after(bk, nbk, R);
-                    auto bucket_of = [&](int ctx) { for (int k = 0; k < nbk; ++k) if (bk[k] >= ctx) return k; return nbk - 1; };
-                    for (int ctx = 1; ctx <= cap + 64; ctx += (ctx < 4200 ? 1 : 61)) {
-                        const bool engine = R >= 0 && bk[bucket_of(ctx)] > R;
-                        CHECK((uint64_t(ctx) > t) == engine);
-                        ++checked;
-                    }
-                    for (int k = 0; k < nbk; ++k) {   // the bucket boundaries themselves and one past them
-                        CHECK((uint64_t(bk[k]) > t) == (R >= 0 && bk[bucket_of(bk[k])] > R));
-                        CHECK((uint64_t(bk[k]) + 1 > t) == (R >= 0 && bk[bucket_of(bk[k] + 1)] > R));
-                    }
+        for (int base : {0, 512, 2048, 4096})
+            for (int R : {-1, 0, 64, 2048, 30016, 32768, 65536, 98304, 212224, 300000}) {
+                int bk[8] = {};   // rank.cuh NBK
+                const int nbk = context_buckets(bk, base, cap, R > 0 ? R : 0);
+                const uint64_t t = cp_after(bk, nbk, R);
+                auto bucket_of = [&](int ctx) { for (int k = 0; k < nbk; ++k) if (bk[k] >= ctx) return k; return nbk - 1; };
+                for (int ctx = 1; ctx <= cap + 64; ctx += (ctx < 4200 ? 1 : 61)) {
+                    const bool engine = R >= 0 && bk[bucket_of(ctx)] > R;
+                    CHECK((uint64_t(ctx) > t) == engine);
+                    ++checked;
                 }
+                for (int k = 0; k < nbk; ++k) {   // the bucket boundaries themselves and one past them
+                    CHECK((uint64_t(bk[k]) > t) == (R >= 0 && bk[bucket_of(bk[k])] > R));
+                    CHECK((uint64_t(bk[k]) + 1 > t) == (R >= 0 && bk[bucket_of(bk[k] + 1)] > R));
+                }
+            }
     CHECK(checked > 100000);
 }
 

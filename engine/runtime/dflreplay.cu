@@ -5,7 +5,7 @@
 // target's trajectory is the dump's; matched, unlike two live runs whose acceptance changes what follows).
 //
 // dflreplay DIR DUMP [--sel 0|1] [--head-i4 0|1] [--temp T] [--seed S] [--top-p P] [--rounds N] [--bench N] [--out FILE]
-//   DIR/dflash.r<r>.manifest.json + .pack   drafter packs (tools/convert/dflash2.py), as dfltest
+//   DIR/dflash.r<r>.manifest.json + .pack   drafter packs (engine/loader-rs/src/dflash2.rs), as dfltest
 //   DIR/head.r<r>.manifest.json + .pack     the target lm_head slice of rank r (dflash2.py --head), as dfltest
 //   DIR/emb.bin   int32 n, int32 ids[n], float32 rows[n][6144]: the target embedding rows of the dump's bonus tokens and
 //                 the mask token (engine/ref/dflreplay_emb.py writes it)

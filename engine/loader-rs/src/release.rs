@@ -1,7 +1,7 @@
 //! A rank's whole image from the exlr8 v2 release alone, planned at boot: no gr8 rank pack. Every non-expert tensor
 //! comes from the release's dense and vocabulary files (src/exlr8.rs), the routed and shared experts from the width
 //! files at the index slices' offsets (src/v2plan.rs, as `--v2` plans them). The tensors and their names are the ones
-//! the engine binds from a converted pack (tools/convert/convert.py), in the forms it reads today:
+//! the engine binds from a converted pack, in the forms it reads today:
 //!
 //!   exact (the release's bytes, or a re-layout of them):
 //!     norms, router weight and bias, indexer weights_proj and k_norm: as stored (+ BF16 decode records)
@@ -445,7 +445,7 @@ impl Planner {
         Ok(())
     }
 
-    /// G6_PF_OWN=3's full-head weights of layer l, the tensors tools/convert/qopack.py assembles from the rank packs:
+    /// G6_PF_OWN=3's full-head weights of layer l, the full-head QO tensors:
     /// q_b and o_proj as MXFP8 for all 64 heads, UK and UV in BF16. MXFP8 scales cover 32 inputs of one row, so the
     /// whole matrix rounds to the concatenation of the rank slices.
     fn full_heads(&mut self, l: usize, p: &str, f: &Arc<StFile>) {
@@ -596,6 +596,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     if model.is_some() && !is_flash { return Err(format!("{dense_dir}: model metadata of an unsupported model")); }
     let model = model.unwrap_or(Json::Null);
     if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
+    if is_flash && opts.kvb_fp8 { return Err("G6_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
     let last = if is_flash { 45 } else { L_MTP };
     if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     let mut moe = 0;

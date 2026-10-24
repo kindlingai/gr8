@@ -317,6 +317,61 @@ class Completions(unittest.TestCase):
         self.assertEqual(r['usage']['completion_tokens'], 16)
 
 
+class StepStats(unittest.TestCase):
+    """`return_step_stats`: the request's share of the /metrics speculative-decoding counters in `usage.step_stats`.
+    Each test runs its requests one at a time, so the /metrics delta around one is that request's."""
+    SPEC = {'steps': 'vllm:spec_decode_num_drafts_total', 'draft_tokens': 'vllm:spec_decode_num_draft_tokens_total',
+            'accepted_tokens': 'vllm:spec_decode_num_accepted_tokens_total'}
+
+    def counters(self):
+        return {k: metric(m) for k, m in self.SPEC.items()}
+
+    def check(self, st, before, usage):
+        after = self.counters()
+        for k in self.SPEC:
+            self.assertEqual(st[k], after[k] - before[k], k)
+        self.assertGreater(st['steps'], 0)
+        self.assertEqual(sum(st['accepted_per_pos']), st['accepted_tokens'])
+        self.assertEqual(st['generated_tokens'], usage['completion_tokens'])
+        self.assertGreater(st['decode_s'], 0)
+        self.assertGreaterEqual(st['prefill_s'], 0)
+
+    def test_only_when_asked(self):
+        s, r = post('/v1/chat/completions', CHAT)
+        self.assertNotIn('step_stats', r['usage'])
+        chunks = sse('/v1/chat/completions', dict(CHAT, stream_options={'include_usage': True}))
+        self.assertNotIn('step_stats', chunks[-1]['usage'])
+        chunks = sse('/v1/chat/completions', dict(CHAT, return_step_stats=True))   # no usage chunk: nowhere to put it
+        self.assertTrue(all('usage' not in c for c in chunks))
+
+    def test_chat_and_completions_match_the_metrics(self):
+        for path, body in (('/v1/chat/completions', CHAT),
+                           ('/v1/completions', {'model': 'glm-5.3', 'prompt': 'Once upon a time', 'max_tokens': 40})):
+            body = dict(body, return_step_stats=True)
+            before = self.counters()
+            s, r = post(path, body)
+            self.assertEqual(s, 200)
+            self.check(r['usage']['step_stats'], before, r['usage'])
+            before = self.counters()
+            chunks = sse(path, dict(body, stream_options={'include_usage': True}))
+            self.assertEqual(chunks[-1]['choices'], [])
+            self.check(chunks[-1]['usage']['step_stats'], before, chunks[-1]['usage'])
+            self.assertTrue(all('usage' not in c for c in chunks[:-1]))
+
+    def test_a_stop_string_waits_for_the_engine_counters(self):
+        body = {'model': 'glm-5.3', 'prompt': 'Tell me a story.', 'max_tokens': 200, 'stop': ['keeper'],
+                'return_step_stats': True}
+        before = self.counters()
+        s, r = post('/v1/completions', body)
+        self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+        st = r['usage']['step_stats']
+        after = self.counters()
+        for k in self.SPEC:
+            self.assertEqual(st[k], after[k] - before[k], k)
+        # the engine ran past the stop string until the cancel reached it
+        self.assertGreaterEqual(st['generated_tokens'], r['usage']['completion_tokens'])
+
+
 class Misc(unittest.TestCase):
     def test_tokenize_text_count(self):
         s, r = post('/tokenize', {'model': 'glm-5.3', 'prompt': 'hello world'})

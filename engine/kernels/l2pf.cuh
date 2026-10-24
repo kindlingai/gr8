@@ -3,8 +3,8 @@
 // docs/engine.md "A paced L2 prefetch in the step's windows"; TensorFold's paced one-block prefetch): one warp on a
 // high-priority side stream issues cp.async.bulk.prefetch.L2 of 8 KiB chunks from a token bucket (G6_L2PF_GBPS, in
 // waves of at most G6_L2PF_WAVE chunks), up to a byte budget per window, and a collective window ends once its
-// collective has arrived (a second warp polls the peers' tails, as k_wait_peers does). Not the burst our G6_OPROJ_PF
-// tried (8 CTAs issuing at once: dependent loads 427 -> 2049 ns in dsgx10's measurement, our attention +12..43 us):
+// collective has arrived (a second warp polls the peers' tails, as k_wait_peers does). Not a burst (an earlier
+// experiment of ours had 8 CTAs issue at once: dependent loads 427 -> 2049 ns in dsgx10's measurement, attention +12..43 us):
 // small waves leave the attention's dependent loads alone (436 ns at 175 GB/s in waves of 8).
 // cp.async.bulk.prefetch.L2 (sm_90+, so sm_121a): one instruction per chunk handled by the bulk-copy unit, no register,
 // no shared memory, no completion to wait for; it writes nothing and changes no load's value, so every output byte is

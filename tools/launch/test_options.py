@@ -215,6 +215,23 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
         self.assertEqual(da, self.digest('--cap', '485376', '--share-limit', '32768', '--sess', '8', '--dflash', '1')[2])
 
+    def test_l2pf_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_L2PF', text)
+        _, text, _ = self.digest('--l2pf', '15')
+        self.assertIn(' G6_L2PF=15', text)
+
+    def test_cp_step_rows_reaches_every_rank(self):
+        _, text, d0 = self.digest()
+        self.assertNotIn('G6_CP_STEP_', text)
+        _, text, d8 = self.digest('--cp-step-rows', '8')
+        self.assertIn(' G6_CP_STEP_ROWS=8', text)
+        self.assertNotIn('G6_CP_STEP_SEG', text)
+        self.assertNotEqual(d0, d8)
+        _, text, _ = self.digest('--cp-step-rows', '8', '--cp-step-seg', '1')
+        self.assertIn(' G6_CP_STEP_ROWS=8', text)
+        self.assertIn(' G6_CP_STEP_SEG=1', text)
+
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
         self.assertIn('CAP=485376\n', text)              # 2,280 physical pages per rank at TP=4, as at 65536
@@ -238,6 +255,12 @@ class CanonicalTests(unittest.TestCase):
         # a knob set to its default, or one this TP does not read, changes nothing
         self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '485376', '--reuse', '1', '--g6args-x', '--top 5')[2])
 
+    def test_cp_onechain_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_CP_ONECHAIN', text)
+        _, text, _ = self.digest('--cp-onechain', '1')
+        self.assertIn(' G6_CP_ONECHAIN=1', text)
+
     def test_template_has_no_paths(self):
         _, text, _ = self.digest('--g6-home', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
         self.assertNotIn('/very/own/home', text)
@@ -245,6 +268,13 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--manifest @RANKDIR/rank@R.manifest.json', text)
         self.assertIn('--v2 @V2', text)
         self.assertIn('--v2-widths @V2_WIDTHS', text)
+
+    def test_dsel_model_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_S2_DSEL_MODEL', text)
+        tab = 'v2:46.63,v3:54.71,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,w:1,r:0.95'
+        _, text, _ = self.digest('--dsel-model', '1', '--dsel-table', tab)
+        self.assertIn(' G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=' + tab, text)
 
     def test_release_alone_has_no_rank_pack(self):
         _, text, _ = self.digest('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel')
@@ -263,6 +293,16 @@ class CanonicalTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError):
             self.digest('--v2-dense-form', 'exact')
 
+    def test_mtp_kstopb_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_MTP_KSTOPB', text)
+        _, text, _ = self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau', '0.6,0.88',
+                                 '--mtp-kstopb-tau-s', '1:0.7,0.7/2:0.7,0.8/4:0.7,0.75')
+        self.assertIn(' G6_MTP_KSTOPB=1 G6_MTP_KSTOPB_TAU=0.6,0.88 G6_MTP_KSTOPB_TAU_S1=0.7,0.7 G6_MTP_KSTOPB_TAU_S2=0.7,0.8'
+                      ' G6_MTP_KSTOPB_TAU_S4=0.7,0.75', text)
+        for bad in ('0.7,0.7', '9:0.7', '1:', '1:0.7/x'):
+            with self.assertRaises(opt.OptionError):
+                self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau-s', bad)
     def test_kvb_fp8_needs_a_release(self):
         rel = ['--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel']
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel + ['--kvb', 'fp8'], {})

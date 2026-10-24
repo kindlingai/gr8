@@ -1,5 +1,5 @@
 //! The exlr8 v2 fetch helper for ./gr8 glm53 up --model https://... (tools/launch/hfsource.py and
-//! tools/tune/fetch_ranks.py keep the HTTP; this plans and checks). JSON on stdout.
+//! tools/launch/fetch_ranks.py keep the HTTP; this plans and checks). JSON on stdout.
 //!
 //!   g6load fetch-plan --slices DIR --tp N --rank R (--manifest FILE | --widths 2,3,4) [--layers 3-40,78]
 //!       the byte ranges of each width file rank R loads: {"units", "bytes", "files": [{"name", "ranges": [[off, n]]}]}
@@ -11,7 +11,7 @@
 //!
 //!   g6load dflash2 --src DIR --out DIR [--nr 4] [--ranks 0,1,2,3] [--bf16 fc,attn,mlp,conv,sel]
 //!       converts the DFlash2 drafter (config.json + model.safetensors in --src) into dflash.r<r>.pack and
-//!       dflash.r<r>.manifest.json for each rank, byte for byte what tools/convert/dflash2.py writes. One JSON line
+//!       dflash.r<r>.manifest.json for each rank (src/dflash2.rs). One JSON line
 //!       per rank: {"rank", "tensors", "bytes", "seconds"}.
 
 use g6load::dflash2;

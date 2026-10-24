@@ -120,7 +120,7 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
 // holds 32 heads of layer l, the two groups g(m) = (m - l) mod 4 in logical order (lower group first): q_b [8192][2048]
 // (+ [8192][64]), o_proj [6144][8192] (+ [6144][256]), UK / UV [32][192][512] / [32][256][512] BF16. Byte-identical on
 // both pair members.
-//   qp_from_pack:  L%03d.qp.{q_b.mx.codes, q_b.mx.scales, o_proj.mx.codes, o_proj.mx.scales} of tools/convert/pairpack.py's
+//   qp_from_pack:  L%03d.qp.{q_b.mx.codes, q_b.mx.scales, o_proj.mx.codes, o_proj.mx.scales} of a resident pair pack's
 //                  qp.rank<r>.pack, UK / UV assembled on the device from the rank's own L%03d.kv_b.{uk,uv} and the pack's
 //                  L%03d.qp.kv_b.{uk,uv} (the partner's 16 heads)
 //   qp_from_ranks: everything assembled on the device from the two pair members' head slices (m4sim holds all packs)
@@ -252,7 +252,7 @@ inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
         die(std::string(who) + ": layer " + std::to_string(l) + " rank " + std::to_string(m) + " slice shapes are not 16 heads");
     return h;
 }
-// slot half k <- the six tensors at qc .. uv (device or pinned), on stream b. The same bytes and layout as pairpack.py.
+// slot half k <- the six tensors at qc .. uv (device or pinned), on stream b. The same bytes and layout as a resident pair pack.
 // qv / ov: the dense trellis vectors of q_b / o_proj (nullptr: that matrix is MXFP8). With ov, oc is the half's raw
 // o_proj entries, which go to byte k * OT of o_c (64 entries of the pair back to back, k_gemm_tr's side-2 layout), and os
 // is unused. A rolling slot holds layers of every form, and the reader picks by each matrix's form (qp.cuh).

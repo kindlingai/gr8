@@ -2,7 +2,7 @@
 
 Design by adapt-ai-systems. This page
 describes what `main` implements. Code: `engine/runtime/qp.cuh`, `engine/runtime/qo_weights.cuh` (pair weights and the
-rolling pack), `engine/runtime/qp_wire.h` (the RDMA protocol), `tools/convert/pairpack.py` (resident pair packs).
+rolling pack), `engine/runtime/qp_wire.h` (the RDMA protocol).
 
 ## Why
 
@@ -34,7 +34,7 @@ Per rank, a QO call covers 2 x (M / 4) rows x 32 heads, the same core work as OW
 A pair's weights per layer: q_b [8192][2048] MXFP8, o_proj [6144][8192] MXFP8, UK / UV for 32 heads. Byte-identical on
 both pair members (the lower head group first).
 
-- **Rolling pack (`G6_PF_QP_ROLL=S`, the TP4 default in `launch_tp4.sh`, S = 2).** S slots roll through the layers
+- **Rolling pack (`G6_PF_QP_ROLL=S`, the TP4 default, S = 2).** S slots roll through the layers
   during a prefill. A slot for layer l is filled from the rank's own head slice (already in its rank pack) and the
   partner's slice, which the partner writes over RDMA into a small pinned ring (`qp_wire.h`; one bulk fabric on
   port + 56, 84 MB). Then the slot's QO state converts UK / UV to FP16. Builds run on their own stream, one layer ahead,
@@ -47,9 +47,8 @@ both pair members (the lower head group first).
 - **Early send (`G6_PF_QP_EARLY=1`, the TP4 launcher default).** The rank quantizes and projects the counterpart's rows
   first and sends that partial before it runs o_proj on its own rows, so the send overlaps that GEMM. It measured
   4-5% faster prefill than 0 at 8K and 32K; 2 (also splitting the QO call in two) was slower than 1.
-- **Resident pair pack (`--qp-manifest` / `--qp-pack`).** `tools/convert/pairpack.py` builds `qp.rank<r>.pack` from the
-  four rank packs (5.97 GB per rank). This does not fit next to a TP4 rank pack at the 393,216-token pool, so it is
-  only for smaller pools or tests.
+- **Resident pair pack (`--qp-manifest` / `--qp-pack`).** One `qp.rank<r>.pack` per rank (5.97 GB): it does not fit
+  next to a TP4 rank pack at the 393,216-token pool, and no tool in the repo builds it now.
 - Dense trellis q_b / o_proj (the exlr8 release form). The q_b half is the member's FP8 tile copy
   (`engine/runtime/dtr_find.h`, exact: the codebook is E4M3) with every scale 127, so the slots and the wire carry it
   as they carry MXFP8. The o_proj half travels and sits in the slot as the member's raw trellis tiles (12.6 MB, inside

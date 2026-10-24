@@ -11,10 +11,9 @@
 //   TIME   one step's phase-1 body (the 7 / 9 launches above) inside a graph of K steps, median of TR alternating trials,
 //          hot (no flush) and cold (a 96 MB L2 flush before every step, subtracted: the served case, the experts stream
 //          between layers). Saved per layer, and per step x 78 layers (every layer takes the CP block past R).
-//   Decision (from the brief, before running): keep G6_CP_ONECHAIN for a fleet test only if every arm is IDENTICAL and it
-//   saves >= 20 us per layer cold at the realistic shape (T 131072, L 70000-80000, R 65536) for M = 1 and 3; reject below.
 // Arms: env CPG_ARMS="arm arm ..." with an arm = comma-separated KEY=VALUE attention flags (SC2 TR CTX2 CTX3 HG CTX4) or
-// "stock" (all 0); default "SC2=4,TR=2,CTX2=4,CTX3=2 stock" (the served flags, then the kernels without them).
+// "stock" (all 0); default "SC2=4,TR=2,CTX2=4,CTX3=2 stock" (the measured attention set of docs/SETTINGS.md, then the
+// kernels without it).
 // build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12):
 //   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o cpgroups cpgroups.cu ../bind.cu -lcublas
 // run: cpgroups T L M [R=65536] [reps=10] [K=16] [TR=7] [chk=3]

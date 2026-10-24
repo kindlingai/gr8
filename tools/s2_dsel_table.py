@@ -19,8 +19,8 @@ A step costs its GPU span plus the mean GPU idle before a step of its kind (the 
 The table goes to stdout (one line, for G6ENV_X), the derivation to stderr.
 
 Measurement boot: the serving configuration being priced (its K-stop policy, DSel settings and kernels) with the model
-(G6_S2_DSEL_MODEL, G6_S2_DSEL_TABLE) and G6_DRAFT_PAR removed, and G6_S2_TIMELINE=200 G6_MTP_LPLOG=1 appended to its
-G6ENV_X (no G6_S2_ROUNDLOG: its route copies lengthen the main steps). Run
+off (no G6_S2_DSEL_MODEL / G6_S2_DSEL_TABLE), DRAFT_PAR=0 (main defaults it on; the table was measured without it), and
+G6_S2_TIMELINE=200 G6_MTP_LPLOG=1 appended to its G6ENV_X (no G6_S2_ROUNDLOG: its route copies lengthen the main steps). Run
 solo decode that visits both drafters (RigMark c1 prose, code and structured), then pass every rank's log. Check the
 derivation: each v<M> the drafters reach (2..4 MTP, 2..8 DFlash2) from enough steps, and enough MTP rounds for g k n.
 

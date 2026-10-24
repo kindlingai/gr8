@@ -3,7 +3,7 @@
 //   cargo build --release --manifest-path engine/loader-rs/Cargo.toml
 //   g++ -O2 -std=c++20 -pthread -I engine/loader -o test_g6load engine/tests/test_g6load.cpp engine/loader/g6pack.cpp
 //       engine/loader-rs/target/release/libg6load.a -ldl -lm      (one command)
-//   test_g6load DIR RANK...      (DIR/rank<r>.{manifest.json,pack}, e.g. from tools/convert/convert.py)
+//   test_g6load DIR RANK...      (DIR/rank<r>.{manifest.json,pack})
 #include "g6pack.h"
 #include "../loader-rs/g6load.h"
 

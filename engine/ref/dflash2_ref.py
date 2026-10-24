@@ -1,7 +1,7 @@
 """NumPy reference of the DFlash2 drafter (engine/runtime/dflash.cuh), fp32 math, for the drafter step test.
 
 Reads the drafter's own safetensors (BF16) or, with quant='mxfp8', the same weights rounded the way the converter
-stores them (tools/convert/dflash2.py), so a test can separate kernel error from quantization error.
+stores them (engine/loader-rs/src/dflash2.rs), so a test can separate kernel error from quantization error.
 
 The drafter, as its config and the public DFlash2 description define it:
   context  ctx = hidden_norm(fc(concat of the target residual after the target layers)); per drafter layer j the

@@ -5600,7 +5600,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     const bool has_dsa = L.q_a.on || L.kv_a.on || L.q_b.on || L.indexer;
 #endif
 #if PF_QO_DEDUP
-    // slim pack (tools/convert/slimpack.py): q_b / o_proj .mx.codes + .scales are left out where the QO pack covers the layer.
+    // slim pack: q_b / o_proj .mx.codes + .scales are left out where the QO pack covers the layer.
     // Both absent together is fine only then; anything else fails loud.
     const bool qo_dedup = !L.q_b.on && !L.o_proj.on && T.qo_cover && T.heads > 0;
 #if G6_MODEL_FLASH

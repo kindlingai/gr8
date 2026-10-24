@@ -477,6 +477,10 @@ extern "C" int g6_attn_cp_front(const G6Attn*,const G6AttnStepCell*,void*,size_t
 extern "C" int g6_attn_cp_index(const G6Attn*,const G6AttnStepCell*,void*,size_t,uint64_t*,void*){return NOTSUP;}
 extern "C" int g6_attn_cp_merge_index(const G6Attn*,const G6AttnStepCell*,const uint64_t*,void*){return NOTSUP;}
 extern "C" int g6_attn_cp_group(const G6Attn*,const G6AttnStepCell*,void*,size_t,const float*,const float*,float*,void*){return NOTSUP;}
+extern "C" int g6_attn_kvb_bf16(const void*,const float*,void*,int,void*){return NOTSUP;}
+extern "C" int g6_attn_cp_groups_ok(int){return 0;}
+extern "C" size_t g6_attn_cp_groups_bytes(int,int){return 0;}
+extern "C" int g6_attn_cp_groups(const G6Attn*,const G6AttnStepCell*,void*,size_t,const float*,const float*,float*,int,int64_t,void*){return NOTSUP;}
 extern "C" int g6_attn_cp_finish(const G6Attn*,const G6AttnStepCell*,void*,size_t,const float*,void*){return NOTSUP;}
 extern "C" int g6_attn_cp_qabs(const G6Attn*,void*,const float**,const float**){return NOTSUP;}
 #endif

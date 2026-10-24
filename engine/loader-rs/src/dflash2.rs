@@ -1,6 +1,21 @@
-//! The DFlash2 drafter (config.json + one BF16 model.safetensors) -> one gr8 pack per rank: the same bytes and the same
-//! manifest tools/convert/dflash2.py writes, without numpy. tools/convert/dflash2.py documents the tensors, the split
-//! across ranks and the record layouts. tests/dflash2.rs checks both agree.
+//! The DFlash2 drafter (config.json + one BF16 model.safetensors) -> one gr8 pack per rank for the drafter step
+//! (engine/runtime/dflash.cuh). `./gr8 glm53 up --drafter` runs it as `bin/g6load dflash2`.
+//!
+//! Tensor-parallel split (NR divides the 8 KV heads; TP4 = 16 q heads, 2 KV heads, 3,072 MLP channels per rank):
+//!   D.fc.gv               fc rows of this rank's output slice [6144/NR][36864] (the context features -> 6144)
+//!   D<j>.q.gv             q_proj rows of this rank's heads [64/NR * 128][6144]
+//!   D<j>.kv.gv            k_proj then v_proj rows of this rank's KV heads [2 * 8/NR * 128][6144]
+//!   D<j>.o.gv             o_proj columns of this rank's heads [6144][64/NR * 128]          (partial, all-reduced)
+//!   D<j>.gu.gv            gate_proj then up_proj rows of this rank's channels [2 * 12288/NR][6144]
+//!   D<j>.down.gv          down_proj columns of this rank's channels [6144][12288/NR]       (partial, all-reduced)
+//!   D<j>.aconv.gv, D<j>.mconv.gv   the two convs' kernel_projection [1536][6144], every rank (replicated)
+//!   D.sel.hproj.gv        candidate_selector.hidden_projection [256][6144], every rank
+//! Weight records are MXFP8 decode records (528 B per group: the kv_a / q_b codec) unless their class is listed in
+//! --bf16 (BF16 records, 512 B per group): classes fc, attn (q, kv, o), mlp (gu, down), conv, sel. The engine reads
+//! the codec from the record size. BF16 as stored: D.hidden_norm, D.norm [6144]; D<j>.in_norm, D<j>.post_norm [6144];
+//! D<j>.q_norm, D<j>.k_norm [128]; D<j>.aconv.base, D<j>.mconv.base [2 sides][2 taps][6144]; D.sel.pred, D.sel.succ
+//! [154880][256] (codebooks). The manifest carries the drafter config (block size, mask id, target layers, window, rope
+//! theta, eps, selector). tests/dflash2.rs checks the output against a checked-in fixture byte for byte.
 
 use crate::json::{self, Json};
 use crate::sha256::Sha256;
@@ -291,7 +306,7 @@ fn int(j: &Json, k: &str) -> Result<i64, String> {
     key(j, k)?.int().ok_or(format!("config {k} is not an integer"))
 }
 
-/// tools/convert/dflash2.check_config.
+/// Refuses a drafter config whose geometry or options the converter and the engine do not support.
 pub fn check_config(cfg: &Json, dims: &Dims) -> Result<(), String> {
     let d = key(cfg, "dflash_config")?;
     for (k, v) in [("hidden_size", dims.hid), ("head_dim", dims.hd), ("num_attention_heads", dims.nh),
@@ -366,12 +381,12 @@ fn meta_values(cfg: &Json, nr: usize) -> Result<Vec<i32>, String> {
     v.into_iter().zip(META).map(|(x, k)| as_i32(x, k)).collect()
 }
 
-/// The replicated layout (tools/convert/dflash2.py): nr does not split the KV heads, every rank holds the whole drafter.
+/// The replicated layout: nr does not split the KV heads, every rank holds the whole drafter.
 pub fn replicated(dims: &Dims, nr: usize) -> bool {
     dims.nkv % nr != 0
 }
 
-/// tools/convert/dflash2.convert_rank: rank r of nr into <out>/dflash.r<r>.{pack,manifest.json}. bf16 lists the record
+/// Rank r of nr into <out>/dflash.r<r>.{pack,manifest.json}. bf16 lists the record
 /// classes kept in BF16. Returns the manifest.
 pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: &str, bf16: &[String])
                     -> Result<Json, String> {
@@ -473,7 +488,7 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
 
 /// g6load dflash2: --src DIR (config.json + model.safetensors) --out DIR [--nr 4] [--ranks 0,1] [--bf16 conv,sel].
 /// --nr 6: the replicated layout, one pack per rank of TP=6.
-/// Prints one JSON line per rank, as tools/convert/dflash2.py does.
+/// Prints one JSON line per rank.
 pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str, dims: &Dims) -> Result<(), String> {
     if nr < 1 || (replicated(dims, nr) && (dims.nkv % REF_NR != 0 || dims.nh % REF_NR != 0 || dims.inter % REF_NR != 0)) {
         return Err("--nr: 1 or more (one that does not divide the KV heads gives the replicated layout)".into());

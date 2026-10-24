@@ -1,5 +1,5 @@
 //! gr8 pack loader. Builds a rank's device image (the pack's bytes at the manifest's offsets) from the pack file and,
-//! for a sparse pack (tools/convert/convert.py --v2-refs, tools/convert/v2pack.py), the ranges its rank<r>.sources
+//! for a sparse pack (--v2-refs), the ranges its rank<r>.sources
 //! names. Worker threads fill fixed-size chunks of the image in parallel, each into its own pinned staging buffer, and
 //! hand every chunk to the caller's copy callback (cudaMemcpy in g6m4). The image is byte for byte the one
 //! engine/loader/devimage.cpp builds. Nothing is hashed: checking the files is an offline step.

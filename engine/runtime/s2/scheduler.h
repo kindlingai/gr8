@@ -61,7 +61,7 @@ struct Config {
     // G6_CP_STEP_ROWS (cp_rows.h): a step past R carries at most cp_step_rows rows (0 = off: every decoding session in
     // every round, as before). cp_after: contexts above it run the CP block (cp_after()). cp_seg: G6_CP_STEP_SEG. Read by
     // Driver::step only; the scheduler's quanta keep their kinds (a capped round is a Decode quantum with fewer sessions)
-    uint32_t cp_step_rows = 0;          // after decode_rounds, for the same reason
+    uint32_t cp_step_rows = 0;          // after window_pages, for the same reason
     uint64_t cp_after = UINT64_MAX;
     bool cp_seg = false;
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)

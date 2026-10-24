@@ -1,5 +1,4 @@
-# The engine command line. scripts/launch_s2.sh (every TP: launch_tp4.sh, launch_tp6.sh and launch_tp3.sh run it) and
-# the per-box supervisor (tools/launch) source this file, so the ssh launchers and `./gr8 glm53 up` start the same engine. KNOBS.md lists
+# The engine command line. The per-box supervisor (tools/launch) sources this file. KNOBS.md lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 # GR8_MODEL picks the model: glm53 (unset) or glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2).
@@ -42,8 +41,10 @@ pool_cap() {
 }
 
 # GLM-5.3-Flash under --serve takes one session and no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu
-# refuses them). CAP is a 32K context plus one prefill chunk until the pool is measured on Flash. MTP=1: --serve needs
-# a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
+# refuses them). MTP=1: --serve needs a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
+# CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and the MTP layer
+# keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at any TP
+# (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
   case $TP in 4|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4 or 2" >&2; return 2 ;; esac
   local k
@@ -51,25 +52,25 @@ flash_defaults() {
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
   [ "${SESS:-1}" = 1 ] || { echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves one session" >&2; return 2; }
-  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-33280}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=1
-  S2PORT=${S2PORT:-7341}; DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=1
+  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
 }
 
 engine_defaults() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
-       DFLASH=${DFLASH:-1}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
+       DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1} ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
          if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
        else [[ "$SHARE_LIMIT" = 32768 || "$SHARE_LIMIT" = 131072 ]] && CAP=${CAP:-614400} || CAP=${CAP:-$(share_cap 2026)} || return 2; fi; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
-       # DFLASH=1: the DFlash2 drafter with its body replicated on every rank (dflash.cuh dfl::REP; drafter packs
-       # converted with --nr 6). Off unless set
-       DFLASH=${DFLASH:-0}; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
+       # DFLASH=1: the DFlash2 drafter with its body replicated on every rank (dflash.cuh dfl::REP; the drafter
+       # converted per rank in the replicated layout, --drafter). Off unless set
+       DFLASH=${DFLASH:-0}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
     3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
-       DFLASH=0; PACKS=${PACKS:-packs}; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
+       DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6 or 3" >&2; return 2 ;;
   esac
 }
@@ -97,7 +98,7 @@ G6_PF_TIMES=1"
 
 engine_env() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
-  ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4   # bin/ENGINE_BIN, for scripts/launch_s2.sh
+  ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
   ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=1024 G6_PF_OWN=$PF_OWN \
 G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
 G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6ENV_X:-}"
@@ -151,11 +152,38 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
       esac
     done
   fi
+  # the drafter choice's frozen cost table (DSEL_MODEL, DSEL_TABLE; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${DSEL_MODEL:+ G6_S2_DSEL_MODEL=$DSEL_MODEL}"
+  ENGINE_ENV="$ENGINE_ENV${DSEL_TABLE:+ G6_S2_DSEL_TABLE=$DSEL_TABLE}"
+  # the per-session MTP confidence stop in shared rounds (MTP_KSTOPB, MTP_KSTOPB_KMIN, MTP_KSTOPB_TAU, MTP_KSTOPB_TAU_S;
+  # docs/SETTINGS.md): off unless set. MTP_KSTOPB_TAU_S="1:0.7,0.7/2:0.7,0.8" sets G6_MTP_KSTOPB_TAU_S1 and _S2.
+  # G6_MTP_KSTOPB_EXPLORE stays engine environment (G6ENV_X)
+  ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB:+ G6_MTP_KSTOPB=$MTP_KSTOPB}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB_KMIN:+ G6_MTP_KSTOPB_KMIN=$MTP_KSTOPB_KMIN}"
+  ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB_TAU:+ G6_MTP_KSTOPB_TAU=$MTP_KSTOPB_TAU}"
+  if [ -n "${MTP_KSTOPB_TAU_S:-}" ]; then
+    local e IFS=/
+    for e in $MTP_KSTOPB_TAU_S; do
+      case $e in
+        [1-8]:?*) ENGINE_ENV="$ENGINE_ENV G6_MTP_KSTOPB_TAU_S${e%%:*}=${e#*:}" ;;
+        *) echo "engine_env: MTP_KSTOPB_TAU_S: want n:t1,t2,... entries (n 1..8) separated by /, not '$e'" >&2; return 2 ;;
+      esac
+    done
+  fi
+  # the paced L2 prefetch in the decode step's idle-DRAM windows (L2PF; docs/SETTINGS.md): off unless set. Its
+  # tuning variables G6_L2PF_T, _GBPS, _WAVE, _US, _MB and _OPMB stay engine environment (G6ENV_X)
+  ENGINE_ENV="$ENGINE_ENV${L2PF:+ G6_L2PF=$L2PF}"
+  # the row cap for S2 steps past SHARE_LIMIT, which also sizes the CP fabric (CP_STEP_ROWS, CP_STEP_SEG;
+  # docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${CP_STEP_ROWS:+ G6_CP_STEP_ROWS=$CP_STEP_ROWS}"
+  ENGINE_ENV="$ENGINE_ENV${CP_STEP_SEG:+ G6_CP_STEP_SEG=$CP_STEP_SEG}"
+  # CP decode's remote head groups as one attention call (CP_ONECHAIN; docs/SETTINGS.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${CP_ONECHAIN:+ G6_CP_ONECHAIN=$CP_ONECHAIN}"
+  # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
+  ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
   # deterministic fp-order attention variants (ATTN_CTX3_SP, ATTN_POSIDX; E1, docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX3_SP:+ G6_ATTN_CTX3_SP=$ATTN_CTX3_SP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_POSIDX:+ G6_ATTN_POSIDX=$ATTN_POSIDX}"
-  # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
-  ENGINE_ENV="$ENGINE_ENV${KVB:+ G6_KVB=$KVB}"
   # prefill o_proj FP32 epilogue, MTP draft-step speed-ups (PF_GEMMF32, MTP_LASTROW, DRAFT_HEAD2, MTP_L2PF,
   # MTP_KSTOPB_WIDTHS; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${PF_GEMMF32:+ G6_PF_GEMMF32=$PF_GEMMF32}"

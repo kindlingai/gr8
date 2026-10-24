@@ -13,9 +13,7 @@ Where a value comes from, strongest first:
 3. the environment: `CAP=262144 ./gr8 glm53 up`;
 4. the default.
 
-This is the other way round from the ssh launchers (`./gr8 glm53 --ssh up`, deprecated), where every script sources the
-config file, so a value there wins over the environment. `./gr8 glm53 up` prints every value and where it came from,
-and `./gr8 glm53 show-config` prints them without booting.
+`./gr8 glm53 up` prints every value and where it came from, and `./gr8 glm53 show-config` prints them without booting.
 
 The handshake before the engines start compares the cluster options on every box: the TP, the shape, the peer list or
 mentat group, the ports, every knob in the launch table below that reaches the engine, and the engine environment and
@@ -25,8 +23,7 @@ box, with the option and each box's value.
 The engine does not inherit `G6_*` variables from the environment, and `./gr8 glm53 up` refuses to start while one is
 set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box compares them.
 
-The defaults in the launch table come from `scripts/engine_args.sh`. The supervisor and the ssh launchers both read
-it. Every TP runs the multi-session engine (`--serve`). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
+The defaults in the launch table come from `scripts/engine_args.sh`, which the supervisor reads. Every TP runs the multi-session engine (`--serve`). A dash means that TP does not read the knob. `V2`, `V2_SLICES`, `V2_DENSE` and
 `V2_WIDTHS` are paths, so each box may have its own. The handshake compares the variant's name and the sha256 of its
 manifest instead.
 
@@ -36,7 +33,8 @@ manifest instead.
 |---|---|---|---|---|
 | `CAP` | 485376 | 614400 | 307136 | KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory. Unset, it follows `SHARE_LIMIT`: each rank keeps the same KV memory (2,280 pages of 64 tokens at TP=4, 2,026 at TP=6, 1,941 at TP=3) |
 | `KV_FORMAT` | fp8 | fp8 | fp8 | experimental. The KV latent row: `fp8` (656 B) or `int4` (416 B, INT4 after a Hadamard rotation). `int4` runs `bin/g6m4-int4` (in the image; `KV_FORMAT=int4 ./gr8 glm53 build` builds it), and its default `CAP` keeps fp8's memory a rank: 415,232 at TP=4 (2,390 pages a rank, measured against fp8 at 1,920; the fp8 default is 2,280 now), 345,088 at TP=3 and 857,600 at TP=6 (estimates). At TP=4 it decodes about 3% slower and prefills about 6% faster, and finds the same needles. `docs/KV4.md` |
-| `SHARE_LIMIT` | 32768 | 32768 | 32768 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 65536 gives `CAP` 310528. A power of two from 4096 |
+| `SHARE_LIMIT` | 32768 | 32768 | 32768 | requests up to this many tokens (prompt + `max_tokens`) share decode steps; a longer one waits for the others and runs alone. Every rank holds the first `SHARE_LIMIT` tokens of a session and a share of the rest, so a higher limit leaves a shorter longest context: at TP=4, 65536 gives `CAP` 387072, 98304 gives 288768. A multiple of 64 from 4096; a limit off the 2048 doubling is a decode bucket boundary of its own |
+| `KV_FORMAT` | fp8 | fp8 | fp8 | experimental. The KV latent row: `fp8` (656 B) or `int4` (416 B, INT4 after a Hadamard rotation). `int4` runs `bin/g6m4-int4` (in the image; `KV_FORMAT=int4 ./gr8 glm53 build` builds it), and its default `CAP` keeps fp8's memory a rank: 415,232 at TP=4 (2,390 pages a rank, measured against fp8 at 1,920; the fp8 default is 1,981 now), 345,088 at TP=3 and 857,600 at TP=6 (estimates). At TP=4 it decodes about 3% slower and prefills about 6% faster, and finds the same needles. `docs/KV4.md` |
 | `SESS` | 8 | 8 | 8 | requests decoding at once (1-8); every reachable step graph is captured at boot (about 2.5 GiB at 8) |
 | `REUSE` | 1 | 1 | 1 | 1 = `--reuse-prefix`: a request that continues an earlier one re-prefills only the new part. 0 = off |
 | `KV_STORE` | off | off | off | experimental. Block stores below the KV pool (`--kv-store`, given once per store, or stores separated by `;` in a file or the environment), tried in order: `STORE,size=N(M\|G\|T)[,persist=on\|off][,keep=system\|sessions\|all]`. `keep=` is that store's `KV_KEEP`: `ssd:PATH,size=4G,persist=on,keep=system;remote:auto,size=4G,keep=all` keeps system prompts on the SSD and every other evicted run (with its tail past `SHARE_LIMIT`) on the KV node. STORE is `ssd:PATH` (a folder on each box: rank r uses `PATH/r<r>`), `remote:HOST:PORT` or `remote:auto` (a KV node the mentat group announces, `./gr8 kv up`). An SSD store is cleared at every boot. With `persist=on` its system prefixes and the counts survive restarts while the model, layout, block format and engine build stay the same; a boot that served wrong output would hand them on, so persist only a store you trust. Sizes are per rank, G = 2^30. Needs `REUSE`. `engine/kvman-rs/REMOTE-TIER.md` |
@@ -56,8 +54,7 @@ manifest instead.
 | `QP_ROLL` | 2 | – | – | `PF_OWN=4`: rolling pair-weight slots (`G6_PF_QP_ROLL`) |
 | `QP_CTX` | `CAP` | – | – | `PF_OWN=4`: QO key-table size; a longer request runs OWN=2 |
 | `QP_EARLY` | 1 | – | – | `PF_OWN=4`: send the counterpart's partial before the own rows' o_proj |
-| `PACKS` | `packs` | `packs` | `packs` | where the rank packs are, relative to `G6_HOME` or absolute |
-| `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files (`tools/tune/README.md`): the width files and the index slices |
+| `V2`, `V2_SLICES` | unset | unset | unset | exlr8 v2 experts from their raw width files: the width files and the index slices |
 | `VARIANT` (`--variant`) | `home` | `home` | `bit225` | the exlr8 v2 width manifest: `bit225`, `bit243`, `bit260`, `bit325`, `bit338` (routed experts at about 2.25-3.38 bpw, spent where they lower KL against bf16 the most), `home` (3.25 bpw), `down1` (about 2.25), `up1` (about 4.0), or a manifest path. A name is `exlr8-manifest-<name>.json` in the model set or in `V2` (directly or under `manifests/`). At TP=3, a release without `bit225` boots `down1`. Without `V2`, only `home` |
 | `V2_WIDTHS` | unset | unset | unset | the width manifest as a path: the older spelling of `--variant <path>`. Giving both is refused |
 | `DFL_REUSE` | 2 | – | – | 1 = a request whose prefix-reuse hit skipped into the DFlash2 drafter's window keeps the drafter; 2 = also a request alone on MTP takes it (`G6_DFL_REUSE`). Defaults to 2 when serving DFlash2 with MTP. Needs `DFLASH=1` |
@@ -81,14 +78,24 @@ manifest instead.
 | `IDX_GRP` | unset (0) | unset (0) | unset (0) | S2 batched decode: the indexer reads each key tile once for up to 1..64 rows of a session (`G6_IDX_GRP`; bit-exact) |
 | `ATTN_QT` | unset (0) | unset (0) | unset (0) | 1 = q and rope stored lane-transposed for the scores kernel (`G6_ATTN_QT`; needs `ATTN_SC2` 2 or 4; bit-exact) |
 | `ATTN_FRONT` | unset (0) | unset (0) | unset (0) | 1 = a decode step's first attention kernels in one launch (`G6_ATTN_FRONT`; bit-exact) |
+| `DSEL_MODEL` | unset (0) | – | – | 1 = the drafter choice prices both drafters from `DSEL_TABLE` and a request's MTP rounds as the confidence stop runs them (`G6_S2_DSEL_MODEL`; drafts only: the target decides every token). Needs `DFLASH=1` |
+| `DSEL_TABLE` | unset | – | – | `DSEL_MODEL`: the cost table, a `key:value` list (`v1`..`v8`, `d`, `m`, `e`, `p`, optional `g`, `k`, `n`, `w`, `r`) or a file holding one, measured on the cluster with `tools/s2_dsel_table.py` (`G6_S2_DSEL_TABLE`) |
+| `MTP_KSTOPB` | unset (0) | unset (0) | unset (0) | 1 = in rounds that several sessions share, each session verifies its own count of the `MTP` drafts, from the MTP head's confidence (`G6_MTP_KSTOPB`; drafts only: the target decides every token). Captures a main graph per width the rule reaches |
+| `MTP_KSTOPB_KMIN` | unset (0) | unset (0) | unset (0) | `MTP_KSTOPB`: the least drafts a session verifies, 0 or 1 (`G6_MTP_KSTOPB_KMIN`) |
+| `MTP_KSTOPB_TAU` | unset (`0.6,0.88`) | same | same | `MTP_KSTOPB`: thresholds t1,t2,... (up to 7) on each session's cumulative draft probability, at every session count (`G6_MTP_KSTOPB_TAU`) |
+| `MTP_KSTOPB_TAU_S` | unset | unset | unset | `MTP_KSTOPB`: thresholds per session count, `n:t1,t2,...` entries separated by `/`, e.g. `1:0.7,0.7/2:0.7,0.8` (`G6_MTP_KSTOPB_TAU_S<n>`) |
+| `L2PF` | unset (0) | unset (0) | unset (0) | decode: a paced L2 prefetch of the weights the step reads next, on a side stream in the windows where DRAM is idle; window mask 1 = MLP all-reduce wait, 2 = gather waits, 4 = attention, 8 = attention all-reduce wait (`G6_L2PF`; bit-exact). Measured at TP=4 only, as 15 |
+| `CP_STEP_ROWS` | unset (0) | unset (0) | unset (0) | S2: a decode step past `SHARE_LIMIT` carries at most this many rows, and the CP fabric is sized for it instead of for the widest S2 step (`SESS` x (`MTP` + 1) = 24 rows, 1.358 GB pinned per rank at TP=4; 8 rows: 0.453 GB). While a session past the limit decodes and the sessions' rows do not fit, they take turns, each once per cycle. At least the rows of a solo step (the boot names the minimum, 8 with DFlash2) (`G6_CP_STEP_ROWS`) |
+| `CP_STEP_SEG` | unset (0) | unset (0) | unset (0) | with `CP_STEP_ROWS`: 1 = a round past `SHARE_LIMIT` takes only sessions past it, so a shorter session never runs the CP attention because a long one is resident (`G6_CP_STEP_SEG`) |
+| `CP_ONECHAIN` | unset (0) | – | – | 1 = past `SHARE_LIMIT`, each rank runs the other ranks' head groups over its keys as one attention call instead of one per group (`G6_CP_ONECHAIN`; bit-exact). TP=4 only (the engine refuses it elsewhere), not with `G6_ATTN_FLIP` |
+| `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
 | `ATTN_CTX3_SP` | unset (0) | unset (0) | unset (0) | with `ATTN_CTX3`: 64 or 128 key slots per context partition instead of 256 (`G6_ATTN_CTX3_SP`; deterministic, not bit-exact) |
 | `ATTN_POSIDX` | unset (0) | unset (0) | unset (0) | 1 = decode steps in the buckets up to 2048 list the keys by position instead of running the indexer, which selects all of them there (`G6_ATTN_POSIDX`; deterministic, not bit-exact) |
-| `KVB` | unset (bf16) | unset (bf16) | unset (bf16) | `fp8` = kv_b (UK / UV) as the release's block FP8 bytes and scales instead of their BF16 (`G6_KVB`; half the bytes, bit-exact). Needs `V2_DENSE` (a release boot) |
 | `PF_GEMMF32` | unset (0) | unset (0) | unset (0) | 1 = with `PF_OWN=3`, prefill's row-owner QO o_proj on the FP32-epilogue GEMM (`G6_PF_GEMMF32`; byte-exact). TP=6 K3: +1.0 % cold prefill (1693.6 -> 1710.4, one point, inside the 2 % band). Set for the boot |
 | `MTP_LASTROW` | unset (0) | unset (0) | unset (0) | 1 = an MTP first-form draft step routes only each session's last row through layer 78's routed experts (`G6_MTP_LASTROW`; same caches, drafts and log-probabilities). Skips the routed experts of every row but the last; no end-to-end number. In the TP=6 K3 recipe |
 | `DRAFT_HEAD2` | unset (0) | unset (0) | unset (0) | experimental: 1 = the MTP draft head in two stages, a 2-bit screen then the exact MXFP8 logits of its best 64 (`G6_DRAFT_HEAD2`; drafts only, +74.5 MB a rank at TP=4); 2 = also the MXFP8 check (measurement). No end-to-end number. In the TP=6 K3 recipe |
 | `MTP_L2PF` | unset (0) | unset (0) | unset (0) | with `G6_L2PF`: the paced L2 prefetch in MTP draft steps, 1 = the draft step, 2 = the head waits, 3 = both (`G6_MTP_L2PF`; same bytes). TP=6: about 0.1 ms per ~39 ms round, below speedbench resolution. In the TP=6 K3 recipe (3) |
-| `MTP_KSTOPB_WIDTHS` | unset | unset | unset | with `G6_MTP_KSTOPB`: the main widths captured besides the multiples of `MTP` + 1, `w1,w2,...` (`G6_MTP_KSTOPB_WIDTHS`); fewer widths = less graph memory (about 115 MiB a width a rank at TP=4) and a shorter boot. The other `MTP_KSTOPB` keys are on open PR #113 |
+| `MTP_KSTOPB_WIDTHS` | unset | unset | unset | with `G6_MTP_KSTOPB`: the main widths captured besides the multiples of `MTP` + 1, `w1,w2,...` (`G6_MTP_KSTOPB_WIDTHS`); fewer widths = less graph memory (about 115 MiB a width a rank at TP=4) and a shorter boot. |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
@@ -96,13 +103,12 @@ manifest instead.
 | `FRONT_BIN` | `bin/g6front-rs` | same | same | the Rust front end binary |
 | `PY` | `$G6_HOME/venv/bin/python` | same | same | the python that runs the shim |
 | `S2PORT` | 7341 | 7341 | 7341 | the multi-session control port on the head |
-| `RANK_HEALTH` | – | 1 | 1 | probe every rank before booting and refuse a bad one (`scripts/rank_health.sh`) |
-| `PROBE_ARGS` | – | empty | empty | thresholds for that probe (`tools/health/README.md`) |
 
 ## `./gr8 glm53`
 
-`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, one session, an fp8 KV build, no drafter
-(`tools/launch/models.py`, `flash_defaults` in `scripts/engine_args.sh`).
+`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, one session, an fp8 KV build, no drafter, and
+`CAP` 262208 at either TP, a 262,144-token request (`tools/launch/models.py`, `flash_defaults` in
+`scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)).
 
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|
@@ -114,15 +120,14 @@ manifest instead.
 | `GROUP` | `--group` | `gr8-<model>` | cluster | the mentat group the boxes join |
 | `HEAD` | `--head` | the lowest address | cluster | mentat mode: the head's LAN address |
 | `IPS`, `IPS2` | `--ips`, `--ips2` | discovered | cluster | each rank's rail-0 and rail-1 fabric address. Without them each box finds its own two RoCE v2 addresses |
-| `MODEL` | `--model` | none | box | the exlr8 release, `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`) or a local copy of it (`dense/`, `experts/`, `index-slices/`, `manifests/`, the tokenizer files), or a prepared pack directory with every rank's manifest. A release is the whole model: the engine plans every rank's weights from its files (`V2_DENSE`). Without `MODEL_CACHE` the engine loads a pack directory in place |
-| `BASE_PACKS` | `--base-packs` | none | box | with an https:// `MODEL`: the non-expert weights come from this prepared pack directory, and the release gives only the experts |
-| `V2_DENSE` | `--v2-dense` | the release, when `MODEL` is one | box | the exlr8 release directory whose `dense/` files give every non-expert weight: no rank packs (`g6m4 --v2-dense`) |
+| `MODEL` | `--model` | none | box | the exlr8 release: `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`), or a local copy of it (`dense/`, `experts/`, `index-slices/`, `manifests/`, the tokenizer files) used in place, on a local disk or a shared mount such as NFS. The engine plans every rank's weights from the release's files (`V2_DENSE`) |
+| `V2_DENSE` | `--v2-dense` | the release | box | the exlr8 release directory whose `dense/` files give every non-expert weight (`g6m4 --v2-dense`) |
 | `V2_DENSE_FORM` | `--v2-dense-form` | `trellis` | cluster | with `V2_DENSE`: `trellis` keeps q_b, o_proj and the dense MLP as the release's trellis entries for the dense trellis kernels, so the weights are the release's own. `rounded` is the fallback: it rounds them to the MXFP8 and int4 forms of a converted pack |
 | `DRAFTER` | `--drafter` | none | box | TP=4: the DFlash2 drafter's repo, `https://huggingface.co/incoai/GLM-5.3-DFlash2`. Each box fetches it and converts its rank into `MODEL_CACHE`. Its repo and commit go into the id the boxes compare |
 | `DFLASH_DIR` | `--dflash-dir` | none | box | a directory holding `dflash.r<r>.*`, when it is not the model set's |
 | `RANK` | `--rank` | none | run | `prepare`: the rank to fetch, when this box cannot tell (mentat mode) |
-| `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
-| `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |
+| `MODEL_CACHE` | `--model-cache` | none | box | with an https:// `MODEL`: this box's local directory for its rank's part of the release, and for the converted drafter |
+| `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the release directory has none |
 | `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `run/` |
 | `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
 | `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
@@ -135,11 +140,9 @@ manifest instead.
 | `JOIN_TIMEOUT` | `--join-timeout` | 600 | run | seconds for the mentat group to fill, for a worker to reach the head, and on the head from the first hello to the last (0 = forever) |
 | `CHECK` | `--no-check` | 1 | run | 0 = skip this box's checks (the model files are checked anyway) |
 | `G6_CLUSTER` | | none | | the config file when there is no `@FILE` |
-| `PACK_DIR` | | none | | `./gr8 glm53 stage` with no argument copies from here |
-| `BIN_DIR` | | `bin` | | what `./gr8 glm53 stage` copies the engine from |
 
-`PACKS`, `RANK_HEALTH` and `PROBE_ARGS` work with `--ssh` only. The symmetric launch takes the packs from `MODEL`, and it
-does not run the rank health probe yet: run `scripts/rank_health.sh` first if you want it.
+The launcher does not run the rank health probe: run `scripts/rank_health.sh` with the same options before a boot if
+you want it (`PROBE_ARGS` sets its thresholds, `tools/health/README.md`).
 
 ## `./gr8 kv`
 
@@ -163,7 +166,7 @@ file is read for these keys only.
 | `NODE_IP` | `--node-ip` | mentat's | the LAN address to announce |
 | `G6_HOME` | `--g6-home` | the repo checkout | the node keeps `out/kv/` here: `kv.log`, `state.json`, `ready.json` |
 
-## Build and stage
+## Build
 
 | variable | script | meaning |
 |---|---|---|
@@ -174,7 +177,6 @@ file is read for these keys only.
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |
 | `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine when `KV_FORMAT=int4` |
-| `SHARED` | `stage.sh` | 1 = `PACK_DIR` is a shared mount at the same path on every box; each box copies its own files |
 
 ## Local steering profile
 

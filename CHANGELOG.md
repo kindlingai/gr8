@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-23: GLM-5.3-Flash defaults to a 262,144-token context (CAP 262,208)
+
+- `./gr8 glm53f` now defaults `CAP` to 262,208 (was 33,280) at TP=4 and TP=2: a 262,144-token request plus a page for
+  the guard rows, so `max_model_len` is 262,206. Only Flash's 11 DSA layers and the MTP layer keep KV, 19,968 B a token
+  a rank, and without CP every rank holds the whole context: about 5.2 GB a rank, computed from `engine/attn/kvfmt.h`
+  (docs/FLASH.md, Context).
+- Not measured yet: the boot's memory headroom at this `CAP`, and the time of a 262K prefill. A prefill that runs past
+  the shim's 900 s `--stall-timeout` fails. Set `CAP=33280` for the old pool.
+
 ## 2026-10-21: the TP=4 fp8 KV pool grows to 2,280 pages a rank (CAP 485,376)
 
 - The default TP=4 `CAP` is now 485,376 (was 408,832): 2,280 physical pages a rank, up from 1,981. The memory comes
@@ -55,7 +64,145 @@
 - On the TP=4 cluster with that config: a 153,580-token session evicted to the KV node came back in 4.1 s (136 s
   cold), each rank restoring 2,872 pages (its first 32,768 tokens and its shard of the tail) in 0.55 s.
 - `docs/kv-tiers.svg` draws the tiers: replicated below `SHARE_LIMIT`, sharded past it, and the stores below the pool.
+## 2026-10-18: S2 sizes three things by the DFlash2 drafter's verify width, not by a block of 8
 
+- A DFlash2 round's MTP first form runs on the accepted prefix + 1 rows (1 .. `dfl_k` + 1); the boot now captures every
+  one of those widths explicitly instead of relying on the prompt chunk and the verify widths to cover them.
+- `sc.max_rows` (one step's bound) is the largest of a round (sessions x (`--mtp` + 1)), a prompt chunk and the DFlash2
+  verify width (`dfl_k` + 1).
+- The per-request acceptance histogram may have up to 16 bins (was 8).
+- With the block-8 DFlash2 drafter nothing changes: the captured widths, the row bound and the histogram are those of
+  before. A drafter with a wider block (a block-12 one was served with these fixes) boots and serves; serving one also
+  needs drafter-side changes that are not part of this.
+## 2026-10-18: CP decode: the remote head groups as one attention call (G6_CP_ONECHAIN, off by default)
+
+- Past R each rank runs the other ranks' head groups over its own keys (`launch_attn_cp`, phase 1): one `k_vget`, one
+  `g6_attn_cp_group` (scores, softmax, context parts, merge) and one `k_vput` per remote group, 18 launches a layer at
+  TP=4. `G6_CP_ONECHAIN=1` (launch knob `CP_ONECHAIN`) gathers the three groups' q / rope side by side
+  (`k_vget_heads`), runs one 48-head `g6_attn_cp_groups` call whose merge writes each group's partial into its own
+  block, and publishes the three partials in the S1 order: 8 launches a layer.
+- Every kernel indexes a (row, head) as `row * heads + h` and batches heads in groups that divide 16, so each head runs
+  the 16-head kernel's code on the same operands in the same order: the published partials are byte-identical
+  (`engine/attn/tests/cpgroups.cu`, one GPU, built by hand). TP=4 only and not with `G6_ATTN_FLIP` (the boot stops
+  with a message otherwise); about 1.3 MB per CP fabric row of device memory, printed by rank 0.
+- Measured on four GB10 at TP=4 (R 65536): decode +3.6 / +2.5 / +1.7 % at 70K / 80K / 90K-token prompts and +9.5 % at
+  ~120K, the same output SHA as off; below R nothing changes.
+
+## 2026-10-18: decode buckets: nine slots, so a SHARE_LIMIT off the doubling keeps the 2048 bucket
+
+- The decode graphs are captured per context bucket (2048, 4096, ... below the capacity, the capacity, and CP's R when it
+  is not already a boundary). With eight slots a limit such as 98304 filled the list and `context_buckets` merged the
+  smallest bucket away, so every short-context step ran on the 4096 graph. `NBK` is now 9 and the doubling stops at
+  seven buckets, as it did when the list was full: at every TP default (R a power of two among the doublings) the list,
+  the graphs and the outputs are those of before; an R off the doubling takes the ninth slot (one more bucket of step
+  graphs). `test_context_buckets` checks both.
+
+## 2026-10-18: --share-limit takes any multiple of 64 from 4096
+
+- The launcher refused a `SHARE_LIMIT` that is not a power of two. The engine does not need one: `context_buckets`
+  makes any `G6_CP_R` that is a multiple of a KV page a decode bucket boundary, so a graph never mixes the replicated and
+  CP paths. The rule is now a whole multiple of 64 from 4096; every limit the old rule took gives the same engine line.
+- A limit off the doubling trades longest context for decode speed between the two limits: at TP=4, 98304 gives CAP
+  212,224 (at the default 1,981 pages a rank), and on four GB10 it decoded +8.3 .. +13.6 % faster than 65536 at 70K-90K
+  token prompts (those sessions keep their KV replicated and skip the CP attention path); short prompts level.
+## 2026-10-19: per-request step counters in usage (`return_step_stats`, opt-in)
+
+- A chat or completions request with `"return_step_stats": true` gets `usage.step_stats`: its verify rounds, draft and
+  accepted tokens (and per draft position), the tokens the engine generated, and its server-side prefill and decode
+  time. These are the numbers the request added to `/metrics` (`vllm:spec_decode_*`, `vllm:request_prefill_time_seconds`,
+  `vllm:request_decode_time_seconds`), so a benchmark client can split decode speed into steps and acceptance per
+  request at any concurrency instead of differencing `/metrics` around one request at a time. Streaming: in the last
+  chunk (`stream_options.include_usage`). Without the field the responses are unchanged.
+- The S2 shim adds each request's counters to its `finish` frame (`spec`, `timing`: optional, PROTOCOL.md); the engine
+  is unchanged.
+## 2026-10-18: the drafter choice: a frozen cost table and K-stop-aware MTP pricing (G6_S2_DSEL_MODEL, off by default)
+
+- Since the confidence stop (`G6_MTP_KSTOP`) a request's solo MTP rounds verify 1..3 drafts chosen per round, but the
+  drafter choice (DSel) priced every MTP round as `--mtp` drafts with fixed drafting constants. `G6_S2_DSEL_MODEL=1`
+  (launch knobs `DSEL_MODEL`, `DSEL_TABLE`) prices both drafters from one frozen cost table, `G6_S2_DSEL_TABLE` (verify
+  ms `v1`..`v8`, drafting ms `d`, `m`, `e`, a probe's extra `p`, and optionally the MTP rounds' prior `g`, `k`, `n`, the
+  estimates' prior weight `w` and `r`), and an MTP round as the stop runs it: 1 + c_1 (1 + g) tokens over the mean table
+  cost of the request's MTP rounds, both shrinking toward the prior until the request has MTP rounds.
+- `r`: DFlash2 is priced from the request's DFlash2 rounds and scored probes as they ran, that evidence aged by `r` per MTP
+  round, so a structured request that a dip moved to MTP comes back.
+- Only the choice reads the table: `G6_SPEC_TABLE` still prices the DFlash2 rounds' own draft count. The table's canonical
+  form is in the S2 runtime signature. Off, the steps are unchanged (`batch_dselmodel_test`).
+- `G6_S2_TIMELINE` also prints the mean GPU span per step kind and row count, and `tools/s2_dsel_table.py` turns one
+  boot's timeline and `# kstop` lines into the table; with `G6_MTP_LPLOG` and the model on, rank 0 prints a `# dsel round`
+  line per solo round.
+- Measured on four GB10 at TP=4 (with the solo confidence stop on, `G6_S2_DSEL_PROBE=32`): RigMark c1 prose +1.8 %, code
+  +3.0 %, structured -3.6 % against DSel with the MTP round priced at 2.9 ms.
+## 2026-10-18: a per-session MTP confidence stop in shared rounds (G6_MTP_KSTOPB, off by default)
+
+- When several sessions decode together, a shared round drafts `--mtp` drafts for every session and verifies all of
+  them, however unlikely a session's later drafts are; the solo stop (`G6_MTP_KSTOP`) does not act there. With
+  `G6_MTP_KSTOPB=1` (launch knobs `MTP_KSTOPB`, `MTP_KSTOPB_KMIN`, `MTP_KSTOPB_TAU`, `MTP_KSTOPB_TAU_S`) the chain still
+  drafts K for every session, and each session q verifies its own k_q: the most j with p_1 x .. x p_i >= t_i for every
+  i <= j (the MTP head's log-probabilities, the same bytes on every rank), at least `G6_MTP_KSTOPB_KMIN`. Thresholds
+  `G6_MTP_KSTOPB_TAU` (default 0.6, 0.88; up to seven) at every session count, or `G6_MTP_KSTOPB_TAU_S<n>` for rounds
+  of n sessions.
+- The main step's width is the sum of the sessions' k_q + 1; the boot captures a main graph for every width the rule
+  reaches (about 115 MiB each over 8 buckets), `G6_MTP_KSTOPB_WIDTHS` limits them (a round then verifies the next most
+  likely drafts up to a captured width). `G6_MTP_LPLOG=1` adds `# kstopb` and `# kstopb_ms` lines per shared round.
+- Drafts only: the target decides every token; the verify's row count varies, as with the solo stop. The policy is in the
+  S2 runtime signature. Off, and on with zero thresholds, the planner's steps are unchanged (`batch_kstopb_test`).
+- Measured on four GB10 at TP=4 (`--mtp 2`, thresholds per session count): ABBA over six blocks, c2 +1.5 %, c4 +3.7 %
+  decode; c1 unchanged.
+  and fc2 n-split (NS2) per step row count from a table, `M:KS1xWG/NS2` entries (`a-b` ranges). An fc1 shape is taken
+  only where KS1 x WG equals the row class's own, and NS2 may be any divisor of 384, so the partials, their k ranges and
+  fc2's summation order are those of the built-in split: same bytes at any accepted table. A malformed table fails the
+  bind with a message.
+  `prefetch.global.L2` per KB granule over its slot's fc1 and fc2 ranges at the start of the launch, so the address
+  translations of the later CTA waves and of fc2 are walked while fc1 runs. A decode step's routed experts touch about
+  5,300 2 MB pages a rank at TP=4, more than the GPU's translation reach. No output change.
+- `engine/kernels/tests/k1_audit.cu` (built by `scripts/build.sh`, run by hand on an idle GB10): the routed MoE phase on
+  synthetic exlr8 v2 layers in the TP=4 rank shape, all 75 MoE layers resident, against a plain read of the same bytes;
+  log-probabilities identical on 75 prompts; decode +2.0 % prose, +1.7 % code, +1.5 % structured at c1.
+## 2026-10-18: decode: a paced L2 prefetch of the next weights in the step's idle-DRAM windows (G6_L2PF, off by default)
+- A decode step leaves DRAM idle in its collective waits (the two all-reduces per layer, the `G6_QA_SPLIT` /
+  `G6_IDXQ_SPLIT` gathers) and through most of the latency-bound attention, while the GEMVs around them start cold.
+  `G6_L2PF` (launch knob `L2PF`, a window mask) has one warp on a high-priority side stream prefetch the layer's next
+  weights into L2 in those windows: 8 KiB `cp.async.bulk.prefetch.L2` chunks from a token bucket (`G6_L2PF_GBPS`, 175
+  GB/s, in waves of `G6_L2PF_WAVE`), not a burst, so dependent loads of the attention are left alone; a second warp
+  polls the collective's tails and ends the window once every peer has arrived.
+- One queue per layer in read order (x_in, idx_q, q_b, UK, UV, o_proj up to `G6_L2PF_OPMB`, router, shared fc1);
+  windows: 1 = the MLP all-reduce wait, 2 = the gather waits, 4 = the attention, 8 = the attention all-reduce wait. The
+  side stream is forked per window and joined at the end of the step part, so captured graphs hold the forks as edges.
+  Unset: no stream, no launch, the graphs are unchanged.
+- A prefetch writes nothing: same bytes out. `engine/kernels/tests/l2pf_bench.cu` (built by `scripts/build.sh`, run by
+  hand) byte-compares the decode layer sequence's outputs per arm and times it per layer.
+- Measured on four GB10 at TP=4 (`L2PF=15`): T=0 top-20 log-probabilities identical on 75 prompts; decode c1 +2.7 %
+  prose, +2.3 % code, +2.7 % structured; `l2pf_bench` -10.1 us a layer at 3 rows, -38.6 us at 12.
+## 2026-10-19: S2: a row cap for steps past SHARE_LIMIT that also sizes the CP fabric (G6_CP_STEP_ROWS, off by default)
+
+- Since #94 sessions past `SHARE_LIMIT` (R) share batched S2 steps, so the CP fabric and the CP graphs at every bucket
+  past R are sized for the widest S2 step: `SESS` x (`MTP` + 1) = 24 rows at 8 sessions / MTP 2, 1.358 GB pinned and
+  registered per rank at TP=4 (8 rows: 0.453 GB). `G6_CP_MMAX` can only raise that.
+- `G6_CP_STEP_ROWS=n` (launch knob `CP_STEP_ROWS`) sizes the fabric for n rows, and `Driver::step` forms rounds so
+  that no step past R carries more than n: while a session past R decodes and the decoding sessions' rows do not fit,
+  a round takes at most n / (`MTP` + 1) sessions, those past R first, and the others sit it out the way a grow stall
+  does (their state does not change); every decoding session gets one round per cycle. Rounds without a session past
+  R keep the full batch. n is at least the rows of a solo or prompt step past R (the boot names the minimum) and is
+  clamped to the widest S2 step. The boot does not capture the main widths above n at the buckets past R.
+- `G6_CP_STEP_SEG=1` (launch knob `CP_STEP_SEG`): a round past R takes only sessions past R, so a session below R
+  never runs the CP attention because a long session is resident.
+- Sessions past R give the same tokens as without the knob; a session below R left out of a past-R round runs that
+  round on the replicated path instead of the CP path (the LSE-merge difference #94 introduced, ~1e-5). Set, the
+  knob joins the scheduler digest, the bootstrap agreement and the S2 runtime signature; unset, nothing changes.
+- Host test `engine/runtime/s2/tests/cp_rows_test.cpp` (in `scripts/host_tests.sh`). Measured on four GB10 at TP=4
+  and the default CAP: with the 24-row fabric the head was down to ~0.5 GiB MemAvailable while serving and hit
+  NV_ERR_NO_MEMORY under load; with `CP_STEP_ROWS=8` it had 3.33 GiB (the other boxes 2.48-2.77). T=0 output
+  unchanged at short context; a ~71K-token request plus three short ones ran concurrently with the cap engaged,
+  without errors.
+
+## 2026-10-20: tool calls stream as they are written
+
+- The front end streams a tool call's name and arguments while the model writes them, instead of sending the whole call
+  once the reply ends. This applies to a call in the answer, outside a code fence, that starts the answer or follows text
+  with no space between, which is how GLM-5.3 places a call. String arguments (file contents, commands) stream as
+  generated; typed ones (integers, booleans, objects) go out once each value ends. Other calls (after a space or
+  newline, in reasoning, in a fence) are held until the reply ends, as before, so a call quoted in prose stays prose.
+  A streamed call is a call even if prose follows it.
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
 - TP=3 now defaults `SHARE_LIMIT` to 32,768 (was 65,536), the mirror of the TP=4 change. Two or three long (32K+)
