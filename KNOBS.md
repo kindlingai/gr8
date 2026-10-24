@@ -123,7 +123,7 @@ the `CAP` pool, each session with its own KDA state slots, while `SESS` x (`MTP`
 |---|---|---|---|---|
 | `GR8_MODEL` | `--gr8-model` | `glm53` | cluster | the model: `glm53` or `glm53f`. `./gr8 <model>` sets it |
 | `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3 (glm53f: 4 or 2); needed with mentat |
-| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch): each box's f0 port cabled to the next box's f1 port, in `--peers` order. Needs `--peers`, takes no `--ips` |
+| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch). With `--peers`, each box's f0 port is cabled to the next box's f1 port, in `--peers` order. With mentat, the boxes take the rank order and their `--ring-devs` from the cables mentat's probes find, on any cabling, and refuse the boot, naming the pair, when the links form no ring. `--head` and the model set's offers turn the ring. Takes no `--ips` |
 | `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
 | `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
 | `GROUP` | `--group` | `gr8-<model>` | cluster | the mentat group the boxes join |
@@ -140,7 +140,7 @@ the `CAP` pool, each session with its own KDA state slots, while `SESS` x (`MTP`
 | `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the release directory has none |
 | `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `run/` |
 | `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
-| `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
+| `RING_DEVS` | `--ring-devs` | from mentat's probes, or the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev. With mentat, the devices behind its addresses toward the next and previous ranks (`/sys/class/infiniband`); with `--peers`, `rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`. An explicit list wins |
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
 | `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |

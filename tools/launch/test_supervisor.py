@@ -16,6 +16,8 @@ import handshake as H  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as S  # noqa: E402
 from test_handshake import hello  # noqa: E402
+from test_mentat import FakeDaemon, cabled, flipped, ring  # noqa: E402
+import mentat as M  # noqa: E402
 
 MEMBERS = ['192.0.2.1', '192.0.2.2', '192.0.2.3', '192.0.2.4']    # TEST-NET: never this box's address
 
@@ -44,6 +46,105 @@ class RingTests(unittest.TestCase):
         with mock.patch.object(S.fabric, 'rails', side_effect=AssertionError('no fabric discovery on a ring')):
             s.rendezvous(4)
         self.assertEqual((s.rank, s.rails), (2, (MEMBERS[2], MEMBERS[2])))
+
+
+class MentatRingTests(unittest.TestCase):
+    """--shape ring with mentat: every box publishes its probed links, and all of them derive one ring and their
+    --ring-devs from it, whatever the cabling."""
+
+    def boot(self, n, cables, broken=(), extra=()):
+        snaps, roots, addr = cabled(n, cables, broken)
+        agents, lock = {}, threading.Lock()
+
+        def group(_):
+            with lock:
+                return {'node_id': 'n1', 'peers': {}, 'groups': {'gr8-glm53': {'agents': {
+                    k: {f: x for f, x in v.items() if f != 'link'} for k, v in agents.items()}}}}
+
+        def on_link(h, alive, link):
+            with lock:
+                if alive:
+                    agents[h['agent_id']] = {'node_ip': h['node_ip'], 'node_id': f'n{h["node_ip"].rsplit(".", 1)[1]}',
+                                             'alive': True, 'machine': h['machine'], 'meta': h['meta'], 'link': link}
+                elif agents[h['agent_id']]['link'] is link:
+                    agents[h['agent_id']]['alive'] = False
+        daemons = [FakeDaemon(group=group, local=lambda i=i: snaps[i], on_link=on_link) for i in range(n)]
+        # the devices: port p of box i at root k is dev{p}r{k}
+        devs = [{a: (f'f{k[1]}r{k[2]}', k[2]) for k, a in addr.items() if k[0] == i} for i in range(n)]
+        sups, res = [], [None] * n
+        elect = M.elect
+        try:
+            with mock.patch.object(S, 'log'), \
+                    mock.patch.object(S.fabric, 'ring_ports', lambda: devs[int(threading.current_thread().name)]), \
+                    mock.patch.object(S.mentat, 'elect', lambda *a, **k: elect(*a, **{**k, 'hold_s': 0.2,
+                                                                                    'ring_settle': 1.0})):
+                for i in range(n):
+                    o = opt.parse(['--no-config', '--mentat', f'127.0.0.1:{daemons[i].port}', '--tp', str(n),
+                                   '--shape', 'ring', '--g6-home', tempfile.mkdtemp(), '--join-timeout', '30',
+                                   *extra], {})
+                    opt.validate(o)
+                    s = S.Supervisor(o)
+                    sups.append(s)
+
+                def run(i):
+                    try:
+                        sups[i].rendezvous(n)
+                        res[i] = 'ok'
+                    except S.Stop as e:
+                        res[i] = e
+                ts = [threading.Thread(target=run, args=(i,), name=str(i)) for i in range(n)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(60)
+        finally:
+            for s in sups:
+                if s.agent:
+                    s.agent.stop()
+            for d in daemons:
+                d.close()
+        return sups, res
+
+    def test_three_and_four_boxes_on_any_cabling(self):
+        for n, order in ((3, [0, 2, 1]), (4, [0, 2, 1, 3])):
+            for cables in (ring(order), flipped(order)):
+                with self.subTest(n=n, cables=cables):
+                    sups, res = self.boot(n, cables)
+                    self.assertEqual(res, ['ok'] * n)
+                    self.assertEqual(len({tuple(s.members) for s in sups}), 1)
+                    self.assertEqual(len({s.ring for s in sups}), 1)     # the handshake compares it
+                    self.assertEqual(sups[0].members[0], '10.0.0.1')
+                    by_rank = sorted(sups, key=lambda s: s.rank)
+                    for s in by_rank:
+                        mine = s.ring_devs.split(',')
+                        self.assertEqual(s.rails, (s.lan, s.lan))
+                        # direct-next and direct-prev are root 1 of two different ports, relay root 0
+                        self.assertEqual({mine[1][-2:], mine[3][-2:], mine[0][-2:], mine[2][-2:]}, {'r1', 'r0'})
+                        self.assertNotEqual(mine[1][:2], mine[3][:2])
+                        self.assertEqual(mine[1][:2], mine[0][:2])
+                        c, _, _ = opt.canonical(s.o, opt.engine_plan(s.o), None, ring=s.ring)
+                        self.assertEqual(c['ring'], by_rank[0].ring)
+
+    def test_the_engine_gets_the_found_devices_and_an_explicit_list_wins(self):
+        sups, res = self.boot(3, flipped([0, 1, 2]))
+        self.assertEqual(res, ['ok'] * 3)
+        s = sups[0]
+        self.assertEqual(s.ring_devs, 'f1r0,f1r1,f0r0,f0r1')       # its next box is on its f1 cable
+        self.assertEqual(s.ring_args(), ['--ring', '--ring-devs', 'f1r0,f1r1,f0r0,f0r1'])
+        sups, res = self.boot(3, flipped([0, 1, 2]), extra=('--ring-devs', 'a,b,c,d'))
+        self.assertEqual(res, ['ok'] * 3)
+        self.assertIsNone(sups[0].ring_devs)
+        self.assertEqual(sups[0].ring_args(), ['--ring', '--ring-devs', 'a,b,c,d'])
+        # --peers: the engine's default devices, as before
+        self.assertEqual(supervisor('--shape', 'ring').ring_args(), ['--ring'])
+        self.assertEqual(supervisor().ring_args(), [])
+
+    def test_a_broken_cable_stops_every_box(self):
+        sups, res = self.boot(3, ring([0, 1, 2]), broken={2})
+        for e in res:
+            self.assertIsInstance(e, S.Stop)
+            self.assertEqual(e.code, 4)
+            self.assertIn('no cable works between 10.0.0.1 and 10.0.0.3', str(e))
 
 
 class ControlPortTests(unittest.TestCase):
