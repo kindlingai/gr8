@@ -78,6 +78,9 @@ RUN MODEL=flash scripts/build.sh /out/bin
 FROM engine-src AS engine-int4
 ARG G6_WIDTHS=
 RUN G6_WIDTHS="$G6_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin
+# CI's int4 leg also compiles the Flash engine (engine-flash above), which BuildKit builds beside this stage; the
+# binaries stay here and are not in dist-int4
+COPY --from=engine-flash /out/bin/g6m4_flash /tmp/flash/
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a
 # and libg6kvman.a
@@ -102,6 +105,9 @@ COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
 
 FROM scratch AS dist-int4
 COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/
+
+FROM scratch AS dist-flash
+COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
 
 FROM scratch AS dist
 COPY --from=dist-fp8 / /
