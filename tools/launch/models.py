@@ -53,7 +53,7 @@ def of(o):
 
 def check_config(model, directory):
     """Raises ModelMismatch when directory/config.json names another architecture than model's. A directory without
-    config.json, or a config.json without `architectures`, passes."""
+    config.json, or a config.json without `architectures`, passes: older pack directories carry none."""
     path = os.path.join(directory or '', 'config.json')
     if not directory or not os.path.isfile(path):
         return
