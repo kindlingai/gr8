@@ -205,7 +205,7 @@ fn random_traces(resize: bool, seeds: std::ops::RangeInclusive<u64>) -> u64 {
                 let s = ranks[0].pool.stash().unwrap();
                 for (i, p) in points.iter().enumerate() {
                     let q = (old > i as u64).then(|| s.quote_resize(t, old - i as u64 - 1)).flatten();
-                    assert_eq!(*p, q.map_or(u64::MAX, |q| q.lost_rows), "seed {seed}: quote point {i}");
+                    assert_eq!(*p, q.map_or(u64::MAX, |q| q.lost_blocks), "seed {seed}: quote point {i}");
                 }
                 let q = s.quote_resize(t, to).expect("a tier with no index resizes");
                 let ids = |s: &g6kvman::stash::Stash, only: Option<usize>| -> Vec<u64> {

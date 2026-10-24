@@ -474,7 +474,7 @@ moves between groups by whole segments (server.rs):
   shrink). A quote is a dry run of the shrink on a copy of the stash (`Stash::quote_resize`: the entries that leave
   the tier in eviction order, the entries lost, their rows and blocks, the blocks a later tier takes), and
   `apply_resize_plan` does the shrink only when a fresh quote still equals it. The node keeps the last quotes per group
-  and shows them in STATS (`quote_rows`); it still picks the group to give by its ages (D-331 M6 step 1).
+  and shows them in STATS (`quote_blocks`); it still picks the group to give by its ages (D-331 M6 step 1).
 - The node answers with a grant or a give, as a transaction: an id and an absolute target in segments a rank. The head
   announces it as a Resize event, and every rank applies it at that one point of the call sequence with the id
   (`GROW target txn`, `SHRINK target txn`). A GROW or SHRINK under any id but the group's open one is refused

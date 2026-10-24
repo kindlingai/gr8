@@ -243,6 +243,82 @@ pub const COUNTS: usize = 4096;
 pub const HEADS: usize = 1024;
 /// The grid when prefix reuse has none: the served prefill chunk.
 pub const GRID: u64 = 4096;
+/// Dropped runs the ghost ledger remembers at most.
+pub const GHOSTS: usize = 4096;
+
+/// The ghost ledger (share_policy.rs): runs no tier kept, and whether a prompt continued one within the horizon. A run
+/// is remembered by the hash of its rows up to its last whole page; a prompt that starts with those rows returned to
+/// it. The head's only: it is not in the digest, and ranks need not agree on it.
+#[derive(Clone, Debug)]
+pub struct Ghosts {
+    on: bool,
+    horizon: std::time::Duration,
+    live: std::collections::HashMap<(usize, u64), std::time::Instant>,
+    order: std::collections::VecDeque<((usize, u64), std::time::Instant)>,
+    /// runs remembered, of them continued within the horizon, and passed it (or pushed out) without
+    pub dropped: u64,
+    pub returned: u64,
+    pub expired: u64,
+}
+
+impl Ghosts {
+    fn new(on: bool) -> Ghosts {
+        Ghosts {
+            on,
+            horizon: std::time::Duration::from_secs(300),
+            live: Default::default(),
+            order: Default::default(),
+            dropped: 0,
+            returned: 0,
+            expired: 0,
+        }
+    }
+    fn fold(h: u64, t: i32) -> u64 {
+        (h ^ t as u32 as u64).wrapping_mul(1099511628211)
+    }
+    fn expire(&mut self, now: std::time::Instant) {
+        while let Some(&(k, at)) = self.order.front() {
+            if self.order.len() <= GHOSTS && now.duration_since(at) < self.horizon {
+                break;
+            }
+            self.order.pop_front();
+            if self.live.get(&k) == Some(&at) {
+                self.live.remove(&k);
+                self.expired += 1;
+            }
+        }
+    }
+    fn note(&mut self, rows: &[i32]) {
+        let n = rows.len() / PAGE as usize * PAGE as usize;
+        if !self.on || n == 0 {
+            return;
+        }
+        let k = (n, rows[..n].iter().fold(FNV, |h, &t| Ghosts::fold(h, t)));
+        let now = std::time::Instant::now();
+        if self.live.insert(k, now).is_none() {
+            self.dropped += 1;
+        }
+        self.order.push_back((k, now));
+        self.expire(now);
+    }
+    fn returns(&mut self, prompt: &[i32]) {
+        if !self.on || self.live.is_empty() {
+            return;
+        }
+        self.expire(std::time::Instant::now());
+        let mut h = FNV;
+        for (i, &t) in prompt.iter().enumerate() {
+            h = Ghosts::fold(h, t);
+            if (i + 1) % PAGE as usize == 0 && self.live.remove(&(i + 1, h)).is_some() {
+                self.returned += 1;
+            }
+        }
+    }
+    /// runs still within the horizon that may yet return
+    pub fn pending(&self) -> u64 {
+        self.live.len() as u64
+    }
+}
 
 pub struct Stash {
     tiers: Vec<Tier>,
@@ -271,6 +347,7 @@ pub struct Stash {
     tail_place: u32,
     // the entries the last resize_tier evicted, in order (quote_resize reads its copy's)
     evicted: Vec<u64>,
+    pub ghosts: Ghosts,
 }
 
 const FNV: u64 = 14695981039346656037;
@@ -305,6 +382,7 @@ impl Stash {
             tail: None,
             tail_place: 0,
             evicted: Vec::new(),
+            ghosts: Ghosts::new(true),
         }
     }
 
@@ -478,6 +556,7 @@ impl Stash {
             tail: self.tail,
             tail_place: self.tail_place,
             evicted: Vec::new(),
+            ghosts: Ghosts::new(false),
         };
         if !d.resize_tier(t, slots) {
             return None;
@@ -948,6 +1027,8 @@ impl Stash {
                 self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
                 if e.kind.prefix() {
                     self.drop_dependents(e.id);
+                } else {
+                    self.ghost(&e);
                 }
             }
         }
@@ -970,8 +1051,27 @@ impl Stash {
                 self.tiers[t].alloc.release(&e.slots);
                 self.tiers[t].stats.dropped += 1;
                 self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
+                self.ghost(&e);
             }
         }
+    }
+
+    // a stock run no tier keeps: into the ghost ledger
+    fn ghost(&mut self, e: &Entry) {
+        if e.namespace == crate::pool::STOCK_NAMESPACE {
+            let n = (e.st.valid.max(0) as usize).min(e.st.history.len());
+            self.ghosts.note(&e.st.history[..n]);
+        }
+    }
+
+    /// A prompt at admission: the ghosts it continues returned (Pool::count).
+    pub fn note_prompt(&mut self, prompt: &[i32]) {
+        self.ghosts.returns(prompt);
+    }
+
+    /// How long a dropped run may take to come back and still count as returned (KV_SHARE_HORIZON_S, 300 s).
+    pub fn set_ghost_horizon(&mut self, h: std::time::Duration) {
+        self.ghosts.horizon = h;
     }
 
     /// Where a shared entry is now: (tier, its slots).
@@ -1443,5 +1543,36 @@ impl Index {
         self.file = OpenOptions::new().append(true).open(&self.path)?;
         self.records = (self.live.len() + self.counts.len()) as u64;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ghost_tests {
+    use super::*;
+
+    #[test]
+    fn a_dropped_run_returns_once_when_a_prompt_continues_it_and_expires_past_the_horizon() {
+        let mut g = Ghosts::new(true);
+        let run: Vec<i32> = (0..150).collect();
+        g.note(&run);
+        g.note(&run[..40]); // less than a page: not remembered
+        assert_eq!((g.dropped, g.pending()), (1, 1));
+        // another conversation with the same first page does not count
+        let other: Vec<i32> = (0..64).chain(1000..1100).collect();
+        g.returns(&other);
+        assert_eq!(g.returned, 0);
+        // the conversation continues: its first 128 rows (two whole pages) and more
+        let next: Vec<i32> = (0..300).collect();
+        g.returns(&next);
+        g.returns(&next);
+        assert_eq!((g.returned, g.pending()), (1, 0));
+        g.horizon = std::time::Duration::ZERO;
+        g.note(&next);
+        g.returns(&next);
+        assert_eq!((g.dropped, g.returned, g.expired, g.pending()), (2, 1, 1, 0));
+        // the dry copy a quote runs on remembers nothing
+        let mut off = Ghosts::new(false);
+        off.note(&run);
+        assert_eq!(off.dropped, 0);
     }
 }

@@ -2,6 +2,7 @@
 //! moves between them by whole segments at their own pace, the coldest group gives, and blocks never mix or get lost.
 //! RDMA (one region per segment) needs the hardware.
 
+use g6kvman::remote::server::Value;
 use g6kvman::remote::{client, coldest_ages, parse_plan, Config, GroupOpts, Node, Opts, RemoteStore, Share, Want};
 use g6kvman::tier::BlockStore;
 use std::io::ErrorKind;
@@ -185,7 +186,7 @@ fn the_colder_group_gives_and_the_other_grows_into_it() {
     let st = stats(&addr);
     assert!(st.contains("\"gave\":1") && st.contains("\"granted\":1"), "{st}");
     // the quotes a head sends show in STATS, beside its ages
-    assert!(st.contains(&format!("\"ages_ms\":[60000],\"quote_rows\":[0,700,{}]", u64::MAX)), "{st}");
+    assert!(st.contains(&format!("\"ages_ms\":[60000],\"quote_blocks\":[0,700,{}]", u64::MAX)), "{st}");
 }
 
 #[test]
@@ -452,4 +453,35 @@ fn stale_shrink_refused() {
     shrink_all(&a, 2, r.txn);
     assert_eq!(a[0].segs(), 2);
     assert_eq!(a[0].shrink(1, r.txn).unwrap_err().kind(), ErrorKind::StaleNetworkFileHandle);
+}
+
+#[test]
+fn the_shadow_prices_what_the_age_rule_gives_beside_what_the_cost_policy_would() {
+    let spg = ["chat", "batch", "req"].iter().map(|n| (n.to_string(), 15_600)).collect();
+    let addr = node_with(10, Share { margin: Duration::from_millis(1_000), value: Value::CostShadow, spg_ms: spg, ..Share::default() });
+    let chat = cluster(&addr, "chat", 2, 100_000, 1, 4);
+    let batch = cluster(&addr, "batch", 2, 100_000, 1, 4);
+    let req = cluster(&addr, "req", 2, 100_000, 1, 4);
+    for c in [&chat, &batch] {
+        let r = c[0].report(1, &[0], &[]).unwrap();
+        assert_eq!(r.grant, 1);
+        for s in c {
+            s.grow(2, r.txn).unwrap();
+        }
+    }
+    // chat is the colder, but a give loses its rows (w3); batch's first segment a rank is empty (w4)
+    chat[0].report_ghosts(0, &[9_000], &[500, 900], [10, 1, 0]).unwrap();
+    batch[0].report_ghosts(0, &[3_000], &[0, 400], [10, 1, 0]).unwrap();
+    // req is 2 segments short and reads back what it drops: the age rule asks chat, the cost policy would take batch's
+    assert_eq!(req[0].report_ghosts(1, &[0], &[], [10, 9, 0]).unwrap().grant, 0);
+    let st = stats(&addr);
+    assert!(
+        st.contains("\"shadow\":{\"value\":\"cost-shadow\",\"short\":1,\"gives\":1,\"waits\":0,\"held\":0,\"none\":0,\"agree\":0,\"age_gives\":1,\"age_unpriced\":0,"),
+        "{st}"
+    );
+    assert!(st.contains("\"cost_loss_ms\":0}"), "{st}");
+    assert!(!st.contains("\"age_loss_ms\":0,"), "the age rule's give loses chat's rows: {st}");
+    assert!(st.contains("\"quote_blocks\":[500,900],\"ghosts\":[10,1,0]"), "{st}");
+    // the age rule acted: chat gives
+    assert_eq!(chat[0].report(0, &[9_000], &[]).unwrap().give, 1);
 }

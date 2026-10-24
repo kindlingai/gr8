@@ -208,14 +208,14 @@ int main(int argc, char** argv)
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     CHECK(!share_poll(a.r[0]->pool, 0, a.r[0]->store, 0));
     g6kv_report rb{};
-    CHECK(g6kv_store_report(b, 2, nullptr, 0, nullptr, 0, &rb) == 0 && rb.grant == 0 && rb.unclaimed == 0);
+    CHECK(g6kv_store_report(b, 2, nullptr, 0, nullptr, 0, nullptr, &rb) == 0 && rb.grant == 0 && rb.unclaimed == 0);
     const auto give = share_poll(a.r[0]->pool, 0, a.r[0]->store, 0);
     CHECK(give && give->segs == 11 && give->slots == 11 * per);
     if (give) CHECK(a.apply(*give));
     CHECK(a.slots(0) == 11 * per && g6kv_store_segs(a.r[0]->store) == 11 && g6kv_store_segs(a.r[1]->store) == 11);
     // the two segments A gave are B's to take now
     uint64_t bb = 0;
-    CHECK(g6kv_store_report(b, 2, nullptr, 0, nullptr, 0, &rb) == 0 && rb.grant == 2);
+    CHECK(g6kv_store_report(b, 2, nullptr, 0, nullptr, 0, nullptr, &rb) == 0 && rb.grant == 2);
     CHECK(g6kv_store_grow(b, 1 + rb.grant, rb.txn, &bb) == 0 && bb == 3 * per);
     a.steps(300);
     const long hits2 = a.hits, stored2 = a.stored;

@@ -24,6 +24,7 @@
 //! until every rank of the group has given, so no other group can take them while the group is between sizes.
 
 use super::proto::{self, Header};
+use crate::share_policy::{self, Decision, Shadow, View};
 use super::sys::{self, Arena};
 use super::verbs::{self, Cq, Device, Mr, Pd, Qp, QpEnd};
 use std::collections::{BTreeMap, HashMap};
@@ -60,6 +61,22 @@ pub struct Share {
     /// A lease opened with persist whose last connection closes is parked this long (kvman-remote --holdover-s): an
     /// OPEN or GOPEN of the same name and shape in that time gets it back as it was, bytes and all. 0 = never parked.
     pub holdover: Duration,
+    /// KV_SHARE_VALUE (kvman-remote --value): age = the age rule picks the giver; cost-shadow = it still does, and the
+    /// value-weighted policy (share_policy.rs) logs and counts in STATS what it would pick (D-331 M6 step 2)
+    pub value: Value,
+    /// recompute ms a GiB of each group's KV costs (--value-spg GROUP=SECONDS; KV_SHARE_SPG_*). A group not listed is
+    /// unknown: the policy never takes rows from it, nor gives it rows of another
+    pub spg_ms: BTreeMap<String, u64>,
+    /// the policy's margin and controls (--value-margin)
+    pub policy: share_policy::Cfg,
+}
+
+/// Share::value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Value {
+    #[default]
+    Age,
+    CostShadow,
 }
 
 impl Default for Share {
@@ -72,6 +89,9 @@ impl Default for Share {
             cooldown: Duration::from_secs(10),
             plan: BTreeMap::new(),
             holdover: Duration::ZERO,
+            value: Value::Age,
+            spg_ms: BTreeMap::new(),
+            policy: share_policy::Cfg::default(),
         }
     }
 }
@@ -160,6 +180,8 @@ struct Group {
     // the rows a give of 1, 2, ... segments would lose, from the last report (Pool::quote_points). Shown in STATS only:
     // the node still picks the group to give by its ages
     quotes: Vec<u64>,
+    // the head's ghost ledger from the last report: runs dropped, returned, still pending
+    ghosts: [u64; 3],
     demand: u64,
     reports: u64,
     granted: u64,
@@ -196,6 +218,26 @@ struct State {
     waiting: BTreeMap<String, u64>,
     // persist leases no connection holds, by name, until the deadline (Share::holdover)
     parked: BTreeMap<String, (Arc<Lease>, Instant)>,
+    // Value::CostShadow: the policy's memory, and what it decided against the age rule
+    shadow: Shadow,
+    shadowed: Shadowed,
+}
+
+/// The shadow's counts (STATS "shadow"): reports a group was short at, what the policy decided, how often it picked
+/// the age rule's giver, and the request ms each would lose, both priced by the policy (score_transfer).
+#[derive(Default, Debug)]
+struct Shadowed {
+    short: u64,
+    gives: u64,
+    waits: u64,
+    held: u64,
+    none: u64,
+    agree: u64,
+    age_gives: u64,
+    // the age rule's gives the policy cannot price (a giver of unknown cost), left out of age_loss_ms
+    age_unpriced: u64,
+    age_loss_ms: f64,
+    cost_loss_ms: f64,
 }
 
 impl State {
@@ -276,10 +318,19 @@ impl State {
     // than `req`'s own coldest by the margin. floor: `req` asks for its floor (a group starting): the margin and the
     // cooldown do not apply, only the giver's own floor. The segments the give frees in all (k a rank x its ranks)
     fn ask(&mut self, req: &str, short: u64, now: Instant, sh: &Share, floor: bool) -> u64 {
+        let Some(n) = self.age_pick(req, now, sh, floor) else { return 0 };
+        let v = self.groups.get_mut(&n).expect("picked");
+        let k = short.div_ceil(v.nr as u64).min(v.segs() - v.floor);
+        let target = v.segs() - k;
+        State::open_txn(v, false, target, 0, now, false);
+        v.asked += 1;
+        k * v.nr as u64
+    }
+    // the group ask() asks to give: the coldest that may give
+    fn age_pick(&self, req: &str, now: Instant, sh: &Share, floor: bool) -> Option<String> {
         let mine = self.groups.get(req).map_or(0, Group::cold);
         let margin = sh.margin.as_millis() as u64;
-        let pick = self
-            .groups
+        self.groups
             .iter()
             .filter(|(n, v)| {
                 *n != req
@@ -293,14 +344,73 @@ impl State {
                             && v.cold() > mine.saturating_add(margin)))
             })
             .max_by_key(|(_, v)| v.cold())
-            .map(|(n, _)| n.clone());
-        let Some(n) = pick else { return 0 };
-        let v = self.groups.get_mut(&n).expect("picked");
-        let k = short.div_ceil(v.nr as u64).min(v.segs() - v.floor);
-        let target = v.segs() - k;
-        State::open_txn(v, false, target, 0, now, false);
-        v.asked += 1;
-        k * v.nr as u64
+            .map(|(n, _)| n.clone())
+    }
+    // what the node knows of group `n` for the share policy
+    fn view(&self, n: &str, now: Instant, sh: &Share) -> View {
+        let g = &self.groups[n];
+        View {
+            name: n.to_string(),
+            nr: g.nr as u64,
+            block_bytes: g.block_bytes as u64,
+            seg_bytes: sh.seg_bytes as u64,
+            segs: g.segs(),
+            floor: g.floor,
+            weight: g.weight,
+            spg_ms: sh.spg_ms.get(n).copied().unwrap_or(0),
+            quotes: g.quotes.clone(),
+            dropped: g.ghosts[0],
+            returned: g.ghosts[1],
+            pending: g.ghosts[2],
+            eligible: g.complete()
+                && g.txn.is_none()
+                && !g.stalled
+                && g.segs() > g.floor
+                && g.calm_until.is_none_or(|t| now >= t),
+        }
+    }
+    // Value::CostShadow: `req` is `short` segments short; before the age rule acts, what the policy would do, beside
+    // what the age rule does
+    fn shadow(&mut self, req: &str, short: u64, now: Instant, sh: &Share, started: Instant) {
+        let r = self.view(req, now, sh);
+        let others: Vec<View> = self.groups.keys().filter(|n| *n != req).map(|n| self.view(n, now, sh)).collect();
+        let age = self.age_pick(req, now, sh, false);
+        let now_ms = now.duration_since(started).as_millis() as u64;
+        let d = self.shadow.decide(now_ms, &r, &others, short);
+        let x = &mut self.shadowed;
+        x.short += 1;
+        if let Some(a) = &age {
+            let v = others.iter().find(|o| &o.name == a).expect("age pick");
+            let k = short.div_ceil(v.nr).min(v.segs - v.floor);
+            let loss = share_policy::score_transfer(&r, v, k, short).map_or(f64::INFINITY, |s| s.loss_ms);
+            x.age_gives += 1;
+            if loss.is_finite() {
+                x.age_loss_ms += loss;
+            } else {
+                x.age_unpriced += 1;
+            }
+        }
+        let what = match &d {
+            Decision::Give(n, s) => {
+                x.gives += 1;
+                x.cost_loss_ms += s.loss_ms;
+                x.agree += (age.as_deref() == Some(n.as_str())) as u64;
+                format!("give {} x {} from {n} (benefit {:.0} ms, loss {:.0} ms)", s.give, s.freed / s.give.max(1), s.benefit_ms, s.loss_ms)
+            }
+            Decision::Wait(n, s) => {
+                x.waits += 1;
+                format!("wait for a second report to take {} from {n} (net {:.0} ms)", s.give, s.net_ms)
+            }
+            Decision::Held(n, s, why) => {
+                x.held += 1;
+                format!("hold {} from {n}: {why}", s.give)
+            }
+            Decision::None => {
+                x.none += 1;
+                "no give pays".to_string()
+            }
+        };
+        eprintln!("kvman-remote: share shadow: {req} short {short}: the age rule asks {}, the cost policy would {what}", age.as_deref().unwrap_or("nobody"));
     }
 }
 
@@ -506,6 +616,8 @@ impl Node {
                 plan: share.plan.clone(),
                 waiting: BTreeMap::new(),
                 parked: BTreeMap::new(),
+                shadow: Shadow::new(share.policy.clone()),
+                shadowed: Shadowed::default(),
             }),
             devices: Mutex::new(HashMap::new()),
             cfg_rdma: cfg.rdma,
@@ -578,7 +690,7 @@ impl Shared {
     pub fn stats_json(&self) -> String {
         // a lease upgraded here may be the last reference, and its drop takes the state lock: collect, then unlock
         let seg = self.share.seg_bytes;
-        let (free, largest, free_segs, unclaimed, groups, leases) = {
+        let (free, largest, free_segs, unclaimed, groups, leases, shadow) = {
             let mut st = self.state.lock().unwrap();
             st.tick(Instant::now(), &self.share);
             let leases: Vec<Arc<Lease>> = st.leases.values().filter_map(Weak::upgrade).collect();
@@ -592,7 +704,7 @@ impl Shared {
                     format!(
                         "{{\"name\":\"{}\",\"nr\":{},\"block\":{},\"floor\":{},\"cap\":{},\"weight\":{},\"segs\":{{{}}},\
                          \"boot\":{},\"txn\":{},\"grant\":{},\"give\":{},\"retired\":{},\"bonus\":{},\"stalled\":{},\
-                         \"demand\":{},\"ages_ms\":[{}],\"quote_rows\":[{}],\"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
+                         \"demand\":{},\"ages_ms\":[{}],\"quote_blocks\":[{}],\"ghosts\":[{},{},{}],\"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
                         json_escape(n),
                         g.nr,
                         g.block_bytes,
@@ -610,6 +722,9 @@ impl Shared {
                         g.demand,
                         ages.join(","),
                         quotes.join(","),
+                        g.ghosts[0],
+                        g.ghosts[1],
+                        g.ghosts[2],
                         g.reports,
                         g.granted,
                         g.gave,
@@ -624,11 +739,29 @@ impl Shared {
                 st.unclaimed(seg),
                 groups,
                 leases,
+                {
+                    let x = &st.shadowed;
+                    format!(
+                        "{{\"value\":\"{}\",\"short\":{},\"gives\":{},\"waits\":{},\"held\":{},\"none\":{},\"agree\":{},\
+                         \"age_gives\":{},\"age_unpriced\":{},\"age_loss_ms\":{:.0},\"cost_loss_ms\":{:.0}}}",
+                        if self.share.value == Value::CostShadow { "cost-shadow" } else { "age" },
+                        x.short,
+                        x.gives,
+                        x.waits,
+                        x.held,
+                        x.none,
+                        x.agree,
+                        x.age_gives,
+                        x.age_unpriced,
+                        x.age_loss_ms,
+                        x.cost_loss_ms
+                    )
+                },
             )
         };
         let mut s = format!(
             "{{\"bytes\":{},\"free\":{},\"largest_free\":{},\"seg_bytes\":{},\"free_segs\":{},\"unclaimed_segs\":{},\
-             \"locked\":{},\"uptime_s\":{},\"opened\":{},\"groups\":[{}],\"leases\":[",
+             \"locked\":{},\"uptime_s\":{},\"opened\":{},\"shadow\":{},\"groups\":[{}],\"leases\":[",
             self.arena.len(),
             free,
             largest,
@@ -638,6 +771,7 @@ impl Shared {
             self.arena.locked,
             self.started.elapsed().as_secs(),
             self.opened.load(Ordering::Relaxed),
+            shadow,
             groups.join(",")
         );
         let mut first = true;
@@ -894,10 +1028,11 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                     fail(&mut s, proto::E_PROTO, "too many ages or quotes")?;
                     break;
                 }
-                let b = read_vec(&mut s, (h.b + h.c) as usize * 8)?;
+                let b = read_vec(&mut s, (h.b + h.c + 3) as usize * 8)?;
                 let mut ages: Vec<u64> = b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+                let ghosts: [u64; 3] = ages.split_off(ages.len() - 3).try_into().unwrap();
                 let quotes = ages.split_off(h.b as usize);
-                match report(sh, &l, h.a, ages, quotes) {
+                match report(sh, &l, h.a, ages, quotes, ghosts) {
                     Ok((grant, give, unclaimed, txn)) => {
                         let mut b = Header::new(proto::OK, grant, give, unclaimed).bytes().to_vec();
                         b.extend_from_slice(&txn.to_le_bytes());
@@ -1187,6 +1322,7 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64, bool), Refusal>
                         calm_until: None,
                         ages: Vec::new(),
                         quotes: Vec::new(),
+                        ghosts: [0; 3],
                         demand: 0,
                         reports: 0,
                         granted: 0,
@@ -1222,7 +1358,14 @@ fn group_of(l: &Lease) -> Result<&(String, u32), Refusal> {
 
 // (segments a rank grows by now, segments a rank gives back, unclaimed segments, the transaction to name in GROW or
 // SHRINK; 0 = nothing to do). A transaction in progress is told once, to the first report after it opened
-fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>, quotes: Vec<u64>) -> Result<(u64, u64, u64, u64), Refusal> {
+fn report(
+    sh: &Arc<Shared>,
+    l: &Lease,
+    demand: u64,
+    ages: Vec<u64>,
+    quotes: Vec<u64>,
+    ghosts: [u64; 3],
+) -> Result<(u64, u64, u64, u64), Refusal> {
     let (name, rank) = group_of(l)?;
     let seg = sh.share.seg_bytes;
     let mut st = sh.state.lock().unwrap();
@@ -1232,6 +1375,7 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>, quotes: Vec<
     let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
     g.ages = ages;
     g.quotes = quotes;
+    g.ghosts = ghosts;
     g.demand = demand;
     g.reports += 1;
     let mine = g.members.get(rank).map_or(g.floor, |m| m.segs);
@@ -1270,6 +1414,9 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>, quotes: Vec<
     if let Some((k, need, left)) = short {
         // the giver gives whole segments on each of its ranks: what that frees past this group's need, a whole
         // segment on each of its ranks, it takes with its next grant
+        if sh.share.value == Value::CostShadow {
+            st.shadow(name, k, now, &sh.share, sh.started);
+        }
         let freed = st.ask(name, k, now, &sh.share, false);
         if freed > 0 {
             st.groups.get_mut(name).expect("reported").bonus = (left + freed).saturating_sub(need) / nr;
@@ -1496,6 +1643,7 @@ mod tests {
             calm_until: None,
             ages: age.into_iter().collect(),
             quotes: Vec::new(),
+            ghosts: [0; 3],
             demand: 0,
             reports: 0,
             granted: 0,
@@ -1514,6 +1662,8 @@ mod tests {
             plan: BTreeMap::new(),
             waiting: BTreeMap::new(),
             parked: BTreeMap::new(),
+            shadow: Shadow::default(),
+            shadowed: Shadowed::default(),
         }
     }
 

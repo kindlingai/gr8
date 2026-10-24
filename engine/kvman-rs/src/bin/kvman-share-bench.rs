@@ -7,7 +7,7 @@
 //!
 //!   kvman-share-bench [--server HOST:PORT] [--gb 4] [--seg-mb 128] [--margin-s 60] [--poll-ms 1000]
 //!                     [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE]
-//!                     [--clock pool|bench] [--seed N]
+//!                     [--clock pool|bench] [--seed N] [--value age|cost-shadow] [--spg-s 15.6]
 //!
 //! Without --server it runs a node in this process (TCP on loopback). The run is four phases: A busy and B idle, B busy
 //! and A idle, both busy, A busy and B idle. A busy cluster runs agent conversations whose KV does not fit its pool, so
@@ -16,6 +16,7 @@
 //! must hold its prompt's token. The ranks of a cluster must queue the same copies and agree on the pool digest after
 //! every call. One line of JSON per head poll (the timeline), and a summary at the end.
 
+use g6kvman::remote::server::Value;
 use g6kvman::remote::{coldest_ages, Config, GroupOpts, Node, Opts, RemoteStore, Share, Want};
 use g6kvman::stash::{Io, Keep, Policy};
 use g6kvman::tier::{page_slot, BlockStore, MLA_ROW, MLA_ROW_KV4};
@@ -33,7 +34,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: kvman-share-bench [--server HOST:PORT] [--gb 4] [--seg-mb 128] [--margin-s 60] [--poll-ms 1000] \
          [--phase-s 150] [--ranks 2] [--agents 24] [--transport tcp|rdma|auto] [--json FILE] [--clock pool|bench] [--seed N] \
-         [--only A|B] [--busy phases|always|idle]\n\
+         [--only A|B] [--busy phases|always|idle] [--value age|cost-shadow] [--spg-s 15.6]\n\
          --only: run that cluster alone (the other group is another process, e.g. vLLM, on --server);\n\
          --busy: phases (the 4 phases), always or idle"
     );
@@ -360,7 +361,13 @@ impl Cluster {
                 8,
             )
         };
-        let rep = self.ranks[0].store.report(if wants { 2 } else { 0 }, &ages, &[]).unwrap_or_else(|e| die(e.to_string()));
+        // the quotes and the ghost ledger the engine's head sends too (s2/kv_share.h share_poll), for --value cost-shadow
+        let quotes = self.ranks[0].pool.quote_points(0, self.per_seg, 8);
+        let (gd, gr, gp) = self.ranks[0].pool.ghosts();
+        let rep = self.ranks[0]
+            .store
+            .report_ghosts(if wants { 2 } else { 0 }, &ages, &quotes, [gd, gr, gp])
+            .unwrap_or_else(|e| die(e.to_string()));
         let mut act = String::new();
         if rep.grant > 0 {
             let target = self.ranks[0].store.segs() + rep.grant;
@@ -430,6 +437,9 @@ struct Args {
     only: Option<usize>,
     // None: the phases; Some(b): busy (or idle) all the time
     busy: Option<bool>,
+    // --value cost-shadow: the in-process node shadows the age rule with the cost policy, both groups at --spg-s
+    value: Value,
+    spg_s: f64,
 }
 
 fn cluster(a: &Args, addr: &str, id: u64, name: &'static str, mla_row: usize, floor: u64, cap: u64) -> Cluster {
@@ -501,6 +511,8 @@ fn main() {
         seed: 0,
         only: None,
         busy: None,
+        value: Value::Age,
+        spg_s: 15.6,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -539,6 +551,14 @@ fn main() {
                     _ => usage(),
                 }
             }
+            "--value" => {
+                a.value = match v().as_str() {
+                    "age" => Value::Age,
+                    "cost-shadow" => Value::CostShadow,
+                    _ => usage(),
+                }
+            }
+            "--spg-s" => a.spg_s = v().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }
@@ -552,6 +572,11 @@ fn main() {
                 margin,
                 stall: margin / 6,
                 cooldown: margin / 6,
+                value: a.value,
+                spg_ms: ["A", "B"]
+                    .iter()
+                    .map(|n| (format!("{n}-{}", std::process::id()), (a.spg_s * 1000.0).round() as u64))
+                    .collect(),
                 ..Share::default()
             };
             let n = Node::new(

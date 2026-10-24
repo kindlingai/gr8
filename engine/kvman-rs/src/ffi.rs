@@ -929,6 +929,18 @@ pub unsafe extern "C" fn g6kv_tier_resize(p: *mut Pool, t: u32, slots: u64, resi
     }
 }
 
+/// The head's ghost ledger (Pool::ghosts) into out[0..3]: runs no tier kept, of them returned, still pending.
+///
+/// # Safety
+/// `p` must be a live pool and `out` hold 3 values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_pool_ghosts(p: *mut Pool, out: *mut u64) {
+    let (d, r, n) = (*p).ghosts();
+    for (i, v) in [d, r, n].into_iter().enumerate() {
+        *out.add(i) = v;
+    }
+}
+
 /// The resize quotes a head reports (g6kv_store_report): out[i] = the rows a give of i + 1 segments of `per_seg` blocks
 /// loses (Pool::quote_points; u64::MAX = the tier would refuse it). Writes up to `cap` and returns how many.
 ///

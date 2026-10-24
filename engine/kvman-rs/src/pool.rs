@@ -614,7 +614,9 @@ impl Pool {
     /// `span`: the tokens of the prompt's system span (system message and tool definitions as templated), when the
     /// front end sent it.
     pub fn count(&mut self, prompt: &[i32], span: Option<u32>) -> u32 {
-        let Some(s) = &self.stash else { return 0 };
+        let Some(s) = &mut self.stash else { return 0 };
+        s.note_prompt(prompt);
+        let s = &*s;
         self.next_tokens = Some(prompt.to_vec());
         self.next_len = Some(prompt.len());
         self.next_span = span.map(|x| s.span_rows(x, prompt.len()));
@@ -685,8 +687,14 @@ impl Pool {
         )
     }
 
+    /// The head's ghost ledger (stash.rs Ghosts): (runs no tier kept, of them continued within the horizon, still
+    /// within it). A KV node's head REPORTs it beside its quotes (share_policy.rs).
+    pub fn ghosts(&self) -> (u64, u64, u64) {
+        self.stash.as_ref().map_or((0, 0, 0), |s| (s.ghosts.dropped, s.ghosts.returned, s.ghosts.pending()))
+    }
+
     /// The resize quotes a KV node's head REPORTs for tier t beside its ages (stash.rs quote_resize): for each i, the
-    /// rows a give of i + 1 segments of `per_seg` blocks loses (the prefill requests pay to compute them again), at most
+    /// blocks a rank a give of i + 1 segments of `per_seg` blocks loses (the prefill requests pay to compute again), at most
     /// `most`; u64::MAX from the first give the tier would refuse (pinned entries, an index, past its size).
     pub fn quote_points(&self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
         let Some(s) = &self.stash else { return Vec::new() };
@@ -694,7 +702,7 @@ impl Pool {
         let mut v = Vec::with_capacity(most);
         for i in 1..=most as u64 {
             let q = slots.checked_sub(i * per_seg).and_then(|to| s.quote_resize(t, to));
-            v.push(q.as_ref().map_or(u64::MAX, |q| q.lost_rows));
+            v.push(q.as_ref().map_or(u64::MAX, |q| q.lost_blocks));
             if q.is_none() {
                 break;
             }

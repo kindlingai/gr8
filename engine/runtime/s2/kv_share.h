@@ -6,6 +6,7 @@
 // copies. Host only: the engine passes its KvTiers::run + io_done as run_io.
 #include "pool.h"
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <optional>
 
@@ -45,8 +46,9 @@ inline std::optional<Resize> share_poll(RunPool& pool, uint32_t tier, const g6kv
     require(per > 0, "share_poll: the store is not a group lease");
     const std::vector<uint64_t> ages = offer ? pool.coldest(tier, per, most) : std::vector<uint64_t>{};
     const std::vector<uint64_t> quotes = offer ? pool.quotes(tier, per, most) : std::vector<uint64_t>{};
+    const std::array<uint64_t, 3> ghosts = pool.ghosts();
     g6kv_report r{};
-    require(g6kv_store_report(store, want, ages.data(), ages.size(), quotes.data(), quotes.size(), &r) == 0,
+    require(g6kv_store_report(store, want, ages.data(), ages.size(), quotes.data(), quotes.size(), ghosts.data(), &r) == 0,
             g6kv_tier_error());
     if (r.grant) return Resize{tier, segs + r.grant, (segs + r.grant) * per, r.txn};
     if (r.give && r.give < segs) return Resize{tier, segs - r.give, (segs - r.give) * per, r.txn};

@@ -433,6 +433,7 @@ pub unsafe extern "C" fn g6kv_store_report(
     n: usize,
     quotes: *const u64,
     nq: usize,
+    ghosts: *const u64,
     out: *mut G6kvReport,
 ) -> i32 {
     if out.is_null() || (n > 0 && ages.is_null()) || (nq > 0 && quotes.is_null()) {
@@ -440,7 +441,8 @@ pub unsafe extern "C" fn g6kv_store_report(
     }
     let ages = if n == 0 { &[][..] } else { std::slice::from_raw_parts(ages, n) };
     let quotes = if nq == 0 { &[][..] } else { std::slice::from_raw_parts(quotes, nq) };
-    match (*t).remote().and_then(|r| r.report(want, ages, quotes)) {
+    let ghosts = if ghosts.is_null() { [0; 3] } else { [*ghosts, *ghosts.add(1), *ghosts.add(2)] };
+    match (*t).remote().and_then(|r| r.report_ghosts(want, ages, quotes, ghosts)) {
         Ok(x) => {
             *out = G6kvReport { grant: x.grant, give: x.give, unclaimed: x.unclaimed, txn: x.txn };
             0

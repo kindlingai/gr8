@@ -178,6 +178,9 @@ public:
         Lock l(mu_); std::vector<uint64_t> v(most); v.resize(g6kv_tier_coldest(p_, t, per_seg, v.data(), v.size())); return v;
     }
     // the rows a give of 1, 2, ... segments loses (g6kv_tier_quotes), what the head reports beside the ages
+    std::array<uint64_t, 3> ghosts() {
+        Lock l(mu_); std::array<uint64_t, 3> v{}; g6kv_pool_ghosts(p_, v.data()); return v;
+    }
     std::vector<uint64_t> quotes(uint32_t t, uint64_t per_seg, size_t most) {
         Lock l(mu_); std::vector<uint64_t> v(most); v.resize(g6kv_tier_quotes(p_, t, per_seg, v.data(), v.size())); return v;
     }
