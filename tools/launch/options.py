@@ -46,7 +46,8 @@ KEYS = {
     'FETCH': ('box', 'legacy', 'with an https:// --model: who fetches the weights. legacy: gr8 itself, from Hugging Face. '
                                "model-loader: the box's model-loader (MODEL_LOADER), into its store (MODEL_CACHE)"),
     'MODEL_LOADER': ('box', None, "FETCH=model-loader: the local model-loader's request API, unix:PATH or host:port "
-                                  '(default unix:<MODEL_CACHE>/model-loader.sock)'),
+                                  '(default unix:<MODEL_CACHE>/model-loader.sock). host:port needs '
+                                  'MODEL_LOADER_LOCAL_TOKEN in the environment'),
     'MODEL_LOADER_MODEL': ('box', None, "FETCH=model-loader: the release's name in model-loader's catalog (default the "
                                         "repo's name, after the org)"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),

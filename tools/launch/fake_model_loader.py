@@ -31,9 +31,9 @@ def glob_match(pattern, path):
 
 
 class FakeModelLoader:
-    def __init__(self, store, catalog, segment=64 << 10, slow=False):
-        """catalog: {name: {revision: (release dir, commit)}}."""
-        self.store, self.catalog, self.segment, self.slow = store, catalog, segment, slow
+    def __init__(self, store, catalog, segment=64 << 10, slow=False, token=None):
+        """catalog: {name: {revision: (release dir, commit)}}. token: answer 401 without Authorization: Bearer token."""
+        self.store, self.catalog, self.segment, self.slow, self.token = store, catalog, segment, slow, token
         self.copied, self.requests, self.puts, self.lock = 0, {}, [], threading.Lock()
         self.waits = {}
         os.makedirs(store, exist_ok=True)
@@ -56,7 +56,15 @@ class FakeModelLoader:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def unauthorized(self):
+                if fake.token and self.headers.get('Authorization') != f'Bearer {fake.token}':
+                    self.reply(401, text='unauthorized')
+                    return True
+                return False
+
             def do_PUT(self):
+                if self.unauthorized():
+                    return
                 m = re.fullmatch(r'/requests/([A-Za-z0-9][A-Za-z0-9._-]{0,127})', self.path)
                 if not m:
                     return self.reply(400, text='bad name')
@@ -65,6 +73,8 @@ class FakeModelLoader:
                 self.reply(code, out if code == 200 else None, None if code == 200 else out)
 
             def do_GET(self):
+                if self.unauthorized():
+                    return
                 m = re.fullmatch(r'/requests/([^?]+)(\?wait=.*)?', self.path)
                 if self.path == '/requests':
                     return self.reply(200, list(fake.requests.values()))

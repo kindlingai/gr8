@@ -56,10 +56,14 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class Client:
-    """The local request API of model-loader. addr: unix:PATH, or host:port (TCP)."""
+    """The local request API of model-loader. addr: unix:PATH, or host:port (TCP). token, when set, is sent as
+    Authorization: Bearer; TCP needs one, as model-loader serves TCP only with a token (MODEL_LOADER_LOCAL_TOKEN)."""
 
-    def __init__(self, addr):
-        self.addr = addr
+    def __init__(self, addr, token=None):
+        self.addr, self.token = addr, token
+        if not addr.startswith('unix:') and not token:
+            raise modelset.ModelError(f'MODEL_LOADER {addr}: a TCP local API needs MODEL_LOADER_LOCAL_TOKEN, the token '
+                                      'model-loader serves it with (or use unix:PATH)')
 
     def conn(self, timeout):
         if self.addr.startswith('unix:'):
@@ -69,9 +73,11 @@ class Client:
 
     def call(self, method, path, body=None, timeout=30):
         c = self.conn(timeout)
+        headers = {'Content-Type': 'application/json'} if body is not None else {}
+        if self.token:
+            headers['Authorization'] = f'Bearer {self.token}'
         try:
-            c.request(method, path, body=None if body is None else json.dumps(body).encode(),
-                      headers={'Content-Type': 'application/json'} if body is not None else {})
+            c.request(method, path, body=None if body is None else json.dumps(body).encode(), headers=headers)
             r = c.getresponse()
             data = r.read()
         except OSError as e:
@@ -79,6 +85,9 @@ class Client:
                                       'API, by default the socket model-loader.sock in the store)') from None
         finally:
             c.close()
+        if r.status == 401:
+            raise modelset.ModelError(f'model-loader at {self.addr}: 401: MODEL_LOADER_LOCAL_TOKEN is '
+                                      f'{"wrong" if self.token else "unset, and model-loader wants one"}')
         try:
             out = json.loads(data) if data and data.lstrip()[:1] in (b'{', b'[') else None
         except ValueError:
@@ -106,6 +115,12 @@ class Client:
         if code not in (200, 422, 504) or not isinstance(st, dict):
             raise modelset.ModelError(f'model-loader: request {name}: HTTP {code}: {text[:500]}')
         return st
+
+
+def safe_path(s):
+    """Is s a relative path that stays where it is joined: a model name or revision under the store?"""
+    return (isinstance(s, str) and '\\' not in s and '\0' not in s
+            and all(c not in ('', '.', '..') for c in s.split('/')))
 
 
 def merge(ranges, seg):
@@ -175,8 +190,10 @@ class Store:
 class Release:
     """The exlr8 release at one revision, as the box's model-loader holds it. The same interface as hfsource.Release."""
 
-    def __init__(self, store, addr, model, repo, rev, work, name, log=print, layout=None):
-        self.client, self.store_root, self.model, self.hf_repo = Client(addr), store, model, repo
+    def __init__(self, store, addr, model, repo, rev, work, name, log=print, layout=None, token=None):
+        if not safe_path(model):
+            raise modelset.ModelError(f'MODEL_LOADER_MODEL {model!r}: not a catalog name')
+        self.client, self.store_root, self.model, self.hf_repo = Client(addr, token), store, model, repo
         self.want_rev, self.work, self.request_name, self.log = rev, work, name, log
         self.layout = layout
         self.layout_sha256 = modelset.sha256_file(layout) if layout else None
@@ -192,6 +209,9 @@ class Release:
             self.ranges = {fr['path']: [(r['offset'], r['length']) for r in fr['ranges']]
                            for fr in old.get('ranges') or []}
         st = self.request()                              # the manifests and the tokenizer: the model set needs them
+        if (rev and st.get('revision') != rev) or not safe_path(st.get('revision')):
+            want = rev or "the catalog's only revision"         # the revision is joined into store paths
+            raise modelset.ModelError(f'model-loader answered {model} revision {st.get("revision")!r} for {want}')
         self.revision = st['revision']
         self.store = Store(store, model, self.revision)
         self.dir = self.store.dir
@@ -371,4 +391,4 @@ def of(o, repo, rev, log=print):
     named = bool(re.search(r'(@|/tree/)[^/]+/?$', url))            # parse_url says main when the URL names none
     work = os.path.join(os.path.abspath(o.get('G6_HOME')), 'run', 'model-loader')
     return Release(store, addr, model, repo, rev if named else '', work, f'gr8-{o.get("GR8_MODEL") or "glm53"}',
-                   log=log, layout=o.get('LAYOUT'))
+                   log=log, layout=o.get('LAYOUT'), token=os.environ.get('MODEL_LOADER_LOCAL_TOKEN') or None)

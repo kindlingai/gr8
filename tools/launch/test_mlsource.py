@@ -164,6 +164,30 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertIn('model-loader at unix:', err)
         self.assertIn('is it running?', err)
 
+    def test_the_local_api_token(self):
+        self.ml.token = 's3cret'
+        ms, v, err = S.resolve_model(self.opts(), log=self.logs.append)
+        self.assertIn('MODEL_LOADER_LOCAL_TOKEN is unset', err)
+        with mock.patch.dict(os.environ, {'MODEL_LOADER_LOCAL_TOKEN': 'wrong'}):
+            ms, v, err = S.resolve_model(self.opts(), log=self.logs.append)
+        self.assertIn('MODEL_LOADER_LOCAL_TOKEN is wrong', err)
+        with mock.patch.dict(os.environ, {'MODEL_LOADER_LOCAL_TOKEN': 's3cret'}):
+            self.resolve()
+        # TCP only with a token: model-loader serves no TCP local API without one
+        ms, v, err = S.resolve_model(self.opts('--model-loader', '127.0.0.1:9'), log=self.logs.append)
+        self.assertIn('a TCP local API needs MODEL_LOADER_LOCAL_TOKEN', err)
+        with mock.patch.dict(os.environ, {'MODEL_LOADER_LOCAL_TOKEN': 's3cret'}):
+            ms, v, err = S.resolve_model(self.opts('--model-loader', '127.0.0.1:9'), log=self.logs.append)
+        self.assertIn('model-loader at 127.0.0.1:9', err)                  # it tried: nothing listens there
+
+    def test_a_revision_outside_the_store_is_refused(self):
+        for bad in ('../../etc', '/abs', 'a//b', ''):
+            with mock.patch.object(mlsource.Client, 'put', return_value={'state': 'ready', 'revision': bad}):
+                ms, v, err = S.resolve_model(self.opts(), log=self.logs.append)
+            self.assertIn(f'revision {bad!r}', err)
+        ms, v, err = S.resolve_model(self.opts('--model-loader-model', '..'), log=self.logs.append)
+        self.assertIn("MODEL_LOADER_MODEL '..'", err)
+
     def test_an_unknown_catalog_name_is_named(self):
         o = self.opts('--model-loader-model', 'nope')
         ms, v, err = S.resolve_model(o, log=self.logs.append)
