@@ -201,10 +201,40 @@ pub struct Tier {
 }
 
 impl Tier {
+    // a copy for a dry run (Stash::quote_resize): everything but the index, which a dry run must never write
+    fn dry(&self) -> Tier {
+        Tier {
+            keep: self.keep,
+            alloc: self.alloc.clone(),
+            slots: self.slots,
+            entries: self.entries.clone(),
+            index: None,
+            whole: self.whole,
+            stats: self.stats,
+            policy: self.policy,
+        }
+    }
     // whether the policy takes an evicted run of `rows` and `hits` (other kinds always)
     fn admits(&self, kind: Kind, rows: u64, hits: u32) -> bool {
         kind != Kind::Evicted || (rows >= self.policy.min_rows && hits >= self.policy.min_hits)
     }
+}
+
+/// What a resize of one tier would do (Stash::quote_resize), worked out on a copy: the entries that leave the tier, in
+/// the order it evicts them, and of those (with the runs stored on them) the ones no tier keeps, which a later request
+/// computes again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Quote {
+    /// entries that leave the tier (moved on to a later tier, or dropped): the ones the shrink evicts, in its order, then
+    /// runs stored on a base it dropped
+    pub victims: Vec<u64>,
+    /// entries no tier keeps after it (victims dropped, and runs stored on a dropped base)
+    pub lost: Vec<u64>,
+    /// the rows and blocks of the lost entries: the prefill a request pays to compute them again
+    pub lost_rows: u64,
+    pub lost_blocks: u64,
+    /// blocks of the victims that a later tier took
+    pub moved_blocks: u64,
 }
 
 /// Prefix counts kept at most, the least recently counted dropped first.
@@ -239,6 +269,8 @@ pub struct Stash {
     // tail_place: the pool's place with it, so a tail's shard pages are read out of a run's list (pool.rs page classes)
     tail: Option<(u32, u32)>,
     tail_place: u32,
+    // the entries the last resize_tier evicted, in order (quote_resize reads its copy's)
+    evicted: Vec<u64>,
 }
 
 const FNV: u64 = 14695981039346656037;
@@ -272,6 +304,7 @@ impl Stash {
             dedupe: true,
             tail: None,
             tail_place: 0,
+            evicted: Vec::new(),
         }
     }
 
@@ -383,6 +416,7 @@ impl Stash {
         if t >= self.tiers.len() || self.tiers[t].index.is_some() {
             return false;
         }
+        self.evicted.clear();
         let old = self.tiers[t].slots;
         if slots < old {
             let need = old - slots;
@@ -399,6 +433,7 @@ impl Stash {
                     return false;
                 };
                 let e = self.tiers[t].entries.remove(i);
+                self.evicted.push(e.id);
                 self.evict(t, e);
             }
             let mut low = self.tiers[t].alloc.free_below(slots).into_iter();
@@ -416,6 +451,66 @@ impl Stash {
         assert!(self.tiers[t].alloc.resize(slots), "the slots past the new size are free");
         self.tiers[t].slots = slots;
         true
+    }
+
+    /// What resize_tier(t, slots) would do, without doing it (no copies, no index records): None when it would refuse.
+    pub fn quote_resize(&self, t: usize, slots: u64) -> Option<Quote> {
+        if t >= self.tiers.len() || self.tiers[t].index.is_some() {
+            return None;
+        }
+        let mut d = Stash {
+            tiers: self.tiers.iter().map(Tier::dry).collect(),
+            io: Vec::new(),
+            taken: false,
+            commits: Vec::new(),
+            counts: BTreeMap::new(),
+            counted: Vec::new(),
+            heads: std::collections::VecDeque::new(),
+            clock: self.clock,
+            shared_after: self.shared_after,
+            grid: self.grid,
+            next_id: self.next_id,
+            pin: self.pin.clone(),
+            index_errors: 0,
+            limit_milli: self.limit_milli,
+            credit: self.credit,
+            dedupe: self.dedupe,
+            tail: self.tail,
+            tail_place: self.tail_place,
+            evicted: Vec::new(),
+        };
+        if !d.resize_tier(t, slots) {
+            return None;
+        }
+        let ids = |s: &Stash, only: Option<usize>| -> Vec<u64> {
+            s.tiers.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i)).flat_map(|(_, x)| &x.entries).map(|e| e.id).collect()
+        };
+        let (stay, kept) = (ids(&d, Some(t)), ids(&d, None));
+        let mut q = Quote::default();
+        // the entries resize_tier evicted, in its order, then the runs that went with a dropped base
+        q.victims = d.evicted.clone();
+        let base_gone = self.tiers[t].entries.iter().map(|e| e.id).filter(|id| !stay.contains(id) && !q.victims.contains(id));
+        q.victims.extend(base_gone.collect::<Vec<_>>());
+        for e in self.tiers.iter().flat_map(|x| &x.entries).filter(|e| !kept.contains(&e.id)) {
+            q.lost.push(e.id);
+            q.lost_rows += e.st.valid.max(0) as u64;
+            q.lost_blocks += e.slots.len() as u64;
+        }
+        for e in self.tiers[t].entries.iter().filter(|e| q.victims.contains(&e.id) && kept.contains(&e.id)) {
+            q.moved_blocks += e.slots.len() as u64;
+        }
+        Some(q)
+    }
+
+    /// resize_tier(t, slots) when it does what `q` (quote_resize, with nothing changed since) said: the same entries
+    /// leave. false, with nothing changed, when it would not (the stash moved on since the quote).
+    pub fn apply_resize_plan(&mut self, t: usize, slots: u64, q: &Quote) -> bool {
+        if self.quote_resize(t, slots).as_ref() != Some(q) {
+            return false;
+        }
+        let ok = self.resize_tier(t, slots);
+        debug_assert!(ok && q.victims.starts_with(&self.evicted));
+        ok
     }
 
     /// Tier t's entries as (id, blocks) in the order a shrink (resize_tier) evicts them: unpinned entries no stored run

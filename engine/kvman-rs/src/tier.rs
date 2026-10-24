@@ -213,6 +213,7 @@ pub fn par_for<F: Fn(usize, usize) -> io::Result<()> + Sync>(threads: usize, n: 
 }
 
 /// Lowest-free-first slot allocator.
+#[derive(Clone)]
 pub struct SlotAlloc {
     used: Vec<bool>,
     free: u64,

@@ -144,19 +144,26 @@ fn finished(tokens: &[i32]) -> Finished {
 
 #[test]
 fn restored_rows_hold_the_prompt_and_ranks_agree() {
-    random_traces(false);
+    random_traces(false, 1..=60);
 }
 
 // the same traces, where every so often a tier grows or shrinks on both ranks at once (a KV node lease that moved)
 #[test]
 fn restored_rows_hold_the_prompt_while_tiers_resize() {
-    random_traces(true);
+    random_traces(true, 1..=60);
 }
 
-fn random_traces(resize: bool) {
+// a resize quote (Stash::quote_resize) names the entries that resize then evicts, and the ones no tier keeps after
+#[test]
+fn quotes_match_resizes() {
+    assert!(random_traces(true, 1001..=1360) >= 10_000);
+}
+
+fn random_traces(resize: bool, seeds: std::ops::RangeInclusive<u64>) -> u64 {
+    let mut quoted = 0;
     let mut resized = (0, 0, 0);
     let (mut evicted_hits, mut shared_hits, mut moves, mut spills, mut exclusive, mut refused) = (0, 0, 0, 0, 0, 0);
-    for seed in 1..=60u64 {
+    for seed in seeds {
         let mut rng = Rng(seed * 104_729);
         let pages = rng.range(12, 48) as u32;
         let place = if rng.one_in(2) { pages } else { rng.range(8, pages as u64) as u32 };
@@ -191,12 +198,23 @@ fn random_traces(resize: bool) {
                 let t = rng.range(0, tiers.len() as u64 - 1) as usize;
                 let old = ranks[0].pool.tier_stats(t).unwrap().slots;
                 let to = rng.range(1, old * 2);
+                let s = ranks[0].pool.stash().unwrap();
+                let q = s.quote_resize(t, to).expect("a tier with no index resizes");
+                let ids = |s: &g6kvman::stash::Stash, only: Option<usize>| -> Vec<u64> {
+                    (0..tiers.len()).filter(|x| only.is_none_or(|o| o == *x)).flat_map(|x| s.entries(x).iter().map(|e| e.id)).collect()
+                };
+                let (in_t, all) = (ids(s, Some(t)), ids(s, None));
                 let mut io = Vec::new();
                 for r in &mut ranks {
                     if to > old {
                         r.tiers[t].resize(to as usize, [-2; ROWS]);
                     }
-                    assert!(r.pool.resize_tier(t, to).unwrap());
+                    // rank 1 takes the quoted plan, which must do the same as rank 0's plain resize
+                    if io.is_empty() {
+                        assert!(r.pool.resize_tier(t, to).unwrap());
+                    } else {
+                        assert!(r.pool.stash_mut().unwrap().apply_resize_plan(t, to, &q));
+                    }
                     io.push(r.run_io());
                     // the blocks past the new size go: poison them first, so a copy that still read one would show
                     for b in r.tiers[t].iter_mut().skip(to as usize) {
@@ -207,6 +225,17 @@ fn random_traces(resize: bool) {
                     assert_eq!(r.pool.tier_stats(t).unwrap().slots, to);
                 }
                 assert_eq!(io[0], io[1], "the ranks queue other copies for a resize");
+                let s = ranks[0].pool.stash().unwrap();
+                let (now_t, now) = (ids(s, Some(t)), ids(s, None));
+                let left: Vec<u64> = in_t.iter().copied().filter(|id| !now_t.contains(id)).collect();
+                let mut victims = q.victims.clone();
+                victims.sort();
+                let mut l = left.clone();
+                l.sort();
+                assert_eq!(victims, l, "seed {seed}: the quote names the entries that leave tier {t}");
+                let lost: Vec<u64> = all.iter().copied().filter(|id| !now.contains(id)).collect();
+                assert_eq!(q.lost, lost, "seed {seed}: the quote names the entries no tier keeps");
+                quoted += 1;
                 assert_eq!(ranks[0].pool.digest(), ranks[1].pool.digest());
                 let inner = io[0].iter().filter(|x| matches!(x, Io::Move { tier, to, .. } if tier == to)).count();
                 resized = (resized.0 + (to > old) as u32, resized.1 + (to < old) as u32, resized.2 + inner);
@@ -305,6 +334,7 @@ fn random_traces(resize: bool) {
         "evicted hits {evicted_hits}, shared hits {shared_hits}, moves {moves}, spills {spills}, exclusive {exclusive}, \
          refused {refused}"
     );
+    quoted
 }
 
 fn toks(seed: i32, n: usize) -> Vec<i32> {
