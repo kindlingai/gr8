@@ -1,6 +1,13 @@
 # Changelog
 
 
+## 2026-10-24: fix: the `FLASH_CAP_POLICY=borrow-idle` engine hooks are in `g6m4_flash` (D-331 M7 part B-2, #166)
+
+- The FLASH_KV_TIER resize hook, `flash_room`, the borrow-idle rule and the `LEDGER.gpu` line sat in GLM-only code
+  (the `#else` of `#if G6_MODEL_FLASH if (s2mode) serve_flash(...)`), so a Flash build had none of them and
+  `FLASH_CAP_POLICY=borrow-idle` did nothing. They go to `serve_flash` through `FlashContext::install` now.
+  `scripts/build.sh` fails a Flash build whose `g6m4_flash` lacks the borrow-idle log line.
+
 ## 2026-10-24: `FLASH_CAP_POLICY=borrow-idle` lends the idle Flash KV chunks to the KV node (D-331 M7 part B-2)
 
 - `FLASH_CAP_POLICY=borrow-idle` (with `FLASH_KV_DONATE_GIB`; default `protected`, unchanged) puts the Flash KV pool
