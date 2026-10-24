@@ -1,17 +1,19 @@
 # CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# Every job runs on GitHub's hosted runners, for every pull request, forks included. The engine job builds the
-# Dockerfile's binaries on arm64 runners, one per KV format, no GPU needed to compile. The image job assembles the
-# runtime image from both of their artifacts, and only it can write packages: it pushes from main and from tags, never
-# from a pull request.
+# Every job runs on GitHub's hosted runners, for every pull request, forks included, except a pull request or push that
+# changes only Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
+# GPU needed to compile. The image job assembles the runtime image from both of their artifacts, and only it can write
+# packages: it pushes from main and from tags, never from a pull request.
 name: ci
 
 on:
   push:
     branches: [main]
     tags: ['v*', 'beta-*']
+    paths-ignore: ['**.md']
   pull_request:
+    paths-ignore: ['**.md']
   workflow_dispatch:
 
 permissions:

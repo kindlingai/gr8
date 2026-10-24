@@ -2,6 +2,9 @@
 #   /ready or /unready, commented on a PR by a maintainer in READY_USERS, adds or removes it. Commands need no write
 #   access, so a maintainer with read access can use them. /ready needs a risk:* category label (pr-category.yml).
 #   The label added by anyone else is removed again, and a push to the PR clears it: ready means the reviewed commits.
+#   /ready on a PR labelled risk:docs-tests whose every changed file is Markdown squash-merges it at once: ci.yml skips
+#   such PRs, and the maintainer's /ready stands in for the review. The merge names the head it checked, so a push
+#   in between makes it fail rather than merge unchecked commits.
 # pull_request_target and issue_comment run the default branch's copy; neither checks out or runs the PR's code.
 name: PR ready
 on:
@@ -11,6 +14,7 @@ on:
     types: [labeled, synchronize]
 
 permissions:
+  contents: write
   pull-requests: write
   issues: write
 
@@ -61,6 +65,17 @@ jobs:
               }
               await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [label] });
               await react("+1");
+              if (!labels.includes("risk:docs-tests")) return;
+              const head = (await github.rest.pulls.get({ owner, repo, pull_number: issue_number })).data.head.sha;
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: issue_number });
+              const md = f => /\.md$/i.test(f);
+              if (!files.length || !files.every(f => md(f.filename) && (!f.previous_filename || md(f.previous_filename)))) return;
+              try {
+                await github.rest.pulls.merge({ owner, repo, pull_number: issue_number, sha: head, merge_method: "squash" });
+                await say(`Markdown-only docs PR marked ready by @${sender}: merged.`);
+              } catch (e) {
+                await say(`Markdown-only docs PR marked ready, but the merge failed: ${e.message}`);
+              }
               return;
             }
 
