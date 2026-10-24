@@ -92,6 +92,23 @@
   chunk (`stream_options.include_usage`). Without the field the responses are unchanged.
 - The S2 shim adds each request's counters to its `finish` frame (`spec`, `timing`: optional, PROTOCOL.md); the engine
   is unchanged.
+## 2026-10-18: the drafter choice: a frozen cost table and K-stop-aware MTP pricing (G6_S2_DSEL_MODEL, off by default)
+
+- Since the confidence stop (`G6_MTP_KSTOP`) a request's solo MTP rounds verify 1..3 drafts chosen per round, but the
+  drafter choice (DSel) priced every MTP round as `--mtp` drafts with fixed drafting constants. `G6_S2_DSEL_MODEL=1`
+  (launch knobs `DSEL_MODEL`, `DSEL_TABLE`) prices both drafters from one frozen cost table, `G6_S2_DSEL_TABLE` (verify
+  ms `v1`..`v8`, drafting ms `d`, `m`, `e`, a probe's extra `p`, and optionally the MTP rounds' prior `g`, `k`, `n`, the
+  estimates' prior weight `w` and `r`), and an MTP round as the stop runs it: 1 + c_1 (1 + g) tokens over the mean table
+  cost of the request's MTP rounds, both shrinking toward the prior until the request has MTP rounds.
+- `r`: DFlash2 is priced from the request's DFlash2 rounds and scored probes as they ran, that evidence aged by `r` per MTP
+  round, so a structured request that a dip moved to MTP comes back.
+- Only the choice reads the table: `G6_SPEC_TABLE` still prices the DFlash2 rounds' own draft count. The table's canonical
+  form is in the S2 runtime signature. Off, the steps are unchanged (`batch_dselmodel_test`).
+- `G6_S2_TIMELINE` also prints the mean GPU span per step kind and row count, and `tools/s2_dsel_table.py` turns one
+  boot's timeline and `# kstop` lines into the table; with `G6_MTP_LPLOG` and the model on, rank 0 prints a `# dsel round`
+  line per solo round.
+- Measured on four GB10 at TP=4 (with the solo confidence stop on, `G6_S2_DSEL_PROBE=32`): RigMark c1 prose +1.8 %, code
+  +3.0 %, structured -3.6 % against DSel with the MTP round priced at 2.9 ms.
 
 ## 2026-10-18: SHARE_LIMIT default 32768 at TP=3
 
