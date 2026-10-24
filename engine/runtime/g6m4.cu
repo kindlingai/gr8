@@ -550,16 +550,18 @@ int main(int argc, char** argv)
     if (pf_qo && !release && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
     if (release && (!qo_man.empty() || !qp_man.empty())) die("--v2-dense: the QO weights come from the release (no --qo- / --qp- packs)");
     v2src.qo = pf_qo;
-    // G6_PF_STRIPE=1 (needs --pf-ips2 or --ips2): prefill payload writes >= G6_PF_STRIPE_MIN bytes (default 1 MiB) go
-    // out half on each rail (FabricConfig::stripe_min). Unset = on when --pf-ips2 is given, else one rail as before;
-    // 0 = one rail.
+    // G6_PF_STRIPE=1 (needs --pf-ips2 or --ips2, or a three-rank --ring): prefill payload writes >= G6_PF_STRIPE_MIN
+    // bytes (default 1 MiB) go out half on each rail (FabricConfig::stripe_min). At a three-rank ring the second half
+    // takes the same port's device on the other PCIe root. Unset = on when --pf-ips2 is given or at a three-rank ring,
+    // else one rail as before; 0 = one rail.
     auto pf_stripe_cfg = [&](g6::FabricConfig& cp, const std::vector<std::string>& ips2) {
         std::string e;
-        const int on = env_choice("G6_PF_STRIPE", 1, ips2.empty() ? 0 : 1, &e);
+        const bool ring3 = cp.ring && cp.ips.size() == 3;   // three-rank ring: stripes over the other PCIe root, no ips2
+        const int on = env_choice("G6_PF_STRIPE", 1, ips2.empty() && !ring3 ? 0 : 1, &e);
         if (on < 0) die(e);
         if (!ips2.empty()) cp.ips2 = ips2;
         if (on != 1) return;
-        if (cp.ips2.size() != cp.ips.size()) die("G6_PF_STRIPE=1 needs --pf-ips2 (or --ips2) with one address per rank");
+        if (!ring3 && cp.ips2.size() != cp.ips.size()) die("G6_PF_STRIPE=1 needs --pf-ips2 (or --ips2) with one address per rank");
         const char* m = getenv("G6_PF_STRIPE_MIN");
         cp.stripe_min = m ? (size_t)atoll(m) : (size_t)1 << 20;
         if (cp.stripe_min < 8192) die("G6_PF_STRIPE_MIN must be >= 8192");
