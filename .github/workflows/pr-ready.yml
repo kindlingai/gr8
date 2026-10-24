@@ -1,15 +1,17 @@
-# The merge queue's ready flag: the label queue:ready, set and cleared only through this workflow.
-#   /ready or /unready, commented on a PR by a maintainer in READY_USERS, adds or removes it. Commands need no write
-#   access, so a maintainer with read access can use them. /ready needs a risk:* category label (pr-category.yml).
-#   The label added by anyone else is removed again, and a push to the PR clears it: ready means the reviewed commits.
-#   /ci from a maintainer runs CI without queueing the PR: it sets ci:requested, which a push clears the same way.
-#   ci.yml's jobs run on a PR only while it carries queue:ready or ci:requested: setting either re-runs the PR's latest
-#   CI run, which a push or an earlier skip left with its jobs skipped.
-#   /ready on a PR labelled risk:docs-tests whose every changed file is Markdown squash-merges it: ci.yml skips such
-#   PRs, and the maintainer's /ready stands in for the review. The bot also approves it as github-actions[bot] when
-#   "Allow GitHub Actions to create and approve pull requests" is on (org and repo), which a required review needs.
-#   The review and the merge name the head the bot checked, so a push in between makes them fail rather than land
-#   unchecked commits.
+# The merge queue's ready flag (queue:ready) and maintainer-requested CI (ci:requested), set and cleared only here.
+#   /ready, /unready and /ci, commented on an open PR by a maintainer in READY_USERS, set or clear them. Commands need
+#   no write access, so a maintainer with read access can use them. /ready needs a risk:* category label
+#   (pr-category.yml); /ci runs CI without queueing the PR.
+#   Either label added by anyone else is removed again. A push to the PR clears both: they always refer to the commits
+#   a maintainer looked at. A command is refused if the PR's head was pushed after the comment, and a label is dropped
+#   again if the head moves while the command is handled.
+#   ci.yml's jobs run on a PR only while it carries one of the labels: setting one re-runs the PR's latest CI run (or
+#   approves it, if it waits for approval), since labels added with GITHUB_TOKEN cannot start workflows.
+#   /ready on an open PR labelled risk:docs-tests that changes only Markdown files squash-merges it. Not eligible: files
+#   under .github/, AGENTS.md and CLAUDE.md (read by GitHub and by coding agents), symlinks, mode changes, and PRs too
+#   large to list completely. The bot also approves it as github-actions[bot] when "Allow GitHub Actions to create and
+#   approve pull requests" is on (org and repo), which a required review needs. The review and the merge name the head
+#   the bot checked.
 # pull_request_target and issue_comment run the default branch's copy; neither checks out or runs the PR's code.
 name: PR ready
 on:
@@ -20,6 +22,7 @@ on:
 
 permissions:
   actions: write
+  checks: read
   contents: write
   pull-requests: write
   issues: write
@@ -43,37 +46,78 @@ jobs:
             const { owner, repo } = context.repo;
             const ev = context.eventName;
             const sender = context.payload.sender.login;
-            const pr = ev === "issue_comment" ? context.payload.issue : context.payload.pull_request;
-            const issue_number = pr.number;
-            const labels = pr.labels.map(l => l.name);
+            const issue_number = (ev === "issue_comment" ? context.payload.issue : context.payload.pull_request).number;
             const say = body => github.rest.issues.createComment({ owner, repo, issue_number, body });
-            const drop = () => github.rest.issues.removeLabel({ owner, repo, issue_number, name: label }).catch(() => {});
+            const remove = name => github.rest.issues.removeLabel({ owner, repo, issue_number, name })
+              .then(() => true, () => false);
+            const pull = async () => (await github.rest.pulls.get({ owner, repo, pull_number: issue_number })).data;
+            const liveLabels = async () => (await github.rest.issues.listLabelsOnIssue(
+              { owner, repo, issue_number, per_page: 100 })).data.map(l => l.name);
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
             await github.rest.issues.createLabel({ owner, repo, name: label, color: "5319e7",
               description: "Marked ready for the merge queue by a maintainer (/ready)" }).catch(() => {});
             await github.rest.issues.createLabel({ owner, repo, name: ciLabel, color: "bfd4f2",
               description: "CI requested by a maintainer (/ci), without queueing" }).catch(() => {});
 
-            // Re-run the PR head's latest ci.yml run once its ready gate has skipped the jobs. A run whose gate has not
-            // decided yet is waited for (up to 3 minutes); one already building, or no run (a Markdown-only PR), is left.
-            const rerunCI = async () => {
-              const head = (await github.rest.pulls.get({ owner, repo, pull_number: issue_number })).data.head.sha;
-              for (let i = 0; i < 18; i++) {
+            // When GitHub first saw this commit: the earliest check suite on it, created on the push. Server time, so a
+            // backdated commit cannot hide a push behind a maintainer's comment. null if there is no suite.
+            const firstSeen = async sha => {
+              const suites = (await github.rest.checks.listSuitesForRef({ owner, repo, ref: sha, per_page: 100 }))
+                .data.check_suites.map(s => Date.parse(s.created_at));
+              return suites.length ? Math.min(...suites) : null;
+            };
+
+            // Start CI on the PR head: find its latest ci.yml run, approve it if it waits for approval, and re-run it
+            // once its ready gate has turned it away. Waits up to 5 minutes for the gate; reports anything else.
+            const rerunCI = async p => {
+              const head = p.head.sha;
+              let approved = false;
+              for (let i = 0; i < 30; i++) {
                 const runs = (await github.rest.actions.listWorkflowRuns(
-                  { owner, repo, workflow_id: "ci.yml", head_sha: head, event: "pull_request", per_page: 1 })).data.workflow_runs;
-                if (!runs.length) return;
+                  { owner, repo, workflow_id: "ci.yml", head_sha: head, per_page: 20 })).data.workflow_runs
+                  .filter(r => r.event === "pull_request" && (r.pull_requests.some(x => x.number === issue_number) ||
+                    (r.head_repository && r.head_repository.full_name === p.head.repo.full_name &&
+                     r.head_branch === p.head.ref)));
+                if (!runs.length) {
+                  if (i < 6) { await sleep(10000); continue; }
+                  await say(`No CI run found for ${head.slice(0, 7)} (a Markdown-only PR runs none), so there is nothing to start.`);
+                  return;
+                }
                 const run = runs[0];
+                if (run.conclusion === "action_required") {
+                  if (approved) { await sleep(10000); continue; }
+                  approved = true;
+                  try {
+                    await github.rest.actions.approveWorkflowRun({ owner, repo, run_id: run.id });
+                  } catch (e) {
+                    await say(`CI for ${head.slice(0, 7)} waits for approval and the bot could not approve it ` +
+                      `(${e.message}): approve it at ${run.html_url}.`);
+                    return;
+                  }
+                  await sleep(10000);
+                  continue;
+                }
+                if (run.conclusion === "startup_failure") {
+                  await say(`CI for ${head.slice(0, 7)} failed to start (${run.html_url}), so it cannot be re-run here.`);
+                  return;
+                }
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
                   { owner, repo, run_id: run.id, filter: "latest" });
                 const gate = jobs.find(j => j.name === "Ready gate");
                 if (gate && gate.status === "completed") {
-                  if (jobs.some(j => j !== gate && j.conclusion !== "skipped")) return;
+                  if (jobs.some(j => j !== gate && j.conclusion !== "skipped")) return;   // already building
                   if (run.status === "completed") {
-                    await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+                    try {
+                      await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+                    } catch (e) {
+                      await say(`Could not re-run CI for ${head.slice(0, 7)} (${e.message}): re-run ${run.html_url} by hand.`);
+                    }
                     return;
                   }
                 }
-                await new Promise(r => setTimeout(r, 10000));
+                await sleep(10000);
               }
+              await say(`Timed out waiting for CI on ${head.slice(0, 7)} to reach its ready gate.`);
             };
 
             if (ev === "issue_comment") {
@@ -86,33 +130,73 @@ jobs:
                 await say(`@${sender}, only ${allowed.map(u => "@" + u).join(", ")} can run \`${cmd}\`.`);
                 return;
               }
-              if (cmd === "/ci") {
-                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [ciLabel] });
-                await react("+1");
-                await rerunCI();
-                return;
-              }
               if (cmd === "/unready") {
-                await drop();
+                await remove(label);
                 await react("+1");
                 return;
               }
-              if (!labels.some(n => n.startsWith("risk:"))) {
+              const p = await pull();
+              if (p.state !== "open") {
+                await react("confused");
+                await say(`@${sender}, \`${cmd}\` only works on an open PR.`);
+                return;
+              }
+              const said = Date.parse(context.payload.comment.created_at);
+              const seen = await firstSeen(p.head.sha);
+              if (seen !== null && seen > said) {
+                await react("confused");
+                await say(`@${sender}, new commits arrived after your \`${cmd}\`: check ${p.head.sha.slice(0, 7)} and comment again.`);
+                return;
+              }
+              const name = cmd === "/ci" ? ciLabel : label;
+              if (cmd === "/ready" && !(await liveLabels()).some(n => n.startsWith("risk:"))) {
                 await react("confused");
                 await say(`@${sender}, this PR has no merge-queue category yet: tick one in the description first.`);
                 return;
               }
-              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [label] });
-              await react("+1");
-              if (!labels.includes("risk:docs-tests")) {
-                await rerunCI();
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [name] });
+              const after = await pull();
+              if (after.head.sha !== p.head.sha) {
+                await remove(name);
+                await react("confused");
+                await say(`@${sender}, the PR moved to ${after.head.sha.slice(0, 7)} while \`${cmd}\` was handled: check it and comment again.`);
                 return;
               }
-              const head = (await github.rest.pulls.get({ owner, repo, pull_number: issue_number })).data.head.sha;
+              await react("+1");
+              if (cmd === "/ci" || !(await liveLabels()).includes("risk:docs-tests")) {
+                await rerunCI(p);
+                return;
+              }
+
+              // Markdown-only docs PRs merge on /ready; anything else falls back to CI.
+              const head = p.head.sha;
               const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: issue_number });
               const md = f => /\.md$/i.test(f);
-              if (!files.length || !files.every(f => md(f.filename) && (!f.previous_filename || md(f.previous_filename)))) {
-                await rerunCI();
+              const names = files.flatMap(f => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
+              if (!files.length || !names.every(md)) {      // not Markdown-only: it has CI, run that
+                await rerunCI(p);
+                return;
+              }
+              // Markdown-only, so it has no CI run either: merge it, or say why not.
+              let why = null;
+              if (files.length >= 3000 || files.length !== p.changed_files) why = "the file list is incomplete";
+              else if (files.length > 50) why = "it changes more than 50 files";
+              else if (names.some(f => /^\.github\//.test(f) || /(^|\/)(AGENTS|CLAUDE)\.md$/i.test(f)))
+                why = "it touches .github/, AGENTS.md or CLAUDE.md";
+              else if (!files.every(f => ["added", "modified", "renamed", "removed"].includes(f.status)))
+                why = "a file changes mode or is copied";
+              for (const f of why ? [] : files.filter(f => f.status !== "removed")) {
+                let type = null;
+                try {
+                  const c = await github.rest.repos.getContent({ owner, repo, path: f.filename, ref: head });
+                  type = Array.isArray(c.data) ? "dir" : c.data.type;
+                } catch (e) {
+                  type = "unreadable";
+                }
+                if (type !== "file") { why = `${f.filename} is a ${type}, not a file`; break; }
+              }
+              if (why) {
+                await say(`Markdown-only PR marked ready, but not merged automatically because ${why}: merge it by hand.`);
                 return;
               }
               // Approval is best effort: it needs "Allow GitHub Actions to create and approve pull requests", and the merge
@@ -136,17 +220,15 @@ jobs:
             const act = context.payload.action;
             const added = act === "labeled" ? context.payload.label.name : null;
             if ((added === label || added === ciLabel) && !allowed.includes(sender)) {
-              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: added }).catch(() => {});
+              await remove(added);
               const how = added === label ? "/ready" : "/ci";
               await say(`@${sender}, \`${added}\` is set by a maintainer commenting \`${how}\`, so it was removed.`);
             } else if (added === label || added === ciLabel) {
-              await rerunCI();
+              await rerunCI(await pull());
             } else if (act === "synchronize") {
-              if (labels.includes(ciLabel)) {
-                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: ciLabel }).catch(() => {});
-              }
-              if (labels.includes(label)) {
-                await drop();
+              // Remove both whatever the event's labels say: a label added after the event was built must go too.
+              await remove(ciLabel);
+              if (await remove(label)) {
                 await say(`New commits since this PR was marked ready: \`${label}\` cleared. A maintainer can comment \`/ready\` again.`);
               }
             }

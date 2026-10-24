@@ -7,9 +7,10 @@
 # packages: it pushes from main and from tags, never from a pull request.
 #
 # On a pull request every job waits for a maintainer: the `ready` job reads the PR's labels and the others run only if
-# it carries queue:ready (/ready, which also queues the PR) or ci:requested (/ci, CI only; pr-ready.yml). A push to the
-# PR clears both, so a run started by a push always skips. Either command re-runs the PR's latest run, which then goes
-# through. Pushes to main, tags and manual runs always build.
+# it carries queue:ready (/ready, which also queues the PR) or ci:requested (/ci, CI only; pr-ready.yml). Until then the
+# gate fails, so the PR shows red. A push to the PR clears both labels, so a run started by a push skips. Either command
+# re-runs the PR's latest run, which then goes through. Pushes to main, tags and manual runs always build. The gate is a
+# cost control, not a security boundary: a fork PR runs its own copy of this file, with a read-only token.
 name: ci
 
 on:
@@ -43,17 +44,21 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
         with:
           script: |
-            // Labels are read live, not from the event: a re-run carries the original event's labels.
+            // Labels are read live, not from the event: a re-run carries the original event's labels and action. A
+            // run started by a push skips (the push cleared the labels), unless it is a re-run, which the bot starts
+            // after a maintainer's /ci or /ready.
             let go = true;
             if (context.eventName === "pull_request") {
               const pr = context.payload.pull_request;
               const labels = (await github.rest.issues.listLabelsOnIssue(
                 { ...context.repo, issue_number: pr.number, per_page: 100 })).data.map(l => l.name);
-              go = context.payload.action !== "synchronize" &&
+              const rerun = Number(process.env.GITHUB_RUN_ATTEMPT) > 1;
+              go = (context.payload.action !== "synchronize" || rerun) &&
                 (labels.includes("queue:ready") || labels.includes("ci:requested"));
-              if (!go) core.notice("CI waits for a maintainer's /ci or /ready on this PR.");
             }
             core.setOutput("go", go ? "true" : "false");
+            // Red, not green: jobs skipped by a condition count as passed.
+            if (!go) core.setFailed("CI has not run: it waits for a maintainer's /ci or /ready on this PR.");
 
   cpu:
     name: CPU tests
