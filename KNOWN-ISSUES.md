@@ -1,6 +1,6 @@
 # Known issues
 
-Bugs we are still working out. Fixed ones move to CHANGELOG.md.
+Bugs we are still working out. The PR that fixes one removes its entry.
 
 ## 1. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open
 
