@@ -4,8 +4,10 @@
 ## 2026-10-24: a group's lease grows before the capture that would drop, not after it (D-331 M8 Flash grow)
 
 - kvman-remote REPORT: when a group's ask makes the node ask another group to give, the node holds that room for the
-  asker and grants it at the asker's next report, even one that asks for nothing more (until granted or `grant_ttl`,
-  30 s). The node's stats show it as `owed`. Before, the node granted only on a report that asked. A head asks once,
+  asker (reserved, as a grant is: no other group's grant and no plain lease takes it) and grants it at the asker's
+  next report, even one that asks for nothing more. A partial grant takes its part off and the rest stays owed, until
+  granted or `grant_ttl` (30 s) after the last ask. The node's stats show it as `owed`, and `unclaimed_segs` no longer
+  counts it. Before, the node granted only on a report that asked. A head asks once,
   for what changed since its last report (s2/kv_share.h `share_want`, one entry before the store is full), so the
   given segments sat free until the store dropped an entry and asked again. On the box (M8.3 re-run, 10-24) the full
   model gave at 11:37:06Z, Flash's 6th capture dropped entry 1 at about 11:37:18Z, and Flash grew at 11:37:28Z: the
@@ -19,7 +21,9 @@
 - Not taken: a shorter `G6_S2_SHARE_MS` (more reports, each still asking 0 after the first, so still no grant), and
   a reserve that waits for a grant before it drops (every rank must grow at the same Resize commit, so a wait inside
   a capture would need a cross-rank step in the middle of a prefill).
-- Tests: `engine/kvman-rs/tests/share.rs` `an_ask_that_made_a_give_is_granted_without_asking_again`, and
+- Tests: `engine/kvman-rs/tests/share.rs` `an_ask_that_made_a_give_is_granted_without_asking_again`,
+  `owed_room_is_held_for_the_asker_against_another_group` and `a_partial_grant_keeps_the_rest_owed` (the review's two
+  interleavings), and
   `engine/runtime/tests/flash_ckpt_group_test.cu` section 7 (a Flash lease asks once, an idle group gives, the next
   report is granted, and the capture that would drop fits with 0 dropped), section 8 (a store a give left full: an
   idle head asks 0, a busy one asks, the idle group gives, the next capture drops nothing) and

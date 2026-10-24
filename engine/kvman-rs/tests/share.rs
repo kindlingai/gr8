@@ -379,7 +379,9 @@ fn nr4_vs_nr2_no_strand() {
     let r = a[0].report(0, &[600_000]).unwrap();
     assert_eq!(r.give, 1, "1 a rank of 4 ranks: 4 freed, 2 needed");
     shrink_all(&a, 1, r.txn);
-    assert_eq!(unclaimed(&addr), 4);
+    // 4 free: the 2 b is owed are held for it (owed 1 a rank), the 2 left over nobody's
+    assert_eq!(unclaimed(&addr), 2);
+    assert!(stats(&addr).contains("\"owed\":1"), "{}", stats(&addr));
     let r = b[0].report(1, &[0]).unwrap();
     assert_eq!(r.grant, 2, "the 1 it asked for and the 1 the give left over");
     grow_all(&b, 4, r.txn);
@@ -404,7 +406,8 @@ fn early_group_reuse() {
     assert_eq!(b[0].report(1, &[0]).unwrap().grant, 0);
     write_all(&a[1..], 9);
     a[1].shrink(2, r.txn).unwrap();
-    assert_eq!(unclaimed(&addr), 2);
+    // the 2 now free are held for b, whose ask made the give (owed 1 a rank)
+    assert_eq!(unclaimed(&addr), 0);
     let r = b[0].report(1, &[0]).unwrap();
     assert_eq!(r.grant, 1);
     grow_all(&b, 2, r.txn);
@@ -494,4 +497,59 @@ fn an_ask_that_made_a_give_is_granted_without_asking_again() {
     // granted once: a later report with no demand takes nothing more, and a is not asked again
     assert_eq!(b[0].report(0, &[]).unwrap().grant, 0);
     assert_eq!(a[0].report(0, &[600_000]).unwrap().give, 0);
+}
+
+// Assayer #174 R1: the room an ask made another group give is held for the asker. Node 10: A 8, B 1, C 1. B asks 1, A
+// gives 1; C asks 1 before B reports again and gets nothing (the segment is B's); B's next report, asking 0, gets it
+#[test]
+fn owed_room_is_held_for_the_asker_against_another_group() {
+    let addr = node(10, 1_000);
+    let a = cluster(&addr, "a", 1, 100_000, 1, 10);
+    let r = a[0].report(7, &[]).unwrap();
+    grow_all(&a, 8, r.txn);
+    let b = cluster(&addr, "b", 1, 100_000, 1, 10);
+    let c = cluster(&addr, "c", 1, 100_000, 1, 10);
+    assert_eq!(unclaimed(&addr), 0);
+    a[0].report(0, &[600_000]).unwrap();
+    assert_eq!(b[0].report(1, &[]).unwrap().grant, 0);
+    let r = a[0].report(0, &[600_000]).unwrap();
+    assert_eq!(r.give, 1);
+    shrink_all(&a, 7, r.txn);
+    assert_eq!(c[0].report(1, &[]).unwrap().grant, 0, "the segment A gave is held for B");
+    assert_eq!(unclaimed(&addr), 0);
+    let r = b[0].report(0, &[]).unwrap();
+    assert_eq!(r.grant, 1);
+    grow_all(&b, 2, r.txn);
+}
+
+// Assayer #174 R2: a grant smaller than what is owed keeps the rest owed. Node 10: A 8, B 1, C 1. B asks 3, A is asked
+// to give 3; C leaves before A gives (1 free); B's report asking 0 takes that 1; A gives 3; B's next report asking 0
+// takes the 2 still owed
+#[test]
+fn a_partial_grant_keeps_the_rest_owed() {
+    let addr = node(10, 1_000);
+    let a = cluster(&addr, "a", 1, 100_000, 1, 10);
+    let r = a[0].report(7, &[]).unwrap();
+    grow_all(&a, 8, r.txn);
+    let b = cluster(&addr, "b", 1, 100_000, 1, 10);
+    let c = cluster(&addr, "c", 1, 100_000, 1, 10);
+    a[0].report(0, &[600_000]).unwrap();
+    assert_eq!(b[0].report(3, &[]).unwrap().grant, 0);
+    drop(c);
+    for _ in 0..200 {
+        if !stats(&addr).contains("\"name\":\"c\"") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let r = b[0].report(0, &[]).unwrap();
+    assert_eq!(r.grant, 1, "C's segment, part of what B is owed");
+    grow_all(&b, 2, r.txn);
+    let r = a[0].report(0, &[600_000]).unwrap();
+    assert_eq!(r.give, 3);
+    shrink_all(&a, 5, r.txn);
+    let r = b[0].report(0, &[]).unwrap();
+    assert_eq!(r.grant, 2, "the rest of what B asked for");
+    grow_all(&b, 4, r.txn);
+    assert_eq!(b[0].report(0, &[]).unwrap().grant, 0);
 }

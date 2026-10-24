@@ -458,11 +458,13 @@ moves between groups by whole segments (server.rs):
   of its last give. A give no rank started within `--stall-s` (10 s) marks the group stalled until it shrinks. A give
   frees whole segments on each of the giver's ranks; what that frees past the asker's need, the asker takes with its
   next grant (a group of 4 ranks giving to one of 2 strands nothing).
-- An ask that made the node ask another group to give is held for the asker (`owed` in the node's stats): its next
-  reports are granted that room even when they ask for nothing more, until granted or `grant_ttl`. A head asks once
+- An ask that made the node ask another group to give is held for the asker (`owed` in the node's stats, segments a
+  rank): that room is reserved for it, as a grant is (no other group's grant and no plain lease takes it), and its next
+  reports are granted it even when they ask for nothing more. A grant smaller than what is owed takes its part off and
+  the rest stays owed; what is owed lapses `grant_ttl` after the last ask. A head asks once
   for what changed since its last report (one entry ahead of a drop), and a give takes a report or more, so without
-  this the given segments sat free until the asker dropped an entry and asked again. A report on what is owed does not
-  ask a group to give again.
+  this the given segments sat free until the asker dropped an entry and asked again. A report asks another group to
+  give only for what no give asked already brings.
 - A group that opens on a full node asks the others down toward their floors (the margin and the cooldown do not apply)
   and waits up to `--stall-s` for them. `kvman-remote --group-plan FILE` (lines `NAME nr=RANKS floor=SEGS`) keeps a
   planned group's floors free from the start, however full the node is; the floors must fit the node.

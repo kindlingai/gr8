@@ -167,9 +167,10 @@ struct Group {
     // segments a rank more than it asked that a give made for it left over (taken with its next grant, so the give's
     // rounding to the giver's rank count strands nothing)
     bonus: u64,
-    // segments a rank this group asked for that the node asked another group to give (owed_at: when): granted at the
-    // group's next reports even when they ask for nothing more (its head's want counts only what changed since its last
-    // report), until granted or grant_ttl
+    // segments a rank this group asked for that the node asked another group to give (owed_at: when): reserved for it
+    // (no other group or lease takes them) and granted at its next reports even when they ask for nothing more (its
+    // head's want counts only what changed since its last report). A grant takes what it gave off; what is left stays
+    // owed until granted or grant_ttl after the last ask
     owed: u64,
     owed_at: Option<Instant>,
     stalled: bool,
@@ -188,7 +189,7 @@ impl Group {
         self.members.values().map(|m| m.segs).max().unwrap_or(self.floor)
     }
     fn reserved(&self) -> u64 {
-        self.boot + self.txn.as_ref().map_or(0, |t| t.held.values().sum::<u64>())
+        self.boot + self.txn.as_ref().map_or(0, |t| t.held.values().sum::<u64>()) + self.owed * self.nr as u64
     }
     fn complete(&self) -> bool {
         self.members.len() == self.nr as usize
@@ -243,6 +244,10 @@ impl State {
     // marked stalled. Once a rank applied either, it stays until every rank did (or left)
     fn tick(&mut self, now: Instant, sh: &Share) {
         for g in self.groups.values_mut() {
+            if g.owed_at.is_some_and(|t| now.duration_since(t) > sh.grant_ttl) {
+                g.owed = 0;
+                g.owed_at = None;
+            }
             let Some(t) = &g.txn else { continue };
             if t.started {
                 continue;
@@ -1336,7 +1341,9 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
     let mut st = sh.state.lock().unwrap();
     let now = Instant::now();
     st.tick(now, &sh.share);
-    let unclaimed = st.unclaimed(seg);
+    // what this group may take: nobody's, and what it is owed (reserved for it)
+    let own = st.groups.get(name).map_or(0, |g| g.owed * g.nr as u64);
+    let unclaimed = st.free_segs(seg).saturating_sub(st.reserved() - own);
     let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
     g.ages = ages;
     g.demand = demand;
@@ -1344,7 +1351,7 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
     let mine = g.members.get(rank).map_or(g.floor, |m| m.segs);
     let nr = g.nr as u64;
     let (mut grant, mut give, mut txn) = (0, 0, 0);
-    let owed = if g.owed_at.is_some_and(|t| now.duration_since(t) < sh.share.grant_ttl) { g.owed } else { 0 };
+    let owed = g.owed;
     // (segments short, of segments needed, with these unclaimed left)
     let mut short = None;
     if let Some(t) = &mut g.txn {
@@ -1363,16 +1370,19 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
         grant = (unclaimed / nr).min((want + g.bonus).min(room));
         if grant > 0 {
             g.bonus = 0;
-            g.owed = 0;
-            g.owed_at = None;
+            g.owed = g.owed.saturating_sub(grant);
+            if g.owed == 0 {
+                g.owed_at = None;
+            }
             g.granted += grant;
             let target = g.segs() + grant;
             txn = State::open_txn(g, true, target, grant, now, true);
         }
-        // only a new ask asks another group to give: a report on what is owed waits for the give already asked
-        if want > grant && demand > 0 {
-            let need = (want - grant) * nr;
-            let left = unclaimed - grant * nr;
+        // only a new ask asks another group to give, and only for what no give asked already brings: a report on
+        // what is owed waits for that give
+        if demand > 0 && want > grant + g.owed {
+            let need = (want - grant - g.owed) * nr;
+            let left = unclaimed.saturating_sub((grant + g.owed) * nr);
             if need > left {
                 short = Some((need - left, need, left));
             }
@@ -1385,7 +1395,7 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
         if freed > 0 {
             let g = st.groups.get_mut(name).expect("reported");
             g.bonus = (left + freed).saturating_sub(need) / nr;
-            g.owed = need.div_ceil(nr);
+            g.owed += (left + freed).min(need) / nr;
             g.owed_at = Some(now);
         }
     }
