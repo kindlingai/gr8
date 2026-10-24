@@ -5,40 +5,34 @@ Need help? Join us on discord: https://discord.gg/M7XTrRJW3
 Full GLM-5.3 on DGX Spark (GB10). *Beta release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 
 gr8 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
-sparse indexer, one MTP layer) on three, four or six DGX Spark (GB10) boxes, tensor-parallel across all of them. It
+sparse indexer, one MTP layer) on three to six DGX Spark (GB10) boxes, tensor-parallel across all of them. It
 uses no vLLM, PyTorch or NCCL at serve time. Each box runs one `g6m4` process, the ranks talk over RoCE v2 through
 their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 
 ## Results
 
-| | TP=4 | TP=3 | TP=6 |
-|---|---|---|---|
-| experts | `home`, 3.25 bpw | `bit225`, 2.25 bpw | `home`, 3.25 bpw |
-| drafting | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 51.7 / 32.5 tok/s | 40.3 / 30.2 tok/s | 54.6 / 40.9 tok/s‖ |
-| aggregate\*, 2 / 4 streams | 53.7 / 67.8 tok/s | 47.9 / 62.2 tok/s | 57.6 / 79.0 tok/s‡ |
-| prefill, 8K prompt, cold | 1,315 tok/s | 654 tok/s | 1,953 tok/s‡ |
-| prefill, 8K prompt, cached | 60,006 tok/s | 57,086 tok/s | – |
-| KV pool (longest context) | 485,376 tokens (513,536 with int4§) | 307,136 tokens (410,624 with int4§) | 614,400 tokens (857,600 with int4§) |
-| requests that share decode steps | up to 32,768 tokens | up to 32,768 tokens | up to 32,768 tokens |
-| requests decoding at once | 8 | 8 | 8 |
+| | TP=3 | TP=4 | TP=5 | TP=6 |
+|---|---|---|---|---|
+| experts | `bit225`, 2.25 bpw | `home`, 3.25 bpw | `home`, 3.25 bpw | `home`, 3.25 bpw |
+| drafting | MTP | DFlash2 or MTP | MTP | MTP |
+| decode\*, code / prose | 41.1 / 31.7 tok/s | 52.1 / 34.2 tok/s | 51.0 / 38.0 tok/s | 57.4 / 43.1 tok/s‡ |
+| aggregate\*, 2 / 4 streams | 50.6 / 63.8 tok/s | 54.0 / 69.0 tok/s | 61.8 / 76.3 tok/s | 67.6 / 85.5 tok/s‡ |
+| prefill, 8K prompt, cold | 635 tok/s | 1,357 tok/s | 1,554 tok/s | 1,808 tok/s‡ |
+| prefill, 8K prompt, cached | 58,655 tok/s | 60,129 tok/s | 60,455 tok/s | 62,337 tok/s |
+| KV pool (longest context) | 307,136 tokens (410,624 with int4§) | 485,376 tokens (513,536 with int4§) | 502,848 tokens | 614,400 tokens (857,600 with int4§) |
+| requests that share decode steps | up to 32,768 tokens | up to 32,768 tokens | up to 32,768 tokens | up to 131,072 tokens |
+| requests decoding at once | 8 | 8 | 8 | 8 |
 
-\* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks uncapped (the full
-application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release
-with `./gr8 glm53 up` and its defaults, which turn the faster decode options on (`DRAFT_PAR`, `QA_SPLIT` /
-`IDXQ_SPLIT` / `MTP_SPLIT`, `MTP_KSTOP` at TP=4). One run per fresh boot (a second run on the same boot replays
-RigMark's prompts from the retained prefix), the mean of two boots. RigMark's structured row is left out: it
-measures predictable output, not agent speed. TP=4 code varies between boots (51.2 to 52.2 on one build),
-because which requests get DFlash2 depends on timing. The TP=3 column is still the earlier measurement at the 2200 MHz
-cap on an older build; its re-measurement is pending.
-‡ TP=6, MTP only (the DFlash2 drafter's 8 KV heads do not split six ways), on an earlier build. Decode is a
-concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; it is not
-RigMark. One test window on one cluster.
-‖ TP=6 decode: RigMark 1.0.0 (`reasoning_effort` low), MTP only, booted at c53b5b8 with the launcher's defaults
-(`home`), GPU clocks capped at 2200 MHz, unlike the other columns, so this cell is lower than an uncapped run would be.
-One run per fresh boot, the mean of two boots (prose 40.5 / 41.3, code 54.4 / 54.7 tok/s); six boxes on one switch.
-§ `--kv-format int4` (experimental): 4-bit KV latent, about 3% slower decode at TP=4; TP=3 and TP=6 int4 figures are
-estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [docs/KV4.md](docs/KV4.md)
+\* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), booted from the Hugging Face release
+with `./gr8 glm53 up` and its defaults (TP=4 with `--drafter`, for DFlash2). GPU clocks uncapped (the full application
+clock; the 2200 MHz cap is only for PR-to-PR gate comparisons). One run per fresh boot, the mean of two boots, on
+2026-10-24. Each pair of boots gave identical temperature-0 replies, and smoke passed 14/14 on every boot. RigMark's
+structured row is left out: it measures predictable output, not agent speed. TP=3 to TP=5 ran on a build of #140
+before it landed, and TP=6 on 8da82ff. Six boxes on one 200G switch.
+‡ One of the six boxes was capped at 2200 MHz (it powers off under sustained load at its full clock), so the TP=6
+column would be a little higher on six uncapped boxes.
+§ `--kv-format int4` (experimental): 4-bit KV latent, about 3% slower decode at TP=4. The TP=3 and TP=6 int4 figures
+are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [docs/KV4.md](docs/KV4.md)
 
 [kindling.json](kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
 
@@ -64,7 +58,7 @@ estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [docs/KV
 
 ## What you need
 
-- Three, four or six DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory), one rank per box, with nothing
+- Three to six DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory), one rank per box, with nothing
   else holding much memory. A rank's weights take about 83 GB at TP=4 and 78 GB at TP=3. The KV pool and the step
   graphs need most of the rest.
 - A RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. We use one 200G switch.
