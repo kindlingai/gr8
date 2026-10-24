@@ -43,6 +43,7 @@ STEERING_PROFILE_CHECK="$T/steering_profile_check" python3 -m unittest discover 
 python3 -m unittest tools.convert.test_v2
 python3 -m unittest discover -s tools/health
 python3 -m unittest discover -s bench/gate/tests
+python3 -m unittest discover -s tools/ngram/tests
 python3 tools/s2_costfit.py --selftest
 (cd engine/tests && python3 -m unittest test_prefix_reuse)
 g++ -std=c++17 -O2 -Wall -Wextra -I engine/runtime \
