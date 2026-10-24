@@ -87,23 +87,28 @@ strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker
 md5sum "$OUT/g6m4" "$OUT/m4sim"
 widths_ok "$OUT/g6m4" "$OUT/m4sim"
 export PATH=/usr/local/cuda/bin:$PATH
+# the compiles below go through the same object cache as build_m4.sh (#32); G6_NVCC_CACHE=0 runs plain nvcc / g++
+CACHE="$REPO/engine/runtime/nvcc_cache.sh"
+if [ "${G6_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="$CACHE nvcc"; GXX="$CACHE g++"; fi
+export G6_NVCC_CACHE_LOG="$OUT/obj/nvcc_cache.tests.calls"
+rm -f "$G6_NVCC_CACHE_LOG"
 # the adaptive draft length decision, CPU
-g++ -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
+$GXX -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
 t=$("$OUT/test_spec_len") || { echo "$t"; echo "test_spec_len FAILED"; exit 1; }
 echo "test_spec_len: $(echo "$t" | tail -1)"
 # the prefix-reuse state machine (--reuse-prefix and its grid rules), CPU
-g++ -O2 -std=c++17 -I "$REPO/engine/runtime" -o "$OUT/test_prefix_reuse" "$REPO/engine/tests/test_prefix_reuse.cpp"
+$GXX -O2 -std=c++17 -I "$REPO/engine/runtime" -o "$OUT/test_prefix_reuse" "$REPO/engine/tests/test_prefix_reuse.cpp"
 t=$("$OUT/test_prefix_reuse") || { echo "$t"; echo "test_prefix_reuse FAILED"; exit 1; }
 echo "test_prefix_reuse: $(echo "$t" | tail -1)"
 # gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py)
-nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
+$NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
 # TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
-nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
+$NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o "$OUT/tr3_e4m3_test" \
   "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" -lcublas
 # G6_L2PF (paced side-stream L2 prefetch in the step's idle-DRAM windows): byte-exact check + per-layer timing of the
 # decode layer sequence (real attention, x_in / q_b / o_proj / router GEMVs, wait and MoE stand-ins); build only (needs
 # an idle GPU and ~3-5 GB): $OUT/l2pf_bench (file header)
-nvcc -O3 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
+$NVCC -O3 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
   -I "$REPO/engine/kernels" -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
   "$REPO/engine/attn/bind.cu" -lcublas
 # the prefetch queues (G6_L2PF targets, G6_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
@@ -121,7 +126,7 @@ fi
 # Steering projection/consume/finalizer fixtures: compile in CI even without a GPU. No model or fabric service needed.
 for test in steering_cuda_test steering_consume_test steering_shared_test steering_boot_cuda_test; do
   # shellcheck disable=SC2086
-  nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} \
+  $NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} \
     $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 -o "$OUT/$test" "$REPO/engine/runtime/tests/$test.cu" -lcublas
   if nvidia-smi -L > /dev/null 2>&1; then
     "$OUT/$test"
@@ -133,7 +138,7 @@ done
 # G6_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
 # + bench on a synthetic TP4 layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
 # shellcheck disable=SC2086
-nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 \
+$NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS -DG6_NR=4 -DDEC_S2 \
   -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" "$REPO/engine/kernels/tests/k1_ovl_test.cu"
 # K1 split choice (G6_K1_SPLIT table vs triple, the fused remap's KS1 x WG >= 2 guard): host only, runs everywhere
 # shellcheck disable=SC2086
@@ -142,6 +147,8 @@ nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K
 t=$("$OUT/k1_split_test") || { echo "$t"; echo "k1_split_test FAILED"; exit 1; }
 echo "$t"
 # fabric groups over real verbs (#154): built here, run by hand on the cluster (one process per box; see its header)
-nvcc -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" "$REPO/engine/comms/tests/fabric_group_test.cpp" \
+$NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" "$REPO/engine/comms/tests/fabric_group_test.cpp" \
   "$REPO/engine/comms/fabric.cpp" -libverbs -lpthread
 echo "fabric_group_test: built (cluster test, not run here)"
+[ -f "$G6_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$G6_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$G6_NVCC_CACHE_LOG") miss"
+exit 0

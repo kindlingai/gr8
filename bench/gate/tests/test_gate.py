@@ -374,6 +374,117 @@ class Records(unittest.TestCase):
         self.assertEqual(st, 'PASS')  # 42 median, -8.3% is inside the 9.5% spread
 
 
+def prec(pair, commit, metrics, boot=None, **kw):
+    r = rec(boot or f'{commit}-{pair}', metrics, commit=commit, **kw)
+    r['pair'] = pair
+    return r
+
+
+class Paired(unittest.TestCase):
+    def pairs(self, deltas, base=40.0, key='work.code.decode_tok_s'):
+        runs = []
+        for i, d in enumerate(deltas):
+            a = base + (i % 3)  # drift between pairs, which the pairing cancels
+            runs += [prec(f'p{i}', 'main', {key: a}), prec(f'p{i}', 'pr', {key: a * (1 + d)})]
+        return runs
+
+    def verdict(self, runs, key='work.code.decode_tok_s', **kw):
+        rows, info = record.paired(runs, 'tp6', 'main', 'pr', **kw)
+        return {r[0]: r for r in rows}[key], info
+
+    def test_clear_regression_is_worse(self):
+        row, _ = self.verdict(self.pairs([-0.05, -0.06, -0.055, -0.052]))
+        self.assertEqual(row[8], 'worse')
+        self.assertEqual((row[6], row[7]), (0, 4))
+        self.assertAlmostEqual(row[3], -5.43, places=2)
+
+    def test_small_steady_shift_is_within_noise(self):
+        row, _ = self.verdict(self.pairs([0.004, -0.003, 0.002, 0.0, -0.001]))
+        self.assertEqual(row[8], 'within noise')
+
+    def test_drift_cancels(self):
+        # unpaired, a 0-2 tok/s drift is 5% spread; paired, the change is exactly +4% in every pair
+        row, _ = self.verdict(self.pairs([0.04] * 4))
+        self.assertEqual(row[8], 'better')
+        self.assertAlmostEqual(row[4], row[5])
+
+    def test_scattered_pairs_are_unresolved_and_one_pair_has_no_interval(self):
+        row, _ = self.verdict(self.pairs([0.05, -0.06, 0.04]))
+        self.assertEqual(row[8], 'unresolved')
+        row, _ = self.verdict(self.pairs([-0.10]))
+        self.assertEqual(row[8], 'one pair')
+        self.assertIsNone(row[4])
+
+    def test_lower_is_better_metrics(self):
+        k = 'long.87k.ttft_s'
+        row, _ = self.verdict(self.pairs([0.05, 0.06, 0.055], base=70.0, key=k), key=k)
+        self.assertEqual(row[8], 'worse')  # ttft up 5%
+        self.assertEqual((row[6], row[7]), (0, 3))
+
+    def test_repeats_reduce_to_the_median_and_lone_pairs_are_listed(self):
+        runs = self.pairs([-0.05, -0.05])
+        runs.append(prec('p0', 'pr', {'work.code.decode_tok_s': 1000.0}))  # a third repeat of p0's pr boot
+        runs.append(prec('p0', 'pr', {'work.code.decode_tok_s': 38.0}))
+        runs.append(prec('p9', 'main', {'work.code.decode_tok_s': 40.0}))
+        row, info = self.verdict(runs)
+        self.assertEqual(info['unpaired'], ['p9'])
+        self.assertEqual(row[2], 2)
+        self.assertAlmostEqual(row[3], -5.0, places=6)  # p0's pr median is 38 = -5%
+
+    def test_refusals(self):
+        runs = self.pairs([0.0, 0.0])
+        with self.assertRaisesRegex(ValueError, 'measurement settings'):
+            record.paired(runs + [prec('p0', 'pr', {'x': 1.0}, settings={**SETTINGS, 'temp': 9})], 'tp6', 'main', 'pr')
+        with self.assertRaisesRegex(ValueError, 'build flags of pr'):
+            record.paired(runs + [prec('p0', 'pr', {'x': 1.0}, flags='other')], 'tp6', 'main', 'pr')
+        with self.assertRaisesRegex(ValueError, 'rank health'):
+            record.paired(runs + [prec('p0', 'pr', {'x': 1.0}, health=SICK)], 'tp6', 'main', 'pr')
+        with self.assertRaisesRegex(ValueError, 'share boot'):
+            record.paired(runs + [prec('p0', 'pr', {'x': 1.0}, boot='main-p0')], 'tp6', 'main', 'pr')
+        with self.assertRaisesRegex(ValueError, 'no pair has runs of both'):
+            record.paired([prec('p0', 'main', {'x': 1.0})], 'tp6', 'main', 'pr')
+        with self.assertRaisesRegex(ValueError, 'no paired runs'):
+            record.paired(runs, 'tp4', 'main', 'pr')
+
+    def test_kl_is_info_even_at_the_floor(self):
+        runs = []
+        for i, (x, y) in enumerate([(1e-7, 2e-7), (1.2e-7, 2.1e-7), (0.9e-7, 1.9e-7)]):
+            runs += [prec(f'p{i}', 'main', {'kl.mean': x}), prec(f'p{i}', 'pr', {'kl.mean': y})]
+        row, _ = self.verdict(runs, key='kl.mean')
+        self.assertEqual(row[8], 'info')  # check gates KL on its absolute threshold
+
+    def test_two_boots_of_one_side_in_a_pair_are_refused(self):
+        runs = self.pairs([0.0]) + [prec('p0', 'pr', {'work.code.decode_tok_s': 40.0}, boot='pr-p0-again')]
+        with self.assertRaisesRegex(ValueError, 'one boot of each side'):
+            record.paired(runs, 'tp6', 'main', 'pr')
+
+    def test_a_lone_unhealthy_run_is_left_out_not_refused(self):
+        runs = self.pairs([0.0, 0.0]) + [prec('p9', 'main', {'work.code.decode_tok_s': 40.0}, health=SICK)]
+        _, info = record.paired(runs, 'tp6', 'main', 'pr')
+        self.assertEqual(info['unpaired'], ['p9'])
+
+    def test_a_lone_pair_with_other_settings_is_left_out(self):
+        runs = self.pairs([0.0, 0.0]) + [prec('p9', 'main', {'work.code.decode_tok_s': 40.0},
+                                              settings={**SETTINGS, 'temp': 9})]
+        _, info = record.paired(runs, 'tp6', 'main', 'pr')
+        self.assertEqual(info['unpaired'], ['p9'])
+
+    def test_a_boot_in_two_pairs_is_refused(self):
+        runs = [prec('p0', 'main', {'m': 1.0}, boot='m0'), prec('p0', 'pr', {'m': 1.0}, boot='c0'),
+                prec('p1', 'main', {'m': 1.0}, boot='m0'), prec('p1', 'pr', {'m': 1.0}, boot='c1')]
+        with self.assertRaisesRegex(ValueError, 'each boot belongs to one pair'):
+            record.paired(runs, 'tp6', 'main', 'pr')
+
+    def test_flags_may_differ_between_sides(self):
+        runs = [prec('p0', 'main', {'m': 1.0}, flags='A'), prec('p0', 'pr', {'m': 1.0}, flags='B')]
+        _, info = record.paired(runs, 'tp6', 'main', 'pr')
+        self.assertEqual(info['sides']['pr']['build_flags'], 'B')
+
+    def test_t_quantiles(self):
+        self.assertEqual(record.t975(1), 12.706)
+        self.assertEqual(record.t975(100), 1.96)
+
+
 class RankHealthRecords(unittest.TestCase):
     def test_baseline_refuses_boots_the_probe_refused(self):
         runs = [rec('b1', {'m': 10.0}), rec('b2', {'m': 11.0}, health=SICK)]
@@ -463,6 +574,25 @@ class CLI(Base):
             p = self.run_gate('check', '--baseline', base, '--runs', runs, '--allow-partial')
             self.assertEqual(p.returncode, 1)
             self.assertIn('RESULT: FAIL', p.stdout)
+
+    def test_paired_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs = f'{d}/runs.jsonl'
+            for pair in ('p1', 'p2'):
+                for commit in ('mainsha', 'prsha'):
+                    p = self.run_gate('run', '--url', self.url, '--topology', 'tp6', '--commit', commit,
+                                      '--boot', f'{commit}-{pair}', '--pair', pair, '--runs', runs, '--repeat', '1',
+                                      '--only', 'workloads', '--runs-per-workload', '1', '--workload-tokens', '80')
+                    self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(json.loads(Path(runs).read_text().splitlines()[0])['pair'], 'p1')
+            p = self.run_gate('paired', '--topology', 'tp6', '--a', 'mainsha', '--b', 'prsha', '--runs', runs,
+                              '--noise', '0.5')
+            self.assertIn('2 pair(s)', p.stdout)
+            self.assertIn('| work.code.decode_tok_s | 2 |', p.stdout)
+            self.assertIn('PAIRED:', p.stdout)
+            p = self.run_gate('paired', '--topology', 'tp6', '--a', 'mainsha', '--b', 'nosuch', '--runs', runs)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn('paired refused', p.stderr)
 
     def test_kl_ref_of_another_topology_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
