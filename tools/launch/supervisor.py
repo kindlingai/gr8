@@ -562,21 +562,27 @@ class Supervisor:
     def ring_publisher(self):
         """--shape ring in mentat mode: a callable that publishes this box's gr8.ring meta (its RoCE addresses and the
         peer addresses its daemon's probes reach) when it changes. Stop(1) when this box has no RoCE v2 address."""
-        try:
-            self.ring_ports = fabric.ring_ports()
-        except OSError as e:
-            raise Stop(1, f'--shape ring: cannot read /sys/class/infiniband ({e})')
+        def read_ports():
+            try:
+                return fabric.ring_ports()
+            except OSError as e:
+                raise Stop(1, f'--shape ring: cannot read /sys/class/infiniband ({e})')
+        self.ring_ports = read_ports()
         if not self.ring_ports:
             raise Stop(1, '--shape ring: no ACTIVE RoCE v2 address under /sys/class/infiniband: are the ring cables '
                           'in and addressed?')
-        roots = {a: r for a, (_, r) in self.ring_ports.items()}
-        said = [None]
+        said, failed = [None], [-60.0]
 
         def publish():
+            # read again each time: a port that finishes link training during the wait joins the ring
+            self.ring_ports = read_ports()
+            roots = {a: r for a, (_, r) in self.ring_ports.items()}
             try:
                 text = mentat.own_links(self.daemon.local_status(), roots)
             except (OSError, ValueError) as e:
-                log(f'mentat: cannot read this box\'s probes: {e}')
+                if time.monotonic() - failed[0] >= 60:
+                    failed[0] = time.monotonic()
+                    log(f'mentat: cannot read this box\'s probes: {e}')
                 return
             except RuntimeError as e:
                 raise Stop(1, str(e))
@@ -593,6 +599,11 @@ class Supervisor:
         log(f'ring: {" -> ".join(lan for lan, _, _ in ranks)} -> {ranks[0][0]}; this box\'s relay-out, next, '
             f'relay-in, prev: {",".join(ports)}')
         devs = [self.ring_ports[a][0] for a in ports]
+        for a, d in zip(ports, devs):
+            others = sorted(x for x, (dd, _) in self.ring_ports.items() if dd == d and x != a)
+            if others:   # the engine takes the device's first RoCE v2 IPv4 GID (fabric.cpp ring_gid_index)
+                log(f'warning: --shape ring: {d} carries {a} and {", ".join(others)}; the engine uses its first RoCE '
+                    'v2 address, which may not be the one on the cable')
         if self.o.get('RING_DEVS'):
             if opt.split_list(self.o.get('RING_DEVS')) != devs:
                 log(f'warning: --ring-devs {self.o.get("RING_DEVS")} overrides the cabling mentat found '

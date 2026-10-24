@@ -226,6 +226,31 @@ class RingPlanTests(unittest.TestCase):
         order, ports = M.ring_plan(meta, n, offers or dict.fromkeys(meta), head)
         return order, ports, addr
 
+    def test_a_partial_probe_table_gives_the_same_tp3_plan(self):
+        """mentat fills its table a round at a time. At TP=3 the relay pair is unused, so a box whose root-0 rows are
+        not in yet derives the same plan (the handshake compares it) as one with the full table."""
+        snaps, roots, addr = cabled(3, ring([0, 2, 1]))
+        full = M.ring_text(*M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in (1, 2, 3))))
+        for s in snaps:
+            for p in s['peers'].values():
+                for x in [x for x in p['probes'] if x.split('.')[1].startswith('1')]:
+                    del p['probes'][x]          # root 0 (10.1x.*) not probed yet
+        order, ports = M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in (1, 2, 3)))
+        self.assertEqual(M.ring_text(order, ports), full)
+        for ro, dn, ri, dp in ports:
+            self.assertEqual((ro, ri), (dn, dp))
+            self.assertTrue(dn.startswith('10.2') and dp.startswith('10.2'))     # root 1
+
+    def test_fewer_boxes_or_a_stranger_head(self):
+        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
+        meta = ring_meta(snaps, roots)
+        with self.assertRaises(M.NoAssignment) as e:
+            M.ring_plan(meta, 4, dict.fromkeys(meta))
+        self.assertIn('links of 3 boxes form no ring of 4', str(e.exception))
+        with self.assertRaises(M.NoAssignment) as e:
+            M.ring_plan(meta, 3, dict.fromkeys(meta), head='10.0.0.9')
+        self.assertIn('--head 10.0.0.9 is not a member', str(e.exception))
+
     def test_three_and_four_box_rings_in_both_directions(self):
         for n, cable_order in ((3, [0, 1, 2]), (3, [0, 2, 1]), (4, [0, 1, 2, 3]), (4, [0, 2, 1, 3]), (4, [0, 3, 1, 2])):
             for cables in (ring(cable_order), flipped(cable_order)):
@@ -299,7 +324,9 @@ class RingPlanTests(unittest.TestCase):
             for a in [a for a, k in r.items() if k == 0]:
                 del r[a]
         order, ports = M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in range(1, 4)))
-        self.assertEqual(len(order), 3)
+        self.assertEqual(order, ['10.0.0.1', '10.0.0.2', '10.0.0.3'])
+        self.assertEqual(ports[0], (addr[(0, 0, 1)], addr[(0, 0, 1)], addr[(0, 1, 1)], addr[(0, 1, 1)]))
+        self.engine_view(order, ports, addr, 3)
 
     def test_forwarded_and_failed_probes_are_not_links(self):
         snaps, roots, _ = cabled(3, ring([0, 1, 2]))
@@ -310,6 +337,12 @@ class RingPlanTests(unittest.TestCase):
         roots_, links = M.parse_links(M.own_links(snaps[0], roots[0]))
         self.assertEqual((sorted(roots_), links), (sorted(roots[0]), set()))
         self.assertEqual(M.parse_links(M.own_links({'peers': {}}, {})), ({}, set()))
+        # an IPv6 far end, a null direct (kept: the MAC is unknown) and an address this box cannot use
+        x = sorted(roots[0])[0]
+        local = {'addr_tags': {x: ['rdma'], '10.99.0.1': ['rdma']}, 'peers': {'n2': {'probes': {
+            x: {'fe80::2': {'ok': True, 'direct': True}, '10.11.0.2': {'ok': True, 'direct': None}},
+            '10.99.0.1': {'10.99.0.2': {'ok': True, 'direct': True}}}}}}
+        self.assertEqual(M.parse_links(M.own_links(local, {x: 0}))[1], {(x, '10.11.0.2')})
 
     def test_meta_fits_mentat(self):
         snaps, roots, _ = cabled(4, ring([0, 1, 2, 3]))
@@ -379,6 +412,45 @@ class DaemonTests(unittest.TestCase):
         with self.assertRaises(M.NoAssignment) as e:
             M.elect(self.d, GROUP, 4, sleep=lambda _: None, log=lambda s: None)
         self.assertIn('10.0.0.1 1, 10.0.0.2 1, 10.0.0.3 any, 10.0.0.4 any', str(e.exception))
+
+    def test_a_ring_election_waits_for_links_that_hold(self):
+        rows = {f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in (1, 2, 3)}
+        snaps, roots, _ = cabled(3, ring([0, 2, 1]))
+        meta = ring_meta(snaps, roots)
+        partial = {ip: t.split(';')[0] + ';' for ip, t in meta.items()}   # no links probed yet
+        for i in (1, 2, 3):
+            rows[f'a{i}']['meta'][M.LINKS_META] = partial[f'10.0.0.{i}']
+        self.fake.snap = snapshot(rows)
+        t, reads = [0.0], []
+
+        def sleep(s):
+            t[0] += s
+            reads.append(t[0])
+            if len(reads) == 3:      # the probes come in
+                for i in (1, 2, 3):
+                    rows[f'a{i}']['meta'][M.LINKS_META] = meta[f'10.0.0.{i}']
+        ranks, _ = M.elect(self.d, GROUP, 3, sleep=sleep, log=lambda s: None, clock=lambda: t[0], ring=lambda: None,
+                           ring_stable=20, ring_settle=45)
+        self.assertEqual([r[0] for r in ranks], ['10.0.0.1', '10.0.0.2', '10.0.0.3'])
+        self.assertGreaterEqual(t[0] - reads[2], 20)        # the full links held a probe round first
+
+    def test_a_ring_election_whose_links_keep_changing_times_out(self):
+        rows = {f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in (1, 2, 3)}
+        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
+        meta = ring_meta(snaps, roots)
+        self.fake.snap = snapshot(rows)
+        t, n = [0.0], [0]
+
+        def flap():
+            n[0] += 1
+            for i in (1, 2, 3):
+                rows[f'a{i}']['meta'][M.LINKS_META] = meta[f'10.0.0.{i}'] if n[0] % 2 else ';'
+
+        def sleep(s):
+            t[0] += s
+        with self.assertRaises(RuntimeError) as e:
+            M.elect(self.d, GROUP, 3, timeout=60, sleep=sleep, log=lambda s: None, clock=lambda: t[0], ring=flap)
+        self.assertIn('ring links kept changing', str(e.exception))
 
     def test_election_refusals(self):
         self.fake.snap = snapshot({f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in range(1, 6)})

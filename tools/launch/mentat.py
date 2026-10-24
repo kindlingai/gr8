@@ -27,11 +27,13 @@ PROTO = '0.99'
 PING_S = 2.0
 # the service a KV node (./gr8 kv up) announces
 KV_SERVICE = 'gr8-kv'
-# --shape ring: the agent meta key with this box's probed rdma links, and how long a full group whose links form no
-# ring waits for more probes before the boot is refused (mentat probes every 15 s by default)
+# --shape ring: the agent meta key with this box's probed rdma links; how long every member's links must hold before
+# a plan (longer than mentat's default 15 s probe round); and how long a full group whose links form no ring waits
+# for more probes before the boot is refused
 LINKS_META = 'gr8.ring'
 META_MAX = 1024
 RING_SETTLE_S = 45.0
+RING_STABLE_S = 20.0
 
 
 def frame(header):
@@ -123,7 +125,7 @@ def members(snap, group):
 
 
 def member_links(snap, group):
-    """{node_ip: gr8.links meta text, or None before the box has published it} of the group's members."""
+    """{node_ip: gr8.ring meta text, or None before the box has published it} of the group's members."""
     return {ip: m.get(LINKS_META) for ip, (_, m) in member_rows(snap, group).items()}
 
 
@@ -256,13 +258,16 @@ def ring_plan(boxes, tp, offers, head=None):
             pairs.setdefault((ip, b), set()).add((x, y))
             pairs.setdefault((b, ip), set()).add((y, x))
     nbrs = {ip: sorted({b for a, b in pairs if a == ip}, key=ip_key) for ip in ips}
-    cycles = [(ips[0], *p) for p in itertools.permutations(ips[1:])
-              if all(((ips[0], *p)[i], (ips[0], *p)[(i + 1) % n]) in pairs for i in range(n))]
-    if len(ips) != n or not cycles:
+    if head and head not in ips:
+        raise NoAssignment(f'--head {head} is not a member ({", ".join(ips)})')
+    cycles = [] if len(ips) != n else [
+        (ips[0], *p) for p in itertools.permutations(ips[1:])
+        if all(((ips[0], *p)[i], (ips[0], *p)[(i + 1) % n]) in pairs for i in range(n))]
+    if not cycles:
         short = [ip for ip in ips if len(nbrs[ip]) < 2]
         idle = [f'{a} on {ip}' for ip in ips for a in sorted(parsed[ip][0], key=ip_key)
                 if not any(a in p for k, v in pairs.items() if k[0] == ip for p in v)]
-        why = 'the probed links form no ring of {}'.format(n)
+        why = f'the probed links of {len(ips)} boxes form no ring of {n}'
         if len(short) == 2 and short[1] not in nbrs[short[0]]:
             why += f': no cable works between {short[0]} and {short[1]}'
         elif short:
@@ -285,11 +290,17 @@ def ring_plan(boxes, tp, offers, head=None):
         a, b = order[r], order[(r + 1) % n]
         ps = sorted(pairs[(a, b)], key=lambda p: (root[p[0]], root[p[1]], ip_key(p[0]), ip_key(p[1])))
         direct = ps[-1]
+        if n == 3:      # TP=3 opens only the direct devices (fabric.cpp): the relay fields repeat them
+            edges.append((direct, direct))
+            continue
         relay = next((p for p in ps if p[0] != direct[0] and p[1] != direct[1]), None)
-        if relay is None and n == 4:
+        if relay is None:
+            ends = lambda ip: ', '.join(f'{x} (root {root[x]})' for x in sorted(parsed[ip][0], key=ip_key))  # noqa: E731
             raise NoAssignment(f'{a} and {b} link on one port pair only ({direct[0]} - {direct[1]}): TP=4 relays '
-                               'over a second pair, so the cable needs both PCIe roots addressed at each end')
-        edges.append((direct, relay or direct))
+                               'over a second pair on the same cable, from the other PCIe root at both ends. '
+                               f'{a} has {ends(a)}; {b} has {ends(b)}. Is that pair addressed, tagged rdma, and '
+                               'answering mentat\'s probes?')
+        edges.append((direct, relay))
     ports = []
     for r in range(n):
         (dn, ro), (dp, ri) = edges[r], edges[r - 1]
@@ -416,16 +427,17 @@ class Agent:
 
 
 def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, sleep=time.sleep, clock=time.monotonic,
-          ring=None, ring_settle=RING_SETTLE_S):
+          ring=None, ring_settle=RING_SETTLE_S, ring_stable=RING_STABLE_S):
     """Wait until the group has tp live members, with their offers, the same on two reads hold_s apart; returns
     (ranks, snapshot), where ranks is [(lan, node_id, (rail0, rail1))] in rank order. Raises NoAssignment when the
     offers fit no assignment, and RuntimeError on a timeout or a bad membership.
 
     ring: for --shape ring, a callable run before each read that republishes this box's gr8.ring meta. The ranks
     then follow the cables (ring_plan), every member's gr8.ring counts toward the two equal reads, and the third
-    field of each rank is its (relay-out, direct-next, relay-in, direct-prev) addresses. Links that form no ring get
-    ring_settle seconds of new probes before the NoAssignment."""
-    t0, last, said, unsettled = clock(), None, -60, None
+    field of each rank is its (relay-out, direct-next, relay-in, direct-prev) addresses. The members' gr8.ring must
+    hold for ring_stable seconds before a plan, and links that form no ring get ring_settle seconds of new probes
+    before the NoAssignment."""
+    t0, last, said, unsettled, since = clock(), None, -60, None, None
     while True:
         if ring:
             ring()
@@ -441,8 +453,24 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
         if len(ms) > tp:
             raise RuntimeError(f'group {group} has {len(ms)} members for --tp {tp} '
                                f'({", ".join(m[0] for m in ms)}); stop one, or use --group')
+        waited = clock() - t0
+        if timeout and waited >= timeout:
+            raise RuntimeError(f'waited {waited:.0f}s for {tp} members in group {group}, have {len(ms)} '
+                               f'({", ".join(m[0] for m in ms) or "none"})'
+                               + (', but their ring links kept changing' if len(ms) == tp and ring else '')
+                               + (f': {err}' if err else ''))
         if len(ms) == tp and all(o is not None for _, _, o in ms) and all(v is not None for v in links.values()):
             key = (ms, sorted(links.items()))
+            if key != last:
+                since = clock()
+            # a ring's links count once no box's gr8.ring changed for a probe round, so every box plans from the same
+            # tables (a plan from other tables is refused by the handshake: ring= in the cluster options)
+            if key == last and ring and clock() - since < ring_stable:
+                if waited - said >= 60:
+                    log(f'waiting for the ring links of group {group} to settle')
+                    said = waited
+                sleep(hold_s)
+                continue
             if key == last and ring:
                 offers = {ip: parse_offers(o) for ip, _, o in ms}
                 try:
@@ -473,10 +501,6 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
             sleep(hold_s)
             continue
         last = None
-        waited = clock() - t0
-        if timeout and waited >= timeout:
-            raise RuntimeError(f'waited {waited:.0f}s for {tp} members in group {group}, have {len(ms)} '
-                               f'({", ".join(m[0] for m in ms) or "none"}){": " + err if err else ""}')
         if waited - said >= 60:
             log(f'waiting for {tp} members in group {group}, have {len(ms)} ({", ".join(m[0] for m in ms) or "none"})'
                 + (f': {err}' if err else ''))

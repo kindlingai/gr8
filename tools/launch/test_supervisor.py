@@ -77,7 +77,7 @@ class MentatRingTests(unittest.TestCase):
             with mock.patch.object(S, 'log'), \
                     mock.patch.object(S.fabric, 'ring_ports', lambda: devs[int(threading.current_thread().name)]), \
                     mock.patch.object(S.mentat, 'elect', lambda *a, **k: elect(*a, **{**k, 'hold_s': 0.2,
-                                                                                    'ring_settle': 1.0})):
+                                                                                    'ring_settle': 1.0, 'ring_stable': 0.5})):
                 for i in range(n):
                     o = opt.parse(['--no-config', '--mentat', f'127.0.0.1:{daemons[i].port}', '--tp', str(n),
                                    '--shape', 'ring', '--g6-home', tempfile.mkdtemp(), '--join-timeout', '30',
@@ -118,10 +118,13 @@ class MentatRingTests(unittest.TestCase):
                     for s in by_rank:
                         mine = s.ring_devs.split(',')
                         self.assertEqual(s.rails, (s.lan, s.lan))
-                        # direct-next and direct-prev are root 1 of two different ports, relay root 0
-                        self.assertEqual({mine[1][-2:], mine[3][-2:], mine[0][-2:], mine[2][-2:]}, {'r1', 'r0'})
+                        # direct-next and direct-prev are root 1 of two different ports; the relay (TP=4) root 0 of
+                        # the same ports, and at TP=3, which opens no relay, the direct devices again
+                        self.assertEqual((mine[1][-2:], mine[3][-2:]), ('r1', 'r1'))
                         self.assertNotEqual(mine[1][:2], mine[3][:2])
-                        self.assertEqual(mine[1][:2], mine[0][:2])
+                        relay = ('r0', 'r0') if n == 4 else ('r1', 'r1')
+                        self.assertEqual((mine[0][-2:], mine[2][-2:]), relay)
+                        self.assertEqual((mine[0][:2], mine[2][:2]), (mine[1][:2], mine[3][:2]))
                         c, _, _ = opt.canonical(s.o, opt.engine_plan(s.o), None, ring=s.ring)
                         self.assertEqual(c['ring'], by_rank[0].ring)
 
@@ -129,8 +132,11 @@ class MentatRingTests(unittest.TestCase):
         sups, res = self.boot(3, flipped([0, 1, 2]))
         self.assertEqual(res, ['ok'] * 3)
         s = sups[0]
-        self.assertEqual(s.ring_devs, 'f1r0,f1r1,f0r0,f0r1')       # its next box is on its f1 cable
-        self.assertEqual(s.ring_args(), ['--ring', '--ring-devs', 'f1r0,f1r1,f0r0,f0r1'])
+        self.assertEqual(s.ring_devs, 'f1r1,f1r1,f0r1,f0r1')       # its next box is on its f1 cable; TP=3: no relay
+        self.assertEqual(s.ring_args(), ['--ring', '--ring-devs', 'f1r1,f1r1,f0r1,f0r1'])
+        sups, res = self.boot(4, flipped([0, 1, 2, 3]))
+        self.assertEqual(res, ['ok'] * 4)
+        self.assertEqual(sups[0].ring_devs, 'f1r0,f1r1,f0r0,f0r1')
         sups, res = self.boot(3, flipped([0, 1, 2]), extra=('--ring-devs', 'a,b,c,d'))
         self.assertEqual(res, ['ok'] * 3)
         self.assertIsNone(sups[0].ring_devs)
