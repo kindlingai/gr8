@@ -10,7 +10,7 @@ use super::verbs::{self, Cq, Device, Mr, Pd, Qp, QpEnd, SendWr, Sge, Wc};
 use crate::tier::{AlignedBuf, BlockStore};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -53,11 +53,29 @@ pub struct Opts {
     pub qp_timeout: u8,
     /// Work requests in flight per RDMA lane.
     pub depth: u32,
+    /// How long one call waits for the node (--kv-store-timeout): a TCP read or write, an RDMA completion (at most
+    /// RDMA_WAIT). A call that waits longer fails with ErrorKind::TimedOut and its lane is done.
+    pub timeout: Duration,
 }
+
+/// The longest an RDMA lane waits for a completion (before the timeout knob, the only wait).
+pub const RDMA_WAIT: Duration = Duration::from_secs(10);
+
+/// The timeout new leases take (g6kv_tier_timeout), in ms. 30 s by default.
+pub static TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 
 impl Opts {
     pub fn new(name: &str, block_bytes: usize, blocks: u64) -> Opts {
-        Opts { name: name.into(), block_bytes, blocks, lanes: 4, want: Want::Auto, qp_timeout: 14, depth: 256 }
+        Opts {
+            name: name.into(),
+            block_bytes,
+            blocks,
+            lanes: 4,
+            want: Want::Auto,
+            qp_timeout: 14,
+            depth: 256,
+            timeout: Duration::from_millis(TIMEOUT_MS.load(Ordering::Relaxed).max(1)),
+        }
     }
 }
 
@@ -74,11 +92,35 @@ struct RdmaLane {
     staging: AlignedBuf,
     staging_mr: Mr,
     broken: bool,
+    wait: Duration,
 }
 
 enum Lane {
     Tcp(TcpStream),
     Rdma(RdmaLane),
+}
+
+/// A TCP call that failed on the socket (a timeout, a reset, an early end) left its lane mid-frame: shut it, so every
+/// later call on it fails at once, and name a timeout as one (a read timeout is EAGAIN to the kernel). The node's own
+/// error replies (proto::reply) leave the lane clean.
+fn tcp_done<T>(s: &TcpStream, t: Duration, r: io::Result<T>) -> io::Result<T> {
+    use io::ErrorKind as K;
+    r.map_err(|e| {
+        let timeout = matches!(e.kind(), K::WouldBlock | K::TimedOut);
+        if timeout
+            || matches!(
+                e.kind(),
+                K::UnexpectedEof | K::BrokenPipe | K::ConnectionReset | K::ConnectionAborted | K::NotConnected
+            )
+        {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        if timeout {
+            io::Error::new(K::TimedOut, format!("KV node timed out: no answer in {:.1} s", t.as_secs_f64()))
+        } else {
+            e
+        }
+    })
 }
 
 pub struct RemoteStore {
@@ -97,21 +139,29 @@ pub struct RemoteStore {
     pub fallback: Option<String>,
     /// The RDMA device and GID index this end uses.
     pub device: Option<(String, u32)>,
+    /// Opts::timeout
+    pub timeout: Duration,
 }
 
-fn connect(addr: &str) -> io::Result<TcpStream> {
+fn connect(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
     let a = addr
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{addr} resolves to nothing")))?;
     let s = TcpStream::connect_timeout(&a, Duration::from_secs(10))?;
     s.set_nodelay(true)?;
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+    {
+        use std::os::fd::AsRawFd;
+        super::sys::keepalive(s.as_raw_fd(), 10, 5, 4)?; // a silent dead node seen in <= 30 s
+    }
     Ok(s)
 }
 
 /// The node's STATS answer (JSON), without a lease.
 pub fn stats(addr: &str) -> io::Result<String> {
-    let mut s = connect(addr)?;
+    let mut s = connect(addr, Duration::from_secs(30))?;
     Header::new(proto::STATS, 0, 0, 0).write(&mut s)?;
     let h = proto::reply(&mut s)?;
     let mut j = vec![0u8; h.a as usize];
@@ -122,7 +172,7 @@ pub fn stats(addr: &str) -> io::Result<String> {
 impl RemoteStore {
     /// Opens a lease of `o.blocks` blocks on the node at `addr` (host:port).
     pub fn open(addr: &str, o: &Opts) -> io::Result<RemoteStore> {
-        let mut ctl = connect(addr)?;
+        let mut ctl = connect(addr, o.timeout)?;
         let (local, server) = (ctl.local_addr()?, ctl.peer_addr()?);
         Header::new(proto::OPEN, o.block_bytes as u64, o.blocks, o.name.len() as u64).write(&mut ctl)?;
         ctl.write_all(o.name.as_bytes())?;
@@ -142,7 +192,7 @@ impl RemoteStore {
             None => {
                 let mut ls = Vec::new();
                 for _ in 0..n {
-                    let mut s = connect(&server.to_string())?;
+                    let mut s = connect(&server.to_string(), o.timeout)?;
                     Header::new(proto::ATTACH, lease_id, 0, 0).write(&mut s)?;
                     s.write_all(&token)?;
                     proto::reply(&mut s)?;
@@ -165,6 +215,7 @@ impl RemoteStore {
             local,
             server,
             fallback,
+            timeout: o.timeout,
         })
     }
 
@@ -185,7 +236,7 @@ impl RemoteStore {
                 staging.as_slice().len(),
                 verbs::ACCESS_LOCAL_WRITE,
             )?;
-            ls.push(RdmaLane { qp, staging, staging_mr, broken: false });
+            ls.push(RdmaLane { qp, staging, staging_mr, broken: false, wait: o.timeout.min(RDMA_WAIT) });
         }
         Header::new(proto::RDMA, lanes as u64, dev.mtu as u64, dev.max_init_rd_atom as u64).write(ctl)?;
         let mut b = dev.gid.to_vec();
@@ -250,9 +301,12 @@ impl RemoteStore {
         let mut g = self.lane();
         match &mut *g {
             Lane::Tcp(s) => {
-                Header::new(proto::WRITE, off, buf.len() as u64, 0).write(s)?;
-                s.write_all(buf)?;
-                proto::reply(s).map(|_| ())
+                let r = (|| {
+                    Header::new(proto::WRITE, off, buf.len() as u64, 0).write(s)?;
+                    s.write_all(buf)?;
+                    proto::reply(s).map(|_| ())
+                })();
+                tcp_done(s, self.timeout, r)
             }
             Lane::Rdma(l) => {
                 let r = self.rdma.as_ref().expect("an RDMA lane has RDMA");
@@ -293,9 +347,12 @@ impl RemoteStore {
                     b.extend_from_slice(&o.to_le_bytes());
                     b.extend_from_slice(&(n as u64).to_le_bytes());
                 }
-                s.write_all(&b)?;
-                proto::reply(s)?;
-                s.read_exact(out)
+                let r = (|| {
+                    s.write_all(&b)?;
+                    proto::reply(s)?;
+                    s.read_exact(out)
+                })();
+                tcp_done(s, self.timeout, r)
             }
             Lane::Rdma(l) => {
                 let r = self.rdma.as_ref().expect("an RDMA lane has RDMA");
@@ -367,12 +424,15 @@ impl RemoteStore {
                     b.extend_from_slice(&o.to_le_bytes());
                     b.extend_from_slice(&(n as u64).to_le_bytes());
                 }
-                s.write_all(&b)?;
-                proto::reply(s)?;
-                for &(_, p, n) in ops {
-                    s.read_exact(std::slice::from_raw_parts_mut(p, n))?;
-                }
-                return Ok(());
+                let r = (|| {
+                    s.write_all(&b)?;
+                    proto::reply(s)?;
+                    for &(_, p, n) in ops {
+                        s.read_exact(std::slice::from_raw_parts_mut(p, n))?;
+                    }
+                    Ok(())
+                })();
+                return tcp_done(s, self.timeout, r);
             }
         }
         for &(o, p, n) in ops {
@@ -454,9 +514,12 @@ fn post_wait(l: &mut RdmaLane, r: &Rdma, opcode: u32, ops: &[(u64, u64, u32, u32
         }
         let got = l.qp.cq.poll(&mut wc)?;
         if got == 0 {
-            if idle.elapsed() > Duration::from_secs(10) {
+            if idle.elapsed() > l.wait {
                 l.broken = true;
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "no RDMA completion for 10 s"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("KV node timed out: no RDMA completion for {:.1} s", l.wait.as_secs_f64()),
+                ));
             }
             std::hint::spin_loop();
             continue;

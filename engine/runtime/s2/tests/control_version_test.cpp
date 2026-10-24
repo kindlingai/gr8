@@ -40,9 +40,9 @@ static bool boot(uint16_t port, const std::string& dir, unsigned version, std::s
 }
 
 int main() {
-    CHECK(CONTROL_VERSION == 6);
+    CHECK(CONTROL_VERSION == 8);
     BootstrapConfig c; c.runtime_signature = "x";
-    CHECK(c.agreement().find(" ctl 6\n") != std::string::npos);
+    CHECK(c.agreement().find(" ctl 8\n") != std::string::npos);
 
     char tmpl[] = "/tmp/ctlverXXXXXX"; const std::string dir = mkdtemp(tmpl);
     const uint16_t port = uint16_t(20000 + getpid() % 20000);

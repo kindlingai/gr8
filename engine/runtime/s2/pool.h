@@ -154,6 +154,13 @@ public:
     // nullptr, or why an index record could not be written (the pool is unchanged)
     const char* io_done() { Lock l(mu_); return g6kv_io_done(p_) ? g6kv_tier_error() : nullptr; }
     size_t io_pending() const { Lock l(mu_); return g6kv_io_pending(p_); }
+    // the tiers in mask failed on some rank under the last io()'s copies (every rank alike, after io_done): they drop
+    // everything and take nothing more. The entries dropped
+    uint64_t tier_dead(uint64_t mask) {
+        Lock l(mu_); const int64_t n = g6kv_tier_dead(p_, mask);
+        check(n < 0 ? int(n) : 0);
+        return uint64_t(n);
+    }
     std::vector<g6kv_tier_totals> tiers() const {
         Lock l(mu_);
         std::vector<g6kv_tier_totals> v;

@@ -104,9 +104,61 @@ static void parse_tests()
     CHECK(threw);
 }
 
+// --kv-store-fail soft (driver.h settle/rebind): a store failed under a grant's restore, so it prefills from row 0 again,
+// through rebind with reuse 0; a grant without restored rows, or a settle without a failure, keeps its reuse
+static void rebind_tests()
+{
+    Config c;
+    c.epoch = 1; c.mtp = 2; c.max_rows = 24; c.max_sessions = 8; c.prefill_rows = 64; c.two_lanes = false; c.pool_rows = 16 * 64;
+    for (int t = 0; t < 3; ++t) {
+        const bool restored = t != 1, failed = t != 2;
+        RunPool pool(16, 16, 16 * 64);
+        std::vector<Grant> rebound;
+        std::vector<uint32_t> firsts;
+        std::vector<int> out;
+        bool admitted = false;
+        DriverHooks h;
+        h.bind = [](const Grant&) {};
+        h.retire = [](const Slot&) {};
+        h.prefill = [&](const Slot&, const Payload&, uint32_t first, uint32_t) { firsts.push_back(first); };
+        std::unique_ptr<Driver> d;
+        h.run = [&](const s2::Step& st) {
+            std::vector<int> ids;
+            for (const auto& r : st.r) ids.push_back(model(r, st.kind, 1));   // salt: the request id, as solo()
+            return ids;
+        };
+        h.emit = [&](Key, const int* ids, int n, int) {
+            const int k = std::min<int>(n, int(20 - out.size()));
+            out.insert(out.end(), ids, ids + k);
+            return Emission{uint32_t(k), out.size() == 20};
+        };
+        h.finished = [&](const Slot& s) { pool.release(s.run); };
+        h.settle = [&] { const bool f = admitted && failed; admitted = false; return f; };
+        h.rebind = [&](const Grant& g) { rebound.push_back(g); };
+        d = std::make_unique<Driver>(c, h);
+        Req r; r.id = 1; r.max_tokens = 20;
+        for (int k = 0; k < 150; ++k) r.prompt.push_back(int(mix(1, k, 7) % V));
+        const Request rq{r.id, uint32_t(r.prompt.size()), r.max_tokens};
+        Commit cm;
+        cm.epoch = 1; cm.event = d->state().next_event(); cm.boundary = d->state().boundary();
+        cm.admit = Grant{d->state().next_key(), rq, pool.reserve(grant_rows(c, rq), reserve_rows(c, rq)), 100, restored ? 2u : 0u};
+        cm.before_hash = d->state().digest();
+        Payload p; p.prompt = r.prompt; p.chunk = 4;
+        d->apply(cm, &p);
+        admitted = true;
+        for (int k = 0; k < 400 && d->state().resident(); ++k) d->step();
+        const bool redo = restored && failed;
+        CHECK(rebound.size() == (redo ? 1u : 0u));
+        if (redo && rebound.size() == 1) CHECK(rebound[0].reuse == 0 && rebound[0].restored == 0 && rebound[0].key == cm.admit->key);
+        CHECK(!firsts.empty() && firsts[0] == (redo ? 0u : 100u));
+        CHECK(out == solo(r, int(c.mtp)));
+    }
+}
+
 int main()
 {
     parse_tests();
+    rebind_tests();
     Config c;
     c.epoch = 1; c.mtp = 2; c.max_rows = 24; c.max_sessions = 8; c.prefill_rows = 64; c.two_lanes = false;
     uint64_t seed = 1;

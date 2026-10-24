@@ -398,6 +398,18 @@ class KvStoreTests(unittest.TestCase):
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
+    def test_store_failure_and_timeout(self):
+        a = 'remote:192.0.2.5:7350,size=8G'
+        p = self.plan('--kv-store', a, '--kv-store-fail', 'hard', '--kv-store-timeout-s', '5')[1]
+        self.assertEqual((self.arg(p, '--kv-store-fail'), self.arg(p, '--kv-store-timeout')), ('hard', '5'))
+        p = self.plan('--kv-store', a)[1]
+        self.assertNotIn('--kv-store-fail', p['args'], 'the engine default (soft, 30 s) unless set')
+        self.assertNotIn('--kv-store-timeout', p['args'])
+        for flag, bad in (('--kv-store-fail', 'maybe'), ('--kv-store-timeout-s', '0'), ('--kv-store-timeout-s', '101'),
+                          ('--kv-store-timeout-s', 'x')):
+            with self.assertRaises(opt.OptionError):
+                self.plan('--kv-store', a, flag, bad)
+
     def test_kv_offload_is_the_local_ssd_store(self):
         # KV_OFFLOAD (local SSD offload) and KV_STORE=ssd: give the same engine plan
         _, old = self.plan('--kv-store', 'ssd:/data/kv,size=4G,persist=on,keep=system')

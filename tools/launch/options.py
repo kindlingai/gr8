@@ -86,6 +86,9 @@ KEYS = {
                                  '(every eviction). Default system'),
     'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
     'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
+    'KV_STORE_FAIL': ('cluster', None, 'what a failed store call does: soft (the store is dropped on every rank, its copies '
+                                       'become misses, the serve goes on) or hard (the serve stops). Default soft'),
+    'KV_STORE_TIMEOUT_S': ('cluster', None, 'seconds a KV node call waits before it fails (30; RDMA at most 10)'),
     'KV_ROWS': ('cluster', None, 'experimental: remote attention rows: the rows past SHARE_LIMIT in a rows store, read back '
                                  'as decode selects them. STORE,size=N(M|G|T)[,local=PAGES][,pool=SLOTS][,place=PAGES]'
                                  '[,fmt=fp8|int4]. STORE: remote:auto (the KV node from the mentat group), remote:HOST:PORT '
@@ -445,6 +448,11 @@ def validate(o):
     wl = o.get('KV_WRITE_LIMIT')
     if wl is not None and not re.fullmatch(r'\d+(\.\d+)?', str(wl)):
         raise OptionError(f'--kv-write-limit {wl}: want a number of page blocks per page computed, such as 0.25')
+    if o.get('KV_STORE_FAIL') not in (None, 'soft', 'hard'):
+        raise OptionError(f'--kv-store-fail {o.get("KV_STORE_FAIL")}: want soft or hard')
+    ts = o.get('KV_STORE_TIMEOUT_S')
+    if ts is not None and not (re.fullmatch(r'\d+(\.\d+)?', str(ts)) and 0 < float(ts) <= 100):
+        raise OptionError(f'--kv-store-timeout-s {ts}: want seconds, more than 0 and at most 100')
 
 
 def deprecated_kv(values, origin, warnings):

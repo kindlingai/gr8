@@ -366,6 +366,33 @@ fn a_full_tier_moves_its_oldest_entry_on() {
     }
 }
 
+// --kv-store-fail soft (tier_dead): a tier failed on some rank under copies of several drains between two barriers; the
+// entry one of those drains moved out of it is garbage there, whichever drain moved it
+#[test]
+fn a_dead_tier_takes_the_entries_moved_out_of_it_since_the_last_barrier() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(4, Keep::Evicted), (16, Keep::Evicted)], 3);
+    for c in 0..3 {
+        session(&mut r, &toks(10 + c, 200), 30);
+        flush(&mut r);
+        assert_eq!(r.pool.tier_dead(0).unwrap(), 0, "a barrier with every store well drops nothing");
+    }
+    let before = r.pool.stash().unwrap().entries(1).len();
+    // a session and a flush, several drains, one of them moving tier 0's entry on, and then the barrier: tier 0 failed
+    session(&mut r, &toks(13, 200), 30);
+    flush(&mut r);
+    assert_eq!(r.pool.stash().unwrap().entries(1).len(), before + 1, "a move from tier 0 into tier 1");
+    r.run_io(); // a later drain without copies (a growth) before the barrier
+    let n = r.pool.tier_dead(1).unwrap();
+    let s = r.pool.stash().unwrap();
+    assert!(s.entries(0).is_empty() && r.pool.tier_stats(0).unwrap().dead == 1);
+    assert_eq!(s.entries(1).len(), before, "the entry moved out of the dead tier goes too");
+    assert_eq!(n, 2);
+    // the dead tier takes nothing more: a new run's spill goes past it
+    session(&mut r, &toks(14, 200), 30);
+    flush(&mut r);
+    assert!(r.pool.stash().unwrap().entries(0).is_empty());
+}
+
 #[test]
 fn shared_prefixes_survive_a_restart_and_a_torn_record_does_not() {
     let dir = std::env::temp_dir().join(format!("g6kv-index-{}", std::process::id()));

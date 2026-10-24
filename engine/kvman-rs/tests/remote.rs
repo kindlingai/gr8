@@ -189,3 +189,99 @@ fn a_tier_spills_to_a_remote_store() {
     assert_eq!(t.free_slots(), 16);
     assert_eq!(t.store().blocks(), 16);
 }
+
+/// A forwarder between a client and the node that can freeze (stop moving bytes, the node SIGSTOPped) or cut every
+/// connection (the node killed).
+struct Proxy {
+    addr: String,
+    frozen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    conns: std::sync::Arc<std::sync::Mutex<Vec<TcpStream>>>,
+}
+
+impl Proxy {
+    fn new(node: &str) -> Proxy {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let frozen = Arc::new(AtomicBool::new(false));
+        let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let (node, f, cs) = (node.to_string(), frozen.clone(), conns.clone());
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(c) = c else { return };
+                let n = TcpStream::connect(&node).unwrap();
+                cs.lock().unwrap().extend([c.try_clone().unwrap(), n.try_clone().unwrap()]);
+                for (mut from, mut to) in [(c.try_clone().unwrap(), n.try_clone().unwrap()), (n, c)] {
+                    let f = f.clone();
+                    std::thread::spawn(move || {
+                        let mut b = vec![0u8; 1 << 16];
+                        loop {
+                            while f.load(Ordering::Relaxed) {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            match from.read(&mut b) {
+                                Ok(0) | Err(_) => break,
+                                Ok(k) => {
+                                    while f.load(Ordering::Relaxed) {
+                                        std::thread::sleep(std::time::Duration::from_millis(5));
+                                    }
+                                    if to.write_all(&b[..k]).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Proxy { addr, frozen, conns }
+    }
+    fn freeze(&self) {
+        self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn cut(&self) {
+        for c in self.conns.lock().unwrap().iter() {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+#[test]
+fn a_frozen_node_times_out_and_the_lane_stays_failed() {
+    let addr = node(4);
+    let p = Proxy::new(&addr);
+    let o = Opts { timeout: std::time::Duration::from_millis(500), ..opts("frozen", 8192, 8) };
+    let s = RemoteStore::open(&p.addr, &o).unwrap();
+    s.write_block(1, &fill(3, 1, 8192)).unwrap();
+    p.freeze();
+    let t0 = std::time::Instant::now();
+    let mut got = vec![0u8; 8192];
+    let e = s.read_block(1, &mut got).unwrap_err();
+    let took = t0.elapsed();
+    assert_eq!(e.kind(), ErrorKind::TimedOut, "{e}");
+    assert!(e.to_string().contains("timed out"), "{e}");
+    assert!(took >= std::time::Duration::from_millis(400) && took < std::time::Duration::from_secs(5), "{took:?}");
+    // every lane fails within the timeout too, and a lane that timed out fails at once after
+    for _ in 0..o.lanes + 2 {
+        let t0 = std::time::Instant::now();
+        assert!(s.write_block(2, &fill(3, 2, 8192)).is_err());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    }
+}
+
+#[test]
+fn a_killed_node_fails_calls_at_once() {
+    let addr = node(4);
+    let p = Proxy::new(&addr);
+    let s = RemoteStore::open(&p.addr, &opts("killed", 8192, 8)).unwrap();
+    s.write_block(0, &fill(4, 0, 8192)).unwrap();
+    p.cut();
+    let t0 = std::time::Instant::now();
+    let mut got = vec![0u8; 8192];
+    assert!(s.read_block(0, &mut got).is_err());
+    assert!(s.write_block(0, &got).is_err());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2), "{:?}", t0.elapsed());
+}

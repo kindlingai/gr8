@@ -182,6 +182,8 @@ pub struct TierStats {
     pub block_bytes: u64,
     /// write limit credit left, blocks (0 without a limit; the same on every tier)
     pub credit: i64,
+    /// 1 once the tier failed (tier_dead): it holds nothing and takes nothing from then on
+    pub dead: u64,
 }
 
 pub struct Tier {
@@ -192,6 +194,7 @@ pub struct Tier {
     index: Option<Index>,
     stats: TierStats,
     policy: Policy,
+    dead: bool,
 }
 
 impl Tier {
@@ -212,6 +215,11 @@ pub struct Stash {
     tiers: Vec<Tier>,
     pub(crate) io: Vec<Io>,
     taken: bool,
+    // the moves of the copies taken since the last tier_dead (tier, slot, to, to_slot): a tier that failed under them
+    // left garbage there. Kept across take_io calls once tier_dead runs at each barrier (--kv-store-fail soft: several
+    // drains can fall between two barriers); without it only the last take_io's
+    moved: Vec<(u32, u64, u32, u64)>,
+    settles: bool,
     commits: Vec<(usize, u64)>,
     counts: BTreeMap<u64, (u32, u64)>,
     counted: Vec<(u64, u32, u64)>, // counts since the last io_done, for the index
@@ -251,6 +259,8 @@ impl Stash {
             tiers: Vec::new(),
             io: Vec::new(),
             taken: false,
+            moved: Vec::new(),
+            settles: false,
             commits: Vec::new(),
             counts: BTreeMap::new(),
             counted: Vec::new(),
@@ -279,6 +289,7 @@ impl Stash {
             index: None,
             stats: TierStats::default(),
             policy: Policy::default(),
+            dead: false,
         };
         if let Some((ix, loaded)) = index {
             for e in loaded {
@@ -347,6 +358,7 @@ impl Stash {
             shared: x.entries.iter().filter(|e| e.kind.prefix()).count() as u32,
             block_bytes: x.policy.block_bytes,
             credit: if self.limit_milli > 0 { self.credit / 1000 } else { 0 },
+            dead: x.dead as u64,
             ..x.stats
         })
     }
@@ -370,7 +382,66 @@ impl Stash {
 
     pub(crate) fn take_io(&mut self) -> Vec<Io> {
         self.taken = !self.io.is_empty() || !self.commits.is_empty();
+        if !self.settles {
+            self.moved.clear();
+        }
+        for x in &self.io {
+            if let Io::Move { tier, slot, to, to_slot } = *x {
+                self.moved.push((tier, slot, to, to_slot));
+            }
+        }
         std::mem::take(&mut self.io)
+    }
+
+    /// The tiers in `mask` (bit t = tier t) failed under the copies last taken, on some rank (every rank calls this
+    /// alike, after io_done, from the mask the ranks agreed on). A dead tier drops every entry, and the runs stored on
+    /// its prefixes in other tiers, and takes nothing from then on. An entry the last copies moved out of a dead tier
+    /// holds whatever the failed read left: it goes too. Restores from those copies are the engine's to redo.
+    /// Returns the entries dropped.
+    /// A mask of 0 drops nothing: the barrier passed with every store well, and the moves so far are settled.
+    pub(crate) fn tier_dead(&mut self, mask: u64) -> u64 {
+        self.settles = true;
+        if mask == 0 {
+            self.moved.clear();
+            return 0;
+        }
+        let dead = |t: usize| t < 64 && mask >> t & 1 == 1;
+        let mut gone: Vec<(usize, u64)> = Vec::new();
+        for &(from, _, to, to_slot) in &self.moved {
+            if dead(from as usize) && !dead(to as usize) {
+                if let Some(e) = self.tiers[to as usize].entries.iter().find(|e| e.slots.contains(&to_slot)) {
+                    gone.push((to as usize, e.id));
+                }
+            }
+        }
+        for (t, tier) in self.tiers.iter_mut().enumerate() {
+            if dead(t) {
+                tier.dead = true;
+                gone.extend(tier.entries.iter().map(|e| (t, e.id)));
+            }
+        }
+        gone.sort();
+        gone.dedup();
+        let before: usize = self.tiers.iter().map(|t| t.entries.len()).sum();
+        for (t, id) in gone {
+            let Some(i) = self.tiers[t].entries.iter().position(|e| e.id == id) else { continue };
+            let e = self.tiers[t].entries.remove(i);
+            if let Some(ix) = &mut self.tiers[t].index {
+                if e.kind.prefix() && ix.drop(e.id).is_err() {
+                    self.index_errors += 1;
+                }
+            }
+            self.commits.retain(|c| *c != (t, e.id));
+            self.tiers[t].alloc.release(&e.slots);
+            self.tiers[t].stats.dropped += 1;
+            self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
+            if e.kind.prefix() {
+                self.drop_dependents(e.id);
+            }
+        }
+        self.moved.clear();
+        let after: usize = self.tiers.iter().map(|t| t.entries.len()).sum();
+        (before - after) as u64
     }
 
     /// The engine ran the copies io() gave it: commit the index records of the entries they wrote.
@@ -593,8 +664,8 @@ impl Stash {
         // a run that starts with a stored prefix stores only the pages after it. Else a prefix another run in the pool
         // holds becomes one, stored once, when a tier takes it
         let rows = st.valid.max(0) as u64;
-        if !self.tiers.iter().any(|t| t.keep.takes(kind) && t.admits(kind, rows, hits)) {
-            if let Some(t) = self.tiers.iter_mut().find(|t| t.keep.takes(kind)) {
+        if !self.tiers.iter().any(|t| !t.dead && t.keep.takes(kind) && t.admits(kind, rows, hits)) {
+            if let Some(t) = self.tiers.iter_mut().find(|t| !t.dead && t.keep.takes(kind)) {
                 t.stats.refused += 1;
                 t.stats.refused_pages += pages.len() as u64;
             }
@@ -696,7 +767,7 @@ impl Stash {
     fn place(&mut self, start: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Option<(usize, Vec<u64>)> {
         let mut refused = None;
         for t in start..self.tiers.len() {
-            if !self.tiers[t].keep.takes(kind) || n as u64 > self.tiers[t].slots {
+            if self.tiers[t].dead || !self.tiers[t].keep.takes(kind) || n as u64 > self.tiers[t].slots {
                 continue;
             }
             if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {
@@ -925,6 +996,9 @@ impl Stash {
         }
         for t in &self.tiers {
             h = mix(mix(h, t.slots), t.alloc.free());
+            if t.dead {
+                h = mix(h, 0xdead);
+            }
             for e in &t.entries {
                 h = mix(mix(mix(mix(h, e.id), e.key), e.st.valid as i64 as u64), slots_hash(&e.slots));
                 h = mix(mix(h, e.kind as u64), e.hits as u64);

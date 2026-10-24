@@ -34,7 +34,7 @@ readiness status and now returns JSON containing `ready` and `steering`; disable
 
 The internal replicated control codec changes from **G6S2E4 to G6S2E5**, including stock grants, because
 grants now carry identity. Encoder and decoder change together and reject old, truncated or malformed
-frames. Deploy the same engine build on every rank; do not mix E4 and E5. (G6S2E6 since the commit frame gained its hold field; the bootstrap agreement carries `ctl 6`, so mixed builds refuse at bootstrap.) Scheduler agreement hashes
+frames. Deploy the same engine build on every rank; do not mix E4 and E5. (G6S2E6 since the commit frame gained its hold field, G6S2E8 since the barrier frames carry a word; the bootstrap agreement carries `ctl 8`, so mixed builds refuse at bootstrap.) Scheduler agreement hashes
 include boot and live-request identities. This is independent of the Unix JSON protocol's version 1.
 
 ## Cache and model inputs

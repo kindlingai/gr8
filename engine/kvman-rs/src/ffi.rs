@@ -718,6 +718,19 @@ pub unsafe extern "C" fn g6kv_io_done(p: *mut Pool) -> i32 {
     }
 }
 
+/// The tiers in `mask` failed on some rank under the last copies (Pool::tier_dead): the entries dropped, or a negative
+/// error (PendingIo before g6kv_io_done).
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_dead(p: *mut Pool, mask: u64) -> i64 {
+    match (*p).tier_dead(mask) {
+        Ok(n) => n as i64,
+        Err(e) => e.code() as i64,
+    }
+}
+
 /// Tier t's counters, or BadArgument when there is no such tier.
 ///
 /// # Safety

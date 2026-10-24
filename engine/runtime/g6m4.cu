@@ -180,6 +180,8 @@ int main(int argc, char** argv)
     std::string kv_keep;                // --kv-keep system|sessions|all
     int kv_system_after = 2;            // --kv-system-after
     double kv_write_limit = 0;          // --kv-write-limit F
+    std::string kv_fail = "soft";       // --kv-store-fail soft|hard: a failed store call drops the store, or stops the serve
+    double kv_timeout = 30;             // --kv-store-timeout S: how long a KV node call waits
     std::string kv_format;              // --kv-format fp8|int4: which latent row this binary was built for (refused otherwise)
     bool kv_old = false, kv_old_all = false;   // a deprecated --kv-tier, and whether one kept evicted runs
     std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
@@ -220,6 +222,8 @@ int main(int argc, char** argv)
         else if (a == "--kv-keep") kv_keep = next();
         else if (a == "--kv-system-after") kv_system_after = atoi(next().c_str());
         else if (a == "--kv-write-limit") kv_write_limit = atof(next().c_str());
+        else if (a == "--kv-store-fail") kv_fail = next();
+        else if (a == "--kv-store-timeout") kv_timeout = atof(next().c_str());
         else if (a == "--kv-format") kv_format = next();
         else if (a == "--kv-tier")
         {
@@ -452,6 +456,8 @@ int main(int argc, char** argv)
     if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep system, sessions or all");
     if (kv_system_after < 1) die("--kv-system-after N: N >= 1");
     if (!(kv_write_limit >= 0) || kv_write_limit > 1000) die("--kv-write-limit F: 0 (off) to 1000 blocks per page computed");
+    if (kv_fail != "soft" && kv_fail != "hard") die("--kv-store-fail soft or hard");
+    if (!(kv_timeout > 0) || kv_timeout > 100) die("--kv-store-timeout S: more than 0, at most 100 s (the control timeout, G6_S2_TIMEOUT, is 120 s)");
     {   // the KV row is fixed at build time (attn/kvfmt.h): the launcher runs bin/g6m4 for fp8 and bin/g6m4-int4 for int4,
         // and each binary refuses the other's format. The int4 build needs the flag, so it never starts by accident.
 #if defined(G6_KV4) && G6_KV4
@@ -1475,6 +1481,9 @@ int main(int argc, char** argv)
             try
             {
                 kvt.reset(new g6s2::KvTiers(bs));
+                kvt->faults.soft = kv_fail == "soft";
+                kvt->faults.rank = R;
+                g6kv_tier_timeout(kv_timeout);
                 pool.stores((uint32_t)kv_system_after);
                 for (size_t i = 0; i < kv_tiers.size(); ++i)
                 {
@@ -1551,17 +1560,18 @@ int main(int argc, char** argv)
             for (size_t i = 0; i < ts.size(); ++i)
             {
                 const auto &a = kv_logged[i], &b = ts[i];
-                if (b.full == a.full && b.moved_out == a.moved_out && b.dropped == a.dropped && b.refused == a.refused) continue;
+                if (b.full == a.full && b.moved_out == a.moved_out && b.dropped == a.dropped && b.refused == a.refused && b.dead == a.dead) continue;
                 const double gb = b.block_bytes / 1e9;
                 fprintf(stderr, "# s2 store %zu: %llu of %llu blocks used, %u entries (%u prefixes); in the last %.0f s: %.1f GB spilled, "
                                 "%.1f GB restored, full %llu times, %llu entries (%.1f GB) passed on, %llu (%.1f GB) dropped, %llu (%.1f GB) "
-                                "refused by the keep policy or write limit\n",
+                                "refused by the keep policy or write limit%s\n",
                         i, (unsigned long long)(b.slots - b.free_slots), (unsigned long long)b.slots, b.entries, b.shared,
                         std::chrono::duration<double>(now - kv_last_log).count(), (b.spilled_pages - a.spilled_pages) * gb,
                         (b.restored_pages - a.restored_pages) * gb, (unsigned long long)(b.full - a.full),
                         (unsigned long long)(b.moved_out - a.moved_out), (b.moved_out_pages - a.moved_out_pages) * gb,
                         (unsigned long long)(b.dropped - a.dropped), (b.dropped_pages - a.dropped_pages) * gb,
-                        (unsigned long long)(b.refused - a.refused), (b.refused_pages - a.refused_pages) * gb);
+                        (unsigned long long)(b.refused - a.refused), (b.refused_pages - a.refused_pages) * gb,
+                        b.dead ? "; DEAD (a store call failed, --kv-store-fail soft): it holds and takes nothing" : "");
                 any = true;
             }
             if (any) { kv_logged = ts; kv_last_log = now; kv_logged_once = true; }
@@ -1967,6 +1977,20 @@ int main(int argc, char** argv)
             };
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
+            if (kvt && kvt->faults.soft)
+            {
+                h.store_faults = [&] { return kvt->faults.take(); };
+                // every rank at the same barrier with the same mask: the pool drops the tiers alike, and this rank stops
+                // calling them too
+                h.stores_dead = [&](uint64_t mask) {
+                    kvt->faults.agreed(mask);
+                    const uint64_t n = pool.tier_dead(mask);
+                    if (!mask) return;
+                    fprintf(stderr, "# rank %d: s2 stores dead (mask 0x%llx): %llu entries dropped; %llu failed store calls here, %llu timed out\n", R,
+                            (unsigned long long)mask, (unsigned long long)n, (unsigned long long)kvt->faults.failed.load(),
+                            (unsigned long long)kvt->faults.timeouts.load());
+                };
+            }
             h.dispatch = nd.hooks();
             if (dfl)
             {

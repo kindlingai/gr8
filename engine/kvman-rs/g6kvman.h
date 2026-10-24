@@ -162,7 +162,14 @@ struct g6kv_tier_totals
     uint64_t full;                       // times the tier had to make room
     uint64_t block_bytes;
     int64_t credit;                      // write limit credit left, blocks (0 without a limit)
+    uint64_t dead;                       // 1 once the tier failed (g6kv_tier_dead): it holds and takes nothing
 };
+// the tiers in mask (bit t = tier t) failed on some rank under the last copies: every rank calls this alike, after
+// g6kv_io_done. A dead tier drops its entries (and the runs stored on its prefixes elsewhere) and takes nothing from
+// then on; an entry the last copies moved out of it goes too. The restores of those copies are the engine's to redo.
+// A mask of 0 at every barrier (soft mode) settles the copies so far: the moves tracked for a dead tier are kept from one
+// barrier to the next, not only the last copies'. Returns the entries dropped, or a negative error.
+int64_t g6kv_tier_dead(g6kv_pool* p, uint64_t mask);
 // tier t's counters, or an error when there is no such tier
 int g6kv_tier_stats(const g6kv_pool* p, uint32_t t, g6kv_tier_totals* out);
 // writes into buf the entries loaded from indexes, one line each. The ranks compare these lines at boot. Returns the
@@ -176,6 +183,9 @@ void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 // write moves one whole block. Calls return 0, or -1 with the reason in g6kv_tier_error (this thread's last).
 struct g6kv_tier;
 int g6kv_tier_open(const char* spec, const char* name, uint64_t block_bytes, uint64_t blocks, g6kv_tier** out);
+// how long a call on a KV node lease opened after this waits for the node: a TCP read or write, an RDMA completion (at
+// most 10 s). Past it the call fails with "KV node timed out" and its lane is done. 30 s until set.
+void g6kv_tier_timeout(double seconds);
 void g6kv_tier_free(g6kv_tier* t);
 const char* g6kv_tier_error();
 uint64_t g6kv_tier_block_bytes(const g6kv_tier* t);

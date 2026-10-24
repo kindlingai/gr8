@@ -75,10 +75,12 @@ inline RequestBytes decode_request(const std::vector<uint8_t>& b){
 inline std::vector<uint8_t> encode_quit(uint64_t epoch){Encoder e(Tag::Quit);e.u64(epoch);return e.b;}
 inline uint64_t decode_quit(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Quit,"expected quit");auto e=d.u64();d.end();return e;}
 // A barrier between rounds (EventEndpoint::sync): each worker sends Sync with the barrier's number, the head answers Go
-// once every worker has. No tensors, no event: it only lines the ranks up in time.
-struct SyncFrame { uint64_t epoch = 0; unsigned rank = 0; uint64_t seq = 0; };
-inline std::vector<uint8_t> encode(const SyncFrame& s){Encoder e(Tag::Sync);e.u64(s.epoch);e.u64(s.rank);e.u64(s.seq);return e.b;}
-inline SyncFrame decode_sync(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Sync,"expected sync");SyncFrame s;s.epoch=d.u64();s.rank=d.u32();s.seq=d.u64();d.end();return s;}
-inline std::vector<uint8_t> encode_go(uint64_t epoch,uint64_t seq){Encoder e(Tag::Go);e.u64(epoch);e.u64(seq);return e.b;}
-inline std::pair<uint64_t,uint64_t> decode_go(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Go,"expected go");auto e=d.u64();auto q=d.u64();d.end();return {e,q};}
+// once every worker has. No tensors, no event: it lines the ranks up in time, and carries one word every rank ORs in
+// (the tiers whose store failed on that rank, kv_fault.h), so every rank leaves with the same word.
+struct SyncFrame { uint64_t epoch = 0; unsigned rank = 0; uint64_t seq = 0; uint64_t mask = 0; };
+inline std::vector<uint8_t> encode(const SyncFrame& s){Encoder e(Tag::Sync);e.u64(s.epoch);e.u64(s.rank);e.u64(s.seq);e.u64(s.mask);return e.b;}
+inline SyncFrame decode_sync(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Sync,"expected sync");SyncFrame s;s.epoch=d.u64();s.rank=d.u32();s.seq=d.u64();s.mask=d.u64();d.end();return s;}
+struct GoFrame { uint64_t epoch = 0, seq = 0, mask = 0; };
+inline std::vector<uint8_t> encode_go(uint64_t epoch,uint64_t seq,uint64_t mask=0){Encoder e(Tag::Go);e.u64(epoch);e.u64(seq);e.u64(mask);return e.b;}
+inline GoFrame decode_go(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Go,"expected go");GoFrame g;g.epoch=d.u64();g.seq=d.u64();g.mask=d.u64();d.end();return g;}
 } // namespace g6s2
