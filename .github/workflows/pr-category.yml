@@ -31,7 +31,7 @@ jobs:
             const issue_number = pr.number;
             const marker = "<!-- pr-category-bot -->";
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
-            const mine = comments.find(c => c.body.includes(marker));
+            const mine = comments.find(c => c.user.login === "github-actions[bot]" && c.body.includes(marker));
 
             for (const [, name, color] of cats) {
               await github.rest.issues.createLabel({ owner, repo, name, color }).catch(() => {});
