@@ -23,6 +23,7 @@ import urllib.request
 import fabric
 import handshake
 import hfsource
+import mlsource
 import mentat
 import models
 import modelset
@@ -150,8 +151,11 @@ def resolve_model(o, refresh=False, log=log):
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
-            release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
-                                       layout=o.get('LAYOUT'))
+            if o.get('FETCH') == 'model-loader':
+                release = mlsource.of(o, *hf, log=log)
+            else:
+                release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
+                                           layout=o.get('LAYOUT'))
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir
@@ -551,7 +555,7 @@ class Supervisor:
                 pass
             elif copy:
                 rel = self.ms.release
-                if rel and rel.check(int(o.get('TP')), self.rank, self.variant):
+                if rel and (getattr(rel, 'pins', False) or rel.check(int(o.get('TP')), self.rank, self.variant)):
                     rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
                 if self.ms.drafter and self.ms.drafter.check(self.rank):
                     self.ms.drafter.fetch_rank(self.rank)
