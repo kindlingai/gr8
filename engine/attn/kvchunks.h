@@ -5,7 +5,7 @@
 // share stays while either is online, so a shrink returns slightly less than the chunks' bytes.
 // The address never moves, so block tables, kernels and captured CUDA graphs keep working across a resize, as long as
 // no kernel reads an offline page (the pool hands none out). Pages that come back read as zero.
-// Host only; calls the CUDA driver API (link -lcuda). Not thread safe. Order: run the pool's queued spills (io())
+// Host only; calls the CUDA driver API (through cudaGetDriverEntryPointByVersion, no -lcuda). Not thread safe. Order: run the pool's queued spills (io())
 // before a sync that releases their pages, and sync before the pool's grow_pool() hands the pages out.
 #pragma once
 #include <cstddef>

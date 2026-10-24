@@ -45,7 +45,7 @@ nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pac
 # Flash: the kvchunks regions of G6_FLASH_KV_CHUNKS (runtime/flash_kv.h), one object for every width
 KVC=
 if [ "$ATTN_CU" = ../attn/flash_attn.cu ]; then
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -c ../attn/kvchunks.cu -o $O/kvchunks.o; KVC="$O/kvchunks.o -lcuda"
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -c ../attn/kvchunks.cu -o $O/kvchunks.o; KVC="$O/kvchunks.o"
 fi
 nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
 if [ "$WHAT" = dfl ]; then

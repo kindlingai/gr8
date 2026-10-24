@@ -1,8 +1,45 @@
 #include "kvchunks.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <mutex>
 #include <utility>
 #include <vector>
+
+// The driver calls below come through cudaGetDriverEntryPointByVersion (as engine/vmm.h), not linked with -lcuda: a
+// binary that links libcuda.so.1 does not start where there is no driver (a build container), even with
+// G6_FLASH_KV_CHUNKS=0, which never calls them.
+namespace {
+#define G6_KVC_DRIVER(X) X(cuMemCreate) X(cuMemMap) X(cuMemUnmap) X(cuMemRelease) X(cuMemSetAccess) \
+    X(cuMemsetD8Async) X(cuMemGetAllocationGranularity) X(cuMemAddressReserve) X(cuMemAddressFree) \
+    X(cuStreamSynchronize) X(cuCtxSynchronize)
+struct Driver {
+#define G6_KVC_PTR(f) decltype(&::f) f = nullptr;
+    G6_KVC_DRIVER(G6_KVC_PTR)
+#undef G6_KVC_PTR
+    CUresult status = CUDA_ERROR_NOT_INITIALIZED;
+};
+// every entry point, or the first one missing (its status, CUDA_ERROR_NOT_FOUND)
+const Driver& drv() {
+    static Driver d;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        d.status = CUDA_SUCCESS;
+#define G6_KVC_GET(f)                                                                                                  \
+        if (d.status == CUDA_SUCCESS) {                                                                                \
+            void* p = nullptr;                                                                                         \
+            cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;                                    \
+            if (cudaGetDriverEntryPointByVersion(#f, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||               \
+                q != cudaDriverEntryPointSuccess || !p)                                                                \
+                d.status = CUDA_ERROR_NOT_FOUND;                                                                       \
+            else d.f = reinterpret_cast<decltype(d.f)>(p);                                                             \
+        }
+        G6_KVC_DRIVER(G6_KVC_GET)
+#undef G6_KVC_GET
+    });
+    return d;
+}
+#undef G6_KVC_DRIVER
+}
 
 struct G6KvChunks {
     CUdeviceptr base = 0;
@@ -23,28 +60,28 @@ CUmemAllocationProp prop(int device) {
 int back(G6KvChunks* c, size_t g, CUstream s) {
     CUmemAllocationProp p = prop(c->device);
     CUmemGenericAllocationHandle h = 0;
-    CUresult r = cuMemCreate(&h, c->gran, &p, 0);
+    CUresult r = drv().cuMemCreate(&h, c->gran, &p, 0);
     if (r != CUDA_SUCCESS) return (int)r;
     const CUdeviceptr at = c->base + g * c->gran;
-    r = cuMemMap(at, c->gran, 0, h, 0);
-    if (r != CUDA_SUCCESS) { cuMemRelease(h); return (int)r; }
+    r = drv().cuMemMap(at, c->gran, 0, h, 0);
+    if (r != CUDA_SUCCESS) { drv().cuMemRelease(h); return (int)r; }
     CUmemAccessDesc a{};
     a.location = p.location;
     a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    r = cuMemSetAccess(at, c->gran, &a, 1);
-    if (r == CUDA_SUCCESS) r = cuMemsetD8Async(at, 0, c->gran, s);
-    if (r != CUDA_SUCCESS) { cuMemUnmap(at, c->gran); cuMemRelease(h); return (int)r; }
+    r = drv().cuMemSetAccess(at, c->gran, &a, 1);
+    if (r == CUDA_SUCCESS) r = drv().cuMemsetD8Async(at, 0, c->gran, s);
+    if (r != CUDA_SUCCESS) { drv().cuMemUnmap(at, c->gran); drv().cuMemRelease(h); return (int)r; }
     c->h[g] = h;
     c->on[g] = 1;
     return 0;
 }
 int drop(G6KvChunks* c, size_t g) {
     const CUdeviceptr at = c->base + g * c->gran;
-    CUresult r = cuMemUnmap(at, c->gran);
+    CUresult r = drv().cuMemUnmap(at, c->gran);
     if (r != CUDA_SUCCESS) return (int)r;
     // unmapped: the granule is gone from the region whatever the release says (a failed release leaks the handle)
     c->on[g] = 0;
-    r = cuMemRelease(std::exchange(c->h[g], 0));
+    r = drv().cuMemRelease(std::exchange(c->h[g], 0));
     return (int)r;
 }
 }
@@ -54,14 +91,15 @@ namespace {
 int create(G6KvChunks** out, size_t bytes, int device, bool all) {
     if (!out || !bytes) return (int)CUDA_ERROR_INVALID_VALUE;
     cudaFree(nullptr);   // the runtime's primary context, current on this thread
+    if (drv().status != CUDA_SUCCESS) return (int)drv().status;
     G6KvChunks* c = new G6KvChunks;
     c->bytes = bytes;
     c->device = device;
     CUmemAllocationProp p = prop(device);
-    CUresult r = cuMemGetAllocationGranularity(&c->gran, &p, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    CUresult r = drv().cuMemGetAllocationGranularity(&c->gran, &p, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
     if (r == CUDA_SUCCESS) {
         c->reserved = (bytes + c->gran - 1) / c->gran * c->gran;
-        r = cuMemAddressReserve(&c->base, c->reserved, c->gran, 0, 0);
+        r = drv().cuMemAddressReserve(&c->base, c->reserved, c->gran, 0, 0);
     }
     if (r != CUDA_SUCCESS) { delete c; return (int)r; }
     const size_t n = c->reserved / c->gran;
@@ -71,7 +109,7 @@ int create(G6KvChunks** out, size_t bytes, int device, bool all) {
         int e = back(c, g, 0);
         if (e) { g6_kvc_free(c); return e; }
     }
-    r = cuStreamSynchronize(0);
+    r = drv().cuStreamSynchronize(0);
     if (r != CUDA_SUCCESS) { g6_kvc_free(c); return (int)r; }
     *out = c;
     return 0;
@@ -97,7 +135,7 @@ extern "C" int g6_kvc_zero(G6KvChunks* c, void* stream) {
         if (!c->on[g]) { ++g; continue; }
         size_t e = g;
         while (e < c->on.size() && c->on[e]) ++e;
-        CUresult r = cuMemsetD8Async(c->base + g * c->gran, 0, (e - g) * c->gran, (CUstream)stream);
+        CUresult r = drv().cuMemsetD8Async(c->base + g * c->gran, 0, (e - g) * c->gran, (CUstream)stream);
         if (r != CUDA_SUCCESS) return (int)r;
         g = e;
     }
@@ -106,10 +144,10 @@ extern "C" int g6_kvc_zero(G6KvChunks* c, void* stream) {
 
 extern "C" void g6_kvc_free(G6KvChunks* c) {
     if (!c) return;
-    cuCtxSynchronize();
+    drv().cuCtxSynchronize();
     for (size_t g = 0; g < c->h.size(); ++g)
         if (c->on[g]) drop(c, g);
-    if (c->base) cuMemAddressFree(c->base, c->reserved);
+    if (c->base) drv().cuMemAddressFree(c->base, c->reserved);
     delete c;
 }
 
@@ -118,9 +156,10 @@ extern "C" size_t g6_kvc_bytes(const G6KvChunks* c) { return c ? c->bytes : 0; }
 extern "C" size_t g6_kvc_granule(const G6KvChunks* c) { return c ? c->gran : 0; }
 extern "C" size_t g6_kvc_device_granule(int device) {
     cudaFree(nullptr);
+    if (drv().status != CUDA_SUCCESS) return 0;
     CUmemAllocationProp p = prop(device);
     size_t g = 0;
-    return cuMemGetAllocationGranularity(&g, &p, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS ? g : 0;
+    return drv().cuMemGetAllocationGranularity(&g, &p, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS ? g : 0;
 }
 extern "C" size_t g6_kvc_backed(const G6KvChunks* c) {
     size_t n = 0;
@@ -150,7 +189,7 @@ extern "C" int g6_kvc_sync(G6KvChunks* c, size_t page_bytes, uint32_t chunk_page
     if (mapped) *mapped = 0;
     if (released) *released = 0;
     // nothing on any stream may still read a granule that goes
-    CUresult r = cuCtxSynchronize();
+    CUresult r = drv().cuCtxSynchronize();
     if (r != CUDA_SUCCESS) return (int)r;
     for (size_t g = 0; g < n; ++g) {
         if (need[g] && !c->on[g]) {
@@ -165,5 +204,5 @@ extern "C" int g6_kvc_sync(G6KvChunks* c, size_t page_bytes, uint32_t chunk_page
             if (e) return e;
         }
     }
-    return (int)cuStreamSynchronize(s);
+    return (int)drv().cuStreamSynchronize(s);
 }
