@@ -162,6 +162,7 @@ struct g6kv_tier_totals
     uint64_t full;                       // times the tier had to make room
     uint64_t block_bytes;
     int64_t credit;                      // write limit credit left, blocks (0 without a limit)
+    uint64_t oversize, oversize_last;    // entries bigger than the whole tier, and the last one's pages
 };
 // tier t's counters, or an error when there is no such tier
 int g6kv_tier_stats(const g6kv_pool* p, uint32_t t, g6kv_tier_totals* out);
@@ -240,16 +241,20 @@ uint64_t g6kv_store_blocks(const g6kv_tier* t);
 // a group lease's blocks per segment and segments now; 0 for any other store
 uint64_t g6kv_store_seg_blocks(const g6kv_tier* t);
 uint64_t g6kv_store_segs(const g6kv_tier* t);
-// the node's answer to a report, in segments per rank: every rank grows by grant, or shrinks by give
+// the node's answer to a report, in segments per rank: every rank grows by grant, or shrinks by give, under txn
 struct g6kv_report
 {
     uint64_t grant, give, unclaimed;
+    uint64_t txn;   // the transaction every rank names in g6kv_store_grow / g6kv_store_shrink; 0 = nothing to do
 };
 // rank 0 only: want = segments more per rank (0 = none), ages = g6kv_tier_coldest's
 int g6kv_store_report(const g6kv_tier* t, uint64_t want, const uint64_t* ages, size_t n, g6kv_report* out);
-// grow by n segments / shrink to segs segments; the store's blocks after it in *blocks (or NULL)
-int g6kv_store_grow(const g6kv_tier* t, uint64_t n, uint64_t* blocks);
-int g6kv_store_shrink(const g6kv_tier* t, uint64_t segs, uint64_t* blocks);
+// grow to segs segments / shrink to segs segments, under the report's transaction txn; the store's blocks after it in
+// *blocks (or NULL). 0; G6KV_STORE_REFUSED: the node refused (a transaction no longer open, or no room), every rank
+// alike, and the store keeps its size; -1 with g6kv_tier_error: a fault
+#define G6KV_STORE_REFUSED 1
+int g6kv_store_grow(const g6kv_tier* t, uint64_t segs, uint64_t txn, uint64_t* blocks);
+int g6kv_store_shrink(const g6kv_tier* t, uint64_t segs, uint64_t txn, uint64_t* blocks);
 // A session's KV in a form independent of the layout (src/canon.rs, #152): per binding and token, in order, the MLA
 // latent row and, on full-index layers, the indexer key row (128 codes, then its FP32 scale). Host memory only: the
 // caller copies the pages between the device and the buffers. flags[b]: 1 = binding b has index keys, 2 = its cache is

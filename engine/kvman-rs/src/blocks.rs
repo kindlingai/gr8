@@ -391,6 +391,7 @@ pub struct G6kvReport {
     pub grant: u64,
     pub give: u64,
     pub unclaimed: u64,
+    pub txn: u64,
 }
 
 /// The head's report to the node (rank 0 only): `want` segments more per rank (0 = none), and `n` ages in ms of its
@@ -412,46 +413,70 @@ pub unsafe extern "C" fn g6kv_store_report(
     let ages = if n == 0 { &[][..] } else { std::slice::from_raw_parts(ages, n) };
     match (*t).remote().and_then(|r| r.report(want, ages)) {
         Ok(x) => {
-            *out = G6kvReport { grant: x.grant, give: x.give, unclaimed: x.unclaimed };
+            *out = G6kvReport { grant: x.grant, give: x.give, unclaimed: x.unclaimed, txn: x.txn };
             0
         }
         Err(e) => fail(e),
     }
 }
 
-/// Grows a group lease by `n` segments; the store's blocks after it in `*blocks`. Then g6kv_tier_resize the tier to
-/// them. 0, or -1 with g6kv_tier_error.
+/// The node refused a GROW or SHRINK (a transaction it no longer has open, or no room): the store keeps its size.
+/// Every rank gets the same answer, so the cluster stays in lock step.
+pub const STORE_REFUSED: i32 = 1;
+
+fn refused(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::StaleNetworkFileHandle | io::ErrorKind::OutOfMemory)
+}
+
+/// Grows a group lease to `segs` segments under transaction `txn` (g6kv_store_report's); the store's blocks after it
+/// in `*blocks`. Then g6kv_tier_resize the tier to them. 0, 1 (STORE_REFUSED, with g6kv_tier_error) or -1.
 ///
 /// # Safety
 /// `t` must be a live store and `blocks` valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_store_grow(t: *const Blocks, n: u64, blocks: *mut u64) -> i32 {
-    match (*t).remote().and_then(|r| r.grow(n)) {
+pub unsafe extern "C" fn g6kv_store_grow(t: *const Blocks, segs: u64, txn: u64, blocks: *mut u64) -> i32 {
+    match (*t).remote().and_then(|r| r.grow(segs, txn)) {
         Ok(b) => {
             if !blocks.is_null() {
                 *blocks = b;
             }
             0
         }
-        Err(e) => fail(e),
+        Err(e) => {
+            let r = refused(&e);
+            let c = fail(e);
+            if r {
+                STORE_REFUSED
+            } else {
+                c
+            }
+        }
     }
 }
 
-/// Shrinks a group lease to its first `segs` segments; the blocks after it in `*blocks`. Only after the tier was
-/// resized below them (g6kv_tier_resize) and its copies ran: nothing may touch the blocks past them. 0, or -1 with
-/// g6kv_tier_error.
+/// Shrinks a group lease to its first `segs` segments under the give `txn`; the blocks after it in `*blocks`. Only
+/// after the tier was resized below them (g6kv_tier_resize) and its copies ran: nothing may touch the blocks past them.
+/// 0, 1 (STORE_REFUSED, with g6kv_tier_error) or -1.
 ///
 /// # Safety
 /// `t` must be a live store and `blocks` valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_store_shrink(t: *const Blocks, segs: u64, blocks: *mut u64) -> i32 {
-    match (*t).remote().and_then(|r| r.shrink(segs)) {
+pub unsafe extern "C" fn g6kv_store_shrink(t: *const Blocks, segs: u64, txn: u64, blocks: *mut u64) -> i32 {
+    match (*t).remote().and_then(|r| r.shrink(segs, txn)) {
         Ok(b) => {
             if !blocks.is_null() {
                 *blocks = b;
             }
             0
         }
-        Err(e) => fail(e),
+        Err(e) => {
+            let r = refused(&e);
+            let c = fail(e);
+            if r {
+                STORE_REFUSED
+            } else {
+                c
+            }
+        }
     }
 }

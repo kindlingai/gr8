@@ -1972,8 +1972,8 @@ int main(int argc, char** argv)
             h.fence = [&] { nd.synchronize(); };
             if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
             // a tier on a group lease (--kv-store group=): every rank resizes it at the Resize commit; the head reports
-            // to the node, asking for 2 segments more a rank when the tier filled since its last report or a spill
-            // left less free than an entry holds (s2/kv_share.h share_want: ask before the next spill drops an entry),
+            // to the node, asking for the segments an oversize entry, the pages the tier pushed out since its last
+            // report, or the next spill would need (s2/kv_share.h share_want: ask before the next spill drops an entry),
             // and announces what the node grants or asks back
             std::vector<uint32_t> kv_groups;
             for (size_t i = 0; kvt && i < kvt->size(); ++i) if (kvt->group(i)) kv_groups.push_back((uint32_t)i);
@@ -1983,8 +1983,8 @@ int main(int argc, char** argv)
             {
                 h.resize = [&](const g6s2::Resize& r) {
                     if (!g6s2::share_apply(pool, kvt->store(r.tier), r, kv_drain))
-                        fprintf(stderr, "# rank %d: s2 share: tier %u refused to shrink to %llu blocks, the lease keeps its size\n", R, r.tier,
-                                (unsigned long long)r.slots);
+                        fprintf(stderr, "# rank %d: s2 share: tier %u to %llu blocks refused (transaction %llu), the lease keeps its size: %s\n", R,
+                                r.tier, (unsigned long long)r.slots, (unsigned long long)r.txn, g6kv_tier_error());
                     else
                         fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
                                 (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
@@ -1995,7 +1995,7 @@ int main(int argc, char** argv)
                         const size_t k = kv_next_group++ % kv_groups.size();
                         const uint32_t t = kv_groups[k];
                         const g6kv_tier_totals now = pool.tiers().at(t);
-                        const uint64_t want = g6s2::share_want(kv_seen[k], now);
+                        const uint64_t want = g6s2::share_want(kv_seen[k], now, g6kv_store_seg_blocks(kvt->store(t)));
                         kv_seen[k] = now;
                         return g6s2::share_poll(pool, t, kvt->store(t), want);
                     };

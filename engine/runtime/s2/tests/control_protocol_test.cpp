@@ -24,7 +24,7 @@ int main()
     EventCommit r;
     r.notice = Notice{7, 13, 3500, 0, 0, EventKind::Resize};
     r.commit.epoch = 7; r.commit.event = 13; r.commit.boundary = 3500; r.commit.before_hash = 42;
-    r.commit.resize = Resize{1, 12, 12 * 38};
+    r.commit.resize = Resize{1, 12, 12 * 38, 5};
     const EventCommit rd = decode_commit(encode(r));
     CHECK(rd.notice.kind == EventKind::Resize && rd.commit.resize && *rd.commit.resize == *r.commit.resize && !rd.commit.admit &&
           !rd.commit.cancel && !rd.commit.hold);

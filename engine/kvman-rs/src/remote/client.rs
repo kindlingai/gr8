@@ -84,6 +84,8 @@ pub struct Report {
     pub give: u64,
     /// segments nobody holds or was promised
     pub unclaimed: u64,
+    /// the transaction every rank names in grow or shrink (0 = nothing to do)
+    pub txn: u64,
 }
 
 impl Opts {
@@ -339,14 +341,20 @@ impl RemoteStore {
         }
         ctl.write_all(&b)?;
         let h = proto::reply(&mut *ctl)?;
-        Ok(Report { grant: h.a, give: h.b, unclaimed: h.c })
+        let mut t = [0u8; 8];
+        ctl.read_exact(&mut t)?;
+        Ok(Report { grant: h.a, give: h.b, unclaimed: h.c, txn: u64::from_le_bytes(t) })
     }
 
-    /// Adds `n` segments at the end (each rank, after its head was granted them). Returns the blocks now.
-    pub fn grow(&self, n: u64) -> io::Result<u64> {
+    /// Grows to `segs` segments (each rank, under the transaction `txn` its head's report named). Growing again under
+    /// the same transaction does nothing. Returns the blocks now.
+    pub fn grow(&self, segs: u64, txn: u64) -> io::Result<u64> {
         self.group_only()?;
         let mut ctl = self.ctl.lock().unwrap();
-        Header::new(proto::GROW, n, 0, 0).write(&mut *ctl)?;
+        if segs <= self.segs() {
+            return Ok(self.blocks());
+        }
+        Header::new(proto::GROW, segs, txn, 0).write(&mut *ctl)?;
         let segs = proto::reply(&mut *ctl)?.a;
         if let Some(r) = &self.rdma {
             *r.segs.write().unwrap() = Self::segs_of(&mut ctl)?.1;
@@ -355,9 +363,10 @@ impl RemoteStore {
         Ok(segs * self.per_seg)
     }
 
-    /// Keeps the first `segs` segments and gives the rest back. Nothing may read or write the blocks past them once
-    /// this is called (the tier moved what it kept below them first: stash.rs resize_tier). Returns the blocks now.
-    pub fn shrink(&self, segs: u64) -> io::Result<u64> {
+    /// Keeps the first `segs` segments and gives the rest back, under the give `txn` its head's report named. Nothing
+    /// may read or write the blocks past them once this is called (the tier moved what it kept below them first:
+    /// stash.rs resize_tier). Returns the blocks now.
+    pub fn shrink(&self, segs: u64, txn: u64) -> io::Result<u64> {
         self.group_only()?;
         let mut ctl = self.ctl.lock().unwrap();
         if segs >= self.segs() {
@@ -365,7 +374,7 @@ impl RemoteStore {
         }
         // the node checks every TCP offset and deregisters the segments' regions, so a stray copy fails rather than
         // reaching memory the node granted to someone else
-        Header::new(proto::SHRINK, segs, 0, 0).write(&mut *ctl)?;
+        Header::new(proto::SHRINK, segs, txn, 0).write(&mut *ctl)?;
         proto::reply(&mut *ctl)?;
         self.blocks.store(segs * self.per_seg, Ordering::Release);
         if let Some(r) = &self.rdma {

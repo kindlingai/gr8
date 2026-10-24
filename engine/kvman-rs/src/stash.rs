@@ -182,6 +182,10 @@ pub struct TierStats {
     pub block_bytes: u64,
     /// write limit credit left, blocks (0 without a limit; the same on every tier)
     pub credit: i64,
+    /// entries this tier keeps that were bigger than the whole tier (they went to a later tier, or nowhere), and the
+    /// pages of the last one: a group lease's head asks to grow by that much (s2/kv_share.h share_want)
+    pub oversize: u64,
+    pub oversize_last: u64,
 }
 
 pub struct Tier {
@@ -760,7 +764,12 @@ impl Stash {
     fn place(&mut self, start: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Option<(usize, Vec<u64>)> {
         let mut refused = None;
         for t in start..self.tiers.len() {
-            if !self.tiers[t].keep.takes(kind) || n as u64 > self.tiers[t].slots {
+            if !self.tiers[t].keep.takes(kind) {
+                continue;
+            }
+            if n as u64 > self.tiers[t].slots {
+                self.tiers[t].stats.oversize += 1;
+                self.tiers[t].stats.oversize_last = n as u64;
                 continue;
             }
             if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {

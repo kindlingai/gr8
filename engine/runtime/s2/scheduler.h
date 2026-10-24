@@ -157,11 +157,12 @@ inline bool prefill_first(const Slot& a, const Slot& b) {
 // prefixes the request counted toward (pool.h count)
 struct Grant { Key key; Request req; Run run; uint32_t reuse = 0, restored = 0, counted = 0; };
 // a Resize event: every rank takes pool tier `tier` to `segs` segments of its group lease on a KV node, `slots` blocks
-// (s2/kv_share.h share_apply), at the commit, so every rank's pool queues the same copies
+// (s2/kv_share.h share_apply), at the commit, so every rank's pool queues the same copies. txn: the node's transaction
+// for it (each rank names it in its GROW or SHRINK)
 struct Resize {
     uint32_t tier = 0;
-    uint64_t segs = 0, slots = 0;
-    bool operator==(const Resize& r) const { return tier == r.tier && segs == r.segs && slots == r.slots; }
+    uint64_t segs = 0, slots = 0, txn = 0;
+    bool operator==(const Resize& r) const { return tier == r.tier && segs == r.segs && slots == r.slots && txn == r.txn; }
 };
 struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;

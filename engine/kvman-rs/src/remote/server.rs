@@ -16,6 +16,12 @@
 //! are the oldest (by more than the margin, weighted) to give: the coldest chat across all the models on the node. The
 //! node never takes a segment back on its own: a cluster's ranks hold their blocks in lock step, so only the cluster
 //! can drop them, at one event on every rank (stash.rs resize_tier). REMOTE-TIER.md, "Sharing a node".
+//!
+//! Every grant and every give is a transaction (Txn) of the whole group: an id, one absolute target in segments per
+//! rank, and each rank's own part. A rank's GROW and SHRINK name the transaction and its target; one against another
+//! transaction is refused (E_STALE), and one a rank already applied is answered as done. A grant is held per rank:
+//! once any rank grew into it, the others' parts never expire. Segments a rank gives back stay the group's (retired)
+//! until every rank of the group has given, so no other group can take them while the group is between sizes.
 
 use super::proto::{self, Header};
 use super::sys::{self, Arena};
@@ -48,6 +54,9 @@ pub struct Share {
     pub stall: Duration,
     /// A group that gave is not asked again for this long.
     pub cooldown: Duration,
+    /// Floors reserved from the start (kvman-remote --group-plan): group name -> (ranks, floor segments a rank). A
+    /// planned group can start (or restart) whatever the other groups hold; its floor is kept for it while it is away.
+    pub plan: BTreeMap<String, (u32, u64)>,
 }
 
 impl Default for Share {
@@ -58,6 +67,7 @@ impl Default for Share {
             grant_ttl: Duration::from_secs(30),
             stall: Duration::from_secs(10),
             cooldown: Duration::from_secs(10),
+            plan: BTreeMap::new(),
         }
     }
 }
@@ -78,6 +88,20 @@ struct Member {
     segs: u64,
 }
 
+/// A grant (grow) or give (shrink) of a whole group: every rank to `target` segments.
+struct Txn {
+    id: u64,
+    grow: bool,
+    target: u64,
+    at: Instant,
+    // the head was told (REPORT); a give made by another group's ask is told at the group's next report
+    told: bool,
+    // a rank applied it: from then on it neither expires nor stalls
+    started: bool,
+    // grow: each rank's part not yet taken
+    held: BTreeMap<u32, u64>,
+}
+
 struct Group {
     nr: u32,
     block_bytes: usize,
@@ -85,12 +109,16 @@ struct Group {
     cap: u64,
     weight: u64,
     members: BTreeMap<u32, Member>,
-    // segments held for ranks that have not opened yet (their floors), and granted ones no rank grew into yet
+    // segments held for ranks that have not opened yet (their floors)
     boot: u64,
-    grant: u64,
-    grant_at: Instant,
-    // every rank down to this many segments, asked then
-    give: Option<(u64, Instant)>,
+    // the grant or give in progress, and the last transaction id
+    txn: Option<Txn>,
+    last_txn: u64,
+    // segments ranks gave back in the open give, held until every rank gave (then free)
+    retired: Vec<usize>,
+    // segments a rank more than it asked that a give made for it left over (taken with its next grant, so the give's
+    // rounding to the giver's rank count strands nothing)
+    bonus: u64,
     stalled: bool,
     calm_until: Option<Instant>,
     ages: Vec<u64>,
@@ -107,7 +135,7 @@ impl Group {
         self.members.values().map(|m| m.segs).max().unwrap_or(self.floor)
     }
     fn reserved(&self) -> u64 {
-        self.boot + self.grant
+        self.boot + self.txn.as_ref().map_or(0, |t| t.held.values().sum::<u64>())
     }
     fn complete(&self) -> bool {
         self.members.len() == self.nr as usize
@@ -124,36 +152,85 @@ struct State {
     names: BTreeMap<String, u64>,
     groups: BTreeMap<String, Group>,
     next_id: u64,
+    // Share::plan: the floors of planned groups, reserved while the group is away
+    plan: BTreeMap<String, (u32, u64)>,
+    // segments earmarked for a rank waiting in GOPEN while other groups give
+    waiting: BTreeMap<String, u64>,
 }
 
 impl State {
     fn free_segs(&self, seg: usize) -> u64 {
         self.free.values().map(|&l| (l / seg) as u64).sum()
     }
+    fn planned(&self, name: &str) -> u64 {
+        match self.plan.get(name) {
+            Some(&(nr, floor)) if !self.groups.contains_key(name) => nr as u64 * floor,
+            _ => 0,
+        }
+    }
     fn reserved(&self) -> u64 {
-        self.groups.values().map(Group::reserved).sum()
+        self.groups.values().map(Group::reserved).sum::<u64>()
+            + self.plan.keys().map(|n| self.planned(n)).sum::<u64>()
+            + self.waiting.values().sum::<u64>()
+    }
+    // segments the gives in progress will free
+    fn coming(&self) -> u64 {
+        self.groups
+            .values()
+            .filter_map(|g| g.txn.as_ref().filter(|t| !t.grow).map(|t| (g.segs().saturating_sub(t.target)) * g.nr as u64))
+            .sum()
     }
     // segments nobody holds or has been promised
     fn unclaimed(&self, seg: usize) -> u64 {
         self.free_segs(seg).saturating_sub(self.reserved())
     }
+    // a grant no rank took within grant_ttl goes back; a give no rank started within stall is dropped and the group
+    // marked stalled. Once a rank applied either, it stays until every rank did (or left)
     fn tick(&mut self, now: Instant, sh: &Share) {
         for g in self.groups.values_mut() {
-            if g.grant > 0 && now.duration_since(g.grant_at) > sh.grant_ttl {
-                g.grant = 0;
+            let Some(t) = &g.txn else { continue };
+            if t.started {
+                continue;
             }
-            if let Some((_, at)) = g.give {
-                if now.duration_since(at) > sh.stall {
-                    g.give = None;
-                    g.stalled = true;
-                }
+            if t.grow && now.duration_since(t.at) > sh.grant_ttl {
+                g.txn = None;
+            } else if !t.grow && now.duration_since(t.at) > sh.stall {
+                g.txn = None;
+                g.stalled = true;
             }
         }
     }
+    // ends group `name`'s transaction once every rank it has applied it: a give's retired segments go free then
+    fn settle(&mut self, name: &str, now: Instant, sh: &Share, seg: usize) {
+        let Some(g) = self.groups.get_mut(name) else { return };
+        let Some(t) = &g.txn else { return };
+        let done = if t.grow {
+            g.members.values().all(|m| m.segs >= t.target)
+        } else {
+            g.members.values().all(|m| m.segs <= t.target)
+        };
+        if !done {
+            return;
+        }
+        if !t.grow {
+            g.calm_until = Some(now + sh.cooldown);
+        }
+        g.txn = None;
+        for o in std::mem::take(&mut g.retired) {
+            release(&mut self.free, o, seg);
+        }
+    }
+    fn open_txn(g: &mut Group, grow: bool, target: u64, per_rank: u64, now: Instant, told: bool) -> u64 {
+        g.last_txn += 1;
+        let held = if grow { g.members.keys().map(|&r| (r, per_rank)).collect() } else { BTreeMap::new() };
+        g.txn = Some(Txn { id: g.last_txn, grow, target, at: now, told, started: false, held });
+        g.last_txn
+    }
     // the group `req` is `short` segments short: ask the group with the coldest blocks to give them, if any is colder
-    // than `req`'s own coldest by the margin
-    fn ask(&mut self, req: &str, short: u64, now: Instant, sh: &Share) {
-        let mine = self.groups[req].cold();
+    // than `req`'s own coldest by the margin. floor: `req` asks for its floor (a group starting): the margin and the
+    // cooldown do not apply, only the giver's own floor. The segments the give frees in all (k a rank x its ranks)
+    fn ask(&mut self, req: &str, short: u64, now: Instant, sh: &Share, floor: bool) -> u64 {
+        let mine = self.groups.get(req).map_or(0, Group::cold);
         let margin = sh.margin.as_millis() as u64;
         let pick = self
             .groups
@@ -161,21 +238,23 @@ impl State {
             .filter(|(n, v)| {
                 *n != req
                     && v.complete()
-                    && v.give.is_none()
+                    && v.txn.is_none()
                     && !v.stalled
-                    && v.calm_until.is_none_or(|t| now >= t)
                     && v.segs() > v.floor
-                    && !v.ages.is_empty()
-                    && v.cold() > mine.saturating_add(margin)
+                    && (floor
+                        || (v.calm_until.is_none_or(|t| now >= t)
+                            && !v.ages.is_empty()
+                            && v.cold() > mine.saturating_add(margin)))
             })
             .max_by_key(|(_, v)| v.cold())
             .map(|(n, _)| n.clone());
-        if let Some(n) = pick {
-            let v = self.groups.get_mut(&n).expect("picked");
-            let k = short.div_ceil(v.nr as u64).min(v.segs() - v.floor);
-            v.give = Some((v.segs() - k, now));
-            v.asked += 1;
-        }
+        let Some(n) = pick else { return 0 };
+        let v = self.groups.get_mut(&n).expect("picked");
+        let k = short.div_ceil(v.nr as u64).min(v.segs() - v.floor);
+        let target = v.segs() - k;
+        State::open_txn(v, false, target, 0, now, false);
+        v.asked += 1;
+        k * v.nr as u64
     }
 }
 
@@ -277,12 +356,22 @@ impl Drop for Lease {
             let gone = st.groups.get_mut(g).is_some_and(|x| {
                 if x.members.get(rank).is_some_and(|m| m.lease == self.id) {
                     x.members.remove(rank);
+                    if let Some(t) = &mut x.txn {
+                        t.held.remove(rank);
+                    }
                 }
                 x.members.is_empty()
             });
-            // the last rank of a group took the group with it, and what it held for the others
+            // the last rank of a group took the group with it, and what it held for the others; a rank that left ends
+            // a transaction the others have all applied
             if gone {
-                st.groups.remove(g);
+                if let Some(x) = st.groups.remove(g) {
+                    for o in x.retired {
+                        release(&mut st.free, o, self.seg_len);
+                    }
+                }
+            } else {
+                st.settle(g, Instant::now(), &self.shared.share, self.seg_len);
             }
         }
     }
@@ -359,6 +448,8 @@ impl Node {
                 names: BTreeMap::new(),
                 groups: BTreeMap::new(),
                 next_id: 1,
+                plan: share.plan.clone(),
+                waiting: BTreeMap::new(),
             }),
             devices: Mutex::new(HashMap::new()),
             cfg_rdma: cfg.rdma,
@@ -438,8 +529,8 @@ impl Shared {
                     let ages: Vec<String> = g.ages.iter().map(u64::to_string).collect();
                     format!(
                         "{{\"name\":\"{}\",\"nr\":{},\"block\":{},\"floor\":{},\"cap\":{},\"weight\":{},\"segs\":{{{}}},\
-                         \"boot\":{},\"grant\":{},\"give\":{},\"stalled\":{},\"demand\":{},\"ages_ms\":[{}],\
-                         \"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
+                         \"boot\":{},\"txn\":{},\"grant\":{},\"give\":{},\"retired\":{},\"bonus\":{},\"stalled\":{},\
+                         \"demand\":{},\"ages_ms\":[{}],\"reports\":{},\"granted\":{},\"gave\":{},\"asked\":{}}}",
                         json_escape(n),
                         g.nr,
                         g.block_bytes,
@@ -448,8 +539,11 @@ impl Shared {
                         g.weight,
                         segs.join(","),
                         g.boot,
-                        g.grant,
-                        g.give.map_or(-1, |x| x.0 as i64),
+                        g.txn.as_ref().map_or(0, |t| t.id),
+                        g.txn.as_ref().map_or(0, |t| t.held.values().sum::<u64>()),
+                        g.txn.as_ref().filter(|t| !t.grow).map_or(-1, |t| t.target as i64),
+                        g.retired.len(),
+                        g.bonus,
                         g.stalled,
                         g.demand,
                         ages.join(","),
@@ -704,20 +798,24 @@ fn conn(sh: &Arc<Shared>, mut s: TcpStream) -> io::Result<()> {
                 let b = read_vec(&mut s, h.b as usize * 8)?;
                 let ages: Vec<u64> = b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
                 match report(sh, &l, h.a, ages) {
-                    Ok((grant, give, unclaimed)) => Header::new(proto::OK, grant, give, unclaimed).write(&mut s)?,
+                    Ok((grant, give, unclaimed, txn)) => {
+                        let mut b = Header::new(proto::OK, grant, give, unclaimed).bytes().to_vec();
+                        b.extend_from_slice(&txn.to_le_bytes());
+                        s.write_all(&b)?
+                    }
                     Err((code, msg)) => fail(&mut s, code, &msg)?,
                 }
             }
             proto::GROW => {
                 let l = lease.as_ref().unwrap().0.clone();
-                match grow(sh, &l, h.a) {
+                match grow(sh, &l, h.a, h.b) {
                     Ok(n) => Header::new(proto::OK, n, 0, 0).write(&mut s)?,
                     Err((code, msg)) => fail(&mut s, code, &msg)?,
                 }
             }
             proto::SHRINK => {
                 let l = lease.as_ref().unwrap().0.clone();
-                match shrink(sh, &l, h.a) {
+                match shrink(sh, &l, h.a, h.b) {
                     Ok(n) => Header::new(proto::OK, n, 0, 0).write(&mut s)?,
                     Err((code, msg)) => fail(&mut s, code, &msg)?,
                 }
@@ -879,7 +977,10 @@ pub struct Want {
     pub weight: u32,
 }
 
-// the lease and its blocks per segment
+// the lease and its blocks per segment. A group's first rank needs room for every rank's floor, a later rank its own
+// floor beyond what the first held for it. Short of room, the rank asks the other groups to give down to their
+// floors (the margin does not apply: a floor is the group's right) and waits up to Share::stall for them, the room
+// earmarked for it meanwhile; a planned group (Share::plan) finds its floors reserved
 fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
     let seg = sh.share.seg_bytes;
     if w.block_bytes == 0 || w.block_bytes > seg as u64 {
@@ -893,16 +994,18 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
     let floor = w.floor_bytes.div_ceil(span).max(1);
     let cap = w.cap_bytes.div_ceil(span).max(floor);
     let weight = if w.weight == 0 { 1000 } else { w.weight as u64 };
-    let l = {
+    let deadline = Instant::now() + sh.share.stall;
+    let l = loop {
         let mut st = sh.state.lock().unwrap();
         let now = Instant::now();
         st.tick(now, &sh.share);
         if let Some(id) = st.names.get(&w.name) {
             return Err((proto::E_BUSY, format!("lease {} is held (id {id}); a name has one holder", w.name)));
         }
-        let have = st.free_segs(seg);
-        let reserved = st.reserved();
-        match st.groups.get_mut(&w.group) {
+        // what this rank may take: what nobody holds or was promised, what is earmarked for it, its planned floors
+        st.waiting.remove(&w.group);
+        let room = st.unclaimed(seg) + st.planned(&w.group);
+        let need = match st.groups.get(&w.group) {
             Some(g) => {
                 if (g.nr, g.block_bytes as u64, g.floor, g.cap) != (w.nr, w.block_bytes, floor, cap) {
                     return Err((
@@ -918,25 +1021,37 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
                     return Err((proto::E_BUSY, format!("rank {} of group {} is held", w.rank, w.group)));
                 }
                 // a rank's floor comes out of what the group's first rank held for it
-                let from_boot = floor.min(g.boot);
-                if floor - from_boot > have.saturating_sub(reserved) {
-                    return Err((proto::E_NOROOM, format!("no room for {floor} segments of {seg} bytes")));
-                }
-                g.boot -= from_boot;
+                floor - floor.min(g.boot)
             }
+            None => floor * w.nr as u64,
+        };
+        if need > room {
+            let short = need - room;
+            let coming = st.coming();
+            if short > coming {
+                st.ask(&w.group, short - coming, now, &sh.share, true);
+            }
+            if now >= deadline {
+                return Err((
+                    proto::E_NOROOM,
+                    format!(
+                        "no room for group {} rank {}: {need} segments of {seg} bytes, {room} unclaimed, {} more \
+                         being given back",
+                        w.group,
+                        w.rank,
+                        st.coming()
+                    ),
+                ));
+            }
+            // earmark what there is, so a grant to another group does not take it while the gives land
+            st.waiting.insert(w.group.clone(), room.min(need));
+            drop(st);
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        match st.groups.get_mut(&w.group) {
+            Some(g) => g.boot -= floor.min(g.boot),
             None => {
-                let need = floor * w.nr as u64;
-                if need > have.saturating_sub(reserved) {
-                    return Err((
-                        proto::E_NOROOM,
-                        format!(
-                            "no room for group {}: {} ranks x {floor} segments of {seg} bytes, {} unclaimed",
-                            w.group,
-                            w.nr,
-                            have.saturating_sub(reserved)
-                        ),
-                    ));
-                }
                 st.groups.insert(
                     w.group.clone(),
                     Group {
@@ -947,9 +1062,10 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
                         weight,
                         members: BTreeMap::new(),
                         boot: floor * (w.nr as u64 - 1),
-                        grant: 0,
-                        grant_at: now,
-                        give: None,
+                        txn: None,
+                        last_txn: 0,
+                        retired: Vec::new(),
+                        bonus: 0,
                         stalled: false,
                         calm_until: None,
                         ages: Vec::new(),
@@ -974,7 +1090,7 @@ fn gopen(sh: &Arc<Shared>, w: &Want) -> Result<(Arc<Lease>, u64), Refusal> {
             Some((w.group.clone(), w.rank)),
         )?;
         st.groups.get_mut(&w.group).expect("made").members.insert(w.rank, Member { lease: l.id, segs: floor });
-        l
+        break l;
     };
     l.zero(&l.segs.read().unwrap());
     sh.opened.fetch_add(1, Ordering::Relaxed);
@@ -985,9 +1101,10 @@ fn group_of(l: &Lease) -> Result<&(String, u32), Refusal> {
     l.group.as_ref().ok_or((proto::E_PROTO, "this lease is not in a group (GOPEN)".to_string()))
 }
 
-// (segments per rank granted now, segments per rank asked back, unclaimed segments)
-fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u64, u64, u64), Refusal> {
-    let (name, _) = group_of(l)?;
+// (segments a rank grows by now, segments a rank gives back, unclaimed segments, the transaction to name in GROW or
+// SHRINK; 0 = nothing to do). A transaction in progress is told once, to the first report after it opened
+fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u64, u64, u64, u64), Refusal> {
+    let (name, rank) = group_of(l)?;
     let seg = sh.share.seg_bytes;
     let mut st = sh.state.lock().unwrap();
     let now = Instant::now();
@@ -997,48 +1114,108 @@ fn report(sh: &Arc<Shared>, l: &Lease, demand: u64, ages: Vec<u64>) -> Result<(u
     g.ages = ages;
     g.demand = demand;
     g.reports += 1;
-    let mut grant = 0;
-    let mut short = 0;
-    if demand > 0 && g.give.is_none() && g.complete() {
-        let want = demand.min(g.cap.saturating_sub(g.segs()));
-        let nr = g.nr as u64;
-        grant = (unclaimed / nr).min(want);
-        if grant > 0 {
-            g.grant += grant * nr;
-            g.grant_at = now;
-            g.granted += grant;
+    let mine = g.members.get(rank).map_or(g.floor, |m| m.segs);
+    let nr = g.nr as u64;
+    let (mut grant, mut give, mut txn) = (0, 0, 0);
+    // (segments short, of segments needed, with these unclaimed left)
+    let mut short = None;
+    if let Some(t) = &mut g.txn {
+        if !t.told {
+            t.told = true;
+            txn = t.id;
+            if t.grow {
+                grant = t.target.saturating_sub(mine);
+            } else {
+                give = mine.saturating_sub(t.target);
+            }
         }
-        short = (want - grant) * nr - (unclaimed - grant * nr).min((want - grant) * nr);
+    } else if demand > 0 && g.complete() {
+        let room = g.cap.saturating_sub(g.segs());
+        let want = demand.min(room);
+        grant = (unclaimed / nr).min((want + g.bonus).min(room));
+        if grant > 0 {
+            g.bonus = 0;
+            g.granted += grant;
+            let target = g.segs() + grant;
+            txn = State::open_txn(g, true, target, grant, now, true);
+        }
+        if want > grant {
+            let need = (want - grant) * nr;
+            let left = unclaimed - grant * nr;
+            if need > left {
+                short = Some((need - left, need, left));
+            }
+        }
     }
-    if short > 0 {
-        st.ask(name, short, now, &sh.share);
+    if let Some((k, need, left)) = short {
+        // the giver gives whole segments on each of its ranks: what that frees past this group's need, a whole
+        // segment on each of its ranks, it takes with its next grant
+        let freed = st.ask(name, k, now, &sh.share, false);
+        if freed > 0 {
+            st.groups.get_mut(name).expect("reported").bonus = (left + freed).saturating_sub(need) / nr;
+        }
     }
-    let g = &st.groups[name];
-    let give = g.give.map_or(0, |(t, _)| g.segs().saturating_sub(t));
-    Ok((grant, give, st.unclaimed(seg)))
+    Ok((grant, give, st.unclaimed(seg), txn))
 }
 
-// the lease's segments after growing by n
-fn grow(sh: &Arc<Shared>, l: &Lease, n: u64) -> Result<u64, Refusal> {
+fn stale(g: &Group, txn: u64, grow: bool) -> Refusal {
+    let open = g.txn.as_ref().map_or("none".to_string(), |t| format!("{} ({})", t.id, if t.grow { "grow" } else { "give" }));
+    (
+        proto::E_STALE,
+        format!("{} under transaction {txn}: the group's open transaction is {open}", if grow { "GROW" } else { "SHRINK" }),
+    )
+}
+
+// the lease's segments after growing to `target` under transaction `txn` (REPORT's). Done already: the segments as
+// they are
+fn grow(sh: &Arc<Shared>, l: &Lease, target: u64, txn: u64) -> Result<u64, Refusal> {
     let (name, rank) = group_of(l)?;
     let seg = sh.share.seg_bytes;
     let new = {
         let mut st = sh.state.lock().unwrap();
-        st.tick(Instant::now(), &sh.share);
+        let now = Instant::now();
+        st.tick(now, &sh.share);
         let spare = st.free_segs(seg).saturating_sub(st.reserved());
-        let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
-        let m = g.members.get(rank).ok_or((proto::E_NOLEASE, "not a member".to_string()))?;
-        if m.segs + n > g.cap {
-            return Err((proto::E_NOROOM, format!("{} + {n} segments is past the group's cap {}", m.segs, g.cap)));
+        let g = st.groups.get(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
+        let have = g.members.get(rank).ok_or((proto::E_NOLEASE, "not a member".to_string()))?.segs;
+        let Some(t) = g.txn.as_ref().filter(|t| t.id == txn && t.grow) else {
+            if have >= target && txn != 0 && txn <= g.last_txn {
+                return Ok(have);
+            }
+            return Err(stale(g, txn, true));
+        };
+        if target != t.target {
+            return Err((proto::E_PROTO, format!("transaction {txn} grows to {} segments, not {target}", t.target)));
         }
-        // from the group's grant, or else from what nobody was promised
-        let from_grant = n.min(g.grant);
-        if n - from_grant > spare {
-            return Err((proto::E_NOROOM, format!("no room for {n} segments: {} granted, {spare} spare", g.grant)));
+        if have >= target {
+            return Ok(have);
         }
-        g.grant -= from_grant;
-        g.members.get_mut(rank).expect("member").segs += n;
-        alloc_segs(&mut st.free, seg, n).ok_or((proto::E_NOROOM, "no room".to_string()))?
+        let n = target - have;
+        // from this rank's part of the grant, or else from what nobody was promised
+        let from_held = n.min(t.held.get(rank).copied().unwrap_or(0));
+        if n - from_held > spare {
+            return Err((proto::E_NOROOM, format!("no room for {n} segments: {from_held} granted, {spare} spare")));
+        }
+        // the rank's part leaves the reservation as its segments leave the free list
+        let g = st.groups.get_mut(name).expect("checked");
+        let t = g.txn.as_mut().expect("checked");
+        if let Some(h) = t.held.get_mut(rank) {
+            *h -= from_held;
+        }
+        t.started = true;
+        let new = match alloc_segs(&mut st.free, seg, n) {
+            Some(v) => v,
+            None => {
+                let t = st.groups.get_mut(name).expect("checked").txn.as_mut().expect("checked");
+                if let Some(h) = t.held.get_mut(rank) {
+                    *h += from_held;
+                }
+                return Err((proto::E_NOROOM, "no room".to_string()));
+            }
+        };
+        st.groups.get_mut(name).expect("checked").members.get_mut(rank).expect("member").segs = target;
+        st.settle(name, now, &sh.share, seg);
+        new
     };
     l.zero(&new);
     let mut segs = l.segs.write().unwrap();
@@ -1046,41 +1223,58 @@ fn grow(sh: &Arc<Shared>, l: &Lease, n: u64) -> Result<u64, Refusal> {
     Ok(segs.len() as u64)
 }
 
-// the lease's segments after shrinking to `to`. The client sends nothing to the segments that go after it asks.
-fn shrink(sh: &Arc<Shared>, l: &Lease, to: u64) -> Result<u64, Refusal> {
+// the lease's segments after shrinking to `to` under the group's give `txn`. The client sends nothing to the
+// segments that go after it asks. They stay the group's until every rank has given (then free)
+fn shrink(sh: &Arc<Shared>, l: &Lease, to: u64, txn: u64) -> Result<u64, Refusal> {
     let (name, rank) = group_of(l)?;
-    let floor = sh.state.lock().unwrap().groups.get(name).map_or(1, |g| g.floor);
-    if to < floor {
-        return Err((proto::E_RANGE, format!("{to} segments is below the group's floor {floor}")));
+    {
+        let mut st = sh.state.lock().unwrap();
+        let g = st.groups.get_mut(name).ok_or((proto::E_NOLEASE, format!("no group {name}")))?;
+        let have = g.members.get(rank).map_or(0, |m| m.segs);
+        let Some(t) = g.txn.as_mut().filter(|t| t.id == txn && !t.grow) else {
+            if have <= to && txn != 0 && txn <= g.last_txn {
+                return Ok(have);
+            }
+            return Err(stale(g, txn, false));
+        };
+        if to != t.target {
+            return Err((proto::E_PROTO, format!("transaction {txn} gives down to {} segments, not {to}", t.target)));
+        }
+        if to < g.floor {
+            return Err((proto::E_RANGE, format!("{to} segments is below the group's floor {}", g.floor)));
+        }
+        // from here the give completes: it never stalls or expires
+        t.started = true;
     }
     let gone = {
         let mut r = l.regions.lock().unwrap();
         let mut segs = l.segs.write().unwrap();
         if to as usize >= segs.len() {
-            return Ok(segs.len() as u64);
+            Vec::new()
+        } else {
+            for (_, mrs) in r.values_mut() {
+                mrs.truncate(to as usize);
+            }
+            segs.split_off(to as usize)
         }
-        for (_, mrs) in r.values_mut() {
-            mrs.truncate(to as usize);
-        }
-        segs.split_off(to as usize)
     };
     let mut st = sh.state.lock().unwrap();
-    for &o in &gone {
-        release(&mut st.free, o, l.seg_len);
-    }
     let now = Instant::now();
-    if let Some(g) = st.groups.get_mut(name) {
-        if let Some(m) = g.members.get_mut(rank) {
-            m.segs = to;
+    match st.groups.get_mut(name) {
+        Some(g) => {
+            if let Some(m) = g.members.get_mut(rank) {
+                m.segs = to;
+            }
+            g.stalled = false;
+            if rank == &0 {
+                g.gave += gone.len() as u64;
+            }
+            g.retired.extend(gone);
+            st.settle(name, now, &sh.share, l.seg_len);
         }
-        g.stalled = false;
-        if rank == &0 {
-            g.gave += gone.len() as u64;
-        }
-        if let Some((t, _)) = g.give {
-            if g.members.values().all(|m| m.segs <= t) {
-                g.give = None;
-                g.calm_until = Some(now + sh.share.cooldown);
+        None => {
+            for o in gone {
+                release(&mut st.free, o, l.seg_len);
             }
         }
     }
