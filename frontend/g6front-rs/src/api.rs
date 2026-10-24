@@ -647,7 +647,7 @@ fn chat_full(
             }
             None => x.raw("logprobs", b"null"),
         }
-        x.str("finish_reason", if p.calls.is_empty() { res.finish_reason.unwrap_or("stop") } else { "tool_calls" });
+        x.str("finish_reason", finish_with_calls(!p.calls.is_empty(), res.finish_reason.unwrap_or("stop")));
         stop_reason_json(x.key("stop_reason"), &res.stop_reason);
         let ret_ids = truthy(body.get("return_token_ids"));
         if ret_ids {
@@ -849,7 +849,7 @@ async fn chat_step(
             x.raw("logprobs", b"null");
         }
         match step.finish_reason {
-            Some(fr) => x.str("finish_reason", if *tools_streamed && fr == "stop" { "tool_calls" } else { fr }),
+            Some(fr) => x.str("finish_reason", finish_with_calls(*tools_streamed, fr)),
             None => x.raw("finish_reason", b"null"),
         }
         if ret_ids {
@@ -1298,6 +1298,25 @@ async fn metrics_route(st: &State) -> Response<HttpBody> {
         Err(e) => {
             response(503, "text/plain; charset=utf-8", format!("engine metrics unavailable: {}\n", e.0).into_bytes())
         }
+    }
+}
+
+/// A reply that ends normally with a tool call finishes as `tool_calls`. Any other reason stays: a call that
+/// `max_tokens` cut off finishes as `length`, so a client does not run its truncated arguments.
+fn finish_with_calls(has_calls: bool, reason: &'static str) -> &'static str {
+    if has_calls && reason == "stop" { "tool_calls" } else { reason }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::finish_with_calls;
+
+    #[test]
+    fn a_cut_off_call_finishes_as_length() {
+        assert_eq!(finish_with_calls(true, "stop"), "tool_calls");
+        assert_eq!(finish_with_calls(true, "length"), "length");
+        assert_eq!(finish_with_calls(false, "stop"), "stop");
+        assert_eq!(finish_with_calls(false, "length"), "length");
     }
 }
 
