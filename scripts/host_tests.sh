@@ -19,6 +19,8 @@
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+# the build's object cache (engine/runtime/nvcc_cache.sh, #32), with g++ standing in for nvcc
+bash "$REPO/engine/runtime/tests/nvcc_cache_test.sh"
 # Inactive steering contracts/profile loader: CPU only, no CUDA or Rust dependencies.
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"

@@ -78,6 +78,30 @@ the gate set; a baseline built from runs with it gates these metrics like any ot
   have the same metrics. `check` refuses (exit 1, "check refused") a run of another topology, other engine environment, other measurement
   settings, or a KL reference other than the baseline's. `run` refuses a `--kl-ref` taken on another topology.
 
+## Paired A/B (#32)
+
+`check` compares one build with a baseline of main measured earlier, so drift between the two days (clocks, thermals,
+a node that degrades) shows up as a delta. `paired` takes boots of main and of the change measured back to back: each
+**pair** is one boot of each side, labelled with the same `run --pair ID` (each side keeps its own `--boot`). Drift
+between pairs cancels in the per-pair difference.
+
+```bash
+# per pair: boot main, run; boot the change, run (alternate the order between pairs: a b, b a, a b, ...)
+python3 bench/gate/gate.py run ... --commit <main sha> --boot m1 --pair p1
+python3 bench/gate/gate.py run ... --commit <pr sha>   --boot c1 --pair p1
+python3 bench/gate/gate.py paired --topology tp4 --a <main sha> --b <pr sha>
+```
+
+Per pair and metric it takes d = (b - a) / |a| on the medians of each side's repeats, then over the pairs the mean
+of d, its 95% Student t interval, and how many pairs went each way. Verdicts: `worse` (the whole interval is on the
+worse side of 0 and the mean is past `--noise`, default 3%), `better` (likewise the other way), `within noise` (the
+interval lies inside +-noise), `unresolved` (more pairs would settle it), `one pair` (no interval). Needles and the
+KL p95 / top-1 stay `info`. It exits 1 if any metric is `worse`. Pairs must share measurement settings and topology;
+the two sides may differ in build flags and engine environment (that may be the change), each side within itself may
+not. Records without an admitted rank health probe are refused, as in `check`.
+
+`paired` is an extra view for a PR's gates table, not a replacement for `check`: the light gates still run `check`.
+
 ## Notes
 
 - The KL reference must be taken on the same topology, from gr8 `main` at a recorded commit (`--commit` is stored in
