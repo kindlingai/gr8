@@ -30,11 +30,13 @@ while [ $i -lt $n ]; do
   a=${args[$i]}
   case $a in
     *' '*) PASS=space ;;
+    # before -o*: -optf and -odir start with -o
+    -|-x|-x*|--x|--x=*|-E|--preprocess|-M*|--generate-dependencies*|--generate-nonsystem-dependencies*|@*|-optf|-optf=*|\
+    --options-file*|-odir|-odir=*|--output-directory*)
+      PASS=$a ;;
     -o) i=$((i + 1)); OUTF=${args[$i]:-}; NOUT=$((NOUT + 1)) ;;
     -o*) OUTF=${a#-o}; NOUT=$((NOUT + 1)) ;;
     -c) HASC=1; ARGS+=("$a") ;;
-    -|-x|-x*|--x|--x=*|-E|--preprocess|-M*|--generate-dependencies*|--generate-nonsystem-dependencies*|@*|-optf|--options-file*)
-      PASS=$a ;;
     # options whose value is the next argument: flags, never inputs
     -I|-isystem|-iquote|-idirafter|-include|-imacros|-L|-Xcompiler|-Xlinker|-Xptxas|-Xnvlink|-Xfatbin|-arch|-code|-gencode|-ccbin|--compiler-bindir)
       v=${args[$((i + 1))]:-}
@@ -45,6 +47,7 @@ while [ $i -lt $n ]; do
       i=$((i + 1)) ;;
     -L*) ARGS+=("$a"); MFLAGS+=("$a"); LDIRS+=("${a#-L}") ;;
     -ccbin=*|--compiler-bindir=*) ARGS+=("$a"); MFLAGS+=("$a"); HOSTCC=${a#*=} ;;
+    -lineinfo|-link|-lto|-lib) ARGS+=("$a"); MFLAGS+=("$a") ;;
     -l*) ARGS+=("$a"); LIBS+=("${a#-l}") ;;
     -*) ARGS+=("$a"); MFLAGS+=("$a") ;;
     *.cu|*.cpp|*.cc|*.cxx|*.c) ARGS+=("$a"); SRCS+=("$a") ;;
@@ -70,7 +73,7 @@ KEY=$(
   {
     command -v "$CC"; "$CC" --version 2>&1
     if [ -n "$HOSTCC" ]; then echo "host $HOSTCC"; "$HOSTCC" --version 2>&1
-    else echo "host c++"; c++ --version 2>&1; fi
+    else for h in c++ g++ gcc; do echo "host $h"; "$h" --version 2>&1; done; fi
     ld --version 2>&1 | head -1
     for v in CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS NVCC_CCBIN; do
       printf 'env %s=%s\n' "$v" "${!v-}"
@@ -79,6 +82,7 @@ KEY=$(
     for s in "${SRCS[@]}"; do
       d=$(deps "$s") || exit 1
       [ -n "$d" ] || exit 1
+      printf 'src %s ' "$s"; sha256sum < "$s" || exit 1
       echo "deps of $s"
       echo "$d" | sort -u | while read -r f; do printf '%s ' "$f"; sha256sum < "$f" || exit 1; done || exit 1
     done

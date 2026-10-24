@@ -463,6 +463,18 @@ class Paired(unittest.TestCase):
         _, info = record.paired(runs, 'tp6', 'main', 'pr')
         self.assertEqual(info['unpaired'], ['p9'])
 
+    def test_a_lone_pair_with_other_settings_is_left_out(self):
+        runs = self.pairs([0.0, 0.0]) + [prec('p9', 'main', {'work.code.decode_tok_s': 40.0},
+                                              settings={**SETTINGS, 'temp': 9})]
+        _, info = record.paired(runs, 'tp6', 'main', 'pr')
+        self.assertEqual(info['unpaired'], ['p9'])
+
+    def test_a_boot_in_two_pairs_is_refused(self):
+        runs = [prec('p0', 'main', {'m': 1.0}, boot='m0'), prec('p0', 'pr', {'m': 1.0}, boot='c0'),
+                prec('p1', 'main', {'m': 1.0}, boot='m0'), prec('p1', 'pr', {'m': 1.0}, boot='c1')]
+        with self.assertRaisesRegex(ValueError, 'each boot belongs to one pair'):
+            record.paired(runs, 'tp6', 'main', 'pr')
+
     def test_flags_may_differ_between_sides(self):
         runs = [prec('p0', 'main', {'m': 1.0}, flags='A'), prec('p0', 'pr', {'m': 1.0}, flags='B')]
         _, info = record.paired(runs, 'tp6', 'main', 'pr')

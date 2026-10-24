@@ -60,6 +60,8 @@ cp a.cpp a.inl
 "$C" g++ -x c++ -c a.inl -o x.o;         [ "$(last)" = pass ] || fail "-x is cached"
 echo -O2 > rsp
 "$C" g++ @rsp -c a.cpp -o r.o;           [ "$(last)" = pass ] || fail "a response file is cached"
+"$C" g++ -optf rsp -c a.cpp -o r.o 2> /dev/null || true
+[ "$(last)" = pass ] || fail "-optf is cached"
 # eight compiles of one key at once: one entry, the same bytes everywhere
 printf 'int k() { return 7; }\n' > k.cpp
 for j in 1 2 3 4 5 6 7 8; do "$C" g++ -O2 -c k.cpp -o k$j.o & done; wait

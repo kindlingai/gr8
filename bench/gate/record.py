@@ -278,13 +278,6 @@ def paired(runs, topology, a, b, noise=0.03):
         raise ValueError('paired needs two different commits')
     if not runs:
         raise ValueError(f'no paired runs of {a} and {b} on {topology} (run --pair ID)')
-    _same(runs, lambda r: {k: r['settings'].get(k) for k in MEASURE_KEYS}, 'measurement settings')
-    side = {}
-    for c in (a, b):
-        rs = [r for r in runs if r['commit'] == c]
-        side[c] = {'build_flags': _same(rs, lambda r: r['build_flags'], f'build flags of {c}') if rs else None,
-                   'engine_env': _same(rs, lambda r: norm_env(r.get('engine_env')), f'engine environment of {c}')
-                   if rs else None}
     by = {}
     for r in runs:
         by.setdefault(r['pair'], {}).setdefault(r['commit'], []).append(r)
@@ -292,6 +285,7 @@ def paired(runs, topology, a, b, noise=0.03):
     lone = sorted(set(by) - set(whole))
     if not whole:
         raise ValueError(f'no pair has runs of both {a} and {b}')
+    seen = {}
     for p, v in whole.items():
         boots = {c: {r['boot'] for r in v[c]} for c in (a, b)}
         if boots[a] & boots[b]:
@@ -300,11 +294,20 @@ def paired(runs, topology, a, b, noise=0.03):
             if len(boots[c]) > 1:
                 raise ValueError(f'pair {p!r} has {len(boots[c])} boots of {c} ({sorted(boots[c])}); a pair is one boot '
                                  'of each side')
+            bt = next(iter(boots[c]))
+            if seen.setdefault(bt, p) != p:
+                raise ValueError(f'boot {bt!r} is in pairs {seen[bt]!r} and {p!r}; each boot belongs to one pair')
         for r in v[a] + v[b]:
             why = ineligible(r)
             if why:
                 raise ValueError(f'boot {r["boot"]!r} cannot be compared: {why}')
     runs = [r for v in whole.values() for r in v[a] + v[b]]
+    _same(runs, lambda r: {k: r['settings'].get(k) for k in MEASURE_KEYS}, 'measurement settings')
+    side = {}
+    for c in (a, b):
+        rs = [r for r in runs if r['commit'] == c]
+        side[c] = {'build_flags': _same(rs, lambda r: r['build_flags'], f'build flags of {c}'),
+                   'engine_env': _same(rs, lambda r: norm_env(r.get('engine_env')), f'engine environment of {c}')}
 
     def med(rs, k):
         vals = [r['metrics'][k]['value'] for r in rs if k in r['metrics']]
