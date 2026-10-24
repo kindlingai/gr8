@@ -3,7 +3,8 @@
 // collective on the prefill fabric: the proxy serves a step's collectives in order and c1 is published after the MoE block).
 // One step per MoE block: publish (own rows) -> hx / shared work runs -> wait + copy peers' rows -> launch_experts with
 // Expert::pre_routed. Layout and row split: flash_route_split.h. Parity-2 slots; the next use of a parity is ordered after
-// the peer's c1 put of the following layer, which is after the peer's receive of this one (same argument as the pool owner).
+// every peer's c1 put of the following layer, which is after that peer's receive of this one (same argument as the pool
+// owner, once per peer). Nothing here depends on the rank count or on mesh vs ring: the fabric moves a uniform slot.
 #pragma once
 #include "flash_route_split.h"
 #include "flash_pool_owner.cuh"
@@ -43,13 +44,12 @@ __global__ void __launch_bounds__(128) k_rs_put(g6::FabricDev f, const u64* step
     glue::publish(f, 0, g6::coll_seq(*step, 0, f.ncoll), ticket);
 }
 // grid (RS_UNPACK_CTA, nr), block 256, after k_wait_peers: peer p's records -> tok_e / tok_w rows r0(M, p)..
-template <int NR> __global__ void __launch_bounds__(256) k_rs_unpack(g6::FabricDev f, const u64* step, int M, int* tok_e, float* tok_w)
+// One instance for every rank count: blockIdx.y is the peer, the row split is flash_route_split.h's.
+__global__ void __launch_bounds__(256) k_rs_unpack(g6::FabricDev f, const u64* step, int M, int* tok_e, float* tok_w)
 {
-    static_assert(NR == 2 || NR == 4, "route split supports TP2 or TP4");
     using namespace flash_route_split;
     const int p = blockIdx.y;
-    if (p >= NR) return;
-    if (p == f.rank || *reinterpret_cast<const volatile unsigned*>(f.error)) return;
+    if (p >= f.nr || p == f.rank || *reinterpret_cast<const volatile unsigned*>(f.error)) return;
     const uint4* src = reinterpret_cast<const uint4*>(glue::peer_slot(f, *step, 0, p));
     const int lo = r0(M, p, f.nr), n = rows(M, p, f.nr);
     uint4* e = reinterpret_cast<uint4*>(tok_e + size_t(lo) * SLOTS);
@@ -62,7 +62,7 @@ template <int NR> __global__ void __launch_bounds__(256) k_rs_unpack(g6::FabricD
 inline void init_flash_route_split(FlashRouteSplit& p, g6::Fabric& fabric, int max_rows)
 {
     p.fabric = &fabric; p.f = fabric.dev(); p.max_rows = max_rows;
-    if (p.f.ncoll != 1 || (p.f.nr != 2 && p.f.nr != 4) ||
+    if (p.f.ncoll != 1 || p.f.nr < 2 || p.f.nr > MAX_NR ||
         p.f.stride < flash_route_split::payload(max_rows, p.f.nr) + 8)
         die("G6_PF_ROUTER_SPLIT: invalid dedicated fabric geometry");
     p.step = dmalloc<u64>(1); p.ticket = dmalloc<unsigned>(1);
@@ -83,9 +83,7 @@ inline void flash_route_receive(FlashRouteSplit& p, int* tok_e, float* tok_w, in
 {
     if (!p.flow.can_receive(M)) die("G6_PF_ROUTER_SPLIT: receive out of protocol");
     glue::k_wait_peers<<<1, 32, 0, st>>>(p.f, p.step, 0, flash_route_split::payload(M, p.f.nr), glue::ERR_AR);
-    if (p.f.nr == 2) k_rs_unpack<2><<<dim3(RS_UNPACK_CTA, 2), 256, 0, st>>>(p.f, p.step, M, tok_e, tok_w);
-    else if (p.f.nr == 4) k_rs_unpack<4><<<dim3(RS_UNPACK_CTA, 4), 256, 0, st>>>(p.f, p.step, M, tok_e, tok_w);
-    else die("G6_PF_ROUTER_SPLIT: unsupported rank count");
+    k_rs_unpack<<<dim3(RS_UNPACK_CTA, p.f.nr), 256, 0, st>>>(p.f, p.step, M, tok_e, tok_w);
     G6RT_CK(cudaGetLastError());
     if (!p.flow.received(M)) die("G6_PF_ROUTER_SPLIT: receive out of protocol");
 }

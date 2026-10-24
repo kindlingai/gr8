@@ -13,6 +13,7 @@
 #endif
 namespace flash_route_split {
 constexpr int SLOTS = 8, ROW_BYTES = SLOTS * 8;                 // 8 x int32 + 8 x float32
+constexpr int MAX_NR = 8;                                       // ranks of one g6::Fabric (fabric.cpp), any count 2..8
 G6_RS_HD inline int r0(int M, int p, int nr) { return p * M / nr; }          // = g6rt::pf_r0 (the GLM prefill all-gather split)
 G6_RS_HD inline int rows(int M, int p, int nr) { return r0(M, p + 1, nr) - r0(M, p, nr); }
 G6_RS_HD inline int padded_rows(int M, int nr) { return (M + nr - 1) / nr; }   // >= rows(M, p, nr) for every p
