@@ -813,9 +813,10 @@ inline const K1SplitEnv& k1_split_env(const char* set = nullptr)
         if (*q != '/') { ks = strtol(q, &q, 10); if (*q++ != 'x') { t.err = "G6_K1_SPLIT: fc1 shape is KS1xWG"; break; } wg = strtol(q, &q, 10); }
         if (*q == '/') ns = strtol(q + 1, &q, 10);
         if (*q && *q != ',') { t.err = "G6_K1_SPLIT: entries are separated by ','"; break; }
-        if (ks && (ks > 16 || KSH % ks || (wg != 1 && wg != 2 && wg != 4) || (KSH / ks) % (8 * wg)))
-        { t.err = "G6_K1_SPLIT: KS1 must divide 384 into a multiple of 8 x WG k16 steps, WG 1, 2 or 4"; break; }
-        if (ns && (ns > 48 || KSH % ns)) { t.err = "G6_K1_SPLIT: NS2 must divide 384 (1..48)"; break; }
+        // tr3.cuh splits by shifts and masks (__ffs(KS1), __ffs(NS2), unit & (NS2 - 1)): powers of two only
+        if (ks && (ks < 0 || ks > 16 || (ks & (ks - 1)) || (wg != 1 && wg != 2 && wg != 4) || (KSH / ks) % (8 * wg)))
+        { t.err = "G6_K1_SPLIT: KS1 is 1, 2, 4, 8 or 16 and WG 1, 2 or 4"; break; }
+        if (ns && (ns < 0 || ns > 16 || (ns & (ns - 1)))) { t.err = "G6_K1_SPLIT: NS2 is 1, 2, 4, 8 or 16"; break; }
         if (!ks && !ns) { t.err = "G6_K1_SPLIT: an entry sets KS1xWG, /NS2 or both"; break; }
         for (long m = a; m <= b; ++m)
         {

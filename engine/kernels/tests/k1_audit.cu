@@ -56,8 +56,8 @@
 //                 bind.cuh quotes; the M >= 2 rule for trellis-shared layers was set for 16+ rows.
 //   fc1 KSxWG     fc1 CTA shape with the same k ranges (KS1 * WG fixed: partial p = h * WG + q covers the same k range,
 //                 fc2 sums the same partials in the same order): exact. 256 threads/CTA = 2 CTAs per SM at M 2-3.
-//   ns2=N         fc2 n-split (every z tile is still one warp's sum over its block's 8 k-tiles): exact. N divides 384:
-//                 1 2 3 4 6 8 12 16 24. The "ns2 pick" line names the fastest exact one (k1 = the bound NS2) per M.
+//   ns2=N         fc2 n-split (every z tile is still one warp's sum over its block's 8 k-tiles): exact. N a power of two
+//                 (tr3.cuh splits by shifts): 1 2 4 8 16. The "ns2 pick" line names the fastest exact one (k1 = the bound NS2) per M.
 //   tab           with --tab: the k1 arm bound with that G6_K1_SPLIT table (exact by construction; checked).
 //   tlbwN         G6_K1_TLBW=N KB (N = 64, 2048): fc1 prefetches every routed slot's fc1 + fc2 translations at the
 //                 start of the launch (k1.cuh k1_tlbw); chain-ovl1 tlbw2048 = the same in the served route-overlap form.
@@ -1080,8 +1080,8 @@ int main(int argc, char** argv)
             }
             if (all_arms == 1 || all_arms == 2)
             {
-                // fc2 n-splits (divisors of KSH = 384), on the engine's form
-                for (int ns : {1, 2, 3, 4, 6, 8, 12, 16, 24})
+                // fc2 n-splits (powers of two dividing KSH = 384: tr3.cuh splits by shifts), on the engine's form
+                for (int ns : {1, 2, 4, 8, 16})
                 {
                     if (ns == keng[0].a.NS2) continue;
                     Arm a{"ns2=" + std::to_string(ns), K_K1, keng, 3, 0, true};
