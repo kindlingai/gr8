@@ -11,6 +11,11 @@ function outsideFrontend(files) {
   return [...new Set(paths)].filter(p => ENGINE.some(r => r.test(p)) || !FRONTEND.some(r => r.test(p)));
 }
 
+/** Whether every path of `files` (pulls.listFiles entries) is a Markdown file: a rename counts by both of its names. */
+function markdownOnly(files) {
+  return files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)).every(p => /\.md$/i.test(p));
+}
+
 /** Every file of the PR, or null when GitHub lists only part of them (3,000 at most). */
 async function prFiles(github, context, pr) {
   const files = await github.paginate(github.rest.pulls.listFiles,
@@ -18,4 +23,4 @@ async function prFiles(github, context, pr) {
   return files.length < pr.changed_files ? null : files;
 }
 
-module.exports = { outsideFrontend, prFiles };
+module.exports = { outsideFrontend, markdownOnly, prFiles };

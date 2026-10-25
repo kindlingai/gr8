@@ -1,8 +1,8 @@
 # CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# Every job runs on GitHub's hosted runners, for every pull request, forks included, except a pull request or push that
-# changes only Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
+# Every job runs on GitHub's hosted runners, for every pull request, forks included, except a push that changes only
+# Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
 # GPU needed to compile. The image job assembles the runtime image from both of their artifacts, and only it can write
 # packages: it pushes from main and from tags, never from a pull request.
 #
@@ -13,7 +13,9 @@
 # cost control, not a security boundary: a fork PR runs its own copy of this file, with a read-only token.
 #
 # A PR that changes only front-end files (.github/ci/scope.js) runs the front-end CPU tests and the Rust binaries: the
-# engine CPU tests, the engine builds, the tester zip and the image skip. Every other run builds everything.
+# engine CPU tests, the engine builds, the tester zip and the image skip. A PR that changes only Markdown files runs
+# just the gate and Finalize. A run dispatched on a PR's branch (pr-ready.yml) takes the PR's scope. Every other run
+# builds everything.
 #
 # Finalize is the one check a PR needs to land: green when every job passed or skipped by design and the PR carries
 # queue:ready. A /ci run that passes stays red there until /ready.
@@ -25,7 +27,6 @@ on:
     tags: ['v*', 'beta-*']
     paths-ignore: ['**.md']
   pull_request:
-    paths-ignore: ['**.md']
   workflow_dispatch:
 
 permissions:
@@ -70,21 +71,32 @@ jobs:
                 (labels.includes("queue:ready") || labels.includes("ci:requested"));
             }
             core.setOutput("go", go ? "true" : "false");
+            // The PR: this run's, or for a dispatched run the open PR whose head is this commit
+            let pr = context.eventName === "pull_request" ? context.payload.pull_request : null;
+            if (go && context.eventName === "workflow_dispatch") {
+              const prs = (await github.rest.repos.listPullRequestsAssociatedWithCommit(
+                { ...context.repo, commit_sha: context.sha })).data;
+              const open = prs.find(p => p.state === "open" && p.head.sha === context.sha);
+              if (open) pr = (await github.rest.pulls.get({ ...context.repo, pull_number: open.number })).data;
+            }
             let scope = "full";
-            if (go && context.eventName === "pull_request") {
-              const { outsideFrontend, prFiles } = require(`${process.env.GITHUB_WORKSPACE}/.github/ci/scope.js`);
-              const files = await prFiles(github, context, context.payload.pull_request);
-              if (files && !outsideFrontend(files).length) scope = "frontend";
+            if (go && pr) {
+              const { outsideFrontend, markdownOnly, prFiles } =
+                require(`${process.env.GITHUB_WORKSPACE}/.github/ci/scope.js`);
+              const files = await prFiles(github, context, pr);
+              if (files && files.length && markdownOnly(files)) scope = "docs";
+              else if (files && !outsideFrontend(files).length) scope = "frontend";
             }
             core.setOutput("scope", scope);
-            core.summary.addRaw(`Scope: ${scope}${scope === "frontend" ? " (no engine tests or builds)" : ""}`).write();
+            const what = { frontend: " (no engine tests or builds)", docs: " (Markdown only: no tests or builds)" };
+            core.summary.addRaw(`Scope: ${scope}${what[scope] || ""}`).write();
             // Red, not green: jobs skipped by a condition count as passed.
             if (!go) core.setFailed("CI has not run: it waits for a maintainer's /ci or /ready on this PR.");
 
   cpu:
     name: CPU tests (${{ matrix.part }})
     needs: ready
-    if: needs.ready.outputs.go == 'true'
+    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -122,7 +134,7 @@ jobs:
   cpu-macos:
     name: CPU tests (frontend, macOS)
     needs: ready
-    if: needs.ready.outputs.go == 'true'
+    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'docs'
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -155,7 +167,7 @@ jobs:
   rust:
     name: Rust binaries (arm64)
     needs: ready
-    if: needs.ready.outputs.go == 'true'
+    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'docs'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -187,7 +199,7 @@ jobs:
     # 27-42 min while int4 alone took 6-11.
     name: Engine build (${{ matrix.label }}, arm64, CUDA 13, sm_121a)
     needs: ready
-    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'frontend'
+    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope == 'full'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     strategy:
@@ -404,8 +416,9 @@ jobs:
     name: Finalize
     # The check a PR needs to land. It runs after a failure or a cancellation too, so it always reports. It passes when
     # every job above succeeded or skipped, and a PR's run carries queue:ready (/ready), read live. A job skips by design
-    # (the tester zip on a PR, the engine builds on a front-end PR) or because a job it needs failed, which fails here
-    # too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished run.
+    # (the tester zip on a PR, the engine builds on a front-end PR, everything on a Markdown-only PR) or because a job
+    # it needs failed, which fails here too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished
+    # run.
     if: always()
     needs: [ready, cpu, cpu-macos, rust, engine, zip, image]
     runs-on: ubuntu-24.04

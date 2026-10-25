@@ -9,7 +9,8 @@
 #   approves it, if it waits for approval), since labels added with GITHUB_TOKEN cannot start workflows.
 #   ci.yml's Finalize reads queue:ready when it runs, so /ready, /unready and a maintainer removing the label re-run
 #   that job alone on a run that has finished.
-#   /ready on an open PR labelled risk:docs-tests that changes only Markdown files squash-merges it. Not eligible: files
+#   /ready on an open PR labelled risk:docs-tests that changes only Markdown files squash-merges it once its CI run's
+#   Finalize passes (the run checks nothing else for such a PR). Not eligible: files
 #   under .github/, AGENTS.md and CLAUDE.md (read by GitHub and by coding agents), symlinks, mode changes, and PRs too
 #   large to list completely. The bot also approves it as github-actions[bot] when "Allow GitHub Actions to create and
 #   approve pull requests" is on (org and repo), which a required review needs. The review and the merge name the head
@@ -141,6 +142,21 @@ jobs:
                 if (run) await refinalize(run);
               }
             };
+            // Whether a ci.yml run of the PR head that started after SINCE (a PR run's re-run, or a dispatched run) has
+            // passed Finalize. Waits up to 6 minutes, enough for a Markdown-only run, which has only the gate and Finalize.
+            const finalized = async (p, since) => {
+              for (let i = 0; i < 36; i++) {
+                await sleep(10000);
+                for (const run of await prRuns(p, ["pull_request", "workflow_dispatch"])) {
+                  if (run.status !== "completed" || Date.parse(run.run_started_at) < since) continue;
+                  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                    { owner, repo, run_id: run.id, filter: "latest" });
+                  const fin = jobs.find(j => j.name === "Finalize");
+                  if (fin && fin.conclusion === "success") return true;
+                }
+              }
+              return false;
+            };
             const rerunCI = async p => {
               const head = p.head.sha;
               let approved = false;
@@ -148,7 +164,7 @@ jobs:
                 const runs = await prRuns(p);
                 if (!runs.length) {
                   if (i < 6) { await sleep(10000); continue; }
-                  await say(`No CI run found for ${head.slice(0, 7)} (a Markdown-only PR runs none), so there is nothing to start.`);
+                  await say(`No CI run found for ${head.slice(0, 7)}, so there is nothing to start.`);
                   return;
                 }
                 const run = runs[0];
@@ -296,7 +312,7 @@ jobs:
                 await startCI(p);
                 return;
               }
-              // Markdown-only, so it has no CI run either: merge it, or say why not.
+              // Markdown-only: merge it once Finalize passes, or say why not.
               let why = null;
               if (files.length >= 3000 || files.length !== p.changed_files) why = "the file list is incomplete";
               else if (files.length > 50) why = "it changes more than 50 files";
@@ -316,6 +332,12 @@ jobs:
               }
               if (why) {
                 await say(`Markdown-only PR marked ready, but not merged automatically because ${why}: merge it by hand.`);
+                return;
+              }
+              const since = Date.now() - 5000;
+              await startCI(p);
+              if (!(await finalized(p, since))) {
+                await say(`Markdown-only PR marked ready, but its Finalize check has not passed: see its CI run.`);
                 return;
               }
               // Approval is best effort: it needs "Allow GitHub Actions to create and approve pull requests", and the merge
