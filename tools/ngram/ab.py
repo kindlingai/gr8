@@ -13,12 +13,16 @@ Stdlib only.
 /v1/completions on those ids at temperature 0 with `return_token_ids` and `return_step_stats`, one request at a time
 (the table only serves a request decoding alone). No log-probabilities are asked for, so decoding runs as it serves.
 Per prompt it keeps the generated ids, decode tok/s ((tokens - 1) / step_stats.decode_s, the first token to the end on
-the front end's clock; replies under 50 tokens are not timed) and the request's step counters. `--traces` refuses a prompt whose ids are in a trace file: a
-table measured on its own prompts would overstate the gain.
+the front end's clock; replies under 50 tokens are not timed) and the request's step counters. `--traces` refuses
+the run, before any generation, when a prompt's ids are in a trace file: a table measured on its own prompts would
+overstate the gain. The ids depend on `--effort`, so give `run` the effort the traces were captured with. A failed
+request is kept as an error row and the run goes on.
 
 `compare` checks that every prompt produced the same ids on both runs (the table drafts only, so any difference is a
-bug), then prints, by workload, decode tok/s (median of the prompts) and tokens per verify step on each side.
-It exits 1 on any output difference or on runs made with different settings.
+bug), then prints, by workload, decode tok/s (median of the timed prompts, with their count) and decode tokens per
+verify step on each side. It exits 1 on any output difference, any error row, or runs made with different settings,
+prompt files or models. It cannot see whether the table served: check rank 0's `# s2 ngram slot` lines on the `on`
+boot for nonzero table rounds (the table only serves a request decoding alone with DFlash2).
 """
 import argparse
 import hashlib
@@ -27,6 +31,7 @@ import os
 import statistics
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capture  # noqa: E402
@@ -62,29 +67,46 @@ def run(a):
     with open(a.prompts) as f:
         items = json.load(f)
     seen = trace_prompts(a.traces)
+    prompts = [capture.chat_ids(c, item, a.effort) for item in items]
+    clash = [i for i, ids in enumerate(prompts) if tuple(ids) in seen]
+    if clash:
+        print(f'prompts {clash} are in the table\'s traces; hold them out', file=sys.stderr)
+        return 2
     rows = []
-    for i, item in enumerate(items):
-        ids = capture.chat_ids(c, item, a.effort)
-        if tuple(ids) in seen:
-            print(f'[{i}] {item.get("workload")}: this prompt is in the table\'s traces; hold it out', file=sys.stderr)
-            return 2
-        gen, st, finish, wall = complete(c, ids, a.max_tokens)
+    for i, (item, ids) in enumerate(zip(items, prompts)):
+        row = {'i': i, 'workload': item.get('workload', 'other'), 'prompt_tokens': len(ids)}
+        try:
+            gen, st, finish, wall = complete(c, ids, a.max_tokens)
+        except (OSError, KeyError, IndexError, ValueError) as e:
+            row.update(gen=None, tokens=0, tok_s=None, steps=None, error=repr(e))
+            rows.append(row)
+            print(f'[{i}] {row["workload"]}: failed: {e}', file=sys.stderr)
+            continue
         n = len(gen)
         dec_s = st.get('decode_s')
         tps = round((n - 1) / dec_s, 2) if n >= MIN_TIMED and dec_s else None
-        rows.append({'i': i, 'workload': item.get('workload', 'other'), 'prompt_tokens': len(ids), 'gen': gen,
-                     'tokens': n, 'decode_s': dec_s, 'wall_s': round(wall, 3), 'tok_s': tps,
-                     'finish_reason': finish, 'steps': st.get('steps'), 'draft_tokens': st.get('draft_tokens'),
-                     'accepted_tokens': st.get('accepted_tokens')})
-        print(f'[{i}] {rows[-1]["workload"]}: {len(ids)} prompt, {n} generated, {tps} tok/s, '
-              f'{st.get("steps")} steps')
-    out = {'label': a.label, 'prompts': os.path.basename(a.prompts), 'prompts_sha': capture_sha(a.prompts),
+        row.update(gen=gen, tokens=n, decode_s=dec_s, wall_s=round(wall, 3), tok_s=tps, finish_reason=finish,
+                   steps=st.get('steps'), draft_tokens=st.get('draft_tokens'),
+                   accepted_tokens=st.get('accepted_tokens'))
+        rows.append(row)
+        print(f'[{i}] {row["workload"]}: {len(ids)} prompt, {n} generated, {tps} tok/s, {st.get("steps")} steps')
+    out = {'label': a.label, 'model': model_id(c), 'prompts': os.path.basename(a.prompts),
+           'prompts_sha': capture_sha(a.prompts),
            'settings': {'max_tokens': a.max_tokens, 'effort': a.effort or 'default', 'temperature': 0},
            'rows': rows}
     with open(a.out, 'w') as f:
         json.dump(out, f, separators=(',', ':'))
     print(f'{len(rows)} prompts -> {a.out}')
     return 0
+
+
+def model_id(c):
+    """The served model's id from /v1/models (None when the server has no such route)."""
+    try:
+        with urllib.request.urlopen(c.url + '/v1/models', timeout=60) as r:
+            return [m.get('id') for m in json.load(r).get('data') or []]
+    except (OSError, ValueError):
+        return None
 
 
 def capture_sha(path):
@@ -98,15 +120,15 @@ def med(xs):
 
 
 def per_step(rows):
-    """Tokens per verify step over rows that report steps (None when none do)."""
+    """Decode tokens (all but the first, which prefill samples) per verify step, over rows that report steps."""
     rs = [r for r in rows if r.get('steps')]
-    return sum(r['tokens'] for r in rs) / sum(r['steps'] for r in rs) if rs else None
+    return sum(r['tokens'] - 1 for r in rs) / sum(r['steps'] for r in rs) if rs else None
 
 
 def compare(A, B):
     """-> (problems, markdown lines). A problem is a settings mismatch or a prompt whose ids differ."""
     probs = []
-    for k in ('prompts_sha', 'settings'):
+    for k in ('prompts_sha', 'settings', 'model'):
         if A.get(k) != B.get(k):
             probs.append(f'{k} differs: {A.get(k)} vs {B.get(k)}')
     ra, rb = {r['i']: r for r in A['rows']}, {r['i']: r for r in B['rows']}
@@ -114,6 +136,10 @@ def compare(A, B):
         probs.append(f'prompt sets differ: {sorted(set(ra) ^ set(rb))}')
     same = 0
     for i in sorted(set(ra) & set(rb)):
+        bad = [lab for lab, r in ((A.get('label', 'a'), ra[i]), (B.get('label', 'b'), rb[i])) if r.get('error')]
+        if bad:
+            probs.append(f'prompt {i} ({ra[i]["workload"]}): request failed on {", ".join(bad)}')
+            continue
         x, y = ra[i]['gen'], rb[i]['gen']
         if x == y:
             same += 1
@@ -122,8 +148,9 @@ def compare(A, B):
         probs.append(f'prompt {i} ({ra[i]["workload"]}): outputs differ at token {d} ({len(x)} vs {len(y)} tokens)')
     la, lb = A.get('label', 'a'), B.get('label', 'b')
     lines = [f'outputs: {same} of {len(set(ra) & set(rb))} prompts identical', '',
-             f'| workload | prompts | tok/s {la} | tok/s {lb} | ratio | tokens / step {la} | tokens / step {lb} |',
-             '|---|---|---|---|---|---|---|']
+             f'| workload | prompts | timed {la} / {lb} | tok/s {la} | tok/s {lb} | ratio '
+             f'| tokens / step {la} | tokens / step {lb} |',
+             '|---|---|---|---|---|---|---|---|']
     ws = sorted({r['workload'] for r in A['rows']})
     for w in ws + ['all']:
         xa = [r for r in A['rows'] if w in ('all', r['workload'])]
@@ -132,7 +159,8 @@ def compare(A, B):
         sa, sb = per_step(xa), per_step(xb)
         f = (lambda v, p=2: '-' if v is None else f'{v:.{p}f}')
         ratio = f(tb / ta, 3) if ta and tb else '-'
-        lines.append(f'| {w} | {len(xa)} | {f(ta)} | {f(tb)} | {ratio} | {f(sa, 3)} | {f(sb, 3)} |')
+        na, nb = (sum(r.get('tok_s') is not None for r in x) for x in (xa, xb))
+        lines.append(f'| {w} | {len(xa)} | {na} / {nb} | {f(ta)} | {f(tb)} | {ratio} | {f(sa, 3)} | {f(sb, 3)} |')
     return probs, lines
 
 

@@ -639,6 +639,177 @@
   ]
  },
  {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "kubectl",
+     "description": "Run a read-only kubectl command and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "args": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "args"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_ticket",
+     "description": "Fetch a ticket by its key.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add_comment",
+     "description": "Add a comment to a ticket.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key",
+       "body"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are an operations assistant with access to a Kubernetes cluster and a ticket tracker. Call a tool when you need data; answer briefly when you have it."
+   },
+   {
+    "role": "user",
+    "content": "Ticket OPS-412 says the checkout service keeps restarting. Find out why and note it on the ticket."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "kubectl",
+     "description": "Run a read-only kubectl command and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "args": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "args"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_ticket",
+     "description": "Fetch a ticket by its key.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add_comment",
+     "description": "Add a comment to a ticket.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key",
+       "body"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are an operations assistant with access to a Kubernetes cluster and a ticket tracker. Call a tool when you need data; answer briefly when you have it."
+   },
+   {
+    "role": "user",
+    "content": "Why are the pods of deployment search-api not ready?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "kubectl",
+       "arguments": "{\"args\": [\"get\", \"pods\", \"-l\", \"app=search-api\", \"-o\", \"wide\"]}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "NAME                          READY   STATUS             RESTARTS   AGE\nsearch-api-7d9f8c6b5-2xkqp    0/1     CrashLoopBackOff   14         52m\nsearch-api-7d9f8c6b5-r8tlm    0/1     CrashLoopBackOff   14         52m\n"
+   }
+  ]
+ },
+ {
   "workload": "edit",
   "messages": [
    {

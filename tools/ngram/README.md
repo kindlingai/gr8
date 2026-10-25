@@ -10,7 +10,7 @@ near-certain continuations would propose drafts that the target accepts. Python 
 | `ab.py` | the engine gate: one boot with `NGRAM` unset, one with it set, the same held-out prompts at temperature 0; outputs byte for byte, decode tok/s and tokens per verify step by workload |
 | `data/prompts.json` | 45 agentic coding prompts: code (16), edit (8), tool calls with a tool list and multi-turn transcripts (11), JSON (6), prose (4) |
 | `data/prompts_tool2.json` | 24 more tool-call turns for the table (the first cluster replay's tool row rested on 11): first turns and transcripts after one or two tool results |
-| `data/ab_prompts.json` | 15 prompts held out of both table sets for the A/B: tool (6), edit (3), JSON (3), code (2), prose (1) |
+| `data/ab_prompts.json` | 17 prompts held out of both table sets for the A/B: tool (8), edit (3), JSON (3), code (2), prose (1). Six tool prompts share the table sets' system prompt and tool list with new tasks (the repeated scaffolding is what the table is for); two use a system prompt and tools the table never saw |
 | `tests/` | `python3 -m unittest discover -s tools/ngram/tests` |
 
 ## Run
@@ -86,7 +86,10 @@ the speedup with 1.
 with `return_token_ids` and `return_step_stats`, one request at a time: the table serves only a request decoding alone.
 It asks for no log-probabilities, so decoding runs as it does when serving. Decode tok/s is (tokens - 1) over the
 request's `step_stats.decode_s` (the first token to the end, on the front end's clock); replies under 50 tokens are not
-timed. `--traces` refuses a prompt whose ids are in the table's traces. `compare` fails on any prompt whose ids differ
-or on runs with different settings or prompt files, and prints, by workload, the median decode tok/s and the tokens
-per verify step on each side. With `G6ENV_X="G6_NGRAM_LOG=1"` rank 0 also logs each table round, and `service.h`
-prints per request how many rounds the table took and how many of its tokens were accepted.
+timed, and the table says how many prompts were. `--traces` refuses the run before it generates anything when a
+prompt's ids are in the table's traces (ids depend on `--effort`: use the traces' effort). A failed request becomes an
+error row. `compare` fails on any prompt whose ids differ, any error row, or runs with different settings, prompt
+files or models, and prints, by workload, the median decode tok/s and the decode tokens per verify step on each side.
+It cannot tell whether the table served: on the `on` boot, check rank 0's `# s2 ngram slot` lines for nonzero table
+rounds (the table serves only a request decoding alone with DFlash2, so a TP3 or MTP-only boot gives ratio 1).
+With `G6ENV_X="G6_NGRAM_LOG=1"` rank 0 also logs each table round.

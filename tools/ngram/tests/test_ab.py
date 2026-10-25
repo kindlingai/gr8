@@ -17,7 +17,17 @@ import ab  # noqa: E402
 class Stub(BaseHTTPRequestHandler):
     seen = []
     flip = None         # a prompt length whose reply changes one token (a broken draft source)
+    fail = None         # a prompt length whose request gets a 500
+    short = None        # a prompt length whose reply is 10 tokens (not timed)
     steps = 20
+    model = 'glm-5.3'
+
+    def do_GET(self):
+        b = json.dumps({'object': 'list', 'data': [{'id': Stub.model}]}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
 
     def log_message(self, *a):
         pass
@@ -30,7 +40,10 @@ class Stub(BaseHTTPRequestHandler):
             out = {'count': n, 'tokens': list(range(1, n + 1))}
         else:
             p = body['prompt']
-            gen = [(len(p) * 31 + j) % 97 for j in range(min(body['max_tokens'], 60))]
+            if Stub.fail == len(p):
+                self.send_error(500)
+                return
+            gen = [(len(p) * 31 + j) % 97 for j in range(min(body['max_tokens'], 10 if Stub.short == len(p) else 60))]
             if Stub.flip == len(p):
                 gen[40] += 1
             out = {'choices': [{'index': 0, 'text': 'x', 'token_ids': gen, 'finish_reason': 'length'}],
@@ -60,7 +73,7 @@ class AbTest(unittest.TestCase):
         self.pp = os.path.join(self.d.name, 'p.json')
         with open(self.pp, 'w') as f:
             json.dump(ITEMS, f)
-        Stub.seen, Stub.flip, Stub.steps = [], None, 20
+        Stub.seen, Stub.flip, Stub.fail, Stub.short, Stub.steps, Stub.model = [], None, None, None, 20, 'glm-5.3'
 
     def tearDown(self):
         self.srv.shutdown()
@@ -96,9 +109,9 @@ class AbTest(unittest.TestCase):
         rc, out = self.compare(a, b)
         self.assertEqual(rc, 0, out)
         self.assertIn('outputs: 3 of 3 prompts identical', out)
-        self.assertIn('| json | 2 |', out)
-        self.assertIn('| all | 3 |', out)
-        self.assertIn('| 3.000 | 6.000 |', out)          # tokens per step: 60/20 off, 60/10 on
+        self.assertIn('| json | 2 | 2 / 2 |', out)
+        self.assertIn('| all | 3 | 3 / 3 |', out)
+        self.assertIn('| 2.950 | 5.900 |', out)          # decode tokens per step: 59/20 off, 59/10 on
 
     def test_a_changed_output_fails(self):
         _, a = self.run_ab('off')
@@ -108,6 +121,44 @@ class AbTest(unittest.TestCase):
         rc, out = self.compare(a, b)
         self.assertEqual(rc, 1)
         self.assertIn('outputs differ at token 40', out)
+
+    def prompt_len(self, out, i):
+        with open(out) as f:
+            return json.load(f)['rows'][i]['prompt_tokens']
+
+    def test_a_failed_request_is_an_error_row_and_fails_compare(self):
+        rc, a = self.run_ab('off')
+        Stub.fail = self.prompt_len(a, 0)
+        rc, b = self.run_ab('on')
+        self.assertEqual(rc, 0)                          # the run goes on
+        with open(b) as f:
+            rows = json.load(f)['rows']
+        self.assertEqual(len(rows), 3)
+        self.assertIn('error', rows[0])
+        self.assertEqual(rows[1]['tokens'], 60)
+        rc, out = self.compare(a, b)
+        self.assertEqual(rc, 1)
+        self.assertIn('prompt 0 (tool): request failed on on', out)
+
+    def test_short_replies_are_counted_but_not_timed(self):
+        rc, a = self.run_ab('off')
+        Stub.short = self.prompt_len(a, 0)
+        _, a = self.run_ab('off')
+        _, b = self.run_ab('on')
+        with open(a) as f:
+            self.assertIsNone(json.load(f)['rows'][0]['tok_s'])
+        rc, out = self.compare(a, b)
+        self.assertEqual(rc, 0, out)
+        self.assertIn('| tool | 1 | 0 / 0 | - | - | - |', out)
+        self.assertIn('| all | 3 | 2 / 2 |', out)
+
+    def test_model_mismatch_fails(self):
+        _, a = self.run_ab('off')
+        Stub.model = 'other'
+        _, b = self.run_ab('on')
+        rc, out = self.compare(a, b)
+        self.assertEqual(rc, 1)
+        self.assertIn('model differs', out)
 
     def test_settings_mismatch_fails(self):
         _, a = self.run_ab('off')
@@ -123,8 +174,10 @@ class AbTest(unittest.TestCase):
         tp = os.path.join(self.d.name, 't.jsonl')
         with open(tp, 'w') as f:
             f.write(json.dumps({'workload': 'json', 'prompt': list(range(1, n + 1)), 'gen': [], 'top': []}) + '\n')
+        Stub.seen = []
         rc, _ = self.run_ab('on', '--traces', tp)
         self.assertEqual(rc, 2)
+        self.assertFalse([p for p, _ in Stub.seen if p == '/v1/completions'])   # refused before any generation
 
 
 class BundledSetsTest(unittest.TestCase):
@@ -141,6 +194,11 @@ class BundledSetsTest(unittest.TestCase):
         for i in table + held:
             self.assertIn(i['workload'], ('code', 'edit', 'tool', 'json', 'prose'))
             if i.get('tools'):     # every tool call has its result, so the next turn is the model's
+                names = {t['function']['name'] for t in i['tools']}
+                for m in i['messages']:
+                    for c in m.get('tool_calls') or []:
+                        self.assertIn(c['function']['name'], names)
+                        self.assertIsInstance(json.loads(c['function']['arguments']), dict)
                 ids = [c['id'] for m in i['messages'] for c in m.get('tool_calls') or []]
                 res = [m['tool_call_id'] for m in i['messages'] if m['role'] == 'tool']
                 self.assertEqual(ids, res)
