@@ -106,6 +106,9 @@ struct FlashPrefill
     bool agd_done = false;                       // G6_PF_SP_AGD: the owner pass wrote the send slot (pf_consume_launch)
     bool sp_agk[4] = {};                         // G6_PF_SP_AGK: all-gather c runs on the compute stream (pf_sp_gather)
     bool attn_frag = false;                      // xn holds the attention input as f16 + bf16 fragment tables (G6_PF_XFRAG)
+    bool sp_frag = false;                        // G6_PF_SP_XFRAG, owner-row view: write rows sp_m0.. of the sp_M-row tables
+    unsigned *sp_f16 = nullptr, *sp_bf16 = nullptr;
+    int sp_m0 = 0, sp_M = 0;
     __half *x = nullptr, *x2 = nullptr;          // [MP][HID]
     __nv_bfloat16* part[2] = {};                 // [MP][HID]
     float* resid = nullptr;                      // [MP][HID]: final stream mean (after the last layer)
@@ -510,13 +513,14 @@ inline bool pf_xfrag_env()
     static const bool on = getenv("G6_PF_XFRAG") && atoi(getenv("G6_PF_XFRAG")) == 1;
     return on;
 }
-inline bool pf_attn_frag_ok(Model& m, int j)
+inline bool pf_attn_frag_layer_ok(Model& m, int j)   // layer j's attention block reads fragment tables only
 {
-    if (!pf_xfrag_env() || pf_force_p1() || HID != 4096) return false;
+    if (pf_force_p1() || HID != 4096) return false;
     const Layer& y = m.layers[j];
     if (y.kda) return pf_kda_gemm_on(y.kda_w) && (pf_kda_tail() == 1 || pf_kda_tail() == 2) && !pf_kda_tail_check();
     return !pf_dsa_p1();
 }
+inline bool pf_attn_frag_ok(Model& m, int j) { return pf_xfrag_env() && pf_attn_frag_layer_ok(m, j); }
 inline unsigned* pf_attn_f16(FlashPrefill& P) { return reinterpret_cast<unsigned*>(P.xn); }
 inline unsigned* pf_attn_bf16(FlashPrefill& P) { return reinterpret_cast<unsigned*>(P.xn) + (size_t)(P.MP + 7) / 8 * 8 * HID / 2; }
 inline void pf_need_fp32_xn(const FlashPrefill& P, const char* who)
@@ -896,14 +900,16 @@ inline void pf_consume_launch(Model& m, FlashPrefill& P, int i, int c, int M, cu
             const int wl = c == 0 ? i : i + 1, wh = c == 0 ? 1 : 0;
             const flash_mhc::Weights& w = m.layers[wl].hc[wh];
             const bool rr = !P.fnp.empty() && !wp && pf_mhc_rr();
-            const bool frag = c == 1 && rr && !P.sp_view && pf_attn_frag_ok(m, i + 1);
+            const bool frag = c == 1 && rr && (P.sp_view ? P.sp_frag : pf_attn_frag_ok(m, i + 1));
             if (c == 1) P.attn_frag = frag;
             if (rr)   // nothing to wait for: re-read rows, bit-identical
             {
+                unsigned* f16 = frag ? (P.sp_view ? P.sp_f16 : pf_attn_f16(P)) : nullptr;
+                unsigned* bf16 = frag ? (P.sp_view ? P.sp_bf16 : pf_attn_bf16(P)) : nullptr;
                 flash_mhc::k_mhc_out_inv_prepare_rr<Blk, PF_MHC_RR_R, 1><<<(M + PF_MHC_RR_R - 1) / PF_MHC_RR_R, flash_mhc::THREADS, 0, st>>>(
                     flash_mhc::side(mhc_buffers(P), c), blk, w, P.fnp[wl * 2 + wh], M, geom::RMS_EPS_FLASH, c == 0 ? P.x2 : P.x,
-                    c == 0 ? P.xn2 : frag ? nullptr : P.xn, frag ? pf_attn_f16(P) : nullptr, frag ? pf_attn_bf16(P) : nullptr,
-                    P.agd_x, P.agd_xn);
+                    c == 0 ? P.xn2 : frag ? nullptr : P.xn, f16, bf16, P.agd_x, P.agd_xn, frag && P.sp_view ? P.sp_m0 : 0,
+                    frag && P.sp_view ? P.sp_M : 0);
                 P.agd_done = P.agd_x || P.agd_xn;
             }
             else if (!P.fnp.empty())   // packed fn, 2 rows per CTA: bit-identical to k_mhc_out_inv_prepare
@@ -962,7 +968,9 @@ inline void pf_sp_issue(FlashPrefill& P, int c, int M, cudaStream_t st, bool x16
     else if (P.sp_agk[c]) {}   // G6_PF_SP_AGK: pf_sp_gather waits and copies on the compute stream
     else
     {
-        float* xn = c == 1 ? P.xn2 : P.xn;
+        // G6_PF_SP_XFRAG (P.attn_frag, c = 3): xn holds the fragment tables, the rows land in xn2 (its MLP is done, the
+        // next layer's owner pass writes it after pf_sp_gather) and pf_sp_gather builds the tables from there
+        float* xn = c == 1 || P.attn_frag ? P.xn2 : P.xn;
         k_wait_ag<<<1, 32, 0, P.sp_st>>>(P.f, P.stepp, c, M, HID * 4);
         for (int p = 0; p < nr; ++p)
         {
@@ -979,28 +987,67 @@ __global__ void k_sp_f16(const float* __restrict__ src, __half* __restrict__ dst
 // G6_PF_SP_AGK: grid (PF_SP_AGK_CTA, nr), block 256, after k_wait_ag on the same stream: peer p's FP32 rows (offset 0
 // of its recv slot) -> xn rows pf_r0(M, p).. and their __float2half_rn copy -> x rows (what the copy engine + k_sp_f16 write)
 constexpr int PF_SP_AGK_CTA = 96;
+// FRAG (G6_PF_SP_XFRAG): the rows' fragment table words (flash_mhc::write_frag_pair, pad rows after row M - 1) instead of
+// the FP32 rows; the same rounding of the same FP32 values as k_mhc_fragments
+template <bool FRAG = false>
+__device__ __forceinline__ void pf_sp_row4(const float4 v, size_t i, size_t r0, int M, float4* d, uint2* h, unsigned* f16,
+                                           unsigned* bf16)
+{
+    if (FRAG)
+    {
+        const int m = (int)(r0 + i / (HID / 4)), hh = (int)(i % (HID / 4)) * 4;
+        flash_mhc::write_frag_pair(m, M, HID, hh, v.x, v.y, f16, bf16);
+        flash_mhc::write_frag_pair(m, M, HID, hh + 2, v.z, v.w, f16, bf16);
+    }
+    else d[i] = v;
+    const __half2 lo = __halves2half2(__float2half_rn(v.x), __float2half_rn(v.y));
+    const __half2 hi = __halves2half2(__float2half_rn(v.z), __float2half_rn(v.w));
+    h[i] = make_uint2(*reinterpret_cast<const unsigned*>(&lo), *reinterpret_cast<const unsigned*>(&hi));
+}
+template <bool FRAG = false>
 __global__ void __launch_bounds__(256) k_sp_ag_f16(g6::FabricDev f, const u64* stepp, int c, int M, float* __restrict__ xn,
-                                                   __half* __restrict__ x)
+                                                   __half* __restrict__ x, unsigned* f16 = nullptr, unsigned* bf16 = nullptr)
 {
     const int p = blockIdx.y;
     if (p == f.rank) return;
     const size_t r0 = (size_t)pf_r0(M, p, f.nr), n4 = (size_t)pf_rows(M, p, f.nr) * HID / 4;
     const float4* s = reinterpret_cast<const float4*>(glue::peer_slot(f, *stepp, c, p));
-    float4* d = reinterpret_cast<float4*>(xn + r0 * HID);
+    float4* d = FRAG ? nullptr : reinterpret_cast<float4*>(xn + r0 * HID);
     uint2* h = reinterpret_cast<uint2*>(x + r0 * HID);
     for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < n4; i += (size_t)gridDim.x * 256)
-    {
-        const float4 v = __ldcv(s + i);
-        d[i] = v;
-        const __half2 lo = __halves2half2(__float2half_rn(v.x), __float2half_rn(v.y));
-        const __half2 hi = __halves2half2(__float2half_rn(v.z), __float2half_rn(v.w));
-        h[i] = make_uint2(*reinterpret_cast<const unsigned*>(&lo), *reinterpret_cast<const unsigned*>(&hi));
-    }
+        pf_sp_row4<FRAG>(__ldcv(s + i), i, r0, M, d, h, f16, bf16);
+}
+// G6_PF_SP_XFRAG, lane without AGK: peer rows r0.. (FP32, device, xn2) -> x rows + the fragment table words
+__global__ void __launch_bounds__(256) k_sp_frag(const float* __restrict__ src, __half* __restrict__ x, int r0, int rows,
+                                                 int M, unsigned* f16, unsigned* bf16)
+{
+    const size_t n4 = (size_t)rows * HID / 4;
+    const float4* s = reinterpret_cast<const float4*>(src + (size_t)r0 * HID);
+    uint2* h = reinterpret_cast<uint2*>(x + (size_t)r0 * HID);
+    for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < n4; i += (size_t)gridDim.x * 256)
+        pf_sp_row4<true>(s[i], i, (size_t)r0, M, nullptr, h, f16, bf16);
 }
 // G6_PF_SP_X16 applies to collective 1 (the MLP input) of an MoE layer whose router runs row-split
 inline bool pf_sp_x16_layer(const Model& m, const FlashPrefill& P, int i, int c, int M)
 {
     return pf_sp_x16() && c == 0 && m.layers[i].moe && P.route_split.fabric && flash_route_split::active(M, P.route_split.f.nr);
+}
+// G6_PF_SP_XFRAG (default on, read once; =0 off; with G6_PF_SP_AGD): the consume after layer i's MLP (c = 1) builds layer i + 1's
+// attention input as fragment tables in P.xn's memory (G6_PF_XFRAG's layout), not FP32 rows: the owner pass
+// (k_mhc_out_inv_prepare_rr, rows r0.. of M) and the gather (k_sp_ag_f16<true> / k_sp_frag, the peers' rows) each write
+// their rows' words. The same rounding of the same FP32 values as k_mhc_fragments: the same tables, and the attention
+// block skips its fragment pass. The FP32 rows still travel (the AG send slot, G6_PF_SP_AGD). TP3 8K A/B: prefill
+// 2540 -> 2560 tok/s, rank-0 8K -21 ms, T=0 hashes unchanged.
+inline bool pf_sp_xfrag()
+{
+    static const bool on = !(getenv("G6_PF_SP_XFRAG") && atoi(getenv("G6_PF_SP_XFRAG")) == 0);
+    return on;
+}
+inline bool pf_sp_frag_on(Model& m, const FlashPrefill& P, int i, int c)
+{
+    if (!pf_sp_xfrag() || c != 1 || i + 1 >= m.nl || !pf_sp_agd() || HID != 4096) return false;
+    if (pf_fuse_level() < 1 || P.fnp.empty() || !pf_mhc_rr()) return false;   // the rr owner pass of pf_consume_launch
+    return pf_attn_frag_layer_ok(m, i + 1);
 }
 // G6_PF_SP, first half of a consume: this rank's rows of every partial have landed (collective 2c), mHC on them,
 // then the FP32 normalized rows (xn2 after attention, xn after the MLP / the final norm) into collective 2c + 1
@@ -1009,6 +1056,7 @@ inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream
     const int crs = 2 * c, cag = crs + 1, nr = P.f.nr, me = P.f.rank;
     const int r0 = pf_r0(M, me, nr), rows = pf_rows(M, me, nr);
     G6RT_CK(cudaStreamWaitEvent(st, P.sp_ready[crs], 0));   // the peers' slices are in sp_peer (pf_sp_issue)
+    const bool frag = pf_sp_frag_on(m, P, i, c);
     bool agd = false;
     if (rows)
     {
@@ -1018,6 +1066,7 @@ inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream
         Q.hc_post += r * geom::HC; Q.hc_comb += r * geom::HC * geom::HC; Q.hc_done += r;
         Q.xn += r * HID; Q.xn2 += r * HID; Q.x += r * HID; Q.x2 += r * HID; Q.resid += r * HID;
         Q.sp_view = true;
+        Q.sp_frag = frag; Q.sp_f16 = pf_attn_f16(P); Q.sp_bf16 = pf_attn_bf16(P); Q.sp_m0 = r0; Q.sp_M = M;
         const char* slot_own = c == 1 ? P.fin_own : P.att_own;   // G6_PF_SP_FIND / G6_PF_SP_ATTD
         __nv_bfloat16* own = slot_own ? reinterpret_cast<__nv_bfloat16*>(const_cast<char*>(slot_own)) : P.part[c] + r * HID;
         MhcFabricPeerBlock blk{MhcFabricBlock{P.f, P.stepp, crs, 0, own}};
@@ -1030,8 +1079,9 @@ inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream
         }
         pf_consume_launch(m, Q, i, c, rows, st, blk, 0);
         agd = Q.agd_done;
+        if (frag && (!agd || !Q.attn_frag)) die("pf_sp_own: G6_PF_SP_XFRAG without the AGD rr owner pass");
     }
-    P.attn_frag = false;
+    P.attn_frag = frag;
     if (pf_sp_x16_layer(m, P, i, c, M))
     {
         if (agd) k_publish<<<1, 32, 0, st>>>(P.f, P.stepp, cag, P.tickets + cag);   // G6_PF_SP_AGD: rows already in the slot
@@ -1051,18 +1101,21 @@ inline void pf_sp_gather(FlashPrefill& P, int c, int M, cudaStream_t st, bool x1
     float* xn = c == 0 ? P.xn2 : P.xn;
     __half* x = c == 0 ? P.x2 : P.x;
     const int cag = 2 * c + 1;
+    const bool frag = c == 1 && P.attn_frag;   // G6_PF_SP_XFRAG (pf_sp_own)
     if (P.sp_agk[cag])   // G6_PF_SP_AGK: pf_sp_issue left the wait and the copies to this pass
     {
         k_wait_ag<<<1, 32, 0, st>>>(P.f, P.stepp, cag, M, HID * 4);
-        k_sp_ag_f16<<<dim3(PF_SP_AGK_CTA, P.f.nr), 256, 0, st>>>(P.f, P.stepp, cag, M, xn, x);
+        if (frag) k_sp_ag_f16<true><<<dim3(PF_SP_AGK_CTA, P.f.nr), 256, 0, st>>>(P.f, P.stepp, cag, M, nullptr, x, pf_attn_f16(P), pf_attn_bf16(P));
+        else k_sp_ag_f16<false><<<dim3(PF_SP_AGK_CTA, P.f.nr), 256, 0, st>>>(P.f, P.stepp, cag, M, xn, x);
         return;
     }
-    G6RT_CK(cudaStreamWaitEvent(st, P.sp_ready[cag], 0));   // the peers' rows are in xn (pf_sp_issue)
+    G6RT_CK(cudaStreamWaitEvent(st, P.sp_ready[cag], 0));   // the peers' rows are in xn (xn2 with frag; pf_sp_issue)
     for (int p = 0; p < P.f.nr; ++p)   // peer rows only: the owner pass wrote this rank's xn / x rows
     {
         const int r0 = pf_r0(M, p, P.f.nr), rows = pf_rows(M, p, P.f.nr);
         if (p == P.f.rank || !rows) continue;
-        k_sp_f16<<<256, 256, 0, st>>>(xn + (size_t)r0 * HID, x + (size_t)r0 * HID, (size_t)rows * HID);
+        if (frag) k_sp_frag<<<256, 256, 0, st>>>(P.xn2, x, r0, rows, M, pf_attn_f16(P), pf_attn_bf16(P));
+        else k_sp_f16<<<256, 256, 0, st>>>(xn + (size_t)r0 * HID, x + (size_t)r0 * HID, (size_t)rows * HID);
     }
 }
 // wait for every rank's partial of collective c, sum in rank order (FP32), update the streams, then the next block's

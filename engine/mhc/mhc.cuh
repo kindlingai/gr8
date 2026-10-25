@@ -631,7 +631,8 @@ template<class Block, int R, int MINB>
 __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
     Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
     __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr,
-    __half* out2=nullptr, float* normalized2=nullptr) {
+    __half* out2=nullptr, float* normalized2=nullptr, int fm0=0, int fM=0) {
+    // fm0 / fM (G6_PF_SP_XFRAG): the rows are rows fm0.. of an fM-row batch; the fragment tables are the batch's
     __shared__ float sh_sums[R][24][8];
     __shared__ float sh_mix[R][24];
     __shared__ float sh_pre[R][4];
@@ -762,7 +763,7 @@ __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
             if (normalized2) normalized2[(size_t)m * 4096 + h] = val;
             if (f16 || bf16) {   // fragment tables of all M rows (zero pad rows after the last), as k_mhc_fragments
                 const float b_val = __shfl_xor_sync(0xffffffffu, val, 1);
-                if (!(threadIdx.x & 1)) write_frag_pair(m, M, 4096, h, val, b_val, f16, bf16);
+                if (!(threadIdx.x & 1)) write_frag_pair(m + fm0, fM ? fM : M, 4096, h, val, b_val, f16, bf16);
             }
         }
     }
