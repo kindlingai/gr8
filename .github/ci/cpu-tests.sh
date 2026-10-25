@@ -21,24 +21,6 @@ if [ "$PART" != frontend ]; then
   step "scripts/host_tests.sh"
   scripts/host_tests.sh
 
-  step "other host C++ tests"
-  g++ -O2 -std=c++17 engine/tests/test_spec_len.cpp -o "$T/test_spec_len"
-  "$T/test_spec_len"
-  g++ -O2 -std=c++17 -I engine/kernels engine/tests/test_topk.cpp -o "$T/test_topk"
-  "$T/test_topk"
-  g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_request_test.cpp -o "$T/control_request_test"
-  "$T/control_request_test"
-  g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_sync_test.cpp -o "$T/control_sync_test"
-  "$T/control_sync_test"
-  g++ -std=c++17 -O1 -fsanitize=address,undefined -I engine/runtime engine/runtime/tests/serve_parse_test.cpp -o "$T/serve_parse_test"
-  "$T/serve_parse_test"
-  g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_idle_test.cpp -o "$T/control_idle_test"
-  "$T/control_idle_test"     # the socketpair cases. The silent-peer case needs a network namespace.
-  g++ -std=c++17 -O2 -fsanitize=address,undefined -I engine/comms engine/comms/tests/relay_test.cpp -o "$T/relay_test"
-  "$T/relay_test"
-  g++ -std=c++20 -O1 -pthread -I engine/comms tools/health/test_progress_cpus.cpp -o "$T/test_progress_cpus"
-  "$T/test_progress_cpus"    # needs 3 or more CPUs
-
   step "Python tests (engine)"
   # Artifact tools and the C++ loader must agree on the same materialized profiles.
   g++ -std=c++17 -O2 -Wall -Wextra -pthread -I engine/runtime \

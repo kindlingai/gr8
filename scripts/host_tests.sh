@@ -18,7 +18,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 "$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
 "$T/fabric_mtu_test"
-g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" -o "$T/relay_test"
+g++ -std=c++17 -O2 -Wall -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" \
+  -o "$T/relay_test"
 "$T/relay_test"
 python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the fabric pool (engine/comms/fabric_pool.h, #154): boot, groups and their ports over loopback, no leaked descriptor
@@ -188,3 +189,35 @@ python3 "$REPO/engine/tests/test_flash_terminal_retain.py"
 # G6_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
 # the real Service on two ranks; the entry stays aligned and a longer prompt keeps its own aligned checkpoint
 python3 "$REPO/engine/tests/test_flash_terminal_cancel.py"
+# the adaptive draft length decision, and the top-k selection
+g++ -std=c++17 -O2 "$REPO/engine/tests/test_spec_len.cpp" -o "$T/test_spec_len"
+"$T/test_spec_len"
+g++ -std=c++17 -O2 -I "$REPO/engine/kernels" "$REPO/engine/tests/test_topk.cpp" -o "$T/test_topk"
+"$T/test_topk"
+# the control channel: requests, sync, and idle peers (the socketpair cases; the silent-peer case needs a network
+# namespace)
+for t in control_request_test control_sync_test control_idle_test; do
+  g++ -std=c++17 -O2 -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/$t"
+  "$T/$t"
+done
+g++ -std=c++17 -O1 -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/serve_parse_test.cpp" \
+  -o "$T/serve_parse_test"
+"$T/serve_parse_test"
+# the fabric's progress CPU lists; needs 3 or more CPUs
+g++ -std=c++20 -O1 -pthread -I "$REPO/engine/comms" "$REPO/tools/health/test_progress_cpus.cpp" -o "$T/test_progress_cpus"
+"$T/test_progress_cpus"
+# CP batching on the CPU, the Flash DSA full-attention schedule, the Flash pool owner's rows and TP2 wire format, the
+# MoE top-k env parse, the Flash per-request speculation reset
+g++ -std=c++17 -O2 "$REPO/engine/runtime/tests/cp_batch_cpu_test.cpp" -o "$T/cp_batch_cpu_test"
+"$T/cp_batch_cpu_test"
+g++ -std=c++17 -O2 "$REPO/engine/runtime/tests/flash_dsa_full_schedule_test.cpp" -o "$T/flash_dsa_full_schedule_test"
+"$T/flash_dsa_full_schedule_test"
+g++ -std=c++17 -O2 "$REPO/engine/tests/test_flash_pool_owner.cpp" -o "$T/test_flash_pool_owner"
+"$T/test_flash_pool_owner"
+g++ -std=c++17 -O2 -I "$REPO/engine/runtime" "$REPO/engine/tests/test_moe_topk_env.cpp" -o "$T/test_moe_topk_env"
+"$T/test_moe_topk_env"
+g++ -std=c++17 -O2 -DG6_MODEL_FLASH=1 "$REPO/engine/tests/test_spec_reset.cpp" -o "$T/test_spec_reset"
+"$T/test_spec_reset"
+# the glue kda_g9_test.cu feeds the KDA G9 CPU emulation with (kda_g9_glue.h), on two heads
+g++ -std=c++17 -O3 -fopenmp -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_g9_glue_test.cpp" -o "$T/kda_g9_glue_test"
+"$T/kda_g9_glue_test"

@@ -1,13 +1,12 @@
 #!/bin/bash
-# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs|tests]
+# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs]
 # sim / g6 / all: m4sim and g6m4, one binary each that runs every TP width in WIDTHS (default 6; below).
 # JOBS: compiles at once (default: the CPU count; each takes under 1 GB).
-# tests: only the unit tests (tests/row_budget_test.cu, tests/s2_attn_test.cu) into $OUT; scripts/c1_tests.sh builds and runs them.
 # m4sim: one GPU, NR simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
 # dfl: dfltest and dflreplay only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py; the
 #      G6_DFL_BODY_I4 replay of a G6_DFL_DUMP)
 # rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution.
-# tests, dfl and rs build the one width EXTRA names (EXTRA="-DG6_NR=4 -DDEC_S2"; default 6).
+# dfl and rs build the one width EXTRA names (EXTRA="-DG6_NR=4 -DDEC_S2"; default 6).
 # EXTRA=-DG6_MODEL_FLASH=1: the GLM 5.3 Flash geometry (engine/model_geom.h); scripts/build.sh MODEL=flash names the results *_flash.
 set -e
 cd "$(dirname "$0")"
@@ -29,13 +28,6 @@ cache_counts() { [ -f $G6_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit'
 # flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer)
 ATTN_CU=../attn/attn.cu; ATTN_BIND_CU=../attn/bind.cu; ATTN_OPS_CU=../attn/ops_glm.cu
 case " $EXTRA " in *" -DG6_MODEL_FLASH=1 "*) ATTN_CU=../attn/flash_attn.cu; ATTN_BIND_CU=../attn/flash_bind.cu; ATTN_OPS_CU=../attn/ops_flash.cu ;; esac
-if [ "$WHAT" = tests ]; then
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/row_budget_test tests/row_budget_test.cu
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/s2_attn_test tests/s2_attn_test.cu $ATTN_CU $ATTN_BIND_CU $ATTN_OPS_CU -lcublas
-  ls -la $OUT/row_budget_test $OUT/s2_attn_test
-  cache_counts
-  exit 0
-fi
 if [ "$WHAT" = rs ]; then
   nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/rstest rstest.cu
   ls -la $OUT/rstest

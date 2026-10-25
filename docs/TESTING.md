@@ -34,8 +34,8 @@ What the two halves cover, and how to run one part alone:
 | the pseudo engine's rules (`model/responses.toml`) | front end | `cd frontend/pseudo-engine && cargo test` |
 | the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`), and four supervisors with stub engines on 127.0.0.1-4 | front end | `python3 -m unittest discover -s tools/launch` |
 
-`cpu-tests.sh` also runs the other host C++ tests, the steering and converter tests and a shell syntax check. Read it
-for the full list.
+`cpu-tests.sh` also runs the steering and converter tests and a shell syntax check, and `scripts/host_tests.sh` runs
+the host C++ tests. Read them for the full list.
 
 ## The pseudo engine: no GPU
 
@@ -110,7 +110,6 @@ one GPU and makes its own synthetic weights.
 
 | mode | test | checks | needs |
 |---|---|---|---|
-| `tests` | `row_budget_test`, `s2_attn_test` | as above | |
 | `rs` | `rstest` | the vocab-split head kernels for rejection sampling, all ranks on one GPU | |
 | `dfl` | `dfltest` | the DFlash2 drafter step against `engine/ref/dflash2_check.py` | drafter packs |
 | `dfl` | `dflreplay` | `G6_DFL_BODY_I4` against MXFP8, replaying a `G6_DFL_DUMP` | drafter packs, a dump |
