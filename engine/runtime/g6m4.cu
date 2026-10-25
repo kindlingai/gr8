@@ -601,7 +601,10 @@ int main(int argc, char** argv)
     boot_rank = cfg.rank;
     mem_min_gib();                      // a bad G6_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
-    cfg.xtrace = getenv("G6_XTRACE_PF") ? 0 : 1;   // G6_XTRACE=1: stage-0 trace on the decode fabric only (xtrace.h); off by default
+    // G6_XTRACE=1: stage-0 trace (xtrace.h, default off) on the decode fabric, or with G6_XTRACE_PF=1 on the two prefill
+    // fabrics instead
+    const bool xtrace_pf = getenv("G6_XTRACE_PF") && atoi(getenv("G6_XTRACE_PF")) == 1;
+    cfg.xtrace = xtrace_pf ? 0 : 1;
     fab.init(cfg);
     cfg.xtrace = 0;
     const g6::FabricDev f = fab.dev();
@@ -641,7 +644,7 @@ int main(int argc, char** argv)
         cp.port = cfg.port + 8;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
-        cp.xtrace = getenv("G6_XTRACE_PF") ? 1 : 0;
+        cp.xtrace = xtrace_pf ? 1 : 0;
         fabp.init(cp);
         fabp.start_proxy();
     }
@@ -659,7 +662,7 @@ int main(int argc, char** argv)
         cp.port = cfg.port + 24;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
-        cp.xtrace = getenv("G6_XTRACE_PF") ? 1 : 0;
+        cp.xtrace = xtrace_pf ? 1 : 0;
         fabp2.init(cp);
         fabp2.start_proxy();
     }
@@ -2645,14 +2648,14 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
             {
                 pf_inputs_flash(FP, M, p.prompt.data() + a, pos.data());
-                pf_enqueue_flash(fabp, ls0, NL, M);
+                pf_enqueue_flash(fabp, m, FP, ls0, NL, M);
                 const int MB = two && p.first - a > MP ? std::min(MP, p.first - a - MP) : 0;
                 if (MB)
                 {
                     std::vector<int> posB(MB);
                     for (int r = 0; r < MB; ++r) posB[r] = a + M + r;
                     pf_inputs_flash(FP2, MB, p.prompt.data() + a + M, posB.data());
-                    pf_enqueue_flash(fabp2, ls0b, NL, MB);
+                    pf_enqueue_flash(fabp2, m, FP2, ls0b, NL, MB);
                 }
                 // G6_RESID_DUMP: one record per sub-batch (step field 0), every slot copied out as it is reached
                 std::function<void(int, int)> pf_copy;

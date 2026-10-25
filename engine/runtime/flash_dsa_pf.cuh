@@ -264,6 +264,7 @@ inline F16Set* f16_prepare(Model& m, const void* lane, int MP, cudaStream_t st)
         ln.y32 = dmalloc<float>(static_cast<size_t>(MP) * o32);
     }
     ln.MP = std::max(ln.MP, MP);
+    flash_dsa_f16::lt_prepare(MP);   // G6_PF_DSA_LT: every row-count plan now, none on the serve path
     G6RT_CK(cudaStreamSynchronize(st));
     G6RT_CK(cudaMemGetInfo(&free1, &total));
     std::fprintf(stderr, "# DSA f16 gemm: %d of %d projections on cuBLAS; lane %d MP %d; device memory +%.1f MiB\n", f.on,

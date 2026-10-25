@@ -175,7 +175,7 @@ void check_qp_mtu(ibv_qp* qp, const Rail& R, const QPInfo& peer, ibv_mtu selecte
 // bulk ranges ahead of their flags. Writes of up to kRelayInline bytes (the bulk flags) travel inside the SEND.
 struct RelayHdr { uint64_t off, pos; uint32_t len, kind; };   // kind 0: len bytes at ring position pos; 1: inline
 constexpr int kRelayRecv = 4096, kRelayBuf = 64, kRelayInline = kRelayBuf - (int)sizeof(RelayHdr);
-struct RingInfo { QPInfo dn, dp, orq, ri, fwd, fin, dn2, dp2; };  // dn2/dp2: TP=3 stripe QPs (other PCIe root)        // my QPs; addr/rkey = where the paired QP writes
+struct RingInfo { QPInfo dn, dp, orq, ri, fwd, fin, dn2, dp2; uint32_t stripe; };  // dn2/dp2: TP=3 stripe QPs (other PCIe root); stripe: this rank has them        // my QPs; addr/rkey = where the paired QP writes
 struct RelayCtx {
   ibv_qp* ri = nullptr; ibv_cq* ri_cq = nullptr; ibv_qp* fwd = nullptr; ibv_cq* fwd_cq = nullptr;
   char* rbuf = nullptr; char* ring = nullptr; uint32_t ring_lkey = 0;
@@ -379,7 +379,7 @@ struct Fabric::Impl {
   int bump = 1;                                      // barrier port rotation (per fabric: groups run their own barriers)
   std::thread xquit;                                 // G6_XTRACE_QUIT watcher
   void wc_count(int r, int peer, int st) {
-    if (r > 1) r -= 2;                               // ring stripe rails 2 / 3 count with the port's direct rail
+    if (r > 1 && stripe) r -= 2;                     // TP=3 ring stripe: rails 2 / 3 count with the port's direct rail
     if (peer < 0 || peer >= 8 || r < 0 || r > 1) return;
     xwc[r][peer][st == IBV_WC_RETRY_EXC_ERR ? 0 : st == IBV_WC_RNR_RETRY_EXC_ERR ? 1 : 2]++;
   }
@@ -513,11 +513,19 @@ void Fabric::init(const FabricConfig& cfg) {
     I.ring_rail[I.nxt] = 0; I.ring_rail[I.prv] = 1; if (I.dia >= 0) I.ring_rail[I.dia] = 2;
     // TP=3: both directs sit on one PCIe root (one x4 link carries both peers' traffic). With stripe_min set, a second
     // QP per neighbour on the same port's device on the other root carries half of each large write (rail2_of).
-    const bool rstripe = nr == 3 && cfg.stripe_min > 0 && !I.var && !I.bulk;
-    I.nrails = nr == 4 ? 3 : rstripe ? 4 : 2;           // the rails whose CQs the proxy polls
+    bool rstripe = nr == 3 && cfg.stripe_min > 0 && !I.var && !I.bulk;
     const std::vector<std::string> dn = cfg.ring_devs.empty()
         ? std::vector<std::string>{"rocep1s0f0", "roceP2p1s0f0", "rocep1s0f1", "roceP2p1s0f1"} : cfg.ring_devs;
     FCHECK(dn.size() == 4);
+    // The stripe devices (ring_devs 0 and 2: rails 2 / 3) need an IPv4 RoCE v2 GID; a ring set up for the direct rails
+    // only may have none there. Then this rank opens rails 0 / 1 only, and every rank sees that in the allgather below.
+    if (rstripe)
+      for (int k : {0, 2})
+        if (rstripe && ring_gid_index(dn[k]) < 0) {
+          fprintf(stderr, "[fabric r%d port %d] ring stripe off: %s has no IPv4 RoCE v2 GID\n", me, cfg.port, dn[k].c_str());
+          rstripe = false;
+        }
+    I.nrails = nr == 4 ? 3 : rstripe ? 4 : 2;           // the rails whose CQs the proxy polls
     const int map[4] = {2, 0, 3, 1};                    // ring_devs order -> rails index
     const int nopen = nr == 4 || rstripe ? 4 : 2;
     for (int k = 0; k < 4; k++) {
@@ -569,6 +577,7 @@ void Fabric::init(const FabricConfig& cfg) {
       qdp2 = mkqp(I.rails[3], nullptr, 2048, 1, 1, inl, nullptr);
       mi.dn2 = info(qdn2, I.rails[2], I.rails[2].mr->rkey, recv, 7);
       mi.dp2 = info(qdp2, I.rails[3], I.rails[3].mr->rkey, recv, 8);
+      mi.stripe = 1;
     }
     ibv_qp *qor = nullptr, *qri = nullptr, *qfwd = nullptr, *qfin = nullptr;
     RelayCtx& X = I.relay;
@@ -610,6 +619,14 @@ void Fabric::init(const FabricConfig& cfg) {
     }
     auto all = allgather(me, nr, cfg.ips[0], cfg.port, &mi, sizeof mi);
     const RingInfo* A = (const RingInfo*)all.data();
+    if (rstripe)   // stripe on only when every rank has its stripe QPs; else the same direct-rail ring as without it
+      for (int p = 0; p < nr; p++)
+        if (!A[p].stripe) {
+          fprintf(stderr, "[fabric r%d port %d] ring stripe off: rank %d has no stripe rails\n", me, cfg.port, p);
+          FCHECK(ibv_destroy_qp(qdn2) == 0); FCHECK(ibv_destroy_qp(qdp2) == 0); qdn2 = qdp2 = nullptr;
+          rstripe = false; I.nrails = 2;
+          break;
+        }
     connect(qdn, I.rails[0], mi.dn, A[I.nxt].dp); I.qp[I.nxt] = qdn; I.peer[I.nxt] = A[I.nxt].dp;
     connect(qdp, I.rails[1], mi.dp, A[I.prv].dn); I.qp[I.prv] = qdp; I.peer[I.prv] = A[I.prv].dn;
     if (rstripe) {
@@ -875,7 +892,7 @@ void Fabric::start_proxy() {
           ibv_wc wc[32]; const int n = ibv_poll_cq(I.rails[r2].cq, 32, wc);
           if (n < 0) { fprintf(stderr, "[fabric r%d] ibv_poll_cq failed (%d)\n", me, n); *dev_.error = kBulkCqError; return false; }
           for (int k = 0; k < n; k++) {
-            if (wc[k].status != IBV_WC_SUCCESS) { I.wc_count(r2, (int)(wc[k].wr_id & 0xff), wc[k].status); fprintf(stderr, "[fabric r%d] WC error %s (stripe)\n", me, ibv_wc_status_str(wc[k].status)); *dev_.error = kBulkCqError; return false; }
+            if (wc[k].status != IBV_WC_SUCCESS) { I.wc_count(r2, (int)(wc[k].wr_id & 0xff), wc[k].status); fprintf(stderr, "[fabric r%d] WC error %s (stripe)\n", me, ibv_wc_status_str(wc[k].status)); *dev_.error = 0x71000000u; return false; }
             if (wc[k].wr_id >= 0x100u && wc[k].wr_id < 0x100u + 32) want &= ~(1u << (wc[k].wr_id - 0x100u));
           }
         }

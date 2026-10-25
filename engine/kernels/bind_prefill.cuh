@@ -5692,8 +5692,9 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
 #if G6_MODEL_FLASH
     t.ysh = t.yw + R0 * HID;
     t.hx = reinterpret_cast<__half*>(take(m * HID * 2));
-    t.hq = reinterpret_cast<uint8_t*>(take(m * HID));
-    t.hs = reinterpret_cast<uint8_t*>(take(m * (HID / 32)));
+    static const bool q8 = getenv("G6_PF_Q8") && atoi(getenv("G6_PF_Q8")) == 1;   // the only reader of hq / hs (A.q8)
+    t.hq = q8 ? reinterpret_cast<uint8_t*>(take(m * HID)) : nullptr;
+    t.hs = q8 ? reinterpret_cast<uint8_t*>(take(m * (HID / 32))) : nullptr;
     t.wt = reinterpret_cast<int*>(take((static_cast<size_t>(max_wtiles(M)) + (m + WM_R - 1) / WM_R) * 3 * 4));
     t.n_wt = reinterpret_cast<int*>(take(4));
 #endif

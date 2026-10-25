@@ -309,10 +309,10 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             c.main.s2on = c.draft.d.s2on = false;
         }
         pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot);
-        pf_enqueue_flash(c.prefill_fabric, pfseq, c.main.nl, ma);
+        pf_enqueue_flash(c.prefill_fabric, c.main, c.prefill, pfseq, c.main.nl, ma);
         if (mb) {
             pf_inputs_flash(c.prefill2, mb, p.prompt.data() + a + ma, pos.data() + ma, kslot);
-            pf_enqueue_flash(c.prefill_fabric2, pfseq2, c.main.nl, mb);
+            pf_enqueue_flash(c.prefill_fabric2, c.main, c.prefill2, pfseq2, c.main.nl, mb);
             pf_step2_flash(c.main, c.prefill, c.prefill2, ma, mb, a + ma, a + ma + mb, pfseq, pfseq2, c.stream);
             pfseq2 += c.main.nl;
         } else pf_step_flash(c.main, c.prefill, ma, a + ma, pfseq, c.stream);

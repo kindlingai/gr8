@@ -43,7 +43,7 @@ struct KdaLayer
     dtr::Mat qt, kt, vt, ot;                                  // W8 trellis q, k, v (SIDE_OUT) and o_proj (SIDE_IN)
     const uint8_t *mxc[3] = {}, *mxs[3] = {};                 // q, k, v own rows as MXFP8 (prefill GEMM): [nh*128][HID], [..][HID/32]
     uint8_t *mxgv[3] = {};                                    // q, k, v own rows as MXFP8 decode records [nh*8][HID/32][528],
-                                                              // built from mxc / mxs at bind (G6_KDA_MX=0: decode reads q / k / v)
+                                                              // built from mxc / mxs at bind, G6_KDA_MX=1 only (not byte-exact)
     const uint16_t *conv[3] = {};                             // [own ch][4]
     const uint16_t *fb = nullptr, *gb = nullptr;              // [own ch][128]
     const float *A_log = nullptr, *dt_bias = nullptr;         // [own heads], [own ch]
@@ -143,7 +143,10 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
             w.mxc[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.codes", {dl, HID}));
             w.mxs[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.scales", {dl, HID / 32}));
         }
-    static const bool kda_mx = !getenv("G6_KDA_MX") || atoi(getenv("G6_KDA_MX")) != 0;
+    // G6_KDA_MX=1 (default off): decode q / k / v read MXFP8 records with FP16 activations instead of the BF16 weights.
+    // Not byte-exact, and a third copy of q / k / v per rank (dl / 16 x HID / 32 x 528 B per matrix) outside the loader's
+    // accounting; off until the quality battery and hashes are in.
+    static const bool kda_mx = getenv("G6_KDA_MX") && atoi(getenv("G6_KDA_MX")) == 1;
     if (kda_mx && !w.qt.w && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
         for (int i = 0; i < 3; ++i)
         {
