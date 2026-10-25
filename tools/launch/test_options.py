@@ -358,6 +358,28 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--reuse-prefix', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
 
+    def test_tp4_serve_options_default_on_and_override(self):
+        on = ['G6_ROUTE_OVL=1', 'G6_DRAFT_HEAD_I4=1', 'G6_ATTN_SC2=4', 'G6_ATTN_SC2_TR=2', 'G6_ATTN_CTX2=4', 'G6_ATTN_CTX3=2',
+              'G6_ATTN_SEL2=16', 'G6_IDX_GRP=16', 'G6_ATTN_QT=1', 'G6_ATTN_FRONT=1', 'G6_IDX_VEC=1', 'G6_DEC_BK=512',
+              'G6_S2_ADAPT=1', 'G6_S2_DECODE_PF=4096', 'G6_S2_ADMIT_HOLD=1', 'G6_PF_SELX_CTX=53248']
+        def env(peers, *argv):
+            o = opt.parse(['--no-config', '--peers', peers, *argv], {})
+            opt.validate(o)
+            return opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+        e = env(PEERS)
+        for v in on:
+            self.assertIn(v, e)
+        e = env(PEERS, '--route-ovl', '0', '--attn-sc2', '0', '--draft-head-i4', '0')
+        self.assertIn('G6_ROUTE_OVL=0', e)
+        self.assertIn('G6_ATTN_SC2=0', e)
+        self.assertIn('G6_DRAFT_HEAD_I4=0', e)
+        self.assertFalse(any(a.startswith('G6_DRAFT_HEAD_I4') for a in env(PEERS, '--mtp', '0', '--dflash', '0')))
+        e = env(PEERS, '--dec-bk', '0', '--pf-selx-ctx', '0')   # 0 = the engine default: not passed
+        self.assertFalse(any(a.startswith(('G6_DEC_BK=', 'G6_PF_SELX_CTX=')) for a in e))
+        e = env(PEERS, '--g6env-x', 'G6_ROUTE_OVL=0 G6_DEC_BK=2048')   # G6ENV_X keeps its own value, no second copy
+        self.assertEqual([a for a in e if a.startswith(('G6_ROUTE_OVL=', 'G6_DEC_BK='))], ['G6_ROUTE_OVL=0', 'G6_DEC_BK=2048'])
+        e = env('10.0.0.1,10.0.0.2,10.0.0.3')   # TP=3 unchanged
+        self.assertFalse(any(a.split('=')[0] in [v.split('=')[0] for v in on] for a in e))
     def test_tp5_prefills_with_pf_own_3(self):
         def env(*argv):
             o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], {})
