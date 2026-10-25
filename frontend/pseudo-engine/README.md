@@ -10,9 +10,24 @@ model. It is for CI and for local work on everything above the engine. It tests 
 `TOKENIZER_DIR` holds GLM-5.3's `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
 `generation_config.json`: the release's top level, or a box's model cache `tokenizer/` directory.
 
-    g6pseudo --model DIR [--sock PATH]       serve; DIR holds responses.toml and the tokenizer files
+    g6pseudo --model DIR [--sock PATH]       serve; DIR holds responses.toml and the tokenizer files (at its top
+                                             level or under tokenizer/)
+    g6pseudo --model DIR --rank R --serve S2DIR --s2-epoch E   the S2 file protocol, as g6m4 --serve, for the shim
     g6pseudo --weights FILE --check          compile the rules
     g6pseudo --weights FILE --explain TEXT   the rules a user message TEXT matches, their weights, the winner's reply
+
+## Through the launcher
+
+`./gr8 pseudo` boots it as `./gr8 glm53` boots g6m4: the supervisor, the handshake, the shim and the front end, at TP 1
+to 4 and with no RDMA. The release is a directory with `responses.toml` and the four tokenizer files, and its model set
+id follows the bytes of both. `./gr8 pseudo build` puts `g6pseudo` and `g6front-rs` in `bin/`.
+
+    ./gr8 pseudo build
+    ./gr8 pseudo up --peers 127.0.0.1 --model RELEASE_DIR
+    ./gr8 pseudo smoke
+
+Under `--serve` (src/s2.rs) rank 0 serves the S2 directory and the other ranks wait for its `quit`. It reports MTP 0
+and takes `--cap` as the pool. `tools/launch/test_pseudo_e2e.py` boots it with `GR8_PSEUDO_TOKENIZER` set.
 
 ## The weights
 

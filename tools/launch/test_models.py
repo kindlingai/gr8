@@ -40,7 +40,7 @@ class OptionTests(unittest.TestCase):
             self.assertIn(want, str(e.exception))
         with self.assertRaises(opt.OptionError) as e:
             opt.parse(['--no-config', '--gr8-model', 'glm9'], {})
-        self.assertIn('want glm53 or glm53f', str(e.exception))
+        self.assertIn('want glm53, glm53f, pseudo', str(e.exception))
         for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
                            (['--sess', '0'], 'serves 1 to 8 sessions'),
                            (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
@@ -117,6 +117,46 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(models.ModelMismatch) as e:
             models.check_config(models.GLM53, self.t)
         self.assertIn('./gr8 glm53f serves it', str(e.exception))
+
+
+
+class PseudoTests(unittest.TestCase):
+    """GR8_MODEL=pseudo: the pseudo engine's command line and its release, a directory with responses.toml."""
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp()
+        self.rel = os.path.join(self.t, 'rel')
+        os.makedirs(self.rel)
+        for n in (*M.TOKENIZER, 'responses.toml'):
+            with open(os.path.join(self.rel, n), 'w') as f:
+                f.write(n)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.t)
+
+    def pseudo(self, *argv):
+        o = opt.parse(['--no-config', '--peers', '127.0.0.1', '--model', self.rel, *argv], {'GR8_MODEL': 'pseudo'})
+        opt.validate(o)
+        return o
+
+    def test_engine_plan(self):
+        o = self.pseudo()
+        self.assertEqual((o.get('TP'), o.get('GROUP'), S.engine_bin(o)), ('1', 'gr8-pseudo', 'g6pseudo'))
+        ms, variant, err = S.resolve_model(o)
+        self.assertEqual((err, variant.name, ms.set['source']['kind']), ('', 'home', 'pseudo'))
+        plan = opt.engine_plan(o, rank=0, home='/h', epoch=3, set_id=ms.id)
+        self.assertEqual(plan['env'], [])
+        self.assertEqual(plan['args'], ['--model', self.rel, '--cap', '202752', '--serve', '/h/s2', '--s2-sessions', '8',
+                                        '--s2-epoch', '3', '--set-id', ms.id])
+
+    def test_the_rules_are_the_weights(self):
+        first = M.pseudo_set(self.rel, 1).id
+        with open(os.path.join(self.rel, 'responses.toml'), 'a') as f:
+            f.write('\n')
+        self.assertNotEqual(M.pseudo_set(self.rel, 1).id, first)
+        os.unlink(os.path.join(self.rel, 'responses.toml'))
+        self.assertIn('want a pseudo engine release', S.resolve_model(self.pseudo())[2])
 
 
 if __name__ == '__main__':

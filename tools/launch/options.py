@@ -329,7 +329,7 @@ def parse(argv, environ=None):
         values['CHECK'], origin['CHECK'] = '0', 'command line'
     deprecated_kv(values, origin, warnings)
     if values['GR8_MODEL'] not in models.MODELS:
-        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {" or ".join(models.MODELS)}')
+        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {", ".join(models.MODELS)}')
     if not values['GROUP']:
         values['GROUP'] = models.MODELS[values['GR8_MODEL']].group
     opts = Options(values, origin, path, args, switches, warnings)

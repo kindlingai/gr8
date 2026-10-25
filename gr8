@@ -1,6 +1,6 @@
 #!/bin/bash
-# The one entry point: ./gr8 <model> <command>, the model glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash: the launcher
-# commands, smoke, bench and build); ./gr8 kv runs a KV node. Run the same command on every box, from the repo checkout
+# The one entry point: ./gr8 <model> <command>, the model glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or pseudo (the
+# pseudo engine, frontend/pseudo-engine: the launcher commands, smoke, bench and build); ./gr8 kv runs a KV node. Run the same command on every box, from the repo checkout
 # on that box. Each box's supervisor (tools/launch) finds the others, checks that every box has the same
 # options, model set and engine, and starts its own rank. The head (rank 0) also runs the front end and the shim.
 #
@@ -56,8 +56,9 @@ model=$1
 case $model in
   glm53) build_model=glm ;;
   glm53f) build_model=flash ;;
+  pseudo) build_model=pseudo ;;
   kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;
-  *) echo "gr8: the first argument names the model, glm53 or glm53f: ./gr8 glm53 <command> (or ./gr8 kv)" >&2; exit 2 ;;
+  *) echo "gr8: the first argument names the model, glm53, glm53f or pseudo: ./gr8 glm53 <command> (or ./gr8 kv)" >&2; exit 2 ;;
 esac
 shift
 export GR8_MODEL=$model   # tools/launch/options.py
@@ -86,6 +87,11 @@ case $cmd in
     exec python3 "$REPO/bench/pbench.py" --url "$(api)" "$@" ;;
   build)
     out=${1:-$REPO/bin}
+    if [ "$build_model" = pseudo ]; then
+      (cd "$REPO/frontend/pseudo-engine" && cargo build --release --locked)
+      mkdir -p "$out" && cp "$REPO/frontend/pseudo-engine/target/release/g6pseudo" "$out/"
+      exec "$SCRIPTS/build_front.sh" "$out"
+    fi
     [ -n "${KV_FORMAT:-}" ] || KV_FORMAT=$(python3 "$REPO/tools/launch/launch.py" get KV_FORMAT 2> /dev/null) || KV_FORMAT=""
     # MODEL here is scripts/build.sh's (glm or flash), not the launcher's release
     MODEL=$build_model KV_FORMAT=fp8 "$SCRIPTS/build.sh" "$out"

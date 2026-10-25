@@ -55,6 +55,7 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |
 | the front end end to end against the pseudo engine (`frontend/pseudo-engine`: rules in a TOML file), and the smoketest | anywhere, with GLM-5.3's tokenizer files | `frontend/pseudo-engine/smoke.sh TOKENIZER_DIR`; `cd frontend/pseudo-engine && cargo test` for its rules |
+| `./gr8 pseudo up` end to end: supervisor, handshake, g6pseudo under `--serve`, shim, front end | anywhere, with the release builds and GLM-5.3's tokenizer files | `GR8_PSEUDO_TOKENIZER=DIR python3 -m unittest discover -s tools/launch -p 'test_pseudo_e2e.py'` |
 | the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
 | the rank health probe | anywhere | `python3 -m unittest discover tools/health` |
 | the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |

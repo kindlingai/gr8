@@ -21,6 +21,7 @@ class Model:
     drafter: bool               # DFlash2 drafter (--drafter, DFLASH=1)
     int4_kv: bool               # KV_FORMAT=int4 (bin/<engine>-int4)
     thinking_off: bool          # the chat template can turn thinking off (reasoning_effort none)
+    fabric: bool = True         # the ranks talk over RDMA: rails and /dev/infiniband
 
     @property
     def tp_sizes(self):
@@ -40,7 +41,11 @@ GLM53 = Model('glm53', 'g6m4', 'glm', ('4', '6', '3', '5'),
 # GLM-5.3-Flash: uniform-width releases, K4 by default.
 GLM53F = Model('glm53f', 'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
                {2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
-MODELS = {m.name: m for m in (GLM53, GLM53F)}
+# The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
+# a CPU. Its release is a directory with responses.toml and the tokenizer files.
+PSEUDO = Model('pseudo', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo', 'GlmMoeDsaForCausalLM',
+               False, False, False, fabric=False)
+MODELS = {m.name: m for m in (GLM53, GLM53F, PSEUDO)}
 
 
 def of(o):

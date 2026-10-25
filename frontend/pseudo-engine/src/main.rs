@@ -1,7 +1,11 @@
 //! g6pseudo: a pseudo engine. It speaks PROTOCOL.md in GLM-5.3 tokens like g6m4, and answers from its weights, a TOML
 //! file of rules (src/rules.rs), so the front end, the shim and the launcher run end to end on a CPU.
 //!
-//!   g6pseudo --model DIR [--sock PATH]      DIR holds responses.toml (the weights) and the GLM tokenizer files
+//!   g6pseudo --model DIR [--sock PATH]      DIR holds responses.toml (the weights) and the GLM tokenizer files, at its
+//!                                           top level or under tokenizer/
+//!   g6pseudo --model DIR --rank R --serve S2DIR --s2-epoch E [--s2-sessions N] [--cap ROWS] [--ips A,B,..]
+//!                                           the S2 file protocol in place of the socket, as g6m4 --serve (src/s2.rs).
+//!                                           It takes the rest of g6m4's command line and ignores it
 //!   g6pseudo --weights FILE --check         load and compile the rules, print how many
 //!   g6pseudo --weights FILE --explain TEXT  the candidates for a user message TEXT, their weights and the winner's reply
 //!
@@ -9,6 +13,7 @@
 
 mod prompt;
 mod rules;
+mod s2;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -69,15 +74,27 @@ fn run() -> Result<(), String> {
     let mut weights_path: Option<PathBuf> = None;
     let mut sock = PathBuf::from("/run/g6/engine.sock");
     let (mut check, mut explain) = (false, None);
+    let mut s2 = s2::Config { dir: PathBuf::new(), rank: 0, ranks: 1, epoch: 0, sessions: 8, cap: 0 };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or(format!("{a} needs a value"));
+        let num = |v: String| v.parse::<usize>().map_err(|_| format!("{a} {v}: want a whole number"));
         match a.as_str() {
             "--model" => model = Some(PathBuf::from(val()?)),
             "--weights" => weights_path = Some(PathBuf::from(val()?)),
             "--sock" => sock = PathBuf::from(val()?),
             "--check" => check = true,
             "--explain" => explain = Some(val()?),
+            "--serve" => s2.dir = PathBuf::from(val()?),
+            "--rank" => s2.rank = num(val()?)?,
+            "--s2-epoch" => s2.epoch = num(val()?)? as u64,
+            "--s2-sessions" => s2.sessions = num(val()?)?.max(1),
+            "--cap" => s2.cap = num(val()?)?,
+            "--ips" => s2.ranks = val()?.split(',').count(),
+            // g6m4's: the fabric, the pinned CPU, the S2 port and the model set id
+            "--ips2" | "--pf-ips2" | "--proxy-cpu" | "--s2-port" | "--set-id" => {
+                val()?;
+            }
             _ => return Err(format!("unknown argument {a} (see the header of src/main.rs)")),
         }
     }
@@ -93,11 +110,21 @@ fn run() -> Result<(), String> {
         print!("{}", explain_text(&rules, &text));
         return Ok(());
     }
-    let dir = model.ok_or("--model DIR: serving needs the tokenizer files")?;
+    let model = model.ok_or("--model DIR: serving needs the tokenizer files")?;
+    let dir = [model.join("tokenizer"), model.clone()]
+        .into_iter()
+        .find(|d| d.join("tokenizer.json").is_file())
+        .ok_or(format!("no tokenizer.json in {0}/tokenizer or {0}", model.display()))?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
     let eos = eos_ids(&dir)?;
     let vocab = tok.get_vocab_size(true) as u32;
     let e = Arc::new(Engine { rules, tok, eos, vocab, c: Counters::default() });
+    if !s2.dir.as_os_str().is_empty() {
+        if s2.cap == 0 {
+            s2.cap = e.rules.engine.max_model_len as usize;
+        }
+        return s2::serve(&e, &s2);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -254,20 +281,19 @@ async fn generate(e: &Engine, v: &Value, cancel: &AtomicBool, tx: &mpsc::Unbound
     }
     let pace =
         if eng.tokens_per_s > 0.0 { Some(Duration::from_secs_f64(eng.chunk as f64 / eng.tokens_per_s)) } else { None };
+    let stop = stop_at(&plan.ids, &stop_ids, min_tokens);
+    let last = stop.map_or(plan.ids.len(), |i| i + 1);
+    let (mut reason, stop_id) = match stop {
+        Some(i) => ("stop", Some(plan.ids[i])),
+        None => ("length", None),
+    };
     let mut sent = 0usize;
-    let (mut reason, mut stop_id) = ("length", None);
-    while sent < plan.ids.len() {
+    while sent < last {
         if cancel.load(Ordering::Relaxed) {
             reason = "abort";
             break;
         }
-        let mut end = (sent + eng.chunk).min(plan.ids.len());
-        // a stop id ends the request and is sent with the ids before it
-        if let Some(i) = (sent..end).find(|&i| i + 1 > min_tokens && stop_ids.contains(&plan.ids[i])) {
-            end = i + 1;
-            reason = "stop";
-            stop_id = Some(plan.ids[i]);
-        }
+        let end = (sent + eng.chunk).min(last);
         let mut f = json!({"type": "tokens", "id": id, "ids": &plan.ids[sent..end]});
         if lp_k.is_some() {
             f["logprobs"] = Value::Array(plan.lps[sent..end].to_vec());
@@ -275,13 +301,11 @@ async fn generate(e: &Engine, v: &Value, cancel: &AtomicBool, tx: &mpsc::Unbound
         let _ = tx.send(f);
         e.c.gen.fetch_add((end - sent) as u64, Ordering::Relaxed);
         sent = end;
-        if stop_id.is_some() {
-            break;
-        }
-        if let Some(d) = pace {
+        if let Some(d) = pace.filter(|_| sent < last) {
             tokio::time::sleep(d).await;
         }
     }
+    let stop_id = if reason == "stop" { stop_id } else { None };
     let counter = match reason {
         "stop" => &e.c.stop,
         "abort" => &e.c.abort,
@@ -290,6 +314,11 @@ async fn generate(e: &Engine, v: &Value, cancel: &AtomicBool, tx: &mpsc::Unbound
     counter.fetch_add(1, Ordering::Relaxed);
     e.c.running.fetch_sub(1, Ordering::Relaxed);
     let _ = tx.send(finish(reason, stop_id, sent));
+}
+
+/// The index of the stop id that ends a reply: the first one past `min_tokens`. The request emits it last.
+fn stop_at(ids: &[u32], stop: &HashSet<u32>, min_tokens: usize) -> Option<usize> {
+    (min_tokens..ids.len()).find(|&i| stop.contains(&ids[i]))
 }
 
 /// The ids a request emits: the chosen candidate's reply, an insert rule applied, cut to max_tokens.
