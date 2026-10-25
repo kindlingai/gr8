@@ -62,3 +62,5 @@ step "Rust: engine/kvman-rs"
 cargo test --locked --manifest-path engine/kvman-rs/Cargo.toml
 step "Rust: frontend/g6front-rs"
 (cd frontend/g6front-rs && cargo test --locked)
+step "Rust: frontend/pseudo-engine (and its weights compile)"
+(cd frontend/pseudo-engine && cargo test --locked && cargo run --locked --quiet -- --weights model/responses.toml --check)
