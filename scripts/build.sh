@@ -13,6 +13,8 @@
 #   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
 #                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
 #                                         G6_WIDTHS or G6_NR says otherwise
+#   G6_TESTS=0 / G6_TESTS=only            the GLM engine without the test binaries below it, or the tests alone (CI
+#                                         builds them on separate runners)
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (the engine finds it there at any TP)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
@@ -101,18 +103,23 @@ case "${MODEL:-glm}" in
     exit 0 ;;
   *) echo "MODEL=$MODEL: glm or flash"; exit 2 ;;
 esac
-WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
-if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
-  mkdir -p "$OUT/lib"
-  cp -L /usr/local/cuda/lib64/libcublas.so.13 /usr/local/cuda/lib64/libcublasLt.so.13 "$OUT/lib/"
+case "${G6_TESTS:-1}" in 0|1|only) ;; *) echo "G6_TESTS=$G6_TESTS: 0, 1 or only"; exit 2 ;; esac
+if [ "${G6_TESTS:-1}" != only ]; then
+  WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
+  if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
+    mkdir -p "$OUT/lib"
+    cp -L /usr/local/cuda/lib64/libcublas.so.13 /usr/local/cuda/lib64/libcublasLt.so.13 "$OUT/lib/"
+  fi
+  strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
+  md5sum "$OUT/g6m4" "$OUT/m4sim"
+  widths_ok "$OUT/g6m4" "$OUT/m4sim"
 fi
-strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
-md5sum "$OUT/g6m4" "$OUT/m4sim"
-widths_ok "$OUT/g6m4" "$OUT/m4sim"
+[ "${G6_TESTS:-1}" = 0 ] && exit 0
 export PATH=/usr/local/cuda/bin:$PATH
 # the compiles below go through the same object cache as build_m4.sh (#32); G6_NVCC_CACHE=0 runs plain nvcc / g++
 CACHE="$REPO/engine/runtime/nvcc_cache.sh"
 if [ "${G6_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="$CACHE nvcc"; GXX="$CACHE g++"; fi
+mkdir -p "$OUT/obj"
 export G6_NVCC_CACHE_LOG="$OUT/obj/nvcc_cache.tests.calls"
 rm -f "$G6_NVCC_CACHE_LOG"
 # the adaptive draft length decision, CPU

@@ -143,7 +143,7 @@ jobs:
           .github/ci/fetch-tokenizer.sh "$RUNNER_TEMP/tokenizer"
           echo "GR8_PSEUDO_TOKENIZER=$RUNNER_TEMP/tokenizer" >> "$GITHUB_ENV"
       - name: The loopback addresses the launch end to end test uses
-        run: for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias $a up; done
+        run: for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias "$a" up; done
       - name: Tests
         run: .github/ci/cpu-tests.sh frontend
 
@@ -164,7 +164,9 @@ jobs:
           platforms: linux/arm64
           outputs: type=local,dest=rust-dist
           cache-from: type=gha,scope=rust
-          cache-to: type=gha,scope=rust,mode=max
+          # Only main writes the cache. A pull request reads main's but keeps what it writes to itself, under its
+          # own ref, so each one that wrote added a copy no other run could use.
+          cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'type=gha,scope=rust,mode=max' || '' }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: rust-bin-arm64
@@ -173,10 +175,12 @@ jobs:
           if-no-files-found: error
 
   engine:
-    # The two KV formats are the whole cost of a build and share no compilation,
-    # so they get a runner each: on one runner they spent most of their lives
-    # competing for its four cores (fp8 ~1,000 s, int4 ~551 s, job 1,187 s).
-    name: Engine build (${{ matrix.kv }} KV, arm64, CUDA 13, sm_121a)
+    # The four parts (GLM with the fp8 KV, GLM with the int4 KV, Flash, and the
+    # test binaries) are the whole cost of a build and share no compilation, so
+    # they get a runner each. Two on one runner spend most of their time
+    # competing for its four cores: the fp8 leg, with Flash and the tests, took
+    # 27-42 min while int4 alone took 6-11.
+    name: Engine build (${{ matrix.label }}, arm64, CUDA 13, sm_121a)
     needs: ready
     if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'frontend'
     runs-on: ubuntu-24.04-arm
@@ -185,17 +189,38 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both legs share every stage before the compile (toolchain, rust,
-          # the three cargo builds, engine-src), and neither leg's own compile
-          # layer survives a change under engine/, which is most pull requests.
-          # So one leg exports the cache for both: a scope each would double
-          # what this repo keeps in a cache that is already at its 10 GB cap.
-          - kv: fp8
+          # Every leg shares the stages before its compile (toolchain, rust,
+          # the three cargo builds, XGrammar, engine-src). The fp8 leg exports
+          # them in scope gr8 and every leg reads it. Each leg also exports its
+          # own scope, so a pull request that leaves engine/ alone reuses every
+          # compile. Within a ref the cache stores a layer once whichever scopes
+          # name it, so a leg's scope adds only its own compile layer.
+          - leg: fp8
+            label: fp8 KV
             target: dist-fp8
+            cache_from: type=gha,scope=gr8
             cache_to: type=gha,scope=gr8,mode=max
-          - kv: int4
+          - leg: int4
+            label: int4 KV
             target: dist-int4
-            cache_to: ''
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-int4
+            cache_to: type=gha,scope=gr8-int4,mode=max
+          - leg: flash
+            label: Flash
+            target: dist-flash
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-flash
+            cache_to: type=gha,scope=gr8-flash,mode=max
+          - leg: tests
+            label: tests
+            target: dist-tests
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-tests
+            cache_to: type=gha,scope=gr8-tests,mode=max
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Free disk space
@@ -207,13 +232,17 @@ jobs:
       - name: Widths
         # A pull request compiles the three widths whose code differs: 1, the
         # PF_F12 fat-CTA width 4, and the largest. main and tags compile all
-        # six, so a width-specific break still fails before a release.
+        # seven, so a width-specific break still fails before a release.
         id: w
         run: |
           widths=''
           [ "${{ github.event_name }}" = pull_request ] && widths='1 4 8'
           echo "widths=$widths" >> "$GITHUB_OUTPUT"
-          echo "${{ matrix.kv }} KV, TP widths ${widths:-1 2 3 4 6 8}" >> "$GITHUB_STEP_SUMMARY"
+          case "${{ matrix.leg }}" in
+            flash) echo "Flash, TP widths 2 3 4" ;;
+            tests) echo "test binaries" ;;
+            *) echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
+          esac >> "$GITHUB_STEP_SUMMARY"
       - name: Build the binaries (Dockerfile target ${{ matrix.target }})
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
@@ -223,11 +252,11 @@ jobs:
           build-args: |
             G6_WIDTHS=${{ steps.w.outputs.widths }}
           outputs: type=local,dest=dist
-          cache-from: type=gha,scope=gr8
-          cache-to: ${{ matrix.cache_to }}
+          cache-from: ${{ matrix.cache_from }}
+          cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && matrix.cache_to || '' }}   # only main writes, as in the rust job
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: engine-bin-arm64-${{ matrix.kv }}
+          name: engine-bin-arm64-${{ matrix.leg }}
           path: dist/
           retention-days: 7
           if-no-files-found: error
@@ -317,7 +346,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           load: true
           cache-from: type=gha,scope=runtime
-          cache-to: type=gha,scope=runtime,mode=max
+          cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'type=gha,scope=runtime,mode=max' || '' }}   # only main writes, as in the rust job
       - name: Smoke test (no GPU)
         env:
           TAGS: ${{ steps.meta.outputs.tags }}

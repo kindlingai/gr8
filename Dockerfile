@@ -65,14 +65,19 @@ WORKDIR /src/frontend/g6front-rs
 RUN mkdir -p src && touch src/main.rs && cargo fetch --locked \
  && cp -a "$(ls -d /opt/cargo/registry/src/*/xgrammar-*/thirdparty/xgrammar | head -1)" /out-xgrammar
 
-# engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
-# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a and libg6kvman.a built above.
-FROM toolchain AS engine-src
-# cmake for XGrammar (G6_XGRAMMAR below)
+# XGrammar's library, built once for both GLM engine stages; it changes only with the pin, so engine edits keep it cached
+FROM toolchain AS xgrammar
 # hadolint ignore=DL3008
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake \
  && rm -rf /var/lib/apt/lists/*
+COPY engine/runtime/xgrammar_build.sh /xgrammar_build.sh
+COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
+RUN /xgrammar_build.sh /opt/xgrammar /xb && mkdir -p /out && cp /xb/libxgrammar.a /out/ && rm -rf /xb
+
+# engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
+# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a and libg6kvman.a built above.
+FROM toolchain AS engine-src
 WORKDIR /src
 COPY engine engine
 COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
@@ -80,24 +85,35 @@ COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
 COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
-ENV G6_XGRAMMAR=/opt/xgrammar
+COPY --from=xgrammar /out/libxgrammar.a /opt/xgrammar-lib/libxgrammar.a
+ENV G6_XGRAMMAR=/opt/xgrammar G6_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
 
 # one g6m4 and one m4sim for every TP width; every launcher runs this build.
+# Each engine stage keeps only the binaries its dist stage copies: a cached layer is reused whole or rebuilt whole, so
+# its objects and build-only binaries are dead weight in the CI cache.
 # G6_WIDTHS builds a subset (build.sh): CI passes one on a pull request and
-# leaves it empty, for all six widths, on main and on tags.
+# leaves it empty, for all seven widths (1 2 3 4 5 6 8), on main and on tags.
 FROM engine-src AS engine
 ARG G6_WIDTHS=
-RUN G6_WIDTHS="$G6_WIDTHS" scripts/build.sh /out/bin
+RUN G6_WIDTHS="$G6_WIDTHS" G6_TESTS=0 scripts/build.sh /out/bin \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4 ! -name m4sim -exec rm -rf {} +
+
+# the test binaries build.sh makes after the GLM engine (gpuprobe and tr3_e4m3_test ship), on their own CI runner
+FROM engine-src AS engine-tests
+RUN G6_TESTS=only scripts/build.sh /out/bin \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name gpuprobe ! -name tr3_e4m3_test -exec rm -rf {} +
 
 # GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 2, 3 and 4
 FROM engine-src AS engine-flash
-RUN MODEL=flash scripts/build.sh /out/bin
+RUN MODEL=flash scripts/build.sh /out/bin \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash ! -name m4sim_flash -exec rm -rf {} +
 
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src AS engine-int4
 ARG G6_WIDTHS=
-RUN G6_WIDTHS="$G6_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin
+RUN G6_WIDTHS="$G6_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a
 # and libg6kvman.a
@@ -109,23 +125,30 @@ COPY --from=front /out/g6front-rs /
 # dist holds the shipped binaries in bin/: g6m4 (fp8 KV) and g6m4-int4 (--kv-format int4), both for every TP width,
 # and g6load (the Hugging Face fetch's planner and checker). build.sh's CPU test binaries and objects stay behind.
 # tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
-# dist-fp8 and dist-int4 are the two halves of dist. The two engine stages are
-# the whole cost of a build and they share nothing, so CI builds one in each of
-# two jobs and unpacks both artifacts into one directory. dist stays the union,
-# for a local build and for anything that wants every binary from one target.
+# dist-fp8, dist-int4, dist-flash and dist-tests are the four parts of dist. Their
+# stages are the whole cost of a build and they share nothing, so CI builds each
+# in its own job and unpacks the artifacts into one directory. dist stays the
+# union, for a local build and for anything that wants every binary from one target.
 FROM scratch AS dist-fp8
-COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
+COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /bin/
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
 COPY --from=kvman /out/kvman-remote /bin/
-COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
 
 FROM scratch AS dist-int4
 COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/
 
+FROM scratch AS dist-flash
+COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
+
+FROM scratch AS dist-tests
+COPY --from=engine-tests /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
+
 FROM scratch AS dist
 COPY --from=dist-fp8 / /
 COPY --from=dist-int4 / /
+COPY --from=dist-flash / /
+COPY --from=dist-tests / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
 # libibverbs1 + ibverbs-providers (mlx5) for the fabric, ibverbs-utils for ibv_devinfo, python3 for the shims and
