@@ -89,7 +89,7 @@ the short version.
 | `G6_XTRACE_OUT` | /tmp | directory for the dumps, `g6xtrace.r<rank>.f<n>.txt` |
 | `G6_XTRACE_QUIT` | unset | path of a file; when it appears, each fabric dumps once |
 | `G6_XTRACE_PF` | 0 | 1 = with `G6_XTRACE=1`, trace the two prefill fabrics instead of the decode fabric |
-| `G6_KDA_MX` | 0 | 1 = KDA decode q / k / v read MXFP8 records built at bind (FP16 activations): not byte-exact, and a third copy of q / k / v on each rank (about 1.2 GB at TP3) outside the loader's accounting |
+| `G6_KDA_MX` | 1 | 1 = KDA decode q / k / v read MXFP8 records built at bind (FP16 activations), 0 = the BF16 weights: not byte-exact, and a third copy of q / k / v on each rank (about 1.2 GB at TP3) outside the loader's accounting |
 | `G6_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
 | `G6_ATTN_SC2` | 0 | decode attention scores of the head-group kernel with S = 1, 2, 4 or 8 key slots per warp, the query loaded once for all S; 0 = off. FP8 KV only, same bits |
 | `G6_ATTN_SC2_PART` | 1 | with `G6_ATTN_SC2` (and `G6_ATTN_QT`): a head count that is not a multiple of 16 (TP=6: 10 or 11 heads a rank; TP=3: 21 or 22) also takes the scores kernel, its last head group partial (the missing heads load nothing and are not stored). 0 = those layers keep the head-group kernel of 16. Inert at TP=4. Same bits |
