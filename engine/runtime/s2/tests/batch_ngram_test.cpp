@@ -96,7 +96,7 @@ int main()
         std::string err;
         CHECK(t.parse("g6ngram 1\nns 2 4\ncal none\ne 4 1 2 3 4 9 0.9\ne 2 3 4 8 0.5\ne 2 4 9 5 0.8\n", &err));
         CHECK(t.ns.size() == 2 && t.ns[0] == 4 && !t.has_cal && t.t.size() == 3);
-        int tok; float p;
+        int tok; double p;
         const int c1[] = {1, 2, 3, 4};
         CHECK(t.next(c1, 4, &tok, &p) && tok == 9 && p > 0.89f);          // the 4-gram first
         const int c2[] = {7, 7, 3, 4};
