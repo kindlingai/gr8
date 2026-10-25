@@ -229,16 +229,23 @@ def cmd_fit(a):
     model = dict(base['model'])
     if model['hidden_size'] != hid or model['layer_count'] != nl:
         die(f'--base is a {model["hidden_size"]} x {model["layer_count"]} model, the dump {hid} x {nl}')
+    if a.toward == 'negative' and not a.anchor:
+        die('--toward negative needs --anchor: the default fit gives nearly the same profile both ways')
+    # target and source means per layer: the writer outputs of attention + MLP
+    tgt = 1 if a.toward == 'positive' else 0
     layers, alphas, dirs = [], [], []
-    print(' layer     c-      c+   alpha  (c = the mean writer output along the direction; kept: alpha in [0, 4])')
+    print(' layer    c src   c tgt   alpha  (c = the mean writer output along the direction)')
     for l in parse_layers(a.layers, nl):
-        pos, neg = mean[1, 2 * l] + mean[1, 2 * l + 1], mean[0, 2 * l] + mean[0, 2 * l + 1]
-        d = pos - neg
+        t, s = (mean[k, 2 * l] + mean[k, 2 * l + 1] for k in (tgt, 1 - tgt))
+        d = t - s
+        if a.anchor:                             # the part of the gap with no component along the target mean
+            u = t / np.linalg.norm(t)
+            d = (s - t) - ((s - t) @ u) * u
         d /= np.linalg.norm(d)
-        cp, cn = float(pos @ d), float(neg @ d)
-        alpha = 1 - a.strength * cp / cn if cn else float('inf')
+        ct, cs = float(t @ d), float(s @ d)
+        alpha = a.strength if a.anchor else 1 - a.strength * ct / cs if cs else float('inf')
         ok = 0 <= alpha <= 4
-        print(f'{l:6d} {cn:7.3f} {cp:7.3f} {alpha:7.3f}  {"kept" if ok else "left out"}')
+        print(f'{l:6d} {cs:8.3f} {ct:7.3f} {alpha:7.3f}  {"kept" if ok else "left out"}')
         if ok:
             layers.append(l)
             alphas.append(round(alpha, 4))
@@ -288,7 +295,12 @@ def main():
     p.add_argument('--name', required=True)
     p.add_argument('--layers', default='0-77', help='candidate layers, e.g. 10-60 or 2,4,6')
     p.add_argument('--strength', type=float, default=1.0,
-                   help='fraction of the way from the negative to the positive component (default 1)')
+                   help='fraction of the way from the source to the target component (default 1)')
+    p.add_argument('--anchor', action='store_true',
+                   help='directions with the target mean at zero and alpha = strength: the profile erases what '
+                        'sets the source apart and leaves target-like text nearly unchanged')
+    p.add_argument('--toward', choices=('positive', 'negative'), default='positive',
+                   help='the side to steer toward (negative needs --anchor)')
     a = ap.parse_args()
     {'tokenize': cmd_tokenize, 'argv': cmd_argv, 'reduce': cmd_reduce, 'fit': cmd_fit}[a.cmd](a)
 

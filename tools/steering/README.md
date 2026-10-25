@@ -143,19 +143,45 @@ break the text.
 The operator scales a component and never adds one, so a profile pushes toward the positive side only by shrinking
 or flipping what is there. On a layer where the two means sit on opposite sides, alpha is above 1 and the operator
 flips the component, whichever side the input starts on. Swapping positive and negative gives nearly the same
-operator, not the opposite one: a "back to the negative" profile needs an additive term the schema does not have.
+operator, not the opposite one.
 
-[examples/en-zh](examples/en-zh) makes an English-to-Chinese profile this way. `make_pairs.py` asks the served model
-for an English and a Chinese answer to each question. `score.py` measures the share of Chinese in held-out answers at
-several scales. `heldout-zh.txt` holds the same held-out questions in Chinese, to check that Chinese questions keep
-Chinese answers.
+### Anchored profiles
 
-Measured on GLM-5.3 with 48 pairs (52 layers kept): on the 16 held-out English questions, the Chinese share of the
-answers was 0 at scale 0, 0.12 at 0.35, 0.67 at 0.5, 0.66 at 0.65 (9 of 16 mostly Chinese), 0.25 at 1 and 0.11 at 2,
-where the text broke down. Chinese questions kept 0.99 Chinese up to 0.65 and fell to 0.48 at 1. With
-`reasoning_effort` medium the reasoning stays English and the answer switches: six runs at 0.5 and 0.65 gave 0.93 to
-0.97. With the template's default effort the long English reasoning pulls the answer back toward English, and
-repeated runs vary.
+`fit --anchor` makes a one-way profile. Each layer's direction is the part of `negative - positive` orthogonal to the
+positive mean, and alpha is `--strength` (default 1). The profile then removes what sets the negative answers apart
+and leaves positive-like input almost untouched. `--toward negative` swaps the roles, so the same `sums.npz` gives a
+profile for each direction:
+
+```sh
+python3 tools/steering/contrast.py fit work profiles/en-zh --base OTHER/manifest.json --name en-zh-a1 --anchor
+python3 tools/steering/contrast.py fit work profiles/zh-en --base OTHER/manifest.json --name zh-en-a1 --anchor \
+  --toward negative
+```
+
+Erasing a behaviour does not pick a replacement. With only two behaviours in the pairs, some answers can land on a
+third one, such as another language.
+
+### Example: English and Chinese
+
+[examples/en-zh](examples/en-zh) makes English-to-Chinese and Chinese-to-English profiles. `make_pairs.py` asks the
+served model for an English and a Chinese answer to each question. `score.py` measures the share of Chinese in
+held-out answers at several scales. `heldout-zh.txt` holds the same held-out questions in Chinese.
+
+Measured on GLM-5.3 with 48 pairs and `reasoning_effort` medium, 16 held-out questions per language. A cell is the
+Chinese share of the answers, with the number of mostly-Chinese answers (share above 0.8) in brackets:
+
+| profile | layers | question | scale 0 | 0.5 | 0.65 | 1.0 | 1.5 |
+|---|---|---|---|---|---|---|---|
+| en-zh, default fit | 52 | English | 0.00 (0) | 0.67 | 0.66 (9) | 0.25 | |
+| | | Chinese | 0.99 (16) | 0.99 (16) | 0.99 (16) | 0.48 (2) | |
+| en-zh-a1, `--anchor` | 78 | English | 0.00 (0) | 0.95 (15) | | 0.99 (16) | 0.99 (16) |
+| | | Chinese | 0.99 (16) | 1.00 (16) | | 0.99 (16) | 1.00 (16) |
+| zh-en-a1, `--anchor --toward negative` | 78 | English | 0.00 (0) | 0.00 (0) | | 0.00 (0) | 0.00 (0) |
+| | | Chinese | 0.99 (16) | 13 Chinese, 3 English | | 13 English, 2 Spanish, 1 Russian | 14 English, 2 Spanish |
+
+The default fit breaks down past 0.65 (0.11 at scale 2). The anchored profiles hold up to 1.5, and English questions
+under zh-en-a1 at 1.5 give nearly the same text as no steering. With the template's default effort the long English
+reasoning pulls answers back toward English, and repeated runs vary.
 
 ## Offline qualification reports
 

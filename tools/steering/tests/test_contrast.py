@@ -68,6 +68,22 @@ class ReduceFitTests(unittest.TestCase):
             dirs = np.fromfile(os.path.join(out, 'directions.f32'), '<f4').reshape(NL, HID)
             self.assertTrue((dirs[:, 0] > 0.99).all())
 
+            # anchored, toward the negative side: the positive mean has no component left to erase toward, so the
+            # direction is the part of the gap orthogonal to the negative mean, with alpha = strength
+            def fit(name, *extra):
+                return subprocess.run([sys.executable, TOOL, 'fit', d, os.path.join(d, name), '--base',
+                                       os.path.join(d, 'base.json'), '--name', name, '--layers', '0-2', *extra],
+                                      capture_output=True, text=True)
+            self.assertNotEqual(fit('flip', '--toward', 'negative').returncode, 0)
+            r = fit('back', '--anchor', '--toward', 'negative', '--strength', '0.5')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            m = release.validate_directory(os.path.join(d, 'back'), expected=base['model'])
+            self.assertEqual(m['alphas'], [0.5] * NL)
+            z = np.load(os.path.join(d, 'sums.npz'))
+            neg = (z['sums'][0] / z['count'][0]).reshape(NL, 2, HID).sum(1)
+            dirs = np.fromfile(os.path.join(d, 'back', 'directions.f32'), '<f4').reshape(NL, HID)
+            self.assertTrue((np.abs((dirs * neg).sum(1)) < 1e-4).all())
+
 
 if __name__ == '__main__':
     unittest.main()

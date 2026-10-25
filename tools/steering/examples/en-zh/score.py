@@ -23,7 +23,7 @@ def cjk_share(text):
 def answer(a, question, scale):
     body = {'model': a.model, 'temperature': 0, 'max_tokens': a.max_tokens,
             'messages': [{'role': 'user', 'content': question}],
-            'chat_template_kwargs': {'reasoning_effort': 'low'}}
+            'chat_template_kwargs': {'reasoning_effort': a.effort}}
     if scale:
         body.update(steering_profile=a.profile, steering_scale=scale)
     req = urllib.request.Request(a.api.rstrip('/') + '/v1/chat/completions', json.dumps(body).encode(),
@@ -41,6 +41,7 @@ def main():
     ap.add_argument('--api', default='http://127.0.0.1:8100')
     ap.add_argument('--model', default='glm-5.3')
     ap.add_argument('--max-tokens', type=int, default=512)
+    ap.add_argument('--effort', default='low', help='reasoning_effort (low: answers without reasoning)')
     a = ap.parse_args()
     qs = [q.strip() for q in open(a.questions, encoding='utf-8') if q.strip()]
     rows = []
