@@ -243,6 +243,11 @@ def bucket(p):
     return b
 
 
+def stored(p):
+    """A probability as the exported file holds it (6 places; the engine parses it to a double)."""
+    return float(f'{min(max(p, 1e-6), 1.0):.6f}')
+
+
 def calibrate(traces, k=5, seed=0, kmax=7, prior=4.0, **table_kw):
     """Held out by prompt as replay(): per bucket of a chain token's stored probability, (offered, accepted) counts and
     the calibrated acceptance (shrunk toward the bucket's lower edge by `prior` pseudo-counts, so a thin bucket errs
@@ -253,12 +258,14 @@ def calibrate(traces, k=5, seed=0, kmax=7, prior=4.0, **table_kw):
         for tr in test:
             gen, ctx, pos = tr['gen'], list(tr['prompt']), 0
             while pos < len(gen):
-                nodes, prev, acc = chain(t, ctx, kmax), 1.0, 0
-                for j, (_, tok, path) in enumerate(nodes):
-                    if pos + j >= len(gen):
+                acc, w = 0, list(ctx[-t.ns[0]:])
+                for j in range(kmax):
+                    _, cand = t.lookup(w)
+                    if not cand or pos + j >= len(gen):
                         break
-                    b = bucket(path / prev)
-                    prev = path
+                    tok, q, _ = cand[0]
+                    w.append(tok)
+                    b = bucket(stored(q))        # the probability as export writes it and the engine reads it
                     n[b] += 1
                     if gen[pos + j] != tok:
                         break
@@ -283,7 +290,7 @@ def export(table, cal, path):
         for n in table.ns:
             for key in sorted(table.t[n]):
                 tok, p, _ = table.t[n][key][0]
-                f.write(f'e {n} ' + ' '.join(map(str, key)) + f' {tok} {min(max(p, 1e-6), 1.0):.6f}\n')
+                f.write(f'e {n} ' + ' '.join(map(str, key)) + f' {tok} {stored(p):.6f}\n')
 
 
 def read_export(path):

@@ -511,6 +511,7 @@ public:
         x.warm = x.lo + std::max(1, reuse_.min);
         x.pb = -1; x.since = 0; x.mn = 0;
         if (sel_.on) restart();
+        if (ng_.t) ng_fresh();
         Stats& s = stats_[q];
         if ((int)s.acc.size() < DFL_B) s.acc.resize(DFL_B, 0);
         s.promoted = s.dfl_lo = x.lo; s.dfl_warm = x.warm;
@@ -731,14 +732,20 @@ private:
         const int c = commit(q, t.data(), a + 1, &kept);
         if (!nk && !m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
         if (!nk && sel_.on) score(x, k, a, t.data(), pe);
-        if (!nk && ng_.t) (m ? ngm_ : ngd_).observe(k, a, m ? x.dlm.data() : x.dl, 0);
+        if (!nk && ng_.t) (m ? ngm_ : ngd_).observe(k, a, ng_lp(x, m), 0);
         if (nk)
         {
             ngram_score(x, m, kd, a, t.data(), de);
             ++stats_[q].ngram_rounds; stats_[q].ngram_drafted += k; stats_[q].ngram_acc += a;
             if (ng_.log)
-                fprintf(stderr, "# ngram round %ld slot %d base %d k %d a %d expected %.3f drafter %s k %d expected %.3f\n", cur_round_, q,
-                        base, k, a, ne, m ? "mtp" : "dfl", kd, de);
+            {   // hash: the chain's tokens and its length, then the drafter's log-probabilities (the decision's inputs)
+                float tk[DFL_B];
+                for (int j = 1; j <= k; ++j) tk[j] = (float)dr[j];
+                const float* lp = ng_lp(x, m);
+                fprintf(stderr, "# ngram round %ld slot %d base %d k %d a %d expected %.3f drafter %s k %d expected %.3f hash %08x\n",
+                        cur_round_, q, base, k, a, ne, m ? "mtp" : "dfl", kd, de,
+                        g6rt::SpecLen::hash(tk, k, k) ^ (lp ? g6rt::SpecLen::hash(lp, kd, kd) : 0u));
+            }
         }
         if (ks_.log && !nk)
         {   // G6_MTP_LPLOG: the verified drafts' log-probabilities (MTP: every drafted one), and MTP's d[1] with whether
@@ -867,7 +874,7 @@ private:
             if (j >= ng_.kmin && r > br * (1 + 1e-9)) { br = r; bk = j; *ne = e; }
         }
         double ed = 0;
-        (m ? ngm_ : ngd_).ratio(k, m ? x.dlm.data() : x.dl, k, &ed);
+        (m ? ngm_ : ngd_).ratio(k, ng_lp(x, m), k, &ed);
         *de = ed;
         return br > ed / dsl_.verify_ms(k + 1) * (1 + ng_.margin) ? bk : 0;
     }
@@ -877,16 +884,29 @@ private:
     void ngram_score(St& x, bool m, int kd, int a, const int* t, double de)
     {
         const int* dr = m ? x.d.data() : x.dd;
-        const float* lp = m ? x.dlm.data() : x.dl;
+        const float* lp = ng_lp(x, m);
         int b = 0;
         while (b < kd && b < a + 1 && dr[b + 1] == t[b]) ++b;
         const int ko = b == a + 1 ? b : std::min(b + 1, kd);   // positions offered: known right ones, and the first miss
         if (!ko) return;
         (m ? ngm_ : ngd_).observe(ko, b, lp, 0);
-        if (m) { if (sel_.on || ks_.mode == 2) sel_.m.observe(ko, b, ks_.mode ? lp : nullptr, de); return; }
+        if (m)
+        {   // as score() on an MTP round, with what the verify showed of MTP's drafts
+            if (sel_.on || ks_.mode == 2) sel_.m.observe(ko, b, lp, de);
+            if (sel_.on) probe_score(x);
+            return;
+        }
         if (dsl_.on) dsl_.observe(ko, b, lp, de);
-        if (sel_.on) sel_.d.observe(ko, b, lp, 0);
+        if (sel_.on)
+        {   // as score() on a DFlash2 round: MTP's first draft (t[0] is always known) and DFlash2's drafts
+            sel_.d.observe(ko, b, lp, 0);
+            sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, ks_.mode ? x.dlm.data() : nullptr, 0);
+            dfl_obs(std::min(b, kd) + 1, kd);   // as a round verifying the kd drafts would have (a lower bound when all matched)
+        }
     }
+    // the drafts' log-probabilities the choice's estimates read: DFlash2's always; MTP's only under KStop (every rank has
+    // them then; G6_MTP_LPLOG alone fills them on rank 0 only, and a decision on them would split the ranks)
+    const float* ng_lp(const St& x, bool m) const { return m ? (ks_.mode ? x.dlm.data() : nullptr) : x.dl; }
     // the chain of a solo session about to verify MTP drafts: K-1 steps, or with KStop while kmore() allows (x.k drafted)
     void kchain(int q, int ev)
     {

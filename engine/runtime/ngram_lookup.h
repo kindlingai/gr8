@@ -11,8 +11,8 @@
 //   ns 8 6 4 3                       context lengths, longest first (lookups back off in this order)
 //   cal c0 c1 .. c7 | cal none       acceptance per probability bucket (SpecLen::bucket's edges); none: the raw means
 //   e n t1 .. tn tok p               context t1..tn (oldest first) -> next token tok at mean probability p
-// Contexts are keyed by a 64-bit hash of (n, tokens). A collision proposes a wrong token, which the verify rejects: it
-// costs speed only. Every rank must load the same file: digest() (FNV-1a over its bytes) goes into the S2 runtime
+// Contexts are keyed by a 64-bit hash of (n, tokens); the loader refuses a file where two contexts share a key. A token
+// id must be below the vocabulary (g6m4 passes it). A wrong proposed token is rejected by the verify: it costs speed only. Every rank must load the same file: digest() (FNV-1a over its bytes) goes into the S2 runtime
 // signature, because the chain decides each round's verify width and every rank must choose the same one.
 #pragma once
 #include <algorithm>
@@ -34,7 +34,7 @@ struct NgramTable
     std::vector<int> ns;                          // context lengths, descending
     bool has_cal = false;
     double cal[NB] = {};
-    std::unordered_map<uint64_t, std::pair<int, float>> t;
+    std::unordered_map<uint64_t, std::pair<int, double>> t;
     uint64_t digest = 0;
 
     static int bucket(double p)
@@ -64,8 +64,9 @@ struct NgramTable
     double conf(double p) const { return has_cal ? cal[bucket(p)] : p; }
     int nmax() const { return ns.empty() ? 0 : ns[0]; }
 
-    // the file's text; false with *err on a malformed one
-    bool parse(const std::string& text, std::string* err)
+    // the file's text; false with *err on a malformed one. vocab: token ids must be below it (a verify row's token
+    // indexes the embedding)
+    bool parse(const std::string& text, std::string* err, int vocab = 1 << 30)
     {
         *this = NgramTable();
         digest = fnv(text);
@@ -90,12 +91,14 @@ struct NgramTable
             }
             if (tag == "ns")
             {
+                if (have_ns) return fail(ln, "a second 'ns'");
                 int n;
                 while (ls >> n)
                 {
                     if (n < 1 || n > NMAX) return fail(ln, "context length 1.." + std::to_string(NMAX));
                     ns.push_back(n);
                 }
+                if (!ls.eof()) return fail(ln, "ns: whole numbers");
                 if (ns.empty()) return fail(ln, "no context length");
                 std::sort(ns.rbegin(), ns.rend());
                 ns.erase(std::unique(ns.begin(), ns.end()), ns.end());
@@ -123,11 +126,14 @@ struct NgramTable
                 int n;
                 if (!(ls >> n) || std::find(ns.begin(), ns.end(), n) == ns.end()) return fail(ln, "entry length not in ns");
                 int ctx[NMAX];
-                for (int i = 0; i < n; ++i) if (!(ls >> ctx[i])) return fail(ln, "short entry");
+                for (int i = 0; i < n; ++i) if (!(ls >> ctx[i]) || ctx[i] < 0) return fail(ln, "short entry");
                 int tok;
                 double p;
-                if (!(ls >> tok >> p) || tok < 0 || !(p > 0 && p <= 1)) return fail(ln, "entry: token >= 0 and p in (0, 1]");
-                t[key(ctx, n)] = {tok, (float)p};
+                std::string extra;
+                if (!(ls >> tok >> p) || tok < 0 || tok >= vocab || !(p > 0 && p <= 1))
+                    return fail(ln, "entry: token in 0.." + std::to_string(vocab - 1) + " and p in (0, 1]");
+                if (ls >> extra) return fail(ln, "entry: extra fields");
+                if (!t.emplace(key(ctx, n), std::make_pair(tok, p)).second) return fail(ln, "a context given twice (or a hash collision)");
             }
             else return fail(ln, "unknown record '" + tag + "'");
         }
@@ -135,7 +141,7 @@ struct NgramTable
         return true;
     }
     // the next token after ctx[0..len) at the longest context length with an entry; false: none
-    bool next(const int* ctx, int len, int* tok, float* p) const
+    bool next(const int* ctx, int len, int* tok, double* p) const
     {
         for (int n : ns)
         {
@@ -155,7 +161,7 @@ struct NgramTable
         while (k < kmax)
         {
             int tok;
-            float p;
+            double p;
             if (!next(w.data(), (int)w.size(), &tok, &p)) break;
             ++k;
             out[k] = tok;

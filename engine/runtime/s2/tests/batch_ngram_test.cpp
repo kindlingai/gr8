@@ -32,8 +32,17 @@ struct Run
     Stats st;
 };
 
+struct Opt
+{
+    bool adaptive = false;            // --spec-adaptive estimates
+    bool dsel = false;                // the drafter choice (MTP drafts every token right: it moves to MTP)
+    bool lp = false;                  // the lp hook (MTP drafts' log-probabilities)
+    bool klog = false;                // KStop::log (G6_MTP_LPLOG on this rank only): must not change any decision
+    g6rt::InsertRule ins;
+};
+
 // one solo DFlash2 request of n_gen tokens; dfl_right: how many of the drafter's 7 drafts are right
-static Run run(const NgramSrc* ng, int dfl_right, bool adaptive = false)
+static Run run(const NgramSrc* ng, int dfl_right, const Opt& op = Opt())
 {
     Run o;
     bool prompt = true;
@@ -52,14 +61,25 @@ static Run run(const NgramSrc* ng, int dfl_right, bool adaptive = false)
         return d;
     };
     h.emit = [&](int, const int* t, int k, int) { o.got.insert(o.got.end(), t, t + k); return false; };
+    if (op.lp) h.lp = [&](int r) { return -0.05f * (float)(1 + r % 4); };
     Batch b(3, 32, h);
     g6rt::SpecLen sl;                 // adaptive: the --spec-adaptive estimates (TP4 serving), which learn the drafter
-    if (adaptive) { sl.on = true; sl.set_levels({7}); }
+    if (op.adaptive) { sl.on = true; sl.set_levels({7}); }
     b.dflash(7, sl);
+    if (op.dsel)
+    {
+        DSel sel;
+        sel.on = true;
+        sel.d.draft_round = 8.1; sel.m.draft_round = 5.5; sel.m.draft_each = 2.1;
+        b.dsel(sel);
+    }
+    KStop ks;
+    ks.log = op.klog;
+    b.kstop(ks);
     if (ng) b.ngram(*ng);
     Session s;
     for (int i = 0; i < 10; ++i) s.prompt.push_back(i < 7 ? 5 : target(i - 1));   // its last 3 tokens are the cycle's
-    s.first = 9; s.chunk = 8; s.n_gen = 200; s.dflash = true;
+    s.first = 9; s.chunk = 8; s.n_gen = 200; s.dflash = true; s.ins = op.ins;
     b.admit({0}, {s});
     prompt = false;
     while (b.round({0})) {}
@@ -121,7 +141,8 @@ int main()
     ng.kmax = 7;
     for (bool ad : {false, true})
     {
-        const Run dfl7 = run(&ng, 7, ad);
+        Opt op; op.adaptive = ad;
+        const Run dfl7 = run(&ng, 7, op);
         CHECK(dfl7.got == base.got);
         CHECK(dfl7.st.ngram_rounds > 0 && dfl7.st.ngram_rounds < 10 && dfl7.st.dfl_rounds > 10);
     }
@@ -146,6 +167,43 @@ int main()
     const Run wr = run(&ng, 3);
     CHECK(wr.got == base.got && wr.st.ngram_rounds > 0 && wr.st.ngram_acc == 0);
     CHECK(ngram_sig(NgramSrc()).empty() && !ngram_sig(ng).empty());
+    // MTP rounds (the drafter choice moves to MTP, whose drafts are all right): the table still takes rounds, the output
+    // is the target's, and the MTP log-probabilities that only a logging rank has (G6_MTP_LPLOG, KStop::log without a
+    // stop mode) change no verify width
+    {
+        ng.t = &good; ng.kmin = 2; ng.kmax = 7;
+        Opt op; op.dsel = true; op.lp = true;
+        const Run plain = run(nullptr, 3, op);
+        const Run a = run(&ng, 3, op);
+        op.klog = true;
+        const Run b = run(&ng, 3, op);
+        CHECK(plain.st.mtp_rounds > 0);
+        CHECK(a.got == base.got && b.got == base.got);
+        CHECK(a.st.ngram_rounds > 0);
+        CHECK(a.widths == b.widths);
+    }
+    // an insert rule that cuts inside a table chain: the reply is the same as without the table
+    {
+        Opt op;
+        op.ins.after = 37; op.ins.tokens = {7, 8, 9}; op.ins.unless = -1;
+        const Run plain = run(nullptr, 3, op);
+        const Run tab = run(&ng, 3, op);
+        CHECK(plain.got.size() == 200 && tab.got == plain.got && tab.st.ngram_rounds > 0);
+        CHECK(plain.got[37] == 7 && plain.got[39] == 9);
+    }
+    // the loader's bounds: token ids below the vocabulary, one entry per context, strict lines
+    {
+        g6rt::NgramTable t;
+        CHECK(!t.parse("g6ngram 1\nns 2\ncal none\ne 2 1 2 1500 0.9\n", &err, 1500));
+        CHECK(t.parse("g6ngram 1\nns 2\ncal none\ne 2 1 2 1499 0.9\n", &err, 1500));
+        CHECK(!t.parse("g6ngram 1\nns 2\ncal none\ne 2 1 2 3 0.9\ne 2 1 2 4 0.8\n", &err));
+        CHECK(!t.parse("g6ngram 1\nns 2\ncal none\ne 2 1 2 3 0.9 7\n", &err));
+        CHECK(!t.parse("g6ngram 1\nns 2 x 4\ncal none\n", &err));
+        CHECK(!t.parse("g6ngram 1\nns 2\nns 3\ncal none\n", &err));
+        CHECK(t.parse("g6ngram 1\nns 2\ncal none\ne 2 1 2 3 0.88\n", &err));
+        int tok; double pp; const int c[] = {1, 2};
+        CHECK(t.next(c, 2, &tok, &pp) && g6rt::NgramTable::bucket(pp) == 5);   // 0.88 read as a double: bucket [0.88, 0.95)
+    }
     std::printf("batch_ngram_test: %s (rounds: drafter %ld, table %ld)\n", fails ? "FAIL" : "PASS", base.st.rounds, on.st.rounds);
     return fails ? 1 : 0;
 }

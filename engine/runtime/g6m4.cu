@@ -774,7 +774,7 @@ int main(int argc, char** argv)
         if (!f) die(std::string("G6_NGRAM: cannot read ") + e);
         const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         std::string err;
-        if (!ngram_tab.parse(text, &err)) die("G6_NGRAM: " + err);
+        if (!ngram_tab.parse(text, &err, geom::VOCAB)) die("G6_NGRAM: " + err);
         ngram.t = &ngram_tab;
         ngram.kmax = getenv("G6_NGRAM_KMAX") ? atoi(getenv("G6_NGRAM_KMAX")) : dfl_k;
         ngram.kmin = getenv("G6_NGRAM_KMIN") ? atoi(getenv("G6_NGRAM_KMIN")) : 2;
