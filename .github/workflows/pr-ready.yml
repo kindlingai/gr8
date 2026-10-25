@@ -1,7 +1,7 @@
 # The merge queue's ready flag (queue:ready) and maintainer-requested CI (ci:requested), set and cleared only here.
 #   /ready, /unready and /ci, commented on an open PR by a maintainer in READY_USERS, set or clear them. Commands need
 #   no write access, so a maintainer with read access can use them. /ready needs a risk:* category label
-#   (pr-category.yml); /ci runs CI without queueing the PR.
+#   (pr-category.yml), or applies the one ticked in the description; /ci runs CI without queueing the PR.
 #   Either label added by anyone else is removed again. A push to the PR clears both: they always refer to the commits
 #   a maintainer looked at. A command is refused if the PR's head was pushed after the comment, and a label is dropped
 #   again if the head moves while the command is handled.
@@ -69,9 +69,9 @@ jobs:
 
             // Start CI on the PR head: find its latest ci.yml run, approve it if it waits for approval, and re-run it
             // once its ready gate has turned it away. Waits up to 5 minutes for the gate; reports anything else.
-            // The org's Actions policy can refuse runs started by github-actions[bot]: GitHub accepts the re-run and
-            // fails it at startup a few seconds later. The bot watches for that and asks a maintainer to re-run the
-            // run themselves, which the policy allows.
+            // A re-run started with GITHUB_TOKEN fails at startup (GitHub accepts it, then fails it seconds later), as
+            // does any run of a PR whose author's runs are refused. The bot watches for that and asks a maintainer to
+            // re-run the run themselves. startCI below avoids the re-run where it can.
             const askHuman = (run, why) => say(`CI on ${run.head_sha.slice(0, 7)} is cleared to run, but ${why}. ` +
               `A maintainer with write access can start it: open ${run.html_url} and choose **Re-run all jobs**.`);
             const rerunCI = async p => {
@@ -122,7 +122,7 @@ jobs:
                       await sleep(10000);
                       const now = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })).data;
                       if (now.conclusion === "startup_failure") {
-                        await askHuman(run, "the org's Actions policy stopped the bot's re-run from starting");
+                        await askHuman(run, "the bot's re-run failed to start");
                         return;
                       }
                       if (now.status !== "completed") return;      // the re-run is running
@@ -134,6 +134,41 @@ jobs:
                 await sleep(10000);
               }
               await say(`Timed out waiting for CI on ${head.slice(0, 7)} to reach its ready gate.`);
+            };
+
+            // A PR whose branch is in this repository gets a workflow_dispatch run of ci.yml on its branch instead:
+            // GitHub lets GITHUB_TOKEN start workflow_dispatch runs, and the gate always passes them. Its checks land
+            // on the PR's head commit. A fork's branch cannot be dispatched, so it goes through rerunCI.
+            const startCI = async p => {
+              if (p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
+                const since = Date.now() - 5000;
+                try {
+                  await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: "ci.yml", ref: p.head.ref });
+                  for (let i = 0; i < 12; i++) {
+                    await sleep(10000);
+                    const run = (await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: "ci.yml",
+                      event: "workflow_dispatch", head_sha: p.head.sha, per_page: 5 })).data.workflow_runs
+                      .find(r => Date.parse(r.created_at) >= since);
+                    if (!run) continue;
+                    if (run.conclusion !== "startup_failure") return;
+                    break;
+                  }
+                } catch (e) {
+                  core.info(`workflow_dispatch failed: ${e.message}`);
+                }
+              }
+              await rerunCI(p);
+            };
+
+            // The category the author ticked, as pr-category.yml reads it (same list): its label, or null unless
+            // exactly one is ticked. /ready applies it when pr-category.yml never ran (an author whose runs are refused).
+            const tickedCategory = body => {
+              const cats = [["Bit-exact / off by default", "risk:bit-exact"],
+                ["Changes defaults or performance", "risk:default-change"], ["Front end only", "risk:frontend"],
+                ["Docs or tests only", "risk:docs-tests"]];
+              const ticked = cats.filter(([t]) =>
+                new RegExp(`^\\s*[-*] \\[[xX]\\] \\**${t.replace(/[/]/g, "\\/")}`, "m").test(body || ""));
+              return ticked.length === 1 ? ticked[0][1] : null;
             };
 
             if (ev === "issue_comment") {
@@ -166,9 +201,13 @@ jobs:
               }
               const name = cmd === "/ci" ? ciLabel : label;
               if (cmd === "/ready" && !(await liveLabels()).some(n => n.startsWith("risk:"))) {
-                await react("confused");
-                await say(`@${sender}, this PR has no merge-queue category yet: tick one in the description first.`);
-                return;
+                const cat = tickedCategory(p.body);
+                if (!cat) {
+                  await react("confused");
+                  await say(`@${sender}, this PR has no merge-queue category yet: tick exactly one in the description first.`);
+                  return;
+                }
+                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [cat] });
               }
               await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [name] });
               const after = await pull();
@@ -180,7 +219,7 @@ jobs:
               }
               await react("+1");
               if (cmd === "/ci" || !(await liveLabels()).includes("risk:docs-tests")) {
-                await rerunCI(p);
+                await startCI(p);
                 return;
               }
 
@@ -190,7 +229,7 @@ jobs:
               const md = f => /\.md$/i.test(f);
               const names = files.flatMap(f => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
               if (!files.length || !names.every(md)) {      // not Markdown-only: it has CI, run that
-                await rerunCI(p);
+                await startCI(p);
                 return;
               }
               // Markdown-only, so it has no CI run either: merge it, or say why not.
@@ -240,7 +279,7 @@ jobs:
               const how = added === label ? "/ready" : "/ci";
               await say(`@${sender}, \`${added}\` is set by a maintainer commenting \`${how}\`, so it was removed.`);
             } else if (added === label || added === ciLabel) {
-              await rerunCI(await pull());
+              await startCI(await pull());
             } else if (act === "synchronize") {
               // Remove both whatever the event's labels say: a label added after the event was built must go too.
               await remove(ciLabel);
