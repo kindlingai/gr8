@@ -84,7 +84,7 @@ jobs:
 
             // Start CI on the PR head: find its latest ci.yml run, approve it if it waits for approval, and re-run it
             // once its ready gate has turned it away. Waits up to 5 minutes for the gate; reports anything else.
-            // startCI below avoids the re-run where it can.
+            // startCI below picks between this and a dispatched run.
             const askHuman = (run, why) => say(`CI on ${run.head_sha.slice(0, 7)} is cleared to run, but ${why}. ` +
               `A maintainer with write access can start it: open ${run.html_url} and choose **Re-run all jobs**.`);
             // Re-run RUN and watch it start; a failed start is retried while retries last, then a maintainer is asked.
@@ -160,11 +160,12 @@ jobs:
               await say(`Timed out waiting for CI on ${head.slice(0, 7)} to reach its ready gate.`);
             };
 
-            // A PR whose branch is in this repository gets a workflow_dispatch run of ci.yml on its branch instead: the
-            // gate always passes such runs, and its checks land on the PR's head commit. A fork's branch cannot be
-            // dispatched, so it goes through rerunCI.
+            // With CI_TRIGGER_TOKEN the PR's own run is re-run, so its checks replace the failed gate on the PR page.
+            // Without the token a re-run fails at startup, so a PR whose branch is in this repository gets a
+            // workflow_dispatch run of ci.yml on its branch instead. The gate always passes such runs, but GitHub lists
+            // them only on the commit, not on the PR, so the bot links the run. A fork's branch cannot be dispatched.
             const startCI = async p => {
-              if (p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
+              if (!token && p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
                 const since = Date.now() - 5000;
                 try {
                   await starter.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: "ci.yml", ref: p.head.ref });
@@ -174,8 +175,10 @@ jobs:
                       event: "workflow_dispatch", head_sha: p.head.sha, per_page: 5 })).data.workflow_runs
                       .find(r => Date.parse(r.created_at) >= since);
                     if (!run) continue;
-                    if (run.conclusion !== "startup_failure") return;
-                    break;
+                    if (run.conclusion === "startup_failure") break;
+                    await say(`CI is running on ${p.head.sha.slice(0, 7)}: ${run.html_url}. The PR's checks do not list ` +
+                      `this run, so they still show the failed ready gate.`);
+                    return;
                   }
                 } catch (e) {
                   core.info(`workflow_dispatch failed: ${e.message}`);
