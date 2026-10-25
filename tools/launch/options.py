@@ -159,6 +159,11 @@ KEYS = {
                                        'int4, the fallback)'),
     'LAYOUT': ('box', None, 'with V2_DENSE: a layout file (bin/g6layout) that says which pieces each rank holds, instead '
                             'of the formulas. The handshake compares its sha256'),
+    'GRAMMAR': ('cluster', '1', '1 = the engine masks response_format JSON replies with their grammar (XGrammar; '
+                                'GLM-5.3 only, and an engine built without it serves without); the front end checks '
+                                'them either way'),
+    'GRAMMAR_DIR': ('box', None, 'GRAMMAR=1: the directory with the tokenizer.json and generation_config.json the grammars '
+                                 'compile against (default: the model set\'s tokenizer)'),
     'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
@@ -325,7 +330,7 @@ def parse(argv, environ=None):
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
-              'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT'):
+              'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT', 'GRAMMAR_DIR'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or \
                 (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
                 (k == 'VARIANT' and '/' not in values[k] and not values[k].endswith('.json')):
@@ -372,6 +377,8 @@ def validate(o):
                           '--default-thinking-budget)')
     if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
         raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
+    if o.get('GRAMMAR') not in ('0', '1'):
+        raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
     if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
@@ -609,7 +616,8 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
     if kv_rows:
         env['KV_ROWS'] = kv_rows
     if rank == '@R':   # the template: v2 paths are per box
-        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT'):
+        for k in ('V2', 'V2_SLICES', 'V2_WIDTHS', 'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT',
+                  'GRAMMAR_DIR'):
             if env.get(k):
                 env[k] = '@' + k
     names = ' '.join(ENGINE_KNOBS + ['S2PORT', 'READY_TMO'])

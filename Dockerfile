@@ -57,15 +57,30 @@ RUN mkdir -p /out \
  && cp target/release/g6front-rs /out/ \
  && rm -rf target
 
+# XGrammar's C++ sources, the copy the front end's xgrammar crate pins (Cargo.lock): the engine's request grammars build
+# from it (engine/runtime/grammar.h). cargo fetch only, so the engine stages need not wait for the front end's build
+FROM rust AS xgrammar-src
+COPY frontend/g6front-rs/Cargo.toml frontend/g6front-rs/Cargo.lock frontend/g6front-rs/rust-toolchain.toml frontend/g6front-rs/
+WORKDIR /src/frontend/g6front-rs
+RUN mkdir -p src && touch src/main.rs && cargo fetch --locked \
+ && cp -a "$(ls -d /opt/cargo/registry/src/*/xgrammar-*/thirdparty/xgrammar | head -1)" /out-xgrammar
+
 # engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
 # This stage has no cargo: build.sh skips its cargo step and links the libg6load.a and libg6kvman.a built above.
 FROM toolchain AS engine-src
+# cmake for XGrammar (G6_XGRAMMAR below)
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY engine engine
 COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
 COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
+COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
+ENV G6_XGRAMMAR=/opt/xgrammar
 
 # one g6m4 and one m4sim for every TP width; every launcher runs this build.
 # G6_WIDTHS builds a subset (build.sh): CI passes one on a pull request and

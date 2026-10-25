@@ -41,7 +41,17 @@ struct DispatchHooks {
     std::function<s2::DflDrafts(const s2::DflReq&, const Sampling&)> dfl;
     // optional: row's log-probability in the last draft or chain step (StepOut::lp; s2_batch.h Batch::kstop)
     std::function<float(int row)> draft_lp;
+    // optional, grammars (Dispatch::set_grammar): the host side of the mask arena the main head reads
+    int* gm_on = nullptr; uint32_t* gm_bits = nullptr; int gm_words = 0;
 };
+// The row of the step's j-th session that samples its next reply token: the one whose input is the last committed token,
+// at position `last` (the prompt's length + the tokens emitted - 1). -1 when the step holds none (a prompt step before
+// the prompt's last token). The session's rows after it hold drafts.
+inline int grammar_row0(const s2::Step& sp, size_t j, int last) {
+    for (int r = sp.row0[j]; r < sp.row0[j] + sp.rows[j]; ++r)
+        if (sp.r[r].pos == last) return r;
+    return -1;
+}
 // the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
 inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
 class Dispatch {
@@ -53,9 +63,11 @@ class Dispatch {
     std::array<bool, MAX_SESSIONS> have_main_{};
     std::array<g6rt::PrefixReuse, MAX_SESSIONS> rows_;   // prefix reuse: each session's written rows (main, draft, prefill)
     bool track_ = false;
+    int* gm_on_ = nullptr; uint32_t* gm_bits_ = nullptr; int gm_words_ = 0;   // the grammar masks (set_grammar)
 public:
     Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h) : sessions_(sessions), hooks_(std::move(h)), max_rows_(rows) {
         require(rows && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && bool(hooks_.prefill), "incomplete dispatch hooks");
+        if (hooks_.gm_on) set_grammar(hooks_.gm_on, hooks_.gm_bits, hooks_.gm_words);
     }
     // Call at every safe boundary after local EOS/commit, not inside a Step.
     // Resident means Prefill OR Decode; a 1-session prompt step within S>=2 is
@@ -67,6 +79,9 @@ public:
         if (next != solo_ || mode_dirty_) { hooks_.mode(solo_, next); solo_ = next; mode_dirty_ = false; }
     }
     void track_rows() { track_ = true; }
+    // Grammars (grammar.h): before every step, on[r] = 1 where row r's sample follows its session's grammar, with the
+    // row's mask at bits + r * words; the head reads both (rank.cuh launch_head_local). Draft steps are not masked.
+    void set_grammar(int* on, uint32_t* bits, int words) { gm_on_ = on; gm_bits_ = bits; gm_words_ = words; }
     // a new session on `slot`; skip: rows its run already holds (Grant::reuse)
     void begin(unsigned slot, int skip, const g6rt::CacheNamespace& ns = {}) {
         require(slot < MAX_SESSIONS, "invalid dispatch slot");
@@ -111,6 +126,7 @@ public:
         }
         require(next_row == sp.M(), "unmapped native rows");
         l.graph_key = launch_key(sp.key(), l.bucket);
+        if (gm_on_) grammar_masks(sp, draft);
         auto& seq = draft ? draft_sequence_ : main_sequence_;
         require(seq != UINT64_MAX, "fabric sequence exhausted"); l.sequence = ++seq;
         auto ids = hooks_.launch(l); require(ids.size() == sp.r.size(), "native output row mismatch");
@@ -124,6 +140,19 @@ public:
             else w.draft_rows(first, n, sp.kind == s2::Step::CHAIN);
         }
         return ids;
+    }
+    void grammar_masks(const s2::Step& sp, bool draft) {
+        for (int r = 0; r < sp.M(); ++r) gm_on_[r] = 0;
+        if (draft) return;
+        for (size_t j = 0; j < sp.sess.size(); ++j) {
+            const auto& s = sessions_.at(unsigned(sp.sess[j]));
+            if (!s.grammar) continue;
+            const int i0 = grammar_row0(sp, j, int(s.payload.prompt.size()) + s.emitter.emitted - 1);
+            if (i0 < 0) continue;
+            std::vector<int> drafts;
+            for (int r = i0 + 1; r < sp.row0[j] + sp.rows[j]; ++r) drafts.push_back(sp.r[r].tok);
+            g6rt::grammar_masks(*s.grammar, drafts.data(), int(drafts.size()), gm_on_ + i0, gm_bits_ + size_t(i0) * gm_words_);
+        }
     }
     bool dfl_ok(unsigned slot) const { return hooks_.dfl_ok && hooks_.dfl_ok(int(slot)); }
     int dfl_start(unsigned slot) { require(int(slot) == solo_, "DFlash2 outside the solo path"); return hooks_.dfl_start(int(slot)); }

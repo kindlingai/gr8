@@ -19,6 +19,7 @@
 //       m <rounds> <draft_tokens> <accepted> <acc_pos0> ..   cumulative MTP counters since start
 //       end <stop|length|error> <stop_id|-1> <completion_tokens>
 #pragma once
+#include "grammar.h"
 #include "steering.h"
 #include <sys/stat.h>
 #include <chrono>
@@ -45,6 +46,7 @@ struct ServeReq
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
     steering::Identity steering{};
     InsertRule ins;               // S2 only (s2/sessions.h parse_request)
+    GrammarSpec gram;             // S2 only: the reply's grammar (grammar.h), off unless the request has one
 };
 
 constexpr int LP_MAX = 20;       // = glue::LP_K (rank.cuh checks)

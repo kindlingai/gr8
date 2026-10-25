@@ -355,6 +355,7 @@ pub fn build(
             prompt_logprobs: plp.map(|v| v as i64),
             system_tokens: None,
             insert: None,
+            grammar: None,
             steering_profile: None,
             steering_scale: None,
         },

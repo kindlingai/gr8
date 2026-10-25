@@ -29,19 +29,21 @@ pub struct Rf {
     pub kind: String,
     pub schema: Option<Value>,
     pub grammar: Option<CompiledGrammar>,
+    /// json_schema.strict
+    pub strict: bool,
 }
 
 pub fn parse_response_format(v: Option<&Value>, grammars: &Grammars) -> Result<Rf, ApiError> {
     let bad = |m: String| ApiError::bad(m, Some("response_format"));
     let Some(v) = v.filter(|v| !v.is_null()) else {
-        return Ok(Rf { kind: "text".into(), schema: None, grammar: None });
+        return Ok(Rf { kind: "text".into(), schema: None, grammar: None, strict: false });
     };
     let Some(o) = v.as_object() else {
         return Err(bad("response_format must be an object".into()));
     };
     match o.get("type").and_then(Value::as_str) {
-        Some("text") => Ok(Rf { kind: "text".into(), schema: None, grammar: None }),
-        Some("json_object") => Ok(Rf { kind: "json_object".into(), schema: None, grammar: None }),
+        Some("text") => Ok(Rf { kind: "text".into(), schema: None, grammar: None, strict: false }),
+        Some("json_object") => Ok(Rf { kind: "json_object".into(), schema: None, grammar: None, strict: false }),
         Some("json_schema") => {
             let js = o.get("json_schema").and_then(Value::as_object);
             let ok = js.is_some_and(|js| js.get("name").is_some_and(Value::is_string))
@@ -56,7 +58,7 @@ pub fn parse_response_format(v: Option<&Value>, grammars: &Grammars) -> Result<R
             let grammar = grammars
                 .json_schema(&schema.to_string(), strict)
                 .map_err(|e| bad(format!("response_format json_schema: the schema does not compile: {e}")))?;
-            Ok(Rf { kind: "json_schema".into(), schema: Some(schema), grammar: Some(grammar) })
+            Ok(Rf { kind: "json_schema".into(), schema: Some(schema), grammar: Some(grammar), strict })
         }
         Some(t) => Err(bad(format!(
             "response_format \"{t}\" is not supported by the gr8 front end yet (only \"text\", \"json_object\", \
@@ -377,7 +379,7 @@ mod tests {
 
     #[test]
     fn enforcement_policies() {
-        let rf = Rf { kind: "json_object".into(), schema: None, grammar: None };
+        let rf = Rf { kind: "json_object".into(), schema: None, grammar: None, strict: false };
         let (c, w) = enforce(Some("Here: {\"a\": 1} done"), &rf);
         assert_eq!(c.as_deref(), Some("{\"a\": 1}"));
         assert!(w.is_empty());
@@ -385,7 +387,7 @@ mod tests {
         assert_eq!(c.as_deref(), Some("no json"));
         assert_eq!(w.len(), 1);
         let schema = json!({"type": "object", "required": ["a"], "properties": {"a": {"type": "integer"}}});
-        let rf = Rf { kind: "json_schema".into(), schema: Some(schema), grammar: None };
+        let rf = Rf { kind: "json_schema".into(), schema: Some(schema), grammar: None, strict: false };
         // no compiled grammar in this unit test: extraction only, no validation claim
         let (c, w) = enforce(Some("{\"a\": \"x\"}"), &rf);
         assert_eq!(c.as_deref(), Some("{\"a\": \"x\"}"));

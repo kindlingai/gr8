@@ -474,6 +474,7 @@ public:
                 return g6rt::lp_row(lp_,row,target,k);
             }
         };
+        h.gm_on = c_.main.gm_on_host; h.gm_bits = c_.main.gm_bits_host; h.gm_words = c_.main.gm_words;
         h.draft_lp = [&](int row) {
             require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
             return dlp_[row];
