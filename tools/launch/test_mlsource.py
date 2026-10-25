@@ -120,6 +120,31 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertEqual({r['path'] for r in first['ranges']}, {r['path'] for r in last['ranges']})
         self.assertTrue(set(last['include']) <= set(first['include']))
 
+    def test_a_state_from_an_older_model_loader(self):
+        """segments_done, without held: the state a model-loader from before small segments writes."""
+        self.ml.legacy_state = True
+        o, ms, v = self.resolve()
+        ms.release.fetch_rank(4, 1, v)
+        with open(os.path.join(self.store, 'state', NAME, 'main.json')) as f:
+            self.assertTrue(all('held' not in x for x in json.load(f)['files']))
+        self.assertEqual(ms.release.check(4, 1, v), [])
+        self.ml.drop(NAME, 'main', 'experts/exlr8-layer-003.k3.safetensors')
+        self.assertTrue(ms.release.check(4, 1, v))
+
+    def test_held_runs(self):
+        fm = {'size': 10 * 64, 'segment_size': 64}
+        V = mlsource.Store.verified
+        st = {'complete': False, 'held': [[0, 2], [2, 4], [7, 9]]}
+        self.assertTrue(V(fm, st, 0, 256))                        # runs that touch join
+        self.assertTrue(V(fm, st, 7 * 64 + 3, 100))
+        self.assertFalse(V(fm, st, 3 * 64, 65))                   # crosses into segment 4
+        self.assertFalse(V(fm, st, 9 * 64, 1))
+        self.assertFalse(V(fm, st, 0, 0))
+        self.assertFalse(V(fm, {'complete': False, 'held': [[0, 10]]}, 0, 64))   # all held: whole check pending
+        self.assertTrue(V(fm, {'complete': True, 'held': [[0, 10]]}, 0, 64))
+        self.assertFalse(V(fm, {'complete': True, 'whole_failed': True, 'held': [[0, 10]]}, 0, 64))
+        self.assertTrue(V(fm, {'complete': False, 'segments_done': [True, True] + [False] * 8}, 64, 64))
+
     def test_the_store_losing_a_piece_fails_the_check(self):
         o, ms, v = self.resolve()
         ms.release.fetch_rank(4, 3, v)
@@ -293,7 +318,8 @@ class RealModelLoaderTests(unittest.TestCase):
         store = os.path.join(t, 'store')
         with open(os.path.join(t, 'catalog.yaml'), 'w') as f:
             f.write(f'models:\n  - name: {NAME}\n    source:\n      type: http\n      url: '
-                    f'http://127.0.0.1:{srv.server_address[1]}/\n    revision: main\n')
+                    f'http://127.0.0.1:{srv.server_address[1]}/\n    revision: main\n'
+                    '    segment_sizes:\n      - {path: "experts/*.k?.safetensors", size: 65536}\n')
         sel = os.path.join(t, 'selection.yaml')
         p = subprocess.Popen([os.environ['MODEL_LOADER_BIN'], '-mode=both', f'-catalog={t}/catalog.yaml',
                               f'-selection={sel}', f'-store={store}', f'-listen=127.0.0.1:{free_port()}',
@@ -316,6 +342,10 @@ class RealModelLoaderTests(unittest.TestCase):
         self.assertEqual(ms.release.check(4, 1, v), [])
         T.same_halves(rel, ms.release.v2, 3, 4, 1, lambda p: 3)
         self.assertFalse([x for x in log if 'k2.safetensors' in x])       # home: no K2 bytes from the origin
+        # 64 KiB segments: the store holds about the rank's quarter of each width file, not all of it
+        k3 = os.path.join(ms.release.v2, 'exlr8-layer-003.k3.safetensors')
+        held = os.stat(k3).st_blocks * 512
+        self.assertLess(held, 0.6 * os.path.getsize(k3), (held, os.path.getsize(k3)))
         # a second boot with the origin gone reads the store alone
         srv.shutdown()
         srv.server_close()

@@ -167,10 +167,38 @@ class Store:
             return False
         if fs.get('complete'):
             return True
-        done, seg = fs.get('segments_done') or [], int(fm.get('segment_size') or 0)
-        if not seg or a + n > fm['size'] or all(done):
+        seg = int(fm.get('segment_size') or 0)
+        if not seg or n <= 0 or a < 0 or a + n > fm['size']:
             return False
-        return all(i < len(done) and done[i] for i in range(a // seg, (a + n - 1) // seg + 1))
+        nseg = -(-fm['size'] // seg)
+        runs = Store.runs(fs, nseg)
+        if runs == [[0, nseg]]:                 # every segment held, not complete: not used until its whole check
+            return False
+        first, last = a // seg, (a + n - 1) // seg
+        return any(lo <= first and last < hi for lo, hi in runs)
+
+    @staticmethod
+    def runs(fs, nseg):
+        """The held segments as sorted, joined half-open runs: `held` (the contract's field), else `segments_done` (a
+        state an older model-loader wrote)."""
+        if 'held' in fs:
+            out = []
+            for lo, hi in sorted((int(x[0]), int(x[1])) for x in fs['held'] or []):
+                lo, hi = max(lo, 0), min(hi, nseg)
+                if lo >= hi:
+                    continue
+                if out and lo <= out[-1][1]:
+                    out[-1][1] = max(out[-1][1], hi)
+                else:
+                    out.append([lo, hi])
+            return out
+        out, done = [], fs.get('segments_done') or []
+        for i, d in enumerate(done[:nseg]):
+            if d and out and out[-1][1] == i:
+                out[-1][1] = i + 1
+            elif d:
+                out.append([i, i + 1])
+        return out
 
     def missing(self, files, ranges):
         """The pieces the store does not hold verified: whole files, and {path: [[a, n]]}."""

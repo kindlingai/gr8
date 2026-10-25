@@ -31,9 +31,12 @@ def glob_match(pattern, path):
 
 
 class FakeModelLoader:
-    def __init__(self, store, catalog, segment=64 << 10, slow=False, token=None):
-        """catalog: {name: {revision: (release dir, commit)}}. token: answer 401 without Authorization: Bearer token."""
+    def __init__(self, store, catalog, segment=64 << 10, slow=False, token=None, legacy_state=False):
+        """catalog: {name: {revision: (release dir, commit)}}. token: answer 401 without Authorization: Bearer ***
+        legacy_state: write segments_done only, as a model-loader from before `held` did; else `held` runs only, as
+        a file of small segments has."""
         self.store, self.catalog, self.segment, self.slow, self.token = store, catalog, segment, slow, token
+        self.legacy_state = legacy_state
         self.copied, self.requests, self.puts, self.lock = 0, {}, [], threading.Lock()
         self.waits = {}
         os.makedirs(store, exist_ok=True)
@@ -166,17 +169,41 @@ class FakeModelLoader:
         return os.path.join(self.store, 'state', model, rev + '.json')
 
     def load_state(self, model, rev):
+        """{path: {'path', 'complete', 'segments_done'}}, whichever form the file is in."""
         try:
             with open(self.state_path(model, rev)) as f:
-                return {x['path']: x for x in json.load(f)['files']}
+                files = json.load(f)['files']
         except (OSError, ValueError):
             return {}
+        out = {}
+        for x in files:
+            done = x.get('segments_done')
+            if done is None:
+                done = [False] * x['nseg']
+                for lo, hi in x['held']:
+                    done[lo:hi] = [True] * (hi - lo)
+            out[x['path']] = {'path': x['path'], 'complete': x['complete'], 'segments_done': done}
+        return out
 
     def save_state(self, model, rev, state):
+        files = []
+        for fs in state.values():
+            if self.legacy_state:
+                files.append(dict(fs))
+                continue
+            runs = []
+            for i, d in enumerate(fs['segments_done']):
+                if d and runs and runs[-1][1] == i:
+                    runs[-1][1] = i + 1
+                elif d:
+                    runs.append([i, i + 1])
+            # nseg is the fake's own (model-loader takes it from the manifest)
+            files.append({'path': fs['path'], 'complete': fs['complete'], 'held': runs,
+                          'nseg': len(fs['segments_done'])})
         p = self.state_path(model, rev)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p + '.tmp', 'w') as f:
-            json.dump({'model': model, 'revision': rev, 'files': list(state.values())}, f)
+            json.dump({'model': model, 'revision': rev, 'files': files}, f)
         os.replace(p + '.tmp', p)
 
     def hold(self, src, model, rev, path, size, ranges, state):
