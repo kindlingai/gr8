@@ -70,6 +70,9 @@ int main() {
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     auto fence = [&] { events += 'F'; };
     auto check = [&] { events += 'C'; assert(!c.main.s2on && !c.draft.d.s2on); require(!word, "Flash serve fabric/attention error"); };
+    uint32_t capture_at = 0;          // G6_FLASH_CACHE: the live request's checkpoint point (0: none)
+    std::vector<int> capture_tokens;
+    u64 capture_req = 0;
 ''' + prefill + r'''
     int cases = 0;
     const Slot slot{{7}, {0}};
@@ -123,6 +126,16 @@ int main() {
                 }
         }
     unsetenv("G6_FLASH_DRAFT_KV");
+    // G6_FLASH_CACHE: the quantum that ends at the checkpoint point notes its tokens [0, p] and the request; another
+    // quantum leaves it pending
+    word = 0; inject = -1; sc.prefill_rows = 8; sc.two_lanes = false;
+    for (int i = 0; i < 64; ++i) p.prompt[i] = 100 + i;
+    capture_at = 12;
+    prefill(slot, p, 0, 4);
+    assert(capture_at == 12 && capture_tokens.empty());
+    prefill(slot, p, 8, 4);
+    assert(capture_at == 0 && capture_req == 7 && capture_tokens.size() == 13 && capture_tokens.back() == 112);
+    ++cases;
     std::printf("flash_serve_prefill_check: PASS %d CPU mock cases (actual serve prefill lambda)\n", cases);
 }
 '''

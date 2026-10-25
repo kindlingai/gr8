@@ -4,6 +4,7 @@
 #include "bootstrap.h"
 #include "control_channel.h"
 #include "dispatch.h"
+#include "flash_lend.h"
 #include "pool.h"
 #include <algorithm>
 #include <chrono>
@@ -49,10 +50,25 @@ struct NativeHooks {
     std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK
+    // optional: every rank, at each boundary after its last commit and before its work (compute thread). Flash takes a
+    // prefill's checkpoint here (flash_native.cuh), so a Resize that lands at the boundary the quantum ended on is in
+    // place before the capture
+    std::function<void()> before_work;
     // optional: did this rank run tier copies since the last call (the same answer on every rank: the copies are). Then
     // the ranks line up before the next round: one rank's copies can take seconds longer than another's, and a GPU wait
     // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
     std::function<bool()> drained;
+    // optional, a tier on a group lease of a KV node (s2/kv_share.h): share = the head's report to the node, on its
+    // control thread every G6_S2_SHARE_MS (default 1000) while no resize is in flight, told whether the engine is idle
+    // (no resident session, none queued); the resize to announce, or nothing. resize = every rank's change at the
+    // Resize commit (share_apply with the tier drain)
+    std::function<std::optional<Resize>(bool idle)> share;
+    std::function<void(const Resize&)> resize;
+    // optional, G6_FLASH_KV_CHUNKS: flash_room = this rank's Flash KV chunks online (its ACKs carry it, Ack::room);
+    // flash = the head's borrow-idle rule (s2/flash_lend.h; chunk_rows 0 = no gate, idle_ms 0 = never lend). Its lends
+    // and recalls are Resize events on FLASH_KV_TIER, so they need the resize hook
+    std::function<uint32_t()> flash_room;
+    FlashLend flash;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
@@ -95,6 +111,15 @@ class Service {
     uint64_t attempted_head_ = UINT64_MAX, attempted_revision_ = UINT64_MAX;
     uint64_t event_ = 1;
     uint64_t sync_ = 0;   // compute thread: barriers passed (native_.drained)
+    // head: a Resize announced and not yet applied on this rank (no second report until then: it would ask again for
+    // segments already granted)
+    std::atomic<bool> resizing_{false};
+    // head, borrow-idle: the chunks the FIFO head waits for (0 = none), when its first recall went out, the last
+    // request the wait line named
+    uint32_t recall_ = 0;
+    std::chrono::steady_clock::time_point recall_t0_{};
+    uint64_t recall_for_ = UINT64_MAX;
+    const long share_ms_ = ::getenv("G6_S2_SHARE_MS") ? std::max(1L, std::atol(::getenv("G6_S2_SHARE_MS"))) : 1000;
     // G6_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
     // boundary it read and the future boundary it chose), one "commit" line when that notice lands on each rank, and one
     // "step" line per prefill quantum. Together they say whether a cancel was installed while a long prefill was still
@@ -177,15 +202,17 @@ class Service {
         const auto target = held ? *held : std::clamp(horizon, boundary + NOTICE_MIN, boundary + NOTICE_MAX);
         if (elog_)
             fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu)\n",
-                    c_.rank, (unsigned long long)event_, command.admit ? "admit" : "cancel", (unsigned long long)command.request,
+                    c_.rank, (unsigned long long)event_, command.resize ? "resize" : command.admit ? "admit" : "cancel",
+                    (unsigned long long)command.request,
                     (unsigned long long)boundary, (unsigned long long)target, (unsigned long long)(target - boundary));
         Notice n{c_.scheduler.epoch, event_, target, command.request, command.hash,
-                 command.admit ? EventKind::Admit : EventKind::Cancel};
+                 command.resize ? EventKind::Resize : command.admit ? EventKind::Admit : EventKind::Cancel};
         bool hold = false;
         leader_->event(n, [&](uint64_t hash) {
             const auto& s = driver_->state(); // compute paused in boundary() until this commit
             Commit cm{n.epoch, n.event, n.boundary, hash, {}, {}};
-            if (!command.admit) cm.cancel = s.find(command.request);
+            cm.resize = command.resize;   // every rank applies it at the commit (Driver resize hook), the head too
+            if (!command.admit && !command.resize) cm.cancel = s.find(command.request);
             // Head owns the real pool delta once; Driver callbacks skip it here. A Retiring slot gave its run back when it
             // finished (Driver finished hook); a cancelled live one gives it back now.
             for (const auto& sl : s.slots())
@@ -214,7 +241,23 @@ class Service {
                             fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
                                     (unsigned long long)worst, why.c_str());
                 }
-                if (fit->why == Stall::None) {
+                // borrow-idle: a request whose worst case passes the chunks every rank has online waits for a recall
+                const uint32_t short_of = fit->why == Stall::None && native_.flash.chunk_rows
+                                              ? native_.flash.recall(worst, leader_->agreed_room()) : 0;
+                if (short_of) {
+                    if (recall_for_ != request->id) {
+                        recall_for_ = request->id; recall_t0_ = std::chrono::steady_clock::now();
+                        fprintf(stderr, "# s2 flash kv: request %llu (%llu rows) waits for a recall to %u chunks (%u online)\n",
+                                (unsigned long long)request->id, (unsigned long long)worst, short_of, leader_->agreed_room());
+                    }
+                    recall_ = short_of;
+                } else if (fit->why == Stall::None && recall_for_ == request->id) {
+                    fprintf(stderr, "# s2 flash kv: request %llu admitted %lld ms after its recall began\n",
+                            (unsigned long long)request->id, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - recall_t0_).count());
+                    recall_for_ = UINT64_MAX;
+                }
+                if (fit->why == Stall::None && !short_of) {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
@@ -254,6 +297,11 @@ class Service {
         // FIFO head there now. Its commit holds again or releases (no grant, or nothing left to chain), so the chain
         // ends within limit() admissions.
         if (hold) { const auto next = commands_.at(queue_.front()->id); event(next, n.boundary); }
+        // the FIFO head waits for lent chunks: recall them (every rank grows at the commit), then it is tried again
+        if (recall_ && !resizing_.load()) {
+            Command c; c.epoch = c_.scheduler.epoch; c.resize = Resize{FLASH_KV_TIER, recall_, 0, 0};
+            recall_ = 0; resizing_.store(true); event(c);
+        }
     }
     // A grammar that does not compile ends its request with an error before it is queued, so no request that asks
     // for a grammar runs without one. The front end compiles each schema first and returns a 400 for one that fails.
@@ -269,8 +317,28 @@ class Service {
     }
     void controller() {
         uint64_t status_revision = UINT64_MAX;
+        auto next_share = std::chrono::steady_clock::now();
         while (!stopping_.load()) {
             bool changed = false;
+            if (native_.share && !resizing_.load() && std::chrono::steady_clock::now() >= next_share) {
+                next_share = std::chrono::steady_clock::now() + std::chrono::milliseconds(share_ms_);
+                if (const auto r = native_.share(progress_.resident.load() == 0 && queue_.size() == 0)) {
+                    fprintf(stderr, "# s2 share: tier %u to %llu segments (%llu blocks)\n", r->tier, (unsigned long long)r->segs,
+                            (unsigned long long)r->slots);
+                    resizing_.store(true);
+                    Command c; c.epoch = c_.scheduler.epoch; c.resize = *r;
+                    event(c); changed = true;
+                }
+            }
+            // borrow-idle: lend the chunks above flash.keep once the engine has been idle flash.idle_ms
+            if (native_.flash.chunk_rows && !resizing_.load())
+                if (const auto n = native_.flash.poll(progress_.resident.load() == 0 && queue_.size() == 0 &&
+                                                      progress_.retiring.load() == 0, std::chrono::steady_clock::now())) {
+                    fprintf(stderr, "# s2 flash kv: idle, lending down to %u chunks\n", *n);
+                    resizing_.store(true);
+                    Command c; c.epoch = c_.scheduler.epoch; c.resize = Resize{FLASH_KV_TIER, *n, 0, 0};
+                    event(c); changed = true;
+                }
             while (auto command = ingress_.next()) {
                 changed = true;
                 if (command->admit) {
@@ -350,12 +418,15 @@ class Service {
                 driver_->apply(*cm, payload ? &*payload : nullptr);
                 if (elog_)
                     fprintf(stderr, "# s2_event commit rank %u event %llu %s request %llu boundary %llu\n", c_.rank,
-                            (unsigned long long)noticed.event, noticed.kind == EventKind::Cancel ? "cancel" : "admit",
+                            (unsigned long long)noticed.event,
+                            noticed.kind == EventKind::Resize ? "resize" : noticed.kind == EventKind::Cancel ? "cancel" : "admit",
                             (unsigned long long)noticed.request, (unsigned long long)cm->boundary);
                 if (worker_ && cm->admit) worker_->admitted(cm->admit->req.id);
+                if (cm->resize) resizing_.store(false);
                 dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
                 staged_.reset(); endpoint_->applied(); continue;
             }
+            if (native_.before_work) native_.before_work();
             const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
             if (elog_ && work.kind != Kind::Decode)
                 fprintf(stderr, "# s2_event step rank %u boundary %llu request %llu %s first %u rows %u\n", c_.rank,
@@ -373,7 +444,10 @@ public:
         require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
                 bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
         require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
+        require(!native_.share || bool(native_.resize), "a share report needs the resize hook");
+        require(!native_.flash.chunk_rows || bool(native_.resize), "borrow-idle needs the resize hook");
         DriverHooks h;
+        h.resize = native_.resize;
         h.bind = [&](const Grant& g) {
             require(staged_.has_value(), "binding without verified payload");
             require(!g.reuse || reuse(), "reused rows without prefix reuse");
@@ -460,6 +534,7 @@ public:
             worker_ = std::make_unique<WorkerChannel>(c_.scheduler.epoch,c_.rank,*links_.links[0]); endpoint_ = worker_.get();
             worker_->on_quit = [this] { atomic_file(c_.directory + "/quit", ""); };
         }
+        endpoint_->room = native_.flash_room;
     }
     // Blocking compute loop, with persistent control + abort/quit monitor threads.
     // Caller must use the runtime's all-rank failure path if this throws.

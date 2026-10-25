@@ -9,7 +9,7 @@
 #include <mutex>
 
 namespace g6s2 {
-enum class EventKind : uint32_t { Admit = 1, Cancel = 2 };
+enum class EventKind : uint32_t { Admit = 1, Cancel = 2, Resize = 3 };
 struct Notice {
     uint64_t epoch = 0, event = 0, boundary = 0, request = 0, payload_hash = 0;
     EventKind kind = EventKind::Admit;
@@ -18,7 +18,9 @@ struct Notice {
                request == n.request && payload_hash == n.payload_hash && kind == n.kind;
     }
 };
-struct Ack { Notice notice; unsigned rank = 0; uint64_t state_hash = 0; };
+// room: the rank's Flash KV chunks online (G6_FLASH_KV_CHUNKS, runtime/flash_kv.h), UINT32_MAX without a chunk map.
+// Not replicated state: a recall the KV node did not release in time leaves one rank short (s2/flash_lend.h)
+struct Ack { Notice notice; unsigned rank = 0; uint64_t state_hash = 0; uint32_t room = UINT32_MAX; };
 class EventGate {
     const uint64_t epoch_; const unsigned rank_;
     std::atomic<int64_t> passed_{-1};
@@ -53,7 +55,8 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         require(!failed_ && !n_, "pending event or failed epoch");
         require(n.epoch == epoch_ && n.event == next_event_ &&
-                (n.kind == EventKind::Admit || n.kind == EventKind::Cancel), "notice epoch/sequence/kind mismatch");
+                (n.kind == EventKind::Admit || n.kind == EventKind::Cancel || n.kind == EventKind::Resize),
+                "notice epoch/sequence/kind mismatch");
         require(n.boundary <= uint64_t(INT64_MAX) && int64_t(n.boundary) > passed_.load(), "late event notice");
         require(!held_ || n.boundary == due_.load(), "notice does not name the held boundary");
         n_ = n; arrived_ = committed_ = held_ = false;
@@ -64,10 +67,10 @@ public:
             failed_ = true; cv_.notify_all(); throw std::runtime_error("notice raced departed boundary");
         }
     }
-    Ack arrive(uint64_t boundary, uint64_t state_hash) {
+    Ack arrive(uint64_t boundary, uint64_t state_hash, uint32_t room = UINT32_MAX) {
         std::lock_guard<std::mutex> lock(mu_);
         require(!failed_ && n_ && !arrived_ && n_->boundary == boundary && due_ == boundary, "invalid event arrival");
-        arrived_ = true; return Ack{*n_, rank_, state_hash};
+        arrived_ = true; return Ack{*n_, rank_, state_hash, room};
     }
     void commit(const Notice& n) { // only from a coordinator with all-rank ACK proof
         std::lock_guard<std::mutex> lock(mu_);
@@ -97,7 +100,7 @@ public:
 };
 
 class Agreement { // rank0's per-event ACK set; never used in steady-state rounds
-    unsigned nr_; Notice n_; std::vector<bool> seen_; std::optional<uint64_t> hash_;
+    unsigned nr_; Notice n_; std::vector<bool> seen_; std::optional<uint64_t> hash_; uint32_t room_ = UINT32_MAX;
 public:
     Agreement(unsigned nr, Notice n) : nr_(nr), n_(n), seen_(nr, false) {
         require(nr == 2 || nr == 3 || nr == 4 || nr == 5 || nr == 6, "expected TP2, TP3, TP4, TP5 or TP6 ranks");
@@ -106,9 +109,10 @@ public:
         require(a.rank < nr_ && a.notice == n_, "ACK rank/event mismatch");
         require(!seen_[a.rank], "duplicate event ACK");
         require(!hash_ || *hash_ == a.state_hash, "replicated state mismatch");
-        hash_ = a.state_hash; seen_[a.rank] = true;
+        hash_ = a.state_hash; seen_[a.rank] = true; room_ = std::min(room_, a.room);
     }
     bool ready() const { return std::all_of(seen_.begin(), seen_.end(), [](bool b) { return b; }); }
     uint64_t agreed_hash() const { require(ready(), "not all ranks quiescent"); return *hash_; }
+    uint32_t room() const { require(ready(), "not all ranks quiescent"); return room_; }   // the least of the ranks' rooms
 };
 } // namespace g6s2

@@ -182,6 +182,10 @@ pub struct TierStats {
     pub block_bytes: u64,
     /// write limit credit left, blocks (0 without a limit; the same on every tier)
     pub credit: i64,
+    /// entries this tier keeps that were bigger than the whole tier (they went to a later tier, or nowhere), and the
+    /// pages of the last one: a group lease's head asks to grow by that much (s2/kv_share.h share_want)
+    pub oversize: u64,
+    pub oversize_last: u64,
 }
 
 pub struct Tier {
@@ -349,6 +353,70 @@ impl Stash {
             credit: if self.limit_milli > 0 { self.credit / 1000 } else { 0 },
             ..x.stats
         })
+    }
+
+    /// Tier t to `slots` blocks, at an event every rank sees (a KV node lease that grew or shrank: REMOTE-TIER.md,
+    /// "Sharing a node"). Growing adds free slots at the top. Shrinking evicts the tier's least recently used entries
+    /// (each moves on to the next tier that takes it, or is dropped, as when the tier is full) until enough slots are
+    /// free, then moves every entry block at or past `slots` into the lowest free slot below it (Io::Move within the
+    /// tier). Entries that stored runs are based on go last. The engine runs those copies before the store gives the
+    /// top blocks back. Every rank makes the same call,
+    /// so every rank queues the same copies. A tier with an index keeps its size (its records name slots): false.
+    pub fn resize_tier(&mut self, t: usize, slots: u64) -> bool {
+        if t >= self.tiers.len() || self.tiers[t].index.is_some() {
+            return false;
+        }
+        let old = self.tiers[t].slots;
+        if slots < old {
+            let need = old - slots;
+            while self.tiers[t].alloc.free() < need {
+                // the least recently used entry that no stored run is based on, before any base: a base's runs go
+                // with it, and a base of many runs is a prefix many conversations still use
+                let bases: Vec<u64> =
+                    self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+                let free = |e: &Entry| !self.pin.contains(&e.id);
+                let es = &self.tiers[t].entries;
+                let Some(i) =
+                    es.iter().position(|e| free(e) && !bases.contains(&e.id)).or_else(|| es.iter().position(free))
+                else {
+                    return false;
+                };
+                let e = self.tiers[t].entries.remove(i);
+                self.evict(t, e);
+            }
+            let mut low = self.tiers[t].alloc.free_below(slots).into_iter();
+            let tier = &mut self.tiers[t];
+            for e in &mut tier.entries {
+                for s in e.slots.iter_mut().filter(|s| **s >= slots) {
+                    let to = low.next().expect("as many free slots below the new size as blocks above it");
+                    self.io.push(Io::Move { tier: t as u32, slot: *s, to: t as u32, to_slot: to });
+                    assert!(tier.alloc.claim(&[to]));
+                    tier.alloc.release(&[*s]);
+                    *s = to;
+                }
+            }
+        }
+        assert!(self.tiers[t].alloc.resize(slots), "the slots past the new size are free");
+        self.tiers[t].slots = slots;
+        true
+    }
+
+    /// Tier t's entries as (id, blocks) in the order a shrink (resize_tier) evicts them: unpinned entries no stored run
+    /// is based on, least recently used first, then unpinned bases, then pinned ones (a shrink stops there). What a KV
+    /// node's head reports its coldest from (pool.rs coldest_ages), so the ages it reports are those of the blocks a
+    /// give costs. resize_tier takes the same rule again after each eviction (a base whose runs all went is no base).
+    pub fn give_order(&self, t: usize) -> Vec<(u64, usize)> {
+        let Some(x) = self.tiers.get(t) else { return Vec::new() };
+        let bases: Vec<u64> = self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+        let rank = |e: &Entry| if self.pin.contains(&e.id) { 2 } else if bases.contains(&e.id) { 1 } else { 0 };
+        let mut v: Vec<(u8, u64, usize)> = x.entries.iter().map(|e| (rank(e), e.id, e.slots.len())).collect();
+        v.sort_by_key(|e| e.0); // stable: LRU order within each class
+        v.into_iter().map(|(_, id, n)| (id, n)).collect()
+    }
+
+    /// Tier t's entries as (id, blocks), least recently used first.
+    pub fn lru(&self, t: usize) -> Vec<(u64, usize)> {
+        self.tiers.get(t).map_or_else(Vec::new, |x| x.entries.iter().map(|e| (e.id, e.slots.len())).collect())
     }
 
     pub fn entries(&self, t: usize) -> &[Entry] {
@@ -696,7 +764,12 @@ impl Stash {
     fn place(&mut self, start: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Option<(usize, Vec<u64>)> {
         let mut refused = None;
         for t in start..self.tiers.len() {
-            if !self.tiers[t].keep.takes(kind) || n as u64 > self.tiers[t].slots {
+            if !self.tiers[t].keep.takes(kind) {
+                continue;
+            }
+            if n as u64 > self.tiers[t].slots {
+                self.tiers[t].stats.oversize += 1;
+                self.tiers[t].stats.oversize_last = n as u64;
                 continue;
             }
             if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {

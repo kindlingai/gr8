@@ -39,6 +39,7 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS)
   [ -x "$BIN" ] || stale=1
   [ "$(cat "$BIN.flags" 2>/dev/null)" = "$FLAGS" ] || stale=1
   if [ "$stale" = 0 ] && [ -n "$(find "$REPO/engine" -type f \( -name '*.cu' -o -name '*.cuh' -o -name '*.h' \) -newer "$BIN" -print -quit)" ]; then stale=1; fi
+  local a; for a in "$@"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6kvman.a
   if [ "$stale" = 1 ]; then
     echo "building $BIN ($FLAGS)"
     rm -f "$BIN" "$BIN.flags"
@@ -51,6 +52,19 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS)
   local rc=0
   "$BIN" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
   return $rc
+}
+# kvlib_ready: target/release/libg6kvman.a for the tests that link it, built first when cargo is on PATH; 1 (with
+# the reason) when it is missing or older than the crate's sources
+kvlib_ready() {
+  local crate="$REPO/engine/kvman-rs" lib="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  if command -v cargo > /dev/null; then
+    cargo build --release -q --manifest-path "$crate/Cargo.toml" || { echo "cargo build --release failed"; return 1; }
+  fi
+  [ -f "$lib" ] || { echo "no $lib (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"; return 1; }
+  if [ -n "$(find "$crate/src" "$crate/Cargo.toml" -newer "$lib" -print -quit)" ]; then
+    echo "$lib is older than engine/kvman-rs/src (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+    return 1
+  fi
 }
 TEST=${TEST:-all}
 ARGS=("$@")
@@ -88,20 +102,51 @@ if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
   # a session's KV across page lists and layouts (#152): links the S2 page allocator's library (engine/kvman-rs)
   [ "$TEST" = all ] && ARGS=()
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
-  if [ -f "$KVLIB" ]; then
+  if why=$(kvlib_ready); then
     build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
-    echo "SKIP canon_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+    echo "SKIP canon_test: $why"
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   # the KV pool's chunks shrunk and grown under live sessions (#153): the allocator's library and the driver API
   [ "$TEST" = all ] && ARGS=()
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
-  if [ -f "$KVLIB" ]; then
+  if why=$(kvlib_ready); then
     build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
-    echo "SKIP kv_resize_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+    echo "SKIP kv_resize_test: $why"
+  fi
+fi
+if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
+  # the Flash KV caches in chunks (G6_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
+  [ "$TEST" = all ] && ARGS=()
+  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  if why=$(kvlib_ready); then
+    GLM_FLAGS="$FLAGS"; FLAGS="$FLAGS -DG6_MODEL_FLASH=1"
+    KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    FLAGS="$GLM_FLAGS"
+  else
+    echo "SKIP flash_kv_chunks_test: $why"
+  fi
+fi
+if [ "$TEST" = all ] || [ "$TEST" = flash_ckpt_group_test ]; then
+  # Flash checkpoints on a group lease (D-331 M8 (c), s2/flash_checkpoint.cuh): a loopback KV node with 2 MiB segments
+  [ "$TEST" = all ] && ARGS=()
+  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  NODE="$REPO/engine/kvman-rs/target/release/kvman-remote"
+  if why=$(kvlib_ready) && [ -x "$NODE" ]; then
+    NJ="$OUT/flash_ckpt_group_node.json"
+    : > "$NJ"
+    "$NODE" --gb 0.05 --seg-mb 2 --margin-s 0 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma --ready "$NJ" \
+      > "$OUT/flash_ckpt_group_node.log" 2>&1 &
+    NODE_PID=$!
+    for _ in $(seq 50); do [ -s "$NJ" ] && break; sleep 0.1; done
+    [ ${#ARGS[@]} -gt 0 ] || ARGS=("remote:127.0.0.1:$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$NJ")")
+    build_run flash_ckpt_group_test "$KVLIB" -lpthread -ldl -lm || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    kill "$NODE_PID"
+  else
+    echo "SKIP flash_ckpt_group_test: ${why:-no kvman-remote: cargo build --release}"
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then

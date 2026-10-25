@@ -4,7 +4,7 @@
 //!   mem:              this process's memory (tests)
 //! A block's bytes are rounded up to 4 KiB, the slot an SSD needs, so every store takes the same buffers.
 
-use crate::remote::{Opts, RemoteStore};
+use crate::remote::{GroupOpts, Opts, RemoteStore};
 use crate::tier::{par_for, BlockStore, SlotFile, ALIGN};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -15,6 +15,15 @@ pub enum Blocks {
     Ssd(SlotFile),
     Remote(Box<RemoteStore>),
     Mem(Mutex<Vec<u8>>, usize, u64),
+}
+
+// KVMAN_TRANSPORT=tcp|rdma|auto (default auto) per box: a rank whose path to the node is routed through another box
+// sets up RDMA but cannot write, and auto does not fall back after setup
+fn transport() -> io::Result<crate::remote::Want> {
+    match std::env::var("KVMAN_TRANSPORT") {
+        Ok(s) if !s.is_empty() => s.parse().map_err(|e: String| io::Error::new(io::ErrorKind::InvalidInput, e)),
+        _ => Ok(crate::remote::Want::Auto),
+    }
 }
 
 impl Blocks {
@@ -35,18 +44,31 @@ impl Blocks {
                 Ok(Blocks::Ssd(f))
             }
             "remote" if !rest.is_empty() => {
-                let addr = if rest.contains(':') {
-                    rest.to_string()
-                } else {
-                    format!("{rest}:{}", crate::remote::proto::DEFAULT_PORT)
-                };
                 // four ranks share one switch port without PFC: a dropped packet costs one ack timeout, and 4.096 us *
                 // 2^17 (0.5 s) leaves room for the retries before a lane fails
-                let o = Opts { lanes: THREADS, qp_timeout: 17, ..Opts::new(name, slot, blocks) };
-                Ok(Blocks::Remote(Box::new(RemoteStore::open(&addr, &o)?)))
+                let o = Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, ..Opts::new(name, slot, blocks) };
+                Ok(Blocks::Remote(Box::new(RemoteStore::open(&node_addr(rest), &o)?)))
             }
             "mem" => Ok(Blocks::Mem(Mutex::new(vec![0u8; slot * blocks as usize]), slot, blocks)),
             _ => Err(bad()),
+        }
+    }
+
+    /// This rank's lease in a group on a KV node (`spec` remote:HOST:PORT only): it starts at the group's floor and
+    /// grows and shrinks by whole segments (g6kv_store_*).
+    pub fn open_group(spec: &str, name: &str, block_bytes: usize, g: GroupOpts) -> io::Result<Blocks> {
+        let slot = block_bytes.div_ceil(ALIGN) * ALIGN;
+        let rest = spec.strip_prefix("remote:").filter(|r| !r.is_empty()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("store {spec}: a group lease is remote:HOST:PORT"))
+        })?;
+        let o = Opts { lanes: THREADS, qp_timeout: 17, want: transport()?, group: Some(g), ..Opts::new(name, slot, 0) };
+        Ok(Blocks::Remote(Box::new(RemoteStore::open(&node_addr(rest), &o)?)))
+    }
+
+    fn remote(&self) -> io::Result<&RemoteStore> {
+        match self {
+            Blocks::Remote(r) => Ok(r),
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "not a KV node store")),
         }
     }
 
@@ -81,7 +103,7 @@ impl BlockStore for Blocks {
     fn blocks(&self) -> u64 {
         match self {
             Blocks::Ssd(f) => f.slots(),
-            Blocks::Remote(r) => r.blocks,
+            Blocks::Remote(r) => r.blocks(),
             Blocks::Mem(_, _, n) => *n,
         }
     }
@@ -112,6 +134,14 @@ impl BlockStore for Blocks {
                 Ok(())
             }
         }
+    }
+}
+
+fn node_addr(rest: &str) -> String {
+    if rest.contains(':') {
+        rest.to_string()
+    } else {
+        format!("{rest}:{}", crate::remote::proto::DEFAULT_PORT)
     }
 }
 
@@ -292,5 +322,161 @@ pub unsafe extern "C" fn g6kv_tier_read_many(
     match batch(t, n, blocks, bufs, false) {
         Ok(()) => 0,
         Err(e) => fail(e),
+    }
+}
+
+/// Opens this rank's lease in group `group` on a KV node into `*out` (spec remote:HOST:PORT): `nr` ranks, this one
+/// `rank`, never below floor_bytes nor past cap_bytes, weight 1000 = 1x (0 = 1000). Every rank of a cluster gives the
+/// same group, ranks, sizes and weight. 0, or -1 with g6kv_tier_error.
+///
+/// # Safety
+/// `spec`, `name` and `group` must be NUL-terminated strings, `out` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_open_group(
+    spec: *const c_char,
+    name: *const c_char,
+    group: *const c_char,
+    nr: u32,
+    rank: u32,
+    floor_bytes: u64,
+    cap_bytes: u64,
+    weight: u32,
+    block_bytes: u64,
+    out: *mut *mut Blocks,
+) -> i32 {
+    if spec.is_null() || name.is_null() || group.is_null() || out.is_null() {
+        return fail(io::Error::new(io::ErrorKind::InvalidInput, "null argument"));
+    }
+    let s = |p: *const c_char| CStr::from_ptr(p).to_string_lossy().into_owned();
+    let g = GroupOpts { group: s(group), nr, rank, floor_bytes, cap_bytes, weight };
+    match Blocks::open_group(&s(spec), &s(name), block_bytes as usize, g) {
+        Ok(b) => {
+            *out = Box::into_raw(Box::new(b));
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Blocks in the store now.
+///
+/// # Safety
+/// `t` must be a live store.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_store_blocks(t: *const Blocks) -> u64 {
+    (*t).blocks()
+}
+
+/// Blocks a segment of a group lease, or 0 for a store that does not grow or shrink.
+///
+/// # Safety
+/// `t` must be a live store.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_store_seg_blocks(t: *const Blocks) -> u64 {
+    (*t).remote().map_or(0, |r| r.per_seg)
+}
+
+/// Segments in a group lease now (0 for any other store).
+///
+/// # Safety
+/// `t` must be a live store.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_store_segs(t: *const Blocks) -> u64 {
+    (*t).remote().map_or(0, |r| if r.per_seg == 0 { 0 } else { r.segs() })
+}
+
+/// g6kv_store_report's answer, in segments per rank: grow every rank by `grant`, or shrink every rank by `give`.
+#[repr(C)]
+pub struct G6kvReport {
+    pub grant: u64,
+    pub give: u64,
+    pub unclaimed: u64,
+    pub txn: u64,
+}
+
+/// The head's report to the node (rank 0 only): `want` segments more per rank (0 = none), and `n` ages in ms of its
+/// coldest blocks (g6kv_tier_coldest). The node's answer goes into `*out`. 0, or -1 with g6kv_tier_error.
+///
+/// # Safety
+/// `t` must be a live store, `ages` hold `n` values (or be NULL when n = 0), `out` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_store_report(
+    t: *const Blocks,
+    want: u64,
+    ages: *const u64,
+    n: usize,
+    out: *mut G6kvReport,
+) -> i32 {
+    if out.is_null() || (n > 0 && ages.is_null()) {
+        return fail(io::Error::new(io::ErrorKind::InvalidInput, "null argument"));
+    }
+    let ages = if n == 0 { &[][..] } else { std::slice::from_raw_parts(ages, n) };
+    match (*t).remote().and_then(|r| r.report(want, ages)) {
+        Ok(x) => {
+            *out = G6kvReport { grant: x.grant, give: x.give, unclaimed: x.unclaimed, txn: x.txn };
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// The node refused a GROW or SHRINK (a transaction it no longer has open, or no room): the store keeps its size.
+/// Every rank gets the same answer, so the cluster stays in lock step.
+pub const STORE_REFUSED: i32 = 1;
+
+fn refused(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::StaleNetworkFileHandle | io::ErrorKind::OutOfMemory)
+}
+
+/// Grows a group lease to `segs` segments under transaction `txn` (g6kv_store_report's); the store's blocks after it
+/// in `*blocks`. Then g6kv_tier_resize the tier to them. 0, 1 (STORE_REFUSED, with g6kv_tier_error) or -1.
+///
+/// # Safety
+/// `t` must be a live store and `blocks` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_store_grow(t: *const Blocks, segs: u64, txn: u64, blocks: *mut u64) -> i32 {
+    match (*t).remote().and_then(|r| r.grow(segs, txn)) {
+        Ok(b) => {
+            if !blocks.is_null() {
+                *blocks = b;
+            }
+            0
+        }
+        Err(e) => {
+            let r = refused(&e);
+            let c = fail(e);
+            if r {
+                STORE_REFUSED
+            } else {
+                c
+            }
+        }
+    }
+}
+
+/// Shrinks a group lease to its first `segs` segments under the give `txn`; the blocks after it in `*blocks`. Only
+/// after the tier was resized below them (g6kv_tier_resize) and its copies ran: nothing may touch the blocks past them.
+/// 0, 1 (STORE_REFUSED, with g6kv_tier_error) or -1.
+///
+/// # Safety
+/// `t` must be a live store and `blocks` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_store_shrink(t: *const Blocks, segs: u64, txn: u64, blocks: *mut u64) -> i32 {
+    match (*t).remote().and_then(|r| r.shrink(segs, txn)) {
+        Ok(b) => {
+            if !blocks.is_null() {
+                *blocks = b;
+            }
+            0
+        }
+        Err(e) => {
+            let r = refused(&e);
+            let c = fail(e);
+            if r {
+                STORE_REFUSED
+            } else {
+                c
+            }
+        }
     }
 }

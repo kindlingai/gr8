@@ -12,7 +12,8 @@
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
 # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
 # the pool's block
-# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
+# store in lock-step with its copies run through memory, a file and a loopback KV node, eager and --lazy-lock
+# (pool_stash_test), the commit
 # frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
 # after load (engine/runtime/host_reclaim.h), and steering profile contracts/validation.
 #   scripts/host_tests.sh
@@ -100,11 +101,31 @@ if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in
   for _ in $(seq 50); do [ -s "$T/node.json" ] && break; sleep 0.1; done
   PORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/node.json")
   [ -n "$PORT" ] && STORES+=("remote:127.0.0.1:$PORT")
+  # the same node with --lazy-lock: each lease's range is backed only while it lives (it locks where RLIMIT_MEMLOCK
+  # allows the lease, and runs unlocked otherwise)
+  LOCK=--no-lock; [ "$(ulimit -l)" = unlimited ] || [ "$(ulimit -l)" -ge 131072 ] && LOCK=
+  "$NODE" --gb 0.05 --port 0 --bind 127.0.0.1 --min-free-gb 0 $LOCK --lazy-lock --ready "$T/lazy.json" > "$T/lazy.log" 2>&1 &
+  LAZY_PID=$!
+  for _ in $(seq 50); do [ -s "$T/lazy.json" ] && break; sleep 0.1; done
+  LPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/lazy.json")
+  [ -n "$LPORT" ] && STORES+=("remote:127.0.0.1:$LPORT")
 fi
 "$T/pool_stash_test" "${STORES[@]}"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_namespace_test.cpp" "${KVLIB[@]}" -o "$T/pool_namespace_test"
 "$T/pool_namespace_test" "${STORES[@]}"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
+[ -n "${LAZY_PID:-}" ] && kill "$LAZY_PID"
+# a pool tier on a group lease that grows into the node's grant, gives a segment back when another cluster asks, and
+# shrinks to its floor, through the C interface (s2/kv_share.h): a second node with 2 MiB segments and no margin
+if [ -x "$NODE" ]; then
+  g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_share_test.cpp" "${KVLIB[@]}" -o "$T/kv_share_test"
+  "$NODE" --gb 0.05 --seg-mb 2 --margin-s 0 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma --ready "$T/share.json" > "$T/share.log" 2>&1 &
+  SHARE_PID=$!
+  for _ in $(seq 50); do [ -s "$T/share.json" ] && break; sleep 0.1; done
+  SPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/share.json")
+  "$T/kv_share_test" "remote:127.0.0.1:$SPORT"
+  kill "$SHARE_PID"
+fi
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
 # a held event boundary (Commit::hold): queued admissions chained at one boundary, three ranks on socket pairs
@@ -143,6 +164,14 @@ g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/
 "$T/kda_carry_cpu_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test"
 "$T/control_tp2_test"
+# FLASH_CAP_POLICY=borrow-idle's rule (s2/flash_lend.h) and the ACK's room (Ack::room): lend once idle, recall before a
+# request that needs the chunks, the head admits within the least room over the ranks
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/flash_lend_test.cpp" -o "$T/flash_lend_test"
+"$T/flash_lend_test"
+# the Flash prefill checkpoint waits for the boundary's commits (s2/flash_native.cuh h.before_work): a grow announced
+# during the prefill lands before the capture, on two ranks through the real Service loop
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_capture_order_test.cpp" "${KVLIB[@]}" -o "$T/flash_capture_order_test"
+(cd "$T" && "$T/flash_capture_order_test" 2>/dev/null)
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost"
 "$T/test_flash_s2_cost"
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost"
@@ -161,3 +190,11 @@ for t in test_flash_route_split test_flash_route_split_tp4 test_flash_route_spli
   "$T/$t"
 done
 python3 "$REPO/engine/tests/test_flash_route_split_source.py"
+# Flash session checkpoints (G6_FLASH_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/tests/test_flash_ckpt_index.cpp" -o "$T/test_flash_ckpt_index"
+"$T/test_flash_ckpt_index"
+# G6_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
+python3 "$REPO/engine/tests/test_flash_terminal_retain.py"
+# G6_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
+# the real Service on two ranks; the entry stays aligned and a longer prompt keeps its own aligned checkpoint
+python3 "$REPO/engine/tests/test_flash_terminal_cancel.py"

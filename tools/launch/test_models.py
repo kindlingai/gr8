@@ -62,6 +62,39 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('G6_PF_DSA_F16GEMM=1', plan['env'])
 
+    def test_flash_cache(self):
+        plan = opt.engine_plan(flash())
+        self.assertFalse([e for e in plan['env'] if e.startswith('G6_FLASH_')])
+        self.assertNotIn('--kv-store', plan['args'])
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--flash-state-budget-mib', '4096'))
+        self.assertIn('G6_FLASH_CACHE=aligned', plan['env'])
+        self.assertIn('G6_FLASH_STATE_BUDGET_MIB=4096', plan['env'])
+        self.assertNotIn('--kv-store', plan['args'])
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G')
+        plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
+        self.assertIn('G6_FLASH_CACHE=terminal', plan['env'])
+        # the checkpoint store on a group lease (D-331 M8 (c)): the store as given, KV_SHARE_WHEN reaches the engine
+        g = 'remote:192.0.2.5:7350,size=1G,group=flash'
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g, '--kv-share-when', 'always'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], g)
+        self.assertIn('G6_KV_SHARE_WHEN=always', plan['env'])
+        self.assertNotIn('G6_KV_SHARE_WHEN', ' '.join(opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g))['env']))
+        for argv, want in ((['--flash-cache', 'sessions'], 'want off, aligned or terminal'),
+                           (['--flash-state-budget-mib', '0'], 'whole number of MiB'),
+                           (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned or terminal'),
+                           (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G', '--kv-store',
+                             'ssd:/tmp/b,size=1G'], 'give one --kv-store'),
+                           (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
+                            'do not persist')):
+            with self.assertRaises(opt.OptionError) as e:
+                flash(*argv)
+            self.assertIn(want, str(e.exception))
+        glm = opt.parse(['--no-config', '--peers', PEERS, '--flash-cache', 'aligned'], {})
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(glm)
+        self.assertIn('glm53f only', str(e.exception))
+
     def test_cap(self):
         """CAP: a 262,144-token request and a page for the guard rows (2 at MTP=1) at either TP, as no CP leaves every
         rank the whole context; a set CAP wins."""
