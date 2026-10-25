@@ -7,7 +7,10 @@
 #   again if the head moves while the command is handled.
 #   ci.yml's jobs run on a PR only while it carries one of the labels: setting one re-runs the PR's latest CI run (or
 #   approves it, if it waits for approval), since labels added with GITHUB_TOKEN cannot start workflows.
-#   /ready on an open PR labelled risk:docs-tests that changes only Markdown files squash-merges it. Not eligible: files
+#   ci.yml's Finalize reads queue:ready when it runs, so /ready, /unready and a maintainer removing the label re-run
+#   that job alone on a run that has finished.
+#   /ready on an open PR labelled risk:docs-tests that changes only Markdown files squash-merges it once its CI run's
+#   Finalize passes (the run checks nothing else for such a PR). Not eligible: files
 #   under .github/, AGENTS.md and CLAUDE.md (read by GitHub and by coding agents), symlinks, mode changes, and PRs too
 #   large to list completely. The bot also approves it as github-actions[bot] when "Allow GitHub Actions to create and
 #   approve pull requests" is on (org and repo), which a required review needs. The review and the merge name the head
@@ -18,7 +21,7 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [labeled, synchronize]
+    types: [labeled, unlabeled, synchronize]
 
 permissions:
   actions: write
@@ -108,18 +111,60 @@ jobs:
                 return;
               }
             };
+            // the PR head's ci.yml runs started by EVENTS, newest first
+            const prRuns = async (p, events = ["pull_request"]) => (await github.rest.actions.listWorkflowRuns(
+              { owner, repo, workflow_id: "ci.yml", head_sha: p.head.sha, per_page: 20 })).data.workflow_runs
+              .filter(r => events.includes(r.event) && (r.pull_requests.some(x => x.number === issue_number) ||
+                (r.head_repository && r.head_repository.full_name === p.head.repo.full_name &&
+                 r.head_branch === p.head.ref)));
+            // ci.yml's Finalize reads queue:ready when it runs. Once it has run, re-run it alone so it sees the label as
+            // it is now; one still waiting for the other jobs reads it when it starts.
+            const refinalize = async run => {
+              for (let i = 0; i < 12; i++) {
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                  { owner, repo, run_id: run.id, filter: "latest" });
+                const fin = jobs.find(j => j.name === "Finalize");
+                if (!fin || (fin.status !== "in_progress" && fin.status !== "completed")) return;
+                if (fin.status === "in_progress") { await sleep(10000); continue; }
+                try {
+                  await starter.rest.actions.reRunJobForWorkflowRun({ owner, repo, job_id: fin.id });
+                } catch (e) {
+                  await say(`The bot could not re-run Finalize (${e.message}): open ${run.html_url} and re-run that job.`);
+                }
+                return;
+              }
+            };
+            // the newest PR run and the newest dispatched run of the head, after queue:ready went
+            const unfinalize = async p => {
+              const runs = await prRuns(p, ["pull_request", "workflow_dispatch"]);
+              for (const ev of ["pull_request", "workflow_dispatch"]) {
+                const run = runs.find(r => r.event === ev);
+                if (run) await refinalize(run);
+              }
+            };
+            // Whether a ci.yml run of the PR head that started after SINCE (a PR run's re-run, or a dispatched run) has
+            // passed Finalize. Waits up to 6 minutes, enough for a Markdown-only run, which has only the gate and Finalize.
+            const finalized = async (p, since) => {
+              for (let i = 0; i < 36; i++) {
+                await sleep(10000);
+                for (const run of await prRuns(p, ["pull_request", "workflow_dispatch"])) {
+                  if (run.status !== "completed" || Date.parse(run.run_started_at) < since) continue;
+                  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                    { owner, repo, run_id: run.id, filter: "latest" });
+                  const fin = jobs.find(j => j.name === "Finalize");
+                  if (fin && fin.conclusion === "success") return true;
+                }
+              }
+              return false;
+            };
             const rerunCI = async p => {
               const head = p.head.sha;
               let approved = false;
               for (let i = 0; i < 30; i++) {
-                const runs = (await github.rest.actions.listWorkflowRuns(
-                  { owner, repo, workflow_id: "ci.yml", head_sha: head, per_page: 20 })).data.workflow_runs
-                  .filter(r => r.event === "pull_request" && (r.pull_requests.some(x => x.number === issue_number) ||
-                    (r.head_repository && r.head_repository.full_name === p.head.repo.full_name &&
-                     r.head_branch === p.head.ref)));
+                const runs = await prRuns(p);
                 if (!runs.length) {
                   if (i < 6) { await sleep(10000); continue; }
-                  await say(`No CI run found for ${head.slice(0, 7)} (a Markdown-only PR runs none), so there is nothing to start.`);
+                  await say(`No CI run found for ${head.slice(0, 7)}, so there is nothing to start.`);
                   return;
                 }
                 const run = runs[0];
@@ -149,7 +194,11 @@ jobs:
                   { owner, repo, run_id: run.id, filter: "latest" });
                 const gate = jobs.find(j => j.name === "Ready gate");
                 if (gate && gate.status === "completed") {
-                  if (jobs.some(j => j !== gate && j.conclusion !== "skipped")) return;   // already building
+                  // Finalize runs even when the gate turned the run away
+                  if (jobs.some(j => j !== gate && j.name !== "Finalize" && j.conclusion !== "skipped")) {
+                    await refinalize(run);   // already building, or built
+                    return;
+                  }
                   if (run.status === "completed") {
                     await restart(run);
                     return;
@@ -164,8 +213,11 @@ jobs:
             // Without the token a re-run fails at startup, so a PR whose branch is in this repository gets a
             // workflow_dispatch run of ci.yml on its branch instead. The gate always passes such runs, but GitHub lists
             // them only on the commit, not on the PR, so the bot links the run. A fork's branch cannot be dispatched.
+            // A run GitHub refused to start ("Actor is not allowed to trigger Actions workflows", which the PR's author
+            // can get) cannot be re-run either, so it gets a dispatched run too, token or not.
             const startCI = async p => {
-              if (!token && p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
+              const refused = token && ((await prRuns(p))[0] || {}).conclusion === "startup_failure";
+              if ((!token || refused) && p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
                 const since = Date.now() - 5000;
                 try {
                   await starter.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: "ci.yml", ref: p.head.ref });
@@ -211,6 +263,7 @@ jobs:
               if (cmd === "/unready") {
                 await remove(label);
                 await react("+1");
+                await unfinalize(await pull());
                 return;
               }
               const p = await pull();
@@ -259,7 +312,7 @@ jobs:
                 await startCI(p);
                 return;
               }
-              // Markdown-only, so it has no CI run either: merge it, or say why not.
+              // Markdown-only: merge it once Finalize passes, or say why not.
               let why = null;
               if (files.length >= 3000 || files.length !== p.changed_files) why = "the file list is incomplete";
               else if (files.length > 50) why = "it changes more than 50 files";
@@ -279,6 +332,12 @@ jobs:
               }
               if (why) {
                 await say(`Markdown-only PR marked ready, but not merged automatically because ${why}: merge it by hand.`);
+                return;
+              }
+              const since = Date.now() - 5000;
+              await startCI(p);
+              if (!(await finalized(p, since))) {
+                await say(`Markdown-only PR marked ready, but its Finalize check has not passed: see its CI run.`);
                 return;
               }
               // Approval is best effort: it needs "Allow GitHub Actions to create and approve pull requests", and the merge
@@ -307,6 +366,8 @@ jobs:
               await say(`@${sender}, \`${added}\` is set by a maintainer commenting \`${how}\`, so it was removed.`);
             } else if (added === label || added === ciLabel) {
               await startCI(await pull());
+            } else if (act === "unlabeled" && context.payload.label.name === label) {
+              await unfinalize(await pull());
             } else if (act === "synchronize") {
               // Remove both whatever the event's labels say: a label added after the event was built must go too.
               await remove(ciLabel);
