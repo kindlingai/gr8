@@ -42,6 +42,8 @@ struct KdaLayer
     const uint8_t *o = nullptr;                               // o_proj shard .gv [HID/16][nh*8][512]
     dtr::Mat qt, kt, vt, ot;                                  // W8 trellis q, k, v (SIDE_OUT) and o_proj (SIDE_IN)
     const uint8_t *mxc[3] = {}, *mxs[3] = {};                 // q, k, v own rows as MXFP8 (prefill GEMM): [nh*128][HID], [..][HID/32]
+    uint8_t *mxgv[3] = {};                                    // q, k, v own rows as MXFP8 decode records [nh*8][HID/32][528],
+                                                              // built from mxc / mxs at bind (G6_KDA_MX=0: decode reads q / k / v)
     const uint16_t *conv[3] = {};                             // [own ch][4]
     const uint16_t *fb = nullptr, *gb = nullptr;              // [own ch][128]
     const float *A_log = nullptr, *dt_bias = nullptr;         // [own heads], [own ch]
@@ -74,6 +76,24 @@ template <class T> inline const char* kda_get(const T& r, const char* what, std:
     if (n != want) return what;
     p = r.p;
     return nullptr;
+}
+
+// MXFP8 decode record of codes [16T][K] + E8M0 scales [16T][K/32] -> [T][K/32][528], as loader-rs records::mxfp8_record:
+// two 16x16 tiles in GV lane order (lane l = (r, c), r = l / 4, c = l % 4: (r,2c) (r,2c+1) (r+8,2c) (r+8,2c+1)
+// (r,2c+8) (r,2c+9) (r+8,2c+8) (r+8,2c+9)), then the 8 scale pairs {s[i], s[i+8]}. One CTA of 256 threads per record.
+__global__ void __launch_bounds__(256) k_kda_mx_record(const uint8_t* codes, const uint8_t* scales, int K, uint8_t* out)
+{
+    const int ng = K / 32, t = blockIdx.x / ng, g = blockIdx.x % ng, i = threadIdx.x;
+    uint8_t* rec = out + static_cast<size_t>(blockIdx.x) * 528;
+    const int l = i >> 3, e = i & 7, r = l >> 2, c = l & 3;
+    const int row = r + ((e & 2) ? 8 : 0), col = 2 * c + (e & 1) + ((e & 4) ? 8 : 0);
+    for (int h = 0; h < 2; ++h)
+        rec[h * 256 + i] = codes[static_cast<size_t>(16 * t + row) * K + 32 * g + 16 * h + col];
+    if (i < 8)
+    {
+        rec[512 + 2 * i] = scales[static_cast<size_t>(16 * t + i) * ng + g];
+        rec[512 + 2 * i + 1] = scales[static_cast<size_t>(16 * t + i + 8) * ng + g];
+    }
 }
 
 // find(name) -> {p, nd, shape[]} (rank.cuh TensorRef). Names: loader-rs FLASH.md. Returns nullptr or the missing name.
@@ -122,6 +142,15 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
         {
             w.mxc[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.codes", {dl, HID}));
             w.mxs[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.scales", {dl, HID / 32}));
+        }
+    static const bool kda_mx = !getenv("G6_KDA_MX") || atoi(getenv("G6_KDA_MX")) != 0;
+    if (kda_mx && !w.qt.w && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
+        for (int i = 0; i < 3; ++i)
+        {
+            const size_t recs = static_cast<size_t>(dl / 16) * (HID / 32);
+            if (cudaMalloc(&w.mxgv[i], recs * 528) != cudaSuccess) return "KDA: cudaMalloc mx decode record";
+            k_kda_mx_record<<<static_cast<unsigned>(recs), 256>>>(w.mxc[i], w.mxs[i], HID, w.mxgv[i]);
+            if (cudaDeviceSynchronize() != cudaSuccess) return "KDA: mx decode record build";
         }
     if (find(A + "f_a_proj.weight.mx.gv").p)
         w.fa_mx = static_cast<const uint8_t*>(get(A + "f_a_proj.weight.mx.gv", {DK / 16, HID / 32, 528}));
@@ -809,9 +838,16 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
     pa.xfrag = xb; pa.M = M; pa.ld = pl.ld(); pa.odt = gv::O_F32;
     if (!w.qt.w)
     {
-        pa.add(w.q, P + pl.q(), HID, dl, 4, 8);
-        pa.add(w.k, P + pl.q() + dl, HID, dl, 4, 8);
-        pa.add(w.v, P + pl.q() + 2 * dl, HID, dl, 4, 8);
+        if (w.mxgv[0] && xf)   // MXFP8 records (half the bytes of BF16), fp16 activations like f_a / g_a
+        {
+            for (int s = 0; s < 3; ++s) pa.add(w.mxgv[s], P + pl.q() + s * dl, HID, dl, 4, 8, xf, 1);
+        }
+        else
+        {
+            pa.add(w.q, P + pl.q(), HID, dl, 4, 8);
+            pa.add(w.k, P + pl.q() + dl, HID, dl, 4, 8);
+            pa.add(w.v, P + pl.q() + 2 * dl, HID, dl, 4, 8);
+        }
     }
     if (w.fa_mx) pa.add(w.fa_mx, P + pl.fa(), HID, DK, 1, 32, xf, 1);
     else         pa.add(w.fa,    P + pl.fa(), HID, DK, 1, 32);
