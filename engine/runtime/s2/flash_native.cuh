@@ -325,6 +325,29 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         fence();
         if (!cache) check();
         auto draft = [&](FlashPrefill& fp, int n, int base) {
+            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // G6_PF_DRAFT_FULL (flash_prefill.cuh)
+            {
+                const bool chk = pf_draft_full() == 2;
+                DraftFull& F = pf_draft_cache_full(c.draft, fp, n, base, p.prompt.data() + base + 1, chk, c.stream);
+                if (!chk) { dseq += (n + MX - 1) / MX; wrote(base + n); fence(); return; }   // fence: check() reads the error words
+                pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
+                    *c.draft_input = di;
+                    wrote_step(di);
+                    Model& d = c.draft.d;
+                    const bind::Layer& b = d.layers[0].L[di.M];
+                    launch_step_in(d, c.stream);
+                    launch_draft_embed(c.draft, di.M, false, c.stream);
+                    bind::launch(b.kv_a, c.stream);
+                    bind::launch(b.idx_k, c.stream);
+                    bind::launch(b.idx_g, c.stream);
+                    pf_draft_full_cmp(c.draft, F, di.pos[0] - base, di.M, c.stream);
+                    fence();
+                });
+                unsigned dw = 0;
+                G6RT_CK(cudaMemcpy(&dw, F.diff, 4, cudaMemcpyDeviceToHost));
+                fprintf(stderr, "# G6_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
+                return;
+            }
             pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
                 *c.draft_input = di;
                 wrote_step(di);

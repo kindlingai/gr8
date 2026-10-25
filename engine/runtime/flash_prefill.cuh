@@ -1309,6 +1309,155 @@ inline void pf_draft_cache_flash(Draft& D, int M, int context, cudaStream_t st)
     G6RT_CK(g6_attn_append(&a, st));
 }
 
+// G6_PF_DRAFT_FULL (default 1, read once; the cache fill only; =0 off): the cache fill over the lane's rows in DF_ROWS-row
+// passes instead of one decode draft step (k_step_in, a host fence) per MX rows. Each pass runs the same kernels on the
+// same rows: k_input, the fragment tables, eh_proj, k_norm, the tables, kv_a / idx_k / idx_g, then the append. The
+// GEMVs are k_gv_full's 32-row CTAs (the decode launch's body, NT choice and output per 32 rows: the same bits), in one
+// launch with the row group fastest, so the CTAs in flight share their weight tiles in L2: eh_proj ([HID][2 HID] MXFP8,
+// 32 MB) is read once per pass, not once per 32 rows. =2: also run the per-MX-row projections and count the differing
+// words of kv_a / idx_k / idx_g (printed per request; 0 in 38 lane fills x 3 ranks, TP3). TP3 8K A/B: prefill
+// 2560 -> 2587 tok/s (pbench TTFT -34 ms), T=0 hashes unchanged.
+constexpr int DF_ROWS = 256;
+inline int pf_draft_full()
+{
+    static const int v = [] { const char* e = getenv("G6_PF_DRAFT_FULL"); const int x = e ? atoi(e) : 1; return x == 1 || x == 2 ? x : 0; }();
+    return v;
+}
+template <class C, int THREADS>
+__global__ void __launch_bounds__(THREADS) k_gv_rg(const uint8_t* w, const u32* xfrag, int K, int ot, int tpc, int ks, int M,
+                                                   void* y, int ld, int odt, const float* rscale)
+{
+    namespace fs = flash_dsa_full_schedule;
+    const int RG = fs::grid_rows(M), gy = blockIdx.x % RG, cta = blockIdx.x / RG;
+    const int r = fs::active_rows(M, gy);
+    const u32* xf = xfrag + fs::fragment_words(gy, K);
+    char* out = static_cast<char*>(y) + fs::output_elements(gy, ld) * (odt == gv::O_F32 ? 4 : 2);
+    __shared__ float4 red[32][32];
+    if (r <= 8) gv_gemv_body<C, 1>(w, xf, K, ot, tpc, ks, r, out, ld, odt, red, cta, rscale);
+    else if (r <= 16) gv_gemv_body<C, 2>(w, xf, K, ot, tpc, ks, r, out, ld, odt, red, cta, rscale);
+    else if (r <= 24) gv_gemv_body<C, 3>(w, xf, K, ot, tpc, ks, r, out, ld, odt, red, cta, rscale);
+    else gv_gemv_body<C, 4>(w, xf, K, ot, tpc, ks, r, out, ld, odt, red, cta, rscale);
+}
+inline void pf_gv_rg(const bind::Gv& g, const u32* xfrag, int M, void* y, cudaStream_t st)
+{
+    const int ot = g.O / 16;
+    auto go = [&](auto* kern) {
+        const int tpc = bind::gv_fit_tpc(kern, g.tpc, g.ks);
+        kern<<<(ot + tpc - 1) / tpc * flash_dsa_full_schedule::grid_rows(M), tpc * g.ks * 32, 0, st>>>(
+            g.w, xfrag, g.K, ot, tpc, g.ks, M, y, g.ld, g.odt, g.rscale);
+    };
+    const bool b512 = g.ks <= 16;
+    if (g.codec == bind::INT4) { if (b512) go(k_gv_rg<Int4v, 512>); else go(k_gv_rg<Int4v, 1024>); }
+    else if (g.codec == bind::MXFP8) { if (b512) go(k_gv_rg<Mxfp8, 512>); else go(k_gv_rg<Mxfp8, 1024>); }
+    else if (g.codec == bind::FP8R) { if (b512) go(k_gv_rg<Fp8r, 512>); else go(k_gv_rg<Fp8r, 1024>); }
+    else { if (b512) go(k_gv_rg<Bf16w, 512>); else go(k_gv_rg<Bf16w, 1024>); }
+}
+__global__ void k_df_cmp(const unsigned short* a, const unsigned short* b, size_t n, unsigned* diff)
+{
+    unsigned c = 0;
+    for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < n; i += (size_t)gridDim.x * 256) c += a[i] != b[i];
+    if (c) atomicAdd(diff, c);
+}
+struct DraftFull
+{
+    int cap = 0;
+    int* tok = nullptr;
+    float *cat = nullptr, *resid = nullptr, *xn = nullptr;
+    u32 *cat_f = nullptr, *xf = nullptr, *xb = nullptr;
+    char* out[3] = {};                 // kv_a, idx_k, idx_g rows of the pass, [DF_ROWS][ld] of odt (all M rows with =2)
+    unsigned* diff = nullptr;
+};
+inline size_t df_row_bytes(const bind::Gv& g) { return (size_t)g.ld * (g.odt == gv::O_F32 ? 4 : 2); }
+// false: not this path (the bf16 eh_proj, a send-slot GEMV or an unknown fragment table): the caller runs the old loop
+inline bool pf_draft_full_ok(Draft& D)
+{
+    Model& d = D.d;
+    Layer& y = d.layers[0];
+    if (d.mtp_eh || !d.mtp_eh_mx.on || !y.built[MX]) return false;
+    const bind::Layer& b = y.L[MX];
+    const bind::Gv* gs[3] = {&b.kv_a, &b.idx_k, &b.idx_g};
+    for (const bind::Gv* g : gs)
+    {
+        if (!g->on || (g->xfrag != d.sc.xf_x && g->xfrag != d.sc.xb_x)) return false;
+#ifdef DEC_SLOT
+        if (g->slot.send) return false;
+#endif
+    }
+#ifdef DEC_SLOT
+    if (d.mtp_eh_mx.slot.send) return false;
+#endif
+    return d.mtp_eh_mx.odt == gv::O_F32 && d.mtp_eh_mx.ld == HID;
+}
+// the lane's M rows (positions pos0.., P.xn = the main final-norm rows, next = the tokens after them); keep = true
+// (=2): kv_a / idx_k / idx_g of all M rows stay in DraftFull::out for pf_draft_full_cmp
+inline DraftFull& pf_draft_cache_full(Draft& D, FlashPrefill& P, int M, int pos0, const int* next, bool keep, cudaStream_t st)
+{
+    static DraftFull F;
+    Model& d = D.d;
+    Layer& y = d.layers[0];
+    const bind::Layer& b = y.L[MX];
+    const bind::Gv* gs[3] = {&b.kv_a, &b.idx_k, &b.idx_g};
+    const int orows = keep ? M : DF_ROWS;
+    if (M > F.cap || (keep && orows > F.cap))
+    {
+        const int cap = (M + DF_ROWS - 1) / DF_ROWS * DF_ROWS;
+        if (F.cap) G6RT_CK(cudaStreamSynchronize(st));
+        for (void* q : {(void*)F.tok, (void*)F.out[0], (void*)F.out[1], (void*)F.out[2]}) if (q) G6RT_CK(cudaFree(q));
+        F.tok = dmalloc<int>(cap);
+        for (int k = 0; k < 3; ++k) F.out[k] = dmalloc<char>((size_t)cap * df_row_bytes(*gs[k]));
+        if (!F.cat)
+        {
+            F.cat = dmalloc<float>((size_t)DF_ROWS * 2 * HID);
+            F.resid = dmalloc<float>((size_t)DF_ROWS * HID);
+            F.xn = dmalloc<float>((size_t)DF_ROWS * HID);
+            F.cat_f = dmalloc<u32>(flash_dsa_full_schedule::full_fragment_words(DF_ROWS, 2 * HID));
+            F.xf = dmalloc<u32>(flash_dsa_full_schedule::full_fragment_words(DF_ROWS, HID));
+            F.xb = dmalloc<u32>(flash_dsa_full_schedule::full_fragment_words(DF_ROWS, HID));
+            F.diff = dmalloc<unsigned>(1);
+        }
+        F.cap = cap;
+    }
+    G6RT_CK(cudaMemcpyAsync(F.tok, next, (size_t)M * sizeof(int), cudaMemcpyHostToDevice, st));
+    for (int m0 = 0; m0 < M; m0 += DF_ROWS)
+    {
+        const int r = std::min(DF_ROWS, M - m0);
+        flash_mtp::input(F.tok + m0, P.pos + m0, d.emb, D.enorm, D.hnorm, P.xn + (size_t)m0 * HID, F.cat, r, st);
+        flash_mhc::fragments(F.cat, r, 2 * HID, F.cat_f, nullptr, st);
+        pf_gv_rg(d.mtp_eh_mx, F.cat_f, r, F.resid, st);
+        flash_mtp::norm(F.resid, y.attn_norm, F.xn, nullptr, r, st);
+        flash_mhc::fragments(F.xn, r, HID, F.xf, F.xb, st);
+        char* o[3];
+        for (int k = 0; k < 3; ++k)
+        {
+            o[k] = F.out[k] + (keep ? (size_t)m0 * df_row_bytes(*gs[k]) : 0);
+            pf_gv_rg(*gs[k], gs[k]->xfrag == d.sc.xf_x ? F.xf : F.xb, r, o[k], st);
+        }
+        G6Attn a = y.ab.args;
+        a.rows = r; a.context = pos0 + m0 + r; a.positions = P.pos + m0;
+        a.kv_a = o[0]; a.index_k = o[1]; a.index_gate = o[2];
+        a.reuse_indices = nullptr;
+        G6RT_CK(g6_attn_append(&a, st));
+    }
+    if (keep) G6RT_CK(cudaMemsetAsync(F.diff, 0, 4, st));
+    return F;
+}
+// =2, after the decode draft step's projections of rows m0 .. m0 + r - 1 of the lane (d.kv_a / d.idx_k / d.idx_g)
+inline void pf_draft_full_cmp(Draft& D, DraftFull& F, int m0, int r, cudaStream_t st)
+{
+    Model& d = D.d;
+    const bind::Layer& b = d.layers[0].L[MX];
+    const bind::Layer& br = d.layers[0].L[r];   // the decode step's binding at r rows
+    const bind::Gv* gs[3] = {&b.kv_a, &b.idx_k, &b.idx_g};
+    const bind::Gv* gr[3] = {&br.kv_a, &br.idx_k, &br.idx_g};
+    for (int k = 0; k < 3; ++k)
+    {
+        const size_t rb = df_row_bytes(*gs[k]);
+        if (df_row_bytes(*gr[k]) != rb) die("G6_PF_DRAFT_FULL=2: the r-row binding's output rows differ");
+        k_df_cmp<<<64, 256, 0, st>>>(static_cast<const unsigned short*>(gr[k]->y),
+                                     reinterpret_cast<const unsigned short*>(F.out[k] + (size_t)m0 * rb), (size_t)r * rb / 2, F.diff);
+    }
+}
+
 // MTP draft prefill (P1): the decode draft step (layer 45: eh_proj, DSA, MoE, single residual) over the sub-batch's
 // rows in MX-row chunks, without graphs. Row r: hidden = main final-norm row r (P.xn), token = the prompt token after
 // it (next[r]), position pos0 + r; it writes the MTP layer's KV rows of the prompt. run(di) enqueues the draft fabric
