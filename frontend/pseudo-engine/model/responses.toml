@@ -1,0 +1,399 @@
+# The pseudo engine's weights (frontend/pseudo-engine/README.md): rules that map a prompt to a reply.
+#
+# Every rule whose regex matches is a candidate. The most specific wins: the higher `specificity`, then the longer
+# match, then the earlier rule. A rule reads one part of the prompt (`on`): "user" (the last user message, default),
+# "tool" (the last tool result, when the prompt ends with one), "system" (the system messages and the tool block) or
+# "prompt" (all of it). `tools` lists tools the prompt must define ("*" for any). The reply is `reasoning` (default
+# [engine].reasoning), `content` and any `[[rule.call]]`s; `fill = true` repeats the content until max_tokens.
+# Captures go into the reply as $1 or ${name} (regex crate syntax; $$ is a literal $).
+#
+# Rules match with the regex crate (no look-around). Add a rule with a specificity above the ones it should beat.
+
+[engine]
+model = "glm-5.3"
+max_model_len = 200000
+tokens_per_s = 2000
+chunk = 4
+reasoning = "Let me work out the answer."
+
+[fallback]
+content = "I am the gr8 pseudo engine, and no rule in my weights matches this prompt."
+
+# ---- smoketest/run.sh ----------------------------------------------------------------------------------------
+
+[[rule]]
+name = "capital-of-australia"
+match = '(?i)capital of australia'
+specificity = 10
+reasoning = "The capital of Australia is Canberra, not Sydney."
+content = "Canberra"
+
+[[rule]]
+name = "capital-of-france"
+match = '(?i)capital of france'
+specificity = 10
+reasoning = "France's capital is Paris."
+content = "Paris"
+
+[[rule]]
+name = "capital-of-france-completion"
+match = 'capital of France is\s*$'
+on = "prompt"
+specificity = 20
+content = " Paris, which is also its largest city."
+
+[[rule]]
+name = "17x23"
+match = '17\s*[*x×]\s*23'
+specificity = 10
+reasoning = "17 times 23: 17 * 20 = 340, 17 * 3 = 51, 340 + 51 = 391."
+content = "391"
+
+[[rule]]
+name = "say-hi"
+match = '(?i)^say (hi|hello)\b'
+specificity = 5
+reasoning = "A short greeting."
+content = "Hi! How can I help?"
+
+[[rule]]
+name = "hello-in-french"
+match = '(?i)hello in french'
+specificity = 10
+content = "Bonjour !"
+
+[[rule]]
+name = "count-to-fifty-in-words"
+match = '(?i)count from one to fifty in words'
+specificity = 10
+content = "one, two, three, four, five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty, twenty, twenty-one, twenty-two, twenty-three, twenty-four, twenty-five, twenty-six, twenty-seven, twenty-eight, twenty-nine, thirty, thirty-one, thirty-two, thirty-three, thirty-four, thirty-five, thirty-six, thirty-seven, thirty-eight, thirty-nine, forty, forty-one, forty-two, forty-three, forty-four, forty-five, forty-six, forty-seven, forty-eight, forty-nine, fifty."
+
+[[rule]]
+name = "count-to-200"
+match = '(?i)count from 1 to 200, one number per line'
+specificity = 10
+content = """1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+101
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+149
+150
+151
+152
+153
+154
+155
+156
+157
+158
+159
+160
+161
+162
+163
+164
+165
+166
+167
+168
+169
+170
+171
+172
+173
+174
+175
+176
+177
+178
+179
+180
+181
+182
+183
+184
+185
+186
+187
+188
+189
+190
+191
+192
+193
+194
+195
+196
+197
+198
+199
+200"""
+
+[[rule]]
+name = "weather-call"
+match = '(?i)weather (?:in|for) (?P<city>[A-Z][\w-]*)'
+tools = ["get_weather"]
+specificity = 10
+reasoning = "The user wants the weather in ${city}, and get_weather can tell me."
+content = "Let me check the weather in ${city}."
+[[rule.call]]
+name = "get_weather"
+arguments = { city = "${city}" }
+
+[[rule]]
+name = "weather-no-tool"
+match = '(?i)\bweather\b'
+content = "I can't look up live weather without a tool."
+
+# ---- bench/toolbench scenarios -----------------------------------------------------------------------------
+
+[[rule]]
+name = "weather-two-cities"
+match = '(?i)weather for (?P<a>[A-Z][\w-]*) and (?:for )?(?P<b>[A-Z][\w-]*)(?:.*?(?P<days>\d+) days?)?'
+tools = ["get_weather"]
+specificity = 20
+reasoning = "Two cities, so two calls at once."
+[[rule.call]]
+name = "get_weather"
+arguments = { city = "${a}", days = 2 }
+[[rule.call]]
+name = "get_weather"
+arguments = { city = "${b}", days = 2 }
+
+[[rule]]
+name = "weather-days-metric"
+match = '(?i)weather in (?P<city>[A-Z][\w-]*) for the next (?P<days>\d+) days, in metric'
+tools = ["get_weather"]
+specificity = 30
+[[rule.call]]
+name = "get_weather"
+arguments = { city = "${city}", days = "${days}", metric = true }
+
+[[rule]]
+name = "write-file"
+match = '(?i)write a file (?P<path>[\w./-]+)'
+tools = ["write_file"]
+specificity = 10
+content = "I'll write ${path}."
+[[rule.call]]
+name = "write_file"
+arguments = { path = "${path}", content = "# ${path}\nprint('hello')\n" }
+
+[[rule]]
+name = "search-docs"
+match = '(?i)search the docs for "(?P<q>[^"]+)"'
+tools = ["search"]
+specificity = 10
+[[rule.call]]
+name = "search"
+arguments = { query = "${q}" }
+
+[[rule]]
+name = "sql-users"
+match = '(?i)users in (?P<city>[A-Z]\w+) older than (?P<age>\d+)'
+tools = ["run_query"]
+specificity = 10
+[[rule.call]]
+name = "run_query"
+arguments = { sql = "SELECT * FROM users WHERE city = :city AND age > :age", params = { city = "${city}", age = "${age}" }, limit = 10 }
+
+[[rule]]
+name = "create-event"
+match = '(?i)create an event "(?P<title>[^"]+)" starting (?P<start>\S+)'
+tools = ["create_event"]
+specificity = 10
+[[rule.call]]
+name = "create_event"
+arguments = { title = "${title}", start = "${start}" }
+
+# ---- after a tool result ------------------------------------------------------------------------------------
+
+[[rule]]
+name = "weather-result"
+match = '"temp_c"\s*:\s*(?P<t>-?\d+)(?:.*?"sky"\s*:\s*"(?P<sky>[^"]+)")?'
+on = "tool"
+specificity = 10
+reasoning = "The tool gave the temperature."
+content = "It is ${t} °C there right now."
+
+[[rule]]
+name = "tool-result"
+match = '(?s)^(?P<out>.{1,200})'
+on = "tool"
+content = "The tool returned: ${out}"
+
+# ---- formats -------------------------------------------------------------------------------------------------
+
+[[rule]]
+name = "json-object"
+match = 'Respond with only a JSON object'
+specificity = 5
+content = '{"name": "Ada Lovelace", "age": 36}'
+
+[[rule]]
+name = "python-function"
+match = '(?i)python function (?:that|to|which) (?P<what>[^.?!]+)'
+specificity = 5
+reasoning = "A small function with a docstring."
+content = """```python
+def solution(*args):
+    \"\"\"${what}.\"\"\"
+    raise NotImplementedError
+```"""
+
+[[rule]]
+name = "story"
+match = '(?i)write (?:me )?a (?:short )?story'
+specificity = 5
+content = "The lighthouse keeper climbed the stairs again, as he had every night for thirty years. "
+fill = true
+
+[[rule]]
+name = "explain"
+match = '(?i)^(?:explain|what is|what are) (?P<topic>[^?.]+)'
+specificity = -1
+content = "${topic} is a topic the pseudo engine knows nothing about, but here is a confident sentence about it."

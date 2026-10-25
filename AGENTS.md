@@ -54,6 +54,7 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | the replicated-GEMV split (`G6_QA_SPLIT`, `G6_IDXQ_SPLIT`, `G6_MTP_SPLIT`) against the replicated path, m4sim stdout byte for byte | one GB10 and a model | `MODEL_ARGS="--packs DIR" scripts/m4sim_split_check.sh` |
 | the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |
+| the front end end to end against the pseudo engine (`frontend/pseudo-engine`: rules in a TOML file), and the smoketest | anywhere, with GLM-5.3's tokenizer files | `frontend/pseudo-engine/smoke.sh TOKENIZER_DIR`; `cd frontend/pseudo-engine && cargo test` for its rules |
 | the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
 | the rank health probe | anywhere | `python3 -m unittest discover tools/health` |
 | the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |
