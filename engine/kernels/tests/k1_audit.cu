@@ -64,7 +64,7 @@
 //   read1/read2   the floor for the same bytes: a plain 16 B ld.global.nc read of exactly the call's tile ranges in one
 //                 launch (read2: fc1 ranges, then fc2 ranges), same graph, same cold rotation.
 //   stream        (once) a persistent read over 4 GB of cold weights: the GPU's plain-read rate.
-// Compile-time load-order arms are separate builds of this file (Dockerfile.moeaudit): -DTR3_UNR=4, -DTR3_UNR1=16
+// Compile-time load-order arms are separate builds of this file: -DTR3_UNR=4, -DTR3_UNR1=16
 // (fc1 narrow order only), -DTR3_PU=1|4, -DTR3_EARLY=0, -DTR3_EARLY4=1 (K4 / narrow first tile words before the
 // prologue), -DTR3_XCOMP=1. Each prints the same "digest" line as the default build when its bytes are the same.
 //
