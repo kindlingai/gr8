@@ -38,6 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          # A maintainer's fine-grained token with Actions: Read and write on this repository only. Used only to
+          # start runs (re-run, workflow_dispatch, approval); everything else uses GITHUB_TOKEN. May be empty.
+          CI_TRIGGER_TOKEN: ${{ secrets.CI_TRIGGER_TOKEN }}
         with:
           script: |
             const allowed = process.env.READY_USERS.split(",");
@@ -67,13 +71,43 @@ jobs:
               return suites.length ? Math.min(...suites) : null;
             };
 
+            // Runs are started with CI_TRIGGER_TOKEN when the secret is set, so they run as that maintainer: a re-run
+            // started with GITHUB_TOKEN fails at startup (GitHub accepts it, then fails it seconds later), and some
+            // starts fail at random. A start that fails is retried once with the token; after that, or without it,
+            // the bot asks a maintainer to re-run the run. A run first triggered by an author whose runs are refused
+            // cannot be re-run by anyone.
+            const token = process.env.CI_TRIGGER_TOKEN;
+            const starter = token
+              ? (typeof getOctokit === "function" ? getOctokit(token) : new github.constructor({ auth: token }))
+              : github;
+            let retries = token ? 1 : 0;
+
             // Start CI on the PR head: find its latest ci.yml run, approve it if it waits for approval, and re-run it
             // once its ready gate has turned it away. Waits up to 5 minutes for the gate; reports anything else.
-            // A re-run started with GITHUB_TOKEN fails at startup (GitHub accepts it, then fails it seconds later), as
-            // does any run of a PR whose author's runs are refused. The bot watches for that and asks a maintainer to
-            // re-run the run themselves. startCI below avoids the re-run where it can.
+            // startCI below avoids the re-run where it can.
             const askHuman = (run, why) => say(`CI on ${run.head_sha.slice(0, 7)} is cleared to run, but ${why}. ` +
               `A maintainer with write access can start it: open ${run.html_url} and choose **Re-run all jobs**.`);
+            // Re-run RUN and watch it start; a failed start is retried while retries last, then a maintainer is asked.
+            const restart = async run => {
+              for (;;) {
+                try {
+                  await starter.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+                } catch (e) {
+                  await askHuman(run, `the bot could not re-run it (${e.message})`);
+                  return;
+                }
+                let failed = false;
+                for (let k = 0; k < 9 && !failed; k++) {
+                  await sleep(10000);
+                  const now = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })).data;
+                  if (now.conclusion === "startup_failure") failed = true;
+                  else if (now.status !== "completed") return;            // the re-run is running
+                }
+                if (failed && retries > 0) { retries--; continue; }
+                await askHuman(run, failed ? "the bot's re-run failed to start" : "the bot's re-run has not started after 90 seconds");
+                return;
+              }
+            };
             const rerunCI = async p => {
               const head = p.head.sha;
               let approved = false;
@@ -93,7 +127,7 @@ jobs:
                   if (approved) { await sleep(10000); continue; }
                   approved = true;
                   try {
-                    await github.rest.actions.approveWorkflowRun({ owner, repo, run_id: run.id });
+                    await starter.rest.actions.approveWorkflowRun({ owner, repo, run_id: run.id });
                   } catch (e) {
                     await say(`CI for ${head.slice(0, 7)} waits for approval and the bot could not approve it ` +
                       `(${e.message}): approve it at ${run.html_url}.`);
@@ -103,7 +137,12 @@ jobs:
                   continue;
                 }
                 if (run.conclusion === "startup_failure") {
-                  await askHuman(run, "its last start failed (the bot cannot start it)");
+                  if (retries > 0) {
+                    retries--;
+                    await restart(run);
+                  } else {
+                    await askHuman(run, "its last start failed and the bot could not start it");
+                  }
                   return;
                 }
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
@@ -112,22 +151,7 @@ jobs:
                 if (gate && gate.status === "completed") {
                   if (jobs.some(j => j !== gate && j.conclusion !== "skipped")) return;   // already building
                   if (run.status === "completed") {
-                    try {
-                      await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
-                    } catch (e) {
-                      await askHuman(run, `the bot could not re-run it (${e.message})`);
-                      return;
-                    }
-                    for (let k = 0; k < 9; k++) {
-                      await sleep(10000);
-                      const now = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })).data;
-                      if (now.conclusion === "startup_failure") {
-                        await askHuman(run, "the bot's re-run failed to start");
-                        return;
-                      }
-                      if (now.status !== "completed") return;      // the re-run is running
-                    }
-                    await askHuman(run, "the bot's re-run has not started after 90 seconds");
+                    await restart(run);
                     return;
                   }
                 }
@@ -136,14 +160,14 @@ jobs:
               await say(`Timed out waiting for CI on ${head.slice(0, 7)} to reach its ready gate.`);
             };
 
-            // A PR whose branch is in this repository gets a workflow_dispatch run of ci.yml on its branch instead:
-            // GitHub lets GITHUB_TOKEN start workflow_dispatch runs, and the gate always passes them. Its checks land
-            // on the PR's head commit. A fork's branch cannot be dispatched, so it goes through rerunCI.
+            // A PR whose branch is in this repository gets a workflow_dispatch run of ci.yml on its branch instead: the
+            // gate always passes such runs, and its checks land on the PR's head commit. A fork's branch cannot be
+            // dispatched, so it goes through rerunCI.
             const startCI = async p => {
               if (p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
                 const since = Date.now() - 5000;
                 try {
-                  await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: "ci.yml", ref: p.head.ref });
+                  await starter.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: "ci.yml", ref: p.head.ref });
                   for (let i = 0; i < 12; i++) {
                     await sleep(10000);
                     const run = (await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: "ci.yml",
