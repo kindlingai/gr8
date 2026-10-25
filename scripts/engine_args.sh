@@ -1,7 +1,8 @@
 # The engine command line. The per-box supervisor (tools/launch) sources this file. KNOBS.md lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
-# GR8_MODEL picks the model: glm53 (unset) or glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2).
+# GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), or pseudo, the pseudo
+# engine (bin/g6pseudo, frontend/pseudo-engine).
 #
 #   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
@@ -67,8 +68,15 @@ flash_defaults() {
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
 }
 
+# The pseudo engine: no KV pool to size, MTP, drafter or fabric. CAP bounds a request's prompt plus max_tokens.
+pseudo_defaults() {
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-202752}; READY_TMO=${READY_TMO:-60}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+  MTP=0; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+}
+
 engine_defaults() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
+  [ "${GR8_MODEL:-glm53}" = pseudo ] && { pseudo_defaults; return; }
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
@@ -127,6 +135,7 @@ G6_PF_TIMES=1 G6_PF_STAGE_ASYNC=1"
 
 engine_env() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
+  [ "${GR8_MODEL:-glm53}" = pseudo ] && { ENGINE_BIN=g6pseudo; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
   ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} G6_PF_OWN=$PF_OWN \
 G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
@@ -256,6 +265,11 @@ engine_args() {
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
+  if [ "${GR8_MODEL:-glm53}" = pseudo ]; then
+    a="--model $V2_DENSE --cap $CAP --serve $home/s2 --s2-sessions $SESS --s2-epoch $epoch ${SET_ID:+--set-id $SET_ID}"
+    (set -f; echo $a)
+    return
+  fi
   # a release only, SESS sessions (flash_defaults). --chunk 1: a prompt tail goes one row a step, and a session's rows
   # in a main step stay within its KDA state ring (MTP + 1)
   if [ "${GR8_MODEL:-glm53}" = glm53f ]; then

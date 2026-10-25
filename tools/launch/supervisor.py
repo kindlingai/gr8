@@ -146,7 +146,12 @@ def resolve_model(o, refresh=False, log=log):
         steering = steering_hf.request(o)
         if steering and not hf:
             raise modelset.ModelError('--steering-profile hf:... requires an HF release (--model https://...)')
-        if hf:
+        if models.of(o) is models.PSEUDO:
+            if not modelset.is_pseudo(model):
+                raise modelset.ModelError(f'--model {model}: want a pseudo engine release, a directory with '
+                                          'responses.toml and the tokenizer files')
+            ms = modelset.pseudo_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        elif hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
@@ -534,7 +539,7 @@ class Supervisor:
                 self.rails = ranks[self.rank][2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
                     log(f'warning: {p}')
-        if o.get('SHAPE') == 'ring':    # no switch: the engine bootstraps over the LAN and finds its devices by name
+        if o.get('SHAPE') == 'ring' or not models.of(o).fabric:   # no switch: the engine bootstraps over the LAN
             self.rails = (self.lan, self.lan)
         elif o.get('IPS'):
             self.rails = (opt.split_list(o.get('IPS'))[self.rank], opt.split_list(o.get('IPS2'))[self.rank])
@@ -579,7 +584,7 @@ class Supervisor:
             name = engine_bin(o)
             fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name.endswith('-int4') else '') +
                          f'./gr8 {models.of(o).name} build')
-        if not os.path.isdir('/dev/infiniband'):
+        if models.of(o).fabric and not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
             if not os.access(self.front_bin(), os.X_OK):

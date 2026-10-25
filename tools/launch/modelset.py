@@ -67,6 +67,24 @@ def describe_release(d, tp, tok):
     return s
 
 
+def is_pseudo(d):
+    """A pseudo engine release: responses.toml, the rules the engine answers from (frontend/pseudo-engine)."""
+    return bool(d) and os.path.isfile(os.path.join(d, 'responses.toml'))
+
+
+def pseudo_set(d, tp, model_dir=None):
+    """The model set of a pseudo engine release, used in place: its weights are named by the sha256 of responses.toml.
+    The engine reads the tokenizer from the release alone, so MODEL_DIR is refused."""
+    tok = tokenizer_dir(d, None)
+    if model_dir and os.path.abspath(model_dir) != os.path.abspath(tok):
+        raise ModelError(f'--model-dir {model_dir}: g6pseudo reads the tokenizer files from the release ({tok})')
+    s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in TOKENIZER},
+         'source': {'kind': 'pseudo', 'weights': sha256_file(os.path.join(d, 'responses.toml'))}}
+    s['set_id'] = compute_id(s)
+    return ModelSet(s, f'{d} (pseudo engine rules)', tok, d)
+
+
 def release_set(d, tp, model_dir=None, label=None):
     """The model set of an exlr8 release directory, used in place."""
     tok = tokenizer_dir(d, model_dir)
