@@ -212,6 +212,7 @@ inline std::map<const Model*, F16Set>& f16_sets()
     return s;
 }
 constexpr size_t F16_WS = size_t(32) << 20;   // cuBLAS workspace per lane handle
+static_assert(F16_WS == flash_dsa_f16::GEMMEX_WS, "the G6_PF_DSA_LT heuristic query assumes the GemmEx workspace");
 
 // load time (build_flash_prefill), and a no-op check per DSA block after that: decode every bound DSA layer's
 // projections once per model, then the lane's handle and buffers for MP rows. Logs the device-memory delta.

@@ -15,9 +15,13 @@
 // rows are unpacked from the same bf16 fragment table the GV kernel reads; cuBLAS writes fp32, rounded to fp16 rows.
 #pragma once
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <cstdio>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 namespace g6rt
 {
@@ -188,15 +192,117 @@ inline void gemm_bf_split(cublasHandle_t h, const Mat& w, const u32* xb_frag, in
     k_split_f16<<<static_cast<unsigned>((outs + 255) / 256), 256, 0, st>>>(y32, M, w.O, w.Oa, ya, lda, yb, ldb);
 }
 
+// G6_PF_DSA_LT (default on, read once; =0 off): q_a (O 1536, K 4096) and idx_q (O 4096, K 1536) run on a cublasLt algo with a
+// bigger tile than the one cublasGemmEx (CUBLAS_GEMM_DEFAULT) picks (64x64, 32x6 stages): q_a 256x64 / 32x4, idx_q
+// 128x128 / 64x3, both split-K 1. Only where the default is itself one sequential k pass: the Lt heuristic (the one
+// GemmEx follows, same workspace) answers split-K 1, no reduction, a defined tile, the same algo id. Then every output
+// element is the same fp32 k-ordered sum: the same bits (bench, 28 row counts 1..4096 per shape, 0 differing bytes;
+// where the default is split-K, a GEMV (M 1), or a smaller tile wins (q_a M < 768, idx_q M < 256), GemmEx stays).
+// Bench, M 4096: q_a 963 -> 627 us, idx_q 953 -> 765 us. TP3 8K A/B: prefill 2520 -> 2537 tok/s, rank-0 8K -19 ms.
+constexpr size_t GEMMEX_WS = size_t(32) << 20;   // = flash_dsa_pf::F16_WS, the GemmEx handle's workspace
+inline bool lt_on()
+{
+    static const bool v = !(getenv("G6_PF_DSA_LT") && atoi(getenv("G6_PF_DSA_LT")) == 0);
+    return v;
+}
+inline cublasLtHandle_t lt_handle()
+{
+    static cublasLtHandle_t h = [] {
+        cublasLtHandle_t x = nullptr;
+        if (cublasLtCreate(&x) != CUBLAS_STATUS_SUCCESS) die("flash_dsa_f16: cublasLtCreate failed");
+        return x;
+    }();
+    return h;
+}
+struct LtPlan
+{
+    bool use = false;
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t La = nullptr, Lb = nullptr, Lc = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+};
+inline const LtPlan& lt_plan(int O, int K, int ldx, int M)
+{
+    static std::mutex mu;
+    static std::map<std::tuple<int, int, int, int>, LtPlan> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto key = std::make_tuple(O, K, ldx, M);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    LtPlan& p = cache[key];
+    int tile = 0, stages = 0, mmin = 0;
+    if (O == 1536 && K == 4096) { tile = CUBLASLT_MATMUL_TILE_256x64; stages = CUBLASLT_MATMUL_STAGES_32x4; mmin = 768; }
+    else if (O == 4096 && K == 1536) { tile = CUBLASLT_MATMUL_TILE_128x128; stages = CUBLASLT_MATMUL_STAGES_64x3; mmin = 256; }
+    else return p;
+    if (M < mmin) return p;
+    cublasLtHandle_t lt = lt_handle();
+    const cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+    bool ok = cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof tA) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof tB) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatrixLayoutCreate(&p.La, CUDA_R_16F, K, O, K) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatrixLayoutCreate(&p.Lb, CUDA_R_16F, K, M, ldx) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatrixLayoutCreate(&p.Lc, CUDA_R_32F, O, M, O) == CUBLAS_STATUS_SUCCESS;
+    if (!ok) die("flash_dsa_f16: cublasLt descriptor setup failed");
+    cublasLtMatmulPreference_t pref = nullptr;
+    size_t wsz = GEMMEX_WS;
+    if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof wsz) != CUBLAS_STATUS_SUCCESS)
+        die("flash_dsa_f16: cublasLt preference setup failed");
+    cublasLtMatmulHeuristicResult_t hr{};
+    int nh = 0;
+    const bool got = cublasLtMatmulAlgoGetHeuristic(lt, p.op, p.La, p.Lb, p.Lc, p.Lc, pref, 1, &hr, &nh) == CUBLAS_STATUS_SUCCESS && nh > 0;
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (!got) return p;
+    auto get = [&](cublasLtMatmulAlgoConfigAttributes_t at) {
+        int v = -1; size_t w = 0;
+        cublasLtMatmulAlgoConfigGetAttribute(&hr.algo, at, &v, sizeof v, &w);
+        return v;
+    };
+    const int id = get(CUBLASLT_ALGO_CONFIG_ID);
+    if (get(CUBLASLT_ALGO_CONFIG_SPLITK_NUM) != 1 || get(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME) != CUBLASLT_REDUCTION_SCHEME_NONE ||
+        get(CUBLASLT_ALGO_CONFIG_TILE_ID) == CUBLASLT_MATMUL_TILE_UNDEFINED || id != 21)
+        return p;   // the default is split-K, a GEMV or another kernel family: keep GemmEx
+    const int one = 1, rnone = CUBLASLT_REDUCTION_SCHEME_NONE, swz = 0;
+    ok = cublasLtMatmulAlgoInit(lt, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, CUDA_R_32F, id, &p.algo) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulAlgoConfigSetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof tile) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulAlgoConfigSetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof stages) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulAlgoConfigSetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &one, sizeof one) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulAlgoConfigSetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &rnone, sizeof rnone) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulAlgoConfigSetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swz, sizeof swz) == CUBLAS_STATUS_SUCCESS;
+    cublasLtMatmulHeuristicResult_t chk{};
+    ok = ok && cublasLtMatmulAlgoCheck(lt, p.op, p.La, p.Lb, p.Lc, p.Lc, &p.algo, &chk) == CUBLAS_STATUS_SUCCESS && chk.workspaceSize == 0;
+    p.use = ok;
+    return p;
+}
+// the Lt arm of gemm(); false: not taken (off, another shape or row count, or the buffers not 256-byte aligned, which
+// the heuristic query assumes)
+inline bool lt_gemm(const Mat& w, const __half* x, int ldx, int M, float* y32, cudaStream_t st)
+{
+    if (!lt_on()) return false;
+    auto al = [](const void* q) { return (reinterpret_cast<uintptr_t>(q) & 255) == 0; };
+    if (!al(w.w) || !al(x) || !al(y32) || (ldx * 2) % 16) return false;
+    const LtPlan& p = lt_plan(w.O, w.K, ldx, M);
+    if (!p.use) return false;
+    const float zero = 0.f;
+    if (cublasLtMatmul(lt_handle(), p.op, &w.alpha, w.w, p.La, x, p.Lb, &zero, y32, p.Lc, y32, p.Lc, &p.algo, nullptr, 0, st) !=
+        CUBLAS_STATUS_SUCCESS)
+        die("flash_dsa_f16: cublasLtMatmul failed");
+    return true;
+}
+
 // y[M][ldy] (fp16) = alpha * x[M][ldx] (fp16) @ W'^T, through y32 [M][O] fp32
 inline void gemm(cublasHandle_t h, const Mat& w, const __half* x, int ldx, int M, float* y32, __half* y, int ldy,
                  cudaStream_t st)
 {
     const float zero = 0.f;
-    if (cublasSetStream(h, st) != CUBLAS_STATUS_SUCCESS) die("flash_dsa_f16: cublasSetStream failed");
-    if (cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, w.O, M, w.K, &w.alpha, w.w, CUDA_R_16F, w.K, x, CUDA_R_16F, ldx, &zero,
-                     y32, CUDA_R_32F, w.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
-        die("flash_dsa_f16: cublasGemmEx failed");
+    if (!lt_gemm(w, x, ldx, M, y32, st))
+    {
+        if (cublasSetStream(h, st) != CUBLAS_STATUS_SUCCESS) die("flash_dsa_f16: cublasSetStream failed");
+        if (cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, w.O, M, w.K, &w.alpha, w.w, CUDA_R_16F, w.K, x, CUDA_R_16F, ldx, &zero,
+                         y32, CUDA_R_32F, w.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            die("flash_dsa_f16: cublasGemmEx failed");
+    }
     const size_t outs = static_cast<size_t>(M) * w.O;
     k_split_f16<<<static_cast<unsigned>((outs + 255) / 256), 256, 0, st>>>(y32, M, w.O, w.O, y, ldy, nullptr, 0);
 }

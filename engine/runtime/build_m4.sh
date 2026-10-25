@@ -131,13 +131,13 @@ inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of 
 if [ "$WHAT" != g6 ]; then
   I=""
   for n in $WIDTHS; do inst m4sim $n; I="$I $O/m4sim.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -lpthread
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
   I=""
   for n in $WIDTHS; do inst g6m4 $n; I="$I $O/g6m4.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -libverbs -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -libverbs -lpthread
   if [ -n "$GRDEF" ]; then echo "g6m4: request grammars (XGrammar) linked"; fi
   if [ -n "$RSDEF" ]; then echo "g6m4: Rust pack loader linked"; else echo "g6m4: no $RSLIB, C++ pack loader only"; fi
   ls -la $OUT/g6m4
