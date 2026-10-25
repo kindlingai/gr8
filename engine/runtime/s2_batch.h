@@ -796,43 +796,6 @@ private:
         if (!nm) x.pb = -1;
         if (nm && !par) kchain(q, v.event);
     }
-    // G6_NGRAM: the table's chain after tokens[0..base] when it promises more tokens per verify ms than the drafter's k
-    // drafts (pe: their expected tokens when the policy that chose k computed it, else 0): its length (0: the drafter's),
-    // the chain in nd[1..], the expected tokens of both. Rank-invariant: the committed tokens, the table, the drafts'
-    // log-probabilities, accept counts and the fixed verify table
-    int ngram_pick(const St& x, int base, bool m, int k, double pe, int* nd, double* ne, double* de) const
-    {
-        double c[DFL_B];
-        const int n = ng_.t->chain(x.tokens.data(), base + 1, ng_.kmax, nd, c);
-        if (n < ng_.kmin) return 0;
-        int bk = 0;
-        double e = 1, s = 1, br = -1;
-        for (int j = 1; j <= n; ++j)
-        {
-            s *= c[j]; e += s;
-            const double r = e / dsl_.verify_ms(j + 1);
-            if (j >= ng_.kmin && r > br * (1 + 1e-9)) { br = r; bk = j; *ne = e; }
-        }
-        double ed = pe;
-        if (!(ed > 0)) (m ? sel_.m : dsl_).ratio(k, m ? x.dlm.data() : x.dl, k, &ed);
-        *de = ed;
-        return br > ed / dsl_.verify_ms(k + 1) * (1 + ng_.margin) ? bk : 0;
-    }
-    // G6_NGRAM: a round that verified the table's chain still teaches the drafter's estimates (else a drafter that the
-    // table once beat could never win the choice back): its kd drafts against the a + 1 target tokens the verify
-    // produced. When all a + 1 match, the rest is unknown and the estimates learn only those positions
-    void ngram_score(St& x, bool m, int kd, int a, const int* t, double de)
-    {
-        const int* dr = m ? x.d.data() : x.dd;
-        const float* lp = m ? x.dlm.data() : x.dl;
-        int b = 0;
-        while (b < kd && b < a + 1 && dr[b + 1] == t[b]) ++b;
-        const int ko = b == a + 1 ? b : std::min(b + 1, kd);   // positions offered: known right ones, and the first miss
-        if (!ko) return;
-        if (m) { if (sel_.on || ks_.mode == 2) sel_.m.observe(ko, b, ks_.mode ? lp : nullptr, de); return; }
-        if (dsl_.on) dsl_.observe(ko, b, lp, de);
-        if (sel_.on) sel_.d.observe(ko, b, lp, 0);
-    }
     // the drafter of the next round (drafter choice, G6_DFL_REUSE warm-up) and this round's drafter step: the a + 1
     // committed rows as context, drafting when the next round is on DFlash2 or probes
     DflReq choose_drafter(int q, int base, int a, int tok, bool& nm, bool& probe)
@@ -882,6 +845,43 @@ private:
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
     };
+    // G6_NGRAM: the table's chain after tokens[0..base] when it promises more tokens per verify ms than the drafter's k
+    // drafts (pe: their expected tokens when the policy that chose k computed it, else 0): its length (0: the drafter's),
+    // the chain in nd[1..], the expected tokens of both. Rank-invariant: the committed tokens, the table, the drafts'
+    // log-probabilities, accept counts and the fixed verify table
+    int ngram_pick(const St& x, int base, bool m, int k, double pe, int* nd, double* ne, double* de) const
+    {
+        double c[DFL_B];
+        const int n = ng_.t->chain(x.tokens.data(), base + 1, ng_.kmax, nd, c);
+        if (n < ng_.kmin) return 0;
+        int bk = 0;
+        double e = 1, s = 1, br = -1;
+        for (int j = 1; j <= n; ++j)
+        {
+            s *= c[j]; e += s;
+            const double r = e / dsl_.verify_ms(j + 1);
+            if (j >= ng_.kmin && r > br * (1 + 1e-9)) { br = r; bk = j; *ne = e; }
+        }
+        double ed = pe;
+        if (!(ed > 0)) (m ? sel_.m : dsl_).ratio(k, m ? x.dlm.data() : x.dl, k, &ed);
+        *de = ed;
+        return br > ed / dsl_.verify_ms(k + 1) * (1 + ng_.margin) ? bk : 0;
+    }
+    // G6_NGRAM: a round that verified the table's chain still teaches the drafter's estimates (else a drafter that the
+    // table once beat could never win the choice back): its kd drafts against the a + 1 target tokens the verify
+    // produced. When all a + 1 match, the rest is unknown and the estimates learn only those positions
+    void ngram_score(St& x, bool m, int kd, int a, const int* t, double de)
+    {
+        const int* dr = m ? x.d.data() : x.dd;
+        const float* lp = m ? x.dlm.data() : x.dl;
+        int b = 0;
+        while (b < kd && b < a + 1 && dr[b + 1] == t[b]) ++b;
+        const int ko = b == a + 1 ? b : std::min(b + 1, kd);   // positions offered: known right ones, and the first miss
+        if (!ko) return;
+        if (m) { if (sel_.on || ks_.mode == 2) sel_.m.observe(ko, b, ks_.mode ? lp : nullptr, de); return; }
+        if (dsl_.on) dsl_.observe(ko, b, lp, de);
+        if (sel_.on) sel_.d.observe(ko, b, lp, 0);
+    }
     // the chain of a solo session about to verify MTP drafts: K-1 steps, or with KStop while kmore() allows (x.k drafted)
     void kchain(int q, int ev)
     {
