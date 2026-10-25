@@ -125,6 +125,10 @@ public:
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
                 req.steering == g.req.steering &&
                 grant_pages_ok(config_, req, g.run.pages), "session payload/grant mismatch");
+        // the kernels index the profile tables by this slot
+        require(!req.steering.enabled || (req.steering.slot < config_.steering.profiles.size() &&
+                req.steering == config_.steering.selected(req.steering.scale_bits, req.steering.slot)),
+                "session steering is not a loaded profile");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
         // the head compiled this grammar before queueing the request (Service::controller), so a failure here means

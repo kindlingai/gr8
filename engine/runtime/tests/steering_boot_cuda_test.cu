@@ -14,12 +14,14 @@ static g6rt::steering::Profile profile(g6rt::steering::Scope scope) {
 static void initialize(g6rt::Model& m,cudaStream_t st) {
     m.nl=3; m.layers.resize(3); m.layers[0].l=0; m.layers[1].l=1; m.layers[2].l=3;
     CK(cudaMalloc(&m.steering_scale,G6_MX*sizeof(float))); CK(cudaMemsetAsync(m.steering_scale,0xff,G6_MX*sizeof(float),st));
+    CK(cudaMalloc(&m.steering_slot,G6_MX*sizeof(int))); CK(cudaMemsetAsync(m.steering_slot,0xff,G6_MX*sizeof(int),st));
 }
 static void cleanup(g6rt::Model& m) {
     if(!m.steering_dir.empty()) CK(cudaFree(const_cast<float*>(m.steering_dir[0])));
     if(m.steering_part) CK(cudaFree(m.steering_part));
     if(m.steering_count) CK(cudaFree(m.steering_count));
     CK(cudaFree(m.steering_scale));
+    CK(cudaFree(m.steering_slot));
 }
 int main() {
     using namespace g6rt;
@@ -41,6 +43,30 @@ int main() {
         } else check(!m.steering_part && !m.steering_count,"full scope needs no shared scratch");
         rejects([&]{materialize_steering(m,p,st);});
         cleanup(m);
+    }
+    {   // two profiles: A steers layers 0 and 3, B layers 1 and 3; each steered layer holds a [2][HID] table
+        Model m; initialize(m,st); const auto a=profile(steering::Scope::Full); auto b=a;
+        b.name="b"; b.layers={1,3}; b.alphas={2.f,3.f}; b.directions.assign(2*HID,0.f); b.directions[2]=1.f; b.directions[HID+3]=1.f;
+        materialize_steering(m,std::vector<steering::Profile>{a,b},st);
+        check(m.steering_profiles==2 && m.steering_dir[0] && m.steering_dir[1] && m.steering_dir[2],"a layer either profile steers has a table");
+        check(m.steering_alphas==std::vector<float>({.5f,0.f, 0.f,2.f, 1.f,3.f}),"[layer][profile] alphas, 0 where a profile leaves a layer out");
+        check(m.steering_alpha==std::vector<float>({.5f,0.f,1.f}),"profile 0's alphas");
+        std::vector<float> l0(2*HID),l1(2*HID),l3(2*HID),slot_alpha(3*2);
+        CK(cudaMemcpy(l0.data(),m.steering_dir[0],l0.size()*sizeof(float),cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(l1.data(),m.steering_dir[1],l1.size()*sizeof(float),cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(l3.data(),m.steering_dir[2],l3.size()*sizeof(float),cudaMemcpyDeviceToHost));
+        check(l0[0]==1.f && std::count(l0.begin(),l0.end(),0.f)==long(l0.size())-1,"layer 0: A's direction, B's row zero");
+        check(l1[HID+2]==1.f && std::count(l1.begin(),l1.end(),0.f)==long(l1.size())-1,"layer 1: A's row zero, B's direction");
+        check(l3[1]==1.f && l3[HID+3]==1.f,"layer 3: both directions in slot order");
+        check(m.steering_slot_alpha.size()==3,"one device alpha table per layer");
+        for(int i=0;i<3;++i) CK(cudaMemcpy(slot_alpha.data()+2*i,m.steering_slot_alpha[i],2*sizeof(float),cudaMemcpyDeviceToHost));
+        check(slot_alpha==m.steering_alphas,"device alpha tables match the host's");
+        std::vector<int> slots(MX); CK(cudaMemcpy(slots.data(),m.steering_slot,MX*sizeof(int),cudaMemcpyDeviceToHost));
+        check(std::all_of(slots.begin(),slots.end(),[](int x){return x==0;}),"row slots start at 0");
+        cleanup(m);
+        Model n; initialize(n,st); auto shared=b; shared.scope=steering::Scope::Shared;
+        rejects([&]{materialize_steering(n,std::vector<steering::Profile>{a,shared},st);});
+        cleanup(n);
     }
     for(int invalid=0;invalid<3;++invalid) {
         Model m; initialize(m,st); auto p=profile(steering::Scope::Full);

@@ -8,8 +8,8 @@ static int fails = 0;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); ++fails; } } while (0)
 
 static st::BootConfig boot() {
-    st::BootConfig b; b.loaded = true; b.profile_name = "example"; b.scope = st::Scope::Full; b.active_layers=2;
-    for (unsigned i=0;i<32;++i) { b.profile_digest[i]=uint8_t(i); b.schedule_digest[i]=uint8_t(63-i); }
+    st::BootConfig b; b.loaded = true; b.scope = st::Scope::Full; b.profiles.push_back({"example", {}, {}, 2});
+    for (unsigned i=0;i<32;++i) { b.profiles[0].profile_digest[i]=uint8_t(i); b.profiles[0].schedule_digest[i]=uint8_t(63-i); }
     return b;
 }
 
@@ -20,7 +20,7 @@ static g6rt::PrefixReuse finished(const std::vector<int>& p) {
 
 int main() {
     auto b = boot();
-    st::RequestFields none, named; named.has_profile=true; named.profile=b.profile_name;
+    st::RequestFields none, named; named.has_profile=true; named.profile=b.profiles[0].name;
     st::RequestFields zero; zero.has_scale=true; zero.scale=-0.0;
     const auto off=b.resolve(none), on=b.resolve(named);
     CHECK(!off.enabled && on.enabled && st::bits_float(on.scale_bits)==1.0f && !b.resolve(zero).enabled);

@@ -19,7 +19,8 @@ template<class T> static void put(T* dst,const std::vector<T>& v) { CK(cudaMemcp
 template<class T> static std::vector<T> get(const T* src,size_t n) { std::vector<T> v(n); CK(cudaMemcpy(v.data(),src,n*sizeof(T),cudaMemcpyDeviceToHost)); return v; }
 static float partial(int p,int m,int c) { return float((c*13+m*7+p*3)%97-48)/64.f; }
 static void append(FILE* f,const void* p,size_t n) { if(f && std::fwrite(p,1,n,f)!=n) std::exit(2); }
-// Each case covers either AR, RS cluster, RS wide, owner, or pair-owner (lo/hi in both orders).
+// Each case covers either AR, RS cluster, RS wide, owner, or pair-owner (lo/hi in both orders). Modes 7 and 8 load two
+// profiles: odd rows take the second (slot 1), and in mode 8 the first leaves the layer out (alpha 0, stock rows).
 static void run(int kind,int M,int nr,int rank,int mode,bool loop,FILE* dump) {
     Arena a;
     const int rows=kind==0 ? M : pf_rows(M,rank,nr), first=kind==0 ? 0 : pf_r0(M,rank,nr);
@@ -37,8 +38,16 @@ static void run(int kind,int M,int nr,int rank,int mode,bool loop,FILE* dump) {
     for(size_t i=0;i<N;++i) residual[i]=float(int(i%53)-26)/128.f;
     const auto original=residual;
     const float alpha=.875f;
+    const std::vector<float> slot_alphas={mode==8 ? 0.f : alpha,1.5f};
+    std::vector<float> table(2*HID);
     for(int c=0;c<HID;++c) { direction[c]=float((c%7)-3)/std::sqrt(4.f*HID); weight[c]=__float2bfloat16(float(3+c%5)/4.f); }
-    for(int m=0;m<M;++m) scales[m]=mode==0 ? 0.f : mode==1 ? 1.125f : (m%2 ? .625f : 0.f);
+    for(int c=0;c<HID;++c) { table[c]=direction[c]; table[HID+c]=float((c%5)-2)/std::sqrt(2.f*HID); }
+    const bool slots=mode>=7;
+    auto row_dir=[&](int m) { return slots && m%2 ? table.data()+HID : direction.data(); };
+    auto row_alpha=[&](int m) { return slots ? slot_alphas[m%2] : alpha; };
+    std::vector<int> row_slots(M);
+    for(int m=0;m<M;++m) row_slots[m]=m%2;
+    for(int m=0;m<M;++m) scales[m]=mode==0 ? 0.f : mode==1 || slots ? 1.125f : (m%2 ? .625f : 0.f);
     if(mode==4) std::fill(scales.begin(),scales.end(),.75f);
     if(mode==3 || mode==5 || mode==6) std::fill(scales.begin(),scales.end(),0.f); // invalid direction pointer must never be dereferenced
     for(int j=0;j<rows;++j) for(int c=0;c<HID;++c) {
@@ -57,6 +66,9 @@ static void run(int kind,int M,int nr,int rank,int mode,bool loop,FILE* dump) {
     auto* dr=a.alloc<float>(N); put(dr,residual);
     auto* dw=a.alloc<__nv_bfloat16>(HID); put(dw,weight);
     auto* dd=a.alloc<float>(HID); put(dd,direction);
+    auto* dt=a.alloc<float>(2*HID); put(dt,table);
+    auto* dslot=a.alloc<int>(M); put(dslot,row_slots);
+    auto* dalpha=a.alloc<float>(2); put(dalpha,slot_alphas);
     auto* ds=a.alloc<float>(M); put(ds,scales);
     auto* dy=a.alloc<float>(writer.size()); put(dy,writer);
     auto* dm=a.alloc<__nv_bfloat16>(mine.size()); put(dm,mine);
@@ -70,6 +82,7 @@ static void run(int kind,int M,int nr,int rank,int mode,bool loop,FILE* dump) {
 #ifndef G6_STEERING_TEST_BASELINE
         args.steer={mode==6 ? nullptr : mode==3 || mode==5 ? reinterpret_cast<const float*>(uintptr_t(1)) : dd,
                     mode==4 || mode==5 ? nullptr : ds, mode==4 ? .75f : mode==5 ? 1.f : 0.f, mode==5 ? 0.f : alpha};
+        if(slots) args.steer={dt,ds,0.f,0.f,dslot,dalpha};
 #endif
 #ifdef DEC_SLOT
         args.xf16=xf; args.xbf16=xb;
@@ -80,6 +93,7 @@ static void run(int kind,int M,int nr,int rank,int mode,bool loop,FILE* dump) {
 #ifndef G6_STEERING_TEST_BASELINE
         args.steer={mode==6 ? nullptr : mode==3 || mode==5 ? reinterpret_cast<const float*>(uintptr_t(1)) : dd,
                     mode==4 || mode==5 ? nullptr : ds, mode==4 ? .75f : mode==5 ? 1.f : 0.f, mode==5 ? 0.f : alpha};
+        if(slots) args.steer={dt,ds,0.f,0.f,dslot,dalpha};
 #endif
         if(kind==1) k_rs_add_norm<<<dim3(glue::RN_CL,std::max(rows,1)),glue::RN_T>>>(args);
 #ifdef PF_RNWIDE
@@ -112,7 +126,8 @@ static void run(int kind,int M,int nr,int rank,int mode,bool loop,FILE* dump) {
             y[c]=v;
         }
         const auto stock=y;
-        g6rt::steering::project(y.data(),direction.data(),HID,scales[m]*alpha);
+        const float effective=scales[m]*row_alpha(m);
+        g6rt::steering::project(y.data(),row_dir(m),HID,effective);
         double ss=0;
         for(int c=0;c<HID;++c) { y[c]+=original[size_t(m)*HID+c]; ss+=double(y[c])*y[c]; }
         const double inv=1/std::sqrt(ss/HID+1e-5);
@@ -122,7 +137,7 @@ static void run(int kind,int M,int nr,int rank,int mode,bool loop,FILE* dump) {
             finite &= std::isfinite(residual[i]) && std::isfinite(__half2float(output[i]));
             er=std::max(er,std::fabs(residual[i]-y[c]));
             en=std::max(en,std::fabs(__half2float(output[i])-expected));
-            if(scales[m]==0.f) { const float v=stock[c]+original[i]; exact_zero &= std::memcmp(&v,&residual[i],4)==0; }
+            if(effective==0.f) { const float v=stock[c]+original[i]; exact_zero &= std::memcmp(&v,&residual[i],4)==0; }
             if(kind!=0) {
                 const size_t off=3*stride+size_t(m-first)*HID*2+c*2;
                 ag_same &= std::memcmp(ag.data()+off,&output[i],2)==0;
@@ -146,11 +161,17 @@ static void scope_selection() {
     m.layers.resize(2); m.layers[0].moe=false; m.layers[1].moe=true;
     m.steering_dir.assign(2,reinterpret_cast<const float*>(uintptr_t(1)));
     m.steering_alpha.assign(2,.5f); p.steering_scale=.75f;
+    m.steering_profiles=1; m.steering_alphas.assign(2,.5f);
     m.steering_scope=steering::Scope::Shared;
     check(pf_steer(m,p,1,true).dir && !pf_steer(m,p,1,false).dir,"shared MoE excludes full MLP consume");
     check(pf_steer(m,p,0,false).dir && !pf_steer(m,p,2,true).dir,"dense MLP included; absent layer excluded");
     m.steering_scope=steering::Scope::Full;
     check(pf_steer(m,p,1,false).dir && pf_steer(m,p,1,false).scale==.75f,"full scope includes MLP with lane scale");
+    // two profiles: a lane's slot picks its row of the layer's table and its alpha
+    m.steering_profiles=2; m.steering_alphas={.5f,0.f, .25f,2.f}; p.steering_slot=1;
+    const auto second=pf_steer(m,p,1,false);
+    check(second.dir==m.steering_dir[1]+HID && second.alpha==2.f && !second.row_slot,"lane slot selects direction and alpha");
+    check(pf_steer(m,p,0,false).alpha==0.f,"a profile that leaves the layer out runs stock");
 }
 #endif
 int main(int argc,char** argv) {
@@ -171,7 +192,7 @@ int main(int argc,char** argv) {
 #if G6_NR != 4
             if(kind>=4)continue;
 #endif
-            const int modes=dump ? 1 : 7;
+            const int modes=dump ? 1 : 9;
             for(int mode=0;mode<modes;++mode) run(kind,M,nr,rank,mode,false,dump);
             if(kind==1 || kind>=4) run(kind,M,nr,rank,0,true,dump);
         }

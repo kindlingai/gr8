@@ -364,7 +364,7 @@ int main(int argc, char** argv)
             steering_tokenizer_revision, steering_template_digest, HID, 78};
         steering_prepared = steering::prepare_boot(steering_dir, expected, steering_template_file, layers, steering_force_s);
     } catch (const std::exception& e) { die(e.what()); }
-    const auto& steering_profile = steering_prepared.profile;
+    const auto& steering_profiles = steering_prepared.profiles;
     const auto& steering_boot = steering_prepared.config;
     // G6_MTP_KSTOP=1|2 (s2_batch.h KStop; default 0): a solo DFlash2 session's MTP rounds draft and verify 1..
     // G6_MTP_KSTOP_KMAX (1..3, default --mtp) drafts, chosen from the drafts' log-probabilities: 1 by G6_MTP_KSTOP_TAU=
@@ -1059,13 +1059,16 @@ int main(int argc, char** argv)
 #endif
     if (steering_boot.loaded)
     {
-        try { materialize_steering(m, steering_profile, st); }
+        try { materialize_steering(m, steering_profiles, st); }
         catch (const std::exception& e) { die(e.what()); }
-        fprintf(stderr, "# rank %d: steering profile %s manifest %s tensor %s scope %s layers %zu forced %s\n", R,
-                steering_profile.name.c_str(), steering::digest_hex(steering_profile.manifest_digest).c_str(),
-                steering::digest_hex(steering_profile.tensor_digest).c_str(), steering::scope_name(steering_profile.scope),
-                steering_profile.layers.size(), steering_boot.forced ? steering_force_s.c_str() : "off");
-        if (R == 0) fprintf(stderr, "# steering manifest %s\n", steering_profile.manifest_json.c_str());
+        for (const auto& sp : steering_profiles)
+        {
+            fprintf(stderr, "# rank %d: steering profile %s manifest %s tensor %s scope %s layers %zu forced %s\n", R,
+                    sp.name.c_str(), steering::digest_hex(sp.manifest_digest).c_str(),
+                    steering::digest_hex(sp.tensor_digest).c_str(), steering::scope_name(sp.scope),
+                    sp.layers.size(), steering_boot.forced ? steering_force_s.c_str() : "off");
+            if (R == 0) fprintf(stderr, "# steering manifest %s\n", sp.manifest_json.c_str());
+        }
     }
     boot("layers bound");
     if (m.qs.on())                      // every rank, at the same point: its TCP bootstrap is a barrier
@@ -2457,7 +2460,7 @@ int main(int argc, char** argv)
                 (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "") +
                 // the S2 layers carry the shared-scope MoE finalize steering; every rank must (a rank without it would
                 // leave its share of the shared-expert correction out of batched steps)
-                (steering_boot.loaded && steering_profile.scope == steering::Scope::Shared ? " s2steer 1" : "");
+                (steering_boot.loaded && steering_boot.scope == steering::Scope::Shared ? " s2steer 1" : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -2483,7 +2486,7 @@ int main(int argc, char** argv)
                     int s2moe = 0, s2st = 0;
                     s2_steer_count(m, s2moe, s2st);
                     fprintf(stderr, "# rank %d: steering S2: %d of %d S2 MoE layer bindings carry the shared-scope finalize steering (scope %s)\n",
-                            R, s2st, s2moe, steering::scope_name(steering_profile.scope));
+                            R, s2st, s2moe, steering::scope_name(steering_boot.scope));
                 }
                 wcheck::seal(R);
                 int dev = 0;
@@ -2549,6 +2552,7 @@ int main(int argc, char** argv)
         if (skip > sp.first) sp.first = skip;
         const Plan& p = sp;
         P.steering_scale = P2.steering_scale = p.steering_scale;
+        P.steering_slot = P2.steering_slot = p.steering_slot;
         if (pf_qp)                      // OWN=4 iff prompt + gen fits the QO table (G6_PF_QP_CTX), else OWN=2 for this request
         {
             const int ctx = (int)p.prompt.size() + p.n_gen;

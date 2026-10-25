@@ -611,7 +611,8 @@ inline void s2_hprev_from_solo(Draft& D, int q, cudaStream_t st)
 inline bool s2_steer_same(const bind::K1& a, const bind::K1& b)
 {
     return a.a.steer_dir == b.a.steer_dir && a.a.steer_scale == b.a.steer_scale && a.a.steer_part == b.a.steer_part &&
-           a.a.steer_count == b.a.steer_count && std::memcmp(&a.a.steer_alpha, &b.a.steer_alpha, sizeof(float)) == 0;
+           a.a.steer_count == b.a.steer_count && a.a.steer_slot == b.a.steer_slot &&
+           a.a.steer_slot_alpha == b.a.steer_slot_alpha && std::memcmp(&a.a.steer_alpha, &b.a.steer_alpha, sizeof(float)) == 0;
 }
 // an S2 layer i after make_layer (s2_layer): the head-count check, G6_QA_SPLIT narrowing as layer_base, the MoE
 // finalize's shared-scope steering (k1_steer, refused unless it equals today's layer `base` of the same M), and the

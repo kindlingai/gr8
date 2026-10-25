@@ -1,4 +1,4 @@
-"""Validate a local steering directory against the resolved model before rank preparation."""
+"""Validate local steering directories against the resolved model before rank preparation."""
 import json
 import os
 import sys
@@ -12,8 +12,9 @@ import options
 
 
 def prepare(o, ms):
-    directory = o.get('STEERING_PROFILE')
-    if not directory:
+    """-> the manifests of STEERING_PROFILE's comma-separated directories, in order (None without a profile)."""
+    directories = o.get('STEERING_PROFILE')
+    if not directories:
         return
     try:
         template = os.path.join(ms.tokenizer, 'chat_template.jinja')
@@ -49,9 +50,19 @@ def prepare(o, ms):
         expected = {'name': 'glm-5.3', 'revision': o.get('STEERING_MODEL_REVISION'),
                     'weight_set': weights, 'tokenizer_revision': o.get('STEERING_TOKENIZER_REVISION'),
                     'chat_template_sha256': actual_template, 'hidden_size': 6144, 'layer_count': 78}
-        manifest = release.validate_directory(directory, expected)
+        manifests = []
+        for directory in directories.split(','):
+            try:
+                manifests.append(release.validate_directory(directory, expected))
+            except release.ProfileError as e:
+                raise ValueError(f'{directory}: {e}') from None
+        names = [m['profile_name'] for m in manifests]
+        if len(set(names)) != len(names):
+            raise ValueError('two profiles have one profile_name')
+        if len({m['scope'] for m in manifests}) != 1:
+            raise ValueError('the profiles differ in scope')
         o.values['STEERING_WEIGHT_SET'] = weights
         o.values['STEERING_CHAT_TEMPLATE'] = template
-        return manifest
+        return manifests
     except (OSError, ValueError, release.ProfileError) as e:
-        raise modelset.ModelError(f'--steering-profile {directory}: {e}') from None
+        raise modelset.ModelError(f'--steering-profile {directories}: {e}') from None

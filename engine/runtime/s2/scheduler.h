@@ -19,7 +19,8 @@ constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
 // The control link's version: the frame magic is "G6S2E" + this digit (control_protocol.h) and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
-constexpr unsigned CONTROL_VERSION = 9;
+// 10 adds the steering profile slot.
+constexpr unsigned CONTROL_VERSION = 10;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -76,10 +77,12 @@ struct Config {
         require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
         require(!cp_step_rows || cp_step_rows >= mtp + 1, "cp_step_rows must be 0 or at least one session's verify (mtp + 1)");
         require(!cp_seg || cp_step_rows, "cp_seg needs cp_step_rows");
-        require(!steering.loaded || (g6rt::steering::valid_profile_name(steering.profile_name) && steering.active_layers &&
-                (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full)),
+        require(steering.loaded == !steering.profiles.empty() && steering.profiles.size() <= g6rt::steering::PROFILES_MAX &&
+                (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full),
                 "invalid loaded steering receipt");
-        require(!steering.forced || steering.loaded, "forced steering needs a loaded profile");
+        for (const auto& p : steering.profiles)
+            require(g6rt::steering::valid_profile_name(p.name) && p.active_layers, "invalid loaded steering receipt");
+        require(!steering.forced || steering.profiles.size() == 1, "forced steering needs exactly one loaded profile");
         if (steering.forced) {
             const float scale = g6rt::steering::bits_float(steering.forced_scale_bits);
             require(std::isfinite(scale) && scale > 0.f && scale <= g6rt::steering::SCALE_MAX,

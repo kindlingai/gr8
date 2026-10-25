@@ -643,7 +643,10 @@ __device__ __forceinline__ bool tr3_fin_body(const K1Args& A, int plan)
     }
     __syncthreads();
     const float scale = A.steer_scale ? A.steer_scale[m] : 0.f;
-    const bool steer = A.steer_dir && scale != 0.f && A.steer_alpha != 0.f;
+    const int slot = A.steer_slot ? A.steer_slot[m] : 0;
+    const float alpha = A.steer_slot ? A.steer_slot_alpha[slot] : A.steer_alpha;
+    const float* sdir = A.steer_dir + (size_t)slot * HID;
+    const bool steer = A.steer_dir && scale != 0.f && alpha != 0.f;
     __shared__ int steer_last;
     __shared__ float steer_kappa;
     if (warp == 0)
@@ -669,7 +672,7 @@ __device__ __forceinline__ bool tr3_fin_body(const K1Args& A, int plan)
         // through warp 0; the existing finalize launch and slot publish remain unchanged.
         if (steer)
         {
-            const float4 r = *reinterpret_cast<const float4*>(A.steer_dir + n0);
+            const float4 r = *reinterpret_cast<const float4*>(sdir + n0);
             float dot = shared.x * r.x + shared.y * r.y + shared.z * r.z + shared.w * r.w;
             #pragma unroll
             for (int d = 16; d > 0; d >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, d);
@@ -687,7 +690,7 @@ __device__ __forceinline__ bool tr3_fin_body(const K1Args& A, int plan)
                     float total = 0.f;
                     #pragma unroll
                     for (int j = 0; j < 48; ++j) total += partial[j];
-                    steer_kappa = (scale * A.steer_alpha) * total;
+                    steer_kappa = (scale * alpha) * total;
                 }
             }
         }
@@ -699,7 +702,7 @@ __device__ __forceinline__ bool tr3_fin_body(const K1Args& A, int plan)
         const float kappa = steer_kappa;
         for (int c = threadIdx.x * 4; c < HID; c += blockDim.x * 4)
         {
-            const float4 d = *reinterpret_cast<const float4*>(A.steer_dir + c);
+            const float4 d = *reinterpret_cast<const float4*>(sdir + c);
             if (A.out_bf16)
             {
                 __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(K1_OUT(A) + (size_t)m * HID + c);

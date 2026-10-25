@@ -75,6 +75,16 @@ static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FIL
     a.z=mem.alloc<__half>(size_t(nslots+nsh)*B*8*HID);
     a.ypart=mem.alloc<__half>(size_t(M+1)*HID); a.out=mem.alloc<__half>(guarded);
     auto d=direction(); auto* dd=mem.alloc<float>(HID); put(dd,d); auto* ds=mem.alloc<float>(M);
+    // modes 7 and 8: two loaded profiles, odd rows on slot 1 (direction d2); in mode 8 slot 0 leaves the layer out
+    std::vector<float> d2(HID), table(2*HID);
+    for(int c=0;c<HID;++c) d2[c]=float((c%5)-2)/std::sqrt(2.f*HID);
+    std::copy(d.begin(),d.end(),table.begin()); std::copy(d2.begin(),d2.end(),table.begin()+HID);
+    auto* dt=mem.alloc<float>(2*HID); put(dt,table);
+    std::vector<int> row_slots(M); for(int m=0;m<M;++m) row_slots[m]=m%2;
+    auto* dslot=mem.alloc<int>(M); put(dslot,row_slots);
+    const std::vector<float> slot_alphas={mode==8 ? 0.f:.625f,.9f};
+    auto* dalpha=mem.alloc<float>(2); put(dalpha,slot_alphas);
+    const bool two=mode>=7;
     auto* parts=mem.alloc<float>(size_t(M+1)*48); auto* counts=mem.alloc<unsigned>(M+1);
     std::vector<float> ps(size_t(M+1)*48,-123.f); put(parts,ps);
     std::vector<unsigned> ct(M+1,0); ct[M]=0xabcdefu; put(counts,ct);
@@ -102,12 +112,13 @@ static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FIL
         put(a.z,z); put(a.ypart,ys); CK(cudaMemsetAsync(a.out,0x5a,guarded*2,producer));
         std::vector<float> scales(M,0.f);
         for(int m=0;m<M;++m) scales[m]=mode==1 ? .75f:mode==2 && m%2 ? 1.25f:0.f;
-        if(mode==3 || mode==4 || mode==5) std::fill(scales.begin(),scales.end(),1.f);
+        if(mode==3 || mode==4 || mode==5 || two) std::fill(scales.begin(),scales.end(),1.f);
         put(ds,scales);
         const float alpha=mode==5 ? 0.f:.625f;
 #ifndef G6_STEERING_TEST_BASELINE
         a.steer_dir=mode==3 || mode==5 ? reinterpret_cast<const float*>(uintptr_t(1)):mode==4 ? nullptr:dd;
         a.steer_scale=mode==6 ? nullptr:ds; a.steer_alpha=alpha; a.steer_part=parts; a.steer_count=counts;
+        if(two) { a.steer_dir=dt; a.steer_slot=dslot; a.steer_slot_alpha=dalpha; }
         if(mode==3) { std::fill(scales.begin(),scales.end(),0.f); put(ds,scales); }
 #else
         std::fill(scales.begin(),scales.end(),0.f);
@@ -165,12 +176,14 @@ static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FIL
                 }
                 for(int c=0;c<HID;++c) { if(group==4) shared[c]=sum[c]; else routed[c]+=sum[c]; }
             }
-            double dot=0; for(int c=0;c<HID;++c) dot+=double(shared[c])*d[c];
-            const bool selected=mode!=3 && mode!=4 && mode!=6 && scales[m]!=0.f && alpha!=0.f;
+            const std::vector<float>& rd=two && m%2 ? d2:d;
+            const float ra=two ? slot_alphas[m%2]:alpha;
+            double dot=0; for(int c=0;c<HID;++c) dot+=double(shared[c])*rd[c];
+            const bool selected=mode!=3 && mode!=4 && mode!=6 && scales[m]!=0.f && ra!=0.f;
             if(!selected) off_exact &= std::memcmp(out.data()+size_t(m)*HID,stock_output.data()+size_t(m)*HID,HID*2)==0;
             for(int c=0;c<HID;++c) {
                 const float stock=decode(encode(routed[c]+shared[c],bf),bf);
-                want[size_t(m)*HID+c]=stock-(selected ? float(scales[m]*alpha*dot)*d[c]:0.f);
+                want[size_t(m)*HID+c]=stock-(selected ? float(scales[m]*ra*dot)*rd[c]:0.f);
             }
         }
         float error=0; check(close(out,want,bf,error),"decode projects only shared contribution; host transform/projection oracle");
@@ -179,7 +192,8 @@ static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FIL
         check(guard,"decode output guard row untouched");
         const auto got_count=get(counts,M+1); const auto got_parts=get(parts,ps.size());
         bool reset=got_count[M]==ct[M], scratch_guard=true;
-        for(int m=0;m<M;++m) { reset &= got_count[m]==0; const bool active=mode!=3 && mode!=4 && mode!=6 && scales[m]!=0 && alpha!=0;
+        for(int m=0;m<M;++m) { reset &= got_count[m]==0;
+            const bool active=mode!=3 && mode!=4 && mode!=6 && scales[m]!=0 && (two ? slot_alphas[m%2]:alpha)!=0;
             if(!active) for(int b=0;b<48;++b) scratch_guard &= got_parts[m*48+b]==ps[m*48+b];
         }
         for(int b=0;b<48;++b) scratch_guard &= got_parts[M*48+b]==ps[M*48+b];
@@ -274,7 +288,7 @@ int main(int argc,char** argv) {
 #ifndef DEC_SLOT
         if(slot) continue;
 #endif
-        for(int mode=0;mode<(dump ? 1:7);++mode) decode_case(sh,bf,M,slot,mode,dump ? 2:mode==1 || mode==2 ? 5:1,dump);
+        for(int mode=0;mode<(dump ? 1:9);++mode) decode_case(sh,bf,M,slot,mode,dump ? 2:mode==1 || mode==2 || mode>=7 ? 5:1,dump);
     }
     for(int M:{1,3,8,17,32}) for(bool sh:{false,true}) for(bool rs:{false,true}) for(bool bs:{false,true}) {
         if(!sh && bs) continue;

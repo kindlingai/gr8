@@ -15,7 +15,7 @@ struct Encoder {
         for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.profile_digest[i+k];u64(x);}
         u64(uint64_t(s.scope));
         for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.schedule_digest[i+k];u64(x);}
-        u64(s.scale_bits);
+        u64(s.scale_bits);u64(s.slot);
     }
 };
 struct Decoder {
@@ -32,7 +32,8 @@ struct Decoder {
         auto scope=u64();require(scope==uint64_t(g6rt::steering::Scope::Shared)||scope==uint64_t(g6rt::steering::Scope::Full),"invalid steering scope");s.scope=g6rt::steering::Scope(scope);
         for(unsigned i=0;i<32;i+=8){auto x=u64();for(int k=7;k>=0;--k){s.schedule_digest[i+k]=uint8_t(x);x>>=8;}}
         s.scale_bits=u32();const float scale=g6rt::steering::bits_float(s.scale_bits);
-        require(s.scale_bits&&std::isfinite(scale)&&scale>0&&scale<=g6rt::steering::SCALE_MAX,"invalid steering scale bits");return s;
+        require(s.scale_bits&&std::isfinite(scale)&&scale>0&&scale<=g6rt::steering::SCALE_MAX,"invalid steering scale bits");
+        s.slot=u32();require(s.slot<g6rt::steering::PROFILES_MAX,"invalid steering profile slot");return s;
     }
     void end(){require(i==b.size(),"trailing control metadata");}
 };

@@ -49,7 +49,7 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
   count comes from a live model of step cost and acceptance.
 - Prefix reuse: a request that continues an earlier conversation re-prefills only the new part. A continued 20K
   conversation takes 7.1 s instead of 17.3 s at TP=4.
-- Opt-in runtime steering: one validated rank-one profile can be selected per request across decode, prefill and target
+- Opt-in runtime steering: one of up to eight validated rank-one profiles can be selected per request across decode, prefill and target
   verification, with steering identity included in prefix reuse. The fused operator adds no CUDA launches to the
   production path. See [docs/STEERING.md](docs/STEERING.md).
 - Prefill attention split by query and head owner across ranks ([docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
@@ -190,9 +190,10 @@ read back as decode selects them ([Remote KV](#remote-kv)).
 - `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 513,536 against
   408,832; the fp8 default has since grown to 485,376 and int4 is not re-measured) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
-- `--steering-profile DIR` loads a local schema-v1 profile; with an HF model, `hf:default` or `hf:NAME` explicitly
-  selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select the loaded profile with
-  `steering_profile` and `steering_scale`; `--steering-force SCALE` is the process-wide qualification mode.
+- `--steering-profile DIR[,DIR...]` loads local schema-v1 profiles; with an HF model, `hf:default` or `hf:NAME`
+  explicitly selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select a loaded profile
+  by name with `steering_profile` and `steering_scale`; `--steering-force SCALE` (one profile) is the process-wide
+  qualification mode.
 - `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.
 
