@@ -1,0 +1,1 @@
+e2e check of CI_TRIGGER_TOKEN; closed without merging.
