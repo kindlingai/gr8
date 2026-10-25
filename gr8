@@ -28,6 +28,9 @@
 #                                     (engine/kvman-rs/REMOTE-TIER.md), announced in the mentat group; ./gr8 kv --help
 #   ./gr8 kv down | status [all] | logs [-f]
 #
+#   ./gr8 query [OPTIONS] PROMPT      one chat prompt streamed to the terminal, thinking dim (tools/query/query.py):
+#                                     --api URL, --steer PROFILE[:SCALE], --effort, --record/--replay FILE, --window 40x10
+#
 #   ./gr8 test [frontend|engine|all]  the CPU tests CI runs (.github/ci/cpu-tests.sh), all by default; docs/TESTING.md
 #   ./gr8 test pseudo TOKENIZER_DIR   the smoke test and the front end's API tests against the pseudo engine, no GPU
 #   ./gr8 test gpu [BIN_DIR]          the one-GPU unit tests (scripts/c1_tests.sh)
@@ -62,6 +65,7 @@ case $model in
   glm53f) build_model=flash ;;
   pseudo) build_model=pseudo ;;
   kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;
+  query) shift; exec python3 "$REPO/tools/query/query.py" "$@" ;;
   test)
     shift
     case ${1:-all} in
@@ -70,7 +74,7 @@ case $model in
       gpu) shift; exec bash "$SCRIPTS/c1_tests.sh" "$@" ;;
       *) echo "gr8: ./gr8 test [frontend|engine|all], ./gr8 test pseudo TOKENIZER_DIR or ./gr8 test gpu [BIN_DIR]" >&2; exit 2 ;;
     esac ;;
-  *) echo "gr8: the first argument names the model, glm53, glm53f or pseudo: ./gr8 glm53 <command> (or ./gr8 kv, ./gr8 test)" >&2; exit 2 ;;
+  *) echo "gr8: the first argument names the model, glm53, glm53f or pseudo: ./gr8 glm53 <command> (or ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
 esac
 shift
 export GR8_MODEL=$model   # tools/launch/options.py
