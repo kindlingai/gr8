@@ -202,8 +202,9 @@ def fetch_ranges(hub, out, path, size, ranges, workers, on_bytes=None):
     prog = Progress(out, os.path.basename(path))
     todo = [r for r in ranges if tuple(r) not in prog.done]
     got = 0
-    for r in sorted(todo):              # blocks in file order (see the module docstring)
-        os.posix_fallocate(fd, r[0], r[1])
+    if hasattr(os, 'posix_fallocate'):  # macOS has none: the file stays sparse there
+        for r in sorted(todo):          # blocks in file order (see the module docstring)
+            os.posix_fallocate(fd, r[0], r[1])
 
     def one(r):
         b = hub.get(path, r[0], r[1])

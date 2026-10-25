@@ -19,11 +19,16 @@
 #include <thread>
 #include <unistd.h>
 
-#if defined(__aarch64__) && (defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO))
+#if defined(__linux__) && defined(__aarch64__) && (defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO))
 #include <arm_neon.h>
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
 #define G6_ARM_SHA 1
+#endif
+#ifndef __linux__
+// macOS, where the front end's tests also build the loader: buffered reads (no O_DIRECT) and no page-cache hints.
+#define O_DIRECT 0
+#define posix_fadvise(fd, offset, len, advice) 0
 #endif
 
 namespace g6
@@ -382,7 +387,7 @@ bool Pack::load(const std::string& path, const LoadOpts& opt, LoadStats& st, std
     st.used_direct_io = false;
     if (!is_stdin)
     {
-        fd = opt.direct_io ? open(path.c_str(), O_RDONLY | O_DIRECT) : -1;
+        fd = opt.direct_io && O_DIRECT ? open(path.c_str(), O_RDONLY | O_DIRECT) : -1;
         if (fd >= 0) st.used_direct_io = true;
         else fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) { err = "cannot open " + path + ": " + strerror(errno); return false; }
@@ -395,7 +400,9 @@ bool Pack::load(const std::string& path, const LoadOpts& opt, LoadStats& st, std
         }
         if (!st.used_direct_io) posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     }
+#ifdef F_SETPIPE_SZ
     if (is_stdin) fcntl(fd, F_SETPIPE_SZ, 1 << 20);   // fewer, larger pipe reads when streamed over the fabric
+#endif
     constexpr size_t HUGE2M = 2ull << 20;
     if (base_) { free(base_); base_ = nullptr; }
     alloc_bytes_ = (pack_bytes_ + HUGE2M - 1) / HUGE2M * HUGE2M;
@@ -407,7 +414,9 @@ bool Pack::load(const std::string& path, const LoadOpts& opt, LoadStats& st, std
         return false;
     }
     base_ = (uint8_t*)mem;
+#ifdef MADV_HUGEPAGE
     madvise(base_, alloc_bytes_, MADV_HUGEPAGE);
+#endif
 
     std::atomic<uint64_t> done{0};
     std::atomic<bool> abort{false};

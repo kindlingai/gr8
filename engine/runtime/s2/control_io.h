@@ -27,7 +27,7 @@ class ControlIO {
     void send_all(const uint8_t* p, size_t n) {
         const size_t total = n;
         while (n) {
-            ssize_t k = ::send(fd_, p, n, MSG_NOSIGNAL);
+            ssize_t k = ::send(fd_, p, n, SEND_FLAGS);
             if (k < 0 && errno == EINTR) continue;
             if (k <= 0) log_disconnect("send", k, n, total);
             require(k > 0, "control send failed"); p += k; n -= size_t(k);
@@ -68,10 +68,10 @@ public:
         require(idle_s > 0 && intvl_s > 0 && cnt > 0, "invalid keepalive");
         const int on = 1; const unsigned user_ms = unsigned(idle_s + intvl_s * cnt) * 1000u;
         require(!setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on) &&
-                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof idle_s) &&
+                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPALIVE_IDLE, &idle_s, sizeof idle_s) &&
                 !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_s, sizeof intvl_s) &&
                 !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt) &&
-                !setsockopt(fd_, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_ms, sizeof user_ms), "control keepalive setup failed");
+                !set_user_timeout(fd_, user_ms), "control keepalive setup failed");
     }
     void send(const std::vector<uint8_t>& body) {
         require(!body.empty() && body.size() <= MAX_BYTES, "control frame size invalid");

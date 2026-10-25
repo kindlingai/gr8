@@ -46,7 +46,7 @@ inline sockaddr_in address(const std::string& ip, uint16_t port) {
     return a;
 }
 inline int listen_control(const std::string& ip, uint16_t port) {
-    Socket fd(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+    Socket fd(cloexec_socket(AF_INET, SOCK_STREAM, true));
     require(fd.get() >= 0, "control socket failed");
     int one = 1;
     require(!setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof one), "control reuseaddr failed");
@@ -58,7 +58,7 @@ inline std::unique_ptr<ControlIO> accept_control(int listener, unsigned timeout)
     auto end = deadline(timeout);
     for (;;) {
         socket_wait(listener, POLLIN, end);
-        Socket fd(::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC));
+        Socket fd(cloexec_accept(listener));
         if (fd.get() < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         require(fd.get() >= 0, "control accept failed");
         auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); return io; // dead peer seen in <= 30 s
@@ -67,7 +67,7 @@ inline std::unique_ptr<ControlIO> accept_control(int listener, unsigned timeout)
 inline std::unique_ptr<ControlIO> connect_control(const std::string& ip, uint16_t port, unsigned timeout) {
     const auto a = address(ip, port); const auto end = deadline(timeout);
     for (;;) {
-        Socket fd(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+        Socket fd(cloexec_socket(AF_INET, SOCK_STREAM, true));
         require(fd.get() >= 0, "control socket failed");
         int rc = ::connect(fd.get(), reinterpret_cast<const sockaddr*>(&a), sizeof a), error = 0;
         if (rc && errno == EINPROGRESS) {

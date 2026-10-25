@@ -167,7 +167,12 @@ struct PfTimes
         {
             timespec now;
             clock_gettime(CLOCK_REALTIME, &now);
-            const double ms = (now.tv_sec - st.st_mtim.tv_sec) * 1e3 + (now.tv_nsec - st.st_mtim.tv_nsec) * 1e-6;
+#ifdef __APPLE__
+            const timespec& m = st.st_mtimespec;
+#else
+            const timespec& m = st.st_mtim;
+#endif
+            const double ms = (now.tv_sec - m.tv_sec) * 1e3 + (now.tv_nsec - m.tv_nsec) * 1e-6;
             add("poll", ms);
         }
     }

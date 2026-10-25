@@ -64,7 +64,7 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved | anywhere | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
 | m4sim from the release against a PyTorch forward of the same weights | one GB10, transformers with `glm_moe_dsa` | `engine/ref/release_forward.py` |
 | the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`) | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
-| the launch end to end (four supervisors, stub engines) | Linux (it needs 127.0.0.2-4) | the line above runs it, and skips it elsewhere |
+| the launch end to end (four supervisors, stub engines) | Linux, or macOS after `sudo ifconfig lo0 alias 127.0.0.N up` for N = 2, 3, 4 | the line above runs it, and skips it without those addresses |
 
 A kernel or anything else that changes numerics gets an exactness or tolerance test against the path it replaces, and
 the PR says which and why a tolerance is safe.
