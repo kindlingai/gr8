@@ -50,6 +50,9 @@ def read(path):
 
 def running(pid):
     """Alive and not a zombie."""
+    if not os.path.isdir('/proc'):           # macOS
+        st = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(st) and not st.startswith('Z')
     try:
         with open(f'/proc/{pid}/stat') as f:
             return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
