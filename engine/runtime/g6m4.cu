@@ -760,6 +760,35 @@ int main(int argc, char** argv)
         if (!*e || *end || v < 0 || v > dfl::WIN) die("G6_DFL_REUSE_MIN: 0.." + std::to_string(dfl::WIN) + " rows");
         dfl_reuse_min = (int)v;
     }
+    // G6_NGRAM=<file> (s2_batch.h NgramSrc, ngram_lookup.h; default off; S5, #56): the GLM-distilled n-gram table
+    // (tools/ngram/ngram.py export) as a draft source for a solo DFlash2 session: a round verifies the table's chain
+    // instead of the drafter's drafts when it promises more tokens per verify ms. G6_NGRAM_KMAX (1..dflash-k, default
+    // dflash-k): the longest chain; G6_NGRAM_KMIN (default 2); G6_NGRAM_MARGIN (default 0.1); G6_NGRAM_LOG=1: one line per
+    // round it takes (rank 0). Drafts only: the target decides every token. In the S2 runtime signature
+    g6rt::NgramTable ngram_tab;
+    s2::NgramSrc ngram;
+    if (const char* e = getenv("G6_NGRAM"); e && *e)
+    {
+        if (!(dfl && s2mode)) die("G6_NGRAM needs --dflash-manifest and --serve");
+        std::ifstream f(e);
+        if (!f) die(std::string("G6_NGRAM: cannot read ") + e);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::string err;
+        if (!ngram_tab.parse(text, &err)) die("G6_NGRAM: " + err);
+        ngram.t = &ngram_tab;
+        ngram.kmax = getenv("G6_NGRAM_KMAX") ? atoi(getenv("G6_NGRAM_KMAX")) : dfl_k;
+        ngram.kmin = getenv("G6_NGRAM_KMIN") ? atoi(getenv("G6_NGRAM_KMIN")) : 2;
+        if (const char* m = getenv("G6_NGRAM_MARGIN")) ngram.margin = atof(m);
+        ngram.log = getenv("G6_NGRAM_LOG") && atoi(getenv("G6_NGRAM_LOG")) && cfg.rank == 0;
+        if (ngram.kmin < 1 || ngram.kmax < ngram.kmin || ngram.kmax > dfl_k || !std::isfinite(ngram.margin))
+            die("G6_NGRAM: 1 <= G6_NGRAM_KMIN <= G6_NGRAM_KMAX <= --dflash-k, G6_NGRAM_MARGIN a number");
+        fprintf(stderr, "# rank %d: ngram table: %zu entries, ns", cfg.rank, ngram_tab.t.size());
+        for (int n : ngram_tab.ns) fprintf(stderr, " %d", n);
+        fprintf(stderr, ", %s, digest %016llx; chains %d..%d, margin %.3f\n", ngram_tab.has_cal ? "calibrated" : "raw probabilities",
+                (unsigned long long)ngram_tab.digest, ngram.kmin, ngram.kmax, ngram.margin);
+        for (int M = 2; M <= ngram.kmax + 1; ++M)   // a chain's solo verify of k + 1 rows, class row_class(k + 1)
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+    }
     // G6_DRAFT_PAR=1|2 (s2_batch.h draft_par_env; default 0): a solo DFlash2 round's drafter step runs on its own stream
     // under the MTP first form (and the chain on MTP rounds). 2: a drafting step goes on a high-priority stream (its CTAs
     // are dispatched first while both wait), a context-only step stays at the default priority. Each graph's bytes are as
@@ -2312,6 +2341,7 @@ int main(int argc, char** argv)
                 }
                 h.dfl_reuse.mode = dfl_reuse;
                 h.dfl_reuse.min = dfl_reuse_min;
+                h.ngram = ngram;
                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
                                                  dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
@@ -2406,7 +2436,7 @@ int main(int argc, char** argv)
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
                 (set_id.empty() ? "" : " set " + set_id) + (g6rt::grammar_ready() ? " grammar" : "") +
-                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") +
+                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") + s2::ngram_sig(ngram) +
                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
                 (draft_par ? " draftpar " + std::to_string(draft_par) : "") +

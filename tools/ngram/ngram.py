@@ -19,6 +19,7 @@ verify times by row count (2200 MHz, DFlash2 verify steps); a lookup costs no GP
     python3 tools/ngram/ngram.py import-kl-ref bench/gate/refs/tp4.json --out traces.jsonl
     python3 tools/ngram/ngram.py replay traces.jsonl --folds 5 [--json out.json]
     python3 tools/ngram/ngram.py sizes traces.jsonl --floors 0.3,0.5,0.7,0.9
+    python3 tools/ngram/ngram.py export traces.jsonl --out ngram.tab     # the engine's table (G6_NGRAM)
 """
 import argparse
 import heapq
@@ -227,6 +228,99 @@ def accept(nodes, truth):
     return best
 
 
+# ---------------------------------------------------------------- the engine's table (G6_NGRAM, engine/runtime/ngram_lookup.h)
+# The engine proposes chains: only each entry's top token is exported. Its stored probability is calibrated: cal[b] is
+# the share of held-out chain tokens whose stored probability fell in bucket b that GLM produced, given the tokens before
+# them in the chain were right (the replay showed the raw means overestimate acceptance by 30-60%).
+
+CAL_EDGES = (0.2, 0.4, 0.6, 0.75, 0.88, 0.95, 0.99)     # = spec_len.h SpecLen::bucket, ngram_lookup.h NgramTable::bucket
+
+
+def bucket(p):
+    b = 0
+    while b < len(CAL_EDGES) and p >= CAL_EDGES[b]:
+        b += 1
+    return b
+
+
+def calibrate(traces, k=5, seed=0, kmax=7, prior=4.0, **table_kw):
+    """Held out by prompt as replay(): per bucket of a chain token's stored probability, (offered, accepted) counts and
+    the calibrated acceptance (shrunk toward the bucket's lower edge by `prior` pseudo-counts, so a thin bucket errs
+    low). Rounds walk as replay's chain source with every row filled."""
+    n, a = [0] * 8, [0] * 8
+    for train, test in folds(traces, k, seed):
+        t = build(train, **table_kw)
+        for tr in test:
+            gen, ctx, pos = tr['gen'], list(tr['prompt']), 0
+            while pos < len(gen):
+                nodes, prev, acc = chain(t, ctx, kmax), 1.0, 0
+                for j, (_, tok, path) in enumerate(nodes):
+                    if pos + j >= len(gen):
+                        break
+                    b = bucket(path / prev)
+                    prev = path
+                    n[b] += 1
+                    if gen[pos + j] != tok:
+                        break
+                    a[b] += 1
+                    acc += 1
+                commit = min(acc + 1, len(gen) - pos)
+                ctx.extend(gen[pos:pos + commit])
+                pos += commit
+    lo = (0.0,) + CAL_EDGES
+    cal = [(a[b] + prior * lo[b]) / (n[b] + prior) for b in range(8)]
+    return n, a, cal
+
+
+def export(table, cal, path):
+    """Write the engine's table: top token per entry, entries sorted (the file's bytes, and so its digest, depend only
+    on the table)."""
+    with open(path, 'w') as f:
+        f.write('# GLM-distilled n-gram table (tools/ngram/ngram.py export); engine/runtime/ngram_lookup.h reads it\n')
+        f.write('g6ngram 1\n')
+        f.write('ns ' + ' '.join(map(str, table.ns)) + '\n')
+        f.write('cal ' + (' '.join(f'{c:.4f}' for c in cal) if cal else 'none') + '\n')
+        for n in table.ns:
+            for key in sorted(table.t[n]):
+                tok, p, _ = table.t[n][key][0]
+                f.write(f'e {n} ' + ' '.join(map(str, key)) + f' {tok} {min(max(p, 1e-6), 1.0):.6f}\n')
+
+
+def read_export(path):
+    """-> (ns, cal or None, {(n, key): (tok, p)}): the file as ngram_lookup.h reads it (tests)."""
+    ns, cal, t = None, None, {}
+    with open(path) as f:
+        lines = [x.split() for x in f if x.strip() and not x.startswith('#')]
+    if lines[0] != ['g6ngram', '1']:
+        raise ValueError('not a g6ngram 1 file')
+    for x in lines[1:]:
+        if x[0] == 'ns':
+            ns = tuple(int(v) for v in x[1:])
+        elif x[0] == 'cal':
+            cal = None if x[1] == 'none' else [float(v) for v in x[1:]]
+        elif x[0] == 'e':
+            n = int(x[1])
+            t[(n, tuple(int(v) for v in x[2:2 + n]))] = (int(x[2 + n]), float(x[3 + n]))
+    return ns, cal, t
+
+
+def engine_chain(ns, cal, t, ctx, kmax):
+    """ngram_lookup.h NgramTable::chain on a read_export() table: tokens and calibrated conditionals."""
+    out, c, w = [], [], list(ctx[-ns[0]:])
+    while len(out) < kmax:
+        hit = None
+        for n in ns:
+            if len(w) >= n and (n, tuple(w[-n:])) in t:
+                hit = t[(n, tuple(w[-n:]))]
+                break
+        if not hit:
+            break
+        out.append(hit[0])
+        c.append(cal[bucket(hit[1])] if cal else hit[1])
+        w.append(hit[0])
+    return out, c
+
+
 # ---------------------------------------------------------------- replay
 
 SOURCES = ('prompt', 'chain', 'tree', 'chain+prompt', 'tree+prompt')
@@ -367,7 +461,7 @@ def main(argv=None):
     p = sub.add_parser('import-kl-ref', help='a bench/gate kl-ref file -> traces')
     p.add_argument('ref')
     p.add_argument('--out', required=True)
-    for name in ('replay', 'sizes'):
+    for name in ('replay', 'sizes', 'export'):
         p = sub.add_parser(name)
         p.add_argument('traces', nargs='+')
         p.add_argument('--ns', default='8,6,4,3', help='context lengths, with backoff from the longest')
@@ -384,6 +478,8 @@ def main(argv=None):
     sub.choices['sizes'].add_argument('--floors', default='0.1,0.3,0.5,0.7,0.9')
     sub.choices['sizes'].add_argument('--widths', default='', help='also sweep these widths (at --floor)')
     sub.choices['sizes'].add_argument('--ns-list', default='', help='also sweep these ns sets, e.g. "8,6,4,3;4,3;3"')
+    sub.choices['export'].add_argument('--out', required=True, help="the engine's table file (G6_NGRAM)")
+    sub.choices['export'].add_argument('--no-cal', action='store_true', help='write the raw mean probabilities (cal none)')
     a = ap.parse_args(argv)
 
     if a.cmd == 'import-kl-ref':
@@ -397,6 +493,18 @@ def main(argv=None):
     ns = tuple(int(x) for x in a.ns.split(','))
     kw = dict(ns=ns, width=a.width, min_count=a.min_count)
     print(f'{len(traces)} traces, {sum(len(t["gen"]) for t in traces)} generated positions, {a.folds} folds')
+    if a.cmd == 'export':
+        table = build(traces, ns=ns, width=a.width, floor=a.floor, min_count=a.min_count)
+        cal = None
+        if not a.no_cal:
+            n, acc, cal = calibrate(traces, a.folds, a.seed, ns=ns, width=a.width, floor=a.floor, min_count=a.min_count)
+            print('| bucket from | chain tokens | accepted | calibrated |')
+            print('|---|---|---|---|')
+            for b, lo in enumerate((0.0,) + CAL_EDGES):
+                print(f'| {lo} | {n[b]} | {acc[b]} | {cal[b]:.3f} |')
+        export(table, cal, a.out)
+        print(f'{sum(table.entries().values())} entries -> {a.out}')
+        return 0
     if a.cmd == 'sizes':
         print('| ns | width | floor | entries (mean per fold) | packed MB | chain hit % (8 rows) '
               '| tokens / round (chain, 8 rows) |')

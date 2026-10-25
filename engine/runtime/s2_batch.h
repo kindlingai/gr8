@@ -46,6 +46,11 @@
 // prompt steps are, each followed by its first-form draft, the last row sampling the token after them. Then the chain.
 // Rows the verify wrote past the cut are rewritten later, as rejected drafts' rows are. The rule is a function of the
 // committed tokens alone, so every rank cuts at the same token.
+// N-gram lookup (Batch::ngram, G6_NGRAM; S5, #56): before a solo DFlash2 session's verify (either drafter), the GLM-distilled
+// table (ngram_lookup.h) proposes a chain after the committed tokens. When the chain's expected tokens per verify ms
+// (its calibrated probabilities, the verify table) beat the drafter's by NgramSrc::margin, the round verifies the chain
+// instead of the drafter's drafts; the rest of the round (first form, drafter step, chain) runs as before on the
+// committed tokens. The drafter estimates learn nothing from such a round. Every input is the same on every rank.
 // Within a step the sessions are in ascending index and each session's rows are contiguous, in position order.
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
@@ -61,6 +66,7 @@
 #include <utility>
 #include <vector>
 #include "insert_rule.h"
+#include "ngram_lookup.h"
 #include "spec_len.h"
 
 namespace s2
@@ -116,6 +122,7 @@ struct Stats
     long rounds = 0, tokens = 0, drafted = 0;
     long mtp_rounds = 0, switches = 0;    // drafter choice: a DFlash2 session's rounds on MTP, drafter switches
     long inserted = 0;                // tokens the insert rule put in
+    long ngram_rounds = 0, ngram_drafted = 0, ngram_acc = 0;   // G6_NGRAM: rounds that verified a table chain, its tokens, accepted
     std::vector<long> acc;            // [K+1] rounds by accepted drafts (K = 7 for a DFlash2 session)
     long dfl_rounds = 0;              // rounds that verified DFlash2 drafts
     // G6_DFL_REUSE (Batch::dfl_reuse, -1 = not set): where dfl_start filled the drafter from, the lowest position it held
@@ -402,6 +409,24 @@ struct DflReuse
     int mode = 0;
     int min = 256;
 };
+// G6_NGRAM=<table file> (every rank, read at boot; Batch::ngram): t = the table (null: off). kmax: the longest chain
+// verified (the engine captures verify widths 2..kmax + 1), kmin: the shortest worth a round, margin: how much more
+// tokens per verify ms the chain must promise than the drafter's drafts. log: one "# ngram" line per round it takes
+struct NgramSrc
+{
+    const g6rt::NgramTable* t = nullptr;
+    int kmax = 7, kmin = 2;
+    double margin = 0.1;
+    bool log = false;
+};
+// the src's part of the S2 runtime signature (every rank must take the same rounds); empty when off
+inline std::string ngram_sig(const NgramSrc& s)
+{
+    if (!s.t) return "";
+    char b[160];
+    snprintf(b, sizeof b, " ngram %016llx kmax %d kmin %d margin %.17g", (unsigned long long)s.t->digest, s.kmax, s.kmin, s.margin);
+    return b;
+}
 class Batch
 {
 public:
@@ -463,6 +488,11 @@ public:
         sel_.m.seed[3] = ks_.seed3;
     }
     void dfl_reuse(const DflReuse& r) { reuse_ = r; }
+    void ngram(const NgramSrc& n)
+    {
+        if (n.t && (n.kmin < 1 || n.kmax < n.kmin || n.kmax > DFL_B - 1)) throw std::runtime_error("s2: ngram: 1 <= kmin <= kmax <= 7");
+        ng_ = n;
+    }
     // G6_DFL_REUSE=2: session q, the only active one and drafting with MTP (it was not alone at its prompt tail, or was
     // demoted), takes the drafter before the next round: MTP rounds feed it the accepted rows as context from the
     // session's last token on, and once it holds reuse_.min rows the session drafts with DFlash2, as a new request starts.
@@ -675,8 +705,13 @@ private:
         const int base = (int)x.tokens.size() - 1;
         const bool m = x.mtp;
         double pe = 0;
-        const int k = m ? (ks_.mode ? kverify(x, &pe) : x.k) : dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
+        int k = m ? (ks_.mode ? kverify(x, &pe) : x.k) : dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
         const int* dr = m ? x.d.data() : x.dd;
+        int nd[DFL_B];                    // G6_NGRAM: the table's chain nd[1..nk], verified in place of the drafter's
+        double ne = 0, de = 0;
+        const int nk = ng_.t ? ngram_pick(x, base, m, k, pe, nd, &ne, &de) : 0;
+        const int kd = k;
+        if (nk) { dr = nd; k = nk; }
         Step v;
         v.kind = Step::MAIN;
         v.round = cur_round_; v.round_active = cur_active_;
@@ -684,16 +719,24 @@ private:
         std::vector<Row> rows;
         for (int r = 0; r <= k; ++r) rows.push_back(Row{q, r ? dr[r] : x.tokens[base], base + r, base + r + 1, -1});
         add_rows(v, q, rows, v.event);
-        v.cls = row_class(m && !ks_.mode ? K_ + 1 : k + 1);
+        v.cls = row_class(m && !ks_.mode && !nk ? K_ + 1 : k + 1);
         check(v);
         const std::vector<int> t = h_.run(v);
         int a = 0;
         while (a < k && dr[a + 1] == t[a]) ++a;
         int kept;
         const int c = commit(q, t.data(), a + 1, &kept);
-        if (!m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
-        if (sel_.on) score(x, k, a, t.data(), pe);
-        if (ks_.log)
+        if (!nk && !m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
+        if (!nk && sel_.on) score(x, k, a, t.data(), pe);
+        if (nk)
+        {
+            ngram_score(x, m, kd, a, t.data(), de);
+            ++stats_[q].ngram_rounds; stats_[q].ngram_drafted += k; stats_[q].ngram_acc += a;
+            if (ng_.log)
+                fprintf(stderr, "# ngram round %ld slot %d base %d k %d a %d expected %.3f drafter %s k %d expected %.3f\n", cur_round_, q,
+                        base, k, a, ne, m ? "mtp" : "dfl", kd, de);
+        }
+        if (ks_.log && !nk)
         {   // G6_MTP_LPLOG: the verified drafts' log-probabilities (MTP: every drafted one), and MTP's d[1] with whether
             // the target took it (t[0]); round = G6_S2_ROUNDLOG's round id
             const int n = m ? x.k : k;
@@ -708,7 +751,8 @@ private:
         if (h_.round) h_.round(q, stats_[q].rounds, base, a, k);
         ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
         ++x.rounds;
-        if (m) ++stats_[q].mtp_rounds;
+        if (nk) {}
+        else if (m) ++stats_[q].mtp_rounds;
         else ++stats_[q].dfl_rounds;
         if (h_.emit && h_.emit(q, &x.tokens[base + 1], c, 0)) { x.done = true; return; }
         // G6_DRAFT_PAR: the drafter choice reads nothing the first form writes, so it is made first and the drafter step
@@ -751,6 +795,43 @@ private:
         if (probe) { x.pb = base + a + 1; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
         if (!nm) x.pb = -1;
         if (nm && !par) kchain(q, v.event);
+    }
+    // G6_NGRAM: the table's chain after tokens[0..base] when it promises more tokens per verify ms than the drafter's k
+    // drafts (pe: their expected tokens when the policy that chose k computed it, else 0): its length (0: the drafter's),
+    // the chain in nd[1..], the expected tokens of both. Rank-invariant: the committed tokens, the table, the drafts'
+    // log-probabilities, accept counts and the fixed verify table
+    int ngram_pick(const St& x, int base, bool m, int k, double pe, int* nd, double* ne, double* de) const
+    {
+        double c[DFL_B];
+        const int n = ng_.t->chain(x.tokens.data(), base + 1, ng_.kmax, nd, c);
+        if (n < ng_.kmin) return 0;
+        int bk = 0;
+        double e = 1, s = 1, br = -1;
+        for (int j = 1; j <= n; ++j)
+        {
+            s *= c[j]; e += s;
+            const double r = e / dsl_.verify_ms(j + 1);
+            if (j >= ng_.kmin && r > br * (1 + 1e-9)) { br = r; bk = j; *ne = e; }
+        }
+        double ed = pe;
+        if (!(ed > 0)) (m ? sel_.m : dsl_).ratio(k, m ? x.dlm.data() : x.dl, k, &ed);
+        *de = ed;
+        return br > ed / dsl_.verify_ms(k + 1) * (1 + ng_.margin) ? bk : 0;
+    }
+    // G6_NGRAM: a round that verified the table's chain still teaches the drafter's estimates (else a drafter that the
+    // table once beat could never win the choice back): its kd drafts against the a + 1 target tokens the verify
+    // produced. When all a + 1 match, the rest is unknown and the estimates learn only those positions
+    void ngram_score(St& x, bool m, int kd, int a, const int* t, double de)
+    {
+        const int* dr = m ? x.d.data() : x.dd;
+        const float* lp = m ? x.dlm.data() : x.dl;
+        int b = 0;
+        while (b < kd && b < a + 1 && dr[b + 1] == t[b]) ++b;
+        const int ko = b == a + 1 ? b : std::min(b + 1, kd);   // positions offered: known right ones, and the first miss
+        if (!ko) return;
+        if (m) { if (sel_.on || ks_.mode == 2) sel_.m.observe(ko, b, ks_.mode ? lp : nullptr, de); return; }
+        if (dsl_.on) dsl_.observe(ko, b, lp, de);
+        if (sel_.on) sel_.d.observe(ko, b, lp, 0);
     }
     // the drafter of the next round (drafter choice, G6_DFL_REUSE warm-up) and this round's drafter step: the a + 1
     // committed rows as context, drafting when the next round is on DFlash2 or probes
@@ -1000,6 +1081,7 @@ private:
     DSel sel_;
     KStop ks_;
     DflReuse reuse_;
+    NgramSrc ng_;
     Ring ring_;
     S2Cost cost_;
     std::vector<g6rt::SpecLen> sl_ = std::vector<g6rt::SpecLen>(S2N_SLOTS);

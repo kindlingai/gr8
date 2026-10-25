@@ -128,6 +128,7 @@ public:
     void dsel(const s2::DSel& d) { batch_.dsel(d); }
     void kstop(const s2::KStop& k) { batch_.kstop(k); }
     void dfl_reuse(const s2::DflReuse& r) { batch_.dfl_reuse(r); }
+    void ngram(const s2::NgramSrc& n) { batch_.ngram(n); }
     void fail() { scheduler_.fail(); }
     void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
     void pool_digest(uint64_t d) { scheduler_.pool_digest(d); }

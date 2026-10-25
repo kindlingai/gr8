@@ -253,6 +253,11 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   # the drafter choice's frozen cost table (DSEL_MODEL, DSEL_TABLE; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${DSEL_MODEL:+ G6_S2_DSEL_MODEL=$DSEL_MODEL}"
   ENGINE_ENV="$ENGINE_ENV${DSEL_TABLE:+ G6_S2_DSEL_TABLE=$DSEL_TABLE}"
+  # the n-gram table as a draft source (NGRAM, NGRAM_KMAX, NGRAM_MARGIN; docs/SETTINGS.md, #56): off unless set.
+  # G6_NGRAM_KMIN and G6_NGRAM_LOG stay engine environment (G6ENV_X)
+  ENGINE_ENV="$ENGINE_ENV${NGRAM:+ G6_NGRAM=$NGRAM}"
+  ENGINE_ENV="$ENGINE_ENV${NGRAM_KMAX:+ G6_NGRAM_KMAX=$NGRAM_KMAX}"
+  ENGINE_ENV="$ENGINE_ENV${NGRAM_MARGIN:+ G6_NGRAM_MARGIN=$NGRAM_MARGIN}"
   # the per-session MTP confidence stop in shared rounds (MTP_KSTOPB, MTP_KSTOPB_KMIN, MTP_KSTOPB_TAU, MTP_KSTOPB_TAU_S;
   # docs/SETTINGS.md): off unless set. MTP_KSTOPB_TAU_S="1:0.7,0.7/2:0.7,0.8" sets G6_MTP_KSTOPB_TAU_S1 and _S2.
   # G6_MTP_KSTOPB_EXPLORE stays engine environment (G6ENV_X)

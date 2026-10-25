@@ -215,5 +215,79 @@ class CliTest(unittest.TestCase):
                 ng.load_traces(p)
 
 
+class ExportTest(unittest.TestCase):
+    """The engine's table (G6_NGRAM, engine/runtime/ngram_lookup.h)."""
+
+    def traces(self):
+        # 6 prompts; each continues the loop 3 4 1 2 ..., two of them with a detour where the table guesses wrong
+        out = []
+        for i in range(6):
+            g = [3, 4, 1, 2] * 5
+            if i % 3 == 0:
+                g[6] = 9
+            out.append(trace([50 + i, 1, 2], g, [[(t, 0.97), (9, 0.02)] for t in g]))
+        return out
+
+    def test_calibration_counts_and_shrinks(self):
+        n, a, cal = ng.calibrate(self.traces(), k=3, ns=(2,), floor=0.5)
+        self.assertLess(sum(a), sum(n))                  # the detours are counted as misses
+        for b in range(8):
+            if n[b]:
+                self.assertAlmostEqual(cal[b], (a[b] + 4 * ((0.0,) + ng.CAL_EDGES)[b]) / (n[b] + 4))   # shrunk to the edge
+        self.assertEqual(cal[0], 0.0)                    # an empty bucket keeps its lower edge
+        self.assertAlmostEqual(cal[3], 0.6)
+
+    def test_bucket_edges_match_spec_len(self):
+        h = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'engine', 'runtime',
+                         'spec_len.h')
+        with open(h) as f:
+            m = re.search(r'edge\[NB - 1\] = \{([^}]*)\}', f.read())
+        self.assertEqual(tuple(float(x) for x in m.group(1).split(',')), ng.CAL_EDGES)
+
+    def test_export_round_trip_and_cli(self):
+        tr = self.traces()
+        with tempfile.TemporaryDirectory() as d:
+            tp, out = os.path.join(d, 't.jsonl'), os.path.join(d, 'ngram.tab')
+            ng.save_traces(tp, tr)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(ng.main(['export', tp, '--ns', '4,2', '--floor', '0.5', '--folds', '3', '--out', out]), 0)
+            ns, cal, t = ng.read_export(out)
+            self.assertEqual(ns, (4, 2))
+            self.assertEqual(len(cal), 8)
+            self.assertEqual(t[(2, (3, 4))][0], 1)
+            toks, c = ng.engine_chain(ns, cal, t, [7, 1, 2], 5)
+            self.assertEqual(toks, [3, 4, 1, 2, 3])
+            self.assertEqual(c[0], cal[ng.bucket(t[(2, (1, 2))][1])])
+            with open(out) as f:
+                first = f.read()
+            with contextlib.redirect_stdout(io.StringIO()):
+                ng.main(['export', tp, '--ns', '4,2', '--floor', '0.5', '--folds', '3', '--out', out])
+            with open(out) as f:
+                self.assertEqual(f.read(), first)        # the same traces give the same bytes (the engine's digest)
+
+    def test_engine_reads_the_same_chains(self):
+        """With NGRAM_LOOKUP_CHECK set (a build of engine/runtime/tests/ngram_lookup_check.cpp): the C++ table gives
+        the chains engine_chain gives on the same file."""
+        exe = os.environ.get('NGRAM_LOOKUP_CHECK')
+        if not exe:
+            self.skipTest('NGRAM_LOOKUP_CHECK not set')
+        import subprocess
+        tr = self.traces()
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, 'ngram.tab')
+            n, a, cal = ng.calibrate(tr, k=3, ns=(4, 2), floor=0.3)
+            ng.export(ng.build(tr, ns=(4, 2), floor=0.3), cal, out)
+            ns, cal2, t = ng.read_export(out)
+            ctxs = [[7, 1, 2], [3, 4], [9], [2, 3, 4, 1, 2], [1, 2, 3, 4, 9]] + [x['prompt'] + x['gen'][:j]
+                                                                                 for x in tr for j in (0, 5, 7)]
+            res = subprocess.run([exe, out, '7'], input='\n'.join(' '.join(map(str, c)) for c in ctxs) + '\n',
+                                 capture_output=True, text=True, check=True)
+            got = res.stdout.split('\n')[:len(ctxs)]
+            for c, line in zip(ctxs, got):
+                toks, cc = ng.engine_chain(ns, cal2, t, c, 7)
+                self.assertEqual(line, ' '.join(f'{x}:{y:.6f}' for x, y in zip(toks, cc)), c)
+
+
 if __name__ == '__main__':
     unittest.main()
