@@ -59,7 +59,7 @@ def free_port():
         return s.getsockname()[1]
 
 
-@unittest.skipUnless(loopback_aliases(), 'needs 127.0.0.2..4 (Linux)')
+@unittest.skipUnless(loopback_aliases(), 'needs 127.0.0.2..4 (on macOS: sudo ifconfig lo0 alias 127.0.0.N up)')
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp(prefix='gr8e2e-')
