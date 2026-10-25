@@ -38,7 +38,12 @@ fi
 # (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
 # G6_XGRAMMAR=DIR names a source tree instead (the image's engine stages), G6_XGRAMMAR=0 builds without grammars.
 # Needs cmake; GLM-5.3 only
-if [ "${MODEL:-glm}" = flash ] || [ "${G6_XGRAMMAR:-}" = 0 ]; then
+GR_OFF=""
+if [ "${MODEL:-glm}" = flash ]; then GR_OFF="MODEL=flash"
+elif [ "${G6_TESTS:-1}" = only ]; then GR_OFF="G6_TESTS=only builds no engine"
+elif [ "${G6_XGRAMMAR:-}" = 0 ]; then GR_OFF="G6_XGRAMMAR=0"
+fi
+if [ -n "$GR_OFF" ]; then
   unset G6_XGRAMMAR
 elif [ -z "${G6_XGRAMMAR:-}" ] && command -v cargo > /dev/null 2>&1 && command -v cmake > /dev/null 2>&1; then
   F=$REPO/frontend/g6front-rs/Cargo.toml
@@ -48,6 +53,7 @@ elif [ -z "${G6_XGRAMMAR:-}" ] && command -v cargo > /dev/null 2>&1 && command -
   [ -n "$M" ] && [ -d "$(dirname "$M")/thirdparty/xgrammar" ] && G6_XGRAMMAR=$(dirname "$M")/thirdparty/xgrammar
 fi
 if [ -n "${G6_XGRAMMAR:-}" ]; then export G6_XGRAMMAR; echo "request grammars: XGrammar from $G6_XGRAMMAR"
+elif [ -n "$GR_OFF" ]; then echo "request grammars: off ($GR_OFF)"
 else echo "request grammars: off (no XGrammar source; it needs cargo and cmake, or G6_XGRAMMAR=DIR)"; fi
 G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi

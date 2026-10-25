@@ -84,6 +84,9 @@ COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
 COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
+
+# the two GLM engine stages add XGrammar; Flash and the tests build without it, so they do not wait for its stage
+FROM engine-src AS engine-src-glm
 COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
 COPY --from=xgrammar /out/libxgrammar.a /opt/xgrammar-lib/libxgrammar.a
 ENV G6_XGRAMMAR=/opt/xgrammar G6_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
@@ -93,7 +96,7 @@ ENV G6_XGRAMMAR=/opt/xgrammar G6_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
 # its objects and build-only binaries are dead weight in the CI cache.
 # G6_WIDTHS builds a subset (build.sh): CI passes one on a pull request and
 # leaves it empty, for all seven widths (1 2 3 4 5 6 8), on main and on tags.
-FROM engine-src AS engine
+FROM engine-src-glm AS engine
 ARG G6_WIDTHS=
 RUN G6_WIDTHS="$G6_WIDTHS" G6_TESTS=0 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4 ! -name m4sim -exec rm -rf {} +
@@ -110,7 +113,7 @@ RUN MODEL=flash scripts/build.sh /out/bin \
 
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
-FROM engine-src AS engine-int4
+FROM engine-src-glm AS engine-int4
 ARG G6_WIDTHS=
 RUN G6_WIDTHS="$G6_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
