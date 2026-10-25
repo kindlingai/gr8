@@ -2036,7 +2036,7 @@ struct Expert
                                       // dropped routes get tok_e -1, weights renormalize over the kept (k_pf_route). Host-side
                                       // only; kept after the pre-cut fields so their kernel offsets stay unchanged
     int pre_routed = 0;               // 1: tok_e / tok_w already hold every row (G6_PF_ROUTER_SPLIT: own rows routed here, the
-                                      // peers' rows copied in), so launch_route skips k_pf_route. Host-side only, LAST member
+                                      // peers' rows copied in), so launch_route skips k_pf_route. Host-side only, LAST member but Flash's q8 / hq / hs
 #if G6_MODEL_FLASH
     int q8 = 0;                       // G6_PF_Q8=1 (h16 + bs + hx): routed fc1 = k_pf_fc1q on MXFP8 rows hq / hs (k_pf_hxq)
     uint8_t* hq = nullptr;            // [M][HID] E4M3 of hx, one E8M0 scale per 32 k in hs [M][HID / 32]
