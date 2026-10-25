@@ -9,6 +9,7 @@
 #include "rank.cuh"
 #include "../attn/bind.h"
 #include "../attn/prefill-qo-bind.h"
+#include "../attn/ops.h"
 #include "qp_wire.h"
 #include <functional>
 

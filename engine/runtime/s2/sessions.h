@@ -32,6 +32,22 @@ inline g6rt::InsertRule parse_insert(const std::string& s) {
     require(!r.tokens.empty() && r.tokens.size() <= size_t(g6rt::INSERT_MAX), "invalid ins token count");
     return r;
 }
+// `gram <kind>:<strict>:<arm or -1>:<hex>` (grammar.h): kind 1 = JSON, 2 = the JSON schema whose UTF-8 bytes are <hex>
+inline g6rt::GrammarSpec parse_grammar(const std::string& s) {
+    g6rt::GrammarSpec g;
+    size_t c[3], at = 0;
+    for (auto& x : c) { x = s.find(':', at); require(x != std::string::npos, "invalid gram header"); at = x + 1; }
+    const auto kind = s.substr(0, c[0]), strict = s.substr(c[0] + 1, c[1] - c[0] - 1), arm = s.substr(c[1] + 1, c[2] - c[1] - 1);
+    require((kind == "1" || kind == "2") && (strict == "0" || strict == "1"), "invalid gram kind/strict");
+    g.kind = kind == "1" ? g6rt::GrammarSpec::JSON : g6rt::GrammarSpec::SCHEMA;
+    g.strict = strict == "1";
+    g.arm = arm == "-1" ? -1 : int(std::min<uint64_t>(number(arm), INT32_MAX));
+    const auto hex = s.substr(c[2] + 1);
+    require(hex.size() % 2 == 0 && (g.kind == g6rt::GrammarSpec::JSON) == hex.empty(), "invalid gram schema");
+    auto nib = [](char h) { require(isxdigit((unsigned char)h), "invalid gram hex"); return h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10; };
+    for (size_t i = 0; i < hex.size(); i += 2) g.schema.push_back(char(nib(hex[i]) << 4 | nib(hex[i + 1])));
+    return g;
+}
 inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {}) {
     const auto line = bytes.find('\n'); require(line != std::string::npos, "request missing prompt line");
     std::istringstream in(bytes.substr(0, line));
@@ -39,7 +55,8 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     require(bool(in >> k) && k == "n_gen" && bool(in >> gen >> k) && k == "temp" &&
             bool(in >> r.temp >> k) && k == "seed" && bool(in >> seed >> k) && k == "min" &&
             bool(in >> min >> k) && k == "stop" && bool(in >> stop), "invalid request header");
-    // optional, in this order: top_p <float>, lp <k>, plp <k>, sys <tokens>, ins <rule>, steer <profile> <canonical-fp32-hex>
+    // optional, in this order: top_p <float>, lp <k>, plp <k>, sys <tokens>, ins <rule>, gram <grammar>,
+    // steer <profile> <canonical-fp32-hex>
     auto next = [&] { if (!(in >> k)) k.clear(); };
     next();
     if (k == "top_p") { require(bool(in >> r.top_p), "invalid top_p header"); next(); }
@@ -47,6 +64,10 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     if (k == "plp") { require(bool(in >> r.plp) && r.plp >= 0 && r.plp <= g6rt::LP_MAX, "invalid plp header"); next(); }
     if (k == "sys") { require(bool(in >> r.sys) && r.sys >= 0 && r.sys <= INT32_MAX, "invalid sys header"); next(); }
     if (k == "ins") { std::string v; require(bool(in >> v), "invalid ins header"); r.ins = parse_insert(v); next(); }
+    if (k == "gram") {
+        std::string v; require(bool(in >> v), "invalid gram header"); r.gram = parse_grammar(v); next();
+        require(g6rt::grammar_ready(), "gram: the engine was started without --grammar-dir");
+    }
     g6rt::steering::RequestFields sf;
     if (k == "steer") {
         std::string name, bits; require(bool(in >> name >> bits), "invalid steering header"); next();
@@ -55,7 +76,7 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
         sf.has_profile = sf.has_scale = true; sf.profile = std::move(name);
         sf.scale = g6rt::steering::bits_float(scale);
     }
-    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins and steer)");
+    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)");
     require(!r.ins.on() || r.lp < 0, "ins with lp");
     r.steering = steering.resolve(sf);
     auto g = number(gen), sd = number(seed), mn = number(min);
@@ -72,6 +93,7 @@ struct Sampling { float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = 
 struct Session {
     Key key; uint64_t request = 0;
     Run run; Payload payload; Sampling sampling; g6rt::Emitter emitter;
+    g6rt::GrammarRef grammar;         // the reply's grammar (Payload::gram), on every rank; null = none
     bool bound = false, ended = false;
 };
 class Sessions {
@@ -93,7 +115,7 @@ public:
     static Request request(uint64_t id, const g6rt::ServeReq& r) {
         return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen), r.steering};
     }
-    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering}; }
+    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering, r.gram}; }
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;
     void bind(const Grant& g, const g6rt::ServeReq& r) {
@@ -105,6 +127,9 @@ public:
                 grant_pages_ok(config_, req, g.run.pages), "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
+        // the head compiled this grammar before queueing the request (Service::controller), so a failure here means
+        // the ranks disagree, and the epoch ends
+        if (r.gram.on()) s.grammar = g6rt::GrammarRef(g6rt::grammar_open(r.gram).release(), g6rt::GrammarDeleter{});
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
         require(!head_ || s.emitter.f, "cannot open S2 response");
         if (s.emitter.f) {
@@ -146,6 +171,7 @@ public:
             for (int i = 0; i < count; ++i) lps.push_back(logprob(row + i, false, s.sampling.lp));
         }
         const int before = s.emitter.emitted;
+        if (s.grammar) g6rt::grammar_commit(*s.grammar, ids, count);
         const bool done = s.emitter.push(ids, count, lps.empty() ? nullptr : lps.data()); output_ok(s.emitter);
         return {uint32_t(s.emitter.emitted - before), done};
     }

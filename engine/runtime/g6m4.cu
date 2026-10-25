@@ -67,6 +67,9 @@
 //                     (s2/service.h, head = rank 0 on the bootstrap address, port N); DIR is this rank's fresh S2 directory
 //                     (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2). Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3.
 //                     Without --serve the --prompt sequences run once and the process exits.
+//      [--grammar-dir DIR]  with --serve, in a build with XGrammar (G6_XGRAMMAR): requests may carry a grammar (gram,
+//                     grammar.h) compiled against DIR/tokenizer.json, its stop ids from DIR/generation_config.json. The
+//                     head writes grammar.s2 next to ready.s2, so the shim offers it
 //      [--qp-manifest PM --qp-pack PP]  (G6_NR=4) G6_PF_OWN=4 pair weights resident; or
 //                     G6_PF_QP_ROLL=S + G6_PF_QP_CTX=N: S rolling slots, the partner's half over RDMA (docs/DESIGN-QO-PAIR.md)
 //      [--dflash-manifest DM --dflash-pack DP [--dflash-sel 0|1] [--dflash-k K]]  replaces MTP with the DFlash2 block
@@ -180,6 +183,7 @@ int main(int argc, char** argv)
     bool image = false, hash = true, reuse_prefix = false;
     bool lanes_explicit = false;        // --pf-lanes given (common_arg parses it)
     std::string s2dir;                  // --serve DIR: serve through S2 (below R)
+    std::string grammar_dir;            // --grammar-dir DIR: request grammars (grammar.h)
     std::vector<std::string> kv_tiers;  // --kv-store (and the deprecated --kv-tier), in flag order
     std::string kv_keep;                // --kv-keep system|sessions|all
     int kv_system_after = 2;            // --kv-system-after
@@ -235,6 +239,7 @@ int main(int argc, char** argv)
         }
         else if (a == "--kv-shared-after") { kv_old = true; kv_system_after = atoi(next().c_str()); }
         else if (a == "--serve") s2dir = next();
+        else if (a == "--grammar-dir") grammar_dir = next();
         else if (a == "--s2-port") s2port = atoi(next().c_str());
         else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
         else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
@@ -552,6 +557,27 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), n) == row_counts.end()) row_counts.push_back(n);
 #endif
     const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
+    if (!grammar_dir.empty())
+    {
+        if (!s2mode) die("--grammar-dir needs --serve");
+#if G6_MODEL_FLASH
+        die("--grammar-dir: request grammars are GLM-5.3 only for now (Flash serves outside the S2 dispatch)");
+#endif
+#if !G6_GRAMMAR
+        // GRAMMAR defaults to 1, so a build without XGrammar serves without grammars: its hello leaves out
+        // `grammar`, and the front end sends none
+        fprintf(stderr, "# rank %d: --grammar-dir ignored: this engine was built without XGrammar (G6_XGRAMMAR)\n", R);
+        grammar_dir.clear();
+#endif
+    }
+    if (!grammar_dir.empty())
+    {
+        const std::string e = g6rt::grammar_init(grammar_dir, geom::VOCAB);
+        if (!e.empty()) die("--grammar-dir " + grammar_dir + ": " + e);
+        if (R == 0)
+            if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
+        fprintf(stderr, "# rank %d: request grammars from %s (%d mask words a row)\n", R, grammar_dir.c_str(), g6rt::grammar_words());
+    }
     // G6_PF_OWN=4 (TP4) env refusals before any CUDA / fabric work (qp_wire.h roll_env_refusal)
     const bool own4 = MP && getenv("G6_PF_OWN") && atoi(getenv("G6_PF_OWN")) == 4;
     std::string qre;
@@ -1244,6 +1270,19 @@ int main(int argc, char** argv)
     double pf_ms = 0;
     long pf_rows = 0;
     m.nc = nc; D.d.nc = nc;             // before any capture: the head kernels take it by value
+    if (grammar_ready())                // before any capture: the main head's grammar mask (rank.cuh k_grammar_mask)
+    {
+        m.gm_words = grammar_words();
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.gm_on_host), sizeof(int) * MX, cudaHostAllocMapped));
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.gm_bits_host), sizeof(uint32_t) * MX * m.gm_words, cudaHostAllocMapped));
+        memset(m.gm_on_host, 0, sizeof(int) * MX);
+        int* on;
+        uint32_t* bits;
+        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&on), m.gm_on_host, 0));
+        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&bits), m.gm_bits_host, 0));
+        m.gm_on = on;
+        m.gm_bits = bits;
+    }
     m.rs = plan.rs;                     // the target's verify steps only; the MTP layer's head stays as it is
     if (!pf_qo && !pf_qp)               // QO attention builds the decode RoPE table; without it absorb would take FP64 sincos
         if (int e = g6_attn_rope_init(cap, st)) die("g6_attn_rope_init failed (" + std::to_string(e) + ")");
@@ -2366,7 +2405,7 @@ int main(int argc, char** argv)
                 " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
-                (set_id.empty() ? "" : " set " + set_id) +
+                (set_id.empty() ? "" : " set " + set_id) + (g6rt::grammar_ready() ? " grammar" : "") +
                 (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") +
                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +

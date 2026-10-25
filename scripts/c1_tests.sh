@@ -75,7 +75,7 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = s2_attn_test ]; then
   [ "$TEST" = all ] && ARGS=()
   case "$FLAGS" in
-    *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
+    *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
     *) build_run s2_attn_test || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
   esac
 fi
@@ -88,7 +88,7 @@ if [ "$TEST" = all ] || [ "$TEST" = dec_heads_test ]; then
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kv4_test ]; then
   [ "$TEST" = all ] && ARGS=()
-  build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kvb8_test ]; then
   # kv_b (UK / UV) in FP8 (#50): decode and prefill outputs against the BF16 form of the same weights, byte for byte
@@ -103,7 +103,7 @@ if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
   [ "$TEST" = all ] && ARGS=()
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
-    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP canon_test: $why"
   fi
@@ -113,7 +113,7 @@ if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   [ "$TEST" = all ] && ARGS=()
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
-    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP kv_resize_test: $why"
   fi
@@ -124,7 +124,7 @@ if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
     GLM_FLAGS="$FLAGS"; FLAGS="$FLAGS -DG6_MODEL_FLASH=1"
-    KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
     FLAGS="$GLM_FLAGS"
   else
     echo "SKIP flash_kv_chunks_test: $why"

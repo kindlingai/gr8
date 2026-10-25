@@ -32,6 +32,21 @@ if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
   cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
 fi
+# request grammars (engine/runtime/grammar.h): XGrammar's C++, the copy the front end's xgrammar crate pins
+# (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
+# G6_XGRAMMAR=DIR names a source tree instead (the image's engine stages), G6_XGRAMMAR=0 builds without grammars.
+# Needs cmake; GLM-5.3 only
+if [ "${MODEL:-glm}" = flash ] || [ "${G6_XGRAMMAR:-}" = 0 ]; then
+  unset G6_XGRAMMAR
+elif [ -z "${G6_XGRAMMAR:-}" ] && command -v cargo > /dev/null 2>&1 && command -v cmake > /dev/null 2>&1; then
+  F=$REPO/frontend/g6front-rs/Cargo.toml
+  cargo fetch --quiet --manifest-path "$F" 2> /dev/null || true
+  M=$(cargo metadata --quiet --format-version 1 --manifest-path "$F" 2> /dev/null |
+      grep -o '"manifest_path":"[^"]*/xgrammar-[0-9][^"/]*/Cargo.toml"' | head -1 | sed 's/.*:"//; s/"$//')
+  [ -n "$M" ] && [ -d "$(dirname "$M")/thirdparty/xgrammar" ] && G6_XGRAMMAR=$(dirname "$M")/thirdparty/xgrammar
+fi
+if [ -n "${G6_XGRAMMAR:-}" ]; then export G6_XGRAMMAR; echo "request grammars: XGrammar from $G6_XGRAMMAR"
+else echo "request grammars: off (no XGrammar source; it needs cargo and cmake, or G6_XGRAMMAR=DIR)"; fi
 G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 # the KV node ./gr8 kv up runs
@@ -118,7 +133,7 @@ $NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -
 # an idle GPU and ~3-5 GB): $OUT/l2pf_bench (file header)
 $NVCC -O3 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
   -I "$REPO/engine/kernels" -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
-  "$REPO/engine/attn/bind.cu" -lcublas
+  "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas
 # the prefetch queues (G6_L2PF targets, G6_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
   -I "$REPO/engine/kernels" -o "$OUT/l2pf_queue_test" "$REPO/engine/kernels/tests/l2pf_queue_test.cu"

@@ -49,7 +49,7 @@ template <class F> static float time_ms(F f, int it = 200)
 int main(int argc, char** argv)
 {
     const bool bench = argc > 1 && !strcmp(argv[1], "--bench");
-    CK((cudaError_t)g6_attn_rope_init(4096, nullptr));      // as a decode boot: absorb reads the RoPE table
+    CK((cudaError_t)g6a_rope_init(4096, nullptr));      // as a decode boot: absorb reads the RoPE table
     std::mt19937 rng(7);
     std::uniform_real_distribution<float> uf(-1.f, 1.f);
     const int TOP = ga::TOP, PART = ga::PART, KVB = ga::KV_BYTES, PS = 64;

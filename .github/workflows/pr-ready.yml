@@ -69,6 +69,11 @@ jobs:
 
             // Start CI on the PR head: find its latest ci.yml run, approve it if it waits for approval, and re-run it
             // once its ready gate has turned it away. Waits up to 5 minutes for the gate; reports anything else.
+            // The org's Actions policy can refuse runs started by github-actions[bot]: GitHub accepts the re-run and
+            // fails it at startup a few seconds later. The bot watches for that and asks a maintainer to re-run the
+            // run themselves, which the policy allows.
+            const askHuman = (run, why) => say(`CI on ${run.head_sha.slice(0, 7)} is cleared to run, but ${why}. ` +
+              `A maintainer with write access can start it: open ${run.html_url} and choose **Re-run all jobs**.`);
             const rerunCI = async p => {
               const head = p.head.sha;
               let approved = false;
@@ -98,7 +103,7 @@ jobs:
                   continue;
                 }
                 if (run.conclusion === "startup_failure") {
-                  await say(`CI for ${head.slice(0, 7)} failed to start (${run.html_url}), so it cannot be re-run here.`);
+                  await askHuman(run, "its last start failed (the bot cannot start it)");
                   return;
                 }
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
@@ -110,8 +115,19 @@ jobs:
                     try {
                       await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
                     } catch (e) {
-                      await say(`Could not re-run CI for ${head.slice(0, 7)} (${e.message}): re-run ${run.html_url} by hand.`);
+                      await askHuman(run, `the bot could not re-run it (${e.message})`);
+                      return;
                     }
+                    for (let k = 0; k < 9; k++) {
+                      await sleep(10000);
+                      const now = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })).data;
+                      if (now.conclusion === "startup_failure") {
+                        await askHuman(run, "the org's Actions policy stopped the bot's re-run from starting");
+                        return;
+                      }
+                      if (now.status !== "completed") return;      // the re-run is running
+                    }
+                    await askHuman(run, "the bot's re-run has not started after 90 seconds");
                     return;
                   }
                 }

@@ -710,6 +710,7 @@ mod tests {
                 prompt_logprobs: None,
                 system_tokens: None,
                 insert: None,
+                grammar: None,
                 steering_profile: None,
                 steering_scale: None,
             },

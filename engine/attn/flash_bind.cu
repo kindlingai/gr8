@@ -29,20 +29,20 @@ constexpr int invalid = (int)cudaErrorInvalidValue;
 constexpr int SEL = g6kv::SEL, PAGE = g6kv::PAGE;
 }
 
-extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile) {
+extern "C" size_t g6a_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile) {
     if (capacity <= 0 || max_rows <= 0 || query_tile <= 0 || query_tile > 64 || capacity > INT_MAX / query_tile) return 0;
     G6Attn a{};
     a.rows = max_rows; a.context = capacity; a.heads = heads; a.page_size = PAGE;
     a.page_count = a.table_size = (int)(((int64_t)capacity + PAGE - 1) / PAGE);
     a.query_tile = query_tile;
-    return g6_attn_scratch_bytes(&a);
+    return g6a_scratch_bytes(&a);
 }
-extern "C" int g6_attn_bind_create(G6AttnBinding* out, const G6AttnPack* p,
+extern "C" int g6a_bind_create(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s) {
-    return g6_attn_bind_create_ext(out, p, rank, layer, capacity, max_rows, query_tile, s, nullptr, 0);
+    return g6a_bind_create_ext(out, p, rank, layer, capacity, max_rows, query_tile, s, nullptr, 0);
 }
 #if defined(G6_CP) && G6_CP
-extern "C" int g6_attn_bind_create_cp(G6AttnBinding*, const G6AttnPack*, int, int, int, int, int, int, int, void*, void*, size_t) {
+extern "C" int g6a_bind_create_cp(G6AttnBinding*, const G6AttnPack*, int, int, int, int, int, int, int, void*, void*, size_t) {
     return (int)cudaErrorNotSupported;
 }
 #endif
@@ -68,7 +68,7 @@ int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int cap
     a.query_tile = query_tile;
     a.kv_norm = p->kv_norm.data; a.uk = p->uk.data; a.uv = p->uv.data;
     a.index_norm = p->index_norm.data; a.index_bias = p->index_bias.data; a.index_ape = p->index_ape.data;
-    b.scratch_bytes = g6_attn_scratch_bytes(&a);
+    b.scratch_bytes = g6a_scratch_bytes(&a);
     if (!b.scratch_bytes || (ext_scratch && ext_bytes < b.scratch_bytes)) return invalid;
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
@@ -105,7 +105,7 @@ int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int cap
 }
 }
 
-extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
+extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
     return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, nullptr, nullptr);
 }
@@ -125,7 +125,7 @@ extern "C" uint32_t g6_flash_kv_chunk_pages(size_t granule) {
     return p > UINT32_MAX ? 0 : (uint32_t)p;
 }
 
-extern "C" int g6_attn_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, void* s) {
+extern "C" int g6a_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, void* s) {
     if (!b || !b->storage || !step || step->rows <= 0 || step->rows > b->max_rows ||
         step->context <= 0 || step->context > b->capacity || step->rows > step->context ||
         !step->q_b || !step->kv_a || !step->positions) return invalid;
@@ -146,11 +146,11 @@ extern "C" int g6_attn_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, vo
 #endif
     return (int)cudaMemsetAsync(a.error, 0, sizeof(unsigned), (cudaStream_t)s);
 }
-extern "C" int g6_attn_bind_run(G6AttnBinding* b, const G6AttnStep* step, void* s) {
-    int e = g6_attn_bind_prepare(b, step, s);
-    return e ? e : g6_attn_run(&b->args, b->scratch, b->scratch_bytes, s);
+extern "C" int g6a_bind_run(G6AttnBinding* b, const G6AttnStep* step, void* s) {
+    int e = g6a_bind_prepare(b, step, s);
+    return e ? e : g6a_run(&b->args, b->scratch, b->scratch_bytes, s);
 }
-extern "C" int g6_attn_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step,
+extern "C" int g6a_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step,
     G6AttnStepCell* cell, int captured_capacity, G6AttnReplay* out, void* s) {
     if (!b || !step || !cell || !out || captured_capacity < step->context ||
         captured_capacity <= 0 || captured_capacity > b->capacity) return invalid;
@@ -158,7 +158,7 @@ extern "C" int g6_attn_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step
     cudaError_t e = cudaPointerGetAttributes(&attr, cell);
     if (e != cudaSuccess) return (int)e;
     if (attr.type != cudaMemoryTypeDevice) return invalid;
-    int code = g6_attn_bind_prepare(b, step, s);
+    int code = g6a_bind_prepare(b, step, s);
     if (code) return code;
     G6AttnReplay r{};
     r.fixed = b->args;
@@ -167,7 +167,7 @@ extern "C" int g6_attn_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step
     *out = r;
     return 0;
 }
-extern "C" int g6_attn_bind_reset(G6AttnBinding* b, void* s) {
+extern "C" int g6a_bind_reset(G6AttnBinding* b, void* s) {
     if (!b || !b->storage) return invalid;
     const G6Attn& a = b->args;
     cudaStream_t stream = (cudaStream_t)s;
@@ -186,7 +186,7 @@ extern "C" int g6_attn_bind_reset(G6AttnBinding* b, void* s) {
     if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
     return (int)e;
 }
-extern "C" int g6_attn_bind_release(G6AttnBinding* b) {
+extern "C" int g6a_bind_release(G6AttnBinding* b) {
     if (!b) return invalid;
     cudaError_t e = b->storage ? cudaFree(b->storage) : cudaSuccess;
     if (e == cudaSuccess) *b = G6AttnBinding{};

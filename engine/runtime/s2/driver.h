@@ -5,6 +5,7 @@
 #include "scheduler.h"
 #include "cp_rows.h"
 #include "../s2_batch.h"
+#include "../grammar.h"
 
 namespace g6s2 {
 // decode_prompt: the whole prompt runs as decode steps from position 0, no tensor prefill (prompt logprobs)
@@ -12,6 +13,7 @@ struct Payload {
     std::vector<int> prompt; int chunk = 4; bool decode_prompt = false;
     g6rt::InsertRule ins;
     g6rt::steering::Identity steering{};
+    g6rt::GrammarSpec gram;
 };
 struct Emission { uint32_t count = 0; bool finished = false; };
 struct DriverHooks {

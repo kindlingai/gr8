@@ -54,7 +54,7 @@ int main(int argc,char** argv){
     // the live context arrives through the replay cell, as in the graph form (context = bucket capacity)
     G6AttnStepCell cell{L,pages,pages,0,1},*dcell;CK(cudaMalloc(&dcell,sizeof cell));CK(cudaMemcpy(dcell,&cell,sizeof cell,cudaMemcpyHostToDevice));
     ga::ReplayInput in{a,dcell};
-    size_t bytes=g6_attn_scratch_bytes(&a);void* scr;CK(cudaMalloc(&scr,bytes));auto W=ga::workspace(a,scr);
+    size_t bytes=g6a_scratch_bytes(&a);void* scr;CK(cudaMalloc(&scr,bytes));auto W=ga::workspace(a,scr);
     cudaStream_t st;CK(cudaStreamCreate(&st));
     auto hash=[&](std::vector<int>& ind){CK(cudaStreamSynchronize(st));CK(cudaMemcpy(ind.data(),dind,ind.size()*4,cudaMemcpyDeviceToHost));
         uint64_t h=1469598103934665603ull;for(int v:ind){h^=(uint32_t)v;h*=1099511628211ull;}return h;};

@@ -303,6 +303,18 @@ class Service {
             recall_ = 0; resizing_.store(true); event(c);
         }
     }
+    // A grammar that does not compile ends its request with an error before it is queued, so no request that asks
+    // for a grammar runs without one. The front end compiles each schema first and returns a 400 for one that fails.
+    // This catches a schema that compiles there but not with the engine's fixed layout (grammar.cc).
+    bool grammar_ok(uint64_t id, const g6rt::ServeReq& r) {
+        if (!r.gram.on()) return true;
+        try { g6rt::grammar_open(r.gram); return true; }
+        catch (const std::exception& e) {
+            fprintf(stderr, "# s2: request %llu: the grammar does not compile: %s\n", (unsigned long long)id, e.what());
+            atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+            return false;
+        }
+    }
     void controller() {
         uint64_t status_revision = UINT64_MAX;
         auto next_share = std::chrono::steady_clock::now();
@@ -332,6 +344,7 @@ class Service {
                 if (command->admit) {
                     auto bytes = ingress_.request(*command);
                     auto request = parse_request(bytes, c_.scheduler.steering);
+                    if (!grammar_ok(command->request, request)) continue;
                     queue_.push(Sessions::request(command->request, request)); commands_.emplace(command->request, *command);
                     payloads_.emplace(command->request, std::move(bytes));
                     if (reuse() && request.plp < 0) {

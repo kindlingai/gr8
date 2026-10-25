@@ -2,7 +2,7 @@
 // with one f32 scale per 128 x 128 block, sliced to one rank's heads as the loader slices it (engine/loader-rs/src/release.rs
 // kv_b_fp8: the E4M3 rows of UK / UV and each row's 4 block scales). The BF16 form of the same weights is BF16(e4m3 x
 // scale), what the BF16 loader stores.
-//   1. g6_attn_kvb_bf16 (the QO / pair-owner staging) against the host's BF16(e4m3 x scale): every byte.
+//   1. g6a_kvb_bf16 (the QO / pair-owner staging) against the host's BF16(e4m3 x scale): every byte.
 //   2. Two bindings of one layer, BF16 and FP8, on the same KV rows and queries: decode (g6_attn_bind_run) under each
 //      absorb / value_project variant (absorb_m / value_project_m, G6_AVP1, G6_ATTN_QT) and prefill
 //      (g6_attn_bind_prefill_run) must give byte-identical outputs.
@@ -21,6 +21,7 @@
 #include <vector>
 #include "../../attn/attn.cu"
 #include "../../attn/bind.h"
+#include "../../attn/ops.h"
 
 #define CK(x) do { const cudaError_t e_ = (x); if (e_ != cudaSuccess) { printf("CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_)); exit(2); } } while (0)
 #define CKI(x) do { const int e_ = (x); if (e_) { printf("call failed (%d) %s at %s:%d\n", e_, #x, __FILE__, __LINE__); exit(2); } } while (0)
@@ -57,7 +58,7 @@ int main(int argc, char** argv)
     if ((L - 2) % 4 == 0 || L <= 2 || L == 78) { printf("--layer: a shared-index layer (not 0-2, 78 or 2 + 4k)\n"); return 2; }
     std::mt19937_64 rng(seed);
     std::normal_distribution<float> g(0.f, 1.f);
-    CK((cudaError_t)g6_attn_rope_init(8192, nullptr));
+    CK((cudaError_t)g6a_rope_init(8192, nullptr));
     const int group = (0 - L % g6nr::NR + g6nr::NR) % g6nr::NR, H = g6nr::width(g6nr::HEADS, group), h0 = g6nr::start(g6nr::HEADS, group);
     printf("kvb8_test: NR %d, layer %d, heads %d (from %d), seed %llu\n", g6nr::NR, L, H, h0, seed);
 
@@ -93,10 +94,10 @@ int main(int argc, char** argv)
     {
         __nv_bfloat16* x = nullptr;
         CK(cudaMalloc(&x, uv8.size() * 2));
-        CKI(g6_attn_kvb_bf16(duk8, duks, x, H * 192, nullptr));
+        CKI(g6a_kvb_bf16(duk8, duks, x, H * 192, nullptr));
         CK(cudaDeviceSynchronize());
         check("g6_attn_kvb_bf16 UK = BF16(e4m3 x scale)", !memcmp(down(x, uk8.size()).data(), ukb.data(), uk8.size() * 2));
-        CKI(g6_attn_kvb_bf16(duv8, duvs, x, H * 256, nullptr));
+        CKI(g6a_kvb_bf16(duv8, duvs, x, H * 256, nullptr));
         CK(cudaDeviceSynchronize());
         check("g6_attn_kvb_bf16 UV = BF16(e4m3 x scale)", !memcmp(down(x, uv8.size()).data(), uvb.data(), uv8.size() * 2));
         CK(cudaFree(x));
@@ -115,15 +116,15 @@ int main(int argc, char** argv)
     {
         G6AttnPack bad = p8; bad.uvs = G6AttnTensor{};
         G6AttnBinding x{};
-        check("FP8 pack without UV scales is refused", g6_attn_bind_create(&x, &bad, 0, L, 4096, 8, 8, nullptr) != 0);
+        check("FP8 pack without UV scales is refused", g6a_bind_create(&x, &bad, 0, L, 4096, 8, 8, nullptr) != 0);
     }
     for (int T : {700, 3000})
         for (int M : {1, 3, 8, 24})
         {
             const int N = T + M, CAP = (N + 63) / 64 * 64 + 64, QT = std::min(M, 64);
             G6AttnBinding bb{}, b8{};
-            CKI(g6_attn_bind_create(&bb, &pb, 0, L, CAP, M, QT, nullptr));
-            CKI(g6_attn_bind_create(&b8, &p8, 0, L, CAP, M, QT, nullptr));
+            CKI(g6a_bind_create(&bb, &pb, 0, L, CAP, M, QT, nullptr));
+            CKI(g6a_bind_create(&b8, &p8, 0, L, CAP, M, QT, nullptr));
             check("FP8 binding holds less than the BF16 one", b8.storage_bytes < bb.storage_bytes);
             std::vector<__half> kva((size_t)N * 576), qb((size_t)M * H * 256);
             for (auto& x : kva) x = __float2half(g(rng));
@@ -138,7 +139,7 @@ int main(int argc, char** argv)
             {
                 G6Attn a = b->args;
                 a.rows = N; a.context = N; a.positions = dpos; a.kv_a = dkva; a.reuse_indices = dids; a.reuse_rows = M;
-                CKI(g6_attn_append(&a, nullptr));
+                CKI(g6a_append(&a, nullptr));
             }
             G6AttnStep s{};
             s.rows = M; s.context = N; s.q_b = dqb; s.kv_a = dkva + (size_t)T * 576; s.positions = dpos + T;
@@ -154,16 +155,16 @@ int main(int argc, char** argv)
                 snprintf(what, sizeof what, "%s T %d M %d: FP8 output = BF16 output", path, T, M);
                 check(what, e0 && !memcmp(ob.data(), o8.data(), no * 2));
             };
-            auto decode = [&](G6AttnBinding* b) { CKI(g6_attn_bind_run(b, &s, nullptr)); };
+            auto decode = [&](G6AttnBinding* b) { CKI(g6a_bind_run(b, &s, nullptr)); };
             both("decode", decode);
             ga::avp1_on() = 1; both("decode G6_AVP1", decode); ga::avp1_on() = 0;
             ga::attn_qt() = 1; ga::attn_sc2() = 4; both("decode G6_ATTN_QT", decode); ga::attn_qt() = 0; ga::attn_sc2() = 0;
             G6AttnPrefill *fb = nullptr, *f8 = nullptr;
-            CKI(g6_attn_bind_prefill_create(&fb, &bb, nullptr));
-            CKI(g6_attn_bind_prefill_create(&f8, &b8, nullptr));
-            both("prefill", [&](G6AttnBinding* b) { CKI(g6_attn_bind_prefill_run(b == &bb ? fb : f8, b, &s, nullptr)); });
-            CKI(g6_attn_bind_prefill_release(fb)); CKI(g6_attn_bind_prefill_release(f8));
-            CKI(g6_attn_bind_release(&bb)); CKI(g6_attn_bind_release(&b8));
+            CKI(g6a_bind_prefill_create(&fb, &bb, nullptr));
+            CKI(g6a_bind_prefill_create(&f8, &b8, nullptr));
+            both("prefill", [&](G6AttnBinding* b) { CKI(g6a_bind_prefill_run(b == &bb ? fb : f8, b, &s, nullptr)); });
+            CKI(g6a_bind_prefill_release(fb)); CKI(g6a_bind_prefill_release(f8));
+            CKI(g6a_bind_release(&bb)); CKI(g6a_bind_release(&b8));
             for (void* p : {(void*)dpos, (void*)dids, (void*)dkva, (void*)dqb}) CK(cudaFree(p));
         }
 
@@ -180,8 +181,8 @@ int main(int argc, char** argv)
         CK(cudaMalloc(&flush, FL));
         G6AttnBinding bb{}, b8{};
         const int MX = 32;
-        CKI(g6_attn_bind_create(&bb, &pb, 0, L, 4096, MX, MX, nullptr));
-        CKI(g6_attn_bind_create(&b8, &p8, 0, L, 4096, MX, MX, nullptr));
+        CKI(g6a_bind_create(&bb, &pb, 0, L, 4096, MX, MX, nullptr));
+        CKI(g6a_bind_create(&b8, &p8, 0, L, 4096, MX, MX, nullptr));
         std::vector<int> pos(MX);
         for (int i = 0; i < MX; ++i) pos[i] = 1000 + i;
         int* dpos = up(pos);
@@ -226,7 +227,7 @@ int main(int argc, char** argv)
                    saved * 78 / 1000, t[0][2], t[1][2]);
         }
         for (void* p : {(void*)dpos, (void*)dqb, (void*)q, (void*)rope, (void*)ctx, flush}) CK(cudaFree(p));
-        CKI(g6_attn_bind_release(&bb)); CKI(g6_attn_bind_release(&b8));
+        CKI(g6a_bind_release(&bb)); CKI(g6a_bind_release(&b8));
     }
     printf("kvb8_test: %d PASS, %d FAIL\n", passes, fails);
     return fails ? 1 : 0;

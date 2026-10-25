@@ -61,6 +61,10 @@ impl Engine {
         self.conn.lock().unwrap().hello.clone()
     }
 
+    /// The engine masks a reply with `generate`'s grammar (its hello says `"grammar": true`).
+    pub fn grammars(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("grammar") == Some(&Value::Bool(true)))
+    }
     /// The engine applies `generate`'s insert rule (its hello says `"insert": true`).
     pub fn inserts(&self) -> bool {
         self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))

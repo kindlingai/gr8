@@ -277,6 +277,7 @@ engine_args() {
   # left out.
   [ -n "${V2_DENSE:-}" ] && src="$src --v2-dense $V2_DENSE ${V2_DENSE_FORM:+--v2-dense-form $V2_DENSE_FORM}"
   [ -n "${LAYOUT:-}" ] && src="$src --layout $LAYOUT"   # the engine refuses it without --v2-dense
+  [ -n "${GRAMMAR_DIR:-}" ] && src="$src --grammar-dir $GRAMMAR_DIR"
   local dd=${DFLASH_DIR:-$ap}   # the drafter packs: with the other packs, or where the supervisor converted them
   [ "${DFLASH:-0}" = 1 ] && df="--dflash-manifest $dd/dflash.r$r.manifest.json --dflash-pack $dd/dflash.r$r.pack ${DFLASH_SEL:+--dflash-sel $DFLASH_SEL} ${DFLASH_K:+--dflash-k $DFLASH_K}"
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"

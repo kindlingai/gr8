@@ -1,6 +1,6 @@
 // cpgroups: G6_CP_ONECHAIN on one GPU. Past R every layer of a CP step runs, on each rank, the other ranks' head groups
 // over its own keys (rank.cuh launch_attn_cp, phase 1). Stock (G6_CP_S3=1, as served): per remote group k = 1..nr-1 a
-// k_vget of its q / rope from the q all-gather slot, g6_attn_cp_group (scores, cp_softmax, context parts, merge) of 16
+// k_vget of its q / rope from the q all-gather slot, g6a_cp_group (scores, cp_softmax, context parts, merge) of 16
 // heads, a k_vput of its partial. ONE: one k_vget_heads (the three payloads side by side), one g6_attn_cp_groups of 48
 // heads (each partial into its own block), the same three k_vput. The fabric is device memory here (the recv slots hold
 // what the peers' k_vput packed, the send slots are what this rank publishes; doorbells / tickets / error word in device
@@ -81,7 +81,7 @@ int main(int argc,char** argv){
         K=argc>6?atoi(argv[6]):16,TR=argc>7?atoi(argv[7]):7,CHK=argc>8?atoi(argv[8]):3;
     const int NR=g6nr::NR,H=g6nr::HMAX,NG=NR-1,HA=NG*H,QT=32,PS=64;
     if(L>T||L<ga::TOP||M<1||M>QT||M>L||CPR<0||CPR%PS||CPR>=L){fprintf(stderr,"bad sizes (M <= 32, 2048 <= L <= T, R < L, R %% 64 == 0)\n");return 2;}
-    if(g6nr::HMIN!=H||!g6_attn_cp_groups_ok(H)){fprintf(stderr,"needs equal head groups of a multiple of 16 heads (G6_NR=4) and G6_ATTN_FLIP off\n");return 2;}
+    if(g6nr::HMIN!=H||!g6a_cp_groups_ok(H)){fprintf(stderr,"needs equal head groups of a multiple of 16 heads (G6_NR=4) and G6_ATTN_FLIP off\n");return 2;}
     std::vector<Arm> arms;std::vector<std::string> specs={"SC2=4,TR=2,CTX2=4,CTX3=2","stock"};
     if(const char* e=getenv("CPG_ARMS")){specs.clear();std::string s=e;size_t i=0;
         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
@@ -131,15 +131,15 @@ int main(int argc,char** argv){
     int bad=0;
     for(size_t ai=0;ai<arms.size();ai++){
         set_arm(arms[ai]);const std::string tag=specs[ai];
-        const size_t sb=g6_attn_scratch_bytes(&a1),ob=g6_attn_cp_groups_bytes(HA,M);
+        const size_t sb=g6a_scratch_bytes(&a1),ob=g6a_cp_groups_bytes(HA,M);
         char *scr=dalloc<char>(sb),*obuf=dalloc<char>(ob);
         auto stock=[&]{for(int k=1;k<NR;k++){
             cpglue::k_vget<<<16,256,0,st>>>(vq,k-1,stepp,qbuf,qn+rn);
-            CKI(g6_attn_cp_group(&a1,cell,scr,sb,qbuf,qbuf+qn/4,ptmp,st));
+            CKI(g6a_cp_group(&a1,cell,scr,sb,qbuf,qbuf+qn/4,ptmp,st));
             cpglue::k_vput<<<16,256,0,st>>>(ptmp,pb,nullptr,0,vp[k-1],stepp,tick+k);}};
         auto one=[&]{cpglue::VHeads s{};for(int k=0;k<NG;k++)s.j[k]=k;float* rall=qall+(size_t)M*HA*512;
             cpglue::k_vget_heads<<<dim3(16,NG),256,0,st>>>(vq,s,stepp,qall,rall,M,H);
-            CKI(g6_attn_cp_groups(&aa,cell,obuf,ob,qall,rall,pall,H,(int64_t)tblk,st));
+            CKI(g6a_cp_groups(&aa,cell,obuf,ob,qall,rall,pall,H,(int64_t)tblk,st));
             for(int k=1;k<NR;k++)cpglue::k_vput<<<16,256,0,st>>>(pall+(size_t)(k-1)*tblk,pb,nullptr,0,vp[k-1],stepp,tick+k);};
         // EXACT: the published partials, every step from poisoned buffers
         auto take=[&](bool o){std::vector<uint8_t> out;

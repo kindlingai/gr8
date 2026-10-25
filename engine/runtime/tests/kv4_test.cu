@@ -26,6 +26,7 @@
 #include "../../attn/bind.h"
 #include "../../attn/prefill.h"
 #include "../../attn/prefill-qo-bind.h"
+#include "../../attn/ops.h"
 #include "../../attn/kvfmt.h"
 #include "../../g6nr.h"
 
