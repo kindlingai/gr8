@@ -4,19 +4,26 @@
 #include <cstdlib>
 #include "ops.h"
 
+// the CP entry points exist only in G6_CP builds, and only CP code calls them
+#if defined(G6_CP) && G6_CP
+#define G6_CP_OP(f) f
+#else
+#define G6_CP_OP(f) nullptr
+#endif
+
 extern "C" const G6AttnOps* g6_attn_ops(void) {
     static const G6AttnOps ops = {
         "GLM-5.3",
         g6a_append,   // append
-        g6a_cp_finish,   // cp_finish
-        g6a_cp_front,   // cp_front
-        g6a_cp_group,   // cp_group
-        g6a_cp_groups,   // cp_groups
-        g6a_cp_groups_bytes,   // cp_groups_bytes
-        g6a_cp_groups_ok,   // cp_groups_ok
-        g6a_cp_index,   // cp_index
-        g6a_cp_merge_index,   // cp_merge_index
-        g6a_cp_qabs,   // cp_qabs
+        G6_CP_OP(g6a_cp_finish),   // cp_finish
+        G6_CP_OP(g6a_cp_front),   // cp_front
+        G6_CP_OP(g6a_cp_group),   // cp_group
+        G6_CP_OP(g6a_cp_groups),   // cp_groups
+        G6_CP_OP(g6a_cp_groups_bytes),   // cp_groups_bytes
+        G6_CP_OP(g6a_cp_groups_ok),   // cp_groups_ok
+        G6_CP_OP(g6a_cp_index),   // cp_index
+        G6_CP_OP(g6a_cp_merge_index),   // cp_merge_index
+        G6_CP_OP(g6a_cp_qabs),   // cp_qabs
         g6a_ctx_sp,   // ctx_sp
         g6a_index_scores,   // index_scores
         g6a_posidx,   // posidx
@@ -27,8 +34,8 @@ extern "C" const G6AttnOps* g6_attn_ops(void) {
         g6a_rt_pack_int4,   // rt_pack_int4
         g6a_rt_unpack_int4,   // rt_unpack_int4
         g6a_bind_create,   // bind_create
-        g6a_bind_create_cp,   // bind_create_cp
-        g6a_bind_create_cp_phys,   // bind_create_cp_phys
+        G6_CP_OP(g6a_bind_create_cp),   // bind_create_cp
+        G6_CP_OP(g6a_bind_create_cp_phys),   // bind_create_cp_phys
         g6a_bind_create_ext,   // bind_create_ext
         g6a_bind_prepare,   // bind_prepare
         g6a_bind_release,   // bind_release

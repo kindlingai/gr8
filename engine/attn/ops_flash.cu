@@ -4,6 +4,13 @@
 #include <cstdlib>
 #include "ops.h"
 
+// the CP entry points exist only in G6_CP builds, and only CP code calls them
+#if defined(G6_CP) && G6_CP
+#define G6_CP_OP(f) f
+#else
+#define G6_CP_OP(f) nullptr
+#endif
+
 extern "C" const G6AttnOps* g6_attn_ops(void) {
     static const G6AttnOps ops = {
         "GLM-5.3-Flash",
@@ -27,7 +34,7 @@ extern "C" const G6AttnOps* g6_attn_ops(void) {
         nullptr,   // rt_pack_int4
         nullptr,   // rt_unpack_int4
         g6a_bind_create,   // bind_create
-        g6a_bind_create_cp,   // bind_create_cp
+        G6_CP_OP(g6a_bind_create_cp),   // bind_create_cp
         nullptr,   // bind_create_cp_phys
         g6a_bind_create_ext,   // bind_create_ext
         g6a_bind_prepare,   // bind_prepare

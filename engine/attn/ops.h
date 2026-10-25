@@ -1,18 +1,14 @@
 #pragma once
-// The attention interface as data: each model fills one G6AttnOps (ops_glm.cu for GLM-5.3, ops_flash.cu for
-// GLM-5.3-Flash), and the runtime calls the g6_attn_* wrappers below, which go through it. An op a model does not
-// have stays null: its wrapper returns what a model without it gives (NOTSUP, 0 or nothing), or stops with the op's
-// name when the runtime cannot do without it. So the runtime links only g6_attn_ops, and an op one model adds cannot
-// break the other model's link. The implementations are the g6a_* functions the headers declare.
-//
-// Adding an op: declare its g6a_* implementation in the header for its area, add a member here and a wrapper below
-// (a default when the runtime can do without it, g6_attn_missing when it cannot), and set the member in ops_glm.cu and
-// ops_flash.cu: the model's g6a_* function, or nullptr.
+// The attention ops, one table per model (ops_glm.cu, ops_flash.cu). The runtime calls the g6_attn_* wrappers below,
+// which go through g6_attn_ops(). A null slot is an op the linked model lacks: its wrapper returns G6_ATTN_NOTSUP, 0
+// or nothing, or calls g6_attn_missing where the runtime cannot go on without it. A new op is a g6a_* declaration in
+// its area's header, a member and a wrapper here, and one slot in each table (the function, or nullptr).
 #include "prefill.h"
 #include "prefill-qo-bind.h"
 
 #define G6_ATTN_NOTSUP 801   // cudaErrorNotSupported
-struct G6FlashPoolOwner;   // prefill.h: Flash builds only
+struct G6AttnStepCell;      // attn.h: G6_CP builds only
+struct G6FlashPoolOwner;    // prefill.h: Flash builds only
 
 struct G6AttnOps {
     const char* model;
