@@ -429,9 +429,6 @@ def validate(o):
         raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
     if o.get('LAYOUT') and not os.path.isfile(o.get('LAYOUT')):
         raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
-    if o.get('LAYOUT') and looks_remote(o.get('MODEL') or ''):
-        raise OptionError('--layout needs a local copy of the release (--model DIR): a box\'s cache holds only the '
-                          'pieces the formulas give its rank')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')

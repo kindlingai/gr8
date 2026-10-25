@@ -344,8 +344,8 @@ class CanonicalTests(unittest.TestCase):
             self.assertNotEqual(da, self.digest(*rel)[2])
             with self.assertRaises(opt.OptionError):
                 self.digest(*rel, '--layout', os.path.join(d, 'none.json'))
-            with self.assertRaises(opt.OptionError):
-                self.digest('--model', 'https://huggingface.co/org/repo', '--layout', a)
+            # a box's cache fetches the layout's pieces (hfsource.Release)
+            self.digest('--model', 'https://huggingface.co/org/repo', '--layout', a)
 
     def test_tp3_is_s2_without_drafter(self):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})

@@ -156,7 +156,8 @@ def resolve_model(o, refresh=False, log=log):
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
-            release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
+            release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
+                                       layout=o.get('LAYOUT'))
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir
