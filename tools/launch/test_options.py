@@ -132,6 +132,7 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--grammar', '2'], 'want 0 or 1')
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('GRAMMAR'), '1')
         # a grammar directory reaches the engine as --grammar-dir, a path per box
         o = opt.parse(['--no-config', '--peers', PEERS, '--grammar', '1', '--grammar-dir', '/t'], {})
         opt.validate(o)

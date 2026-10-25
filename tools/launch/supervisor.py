@@ -174,7 +174,7 @@ def resolve_model(o, refresh=False, log=log):
         models.check_config(models.of(o), ms.tokenizer)
         if o.get('GRAMMAR') == '1' and not o.get('GRAMMAR_DIR'):
             o.values['GRAMMAR_DIR'] = ms.tokenizer
-        if o.get('GRAMMAR') != '1':
+        if o.get('GRAMMAR') != '1' or models.of(o) is not models.GLM53:   # Flash serves outside the S2 dispatch
             o.values['GRAMMAR_DIR'] = None
         steering_hf.bind(o, release)
         steering_local.prepare(o, ms)

@@ -544,6 +544,15 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
         die("--grammar-dir: request grammars are GLM-5.3 only for now (Flash serves outside the S2 dispatch)");
 #endif
+#if !G6_GRAMMAR
+        // GRAMMAR defaults to 1, so a build without XGrammar serves without grammars: its hello leaves out
+        // `grammar`, and the front end sends none
+        fprintf(stderr, "# rank %d: --grammar-dir ignored: this engine was built without XGrammar (G6_XGRAMMAR)\n", R);
+        grammar_dir.clear();
+#endif
+    }
+    if (!grammar_dir.empty())
+    {
         const std::string e = g6rt::grammar_init(grammar_dir, geom::VOCAB);
         if (!e.empty()) die("--grammar-dir " + grammar_dir + ": " + e);
         if (R == 0)

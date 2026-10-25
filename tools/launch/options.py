@@ -159,8 +159,9 @@ KEYS = {
                                        'int4, the fallback)'),
     'LAYOUT': ('box', None, 'with V2_DENSE: a layout file (bin/g6layout) that says which pieces each rank holds, instead '
                             'of the formulas. The handshake compares its sha256'),
-    'GRAMMAR': ('cluster', '0', 'experimental: 1 = the engine masks response_format JSON replies with their grammar '
-                                '(XGrammar; an engine build with it, GLM-5.3 only); the front end checks them either way'),
+    'GRAMMAR': ('cluster', '1', '1 = the engine masks response_format JSON replies with their grammar (XGrammar; '
+                                'GLM-5.3 only, and an engine built without it serves without); the front end checks '
+                                'them either way'),
     'GRAMMAR_DIR': ('box', None, 'GRAMMAR=1: the directory with the tokenizer.json and generation_config.json the grammars '
                                  'compile against (default: the model set\'s tokenizer)'),
     'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
