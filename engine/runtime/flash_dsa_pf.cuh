@@ -335,10 +335,12 @@ inline void bind_dsa_prefill(Model& m, Prefill& P, cudaStream_t st)
 
 // xf_all / xb_all: f16 / bf16 fragment tables of all M input rows (bind::Xfrag layout) already built by the mHC
 // consume; null = build each chunk's tables from P.xn here.
+// rs.base set (G6_PF_SP_ATTD): the GEMM-path o_proj writes its rows to that RS send slot instead of P.part[0]; returns
+// whether it did (false: the chunked o_proj paths, P.part[0] as usual).
 template <class Prefill, class Mark>
-inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, Mark mark,
+inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, Mark mark,
                               const u32* xf_all = nullptr, const u32* xb_all = nullptr,
-                              FlashPoolTransport* transport = nullptr)
+                              FlashPoolTransport* transport = nullptr, const bindp::RsOut& ors = bindp::RsOut())
 {
     if (M < 1 || M > P.MP) die("pf_dsa_block_gemm: M outside 1..MP");
     flash_dsa_pf::State& S = flash_dsa_pf::ensure_state(m, P, st);
@@ -488,7 +490,8 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
     }
     mark(4, st);
 
-    // 5. o_proj -> P.part[0] [M][HID] BF16
+    // 5. o_proj -> P.part[0] [M][HID] BF16 (or the RS send slot ors)
+    bool used_rs = false;
     if (b1.o_proj_t.on && !proj_p1)
     {
         const dtr::Mat opm = flash_dsa_pf::mat_from_gemv(b1.o_proj_t);
@@ -498,7 +501,8 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         g_o.pre.on = 1; g_o.pre.src = attn_out; g_o.pre.ld = h * 256; g_o.pre.K = h * 256; g_o.pre.M = M;
         g_o.pre.dst = S.x8_attn; g_o.pre.suh = opm.suh; g_o.pre.h16 = g_o.h16;
         g_o.osvh = opm.svh;
-        bindp::launch(g_o, st);
+        bindp::launch(g_o, st, ors);
+        used_rs = ors.base != nullptr;
     }
     else if (b1.o_proj.on)
     {
@@ -524,6 +528,7 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         }
     }
     mark(5, st);
+    return used_rs;
 }
 
 template <class Prefill>
