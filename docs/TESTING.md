@@ -104,6 +104,7 @@ one GPU and makes its own synthetic weights.
 | `l2pf_bench` | `G6_L2PF` prefetch: speed, and exactness against no prefetch |
 | `k1_ovl_test` | `G6_ROUTE_OVL` against the default MoE layer |
 | `gpuprobe` | the GPU half of the rank health probe (`tools/health/rank_probe.py` runs it) |
+| `dtr_test_tp<N>`, `dtr_test_flash_tp<N>` | dense trellis matrices, at each width: dumps for `engine/ref/dtr_ref.py`, and decode timing (needs release entries) |
 
 `engine/runtime/build_m4.sh` builds these, by mode:
 
@@ -113,7 +114,6 @@ one GPU and makes its own synthetic weights.
 | `rs` | `rstest` | the vocab-split head kernels for rejection sampling, all ranks on one GPU | |
 | `dfl` | `dfltest` | the DFlash2 drafter step against `engine/ref/dflash2_check.py` | drafter packs |
 | `dfl` | `dflreplay` | `G6_DFL_BODY_I4` against MXFP8, replaying a `G6_DFL_DUMP` | drafter packs, a dump |
-| `all` | `dtr_test_tp<N>` | dense trellis matrices: dumps for `engine/ref/dtr_ref.py`, and decode timing | release entries |
 
 No script builds the rest. Each file's header has its build line and usage. Each compiles with the flags shown.
 `flash_dsa_pf_test` fails today: in its W8d case the KV and index caches match, but the block output does not

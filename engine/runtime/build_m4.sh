@@ -1,7 +1,7 @@
 #!/bin/bash
 # build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs|tests]
-# sim / g6 / all: m4sim and g6m4, one binary each that runs every TP width in WIDTHS (default 6; below), and with all a
-# dtr_test_tp<N> per width. JOBS: compiles at once (default: the CPU count; each takes under 1 GB).
+# sim / g6 / all: m4sim and g6m4, one binary each that runs every TP width in WIDTHS (default 6; below).
+# JOBS: compiles at once (default: the CPU count; each takes under 1 GB).
 # tests: only the unit tests (tests/row_budget_test.cu, tests/s2_attn_test.cu) into $OUT; scripts/c1_tests.sh builds and runs them.
 # m4sim: one GPU, NR simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
 # dfl: dfltest and dflreplay only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py; the
@@ -120,10 +120,6 @@ for n in $WIDTHS; do
   job $O/attn_ops.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_OPS_CU -o $O/attn_ops.w$n.o
   if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c m4sim.cu -o $O/m4sim.w$n.o; fi
   if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF $GRDEF -c g6m4.cu -o $O/g6m4.w$n.o; fi
-  # dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
-  if [ "$WHAT" = all ]; then
-    job $O/dtr_test.w$n.log $NVCC -O2 -std=c++17 $F -I ../kernels -o $OUT/dtr_test_tp$n ../kernels/tests/dtr_test.cu -lcublas
-  fi
 done
 wait
 cat $O/*.log

@@ -101,9 +101,11 @@ ARG G6_WIDTHS=
 RUN G6_WIDTHS="$G6_WIDTHS" G6_TESTS=0 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4 ! -name m4sim -exec rm -rf {} +
 
-# the test binaries build.sh makes after the GLM engine (gpuprobe and tr3_e4m3_test ship), on their own CI runner
+# the test binaries build.sh makes after the GLM engine (gpuprobe and tr3_e4m3_test ship), on their own CI runner;
+# dtr_test at the G6_WIDTHS the engine leg builds
 FROM engine-src AS engine-tests
-RUN G6_TESTS=only scripts/build.sh /out/bin \
+ARG G6_WIDTHS=
+RUN G6_WIDTHS="$G6_WIDTHS" G6_TESTS=only scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name gpuprobe ! -name tr3_e4m3_test -exec rm -rf {} +
 
 # GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 2, 3 and 4
