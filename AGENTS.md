@@ -57,6 +57,7 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 | the front end end to end against the pseudo engine (`frontend/pseudo-engine`: rules in a TOML file), and the smoketest | anywhere, with GLM-5.3's tokenizer files | `frontend/pseudo-engine/smoke.sh TOKENIZER_DIR`; `cd frontend/pseudo-engine && cargo test` for its rules |
 | `./gr8 pseudo up` end to end: supervisor, handshake, g6pseudo under `--serve`, shim, front end | anywhere, with the release builds and GLM-5.3's tokenizer files | `GR8_PSEUDO_TOKENIZER=DIR python3 -m unittest discover -s tools/launch -p 'test_pseudo_e2e.py'` |
 | the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
+| the n-gram draft source replay (#56: table, chain and tree proposals, acceptance, held-out folds) | anywhere, stdlib only | `python3 -m unittest discover -s tools/ngram/tests` |
 | the rank health probe | anywhere | `python3 -m unittest discover tools/health` |
 | the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |
 | a rank image planned from the release (`--v2-dense`) against an independent derivation, from the formulas or a layout file | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py`, with `--layout FILE` for a layout |
