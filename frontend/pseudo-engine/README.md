@@ -59,6 +59,34 @@ arguments = { city = "${city}" }
 - `[fallback]` answers a prompt no rule matches. `[engine]` sets the hello's model name and `max_model_len`, the pace
   (`tokens_per_s`, `chunk` ids a frame, `prefill_tps`) and the default reasoning.
 
+## Variables
+
+The engine keeps one JSON object of variables, the KV, for as long as it runs. Every request reads it, so a reply can
+depend on what earlier requests set. It starts empty on every boot.
+
+```toml
+[[rule]]
+name = "kv-set"
+match = '(?i)^set (?P<key>[A-Za-z_]\w*) to (?P<value>[^\n]+?)\.?$'
+content = "Done: ${key} is now ${value}."
+set = { "${key}" = "${value}" }
+
+[[rule]]
+name = "kv-get"
+match = '(?i)^what is (?:the value of )?(?P<key>[A-Za-z_]\w*)\??$'
+needs = ["${key}"]
+content = "${key} is {{${key}}}."
+```
+
+- `set` writes each key to its value. Both take captures. A value that reads as a JSON number, `true`, `false` or
+  `null` is stored as one, and any other value as a string.
+- Only the reply the request emits writes. The candidates behind the logprobs do not.
+- `{{name}}` in the reasoning, the content or an argument is the variable: a string as itself, anything else as JSON,
+  and nothing when it is unset. `{{*}}` is the whole object. Captures go in first, so `{{${key}}}` reads the variable
+  that a capture names.
+- `needs` lists the keys a rule needs set before it matches. Without them, the next candidate answers.
+- One request at a time reads and writes the KV, at the moment it plans its reply.
+
 ## Which rule answers
 
 Every rule that matches is a candidate. The most specific wins: the higher `specificity`, then the longer match, then

@@ -9,7 +9,8 @@
 //!   g6pseudo --weights FILE --check         load and compile the rules, print how many
 //!   g6pseudo --weights FILE --explain TEXT  the candidates for a user message TEXT, their weights and the winner's reply
 //!
-//! Deterministic: the reply is a function of the prompt, the request's temperature and seed, and the weights.
+//! Deterministic: the reply is a function of the prompt, the request's temperature and seed, the weights, and the KV the
+//! earlier requests' rules set.
 
 mod prompt;
 mod rules;
@@ -28,7 +29,7 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
 use prompt::Prompt;
-use rules::{weights, Candidate, Rules};
+use rules::{weights, Candidate, Kv, Rules};
 
 const MAX_FRAME: usize = 256 << 20;
 const MAX_LOGPROBS: usize = 20;
@@ -43,6 +44,8 @@ struct Engine {
     eos: Vec<u32>,
     vocab: u32,
     c: Counters,
+    /// The variables rules set, shared by every request of this process.
+    kv: Mutex<Kv>,
 }
 
 #[derive(Default)]
@@ -118,7 +121,7 @@ fn run() -> Result<(), String> {
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
     let eos = eos_ids(&dir)?;
     let vocab = tok.get_vocab_size(true) as u32;
-    let e = Arc::new(Engine { rules, tok, eos, vocab, c: Counters::default() });
+    let e = Arc::new(Engine { rules, tok, eos, vocab, c: Counters::default(), kv: Mutex::default() });
     if !s2.dir.as_os_str().is_empty() {
         if s2.cap == 0 {
             s2.cap = e.rules.engine.max_model_len as usize;
@@ -146,7 +149,7 @@ fn eos_ids(dir: &Path) -> Result<Vec<u32>, String> {
 
 fn explain_text(rules: &Rules, user: &str) -> String {
     let p = Prompt::parse(&format!("<|user|>{user}<|assistant|><think>"));
-    let c = rules.candidates(&p);
+    let c = rules.candidates(&p, &Kv::new());
     let w = weights(&c, 1.0);
     let mut out = String::new();
     for (cand, w) in c.iter().zip(&w) {
@@ -157,7 +160,11 @@ fn explain_text(rules: &Rules, user: &str) -> String {
             cand.len
         );
     }
-    out += &format!("reply: {:?}\n", rules.reply(&c[0], &p).text);
+    let r = rules.reply(&c[0], &p, &Kv::new());
+    out += &format!("reply: {:?}\n", r.text);
+    for (k, v) in r.set {
+        out += &format!("set {k} = {v}\n");
+    }
     out
 }
 
@@ -321,18 +328,20 @@ fn stop_at(ids: &[u32], stop: &HashSet<u32>, min_tokens: usize) -> Option<usize>
     (min_tokens..ids.len()).find(|&i| stop.contains(&ids[i]))
 }
 
-/// The ids a request emits: the chosen candidate's reply, an insert rule applied, cut to max_tokens.
+/// The ids a request emits: the chosen candidate's reply, an insert rule applied, cut to max_tokens. The emitted
+/// replies' `set` goes into the KV, and the KV stays locked until then, so requests read and write it in turn.
 fn plan(e: &Engine, prompt: &[u32], v: &Value, max_tokens: usize, lp_k: Option<usize>) -> Plan {
     let text = e.tok.decode(prompt, false).unwrap_or_default();
     let p = Prompt::parse(&text);
-    let cands = e.rules.candidates(&p);
+    let mut kv = e.kv.lock().unwrap();
+    let cands = e.rules.candidates(&p, &kv);
     let temperature = v["temperature"].as_f64().unwrap_or(0.0);
     let pick = if temperature > 0.0 {
         sample(&weights(&cands, temperature), v["seed"].as_u64().unwrap_or(0) ^ hash(prompt))
     } else {
         0
     };
-    let mut ids = reply_ids(e, &cands[pick], &p, max_tokens);
+    let (mut ids, mut set) = reply_ids(e, &cands[pick], &p, &kv, max_tokens);
     if let Some(rule) = v["insert"].as_array().and_then(|a| a.first()) {
         let after = rule["after_tokens"].as_u64().unwrap_or(0) as usize;
         let unless = rule["unless_emitted"].as_u64().map(|x| x as u32);
@@ -346,21 +355,25 @@ fn plan(e: &Engine, prompt: &[u32], v: &Value, max_tokens: usize, lp_k: Option<u
             let mut cont = prompt.to_vec();
             cont.extend(&head);
             let cp = Prompt::parse(&e.tok.decode(&cont, false).unwrap_or_default());
-            let cc = e.rules.candidates(&cp);
-            head.extend(reply_ids(e, &cc[0], &cp, max_tokens));
+            let cc = e.rules.candidates(&cp, &kv);
+            let (more, more_set) = reply_ids(e, &cc[0], &cp, &kv, max_tokens);
+            head.extend(more);
+            set.extend(more_set);
             ids = head;
         }
     }
     ids.truncate(max_tokens);
     let lps = match lp_k {
-        Some(k) => logprobs(e, &cands, &p, &ids, k, max_tokens),
+        Some(k) => logprobs(e, &cands, &p, &kv, &ids, k, max_tokens),
         None => Vec::new(),
     };
+    kv.extend(set);
     Plan { ids, lps }
 }
 
-fn reply_ids(e: &Engine, c: &Candidate, p: &Prompt, max_tokens: usize) -> Vec<u32> {
-    let r = e.rules.reply(c, p);
+/// A candidate's reply as ids, and the variables it sets.
+fn reply_ids(e: &Engine, c: &Candidate, p: &Prompt, kv: &Kv, max_tokens: usize) -> (Vec<u32>, Vec<(String, Value)>) {
+    let r = e.rules.reply(c, p, kv);
     let mut ids = encode(e, &r.text);
     if let Some(f) = r.fill {
         let f = encode(e, &f);
@@ -368,7 +381,7 @@ fn reply_ids(e: &Engine, c: &Candidate, p: &Prompt, max_tokens: usize) -> Vec<u3
             ids.extend(&f);
         }
     }
-    ids
+    (ids, r.set)
 }
 
 fn encode(e: &Engine, text: &str) -> Vec<u32> {
@@ -378,10 +391,18 @@ fn encode(e: &Engine, text: &str) -> Vec<u32> {
 /// Logprobs from the candidates: at each position the emitted id's probability is the weight of the candidates still
 /// in agreement with the reply so far that emit it, over the weight of all of them still in agreement; the top list is
 /// the ids those candidates emit there, best first, then made-up ids from the rest of the vocabulary.
-fn logprobs(e: &Engine, cands: &[Candidate], p: &Prompt, ids: &[u32], k: usize, max_tokens: usize) -> Vec<Value> {
+fn logprobs(
+    e: &Engine,
+    cands: &[Candidate],
+    p: &Prompt,
+    kv: &Kv,
+    ids: &[u32],
+    k: usize,
+    max_tokens: usize,
+) -> Vec<Value> {
     let n = cands.len().min(LP_CANDIDATES);
     let w = weights(&cands[..n], 1.0);
-    let seqs: Vec<Vec<u32>> = cands[..n].iter().map(|c| reply_ids(e, c, p, max_tokens)).collect();
+    let seqs: Vec<Vec<u32>> = cands[..n].iter().map(|c| reply_ids(e, c, p, kv, max_tokens).0).collect();
     let mut alive: Vec<bool> = vec![true; n];
     let mut out = Vec::with_capacity(ids.len());
     for (i, &id) in ids.iter().enumerate() {
