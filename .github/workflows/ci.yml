@@ -14,6 +14,9 @@
 #
 # A PR that changes only front-end files (.github/ci/scope.js) runs the front-end CPU tests and the Rust binaries: the
 # engine CPU tests, the engine builds, the tester zip and the image skip. Every other run builds everything.
+#
+# Finalize is the one check a PR needs to land: green when every job passed or skipped by design and the PR carries
+# queue:ready. A /ci run that passes stays red there until /ready.
 name: ci
 
 on:
@@ -396,3 +399,46 @@ jobs:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  finalize:
+    name: Finalize
+    # The check a PR needs to land. It runs after a failure or a cancellation too, so it always reports. It passes when
+    # every job above succeeded or skipped, and a PR's run carries queue:ready (/ready), read live. A job skips by design
+    # (the tester zip on a PR, the engine builds on a front-end PR) or because a job it needs failed, which fails here
+    # too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished run.
+    if: always()
+    needs: [ready, cpu, cpu-macos, rust, engine, zip, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS);
+            const bad = needs.ready.outputs.go === "true" ? [] : ["CI has not run: it waits for /ci or /ready"];
+            for (const [name, j] of Object.entries(needs)) {
+              if (name !== "ready" && !["success", "skipped"].includes(j.result)) bad.push(`${name}: ${j.result}`);
+            }
+            // The PR: this run's, or for a dispatched run (pr-ready.yml starts one without its token) the open PR
+            // whose head is this commit. A push to main or a tag has none.
+            let pr = context.eventName === "pull_request" ? context.payload.pull_request.number : null;
+            if (context.eventName === "workflow_dispatch") {
+              const prs = (await github.rest.repos.listPullRequestsAssociatedWithCommit(
+                { ...context.repo, commit_sha: context.sha })).data;
+              const open = prs.find(p => p.state === "open" && p.head.sha === context.sha);
+              if (open) pr = open.number;
+            }
+            if (pr) {
+              const labels = (await github.rest.issues.listLabelsOnIssue(
+                { ...context.repo, issue_number: pr, per_page: 100 })).data.map(l => l.name);
+              if (!labels.includes("queue:ready")) bad.push(`#${pr} is not marked ready (/ready)`);
+            }
+            const rows = Object.entries(needs).map(([name, j]) => [name, j.result]);
+            await core.summary.addTable([[{ data: "job", header: true }, { data: "result", header: true }], ...rows])
+              .addRaw(bad.length ? `Not ready to land: ${bad.join("; ")}` : "Ready to land").write();
+            if (bad.length) core.setFailed(`Not ready to land: ${bad.join("; ")}`);
