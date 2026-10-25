@@ -1,21 +1,11 @@
 #!/bin/bash
-# Host-only tests (g++, no CUDA): the switchless relay's ring and credit accounting, the S2 batch planner
-# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE) and the insert
-# rule), the S2 control barrier, the pool's page lists
-# Host-only tests (g++, no CUDA): the fabric's QP MTU choice, the fabric pool's groups (#154), the switchless relay's ring and credit accounting, the S2 batch planner
-# (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
-# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule
-# and the MTP confidence stop), the S2 control barrier, the pool's page lists
-# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule,
-# the MTP confidence stop and the parallel drafter step (G6_DRAFT_PAR)), the S2 control barrier, the pool's page lists
-# and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
-# it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
-# prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
-# the pool's block
-# store in lock-step with its copies run through memory, a file and a loopback KV node, eager and --lazy-lock
-# (pool_stash_test), the commit
-# frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
-# after load (engine/runtime/host_reclaim.h), and steering profile contracts/validation.
+# Host-only tests (g++ and cargo, no CUDA) of the engine's CPU-side logic: the build's object cache, steering contracts,
+# the fabric (QP MTU choice, the pool's groups, the switchless relay's ring and credits), the S2 batch planner
+# (engine/runtime/s2_batch.h: DFlash2 sessions and their reuse, the insert rule, the MTP confidence stop, the parallel
+# drafter step), the scheduler, the KV pool over the Rust page allocator in engine/kvman-rs and its block stores (memory,
+# a file, loopback KV nodes), the control protocol, the pack manifest parser, host memory reclaim, and the Flash ring,
+# checkpoint and prefill split rules.
+# .github/ci/cpu-tests.sh engine (./gr8 test engine) runs it with the other host tests.
 #   scripts/host_tests.sh
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
