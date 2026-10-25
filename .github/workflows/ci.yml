@@ -242,7 +242,7 @@ jobs:
           echo "widths=$widths" >> "$GITHUB_OUTPUT"
           case "${{ matrix.leg }}" in
             flash) echo "Flash, TP widths 2 3 4" ;;
-            tests) echo "test binaries" ;;
+            tests) echo "test binaries, dtr_test at TP widths ${widths:-1 2 3 4 5 6 8}" ;;
             *) echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
           esac >> "$GITHUB_STEP_SUMMARY"
       - name: Build the binaries (Dockerfile target ${{ matrix.target }})
