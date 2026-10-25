@@ -33,7 +33,7 @@ struct Run
 };
 
 // one solo DFlash2 request of n_gen tokens; dfl_right: how many of the drafter's 7 drafts are right
-static Run run(const NgramSrc* ng, int dfl_right)
+static Run run(const NgramSrc* ng, int dfl_right, bool adaptive = false)
 {
     Run o;
     bool prompt = true;
@@ -53,7 +53,9 @@ static Run run(const NgramSrc* ng, int dfl_right)
     };
     h.emit = [&](int, const int* t, int k, int) { o.got.insert(o.got.end(), t, t + k); return false; };
     Batch b(3, 32, h);
-    b.dflash(7, g6rt::SpecLen());
+    g6rt::SpecLen sl;                 // adaptive: the --spec-adaptive estimates (TP4 serving), which learn the drafter
+    if (adaptive) { sl.on = true; sl.set_levels({7}); }
+    b.dflash(7, sl);
     if (ng) b.ngram(*ng);
     Session s;
     for (int i = 0; i < 10; ++i) s.prompt.push_back(i < 7 ? 5 : target(i - 1));   // its last 3 tokens are the cycle's
@@ -114,10 +116,15 @@ int main()
     const Run k3 = run(&ng, 3);
     CHECK(k3.got == base.got);
     for (int w : k3.widths) CHECK(w == 4);
-    // the drafter right on all 7: the table's chain of 7 at calibrated 0.98 each no longer beats it by the margin
+    // the drafter right on all 7: the table takes the first rounds (the estimates start at their seeds), its rounds
+    // still teach the drafter's estimates, and the drafter wins the rest back; with and without --spec-adaptive
     ng.kmax = 7;
-    const Run dfl7 = run(&ng, 7);
-    CHECK(dfl7.st.ngram_rounds == 0);
+    for (bool ad : {false, true})
+    {
+        const Run dfl7 = run(&ng, 7, ad);
+        CHECK(dfl7.got == base.got);
+        CHECK(dfl7.st.ngram_rounds > 0 && dfl7.st.ngram_rounds < 10 && dfl7.st.dfl_rounds > 10);
+    }
     // a calibration that says the table is often wrong: the drafter keeps every round
     g6rt::NgramTable weak;
     CHECK(weak.parse(cycle_table("0.05 0.1 0.15 0.2 0.25 0.3 0.3 0.3", 0.995), &err));

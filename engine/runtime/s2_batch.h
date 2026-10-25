@@ -50,7 +50,9 @@
 // table (ngram_lookup.h) proposes a chain after the committed tokens. When the chain's expected tokens per verify ms
 // (its calibrated probabilities, the verify table) beat the drafter's by NgramSrc::margin, the round verifies the chain
 // instead of the drafter's drafts; the rest of the round (first form, drafter step, chain) runs as before on the
-// committed tokens. The drafter estimates learn nothing from such a round. Every input is the same on every rank.
+// committed tokens. The drafter's drafts are still scored against the tokens the verify produced, so its estimates keep
+// learning while the table serves. Drafting costs are left out on both sides: the drafter runs every round either way.
+// Every input is the same on every rank.
 // Within a step the sessions are in ascending index and each session's rows are contiguous, in position order.
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
@@ -492,6 +494,7 @@ public:
     {
         if (n.t && (n.kmin < 1 || n.kmax < n.kmin || n.kmax > DFL_B - 1)) throw std::runtime_error("s2: ngram: 1 <= kmin <= kmax <= 7");
         ng_ = n;
+        ng_fresh();
     }
     // G6_DFL_REUSE=2: session q, the only active one and drafting with MTP (it was not alone at its prompt tail, or was
     // demoted), takes the drafter before the next round: MTP rounds feed it the accepted rows as context from the
@@ -728,6 +731,7 @@ private:
         const int c = commit(q, t.data(), a + 1, &kept);
         if (!nk && !m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
         if (!nk && sel_.on) score(x, k, a, t.data(), pe);
+        if (!nk && ng_.t) (m ? ngm_ : ngd_).observe(k, a, m ? x.dlm.data() : x.dl, 0);
         if (nk)
         {
             ngram_score(x, m, kd, a, t.data(), de);
@@ -846,10 +850,10 @@ private:
         float dl[DFL_B] = {};
     };
     // G6_NGRAM: the table's chain after tokens[0..base] when it promises more tokens per verify ms than the drafter's k
-    // drafts (pe: their expected tokens when the policy that chose k computed it, else 0): its length (0: the drafter's),
-    // the chain in nd[1..], the expected tokens of both. Rank-invariant: the committed tokens, the table, the drafts'
-    // log-probabilities, accept counts and the fixed verify table
-    int ngram_pick(const St& x, int base, bool m, int k, double pe, int* nd, double* ne, double* de) const
+    // drafts (their expected tokens from ngd_ / ngm_, which learn every round of the request): its length (0: the
+    // drafter's), the chain in nd[1..], the expected tokens of both. Rank-invariant: the committed tokens, the table, the
+    // drafts' log-probabilities, accept counts and the fixed verify table
+    int ngram_pick(const St& x, int base, bool m, int k, double, int* nd, double* ne, double* de) const
     {
         double c[DFL_B];
         const int n = ng_.t->chain(x.tokens.data(), base + 1, ng_.kmax, nd, c);
@@ -862,8 +866,8 @@ private:
             const double r = e / dsl_.verify_ms(j + 1);
             if (j >= ng_.kmin && r > br * (1 + 1e-9)) { br = r; bk = j; *ne = e; }
         }
-        double ed = pe;
-        if (!(ed > 0)) (m ? sel_.m : dsl_).ratio(k, m ? x.dlm.data() : x.dl, k, &ed);
+        double ed = 0;
+        (m ? ngm_ : ngd_).ratio(k, m ? x.dlm.data() : x.dl, k, &ed);
         *de = ed;
         return br > ed / dsl_.verify_ms(k + 1) * (1 + ng_.margin) ? bk : 0;
     }
@@ -878,6 +882,7 @@ private:
         while (b < kd && b < a + 1 && dr[b + 1] == t[b]) ++b;
         const int ko = b == a + 1 ? b : std::min(b + 1, kd);   // positions offered: known right ones, and the first miss
         if (!ko) return;
+        (m ? ngm_ : ngd_).observe(ko, b, lp, 0);
         if (m) { if (sel_.on || ks_.mode == 2) sel_.m.observe(ko, b, ks_.mode ? lp : nullptr, de); return; }
         if (dsl_.on) dsl_.observe(ko, b, lp, de);
         if (sel_.on) sel_.d.observe(ko, b, lp, 0);
@@ -1082,6 +1087,9 @@ private:
     KStop ks_;
     DflReuse reuse_;
     NgramSrc ng_;
+    g6rt::SpecLen ngd_, ngm_;         // G6_NGRAM: the drafters' acceptance in this request (DFlash2, MTP), for the choice
+    // the verify table is dsl_'s (spec_len.h's, or G6_SPEC_TABLE); every request starts from the seeds
+    void ng_fresh() { ngd_ = fresh(dsl_); ngm_ = fresh(dsl_); ngd_.on = ngm_.on = false; }
     Ring ring_;
     S2Cost cost_;
     std::vector<g6rt::SpecLen> sl_ = std::vector<g6rt::SpecLen>(S2N_SLOTS);
@@ -1156,6 +1164,7 @@ private:
         {
             restart();
         }
+        if (x.dfl && ng_.t) ng_fresh();
         if (x.dfl && !(h_.dfl && h_.dfl_start)) throw std::runtime_error("s2: DFlash2 session without drafter hooks");
         stats_[q].acc.assign(std::max(K_, x.dfl ? DFL_B - 1 : 0) + 1, 0);
         for (float& v : x.dl) v = NAN;
