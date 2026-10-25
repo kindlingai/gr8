@@ -1239,7 +1239,11 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     embed(A, MA);
     embed(B, MB);
     // G6_PF_SP_AGK: lane B's gathers directly follow one of A's owner passes (exposed wire time); A's are covered by blocks
-    A.sp_agk[1] = A.sp_agk[3] = false;
+    // G6_PF_SP_AGKA (default on with G6_PF_SP_AGK, read once; =0 off): lane A's too. Its wire hop is covered, so the gain
+    // is the copy engine's slot -> device copies (DRAM traffic under B's block) and, with G6_PF_SP_XFRAG, the k_sp_frag
+    // re-read of xn2. TP3 8K A/B: prefill 2563 -> 2572 tok/s, rank-0 8K -10 ms, T=0 hashes unchanged.
+    static const bool agka = !(getenv("G6_PF_SP_AGKA") && atoi(getenv("G6_PF_SP_AGKA")) == 0);
+    A.sp_agk[1] = A.sp_agk[3] = agka && pf_sp() && pf_sp_agk();
     B.sp_agk[1] = B.sp_agk[3] = pf_sp() && pf_sp_agk();
     if (pf_sp())
     {
