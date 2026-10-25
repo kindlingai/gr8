@@ -37,6 +37,7 @@ import modelset
 
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
 WAIT = 60                  # seconds per GET ?wait=: one progress line each
+STATE_LAG = 5              # seconds the store's state may lag a request model-loader reports ready (Store.settled)
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -199,6 +200,17 @@ class Store:
             elif d:
                 out.append([i, i + 1])
         return out
+
+    def settled(self, files, ranges, wait=STATE_LAG):
+        """missing(), after model-loader said the request is ready: it saves a revision's state at most once a second
+        while small segments land (docs/design.md, "Small segments"), so the state on disk may lag the answer by
+        that. Read again until it holds every piece or the wait is over."""
+        end = time.monotonic() + wait
+        while True:
+            bad = self.missing(files, ranges)
+            if not bad or time.monotonic() >= end:
+                return bad
+            time.sleep(0.2)
 
     def missing(self, files, ranges):
         """The pieces the store does not hold verified: whole files, and {path: [[a, n]]}."""
@@ -404,7 +416,7 @@ class Release:
             with open(rec + '.tmp', 'w') as f:
                 json.dump(mine, f, indent=1, sort_keys=True)
             os.replace(rec + '.tmp', rec)
-        bad = self.store.missing(whole, self.ranges)
+        bad = self.store.settled(whole, self.ranges)
         if bad:
             raise modelset.ModelError(f'{self}: model-loader reports the request ready, and the store does not hold '
                                       f'{", ".join(bad[:3])}')
