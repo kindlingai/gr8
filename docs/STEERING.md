@@ -59,8 +59,10 @@ mode; without it, loading alone never selects requests. `m4sim` does not expose 
 
 Stock and selected resident prefix caches are separated by exact manifest/scope/schedule/scale identity. Selected
 state is not persisted into stock SSD/remote tiers. Target decode, prefill, prompt tails, teacher-forced scoring and
-speculative target verification carry the selection; draft models and padding remain unselected. All ranks must run
-the same engine build and agree on the loaded receipt.
+speculative target verification carry the selection; draft models and padding remain unselected. Decode carries it
+whether a request runs alone or shares S2 batched steps with other sessions: with a `shared` profile every rank prints
+`steering S2: X of Y S2 MoE layer bindings carry the shared-scope finalize steering` after graph capture, and X / Y is
+the profile's MoE layers over all MoE layers. All ranks must run the same engine build and agree on the loaded receipt.
 
 ## Operator and precision
 

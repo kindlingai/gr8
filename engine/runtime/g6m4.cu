@@ -2419,7 +2419,10 @@ int main(int argc, char** argv)
                 (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
                 (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
                 (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
-                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "");
+                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "") +
+                // the S2 layers carry the shared-scope MoE finalize steering; every rank must (a rank without it would
+                // leave its share of the shared-expert correction out of batched steps)
+                (steering_boot.loaded && steering_profile.scope == steering::Scope::Shared ? " s2steer 1" : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -2440,6 +2443,13 @@ int main(int argc, char** argv)
             {
                 nd.capture_all(sc.limit(), mtp, plan.chunk, kstop.b, cp_step, kstop.solo ? kstop.kmax : 0);
                 m.dfl_tap = tap;
+                if (steering_boot.loaded)    // receipt: with shared scope every captured S2 MoE binding is steered
+                {
+                    int s2moe = 0, s2st = 0;
+                    s2_steer_count(m, s2moe, s2st);
+                    fprintf(stderr, "# rank %d: steering S2: %d of %d S2 MoE layer bindings carry the shared-scope finalize steering (scope %s)\n",
+                            R, s2st, s2moe, steering::scope_name(steering_profile.scope));
+                }
                 wcheck::seal(R);
                 int dev = 0;
                 G6RT_CK(cudaGetDevice(&dev));

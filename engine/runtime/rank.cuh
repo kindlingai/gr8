@@ -951,6 +951,38 @@ inline void qs_narrow(Model& m, int i, bind::Layer& L)
     else bind::make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w}, L.M, L.x_in);
 }
 
+// Shared-scope steering of layer i's MoE decode finalize (tr3.cuh tr3_fin_body): the profile's direction and alpha, the
+// step's per-row scales (k_step_in) and the dot scratch. Every decode binding of the layer takes these same fields: today's
+// layer (layer_base) and the S2 batched layers (s2_layer), so a row is steered by the same arithmetic whichever path runs
+// it. A dense layer, full scope (the MLP consume steers instead) or a model without directions (no profile, the draft
+// model) keeps make_k1's zero fields: the stock finalize, unchanged arguments.
+inline void k1_steer(const Model& m, int i, bind::K1& k)
+{
+    if (!m.layers[i].moe || m.steering_scope != steering::Scope::Shared || i >= (int)m.steering_dir.size()) return;
+    k.a.steer_dir = m.steering_dir[i]; k.a.steer_scale = m.steering_scale;
+    k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
+}
+
+// today's layer i after make_layer: K1 steering, the head-count check, G6_QA_SPLIT narrowing, DEC_SLOT slots
+// (layer_base; s2_bind is the S2 layers' counterpart; s2_steer_test drives both)
+inline void base_bind(Model& m, int i, bind::Layer& L)
+{
+    const Layer& y = m.layers[i];
+    k1_steer(m, i, L.k1);
+    if (L.heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
+    qs_narrow(m, i, L);
+#ifdef DEC_SLOT
+    // DEC_SLOT: o_proj and the K1 finalize / dense fc2 write the partial into the send slot (decslot.cuh)
+    auto slot = [&](int c) {
+        dslot::Slot q;
+        q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.stride = m.f.stride;
+        q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c; q.xt = m.f.xt;
+        return q;
+    };
+    bind::set_slots(L, slot(2 * i), slot(2 * i + 1));
+#endif
+}
+
 #ifdef DEC_S2
 inline const bind::Layer& s2_layer(Model& m, int i, int M);
 inline const bind::Layer& layer_base(Model& m, int i, int M);
@@ -978,24 +1010,7 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
         static const int fuse = getenv("G6_FUSE") ? atoi(getenv("G6_FUSE")) : 1;
         if (const char* e = bind::make_layer(y.T, M, m.sc, io, y.L[M], fuse))
             die("rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
-        if (y.moe && m.steering_scope == steering::Scope::Shared && i < (int)m.steering_dir.size())
-        {
-            bind::K1& k = y.L[M].k1;
-            k.a.steer_dir = m.steering_dir[i]; k.a.steer_scale = m.steering_scale;
-            k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
-        }
-        if (y.L[M].heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
-        qs_narrow(m, i, y.L[M]);
-#ifdef DEC_SLOT
-        // DEC_SLOT: o_proj and the K1 finalize / dense fc2 write the partial into the send slot (decslot.cuh)
-        auto slot = [&](int c) {
-            dslot::Slot q;
-            q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.stride = m.f.stride;
-            q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c; q.xt = m.f.xt;
-            return q;
-        };
-        bind::set_slots(y.L[M], slot(2 * i), slot(2 * i + 1));
-#endif
+        base_bind(m, i, y.L[M]);
         y.built[M] = true;
     }
     return y.L[M];

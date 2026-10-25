@@ -607,8 +607,31 @@ inline void s2_hprev_from_solo(Draft& D, int q, cudaStream_t st)
 #endif
 }
 
+// the K1 steering fields of two bindings agree (the S2 layer against today's layer of the same M)
+inline bool s2_steer_same(const bind::K1& a, const bind::K1& b)
+{
+    return a.a.steer_dir == b.a.steer_dir && a.a.steer_scale == b.a.steer_scale && a.a.steer_part == b.a.steer_part &&
+           a.a.steer_count == b.a.steer_count && std::memcmp(&a.a.steer_alpha, &b.a.steer_alpha, sizeof(float)) == 0;
+}
+// an S2 layer i after make_layer (s2_layer): the head-count check, G6_QA_SPLIT narrowing as layer_base, the MoE
+// finalize's shared-scope steering (k1_steer, refused unless it equals today's layer `base` of the same M), and the
+// DEC_SLOT slots of `base`
+inline void s2_bind(Model& m, int i, const bind::Layer& base, bind::Layer& L)
+{
+    const Layer& y = m.layers[i];
+    if (L.heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
+    qs_narrow(m, i, L);                                 // G6_QA_SPLIT: this rank's tiles of the input GEMVs, as layer_base
+    k1_steer(m, i, L.k1);                               // shared-scope steering of the MoE finalize, as layer_base
+    if (!s2_steer_same(L.k1, base.k1))
+        die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": K1 steering differs from today's layer");
+#ifdef DEC_SLOT
+    bind::set_slots(L, base.o_proj.slot, base.k1.a.slot);
+#endif
+}
 // the bound layer of the step's row class (A1): today's arguments except the k1 split (split_m = cls) and o_proj's
-// fragment source (the concatenated attention rows)
+// fragment source (the concatenated attention rows). The MoE finalize's shared-scope steering is today's (k1_steer in
+// s2_bind): without it the S2 layers keep make_k1's zero steering fields, and batched decode (2+ sessions) would run the
+// steered MoE layers' shared-expert finalize unsteered while solo decode and prefill steer it.
 inline const bind::Layer& s2_layer(Model& m, int i, int M)
 {
     S2Model& s = *m.s2;
@@ -628,14 +651,22 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M)
     std::unique_ptr<bind::Layer> L(new bind::Layer());
     if (const char* e = bind::make_layer(y.T, M, m.sc, io, *L, fuse, s.h.cls))
         die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
-    if (L->heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
-    qs_narrow(m, i, *L);                                // G6_QA_SPLIT: this rank's tiles of the input GEMVs, as layer_base
-#ifdef DEC_SLOT
-    bind::set_slots(*L, base.o_proj.slot, base.k1.a.slot);
-#else
-    (void)base;
-#endif
+    s2_bind(m, i, base, *L);
     return *(s.L[key] = std::move(L));
+}
+// boot receipt, after the S2 graphs are captured: of the bound S2 layers (every (layer, M, cls) key), the MoE ones and
+// those whose finalize carries a shared-scope steering direction
+inline void s2_steer_count(const Model& m, int& moe, int& steered)
+{
+    moe = steered = 0;
+    if (!m.s2) return;
+    for (const auto& kv : m.s2->L)
+    {
+        const bind::K1& k = kv.second->k1;
+        if (!k.on || k.dense) continue;
+        ++moe;
+        steered += k.a.steer_dir != nullptr;
+    }
 }
 
 // attention step of the j-th session of the step on layer i (its rows of the step's inputs, its slot's binding)
