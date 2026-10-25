@@ -73,6 +73,13 @@ public:
                 !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt) &&
                 !set_user_timeout(fd_, user_ms), "control keepalive setup failed");
     }
+    // TCP_NODELAY: send() writes a frame as two segments (4-byte header, then body). With Nagle on, the body waits
+    // for the ACK of the header, and the peer (blocked in recv for the body) delays that ACK by up to 40 ms: every
+    // small frame, such as an admission, reached the workers ~40 ms late. TCP sockets only.
+    void nodelay() {
+        const int on = 1;
+        require(!setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on), "control nodelay setup failed");
+    }
     void send(const std::vector<uint8_t>& body) {
         require(!body.empty() && body.size() <= MAX_BYTES, "control frame size invalid");
         const uint32_t n = uint32_t(body.size());

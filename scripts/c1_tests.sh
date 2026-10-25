@@ -215,7 +215,7 @@ if [ "$TEST" = all ] || [ "$TEST" = kda_g9_det ]; then
 fi
 if [ "$TEST" = all ] || [ "$TEST" = flash_dsa_f16_test ]; then
   [ "$TEST" = all ] && ARGS=()
-  with_flags "$FLASH_FLAGS -I$REPO/engine" build_run flash_dsa_f16_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  with_flags "$FLASH_FLAGS -I$REPO/engine" build_run flash_dsa_f16_test -lcublas -lcublasLt || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$TEST" = all ] || [ "$TEST" = mhc_decode_stage_test ]; then
   [ "$TEST" = all ] && ARGS=()

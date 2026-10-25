@@ -31,7 +31,8 @@ class StageAsyncTest(unittest.TestCase):
         self.assertIn('G6_PF_STAGE_ASYNC on (lane %d, peers %d)', b)
         self.assertIn('check_headroom(f.rank, MP, false)', b)
         self.assertIn('cudaStreamCreateWithPriority(&S.stream, cudaStreamNonBlocking, hi)', b)   # one per lane: built per FlashPrefill
-        self.assertEqual(b.count('cudaEventCreateWithFlags'), 3)
+        stage = b.split('PfPeerStage& S = P.peer_stage;', 1)[1]
+        self.assertEqual(stage.count('cudaEventCreateWithFlags'), 3)   # put, ready, used (G6_PF_SP's events are its own)
 
     def test_issue_at_put_consume_waits_ready_records_used(self):
         put = body(PF, 'inline void pf_put_flash')

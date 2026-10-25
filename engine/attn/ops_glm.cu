@@ -65,6 +65,8 @@ extern "C" const G6AttnOps* g6_attn_ops(void) {
         g6a_qo_run,   // qo_run
         g6a_qo_warm,   // qo_warm
         g6a_replay_run,   // replay_run
+        nullptr,   // bind_reset_pages
+        nullptr,   // bind_check_clear
     };
     return &ops;
 }

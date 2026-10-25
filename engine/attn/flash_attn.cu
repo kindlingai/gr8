@@ -1234,6 +1234,104 @@ __global__ void __launch_bounds__(128) value_project_tc(Input input,int start,in
     }
 }
 
+// G6_PF_MLA_PROJ2 (default on; =0 off): absorb_tc / value_project_tc with a pipelined k loop. The same tiles (64 rows x 64 cols, warp
+// w = rows w*16..+16), the same wmma m16n16k16 half -> float op per k16 step in order 0..K-16, the same bf16 -> fp16
+// weight conversion and the same __float2half_rn store: the same bits. 2-stage smem ring of BK = 32: the activation rows
+// by cp.async, the weights through registers one stage ahead; vectorized epilogue. Bench (n 256, 21 heads): absorb
+// 99.7 -> 81.2 us, value_project 103.3 -> 53.9 us, 0 differing bytes (n 256, 191, 37). TP3 8K A/B: prefill 2495 ->
+// 2523 tok/s, rank-0 8K prefill -42 ms, T=0 hashes unchanged.
+template<bool VPROJ> struct MlaProjB { using T=nvcuda::wmma::row_major; };
+template<> struct MlaProjB<true> { using T=nvcuda::wmma::col_major; };
+__device__ __forceinline__ void mla_cp16(void* s,const void* g,bool v){
+    const unsigned sa=(unsigned)__cvta_generic_to_shared(s);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"::"r"(sa),"l"(g),"r"(v?16:0));
+}
+template<bool VPROJ,class Input>
+__global__ void __launch_bounds__(128) mla_proj2(Input input,int start,int n,const half* ctxh,half* qh){
+    using namespace nvcuda;
+    auto a=resolve(input);if(!a.active)return;
+    constexpr int K=VPROJ?LAT:NOPE,BM=64,BN=64,BK=32,NJ=BN/16;
+    constexpr int XA=BM*BK,WB=BK*BN,NST=K/BK,SM_ST=(XA+WB)*2,SM_O=BM*BN*4;
+    constexpr int SMEM=2*SM_ST>SM_O?2*SM_ST:SM_O,XCH=XA/8,WPT=WB/8/128;
+    __shared__ __align__(128) unsigned char sm[SMEM];
+    const int r0=blockIdx.x*BM,c0=blockIdx.y*BN,h=blockIdx.z,t=threadIdx.x,w=t>>5;
+    const half* xb=VPROJ?ctxh:(const half*)a.q_b;
+    const int xrow0=VPROJ?0:start;   // ctxh rows are relative to start, q_b rows absolute
+    const bf16* __restrict__ wh=VPROJ?(const bf16*)a.uv+(int64_t)h*VD*LAT:(const bf16*)a.uk+(int64_t)h*NOPE*LAT;
+    auto ldX=[&](int slot,int st){
+        half* A=reinterpret_cast<half*>(sm+slot*SM_ST);
+        for(int i=t;i<XCH;i+=128){
+            const int rr=i/(BK/8),kk=(i%(BK/8))*8;
+            const bool v=r0+rr<n;
+            mla_cp16(A+rr*BK+kk,xb+((int64_t)(xrow0+r0+(v?rr:0))*a.heads+h)*K+st*BK+kk,v);
+        }
+        asm volatile("cp.async.commit_group;\n"::);
+    };
+    uint4 wreg[WPT];
+    auto ldW=[&](int st){
+        #pragma unroll
+        for(int q=0;q<WPT;++q){
+            const int i=t+q*128;
+            if(VPROJ){const int dd=i/(BK/8),kk=(i%(BK/8))*8;wreg[q]=__ldg((const uint4*)(wh+(int64_t)(c0+dd)*LAT+st*BK+kk));}
+            else{const int kk=i/(BN/8),ll=(i%(BN/8))*8;wreg[q]=__ldg((const uint4*)(wh+(int64_t)(st*BK+kk)*LAT+c0+ll));}
+        }
+    };
+    auto stW=[&](int slot){
+        half* B=reinterpret_cast<half*>(sm+slot*SM_ST)+XA;
+        #pragma unroll
+        for(int q=0;q<WPT;++q){
+            const bf16* b=(const bf16*)&wreg[q];half h8[8];
+            #pragma unroll
+            for(int m=0;m<8;m++)h8[m]=__float2half_rn(__bfloat162float(b[m]));
+            reinterpret_cast<int4*>(B)[t+q*128]=*(const int4*)h8;
+        }
+    };
+    wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>af;
+    wmma::fragment<wmma::matrix_b,16,16,16,half,typename MlaProjB<VPROJ>::T>bf;
+    wmma::fragment<wmma::accumulator,16,16,16,float>cf[NJ];
+    #pragma unroll
+    for(int j=0;j<NJ;j++)wmma::fill_fragment(cf[j],0.f);
+    ldX(0,0);ldW(0);stW(0);
+    for(int st=0;st<NST;++st){
+        const int cur=st&1;
+        if(st+1<NST){ldX(cur^1,st+1);ldW(st+1);}
+        else asm volatile("cp.async.commit_group;\n"::);
+        asm volatile("cp.async.wait_group 1;\n"::);
+        __syncthreads();
+        const half* A=reinterpret_cast<const half*>(sm+cur*SM_ST);
+        const half* B=A+XA;
+        #pragma unroll
+        for(int k=0;k<BK;k+=16){
+            wmma::load_matrix_sync(af,A+(w*16)*BK+k,BK);
+            #pragma unroll
+            for(int j=0;j<NJ;j++){
+                if(VPROJ)wmma::load_matrix_sync(bf,B+(j*16)*BK+k,BK);
+                else wmma::load_matrix_sync(bf,B+k*BN+j*16,BN);
+                wmma::mma_sync(cf[j],af,bf,cf[j]);
+            }
+        }
+        __syncthreads();
+        if(st+1<NST)stW(cur^1);
+    }
+    asm volatile("cp.async.wait_group 0;\n"::);
+    __syncthreads();
+    float* O=reinterpret_cast<float*>(sm);
+    #pragma unroll
+    for(int j=0;j<NJ;j++)wmma::store_matrix_sync(O+(w*16)*BN+j*16,cf[j],BN,wmma::mem_row_major);
+    __syncthreads();
+    for(int i=t;i<BM*BN/8;i+=128){
+        const int rr=i/(BN/8),cc=(i%(BN/8))*8;
+        if(r0+rr>=n)continue;
+        half z[8];bool bad=false;
+        #pragma unroll
+        for(int m=0;m<8;++m){z[m]=__float2half_rn(O[rr*BN+cc+m]);bad|=!isfinite(__half2float(z[m]));}
+        if(!VPROJ&&bad)error(a,4);
+        half* dst=VPROJ?(half*)a.output+((int64_t)(start+r0+rr)*a.heads+h)*VD+c0+cc
+                       :qh+((int64_t)(r0+rr)*a.heads+h)*LAT+c0+cc;
+        *reinterpret_cast<int4*>(dst)=*reinterpret_cast<const int4*>(z);
+    }
+}
+
 constexpr int PF_DEFAULT_TILE=256;
 constexpr int PF_MAX_ROWS_DEFAULT=4096;
 
@@ -1574,6 +1672,7 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
             ce=cudaFuncSetAttribute(fa_pf::sparse_mla_pf<G6Attn>,cudaFuncAttributeMaxDynamicSharedMemorySize,fa_pf::MLA_SMEM);
         if(ce!=cudaSuccess)return (int)ce;
     }
+    static const bool proj2=[]{const char* e=getenv("G6_PF_MLA_PROJ2");return !(e&&atoi(e)==0);}();   // fa_pf::mla_proj2 (=0: old kernels)
     auto select = [&](int start, int n) {
             if(kp_tc==3)fa_pf::kp_scores_tc_stream<2><<<dim3(pstride/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,pstride);
             else if(kp_tc>=2)fa_pf::kp_scores_tc<2><<<dim3(pstride/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,pstride);
@@ -1599,7 +1698,8 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
             AMARK(1);
         }
         AMARK(2);
-        fa_pf::absorb_tc<<<dim3((n+63)/64,fa::LAT/64,a.heads),128,0,stream>>>(a,start,n,w->qh);
+        if(proj2)fa_pf::mla_proj2<false><<<dim3((n+63)/64,fa::LAT/64,a.heads),128,0,stream>>>(a,start,n,nullptr,w->qh);
+        else fa_pf::absorb_tc<<<dim3((n+63)/64,fa::LAT/64,a.heads),128,0,stream>>>(a,start,n,w->qh);
         AMARK(3);
         // absorb_tc reads queries/UK only. Complete IDs before either MLA path.
         if(owner && start==0){
@@ -1626,7 +1726,8 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
         }
         AMARK(6);
         AMARK(7);
-        fa_pf::value_project_tc<<<dim3((n+63)/64,fa::VD/64,a.heads),128,0,stream>>>(a,start,n,w->ctxh);
+        if(proj2)fa_pf::mla_proj2<true><<<dim3((n+63)/64,fa::VD/64,a.heads),128,0,stream>>>(a,start,n,w->ctxh,nullptr);
+        else fa_pf::value_project_tc<<<dim3((n+63)/64,fa::VD/64,a.heads),128,0,stream>>>(a,start,n,w->ctxh);
         AMARK(8);
     }
     return (int)cudaGetLastError();
