@@ -173,10 +173,10 @@ int main()
     {
         ng.t = &good; ng.kmin = 2; ng.kmax = 7;
         Opt op; op.dsel = true; op.lp = true;
-        const Run plain = run(nullptr, 3, op);
-        const Run a = run(&ng, 3, op);
+        const Run plain = run(nullptr, 1, op);    // DFlash2 right on its first draft only: the choice moves to MTP
+        const Run a = run(&ng, 1, op);
         op.klog = true;
-        const Run b = run(&ng, 3, op);
+        const Run b = run(&ng, 1, op);
         CHECK(plain.st.mtp_rounds > 0);
         CHECK(a.got == base.got && b.got == base.got);
         CHECK(a.st.ngram_rounds > 0);
