@@ -143,7 +143,7 @@ jobs:
           .github/ci/fetch-tokenizer.sh "$RUNNER_TEMP/tokenizer"
           echo "GR8_PSEUDO_TOKENIZER=$RUNNER_TEMP/tokenizer" >> "$GITHUB_ENV"
       - name: The loopback addresses the launch end to end test uses
-        run: for n in 2 3 4; do sudo ifconfig lo0 alias 127.0.0.$n up; done
+        run: for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias $a up; done
       - name: Tests
         run: .github/ci/cpu-tests.sh frontend
 

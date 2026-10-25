@@ -12,9 +12,9 @@ PR's gates table says which ones it ran ([AGENTS.md](../AGENTS.md), "How changes
 
 Both halves need g++, Python 3 with NumPy, and cargo (rustup reads `frontend/g6front-rs/rust-toolchain.toml`). The
 engine half needs Linux. The front-end half also runs on macOS with Apple's clang, and CI runs it there too. On macOS
-the launch end to end test skips unless the loopback has three more addresses:
+the launch end to end test skips unless the loopback has the boxes' addresses:
 
-    for n in 2 3 4; do sudo ifconfig lo0 alias 127.0.0.$n up; done
+    for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias $a up; done
 
 With `GR8_PSEUDO_TOKENIZER` set to a directory of GLM-5.3's tokenizer files, the front-end half also runs the pseudo
 engine's tests below. CI sets it. `.github/ci/fetch-tokenizer.sh DIR` fetches the files.
