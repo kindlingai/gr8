@@ -30,6 +30,7 @@ if [ "$PART" != frontend ]; then
   python3 -m unittest discover -s tools/health
   python3 -m unittest discover -s bench/gate/tests
   python3 -m unittest discover -s tools/ngram/tests
+  python3 -m unittest discover -s tools/query
   python3 tools/s2_costfit.py --selftest
   (cd engine/tests && python3 -m unittest test_prefix_reuse)
   # the container's compose file and entrypoint
