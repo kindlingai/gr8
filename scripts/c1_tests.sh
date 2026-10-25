@@ -11,7 +11,10 @@
 # --time: MXFP8 vs INT4 head GEMV) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same
 # weights, byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each
 # row as solo decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row
-# against each session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP).
+# against each session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP). headgroup_test,
+# cpgroups and the Flash tests (flash_kpool_stream_test, flash_sparse_mla_test, flash_sparse_mla_v2_test, kda_g9_det,
+# flash_dsa_f16_test, mhc_decode_stage_test) build in one fixed configuration each, whatever G6_NR and EXTRA say
+# (docs/TESTING.md).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -34,9 +37,11 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 -DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
 -DG6_CP=1 -DG6_CP_PF_HASH2=1 -DDEC_IDX31=1 -DPF_QO_DEDUP=1"
 FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} ${EXTRA:-}"
-build_run() {   # build_run <test> <extra sources...>  (test args in ARGS)
-  local name=$1; shift
-  local SRC="$REPO/engine/runtime/tests/$name.cu" BIN="$OUT/$name"
+build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a test outside runtime/tests is a path under engine/
+  local src=$1; shift
+  case "$src" in */*) ;; *) src=runtime/tests/$src ;; esac
+  local name=${src##*/}
+  local SRC="$REPO/engine/$src.cu" BIN="$OUT/$name"
   local stale=0
   [ -x "$BIN" ] || stale=1
   [ "$(cat "$BIN.flags" 2>/dev/null)" = "$FLAGS" ] || stale=1
@@ -55,6 +60,17 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS)
   "$BIN" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
   return $rc
 }
+# with_flags <flags> <command...>: the command with FLAGS = the arch and <flags> alone, for a test built in one fixed
+# configuration whatever G6_NR and EXTRA say
+with_flags() {
+  local saved=$FLAGS r=0
+  FLAGS="-gencode=arch=compute_$A,code=sm_$A $1"; shift
+  "$@" || r=$?
+  FLAGS=$saved
+  return $r
+}
+FLASH_FLAGS="-DG6_MODEL_FLASH=1 -DG6_NR=2"
+KVC="$REPO/engine/attn/kvchunks.cu"
 # kvlib_ready: target/release/libg6kvman.a for the tests that link it, built first when cargo is on PATH; 1 (with
 # the reason) when it is missing or older than the crate's sources
 kvlib_ready() {
@@ -176,6 +192,34 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = dhead_i4_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run dhead_i4_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = headgroup_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$K1H2_FLAGS -DG6_NR=3" build_run attn/tests/headgroup_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = cpgroups ]; then
+  # exit 3 on a byte difference; the timing it prints is not checked
+  [ "$TEST" = all ] && ARGS=()
+  [ ${#ARGS[@]} -gt 0 ] || ARGS=(131072 75000 3)
+  with_flags "$K1H2_FLAGS -DG6_NR=4 -DDEC_S2 -DPF_F12" build_run attn/tests/cpgroups "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+for t in flash_kpool_stream_test flash_sparse_mla_test flash_sparse_mla_v2_test; do
+  if [ "$TEST" = all ] || [ "$TEST" = $t ]; then
+    [ "$TEST" = all ] && ARGS=()
+    with_flags "$FLASH_FLAGS" build_run attn/tests/$t "$REPO/engine/attn/flash_bind.cu" "$KVC" -lcuda || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  fi
+done
+if [ "$TEST" = all ] || [ "$TEST" = kda_g9_det ]; then
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$FLASH_FLAGS -DG9_CONV_DBG=1" build_run kda/tests/kda_g9_det || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = flash_dsa_f16_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$FLASH_FLAGS -I$REPO/engine" build_run flash_dsa_f16_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = mhc_decode_stage_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$FLASH_FLAGS -I$REPO/engine" build_run mhc_decode_stage_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"
