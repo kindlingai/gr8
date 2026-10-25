@@ -27,7 +27,7 @@ What the two halves cover, and how to run one part alone:
 | the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree, across shrinks and grows of the pool), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | engine | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
 | the exlr8 dense decoder against `loader/exlr8.py` (a synthetic fixture), and the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved | engine | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
 | the gate harness | engine | `python3 -m unittest discover bench/gate/tests` |
-| the n-gram draft source replay (#56: table, chain and tree proposals, acceptance, held-out folds) | engine | `python3 -m unittest discover -s tools/ngram/tests` |
+| the n-gram draft source replay and A/B tool (#56: table, chain and tree proposals, acceptance, held-out folds; `ab.py` against a stub server) | engine | `python3 -m unittest discover -s tools/ngram/tests` |
 | the rank health probe | engine | `python3 -m unittest discover tools/health` |
 | the S2 shim | front end | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | front end | `cd frontend/g6front-rs && cargo test --release` |

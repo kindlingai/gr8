@@ -7,14 +7,19 @@ near-certain continuations would propose drafts that the target accepts. Python 
 |---|---|
 | `capture.py` | step 1: greedy generations with the top-k log-probabilities of every generated token, through the front end |
 | `ngram.py` | steps 2-4: the table, chain and tree proposals, prompt lookup (#34) for comparison, and the replay |
+| `ab.py` | the engine gate: one boot with `NGRAM` unset, one with it set, the same held-out prompts at temperature 0; outputs byte for byte, decode tok/s and tokens per verify step by workload |
 | `data/prompts.json` | 45 agentic coding prompts: code (16), edit (8), tool calls with a tool list and multi-turn transcripts (11), JSON (6), prose (4) |
+| `data/prompts_tool2.json` | 24 more tool-call turns for the table (the first cluster replay's tool row rested on 11): first turns and transcripts after one or two tool results |
+| `data/ab_prompts.json` | 15 prompts held out of both table sets for the A/B: tool (6), edit (3), JSON (3), code (2), prose (1) |
 | `tests/` | `python3 -m unittest discover -s tools/ngram/tests` |
 
 ## Run
 
-    # 1. traces, on a booted cluster (any TP): one line per prompt
-    python3 tools/ngram/capture.py --url http://127.0.0.1:8100 --prompts tools/ngram/data/prompts.json \
-        --out traces.jsonl --max-tokens 1024 --top 8
+    # 1. traces, on a booted cluster (any TP): one line per prompt, both table sets into one file
+    for p in prompts prompts_tool2; do
+      python3 tools/ngram/capture.py --url http://127.0.0.1:8100 --prompts tools/ngram/data/$p.json \
+          --out traces.jsonl --max-tokens 1024 --top 8 --effort low
+    done
     # 2. replay: 5 folds by prompt (table from 80%, replay the other 20%), chain and tree, rows 3/5/8
     python3 tools/ngram/ngram.py replay traces.jsonl --folds 5 --json replay.json
     # 3. table size against hit rate
@@ -22,6 +27,12 @@ near-certain continuations would propose drafts that the target accepts. Python 
 
     # 4. the engine's table (G6_NGRAM / NGRAM=FILE, engine/runtime/ngram_lookup.h), calibrated on held-out folds
     python3 tools/ngram/ngram.py export traces.jsonl --out ngram.tab
+
+    # 5. the engine gate on two boots of the same build (NGRAM unset, then NGRAM=ngram.tab), same settings
+    python3 tools/ngram/ab.py run --url http://127.0.0.1:8100 --prompts tools/ngram/data/ab_prompts.json \
+        --label off --out ab_off.json --effort low --traces traces.jsonl
+    python3 tools/ngram/ab.py run ... --label on --out ab_on.json            # after the reboot with NGRAM set
+    python3 tools/ngram/ab.py compare ab_off.json ab_on.json                 # exits 1 on any output difference
 
 `export` writes each context's top token and GLM's mean probability for it, and a calibration: per probability bucket
 (`spec_len.h`'s edges), the share of held-out chain tokens GLM produced after a right prefix, shrunk toward the bucket's
@@ -68,3 +79,14 @@ the rounds not served by prompt lookup, against what happened.
 `speedup vs 1 row`: tokens per ms against plain decoding with the same verify table. It ignores the MTP or DFlash2
 drafts the engine would otherwise make, so compare a source's tokens per round with theirs from the engine's log, not
 the speedup with 1.
+
+## The A/B (`ab.py`)
+
+`run` templates each prompt on the server as `capture.py` does, then sends it to `/v1/completions` at temperature 0
+with `return_token_ids` and `return_step_stats`, one request at a time: the table serves only a request decoding alone.
+It asks for no log-probabilities, so decoding runs as it does when serving. Decode tok/s is (tokens - 1) over the
+request's `step_stats.decode_s` (the first token to the end, on the front end's clock); replies under 50 tokens are not
+timed. `--traces` refuses a prompt whose ids are in the table's traces. `compare` fails on any prompt whose ids differ
+or on runs with different settings or prompt files, and prints, by workload, the median decode tok/s and the tokens
+per verify step on each side. With `G6ENV_X="G6_NGRAM_LOG=1"` rank 0 also logs each table round, and `service.h`
+prints per request how many rounds the table took and how many of its tokens were accepted.
