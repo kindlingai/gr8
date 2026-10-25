@@ -1,8 +1,9 @@
 # Steering profile artifact tools
 
 `release.py` validates, packs and materializes a finished steering profile using only Python's standard library.
-Profile extraction belongs to the publisher. These tools implement the [schema-v1 host contract](../../docs/STEERING-PROFILE-SCHEMA.md);
-serving, launcher flags, profile discovery and GPU steering are separate integrations.
+`contrast.py` makes a profile from pairs of contrasting answers ([below](#make-a-profile-from-contrastive-answers)).
+These tools implement the [schema-v1 host contract](../../docs/STEERING-PROFILE-SCHEMA.md); serving, launcher flags,
+profile discovery and GPU steering are separate integrations.
 
 ## Commands
 
@@ -82,6 +83,79 @@ STEERING_PROFILE_CHECK=/tmp/steering_profile_check python3 -m unittest discover 
 The CPU CI entry point builds the bridge and runs the complete suite. Running Python alone skips only the C++ parity
 test. The shared fixtures live at `engine/runtime/tests/fixtures/steering_contract.json`; scale cases exercise the
 manifest alpha bounds here, with request-scale canonicalization covered by the host contract tests.
+
+## Make a profile from contrastive answers
+
+A pairs file holds one JSON object per line: a prompt and two answers to it. `positive` shows the behaviour to steer
+toward and `negative` the behaviour to steer away from. Keep everything else about the two answers the same (topic,
+length, format), since the profile learns whatever separates them. An optional `system` adds a system turn.
+
+```json
+{"prompt": "Why is the sky blue?", "positive": "天空之所以是蓝色的……", "negative": "The sky is blue because ..."}
+```
+
+`contrast.py` teacher-forces both answers through the engine and records each layer's writer outputs over the answer
+tokens. The direction of a layer is the unit difference of the positive and negative mean outputs. The alpha moves the
+negative mean's component along it onto the positive one's, `alpha = 1 - c+ / c-`. The operator shrinks
+(`0 < alpha < 1`) or flips (`alpha > 1`) a component but cannot grow one, and the schema caps alpha at 4, so a layer
+qualifies only where alpha lands in `[0, 4]`. `fit` prints every layer's numbers and which it kept. Profiles are
+`full` scope.
+
+1. Tokenize against the running server. This renders each (prompt, answer) with the served chat template and finds
+   where the answers start and end:
+
+   ```sh
+   python3 tools/steering/contrast.py tokenize pairs.jsonl work --api http://HEAD:8100 --model glm-5.3
+   ```
+
+2. Stop serving. Copy `work/` to the same path on every rank. On each rank, turn that rank's last supervisor
+   `engine:` line into an offline command (no `--serve`, MTP, prefill lanes, drafter, KV tiers or steering; one
+   generated token per sequence):
+
+   ```sh
+   python3 tools/steering/contrast.py argv out/supervisor.log work > work/offline.sh
+   ```
+
+3. Run the offline command on every rank, workers first, from the tree root. Rank 0 also gets `G6_RESID_DUMP`, about
+   3.9 MB per token for GLM-5.3, so stream it into the reducer through a fifo (`reduce` needs numpy):
+
+   ```sh
+   mkfifo work/dump
+   python3 tools/steering/contrast.py reduce work < work/dump &
+   G6_RESID_DUMP=work/dump sh work/offline.sh
+   ```
+
+   `reduce` checks that the dump's row count matches `work/seqs.json` and writes `work/sums.npz`.
+
+4. Fit, taking the model identity from any profile manifest made for the same served model:
+
+   ```sh
+   python3 tools/steering/contrast.py fit work profiles/my-profile --base OTHER/manifest.json --name my-profile-v1
+   ```
+
+   `--layers 10-60` limits the candidates. `--strength 0.5` goes half way from `c-` to `c+`. A request's
+   `steering_scale` multiplies the alphas again at serving time.
+
+Each layer's alpha closes the whole gap on its own, and the layers add up, so a full-strength profile overshoots.
+Sweep the request scale and read the answers. Scales past the good range make the output mix both behaviours, then
+break the text.
+
+The operator scales a component and never adds one, so a profile pushes toward the positive side only by shrinking
+or flipping what is there. On a layer where the two means sit on opposite sides, alpha is above 1 and the operator
+flips the component, whichever side the input starts on. Swapping positive and negative gives nearly the same
+operator, not the opposite one: a "back to the negative" profile needs an additive term the schema does not have.
+
+[examples/en-zh](examples/en-zh) makes an English-to-Chinese profile this way. `make_pairs.py` asks the served model
+for an English and a Chinese answer to each question. `score.py` measures the share of Chinese in held-out answers at
+several scales. `heldout-zh.txt` holds the same held-out questions in Chinese, to check that Chinese questions keep
+Chinese answers.
+
+Measured on GLM-5.3 with 48 pairs (52 layers kept): on the 16 held-out English questions, the Chinese share of the
+answers was 0 at scale 0, 0.12 at 0.35, 0.67 at 0.5, 0.66 at 0.65 (9 of 16 mostly Chinese), 0.25 at 1 and 0.11 at 2,
+where the text broke down. Chinese questions kept 0.99 Chinese up to 0.65 and fell to 0.48 at 1. With
+`reasoning_effort` medium the reasoning stays English and the answer switches: six runs at 0.5 and 0.65 gave 0.93 to
+0.97. With the template's default effort the long English reasoning pulls the answer back toward English, and
+repeated runs vary.
 
 ## Offline qualification reports
 

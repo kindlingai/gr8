@@ -85,8 +85,8 @@ Those differences prevent treating every path as an exact FP32 projection of an 
 
 ## Qualification and provenance
 
-[Artifact tools](../tools/steering/README.md) pack a publisher-provided finished profile deterministically and preserve
-its exact manifest bytes. Extraction stays with its publisher. The [offline report tools](../tools/steering/REPORTS.md)
+[Artifact tools](../tools/steering/README.md) pack a finished profile deterministically and preserve its exact
+manifest bytes. `contrast.py` there makes a profile from contrastive answer pairs. The [offline report tools](../tools/steering/REPORTS.md)
 summarize frozen paired results and normalized CUDA operation counts. They do not collect measurements, validate
 external judges or establish end-to-end behavior/accuracy/performance.
 
