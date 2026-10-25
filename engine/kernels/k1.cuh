@@ -115,6 +115,7 @@ __device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
     if (threadIdx.x >= 32 || !k1_slot<SH>(A, plan, s, e, mask, ss)) return;
     const long long* tr = A.t_tab + 6 * e;
     const int nb = static_cast<int>(tr[3]);
+    if (nb <= 0) return;                                           // an expert without blocks on this rank: no ranges
     constexpr size_t MB = static_cast<size_t>(KSH) * 8 * 32;      // bytes of one fc1 matrix or fc2 block per bit of width
     size_t f1lo, f1hi;
     tr3_unit(A.t_kmix, e, tr, 0, f1lo);                          // units are back to back in unit order
@@ -123,6 +124,7 @@ __device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
     const size_t f2lo = static_cast<size_t>(tr[1]), f2hi = f2lo + static_cast<size_t>(nb) * static_cast<size_t>(tr[4]) * MB;
     const uintptr_t g = uintptr_t(1) << A.tlbw;
     auto warm = [&](const uint8_t* base, size_t lo, size_t hi) {
+        if (hi <= lo) return;
         const uintptr_t a0 = reinterpret_cast<uintptr_t>(base + lo), a1 = reinterpret_cast<uintptr_t>(base + hi);
         for (uintptr_t a = (a0 & ~(g - 1)) + threadIdx.x * g; a < a1; a += 32 * g)
             asm volatile("prefetch.global.L2 [%0];" :: "l"(a < a0 ? a0 : a) : "memory");
@@ -249,7 +251,8 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
     int* done = A.fctl + 1;
     int* sdone = A.fctl + 1 + SMAX * g6nr::EB;
     if (blockIdx.x == 0 && t == 0) A.ctl[2] = plan;
-    if (A.tlbw && static_cast<int>(blockIdx.x) < nsl) k1_tlbw<SH>(A, plan, blockIdx.x);
+    if (A.tlbw)                                                         // every item slot, also past a smaller persistent grid
+        for (int s = blockIdx.x; s < nsl; s += gridDim.x) k1_tlbw<SH>(A, plan, s);
     for (;;)
     {
         if (t == 0) s_item = atomicAdd(A.fctl, 1);
