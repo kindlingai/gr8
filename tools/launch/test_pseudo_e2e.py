@@ -56,19 +56,25 @@ class PseudoEndToEnd(unittest.TestCase):
         return subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), cmd, '--no-config', '--g6-home', self.home,
                                *argv], env=self.env, capture_output=True, text=True, timeout=120)
 
+    def chat(self, text):
+        body = json.dumps({'model': 'glm-5.3', 'max_tokens': 200, 'messages': [{'role': 'user', 'content': text}]})
+        req = urllib.request.Request(f'http://127.0.0.1:{self.api}/v1/chat/completions', body.encode(),
+                                     {'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)['choices'][0]['message']
+
     def test_up_chat_down(self):
         r = self.gr8('up', '--peers', '127.0.0.1', '--model', self.rel, '--port', str(self.api),
                      '--control-port', str(free_port()), '--py', sys.executable, '--front-bin', FRONT)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn(f'serving: http://127.0.0.1:{self.api}/v1', r.stdout)
-        body = json.dumps({'model': 'glm-5.3', 'max_tokens': 200,
-                           'messages': [{'role': 'user', 'content': 'What is the capital of Australia?'}]}).encode()
-        req = urllib.request.Request(f'http://127.0.0.1:{self.api}/v1/chat/completions', body,
-                                     {'Content-Type': 'application/json'})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            msg = json.load(resp)['choices'][0]['message']
+        msg = self.chat('What is the capital of Australia?')
         self.assertIn('Canberra', msg['content'])
         self.assertTrue(msg.get('reasoning_content') or msg.get('reasoning'))
+        # the KV outlives a request
+        self.assertEqual(self.chat('What is the value of x?')['content'], 'x is not set.')
+        self.assertEqual(self.chat('set x to 5')['content'], 'Done: x is now 5.')
+        self.assertEqual(self.chat('What is x?')['content'], 'x is 5.')
         self.assertIn('stopped', self.gr8('down').stdout)
 
 

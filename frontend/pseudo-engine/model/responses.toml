@@ -392,6 +392,35 @@ specificity = 5
 content = "The lighthouse keeper climbed the stairs again, as he had every night for thirty years. "
 fill = true
 
+# The KV: "set x to 5" writes x into the engine's JSON object of variables, and later requests read it back.
+[[rule]]
+name = "kv-set"
+match = '(?i)^set (?P<key>[A-Za-z_]\w*) to (?P<value>[^\n]+?)\.?$'
+specificity = 15
+reasoning = "The user wants ${key} set to ${value}."
+content = "Done: ${key} is now ${value}."
+set = { "${key}" = "${value}" }
+
+[[rule]]
+name = "kv-get"
+match = '(?i)^what is (?:the value of )?(?P<key>[A-Za-z_]\w*)\??$'
+needs = ["${key}"]
+specificity = 15
+reasoning = "${key} was set earlier."
+content = "${key} is {{${key}}}."
+
+[[rule]]
+name = "kv-unset"
+match = '(?i)^what is the value of (?P<key>[A-Za-z_]\w*)\??$'
+specificity = 14
+content = "${key} is not set."
+
+[[rule]]
+name = "kv-all"
+match = '(?i)^(?:list|show) (?:all )?(?:the )?variables\.?$'
+specificity = 15
+content = "{{*}}"
+
 [[rule]]
 name = "explain"
 match = '(?i)^(?:explain|what is|what are) (?P<topic>[^?.]+)'

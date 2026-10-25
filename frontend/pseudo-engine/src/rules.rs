@@ -1,17 +1,23 @@
 //! The pseudo model's weights: a TOML file of rules. A rule is a regex over one part of the prompt and the reply it
 //! gives. Every rule that matches is a candidate; the most specific wins (its `specificity`, then the longer match,
 //! then the earlier rule), and the candidates' weights give the logprobs and, with a seed, the sampling.
+//!
+//! A rule's `set` writes values into the KV, one JSON object the engine keeps across requests, and `{{name}}` in a
+//! reply reads one back (`{{*}}`: the whole object). `needs` names the keys that must be set for the rule to match.
 
 use std::collections::BTreeMap;
 
 use regex::{Captures, Regex};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::prompt::{Prompt, THINK_CLOSE, TOOL_CLOSE, TOOL_OPEN};
 
 pub const STOP_USER: &str = "<|user|>";
 pub const STOP_OBSERVATION: &str = "<|observation|>";
+
+/// The variables rules set.
+pub type Kv = Map<String, Value>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +78,10 @@ struct RuleSrc {
     calls: Vec<CallSrc>,
     #[serde(default)]
     fill: bool,
+    #[serde(default)]
+    set: BTreeMap<String, String>,
+    #[serde(default)]
+    needs: Vec<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -84,6 +94,8 @@ struct ReplySrc {
     calls: Vec<CallSrc>,
     #[serde(default)]
     fill: bool,
+    #[serde(default)]
+    set: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -114,6 +126,7 @@ pub struct Rule {
     re: Regex,
     on: Scope,
     tools: Vec<String>,
+    needs: Vec<String>,
     pub specificity: i64,
     reply: ReplySrc,
 }
@@ -152,8 +165,10 @@ impl Rules {
             if rules.iter().any(|x: &Rule| x.name == r.name) {
                 return Err(format!("rule {}: the name is used twice", r.name));
             }
-            let reply = ReplySrc { reasoning: r.reasoning, content: r.content, calls: r.calls, fill: r.fill };
-            rules.push(Rule { name: r.name, re, on: r.on, tools: r.tools, specificity: r.specificity, reply });
+            let reply =
+                ReplySrc { reasoning: r.reasoning, content: r.content, calls: r.calls, fill: r.fill, set: r.set };
+            let (on, tools, needs, specificity) = (r.on, r.tools, r.needs, r.specificity);
+            rules.push(Rule { name: r.name, re, on, tools, needs, specificity, reply });
         }
         if f.engine.chunk == 0 {
             return Err("engine.chunk must be at least 1".into());
@@ -166,8 +181,8 @@ impl Rules {
         Rules::parse(&src).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Every rule that matches `p`, best first, then the fallback.
-    pub fn candidates<'a>(&'a self, p: &'a Prompt) -> Vec<Candidate<'a>> {
+    /// Every rule that matches `p` with the keys it needs set in `kv`, best first, then the fallback.
+    pub fn candidates<'a>(&'a self, p: &'a Prompt, kv: &Kv) -> Vec<Candidate<'a>> {
         let mut out: Vec<Candidate> = Vec::new();
         for r in &self.rules {
             if !r.tools.iter().all(|t| t == "*" && !p.tools.is_empty() || p.has_tool(t)) {
@@ -184,6 +199,9 @@ impl Rules {
                 Scope::User => continue,
             };
             if let Some(c) = r.re.captures(text) {
+                if !r.needs.iter().all(|k| kv.contains_key(&expand(&c, k))) {
+                    continue;
+                }
                 let len = c.get(0).map_or(0, |m| m.len());
                 out.push(Candidate { rule: Some(r), caps: Some(c), len });
             }
@@ -194,17 +212,13 @@ impl Rules {
         out
     }
 
-    /// The reply text a candidate gives `p`, its stop marker last unless the reply fills to max_tokens.
-    pub fn reply(&self, c: &Candidate, p: &Prompt) -> Reply {
+    /// The reply text a candidate gives `p` with the variables in `kv`, its stop marker last unless the reply fills to
+    /// max_tokens, and what it sets.
+    pub fn reply(&self, c: &Candidate, p: &Prompt, kv: &Kv) -> Reply {
         let src = c.rule.map_or(&self.fallback, |r| &r.reply);
-        let fill = |s: &str| match &c.caps {
-            Some(caps) => {
-                let mut out = String::new();
-                caps.expand(s, &mut out);
-                out
-            }
-            None => s.to_string(),
-        };
+        let caps = |s: &str| c.caps.as_ref().map_or_else(|| s.to_string(), |caps| expand(caps, s));
+        let fill = |s: &str| recall(&caps(s), kv);
+        let set = src.set.iter().map(|(k, v)| (caps(k), scalar(&caps(v)))).collect();
         let calls: Vec<(String, String)> = src
             .calls
             .iter()
@@ -226,12 +240,12 @@ impl Rules {
                 .cloned()
                 .unwrap_or_else(|| first_tool_call(p));
             let head = if open.trim().is_empty() { name } else { String::new() };
-            return Reply { text: format!("{head}{args}{TOOL_CLOSE}{STOP_OBSERVATION}"), fill: None };
+            return Reply { text: format!("{head}{args}{TOOL_CLOSE}{STOP_OBSERVATION}"), fill: None, set };
         }
         let content = fill(&src.content);
         if !p.chat {
             // a raw completion: the text goes on, no reasoning, no turn markers
-            return Reply { text: format!("{content}{STOP_USER}"), fill: None };
+            return Reply { text: format!("{content}{STOP_USER}"), fill: None, set };
         }
         let mut text = String::new();
         if !p.think_closed {
@@ -243,18 +257,53 @@ impl Rules {
             text += &format!("{TOOL_OPEN}{name}{args}{TOOL_CLOSE}");
         }
         if src.fill {
-            return Reply { text, fill: Some(if content.is_empty() { " ".into() } else { content }) };
+            return Reply { text, fill: Some(if content.is_empty() { " ".into() } else { content }), set };
         }
         text += if calls.is_empty() { STOP_USER } else { STOP_OBSERVATION };
-        Reply { text, fill: None }
+        Reply { text, fill: None, set }
     }
 }
 
-/// A reply's text, and with `fill` the text it repeats after it until max_tokens.
+/// A reply's text, with `fill` the text it repeats after it until max_tokens, and the variables it sets.
 #[derive(Debug, PartialEq)]
 pub struct Reply {
     pub text: String,
     pub fill: Option<String>,
+    pub set: Vec<(String, Value)>,
+}
+
+fn expand(caps: &Captures, s: &str) -> String {
+    let mut out = String::new();
+    caps.expand(s, &mut out);
+    out
+}
+
+/// `s` with each `{{name}}` replaced by that variable (a string as itself, anything else as JSON, nothing when it is
+/// unset), and `{{*}}` by the whole KV.
+fn recall(s: &str, kv: &Kv) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("{{") {
+        let Some(j) = rest[i..].find("}}") else { break };
+        out += &rest[..i];
+        let name = &rest[i + 2..i + j];
+        out += &match (name, kv.get(name)) {
+            ("*", _) => Value::Object(kv.clone()).to_string(),
+            (_, Some(Value::String(v))) => v.clone(),
+            (_, Some(v)) => v.to_string(),
+            (_, None) => String::new(),
+        };
+        rest = &rest[i + j + 2..];
+    }
+    out + rest
+}
+
+/// A set value: a JSON number, true, false or null as itself, anything else as a string.
+fn scalar(s: &str) -> Value {
+    match serde_json::from_str::<Value>(s.trim()) {
+        Ok(v @ (Value::Number(_) | Value::Bool(_) | Value::Null)) => v,
+        _ => Value::String(s.to_string()),
+    }
 }
 
 /// An argument as GLM writes it: a string as itself (captures filled in), anything else as JSON.
@@ -345,28 +394,29 @@ content = "I don't know."
     fn the_most_specific_rule_wins_then_the_longer_match() {
         let r = Rules::parse(RULES).unwrap();
         let p = prompt("What is the weather in Paris?", true);
-        let names: Vec<_> = r.candidates(&p).iter().map(|c| c.name().to_string()).collect();
+        let names: Vec<_> = r.candidates(&p, &Kv::new()).iter().map(|c| c.name().to_string()).collect();
         assert_eq!(names, ["weather", "short", "weather-no-tool", "fallback"]);
         // without the tool the tool rule drops out
         let p = prompt("What is the weather in Paris?", false);
-        assert_eq!(r.candidates(&p)[0].name(), "short");
+        assert_eq!(r.candidates(&p, &Kv::new())[0].name(), "short");
         let p = prompt("Tell me a joke", false);
-        assert_eq!(r.candidates(&p)[0].name(), "fallback");
+        assert_eq!(r.candidates(&p, &Kv::new())[0].name(), "fallback");
     }
 
     #[test]
     fn captures_fill_the_reply_and_its_call() {
         let r = Rules::parse(RULES).unwrap();
         let p = prompt("What is the weather in Paris?", true);
-        let c = r.candidates(&p);
+        let c = r.candidates(&p, &Kv::new());
         assert_eq!(
-            r.reply(&c[0], &p),
+            r.reply(&c[0], &p, &Kv::new()),
             Reply {
                 text: "The user wants the weather in Paris.</think>Checking Paris.<tool_call>get_weather\
 <arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value>\
 <arg_key>metric</arg_key><arg_value>true</arg_value></tool_call><|observation|>"
                     .into(),
                 fill: None,
+                set: Vec::new(),
             }
         );
     }
@@ -378,18 +428,18 @@ content = "I don't know."
             "<|user|>weather in Paris<|assistant|></think><tool_call>get_weather</tool_call>\
 <|observation|><tool_response>{\"temp_c\": 21}</tool_response><|assistant|><think>",
         );
-        let c = r.candidates(&after);
+        let c = r.candidates(&after, &Kv::new());
         assert_eq!(c[0].name(), "after-weather");
-        assert_eq!(r.reply(&c[0], &after).text, "Thinking.</think>It is 21 degrees.<|user|>");
+        assert_eq!(r.reply(&c[0], &after, &Kv::new()).text, "Thinking.</think>It is 21 degrees.<|user|>");
         let mut p = prompt("What is the weather in Paris?", true);
         p.think_closed = true;
-        let c = r.candidates(&p);
-        assert!(r.reply(&c[0], &p).text.starts_with("Checking Paris."));
+        let c = r.candidates(&p, &Kv::new());
+        assert!(r.reply(&c[0], &p, &Kv::new()).text.starts_with("Checking Paris."));
         let mut forced = prompt("What is the weather in Paris?", true);
         forced.think_closed = true;
         forced.open_call = Some(String::new());
-        let c = r.candidates(&forced);
-        assert_eq!(r.reply(&c[0], &forced).text, "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+        let c = r.candidates(&forced, &Kv::new());
+        assert_eq!(r.reply(&c[0], &forced, &Kv::new()).text, "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
 <arg_key>days</arg_key><arg_value>3</arg_value><arg_key>metric</arg_key><arg_value>true</arg_value></tool_call><|observation|>");
     }
 
@@ -397,12 +447,48 @@ content = "I don't know."
     fn weights_follow_the_ranking() {
         let r = Rules::parse(RULES).unwrap();
         let p = prompt("What is the weather in Paris?", true);
-        let c = r.candidates(&p);
+        let c = r.candidates(&p, &Kv::new());
         let w = weights(&c, 0.0);
         assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         assert!(w.windows(2).all(|x| x[0] >= x[1]) && w[0] > 0.99);
         // a higher temperature spreads the mass
         assert!(weights(&c, 20.0)[1] > w[1]);
+    }
+
+    #[test]
+    fn rules_set_and_recall_variables() {
+        let r = Rules::parse(
+            r#"
+[[rule]]
+name = "set"
+match = '^set (?P<k>\w+) to (?P<v>.+)$'
+content = "Done."
+set = { "${k}" = "${v}" }
+
+[[rule]]
+name = "get"
+match = '^what is (?P<k>\w+)$'
+needs = ["${k}"]
+content = "${k} is {{${k}}}; all: {{*}}"
+
+[fallback]
+content = "${k} is not set."
+"#,
+        )
+        .unwrap();
+        let mut kv = Kv::new();
+        for (msg, v) in [("set x to 5", Value::from(5)), ("set name to Ada Lovelace", Value::from("Ada Lovelace"))] {
+            let p = prompt(msg, false);
+            let reply = r.reply(&r.candidates(&p, &kv)[0], &p, &kv);
+            assert_eq!(reply.set, [(msg.split(' ').nth(1).unwrap().to_string(), v)]);
+            kv.extend(reply.set);
+        }
+        let p = prompt("what is x", false);
+        let c = r.candidates(&p, &kv);
+        assert_eq!(c[0].name(), "get");
+        assert!(r.reply(&c[0], &p, &kv).text.ends_with(r#"x is 5; all: {"x":5,"name":"Ada Lovelace"}<|user|>"#));
+        let p = prompt("what is y", false);
+        assert_eq!(r.candidates(&p, &kv)[0].name(), "fallback", "get needs y");
     }
 
     #[test]
