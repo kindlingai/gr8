@@ -127,12 +127,9 @@ public:
                 grant_pages_ok(config_, req, g.run.pages), "session payload/grant mismatch");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
-        if (r.gram.on()) {
-            // the front end compiled the same schema with the same XGrammar before sending it, so this does not throw
-            // for a request it passed; a failure stops this session's grammar, not the engine
-            try { s.grammar = g6rt::GrammarRef(g6rt::grammar_open(r.gram).release(), g6rt::GrammarDeleter{}); }
-            catch (const std::exception& e) { fprintf(stderr, "# s2: request %llu: grammar off: %s\n", (unsigned long long)g.req.id, e.what()); }
-        }
+        // the head compiled this grammar before queueing the request (Service::controller), so a failure here means
+        // the ranks disagree, and the epoch ends
+        if (r.gram.on()) s.grammar = g6rt::GrammarRef(g6rt::grammar_open(r.gram).release(), g6rt::GrammarDeleter{});
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
         require(!head_ || s.emitter.f, "cannot open S2 response");
         if (s.emitter.f) {

@@ -5,13 +5,17 @@ use std::path::Path;
 
 use xgrammar::{CompiledGrammar, GrammarCompiler, GrammarMatcher, TokenizerInfo};
 
+const CACHE_BYTES: usize = 256 << 20;
+
 pub struct Grammars(GrammarCompiler);
 
 impl Grammars {
     pub fn load(model_dir: &Path, vocab_size: usize) -> Result<Grammars, String> {
         let info = TokenizerInfo::from_path(model_dir, Some(vocab_size), None)
             .map_err(|e| format!("{}: XGrammar tokenizer info: {e}", model_dir.display()))?;
-        Ok(Grammars(GrammarCompiler::new(&info)))
+        // the cache keeps compiled schemas for later requests. A request picks its schema, and one short `pattern`
+        // compiles to 41 MB, so the cache is capped: past the cap, the least recently used schema is compiled again
+        Ok(Grammars(GrammarCompiler::with(&info, None, None, Some(CACHE_BYTES))))
     }
 
     /// A JSON schema's grammar, keys in any order. `strict`: properties and items the schema does not name are refused

@@ -13,6 +13,7 @@ namespace g6rt
 {
 namespace
 {
+constexpr int64_t CACHE_BYTES = 256ll << 20;
 struct Boot
 {
     std::optional<xgrammar::TokenizerInfo> info;
@@ -79,7 +80,9 @@ std::string grammar_init(const std::string& dir, int vocab)
         auto& b = boot();
         b.info.emplace(v, (xgrammar::VocabType)(int)meta.get("vocab_type").get<double>(), vocab, stop,
                        meta.get("add_prefix_space").get<bool>());
-        b.compiler.emplace(*b.info, 8);
+        // the cache keeps compiled schemas for later requests. A request picks its schema, and one short `pattern`
+        // compiles to 41 MB, so the cache is capped: past the cap, the least recently used schema is compiled again
+        b.compiler.emplace(*b.info, 8, true, CACHE_BYTES);
         b.vocab = vocab;
         b.words = xgrammar::GetBitmaskSize(vocab);
         return "";
