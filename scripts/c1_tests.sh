@@ -9,7 +9,9 @@
 # under live sessions, on caches in virtual memory, against caches that never resized; #153) and dhead_i4_test
 # (G6_DRAFT_HEAD_I4: the MXFP8 -> INT4 head records against a host derivation, the INT4 head GEMV against a host dot;
 # --time: MXFP8 vs INT4 head GEMV) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same
-# weights, byte for byte; --bench times absorb / value_project; #50).
+# weights, byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each
+# row as solo decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row
+# against each session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -158,6 +160,10 @@ if [ "$TEST" = all ] || [ "$TEST" = steering_boot_cuda_test ]; then
 fi
 if [ "$TEST" = all ] || [ "$TEST" = steering_shared_test ]; then
   build_run steering_shared_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = s2_steer_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  build_run s2_steer_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$TEST" = all ] || [ "$TEST" = steering_consume_test ]; then
   [ "$TEST" = all ] && ARGS=()

@@ -36,6 +36,8 @@ Thanks to:
     ([#82](https://github.com/kindlingai/gr8/pull/82), [#84](https://github.com/kindlingai/gr8/pull/84),
     [#86](https://github.com/kindlingai/gr8/pull/86), [#87](https://github.com/kindlingai/gr8/pull/87),
     [#90](https://github.com/kindlingai/gr8/pull/90)).
+  - Shared-scope steering in S2 batched decode (the MoE shared-expert finalize of shared steps,
+    [#209](https://github.com/kindlingai/gr8/pull/209)).
 - [@eqvse](https://github.com/eqvse) and [@cl83](https://github.com/cl83)
   - TP=3/TP=4 ring fabric and relay support ([#4](https://github.com/kindlingai/gr8/pull/4)).
 - [@chuck-ads](https://github.com/chuck-ads)
