@@ -44,6 +44,9 @@ pub struct Engine {
     pub prefill_tps: f64,
     /// The reasoning a reply gives when its rule names none.
     pub reasoning: String,
+    /// Draft tokens per verify round, for the speculative-decoding counters (0: none, and no `spec` is reported). A
+    /// `tokens` frame is then one round: 1 + its accepted drafts, from a fixed cycle, in place of `chunk`.
+    pub draft_k: usize,
 }
 
 impl Default for Engine {
@@ -55,6 +58,7 @@ impl Default for Engine {
             chunk: 4,
             prefill_tps: 0.0,
             reasoning: "Let me work out the answer.".into(),
+            draft_k: 0,
         }
     }
 }

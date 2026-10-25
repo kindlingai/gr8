@@ -6,6 +6,7 @@ streaming, logprobs, `tool_choice`, thinking budgets and the smoketest then run 
 model. It is for CI and for local work on everything above the engine. It tests nothing in the engine itself.
 
     frontend/pseudo-engine/smoke.sh TOKENIZER_DIR       smoketest/run.sh against the front end and g6pseudo
+    frontend/tests/api.sh TOKENIZER_DIR                 the front end's API tests, with frontend/tests/api_responses.toml
 
 `TOKENIZER_DIR` holds GLM-5.3's `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
 `generation_config.json`: the release's top level, or a box's model cache `tokenizer/` directory.
@@ -57,7 +58,9 @@ arguments = { city = "${city}" }
 - A prompt whose reply already closed its think block (thinking off, or a thinking budget's continuation) gets no
   reasoning. A raw `/v1/completions` prompt, which opens no assistant turn, gets the content alone.
 - `[fallback]` answers a prompt no rule matches. `[engine]` sets the hello's model name and `max_model_len`, the pace
-  (`tokens_per_s`, `chunk` ids a frame, `prefill_tps`) and the default reasoning.
+  (`tokens_per_s`, `chunk` ids a frame, `prefill_tps`) and the default reasoning. `draft_k` (0 by default) makes each
+  frame a verify round of that many drafts, with 1 + its accepted drafts from a fixed cycle, and the engine reports
+  the speculative-decoding counters and timings (PROTOCOL.md `spec`, `timing`), as `return_step_stats` reads them.
 
 ## Variables
 

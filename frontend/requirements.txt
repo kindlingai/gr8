@@ -1,3 +1,2 @@
-# The mock engine's tokenizer (frontend/mock_engine.py); the front end itself is Rust (frontend/g6front-rs)
-# and the shim is stdlib only, so nothing else is needed.
-tokenizers>=0.21
+# The shim is stdlib only and the front end is Rust (frontend/g6front-rs), so nothing needs installing. The
+# venv only gives the shim its python.

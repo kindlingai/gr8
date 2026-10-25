@@ -1,0 +1,69 @@
+# The pseudo engine's weights for tests/test_api.py (frontend/pseudo-engine/README.md has the format). Each rule
+# answers one of the test's prompts. The fallback writes prose until max_tokens, so a test can ask for an exact count.
+
+[engine]
+model = "glm-5.3"
+max_model_len = 200000
+tokens_per_s = 4000
+draft_k = 3
+reasoning = "Let me think about how to answer this well. I will keep it short and clear."
+
+[fallback]
+content = """The harbor lay quiet under a pale morning sky, and the old keeper walked the length of the stone pier \
+as he had done for thirty years. Gulls turned over the water, the tide pulled at the pilings, and the town behind \
+him woke slowly, one lamp and one chimney at a time. """
+fill = true
+
+[[rule]]
+name = "gsm8k-answer"
+match = '####'
+specificity = 10
+content = "Working: 6 * 7 = 42.\n#### 42"
+
+# Any prompt with the test's tool gets a call, so a forced tool_choice continues inside this one.
+[[rule]]
+name = "weather-call"
+match = '(?s).'
+tools = ["get_weather"]
+specificity = 5
+content = "I will call a tool."
+[[rule.call]]
+name = "get_weather"
+arguments = { city = "Paris", days = 3 }
+
+[[rule]]
+name = "after-the-tool"
+match = '(?s).'
+on = "tool"
+specificity = 40
+content = "The tool returned its result; here is the answer."
+
+[[rule]]
+name = "prose-about-a-call"
+match = 'describe the call format'
+tools = ["*"]
+specificity = 20
+content = "Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> in your code."
+
+# The front end asks for JSON in the user message when response_format is json_object or json_schema.
+[[rule]]
+name = "json-mode"
+match = 'Respond with only a JSON object'
+specificity = 10
+content = "Here you are:\n```json\n{\"city\": \"Paris\", \"days\": 3}\n```"
+
+[[rule]]
+name = "json-mode-invalid"
+match = 'invalid-json-please'
+specificity = 15
+content = "Here you are:\n```json\n{\"a\": \"x\"}\n```"
+
+[[rule]]
+name = "json-mode-answered-with-a-call"
+match = 'use-a-tool-please'
+tools = ["get_weather"]
+specificity = 30
+content = "I will call a tool."
+[[rule.call]]
+name = "get_weather"
+arguments = { city = "Paris" }

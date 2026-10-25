@@ -1,7 +1,7 @@
-"""HTTP-level tests against a running front end + mock engine (tests/serve_mock.sh start).
+"""HTTP-level tests against a running front end and the pseudo engine with tests/api_responses.toml (tests/api.sh).
 Run: URL=http://127.0.0.1:8100 python -m unittest tests.test_api -v
-/health?deep needs the front end started with FRONT_ARGS='--supervisor 127.0.0.1:8198' (SUP_PORT): the test plays the
-supervisor there."""
+/health?deep needs the front end started with --supervisor 127.0.0.1:8198 (SUP_PORT): the test plays the supervisor
+there."""
 import http.client
 import json
 import os
@@ -14,8 +14,7 @@ import urllib.parse
 import urllib.request
 
 URL = os.environ.get('URL', 'http://127.0.0.1:8100')
-# the front end runs with --allow-thinking-off (FRONT_ARGS=--allow-thinking-off): the thinking-off tests run, and the
-# refusals of thinking off skip
+# the front end runs with --allow-thinking-off: the thinking-off tests run, and the refusals of thinking off skip
 THINKING_OFF = os.environ.get('ALLOW_THINKING_OFF') == '1'
 
 
@@ -199,7 +198,7 @@ class Thinking(unittest.TestCase):
         s, r = post('/v1/chat/completions', CHAT)
         n = post('/tokenize', {'model': 'glm-5.3', 'prompt': r['choices'][0]['message']['reasoning'],
                                'add_special_tokens': False})[1]['count']
-        self.assertEqual(reasoning_tokens(r), n + 1)    # the mock's reasoning, then </think>
+        self.assertEqual(reasoning_tokens(r), n + 1)    # the engine's reasoning, then </think>
 
     def test_budget_closes_the_think_block_and_the_answer_follows(self):
         body = dict(CHAT, messages=[{'role': 'user', 'content': "Solve. Answer as '#### <number>'."}],
@@ -403,7 +402,7 @@ class Completions(unittest.TestCase):
             actual = pl[j][str(ids[j])]  # vLLM: the scored token first, then the top-k
             self.assertEqual(next(iter(pl[j])), str(ids[j]))
             others = sorted(v['rank'] for k, v in pl[j].items() if k != str(ids[j]))
-            if actual['rank'] <= 20:
+            if actual['rank'] is not None and actual['rank'] <= 20:   # null: below the engine's top 20 (PROTOCOL.md)
                 self.assertEqual(len(pl[j]), 20)
                 self.assertEqual(others, [r for r in range(1, 21) if r != actual['rank']])
             else:
