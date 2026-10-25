@@ -626,10 +626,12 @@ __global__ void __launch_bounds__(THREADS, 1) k_mhc_out_inv_prepare_pk(
 // from L2. Same values, same order per thread, same reduction trees -> bit-identical. Low register use lets MINB
 // CTAs share an SM, so the DRAM phase of one row overlaps the L2/FMA phase of another. f16 / bf16: optional
 // fragment tables (bind::Xfrag layout, rows 0..M) of the normalized rows, as k_mhc_fragments would build them.
+// out2 / normalized2 (optional): a second copy of the out / normalized rows, e.g. straight into a fabric send slot.
 template<class Block, int R, int MINB>
 __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
     Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
-    __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr) {
+    __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr,
+    __half* out2=nullptr, float* normalized2=nullptr) {
     __shared__ float sh_sums[R][24][8];
     __shared__ float sh_mix[R][24];
     __shared__ float sh_pre[R][4];
@@ -756,6 +758,8 @@ __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
             const float val = rv[idx] * rinv * __bfloat162float(__ldg(w.norm + h));
             if (out) out[(size_t)m * 4096 + h] = __float2half_rn(val);
             if (normalized) normalized[(size_t)m * 4096 + h] = val;
+            if (out2) out2[(size_t)m * 4096 + h] = __float2half_rn(val);
+            if (normalized2) normalized2[(size_t)m * 4096 + h] = val;
             if (f16 || bf16) {   // fragment tables of all M rows (zero pad rows after the last), as k_mhc_fragments
                 const float b_val = __shfl_xor_sync(0xffffffffu, val, 1);
                 if (!(threadIdx.x & 1)) write_frag_pair(m, M, 4096, h, val, b_val, f16, bf16);

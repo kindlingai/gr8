@@ -1723,9 +1723,10 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
     if (f32)
     {
 #if defined(PF_GEMMF) && !defined(PF_GEMMW)
-        // G6_PF_GEMMF32=1 (default 0, read once): a big launch takes the unguarded full-tile kernel with the FP32
-        // epilogue, not the guarded k_gemm_mx8b. Same mma calls, operands and k order, so the same bits.
-        static const bool gemmf32 = [] { const char* e = getenv("G6_PF_GEMMF32"); return e && atoi(e) == 1; }();
+        // G6_PF_GEMMF32 (default on, read once; =0 off): a big launch takes the unguarded full-tile kernel with the FP32
+        // epilogue, not the guarded k_gemm_mx8b. Same mma calls, operands and k order, so the same bits. TP3 8K: mx8b
+        // 218 ms -> mx8f 206 ms in situ (nsys), rank-0 8K prefill -7 ms (A/B), T=0 hashes unchanged.
+        static const bool gemmf32 = [] { const char* e = getenv("G6_PF_GEMMF32"); return !(e && atoi(e) == 0); }();
         static bool attrf32 = false;
         if (gemmf32 && big)
         {

@@ -58,6 +58,15 @@ inline bool pf_sp_x16()
 // peers' rows with one SM pass that also writes their FP16 copy (k_sp_ag_f16), instead of two serial copy-engine copies
 // on the lane's copy stream plus k_sp_f16. Same bytes in xn2 / xn and x2 / x (plain copy, the same __float2half_rn):
 // byte-equal. TP3 8K A/B: prefill 2418 -> 2436 tok/s, rank-0 8K prefill -29 ms, T=0 hashes unchanged.
+// G6_PF_SP_AGD (default on with G6_PF_SP; =0 off): the owner pass (k_mhc_out_inv_prepare_rr) also stores its rows
+// straight into the all-gather send slot (FP32 rows, or the FP16 x2 rows of a G6_PF_SP_X16 layer), so the publish only
+// rings the doorbell instead of copying the rows (k_put_publish_n). The same values in the same place: byte-equal.
+// TP3 8K (nsys): k_put_publish_n -35 ms, rr +27 ms (its extra stores to the pinned slot); A/B rank-0 8K prefill -6 ms.
+inline bool pf_sp_agd()
+{
+    static const bool on = !(getenv("G6_PF_SP_AGD") && atoi(getenv("G6_PF_SP_AGD")) == 0);
+    return on;
+}
 inline bool pf_sp_agk()
 {
     static const bool on = !(getenv("G6_PF_SP_AGK") && atoi(getenv("G6_PF_SP_AGK")) == 0);
@@ -92,6 +101,9 @@ struct FlashPrefill
     cudaStream_t sp_st = nullptr;                // G6_PF_SP: per-lane copy stream (wait + copy-engine staging off the compute stream)
     cudaEvent_t sp_put[4] = {}, sp_ready[4] = {};
     bool sp_view = false;                        // G6_PF_SP owner-row view: no fragment tables (rows are a slice of M)
+    __half* agd_x = nullptr;                     // G6_PF_SP_AGD: owner pass also writes its FP16 rows here (AG send slot)
+    float* agd_xn = nullptr;                     // G6_PF_SP_AGD: owner pass also writes its FP32 rows here (AG send slot)
+    bool agd_done = false;                       // G6_PF_SP_AGD: the owner pass wrote the send slot (pf_consume_launch)
     bool sp_agk[4] = {};                         // G6_PF_SP_AGK: all-gather c runs on the compute stream (pf_sp_gather)
     bool attn_frag = false;                      // xn holds the attention input as f16 + bf16 fragment tables (G6_PF_XFRAG)
     __half *x = nullptr, *x2 = nullptr;          // [MP][HID]
@@ -887,9 +899,13 @@ inline void pf_consume_launch(Model& m, FlashPrefill& P, int i, int c, int M, cu
             const bool frag = c == 1 && rr && !P.sp_view && pf_attn_frag_ok(m, i + 1);
             if (c == 1) P.attn_frag = frag;
             if (rr)   // nothing to wait for: re-read rows, bit-identical
+            {
                 flash_mhc::k_mhc_out_inv_prepare_rr<Blk, PF_MHC_RR_R, 1><<<(M + PF_MHC_RR_R - 1) / PF_MHC_RR_R, flash_mhc::THREADS, 0, st>>>(
                     flash_mhc::side(mhc_buffers(P), c), blk, w, P.fnp[wl * 2 + wh], M, geom::RMS_EPS_FLASH, c == 0 ? P.x2 : P.x,
-                    c == 0 ? P.xn2 : frag ? nullptr : P.xn, frag ? pf_attn_f16(P) : nullptr, frag ? pf_attn_bf16(P) : nullptr);
+                    c == 0 ? P.xn2 : frag ? nullptr : P.xn, frag ? pf_attn_f16(P) : nullptr, frag ? pf_attn_bf16(P) : nullptr,
+                    P.agd_x, P.agd_xn);
+                P.agd_done = P.agd_x || P.agd_xn;
+            }
             else if (!P.fnp.empty())   // packed fn, 2 rows per CTA: bit-identical to k_mhc_out_inv_prepare
                 flash_mhc::k_mhc_out_inv_prepare_pk<Blk, 2><<<(M + 1) / 2, flash_mhc::THREADS, 0, st>>>(
                     flash_mhc::side(mhc_buffers(P), c), blk, w, P.fnp[wl * 2 + wh], M, geom::RMS_EPS_FLASH, c == 0 ? P.x2 : P.x,
@@ -993,6 +1009,7 @@ inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream
     const int crs = 2 * c, cag = crs + 1, nr = P.f.nr, me = P.f.rank;
     const int r0 = pf_r0(M, me, nr), rows = pf_rows(M, me, nr);
     G6RT_CK(cudaStreamWaitEvent(st, P.sp_ready[crs], 0));   // the peers' slices are in sp_peer (pf_sp_issue)
+    bool agd = false;
     if (rows)
     {
         FlashPrefill Q = P;   // the owner rows as a sub-batch of their own
@@ -1005,17 +1022,26 @@ inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream
         __nv_bfloat16* own = slot_own ? reinterpret_cast<__nv_bfloat16*>(const_cast<char*>(slot_own)) : P.part[c] + r * HID;
         MhcFabricPeerBlock blk{MhcFabricBlock{P.f, P.stepp, crs, 0, own}};
         for (int p = 0; p < nr; ++p) blk.peers[p] = P.sp_peer[p];
+        if (pf_sp_agd())   // G6_PF_SP_AGD: this lane's AG send slot of the current step (glue::send_slot)
+        {
+            char* slot = P.f.send + ((size_t)(P.cur_step & 1) * P.f.ncoll + cag) * P.f.stride;
+            if (pf_sp_x16_layer(m, P, i, c, M)) Q.agd_x = reinterpret_cast<__half*>(slot);
+            else Q.agd_xn = reinterpret_cast<float*>(slot);
+        }
         pf_consume_launch(m, Q, i, c, rows, st, blk, 0);
+        agd = Q.agd_done;
     }
     P.attn_frag = false;
     if (pf_sp_x16_layer(m, P, i, c, M))
     {
-        k_put_publish_n<<<pf_sp_put_cta(), 128, 0, st>>>(reinterpret_cast<const uint4*>(P.x2 + (size_t)r0 * HID), P.f, P.stepp, cag, rows * (HID * 2 / 16), P.tickets + cag);
+        if (agd) k_publish<<<1, 32, 0, st>>>(P.f, P.stepp, cag, P.tickets + cag);   // G6_PF_SP_AGD: rows already in the slot
+        else k_put_publish_n<<<pf_sp_put_cta(), 128, 0, st>>>(reinterpret_cast<const uint4*>(P.x2 + (size_t)r0 * HID), P.f, P.stepp, cag, rows * (HID * 2 / 16), P.tickets + cag);
         pf_sp_issue(P, cag, M, st, true);
         return;
     }
     const float* src = (c == 0 ? P.xn2 : P.xn) + (size_t)r0 * HID;
-    k_put_publish_n<<<pf_sp_put_cta(), 128, 0, st>>>(reinterpret_cast<const uint4*>(src), P.f, P.stepp, cag, rows * (HID * 4 / 16), P.tickets + cag);
+    if (agd) k_publish<<<1, 32, 0, st>>>(P.f, P.stepp, cag, P.tickets + cag);   // G6_PF_SP_AGD: rows already in the slot
+    else k_put_publish_n<<<pf_sp_put_cta(), 128, 0, st>>>(reinterpret_cast<const uint4*>(src), P.f, P.stepp, cag, rows * (HID * 4 / 16), P.tickets + cag);
     pf_sp_issue(P, cag, M, st);
 }
 // second half: every owner's rows (collective 2c + 1) into xn2 / xn, then the FP16 block input of all M rows
