@@ -778,7 +778,12 @@ int main(int argc, char** argv)
         ngram.t = &ngram_tab;
         ngram.kmax = getenv("G6_NGRAM_KMAX") ? atoi(getenv("G6_NGRAM_KMAX")) : dfl_k;
         ngram.kmin = getenv("G6_NGRAM_KMIN") ? atoi(getenv("G6_NGRAM_KMIN")) : 2;
-        if (const char* m = getenv("G6_NGRAM_MARGIN")) ngram.margin = atof(m);
+        if (const char* m = getenv("G6_NGRAM_MARGIN"))
+        {
+            char* end = nullptr;
+            ngram.margin = strtod(m, &end);
+            if (!*m || *end || !(ngram.margin >= 0 && ngram.margin <= 10)) die("G6_NGRAM_MARGIN: a number in 0..10");
+        }
         ngram.log = getenv("G6_NGRAM_LOG") && atoi(getenv("G6_NGRAM_LOG")) && cfg.rank == 0;
         if (ngram.kmin < 1 || ngram.kmax < ngram.kmin || ngram.kmax > dfl_k || !std::isfinite(ngram.margin))
             die("G6_NGRAM: 1 <= G6_NGRAM_KMIN <= G6_NGRAM_KMAX <= --dflash-k, G6_NGRAM_MARGIN a number");
