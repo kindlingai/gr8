@@ -47,7 +47,10 @@ Thanks to:
   - Host-memory reclamation and canonical session KV export/import
     ([#60](https://github.com/kindlingai/gr8/pull/60), [#65](https://github.com/kindlingai/gr8/pull/65)).
 - [@unsaltedbutter-ai](https://github.com/unsaltedbutter-ai)
-  - API compatibility and structured-output proposals ([#71](https://github.com/kindlingai/gr8/pull/71)).
+  - Structured responses (`response_format` `json_object` and `json_schema`, checked with XGrammar) and thinking off
+    (`--allow-thinking-off`), with the count-to-200 gate
+    ([#71](https://github.com/kindlingai/gr8/pull/71), landed in [#186](https://github.com/kindlingai/gr8/pull/186)
+    and [#189](https://github.com/kindlingai/gr8/pull/189)).
 - [@alexellis](https://github.com/alexellis)
   - [RigMark](https://github.com/alexellis/rigmark), used for decode and concurrency benchmarking.
 
