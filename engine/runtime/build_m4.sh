@@ -65,23 +65,20 @@ RSDEF=""
 RSLINK=""
 if [ -f "$RSLIB" ]; then RSDEF="-DG6_RS_LOADER"; RSLINK="$RSLIB -ldl -lm"; fi
 # request grammars (grammar.h): G6_XGRAMMAR=DIR, an XGrammar source tree (scripts/build.sh finds the one the front end's
-# xgrammar crate pins). Built once per object directory with CMake, Python bindings off. g6m4 then takes --grammar-dir;
-# without G6_XGRAMMAR a gram request is refused
+# xgrammar crate pins). Its library is built once per object directory (xgrammar_build.sh), or comes prebuilt from
+# G6_XGRAMMAR_LIB. g6m4 then takes --grammar-dir; without G6_XGRAMMAR a gram request is refused
 GRDEF=""
 GRLINK=""
 if [ -n "${G6_XGRAMMAR:-}" ] && [ "$WHAT" != sim ]; then
-  XB=$O/xgrammar
-  if [ ! -f "$XB/libxgrammar.a" ]; then
-    mkdir -p "$XB"
-    echo 'set(XGRAMMAR_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)' > "$XB/config.cmake"   # the tree reads it from -B
-    { cmake -S "$G6_XGRAMMAR" -B "$XB" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++ \
-          -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations -DCMAKE_POSITION_INDEPENDENT_CODE=ON &&
-      cmake --build "$XB" -j "$(nproc)" --target xgrammar; } > "$XB/build.log" 2>&1 || { echo "XGrammar: $XB/build.log"; exit 1; }
+  XLIB=${G6_XGRAMMAR_LIB:-$O/xgrammar/libxgrammar.a}
+  if [ ! -f "$XLIB" ]; then
+    [ -z "${G6_XGRAMMAR_LIB:-}" ] || { echo "G6_XGRAMMAR_LIB=$G6_XGRAMMAR_LIB: no such file"; exit 1; }
+    bash xgrammar_build.sh "$G6_XGRAMMAR" "$O/xgrammar" || exit 1
   fi
   GRDEF="-DG6_GRAMMAR=1"
   g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I"$G6_XGRAMMAR/include" -I"$G6_XGRAMMAR/3rdparty/dlpack/include" \
       -I"$G6_XGRAMMAR/3rdparty/picojson" -c grammar.cc -o $O/grammar.o || exit 1
-  GRLINK="$O/grammar.o $XB/libxgrammar.a"
+  GRLINK="$O/grammar.o $XLIB"
   g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I. -o $OUT/grammar_test tests/grammar_test.cc $GRLINK -lpthread || exit 1
   $OUT/grammar_test || exit 1
 fi
