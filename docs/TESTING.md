@@ -85,10 +85,19 @@ one GPU and makes its own synthetic weights.
 | `flash_ckpt_group_test` | Flash checkpoints on a group lease, against a loopback KV node |
 | `weight_check_test` | the weight check's sums, GPU against CPU |
 | `steering_boot_cuda_test`, `steering_consume_test`, `steering_cuda_test`, `steering_shared_test` | the steering kernels against the stock ones |
+| `s2_steer_test` | S2 batched decode steers each row as solo decode does (S2 builds) |
 | `dhead_i4_test` | `G6_DRAFT_HEAD_I4`: the INT4 draft head against a host derivation |
+| `headgroup_test` | sparse prefill attention for more than 16 heads, against a CPU reference |
+| `cpgroups` | `G6_CP_ONECHAIN` against the stock CP groups: bytes and time |
+| `flash_kpool_stream_test` | the streaming pool scorer against the hi/lo one: bytes and time |
+| `flash_sparse_mla_test` | fused sparse MLA prefill against QK, softmax and PV |
+| `flash_sparse_mla_v2_test` | `sparse_mla_pf_v2` against `sparse_mla_pf_512`, byte for byte (#10) |
+| `kda_g9_det` | the G9 ON kernels give the same bits run to run |
+| `flash_dsa_f16_test` | `G6_PF_DSA_F16GEMM` against the full-GV kernel and fp64 |
+| `mhc_decode_stage_test` | the decode mHC pinned-partial stage: bytes and time |
 
 `scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible), `l2pf_queue_test` and
-`k1_split_test` (both host only) and the four steering tests. It builds these without running them:
+`k1_split_test` (both host only), the four steering tests and `s2_steer_test`. It builds these without running them:
 
 | test | checks |
 |---|---|
@@ -107,27 +116,22 @@ one GPU and makes its own synthetic weights.
 | `all` | `dtr_test_tp<N>` | dense trellis matrices: dumps for `engine/ref/dtr_ref.py`, and decode timing | release entries |
 
 No script builds the rest. Each file's header has its build line and usage. Each compiles with the flags shown.
+`flash_dsa_pf_test` fails today: in its W8d case the KV and index caches match, but the block output does not
+(rel_l2 156 against the P1 math). `pf_v2_test` and `k1_v2_test` check against `engine/ref/k1_v2_ref.py`, so they
+need a pack and the NumPy reference.
 
 | test | flags | checks | needs |
 |---|---|---|---|
 | `engine/attn/tests/attnk` | GLM, `-DPF_F12` | decode attention kernel arms against the stock chain (`attnk_r10a.sh`, `docs/SETTINGS.md`) | |
-| `engine/attn/tests/cpgroups` | GLM, `-DPF_F12` | `G6_CP_ONECHAIN` against the stock CP groups: bytes and time | |
-| `engine/attn/tests/headgroup_test` | `K1H2_FLAGS`, `-DG6_NR=3` | sparse prefill attention for more than 16 heads, against a CPU reference | |
 | `engine/attn/tests/idxbench` | GLM | times the decode indexer stages | |
-| `engine/attn/tests/flash_kpool_stream_test` | Flash | the streaming pool scorer against the hi/lo one: bytes and time | |
-| `engine/attn/tests/flash_sparse_mla_test` | Flash | fused sparse MLA prefill against QK, softmax and PV | |
-| `engine/attn/tests/flash_sparse_mla_v2_test` | Flash | `sparse_mla_pf_v2` against `sparse_mla_pf_512`, byte for byte (#10) | |
 | `engine/kda/tests/kda_g9_test` | Flash | the G9 ON kernels against the OFF kernels and host math | |
-| `engine/kda/tests/kda_g9_det` | Flash, `-DG9_CONV_DBG=1` | the G9 ON kernels give the same bits run to run | |
 | `engine/kda/tests/kda_ring_test` | Flash | the KDA carry mode (the MTP verify ring) against stock runs, bit for bit | |
 | `engine/kernels/tests/k1_audit` | GLM | the routed-expert MoE reads its weights at the DRAM floor (`docs/SETTINGS.md`) | about 74 GB of memory |
 | `engine/kernels/tests/mtp_lastrow_test` | GLM | `G6_MTP_LASTROW` against the full MoE layer (`scripts/mtp_lastrow_check.sh`) | |
 | `engine/kernels/tests/k1_v2_test` | `-DG6_NR=4` | exlr8 v2 decode MoE: dumps for `engine/ref/k1_v2_ref.py`, and timing | a rank's expert pack |
 | `engine/kernels/tests/pf_v2_test` | `-DG6_NR=4` | exlr8 v2 prefill MoE: dumps for `engine/ref/k1_v2_ref.py`, and timing | a rank's expert pack |
 | `engine/runtime/tests/dhead2_test` | GLM | `G6_DRAFT_HEAD2` against a host derivation, and timing | |
-| `engine/runtime/tests/flash_dsa_f16_test` | Flash | `G6_PF_DSA_F16GEMM` against the full-GV kernel and fp64 | |
 | `engine/runtime/tests/flash_dsa_pf_test` | Flash | Flash's dense MLP and DSA prefill against the P1 math | |
-| `engine/runtime/tests/mhc_decode_stage_test` | Flash | the decode mHC pinned-partial stage: bytes and time | |
 | `engine/tests/test_flash_ckpt` | `-DG6_NR=2` | Flash session checkpoints (the table above) | |
 
 ## The release's files
