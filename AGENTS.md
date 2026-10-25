@@ -44,29 +44,8 @@ first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 
 ## Test
 
-| test | where | command |
-|---|---|---|
-| S2 batch planner (with insert rules), control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced, the pool's block stores (`--kv-store`) in lock-step through memory, a file and a loopback KV node | any Linux box with g++ and cargo | `scripts/host_tests.sh` |
-| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree, across shrinks and grows of the pool), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
-| row budget, S2 attention, decode heads, the KV pool shrunk and grown under live sessions | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
-| the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | anywhere | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
-| row budget, S2 attention, decode heads | one GB10 | `scripts/c1_tests.sh bin`, and `G6_NR=4 EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2` for the S2 build |
-| Flash session checkpoints (`G6_FLASH_CACHE`): poison and restore bit for bit, overwrite, least-recently-used drops, torn or changed blocks refused, through memory, a file and a loopback KV node | one GPU, cargo | `nvcc -O2 -std=c++17 -gencode=arch=compute_120a,code=sm_120a -I engine/runtime engine/tests/test_flash_ckpt.cu engine/kvman-rs/target/release/libg6kvman.a -lpthread -ldl -lm -o test_flash_ckpt`, then `./test_flash_ckpt mem: ssd:FILE remote:HOST:PORT` (a loopback node: `kvman-remote --gb 0.5 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --ready node.json`) |
-| Flash checkpoints on a group lease (`--kv-store ...,group=`, D-331 M8 (c)): ask before a drop, grant and grow, give with ages, least-recently-used drop and packing, restore bit for bit after a move, back to the floor, a refused transaction, two ranks agreeing | one GPU, cargo | `TEST=flash_ckpt_group_test ARCH=120a scripts/c1_tests.sh DIR` (starts a loopback node with 2 MiB segments) |
-| the replicated-GEMV split (`G6_QA_SPLIT`, `G6_IDXQ_SPLIT`, `G6_MTP_SPLIT`) against the replicated path, m4sim stdout byte for byte | one GB10 and a model | `MODEL_ARGS="--packs DIR" scripts/m4sim_split_check.sh` |
-| the S2 shim | anywhere, stdlib only | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
-| the front end | anywhere | `cd frontend/g6front-rs && cargo test --release`; `frontend/README.md` has the API tests |
-| the front end end to end against the pseudo engine (`frontend/pseudo-engine`: rules in a TOML file), and the smoketest | anywhere, with GLM-5.3's tokenizer files | `frontend/pseudo-engine/smoke.sh TOKENIZER_DIR`; `cd frontend/pseudo-engine && cargo test` for its rules |
-| `./gr8 pseudo up` end to end: supervisor, handshake, g6pseudo under `--serve`, shim, front end | anywhere, with the release builds and GLM-5.3's tokenizer files | `GR8_PSEUDO_TOKENIZER=DIR python3 -m unittest discover -s tools/launch -p 'test_pseudo_e2e.py'` |
-| the gate harness | anywhere | `python3 -m unittest discover bench/gate/tests` |
-| the n-gram draft source replay (#56: table, chain and tree proposals, acceptance, held-out folds) | anywhere, stdlib only | `python3 -m unittest discover -s tools/ngram/tests` |
-| the rank health probe | anywhere | `python3 -m unittest discover tools/health` |
-| the exlr8 dense decoder against `loader/exlr8.py` | anywhere (a synthetic fixture), and on the release's files with torch | `cargo test --manifest-path engine/loader-rs/Cargo.toml`; `engine/loader-rs/tests/exlr8_compare.py` |
-| a rank image planned from the release (`--v2-dense`) against an independent derivation, from the formulas or a layout file | the release's files, torch and NumPy | `engine/loader-rs/tests/release_check.py`, with `--layout FILE` for a layout |
-| the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved | anywhere | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
-| m4sim from the release against a PyTorch forward of the same weights | one GB10, transformers with `glm_moe_dsa` | `engine/ref/release_forward.py` |
-| the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`) | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
-| the launch end to end (four supervisors, stub engines) | Linux, or macOS after `sudo ifconfig lo0 alias 127.0.0.N up` for N = 2, 3, 4 | the line above runs it, and skips it without those addresses |
+`./gr8 test` runs the CPU tests CI runs (`frontend` or `engine` for one half). [docs/TESTING.md](docs/TESTING.md) lists
+every test, by what it needs (a CPU, the pseudo engine, one GPU, the release's files, a cluster), with its command.
 
 A kernel or anything else that changes numerics gets an exactness or tolerance test against the path it replaces, and
 the PR says which and why a tolerance is safe.
