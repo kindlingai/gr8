@@ -67,6 +67,7 @@ def run(a):
     with open(a.prompts) as f:
         items = json.load(f)
     seen = trace_prompts(a.traces)
+    model = model_id(c)
     prompts = [capture.chat_ids(c, item, a.effort) for item in items]
     clash = [i for i, ids in enumerate(prompts) if tuple(ids) in seen]
     if clash:
@@ -77,7 +78,9 @@ def run(a):
         row = {'i': i, 'workload': item.get('workload', 'other'), 'prompt_tokens': len(ids)}
         try:
             gen, st, finish, wall = complete(c, ids, a.max_tokens)
-        except (OSError, KeyError, IndexError, ValueError) as e:
+            if not isinstance(gen, list):
+                raise ValueError(f'token_ids is {type(gen).__name__}, not a list')
+        except (OSError, KeyError, IndexError, TypeError, ValueError) as e:
             row.update(gen=None, tokens=0, tok_s=None, steps=None, error=repr(e))
             rows.append(row)
             print(f'[{i}] {row["workload"]}: failed: {e}', file=sys.stderr)
@@ -90,7 +93,7 @@ def run(a):
                    accepted_tokens=st.get('accepted_tokens'))
         rows.append(row)
         print(f'[{i}] {row["workload"]}: {len(ids)} prompt, {n} generated, {tps} tok/s, {st.get("steps")} steps')
-    out = {'label': a.label, 'model': model_id(c), 'prompts': os.path.basename(a.prompts),
+    out = {'label': a.label, 'model': model, 'prompts': os.path.basename(a.prompts),
            'prompts_sha': capture_sha(a.prompts),
            'settings': {'max_tokens': a.max_tokens, 'effort': a.effort or 'default', 'temperature': 0},
            'rows': rows}

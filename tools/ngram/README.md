@@ -10,7 +10,7 @@ near-certain continuations would propose drafts that the target accepts. Python 
 | `ab.py` | the engine gate: one boot with `NGRAM` unset, one with it set, the same held-out prompts at temperature 0; outputs byte for byte, decode tok/s and tokens per verify step by workload |
 | `data/prompts.json` | 45 agentic coding prompts: code (16), edit (8), tool calls with a tool list and multi-turn transcripts (11), JSON (6), prose (4) |
 | `data/prompts_tool2.json` | 24 more tool-call turns for the table (the first cluster replay's tool row rested on 11): first turns and transcripts after one or two tool results |
-| `data/ab_prompts.json` | 17 prompts held out of both table sets for the A/B: tool (8), edit (3), JSON (3), code (2), prose (1). Six tool prompts share the table sets' system prompt and tool list with new tasks (the repeated scaffolding is what the table is for); two use a system prompt and tools the table never saw |
+| `data/ab_prompts.json` | 17 prompts held out of both table sets for the A/B: tool (8), edit (3), JSON (3), code (2), prose (1). Six tool prompts share the table sets' system prompt and tool list, with new tasks or new tool results (the repeated scaffolding is what the table is for); two use a system prompt and tools the table never saw |
 | `tests/` | `python3 -m unittest discover -s tools/ngram/tests` |
 
 ## Run

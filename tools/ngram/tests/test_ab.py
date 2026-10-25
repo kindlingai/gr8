@@ -160,6 +160,18 @@ class AbTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn('model differs', out)
 
+    def test_prompt_sets_differ_fails(self):
+        _, a = self.run_ab('off')
+        _, b = self.run_ab('on')
+        with open(b) as f:
+            B = json.load(f)
+        B['rows'] = B['rows'][:2]
+        with open(b, 'w') as f:
+            json.dump(B, f)
+        rc, out = self.compare(a, b)
+        self.assertEqual(rc, 1)
+        self.assertIn('prompt sets differ: [2]', out)
+
     def test_settings_mismatch_fails(self):
         _, a = self.run_ab('off')
         _, b = self.run_ab('on', '--effort', 'low')
