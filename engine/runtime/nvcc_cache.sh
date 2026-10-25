@@ -91,8 +91,8 @@ KEY=$(
       for l in "${LIBS[@]}"; do
         f=$(libfile "$l") || exit 1
         case $f in
-          *.a) printf 'lib %s ' "$f"; sha256sum < "$f" || exit 1 ;;
-          *) printf 'lib %s ' "$f"; stat -L -c '%s %Y' "$f" || exit 1 ;;
+          (*.a) printf 'lib %s ' "$f"; sha256sum < "$f" || exit 1 ;;
+          (*) printf 'lib %s ' "$f"; stat -L -c '%s %Y' "$f" || exit 1 ;;
         esac
       done
     fi

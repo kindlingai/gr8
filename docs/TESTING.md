@@ -11,10 +11,13 @@ PR's gates table says which ones it ran ([AGENTS.md](../AGENTS.md), "How changes
     ./gr8 test engine       # the host engine tests, steering, the converter, the gate harness (the cpu-engine job)
 
 Both halves need g++, Python 3 with NumPy, and cargo (rustup reads `frontend/g6front-rs/rust-toolchain.toml`). The
-engine half needs Linux. The front-end half also runs on macOS with Apple's clang. On macOS the launch end to end test
-skips unless the loopback has three more addresses:
+engine half needs Linux. The front-end half also runs on macOS with Apple's clang, and CI runs it there too. On macOS
+the launch end to end test skips unless the loopback has the boxes' addresses:
 
-    for n in 2 3 4; do sudo ifconfig lo0 alias 127.0.0.$n up; done
+    for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias $a up; done
+
+With `GR8_PSEUDO_TOKENIZER` set to a directory of GLM-5.3's tokenizer files, the front-end half also runs the pseudo
+engine's tests below. CI sets it. `.github/ci/fetch-tokenizer.sh DIR` fetches the files.
 
 What the two halves cover, and how to run one part alone:
 
@@ -42,10 +45,11 @@ end to end without a model. Both tests need GLM-5.3's tokenizer files (the relea
 
 | test | command |
 |---|---|
-| the front end and the smoke test against the pseudo engine | `./gr8 test pseudo TOKENIZER_DIR` (`frontend/pseudo-engine/smoke.sh`) |
+| the front end and the smoke test against the pseudo engine | `frontend/pseudo-engine/smoke.sh TOKENIZER_DIR` |
+| the front end's HTTP API: streaming, tools, thinking budgets, JSON modes, logprobs, `return_step_stats`, deep health (`frontend/tests/test_api.py`, with the weights in `frontend/tests/api_responses.toml`) | `frontend/tests/api.sh TOKENIZER_DIR` |
 | `./gr8 pseudo up` end to end: supervisor, handshake, g6pseudo under `--serve`, shim, front end (needs the release builds) | `GR8_PSEUDO_TOKENIZER=DIR python3 -m unittest discover -s tools/launch -p 'test_pseudo_e2e.py'` |
 
-`frontend/README.md` has the front end's HTTP API tests.
+`./gr8 test pseudo TOKENIZER_DIR` runs the first two.
 
 ## One GPU
 

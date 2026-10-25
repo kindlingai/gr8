@@ -4,7 +4,8 @@
 #   .github/ci/cpu-tests.sh [frontend|engine|all]     from any directory; all by default. The CI's cpu-frontend and
 #                                                    cpu-engine jobs run one half each.
 # frontend: the front end, the shim, the launcher and the pseudo engine, with the small engine-side checkers their tests
-# drive. engine: everything else.
+# drive; with GR8_PSEUDO_TOKENIZER (.github/ci/fetch-tokenizer.sh DIR) also the smoke test, the front end's API tests
+# and ./gr8 pseudo up end to end, against the pseudo engine. It runs on Linux and macOS. engine: everything else.
 set -euo pipefail
 PART=${1:-all}
 case $PART in frontend|engine|all) ;; *) echo "usage: cpu-tests.sh [frontend|engine|all]" >&2; exit 2 ;; esac
@@ -64,6 +65,14 @@ fi
 
 step "bin/g6load (the Hugging Face fetch's planner and checker, for the launch tests)"
 cargo build --release --locked --quiet --manifest-path engine/loader-rs/Cargo.toml
+
+if [ -n "${GR8_PSEUDO_TOKENIZER:-}" ]; then
+  step "the pseudo engine: the smoke test and the front end's API tests (release builds, for the launcher's tests too)"
+  frontend/pseudo-engine/smoke.sh "$GR8_PSEUDO_TOKENIZER"
+  frontend/tests/api.sh "$GR8_PSEUDO_TOKENIZER"
+else
+  echo "(no GR8_PSEUDO_TOKENIZER: no pseudo engine smoke or API tests)"
+fi
 
 step "Python tests (front end and launcher)"
 g++ -std=c++17 -O2 -Wall -Wextra -I engine/runtime \

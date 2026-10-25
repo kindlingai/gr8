@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End to end: four supervisors on this machine, each `./gr8 glm53 up` with its own G6_HOME and model cache, the
 stub engine (stubs/g6m4, which plays each rank with frontend/tests/fake_s2_engine.py), the real shim and a stub front
-end. The boxes are 127.0.0.1-4 on the LAN and 127.0.1.x / 127.0.2.x on the rails, so it needs
-Linux (every 127/8 address is local there). Every box boots one local fake release in place.
+end. The boxes are 127.0.0.1-4 on the LAN and 127.0.1.x / 127.0.2.x on the rails: Linux answers on all of them, and
+macOS after the aliases in loopback_aliases. Every box boots one local fake release in place.
     python3 -m unittest discover -s tools/launch -p 'test_e2e.py'"""
 import asyncio
 import json
@@ -31,9 +31,13 @@ LAN = [f'127.0.0.{i + 1}' for i in range(TP)]
 
 
 def loopback_aliases():
+    """Whether this box answers on every address the boxes use. Linux answers on all of 127/8. macOS needs an alias
+    for each: for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias $a up; done"""
+    addrs = LAN + [f'127.0.{rail}.{r + 1}' for rail in (1, 2) for r in range(TP)]
     try:
-        with socket.socket() as s:
-            s.bind(('127.0.0.2', 0))
+        for a in addrs:
+            with socket.socket() as s:
+                s.bind((a, 0))
         return True
     except OSError:
         return False
@@ -46,6 +50,9 @@ def read(path):
 
 def running(pid):
     """Alive and not a zombie."""
+    if not os.path.isdir('/proc'):           # macOS
+        st = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(st) and not st.startswith('Z')
     try:
         with open(f'/proc/{pid}/stat') as f:
             return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
@@ -59,7 +66,7 @@ def free_port():
         return s.getsockname()[1]
 
 
-@unittest.skipUnless(loopback_aliases(), 'needs 127.0.0.2..4 (on macOS: sudo ifconfig lo0 alias 127.0.0.N up)')
+@unittest.skipUnless(loopback_aliases(), 'needs 127.0.0.1-4, 127.0.1.1-4 and 127.0.2.1-4 (macOS: see loopback_aliases)')
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp(prefix='gr8e2e-')

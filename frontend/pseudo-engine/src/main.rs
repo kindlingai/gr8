@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokenizers::Tokenizer;
@@ -37,6 +37,8 @@ const MAX_LOGPROBS: usize = 20;
 const REST: f64 = 1e-3;
 /// Candidates whose replies the logprobs follow.
 const LP_CANDIDATES: usize = 8;
+/// Accepted drafts per verify round, in turn (capped at `draft_k`).
+const ACCEPT_CYCLE: [usize; 10] = [3, 2, 3, 1, 0, 2, 3, 3, 1, 2];
 
 struct Engine {
     rules: Rules,
@@ -57,6 +59,33 @@ struct Counters {
     length: AtomicU64,
     abort: AtomicU64,
     error: AtomicU64,
+    spec: Mutex<Spec>,
+}
+
+/// The speculative-decoding counters (PROTOCOL.md `metrics`), for the engine or one request.
+#[derive(Default)]
+struct Spec {
+    drafts: u64,
+    draft_tokens: u64,
+    accepted: u64,
+    per_pos: Vec<u64>,
+}
+
+impl Spec {
+    fn add(&mut self, o: &Spec) {
+        self.drafts += o.drafts;
+        self.draft_tokens += o.draft_tokens;
+        self.accepted += o.accepted;
+        self.per_pos.resize(self.per_pos.len().max(o.per_pos.len()), 0);
+        for (a, b) in self.per_pos.iter_mut().zip(&o.per_pos) {
+            *a += b;
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({"drafts": self.drafts, "draft_tokens": self.draft_tokens, "accepted": self.accepted,
+               "accepted_per_pos": self.per_pos})
+    }
 }
 
 /// What one request emits: its ids, the logprob entry of each (when asked), and how it ends.
@@ -245,10 +274,16 @@ async fn connection(e: Arc<Engine>, s: tokio::net::UnixStream) -> Result<(), Str
 
 fn metrics(e: &Engine, seq: Value) -> Value {
     let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-    json!({"type": "metrics", "seq": seq,
+    let mut m = json!({"type": "metrics", "seq": seq,
         "requests": {"running": g(&e.c.running), "waiting": 0,
                      "finished": {"stop": g(&e.c.stop), "length": g(&e.c.length), "abort": g(&e.c.abort), "error": g(&e.c.error)}},
-        "tokens": {"prompt": g(&e.c.prompt), "generation": g(&e.c.gen)}})
+        "tokens": {"prompt": g(&e.c.prompt), "generation": g(&e.c.gen)}});
+    if e.rules.engine.draft_k > 0 {
+        let mut s = e.c.spec.lock().unwrap();
+        s.per_pos.resize(e.rules.engine.draft_k, 0);
+        m["spec"] = s.json();
+    }
+    m
 }
 
 async fn generate(e: &Engine, v: &Value, cancel: &AtomicBool, tx: &mpsc::UnboundedSender<Value>) {
@@ -272,6 +307,7 @@ async fn generate(e: &Engine, v: &Value, cancel: &AtomicBool, tx: &mpsc::Unbound
         let _ = tx.send(f);
         return;
     }
+    let t0 = Instant::now();
     e.c.prompt.fetch_add(prompt.len() as u64, Ordering::Relaxed);
     e.c.running.fetch_add(1, Ordering::Relaxed);
     if let Some(k) = v["prompt_logprobs"].as_u64() {
@@ -294,19 +330,32 @@ async fn generate(e: &Engine, v: &Value, cancel: &AtomicBool, tx: &mpsc::Unbound
         Some(i) => ("stop", Some(plan.ids[i])),
         None => ("length", None),
     };
+    let k = eng.draft_k;
+    let mut spec = Spec { per_pos: vec![0; k], ..Spec::default() };
+    let mut t_first = None;
     let mut sent = 0usize;
     while sent < last {
         if cancel.load(Ordering::Relaxed) {
             reason = "abort";
             break;
         }
-        let end = (sent + eng.chunk).min(last);
+        let n = if k > 0 { 1 + ACCEPT_CYCLE[spec.drafts as usize % ACCEPT_CYCLE.len()].min(k) } else { eng.chunk };
+        let end = (sent + n).min(last);
+        if k > 0 && last - sent > 1 {
+            spec.drafts += 1;
+            spec.draft_tokens += k as u64;
+            spec.accepted += (end - sent - 1) as u64;
+            for p in &mut spec.per_pos[..end - sent - 1] {
+                *p += 1;
+            }
+        }
         let mut f = json!({"type": "tokens", "id": id, "ids": &plan.ids[sent..end]});
         if lp_k.is_some() {
             f["logprobs"] = Value::Array(plan.lps[sent..end].to_vec());
         }
         let _ = tx.send(f);
         e.c.gen.fetch_add((end - sent) as u64, Ordering::Relaxed);
+        t_first.get_or_insert_with(Instant::now);
         sent = end;
         if let Some(d) = pace.filter(|_| sent < last) {
             tokio::time::sleep(d).await;
@@ -320,7 +369,15 @@ async fn generate(e: &Engine, v: &Value, cancel: &AtomicBool, tx: &mpsc::Unbound
     };
     counter.fetch_add(1, Ordering::Relaxed);
     e.c.running.fetch_sub(1, Ordering::Relaxed);
-    let _ = tx.send(finish(reason, stop_id, sent));
+    let mut f = finish(reason, stop_id, sent);
+    if k > 0 {
+        e.c.spec.lock().unwrap().add(&spec);
+        f["spec"] = spec.json();
+    }
+    if let Some(t1) = t_first {
+        f["timing"] = json!({"prefill_s": (t1 - t0).as_secs_f64(), "decode_s": t1.elapsed().as_secs_f64()});
+    }
+    let _ = tx.send(f);
 }
 
 /// The index of the stop id that ends a reply: the first one past `min_tokens`. The request emits it last.
