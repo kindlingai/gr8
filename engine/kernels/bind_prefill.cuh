@@ -407,6 +407,8 @@ struct Gemm
     // w / ws unused. The bits equal the GEMM on the matrix's FP8 copy (dtr::make_fp8).
     const uint8_t* tw = nullptr;
     long long tsB = 0, tsG = 0;
+    int rgrp = 0;                     // k_gemm_mx8f full-M launches: > 1 = grouped raster of rgrp row blocks (PF_GEMMRF;
+                                      // launch sets it from G6_PF_GEMMG when 0). Launch order only: the same bits.
 #if G6_MODEL_FLASH
     int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
 #endif
@@ -1056,11 +1058,20 @@ template <int BM, bool F32 = false> __global__ void __launch_bounds__(256) k_gem
     Gemm g = g0;
 #ifdef PF_GEMMRF
     // PF_GEMMRF: owner-row launches only (gridDim.y <= 8): row block fastest in launch order, as PF_GEMMR in k_gemm_mx8b
-    // (q_b 128 x 6 at OWN=3: W read once instead of once per row block, 205 -> ~46 MB). Full-M launches keep the raster.
-    // Same tiles, same k order, same mma operands per output element: the same bits.
+    // (q_b 128 x 6 at OWN=3: W read once instead of once per row block, 205 -> ~46 MB). Full-M launches keep the raster,
+    // or with g.rgrp = G > 1 (G6_PF_GEMMG) a grouped raster: groups of G row blocks, row block fastest inside a group, so
+    // the CTAs in flight share a few column blocks of W (dense gate+up: W 33.5 MB > L2 was re-read from DRAM per row
+    // block). Same tiles, same k order, same mma operands per output element: the same bits.
     const bool rr = gridDim.y <= 8;
-    const int lin = blockIdx.y * gridDim.x + blockIdx.x, by = rr ? lin % gridDim.y : blockIdx.y;
-    int bx = rr ? lin / gridDim.y : blockIdx.x;
+    const int lin = blockIdx.y * gridDim.x + blockIdx.x;
+    int by = blockIdx.y, bx = blockIdx.x;
+    if (rr) { by = lin % gridDim.y; bx = lin / gridDim.y; }
+    else if (g0.rgrp > 1)
+    {
+        const int per = g0.rgrp * gridDim.x, grp = lin / per, gy0 = grp * g0.rgrp, gh = min(g0.rgrp, gridDim.y - gy0);
+        const int r = lin - grp * per;
+        by = gy0 + r % gh; bx = r / gh;
+    }
 #else
     int bx = blockIdx.x;
 #endif
@@ -1651,6 +1662,15 @@ inline int gemm_mode()
     return m;
 }
 // rs.base set (G6_PF_RSDIRECT): y is unused, rows go to the RS send slot (unpaired v2 kernel only)
+// G6_PF_GEMMG=G (read once, default 0 = plain raster): k_gemm_mx8f full-M launches use the grouped raster of G row
+// blocks (Gemm::rgrp) unless the caller set rgrp. Launch order only: the same bits.
+inline Gemm with_rgrp(const Gemm& g)
+{
+    static const int grp = [] { const char* e = getenv("G6_PF_GEMMG"); return e ? atoi(e) : 0; }();
+    Gemm r = g;
+    if (!r.rgrp) r.rgrp = grp;
+    return r;
+}
 inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = RsOut())
 {
     if (!g.on) return;
@@ -1710,7 +1730,7 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
         if (gemmf32 && big)
         {
             if (!attrf32) { cudaFuncSetAttribute(k_gemm_mx8f<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, G2<8>::SMEM); attrf32 = true; }
-            k_gemm_mx8f<8, true><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(g);
+            k_gemm_mx8f<8, true><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(with_rgrp(g));
             return;
         }
 #endif
@@ -1726,7 +1746,7 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
 #elif defined(PF_GEMMF)
     static bool attrf = false;
     if (!attrf) { cudaFuncSetAttribute(k_gemm_mx8f<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, G2<8>::SMEM); attrf = true; }
-    if (big) k_gemm_mx8f<8><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(g);
+    if (big) k_gemm_mx8f<8><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(with_rgrp(g));
 #elif defined(PF_GEMMP)
     static bool attrp = false;
     if (!attrp) { cudaFuncSetAttribute(k_gemm_mx8p<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, G2<8>::SMEM); attrp = true; }
@@ -1998,6 +2018,7 @@ struct Expert
     const __half* x = nullptr;        // [M][ldx] mlp_norm output
     int ldx = 0;
     __half* z1 = nullptr;             // [8M][EB blocks][gate, up][128] fp16 (EB = 3 for the TP6 packs, 4 for TP4)
+    int* mid_ctr = nullptr;           // G6_PF_MIDF=1: [maxseg][8] fc1q arrivals per (segment, block); the second runs mid_tail
     uint8_t* x2 = nullptr;            // [maxseg][MB][EB blocks][4][REC]  fc2 inputs, TR3 k order
     __half* yw = nullptr;             // [8M][6144] fp16 weighted expert output per route
     const __half* ysh = nullptr;      // [M][6144] fp16 shared expert output
@@ -3411,10 +3432,13 @@ __global__ void __launch_bounds__(256) k_pf_hx(Expert A)
     }
 }
 __global__ void __launch_bounds__(256) k_pf_hxq(Expert A);       // PF_Q8, below
+__global__ void __launch_bounds__(256) k_pf_hxqf(Expert A);      // G6_PF_HXF, below
 inline void launch_hx(const Expert& A, cudaStream_t st)     // once per layer, before the shared and the routed fc1
 {
     if (!A.on || !A.hx) return;
     const long long warps = static_cast<long long>((A.M + 7) / 8) * (HID / 128);
+    static const bool hxf = [] { const char* e = getenv("G6_PF_HXF"); return e && atoi(e) == 1; }();
+    if (A.q8 && hxf) { k_pf_hxqf<<<static_cast<unsigned>((warps + 7) / 8), 256, 0, st>>>(A); return; }
     k_pf_hx<<<static_cast<unsigned>((warps + 7) / 8), 256, 0, st>>>(A);
     if (A.q8)
     {
@@ -3463,6 +3487,59 @@ __global__ void __launch_bounds__(256) k_pf_hxq(Expert A)
     uint4* dst = reinterpret_cast<uint4*>(A.hq + static_cast<size_t>(r) * HID + ch * 32);
     dst[0] = make_uint4(w[0], w[1], w[2], w[3]);
     dst[1] = make_uint4(w[4], w[5], w[6], w[7]);
+    A.hs[static_cast<size_t>(r) * (HID / 32) + ch] = static_cast<uint8_t>(code);
+}
+// G6_PF_HXF=1 (Q8 layers, read once; default off): k_pf_hx and k_pf_hxq in one pass, hx is not stored (under Q8 only
+// k_pf_hxq reads it: fc1q and the trellis shared pass take hq / hs). Lane (row r, 32-k chunk q of 128-k block kb) of the
+// k_pf_hx layout holds the 32 values of k_pf_hxq's thread (r, kb * 4 + q) in the same order; they round to fp16 as the hx
+// store rounds them, then k_pf_hxq's arithmetic runs on them: the same hq / hs bytes, one 33.5 MB write + read less per
+// chunk. Grid and block of k_pf_hx.
+__global__ void __launch_bounds__(256) k_pf_hxqf(Expert A)
+{
+    constexpr int NB = HID / 128;
+    const int w = (blockIdx.x * 256 + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    const int rb = w / NB, kb = w - rb * NB, r = rb * 8 + (lane >> 2), q = lane & 3;
+    if (rb * 8 >= A.M) return;                   // warp-uniform
+    const bool on = r < A.M;
+    const __half* xr = A.x + static_cast<size_t>(on ? r : 0) * A.ldx + kb * 128 + q * 32;
+    const __half* sp = A.t_sg + kb * 128 + q * 32;
+    float v[32];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const uint4 xv = on ? *reinterpret_cast<const uint4*>(xr + j * 8) : make_uint4(0u, 0u, 0u, 0u);
+        const uint4 sv = *reinterpret_cast<const uint4*>(sp + j * 8);
+        const u32 xw[4] = {xv.x, xv.y, xv.z, xv.w}, sw[4] = {sv.x, sv.y, sv.z, sv.w};
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float2 x2 = __half22float2(as_h2(xw[e])), s2 = __half22float2(as_h2(sw[e]));
+            v[j * 8 + e * 2] = __fmul_rn(x2.x, s2.x);
+            v[j * 8 + e * 2 + 1] = __fmul_rn(x2.y, s2.y);
+        }
+    }
+    had128_l32(v, lane);
+    if (!on) return;
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 32; ++i)
+    {
+        v[i] = __half2float(__float2half_rn(v[i]));          // the hx store's rounding (pack_h2)
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    float inv;
+    const u32 code = mx_scale(amax, inv);
+    u32 o[8];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c)
+    {
+        o[c] = f2_e4m3x2(v[2 * c] * inv, v[2 * c + 1] * inv) | (f2_e4m3x2(v[2 * c + 16] * inv, v[2 * c + 17] * inv) << 16);
+        o[4 + c] = f2_e4m3x2(v[2 * c + 8] * inv, v[2 * c + 9] * inv) | (f2_e4m3x2(v[2 * c + 24] * inv, v[2 * c + 25] * inv) << 16);
+    }
+    const int ch = kb * 4 + q;
+    uint4* dst = reinterpret_cast<uint4*>(A.hq + static_cast<size_t>(r) * HID + ch * 32);
+    dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+    dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
     A.hs[static_cast<size_t>(r) * (HID / 32) + ch] = static_cast<uint8_t>(code);
 }
 
@@ -3603,6 +3680,54 @@ __device__ __forceinline__ void fc1q_body(const Expert& A, const long long* tr, 
         }
 }
 // grid (2 EB, maxseg), block 256 (as k_pf_fc1)
+// G6_PF_MIDF=1 (Expert::mid_ctr set; q8 + h16 + bs): the k_pf_mid H16 pass inside fc1q. The gate and up CTAs of a
+// (segment, block) are in the same grid row (x = b, EB + b) and run together; after its z1 stores each counts one
+// arrival, and the second runs k_pf_mid's arithmetic on the segment's rows of that block, reading both z1 halves back
+// through L2. The same fp16 values and operations as k_pf_mid: x2 is byte-equal, and launch_mid skips k_pf_mid.
+template <int EB>
+__device__ __forceinline__ void mid_tail(const Expert& A, const long long* tr, int seg, int b, int r0, int rows)
+{
+    __shared__ int sLast;
+    __threadfence();                                  // this thread's z1 stores before the CTA's arrival
+    __syncthreads();
+    if (threadIdx.x == 0) sLast = atomicAdd(A.mid_ctr + static_cast<size_t>(seg) * EB + b, 1);
+    __syncthreads();
+    if (sLast != 1) return;                           // CTA-uniform: the first of the pair leaves
+    __threadfence();                                  // the partner's z1 stores before the reads below
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const __half* v2 = A.t_v2 + (static_cast<size_t>(tr[2]) + b) * 3 * 128 + lane * 4;
+    auto f4 = [](const uint2& q, float (&o)[4]) {
+        const float2 a = __half22float2(as_h2(q.x)), c = __half22float2(as_h2(q.y));
+        o[0] = a.x; o[1] = a.y; o[2] = c.x; o[3] = c.y;
+    };
+    float svg[4], svu[4], sud[4];
+    f4(*reinterpret_cast<const uint2*>(v2), svg); f4(*reinterpret_cast<const uint2*>(v2 + 128), svu); f4(*reinterpret_cast<const uint2*>(v2 + 256), sud);
+    for (int row = warp; row < rows; row += 8)        // warp-uniform
+    {
+        const int route = r0 + row;
+        const __half* z = A.z1 + (static_cast<size_t>(route) * (2 * EB) + b * 2) * 128 + lane * 4;
+        const uint2 zg = __ldcg(reinterpret_cast<const uint2*>(z)), zu = __ldcg(reinterpret_cast<const uint2*>(z + 128));
+        float gv[4], uv[4], v[4];
+        f4(zg, gv); f4(zu, uv);
+        had128(gv, lane);
+        had128(uv, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float gg = rnd_h(__fmul_rn(gv[e], svg[e])), uu = rnd_h(__fmul_rn(uv[e], svu[e]));
+            v[e] = __fmul_rn(rnd_h(swiglu_f(gg, uu)), sud[e]);
+        }
+        had128(v, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) v[e] = rnd_h(v[e]);
+        const int sp = A.rr_sp[route], p = sp % RS;
+        const int rr = p & 15, kk = (lane * 4) & 15;
+        u32* fr = reinterpret_cast<u32*>(A.x2) + (((static_cast<size_t>(sp / RS) * MB + (p >> 4)) * EB + b) * 8 + (lane >> 2)) * 128;
+        const int fl = (rr & 7) * 4 + ((kk & 7) >> 1), reg = ((kk >> 3) << 1) | (rr >> 3);
+        fr[fl * 4 + reg] = pack_h2(v[0], v[1]);
+        fr[(fl + 1) * 4 + reg] = pack_h2(v[2], v[3]);
+    }
+}
 template <int EB = g6nr::EB, bool K2 = false>
 __global__ void __launch_bounds__(256, 2) k_pf_fc1q(Expert A)
 {
@@ -3624,6 +3749,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1q(Expert A)
     if (k == 3) fc1q_body<3, EB>(A, tr, b, mat, r0, rows, sX, sS, sRow, mw);
     else if (!K2 || k == 4) fc1q_body<4, EB>(A, tr, b, mat, r0, rows, sX, sS, sRow, mw);
     else fc1q_body<K2 ? 2 : 4, EB>(A, tr, b, mat, r0, rows, sX, sS, sRow, mw);
+    if (A.mid_ctr) mid_tail<EB>(A, tr, seg, b, r0, rows);
 }
 
 // Weight-major fc1 (Expert::wm, G6_PF_WM=1; h16 + bs + hx layers, non-wide units). CTA = (wtile = up to WM_R consecutive
@@ -5322,6 +5448,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
 #endif
 template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_t st)
 {
+    if (A.mid_ctr) return;            // G6_PF_MIDF: fc1q ran the pass (mid_tail)
 #if G6_MODEL_FLASH
     if (A.on && A.h16) { k_pf_mid<EB, true><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A); return; }
 #endif
@@ -5521,9 +5648,13 @@ template <int EB = g6nr::EB> inline void launch_shared(const Expert& S, cudaStre
     launch_fc2<EB>(S, st);
 }
 
-template <int EB = g6nr::EB> inline void launch_experts(const Expert& A, cudaStream_t st)
+template <int EB = g6nr::EB> inline void launch_experts(const Expert& A0, cudaStream_t st)
 {
+    Expert A = A0;
+    // G6_PF_MIDF: mid_tail runs in k_pf_fc1q only, so the pass must take launch_fc1's fc1q branch (q8 + h16 + bs + hq)
+    if (A.mid_ctr && !(A.q8 && A.h16 && A.bs && A.hq)) A.mid_ctr = nullptr;
     launch_route(A, st);
+    if (A.on && A.mid_ctr) cudaMemsetAsync(A.mid_ctr, 0, static_cast<size_t>(A.maxseg) * EB * sizeof(int), st);
     launch_fc1<EB>(A, st);
     launch_mid<EB>(A, st);
     launch_fc2<EB>(A, st);
@@ -5555,6 +5686,7 @@ struct Scratch
     __half* hx;                       // [M][HID] Expert::hx
     uint8_t *hq, *hs;                 // [M][HID], [M][HID / 32] Expert::hq, hs
     int *wt, *n_wt;                   // Expert::wt, n_wt
+    int* mid_ctr;                     // Expert::mid_ctr (G6_PF_MIDF)
 #endif
 };
 
@@ -5619,6 +5751,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
     t.hs = reinterpret_cast<uint8_t*>(take(m * (HID / 32)));
     t.wt = reinterpret_cast<int*>(take((static_cast<size_t>(max_wtiles(M)) + (m + WM_R - 1) / WM_R) * 3 * 4));
     t.n_wt = reinterpret_cast<int*>(take(4));
+    t.mid_ctr = reinterpret_cast<int*>(take(ms * 8 * 4));
 #endif
 #ifdef PF_AOP
     t.aop = reinterpret_cast<uint8_t*>(take(ms * AOP_NS * 2 * AOPS));
@@ -5973,6 +6106,9 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #if G6_MODEL_FLASH
         { const char* ev = getenv("G6_PF_HX"); if (A.h16 && bsf && !(ev && atoi(ev) == 0)) A.hx = sc.hx; }
         { const char* ev = getenv("G6_PF_Q8"); A.q8 = A.hx && ev && atoi(ev) == 1; if (A.q8) { A.hq = sc.hq; A.hs = sc.hs; } }
+#if !defined(PF_HOIST) && !defined(PF_F12)
+        { const char* ev = getenv("G6_PF_MIDF"); if (A.q8 && A.h16 && bsf && ev && atoi(ev) == 1) A.mid_ctr = sc.mid_ctr; }
+#endif
         { const char* ev = getenv("G6_PF_FC2ONE"); A.fc2one = A.h16 && bsf && !(ev && atoi(ev) == 0); }
         { const char* ev = getenv("G6_PF_FC2V2"); A.fc2v2 = A.fc2one && !(ev && atoi(ev) == 0); }
         {   // weight-major fc1 (default on, G6_PF_WM=0 = k_pf_fc1): k_pf_fc1ws only for passes of >= G6_PF_WM_MIN rows
@@ -6036,6 +6172,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #endif
             Expert& S = L.exs;
             S = A;
+            S.mid_ctr = nullptr;          // the shared pass keeps k_pf_mid
             S.nroutes = M; S.maxseg = (M + RS - 1) / RS;
             S.rr_row = sc.sh_rr_row; S.rr_e = sc.sh_rr_e; S.rr_sp = sc.sh_rr_sp; S.rr_w = sc.sh_rr_w;
             S.segs = sc.sh_segs; S.n_seg = sc.sh_n_seg; S.pos = nullptr;
