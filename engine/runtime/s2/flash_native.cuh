@@ -90,6 +90,22 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         capture_tokens.clear();
     };
     NativeHooks h;
+    // Rows the steps wrote into the attention caches (main and draft) since the last clear: a request clears only the
+    // pages that hold them, one page past the last, and every later page is still zero from that clear (the full reset
+    // cleared 12 x 436 MB per request at the 262K cap, ~27 ms). -1 = not known (boot): every page.
+    // G6_FLASH_RESET_ALL=1: every page per request, as before. G6_FLASH_RESET_CHECK=1: dies unless the pages past the
+    // cleared ones are all zero (a test arm: it reads every cache).
+    auto env_on = [](const char* k) { const char* v = getenv(k); return v && atoi(v) != 0; };
+    const bool reset_all = env_on("G6_FLASH_RESET_ALL"), reset_check = env_on("G6_FLASH_RESET_CHECK");
+    int dirty = -1;
+    unsigned* zflag = nullptr;
+    if (reset_check) G6RT_CK(cudaMalloc(&zflag, 4));
+    auto wrote = [&](int end) { if (dirty >= 0) dirty = std::max(dirty, end); };
+    auto wrote_step = [&](const StepIn& si) {      // a step writes its rows' positions (context = last row's + 1)
+        int e = si.context;
+        for (int r = 0; r < si.M; ++r) e = std::max(e, si.pos[r] + 1);
+        wrote(e);
+    };
     h.pool.free_pages = [&] { return pool.free_pages(); };
     h.pool.room = [&] { return pool.room(); };
     h.pool.reserve = [&](uint64_t n, uint64_t worst) { return pool.reserve(n, worst); };
@@ -155,7 +171,20 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         require(g.key.slot == 0 && (!g.reuse || ck) && g.run.first_page == 0,
                 "Flash serve requires a fresh identity run");
         for (size_t i = 0; i < list.size(); ++i) require(list[i] == int(i), "Flash run is not contiguous");
-        reset(c.main, c.stream); reset(c.draft.d, c.stream);
+        if (dirty < 0 || reset_all) { reset(c.main, c.stream); reset(c.draft.d, c.stream); }
+        else {
+            const int pg = (dirty + PAGE - 1) / PAGE + 1;
+            if (reset_check) {
+                const int lm = reset_dirty_layer(c.main, pg, zflag, c.stream), ld = reset_dirty_layer(c.draft.d, pg, zflag, c.stream);
+                if (lm >= 0 || ld >= 0) {
+                    fprintf(stderr, "# G6_FLASH_RESET_CHECK: request %llu: nonzero cache past page %d (rows < %d written): main layer %d, draft layer %d\n",
+                            (unsigned long long)g.req.id, pg, dirty, lm, ld);
+                    require(false, "Flash partial reset: a cache page past the written rows is not zero");
+                }
+            }
+            reset_pages(c.main, pg, c.stream); reset_pages(c.draft.d, pg, c.stream);
+        }
+        dirty = 0;
         ks.reset(0); lp_rows = 0; fence();
         capture_at = 0; capture_tokens.clear();
         if (!ck) return;
@@ -169,6 +198,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             require(x && x->position == g.reuse, "Flash checkpoint hit differs from its entry");
             exact = !x->terminal;
             ck->restore(gen, 0, c.stream);
+            wrote((int(g.reuse) + PAGE - 1) / PAGE * PAGE);   // whole pages of both models' caches
             fprintf(stderr, "# flash ckpt request %llu restored %u rows (%s entry %llu, %llu blocks) in %.1f ms\n",
                     (unsigned long long)g.req.id, g.reuse, exact ? "aligned" : "terminal", (unsigned long long)gen,
                     (unsigned long long)ck->last.blocks, ck->last.ms);
@@ -231,6 +261,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             std::vector<uint32_t> sizes(3, uint32_t(si.M * HID * 2));
             sizes[2] = uint32_t(glue::head_bytes(si.M, c.draft.d.nc));
             c.draft_fabric.enqueue_step(si.step, sizes);
+            wrote_step(si);
             if (!g) c.draft_graph(l.buckets[0], chain, si.M);
         } else {
             ks.step(si, l.step, l.events, s2::Step::TAIL);
@@ -238,6 +269,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             std::vector<uint32_t> sizes(c.main.ncoll(), uint32_t(si.M * HID * 2));
             sizes.back() = head_size(si, c.main.nc);
             c.main_fabric.enqueue_step(si.step, sizes);
+            wrote_step(si);
             if (!g) c.main_graph(l.buckets[0], si.M);
         }
         if (g) {
@@ -265,6 +297,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         require(!mb || (sc.two_lanes && mb <= int(sc.prefill_rows)), "Flash prefill exceeds lanes");
         std::vector<int> pos(rows);
         for (unsigned r = 0; r < rows; ++r) pos[r] = a + int(r);
+        wrote(a + int(rows));
         // several sessions: the prefill runs today's path (s2on off) on the session's pages in the layers' own tables
         // (the batched steps read the slots' tables) and its first KDA slot
         const int q = int(slot.key.slot), kslot = multi ? ks.base(q) : 0;
@@ -294,6 +327,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         auto draft = [&](FlashPrefill& fp, int n, int base) {
             pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
                 *c.draft_input = di;
+                wrote_step(di);
                 if (cache) pf_draft_cache_flash(c.draft, di.M, di.context, c.stream);
                 else {
                     std::vector<uint32_t> sizes(3, uint32_t(di.M * HID * 2));
