@@ -76,6 +76,7 @@ struct NativeHooks {
     s2::DSel dsel;                    // drafter choice (G6_S2_DSEL)
     s2::KStop kstop;                  // solo MTP rounds' draft count (G6_MTP_KSTOP, G6_MTP_LPLOG)
     s2::DflReuse dfl_reuse;           // G6_DFL_REUSE
+    s2::NgramSrc ngram;               // G6_NGRAM: the n-gram table as a draft source (S5, #56)
 };
 // Only atomic scalar stores/loads on the compute hot path. No request-file
 // checks, digest, allocation, or lock in an event-free boundary. horizon() is
@@ -505,6 +506,9 @@ public:
                 fprintf(stderr,"# s2 dflash reuse slot %u: %ld of %ld rounds on DFlash2, %ld on MTP; context from %d (taps from %d), "
                         "warm-up to %d, promoted at %d, %ld tokens\n",unsigned(k.slot),stats.dfl_rounds,stats.rounds,stats.mtp_rounds,
                         stats.dfl_lo,stats.dfl_from,stats.dfl_warm,stats.promoted,stats.tokens);
+            if (native_.ngram.t && !c_.rank)
+                fprintf(stderr,"# s2 ngram slot %u: %ld of %ld rounds verified a table chain, %ld of %ld of its tokens accepted, %ld tokens\n",
+                        unsigned(k.slot),stats.ngram_rounds,stats.rounds,stats.ngram_acc,stats.ngram_drafted,stats.tokens);
             sessions_.terminal(k,stats);
         };
         if (native_.dispatch.dfl) {
@@ -521,6 +525,7 @@ public:
         if (native_.dispatch.dfl) {
             driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
             driver_->dfl_reuse(native_.dfl_reuse);
+            driver_->ngram(native_.ngram);
         }
         else if (kstop_mtp) driver_->kstop(native_.kstop);
         if (reuse()) {

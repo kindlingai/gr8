@@ -40,6 +40,11 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/batch_dflash_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dsel_test.cpp" -o "$T/batch_dsel_test"
 "$T/batch_dsel_test"
+# the n-gram table as a draft source (G6_NGRAM, #56): the table file, chains, the round choice, exact output
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ngram_test.cpp" -o "$T/batch_ngram_test"
+"$T/batch_ngram_test" 2>/dev/null    # the G6_MTP_LPLOG case prints its round lines
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check"
+(cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test"
 "$T/batch_dflreuse_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test"

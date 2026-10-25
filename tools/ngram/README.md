@@ -20,6 +20,16 @@ near-certain continuations would propose drafts that the target accepts. Python 
     # 3. table size against hit rate
     python3 tools/ngram/ngram.py sizes traces.jsonl --floors 0.1,0.3,0.5,0.7,0.9
 
+    # 4. the engine's table (G6_NGRAM / NGRAM=FILE, engine/runtime/ngram_lookup.h), calibrated on held-out folds
+    python3 tools/ngram/ngram.py export traces.jsonl --out ngram.tab
+
+`export` writes each context's top token and GLM's mean probability for it, and a calibration: per probability bucket
+(`spec_len.h`'s edges), the share of held-out chain tokens GLM produced after a right prefix, shrunk toward the bucket's
+lower edge. The engine prices a chain with the calibrated values, so the 30-60% overestimate the raw means showed on
+the first cluster traces does not reach its choice. With `NGRAM` set, a request decoding alone with DFlash2 verifies the
+table's chain instead of the drafter's drafts in rounds where the chain promises more tokens per verify ms
+(`docs/SETTINGS.md`, `G6_NGRAM`).
+
 `import-kl-ref` turns a `bench/gate` KL reference (16 greedy continuations of 256 tokens, top 20) into traces, which
 checks the tools but is too little and too varied to judge the table. Its top lists come from a separate scoring pass:
 in `refs/tp4.json` 108 of 4,096 positions have the generated token outside first place.

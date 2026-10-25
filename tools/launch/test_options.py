@@ -286,6 +286,13 @@ class CanonicalTests(unittest.TestCase):
         _, text, _ = self.digest('--dsel-model', '1', '--dsel-table', tab)
         self.assertIn(' G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=' + tab, text)
 
+    def test_ngram_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_NGRAM', text)
+        _, text, _ = self.digest('--ngram', '/tables/ngram.tab', '--ngram-kmax', '5', '--ngram-kmin', '3',
+                                 '--ngram-margin', '0.2')
+        self.assertIn(' G6_NGRAM=/tables/ngram.tab G6_NGRAM_KMAX=5 G6_NGRAM_KMIN=3 G6_NGRAM_MARGIN=0.2', text)
+
     def test_release_alone_has_no_rank_pack(self):
         _, text, _ = self.digest('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel')
         self.assertIn('--v2-dense @V2_DENSE', text)
