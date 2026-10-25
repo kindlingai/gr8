@@ -28,8 +28,10 @@ on:
 permissions:
   contents: read
 
+# A pull request's new push cancels its old run. Each push to main or a tag runs in its own group: one group per ref
+# keeps a single pending run, and a newer one cancels it, so in a burst of merges only the first and last were tested.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}${{ github.event_name == 'push' && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -297,6 +299,10 @@ jobs:
     needs: [cpu, engine]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
+    # main's runs overlap, so their pushes take turns, and latest and main move only to main's head (below)
+    concurrency:
+      group: image-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -324,14 +330,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Is this commit still main's head?
+        # a run that finishes after a newer commit's run pushes only its sha tag, so latest never moves back
+        id: head
+        run: |
+          head=false
+          if [ "$GITHUB_REF" = refs/heads/main ] && [ "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA" ]; then head=true; fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "main's head: $head"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
-          # latest and main follow main; a tag gets its own name; every image also gets sha-<commit>
+          # latest and main follow main's head; a tag gets its own name; every image also gets sha-<commit>
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
+            type=raw,value=latest,enable=${{ steps.head.outputs.head }}
+            type=ref,event=branch,enable=${{ steps.head.outputs.head }}
             type=ref,event=tag
             type=sha
       - name: Build the runtime image
