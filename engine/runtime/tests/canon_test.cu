@@ -27,6 +27,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "../../attn/bind.h"
+#include "../../attn/ops.h"
 #include "../../attn/kvfmt.h"
 #include "../../g6nr.h"
 #include "../../kvman-rs/g6kvman.h"

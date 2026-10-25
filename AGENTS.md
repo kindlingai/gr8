@@ -118,3 +118,5 @@ write 0 or an estimate. Check it parses: `python3 -m json.tool kindling.json`.
 ## Things worth knowing
 
 - If a rank dies, the whole engine stops. `./gr8 glm53 status` names the rank and its last log line.
+- The runtime calls attention through `engine/attn/ops.h`, one op table per model (`ops_glm.cu`, `ops_flash.cu`). An op
+  only one model has stays null in the other's table, so it needs no stub; the file says how to add one.

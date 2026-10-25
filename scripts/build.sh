@@ -110,7 +110,7 @@ $NVCC -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -
 # an idle GPU and ~3-5 GB): $OUT/l2pf_bench (file header)
 $NVCC -O3 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
   -I "$REPO/engine/kernels" -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
-  "$REPO/engine/attn/bind.cu" -lcublas
+  "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas
 # the prefetch queues (G6_L2PF targets, G6_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} \
   -I "$REPO/engine/kernels" -o "$OUT/l2pf_queue_test" "$REPO/engine/kernels/tests/l2pf_queue_test.cu"

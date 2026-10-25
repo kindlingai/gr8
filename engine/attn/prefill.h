@@ -17,7 +17,7 @@ struct G6AttnTrace {
 // Config stays frozen for all calls/graphs on this state; changing env later has
 // no effect. Use matching settings when creating a shared root and borrowers.
 // Pack/binding lifetime exceeds state lifetime; release state before binding.
-extern "C" int g6_attn_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding*,void* stream);
+extern "C" int g6a_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding*,void* stream);
 // A null storage_owner creates one H11/full-index scratch allocation sized for
 // b->capacity/max_rows (even when b is H10 or a reuse layer). A non-null owner
 // borrows and retains its scratch and cuBLAS handle; incompatible device/shape/size is rejected.
@@ -25,20 +25,20 @@ extern "C" int g6_attn_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding*,vo
 // on one stream, or order streams externally; overlapping calls are unsafe.
 // Complete outstanding GPU uses before release. States may be released in any
 // order: borrowers retain scratch after the original owner is destroyed.
-extern "C" int g6_attn_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding*,void* stream,G6AttnPrefill* storage_owner);
-extern "C" int g6_attn_bind_prefill_run(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,void* stream);
-extern "C" int g6_attn_bind_prefill_release(G6AttnPrefill*);
+extern "C" int g6a_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding*,void* stream,G6AttnPrefill* storage_owner);
+extern "C" int g6a_bind_prefill_run(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,void* stream);
+extern "C" int g6a_bind_prefill_release(G6AttnPrefill*);
 // Accounting: private weight bytes plus scratch only for the allocating root.
 // Sum once over the states at creation to count shared storage once. Not peak
 // memory: excludes cuBLAS private allocations and binding/cache storage. After
 // destroying the root, its accounting charge disappears but retained scratch
 // remains live until the final borrower is released.
-extern "C" size_t g6_attn_bind_prefill_bytes(const G6AttnPrefill*);
+extern "C" size_t g6a_bind_prefill_bytes(const G6AttnPrefill*);
 // Query effective tile=min(configured tile,max_rows) and frozen dense threshold.
-extern "C" int g6_attn_bind_prefill_get_config(const G6AttnPrefill*,int* query_tile,int* dense_limit);
+extern "C" int g6a_bind_prefill_get_config(const G6AttnPrefill*,int* query_tile,int* dense_limit);
 // Diagnostic runners: same computation with optional FP32 stage copies.
-extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,const G6AttnTrace*,void* stream);
-extern "C" int g6_attn_bind_baseline_trace(G6AttnBinding*,const G6AttnStep*,const G6AttnTrace*,void* stream);
+extern "C" int g6a_bind_prefill_trace(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,const G6AttnTrace*,void* stream);
+extern "C" int g6a_bind_baseline_trace(G6AttnBinding*,const G6AttnStep*,const G6AttnTrace*,void* stream);
 
 // Optional diagnostic event profile, independent per state (also with shared
 // scratch). G6_PF_EVENTS is frozen at create; OFF allocates/records/queries no
@@ -67,7 +67,7 @@ struct G6AttnPrefillProfile {
 // other=inter-tile gaps. Groups partition that span (event rounding applies).
 // Trace-copy overhead is included when traced=1. Event timing perturbs the
 // workload: use OFF whole-call measurements for performance acceptance.
-extern "C" int g6_attn_bind_prefill_profile_read(G6AttnPrefill*,G6AttnPrefillProfile* out);
+extern "C" int g6a_bind_prefill_profile_read(G6AttnPrefill*,G6AttnPrefillProfile* out);
 
 // Row-owner phase1b. All pointers are device addresses; calls enqueue on stream
 // without allocating or synchronizing. Binding/state must be successfully
@@ -81,7 +81,7 @@ extern "C" int g6_attn_bind_prefill_profile_read(G6AttnPrefill*,G6AttnPrefillPro
 // ignores all other step fields. Requires full-index binding. Uses exactly the
 // normal normalize/RoPE/FP8 append; does not read/write latent KV, IDs or output.
 // Clears the binding error word before append; errors are asynchronous as usual.
-extern "C" int g6_attn_bind_index_append(G6AttnBinding*,const G6AttnStep* full_step,void* stream);
+extern "C" int g6a_bind_index_append(G6AttnBinding*,const G6AttnStep* full_step,void* stream);
 // Score/select ONLY owner rows from the already appended index-key cache.
 // For contiguous ownership [r0,r1), caller offsets positions/index_q/index_weight
 // to r0, sets rows=r1-r0, context>=max(owner positions)+1. Other activation fields
@@ -99,7 +99,7 @@ extern "C" int g6_attn_bind_index_append(G6AttnBinding*,const G6AttnStep* full_s
 // profile (EMPTY when enabled, OFF otherwise); no subset timing is reported.
 // Intended sequence: append(all rows) -> score(owner) -> caller all-gather IDs ->
 // normal full-row prefill_run with reuse_indices (appends latent KV exactly once).
-extern "C" int g6_attn_bind_prefill_index_rows(G6AttnPrefill*,G6AttnBinding*,
+extern "C" int g6a_bind_prefill_index_rows(G6AttnPrefill*,G6AttnBinding*,
     const G6AttnStep* owner_step,int* out_ids,float* out_scores,void* stream);
 
 #if G6_MODEL_FLASH
@@ -114,6 +114,6 @@ struct G6FlashPoolOwner {
     int (*publish)(void*, const int* indices, const int* positions, int rows, void* stream);
     int (*receive)(void*, int* indices, const int* positions, int rows, void* stream);
 };
-extern "C" int g6_attn_bind_prefill_run_owned(G6AttnPrefill*, G6AttnBinding*,
+extern "C" int g6a_bind_prefill_run_owned(G6AttnPrefill*, G6AttnBinding*,
     const G6AttnStep*, void* stream, const G6FlashPoolOwner*);
 #endif

@@ -242,7 +242,7 @@ int main(int argc,char** argv){
      cudaDeviceGetAttribute(&clk,cudaDevAttrClockRate,dev);cudaDeviceGetAttribute(&l2,cudaDevAttrL2CacheSize,dev);
      printf("GPU %d SMs, attr clock %d MHz, L2 %.1f MB | T=%d L=%d M=%d H=%d s2=%d sessions=%d ties=%d qscale=%g K=%d reps=%d TR=%d chk=%d bw=%.0f GB/s | BASE %s\n",
         sms,clk/1000,l2/1048576.,T,L,M,H,S2,NSESS,TIES,QS,K,REPS,TR,CHK,BW,tag_of(base).c_str());}
-    CKI(g6_attn_rope_init(T,st));   // as a served boot: the decode RoPE table (absorb / append skip the FP64 sincos)
+    CKI(g6a_rope_init(T,st));   // as a served boot: the decode RoPE table (absorb / append skip the FP64 sincos)
     // weights, per-layer caches (layer 0 full index, layer 1 shared), step inputs
     __nv_bfloat16 *uk=dalloc<__nv_bfloat16>((size_t)H*512*192),*uv=dalloc<__nv_bfloat16>((size_t)H*256*512),
         *kvn=dalloc<__nv_bfloat16>(512),*inw=dalloc<__nv_bfloat16>(128),*inb=dalloc<__nv_bfloat16>(128);
@@ -295,7 +295,7 @@ int main(int argc,char** argv){
         CK(cudaMalloc(&dcell[l],sizeof c));CK(cudaMemcpy(dcell[l],&c,sizeof c,cudaMemcpyHostToDevice));
         c.context=0;CK(cudaMalloc(&dead[l],sizeof c));CK(cudaMemcpy(dead[l],&c,sizeof c,cudaMemcpyHostToDevice));}
     ga::attn_ctx3_sp()=64;   // size the scratch for the largest layout (SP=64: 32 partials), so every arm's layout fits it
-    const size_t sb=std::max(g6_attn_scratch_bytes(&a[0]),g6_attn_scratch_bytes(&a[1]));
+    const size_t sb=std::max(g6a_scratch_bytes(&a[0]),g6a_scratch_bytes(&a[1]));
     ga::attn_ctx3_sp()=0;
     void* scr=dalloc<uint8_t>(sb);
     G6AttnReplay rp[2]={{a[0],dcell[0],scr,sb},{a[1],dcell[1],scr,sb}},rd[2]={{a[0],dead[0],scr,sb},{a[1],dead[1],scr,sb}};
@@ -309,7 +309,7 @@ int main(int argc,char** argv){
     const size_t no=(size_t)M*H*256,ni=(size_t)M*ga::TOP,nc=(size_t)M*H*512,np=(size_t)M*H*ga::TOP,npa=(size_t)M*H*ga::PART*512,nsi=(size_t)M*T;
     const size_t ipb=(size_t)64*g6kv::IDX_ROW;   // one index-cache page
     struct Snap{std::vector<__half> o0,o1;std::vector<int> i0,ii;std::vector<float> cx,pr,pa,si,sc[2],pl[2];std::vector<uint8_t> kv,ix;unsigned e0,e1,v0,v1;};
-    auto call=[&](int l){CKI(g6_attn_replay_run(&rp[l],st));};
+    auto call=[&](int l){CKI(g6a_replay_run(&rp[l],st));};
     auto both=[&]{call(0);call(1);};
     auto poison_w=[&](const ga::Work& W){CK(cudaMemsetAsync(W.context,0xab,nc*4,st));CK(cudaMemsetAsync(W.prob,0xab,np*4,st));CK(cudaMemsetAsync(W.parts,0xab,npa*4,st));
         CK(cudaMemsetAsync(W.si,0xab,nsi*4,st));CK(cudaMemsetAsync(W.ii,0xab,nsi*4,st));};
@@ -352,7 +352,7 @@ int main(int argc,char** argv){
         if(!(WHAT&(which?4:1)))continue;
         const Arm cfg=which?STOCK:base;set_arm(cfg);
         for(int l=0;l<2;l++){
-            cudaGraph_t gl=capture(st,[&]{call(l);}),gd=capture(st,[&]{CKI(g6_attn_replay_run(&rd[l],st));});
+            cudaGraph_t gl=capture(st,[&]{call(l);}),gd=capture(st,[&]{CKI(g6a_replay_run(&rd[l],st));});
             std::vector<Node> nl=chain_of(gl),nd=chain_of(gd);
             if(nl.size()!=nd.size()){fprintf(stderr,"live / dead chains differ in length\n");exit(1);}
             const int n=(int)nl.size();std::vector<Timed> g;

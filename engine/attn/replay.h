@@ -35,4 +35,4 @@ struct G6AttnReplay {
 // Capture/replay entry: topology is fixed by rows, reuse mode and capacity.
 // All per-step validation/clearing uses a captured device kernel. No allocation,
 // host reads of live control words, graph update or recapture is required.
-extern "C" int g6_attn_replay_run(const G6AttnReplay*, void* stream);
+extern "C" int g6a_replay_run(const G6AttnReplay*, void* stream);

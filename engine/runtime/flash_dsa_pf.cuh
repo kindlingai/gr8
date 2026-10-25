@@ -29,6 +29,7 @@
 #include <vector>
 #include "rank.cuh"
 #include "../attn/prefill.h"
+#include "../attn/ops.h"
 #include "flash_pool_owner.cuh"
 #include "flash_dsa_full_schedule.h"
 #include "../kernels/bind_prefill.cuh"

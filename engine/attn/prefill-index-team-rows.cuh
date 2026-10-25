@@ -16,7 +16,7 @@ static bool index_rows_bounds(const G6AttnBinding* b,const G6AttnStep* step){
         step->positions&&b->args.block_table&&b->args.error;
 }
 }
-extern "C" int g6_attn_bind_index_append(G6AttnBinding* b,const G6AttnStep* step,void* s){
+extern "C" int g6a_bind_index_append(G6AttnBinding* b,const G6AttnStep* step,void* s){
     if(!gp::index_rows_shape(b,step))return int(cudaErrorInvalidValue);
     if(!step->rows)return 0;
     if(!gp::index_rows_bounds(b,step)||!b->full_index||!step->index_k||
@@ -27,7 +27,7 @@ extern "C" int g6_attn_bind_index_append(G6AttnBinding* b,const G6AttnStep* step
     if(e!=cudaSuccess)return int(e);
     ga::append_index<<<a.rows,128,0,st>>>(a);return int(cudaGetLastError());
 }
-extern "C" int g6_attn_bind_prefill_index_rows(G6AttnPrefill* p,G6AttnBinding* b,
+extern "C" int g6a_bind_prefill_index_rows(G6AttnPrefill* p,G6AttnBinding* b,
     const G6AttnStep* step,int* out_ids,float* out_scores,void* s){
     if(!p)return int(cudaErrorInvalidValue);
     gp::profile_reset(p->profile); // No whole-prefill timing is produced here.
