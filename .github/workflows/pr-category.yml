@@ -1,6 +1,7 @@
 # Asks a PR's author to tick one merge-queue category in the description (.github/pull_request_template.md) and labels
-# the PR with it. pull_request_target, so it can comment on PRs from forks: it never checks out or runs the PR's code,
-# and reads the description only as text.
+# the PR with it. "Front end only" also needs every changed file to be front-end code (.github/ci/scope.js).
+# pull_request_target, so it can comment on PRs from forks: it checks out the default branch's .github/ci, never the
+# PR's code, and reads the description and the file list only as text.
 name: PR category
 on:
   pull_request_target:
@@ -14,6 +15,10 @@ jobs:
   category:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          sparse-checkout: .github/ci
+          persist-credentials: false
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
         with:
           script: |
@@ -38,7 +43,24 @@ jobs:
             }
             const current = pr.labels.map(l => l.name).filter(n => n.startsWith("risk:"));
 
-            if (ticked.length === 1) {
+            let msg = null;
+            if (ticked.length === 1 && ticked[0][1] === "risk:frontend") {
+              const scope = require(`${process.env.GITHUB_WORKSPACE}/.github/ci/scope.js`);
+              const files = await scope.prFiles(github, context, pr);
+              const outside = files ? scope.outsideFrontend(files) : null;
+              if (!files) {
+                msg = `${marker}\n@${pr.user.login}, this PR changes too many files to check against **Front end ` +
+                  `only**: pick another category.`;
+              } else if (outside.length) {
+                msg = `${marker}\n@${pr.user.login}, **Front end only** covers \`frontend/\`, \`tools/launch/\`, ` +
+                  `\`smoketest/\`, \`./gr8\` and Markdown (.github/ci/scope.js), and this PR also changes:\n\n` +
+                  outside.slice(0, 20).map(p => `- \`${p}\``).join("\n") +
+                  (outside.length > 20 ? `\n- and ${outside.length - 20} more` : "") +
+                  `\n\nPick another category, or move those changes to their own PR.`;
+              }
+            }
+
+            if (ticked.length === 1 && !msg) {
               const want = ticked[0][1];
               for (const l of current.filter(n => n !== want)) {
                 await github.rest.issues.removeLabel({ owner, repo, issue_number, name: l }).catch(() => {});
@@ -50,10 +72,14 @@ jobs:
               return;
             }
 
-            const msg = `${marker}\n@${pr.user.login}, please tick **exactly one** merge-queue category in the PR ` +
+            msg = msg || `${marker}\n@${pr.user.login}, please tick **exactly one** merge-queue category in the PR ` +
               `description (${ticked.length} ticked now). The queue batches PRs by category:\n\n` +
               cats.map(([t]) => `- [ ] ${t}`).join("\n") +
               `\n\nIf the template section is missing, paste the list above into the description and tick one.`;
+            for (const l of current) {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: l }).catch(() => {});
+            }
             if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body: msg });
             else await github.rest.issues.createComment({ owner, repo, issue_number, body: msg });
-            core.setFailed(`expected exactly one category, found ${ticked.length}`);
+            core.setFailed(ticked.length === 1 ? "Front end only, with changes outside the front end"
+              : `expected exactly one category, found ${ticked.length}`);
