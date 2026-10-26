@@ -87,7 +87,7 @@
 //                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
 //                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
 //                     Needs --mtp or --dflash-manifest. Under S2: the DFlash2 sessions' policy (needs --dflash-manifest).
-//                     Flash: on by default with --mtp K (Flash TP2 verify cost table, spec_len.h flash_tp2).
+//                     Flash: on by default with --mtp K (the width's Flash verify cost table, spec_len.h flash_cost).
 //      [--spec-reset-per-request]  Flash offline: restore the configured adaptive policy before each request (default off).
 //                     Does not reset transport counters or cumulative MTP statistics; no effect with --spec-fixed.
 //      [--spec-fixed]  Flash: --mtp K verifies all K drafts every round (the adaptive default off).
@@ -335,7 +335,7 @@ int main(int argc, char** argv)
         spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
         spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
 #if G6_MODEL_FLASH
-        if (!dfl) spec.flash_tp2();
+        if (!dfl) spec.flash_cost(g6nr::NR);
 #endif
     }
 #if G6_MODEL_FLASH
