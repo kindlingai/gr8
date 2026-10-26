@@ -628,6 +628,12 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(rc, 1, line)
         self.assertIn('no supervisor runs', line)
 
+    def test_without_proc_ps_tells_a_supervisor_from_another_process(self):
+        """macOS has no /proc: the command line comes from ps."""
+        no_proc = os.path.join(self.home, 'no-proc')
+        self.assertTrue(self.L.is_supervisor(self.fake_supervisor(), no_proc))
+        self.assertFalse(self.L.is_supervisor(os.getpid(), no_proc))
+
     def test_a_clock_step_after_the_boot_does_not_make_it_unready(self):
         self.write('serving', 1)
         p = os.path.join(self.out, 'supervisor.pid')

@@ -208,17 +208,31 @@ def cmd_status(argv):
     return 0
 
 
+def cmdline(pid, proc='/proc'):
+    """pid's command line as its words, or None where neither /proc nor ps can say. /proc/<pid>/cmdline on Linux;
+    elsewhere (macOS) `ps -o command=`, whose words split at spaces, so a path with a space in it reads as two."""
+    try:
+        with open(os.path.join(proc, str(pid), 'cmdline'), 'rb') as f:
+            return [a.decode(errors='replace') for a in f.read().split(b'\0') if a]
+    except OSError:
+        if os.path.isdir(os.path.join(proc, 'self')):
+            return None     # a /proc that does not show this pid: gone, or hidden
+    try:
+        r = subprocess.run(['ps', '-ww', '-o', 'command=', '-p', str(pid)], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.split() if r.returncode == 0 and r.stdout.strip() else None
+
+
 def is_supervisor(pid, proc='/proc'):
     """Whether pid runs a gr8 supervisor (`launch.py supervise` or `launch.py up --foreground`), from its command line.
     A probe cannot use sv.recorded(): its start time against the pid file's mtime moves when NTP steps the clock after
-    boot, and the probe would call a serving box unready for the rest of that boot. Where /proc cannot say (macOS, a
-    hidden process), a live pid is taken as the supervisor."""
+    boot, and the probe would call a serving box unready for the rest of that boot. Where neither /proc nor ps can
+    say, a live pid is taken as the supervisor."""
     if not pid or not sv.alive(pid):
         return False
-    try:
-        with open(os.path.join(proc, str(pid), 'cmdline'), 'rb') as f:
-            argv = [a.decode(errors='replace') for a in f.read().split(b'\0')]
-    except OSError:
+    argv = cmdline(pid, proc)
+    if argv is None:
         return not os.path.isdir(os.path.join(proc, 'self'))
     return any(os.path.basename(a) == 'launch.py' for a in argv) and ('supervise' in argv or '--foreground' in argv)
 
