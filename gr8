@@ -28,7 +28,7 @@
 #
 #   ./gr8 kv up --gb N [OPTIONS]      lock N GiB of this box's memory and serve it as KV page blocks to the cluster
 #                                     (engine/kvman-rs/REMOTE-TIER.md), announced in the mentat group; ./gr8 kv --help
-#   ./gr8 kv down | status [all] | logs [-f]
+#   ./gr8 kv down | status [all] | health | logs [-f]
 #
 #   ./gr8 query [OPTIONS] PROMPT      one chat prompt streamed to the terminal, thinking dim (tools/query/query.py):
 #                                     --api URL, --steer PROFILE[:SCALE], --effort, --record/--replay FILE, --window 40x10

@@ -196,8 +196,8 @@ A KV node: a box that locks some of its memory and serves it as KV page blocks t
 ends have a RoCE v2 address and TCP otherwise (`engine/kvman-rs/REMOTE-TIER.md`). The cluster uses it through `KV_STORE` and `KV_ROWS` with `remote:auto`.
 `./gr8 kv up --gb N` starts it on this box. The node joins the mentat group as an agent without GPUs, with the service
 `gr8-kv`, and the model's election counts only agents with GPUs. `down`, `status` (`status all`: every node the group
-announces) and `logs [-f]` work as for the model. The options come from the same places as above. A shared config
-file is read for these keys only.
+announces), `health` (exit 0 when this box's node serves, else 1) and `logs [-f]` work as for the model. The options
+come from the same places as above. A shared config file is read for these keys only.
 
 | name | flag | default | meaning |
 |---|---|---|---|
