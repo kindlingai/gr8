@@ -1,25 +1,30 @@
 //! A RAM cache in front of a block store ("ram:FLOOR+STORE", the store's ram=on): the box's free memory holds copies
 //! of the store's blocks, and the kernel takes that memory back whenever it needs it.
 //!
-//! - Writes go to the store first, then into the cache, whose pages are then given MADV_FREE. Until the kernel needs
-//!   the memory, a read copies the block from RAM. A page the kernel took reads as zeros.
+//! - Writes go to the store first, then into the cache, whose pages are then given MADV_FREE. A read that misses fills
+//!   the cache from what it read, so blocks a persisted SSD store had at boot get cached on first use. Until the
+//!   kernel needs the memory, a read copies the block from RAM. A page the kernel took reads as zeros.
 //! - Each cached block keeps a hash of its bytes. A read copies the block, then hashes the copy: a mismatch (a page
 //!   taken before or during the copy) reads the store instead. Every read returns the store's bytes, so ranks whose
 //!   kernels took different pages still agree on everything the pool decides.
 //! - A block is cached only while MemAvailable stays above FLOOR bytes (read at most every 100 ms). Below it, filling
 //!   the cache would push the engine's own memory into swap.
 //! - Slots are whole pages (64 KiB on a 64K kernel), so the kernel's reclaim of one block never touches another.
+//! - A fill is dropped if a write to the same block started after the fill's store read, so a fill never caches
+//!   bytes older than the store's.
 
 use crate::blocks::Blocks;
 use crate::remote::sys;
 use crate::tier::BlockStore;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// The hash of a block not in the cache. A block whose hash comes out 0 is stored as 1.
 const ABSENT: u64 = 0;
 const CHECK_MS: u64 = 100;
+const STRIPES: usize = 64;
 
 pub struct RamCache {
     pub back: Blocks,
@@ -28,6 +33,9 @@ pub struct RamCache {
     blocks: u64,
     floor: u64,
     sums: Vec<AtomicU64>,
+    // writes started per block, read and changed under the block's stripe lock
+    writes: Vec<AtomicU64>,
+    stripes: [Mutex<()>; STRIPES],
     start: Instant,
     checked_ms: AtomicU64,
     above: AtomicU64,
@@ -75,6 +83,8 @@ impl RamCache {
             blocks,
             floor,
             sums: (0..blocks).map(|_| AtomicU64::new(ABSENT)).collect(),
+            writes: (0..blocks).map(|_| AtomicU64::new(0)).collect(),
+            stripes: std::array::from_fn(|_| Mutex::new(())),
             start: Instant::now(),
             checked_ms: AtomicU64::new(u64::MAX),
             above: AtomicU64::new(0),
@@ -135,9 +145,52 @@ impl BlockStore for RamCache {
         self.blocks
     }
     fn write_block(&self, block: u64, buf: &[u8]) -> io::Result<()> {
+        let b = block as usize;
+        {
+            let _g = self.lock(block);
+            self.writes[b].fetch_add(1, Ordering::Relaxed);
+            self.sums[b].store(ABSENT, Ordering::Release);
+        }
         self.back.write_block(block, buf)?;
-        let sum = &self.sums[block as usize];
-        sum.store(ABSENT, Ordering::Release);
+        let _g = self.lock(block);
+        // a fill may have run between the two locks with bytes read before the store write landed
+        self.writes[b].fetch_add(1, Ordering::Relaxed);
+        self.sums[b].store(ABSENT, Ordering::Release);
+        self.cache(block, buf)
+    }
+    fn read_block(&self, block: u64, buf: &mut [u8]) -> io::Result<()> {
+        let b = block as usize;
+        let want = self.sums[b].load(Ordering::Acquire);
+        if want != ABSENT {
+            unsafe { std::ptr::copy_nonoverlapping(self.slot_ptr(block), buf.as_mut_ptr(), buf.len()) };
+            if hash(buf) == want {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            let _ = self.sums[b].compare_exchange(want, ABSENT, Ordering::AcqRel, Ordering::Relaxed);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let seen = {
+            let _g = self.lock(block);
+            self.writes[b].load(Ordering::Relaxed)
+        };
+        self.back.read_block(block, buf)?;
+        let _g = self.lock(block);
+        if self.writes[b].load(Ordering::Relaxed) == seen && self.sums[b].load(Ordering::Acquire) == ABSENT {
+            self.cache(block, buf)?;
+        }
+        Ok(())
+    }
+}
+
+impl RamCache {
+    fn lock(&self, block: u64) -> std::sync::MutexGuard<'_, ()> {
+        self.stripes[block as usize % STRIPES].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // copies `buf` into the block's slot if there is room; the caller holds the block's stripe lock and has set its sum
+    // to ABSENT
+    fn cache(&self, block: u64, buf: &[u8]) -> io::Result<()> {
         if !self.room() {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
@@ -147,21 +200,8 @@ impl BlockStore for RamCache {
             std::ptr::copy_nonoverlapping(buf.as_ptr(), p, buf.len());
             sys::free_lazily(p, self.slot)?;
         }
-        sum.store(hash(buf), Ordering::Release);
+        self.sums[block as usize].store(hash(buf), Ordering::Release);
         Ok(())
-    }
-    fn read_block(&self, block: u64, buf: &mut [u8]) -> io::Result<()> {
-        let want = self.sums[block as usize].load(Ordering::Acquire);
-        if want != ABSENT {
-            unsafe { std::ptr::copy_nonoverlapping(self.slot_ptr(block), buf.as_mut_ptr(), buf.len()) };
-            if hash(buf) == want {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            self.sums[block as usize].store(ABSENT, Ordering::Release);
-        }
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        self.back.read_block(block, buf)
     }
 }
 
@@ -218,9 +258,20 @@ mod tests {
             assert_eq!(read(&c, b), pattern(b, n));
         }
         assert_eq!((c.hits.load(Ordering::Relaxed), c.misses.load(Ordering::Relaxed)), (2, 2));
-        // a miss forgets the block: the next read goes straight to the store
+        // a miss caches what it read
         assert_eq!(read(&c, 1), pattern(1, n));
-        assert_eq!(c.misses.load(Ordering::Relaxed), 3);
+        assert_eq!((c.hits.load(Ordering::Relaxed), c.misses.load(Ordering::Relaxed)), (3, 2));
+    }
+
+    #[test]
+    fn a_block_only_in_the_store_is_cached_on_first_read() {
+        // a persisted SSD store's blocks from an earlier boot
+        let c = cache(2, 0);
+        let n = c.block_bytes();
+        c.back.write_block(1, &pattern(1, n)).unwrap();
+        assert_eq!(read(&c, 1), pattern(1, n));
+        assert_eq!(read(&c, 1), pattern(1, n));
+        assert_eq!((c.hits.load(Ordering::Relaxed), c.misses.load(Ordering::Relaxed)), (1, 1));
     }
 
     #[test]
@@ -229,7 +280,8 @@ mod tests {
         let n = c.block_bytes();
         c.write_block(0, &pattern(0, n)).unwrap();
         assert_eq!(read(&c, 0), pattern(0, n));
-        assert_eq!((c.skipped.load(Ordering::Relaxed), c.hits.load(Ordering::Relaxed)), (1, 0));
+        assert_eq!(read(&c, 0), pattern(0, n));
+        assert_eq!((c.skipped.load(Ordering::Relaxed), c.hits.load(Ordering::Relaxed)), (3, 0));
     }
 
     #[test]
