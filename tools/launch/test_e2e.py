@@ -173,13 +173,14 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('this box  rank 1 of 127.0.0.1', sc.stdout)
         dn = self.gr8(3, 'down', timeout=60)
         self.assertIn('rank 0 (127.0.0.1): stopping', dn.stdout)
-        for i in range(TP):
-            pid = int(read(os.path.join(self.homes[i], 'out', 'g6m4.pid')))
-            for _ in range(200):
-                if not running(pid):
-                    break
-                time.sleep(0.1)
-            self.assertFalse(running(pid), f'box {i} engine {pid} runs')
+        for i in range(TP):     # down returns before the supervisors finish stopping, which on macOS takes seconds
+            for name in ('g6m4', 'supervisor'):
+                pid = int(read(os.path.join(self.homes[i], 'out', f'{name}.pid')))
+                for _ in range(200):
+                    if not running(pid):
+                        break
+                    time.sleep(0.1)
+                self.assertFalse(running(pid), f'box {i} {name} {pid} runs')
         st = self.gr8(0, 'status')
         self.assertIn('no supervisor answers', st.stdout)
         for i in range(TP):     # down: no box is ready, and each says why in its one line
