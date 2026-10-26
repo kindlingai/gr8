@@ -1,10 +1,10 @@
 # The gr8 container
 
-One image for GB10 boxes (linux/arm64, CUDA 13, sm_121a): the engine for every TP width (`bin/`; `bin3/` and `bin6/`
-link to it), the Rust front end, the loader, the shims and the launcher, on the CUDA 13 runtime image (which brings
-cuBLAS) with libibverbs and the mlx5 provider. Each box runs one container, which holds one rank. The head (rank 0)
-also runs the shim and the OpenAI front end. The container's entrypoint is `./gr8 glm53`, so it takes the launcher's
-commands and options (KNOBS.md) and runs the same checks and handshake as a bare-metal box.
+One image for GB10 boxes (linux/arm64, CUDA 13, sm_121a): the engine for every TP width (`bin/`), the Rust front end,
+the loader, the shims and the launcher, on the CUDA 13 runtime image (which brings cuBLAS) with libibverbs and the mlx5
+provider. Each box runs one container, which holds one rank. The head (rank 0) also runs the shim and the OpenAI front
+end. The container's entrypoint is `./gr8 glm53`, so it takes the launcher's commands and options (KNOBS.md) and runs
+the same checks and handshake as a bare-metal box.
 
 ## Running it
 
@@ -73,12 +73,12 @@ boxes find each other through the mentat daemon on each box.
 
 | | why |
 |---|---|
-| host network, `/dev/infiniband`, `IPC_LOCK` and unlimited memlock | the RoCE fabric |
+| host network, `/dev/infiniband`, `IPC_LOCK` and unlimited memlock | the RoCE fabric. The entrypoint raises the soft memlock limit to the hard one, and `up` exits 2 at once when that is not unlimited: compose sets it (`ulimits.memlock`), `docker run` needs `--ulimit memlock=-1`, and on Kubernetes, which has no ulimits field, it is the container runtime's default limit |
 | the GPU | the engine |
 | the host's process list (`pid: host`) | the launcher refuses to start when another `g6m4` runs on the box, and can see one started outside the container only there |
 | uid 1000, no capabilities but `IPC_LOCK`, no new privileges, a read-only image with a private `/tmp` | no more rights than the engine needs |
 | `oom_score_adj 1000` | under memory pressure the kernel ends the engine first, before sshd or the rest of the box |
-| no core dumps | a rank maps ~90 GB, and dumping it holds the NVIDIA driver's lock long enough to leave the box unreachable |
+| no core dumps (the entrypoint sets `ulimit -c 0` itself) | a rank maps ~90 GB, and dumping it holds the NVIDIA driver's lock long enough to leave the box unreachable |
 | two volumes: the model cache and the home directory | the only state the container writes |
 
 ## Building the image
