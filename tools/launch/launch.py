@@ -224,17 +224,17 @@ def cmdline(pid, proc='/proc'):
     return r.stdout.split() if r.returncode == 0 and r.stdout.strip() else None
 
 
-def is_supervisor(pid, proc='/proc'):
-    """Whether pid runs a gr8 supervisor (`launch.py supervise` or `launch.py up --foreground`), from its command line.
-    A probe cannot use sv.recorded(): its start time against the pid file's mtime moves when NTP steps the clock after
-    boot, and the probe would call a serving box unready for the rest of that boot. Where neither /proc nor ps can
-    say, a live pid is taken as the supervisor."""
+def is_supervisor(pid, proc='/proc', script='launch.py'):
+    """Whether pid runs a gr8 supervisor (`launch.py supervise` or `launch.py up --foreground`; a KV node's is
+    kvnode.py's), from its command line. A probe cannot use sv.recorded(): its start time against the pid file's mtime
+    moves when NTP steps the clock after boot, and the probe would call a serving box unready for the rest of that
+    boot. Where neither /proc nor ps can say, a live pid is taken as the supervisor."""
     if not pid or not sv.alive(pid):
         return False
     argv = cmdline(pid, proc)
     if argv is None:
         return not os.path.isdir(os.path.join(proc, 'self'))
-    return any(os.path.basename(a) == 'launch.py' for a in argv) and ('supervise' in argv or '--foreground' in argv)
+    return any(os.path.basename(a) == script for a in argv) and ('supervise' in argv or '--foreground' in argv)
 
 
 # The probe asks 127.0.0.1 directly: an HTTP_PROXY that docker or a cluster sets in the container must not take it.
