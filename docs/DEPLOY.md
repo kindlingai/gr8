@@ -31,19 +31,18 @@ downloads anything.
 
 | name | model | `MODEL` | TP | `DRAFTER` |
 |---|---|---|---|---|
-| `glm53` | GLM-5.3 | `https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4` | 3, 4 or 6 | TP=4: `https://huggingface.co/incoai/GLM-5.3-DFlash2` |
+| `glm53` | GLM-5.3 | `https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4` | 3, 4, 5 or 6 | TP=4: `https://huggingface.co/incoai/GLM-5.3-DFlash2` |
 | `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 2, 3 or 4 | none |
 
-`./gr8 models` lists each model's release and the values `--tp` and `--variant` take (TP=5 is a tuned serve of its
-own: [TP5-SERVE.md](TP5-SERVE.md)). Each box fetches only its own part of the release into its model cache: the first
-`up` downloads it (about 90 GB at TP=4, 35 minutes at 40 MB/s), and later boots load from the cache in about a minute.
-`prepare` with the same options downloads ahead of time, and is never required. On bare metal a Hugging Face `MODEL`
-needs `MODEL_CACHE`, a local directory for this box's part; the container sets its own. `MODEL` may also be a local
-copy of the release, used in place.
+`./gr8 models` lists each model's release and the values `--tp` and `--variant` take. Each box fetches only its own part
+of the release into its model cache: the first `up` downloads it (about 90 GB at TP=4, 35 minutes at 40 MB/s), and later
+boots load from the cache in about a minute. `prepare` with the same options downloads ahead of time, and is never
+required. On bare metal a Hugging Face `MODEL` needs `MODEL_CACHE`, a local directory for this box's part; the container
+sets its own. `MODEL` may also be a local copy of the release, used in place.
 
-`DRAFTER` is optional: without it, TP=4 drafts with MTP only. TP=3 and TP=6 leave it out, since its 8 KV heads do not
-split three or six ways (TP=6 runs its whole body on every box with `DFLASH=1`). Its licence (CC BY-NC-ND 4.0) forbids
-sharing a converted copy, so each box downloads the drafter and converts its own rank.
+`DRAFTER` is optional: without it, TP=4 drafts with MTP only. TP=3, 5 and 6 leave it out, since its 8 KV heads do not
+split three, five or six ways (TP=6 runs its whole body on every box with `DFLASH=1`). Its licence (CC BY-NC-ND 4.0)
+forbids sharing a converted copy, so each box downloads the drafter and converts its own rank.
 
 ### How the boxes find each other
 
@@ -75,7 +74,7 @@ Python 3 with venv. The stock DGX OS has all of them but Rust. On every box:
         --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/gr8/cache \
         --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
 
-`up` returns once the cluster serves. For three or six boxes, list three or six addresses, and leave out `--drafter`.
+`up` returns once the cluster serves. For three, five or six boxes, list that many addresses, and leave out `--drafter`.
 With mentatd on every box, `--tp 4` takes the place of `--peers`. Every box must run the same build: build on each, or
 build on one with `BUNDLE_LIBS=1` (which copies cuBLAS next to the engine, for boxes without the CUDA toolkit) and copy
 its `bin/` to the others.
@@ -138,7 +137,7 @@ A values file, `my-values.yaml`:
 ```yaml
 image:
   tag: sha-<commit>                 # the same build on every box: they refuse a mix
-size: 4                             # the TP: 3, 4 or 6
+size: 4                             # the TP: 3, 4, 5 or 6
 options:                            # the launcher's options (KNOBS.md)
   GR8_MODEL: glm53
   MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4

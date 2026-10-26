@@ -6,7 +6,7 @@ image:
   pullPolicy: ""
 imagePullSecrets: []
 
-# The boxes in the group: TP, 3, 4 or 6.
+# The boxes in the group: TP, 3, 4, 5 or 6.
 size: 4
 # 0 stops every box, 1 boots them. One group per release: a second group is a second release, with its own GROUP.
 replicas: 1
