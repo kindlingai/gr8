@@ -6,6 +6,8 @@ reads line by line.
     python3 -m unittest discover -s tools/launch"""
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 
@@ -93,6 +95,41 @@ class ComposeTests(unittest.TestCase):
                        '--model', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'], env)
         opt.validate(o)
         self.assertEqual((o.get('FETCH'), o.origin['FETCH']), ('model-loader', 'environment'))
+
+
+CHART = os.path.join(REPO, 'deploy', 'k8s')
+
+
+@unittest.skipUnless(shutil.which('helm'), 'needs helm')
+class ChartTests(unittest.TestCase):
+    """deploy/k8s with modelLoader.enabled: the same contract as docker/model-loader.yaml."""
+
+    def render(self, *sets):
+        argv = ['helm', 'template', 'gr8', CHART]
+        for s in sets:
+            argv += ['--set', s]
+        return subprocess.run(argv, capture_output=True, text=True, check=True).stdout
+
+    @staticmethod
+    def env(text):
+        return dict(re.findall(r'- name: ([A-Z0-9_]+)\n\s+value: (\S+)', text))
+
+    def test_off_by_default(self):
+        out = self.render()
+        self.assertNotIn('model-loader', out)
+        self.assertEqual(self.env(out)['MODEL_CACHE'], '/var/lib/gr8/cache')
+        self.assertIn('name: cache', out)
+
+    def test_on(self):
+        out = self.render('modelLoader.enabled=true', 'modelLoader.store=/srv/ml')
+        env = self.env(out)
+        self.assertEqual((env['FETCH'], env['MODEL_CACHE'], env['MODEL_LOADER']),
+                         ('model-loader', '/var/lib/model-loader', 'unix:/var/lib/model-loader/model-loader.sock'))
+        self.assertNotIn('name: cache', out)                     # no cache claim or mount
+        self.assertRegex(out, r'- name: model-loader-store\n\s+mountPath: /var/lib/model-loader\n\s+readOnly: true')
+        self.assertRegex(out, r'- name: model-loader-store\n\s+hostPath:\n\s+path: /srv/ml')
+        self.assertIn("model-loader -check unix:/var/lib/model-loader/model-loader.sock", out)
+        self.assertEqual(out.count('readOnly: true'), 2)             # gr8 and the init container both read-only
 
 
 if __name__ == '__main__':

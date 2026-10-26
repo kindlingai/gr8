@@ -105,7 +105,8 @@ for the pieces its rank needs, waits until they are held, checks every expert ha
 in place. gr8 finds the release and the drafter in model-loader's catalog by their repos, whatever the catalog
 calls them. No `prepare` is needed: model-loader keeps the pieces between boots. Bare metal takes the same options:
 `--fetch model-loader --model-cache /var/lib/model-loader` (KNOBS.md). Give the catalog's width files small segments
-(model-loader's `deploy/compose/catalog.yaml` does), or each box holds every width file whole.
+(model-loader's `deploy/compose/catalog.yaml` does), or each box holds every width file whole. On Kubernetes, the chart
+takes `modelLoader.enabled: true` ([deploy/k8s](deploy/k8s/README.md#model-loader)).
 
 ## Running it
 
