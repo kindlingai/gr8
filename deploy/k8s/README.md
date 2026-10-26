@@ -76,6 +76,22 @@ first ran on, so each pod comes back to its box and its warm cache; when a box i
 claims (for `gr8-0-2`: `cache-gr8-0-2`, `home-gr8-0-2`) and the pod starts on another box, which downloads its part
 again. The claims outlive the release (`persistentVolumeClaimRetentionPolicy`): delete them by hand to free the disk.
 
+`MODEL` may also be a local copy of the release, used in place (KNOBS.md). Mount it with `extraVolumes` and
+`extraVolumeMounts`, read-only, at the same path on every box, and set `MODEL` to that path in `options`. The cache then
+holds no weights:
+
+```yaml
+options:
+  MODEL: /models/release
+extraVolumes:
+  - name: release
+    hostPath: {path: /srv/models/<release>, type: Directory}
+extraVolumeMounts:
+  - name: release
+    mountPath: /models/release
+    readOnly: true
+```
+
 ### Placement
 
 The pods go wherever the scheduler finds a GPU and the RDMA resource. When the cluster has GB10 boxes that are not on
