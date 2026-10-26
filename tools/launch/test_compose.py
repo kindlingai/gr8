@@ -92,7 +92,7 @@ class ComposeTests(unittest.TestCase):
     def test_the_override_parses_as_options(self):
         env = dict(e.split('=', 1) for e in self.o['gr8']['environment'])
         o = opt.parse(['--no-config', '--peers', '192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4',
-                       '--model', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'], env)
+                       '--model', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'], {**env, 'GR8_MODEL': 'glm53'})
         opt.validate(o)
         self.assertEqual((o.get('FETCH'), o.origin['FETCH']), ('model-loader', 'environment'))
 
@@ -105,7 +105,9 @@ class ChartTests(unittest.TestCase):
     """deploy/k8s with modelLoader.enabled: the same contract as docker/model-loader.yaml."""
 
     def render(self, *sets):
-        argv = ['helm', 'template', 'gr8', CHART]
+        # GR8_MODEL and MODEL are required values (#245)
+        argv = ['helm', 'template', 'gr8', CHART, '--set', 'options.GR8_MODEL=glm53',
+                '--set', 'options.MODEL=https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4']
         for s in sets:
             argv += ['--set', s]
         return subprocess.run(argv, capture_output=True, text=True, check=True).stdout

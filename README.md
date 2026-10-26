@@ -95,7 +95,7 @@ from Hugging Face once, or from a NAS that holds the master copy, and the boxes 
 LAN. Each box runs model-loader next to gr8, from model-loader's `deploy/compose` or `deploy/spark-os`, with the
 release (and the drafter) in its `catalog.yaml`. Then on every box:
 
-    cp docker/.env.example docker/.env        # MODEL, PEERS and DRAFTER as above
+    cp docker/.env.example docker/.env        # GR8_MODEL, MODEL, PEERS and DRAFTER as above
     docker compose -f docker/compose.yaml -f docker/model-loader.yaml pull
     docker compose -f docker/compose.yaml -f docker/model-loader.yaml up -d
 
