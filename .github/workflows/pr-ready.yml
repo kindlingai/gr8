@@ -141,7 +141,7 @@ jobs:
               }
             };
             // Whether a ci.yml run of the PR head has passed Finalize, which needs queue:ready. Waits up to 6 minutes,
-            // enough for a Markdown-only run, which has only the changes job and Finalize.
+            // enough for a Markdown-only run, which has only changes, zip-check and Finalize.
             const finalized = async p => {
               for (let i = 0; i < 36; i++) {
                 await sleep(10000);

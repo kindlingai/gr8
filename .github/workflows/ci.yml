@@ -8,7 +8,7 @@
 #
 # On a pull request the changes job picks the jobs from the files it changes (dorny/paths-filter, below): the
 # front-end and engine halves of the CPU tests, the Rust binaries, and the engine builds with the image around them.
-# Markdown files start nothing, so a PR that changes only them runs just the changes job and Finalize. Pushes to main,
+# Markdown files start nothing, so a PR that changes only them runs just changes, zip-check and Finalize. Pushes to main,
 # tags and manual runs always build everything: the image pushed from main is built from all of the tree.
 #
 # Finalize is the one check a PR needs to land: green when every job passed or skipped and the PR carries queue:ready
@@ -300,6 +300,17 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  # make_zip.py's tree checks (every top-level entry shipped or skipped, no symlinks), which the zip job runs only on
+  # main and tags, so a PR that adds a top-level entry fails here instead of after it lands. A few seconds.
+  zip-check:
+    name: Tester zip (tree check)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - run: python3 scripts/make_zip.py --check
+
   zip:
     name: Tester zip
     if: github.event_name != 'pull_request'
@@ -454,9 +465,9 @@ jobs:
     # (the tester zip on a PR, whatever the changes job left out) or because a job it needs failed, which fails here
     # too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished run.
     # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
-    # but a run with no jobs besides changes can reach this step before that removal.
+    # but a run with only changes and zip-check can reach this step before that removal.
     if: always()
-    needs: [changes, cpu, cpu-macos, rust, engine, zip, image]
+    needs: [changes, cpu, cpu-macos, rust, engine, zip-check, zip, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
