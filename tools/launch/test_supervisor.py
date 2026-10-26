@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """The supervisor's control port, a head that fails before its checks finish, the engine's environment and build id.
     python3 -m unittest discover -s tools/launch"""
+import http.server
+import io
+import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -510,6 +514,113 @@ class SelfCheckTests(unittest.TestCase):
         self.assertFalse(a['ok'])                               # rank 2 did not answer
         self.assertEqual([x.get('ok') for x in a['ranks']], [True, True, False, True])
         self.assertIn('error', supervisor(rank=1).check_all())  # only the head gathers
+
+
+class HealthTests(unittest.TestCase):
+    """./gr8 <model> health: this box alone, exit 0 only while its own supervisor reports serving (and on the head,
+    while the API's /health answers 200), so compose and a Kubernetes exec probe can run it on every rank."""
+    def setUp(self):
+        import launch
+        self.L = launch
+        self.home = tempfile.mkdtemp()
+        self.out = os.path.join(self.home, 'out')
+        os.makedirs(self.out)
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+
+    def write(self, state, rank, pid=None, supervisor=True):
+        """gr8.state as set_state writes it, and supervisor.pid as run() does; this test process plays the supervisor."""
+        pid = os.getpid() if pid is None else pid
+        with open(os.path.join(self.out, 'gr8.state'), 'w') as f:
+            json.dump({'state': state, 'rank': rank, 'pid': pid, 'time': time.time()}, f)
+        if supervisor:
+            with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
+                f.write(f'{pid}\n')
+
+    def api(self, code):
+        """A front end whose /health answers `code`; returns its port."""
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(code if self.path == '/health' else 404)
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def run_health(self, *argv):
+        """cmd_health through launch.main, as ./gr8 runs it: (exit status, the one line it printed)."""
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as so:
+            rc = self.L.main(['health', '--no-config', '--g6-home', self.home, *argv])
+        return rc, so.getvalue()
+
+    def test_every_state_before_serving_is_not_ready(self):
+        for state in ('starting', 'preparing', 'handshake', 'joining', 'loading', 'stopping'):
+            self.write(state, 1 if state != 'starting' else None)
+            rc, line = self.run_health()
+            self.assertEqual(rc, 1, (state, line))
+            self.assertIn(state, line)
+            self.assertEqual(line.count('\n'), 1, line)
+
+    def test_a_worker_that_serves_is_ready(self):
+        self.write('serving', 2)
+        rc, line = self.run_health('--port', str(free_port()))     # a worker does not ask any API
+        self.assertEqual((rc, line), (0, f'rank 2: serving, supervisor pid {os.getpid()}\n'))
+
+    def test_the_head_serves_only_while_its_api_answers(self):
+        self.write('serving', 0)
+        rc, line = self.run_health('--port', str(self.api(200)))
+        self.assertEqual(rc, 0, line)
+        self.assertIn('API /health 200', line)
+        rc, line = self.run_health('--port', str(self.api(503)))
+        self.assertEqual(rc, 1, line)
+        self.assertIn('answers 503', line)
+        port = free_port()
+        rc, line = self.run_health('--port', str(port))
+        self.assertEqual(rc, 1, line)
+        self.assertIn(f'on port {port} answers nothing', line)
+
+    def test_the_head_asks_the_port_the_boot_agreed(self):
+        self.write('serving', 0)
+        with open(os.path.join(self.out, 'handshake.json'), 'w') as f:
+            json.dump({'t': 'ok', 'port': str(self.api(200)), 'rank': 0}, f)
+        self.assertEqual(self.run_health('--port', str(free_port()))[0], 0)
+
+    def test_a_failed_or_stopped_boot_is_not_ready(self):
+        for state in ('failed: engine exited (-9)', 'stopped'):
+            self.write(state, 1)
+            rc, line = self.run_health()
+            self.assertEqual(rc, 1, line)
+            self.assertIn(state, line)
+
+    def test_serving_written_by_a_supervisor_that_is_gone_is_not_ready(self):
+        p = subprocess.Popen([sys.executable, '-c', 'pass'])
+        p.wait()
+        self.write('serving', 1, pid=p.pid)                           # kill -9: no shutdown() rewrote the state
+        rc, line = self.run_health()
+        self.assertEqual(rc, 1, line)
+        self.assertIn('no supervisor runs (last state serving)', line)
+        self.write('serving', 1, pid=os.getpid() + 10 ** 6, supervisor=False)
+        with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
+            f.write(f'{os.getpid()}\n')                               # another supervisor than the one that wrote it
+        self.assertEqual(self.run_health()[0], 1)
+
+    def test_no_state_is_not_ready(self):
+        rc, line = self.run_health()
+        self.assertEqual((rc, line), (1, 'this box: not serving, no supervisor runs (last state none)\n'))
+
+    def test_bad_options_exit_1_not_docker_reserved_2(self):
+        rc, line = self.run_health('--no-such-option', 'x')
+        self.assertEqual(rc, 1)
+        self.assertIn('unknown option --no-such-option', line)
+
+    def test_it_takes_no_supervisor_lock(self):
+        self.write('serving', 1)
+        with mock.patch.object(self.L, 'supervisor_running', side_effect=AssertionError('took the lock')):
+            self.assertEqual(self.run_health()[0], 0)
 
 
 if __name__ == '__main__':

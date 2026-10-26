@@ -5,6 +5,9 @@
     down                       stop every box of the last boot (or this box alone)
     restart [OPTIONS]          down, then up
     status                     every box: its state, the engine, MemAvailable; the head's shim, front end and /health
+    health                     this box alone, in one line: exit 0 when its supervisor reports the cluster serving
+                               (and, on the head, the front end's /health answers 200), else 1. A readiness check for
+                               a compose healthcheck or a Kubernetes exec probe, on every rank
     logs [RANK|shim|front|supervisor] [-f]   a log, from any box
     check [OPTIONS]            this box's checks
     show-config [OPTIONS]      the effective options, the cluster options the handshake compares, their digest, the
@@ -204,6 +207,48 @@ def cmd_status(argv):
     return 0
 
 
+def health(out, port, timeout=2):
+    """(ok, line): whether this box's part of the cluster serves, read from this box alone, so the same command is a
+    readiness check on every rank. Serving means out/gr8.state says `serving`, the supervisor that wrote it still runs,
+    and on the head (rank 0) the front end's /health answers 200. It takes no lock: a probe must not make a supervisor
+    that starts beside it think another one runs."""
+    st = read_state(out)
+    state, rank = st.get('state') or 'none', st.get('rank')
+    who = f'rank {rank}' if rank is not None else 'this box'
+    pid = sv.recorded(os.path.join(out, 'supervisor.pid'))
+    if not pid or pid != st.get('pid'):
+        return False, f'{who}: not serving, no supervisor runs (last state {state})'
+    if state != 'serving':
+        return False, f'{who}: {state}, supervisor pid {pid}'
+    if rank != 0:
+        return True, f'{who}: serving, supervisor pid {pid}'
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=timeout) as r:
+            code = r.status
+    except OSError as e:
+        code = getattr(e, 'code', 0)
+        if hasattr(e, 'close'):
+            e.close()
+    if code != 200:
+        return False, f'{who}: serving, supervisor pid {pid}, but the API /health ' + \
+            (f'answers {code}' if code else f'on port {port} answers nothing')
+    return True, f'{who}: serving, supervisor pid {pid}, API /health 200'
+
+
+def cmd_health(argv):
+    """Exit 0 or 1 only: docker reserves a healthcheck's exit 2, which bad options would otherwise give."""
+    try:
+        o = opt.parse(argv)
+    except opt.OptionError as e:
+        print(f'gr8: {e}')
+        return 1
+    out = out_dir(o)
+    # the head's API port as the boot agreed it (the handshake), so a probe without the boot's options still finds it
+    ok, line = health(out, (read_handshake(out) or {}).get('port') or o.get('PORT'))
+    print(line)
+    return 0 if ok else 1
+
+
 def cmd_logs(argv):
     follow = '-f' in argv
     words = [a for a in argv if a != '-f']
@@ -375,7 +420,8 @@ def main(argv):
             return 2
         cmd_down(rest)
         return cmd_up(rest)
-    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'logs': cmd_logs, 'show-config': cmd_show_config,
+    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'health': cmd_health, 'logs': cmd_logs,
+         'show-config': cmd_show_config,
          'check': cmd_check, 'prepare': cmd_prepare}.get(cmd)
     if not f:
         print(f'gr8: unknown command {cmd}\n{__doc__}', file=sys.stderr)

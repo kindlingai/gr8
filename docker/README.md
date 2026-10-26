@@ -18,7 +18,9 @@ On every box, with the NVIDIA container toolkit (on DGX OS by default):
 
 `up -d` returns at once, and the boot goes on in the container: the boxes find each other, load (about a minute from a
 warm cache) and serve the OpenAI API on the head, port 8100. `docker compose -f docker/compose.yaml ps` shows the
-container healthy once this box's supervisor reports the cluster serving. Then, on any box:
+container healthy once this box's supervisor reports the cluster serving (the healthcheck runs `/opt/gr8/gr8 glm53
+health`, with the model from `GR8_MODEL`; on the head it also needs the API's `/health`). A Kubernetes pod can use the
+same command as an `exec` readiness probe on every rank. Then, on any box:
 
     docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 status     # every box
     docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 down       # stop every box
