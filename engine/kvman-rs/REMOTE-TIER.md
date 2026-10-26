@@ -145,8 +145,11 @@ The launcher's `KV_STORE` holds the stores separated by `;`, with `KV_KEEP`, `KV
 RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40). An SSD store is cleared
 at every boot unless it has `persist=on` (below, Persistence).
 
-`KV_STORE=@FILE` reads the stores from a YAML file instead, relative to the config file that names it. The launcher
-turns the file into the one-line form above, which is what the engine gets and the logs print:
+A cache in spare RAM (src/ram.rs) is an entry of its own, and stores name it:
+
+    cache:spare,kind=spare_ram,floor=2G;ssd:/nvme/gr8kv,size=4G,persist=on,keep=system,cache=spare;remote:auto,size=8G,keep=all,cache=spare
+
+`KV_STORE=@FILE` reads the same settings from a YAML file, relative to the config file that names it:
 
 ```yaml
 caches:
@@ -162,14 +165,13 @@ tiers:                                  # tried in order: a full tier passes ent
       remote: {address: auto, size_per_rank: 8G}
 ```
 
-becomes
+The two forms accept and refuse the same stores: the launcher turns the file into the one-line form and checks that
+with the one-line parser (tools/launch/test_options.py fuzzes both). The boot log prints both forms. A store's `name`
+defaults to its kind, or kind-N when the kind repeats. A `remote` store also takes `group`, `cap_per_rank` and
+`weight`. Keys from the design that are not built yet (`transforms`, `takes`, `runs`) are refused by name.
 
-    ssd:/nvme/gr8kv,size=4G,persist=on,keep=system,spare_ram_cache=on,spare_ram_floor=2G;remote:auto,size=8G,keep=all,spare_ram_cache=on,spare_ram_floor=2G
-
-A tier's `name` defaults to its store kind, and two tiers of one kind
-need names. A `remote` store also takes `group`, `cap_per_rank` and `weight`. Each tier that names a cache gets its own
-copy of it today, with the cache's floor. Keys from the design that are not built yet (`transforms`, `takes`, `runs`)
-are refused by name.
+The engine takes each store with its cache spelled out, `spare_ram_cache=on,spare_ram_floor=2G`, so each store that
+names a cache gets its own copy of it today, with the cache's floor.
 
 ### What the stores keep
 

@@ -457,6 +457,8 @@ class Supervisor:
             log(f'warning: {w}')
         log(f'gr8 {version(self.home)}, options ({o.file or "no config file"}; command line > file > environment > default):')
         log(opt.summary(o))
+        for line in opt.kv_describe(o):
+            log(line)
         tp = int(o.get('TP'))
         # a box that cannot resolve its model still joins, so every box hears why the boot stops
         self.ms, self.variant, self.model_error = resolve_model(o)
@@ -783,8 +785,7 @@ class Supervisor:
             return None
         target = self.kv_node('--kv-store')
         log(f'KV store: the KV node at {target}')
-        return ';'.join(t['text'].replace('remote:auto', f'remote:{target}', 1) if t['host'] == 'auto' else t['text']
-                        for t in stores)
+        return opt.kv_store_with(self.o, target)
 
     def kv_rows(self):
         """KV_ROWS for this box's engine: remote:auto becomes the KV node by this box's rails, as for KV_STORE (odd ranks
