@@ -10,6 +10,8 @@
 # handshake refused the boot. Its output goes to docker logs and to out/supervisor.log, which `logs supervisor` reads.
 set -euo pipefail
 home=${G6_HOME:?G6_HOME is not set}
+# ./gr8 takes --no-check before the command; take it here as CHECK=0, so the command below is the real one.
+while [ "${1:-}" = --no-check ]; do export CHECK=0; shift; done
 [ $# -gt 0 ] || set -- up
 cmd=$1; shift
 
@@ -18,14 +20,15 @@ model=${GR8_MODEL:-glm53}
 # A crash must not dump core: a rank maps ~90 GB, and the dumping thread holds the NVIDIA driver's lock the whole time
 # it writes, which can leave the box unreachable until a power cycle.
 ulimit -c 0
-# The fabric registers its pinned buffers with the NIC. Only the runtime can raise the hard limit, so a limited one
-# stops the boot here rather than later in the fabric.
+# The fabric registers its pinned buffers with the NIC, which uid 1000 (no effective IPC_LOCK) may only do within
+# RLIMIT_MEMLOCK. The runtime sets the hard limit, so a limited one stops the boot here rather than later in the
+# fabric. This runs before out/supervisor.log is set up: the message goes to docker logs (kubectl logs) only.
 if [ "$cmd" = up ]; then
   ulimit -S -l "$(ulimit -H -l)"
   if [ "$(ulimit -l)" != unlimited ]; then
-    echo "gr8: memlock is limited to $(ulimit -l) KiB, and the fabric needs it unlimited: set ulimits.memlock: -1" \
-         "in compose, --ulimit memlock=-1 with docker run, or on Kubernetes raise the container runtime's default" \
-         "limit (containerd's or CRI-O's, which a pod spec cannot set)" >&2
+    echo "gr8: memlock is limited (ulimit -l: $(ulimit -l) KiB), and the fabric needs it unlimited: set" \
+         "ulimits.memlock: -1 in compose, --ulimit memlock=-1 with docker run, or on Kubernetes raise the" \
+         "container runtime's default limit (containerd's or CRI-O's)" >&2
     exit 2
   fi
 fi

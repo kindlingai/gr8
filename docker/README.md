@@ -73,13 +73,19 @@ boxes find each other through the mentat daemon on each box.
 
 | | why |
 |---|---|
-| host network, `/dev/infiniband`, `IPC_LOCK` and unlimited memlock | the RoCE fabric. The entrypoint raises the soft memlock limit to the hard one, and `up` exits 2 at once when that is not unlimited: compose sets it (`ulimits.memlock`), `docker run` needs `--ulimit memlock=-1`, and on Kubernetes, which has no ulimits field, it is the container runtime's default limit |
+| host network, `/dev/infiniband`, `IPC_LOCK` and unlimited memlock | the RoCE fabric (below) |
 | the GPU | the engine |
 | the host's process list (`pid: host`) | the launcher refuses to start when another `g6m4` runs on the box, and can see one started outside the container only there |
 | uid 1000, no capabilities but `IPC_LOCK`, no new privileges, a read-only image with a private `/tmp` | no more rights than the engine needs |
 | `oom_score_adj 1000` | under memory pressure the kernel ends the engine first, before sshd or the rest of the box |
 | no core dumps (the entrypoint sets `ulimit -c 0` itself) | a rank maps ~90 GB, and dumping it holds the NVIDIA driver's lock long enough to leave the box unreachable |
 | two volumes: the model cache and the home directory | the only state the container writes |
+
+The entrypoint sets these limits itself, so a runtime without compose's `ulimits:` needs no wrapper. It sets
+`ulimit -c 0`, and before `up` raises the soft memlock limit to the hard one. When the hard limit is not unlimited, `up`
+exits 2 at once with a message: compose sets it (`ulimits.memlock: -1`), `docker run` needs `--ulimit memlock=-1`, and
+Kubernetes, which has no ulimits field, takes the container runtime's default limit. The message goes to `docker logs`
+only, not `out/supervisor.log`, since the supervisor never started.
 
 ## Building the image
 
