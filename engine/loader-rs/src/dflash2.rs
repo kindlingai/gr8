@@ -1,8 +1,9 @@
 //! The DFlash2 drafter (config.json + one BF16 model.safetensors) -> one gr8 pack per rank for the drafter step
-//! (engine/runtime/dflash.cuh). `./gr8 glm53 up --drafter` runs it as `bin/g6load dflash2`.
+//! (engine/runtime/dflash.cuh). `./gr8 glm53 up --drafter` runs it as `bin/g6load dflash2`. The config's hidden size
+//! picks the model: GLM 5.3 (below) or GLM 5.3 Flash (hidden 4096, 32 q heads, 5 taps: [4096/NR][20480] fc rows).
 //!
 //! Tensor-parallel split (NR divides the 8 KV heads; TP4 = 16 q heads, 2 KV heads, 3,072 MLP channels per rank):
-//!   D.fc.gv               fc rows of this rank's output slice [6144/NR][36864] (the context features -> 6144)
+//!   D.fc.gv               fc rows of this rank's output slice [6144/NR][taps x 6144] (the context features -> 6144)
 //!   D<j>.q.gv             q_proj rows of this rank's heads [64/NR * 128][6144]
 //!   D<j>.kv.gv            k_proj then v_proj rows of this rank's KV heads [2 * 8/NR * 128][6144]
 //!   D<j>.o.gv             o_proj columns of this rank's heads [6144][64/NR * 128]          (partial, all-reduced)
@@ -15,7 +16,8 @@
 //! the codec from the record size. BF16 as stored: D.hidden_norm, D.norm [6144]; D<j>.in_norm, D<j>.post_norm [6144];
 //! D<j>.q_norm, D<j>.k_norm [128]; D<j>.aconv.base, D<j>.mconv.base [2 sides][2 taps][6144]; D.sel.pred, D.sel.succ
 //! [154880][256] (codebooks). The manifest carries the drafter config (block size, mask id, target layers, window, rope
-//! theta, eps, selector). tests/dflash2.rs checks the output against a checked-in fixture byte for byte.
+//! theta, eps, selector), D.meta the same as int32 (meta_fields: the tap count is its length - 11). tests/dflash2.rs
+//! checks the output against checked-in fixtures byte for byte.
 
 use crate::json::{self, Json};
 use crate::sha256::Sha256;
@@ -29,8 +31,13 @@ pub const CLASSES: [&str; 5] = ["fc", "attn", "mlp", "conv", "sel"];
 /// Replicated packs (an nr that does not split the KV heads: TP=6) keep o_proj / down_proj as this split's K-slices (TP4).
 pub const REF_NR: usize = 4;
 const ALIGN: u64 = 4096;
-const META: [&str; 17] = ["mask_id", "nr", "block", "layers", "window", "tl0", "tl1", "tl2", "tl3", "tl4", "tl5", "theta",
-                          "eps_bits", "sel_rank", "sel_topk", "conv_group", "conv_kernel"];
+
+/// D.meta's fields for a drafter that taps `taps` target layers: 11 + taps (GLM 5.3: 17, Flash: 16).
+fn meta_fields(taps: usize) -> Vec<String> {
+    let head = ["mask_id", "nr", "block", "layers", "window"].map(String::from);
+    let tail = ["theta", "eps_bits", "sel_rank", "sel_topk", "conv_group", "conv_kernel"].map(String::from);
+    head.into_iter().chain((0..taps).map(|i| format!("tl{i}"))).chain(tail).collect()
+}
 
 /// The model shape the converter is written for. The tests use a small one.
 #[derive(Clone, Copy)]
@@ -44,6 +51,15 @@ pub struct Dims {
 }
 
 pub const GLM53: Dims = Dims { hid: 6144, hd: 128, nh: 64, nkv: 8, inter: 12288, vocab: 154880 };
+pub const GLM53F: Dims = Dims { hid: 4096, hd: 128, nh: 32, nkv: 8, inter: 12288, vocab: 154880 };
+
+/// The dims of the model a drafter config is for, by its hidden size: GLM 5.3 or GLM 5.3 Flash.
+pub fn dims_of(cfg: &Json) -> Result<&'static Dims, String> {
+    let h = num(cfg, "hidden_size")?;
+    [&GLM53, &GLM53F].into_iter().find(|d| d.hid as f64 == h).ok_or(format!(
+        "config hidden_size = {}, this converter is written for 6144 (GLM 5.3) or 4096 (GLM 5.3 Flash)",
+        json::dump_py(key(cfg, "hidden_size")?)))
+}
 
 /// A safetensors file read a tensor at a time (BF16 kept as its bits).
 pub struct St {
@@ -341,8 +357,8 @@ pub fn check_config(cfg: &Json, dims: &Dims) -> Result<(), String> {
     if num(cfg, "vocab_size")? != dims.vocab as f64 {
         return Err(format!("vocab must be GLM 5.3 ({})", dims.vocab));
     }
-    if key(d, "target_layer_ids")?.arr().map(|a| a.len()) != Some(6) {
-        return Err("the engine taps six target layers".into());
+    if key(d, "target_layer_ids")?.arr().is_none_or(|a| a.is_empty()) {
+        return Err("dflash_config target_layer_ids is not a list of target layers".into());
     }
     Ok(())
 }
@@ -356,7 +372,7 @@ fn window(cfg: &Json) -> Json {
     }
 }
 
-/// D.meta: int32 [17] in META order.
+/// D.meta: int32 [11 + taps] in meta_fields order.
 fn meta_values(cfg: &Json, nr: usize) -> Result<Vec<i32>, String> {
     let d = key(cfg, "dflash_config")?;
     let as_i32 = |v: i64, what: &str| i32::try_from(v).map_err(|_| format!("config {what} = {v} does not fit int32"));
@@ -378,7 +394,8 @@ fn meta_values(cfg: &Json, nr: usize) -> Result<Vec<i32>, String> {
     v.push(num(key(cfg, "rope_parameters")?, "rope_theta")?.trunc() as i64);
     v.push((num(cfg, "rms_norm_eps")? as f32).to_bits() as i32 as i64);
     v.extend([opt("selector_rank")?, opt("selector_top_k")?, int(d, "conv_group_size")?, int(d, "conv_kernel_size")?]);
-    v.into_iter().zip(META).map(|(x, k)| as_i32(x, k)).collect()
+    let fields = meta_fields(v.len() - 11);
+    v.into_iter().zip(&fields).map(|(x, k)| as_i32(x, k)).collect()
 }
 
 /// The replicated layout: nr does not split the KV heads, every rank holds the whole drafter.
@@ -441,7 +458,8 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
 
     let mv = meta_values(cfg, nr)?;
     let mb: Vec<u8> = mv.iter().flat_map(|v| v.to_le_bytes()).collect();
-    w.put("D.meta", &mb, "i32", &[mv.len()], vec![("fields", Json::Arr(META.iter().map(|s| Json::Str(s.to_string())).collect()))])?;
+    let fields = Json::Arr(meta_fields(mv.len() - 11).into_iter().map(Json::Str).collect());
+    w.put("D.meta", &mb, "i32", &[mv.len()], vec![("fields", fields)])?;
     put_rec(&mut w, "D.fc.gv", st.get("fc.weight", Some((s * nf, (s + 1) * nf)))?, "fc")?;
     w.put_bf16("D.hidden_norm", st.get("hidden_norm.weight", None)?)?;
     w.put_bf16("D.norm", st.get("norm.weight", None)?)?;
@@ -487,9 +505,12 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
 }
 
 /// g6load dflash2: --src DIR (config.json + model.safetensors) --out DIR [--nr 4] [--ranks 0,1] [--bf16 conv,sel].
-/// --nr 6: the replicated layout, one pack per rank of TP=6.
+/// --nr 6: the replicated layout, one pack per rank of TP=6. The model (dims_of) from the config's hidden size.
 /// Prints one JSON line per rank.
-pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str, dims: &Dims) -> Result<(), String> {
+pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str) -> Result<(), String> {
+    let cp = format!("{src}/config.json");
+    let cfg = json::parse(&std::fs::read_to_string(&cp).map_err(|e| format!("{cp}: {e}"))?)?;
+    let dims = dims_of(&cfg)?;
     if nr < 1 || (replicated(dims, nr) && (dims.nkv % REF_NR != 0 || dims.nh % REF_NR != 0 || dims.inter % REF_NR != 0)) {
         return Err("--nr: 1 or more (one that does not divide the KV heads gives the replicated layout)".into());
     }
@@ -504,8 +525,6 @@ pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str, di
     if let Some(c) = bf16.iter().find(|c| !CLASSES.contains(&c.as_str())) {
         return Err(format!("--bf16: unknown class {c} (classes: {})", CLASSES.join(",")));
     }
-    let cp = format!("{src}/config.json");
-    let cfg = json::parse(&std::fs::read_to_string(&cp).map_err(|e| format!("{cp}: {e}"))?)?;
     check_config(&cfg, dims)?;
     let st = St::open(&format!("{src}/model.safetensors"))?;
     std::fs::create_dir_all(out).map_err(|e| format!("{out}: {e}"))?;

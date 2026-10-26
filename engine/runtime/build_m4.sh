@@ -45,8 +45,8 @@ if [ "$WHAT" = dfl ]; then
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_CU -o $O/attn.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_BIND_CU -o $O/attn_bind.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_OPS_CU -o $O/attn_ops.o
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
   ls -la $OUT/dfltest $OUT/dflreplay
   cache_counts
   exit 0
