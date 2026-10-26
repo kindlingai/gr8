@@ -8,16 +8,17 @@ runs the same checks and handshake as a bare-metal box.
 
 ## Running it
 
-On every box, with the NVIDIA container toolkit (on DGX OS by default):
+[docs/DEPLOY.md](../docs/DEPLOY.md#docker-compose) has the steps, with or without a checkout. The commands here run from
+a checkout's root; in a directory that holds only `compose.yaml` and `.env`, run them there without
+`-f docker/compose.yaml`. On every box, with the NVIDIA container toolkit (on DGX OS by default):
 
-    git clone https://github.com/kindlingai/gr8 && cd gr8
-    cp docker/.env.example docker/.env        # then set GR8_MODEL, MODEL, DRAFTER and PEERS (one file for every box)
-    docker compose -f docker/compose.yaml pull                     # the latest image
-    docker compose -f docker/compose.yaml run --rm gr8 prepare    # this box's part of the model, ~90 GB at TP=4
+    cp docker/.env.example docker/.env        # then set GR8_MODEL, MODEL, PEERS and (TP=4) DRAFTER: one file for all
     docker compose -f docker/compose.yaml up -d
 
-`up -d` returns at once, and the boot goes on in the container: the boxes find each other, load (about a minute from a
-warm cache) and serve the OpenAI API on the head, port 8100. `docker compose -f docker/compose.yaml ps` shows the
+`up -d` returns at once, and the boot goes on in the container: the first one downloads this box's part of the model
+(~90 GB at TP=4; `docker compose -f docker/compose.yaml run --rm gr8 prepare` does that ahead of time, and is
+optional), then the boxes find each other, load (about a minute from a warm cache) and serve the OpenAI API on the
+head, port 8100. `docker compose -f docker/compose.yaml ps` shows the
 container healthy once this box's supervisor reports the cluster serving: the healthcheck runs
 `/opt/gr8/gr8 "$GR8_MODEL" health`, and on the head it also needs the API's `/health`. A Kubernetes
 pod can run the same command as an `exec` readiness probe on every rank. A KV node's container (`GR8_MODEL=kv` and
@@ -43,7 +44,7 @@ reports the failure.
 
 CI publishes `ghcr.io/kindlingai/gr8:latest` from every push to main, and `sha-<commit>` and release tags beside it.
 Compose pulls an image only when the box has none, so a box keeps the image it first pulled until you pull again. To
-update, on every box:
+update, on every box (with the files fetched by URL, fetch `compose.yaml` again first):
 
     docker compose -f docker/compose.yaml pull
     docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 down     # once, on any box: stops every box

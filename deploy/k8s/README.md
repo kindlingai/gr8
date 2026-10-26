@@ -31,7 +31,7 @@ A values file for your cluster ([values.yaml](values.yaml) has every value and i
 ```yaml
 image:
   tag: sha-<commit>                 # the same build on every box: they refuse a mix
-size: 4                             # TP: 3, 4 or 6
+size: 4                             # TP: 3, 4, 5 or 6
 options:                            # the launcher's options (KNOBS.md)
   GR8_MODEL: glm53                  # required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)
   MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4    # required: a release of that model
