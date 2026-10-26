@@ -129,9 +129,9 @@ box). [docker/README.md](docker/README.md) has the settings, how to update, and 
 
 ### On Kubernetes
 
-[deploy/k8s](deploy/k8s/README.md) is a kustomize base: a LeaderWorkerSet of one pod per box, each running the image's
-`up`, with the head on the leader pod wherever it lands, and a Service for its API. An overlay sets the image tag, TP,
-the RDMA device resource and the options.
+[deploy/k8s](deploy/k8s/README.md) is a Helm chart: a LeaderWorkerSet of one pod per box, each running the image's `up`,
+with the head on the leader pod wherever it lands, and a Service for its API. A values file sets the image tag, TP, the
+storage, the RDMA device resource and the options.
 
 ## Running it
 

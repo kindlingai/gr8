@@ -1,8 +1,0 @@
-# kustomize does not know the LeaderWorkerSet's fields: this takes the generated ConfigMap's name, with its hash, into
-# the pod template, so a change of options rolls the group.
-nameReference:
-  - kind: ConfigMap
-    version: v1
-    fieldSpecs:
-      - kind: LeaderWorkerSet
-        path: spec/leaderWorkerTemplate/workerTemplate/spec/containers/envFrom/configMapRef/name

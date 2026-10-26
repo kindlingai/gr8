@@ -1,0 +1,17 @@
+{{- range (list "TP" "HEAD" "PEERS") }}
+{{- if hasKey $.Values.options . }}
+{{- fail (printf "options.%s: the chart sets TP (size) and HEAD (the leader); PEERS would move the head" .) }}
+{{- end }}
+{{- end }}
+# The launcher's options, the same on every pod (values.yaml, options).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: gr8
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  {{- range $k, $v := .Values.options }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}

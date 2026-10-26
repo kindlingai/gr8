@@ -1,0 +1,72 @@
+# Pin a sha-<commit> tag: every box must run the same build, and the boxes refuse to boot with a mix. latest is pulled
+# at every start, so a pod that starts after CI publishes can run a different build from the others.
+image:
+  repository: ghcr.io/kindlingai/gr8
+  tag: latest
+  pullPolicy: ""
+imagePullSecrets: []
+
+# The boxes in the group: TP, 3, 4 or 6.
+size: 4
+# 0 stops every box, 1 boots them. One group per release: a second group is a second release, with its own GROUP.
+replicas: 1
+
+# The launcher's options (KNOBS.md), the same on every pod. Set only what this cluster needs: the launcher owns every
+# default. Not here: TP and HEAD (the chart sets them from the group), and PEERS (the first address would be the head,
+# and the leader need not be on it).
+options:
+  MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4
+  # DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2      # TP=4 only
+  # SHAPE: ring                                                 # no switch: the boxes cabled in a ring
+# More of the container's envFrom, such as HF_TOKEN for a gated repo: [{secretRef: {name: hf-token}}]
+extraEnvFrom: []
+
+# The gr8 container's resources. The engine needs the box's GPU and its RDMA devices (/dev/infiniband): add the
+# resource your RDMA device plugin exposes, such as rdma/rdma_shared_device_a: 1. Without cpu or memory requests the pod
+# is BestEffort, so under memory pressure the kernel ends the engine (oom_score_adj 1000) before the rest of the box.
+resources:
+  limits:
+    nvidia.com/gpu: 1
+
+# This box's part of the model (about 90 GB at TP=4 and 85 GB at TP=3, one cache for both), and the logs and state.
+# Each is a claim per pod from storageClass ("" = the cluster's default), or with hostPath, a directory on every box,
+# which must exist and be owned by uid 1000. Local storage keeps a pod's cache on its box.
+storage:
+  cache:
+    storageClass: ""
+    size: 150Gi
+    hostPath: ""
+  home:
+    storageClass: ""
+    size: 10Gi
+    hostPath: ""
+# The claims are kept when the LeaderWorkerSet is deleted: delete them by hand to free the disk.
+persistentVolumeClaimRetentionPolicy:
+  whenDeleted: Retain
+
+# Both run `gr8 <GR8_MODEL> health`: ready once the cluster serves (on the leader, once its API answers too). A cold
+# boot downloads this box's part first, about 35 minutes at 40 MB/s: the startup probe allows 4 hours.
+startupProbe:
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 480
+readinessProbe:
+  periodSeconds: 30
+  timeoutSeconds: 5
+
+# The OpenAI API, on the leader.
+service:
+  type: ClusterIP
+  port: 8100
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+affinity: {}
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+runtimeClassName: ""
+priorityClassName: ""
