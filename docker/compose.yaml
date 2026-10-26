@@ -74,8 +74,10 @@ services:
       # directory. Unset, a named volume.
       - ${GR8_HOME:-home}:/var/lib/gr8/home
     healthcheck:
-      # Healthy once this box's supervisor reports the cluster serving. A boot reads ~80 GB, so allow it time.
-      test: ["CMD", "python3", "-c", "import json,sys; sys.exit(json.load(open('/var/lib/gr8/home/out/gr8.state'))['state'] != 'serving')"]
+      # Healthy once this box's supervisor reports the cluster serving (on the head, once its API's /health answers
+      # too): `gr8 <model> health`, the same check a Kubernetes exec probe runs. $$ leaves GR8_MODEL to the
+      # container's shell, which has docker/.env's value, as the entrypoint does. A boot reads ~80 GB, so allow it time.
+      test: ["CMD-SHELL", "exec /opt/gr8/gr8 \"$${GR8_MODEL:-glm53}\" health"]
       interval: 30s
       timeout: 5s
       start_period: 30m

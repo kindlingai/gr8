@@ -154,6 +154,10 @@ class EndToEnd(unittest.TestCase):
         st = self.gr8(2, 'status')
         self.assertEqual(st.stdout.count(': serving, engine running'), TP, st.stdout)
         self.assertIn('answers (/health 200)', st.stdout)
+        for i in range(TP):     # every rank's readiness probe passes once `up` has returned on it
+            hl = self.gr8(i, 'health', '--port', str(self.api))
+            self.assertEqual(hl.returncode, 0, f'box {i}: {hl.stdout}{hl.stderr}')
+            self.assertTrue(hl.stdout.startswith(f'rank {i}: serving'), hl.stdout)
         lg = self.gr8(1, 'logs', 'supervisor')
         self.assertIn('the head serves', lg.stdout)
         lg = self.gr8(1, 'logs', '0')
@@ -178,6 +182,10 @@ class EndToEnd(unittest.TestCase):
             self.assertFalse(running(pid), f'box {i} engine {pid} runs')
         st = self.gr8(0, 'status')
         self.assertIn('no supervisor answers', st.stdout)
+        for i in range(TP):     # down: no box is ready, and each says why in its one line
+            hl = self.gr8(i, 'health')
+            self.assertEqual(hl.returncode, 1, f'box {i}: {hl.stdout}{hl.stderr}')
+            self.assertRegex(hl.stdout, r'^rank \d: not serving, no supervisor runs \(last state stopped\)\n$')
 
     def request(self):
         from fake_s2_engine import token_at

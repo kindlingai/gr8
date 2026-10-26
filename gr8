@@ -15,6 +15,8 @@
 #   ./gr8 glm53 down                  stop every box of the last boot
 #   ./gr8 glm53 restart [OPTIONS]     down, then up
 #   ./gr8 glm53 status                every box's state, engine and MemAvailable, and the head's shim, front end, /health
+#   ./gr8 glm53 health                exit 0 when this box serves (on the head, its /health answers too), else 1: a
+#                                     readiness check for compose and Kubernetes probes, on every rank
 #   ./gr8 glm53 logs [r|shim|front|supervisor] [-f]   a log from any box (default this box's engine)
 #   ./gr8 glm53 check [OPTIONS]       what would stop this box's boot
 #   ./gr8 glm53 show-config [OPTIONS] the effective options, the cluster options the boxes compare, the model set id
@@ -91,7 +93,7 @@ done
 set -- ${args[@]+"${args[@]}"}
 api() { echo "http://127.0.0.1:$PORT"; }
 case $cmd in
-  up|down|restart|status|logs|check|show-config|prepare)
+  up|down|restart|status|health|logs|check|show-config|prepare)
     [ $check = 0 ] && set -- "$@" --no-check
     exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@" ;;
   smoke)
