@@ -48,6 +48,8 @@ KEYS = {
     'MODEL_LOADER': ('box', None, "FETCH=model-loader: the local model-loader's request API, unix:PATH or host:port "
                                   '(default unix:<MODEL_CACHE>/model-loader.sock). host:port needs '
                                   'MODEL_LOADER_LOCAL_TOKEN in the environment'),
+    'MODEL_LOADER_DRAFTER_MODEL': ('box', None, "FETCH=model-loader: the drafter's name in model-loader's catalog, when "
+                                                "the catalog cannot be asked (default: the entry whose source is DRAFTER's repo)"),
     'MODEL_LOADER_MODEL': ('box', None, "FETCH=model-loader: the release's name in model-loader's catalog, when the "
                                         "catalog cannot be asked (default: the entry whose source is MODEL's repo)"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
@@ -450,10 +452,6 @@ def validate(o):
         raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
     if o.get('FETCH') not in ('legacy', 'model-loader'):
         raise OptionError(f'--fetch {o.get("FETCH")}: want legacy or model-loader')
-    if o.get('FETCH') == 'model-loader' and o.get('DRAFTER'):
-        raise OptionError('--drafter with --fetch model-loader: not yet; the drafter needs --fetch legacy')
-    if o.get('FETCH') == 'model-loader' and (o.get('STEERING_PROFILE') or '').startswith('hf:'):
-        raise OptionError('--steering-profile hf:... with --fetch model-loader: not yet; it needs --fetch legacy')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')

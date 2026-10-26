@@ -248,6 +248,7 @@ class Release:
         self.layout_sha256 = modelset.sha256_file(layout) if layout else None
         self.steering_profile = None
         self.include, self.ranges = list(META_FILES) + ['manifests/*.json'], {}
+        self.pinned = []            # files the boot needs besides the rank's (the steering index and artifact)
         self.priority = 10
         self.revision = rev
         old = self.client.get(name)
@@ -320,11 +321,48 @@ class Release:
         return st
 
     def fetch_meta(self, steering=None):
-        if steering:
-            raise modelset.ModelError('--steering-profile hf:... with --fetch model-loader: not yet (#179)')
+        """The tokenizer files, then an explicitly selected steering artifact (steering_hf.fetch, with this Release as
+        its source: the index and the artifact come through the request, and are unpacked under G6_HOME)."""
         missing = [n for n in META_FILES if n not in self.files]
         if missing:
             raise modelset.ModelError(f'{self} lacks {", ".join(missing)} at its root')
+        self.steering_profile = None
+        if steering:
+            import steering_hf
+            try:
+                self.pin_steering(steering_hf, steering)
+            except (OSError, ValueError) as e:
+                raise modelset.ModelError(f'{self}: --steering-profile hf:{steering}: {e}') from None
+            self.steering_profile = steering_hf.fetch(self, steering)
+
+    def pin_steering(self, steering_hf, requested):
+        """Put the steering index and the selected artifact in the request, held for as long as the boot's request
+        stands (fetch_rank keeps them), so steering_hf.fetch finds both held in the store."""
+        if steering_hf.INDEX not in self.files:
+            raise ValueError(f'needs {steering_hf.INDEX}')
+        if not 0 < self.files[steering_hf.INDEX]['size'] <= steering_hf.release.MAX_HEADER:
+            raise ValueError('steering index is too large or empty')
+        self.repo.fetch(steering_hf.INDEX, os.path.join(self.dir, steering_hf.INDEX))
+        raw = steering_hf.release.read_limited(os.path.join(self.dir, steering_hf.INDEX), steering_hf.release.MAX_HEADER,
+                                               'steering index')
+        default, records = steering_hf.parse_index(raw)
+        name = default if requested == 'default' else requested
+        if name in records:
+            rec = records[name]
+            if (self.files.get(rec['file']) or {}).get('size') != rec['byte_count']:
+                raise ValueError('profile file is missing or its published size differs from the index')
+            self.repo.fetch(rec['file'], os.path.join(self.dir, rec['file']))
+        self.pinned = sorted(set(self.pinned) | {steering_hf.INDEX} | ({records[name]['file']} if name in records else set()))
+
+    @property
+    def steering_work(self):
+        safe = re.sub(r'[^A-Za-z0-9._-]', '_', f'{self.model}@{self.revision}')
+        return os.path.join(self.work, safe, 'steering')
+
+    @property
+    def repo(self):
+        """What steering_hf asks of a source's repo: the file list, a fetch into place, and a hash check."""
+        return StoreRepo(self)
 
     def whole_files(self, tp, rank):
         """The rank's index slices (every rank's under a layout), and the dense and vocab files without the vision
@@ -388,7 +426,8 @@ class Release:
         xxhash64 (once per rank, variant and layout: a receipt under G6_HOME records it)."""
         import fetch_ranks as fr
         whole = self.whole_files(tp, rank)
-        self.include, self.ranges = list(META_FILES) + ['manifests/*.json'] + whole, {}   # this boot's pieces only
+        # this boot's pieces only
+        self.include, self.ranges = list(META_FILES) + ['manifests/*.json'] + self.pinned + whole, {}
         self.request(f'rank {rank} of TP={tp}: the index slices and dense files')
         halves, nbytes = self.plan(tp, rank, variant)
         self.ranges = {p: merge(rs + [(0, 8)], int(self.files[p].get('segment_size') or 1)) for p, rs in halves.items()}
@@ -464,6 +503,140 @@ def client_of(o):
     return Client(addr, os.environ.get('MODEL_LOADER_LOCAL_TOKEN') or None)
 
 
+class StoreRepo:
+    """steering_hf's view of the release in the store: tree() lists the manifest's files and sizes, fetch(path, dest)
+    adds the file to the request, waits until it is held, and checks dest is that held file (dest is always
+    <dir>/<path>: gr8 reads it in place and writes nothing in the store), and matches() checks a held file against the
+    manifest's sha256."""
+
+    def __init__(self, release):
+        self.r = release
+
+    def tree(self):
+        return {p: f['size'] for p, f in self.r.files.items()}
+
+    def fetch(self, path, dest, meter=None):
+        r = self.r
+        if os.path.abspath(dest) != os.path.abspath(os.path.join(r.dir, path)):
+            raise modelset.ModelError(f'{path}: read in place from the store, not {dest}')
+        if path not in r.files:
+            raise modelset.ModelError(f'{path}: not in {r}')
+        if path not in r.include:
+            r.include.append(path)
+            r.request(path)
+        bad = r.store.settled([path], {})
+        if bad:
+            raise modelset.ModelError(f'{path}: model-loader reports it held, and the store does not hold it')
+
+    def matches(self, path, local):
+        """The held file against the manifest's sha256. A file the origin gives no sha256 for (a small non-LFS file on
+        Hugging Face, such as the steering index) is the bytes model-loader fetched from the origin over TLS and holds
+        complete: that is the check, as the legacy fetch takes the hub's git blob id over TLS."""
+        r = self.r
+        if os.path.abspath(local) != os.path.abspath(os.path.join(r.dir, path)) or r.store.missing([path], {}):
+            return False
+        want = (r.files.get(path) or {}).get('sha256')
+        return modelset.sha256_file(local) == want if want else True
+
+
+class Drafter:
+    """The DFlash2 drafter at one revision, fetched by the box's model-loader and converted on this box, as
+    hfsource.Drafter. Its licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so model-loader holds only the
+    drafter's own files, and the converted rank goes under G6_HOME, which model-loader never reads or serves:
+
+        <G6_HOME>/run/model-loader/<model>@<revision>/tp<TP>/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE
+
+    Its request is its own (gr8-<model>-drafter), so it stands apart from the release's."""
+
+    FILES = ('config.json', 'model.safetensors')
+
+    def __init__(self, store, addr, model, repo, rev, work, name, log=print, tp=4, token=None):
+        if not safe_path(model):
+            raise modelset.ModelError(f'MODEL_LOADER_DRAFTER_MODEL {model!r}: not a catalog name')
+        self.client, self.model, self.hf_repo, self.log, self.tp = Client(addr, token), model, repo, log, tp
+        self.request_name, self.revision = name, rev
+        self.where = f'model-loader {model}'
+        st = self.put()
+        if (rev and st.get('revision') != rev) or not safe_path(st.get('revision')):
+            want = rev or "the catalog's only revision"
+            raise modelset.ModelError(f'model-loader answered {model} revision {st.get("revision")!r} for {want}')
+        self.revision = st['revision']
+        self.store = Store(store, model, self.revision)
+        self.dir = self.store.dir
+        man, self.commit = self.store.manifest()
+        if man is None:
+            raise modelset.ModelError(f'{self.where}: ready, but the store has no manifest: is MODEL_CACHE the store?')
+        if re.fullmatch(r'[0-9a-f]{40}', rev or '') and self.commit and self.commit != rev:
+            raise modelset.ModelError(f'--drafter names commit {rev}, and model-loader\'s {model}@{self.revision} is '
+                                      f'commit {self.commit}')
+        self.commit = self.commit or self.revision
+        missing = [n for n in self.FILES if n not in man]
+        if missing:
+            raise modelset.ModelError(f'the drafter {self} has no {", ".join(missing)}')
+        self.files = man
+        safe = re.sub(r'[^A-Za-z0-9._-]', '_', f'{model}@{self.revision}')
+        self.out = os.path.join(work, safe, f'tp{tp}')
+
+    def put(self):
+        b = {'model': self.model, 'include': list(self.FILES), 'priority': 5}
+        if self.revision:
+            b['revision'] = self.revision
+        st = self.client.put(self.request_name, b)
+        said = None
+        while st.get('state') not in ('ready', 'invalid'):
+            line = (f'{self.where}: the drafter: {st.get("state")}, {st.get("bytes_done", 0) / 1e9:.1f} of '
+                    f'{st.get("bytes_total", 0) / 1e9:.1f} GB' + (f' ({st["error"]})' if st.get('error') else ''))
+            if line != said:
+                self.log(line)
+                said = line
+            st = self.client.wait(self.request_name, WAIT)
+        if st['state'] == 'invalid':
+            raise modelset.ModelError(f'{self.where}: request {self.request_name} is invalid: {st.get("error")}')
+        return st
+
+    pins = True
+
+    @property
+    def id(self):
+        """As hfsource.Drafter's, so boxes on either fetch agree."""
+        return f'{self.hf_repo}@{self.commit}'
+
+    def __str__(self):
+        return f'{self.hf_repo}@{self.commit[:12]}'
+
+    @property
+    def label(self):
+        return self.hf_repo
+
+    def check(self, rank):
+        """Problems with this rank's converted drafter. [] = ready: converted from this commit's files."""
+        try:
+            with open(os.path.join(self.out, f'rank{rank}.COMPLETE')) as f:
+                c = json.load(f)
+        except (OSError, ValueError):
+            return [f'the drafter {self} is not converted for rank {rank} yet']
+        if c.get('drafter') != self.id:
+            return [f'the drafter for rank {rank} was converted from {c.get("drafter")}, not {self.id}']
+        return [f'{p}: missing or not {n} bytes' for p, n in sorted(c['files'].items())
+                if not os.path.isfile(os.path.join(self.out, p)) or os.path.getsize(os.path.join(self.out, p)) != n]
+
+    def fetch_rank(self, rank):
+        """Put the drafter's request (it pins the drafter's files), wait until held, and convert this rank from the
+        store when it is not converted yet."""
+        import hfsource
+        convert = hfsource.converter()
+        self.put()
+        bad = self.store.settled(list(self.FILES), {})
+        if bad:
+            raise modelset.ModelError(f'the drafter {self}: model-loader reports it held, and the store does not hold '
+                                      f'{", ".join(bad)}')
+        if not self.check(rank):
+            return
+        os.makedirs(os.path.dirname(self.out), exist_ok=True)
+        hfsource.convert_drafter(convert, self.dir, self.out, self.tp, rank, self.id, self.log, str(self),
+                                 scratch=os.path.dirname(self.out))
+
+
 def of(o, repo, rev, log=print):
     """The model-loader Release for --fetch model-loader and --model https://huggingface.co/<repo>[@rev]."""
     store = o.get('MODEL_CACHE')
@@ -474,3 +647,15 @@ def of(o, repo, rev, log=print):
     work = os.path.join(os.path.abspath(o.get('G6_HOME')), 'run', 'model-loader')
     return Release(store, client.addr, model, repo, rev if named else '', work, f'gr8-{o.get("GR8_MODEL") or "glm53"}',
                    log=log, layout=o.get('LAYOUT'), token=client.token)
+
+
+def drafter_of(o, repo, rev, log=print):
+    """The model-loader Drafter for --fetch model-loader and --drafter https://huggingface.co/<repo>[@rev]."""
+    store = o.get('MODEL_CACHE')
+    named = bool(re.search(r'(@|/tree/)[^/]+/?$', o.get('DRAFTER') or ''))
+    client = client_of(o)
+    model = o.get('MODEL_LOADER_DRAFTER_MODEL') or catalog_name(client, repo, rev if named else '',
+                                                                'MODEL_LOADER_DRAFTER_MODEL', log)
+    work = os.path.join(os.path.abspath(o.get('G6_HOME')), 'run', 'model-loader')
+    return Drafter(store, client.addr, model, repo, rev if named else '', work,
+                   f'gr8-{o.get("GR8_MODEL") or "glm53"}-drafter', log=log, tp=int(o.get('TP')), token=client.token)

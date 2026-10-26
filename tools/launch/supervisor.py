@@ -211,8 +211,11 @@ def drafter_of(o, ms, refresh, log):
             raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
         if o.get('DFLASH') == '0':
             return None
-        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log,
-                             tp=int(o.get('TP')))
+        if o.get('FETCH') == 'model-loader':
+            d = mlsource.drafter_of(o, *hfsource.parse_url(o.get('DRAFTER')), log=log)
+        else:
+            d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh,
+                                 log=log, tp=int(o.get('TP')))
         o.values['DFLASH_DIR'] = d.out
         return d
     if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
@@ -641,7 +644,7 @@ class Supervisor:
                 rel = self.ms.release
                 if rel and (getattr(rel, 'pins', False) or rel.check(int(o.get('TP')), self.rank, self.variant)):
                     rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
-                if self.ms.drafter and self.ms.drafter.check(self.rank):
+                if self.ms.drafter and (getattr(self.ms.drafter, 'pins', False) or self.ms.drafter.check(self.rank)):
                     self.ms.drafter.fetch_rank(self.rank)
             if self.ms and self.rank is not None:
                 if self.ms.release:
