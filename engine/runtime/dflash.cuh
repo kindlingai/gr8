@@ -725,7 +725,22 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     sc.xf_head = D.xf_head;
     bind::HeadIo io;
     io.h = D.x; io.logits = D.hlog;
+#if G6_MODEL_FLASH
+    {   // Flash's lm_head is FP8R (row scales) or BF16: the codec rule of head_for, on fp16 fragments (BF16: bf16 ones)
+        const int codec = ht.lm_head_scale.p ? bind::FP8R : ht.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W;
+        D.head = bind::Head();
+        D.head.M = B; D.head.vlo = main.vlo; D.head.vn = main.vn;
+        if (const char* e = bind::make_gv(ht.lm_head, codec, 1, 32, B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head,
+                                          static_cast<const float*>(ht.lm_head_scale.p)))
+            die(std::string("dflash head: ") + e);
+        if (D.head.lm_head.K != HID || D.head.lm_head.O != D.vn) die("dflash head: G.lm_head is not this rank's vocab slice");
+        bind::Xfrag& x = D.head.xf_h;
+        x.on = 1; x.src = D.x; x.ld = HID; x.K = HID; x.M = B;
+        (codec == bind::BF16W ? x.bf16 : x.f16) = D.xf_head;
+    }
+#else
     if (const char* e = bind::make_head(ht, D.rank, B, sc, io, D.head)) die(std::string("dflash head: ") + e);
+#endif
     G6RT_CK(cudaStreamSynchronize(st));
     size_t wb = 0;
     auto gvb = [&](const bind::Gv& g) { wb += bind::gv_bytes(g); };
