@@ -66,13 +66,8 @@ spec:
         # The launcher refuses to start next to another g6m4 on the box, and sees one started outside the pod only in
         # the host's process list.
         hostPID: true
+        # The cluster's DNS on the host network: HEAD is the leader pod's name in it.
         dnsPolicy: ClusterFirstWithHostNet
-        dnsConfig:
-          options:
-            # The fetch looks up the Hugging Face host for every connection, and ndots:5 would send each lookup
-            # through the cluster's search list first.
-            - name: ndots
-              value: "1"
         securityContext:
           # The image's uid 1000 owns the volumes, where the storage supports it. OnRootMismatch: not a walk over the
           # whole cache at every start.
