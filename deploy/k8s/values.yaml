@@ -13,10 +13,12 @@ replicas: 1
 
 # The launcher's options (KNOBS.md), the same on every pod. Set only what this cluster needs: the launcher owns every
 # default. Not here: TP and HEAD (the chart sets them from the group), and PEERS (the first address would be the head,
-# and the leader need not be on it).
-options:
-  MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4
-  # DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2      # TP=4 only
+# and the leader need not be on it). GR8_MODEL and MODEL are required, with no default: the model, glm53 (GLM-5.3) or
+# glm53f (GLM-5.3-Flash), and a release of it. `./gr8 models` lists each model's release, TP sizes and variants.
+options: {}
+  # GR8_MODEL: glm53
+  # MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4
+  # DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2      # glm53 at TP=4 only
   # SHAPE: ring                                                 # no switch: the boxes cabled in a ring
 # More of the container's envFrom, such as HF_TOKEN for a gated repo: [{secretRef: {name: hf-token}}]
 extraEnvFrom: []

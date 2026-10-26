@@ -1,5 +1,5 @@
 # gr8 on Kubernetes: one LeaderWorkerSet group of TP pods, one per box, one rank in each. Every pod runs the image's
-# entrypoint with no command, which is `./gr8 glm53 up` in the foreground, so a pod lives as long as its box's part of
+# entrypoint with no command, which is `./gr8 $GR8_MODEL up` in the foreground, so a pod lives as long as its box's part of
 # the cluster. docker/compose.yaml is the same container for docker.
 #
 # The boxes find each other through the mentat daemon on each box (no PEERS), and every pod has the same options: TP is
@@ -133,11 +133,11 @@ spec:
                 containerPort: {{ int (.Values.options.S2PORT | default 7341) }}
             startupProbe:
               exec:
-                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "${GR8_MODEL:-glm53}" health']
+                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "$GR8_MODEL" health']
               {{- toYaml .Values.startupProbe | nindent 14 }}
             readinessProbe:
               exec:
-                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "${GR8_MODEL:-glm53}" health']
+                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "$GR8_MODEL" health']
               {{- toYaml .Values.readinessProbe | nindent 14 }}
             # The engine runs with no more rights than it needs: the image's uid 1000, no capabilities but IPC_LOCK
             # (pinned memory), no privilege escalation, a read-only image with a private /tmp. The entrypoint sets no
