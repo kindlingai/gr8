@@ -484,10 +484,10 @@ class KvStoreTests(unittest.TestCase):
         o, p = self.plan('--kv-store', a + ',persist=on,keep=system', '--kv-store', b + ',keep=all')
         self.assertEqual(self.stores(p), [a + ',persist=on,keep=system', b + ',keep=all'])
         self.assertEqual([x['keep'] for x in opt.kv_stores(o)], ['system', 'all'])
-        # ram=on reaches the engine as written
-        o, p = self.plan('--kv-store', b + ',ram=on,ram_floor=3G')
-        self.assertEqual(self.stores(p), [b + ',ram=on,ram_floor=3G'])
-        self.assertTrue(opt.kv_stores(o)[0]['ram'])
+        # spare_ram_cache=on reaches the engine as written
+        o, p = self.plan('--kv-store', b + ',spare_ram_cache=on,spare_ram_floor=3G')
+        self.assertEqual(self.stores(p), [b + ',spare_ram_cache=on,spare_ram_floor=3G'])
+        self.assertTrue(opt.kv_stores(o)[0]['spare_ram_cache'])
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
@@ -516,13 +516,98 @@ class KvStoreTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=most'], 'keep=system, sessions or all'),
                            (['--kv-store', 'remote:192.0.2.5:7350,size=8G,persist=on'], 'for ssd:'),
                            (['--kv-store', 'ssd:/x,size=8G,persist=yes'], 'persist=on|off'),
-                           (['--kv-store', 'ssd:/x,size=8G,ram=yes'], 'ram=on|off'),
-                           (['--kv-store', 'remote:192.0.2.5:7350,size=8G,group=g,ram=on'], 'fixed lease'),
+                           (['--kv-store', 'ssd:/x,size=8G,spare_ram_cache=yes'], 'spare_ram_cache=on|off'),
+                           (['--kv-store', 'remote:192.0.2.5:7350,size=8G,group=g,spare_ram_cache=on'], 'fixed lease'),
                            (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-system-after', '0'], 'from 1'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-write-limit', 'lots'], 'per page computed')):
             v.check(['--peers', PEERS, *argv], want)
+
+
+class KvStoreFileTests(unittest.TestCase):
+    """KV_STORE=@FILE: tiers in a YAML file, lowered to the one-line form the engine and the logs take."""
+    FILE = """
+caches:
+  spare: {kind: spare_ram, floor: 2G}
+tiers:                       # tried in order
+  - keep: system
+    cache: spare
+    store:
+      ssd: {path: /nvme/gr8kv, size_per_rank: 4G, persist: true}
+  - keep: all
+    cache: spare
+    store:
+      remote: {address: auto, size_per_rank: 8G}
+"""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def lower(self, text):
+        return opt.kv_store_file(write(self.d, 'kv.yaml', text))
+
+    def test_lowers_in_cascade_order(self):
+        self.assertEqual(self.lower(self.FILE), 'ssd:/nvme/gr8kv,size=4G,persist=on,keep=system,spare_ram_cache=on,'
+                                                'spare_ram_floor=2G;remote:auto,size=8G,keep=all,spare_ram_cache=on,'
+                                                'spare_ram_floor=2G')
+        self.assertEqual(self.lower('tiers:\n- store:\n    remote: {address: "192.0.2.5:7350", size_per_rank: 8G, '
+                                    'group: g, cap_per_rank: 32G, weight: 2000}\n'),
+                         'remote:192.0.2.5:7350,size=8G,group=g,cap=32G,weight=2000')
+        # two tiers of one kind need names
+        two = 'tiers:\n- {name: a, store: {ssd: {path: /a, size_per_rank: 4G}}}\n' \
+              '- {name: b, store: {ssd: {path: /b, size_per_rank: 4G}}}\n'
+        self.assertEqual(self.lower(two), 'ssd:/a,size=4G;ssd:/b,size=4G')
+
+    def test_at_file_beside_the_config_file(self):
+        write(self.d, 'kv.yaml', 'tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G}}\n')
+        cfg = write(self.d, 'c.env', f'PEERS={PEERS}\nKV_STORE=@kv.yaml\n')
+        o = opt.parse(['@' + cfg], {})
+        self.assertEqual(o.get('KV_STORE'), 'ssd:/x,size=4G')
+        self.assertIn('via ' + os.path.join(self.d, 'kv.yaml'), opt.summary(o))
+        # an @FILE among one-line stores, from the command line: relative to the working directory
+        o = opt.parse(['--no-config', '--kv-store', 'remote:192.0.2.5:7350,size=8G', '--kv-store',
+                       '@' + os.path.join(self.d, 'kv.yaml')], {})
+        self.assertEqual(o.get('KV_STORE'), 'remote:192.0.2.5:7350,size=8G;ssd:/x,size=4G')
+
+    def test_refusals_name_the_key(self):
+        ssd = '{ssd: {path: /x, size_per_rank: 4G}}'
+        for text, want in [
+            ('', 'the file: want a mapping'),
+            ('caches: {}\n', 'tiers: no tiers'),
+            ('tiers: []\n', 'tiers: no tiers'),
+            ('runs: []\ntiers: []\n', 'the file.runs: not built yet'),
+            ('tier: []\n', 'the file.tier: want caches, tiers'),
+            (f'tiers:\n- {{keep: all}}\n', 'tiers[0]: no store'),
+            ('tiers:\n- store: {nvme: {path: /x}}\n', 'tiers[0].store: want one of ssd: or remote:'),
+            ('tiers:\n- store: {ssd: {size_per_rank: 4G}}\n', 'tiers[0].store.ssd: no path'),
+            ('tiers:\n- store: {ssd: {path: /x, size: 4G}}\n', 'tiers[0].store.ssd.size: want path, size_per_rank, persist'),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: on}}\n', None),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: maybe}}\n',
+             "tiers[0].store.ssd.persist: want true or false, got 'maybe'"),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4}}\n', 'tiers[0].store.ssd.size_per_rank: want a string'),
+            ('tiers:\n- store: {ssd: {path: /x}}\n', 'tiers[0]: --kv-store ssd:/x: size=N(G|T) is needed'),
+            (f'tiers:\n- store: {ssd}\n- store: {ssd}\n', 'tiers[1].name: two ssd tiers: give each a name'),
+            (f'tiers:\n- {{store: {ssd}, transforms: []}}\n', 'tiers[0].transforms: not built yet'),
+            (f'tiers:\n- {{store: {ssd}, cache: spar}}\n', "tiers[0].cache: no cache 'spar' (caches: none)"),
+            (f'caches: {{spare: {{kind: fixed_ram}}}}\ntiers:\n- store: {ssd}\n', 'caches.spare.kind: want spare_ram'),
+            (f'caches: {{spare: {{kind: spare_ram, takes: [system]}}}}\ntiers:\n- store: {ssd}\n',
+             'caches.spare.takes: not built yet'),
+            (f'tiers:\n- {{keep: most, store: {ssd}}}\n', 'keep=system, sessions or all'),
+            ('caches: {s: {kind: spare_ram}}\ntiers:\n- cache: s\n  store: {remote: {address: "192.0.2.5:7350", '
+             'size_per_rank: 8G, group: g}}\n', 'fixed lease'),
+            ('tiers: [\n', 'KV_STORE=@'),
+        ]:
+            with self.subTest(text=text):
+                if want is None:   # YAML 1.1: on is true
+                    self.assertEqual(self.lower(text), 'ssd:/x,size=4G,persist=on')
+                    continue
+                with self.assertRaises(opt.OptionError) as e:
+                    self.lower(text)
+                self.assertIn(want, str(e.exception))
+        with self.assertRaises(opt.OptionError) as e:
+            opt.kv_store_file(os.path.join(self.d, 'missing.yaml'))
+        self.assertIn('No such file', str(e.exception))
 
 
 class KvRowsTests(unittest.TestCase):

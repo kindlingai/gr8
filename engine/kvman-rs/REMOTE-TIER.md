@@ -145,6 +145,32 @@ The launcher's `KV_STORE` holds the stores separated by `;`, with `KV_KEEP`, `KV
 RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40). An SSD store is cleared
 at every boot unless it has `persist=on` (below, Persistence).
 
+`KV_STORE=@FILE` reads the stores from a YAML file instead, relative to the config file that names it. The launcher
+turns the file into the one-line form above, which is what the engine gets and the logs print:
+
+```yaml
+caches:
+  spare: {kind: spare_ram, floor: 2G}   # memory the kernel may take back (src/ram.rs)
+tiers:                                  # tried in order: a full tier passes entries to the next
+  - keep: system
+    cache: spare
+    store:
+      ssd: {path: /nvme/gr8kv, size_per_rank: 4G, persist: true}
+  - keep: all
+    cache: spare
+    store:
+      remote: {address: auto, size_per_rank: 8G}
+```
+
+becomes
+
+    ssd:/nvme/gr8kv,size=4G,persist=on,keep=system,spare_ram_cache=on,spare_ram_floor=2G;remote:auto,size=8G,keep=all,spare_ram_cache=on,spare_ram_floor=2G
+
+A tier's `name` defaults to its store kind, and two tiers of one kind
+need names. A `remote` store also takes `group`, `cap_per_rank` and `weight`. Each tier that names a cache gets its own
+copy of it today, with the cache's floor. Keys from the design that are not built yet (`transforms`, `takes`, `runs`)
+are refused by name.
+
 ### What the stores keep
 
 - `system` (the default): the system prompt and tool definitions of each conversation, once per distinct span, after

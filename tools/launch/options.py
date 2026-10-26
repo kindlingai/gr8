@@ -89,8 +89,10 @@ KEYS = {
                                   'separated by ; (or --kv-store given again). STORE: ssd:PATH (a folder on each box\'s own SSD), '
                                   'remote:HOST:PORT or remote:auto (a KV node on another machine; auto = the one the mentat '
                                   'group announces). Sizes per rank. An SSD store starts empty at every boot; '
-                                  ',persist=on keeps it across restarts. ,ram=on caches a store\'s blocks in memory the '
-                                  'kernel may take back, while MemAvailable is above ,ram_floor=N(M|G) (default 2G)'),
+                                  ',persist=on keeps it across restarts. ,spare_ram_cache=on caches a store\'s blocks in spare '
+                                  'memory the kernel may take back, while MemAvailable is above ,spare_ram_floor=N(M|G) '
+                                  '(default 2G). @FILE reads the stores from a YAML file (kvman-rs REMOTE-TIER.md), '
+                                  'relative to the config file it is named in'),
     'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
@@ -358,6 +360,7 @@ def parse(argv, environ=None):
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
     deprecated_kv(values, origin, warnings)
+    kv_store_files(values, origin, path)
     model = values['GR8_MODEL']
     if model and model not in models.MODELS:
         raise OptionError(f'GR8_MODEL={model}, from the {origin["GR8_MODEL"]}: not a model gr8 serves. Want '
@@ -548,6 +551,134 @@ def deprecated_kv(values, origin, warnings):
     values['KV_TIER'] = values['KV_SHARED_AFTER'] = None
 
 
+# a store file's keys: {key: (type, the one-line key)}; the store's address comes first
+STORE_KEYS = {'ssd': {'path': (str, None), 'size_per_rank': (str, 'size'), 'persist': (bool, 'persist')},
+              'remote': {'address': (str, None), 'size_per_rank': (str, 'size'), 'group': (str, 'group'),
+                         'cap_per_rank': (str, 'cap'), 'weight': (int, 'weight')}}
+CACHE_KINDS = ('spare_ram',)
+# in the design but not built: refused by name so a file written for them fails loudly
+NOT_BUILT = {'caches': ('takes', 'holds', 'size', 'overflow'), 'tiers': ('transforms', 'tag_restored'),
+             'top': ('runs',)}
+TYPE_WORDS = {str: 'a string', bool: 'true or false', int: 'a whole number', dict: 'a mapping', list: 'a list'}
+
+
+def kv_store_files(values, origin, config):
+    """Each @FILE in KV_STORE replaced by the stores it holds, in the one-line form. A relative FILE is relative to the
+    config file that names it, else to the working directory."""
+    v = values.get('KV_STORE')
+    if not v or '@' not in v:
+        return
+    base = os.path.dirname(config) if config and origin['KV_STORE'] in ('config file', '@file') else os.getcwd()
+    texts, files = [], []
+    for t in [t.strip() for t in v.split(';') if t.strip()]:
+        if t.startswith('@'):
+            files.append(os.path.join(base, t[1:]))
+            t = kv_store_file(files[-1])
+        texts.append(t)
+    values['KV_STORE'] = ';'.join(texts)
+    origin['KV_STORE'] += ' via ' + ', '.join(files)
+
+
+def kv_store_file(path):
+    """A YAML store file's tiers as KV_STORE's one-line form. Raises OptionError naming the file and the key.
+
+        caches:
+          spare: {kind: spare_ram, floor: 2G}      # memory the kernel may take back
+        tiers:                                     # tried in order: a full tier passes entries to the next
+          - keep: system
+            cache: spare
+            store:
+              ssd: {path: /nvme/gr8kv, size_per_rank: 4G, persist: true}
+          - keep: all
+            cache: spare
+            store:
+              remote: {address: auto, size_per_rank: 4G}
+    """
+    def fail(where, msg):
+        raise OptionError(f'KV_STORE=@{path}: {where}: {msg}')
+
+    def want(where, x, t):
+        if type(x) is not t:   # a YAML 1.1 on/yes is a bool, a bare 4 an int
+            fail(where, f'want {TYPE_WORDS[t]}, got {x!r}')
+        return x
+
+    def keys(where, d, allowed, not_built=()):
+        for k in d:
+            if k in not_built:
+                fail(f'{where}.{k}', 'not built yet')
+            if k not in allowed:
+                fail(f'{where}.{k}', f'want {", ".join(allowed)}')
+
+    try:
+        import yaml
+    except ImportError:
+        raise OptionError(f'KV_STORE=@{path}: needs PyYAML (python3-yaml)') from None
+    try:
+        with open(path) as f:
+            doc = yaml.safe_load(f)
+    except OSError as e:
+        raise OptionError(f'KV_STORE=@{path}: {e.strerror}') from None
+    except yaml.YAMLError as e:
+        raise OptionError(f'KV_STORE=@{path}: {e}') from None
+    want('the file', doc, dict)
+    keys('the file', doc, ('caches', 'tiers'), NOT_BUILT['top'])
+    caches = want('caches', doc.get('caches', {}), dict)
+    for name, c in caches.items():
+        where = f'caches.{name}'
+        keys(where, want(where, c, dict), ('kind', 'floor'), NOT_BUILT['caches'])
+        if c.get('kind') not in CACHE_KINDS:
+            fail(f'{where}.kind', f'want {" or ".join(CACHE_KINDS)}')
+        if 'floor' in c:
+            want(f'{where}.floor', c['floor'], str)
+    tiers = want('tiers', doc.get('tiers'), list) if 'tiers' in doc else fail('tiers', 'no tiers')
+    if not tiers:
+        fail('tiers', 'no tiers')
+    out, names = [], {}
+    for i, t in enumerate(tiers):
+        where = f'tiers[{i}]'
+        keys(where, want(where, t, dict), ('name', 'keep', 'cache', 'store'), NOT_BUILT['tiers'])
+        store = want(f'{where}.store', t.get('store'), dict) if 'store' in t else fail(where, 'no store')
+        if len(store) != 1 or next(iter(store)) not in STORE_KEYS:
+            fail(f'{where}.store', 'want one of ssd: or remote:')
+        kind, s = next(iter(store.items()))
+        where_s = f'{where}.store.{kind}'
+        attrs = STORE_KEYS[kind]
+        keys(where_s, want(where_s, s, dict), tuple(attrs))
+        for k, x in s.items():
+            want(f'{where_s}.{k}', x, attrs[k][0])
+        address = next(iter(attrs))
+        if address not in s:
+            fail(where_s, f'no {address}')
+        name = want(f'{where}.name', t.get('name', kind), str)
+        if name in names:
+            fail(f'{where}.name', f'{name!r} is also tiers[{names[name]}]\'s name' if 'name' in t else
+                 f'two {kind} tiers: give each a name')
+        names[name] = i
+        parts = [f'{kind}:{s[address]}']
+        for k, (_, one) in list(attrs.items())[1:]:
+            if k in s:
+                x = s[k]
+                parts.append(f'{one}={("on" if x else "off") if isinstance(x, bool) else x}')
+        if 'keep' in t:
+            parts.append(f'keep={want(f"{where}.keep", t["keep"], str)}')
+        if 'cache' in t:
+            c = want(f'{where}.cache', t['cache'], str)
+            if c not in caches:
+                fail(f'{where}.cache', f'no cache {c!r} (caches: {", ".join(caches) or "none"})')
+            parts.append('spare_ram_cache=on')
+            if 'floor' in caches[c]:
+                parts.append(f'spare_ram_floor={caches[c]["floor"]}')
+        text = ','.join(parts)
+        if re.search(r'[;\s]', text):
+            fail(where, f'{text!r}: no semicolons or spaces')
+        try:
+            kv_stores({'KV_STORE': text})
+        except OptionError as e:
+            fail(where, str(e))
+        out.append(text)
+    return ';'.join(out)
+
+
 def kv_stores(o):
     """KV_STORE parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size',
     'persist', 'keep'}] ([] when unset or off; keep None = KV_KEEP). Raises OptionError naming the bad store."""
@@ -561,7 +692,7 @@ def kv_stores(o):
         if not m or (store.startswith('remote:auto') and m.group(2)):
             raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
         t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
-             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None, 'ram': False}
+             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None, 'spare_ram_cache': False}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
         else:
@@ -582,21 +713,21 @@ def kv_stores(o):
                 t['cap'] = x
             elif k == 'weight' and re.fullmatch(r'\d+', x) and 1 <= int(x) <= 1000000:
                 t['weight'] = int(x)
-            elif k == 'ram' and x in ('on', 'off'):
-                t['ram'] = x == 'on'
-            elif k == 'ram_floor' and re.fullmatch(r'\d+(\.\d+)?[MG]', x) and float(x[:-1]) > 0:
-                t['ram_floor'] = x
+            elif k == 'spare_ram_cache' and x in ('on', 'off'):
+                t['spare_ram_cache'] = x == 'on'
+            elif k == 'spare_ram_floor' and re.fullmatch(r'\d+(\.\d+)?[MG]', x) and float(x[:-1]) > 0:
+                t['spare_ram_floor'] = x
             elif k == 'keep':
                 if x not in ('system', 'sessions', 'all'):
                     raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
                 t['keep'] = x
             else:
                 raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off, keep=RULE, '
-                                  'ram=on|off, ram_floor=N(M|G), or group=NAME[,cap=N(M|G|T)][,weight=N] on remote:')
+                                  'spare_ram_cache=on|off, spare_ram_floor=N(M|G), or group=NAME[,cap=N(M|G|T)][,weight=N] on remote:')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
-        if t['ram'] and t.get('group'):
-            raise OptionError(f'--kv-store {text}: ram=on needs a fixed lease (no group=)')
+        if t['spare_ram_cache'] and t.get('group'):
+            raise OptionError(f'--kv-store {text}: spare_ram_cache=on needs a fixed lease (no group=)')
         out.append(t)
     return out
 
