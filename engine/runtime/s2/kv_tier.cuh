@@ -175,6 +175,12 @@ public:
                      (unsigned long long)x.wblocks, x.wblocks * pb_.slot_bytes() / 1e6, x.wms, (unsigned long long)x.rblocks,
                      x.rblocks * pb_.slot_bytes() / 1e6, x.rms, (unsigned long long)x.calls);
             out += b;
+            uint64_t ram[3];
+            if (g6kv_tier_ram_stats(t_[t], ram) == 0) {
+                snprintf(b, sizeof b, ", RAM %llu hits %llu misses %llu skipped", (unsigned long long)ram[0], (unsigned long long)ram[1],
+                         (unsigned long long)ram[2]);
+                out += b;
+            }
         }
         return out;
     }
@@ -278,6 +284,8 @@ struct TierSpec {
     int keep = 0;       // --kv-tier only: 0 evicted, 1 shared, 2 all
     std::string rule;   // --kv-store keep=: system, sessions or all; empty = --kv-keep
     bool persist = false;
+    bool ram = false;                   // ram=on: a RAM cache in front of the store (kvman-rs src/ram.rs)
+    uint64_t ram_floor = 2ull << 30;    // ram_floor=: cache only while MemAvailable stays above it
     std::string group;
     uint64_t cap = 0;
     uint32_t weight = 0;
@@ -310,6 +318,11 @@ struct TierSpec {
                 const long w = strtol(x.c_str(), &end, 10);
                 if (x.empty() || *end || w < 1 || w > 1000000) throw std::runtime_error("--kv-store " + v + ": weight=N, 1000 = 1x");
                 t.weight = uint32_t(w);
+            } else if (k == "ram") {
+                if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": ram=on or off");
+                t.ram = x == "on";
+            } else if (k == "ram_floor") {
+                t.ram_floor = bytes();
             } else if (k == "persist") {
                 if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": persist=on or off");
                 t.persist = x == "on";
@@ -330,6 +343,7 @@ struct TierSpec {
         if (!t.bytes) throw std::runtime_error("--kv-store " + v + ": size=N(G|T) is needed");
         if (t.persist && !ssd) throw std::runtime_error("--kv-store " + v + ": persist=on is for ssd: stores");
         if (!t.group.empty() && !remote) throw std::runtime_error("--kv-store " + v + ": group= is for remote: stores");
+        if (t.ram && !t.group.empty()) throw std::runtime_error("--kv-store " + v + ": ram=on needs a fixed lease (no group=)");
         if (t.group.empty() && (t.cap || t.weight)) throw std::runtime_error("--kv-store " + v + ": cap= and weight= need group=");
         if (t.cap && t.cap < t.bytes) throw std::runtime_error("--kv-store " + v + ": cap= is below size=");
         return t;

@@ -89,7 +89,8 @@ KEYS = {
                                   'separated by ; (or --kv-store given again). STORE: ssd:PATH (a folder on each box\'s own SSD), '
                                   'remote:HOST:PORT or remote:auto (a KV node on another machine; auto = the one the mentat '
                                   'group announces). Sizes per rank. An SSD store starts empty at every boot; '
-                                  ',persist=on keeps it across restarts'),
+                                  ',persist=on keeps it across restarts. ,ram=on caches a store\'s blocks in memory the '
+                                  'kernel may take back, while MemAvailable is above ,ram_floor=N(M|G) (default 2G)'),
     'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
@@ -560,7 +561,7 @@ def kv_stores(o):
         if not m or (store.startswith('remote:auto') and m.group(2)):
             raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
         t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
-             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None}
+             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None, 'ram': False}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
         else:
@@ -581,15 +582,21 @@ def kv_stores(o):
                 t['cap'] = x
             elif k == 'weight' and re.fullmatch(r'\d+', x) and 1 <= int(x) <= 1000000:
                 t['weight'] = int(x)
+            elif k == 'ram' and x in ('on', 'off'):
+                t['ram'] = x == 'on'
+            elif k == 'ram_floor' and re.fullmatch(r'\d+(\.\d+)?[MG]', x) and float(x[:-1]) > 0:
+                t['ram_floor'] = x
             elif k == 'keep':
                 if x not in ('system', 'sessions', 'all'):
                     raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
                 t['keep'] = x
             else:
                 raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off, keep=RULE, '
-                                  'or group=NAME[,cap=N(M|G|T)][,weight=N] on remote:')
+                                  'ram=on|off, ram_floor=N(M|G), or group=NAME[,cap=N(M|G|T)][,weight=N] on remote:')
         if not t['size']:
             raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
+        if t['ram'] and t.get('group'):
+            raise OptionError(f'--kv-store {text}: ram=on needs a fixed lease (no group=)')
         out.append(t)
     return out
 

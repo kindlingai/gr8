@@ -484,6 +484,10 @@ class KvStoreTests(unittest.TestCase):
         o, p = self.plan('--kv-store', a + ',persist=on,keep=system', '--kv-store', b + ',keep=all')
         self.assertEqual(self.stores(p), [a + ',persist=on,keep=system', b + ',keep=all'])
         self.assertEqual([x['keep'] for x in opt.kv_stores(o)], ['system', 'all'])
+        # ram=on reaches the engine as written
+        o, p = self.plan('--kv-store', b + ',ram=on,ram_floor=3G')
+        self.assertEqual(self.stores(p), [b + ',ram=on,ram_floor=3G'])
+        self.assertTrue(opt.kv_stores(o)[0]['ram'])
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
@@ -512,6 +516,8 @@ class KvStoreTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=most'], 'keep=system, sessions or all'),
                            (['--kv-store', 'remote:192.0.2.5:7350,size=8G,persist=on'], 'for ssd:'),
                            (['--kv-store', 'ssd:/x,size=8G,persist=yes'], 'persist=on|off'),
+                           (['--kv-store', 'ssd:/x,size=8G,ram=yes'], 'ram=on|off'),
+                           (['--kv-store', 'remote:192.0.2.5:7350,size=8G,group=g,ram=on'], 'fixed lease'),
                            (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-system-after', '0'], 'from 1'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),

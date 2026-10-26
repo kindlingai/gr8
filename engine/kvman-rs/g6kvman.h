@@ -181,8 +181,9 @@ size_t g6kv_tier_coldest(g6kv_pool* p, uint32_t t, uint64_t per_seg, uint64_t* o
 void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 
 // A block store for those copies (src/blocks.rs): "ssd:PATH", "remote:HOST:PORT" (a lease named `name` on a KV node,
-// kvman-remote) or "mem:". Blocks are block_bytes rounded up to 4 KiB (g6kv_tier_block_bytes), and every read and
-// write moves one whole block. Calls return 0, or -1 with the reason in g6kv_tier_error (this thread's last).
+// kvman-remote) or "mem:", any of them behind "ram:FLOOR+" (a RAM cache the kernel may take back, src/ram.rs).
+// Blocks are block_bytes rounded up to 4 KiB (g6kv_tier_block_bytes), and every read and write moves one whole block.
+// Calls return 0, or -1 with the reason in g6kv_tier_error (this thread's last).
 struct g6kv_tier;
 int g6kv_tier_open(const char* spec, const char* name, uint64_t block_bytes, uint64_t blocks, g6kv_tier** out);
 void g6kv_tier_free(g6kv_tier* t);
@@ -196,6 +197,9 @@ int g6kv_tier_write_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, v
 int g6kv_tier_read_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, void* const* bufs);
 // staging memory a KV node's RDMA device may read and write directly (a no-op for the other stores)
 int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
+// a RAM cache's counters ("ram:FLOOR+STORE"): out[0] reads from RAM, out[1] reads that went to the store, out[2]
+// writes not cached for lack of free memory. 0, or -1 for a store without a RAM cache.
+int g6kv_tier_ram_stats(const g6kv_tier* t, uint64_t* out);
 // Remote attention rows (src/rows.rs, the engine's G6_RT_STORE tier): a store of `bytes` ("mem:" or "remote:HOST:PORT",
 // a lease named `name`), and a helper thread that serves each group's request ring. Its first G6KV_ROWS_HEADER bytes
 // hold the layout the records were written under: open writes `layout` into an empty store and refuses a store that

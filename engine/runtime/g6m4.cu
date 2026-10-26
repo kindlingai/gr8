@@ -56,6 +56,9 @@
 //                     all: every run the pool evicts (benchmarks). A store's keep=system|sessions|all overrides it for
 //                     that store: ssd:...,keep=system then remote:...,keep=all puts system prefixes on the SSD and
 //                     evicted runs on the KV node
+//                     A store's ram=on puts a RAM cache in front of it (kvman-rs src/ram.rs): blocks are copied into
+//                     memory the kernel may take back (MADV_FREE) while MemAvailable is above ram_floor=N(M|G) (default
+//                     2G), and a read whose copy the kernel took goes to the store
 //      [--kv-write-limit F]  the stores write at most F page blocks per page of KV the engine computes (off by default)
 //      [--kv-tier STORE,size=N[,keep=evicted|shared|all]] [--kv-shared-after N]  deprecated: --kv-store, with --kv-keep
 //                     all when any keep is evicted or all, else system; --kv-system-after N
@@ -1786,6 +1789,7 @@ int main(int argc, char** argv)
                         spec = "ssd:" + dir + "/blocks";
                         if (t.persist && !set_id.empty()) index = dir;
                     }
+                    if (t.ram) spec = "ram:" + std::to_string(t.ram_floor) + "+" + spec;
                     // group=: a lease that shares its node with other clusters (s2/kv_share.h); it starts at size=
                     const uint64_t slots = t.group.empty() ? kvt->add(spec, name + "-t" + std::to_string(i), t.bytes)
                                                            : kvt->add_group(spec, name + "-t" + std::to_string(i), t.group, (uint32_t)g6nr::NR,

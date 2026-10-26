@@ -52,6 +52,62 @@ pub fn is_root() -> bool {
     unsafe { geteuid() == 0 }
 }
 
+#[cfg(target_os = "linux")]
+const MAP_NORESERVE: c_int = 0x4000;
+#[cfg(not(target_os = "linux"))]
+const MAP_NORESERVE: c_int = 0x40;
+#[cfg(target_os = "linux")]
+const MADV_FREE: c_int = 8;
+#[cfg(not(target_os = "linux"))]
+const MADV_FREE: c_int = 5;
+#[cfg(target_os = "linux")]
+const SC_PAGESIZE: c_int = 30;
+#[cfg(not(target_os = "linux"))]
+const SC_PAGESIZE: c_int = 29;
+
+extern "C" {
+    fn sysconf(name: c_int) -> std::ffi::c_long;
+}
+
+pub fn page_size() -> usize {
+    unsafe { sysconf(SC_PAGESIZE) as usize }
+}
+
+/// `len` bytes of private anonymous memory with no swap reserved for them: pages are backed as they are written.
+pub fn map_noreserve(len: usize) -> io::Result<*mut u8> {
+    let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_RW, MAP_PRIVATE_ANON | MAP_NORESERVE, -1, 0) };
+    if p as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(p as *mut u8)
+}
+
+/// # Safety
+/// `p` and `len` must be a whole mapping from map_noreserve that nothing uses any more.
+pub unsafe fn unmap(p: *mut u8, len: usize) {
+    munmap(p as *mut c_void, len);
+}
+
+/// MADV_FREE: the kernel may drop the pages when it needs the memory, and a dropped page reads as zeros. A write
+/// before then keeps the page.
+///
+/// # Safety
+/// `p` must be page-aligned and `len` bytes of a private anonymous mapping.
+pub unsafe fn free_lazily(p: *mut u8, len: usize) -> io::Result<()> {
+    if madvise(p as *mut c_void, len, MADV_FREE) != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// MADV_DONTNEED: drops the pages now (tests stand in for the kernel's reclaim with it).
+///
+/// # Safety
+/// As free_lazily.
+pub unsafe fn drop_now(p: *mut u8, len: usize) {
+    madvise(p as *mut c_void, len, MADV_DONTNEED);
+}
+
 /// MemAvailable from /proc/meminfo, in bytes.
 pub fn mem_available() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
