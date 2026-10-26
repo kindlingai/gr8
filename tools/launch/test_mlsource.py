@@ -213,6 +213,39 @@ class ModelLoaderTests(unittest.TestCase):
         ms, v, err = S.resolve_model(self.opts('--model-loader-model', '..'), log=self.logs.append)
         self.assertIn("MODEL_LOADER_MODEL '..'", err)
 
+    def test_the_catalog_name_comes_from_the_catalog(self):
+        """The catalog names the release anything; gr8 finds it by the repo, so nobody sets MODEL_LOADER_MODEL."""
+        self.ml.catalog = {'glm-5.3-exlr8': {'main': (self.rel, T.C1)}, 'other': {'main': (self.rel, T.C2)}}
+        self.ml.repos = {'glm-5.3-exlr8': T.RELEASE.upper(), 'other': 'fakeorg/other'}   # HF repo ids: any case
+        o, ms, v = self.resolve()
+        self.assertEqual(ms.release.model, 'glm-5.3-exlr8')
+        self.assertEqual(ms.release.dir, os.path.join(self.store, 'models', 'glm-5.3-exlr8', 'main'))
+        self.assertEqual(ms.release.id, f'{T.RELEASE}@{T.C1}')
+
+    def test_two_entries_for_the_repo(self):
+        self.ml.catalog = {'a': {'v0.4': (self.rel, T.C2)}, 'b': {'main': (self.rel, T.C1)}}
+        self.ml.repos = {'a': T.RELEASE, 'b': T.RELEASE}
+        o = self.opts()
+        ms, v, err = S.resolve_model(o, log=self.logs.append)
+        self.assertIn('names https://huggingface.co/fakeorg/glm-exlr8 as a, b', err)
+        o.values['MODEL'] = URL + '@v0.4'                                # the revision tells them apart
+        ms, v, err = S.resolve_model(o, log=self.logs.append)
+        self.assertEqual((err, ms.release.model, ms.release.revision), ('', 'a', 'v0.4'))
+
+    def test_a_repo_the_catalog_lacks(self):
+        self.ml.repos = {NAME: 'fakeorg/something-else'}
+        ms, v, err = S.resolve_model(self.opts(), log=self.logs.append)
+        self.assertIn("catalog has no entry for https://huggingface.co/fakeorg/glm-exlr8", err)
+        self.assertIn('MODEL_LOADER_MODEL', err)
+        o, ms, v = self.resolve('--model-loader-model', NAME)             # the name, given, still works
+        self.assertEqual(ms.release.model, NAME)
+
+    def test_a_model_loader_without_the_catalog_endpoint(self):
+        self.ml.no_catalog = True
+        o, ms, v = self.resolve()
+        self.assertEqual(ms.release.model, NAME)                          # the repo's name, as before
+        self.assertTrue(any('lists no catalog' in m for m in self.logs), self.logs)
+
     def test_an_unknown_catalog_name_is_named(self):
         o = self.opts('--model-loader-model', 'nope')
         ms, v, err = S.resolve_model(o, log=self.logs.append)
@@ -336,6 +369,14 @@ class RealModelLoaderTests(unittest.TestCase):
                        'model-loader', '--g6-home', home, '--dflash', '0'], {})
         opt.validate(o)
         logs = []
+        # GET /catalog lists the entry (an http source here, so the name is looked up from the repo only for
+        # huggingface ones: the repo's name, NAME, is the catalog's)
+        cat = mlsource.Client(f'unix:{sock}').catalog()
+        self.assertEqual([(m['name'], m['source']['type']) for m in cat or []], [(NAME, 'http')], cat)
+        ms, v, err = S.resolve_model(o, log=logs.append)
+        self.assertNotEqual(err, '')                                    # no huggingface entry for the repo
+        self.assertIn('catalog has no entry for', err)
+        o.values['MODEL_LOADER_MODEL'] = NAME
         ms, v, err = S.resolve_model(o, log=logs.append)
         self.assertEqual(err, '', logs)
         ms.release.fetch_rank(4, 1, v)

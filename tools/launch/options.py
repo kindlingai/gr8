@@ -48,8 +48,8 @@ KEYS = {
     'MODEL_LOADER': ('box', None, "FETCH=model-loader: the local model-loader's request API, unix:PATH or host:port "
                                   '(default unix:<MODEL_CACHE>/model-loader.sock). host:port needs '
                                   'MODEL_LOADER_LOCAL_TOKEN in the environment'),
-    'MODEL_LOADER_MODEL': ('box', None, "FETCH=model-loader: the release's name in model-loader's catalog (default the "
-                                        "repo's name, after the org)"),
+    'MODEL_LOADER_MODEL': ('box', None, "FETCH=model-loader: the release's name in model-loader's catalog, when the "
+                                        "catalog cannot be asked (default: the entry whose source is MODEL's repo)"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),

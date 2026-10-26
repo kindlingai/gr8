@@ -31,12 +31,15 @@ def glob_match(pattern, path):
 
 
 class FakeModelLoader:
-    def __init__(self, store, catalog, segment=64 << 10, slow=False, token=None, legacy_state=False):
-        """catalog: {name: {revision: (release dir, commit)}}. token: answer 401 without Authorization: Bearer ***
-        legacy_state: write segments_done only, as a model-loader from before `held` did; else `held` runs only, as
-        a file of small segments has."""
+    def __init__(self, store, catalog, segment=64 << 10, slow=False, token=None, legacy_state=False, repos=None,
+                 no_catalog=False):
+        """catalog: {name: {revision: (release dir, commit)}}. repos: {name: Hugging Face repo} of the entries'
+        sources (default fakeorg/<name>), which GET /catalog lists. no_catalog: answer GET /catalog 404, as a
+        model-loader from before it. token: answer 401 without Authorization: Bearer ***. legacy_state: write
+        segments_done only, as a model-loader from before `held` did; else `held` runs only, as a file of small
+        segments has."""
         self.store, self.catalog, self.segment, self.slow, self.token = store, catalog, segment, slow, token
-        self.legacy_state = legacy_state
+        self.legacy_state, self.repos, self.no_catalog = legacy_state, dict(repos or {}), no_catalog
         self.copied, self.requests, self.puts, self.lock = 0, {}, [], threading.Lock()
         self.waits = {}
         os.makedirs(store, exist_ok=True)
@@ -78,6 +81,11 @@ class FakeModelLoader:
             def do_GET(self):
                 if self.unauthorized():
                     return
+                if self.path == '/catalog' and not fake.no_catalog:
+                    return self.reply(200, {'models': [
+                        {'name': n, 'revision': r,
+                         'source': {'type': 'huggingface', 'repo': fake.repos.get(n, f'fakeorg/{n}')}}
+                        for n, revs in fake.catalog.items() for r in revs]})
                 m = re.fullmatch(r'/requests/([^?]+)(\?wait=.*)?', self.path)
                 if self.path == '/requests':
                     return self.reply(200, list(fake.requests.values()))

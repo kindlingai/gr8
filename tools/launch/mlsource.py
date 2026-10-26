@@ -110,6 +110,15 @@ class Client:
             raise modelset.ModelError(f'model-loader: request {name}: HTTP {code}: {text[:500]}')
         return st
 
+    def catalog(self):
+        """The catalog's models (GET /catalog: name, revision, source), or None from a model-loader without it."""
+        code, out, text = self.call('GET', '/catalog')
+        if code == 404:
+            return None
+        if code != 200 or not isinstance(out, dict) or not isinstance(out.get('models'), list):
+            raise modelset.ModelError(f'model-loader at {self.addr}: GET /catalog: HTTP {code}: {text[:500]}')
+        return [m for m in out['models'] if isinstance(m, dict)]
+
     def wait(self, name, seconds):
         code, st, text = self.call('GET', f'/requests/{urllib.parse.quote(name)}?wait={int(seconds)}s',
                                    timeout=seconds + 30)
@@ -422,13 +431,46 @@ class Release:
                                       f'{", ".join(bad[:3])}')
 
 
+def catalog_name(client, repo, rev, key, log=print):
+    """The name model-loader's catalog gives the Hugging Face repo, looked up in GET /catalog, so no box has to be told
+    it. rev: the revision the URL names, or '' for none. Several entries for the repo (different revisions) are told
+    apart by rev; with none named they must all have one name. A model-loader without GET /catalog: the repo's name
+    after the org, as before it."""
+    models = client.catalog()
+    if models is None:
+        name = repo.split('/')[-1]
+        log(f'model-loader at {client.addr} lists no catalog (GET /catalog): taking {repo} to be {name!r} in it; '
+            f'{key} names it otherwise')
+        return name
+    want = repo.lower()
+    hits = [m for m in models if (m.get('source') or {}).get('type') == 'huggingface'
+            and str((m.get('source') or {}).get('repo') or '').lower() == want and isinstance(m.get('name'), str)]
+    if rev and any(m.get('revision') == rev for m in hits):
+        hits = [m for m in hits if m.get('revision') == rev]
+    names = sorted({m['name'] for m in hits})
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        listed = ', '.join(sorted(str((m.get('source') or {}).get('repo') or m.get('name')) for m in models)) or 'nothing'
+        raise modelset.ModelError(f'model-loader\'s catalog has no entry for https://huggingface.co/{repo} (it lists '
+                                  f'{listed}): add one to its catalog.yaml, or set {key} to the catalog name')
+    raise modelset.ModelError(f'model-loader\'s catalog names https://huggingface.co/{repo} as {", ".join(names)}: name '
+                              f'the revision in the URL (@rev), or set {key}')
+
+
+def client_of(o):
+    store = o.get('MODEL_CACHE')
+    addr = o.get('MODEL_LOADER') or f'unix:{os.path.join(store, "model-loader.sock")}'
+    return Client(addr, os.environ.get('MODEL_LOADER_LOCAL_TOKEN') or None)
+
+
 def of(o, repo, rev, log=print):
     """The model-loader Release for --fetch model-loader and --model https://huggingface.co/<repo>[@rev]."""
     store = o.get('MODEL_CACHE')
-    addr = o.get('MODEL_LOADER') or f'unix:{os.path.join(store, "model-loader.sock")}'
-    model = o.get('MODEL_LOADER_MODEL') or repo.split('/')[-1]
     url = o.get('MODEL') or ''
     named = bool(re.search(r'(@|/tree/)[^/]+/?$', url))            # parse_url says main when the URL names none
+    client = client_of(o)
+    model = o.get('MODEL_LOADER_MODEL') or catalog_name(client, repo, rev if named else '', 'MODEL_LOADER_MODEL', log)
     work = os.path.join(os.path.abspath(o.get('G6_HOME')), 'run', 'model-loader')
-    return Release(store, addr, model, repo, rev if named else '', work, f'gr8-{o.get("GR8_MODEL") or "glm53"}',
-                   log=log, layout=o.get('LAYOUT'), token=os.environ.get('MODEL_LOADER_LOCAL_TOKEN') or None)
+    return Release(store, client.addr, model, repo, rev if named else '', work, f'gr8-{o.get("GR8_MODEL") or "glm53"}',
+                   log=log, layout=o.get('LAYOUT'), token=client.token)
