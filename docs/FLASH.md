@@ -11,6 +11,11 @@ TP=3 (a three-box ring, variant k4) or TP=2. The engine is `bin/g6m4_flash`, a b
     ./gr8 glm53f up --model https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 --model-cache DIR --tp 4 ...
     ./gr8 glm53f smoke
 
+With the box's model-loader fetching the weights (README, "With model-loader"), give its store and the release's
+catalog name instead: `--fetch model-loader --model-cache /var/lib/model-loader --model-loader-model NAME`, or in Docker
+add `-f docker/model-loader.yaml`. Its catalog needs an entry for the Flash release, with the width files in small
+segments as for GLM-5.3. GLM-5.3 and Flash then share one store and its disk budget.
+
 `./gr8 glm53f` takes the options of `./gr8 glm53` (KNOBS.md). Each box fetches its rank's part of the release and loads
 it through the same release planner as GLM-5.3 (`engine/loader-rs`): `release::plan` reads the model from the release's
 own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-rs/src/flash.rs`. The width manifests are
