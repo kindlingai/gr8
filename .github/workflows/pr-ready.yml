@@ -102,9 +102,36 @@ jobs:
                 if (run) await refinalize(run);
               }
             };
-            // /ready: approve the PR's run if it waits for approval, else re-run Finalize
+            // A run GitHub refused to start ("Actor is not allowed to trigger Actions workflows", which a PR's author can
+            // get) has no jobs and cannot be re-run. A same-repo branch gets a dispatched run instead, whose Finalize
+            // counts for the PR; a fork's branch cannot be dispatched, so the bot says so.
+            const restart = async (p, run) => {
+              if (p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
+                const since = Date.now() - 5000;
+                try {
+                  await starter.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: "ci.yml", ref: p.head.ref });
+                  for (let i = 0; i < 9; i++) {
+                    await sleep(10000);
+                    const d = (await prRuns(p, ["workflow_dispatch"])).find(r => Date.parse(r.created_at) >= since);
+                    if (d && d.conclusion === "startup_failure") break;
+                    if (d) {
+                      await say(`CI for ${p.head.sha.slice(0, 7)} failed to start, so the bot dispatched it: ${d.html_url}. ` +
+                        `The PR's checks do not list this run.`);
+                      return;
+                    }
+                  }
+                } catch (e) {
+                  core.info(`workflow_dispatch failed: ${e.message}`);
+                }
+              }
+              await say(`CI for ${p.head.sha.slice(0, 7)} failed to start (${run.html_url}) and the bot could not start ` +
+                `it: push again, or run ci.yml on the branch from the Actions tab.`);
+            };
+            // /ready: approve the PR's run if it waits for approval, start it again if GitHub refused it, else re-run
+            // Finalize
             const kick = async p => {
               const run = (await prRuns(p))[0];
+              if (run && run.conclusion === "startup_failure") return restart(p, run);
               if (!run || run.conclusion !== "action_required") return finalizeAgain(p);
               try {
                 await starter.rest.actions.approveWorkflowRun({ owner, repo, run_id: run.id });

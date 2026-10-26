@@ -453,6 +453,8 @@ jobs:
     # every job above succeeded or skipped, and a PR's run carries queue:ready (/ready), read live. A job skips by design
     # (the tester zip on a PR, whatever the changes job left out) or because a job it needs failed, which fails here
     # too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished run.
+    # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
+    # but a run with no jobs besides changes can reach this step before that removal.
     if: always()
     needs: [changes, cpu, cpu-macos, rust, engine, zip, image]
     runs-on: ubuntu-24.04
@@ -460,6 +462,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      issues: read
+      checks: read
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
         env:
@@ -474,6 +478,8 @@ jobs:
             // The PR: this run's, or for a run dispatched on a PR's branch the open PR whose head is this commit, whose
             // checks this run's count for. A push to main or a tag has none.
             let pr = context.eventName === "pull_request" ? context.payload.pull_request.number : null;
+            // a pull_request run's context.sha is the merge commit
+            const head = context.eventName === "pull_request" ? context.payload.pull_request.head.sha : context.sha;
             if (context.eventName === "workflow_dispatch") {
               const prs = (await github.rest.repos.listPullRequestsAssociatedWithCommit(
                 { ...context.repo, commit_sha: context.sha })).data;
@@ -484,6 +490,17 @@ jobs:
               const labels = (await github.rest.issues.listLabelsOnIssue(
                 { ...context.repo, issue_number: pr, per_page: 100 })).data.map(l => l.name);
               if (!labels.includes("queue:ready")) bad.push(`#${pr} is not marked ready (/ready)`);
+              else {
+                // when the label was last added, and when GitHub first saw the head (its earliest check suite)
+                const events = await github.paginate(github.rest.issues.listEvents,
+                  { ...context.repo, issue_number: pr, per_page: 100 });
+                const added = events.filter(e => e.event === "labeled" && e.label && e.label.name === "queue:ready")
+                  .map(e => Date.parse(e.created_at));
+                const suites = (await github.rest.checks.listSuitesForRef(
+                  { ...context.repo, ref: head, per_page: 100 })).data.check_suites.map(s => Date.parse(s.created_at));
+                if (!added.length || !suites.length || Math.max(...added) <= Math.min(...suites))
+                  bad.push(`#${pr} was marked ready before ${head.slice(0, 7)} was pushed (/ready again)`);
+              }
             }
             const rows = Object.entries(needs).map(([name, j]) => [name, j.result]);
             await core.summary.addTable([[{ data: "job", header: true }, { data: "result", header: true }], ...rows])
