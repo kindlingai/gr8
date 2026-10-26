@@ -1,0 +1,176 @@
+# gr8 on Kubernetes: one LeaderWorkerSet group of TP pods, one per box, one rank in each. Every pod runs the image's
+# entrypoint with no command, which is `./gr8 glm53 up` in the foreground, so a pod lives as long as its box's part of
+# the cluster. docker/compose.yaml is the same container for docker.
+#
+# The boxes find each other through the mentat daemon on each box (no PEERS), and every pod has the same options: TP is
+# the group's size, and the head (rank 0, which serves the API) is the leader pod, wherever the scheduler put it. LWS
+# puts LWS_GROUP_SIZE and LWS_LEADER_ADDRESS (the leader pod's DNS name) first in every container's env, so the env
+# below can use them. The leader's name resolves to its box's address: the pod is on the host network.
+{{- $claims := dict }}
+{{- range $name, $v := .Values.storage }}
+{{- if not $v.hostPath }}{{ $_ := set $claims $name $v }}{{ end }}
+{{- end }}
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: gr8
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicas }}
+  # The default startupPolicy (LeaderCreated) starts the workers with the leader: the leader cannot be ready before
+  # they join, so LeaderReady would never start them.
+  leaderWorkerTemplate:
+    size: {{ .Values.size }}
+    # When a rank fails, the supervisors stop every box and boot again together, so a pod that restarts takes its
+    # group with it.
+    restartPolicy: RecreateGroupOnPodRestart
+    {{- if $claims }}
+    volumeClaimTemplates:
+      {{- range $name, $v := $claims }}
+      - metadata:
+          name: {{ $name }}
+        spec:
+          {{- with $v.storageClass }}
+          storageClassName: {{ . }}
+          {{- end }}
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: {{ $v.size }}
+      {{- end }}
+    {{- with .Values.persistentVolumeClaimRetentionPolicy }}
+    persistentVolumeClaimRetentionPolicy:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- end }}
+    workerTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: gr8
+          app.kubernetes.io/instance: {{ .Release.Name }}
+          {{- with .Values.podLabels }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+        annotations:
+          # A change of options rolls the group onto pods that read them.
+          checksum/options: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+          {{- with .Values.podAnnotations }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+      spec:
+        # The RoCE fabric and the front end need the box's real interfaces. The supervisors' control port, the S2
+        # control port and the API are host ports.
+        hostNetwork: true
+        # The launcher refuses to start next to another g6m4 on the box, and sees one started outside the pod only in
+        # the host's process list.
+        hostPID: true
+        # The cluster's DNS on the host network: HEAD is the leader pod's name in it.
+        dnsPolicy: ClusterFirstWithHostNet
+        securityContext:
+          # The image's uid 1000 owns the volumes, where the storage supports it. OnRootMismatch: not a walk over the
+          # whole cache at every start.
+          fsGroup: 1000
+          fsGroupChangePolicy: OnRootMismatch
+          seccompProfile:
+            type: RuntimeDefault
+        {{- with .Values.imagePullSecrets }}
+        imagePullSecrets:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.runtimeClassName }}
+        runtimeClassName: {{ . }}
+        {{- end }}
+        {{- with .Values.priorityClassName }}
+        priorityClassName: {{ . }}
+        {{- end }}
+        {{- with .Values.nodeSelector }}
+        nodeSelector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.affinity }}
+        affinity:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.tolerations }}
+        tolerations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        containers:
+          - name: gr8
+            image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+            {{- with .Values.image.pullPolicy }}
+            imagePullPolicy: {{ . }}
+            {{- end }}
+            envFrom:
+              - configMapRef:
+                  name: {{ .Release.Name }}
+              {{- with .Values.extraEnvFrom }}
+              {{- toYaml . | nindent 14 }}
+              {{- end }}
+            # Set here, the same on every pod, and over any ConfigMap line of the same name.
+            env:
+              - name: TP
+                value: $(LWS_GROUP_SIZE)
+              - name: HEAD
+                value: $(LWS_LEADER_ADDRESS)
+              # The container's own paths, so an option meant for a bare-metal box cannot point the launcher elsewhere.
+              - name: G6_HOME
+                value: /var/lib/gr8/home
+              - name: MODEL_CACHE
+                value: /var/lib/gr8/cache
+              - name: PY
+                value: /usr/bin/python3
+              - name: FRONT_BIN
+                value: /opt/gr8/bin/g6front-rs
+            ports:
+              - name: api
+                containerPort: {{ int (.Values.options.PORT | default 8100) }}
+              - name: control
+                containerPort: {{ int (.Values.options.CONTROL_PORT | default 7340) }}
+              - name: s2
+                containerPort: {{ int (.Values.options.S2PORT | default 7341) }}
+            startupProbe:
+              exec:
+                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "${GR8_MODEL:-glm53}" health']
+              {{- toYaml .Values.startupProbe | nindent 14 }}
+            readinessProbe:
+              exec:
+                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "${GR8_MODEL:-glm53}" health']
+              {{- toYaml .Values.readinessProbe | nindent 14 }}
+            # The engine runs with no more rights than it needs: the image's uid 1000, no capabilities but IPC_LOCK
+            # (pinned memory), no privilege escalation, a read-only image with a private /tmp. The entrypoint sets no
+            # core dumps and raises the soft memlock limit itself; the runtime's hard limit must be unlimited.
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: [ALL]
+                add: [IPC_LOCK]
+            resources:
+              {{- toYaml .Values.resources | nindent 14 }}
+            volumeMounts:
+              - name: cache
+                mountPath: /var/lib/gr8/cache
+              - name: home
+                mountPath: /var/lib/gr8/home
+              - name: shm
+                mountPath: /dev/shm
+              - name: tmp
+                mountPath: /tmp
+        volumes:
+          {{- range $name, $v := .Values.storage }}
+          {{- with $v.hostPath }}
+          - name: {{ $name }}
+            hostPath:
+              path: {{ . }}
+              type: Directory
+          {{- end }}
+          {{- end }}
+          - name: shm
+            emptyDir:
+              medium: Memory
+          - name: tmp
+            emptyDir:
+              sizeLimit: 1Gi

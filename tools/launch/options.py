@@ -33,7 +33,7 @@ KEYS = {
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
     'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
-    'HEAD': ('cluster', None, 'mentat mode: the head LAN address, instead of the lowest one'),
+    'HEAD': ('cluster', None, 'mentat mode: the head LAN address, or a name that resolves to it, instead of the lowest one'),
     'IPS': ('cluster', None, 'rail-0 fabric address of every rank (skips fabric discovery)'),
     'IPS2': ('cluster', None, 'rail-1 fabric address of every rank'),
     'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
