@@ -2,6 +2,10 @@
 """Build the tester zip: one commit's source tree plus the prebuilt arm64 binaries, with a MANIFEST.txt of sha256s.
 
     scripts/make_zip.py --bin DIR [--ref HEAD] [--out DIR] [--allow-missing]
+    scripts/make_zip.py --check [--ref HEAD]
+
+--check reads the tree and stops before the binaries: it fails where a build would fail on the source tree, and
+writes nothing. CI runs it on every PR, where the binaries are not built.
 
 DIR is the `dist` export of the Dockerfile (docker buildx build --target dist -o type=local,dest=DIR .): DIR/bin holds
 the engine (every TP width) and the front end. The source files come from
@@ -63,11 +67,14 @@ def git(*args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--bin', required=True, help='the dist export: DIR/bin')
+    ap.add_argument('--bin', help='the dist export: DIR/bin')
     ap.add_argument('--ref', default='HEAD')
     ap.add_argument('--out', default='.')
     ap.add_argument('--allow-missing', action='store_true', help='leave out missing binaries instead of failing')
+    ap.add_argument('--check', action='store_true', help='check the tree only: no binaries, no zip')
     a = ap.parse_args()
+    if not a.check and not a.bin:
+        ap.error('--bin is required without --check')
 
     commit = git('rev-parse', '--verify', a.ref + '^{commit}').decode().strip()
     short = git('rev-parse', '--short', commit).decode().strip()
@@ -92,6 +99,9 @@ def main():
         files[m.name] = (tar.extractfile(m).read(), 0o755 if m.mode & 0o111 else 0o644)
     if unknown:
         sys.exit('top-level entries in neither SHIP nor SKIP (scripts/make_zip.py): ' + ', '.join(sorted(unknown)))
+    if a.check:
+        print(f'{short}: {len(files)} source files, every top-level entry shipped or skipped')
+        return
 
     missing = []
     for path in BINARIES:
