@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The supervisor's control port, a head that fails before its checks finish, the engine's environment and build id.
     python3 -m unittest discover -s tools/launch"""
+import fcntl
 import http.server
 import io
 import json
@@ -527,9 +528,18 @@ class HealthTests(unittest.TestCase):
         os.makedirs(self.out)
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
 
+    def fake_supervisor(self):
+        """A process whose command line is a supervisor's (`launch.py supervise`), as health() checks in /proc."""
+        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',
+                              os.path.join(self.home, 'launch.py'), 'supervise'])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        return p.pid
+
     def write(self, state, rank, pid=None, supervisor=True):
-        """gr8.state as set_state writes it, and supervisor.pid as run() does; this test process plays the supervisor."""
-        pid = os.getpid() if pid is None else pid
+        """gr8.state as set_state writes it, and supervisor.pid as run() does."""
+        if pid is None:
+            pid = self.sup = getattr(self, 'sup', None) or self.fake_supervisor()
         with open(os.path.join(self.out, 'gr8.state'), 'w') as f:
             json.dump({'state': state, 'rank': rank, 'pid': pid, 'time': time.time()}, f)
         if supervisor:
@@ -540,6 +550,9 @@ class HealthTests(unittest.TestCase):
         """A front end whose /health answers `code`; returns its port."""
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
+                if code is None:                       # an answer that is not HTTP
+                    self.wfile.write(b'garbage\r\n\r\n')
+                    return
                 self.send_response(code if self.path == '/health' else 404)
                 self.end_headers()
 
@@ -568,7 +581,7 @@ class HealthTests(unittest.TestCase):
     def test_a_worker_that_serves_is_ready(self):
         self.write('serving', 2)
         rc, line = self.run_health('--port', str(free_port()))     # a worker does not ask any API
-        self.assertEqual((rc, line), (0, f'rank 2: serving, supervisor pid {os.getpid()}\n'))
+        self.assertEqual((rc, line), (0, f'rank 2: serving, supervisor pid {self.sup}\n'))
 
     def test_the_head_serves_only_while_its_api_answers(self):
         self.write('serving', 0)
@@ -603,10 +616,40 @@ class HealthTests(unittest.TestCase):
         rc, line = self.run_health()
         self.assertEqual(rc, 1, line)
         self.assertIn('no supervisor runs (last state serving)', line)
-        self.write('serving', 1, pid=os.getpid() + 10 ** 6, supervisor=False)
+        other = self.fake_supervisor()
+        self.write('serving', 1, pid=other, supervisor=False)
         with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
-            f.write(f'{os.getpid()}\n')                               # another supervisor than the one that wrote it
+            f.write(f'{self.fake_supervisor()}\n')                 # another supervisor than the one that wrote it
         self.assertEqual(self.run_health()[0], 1)
+
+    def test_a_live_pid_that_is_not_a_supervisor_is_not_ready(self):
+        self.write('serving', 1, pid=os.getpid())                     # pid reuse: the number now runs something else
+        rc, line = self.run_health()
+        self.assertEqual(rc, 1, line)
+        self.assertIn('no supervisor runs', line)
+
+    def test_a_clock_step_after_the_boot_does_not_make_it_unready(self):
+        self.write('serving', 1)
+        p = os.path.join(self.out, 'supervisor.pid')
+        os.utime(p, (time.time() - 3600,) * 2)    # NTP stepped back an hour: the file looks older than the process
+        self.assertEqual(self.run_health()[0], 0)
+
+    def test_an_http_proxy_in_the_environment_is_not_used(self):
+        """As docker runs it: a new process, with an HTTP_PROXY (docker's daemon proxies) that answers nothing."""
+        self.write('serving', 0)
+        env = {**os.environ, 'http_proxy': 'http://127.0.0.1:9', 'HTTP_PROXY': 'http://127.0.0.1:9', 'no_proxy': '',
+               'NO_PROXY': ''}
+        r = subprocess.run([sys.executable, self.L.HERE, 'health', '--no-config', '--g6-home', self.home, '--port',
+                            str(self.api(200))], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_an_answer_that_is_not_http_or_a_bad_port_is_one_line_not_a_traceback(self):
+        self.write('serving', 0)
+        rc, line = self.run_health('--port', str(self.api(None)))
+        self.assertEqual((rc, line.count('\n')), (1, 1), line)
+        self.assertIn('failed: ', line)
+        rc, line = self.run_health('--port', 'eighty')
+        self.assertEqual((rc, line.count('\n')), (1, 1), line)
 
     def test_no_state_is_not_ready(self):
         rc, line = self.run_health()
@@ -619,9 +662,13 @@ class HealthTests(unittest.TestCase):
 
     def test_it_takes_no_supervisor_lock(self):
         self.write('serving', 1)
-        with mock.patch.object(self.L, 'supervisor_running', side_effect=AssertionError('took the lock')):
-            self.assertEqual(self.run_health()[0], 0)
-
+        with open(os.path.join(self.out, 'supervisor.lock'), 'w') as lk:   # the supervisor holds it while it runs
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(fcntl, 'flock', side_effect=AssertionError('took the lock')):
+                self.assertEqual(self.run_health()[0], 0)
+        os.unlink(os.path.join(self.out, 'supervisor.lock'))
+        self.assertEqual(self.run_health()[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.out, 'supervisor.lock')), 'health created the lock file')
 
 if __name__ == '__main__':
     unittest.main()

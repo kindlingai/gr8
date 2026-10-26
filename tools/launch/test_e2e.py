@@ -182,8 +182,10 @@ class EndToEnd(unittest.TestCase):
             self.assertFalse(running(pid), f'box {i} engine {pid} runs')
         st = self.gr8(0, 'status')
         self.assertIn('no supervisor answers', st.stdout)
-        for i in range(TP):     # down: no box is ready
-            self.assertEqual(self.gr8(i, 'health').returncode, 1, i)
+        for i in range(TP):     # down: no box is ready, and each says why in its one line
+            hl = self.gr8(i, 'health')
+            self.assertEqual(hl.returncode, 1, f'box {i}: {hl.stdout}{hl.stderr}')
+            self.assertRegex(hl.stdout, r'^rank \d: not serving, no supervisor runs \(last state stopped\)\n$')
 
     def request(self):
         from fake_s2_engine import token_at

@@ -21,6 +21,7 @@ OPTIONS are --key value (or KEY=value lines in a config file, or KEY in the envi
 handshake refused the boot.
 """
 import fcntl
+import http.client
 import json
 import os
 import signal
@@ -207,28 +208,51 @@ def cmd_status(argv):
     return 0
 
 
-def health(out, port, timeout=2):
+def is_supervisor(pid, proc='/proc'):
+    """Whether pid runs a gr8 supervisor (`launch.py supervise` or `launch.py up --foreground`), from its command line.
+    A probe cannot use sv.recorded(): its start time against the pid file's mtime moves when NTP steps the clock after
+    boot, and the probe would call a serving box unready for the rest of that boot. Where /proc cannot say (macOS, a
+    hidden process), a live pid is taken as the supervisor."""
+    if not pid or not sv.alive(pid):
+        return False
+    try:
+        with open(os.path.join(proc, str(pid), 'cmdline'), 'rb') as f:
+            argv = [a.decode(errors='replace') for a in f.read().split(b'\0')]
+    except OSError:
+        return not os.path.isdir(os.path.join(proc, 'self'))
+    return any(os.path.basename(a) == 'launch.py' for a in argv) and ('supervise' in argv or '--foreground' in argv)
+
+
+# The probe asks 127.0.0.1 directly: an HTTP_PROXY that docker or a cluster sets in the container must not take it.
+NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def health(out, port, timeout=2, proc='/proc'):
     """(ok, line): whether this box's part of the cluster serves, read from this box alone, so the same command is a
     readiness check on every rank. Serving means out/gr8.state says `serving`, the supervisor that wrote it still runs,
     and on the head (rank 0) the front end's /health answers 200. It takes no lock: a probe must not make a supervisor
-    that starts beside it think another one runs."""
+    that starts beside it think another one runs. Under load the front end can answer /health late: a probe that
+    times out (2 s) calls the head unready while it serves."""
     st = read_state(out)
     state, rank = st.get('state') or 'none', st.get('rank')
     who = f'rank {rank}' if rank is not None else 'this box'
-    pid = sv.recorded(os.path.join(out, 'supervisor.pid'))
-    if not pid or pid != st.get('pid'):
+    pid = sv.read_pid(os.path.join(out, 'supervisor.pid'))
+    if not pid or pid != st.get('pid') or not is_supervisor(pid, proc):
         return False, f'{who}: not serving, no supervisor runs (last state {state})'
     if state != 'serving':
         return False, f'{who}: {state}, supervisor pid {pid}'
     if rank != 0:
         return True, f'{who}: serving, supervisor pid {pid}'
     try:
-        with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=timeout) as r:
+        with NO_PROXY.open(f'http://127.0.0.1:{port}/health', timeout=timeout) as r:
             code = r.status
     except OSError as e:
         code = getattr(e, 'code', 0)
         if hasattr(e, 'close'):
             e.close()
+    except (http.client.HTTPException, ValueError) as e:     # a bad answer, or a PORT that makes no URL
+        return False, f'{who}: serving, supervisor pid {pid}, but the API /health on port {port} failed: ' \
+            f'{type(e).__name__}: {e}'.splitlines()[0]
     if code != 200:
         return False, f'{who}: serving, supervisor pid {pid}, but the API /health ' + \
             (f'answers {code}' if code else f'on port {port} answers nothing')
@@ -240,7 +264,7 @@ def cmd_health(argv):
     try:
         o = opt.parse(argv)
     except opt.OptionError as e:
-        print(f'gr8: {e}')
+        print(f'gr8: {e}')    # stdout, not stderr: docker keeps a healthcheck's stdout in `docker inspect`
         return 1
     out = out_dir(o)
     # the head's API port as the boot agreed it (the handshake), so a probe without the boot's options still finds it
