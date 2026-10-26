@@ -74,7 +74,7 @@ class DrafterTests(unittest.TestCase):
 
     def boot(self, *argv, peers=PEERS4):
         o = opt.parse(['--no-config', '--peers', peers, '--model', self.rel, '--fetch', 'model-loader',
-                       '--model-cache', self.store, '--g6-home', self.home, '--drafter', DRAFTER, *argv], {})
+                       '--model-cache', self.store, '--g6-home', self.home, '--drafter', DRAFTER, *argv], T.GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -163,7 +163,7 @@ class DrafterTests(unittest.TestCase):
     def test_missing_drafter_files_are_named(self):
         os.unlink(os.path.join(self.src, 'model.safetensors'))
         o = opt.parse(['--no-config', '--peers', PEERS4, '--model', self.rel, '--fetch', 'model-loader',
-                       '--model-cache', self.store, '--g6-home', self.home, '--drafter', DRAFTER], {})
+                       '--model-cache', self.store, '--g6-home', self.home, '--drafter', DRAFTER], T.GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertIn('the drafter fakeorg/drafter@', err)
@@ -228,7 +228,7 @@ class SteeringTests(unittest.TestCase):
     def opts(self, selector='hf:default', *extra):
         o = opt.parse(['--no-config', '--peers', PEERS4, '--model', f'https://huggingface.co/{T.RELEASE}',
                        '--model-cache', self.store, '--fetch', 'model-loader', '--g6-home', self.home,
-                       '--variant', 'home', '--dflash', '0', '--steering-profile', selector, *extra], {})
+                       '--variant', 'home', '--dflash', '0', '--steering-profile', selector, *extra], T.GLM)
         opt.validate(o)
         return o
 
@@ -283,7 +283,7 @@ class SteeringTests(unittest.TestCase):
     def test_no_steering_files_without_a_selection(self):
         o = opt.parse(['--no-config', '--peers', PEERS4, '--model', f'https://huggingface.co/{T.RELEASE}',
                        '--model-cache', self.store, '--fetch', 'model-loader', '--g6-home', self.home,
-                       '--dflash', '0'], {})
+                       '--dflash', '0'], T.GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=lambda _: None)
         self.assertEqual((err, ms.release.steering_profile), ('', None))
