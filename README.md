@@ -95,15 +95,15 @@ from Hugging Face once, or from a NAS that holds the master copy, and the boxes 
 LAN. Each box runs model-loader next to gr8, from model-loader's `deploy/compose` or `deploy/spark-os`, with the
 release (and the drafter) in its `catalog.yaml`. Then on every box:
 
-    cp docker/.env.example docker/.env        # MODEL, PEERS and DRAFTER as above, and MODEL_LOADER_MODEL: the
-                                              # release's name in the catalog (glm-5.3-exlr8 in model-loader's example)
+    cp docker/.env.example docker/.env        # MODEL, PEERS and DRAFTER as above
     docker compose -f docker/compose.yaml -f docker/model-loader.yaml pull
     docker compose -f docker/compose.yaml -f docker/model-loader.yaml up -d
 
 `docker/model-loader.yaml` mounts model-loader's store read-only (`MODEL_LOADER_STORE`, default
 `/var/lib/model-loader`), sets `FETCH=model-loader`, and starts gr8 once model-loader answers. gr8 asks model-loader
 for the pieces its rank needs, waits until they are held, checks every expert half's xxhash64, and reads the weights
-in place. No `prepare` is needed: model-loader keeps the pieces between boots. Bare metal takes the same options:
+in place. gr8 finds the release and the drafter in model-loader's catalog by their repos, whatever the catalog
+calls them. No `prepare` is needed: model-loader keeps the pieces between boots. Bare metal takes the same options:
 `--fetch model-loader --model-cache /var/lib/model-loader` (KNOBS.md). Give the catalog's width files small segments
 (model-loader's `deploy/compose/catalog.yaml` does), or each box holds every width file whole.
 

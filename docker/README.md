@@ -58,10 +58,9 @@ Give both `-f` files to every compose command (`pull`, `exec`, `logs`). The over
 model-loader runs from its own deploy tree: `deploy/compose` as a container, or `deploy/spark-os` as a systemd unit on
 kindling-spark-os. Either runs in group 1000, gr8's, so gr8 can open the socket (mode 0660). With `deploy/compose`,
 set its `MODEL_LOADER_STORE` to the same host directory as here, because its default is a named volume. Its catalog
-names the release and, for `DRAFTER`, the drafter. gr8 takes each catalog name to be the repo's name after the org
-(`glm-5.3-exlr8-k2-k3-k4`, `GLM-5.3-DFlash2`); set `MODEL_LOADER_MODEL` or `MODEL_LOADER_DRAFTER_MODEL` in
-`docker/.env` when the catalog names them otherwise. model-loader's example catalog names the release
-`glm-5.3-exlr8`, so with it set `MODEL_LOADER_MODEL=glm-5.3-exlr8`.
+lists the release and, for `DRAFTER`, the drafter, with their Hugging Face repos as sources. gr8 asks model-loader for
+the entries whose repos are `MODEL`'s and `DRAFTER`'s, so the catalog may name them anything and nothing in
+`docker/.env` repeats the names.
 
 The `cache` volume is not used then. A `run --rm gr8 prepare` asks model-loader for this box's pieces and waits until
 it holds them, without booting.
