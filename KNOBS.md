@@ -156,7 +156,7 @@ A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `do
 | `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3 (glm53f: 4 or 2); needed with mentat |
 | `FLASH_CACHE` | `--flash-cache` | `off` | cluster | glm53f, experimental: `terminal` = `aligned` plus a checkpoint at the end of every request, **NOT cold-exact** (docs/FLASH.md). `aligned` = session checkpoints, so a prompt that starts with an earlier prompt's tokens is prefilled from that prompt's last 8,192-row grid point, bit-exact (`G6_FLASH_CACHE`, [docs/FLASH.md](docs/FLASH.md)). The store is the one `KV_STORE` (no `persist=on`), else memory. On glm53f, `KV_STORE` needs it. The prefill checkpoint is taken at the boundary after the quantum that reaches the grid point, once that boundary's events have committed, so a store Resize that lands there comes first |
 | `FLASH_STATE_BUDGET_MIB` | `--flash-state-budget-mib` | 8192 | cluster | `FLASH_CACHE` with no `KV_STORE`: the in-memory checkpoint store a rank, in MiB (`G6_FLASH_STATE_BUDGET_MIB`) |
-| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch): each box's f0 port cabled to the next box's f1 port, in `--peers` order. Needs `--peers`, takes no `--ips` |
+| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch). With `--peers`, each box's f0 port is cabled to the next box's f1 port, in `--peers` order. With mentat (mentatd 0.24.0 or later on every box), the boxes claim a ring from mentat, which solves it once over the cables its probes find, on any cabling. They take the rank order and their `--ring-devs` from that one view, and refuse the boot, naming the pair, when the links form no ring. `--head` and the model set's offers turn the ring. Takes no `--ips` |
 | `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
 | `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
 | `GROUP` | `--group` | `gr8-<model>` | cluster | the mentat group the boxes join |
@@ -173,7 +173,7 @@ A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `do
 | `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the release directory has none |
 | `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `run/` |
 | `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
-| `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
+| `RING_DEVS` | `--ring-devs` | from mentat's probes, or the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev. With mentat, the devices behind its addresses toward the next and previous ranks (`/sys/class/infiniband`); with `--peers`, `rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`. An explicit list wins |
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
 | `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |

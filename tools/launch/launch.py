@@ -354,6 +354,8 @@ def cmd_show_config(argv):
     print('\ncluster options (the handshake compares these):')
     sys.stdout.write(''.join(f'  {line}\n' for line in text.splitlines()))
     print(f'digest    {digest}')
+    if o.get('SHAPE') == 'ring' and opt.mode(o) == 'mentat':
+        print('          (with --shape ring, each box adds ring=<the ring it found> when it joins, so the boot digest differs)')
     if err:
         print(f'model set none: {err}')
     else:
