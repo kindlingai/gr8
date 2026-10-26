@@ -159,6 +159,9 @@ spec:
                 mountPath: /dev/shm
               - name: tmp
                 mountPath: /tmp
+              {{- with .Values.extraVolumeMounts }}
+              {{- toYaml . | nindent 14 }}
+              {{- end }}
         volumes:
           {{- range $name, $v := .Values.storage }}
           {{- with $v.hostPath }}
@@ -174,3 +177,6 @@ spec:
           - name: tmp
             emptyDir:
               sizeLimit: 1Gi
+          {{- with .Values.extraVolumes }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}

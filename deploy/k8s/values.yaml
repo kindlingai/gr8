@@ -40,6 +40,11 @@ storage:
     storageClass: ""
     size: 10Gi
     hostPath: ""
+# More volumes and their mounts in the gr8 container, such as a local copy of the release for a MODEL path, kept on
+# each box by another tool: [{name: release, hostPath: {path: /srv/models/<release>, type: Directory}}] and
+# [{name: release, mountPath: /models/release, readOnly: true}].
+extraVolumes: []
+extraVolumeMounts: []
 # The claims are kept when the LeaderWorkerSet is deleted: delete them by hand to free the disk.
 persistentVolumeClaimRetentionPolicy:
   whenDeleted: Retain
