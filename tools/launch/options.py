@@ -28,7 +28,8 @@ KEYS = {
     'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2)'),
     'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: with --peers, each box's "
                                  "f0 port cabled to the f1 port of the next box in --peers order, the last to the "
-                                 "first; with mentat, the order and the devices follow the probed cables)"),
+                                 "first; with mentat, the order and the devices follow the cables mentat's ring "
+                                 "claim finds)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
     'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
@@ -45,7 +46,7 @@ KEYS = {
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
     'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default: from "
-                               "mentat's probes, or with --peers rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)"),
+                               "mentat's ring claim, or with --peers rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)"),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
@@ -707,7 +708,7 @@ def file_sha256(path):
 def canonical(o, plan, members, variant=None, ring=''):
     """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None.
     variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count. ring: --shape ring
-    with mentat, the ring this box derived from the probes (mentat.ring_text), so every box must have found the same."""
+    with mentat, the ring this box planned from mentat's claim (mentat.ring_text), so every box must have the same."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
     if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
         c['model'] = models.of(o).name

@@ -65,9 +65,10 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
   At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and at TP=4
   the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned per
   rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited. With mentat
-  (`--mentat localhost --tp 3 --shape ring`), the cabling can be any ring: the boxes take their rank order and their
-  RDMA devices from the links mentat's probes find, so a scheduler such as a Kubernetes LeaderWorkerSet can place them
-  in any order. Tag both addresses of each ConnectX port `rdma` in mentat (`MENTAT_ANNOUNCE_IFACES`).
+  (`--mentat localhost --tp 3 --shape ring`, mentatd 0.24.0 or later on every box), the cabling can be any ring: the
+  boxes claim a ring from mentat and take their rank order and RDMA devices from its one answer, so a scheduler such as
+  a Kubernetes LeaderWorkerSet can place them in any order. Tag both addresses of each ConnectX port `rdma` in mentat
+  (`MENTAT_ANNOUNCE_IFACES`).
 - A LAN between the boxes with TCP ports 7340 and 7341 open. The boxes need no ssh between them: the head engine
   passes each request to the other ranks over its control links.
 - Disk per box: about 90 GB at TP=4 (its experts, the 11 GB of dense and vocab files, the drafter) and about 85 GB at

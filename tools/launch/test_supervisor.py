@@ -16,7 +16,7 @@ import handshake as H  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as S  # noqa: E402
 from test_handshake import hello  # noqa: E402
-from test_mentat import FakeDaemon, cabled, flipped, ring  # noqa: E402
+from test_mentat import FakeDaemon, flipped, ring, solved  # noqa: E402
 import mentat as M  # noqa: E402
 
 MEMBERS = ['192.0.2.1', '192.0.2.2', '192.0.2.3', '192.0.2.4']    # TEST-NET: never this box's address
@@ -49,12 +49,12 @@ class RingTests(unittest.TestCase):
 
 
 class MentatRingTests(unittest.TestCase):
-    """--shape ring with mentat: every box publishes its probed links, and all of them derive one ring and their
-    --ring-devs from it, whatever the cabling."""
+    """--shape ring with mentat: every box claims the ring, gets the one view the head solved, and derives the same
+    ring and its own --ring-devs from it, whatever the cabling."""
 
     def boot(self, n, cables, broken=(), extra=()):
-        snaps, roots, addr = cabled(n, cables, broken)
-        agents, lock = {}, threading.Lock()
+        view, ids, roots, addr = solved(n, cables, broken=broken)
+        agents, lock, holders = {}, threading.Lock(), {}
 
         def group(_):
             with lock:
@@ -68,8 +68,19 @@ class MentatRingTests(unittest.TestCase):
                                              'alive': True, 'machine': h['machine'], 'meta': h['meta'], 'link': link}
                 elif agents[h['agent_id']]['link'] is link:
                     agents[h['agent_id']]['alive'] = False
-        daemons = [FakeDaemon(group=group, local=lambda i=i: snaps[i], on_link=on_link) for i in range(n)]
-        # the devices: port p of box i at root k is dev{p}r{k}
+
+        def claim(h, link):
+            # the head: a claim solves once, and every later holder gets that view
+            with lock:
+                if h['shape']['sets'][0]['layout'] == 'any':
+                    return {'t': 'claim_ok', 'view': {'sets': {'ring': []}, 'links': view['links']}}
+                if broken:
+                    return {'t': 'err', 'code': 'unsolvable_claim', 'error': 'set "ring" wants a ring of 3 nodes'}
+                holders.setdefault(h['name'], []).append(link)
+                return {'t': 'claim_ok', 'name': h['name'], 'generation': 1, 'head_node_id': 'n1', 'view': view}
+        daemons = [FakeDaemon(group=group, local=lambda i=i: {'node_ip': f'10.0.0.{i + 1}', 'addr_tags': {}},
+                              on_link=on_link, claim=claim) for i in range(n)]
+        # the devices: port p of box i at root k is f{p}r{k}
         devs = [{a: (f'f{k[1]}r{k[2]}', k[2]) for k, a in addr.items() if k[0] == i} for i in range(n)]
         sups, res = [], [None] * n
         elect = M.elect
@@ -77,7 +88,7 @@ class MentatRingTests(unittest.TestCase):
             with mock.patch.object(S, 'log'), \
                     mock.patch.object(S.fabric, 'ring_ports', lambda: devs[int(threading.current_thread().name)]), \
                     mock.patch.object(S.mentat, 'elect', lambda *a, **k: elect(*a, **{**k, 'hold_s': 0.2,
-                                                                                    'ring_settle': 1.0, 'ring_stable': 0.5})):
+                                                                                    'ring_settle': 1.0})):
                 for i in range(n):
                     o = opt.parse(['--no-config', '--mentat', f'127.0.0.1:{daemons[i].port}', '--tp', str(n),
                                    '--shape', 'ring', '--g6-home', tempfile.mkdtemp(), '--join-timeout', '30',
@@ -97,6 +108,10 @@ class MentatRingTests(unittest.TestCase):
                     t.start()
                 for t in ts:
                     t.join(60)
+                self.holding = [s.claim_link.sock is not None for s in sups]
+                for s in sups:
+                    s.release_claim()
+                self.released = [s.claim_link.sock is None for s in sups]
         finally:
             for s in sups:
                 if s.agent:
@@ -111,8 +126,11 @@ class MentatRingTests(unittest.TestCase):
                 with self.subTest(n=n, cables=cables):
                     sups, res = self.boot(n, cables)
                     self.assertEqual(res, ['ok'] * n)
+                    self.assertEqual(self.holding, [True] * n)      # each box holds the claim until the handshake
+                    self.assertEqual(self.released, [True] * n)
                     self.assertEqual(len({tuple(s.members) for s in sups}), 1)
                     self.assertEqual(len({s.ring for s in sups}), 1)     # the handshake compares it
+                    self.assertIn(f' claim=gr8-glm53-ring{n}@n1:1', sups[0].ring)
                     self.assertEqual(sups[0].members[0], '10.0.0.1')
                     by_rank = sorted(sups, key=lambda s: s.rank)
                     for s in by_rank:
@@ -144,6 +162,22 @@ class MentatRingTests(unittest.TestCase):
         # --peers: the engine's default devices, as before
         self.assertEqual(supervisor('--shape', 'ring').ring_args(), ['--ring'])
         self.assertEqual(supervisor().ring_args(), [])
+
+    def test_the_handshake_lets_the_claim_go_whatever_its_verdict(self):
+        for verdict in ({'t': 'ok'}, RuntimeError('head gone')):
+            for rank in (0, 1):
+                with self.subTest(verdict=verdict, rank=rank):
+                    s = supervisor('--shape', 'ring', rank=rank)
+                    s.claim_link = mock.Mock()
+                    which = 'handshake_head' if rank == 0 else 'handshake_worker'
+                    effect = {'side_effect': verdict} if isinstance(verdict, Exception) else {'return_value': verdict}
+                    with mock.patch.object(s, which, **effect):
+                        if isinstance(verdict, Exception):
+                            with self.assertRaises(RuntimeError):
+                                s.handshake({})
+                        else:
+                            self.assertEqual(s.handshake({}), verdict)
+                    s.claim_link.close.assert_called_once_with()
 
     def test_a_broken_cable_stops_every_box(self):
         sups, res = self.boot(3, ring([0, 1, 2]), broken={2})

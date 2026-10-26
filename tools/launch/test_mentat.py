@@ -36,10 +36,11 @@ class FakeDaemon:
     """Control port: hello/status (client link) and agent_register/ping (agent link). HTTP on port + 1: /status.
     By default every answer is self.snap. A test of several daemons passes group(group) for the status answer,
     local() for /status, and gets on_link(header, alive, link) for each registration and its link's end; like mentat,
-    a link's end matters only while that link holds the registration."""
+    a link's end matters only while that link holds the registration. claim(header, link) answers a claim."""
 
-    def __init__(self, snap=None, group=None, local=None, on_link=None, host='127.0.0.1'):
-        self.snap, self.registrations, self.links = snap, [], 0
+    def __init__(self, snap=None, group=None, local=None, on_link=None, host='127.0.0.1', claim=None):
+        self.snap, self.registrations, self.links, self.claims = snap, [], 0, []
+        self.claim_fn, self.hellos = None, []
         fake = self
         group = group or (lambda g: fake.snap)
         local = local or (lambda: fake.snap)
@@ -52,9 +53,15 @@ class FakeDaemon:
                         h = M.read_frame(s)
                         t = h.get('t')
                         if t == 'hello':
+                            fake.hellos.append(h.get('client_id'))
                             s.sendall(M.frame({'t': 'hello_ok', 'req': h['req'], 'proto': '0.99'}))
                         elif t == 'status':
                             s.sendall(M.frame({'t': 'status_ok', 'req': h['req'], 'snapshot': group(h.get('group'))}))
+                        elif t == 'claim':
+                            fake.claims.append(h)
+                            fn = claim or fake.claim_fn
+                            reply = fn(h, self) if fn else {'t': 'err', 'code': 'not_head', 'error': 'no'}
+                            s.sendall(M.frame({**reply, 'req': h['req']}))
                         elif t == 'agent_register':
                             fake.registrations.append(h)
                             fake.links += 1
@@ -148,46 +155,52 @@ class MembershipTests(unittest.TestCase):
         self.assertFalse(M.major_ok('2.0') or M.major_ok('x') or M.major_ok('1'))
 
 
-def cabled(n, cables, broken=()):
-    """Local /status snapshots of n switchless boxes. Box i's LAN address is 10.0.0.<i+1>. cables: [(box, port, box,
-    port)] with port 0 (f0) or 1 (f1). Each port shows two RoCE addresses, one per PCIe root, and the two ends of a
-    cable share a /24 per root: root 0 on 10.<10+c>.0.x, root 1 on 10.<20+c>.0.x for cable c. A probe is bound to its
-    address, so it reaches only the far end of its own cable on its own root (mentat's PROTOCOL.md, "Probes").
-    broken: cable indices that answer no probe. Returns (snaps, roots): snaps[i] is box i's local status, roots[i]
-    its {address: root}, as fabric.ring_ports gives them."""
-    addr = {}      # (box, port, root) -> address
+def cabled(n, cables, broken=(), skip=()):
+    """What mentat knows of n switchless boxes. Box i's LAN address is 10.0.0.<i+1> and its node id n<i+1>. cables:
+    [(box, port, box, port)] with port 0 (f0) or 1 (f1). Each port has two RoCE addresses, one per PCIe root, and the
+    two ends of a cable share a /24 per root: root 0 on 10.<10+c>.0.x, root 1 on 10.<20+c>.0.x for cable c, so a bound
+    probe reaches only the far end of its own cable on its own root. broken: cables that answer no probe. skip:
+    addresses whose probes are not in. Returns (links, roots, addr): the view's links[set] as mentat lists them, each
+    box's {address: root} (gr8.roots), and {(box, port, root): address}."""
+    addr = {}
     for c, (a, pa, b, pb) in enumerate(cables):
         for root in (0, 1):
             net = 10 + c if root == 0 else 20 + c
             addr[(a, pa, root)] = f'10.{net}.0.{a + 1}'
             addr[(b, pb, root)] = f'10.{net}.0.{b + 1}'
-    snaps, roots = [], []
-    for i in range(n):
-        mine = {a: k[2] for k, a in addr.items() if k[0] == i}
-        tags = {f'10.0.0.{i + 1}': ['lan'], **{a: ['connectx', 'rdma'] for a in mine}}
-        peers = {}
-        for j in range(n):
-            if j == i:
+    links = []
+    for c, (a, pa, b, pb) in enumerate(cables):
+        if c in broken:
+            continue
+        for root in (0, 1):
+            x, y = addr[(a, pa, root)], addr[(b, pb, root)]
+            if x in skip or y in skip:
                 continue
-            theirs = {a for k, a in addr.items() if k[0] == j}
-            probes = {}
-            for x in mine:
-                row = {}
-                for y in theirs:
-                    if x.rsplit('.', 1)[0] != y.rsplit('.', 1)[0]:
-                        continue             # a bound probe stays in its own subnet
-                    cable = int(x.split('.')[1]) % 10
-                    row[y] = {'ok': cable not in broken, 'rtt_ms': 0, 'direct': True if cable not in broken else None}
-                if row:
-                    probes[x] = row
-            peers[f'n{j + 1}'] = {'node_ip': f'10.0.0.{j + 1}', 'probes': probes}
-        snaps.append({'node_id': f'n{i + 1}', 'node_ip': f'10.0.0.{i + 1}', 'addr_tags': tags, 'peers': peers})
-        roots.append(mine)
-    return snaps, roots, addr
+            ends = sorted([(f'n{a + 1}', x), (f'n{b + 1}', y)])
+            links.append({'a': {'node': ends[0][0], 'addr': ends[0][1], 'port': ends[0][1], 'iface': None},
+                          'b': {'node': ends[1][0], 'addr': ends[1][1], 'port': ends[1][1], 'iface': None},
+                          'rtt_ms': 0})
+    roots = [{a: k[2] for k, a in addr.items() if k[0] == i} for i in range(n)]
+    return links, roots, addr
 
 
-def ring_meta(snaps, roots):
-    return {s['node_ip']: M.own_links(s, r) for s, r in zip(snaps, roots)}
+def solved(n, cables, broken=(), skip=(), cycle=None):
+    """A claim_ok view of a ring over the cables, as mentat gives it: its members from the lowest node id along the
+    cables (cycle overrides), and links[set]. Returns (view, ids, roots, addr) with ids and roots keyed by LAN."""
+    links, roots, addr = cabled(n, cables, broken, skip)
+    if cycle is None:
+        nxt = {}
+        for a, _, b, _ in cables:
+            nxt.setdefault(a, []).append(b)
+            nxt.setdefault(b, []).append(a)
+        cycle, prev = [0], None
+        while len(cycle) < n:
+            step = min(x for x in nxt[cycle[-1]] if x != prev and x not in cycle)
+            prev = cycle[-1]
+            cycle.append(step)
+    view = {'sets': {'ring': [{'node': f'n{i + 1}'} for i in cycle]}, 'links': {'ring': links}, 'paths': {'ring': {}}}
+    lan = [f'10.0.0.{i + 1}' for i in range(n)]
+    return view, {lan[i]: f'n{i + 1}' for i in range(n)}, {lan[i]: roots[i] for i in range(n)}, addr
 
 
 def ring(order):
@@ -212,44 +225,19 @@ class RingPlanTests(unittest.TestCase):
             self.assertEqual((where[dn][0], where[ndp][0]), (me, nxt))
             self.assertEqual(dn.rsplit('.', 1)[0], ndp.rsplit('.', 1)[0], f'rank {r}: next is not on its cable')
             self.assertNotEqual(where[dn][1], where[dp][1], f'rank {r}: next and prev on one port')
+            # the direct writes take root 1, as the GB10 default --ring-devs does
+            self.assertEqual(where[dn][2], 1)
             if tp == 4:
                 self.assertEqual(ro.rsplit('.', 1)[0], nri.rsplit('.', 1)[0], f'rank {r}: relay is not on its cable')
-                self.assertNotEqual(ro, dn)
-                self.assertEqual(where[ro][1], where[dn][1], f'rank {r}: relay-out on another port than next')
-                self.assertEqual(where[ri][1], where[dp][1], f'rank {r}: relay-in on another port than prev')
-                # the direct writes take root 1 and the relay root 0, as the GB10 default --ring-devs does
-                self.assertEqual((where[dn][2], where[ro][2]), (1, 0))
+                self.assertEqual(where[ro][1:], (where[dn][1], 0), f'rank {r}: relay-out not root 0 of next\'s port')
+                self.assertEqual(where[ri][1:], (where[dp][1], 0), f'rank {r}: relay-in not root 0 of prev\'s port')
+            else:
+                self.assertEqual((ro, ri), (dn, dp))      # TP=3 opens no relay: the fields repeat the direct pair
 
-    def plan(self, n, cables, offers=None, head=None, broken=()):
-        snaps, roots, addr = cabled(n, cables, broken)
-        meta = ring_meta(snaps, roots)
-        order, ports = M.ring_plan(meta, n, offers or dict.fromkeys(meta), head)
+    def plan(self, n, cables, offers=None, head=None, **kw):
+        view, ids, roots, addr = solved(n, cables, **kw)
+        order, ports = M.ring_plan(view, ids, roots, n, offers or dict.fromkeys(ids), head)
         return order, ports, addr
-
-    def test_a_partial_probe_table_gives_the_same_tp3_plan(self):
-        """mentat fills its table a round at a time. At TP=3 the relay pair is unused, so a box whose root-0 rows are
-        not in yet derives the same plan (the handshake compares it) as one with the full table."""
-        snaps, roots, addr = cabled(3, ring([0, 2, 1]))
-        full = M.ring_text(*M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in (1, 2, 3))))
-        for s in snaps:
-            for p in s['peers'].values():
-                for x in [x for x in p['probes'] if x.split('.')[1].startswith('1')]:
-                    del p['probes'][x]          # root 0 (10.1x.*) not probed yet
-        order, ports = M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in (1, 2, 3)))
-        self.assertEqual(M.ring_text(order, ports), full)
-        for ro, dn, ri, dp in ports:
-            self.assertEqual((ro, ri), (dn, dp))
-            self.assertTrue(dn.startswith('10.2') and dp.startswith('10.2'))     # root 1
-
-    def test_fewer_boxes_or_a_stranger_head(self):
-        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
-        meta = ring_meta(snaps, roots)
-        with self.assertRaises(M.NoAssignment) as e:
-            M.ring_plan(meta, 4, dict.fromkeys(meta))
-        self.assertIn('links of 3 boxes form no ring of 4', str(e.exception))
-        with self.assertRaises(M.NoAssignment) as e:
-            M.ring_plan(meta, 3, dict.fromkeys(meta), head='10.0.0.9')
-        self.assertIn('--head 10.0.0.9 is not a member', str(e.exception))
 
     def test_three_and_four_box_rings_in_both_directions(self):
         for n, cable_order in ((3, [0, 1, 2]), (3, [0, 2, 1]), (4, [0, 1, 2, 3]), (4, [0, 2, 1, 3]), (4, [0, 3, 1, 2])):
@@ -273,11 +261,13 @@ class RingPlanTests(unittest.TestCase):
         self.assertEqual(order, ['10.0.0.1', '10.0.0.3', '10.0.0.2', '10.0.0.4'])
         self.assertEqual(ports[0], (addr[(0, 1, 0)], addr[(0, 1, 1)], addr[(0, 0, 0)], addr[(0, 0, 1)]))
 
-    def test_every_box_derives_the_same_plan(self):
-        snaps, roots, _ = cabled(4, ring([0, 3, 1, 2]))
-        meta = ring_meta(snaps, roots)
-        plans = {M.ring_text(*M.ring_plan(dict(reversed(list(meta.items()))), 4, dict.fromkeys(meta)))}
-        plans.add(M.ring_text(*M.ring_plan(meta, 4, dict.fromkeys(meta))))
+    def test_the_plan_does_not_depend_on_mentats_rotation_or_direction(self):
+        """mentat starts a ring at its lowest node id, and either way round is its answer: gr8's rule turns it."""
+        n, cables = 4, ring([0, 3, 1, 2])
+        plans = set()
+        for cycle in ([0, 3, 1, 2], [3, 1, 2, 0], [0, 2, 1, 3], [2, 1, 3, 0]):
+            view, ids, roots, _ = solved(n, cables, cycle=cycle)
+            plans.add(M.ring_text(*M.ring_plan(view, ids, roots, n, dict.fromkeys(ids))))
         self.assertEqual(len(plans), 1)
 
     def test_head_and_offers_turn_the_ring(self):
@@ -292,64 +282,82 @@ class RingPlanTests(unittest.TestCase):
                                                      '10.0.0.4': None})
         self.assertIn('no rank order along the ring (10.0.0.1 - 10.0.0.2 - 10.0.0.3 - 10.0.0.4)', str(e.exception))
         self.assertIn('10.0.0.3 1', str(e.exception))
-
-    def test_a_broken_cable_is_refused_naming_the_pair(self):
-        for n, cables in ((4, ring([0, 2, 1, 3])), (3, ring([0, 1, 2]))):
-            with self.subTest(n=n):
-                with self.assertRaises(M.NoAssignment) as e:
-                    self.plan(n, cables, broken={1})
-                a, b = cables[1][0] + 1, cables[1][2] + 1
-                self.assertIn(f'no cable works between 10.0.0.{min(a, b)} and 10.0.0.{max(a, b)}', str(e.exception))
-                self.assertIn('Ports that reach no box: ', str(e.exception))
-                self.assertIn(f'10.11.0.{a} on 10.0.0.{a}', str(e.exception))
-
-    def test_a_port_that_reaches_no_box_and_a_missing_box(self):
-        # box 4 is cabled to nothing: a ring of 3 and an idle box
-        snaps, roots, _ = cabled(4, ring([0, 1, 2]))
         with self.assertRaises(M.NoAssignment) as e:
-            M.ring_plan(ring_meta(snaps, roots), 4, dict.fromkeys(f'10.0.0.{i}' for i in range(1, 5)))
-        self.assertIn('10.0.0.4 reaches no box', str(e.exception))
+            self.plan(3, ring([0, 1, 2]), head='10.0.0.9')
+        self.assertIn('--head 10.0.0.9 is not a member', str(e.exception))
+
+    def test_a_view_of_other_nodes_is_stale(self):
+        view, ids, roots, _ = solved(3, ring([0, 1, 2]))
+        view['sets']['ring'][2]['node'] = 'n9'                # an earlier boot's box still holds the name
+        with self.assertRaises(M.Stale) as e:
+            M.ring_plan(view, ids, roots, 3, dict.fromkeys(ids))
+        self.assertIn("is not the group's 3 members", str(e.exception))
+        with self.assertRaises(M.Stale):                       # a ring of another size
+            M.ring_plan(solved(3, ring([0, 1, 2]))[0], {**ids, '10.0.0.4': 'n4'}, roots, 4, dict.fromkeys(ids))
 
     def test_four_boxes_need_both_roots_on_a_cable(self):
-        snaps, roots, addr = cabled(4, ring([0, 1, 2, 3]))
-        for s, r in zip(snaps, roots):                      # root 0 of every port unaddressed
+        view, ids, roots, addr = solved(4, ring([0, 1, 2, 3]))
+        for r in roots.values():                     # root 0 of every port has no RoCE device
             for a in [a for a, k in r.items() if k == 0]:
                 del r[a]
-        with self.assertRaises(M.NoAssignment) as e:
-            M.ring_plan(ring_meta(snaps, roots), 4, dict.fromkeys(f'10.0.0.{i}' for i in range(1, 5)))
+        with self.assertRaises(M.Incomplete) as e:
+            M.ring_plan(view, ids, roots, 4, dict.fromkeys(ids))
         self.assertIn('link on one port pair only', str(e.exception))
+        # a root-0 probe not yet in: the same, and claim_ring claims again
+        skip = {a for k, a in solved(4, ring([0, 1, 2, 3]))[3].items() if k == (1, 1, 0)}
+        with self.assertRaises(M.Incomplete):
+            self.plan(4, ring([0, 1, 2, 3]), skip=skip)
         # three boxes write their neighbours directly and need no relay pair
-        snaps, roots, addr = cabled(3, ring([0, 1, 2]))
-        for r in roots:
+        view, ids, roots, addr = solved(3, ring([0, 1, 2]))
+        for r in roots.values():
             for a in [a for a, k in r.items() if k == 0]:
                 del r[a]
-        order, ports = M.ring_plan(ring_meta(snaps, roots), 3, dict.fromkeys(f'10.0.0.{i}' for i in range(1, 4)))
+        order, ports = M.ring_plan(view, ids, roots, 3, dict.fromkeys(ids))
         self.assertEqual(order, ['10.0.0.1', '10.0.0.2', '10.0.0.3'])
         self.assertEqual(ports[0], (addr[(0, 0, 1)], addr[(0, 0, 1)], addr[(0, 1, 1)], addr[(0, 1, 1)]))
         self.engine_view(order, ports, addr, 3)
 
-    def test_forwarded_and_failed_probes_are_not_links(self):
-        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
-        for p in snaps[0]['peers'].values():
-            for row in p['probes'].values():
-                for y in row:
-                    row[y]['direct'] = False
-        roots_, links = M.parse_links(M.own_links(snaps[0], roots[0]))
-        self.assertEqual((sorted(roots_), links), (sorted(roots[0]), set()))
-        self.assertEqual(M.parse_links(M.own_links({'peers': {}}, {})), ({}, set()))
-        # an IPv6 far end, a null direct (kept: the MAC is unknown) and an address this box cannot use
-        x = sorted(roots[0])[0]
-        local = {'addr_tags': {x: ['rdma'], '10.99.0.1': ['rdma']}, 'peers': {'n2': {'probes': {
-            x: {'fe80::2': {'ok': True, 'direct': True}, '10.11.0.2': {'ok': True, 'direct': None}},
-            '10.99.0.1': {'10.99.0.2': {'ok': True, 'direct': True}}}}}}
-        self.assertEqual(M.parse_links(M.own_links(local, {x: 0}))[1], {(x, '10.11.0.2')})
+    def test_a_partial_view_gives_the_same_tp3_plan(self):
+        """At TP=3 the relay pair is unused, so a view without the root-0 links plans the same ring."""
+        full = M.ring_text(*self.plan(3, ring([0, 2, 1]))[:2])
+        skip = {a for k, a in solved(3, ring([0, 2, 1]))[3].items() if k[2] == 0}
+        self.assertEqual(M.ring_text(*self.plan(3, ring([0, 2, 1]), skip=skip)[:2]), full)
 
-    def test_meta_fits_mentat(self):
-        snaps, roots, _ = cabled(4, ring([0, 1, 2, 3]))
-        self.assertLess(len(M.own_links(snaps[0], roots[0])), M.META_MAX)
-        big = {f'10.{i}.{j}.1': 0 for i in range(12) for j in range(12)}
-        with self.assertRaises(RuntimeError):
-            M.own_links({'addr_tags': {a: ['rdma'] for a in big}, 'peers': {}}, big)
+    def test_links_off_roce_addresses_do_not_count(self):
+        """A link between addresses with no ACTIVE RoCE v2 device (not in gr8.roots) cannot carry the engine's ring."""
+        view, ids, roots, addr = solved(3, ring([0, 1, 2]))
+        for a in [a for k, a in addr.items() if k[:2] == (0, 0)]:
+            del roots['10.0.0.1'][a]                       # box 1's f0 port is down on both roots
+        with self.assertRaises(M.NoAssignment) as e:
+            M.ring_plan(view, ids, roots, 3, dict.fromkeys(ids))
+        self.assertIn('no link between them joins two RoCE v2 addresses', str(e.exception))
+
+    def test_why_names_the_broken_pair(self):
+        for n, cables in ((4, ring([0, 2, 1, 3])), (3, ring([0, 1, 2]))):
+            with self.subTest(n=n):
+                links, roots, addr = cabled(n, cables, broken={1})
+                ids = {f'10.0.0.{i + 1}': f'n{i + 1}' for i in range(n)}
+                pairs = M.view_pairs({'links': {'ring': links}}, {v: k for k, v in ids.items()})
+                why = M.ring_why(pairs, {f'10.0.0.{i + 1}': roots[i] for i in range(n)}, n, 'set "ring" wants a ring')
+                a, b = cables[1][0] + 1, cables[1][2] + 1
+                self.assertIn(f'no cable works between 10.0.0.{min(a, b)} and 10.0.0.{max(a, b)}', why)
+                self.assertIn('Ports that reach no box: ', why)
+                self.assertIn(f'10.11.0.{a} on 10.0.0.{a}', why)
+                self.assertIn('mentat: set "ring" wants a ring', why)
+        links, roots, _ = cabled(4, ring([0, 1, 2]))           # box 4 is cabled to nothing
+        roots = {f'10.0.0.{i + 1}': r for i, r in enumerate(roots)}
+        why = M.ring_why(M.view_pairs({'links': {'ring': links}}, {f'n{i}': f'10.0.0.{i}' for i in range(1, 5)}),
+                         roots, 4, '')
+        self.assertIn('10.0.0.4 reaches no box', why)
+
+    def test_roots_meta(self):
+        roots = {'10.21.0.1': 1, '10.11.0.1': 0, '10.3.0.1': 0}
+        self.assertEqual(M.format_roots(roots), '10.3.0.1=0,10.11.0.1=0,10.21.0.1=1')
+        self.assertEqual(M.parse_roots(M.format_roots(roots)), roots)
+        self.assertEqual(M.parse_roots(None), {})
+        # 16 RoCE addresses still fit mentat's 1024-byte meta value
+        self.assertLess(len(M.format_roots({f'10.{i}.{j}.100': 1 for i in range(200, 204) for j in range(200, 204)})),
+                        1024)
 
 
 class KvTargetTests(unittest.TestCase):
@@ -413,44 +421,145 @@ class DaemonTests(unittest.TestCase):
             M.elect(self.d, GROUP, 4, sleep=lambda _: None, log=lambda s: None)
         self.assertIn('10.0.0.1 1, 10.0.0.2 1, 10.0.0.3 any, 10.0.0.4 any', str(e.exception))
 
-    def test_a_ring_election_waits_for_links_that_hold(self):
-        rows = {f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in (1, 2, 3)}
-        snaps, roots, _ = cabled(3, ring([0, 2, 1]))
-        meta = ring_meta(snaps, roots)
-        partial = {ip: t.split(';')[0] + ';' for ip, t in meta.items()}   # no links probed yet
-        for i in (1, 2, 3):
-            rows[f'a{i}']['meta'][M.LINKS_META] = partial[f'10.0.0.{i}']
+    def ring_rows(self, n, cables, **kw):
+        view, ids, roots, addr = solved(n, cables, **kw)
+        rows = {f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in range(1, n + 1)}
+        for i in range(1, n + 1):
+            rows[f'a{i}']['meta'][M.ROOTS_META] = M.format_roots(roots[f'10.0.0.{i}'])
         self.fake.snap = snapshot(rows)
-        t, reads = [0.0], []
+        return view, rows
+
+    def ring_elect(self, n, link=None, **kw):
+        t, mine = [0.0], link is None
+        link = link or M.ClaimLink(self.d, GROUP, 'test')
 
         def sleep(s):
             t[0] += s
-            reads.append(t[0])
-            if len(reads) == 3:      # the probes come in
-                for i in (1, 2, 3):
-                    rows[f'a{i}']['meta'][M.LINKS_META] = meta[f'10.0.0.{i}']
-        ranks, _ = M.elect(self.d, GROUP, 3, sleep=sleep, log=lambda s: None, clock=lambda: t[0], ring=lambda: None,
-                           ring_stable=20, ring_settle=45)
+        try:
+            ranks, _ = M.elect(self.d, GROUP, n, sleep=sleep, log=lambda s: None, clock=lambda: t[0], ring=link, **kw)
+        finally:
+            if mine:
+                link.close()
+        return ranks, t[0]
+
+    def test_a_ring_election_claims_until_mentat_finds_the_ring(self):
+        view, rows = self.ring_rows(3, ring([0, 2, 1]))
+        answers = [{'t': 'err', 'code': 'unsolvable_claim', 'error': 'set "ring" wants a ring'}] * 2 + \
+            [{'t': 'claim_ok', 'name': 'x', 'generation': 7, 'head_node_id': 'n2', 'view': view}]
+        self.fake.claim_fn = lambda h, link: answers.pop(0) if len(answers) > 1 else answers[0]
+        link = M.ClaimLink(self.d, GROUP, 'test')
+        ranks, _ = self.ring_elect(3, link)
         self.assertEqual([r[0] for r in ranks], ['10.0.0.1', '10.0.0.2', '10.0.0.3'])
-        self.assertGreaterEqual(t[0] - reads[2], 20)        # the full links held a probe round first
+        self.assertEqual(link.tag, f'{GROUP}-ring3@n2:7')
+        c = self.fake.claims
+        self.assertEqual(len(c), 3)
+        self.assertEqual({h['name'] for h in c}, {f'{GROUP}-ring3'})
+        self.assertEqual(c[0]['shape'], {'sets': [{'name': 'ring', 'bundles': 3, 'link': 'rdma', 'layout': 'ring'}],
+                                         'driver': 'ignore'})
+        self.assertIsNotNone(link.sock)       # the link holds the claim until the supervisor closes it
+        link.close()
 
-    def test_a_ring_election_whose_links_keep_changing_times_out(self):
-        rows = {f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in (1, 2, 3)}
-        snaps, roots, _ = cabled(3, ring([0, 1, 2]))
-        meta = ring_meta(snaps, roots)
-        self.fake.snap = snapshot(rows)
-        t, n = [0.0], [0]
+    def test_a_ring_claims_only_after_two_equal_reads(self):
+        view, rows = self.ring_rows(3, ring([0, 1, 2]))
+        sleeps, at_claim = [0], []
 
-        def flap():
-            n[0] += 1
-            for i in (1, 2, 3):
-                rows[f'a{i}']['meta'][M.LINKS_META] = meta[f'10.0.0.{i}'] if n[0] % 2 else ';'
+        def claim(h, link):
+            at_claim.append(sleeps[0])
+            return {'t': 'claim_ok', 'view': view}
+        self.fake.claim_fn = claim
 
-        def sleep(s):
-            t[0] += s
+        def sleep(_):
+            sleeps[0] += 1
+            if sleeps[0] == 1:       # box 3 republishes its roots: the first read does not count
+                rows['a3']['meta'][M.ROOTS_META] += ',10.99.0.3=0'
+        link = M.ClaimLink(self.d, GROUP, 'test')
+        try:
+            M.elect(self.d, GROUP, 3, sleep=sleep, log=lambda s: None, ring=link)
+        finally:
+            link.close()
+        self.assertEqual(at_claim, [2])
+
+    def test_a_tp4_retry_stops_at_the_join_timeout(self):
+        skip = {a for k, a in solved(4, ring([0, 1, 2, 3]))[3].items() if k == (1, 1, 0)}
+        partial, _ = self.ring_rows(4, ring([0, 1, 2, 3]), skip=skip)
+        self.fake.claim_fn = lambda h, link: {'t': 'claim_ok', 'view': partial}
         with self.assertRaises(RuntimeError) as e:
-            M.elect(self.d, GROUP, 3, timeout=60, sleep=sleep, log=lambda s: None, clock=lambda: t[0], ring=flap)
-        self.assertIn('ring links kept changing', str(e.exception))
+            self.ring_elect(4, timeout=40, ring_retry=15, ring_attempts=100)
+        self.assertIn('timed out: ', str(e.exception))
+        self.assertIn('link on one port pair only', str(e.exception))
+
+    def test_a_ring_mentat_never_finds_is_refused_naming_the_pair(self):
+        links, roots, _ = cabled(3, ring([0, 1, 2]), broken={2})
+        self.ring_rows(3, ring([0, 1, 2]))
+
+        def claim(h, link):
+            if h['shape']['sets'][0]['layout'] == 'any':      # the why: every link between the members
+                return {'t': 'claim_ok', 'view': {'sets': {'ring': []}, 'links': {'ring': links}}}
+            return {'t': 'err', 'code': 'unsolvable_claim', 'error': 'set "ring" wants a ring of 3 nodes'}
+        self.fake.claim_fn = claim
+        with self.assertRaises(M.NoAssignment) as e:
+            self.ring_elect(3, ring_settle=45)
+        self.assertIn('no cable works between 10.0.0.1 and 10.0.0.3', str(e.exception))
+        self.assertIn('mentat: set "ring" wants a ring of 3 nodes', str(e.exception))
+
+    def test_a_tp4_view_without_relay_pairs_claims_a_fresh_name(self):
+        skip = {a for k, a in solved(4, ring([0, 1, 2, 3]))[3].items() if k == (1, 1, 0)}
+        partial, _ = self.ring_rows(4, ring([0, 1, 2, 3]), skip=skip)
+        full, _ = self.ring_rows(4, ring([0, 1, 2, 3]))
+        self.fake.claim_fn = lambda h, link: {'t': 'claim_ok', 'generation': 1, 'head_node_id': 'n1',
+                                              'view': full if h['name'].endswith('-2') else partial}
+        link = M.ClaimLink(self.d, GROUP, 'test')
+        ranks, waited = self.ring_elect(4, link, ring_retry=15)
+        self.assertEqual(len(ranks), 4)
+        self.assertEqual([h['name'] for h in self.fake.claims], [f'{GROUP}-ring4', f'{GROUP}-ring4-1',
+                                                                  f'{GROUP}-ring4-2'])
+        self.assertEqual(link.tag, f'{GROUP}-ring4-2@n1:1')
+        link.close()
+        self.fake.claims.clear()
+        self.fake.claim_fn = lambda h, link: {'t': 'claim_ok', 'view': partial}
+        with self.assertRaises(M.NoAssignment) as e:
+            self.ring_elect(4, ring_attempts=2)
+        self.assertIn('link on one port pair only', str(e.exception))
+        self.assertIn('2 claims', str(e.exception))
+
+    def test_a_stale_view_is_let_go_and_claimed_again(self):
+        view, _ = self.ring_rows(3, ring([0, 1, 2]))
+        stale = json.loads(json.dumps(view))
+        stale['sets']['ring'][0]['node'] = 'old'
+        answers = [stale, stale, view]
+        self.fake.claim_fn = lambda h, link: {'t': 'claim_ok', 'view': answers.pop(0)}
+        ranks, _ = self.ring_elect(3)
+        self.assertEqual(len(ranks), 3)
+        self.assertEqual(self.fake.hellos.count('test'), 3)    # a new link each time: the old one let the claim go
+
+    def test_a_ring_election_waits_for_every_roots_meta_and_refuses_old_mentat(self):
+        view, rows = self.ring_rows(3, ring([0, 1, 2]))
+        del rows['a2']['meta'][M.ROOTS_META]
+        self.fake.claim_fn = lambda h, link: {'t': 'claim_ok', 'view': {'sets': view['sets']}}
+        n = [0]
+
+        def sleep(_):
+            n[0] += 1
+            if n[0] == 3:
+                rows['a2']['meta'][M.ROOTS_META] = M.format_roots({'10.10.0.2': 0})
+        link = M.ClaimLink(self.d, GROUP, 't')
+        with self.assertRaises(M.NoAssignment) as e:
+            M.elect(self.d, GROUP, 3, sleep=sleep, log=lambda s: None, ring=link)
+        link.close()
+        self.assertGreaterEqual(n[0], 3)
+        self.assertEqual(len(self.fake.claims), 1)            # no claim before every box published its roots
+        self.assertIn('needs mentatd 0.24.0 or later', str(e.exception))
+
+    def test_a_refused_claim_stops_and_a_missing_head_times_out(self):
+        self.ring_rows(3, ring([0, 1, 2]))
+        self.fake.claim_fn = lambda h, link: {'t': 'err', 'code': 'shape_conflict', 'error': 'held for another shape'}
+        with self.assertRaises(M.NoAssignment) as e:
+            self.ring_elect(3)
+        self.assertIn('held for another shape (shape_conflict)', str(e.exception))
+        self.fake.claim_fn = lambda h, link: {'t': 'err', 'code': 'not_head', 'error': 'send claims to n1'}
+        with self.assertRaises(RuntimeError) as e:
+            self.ring_elect(3, timeout=60)
+        self.assertIn('timed out: send claims to n1 (not_head)', str(e.exception))
 
     def test_election_refusals(self):
         self.fake.snap = snapshot({f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in range(1, 6)})
