@@ -199,6 +199,20 @@ def ip_key(a):
     return ipaddress.ip_address(a)
 
 
+def head_address(head):
+    """--head as a LAN address. A name, such as a LeaderWorkerSet's LWS_LEADER_ADDRESS (the leader pod's DNS name, its
+    box's address on the host network), resolves to its IPv4 address. Raises OSError, naming it, while it does not."""
+    try:
+        ipaddress.ip_address(head)
+        return head
+    except ValueError:
+        pass
+    try:
+        return socket.gethostbyname(head)
+    except OSError as e:
+        raise OSError(f'--head {head} does not resolve ({e})') from None
+
+
 def format_roots(roots):
     """{address: PCIe root} -> the gr8.roots meta text 'addr=root,...'."""
     return ','.join(f'{a}={r}' for a, r in sorted(roots.items(), key=lambda x: ip_key(x[0])))
@@ -591,6 +605,12 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
             err = str(e)
         else:
             err = ''
+        lan_head = None
+        if head:
+            try:
+                lan_head = head_address(head)
+            except OSError as e:     # a pod's name resolves once the pod has an address: wait for it like a member
+                err = str(e)
         if len(ms) > tp:
             raise RuntimeError(f'group {group} has {len(ms)} members for --tp {tp} '
                                f'({", ".join(m[0] for m in ms)}); stop one, or use --group')
@@ -598,14 +618,15 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
         if timeout and waited >= timeout:
             raise RuntimeError(f'waited {waited:.0f}s for {tp} members in group {group}, have {len(ms)} '
                                f'({", ".join(m[0] for m in ms) or "none"})' + (f': {err}' if err else ''))
-        if len(ms) == tp and all(o is not None for _, _, o in ms) and all(v is not None for v in roots.values()):
+        if len(ms) == tp and (lan_head or not head) and all(o is not None for _, _, o in ms) \
+                and all(v is not None for v in roots.values()):
             key = (ms, sorted(roots.items()))
             if key == last and ring:
                 deadline = t0 + timeout if timeout else float('inf')
-                return claim_ring(daemon, ring, group, tp, ms, snap, head, deadline, hold_s, log, sleep, clock,
+                return claim_ring(daemon, ring, group, tp, ms, snap, lan_head, deadline, hold_s, log, sleep, clock,
                                   ring_settle, ring_retry, ring_attempts), snap
             if key == last:
-                ips = assign_ranks([ip for ip, _, _ in ms], {ip: parse_offers(o) for ip, _, o in ms}, tp, head)
+                ips = assign_ranks([ip for ip, _, _ in ms], {ip: parse_offers(o) for ip, _, o in ms}, tp, lan_head)
                 ids = {ip: n for ip, n, _ in ms}
                 ranks = []
                 for ip in ips:

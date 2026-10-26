@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mentat as M  # noqa: E402
@@ -414,6 +415,34 @@ class DaemonTests(unittest.TestCase):
         ranks, _ = M.elect(self.d, GROUP, 4, sleep=sleep, log=lambda s: None)
         self.assertEqual(len(ranks), 4)
         self.assertGreaterEqual(len(reads), 3)
+
+    def test_a_head_name_waits_until_it_resolves(self):
+        """HEAD=$(LWS_LEADER_ADDRESS) under a LeaderWorkerSet: the leader pod's DNS name, which a worker can read before
+        the leader's pod has an address."""
+        self.fake.snap = snapshot({f'a{i}': agent(f'10.0.0.{i}', f'n{i}') for i in (1, 2, 3, 4)})
+        calls = []
+
+        def resolve(name):
+            calls.append(name)
+            if len(calls) <= 2:
+                raise socket.gaierror(-2, 'Name or service not known')
+            return '10.0.0.3'
+        with mock.patch.object(M.socket, 'gethostbyname', resolve):
+            ranks, _ = M.elect(self.d, GROUP, 4, 'gr8-0.gr8.ns', sleep=lambda _: None, log=lambda s: None)
+        self.assertEqual(set(calls), {'gr8-0.gr8.ns'})
+        self.assertGreaterEqual(len(calls), 4)    # two failures, then two equal reads
+        self.assertEqual([r[0] for r in ranks], ['10.0.0.3', '10.0.0.1', '10.0.0.2', '10.0.0.4'])
+        t = [0.0]
+
+        def clock():
+            t[0] += 100
+            return t[0]
+        with mock.patch.object(M.socket, 'gethostbyname', side_effect=socket.gaierror(-2, 'Name or service not known')):
+            with self.assertRaises(RuntimeError) as e:
+                M.elect(self.d, GROUP, 4, 'gr8-0.gr8.ns', timeout=300, sleep=lambda _: None, log=lambda s: None,
+                        clock=clock)
+        self.assertIn('have 4 (10.0.0.1, 10.0.0.2, 10.0.0.3, 10.0.0.4): --head gr8-0.gr8.ns does not resolve',
+                      str(e.exception))
 
     def test_election_refuses_offers_that_do_not_fit(self):
         self.fake.snap = snapshot({f'a{i}': agent(f'10.0.0.{i}', f'n{i}', offers='1' if i < 3 else 'any') for i in (1, 2, 3, 4)})

@@ -1,0 +1,14 @@
+# The OpenAI API on the leader, which is the head (lws.yaml). Not named gr8: the LeaderWorkerSet owns a headless
+# Service with its own name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gr8-api
+spec:
+  selector:
+    app.kubernetes.io/name: gr8
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: http
+      port: 8100
+      targetPort: api

@@ -127,6 +127,12 @@ Nothing to build: CI publishes the image, `ghcr.io/kindlingai/gr8`. On every box
 Then `docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 status` (or `smoke`, or `down` to stop every
 box). [docker/README.md](docker/README.md) has the settings, how to update, and what the container gets.
 
+### On Kubernetes
+
+[deploy/k8s](deploy/k8s/README.md) is a kustomize base: a LeaderWorkerSet of one pod per box, each running the image's
+`up`, with the head on the leader pod wherever it lands, and a Service for its API. An overlay sets the image tag, TP,
+the RDMA device resource and the options.
+
 ## Running it
 
 Every box runs the same `./gr8 glm53 up`. The first address in `--peers` is the head: it runs the API on port 8100.

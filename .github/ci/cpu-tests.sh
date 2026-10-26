@@ -37,6 +37,9 @@ if [ "$PART" != frontend ]; then
   if docker compose version > /dev/null 2>&1; then docker compose -f docker/compose.yaml config -q
   else echo "(no docker compose here: compose.yaml not checked)"; fi
   bash -n docker/entrypoint.sh
+  # the Kubernetes base
+  if command -v kubectl > /dev/null; then kubectl kustomize deploy/k8s > /dev/null
+  else echo "(no kubectl here: deploy/k8s not checked)"; fi
 
   step "Rust: engine/loader-rs"
   cargo test --locked --manifest-path engine/loader-rs/Cargo.toml

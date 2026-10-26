@@ -160,7 +160,7 @@ A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `do
 | `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
 | `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
 | `GROUP` | `--group` | `gr8-<model>` | cluster | the mentat group the boxes join |
-| `HEAD` | `--head` | the lowest address | cluster | mentat mode: the head's LAN address |
+| `HEAD` | `--head` | the lowest address | cluster | mentat mode: the head's LAN address, or a name that resolves to it (a LeaderWorkerSet's `LWS_LEADER_ADDRESS`, deploy/k8s), which the boxes wait for until `JOIN_TIMEOUT` |
 | `IPS`, `IPS2` | `--ips`, `--ips2` | discovered | cluster | each rank's rail-0 and rail-1 fabric address. Without them each box finds its own two RoCE v2 addresses |
 | `MODEL` | `--model` | none | box | the exlr8 release: `https://huggingface.co/<org>/<repo>[@rev]` (each box fetches its part into `MODEL_CACHE`), or a local copy of it (`dense/`, `experts/`, `index-slices/`, `manifests/`, the tokenizer files) used in place, on a local disk or a shared mount such as NFS. The engine plans every rank's weights from the release's files (`V2_DENSE`) |
 | `V2_DENSE` | `--v2-dense` | the release | box | the exlr8 release directory whose `dense/` files give every non-expert weight (`g6m4 --v2-dense`) |

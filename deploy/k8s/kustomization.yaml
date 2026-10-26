@@ -1,0 +1,14 @@
+# A kustomize base: gr8 as a LeaderWorkerSet, one pod per box. Overlay it (README.md); it does not set a namespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - lws.yaml
+  - service.yaml
+# The launcher's options, the same on every pod. Only what is required: the model. The boxes find each other through
+# mentat, and lws.yaml sets TP and HEAD. RULE (docker/compose.yaml): no option default lives here.
+configMapGenerator:
+  - name: gr8
+    literals:
+      - MODEL=https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4
+configurations:
+  - kustomizeconfig.yaml

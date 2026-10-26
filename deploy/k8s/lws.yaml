@@ -1,0 +1,151 @@
+# gr8 on Kubernetes: one LeaderWorkerSet group of TP pods, one per box, one rank in each. Every pod runs the image's
+# entrypoint with no command, which is `./gr8 glm53 up` in the foreground, so a pod lives as long as its box's part of
+# the cluster. docker/compose.yaml is the same container for docker; README.md here has the overlay a cluster writes.
+#
+# The boxes find each other through the mentat daemon on each box (no PEERS), and every pod has the same options: TP is
+# the group's size, and the head (rank 0, which serves the API) is the leader pod, wherever the scheduler put it. LWS
+# puts LWS_GROUP_SIZE and LWS_LEADER_ADDRESS (the leader pod's DNS name) first in every container's env, so the env
+# below can use them. The leader's name resolves to its box's address: the pod is on the host network.
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: gr8
+spec:
+  # 0 stops every box. `down` in a pod exits 0, the pod restarts, and the group boots again.
+  replicas: 1
+  # The default startupPolicy (LeaderCreated) starts the workers with the leader: the leader cannot be ready before
+  # they join, so LeaderReady would never start them.
+  leaderWorkerTemplate:
+    # TP: 3, 4 or 6 boxes.
+    size: 4
+    # When a rank fails, the supervisors stop every box and boot again together, so a pod that restarts takes its
+    # group with it.
+    restartPolicy: RecreateGroupOnPodRestart
+    # This box's part of the model (~90 GB at TP=4), and logs and state (out/, s2/, run/), on the box: local-path
+    # binds each claim to the box its pod first ran on, so each pod returns to its box and its cache. Kept when the
+    # LeaderWorkerSet is deleted.
+    volumeClaimTemplates:
+      - metadata:
+          name: cache
+        spec:
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 150Gi
+      - metadata:
+          name: home
+        spec:
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 10Gi
+    persistentVolumeClaimRetentionPolicy:
+      whenDeleted: Retain
+    workerTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: gr8
+      spec:
+        # The RoCE fabric and the front end need the box's real interfaces. The supervisors' control port (7340), the
+        # S2 control port (7341) and the API (8100) are host ports.
+        hostNetwork: true
+        # The launcher refuses to start next to another g6m4 on the box, and sees one started outside the pod only in
+        # the host's process list.
+        hostPID: true
+        dnsPolicy: ClusterFirstWithHostNet
+        dnsConfig:
+          options:
+            # The fetch looks up the Hugging Face host for every connection, and ndots:5 would send each lookup
+            # through the cluster's search list first.
+            - name: ndots
+              value: "1"
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        securityContext:
+          # The image's uid 1000 owns the volumes, where the storage supports it. OnRootMismatch: not a walk over the
+          # whole cache at every start.
+          fsGroup: 1000
+          fsGroupChangePolicy: OnRootMismatch
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+          - name: gr8
+            image: ghcr.io/kindlingai/gr8:latest
+            # The launcher's options: the ConfigMap holds only what this cluster needs, and the launcher owns every
+            # default (KNOBS.md).
+            envFrom:
+              - configMapRef:
+                  name: gr8
+            # Set here, the same on every pod, and over any ConfigMap line of the same name.
+            env:
+              - name: TP
+                value: $(LWS_GROUP_SIZE)
+              - name: HEAD
+                value: $(LWS_LEADER_ADDRESS)
+              # The container's own paths, so a line meant for a bare-metal box cannot point the launcher elsewhere.
+              - name: G6_HOME
+                value: /var/lib/gr8/home
+              - name: MODEL_CACHE
+                value: /var/lib/gr8/cache
+              - name: PY
+                value: /usr/bin/python3
+              - name: FRONT_BIN
+                value: /opt/gr8/bin/g6front-rs
+            ports:
+              - name: api
+                containerPort: 8100
+              - name: control
+                containerPort: 7340
+              - name: s2
+                containerPort: 7341
+            # Ready once this box's supervisor reports the cluster serving (on the leader, once its API's /health
+            # answers too), the compose healthcheck's command. A cold boot downloads this box's part first: about
+            # 35 minutes at 40 MB/s, and the startup probe allows 4 hours.
+            startupProbe:
+              exec:
+                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "${GR8_MODEL:-glm53}" health']
+              periodSeconds: 30
+              timeoutSeconds: 5
+              failureThreshold: 480
+            readinessProbe:
+              exec:
+                command: [/bin/sh, -c, 'exec /opt/gr8/gr8 "${GR8_MODEL:-glm53}" health']
+              periodSeconds: 30
+              timeoutSeconds: 5
+            # The engine runs with no more rights than it needs: the image's uid 1000, no capabilities but IPC_LOCK
+            # (pinned memory), no privilege escalation, a read-only image with a private /tmp. The entrypoint sets no
+            # core dumps and raises the soft memlock limit itself; the runtime's hard limit must be unlimited.
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: [ALL]
+                add: [IPC_LOCK]
+            # No cpu or memory request: the pod is BestEffort, so under memory pressure the kernel ends the engine
+            # (oom_score_adj 1000) before the rest of the box.
+            resources:
+              limits:
+                nvidia.com/gpu: 1
+                # PLACEHOLDER: the RDMA device resource the cluster's device plugin exposes (/dev/infiniband).
+                # The overlay replaces it (README.md).
+                rdma/rdma_shared_device_a: 1
+            volumeMounts:
+              - name: cache
+                mountPath: /var/lib/gr8/cache
+              - name: home
+                mountPath: /var/lib/gr8/home
+              - name: shm
+                mountPath: /dev/shm
+              - name: tmp
+                mountPath: /tmp
+        volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+          - name: tmp
+            emptyDir:
+              sizeLimit: 1Gi
