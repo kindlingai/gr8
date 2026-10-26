@@ -10,8 +10,8 @@
 //! - A block is cached only while MemAvailable stays above FLOOR bytes (read at most every 100 ms). Below it, filling
 //!   the cache would push the engine's own memory into swap.
 //! - Slots are whole pages (64 KiB on a 64K kernel), so the kernel's reclaim of one block never touches another.
-//! - A fill is dropped if a write to the same block started after the fill's store read, so a fill never caches
-//!   bytes older than the store's.
+//! - A fill is dropped if a write to the same block was in flight or started while the fill read the store, so a
+//!   fill never caches bytes older than the store's.
 
 use crate::blocks::Blocks;
 use crate::remote::sys;
@@ -33,7 +33,7 @@ pub struct RamCache {
     blocks: u64,
     floor: u64,
     sums: Vec<AtomicU64>,
-    // writes started per block, read and changed under the block's stripe lock
+    // per block, odd while a write is in flight; read and changed under the block's stripe lock
     writes: Vec<AtomicU64>,
     stripes: [Mutex<()>; STRIPES],
     start: Instant,
@@ -151,11 +151,10 @@ impl BlockStore for RamCache {
             self.writes[b].fetch_add(1, Ordering::Relaxed);
             self.sums[b].store(ABSENT, Ordering::Release);
         }
-        self.back.write_block(block, buf)?;
+        let stored = self.back.write_block(block, buf);
         let _g = self.lock(block);
-        // a fill may have run between the two locks with bytes read before the store write landed
         self.writes[b].fetch_add(1, Ordering::Relaxed);
-        self.sums[b].store(ABSENT, Ordering::Release);
+        stored?;
         self.cache(block, buf)
     }
     fn read_block(&self, block: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -176,7 +175,10 @@ impl BlockStore for RamCache {
         };
         self.back.read_block(block, buf)?;
         let _g = self.lock(block);
-        if self.writes[b].load(Ordering::Relaxed) == seen && self.sums[b].load(Ordering::Acquire) == ABSENT {
+        if seen % 2 == 0
+            && self.writes[b].load(Ordering::Relaxed) == seen
+            && self.sums[b].load(Ordering::Acquire) == ABSENT
+        {
             self.cache(block, buf)?;
         }
         Ok(())
