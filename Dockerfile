@@ -170,11 +170,9 @@ COPY --from=dist / .
 # The container runs as uid 1000 (the base image's ubuntu account) on a read-only image. Its writable state is two
 # volumes (docker/compose.yaml): the model cache and G6_HOME, which docker fills from these empty, uid-1000 directories
 # on first use. bench/pbench.py appends results.jsonl next to itself, so that file links into G6_HOME/out.
-# bin3/ and bin6/ held the TP=3 and TP=6 builds, and docker/entrypoint.sh still links one of them: bin/ runs every width.
 RUN mkdir -p /var/lib/gr8/home /var/lib/gr8/cache \
  && chown 1000:1000 /var/lib/gr8/home /var/lib/gr8/cache \
- && ln -s /var/lib/gr8/home/out/pbench-results.jsonl bench/results.jsonl \
- && ln -s bin bin3 && ln -s bin bin6
+ && ln -s /var/lib/gr8/home/out/pbench-results.jsonl bench/results.jsonl
 ENV PATH=/opt/gr8/bin:$PATH PYTHONPATH=/opt/gr8/frontend HOME=/tmp GR8_CONTAINER=1 \
     G6_HOME=/var/lib/gr8/home MODEL_CACHE=/var/lib/gr8/cache PY=/usr/bin/python3
 USER 1000:1000
