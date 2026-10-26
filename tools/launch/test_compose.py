@@ -97,6 +97,29 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual((o.get('FETCH'), o.origin['FETCH']), ('model-loader', 'environment'))
 
 
+class ModelLoaderTreeTests(unittest.TestCase):
+    """model-loader's own deploy trees (its deploy/compose/gr8.yml, deploy/spark-os/gr8.override.yml and
+    deploy/k8s/examples/gr8) set MODEL_CACHE and MODEL_LOADER, not FETCH: those two alone select model-loader."""
+
+    GLM = {'GR8_MODEL': 'glm53', 'MODEL': 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'}
+    TREE = {'MODEL_CACHE': '/var/lib/model-loader', 'MODEL_LOADER': 'unix:/var/lib/model-loader/model-loader.sock'}
+
+    def test_model_loader_alone_selects_it(self):
+        o = opt.parse(['--no-config'], {**self.GLM, **self.TREE})
+        self.assertEqual(o.get('FETCH'), 'model-loader')
+        self.assertIn('MODEL_LOADER', o.origin['FETCH'])
+
+    def test_unset_stays_legacy(self):
+        o = opt.parse(['--no-config'], {**self.GLM, 'MODEL_CACHE': '/opt/gr8/cache'})
+        self.assertEqual((o.get('FETCH'), o.origin['FETCH']), ('legacy', 'default'))
+
+    def test_legacy_with_model_loader_is_refused(self):
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--fetch', 'legacy'],
+                      {**self.GLM, **self.TREE})
+        with self.assertRaisesRegex(opt.OptionError, 'fetch legacy with --model-loader'):
+            opt.validate(o)
+
+
 CHART = os.path.join(REPO, 'deploy', 'k8s')
 
 

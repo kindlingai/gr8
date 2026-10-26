@@ -90,23 +90,9 @@ each way to run it, each ending with a passing `smoke`: [bare metal](docs/DEPLOY
 
 ### With model-loader
 
-[model-loader](https://github.com/kindlingai/model-loader) can fetch the weights instead of gr8. The release comes
-from Hugging Face once, or from a NAS that holds the master copy, and the boxes copy the pieces between them over the
-LAN. Each box runs model-loader next to gr8, from model-loader's `deploy/compose` or `deploy/spark-os`, with the
-release (and the drafter) in its `catalog.yaml`. Then on every box:
-
-    cp docker/.env.example docker/.env        # GR8_MODEL, MODEL, PEERS and DRAFTER as above
-    docker compose -f docker/compose.yaml -f docker/model-loader.yaml pull
-    docker compose -f docker/compose.yaml -f docker/model-loader.yaml up -d
-
-`docker/model-loader.yaml` mounts model-loader's store read-only (`MODEL_LOADER_STORE`, default
-`/var/lib/model-loader`), sets `FETCH=model-loader`, and starts gr8 once model-loader answers. gr8 asks model-loader
-for the pieces its rank needs, waits until they are held, checks every expert half's xxhash64, and reads the weights
-in place. gr8 finds the release and the drafter in model-loader's catalog by their repos, whatever the catalog
-calls them. No `prepare` is needed: model-loader keeps the pieces between boots. Bare metal takes the same options:
-`--fetch model-loader --model-cache /var/lib/model-loader` (KNOBS.md). Give the catalog's width files small segments
-(model-loader's `deploy/compose/catalog.yaml` does), or each box holds every width file whole. On Kubernetes, the chart
-takes `modelLoader.enabled: true` ([deploy/k8s](deploy/k8s/README.md#model-loader)).
+[model-loader](https://github.com/kindlingai/model-loader) can fetch the weights instead of gr8: the boxes copy the
+pieces between them over the LAN, from one Hugging Face fetch or a NAS. Each surface takes it with one more file or
+value: [docs/DEPLOY.md](docs/DEPLOY.md#with-model-loader).
 
 ## Running it
 

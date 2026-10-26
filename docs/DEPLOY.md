@@ -162,6 +162,77 @@ The leader is `gr8-0`, and the Service `gr8-api` reaches its API. A cold boot do
 4 hours. `kubectl -n gr8 scale leaderworkerset gr8 --replicas 0` stops every box, and `--replicas 1` boots them again.
 The chart's [README](../deploy/k8s/README.md) has every value, storage, placement and updating.
 
+## With model-loader
+
+[model-loader](https://github.com/kindlingai/model-loader) can fetch the weights instead of gr8. The release comes
+from Hugging Face once, or from a NAS that holds the master copy, and the boxes copy the pieces between them over the
+LAN. Each box runs model-loader next to gr8, from model-loader's own deploy tree, with the release (and the drafter) in
+its `catalog.yaml`. gr8 then asks the box's model-loader for the pieces its rank needs, waits until they are held,
+checks every expert half's xxhash64, and reads the weights in place from model-loader's store, which it mounts
+read-only. The legacy fetch stays the default; nothing changes for a box without model-loader.
+
+Nothing about the model changes either: the two settings are the same. gr8 finds the release and the drafter in
+model-loader's catalog by their Hugging Face repos, whatever the catalog calls them. What selects model-loader is its
+address, `MODEL_LOADER` (with `MODEL_CACHE` its store): every setup below sets both, and that alone is enough
+(`FETCH=model-loader` is then implied). The catalog should give the width files small segments, as model-loader's
+example catalogs do, or each box holds every width file whole.
+
+| | model-loader on the box | gr8 |
+|---|---|---|
+| bare metal | model-loader's `deploy/compose`, or `deploy/spark-os` | `--model-loader unix:/var/lib/model-loader/model-loader.sock --model-cache /var/lib/model-loader` |
+| Docker Compose | model-loader's `deploy/compose`, or `deploy/spark-os` | add `-f docker/model-loader.yaml` (or model-loader's `deploy/compose/gr8.yml`) |
+| Kubernetes | model-loader's `deploy/k8s` DaemonSet | `modelLoader.enabled: true` in the chart's values |
+
+model-loader runs in group 1000, gr8's, in all of its deploy trees: its socket, `model-loader.sock` in the store, is
+mode 0660 in that group, so gr8 can open it and nothing else on the box can.
+
+### Docker Compose with model-loader
+
+With model-loader running on the box (its `deploy/compose`, or `deploy/spark-os` on kindling-spark-os), fetch the
+override next to `compose.yaml` and add it to every command:
+
+    cd ~/gr8
+    curl -fsSLO https://raw.githubusercontent.com/kindlingai/gr8/main/docker/model-loader.yaml
+    docker compose -f compose.yaml -f model-loader.yaml up -d
+
+`.env` is the same file as without model-loader. The override mounts model-loader's store read-only
+(`MODEL_LOADER_STORE` in `.env`, default `/var/lib/model-loader`), points gr8 at it and its socket, and starts gr8
+once `model-loader -check` answers. model-loader's `deploy/compose` keeps its store in a named volume unless
+`MODEL_LOADER_STORE` is set there: set it to the same host directory on both sides. No `prepare` is needed:
+model-loader keeps the pieces between boots. [docker/README.md](../docker/README.md#with-model-loader) has the rest.
+
+model-loader's own `deploy/compose/gr8.yml` (gr8 and model-loader in one project, `GR8_ENV` naming gr8's `.env`) and
+`deploy/spark-os/gr8.override.yml` work as they are: they set the store and the socket, which selects model-loader.
+
+### Bare metal with model-loader
+
+With model-loader on the box (its `deploy/compose` or `deploy/spark-os`, store at `/var/lib/model-loader`), give
+`up` its socket and store in place of the model cache:
+
+    ./gr8 glm53 up --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
+        --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 \
+        --model-loader unix:/var/lib/model-loader/model-loader.sock --model-cache /var/lib/model-loader \
+        --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
+
+The user running gr8 must be in group 1000 to open the socket. The drafter is converted under `G6_HOME`, never in
+the store: its licence forbids sharing a converted copy. [config/cluster.env.example](../config/cluster.env.example)
+has the same two lines.
+
+### Kubernetes with model-loader
+
+Run model-loader's `deploy/k8s` peer DaemonSet on the GPU nodes (its `examples/gr8` has the settings gr8 needs: group
+1000 and a readiness probe on the socket; leave out its gr8 Deployment, which this chart replaces), then add to
+`my-values.yaml`:
+
+```yaml
+modelLoader:
+  enabled: true
+  store: /var/lib/model-loader      # the DaemonSet's store on every node (hostPath)
+```
+
+The chart mounts the store read-only, sets `MODEL_LOADER` and `MODEL_CACHE`, makes no `cache` claim, and waits in an
+init container until model-loader answers. The chart's [README](../deploy/k8s/README.md#model-loader) has the rest.
+
 ## After smoke
 
 On the head, the API is OpenAI's:

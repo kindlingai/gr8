@@ -42,9 +42,12 @@ reports the failure.
 
 ## With model-loader
 
-`docker/model-loader.yaml` makes the box's model-loader fetch the weights:
+`docker/model-loader.yaml` makes the box's model-loader fetch the weights ([docs/DEPLOY.md](../docs/DEPLOY.md#with-model-loader)
+has every surface):
 
     docker compose -f docker/compose.yaml -f docker/model-loader.yaml up -d
+
+In a directory that holds only `compose.yaml` and `.env`, fetch `model-loader.yaml` next to them and drop `docker/`.
 
 Give both `-f` files to every compose command (`pull`, `exec`, `logs`). The override:
 
@@ -61,6 +64,9 @@ set its `MODEL_LOADER_STORE` to the same host directory as here, because its def
 lists the release and, for `DRAFTER`, the drafter, with their Hugging Face repos as sources. gr8 asks model-loader for
 the entries whose repos are `MODEL`'s and `DRAFTER`'s, so the catalog may name them anything and nothing in
 `docker/.env` repeats the names.
+
+model-loader's own `deploy/compose/gr8.yml` (gr8 in model-loader's project) and `deploy/spark-os/gr8.override.yml`
+work in place of this file: they set `MODEL_CACHE` and `MODEL_LOADER`, and `MODEL_LOADER` alone selects model-loader.
 
 The `cache` volume is not used then. A `run --rm gr8 prepare` asks model-loader for this box's pieces and waits until
 it holds them, without booting.

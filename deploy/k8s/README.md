@@ -109,8 +109,9 @@ modelLoader:
 
 The chart mounts the store read-only from the box (`hostPath`), sets `FETCH=model-loader`, `MODEL_CACHE` to the store
 and `MODEL_LOADER` to its socket, and makes no `cache` claim. An init container waits until `model-loader -check`
-answers. model-loader runs on each box from its own deploy tree (its `deploy/k8s` DaemonSet, or `deploy/spark-os`), in
-group 1000, gr8's, so gr8 can open its socket. gr8 finds the release (and `DRAFTER`) in model-loader's catalog by the
+answers. model-loader runs on each box from its own deploy tree: its `deploy/k8s` peer DaemonSet with the settings of
+its `examples/gr8` (group 1000, gr8's, so gr8 can open its socket, and a readiness probe on the socket; leave out that
+example's gr8 Deployment, which this chart replaces), or `deploy/spark-os`. gr8 finds the release (and `DRAFTER`) in model-loader's catalog by the
 repo, so nothing in `options` repeats a catalog name.
 
 ### Placement
