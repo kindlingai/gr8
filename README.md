@@ -110,6 +110,10 @@ drafter body (its 8 KV heads do not split six ways), which drafts what TP=4 draf
 engine, for boxes without the CUDA toolkit. Every box must run the same build: build on one and copy `bin/`, or build
 on each.
 
+The first argument names the model, `glm53` (GLM-5.3) or `glm53f` (GLM-5.3-Flash, [docs/FLASH.md](docs/FLASH.md)), and
+`--model` a release of that model: gr8 picks neither, and refuses a release of the other model before it downloads
+anything. `./gr8 models` lists each model's release and the values its `--tp` and `--variant` take.
+
 The first `up` downloads this box's part: about 35 minutes at 40 MB/s. To download ahead of time, run `./gr8 glm53
 prepare` with the same options. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
 downloads the drafter and converts its own rank.
@@ -119,7 +123,7 @@ downloads the drafter and converts its own rank.
 Nothing to build: CI publishes the image, `ghcr.io/kindlingai/gr8`. On every box, with the NVIDIA container toolkit:
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
-    cp docker/.env.example docker/.env        # set MODEL, PEERS and (TP=4 only) DRAFTER: the same file on every box
+    cp docker/.env.example docker/.env        # set GR8_MODEL, MODEL, PEERS and (TP=4) DRAFTER: one file for every box
     docker compose -f docker/compose.yaml pull
     docker compose -f docker/compose.yaml run --rm gr8 prepare
     docker compose -f docker/compose.yaml up -d

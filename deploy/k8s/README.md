@@ -1,7 +1,7 @@
 # gr8 on Kubernetes
 
 A Helm chart: a [LeaderWorkerSet](https://github.com/kubernetes-sigs/lws) of one pod per box, each running the image's
-`./gr8 glm53 up` in the foreground, and a Service, `<release>-api`, for the OpenAI API on the leader. It is the
+`./gr8 $GR8_MODEL up` in the foreground, and a Service, `<release>-api`, for the OpenAI API on the leader. It is the
 container of [docker/compose.yaml](../../docker/compose.yaml), with the same rights: the host network and process list,
 the GPU, the RDMA devices, `IPC_LOCK`, uid 1000 on a read-only image.
 
@@ -33,7 +33,9 @@ image:
   tag: sha-<commit>                 # the same build on every box: they refuse a mix
 size: 4                             # TP: 3, 4 or 6
 options:                            # the launcher's options (KNOBS.md)
-  DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2     # TP=4 only
+  GR8_MODEL: glm53                  # required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)
+  MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4    # required: a release of that model
+  DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2     # glm53 at TP=4 only
   # SHAPE: ring                     # no switch: the boxes cabled in a ring
 resources:
   limits:
@@ -45,6 +47,8 @@ storage:
     storageClass: local-path
 ```
 
+`GR8_MODEL` and `MODEL` have no default, and `helm install` refuses a values file without them: `./gr8 models` lists
+each model's release, TP sizes and variants (for GLM-5.3-Flash, `GR8_MODEL: glm53f`, its release, and no `DRAFTER`).
 For TP=3, `size: 3` and no `DRAFTER`. Then, from a checkout:
 
     kubectl create namespace gr8
@@ -102,7 +106,7 @@ cluster needs them.
 
 ## Running it
 
-The probes run `/opt/gr8/gr8 "$GR8_MODEL" health` (glm53 when unset), the compose healthcheck: a pod is Ready once the
+The probes run `/opt/gr8/gr8 "$GR8_MODEL" health`, the compose healthcheck: a pod is Ready once the
 cluster serves, and on the leader once its API's `/health` answers too. The startup probe gives a cold boot 4 hours to
 download this box's part (about 35 minutes at 40 MB/s); on a slower link, raise `startupProbe.failureThreshold`.
 

@@ -3,15 +3,15 @@
 One image for GB10 boxes (linux/arm64, CUDA 13, sm_121a): the engine for every TP width (`bin/`), the Rust front end,
 the loader, the shims and the launcher, on the CUDA 13 runtime image (which brings cuBLAS) with libibverbs and the mlx5
 provider. Each box runs one container, which holds one rank. The head (rank 0) also runs the shim and the OpenAI front
-end. The container's entrypoint is `./gr8 glm53`, so it takes the launcher's commands and options (KNOBS.md) and runs
-the same checks and handshake as a bare-metal box.
+end. The container's entrypoint is `./gr8 $GR8_MODEL`, so it takes the launcher's commands and options (KNOBS.md) and
+runs the same checks and handshake as a bare-metal box.
 
 ## Running it
 
 On every box, with the NVIDIA container toolkit (on DGX OS by default):
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
-    cp docker/.env.example docker/.env        # then set MODEL, DRAFTER and PEERS (the same file on every box)
+    cp docker/.env.example docker/.env        # then set GR8_MODEL, MODEL, DRAFTER and PEERS (one file for every box)
     docker compose -f docker/compose.yaml pull                     # the latest image
     docker compose -f docker/compose.yaml run --rm gr8 prepare    # this box's part of the model, ~90 GB at TP=4
     docker compose -f docker/compose.yaml up -d
@@ -19,7 +19,7 @@ On every box, with the NVIDIA container toolkit (on DGX OS by default):
 `up -d` returns at once, and the boot goes on in the container: the boxes find each other, load (about a minute from a
 warm cache) and serve the OpenAI API on the head, port 8100. `docker compose -f docker/compose.yaml ps` shows the
 container healthy once this box's supervisor reports the cluster serving: the healthcheck runs
-`/opt/gr8/gr8 "$GR8_MODEL" health` (glm53 when unset), and on the head it also needs the API's `/health`. A Kubernetes
+`/opt/gr8/gr8 "$GR8_MODEL" health`, and on the head it also needs the API's `/health`. A Kubernetes
 pod can run the same command as an `exec` readiness probe on every rank. A KV node's container (`GR8_MODEL=kv` and
 `KV_GB` in `docker/.env`, so the entrypoint runs `./gr8 kv up`) gets the same healthcheck, which there runs
 `./gr8 kv health`: healthy once the node serves and its process runs, and a Kubernetes `exec` probe runs that command
@@ -57,7 +57,10 @@ To stay on one build, set `GR8_IMAGE=ghcr.io/kindlingai/gr8:sha-<commit>` in `do
 ## Settings
 
 `docker/.env` holds the launcher's options, one `KEY=value` per line: compose passes every line into the container, and
-the launcher owns every default. Three more lines are for compose itself:
+the launcher owns every default. `GR8_MODEL` has none: it names the model, `glm53` (GLM-5.3) or `glm53f`
+(GLM-5.3-Flash), and `MODEL` must be a release of that model. Without it the container exits 2 at once, naming the
+line to add. `docker run --rm --entrypoint /opt/gr8/gr8 ghcr.io/kindlingai/gr8 models` lists each model's release, TP
+sizes and variants. Three more lines are for compose itself:
 
 | variable | default | |
 |---|---|---|

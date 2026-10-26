@@ -25,6 +25,7 @@ from test_mentat import FakeDaemon, flipped, ring, solved  # noqa: E402
 import mentat as M  # noqa: E402
 
 MEMBERS = ['192.0.2.1', '192.0.2.2', '192.0.2.3', '192.0.2.4']    # TEST-NET: never this box's address
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def free_port():
@@ -36,7 +37,7 @@ def free_port():
 def supervisor(*argv, rank=0, members=MEMBERS):
     home = tempfile.mkdtemp()
     o = opt.parse(['--no-config', '--peers', ','.join(members), '--g6-home', home, '--control-port', str(free_port()),
-                   *argv], {})
+                   *argv], GLM)
     opt.validate(o)
     s = S.Supervisor(o)
     s.rank, s.members, s.lan, s.rails = rank, members, members[rank], ('192.0.2.101', '192.0.2.201')
@@ -97,7 +98,7 @@ class MentatRingTests(unittest.TestCase):
                 for i in range(n):
                     o = opt.parse(['--no-config', '--mentat', f'127.0.0.1:{daemons[i].port}', '--tp', str(n),
                                    '--shape', 'ring', '--g6-home', tempfile.mkdtemp(), '--join-timeout', '30',
-                                   *extra], {})
+                                   *extra], GLM)
                     opt.validate(o)
                     s = S.Supervisor(o)
                     sups.append(s)
@@ -311,7 +312,7 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(s.engine_env({'env': [], 'args': []})['LD_LIBRARY_PATH'], os.path.join(s.home, 'bin', 'lib'))
 
     def test_g6_variables_in_the_environment_are_refused_by_name(self):
-        o = opt.parse(['--no-config', '--peers', ','.join(MEMBERS)], {'G6_S2_TIMEOUT': '300', 'G6_HOME': '/h',
+        o = opt.parse(['--no-config', '--peers', ','.join(MEMBERS)], {**GLM, 'G6_S2_TIMEOUT': '300', 'G6_HOME': '/h',
                                                                       'G6_CLUSTER': '/c', 'G6_NR': '4'})
         with self.assertRaises(opt.OptionError) as e:
             opt.validate(o)
@@ -337,8 +338,8 @@ class EngineTests(unittest.TestCase):
         os.makedirs(os.path.join(home, 'bin'))
         with open(os.path.join(home, 'bin', 'g6m4'), 'w') as f:
             f.write('fp8')
-        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], {})
-        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'int4'], {})
+        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], GLM)
+        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'int4'], GLM)
         self.assertEqual((S.engine_bin(o8), S.engine_bin(o4)), ('g6m4', 'g6m4-int4'))
         self.assertEqual(S.engine_build(home, S.engine_bin(o4)), 'missing', 'an fp8-only bin/ cannot run int4')
         with open(os.path.join(home, 'bin', 'g6m4-int4'), 'w') as f:

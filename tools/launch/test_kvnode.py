@@ -21,6 +21,7 @@ import options as opt  # noqa: E402
 from test_mentat import FakeDaemon, agent, snapshot  # noqa: E402
 
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stubs', 'kvman-remote')
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def free_port():
@@ -222,11 +223,11 @@ class KvRowsTargetTests(unittest.TestCase):
     """KV_ROWS remote:auto takes KV_STORE's node rule: an RDMA address on one of the box's rails, odd ranks on the
     second rail, so the ranks split over the node's two PCIe roots."""
     def test_ranks_split_over_the_rails(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], GLM)
         opt.validate(o)
         nodes = [('192.0.2.20', 7351, {'gr8.kv.rdma': '10.2.0.20,10.1.0.20'})]
         rows = [opt.kv_rows_with(o, M.kv_target(nodes, ('10.1.0.3', '10.2.0.3'), r)) for r in range(4)]
         self.assertEqual(rows, ['remote:10.1.0.20:7351,size=8G,local=40', 'remote:10.2.0.20:7351,size=8G,local=40'] * 2)
         # a named node stays as written
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:192.0.2.9:7350,size=8G'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:192.0.2.9:7350,size=8G'], GLM)
         self.assertEqual(opt.kv_rows_with(o, '10.1.0.20:7351'), 'remote:192.0.2.9:7350,size=8G')

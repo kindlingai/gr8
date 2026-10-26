@@ -171,6 +171,8 @@ def resolve_model(o, refresh=False, log=log):
             raise modelset.ModelError(f'--model {model}: want an exlr8 release, https://huggingface.co/<org>/<repo>[@rev] '
                                       'or a local copy of one (dense/, experts/, index-slices/, manifests/)'
                                       if model else 'no model: pass --model <exlr8 release URL or directory>')
+        # a release for the other model is refused here, by name, before the variant, the drafter or any weights
+        models.check_config(models.of(o), ms.tokenizer)
         o.values['V2_DENSE'] = model
         ms.release = release
         search = [model]
@@ -178,7 +180,6 @@ def resolve_model(o, refresh=False, log=log):
         variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')), models.of(o))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
-        models.check_config(models.of(o), ms.tokenizer)
         if o.get('GRAMMAR') == '1' and not o.get('GRAMMAR_DIR'):
             o.values['GRAMMAR_DIR'] = ms.tokenizer
         if o.get('GRAMMAR') != '1' or models.of(o) is not models.GLM53:   # Flash serves outside the S2 dispatch
