@@ -23,8 +23,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
-                                      '<model> sets it'),
+    'GR8_MODEL': ('cluster', None, 'the model the engine serves, required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); '
+                                   './gr8 <model> sets it, and ./gr8 models lists what each one takes'),
     'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2)'),
     'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: with --peers, each box's "
                                  "f0 port cabled to the f1 port of the next box in --peers order, the last to the "
@@ -357,10 +357,12 @@ def parse(argv, environ=None):
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
     deprecated_kv(values, origin, warnings)
-    if values['GR8_MODEL'] not in models.MODELS:
-        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {", ".join(models.MODELS)}')
-    if not values['GROUP']:
-        values['GROUP'] = models.MODELS[values['GR8_MODEL']].group
+    model = values['GR8_MODEL']
+    if model and model not in models.MODELS:
+        raise OptionError(f'GR8_MODEL={model}, from the {origin["GR8_MODEL"]}: not a model gr8 serves. Want '
+                          f'{models.CHOICES} (./gr8 models lists them)')
+    if model and not values['GROUP']:
+        values['GROUP'] = models.MODELS[model].group
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
@@ -385,6 +387,9 @@ def mode(o):
 
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
+    if not o.get('GR8_MODEL'):
+        raise OptionError(f'no model: set GR8_MODEL to {models.CHOICES}, in the config file or the environment, or '
+                          'run ./gr8 <model> (./gr8 models lists them)')
     model = models.of(o)
     tp = o.get('TP')
     if tp is None:

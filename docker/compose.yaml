@@ -77,7 +77,7 @@ services:
       # Healthy once this box's supervisor reports the cluster serving (on the head, once its API's /health answers
       # too): `gr8 <model> health`, the same check a Kubernetes exec probe runs. $$ leaves GR8_MODEL to the
       # container's shell, which has docker/.env's value, as the entrypoint does. A boot reads ~80 GB, so allow it time.
-      test: ["CMD-SHELL", "exec /opt/gr8/gr8 \"$${GR8_MODEL:-glm53}\" health"]
+      test: ["CMD-SHELL", "exec /opt/gr8/gr8 \"$${GR8_MODEL}\" health"]
       interval: 30s
       timeout: 5s
       start_period: 30m

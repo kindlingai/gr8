@@ -85,7 +85,7 @@ class EndToEnd(unittest.TestCase):
             os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', 'g6m4'))
             self.homes.append(h)
         self.env = {**os.environ, 'PATH': os.path.join(HERE, 'stubs') + os.pathsep + os.environ['PATH'],
-                    'GR8_REFUSAL_LINGER': '3'}   # three polls' worth
+                    'GR8_REFUSAL_LINGER': '3', 'GR8_MODEL': 'glm53'}   # three polls' worth; ./gr8 glm53 sets the model
         for k in ('CAP', 'SESS', 'PEERS', 'G6_CLUSTER'):
             self.env.pop(k, None)
 

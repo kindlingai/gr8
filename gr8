@@ -1,8 +1,9 @@
 #!/bin/bash
 # The one entry point: ./gr8 <model> <command>, the model glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or pseudo (the
 # pseudo engine, frontend/pseudo-engine: the launcher commands, smoke, bench and build); ./gr8 kv runs a KV node. Run the same command on every box, from the repo checkout
-# on that box. Each box's supervisor (tools/launch) finds the others, checks that every box has the same
-# options, model set and engine, and starts its own rank. The head (rank 0) also runs the front end and the shim.
+# on that box. The model is always named: nothing picks one (GR8_MODEL, for the image, has no default). Each box's
+# supervisor (tools/launch) finds the others, checks that every box has the same options, model set and engine, and
+# starts its own rank. The head (rank 0) also runs the front end and the shim.
 #
 #   ./gr8 glm53 up [OPTIONS] [@FILE]  start this box's supervisor and follow it until the cluster serves
 #        --tp 4|6|3 --peers A,B,C,D   the boxes' LAN addresses, the same list on every box, head first
@@ -25,6 +26,9 @@
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
+#
+#   ./gr8 models                      the models, and for each the name to give, its release and the values --tp and
+#                                     --variant take (tools/launch/models.py)
 #
 #   ./gr8 kv up --gb N [OPTIONS]      lock N GiB of this box's memory and serve it as KV page blocks to the cluster
 #                                     (engine/kvman-rs/REMOTE-TIER.md), announced in the mentat group; ./gr8 kv --help
@@ -66,6 +70,7 @@ case $model in
   glm53) build_model=glm ;;
   glm53f) build_model=flash ;;
   pseudo) build_model=pseudo ;;
+  models) exec python3 "$REPO/tools/launch/models.py" ;;
   kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;
   query) shift; exec python3 "$REPO/tools/query/query.py" "$@" ;;
   test)
@@ -76,7 +81,8 @@ case $model in
       gpu) shift; exec bash "$SCRIPTS/c1_tests.sh" "$@" ;;
       *) echo "gr8: ./gr8 test [frontend|engine|all], ./gr8 test pseudo TOKENIZER_DIR or ./gr8 test gpu [BIN_DIR]" >&2; exit 2 ;;
     esac ;;
-  *) echo "gr8: the first argument names the model, glm53, glm53f or pseudo: ./gr8 glm53 <command> (or ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
+  *) echo "gr8: the first argument names the model, glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash): ./gr8 glm53 <command>" \
+          "(./gr8 models lists them; or ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
 esac
 shift
 export GR8_MODEL=$model   # tools/launch/options.py

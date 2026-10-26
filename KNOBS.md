@@ -152,7 +152,7 @@ A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `do
 
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|
-| `GR8_MODEL` | `--gr8-model` | `glm53` | cluster | the model: `glm53` or `glm53f`. `./gr8 <model>` sets it |
+| `GR8_MODEL` | `--gr8-model` | none: required | cluster | the model: `glm53` (GLM-5.3) or `glm53f` (GLM-5.3-Flash). `./gr8 <model>` sets it; the image reads it from `docker/.env`. `up`, `check`, `prepare` and `show-config` refuse to run without it, and `MODEL` must be a release of it. `./gr8 models` lists each model's release, TP sizes and variants |
 | `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3 (glm53f: 4 or 2); needed with mentat |
 | `FLASH_CACHE` | `--flash-cache` | `off` | cluster | glm53f, experimental: `terminal` = `aligned` plus a checkpoint at the end of every request, **NOT cold-exact** (docs/FLASH.md). `aligned` = session checkpoints, so a prompt that starts with an earlier prompt's tokens is prefilled from that prompt's last 8,192-row grid point, bit-exact (`G6_FLASH_CACHE`, [docs/FLASH.md](docs/FLASH.md)). The store is the one `KV_STORE` (no `persist=on`), else memory. On glm53f, `KV_STORE` needs it. The prefill checkpoint is taken at the boundary after the quantum that reaches the grid point, once that boundary's events have committed, so a store Resize that lands there comes first |
 | `FLASH_STATE_BUDGET_MIB` | `--flash-state-budget-mib` | 8192 | cluster | `FLASH_CACHE` with no `KV_STORE`: the in-memory checkpoint store a rank, in MiB (`G6_FLASH_STATE_BUDGET_MIB`) |

@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import options as opt  # noqa: E402
 
 PEERS = '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def write(d, name, text):
@@ -69,7 +70,7 @@ class PrecedenceTests(unittest.TestCase):
 
     def test_hosts_are_peers(self):
         p = write(self.d, 'old.env', 'HOSTS="10.0.0.1 10.0.0.2 10.0.0.3"\nIPS=a,b,c\nIPS2=d,e,f\n')
-        o = opt.parse(['@' + p], {})
+        o = opt.parse(['@' + p], GLM)
         self.assertEqual((opt.mode(o), o.get('PEERS')), ('peers', '10.0.0.1,10.0.0.2,10.0.0.3'))
         opt.validate(o)
         self.assertEqual(o.get('TP'), '3')
@@ -105,13 +106,13 @@ class PrecedenceTests(unittest.TestCase):
 
 class ValidateTests(unittest.TestCase):
     def check(self, argv, want, env=None):
-        o = opt.parse(['--no-config', *argv], env or {})
+        o = opt.parse(['--no-config', *argv], {**GLM, **(env or {})})
         with self.assertRaises(opt.OptionError) as e:
             opt.validate(o)
         self.assertIn(want, str(e.exception))
 
     def test_a_ring_with_mentat(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '3', '--shape', 'ring'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '3', '--shape', 'ring'], GLM)
         opt.validate(o)
         self.assertEqual((opt.mode(o), o.get('SHAPE')), ('mentat', 'ring'))
 
@@ -134,17 +135,17 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
         self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a whole number')
         o = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'medium',
-                       '--default-thinking-budget', '4096'], {})
+                       '--default-thinking-budget', '4096'], GLM)
         opt.validate(o)
         self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--grammar', '2'], 'want 0 or 1')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('GRAMMAR'), '1')
         # a grammar directory reaches the engine as --grammar-dir, a path per box
-        o = opt.parse(['--no-config', '--peers', PEERS, '--grammar', '1', '--grammar-dir', '/t'], {})
+        o = opt.parse(['--no-config', '--peers', PEERS, '--grammar', '1', '--grammar-dir', '/t'], GLM)
         opt.validate(o)
         self.assertIn('--grammar-dir @GRAMMAR_DIR', ' '.join(opt.engine_plan(o)['args']))
-        o = opt.parse(['--no-config', '--peers', PEERS, '--allow-thinking-off', '1'], {})
+        o = opt.parse(['--no-config', '--peers', PEERS, '--allow-thinking-off', '1'], GLM)
         opt.validate(o)
         self.assertEqual(o.get('ALLOW_THINKING_OFF'), '1')
 
@@ -164,7 +165,7 @@ class GetTests(unittest.TestCase):
     """launch.py get: TP for ./gr8 glm53 build, PORT for smoke and bench, on a box whose options need not boot."""
     def get(self, *argv):
         r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launch.py'), 'get',
-                            *argv], capture_output=True, text=True, timeout=60)
+                            *argv], env={**os.environ, **GLM}, capture_output=True, text=True, timeout=60)
         return r.returncode, r.stdout.strip(), r.stderr
 
     def test_port_needs_no_bootable_options(self):
@@ -214,7 +215,7 @@ class PathTests(unittest.TestCase):
 
 class CanonicalTests(unittest.TestCase):
     def digest(self, *argv, env=None):
-        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], {**GLM, **(env or {})})
         opt.validate(o)
         c, text, d = opt.canonical(o, opt.engine_plan(o), opt.split_list(PEERS))
         return c, text, d
@@ -309,7 +310,7 @@ class CanonicalTests(unittest.TestCase):
                                  '--v2-dense-form', 'rounded')
         self.assertIn('--v2-dense @V2_DENSE --v2-dense-form rounded', text)
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4,10.0.0.5,10.0.0.6', '--v2', '/v2',
-                       '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel'], {})
+                       '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
         self.assertIn('G6_PF_OWN=3', p['env'])
@@ -329,12 +330,12 @@ class CanonicalTests(unittest.TestCase):
                 self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau-s', bad)
     def test_kvb_fp8_needs_a_release(self):
         rel = ['--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel']
-        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel + ['--kvb', 'fp8'], {})
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel + ['--kvb', 'fp8'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
         self.assertIn('G6_KVB=fp8', p['env'])
         self.assertNotEqual(self.digest(*rel)[2], self.digest(*rel, '--kvb', 'fp8')[2])   # a cluster option
-        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel, {})
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel, GLM)
         opt.validate(o)
         self.assertNotIn('G6_KVB', opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['env'])
         with self.assertRaises(opt.OptionError):
@@ -362,7 +363,7 @@ class CanonicalTests(unittest.TestCase):
             self.digest('--model', 'https://huggingface.co/org/repo', '--layout', a)
 
     def test_tp3_is_s2_without_drafter(self):
-        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=1', p['env'])
@@ -377,7 +378,7 @@ class CanonicalTests(unittest.TestCase):
               'G6_ATTN_SEL2=16', 'G6_IDX_GRP=16', 'G6_ATTN_QT=1', 'G6_ATTN_FRONT=1', 'G6_IDX_VEC=1', 'G6_DEC_BK=512',
               'G6_S2_ADAPT=1', 'G6_S2_DECODE_PF=4096', 'G6_S2_ADMIT_HOLD=1', 'G6_PF_SELX_CTX=53248']
         def env(peers, *argv):
-            o = opt.parse(['--no-config', '--peers', peers, *argv], {})
+            o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
             opt.validate(o)
             return opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
         e = env(PEERS)
@@ -396,7 +397,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertFalse(any(a.split('=')[0] in [v.split('=')[0] for v in on] for a in e))
     def test_tp5_prefills_with_pf_own_3(self):
         def env(*argv):
-            o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], {})
+            o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], GLM)
             opt.validate(o)
             return opt.engine_plan(o, rank=4, rank_dir='/r', aux_dir='/a', home='/h')['env']
         self.assertIn('G6_PF_OWN=3', env())
@@ -404,7 +405,7 @@ class CanonicalTests(unittest.TestCase):
 
     def test_tp4_tr3_w2all_default_on_and_override(self):
         def env(peers, *argv):
-            o = opt.parse(['--no-config', '--peers', peers, *argv], {})
+            o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
             opt.validate(o)
             return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env'] if a.startswith('G6_TR3_W2ALL=')]
         self.assertEqual(env(PEERS), ['G6_TR3_W2ALL=1'])
@@ -414,7 +415,7 @@ class CanonicalTests(unittest.TestCase):
 
     def test_tp6_is_s2_without_drafter(self):
         peers = ','.join(f'10.0.0.{i}' for i in range(1, 7))
-        o = opt.parse(['--no-config', '--peers', peers], {})
+        o = opt.parse(['--no-config', '--peers', peers], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=3', p['env'])
@@ -425,14 +426,14 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotIn('--spec-adaptive', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
         # --dflash 1: the drafter (its body replicated on every rank), adaptive draft count as at TP=4
-        o = opt.parse(['--no-config', '--peers', peers, '--dflash', '1'], {})
+        o = opt.parse(['--no-config', '--peers', peers, '--dflash', '1'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('/a/dflash.r2.manifest.json', p['args'])
         self.assertIn('/a/dflash.r2.pack', p['args'])
         self.assertIn('--spec-adaptive', p['args'])
         # PF_OWN=1 is the fallback: no QO pack
-        o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], {})
+        o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=1', p['env'])
@@ -441,7 +442,7 @@ class CanonicalTests(unittest.TestCase):
 
 class KvStoreTests(unittest.TestCase):
     def plan(self, *argv, kv_store=None, env=None):
-        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], {**GLM, **(env or {})})
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store=kv_store)
 
@@ -498,7 +499,7 @@ class KvStoreTests(unittest.TestCase):
         self.assertEqual(self.arg(p, '--kv-keep'), 'sessions', 'an explicit KV_KEEP wins')
 
     def test_remote_auto_is_resolved_per_box(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-store', 'remote:auto,size=8G'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-store', 'remote:auto,size=8G'], GLM)
         opt.validate(o)
         self.assertEqual(opt.kv_stores(o)[0]['host'], 'auto')
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store='remote:192.0.2.5:7350,size=8G')
@@ -520,7 +521,7 @@ class KvStoreTests(unittest.TestCase):
 
 class KvRowsTests(unittest.TestCase):
     def plan(self, *argv, kv_rows=None, env=None):
-        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], {**GLM, **(env or {})})
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_rows=kv_rows)
 
@@ -546,7 +547,7 @@ class KvRowsTests(unittest.TestCase):
                          {'G6_RT_STORE': 'mem:', 'G6_RT_SIZE': str(1 << 30), 'G6_RT_LOCAL': '8'})
 
     def test_remote_auto_is_resolved_per_box(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], GLM)
         opt.validate(o)
         self.assertEqual(opt.kv_rows(o)['host'], 'auto')
         rows = opt.kv_rows_with(o, '10.1.0.20:7351')
@@ -570,7 +571,7 @@ class KvRowsTests(unittest.TestCase):
 class KvFormatTests(unittest.TestCase):
     def plan(self, *argv, tp='4'):
         o = opt.parse(['--no-config', '--peers', ','.join(PEERS.split(',')[:int(tp)]) if tp != '6' else
-                       ','.join(f'10.0.0.{i}' for i in range(1, 7)), *argv], {})
+                       ','.join(f'10.0.0.{i}' for i in range(1, 7)), *argv], GLM)
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
 

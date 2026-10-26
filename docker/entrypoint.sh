@@ -1,6 +1,7 @@
 #!/bin/bash
-# The image's entrypoint: ./gr8 glm53 COMMAND [OPTIONS], with no command meaning `up`. It first sets up this box's
-# working directory (G6_HOME): out/ exists, and bin/ links to the image's engine, which runs every TP width.
+# The image's entrypoint: ./gr8 $GR8_MODEL COMMAND [OPTIONS], with no command meaning `up`. GR8_MODEL is required
+# (glm53 or glm53f): nothing picks the model for the runner. It first sets up this box's working directory (G6_HOME):
+# out/ exists, and bin/ links to the image's engine, which runs every TP width.
 #
 # It sets its own limits, so a runtime without compose's `ulimits:` (Kubernetes has no such field) needs no wrapper: no
 # core dumps, and before `up` the soft memlock limit raised to the hard one, which must be unlimited.
@@ -15,7 +16,13 @@ while [ "${1:-}" = --no-check ]; do export CHECK=0; shift; done
 [ $# -gt 0 ] || set -- up
 cmd=$1; shift
 
-model=${GR8_MODEL:-glm53}
+# ./gr8 refuses an unknown name, listing the models; this names the line to add.
+if [ -z "${GR8_MODEL:-}" ]; then
+  echo "gr8: GR8_MODEL is not set: name the model, GR8_MODEL=glm53 (GLM-5.3) or GR8_MODEL=glm53f (GLM-5.3-Flash)," \
+       "in docker/.env, with docker run -e, or in the container's env on Kubernetes" >&2
+  exit 2
+fi
+model=$GR8_MODEL
 
 # A crash must not dump core: a rank maps ~90 GB, and the dumping thread holds the NVIDIA driver's lock the whole time
 # it writes, which can leave the box unreachable until a power cycle.

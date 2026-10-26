@@ -15,6 +15,7 @@ import supervisor as S  # noqa: E402
 from test_modelset import make_release  # noqa: E402
 
 PEERS = '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def manifest(path, name, width, layers=(0,), shared=4):
@@ -95,7 +96,7 @@ class OptionTests(unittest.TestCase):
         self.rel = make_release(os.path.join(self.t, 'rel'), variants=('base',))
 
     def opts(self, *argv):
-        o = opt.parse(['--no-config', '--peers', PEERS, '--model', self.rel, *argv], {})
+        o = opt.parse(['--no-config', '--peers', PEERS, '--model', self.rel, *argv], GLM)
         opt.validate(o)
         return o
 

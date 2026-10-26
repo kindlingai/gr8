@@ -394,13 +394,17 @@ jobs:
             python3 tools/steering/trace_audit.py --help > /dev/null
             bin/g6front-rs --help > /dev/null
             echo smoke OK'
-          docker run --rm "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4 \
+          docker run --rm -e GR8_MODEL=glm53 "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4 \
             --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
           # TP=5: the entrypoint no longer picks a bin/ by width, so every width the launcher accepts gets through it
-          docker run --rm "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4,192.0.2.5 \
-            --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
+          docker run --rm -e GR8_MODEL=glm53 "$img" show-config \
+            --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4,192.0.2.5 --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
+          # no model stops in the entrypoint, with exit 2 and the line to add: nothing picks one
+          rc=0; err=$(docker run --rm "$img" 2>&1 >/dev/null) || rc=$?
+          echo "$err"
+          [ "$rc" = 2 ] && echo "$err" | grep -q 'GR8_MODEL=glm53f' || { echo "model check: exit $rc"; exit 1; }
           # up with a limited memlock stops in the entrypoint, with exit 2 and the setting to change
-          rc=0; err=$(docker run --rm --ulimit memlock=65536:65536 "$img" 2>&1 >/dev/null) || rc=$?
+          rc=0; err=$(docker run --rm -e GR8_MODEL=glm53 --ulimit memlock=65536:65536 "$img" 2>&1 >/dev/null) || rc=$?
           echo "$err"
           [ "$rc" = 2 ] && echo "$err" | grep -q 'memlock=-1' || { echo "memlock check: exit $rc"; exit 1; }
       - name: Push
