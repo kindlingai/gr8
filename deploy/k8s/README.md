@@ -96,6 +96,24 @@ extraVolumeMounts:
     readOnly: true
 ```
 
+### model-loader
+
+With `modelLoader.enabled: true`, the box's [model-loader](https://github.com/kindlingai/model-loader) fetches the
+weights, and the pods share its pieces over the LAN rather than each fetching from Hugging Face:
+
+```yaml
+modelLoader:
+  enabled: true
+  store: /var/lib/model-loader      # model-loader's store on every box
+```
+
+The chart mounts the store read-only from the box (`hostPath`), sets `FETCH=model-loader`, `MODEL_CACHE` to the store
+and `MODEL_LOADER` to its socket, and makes no `cache` claim. An init container waits until `model-loader -check`
+answers. model-loader runs on each box from its own deploy tree: its `deploy/k8s` peer DaemonSet with the settings of
+its `examples/gr8` (group 1000, gr8's, so gr8 can open its socket, and a readiness probe on the socket; leave out that
+example's gr8 Deployment, which this chart replaces), or `deploy/spark-os`. gr8 finds the release (and `DRAFTER`) in model-loader's catalog by the
+repo, so nothing in `options` repeats a catalog name.
+
 ### Placement
 
 The pods go wherever the scheduler finds a GPU and the RDMA resource. When the cluster has GB10 boxes that are not on

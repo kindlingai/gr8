@@ -44,7 +44,8 @@ KEYS = {
     'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release "
                                  '(FETCH=model-loader: the model-loader store, which gr8 reads and may mount read-only)'),
     'FETCH': ('box', 'legacy', 'with an https:// --model: who fetches the weights. legacy: gr8 itself, from Hugging Face. '
-                               "model-loader: the box's model-loader (MODEL_LOADER), into its store (MODEL_CACHE)"),
+                               "model-loader: the box's model-loader (MODEL_LOADER), into its store (MODEL_CACHE). "
+                               'Default: model-loader when MODEL_LOADER is set, else legacy'),
     'MODEL_LOADER': ('box', None, "FETCH=model-loader: the local model-loader's request API, unix:PATH or host:port "
                                   '(default unix:<MODEL_CACHE>/model-loader.sock). host:port needs '
                                   'MODEL_LOADER_LOCAL_TOKEN in the environment'),
@@ -366,6 +367,10 @@ def parse(argv, environ=None):
         values['MENTAT'], origin['MENTAT'] = 'localhost', 'default'
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
+    # A box that names its model-loader fetches through it: model-loader's own deploy trees (deploy/compose/gr8.yml,
+    # deploy/spark-os/gr8.override.yml, deploy/k8s/examples/gr8) set MODEL_LOADER and MODEL_CACHE, not FETCH.
+    if origin['FETCH'] == 'default' and values['MODEL_LOADER']:
+        values['FETCH'], origin['FETCH'] = 'model-loader', f'MODEL_LOADER, from the {origin["MODEL_LOADER"]}'
     deprecated_kv(values, origin, warnings)
     model = values['GR8_MODEL']
     if model and model not in models.MODELS:
@@ -452,6 +457,9 @@ def validate(o):
         raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
     if o.get('FETCH') not in ('legacy', 'model-loader'):
         raise OptionError(f'--fetch {o.get("FETCH")}: want legacy or model-loader')
+    if o.get('FETCH') == 'legacy' and o.get('MODEL_LOADER'):
+        raise OptionError(f'--fetch legacy with --model-loader {o.get("MODEL_LOADER")}: gr8 fetches its own weights then, '
+                          'and does not ask model-loader. Unset one')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')

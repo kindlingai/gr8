@@ -40,6 +40,37 @@ needs to stop a wedged rank should end its `g6m4`, not its container: the superv
 every box restarts and boots again together. Killing the container takes the supervisor with it, so no supervisor
 reports the failure.
 
+## With model-loader
+
+`docker/model-loader.yaml` makes the box's model-loader fetch the weights ([docs/DEPLOY.md](../docs/DEPLOY.md#with-model-loader)
+has every surface):
+
+    docker compose -f docker/compose.yaml -f docker/model-loader.yaml up -d
+
+In a directory that holds only `compose.yaml` and `.env`, fetch `model-loader.yaml` next to them and drop `docker/`.
+
+Give both `-f` files to every compose command (`pull`, `exec`, `logs`). The override:
+
+- mounts model-loader's store read-only at `/var/lib/model-loader` (`MODEL_LOADER_STORE` on the host, default
+  `/var/lib/model-loader`), and sets `MODEL_CACHE` to it. gr8 reads the release in place and writes nothing there.
+  Its own state (the expert-half check receipts, a converted drafter, unpacked steering profiles) goes to
+  `run/model-loader/` in the home volume;
+- sets `FETCH=model-loader` and `MODEL_LOADER` to the socket `model-loader.sock` in the store;
+- starts gr8 once that socket answers (`model-loader -check`, in a one-shot container from `MODEL_LOADER_IMAGE`).
+
+model-loader runs from its own deploy tree: `deploy/compose` as a container, or `deploy/spark-os` as a systemd unit on
+kindling-spark-os. Either runs in group 1000, gr8's, so gr8 can open the socket (mode 0660). With `deploy/compose`,
+set its `MODEL_LOADER_STORE` to the same host directory as here, because its default is a named volume. Its catalog
+lists the release and, for `DRAFTER`, the drafter, with their Hugging Face repos as sources. gr8 asks model-loader for
+the entries whose repos are `MODEL`'s and `DRAFTER`'s, so the catalog may name them anything and nothing in
+`docker/.env` repeats the names.
+
+model-loader's own `deploy/compose/gr8.yml` (gr8 in model-loader's project) and `deploy/spark-os/gr8.override.yml`
+work in place of this file: they set `MODEL_CACHE` and `MODEL_LOADER`, and `MODEL_LOADER` alone selects model-loader.
+
+The `cache` volume is not used then. A `run --rm gr8 prepare` asks model-loader for this box's pieces and waits until
+it holds them, without booting.
+
 ## Updating
 
 CI publishes `ghcr.io/kindlingai/gr8:latest` from every push to main, and `sha-<commit>` and release tags beside it.
@@ -68,6 +99,8 @@ sizes and variants. Three more lines are for compose itself:
 | `GR8_IMAGE` | `ghcr.io/kindlingai/gr8:latest` | the image |
 | `GR8_CACHE` | the `cache` volume | this box's part of the model: a host directory instead, owned by uid 1000 |
 | `GR8_HOME` | the `home` volume | logs and state (`out/`, `s2/`, `run/`): a host directory instead, owned by uid 1000, and not a bare-metal `G6_HOME` (its `bin/` is a build) |
+| `MODEL_LOADER_STORE` | `/var/lib/model-loader` | with `docker/model-loader.yaml`: model-loader's store on this box |
+| `MODEL_LOADER_IMAGE` | `ghcr.io/kindlingai/model-loader:latest` | with `docker/model-loader.yaml`: the image whose `model-loader -check` gr8's start waits on |
 
 No topology needs ssh between the boxes: TP=6 serves through S2 like TP=4 and TP=3.
 

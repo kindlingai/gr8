@@ -88,6 +88,12 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
 each way to run it, each ending with a passing `smoke`: [bare metal](docs/DEPLOY.md#bare-metal),
 [Docker Compose](docs/DEPLOY.md#docker-compose) and [Kubernetes](docs/DEPLOY.md#kubernetes).
 
+### With model-loader
+
+[model-loader](https://github.com/kindlingai/model-loader) can fetch the weights instead of gr8: the boxes copy the
+pieces between them over the LAN, from one Hugging Face fetch or a NAS. Each surface takes it with one more file or
+value: [docs/DEPLOY.md](docs/DEPLOY.md#with-model-loader).
+
 ## Running it
 
 Every box runs the same `./gr8 glm53 up` ([docs/DEPLOY.md](docs/DEPLOY.md)). The first address in `--peers` is the
