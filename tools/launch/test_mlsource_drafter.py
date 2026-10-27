@@ -216,7 +216,9 @@ class SteeringTests(unittest.TestCase):
         shutil.rmtree(cls.t, ignore_errors=True)
 
     def setUp(self):
-        self.d = tempfile.mkdtemp(prefix='gr8mlss-', dir=self.t)
+        # Not under self.t: macOS's long $TMPDIR would push the store's socket past AF_UNIX's 104 bytes
+        self.d = tempfile.mkdtemp(prefix='gr8mlss-')
+        self.addCleanup(shutil.rmtree, self.d, True)
         self.store, self.home = os.path.join(self.d, 'store'), os.path.join(self.d, 'home')
         self.ml = fake_model_loader.FakeModelLoader(self.store, {'glm-5.3-exlr8': {'main': (self.rel, T.C1)}},
                                                     repos={'glm-5.3-exlr8': T.RELEASE})
