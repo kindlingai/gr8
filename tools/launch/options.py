@@ -41,7 +41,15 @@ KEYS = {
     'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
     'MODEL': ('box', None, 'the exlr8 release: https://huggingface.co/<org>/<repo>[@rev], or a local copy (an NFS '
                            'mount works) used in place'),
-    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release"),
+    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release "
+                                 '(FETCH=model-loader: the model-loader store, which gr8 reads and may mount read-only)'),
+    'FETCH': ('box', 'legacy', 'with an https:// --model: who fetches the weights. legacy: gr8 itself, from Hugging Face. '
+                               "model-loader: the box's model-loader (MODEL_LOADER), into its store (MODEL_CACHE)"),
+    'MODEL_LOADER': ('box', None, "FETCH=model-loader: the local model-loader's request API, unix:PATH or host:port "
+                                  '(default unix:<MODEL_CACHE>/model-loader.sock). host:port needs '
+                                  'MODEL_LOADER_LOCAL_TOKEN in the environment'),
+    'MODEL_LOADER_MODEL': ('box', None, "FETCH=model-loader: the release's name in model-loader's catalog, when the "
+                                        "catalog cannot be asked (default: the entry whose source is MODEL's repo)"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
@@ -440,6 +448,12 @@ def validate(o):
         raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
     if o.get('LAYOUT') and not os.path.isfile(o.get('LAYOUT')):
         raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
+    if o.get('FETCH') not in ('legacy', 'model-loader'):
+        raise OptionError(f'--fetch {o.get("FETCH")}: want legacy or model-loader')
+    if o.get('FETCH') == 'model-loader' and o.get('DRAFTER'):
+        raise OptionError('--drafter with --fetch model-loader: not yet; the drafter needs --fetch legacy')
+    if o.get('FETCH') == 'model-loader' and (o.get('STEERING_PROFILE') or '').startswith('hf:'):
+        raise OptionError('--steering-profile hf:... with --fetch model-loader: not yet; it needs --fetch legacy')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')
