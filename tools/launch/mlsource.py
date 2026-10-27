@@ -25,6 +25,7 @@ well as its bytes, so they cannot go into the request's xxh64 fields.
 model-loader holds whole 64 MiB segments. A rank's expert halves are spread over every segment of a width file (the half
 rule interleaves the ranks), so the store holds every expert file the rank's widths use, in full.
 """
+import bisect
 import http.client
 import json
 import os
@@ -171,21 +172,28 @@ class Store:
         return {f['path']: f for f in (s or {}).get('files', [])}
 
     @staticmethod
-    def verified(fm, fs, a, n):
-        """Is [a, a + n) of the file verified on disk (the contract's rule)?"""
+    def verified(fm, fs, ranges):
+        """Is every [a, a + n) in ranges verified on disk (the contract's rule)? It builds the held runs once: a rank
+        checks about 1500 ranges in each file."""
         if not fs or fs.get('whole_failed'):
             return False
         if fs.get('complete'):
             return True
         seg = int(fm.get('segment_size') or 0)
-        if not seg or n <= 0 or a < 0 or a + n > fm['size']:
+        if not seg:
             return False
         nseg = -(-fm['size'] // seg)
         runs = Store.runs(fs, nseg)
         if runs == [[0, nseg]]:                 # every segment held, not complete: not used until its whole check
             return False
-        first, last = a // seg, (a + n - 1) // seg
-        return any(lo <= first and last < hi for lo, hi in runs)
+        starts = [lo for lo, _ in runs]
+        for a, n in ranges:
+            if n <= 0 or a < 0 or a + n > fm['size']:
+                return False
+            i = bisect.bisect_right(starts, a // seg) - 1
+            if i < 0 or (a + n - 1) // seg >= runs[i][1]:
+                return False
+        return True
 
     @staticmethod
     def runs(fs, nseg):
@@ -231,7 +239,7 @@ class Store:
             if p not in man or not (held.get(p) or {}).get('complete') or held[p].get('whole_failed'):
                 out.append(p)
         for p, rs in ranges.items():
-            if p not in man or not all(self.verified(man[p], held.get(p), a, n) for a, n in rs):
+            if p not in man or not self.verified(man[p], held.get(p), rs):
                 out.append(p)
         return out
 

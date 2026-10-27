@@ -131,7 +131,9 @@ class ModelLoaderTests(unittest.TestCase):
 
     def test_held_runs(self):
         fm = {'size': 10 * 64, 'segment_size': 64}
-        V = mlsource.Store.verified
+        def V(fm, st, a, n):
+            return mlsource.Store.verified(fm, st, [(a, n)])
+
         st = {'complete': False, 'held': [[0, 2], [2, 4], [7, 9]]}
         self.assertTrue(V(fm, st, 0, 256))                        # runs that touch join
         self.assertTrue(V(fm, st, 7 * 64 + 3, 100))
@@ -142,6 +144,8 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertTrue(V(fm, {'complete': True, 'held': [[0, 10]]}, 0, 64))
         self.assertFalse(V(fm, {'complete': True, 'whole_failed': True, 'held': [[0, 10]]}, 0, 64))
         self.assertTrue(V(fm, {'complete': False, 'segments_done': [True, True] + [False] * 8}, 64, 64))
+        self.assertTrue(mlsource.Store.verified(fm, st, [(0, 256), (7 * 64, 128)]))
+        self.assertFalse(mlsource.Store.verified(fm, st, [(0, 256), (4 * 64, 1)]))
 
     def test_the_store_losing_a_piece_fails_the_check(self):
         o, ms, v = self.resolve()
