@@ -67,10 +67,8 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertEqual(opt.parse(['--no-config'], T.GLM).get('FETCH'), 'legacy')
         with self.assertRaises(opt.OptionError):
             opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--fetch', 'nas'], T.GLM))
-        for bad in (['--drafter', 'https://huggingface.co/incoai/GLM-5.3-DFlash2'], ['--steering-profile', 'hf:default']):
-            with self.assertRaises(opt.OptionError) as e:
-                self.opts(*bad)
-            self.assertIn('--fetch legacy', str(e.exception))
+        for ok in (['--drafter', 'https://huggingface.co/incoai/GLM-5.3-DFlash2'], ['--steering-profile', 'hf:default']):
+            self.opts(*ok)                                            # #179: both go through model-loader too
 
     def test_one_rank_through_model_loader(self):
         o, ms, v = self.resolve()

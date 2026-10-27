@@ -60,9 +60,15 @@ def _save(path, value):
             os.unlink(tmp)
 
 
+def _work(source):
+    """Where gr8 writes the receipt, the lock and the unpacked profiles: the release's own cache directory for the
+    legacy fetch, a directory under G6_HOME for model-loader (whose store gr8 never writes)."""
+    return getattr(source, 'steering_work', None) or os.path.join(source.dir, 'steering')
+
+
 def _index(source):
     path = os.path.join(source.dir, INDEX)
-    receipt = os.path.join(source.dir, 'steering', '.index-identity.json')
+    receipt = os.path.join(_work(source), '.index-identity.json')
     if os.path.isfile(path) and os.path.isfile(receipt):
         # These small integrity records are scoped to the resolved commit. Recheck cached bytes on every restart;
         # a complete cache does not need the hub's tree API. Like the model cache, this is not a trust store.
@@ -94,7 +100,7 @@ def _index(source):
 def fetch(source, requested):
     """Verify and materialize one selected artifact, reusing only identical cached bytes."""
     try:
-        directory = os.path.join(source.dir, 'steering')
+        directory = _work(source)
         os.makedirs(directory, exist_ok=True)
         # Serialize fetch's shared .part files and publication across processes using this commit's cache.
         with open(os.path.join(directory, '.fetch.lock'), 'a') as lock:

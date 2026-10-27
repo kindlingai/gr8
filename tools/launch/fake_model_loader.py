@@ -164,11 +164,27 @@ class FakeModelLoader:
             self.requests[name] = st
             return 200, st
 
+    @staticmethod
+    def sha256(path):
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    LFS_MIN = 4096     # as test_hf's hub: a file this big has a sha256 from the origin, a smaller one none (git only)
+
     def manifest(self, model, rev, commit, files):
         p = os.path.join(self.store, 'manifests', model, rev + '.json')
         os.makedirs(os.path.dirname(p), exist_ok=True)
+        src = self.catalog[model][rev][0]
         m = {'model': model, 'revision': rev, 'commit': commit,
-             'files': [{'path': f, 'size': n, 'sha256': '', 'segment_size': self.segment} for f, n in sorted(files.items())]}
+             'files': [{'path': f, 'size': n, 'segment_size': self.segment,
+                        'sha256': self.sha256(os.path.join(src, f)) if n >= self.LFS_MIN else ''}
+                       for f, n in sorted(files.items())]}
+        try:
+            with open(p) as f:
+                if json.load(f) == m:
+                    return
+        except (OSError, ValueError):
+            pass
         with open(p + '.tmp', 'w') as f:
             json.dump(m, f)
         os.replace(p + '.tmp', p)
@@ -209,9 +225,16 @@ class FakeModelLoader:
             files.append({'path': fs['path'], 'complete': fs['complete'], 'held': runs,
                           'nseg': len(fs['segments_done'])})
         p = self.state_path(model, rev)
+        new = {'model': model, 'revision': rev, 'files': files}
+        try:
+            with open(p) as f:
+                if json.load(f) == new:
+                    return
+        except (OSError, ValueError):
+            pass
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p + '.tmp', 'w') as f:
-            json.dump({'model': model, 'revision': rev, 'files': files}, f)
+            json.dump(new, f)
         os.replace(p + '.tmp', p)
 
     def hold(self, src, model, rev, path, size, ranges, state):
@@ -221,6 +244,8 @@ class FakeModelLoader:
         segs = range(nseg) if ranges is None else sorted({i for a, n in ranges
                                                           for i in range(a // self.segment, (a + n - 1) // self.segment + 1)})
         dst = os.path.join(self.store, 'models', model, rev, path)
+        if all(fs['segments_done'][i] for i in segs):
+            return len(segs) * self.segment
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         fd = os.open(dst, os.O_RDWR | os.O_CREAT, 0o644)
         try:
