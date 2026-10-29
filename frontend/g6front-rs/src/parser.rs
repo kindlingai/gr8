@@ -11,7 +11,8 @@
 //!   held until the reply ends.
 //! - A call to a name the request did not declare is prose by default, tags and all. `emit_undeclared`
 //!   (`--undeclared-tool-calls emit`) takes it as a call when the name looks like a function name (`plausible_name`),
-//!   so the client sees the call and can answer it with its own "unknown tool" error.
+//!   so the client sees the call and can answer it with its own "unknown tool" error. Such a call is never live: it is
+//!   held until the reply ends with it.
 //!
 //! Tags are ASCII, so all scanning is on bytes; text is only ever cut at tag boundaries.
 
@@ -168,8 +169,8 @@ impl GlmParser {
 
     /// A call may name a function the request did not declare (`--undeclared-tool-calls emit`): such a call is read
     /// like any other instead of staying prose, when its name looks like a function name (`plausible_name`). Its
-    /// arguments are strings, having no schema to coerce them by. Nothing else about how a call is read changes: the
-    /// rules that tell a call the model makes from one it writes about apply as before.
+    /// arguments are strings, having no schema to coerce them by. Such a call never goes live: it is held until the
+    /// reply ends with it, so the rules that tell a call the model makes from one it writes about apply in full.
     pub fn emit_undeclared(mut self, on: bool) -> GlmParser {
         self.undeclared = on;
         self
@@ -416,7 +417,9 @@ impl GlmParser {
     fn go_live(&mut self, idx: usize, body: &str, closed: bool, deltas: &mut Vec<ToolDelta>) {
         let Some(end) = body.find(ARG_KEY).or(closed.then_some(body.len())) else { return };
         let name = py_strip(&body[..end]);
-        if name.contains(THINK_START) || name.contains(THINK_END) || !self.name_valid(name) {
+        // only a declared name goes live: an undeclared one (`emit_undeclared`) is held, so prose after it still proves
+        // the run was prose -- a client answering it with an unknown-tool error gains nothing from streaming it
+        if name.contains(THINK_START) || name.contains(THINK_END) || !self.declared(name) {
             return; // the held rules decide it
         }
         let id = tool_call_id();
@@ -549,9 +552,13 @@ impl GlmParser {
         }
     }
 
+    /// A name the request offered (any name when it lists no functions, as before).
+    fn declared(&self, name: &str) -> bool {
+        !name.is_empty() && (self.tools.is_empty() || self.tools.contains_key(name))
+    }
+    /// A name a held run may call: a declared one, or with `emit_undeclared` one that looks like a function name.
     fn name_valid(&self, name: &str) -> bool {
-        !name.is_empty()
-            && (self.tools.is_empty() || self.tools.contains_key(name) || (self.undeclared && plausible_name(name)))
+        self.declared(name) || (self.undeclared && plausible_name(name))
     }
     fn args_json(&self, name: &str, pairs: &[(String, String)]) -> String {
         let mut params: Map<String, Value> = Map::new();
@@ -698,12 +705,13 @@ fn inside_value(before: &str) -> bool {
 /// Longest undeclared name `plausible_name` takes, in bytes.
 const NAME_MAX: usize = 128;
 
-/// Whether `name`, which no tool of the request has, could be a function the model means to call: 1 to `NAME_MAX`
-/// bytes of ASCII letters, digits, `_`, `-`, `.` and `:` (OpenAI's `[a-zA-Z0-9_-]`, plus the separators namespaced tool
-/// names use). Prose between the tags -- spaces, punctuation, markup -- stays prose.
+/// Whether `name`, which no tool of the request has, could be a function the model means to call: an identifier of
+/// 1 to `NAME_MAX` bytes that starts with an ASCII letter or `_` and goes on with letters, digits, `_`, `-`, `.` and
+/// `:` (OpenAI's `[a-zA-Z0-9_-]`, plus the separators namespaced tool names use). Prose between the tags -- spaces,
+/// markup, a placeholder like `...` or `-`, a number -- stays prose.
 fn plausible_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= NAME_MAX
+    name.len() <= NAME_MAX
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
 
@@ -1229,8 +1237,9 @@ mod tests {
         (content, calls)
     }
 
-    /// `--undeclared-tool-calls emit`: a call to a name the request did not declare is a call, whole and streamed,
-    /// live (it starts the answer) or held (after a space). Its arguments are strings: there is no schema to coerce by.
+    /// `--undeclared-tool-calls emit`: a call to a name the request did not declare is a call, whole and streamed, when
+    /// the reply ends with it (it is held even where a declared call would go live). Its arguments are strings: there is
+    /// no schema to coerce by.
     #[test]
     fn undeclared_name_is_a_call_when_emitting() {
         for text in [
@@ -1272,6 +1281,17 @@ mod tests {
             "</think><tool_call>a <b>c</b></tool_call>",
             "</think>The format is <tool_call>nope and then the arguments.",
             "Think <tool_call>nope here</think>Done.",
+            // not identifiers: placeholders, numbers, words with spaces or slashes
+            "</think>The placeholder is <tool_call>...</tool_call>",
+            "</think>Done.<tool_call>-</tool_call>",
+            "</think>Score:<tool_call>10</tool_call>",
+            "</think><tool_call>.hidden</tool_call>",
+            "</think><tool_call>get weather</tool_call>",
+            "</think><tool_call>fs/read</tool_call>",
+            // an undeclared call where a declared one would go live is held: prose after it makes it prose
+            "</think>I agree.<tool_call>yes</tool_call> That is all.",
+            "</think>I'd write it as:<tool_call>example_tool<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>\n\
+             That's the format.",
         ] {
             let off = full(text);
             let on = emitting().parse_full(text);
