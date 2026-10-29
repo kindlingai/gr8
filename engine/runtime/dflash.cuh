@@ -30,7 +30,8 @@
 // summed per vocab slice). Real collectives left: the head (2L + 1) and the fill's NT feature gathers, plus the fill's
 // collective NT with no payload (a barrier: a rank publishes the next fill's gathers only after every peer received
 // this one's, so the proxy never misses a doorbell). Two query steps of a rank are always separated by a target step.
-// The target step writes its residual rows after the tapped layers into Dfl::feat (Model::dfl_tap, inside its graph).
+// The target step writes its residual rows after the tapped layers into Dfl::feat (Model::dfl_tap, inside its graph;
+// Flash: the mean of the four mHC streams).
 // Prompt context: the prefill sub-batches write the owner rows of the last WIN prompt positions into Dfl::pf_feat
 // (Prefill::dfl_tap); after the prefill, fill steps gather them 8 rows at a time (collectives 0..NT-1: every rank's rows,
 // zero where it is not the owner, summed: exact) and run the context part on them (fc slices on collective NT).
@@ -175,6 +176,17 @@ __global__ void __launch_bounds__(256) k_tap(const float* resid, __half* feat, i
     const int m = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x;
     feat[((size_t)m * NT + s) * HID + c] = __float2half_rn(resid[(size_t)m * HID + c] * FEAT_SCALE);
 }
+#if G6_MODEL_FLASH
+// Flash: the mean of the four mHC streams [M][4][HID] after the layer's MLP consume (hc_post applied), summed in stream
+// order, as k_mhc_out_inv_final forms it before the final norm -> fp16 features of tap slot s. grid (HID / 256, M), block 256
+static_assert(geom::HC == 4, "k_tap_mhc: four mHC streams");
+__global__ void __launch_bounds__(256) k_tap_mhc(const float* streams, __half* feat, int s)
+{
+    const int m = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x;
+    const float* x = streams + (size_t)m * 4 * HID + c;
+    feat[((size_t)m * NT + s) * HID + c] = __float2half_rn((x[0] + x[HID] + x[2 * HID] + x[3 * HID]) * .25f * FEAT_SCALE);
+}
+#endif
 
 // collective 0: every rank's [B][NFR] fp32 fc columns -> the full rows -> hidden_norm -> fp16. grid (RN_CL, B), block RN_T
 struct CtxArgs { g6::FabricDev f; const u64* stepp; int c; const __nv_bfloat16* w; __half* out; float eps; };
@@ -713,7 +725,22 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     sc.xf_head = D.xf_head;
     bind::HeadIo io;
     io.h = D.x; io.logits = D.hlog;
+#if G6_MODEL_FLASH
+    {   // Flash's lm_head is FP8R (row scales) or BF16: the codec rule of head_for, on fp16 fragments (BF16: bf16 ones)
+        const int codec = ht.lm_head_scale.p ? bind::FP8R : ht.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W;
+        D.head = bind::Head();
+        D.head.M = B; D.head.vlo = main.vlo; D.head.vn = main.vn;
+        if (const char* e = bind::make_gv(ht.lm_head, codec, 1, 32, B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head,
+                                          static_cast<const float*>(ht.lm_head_scale.p)))
+            die(std::string("dflash head: ") + e);
+        if (D.head.lm_head.K != HID || D.head.lm_head.O != D.vn) die("dflash head: G.lm_head is not this rank's vocab slice");
+        bind::Xfrag& x = D.head.xf_h;
+        x.on = 1; x.src = D.x; x.ld = HID; x.K = HID; x.M = B;
+        (codec == bind::BF16W ? x.bf16 : x.f16) = D.xf_head;
+    }
+#else
     if (const char* e = bind::make_head(ht, D.rank, B, sc, io, D.head)) die(std::string("dflash head: ") + e);
+#endif
     G6RT_CK(cudaStreamSynchronize(st));
     size_t wb = 0;
     auto gvb = [&](const bind::Gv& g) { wb += bind::gv_bytes(g); };
@@ -1028,7 +1055,8 @@ inline void dfl_dump_tokens(FILE* f, const std::vector<int>& t)
 }
 
 // ---------------------------------------------------------------- the target side
-// Model::dfl_tap hook: after layer i's second consume, the residual rows of a tapped layer -> Dfl::feat
+// Model::dfl_tap hook: after layer i's second consume, the residual rows of a tapped layer -> Dfl::feat (Flash: the
+// mean of the mHC streams, launch_step_flash)
 inline Dfl*& dfl_of(const Model& m)
 {
     static Dfl* by_rank[8] = {};
@@ -1038,7 +1066,12 @@ inline void dfl_tap_launch(Model& m, int i, int M, cudaStream_t st)
 {
     Dfl* D = dfl_of(m);
     for (int s = 0; s < dfl::NT; ++s)
-        if (D->tlayer[s] == m.layers[i].l) dflk::k_tap<<<dim3(HID / 256, M), 256, 0, st>>>(m.resid, D->feat, s);
+        if (D->tlayer[s] == m.layers[i].l)
+#if G6_MODEL_FLASH
+            dflk::k_tap_mhc<<<dim3(HID / 256, M), 256, 0, st>>>(m.resid4, D->feat, s);
+#else
+            dflk::k_tap<<<dim3(HID / 256, M), 256, 0, st>>>(m.resid, D->feat, s);
+#endif
 }
 // Prefill::dfl_tap hook: after layer i of a prefill sub-batch, this rank's up-to-date rows (its owner rows in the RS form;
 // rank 0 alone in the all-reduce form, so a gathered row is never summed twice) -> Dfl::pf_feat
@@ -1089,6 +1122,9 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
     const u64 step0 = main_step;
     std::vector<int> tokens = p.prompt;
     int d[B] = {};
+#if G6_MODEL_FLASH
+    int kcur = 0;                     // KDA ring: the slot with the committed state (prompt steps: slot 0)
+#endif
     const float dtemp = p.rs ? 0.f : p.inv_temp;   // rejection sampling: greedy drafts (they must not use the target's noise)
     auto draft = [&](int rows, int pos0, int bonus, bool query, int s, double& ms) {
         DflIn di;
@@ -1129,13 +1165,22 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
             si.steering_scale[r] = p.steering_scale;
+#if G6_MODEL_FLASH
+            si.kslot[r] = r;                     // slot r ends with the state after rows 0..r (Model::kda_ring >= B)
+#endif
         }
+#if G6_MODEL_FLASH
+        si.kda_src = kcur;
+#endif
         si.context = base + k + 1;
         double tv = 0, tf = 0;
         const StepOut so = run_main(si, s, tv);
         int a = 0;
         while (a < k && d[a + 1] == so.tok[a]) ++a;
         for (int r = 0; r <= a; ++r) tokens.push_back(so.tok[r]);
+#if G6_MODEL_FLASH
+        kcur = a;
+#endif
         if (ad)
         {
             sl->observe(k, a, dl, pe);

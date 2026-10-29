@@ -2,6 +2,9 @@
 
 python3 engine/ref/dflash2_replay.py DUMP --src DRAFTER --glm GLM_DIR [--quant mxfp8|bf16] [--rounds N] [--out FILE]
 
+GLM_DIR holds the target's model-embed.safetensors and model-head.safetensors (GLM-5.3 or GLM-5.3-Flash); the sizes come
+from the drafter's config.
+
 For every draft step of the dump: the reference's drafts (argmax and selector walk) from the same context features and
 bonus token, against the engine's drafts and against the committed tokens (acceptance = leading drafts equal to them).
 The context K/V of a position is computed once; the block of every round runs layer by layer over all rounds together,
@@ -17,10 +20,12 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dflash2_ref as R  # noqa: E402
 
-B, NT, HID, NH, NKV, HD = 8, 6, 6144, 64, 8, 128
+B, HD = 8, 128
+NT, HID = 6, 6144                     # GLM-5.3's: dflash2_ab.py's sizes. The replay takes the drafter's
 
 
-def load_dump(path):
+def load_dump(path, width=NT * HID):
+    """width: the feature values a row (taps x hidden)"""
     raw = open(path, 'rb').read()
     off, steps, feats, tokens = 0, [], {}, None
     while off < len(raw):
@@ -31,7 +36,7 @@ def load_dump(path):
             off += 4 * h[1]
             continue
         kind, pos0, rows, q0, tok0 = (int(x) for x in h[:5])
-        f = np.frombuffer(raw, np.float16, rows * NT * HID, off).reshape(rows, NT * HID)
+        f = np.frombuffer(raw, np.float16, rows * width, off).reshape(rows, width)
         off += f.nbytes
         for r in range(rows):
             feats[pos0 + r] = f[r]
@@ -48,21 +53,22 @@ def accept(d, actual):
 
 
 def ref_drafts(D, glm, pos, F, steps):
-    """Reference drafts of every step at once. pos [P] positions with context features F [P, 6 x 6144] (float32, the
-    residual itself); steps: dicts with q0 (block start = the bonus position) and tok0 (the bonus token).
+    """Reference drafts of every step at once. pos [P] positions with context features F [P, taps x hidden] (float32,
+    the residual itself); steps: dicts with q0 (block start = the bonus position) and tok0 (the bonus token).
     -> (walk drafts [n, 7], argmax drafts [n, 7])"""
+    HID, NH, NKV = D.hid, D.nh, D.nkv
     kv, _ = D.context_kv(F, pos)
     emb_st = R.ST(os.path.join(glm, 'model-embed.safetensors'))
     mask = D.d['mask_token_id']
     erow = lambda t: R.bf(emb_st.get('model.embed_tokens.weight', rows=(t, t + 1))[0])
     me = erow(mask)
     n = len(steps)
-    h = np.stack([np.stack([erow(s['tok0'])] + [me] * 7) for s in steps])  # [n, 8, 6144]
+    h = np.stack([np.stack([erow(s['tok0'])] + [me] * 7) for s in steps])  # [n, 8, hidden]
     qpos = np.array([np.arange(s['q0'], s['q0'] + B) for s in steps])
     NG = HID // D.G
 
     def prep(x, j, which):
-        """conv prepare of every round at once: (conv'd rows [n, 8, 6144], (delta side 1, base side 1))"""
+        """conv prepare of every round at once: (conv'd rows [n, 8, hidden], (delta side 1, base side 1))"""
         p = f'layers.{j}.{which}.'
         dl = D.lin(x.reshape(-1, HID), p + 'kernel_projection.weight').reshape(n, B, 2, 2, NG)
         base = D.w(p + 'base_kernel')
@@ -120,19 +126,20 @@ def main():
     ap.add_argument('--feats', default=None, help='take the context features from this dump instead (e.g. the same text '
                                                   'sent again as a prompt, so its features come from the prefill path)')
     a = ap.parse_args()
-    steps, feats, tokens = load_dump(a.dump)
+    D = R.Drafter(a.src, None if a.quant == 'bf16' else a.quant)
+    nt = len(D.d['target_layer_ids'])
+    steps, feats, tokens = load_dump(a.dump, nt * D.hid)
     if a.feats:
-        _, f2, _ = load_dump(a.feats)
+        _, f2, _ = load_dump(a.feats, nt * D.hid)
         missing = [p for p in feats if p not in f2]
         print(f'features from {a.feats}: {len(f2)} positions, {len(missing)} of the original missing (kept)')
         feats = {p: f2.get(p, v) for p, v in feats.items()}
     if a.rounds:
         steps = steps[:a.rounds]
-    D = R.Drafter(a.src, None if a.quant == 'bf16' else a.quant)
     pos = np.array(sorted(feats))
     F = np.stack([feats[p] for p in pos]).astype(np.float32) * 64          # the engine stores residual / 64
     if a.noise:                       # sensitivity: Gaussian noise, std = noise x the RMS of each row's tap layer
-        Fl = F.reshape(len(F), NT, HID)
+        Fl = F.reshape(len(F), nt, D.hid)
         Fl += np.random.default_rng(0).standard_normal(Fl.shape).astype(np.float32) * a.noise * np.sqrt((Fl ** 2).mean(-1, keepdims=True))
     walks, argmaxes = ref_drafts(D, a.glm, pos, F, steps)
     rows = []

@@ -1050,18 +1050,21 @@ int main(int argc, char** argv)
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
 #if G6_MODEL_FLASH
-    if (mtp) m.kda_ring = mtp + 1;      // KDA state slots for the verify ring
+    if (mtp || dfl) m.kda_ring = std::max(mtp + 1, dfl ? dfl::B : 0);   // KDA state slots for the verify ring (DFlash2: B rows)
     if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
 #endif
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
-    // stay decode-sized. Combinations the Flash prefill does not support yet stop here.
-    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || dfl || reuse_prefix
+    // stay decode-sized. Combinations the Flash prefill does not support yet stop here. --dflash: offline, and without
+    // the drafter's prompt context (G6_DFL_PFCTX=0), until the prefill has taps
+    const bool dfl_pfctx = !(getenv("G6_DFL_PFCTX") && atoi(getenv("G6_DFL_PFCTX")) == 0);
+    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || (dfl && (s2mode || dfl_pfctx)) || reuse_prefix
 #if defined(G6_CP) && G6_CP
                || cp_on
 #endif
                ))
-        die("Flash --prefill: not with G6_PF_RS, G6_PF_OWN, --qo-/--qp- packs, --dflash, --reuse-prefix or CP (P1)");
+        die("Flash --prefill: not with G6_PF_RS, G6_PF_OWN, --qo-/--qp- packs, --dflash (offline with G6_DFL_PFCTX=0 only), "
+            "--reuse-prefix or CP (P1)");
     if (two && getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2)
         die("Flash --pf-lanes 2 uses one compute stream; G6_PF_STREAMS=2 is not supported");
     if (two && getenv("G6_RESID_DUMP"))
