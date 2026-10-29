@@ -124,6 +124,8 @@ manifest instead. `LAYOUT` is a path too: the handshake compares the sha256 of t
 | `ATTN_P11` | unset (0) | unset (0) | unset (0) | 1 = the P11 decode attention tile retune; takes precedence over `ATTN_SC2`, `ATTN_CTX2`, `ATTN_CTX3` (`G6_ATTN_P11`; read before graph capture). Effect not measured |
 | `DTR` | unset (1) | unset (1) | unset (1) | 0 = the int4 / MXFP8 records instead of the exlr8 release's dense trellis matrices, where the layer has both (`G6_DTR`; A/B). Effect not measured; inert on pack boots |
 | `PF_AOP` | unset (1 when built with `PF_AOP`) | unset | unset | 0 = no fc1 A-operand share in prefill (`G6_PF_AOP`; byte-exact). Effect not measured |
+| `K1_SPLIT` | unset | unset | unset | decode MoE: the fc1 CTA shape and / or fc2 n-split per step row count, `M:KS1xWG/NS2` entries (`a-b:` ranges; KS1, WG, NS2 powers of two), e.g. `1:/4,3:2x1,4-32:/4` (`G6_K1_SPLIT`; bit-exact, an entry that would change the sums or that the kernels cannot index is refused at boot). Tuning: measured at TP=4 with the `home` widths |
+| `K1_TLBW` | unset (0) | unset (0) | unset (0) | decode MoE: fc1 prefetches the routed slots' weight translations into L2 at this granule in KB, a power of two; 2048 = the huge page (`G6_K1_TLBW`; bit-exact). Measured at TP=4 only |
 | `NOHASH` | 0 | 0 | 0 | 1 = skip the sha256 check of every pack tensor at load (run once without it first) |
 | `G6ENV_X` | empty | empty | empty | more engine environment for every rank (`"A=1 B=2"`) |
 | `G6ARGS_X` | – | empty | empty | more engine arguments for every rank |
