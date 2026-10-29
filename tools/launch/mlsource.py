@@ -19,7 +19,7 @@ and needs no network beyond the local socket.
 
 model-loader verifies every segment it holds (sha256 against the manifest or the origin). gr8 still checks the xxhash64
 of every expert half before boot (bin/g6load verify), once per rank, variant and layout; the receipt of that check is
-kept under G6_HOME, since the store is model-loader's alone. gr8's checksums cover each half's per-channel scales as
+kept under GR8_WORK_DIR, since the store is model-loader's alone. gr8's checksums cover each half's per-channel scales as
 well as its bytes, so they cannot go into the request's xxh64 fields.
 
 model-loader holds whole 64 MiB segments. A rank's expert halves are spread over every segment of a width file (the half
@@ -330,7 +330,7 @@ class Release:
 
     def fetch_meta(self, steering=None):
         """The tokenizer files, then an explicitly selected steering artifact (steering_hf.fetch, with this Release as
-        its source: the index and the artifact come through the request, and are unpacked under G6_HOME)."""
+        its source: the index and the artifact come through the request, and are unpacked under GR8_WORK_DIR)."""
         missing = [n for n in META_FILES if n not in self.files]
         if missing:
             raise modelset.ModelError(f'{self} lacks {", ".join(missing)} at its root')
@@ -431,7 +431,7 @@ class Release:
 
     def fetch_rank(self, tp, rank, variant, workers=None):
         """Put this rank's pieces as the request, wait until model-loader holds them, then check every expert half's
-        xxhash64 (once per rank, variant and layout: a receipt under G6_HOME records it)."""
+        xxhash64 (once per rank, variant and layout: a receipt under GR8_WORK_DIR records it)."""
         import fetch_ranks as fr
         whole = self.whole_files(tp, rank)
         # this boot's pieces only
@@ -550,9 +550,9 @@ class StoreRepo:
 class Drafter:
     """The DFlash2 drafter at one revision, fetched by the box's model-loader and converted on this box, as
     hfsource.Drafter. Its licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so model-loader holds only the
-    drafter's own files, and the converted rank goes under G6_HOME, which model-loader never reads or serves:
+    drafter's own files, and the converted rank goes under GR8_WORK_DIR, which model-loader never reads or serves:
 
-        <G6_HOME>/run/model-loader/<model>@<revision>/tp<TP>/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE
+        <GR8_WORK_DIR>/run/model-loader/<model>@<revision>/tp<TP>/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE
 
     Its request is its own (gr8-<model>-drafter), so it stands apart from the release's."""
 
@@ -652,7 +652,7 @@ def of(o, repo, rev, log=print):
     named = bool(re.search(r'(@|/tree/)[^/]+/?$', url))            # parse_url says main when the URL names none
     client = client_of(o)
     model = o.get('MODEL_LOADER_MODEL') or catalog_name(client, repo, rev if named else '', 'MODEL_LOADER_MODEL', log)
-    work = os.path.join(os.path.abspath(o.get('G6_HOME')), 'run', 'model-loader')
+    work = os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'run', 'model-loader')
     return Release(store, client.addr, model, repo, rev if named else '', work, f'gr8-{o.get("GR8_MODEL") or "glm53"}',
                    log=log, layout=o.get('LAYOUT'), token=client.token)
 
@@ -664,6 +664,6 @@ def drafter_of(o, repo, rev, log=print):
     client = client_of(o)
     model = o.get('MODEL_LOADER_DRAFTER_MODEL') or catalog_name(client, repo, rev if named else '',
                                                                 'MODEL_LOADER_DRAFTER_MODEL', log)
-    work = os.path.join(os.path.abspath(o.get('G6_HOME')), 'run', 'model-loader')
+    work = os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'run', 'model-loader')
     return Drafter(store, client.addr, model, repo, rev if named else '', work,
                    f'gr8-{o.get("GR8_MODEL") or "glm53"}-drafter', log=log, tp=int(o.get('TP')), token=client.token)

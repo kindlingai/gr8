@@ -98,7 +98,7 @@ sizes and variants. Three more lines are for compose itself:
 |---|---|---|
 | `GR8_IMAGE` | `ghcr.io/kindlingai/gr8:latest` | the image |
 | `GR8_CACHE` | the `cache` volume | this box's part of the model: a host directory instead, owned by uid 1000 |
-| `GR8_HOME` | the `home` volume | logs and state (`out/`, `s2/`, `run/`): a host directory instead, owned by uid 1000, and not a bare-metal `G6_HOME` (its `bin/` is a build) |
+| `GR8_HOME` | the `home` volume | logs and state (`out/`, `s2/`, `run/`): a host directory instead, owned by uid 1000, and not a bare-metal `GR8_WORK_DIR` (its `bin/` is a build) |
 | `MODEL_LOADER_STORE` | `/var/lib/model-loader` | with `docker/model-loader.yaml`: model-loader's store on this box |
 | `MODEL_LOADER_IMAGE` | `ghcr.io/kindlingai/model-loader:latest` | with `docker/model-loader.yaml`: the image whose `model-loader -check` gr8's start waits on |
 

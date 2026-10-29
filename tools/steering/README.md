@@ -116,13 +116,13 @@ qualifies only where alpha lands in `[0, 4]`. `fit` prints every layer's numbers
    python3 tools/steering/contrast.py argv out/supervisor.log work > work/offline.sh
    ```
 
-3. Run the offline command on every rank, workers first, from the tree root. Rank 0 also gets `G6_RESID_DUMP`, about
+3. Run the offline command on every rank, workers first, from the tree root. Rank 0 also gets `GR8_RESID_DUMP`, about
    3.9 MB per token for GLM-5.3, so stream it into the reducer through a fifo (`reduce` needs numpy):
 
    ```sh
    mkfifo work/dump
    python3 tools/steering/contrast.py reduce work < work/dump &
-   G6_RESID_DUMP=work/dump sh work/offline.sh
+   GR8_RESID_DUMP=work/dump sh work/offline.sh
    ```
 
    `reduce` checks that the dump's row count matches `work/seqs.json` and writes `work/sums.npz`.

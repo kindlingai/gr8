@@ -291,7 +291,7 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/arm64
           build-args: |
-            G6_WIDTHS=${{ steps.w.outputs.widths }}
+            GR8_WIDTHS=${{ steps.w.outputs.widths }}
           outputs: type=local,dest=dist
           cache-from: ${{ matrix.cache_from }}
           cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && matrix.cache_to || '' }}   # only main writes, as in the rust job

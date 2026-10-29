@@ -19,7 +19,7 @@ verify times by row count (2200 MHz, DFlash2 verify steps); a lookup costs no GP
     python3 tools/ngram/ngram.py import-kl-ref bench/gate/refs/tp4.json --out traces.jsonl
     python3 tools/ngram/ngram.py replay traces.jsonl --folds 5 [--json out.json]
     python3 tools/ngram/ngram.py sizes traces.jsonl --floors 0.3,0.5,0.7,0.9
-    python3 tools/ngram/ngram.py export traces.jsonl --out ngram.tab     # the engine's table (G6_NGRAM)
+    python3 tools/ngram/ngram.py export traces.jsonl --out ngram.tab     # the engine's table (GR8_NGRAM)
 """
 import argparse
 import heapq
@@ -228,7 +228,7 @@ def accept(nodes, truth):
     return best
 
 
-# ---------------------------------------------------------------- the engine's table (G6_NGRAM, engine/runtime/ngram_lookup.h)
+# ---------------------------------------------------------------- the engine's table (GR8_NGRAM, engine/runtime/ngram_lookup.h)
 # The engine proposes chains: only each entry's top token is exported. Its stored probability is calibrated: cal[b] is
 # the share of held-out chain tokens whose stored probability fell in bucket b that GLM produced, given the tokens before
 # them in the chain were right (the replay showed the raw means overestimate acceptance by 30-60%).
@@ -485,7 +485,7 @@ def main(argv=None):
     sub.choices['sizes'].add_argument('--floors', default='0.1,0.3,0.5,0.7,0.9')
     sub.choices['sizes'].add_argument('--widths', default='', help='also sweep these widths (at --floor)')
     sub.choices['sizes'].add_argument('--ns-list', default='', help='also sweep these ns sets, e.g. "8,6,4,3;4,3;3"')
-    sub.choices['export'].add_argument('--out', required=True, help="the engine's table file (G6_NGRAM)")
+    sub.choices['export'].add_argument('--out', required=True, help="the engine's table file (GR8_NGRAM)")
     sub.choices['export'].add_argument('--no-cal', action='store_true', help='write the raw mean probabilities (cal none)')
     a = ap.parse_args(argv)
 

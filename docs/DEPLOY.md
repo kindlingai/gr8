@@ -214,7 +214,7 @@ With model-loader on the box (its `deploy/compose` or `deploy/spark-os`, store a
         --model-loader unix:/var/lib/model-loader/model-loader.sock --model-cache /var/lib/model-loader \
         --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
 
-The user running gr8 must be in group 1000 to open the socket. The drafter is converted under `G6_HOME`, never in
+The user running gr8 must be in group 1000 to open the socket. The drafter is converted under `GR8_WORK_DIR`, never in
 the store: its licence forbids sharing a converted copy. [config/cluster.env.example](../config/cluster.env.example)
 has the same two lines.
 

@@ -21,12 +21,12 @@ at least 2.6 GB free memory on every box. Needle tests at 128K and 437K pass (on
 
 ## Boot and stop
 On all five boxes: free page cache and compact memory, cap the clock (`nvidia-smi -lgc 0,2000`), then start the
-rank detached: `cd $G6_HOME && ./gr8 glm53 up @<cluster.env> > out/window-up.log 2>&1 < /dev/null` (for example
+rank detached: `cd $GR8_WORK_DIR && ./gr8 glm53 up @<cluster.env> > out/window-up.log 2>&1 < /dev/null` (for example
 under `systemd-run --collect -p RemainAfterExit=yes`). The ranks wait for each other. Ready when
 `curl -s 127.0.0.1:8000/health` on the head returns 200. Stop: `./gr8 glm53 down @<cluster.env>` on the head
 stops all ranks.
 
-Build: `G6_WIDTHS="4 5" F12_WIDTHS="4 5"` (TP5 widths), Rust toolchain 1.94.1.
+Build: `GR8_WIDTHS="4 5" F12_WIDTHS="4 5"` (TP5 widths), Rust toolchain 1.94.1.
 
 ## Measured at TP5 and left off
 - `L2PF`: 0.4 GB less free memory, no mixed-load gain.

@@ -25,7 +25,7 @@ near-certain continuations would propose drafts that the target accepts. Python 
     # 3. table size against hit rate
     python3 tools/ngram/ngram.py sizes traces.jsonl --floors 0.1,0.3,0.5,0.7,0.9
 
-    # 4. the engine's table (G6_NGRAM / NGRAM=FILE, engine/runtime/ngram_lookup.h), calibrated on held-out folds
+    # 4. the engine's table (GR8_NGRAM / NGRAM=FILE, engine/runtime/ngram_lookup.h), calibrated on held-out folds
     python3 tools/ngram/ngram.py export traces.jsonl --out ngram.tab
 
     # 5. the engine gate on two boots of the same build (NGRAM unset, then NGRAM=ngram.tab), same settings
@@ -39,7 +39,7 @@ near-certain continuations would propose drafts that the target accepts. Python 
 lower edge. The engine prices a chain with the calibrated values, so the 30-60% overestimate the raw means showed on
 the first cluster traces does not reach its choice. With `NGRAM` set, a request decoding alone with DFlash2 verifies the
 table's chain instead of the drafter's drafts in rounds where the chain promises more tokens per verify ms
-(`docs/SETTINGS.md`, `G6_NGRAM`).
+(`docs/SETTINGS.md`, `GR8_NGRAM`).
 
 `import-kl-ref` turns a `bench/gate` KL reference (16 greedy continuations of 256 tokens, top 20) into traces, which
 checks the tools but is too little and too varied to judge the table. Its top lists come from a separate scoring pass:
@@ -92,4 +92,4 @@ error row. `compare` fails on any prompt whose ids differ, any error row, or run
 files or models, and prints, by workload, the median decode tok/s and the decode tokens per verify step on each side.
 It cannot tell whether the table served: on the `on` boot, check rank 0's `# s2 ngram slot` lines for nonzero table
 rounds (the table serves only a request decoding alone with DFlash2, so a TP3 or MTP-only boot gives ratio 1).
-With `G6ENV_X="G6_NGRAM_LOG=1"` rank 0 also logs each table round.
+With `EXTRA_ENV="GR8_NGRAM_LOG=1"` rank 0 also logs each table round.

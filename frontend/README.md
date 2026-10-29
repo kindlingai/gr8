@@ -42,7 +42,7 @@ A rank whose weights changed has `"changed": N` and, for the first chunk that di
 ```bash
 scripts/build_front.sh                 # -> bin/g6front-rs (rustup fetches the pinned toolchain on first build)
 bin/g6front-rs --model-dir <dir with tokenizer.json, tokenizer_config.json, chat_template.jinja, generation_config.json> \
-  --engine-sock $G6_HOME/run/engine.sock --port 8100
+  --engine-sock $GR8_WORK_DIR/run/engine.sock --port 8100
 ```
 
 On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 ms at 32K tokens.
@@ -195,7 +195,7 @@ How it differs inside (not in its output):
   backpressure.
 - **Long prompts are encoded in parallel.** The text is cut only where GLM's pre-tokenizer regex always ends a token:
   after `\n` + ASCII letter, or before a space that follows an ASCII letter. Concatenated ids are identical to one
-  encode; `src/tok.rs` gives the argument. A start-up self-check and a fuzz test (`G6_TOKENIZER_DIR=<dir> cargo test
+  encode; `src/tok.rs` gives the argument. A start-up self-check and a fuzz test (`GR8_TOKENIZER_DIR=<dir> cargo test
   --release`) confirm it. The self-check turns the parallel path off for a tokenizer whose shape the argument does not
   cover.
 - **Memory goes back to the OS.** It uses mimalloc. Loading `tokenizer.json` peaks at ~280 MB, and it is collected
@@ -243,7 +243,7 @@ weights in `tests/api_responses.toml`.
 - `DIR/abort.s2` (epoch lost) turns every open request into `error` and every later request too; restart the engine and the shim. SIGTERM writes `DIR/quit`, and the head engine passes it to the other ranks. A restarted shim continues the `req`/`cmd` numbers from the files in DIR. Every rank's DIR must be fresh for a new engine start.
 
 ```bash
-# engine (every rank; fresh DIR each start): --graph --mtp --prefill, G6_DEC_SPLIT=3, a G6_CP build
+# engine (every rank; fresh DIR each start): --graph --mtp --prefill, GR8_DEC_SPLIT=3, a G6_CP build
 g6m4 ... --serve /run/g6/s2 --s2-port N --s2-sessions 4 --s2-epoch 7
 python3 g6s2shim.py --dir /run/g6/s2 --sock /run/g6/engine.sock      # on the head only
 bin/g6front-rs --engine-sock /run/g6/engine.sock ...
@@ -259,14 +259,14 @@ It covers 4 concurrent streams (exact tokens, wall clock under 2x one stream, 4 
 
 ### Round log and cost fit
 
-`G6_S2_ROUNDLOG=1 g6m4 ... --serve ...` makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
+`GR8_S2_ROUNDLOG=1 g6m4 ... --serve ...` makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
 
 ```bash
 tools/s2_costfit.py engine_rank0.log [--residuals] [--json]   # also ms per whole round by active sessions; step_ms = base + per_expert * experts(d*rows) + per_token * rows
 tools/s2_costfit.py --selftest
 ```
 
-`G6_S2_TIMELINE=N` (every rank, through `G6ENV_X`) splits the time between decode steps into main-stream work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: main-stream gap <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean main-stream gap from one step's end to the next step's start and the host time from the fence to the next launch. The gap is bounded by events on the main stream only: it is not total GPU idle time — with `G6_DRAFT_PAR` the drafter's side stream can execute inside it. The `drafting GPU span` figure includes side-stream spans alongside all other non-main spans; `dfl_ctx_par` / `dfl_query_par` report mean side-stream spans per step. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `G6_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing. It also prints the mean GPU span per step kind and row count (`# s2_tl rank R rows <kind> M <rows> n <steps> span <ms> ms`). `tools/s2_dsel_table.py rank*.log` turns a boot's lines (with `G6_MTP_LPLOG=1` on rank 0 for the MTP rounds' accept counts) into the drafter choice's cost table, `G6_S2_DSEL_TABLE`; `--selftest` runs its tests.
+`GR8_S2_TIMELINE=N` (every rank, through `EXTRA_ENV`) splits the time between decode steps into main-stream work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: main-stream gap <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean main-stream gap from one step's end to the next step's start and the host time from the fence to the next launch. The gap is bounded by events on the main stream only: it is not total GPU idle time — with `GR8_DRAFT_PAR` the drafter's side stream can execute inside it. The `drafting GPU span` figure includes side-stream spans alongside all other non-main spans; `dfl_ctx_par` / `dfl_query_par` report mean side-stream spans per step. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `GR8_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing. It also prints the mean GPU span per step kind and row count (`# s2_tl rank R rows <kind> M <rows> n <steps> span <ms> ms`). `tools/s2_dsel_table.py rank*.log` turns a boot's lines (with `GR8_MTP_LPLOG=1` on rank 0 for the MTP rounds' accept counts) into the drafter choice's cost table, `GR8_S2_DSEL_TABLE`; `--selftest` runs its tests.
 
 ## Tests against the pseudo engine
 

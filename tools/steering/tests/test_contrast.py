@@ -21,10 +21,10 @@ HID, NL = 4, 3
 
 class ArgvTests(unittest.TestCase):
     def test_serve_flags_dropped(self):
-        line = ('2026-10-25 supervisor: engine: G6_CP=1 G6_RT_X=1 ./bin/g6m4 --rank 0 --serve 127.0.0.1:9 '
+        line = ('2026-10-25 supervisor: engine: GR8_CP=1 GR8_RT_X=1 G6_PF_Y=1 ./bin/g6m4 --rank 0 --serve 127.0.0.1:9 '
                 '--mtp 2 --graph --v2 /m --prefill 4096 --chunk 8 --steering-profile /p --cap 500032')
         env, argv = contrast.offline_argv(line, ['/a.ids', '/b.ids'], 128)
-        self.assertEqual(env, ['G6_CP=1', 'LD_LIBRARY_PATH=bin/lib'])
+        self.assertEqual(env, ['GR8_CP=1', 'LD_LIBRARY_PATH=bin/lib'])
         self.assertEqual(argv, ['./bin/g6m4', '--rank', '0', '--v2', '/m', '--chunk', '8', '--cap', '128',
                                 '--gen', str(contrast.GEN), '--temp', '0', '--prompt', '@/a.ids', '--prompt',
                                 '@/b.ids'])

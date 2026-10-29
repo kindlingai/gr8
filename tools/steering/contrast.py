@@ -12,7 +12,7 @@ The steps (README.md has the whole run):
                                                  answer starts, from a running front end's /tokenize
     contrast.py argv LOG OUT                     an offline g6m4 command for one rank: the serving command from a
                                                  supervisor log with the serve-only flags removed and OUT's prompts added
-    contrast.py reduce OUT < DUMP                rank 0's G6_RESID_DUMP stream -> per-layer sums of the attention and
+    contrast.py reduce OUT < DUMP                rank 0's GR8_RESID_DUMP stream -> per-layer sums of the attention and
                                                  MLP writer outputs over the answer tokens of each side (OUT/sums.npz)
     contrast.py fit OUT PROFILE --base M --name N   one direction and alpha per layer -> PROFILE (manifest.json and
                                                  directions.f32, checked with release.validate_directory)
@@ -117,8 +117,9 @@ DROP_VAL = {'--serve', '--s2-port', '--s2-sessions', '--s2-epoch', '--kv-store',
             '--steering-weight-set', '--steering-force'}
 DROP_SW = {'--reuse-prefix', '--spec-adaptive', '--pfv2', '--graph'}
 # the knobs of what the offline run leaves out (tensor prefill, MTP, the drafter, S2 serving, the rows tier, graphs):
-# g6m4 refuses most of them without their flag
-DROP_ENV = ('G6_PF_', 'G6_MTP_', 'G6_DRAFT_', 'G6_DFL_', 'G6_S2_', 'G6_RT_', 'G6_DEC_SHARED_SCRATCH=', 'G6_DEC_SPLIT=')
+# g6m4 refuses most of them without their flag. A log from before the GR8_ names has them under G6_.
+DROP_ENV = tuple(p + k for p in ('GR8_', 'G6_') for k in ('PF_', 'MTP_', 'DRAFT_', 'DFL_', 'S2_', 'RT_', 'DEC_SHARED_SCRATCH=',
+                                                         'DEC_SPLIT='))
 
 
 def offline_argv(line, prompts, cap):

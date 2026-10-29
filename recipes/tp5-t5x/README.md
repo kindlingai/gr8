@@ -7,15 +7,15 @@ all 22 as missing from `main`. This directory adds the exact serving files we ra
 
 ## What "T5X" is
 T5X = the TP4 FSM decode set, on from the first TP5 boot, plus five knobs measured at TP5: `K1_TLBW=2048`,
-`G6_PF_GEMMF32=1`, `G6_ATTN_CTX3=4`, `G6_PF_ISGRT_RG=32`, `G6_PF_ATTN_ROWS=512`. Also `PF_OWN=3` with
-`G6_QO_CACHE` (13 GB per box; boot ~47 s with it, ~190 s without, the first boot writes it), `KVB=fp8`, `MTP=2`,
+`GR8_PF_GEMMF32=1`, `GR8_ATTN_CTX3=4`, `GR8_PF_ISGRT_RG=32`, `GR8_PF_ATTN_ROWS=512`. Also `PF_OWN=3` with
+`GR8_QO_CACHE` (13 GB per box; boot ~47 s with it, ~190 s without, the first boot writes it), `KVB=fp8`, `MTP=2`,
 `CAP=617536` (max_model_len 617532), `SESS=4`, `SHARE_LIMIT=4096`. Output is byte-identical to the first checked TP5
 build (T5S2): prefill KL against it 0.0 (max).
 
 ## Files
 | file | what |
 |---|---|
-| `T5X.env` | the launcher env file of the measured serve; values of the deployed file (md5 `139ef131...`); its G6ENV_X entries with a launcher option are option lines |
+| `T5X.env` | the launcher env file of the measured serve; values of the deployed file (md5 `139ef131...`); its EXTRA_ENV entries with a launcher option are option lines |
 | `boot.sh` | boot on all five boxes with `./gr8 glm53 up @ENV` under systemd-run, wait for `/health` 200 and max_model_len 617532 |
 | `down.sh` | `./gr8 glm53 down @ENV`, then wait until no g6m4 is left on each box |
 | `T5XR.env` | OPTION ONLY, NEVER RUN AS A SERVE: T5X plus a remote KV store on a sixth Spark (see below) |
@@ -24,7 +24,7 @@ build (T5S2): prefill KL against it 0.0 (max).
 addresses, host memory scrub and menu hook removed). They were syntax-checked, not re-run in this form.
 
 ## Build and boot
-Build with the TP5 widths: `G6_WIDTHS="4 5" F12_WIDTHS="4 5"`, Rust 1.94.1. Measured engine `bin/g6m4` md5
+Build with the TP5 widths: `GR8_WIDTHS="4 5" F12_WIDTHS="4 5"`, Rust 1.94.1. Measured engine `bin/g6m4` md5
 `2fa1d7e78d6d758a81a8078499ba58a8`. `MODEL` / `V2_DENSE` = the exlr8 K2-K3-K4 release, `V2` / `V2_SLICES` = each rank's
 TP5 expert and index slices. On the head box, as root, with the same checkout path `H` on all five boxes:
 ```
@@ -55,14 +55,14 @@ Before boot our script also drops the page cache and compacts memory on every bo
 Full clock changes no output (same canary); memory and heat under long load were not measured at full clock.
 
 ## Measured at TP5 and left off
-- `G6_L2PF`: 0.4 GB less free memory, no mixed-load gain.
+- `GR8_L2PF`: 0.4 GB less free memory, no mixed-load gain.
 - `PF_OWNPERM=1`: output changes (prefill KL 0.0031 vs T5S2), 8K prefill -6.7%.
 - `QA_SPLIT=2`: 32K prefill -5%.
 - `SHARE_LIMIT=8192`: the 4th 128K chat is evicted, 90K solo decode -4%.
 - `KV_FORMAT=int4` with CAP 810,496 (+31% context): -1 to -4% speed, KL 0.0169 against the 0.01 gate. Option only.
 
 ## Option, never run as a serve: T5XR (remote KV store on a sixth Spark)
-`T5XR.env` = `T5X.env` with `G6_HOME` pointing at a build of our `rkv` branch and two lines:
+`T5XR.env` = `T5X.env` with `GR8_WORK_DIR` pointing at a build of our `rkv` branch and two lines:
 `KV_STORE=remote:<node>:7350,size=21G` and `KV_KEEP=sessions`. The sixth Spark runs `./gr8 kv up --gb 106` and
 keeps evicted chats' KV in its RAM; a chat that comes back reads its blocks over RDMA instead of a new prefill.
 The `rkv` commits (stores for steered runs: 864c387, 5c9fdc4, 2c1a4a7; copy-batch fixes 5f5b862; drain trace c5f674d)

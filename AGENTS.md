@@ -14,7 +14,7 @@ The rules, short:
    decode; past that, a second boot).
 2. A change that cannot keep the numbers, or changes a design choice, stops and goes to the maintainers first.
 3. Keep each change to what its issue or PR describes.
-4. Every topology builds (`G6_NR=4`, `6` and `3`), and the others' behaviour does not change unless the issue says so.
+4. Every topology builds (`GR8_NR=4`, `6` and `3`), and the others' behaviour does not change unless the issue says so.
 
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
 your own setup. The config examples use placeholders for a reason.
@@ -34,7 +34,7 @@ On a GB10 with CUDA 13:
 
     ./gr8 glm53 build               # the engine and the Rust front end, into bin/
     scripts/build.sh bin            # the engine: one g6m4 and one m4sim for TP = 1, 2, 3, 4, 6 and 8
-    G6_NR=4 scripts/build.sh bin4   # TP=4 only, a shorter build (G6_WIDTHS="3 4" for several)
+    GR8_NR=4 scripts/build.sh bin4   # TP=4 only, a shorter build (GR8_WIDTHS="3 4" for several)
 
 g6m4 takes its width from `--ips`, m4sim from `--tp N` or the rank packs in `--packs DIR`. Each width is compiled as
 its own build was (`engine/runtime/build_m4.sh`), so one build covers every topology. `scripts/build.sh` also builds
@@ -82,7 +82,7 @@ The light gates, on the target topology:
 `bench/gate/gate.py` runs all of 3 the same way on every build ([bench/gate/README.md](bench/gate/README.md)):
 
     python3 bench/gate/gate.py run --url http://127.0.0.1:8100 --topology tp4 --commit <sha> --boot b1 \
-        --kl-ref bench/gate/refs/tp4.json --health $G6_HOME/out/rank_health.json
+        --kl-ref bench/gate/refs/tp4.json --health $GR8_WORK_DIR/out/rank_health.json
     python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp4.json
 
 `--health` wants the rank health probe's result for this boot: run `scripts/rank_health.sh` with `./gr8`'s options

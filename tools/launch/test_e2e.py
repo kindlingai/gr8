@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End to end: four supervisors on this machine, each `./gr8 glm53 up` with its own G6_HOME and model cache, the
+"""End to end: four supervisors on this machine, each `./gr8 glm53 up` with its own GR8_WORK_DIR and model cache, the
 stub engine (stubs/g6m4, which plays each rank with frontend/tests/fake_s2_engine.py), the real shim and a stub front
 end. The boxes are 127.0.0.1-4 on the LAN and 127.0.1.x / 127.0.2.x on the rails: Linux answers on all of them, and
 macOS after the aliases in loopback_aliases. Every box boots one local fake release in place.
@@ -86,7 +86,7 @@ class EndToEnd(unittest.TestCase):
             self.homes.append(h)
         self.env = {**os.environ, 'PATH': os.path.join(HERE, 'stubs') + os.pathsep + os.environ['PATH'],
                     'GR8_REFUSAL_LINGER': '3', 'GR8_MODEL': 'glm53'}   # three polls' worth; ./gr8 glm53 sets the model
-        for k in ('CAP', 'SESS', 'PEERS', 'G6_CLUSTER'):
+        for k in ('CAP', 'SESS', 'PEERS', 'GR8_CLUSTER'):
             self.env.pop(k, None)
 
     def tearDown(self):
@@ -99,12 +99,12 @@ class EndToEnd(unittest.TestCase):
             ['--peers', ','.join(LAN), '--node-ip', LAN[i], '--ips', ','.join(f'127.0.1.{r + 1}' for r in range(TP)),
              '--ips2', ','.join(f'127.0.2.{r + 1}' for r in range(TP))]
         return ['--no-config', '--no-check', *where,
-                '--model', self.rel, '--g6-home', self.homes[i],
+                '--model', self.rel, '--work-dir', self.homes[i],
                 '--control-port', str(self.port), '--port', str(self.api), '--py', sys.executable,
                 '--front-bin', os.path.join(HERE, 'stubs', 'front'), '--join-timeout', '60', '--ready-tmo', '60', *extra]
 
     def gr8(self, i, cmd, *extra, timeout=120, env=None):
-        args = self.argv(i, *extra) if cmd in ('up', 'show-config') else ['--g6-home', self.homes[i], *extra]
+        args = self.argv(i, *extra) if cmd in ('up', 'show-config') else ['--work-dir', self.homes[i], *extra]
         return subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), cmd, *args], env=env or self.env,
                               capture_output=True, text=True, timeout=timeout)
 
@@ -141,7 +141,7 @@ class EndToEnd(unittest.TestCase):
             self.assertNotIn('--manifest', a)
             self.assertNotIn('--dflash-pack', a)         # no --drafter: MTP only
             self.assertEqual(val('--serve'), os.path.join(self.homes[i], 's2'))
-            self.assertEqual(self.stub(i)['env']['G6_PF_OWN'], '4')
+            self.assertEqual(self.stub(i)['env']['GR8_PF_OWN'], '4')
         # no --default-max-tokens unless DEFAULT_MAX_TOKENS is set: the front end keeps all the room
         front = json.loads(read(os.path.join(self.homes[0], 'out', 'front.json')))
         self.assertIsNone(front['default_max_tokens'])

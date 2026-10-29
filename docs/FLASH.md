@@ -51,7 +51,7 @@ the cost is the same at TP=4 and TP=2:
 | 1,048,640 | 16,385 | 20.9 GB |
 
 Decode and prefill scratch grow with a quarter of `CAP` and stay small by comparison. The model's config allows
-1,048,576 positions, and `CAP` may go higher where memory allows. Each layer's bind checks that `G6_MEM_MIN` (8 GiB)
+1,048,576 positions, and `CAP` may go higher where memory allows. Each layer's bind checks that `GR8_MEM_MIN` (8 GiB)
 stays free, so a `CAP` that leaves too little stops the boot; the boot log's `MemAvailable` line shows what is left.
 
 Nothing else in the engine limits the context to less than `CAP`:
@@ -89,9 +89,9 @@ rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2
 The memory these take (slots and graphs), the speed of shared steps and the output of sessions sharing steps have not
 been measured on Flash yet.
 
-## Session checkpoints (`G6_FLASH_CACHE=aligned`, experimental)
+## Session checkpoints (`GR8_FLASH_CACHE=aligned`, experimental)
 
-Off by default. With `FLASH_CACHE=aligned` (`G6_FLASH_CACHE=aligned`), a prompt's prefill keeps a checkpoint at its last
+Off by default. With `FLASH_CACHE=aligned` (`GR8_FLASH_CACHE=aligned`), a prompt's prefill keeps a checkpoint at its last
 cold prefill grid point, and a later prompt that starts with the same tokens is prefilled from that point, not from 0.
 This is the Flash form of prefix reuse for an agent's next turn. The code is `engine/runtime/s2/flash_checkpoint.h` (the
 index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), hooked into `s2/flash_native.cuh`.
@@ -114,7 +114,7 @@ Why a checkpoint is not taken at the end of the prompt: decode advances the KDA 
 fp32 arithmetic give different state, so a state taken after decode is not the state a cold prefill of the same tokens
 gives. A terminal checkpoint is not cold-exact by construction.
 
-`FLASH_CACHE=terminal` (`G6_FLASH_CACHE=terminal`, experimental, **NOT cold-exact**) keeps aligned's checkpoints and
+`FLASH_CACHE=terminal` (`GR8_FLASH_CACHE=terminal`, experimental, **NOT cold-exact**) keeps aligned's checkpoints and
 one more at the end of every request: `p` = the rows the request consumed (prompt and output; its last output token is
 still pending and becomes token `p`), with the KDA state the verify ring holds for `p` and the pages through `p`, the
 last one partial. A later prompt that starts with those `p + 1` tokens (an agent's next turn sent as raw tokens) is
@@ -134,7 +134,7 @@ digest the ranks compare.
 
 `group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental, D-331 M8 (c)): the lease is a
 member of group `G` on the KV node, the way a full model's `--kv-store group=` tier is, so the two models share the
-node's memory. It starts at `size=`; the head reports to the node every `G6_S2_SHARE_MS` and asks for segments when
+node's memory. It starts at `size=`; the head reports to the node every `GR8_S2_SHARE_MS` and asks for segments when
 captures drop entries, an entry does not fit at all, or the next capture would drop one (after a capture, or at any
 report while a request is resident or queued; the node holds the room an ask made another group give and grants it at
 the next report, so the grow lands before the capture that would drop), and offers what giving would
@@ -163,14 +163,14 @@ Limits:
   resizes through its own index (above), with the same report rule.
 - Each capture writes the whole prefix `[0, p)`, not only the rows past the entry it started from.
 - `terminal` is not cold-exact (above).
-- One session: the engine refuses `G6_FLASH_CACHE` and `G6_FLASH_KV_CHUNKS` with `--s2-sessions` above 1 (the
+- One session: the engine refuses `GR8_FLASH_CACHE` and `GR8_FLASH_KV_CHUNKS` with `--s2-sessions` above 1 (the
   checkpoints keep session 0's KDA ring).
 
 ## Not yet
 
-- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `G6_FLASH_CACHE=aligned` (above) is the
+- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `GR8_FLASH_CACHE=aligned` (above) is the
   experimental Flash form of prefix reuse. DFlash2 runs offline (`g6m4_flash --dflash-manifest`, at a TP that splits
-  its 8 KV heads), and with `--prefill` only without the drafter's prompt context (`G6_DFL_PFCTX=0`). Its taps are the
+  its 8 KV heads), and with `--prefill` only without the drafter's prompt context (`GR8_DFL_PFCTX=0`). Its taps are the
   mean of the four mHC streams after each tapped layer.
 - MTP drafts beyond the first: the KDA state does not roll back a rejected draft yet, so the launcher runs MTP=1.
 - The int4 KV build.

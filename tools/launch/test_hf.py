@@ -401,7 +401,7 @@ class HFTests(unittest.TestCase):
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
         plan = opt.engine_plan(o, rank=2, rank_dir=ms.dir, aux_dir=ms.dir, home='/h')
-        self.assertIn('G6_KVB=fp8', plan['env'])
+        self.assertIn('GR8_KVB=fp8', plan['env'])
         self.assertIn('--v2-dense', plan['args'])
 
     def test_commit_is_recorded_and_refreshed(self):

@@ -107,18 +107,18 @@ ENV GR8_XGRAMMAR=/opt/xgrammar GR8_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
 # one g6m4 and one m4sim for every TP width; every launcher runs this build.
 # Each engine stage keeps only the binaries its dist stage copies: a cached layer is reused whole or rebuilt whole, so
 # its objects and build-only binaries are dead weight in the CI cache.
-# G6_WIDTHS builds a subset (build.sh): CI passes one on a pull request and
+# GR8_WIDTHS builds a subset (build.sh): CI passes one on a pull request and
 # leaves it empty, for all seven widths (1 2 3 4 5 6 8), on main and on tags.
 FROM engine-src-glm AS engine
-ARG G6_WIDTHS=
-RUN G6_WIDTHS="$G6_WIDTHS" G6_TESTS=0 scripts/build.sh /out/bin \
+ARG GR8_WIDTHS=
+RUN GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=0 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4 ! -name m4sim -exec rm -rf {} +
 
 # the test binaries build.sh makes after the GLM engine (gpuprobe and tr3_e4m3_test ship), on their own CI runner;
-# dtr_test at the G6_WIDTHS the engine leg builds
+# dtr_test at the GR8_WIDTHS the engine leg builds
 FROM engine-src AS engine-tests
-ARG G6_WIDTHS=
-RUN G6_WIDTHS="$G6_WIDTHS" G6_TESTS=only scripts/build.sh /out/bin \
+ARG GR8_WIDTHS=
+RUN GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=only scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name gpuprobe ! -name tr3_e4m3_test -exec rm -rf {} +
 
 # GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 2, 3 and 4
@@ -129,8 +129,8 @@ RUN MODEL=flash scripts/build.sh /out/bin \
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src-glm AS engine-int4
-ARG G6_WIDTHS=
-RUN G6_WIDTHS="$G6_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
+ARG GR8_WIDTHS=
+RUN GR8_WIDTHS="$GR8_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a,
@@ -182,13 +182,13 @@ WORKDIR /opt/gr8
 COPY . .
 COPY --from=dist / .
 # The container runs as uid 1000 (the base image's ubuntu account) on a read-only image. Its writable state is two
-# volumes (docker/compose.yaml): the model cache and G6_HOME, which docker fills from these empty, uid-1000 directories
-# on first use. bench/pbench.py appends results.jsonl next to itself, so that file links into G6_HOME/out.
+# volumes (docker/compose.yaml): the model cache and GR8_WORK_DIR, which docker fills from these empty, uid-1000 directories
+# on first use. bench/pbench.py appends results.jsonl next to itself, so that file links into GR8_WORK_DIR/out.
 RUN mkdir -p /var/lib/gr8/home /var/lib/gr8/cache \
  && chown 1000:1000 /var/lib/gr8/home /var/lib/gr8/cache \
  && ln -s /var/lib/gr8/home/out/pbench-results.jsonl bench/results.jsonl
 ENV PATH=/opt/gr8/bin:$PATH PYTHONPATH=/opt/gr8/frontend HOME=/tmp GR8_CONTAINER=1 \
-    G6_HOME=/var/lib/gr8/home MODEL_CACHE=/var/lib/gr8/cache PY=/usr/bin/python3
+    GR8_WORK_DIR=/var/lib/gr8/home MODEL_CACHE=/var/lib/gr8/cache PY=/usr/bin/python3
 USER 1000:1000
 # ./gr8 glm53 COMMAND; with no command, `up` in the foreground
 ENTRYPOINT ["/opt/gr8/docker/entrypoint.sh"]

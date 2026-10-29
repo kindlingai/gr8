@@ -7,16 +7,16 @@
 # against the CPU's, and one changed byte caught in its own chunk) and canon_test (a session's KV exported and imported
 # across page lists and layouts, then a decode step on it; #152) and kv_resize_test (the KV pool's chunks shrunk and grown
 # under live sessions, on caches in virtual memory, against caches that never resized; #153) and dhead_i4_test
-# (G6_DRAFT_HEAD_I4: the MXFP8 -> INT4 head records against a host derivation, the INT4 head GEMV against a host dot;
+# (GR8_DRAFT_HEAD_I4: the MXFP8 -> INT4 head records against a host derivation, the INT4 head GEMV against a host dot;
 # --time: MXFP8 vs INT4 head GEMV) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same
 # weights, byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each
 # row as solo decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row
 # against each session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP). headgroup_test,
 # cpgroups and the Flash tests (flash_kpool_stream_test, flash_sparse_mla_test, flash_sparse_mla_v2_test, kda_g9_det,
-# flash_dsa_f16_test, mhc_decode_stage_test) build in one fixed configuration each, whatever G6_NR and EXTRA say
+# flash_dsa_f16_test, mhc_decode_stage_test) build in one fixed configuration each, whatever GR8_NR and EXTRA say
 # (docs/TESTING.md).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
-#   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
+#   GR8_NR=4 scripts/c1_tests.sh bin4               the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
 #   ARCH=120a ...                                   RTX 50xx instead of the GB10 (default 121a)
 # Compiles engine/runtime/tests/<test>.cu with the K1H2 flags of scripts/build.sh into <bin_dir>/<test> (s2_attn_test also
@@ -27,6 +27,7 @@
 #   row_budget_test: --only gv|k1, --time [reps] (K1 timing over M = 6..24)
 #   s2_attn_test:    --only rep|cp, --seeds N, --no-long (skips the cases above 32768 tokens: two replicated, two CP)
 set -eu
+[ -n "${G6_NR:-}" ] && [ -z "${GR8_NR:-}" ] && GR8_NR=$G6_NR   # the old name still works
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)
 shift || true
@@ -36,7 +37,7 @@ A=${ARCH:-121a}
 K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \
 -DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
 -DG6_CP=1 -DG6_CP_PF_HASH2=1 -DDEC_IDX31=1 -DPF_QO_DEDUP=1"
-FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} ${EXTRA:-}"
+FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} ${EXTRA:-}"
 # every test links the knob table (engine/knobs-rs): the engine headers read their settings through it
 KNOBLIB="$REPO/engine/knobs-rs/target/release/libgr8knobs.a"
 [ -f "$KNOBLIB" ] || cargo build --quiet --release --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
@@ -64,7 +65,7 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a te
   return $rc
 }
 # with_flags <flags> <command...>: the command with FLAGS = the arch and <flags> alone, for a test built in one fixed
-# configuration whatever G6_NR and EXTRA say
+# configuration whatever GR8_NR and EXTRA say
 with_flags() {
   local saved=$FLAGS r=0
   FLAGS="-gencode=arch=compute_$A,code=sm_$A $1"; shift
@@ -140,7 +141,7 @@ if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
-  # the Flash KV caches in chunks (G6_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
+  # the Flash KV caches in chunks (GR8_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
   [ "$TEST" = all ] && ARGS=()
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then

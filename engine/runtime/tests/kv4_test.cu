@@ -10,7 +10,7 @@
 //    (b) the exact latent: the cost of the row format, which this test reports.
 // Thresholds: kernel error < 1e-2 (fp16 tables and outputs); round trip >= 28 dB (FP8) / 17 dB (INT4); attention cost
 // < 0.05 (FP8) / 0.25 (INT4) relative L2.
-// Build and run: TEST=kv4_test G6_NR=4 [EXTRA=-DG6_KV4=1] scripts/c1_tests.sh <bin_dir> (the K1H2 flags; attn.cu, bind.cu)
+// Build and run: TEST=kv4_test GR8_NR=4 [EXTRA=-DG6_KV4=1] scripts/c1_tests.sh <bin_dir> (the K1H2 flags; attn.cu, bind.cu)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
 #include <algorithm>
 #include <cmath>

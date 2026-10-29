@@ -1,6 +1,6 @@
 #!/bin/bash
 # The image's entrypoint: ./gr8 $GR8_MODEL COMMAND [OPTIONS], with no command meaning `up`. GR8_MODEL is required
-# (glm53 or glm53f): nothing picks the model for the runner. It first sets up this box's working directory (G6_HOME):
+# (glm53 or glm53f): nothing picks the model for the runner. It first sets up this box's working directory (GR8_WORK_DIR):
 # out/ exists, and bin/ links to the image's engine, which runs every TP width.
 #
 # It sets its own limits, so a runtime without compose's `ulimits:` (Kubernetes has no such field) needs no wrapper: no
@@ -10,7 +10,7 @@
 # Its exit status is the launcher's: 0 after a `down` or a stop, 1 when a rank failed, 2 for bad options, 4 when the
 # handshake refused the boot. Its output goes to docker logs and to out/supervisor.log, which `logs supervisor` reads.
 set -euo pipefail
-home=${G6_HOME:?G6_HOME is not set}
+home=${GR8_WORK_DIR:?GR8_WORK_DIR is not set}
 # ./gr8 takes --no-check before the command; take it here as CHECK=0, so the command below is the real one.
 while [ "${1:-}" = --no-check ]; do export CHECK=0; shift; done
 [ $# -gt 0 ] || set -- up
@@ -39,7 +39,7 @@ if [ "$cmd" = up ]; then
     exit 2
   fi
 fi
-# A GR8_HOME host directory: docker creates a missing one owned by root, and a bare-metal G6_HOME has a real bin/,
+# A GR8_HOME host directory: docker creates a missing one owned by root, and a bare-metal GR8_WORK_DIR has a real bin/,
 # where the link below would land inside it and the host's engine would run.
 if [ ! -w "$home" ]; then
   echo "gr8: $home is not writable by uid $(id -u): a GR8_HOME host directory must be owned by it" \
@@ -47,7 +47,7 @@ if [ ! -w "$home" ]; then
   exit 2
 fi
 if [ -d "$home/bin" ] && [ ! -L "$home/bin" ]; then
-  echo "gr8: $home/bin is a directory (a bare-metal G6_HOME?): point GR8_HOME at a directory of its own" >&2
+  echo "gr8: $home/bin is a directory (a bare-metal GR8_WORK_DIR?): point GR8_HOME at a directory of its own" >&2
   exit 2
 fi
 mkdir -p "$home/out"

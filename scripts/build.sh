@@ -5,15 +5,15 @@
 # width is compiled as its own build was (engine/runtime/build_m4.sh): DEC_S2 (the multi-session path) at every width,
 # and PF_F12 (the fat-CTA prefill fc1) at 4.
 #   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin; TP = 1, 2, 3, 4, 5, 6 and 8
-#   G6_WIDTHS="3 4" scripts/build.sh bin  only those widths (a shorter build); G6_NR=4 is G6_WIDTHS=4
-#   F12_WIDTHS="4 5" scripts/build.sh bin  PF_F12 (fat-CTA prefill fc1, on unless G6_PF_F12=0) at TP5 too; default TP4 only
+#   GR8_WIDTHS="3 4" scripts/build.sh bin only those widths (a shorter build); GR8_NR=4 is GR8_WIDTHS=4
+#   F12_WIDTHS="4 5" scripts/build.sh bin  PF_F12 (fat-CTA prefill fc1, on unless GR8_PF_F12=0) at TP5 too; default TP4 only
 #   JOBS=N                                compiles at once (default: the CPU count)
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
 #                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
 #   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
 #                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
-#                                         G6_WIDTHS or G6_NR says otherwise
-#   G6_TESTS=0 / G6_TESTS=only            the GLM engine without the test binaries below it, or the tests alone (CI
+#                                         GR8_WIDTHS or GR8_NR says otherwise
+#   GR8_TESTS=0 / GR8_TESTS=only        the GLM engine without the test binaries below it, or the tests alone (CI
 #                                         builds them on separate runners)
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (the engine finds it there at any TP)
@@ -38,14 +38,16 @@ if command -v cargo > /dev/null 2>&1; then
 fi
 KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" -lpthread -ldl -lm)
 # the old G6_ names of these variables still work
-for v in XGRAMMAR XGRAMMAR_LIB NVCC_CACHE NVCC_CACHE_DIR; do o=G6_$v n=GR8_$v; if [ -n "${!o:-}" ] && [ -z "${!n:-}" ]; then export "$n=${!o}"; fi; done
+for v in NR WIDTHS TESTS XGRAMMAR XGRAMMAR_LIB NVCC_CACHE NVCC_CACHE_DIR; do
+  o=G6_$v n=GR8_$v; if [ -n "${!o:-}" ] && [ -z "${!n:-}" ]; then export "$n=${!o}"; fi
+done
 # request grammars (engine/runtime/grammar.h): XGrammar's C++, the copy the front end's xgrammar crate pins
 # (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
 # GR8_XGRAMMAR=DIR names a source tree instead (the image's engine stages), GR8_XGRAMMAR=0 builds without grammars.
 # Needs cmake; GLM-5.3 only
 GR_OFF=""
 if [ "${MODEL:-glm}" = flash ]; then GR_OFF="MODEL=flash"
-elif [ "${G6_TESTS:-1}" = only ]; then GR_OFF="G6_TESTS=only builds no engine"
+elif [ "${GR8_TESTS:-1}" = only ]; then GR_OFF="GR8_TESTS=only builds no engine"
 elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi
 if [ -n "$GR_OFF" ]; then
@@ -70,7 +72,7 @@ LEDGER_BIN=$REPO/engine/kvman-rs/target/release/kvman-ledger
 if [ -x "$LEDGER_BIN" ]; then cp "$LEDGER_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
-WIDTHS=${G6_WIDTHS:-${G6_NR:-1 2 3 4 5 6 8}}
+WIDTHS=${GR8_WIDTHS:-${GR8_NR:-1 2 3 4 5 6 8}}
 # each width runs its own instance: the --top-p-cands bound is TP_SORT (2048) / NR, checked before any CUDA work
 widths_ok() {   # widths_ok <g6m4> [<m4sim>]
   local n ips want
@@ -99,7 +101,7 @@ case "${MODEL:-glm}" in
   glm) ;;
   flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build
     [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=flash: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${G6_WIDTHS:-${G6_NR:-2 3 4}}
+    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-2 3 4}}
     # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
     WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 ${EXTRA:-}" OUT="$OUT/flash" \
       bash build_m4.sh "${ARCH:-121a}" all
@@ -114,8 +116,8 @@ case "${MODEL:-glm}" in
     exit 0 ;;
   *) echo "MODEL=$MODEL: glm or flash"; exit 2 ;;
 esac
-case "${G6_TESTS:-1}" in 0|1|only) ;; *) echo "G6_TESTS=$G6_TESTS: 0, 1 or only"; exit 2 ;; esac
-if [ "${G6_TESTS:-1}" != only ]; then
+case "${GR8_TESTS:-1}" in 0|1|only) ;; *) echo "GR8_TESTS=$GR8_TESTS: 0, 1 or only"; exit 2 ;; esac
+if [ "${GR8_TESTS:-1}" != only ]; then
   WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
   if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
     mkdir -p "$OUT/lib"
@@ -125,7 +127,7 @@ if [ "${G6_TESTS:-1}" != only ]; then
   md5sum "$OUT/g6m4" "$OUT/m4sim"
   widths_ok "$OUT/g6m4" "$OUT/m4sim"
 fi
-[ "${G6_TESTS:-1}" = 0 ] && exit 0
+[ "${GR8_TESTS:-1}" = 0 ] && exit 0
 export PATH=/usr/local/cuda/bin:$PATH
 # the compiles below go through the same object cache as build_m4.sh (#32); GR8_NVCC_CACHE=0 runs plain nvcc / g++
 CACHE="$REPO/engine/runtime/nvcc_cache.sh"
@@ -143,14 +145,14 @@ build() {   # build <bin> <command..>: in the background, at most J at once; a f
   { "${@:2}" > "$TL/$1.log" 2>&1 || touch "$TL/$1.failed"; } &
 }
 # The compiles run first, the longest first. The tests run after them, in order.
-# G6_L2PF (paced side-stream L2 prefetch in the step's idle-DRAM windows): byte-exact check + per-layer timing of the
+# GR8_L2PF (paced side-stream L2 prefetch in the step's idle-DRAM windows): byte-exact check + per-layer timing of the
 # decode layer sequence (real attention, x_in / q_b / o_proj / router GEMVs, wait and MoE stand-ins); build only (needs
 # an idle GPU and ~3-5 GB): $OUT/l2pf_bench (file header)
 # shellcheck disable=SC2086
-build l2pf_bench $NVCC -O3 -std=c++17 $GEN $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} -I "$REPO/engine/kernels" \
+build l2pf_bench $NVCC -O3 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
   -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
   "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas "${KNOBS[@]}"
-# G6_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
+# GR8_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
 # + bench on a synthetic TP4 layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
 # shellcheck disable=SC2086
 build k1_ovl_test $NVCC -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" \
@@ -182,11 +184,11 @@ build tr3_e4m3_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/tr3_e4m3_test" "$REPO/eng
   -lcublas "${KNOBS[@]}"
 # gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py)
 build gpuprobe $NVCC -O2 -std=c++17 $GEN -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
-# the prefetch queues (G6_L2PF targets, G6_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
+# the prefetch queues (GR8_L2PF targets, GR8_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
 # shellcheck disable=SC2086
-build l2pf_queue_test nvcc -O2 -std=c++17 $GEN $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} -I "$REPO/engine/kernels" \
+build l2pf_queue_test nvcc -O2 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
   -o "$OUT/l2pf_queue_test" "$REPO/engine/kernels/tests/l2pf_queue_test.cu"
-# K1 split choice (G6_K1_SPLIT table vs triple, the fused remap's KS1 x WG >= 2 guard): host only, runs everywhere
+# K1 split choice (GR8_K1_SPLIT table vs triple, the fused remap's KS1 x WG >= 2 guard): host only, runs everywhere
 # shellcheck disable=SC2086
 build k1_split_test nvcc -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" \
   "$REPO/engine/kernels/tests/k1_split_test.cu" "${KNOBS[@]}"

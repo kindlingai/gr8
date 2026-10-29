@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit the S2 step cost model to the engine's round log (G6_S2_ROUNDLOG=1, DEC_S2 build, rank 0 stderr).
+"""Fit the S2 step cost model to the engine's round log (GR8_S2_ROUNDLOG=1, DEC_S2 build, rank 0 stderr).
 
 Log line, one per decode step (engine/runtime/s2/native.cuh, round_line):
   # s2_round step <n> <main|draft|chain> round <id> active <sessions in the round> S <sessions in this step> M <rows>
@@ -270,7 +270,7 @@ def main(argv=None):
         ap.error('no log files')
     rows = read_logs(a.logs, a.include_capture, a.skip)
     if not any(rows.values()):
-        print('no "# s2_round" lines found (engine needs a DEC_S2 build and G6_S2_ROUNDLOG=1 on rank 0)', file=sys.stderr)
+        print('no "# s2_round" lines found (engine needs a DEC_S2 build and GR8_S2_ROUNDLOG=1 on rank 0)', file=sys.stderr)
         return 1
     results = {}
     results['main'] = fit_kind('main', rows['main'])

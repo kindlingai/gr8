@@ -1,7 +1,7 @@
 """Launch options: the command line, one config file and the environment, in that order of precedence.
 
 Every option has a KEY (the name in a config file and the environment) and a --flag. A config file is `@FILE` on the
-command line, else $G6_CLUSTER, else ./cluster.env, else <repo>/config/cluster.env, else none (--no-config skips
+command line, else $GR8_CLUSTER, else ./cluster.env, else <repo>/config/cluster.env, else none (--no-config skips
 it). The file is parsed, not sourced: `KEY=value` lines, `#` comments, optional `export`, quotes stripped, no `$`.
 
 Scopes decide what the handshake compares. `cluster` options must be equal on every box (they reach every rank's
@@ -92,7 +92,7 @@ KEYS = {
                                         'A commit in MODEL must be the commit model-loader resolved the revision to. '
                                         'Default: looked up.'),
     'MODEL_DIR': ('box', None, 'the tokenizer files, when the release directory has none'),
-    'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
+    'GR8_WORK_DIR': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below "
                                "it, and the ring's relay thread the one below those"),
     'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev. With mentat, "
@@ -237,7 +237,7 @@ KEYS = {
                                  'CAP may pass what they hold. pool is the resident slots per indexer group (with '
                                  'local it defaults to what the sessions past SHARE_LIMIT that place holds can select '
                                  'in a step, and a smaller value admits fewer of them at once), fmt=int4 stores 416 B '
-                                 "rows for 656. Sets the engine's G6_RT_* (docs/SETTINGS.md)"),
+                                 "rows for 656. Sets the engine's GR8_RT_* (docs/SETTINGS.md)"),
     'KV_TIER': ('cluster', None, 'deprecated, for one release: KV_TIER is KV_STORE with keep=evicted|shared|all per '
                                  'tier, and maps to KV_KEEP=all when any tier kept evicted runs (the old default), '
                                  'else system; KV_SHARED_AFTER is KV_SYSTEM_AFTER. A warning says so'),
@@ -420,8 +420,8 @@ KEYS = {
     'PF_AOP': ('cluster', None, '0 = no fc1 A-operand share in prefill (GR8_PF_AOP; byte-exact). Effect not measured. '
                                 'Default: TP=4 unset (1 when built with PF_AOP), TP=6 unset, TP=3 unset'),
     'NOHASH': ('cluster', None, '1 = skip the sha256 check of every pack tensor at load (run once without it first)'),
-    'G6ENV_X': ('cluster', None, 'more engine environment for every rank ("A=1 B=2")'),
-    'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
+    'EXTRA_ENV': ('cluster', None, 'more engine environment for every rank ("A=1 B=2")'),
+    'EXTRA_ARGS': ('cluster', None, 'more engine arguments for every rank'),
     'V2': ('box', None, 'exlr8 v2 experts from their raw width files: the width files and the index slices'),
     'V2_SLICES': ('box', None, 'exlr8 v2 experts from their raw width files: the width files and the index slices'),
     'V2_WIDTHS': ('box', None, 'the width manifest as a path: the older spelling of --variant <path>. Giving both is '
@@ -471,10 +471,14 @@ KEYS = {
     'STEERING_CHAT_TEMPLATE_SHA256': ('cluster', None, 'must match the actual served template bytes'),
     'STEERING_WEIGHT_SET': ('cluster', None, 'content identity; explicit mismatches fail. Default: resolved model.'),
 }
-FLAGS = {'S2PORT': '--s2-port', 'G6_HOME': '--g6-home'}
+FLAGS = {'S2PORT': '--s2-port', 'GR8_WORK_DIR': '--work-dir'}
+# Old names, still read from the command line, a config file and the environment, with a warning.
+RENAMED = {'G6_HOME': 'GR8_WORK_DIR', 'G6ENV_X': 'EXTRA_ENV', 'G6ARGS_X': 'EXTRA_ARGS', 'G6_CLUSTER': 'GR8_CLUSTER'}
+RENAMED_FLAGS = {'--g6-home': '--work-dir', '--g6env-x': '--extra-env',
+                 '--g6args-x': '--extra-args'}
 # Read from old config files and ignored here, so they do not draw a warning.
-IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'G6_CLUSTER', 'G6_NR', 'BUNDLE_LIBS', 'ARCH', 'EXTRA', 'SHARED',
-           'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN', 'FRONT'}
+IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'GR8_CLUSTER', 'G6_NR', 'G6_WIDTHS', 'G6_TESTS', 'BUNDLE_LIBS', 'ARCH',
+           'EXTRA', 'SHARED', 'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN', 'FRONT'}
 SWITCHES = {'--no-config', '--no-check', '--foreground'}
 ENGINE_KNOBS = [k for k in list(KEYS)[list(KEYS).index('CAP'):]]
 FABRIC_PORT = 18600   # engine/comms/fabric.h: the fabric bootstrap and per-collective ports start here
@@ -521,8 +525,32 @@ def parse_file(path):
     return out
 
 
+def renamed_argv(argv, warnings):
+    """argv with each old flag and old KEY=value word under its new name."""
+    out = []
+    for a in argv:
+        name, eq, val = a.partition('=')
+        new = RENAMED_FLAGS.get(name) or (eq and RENAMED.get(name))
+        if new:
+            warnings.append(f'{name} is the old name of {new}: rename it, the old name will go away')
+            a = new + eq + val
+        out.append(a)
+    return out
+
+
+def renamed_keys(d, where, warnings):
+    """d (a config file's or the environment's values) with each old key under its new name; the new name wins."""
+    d = dict(d)
+    for old, new in RENAMED.items():
+        if old in d:
+            warnings.append(f'{where}: {old} is the old name of {new}: rename it, the old name will go away')
+            d.setdefault(new, d.pop(old))
+    return d
+
+
 def default_file(environ):
-    for p in (environ.get('G6_CLUSTER'), 'cluster.env', os.path.join(REPO, 'config', 'cluster.env')):
+    for p in (environ.get('GR8_CLUSTER') or environ.get('G6_CLUSTER'), 'cluster.env',
+              os.path.join(REPO, 'config', 'cluster.env')):
         if p and os.path.isfile(p):
             return p
     return None
@@ -550,6 +578,8 @@ class Options:
 def parse(argv, environ=None):
     """argv after the command. Returns Options; positional words that are not options stay in .args."""
     environ = os.environ if environ is None else environ
+    warnings = []
+    argv = renamed_argv(argv, warnings)
     cmd, at, args, switches = {}, None, [], set()
     i = 0
     while i < len(argv):
@@ -581,19 +611,19 @@ def parse(argv, environ=None):
         else:
             args.append(a)
         i += 1
-    warnings = []
     path = at or (None if '--no-config' in switches else default_file(environ))
     filev = {}
     if path:
         if not os.path.isfile(path):
             raise OptionError(f'no config file {path}')
-        filev = parse_file(path)
+        filev = renamed_keys(parse_file(path), path, warnings)
         # An old file names the boxes in HOSTS, by ssh name. HOSTS stands for PEERS when PEERS is absent.
         if 'HOSTS' in filev and 'PEERS' not in filev:
             filev['PEERS'] = ','.join(filev['HOSTS'].split())
         for k in sorted(filev):
             if k not in KEYS and k not in IGNORED:
                 warnings.append(f'{path}: unknown key {k}, ignored')
+    environ = renamed_keys(environ, 'the environment', warnings)
     values, origin = {}, {}
     for k, (_, dflt, _) in KEYS.items():
         for src, d in (('command line', cmd), ('@file' if at else 'config file', filev), ('environment', environ)):
@@ -632,13 +662,13 @@ def parse(argv, environ=None):
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
-    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'G6_HOME', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
+    for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'GR8_WORK_DIR', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
               'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT', 'GRAMMAR_DIR'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or \
                 (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
                 (k == 'VARIANT' and '/' not in values[k] and not values[k].endswith('.json')):
             continue
-        # the engine runs in G6_HOME. STEERING_PROFILE may list several directories
+        # the engine runs in GR8_WORK_DIR. STEERING_PROFILE may list several directories
         values[k] = ','.join(d if not d or d.startswith('hf:') else os.path.abspath(d) for d in values[k].split(',')) \
             if k == 'STEERING_PROFILE' else os.path.abspath(values[k])
     return opts
@@ -668,7 +698,7 @@ def validate(o):
             raise OptionError(f'--tp is needed with --mentat ({model.tp_sizes})')
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
-                          'them with --g6env-x "NAME=value ..." so every box compares them')
+                          'them as GR8_ names with --extra-env "NAME=value ..." so every box compares them')
     if o.get('VARIANT') and o.get('V2_WIDTHS'):
         raise OptionError('--variant and --v2-widths both name the width manifest: give one')
     if o.get('DRAFTER') and not o.get('DRAFTER').startswith('https://'):

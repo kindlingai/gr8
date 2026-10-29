@@ -53,7 +53,7 @@ class ModelLoaderTests(unittest.TestCase):
 
     def opts(self, *extra, tp=4):
         o = opt.parse(['--no-config', '--peers', ','.join(PEERS.split(',')[:tp]), '--model', URL, '--model-cache',
-                       self.store, '--fetch', 'model-loader', '--g6-home', self.home, '--dflash', '0', *extra], T.GLM)
+                       self.store, '--fetch', 'model-loader', '--work-dir', self.home, '--dflash', '0', *extra], T.GLM)
         opt.validate(o)
         return o
 
@@ -171,7 +171,7 @@ class ModelLoaderTests(unittest.TestCase):
     def test_a_revision_and_a_catalog_name(self):
         self.ml.catalog['glm-x'] = {'v0.4': (self.rel, T.C2), 'main': (self.rel, T.C1)}
         o = opt.parse(['--no-config', '--peers', PEERS, '--model', URL + '@v0.4', '--model-cache', self.store,
-                       '--fetch', 'model-loader', '--model-loader-model', 'glm-x', '--g6-home', self.home,
+                       '--fetch', 'model-loader', '--model-loader-model', 'glm-x', '--work-dir', self.home,
                        '--dflash', '0'], T.GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
@@ -284,7 +284,7 @@ class ModelLoaderTests(unittest.TestCase):
     def test_prepare(self):
         import launch
         argv = ['--no-config', '--peers', PEERS, '--model', URL, '--model-cache', self.store, '--fetch',
-                'model-loader', '--g6-home', self.home, '--dflash', '0', '--rank', '2']
+                'model-loader', '--work-dir', self.home, '--dflash', '0', '--rank', '2']
         out = subprocess.run([sys.executable, launch.__file__, 'prepare', *argv], capture_output=True, text=True,
                              env={**os.environ, **T.GLM, 'G6LOAD': T.hfsource.fetch_ranks().g6load()})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -368,7 +368,7 @@ class RealModelLoaderTests(unittest.TestCase):
             time.sleep(0.1)
         home = os.path.join(t, 'home')
         o = opt.parse(['--no-config', '--peers', PEERS, '--model', URL, '--model-cache', store, '--fetch',
-                       'model-loader', '--g6-home', home, '--dflash', '0'], T.GLM)
+                       'model-loader', '--work-dir', home, '--dflash', '0'], T.GLM)
         opt.validate(o)
         logs = []
         # GET /catalog lists the entry (an http source here, so the name is looked up from the repo only for

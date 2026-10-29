@@ -8,11 +8,11 @@ recovery is out of scope: the probe says what is wrong, a person fixes it.
 ```bash
 scripts/rank_health.sh [OUT_JSON] [OPTIONS]   # on the head, no model booted; ./gr8's options; exit 0 admitted, 3 refused
 ./gr8 glm53 up                         # after the probe
-python3 bench/gate/gate.py run ... --health $G6_HOME/out/rank_health.json     # stores the result in the run records
+python3 bench/gate/gate.py run ... --health $GR8_WORK_DIR/out/rank_health.json     # stores the result in the run records
 python3 tools/health/rank_probe.py local --proxy-cpu 19 --rail-ips 10.0.1.1,10.0.2.1    # one node, JSON
 ```
 
-`scripts/build.sh` builds `bin/gpuprobe`; every box needs it in `$G6_HOME/bin`, as `./gr8 glm53 build` leaves it. The
+`scripts/build.sh` builds `bin/gpuprobe`; every box needs it in `$GR8_WORK_DIR/bin`, as `./gr8 glm53 build` leaves it. The
 boxes also need `ib_write_bw` (package `perftest`) and `nvidia-smi`. `rank_probe.py` ships itself over ssh.
 
 ## What is measured
@@ -71,7 +71,7 @@ tolerances could be tighter (the healthy spread is under 2%) but that is left un
 ## Progress-thread isolation
 
 `engine/comms/progress_cpus.h` keeps the registry of the CPUs the fabric proxy threads are pinned to. Just before the first
-barrier, `g6m4` moves every other thread of the process off those CPUs. A proxy is recognized by its registered thread id (the proxy registers it when it starts), not by its CPU mask: another thread pinned to a proxy CPU is moved too (`G6_PROGRESS_ISOLATE=0` turns it off; see
+barrier, `g6m4` moves every other thread of the process off those CPUs. A proxy is recognized by its registered thread id (the proxy registers it when it starts), not by its CPU mask: another thread pinned to a proxy CPU is moved too (`GR8_PROGRESS_ISOLATE=0` turns it off; see
 `docs/SETTINGS.md`). A thread that cannot be moved is named in the log. The launcher runs the shim and the front end on
 the other CPUs. Host test: `cd tools/health && g++ -std=c++20 -O1 -Wall -pthread -I../../engine/comms test_progress_cpus.cpp -o /tmp/t && /tmp/t`.
 

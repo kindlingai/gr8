@@ -166,7 +166,7 @@ read back as decode selects them ([Remote KV](#remote-kv)).
   explicitly selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select a loaded profile
   by name with `steering_profile` and `steering_scale`; `--steering-force SCALE` (one profile) is the process-wide
   qualification mode.
-- `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
+- `--extra-env "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
   boxes compare them, and a `G6_*` variable in the environment is refused for that reason.
 
 ### Remote KV
@@ -221,7 +221,7 @@ The limits:
 
 [engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md) covers the block stores, their transports and
 measurements. `./gr8 knobs KV_STORE KV_ROWS` describes every `KV_STORE` and `KV_ROWS` field, and
-[docs/SETTINGS.md](docs/SETTINGS.md) the engine's `G6_RT_*` settings.
+[docs/SETTINGS.md](docs/SETTINGS.md) the engine's `GR8_RT_*` settings.
 
 ### Thinking
 
@@ -263,7 +263,7 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 - Each rank checks its weights at boot: the GPU sums what it holds and compares with the bytes the loader read. A
   difference stops the boot with exit 3 and names the rank and the chunk ("g6: weight check: ..."). Once serving,
   `curl localhost:8100/health?deep` on the head checks every rank again ([frontend/README.md](frontend/README.md)).
-  `G6ENV_X=G6_WEIGHT_CHECK=0` turns both off.
+  `EXTRA_ENV=GR8_WEIGHT_CHECK=0` turns both off.
 - `top_k` and `min_p` are ignored with a warning. `logprobs` and `prompt_logprobs` work up to k = 20.
   [frontend/README.md](frontend/README.md) has the full API.
 

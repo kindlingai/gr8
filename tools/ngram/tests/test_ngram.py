@@ -216,7 +216,7 @@ class CliTest(unittest.TestCase):
 
 
 class ExportTest(unittest.TestCase):
-    """The engine's table (G6_NGRAM, engine/runtime/ngram_lookup.h)."""
+    """The engine's table (GR8_NGRAM, engine/runtime/ngram_lookup.h)."""
 
     def traces(self):
         # 6 prompts; each continues the loop 3 4 1 2 ..., two of them with a detour where the table guesses wrong
