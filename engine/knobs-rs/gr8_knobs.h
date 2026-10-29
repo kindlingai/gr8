@@ -28,7 +28,7 @@ namespace knob
 
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
-inline int init() { return gr8_knobs_init(0xc3fc11c2bbb606ffull); }
+inline int init() { return gr8_knobs_init(0x750d3e8ee8896edaull); }
 
 /// The set agree-scope knobs that differ from their defaults, as " env NAME=value ...", or "".
 inline std::string signature() { return gr8_knobs_signature(); }
@@ -1748,9 +1748,9 @@ inline bool pf_qp_warm()
 }
 
 /// GR8_PF_QP_WIRE_E
-inline int64_t pf_qp_wire_e()
+inline std::optional<int64_t> pf_qp_wire_e()
 {
-    static const int64_t v = *detail::int_(239, 0);
+    static const std::optional<int64_t> v = detail::int_(239, 0);
     return v;
 }
 
