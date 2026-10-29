@@ -1,26 +1,27 @@
-// gr8 stage-0 transport trace (G6_XTRACE=1; default off). Measurement only: nothing here feeds a compute result.
+// gr8 stage-0 transport trace (GR8_XTRACE=1; default off). Measurement only: nothing here feeds a compute result.
 // GPU side: one record of XT_W u64 per (step % XT_STEPS, collective) in DEVICE memory (FabricDev::xt; null = off).
 //   [0] globaltimer before the final publish work (last CTA, before its system fence + doorbell store)
 //   [1] globaltimer right after the doorbell store       [2 + p] globaltimer when peer p's tail was seen (own = 0)
 //   [10] globaltimer at reduce end (k_ar_add_norm, max over CTAs)   [11] seq of the collective that wrote [1]
 // Host proxy side (fabric.cpp): per (step % XT_STEPS, collective, rail) 4 ticks of the CPU counter (CNTVCT_EL0 on
 // ARM, rdtsc on x86): doorbell seen, tail stored, first post, last post on that rail. Per-QP WC error counters.
-// Everything is dumped OUTSIDE the timed loop: at stop_proxy / exit, or once when the file G6_XTRACE_QUIT appears.
+// Everything is dumped OUTSIDE the timed loop: at stop_proxy / exit, or once when the file GR8_XTRACE_QUIT appears.
 // Only local intervals are meaningful across ranks (each clock is per node).
 #pragma once
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6 {
 
 constexpr int XT_STEPS = 64, XT_W = 16;
 enum { XT_PUB = 0, XT_DB = 1, XT_TAIL = 2, XT_RED = 10, XT_SEQ = 11 };
 
-inline bool xtrace_env() { const char* e = getenv("G6_XTRACE"); return e && atoi(e) == 1; }
+inline bool xtrace_env() { return knob::xtrace(); }
 
-// device buffer for one rank's GPU records (zeroed); nullptr when G6_XTRACE is off
+// device buffer for one rank's GPU records (zeroed); nullptr when GR8_XTRACE is off
 inline unsigned long long* xt_alloc(int ncoll) {
   if (!xtrace_env()) return nullptr;
   unsigned long long* p = nullptr;

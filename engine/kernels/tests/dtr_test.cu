@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 #include "../bind_prefill.cuh"
+#include "../../knobs-rs/gr8_knobs.h"
 #include "../../h2d.h"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -219,7 +220,7 @@ static int check(const std::string& dir, std::vector<HostMat>& mats, const std::
     const size_t recb = static_cast<size_t>((Rmax + 15) / 16) * (16384 / 32) * 1024;
     float* y_all = nullptr;
     CK(cudaMalloc(&y_all, static_cast<size_t>(Rmax) * 16384 * 4));
-    const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+    const bool dtr8 = knob::pf_dtr8();
 #else
     const size_t recb = static_cast<size_t>((Rmax + 15) / 16) * (16384 / 32) * bindp::REC;
 #endif
@@ -493,7 +494,7 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
             for (auto& v : hx) v = __float2half(nd(rng));
             CK(g6h2d::copy(px, hx.data(), hx.size() * 2));
         }
-        // the pair-owner o_proj shape (G6_PF_OWN=4: two members' entries back to back, K = 2 x 4096), from o_proj.r0 twice
+        // the pair-owner o_proj shape (GR8_PF_OWN=4: two members' entries back to back, K = 2 x 4096), from o_proj.r0 twice
         std::vector<HostMat> pair;
         for (HostMat& h : mats)
             if (h.name.rfind("o_proj", 0) == 0 && h.K == 4096)
@@ -616,7 +617,7 @@ static int bench(std::vector<HostMat>& mats, const std::vector<std::array<std::s
             T.t[bind::T_D_FC2] = ten(ipool + m1, {384, I / 32, 288});
             bind::K1 k;
             bind::Tensor sh[3];
-            static const int fuse = getenv("G6_FUSE") ? atoi(getenv("G6_FUSE")) : 1;
+            const int fuse = static_cast<int>(knob::fuse());
             ok(bind::make_k1(T, M, bsc, G.dx, bsc.xf_x2, bind::PlanPtrs(), out, 1, k, sh, fuse));
             bind::Xfrag xa;
             xa.on = 1; xa.src = G.dx; xa.ld = HID; xa.K = HID; xa.M = M; xa.f16 = bsc.xf_x2;
@@ -791,7 +792,7 @@ static int bind_check(const std::string& dir, std::vector<HostMat>& mats)
     P2.s[bindp::T_O_PROJ] = bind::Tensor();
     P2.tm.o_proj = O.m;
 #if G6_MODEL_FLASH
-    const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+    const bool dtr8 = knob::pf_dtr8();
     if (!dtr8)
     {
         P2.tm.q_b = Q.m; P2.tm.gate = G.m; P2.tm.up = U.m; P2.tm.down = D.m;

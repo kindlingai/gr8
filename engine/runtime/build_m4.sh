@@ -4,7 +4,7 @@
 # JOBS: compiles at once (default: the CPU count; each takes under 1 GB).
 # m4sim: one GPU, NR simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
 # dfl: dfltest and dflreplay only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py; the
-#      G6_DFL_BODY_I4 replay of a G6_DFL_DUMP)
+#      GR8_DFL_BODY_I4 replay of a GR8_DFL_DUMP)
 # rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution.
 # dfl and rs build the one width EXTRA names (EXTRA="-DG6_NR=4 -DDEC_S2"; default 6).
 # EXTRA=-DG6_MODEL_FLASH=1: the GLM 5.3 Flash geometry (engine/model_geom.h); scripts/build.sh MODEL=flash names the results *_flash.
@@ -19,11 +19,11 @@ CPU=""
 OUT=${OUT:-../../bin}
 O=$OUT/obj                 # one object dir per variant (OUT): concurrent flag / NR builds never share objects
 mkdir -p $OUT $O
-# every compile goes through nvcc_cache.sh (#32): a rebuild compiles only what an edit reaches. G6_NVCC_CACHE=0: plain nvcc
-if [ "${G6_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="./nvcc_cache.sh nvcc"; GXX="./nvcc_cache.sh g++"; fi
-export G6_NVCC_CACHE_LOG=$O/nvcc_cache.calls
-rm -f $G6_NVCC_CACHE_LOG
-cache_counts() { [ -f $G6_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit' $G6_NVCC_CACHE_LOG) hit, $(grep -c '^miss' $G6_NVCC_CACHE_LOG) miss, $(grep -c '^pass' $G6_NVCC_CACHE_LOG) not cacheable"; return 0; }
+# every compile goes through nvcc_cache.sh (#32): a rebuild compiles only what an edit reaches. GR8_NVCC_CACHE=0: plain nvcc
+if [ "${GR8_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="./nvcc_cache.sh nvcc"; GXX="./nvcc_cache.sh g++"; fi
+export GR8_NVCC_CACHE_LOG=$O/nvcc_cache.calls
+rm -f $GR8_NVCC_CACHE_LOG
+cache_counts() { [ -f $GR8_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit' $GR8_NVCC_CACHE_LOG) hit, $(grep -c '^miss' $GR8_NVCC_CACHE_LOG) miss, $(grep -c '^pass' $GR8_NVCC_CACHE_LOG) not cacheable"; return 0; }
 # the knob table's C API (engine/knobs-rs, gr8_knobs.h): every binary that reads a knob links it. scripts/build.sh
 # builds it with cargo
 KNOBLIB=../knobs-rs/target/release/libgr8knobs.a
@@ -40,7 +40,7 @@ if [ "$WHAT" = rs ]; then
   exit 0
 fi
 nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack.o
-# Flash: the kvchunks regions of G6_FLASH_KV_CHUNKS (runtime/flash_kv.h), one object for every width
+# Flash: the kvchunks regions of GR8_FLASH_KV_CHUNKS (runtime/flash_kv.h), one object for every width
 KVC=
 if [ "$ATTN_CU" = ../attn/flash_attn.cu ]; then
   nice -n 19 $NVCC -O2 -std=c++17 $GEN -c ../attn/kvchunks.cu -o $O/kvchunks.o; KVC="$O/kvchunks.o"
@@ -61,20 +61,20 @@ RSLIB=../loader-rs/target/release/libg6load.a
 RSDEF=""
 RSLINK=""
 if [ -f "$RSLIB" ]; then RSDEF="-DG6_RS_LOADER"; RSLINK="$RSLIB -ldl -lm"; fi
-# request grammars (grammar.h): G6_XGRAMMAR=DIR, an XGrammar source tree (scripts/build.sh finds the one the front end's
+# request grammars (grammar.h): GR8_XGRAMMAR=DIR, an XGrammar source tree (scripts/build.sh finds the one the front end's
 # xgrammar crate pins). Its library is built once per object directory (xgrammar_build.sh), or comes prebuilt from
-# G6_XGRAMMAR_LIB. g6m4 then takes --grammar-dir; without G6_XGRAMMAR a gram request is refused
+# GR8_XGRAMMAR_LIB. g6m4 then takes --grammar-dir; without GR8_XGRAMMAR a gram request is refused
 GRDEF=""
 GRLINK=""
-if [ -n "${G6_XGRAMMAR:-}" ] && [ "$WHAT" != sim ]; then
-  XLIB=${G6_XGRAMMAR_LIB:-$O/xgrammar/libxgrammar.a}
+if [ -n "${GR8_XGRAMMAR:-}" ] && [ "$WHAT" != sim ]; then
+  XLIB=${GR8_XGRAMMAR_LIB:-$O/xgrammar/libxgrammar.a}
   if [ ! -f "$XLIB" ]; then
-    [ -z "${G6_XGRAMMAR_LIB:-}" ] || { echo "G6_XGRAMMAR_LIB=$G6_XGRAMMAR_LIB: no such file"; exit 1; }
-    bash xgrammar_build.sh "$G6_XGRAMMAR" "$O/xgrammar" || exit 1
+    [ -z "${GR8_XGRAMMAR_LIB:-}" ] || { echo "GR8_XGRAMMAR_LIB=$GR8_XGRAMMAR_LIB: no such file"; exit 1; }
+    bash xgrammar_build.sh "$GR8_XGRAMMAR" "$O/xgrammar" || exit 1
   fi
   GRDEF="-DG6_GRAMMAR=1"
-  g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I"$G6_XGRAMMAR/include" -I"$G6_XGRAMMAR/3rdparty/dlpack/include" \
-      -I"$G6_XGRAMMAR/3rdparty/picojson" -c grammar.cc -o $O/grammar.o || exit 1
+  g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I"$GR8_XGRAMMAR/include" -I"$GR8_XGRAMMAR/3rdparty/dlpack/include" \
+      -I"$GR8_XGRAMMAR/3rdparty/picojson" -c grammar.cc -o $O/grammar.o || exit 1
   GRLINK="$O/grammar.o $XLIB"
   g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I. -o $OUT/grammar_test tests/grammar_test.cc $GRLINK -lpthread || exit 1
   $OUT/grammar_test || exit 1

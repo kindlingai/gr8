@@ -1,10 +1,10 @@
-"""CPU source checks of G6_PF_ROUTER_SPLIT (flash-G4), no GPU:
+"""CPU source checks of GR8_PF_ROUTER_SPLIT (flash-G4), no GPU:
 
     python3 engine/tests/test_flash_route_split_source.py -v
 
 1. OFF surface: the decode router (k_router_linear / glue.cuh / flash_mlp.cuh / rank.cuh / flash_step.cuh) and the router kernels
    themselves keep BASE's bytes, except NK's additive prefill-only MhcFabricPeerBlock; Expert::pre_routed is the LAST member of
-   Expert but the Flash-only G6_PF_Q8 fields after it; launch_route runs k_pf_route unless pre_routed,
+   Expert but the Flash-only GR8_PF_Q8 fields after it; launch_route runs k_pf_route unless pre_routed,
    count and fill always (the skip sits INSIDE bindp::launch_route, so every caller inherits it); the OFF block calls
    launch_router on all M exactly as before.
 2. ON order: router on own rows -> own-row route -> publish -> hx -> shared -> receive -> pre_routed -> experts.
@@ -46,7 +46,7 @@ class OffSurface(unittest.TestCase):
     @unittest.skipUnless(have_base(), f'commit {BASE} is not in this checkout')
     def test_decode_router_is_base_bytes(self):
         for name in ['engine/kernels/glue.cuh', 'engine/kernels/flash_mlp.cuh', 'engine/runtime/rank.cuh',
-                     'engine/model_geom.h', 'engine/runtime/envparse.h']:
+                     'engine/model_geom.h']:
             self.assertEqual(base(name), src(name), name)
         name = 'engine/runtime/flash_step.cuh'
         step = src(name)
@@ -68,7 +68,7 @@ class OffSurface(unittest.TestCase):
     def test_pre_routed_is_last_member(self):
         s = src('engine/kernels/bind_prefill.cuh')
         body = between(s, 'struct Expert\n{', '\n};\n')
-        q8 = body.find('#if G6_MODEL_FLASH', body.index('int pre_routed'))   # the Flash-only G6_PF_Q8 fields follow it
+        q8 = body.find('#if G6_MODEL_FLASH', body.index('int pre_routed'))   # the Flash-only GR8_PF_Q8 fields follow it
         core = body if q8 < 0 else body[:q8]
         decl = [l for l in core.split('\n') if re.match(r'    (int|const|float|__half|uint|long)', l)]
         self.assertTrue(decl[-1].startswith('    int pre_routed = 0;'), decl[-1])
@@ -143,16 +143,15 @@ class DroppedSlots(unittest.TestCase):
 class Boot(unittest.TestCase):
     def test_env_strict(self):
         c = src('engine/runtime/flash_route_split.cuh')
-        self.assertIn('env_choice("G6_PF_ROUTER_SPLIT", 1, 0, &e)', c)
-        self.assertIn('if (v < 0) die(e);', c)
+        self.assertIn('return knob::pf_router_split() ? 1 : 0;', c)   # the knob table refuses anything but 0 and 1
         g = src('engine/runtime/g6m4.cu')
-        self.assertIn('if (getenv("G6_PF_ROUTER_SPLIT")) die("G6_PF_ROUTER_SPLIT is a Flash-model option', g)
+        self.assertIn('if (knob::pf_router_split()) die("GR8_PF_ROUTER_SPLIT is a Flash-model option', g)
         rs = between(g, 'const bool route_split = route_split_mode == 1;', 'auto init_rs')
         self.assertIn('g6nr::NR >= 2 && g6nr::NR <= flash_route_split::MAX_NR', rs)
         self.assertIn('cfg.ips.size() == (size_t)g6nr::NR', rs)
         self.assertNotIn('ring', rs)          # the ring fabric relays the slot as it does the prefill fabric's
         self.assertNotIn('NR == 4', rs)
-        self.assertIn('if (getenv("G6_PF_ROUTER_SPLIT"))', src('engine/runtime/m4sim.cu'))
+        self.assertIn('if (knob::pf_router_split())', src('engine/runtime/m4sim.cu'))
 
     def test_one_unpack_for_every_rank_count(self):
         c = src('engine/runtime/flash_route_split.cuh')
@@ -168,7 +167,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(sorted(ports).count(80), 1)
         self.assertEqual(sorted(ports).count(88), 1)
         self.assertEqual(len(ports), len(set(ports)), sorted(ports))
-        # the replicated-GEMV gather fabric (gc, offset 9) is GLM-5.3 only: a Flash build dies on G6_QA_SPLIT and friends,
+        # the replicated-GEMV gather fabric (gc, offset 9) is GLM-5.3 only: a Flash build dies on GR8_QA_SPLIT and friends,
         # and the pool-ID fabric takes offset 9 there
         self.assertIn('if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die(', g)
         flash = '\n'.join(l for l in g.split('\n') if 'gc.proxy_cpu' not in l)

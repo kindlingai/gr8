@@ -59,8 +59,8 @@ struct Config {
     // remote rows release (pool.h window, kvman-rs Pool::window): a run past R lists its worst case and this many window
     // pages besides. 0 = off
     uint32_t window_pages = 0;          // last, for the same reason
-    // G6_CP_STEP_ROWS (cp_rows.h): a step past R carries at most cp_step_rows rows (0 = off: every decoding session in
-    // every round, as before). cp_after: contexts above it run the CP block (cp_after()). cp_seg: G6_CP_STEP_SEG. Read by
+    // GR8_CP_STEP_ROWS (cp_rows.h): a step past R carries at most cp_step_rows rows (0 = off: every decoding session in
+    // every round, as before). cp_after: contexts above it run the CP block (cp_after()). cp_seg: GR8_CP_STEP_SEG. Read by
     // Driver::step only; the scheduler's quanta keep their kinds (a capped round is a Decode quantum with fewer sessions)
     uint32_t cp_step_rows = 0;          // after window_pages, for the same reason
     uint64_t cp_after = UINT64_MAX;
@@ -162,10 +162,10 @@ struct Grant { Key key; Request req; Run run; uint32_t reuse = 0, restored = 0, 
 // a Resize event: every rank takes pool tier `tier` to `segs` segments of its group lease on a KV node, `slots` blocks
 // (s2/kv_share.h share_apply), at the commit, so every rank's pool queues the same copies. txn: the node's transaction
 // for it (each rank names it in its GROW or SHRINK)
-// tier FLASH_KV_TIER (G6_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash rank's GPU KV chunks instead, `segs` = the chunks
+// tier FLASH_KV_TIER (GR8_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash rank's GPU KV chunks instead, `segs` = the chunks
 // online (slots and txn unused)
 constexpr uint32_t FLASH_KV_TIER = 0xFFFFFFFFu;
-// tier FLASH_CKPT_TIER (G6_FLASH_CACHE on a group lease, s2/flash_checkpoint.cuh): the Flash checkpoint store's lease
+// tier FLASH_CKPT_TIER (GR8_FLASH_CACHE on a group lease, s2/flash_checkpoint.cuh): the Flash checkpoint store's lease
 constexpr uint32_t FLASH_CKPT_TIER = 0xFFFFFFFEu;
 struct Resize {
     uint32_t tier = 0;

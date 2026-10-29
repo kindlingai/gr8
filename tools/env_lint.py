@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Fail on environment reads that go around the knob table (engine/knobs-rs), and on a table out of step with the tree.
 
-  - C, C++ and CUDA under engine/ and tools/: no getenv, secure_getenv, setenv, unsetenv, putenv or environ, and no
-    "G6_..." string. Rust anywhere: no std::env::var, var_os, vars, vars_os, set_var or remove_var. The knobs crate
-    itself is the one exception. Read a setting through its knob: knob::name() in C++, gr8knobs::NAME.get() in Rust.
+  - C, C++ and CUDA under engine/ and tools/: no getenv, secure_getenv or environ, no setenv, unsetenv or putenv
+    outside tests (a test sets a child's environment with them), and no "G6_NAME" string where NAME is a knob and
+    G6_NAME no compile-time macro. Rust anywhere: no std::env::var, var_os or vars, and no set_var or remove_var
+    outside tests. The knobs crate itself is the one exception. Read a setting through its knob: knob::name() in C++,
+    gr8knobs::NAME.get() in Rust.
   - every knob the engine, its tests or the front end should read (scope agree, local or test) is read somewhere.
   - every G6_ or GR8_ assignment in the launcher (scripts/engine_args.sh) and the recipes (recipes/**/*.env) is one the
     engine accepts (`knobs validate`).
@@ -19,8 +21,12 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATE = 'engine/knobs-rs/'
 C_EXT = re.compile(r'\.(c|cc|cpp|cu|cuh|h|hpp)$')
-C_BAD = re.compile(r'\b(?:std::)?(?:secure_getenv|getenv|setenv|unsetenv|putenv|clearenv)\s*\(|\benviron\b')
-RS_BAD = re.compile(r'\benv::(?:var|var_os|vars|vars_os|set_var|remove_var)\s*\(')
+C_READ = re.compile(r'\b(?:std::)?(?:secure_getenv|getenv)\s*\(|\benviron\b')
+C_SET = re.compile(r'\b(?:std::)?(?:setenv|unsetenv|putenv|clearenv)\s*\(')
+RS_READ = re.compile(r'\benv::(?:var|var_os|vars|vars_os)\s*\(')
+RS_SET = re.compile(r'\benv::(?:set_var|remove_var)\s*\(')
+TEST = re.compile(r'(^|/)tests?/|(^|/)test_|_test\.\w+$')
+G6_NAME = re.compile(r'\bG6_[A-Z0-9_]*[A-Z0-9]\b')
 # a comment, or a string or character literal (kept, for the G6_ check)
 TOKENS = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'', re.S)
 
@@ -57,7 +63,24 @@ def line_of(text, pos):
     return text.count('\n', 0, pos) + 1
 
 
-def bare_reads(paths):
+def macros(paths):
+    """The G6_ names the build defines: -D flags, #define, and names tested by #if lines."""
+    out = set()
+    for f in paths:
+        text = open(os.path.join(REPO, f), errors='replace').read()
+        out |= set(re.findall(r'-D(G6_\w+)', text)) | set(re.findall(r'#\s*define\s+(G6_\w+)', text))
+        for line in re.findall(r'#\s*(?:if|ifdef|ifndef|elif)\b[^\n]*', text):
+            out |= set(G6_NAME.findall(line))
+    return out
+
+
+def bare_reads(paths, table):
+    names = {name for name, _scope, _kind, family in table if not family}
+    families = {name for name, _scope, _kind, family in table if family}
+    defined = macros(paths)
+
+    def knob(g6):
+        return g6 not in defined and (g6[3:] in names or re.sub(r'\d+$', '', g6[3:]) in families)
     errs = []
     for f in paths:
         if f.startswith(CRATE):
@@ -67,12 +90,16 @@ def bare_reads(paths):
             continue
         text = open(os.path.join(REPO, f), errors='replace').read()
         body, strings = code(text)
-        for m in (RS_BAD if rust else C_BAD).finditer(body):
-            errs.append(f'{f}:{line_of(body, m.start())}: `{m.group(0).strip()}` reads the environment around the knob '
+        bad = [RS_READ if rust else C_READ] + ([] if TEST.search(f) else [RS_SET if rust else C_SET])
+        for m in (m for b in bad for m in b.finditer(body)):
+            errs.append(f'{f}:{line_of(body, m.start())}: `{m.group(0).strip()}` uses the environment around the knob '
                         f'table: use the knob (engine/knobs-rs/src/table.rs)')
+        if TEST.search(f):
+            continue
         for s in strings:
-            if s.startswith('"G6_'):
-                errs.append(f'{f}: {s}: a G6_ variable name in code: use the knob, and GR8_ names in messages')
+            for g6 in G6_NAME.findall(s):
+                if knob(g6):
+                    errs.append(f'{f}: {s}: {g6} in code: use the knob, and its GR8_ name in messages')
     return errs
 
 
@@ -108,12 +135,11 @@ def assignments(paths):
 
 def main():
     paths = [f for f in files() if f and os.path.isfile(os.path.join(REPO, f))]
-    errs = bare_reads(paths)
     code_, listing, err = knobs('list')
     if code_:
         sys.exit(f'env_lint: knobs list failed:\n{err}')
     table = [tuple(line.split()) + ('',) * (4 - len(line.split())) for line in listing.splitlines()]
-    errs += unread(paths, table)
+    errs = bare_reads(paths, table) + unread(paths, table)
     for f, a in assignments(paths):
         code_, _, err = knobs('validate', a)
         if code_:

@@ -1,8 +1,8 @@
-// G6_L2PF: a paced L2 prefetch of the weights the decode step reads next, issued in the step's windows where DRAM is
+// GR8_L2PF: a paced L2 prefetch of the weights the decode step reads next, issued in the step's windows where DRAM is
 // idle (the collective waits and the latency-bound attention). Modelled on blaesus/dsgx10 (ds41f kernels/l2pf.cu,
 // docs/engine.md "A paced L2 prefetch in the step's windows"; TensorFold's paced one-block prefetch): one warp on a
-// high-priority side stream issues cp.async.bulk.prefetch.L2 of 8 KiB chunks from a token bucket (G6_L2PF_GBPS, in
-// waves of at most G6_L2PF_WAVE chunks), up to a byte budget per window, and a collective window ends once its
+// high-priority side stream issues cp.async.bulk.prefetch.L2 of 8 KiB chunks from a token bucket (GR8_L2PF_GBPS, in
+// waves of at most GR8_L2PF_WAVE chunks), up to a byte budget per window, and a collective window ends once its
 // collective has arrived (a second warp polls the peers' tails, as k_wait_peers does). Not a burst (an earlier
 // experiment of ours had 8 CTAs issue at once: dependent loads 427 -> 2049 ns in dsgx10's measurement, attention +12..43 us):
 // small waves leave the attention's dependent loads alone (436 ns at 175 GB/s in waves of 8).
@@ -11,22 +11,22 @@
 // unchanged. (prefetch.global.L2 would take 128 instructions per 8 KiB; ld + discard ties up registers and load slots.)
 //
 // A layer's targets in the order the step reads them, one queue per layer (plan_layer): x_in (q_a, kv_a, idx_k, idx_w;
-// the rank's tiles under G6_QA_SPLIT), idx_q, q_b, UK, UV, o_proj (capped at G6_L2PF_OPMB), router, the shared expert's
-// fc1 (the dense MLP's gate + up on layers 0-2). Windows (G6_L2PF bits), each from its first target not yet read, and
+// the rank's tiles under GR8_QA_SPLIT), idx_q, q_b, UK, UV, o_proj (capped at GR8_L2PF_OPMB), router, the shared expert's
+// fc1 (the dense MLP's gate + up on layers 0-2). Windows (GR8_L2PF bits), each from its first target not yet read, and
 // continuing where the layer's earlier windows ended (State, device memory):
 //   1 = W_M  the wait for the MLP partials of layer i-1: layer i's queue from x_in
-//   2 = W_Q  the q_a gather wait (G6_QA_SPLIT) from idx_q, the idx_q gather wait (G6_IDXQ_SPLIT) from UK
+//   2 = W_Q  the q_a gather wait (GR8_QA_SPLIT) from idx_q, the idx_q gather wait (GR8_IDXQ_SPLIT) from UK
 //   4 = W_T  the attention (no collective: its budget only) from UK
 //   8 = W_A  the wait for the attention partials from the router
-//  16 = W_H  the last layer's MLP wait (no next layer): the head's lm_head slice (budget G6_L2PF_US[W_M])
-// Each window issues at most G6_L2PF_US[w] us at the pace and G6_L2PF_MB MiB.
-// G6_MTP_L2PF (rank.cuh, default 0; needs G6_L2PF and --mtp): the MTP draft step's windows. 1 = the draft step arms
+//  16 = W_H  the last layer's MLP wait (no next layer): the head's lm_head slice (budget GR8_L2PF_US[W_M])
+// Each window issues at most GR8_L2PF_US[w] us at the pace and GR8_L2PF_MB MiB.
+// GR8_MTP_L2PF (rank.cuh, default 0; needs GR8_L2PF and --mtp): the MTP draft step's windows. 1 = the draft step arms
 // the prefetch: layer 78's own W_Q / W_T / W_A windows, its eh_proj gather wait as its W_M (queue from x_in) and its MLP
 // wait (queue from the draft head's records, T_HEAD); 2 = the head merge wait of the main step and of every draft step
-// prefetches the next draft step's front (T_EH: this rank's eh_proj tiles, then x_in), budget G6_MTP_L2PF_US (60) us,
+// prefetches the next draft step's front (T_EH: this rank's eh_proj tiles, then x_in), budget GR8_MTP_L2PF_US (60) us,
 // stopped when the head collective arrives. The draft queue reads T_EH first and T_HEAD last; both are empty in the
 // main model's queues (T_HEAD only with W_H, in its last layer), so those are unchanged. The side stream is forked at each window
-// and joined once at the end of the step (part), so the step's stream never waits for a prefetch. Off (G6_L2PF unset or
+// and joined once at the end of the step (part), so the step's stream never waits for a prefetch. Off (GR8_L2PF unset or
 // 0): no stream, no launch, no fork; the graphs are unchanged.
 #pragma once
 #include <cstdio>
@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 #include "bind.cuh"
 #include "glue.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace l2pf
 {
@@ -41,7 +42,7 @@ namespace l2pf
 constexpr uint32_t CHUNK = 8192;      // bytes per bulk prefetch
 constexpr int MAXR = 24;              // ranges in a queue (16 + kv_b FP8 scales, #50; the MTP draft with eh_proj and its head: up to 21)
 enum { W_M, W_Q, W_T, W_A, NW, W_H = NW };
-// targets (G6_L2PF_T bits); queue order: T_EH, T_XIN .. T_SHARED, T_HEAD (READ_ORDER)
+// targets (GR8_L2PF_T bits); queue order: T_EH, T_XIN .. T_SHARED, T_HEAD (READ_ORDER)
 enum { T_XIN, T_IDXQ, T_QB, T_UK, T_UV, T_OPROJ, T_ROUTER, T_SHARED, T_EH, T_HEAD, NTG };
 constexpr int READ_ORDER[NTG] = {T_EH, T_XIN, T_IDXQ, T_QB, T_UK, T_UV, T_OPROJ, T_ROUTER, T_SHARED, T_HEAD};
 
@@ -71,7 +72,7 @@ struct Stop                           // a collective window ends when every pee
     const u64* stepp = nullptr;
     int c = 0;
     size_t payload = 0;
-    // the head all-gather (G6_MTP_L2PF 2): hrows != null, the payload is re-derived on the device as the merge kernels do
+    // the head all-gather (GR8_MTP_L2PF 2): hrows != null, the payload is re-derived on the device as the merge kernels do
     // (glue::head_wait_bytes: hm rows, hnc top_p candidates, + the top lists when htk and a row asks)
     const glue::SampleRow* hrows = nullptr;
     const glue::TkRes* htk = nullptr;
@@ -165,16 +166,16 @@ __global__ void __launch_bounds__(64) k_l2pf(const __grid_constant__ Queue q, in
 
 struct Cfg
 {
-    int win = 0;                      // G6_L2PF: window mask (0 = off)
-    unsigned tmask = (1u << NTG) - 1; // G6_L2PF_T: targets (bit = T_*)
-    float gbps = 175;                 // G6_L2PF_GBPS: the pace
-    int wave = 8;                     // G6_L2PF_WAVE: chunks per poll at most (1..32)
-    float us[NW] = {30, 30, 100, 30}; // G6_L2PF_US: budget per window, us at the pace (W_M, W_Q, W_T, W_A)
-    float mb = 10;                    // G6_L2PF_MB: MiB per window at most
-    float opmb = 8;                   // G6_L2PF_OPMB: o_proj's entries prefetched per layer, MB (0 = all)
-    int mtp = 0;                      // G6_MTP_L2PF (set by the driver after init_env): 1 draft-step windows, 2 head-merge tails
-    float mtp_us = 60;                // G6_MTP_L2PF_US: budget of a head-merge tail window, us at the pace
-    bool front_on = false;            // G6_MTP_L2PF 2: the draft's front (set once at boot, before any capture)
+    int win = 0;                      // GR8_L2PF: window mask (0 = off)
+    unsigned tmask = (1u << NTG) - 1; // GR8_L2PF_T: targets (bit = T_*)
+    float gbps = 175;                 // GR8_L2PF_GBPS: the pace
+    int wave = 8;                     // GR8_L2PF_WAVE: chunks per poll at most (1..32)
+    float us[NW] = {30, 30, 100, 30}; // GR8_L2PF_US: budget per window, us at the pace (W_M, W_Q, W_T, W_A)
+    float mb = 10;                    // GR8_L2PF_MB: MiB per window at most
+    float opmb = 8;                   // GR8_L2PF_OPMB: o_proj's entries prefetched per layer, MB (0 = all)
+    int mtp = 0;                      // GR8_MTP_L2PF (set by the driver after init_env): 1 draft-step windows, 2 head-merge tails
+    float mtp_us = 60;                // GR8_MTP_L2PF_US: budget of a head-merge tail window, us at the pace
+    bool front_on = false;            // GR8_MTP_L2PF 2: the draft's front (set once at boot, before any capture)
     Plan front;
     cudaStream_t side = nullptr;
     cudaEvent_t fork = nullptr, join = nullptr;
@@ -212,20 +213,20 @@ inline cudaError_t setup(const Cfg& in)
     if (e == cudaSuccess) e = cudaMemset(c.state, 0, sizeof(State));
     return e;
 }
-// G6_L2PF, G6_L2PF_T, G6_L2PF_GBPS, G6_L2PF_WAVE, G6_L2PF_US=wm,wq,wt,wa, G6_L2PF_MB, G6_L2PF_OPMB (bind::init)
+// GR8_L2PF, GR8_L2PF_T, GR8_L2PF_GBPS, GR8_L2PF_WAVE, GR8_L2PF_US=wm,wq,wt,wa, GR8_L2PF_MB, GR8_L2PF_OPMB (bind::init)
 inline cudaError_t init_env()
 {
     Cfg c;
-    const char* e = getenv("G6_L2PF");
-    c.win = e ? atoi(e) & 31 : 0;
+    c.win = static_cast<int>(knob::l2pf());
     if (!c.win) return cudaSuccess;
-    if ((e = getenv("G6_L2PF_T")) && *e) c.tmask = static_cast<unsigned>(strtoul(e, nullptr, 0));
-    if ((e = getenv("G6_L2PF_GBPS")) && *e) c.gbps = static_cast<float>(atof(e));
-    if ((e = getenv("G6_L2PF_WAVE")) && *e) c.wave = atoi(e);
-    if ((e = getenv("G6_L2PF_US")) && *e) sscanf(e, "%f,%f,%f,%f", &c.us[0], &c.us[1], &c.us[2], &c.us[3]);
-    if ((e = getenv("G6_L2PF_MB")) && *e) c.mb = static_cast<float>(atof(e));
-    if ((e = getenv("G6_L2PF_OPMB")) && *e) c.opmb = static_cast<float>(atof(e));
-    fprintf(stderr, "# G6_L2PF=%d: targets 0x%x, %.0f GB/s in waves of %d x 8 KiB, budgets %.0f/%.0f/%.0f/%.0f us, <= %.1f MiB a window, "
+    c.tmask = static_cast<unsigned>(knob::l2pf_t());
+    c.gbps = static_cast<float>(knob::l2pf_gbps());
+    c.wave = static_cast<int>(knob::l2pf_wave());
+    const std::vector<double>& us = knob::l2pf_us();     // sets as many windows as it has numbers
+    for (size_t i = 0; i < us.size() && i < static_cast<size_t>(NW); ++i) c.us[i] = static_cast<float>(us[i]);
+    c.mb = static_cast<float>(knob::l2pf_mb());
+    c.opmb = static_cast<float>(knob::l2pf_opmb());
+    fprintf(stderr, "# GR8_L2PF=%d: targets 0x%x, %.0f GB/s in waves of %d x 8 KiB, budgets %.0f/%.0f/%.0f/%.0f us, <= %.1f MiB a window, "
             "o_proj <= %.1f MB\n", c.win, c.tmask, c.gbps, c.wave, c.us[0], c.us[1], c.us[2], c.us[3], c.mb, c.opmb);
     return setup(c);
 }
@@ -246,7 +247,7 @@ inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv, con
     if (b.q_b_t.on) dtr_add(T_QB, b.q_b_t, 0);
     else if (b.q_b.on) P.add(T_QB, b.q_b.w, bind::gv_bytes(b.q_b));
     const int H = b.heads;
-    // kv_b BF16, or E4M3 with f32 block scales (#50, G6_KVB=fp8: uks / uvs set): one byte a weight plus the scales
+    // kv_b BF16, or E4M3 with f32 block scales (#50, GR8_KVB=fp8: uks / uvs set): one byte a weight plus the scales
     const size_t ukw = uks ? 1 : 2, uvw = uvs ? 1 : 2;
     if (uk) P.add(T_UK, uk, static_cast<size_t>(H) * 512 * 192 * ukw);
     if (uk && uks) P.add(T_UK, uks, static_cast<size_t>(H) * 4 * 192 * 4);
@@ -287,7 +288,7 @@ inline Queue queue(const Plan& P, unsigned tmask)
 }
 
 // step (part) begin / end: windows only between them (the main model's launch_step; the MTP draft step under
-// G6_MTP_L2PF, arm(true)), the side stream joined at the end
+// GR8_MTP_L2PF, arm(true)), the side stream joined at the end
 inline void arm(bool draft = false) { Cfg& c = cfg(); c.armed = c.win != 0 && c.side && (!draft || c.mtp != 0); }
 inline void join(cudaStream_t st)
 {
@@ -298,7 +299,7 @@ inline void join(cudaStream_t st)
     cudaStreamWaitEvent(st, c.join, 0);
     c.pending = false;
 }
-// a window of `us` us at the pace (at most G6_L2PF_MB) over P from target `from`; `layer` keys the chained state (the
+// a window of `us` us at the pace (at most GR8_L2PF_MB) over P from target `from`; `layer` keys the chained state (the
 // step's layer index; the MTP draft's windows and the head-merge tails use their own ids), on st where it starts
 inline void window_us(float us, int from, int layer, const Plan& P, const Stop& s, cudaStream_t st)
 {
@@ -322,7 +323,7 @@ inline void window_us(float us, int from, int layer, const Plan& P, const Stop& 
     cudaLaunchKernelEx(&lc, k_l2pf, q, layer, q.from[from], budget, ns_chunk, c.wave, s, c.state);
     c.pending = true;
 }
-// window w (G6_L2PF bit w) of layer `layer`, its first target `from`; W_H takes W_M's budget
+// window w (GR8_L2PF bit w) of layer `layer`, its first target `from`; W_H takes W_M's budget
 inline void window(int w, int from, int layer, const Plan& P, const Stop& s, cudaStream_t st)
 {
     Cfg& c = cfg();

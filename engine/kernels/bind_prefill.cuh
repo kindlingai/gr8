@@ -40,7 +40,7 @@
 #include <cublas_v2.h>
 #include "bind.cuh"
 #include "gemm_x.cuh"
-#include "../runtime/envparse.h"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace bindp
 {
@@ -55,7 +55,7 @@ constexpr int REC = 528;              // MXFP8 activation record of (16 rows, 32
 constexpr int NEXP = geom::NEXP, TOPK = geom::TOPK;
 constexpr int EPL = NEXP / 32;       // k_pf_route: experts per lane
 #if G6_MODEL_FLASH
-// Flash MoE expert passes in fp16 (Expert::h16, the Flash default; G6_PF_MOE8=1 = the MXFP8 passes): fc1 A = the fp16
+// Flash MoE expert passes in fp16 (Expert::h16, the Flash default; GR8_PF_MOE8=1 = the MXFP8 passes): fc1 A = the fp16
 // H128(x * suh) rows, fc2 A = the fp16 mid output, B = the fp16 trellis-decoded fragments, mma m16n8k16 fp32 accumulate.
 #define PF_H16P , bool H16 = false
 #define PF_H16A , false, H16, CB
@@ -117,7 +117,7 @@ struct Tensors
     int e4m3 = 0;                     // routed experts are exlr8-e4m3 (bind::LayerTensors::e4m3): codebook values rounded to E4M3
 #endif
     long long sh_tr[6] = {};          // tr3.table row 256
-    int qo_cover = 0;                 // G6_PF_OWN=3: q_b / o_proj of this layer are prefilled from the QO pack (never from these tensors)
+    int qo_cover = 0;                 // GR8_PF_OWN=3: q_b / o_proj of this layer are prefilled from the QO pack (never from these tensors)
     int heads = 0;                    // attention head count, used in place of q_b.N / 256 when the q_b tensor is deduplicated away
     // dense trellis matrices (dtr.cuh, in dtr::MAT_NAMES order: q_b, o_proj, dense gate, up, down): their input and output
     // vectors. Set, the matrix's .mx codes are its FP8 tile copy (dtr::make_fp8, still rotated), and make_layer wraps the
@@ -373,7 +373,7 @@ inline void launch(const Xq& a, cudaStream_t st)
 // ------------------------------------------------------------------------------------------ dense MXFP8 GEMM
 // Y[M][N] = X8 @ W^T. CTA = (128 output cols, MB row blocks); X records through smem (cp.async), W codes and
 // scales straight from the pack's row-major tensors (4 x 4-byte loads + 2 scale bytes per lane per k32 step).
-// G6_PF_RSDIRECT (prefill.cuh): an [M][ld] BF16 output written straight into the reduce-scatter send slot instead of a
+// GR8_PF_RSDIRECT (prefill.cuh): an [M][ld] BF16 output written straight into the reduce-scatter send slot instead of a
 // staging buffer + k_put_rs: row j of owner p = (j + 1) * nr - 1) / M lands at slot(step) + p * ss + (j - p * M / nr) * ld,
 // slot(step) = base + (step & 1) * pstride (the step parity is read from the device step cell). base == nullptr: off.
 struct RsOut
@@ -414,7 +414,7 @@ struct Gemm
     const uint8_t* tw = nullptr;
     long long tsB = 0, tsG = 0;
     int rgrp = 0;                     // k_gemm_mx8f full-M launches: > 1 = grouped raster of rgrp row blocks (PF_GEMMRF;
-                                      // launch sets it from G6_PF_GEMMG when 0). Launch order only: the same bits.
+                                      // launch sets it from GR8_PF_GEMMG when 0). Launch order only: the same bits.
 #if G6_MODEL_FLASH
     int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
 #endif
@@ -588,8 +588,8 @@ __device__ __forceinline__ void ldsm_x4(const void* p, u32& r0, u32& r1, u32& r2
     const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
 }
-// RS: rows go to the RS send slot (rs, G6_PF_RSDIRECT); a separate instantiation so the default kernel is unchanged
-// F32: fp32 output (Gemm.bf16 == 2, G6_PF_OWN=3 o_proj); F32 = false instantiations are the served code, unchanged
+// RS: rows go to the RS send slot (rs, GR8_PF_RSDIRECT); a separate instantiation so the default kernel is unchanged
+// F32: fp32 output (Gemm.bf16 == 2, GR8_PF_OWN=3 o_proj); F32 = false instantiations are the served code, unchanged
 template <int BM, bool RS = false, bool F32 = false> __global__ void __launch_bounds__(256) k_gemm_mx8b(Gemm g0, RsOut rs = RsOut())
 {
     Gemm g = g0;
@@ -1065,7 +1065,7 @@ template <int BM, bool F32 = false> __global__ void __launch_bounds__(256) k_gem
 #ifdef PF_GEMMRF
     // PF_GEMMRF: owner-row launches only (gridDim.y <= 8): row block fastest in launch order, as PF_GEMMR in k_gemm_mx8b
     // (q_b 128 x 6 at OWN=3: W read once instead of once per row block, 205 -> ~46 MB). Full-M launches keep the raster,
-    // or with g.rgrp = G > 1 (G6_PF_GEMMG) a grouped raster: groups of G row blocks, row block fastest inside a group, so
+    // or with g.rgrp = G > 1 (GR8_PF_GEMMG) a grouped raster: groups of G row blocks, row block fastest inside a group, so
     // the CTAs in flight share a few column blocks of W (dense gate+up: W 33.5 MB > L2 was re-read from DRAM per row
     // block). Same tiles, same k order, same mma operands per output element: the same bits.
     const bool rr = gridDim.y <= 8;
@@ -1646,11 +1646,10 @@ template <int BM, bool RS> inline void launch_tr_bm(const Gemm& g, const RsOut& 
     k_gemm_tr<BM, RS><<<dim3((g.N + 127) / 128, (RB + BM - 1) / BM), GT<BM>::NTH, GT<BM>::SMEM, st>>>(g, rs);
 }
 #endif
-// G6_PF_TR_BM (default 16): the row blocks of a large launch's CTA (8 or 16); small launches take 4, as k_gemm_mx8b
+// GR8_PF_TR_BM (default 16): the row blocks of a large launch's CTA (8 or 16); small launches take 4, as k_gemm_mx8b
 inline void launch_tr(const Gemm& g, const RsOut& rs, bool big, cudaStream_t st)
 {
-    static const int bmw = getenv("G6_PF_TR_BM") ? atoi(getenv("G6_PF_TR_BM")) : 16;
-    const int bm = !big ? 4 : bmw == 8 ? 8 : 16;
+    const int bm = !big ? 4 : knob::pf_tr_bm() == 8 ? 8 : 16;
     if (rs.base) { if (bm == 16) launch_tr_bm<16, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, true>(g, rs, st); else launch_tr_bm<4, true>(g, rs, st); }
 #if G6_MODEL_FLASH
     else if (g.bf16 == 2) { if (bm == 16) launch_tr_bm<16, false, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, false, true>(g, rs, st); else launch_tr_bm<4, false, true>(g, rs, st); }
@@ -1661,20 +1660,15 @@ inline void launch_tr(const Gemm& g, const RsOut& rs, bool big, cudaStream_t st)
 }
 
 inline void die_gemm_pair() { fprintf(stderr, "bindp: a paired Gemm needs the v2 kernel\n"); exit(1); }
-// G6_GEMM: 1 = k_gemm_mx8 (v1), 2 = v2 with 128-row CTAs, 3 = v2 with 64-row CTAs, unset/0 = v2, row blocks by grid size
-inline int gemm_mode()
-{
-    static const int m = [] { const char* e = getenv("G6_GEMM"); return e ? atoi(e) : 0; }();
-    return m;
-}
-// rs.base set (G6_PF_RSDIRECT): y is unused, rows go to the RS send slot (unpaired v2 kernel only)
-// G6_PF_GEMMG=G (read once, default 8; 0 or 1 = plain raster): k_gemm_mx8f full-M launches use the grouped raster of G row
+// GR8_GEMM: 1 = k_gemm_mx8 (v1), 2 = v2 with 128-row CTAs, 3 = v2 with 64-row CTAs, unset/0 = v2, row blocks by grid size
+inline int gemm_mode() { return static_cast<int>(knob::gemm()); }
+// rs.base set (GR8_PF_RSDIRECT): y is unused, rows go to the RS send slot (unpaired v2 kernel only)
+// GR8_PF_GEMMG=G (read once, default 8; 0 or 1 = plain raster): k_gemm_mx8f full-M launches use the grouped raster of G row
 // blocks (Gemm::rgrp) unless the caller set rgrp. Launch order only: the same bits.
 inline Gemm with_rgrp(const Gemm& g)
 {
-    static const int grp = [] { const char* e = getenv("G6_PF_GEMMG"); return e ? atoi(e) : 8; }();
     Gemm r = g;
-    if (!r.rgrp) r.rgrp = grp;
+    if (!r.rgrp) r.rgrp = static_cast<int>(knob::pf_gemmg());
     return r;
 }
 inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = RsOut())
@@ -1684,7 +1678,7 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
 #if defined(PF_GEMMW) || defined(PF_GEMMP)
     if (g.osvh || g.osvh2) { fprintf(stderr, "bindp: Gemm::osvh needs the v2 or PF_GEMMF kernel (not PF_GEMMW / PF_GEMMP)\n"); exit(1); }
 #endif
-    if ((g.osvh || g.osvh2 || g.tw) && mode == 1) { fprintf(stderr, "bindp: Gemm::osvh / tw need the v2 kernel (G6_GEMM != 1)\n"); exit(1); }
+    if ((g.osvh || g.osvh2 || g.tw) && mode == 1) { fprintf(stderr, "bindp: Gemm::osvh / tw need the v2 kernel (GR8_GEMM != 1)\n"); exit(1); }
     const int RB = (g.M + 15) / 16, NB = (g.N + 127) / 128 + (g.w2 ? (g.N2 + 127) / 128 : 0);
     if (rs.base && (mode == 1 || g.w2)) { fprintf(stderr, "bindp: an RS-slot Gemm needs the unpaired v2 kernel\n"); exit(1); }
     const bool f32 = g.bf16 == 2;
@@ -1729,12 +1723,11 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
     if (f32)
     {
 #if defined(PF_GEMMF) && !defined(PF_GEMMW)
-        // G6_PF_GEMMF32 (default on, read once; =0 off): a big launch takes the unguarded full-tile kernel with the FP32
+        // GR8_PF_GEMMF32 (default on, read once; =0 off): a big launch takes the unguarded full-tile kernel with the FP32
         // epilogue, not the guarded k_gemm_mx8b. Same mma calls, operands and k order, so the same bits. TP3 8K: mx8b
         // 218 ms -> mx8f 206 ms in situ (nsys), rank-0 8K prefill -7 ms (A/B), T=0 hashes unchanged.
-        static const bool gemmf32 = [] { const char* e = getenv("G6_PF_GEMMF32"); return !(e && atoi(e) == 0); }();
         static bool attrf32 = false;
-        if (gemmf32 && big)
+        if (knob::pf_gemmf32() && big)
         {
             if (!attrf32) { cudaFuncSetAttribute(k_gemm_mx8f<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, G2<8>::SMEM); attrf32 = true; }
             k_gemm_mx8f<8, true><<<dim3(NB, (RB + 7) / 8), 256, G2<8>::SMEM, st>>>(with_rgrp(g));
@@ -1811,8 +1804,7 @@ inline const char* make_gemm_tr(const dtr::Mat& m, int M, const uint8_t* x8, voi
     g.N = m.N; g.K = m.K; g.M = M;
     g.y = y; g.ldy = g.N; g.bf16 = bf16;
 #if G6_MODEL_FLASH
-    static const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
-    g.h16 = dtr8 ? 0 : 1;
+    g.h16 = knob::pf_dtr8() ? 0 : 1;
 #endif
     return nullptr;
 }
@@ -1979,12 +1971,12 @@ struct Expert
 #if G6_MODEL_FLASH
     int h16 = 0;                      // 1: fp16 fc1 / mid / fc2 (x2 then holds fp16 A fragments: [seg][MB][EB][8 k16][32 lanes][4] u32)
     int e4 = 0;                       // h16 on an exlr8-e4m3 layer: the fp16 weight fragments get the E4M3 round trip of decode (tr3_cb2<true>)
-    int fc2one = 0;                   // h16 + bs: fc2 runs one output Hadamard per 128-col group (G6_PF_FC2ONE=0: one per block)
-    int fc2v2 = 0;                    // fc2one: k_pf_fc2v (A + weights staged in smem, row blocks as a template; G6_PF_FC2V2=0: k_pf_fc2g)
+    int fc2one = 0;                   // h16 + bs: fc2 runs one output Hadamard per 128-col group (GR8_PF_FC2ONE=0: one per block)
+    int fc2v2 = 0;                    // fc2one: k_pf_fc2v (A + weights staged in smem, row blocks as a template; GR8_PF_FC2V2=0: k_pf_fc2g)
     const __half* hx = nullptr;       // h16 + bs: [M][HID] f16(H128(x * t_sg)) per token row (k_pf_hx); fc1 stages these rows and
-                                      // scales each 128-k block by its t_v1b entry instead of rotating x per CTA (G6_PF_HX=0: off)
-    int wm = 0;                       // hx set: routed fc1 runs as k_pf_fc1w over the wtiles (unless G6_PF_WM=0; M >= G6_PF_WM_MIN; 0 = k_pf_fc1)
-    int wm2 = 0;                      // wm + fc2v2: fc2 runs as k_pf_fc2w over half wtiles (G6_PF_WM2=1; 0 = k_pf_fc2v)
+                                      // scales each 128-k block by its t_v1b entry instead of rotating x per CTA (GR8_PF_HX=0: off)
+    int wm = 0;                       // hx set: routed fc1 runs as k_pf_fc1w over the wtiles (unless GR8_PF_WM=0; M >= GR8_PF_WM_MIN; 0 = k_pf_fc1)
+    int wm2 = 0;                      // wm + fc2v2: fc2 runs as k_pf_fc2w over half wtiles (GR8_PF_WM2=1; 0 = k_pf_fc2v)
     int* wt = nullptr;                // [max_wtiles][3] expert, first route, rows (<= WM_R): k_pf_fill writes it when set
     int* n_wt = nullptr;              // [1]
 #endif
@@ -2036,15 +2028,15 @@ struct Expert
     uint8_t* aop = nullptr;           // PF_AOP: [maxseg][AOP_NS][gate, up][AOPS] fragment-ready fc1 A records (k_pf_aop); nullptr = off
 #endif
 #ifdef PF_F12
-    int f12 = 0;                      // PF_F12: 1 = fc1 runs as k_pf_fc1f (fat CTA: F12_NE adjacent expert blocks share one quantized A record); the host sets it (G6_PF_F12, default 1)
+    int f12 = 0;                      // PF_F12: 1 = fc1 runs as k_pf_fc1f (fat CTA: F12_NE adjacent expert blocks share one quantized A record); the host sets it (GR8_PF_F12, default 1)
 #endif
-    int topk = TOPK;                  // routed experts kept per token (G6_MOE_TOPK cut, host-set in make; default = the model's):
+    int topk = TOPK;                  // routed experts kept per token (GR8_MOE_TOPK cut, host-set in make; default = the model's):
                                       // dropped routes get tok_e -1, weights renormalize over the kept (k_pf_route). Host-side
                                       // only; kept after the pre-cut fields so their kernel offsets stay unchanged
-    int pre_routed = 0;               // 1: tok_e / tok_w already hold every row (G6_PF_ROUTER_SPLIT: own rows routed here, the
+    int pre_routed = 0;               // 1: tok_e / tok_w already hold every row (GR8_PF_ROUTER_SPLIT: own rows routed here, the
                                       // peers' rows copied in), so launch_route skips k_pf_route. Host-side only, LAST member but Flash's q8 / hq / hs
 #if G6_MODEL_FLASH
-    int q8 = 0;                       // G6_PF_Q8=1 (h16 + bs + hx): routed fc1 = k_pf_fc1q on MXFP8 rows hq / hs (k_pf_hxq)
+    int q8 = 0;                       // GR8_PF_Q8=1 (h16 + bs + hx): routed fc1 = k_pf_fc1q on MXFP8 rows hq / hs (k_pf_hxq)
     uint8_t* hq = nullptr;            // [M][HID] E4M3 of hx, one E8M0 scale per 32 k in hs [M][HID / 32]
     uint8_t* hs = nullptr;
 #endif
@@ -2120,7 +2112,7 @@ template <int K = TOPK> __global__ void __launch_bounds__(256) k_pf_route(Expert
         }
         else
         {
-            A.tok_e[m * TOPK + l] = -1;     // dropped route (G6_MOE_TOPK): no expert; count / fill / fin skip -1
+            A.tok_e[m * TOPK + l] = -1;     // dropped route (GR8_MOE_TOPK): no expert; count / fill / fin skip -1
             A.tok_w[m * TOPK + l] = 0.f;
         }
     }
@@ -2222,7 +2214,7 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
         }
         else if constexpr (CUT)
             if (A.tok_e[i] < 0)
-                A.pos[i] = -1;             // dropped route (G6_MOE_TOPK): no route index, k_pf_fin skips it
+                A.pos[i] = -1;             // dropped route (GR8_MOE_TOPK): no route index, k_pf_fin skips it
     const int ne = A.cnt[e], nseg = (ne + RS - 1) / RS;
     for (int i = t; i < nseg; i += 256)
     {
@@ -3440,13 +3432,12 @@ __global__ void __launch_bounds__(256) k_pf_hx(Expert A)
     }
 }
 __global__ void __launch_bounds__(256) k_pf_hxq(Expert A);       // PF_Q8, below
-__global__ void __launch_bounds__(256) k_pf_hxqf(Expert A);      // G6_PF_HXF, below
+__global__ void __launch_bounds__(256) k_pf_hxqf(Expert A);      // GR8_PF_HXF, below
 inline void launch_hx(const Expert& A, cudaStream_t st)     // once per layer, before the shared and the routed fc1
 {
     if (!A.on || !A.hx) return;
     const long long warps = static_cast<long long>((A.M + 7) / 8) * (HID / 128);
-    static const bool hxf = [] { const char* e = getenv("G6_PF_HXF"); return !(e && atoi(e) == 0); }();
-    if (A.q8 && hxf) { k_pf_hxqf<<<static_cast<unsigned>((warps + 7) / 8), 256, 0, st>>>(A); return; }
+    if (A.q8 && knob::pf_hxf()) { k_pf_hxqf<<<static_cast<unsigned>((warps + 7) / 8), 256, 0, st>>>(A); return; }
     k_pf_hx<<<static_cast<unsigned>((warps + 7) / 8), 256, 0, st>>>(A);
     if (A.q8)
     {
@@ -3455,7 +3446,7 @@ inline void launch_hx(const Expert& A, cudaStream_t st)     // once per layer, b
     }
 }
 
-// PF_Q8 (G6_PF_Q8=1; h16 + bs + hx layers): the routed fc1 on MXFP8 activations quantized once per token and layer
+// PF_Q8 (GR8_PF_Q8=1; h16 + bs + hx layers): the routed fc1 on MXFP8 activations quantized once per token and layer
 // (k_pf_hxq: E4M3 of hx = H128(x * t_sg), one E8M0 scale per 32 k) against the E4M3 trellis weights (tr3_b8). The
 // per-expert v1b scale of each 128-k block multiplies that block's fp32 partial sum (H128 is linear), so no per-CTA
 // prologue runs. Not byte-equal to the fp16 path (activations round to E4M3): a quality-checked option.
@@ -3497,7 +3488,7 @@ __global__ void __launch_bounds__(256) k_pf_hxq(Expert A)
     dst[1] = make_uint4(w[4], w[5], w[6], w[7]);
     A.hs[static_cast<size_t>(r) * (HID / 32) + ch] = static_cast<uint8_t>(code);
 }
-// G6_PF_HXF (Q8 layers, read once; default on, 0 = k_pf_hx + k_pf_hxq): k_pf_hx and k_pf_hxq in one pass, hx is not stored (under Q8 only
+// GR8_PF_HXF (Q8 layers, read once; default on, 0 = k_pf_hx + k_pf_hxq): k_pf_hx and k_pf_hxq in one pass, hx is not stored (under Q8 only
 // k_pf_hxq reads it: fc1q and the trellis shared pass take hq / hs). Lane (row r, 32-k chunk q of 128-k block kb) of the
 // k_pf_hx layout holds the 32 values of k_pf_hxq's thread (r, kb * 4 + q) in the same order; they round to fp16 as the hx
 // store rounds them, then k_pf_hxq's arithmetic runs on them: the same hq / hs bytes, one 33.5 MB write + read less per
@@ -3711,7 +3702,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1q(Expert A)
     else fc1q_body<K2 ? 2 : 4, EB, CB>(A, tr, b, mat, r0, rows, sX, sS, sRow, mw);
 }
 
-// Weight-major fc1 (Expert::wm, G6_PF_WM=1; h16 + bs + hx layers, non-wide units). CTA = (wtile = up to WM_R consecutive
+// Weight-major fc1 (Expert::wm, GR8_PF_WM=1; h16 + bs + hx layers, non-wide units). CTA = (wtile = up to WM_R consecutive
 // routes of one expert (k_pf_fill), x = mat * EB + b as k_pf_fc1), 16 warps: warp (wr = warp / 4, wc = warp % 4) owns rows
 // wr * 64 .. + 63 and cols wc * 32 .. + 31 of the 128-col block. Per k32 step the CTA stages by cp.async (WM_ST stages) the
 // hx rows of the tile (64 B per row, 16 B chunks swizzled by row / 2) and the step's 16 weight tiles (16 TB contiguous bytes,
@@ -4655,7 +4646,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
     else fc2_body_gl<K2 ? 2 : 4, EB, BS, ONE PF_H16X, CB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
 }
 #if G6_MODEL_FLASH
-// fc2 v2 (h16 + bs + one, the Flash default; G6_PF_FC2V2=0 = k_pf_fc2g). Per iteration (group G, block b) the CTA
+// fc2 v2 (h16 + bs + one, the Flash default; GR8_PF_FC2V2=0 = k_pf_fc2g). Per iteration (group G, block b) the CTA
 // copies the fp16 A fragments of its row blocks (x2, 4 KB per 16-row block) and the weight words of the 8 warps
 // (64 TB bytes) to shared memory by cp.async, one iteration ahead (k_pf_fc2g reads A by __ldg at the mma and the K4
 // words at the top of the same iteration). NM = 16-row blocks of the segment is a template parameter, so no HMMA is
@@ -5248,7 +5239,7 @@ template <bool RS = false, bool SHX = false, bool CUT = false> __global__ void _
         #pragma unroll
         for (int k = 0; k < TOPK; ++k)
         {
-            if constexpr (CUT)      // G6_MOE_TOPK cut: pos -1 = dropped route
+            if constexpr (CUT)      // GR8_MOE_TOPK cut: pos -1 = dropped route
             {
                 if (p[k] >= 0) add(A.yw + static_cast<size_t>(p[k]) * HID);
             }
@@ -5305,7 +5296,7 @@ template <bool RS = false, bool SHX = false, bool CUT = false> __global__ void _
 
 inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits -> tok_e, tok_w of the A.M rows of A
 {
-    switch (A.topk)                 // G6_MOE_TOPK cut: one instance per K; K = TOPK is the pre-cut kernel
+    switch (A.topk)                 // GR8_MOE_TOPK cut: one instance per K; K = TOPK is the pre-cut kernel
     {
         case 1: k_pf_route<1><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
         case 2: k_pf_route<2><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
@@ -5317,7 +5308,7 @@ inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits ->
         default: k_pf_route<TOPK><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
     }
 }
-// G6_PF_ROUTER_SPLIT: route rows [r0, r0 + rows) only, from logits / tok_e / tok_w of the same rows (the pointers are per-row
+// GR8_PF_ROUTER_SPLIT: route rows [r0, r0 + rows) only, from logits / tok_e / tok_w of the same rows (the pointers are per-row
 // views of the full tables, so a row's bytes are those of the whole-M launch)
 inline void launch_route_slice(const Expert& A, int r0, int rows, cudaStream_t st)
 {
@@ -5332,7 +5323,7 @@ inline void launch_route_slice(const Expert& A, int r0, int rows, cudaStream_t s
 inline void launch_route(const Expert& A, cudaStream_t st)     // logits -> tok_e, tok_w, the grouped route list, segments
 {
     if (!A.on) return;
-    if (!A.pre_routed) launch_route_rows(A, st);    // pre_routed: the rows were routed and exchanged (G6_PF_ROUTER_SPLIT)
+    if (!A.pre_routed) launch_route_rows(A, st);    // pre_routed: the rows were routed and exchanged (GR8_PF_ROUTER_SPLIT)
     k_pf_count<<<NEXP, 256, 0, st>>>(A);
     if (A.topk < TOPK) k_pf_fill<true><<<NEXP + (A.shr ? 1 : 0), 256, 0, st>>>(A);
     else k_pf_fill<<<NEXP + (A.shr ? 1 : 0), 256, 0, st>>>(A);
@@ -5379,8 +5370,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
 #ifdef PF_AOP
         // below AOP_MMIN rows the record write traffic (8 routes per token, padded segments) costs more than the prologue
         // it saves (1-GPU home L5: +5..10% at M <= 1024, ~0 at 2048, -3..5% at 3072-4096): those passes run the stock fc1 (also byte-exact)
-        static const int mmin = [] { const char* e = getenv("G6_PF_AOP_MMIN"); return e ? atoi(e) : 3072; }();
-        if (A.aop && A.M >= mmin)
+        if (A.aop && A.M >= knob::pf_aop_mmin())
         {
             const dim3 ga(2 * AOP_NS * AOP_NCH, A.maxseg);
             if (A.bs) k_pf_aop<true><<<ga, 256, 0, st>>>(A);
@@ -5453,7 +5443,7 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
 inline void launch_fin(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
-    if (A.topk < TOPK)              // G6_MOE_TOPK cut: the fin skips pos -1 (dropped routes)
+    if (A.topk < TOPK)              // GR8_MOE_TOPK cut: the fin skips pos -1 (dropped routes)
     {
         if (A.sh_svh)
         {
@@ -5707,7 +5697,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
 #if G6_MODEL_FLASH
     t.ysh = t.yw + R0 * HID;
     t.hx = reinterpret_cast<__half*>(take(m * HID * 2));
-    static const bool q8 = getenv("G6_PF_Q8") && atoi(getenv("G6_PF_Q8")) == 1;   // the only reader of hq / hs (A.q8)
+    const bool q8 = knob::pf_q8();   // the only reader of hq / hs (A.q8)
     t.hq = q8 ? reinterpret_cast<uint8_t*>(take(m * HID)) : nullptr;
     t.hs = q8 ? reinterpret_cast<uint8_t*>(take(m * (HID / 32))) : nullptr;
     t.wt = reinterpret_cast<int*>(take((static_cast<size_t>(max_wtiles(M)) + (m + WM_R - 1) / WM_R) * 3 * 4));
@@ -5761,7 +5751,7 @@ struct Layer
     int M = 0, moe = 0, indexer = 0, heads = 0, inter = 0;      // inter = shared / dense MLP width on this rank
     Xq xq_x, xq_qa, xq_attn, xq_x2, xq_act;
     Gemm q_a, kv_a, q_b, idx_q, o_proj, gate, up, down;
-    RsOut rs_o, rs_down;              // G6_PF_RSDIRECT (prefill.cuh): o_proj / dense down rows -> RS send slot
+    RsOut rs_o, rs_down;              // GR8_PF_RSDIRECT (prefill.cuh): o_proj / dense down rows -> RS send slot
     ToBf xb_x, xb_x2;
     Blas idx_k, idx_w, router;
     Act act;
@@ -5846,9 +5836,8 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
         L.xq_x2.suh = T.tsuh[2];
 #if G6_MODEL_FLASH
         L.xq_x2.h16 = L.gate.h16;
-        // dense.gate and dense.up have distinct suh vectors in W8d: rotate up into sc.x8_up unless pointers match or G6_DTR_PF_SHARE_SUH=1
-        static const bool share_suh = getenv("G6_DTR_PF_SHARE_SUH") && atoi(getenv("G6_DTR_PF_SHARE_SUH")) == 1;
-        if (share_suh || T.tsuh[2] == T.tsuh[3])
+        // dense.gate and dense.up have distinct suh vectors in W8d: rotate up into sc.x8_up unless pointers match or GR8_DTR_PF_SHARE_SUH=1
+        if (knob::dtr_pf_share_suh() || T.tsuh[2] == T.tsuh[3])
         {
             L.up.pre = Xq();
             L.up.x8 = sc.x8_big;
@@ -5900,7 +5889,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if ((e = make_gemm(T.t[UT],         T.s[UT],         M, sc.x8_big,   sc.u,                               0, L.up))) return e;
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
 #if G6_MODEL_FLASH
-    static const bool dtr8 = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+    const bool dtr8 = knob::pf_dtr8();
     if ((!L.o_proj.on || !dtr8) && T.tm.o_proj.w && (e = make_gemm_tr(T.tm.o_proj, M, sc.x8_small, io.attn_part, 1, L.o_proj))) return e;
     if ((!L.q_b.on || !dtr8) && T.tm.q_b.w && (e = make_gemm_tr(T.tm.q_b, M, sc.x8_small, io.q_b, 0, L.q_b))) return e;
     if (!L.moe)
@@ -5939,7 +5928,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if (!L.q_a.on || !L.kv_a.on || (!qo_dedup && (!L.q_b.on || !L.o_proj.on)))
 #endif
         return !L.q_b.on && !L.o_proj.on && !T.qo_cover
-                   ? "layer without q_b / o_proj .mx.codes and no QO pack covers it (slim pack booted without G6_PF_OWN=3 / qo pack?)"
+                   ? "layer without q_b / o_proj .mx.codes and no QO pack covers it (slim pack booted without GR8_PF_OWN=3 / qo pack?)"
                    : "layer without q_a / kv_a / q_b / o_proj .mx.codes";
 #else
     const bool qo_dedup = false;
@@ -6048,13 +6037,13 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             return "tr3 table / v1 / v2 / v3 (or sg / v1b / v3b) / router.bias shapes do not match the pack layout";
         Expert& A = L.ex;
         A.on = 1; A.M = M; A.maxseg = max_segments(M);
-        A.topk = moe_topk_cut(TOPK);     // G6_MOE_TOPK (validated at boot); nroutes = the exact live count (sum of cnt)
+        A.topk = static_cast<int>(knob::moe_topk());     // GR8_MOE_TOPK (validated at boot); nroutes = the exact live count (sum of cnt)
         A.nroutes = M * A.topk;          // (0-sentinel would expand to M * TOPK and overshoot the route grids)
 #if G6_MODEL_FLASH
-        { const char* ev = getenv("G6_PF_MOE8"); A.h16 = (ev && atoi(ev) == 1) ? 0 : 1; }
+        A.h16 = knob::pf_moe8() ? 0 : 1;
         A.e4 = T.e4m3;
 #if defined(PF_F12) || defined(PF_AOP) || defined(PF_HOIST) || !defined(PF_FC2GL)
-        if (A.h16) return "fp16 MoE passes (the Flash default; G6_PF_MOE8=1 = MXFP8) need PF_FC2GL and no PF_F12 / PF_AOP / PF_HOIST";
+        if (A.h16) return "fp16 MoE passes (the Flash default; GR8_PF_MOE8=1 = MXFP8) need PF_FC2GL and no PF_F12 / PF_AOP / PF_HOIST";
 #endif
 #endif
         A.logits = io.logits; A.bias = static_cast<const float*>(bias.p);
@@ -6070,28 +6059,27 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);
         A.x = io.x2; A.ldx = HID;
 #if G6_MODEL_FLASH
-        { const char* ev = getenv("G6_PF_HX"); if (A.h16 && bsf && !(ev && atoi(ev) == 0)) A.hx = sc.hx; }
-        { const char* ev = getenv("G6_PF_Q8"); A.q8 = A.hx && ev && atoi(ev) == 1; if (A.q8) { A.hq = sc.hq; A.hs = sc.hs; } }
-        { const char* ev = getenv("G6_PF_FC2ONE"); A.fc2one = A.h16 && bsf && !(ev && atoi(ev) == 0); }
-        { const char* ev = getenv("G6_PF_FC2V2"); A.fc2v2 = A.fc2one && !(ev && atoi(ev) == 0); }
-        {   // weight-major fc1 (default on, G6_PF_WM=0 = k_pf_fc1): k_pf_fc1ws only for passes of >= G6_PF_WM_MIN rows
+        if (A.h16 && bsf && knob::pf_hx()) A.hx = sc.hx;
+        A.q8 = A.hx && knob::pf_q8();
+        if (A.q8) { A.hq = sc.hq; A.hs = sc.hs; }
+        A.fc2one = A.h16 && bsf && knob::pf_fc2one();
+        A.fc2v2 = A.fc2one && knob::pf_fc2v2();
+        {   // weight-major fc1 (default on, GR8_PF_WM=0 = k_pf_fc1): k_pf_fc1ws only for passes of >= GR8_PF_WM_MIN rows
             // (default 6144; slower than k_pf_fc1 below ~5000). Byte-equal to k_pf_fc1.
-            const char* ev = getenv("G6_PF_WM");
-            const char* em = getenv("G6_PF_WM_MIN");
             // the WM kernels read K4 order only: the widened order (fc1_wide / fc2_wide) differs only for K2 and K3 units
             const bool k4 = !T.k2 && !T.k3;
-            A.wm = A.hx && !(ev && atoi(ev) == 0) && M >= (em ? atoi(em) : 6144) && (!T.fc1_wide || k4);
-            const char* e2 = getenv("G6_PF_WM2");      // k_pf_fc2w: byte-equal, ~4% slower than k_pf_fc2v at M 8192 (bench): off
-            A.wm2 = A.wm && A.fc2v2 && e2 && atoi(e2) == 1 && (!T.fc2_wide || k4);
+            A.wm = A.hx && knob::pf_wm() && M >= knob::pf_wm_min() && (!T.fc1_wide || k4);
+            // GR8_PF_WM2, k_pf_fc2w: byte-equal, ~4% slower than k_pf_fc2v at M 8192 (bench): off
+            A.wm2 = A.wm && A.fc2v2 && knob::pf_wm2() && (!T.fc2_wide || k4);
         }
         if (A.wm) { A.wt = sc.wt; A.n_wt = sc.n_wt; }
 #endif
         A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.ysh = sc.ysh; A.out = io.mlp_part;
 #ifdef PF_AOP
-        { const char* ev = getenv("G6_PF_AOP"); A.aop = (ev && atoi(ev) == 0) ? nullptr : sc.aop; }   // compiled in: on unless G6_PF_AOP=0
+        A.aop = knob::pf_aop().value_or(true) ? sc.aop : nullptr;   // compiled in: on unless GR8_PF_AOP=0
 #endif
 #ifdef PF_F12
-        { const char* ev = getenv("G6_PF_F12"); A.f12 = ev ? atoi(ev) : 1; }   // compiled in: on unless G6_PF_F12=0
+        A.f12 = knob::pf_f12().value_or(true) ? 1 : 0;   // compiled in: on unless GR8_PF_F12=0
 #endif
         if (T.sh_trellis && T.sh_fp8)
         {
@@ -6120,11 +6108,10 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         {
             if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row NEXP";
 #if G6_MODEL_FLASH
-            // G6_PF_SHR=1 (default off: ~-0.05 s at 45L 32K): the shared expert rides in the routed pass (Expert::shr):
+            // GR8_PF_SHR=1 (default off: ~-0.05 s at 45L 32K): the shared expert rides in the routed pass (Expert::shr):
             // one route list, one fc1 / mid / fc2 launch set; its rows run the routed kernels (k_pf_fc1ws when wm) -> same
             // bytes. Default = its own pass.
-            static const bool shr = [] { const char* e = getenv("G6_PF_SHR"); return e && atoi(e) == 1; }();
-            if (shr)
+            if (knob::pf_shr())
             {
                 A.shr = 1; A.nroutes = M * A.topk + M; A.maxseg = max_segments(M) + (M + RS - 1) / RS;
                 A.ysh = sc.yw + static_cast<size_t>(M) * A.topk * HID;     // route M * topk + row (sc.ysh is at the Mmax tail)

@@ -9,6 +9,7 @@
 #pragma once
 #include "kda.cuh"
 #include "prefill.h"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace kda
 {
@@ -621,14 +622,11 @@ inline PfArgs make_pf_args(const Args& a, const KdaPrefillScratch& ps)
 inline void launch_core_prefill(const PfArgs& p, cudaStream_t st)
 {
     const Args& a = p.a;
-    static const bool p1 = getenv("G6_KDA_PF_P1") && atoi(getenv("G6_KDA_PF_P1")) == 1;   // 1: row-loop prep (old)
-    if (p1) k_kda_prep<<<a.nh * 2, PREP_T, 0, st>>>(a);
+    if (knob::kda_pf_p1()) k_kda_prep<<<a.nh * 2, PREP_T, 0, st>>>(a);
     else launch_prep_pf(a, st);
-    static const bool in1 = getenv("G6_KDA_PF_IN1") && atoi(getenv("G6_KDA_PF_IN1")) == 1;   // 1: intra kernel v1 (old)
-    if (in1) k_kda_intra<<<dim3(a.nh, p.nchunk()), INTRA_T, 0, st>>>(p);
+    if (knob::kda_pf_in1()) k_kda_intra<<<dim3(a.nh, p.nchunk()), INTRA_T, 0, st>>>(p);
     else k_kda_intra3<<<dim3(a.nh, p.nchunk()), INTRA_T, 0, st>>>(p);
-    static const bool st1 = getenv("G6_KDA_PF_ST1") && atoi(getenv("G6_KDA_PF_ST1")) == 1;   // 1: state kernel v1 (old)
-    if (st1) k_kda_state<<<dim3(a.nh, DV / VB), ST_T, 0, st>>>(p);
+    if (knob::kda_pf_st1()) k_kda_state<<<dim3(a.nh, DV / VB), ST_T, 0, st>>>(p);
     else k_kda_state2<<<dim3(a.nh, DV / VB), ST_T, 0, st>>>(p);
     k_kda_out<<<dim3(a.nh, a.M), OUT_T, 0, st>>>(a);
 }

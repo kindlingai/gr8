@@ -104,7 +104,7 @@ __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int
     return false;
 }
 
-// G6_K1_TLBW (A/B, bind.cuh make_k1): warp 0 of fc1 CTA s, s < the step's item slots, prefetches one L2 line per
+// GR8_K1_TLBW (A/B, bind.cuh make_k1): warp 0 of fc1 CTA s, s < the step's item slots, prefetches one L2 line per
 // 2^tlbw-byte granule of item slot s's fc1 and fc2 ranges at the start of the launch. The GPU's address translations
 // of every routed slot (fc1 units of the later CTA waves, all fc2 units) are then walked while fc1 runs, not when
 // those CTAs start (k1_audit --arms tlbw). prefetch.global.L2 has no result: no output changes.
@@ -184,7 +184,7 @@ __global__ __launch_bounds__(SH ? 288 : 256, 3) void k1_tr3_fin(K1Args A)
 #endif
 }
 
-// ------------------------------------------------------------------ G6_ROUTE_OVL: the trellis shared expert apart
+// ------------------------------------------------------------------ GR8_ROUTE_OVL: the trellis shared expert apart
 // SH layers, separate fc1 / fc2 launches (bind.cuh k1_ovl_fork / launch_k1_ovl). The shared expert's units need nothing
 // from the route plan (k1_slot: item slots 0 .. nsh-1, scratch slots n_slots + t; tr3_fc1_body reads the plan only for
 // routed slots, tr3_fc2_body not at all), so they can run on a forked stream while the router GEMV and the plan kernel

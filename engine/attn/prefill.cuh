@@ -3,7 +3,6 @@
 #include <cublas_v2.h>
 #include <cstdio>
 #include <atomic>
-#include <cerrno>
 #include <climits>
 #include <cstdlib>
 #include "prefill-index-team-profile.cuh"
@@ -28,12 +27,6 @@ struct G6AttnPrefill {
 };
 namespace gp {
 using ga::half;using ga::bf16;constexpr int TOP=ga::TOP;
-// At modest context, shared dense tensor GEMMs win despite extra masked FLOPs.
-// Selection and softmax still use precisely the supplied TOP list.
-constexpr int DEFAULT_DENSE_LIMIT=8192;
-// Bound all prefill scratch and GEMM widths at creation, independent of tails.
-// Larger batches reduce launch overhead and improve selector/WMMA occupancy.
-constexpr int DEFAULT_QUERY_TILE=256;
 static int blas_status(cublasStatus_t s){if(s==CUBLAS_STATUS_SUCCESS)return 0;fprintf(stderr,"gr8 prefill cuBLAS status %d\n",int(s));return int(cudaErrorUnknown);}
 __global__ void weight_half(const void* src,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[i]=__float2half_rn(ga::bfloat(src,i));}
 // #50: the FP16 UK / UV copies from a binding's E4M3 weights (attn.h uks / uvs): each FP16 value is weight_half's of the BF16
@@ -141,8 +134,8 @@ __global__ void __launch_bounds__(256,2) index_scores_rg8(G6Attn a,int start,int
  }
 }
 template<int BL,int OL> constexpr int isg_rg8_smem(){return 64*BL*2+4*32*OL*4;}
-// Rows per CTA: G6_PF_ISGRT_RG (multiple of 8) overrides the default 8.
-static inline int isgrt_rg(){static const int env=[]{const char* s=getenv("G6_PF_ISGRT_RG");return s?atoi(s)&~7:0;}();return env>=8?env:8;}
+// Rows per CTA: GR8_PF_ISGRT_RG (multiple of 8) overrides the default 8.
+static inline int isgrt_rg(){return int(knob::pf_isgrt_rg())&~7;}
 static inline void launch_index_scores_rg(G6Attn a,int start,int n,const half* q,const float* weight,const half* keys,const float* scales,float* scores,int* ids,cudaStream_t st){
  constexpr int SMEM=isg_rg8_smem<136,64>();static const bool once=cudaFuncSetAttribute(index_scores_rg8<136,64>,cudaFuncAttributeMaxDynamicSharedMemorySize,SMEM)==cudaSuccess;(void)once;
  int RG=isgrt_rg();index_scores_rg8<136,64><<<dim3((a.context+63)/64,(n+RG-1)/RG),256,SMEM,st>>>(a,start,n,RG,q,weight,keys,scales,scores,ids);
@@ -245,16 +238,15 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
         w.temp_bytes=std::max(bytes,single);w.temp=take(w.temp_bytes);}
     w.total=used;return w;
 }
-// G6_PF_SELX_CTX (selx.cuh = tp6-spare 446fa62, shared with TP4 verbatim): prefill index tiles with n >= SELX_MINN rows and context
+// GR8_PF_SELX_CTX (selx.cuh = tp6-spare 446fa62, shared with TP4 verbatim): prefill index tiles with n >= SELX_MINN rows and context
 // >= this select with selx (one CTA per row, sample bound + filter + radix + sort) instead of SEL32: the same ids in the same
 // order (score desc, then id asc, -1 fill). Unset = SEL32 for every tile (today). Strict: an integer 32769..1048576, else exit 2.
 // cand scratch = w.so .. w.io (2 * R * T * 4 B, present for T > 32768, used by SEL32 only as its histogram) -> min(CAPG, T) keys/row.
 static constexpr int SELX_MINN=32;   // our gate: selx 1.6-2.0x SEL32 from 53K at n >= 33
 static int selx_ctx(){
-    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 53248;   // default: SELX at 53248 context (v0.7)
-        char* e=nullptr;errno=0;const long x=strtol(s,&e,10);
-        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = 53248)\n",s);exit(2);}
-        fprintf(stderr,"# G6_PF_SELX_CTX %ld: prefill index tiles with n >= %d and context >= %ld select with selx\n",x,SELX_MINN,x);return (int)x;}();
+    static const int v=[]{const int x=int(knob::pf_selx_ctx());   // default: SELX at 53248 context (v0.7)
+        if(x!=53248)fprintf(stderr,"# GR8_PF_SELX_CTX %d: prefill index tiles with n >= %d and context >= %d select with selx\n",x,SELX_MINN,x);
+        return x;}();
     return v;
 }
 static cudaError_t select_prefill(const G6Attn& a,ga::Work& w,int start,int n,cudaStream_t st){
@@ -282,15 +274,9 @@ static cudaError_t release_scratch(G6AttnPrefillScratch* w){
     if(!w||w->refs.fetch_sub(1,std::memory_order_acq_rel)!=1)return cudaSuccess;
     auto bs=cublasDestroy(w->blas);auto e=cudaFree(w->data);delete w;return e!=cudaSuccess?e:cudaError_t(blas_status(bs));
 }
-static bool env_int(const char* name,int fallback,int& out){
-    const char* v=std::getenv(name);if(!v||!*v){out=fallback;return true;}
-    char* end=nullptr;errno=0;long x=std::strtol(v,&end,10);
-    if(errno||end==v||*end||x<0||x>INT_MAX-31)return false;out=int(x);return true;
-}
 static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefill* owner,bool shared){
     if(!out||*out||!b||!b->storage)return int(cudaErrorInvalidValue);
-    int tile=0,dense=0,events=0;
-    if(!env_int("G6_PF_TILE",DEFAULT_QUERY_TILE,tile)||(tile!=64&&tile!=128&&tile!=256)||!env_int("G6_PF_DENSE",DEFAULT_DENSE_LIMIT,dense)||!env_int("G6_PF_EVENTS",0,events)||events>1)return int(cudaErrorInvalidValue);
+    const int tile=int(knob::pf_tile()),dense=int(knob::pf_dense()),events=knob::pf_events();
     auto p=new G6AttnPrefill;p->dense_limit=dense;p->owner=b;p->full_index=b->full_index;p->H=b->args.heads;p->cap=b->capacity;p->maxrows=b->max_rows;p->R=std::min(tile,p->maxrows);p->C=(p->cap+31)&~31;
     const size_t need=scratch_layout(*p,b->args,nullptr);p->weight_bytes=weight_layout(*p,nullptr);
     int device=0;auto e=cudaGetDevice(&device);if(e!=cudaSuccess){delete p;return int(e);}

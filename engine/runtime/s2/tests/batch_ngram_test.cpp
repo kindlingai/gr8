@@ -37,7 +37,7 @@ struct Opt
     bool adaptive = false;            // --spec-adaptive estimates
     bool dsel = false;                // the drafter choice (MTP drafts every token right: it moves to MTP)
     bool lp = false;                  // the lp hook (MTP drafts' log-probabilities)
-    bool klog = false;                // KStop::log (G6_MTP_LPLOG on this rank only): must not change any decision
+    bool klog = false;                // KStop::log (GR8_MTP_LPLOG on this rank only): must not change any decision
     g6rt::InsertRule ins;
 };
 
@@ -168,7 +168,7 @@ int main()
     CHECK(wr.got == base.got && wr.st.ngram_rounds > 0 && wr.st.ngram_acc == 0);
     CHECK(ngram_sig(NgramSrc()).empty() && !ngram_sig(ng).empty());
     // MTP rounds (the drafter choice moves to MTP, whose drafts are all right): the table still takes rounds, the output
-    // is the target's, and the MTP log-probabilities that only a logging rank has (G6_MTP_LPLOG, KStop::log without a
+    // is the target's, and the MTP log-probabilities that only a logging rank has (GR8_MTP_LPLOG, KStop::log without a
     // stop mode) change no verify width
     {
         ng.t = &good; ng.kmin = 2; ng.kmax = 7;

@@ -1,8 +1,8 @@
-// CPU-only: G6_PF_ROUTER_SPLIT row partition, payload and 64-byte record layout, then the exchange of every rank's table.
+// CPU-only: GR8_PF_ROUTER_SPLIT row partition, payload and 64-byte record layout, then the exchange of every rank's table.
 //   g++ -std=c++17 -O1 -Wall -o /tmp/t_rs engine/tests/test_flash_route_split.cpp && /tmp/t_rs
 // The model of the kernels (flash_route_split.h pack / unpack) is applied for every rank count 2..MAX_NR: each rank fills only its
 // own rows with a per-row route rule (stand-in for k_pf_route<K>: it writes all 8 slots, dropped slots as -1 / 0.0f), packs,
-// "sends"; every rank must end byte-equal to the replicated table, for K = 8, 6, 4, 1 (G6_MOE_TOPK). A byte compare, not a float
+// "sends"; every rank must end byte-equal to the replicated table, for K = 8, 6, 4, 1 (GR8_MOE_TOPK). A byte compare, not a float
 // compare. The 16-byte index maps of k_rs_put and k_rs_unpack (flash_route_split.cuh, one instance for every rank count, grid y =
 // peer) are run as written, for several grid strides, and must write the same bytes as pack / unpack.
 #include "../runtime/flash_route_split.h"

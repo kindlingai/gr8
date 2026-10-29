@@ -19,11 +19,12 @@
 #include "dtr_find.h"
 #include "../kernels/bind_prefill.cuh"
 #include "flash_route_split.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt
 {
 
-static_assert(flash_route_split::SLOTS == geom::TOPK, "G6_PF_ROUTER_SPLIT record carries TOPK slots");
+static_assert(flash_route_split::SLOTS == geom::TOPK, "GR8_PF_ROUTER_SPLIT record carries TOPK slots");
 
 namespace flash_mlp_pf
 {
@@ -120,11 +121,11 @@ __global__ void __launch_bounds__(WR * WC * 32) k_router_tile(const float* __res
 }
 
 // Router logits y [M][N] = x [M][K] FP32 . w [N][K] BF16 (0-ULP vs flash_mlp::k_linear); k_linear_mr below 64 rows or
-// with G6_PF_ROUTER1=1. 9216 rows x 288 x 4096 on one GB10: k_linear_mr 16.3 ms, k_router_tile<8,16,2,2,8> 2.5 ms.
+// with GR8_PF_ROUTER1=1. 9216 rows x 288 x 4096 on one GB10: k_linear_mr 16.3 ms, k_router_tile<8,16,2,2,8> 2.5 ms.
 template <int R = 8, int C = 16, int WR = 2, int WC = 2, int KC = 8>
 inline void launch_router(const float* x, const uint16_t* w, float* y, int K, int N, int M, cudaStream_t st)
 {
-    static const bool old = getenv("G6_PF_ROUTER1") && atoi(getenv("G6_PF_ROUTER1")) == 1;
+    const bool old = knob::pf_router1();
     if (old || M < 64 || K % (32 * KC) || K % 8)   // small M: one CTA row tile per 16 rows idles most lanes
     {
         constexpr int MR = 4;
@@ -184,7 +185,7 @@ inline bind::Tensor as_bind_tensor(const TensorRef& r)
 
 // Populate bindp::Tensors for layer i from m.layers[i].flash_mlp_w (and optional Find).
 // Makes exact FP8 tile copies for dense gate/up/down (unless G6_DTR_PF_DENSE_COPY=0, which uses k_gemm_tr directly)
-// and optional shared-expert FP8 copies (G6_PF_SHFP8=1; default 0 on the fp16 expert body, 1 with G6_PF_MOE8=1).
+// and optional shared-expert FP8 copies (GR8_PF_SHFP8=1; default 0 on the fp16 expert body, 1 with GR8_PF_MOE8=1).
 inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t st, bindp::Tensors& bt)
 {
     Layer& y = m.layers[i];
@@ -221,16 +222,15 @@ inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t s
             bt.t[bindp::T_ROUTER_BIAS].shape[0] = geom::NEXP;
         }
         // default off: the FP8 copy quantizes the shared expert's activations, the fp16 trellis pass matches decode
-        static const bool shfp8 = getenv("G6_PF_SHFP8") ? atoi(getenv("G6_PF_SHFP8")) != 0
-                                                        : getenv("G6_PF_MOE8") && atoi(getenv("G6_PF_MOE8")) == 1;
+        const bool shfp8 = knob::pf_shfp8().value_or(knob::pf_moe8());
         if (shfp8 && !y.T.shfp8.codes[0] && !y.T.fc1_wide && !y.T.fc2_wide)
             if (const char* e = bind::make_shared_fp8(y.T, st))
                 die("layer " + std::to_string(y.l) + ": " + e);
-        static const bool wide = !getenv("G6_PF_NOWIDE") || atoi(getenv("G6_PF_NOWIDE")) == 0;
+        const bool wide = !knob::pf_nowide();
         if (wide && !y.T.fc1_wide)
         {
             bind::widen_fc1(y.T, st);
-            if (!getenv("G6_NOWIDE2")) bind::widen_fc2(y.T, st);
+            if (!knob::nowide2()) bind::widen_fc2(y.T, st);
             y.flash_mlp_w.experts = y.T;
         }
         bt.fc1_wide = y.T.fc1_wide;
@@ -262,7 +262,7 @@ inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t s
         bt.tsuh[2] = w.gate_t.suh; bt.tsvh[2] = w.gate_t.svh;
         bt.tsuh[3] = w.up_t.suh;   bt.tsvh[3] = w.up_t.svh;
         bt.tsuh[4] = w.down_t.suh; bt.tsvh[4] = w.down_t.svh;
-        static const bool dcopy = getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1;
+        const bool dcopy = knob::pf_dtr8();
         if (dcopy && (!bt.t[bindp::T_D_GATE].p || !bt.t[bindp::T_D_UP].p || !bt.t[bindp::T_D_DOWN].p))
         {
             const dtr::Mat* mats[3] = {&w.gate_t, &w.up_t, &w.down_t};
@@ -324,7 +324,7 @@ inline void bind_mlp_prefill(Model& m, Prefill& P, cudaStream_t st)
         }
 }
 
-// G6_PF_SP_FIND (FlashPrefill only): the MoE final sum writes its rows straight into the reduce-scatter send slot
+// GR8_PF_SP_FIND (FlashPrefill only): the MoE final sum writes its rows straight into the reduce-scatter send slot
 template <class Pf> auto pf_fin_rs(Pf& p, int) -> decltype(p.fin_rs, (const bindp::RsOut*)nullptr) { return p.fin_rs.base ? &p.fin_rs : nullptr; }
 template <class Pf> const bindp::RsOut* pf_fin_rs(Pf&, long) { return nullptr; }
 template <class Prefill>
@@ -350,7 +350,7 @@ inline void pf_mlp_block_gemm(Model& m, Prefill& P, int i, int M, cudaStream_t s
             S.bf16_out = dmalloc<float>(static_cast<size_t>(P.MP) * HID);
             if (cublasCreate(&S.blas) != CUBLAS_STATUS_SUCCESS) die("flash_mlp_pf: cublasCreate failed");
         }
-        static const bool exact = getenv("G6_PF_BF16_EXACT") && atoi(getenv("G6_PF_BF16_EXACT")) == 1;
+        const bool exact = knob::pf_bf16_exact();
         if (exact)
         {
             flash_mlp::k_dense_gate<<<dim3((w.I + 7) / 8, M), 256, 0, st>>>(P.xn2, w.gate, w.up, S.bf16_act, w.I);
@@ -395,7 +395,7 @@ inline void pf_mlp_block_gemm(Model& m, Prefill& P, int i, int M, cudaStream_t s
     {
         if (const bindp::RsOut* o = pf_fin_rs(P, 0)) L.ex.rs = *o;
         // FP32 router input (no BF16 rounding before top-k), 0-ULP bit-identical to flash_mlp::k_linear
-        // G6_PF_ROUTER_SPLIT (opt-in): this rank routes its own rows only, publishes them, and takes the peers' rows after the
+        // GR8_PF_ROUTER_SPLIT (opt-in): this rank routes its own rows only, publishes them, and takes the peers' rows after the
         // hx / shared launches; launch_route then skips k_pf_route (Expert::pre_routed). Off: the replicated path below.
         const bool split = P.route_split.fabric && flash_route_split::active(M, P.route_split.f.nr);
         if (split)
@@ -408,7 +408,7 @@ inline void pf_mlp_block_gemm(Model& m, Prefill& P, int i, int M, cudaStream_t s
             flash_route_publish(P.route_split, L.ex.tok_e, L.ex.tok_w, M, st);
         }
         else flash_mlp_pf::launch_router(P.xn2, w.router, S.logits, HID, geom::NEXP, M, st);
-        bindp::launch_hx(L.ex, st);           // G6_PF_HX: pre-rotated fc1 rows for the shared and the routed passes
+        bindp::launch_hx(L.ex, st);           // GR8_PF_HX: pre-rotated fc1 rows for the shared and the routed passes
         bindp::launch_shared<g6nr::EB>(L, st);
         if (split)
         {

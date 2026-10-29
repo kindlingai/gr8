@@ -256,7 +256,7 @@ def main():
     ap.add_argument('--partial', action='store_true', help='component test: only plan the requested layers')
     ap.add_argument('--no-globals', action='store_true')
     ap.add_argument('--no-experts', action='store_true', help='dense-only check: do not materialize expert payloads')
-    ap.add_argument('--qo', action='store_true', help='plan and check the G6_PF_OWN=3 full-head tensors too')
+    ap.add_argument('--qo', action='store_true', help='plan and check the GR8_PF_OWN=3 full-head tensors too')
     ap.add_argument('--rounded', action='store_true', help='plan and check the rounded form of the trellis matrices')
     ap.add_argument('--layout', help='plan the ranks from this layout file (bin/g6layout)')
     ap.add_argument('--work', default='/tmp/release-check')

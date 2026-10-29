@@ -76,7 +76,7 @@ private:
 // The step shapes S2 can launch with several Flash sessions, each captured as a graph at every context bucket before
 // serving (flash_native.cuh; the same set as the full model's NativeDispatch::capture_all, without the row classes,
 // which Flash's bound layers do not have): main = prompt tails 1..chunk and rounds S x (k + 1), S = 1..sessions, k = 1..K
-// with G6_S2_ADAPT (else K); draft = 1..chunk and 1..sessions x (K + 1); chain = 1..sessions (K >= 2 only).
+// with GR8_S2_ADAPT (else K); draft = 1..chunk and 1..sessions x (K + 1); chain = 1..sessions (K >= 2 only).
 struct FlashShapes { std::set<int> mains, drafts, chains; };
 inline FlashShapes flash_shapes(int sessions, int mtp, int chunk, bool adapt, int mx) {
     if (sessions < 1 || mtp < 1 || chunk < 1 || chunk > mx) throw std::runtime_error("Flash capture set: invalid sessions, mtp or chunk");

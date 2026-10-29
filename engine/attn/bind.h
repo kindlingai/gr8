@@ -18,7 +18,7 @@ struct G6AttnPack {
 #if G6_MODEL_FLASH
     G6AttnTensor index_ape;   // Lnnn.self_attn.indexer.index_kpool_compress_ape [4,128]; uk is [H,256,512], not transposed
 #endif
-    // #50 (G6_KVB=fp8): uk / uv are u8 E4M3 [H,192,512] / [H,256,512] and these their f32 scales, the release's 128x128
+    // #50 (GR8_KVB=fp8): uk / uv are u8 E4M3 [H,192,512] / [H,256,512] and these their f32 scales, the release's 128x128
     // block scale of every weight row and 128-column block. Both null: uk / uv are BF16.
     G6AttnTensor uks;         // Lnnn.kv_b.uk.scale [H,192,4]; transposed once by binder to [H,4,192]
     G6AttnTensor uvs;         // Lnnn.kv_b.uv.scale [H,256,4]; borrowed unchanged
@@ -42,7 +42,7 @@ struct G6AttnBinding {
     void *storage, *scratch;
     size_t storage_bytes, scratch_bytes;
     int rank, layer, head_begin, capacity, max_rows, full_index;
-    // Flash, G6_FLASH_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
+    // Flash, GR8_FLASH_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
     void* kv_chunks[2];
 };
 
@@ -58,7 +58,7 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding*, const G6AttnPack*, int rank,
     int layer, int capacity, int max_rows, int query_tile, void* stream, void* ext_scratch, size_t ext_bytes);
 #if G6_MODEL_FLASH
 struct G6KvChunks;
-// Flash (G6_FLASH_KV_CHUNKS): the MLA and index caches are the two regions (kvchunks.h, each at least the capacity's
+// Flash (GR8_FLASH_KV_CHUNKS): the MLA and index caches are the two regions (kvchunks.h, each at least the capacity's
 // pages; the caller frees them after release), the rest is storage as g6_attn_bind_create. Kernels see the same
 // pointers; no step may reach a page whose chunk is offline. Reset zeroes only what the regions back.
 extern "C" int g6_attn_bind_create_chunked(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,

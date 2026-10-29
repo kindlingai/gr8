@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include "../model_geom.h"
 #include "math.h"
+#include "../knobs-rs/gr8_knobs.h"
 namespace flash_mhc {
 constexpr int THREADS = 256;
 struct Weights {
@@ -21,17 +22,14 @@ struct Buffers {
     float* post;   // [max_rows,4]
     float* comb;   // [max_rows,4,4], source then destination
     unsigned* done = nullptr; // [max_rows], zeroed retirement counter for fused prepare
-    int bf16 = 0;             // test (G6_MHC_BF16): this launch rounds every stream write to BF16 (= BF16 storage, FP32 math)
+    int bf16 = 0;             // test (GR8_MHC_BF16): this launch rounds every stream write to BF16 (= BF16 storage, FP32 math)
 };
-// G6_MHC_BF16: quality test of BF16 residual streams. The buffer stays FP32; each written value is rounded to BF16, so
+// GR8_MHC_BF16: quality test of BF16 residual streams. The buffer stays FP32; each written value is rounded to BF16, so
 // every later read, sum of squares and register copy sees exactly what a BF16 buffer would hold. 1 = the writes after
 // both blocks, 2 = only the write after the MLP block (attention-side write stays FP32). Default 0 = unchanged.
 inline int bf16_env() {   // bit 0 = attention-side write, bit 1 = MLP-side write
-    static const int mask = [] {
-        const int v = getenv("G6_MHC_BF16") ? atoi(getenv("G6_MHC_BF16")) : 0;
-        return v == 1 ? 3 : v == 2 ? 2 : 0;
-    }();
-    return mask;
+    const int64_t v = knob::mhc_bf16();
+    return v == 1 ? 3 : v == 2 ? 2 : 0;
 }
 // The buffers for the stream write after block mlp (0 = attention, 1 = MLP).
 inline Buffers side(Buffers b, int mlp) {
@@ -632,7 +630,7 @@ __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
     Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
     __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr,
     __half* out2=nullptr, float* normalized2=nullptr, int fm0=0, int fM=0) {
-    // fm0 / fM (G6_PF_SP_XFRAG): the rows are rows fm0.. of an fM-row batch; the fragment tables are the batch's
+    // fm0 / fM (GR8_PF_SP_XFRAG): the rows are rows fm0.. of an fM-row batch; the fragment tables are the batch's
     __shared__ float sh_sums[R][24][8];
     __shared__ float sh_mix[R][24];
     __shared__ float sh_pre[R][4];

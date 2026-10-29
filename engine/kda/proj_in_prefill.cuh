@@ -3,6 +3,7 @@
 // 4 M groups x 4 N groups and the original K16 accumulation order.
 #pragma once
 #include "../kernels/bind_prefill.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 namespace kda_proj_ws {
 using namespace bindp;
 constexpr int BM=16, NA=4, NB=2, NW=4, LA=2, LW=2;
@@ -112,10 +113,7 @@ __global__ void __launch_bounds__(THREADS,1) kernel(Gemm g) {
 
 // Default on for supported FP32 matrices. Explicit 0 selects the original path;
 // small or unsupported matrices continue to use it automatically.
-inline bool enabled() {
- static const bool on = [] { const char* v = getenv("G6_PF_KDA_WS"); return !v || atoi(v) == 1; }();
- return on;
-}
+inline bool enabled() { return knob::pf_kda_ws(); }
 inline bool supported(const Gemm& g) {
  return g.on && g.M >= 256 && g.h16 == 1 && g.tw && g.bf16 == 2 &&
         g.N > 0 && g.N % 128 == 0 && g.K > 0 && g.K % 128 == 0 && !g.w2;

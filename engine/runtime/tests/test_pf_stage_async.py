@@ -1,4 +1,4 @@
-"""CPU source check of G6_PF_STAGE_ASYNC: default ON at NR=2 only (=0 kills it, =1 asks for it at any NR, an unsupported config dies only when asked), the OFF consume path and MhcFabricBlock are untouched, the async path
+"""CPU source check of GR8_PF_STAGE_ASYNC: default ON at NR=2 only (=0 kills it, =1 asks for it at any NR, an unsupported config dies only when asked), the OFF consume path and MhcFabricBlock are untouched, the async path
 issues at the put and waits ready / records used at the consume, one high-priority stream per lane."""
 from pathlib import Path
 import re
@@ -16,23 +16,23 @@ def body(src, head):
 class StageAsyncTest(unittest.TestCase):
     def test_env_default_on_at_tp2_with_kill_switch(self):
         env = body(PF, 'inline int pf_stage_async_mode()')
-        self.assertIn('getenv("G6_PF_STAGE_ASYNC")', env)
-        self.assertIn('if (e && *e) return atoi(e) == 1 ? 2 : 0;', env)   # set: =1 asks for it, anything else (=0) is off
+        self.assertIn('const std::optional<bool> v = knob::pf_stage_async();', env)
+        self.assertIn('if (v) return *v ? 2 : 0;', env)                     # set: =1 asks for it, =0 is off
         self.assertIn('return g6nr::NR == 2 ? 1 : 0;', env)                 # unset: on at TP2, off at TP4
 
     def test_build_gate_and_stream(self):
         b = body(PF, 'inline void build_flash_prefill')
         gate = b.split('pf_stage_async_mode())', 1)[1].split('cudaStreamCreateWithPriority', 1)[0]
-        for need in ('!pf_mhc_stage()', 'pf_fuse_level() < 1', 'pf_xtrace_env()', 'G6_PF_RS'):
+        for need in ('!pf_mhc_stage()', 'pf_fuse_level() < 1', 'pf_xtrace_env()', 'knob::pf_rs()', 'GR8_PF_RS'):
             self.assertIn(need, gate)
         self.assertIn('if (no && mode == 2)', gate)                          # asked for: die
-        self.assertIn('G6_PF_STAGE_ASYNC=1 cannot run with', gate)
-        self.assertIn('if (no) fprintf(stderr, "# rank %d: G6_PF_STAGE_ASYNC off (default-on skipped', gate)   # default-on: stay off, say so
-        self.assertIn('G6_PF_STAGE_ASYNC on (lane %d, peers %d)', b)
+        self.assertIn('GR8_PF_STAGE_ASYNC=1 cannot run with', gate)
+        self.assertIn('if (no) fprintf(stderr, "# rank %d: GR8_PF_STAGE_ASYNC off (default-on skipped', gate)   # default-on: stay off, say so
+        self.assertIn('GR8_PF_STAGE_ASYNC on (lane %d, peers %d)', b)
         self.assertIn('check_headroom(f.rank, MP, false)', b)
         self.assertIn('cudaStreamCreateWithPriority(&S.stream, cudaStreamNonBlocking, hi)', b)   # one per lane: built per FlashPrefill
         stage = b.split('PfPeerStage& S = P.peer_stage;', 1)[1]
-        self.assertEqual(stage.count('cudaEventCreateWithFlags'), 3)   # put, ready, used (G6_PF_SP's events are its own)
+        self.assertEqual(stage.count('cudaEventCreateWithFlags'), 3)   # put, ready, used (GR8_PF_SP's events are its own)
 
     def test_issue_at_put_consume_waits_ready_records_used(self):
         put = body(PF, 'inline void pf_put_flash')

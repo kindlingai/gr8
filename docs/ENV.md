@@ -89,21 +89,23 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_FUSE` | int | `1` | 0\|1\|2 | Decode MoE K1: 1 = one fused launch, 0 = separate launches, 2 = fused with a KS1=2 WG=2 split at 2 and 3 rows, which rounds differently. |
 | `GR8_GEMM` | int | `0` | 0..3 | Prefill MXFP8 GEMM kernel: 1 = k_gemm_mx8 (v1), 2 = v2 with 128-row CTAs, 3 = v2 with 64-row CTAs, 0 = v2 with row blocks by grid size. |
 | `GR8_GV_MULTI` | flag | `1` |  | Steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch. 0 = one launch each. Same bits. |
-| `GR8_IDXQ_SPLIT` | flag | 1 when TP>1 on GLM, else 0 | 0\|1 | Splits the indexer's replicated wq_b GEMV by output tiles across the ranks and all-gathers it on the split-GEMV fabric, with the same bits as the full GEMV. |
-| `GR8_IDX_GRP` | int | `0` | 0..64 | In S2 batched decode steps the per-row indexer reads each key tile once for up to this many rows of one session, with the same bits. 0 or out of range is off. |
+| `GR8_IDXQ_SPLIT` | flag | g6m4: 1 when TP>1 on GLM, else 0; m4sim: 0 | 0\|1 | Splits the indexer's replicated wq_b GEMV by output tiles across the ranks and all-gathers it on the split-GEMV fabric, with the same bits as the full GEMV. |
+| `GR8_IDX_GRP` | int | `0` | 0..64 | In S2 batched decode steps the per-row indexer reads each key tile once for up to this many rows of one session, with the same bits. 0 is off. |
 | `GR8_IDX_VEC` | flag | `0` | 0\|1 | The per-row decode index_scores loads its key tile with 16 B vector loads (page size 32 or more), with the same bytes. Read once before graph capture. |
 | `GR8_K1_FUSE_POLICY` | flag | `1` | 0\|1 | 0 turns off the timed table that makes exlr8 v2 MoE layers pick fused or separate fc1 / fc2 launches by row count, so GR8_FUSE applies as given. |
 | `GR8_K1_SPLIT` | text | the release split per row count |  | Sets the decode MoE K1 split: a KS1,WG,NS2 triple for every row count, or a table of M:KS1xWG/NS2 entries that keeps the bytes. A bad split stops the bind. |
-| `GR8_K1_SPLIT_M1` | ints | the release split (4,1,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 1-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
-| `GR8_K1_SPLIT_M2` | ints | the release split (1,2,8) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 2- and 3-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
-| `GR8_K1_SPLIT_M4` | ints | the release split (4,2,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for steps of 4 or more rows, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
+| `GR8_K1_SPLIT_M1` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,1,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 1-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
+| `GR8_K1_SPLIT_M2` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (1,2,8) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 2- and 3-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
+| `GR8_K1_SPLIT_M4` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,2,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for steps of 4 or more rows, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
 | `GR8_KDA_MX` | flag | `1` | 0\|1 | KDA decode q / k / v read MXFP8 records built at bind with FP16 activations. 0 reads the BF16 weights. Not byte- exact, and the records are an extra copy outside the loader's accounting. |
 | `GR8_KDA_OPROJ_SPLIT` | ints | ks 8 at 1 row, 4 at 2+ rows, sub 1 |  | Sets the k-split and sub-split of the KDA o_proj trellis GEMV as k1,s1,k4,s4 (1 row, then 2+ rows), in `kernels/dtr.cuh`. |
 | `GR8_KDA_PF_IN1` | flag | `0` | 0\|1 | 1 runs the older v1 intra-chunk kernel in KDA prefill instead of k_kda_intra3. |
 | `GR8_KDA_PF_P1` | flag | `0` | 0\|1 | 1 runs the older row-loop prep kernel in KDA prefill instead of launch_prep_pf. |
 | `GR8_KDA_PF_ST1` | flag | `0` | 0\|1 | 1 runs the older v1 state kernel in KDA prefill instead of k_kda_state2. |
-| `GR8_KDA_PROJ_KS` | int | `16` | 8\|16\|32 | Sets the k-split of the KDA trellis q / k / v projection GEMV. Other values fall back to 16. |
+| `GR8_KDA_PROJ_KS` | int | `16` | 8\|16\|32 | Sets the k-split of the KDA trellis q / k / v projection GEMV. |
 | `GR8_KDA_PROJ_MODE` | int | `0` | 0\|1\|2 | Picks how the KDA trellis q / k / v projection rotates its input: 0 inside the GEMV, 1 and 2 in a separate pre- rotate launch that also carries the f_a / g_a / b GEMVs (1) or not (2). |
+| `GR8_KDA_SCAN` | int | `0` | 0\|1 | 1 runs the Flash KDA prefill scan as the CH16 bf16-MMA scan (`kda/kda_g9.cuh`), a precision arm that is not byte-exact. 0 runs the base scan. |
+| `GR8_KDA_VS` | int | `2` | 1\|2\|4 | With GR8_KDA_SCAN=1, the v slices per head of the G9 KDA scan kernel: 1, 2 or 4. |
 | `GR8_KVB` | text | `bf16` | bf16\|fp8 | fp8 loads every layer's kv_b (UK / UV) as the release's block FP8 bytes and scales instead of BF16, with the same output bytes. Needs --v2-dense. |
 | `GR8_MHC_BF16` | int | `0` | 0\|1\|2 | Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block. |
 | `GR8_MHC_FUSE` | int | `2` | 0\|1\|2 | Sets the decode mHC consume form for every row count unless GR8_MHC_FUSE_M1 / _M4 set it: 0 a separate peer-wait kernel, 1 the consume waits itself, 2 the fused consume. |
@@ -121,7 +123,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_MTP_KSTOP_SEED3` | float | `0.55` | 0..1 | With GR8_MTP_KSTOP=2, sets the prior acceptance of a third MTP draft in the drafter choice's estimates. |
 | `GR8_MTP_KSTOP_TAU` | floats | `0,0.2,0.5` |  | With GR8_MTP_KSTOP=1, sets the thresholds t1,t2,t3: a solo round verifies draft j while the product of the draft probabilities up to j is at least t_j. |
 | `GR8_MTP_LASTROW` | flag | `0` | 0\|1 | A first-form MTP draft step routes only each session's last row through the MTP layer's routed experts. Caches, drafts and log-probabilities keep their bytes. |
-| `GR8_MTP_SPLIT` | flag | 1 when TP>1 on GLM with --mtp, else 0 | 0\|1 | MTP draft steps split eh_proj and the draft layer's replicated input GEMVs by output tiles across the ranks, gathered on a draft fabric (port + 72). Same bits. |
+| `GR8_MTP_SPLIT` | flag | g6m4: 1 when TP>1 on GLM with --mtp, else 0; m4sim: 0 | 0\|1 | MTP draft steps split eh_proj and the draft layer's replicated input GEMVs by output tiles across the ranks, gathered on a draft fabric (port + 72). Same bits. |
 | `GR8_NGRAM` | path | unset |  | A solo DFlash2 session also drafts from this n-gram table file and verifies its chain when it promises more tokens per verify ms. Needs --serve. |
 | `GR8_NGRAM_KMAX` | int | --dflash-k | 1.. | Sets the longest GR8_NGRAM chain a round verifies. |
 | `GR8_NGRAM_KMIN` | int | `2` | 1.. | Sets the shortest GR8_NGRAM chain worth a round. |
@@ -132,7 +134,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_PF_ATTN_ROWS` | int | the whole sub-batch (the GLM launcher sets 1024) |  | Prefill attention runs in chunks of this many rows inside a sub-batch. The rest of the layer runs at the sub- batch size. |
 | `GR8_PF_BF16_EXACT` | flag | `0` | 0\|1 | The Flash BF16 dense MLP fallback in prefill runs plain kernels instead of cuBLAS. |
 | `GR8_PF_BLAS_ROWS` | int | the whole sub-batch (the GLM launcher sets 1024) | 16.. | Runs the prefill cuBLAS calls in chunks of this many rows, so a row's bits depend on its chunk and not on the sub-batch size. |
-| `GR8_PF_DENSE` | int | `8192` |  | Sets the context up to which prefill attention takes the dense path. Past it the sparse, indexer-selected path runs. 0 means always sparse. |
+| `GR8_PF_DENSE` | int | `8192` | 0..2147483616 | Sets the context up to which prefill attention takes the dense path. Past it the sparse, indexer-selected path runs. 0 means always sparse. |
 | `GR8_PF_DRAFT_FULL` | int | `1` | 0\|1\|2 | The Flash MTP draft cache fill runs over the lane's rows in 256-row passes instead of one draft step per MX rows, with the same bits. 2 also counts differing words against the old path. |
 | `GR8_PF_DRAFT_SHARE` | int | on when the target has tensor-core prefill states | 0\|1 | The MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of its own, about 2 GB a rank. 1 requires it, 0 gives the draft its own. |
 | `GR8_PF_DSA_F16GEMM` | flag | `0` | 0\|1 | Flash DSA prefill input projections run as FP16 cuBLAS GEMMs on weights decoded once at bind, instead of the MXFP8 GV kernel. Near-byte, not byte-equal. |
@@ -151,7 +153,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_PF_ISGRT_RG` | int | `8` | 8.. | Sets the rows per CTA of the prefill index-score kernel, rounded down to a multiple of 8 (below 8 means 8). Same bits. |
 | `GR8_PF_KDA_GZF` | flag | `1` | 0\|1 | 0 makes the G9 KDA prefill scan write and re-read the G16 / Z16 planes instead of building those tiles in its K1 and output kernels (`kda/kda_g9.cuh`). Same bits. |
 | `GR8_PF_KDA_TAIL` | int | `1` | 0\|1\|2 | Selects how Flash prefill runs the KDA f_a / g_a / b projections: 0 = the per-MX-row host loop, 1 = full-M 32-row tiles, 2 = full-M 64-row tiles. |
-| `GR8_PF_KDA_WS` | flag | `1` | 0\|1 | Any value other than 1 turns off the warp-specialized GEMM for the Flash KDA prefill projections (`kda/proj_in_prefill.cuh`). |
+| `GR8_PF_KDA_WS` | flag | `1` | 0\|1 | 0 turns off the warp-specialized GEMM for the Flash KDA prefill projections (`kda/proj_in_prefill.cuh`). |
 | `GR8_PF_KP_TC` | int | `2` | 0\|1\|2\|3 | Selects the Flash prefill kpool score kernel: 0 = `kp_scores_pf`, 1 = tensor-core with one stage, 2 = tensor- core with two stages, 3 = the streaming tensor-core form. |
 | `GR8_PF_MHC_FUSE` | int | `2` | 0\|1\|2 | Sets how far Flash prefill fuses the mHC update with the fabric wait: 0 = separate passes, 1 = the mHC kernel reads the partials, 2 = it also waits for the payload. |
 | `GR8_PF_MHC_PK` | flag | `1` | 0\|1 | 0 turns off the packed mHC fn weights for `k_mhc_out_inv_prepare_pk` in Flash prefill. |
@@ -189,19 +191,19 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_PF_SP_AGKA` | flag | `1` | 0\|1 | 0 limits the GR8_PF_SP_AGK compute-stream all-gather to lane B instead of both prefill lanes. |
 | `GR8_PF_SP_ATTD` | flag | `1` | 0\|1 | 0 stops the GR8_PF_SP attention o_proj GEMM from writing each row into its owner's slice of the send slot. Byte- equal. |
 | `GR8_PF_SP_FIND` | flag | `1` | 0\|1 | 0 stops the GR8_PF_SP MoE final sum from writing each row into its owner's slice of the send slot. Byte-equal. |
-| `GR8_PF_SP_PUT_CTA` | int | `96` | 1..1024 | Sets the CTA count of the GR8_PF_SP send copies (`k_put_rs`, `k_put_publish_n`), with out-of-range values meaning 96. Copy only, same bytes. |
+| `GR8_PF_SP_PUT_CTA` | int | `96` | 1..1024 | Sets the CTA count of the GR8_PF_SP send copies (`k_put_rs`, `k_put_publish_n`). Copy only, same bytes. |
 | `GR8_PF_SP_X16` | flag | `0` | 0\|1 | With GR8_PF_SP and GR8_PF_ROUTER_SPLIT, an MoE layer's MLP input travels as FP16 rows instead of FP32 rows, halving that all-gather. Byte-equal. |
 | `GR8_PF_SP_XFRAG` | flag | `1` | 0\|1 | 0 stops the GR8_PF_SP owner pass and gather from writing the next attention's fragment tables directly. Same tables either way. |
 | `GR8_PF_STAGE_ASYNC` | flag | 1 at TP2 when the config allows, else 0 | 0\|1 | 1 waits for and copies the peers' partials on a per-lane side stream under the other lane's block, at any rank count, and stops the boot if the config cannot run it. |
 | `GR8_PF_STREAMS` | int | `1` | 1\|2 | 2 runs the two GLM prefill lanes on two CUDA streams, and any other value keeps one stream. |
 | `GR8_PF_STRIPE` | flag | 1 with --pf-ips2 or on a three-rank ring, else 0 | 0\|1 | 1 splits large prefill payload writes over two rails (needs --pf-ips2 or --ips2, or a three-rank ring that uses the other PCIe root's device). |
 | `GR8_PF_TILE` | int | `256` | 64\|128\|256 | Sets the prefill attention query tile in rows. Other values make the attention state fail to create. |
-| `GR8_PF_TR_BM` | int | `16` | 8\|16 | Sets the row blocks per CTA of large prefill GEMMs on trellis tiles (`k_gemm_tr`): 8 or 16, other values mean 16. Small launches take 4. |
+| `GR8_PF_TR_BM` | int | `16` | 8\|16 | Sets the row blocks per CTA of large prefill GEMMs on trellis tiles (`k_gemm_tr`): 8 or 16. Small launches take 4. |
 | `GR8_PF_WM` | flag | `1` | 0\|1 | 0 runs the Flash routed fc1 on `k_pf_fc1` instead of the weight-major `k_pf_fc1ws` for passes of at least GR8_PF_WM_MIN rows. Byte-equal. |
 | `GR8_PF_WM2` | flag | `0` | 0\|1 | 1 runs the Flash prefill fc2 weight-major (`k_pf_fc2w`) instead of `k_pf_fc2v` when the fc1 runs weight-major. Byte-equal. |
 | `GR8_PF_WM_MIN` | int | `6144` |  | Sets the fewest rows a Flash MoE prefill pass needs before the routed fc1 runs weight-major. |
 | `GR8_PF_XFRAG` | flag | `0` | 0\|1 | 1 makes the Flash mHC kernel write the next attention's input as f16 and bf16 fragment tables instead of FP32 rows when that attention reads only fragments. Same bits. |
-| `GR8_QA_SPLIT` | int | 2 when TP>1 on GLM, else 0 | 0\|1\|2 | Splits the decode layer-input GEMVs across the ranks by 16-output tiles and all-gathers them on their own fabric. 1 = q_a, kv_a and the indexer's k and weights, 2 = q_a only. Same bits. |
+| `GR8_QA_SPLIT` | int | g6m4: 2 when TP>1 on GLM, else 0; m4sim: 0 | 0\|1\|2 | Splits the decode layer-input GEMVs across the ranks by 16-output tiles and all-gathers them on their own fabric. 1 = q_a, kv_a and the indexer's k and weights, 2 = q_a only. Same bits. |
 | `GR8_QA_SPLIT_TPC` | int | `1` |  | Sets the output tiles per CTA of the GEMVs that GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT narrow. It only lowers a GEMV's own count and keeps the output bits (rank.cuh qs_narrow). |
 | `GR8_QO_NANINJ` | flag | `0` |  | Writes an FP16 NaN into q[0] of the prefill attention on every call, a fault injection for the error checks. |
 | `GR8_REUSE_ALIGN` | flag | 1 with --serve, 0 offline | 0\|1 | With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result equals a cold prefill bit for bit. 0 keeps the whole matched prefix. 1 needs --prefill. |
@@ -264,14 +266,14 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_L2PF_OPMB` | float | `8` |  | Sets how many MB of o_proj entries the GR8_L2PF prefetch takes per layer. 0 takes all. |
 | `GR8_L2PF_T` | int | `0x3ff` |  | Bit mask of the GR8_L2PF prefetch targets: 1 x_in, 2 idx_q, 4 q_b, 8 UK, 16 UV, 32 o_proj, 64 router, 128 shared or dense fc1, 256 eh_proj, 512 head records. |
 | `GR8_L2PF_US` | floats | `30,30,100,30` |  | Sets the GR8_L2PF budget per window in us at the pace, as four numbers: MLP all-reduce wait, gather waits, attention, attention all-reduce wait. |
-| `GR8_L2PF_WAVE` | int | `8` | 1..32 | Sets the most 8 KiB GR8_L2PF prefetch chunks issued per poll. Values are clamped to 1..32. |
+| `GR8_L2PF_WAVE` | int | `8` | 1..32 | Sets the most 8 KiB GR8_L2PF prefetch chunks issued per poll. |
 | `GR8_LOADER` | text | the Rust loader | cpp | cpp loads a pack through the C++ path instead of the Rust loader. |
-| `GR8_LOAD_CHUNK_MB` | int | `32` | 1.. | Sets the chunk size in MB that the Rust loader reads and the weight check sums. Values that are not positive use 32. |
+| `GR8_LOAD_CHUNK_MB` | int | `32` | 1.. | Sets the chunk size in MB that the Rust loader reads and the weight check sums. |
 | `GR8_LOAD_MODE` | text | `read` | read\|mmap | Picks how the Rust loader reads weight files: read or mmap. Other values fail the load. |
-| `GR8_LOAD_THREADS` | int | `8` | 1.. | Sets the number of Rust loader worker threads. Values that are not positive use 8. |
+| `GR8_LOAD_THREADS` | int | `8` | 1.. | Sets the number of Rust loader worker threads. |
 | `GR8_LOGIT_DUMP` | path | unset |  | Offline runs write each main step's head logits (each rank's vocab slice) to PATH.rank<R>, with a header. Not with --serve. |
 | `GR8_LOGIT_DUMP_FROM` | int | `0` |  | Main-step dumps (GR8_LOGIT_DUMP, GR8_RESID_DUMP) start at this step. |
-| `GR8_MEM_MIN` | float | `8` |  | GiB of MemAvailable the boot must keep after the weights and each layer of the KV pool. Below it the engine stops with a message instead of meeting the OOM killer. |
+| `GR8_MEM_MIN` | float | `8` | 0.. | GiB of MemAvailable the boot must keep after the weights and each layer of the KV pool. Below it the engine stops with a message instead of meeting the OOM killer. |
 | `GR8_MTP_L2PF` | int | `0` | 0..3 | With GR8_L2PF and --mtp, runs the paced L2 prefetch in MTP draft steps: 1 the draft step's windows, 2 the head waits prefetch the next draft step's front, 3 both. Same output bytes. |
 | `GR8_MTP_L2PF_US` | float | `60` | 0..1000 | Sets the budget in us at the pace of each GR8_MTP_L2PF head-wait prefetch window. |
 | `GR8_MTP_LPLOG` | int | `0` | 0\|1\|2 | Prints one # kstop line per solo S2 round with the drafter, verified and accepted counts and the drafts' log- probabilities: 1 on rank 0, 2 on every rank. |
@@ -304,7 +306,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_QO_ROPECHK` | flag | `0` |  | Checks the prefill rope table against the decode rope function once at bind and prints the mismatch count to stderr. |
 | `GR8_RESID_DUMP` | path | unset |  | Writes rank 0's residual stream after the embedding and after every attention and MLP sublayer of each offline main step to this file, in the m4sim dump format. |
 | `GR8_REUSE_HDUMP` | path | unset |  | Writes every layer's KV cache bytes for the prefilled rows of each sequence GR8_REUSE_HDUMP_SEQ lists to DIR/hd.<q>.r<rank>.bin, a prefix-reuse diagnostic (reuse_hdump.cuh). |
-| `GR8_REUSE_HDUMP_SEQ` | ints | unset |  | Lists the sequence numbers (comma-separated, 0 and up) whose cache rows GR8_REUSE_HDUMP dumps. |
+| `GR8_REUSE_HDUMP_SEQ` | ints | unset | 0.. | Lists the sequence numbers (comma-separated, 0 and up) whose cache rows GR8_REUSE_HDUMP dumps. |
 | `GR8_REUSE_POISON` | flag | `0` | 0\|1 | With --reuse-prefix, sets every stale cache row past the reused prefix to NaN on a hit, so a read of a stale row shows in the output. A test gate. |
 | `GR8_REUSE_ZSCRATCH` | flag | `0` | 0\|1 | With --reuse-prefix, clears every layer's per-sequence attention scratch before the suffix prefill on a hit (indices to -1, output to 0), a prefix-reuse diagnostic. |
 | `GR8_ROUTE_LOG` | path | unset |  | Writes one JSON line per MTP main step to this file with each MoE layer's distinct routed expert ids, from rank 0. |
@@ -333,16 +335,16 @@ Read by test programs, audits and benchmarks, never by a serving engine.
 
 | variable | type | unset | values | what it does |
 |---|---|---|---|---|
-| `GR8_ATTNK_ARMS` | text | the built-in arms |  | attnk: the arms to run, as name or KEY=V,... specs joined by ;. |
-| `GR8_ATTNK_BASE` | text | the stock arm |  | attnk: the base arm the others compare with, as KEY=V,... |
+| `GR8_ATTNK_ARMS` | text | the built-in arms |  | attnk: the arms to run, as name or KEY=V,... specs joined by spaces. |
+| `GR8_ATTNK_BASE` | text | the serving arm SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16 |  | attnk: the base arm the others compare with, as KEY=V,... over the stock arm (every flag 0), or stock. |
 | `GR8_ATTNK_E1` | flag | `0` |  | attnk: 1 runs the round 10 arm set. |
-| `GR8_ATTNK_H` | int | every head of the build |  | attnk: the attention heads to run. |
-| `GR8_ATTNK_NANKEY` | int | `-1` |  | attnk: the key slot that gets a NaN, -1 none. |
+| `GR8_ATTNK_H` | int | g6nr::HMAX, the larger head count of a rank in the build |  | attnk: the rank's head count, g6nr::HMIN or g6nr::HMAX of the build (a TP=6 build: 11 or 10). |
+| `GR8_ATTNK_NANKEY` | int | `-1` |  | attnk: the index key position (session 0) whose scale is NaN, -1 none. |
 | `GR8_ATTNK_QSCALE` | float | `1` |  | attnk: scales the test queries. |
 | `GR8_ATTNK_SESS` | int | `1` | 1\|2 | attnk: 2 runs two S2 sessions when the build and shape allow it. |
 | `GR8_ATTNK_TIES` | flag | `0` |  | attnk: 1 makes the test scores tie. |
-| `GR8_CPG_ARMS` | text | the built-in arms |  | cpgroups: the arms to run, as specs joined by ;. |
-| `GR8_CPG_LOCAL` | int | `0` |  | cpgroups: the local group setting of the run. |
+| `GR8_CPG_ARMS` | text | the built-in arms |  | cpgroups: the arms to run, as KEY=V,... specs (SC2 TR CTX2 CTX3 HG) or stock, joined by spaces. |
+| `GR8_CPG_LOCAL` | int | `0` |  | cpgroups: puts the N most recent positions first in each row's index list, as a local window. 0: uniform random positions. |
 | `GR8_CP_PF_BREAK` | text | unset | gather\|back | Negative control for the CP prefill staging gate in m4sim: skips the gather or the back half of the staging so the gate must fail. |
 | `GR8_CP_PF_NET` | flag | `0` |  | In m4sim, the CP prefill gather runs as g6m4's real fabric does it, each rank filling its own pool and sending tail pages to the others, instead of the loopback gather. |
 | `GR8_FUZZ_ROUNDS` | int | `40` |  | Rounds of the front end tokenizer fuzz test. |
@@ -367,6 +369,7 @@ Read by test programs, audits and benchmarks, never by a serving engine.
 | `GR8_S2_ATTN_PERSESSION` | flag | `0` | 0\|1 | S2: runs attention once per session instead of one batched launch over the sessions. Refused with graphs and on Flash. |
 | `GR8_S2_CLS` | int | `0` |  | m4sim --s2 probe: runs every step at this k1 row class. |
 | `GR8_S2_GEN` | ints | --gen |  | m4sim --s2: per-session generation lengths (comma-separated), so sessions finish at different rounds. |
+| `GR8_S2_GROW_POOL` | int | fixed runs (GR8_S2_RUNS, GR8_S2_PAGES or the default layout) | 1.. | m4sim --s2: the sessions' runs come from a pool of this many pages (s2/pool.h) and grow on demand: each starts with its prompt + 1 + guard rows, grows before each round, sits a round out when the pool would be unsafe, and gives its pages back when it finishes. At most the pool's pages. Not with GR8_S2_RUNS or GR8_S2_PAGES. |
 | `GR8_S2_INSERT` | text | unset |  | m4sim --s2: q:after:unless:id,id,.. gives session q an insert rule (s2_batch.h), several rules joined by semicolons. unless -1 = none. |
 | `GR8_S2_PAGES` | ints | unset |  | m4sim --s2: seed[,pages] gives each slot a scattered run from a seeded shuffle of the pool. Output must equal the default layout's. |
 | `GR8_S2_PFBASE` | ints | unset |  | m4sim gate: B[,pages] runs every sequence as one session at base page B below R. Stdout must equal the run at B = 0. Needs GR8_CP, --prefill and no --s2. |

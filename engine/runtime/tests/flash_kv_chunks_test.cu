@@ -1,16 +1,16 @@
-// G6_FLASH_KV_CHUNKS (D-331 M7 part B): a Flash rank's MLA and index caches in kvchunks regions under one chunk map
+// GR8_FLASH_KV_CHUNKS (D-331 M7 part B): a Flash rank's MLA and index caches in kvchunks regions under one chunk map
 // (runtime/flash_kv.h), on the Flash attention's own kernels. One GPU, synthetic weights, two DSA bindings (layers 3
 // and 7) that share the map. Checked here:
 //   1. masked boot: one chunk online backs exactly one chunk's granules in every region;
 //   2. at every count of chunks online (1..4), decode steps on the chunked bindings give the same output bits and
-//      index lists as the same steps on plain bindings (one cudaMalloc, G6_FLASH_KV_CHUNKS=0), and a chunk that comes
+//      index lists as the same steps on plain bindings (one cudaMalloc, GR8_FLASH_KV_CHUNKS=0), and a chunk that comes
 //      online reads as zero; at the end every cache byte is the same;
 //   3. a live session through shrink -> grow: decode, shrink to the chunks it uses, decode, grow, decode into the
 //      chunks that came back: the same bits as the plain bindings that never resized;
 //   4. with a host ledger: a shrink moves exactly the released bytes GPU -> node, a grow waits for the node to release
 //      and moves them back; the book balances after each;
 //   5. a crash after begin, between the sync and released, and between released and commit (a child process,
-//      G6_FLASH_KV_CRASH_AT), in both directions: the book balances, no byte is counted on both sides, and it recovers.
+//      flashkv::Map::crash, which GR8_FLASH_KV_CRASH_AT sets), in both directions: the book balances, no byte is counted on both sides, and it recovers.
 //   6. FLASH_CAP_POLICY=borrow-idle (s2/flash_lend.h) with the ledger booked as the launcher books it (the GPU's
 //      lendable chunks): after a session, idle, the lend takes the map to the kept chunk; a short request is admitted
 //      at once, a long one waits for a recall (timed); then a fresh session on the recalled chunks gives the same bits
@@ -36,6 +36,7 @@
 #include "../../attn/kvchunks.h"
 #include "../../attn/kvfmt.h"
 #include "../../g6nr.h"
+#include "../../knobs-rs/gr8_knobs.h"
 #include "../../model_geom.h"
 #include "../flash_kv.h"
 #include "../s2/flash_lend.h"
@@ -253,7 +254,7 @@ static Bk book(const std::string& path)
     CKI(g6kv_ledger_show(path.c_str(), b.v));
     return b;
 }
-static std::string ledger_bin() { return getenv("KVMAN_LEDGER") ? getenv("KVMAN_LEDGER") : "kvman-ledger"; }
+static std::string ledger_bin() { return knob::kvman_ledger(); }
 static void ledger_init(const std::string& path, uint64_t total, uint64_t gpu, uint64_t node)
 {
     // the book file as kvman-ledger init writes it (src/ledger.rs Book::to_text)
@@ -301,7 +302,7 @@ static int child(const char* point, const char* path, int dir)
     {
         // grow: shrink first (no crash), then the crash in the grow
         CKI(map.resize(1, nullptr));
-        setenv("G6_FLASH_KV_CRASH_AT", point, 1);
+        map.crash = point;
         if (!strcmp(point, "begun")) map.resize(CHUNKS, nullptr);   // no node: the crash comes before any release
         else {
             FakeNode node(path);
@@ -310,7 +311,7 @@ static int child(const char* point, const char* path, int dir)
     }
     else
     {
-        setenv("G6_FLASH_KV_CRASH_AT", point, 1);
+        map.crash = point;
         map.resize(1, nullptr);
     }
     return 0;   // not reached when the point is hit
@@ -454,7 +455,7 @@ int main(int argc, char** argv)
         }
         same = same && decode(plain, chunked, ly, in, 0, (int)worst, st, why);
         report(same, std::string("idle lend -> request -> recall -> decode to ") + std::to_string(worst) +
-                         " tokens: same bits as G6_FLASH_KV_CHUNKS=0" + (same ? "" : " (differs: " + why + ")"));
+                         " tokens: same bits as GR8_FLASH_KV_CHUNKS=0" + (same ? "" : " (differs: " + why + ")"));
         // a recall the node does not release in time
         CKI(map.resize(1, st));
         map.wait_ms = 200;

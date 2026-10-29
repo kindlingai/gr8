@@ -15,14 +15,14 @@
 # dependency and preprocess runs (-M*, -E), a -l library not found, a path with a space.
 # docs/BUILD-CACHE.md has the details.
 #
-#   G6_NVCC_CACHE=0          off: every call runs the compiler
-#   G6_NVCC_CACHE_DIR=DIR    where outputs are kept (default ~/.cache/gr8-nvcc). Delete it to empty the cache.
-#   G6_NVCC_CACHE_LOG=FILE   one line per call: hit|miss|pass <output>; build_m4.sh prints the counts
+#   GR8_NVCC_CACHE=0          off: every call runs the compiler
+#   GR8_NVCC_CACHE_DIR=DIR    where outputs are kept (default ~/.cache/gr8-nvcc). Delete it to empty the cache.
+#   GR8_NVCC_CACHE_LOG=FILE   one line per call: hit|miss|pass <output>; build_m4.sh prints the counts
 set -o pipefail
 CC=$1; shift
-[ "${G6_NVCC_CACHE:-1}" = 0 ] && exec "$CC" "$@"
-DIR=${G6_NVCC_CACHE_DIR:-${HOME:-/tmp}/.cache/gr8-nvcc}
-log() { [ -n "${G6_NVCC_CACHE_LOG:-}" ] && echo "$1 $2" >> "$G6_NVCC_CACHE_LOG"; return 0; }
+[ "${GR8_NVCC_CACHE:-1}" = 0 ] && exec "$CC" "$@"
+DIR=${GR8_NVCC_CACHE_DIR:-${HOME:-/tmp}/.cache/gr8-nvcc}
+log() { [ -n "${GR8_NVCC_CACHE_LOG:-}" ] && echo "$1 $2" >> "$GR8_NVCC_CACHE_LOG"; return 0; }
 
 OUTF=""; NOUT=0; ARGS=(); MFLAGS=(); SRCS=(); INS=(); LIBS=(); LDIRS=(); HOSTCC=""; PASS=""; HASC=0
 args=("$@"); i=0; n=${#args[@]}

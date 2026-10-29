@@ -1,26 +1,27 @@
-// G6_L2PF microbenchmark + exactness check, one GPU: NL distinct layers of the decode step's per-layer sequence at the TP
+// GR8_L2PF microbenchmark + exactness check, one GPU: NL distinct layers of the decode step's per-layer sequence at the TP
 // rank shapes, in one CUDA graph, with the engine's prefetch calls (l2pf::arm / window / join, kernels/l2pf.cuh) at the
 // engine's places (rank.cuh launch_consume, launch_layer_in_qs, launch_attn_block):
 //   [W_M] wait stand-in (the MLP all-reduce of layer l-1)          the rank waits, DRAM idle
-//   x_in: the rank's q_a + kv_a (+ idx_k on full layers) tiles, MXFP8 / BF16 gv_multi as under G6_QA_SPLIT=1
+//   x_in: the rank's q_a + kv_a (+ idx_k on full layers) tiles, MXFP8 / BF16 gv_multi as under GR8_QA_SPLIT=1
 //   [W_Q] wait stand-in (the q_a gather)
 //   q_b: dense trellis, K 2048 x N H*256
 //   [W_T] the real decode attention (g6_attn_replay_run, S2 batched cell; reads UK / UV / KV / index keys)
 //   o_proj: dense trellis, K H*256 x N 6144
 //   [W_A] wait stand-in (the attention all-reduce)
 //   router (BF16 gv, 256 x 6144) on the stream, || a stand-in for the trellis shared expert's fc1 on a forked stream (a
-//   dense trellis K 6144 x N 1024, about the bytes of the rank's gate + up), as G6_ROUTE_OVL=1
+//   dense trellis K 6144 x N 1024, about the bytes of the rank's gate + up), as GR8_ROUTE_OVL=1
 //   MoE stand-in: --moe MB of streaming nc loads at the DRAM rate (the routed experts; evicts L2), then the join
 // A wait stand-in is one warp that idles for its time, with the peer's tail landing --arr us before its end (the
 // window's stop sees the collective arrive there, as in the engine). Every layer's weights are distinct (each layer
-// starts cold, as after the routed experts). The attention runs the serving flags (G6_ATTN_SC2=4 ... G6_ATTN_FRONT=1)
-// unless they are set in the environment (or --stock-attn 1).
+// starts cold, as after the routed experts). The attention runs the serving flags (GR8_ATTN_SC2=4 ... GR8_ATTN_FRONT=1),
+// which the environment must set (the bench stops and names them otherwise); --stock-attn 1 runs the environment's
+// attention flags as they are.
 //   EXACT  per arm: every layer's x_in, q_b, attention (output + indices), o_proj, router and shared outputs after one
 //          graph launch, against off, byte for byte (exit 3 otherwise)
 //   TIME   per arm: us per layer (graph time / NL, median of TR alternating trials), against off, x 78 in ms per step;
 //          and per segment (one stamp kernel between segments, a separate graph): wm x_in wq q_b attn o_proj wa
 //          router moe, us per layer
-// Arms: --arms "win[:tmask[:gbps[:opmb[:wave]]]],..." (G6_L2PF windows 1 W_M 2 W_Q 4 W_T 8 W_A, G6_L2PF_T targets
+// Arms: --arms "win[:tmask[:gbps[:opmb[:wave]]]],..." (GR8_L2PF windows 1 W_M 2 W_Q 4 W_T 8 W_A, GR8_L2PF_T targets
 // 1 x_in 2 idx_q 4 q_b 8 UK 16 UV 32 o_proj 64 router 128 shared; empty field = the --gbps / --opmb / --wave default),
 // budgets --us wm,wq,wt,wa and --mb MiB per window for all arms.
 // build (scripts/build.sh builds it): from the repo root, with the engine's K1H2 flags, -DG6_NR=4 -DDEC_S2 -DPF_F12:
@@ -38,6 +39,7 @@
 #include <vector>
 #include <cuda_bf16.h>
 #include "../l2pf.cuh"
+#include "../../knobs-rs/gr8_knobs.h"
 #include "../../attn/replay.h"
 #include "../../attn/ops.h"
 #include "../../attn/kvfmt.h"
@@ -46,7 +48,7 @@
 #define CKI(x) do { int e_ = (x); if (e_) { fprintf(stderr, "%s:%d status %d (%s)\n", __FILE__, __LINE__, e_, cudaGetErrorString((cudaError_t)e_)); exit(1); } } while (0)
 static void die(const std::string& s) { fprintf(stderr, "error: %s\n", s.c_str()); exit(1); }
 constexpr int TOP = 2048;             // attn.cu ga::TOP
-constexpr int QA_T = 2048 / 16 / 4, KVA_T = 576 / 16 / 4, IDXK_T = 128 / 16 / 4;   // the rank's tiles under G6_QA_SPLIT (TP4)
+constexpr int QA_T = 2048 / 16 / 4, KVA_T = 576 / 16 / 4, IDXK_T = 128 / 16 / 4;   // the rank's tiles under GR8_QA_SPLIT (TP4)
 constexpr int SH_N = 1024;            // shared expert fc1 stand-in outputs (gate + up, 512 each at TP4)
 
 __device__ uint32_t hsh(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return (uint32_t)x; }
@@ -223,13 +225,11 @@ int main(int argc, char** argv)
 #ifndef DEC_S2
     if (S2) die("--s2 1 needs -DDEC_S2");
 #endif
-    if (getenv("G6_L2PF")) fprintf(stderr, "note: G6_L2PF is set; the bench sets the arms itself\n");
-    if (!STOCK)
-        for (const char* kv : {"G6_ATTN_SC2=4", "G6_ATTN_SC2_TR=2", "G6_ATTN_CTX2=4", "G6_ATTN_CTX3=2", "G6_ATTN_SEL2=16", "G6_IDX_GRP=16", "G6_ATTN_QT=1", "G6_ATTN_FRONT=1"})
-        {
-            const std::string s = kv;
-            setenv(s.substr(0, s.find('=')).c_str(), s.substr(s.find('=') + 1).c_str(), 0);
-        }
+    if (!STOCK && !(knob::attn_sc2() == 4 && knob::attn_sc2_tr() == 2 && knob::attn_ctx2() == 4 && knob::attn_ctx3() == 2 &&
+                    knob::attn_sel2() == 16 && knob::idx_grp() == 16 && knob::attn_qt() && knob::attn_front()))
+        die("the serving attention flags: GR8_ATTN_SC2=4 GR8_ATTN_SC2_TR=2 GR8_ATTN_CTX2=4 GR8_ATTN_CTX3=2 GR8_ATTN_SEL2=16 "
+            "GR8_IDX_GRP=16 GR8_ATTN_QT=1 GR8_ATTN_FRONT=1 in the environment, or --stock-attn 1 for its own");
+    if (knob::l2pf()) fprintf(stderr, "note: GR8_L2PF is set; the bench sets the arms itself\n");
     CK(bind::init());
     const int H = g6nr::HMAX, K = g6nr::QBW, N = HID, pages = (T + 63) / 64;
     cudaStream_t st;
@@ -242,7 +242,7 @@ int main(int argc, char** argv)
     printf("GPU %d SMs, clock %d MHz, L2 %.2f MB | TP%d: H %d, q_b 2048 x %d, o_proj %d x %d | T=%d L=%d layers %d s2=%d | stand-ins: "
            "wm %.0f wq %.0f wa %.0f us (arrival %.1f us before the end), moe %.0f MB | budgets %.0f/%.0f/%.0f/%.0f us, <= %.1f MiB a window | "
            "attention %s | reps %d TR %d\n", sms, clk / 1000, l2 / 1e6, g6nr::NR, H, K, K, N, T, L, NL, S2, wm, wq, wa, arr, moe, us[0], us[1],
-           us[2], us[3], mb, STOCK ? "stock flags" : "serving flags", REPS, TR);
+           us[2], us[3], mb, STOCK ? "the environment's flags" : "serving flags", REPS, TR);
     CKI(g6_attn_rope_init(T, st));
 
     // ---- layers: full-index ones spread as 22 of 78 (the others reuse the last full layer's indices)
@@ -399,7 +399,7 @@ int main(int argc, char** argv)
             if ((e = bind::make_gv(bt(y.gkva, {KVA_T, 192, 528}), bind::MXFP8, 2, 16, M, xf, y.kvay, gv::O_F16, B.kv_a))) die(e);
             if (full[l] && (e = bind::make_gv(bt(y.gik, {IDXK_T, 384, 512}), bind::BF16W, 1, 32, M, xb, y.iky, gv::O_F16, B.idx_k))) die(e);
             if ((e = bind::make_gv(bt(y.grt, {16, 384, 512}), bind::BF16W, 2, 16, M, xb, y.rty, gv::O_F32, B.router))) die(e);
-            B.q_a.tpc = B.kv_a.tpc = B.idx_k.tpc = 1;          // qs_narrow's G6_QA_SPLIT_TPC default
+            B.q_a.tpc = B.kv_a.tpc = B.idx_k.tpc = 1;          // qs_narrow's GR8_QA_SPLIT_TPC default
             bind::make_gv_multi({&B.q_a, &B.kv_a, &B.idx_k}, M, B.x_in);
             if ((e = dtr::make_out(y.mq, M, qan, 2048, nullptr, y.qby, K, dtr::O_F16, sc, 0, 0, 1, B.q_b_t))) die(e);
             if ((e = dtr::make_out(y.mo, M, y.att, K, nullptr, y.y, N, dtr::O_BF16, sc, 64, 0, 1, B.o_proj_t))) die(e);

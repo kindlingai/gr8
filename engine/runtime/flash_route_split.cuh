@@ -1,4 +1,4 @@
-// G6_PF_ROUTER_SPLIT transport (opt-in, default off): the prefill MoE router is row-split across the ranks and the route tables
+// GR8_PF_ROUTER_SPLIT transport (opt-in, default off): the prefill MoE router is row-split across the ranks and the route tables
 // (tok_e, tok_w) are exchanged over a dedicated ncoll = 1 fabric per prefill lane (the flash_pool_owner.cuh pattern; not a
 // collective on the prefill fabric: the proxy serves a step's collectives in order and c1 is published after the MoE block).
 // One step per MoE block: publish (own rows) -> hx / shared work runs -> wait + copy peers' rows -> launch_experts with
@@ -8,18 +8,13 @@
 #pragma once
 #include "flash_route_split.h"
 #include "flash_pool_owner.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt {
-// G6_PF_ROUTER_SPLIT: unset = 0, "1" = on (g6m4 dies if the build or topology cannot run it), else die at boot.
+// GR8_PF_ROUTER_SPLIT: unset = 0, 1 = on (g6m4 dies if the build or topology cannot run it).
 inline int flash_route_split_mode()
 {
-    static const int mode = [] {
-        std::string e;
-        const int v = env_choice("G6_PF_ROUTER_SPLIT", 1, 0, &e);
-        if (v < 0) die(e);
-        return v;
-    }();
-    return mode;
+    return knob::pf_router_split() ? 1 : 0;
 }
 struct FlashRouteSplit {
     g6::Fabric* fabric = nullptr;
@@ -64,7 +59,7 @@ inline void init_flash_route_split(FlashRouteSplit& p, g6::Fabric& fabric, int m
     p.fabric = &fabric; p.f = fabric.dev(); p.max_rows = max_rows;
     if (p.f.ncoll != 1 || p.f.nr < 2 || p.f.nr > flash_route_split::MAX_NR ||
         p.f.stride < flash_route_split::payload(max_rows, p.f.nr) + 8)
-        die("G6_PF_ROUTER_SPLIT: invalid dedicated fabric geometry");
+        die("GR8_PF_ROUTER_SPLIT: invalid dedicated fabric geometry");
     p.step = dmalloc<u64>(1); p.ticket = dmalloc<unsigned>(1);
     G6RT_CK(cudaMemset(p.ticket, 0, sizeof(unsigned)));
 }
@@ -72,7 +67,7 @@ inline void init_flash_route_split(FlashRouteSplit& p, g6::Fabric& fabric, int m
 inline void flash_route_publish(FlashRouteSplit& p, const int* tok_e, const float* tok_w, int M, cudaStream_t st)
 {
     if (!p.fabric || M < 1 || M > p.max_rows || !flash_route_split::active(M, p.f.nr) || !p.flow.publish(M))
-        die("G6_PF_ROUTER_SPLIT: publish out of protocol");
+        die("GR8_PF_ROUTER_SPLIT: publish out of protocol");
     p.fabric->enqueue_step(p.flow.current, {uint32_t(flash_route_split::payload(M, p.f.nr))});
     k_pool_step<<<1, 1, 0, st>>>(p.step, p.flow.current);
     k_rs_put<<<RS_PUT_CTA, 128, 0, st>>>(p.f, p.step, p.ticket, tok_e, tok_w, M);
@@ -81,16 +76,16 @@ inline void flash_route_publish(FlashRouteSplit& p, const int* tok_e, const floa
 // before launch_experts: all rows of tok_e / tok_w valid on this stream
 inline void flash_route_receive(FlashRouteSplit& p, int* tok_e, float* tok_w, int M, cudaStream_t st)
 {
-    if (!p.flow.can_receive(M)) die("G6_PF_ROUTER_SPLIT: receive out of protocol");
+    if (!p.flow.can_receive(M)) die("GR8_PF_ROUTER_SPLIT: receive out of protocol");
     glue::k_wait_peers<<<1, 32, 0, st>>>(p.f, p.step, 0, flash_route_split::payload(M, p.f.nr), glue::ERR_AR);
     k_rs_unpack<<<dim3(RS_UNPACK_CTA, p.f.nr), 256, 0, st>>>(p.f, p.step, M, tok_e, tok_w);
     G6RT_CK(cudaGetLastError());
-    if (!p.flow.received(M)) die("G6_PF_ROUTER_SPLIT: receive out of protocol");
+    if (!p.flow.received(M)) die("GR8_PF_ROUTER_SPLIT: receive out of protocol");
 }
 // Call only after compute synchronization and checked proxy drain/stop.
 inline void release_flash_route_split(FlashRouteSplit& p)
 {
-    if (p.flow.awaiting) die("G6_PF_ROUTER_SPLIT: unmatched publish at teardown");
+    if (p.flow.awaiting) die("GR8_PF_ROUTER_SPLIT: unmatched publish at teardown");
     if (p.ticket) G6RT_CK(cudaFree(p.ticket));
     if (p.step) G6RT_CK(cudaFree(p.step));
     p = FlashRouteSplit{};

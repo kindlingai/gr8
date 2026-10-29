@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(256) scores_heads(Input input,int start,const 
  if(lane<nh)out[((int64_t)row*a.heads+h0+lane)*ga::TOP+j]=mine;
 }
 // context_parts_heads: block per (part, half of the 512 dims, head group, row); thread t owns dims d, d+1 for HG heads.
-// PB gathered pairs are loaded per batch (16; G6_ATTN_CTX2=1 / 2: 32 / 64, the same FMAs in the same order).
+// PB gathered pairs are loaded per batch (16; GR8_ATTN_CTX2=1 / 2: 32 / 64, the same FMAs in the same order).
 template<int HG,int PB=16,class Input>
 __global__ void __launch_bounds__(128) context_parts_heads(Input input,int start,const float* probs,float* parts){
  auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2,GROUPS=(D+127)/128;
@@ -107,25 +107,25 @@ __global__ void __launch_bounds__(128) context_parts_heads(Input input,int start
  #pragma unroll
  for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
 }
-// G6_ATTN_SC2=<S> (attn_sc2): scores_heads<16> with S consecutive slots per warp. Each head's 16 latent + 2 RoPE query
+// GR8_ATTN_SC2=<S> (attn_sc2): scores_heads<16> with S consecutive slots per warp. Each head's 16 latent + 2 RoPE query
 // values are loaded once per warp and used for all S slots (Q traffic / S, S independent fmaf chains per head), head loop
 // unrolled. Per (row, head, slot): the same products in the same fmaf order, then the same warp_sum (TR = false) or
-// scores_tr's transpose reduction (TR = true, G6_ATTN_SC2_TR=1: per head the same xor tree, a + b commutes bitwise), the
+// scores_tr's transpose reduction (TR = true, GR8_ATTN_SC2_TR=1: per head the same xor tree, a + b commutes bitwise), the
 // same 1/16 scale, -inf for a dead slot, the same output address -> bit-identical to scores_heads<16>. Validity is per slot
 // and warp-uniform (one id per slot), so every shuffle stays full-warp; a dead slot in a live warp runs on zero operands and
 // stores -inf. Full groups (heads % 16 == 0) or, with PH below, a partial last group. grid dim3(TOP/(4*S), ceil(heads/16), n),
 // block 128: warp w of block x owns slots
 // (4x + w)*S .. +S-1, lane l < 16 stores head h0 + l of them (one S-wide vector store).
-// TR = 2 (G6_ATTN_SC2_TR=2): the same transpose reduction, eager. Every combine of TR = 1 pairs entries i and i + n/2 of the
+// TR = 2 (GR8_ATTN_SC2_TR=2): the same transpose reduction, eager. Every combine of TR = 1 pairs entries i and i + n/2 of the
 // stage, so the head entering it can be computed right before: heads in bit-reversed order (0 8 4 12 2 10 6 14 1 ...), each
 // pair combined at offset 16 at once, two such results at 8, then 4, 2, and the last stage's a += shfl(a, 1). The same
 // combines of the same values (keep / send by the same lane bit) -> TR = 1's bytes, with at most a few partials per slot
-// live instead of 16 (registers). S = 8 (kv alone is 128 registers) is built with TR = 0 only (G6_ATTN_SC2_TR ignored).
-// QT (G6_ATTN_QT, attn.cu use_qt): q / rope are lane-transposed (absorb_m2<R,true>): head hh's 16 latent q of a lane are four
+// live instead of 16 (registers). S = 8 (kv alone is 128 registers) is built with TR = 0 only (GR8_ATTN_SC2_TR ignored).
+// QT (GR8_ATTN_QT, attn.cu use_qt): q / rope are lane-transposed (absorb_m2<R,true>): head hh's 16 latent q of a lane are four
 // float4 (c*32 + lane, c = 0..3: qv[4c + e]) and its 2 rope q one float2 (lane), 5 loads instead of 18; a slot's 4 KV
 // scales are one float4 (row = 41 x 16 B, mla_cache 16 B aligned). The same values in qv / pv / scale -> the same bytes.
 // scores_sc_qt is that kernel, registers capped at 4 blocks / SM (S = 4 is 128 registers without QT).
-// PH (partial heads, G6_ATTN_SC2_PART, attn.cu attn_sc2_part; TP=6 and TP=3: 10 / 11 / 21 / 22 heads a rank): the last
+// PH (partial heads, GR8_ATTN_SC2_PART, attn.cu attn_sc2_part; TP=6 and TP=3: 10 / 11 / 21 / 22 heads a rank): the last
 // head group holds nh = heads - h0 < 16 heads. Heads nh..15 of it load nothing and enter the reductions as 0 (TR = 0:
 // skipped); a real head's partials meet only its own partials in every combine (keep / send pick the same head index on
 // both lanes), so each real head gets the full kernel's bytes, = scores_heads<16>'s with its nh. Only lanes < nh store.
@@ -251,7 +251,7 @@ __global__ void __launch_bounds__(128) scores_sc(Input input,int start,const flo
 template<int S,int TR,class Input,bool PH=false>
 __global__ void __launch_bounds__(128,4) scores_sc_qt(Input input,int start,const float* q,const float* rope,float* out){
  scores_sc_body<S,TR,true,Input,PH>(input,start,q,rope,out,threadIdx.x);}
-// G6_ATTN_CTX2=3 / 4 (attn_ctx2): context_parts_heads<HG> with the per-slot work packed and branch-free. Prologue as
+// GR8_ATTN_CTX2=3 / 4 (attn_ctx2): context_parts_heads<HG> with the per-slot work packed and branch-free. Prologue as
 // context_parts_heads, but slot j's HG probabilities sit together (pm[j], 16 B smem loads), a slot whose row pointer is null
 // gets p = 0 for every head, and the skip is a select: lo = p != 0 ? fmaf(p, x*s, lo) : lo, which is `if (!rows[j]) continue`
 // + `if (p == 0) continue` (-0 and NaN p included). The gathered pairs of the next PB slots are loaded before the current PB
@@ -294,7 +294,7 @@ __global__ void __launch_bounds__(128) context_pk(Input input,int start,const fl
  #pragma unroll
  for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*P+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
 }
-// G6_ATTN_CTX3=1..4 (attn_ctx3): context_pk with less work per slot. Prologue as context_pk (pm[j] = slot j's HG
+// GR8_ATTN_CTX3=1..4 (attn_ctx3): context_pk with less work per slot. Prologue as context_pk (pm[j] = slot j's HG
 // probabilities, 0 for a slot whose KV row is not read), plus the slot's KV row index (kv_row; a slot that is not read points
 // at row 0, which is loaded and never used), its scales (scl[g][j], g = the CTA's 128-dim groups) and, per batch of PB
 // slots, one state from two warp ballots: 0 = no slot read (skipped), 1 = every slot read with all HG probabilities != 0
@@ -305,7 +305,7 @@ __global__ void __launch_bounds__(128) context_pk(Input input,int start,const fl
 // p == 0 (-0 and NaN p as there) -> parts bit-identical. D = dims per CTA: 256 (two CTAs per partition, as
 // context_parts_heads) or 512 (one, the prologue once per partition). grid dim3(P*512/D, ceil(heads/HG), n), block D/2.
 // Rows are 32-bit: the dispatch (use_ctx3) needs page_count * page_size <= INT_MAX.
-// SP = slots per partition, P = TOP/SP partitions: 256 (P = PART, the bytes above); 64 / 128 (G6_ATTN_CTX3_SP, run_body
+// SP = slots per partition, P = TOP/SP partitions: 256 (P = PART, the bytes above); 64 / 128 (GR8_ATTN_CTX3_SP, run_body
 // only, E1): every (row, head, dim) chain runs over SP slots in slot order and merge_parts<P> sums the P partials in
 // partition order, so the 2048-slot sum is regrouped (deterministic, not the same bits).
 template<int HG,int PB,int D,int SP=256,class Input>
@@ -458,49 +458,48 @@ static bool use_fixed_k_decode(const G6Attn& a){
  #endif
  return use_small_decode(a)||(a.reuse_indices&&a.rows<=8);
 }
-// G6_ATTN_FLIP=1 (default off; design-review delta). Attention-only dispatch, launch_index_scores is untouched.
+// GR8_ATTN_FLIP=1 (default off; design-review delta). Attention-only dispatch, launch_index_scores is untouched.
 // Eligible = n 1..8, heads 1..22, and either the release fixed-K request (small decode or reuse rows <= 8, or a batched
-// S2 step) or a genuine fresh decode request (a.rows <= 3). Eligible at context >= G6_ATTN_FLIP_MIN (default 2048, the
+// S2 step) or a genuine fresh decode request (a.rows <= 3). Eligible at context >= GR8_ATTN_FLIP_MIN (default 2048, the
 // GB10 sweep: byte-identical and <= 0.9x cold+hot for M=1..3 from 2048 up): scores_flip<11>, context_flip M=1 HG=4 D=128
 // CB=32 / M>=2 HG=11 D=128 CB=16. The flip is chosen before the head-batched kernels (attn_heads), which stay the default
-// and serve every call the flip does not take. Under G6_ATTN_HEADS=0, a fresh decode request below the minimum runs the
+// and serve every call the flip does not take. Under GR8_ATTN_HEADS=0, a fresh decode request below the minimum runs the
 // fixed-K HG=1 forms, and requests whose reference is the generic context_parts keep scalar e4() (GENERIC_E4); with the
 // head-batched kernels as the reference every request uses fp8_pair. Scores need no mode: latent(v,d) is literally
 // e4(v[d])*scale[d/128]. Off = the dispatch below, unchanged.
 // Host-side, read once (set before graph capture); attn_flip_min() < 0 = off. Tests may assign it.
-static int& attn_flip_min(){static int v=[]{const char* e=getenv("G6_ATTN_FLIP");if(!e||!atoi(e))return -1;
- const char* m=getenv("G6_ATTN_FLIP_MIN");return m&&*m?atoi(m):2048;}();return v;}
-// G6_ATTN_D256=1 (default off; only with G6_ATTN_FLIP): context M=1 HG4 D256 CB16, M>=2 HG8 D256 CB16 + idok dead-slot skip.
+static int& attn_flip_min(){static int v=knob::attn_flip()?int(knob::attn_flip_min()):-1;return v;}
+// GR8_ATTN_D256=1 (default off; only with GR8_ATTN_FLIP): context M=1 HG4 D256 CB16, M>=2 HG8 D256 CB16 + idok dead-slot skip.
 // Host-side, read once (set before graph capture). Tests may assign it.
-static int& attn_flip_d256(){static int v=[]{const char* e=getenv("G6_ATTN_D256");return e&&atoi(e)?1:0;}();return v;}
+static int& attn_flip_d256(){static int v=knob::attn_d256();return v;}
 static bool attn_flip_eligible(const G6Attn& a,int n){
  return attn_flip_min()>=0&&n>=1&&n<=8&&a.heads>=1&&a.heads<=22&&(use_fixed_k_decode(a)||(a.rows>0&&a.rows<=3));}
 static bool use_attn_flip(const G6Attn& a,int n){return attn_flip_eligible(a,n)&&a.context>=attn_flip_min();}
 static bool use_long_fixed_k(const G6Attn& a,int n){return attn_flip_eligible(a,n)&&!use_fixed_k_decode(a);}
-// G6_IDX_VEC=1 (default 0 = off): the per-row index_scores loads its key tile with 16 B
+// GR8_IDX_VEC=1 (default 0 = off): the per-row index_scores loads its key tile with 16 B
 // vector loads (page_size >= 32). Byte-exact; -7.65 ms/step index_scores @S4 L32K. Host-side, read once (set
 // before graph capture). Short decode (use_small_decode) and the DEC_IDX31 shared-key kernel are not affected.
-static bool idx_vec(){static const bool on=getenv("G6_IDX_VEC")&&atoi(getenv("G6_IDX_VEC"))!=0;return on;}
+static bool idx_vec(){return knob::idx_vec();}
 template<class Input>
 static void launch_index_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
  if(use_small_decode(a))small_decode::index_scores<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,w.iq,w.weights,w.si,w.ii);
  else if(idx_vec())index_scores<1><<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,w.iq,w.weights,w.si,w.ii);
  else index_scores<<<dim3((a.context+31)/32,n),128,0,st>>>(input,start,w.iq,w.weights,w.si,w.ii);
 }
-// G6_ATTN_HEADS=0 (read at launch / capture): the per-head scores_direct / context_parts kernels (A/B and tests)
-static bool attn_heads(){static const bool on=!getenv("G6_ATTN_HEADS")||atoi(getenv("G6_ATTN_HEADS"))!=0;return on;}
-// G6_ATTN_SC2=<S> (default 0 = off): scores_sc<S> (S = 1, 2, 4, 8 slots per warp) for the scores_heads<16> calls;
-// G6_ATTN_SC2_TR=1 adds scores_tr's transpose reduction, =2 the same reduction eager (S = 8: TR 0 only).
+// GR8_ATTN_HEADS=0 (read at launch / capture): the per-head scores_direct / context_parts kernels (A/B and tests)
+static bool attn_heads(){return knob::attn_heads();}
+// GR8_ATTN_SC2=<S> (default 0 = off): scores_sc<S> (S = 1, 2, 4, 8 slots per warp) for the scores_heads<16> calls;
+// GR8_ATTN_SC2_TR=1 adds scores_tr's transpose reduction, =2 the same reduction eager (S = 8: TR 0 only).
 // Bit-identical. Host-side, read once (before graph capture). Tests may assign them.
-static int& attn_sc2(){static int v=[]{const char* e=getenv("G6_ATTN_SC2");const int x=e?atoi(e):0;return x==1||x==2||x==4||x==8?x:0;}();return v;}
-static int& attn_sc2_tr(){static int v=[]{const char* e=getenv("G6_ATTN_SC2_TR");const int x=e?atoi(e):0;return x==1||x==2?x:0;}();return v;}
-// G6_ATTN_SC2_PART (default 1; 0 = off): scores_sc (and QT) also serve a head count that is not a multiple of 16 (TP=6:
+static int& attn_sc2(){static int v=int(knob::attn_sc2());return v;}
+static int& attn_sc2_tr(){static int v=int(knob::attn_sc2_tr());return v;}
+// GR8_ATTN_SC2_PART (default 1; 0 = off): scores_sc (and QT) also serve a head count that is not a multiple of 16 (TP=6:
 // 10 / 11 heads a rank, TP=3: 21 / 22) with the partial-head forms (scores_sc_body PH), bit-identical to scores_heads<16>.
 // Off: those calls take scores_heads<16> as before. Inert at a multiple of 16 (TP=4). Host-side, read once. Tests may assign it.
-static int& attn_sc2_part(){static int v=[]{const char* e=getenv("G6_ATTN_SC2_PART");return e&&*e?(atoi(e)!=0):1;}();return v;}
+static int& attn_sc2_part(){static int v=knob::attn_sc2_part();return v;}
 static bool sc2_heads_ok(const G6Attn& a){return a.heads%16==0||(attn_sc2_part()&&a.heads>0);}
 // qt (run_body, attn.cu use_qt: S = 2 / 4 only): scores_sc_qt on the lane-transposed q / rope
-// PH: the partial-head instantiations (a.heads % 16 != 0, G6_ATTN_SC2_PART), grid y = ceil(heads / 16)
+// PH: the partial-head instantiations (a.heads % 16 != 0, GR8_ATTN_SC2_PART), grid y = ceil(heads / 16)
 template<int S,bool PH,class Input>
 static void launch_scores_qt(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
  const dim3 g(TOP/(4*S),(a.heads+15)/16,n);const int tr=attn_sc2_tr();
@@ -532,7 +531,7 @@ static void launch_scores_sc(const G6Attn& a,Input input,Work& w,int start,int n
  if(a.heads%16==0)launch_scores_sc_ph<false>(a,input,w,start,n,st,qt);
  else launch_scores_sc_ph<true>(a,input,w,start,n,st,qt);
 }
-// G6_ATTN_CTX2 (attn.cu attn_ctx2): the context_parts_heads calls (HG 4 up to 4 rows, then 8) under the same head groups
+// GR8_ATTN_CTX2 (attn.cu attn_ctx2): the context_parts_heads calls (HG 4 up to 4 rows, then 8) under the same head groups
 template<int HG,class Input>
 static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
  const dim3 g(PART*2,(a.heads+HG-1)/HG,n);
@@ -542,7 +541,7 @@ static void launch_ctx2(const G6Attn& a,Input input,Work& w,int start,int n,cuda
   case 3:small_decode::context_pk<HG,16,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;
   case 4:small_decode::context_pk<HG,32,256><<<g,128,0,st>>>(input,start,w.prob,w.parts);break;}
 }
-// G6_ATTN_CTX3 (attn.cu attn_ctx3): context_pk3 on the context_parts_heads calls; head group G6_ATTN_CTX3_HG, else as there.
+// GR8_ATTN_CTX3 (attn.cu attn_ctx3): context_pk3 on the context_parts_heads calls; head group GR8_ATTN_CTX3_HG, else as there.
 // Only while every KV row index fits in 32 bits (page() bounds a page by the fixed page_count).
 // Not with remote rows: their slots sit outside mla_cache.
 static bool use_ctx3(const G6Attn& a){return attn_ctx3()&&!a.rt_page&&(int64_t)a.page_count*a.page_size<=INT_MAX;}
@@ -569,18 +568,18 @@ static void launch_ctx3(const G6Attn& a,Input input,Work& w,int start,int n,cuda
   case 8:launch_ctx3_hg<8>(a,input,w,start,n,st,sp);break;
   default:launch_ctx3_hg<4>(a,input,w,start,n,st,sp);break;}
 }
-// G6_ATTN_P11 decode tile retune. Host-side, read once (set before graph
-// capture). G6_ATTN_P11=0 -> the old head-batched path (scores_heads<16>, context_parts_heads HG4/HG8 x D256), unchanged.
-// Default OFF (G6_ATTN_P11=1 turns it on). Compile switch: -DATTN_P11_OLD=1 forces the old path regardless of the env. Only the attn_heads() branch
-// changes; G6_ATTN_FLIP still takes precedence, G6_ATTN_HEADS=0 still selects the per-head kernels.
+// GR8_ATTN_P11 decode tile retune. Host-side, read once (set before graph
+// capture). GR8_ATTN_P11=0 -> the old head-batched path (scores_heads<16>, context_parts_heads HG4/HG8 x D256), unchanged.
+// Default OFF (GR8_ATTN_P11=1 turns it on). Compile switch: -DATTN_P11_OLD=1 forces the old path regardless of the env. Only the attn_heads() branch
+// changes; GR8_ATTN_FLIP still takes precedence, GR8_ATTN_HEADS=0 still selects the per-head kernels.
 static bool attn_p11(){
  #if defined(ATTN_P11_OLD) && ATTN_P11_OLD
  return false;
  #else
- static const bool on=getenv("G6_ATTN_P11")&&atoi(getenv("G6_ATTN_P11"))!=0;return on;
+ return knob::attn_p11();
  #endif
 }
-// G6_ATTN_CTX3_SP (attn.cu attn_ctx3_sp, E1): the slots per partition of a run_body call's context, 64 / 128 exactly when
+// GR8_ATTN_CTX3_SP (attn.cu attn_ctx3_sp, E1): the slots per partition of a run_body call's context, 64 / 128 exactly when
 // launch_context_parts reaches launch_ctx3 (no FLIP, the head-batched kernels, no P11, use_ctx3); 256 otherwise. run_body
 // passes it to launch_context_parts and merges TOP/sp partials; the CP calls keep 256 (their merges assume PART).
 static int ctx_sp(const G6Attn& a,int n){
@@ -591,17 +590,17 @@ static int ctx_sp(const G6Attn& a,int n){
  #endif
 }
 // Context length used to pick the tile. a.context at capture is the cell window, not the live length (live_context is
-// device-side), so graphs captured per context bucket get the right row; G6_ATTN_TILE_L=<L> overrides (A/B, tests).
-static int attn_tile_l(const G6Attn& a){static const int f=[]{const char* e=getenv("G6_ATTN_TILE_L");return e&&*e?atoi(e):0;}();return f>0?f:a.context;}
+// device-side), so graphs captured per context bucket get the right row; GR8_ATTN_TILE_L=<L> overrides (A/B, tests).
+static int attn_tile_l(const G6Attn& a){static const int f=int(knob::attn_tile_l());return f>0?f:a.context;}
 // Shape -> context tile (HG heads x D dims per CTA), from the measured best-unfused rows (GB10, 2000 MHz, 16 heads
 // per rank, n = S x 3 batched S2 rows). Rows: n >= 10 (S4), 5..9 (S2), <= 4 (S1). Columns: L <= 512 | L <= 1024 | L > 1024.
 // Measured: S4 L512 4x128, L1024 8x128, L2048 16x256, L32768 16x256; S2 L512 8x128, L2048 8x256; S1 L512 4x128, L2048 4x256.
 // Not measured (nearest measured row used): S2/S1 at L 513..1024 (= their L512 tile), S2/S1 above 2048 (= their L2048 tile).
-// G6_ATTN_CTX_TILE=<HG>x<D> (e.g. 16x256) forces one tile for every shape (A/B); unknown values are ignored.
+// GR8_ATTN_CTX_TILE=<HG>x<D> (e.g. 16x256) forces one tile for every shape (A/B); the table lists the tiles launch_context_tile has.
 struct CtxTile{int hg,d;};
 static CtxTile attn_ctx_tile(const G6Attn& a,int n){
- static const int force=[]{const char* e=getenv("G6_ATTN_CTX_TILE");if(!e||!*e)return 0;   // "<HG>x<D>", no <cstdio> needed
-  const int h=atoi(e);const char* x=e;while(*x&&*x!='x')x++;const int d=*x?atoi(x+1):0;return h>0&&d>0?h*1000+d:0;}();
+ static const int force=[]{const auto& t=knob::attn_ctx_tile();if(!t)return 0;   // "<HG>x<D>", one of the table's values
+  const char* e=t->c_str();const int h=atoi(e);const char* x=e;while(*x!='x')x++;return h*1000+atoi(x+1);}();
  if(force)return {force/1000,force%1000};
  static const CtxTile T[3][3]={
   /* S1 n<=4  */ {{4,128},{4,128},{4,256}},

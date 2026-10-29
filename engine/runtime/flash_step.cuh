@@ -35,8 +35,7 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     if(max_rows>MX) die("Flash main model currently supports decode rows only (no prefill)");
     m.rank=rank; m.nl=(int)ids.size(); m.f=f; m.stepp=stepp;
     if(f.ncoll!=m.ncoll()) die("Flash fabric ncoll must be 2 * layers + 1");
-    const char* be=getenv("G6_DEC_BK");
-    m.nbk=context_buckets(m.bk,be?atoi(be):2048,capacity,0);
+    m.nbk=context_buckets(m.bk,(int)knob::dec_bk(),capacity,0);
 #ifdef DEC_S2
     m.s2_run_pages=(capacity+63)/64;
 #endif
@@ -115,7 +114,7 @@ inline void prepare_flash(Model& m,int M,cudaStream_t st) {
         if(!y.kda) prepare_dsa_layer(m,i,M,st);
         if(!y.flash_mlp[M].M) {
             if(const char* e=flash_mlp::make(y.flash_mlp_w,M,m.xn2,m.sc.part[1],m.plan,m.flash_mlp_sc,m.sc,y.flash_mlp[M],-1,m.x2)) die(e);
-            y.flash_mlp[M].topk=m.flash_draft ? geom::TOPK : moe_topk_cut(geom::TOPK);   // G6_MOE_TOPK: main model only, the drafter keeps the model's top-k
+            y.flash_mlp[M].topk=m.flash_draft ? geom::TOPK : (int)knob::moe_topk();   // GR8_MOE_TOPK: main model only, the drafter keeps the model's top-k
 #ifdef DEC_SLOT
             const dslot::Slot mlp_slot=make_flash_slot(m,2*i+1);
             y.flash_mlp[M].k1.a.slot=mlp_slot;
@@ -133,7 +132,7 @@ inline void launch_embed_flash(Model& m,int M,cudaStream_t st) {
     flash_mhc::k_mhc_embed<<<M,flash_mhc::THREADS,0,st>>>(mhc_buffers(m),m.tok,m.emb,HID,geom::RMS_EPS_FLASH);
     launch_mhc_input(m,0,false,M,st);
 }
-// G6_PF_XTRACE=1 (prefill measurement only): one record of PX_W u64 per (step % PX_STEPS, collective) in device memory.
+// GR8_PF_XTRACE=1 (prefill measurement only): one record of PX_W u64 per (step % PX_STEPS, collective) in device memory.
 // globaltimer ns: [PX_PROD] producer end (before the put), [PX_PUT] put + doorbell done, [PX_ENTRY] first consumer CTA
 // entry, [PX_WMIN]/[PX_WMAX] first/last consumer CTA past the wait, [PX_END] mHC end; [PX_M] rows, [PX_STEP] step + 1.
 namespace pxt {
@@ -154,7 +153,7 @@ struct MhcFabricBlock {
     int c;
     size_t wait_payload=0;
     const __nv_bfloat16* local_part=nullptr;
-    unsigned long long* pxt=nullptr;      // G6_PF_XTRACE records (prefill), null = off
+    unsigned long long* pxt=nullptr;      // GR8_PF_XTRACE records (prefill), null = off
     const __nv_bfloat16* peer_part=nullptr; // NR == 2 prefill: the peer's partial already copied to device memory
     unsigned long long* xr=nullptr;
     const unsigned short* base[g6nr::NR]={};
@@ -255,11 +254,8 @@ inline void flash_mark(int fmk,void* p) {
     dmark(dp[fmk],(cudaStream_t)p);
 }
 inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
-    static const int mhc_fuse_m1 = getenv("G6_MHC_FUSE_M1") ? atoi(getenv("G6_MHC_FUSE_M1")) : (getenv("G6_MHC_FUSE") ? atoi(getenv("G6_MHC_FUSE")) : 2);
-    static const int mhc_fuse_m4 = getenv("G6_MHC_FUSE_M4") ? atoi(getenv("G6_MHC_FUSE_M4")) : (getenv("G6_MHC_FUSE") ? atoi(getenv("G6_MHC_FUSE")) : 2);
-    const int mhc_fuse = M == 1 ? mhc_fuse_m1 : mhc_fuse_m4;
-    static const bool stage_on = !getenv("G6_DEC_MHC_STAGE") || atoi(getenv("G6_DEC_MHC_STAGE"));
-    const bool stage = stage_on && (M == 1 || M == 4);
+    const int mhc_fuse = (int)(M == 1 ? knob::mhc_fuse_m1() : knob::mhc_fuse_m4()).value_or(knob::mhc_fuse());
+    const bool stage = knob::dec_mhc_stage() && (M == 1 || M == 4);
     const size_t payload = (size_t)M*HID*2;
     dmark(DP_OTHER,st);
     if (mhc_fuse == 0)
@@ -355,7 +351,7 @@ inline void launch_step_flash(Model& m,int M,int context,cudaStream_t st,int par
     EvProf& ep=ev_prof();
     if(part!=1) ep.n=0;
     ep.rec=ep.every>0;
-    if(ep.rec || getenv("G6_DEC_PROF")) { g6_attn_mark=attn_mark; g6_flash_mark=flash_mark; }
+    if(ep.rec || knob::dec_prof()) { g6_attn_mark=attn_mark; g6_flash_mark=flash_mark; }
     if(part!=1) { dmark(DP_OTHER,st); launch_step_in(m,st); launch_embed_flash(m,M,st); if(residual_copy) residual_copy(0,M); dmark(DP_STEP,st); }
     for(int i=part==1?ls:0;i<(part==0?ls:m.nl);++i) {
         if(geom::is_kda(m.layers[i].l)) launch_kda_block(m,i,M,st);

@@ -1,4 +1,4 @@
-"""The embedding rows engine/runtime/dflreplay.cu needs: every bonus token of a G6_DFL_DUMP's draft steps, and the mask.
+"""The embedding rows engine/runtime/dflreplay.cu needs: every bonus token of a GR8_DFL_DUMP's draft steps, and the mask.
 
 python3 engine/ref/dflreplay_emb.py DUMP --src DRAFTER --glm GLM_DIR --out DIR/emb.bin
 

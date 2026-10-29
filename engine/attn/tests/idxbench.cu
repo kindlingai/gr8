@@ -114,7 +114,7 @@ int main(int argc,char** argv){
 #if defined(G6_CP) && G6_CP
         if(cp)t_cp=timed(st,reps,[&]{for(int g=0;g<cp;g++)CK(ga::cp_group_body(b,in2,W2,W2.q,W2.rope,part,st));});
 #endif
-        {   // FLIPCHK (release gate): G6_ATTN_FLIP off vs on through the engine dispatch. Per mode: re-run the
+        {   // FLIPCHK (release gate): GR8_ATTN_FLIP off vs on through the engine dispatch. Per mode: re-run the
             // index select (IDs in order), then launch_mla_scores (raw QK) -> normalize (probs) -> launch_context_parts
             // (all 8 partials) -> merge_parts (context). Every byte must match. Exit 4 on any difference.
             if(REUSE){b.reuse_indices=dind;b.reuse_rows=M;}

@@ -3,7 +3,7 @@
 //
 // Two forms of the cells of a step (the same S2In, one kernel):
 //  - per session: cells[session slot][layer] = the session's bounds (context, page_count = the pool's pages, table_size =
-//    pages, reuse_rows = rows of a shared-index layer). One attention call per session and layer (G6_S2_ATTN_PERSESSION=1).
+//    pages, reuse_rows = rows of a shared-index layer). One attention call per session and layer (GR8_S2_ATTN_PERSESSION=1).
 //    page_count only bounds a table entry. The slot's pages may sit anywhere in the pool, and its table holds -1 past them.
 //  - batched: one cell per layer for ALL rows of the step (bcells[layer], its `rows` pointer fixed at init) and, per layer,
 //    one G6AttnRow per step row (rows[layer][row]): the bounds and the block table of the session the row belongs to. Cell

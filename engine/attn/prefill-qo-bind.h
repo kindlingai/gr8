@@ -1,7 +1,7 @@
 #pragma once
 #include "bind.h"
-// Row-owner (query-owned) prefill attention for the runtime's G6_PF_OWN=3 mode (engine/runtime/QO-INTEGRATION.md), and
-// the 32-head states of the TP4 pair-owner mode G6_PF_OWN=4 (docs/DESIGN-QO-PAIR.md).
+// Row-owner (query-owned) prefill attention for the runtime's GR8_PF_OWN=3 mode (engine/runtime/QO-INTEGRATION.md), and
+// the 32-head states of the TP4 pair-owner mode GR8_PF_OWN=4 (docs/DESIGN-QO-PAIR.md).
 // One state per layer: private FP16 copies of the 64-head (or 32-head) UK / UV, plus a workspace shared by every state that
 // names the same storage owner (FP16 key table, absorbed Q, FP32 context, FP16 context, one cuBLAS handle).
 // The binding passed to run supplies the layer's latent cache (replicated on every rank, already appended for the
@@ -15,9 +15,9 @@ struct G6AttnQoStep {
     const int* ids;             // device [rows][2048] selected positions, -1 padding (indexer order)
     void* out;                  // FP16 [rows][heads*256]: per head UV x context, the o_proj input
 };
-// uk: [H,192,512] BF16, uv: [H,256,512] BF16 (logical head order), H = 64, or 32 in a TP4 build (G6_PF_OWN=4).
+// uk: [H,192,512] BF16, uv: [H,256,512] BF16 (logical head order), H = 64, or 32 in a TP4 build (GR8_PF_OWN=4).
 // max_rows: owner rows per call.
-// Kernel read once at create: G6_PF_QO=b (default: FP16 key-view prepass + core_b) | v1 (prototype, records direct) |
+// Kernel read once at create: GR8_PF_QO=b (default: FP16 key-view prepass + core_b) | v1 (prototype, records direct) |
 // r1 (the R1 variant, compiled in when engine/attn/prefill-qo-r1.cuh exists). No persisting-L2 window is set here.
 extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
                                  int max_rows, void* stream, G6AttnQo* storage_owner);
@@ -30,7 +30,7 @@ extern "C" void g6a_qo_prof(int on, double* ms);
 // (contents are scratch), then a stream sync. cuBLAS's first call per (handle, shape) costs ~0.1-0.4 s on the host.
 extern "C" int g6a_qo_warm(G6AttnQo*, int rows, void* stream);     // private weights + workspace (root only)
 extern "C" int g6a_qo_release(G6AttnQo*);
-// G6_PF_QP_ROLL (rolling pair pack): reconvert a state's FP16 UK / UV from new BF16 uk / uv of the same head count, on
+// GR8_PF_QP_ROLL (rolling pair pack): reconvert a state's FP16 UK / UV from new BF16 uk / uv of the same head count, on
 // `stream`, with create's kernels (so the FP16 bytes equal a state created from those tensors). The caller orders it
 // after every run that read the old weights.
 extern "C" int g6a_qo_load(G6AttnQo*, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream);

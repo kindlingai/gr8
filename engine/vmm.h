@@ -1,5 +1,5 @@
 // Device memory through the CUDA VMM API (cuMemCreate + cuMemMap into one reserved range) in place of one cudaMalloc:
-// the weight image under G6_IMG_VMM (runtime/packfind.h rs_fill) and k1_audit --alloc vmm. Same bytes, same offsets;
+// the weight image under GR8_IMG_VMM (runtime/packfind.h rs_fill) and k1_audit --alloc vmm. Same bytes, same offsets;
 // only the physical backing differs: the range is built from chunks of `chunk` bytes (a multiple of the device's
 // allocation granularity, 2 MB on GPUs with large pages), each a physical allocation of its own. Whether that gives
 // the GPU larger pages than a cudaMalloc of the same size is what k1_audit --alloc vmm --tlb measures on a GB10.

@@ -1,4 +1,4 @@
-// G6_CP_STEP_ROWS / G6_CP_STEP_SEG (s2/cp_rows.h, Driver::step): a step past R carries at most n rows. Properties:
+// GR8_CP_STEP_ROWS / GR8_CP_STEP_SEG (s2/cp_rows.h, Driver::step): a step past R carries at most n rows. Properties:
 //   1. cp_after(bk, R) splits the contexts exactly as the engine's CP test does (bk[bucket_of(ctx)] > R, context_buckets.h).
 //   2. the boot parse: off, the minimum (solo rows), the clamp to the widest S2 step, junk refused.
 //   3. CpRound::pick on hand-made rounds: fits / no past-R session = everyone; cycles of past-R-first rounds of n / per
@@ -68,15 +68,12 @@ static void after_tests()
 static void parse_tests()
 {
     std::string e;
-    CHECK(cp_step_rows_env(nullptr, 8, 24, &e) == 0);
-    CHECK(cp_step_rows_env("", 8, 24, &e) == 0);
-    CHECK(cp_step_rows_env("0", 8, 24, &e) == 0);
-    CHECK(cp_step_rows_env("8", 8, 24, &e) == 8);
-    CHECK(cp_step_rows_env("12", 8, 24, &e) == 12);
-    CHECK(cp_step_rows_env("24", 8, 24, &e) == 24);
-    CHECK(cp_step_rows_env("32", 8, 24, &e) == 24);          // clamped to the widest S2 step
-    e.clear(); CHECK(cp_step_rows_env("7", 8, 24, &e) == -1 && e.find("at least 8") != std::string::npos);
-    for (const char* bad : {"x", "8x", "-8", "1e3", "99999"}) { e.clear(); CHECK(cp_step_rows_env(bad, 8, 24, &e) == -1 && !e.empty()); }
+    CHECK(cp_step_rows(0, 8, 24, &e) == 0);
+    CHECK(cp_step_rows(8, 8, 24, &e) == 8);
+    CHECK(cp_step_rows(12, 8, 24, &e) == 12);
+    CHECK(cp_step_rows(24, 8, 24, &e) == 24);
+    CHECK(cp_step_rows(32, 8, 24, &e) == 24);          // clamped to the widest S2 step
+    e.clear(); CHECK(cp_step_rows(7, 8, 24, &e) == -1 && e.find("at least 8") != std::string::npos);
 }
 
 // ---- 3. CpRound on hand-made rounds ----

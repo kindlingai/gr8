@@ -34,7 +34,7 @@ struct FabricConfig {
   // of a peer's (identity placement)
   size_t bulk_bytes = 0;
   int bulk_flags = 0;
-  int xtrace = 0;                 // 1 = stage-0 trace records on this fabric when env G6_XTRACE=1 (xtrace.h); uniform layout only
+  int xtrace = 0;                 // 1 = stage-0 trace records on this fabric when env GR8_XTRACE=1 (xtrace.h); uniform layout only
   // switchless ring (fabric.cpp, RelayHdr): QPs on four local devices to the two cabled neighbours, and at TP=4 the
   // diagonal relayed by the next rank. ips then only says where the TCP bootstrap goes (the LAN).
   bool ring = false;
@@ -44,7 +44,7 @@ struct FabricConfig {
 
 // bulk mode kernel view (pinned host, device-mapped). flags[(f * nr + p) * 2 + {0, 1}] = {val, aux} written by peer p as
 // two ordered 8-B writes, aux first, then val (my own slot unused): read val (acquire), then aux. aux = the sender's
-// aux_out[f] when the job was posted (a payload checksum in G6_CP_PF_VERIFY mode, else whatever the GPU left there)
+// aux_out[f] when the job was posted (a payload checksum in GR8_CP_PF_VERIFY mode, else whatever the GPU left there)
 struct BulkDev {
   char* bulk;
   unsigned long long* flags;     // [bulk_flags][nr][2]
@@ -63,7 +63,7 @@ struct FabricDev {
   int rank, nr, ncoll;
   size_t stride;               // slot stride = round_up(slot_bytes + 8, 256); tail = u64 seq at [payload_bytes]
                                // (0 for a variable-layout fabric: use Fabric::vslot)
-  unsigned long long* xt = nullptr;   // G6_XTRACE stage-0 GPU records (device memory, xtrace.h); null = off (default)
+  unsigned long long* xt = nullptr;   // GR8_XTRACE stage-0 GPU records (device memory, xtrace.h); null = off (default)
 };
 
 // seq for collective c of step s (unique, never 0)
@@ -108,21 +108,21 @@ class Fabric {
   // than ncoll (the proxy handles 0..sizes.size()-1 in order).
   // reduce-scatter form: collectives whose bit is set in rs_mask send slice p (at send + p * ss, rs_bytes[p] bytes)
   // to peer p only, into p's recv slot [c][me] at offset 0, tail right after it; sizes[c] is ignored for them.
-  // skip: collectives the proxy neither waits for nor sends this step (G6_PF_OWN=3 has no collective 0)
+  // skip: collectives the proxy neither waits for nor sends this step (GR8_PF_OWN=3 has no collective 0)
   // mask / skip bits address collectives 0..31 only; bit c >= 32 reads as 0 (fabric.cpp bit()).
   // p2p: reduce-scatter collectives (bits also set in mask) whose slice goes to `peer` only; the other peers get no
-  // write (G6_PF_OWN=4: the attention partial of the counterpart's rows, collective 0)
+  // write (GR8_PF_OWN=4: the attention partial of the counterpart's rows, collective 0)
   struct Rs { unsigned mask = 0; size_t ss = 0; std::vector<uint32_t> bytes; unsigned skip = 0; unsigned p2p = 0; int peer = -1; };
   void enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes, const Rs& rs);
   // bulk mode: one proxy job, in enqueue order: wait doorbell[db] >= seq; if wait_flag >= 0 wait flags[wait_flag][p] >=
   // wait_min for every peer p; RDMA-write every (offset, bytes) range of my bulk area to every peer at the same offset;
   // then (post_flag >= 0) write aux_out[post_flag] then post_val into flags[post_flag][me] of every peer (two 8-B inline
-  // writes on the same QP after the ranges; in-order RC delivery is ASSUMED, checked by G6_CP_PF_VERIFY).
+  // writes on the same QP after the ranges; in-order RC delivery is ASSUMED, checked by GR8_CP_PF_VERIFY).
   // A CQ error, a bad completion, or 60 s without a completion while a send queue is full sets the error word
   // (bulk_proxy.h codes) and stops the proxy.
   // wait_flag compares the val word. Ranges: offset and bytes multiples of 8.
   // peer: -1 = every peer (as above); k = peer k only: the wait_flag spin reads only flags[wait_flag][k], and the ranges
-  // and the post_flag writes go to k only (G6_PF_QP_ROLL: the pair partner's half image, qp_wire.h)
+  // and the post_flag writes go to k only (GR8_PF_QP_ROLL: the pair partner's half image, qp_wire.h)
   struct BulkJob { int db = -1; unsigned long long seq = 0; int wait_flag = -1; unsigned long long wait_min = 0;
                    std::vector<std::pair<uint64_t, uint32_t>> ranges; int post_flag = -1; unsigned long long post_val = 0;
                    int peer = -1; };
@@ -134,7 +134,7 @@ class Fabric {
   bool wait_proxy_idle(double stall_s = 180.0);
   // host-side barrier over TCP (slow; setup/teardown only)
   void barrier();
-  // G6_XTRACE: write the GPU + proxy records and the per-QP WC error counters (stop_proxy calls it; once per fabric)
+  // GR8_XTRACE: write the GPU + proxy records and the per-QP WC error counters (stop_proxy calls it; once per fabric)
   void xtrace_dump(const char* why);
 
   struct Impl;

@@ -1,16 +1,19 @@
-"""CPU checks of the G6_MOE_TOPK cut (flash-G4), no GPU:
+"""CPU checks of the GR8_MOE_TOPK cut (flash-G4), no GPU:
 
     python3 engine/tests/test_moe_topk_source.py -v
 
 1. OFF surface: the K1 / TR3 consumers, the plan layout and the GLM decode call site are a5edf0a's bytes; the cut's
-   defaults are the model top-k (k_router_plan<K = TOPK>, Expert::topk = TOPK, moe_topk_cut unset -> model top-k); K is a
+   defaults are the model top-k (k_router_plan<K = TOPK>, Expert::topk = TOPK, the MOE_TOPK knob unset -> 8); K is a
    template parameter, K = TOPK keeps the pre-cut source (SASS-identical, receipt /tmp/g4-sass2/cmp.log); the MTP drafter
    keeps the model's top-k (Block::topk set in prepare_flash only for the main model).
 2. The routing rule the kernels implement (glue.cuh k_router_plan, bind_prefill.cuh k_pf_route), as a NumPy reference:
    K = TOPK is the unchanged rule; K < TOPK keeps the first K of the same selection order and renormalizes over them.
-OFF byte identity of the built engine is a GPU check (m4sim stdout, base vs G4 build).
+OFF byte identity of the built engine is a GPU check (m4sim stdout, base vs G4 build). The base-bytes case compares with
+BASE; a checkout without it skips that case. The knob table (engine/knobs-rs) parses and range-checks the value; its
+cases are engine/tests/test_moe_topk_env.cpp.
 """
 import os
+import re
 import subprocess
 import unittest
 
@@ -26,10 +29,17 @@ def src(name):
         return f.read()
 
 
-class OffSurface(unittest.TestCase):
-    UNTOUCHED = ['engine/kernels/k1.cuh', 'engine/kernels/k1args.cuh', 'engine/kernels/tr3.cuh', 'engine/kernels/bind.cuh',
-                 'engine/runtime/rank.cuh', 'engine/model_geom.h']
+def have_base():
+    return subprocess.run(['git', '-C', ROOT, 'cat-file', '-e', f'{BASE}^{{commit}}'],
+                          stderr=subprocess.DEVNULL).returncode == 0
 
+
+class OffSurface(unittest.TestCase):
+    # rank.cuh is not here: the move to the knob table changed its bytes after BASE
+    UNTOUCHED = ['engine/kernels/k1.cuh', 'engine/kernels/k1args.cuh', 'engine/kernels/tr3.cuh', 'engine/kernels/bind.cuh',
+                 'engine/model_geom.h']
+
+    @unittest.skipUnless(have_base(), f'commit {BASE} is not in this checkout')
     def test_consumers_are_base_bytes(self):
         for name in self.UNTOUCHED:
             base = subprocess.check_output(['git', '-C', ROOT, 'show', f'{BASE}:{name}']).decode()
@@ -41,17 +51,18 @@ class OffSurface(unittest.TestCase):
         self.assertIn('int topk = TOPK;', src('engine/kernels/bind_prefill.cuh'))
         self.assertIn('template <int K = TOPK> __global__ void __launch_bounds__(256) k_pf_route(Expert A)', src('engine/kernels/bind_prefill.cuh'))
         self.assertIn('int topk = geom::TOPK;', src('engine/kernels/flash_mlp.cuh'))
-        env = src('engine/runtime/envparse.h')
-        self.assertIn('env_digit("G6_MOE_TOPK", 1, model_topk, model_topk, &err)', env)
+        self.assertIn('A.topk = static_cast<int>(knob::moe_topk());', src('engine/kernels/bind_prefill.cuh'))
+        # the table: an int of 1..8 (the model's top-k), and unset keeps the model's top-k
+        self.assertRegex(src('engine/knobs-rs/src/table.rs'), r'\n    MOE_TOPK: agree int (= "8"|\? "[^"]*"), "1\.\.8";')
         # the GLM decode call site passes no K (default TOPK)
         self.assertIn('glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan);',
                       src('engine/runtime/rank.cuh'))
 
     def test_drafter_keeps_model_topk(self):
         step = src('engine/runtime/flash_step.cuh')
-        self.assertIn('topk=m.flash_draft ? geom::TOPK : moe_topk_cut(geom::TOPK)', step)
+        self.assertIn('topk=m.flash_draft ? geom::TOPK : (int)knob::moe_topk()', step)
         # the only other flash_mlp::launch caller is the main-model prefill P1 path
-        self.assertIn('b.topk = moe_topk_cut(geom::TOPK);', src('engine/runtime/flash_prefill.cuh'))
+        self.assertIn('b.topk = (int)knob::moe_topk();', src('engine/runtime/flash_prefill.cuh'))
 
     def test_expert_topk_is_last_member(self):
         pf = src('engine/kernels/bind_prefill.cuh')
@@ -62,11 +73,13 @@ class OffSurface(unittest.TestCase):
         self.assertLess(body.index('int f12'), body.index('int topk = TOPK'))      # layout of the pre-cut members unchanged
 
     def test_boot_validation_in_both_mains(self):
-        for name in ('engine/runtime/g6m4.cu', 'engine/runtime/m4sim.cu'):
-            s = src(name)
-            self.assertIn('env_digit("G6_MOE_TOPK", 1, geom::TOPK, geom::TOPK, &e)', s, name)
-            self.assertIn('if (tk < 0) die(e);', s, name)
-            self.assertIn('die("G6_MOE_TOPK is a Flash-model option', s, name)
+        g = src('engine/runtime/g6m4.cu')      # the knob table refuses a value outside 1..8 at knob::init()
+        self.assertIn('static_assert(geom::TOPK == 8,', g)
+        self.assertIn('if (const int tk = (int)knob::moe_topk(); tk < geom::TOPK)', g)
+        self.assertIn('if (knob::moe_topk() != geom::TOPK) die("GR8_MOE_TOPK is a Flash-model option', g)
+        m = src('engine/runtime/m4sim.cu')     # the knob table refuses a value outside 1..8 at knob::init()
+        self.assertIn('const int tk = (int)knob::moe_topk();', m)
+        self.assertIn('if ((int)knob::moe_topk() != geom::TOPK) die("GR8_MOE_TOPK is a Flash-model option', m)
 
     def test_dropped_routes_skipped(self):
         pf = src('engine/kernels/bind_prefill.cuh')

@@ -24,7 +24,7 @@ struct G6RtGroup {
     int slots, rows, cap, hand, n;  // n: misses of the last resolve (the wait skips at 0)
     int kbase;                      // the row of the store's first record (released pages only: page_count * 64)
     unsigned long long local;       // misses the pool had no room for: read from the local copy
-    // G6_RT_FMT=int4: the store's records hold INT4 rows (kvfmt.h int4row), and the helper reads each into the tail of
+    // GR8_RT_FMT=int4: the store's records hold INT4 rows (kvfmt.h int4row), and the helper reads each into the tail of
     // its FP8 slot (out + slot * nl * 656 + soff); after the wait, rt_unpack turns it into that slot's FP8 rows in place.
     // out nullptr: FP8 records, read straight into the slots
     unsigned char *out;
@@ -35,7 +35,7 @@ struct G6Attn {
     const void *q_b, *kv_a, *kv_norm;
     const void *index_q, *index_k, *index_weight, *index_norm, *index_bias;
     const void *uk, *uv;
-    // uks / uvs non-null (#50, G6_KVB=fp8): uk / uv hold the release's E4M3 kv_b bytes in the BF16 layouts (uk [h][512][192],
+    // uks / uvs non-null (#50, GR8_KVB=fp8): uk / uv hold the release's E4M3 kv_b bytes in the BF16 layouts (uk [h][512][192],
     // transposed by the binder; uv [h][256][512]), and these the release's 128x128-block scales, one per weight row and
     // 128-column block: uks [h][4][192] (latent block d / 128, then UK row k; transposed by the binder), uvs [h][256][4].
     // A weight reads as BF16(e4m3 x scale), the value the BF16 loader stores, so outputs are byte-identical to it.
@@ -80,12 +80,12 @@ struct G6Attn {
     int rt_vpages;
     const unsigned char *rt_ix;
 };
-// Remote rows, G6_RT_FMT=int4 (runtime/rt_rows.cuh): n FP8 rows -> INT4 rows (spill) and back (tests); warp per row,
+// Remote rows, GR8_RT_FMT=int4 (runtime/rt_rows.cuh): n FP8 rows -> INT4 rows (spill) and back (tests); warp per row,
 // strides in bytes. cudaErrorNotSupported in a G6_KV4 build, whose rows are INT4 already.
 extern "C" int g6a_rt_pack_int4(const void* src,size_t src_stride,void* dst,size_t dst_stride,int n,void* stream);
 extern "C" int g6a_rt_unpack_int4(const void* src,size_t src_stride,void* dst,size_t dst_stride,int n,void* stream);
 extern "C" size_t g6a_scratch_bytes(const G6Attn*);
-// Round 10 E1 flags as the kernels read them (attn.cu; read once): G6_ATTN_CTX3_SP (64 / 128, 0 = off), G6_ATTN_POSIDX
+// Round 10 E1 flags as the kernels read them (attn.cu; read once): GR8_ATTN_CTX3_SP (64 / 128, 0 = off), GR8_ATTN_POSIDX
 // (1 / 0), and whether a call with these arguments takes the positional index (a full-index call of capacity <= 2048;
 // the runtime then skips that layer's idx_q GEMV, which the call does not read). For the S2 runtime signature.
 extern "C" int g6a_ctx_sp(void);
@@ -116,7 +116,7 @@ extern "C" int g6a_cp_index(const G6Attn*,const G6AttnStepCell* cell,void* scrat
 extern "C" int g6a_cp_merge_index(const G6Attn*,const G6AttnStepCell* cell,const uint64_t* cand_all,void* stream);
 // split-K partial of one head group over my score-owned keys of the merged list: unnormalized (m, l, c)
 extern "C" int g6a_cp_group(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* stream);
-// G6_CP_ONECHAIN: g6_attn_cp_group of G head groups of gh heads in ONE call (a->heads = G * gh): q / rope [M][G gh][512] /
+// GR8_CP_ONECHAIN: g6_attn_cp_group of G head groups of gh heads in ONE call (a->heads = G * gh): q / rope [M][G gh][512] /
 // [M][G gh][64] (group g's heads at g * gh), group g's partial into part + g * gblk floats (gblk >= M * gh * 514). The same bits
 // as G calls when g6_attn_cp_groups_ok(gh). buf: device, g6_attn_cp_groups_bytes(G * gh, M) bytes (its own scratch)
 extern "C" int g6a_cp_groups_ok(int gh);

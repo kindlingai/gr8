@@ -9,8 +9,8 @@ struct G6AttnTrace {
     // [M,H,512], [M,T]. Scores include the 1/16 scale. Null fields are skipped.
 };
 // *out must be null. Create outside capture, with a successfully created binding.
-// Read once at create: G6_PF_TILE=64/128/256 (default256), G6_PF_DENSE>=0
-// (default8192; zero always sparse), G6_PF_EVENTS=0|1 (default0).
+// Read once at create: GR8_PF_TILE=64/128/256 (default256), GR8_PF_DENSE>=0
+// (default8192; zero always sparse), GR8_PF_EVENTS=0|1 (default0).
 // Missing/empty variables use defaults;
 // malformed/out-of-range values return cudaErrorInvalidValue. Dense limits are
 // logical context thresholds; allocation rounds them up to32 within capacity.
@@ -41,7 +41,7 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill*,G6AttnBinding*,const G6Attn
 extern "C" int g6a_bind_baseline_trace(G6AttnBinding*,const G6AttnStep*,const G6AttnTrace*,void* stream);
 
 // Optional diagnostic event profile, independent per state (also with shared
-// scratch). G6_PF_EVENTS is frozen at create; OFF allocates/records/queries no
+// scratch). GR8_PF_EVENTS is frozen at create; OFF allocates/records/queries no
 // profiling events. ON allocates 1+5*ceil(max_rows/query_tile) events once.
 // No profiling events are recorded during stream capture; graph replay is NOT
 // profiled. Preserve the existing external stream ordering/lifetime contract.

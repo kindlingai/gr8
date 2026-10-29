@@ -4,7 +4,7 @@
 // instance per rank. Every rank makes the same calls in the same order: admissions at the event fences (service.h),
 // growth and retirement in Driver::step. Calls take a lock: on the head, publish_status reads the pool from the control
 // thread. Binaries that include it link libg6kvman.a. A pool error throws, with the message of require().
-// log(true) (g6m4: G6_POOL_LOG=1): one stderr line per claim, with its pages and every retained run it evicted.
+// log(true) (g6m4: GR8_POOL_LOG=1): one stderr line per claim, with its pages and every retained run it evicted.
 // stores() + add_tier(): block stores below the pool (kvman-rs src/stash.rs). The engine then takes io() after each
 // reserve, take, grow or retain, runs the copies in order before anything writes those pages, and calls io_done().
 #pragma once
@@ -123,7 +123,7 @@ public:
     // whether tail() set the CP map's ranks: a run past R carries its own page list, and the engine builds its tables
     // from it (true), or it holds the pool as pages 0, 1, .. on the tables as built (false)
     bool split() const { Lock l(mu_); return g6kv_split(p_) != 0; }
-    // remote rows release (G6_RT_LOCAL): a split run takes its prefix and `pages` main pages, its whole tail above place
+    // remote rows release (GR8_RT_LOCAL): a split run takes its prefix and `pages` main pages, its whole tail above place
     // ids: the records of each rank's rows store (0 = no limit): a request whose tail needs more waits
     // runs: the most window runs live at once, what the slot pool covers (0 = no limit)
     void window(uint32_t pages, uint32_t ids, uint32_t runs) { Lock l(mu_); check(g6kv_window(p_, pages, ids, runs)); }

@@ -7,7 +7,7 @@
 
 // The driver calls below come through cudaGetDriverEntryPointByVersion (as engine/vmm.h), not linked with -lcuda: a
 // binary that links libcuda.so.1 does not start where there is no driver (a build container), even with
-// G6_FLASH_KV_CHUNKS=0, which never calls them.
+// GR8_FLASH_KV_CHUNKS=0, which never calls them.
 namespace {
 #define G6_KVC_DRIVER(X) X(cuMemCreate) X(cuMemMap) X(cuMemUnmap) X(cuMemRelease) X(cuMemSetAccess) \
     X(cuMemsetD8Async) X(cuMemGetAllocationGranularity) X(cuMemAddressReserve) X(cuMemAddressFree) \

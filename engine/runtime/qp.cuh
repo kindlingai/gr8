@@ -1,7 +1,7 @@
-// G6_PF_OWN=4, pair-owner QO prefill attention (TP4 only; docs/DESIGN-QO-PAIR.md). Included by prefill.cuh in a
+// GR8_PF_OWN=4, pair-owner QO prefill attention (TP4 only; docs/DESIGN-QO-PAIR.md). Included by prefill.cuh in a
 // G6_NR=4 build, after the prefill helpers it uses; a TP6 build compiles none of it (prefill.cuh has stubs that exit).
 //
-// OWN=2 (row-owner projections + index) with, on the layers of G6_PF_QP_LAYERS (default: all), the attention block of
+// OWN=2 (row-owner projections + index) with, on the layers of GR8_PF_QP_LAYERS (default: all), the attention block of
 // OWN=3 split over two head pairs {0,1}, {2,3}: rank r holds its pair's 32 heads (QpW) and runs them on W_r = O_c then
 // O_r, the owner rows of its counterpart c = r ^ 2 and its own, in ONE QO call. The o_proj partial (K = 8192, BF16) of O_c
 // goes to c alone on c0 (Fabric::Rs::p2p); the owner sums its own and c's partial in a fixed per-layer order
@@ -80,13 +80,12 @@ __global__ void __launch_bounds__(128) k_put_slice(const uint4* src, g6::FabricD
     glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);
 }
 
-// G6_PF_QP_LAYERS = comma list of model layers and ranges a-b (e.g. "0-20,40"); unset or "all" = every layer below 78.
+// GR8_PF_QP_LAYERS = comma list of model layers and ranges a-b (e.g. "0-20,40"); unset or "all" = every layer below 78.
 // Per position of `layers` (the model's layer numbers): 1 = pair-owner attention, 0 = OWN=2.
 inline std::vector<char> pf_qp_mask(const std::vector<int>& layers)
 {
     std::vector<char> on(layers.size(), 0);
-    const char* e = getenv("G6_PF_QP_LAYERS");
-    const std::string v = e && *e ? e : "all";
+    const std::string v = knob::pf_qp_layers().value_or("all");
     std::vector<char> want(geom::L_MAIN, 0);
     if (v == "all") std::fill(want.begin(), want.end(), 1);
     else
@@ -95,12 +94,12 @@ inline std::vector<char> pf_qp_mask(const std::vector<int>& layers)
             char* end = nullptr;
             const long a = strtol(v.c_str() + k, &end, 10);
             long b = a;
-            if (end == v.c_str() + k) die("G6_PF_QP_LAYERS: bad list " + v);
-            if (*end == '-') { const char* q = end + 1; b = strtol(q, &end, 10); if (end == q) die("G6_PF_QP_LAYERS: bad list " + v); }
-            if (a < 0 || b < a || b >= geom::L_MAIN) die("G6_PF_QP_LAYERS: layers must be 0.." + std::to_string(geom::L_MAIN - 1) + " (the MTP layer keeps the head-split path): " + v);
+            if (end == v.c_str() + k) die("GR8_PF_QP_LAYERS: bad list " + v);
+            if (*end == '-') { const char* q = end + 1; b = strtol(q, &end, 10); if (end == q) die("GR8_PF_QP_LAYERS: bad list " + v); }
+            if (a < 0 || b < a || b >= geom::L_MAIN) die("GR8_PF_QP_LAYERS: layers must be 0.." + std::to_string(geom::L_MAIN - 1) + " (the MTP layer keeps the head-split path): " + v);
             for (long l = a; l <= b; ++l) want[l] = 1;
             k = end - v.c_str();
-            if (k < v.size() && v[k] != ',') die("G6_PF_QP_LAYERS: bad list " + v);
+            if (k < v.size() && v[k] != ',') die("GR8_PF_QP_LAYERS: bad list " + v);
             if (k < v.size()) ++k;
         }
     for (size_t i = 0; i < layers.size(); ++i) on[i] = layers[i] >= 0 && layers[i] < geom::L_MAIN && want[layers[i]];
@@ -111,12 +110,11 @@ inline std::vector<char> pf_qp_mask(const std::vector<int>& layers)
 inline void pf_qp_alloc(Prefill& P, Model& m, int Mmax, const g6::FabricDev& f, Prefill* share)
 {
     if (!P.own || !P.ownix || P.qo || f.nr != 4 || !P.qpw || (int)P.qpw->size() != m.nl || (int)P.qpl.size() != m.nl)
-        die("G6_PF_OWN=4 needs G6_PF_RS=1, --pfv2, four ranks and the pair weights of every masked layer");
-    if (getenv("G6_PF_OWNPERM") && atoi(getenv("G6_PF_OWNPERM")) == 1) die("G6_PF_OWNPERM is OWN=3 only");
+        die("GR8_PF_OWN=4 needs GR8_PF_RS=1, --pfv2, four ranks and the pair weights of every masked layer");
+    if (knob::pf_ownperm()) die("GR8_PF_OWNPERM is OWN=3 only");
     P.qp_rows = 2 * ((Mmax + f.nr - 1) / f.nr + 16);
-    std::string ee;
-    if ((P.qp_early = env_choice("G6_PF_QP_EARLY", 2, 0, &ee)) < 0) die(ee);
-    if (P.qp_early && f.rank == 0 && !share) fprintf(stderr, "# G6_PF_QP_EARLY=%d: O_c's partial goes out before O_r's %s\n",
+    P.qp_early = (int)knob::pf_qp_early();
+    if (P.qp_early && f.rank == 0 && !share) fprintf(stderr, "# GR8_PF_QP_EARLY=%d: O_c's partial goes out before O_r's %s\n",
                                                      P.qp_early, P.qp_early == 2 ? "attention" : "o_proj");
     const size_t R = (size_t)P.qp_rows;
     P.qp_qb = dmalloc<__half>(R * 8192);
@@ -135,7 +133,7 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
 {
     if (share)
     {
-        if (P.roll != share->roll) die("G6_PF_QP_ROLL: both lanes must share one roll");
+        if (P.roll != share->roll) die("GR8_PF_QP_ROLL: both lanes must share one roll");
         P.qp_ctx = share->qp_ctx;
         P.qa = share->qa;
         return;
@@ -143,18 +141,16 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
     if (P.roll)              // rolling pack: S states (one shared workspace), layer position i -> state i % S
     {
         QpRoll& R = *P.roll;
-        const char* cl = getenv("G6_PF_QP_CTX");     // key-table / RoPE capacity of the QO workspace (default: the cap)
-        const int qcap = cl && *cl ? atoi(cl) : 0;
-        if (cl && *cl && qcap <= 0) die("G6_PF_QP_CTX must be a positive position count");
+        const int qcap = (int)knob::pf_qp_ctx().value_or(0);   // key-table / RoPE capacity of the QO workspace (0: the cap)
         g6_attn_qo_cap(qcap);
         int i0 = -1;
         for (int i = 0; i < m.nl && i0 < 0; ++i) if (P.qpl[i]) i0 = i;
-        if (i0 < 0) die("G6_PF_QP_ROLL: no pair-owner layer in G6_PF_QP_LAYERS");
+        if (i0 < 0) die("GR8_PF_QP_ROLL: no pair-owner layer in GR8_PF_QP_LAYERS");
         R.qa.assign(R.S, nullptr);
         size_t b = 0;
         for (int s = 0; s < R.S; ++s)
         {
-            if (!qp_check(R.slot[s])) die("G6_PF_QP_ROLL: slot " + std::to_string(s) + " shapes");
+            if (!qp_check(R.slot[s])) die("GR8_PF_QP_ROLL: slot " + std::to_string(s) + " shapes");
             if (int e = g6_attn_qo_create(&R.qa[s], &m.layers[i0].ab, &R.slot[s].uk, &R.slot[s].uv, P.qp_rows, st, s ? R.qa[0] : nullptr))
                 die("rank " + std::to_string(m.rank) + ": g6_attn_qo_create (pair, roll slot " + std::to_string(s) + ") failed (" + std::to_string(e) + ")");
             b += g6_attn_qo_bytes(R.qa[s]);
@@ -167,7 +163,7 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
         for (int i = 0; i < m.nl; ++i) if (P.qpl[i]) P.qa[i] = R.qa[i % R.S];
         const size_t sb = (size_t)R.S * ((size_t)8192 * geom::QA + (size_t)8192 * (geom::QA / 32) + (size_t)HID * 8192 + (size_t)HID * 256 +
                                          (size_t)QP_HEADS * (192 + 256) * 512 * 2);
-        if (m.rank == 0) fprintf(stderr, "# rank %d: G6_PF_QP_ROLL=%d rolling pair pack: %d slots %.3f GB + QO states/workspace %.3f GB (QO cap %d)\n",
+        if (m.rank == 0) fprintf(stderr, "# rank %d: GR8_PF_QP_ROLL=%d rolling pair pack: %d slots %.3f GB + QO states/workspace %.3f GB (QO cap %d)\n",
                                  m.rank, R.S, R.S, sb / 1e9, b / 1e9, P.qp_ctx);
         return;
     }
@@ -179,7 +175,7 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
     {
         if (!P.qpl[i]) continue;
         QpW& w = (*P.qpw)[i];
-        if (!qp_check(w)) die("G6_PF_OWN=4: layer " + std::to_string(m.layers[i].l) + " has no pair weights");
+        if (!qp_check(w)) die("GR8_PF_OWN=4: layer " + std::to_string(m.layers[i].l) + " has no pair weights");
         if (int e = g6_attn_qo_create(&P.qa[i], &m.layers[i].ab, &w.uk, &w.uv, P.qp_rows, st, owner))
             die("rank " + std::to_string(m.rank) + " layer " + std::to_string(m.layers[i].l) + ": g6_attn_qo_create (pair) failed (" + std::to_string(e) + ")");
         if (!owner) owner = P.qa[i];
@@ -189,11 +185,11 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
         ++n;
     }
     P.qp_ctx = m.layers[0].ab.capacity;
-    if (m.rank == 0) fprintf(stderr, "# rank %d: pair-owner QO attention states (G6_PF_OWN=4, 32 heads, kernel %s) for %d of %d layers: %.3f GB\n",
-                             m.rank, getenv("G6_PF_QO") && *getenv("G6_PF_QO") ? getenv("G6_PF_QO") : "b", n, m.nl, b / 1e9);
+    if (m.rank == 0) fprintf(stderr, "# rank %d: pair-owner QO attention states (GR8_PF_OWN=4, 32 heads, kernel %s) for %d of %d layers: %.3f GB\n",
+                             m.rank, knob::pf_qo().c_str(), n, m.nl, b / 1e9);
 }
-// G6_PF_QP_WARM=1 (default 0 = none): the QO absorb + UV of the pair states at every W row count of an Mmax sub-batch
-// over the ranks (nc + no; with G6_PF_QP_EARLY=2 also nc and no alone), then this rank's two q_b GEMMs (O_r's and O_c's
+// GR8_PF_QP_WARM=1 (default 0 = none): the QO absorb + UV of the pair states at every W row count of an Mmax sub-batch
+// over the ranks (nc + no; with GR8_PF_QP_EARLY=2 also nc and no alone), then this rank's two q_b GEMMs (O_r's and O_c's
 // aligned bindings) and its o_proj (W, or the two halves with EARLY >= 1) on the first pair layer's weights, on scratch;
 // then a sync. cuBLAS's first call per (handle, shape) costs ~0.1-0.4 s on the host, paid by the first request otherwise.
 inline void pf_qp_warm(Model& m, Prefill& P, cudaStream_t st)
@@ -228,23 +224,22 @@ inline void pf_qp_warm(Model& m, Prefill& P, cudaStream_t st)
     else if (P.qp_early) { gemm(w.o_c, w.o_s, nc, P.qp_x8, P.qp_part, 1, "o_proj (O_c)"); gemm(w.o_c, w.o_s, no, P.qp_x8, P.qp_part, 1, "o_proj (O_r)"); }
     else gemm(w.o_c, w.o_s, nc + no, P.qp_x8, P.qp_part, 1, "o_proj (W)");
     G6RT_CK(cudaStreamSynchronize(st));
-    if (m.rank == 0) fprintf(stderr, "# rank %d: G6_PF_OWN=4 warm-up (G6_PF_QP_WARM=1): absorb + UV at %zu row counts (%d..%d), q_b + o_proj\n",
+    if (m.rank == 0) fprintf(stderr, "# rank %d: GR8_PF_OWN=4 warm-up (GR8_PF_QP_WARM=1): absorb + UV at %zu row counts (%d..%d), q_b + o_proj\n",
                              m.rank, rows.size(), rows.front(), rows.back());
 }
-// G6_PF_QP_MIN (default 768): OWN=4 pays a fixed ~0.13-0.35 s per request (the pair weights rolled through every layer),
+// GR8_PF_QP_MIN (default 768): OWN=4 pays a fixed ~0.13-0.35 s per request (the pair weights rolled through every layer),
 // so below ~770 prompt tokens OWN=2 prefills faster (TP4: 256 tokens 506 vs 401 tok/s, 1024 tokens 809 vs 846)
 inline int pf_qp_min()
 {
-    static const int v = getenv("G6_PF_QP_MIN") ? atoi(getenv("G6_PF_QP_MIN")) : 768;
-    return v;
+    return (int)knob::pf_qp_min();
 }
 // per request: a request whose prompt has at least pf_qp_min() tokens and whose prompt + gen fits the QO key / RoPE table
-// (P.qp_ctx: G6_PF_QP_CTX with G6_PF_QP_ROLL, else the cap) runs ALL pair layers OWN=4, else ALL layers OWN=2. No
+// (P.qp_ctx: GR8_PF_QP_CTX with GR8_PF_QP_ROLL, else the cap) runs ALL pair layers OWN=4, else ALL layers OWN=2. No
 // per-layer mix; both lanes the same. Call before the request's first pf_inputs / pf_enqueue (pf_enqueue and pf_attn_block
 // read P.qp). Returns the mode (true = OWN=4).
 inline bool pf_qp_select(Prefill& P, Prefill* P2, int ctx, int prompt)
 {
-    if (P2 && P2->qp_built != P.qp_built) die("pf_qp_select: the two lanes were built with different G6_PF_OWN");
+    if (P2 && P2->qp_built != P.qp_built) die("pf_qp_select: the two lanes were built with different GR8_PF_OWN");
     const bool on = P.qp_built && ctx <= P.qp_ctx && prompt >= pf_qp_min();
     P.qp = on;
     if (P2) P2->qp = on;
@@ -276,12 +271,12 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
     const int nr = P.f.nr, me = P.f.rank, cp = me ^ 2;
     const int r0 = pf_r0(M, me, nr), r1 = pf_r0(M, me + 1, nr), c0r = pf_r0(M, cp, nr), c1r = pf_r0(M, cp + 1, nr);
     const int nc = c1r - c0r, no = r1 - r0, W = nc + no;
-    const QpW& w = (*P.qpw)[i];       // G6_PF_QP_ROLL: slot i % S (static pointers), filled by qp_roll_acquire
+    const QpW& w = (*P.qpw)[i];       // GR8_PF_QP_ROLL: slot i % S (static pointers), filled by qp_roll_acquire
     // dense trellis q_b / o_proj (kernels/dtr.cuh): the pair codes are FP8 tile copies. The pair's suh rotates the inputs
     // (q_b: the shared full-width vector), its svh the outputs (o_proj: the shared full-width vector).
     const bindp::Tensors& T = P.T[i];
     const bool trq = T.tsuh[0] != nullptr, tro = T.tsuh[1] != nullptr;   // each may be trellis alone (layer 3's int4 o_proj)
-    if ((trq || tro) && !w.qb_svh) die("G6_PF_OWN=4: layer " + std::to_string(y.l) + " is dense trellis but its pair weights have no vectors");
+    if ((trq || tro) && !w.qb_svh) die("GR8_PF_OWN=4: layer " + std::to_string(y.l) + " is dense trellis but its pair weights have no vectors");
     pf_mark(7, st);
     if (P.roll) { qp_roll_acquire(*P.roll, P.qpl, m.nl, i, st); pf_mark(7, st); }   // exposed staging lands in "other"
     if (i == 0)                  // later layers: every row's q_a_n / kv_a / idx_k / idx_w came with c3 (OWN=2 records)

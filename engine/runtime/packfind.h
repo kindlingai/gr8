@@ -10,6 +10,7 @@
 #include <string>
 #include <unistd.h>
 #include "rank.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
 #include "../vmm.h"
@@ -77,7 +78,7 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
 // exlr8 v2 experts from the raw width files (--v2 DIR --v2-slices DIR --v2-widths FILE). With dense (--v2-dense DIR),
 // every other tensor comes from the release's dense and vocab files too, with no base pack. trellis keeps the trellis
 // matrices as the release's entries (engine/kernels/dtr.cuh, --v2-dense-form trellis); false rounds them to a
-// converted pack's MXFP8 / int4 forms. qo adds the G6_PF_OWN=3 full-head tensors to the image. layout (--layout FILE)
+// converted pack's MXFP8 / int4 forms. qo adds the GR8_PF_OWN=3 full-head tensors to the image. layout (--layout FILE)
 // says which pieces each rank holds (engine/loader-rs/src/layout.rs); empty: the formulas.
 struct V2Src
 {
@@ -130,10 +131,10 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
 {
     RsSink sink;
     void* dev = nullptr;
-    // G6_IMG_VMM=1 (A/B): the image as cuMemCreate chunks of the recommended granularity mapped into one range
+    // GR8_IMG_VMM=1 (A/B): the image as cuMemCreate chunks of the recommended granularity mapped into one range
     // (engine/vmm.h; k1_audit --alloc vmm), =N: chunks of N MB. Same bytes at the same offsets; only the physical
     // backing (the GPU's page size) can differ. Falls back to cudaMalloc, with a line saying why.
-    static const long vmm = getenv("G6_IMG_VMM") ? atol(getenv("G6_IMG_VMM")) : 0;
+    static const long vmm = (long)knob::img_vmm();
     void (*release)(void*) = nullptr;
     if (vmm > 0)
     {
@@ -144,7 +145,7 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
         std::string why;
         const size_t chunk = vmm > 1 ? (size_t)vmm << 20 : 0;
         if ((dev = g6vmm::alloc(pack.bytes(), chunk, why))) release = [](void* p) { g6vmm::release(p); };
-        fprintf(stderr, "# rank %d: G6_IMG_VMM=%ld: %s (granularity min %zu KB, recommended %zu KB)\n", rank, vmm,
+        fprintf(stderr, "# rank %d: GR8_IMG_VMM=%ld: %s (granularity min %zu KB, recommended %zu KB)\n", rank, vmm,
                 dev ? ("image in chunks of " + std::to_string((chunk ? (chunk + gmin - 1) / gmin * gmin : grec) >> 20) + " MB").c_str()
                     : ("cudaMalloc instead: " + why).c_str(), gmin >> 10, grec >> 10);
     }
@@ -165,11 +166,10 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
 }
 
 // The pack -> one device image with the Rust loader: parallel reads, no checksum (the files are checked offline).
-// G6_LOADER=cpp, or a pack streamed on stdin, takes the C++ path instead.
+// GR8_LOADER=cpp, or a pack streamed on stdin, takes the C++ path instead.
 inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& file, int rank)
 {
-    const char* sel = getenv("G6_LOADER");
-    if ((sel && std::string(sel) == "cpp") || file == "-") return false;
+    if (knob::loader() == "cpp" || file == "-") return false;
     std::vector<g6l_extent> ext;
     for (const g6::Entry& e : pack.entries()) ext.push_back({e.offset, e.nbytes});
     rs_fill(pack, img, rank, "pack", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
@@ -183,9 +183,8 @@ inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& 
 // The caller removes it once it has been read.
 inline std::string planned_manifest(int rank, const char* what)
 {
-    const char* tmp = getenv("TMPDIR");
     const std::string sfx = ".manifest.json";
-    std::string p = std::string(tmp && *tmp ? tmp : "/tmp") + "/g6m4-rank" + std::to_string(rank) + "." + what +
+    std::string p = knob::tmpdir() + "/g6m4-rank" + std::to_string(rank) + "." + what +
                     ".XXXXXX" + sfx;
     const int fd = mkstemps(&p[0], (int)sfx.size());
     if (fd < 0) die(p + ": " + strerror(errno));

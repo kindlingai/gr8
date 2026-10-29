@@ -1,4 +1,4 @@
-"""Compile the actual G6_FLASH_CACHE=terminal retain hook (s2/flash_native.cuh) against CPU mocks: the rows it keeps,
+"""Compile the actual GR8_FLASH_CACHE=terminal retain hook (s2/flash_native.cuh) against CPU mocks: the rows it keeps,
 the KDA ring slot it keeps them from, the tokens (through the pending token p), and when it keeps nothing."""
 from pathlib import Path
 import subprocess

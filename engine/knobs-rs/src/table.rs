@@ -92,15 +92,15 @@ macro_rules! table {
 }
 
 table! {
-    /// attnk: the arms to run, as name or KEY=V,... specs joined by ;.
+    /// attnk: the arms to run, as name or KEY=V,... specs joined by spaces.
     ATTNK_ARMS: test text ? "the built-in arms", "", legacy "ATTNK_ARMS";
-    /// attnk: the base arm the others compare with, as KEY=V,...
-    ATTNK_BASE: test text ? "the stock arm", "", legacy "ATTNK_BASE";
+    /// attnk: the base arm the others compare with, as KEY=V,... over the stock arm (every flag 0), or stock.
+    ATTNK_BASE: test text ? "the serving arm SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16", "", legacy "ATTNK_BASE";
     /// attnk: 1 runs the round 10 arm set.
     ATTNK_E1: test flag = "0", "", legacy "ATTNK_E1";
-    /// attnk: the attention heads to run.
-    ATTNK_H: test int ? "every head of the build", "", legacy "ATTNK_H";
-    /// attnk: the key slot that gets a NaN, -1 none.
+    /// attnk: the rank's head count, g6nr::HMIN or g6nr::HMAX of the build (a TP=6 build: 11 or 10).
+    ATTNK_H: test int ? "g6nr::HMAX, the larger head count of a rank in the build", "", legacy "ATTNK_H";
+    /// attnk: the index key position (session 0) whose scale is NaN, -1 none.
     ATTNK_NANKEY: test int = "-1", "", legacy "ATTNK_NANKEY";
     /// attnk: scales the test queries.
     ATTNK_QSCALE: test float = "1", "", legacy "ATTNK_QSCALE";
@@ -170,9 +170,10 @@ table! {
     /// Context-parallel KV: the first GR8_CP_R tokens are replicated and later pages are spread across ranks on a CP
     /// fabric of their own. Read only in builds with -DG6_CP=1.
     CP: agree flag ? "1 in a CP build", "";
-    /// cpgroups: the arms to run, as specs joined by ;.
+    /// cpgroups: the arms to run, as KEY=V,... specs (SC2 TR CTX2 CTX3 HG) or stock, joined by spaces.
     CPG_ARMS: test text ? "the built-in arms", "", legacy "CPG_ARMS";
-    /// cpgroups: the local group setting of the run.
+    /// cpgroups: puts the N most recent positions first in each row's index list, as a local window. 0: uniform random
+    /// positions.
     CPG_LOCAL: test int = "0", "", legacy "CPG_LOCAL";
     /// Raises the row count the CP fabric is sized for. A value below the computed rows has no effect.
     CP_MMAX: agree int ? "the most rows of any step", "";
@@ -360,12 +361,12 @@ table! {
     HOME: outside path ? "unset", "", env "GR8_HOME";
     /// Splits the indexer's replicated wq_b GEMV by output tiles across the ranks and all-gathers it on the split-GEMV
     /// fabric, with the same bits as the full GEMV.
-    IDXQ_SPLIT: agree flag ? "1 when TP>1 on GLM, else 0", "0|1";
+    IDXQ_SPLIT: agree flag ? "g6m4: 1 when TP>1 on GLM, else 0; m4sim: 0", "0|1";
     /// m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from
     /// GR8_LOGIT_DUMP_FROM on.
     IDX_DUMP: test path ? "unset", "";
     /// In S2 batched decode steps the per-row indexer reads each key tile once for up to this many rows of one session,
-    /// with the same bits. 0 or out of range is off.
+    /// with the same bits. 0 is off.
     IDX_GRP: agree int = "0", "0..64";
     /// The per-row decode index_scores loads its key tile with 16 B vector loads (page size 32 or more), with the same
     /// bytes. Read once before graph capture.
@@ -383,13 +384,13 @@ table! {
     K1_SPLIT: agree text ? "the release split per row count", "";
     /// Sets the decode MoE K1 split KS1,WG,NS2 for 1-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change
     /// the sums.
-    K1_SPLIT_M1: agree ints ? "the release split (4,1,2)", "";
+    K1_SPLIT_M1: agree ints ? "GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,1,2)", "";
     /// Sets the decode MoE K1 split KS1,WG,NS2 for 2- and 3-row steps, over GR8_K1_SPLIT. Another fc1 partial count can
     /// change the sums.
-    K1_SPLIT_M2: agree ints ? "the release split (1,2,8)", "";
+    K1_SPLIT_M2: agree ints ? "GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (1,2,8)", "";
     /// Sets the decode MoE K1 split KS1,WG,NS2 for steps of 4 or more rows, over GR8_K1_SPLIT. Another fc1 partial
     /// count can change the sums.
-    K1_SPLIT_M4: agree ints ? "the release split (4,2,2)", "";
+    K1_SPLIT_M4: agree ints ? "GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,2,2)", "";
     /// At the start of each decode MoE fc1 launch, prefetches the routed slots' fc1 and fc2 weight translations into L2
     /// at this granule in KB. No output change.
     K1_TLBW: local int = "0", "0..1048576";
@@ -405,13 +406,18 @@ table! {
     KDA_PF_P1: agree flag = "0", "0|1";
     /// 1 runs the older v1 state kernel in KDA prefill instead of k_kda_state2.
     KDA_PF_ST1: agree flag = "0", "0|1";
-    /// Sets the k-split of the KDA trellis q / k / v projection GEMV. Other values fall back to 16.
+    /// Sets the k-split of the KDA trellis q / k / v projection GEMV.
     KDA_PROJ_KS: agree int = "16", "8|16|32";
     /// Picks how the KDA trellis q / k / v projection rotates its input: 0 inside the GEMV, 1 and 2 in a separate pre-
     /// rotate launch that also carries the f_a / g_a / b GEMVs (1) or not (2).
     KDA_PROJ_MODE: agree int = "0", "0|1|2";
+    /// 1 runs the Flash KDA prefill scan as the CH16 bf16-MMA scan (`kda/kda_g9.cuh`), a precision arm that is not
+    /// byte-exact. 0 runs the base scan.
+    KDA_SCAN: agree int = "0", "0|1", legacy "G9_KDA_SCAN";
     /// After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>.
     KDA_STATE_DUMP: local path ? "unset", "";
+    /// With GR8_KDA_SCAN=1, the v slices per head of the G9 KDA scan kernel: 1, 2 or 4.
+    KDA_VS: agree int = "2", "1|2|4", legacy "G9_KDA_VS";
     /// fp8 loads every layer's kv_b (UK / UV) as the release's block FP8 bytes and scales instead of BF16, with the
     /// same output bytes. Needs --v2-dense.
     KVB: agree text = "bf16", "bf16|fp8";
@@ -454,19 +460,18 @@ table! {
     /// Sets the GR8_L2PF budget per window in us at the pace, as four numbers: MLP all-reduce wait, gather waits,
     /// attention, attention all-reduce wait.
     L2PF_US: local floats = "30,30,100,30", "";
-    /// Sets the most 8 KiB GR8_L2PF prefetch chunks issued per poll. Values are clamped to 1..32.
+    /// Sets the most 8 KiB GR8_L2PF prefetch chunks issued per poll.
     L2PF_WAVE: local int = "8", "1..32";
     /// Aborts the process in the host ledger at that point, before or after the rename, so tests can check crash
     /// recovery. Only test and debug builds read it.
     LEDGER_CRASH_AT: test text ? "unset", "write|written";
     /// cpp loads a pack through the C++ path instead of the Rust loader.
     LOADER: local text ? "the Rust loader", "cpp";
-    /// Sets the chunk size in MB that the Rust loader reads and the weight check sums. Values that are not positive use
-    /// 32.
+    /// Sets the chunk size in MB that the Rust loader reads and the weight check sums.
     LOAD_CHUNK_MB: local int = "32", "1..";
     /// Picks how the Rust loader reads weight files: read or mmap. Other values fail the load.
     LOAD_MODE: local text = "read", "read|mmap";
-    /// Sets the number of Rust loader worker threads. Values that are not positive use 8.
+    /// Sets the number of Rust loader worker threads.
     LOAD_THREADS: local int = "8", "1..";
     /// Offline runs write each main step's head logits (each rank's vocab slice) to PATH.rank<R>, with a header. Not
     /// with --serve.
@@ -475,7 +480,7 @@ table! {
     LOGIT_DUMP_FROM: local int = "0", "";
     /// GiB of MemAvailable the boot must keep after the weights and each layer of the KV pool. Below it the engine
     /// stops with a message instead of meeting the OOM killer.
-    MEM_MIN: local float = "8", "";
+    MEM_MIN: local float = "8", "0..";
     /// Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block.
     MHC_BF16: agree int = "0", "0|1|2";
     /// Sets the decode mHC consume form for every row count unless GR8_MHC_FUSE_M1 / _M4 set it: 0 a separate peer-wait
@@ -531,7 +536,7 @@ table! {
     MTP_LPLOG: local int = "0", "0|1|2";
     /// MTP draft steps split eh_proj and the draft layer's replicated input GEMVs by output tiles across the ranks,
     /// gathered on a draft fabric (port + 72). Same bits.
-    MTP_SPLIT: agree flag ? "1 when TP>1 on GLM with --mtp, else 0", "0|1";
+    MTP_SPLIT: agree flag ? "g6m4: 1 when TP>1 on GLM with --mtp, else 0; m4sim: 0", "0|1";
     /// A solo DFlash2 session also drafts from this n-gram table file and verifies its chain when it promises more
     /// tokens per verify ms. Needs --serve.
     NGRAM: agree path ? "unset", "";
@@ -577,7 +582,7 @@ table! {
     PF_BLAS_ROWS: agree int ? "the whole sub-batch (the GLM launcher sets 1024)", "16..";
     /// Sets the context up to which prefill attention takes the dense path. Past it the sparse, indexer-selected path
     /// runs. 0 means always sparse.
-    PF_DENSE: agree int = "8192", "";
+    PF_DENSE: agree int = "8192", "0..2147483616";
     /// m4sim with --mtp writes the MTP layer's KV and indexer caches after the draft prefill to
     /// DIR/r<rank>.s<seq>.{kv,idx}.
     PF_DRAFTDUMP: test path ? "unset", "";
@@ -650,8 +655,7 @@ table! {
     /// Flash prefill also runs the KDA tail projections on the host-loop path, compares them byte for byte with the
     /// tiled result and stops on a difference.
     PF_KDA_TAIL_CHECK: local flag = "0", "0|1";
-    /// Any value other than 1 turns off the warp-specialized GEMM for the Flash KDA prefill projections
-    /// (`kda/proj_in_prefill.cuh`).
+    /// 0 turns off the warp-specialized GEMM for the Flash KDA prefill projections (`kda/proj_in_prefill.cuh`).
     PF_KDA_WS: agree flag = "1", "0|1";
     /// Selects the Flash prefill kpool score kernel: 0 = `kp_scores_pf`, 1 = tensor-core with one stage, 2 = tensor-
     /// core with two stages, 3 = the streaming tensor-core form.
@@ -783,8 +787,7 @@ table! {
     PF_SP_ATTD: agree flag = "1", "0|1";
     /// 0 stops the GR8_PF_SP MoE final sum from writing each row into its owner's slice of the send slot. Byte-equal.
     PF_SP_FIND: agree flag = "1", "0|1";
-    /// Sets the CTA count of the GR8_PF_SP send copies (`k_put_rs`, `k_put_publish_n`), with out-of-range values
-    /// meaning 96. Copy only, same bytes.
+    /// Sets the CTA count of the GR8_PF_SP send copies (`k_put_rs`, `k_put_publish_n`). Copy only, same bytes.
     PF_SP_PUT_CTA: agree int = "96", "1..1024";
     /// With GR8_PF_SP and GR8_PF_ROUTER_SPLIT, an MoE layer's MLP input travels as FP16 rows instead of FP32 rows,
     /// halving that all-gather. Byte-equal.
@@ -810,8 +813,8 @@ table! {
     /// m4sim --serve prints per-request wall-clock timing laps on stderr, from the request file's mtime to the first
     /// token.
     PF_TIMES: test flag = "0", "0|1";
-    /// Sets the row blocks per CTA of large prefill GEMMs on trellis tiles (`k_gemm_tr`): 8 or 16, other values mean
-    /// 16. Small launches take 4.
+    /// Sets the row blocks per CTA of large prefill GEMMs on trellis tiles (`k_gemm_tr`): 8 or 16. Small launches take
+    /// 4.
     PF_TR_BM: agree int = "16", "8|16";
     /// 0 runs the Flash routed fc1 on `k_pf_fc1` instead of the weight-major `k_pf_fc1ws` for passes of at least
     /// GR8_PF_WM_MIN rows. Byte-equal.
@@ -835,7 +838,7 @@ table! {
     PSEUDO_TOKENIZER: outside path ? "unset", "", env "GR8_PSEUDO_TOKENIZER";
     /// Splits the decode layer-input GEMVs across the ranks by 16-output tiles and all-gathers them on their own
     /// fabric. 1 = q_a, kv_a and the indexer's k and weights, 2 = q_a only. Same bits.
-    QA_SPLIT: agree int ? "2 when TP>1 on GLM, else 0", "0|1|2";
+    QA_SPLIT: agree int ? "g6m4: 2 when TP>1 on GLM, else 0; m4sim: 0", "0|1|2";
     /// Sets the CPU core of the replicated-GEMV gather fabric's proxy thread (GR8_QA_SPLIT, GR8_IDXQ_SPLIT,
     /// GR8_MTP_SPLIT). -1 leaves it unpinned.
     QA_SPLIT_CPU: local int ? "--proxy-cpu minus 9, or -1 when --proxy-cpu is 8 or less", "";
@@ -864,7 +867,7 @@ table! {
     /// DIR/hd.<q>.r<rank>.bin, a prefix-reuse diagnostic (reuse_hdump.cuh).
     REUSE_HDUMP: local path ? "unset", "";
     /// Lists the sequence numbers (comma-separated, 0 and up) whose cache rows GR8_REUSE_HDUMP dumps.
-    REUSE_HDUMP_SEQ: local ints ? "unset", "";
+    REUSE_HDUMP_SEQ: local ints ? "unset", "0..";
     /// With --reuse-prefix, a hit no longer needs the new prompt to reach the end of what the last sequence wrote, so a
     /// prompt can be replayed as it is. 0 restores that rule (prefix_reuse.h).
     REUSE_NOEND: agree flag ? "1 with --serve, 0 offline", "0|1";
@@ -977,6 +980,10 @@ table! {
     /// S2: a session holds the KV pages it needs now and takes more as its output grows, while every live session can
     /// still reach its worst case. 0 = every run holds its worst case from admission.
     S2_GROW: agree flag = "1", "0|1";
+    /// m4sim --s2: the sessions' runs come from a pool of this many pages (s2/pool.h) and grow on demand: each starts
+    /// with its prompt + 1 + guard rows, grows before each round, sits a round out when the pool would be unsafe, and
+    /// gives its pages back when it finishes. At most the pool's pages. Not with GR8_S2_RUNS or GR8_S2_PAGES.
+    S2_GROW_POOL: test int ? "fixed runs (GR8_S2_RUNS, GR8_S2_PAGES or the default layout)", "1..";
     /// m4sim --s2: q:after:unless:id,id,.. gives session q an insert rule (s2_batch.h), several rules joined by
     /// semicolons. unless -1 = none.
     S2_INSERT: test text ? "unset", "";

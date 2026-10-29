@@ -6,6 +6,7 @@
 #include "dispatch.h"
 #include "flash_lend.h"
 #include "pool.h"
+#include "../../knobs-rs/gr8_knobs.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -59,12 +60,12 @@ struct NativeHooks {
     // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
     std::function<bool()> drained;
     // optional, a tier on a group lease of a KV node (s2/kv_share.h): share = the head's report to the node, on its
-    // control thread every G6_S2_SHARE_MS (default 1000) while no resize is in flight, told whether the engine is idle
+    // control thread every GR8_S2_SHARE_MS (default 1000) while no resize is in flight, told whether the engine is idle
     // (no resident session, none queued); the resize to announce, or nothing. resize = every rank's change at the
     // Resize commit (share_apply with the tier drain)
     std::function<std::optional<Resize>(bool idle)> share;
     std::function<void(const Resize&)> resize;
-    // optional, G6_FLASH_KV_CHUNKS: flash_room = this rank's Flash KV chunks online (its ACKs carry it, Ack::room);
+    // optional, GR8_FLASH_KV_CHUNKS: flash_room = this rank's Flash KV chunks online (its ACKs carry it, Ack::room);
     // flash = the head's borrow-idle rule (s2/flash_lend.h; chunk_rows 0 = no gate, idle_ms 0 = never lend). Its lends
     // and recalls are Resize events on FLASH_KV_TIER, so they need the resize hook
     std::function<uint32_t()> flash_room;
@@ -73,10 +74,10 @@ struct NativeHooks {
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
     g6rt::SpecLen dfl_spec;
-    s2::DSel dsel;                    // drafter choice (G6_S2_DSEL)
-    s2::KStop kstop;                  // solo MTP rounds' draft count (G6_MTP_KSTOP, G6_MTP_LPLOG)
-    s2::DflReuse dfl_reuse;           // G6_DFL_REUSE
-    s2::NgramSrc ngram;               // G6_NGRAM: the n-gram table as a draft source (S5, #56)
+    s2::DSel dsel;                    // drafter choice (GR8_S2_DSEL)
+    s2::KStop kstop;                  // solo MTP rounds' draft count (GR8_MTP_KSTOP, GR8_MTP_LPLOG)
+    s2::DflReuse dfl_reuse;           // GR8_DFL_REUSE
+    s2::NgramSrc ngram;               // GR8_NGRAM: the n-gram table as a draft source (S5, #56)
 };
 // Only atomic scalar stores/loads on the compute hot path. No request-file
 // checks, digest, allocation, or lock in an event-free boundary. horizon() is
@@ -120,18 +121,18 @@ class Service {
     uint32_t recall_ = 0;
     std::chrono::steady_clock::time_point recall_t0_{};
     uint64_t recall_for_ = UINT64_MAX;
-    const long share_ms_ = ::getenv("G6_S2_SHARE_MS") ? std::max(1L, std::atol(::getenv("G6_S2_SHARE_MS"))) : 1000;
-    // G6_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
+    const long share_ms_ = std::max<long>(1, knob::s2_share_ms());
+    // GR8_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
     // boundary it read and the future boundary it chose), one "commit" line when that notice lands on each rank, and one
     // "step" line per prefill quantum. Together they say whether a cancel was installed while a long prefill was still
     // running -- the lookahead binding -- or merely waited for it, which is the scheduler's admission. Logs only: no
     // state, no digest and no behaviour change, so it can run on a serving build.
-    const bool elog_ = ::getenv("G6_S2_EVENTLOG") && *::getenv("G6_S2_EVENTLOG") == '1';
-    // G6_S2_ADMIT_HOLD=1 (head only; the workers follow Commit::hold): an admission with another request queued behind it
+    const bool elog_ = knob::s2_eventlog();
+    // GR8_S2_ADMIT_HOLD=1 (head only; the workers follow Commit::hold): an admission with another request queued behind it
     // and a slot left holds its boundary, and the next admission is announced at that same boundary (event below), so a
     // burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each behind
     // 8,192-row prefill quanta). Default off: one admission per notice, as before.
-    const bool admit_hold_ = ::getenv("G6_S2_ADMIT_HOLD") && *::getenv("G6_S2_ADMIT_HOLD") == '1';
+    const bool admit_hold_ = knob::s2_admit_hold();
     uint64_t refused_ = UINT64_MAX;   // the last request the refusal line named (head)
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }

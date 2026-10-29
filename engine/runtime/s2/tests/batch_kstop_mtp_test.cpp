@@ -1,9 +1,9 @@
-// MTP confidence stop in an MTP-only engine (s2_batch.h KStop::solo: G6_MTP_KSTOP=1 without --dflash-manifest, TP=6 /
+// MTP confidence stop in an MTP-only engine (s2_batch.h KStop::solo: GR8_MTP_KSTOP=1 without --dflash-manifest, TP=6 /
 // TP=3). No drafter hooks; every session drafts with MTP and runs round_all. A session alone verifies kverify of the
 // drafts its chain held (main step k + 1 rows, class row_class(k + 1)), its chain stops where kmore says; a round of
 // several sessions first chains every short session to K, so its main step is S * (K + 1) rows of class row_class(K + 1)
 // as without the stop; every committed token is the target's. Off (solo false, or mode 0), the steps are the same as
-// before. KStopB (G6_MTP_KSTOPB) without the drafter: the rule's widths and exact tokens.
+// before. KStopB (GR8_MTP_KSTOPB) without the drafter: the rule's widths and exact tokens.
 // Host only, a fake engine.
 // Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_kstop_mtp_test.cpp -o /tmp/batch_kstop_mtp_test
 #include "s2_batch.h"
@@ -88,7 +88,7 @@ static int verified(const KStop& ks, int K, int base)
 static KStop solo_on(int kmax)
 {
     KStop ks; ks.mode = 1; ks.kmax = kmax; ks.solo = true;
-    ks.tau[1] = 0; ks.tau[2] = 0.5; ks.tau[3] = 0.75;   // the recipe's G6_MTP_KSTOP_TAU=0,0.5,0.75
+    ks.tau[1] = 0; ks.tau[2] = 0.5; ks.tau[3] = 0.75;   // the recipe's GR8_MTP_KSTOP_TAU=0,0.5,0.75
     return ks;
 }
 
@@ -161,7 +161,7 @@ int main()
         }
         CHECK(bad == 0 && shared > 10 && solo > 100);
     }
-    // 4. KStopB without the drafter (MTP-only engine, G6_MTP_KSTOPB=1): each session verifies the rule's k_q, exact tokens
+    // 4. KStopB without the drafter (MTP-only engine, GR8_MTP_KSTOPB=1): each session verifies the rule's k_q, exact tokens
     {
         Fake f;
         Batch b(K, 32, f.hooks());

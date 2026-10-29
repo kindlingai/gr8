@@ -9,7 +9,7 @@
 //!     indexer wk: MXFP8 -> BF16 (exact: E4M3 times a power of two) + BF16 decode record
 //!     q_b and o_proj stored as int4 g32 (layers 0, 2, 3): int4 decode records from the release's codes and scales
 //!   BF16 of the release's value (what loader/exlr8.py --dtype bf16 gives):
-//!     kv_b (FP8 128x128 blocks) -> UK / UV (G6_KVB=fp8: the FP8 bytes and block scales as stored, #50); the embedding
+//!     kv_b (FP8 128x128 blocks) -> UK / UV (GR8_KVB=fp8: the FP8 bytes and block scales as stored, #50); the embedding
 //!     (FP8 per row)
 //!   the trellis matrices (q_b, o_proj, the dense MLP of layers 0-2), by Opts::trellis:
 //!     trellis: the rank's entries as stored + suh / svh, for the dense trellis kernels (engine/kernels/dtr.cuh) - exact
@@ -133,7 +133,7 @@ struct Planner<'a> {
     rank: usize,
     threads: usize,
     forms: BTreeMap<Form, Vec<usize>>,
-    /// add every layer's full-head q_b / o_proj / UK / UV (G6_PF_OWN=3)
+    /// add every layer's full-head q_b / o_proj / UK / UV (GR8_PF_OWN=3)
     qo: bool,
     /// trellis matrices as the release's entries (the dense trellis kernels); false: rounded to MXFP8 / int4
     trellis: bool,
@@ -317,7 +317,7 @@ impl Planner<'_> {
             // the FP8 form takes a contiguous head range (kv_b_fp8): a planned layout's heads may not be
             let h0 = heads[0];
             if heads.iter().enumerate().any(|(i, &h)| h != h0 + i) {
-                return Err(format!("L{l:03}: G6_KVB=fp8 needs this rank's heads in one run; the layout gives {heads:?}"));
+                return Err(format!("L{l:03}: GR8_KVB=fp8 needs this rank's heads in one run; the layout gives {heads:?}"));
             }
             self.kv_b_fp8(l, &p, &f, &kvb, h0, nh)?;
         } else {
@@ -474,10 +474,10 @@ impl Planner<'_> {
     /// weight (i, j) as BF16(e4m3 x scale), the value of the BF16 form, so the two forms give the same outputs.
     fn kv_b_fp8(&mut self, l: usize, p: &str, f: &Arc<StFile>, kvb: &Matrix, h0: usize, nh: usize) -> Result<(), String> {
         if kvb.rec.fmt != FP8_BLOCK || kvb.rec.out != 64 * 448 || kvb.rec.inp != 512 {
-            return Err(format!("{}: kv_b is {} [{} x {}]: G6_KVB=fp8 needs the release's block FP8 [28672 x 512]",
+            return Err(format!("{}: kv_b is {} [{} x {}]: GR8_KVB=fp8 needs the release's block FP8 [28672 x 512]",
                                f.path, fmt_name(kvb), kvb.rec.out, kvb.rec.inp));
         }
-        self.note(l, Form { what: "kv_b", src: fmt_name(kvb), form: "FP8 + block scales (UK, UV; G6_KVB=fp8)", exact: EXACT });
+        self.note(l, Form { what: "kv_b", src: fmt_name(kvb), form: "FP8 + block scales (UK, UV; GR8_KVB=fp8)", exact: EXACT });
         let f2 = f.clone();
         self.gen(format!("{p}.kv_b"), vec![
             (format!("{p}.kv_b.uk"), "u8", vec![nh as i64, 192, 512]),
@@ -498,11 +498,11 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// G6_PF_OWN=3's full-head weights of layer l, the full-head QO tensors:
+    /// GR8_PF_OWN=3's full-head weights of layer l, the full-head QO tensors:
     /// q_b and o_proj as MXFP8 for all 64 heads, UK and UV in BF16. MXFP8 scales cover 32 inputs of one row, so the
     /// whole matrix rounds to the concatenation of the rank slices.
     fn full_heads(&mut self, l: usize, p: &str, f: &Arc<StFile>) {
-        self.note(l, Form { what: "q_b, o_proj all heads (G6_PF_OWN=3)", src: "as above".into(), form: "MXFP8", exact: ROUNDED });
+        self.note(l, Form { what: "q_b, o_proj all heads (GR8_PF_OWN=3)", src: "as above".into(), form: "MXFP8", exact: ROUNDED });
         let (f2, t) = (f.clone(), self.threads);
         let cache = qo_cache_path(p);
         self.gen(format!("{p}.qo"), vec![
@@ -590,7 +590,7 @@ fn qo_cache_write(path: &str, key: &str, parts: &[Vec<u8>]) {
     }
 }
 
-/// G6_PF_OWN=3's full-head tensors of one layer: [q_b codes, q_b scales, o_proj codes, o_proj scales, UK, UV].
+/// GR8_PF_OWN=3's full-head tensors of one layer: [q_b codes, q_b scales, o_proj codes, o_proj scales, UK, UV].
 fn full_heads_make(f2: &StFile, t: usize) -> Result<Vec<Vec<u8>>, String> {
     {
         {
@@ -710,11 +710,11 @@ fn ranges(ls: &[usize]) -> String {
 /// What the plan holds besides the defaults.
 #[derive(Clone, Copy, Default)]
 pub struct Opts {
-    /// every layer's full-head q_b / o_proj / UK / UV (G6_PF_OWN=3)
+    /// every layer's full-head q_b / o_proj / UK / UV (GR8_PF_OWN=3)
     pub qo: bool,
     /// trellis matrices as the release's entries for the dense trellis kernels. false rounds the matrices to MXFP8 / int4
     pub trellis: bool,
-    /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50, G6_KVB=fp8); false: BF16 of them
+    /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50, GR8_KVB=fp8); false: BF16 of them
     pub kvb_fp8: bool,
 }
 
@@ -757,7 +757,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     if model.is_some() && !is_flash { return Err(format!("{dense_dir}: model metadata of an unsupported model")); }
     let model = model.unwrap_or(Json::Null);
     if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
-    if is_flash && opts.kvb_fp8 { return Err("G6_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
+    if is_flash && opts.kvb_fp8 { return Err("GR8_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
     let last = if is_flash { 45 } else { L_MTP };
     if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     let mut moe = 0;

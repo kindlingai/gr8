@@ -1,4 +1,4 @@
-// G6_L2PF / G6_MTP_L2PF queue order, CPU only (no GPU, no launch): l2pf::queue over a main layer's plan gives the queue of
+// GR8_L2PF / GR8_MTP_L2PF queue order, CPU only (no GPU, no launch): l2pf::queue over a main layer's plan gives the queue of
 // before the MTP draft targets existed (targets T_XIN .. T_SHARED in enum order, same chunks), the MTP draft's plan reads
 // T_EH first and T_HEAD last, and the largest draft plan (trellis q_b / o_proj, FP8 kv_b with scales, two shared ranges,
 // eh_proj, the two-stage head's four ranges) fits MAXR with no range dropped.
@@ -98,7 +98,7 @@ int main()
         // every target after T_EH keeps its order and its chunk counts (shifted by T_EH's chunks)
         const l2pf::Queue m = old_queue(main_plan(), all);
         for (int i = 0; i < m.count; ++i) EXPECT(q.p[i + 1] == m.p[i] && q.n[i + 1] == m.n[i] && q.end[i + 1] == m.end[i] + q.end[0]);
-        // G6_L2PF_T without bit 8 / 9 (a mask set before these targets existed) drops them, nothing else
+        // GR8_L2PF_T without bit 8 / 9 (a mask set before these targets existed) drops them, nothing else
         EXPECT(same(l2pf::queue(P, 0xffu), m));
     }
     // 3. the front of the head-merge tails: T_EH then x_in

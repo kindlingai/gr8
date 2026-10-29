@@ -1,4 +1,4 @@
-// k1_ovl_test: G6_ROUTE_OVL (the trellis shared expert on a forked stream while the router GEMV and the plan kernel
+// k1_ovl_test: GR8_ROUTE_OVL (the trellis shared expert on a forked stream while the router GEMV and the plan kernel
 // run; bind.cuh k1_ovl_fork / launch_k1_ovl, k1.cuh k1_tr3_fc1_ovl / _fc2_ovl) against the default MoE layer. One GB10,
 // no pack files, no fabric. One MoE layer call as rank.cuh launch_mlp_block runs it: x2 -> fragment tables (k_xfrag),
 // router GEMV (BF16 records [16][384][512], 3.15 MB, tpc 2 x ks 16 = 8 CTAs, as make_layer binds it) -> k_router_plan
@@ -229,7 +229,7 @@ int main(int argc, char** argv)
     uint8_t* outs = static_cast<uint8_t*>(alloc(obytes * sets));      // per routing set (graph check)
     cudaStream_t st;
     CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-    bind::K1Ovl O[3];                                                // [variant]: 0 = off, 1 / 2 = G6_ROUTE_OVL mode
+    bind::K1Ovl O[3];                                                // [variant]: 0 = off, 1 / 2 = GR8_ROUTE_OVL mode
     for (int v = 1; v < 3; ++v)
     {
         O[v].mode = v;

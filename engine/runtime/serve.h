@@ -147,12 +147,12 @@ inline bool serve_next(const std::string& dir, size_t n, int vocab, ServeReq& r)
     return true;
 }
 
-// G6_PF_TIMES=1 (measurement only, default off; host clock only, no extra syncs): wall-clock laps of one request on this
-// process, from the request file's mtime to the first committed token; one stderr line per request:
+// GR8_PF_TIMES=1 (measurement only, default off; host clock only, no extra syncs): wall-clock laps of one request on
+// this process, from the request file's mtime to the first committed token; one stderr line per request:
 //   # times seq <n> <item>=<ms> .. total=<ms>
 struct PfTimes
 {
-    bool on = getenv("G6_PF_TIMES") && atoi(getenv("G6_PF_TIMES")) == 1;
+    bool on = false;   // m4sim sets it from GR8_PF_TIMES
     std::chrono::steady_clock::time_point t;
     std::string s;
     double tot = 0;
