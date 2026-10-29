@@ -11,7 +11,7 @@ static int fails = 0;
 static Config cfg()
 {
     Config c;
-    c.window_pages = 40; c.r2_rows = 16384; c.cp_after = 32768; c.cp_after2 = 16384;
+    c.window_pages = 40; c.r2_rows = 16384;
     return c;
 }
 
@@ -37,10 +37,9 @@ int main()
     CHECK(!admit(odd, 8192));
     CHECK(big.digest() != small.digest());
     CHECK(big.slots()[0].req.r_rows == 0 && small.slots()[0].req.r_rows == 16384);
-    CHECK(cfg().cp_after_of(0) == 32768 && cfg().cp_after_of(16384) == 16384);
 
     // without r2_rows only the engine's R is granted, and r2_rows needs the window
-    Config plain = cfg(); plain.r2_rows = 0; plain.cp_after2 = UINT64_MAX;
+    Config plain = cfg(); plain.r2_rows = 0;
     Scheduler p(plain), q(plain);
     CHECK(admit(p, 0) && !admit(q, 16384));
     Config bad = cfg(); bad.window_pages = 0;

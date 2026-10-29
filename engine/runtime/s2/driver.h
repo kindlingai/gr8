@@ -184,8 +184,7 @@ public:
             for (const Key& k : scheduler_.decoding())
                 if (!stalled[k.slot]) {
                     const uint64_t ctx = uint64_t(batch_.length(int(k.slot))) + cc.mtp;
-                    const Request& req = scheduler_.slots()[k.slot].req;
-                    cand.push_back({req.id, ctx > cc.cp_after_of(req.r_rows)});
+                    cand.push_back({scheduler_.slots()[k.slot].req.id, ctx > cc.cp_after});
                     slot.push_back(k.slot);
                 }
             pick = cp_round_.pick(cand, cc.cp_step_rows, cc.mtp + 1, cc.cp_seg);

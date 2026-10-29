@@ -103,8 +103,7 @@ struct BootstrapConfig {
             (scheduler.decode_rounds > 1 ? " dr " + std::to_string(scheduler.decode_rounds) : std::string()) +
             (scheduler.cp_step_rows ? " cpsr " + std::to_string(scheduler.cp_step_rows) + (scheduler.cp_seg ? " seg" : "") +
                                       " after " + std::to_string(scheduler.cp_after) : std::string()) +
-            (scheduler.r2_rows ? " r2 " + std::to_string(scheduler.r2_rows) + " after " + std::to_string(scheduler.cp_after2)
-                               : std::string()) +
+            (scheduler.r2_rows ? " r2 " + std::to_string(scheduler.r2_rows) : std::string()) +
             " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
     }
 };

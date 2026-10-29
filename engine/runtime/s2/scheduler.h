@@ -65,10 +65,9 @@ struct Config {
     uint32_t cp_step_rows = 0;          // after window_pages, for the same reason
     uint64_t cp_after = UINT64_MAX;
     bool cp_seg = false;
-    // R per grant: the smaller R a run may take (Request::r_rows; 0 = none), and cp_after at it
+    // R per grant: the smaller R a run may take (Request::r_rows; 0 = none). Steps switch to the CP block at one context
+    // for every session (cp_after), whichever R it takes
     uint32_t r2_rows = 0;
-    uint64_t cp_after2 = UINT64_MAX;
-    uint64_t cp_after_of(uint32_t r_rows) const { return r_rows ? cp_after2 : cp_after; }
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
@@ -280,7 +279,7 @@ public:
         if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
         if (c_.window_pages) add(c_.window_pages);
         if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
-        if (c_.r2_rows) { add(c_.r2_rows); add(c_.cp_after2); }
+        if (c_.r2_rows) add(c_.r2_rows);
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));

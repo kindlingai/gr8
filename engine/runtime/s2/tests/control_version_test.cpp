@@ -45,8 +45,8 @@ int main() {
     CHECK(c.agreement().find(" ctl 11\n") != std::string::npos);
     // a smaller R per grant joins the agreement only when set
     CHECK(c.agreement().find(" r2 ") == std::string::npos);
-    BootstrapConfig r2 = c; r2.scheduler.window_pages = 40; r2.scheduler.r2_rows = 16384; r2.scheduler.cp_after2 = 16384;
-    CHECK(r2.agreement().find(" r2 16384 after 16384 ctl 11\n") != std::string::npos);
+    BootstrapConfig r2 = c; r2.scheduler.window_pages = 40; r2.scheduler.r2_rows = 16384;
+    CHECK(r2.agreement().find(" r2 16384 ctl 11\n") != std::string::npos);
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=1").empty());
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=2") == "rank 1 has 'G6_X=2', the head has 'G6_X=1'");
     CHECK(agreement_difference(3, "a b", "a b c") == "rank 3 has 'c', the head has ''");
