@@ -4,7 +4,7 @@
 gets the same environment and flags, except `--rank`. The values shown are what TP=6 serves with; KNOBS.md has each TP's
 defaults.
 The source comments in `engine/runtime/` (`g6m4.cu`, `prefill.cuh`, `rank.cuh`) are the full reference. This file is
-the short version.
+the short version. [ENV.md](ENV.md) lists every knob (`GR8_*`, formerly `G6_*`) with its default and values.
 
 ## Engine flags (`g6m4`)
 

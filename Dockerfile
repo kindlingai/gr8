@@ -29,6 +29,7 @@ WORKDIR /src
 
 # Each Rust build copies its output out and drops target/ in the same layer, so the cached layer holds one file.
 FROM rust AS loader
+COPY engine/knobs-rs engine/knobs-rs
 COPY engine/loader-rs engine/loader-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/loader-rs/Cargo.toml \
@@ -36,11 +37,19 @@ RUN mkdir -p /out \
  && rm -rf engine/loader-rs/target
 
 FROM rust AS kvman
+COPY engine/knobs-rs engine/knobs-rs
 COPY engine/kvman-rs engine/kvman-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/kvman-rs/Cargo.toml \
  && cp engine/kvman-rs/target/release/libg6kvman.a engine/kvman-rs/target/release/kvman-remote /out/ \
  && rm -rf engine/kvman-rs/target
+
+FROM rust AS knobs
+COPY engine/knobs-rs engine/knobs-rs
+RUN mkdir -p /out \
+ && cargo build --release --locked --features capi --manifest-path engine/knobs-rs/Cargo.toml \
+ && cp engine/knobs-rs/target/release/libgr8knobs.a /out/ \
+ && rm -rf engine/knobs-rs/target
 
 # the slowest step (fat LTO); it runs beside the engine builds
 FROM rust AS front
@@ -49,6 +58,7 @@ FROM rust AS front
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
+COPY engine/knobs-rs engine/knobs-rs
 COPY frontend/g6front-rs frontend/g6front-rs
 # from the crate's directory, so rustup reads its rust-toolchain.toml
 WORKDIR /src/frontend/g6front-rs
@@ -60,6 +70,7 @@ RUN mkdir -p /out \
 # XGrammar's C++ sources, the copy the front end's xgrammar crate pins (Cargo.lock): the engine's request grammars build
 # from it (engine/runtime/grammar.h). cargo fetch only, so the engine stages need not wait for the front end's build
 FROM rust AS xgrammar-src
+COPY engine/knobs-rs engine/knobs-rs
 COPY frontend/g6front-rs/Cargo.toml frontend/g6front-rs/Cargo.lock frontend/g6front-rs/rust-toolchain.toml frontend/g6front-rs/
 WORKDIR /src/frontend/g6front-rs
 RUN mkdir -p src && touch src/main.rs && cargo fetch --locked \
@@ -76,7 +87,8 @@ COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
 RUN /xgrammar_build.sh /opt/xgrammar /xb && mkdir -p /out && cp /xb/libxgrammar.a /out/ && rm -rf /xb
 
 # engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
-# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a and libg6kvman.a built above.
+# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6kvman.a and libgr8knobs.a
+# built above.
 FROM toolchain AS engine-src
 WORKDIR /src
 COPY engine engine
@@ -84,6 +96,7 @@ COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
 COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
+COPY --from=knobs /out/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.a
 
 # the two GLM engine stages add XGrammar; Flash and the tests build without it, so they do not wait for its stage
 FROM engine-src AS engine-src-glm
@@ -120,11 +133,12 @@ ARG G6_WIDTHS=
 RUN G6_WIDTHS="$G6_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
 
-# rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a
-# and libg6kvman.a
+# rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a,
+# libg6kvman.a and libgr8knobs.a
 FROM scratch AS rust-dist
 COPY --from=loader /out/libg6load.a /out/g6load /
 COPY --from=kvman /out/libg6kvman.a /
+COPY --from=knobs /out/libgr8knobs.a /
 COPY --from=front /out/g6front-rs /
 
 # dist holds the shipped binaries in bin/: g6m4 (fp8 KV) and g6m4-int4 (--kv-format int4), both for every TP width,

@@ -331,11 +331,11 @@ mod tests {
         assert!(matches!(root_type_ok(&json!({"anyOf": []})), Ok(())));
     }
 
-    /// The schema check through the real grammar: G6_TOKENIZER_DIR=<the model's tokenizer dir> cargo test -- --ignored
+    /// The schema check through the real grammar: GR8_TOKENIZER_DIR=<the model's tokenizer dir> cargo test -- --ignored
     #[test]
-    #[ignore = "needs G6_TOKENIZER_DIR, a directory holding the model's tokenizer.json"]
+    #[ignore = "needs GR8_TOKENIZER_DIR, a directory holding the model's tokenizer.json"]
     fn schema_grammar_accepts_and_rejects() {
-        let dir = std::env::var("G6_TOKENIZER_DIR").expect("G6_TOKENIZER_DIR");
+        let dir = gr8knobs::TOKENIZER_DIR.get().expect("GR8_TOKENIZER_DIR");
         let g = Grammars::load(std::path::Path::new(&dir), 154880).expect("grammars");
         let schema = json!({"type": "object", "required": ["a"], "properties": {"a": {"type": "integer"}}});
         let rf = parse_response_format(

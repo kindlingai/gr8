@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "g6kvman"
 version = "0.1.0"
+dependencies = [
+ "gr8-knobs",
+]
+
+[[package]]
+name = "gr8-knobs"
+version = "0.1.0"

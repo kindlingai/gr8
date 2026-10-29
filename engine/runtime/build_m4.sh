@@ -24,12 +24,17 @@ if [ "${G6_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="./nvcc_cac
 export G6_NVCC_CACHE_LOG=$O/nvcc_cache.calls
 rm -f $G6_NVCC_CACHE_LOG
 cache_counts() { [ -f $G6_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit' $G6_NVCC_CACHE_LOG) hit, $(grep -c '^miss' $G6_NVCC_CACHE_LOG) miss, $(grep -c '^pass' $G6_NVCC_CACHE_LOG) not cacheable"; return 0; }
+# the knob table's C API (engine/knobs-rs, gr8_knobs.h): every binary that reads a knob links it. scripts/build.sh
+# builds it with cargo
+KNOBLIB=../knobs-rs/target/release/libgr8knobs.a
+[ -f "$KNOBLIB" ] || { echo "need $KNOBLIB: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
+KNOBS="$KNOBLIB -lpthread -ldl -lm"
 # the attention TU, its binder and its op table (attn/ops.h): attn.cu + bind.cu + ops_glm.cu (GLM), flash_attn.cu +
 # flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer)
 ATTN_CU=../attn/attn.cu; ATTN_BIND_CU=../attn/bind.cu; ATTN_OPS_CU=../attn/ops_glm.cu
 case " $EXTRA " in *" -DG6_MODEL_FLASH=1 "*) ATTN_CU=../attn/flash_attn.cu; ATTN_BIND_CU=../attn/flash_bind.cu; ATTN_OPS_CU=../attn/ops_flash.cu ;; esac
 if [ "$WHAT" = rs ]; then
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/rstest rstest.cu
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/rstest rstest.cu $KNOBS
   ls -la $OUT/rstest
   cache_counts
   exit 0
@@ -45,8 +50,8 @@ if [ "$WHAT" = dfl ]; then
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_CU -o $O/attn.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_BIND_CU -o $O/attn_bind.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_OPS_CU -o $O/attn_ops.o
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas $KNOBS
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas $KNOBS
   ls -la $OUT/dfltest $OUT/dflreplay
   cache_counts
   exit 0
@@ -116,7 +121,7 @@ done
 wait
 cat $O/*.log
 if ls $O/*.failed > /dev/null 2>&1; then echo "build_m4.sh failed: $(cd $O && ls *.failed | sed 's/\.log\.failed//')"; exit 1; fi
-SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KVLIB"
+SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KVLIB $KNOBLIB"
 if [ "$WHAT" != sim ]; then SHARED="$SHARED $O/fabric.o"; fi
 if [ -n "$RSDEF" ]; then SHARED="$SHARED $RSLIB"; fi
 nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u > $O/shared.syms
@@ -131,13 +136,13 @@ inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of 
 if [ "$WHAT" != g6 ]; then
   I=""
   for n in $WIDTHS; do inst m4sim $n; I="$I $O/m4sim.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB $KNOBS -lcublas -lcublasLt
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
   I=""
   for n in $WIDTHS; do inst g6m4 $n; I="$I $O/g6m4.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -libverbs -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB $KNOBS -lcublas -lcublasLt -libverbs
   if [ -n "$GRDEF" ]; then echo "g6m4: request grammars (XGrammar) linked"; fi
   if [ -n "$RSDEF" ]; then echo "g6m4: Rust pack loader linked"; else echo "g6m4: no $RSLIB, C++ pack loader only"; fi
   ls -la $OUT/g6m4

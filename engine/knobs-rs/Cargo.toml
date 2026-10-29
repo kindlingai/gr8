@@ -1,0 +1,17 @@
+[package]
+name = "gr8-knobs"
+version = "0.1.0"
+edition = "2021"
+description = "gr8 knobs: every setting the engine reads from the environment, typed, from one table"
+
+[lib]
+name = "gr8knobs"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# the C API (gr8_knob_*): on in exactly one Rust library of a binary, libg6kvman.a for the engine
+capi = []
+
+[profile.release]
+opt-level = 3
+panic = "abort"        # a panic must not unwind into the C++ engine

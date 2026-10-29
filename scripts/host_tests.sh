@@ -27,11 +27,20 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/
 "$T/fabric_pool_test"
 # the Rust page allocator (engine/kvman-rs) that s2/pool.h wraps, built here where cargo is on the PATH
 KV=$REPO/engine/kvman-rs/target/release/libg6kvman.a
+# and the knob table's C API (engine/knobs-rs), which every test that reads a knob links
+KN=$REPO/engine/knobs-rs/target/release/libgr8knobs.a
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
+  cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
 fi
 [ -f "$KV" ] || { echo "no $KV: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
-KVLIB=("$KV" -lpthread -ldl -lm)
+[ -f "$KN" ] || { echo "no $KN: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
+KVLIB=("$KV" "$KN" -lpthread -ldl -lm)
+KNOBS=("$KN" -lpthread -ldl -lm)
+# the knob table: its C++ header over the C API
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-rs/tests/header_test.cpp" "${KNOBS[@]}" \
+  -o "$T/knobs_header_test"
+"$T/knobs_header_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/grammar_request_test.cpp" -o "$T/grammar_request_test"
 "$T/grammar_request_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_round_test.cpp" -o "$T/batch_round_test"
@@ -228,3 +237,5 @@ g++ -std=c++17 -O2 -DG6_MODEL_FLASH=1 "$REPO/engine/tests/test_spec_reset.cpp" -
 # the glue kda_g9_test.cu feeds the KDA G9 CPU emulation with (kda_g9_glue.h), on two heads
 g++ -std=c++17 -O3 -fopenmp -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_g9_glue_test.cpp" -o "$T/kda_g9_glue_test"
 "$T/kda_g9_glue_test"
+# the bare environment reads the knob table replaced, and the table against the tree
+python3 "$REPO/tools/env_lint.py"

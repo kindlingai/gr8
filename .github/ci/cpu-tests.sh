@@ -49,6 +49,8 @@ if [ "$PART" != frontend ]; then
   cargo test --locked --manifest-path engine/loader-rs/Cargo.toml
   step "Rust: engine/kvman-rs"
   cargo test --locked --manifest-path engine/kvman-rs/Cargo.toml
+  step "Rust: engine/knobs-rs"
+  cargo test --locked --manifest-path engine/knobs-rs/Cargo.toml
 fi
 
 [ "$PART" = engine ] && exit 0

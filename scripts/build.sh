@@ -28,12 +28,15 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 # the Rust pack loader (engine/loader-rs), and bin/g6load, which plans and checks the Hugging Face fetch. Where cargo is
 # missing (the CUDA image), build it on the host first: cargo build --release --manifest-path engine/loader-rs/Cargo.toml
 # (g6m4 links target/release/libg6load.a when it exists, and target/release/g6load is copied next to g6m4)
-# The S2 page allocator (engine/kvman-rs) is not optional: g6m4 always links target/release/libg6kvman.a, built the
-# same way.
+# The S2 page allocator (engine/kvman-rs) and the knob table's C API (engine/knobs-rs) are not optional: g6m4 always
+# links target/release/libg6kvman.a and libgr8knobs.a, built the same way, and every test that reads a knob links the
+# second.
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
   cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
+  cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
 fi
+KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" -lpthread -ldl -lm)
 # request grammars (engine/runtime/grammar.h): XGrammar's C++, the copy the front end's xgrammar crate pins
 # (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
 # G6_XGRAMMAR=DIR names a source tree instead (the image's engine stages), G6_XGRAMMAR=0 builds without grammars.

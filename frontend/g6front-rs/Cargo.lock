@@ -397,6 +397,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
+ "gr8-knobs",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -450,6 +451,10 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
 ]
+
+[[package]]
+name = "gr8-knobs"
+version = "0.1.0"
 
 [[package]]
 name = "hashbrown"

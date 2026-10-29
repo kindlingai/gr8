@@ -5,11 +5,11 @@
 //! engine/loader/devimage.cpp builds. Nothing is hashed: checking the files is an offline step.
 //!
 //! Environment:
-//!   G6_LOAD_MODE=read   (default) pread into the staging buffers, O_DIRECT where aligned; nothing is mapped
-//!   G6_LOAD_MODE=mmap   map every file at start; workers prefault a range, copy it out and drop its pages
+//!   GR8_LOAD_MODE=read   (default) pread into the staging buffers, O_DIRECT where aligned; nothing is mapped
+//!   GR8_LOAD_MODE=mmap   map every file at start; workers prefault a range, copy it out and drop its pages
 //!                       (the base for serving from resident pages; slower: 2.2-2.5 GB/s against 3.3 at TP4)
-//!   G6_LOAD_THREADS=8   worker threads (8 and 16 read equally fast at TP4: the NVMe is the limit)
-//!   G6_LOAD_CHUNK_MB=32 bytes of image per chunk (each worker holds one staging buffer of this size)
+//!   GR8_LOAD_THREADS=8   worker threads (8 and 16 read equally fast at TP4: the NVMe is the limit)
+//!   GR8_LOAD_CHUNK_MB=32 bytes of image per chunk (each worker holds one staging buffer of this size)
 //!
 //! g6l_v2_plan plans an image without a v2 pack: the base pack's tensors, with the v2 experts read from the raw width
 //! files at the offsets of the index slices (src/v2plan.rs). g6l_release_plan plans one from the exlr8 release alone,
@@ -173,17 +173,9 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<
     Ok(())
 }
 
-/// G6_KVB (#50): `fp8` plans kv_b (UK / UV) as the release's block FP8 bytes and scales, unset or `bf16` as BF16.
+/// GR8_KVB (#50): `fp8` plans kv_b (UK / UV) as the release's block FP8 bytes and scales, `bf16` as BF16.
 fn kvb_fp8() -> Result<bool, String> {
-    match std::env::var("G6_KVB").as_deref() {
-        Err(_) | Ok("") | Ok("bf16") => Ok(false),
-        Ok("fp8") => Ok(true),
-        Ok(v) => Err(format!("G6_KVB={v}: use bf16 or fp8")),
-    }
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(default)
+    Ok(gr8knobs::KVB.get() == "fp8")
 }
 
 fn open_src(path: &str, mode: Mode) -> Result<Src, String> {
@@ -204,13 +196,9 @@ pub fn load(pack: &str, pack_bytes: u64, tensors: &[G6lExtent], sources: Option<
 
 /// Fills image bytes 0..pack_bytes from `plan` through `sink`. The stats count time from `t0`.
 fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant) -> Result<G6lStats, String> {
-    let mode = match std::env::var("G6_LOAD_MODE").as_deref() {
-        Ok("read") | Err(_) => Mode::Read,
-        Ok("mmap") => Mode::Mmap,
-        Ok(v) => return Err(format!("G6_LOAD_MODE={v}: use mmap or read")),
-    };
-    let threads = env_u64("G6_LOAD_THREADS", 8) as usize;
-    let chunk = env_u64("G6_LOAD_CHUNK_MB", 32) << 20;
+    let mode = if gr8knobs::LOAD_MODE.get() == "mmap" { Mode::Mmap } else { Mode::Read };
+    let threads = gr8knobs::LOAD_THREADS.get() as usize;
+    let chunk = (gr8knobs::LOAD_CHUNK_MB.get() as u64) << 20;
     let files = plan.files.iter().map(|p| open_src(p, mode)).collect::<Result<Vec<_>, _>>()?;
     let l = Loader { plan, files, mode, sink };
     let nchunks = pack_bytes.div_ceil(chunk);

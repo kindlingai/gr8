@@ -527,12 +527,12 @@ impl Planner<'_> {
     }
 }
 
-/// G6_QO_CACHE=DIR: the full-head G6_PF_OWN=3 tensors of a layer are the same bytes on every rank and every boot
+/// GR8_QO_CACHE=DIR: the full-head GR8_PF_OWN=3 tensors of a layer are the same bytes on every rank and every boot
 /// (decoded from the release and rounded to MXFP8 by the same code), so the first boot stores them under DIR and later
 /// boots read them back instead of decoding the whole q_b / o_proj / kv_b again. Key = source file path, size and
 /// mtime; a missing, short or mismatched file is ignored (the tensors are made and the file rewritten).
 fn qo_cache_path(p: &str) -> Option<String> {
-    let d = std::env::var("G6_QO_CACHE").ok().filter(|d| !d.is_empty())?;
+    let d = gr8knobs::QO_CACHE.get()?;
     Some(format!("{d}/{}.qo.bin", p.replace('/', "_")))
 }
 
@@ -748,7 +748,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let slices = Slices::open(slices_dir, nr, &need.into_iter().collect::<Vec<_>>())?;
     let wfile = |l: usize, k: u8| v2plan::width_file(v2_dir, l, k);
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    let workers = std::env::var("G6_LOAD_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(8);
+    let workers = gr8knobs::LOAD_THREADS.get() as usize;
     let mut p = Planner { b: Builder::new(), layout, rank, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8 };
     // the release's files name the model (their metadata); the width manifest has one format for every model

@@ -106,6 +106,21 @@ struct BootstrapConfig {
             " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
     }
 };
+// The first word where a worker's agreement differs from the head's, for the refusal: "rank 2 has 'G6_X=1', the head
+// has 'G6_X=2'". Empty when they are equal.
+inline std::string agreement_difference(unsigned rank, const std::string& head, const std::string& worker) {
+    auto words = [](const std::string& s) {
+        std::vector<std::string> v; size_t a = 0;
+        while (a < s.size()) { const size_t e = std::min(s.find_first_of(" \n", a), s.size()); if (e > a) v.push_back(s.substr(a, e - a)); a = e + 1; }
+        return v;
+    };
+    const auto h = words(head), w = words(worker);
+    for (size_t i = 0; i < std::max(h.size(), w.size()); ++i)
+        if (i >= h.size() || i >= w.size() || h[i] != w[i])
+            return "rank " + std::to_string(rank) + " has '" + (i < w.size() ? w[i] : "") + "', the head has '" +
+                (i < h.size() ? h[i] : "") + "'";
+    return "";
+}
 inline void atomic_file(const std::string& path, const std::string& bytes) {
     const auto temp = path + ".tmp";
     { std::ofstream f(temp, std::ios::binary | std::ios::trunc); require(bool(f), "cannot create S2 file");
@@ -138,7 +153,9 @@ inline ControlLinks bootstrap(const BootstrapConfig& c) {
                 require(eol != std::string::npos && hello.substr(0, 5) == "G6S2 ", "bad bootstrap hello");
                 unsigned rank = 0; const auto nr = number(hello.substr(5, eol - 5));
                 require(nr > 0 && nr < c.ranks, "bad bootstrap worker rank"); rank = unsigned(nr);
-                require(!out.links[rank - 1] && hello.substr(eol + 1) == agree, "duplicate rank or bootstrap config mismatch");
+                require(!out.links[rank - 1], "duplicate rank");
+                const std::string diff = agreement_difference(rank, agree, hello.substr(eol + 1));
+                require(diff.empty(), ("bootstrap config mismatch: " + diff).c_str());
                 out.links[rank - 1] = std::move(io);
             }
             for (auto& io : out.links) io->send(release);

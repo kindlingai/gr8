@@ -37,4 +37,5 @@ lto = "fat"
 codegen-units = 1
 
 [dev-dependencies]
+gr8-knobs = { path = "../../engine/knobs-rs" }
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }

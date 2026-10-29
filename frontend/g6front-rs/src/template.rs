@@ -766,11 +766,11 @@ mod tests {
         effort_lines(&t);
     }
 
-    /// The real template: G6_TOKENIZER_DIR=<dir with chat_template.jinja ...> cargo test --release
+    /// The real template: GR8_TOKENIZER_DIR=<dir with chat_template.jinja ...> cargo test --release
     #[test]
     fn each_effort_renders_the_nearest_named_level_in_the_model_template() {
-        let Ok(dir) = std::env::var("G6_TOKENIZER_DIR") else {
-            eprintln!("G6_TOKENIZER_DIR not set; skipping");
+        let Some(dir) = gr8knobs::TOKENIZER_DIR.get() else {
+            eprintln!("GR8_TOKENIZER_DIR not set; skipping");
             return;
         };
         let t = ChatTemplate::load(Path::new(&dir), Value::Null, Value::Null).unwrap();

@@ -8,7 +8,7 @@
 #
 # On a pull request the changes job picks the jobs from the files it changes (dorny/paths-filter, below): the
 # front-end and engine halves of the CPU tests, the Rust binaries, and the engine builds with the image around them.
-# Markdown files start nothing, so a PR that changes only them runs just changes, zip-check and Finalize. Pushes to main,
+# Markdown files start nothing, so a PR that changes only them runs just changes, env-lint, zip-check and Finalize. Pushes to main,
 # tags and manual runs always build everything: the image pushed from main is built from all of the tree.
 #
 # Finalize is the one check a PR needs to land: green when every job passed or skipped and the PR carries queue:ready
@@ -100,6 +100,7 @@ jobs:
               - '.dockerignore'
               - 'engine/loader-rs/**'
               - 'engine/kvman-rs/**'
+              - 'engine/knobs-rs/**'
               - 'frontend/g6front-rs/**'
             # the engine builds and the image: what the Dockerfile's engine stages copy (the front end's Cargo files
             # pin the XGrammar sources the engine compiles), and the entrypoint the image's smoke test runs
@@ -141,6 +142,7 @@ jobs:
             ~/.rustup/toolchains
             engine/loader-rs/target
             engine/kvman-rs/target
+            engine/knobs-rs/target
             frontend/g6front-rs/target
             frontend/pseudo-engine/target
           key: cargo-${{ matrix.part }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
@@ -302,6 +304,17 @@ jobs:
 
   # make_zip.py's tree checks (every top-level entry shipped or skipped, no symlinks), which the zip job runs only on
   # main and tags, so a PR that adds a top-level entry fails here instead of after it lands. A few seconds.
+  # every environment read goes through the knob table (engine/knobs-rs): no bare getenv or std::env::var, every knob
+  # read somewhere, the launcher's and recipes' values accepted, the generated header and docs/ENV.md current. On every
+  # run, Markdown-only ones too, since docs/ENV.md is generated
+  env-lint:
+    name: Environment reads (knob table)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - run: python3 tools/env_lint.py
+
   zip-check:
     name: Tester zip (tree check)
     if: github.event_name == 'pull_request'
@@ -467,7 +480,7 @@ jobs:
     # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
     # but a run with only changes and zip-check can reach this step before that removal.
     if: always()
-    needs: [changes, cpu, cpu-macos, rust, engine, zip-check, zip, image]
+    needs: [changes, cpu, cpu-macos, rust, engine, env-lint, zip-check, zip, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

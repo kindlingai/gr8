@@ -7,6 +7,9 @@ description = "gr8 pack loader: fills a device image from a (sparse) pack and it
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+[dependencies]
+gr8-knobs = { path = "../knobs-rs" }
+
 [profile.release]
 opt-level = 3
 panic = "abort"        # a panic must not unwind into the C++ engine

@@ -2,7 +2,8 @@
 
 The options of `./gr8 glm53`, the launchers in `scripts/` and the build. Each knob has a name
 (`CAP`) and a flag (`--cap`): the flag is the name in lower case with `-` for `_`, except `--s2-port` for `S2PORT` and
-`--g6-home` for `G6_HOME`. The engine's own environment (`G6_*`) and flags are in [docs/SETTINGS.md](docs/SETTINGS.md).
+`--g6-home` for `G6_HOME`. The engine's own environment (`G6_*`) and flags are in [docs/SETTINGS.md](docs/SETTINGS.md), and
+[docs/ENV.md](docs/ENV.md) lists every `GR8_*` knob.
 
 Where a value comes from, strongest first:
 
