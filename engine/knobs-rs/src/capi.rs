@@ -36,6 +36,13 @@ pub extern "C" fn gr8_knobs_signature() -> *const c_char {
     S.get_or_init(|| CString::new(env().signature()).unwrap()).as_ptr()
 }
 
+/// The table as JSON (TABLE_JSON), for the launcher's binding (tools/launch/knobs.py).
+#[no_mangle]
+pub extern "C" fn gr8_knobs_table_json() -> *const c_char {
+    static S: OnceLock<CString> = OnceLock::new();
+    S.get_or_init(|| CString::new(crate::TABLE_JSON).unwrap()).as_ptr()
+}
+
 #[no_mangle]
 pub extern "C" fn gr8_knobs_tests_set() -> *const c_char {
     static S: OnceLock<CString> = OnceLock::new();

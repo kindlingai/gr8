@@ -55,7 +55,7 @@ the PR says which and why a tolerance is safe.
 `./gr8 glm53 up` is how the cluster starts: the same command on every box, which starts that box's supervisor
 (`tools/launch/`). The supervisors find each other (`--peers`, or the mentat group), compare their options, model set
 and engine build, and each starts its own rank; `status`, `logs` and `down` work from any box (README, "Running it").
-The engine command line lives in `scripts/engine_args.sh`, which the supervisor reads, so change it there. Every option `./gr8 knobs` lists is a flag and a config key, and its meaning lives in `KEYS` in `tools/launch/options.py`.
+The engine command line lives in `scripts/engine_args.sh`, which the supervisor reads, so change it there. Every option `./gr8 knobs` lists is a flag and a config key, and its flag, scope, default and meaning live in `knobs/launch.yaml` (`knobs/kv.yaml` for `./gr8 kv`).
 
 S2 is the only served path. `scripts/build.sh` builds every TP with DEC_S2, which g6m4 needs. `g6m4 --serve` serves up
 to `SESS` requests at once, and at TP=4 (and TP=6 with `DFLASH=1`, the drafter's body replicated) the DFlash2 drafter for a request that runs alone (TP=3 is MTP only).

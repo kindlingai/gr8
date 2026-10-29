@@ -51,7 +51,7 @@ COPY engine/knobs-rs engine/knobs-rs
 COPY knobs knobs
 RUN mkdir -p /out \
  && cargo build --release --locked --features capi --manifest-path engine/knobs-rs/Cargo.toml \
- && cp engine/knobs-rs/target/release/libgr8knobs.a /out/ \
+ && cp engine/knobs-rs/target/release/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.so /out/ \
  && rm -rf engine/knobs-rs/target
 
 # the slowest step (fat LTO); it runs beside the engine builds
@@ -158,6 +158,8 @@ COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /bin/
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
 COPY --from=kvman /out/kvman-remote /bin/
+# the knob table the launcher reads (tools/launch/knobs.py)
+COPY --from=knobs /out/libgr8knobs.so /bin/lib/
 
 FROM scratch AS dist-int4
 COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/

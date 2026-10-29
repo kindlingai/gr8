@@ -6,7 +6,7 @@ description = "gr8 knobs: every setting the engine reads from the environment, t
 
 [lib]
 name = "gr8knobs"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib", "rlib", "cdylib"]
 
 [features]
 # the C API (gr8_knob_*): on in exactly one Rust library of a binary, libg6kvman.a for the engine

@@ -1,0 +1,62 @@
+# The options of ./gr8 kv, a KV node. knobs/README.md describes the fields.
+prefix: ""
+for: kv
+options:
+  KV_GB:
+    doc: >-
+      GiB of this box's memory to lock and serve. RLIMIT_MEMLOCK must allow it (ulimit -l; root, or systemd-run -p
+      LimitMEMLOCK=infinity)
+  KV_PORT:
+    default: "7350"
+    doc: >-
+      the node's TCP port; RDMA connections are set up through it
+  KV_BIND:
+    default: "0.0.0.0"
+    doc: >-
+      the address it listens on
+  KV_MIN_FREE_GB:
+    default: "10"
+    doc: >-
+      refuse to start when locking KV_GB would leave less MemAvailable than this; with KV_LAZY_LOCK=1, refuse each lease
+      that would
+  KV_RDMA:
+    default: "1"
+    doc: >-
+      0 = TCP only
+  KV_LAZY_LOCK:
+    default: "0"
+    doc: >-
+      1 = lock a lease's memory only while the lease lives (given back to the box when it ends), and refuse leases while
+      MemAvailable is under KV_MIN_FREE_GB: a node on a box that also serves. 0 = the whole KV_GB is locked at start.
+      Measured effect: not measured
+  KV_LEDGER:
+    doc: >-
+      with KV_LAZY_LOCK=1: the host ledger of a box shared with a Flash rank (kvman-ledger,
+      engine/kvman-rs/src/ledger.rs). A lease is refused when the node would hold more than the ledger credits it.
+      FLASH_KV_DONATE_GIB sets it
+  KV_GUARD_EVERY_S:
+    default: "1"
+    doc: >-
+      with KV_LAZY_LOCK=1: how often the node reads MemAvailable (0 = at each lease only). Measured effect: not measured
+  KV_BIN:
+    doc: >-
+      the node binary (./gr8 glm53 build puts it in bin/). Default: bin/kvman-remote.
+  MENTAT:
+    default: "localhost"
+    flag: "--mentat"
+    doc: >-
+      the daemon to announce through; none = do not announce
+  GROUP:
+    default: "gr8-glm53"
+    flag: "--group"
+    doc: >-
+      the mentat group it joins
+  NODE_IP:
+    flag: "--node-ip"
+    doc: >-
+      the LAN address to announce. Default: mentat's.
+  GR8_WORK_DIR:
+    default: "{repo}"
+    flag: "--work-dir"
+    doc: >-
+      the node keeps out/kv/ here: kv.log, state.json, ready.json

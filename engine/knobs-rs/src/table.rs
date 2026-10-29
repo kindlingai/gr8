@@ -82,3 +82,6 @@ macro_rules! table {
 }
 
 include!(concat!(env!("OUT_DIR"), "/table.rs"));
+
+/// Every knob and launcher option as JSON (build.rs): {"knobs": [...], "options": [...]}, the knobs in TABLE order.
+pub static TABLE_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/table.json"));

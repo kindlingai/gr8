@@ -49,6 +49,12 @@ knobs:
     legacy: []
     doc: >-
       docker/compose.yaml: the gr8 image to run.
+  GR8_KNOBS_LIB:
+    kind: path
+    unset: "the crate's build, else bin/lib/libgr8knobs.so"
+    legacy: []
+    doc: >-
+      The knob table library the launcher loads (tools/launch/knobs.py).
   GR8_MODEL:
     kind: text
     unset: "unset"

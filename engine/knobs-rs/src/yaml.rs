@@ -99,13 +99,66 @@ fn entry(file: &str, prefix: &str, fscope: Option<&str>, key: &str, y: &Yaml) ->
     Ok((name, e))
 }
 
-/// Adds the entries of `src`, the text of the YAML file `file`, to `out`, or returns the first rule it breaks.
-pub fn add(out: &mut BTreeMap<String, Entry>, file: &str, src: &str) -> Result<(), String> {
+/// One option of a launcher command (`for` in its file: launch for ./gr8 <model>, kv for ./gr8 kv), in file order.
+pub struct Opt {
+    pub command: String,
+    pub key: String,
+    /// cluster, box or run: what the boxes' handshake compares. The KV node's options have none.
+    pub scope: Option<String>,
+    /// `{repo}` stands for the repository checkout.
+    pub default: Option<String>,
+    /// The flag, when it is not the key's usual one.
+    pub flag: Option<String>,
+    pub doc: String,
+}
+
+const OPT_SCOPES: [&str; 3] = ["cluster", "box", "run"];
+const OPT_FIELDS: [&str; 4] = ["scope", "default", "flag", "doc"];
+
+fn options(file: &str, prefix: &str, command: &str, h: &yaml_rust2::yaml::Hash) -> Result<Vec<Opt>, String> {
+    let mut out = Vec::new();
+    for (k, v) in h {
+        let key = k.as_str().ok_or_else(|| format!("{file}: an option's name is not a string"))?;
+        let at = |e: String| format!("{file}: {key}: {e}");
+        if !key.starts_with(prefix) {
+            return Err(at(format!("the names in this file start with {prefix:?}")));
+        }
+        let e = v.as_hash().ok_or_else(|| at("want a mapping".into()))?;
+        for f in e.keys() {
+            if !OPT_FIELDS.contains(&f.as_str().unwrap_or("")) {
+                return Err(at(format!("unknown field {f:?}")));
+            }
+        }
+        let get = |f: &str| e.get(&Yaml::String(f.into())).map(|v| text(v, f).map_err(at)).transpose();
+        let scope = get("scope")?;
+        if scope.as_deref().is_some_and(|s| !OPT_SCOPES.contains(&s)) {
+            return Err(at(format!("scope: want one of {OPT_SCOPES:?}")));
+        }
+        out.push(Opt {
+            command: command.to_string(),
+            key: key.to_string(),
+            scope,
+            default: get("default")?,
+            flag: get("flag")?,
+            doc: get("doc")?.unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+/// Adds the entries of `src`, the text of the YAML file `file`, to `out` (knobs) and `opts` (launcher options), or
+/// returns the first rule it breaks.
+pub fn add(out: &mut BTreeMap<String, Entry>, opts: &mut Vec<Opt>, file: &str, src: &str) -> Result<(), String> {
     let docs = YamlLoader::load_from_str(src).map_err(|e| format!("{file}: {e}"))?;
     let [doc] = docs.as_slice() else { return Err(format!("{file}: want one YAML document")) };
     let prefix = text(&doc["prefix"], "prefix").map_err(|e| format!("{file}: {e}"))?;
+    if let Some(h) = doc["options"].as_hash() {
+        let command = text(&doc["for"], "for").map_err(|e| format!("{file}: {e}"))?;
+        opts.extend(options(file, &prefix, &command, h)?);
+        return Ok(());
+    }
     let fscope = doc["scope"].as_str();
-    let knobs = doc["knobs"].as_hash().ok_or_else(|| format!("{file}: no knobs mapping"))?;
+    let knobs = doc["knobs"].as_hash().ok_or_else(|| format!("{file}: no knobs or options mapping"))?;
     for (k, v) in knobs {
         let key = k.as_str().ok_or_else(|| format!("{file}: a knob's name is not a string"))?;
         let (name, e) = entry(file, &prefix, fscope, key, v)?;
@@ -128,14 +181,14 @@ pub fn files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-/// Every entry of the YAML files in `dir`, by NAME: GR8_NAME's NAME, or the whole name of a variable outside the GR8_
-/// space.
-pub fn load(dir: &Path) -> Result<BTreeMap<String, Entry>, String> {
-    let mut out = BTreeMap::new();
+/// Every knob of the YAML files in `dir`, by NAME (GR8_NAME's NAME, or the whole name of a variable outside the GR8_
+/// space), and every launcher option, in file order.
+pub fn load(dir: &Path) -> Result<(BTreeMap<String, Entry>, Vec<Opt>), String> {
+    let (mut out, mut opts) = (BTreeMap::new(), Vec::new());
     for p in files(dir)? {
         let file = p.file_name().unwrap().to_string_lossy().into_owned();
         let src = std::fs::read_to_string(&p).map_err(|e| format!("{file}: {e}"))?;
-        add(&mut out, &file, &src)?;
+        add(&mut out, &mut opts, &file, &src)?;
     }
-    Ok(out)
+    Ok((out, opts))
 }

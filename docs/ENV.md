@@ -400,6 +400,7 @@ Read by the build or the launcher, never by the engine.
 | `GR8_HF_ENDPOINT` | text | unset |  | The hub the launcher fetches from, https://huggingface.co when unset. The tests point it at a fake one. |
 | `GR8_HOME` | path | unset |  | docker/compose.yaml: a host directory for the home volume (logs and state). Not the bare-metal GR8_WORK_DIR. |
 | `GR8_IMAGE` | text | unset |  | docker/compose.yaml: the gr8 image to run. |
+| `GR8_KNOBS_LIB` | path | the crate's build, else bin/lib/libgr8knobs.so |  | The knob table library the launcher loads (tools/launch/knobs.py). |
 | `GR8_MODEL` | text | unset |  | The model the launcher and the Helm chart serve: glm53 or glm53f. |
 | `GR8_NR` | text | unset |  | The tensor-parallel widths scripts/build.sh builds, the same as GR8_WIDTHS. |
 | `GR8_NVCC_CACHE` | flag | `1` | 0\|1 | 0 turns off the compile cache in front of nvcc and g++. |
