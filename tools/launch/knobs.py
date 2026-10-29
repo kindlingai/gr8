@@ -1,8 +1,8 @@
 """The knob table through the Rust library (engine/knobs-rs), with ctypes: the engine's knobs and the launcher's options,
 both from the YAML files in knobs/. Python standard library only.
 
-The library is $GR8_KNOBS_LIB, else the crate's own build (rebuilt with cargo when a knobs/ file is newer), else
-bin/lib/libgr8knobs.so beside the engine, as scripts/build.sh and the image leave it."""
+The library is the crate's own build or bin/lib/libgr8knobs.so beside the engine (as scripts/build.sh and the image
+leave it), whichever is no older than knobs/; library() has the order."""
 import ctypes
 import json
 import os
@@ -25,23 +25,28 @@ def _newest_yaml():
 
 
 def library():
-    """The path of the library to load, building the crate's when it is missing or older than knobs/."""
+    """The path of the library to load: $GR8_KNOBS_LIB, else one no older than knobs/ (the crate's build, then
+    bin/lib), else the crate's, built with cargo, else an older one, with a warning."""
     if os.environ.get('GR8_KNOBS_LIB'):
         return os.environ['GR8_KNOBS_LIB']
-    built = os.path.join(CRATE, 'target', 'release', LIB)
-    shipped = os.path.join(REPO, 'bin', 'lib', LIB)
-    fresh = os.path.isfile(built) and os.path.getmtime(built) >= _newest_yaml()
-    if not fresh and shutil.which('cargo'):
+    found = [p for p in (os.path.join(CRATE, 'target', 'release', LIB), os.path.join(REPO, 'bin', 'lib', LIB))
+             if os.path.isfile(p)]
+    newest = _newest_yaml()
+    for p in found:
+        if os.path.getmtime(p) >= newest:
+            return p
+    err = ''
+    if shutil.which('cargo'):
         r = subprocess.run(['cargo', 'build', '--release', '--quiet', '--features', 'capi', '--manifest-path',
                             os.path.join(CRATE, 'Cargo.toml')], capture_output=True, text=True)
-        if r.returncode:
-            raise KnobsError(f'cargo build of engine/knobs-rs failed:\n{r.stderr.strip()}')
-        return built
-    for p in (built, shipped):
-        if os.path.isfile(p):
-            return p
+        if not r.returncode:
+            return os.path.join(CRATE, 'target', 'release', LIB)
+        err = f': cargo build failed:\n{r.stderr.strip()}'
+    if found:
+        print(f'gr8: warning: {found[0]} is older than knobs/ and could not be rebuilt{err}', file=sys.stderr)
+        return found[0]
     raise KnobsError(f'no {LIB}: build it with `cargo build --release --features capi --manifest-path '
-                     'engine/knobs-rs/Cargo.toml`, or `./gr8 <model> build`')
+                     f'engine/knobs-rs/Cargo.toml`, or `./gr8 <model> build`{err}')
 
 
 def _load():
