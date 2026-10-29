@@ -285,6 +285,12 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
         self.assertEqual(a[a.index('--default-thinking-budget') + 1], '2048')
 
+    def test_undeclared_tool_calls_reach_the_front_end_only_when_emitted(self):
+        self.assertNotIn('--undeclared-tool-calls', self.front_argv())
+        self.assertNotIn('--undeclared-tool-calls', self.front_argv('--undeclared-tool-calls', 'text'))
+        a = self.front_argv('--undeclared-tool-calls', 'emit')
+        self.assertEqual(a[a.index('--undeclared-tool-calls') + 1], 'emit')
+
     def test_the_front_end_finds_the_supervisor_for_deep_health(self):
         a = self.front_argv()
         host, port = a[a.index('--supervisor') + 1].rsplit(':', 1)

@@ -51,6 +51,8 @@ pub struct State {
     pub thinking: thinking::Defaults,
     /// the grammar compiler for response_format json_schema
     pub grammars: grammar::Grammars,
+    /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a call, not text
+    pub emit_undeclared: bool,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
@@ -74,6 +76,7 @@ struct Args {
     default_effort: Option<&'static str>,
     default_budget: u64,
     allow_thinking_off: bool,
+    emit_undeclared: bool,
     supervisor: Option<String>,
 }
 
@@ -85,7 +88,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max]
                   [--default-thinking-budget N] [--allow-thinking-off]
-                  [--supervisor HOST:PORT]";
+                  [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -106,6 +109,7 @@ fn parse_args() -> Result<Args, String> {
         default_effort: None,
         default_budget: 0,
         allow_thinking_off: false,
+        emit_undeclared: false,
         supervisor: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -153,6 +157,13 @@ fn parse_args() -> Result<Args, String> {
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
+            "--undeclared-tool-calls" => {
+                a.emit_undeclared = match next(&mut i, &flag, inline)?.as_str() {
+                    "text" => false,
+                    "emit" => true,
+                    other => return Err(format!("--undeclared-tool-calls: want text or emit, not {other:?}")),
+                }
+            }
             "--supervisor" => a.supervisor = Some(next(&mut i, &flag, inline)?),
             "--encode-threads" => {
                 a.encode_threads = next(&mut i, &flag, inline)?.parse().map_err(|_| "--encode-threads: not a number")?
@@ -245,6 +256,9 @@ async fn serve(args: Args) -> Result<(), String> {
         args.default_budget,
         if args.allow_thinking_off { "allowed" } else { "refused" }
     );
+    if args.emit_undeclared {
+        log::info!("calls to tools a request did not declare come back as tool calls (--undeclared-tool-calls emit)");
+    }
     let engine = engine::Engine::new(args.engine_sock.clone());
     let grammars = grammar::Grammars::load(&PathBuf::from(&args.model_dir), tok.vocab_size)?;
     let st: &'static State = Box::leak(Box::new(State {
@@ -265,6 +279,7 @@ async fn serve(args: Args) -> Result<(), String> {
             allow_off: args.allow_thinking_off,
         },
         grammars,
+        emit_undeclared: args.emit_undeclared,
         started: util::now_secs(),
         supervisor: args.supervisor,
     }));

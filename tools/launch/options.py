@@ -121,6 +121,15 @@ KEYS = {
                                        "content. GLM 5.3's official template always opens <think>; a closed block "
                                        'gave degenerate output on an earlier serving stack, so it is off by default '
                                        '(frontend/README.md)'),
+    'UNDECLARED_TOOL_CALLS': ('box', 'text', "the head's front end: a call the model writes to a tool name the "
+                                             "request did not declare. text: the call's text stays in content and the "
+                                             'reply finishes stop. emit: it comes back in tool_calls with '
+                                             'finish_reason: tool_calls, streamed or not, when the name is an '
+                                             'identifier (1-128 ASCII letters, digits, _, -, . or :, starting with a '
+                                             'letter or _) and the reply ends with the call (it is not streamed as it '
+                                             'is written, so prose after it keeps it prose), so the client can answer '
+                                             'it with its own unknown-tool error and the model can correct itself. '
+                                             'Its arguments are strings (no schema to coerce them by)'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell (mentat mode)'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds for the mentat group to fill, for a worker to reach the head, and on the '
                                    'head from the first hello to the last (0 = forever)'),
@@ -680,6 +689,8 @@ def validate(o):
         raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
     if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
+    if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
+        raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')
