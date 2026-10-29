@@ -437,6 +437,10 @@ int main(int argc, char** argv)
 #endif
     if (const auto v = knob::cp_mmax()) cp_mmax = std::max(cp_mmax, (int)*v);
     if (cp_R < 0 || cp_R % 64) die("GR8_CP_R must be a multiple of 64");
+    // GR8_CP_R2 (as g6m4: every step past it runs the CP block): GR8_TEST_S2_XLIST runs its sequences at it
+    const int cp_R2 = (int)knob::cp_r2().value_or(0);
+    if (cp_R2 && (cp_R2 < 64 || cp_R2 % 64 || cp_R2 >= cp_R || !cp_on || !knob::test_s2_xlist()))
+        die("GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on and GR8_TEST_S2_XLIST (the runs it lays out)");
     g6::CpColls cp_colls;
     {
         std::vector<bool> full;
@@ -619,7 +623,8 @@ int main(int argc, char** argv)
         xt_dev[r] = f.xt;
         R[r].wide = wide;
 #if defined(G6_CP) && G6_CP
-        R[r].cp.on = cp_on; R[r].cp.R = cp_R; R[r].cp.s3 = cp_s3; R[r].cp.colls = cp_colls;
+        R[r].cp.on = cp_on; R[r].cp.R = cp_R; R[r].cp.R2 = cp_R2; R[r].cp.s3 = cp_s3; R[r].cp.colls = cp_colls;
+        R[r].cp.pf_R = cp_R2;   // only GR8_TEST_S2_XLIST's sequences take GR8_CP_R2, and they are every prefill
 #endif
 #ifdef DEC_S2
         if (s2mode && s2_below) R[r].s2_below = s2_below;       // CP: S2 below R on the CP binding as built
@@ -845,7 +850,9 @@ int main(int argc, char** argv)
     // a shuffled page list of the pool's two classes (the prefix and the run's shard below place, the drafter's tail
     // copy above it): the tables become the run's CP map (s2_solo_cp_pages, main and draft), StepIn::page_bound = the
     // pool's pages, and s2_reset_pages clears the run between sequences. Stdout must equal the run on the tables as
-    // built (the same build without GR8_TEST_S2_XLIST). GR8_TEST_S2_PFPOISON works as for the base-page gate.
+    // built (the same build without GR8_TEST_S2_XLIST). GR8_TEST_S2_PFPOISON works as for the base-page gate. With GR8_CP_R2
+    // the run takes that R (its prefix, prefill staging and rows-tier start) on the bindings GR8_CP_R lays out: stdout must
+    // equal the same gate with GR8_CP_R set to that value and no GR8_CP_R2.
     if (const auto& e = knob::test_s2_xlist())
     {
         const std::vector<int> v(e->begin(), e->end());
@@ -857,7 +864,7 @@ int main(int argc, char** argv)
         int place = R[0].s2->pool_pages, most = DR[0].d.s2->pool_pages;
         for (const Model& m : R) place = std::min(place, m.s2->pool_pages);
         for (const Draft& D : DR) most = std::max(most, D.d.s2->pool_pages);
-        const int rp = cp_R / 64;
+        const int rp = (cp_R2 ? cp_R2 : cp_R) / 64;   // the run's R
         const int n = v.size() > 1 ? v[1] : std::min(most, rp + (place - rp) * g6nr::NR);
         // GR8_RT_LOCAL: the release layout (s2.cuh S2Model::rt_window): the prefix, the window, then the drafter's whole tail
         const int win = rt[0] ? rt[0]->local : 0;
@@ -906,8 +913,8 @@ int main(int argc, char** argv)
             }
             for (Draft& D : DR) D.d.s2->rt_window = win;
         }
-        for (Model& m : R) s2_solo_cp_pages(m, pf_xlist_pages, most);
-        for (Draft& D : DR) s2_solo_cp_pages(D.d, pf_xlist_pages, most);
+        for (Model& m : R) s2_solo_cp_pages(m, pf_xlist_pages, most, rp);
+        for (Draft& D : DR) s2_solo_cp_pages(D.d, pf_xlist_pages, most, rp);
         G6RT_CK(cudaStreamSynchronize(st));
         fprintf(stderr, "# s2 xlist gate: every sequence past R on %zu shuffled pages (prefix %d + %s %d below place %d, %d above)%s\n",
                 pf_xlist_pages.size(), rp, win ? "window" : "shard", shard, place, high, knob::test_s2_pfpoison() ? ", caches poisoned 0x3c" : "");
@@ -933,10 +940,10 @@ int main(int argc, char** argv)
 #ifdef DEC_S2
             if (pf_xlist)
             {
-                const int rp = cp_R / 64, most = std::max(R[0].s2->pool_pages, DR.empty() ? 0 : DR[0].d.s2->pool_pages);
-                rt_begin(t, 0, std::vector<int>(pf_xlist_pages.begin() + rp, pf_xlist_pages.begin() + rp + t.local), pf_xlist_pages, st);
+                const int rp = (cp_R2 ? cp_R2 : cp_R) / 64, most = std::max(R[0].s2->pool_pages, DR.empty() ? 0 : DR[0].d.s2->pool_pages);
+                rt_begin(t, 0, std::vector<int>(pf_xlist_pages.begin() + rp, pf_xlist_pages.begin() + rp + t.local), pf_xlist_pages, rp * 64, st);
                 Model* mm = &m;
-                t.write = [this_list = &pf_xlist_pages, mm, most](int) { s2_solo_cp_pages(*mm, *this_list, most); };
+                t.write = [this_list = &pf_xlist_pages, mm, most, rp](int) { s2_solo_cp_pages(*mm, *this_list, most, rp); };
                 t.write(0);
                 continue;
             }
@@ -950,7 +957,7 @@ int main(int argc, char** argv)
             std::vector<int> win;
             for (int lp = 0; lp < (int)b.size() && (int)win.size() < t.local; ++lp)
                 if (rt_mine(t, lp)) win.push_back(b[lp]);
-            rt_begin(t, 0, win, {}, st);
+            rt_begin(t, 0, win, {}, t.L, st);
             Model* mm = &m;
             t.write = [&b, mm, &t](int qq) {
                 std::vector<int> tab = b;
@@ -1146,7 +1153,7 @@ int main(int argc, char** argv)
     auto cp_gather_net = [&](int i, int start) {
         for (Model& m : R) cp_pf_fill_local(m, i, start, err, st);
         const G6Attn& a = R[0].cp.pf_saved[i];
-        const int ps = a.page_size, Rp = R[0].cp.R / ps, np = (start + ps - 1) / ps;
+        const int ps = a.page_size, Rp = cp_pf_R(R[0]) / ps, np = (start + ps - 1) / ps;
         for (int lp = Rp; lp < np; ++lp)
         {
             const Model& o = R[lp % NR];
@@ -1749,7 +1756,7 @@ int main(int argc, char** argv)
         std::vector<std::vector<int>> gen(NSS);
         // GR8_CP_STEP_ROWS: contexts past cp_after run the CP block (s2/cp_rows.h); the cycle of capped rounds
 #if defined(G6_CP) && G6_CP
-        const uint64_t cp_after = g6s2::cp_after(R[0].bk, R[0].nbk, R[0].cp.on ? R[0].cp.R : -1);
+        const uint64_t cp_after = g6s2::cp_after(R[0].bk, R[0].nbk, R[0].cp.on ? R[0].cp.step_R() : -1);
 #else
         const uint64_t cp_after = UINT64_MAX;
 #endif

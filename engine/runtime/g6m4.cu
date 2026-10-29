@@ -865,6 +865,11 @@ int main(int argc, char** argv)
     else if (knob::cp_step_rows()) die("GR8_CP_STEP_ROWS needs --serve");
     if (const auto v = knob::cp_mmax()) cp_mmax = std::max(cp_mmax, (int)*v);
     if (cp_R < 0 || cp_R % 64) die("GR8_CP_R must be a multiple of 64");
+    // GR8_CP_R2: a session may take a smaller R; every step past it runs the CP block (CpState::step_R)
+    const int cp_R2 = (int)knob::cp_r2().value_or(0);
+    if (cp_R2 && (cp_R2 < 64 || cp_R2 % 64 || cp_R2 >= cp_R || !cp_on || !s2mode || !rt_win))
+        die("GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on, --serve and GR8_RT_LOCAL");
+    const int cp_step_R = cp_R2 ? cp_R2 : cp_R;
     g6::CpColls cp_colls;
     {
         std::vector<bool> full;
@@ -884,8 +889,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "# rank %d: GR8_CP fabric %d collectives, mmax %d, %.3f GB pinned + registered\n", cfg.rank, cp_colls.ncoll(),
                 cp_mmax, (fabc.vlayout().send_bytes() + fabc.vlayout().recv_bytes()) / 1e9);
     }
-    // enqueue the CP collectives of a step that runs the CP block (context > R), before its GPU work
-    auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
+    // enqueue the CP collectives of a step that runs the CP block (context > CpState::step_R), before its GPU work
+    auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_step_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
     auto cp_error = [&]() -> unsigned { return (cp_on ? *fabc.dev().error : 0u) | qs_err(); };   // + the GR8_QA_SPLIT proxy
 #else
     auto cp_enqueue = [&](unsigned long long, int, int) {};
@@ -981,7 +986,7 @@ int main(int argc, char** argv)
     m.qs.mode = qs_mode;
     m.qs.iq = iq_split;
 #if defined(G6_CP) && G6_CP
-    m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
+    m.cp.on = cp_on; m.cp.R = cp_R; m.cp.R2 = cp_R2; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
     if (const auto place = knob::rt_place())
     {
         m.cp.phys = (int)*place;
@@ -1229,7 +1234,8 @@ int main(int argc, char** argv)
                 // below place. Every row of theirs a step selects needs a slot: 2048 x rt_rows x rt_runs. A smaller
                 // GR8_RT_POOL lowers rt_runs, and the pool then admits fewer sessions past R at once
                 rt_rows = std::min<int>(MX, std::max({mtp + 1, dfl ? dfl::K + 1 : 0, plan.chunk}));   // DFlash2: its widest verify
-                rt_runs = std::min(s2sess, place / (rp + rt_win));
+                // sessions at GR8_CP_R2 hold fewer prefix pages: the slots cover as many of them as place holds
+                rt_runs = std::min(s2sess, place / ((cp_R2 ? cp_R2 / 64 : rp) + rt_win));
                 if (knob::rt_pool()) rt_runs = std::min(rt_runs, S / (2048 * rt_rows));
                 else S = 2048 * rt_rows * rt_runs;
                 if (rt_runs < 1) die("GR8_RT_POOL " + std::to_string(S) + ": less than one session past R (2048 x " + std::to_string(rt_rows) + " rows)");
@@ -1639,13 +1645,14 @@ int main(int argc, char** argv)
         sc.decode_rounds = (uint32_t)knob::s2_decode_rounds();
         sc.steering = steering_boot;
         if (rtt && rtt->local) sc.window_pages = (uint32_t)rtt->local;   // a window run lists its worst case and the window
+        sc.r2_rows = (uint32_t)cp_R2;
         // GR8_CP_STEP_ROWS (sized the CP fabric above) and GR8_CP_STEP_SEG=1: Driver::step's rounds past R (cp_rows.h)
         {
             const bool seg = knob::cp_step_seg();
             if (seg && !cp_step) die("GR8_CP_STEP_SEG=1 needs GR8_CP_STEP_ROWS");
             sc.cp_step_rows = (uint32_t)cp_step;
             sc.cp_seg = seg;
-            sc.cp_after = g6s2::cp_after(m.bk, m.nbk, m.cp.on ? m.cp.R : -1);
+            sc.cp_after = g6s2::cp_after(m.bk, m.nbk, m.cp.on ? m.cp.step_R() : -1);
             if (cp_step && R == 0)
                 fprintf(stderr, "# s2 GR8_CP_STEP_ROWS=%d: a step past R (context > %llu) carries at most %d rows = %d sessions of %d%s; "
                         "the CP fabric is sized for it\n", cp_step, (unsigned long long)sc.cp_after, cp_step, cp_step / (mtp + 1), mtp + 1,
@@ -1857,14 +1864,15 @@ int main(int argc, char** argv)
             // the run's pages go into the layers' tables. Staged prefill reads index keys through them too.
             [&](const g6s2::Slot& sl) {
                 const bool ex = pool.exclusive_run(sl.run);
+                m.cp.pf_R = (int)sl.req.r_rows;   // the pages its prefill stages follow its R
                 if (ex)
                 {
                     if (pool.split())   // the run's own pages: its CP map over its list
                     {
                         const std::vector<int> run = pool.list(sl.run);
                         const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
-                        s2_solo_cp_pages(m, run, most);
-                        s2_solo_cp_pages(D.d, run, most);
+                        s2_solo_cp_pages(m, run, most, m.s2->rp[sl.key.slot]);
+                        s2_solo_cp_pages(D.d, run, most, m.s2->rp[sl.key.slot]);
                     }
                     else { s2_solo_built(m); s2_solo_built(D.d); }
                 }
@@ -1960,9 +1968,9 @@ int main(int argc, char** argv)
             rtt->write = [&, most](int q) {
                 const S2Model& s = *m.s2;
                 if (!s.ex_split[q]) return;
-                const std::vector<int> t = s2_cp_map(s, s.pool[0]->args, s.run[q], m.s2_below / 64, (size_t)s.table_cap);
+                const std::vector<int> t = s2_cp_map(s, s.pool[0]->args, s.run[q], s.rp[q], (size_t)s.table_cap);
                 G6RT_CK(g6h2d::copy(s.table[q], t.data(), t.size() * 4));
-                if (rt_layers == q) s2_solo_cp_pages(m, s.run[q], most);
+                if (rt_layers == q) s2_solo_cp_pages(m, s.run[q], most, s.rp[q]);
             };
             nx.before_main = [&](const StepIn& in, const S2In& h) {
                 for (int j = 0; j < h.ns; ++j)
@@ -2070,8 +2078,9 @@ int main(int argc, char** argv)
                     std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
                 }
                 const int q = (int)g.key.slot;
+                const int rp = int(g.req.r_rows ? g.req.r_rows : uint32_t(m.s2_below)) / 64;   // the run's prefix pages
                 if (rtt && !rtt->local) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); rt_told[q] = false; }   // a new run's pages are local
-                // release: a split run's tail starts unmapped, cycling through its window (list[R/64 ..], kvman-rs Pool::window)
+                // release: a split run's tail starts unmapped, cycling through its window (list[rp ..], kvman-rs Pool::window)
                 if (rtt && rtt->local)
                 {
                     if (rt_layers == q) rt_layers = -1;
@@ -2081,7 +2090,6 @@ int main(int argc, char** argv)
                     // slot's own included), so it is found before anything ends that slot
                     const bool ex = pool.exclusive_run(g.run);
                     const std::vector<int> l = ex ? pool.list(g.run) : std::vector<int>{};
-                    const int rp = cp_R / 64;
                     const std::vector<int> win = ex ? std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local) : std::vector<int>{};
                     const int pk = ex && g.reuse ? rt_parked(*rtt, win) : -1;
                     if (pk != q) rt_end(*rtt, q, st);
@@ -2095,9 +2103,9 @@ int main(int argc, char** argv)
                             rt_adopt(m, *rtt, pk, q, l, (int)g.reuse, st);
                             if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL slot %d adopts a retained run's records at row %u\n", q, g.reuse);
                         }
-                        else if (g.reuse > cp_R)   // every rank holds the same entries, so they all stop here alike
+                        else if ((int)g.reuse > rp * 64)   // every rank holds the same entries, so they all stop here alike
                             die("GR8_RT_LOCAL: a hit past R on a run whose records no slot or parked entry holds");
-                        else rt_begin(*rtt, q, win, l, st);
+                        else rt_begin(*rtt, q, win, l, rp * 64, st);
                     }
                 }
                 slot_prompt[q] = g.req.prompt_tokens;
@@ -2112,7 +2120,7 @@ int main(int argc, char** argv)
                 {
                     if (ex)
                     {
-                        if (pool.split()) s2_set_exclusive(*x, q, run, most);   // its own list; the slot view stays unused while solo
+                        if (pool.split()) s2_set_exclusive(*x, q, run, most, rp);   // its own list; the slot view stays unused while solo
                         else s2_set_exclusive(*x, q);
                         // alone: the run's pages clear (the whole pool on the identity map, today's reset)
                         if (!g.reuse)

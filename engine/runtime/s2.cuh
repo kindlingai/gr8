@@ -75,6 +75,7 @@ struct S2Model
     int pages[S2N] = {};              // per slot, run[q].size()
     bool exclusive[S2N] = {};         // per slot: a run past R (s2_set_exclusive), solo on the tables as built
     bool ex_split[S2N] = {};          // per slot: that run on the pool's page classes (its own list): its tables are its CP map
+    int rp[S2N] = {};                 // per slot, that run's prefix pages: the R it was granted at / 64 (GR8_CP_R2)
     int* table[S2N] = {};             // [nslots] device: the slot's block table, table_cap entries, shared by every layer's view
     int* zero_list = nullptr;         // [pool_pages] device: the pages s2_reset_pages clears
     G6AttnStepCell* cells = nullptr;  // [S2N][nl] device
@@ -212,14 +213,14 @@ inline void s2_set_pages(Model& m, int q, const std::vector<int>& list)
     s.exclusive[q] = false;
     s.ex_split[q] = false;
 }
-// slot q holds a run past R. On the pool's page classes (the run carries its own list) it shares the pool with runs
+// slot q holds a run past its R, rp prefix pages. On the pool's page classes (the run carries its own list) it shares the pool with runs
 // below R: alone, the layers' tables become its CP map (s2_solo_cp_pages, written at its prefill and at the mode
 // switch); with other sessions, the slot's table holds the same CP map (written here, table_cap entries) and the
 // batched steps read it (the CP batch views when the step's bucket is past R, s2_cp_step). `most` (the larger of the
 // two models' pools) bounds the list, whose draft-only pages sit past the main model's. Else the run is pages 0, 1, ..
 // on the layers' tables as built (s2_solo_built), S=1 only. ex_split records which, so the mode switch rebuilds what
 // bind decided (the pool's mode at the grant), not what the stored list's shape suggests.
-inline void s2_set_exclusive(Model& m, int q, const std::vector<int>& list, int most)
+inline void s2_set_exclusive(Model& m, int q, const std::vector<int>& list, int most, int rp)
 {
     S2Model& s = *m.s2;
     if (q < 0 || q >= s.nslots) die("s2_set_exclusive: slot out of range");
@@ -231,13 +232,15 @@ inline void s2_set_exclusive(Model& m, int q, const std::vector<int>& list, int 
     for (const G6AttnBinding* p : s.pool)
         if (p->args.cp_nr != a0.cp_nr || p->args.cp_rank != a0.cp_rank) die("s2_set_exclusive: the layers' CP splits differ");
 #endif
-    const std::vector<int> t = s2_cp_map(s, a0, list, m.s2_below / 64, (size_t)s.table_cap);
+    if (rp < 1 || rp > m.s2_below / 64) die("s2_set_exclusive: prefix pages outside 1..GR8_S2_BELOW / 64");
+    const std::vector<int> t = s2_cp_map(s, a0, list, rp, (size_t)s.table_cap);
     G6RT_CK(g6h2d::copy(s.table[q], t.data(), t.size() * 4));
     s.run[q] = list;
     s.base[q] = list.empty() ? 0 : list[0];
     s.pages[q] = (int)list.size();
     s.exclusive[q] = true;
     s.ex_split[q] = true;
+    s.rp[q] = rp;
 }
 // slot q holds a run past R: S=1 only, on the layers' tables as built (s2_solo_built). Its view table is 0, 1, ..
 inline void s2_set_exclusive(Model& m, int q)
@@ -547,15 +550,15 @@ inline void s2_solo_built(Model& m)
 
 // S=1 for a run past R on the page classes: the layers' tables become the run's CP map over its list (s2_cp_map).
 // The driver keeps StepIn::page_bound = pool_pages on every step of it,
-// as for any solo run. `most`: as s2_set_exclusive's.
-inline void s2_solo_cp_pages(Model& m, const std::vector<int>& list, int most)
+// as for any solo run. `most`, rp: as s2_set_exclusive's.
+inline void s2_solo_cp_pages(Model& m, const std::vector<int>& list, int most, int rp)
 {
     S2Model& s = *m.s2;
     if (!m.s2_below) die("s2_solo_cp_pages: only S2 below R has runs past R");
     s2_check_pages(s, list, most, most, "s2_solo_cp_pages");
     for (size_t l = 0; l < s.pool.size(); ++l)
     {
-        const std::vector<int> t = s2_cp_map(s, s.pool[l]->args, list, m.s2_below / 64, s.tab0[l].size());
+        const std::vector<int> t = s2_cp_map(s, s.pool[l]->args, list, rp, s.tab0[l].size());
         G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), t.data(), t.size() * 4));
     }
 }
@@ -711,16 +714,17 @@ inline int s2_bucket(const S2Model& s)
     return b;
 }
 inline int s2_step_rows(const S2Model& s) { return s.h.ns <= 0 ? 0 : s.h.row0[s.h.ns - 1] + s.h.rows[s.h.ns - 1]; }
-// the step runs the CP block (launch_attn_cp on the CP batch views): CP batch views, CP on, and the step's bucket past R.
-// The fabric side enqueues the CP collectives when the step's largest context is past R (g6m4 cp_enqueue); R is a
-// bucket boundary (context_buckets.h), so the two agree. Rows below R in such a step take the CP numerics (LSE merge).
+// the step runs the CP block (launch_attn_cp on the CP batch views): CP batch views, CP on, and the step's bucket past
+// CpState::step_R. The fabric side enqueues the CP collectives when the step's largest context is past it (g6m4
+// cp_enqueue); it is a bucket boundary (context_buckets.h), so the two agree. Rows below their own R in such a step
+// take the CP numerics (LSE merge).
 // s2_cp_bucket: the same for a step whose bucket is bk (NativeDispatch::capture_all skips the widths past
 // GR8_CP_STEP_ROWS where it holds)
 inline bool s2_cp_bucket(const Model& m, int bk)
 {
 #if defined(G6_CP) && G6_CP
     const S2Model& s = *m.s2;
-    return s.batch && !s.cbv.empty() && m.cp.on && m.bk[bk] > m.cp.R;
+    return s.batch && !s.cbv.empty() && m.cp.on && m.bk[bk] > m.cp.step_R();
 #else
     (void)m; (void)bk;
     return false;

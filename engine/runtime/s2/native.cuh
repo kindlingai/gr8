@@ -224,8 +224,9 @@ class NativeDispatch {
                 if (c_.main.s2->ex_split[next])
                 {
                     const int most = std::max(c_.main.s2->pool_pages, c_.draft.d.s2->pool_pages);
-                    g6rt::s2_solo_cp_pages(c_.main, run, most);
-                    g6rt::s2_solo_cp_pages(c_.draft.d, run, most);
+                    const int rp = c_.main.s2->rp[next];
+                    g6rt::s2_solo_cp_pages(c_.main, run, most, rp);
+                    g6rt::s2_solo_cp_pages(c_.draft.d, run, most, rp);
                 }
                 else { g6rt::s2_solo_built(c_.main); g6rt::s2_solo_built(c_.draft.d); }
             }
