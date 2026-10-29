@@ -140,7 +140,7 @@ what it was. #37 shipped this as `--kv-tier STORE,size=N,keep=evicted|shared|all
     --kv-write-limit 0.25                      # optional cap, off by default
 
 The launcher's `KV_STORE` holds the stores separated by `;`, with `KV_KEEP`, `KV_SYSTEM_AFTER` and `KV_WRITE_LIMIT`
-(KNOBS.md). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
+(`./gr8 knobs KV_`). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
 `remote:HOST:PORT`. `remote:auto` is the launcher's: each box's supervisor names the KV node mentat announces, with an
 RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40). An SSD store is cleared
 at every boot unless it has `persist=on` (below, Persistence).
@@ -278,7 +278,7 @@ keys, in the page block's layout), and the T logical pages' replicated parts pac
 GLM 5.3: 41,984 B of the MTP layer each). Before the indexer keys were sharded with the latent (#44) every rank held
 every page's keys, and the replicated part carried them too (15 a block); that is block format 2. Every rank queues the same copies and the same slots; the bytes in them are each rank's own. A tail
 goes back only into a run past R, whole, before the prefill writes the rows past the hit. It is on when the pool's R is
-the CP map's (`G6_S2_BELOW` = `G6_CP_R`, the default). The blocks of a tail differ by rank by design, so a store shared
+the CP map's (`GR8_S2_BELOW` = `GR8_CP_R`, the default). The blocks of a tail differ by rank by design, so a store shared
 by the ranks would have to leave tails out.
 
 ### Lock-step
@@ -343,15 +343,15 @@ are KV node leases.
 | `cargo test` (`tests/stash.rs`) | two ranks on 60 random traces with two tiers, growth and runs past R: each grant's reused rows hold its prompt's tokens after the copies (spills, moves, restores), the ranks queue the same copies and agree on the digest, no slot is held twice or lost. A five-turn chat counts once, and the third conversation stores the shared prefix and a fourth reads it back. A full tier moves its oldest entry on. A committed prefix survives a reopen. One whose copies were never reported done does not come back, and a torn record and another model's index are ignored |
 | `pool_stash_test` (host_tests.sh) | the same through the C interface, with the copies run through `mem:`, an `ssd:` file and a loopback KV node over TCP |
 | `control_protocol_test` | the grant's `restored` and `counted` fields round trip in `G6S2E5` |
-| m4sim (`G6_KV_TIER_CHECK`), layers 0 and 3 + MTP, four simulated ranks | a reuse hit's pages sent through `mem:`, `ssd:` and a loopback KV node, poisoned on the device, and read back: the printed lines equal the plain run's |
-| m4sim (`G6_KV_RANKS_CMP=1`) | below R (G6_CP_R covering the context) every simulated rank's page blocks equal rank 0's, byte for byte. Without that setting each rank holds other pages (the CP map), as expected |
+| m4sim (`GR8_KV_TIER_CHECK`), layers 0 and 3 + MTP, four simulated ranks | a reuse hit's pages sent through `mem:`, `ssd:` and a loopback KV node, poisoned on the device, and read back: the printed lines equal the plain run's |
+| m4sim (`GR8_KV_RANKS_CMP=1`) | below R (GR8_CP_R covering the context) every simulated rank's page blocks equal rank 0's, byte for byte. Without that setting each rank holds other pages (the CP map), as expected |
 
 TP=4, TP=3 and TP=6 build. The served path (Service with stored hits, counting in the grant, the boot agreement) has not
 run on the cluster: it needs four boxes.
 
 ### On the cluster (TP=4, 2026-10-12)
 
-The four GLM boxes, TP=4 home, the release from Hugging Face with the DFlash2 drafter, `--g6env-x G6_POOL_LOG=1`.
+The four GLM boxes, TP=4 home, the release from Hugging Face with the DFlash2 drafter, `--g6env-x GR8_POOL_LOG=1`.
 Requests went one at a time at temperature 0 with logprobs, unless stated. The replays are the opencode captures in the
 agent capture set. Boot-to-boot byte equality is not a check under the default config (the DFlash2 verify shape varies),
 so the check of output identity is the first token and its logprob: prefill is deterministic for the same reused rows.
@@ -401,7 +401,7 @@ ranks' drain ends spread by up to 2.6, 3.8 and 4.4 s, with the slow rank changin
 writes are what vary: four ranks write into the KV node box's one 100G port with no PFC, and the switch dropped 23-27 million
 packets on that port in each 8-agent run (90-190 thousand on each GLM box's port).
 
-`G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]` (test only: that rank sleeps inside every `every`th drain that copies
+`GR8_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]` (test only: that rank sleeps inside every `every`th drain that copies
 anything) makes it deterministic. Without the barrier, 12 s on rank 2's first drain failed the epoch at the next prefill
 with the crashes' text on every rank. Ranks 0, 1 and 3 printed `extra 63000c02`, a CP staging wait (`k_cp_pf_wait`,
 `0x63000c00 | flag << 8 | peer`) for peer 2 that timed out 25 s into the quantum; rank 2 was still asleep. With the
@@ -467,7 +467,7 @@ Two clusters (GLM and Flash, say) can share one KV node. Each store opened with 
 segments (`kvman-remote --seg-mb`, 1 GiB by default), starts at its floor (`size=`), and grows up to `cap=` (no `cap=`: as far as the node has room). Capacity
 moves between groups by whole segments (server.rs):
 
-- The head (rank 0) REPORTs to the node now and then (`G6_S2_SHARE_MS`, 1000 ms): the segments a rank it wants more
+- The head (rank 0) REPORTs to the node now and then (`GR8_S2_SHARE_MS`, 1000 ms): the segments a rank it wants more
   (s2/kv_share.h `share_want`: room for an entry too big for the tier, the pages the tier pushed out since the last
   report, or the next spill) and the ages of its coldest blocks, one per segment, in the order a shrink evicts
   (`coldest_ages`). A segment the tier holds empty reports as u64::MAX, so the node takes empty segments first and at
@@ -496,7 +496,7 @@ moves between groups by whole segments (server.rs):
 - A group that opens on a full node asks the others down toward their floors (the margin and the cooldown do not apply)
   and waits up to `--stall-s` for them. `kvman-remote --group-plan FILE` (lines `NAME nr=RANKS floor=SEGS`) keeps a
   planned group's floors free from the start, however full the node is; the floors must fit the node.
-- `KV_SHARE_WHEN=idle` (the default, engine `G6_KV_SHARE_WHEN`): the head offers its blocks to other groups only while
+- `KV_SHARE_WHEN=idle` (the default, engine `GR8_KV_SHARE_WHEN`): the head offers its blocks to other groups only while
   the engine is idle, so a give's compaction never pauses a turn. A group starting below its floor is still served.
   `always`: whenever the node asks.
 

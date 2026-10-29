@@ -2,18 +2,12 @@
 #pragma once
 #include "../attn/flash_pool_owner.h"
 #include "../comms/fabric.h"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt {
-// G6_PF_POOL_OWNER: unset/empty = auto (on for TP2 Flash prefill, off elsewhere), 0 = off, 1 = on (dies if unsupported).
+// GR8_PF_POOL_OWNER: unset = auto (2: on for TP2 Flash prefill, off elsewhere), 0 = off, 1 = on (dies if unsupported).
 inline int flash_pool_owner_mode() {
-    static const int mode = [] {
-        const char* s = getenv("G6_PF_POOL_OWNER");
-        if (!s || !*s) return 2;
-        if (!strcmp(s, "0")) return 0;
-        if (strcmp(s, "1")) die("G6_PF_POOL_OWNER must be 0 or 1");
-        return 1;
-    }();
-    return mode;
+    return (int)knob::pf_pool_owner().value_or(2);
 }
 struct FlashPoolTransport {
     g6::Fabric* fabric = nullptr;

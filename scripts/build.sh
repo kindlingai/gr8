@@ -28,12 +28,15 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 # the Rust pack loader (engine/loader-rs), and bin/g6load, which plans and checks the Hugging Face fetch. Where cargo is
 # missing (the CUDA image), build it on the host first: cargo build --release --manifest-path engine/loader-rs/Cargo.toml
 # (g6m4 links target/release/libg6load.a when it exists, and target/release/g6load is copied next to g6m4)
-# The S2 page allocator (engine/kvman-rs) is not optional: g6m4 always links target/release/libg6kvman.a, built the
-# same way.
+# The S2 page allocator (engine/kvman-rs) and the knob table's C API (engine/knobs-rs) are not optional: g6m4 always
+# links target/release/libg6kvman.a and libgr8knobs.a, built the same way, and every test that reads a knob links the
+# second.
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
   cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
+  cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
 fi
+KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" -lpthread -ldl -lm)
 # request grammars (engine/runtime/grammar.h): XGrammar's C++, the copy the front end's xgrammar crate pins
 # (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
 # G6_XGRAMMAR=DIR names a source tree instead (the image's engine stages), G6_XGRAMMAR=0 builds without grammars.
@@ -144,18 +147,18 @@ build() {   # build <bin> <command..>: in the background, at most J at once; a f
 # shellcheck disable=SC2086
 build l2pf_bench $NVCC -O3 -std=c++17 $GEN $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} -I "$REPO/engine/kernels" \
   -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
-  "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas
+  "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas "${KNOBS[@]}"
 # G6_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
 # + bench on a synthetic TP4 layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
 # shellcheck disable=SC2086
 build k1_ovl_test $NVCC -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" \
-  "$REPO/engine/kernels/tests/k1_ovl_test.cu"
+  "$REPO/engine/kernels/tests/k1_ovl_test.cu" "${KNOBS[@]}"
 # Steering projection/consume/finalizer fixtures (and S2 batched steering, s2_steer_test): compile in CI even without a
 # GPU. No model or fabric service needed.
 STEERING="s2_steer_test steering_consume_test steering_shared_test steering_boot_cuda_test steering_cuda_test"
 for test in $STEERING; do
   # shellcheck disable=SC2086
-  build $test $NVCC -O2 -std=c++17 $S2 -o "$OUT/$test" "$REPO/engine/runtime/tests/$test.cu" -lcublas
+  build $test $NVCC -O2 -std=c++17 $S2 -o "$OUT/$test" "$REPO/engine/runtime/tests/$test.cu" -lcublas "${KNOBS[@]}"
 done
 # dense trellis matrices, at each width with that width's engine flags, and in the Flash geometry at its widths: build
 # only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
@@ -164,17 +167,17 @@ for n in $WIDTHS; do
   case " ${F12_WIDTHS:-4} " in *" $n "*) f="$f -DPF_F12" ;; esac
   # shellcheck disable=SC2086
   build dtr_test_tp$n $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS $f -I "$REPO/engine/kernels" -o "$OUT/dtr_test_tp$n" \
-    "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas
+    "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas "${KNOBS[@]}"
 done
 for n in 2 3 4; do
   # shellcheck disable=SC2086
   build dtr_test_flash_tp$n $NVCC -O2 -std=c++17 $GEN ${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 \
     -DG6_NR=$n -DDEC_S2 -I "$REPO/engine/kernels" -o "$OUT/dtr_test_flash_tp$n" "$REPO/engine/kernels/tests/dtr_test.cu" \
-    -lcublas
+    -lcublas "${KNOBS[@]}"
 done
 # TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
 build tr3_e4m3_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/tr3_e4m3_test" "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" \
-  -lcublas
+  -lcublas "${KNOBS[@]}"
 # gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py)
 build gpuprobe $NVCC -O2 -std=c++17 $GEN -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
 # the prefetch queues (G6_L2PF targets, G6_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
@@ -184,10 +187,10 @@ build l2pf_queue_test nvcc -O2 -std=c++17 $GEN $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_
 # K1 split choice (G6_K1_SPLIT table vs triple, the fused remap's KS1 x WG >= 2 guard): host only, runs everywhere
 # shellcheck disable=SC2086
 build k1_split_test nvcc -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" \
-  "$REPO/engine/kernels/tests/k1_split_test.cu"
+  "$REPO/engine/kernels/tests/k1_split_test.cu" "${KNOBS[@]}"
 # fabric groups over real verbs (#154): built here, run by hand on the cluster (one process per box; see its header)
 build fabric_group_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" \
-  "$REPO/engine/comms/tests/fabric_group_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs -lpthread
+  "$REPO/engine/comms/tests/fabric_group_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
 # the adaptive draft length decision, CPU
 build test_spec_len $GXX -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
 # the prefix-reuse state machine (--reuse-prefix and its grid rules), CPU

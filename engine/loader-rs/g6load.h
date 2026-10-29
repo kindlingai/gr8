@@ -42,7 +42,7 @@ void* g6l_v2_plan(const char* base_manifest, const char* base_pack, const char* 
                   const char* widths, const char* out_manifest, char* err, size_t errlen);
 // Plans rank `rank`'s image at TP `nr` from the exlr8 v2 release alone, no base pack (src/release.rs): every non-expert
 // tensor from the dense and vocab files under dense_dir (or dense_dir/dense), the experts as g6l_v2_plan reads them.
-// qo != 0 adds every layer's full-head q_b / o_proj / UK / UV (L%03d.qo.*, the QO pack's tensors, G6_PF_OWN=3).
+// qo != 0 adds every layer's full-head q_b / o_proj / UK / UV (L%03d.qo.*, the QO pack's tensors, GR8_PF_OWN=3).
 // trellis != 0 gives the trellis matrices as the release's entries (engine/kernels/dtr.cuh), 0 rounds them to the
 // MXFP8 and int4 forms of a converted pack. layout: a layout file (src/layout.rs) that says which pieces the rank
 // holds, or NULL / "" for the formulas. Writes

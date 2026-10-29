@@ -1,4 +1,4 @@
-// G6_DRAFT_HEAD2 (kernels/head2.cuh, two-stage draft head) unit test and bench: one GB10, synthetic records, no pack.
+// GR8_DRAFT_HEAD2 (kernels/head2.cuh, two-stage draft head) unit test and bench: one GB10, synthetic records, no pack.
 //   dhead2_test [--time [reps]] [--rows O]
 // Check (O = 4096 vocab rows of K = 6144, M = 1, 3, 8; random head-like MXFP8 records as dhead_i4_test):
 //   1. k_mx_to_i2 against a host derivation from the MXFP8 values (head2.cuh header), byte for byte, every byte written

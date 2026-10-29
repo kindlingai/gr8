@@ -6,9 +6,9 @@
 //!              [--rounded] [--kvb-fp8] [--sizes] [--layout FILE]
 //!
 //! --layers picks the L<LLL>.* tensors to write (default none), --globals the G.* ones. Routed-expert tensors (tr3.*)
-//! are written only with --experts. --qo plans the G6_PF_OWN=3 full-head tensors too. --rounded gives the trellis
+//! are written only with --experts. --qo plans the GR8_PF_OWN=3 full-head tensors too. --rounded gives the trellis
 //! matrices in today's forms (MXFP8 / int4), and without it they are the release's entries. --kvb-fp8 plans kv_b as the
-//! engine does under G6_KVB=fp8 (#50). --layout plans the rank's pieces from a layout file (src/layout.rs) instead
+//! engine does under GR8_KVB=fp8 (#50). --layout plans the rank's pieces from a layout file (src/layout.rs) instead
 //! of the formulas. The table of forms goes to stderr, and with --sizes
 //! the image's bytes by tensor kind to stdout.
 

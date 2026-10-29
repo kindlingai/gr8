@@ -1,4 +1,4 @@
-// mtp_lastrow_test: G6_MTP_LASTROW (rank.cuh launch_mlp_block; glue.cuh k_router_plan keep / keep_dev) against the full
+// mtp_lastrow_test: GR8_MTP_LASTROW (rank.cuh launch_mlp_block; glue.cuh k_router_plan keep / keep_dev) against the full
 // MoE layer call. One GB10, no pack files, no fabric. The MTP draft's MoE layer call as launch_mlp_block runs it: x2 ->
 // fragment tables (k_xfrag), router GEMV (BF16 records, tpc 2 x ks 16, as make_layer binds it) -> k_router_plan -> K1
 // (fc1, fc2, finalize), on the synthetic exlr8 v2 layer of k1_ovl_test (GLM-5.3 TP4 rank shape: 256 routed experts x 4
@@ -10,7 +10,7 @@
 //                    [--corr 0.6] [--k4mod 4] [--shbits 4] [--check-only] [--bench-only]
 //
 // Check (the claim: the rows a draft step's readers take are the same bytes): for every M, fuse 1 (the engine's policy:
-// fused at M = 1, separate above) and fuse 0, G6_ROUTE_OVL off / 1 / 2, every routing set:
+// fused at M = 1, separate above) and fuse 0, GR8_ROUTE_OVL off / 1 / 2, every routing set:
 //   last   keep = 1 << (M - 1) (today's path: the step's last row), by value as the S=1 draft graphs capture it
 //   s2     keep_dev = the last rows of a session layout (S2: every session's last row; one layout per set, 1..min(M, 8)
 //          sessions of random sizes), read from device memory at launch as k_s2_last_rows writes it
@@ -249,7 +249,7 @@ int main(int argc, char** argv)
     uint8_t* outs = static_cast<uint8_t*>(alloc(obytes * sets));      // per routing set (graph check)
     cudaStream_t st;
     CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-    bind::K1Ovl O[3];                                                // [variant]: 0 = off, 1 / 2 = G6_ROUTE_OVL mode
+    bind::K1Ovl O[3];                                                // [variant]: 0 = off, 1 / 2 = GR8_ROUTE_OVL mode
     for (int v = 1; v < 3; ++v)
     {
         O[v].mode = v;

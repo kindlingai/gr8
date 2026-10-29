@@ -1,10 +1,10 @@
-// G6_CP_STEP_ROWS=n (every rank, read at boot; default off): a step past R carries at most n rows. Host only, no CUDA.
+// GR8_CP_STEP_ROWS=n (every rank, read at boot; default off): a step past R carries at most n rows. Host only, no CUDA.
 // Since #94 a split run past R shares batched steps, and the CP fabric (and the CP graphs at every bucket past R) are
 // sized for the widest S2 step: sessions x (mtp + 1) = 24 rows at 8 sessions, MTP 2. With the knob the fabric is sized
 // for n rows and the round a past-R session takes holds at most n / (mtp + 1) sessions; the other sessions sit that round
 // out (s2_batch.h Batch::round: their state does not change) and go in the next one, in cycles in which every decoding
 // session gets exactly one round. A round without a past-R session (a step below R) keeps the full batch.
-// G6_CP_STEP_SEG=1 (needs the knob): a past-R round never takes a session below R, so a session below R never runs the CP
+// GR8_CP_STEP_SEG=1 (needs the knob): a past-R round never takes a session below R, so a session below R never runs the CP
 // block (whose LSE merge rounds differently from the replicated path) because of a long session it shares the pool with.
 // Every input is replicated state (the scheduler's decoding sessions in request-id order, the driver's grow stalls,
 // Batch lengths, boot constants), so every rank forms the same rounds without exchanging them.
@@ -27,22 +27,18 @@ inline uint64_t cp_after(const int* bk, int nbk, int R)
     for (int k = 0; k < nbk && bk[k] <= R; ++k) t = uint64_t(bk[k]);
     return t;
 }
-// The knob's boot value: env (unset, "" or "0" = off -> 0), solo = the rows a CP step takes without S2 batching (the
-// solo and prompt graphs' row counts: the fabric's size before #94), full = the widest S2 step (#94's size). A value
-// below solo is refused (-1, *err); one above full is clamped to full.
-inline int cp_step_rows_env(const char* env, int solo, int full, std::string* err)
+// The boot value of v = GR8_CP_STEP_ROWS (0 = off), solo = the rows a CP step takes without S2 batching (the solo and
+// prompt graphs' row counts: the fabric's size before #94), full = the widest S2 step (#94's size). A value below solo
+// is refused (-1, *err); one above full is clamped to full.
+inline int cp_step_rows(int64_t v, int solo, int full, std::string* err)
 {
-    if (!env || !*env) return 0;
-    char* end = nullptr;
-    const long v = std::strtol(env, &end, 10);
-    if (*end || v < 0 || v > 4096) { *err = "G6_CP_STEP_ROWS=" + std::string(env) + ": a row count"; return -1; }
     if (v == 0) return 0;
     if (v < solo) {
-        *err = "G6_CP_STEP_ROWS=" + std::string(env) + ": at least " + std::to_string(solo) +
+        *err = "GR8_CP_STEP_ROWS=" + std::to_string(v) + ": at least " + std::to_string(solo) +
                " (the rows of a solo or prompt step past R: the verify width and --chunk)";
         return -1;
     }
-    return int(std::min<long>(v, std::max(full, solo)));
+    return int(std::min<int64_t>(v, std::max(full, solo)));
 }
 struct CpCand { uint64_t id; bool past; };   // a decoding session: its immutable id, its next round may run past R
 struct CpPick {
@@ -55,7 +51,7 @@ class CpRound {
     bool served(uint64_t id) const { return std::find(served_.begin(), served_.end(), id) != served_.end(); }
 public:
     // The round's sessions among cand (the decoding sessions that are not stalled, in request-id order). rows = n (0 =
-    // off: everyone), per = the most rows one session's verify takes (mtp + 1), seg = G6_CP_STEP_SEG. Pure: commit()
+    // off: everyone), per = the most rows one session's verify takes (mtp + 1), seg = GR8_CP_STEP_SEG. Pure: commit()
     // records it once the round really runs.
     CpPick pick(const std::vector<CpCand>& cand, uint32_t rows, uint32_t per, bool seg) const {
         CpPick p;

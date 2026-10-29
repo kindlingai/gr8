@@ -3,12 +3,13 @@
 // model): steps with one live session take the solo graphs on that session's pages, steps shared by sessions the
 // batched graphs captured here, whose attention reads each row's own table (S2In, the batch views). KDA state is not
 // a paged cache: each session has its own kda_ring slots (FlashSlots), reset when it starts.
-// G6_FLASH_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h, --s2-sessions 1 only): the pool's prefix-reuse hooks
+// GR8_FLASH_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h, --s2-sessions 1 only): the pool's prefix-reuse hooks
 // serve Flash checkpoints. A prompt's prefill keeps one at its last cold-grid point; a later prompt that starts with its
 // tokens is granted the skip, restored at bind and prefilled from there.
 #pragma once
 #if G6_MODEL_FLASH
 #include "service.h"
+#include "../../knobs-rs/gr8_knobs.h"
 #include "flash_ring.h"
 #include "flash_checkpoint.cuh"
 #include "../flash_prefill.cuh"
@@ -26,10 +27,10 @@ struct FlashContext {
     g6rt::StepOut *output, *draft_output;
     std::function<void(int, int)> main_graph;
     std::function<void(int, bool, int)> draft_graph;
-    int split = 0;    // G6_DEC_SPLIT: the batched main graphs in two parts, as the solo ones
-    FlashCheckpoints* ckpt = nullptr;   // G6_FLASH_CACHE on: the checkpoint store, else none
-    bool terminal = false;              // G6_FLASH_CACHE=terminal: also a checkpoint at the end of every request
-    // optional: the engine's own hooks (G6_FLASH_KV_CHUNKS borrow-idle: resize on FLASH_KV_TIER, flash_room, flash),
+    int split = 0;    // GR8_DEC_SPLIT: the batched main graphs in two parts, as the solo ones
+    FlashCheckpoints* ckpt = nullptr;   // GR8_FLASH_CACHE on: the checkpoint store, else none
+    bool terminal = false;              // GR8_FLASH_CACHE=terminal: also a checkpoint at the end of every request
+    // optional: the engine's own hooks (GR8_FLASH_KV_CHUNKS borrow-idle: resize on FLASH_KV_TIER, flash_room, flash),
     // added after serve_flash's; a resize hook chains to the one already set for any other tier
     std::function<void(NativeHooks&)> install;
 };
@@ -47,9 +48,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     const unsigned pages = sc.pool_rows / PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
     FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring));
-    // G6_FLASH_CACHE keeps one live request's state: one session only (its ring is session 0's; g6m4 refuses it, and
-    // G6_FLASH_KV_CHUNKS, with --s2-sessions > 1)
-    require(!multi || !c.ckpt, "G6_FLASH_CACHE needs --s2-sessions 1");
+    // GR8_FLASH_CACHE keeps one live request's state: one session only (its ring is session 0's; g6m4 refuses it, and
+    // GR8_FLASH_KV_CHUNKS, with --s2-sessions > 1)
+    require(!multi || !c.ckpt, "GR8_FLASH_CACHE needs --s2-sessions 1");
     FlashRing& ring = ks.rings[0];
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
@@ -93,10 +94,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     // Rows the steps wrote into the attention caches (main and draft) since the last clear: a request clears only the
     // pages that hold them, one page past the last, and every later page is still zero from that clear (the full reset
     // cleared 12 x 436 MB per request at the 262K cap, ~27 ms). -1 = not known (boot): every page.
-    // G6_FLASH_RESET_ALL=1: every page per request, as before. G6_FLASH_RESET_CHECK=1: dies unless the pages past the
+    // GR8_FLASH_RESET_ALL=1: every page per request, as before. GR8_FLASH_RESET_CHECK=1: dies unless the pages past the
     // cleared ones are all zero (a test arm: it reads every cache).
-    auto env_on = [](const char* k) { const char* v = getenv(k); return v && atoi(v) != 0; };
-    const bool reset_all = env_on("G6_FLASH_RESET_ALL"), reset_check = env_on("G6_FLASH_RESET_CHECK");
+    const bool reset_all = knob::flash_reset_all(), reset_check = knob::flash_reset_check();
     int dirty = -1;
     unsigned* zflag = nullptr;
     if (reset_check) G6RT_CK(cudaMalloc(&zflag, 4));
@@ -177,7 +177,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             if (reset_check) {
                 const int lm = reset_dirty_layer(c.main, pg, zflag, c.stream), ld = reset_dirty_layer(c.draft.d, pg, zflag, c.stream);
                 if (lm >= 0 || ld >= 0) {
-                    fprintf(stderr, "# G6_FLASH_RESET_CHECK: request %llu: nonzero cache past page %d (rows < %d written): main layer %d, draft layer %d\n",
+                    fprintf(stderr, "# GR8_FLASH_RESET_CHECK: request %llu: nonzero cache past page %d (rows < %d written): main layer %d, draft layer %d\n",
                             (unsigned long long)g.req.id, pg, dirty, lm, ld);
                     require(false, "Flash partial reset: a cache page past the written rows is not zero");
                 }
@@ -321,11 +321,11 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         // word check() reads stays set until the next request's reset: one check after the last chunk sees what one per
         // chunk saw, without check()'s blocking copy per layer each MX rows. The fence per chunk stays (k_step_in reads
         // *c.draft_input, which the next chunk rewrites).
-        const bool cache = !getenv("G6_FLASH_DRAFT_KV") || atoi(getenv("G6_FLASH_DRAFT_KV"));
+        const bool cache = knob::flash_draft_kv();
         fence();
         if (!cache) check();
         auto draft = [&](FlashPrefill& fp, int n, int base) {
-            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // G6_PF_DRAFT_FULL (flash_prefill.cuh)
+            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // GR8_PF_DRAFT_FULL (flash_prefill.cuh)
             {
                 const bool chk = pf_draft_full() == 2;
                 DraftFull& F = pf_draft_cache_full(c.draft, fp, n, base, p.prompt.data() + base + 1, chk, c.stream);
@@ -345,7 +345,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 });
                 unsigned dw = 0;
                 G6RT_CK(cudaMemcpy(&dw, F.diff, 4, cudaMemcpyDeviceToHost));
-                fprintf(stderr, "# G6_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
+                fprintf(stderr, "# GR8_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
                 return;
             }
             pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
@@ -391,7 +391,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     auto capture_all = [&] {
         const int nbk = c.main.nbk;
         require(nbk >= 1 && nbk == c.draft.d.nbk && nbk <= NBK, "Flash main/draft context buckets differ");
-        const FlashShapes f = flash_shapes(int(sc.limit()), int(sc.mtp), chunk, s2::adapt_env(), MX);
+        const FlashShapes f = flash_shapes(int(sc.limit()), int(sc.mtp), chunk, knob::s2_adapt(), MX);
         const auto t0 = std::chrono::steady_clock::now();
         size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0, &total));
         c.main.s2on = c.draft.d.s2on = true; fence();
@@ -445,12 +445,10 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         c.main.s2->in = layout; c.draft.d.s2->in = draft_layout;
     }
     // the checkpoint store on a group lease (D-331 M8 (c)): it shares its KV node with the full model's pool. Every rank
-    // resizes it at the Resize commit; the head reports to the node every G6_S2_SHARE_MS, offering what it holds only
-    // while idle (G6_KV_SHARE_WHEN=idle, default) or whenever the node asks (always), as the full model's pool does
+    // resizes it at the Resize commit; the head reports to the node every GR8_S2_SHARE_MS, offering what it holds only
+    // while idle (GR8_KV_SHARE_WHEN=idle, default) or whenever the node asks (always), as the full model's pool does
     if (ck && ck->group()) {
-        const char* when = getenv("G6_KV_SHARE_WHEN");
-        if (when && strcmp(when, "idle") && strcmp(when, "always")) throw std::runtime_error("G6_KV_SHARE_WHEN is idle or always");
-        const bool always = when && !strcmp(when, "always");
+        const bool always = knob::kv_share_when() == "always";
         const int rank = c.main.rank;
         h.resize = [&, rank](const Resize& r) {
             if (r.tier != FLASH_CKPT_TIER) throw std::runtime_error("Flash serve: a Resize on tier " + std::to_string(r.tier));

@@ -84,7 +84,7 @@ int g6kv_match_namespaced(const g6kv_pool* p, const int32_t* prompt, size_t n, u
 int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, g6kv_run* out);
 
 uint64_t g6kv_digest(const g6kv_pool* p);
-// one stderr line per claim (g6m4: G6_POOL_LOG=1)
+// one stderr line per claim (g6m4: GR8_POOL_LOG=1)
 void g6kv_log(g6kv_pool* p, int on);
 uint32_t g6kv_kept_runs(const g6kv_pool* p);
 int g6kv_stats(const g6kv_pool* p, g6kv_totals* out);
@@ -200,7 +200,7 @@ int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
 // a RAM cache's counters ("ram:FLOOR+STORE"): out[0] reads from RAM, out[1] reads that went to the store, out[2]
 // writes not cached for lack of free memory. 0, or -1 for a store without a RAM cache.
 int g6kv_tier_ram_stats(const g6kv_tier* t, uint64_t* out);
-// Remote attention rows (src/rows.rs, the engine's G6_RT_STORE tier): a store of `bytes` ("mem:" or "remote:HOST:PORT",
+// Remote attention rows (src/rows.rs, the engine's GR8_RT_STORE tier): a store of `bytes` ("mem:" or "remote:HOST:PORT",
 // a lease named `name`), and a helper thread that serves each group's request ring. Its first G6KV_ROWS_HEADER bytes
 // hold the layout the records were written under: open writes `layout` into an empty store and refuses a store that
 // names another one. The GPU fills a ring's entries, then stores seq (system-scope release); the thread reads each

@@ -34,6 +34,7 @@
 // rotations around the GEMMs (Xq::suh, Gemm::osvh).
 #pragma once
 #include "tr3.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #ifdef DEC_SLOT
 #include "decslot.cuh"
 #endif
@@ -447,38 +448,31 @@ inline cudaError_t init()
 inline void split_for(int K, int side, int epi, int rot, int M, int& ks, int& sub)
 {
     ks = 4; sub = 1;
+    // a k1,s1[,k4,s4] list (GR8_DSA_QB_SPLIT, GR8_DSA_OPROJ_SPLIT, GR8_KDA_OPROJ_SPLIT): at 1 row k1, s1; at more rows
+    // k4 (else k4_unset) and s4 (else 1). A list of fewer than two numbers keeps the split.
+    auto take = [&](const std::optional<std::vector<int64_t>>& l, int k4_unset) {
+        if (!l || l->size() < 2) return;
+        const std::vector<int64_t>& v = *l;
+        ks = static_cast<int>(M == 1 ? v[0] : v.size() > 2 ? v[2] : k4_unset);
+        sub = static_cast<int>(M == 1 ? v[1] : v.size() > 3 ? v[3] : 1);
+    };
     if (epi == EPI_GLU) { ks = (K == 4096 && M <= 3) ? 32 : 16; sub = (K != 4096 && M <= 3) ? 2 : 1; }
     else if (side == SIDE_OUT && K == geom::QA)
     {
         ks = geom::QA / 128;         // q_b (16 on GLM, 12 on Flash)
-        if (const char* eq = getenv("G6_DSA_QB_SPLIT"))
-        {
-            int k1 = ks, s1 = 1, k4 = ks, s4 = 1;
-            if (sscanf(eq, "%d,%d,%d,%d", &k1, &s1, &k4, &s4) >= 2) { ks = (M == 1) ? k1 : k4; sub = (M == 1) ? s1 : s4; }
-        }
+        take(knob::dsa_qb_split(), ks);
     }
     else if (side == SIDE_IN && K == 8192 && geom::HID == 4096)
     {
         ks = 4;
-        if (const char* ed = getenv("G6_DSA_OPROJ_SPLIT"))
-        {
-            int k1 = 4, s1 = 1, k4 = 4, s4 = 1;
-            if (sscanf(ed, "%d,%d,%d,%d", &k1, &s1, &k4, &s4) >= 2) { ks = (M == 1) ? k1 : k4; sub = (M == 1) ? s1 : s4; }
-        }
+        take(knob::dsa_oproj_split(), 4);
     }
     else if (!rot) { ks = M <= 3 ? K / 128 : K / 256; sub = M <= 3 ? 1 : 2; }
     else if (side == SIDE_OUT) ks = K % 3 == 0 ? 6 : 16;                     // gate/up alone (K 6144) or Flash KDA q/k/v (K 4096)
     else if (K >= 4096)
     {
         ks = M == 1 ? (K == 8192 ? 4 : (geom::HID == 4096 ? 8 : 32)) : 4;
-        if (K == 4096 && geom::HID == 4096)
-        {
-            if (const char* eo = getenv("G6_KDA_OPROJ_SPLIT"))
-            {
-                int k1 = 8, s1 = 1, k4 = 4, s4 = 1;
-                if (sscanf(eo, "%d,%d,%d,%d", &k1, &s1, &k4, &s4) >= 2) { ks = (M == 1) ? k1 : k4; sub = (M == 1) ? s1 : s4; }
-            }
-        }
+        if (K == 4096 && geom::HID == 4096) take(knob::kda_oproj_split(), 4);
     }
     else ks = K % 3 == 0 ? (M <= 3 ? 24 : 3) : (M <= 3 ? 16 : 4);            // down with its own rotation or Flash TP4 KDA o_proj
 }
@@ -508,10 +502,8 @@ inline const char* fill(Gemv& g, int nm, int M, int ks, int sub, int rot, const 
     const int nblk = g.a.N / 128;
     if (part_floats(g.a.N, nm, ks, M) > sc.part_n) return "dense trellis GEMV: scratch partials too small";
     if (cnt_off + nblk > sc.cnt_n) return "dense trellis GEMV: scratch counters too few";
-    static const int dtr_nbfast = !getenv("G6_DTR_NBFAST") || atoi(getenv("G6_DTR_NBFAST"));
-    static const int dtr_nbfast_out = !getenv("G6_DTR_NBFAST_OUT") || atoi(getenv("G6_DTR_NBFAST_OUT"));
     g.a.ks = ks; g.a.M = M;
-    g.a.nb_fast = (nm == 1 && (g.a.sG > g.a.sB ? dtr_nbfast : dtr_nbfast_out)) ? 1 : 0;
+    g.a.nb_fast = (nm == 1 && (g.a.sG > g.a.sB ? knob::dtr_nbfast() : knob::dtr_nbfast_out())) ? 1 : 0;
     g.a.part = sc.part; g.a.cnt = sc.cnt + cnt_off;
     g.nt = NT; g.sub = sub; g.rot = rot;
     g.grid = static_cast<unsigned>(nblk * nm * ks);

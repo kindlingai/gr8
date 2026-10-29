@@ -12,7 +12,7 @@
 #                                     it. The engine plans every rank's weights from its files
 #        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
 #        --drafter URL                TP=4 or 6: the DFlash2 drafter's repo, fetched and converted on each box
-#        --cap 262144, --sess 4, ...  every knob in KNOBS.md, as --<knob> VALUE
+#        --cap 262144, --sess 4, ...  every knob ./gr8 knobs lists, as --<knob> VALUE
 #   ./gr8 glm53 down                  stop every box of the last boot
 #   ./gr8 glm53 restart [OPTIONS]     down, then up
 #   ./gr8 glm53 status                every box's state, engine and MemAvailable, and the head's shim, front end, /health
@@ -22,11 +22,14 @@
 #   ./gr8 glm53 check [OPTIONS]       what would stop this box's boot
 #   ./gr8 glm53 show-config [OPTIONS] the effective options, the cluster options the boxes compare, the model set id
 #   ./gr8 glm53 prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part without booting
+#   ./gr8 glm53 knobs [WORD..] [OPTIONS]   every option, and the value each TP runs with these options; WORDs keep
+#                                     the options whose name holds one
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
 #
+#   ./gr8 knobs [WORD..]              every option of ./gr8 <model> and ./gr8 kv: flag, scope, default and meaning
 #   ./gr8 models                      the models, and for each the name to give, its release and the values --tp and
 #                                     --variant take (tools/launch/models.py)
 #
@@ -42,7 +45,7 @@
 #   ./gr8 test gpu [BIN_DIR]          the one-GPU unit tests (scripts/c1_tests.sh)
 #
 # Options come from the command line, then one config file (@FILE, else ./cluster.env, else config/cluster.env, which
-# ./gr8 parses and does not source), then the environment, then the defaults. An old config file works: HOSTS is read as PEERS. KNOBS.md
+# ./gr8 parses and does not source), then the environment, then the defaults. An old config file works: HOSTS is read as PEERS. ./gr8 knobs
 # lists every option.
 # --no-check (or CHECK=0) boots without the checks.
 set -eu
@@ -71,6 +74,7 @@ case $model in
   glm53f) build_model=flash ;;
   pseudo) build_model=pseudo ;;
   models) exec python3 "$REPO/tools/launch/models.py" ;;
+  knobs) shift; GR8_MODEL='' exec python3 "$REPO/tools/launch/launch.py" knobs "$@" ;;
   kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;
   query) shift; exec python3 "$REPO/tools/query/query.py" "$@" ;;
   test)
@@ -82,7 +86,7 @@ case $model in
       *) echo "gr8: ./gr8 test [frontend|engine|all], ./gr8 test pseudo TOKENIZER_DIR or ./gr8 test gpu [BIN_DIR]" >&2; exit 2 ;;
     esac ;;
   *) echo "gr8: the first argument names the model, glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash): ./gr8 glm53 <command>" \
-          "(./gr8 models lists them; or ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
+          "(./gr8 models lists them; or ./gr8 knobs, ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
 esac
 shift
 export GR8_MODEL=$model   # tools/launch/options.py
@@ -99,7 +103,7 @@ done
 set -- ${args[@]+"${args[@]}"}
 api() { echo "http://127.0.0.1:$PORT"; }
 case $cmd in
-  up|down|restart|status|health|logs|check|show-config|prepare)
+  up|down|restart|status|health|logs|check|show-config|prepare|knobs)
     [ $check = 0 ] && set -- "$@" --no-check
     exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@" ;;
   smoke)

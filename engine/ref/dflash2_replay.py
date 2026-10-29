@@ -1,4 +1,4 @@
-"""Replay a G6_DFL_DUMP of one request through the NumPy reference drafter (dflash2_ref.py).
+"""Replay a GR8_DFL_DUMP of one request through the NumPy reference drafter (dflash2_ref.py).
 
 python3 engine/ref/dflash2_replay.py DUMP --src DRAFTER --glm GLM_DIR [--quant mxfp8|bf16] [--rounds N] [--out FILE]
 

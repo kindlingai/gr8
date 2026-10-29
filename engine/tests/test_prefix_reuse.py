@@ -35,7 +35,7 @@ class PrefixReuseTests(unittest.TestCase):
         self.assertIn('if (s2mode || reuse_prefix)', s)   # prompt-step row counts 1..chunk
         self.assertIn('for (int a = skip; a < p.first; a += MP)', s)
         # the reuse grid is ONE sub-batch (MP = --prefill = 4096 served), not 2 * MP
-        self.assertIn('reuse.grid = al_ == 1 ? MP : 0;', s)
+        self.assertIn('reuse.grid = align ? MP : 0;', s)
         self.assertNotIn('2 * MP : MP', s)
         self.assertEqual(s.count('reuse.prefill_rows('), 2)       # both prefill branches (two lanes, one sub-batch)
         for branch in ['reuse.prefill_rows(a, MA + MB, mtp > 0);', 'reuse.prefill_rows(a, M, mtp > 0);']:
@@ -45,14 +45,14 @@ class PrefixReuseTests(unittest.TestCase):
         self.assertIn('reuse.main_rows(in->pos[0], M);', s)
         self.assertIn('reuse.draft_rows(di.pos[0], M, chain)', s)
         self.assertIn('if (!skip)\n        {\n            reset(m, st);\n            if (mtp) reset(D.d, st);', s)
-        # gate arm: poison only on a hit (the else of if (!skip)), only behind G6_REUSE_POISON=1, before the prefill loop
+        # gate arm: poison only on a hit (the else of if (!skip)), only behind GR8_REUSE_POISON=1, before the prefill loop
         pos = s.index('else if (reuse_poison_on && old_dirty > skip)')
         self.assertIn('reuse_poison(m, skip, old_dirty, st);', s)
         self.assertIn('const int old_end = reuse.written_end, old_dirty = reuse.dirty_end;', s)
         self.assertLess(s.index('old_dirty = reuse.dirty_end;'), s.index('reuse.begin(sp.prompt'))   # read before begin() resets it
         self.assertLess(s.index('if (!skip)\n        {\n            reset(m, st);'), pos)
         self.assertLess(pos, s.index('for (int a = skip; a < p.first; a += MP)'))
-        self.assertIn('reuse_poison_on = po_ == 1;', s)
+        self.assertIn('reuse_poison_on = knob::reuse_poison();', s)
         for mtp in [True, False]:
             self.assertIn('reuse.finish(p.prompt, gen, (int)gen.size(), ' + str(mtp).lower() + ');', s)
         # the offline loop refuses DFlash2 with reuse (the drafter's prompt taps come from the prefill a hit

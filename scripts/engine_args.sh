@@ -1,4 +1,4 @@
-# The engine command line. The per-box supervisor (tools/launch) sources this file. KNOBS.md lists
+# The engine command line. The per-box supervisor (tools/launch) sources this file. ./gr8 knobs lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 # GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), or pseudo, the pseudo
@@ -160,7 +160,7 @@ engine_defaults() {
 flash_env() {
   ENGINE_BIN=g6m4_flash
   ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_FPF_P1=0 G6_FPF_DSA_P1=0 \
-G6_FPF_ATTN_P1=0 G6_PF_SPARSE_MLA_P1=0 G6_PF_SPARSE_MLA_HYBRID=0 G6_PF_SPARSE_MLA=1 G6_PF_SPARSE_MLA_512=1 \
+G6_FPF_ATTN_P1=0 G6_PF_SPARSE_MLA=1 G6_PF_SPARSE_MLA_512=1 \
 G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_FC2V2=1 G6_PF_KDA_WS=1 \
 G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
 G6_PF_TIMES=1 G6_PF_STAGE_ASYNC=1"

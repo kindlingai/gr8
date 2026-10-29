@@ -7,9 +7,9 @@
 // allocation, so a step's calls stream cold weights exactly as the engine's do (the L2 holds 24 MB of one call's ~75 MB).
 //
 // Routing: the plan of every (step, layer) call comes from the engine's k_router_plan on logits that select given
-// experts per row: --routes FILE (G6_ROUTE_LOG lines: the distinct expert ids of every MoE layer of every MTP main
+// experts per row: --routes FILE (GR8_ROUTE_LOG lines: the distinct expert ids of every MoE layer of every MTP main
 // step; offline --prompt runs only, rank.cuh route_log_line; the lines with M = the bench M are used), else --exlog FILE
-// (the "# s2_round" lines of a G6_S2_ROUNDLOG=1 rank-0 log: distinct counts per layer per main step, and the ids
+// (the "# s2_round" lines of a GR8_S2_ROUNDLOG=1 rank-0 log: distinct counts per layer per main step, and the ids
 // themselves when the run also had G6_S2_ROUTE_IDS=1; without ids they are drawn uniformly), else the served means
 // (kstop-1015 meas.r0.err, 5823 main steps: distinct per layer 8.0 / 13.5 / 18.6 / 23.9 / 28.6 / 33.7 / 38.6 / 44.3 at
 // M = 1..8; above 8 rows +5.2 per row). Rows are then given 8 experts each so that every distinct id is used (the
@@ -22,7 +22,7 @@
 //   k1_audit [--M 1,3,4,8,12] [--manifest exlr8-manifest-home.json] [--rank 0] [--widths home|k2|k3|k4|mix|mod:N]
 //            [--routes route.jsonl | --exlog rank0.err] [--steps 8] [--layers 75] [--reps 5] [--arms all|base|ns2|tlbw]
 //            [--nowide] [--nowide2] [--seed 1] [--check-calls 75] [--ncu N] [--split 0|2|3|5] [--sess R]
-//            [--alloc each|one|vmm[:MB]] [--hold N] [--window O] [--tab G6_K1_SPLIT-table] [--tlb 0|1|only]
+//            [--alloc each|one|vmm[:MB]] [--hold N] [--window O] [--tab GR8_K1_SPLIT-table] [--tlb 0|1|only]
 //            [--w2all 0|1] [--check-only]
 //   The v2 release form (a boot from the exlr8 release, --v2-dense, TP=4): --manifest = the release's own width manifest
 //   (manifests/exlr8-manifest-home.json of the model set, mixed widths per unit -> tr3.kmix) and --w2all 1 (the launcher's
@@ -31,7 +31,7 @@
 //   --widths k2 / mix cover the K2 bodies too (every routed unit K2; or K2 / K3 / K4 per unit and per expert down width).
 //   --split S   bind every arm as an S2 step of row class S (make_k1 split_m = S; the engine's batched main step is
 //               class row_class(K+1) = 3 at MTP K = 2, M = sessions x 3). 0 = the solo split of M rows (class 5 at M >= 4:
-//               DFlash2 verify at 8 rows). The "bind" line prints the split the k1 arm got (a G6_K1_SPLIT table: --tab).
+//               DFlash2 verify at 8 rows). The "bind" line prints the split the k1 arm got (a GR8_K1_SPLIT table: --tab).
 //   --sess R    also check: the k1 arm's M rows == M / R solo calls of R rows each (split 0, the session's solo step),
 //               row for row (a batched row's bits do not depend on the batch; with every ns2 arm == k1, for them too).
 //               Give --split the class of R rows (3 for R = 2, 3): another class sums fc1 k partials in another order.
@@ -40,17 +40,18 @@
 //   --alloc     the weights' device memory: each = one cudaMalloc per tensor (the default; the runs before
 //               k1gap); one = ONE cudaMalloc for every held layer's tensors, 4 KB-aligned, back to back in layer order,
 //               as the engine's device image (runtime/packfind.h rs_fill); vmm[:MB] = that range from cuMemCreate chunks
-//               of MB (default: the recommended granularity), as G6_IMG_VMM (engine/vmm.h). Same bytes, other pages.
+//               of MB (default: the recommended granularity), as GR8_IMG_VMM (engine/vmm.h). Same bytes, other pages.
 //   --hold N    allocate N layers (default --layers) and bench --layers of them from layer --window O (default 0):
 //               --layers 8 --hold 75 --window 0 / 67 tells the footprint (TLB reach, page walks) from the allocation
 //               order (late layers on more fragmented memory: smaller pages).
-//   --tab T     arms "tab", "tab <other form>", "tab chain-ovl1", "tab chain-ovl2": the k1 arm bound with G6_K1_SPLIT=T
-//               (bind.cuh; e.g. 1:/4,3:2x1,4-32:/4) put in the ENVIRONMENT, as the launcher passes it, so every reader
-//               of the variable sees it (k1_split's triple form skips a table, #155; before that it read 1:... as KS1 = 1:
-//               the #107 report), in the engine's launch form, the other one (fused / separate) and the route-overlap
-//               forms. The k1 arm itself is bound without G6_K1_SPLIT / G6_K1_SPLIT_M* (unset at start).
-//   --w2all V   G6_TR3_W2ALL=V for every binding (k1_split reads it once; the launcher sets 1 at TP=4). Default: the
-//               environment's value (unset = 0). The header line prints the value in force.
+//   --tab T     arms "tab", "tab <other form>", "tab chain-ovl1", "tab chain-ovl2": the k1 arm bound with GR8_K1_SPLIT=T
+//               (bind.cuh; e.g. 1:/4,3:2x1,4-32:/4) in the K1 settings make_k1 binds with (bind::K1Vars), as the
+//               launcher's environment gives it, so both readers of the variable see it (k1_split's triple form skips a
+//               table, #155; before that it read 1:... as KS1 = 1: the #107 report), in the engine's launch form, the
+//               other one (fused / separate) and the route-overlap forms. The k1 arm itself is bound without
+//               GR8_K1_SPLIT / GR8_K1_SPLIT_M* (the environment's are ignored).
+//   --w2all V   GR8_TR3_W2ALL=V for every binding (the launcher sets 1 at TP=4). Default: the environment's value
+//               (unset = 0). The header line prints the value in force.
 //   --check-only  the exactness checks only (no stream floor, no bench): for a matrix of ranks / widths / M.
 //   --tlb 1     after the benches: the GPU address-translation probe (one thread chasing pointers stored in the held
 //               weights at stride S over N granules from the first held layer, and inside the last one): latency per
@@ -58,21 +59,21 @@
 //               THP mode, /proc/buddyinfo and the VMM granularity (read only). --tlb only: the probe without benches.
 //
 // Arms (all inside one CUDA graph over steps x layers calls, median of --reps interleaved timings, us per call):
-//   k1            the engine's K1 at M rows as rank.cuh binds it (G6_FUSE=1 + the fuse policy of bind.cuh make_k1 for
+//   k1            the engine's K1 at M rows as rank.cuh binds it (GR8_FUSE=1 + the fuse policy of bind.cuh make_k1 for
 //                 these layers: fused at M = 1, separate fc1 / fc2 launches above), k_router_plan in front. THE number:
 //                 GB/s = call bytes / its time.
 //   split         plan alone, + fc1 (or the fused kernel), + fc2, + finalize: per-kernel marginal time incl. boundaries.
 //   chain-ovlN    the full served MoE block: x2 fragment tables, router GEMV (BF16, 3.15 MB, written to a dummy:
-//                 the plan still reads the served logits), plan, K1; ovl1 = G6_ROUTE_OVL=1 (the serving flag), ovl0 off.
-//   fused/sep     the other launch form (G6_K1_FUSE_POLICY=0): exact (same bytes out), 3-11 % either way in the table
+//                 the plan still reads the served logits), plan, K1; ovl1 = GR8_ROUTE_OVL=1 (the serving flag), ovl0 off.
+//   fused/sep     the other launch form (GR8_K1_FUSE_POLICY=0): exact (same bytes out), 3-11 % either way in the table
 //                 bind.cuh quotes; the M >= 2 rule for trellis-shared layers was set for 16+ rows.
 //   fc1 KSxWG     fc1 CTA shape with the same k ranges (KS1 * WG fixed: partial p = h * WG + q covers the same k range,
 //                 fc2 sums the same partials in the same order): exact. 256 threads/CTA = 2 CTAs per SM at M 2-3.
 //   ns2=N         fc2 n-split (every z tile is still one warp's sum over its block's 8 k-tiles): exact. N a power of two
 //                 that divides 384 (the kernels index fc2 units by shifts, #136): 1 2 4 8 16 32. The "ns2 pick" line names the fastest exact one (k1 = the bound NS2) per M.
-//   tab ...       with --tab: the k1 arm bound with that G6_K1_SPLIT table, in each launch form (exact by construction;
+//   tab ...       with --tab: the k1 arm bound with that GR8_K1_SPLIT table, in each launch form (exact by construction;
 //                 checked, the engine form and chain-ovl1 also as a graph).
-//   tlbwN         G6_K1_TLBW=N KB (N = 64, 2048): fc1 prefetches every routed slot's fc1 + fc2 translations at the
+//   tlbwN         GR8_K1_TLBW=N KB (N = 64, 2048): fc1 prefetches every routed slot's fc1 + fc2 translations at the
 //                 start of the launch (k1.cuh k1_tlbw); chain-ovl1 tlbw2048 = the same in the served route-overlap form.
 //   read1/read2   the floor for the same bytes: a plain 16 B ld.global.nc read of exactly the call's tile ranges in one
 //                 launch (read2: fc1 ranges, then fc2 ranges), same graph, same cold rotation.
@@ -101,6 +102,7 @@
 #include <cuda_runtime.h>
 #include "../glue.cuh"
 #include "../bind.cuh"
+#include "../../knobs-rs/gr8_knobs.h"
 #include "../../vmm.h"
 
 #define CK(x)                                                                                                   \
@@ -461,7 +463,7 @@ static void build_layer(SynLayer& L, const Widths& W, uint32_t seed, bool wide1,
     T.e4m3 = 1;
     if (const char* e = bind::scan_widths(T)) { printf("scan_widths: %s\n", e); exit(2); }
     if (!T.sh_trellis) { printf("no trellis shared expert after scan_widths\n"); exit(2); }
-    if (wide1) bind::widen_fc1(T, nullptr);            // as rank.cuh with --wide (scripts/engine_args.sh), G6_NOWIDE2 unset
+    if (wide1) bind::widen_fc1(T, nullptr);            // as rank.cuh with --wide (scripts/engine_args.sh), GR8_NOWIDE2 unset
     if (wide2) bind::widen_fc2(T, nullptr);
     const size_t rn = static_cast<size_t>(16) * 384 * 256;      // router: BF16 records [16][384][512], as k1_ovl_test
     __nv_bfloat16* rw = static_cast<__nv_bfloat16*>(alloc(rn * 2));
@@ -682,13 +684,18 @@ int main(int argc, char** argv)
     if (split < 0 || split > 8 || sess < 0) { printf("bad --split / --sess\n"); return 2; }
     if (!hold) hold = nlay;
     if (hold < nlay || hold > NL_MODEL || window < 0 || window + nlay > hold) { printf("bad --hold / --window (window + layers <= hold <= %d)\n", NL_MODEL); return 2; }
-    for (const char* v : {"G6_K1_SPLIT", "G6_K1_SPLIT_M1", "G6_K1_SPLIT_M2", "G6_K1_SPLIT_M4", "G6_K1_TLBW"})
-        if (getenv(v)) { printf("env %s=%s unset: the k1 arm is the release split (use --tab / the tlbw arms)\n", v, getenv(v)); unsetenv(v); }
-    if (w2all >= 0) setenv("G6_TR3_W2ALL", w2all ? "1" : "0", 1);      // before the first k1_split (it reads it once)
-    if (const char* e = bind::k1_split_env(tab.c_str()).err) { printf("--tab %s: %s\n", tab.c_str(), e); return 2; }
-    bind::k1_split_env("");                 // the k1 arm: no table
-    unsetenv("G6_K1_TLBW");                 // make_k1 reads it once: the tlbw arms set it per binding
-    setenv("G6_K1_FUSE_POLICY", "0", 1);    // make_k1 reads it once: the bench passes the engine's choice itself (fuse_engine)
+    // the K1 settings of every binding: the release split (no GR8_K1_SPLIT*), no GR8_K1_TLBW (the tlbw arms set it per
+    // binding), GR8_K1_FUSE_POLICY=0 (the bench passes the engine's choice itself, fuse_engine), --w2all or the environment's
+    bind::K1Vars k1v;
+    k1v.policy = false;
+    k1v.w2all = w2all >= 0 ? w2all != 0 : knob::tr3_w2all();
+    const char* ignored[] = {knob::k1_split() ? "GR8_K1_SPLIT" : nullptr, knob::k1_split_m1() ? "GR8_K1_SPLIT_M1" : nullptr,
+                             knob::k1_split_m2() ? "GR8_K1_SPLIT_M2" : nullptr, knob::k1_split_m4() ? "GR8_K1_SPLIT_M4" : nullptr,
+                             knob::k1_tlbw() ? "GR8_K1_TLBW" : nullptr};
+    for (const char* v : ignored)
+        if (v) printf("env %s ignored: the k1 arm is the release split (use --tab / the tlbw arms)\n", v);
+    if (const char* e = bind::k1_split_env(tab.c_str(), k1v).err) { printf("--tab %s: %s\n", tab.c_str(), e); return 2; }
+    bind::k1_split_env("", k1v);             // the k1 arm: no table
 
     CK(cudaSetDevice(0));
     CK(bind::init());
@@ -697,8 +704,8 @@ int main(int argc, char** argv)
     printf("k1_audit: %s sm_%d%d %d SMs, G6_NR=%d EB=%d G6_MX=%d rank %d | build TR3_UNR=%d TR3_UNR1=%d TR3_PU=%d TR3_EARLY=%d TR3_EARLY4=%d TR3_XCOMP=%d\n",
            pr.name, pr.major, pr.minor, pr.multiProcessorCount, g6nr::NR, g6nr::EB, G6_MX, rank, TR3_UNR, TR3_UNR1, TR3_PU, TR3_EARLY,
            TR3_EARLY4, TR3_XCOMP);
-    printf("k1_audit: G6_TR3_W2ALL=%s (release split per M:", getenv("G6_TR3_W2ALL") ? getenv("G6_TR3_W2ALL") : "unset");
-    for (int M : Ms) { const bind::K1Split r = bind::k1_split(M); printf(" M%d %d,%d,%d", M, r.KS1, r.WG, r.NS2); }
+    printf("k1_audit: GR8_TR3_W2ALL=%d (release split per M:", k1v.w2all ? 1 : 0);
+    for (int M : Ms) { const bind::K1Split r = bind::k1_split(M, 0, k1v); printf(" M%d %d,%d,%d", M, r.KS1, r.WG, r.NS2); }
     printf(")%s\n", check_only ? ", --check-only" : "");
 
     // widths
@@ -767,7 +774,7 @@ int main(int argc, char** argv)
     }
 
     // route sources
-    std::vector<J> rlines;           // G6_ROUTE_LOG lines
+    std::vector<J> rlines;           // GR8_ROUTE_LOG lines
     if (!routes.empty())
     {
         const std::string t = slurp(routes.c_str());
@@ -1019,7 +1026,7 @@ int main(int argc, char** argv)
             for (int l = 0; l < nlay; ++l)
             {
                 bind::Tensor sh[3];
-                if (const char* e = bind::make_k1(Ls[l].T, M, sc, x2, sc.xf_x2, bind::plan_ptrs(dplan), out, 1, ks[l], sh, fuse, split))
+                if (const char* e = bind::make_k1(Ls[l].T, M, sc, x2, sc.xf_x2, bind::plan_ptrs(dplan), out, 1, ks[l], sh, fuse, split, k1v))
                 { printf("M=%d fuse=%d split=%d make_k1: %s\n", M, fuse, split, e); exit(2); }
             }
         };
@@ -1090,14 +1097,14 @@ int main(int argc, char** argv)
             }
             if (!tab.empty())
             {
-                // as on a launch: the table in the environment (every reader of G6_K1_SPLIT sees it), read by make_k1
+                // as on a launch: the table in the settings (both readers of GR8_K1_SPLIT see it), read by make_k1
                 std::vector<bind::K1> kt, kto;
-                setenv("G6_K1_SPLIT", tab.c_str(), 1);
-                bind::k1_split_env(getenv("G6_K1_SPLIT"));
+                k1v.split = tab;
+                bind::k1_split_env(tab.c_str(), k1v);
                 bind_all(fuse_engine, kt);
                 bind_all(1 - fuse_engine, kto);
-                unsetenv("G6_K1_SPLIT");
-                bind::k1_split_env("");
+                k1v.split.reset();
+                bind::k1_split_env("", k1v);
                 arms.push_back(Arm{"tab", K_K1, kt, 3, 0, true});
                 arms.push_back(Arm{fuse_engine ? "tab separate" : "tab fused", K_K1, kto, 3, 0, true});
                 const std::vector<bind::K1>& ksep = fuse_engine ? kto : kt;      // the route overlap runs separate launches
@@ -1111,8 +1118,8 @@ int main(int argc, char** argv)
             }
             if (all_arms == 1 || all_arms == 3)
             {
-                // G6_K1_TLBW: fc1 prefetches the routed slots' translations (64 KB and 2 MB granules); and in the served
-                // route-overlap form (G6_ROUTE_OVL=1, chain-ovl1)
+                // GR8_K1_TLBW: fc1 prefetches the routed slots' translations (64 KB and 2 MB granules); and in the served
+                // route-overlap form (GR8_ROUTE_OVL=1, chain-ovl1)
                 for (int kb : {64, 2048})
                 {
                     Arm a{"tlbw" + std::to_string(kb), K_K1, keng, 3, 0, true};
@@ -1268,7 +1275,7 @@ int main(int argc, char** argv)
                 {
                     bind::Tensor sh[3];
                     if (const char* e = bind::make_k1(Ls[l].T, sess, sc, x2 + static_cast<size_t>(j) * sess * HID, sc.xf_x2, bind::plan_ptrs(dplan),
-                                                      out + static_cast<size_t>(j) * sess * HID * 2, 1, solo[static_cast<size_t>(j) * nlay + l], sh, sess == 1, 0))
+                                                      out + static_cast<size_t>(j) * sess * HID * 2, 1, solo[static_cast<size_t>(j) * nlay + l], sh, sess == 1, 0, k1v))
                     { printf("M=%d solo R=%d make_k1: %s\n", M, sess, e); exit(2); }
                 }
             for (int c = 0; c < nchk; ++c)
@@ -1380,7 +1387,7 @@ int main(int argc, char** argv)
             printf("ns2 pick M=%d class %d (split_m %d): bound NS2 %d %.1f us/call, best exact NS2 %d %.1f us/call %+.1f us (%+.2f%%) = %+.2f ms/step@75, %d ns2 arms DIFF -> %s",
                    M, rows == 1 ? 1 : rows <= 3 ? 3 : 5, split, keng[0].a.NS2, k1us, bn, bt, bt - k1us, 100 * (bt - k1us) / k1us, 75 * (bt - k1us) / 1e3, ndiff,
                    ndiff ? "KILL (not exact)" : win ? "ADOPT" : "KEEP (< 1 ms/step)");
-            if (win) printf(" G6_K1_SPLIT entry %d:/%d", M, bn);
+            if (win) printf(" GR8_K1_SPLIT entry %d:/%d", M, bn);
             printf("\n");
         }
         fflush(stdout);

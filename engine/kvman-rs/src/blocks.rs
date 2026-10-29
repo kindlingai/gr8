@@ -21,13 +21,10 @@ pub enum Blocks {
     Ram(Box<RamCache>),
 }
 
-// KVMAN_TRANSPORT=tcp|rdma|auto (default auto) per box: a rank whose path to the node is routed through another box
-// sets up RDMA but cannot write, and auto does not fall back after setup
+// GR8_KVMAN_TRANSPORT per box: a rank whose path to the node is routed through another box sets up RDMA but cannot
+// write, and auto does not fall back after setup
 fn transport() -> io::Result<crate::remote::Want> {
-    match std::env::var("KVMAN_TRANSPORT") {
-        Ok(s) if !s.is_empty() => s.parse().map_err(|e: String| io::Error::new(io::ErrorKind::InvalidInput, e)),
-        _ => Ok(crate::remote::Want::Auto),
-    }
+    gr8knobs::KVMAN_TRANSPORT.get().parse().map_err(|e: String| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
 impl Blocks {

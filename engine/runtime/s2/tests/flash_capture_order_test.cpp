@@ -90,8 +90,8 @@ static std::string dir() {
 }
 
 int main() {
-    ::setenv("G6_S2_SHARE_MS", "10", 1);
-    ::setenv("G6_S2_EVENTLOG", "1", 1);
+    ::setenv("GR8_S2_SHARE_MS", "10", 1);
+    ::setenv("GR8_S2_EVENTLOG", "1", 1);
     Config cfg;
     cfg.pool_rows = 64 * 1024; cfg.max_rows = 3; cfg.max_sessions = 1; cfg.mtp = 2;
     cfg.prefill_rows = GRID; cfg.two_lanes = false;

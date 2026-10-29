@@ -42,7 +42,7 @@ void grammar_commit(GrammarState& g, const int* ids, int n);
 void grammar_masks(GrammarState& g, const int* drafts, int nd, int* on, uint32_t* out);
 #else
 inline void GrammarDeleter::operator()(GrammarState*) const {}
-inline std::string grammar_init(const std::string&, int) { return "this engine was built without XGrammar (G6_XGRAMMAR)"; }
+inline std::string grammar_init(const std::string&, int) { return "this engine was built without XGrammar (GR8_XGRAMMAR)"; }
 inline bool grammar_ready() { return false; }
 inline int grammar_words() { return 0; }
 inline Grammar grammar_open(const GrammarSpec&) { return nullptr; }

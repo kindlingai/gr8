@@ -30,7 +30,7 @@ __device__ __forceinline__ u64 ld_nc64(const void* p)
 
 // L2 warm-up: one prefetch.global.L2 per 64 B line of [p, p + 64 * nlines). grid = ceil(nlines / 2048), block 256.
 // The old body (ld_nc, result unused) compiled to LDC + EXIT,
-// 0 loads, so G6_WARM was a no-op. prefetch.global.L2 is asm volatile with a memory side effect, so it is kept from DCE
+// 0 loads, so GR8_WARM was a no-op. prefetch.global.L2 is asm volatile with a memory side effect, so it is kept from DCE
 // (SASS: 8x CCTL.E.PF2); it moves whole 64 B lines (both sectors) into the GPU L2 and writes no register or memory.
 // Changes no result. Measured: -9.6..-9.9 us/layer router window = 0.73-0.75 ms/step @M12 true-cold, ONLY when hidden.
 // Use: issue the warm about ONE LAYER AHEAD of the kernel that reads the bytes, so it completes before that

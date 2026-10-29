@@ -1,17 +1,18 @@
-// G6_MOE_TOPK env parsing (engine/runtime/envparse.h): strict single digit 1..TOPK, unset = the model's top-k.
-// A cut of 0, values above TOPK, signs, spaces, leading zeros, suffixes and the empty string must all fail CLOSED
-// with a message naming the variable and the bad value (atoi would fail open). moe_topk_cut caches its first read in
-// a function-local static, so each of its environments is checked in its own forked child.
+// GR8_MOE_TOPK through the knob table (engine/knobs-rs/src/table.rs MOE_TOPK: int 1..8, unset = 8, the model's top-k).
+// A cut of 0, values above 8, words, suffixes, spaces and negative numbers must stop the process (exit 2) at the first
+// read, not fall back to a default. A knob is read once per process and a refused value ends it, so each case runs in
+// its own child.
 //
-// build and run:  g++ -O2 -std=c++17 -Iengine/runtime engine/tests/test_moe_topk_env.cpp -o /tmp/test_moe_topk_env &&
-//                 /tmp/test_moe_topk_env
+// build and run:  g++ -O2 -std=c++17 engine/tests/test_moe_topk_env.cpp engine/knobs-rs/target/release/libgr8knobs.a \
+//                     -lpthread -ldl -lm -o /tmp/test_moe_topk_env && /tmp/test_moe_topk_env
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdio>
-#include <string>
+#include <cstdlib>
 
-#include "envparse.h"
+#include "../knobs-rs/gr8_knobs.h"
 
 static int fails = 0, checks = 0;
 static void ck(int ok, const char* what)
@@ -21,47 +22,39 @@ static void ck(int ok, const char* what)
     else printf("ok   %s\n", what);
 }
 
-// env_digit is stateless: every case runs in-process
-static bool digit_case(const char* val, int want, bool want_err)
+// knob::moe_topk() in a child with GR8_MOE_TOPK=val (null: unset): the cut, or -2 when the table refuses the value
+static int topk(const char* val)
 {
-    std::string e;
-    if (val) setenv("G6_MOE_TOPK", val, 1); else unsetenv("G6_MOE_TOPK");
-    const int got = env_digit("G6_MOE_TOPK", 1, 8, 8, &e);
-    const bool err_ok = want_err ? e.find("G6_MOE_TOPK") != std::string::npos && (!val || e.find(val) != std::string::npos)
-                                 : e.empty();
-    return got == want && err_ok;
-}
-
-// moe_topk_cut reads the environment once per process: fork per case
-static bool cut_case(const char* val, int want)
-{
-    if (val) setenv("G6_MOE_TOPK", val, 1); else unsetenv("G6_MOE_TOPK");
+    fflush(stdout);
     const pid_t p = fork();
-    if (!p) _exit(moe_topk_cut(8) == want ? 0 : 1);
+    if (!p)
+    {
+        if (val) setenv("GR8_MOE_TOPK", val, 1); else unsetenv("GR8_MOE_TOPK");
+        const int null = open("/dev/null", O_WRONLY);
+        if (null >= 0) dup2(null, 2);        // the refusal's message
+        _exit(10 + (int)knob::moe_topk());
+    }
     int st = 0;
     waitpid(p, &st, 0);
-    return WIFEXITED(st) && !WEXITSTATUS(st);
+    if (!WIFEXITED(st)) return -1;
+    return WEXITSTATUS(st) == 2 ? -2 : WEXITSTATUS(st) - 10;
 }
 
 int main()
 {
-    ck(digit_case(nullptr, 8, false), "unset -> the model default 8");
-    ck(digit_case("1", 1, false), "'1' -> 1 (the smallest valid cut)");
-    ck(digit_case("4", 4, false), "'4' -> 4");
-    ck(digit_case("6", 6, false), "'6' -> 6");
-    ck(digit_case("8", 8, false), "'8' -> 8 (= the model top-k, explicit)");
-    ck(digit_case("0", -1, true), "'0' rejected (a cut of 0 is not valid), error names var + value");
-    ck(digit_case("9", -1, true), "'9' rejected (above TOPK)");
-    ck(digit_case("", -1, true), "empty string rejected");
-    ck(digit_case("x", -1, true), "'x' rejected");
-    ck(digit_case("08", -1, true), "'08' rejected (two chars)");
-    ck(digit_case("4x", -1, true), "'4x' rejected (suffix)");
-    ck(digit_case(" 4", -1, true), "' 4' rejected (space)");
-    ck(digit_case("+6", -1, true), "'+6' rejected (sign)");
-    ck(digit_case("-1", -1, true), "'-1' rejected");
-    ck(cut_case("6", 6), "moe_topk_cut(8) with G6_MOE_TOPK=6 -> 6 (own process)");
-    ck(cut_case(nullptr, 8), "moe_topk_cut(8) unset -> 8 (own process)");
-    ck(cut_case("bad", 8), "moe_topk_cut(8) bad value -> fallback 8 (boot already died; own process)");
+    ck(topk(nullptr) == 8, "unset -> the model default 8");
+    ck(topk("") == 8, "empty -> unset -> 8");
+    ck(topk("1") == 1, "'1' -> 1 (the smallest valid cut)");
+    ck(topk("4") == 4, "'4' -> 4");
+    ck(topk("6") == 6, "'6' -> 6");
+    ck(topk("8") == 8, "'8' -> 8 (= the model top-k, explicit)");
+    ck(topk("0") == -2, "'0' refused (a cut of 0 is not valid)");
+    ck(topk("9") == -2, "'9' refused (above the model top-k)");
+    ck(topk("x") == -2, "'x' refused");
+    ck(topk("4x") == -2, "'4x' refused (suffix)");
+    ck(topk(" 4") == -2, "' 4' refused (space)");
+    ck(topk("2.5") == -2, "'2.5' refused (not an integer)");
+    ck(topk("-1") == -2, "'-1' refused");
     printf("%d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

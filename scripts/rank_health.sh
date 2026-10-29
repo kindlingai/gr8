@@ -1,7 +1,7 @@
 #!/bin/bash
 # Rank health probe and boot admission for every rank (run on the head, with NO model booted on any box).
 #   scripts/rank_health.sh [OUT_JSON] [OPTIONS]   default OUT_JSON = $G6_HOME/out/rank_health.json
-# OPTIONS are ./gr8's (KNOBS.md): --peers, --ips, --ips2, --proxy-cpu, --g6-home, @FILE. The probe reaches the boxes
+# OPTIONS are ./gr8's (./gr8 knobs): --peers, --ips, --ips2, --proxy-cpu, --g6-home, @FILE. The probe reaches the boxes
 # over ssh by their PEERS names and needs IPS and IPS2 set (it does not discover them).
 # Exit 0 = every rank admitted; 3 = refused (one line per refusal with a named reason); 2 = setup problem.
 # The JSON is what `bench/gate/gate.py run --health` records. PROBE_ARGS="--min-clock-mhz 1800 ..." sets thresholds

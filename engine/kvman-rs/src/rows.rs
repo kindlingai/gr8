@@ -1,4 +1,4 @@
-//! Remote attention rows (the engine's G6_RT_STORE tier): one rank's latent rows past L live in a store, and a helper
+//! Remote attention rows (the engine's GR8_RT_STORE tier): one rank's latent rows past L live in a store, and a helper
 //! thread fetches the rows each decode step selects into the engine's resident slots.
 //!
 //! The store is one byte range per rank: a header (HEADER bytes), then per indexer group one record per position past
@@ -325,7 +325,7 @@ mod tests {
         assert!(s.layout("R=1024 nr=3 row=fp8 model=a").is_err());
         assert!(s.layout("R=1024 nr=4 row=int4g32h model=a").is_err());
         assert!(s.layout("R=1024 nr=4 row=fp8 fmt=int4 model=a").is_err());
-        // G6_RT_FMT=int4 records: refused by an fp8 boot as well
+        // GR8_RT_FMT=int4 records: refused by an fp8 boot as well
         let s = Store::open("mem:", "t", 2 * HEADER as u64).unwrap();
         s.layout("R=1024 nr=4 row=fp8 fmt=int4 model=a").unwrap();
         assert!(s.layout("R=1024 nr=4 row=fp8 model=a").is_err());

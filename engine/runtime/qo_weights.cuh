@@ -1,10 +1,10 @@
-// G6_PF_OWN=3 full-head prefill weights (QO-INTEGRATION.md section 4): q_b and o_proj MXFP8 for all 64 heads, UK / UV
+// GR8_PF_OWN=3 full-head prefill weights (QO-INTEGRATION.md section 4): q_b and o_proj MXFP8 for all 64 heads, UK / UV
 // BF16 for all 64 heads, logical head order. Identical on every rank.
 //   qo_from_pack:  the names L%03d.qo.{q_b.mx.codes, q_b.mx.scales, o_proj.mx.codes, o_proj.mx.scales, kv_b.uk, kv_b.uv}
 //   qo_from_ranks: assembled on the device from the NR ranks' head slices (m4sim holds all the packs). Rank r holds
 //                  head group g = (r - l % NR) mod NR of layer l, heads start(64, g) .. + width(64, g) (g6nr.h,
 //                  attn/bind.cu; TP6 edges 0, 11, 22, 33, 44, 54, 64).
-//   G6_PF_OWN=4 (TP4 builds only, below): the pair-owner weights of docs/DESIGN-QO-PAIR.md, 32 heads per head pair.
+//   GR8_PF_OWN=4 (TP4 builds only, below): the pair-owner weights of docs/DESIGN-QO-PAIR.md, 32 heads per head pair.
 #pragma once
 #include "rank.cuh"
 #include "../attn/bind.h"
@@ -46,7 +46,7 @@ inline bool qo_from_pack(const Find& find, int l, QoW& w)
     w.uk = qo_attn_tensor(uk); w.uv = qo_attn_tensor(uv);
     return qo_check(w);
 }
-// #50 (G6_KVB=fp8): a rank's kv_b.uk / kv_b.uv may be E4M3 with f32 scales (kv_b.uk.scale / kv_b.uv.scale). Every QO and
+// #50 (GR8_KVB=fp8): a rank's kv_b.uk / kv_b.uv may be E4M3 with f32 scales (kv_b.uk.scale / kv_b.uv.scale). Every QO and
 // pair-owner path keeps its BF16 UK / UV staging: kvb_put writes `rows` rows of 512 BF16 weights into dst from a BF16
 // tensor (a copy) or from an FP8 one (g6_attn_kvb_bf16: the BF16 bytes the BF16 loader stores), on stream b. sync: a BF16
 // copy is a synchronous cudaMemcpy (the load-time assemblers' copies on main) and an FP8 expansion is waited for.
@@ -66,7 +66,7 @@ inline const void* kvb_scale(const Find& f, const std::string& name, const Tenso
     if (!t.p || t.bf16) return nullptr;
     const TensorRef s = f(name + ".scale");
     if (!s.p || s.nd != 3 || s.shape[0] != t.shape[0] || s.shape[1] != t.shape[1] || s.shape[2] != 4)
-        die(name + " is not BF16 and has no [h][d][4] .scale (G6_KVB=fp8 form)");
+        die(name + " is not BF16 and has no [h][d][4] .scale (GR8_KVB=fp8 form)");
     return s.p;
 }
 // finds[r] = rank r's tensors. Device allocations are never freed (load-time, like the packs).
@@ -75,7 +75,7 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
     if (finds.size() != (size_t)g6nr::NR) die("qo_from_ranks needs every rank's pack");
     char tn[32];
     snprintf(tn, sizeof tn, "L%03d.q_b.trellis", l);
-    if (finds[0](tn).p) die("G6_PF_OWN=3 with dense trellis q_b / o_proj needs --qo-pack (the full-head weights are MXFP8)");
+    if (finds[0](tn).p) die("GR8_PF_OWN=3 with dense trellis q_b / o_proj needs --qo-pack (the full-head weights are MXFP8)");
     QoW w;
     auto alloc2 = [](bind::Tensor& t, long long a, long long b, size_t esz) {
         t.p = dmalloc<char>((size_t)a * b * esz); t.nd = 2; t.shape[0] = a; t.shape[1] = b;
@@ -117,7 +117,7 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
     return w;
 }
 
-// ---- G6_PF_OWN=4 pair-owner weights (docs/DESIGN-QO-PAIR.md section 1, TP4 only). Rank r's head pair {r & ~1, r | 1}
+// ---- GR8_PF_OWN=4 pair-owner weights (docs/DESIGN-QO-PAIR.md section 1, TP4 only). Rank r's head pair {r & ~1, r | 1}
 // holds 32 heads of layer l, the two groups g(m) = (m - l) mod 4 in logical order (lower group first): q_b [8192][2048]
 // (+ [8192][64]), o_proj [6144][8192] (+ [6144][256]), UK / UV [32][192][512] / [32][256][512] BF16. Byte-identical on
 // both pair members.
@@ -125,7 +125,7 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
 //                  qp.rank<r>.pack, UK / UV assembled on the device from the rank's own L%03d.kv_b.{uk,uv} and the pack's
 //                  L%03d.qp.kv_b.{uk,uv} (the partner's 16 heads)
 //   qp_from_ranks: everything assembled on the device from the two pair members' head slices (m4sim holds all packs)
-//   QpRoll:        G6_PF_QP_ROLL=S, S slots that roll through the layers during a prefill (g6m4: own half from the rank
+//   QpRoll:        GR8_PF_QP_ROLL=S, S slots that roll through the layers during a prefill (g6m4: own half from the rank
 //                  pack, partner half over RDMA, qp_wire.h; m4sim: both halves from the packs)
 // The BF16 UK / UV are only read by g6_attn_qo_create / g6_attn_qo_load (they keep FP16 copies): qp_free_kvb releases
 // the resident ones after create.
@@ -194,7 +194,7 @@ inline bool qp_from_pack(const Find& qfind, const Find& find, int r, int l, QpW&
     auto get = [&](const Find& f, const char* s) { snprintf(n, sizeof n, "L%03d.%s", l, s); return f(n); };
     w.qb_c = as_bind(get(qfind, "qp.q_b.mx.codes")); w.qb_s = as_bind(get(qfind, "qp.q_b.mx.scales"));
     w.o_c = as_bind(get(qfind, "qp.o_proj.mx.codes")); w.o_s = as_bind(get(qfind, "qp.o_proj.mx.scales"));
-    if (get(find, "q_b.trellis").p) die("--qp-pack (resident pair pack) has no dense trellis form: use G6_PF_QP_ROLL");
+    if (get(find, "q_b.trellis").p) die("--qp-pack (resident pair pack) has no dense trellis form: use GR8_PF_QP_ROLL");
     const TensorRef puk = get(qfind, "qp.kv_b.uk"), puv = get(qfind, "qp.kv_b.uv"), ouk = get(find, "kv_b.uk"), ouv = get(find, "kv_b.uv");
     if (!puk.p || !puv.p || !ouk.p || !ouv.p) return false;
     qp_alloc_kvb(w);
@@ -210,7 +210,7 @@ inline bool qp_from_pack(const Find& qfind, const Find& find, int r, int l, QpW&
 // the 16-head slice of pair member m: q_b / o_proj codes and scales, UK / UV (shape-checked); qv / ov: a dense trellis
 // q_b's svh slice and o_proj's suh slice [4096] (p = nullptr: that matrix is MXFP8). The two can differ: the release
 // keeps layer 3's o_proj in int4 next to a trellis q_b.
-// uks / uvs: the FP8 kv_b's scales (G6_KVB=fp8, kvb_scale); nullptr = BF16 uk / uv
+// uks / uvs: the FP8 kv_b's scales (GR8_KVB=fp8, kvb_scale); nullptr = BF16 uk / uv
 struct QpHalf { TensorRef qc, qs, oc, os, uk, uv, qv, ov; const void *uks = nullptr, *uvs = nullptr; };
 inline QpHalf qp_half(const Find& f, int m, int l, const char* who)
 {
@@ -273,7 +273,7 @@ inline void qp_put_half_nokvb(const QpW& w, int k, const void* qc, const void* q
         G6RT_CK(cudaMemcpy2DAsync((char*)w.o_s.p + (size_t)k * 128, 256, os, 128, 128, HID, cudaMemcpyDefault, b));
     }
 }
-// uks / uvs (G6_KVB=fp8): uk / uv are the half's E4M3 kv_b and these its scales; the slot gets their BF16 (kvb_put).
+// uks / uvs (GR8_KVB=fp8): uk / uv are the half's E4M3 kv_b and these its scales; the slot gets their BF16 (kvb_put).
 inline void qp_put_half(QpW& w, int k, const void* qc, const void* qs, const void* oc, const void* os, const void* uk, const void* uv,
                         cudaStream_t b, const void* qv = nullptr, const void* ov = nullptr, const void* uks = nullptr,
                         const void* uvs = nullptr)
@@ -306,10 +306,10 @@ inline QpW qp_from_ranks(const std::vector<Find>& finds, int r, int l)
     return w;
 }
 
-// ---- rolling pair pack (G6_PF_QP_ROLL=S): S slots of pair weights in place of one resident QpW per layer. Slot s holds
+// ---- rolling pair pack (GR8_PF_QP_ROLL=S): S slots of pair weights in place of one resident QpW per layer. Slot s holds
 // model layer position i with i % S == s: the same bytes qp_from_ranks assembles (q_b / o_proj halves in qp_order, BF16
 // UK / UV staged in the slot, then reconverted into the slot's QO state by g6_attn_qo_load = create's kernels), so OWN=4
-// output is byte-identical to the resident pack. A build runs on the stage stream ss (G6_PF_QP_ROLL_SER=1: on the lane
+// output is byte-identical to the resident pack. A build runs on the stage stream ss (GR8_PF_QP_ROLL_SER=1: on the lane
 // stream that triggers it, fully exposed) after both lanes' `used` event of that slot; the lanes wait `ready`.
 // Builds are triggered by the first lane to reach layer i (qp_roll_acquire): layer i if the slot does not hold it, then
 // prefetch i + 1 .. i + S - 1. That reuses a slot whose layer is <= i - 1, which both lanes have already ENQUEUED (every
@@ -354,10 +354,10 @@ inline void qp_roll_ev(cudaEvent_t& e, bool timing)
 inline QpRoll* qp_roll_new(int S, bool ser, const std::vector<Find>& finds, int r, const std::vector<int>& layers,
                            const std::vector<char>& qpl, std::vector<QpW>& qpw, QpWire* wire = nullptr)
 {
-    if (finds.size() != (wire ? 1u : 4u)) die("G6_PF_QP_ROLL: pair-owner is TP4 only (all four packs, or the own pack + the wire)");
-    if (S < 2 || S > 4) die("G6_PF_QP_ROLL: 2..4 slots");
+    if (finds.size() != (wire ? 1u : 4u)) die("GR8_PF_QP_ROLL: pair-owner is TP4 only (all four packs, or the own pack + the wire)");
+    if (S < 2 || S > 4) die("GR8_PF_QP_ROLL: 2..4 slots");
     if (wire && (wire->E < 1 || wire->E > qw::max_entries() || wire->peer != qw::partner(r) || !wire->enqueue || !wire->bd.bulk))
-        die("G6_PF_QP_ROLL: wire not set up (E 1.." + std::to_string(qw::max_entries()) + ", peer r ^ 1, bulk fabric)");
+        die("GR8_PF_QP_ROLL: wire not set up (E 1.." + std::to_string(qw::max_entries()) + ", peer r ^ 1, bulk fabric)");
     auto* R = new QpRoll;
     R->S = S; R->ser = ser; R->wire = wire;
     if (wire) wire->S = S;
@@ -374,11 +374,11 @@ inline QpRoll* qp_roll_new(int S, bool ser, const std::vector<Find>& finds, int 
             const int m = h ? ord.second : ord.first;
             if (m != r) q.partner_half = h;
             if (wire && m != r) continue;            // g6m4: the partner's half has no local source
-            q.h[h] = qp_half(finds[wire ? 0 : m], m, l, "G6_PF_QP_ROLL");
+            q.h[h] = qp_half(finds[wire ? 0 : m], m, l, "GR8_PF_QP_ROLL");
             q.have[h] = true;
             q.form = (q.h[h].qv.p ? 1 : 0) | (q.h[h].ov.p ? 2 : 0);   // the wire tag makes the partner agree (qp_wire_build)
         }
-        if (q.partner_half < 0) die("G6_PF_QP_ROLL: rank " + std::to_string(r) + " is not in its own pair");
+        if (q.partner_half < 0) die("GR8_PF_QP_ROLL: rank " + std::to_string(r) + " is not in its own pair");
     }
     R->slot.resize(S);
     bool trellis = false;
@@ -449,7 +449,7 @@ inline void qp_wire_build(QpRoll& R, QpWire& x, const QpSrc& q, QpW& w, cudaStre
     const unsigned pe = (unsigned)(e << 4) | (unsigned)x.peer;
     const unsigned long long tg = qw::tag(q.layer, x.S, x.E, x.ctx, q.form);
     const QpHalf& o = q.h[oh];
-    // G6_KVB=fp8: the wire carries BF16 UK / UV (qp_wire.h layout, both members alike), so my half's are expanded into my
+    // GR8_KVB=fp8: the wire carries BF16 UK / UV (qp_wire.h layout, both members alike), so my half's are expanded into my
     // half of the slot first (it needs only the slot's `used` events, waited by qp_roll_build) and sent from there
     const void *wuk = o.uk.p, *wuv = o.uv.p;
     if (o.uks)
@@ -518,7 +518,7 @@ inline void qp_roll_build(QpRoll& R, int i, cudaStream_t st)
             qp_put_half(w, h, x.qc.p, x.qs.p, x.oc.p, x.os.p, x.uk.p, x.uv.p, b, x.qv.p, x.ov.p, x.uks, x.uvs);
             (h == q.partner_half ? R.bytes_partner : R.bytes_own) += (double)qw::HALF;
         }
-    if (int e = g6_attn_qo_load(R.qa[s], &w.uk, &w.uv, b)) die("G6_PF_QP_ROLL: g6_attn_qo_load failed (" + std::to_string(e) + ")");
+    if (int e = g6_attn_qo_load(R.qa[s], &w.uk, &w.uv, b)) die("GR8_PF_QP_ROLL: g6_attn_qo_load failed (" + std::to_string(e) + ")");
     G6RT_CK(cudaEventRecord(R.t1[k], b));
     G6RT_CK(cudaEventRecord(R.ready[s], b));
     R.have[s] = i;

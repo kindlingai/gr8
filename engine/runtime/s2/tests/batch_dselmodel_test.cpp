@@ -1,4 +1,4 @@
-// Drafter choice cost model (s2_batch.h DSelTable, DSel::model, G6_S2_DSEL_MODEL): the table parses to one canonical
+// Drafter choice cost model (s2_batch.h DSelTable, DSel::model, GR8_S2_DSEL_MODEL): the table parses to one canonical
 // form whatever its spelling, survives each request's fresh estimates, prices MTP rounds as the confidence stop runs
 // them (so a K-stop MTP that verifies three confident drafts wins where the fixed-K pricing keeps DFlash2, and one that
 // verifies one draft loses to a better DFlash2), ranks reading the same table make the same choices bit for bit, and
@@ -249,7 +249,7 @@ int main()
         }
     }
     // 7. the table is the drafter choice's only: the DFlash2 rounds' own draft count (--spec-adaptive) keeps spec_len.h's
-    //    verify table (G6_SPEC_TABLE prices that), so a table with an 8-row verify at 1000 ms still verifies seven
+    //    verify table (GR8_SPEC_TABLE prices that), so a table with an 8-row verify at 1000 ms still verifies seven
     for (int model : {0, 1})
     {
         Fake f;

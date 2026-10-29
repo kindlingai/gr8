@@ -1,6 +1,6 @@
-// G6_PF_ROUTER_SPLIT layout and row partition; shared by the CPU test and CUDA (flash_route_split.cuh).
+// GR8_PF_ROUTER_SPLIT layout and row partition; shared by the CPU test and CUDA (flash_route_split.cuh).
 // Each rank routes rows [r0(M, rank), r0(M, rank + 1)) and sends them as 64-byte records: the 8 tok_e ints (selection order,
-// -1 = dropped route of a G6_MOE_TOPK cut) then the 8 tok_w floats, raw bits. All 8 slots travel, so a dropped slot reaches the
+// -1 = dropped route of a GR8_MOE_TOPK cut) then the 8 tok_w floats, raw bits. All 8 slots travel, so a dropped slot reaches the
 // peer as the -1 / 0 its owner's k_pf_route wrote and every rank ends with byte-equal tables.
 #pragma once
 #include <cstddef>

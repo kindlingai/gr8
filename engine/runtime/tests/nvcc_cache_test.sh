@@ -4,10 +4,10 @@
 set -eu
 C=$(cd "$(dirname "$0")/.." && pwd)/nvcc_cache.sh
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-export G6_NVCC_CACHE_DIR=$T/cache G6_NVCC_CACHE_LOG=$T/log
+export GR8_NVCC_CACHE_DIR=$T/cache GR8_NVCC_CACHE_LOG=$T/log
 cd "$T"
 fail() { echo "nvcc_cache_test FAILED: $1"; exit 1; }
-last() { tail -1 "$G6_NVCC_CACHE_LOG" | cut -d' ' -f1; }
+last() { tail -1 "$GR8_NVCC_CACHE_LOG" | cut -d' ' -f1; }
 printf '#pragma once\n#define V 1\n' > h.h
 printf '#include "h.h"\nint f() { return V; }\n' > a.cpp
 printf 'int f();\nint main() { return f() == 1 ? 0 : 1; }\n' > m.cpp
@@ -50,10 +50,10 @@ printf '#pragma once\n#define V 3\n' > h.h
 "$C" g++ -o m m.cpp a.o;                 [ "$(last)" = miss ] || fail "a link with a changed object hits"
 ./m && fail "the link used the old object"
 # a failing compile: its status comes back and nothing is stored
-n=$(find "$G6_NVCC_CACHE_DIR" -type f | wc -l)
+n=$(find "$GR8_NVCC_CACHE_DIR" -type f | wc -l)
 printf 'int g( {\n' > bad.cpp
 if "$C" g++ -c bad.cpp -o bad.o 2> /dev/null; then fail "a failing compile succeeds"; fi
-[ "$(find "$G6_NVCC_CACHE_DIR" -type f | wc -l)" = "$n" ] || fail "a failing compile stored something"
+[ "$(find "$GR8_NVCC_CACHE_DIR" -type f | wc -l)" = "$n" ] || fail "a failing compile stored something"
 # not cacheable: no -o, -x, a response file
 "$C" g++ -c a.cpp;                       [ "$(last)" = pass ] || fail "no -o is cached"
 cp a.cpp a.inl
@@ -69,7 +69,7 @@ for j in 2 3 4 5 6 7 8; do cmp -s k1.o k$j.o || fail "concurrent compiles of one
 "$C" g++ -O2 -c k.cpp -o k9.o;           [ "$(last)" = hit ] || fail "after concurrent compiles: not a hit"
 cmp -s k1.o k9.o || fail "concurrent compiles stored other bytes"
 # off: the compiler alone, nothing logged
-: > "$G6_NVCC_CACHE_LOG"
-G6_NVCC_CACHE=0 "$C" g++ -O2 -c a.cpp -o a.o
-[ ! -s "$G6_NVCC_CACHE_LOG" ] || fail "G6_NVCC_CACHE=0 still goes through the cache"
+: > "$GR8_NVCC_CACHE_LOG"
+GR8_NVCC_CACHE=0 "$C" g++ -O2 -c a.cpp -o a.o
+[ ! -s "$GR8_NVCC_CACHE_LOG" ] || fail "GR8_NVCC_CACHE=0 still goes through the cache"
 echo "nvcc_cache_test: OK"

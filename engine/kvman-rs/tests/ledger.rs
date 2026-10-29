@@ -18,7 +18,7 @@ fn cli(file: &std::path::Path, args: &[&str], crash: Option<&str>) -> (bool, Str
     let mut c = Command::new(BIN);
     c.arg(file).args(args);
     if let Some(p) = crash {
-        c.env("G6_LEDGER_CRASH_AT", p);
+        c.env(gr8knobs::LEDGER_CRASH_AT.var(), p);
     }
     let o = c.output().unwrap();
     (o.status.success(), String::from_utf8_lossy(&o.stdout).trim().to_string())

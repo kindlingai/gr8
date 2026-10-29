@@ -1,4 +1,4 @@
-// G6_DRAFT_HEAD_I4 unit test: one GB10, synthetic records, no pack.
+// GR8_DRAFT_HEAD_I4 unit test: one GB10, synthetic records, no pack.
 //   dhead_i4_test [--time [reps]]
 // 1. kernels/head_i4.cuh k_mx_to_i4 against a host derivation: random MXFP8 head records (the layout of
 //    engine/ref/g6ref.py mxfp8_record) -> decoded values -> INT4 g32 (engine/loader-rs records::int4_quantize) -> the
@@ -9,7 +9,7 @@
 //    are within that tolerance.
 // --time: the lm_head GEMV of one TP4 vocab slice (38784 x 6144): today's MXFP8 head (tpc 1, ks 32) against the INT4 head
 //    over (tpc, ks), M = 1 and 3, mean of reps launches (CUDA events), and the bytes per launch.
-// 3. (G6_DFL_BODY_I4) 1 and 2 on the DFlash2 drafter's body shapes, at their splits.
+// 3. (GR8_DFL_BODY_I4) 1 and 2 on the DFlash2 drafter's body shapes, at their splits.
 // --time-dfl [reps]: those GEMVs at TP4 per-rank sizes, M = 8, MXFP8 against INT4 at the same split,
 //    each cycling through copies of its records that together exceed the 25 MB L2 (a draft step streams 700 MB), and the
 //    sum over one DFlash2 draft step (context fc + 6 kv; 6 x aconv q kv o mconv gu down).
@@ -410,7 +410,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--time-dfl")) dreps = i + 1 < argc ? atoi(argv[++i]) : 400;
     }
     test_convert_and_gemv();
-    for (const DflShape& d : DFL) test_convert_and_gemv(256, d.K, {{d.tpc, d.ks}});   // G6_DFL_BODY_I4 shapes
+    for (const DflShape& d : DFL) test_convert_and_gemv(256, d.K, {{d.tpc, d.ks}});   // GR8_DFL_BODY_I4 shapes
     if (reps > 0) time_heads(reps);
     if (dreps > 0) time_dfl(dreps);
     printf("%d PASS, %d FAIL\n", g_pass, g_fail);

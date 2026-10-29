@@ -1,10 +1,10 @@
 # Engine settings
 
 `./gr8 glm53 up` builds every rank's command line from `scripts/engine_args.sh` and sets everything below. Every rank
-gets the same environment and flags, except `--rank`. The values shown are what TP=6 serves with; KNOBS.md has each TP's
+gets the same environment and flags, except `--rank`. The values shown are what TP=6 serves with; `./gr8 glm53 knobs` shows each TP's
 defaults.
 The source comments in `engine/runtime/` (`g6m4.cu`, `prefill.cuh`, `rank.cuh`) are the full reference. This file is
-the short version.
+the short version. [ENV.md](ENV.md) lists every knob (`GR8_*`, formerly `G6_*`) with its default and values.
 
 ## Engine flags (`g6m4`)
 

@@ -1,4 +1,4 @@
-// G6_PF_HXF byte test: k_pf_hx + k_pf_hxq (served Q8 path) vs the fused k_pf_hxqf on random rows. Compares hq and hs
+// GR8_PF_HXF byte test: k_pf_hx + k_pf_hxq (served Q8 path) vs the fused k_pf_hxqf on random rows. Compares hq and hs
 // bytes and times both (cudaEvent median).
 //   hxf_test [--M 4096] [--iters 50] [--seed 1] [--scale 1.0]
 #include <algorithm>

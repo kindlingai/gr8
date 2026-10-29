@@ -709,7 +709,7 @@ fn simulate(reqs: &[Req], o: &Opts, policy: &Policy) -> Result {
             next[x.session] = by_session[x.session].front().map(|r| t + r.think);
         }
     }
-    if std::env::var_os("KVSIM_ENTRIES").is_some() {
+    if gr8knobs::KVSIM_ENTRIES.get() {
         if let Some(s) = pool.stash() {
             for t in 0..s.tiers() {
                 for e in s.entries(t) {

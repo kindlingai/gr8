@@ -1,4 +1,4 @@
-// G6_PF_OWN=4 with G6_PF_QP_ROLL (docs/DESIGN-QO-PAIR.md section 6): the wire layout and protocol of the rolling pair
+// GR8_PF_OWN=4 with GR8_PF_QP_ROLL (docs/DESIGN-QO-PAIR.md section 6): the wire layout and protocol of the rolling pair
 // pack in g6m4. Host-only (no CUDA, no verbs).
 //
 // A bulk-mode g6::Fabric (fabric.h bulk mode) per rank. Its bulk area is a ring of E entries; entry e is
@@ -66,8 +66,8 @@ inline unsigned long long val(long n) { return (unsigned long long)n + 1; }
 inline unsigned long long consumed_min(long n, int E) { return n >= E ? (unsigned long long)(n + 1 - E) : 0ull; }
 inline int partner(int r) { return r ^ 1; }
 // ready aux tag: p posts it with ready(n) (BulkJob post_flag aux = aux_out[ready e]); I compare it to mine for the same
-// build. Equal only if both members build the same model layer with the same S, E, QO table (G6_PF_QP_CTX) and weight
-// form (trellis: the layer's q_b / o_proj are dense trellis): a pair whose G6_PF_QP_LAYERS / ROLL / WIRE_E / QP_CTX or
+// build. Equal only if both members build the same model layer with the same S, E, QO table (GR8_PF_QP_CTX) and weight
+// form (trellis: the layer's q_b / o_proj are dense trellis): a pair whose GR8_PF_QP_LAYERS / ROLL / WIRE_E / QP_CTX or
 // weights differ fails closed (ERR_TAG) and reads no other layer's half.
 // form: bit 0 = q_b in dense trellis form, bit 1 = o_proj (bits 48 and 50; the constant holds bit 49)
 inline unsigned long long tag(int layer, int S, int E, int qp_ctx, int form = 0)
@@ -77,21 +77,21 @@ inline unsigned long long tag(int layer, int S, int E, int qp_ctx, int form = 0)
            ((unsigned long long)(S & 0xf) << 36) | ((unsigned long long)(E & 0xf) << 32) | (unsigned long long)(unsigned)qp_ctx;
 }
 // g6m4 boot refusals of the rolling-pack env, before any fabric / CUDA work. "" = ok, else the die message.
-// pf_qp: G6_PF_OWN=4 with --prefill; roll / wire_e: env_choice results (-1 = bad value, err already set by the caller);
-// qp_ctx: getenv("G6_PF_QP_CTX"); wire_e_set: G6_PF_QP_WIRE_E present in the env; qp_pack: --qp-pack given.
+// pf_qp: GR8_PF_OWN=4 with --prefill; roll / wire_e: the GR8_PF_QP_ROLL / GR8_PF_QP_WIRE_E values; qp_ctx: GR8_PF_QP_CTX
+// ("" unset); wire_e_set: GR8_PF_QP_WIRE_E counts as set; qp_pack: --qp-pack given.
 inline std::string roll_env_refusal(bool pf_qp, int roll, bool wire_e_set, int wire_e, const char* qp_ctx, bool qp_pack)
 {
-    if (wire_e_set && roll <= 0) return "G6_PF_QP_WIRE_E is set but G6_PF_QP_ROLL is not (the wire ring exists only with ROLL)";
+    if (wire_e_set && roll <= 0) return "GR8_PF_QP_WIRE_E is set but GR8_PF_QP_ROLL is not (the wire ring exists only with ROLL)";
     if (roll <= 0) return "";
-    if (!pf_qp) return "G6_PF_QP_ROLL needs G6_PF_OWN=4 and --prefill";
-    if (wire_e < 1 || wire_e > max_entries()) return "G6_PF_QP_WIRE_E: 1.." + std::to_string(max_entries()) + " (unset = 1)";
-    if (qp_pack) return "G6_PF_QP_ROLL: no --qp-pack (the rolling pack is built from this rank's pack + the partner's half by RDMA)";
+    if (!pf_qp) return "GR8_PF_QP_ROLL needs GR8_PF_OWN=4 and --prefill";
+    if (wire_e < 1 || wire_e > max_entries()) return "GR8_PF_QP_WIRE_E: 1.." + std::to_string(max_entries()) + " (unset = 1)";
+    if (qp_pack) return "GR8_PF_QP_ROLL: no --qp-pack (the rolling pack is built from this rank's pack + the partner's half by RDMA)";
     // without it the QO key table would be sized at the cap, and every request would run OWN=4
-    if (!qp_ctx || !*qp_ctx) return "G6_PF_QP_ROLL needs G6_PF_QP_CTX (the QO key / RoPE table size, in positions)";
+    if (!qp_ctx || !*qp_ctx) return "GR8_PF_QP_ROLL needs GR8_PF_QP_CTX (the QO key / RoPE table size, in positions)";
     char* end = nullptr;
     const long v = std::strtol(qp_ctx, &end, 10);
     if (*end || qp_ctx[0] < '1' || qp_ctx[0] > '9' || v <= 0 || v > 0x7fffffffL)
-        return std::string("G6_PF_QP_CTX='") + qp_ctx + "': a positive decimal position count";
+        return std::string("GR8_PF_QP_CTX='") + qp_ctx + "': a positive decimal position count";
     return "";
 }
 }   // namespace qw

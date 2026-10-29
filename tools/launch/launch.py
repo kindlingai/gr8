@@ -15,6 +15,8 @@
     prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part of the model, without booting: with an
                                https:// --model the release's files for this rank (it asks the hub for the
                                revision's commit again), and the drafter
+    knobs [WORD..] [OPTIONS]   every option: its flag, scope and meaning, and with GR8_MODEL set the value each TP
+                               runs with these options. WORDs keep the options whose name holds one of them
 
 OPTIONS are --key value (or KEY=value lines in a config file, or KEY in the environment); options.py lists them.
 --foreground runs the supervisor in this process. Exit status: 0 serving (or done), 1 failed, 2 bad options, 4 the
@@ -27,12 +29,15 @@ import os
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import handshake  # noqa: E402
+import kvnode  # noqa: E402
+import models  # noqa: E402
 import modelset  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as sv  # noqa: E402
@@ -443,6 +448,69 @@ def cmd_prepare(argv):
     return 1 if bad else 0
 
 
+def knob_lines(key, flag, scope, values, meaning):
+    head = f'{key}  {flag}' + (f'  {scope}' if scope else '')
+    return [head, *(['    ' + values] if values else []),
+            *textwrap.wrap(meaning, 116, initial_indent='    ', subsequent_indent='    '), '']
+
+
+def default_text(default, meaning, engine=False):
+    """The default line, or '' when the meaning says it ('Default: ...')."""
+    if default:
+        return f'default: {default}'
+    if 'Default: ' in meaning:
+        return ''
+    return 'default: per model and TP (scripts/engine_args.sh)' if engine else 'default: unset'
+
+
+def cmd_knobs(argv):
+    """Without GR8_MODEL: every option of ./gr8 <model> and ./gr8 kv with its default. With it: the value each of the
+    model's TPs (or --tp's alone) runs with, from scripts/engine_args.sh and these options."""
+    o = parse(argv, check=False)
+    words = [w.upper() for w in o.args]
+
+    def wanted(k):
+        return not words or any(w in k for w in words)
+    model = models.of(o) if o.get('GR8_MODEL') else None
+    tps = [o.get('TP')] if o.origin['TP'] != 'default' else list(model.tp) if model else []
+    plans = {}
+    for tp in tps:
+        try:
+            plans[tp] = opt.engine_plan(opt.parse(argv + ['--tp', tp]))['knobs']
+        except opt.OptionError as e:
+            print(f'gr8: TP={tp}: {e}', file=sys.stderr)
+            return 2
+    intro = [f'./gr8 {model.name} options, and the value each TP runs with: ./gr8 {model.name} up --<flag> VALUE, '
+             f'a config file or the environment ({o.file or "no config file"}). - = unset: the engine\'s own default '
+             '(docs/ENV.md)' if model else
+             './gr8 <model> options: --<flag> VALUE, KEY=value in a config file, or KEY in the environment. '
+             './gr8 glm53 knobs shows what each TP runs with']
+    lines = textwrap.wrap(intro[0], 120) + ['']
+    for k, (scope, default, meaning) in opt.KEYS.items():
+        if not wanted(k):
+            continue
+        if k == opt.ENGINE_KNOBS[0]:
+            lines += ['-- engine knobs: scripts/engine_args.sh turns these into the engine\'s environment and flags', '']
+        set_by = '' if o.origin[k] == 'default' else f' (set by the {o.origin[k]})'
+        if model and k in opt.ENGINE_KNOBS:
+            values = '  '.join(f'TP={tp} {plans[tp].get(k) or "-"}' for tp in tps) + set_by
+        elif model:
+            values = (o.get(k) or 'unset') + set_by
+        else:
+            values = default_text(default, meaning, k in opt.ENGINE_KNOBS)
+        lines += knob_lines(k, opt.flag_of(k), scope, values, meaning)
+    if not model:
+        kv = [k for k in kvnode.KEYS if wanted(k)]
+        if kv:
+            lines += ['-- ./gr8 kv up options (a KV node)', '']
+        for k in kv:
+            default, meaning = kvnode.KEYS[k]
+            lines += knob_lines(k, kvnode.flag_of(k), '', default_text(default, meaning), meaning)
+    lines.append('docs/ENV.md lists the engine\'s own GR8_ variables. Pass one with --g6env-x "NAME=value ...".')
+    print('\n'.join(lines))
+    return 0
+
+
 def main(argv):
     if not argv:
         print(__doc__)
@@ -464,7 +532,7 @@ def main(argv):
         return cmd_up(rest)
     f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'health': cmd_health, 'logs': cmd_logs,
          'show-config': cmd_show_config,
-         'check': cmd_check, 'prepare': cmd_prepare}.get(cmd)
+         'check': cmd_check, 'prepare': cmd_prepare, 'knobs': cmd_knobs}.get(cmd)
     if not f:
         print(f'gr8: unknown command {cmd}\n{__doc__}', file=sys.stderr)
         return 2

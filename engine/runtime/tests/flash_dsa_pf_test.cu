@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "../../knobs-rs/gr8_knobs.h"
 #include "runtime/rank.cuh"
 #include "runtime/flash_mlp_pf.cuh"
 #include "runtime/flash_dsa_pf.cuh"
@@ -23,14 +24,10 @@ struct SimplePrefill
 
 inline void pf_dsa_block_p1_ref(Model& m, SimplePrefill& P, int i, int M, int context, cudaStream_t st)
 {
-    // Opt-in gate: compare the fused MLA with CURRENT GEMM prefill, not the older P1 math.
-    if (getenv("G6_TEST_SPARSE_MLA"))
-    {
-        setenv("G6_PF_SPARSE_MLA", "0", 1);
-        pf_dsa_block_gemm(m, P, i, M, context, st);
-        setenv("G6_PF_SPARSE_MLA", "1", 1);
-        return;
-    }
+    // Opt-in gate: compare the fused MLA with CURRENT GEMM prefill, not the older P1 math. The reference needs the
+    // fused MLA off, and GR8_PF_SPARSE_MLA is read once per process (the knob cache), so one process cannot run both.
+    if (knob::test_sparse_mla())
+        die("GR8_TEST_SPARSE_MLA: the reference run needs GR8_PF_SPARSE_MLA=0, and a knob is read once per process");
     Layer& y = m.layers[i];
     for (int m0 = 0; m0 < M; m0 += MX)
     {
@@ -173,9 +170,9 @@ static DevTensor alloc_sign(uint32_t& seed, long long D, float mag = 0.015625f)
 
 int main()
 {
-    if (getenv("G6_TEST_SPARSE_MLA"))
+    if (knob::test_sparse_mla())
     {
-        setenv("G6_PF_SPARSE_MLA", "1", 1);
+        setenv("GR8_PF_SPARSE_MLA", "1", 1);   // before the first read of the knob
         puts("SPARSE MLA GATE: explicit opt-in hi/lo candidate; all P1-labelled reference columns use current GEMM prefill (fused MLA OFF)");
     }
     G6RT_CK(bind::init());
@@ -372,7 +369,7 @@ int main()
         G6RT_CK(cudaMemcpy(P_pf.x, h_x.data(), h_x.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
         bind_dsa_prefill(m_pf, P_pf, st);
-        if (getenv("G6_TEST_SPARSE_MLA")) bind_dsa_prefill(m_ref, P_ref, st);
+        if (knob::test_sparse_mla()) bind_dsa_prefill(m_ref, P_ref, st);
 
         for (int M : {8, 64, 512, 2048})
         {
@@ -461,7 +458,7 @@ int main()
             bind_dsa_layer(m_ref, 0, find, cap_long, st);
             bind_dsa_layer(m_pf, 0, find, cap_long, st);
             bind_dsa_prefill(m_pf, P_pf, st);
-            if (getenv("G6_TEST_SPARSE_MLA")) bind_dsa_prefill(m_ref, P_ref, st);
+            if (knob::test_sparse_mla()) bind_dsa_prefill(m_ref, P_ref, st);
 
             double cum_pf_ms = 0.0, cum_proj_ms = 0.0, cum_attn_ms = 0.0, cum_oproj_ms = 0.0;
             cudaEvent_t ev[4];

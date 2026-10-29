@@ -7,6 +7,9 @@ description = "gr8 S2 KV page allocator: every rank's pool of KV pages, the page
 [lib]
 crate-type = ["staticlib", "rlib", "cdylib"]
 
+[dependencies]
+gr8-knobs = { path = "../knobs-rs" }
+
 [profile.release]
 opt-level = 3
 panic = "abort"        # a panic must not unwind into the C++ engine

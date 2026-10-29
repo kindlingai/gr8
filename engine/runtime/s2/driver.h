@@ -33,7 +33,7 @@ struct DriverHooks {
     std::function<bool(Key)> dfl_ok;
     std::function<int(Key)> dfl_start;
     std::function<s2::DflDrafts(Key, const s2::DflReq&)> dfl;
-    // optional: row r's log-probability in the last draft or chain step (s2::Hooks::lp, G6_MTP_KSTOP / G6_MTP_LPLOG)
+    // optional: row r's log-probability in the last draft or chain step (s2::Hooks::lp, GR8_MTP_KSTOP / GR8_MTP_LPLOG)
     std::function<float(int)> draft_lp;
     // One completion notification.
     std::function<void(Key, const s2::Stats&)> terminal;
@@ -57,7 +57,7 @@ class Driver {
     std::array<uint32_t, MAX_SESSIONS> emitted_{};
     std::array<bool, MAX_SESSIONS> initialized_{};
     s2::Batch batch_;
-    CpRound cp_round_;   // G6_CP_STEP_ROWS: the current cycle of capped rounds (cp_rows.h)
+    CpRound cp_round_;   // GR8_CP_STEP_ROWS: the current cycle of capped rounds (cp_rows.h)
     bool cp_capped_ = false;
     uint64_t cp_rounds_ = 0;   // capped rounds so far
     s2::Hooks batch_hooks() {
@@ -173,7 +173,7 @@ public:
                 }
             if (hooks_.settle) hooks_.settle();
         } catch (...) { scheduler_.fail(); throw; }
-        // G6_CP_STEP_ROWS: of the sessions that can decode, the ones this round takes (cp_rows.h); the rest sit it out like
+        // GR8_CP_STEP_ROWS: of the sessions that can decode, the ones this round takes (cp_rows.h); the rest sit it out like
         // a grow stall. A session's verify context is at most its length + mtp, so `past` holds for every session whose
         // main step can run past R. The pick is recorded only if the quantum is a decode round
         const Config& cc = scheduler_.config();
@@ -196,7 +196,7 @@ public:
             if (pick.capped != cp_capped_) {   // one line per change, every rank (the fleet check reads it)
                 unsigned past = 0, in = 0;
                 for (size_t i = 0; i < cand.size(); ++i) { past += cand[i].past; in += pick.in[i]; }
-                std::fprintf(stderr, "# s2 G6_CP_STEP_ROWS=%u: rounds %s at boundary %llu (%zu decoding, %u past R, %u in this round)\n",
+                std::fprintf(stderr, "# s2 GR8_CP_STEP_ROWS=%u: rounds %s at boundary %llu (%zu decoding, %u past R, %u in this round)\n",
                              cc.cp_step_rows, pick.capped ? "capped" : "uncapped", (unsigned long long)q.boundary, cand.size(), past, in);
                 cp_capped_ = pick.capped;
             }
@@ -222,7 +222,7 @@ public:
                     order.push_back(int(q.keys[i].slot));
                 }
                 if (live() > 1) batch_.demote();   // another session is resident (perhaps still prefilling): the shared path
-                else if (q.count == 1 && !payload_[q.keys[0].slot].decode_prompt) batch_.promote(int(q.keys[0].slot));   // G6_DFL_REUSE=2
+                else if (q.count == 1 && !payload_[q.keys[0].slot].decode_prompt) batch_.promote(int(q.keys[0].slot));   // GR8_DFL_REUSE=2
                 require(batch_.round(order), "empty scheduled decode round");
                 std::vector<Completion> results;
                 for (unsigned i = 0; i < q.count; ++i) results.push_back(completion(q.keys[i]));

@@ -1,23 +1,23 @@
 // attnk: exact decode attention kernel arms against the stock decode attention chain of one layer, as the engine replays it
 // (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier attention-chain bench without the MK
-// chain kernel. Flags under test (each a host-side static the bench assigns): G6_ATTN_SC2 / _SC2_TR (scores_sc), G6_ATTN_CTX2
-// (context_parts_heads PB / context_pk), G6_ATTN_CTX3 / _CTX3_HG (context_pk3), G6_ATTN_SEL2 (rank_selected), G6_IDX_GRP
-// (index_scores_g); round 3: G6_ATTN_QT (absorb_m2 with the lane-transposed q for scores_sc), G6_ATTN_FRONT (attn_front).
+// chain kernel. Flags under test (each a host-side static the bench assigns): GR8_ATTN_SC2 / _SC2_TR (scores_sc), GR8_ATTN_CTX2
+// (context_parts_heads PB / context_pk), GR8_ATTN_CTX3 / _CTX3_HG (context_pk3), GR8_ATTN_SEL2 (rank_selected), GR8_IDX_GRP
+// (index_scores_g); round 3: GR8_ATTN_QT (absorb_m2 with the lane-transposed q for scores_sc), GR8_ATTN_FRONT (attn_front).
 // Layers: a full-index layer (its own indexer + select) then a shared layer reusing its indices, M rows at live context L in
 // capture bucket T, S2 batched cell with per-row tables (s2=1, as served). One call's GPU time inside a graph of K calls,
 // median of TR alternating trials; "cold" = a 96 MB L2 flush before every call, flush subtracted (served case: the experts
 // stream ~90 MB per rank between two layers' attention); "hot" = no flush.
-// ATTNK_SESS=2: the M rows are two sessions (S2 batched step as served at c > 1): rows 0 .. M-M/2-1 at live context L on
+// GR8_ATTNK_SESS=2: the M rows are two sessions (S2 batched step as served at c > 1): rows 0 .. M-M/2-1 at live context L on
 // the identity page table, rows M-M/2 .. M-1 at live context L/2 on the reversed table (other physical pages, unequal
 // lengths, a group boundary inside the step); each session on its own physical pages (pool of 2x the bucket's pages).
-// Fixtures for the edge paths (exactness; timing as any cell): ATTNK_TIES=1 makes the indexer scores repeat every 7
-// positions (exact ties: the selector's id tie-break), ATTNK_QSCALE=<s> scales the query (s = 400: most probabilities
+// Fixtures for the edge paths (exactness; timing as any cell): GR8_ATTNK_TIES=1 makes the indexer scores repeat every 7
+// positions (exact ties: the selector's id tie-break), GR8_ATTNK_QSCALE=<s> scales the query (s = 400: most probabilities
 // underflow to exactly 0, so the p == 0 skips and context_pk3's mixed batches run).
 //   REF     the stock chain (every flag 0): outputs of both layers, indices, the indexer's scores and ids, the appended KV
 //           rows and index pages, per layer the raw scores (chain prefix through the scores node) and the context parts
 //           (prefix through the context node), the shared layer's normalized probabilities and merged context. Captured
 //           once, before any arm is touched.
-//   BASE    the serving kernels of rounds 1 + 2 (default SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16; ATTNK_BASE overrides,
+//   BASE    the serving kernels of rounds 1 + 2 (default SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16; GR8_ATTNK_BASE overrides,
 //           "stock" = all 0): every arm's timing is against BASE, so a gain is on top of round 2. BASE itself is the first
 //           arm (against stock).
 //   CHAIN   per-kernel table of BASE (what bit 1) and of stock (bit 4): in-chain cost of every node = T(prefix k) -
@@ -33,18 +33,18 @@
 //   L=1000 M=3, or >= 1 ms/step at M=12, or >= 1 ms/step at T=32768 (index / select arms: the long-context levers). Kill
 //   otherwise, or on any byte difference.
 // build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12;
-// TP=6: -DG6_NR=6 -DDEC_S2, run with ATTNK_H=11 and ATTNK_H=10, the two head counts of a TP=6 rank):
+// TP=6: -DG6_NR=6 -DDEC_S2, run with GR8_ATTNK_H=11 and GR8_ATTNK_H=10, the two head counts of a TP=6 rank):
 //   nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a $FLAGS -o attnk attnk.cu ../bind.cu -lcublas
 // run: attnk T L M [what=3] [s2=1] [reps=10] [K=16] [TR=7] [chk=5] [bw=250]
-//   what: 1 CHAIN of BASE, 2 the arms, 4 CHAIN of stock. Arms: env ATTNK_ARMS="arm arm ..." with an arm = comma-separated
+//   what: 1 CHAIN of BASE, 2 the arms, 4 CHAIN of stock. Arms: env GR8_ATTNK_ARMS="arm arm ..." with an arm = comma-separated
 //   KEY=VALUE changes over BASE (keys SC2 TR CTX2 CTX3 HG SEL2 IDX QT FRONT; "base" = BASE alone, compared
-//   against stock), default below. ATTNK_BASE="SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16" (the same syntax over stock).
+//   against stock), default below. GR8_ATTNK_BASE="SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16" (the same syntax over stock).
 //   sweep: for M in 1 3 8 12; do ./attnk 2048 1000 $M; ./attnk 8192 8000 $M; ./attnk 32768 32000 $M; done
 // Exit 3 on any byte difference of an exact arm, 1 on a CUDA / validation error.
 //
-// Round 10, E1 arms (deterministic fp-order changes; keys SP and POS; ATTNK_E1=1 picks the default E1 arm list below):
-//   SP=64 / 128   G6_ATTN_CTX3_SP: context_pk3 over 64 / 128-slot partitions, merge_parts over 32 / 16 partials (run_body)
-//   POS=1         G6_ATTN_POSIDX: the full-index layer at capacity T <= 2048 takes the positional index (no indexer)
+// Round 10, E1 arms (deterministic fp-order changes; keys SP and POS; GR8_ATTNK_E1=1 picks the default E1 arm list below):
+//   SP=64 / 128   GR8_ATTN_CTX3_SP: context_pk3 over 64 / 128-slot partitions, merge_parts over 32 / 16 partials (run_body)
+//   POS=1         GR8_ATTN_POSIDX: the full-index layer at capacity T <= 2048 takes the positional index (no indexer)
 //   An E1 arm is not compared byte for byte against stock; instead (E1 lines):
 //     DET    every byte of CHK repeated poisoned calls (a fresh graph each) identical to the arm's first call: deterministic
 //     SAME   what must not change: the selected SET per row (full layer, as sorted ids), the raw scores BY KEY (each key's
@@ -55,7 +55,7 @@
 //            differing; and of the normalized probabilities by key (POS)
 //   An E1 arm the dispatch does not take (POS at T > 2048: those buckets run the indexer) is still byte-compared against
 //   stock and must be IDENTICAL ("inert"): the bucket boundary. Then NODE / TIME as for an exact arm.
-//   ATTNK_NANKEY=<pos>: the index key at <pos> (session 0) gets a NaN scale. Stock drops that key from every row that
+//   GR8_ATTNK_NANKEY=<pos>: the index key at <pos> (session 0) gets a NaN scale. Stock drops that key from every row that
 //   sees it and raises error 4; POS keeps it (no indexer score): reported as the expected semantic difference, and the
 //   SET / score checks then ignore that key.
 //   E1 sweep on one GB10: attnk_r10a.sh next to this file.
@@ -170,7 +170,7 @@ static void relaunch(const Node& n,cudaStream_t st){
 }
 static bool same_node(const Node& x,const Node& y){
     return x.p.func==y.p.func&&x.p.gridDim.x==y.p.gridDim.x&&x.p.gridDim.y==y.p.gridDim.y&&x.p.gridDim.z==y.p.gridDim.z&&x.p.blockDim.x==y.p.blockDim.x;}
-// arms that differ only in a kernel argument (index_scores_g's group size G6_IDX_GRP): the node counts as changed
+// arms that differ only in a kernel argument (index_scores_g's group size GR8_IDX_GRP): the node counts as changed
 static bool arg_differs(const Node& x,int idx_a,int idx_b){return idx_a!=idx_b&&x.name.find("index_scores_g")!=std::string::npos;}
 // the attention scores node (not the indexer's) / the context node of a chain; -1 if absent
 static int node_of(const std::vector<Node>& c,const char* what){
@@ -219,24 +219,24 @@ int main(int argc,char** argv){
 #if G6_KV4
     fprintf(stderr,"attnk: FP8 KV build only (the flags are inert under G6_KV4)\n");return 2;
 #endif
-    const int NSESS=getenv("ATTNK_SESS")&&atoi(getenv("ATTNK_SESS"))==2&&S2&&M>=2?2:1;
-    const int TIES=getenv("ATTNK_TIES")&&atoi(getenv("ATTNK_TIES"))?1:0;
-    const float QS=getenv("ATTNK_QSCALE")?(float)atof(getenv("ATTNK_QSCALE")):1.f;
-    const int NANKEY=getenv("ATTNK_NANKEY")?atoi(getenv("ATTNK_NANKEY")):-1;
+    const int NSESS=knob::attnk_sess()==2&&S2&&M>=2?2:1;
+    const int TIES=knob::attnk_ties();
+    const float QS=(float)knob::attnk_qscale();
+    const int NANKEY=(int)knob::attnk_nankey();
     // BASE and the arms
     Arm base{4,2,4,2,0,16,16,0,0,0,0,false};   // the serving flags (rounds 1 + 2)
-    if(const char* e=getenv("ATTNK_BASE")){base=STOCK;if(!parse_arm(e,base)){fprintf(stderr,"ATTNK_BASE: KEY=V,...\n");return 2;}}
+    if(const auto& e=knob::attnk_base()){base=STOCK;if(!parse_arm(*e,base)){fprintf(stderr,"GR8_ATTNK_BASE: KEY=V,...\n");return 2;}}
     // round 3: QT (S = 4 and S = 2), FRONT, then both (the serving arm)
     std::vector<std::string> specs={"base","QT=1","QT=1,SC2=2","FRONT=1","QT=1,FRONT=1"};
-    if(getenv("ATTNK_E1")&&atoi(getenv("ATTNK_E1")))specs={"base","SP=64","SP=128","POS=1","POS=1,FRONT=0","SP=64,POS=1"};   // round 10
-    if(const char* e=getenv("ATTNK_ARMS")){specs.clear();std::string s=e;size_t i=0;
+    if(knob::attnk_e1())specs={"base","SP=64","SP=128","POS=1","POS=1,FRONT=0","SP=64,POS=1"};   // round 10
+    if(const auto& e=knob::attnk_arms()){specs.clear();const std::string& s=*e;size_t i=0;
         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
     std::vector<Arm> arms;
-    for(auto& sp:specs){Arm x=base;x.vs_stock=sp=="base";if(!parse_arm(sp,x)){fprintf(stderr,"ATTNK_ARMS: bad arm %s\n",sp.c_str());return 2;}arms.push_back(x);}
-    // ATTNK_H=<heads>: the rank's head count, g6nr::HMIN or HMAX (default HMAX). A -DG6_NR=6 build runs 11 or 10 heads, the
-    // partial head groups of the SC2 / QT arms (G6_ATTN_SC2_PART); TP=4 builds have 16 either way
-    const int H=getenv("ATTNK_H")?atoi(getenv("ATTNK_H")):g6nr::HMAX,pages=(T+63)/64,pool=NSESS*pages;   // session s: physical pages [s*pages, (s+1)*pages)
-    if(H!=g6nr::HMIN&&H!=g6nr::HMAX){fprintf(stderr,"ATTNK_H=%d: %d or %d heads at G6_NR=%d\n",H,g6nr::HMIN,g6nr::HMAX,g6nr::NR);return 2;}
+    for(auto& sp:specs){Arm x=base;x.vs_stock=sp=="base";if(!parse_arm(sp,x)){fprintf(stderr,"GR8_ATTNK_ARMS: bad arm %s\n",sp.c_str());return 2;}arms.push_back(x);}
+    // GR8_ATTNK_H=<heads>: the rank's head count, g6nr::HMIN or HMAX (default HMAX). A -DG6_NR=6 build runs 11 or 10 heads, the
+    // partial head groups of the SC2 / QT arms (GR8_ATTN_SC2_PART); TP=4 builds have 16 either way
+    const int H=(int)knob::attnk_h().value_or(g6nr::HMAX),pages=(T+63)/64,pool=NSESS*pages;   // session s: physical pages [s*pages, (s+1)*pages)
+    if(H!=g6nr::HMIN&&H!=g6nr::HMAX){fprintf(stderr,"GR8_ATTNK_H=%d: %d or %d heads at G6_NR=%d\n",H,g6nr::HMIN,g6nr::HMAX,g6nr::NR);return 2;}
     cudaStream_t st;CK(cudaStreamCreate(&st));
     {int dev=0,sms=0,clk=0,l2=0;CK(cudaGetDevice(&dev));cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,dev);
      cudaDeviceGetAttribute(&clk,cudaDevAttrClockRate,dev);cudaDeviceGetAttribute(&l2,cudaDevAttrL2CacheSize,dev);

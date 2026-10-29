@@ -1,8 +1,8 @@
-// MTP confidence stop in shared rounds (s2_batch.h KStopB, G6_MTP_KSTOPB): every shared verify takes each session's
+// MTP confidence stop in shared rounds (s2_batch.h KStopB, GR8_MTP_KSTOPB): every shared verify takes each session's
 // k_q from the rule at the round's session count (k = 0 allowed unless kmin 1), a width outside the captured ones is
 // filled with the most likely unverified drafts, explore rounds stay within 0..k, every committed token is the target's,
 // and the stop off (or on with zero thresholds) plans the same steps with or without the log. Around it: a DFlash2
-// session demoted into shared rounds and promoted back (G6_DFL_REUSE=2, with G6_MTP_KSTOP), and the insert rule.
+// session demoted into shared rounds and promoted back (GR8_DFL_REUSE=2, with GR8_MTP_KSTOP), and the insert rule.
 // Host only, a fake engine.
 // Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_kstopb_test.cpp -o /tmp/batch_kstopb_test
 #include "s2_batch.h"
@@ -233,8 +233,8 @@ int main()
         CHECK(bad == 0 && xr > 10 && xw.size() >= 4);
         for (int q = 0; q < N; ++q) CHECK(exact(b, q, ss[q]));
     }
-    // 5. a DFlash2 session (with G6_MTP_KSTOP, kmax 3, or without) demoted into shared rounds with the stop, then
-    // promoted back when alone (G6_DFL_REUSE=2): shared rounds follow the rule, every token is the target's
+    // 5. a DFlash2 session (with GR8_MTP_KSTOP, kmax 3, or without) demoted into shared rounds with the stop, then
+    // promoted back when alone (GR8_DFL_REUSE=2): shared rounds follow the rule, every token is the target's
     for (int solo_kstop : {0, 1})
     {
         Fake f;

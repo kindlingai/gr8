@@ -1,7 +1,7 @@
 // The Rust pool (engine/kvman-rs through s2/pool.h) against the C++ pool it replaced (pool_ref.h): seeded random traces
 // of reserve, release, retain, match + take, exclusive runs past R and calls that must fail, through both pools at once.
 // After every call both must agree on the result (Run, PoolHit, or the error message), and on room, free pages, retained
-// runs, digest and every live run's list. Some seeds also compare the G6_POOL_LOG lines. Host only.
+// runs, digest and every live run's list. Some seeds also compare the GR8_POOL_LOG lines. Host only.
 //   pool_diff_test [seeds] [ops per seed]
 #include "s2/pool.h"
 #include "s2/tests/pool_ref.h"

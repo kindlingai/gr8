@@ -1,5 +1,5 @@
 #!/bin/bash
-# attnk_r10a.sh [attnk] [log]: the round 10 E1 attention arms (G6_ATTN_CTX3_SP, G6_ATTN_POSIDX) on one GB10, against the
+# attnk_r10a.sh [attnk] [log]: the round 10 E1 attention arms (GR8_ATTN_CTX3_SP, GR8_ATTN_POSIDX) on one GB10, against the
 # served attention flags (BASE). Per cell: determinism, what must stay the same, the error vs stock, and the hot / cold
 # timing vs BASE (attnk.cu, "Round 10"). Nothing else on the GPU; clocks as served. About 15-25 minutes.
 B=${1:-./attnk}

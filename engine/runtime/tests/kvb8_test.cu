@@ -4,11 +4,11 @@
 // scale), what the BF16 loader stores.
 //   1. g6a_kvb_bf16 (the QO / pair-owner staging) against the host's BF16(e4m3 x scale): every byte.
 //   2. Two bindings of one layer, BF16 and FP8, on the same KV rows and queries: decode (g6_attn_bind_run) under each
-//      absorb / value_project variant (absorb_m / value_project_m, G6_AVP1, G6_ATTN_QT) and prefill
+//      absorb / value_project variant (absorb_m / value_project_m, GR8_AVP1, GR8_ATTN_QT) and prefill
 //      (g6_attn_bind_prefill_run) must give byte-identical outputs.
 //   3. --bench: absorb_m and value_project_m of one layer (their launchers: the BF16 or FP8 instantiation), BF16 against
 //      FP8, at M rows with a cold L2 (a 96 MB write between calls, as the experts' stream between two layers' attention
-//      when serving): us per call. Also absorb_m2<1, true> (G6_ATTN_QT), BF16 against FP8.
+//      when serving): us per call. Also absorb_m2<1, true> (GR8_ATTN_QT), BF16 against FP8.
 //   kvb8_test [--bench] [--layer L] [--seed S]
 // Build and run: TEST=kvb8_test G6_NR=4 scripts/c1_tests.sh <bin_dir> [args]  (the K1H2 flags; attn.cu included, bind.cu)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
@@ -157,8 +157,8 @@ int main(int argc, char** argv)
             };
             auto decode = [&](G6AttnBinding* b) { CKI(g6a_bind_run(b, &s, nullptr)); };
             both("decode", decode);
-            ga::avp1_on() = 1; both("decode G6_AVP1", decode); ga::avp1_on() = 0;
-            ga::attn_qt() = 1; ga::attn_sc2() = 4; both("decode G6_ATTN_QT", decode); ga::attn_qt() = 0; ga::attn_sc2() = 0;
+            ga::avp1_on() = 1; both("decode GR8_AVP1", decode); ga::avp1_on() = 0;
+            ga::attn_qt() = 1; ga::attn_sc2() = 4; both("decode GR8_ATTN_QT", decode); ga::attn_qt() = 0; ga::attn_sc2() = 0;
             G6AttnPrefill *fb = nullptr, *f8 = nullptr;
             CKI(g6a_bind_prefill_create(&fb, &bb, nullptr));
             CKI(g6a_bind_prefill_create(&f8, &b8, nullptr));

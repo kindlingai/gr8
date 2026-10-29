@@ -1,6 +1,6 @@
-// dflreplay: the G6_DFL_BODY_I4 judge. A G6_DFL_DUMP (rank 0 of a --dflash run, dflash.cuh dfl_dump_step) replayed step
+// dflreplay: the GR8_DFL_BODY_I4 judge. A GR8_DFL_DUMP (rank 0 of a --dflash run, dflash.cuh dfl_dump_step) replayed step
 // by step through two DFlash2 drafters on ONE GPU, all NR ranks of each with a loopback fabric (as dfltest): A on the
-// MXFP8 body records, B on the INT4 g32 copies G6_DFL_BODY_I4 makes (dflash.cuh dfl_body_i4, the same function). Both get
+// MXFP8 body records, B on the INT4 g32 copies GR8_DFL_BODY_I4 makes (dflash.cuh dfl_body_i4, the same function). Both get
 // the dump's context features, positions and bonus tokens, so every draft step sees the same context in A and B (the
 // target's trajectory is the dump's; matched, unlike two live runs whose acceptance changes what follows).
 //
@@ -10,7 +10,7 @@
 //   DIR/emb.bin   int32 n, int32 ids[n], float32 rows[n][6144]: the target embedding rows of the dump's bonus tokens and
 //                 the mask token (engine/ref/dflreplay_emb.py writes it)
 //   --sel        default: the pack's (DFlash2 selector walk when it has one)
-//   --head-i4    1 (default, as serving with G6_DFL_HEAD_I4=1): both drafters' heads read INT4 records; 0: MXFP8
+//   --head-i4    1 (default, as serving with GR8_DFL_HEAD_I4=1): both drafters' heads read INT4 records; 0: MXFP8
 //   --temp / --seed / --top-p   the drafts' sampling keys (the dump does not record them; 0 = greedy, the drafter's own
 //                default under rejection sampling). Use the dumping run's values for the dump column to match A.
 //   --bench N    then time one rank's body GEMVs of a draft step (context fc + 6 kv, block 6 x aconv q kv o mconv gu

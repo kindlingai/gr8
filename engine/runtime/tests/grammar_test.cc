@@ -1,7 +1,7 @@
 // Request grammars through XGrammar (grammar.h / grammar.cc) on a small byte-level tokenizer this test writes: the
 // grammar applies only after its arming token, the masks of a step's rows follow its drafts and leave the matcher where
 // it was, a draft the grammar refuses turns the rows after it off, and the committed reply moves the state on.
-// build_m4.sh builds and runs it when G6_XGRAMMAR is set.
+// build_m4.sh builds and runs it when GR8_XGRAMMAR is set.
 #include "grammar.h"
 #include <cstdio>
 #include <fstream>

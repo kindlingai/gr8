@@ -1,4 +1,4 @@
-// G6_ATTN_FLIP (review tp3-attn-flip.md): head-inner ("flip") variants of scores_direct / context_parts_cpb.
+// GR8_ATTN_FLIP (review tp3-attn-flip.md): head-inner ("flip") variants of scores_direct / context_parts_cpb.
 // One KV record load serves HG heads; per head the FMA chain, slot order and p==0 skip are unchanged, so every
 // output byte equals scores_direct / mla_scores and context_parts_cpb / context_parts (proved by idxbench FLIPCHK).
 // Head-inner ("flip") variants of small_decode::scores_direct / context_parts_cpb.

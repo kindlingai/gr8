@@ -50,6 +50,7 @@
 #include "k1.cuh"
 #include "densev.cuh"
 #include "dtr.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #if DEC_I4PAIR
 #include <mutex>
 #include <unordered_map>
@@ -613,7 +614,7 @@ inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, c
     return nullptr;
 }
 
-// G6_QA_SPLIT (rank.cuh qs_narrow): g limited to its output tiles t0 .. t0 + nt - 1 (16 outputs each), written at their
+// GR8_QA_SPLIT (rank.cuh qs_narrow): g limited to its output tiles t0 .. t0 + nt - 1 (16 outputs each), written at their
 // columns of the same y rows (ld unchanged). An output tile's arithmetic depends only on the tile, K and ks (warp w of
 // a tile always takes the same k range, the k parts are summed in the same order, gv_gemv_body), so the narrowed GEMV
 // writes the bits the full one writes for those columns, at any tpc. nt = 0: the GEMV is off on this rank.
@@ -715,7 +716,7 @@ inline void launch_k1(const K1& k, cudaStream_t st)
     }
     launch_k1_fin(k, st);
 }
-// G6_ROUTE_OVL (rank.cuh launch_mlp_block): on trellis-shared layers with separate fc1 / fc2 launches the shared expert
+// GR8_ROUTE_OVL (rank.cuh launch_mlp_block): on trellis-shared layers with separate fc1 / fc2 launches the shared expert
 // runs on a forked stream from before the router GEMV, which fills 8 of the 48 SMs, and the single-CTA plan kernel
 // (k1.cuh k1_tr3_fc1_ovl / _fc2_ovl; same bytes out). mode 1: shared fc1 + fc2 on the fork, joined before the finalize;
 // mode 2: shared fc1 only, joined before the whole (default) fc2 launch. Inside a capture the fork and the join are
@@ -778,9 +779,25 @@ inline int k1_fused_grid(int items, size_t smem, int e4 = 0, int k2 = 0, int sh 
 #define TR3_W2SPLIT 0
 #endif
 struct K1Split { int KS1, WG, NS2, s_ks, s_ns2; };
+// The settings make_k1 binds the K1 split and launch form with. k1_vars() holds the environment's; k1_split_test and
+// k1_audit pass their own.
+struct K1Vars
+{
+    std::optional<std::string> split;                 // GR8_K1_SPLIT: a KS1,WG,NS2 triple or a table (k1_split_env)
+    std::optional<std::vector<int64_t>> m1, m2, m4;   // GR8_K1_SPLIT_M1 / _M2 / _M4: KS1,WG,NS2 at 1, 2-3, 4+ rows
+    bool w2all = false;                               // GR8_TR3_W2ALL
+    bool policy = true;                               // GR8_K1_FUSE_POLICY
+    int64_t tlbw_kb = 0;                              // GR8_K1_TLBW
+};
+inline const K1Vars& k1_vars()
+{
+    static const K1Vars v{knob::k1_split(), knob::k1_split_m1(), knob::k1_split_m2(), knob::k1_split_m4(),
+                          knob::tr3_w2all(), knob::k1_fuse_policy(), knob::k1_tlbw()};
+    return v;
+}
 // W1b (TR3_XCOMP builds): NS2 = 2 at 2-3 rows only for layers with 2-bit routed units (k2); every other layer, and
 // every layer of a default build, keeps the release split (NS2 = 8). TP3-specific tuning (window1 microbench, K2).
-inline K1Split k1_split(int M, int k2 = 0)
+inline K1Split k1_split(int M, int k2 = 0, const K1Vars& v = k1_vars())
 {
     K1Split s = M == 1 ? K1Split{4, 1, 2, 8, 24} : M <= 3 ? K1Split{1, 2, TR3_XCOMP && k2 ? 2 : 8, 8, 16} : K1Split{4, 2, 2, 8, 24};
 #if TR3_W2SPLIT
@@ -788,28 +805,31 @@ inline K1Split k1_split(int M, int k2 = 0)
     // Baked, no env (harness K1_KW). NS2 = 2 at M 2..3 is the W1b rule above (k2 layers). Non-k2 layers keep release.
     if (k2 && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
 #endif
-    // G6_TR3_W2ALL=1: the same window2 rule on every MoE layer, not only k2 layers (A/B, default 0 = the rule above).
+    // GR8_TR3_W2ALL=1: the same window2 rule on every MoE layer, not only k2 layers (A/B, default 0 = the rule above).
     // Same k ranges and partial order, so the same bits; only the CTA shape changes (S2 c4 runs class 3, s2_batch.h).
-    static const bool w2all = getenv("G6_TR3_W2ALL") && atoi(getenv("G6_TR3_W2ALL"));
-    if (w2all && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
-    if (const char* ev = getenv(M == 1 ? "G6_K1_SPLIT_M1" : M <= 3 ? "G6_K1_SPLIT_M2" : "G6_K1_SPLIT_M4"))
-        sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
-    else if (const char* ev = getenv("G6_K1_SPLIT"); ev && !strpbrk(ev, ":="))   // "KS1,WG,NS2"; a table: k1_split_env
-        sscanf(ev, "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
+    if (v.w2all && M > 1 && s.WG == 2) { s.KS1 *= 2; s.WG = 1; }
+    // a per-M list sets its leading fields, as many as it has
+    if (const auto& m = M == 1 ? v.m1 : M <= 3 ? v.m2 : v.m4)
+    {
+        int* f[] = {&s.KS1, &s.WG, &s.NS2};
+        for (size_t i = 0; i < m->size() && i < 3; ++i) *f[i] = static_cast<int>((*m)[i]);
+    }
+    else if (v.split && !strpbrk(v.split->c_str(), ":="))   // "KS1,WG,NS2"; a table: k1_split_env
+        sscanf(v.split->c_str(), "%d,%d,%d", &s.KS1, &s.WG, &s.NS2);
     return s;
 }
 // The fused path's 512-thread CTAs: the fc1 split (KS1, WG) becomes (KS1*WG/2, 2), which keeps every k range only
-// where KS1 x WG is 2 or more. KS1 x WG = 1 (e.g. G6_K1_SPLIT_M1=1,1,2) would give KS1 = 0: no fc1 items, wrong output.
+// where KS1 x WG is 2 or more. KS1 x WG = 1 (e.g. GR8_K1_SPLIT_M1=1,1,2) would give KS1 = 0: no fc1 items, wrong output.
 inline const char* k1_fuse_split(K1Split& s)
 {
-    if (s.KS1 * s.WG < 2) return "G6_K1_SPLIT: KS1 x WG must be 2 or more with fused fc1 / fc2 (G6_FUSE=1|2); set G6_FUSE=0";
+    if (s.KS1 * s.WG < 2) return "GR8_K1_SPLIT: KS1 x WG must be 2 or more with fused fc1 / fc2 (GR8_FUSE=1|2); set GR8_FUSE=0";
     s.KS1 = s.KS1 * s.WG / 2;
     s.WG = 2;
     return nullptr;
 }
 constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: only WG, s_ks, s_ns2 matter. Not tuned.
 
-// G6_K1_SPLIT (A/B, exact): per step row count M, the fc1 CTA shape KS1 x WG and / or the routed fc2 n-split NS2 of
+// GR8_K1_SPLIT (A/B, exact): per step row count M, the fc1 CTA shape KS1 x WG and / or the routed fc2 n-split NS2 of
 // the trellis-shared MoE layers, "M:KS1xWG/NS2" entries, M a row count or a range a-b, either part optional:
 // "3:2x1,1:/4,4-32:/4" = k1_audit's "fc1 2x1" arm at 3 rows and "ns2=4" at 1 and 4+ rows. Same bytes at any entry:
 // an fc1 shape is taken only where KS1 * WG equals the split's (partial p = h * WG + q covers the same k range and fc2
@@ -818,21 +838,22 @@ constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: onl
 // __ffs(WG) and __ffs(NS2) (k1.cuh, tr3.cuh), so NS2 = 3 / 6 / 12 / 24 / 48, which divide 384, would pick wrong units.
 // M is the step's rows, also for an S2 batched step (its class keeps the partial count). The value is the table form
 // only (with ':' or '='); k1_split reads the "KS1,WG,NS2" triple form of the same variable and skips a table (#155).
-// A table and a G6_K1_SPLIT_M1 / _M2 / _M4 triple together are refused: the table's fc1 entries are checked against
-// the split k1_split returns, which those triples change. Read once per process (k1_audit passes its own table to set).
+// A table and a GR8_K1_SPLIT_M1 / _M2 / _M4 triple together are refused: the table's fc1 entries are checked against
+// the split k1_split returns, which those triples change. Read once per process from vars (the first call's), or from
+// set at each call that passes it (k1_audit and k1_split_test pass their own tables).
 struct K1SplitEnv
 {
     signed char ks1[G6_MX + 1] = {}, wg[G6_MX + 1] = {}, ns2[G6_MX + 1] = {};
     const char* err = nullptr;
 };
-inline const K1SplitEnv& k1_split_env(const char* set = nullptr)
+inline const K1SplitEnv& k1_split_env(const char* set = nullptr, const K1Vars& vars = k1_vars())
 {
     static K1SplitEnv t;
     static bool done = false;
     if (done && !set) return t;
     done = true;
     t = K1SplitEnv();
-    const char* v = set ? set : getenv("G6_K1_SPLIT");
+    const char* v = set ? set : vars.split ? vars.split->c_str() : nullptr;
     if (v && !strpbrk(v, ":=")) v = nullptr;    // the "KS1,WG,NS2" triple form: k1_split's, not a table
     // a number: at least one digit, no sign, consumed; false if there is none
     auto num = [](const char*& q, long& x) {
@@ -849,35 +870,35 @@ inline const K1SplitEnv& k1_split_env(const char* set = nullptr)
         long a = 0, b = 0, ks = 0, wg = 0, ns = 0;
         bool has_ks = false, has_ns = false;
         if (!num(q, a) || (b = a, *q == '-' && (++q, !num(q, b))) || (*q != ':' && *q != '=') || a < 1 || b < a || b > G6_MX)
-        { t.err = "G6_K1_SPLIT: entries are M:KS1xWG/NS2 or a-b:..., M in 1..G6_MX"; break; }
+        { t.err = "GR8_K1_SPLIT: entries are M:KS1xWG/NS2 or a-b:..., M in 1..G6_MX"; break; }
         ++q;
         if (*q != '/')
         {
             has_ks = true;
-            if (!num(q, ks) || *q++ != 'x' || !num(q, wg)) { t.err = "G6_K1_SPLIT: fc1 shape is KS1xWG (two numbers)"; break; }
+            if (!num(q, ks) || *q++ != 'x' || !num(q, wg)) { t.err = "GR8_K1_SPLIT: fc1 shape is KS1xWG (two numbers)"; break; }
         }
         if (*q == '/')
         {
             ++q;
             has_ns = true;
-            if (!num(q, ns)) { t.err = "G6_K1_SPLIT: /NS2 needs a number"; break; }
+            if (!num(q, ns)) { t.err = "GR8_K1_SPLIT: /NS2 needs a number"; break; }
         }
-        if (*q && *q != ',') { t.err = "G6_K1_SPLIT: entries are separated by ','"; break; }
+        if (*q && *q != ',') { t.err = "GR8_K1_SPLIT: entries are separated by ','"; break; }
         if (has_ks && (!pow2(ks) || ks > 16 || KSH % ks || (wg != 1 && wg != 2 && wg != 4) || (KSH / ks) % (8 * wg)))
-        { t.err = "G6_K1_SPLIT: KS1 must be 1, 2, 4, 8 or 16 and divide KSH into a multiple of 8 x WG k16 steps, WG 1, 2 or 4"; break; }
-        if (has_ns && (!pow2(ns) || ns > 48 || KSH % ns)) { t.err = "G6_K1_SPLIT: NS2 must be a power of two that divides KSH (1..32)"; break; }
-        if (!has_ks && !has_ns) { t.err = "G6_K1_SPLIT: an entry sets KS1xWG, /NS2 or both"; break; }
+        { t.err = "GR8_K1_SPLIT: KS1 must be 1, 2, 4, 8 or 16 and divide KSH into a multiple of 8 x WG k16 steps, WG 1, 2 or 4"; break; }
+        if (has_ns && (!pow2(ns) || ns > 48 || KSH % ns)) { t.err = "GR8_K1_SPLIT: NS2 must be a power of two that divides KSH (1..32)"; break; }
+        if (!has_ks && !has_ns) { t.err = "GR8_K1_SPLIT: an entry sets KS1xWG, /NS2 or both"; break; }
         for (long m = a; m <= b; ++m)
         {
             if (has_ks) { t.ks1[m] = static_cast<signed char>(ks); t.wg[m] = static_cast<signed char>(wg); }
             if (has_ns) t.ns2[m] = static_cast<signed char>(ns);
         }
         p = *q ? q + 1 : q;
-        if (!*p && *q) { t.err = "G6_K1_SPLIT: a trailing ','"; break; }
+        if (!*p && *q) { t.err = "GR8_K1_SPLIT: a trailing ','"; break; }
     }
-    if (!t.err && v && *v && (getenv("G6_K1_SPLIT_M1") || getenv("G6_K1_SPLIT_M2") || getenv("G6_K1_SPLIT_M4")))
-        t.err = "G6_K1_SPLIT: a table with a G6_K1_SPLIT_M1 / _M2 / _M4 triple; set one of them";
-    if (v && *v && !set) fprintf(stderr, "# G6_K1_SPLIT=%s%s%s\n", v, t.err ? ": " : "", t.err ? t.err : "");
+    if (!t.err && v && *v && (vars.m1 || vars.m2 || vars.m4))
+        t.err = "GR8_K1_SPLIT: a table with a GR8_K1_SPLIT_M1 / _M2 / _M4 triple; set one of them";
+    if (v && *v && !set) fprintf(stderr, "# GR8_K1_SPLIT=%s%s%s\n", v, t.err ? ": " : "", t.err ? t.err : "");
     return t;
 }
 
@@ -885,31 +906,31 @@ inline const K1SplitEnv& k1_split_env(const char* set = nullptr)
 // __ffs(WG), __ffs(NS2) (k1.cuh, tr3.cuh: powers of two only), keep KS1 x WG fc1 partials per (block, matrix) in gpart
 // (GPMAX), give each warp group whole groups of 8 k16 steps (the prologue's 128-column blocks, the wide loads), run
 // 256 x WG threads per fc1 CTA (WG <= 4), and the fused form runs 512-thread CTAs (WG = 2). Every K1 split of a TR3
-// layer passes here at bind, whatever set it (release, G6_K1_SPLIT triple, G6_K1_SPLIT_M*, table, G6_FUSE remap):
+// layer passes here at bind, whatever set it (release, GR8_K1_SPLIT triple, GR8_K1_SPLIT_M*, table, GR8_FUSE remap):
 // before #136 the kernels divided, so a triple such as 3,1,2 ran; since then it would read the wrong units.
 inline const char* k1_split_check(const K1Split& s, int fuse)
 {
     auto pow2 = [](int x) { return x >= 1 && (x & (x - 1)) == 0; };
-    if (!pow2(s.KS1) || !pow2(s.WG) || !pow2(s.NS2)) return "K1 split: KS1, WG and NS2 must be powers of two (G6_K1_SPLIT*)";
-    if (s.WG > 4 || s.KS1 * s.WG > GPMAX) return "K1 split: WG <= 4 and KS1 x WG <= 16 (G6_K1_SPLIT*)";
-    if (KSH % s.KS1 || (KSH / s.KS1) % (8 * s.WG)) return "K1 split: KS1 x WG must split KSH into groups of 8 k16 steps (G6_K1_SPLIT*)";
-    if (KSH % s.NS2 || s.NS2 > 48) return "K1 split: NS2 must divide KSH (G6_K1_SPLIT*)";
+    if (!pow2(s.KS1) || !pow2(s.WG) || !pow2(s.NS2)) return "K1 split: KS1, WG and NS2 must be powers of two (GR8_K1_SPLIT*)";
+    if (s.WG > 4 || s.KS1 * s.WG > GPMAX) return "K1 split: WG <= 4 and KS1 x WG <= 16 (GR8_K1_SPLIT*)";
+    if (KSH % s.KS1 || (KSH / s.KS1) % (8 * s.WG)) return "K1 split: KS1 x WG must split KSH into groups of 8 k16 steps (GR8_K1_SPLIT*)";
+    if (KSH % s.NS2 || s.NS2 > 48) return "K1 split: NS2 must divide KSH (GR8_K1_SPLIT*)";
     if (fuse && s.WG != 2) return "K1 split: the fused form runs WG = 2";
     return nullptr;
 }
 // The K1 split of a TR3 MoE layer bound at M rows (split_m: the S2 row class, 0 = M): the release split (k1_split, with
-// its environment triples), the G6_K1_SPLIT table (trellis-shared layers, sh), the fused remap (fuse 1 / 2), checked.
+// its environment triples), the GR8_K1_SPLIT table (trellis-shared layers, sh), the fused remap (fuse 1 / 2), checked.
 // An fc1 table entry whose KS1 x WG is not the split's fails the bind at split_m 0; under an S2 class (split_m) whose
 // partial count differs from the M-row step's, the class's shape stays (exact either way). make_k1 and k1_split_test.
-inline const char* k1_bind_split(int M, int split_m, int k2, bool sh, int fuse, K1Split& s)
+inline const char* k1_bind_split(int M, int split_m, int k2, bool sh, int fuse, K1Split& s, const K1Vars& v = k1_vars())
 {
-    s = k1_split(split_m ? split_m : M, k2);
+    s = k1_split(split_m ? split_m : M, k2, v);
     if (sh)
     {
-        const K1SplitEnv& o = k1_split_env();
+        const K1SplitEnv& o = k1_split_env(nullptr, v);
         if (o.err) return o.err;
         if (o.ks1[M] && o.ks1[M] * o.wg[M] == s.KS1 * s.WG) { s.KS1 = o.ks1[M]; s.WG = o.wg[M]; }
-        else if (o.ks1[M] && !split_m) return "G6_K1_SPLIT: an fc1 entry's KS1 x WG is not the row count's own (it would change the sums)";
+        else if (o.ks1[M] && !split_m) return "GR8_K1_SPLIT: an fc1 entry's KS1 x WG is not the row count's own (it would change the sums)";
         if (o.ns2[M]) s.NS2 = o.ns2[M];
     }
     if (fuse)                                              // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
@@ -942,7 +963,8 @@ template <class P> inline PlanPtrs plan_ptrs(const P* p)
 
 // x2 = mlp_norm output fp16 [8][6144], xf_x2 = its fp16 fragment table, out = [8][6144] (BF16 bits if out_bf16).
 inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, const __half* x2, const u32* xf_x2,
-                           const PlanPtrs& plan, void* out, int out_bf16, K1& k, Tensor* sh_out, int fuse = 0, int split_m = 0)
+                           const PlanPtrs& plan, void* out, int out_bf16, K1& k, Tensor* sh_out, int fuse = 0, int split_m = 0,
+                           const K1Vars& v = k1_vars())
 {
     k = K1();
     const bool moe = T.t[T_TR3_TAB].p != nullptr;
@@ -972,18 +994,17 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
     K1Split s = K1_DENSE_SPLIT;
     // exlr8 v2 layers (2-bit units or the trellis shared expert) choose fused or separate fc1 / fc2 launches from a
-    // table timed on GB10 (TP4 rank 0, MoE step, G6_FUSE=1 only). Separate wins at 2 rows for every layer (3-7.5%), and
+    // table timed on GB10 (TP4 rank 0, MoE step, GR8_FUSE=1 only). Separate wins at 2 rows for every layer (3-7.5%), and
     // at 3+ rows when 2-bit units are at least half the bytes (5-11%). Fused wins at 1 row (1-3%) and for mostly 3/4-bit
-    // layers at 5-8 rows (3-5%). TR3 and v1 layers keep G6_FUSE as given.
-    static const bool policy = !getenv("G6_K1_FUSE_POLICY") || atoi(getenv("G6_K1_FUSE_POLICY"));   // 0: A/B runs only
+    // layers at 5-8 rows (3-5%). TR3 and v1 layers keep GR8_FUSE as given. GR8_K1_FUSE_POLICY=0: A/B runs only.
     const int rows = split_m ? split_m : M;
-    if (policy && fuse == 1 && moe && (T.k2 || T.sh_trellis) && (rows == 2 || (rows >= 3 && T.k2 && T.k2_pct >= 50))) fuse = 0;
+    if (v.policy && fuse == 1 && moe && (T.k2 || T.sh_trellis) && (rows == 2 || (rows >= 3 && T.k2 && T.k2_pct >= 50))) fuse = 0;
     // 16+ rows in the step (S2 batches; split_m keeps rows at the session's class): separate launches, 2-3.5% faster at
     // 24-32 rows (row_budget_test --time-v2, GB10 2200 MHz: M=24 1551 vs 1577 us, M=32 1752 vs 1812 us)
-    if (policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
+    if (v.policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
     if (moe)
     {
-        if (const char* e = k1_bind_split(M, split_m, T.k2, sh, fuse, s)) return e;
+        if (const char* e = k1_bind_split(M, split_m, T.k2, sh, fuse, s, v)) return e;
     }
     else if (fuse)                                         // dense layers: the fused remap of K1_DENSE_SPLIT (4 x 2)
         if (const char* e = k1_fuse_split(s)) return e;
@@ -994,18 +1015,11 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     a.x = x2; a.xfrag = xf_x2;
     a.ctl = sc.ctl; a.n_plans = 1; a.M = M;
     a.B = g6nr::EB; a.KS1 = s.KS1; a.WG = s.WG; a.NS2 = s.NS2;
-    // G6_K1_TLBW = granule in KB, a power of 2 (A/B, no output change): fc1 prefetches the routed slots' weight
+    // GR8_K1_TLBW = granule in KB, a power of 2 (A/B, no output change): fc1 prefetches the routed slots' weight
     // translations into L2 at that granule (k1.cuh k1_tlbw); 64 / 2048 = the GPU's big / huge page. 0 = off.
-    // A value that is not all digits, or not a power of two in 1 .. 1048576, fails the bind ("0" or unset = off).
-    static const long tlbw_kb = [] {
-        const char* v = getenv("G6_K1_TLBW");
-        if (!v || !*v) return 0L;
-        char* e;
-        const long x = (*v >= '0' && *v <= '9') ? strtol(v, &e, 10) : -1;
-        return (x < 0 || *e || x > (1L << 20)) ? -1L : x;
-    }();
-    if (tlbw_kb && (tlbw_kb < 1 || tlbw_kb > (1 << 20) || (tlbw_kb & (tlbw_kb - 1)))) return "G6_K1_TLBW must be a power of 2 KB (1 .. 1048576)";
-    if (moe && tlbw_kb) a.tlbw = 10 + __builtin_ctzl(static_cast<unsigned long>(tlbw_kb));
+    // A value that is not a power of two fails the bind.
+    if (v.tlbw_kb & (v.tlbw_kb - 1)) return "GR8_K1_TLBW must be a power of 2 KB (1 .. 1048576)";
+    if (moe && v.tlbw_kb) a.tlbw = 10 + __builtin_ctzl(static_cast<unsigned long>(v.tlbw_kb));
     a.s_fc1 = static_cast<const uint8_t*>(f1.p); a.s_fc2 = static_cast<const uint8_t*>(f2.p);
     a.s_up = mx ? static_cast<const uint8_t*>(fu.p) : nullptr; a.s_mx = mx;
     a.s_nch = s_nch; a.s_ks = s.s_ks; a.s_cw = w1 / s.s_ks; a.s_ns2 = s.s_ns2;
@@ -1136,7 +1150,7 @@ struct Layer
     Gv idx_g;                         // Flash DSA: x @ index_kpool_compress_gate^T (runtime/flash_dsa.cuh)
 #endif
     GvMulti x_in;                     // q_a, kv_a, idx_k, idx_w as one launch (n = 0: one launch each)
-    GvMulti x_rest;                   // G6_QA_SPLIT=2 only: kv_a, idx_k, idx_w (full) as one launch after the q_a slice
+    GvMulti x_rest;                   // GR8_QA_SPLIT=2 only: kv_a, idx_k, idx_w (full) as one launch after the q_a slice
     K1 k1;
     Tensor sh[3];                     // the K1's shared / dense MLP records (fc1 or gate, up, fc2 or down), for warm_mlp
     const void* shw = nullptr;        // trellis shared expert: its fc1 tiles (tr3.table row 256) and their bytes,
@@ -1148,7 +1162,7 @@ struct Layer
 
 inline void launch_q_b(const Layer& L, cudaStream_t st) { launch(L.q_b, st); dtr::launch(L.q_b_t, st); }
 inline void launch_o_proj(const Layer& L, cudaStream_t st) { launch(L.o_proj, st); dtr::launch(L.o_proj_t, st); }
-// ovl: G6_ROUTE_OVL, k1_ovl_fork ran before the router (k1_ovl_on): launch_k1_ovl in place of launch_k1
+// ovl: GR8_ROUTE_OVL, k1_ovl_fork ran before the router (k1_ovl_on): launch_k1_ovl in place of launch_k1
 inline void launch_mlp(const Layer& L, cudaStream_t st, const K1Ovl* ovl = nullptr)
 {
     if (ovl) launch_k1_ovl(L.k1, *ovl, st);
@@ -1214,11 +1228,11 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     L.moe = T.t[T_TR3_TAB].p != nullptr;
     L.indexer = T.t[T_IDX_WQ_B].p != nullptr;
     const char* e = nullptr;
-    // G6_DTR (default 1): the dense trellis matrices of the exlr8 release form (dtr.cuh) where the layer has them;
+    // GR8_DTR (default 1): the dense trellis matrices of the exlr8 release form (dtr.cuh) where the layer has them;
     // 0 binds the int4 / MXFP8 records instead (a layer must then have them). The int4 record wins over MXFP8 when a
     // layer has both. MXFP8 q_a / o_proj splits: five splits each swept on the GB10 at M = 1, 3
     // (measured on one GB10); all within 3% (best time) and no split wins at both M, so these stay.
-    static const bool dtr_on = !getenv("G6_DTR") || atoi(getenv("G6_DTR"));
+    const bool dtr_on = knob::dtr();
     if (dtr_on && T.mats_err) return T.mats_err;
     const dtr::LayerMats& D = T.mats;
     const bool tq = dtr_on && D.q_b.w, to = dtr_on && D.o_proj.w, tm = dtr_on && D.gate.w;
@@ -1239,9 +1253,9 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     else if (omx) e = make_gv(T.t[T_O_PROJ_MX], MXFP8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     else     e = make_gv(T.t[T_O_PROJ],    INT4,  2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     if (e) return e;
-    // G6_ROUTER_TPC=1: the router's 16 output tiles one per CTA (16 CTAs of 512 threads, not 8 of 1024); same tiles,
+    // GR8_ROUTER_TPC=1: the router's 16 output tiles one per CTA (16 CTAs of 512 threads, not 8 of 1024); same tiles,
     // k parts and reduction order, so the same bits
-    static const int rtpc = getenv("G6_ROUTER_TPC") && atoi(getenv("G6_ROUTER_TPC")) == 1 ? 1 : 2;
+    const int rtpc = static_cast<int>(knob::router_tpc());
     if ((e = make_gv(T.t[T_ROUTER],    BF16W, rtpc, 16, M, sc.xb_x2,  io.logits,    gv::O_F32,  L.router))) return e;
     if (!L.q_a.on || !L.kv_a.on || !(L.q_b.on || tq) || !(L.o_proj.on || to))
         return "layer without q_a.gptq (or q_a.mx.gv) / kv_a.mx.gv / q_b (trellis, q_b.gptq or q_b.mx.gv) / o_proj (trellis, o_proj.gptq or o_proj.mx.gv)";
@@ -1257,8 +1271,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     if (tq && (e = dtr::make_out(D.q_b, M, io.q_a_n, qbK, nullptr, io.q_b, qbO, dtr::O_F16, sc.dt, 0, 0, 1, L.q_b_t))) return e;
     if (to && (e = dtr::make_out(D.o_proj, M, io.attn, opK, nullptr, io.attn_part, HID, dtr::O_BF16, sc.dt, 64, 0, 1, L.o_proj_t)))
         return e;
-    static const bool multi = !getenv("G6_GV_MULTI") || atoi(getenv("G6_GV_MULTI"));
-    if (multi) make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w}, M, L.x_in);
+    if (knob::gv_multi()) make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w}, M, L.x_in);
 
     L.xf_x.on = 1;    L.xf_x.src = io.x;        L.xf_x.ld = HID;          L.xf_x.K = HID;          L.xf_x.f16 = sc.xf_x;
     L.xf_x.bf16 = L.indexer ? sc.xb_x : nullptr;
@@ -1372,7 +1385,7 @@ inline cudaError_t init()
         set(k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
         set(k1_fn_fused<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
         set(k1_fn_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
-        if constexpr (K1_V(SH))                                         // G6_ROUTE_OVL (k1_ovl_fork / launch_k1_ovl)
+        if constexpr (K1_V(SH))                                         // GR8_ROUTE_OVL (k1_ovl_fork / launch_k1_ovl)
         {
             set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, K1_V(K2), 1, K1_V(CB)>));
             set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, K1_V(K2), 2, K1_V(CB)>));

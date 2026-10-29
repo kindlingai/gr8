@@ -1,4 +1,4 @@
-// The XGrammar side of grammar.h. Built by the host compiler when G6_XGRAMMAR names an XGrammar build (build_m4.sh).
+// The XGrammar side of grammar.h. Built by the host compiler when GR8_XGRAMMAR names an XGrammar build (build_m4.sh).
 #include "grammar.h"
 
 #include <xgrammar/xgrammar.h>

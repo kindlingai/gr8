@@ -5,7 +5,7 @@
 // A step carries the rows of up to S2N sessions, session-major, each session's rows contiguous in position order
 // (s2_batch.h Step). Everything but attention is row-invariant (Stage 0) and runs over all M rows as today, with the
 // MoE k1 split of the step's row class (A1: S2In::cls, bind::make_layer split_m). Attention runs once per layer over all
-// rows of the step (batched, below; G6_S2_ATTN_PERSESSION=1: once per session over the session's rows of q_b / kv_a / index
+// rows of the step (batched, below; GR8_S2_ATTN_PERSESSION=1: once per session over the session's rows of q_b / kv_a / index
 // inputs, then a device copy of its output rows) into the concatenated attention rows (cat) that o_proj's fragment table reads.
 // KV: per layer the pool is the layer's OWN binding (y.ab, created by build at s2_pool_slots x the per-session
 // reservation, the --cap pages, identity block table). Session slot q owns a list of pool pages (S2Model::run[q], the
@@ -19,7 +19,7 @@
 // into the layers' tables and the driver sets StepIn::page_bound to the pool's pages.
 // Per-session cells [slot][layer] are written by k_s2_cells from the device S2In of the step (written by the driver before
 // the launch, like StepIn); the per-session calls run without graphs and without replay entries.
-// Batched attention (default; G6_S2_ATTN_PERSESSION=1 keeps the per-session calls above): ONE attention call per layer for
+// Batched attention (default; GR8_S2_ATTN_PERSESSION=1 keeps the per-session calls above): ONE attention call per layer for
 // all rows of the step. Per layer one batch view (its own index list and error word, output = cat) and one replay entry keyed
 // (bucket of the longest session, layer, M): independent of which sessions and how many rows each has. The per-row bounds and
 // block table live in device data (G6AttnRow per row, s2_cells.cuh) that k_s2_cells writes from S2In before the launch, so one
@@ -37,6 +37,7 @@
 #include <memory>
 #include <tuple>
 #include "s2_cells.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt
 {
@@ -47,7 +48,7 @@ namespace g6rt
 // The step's bucket (S2Model::bucket) is the largest bucket of its sessions' contexts.
 //
 // The attention reads its per-row contexts and tables from the per-row cells (s2_cells.cuh, one call per layer). The
-// promise holds in the batched form (default). The per-session form (G6_S2_ATTN_PERSESSION=1) bakes the layout into its
+// promise holds in the batched form (default). The per-session form (GR8_S2_ATTN_PERSESSION=1) bakes the layout into its
 // replay entries: it is for runs without graphs only (s2_init refuses it with graphs).
 constexpr bool S2_ATTN_LAYOUT_FREE = true;
 // selected positions per row of a view's index list (Flash: the kpool selection, kvfmt.h)
@@ -105,7 +106,7 @@ struct S2Model
     int rt_window = 0;
     // the main model's tail entries of the run with this list (logical page -> page, -1 none), or null: all -1
     std::function<const std::vector<int>*(const std::vector<int>& list)> rt_tail;
-    unsigned* last_rows = nullptr;                           // draft model, G6_MTP_LASTROW: bit r = row r is its session's last
+    unsigned* last_rows = nullptr;                           // draft model, GR8_MTP_LASTROW: bit r = row r is its session's last
 };
 
 // pages base, base + 1, .., base + pages - 1: the contiguous run the allocator grants
@@ -255,11 +256,10 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     s->nslots = nslots;
     s->cells = dmalloc<G6AttnStepCell>((size_t)S2N * m.nl);
     {
-        const char* e = getenv("G6_S2_ATTN_PERSESSION");
-        s->batch = !(e && atoi(e));
-        if (!s->batch && s->graph) die("s2: G6_S2_ATTN_PERSESSION=1 bakes the session layout into replay entries; use it without graphs");
+        s->batch = !knob::s2_attn_persession();
+        if (!s->batch && s->graph) die("s2: GR8_S2_ATTN_PERSESSION=1 bakes the session layout into replay entries; use it without graphs");
 #if G6_MODEL_FLASH
-        if (!s->batch) die("s2: Flash runs batched attention only (G6_S2_ATTN_PERSESSION=1 is GLM's)");
+        if (!s->batch) die("s2: Flash runs batched attention only (GR8_S2_ATTN_PERSESSION=1 is GLM's)");
         if (m.s2_below) die("s2: Flash has no S2 below R");
 #endif
     }
@@ -292,7 +292,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
 #if defined(G6_CP) && G6_CP
         if (a0.cp_nr)
         {
-            if (m.s2_below > m.cp.R) die("s2: s2_below > G6_CP_R (the runs must stay on the replicated path)");
+            if (m.s2_below > m.cp.R) die("s2: s2_below > GR8_CP_R (the runs must stay on the replicated path)");
             const int rp = m.cp.R / 64;
             s->pool_pages = std::min(rp + (a0.table_size - rp) / a0.cp_nr, a0.page_count);   // m.cp.phys may cap it
         }
@@ -571,7 +571,7 @@ inline void s2_reloc_copy(char* cache, size_t page_bytes, int B, int pages, cuda
                                 cudaMemcpyDeviceToDevice, st));
     }
 }
-// the 2->1 transition (m4sim G6_S2_RELOC=1): the survivor in slot q (a run at base B != 0) moves to base 0, its first
+// the 2->1 transition (m4sim GR8_S2_RELOC=1): the survivor in slot q (a run at base B != 0) moves to base 0, its first
 // `pages` pages of every layer's MLA cache (g6kv::ROW B per row) and index cache (132 B per row, full-index layers), then
 // s2_set_base(q, 0). Host, at a round boundary, outside capture, before any new admission, for the main and the draft
 // model of every rank.
@@ -614,14 +614,14 @@ inline bool s2_steer_same(const bind::K1& a, const bind::K1& b)
            a.a.steer_count == b.a.steer_count && a.a.steer_slot == b.a.steer_slot &&
            a.a.steer_slot_alpha == b.a.steer_slot_alpha && std::memcmp(&a.a.steer_alpha, &b.a.steer_alpha, sizeof(float)) == 0;
 }
-// an S2 layer i after make_layer (s2_layer): the head-count check, G6_QA_SPLIT narrowing as layer_base, the MoE
+// an S2 layer i after make_layer (s2_layer): the head-count check, GR8_QA_SPLIT narrowing as layer_base, the MoE
 // finalize's shared-scope steering (k1_steer, refused unless it equals today's layer `base` of the same M), and the
 // DEC_SLOT slots of `base`
 inline void s2_bind(Model& m, int i, const bind::Layer& base, bind::Layer& L)
 {
     const Layer& y = m.layers[i];
     if (L.heads != y.ab.args.heads) die("kernel binder and attention binder disagree on the head count");
-    qs_narrow(m, i, L);                                 // G6_QA_SPLIT: this rank's tiles of the input GEMVs, as layer_base
+    qs_narrow(m, i, L);                                 // GR8_QA_SPLIT: this rank's tiles of the input GEMVs, as layer_base
     k1_steer(m, i, L.k1);                               // shared-scope steering of the MoE finalize, as layer_base
     if (!s2_steer_same(L.k1, base.k1))
         die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": K1 steering differs from today's layer");
@@ -648,7 +648,7 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M)
     io.attn_part = m.sc.part[0];
     io.x2 = m.x2; io.logits = m.logits; io.plan = bind::plan_ptrs(m.plan);
     io.mlp_part = m.sc.part[1];
-    static const int fuse = getenv("G6_FUSE") ? atoi(getenv("G6_FUSE")) : 1;
+    static const int fuse = (int)knob::fuse();
     std::unique_ptr<bind::Layer> L(new bind::Layer());
     if (const char* e = bind::make_layer(y.T, M, m.sc, io, *L, fuse, s.h.cls))
         die("s2: rank " + std::to_string(m.rank) + " layer " + std::to_string(y.l) + ": " + e);
@@ -715,7 +715,7 @@ inline int s2_step_rows(const S2Model& s) { return s.h.ns <= 0 ? 0 : s.h.row0[s.
 // The fabric side enqueues the CP collectives when the step's largest context is past R (g6m4 cp_enqueue); R is a
 // bucket boundary (context_buckets.h), so the two agree. Rows below R in such a step take the CP numerics (LSE merge).
 // s2_cp_bucket: the same for a step whose bucket is bk (NativeDispatch::capture_all skips the widths past
-// G6_CP_STEP_ROWS where it holds)
+// GR8_CP_STEP_ROWS where it holds)
 inline bool s2_cp_bucket(const Model& m, int bk)
 {
 #if defined(G6_CP) && G6_CP
@@ -805,7 +805,7 @@ inline void s2_prepare(Model& m, int M, cudaStream_t st)
             const bool cp = s2_cp_step(m);
 #if defined(G6_CP) && G6_CP
             if (cp && M > m.cp.colls.mmax) die("s2: a CP step of " + std::to_string(M) + " rows exceeds the CP fabric's mmax " + std::to_string(m.cp.colls.mmax) +
-                                                     " (G6_CP_MMAX, G6_CP_STEP_ROWS)");
+                                                     " (GR8_CP_MMAX, GR8_CP_STEP_ROWS)");
 #endif
             auto& map = cp ? s.cbrp : s.brp;
             const auto key = std::make_tuple(bk, i, M);
@@ -910,7 +910,7 @@ inline void s2_draft_keep(Draft& D, cudaStream_t st)
     k_s2_draft_keep<<<S2N, 256, 0, st>>>(S2Keep<__half>{reinterpret_cast<const uint32_t*>(s.in), D.d.x, s.hprev_b});
 #endif
 }
-// G6_MTP_LASTROW (rank.cuh launch_mlp_block): the rows of the step that are their session's last (S2In, device), as the
+// GR8_MTP_LASTROW (rank.cuh launch_mlp_block): the rows of the step that are their session's last (S2In, device), as the
 // router plan's keep mask. grid 1, block 32
 __global__ void __launch_bounds__(32) k_s2_last_rows(const uint32_t* in, unsigned* out)
 {

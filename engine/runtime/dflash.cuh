@@ -94,7 +94,7 @@ struct Dfl
 {
     int rank = -1;
     bool sel = false;                 // DFlash2 selector walk (else argmax / gr8's sampler)
-    float sel_alpha = 1.f;            // G6_DFL_SEL_ALPHA: the walk's correction coefficient (draft tokens and lp only)
+    float sel_alpha = 1.f;            // GR8_DFL_SEL_ALPHA: the walk's correction coefficient (draft tokens and lp only)
     int mask_id = 0;
     float theta = 1e6f, eps = 1e-5f;
     int tlayer[dfl::NT] = {};         // target_layer_ids
@@ -755,8 +755,8 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
             D.fc.codec == bind::MXFP8 ? "MXFP8" : "BF16");
 }
 
-// G6_DFL_HEAD_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's head GEMV reads INT4 g32 records of this
-// rank's vocab slice (rank.cuh head_i4_records; the MTP draft's copy when G6_DRAFT_HEAD_I4 made one, same slice and ks)
+// GR8_DFL_HEAD_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's head GEMV reads INT4 g32 records of this
+// rank's vocab slice (rank.cuh head_i4_records; the MTP draft's copy when GR8_DRAFT_HEAD_I4 made one, same slice and ks)
 // instead of the target's MXFP8 records. The head feeds the drafter two ways: argmax mode samples from its logits
 // (k_head_local / merge, as the MTP draft); selector mode takes each row's global top-16 by raw logit (k_top_local, merged
 // in k_walk) and scores them as logit + pred[prev] . hp[s] . succ[c], so INT4 can change both which 16 are candidates and
@@ -767,14 +767,14 @@ inline void dfl_head_i4(Dfl& D, const uint8_t* rec, int tpc, int ks)
     t.p = rec; t.nd = 3;
     t.shape[0] = D.vn / 16; t.shape[1] = HID / 32; t.shape[2] = head_i4::I4GR;
     if (const char* e = bind::make_gv(t, bind::INT4, tpc, ks, dfl::B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head))
-        die(std::string("G6_DFL_HEAD_I4: ") + e);
-    if (D.head.lm_head.O != D.vn || D.head.lm_head.K != HID) die("G6_DFL_HEAD_I4: INT4 head is not this rank's vocab slice");
+        die(std::string("GR8_DFL_HEAD_I4: ") + e);
+    if (D.head.lm_head.O != D.vn || D.head.lm_head.K != HID) die("GR8_DFL_HEAD_I4: INT4 head is not this rank's vocab slice");
 }
 
-// G6_DFL_BODY_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's body GEMVs (fc, and per layer kv (context and
+// GR8_DFL_BODY_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's body GEMVs (fc, and per layer kv (context and
 // block: one record), aconv, q, o, mconv, gu, down) read INT4 g32 records made at boot from their MXFP8 records
-// (rank.cuh gv_to_i4, the G6_DRAFT_HEAD_I4 arithmetic), with the same splits: 382 MB instead of 701 MB per rank, which the
-// pack image keeps as well. The selector's hproj (1.6 MB) and the head (G6_DFL_HEAD_I4) are not touched. A BF16 record
+// (rank.cuh gv_to_i4, the GR8_DRAFT_HEAD_I4 arithmetic), with the same splits: 382 MB instead of 701 MB per rank, which the
+// pack image keeps as well. The selector's hproj (1.6 MB) and the head (GR8_DFL_HEAD_I4) are not touched. A BF16 record
 // (dflash2.py --bf16) stays BF16. Drafts only: the target and the verify step are unchanged; the drafts and their
 // log-probabilities can differ from the MXFP8 drafter's (dflreplay.cu measures how often). After dfl_build, before the
 // drafter's graphs.
@@ -783,7 +783,7 @@ inline void dfl_body_i4(Dfl& D, cudaStream_t st)
     size_t mx = 0, i4 = 0;
     auto cv = [&](bind::Gv& g) {
         if (g.codec != bind::MXFP8) return;
-        const size_t b = bind::gv_bytes(g), n = gv_to_i4(g, "G6_DFL_BODY_I4", st);
+        const size_t b = bind::gv_bytes(g), n = gv_to_i4(g, "GR8_DFL_BODY_I4", st);
         if (n) { mx += b; i4 += n; }
     };
     cv(D.fc);
@@ -792,7 +792,7 @@ inline void dfl_body_i4(Dfl& D, cudaStream_t st)
         cv(y.kvc); cv(y.kv); cv(y.ac); cv(y.q); cv(y.o); cv(y.mc); cv(y.gu); cv(y.down);
         if constexpr (dfl::REP) for (int v = 0; v < dfl::KS; ++v) { cv(y.ok[v]); cv(y.dk[v]); }
     }
-    fprintf(stderr, "# rank %d: G6_DFL_BODY_I4: drafter body INT4 g32 records, %.1f MB (MXFP8 %.1f MB)\n", D.rank, i4 / 1e6, mx / 1e6);
+    fprintf(stderr, "# rank %d: GR8_DFL_BODY_I4: drafter body INT4 g32 records, %.1f MB (MXFP8 %.1f MB)\n", D.rank, i4 / 1e6, mx / 1e6);
 }
 
 // ---------------------------------------------------------------- the step, in phases
@@ -1032,7 +1032,7 @@ inline void dfl_fill_step(Dfl& D, cudaStream_t st)
     for (int p = 0; p < DFL_FILL_PH; ++p) dfl_fill_phase(D, p, st);
 }
 
-// G6_DFL_DUMP=<file> (measurement, rank 0): after a draft or fill step, one record: int32 kind (0 = context rows only,
+// GR8_DFL_DUMP=<file> (measurement, rank 0): after a draft or fill step, one record: int32 kind (0 = context rows only,
 // 1 = context rows + drafts), ctx_pos0, ctx_rows, q0, tok0, drafts[7]; then the context rows' features, fp16
 // [ctx_rows][NT][HID] (FEAT_SCALE x the target residual). kind 2 = the committed tokens of the request: int32 n, then n ids.
 inline void dfl_dump_step(FILE* f, const Dfl& D, const DflIn& di, const DflOut* o)

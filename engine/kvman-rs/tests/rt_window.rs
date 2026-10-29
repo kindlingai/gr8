@@ -1,4 +1,4 @@
-//! Remote rows release (window(): the engine's G6_RT_LOCAL): a split run takes its prefix and `window` pages below
+//! Remote rows release (window(): the engine's GR8_RT_LOCAL): a split run takes its prefix and `window` pages below
 //! place and its whole tail above it, so the drafter never holds one of the main model's pages; such a run is never
 //! retained (its tail rows are records of its own rows store), so no later grant adopts, shares or spills them, and
 //! the digest names the window.
@@ -126,7 +126,7 @@ fn the_digest_names_the_window() {
 
 #[test]
 fn the_cluster_admission_of_a_41k_prompt() {
-    // the TP=4 boot of 2026-10-20: --cap 408832 (6388 pages), place 900 (G6_RT_PLACE), R = 32768 (512 pages), window
+    // the TP=4 boot of 2026-10-20: --cap 408832 (6388 pages), place 900 (GR8_RT_PLACE), R = 32768 (512 pages), window
     // 40, prefix reuse on. A 41,399-token prompt with max_tokens 200 and its guard: an exclusive split run of 41,600 rows
     let mut p = pool(408_832 / 64, 900, 512, 4, 40);
     let worst = 41_600u64;

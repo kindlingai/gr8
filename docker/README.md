@@ -3,7 +3,7 @@
 One image for GB10 boxes (linux/arm64, CUDA 13, sm_121a): the engine for every TP width (`bin/`), the Rust front end,
 the loader, the shims and the launcher, on the CUDA 13 runtime image (which brings cuBLAS) with libibverbs and the mlx5
 provider. Each box runs one container, which holds one rank. The head (rank 0) also runs the shim and the OpenAI front
-end. The container's entrypoint is `./gr8 $GR8_MODEL`, so it takes the launcher's commands and options (KNOBS.md) and
+end. The container's entrypoint is `./gr8 $GR8_MODEL`, so it takes the launcher's commands and options (./gr8 knobs) and
 runs the same checks and handshake as a bare-metal box.
 
 ## Running it

@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 #include "../bind_prefill.cuh"
+#include "../../knobs-rs/gr8_knobs.h"
 #include "../../h2d.h"
 #include "../../loader/devimage.h"
 
@@ -126,10 +127,10 @@ int main(int argc, char** argv)
     A.x = x; A.ldx = HID;
     A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.ysh = sc.ysh; A.out = out;
 #ifdef PF_AOP
-    { const char* ev = getenv("G6_PF_AOP"); A.aop = (ev && atoi(ev) == 0) ? nullptr : sc.aop; }
+    A.aop = knob::pf_aop().value_or(true) ? sc.aop : nullptr;
 #endif
 #ifdef PF_F12
-    { const char* ev = getenv("G6_PF_F12"); A.f12 = ev ? atoi(ev) : 1; }
+    A.f12 = knob::pf_f12().value_or(true) ? 1 : 0;
 #endif
     CK(cudaMemset(sc.ysh, 0, static_cast<size_t>(M) * HID * 2));
     // the shared expert as bindp::make_layer binds it: Ls.exs = the trellis pass, Lf = the FP8 copy on the GEMMs

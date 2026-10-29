@@ -153,7 +153,7 @@ pub struct Pool {
     // built); above 0 it takes its own pages in two classes: the prefix (R/64 pages) and its shard (ceil of the tail
     // pages / nr) from [0, place), the rest (the drafter's copy of the tail) from [place, pages)
     nr: u32,
-    // remote rows release (the engine's G6_RT_LOCAL, with nr > 0): a split run's main class is its prefix and `window`
+    // remote rows release (the engine's GR8_RT_LOCAL, with nr > 0): a split run's main class is its prefix and `window`
     // pages (the rows tier cycles its tail through them), and its drafter class the whole tail, so the drafter never
     // holds a page the main model releases. Retained, such a run keeps its list, and the engine keeps its rows store
     // records with it: a hit adopts its prefix, window and drafter pages below the hit (window_adopt), an eviction lets
@@ -1318,7 +1318,7 @@ impl Pool {
         }
     }
 
-    /// One stderr line per claim (g6m4: G6_POOL_LOG=1).
+    /// One stderr line per claim (g6m4: GR8_POOL_LOG=1).
     pub fn log(&mut self, on: bool) {
         self.log = on;
     }

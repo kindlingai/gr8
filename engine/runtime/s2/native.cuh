@@ -4,6 +4,7 @@
 #pragma once
 #ifdef DEC_S2
 #include "service.h"
+#include "../../knobs-rs/gr8_knobs.h"
 #include "../prefill.cuh"
 #include "../../comms/fabric.h"
 #include <chrono>
@@ -16,17 +17,17 @@ namespace g6s2 {
 inline long long s2_wall_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
-// G6_S2_TIMELINE=N (every rank, N > 0): where the time between decode steps goes. Each step launch (main, first-form
+// GR8_S2_TIMELINE=N (every rank, N > 0): where the time between decode steps goes. Each step launch (main, first-form
 // draft, chain here; the DFlash2 drafter steps in g6m4) stamps the host clock on entry, before and after its graph launch
 // and after its fence, and records a CUDA event before and after its graph(s). After the fence it adds the step to its
 // kind's totals (GPU span = event to event; host input prep, launch call, fence wait) and the transition from the step
 // before to that pair's totals (the main-stream gap = the previous step's end event to this step's start event, both on
 // the main stream; host = the previous
 // fence to this launch's entry: accept, emit, drafter choice, step planning). Prints them every N main steps. The gap is
-// bounded by the main stream's events: with G6_DRAFT_PAR the drafter's side stream can run inside it, so it is an upper
+// bounded by the main stream's events: with GR8_DRAFT_PAR the drafter's side stream can run inside it, so it is an upper
 // bound on what launching the next step from the GPU could remove; the spans stay. Also the mean span per kind and row
 // count (tools/s2_dsel_table.py turns them into the drafter choice's cost table). Unset: no events, no stamps.
-// G6_DRAFT_PAR: a solo DFlash2 round's drafter step (launched before the first form on its own stream, waited for after
+// GR8_DRAFT_PAR: a solo DFlash2 round's drafter step (launched before the first form on its own stream, waited for after
 // the first form and the chain) counts as dfl_ctx_par / dfl_query_par through par_*, with its own event pair: span = its
 // GPU start to end on its stream (under the first form and chain, so it overlaps their spans), prep and launch as above,
 // wait = the phase 2 wait alone (the drafter's tail the first form and chain did not hide). It is not in the
@@ -40,7 +41,7 @@ struct S2Timeline {
     int cur = 0, prev_kind = 0;
     bool have_prev = false;
     clk::time_point t_enter, t_pre, t_post, t_prev;
-    cudaEvent_t evp[2] = {};            // G6_DRAFT_PAR: the drafter step on its own stream [start, end]
+    cudaEvent_t evp[2] = {};            // GR8_DRAFT_PAR: the drafter step on its own stream [start, end]
     clk::time_point p_enter, p_pre, p_post, p_wait;
     long n[NK] = {}, rows[NK] = {}, tn[NK][NK] = {}, mains = 0, breaks = 0;
     double span[NK] = {}, prep[NK] = {}, call[NK] = {}, wait[NK] = {}, idle[NK][NK] = {}, host[NK][NK] = {};
@@ -50,8 +51,7 @@ struct S2Timeline {
     static const char* name(int k) { static const char* s[NK] = {"main", "draft", "chain", "dfl_ctx", "dfl_query", "dfl_ctx_par", "dfl_query_par"}; return s[k]; }
     static double ms(clk::time_point a, clk::time_point b) { return std::chrono::duration<double,std::milli>(b - a).count(); }
     S2Timeline() {
-        const char* e = getenv("G6_S2_TIMELINE");
-        every = e ? atoi(e) : 0;
+        every = (int)knob::s2_timeline();
         if (every > 0) for (auto& p : ev) for (auto& x : p) G6RT_CK(cudaEventCreate(&x));
         if (every > 0) for (auto& x : evp) G6RT_CK(cudaEventCreate(&x));
     }
@@ -59,7 +59,7 @@ struct S2Timeline {
     void enter() { if (on()) t_enter = clk::now(); }
     void pre(cudaStream_t st) { if (!on()) return; t_pre = clk::now(); G6RT_CK(cudaEventRecord(ev[cur][0], st)); }
     void post(cudaStream_t st) { if (!on()) return; G6RT_CK(cudaEventRecord(ev[cur][1], st)); t_post = clk::now(); }
-    // G6_DRAFT_PAR's drafter step: entry, around its launch on its stream (phase 1), phase 2's entry, after its wait
+    // GR8_DRAFT_PAR's drafter step: entry, around its launch on its stream (phase 1), phase 2's entry, after its wait
     void par_enter() { if (on()) p_enter = clk::now(); }
     void par_pre(cudaStream_t st) { if (!on()) return; p_pre = clk::now(); G6RT_CK(cudaEventRecord(evp[0], st)); }
     void par_post(cudaStream_t st) { if (!on()) return; G6RT_CK(cudaEventRecord(evp[1], st)); p_post = clk::now(); }
@@ -81,7 +81,7 @@ struct S2Timeline {
         ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(t_enter, t_pre); call[kind] += ms(t_pre, t_post); wait[kind] += ms(t_post, t);
         if (M >= 1 && M <= MR) { ++nm[kind][M]; sm[kind][M] += s; }
         if (have_prev) {
-            // the between-steps gap is bounded by events on the MAIN stream only: with G6_DRAFT_PAR the drafter's
+            // the between-steps gap is bounded by events on the MAIN stream only: with GR8_DRAFT_PAR the drafter's
             // side stream can run inside it, so idle[] is a main-stream gap, not necessarily GPU idle time
             float g = 0; G6RT_CK(cudaEventElapsedTime(&g, ev[cur ^ 1][1], ev[cur][0]));
             if (g > 20.f) ++breaks;      // an event fence or an idle engine in between, not a round's transition
@@ -95,7 +95,7 @@ struct S2Timeline {
         for (int a = 0; a < NK; ++a) for (int b = 0; b < NK; ++b) { ti += idle[a][b]; th += host[a][b]; }
         for (int k = 1; k < NK; ++k) ds += span[k];
         const double m = double(mains);
-        fprintf(stderr, "# s2_tl rank %d mains %ld: per main step: main-stream gap %.3f ms (host between steps %.3f; with G6_DRAFT_PAR the drafter's side stream may run inside the gap), drafting GPU span %.3f ms, breaks %ld\n",
+        fprintf(stderr, "# s2_tl rank %d mains %ld: per main step: main-stream gap %.3f ms (host between steps %.3f; with GR8_DRAFT_PAR the drafter's side stream may run inside the gap), drafting GPU span %.3f ms, breaks %ld\n",
                 rank, mains, ti / m, th / m, ds / m, breaks);
         for (int k = 0; k < NK; ++k)
             if (n[k])
@@ -137,13 +137,13 @@ struct NativeContext {
     // including QO offsets. begin/end cannot reset KV or other sessions.
     std::function<void(const Slot&)> begin_prefill;
     std::function<void()> end_prefill;
-    // optional: around the main prefill step only, as legacy g6m4 (G6_CP staged view, cp_pf_enter / cp_pf_exit)
+    // optional: around the main prefill step only, as legacy g6m4 (GR8_CP staged view, cp_pf_enter / cp_pf_exit)
     std::function<void()> pf_enter, pf_exit;
     // optional: runtime error words the adapter does not own (CP fabric / CP staging proxy); nonzero fails the epoch
     std::function<unsigned()> extra_error;
-    // optional: a draft step's extra fabric work after its draft fabric enqueue (G6_MTP_SPLIT: the draft gathers)
+    // optional: a draft step's extra fabric work after its draft fabric enqueue (GR8_MTP_SPLIT: the draft gathers)
     std::function<void(unsigned long long step, int rows)> enqueue_draft_extra;
-    // optional (G6_RT_STORE): before a main step's launch, with its inputs (spills its sessions' committed pages), and
+    // optional (GR8_RT_STORE): before a main step's launch, with its inputs (spills its sessions' committed pages), and
     // before a prefill quantum of a slot, rows first .. first + rows - 1 (M1: drops its remote pages; release: spills
     // the pages before first and maps the quantum's)
     std::function<void(const g6rt::StepIn&, const g6rt::S2In&)> before_main;
@@ -151,10 +151,10 @@ struct NativeContext {
 };
 class NativeDispatch {
     NativeContext c_;
-    // first-step timer: off-by-default per-step timer (design r3/r4); set from G6_STEP_TMR=1 at construction
-    const bool tmr_ = ::getenv("G6_STEP_TMR") && *::getenv("G6_STEP_TMR") == '1';
-    // G6_S2_ROUNDLOG=1 (rank 0; g6m4 allocates the main model's route copies): one "# s2_round" line per decode step
-    const bool rlog_ = c_.main.rank == 0 && c_.main.rlog && ::getenv("G6_S2_ROUNDLOG") && *::getenv("G6_S2_ROUNDLOG") == '1';
+    // first-step timer: off-by-default per-step timer (design r3/r4); set from GR8_STEP_TMR=1 at construction
+    const bool tmr_ = knob::step_tmr();
+    // GR8_S2_ROUNDLOG=1 (rank 0; g6m4 allocates the main model's route copies): one "# s2_round" line per decode step
+    const bool rlog_ = c_.main.rank == 0 && c_.main.rlog && knob::s2_roundlog();
     static const char* step_kind(const Launch& l) {
         return l.step.kind == s2::Step::MAIN ? "main" : (l.step.kind == s2::Step::CHAIN ? "chain" : "draft");
     }
@@ -236,9 +236,9 @@ class NativeDispatch {
         fprintf(stderr,"# s2 mode rank %d solo %d -> %d: %.3f ms (tables + hprev; no KV relocation)\n",c_.main.rank,old,next,
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count());
     }
-    // G6_S2_ROUNDLOG: kind, round id and active sessions of the whole round (-1 / 0 outside a round), sessions in this step
-    // (a round is one main step, one draft step and the chain steps, each over all its sessions), rows, launch+fence ms (as G6_STEP_TMR), path, and for main steps the
-    // distinct routed experts per MoE layer (mean, sum, list; the G6_ROUTE_LOG data)
+    // GR8_S2_ROUNDLOG: kind, round id and active sessions of the whole round (-1 / 0 outside a round), sessions in this step
+    // (a round is one main step, one draft step and the chain steps, each over all its sessions), rows, launch+fence ms (as GR8_STEP_TMR), path, and for main steps the
+    // distinct routed experts per MoE layer (mean, sum, list; the GR8_ROUTE_LOG data)
     void round_line(const Launch& l, int rows, std::chrono::steady_clock::time_point t0) {
         const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
         std::string ex;
@@ -391,15 +391,15 @@ public:
     // graphs are keyed by (kind, M, bucket), not by session: a retired session leaves them valid
     void retire(const Slot&) {}
     // Boot capture of every graph key a decode step can reach, before serving (a launch of any other key fails):
-    //   main : M in 1..chunk (prompt tails, class row_class(M)) U S*(k+1), S = 1..sessions, k = 1..K with G6_S2_ADAPT
+    //   main : M in 1..chunk (prompt tails, class row_class(M)) U S*(k+1), S = 1..sessions, k = 1..K with GR8_S2_ADAPT
     //          (else k = K), class row_class(K+1)                          -> two graphs (split A / B)
-    //          U with G6_MTP_KSTOPB (kb) the shared rounds' widths s2::kstopb_widths, class row_class(K+1)
-    //          U with solo_kmax (KStop::solo, an MTP-only engine's G6_MTP_KSTOP=1) k+1, k = 1..solo_kmax, class row_class(k+1)
+    //          U with GR8_MTP_KSTOPB (kb) the shared rounds' widths s2::kstopb_widths, class row_class(K+1)
+    //          U with solo_kmax (KStop::solo, an MTP-only engine's GR8_MTP_KSTOP=1) k+1, k = 1..solo_kmax, class row_class(k+1)
     //   draft: M in 1..max(sessions*(K+1), chunk)                          -> first form
     //   chain: M in 1..sessions (one row per session; only if K >= 2)
     // each at every context bucket. The synthetic layout is irrelevant to the graph (S2_ATTN_LAYOUT_FREE): the sessions' rows,
     // contexts and source rows are read from S2In at launch. Call before the first launch / before connecting.
-    // cp_rows (G6_CP_STEP_ROWS, cp_rows.h; 0 = off): at a bucket whose steps run the CP block (s2_cp_bucket) no main step
+    // cp_rows (GR8_CP_STEP_ROWS, cp_rows.h; 0 = off): at a bucket whose steps run the CP block (s2_cp_bucket) no main step
     // is wider than cp_rows (Driver::step caps those rounds), so those widths are not captured; a launch of one would
     // fail as any uncaptured key does.
     void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}, int cp_rows = 0, int solo_kmax = 0) {
@@ -411,7 +411,7 @@ public:
         std::set<int> drafts, chains;
         for (int M = 1; M <= chunk; ++M) { mains.insert({M, s2::row_class(M)}); drafts.insert(M); }
         for (int S = 1; S <= N; ++S)
-            for (int k = s2::adapt_env() ? 1 : K; k <= K; ++k) mains.insert({S * (k + 1), s2::row_class(K + 1)});
+            for (int k = knob::s2_adapt() ? 1 : K; k <= K; ++k) mains.insert({S * (k + 1), s2::row_class(K + 1)});
         for (int M : s2::kstopb_widths(kb, N, K)) mains.insert({M, s2::row_class(K + 1)});
         for (int k = 1; k <= solo_kmax; ++k) mains.insert({k + 1, s2::row_class(k + 1)});   // s2_batch.h round_all, KStop::solo
         for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
@@ -461,7 +461,7 @@ public:
                 std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(),
                 (double(free0)-double(free1))/(1024.0*1024.0));
         if (c_.main.rank == 0 && cp_rows)
-            fprintf(stderr,"# s2 boot capture: G6_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",
+            fprintf(stderr,"# s2 boot capture: GR8_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",
                 cp_rows,cp_skipped);
     }
     DispatchHooks hooks() {

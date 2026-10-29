@@ -79,7 +79,7 @@ __global__ void __launch_bounds__(32) rt_wait(const G6RtGroup* gp,unsigned* err)
     }
 }
 #if !G6_KV4
-// G6_RT_FMT=int4: the store's records hold rows in the INT4 layout (kvfmt.h int4row), while the pages and the slots stay
+// GR8_RT_FMT=int4: the store's records hold rows in the INT4 layout (kvfmt.h int4row), while the pages and the slots stay
 // FP8, so no attention kernel changes. Warp per row; x[k] is dim lane + 32 k (fwht16's order), so a lane's x[k] has INT4
 // scale k and FP8 scale k / 4. The rope key is copied, 4 B a lane.
 namespace f8=g6kv::fp8row;namespace i4=g6kv::int4row;

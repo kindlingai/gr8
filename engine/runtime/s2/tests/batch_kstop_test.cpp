@@ -1,8 +1,8 @@
-// MTP confidence stop (s2_batch.h Batch::kstop, G6_MTP_KSTOP): a solo DFlash2 session's MTP rounds chain and verify the
+// MTP confidence stop (s2_batch.h Batch::kstop, GR8_MTP_KSTOP): a solo DFlash2 session's MTP rounds chain and verify the
 // drafts the rule allows (mode 1: p_1 * .. * p_j >= tau[j]; mode 2: the drafter choice's MTP estimates), a demoted
 // session's chain is completed to K before its first shared round, every committed token is the target's, and with the
 // stop off the steps are the same with or without the log-probability hook and the log, and a session promoted with
-// more drafts than kmax (G6_DFL_REUSE=2) verifies at most kmax. Host only, a fake engine.
+// more drafts than kmax (GR8_DFL_REUSE=2) verifies at most kmax. Host only, a fake engine.
 // Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_kstop_test.cpp -o /tmp/batch_kstop_test
 #include "s2_batch.h"
 #include <cmath>
@@ -171,8 +171,8 @@ int main()
         else CHECK(by[2] > 40);
         CHECK(exact(f.got));
     }
-    // 5. G6_DFL_REUSE=2 promotes a session that ran shared rounds, so it holds the shared chain's K drafts. With K above
-    //    G6_MTP_KSTOP_KMAX no solo MTP round may verify more than kmax drafts (K 2 / kmax 1, and K 4 / kmax 3, where a
+    // 5. GR8_DFL_REUSE=2 promotes a session that ran shared rounds, so it holds the shared chain's K drafts. With K above
+    //    GR8_MTP_KSTOP_KMAX no solo MTP round may verify more than kmax drafts (K 2 / kmax 1, and K 4 / kmax 3, where a
     //    verify past kmax would also read tau past its end), in either mode
     for (int mode : {1, 2})
         for (const auto& kk : {std::make_pair(2, 1), std::make_pair(4, 3)})

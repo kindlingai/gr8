@@ -4,11 +4,12 @@
 // (dtr::make_fp8: exact, still rotated, every scale 127) under those names. The binders find the matrix's suh / svh
 // themselves and wrap the GEMMs in the rotations.
 // o_proj gets no copy: its prefill GEMM decodes the tiles (bindp::make_gemm_tr, k_gemm_tr), bit-equal and at par, which
-// saves its 25.2 MB per layer at TP4. G6_DTR_PF_COPY=1 makes the o_proj copies too (the A/B).
+// saves its 25.2 MB per layer at TP4. GR8_DTR_PF_COPY=1 makes the o_proj copies too (the A/B).
 #pragma once
 #include <map>
 #include <memory>
 #include "rank.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt
 {
@@ -19,9 +20,9 @@ inline Find dtr_overlay(const Find& base, bool prefill, cudaStream_t st, int ran
 {
     if (!prefill) return base;
 #if G6_MODEL_FLASH
-    if (!(getenv("G6_PF_DTR8") && atoi(getenv("G6_PF_DTR8")) == 1)) return base;
+    if (!knob::pf_dtr8()) return base;
 #endif
-    const bool ocopy = getenv("G6_DTR_PF_COPY") && atoi(getenv("G6_DTR_PF_COPY")) == 1;
+    const bool ocopy = knob::dtr_pf_copy();
     auto over = std::make_shared<std::map<std::string, TensorRef>>();
     size_t bytes = 0;
     int n = 0;
@@ -49,7 +50,7 @@ inline Find dtr_overlay(const Find& base, bool prefill, cudaStream_t st, int ran
         }
 #if G6_MODEL_FLASH
     static const char* const kda_names[3] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"};
-    const bool kcopy = !getenv("G6_DTR_PF_KDA_COPY") || atoi(getenv("G6_DTR_PF_KDA_COPY")) != 0;
+    const bool kcopy = knob::dtr_pf_kda_copy();
     if (kcopy)
         for (int l = 0; l <= geom::MTP_LAYER; ++l)
             for (int i = 0; i < 3; ++i)

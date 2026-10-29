@@ -3,6 +3,7 @@
 // loses the 8192 plusN round's probe and two fillers. Every resubmit / plusN-resubmit request of the 8192 phase must hit.
 // PF_REPLAY_VERBOSE=1 prints one line per request in the g6m4 "# s2 reuse request" format.
 #include "s2/pool.h"
+#include "../../../knobs-rs/gr8_knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -52,7 +53,7 @@ int main(int argc, char** argv) {
         {13,5},{8177,6},{8149,7},{43,8},{35,9},{13,5},{32504,10},{32547,11},{45,12},{36,13},{13,5},{129784,14},{129735,15},{45,12},{36,13}};
     S.log = 0;
     for (auto& e : pre) { S.retire_all(false); S.admit(P(e.n, e.k), "pre"); }
-    S.log = getenv("PF_REPLAY_VERBOSE") != nullptr;
+    S.log = knob::pf_replay_verbose();
     auto seqrun = [&](const std::vector<int>& p, const char* tag) { S.retire_all(false); S.admit(p, tag); };
     // S1
     for (int L : {4096, 8192}) {

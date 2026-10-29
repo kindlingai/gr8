@@ -4,7 +4,7 @@
 #include <string>
 #include "bind.cuh"
 #include "glue.cuh"
-#include "../runtime/envparse.h"
+#include "../knobs-rs/gr8_knobs.h"
 #include "../runtime/flash_mark.h"
 #if G6_MODEL_FLASH
 namespace flash_mlp
@@ -223,13 +223,13 @@ struct Block
     bind::Xfrag xf;
     bind::K1 k1;
     dtr::Gemv glu_t, down_t;
-    int topk = geom::TOPK;            // routed experts kept per token: the G6_MOE_TOPK cut is set by the main-model callers only
+    int topk = geom::TOPK;            // routed experts kept per token: the GR8_MOE_TOPK cut is set by the main-model callers only
 };                                    // (the MTP drafter keeps the model's top-k)
 inline const char* make(const Weights& w, int M, const float* x, uint16_t* out, glue::RoutePlan* plan,
                         const Workspace& ws, const bind::Scratch& sc, Block& b, int fuse = -1,
                         const __half* xh = nullptr)
 {
-    if (fuse < 0) { static const int ef = getenv("G6_FUSE") ? atoi(getenv("G6_FUSE")) : 1; fuse = ef; }
+    if (fuse < 0) fuse = static_cast<int>(knob::fuse());
     b = Block();
     if (M < 1 || M > sc.rows || M > ws.rows || M > G6_MX) return "Flash MLP M exceeds scratch rows";
     if (!x || !out || !ws.act || !ws.dense_out || !ws.logits || !ws.xhalf || !ws.xfrag) return "Flash MLP needs input/output/workspace";
@@ -251,8 +251,8 @@ inline void launch(const Block& b, cudaStream_t st)
 {
     if (b.w.moe)
     {
-        static const int r_nw = getenv("G6_ROUTER_NW") ? atoi(getenv("G6_ROUTER_NW")) : 2;
-        static const int r_mf = getenv("G6_ROUTER_MF") ? atoi(getenv("G6_ROUTER_MF")) : 1;
+        const int64_t r_nw = knob::router_nw();
+        const bool r_mf = knob::router_mf();
         __half* xh_out = b.xh ? nullptr : b.scratch.xhalf;
         auto dispatch_nw = [&](auto nw_tag) {
             constexpr int NW = decltype(nw_tag)::value;

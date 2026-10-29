@@ -31,7 +31,7 @@ public:
     bool load(const Pack& pack, const std::string& path, const LoadOpts& opts, LoadStats& stats, std::string& err);
     void reset();   // frees the device memory
     // Takes ownership of a device image of pack's bytes that another loader filled (the Rust loader, G6_RS_LOADER).
-    // release frees dev in place of cudaFree (memory not from cudaMalloc: G6_IMG_VMM, engine/vmm.h).
+    // release frees dev in place of cudaFree (memory not from cudaMalloc: GR8_IMG_VMM, engine/vmm.h).
     void adopt(const Pack& pack, uint8_t* dev, uint64_t bytes, void (*release)(void*) = nullptr);
 
     const uint8_t* base() const { return base_; }

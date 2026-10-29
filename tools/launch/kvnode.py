@@ -38,22 +38,26 @@ SERVICE = mentat.KV_SERVICE
 
 # key: (default, meaning). The flag is --<key in lower case without KV_, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'KV_GB': (None, 'GiB of this box\'s memory to lock and serve'),
-    'KV_PORT': ('7350', 'the node\'s TCP port (RDMA connections are set up through it too)'),
-    'KV_BIND': ('0.0.0.0', 'the address the node listens on'),
+    'KV_GB': (None, "GiB of this box's memory to lock and serve. RLIMIT_MEMLOCK must allow it (ulimit -l; root, or "
+                    'systemd-run -p LimitMEMLOCK=infinity)'),
+    'KV_PORT': ('7350', "the node's TCP port; RDMA connections are set up through it"),
+    'KV_BIND': ('0.0.0.0', 'the address it listens on'),
     'KV_MIN_FREE_GB': ('10', 'refuse to start when locking KV_GB would leave less MemAvailable than this; with '
                              'KV_LAZY_LOCK=1, refuse each lease that would'),
-    'KV_RDMA': ('1', '0 = serve over TCP only'),
-    'KV_LAZY_LOCK': ('0', '1 = lock each lease\'s memory when it is granted and give it back when the lease ends, and '
-                          'refuse leases while the box is under KV_MIN_FREE_GB (a node on a box that also serves)'),
-    'KV_LEDGER': (None, 'with KV_LAZY_LOCK=1: the host ledger file of a box shared with a Flash rank (kvman-ledger): '
-                        'the node never holds more than it credits to the node'),
-    'KV_GUARD_EVERY_S': ('1', 'with KV_LAZY_LOCK=1: how often the node reads MemAvailable (0 = at each lease only)'),
-    'KV_BIN': (None, 'the kvman-remote binary (default bin/kvman-remote, else the crate\'s target/release)'),
-    'MENTAT': ('localhost', 'the local mentat daemon to announce through; none = do not announce'),
-    'GROUP': ('gr8-glm53', 'mentat group the node joins'),
-    'NODE_IP': (None, "this box's LAN address, when mentat cannot say"),
-    'G6_HOME': (REPO, 'working directory: the node writes out/kv/'),
+    'KV_RDMA': ('1', '0 = TCP only'),
+    'KV_LAZY_LOCK': ('0', "1 = lock a lease's memory only while the lease lives (given back to the box when it ends), "
+                          'and refuse leases while MemAvailable is under KV_MIN_FREE_GB: a node on a box that also '
+                          'serves. 0 = the whole KV_GB is locked at start. Measured effect: not measured'),
+    'KV_LEDGER': (None, 'with KV_LAZY_LOCK=1: the host ledger of a box shared with a Flash rank (kvman-ledger, '
+                        'engine/kvman-rs/src/ledger.rs). A lease is refused when the node would hold more than the '
+                        'ledger credits it. FLASH_KV_DONATE_GIB sets it'),
+    'KV_GUARD_EVERY_S': ('1', 'with KV_LAZY_LOCK=1: how often the node reads MemAvailable (0 = at each lease only). '
+                              'Measured effect: not measured'),
+    'KV_BIN': (None, 'the node binary (./gr8 glm53 build puts it in bin/). Default: bin/kvman-remote.'),
+    'MENTAT': ('localhost', 'the daemon to announce through; none = do not announce'),
+    'GROUP': ('gr8-glm53', 'the mentat group it joins'),
+    'NODE_IP': (None, "the LAN address to announce. Default: mentat's."),
+    'G6_HOME': (REPO, 'the node keeps out/kv/ here: kv.log, state.json, ready.json'),
 }
 FLAGS = {'G6_HOME': '--g6-home', 'MENTAT': '--mentat', 'GROUP': '--group', 'NODE_IP': '--node-ip'}
 SWITCHES = {'--no-config', '--foreground', '--no-rdma', '--lazy-lock'}

@@ -1,9 +1,9 @@
-// G6_DRAFT_HEAD2 (two-stage draft head): a 2-bit screen over the rank's vocab slice, then the exact MXFP8
+// GR8_DRAFT_HEAD2 (two-stage draft head): a 2-bit screen over the rank's vocab slice, then the exact MXFP8
 // logits of the screen's best SL rows. Drafts only: the target's head is not touched.
 //
 //   1. k_screen     y[m][v] ~ x[m] . w[v] from 2-bit g32 records of the slice (made at boot from the MXFP8 head records,
 //                   k_mx_to_i2): 1536 code bytes + 384 scale bytes per vocab row (6144 inputs), 74.5 MB per TP4 slice
-//                   instead of 134 MB (INT4 g32, G6_DRAFT_HEAD_I4) or 246 MB (MXFP8)
+//                   instead of 134 MB (INT4 g32, GR8_DRAFT_HEAD_I4) or 246 MB (MXFP8)
 //   2. k_screen_top per row, the SL best screen logits (ties and the last histogram bin in index order: deterministic)
 //   3. k_rescore    per row and candidate, the MXFP8 logit of that vocab row (its E4M3 codes and E8M0 scales read out of
 //                   the 16-row tile records the target's head reads), written over the screen logit in y and into the
@@ -394,7 +394,7 @@ __global__ void __launch_bounds__(1024) k_head_local_sl(glue::HeadArgs a, const 
     publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
 }
 
-// G6_DRAFT_HEAD2=2 (measurement): per row, whether the MXFP8 head's argmax of the slice (ref, the target's GEMV on the
+// GR8_DRAFT_HEAD2=2 (measurement): per row, whether the MXFP8 head's argmax of the slice (ref, the target's GEMV on the
 // same rows) is among the row's candidates. cnt[0] rows, cnt[1] misses; every 4096 rows rank prints a line (device
 // printf, flushed at the host's next synchronization). grid M, block 256
 __global__ void __launch_bounds__(256) k_check(const float* __restrict__ ref, int ldr, int vn, const int* __restrict__ cand, unsigned* cnt, int rank)

@@ -1,9 +1,9 @@
 // Prefix-reuse diagnostics (test only, default off; no new kernel, the default path is unchanged):
-// G6_REUSE_HDUMP=<dir> + G6_REUSE_HDUMP_SEQ=<q[,q..]>: after the prefill loop of a listed seq (before any decode step),
+// GR8_REUSE_HDUMP=<dir> + GR8_REUSE_HDUMP_SEQ=<q[,q..]>: after the prefill loop of a listed seq (before any decode step),
 //   every layer's cache bytes for rows [0, n) (n = the prefill end, p.first) -> <dir>/hd.<q>.r<rank>.bin, raw, page by
 //   page: the target model (tag 'm') then the MTP draft model (tag 'd'). tools/reuse/hdump.py hashes the rows and
 //   merges the ranks by GLOBAL row (latent and index rows live on their owner rank only).
-// G6_REUSE_ZSCRATCH=1 (with --reuse-prefix): on a hit, every layer's per-seq attention scratch is cleared before the
+// GR8_REUSE_ZSCRATCH=1 (with --reuse-prefix): on a hit, every layer's per-seq attention scratch is cleared before the
 //   suffix prefill: indices := -1 (0xff bytes), output := 0 (max_rows rows of each binding).
 // File format (little endian): per layer a header of 12 int32
 //   {0x31444448 'HDD1', tag, layer index, n, page_size, np = ceil(n / page_size), table_size, page_count, cp_nr,
@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 #include "rank.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt {
 struct HDump
@@ -32,29 +33,22 @@ struct HDump
     }
 };
 
-// strict: G6_REUSE_HDUMP unset = off; set -> non-empty dir and a non-empty list of seq numbers >= 0, else exit
+// GR8_REUSE_HDUMP unset = off; set -> GR8_REUSE_HDUMP_SEQ must list the seq numbers too, else exit
 inline HDump hdump_env()
 {
     HDump h;
-    const char* d = getenv("G6_REUSE_HDUMP");
-    const char* s = getenv("G6_REUSE_HDUMP_SEQ");
-    if (!d) { if (s) die("G6_REUSE_HDUMP_SEQ without G6_REUSE_HDUMP"); return h; }
-    if (!*d || !s || !*s) die("G6_REUSE_HDUMP needs a dir and G6_REUSE_HDUMP_SEQ=<q[,q..]>");
-    h.dir = d;
-    for (const char* p = s; *p;)
-    {
-        char* e = nullptr;
-        const long v = strtol(p, &e, 10);
-        if (e == p || v < 0 || (*e && *e != ',')) die(std::string("G6_REUSE_HDUMP_SEQ: bad list '") + s + "'");
-        h.seqs.push_back(v);
-        p = *e ? e + 1 : e;
-    }
+    const auto& d = knob::reuse_hdump();
+    const auto& s = knob::reuse_hdump_seq();
+    if (!d) { if (s) die("GR8_REUSE_HDUMP_SEQ without GR8_REUSE_HDUMP"); return h; }
+    if (!s) die("GR8_REUSE_HDUMP needs GR8_REUSE_HDUMP_SEQ=<q[,q..]>");
+    h.dir = *d;
+    h.seqs.assign(s->begin(), s->end());
     return h;
 }
 
 inline void hdump_put(FILE* f, const void* p, size_t n)
 {
-    if (fwrite(p, 1, n, f) != n) die("G6_REUSE_HDUMP: write failed");
+    if (fwrite(p, 1, n, f) != n) die("GR8_REUSE_HDUMP: write failed");
 }
 
 // one model's layers, rows [0, n); returns bytes written
@@ -71,7 +65,7 @@ inline size_t hdump_model(FILE* f, Model& m, int tag, int n)
 #else
         const int cp = 0;
 #endif
-        if (np > a.table_size) die("G6_REUSE_HDUMP: rows past the block table");
+        if (np > a.table_size) die("GR8_REUSE_HDUMP: rows past the block table");
         std::vector<int> bt(a.table_size);
         G6RT_CK(cudaMemcpy(bt.data(), a.block_table, (size_t)a.table_size * sizeof(int), cudaMemcpyDeviceToHost));
         const int hdr[12] = {0x31444448, tag, (int)i, n, ps, np, a.table_size, a.page_count, cp, a.index_cache ? 1 : 0, g6kv::ROW, g6kv::IDX_ROW};
@@ -104,14 +98,14 @@ inline void hdump_seq(const HDump& h, Model& m, Model* d, size_t q, int rank, in
     G6RT_CK(cudaStreamSynchronize(st));
     const std::string path = h.dir + "/hd." + std::to_string(q) + ".r" + std::to_string(rank) + ".bin";
     FILE* f = fopen(path.c_str(), "wb");
-    if (!f) die("G6_REUSE_HDUMP: cannot open " + path);
+    if (!f) die("GR8_REUSE_HDUMP: cannot open " + path);
     size_t b = hdump_model(f, m, 'm', n);
     if (d) b += hdump_model(f, *d, 'd', n);
-    if (fclose(f) != 0) die("G6_REUSE_HDUMP: close failed " + path);
+    if (fclose(f) != 0) die("GR8_REUSE_HDUMP: close failed " + path);
     fprintf(stderr, "# hdump seq %zu rank %d rows %d file %s bytes %zu\n", q, rank, n, path.c_str(), b);
 }
 
-// G6_REUSE_ZSCRATCH: on a hit, before the suffix prefill
+// GR8_REUSE_ZSCRATCH: on a hit, before the suffix prefill
 inline void zscratch(Model& m, cudaStream_t st)
 {
     for (Layer& y : m.layers)

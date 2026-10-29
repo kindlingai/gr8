@@ -1,4 +1,4 @@
-// G6_PF_KDA_GZF gate: the G9 ON path with gz16 + the G16 / Z16 planes (gzf 0) and with the tiles built in K1 / k_out16z
+// GR8_PF_KDA_GZF gate: the G9 ON path with gz16 + the G16 / Z16 planes (gzf 0) and with the tiles built in K1 / k_out16z
 // (gzf 1), same inputs (kda_g9_det's e2e setup) and same poison, compared byte for byte: OH, OF (pad slots masked), S,
 // the conv history, the planes QN / KN / V / O16 (rows < M) and the whole K1 -> K2 tape (QE, KD, W, U). G16 / Z16 are
 // not compared (gzf 1 does not write them). Then both arms timed at M 4096 / nh 21 (the TP3 Flash lane).

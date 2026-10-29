@@ -1,4 +1,4 @@
-"""G6_FLASH_CACHE=terminal, a cancel at the boundary the prefill checkpoint waits for: compile
+"""GR8_FLASH_CACHE=terminal, a cancel at the boundary the prefill checkpoint waits for: compile
 runtime/s2/tests/flash_terminal_cancel_test.cpp with flash_native.cuh's own checkpoint hooks pasted in (take_capture,
 h.pool.retain, the prefill's capture block, h.retire, h.before_work) and run it on two ranks through the real Service.
   usage: test_flash_terminal_cancel.py [flash_native.cuh]   (default: this tree's)"""
@@ -30,11 +30,12 @@ def main():
     for k, v in parts.items():
         program = program.replace(k, v)
     kv = root / 'kvman-rs/target/release/libg6kvman.a'
+    knobs = root / 'knobs-rs/target/release/libgr8knobs.a'
     with tempfile.TemporaryDirectory() as d:
         src, exe = Path(d) / 't.cpp', Path(d) / 't'
         src.write_text(program)
         subprocess.run(['g++', '-std=c++17', '-O2', '-Wall', '-pthread', '-I', str(root / 'runtime'), str(src), str(kv),
-                        '-lpthread', '-ldl', '-lm', '-o', str(exe)], check=True)
+                        str(knobs), '-lpthread', '-ldl', '-lm', '-o', str(exe)], check=True)
         out = subprocess.run([str(exe)], cwd=d, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         sys.stdout.write(out.stdout)
         if out.returncode:

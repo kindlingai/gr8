@@ -17,6 +17,7 @@
 #include "math.h"
 #include "../kernels/densev.cuh"
 #include "../kernels/dtr.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #include "../runtime/flash_mark.h"
 
 namespace kda
@@ -43,7 +44,7 @@ struct KdaLayer
     dtr::Mat qt, kt, vt, ot;                                  // W8 trellis q, k, v (SIDE_OUT) and o_proj (SIDE_IN)
     const uint8_t *mxc[3] = {}, *mxs[3] = {};                 // q, k, v own rows as MXFP8 (prefill GEMM): [nh*128][HID], [..][HID/32]
     uint8_t *mxgv[3] = {};                                    // q, k, v own rows as MXFP8 decode records [nh*8][HID/32][528],
-                                                              // built from mxc / mxs at bind (G6_KDA_MX=0: decode reads q / k / v)
+                                                              // built from mxc / mxs at bind (GR8_KDA_MX=0: decode reads q / k / v)
     const uint16_t *conv[3] = {};                             // [own ch][4]
     const uint16_t *fb = nullptr, *gb = nullptr;              // [own ch][128]
     const float *A_log = nullptr, *dt_bias = nullptr;         // [own heads], [own ch]
@@ -143,11 +144,10 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
             w.mxc[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.codes", {dl, HID}));
             w.mxs[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.scales", {dl, HID / 32}));
         }
-    // G6_KDA_MX (default on, =0 off): decode q / k / v read MXFP8 records with FP16 activations instead of the BF16
+    // GR8_KDA_MX (default on, =0 off): decode q / k / v read MXFP8 records with FP16 activations instead of the BF16
     // weights. Not byte-exact, and a third copy of q / k / v per rank (dl / 16 x HID / 32 x 528 B per matrix) outside the
     // loader's accounting.
-    static const bool kda_mx = !getenv("G6_KDA_MX") || atoi(getenv("G6_KDA_MX")) != 0;
-    if (kda_mx && !w.qt.w && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
+    if (knob::kda_mx() && !w.qt.w && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
         for (int i = 0; i < 3; ++i)
         {
             const size_t recs = static_cast<size_t>(dl / 16) * (HID / 32);
@@ -859,9 +859,8 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
     pa.add(w.b, P + pl.b(), HID, HEADS, 1, 32);
     if (w.qt.w)
     {
-        static const int ks_env = getenv("G6_KDA_PROJ_KS") ? atoi(getenv("G6_KDA_PROJ_KS")) : 16;
-        static const int mode_env = !getenv("G6_KDA_PROJ_MODE") ? 0 : atoi(getenv("G6_KDA_PROJ_MODE"));
-        const int KS = (ks_env == 8 || ks_env == 16 || ks_env == 32) ? ks_env : 16;
+        const int KS = static_cast<int>(knob::kda_proj_ks());
+        const int64_t mode = knob::kda_proj_mode();
         const int nblk = dl / 128;
         if (dt && dtr::part_floats(dl, 3, KS, M) <= dt->part_n && 3 * nblk <= dt->cnt_n)
         {
@@ -882,12 +881,12 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
             ta.pa = pa;
             g6mx::nt_dispatch(g6mx::tiles(M), [&](auto N) {
                 constexpr int NTv = decltype(N)::value;
-                if (xa && mode_env == 1)
+                if (xa && mode == 1)
                 {
                     k_kda_rot_pa<NTv><<<12 + ta.pa.ctas, 256, 0, st>>>(ta);
                     k_kda_proj_trellis_norot<NTv><<<ta.dtr_ctas, 256, 0, st>>>(ta);
                 }
-                else if (xa && mode_env == 2)
+                else if (xa && mode == 2)
                 {
                     k_kda_rot_pa<NTv><<<12, 256, 0, st>>>(ta);
                     k_kda_proj_trellis_norot<NTv><<<ta.dtr_ctas + ta.pa.ctas, 256, 0, st>>>(ta);

@@ -1,6 +1,6 @@
 // Weight self-check: is each device image still the bytes the loader read?
 //
-// The Rust loader fills an image in fixed chunks (G6_LOAD_CHUNK_MB, 32 MB), each through a pinned staging buffer. While a
+// The Rust loader fills an image in fixed chunks (GR8_LOAD_CHUNK_MB, 32 MB), each through a pinned staging buffer. While a
 // chunk is in staging, the copy callback (packfind.h RsSink) sums it on the CPU. After the load the GPU sums the same
 // chunks from device memory, and a chunk that differs ends the boot (exit 3, "g6: weight check ..."): the copy to the
 // GPU went wrong. Binding then rewrites some tensors in place (bind::widen_fc1, the i4pair repack), so once the engine
@@ -11,7 +11,7 @@
 // The sum of a chunk is sum over its 64-bit words w_i, i counted from the start of the image, of mix(w_i ^ i * phi):
 // order-free, so the GPU adds it up in parallel and gets the CPU's value. A trailing partial word is zero-padded.
 //
-// G6_WEIGHT_CHECK=0 turns all of it off.
+// GR8_WEIGHT_CHECK=0 turns all of it off.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -26,6 +26,7 @@
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../knobs-rs/gr8_knobs.h"
 #include "../loader/g6pack.h"
 
 namespace wcheck {
@@ -99,19 +100,10 @@ __global__ void k_sums(const uint8_t* __restrict__ base, uint64_t bytes, uint64_
     }
 }
 
-// The chunk size the Rust loader uses (lib.rs env_u64: a positive integer, else the default).
-inline uint64_t loader_chunk()
-{
-    const char* e = getenv("G6_LOAD_CHUNK_MB");
-    const long long v = e ? atoll(e) : 0;
-    return uint64_t(v > 0 ? v : 32) << 20;
-}
+// The chunk size the Rust loader uses (GR8_LOAD_CHUNK_MB).
+inline uint64_t loader_chunk() { return uint64_t(knob::load_chunk_mb()) << 20; }
 
-inline bool enabled()
-{
-    const char* e = getenv("G6_WEIGHT_CHECK");
-    return !(e && std::string(e) == "0");
-}
+inline bool enabled() { return knob::weight_check(); }
 
 // The GPU sums of every chunk of an image, on stream st.
 inline std::vector<uint64_t> device_sums(const uint8_t* base, uint64_t bytes, uint64_t chunk, cudaStream_t st)
@@ -183,7 +175,7 @@ inline void record(const char* what, const g6::Pack& pack, const uint8_t* base, 
     if (!enabled()) return;
     if (l.sums.size() > 65535)     // gridDim.y of k_sums
     {
-        fprintf(stderr, "g6: weight check: %zu chunks of %llu bytes: raise G6_LOAD_CHUNK_MB or set G6_WEIGHT_CHECK=0\n",
+        fprintf(stderr, "g6: weight check: %zu chunks of %llu bytes: raise GR8_LOAD_CHUNK_MB or set GR8_WEIGHT_CHECK=0\n",
                 l.sums.size(), (unsigned long long)l.chunk);
         exit(3);
     }
@@ -196,18 +188,18 @@ inline void record(const char* what, const g6::Pack& pack, const uint8_t* base, 
     const auto t0 = std::chrono::steady_clock::now();
     cudaStream_t st;
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
-    // G6_WEIGHT_CHECK_FLIP=RANK:OFFSET (a test of this check): flip one byte of rank RANK's first image before it runs
-    if (const char* f = getenv("G6_WEIGHT_CHECK_FLIP"))
+    // GR8_WEIGHT_CHECK_FLIP=RANK:OFFSET (a test of this check): flip one byte of rank RANK's first image before it runs
+    if (const auto& f = knob::weight_check_flip())
     {
         int r = -1;
         unsigned long long off = 0;
-        if (sscanf(f, "%d:%llu", &r, &off) == 2 && r == rank && off < l.bytes && images().empty())
+        if (sscanf(f->c_str(), "%d:%llu", &r, &off) == 2 && r == rank && off < l.bytes && images().empty())
         {
             uint8_t b = 0;
             cudaMemcpy(&b, base + off, 1, cudaMemcpyDeviceToHost);
             b ^= 0x40;
             cudaMemcpy(const_cast<uint8_t*>(base) + off, &b, 1, cudaMemcpyHostToDevice);
-            fprintf(stderr, "# rank %d: G6_WEIGHT_CHECK_FLIP: flipped the byte at offset %llu of the %s image\n", rank, off, what);
+            fprintf(stderr, "# rank %d: GR8_WEIGHT_CHECK_FLIP: flipped the byte at offset %llu of the %s image\n", rank, off, what);
         }
     }
     const std::vector<uint64_t> dev = device_sums(base, l.bytes, l.chunk, st);
@@ -262,7 +254,7 @@ inline std::string check_json(int rank, cudaStream_t st)
     std::lock_guard<std::mutex> lk(mu());
     if (images().empty())
         return "{\"rank\":" + std::to_string(rank) + ",\"ok\":false,\"error\":\"no weight images recorded "
-               "(the C++ loader, or G6_WEIGHT_CHECK=0)\"}\n";
+               "(the C++ loader, or GR8_WEIGHT_CHECK=0)\"}\n";
     std::string imgs;
     bool ok = true;
     for (const Image& im : images())
