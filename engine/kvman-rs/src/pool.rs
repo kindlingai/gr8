@@ -492,6 +492,12 @@ impl Pool {
         self.held.values().filter(|h| h.exclusive).count() as u32
     }
 
+    /// With window: the window runs live now at R = r rows (0 = the pool's R); 0 for an R the pool refuses.
+    pub fn window_runs_r(&self, r: u32) -> u32 {
+        let Some(rp) = self.rp_of(r).filter(|_| self.window > 0) else { return 0 };
+        self.held.values().filter(|h| h.exclusive && h.rp as u64 == rp).count() as u32
+    }
+
     // a live window run's records on the rank that holds the most of its tail
     fn ids_of(&self, h: &Held) -> u64 {
         if !h.exclusive || self.window == 0 {

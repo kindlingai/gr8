@@ -224,6 +224,18 @@ options:
       runs alone. Every rank holds the first SHARE_LIMIT tokens of a session and a share of the rest, so a higher limit
       leaves a shorter longest context: at TP=4, 65536 gives CAP 387072, 98304 gives 288768. A multiple of 64 from 4096;
       a limit off the 2048 doubling is a decode bucket boundary of its own
+  SHARE_LIMIT_BUSY:
+    scope: cluster
+    doc: >-
+      experimental. A smaller SHARE_LIMIT for sessions past it while SHARE_BIG sessions already run at SHARE_LIMIT: such
+      a session holds fewer pages a rank, so more of them decode at once. Its rows past SHARE_LIMIT_BUSY come from the
+      rows store, so it needs KV_ROWS with local=. A multiple of 64 below SHARE_LIMIT; every step past it is
+      context-parallel
+  SHARE_BIG:
+    scope: cluster
+    doc: >-
+      experimental, with SHARE_LIMIT_BUSY: how many sessions past SHARE_LIMIT_BUSY may run at SHARE_LIMIT at once
+      (default 1). A turn that continues a retained run keeps that run's limit
   SESS:
     scope: cluster
     doc: >-

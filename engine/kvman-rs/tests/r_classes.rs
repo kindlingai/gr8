@@ -67,6 +67,7 @@ fn seats_follow_the_r_of_each_grant() {
     p.reserve_r(WORST, WORST, 0).unwrap();
     assert_eq!(seats(&mut p, SMALL), 2);
     assert_eq!(p.window_runs(), 3);
+    assert_eq!((p.window_runs_r(0), p.window_runs_r(SMALL), p.window_runs_r(SMALL + 1)), (1, 2, 0));
 }
 
 #[test]

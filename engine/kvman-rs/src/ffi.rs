@@ -690,6 +690,13 @@ pub unsafe extern "C" fn g6kv_window_runs(p: *const Pool) -> u32 {
     (*p).window_runs()
 }
 
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_window_runs_r(p: *const Pool, r: u32) -> u32 {
+    (*p).window_runs_r(r)
+}
+
 /// For a window request of `worst` rows past R with a lease limit: 1 and {records its tail needs per rank, records
 /// free, records in all} in out[0..3]; 0 otherwise.
 ///
