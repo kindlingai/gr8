@@ -31,7 +31,7 @@ A values file for your cluster ([values.yaml](values.yaml) has every value and i
 ```yaml
 image:
   tag: sha-<commit>                 # the same build on every box: they refuse a mix
-size: 4                             # TP: 3, 4 or 6
+size: 4                             # TP: 3, 4, 5 or 6
 options:                            # the launcher's options (KNOBS.md)
   GR8_MODEL: glm53                  # required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)
   MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4    # required: a release of that model
@@ -95,6 +95,24 @@ extraVolumeMounts:
     mountPath: /models/release
     readOnly: true
 ```
+
+### model-loader
+
+With `modelLoader.enabled: true`, the box's [model-loader](https://github.com/kindlingai/model-loader) fetches the
+weights, and the pods share its pieces over the LAN rather than each fetching from Hugging Face:
+
+```yaml
+modelLoader:
+  enabled: true
+  store: /var/lib/model-loader      # model-loader's store on every box
+```
+
+The chart mounts the store read-only from the box (`hostPath`), sets `FETCH=model-loader`, `MODEL_CACHE` to the store
+and `MODEL_LOADER` to its socket, and makes no `cache` claim. An init container waits until `model-loader -check`
+answers. model-loader runs on each box from its own deploy tree: its `deploy/k8s` peer DaemonSet with the settings of
+its `examples/gr8` (group 1000, gr8's, so gr8 can open its socket, and a readiness probe on the socket; leave out that
+example's gr8 Deployment, which this chart replaces), or `deploy/spark-os`. gr8 finds the release (and `DRAFTER`) in model-loader's catalog by the
+repo, so nothing in `options` repeats a catalog name.
 
 ### Placement
 

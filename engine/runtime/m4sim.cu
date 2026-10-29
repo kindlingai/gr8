@@ -384,7 +384,7 @@ int main(int argc, char** argv)
         spec.draft_round = 2.5;
         spec.draft_each = 2.1;
 #if G6_MODEL_FLASH
-        spec.flash_tp2();
+        spec.flash_cost(NR);
 #endif
     }
     if (nc < 0 || nc * NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / NR));

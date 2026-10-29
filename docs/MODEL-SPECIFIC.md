@@ -24,7 +24,7 @@ the full-index layers; vocab 154,880.
 | attention | `engine/attn/` | MLA latent attention (kv_a 576 = 512 + 64 rope, UK/UV absorb), the DSA-style sparse indexer and its exact top-2048 selector (`select.cuh`), value head dim 256 in decode (`decode-small.cuh`) |
 | | `engine/runtime/rank.cuh` | `QA = 2048`, `KVA = 576`, `IDXQ = 4096`, `IDXK = 128`, `IDXW = 32`; the layer sequence (dense / MoE / MTP) |
 | | `engine/runtime/qo_weights.cuh`, `attn/prefill-qo-*` | full-head QO attention shapes |
-| drafter | `engine/runtime/dflash.cuh`, `engine/loader-rs/src/dflash2.rs` | the GLM 5.3 DFlash2 drafter: 6 layers, 64 q / 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), target layers 5..75 (from the pack), selector rank 256 / top 16; TP must divide the 8 KV heads |
+| drafter | `engine/runtime/dflash.cuh`, `engine/loader-rs/src/dflash2.rs`, `engine/model_geom.h` | the DFlash2 drafter: layers, tapped target layers and q heads per model (`DFL_L`, `DFL_NT`, `DFL_NH`: GLM 5.3 6, 6, 64; Flash 5, 5, 32; the converter's `Dims`); both have 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), selector rank 256 / top 16; target layers and rope theta from the pack; TP must divide the 8 KV heads |
 | front end | `frontend/g6s2shim.py` | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
 | | `frontend/g6front-rs/src/{parser,template,tok}.rs` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format, and it reads `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so those follow the model directory |
 

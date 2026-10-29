@@ -1,24 +1,18 @@
 # CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# Every job runs on GitHub's hosted runners, for every pull request, forks included, except a push that changes only
-# Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
+# Every job runs on GitHub's hosted runners, on every push to a pull request, forks included (with a read-only token),
+# and on main and tags, except a push that changes only Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
 # GPU needed to compile. The image job assembles the runtime image from both of their artifacts, and only it can write
 # packages: it pushes from main and from tags, never from a pull request.
 #
-# On a pull request every job waits for a maintainer: the `ready` job reads the PR's labels and the others run only if
-# it carries queue:ready (/ready, which also queues the PR) or ci:requested (/ci, CI only; pr-ready.yml). Until then the
-# gate fails, so the PR shows red. A push to the PR clears both labels, so a run started by a push skips. Either command
-# re-runs the PR's latest run, which then goes through. Pushes to main, tags and manual runs always build. The gate is a
-# cost control, not a security boundary: a fork PR runs its own copy of this file, with a read-only token.
+# On a pull request the changes job picks the jobs from the files it changes (dorny/paths-filter, below): the
+# front-end and engine halves of the CPU tests, the Rust binaries, and the engine builds with the image around them.
+# Markdown files start nothing, so a PR that changes only them runs just changes, zip-check and Finalize. Pushes to main,
+# tags and manual runs always build everything: the image pushed from main is built from all of the tree.
 #
-# A PR that changes only front-end files (.github/ci/scope.js) runs the front-end CPU tests and the Rust binaries: the
-# engine CPU tests, the engine builds, the tester zip and the image skip. A PR that changes only Markdown files runs
-# just the gate and Finalize. A run dispatched on a PR's branch (pr-ready.yml) takes the PR's scope. Every other run
-# builds everything.
-#
-# Finalize is the one check a PR needs to land: green when every job passed or skipped by design and the PR carries
-# queue:ready. A /ci run that passes stays red there until /ready.
+# Finalize is the one check a PR needs to land: green when every job passed or skipped and the PR carries queue:ready
+# (a maintainer's /ready, pr-ready.yml). A PR whose CI passes stays red there until /ready.
 name: ci
 
 on:
@@ -39,71 +33,99 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  ready:
-    name: Ready gate
+  changes:
+    name: Detect changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
     outputs:
-      go: ${{ steps.check.outputs.go }}
-      scope: ${{ steps.check.outputs.scope }}
+      cpu: ${{ github.event_name != 'pull_request' && '["frontend","engine"]' || steps.cpu.outputs.changes }}
+      rust: ${{ github.event_name != 'pull_request' || steps.build.outputs.rust == 'true' }}
+      engine: ${{ github.event_name != 'pull_request' || steps.build.outputs.engine == 'true' }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # A pull request's files come from the API, so nothing is checked out. A filter matches a file that matches one
+      # of its paths and is not Markdown. Every filter lists ci.yml, so a change to this file runs everything.
+      - name: The CPU tests' halves (cpu-tests.sh)
+        id: cpu
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         with:
-          sparse-checkout: .github/ci
-          persist-credentials: false
-      - id: check
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+          predicate-quantifier: some-with-excludes
+          filters: |
+            # the front end, the shim, the launcher and the pseudo engine. Their tests compile the engine's S2 and
+            # steering headers and build g6load, and the launcher imports tools/steering.
+            frontend:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - '.github/ci/**'
+              - 'frontend/**'
+              - 'tools/launch/**'
+              - 'tools/steering/**'
+              - 'smoketest/**'
+              - 'gr8'
+              - 'engine/**'
+              - 'scripts/engine_args.sh'
+            # the host tests, the tools' and the bench gate's tests, the compose file, the Helm chart and the engine's
+            # Rust crates; bash -n of the recipes' scripts
+            engine:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - '.github/ci/**'
+              - 'engine/**'
+              - 'scripts/**'
+              - 'tools/steering/**'
+              - 'tools/convert/**'
+              - 'tools/health/**'
+              - 'tools/ngram/**'
+              - 'tools/query/**'
+              - 'tools/*.py'
+              - 'bench/**'
+              - 'docker/**'
+              - 'deploy/**'
+              - 'recipes/**/*.sh'
+      - name: The builds
+        id: build
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         with:
-          script: |
-            // Labels are read live, not from the event: a re-run carries the original event's labels and action. A
-            // run started by a push skips (the push cleared the labels), unless it is a re-run, which the bot starts
-            // after a maintainer's /ci or /ready.
-            let go = true;
-            if (context.eventName === "pull_request") {
-              const pr = context.payload.pull_request;
-              const labels = (await github.rest.issues.listLabelsOnIssue(
-                { ...context.repo, issue_number: pr.number, per_page: 100 })).data.map(l => l.name);
-              const rerun = Number(process.env.GITHUB_RUN_ATTEMPT) > 1;
-              go = (context.payload.action !== "synchronize" || rerun) &&
-                (labels.includes("queue:ready") || labels.includes("ci:requested"));
-            }
-            core.setOutput("go", go ? "true" : "false");
-            // The PR: this run's, or for a dispatched run the open PR whose head is this commit
-            let pr = context.eventName === "pull_request" ? context.payload.pull_request : null;
-            if (go && context.eventName === "workflow_dispatch") {
-              const prs = (await github.rest.repos.listPullRequestsAssociatedWithCommit(
-                { ...context.repo, commit_sha: context.sha })).data;
-              const open = prs.find(p => p.state === "open" && p.head.sha === context.sha);
-              if (open) pr = (await github.rest.pulls.get({ ...context.repo, pull_number: open.number })).data;
-            }
-            let scope = "full";
-            if (go && pr) {
-              const { outsideFrontend, markdownOnly, prFiles } =
-                require(`${process.env.GITHUB_WORKSPACE}/.github/ci/scope.js`);
-              const files = await prFiles(github, context, pr);
-              if (files && files.length && markdownOnly(files)) scope = "docs";
-              else if (files && !outsideFrontend(files).length) scope = "frontend";
-            }
-            core.setOutput("scope", scope);
-            const what = { frontend: " (no engine tests or builds)", docs: " (Markdown only: no tests or builds)" };
-            core.summary.addRaw(`Scope: ${scope}${what[scope] || ""}`).write();
-            // Red, not green: jobs skipped by a condition count as passed.
-            if (!go) core.setFailed("CI has not run: it waits for a maintainer's /ci or /ready on this PR.");
+          predicate-quantifier: some-with-excludes
+          filters: |
+            # the Dockerfile's rust-dist: the loader, the page allocator and the front end
+            rust:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'engine/loader-rs/**'
+              - 'engine/kvman-rs/**'
+              - 'frontend/g6front-rs/**'
+            # the engine builds and the image: what the Dockerfile's engine stages copy (the front end's Cargo files
+            # pin the XGrammar sources the engine compiles), and the entrypoint the image's smoke test runs
+            engine:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'engine/**'
+              - 'scripts/build.sh'
+              - 'tools/health/gpuprobe.cu'
+              - 'frontend/g6front-rs/Cargo.toml'
+              - 'frontend/g6front-rs/Cargo.lock'
+              - 'frontend/g6front-rs/rust-toolchain.toml'
+              - 'docker/entrypoint.sh'
 
   cpu:
     name: CPU tests (${{ matrix.part }})
-    needs: ready
-    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'docs'
+    needs: changes
+    if: needs.changes.outputs.cpu != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        # a front-end scope drops the engine half
-        part: ${{ fromJSON(needs.ready.outputs.scope == 'frontend' && '["frontend"]' || '["frontend", "engine"]') }}
+        part: ${{ fromJSON(needs.changes.outputs.cpu) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
@@ -133,8 +155,8 @@ jobs:
 
   cpu-macos:
     name: CPU tests (frontend, macOS)
-    needs: ready
-    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'docs'
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.cpu), 'frontend')
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -166,8 +188,8 @@ jobs:
 
   rust:
     name: Rust binaries (arm64)
-    needs: ready
-    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope != 'docs'
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -198,8 +220,8 @@ jobs:
     # competing for its four cores: the fp8 leg, with Flash and the tests, took
     # 27-42 min while int4 alone took 6-11.
     name: Engine build (${{ matrix.label }}, arm64, CUDA 13, sm_121a)
-    needs: ready
-    if: needs.ready.outputs.go == 'true' && needs.ready.outputs.scope == 'full'
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     strategy:
@@ -278,6 +300,17 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  # make_zip.py's tree checks (every top-level entry shipped or skipped, no symlinks), which the zip job runs only on
+  # main and tags, so a PR that adds a top-level entry fails here instead of after it lands. A few seconds.
+  zip-check:
+    name: Tester zip (tree check)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - run: python3 scripts/make_zip.py --check
+
   zip:
     name: Tester zip
     if: github.event_name != 'pull_request'
@@ -311,7 +344,9 @@ jobs:
     name: Container image (linux/arm64)
     # The runtime image around the engine job's binaries: the Dockerfile's dist stage is replaced by them (a named build
     # context), so nothing is compiled here. Pushed to ghcr.io from main and from tags, never from a pull request.
+    # A PR that changes only the Dockerfile runs no CPU tests, so a skipped cpu does not stop it.
     needs: [cpu, engine]
+    if: ${{ !cancelled() && needs.engine.result == 'success' && needs.cpu.result != 'failure' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     # main's runs overlap, so their pushes take turns, and latest and main move only to main's head (below)
@@ -427,16 +462,19 @@ jobs:
     name: Finalize
     # The check a PR needs to land. It runs after a failure or a cancellation too, so it always reports. It passes when
     # every job above succeeded or skipped, and a PR's run carries queue:ready (/ready), read live. A job skips by design
-    # (the tester zip on a PR, the engine builds on a front-end PR, everything on a Markdown-only PR) or because a job
-    # it needs failed, which fails here too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished
-    # run.
+    # (the tester zip on a PR, whatever the changes job left out) or because a job it needs failed, which fails here
+    # too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished run.
+    # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
+    # but a run with only changes and zip-check can reach this step before that removal.
     if: always()
-    needs: [ready, cpu, cpu-macos, rust, engine, zip, image]
+    needs: [changes, cpu, cpu-macos, rust, engine, zip-check, zip, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
+      issues: read
+      checks: read
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
         env:
@@ -444,13 +482,15 @@ jobs:
         with:
           script: |
             const needs = JSON.parse(process.env.NEEDS);
-            const bad = needs.ready.outputs.go === "true" ? [] : ["CI has not run: it waits for /ci or /ready"];
+            const bad = [];
             for (const [name, j] of Object.entries(needs)) {
-              if (name !== "ready" && !["success", "skipped"].includes(j.result)) bad.push(`${name}: ${j.result}`);
+              if (!["success", "skipped"].includes(j.result)) bad.push(`${name}: ${j.result}`);
             }
-            // The PR: this run's, or for a dispatched run (pr-ready.yml starts one without its token) the open PR
-            // whose head is this commit. A push to main or a tag has none.
+            // The PR: this run's, or for a run dispatched on a PR's branch the open PR whose head is this commit, whose
+            // checks this run's count for. A push to main or a tag has none.
             let pr = context.eventName === "pull_request" ? context.payload.pull_request.number : null;
+            // a pull_request run's context.sha is the merge commit
+            const head = context.eventName === "pull_request" ? context.payload.pull_request.head.sha : context.sha;
             if (context.eventName === "workflow_dispatch") {
               const prs = (await github.rest.repos.listPullRequestsAssociatedWithCommit(
                 { ...context.repo, commit_sha: context.sha })).data;
@@ -461,6 +501,17 @@ jobs:
               const labels = (await github.rest.issues.listLabelsOnIssue(
                 { ...context.repo, issue_number: pr, per_page: 100 })).data.map(l => l.name);
               if (!labels.includes("queue:ready")) bad.push(`#${pr} is not marked ready (/ready)`);
+              else {
+                // when the label was last added, and when GitHub first saw the head (its earliest check suite)
+                const events = await github.paginate(github.rest.issues.listEvents,
+                  { ...context.repo, issue_number: pr, per_page: 100 });
+                const added = events.filter(e => e.event === "labeled" && e.label && e.label.name === "queue:ready")
+                  .map(e => Date.parse(e.created_at));
+                const suites = (await github.rest.checks.listSuitesForRef(
+                  { ...context.repo, ref: head, per_page: 100 })).data.check_suites.map(s => Date.parse(s.created_at));
+                if (!added.length || !suites.length || Math.max(...added) <= Math.min(...suites))
+                  bad.push(`#${pr} was marked ready before ${head.slice(0, 7)} was pushed (/ready again)`);
+              }
             }
             const rows = Object.entries(needs).map(([name, j]) => [name, j.result]);
             await core.summary.addTable([[{ data: "job", header: true }, { data: "result", header: true }], ...rows])

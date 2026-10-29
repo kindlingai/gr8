@@ -7,8 +7,9 @@
 # puts LWS_GROUP_SIZE and LWS_LEADER_ADDRESS (the leader pod's DNS name) first in every container's env, so the env
 # below can use them. The leader's name resolves to its box's address: the pod is on the host network.
 {{- $claims := dict }}
+{{- $ml := .Values.modelLoader.enabled }}
 {{- range $name, $v := .Values.storage }}
-{{- if not $v.hostPath }}{{ $_ := set $claims $name $v }}{{ end }}
+{{- if and (not $v.hostPath) (not (and $ml (eq $name "cache"))) }}{{ $_ := set $claims $name $v }}{{ end }}
 {{- end }}
 apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
@@ -97,6 +98,24 @@ spec:
         tolerations:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+        {{- if $ml }}
+        # gr8 starts once the box's model-loader answers on its socket.
+        initContainers:
+          - name: model-loader-ready
+            image: {{ .Values.modelLoader.image }}
+            command: [/bin/sh, -c, 'until model-loader -check unix:/var/lib/model-loader/model-loader.sock; do sleep 2; done']
+            securityContext:
+              runAsUser: 1000
+              runAsGroup: 1000
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: [ALL]
+            volumeMounts:
+              - name: model-loader-store
+                mountPath: /var/lib/model-loader
+                readOnly: true
+        {{- end }}
         containers:
           - name: gr8
             image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
@@ -118,8 +137,18 @@ spec:
               # The container's own paths, so an option meant for a bare-metal box cannot point the launcher elsewhere.
               - name: G6_HOME
                 value: /var/lib/gr8/home
+              {{- if .Values.modelLoader.enabled }}
+              # The model-loader store (KNOBS.md, FETCH), and model-loader's local API in it.
+              - name: FETCH
+                value: model-loader
+              - name: MODEL_CACHE
+                value: /var/lib/model-loader
+              - name: MODEL_LOADER
+                value: unix:/var/lib/model-loader/model-loader.sock
+              {{- else }}
               - name: MODEL_CACHE
                 value: /var/lib/gr8/cache
+              {{- end }}
               - name: PY
                 value: /usr/bin/python3
               - name: FRONT_BIN
@@ -151,8 +180,15 @@ spec:
             resources:
               {{- toYaml .Values.resources | nindent 14 }}
             volumeMounts:
+              {{- if .Values.modelLoader.enabled }}
+              # Read-only: model-loader alone writes the store. gr8 still opens the socket in it.
+              - name: model-loader-store
+                mountPath: /var/lib/model-loader
+                readOnly: true
+              {{- else }}
               - name: cache
                 mountPath: /var/lib/gr8/cache
+              {{- end }}
               - name: home
                 mountPath: /var/lib/gr8/home
               - name: shm
@@ -164,12 +200,20 @@ spec:
               {{- end }}
         volumes:
           {{- range $name, $v := .Values.storage }}
+          {{- if not (and $ml (eq $name "cache")) }}
           {{- with $v.hostPath }}
           - name: {{ $name }}
             hostPath:
               path: {{ . }}
               type: Directory
           {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- if $ml }}
+          - name: model-loader-store
+            hostPath:
+              path: {{ .Values.modelLoader.store }}
+              type: Directory
           {{- end }}
           - name: shm
             emptyDir:

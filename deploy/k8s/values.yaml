@@ -6,7 +6,7 @@ image:
   pullPolicy: ""
 imagePullSecrets: []
 
-# The boxes in the group: TP, 3, 4 or 6.
+# The boxes in the group: TP, 3, 4, 5 or 6.
 size: 4
 # 0 stops every box, 1 boots them. One group per release: a second group is a second release, with its own GROUP.
 replicas: 1
@@ -47,6 +47,15 @@ storage:
 # [{name: release, mountPath: /models/release, readOnly: true}].
 extraVolumes: []
 extraVolumeMounts: []
+# The box's model-loader (github.com/kindlingai/model-loader) fetches the weights instead of gr8: its store, a directory
+# on every box, mounted read-only (gr8 reads the release in place), with model-loader's local API as the socket
+# model-loader.sock in it. model-loader runs on each box from its own deploy tree (deploy/k8s or deploy/spark-os), in
+# group 1000. The cache claim is not made then.
+modelLoader:
+  enabled: false
+  store: /var/lib/model-loader
+  # The image whose `model-loader -check` an init container waits on: gr8 starts once model-loader answers.
+  image: ghcr.io/kindlingai/model-loader:latest
 # The claims are kept when the LeaderWorkerSet is deleted: delete them by hand to free the disk.
 persistentVolumeClaimRetentionPolicy:
   whenDeleted: Retain

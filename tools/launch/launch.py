@@ -363,9 +363,9 @@ def cmd_show_config(argv):
     else:
         print(f'model set {ms.id} ({ms.source})')
         if ms.release:
-            print(f'release   {ms.release.repo.repo} at commit {ms.release.commit}, in {ms.release.dir}')
+            print(f'release   {ms.release.label} at commit {ms.release.commit}, in {ms.release.dir}')
         if ms.drafter:
-            print(f'drafter   {ms.drafter.repo.repo} at commit {ms.drafter.commit}, converted in {ms.drafter.out}')
+            print(f'drafter   {ms.drafter.label} at commit {ms.drafter.commit}, converted in {ms.drafter.out}')
         print(f'variant   {variant}')
         if variant.path:
             print(f'          about {modelset.expert_gb(variant.path, int(o.get("TP"))):.1f} GB of experts on the busiest '
@@ -428,11 +428,11 @@ def cmd_prepare(argv):
     tp, bad = int(o.get('TP')), []
     try:
         if ms.release:
-            if ms.release.check(tp, rank, variant):
+            if getattr(ms.release, 'pins', False) or ms.release.check(tp, rank, variant):
                 ms.release.fetch_rank(tp, rank, variant)
             bad += ms.release.check(tp, rank, variant)
         if ms.drafter:
-            if ms.drafter.check(rank):
+            if getattr(ms.drafter, 'pins', False) or ms.drafter.check(rank):
                 ms.drafter.fetch_rank(rank)
             bad += ms.drafter.check(rank)
     except (modelset.ModelError, OSError, RuntimeError) as e:

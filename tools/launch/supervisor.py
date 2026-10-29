@@ -24,6 +24,7 @@ import fabric
 import handshake
 import hfsource
 import kvnode
+import mlsource
 import mentat
 import models
 import modelset
@@ -156,8 +157,11 @@ def resolve_model(o, refresh=False, log=log):
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
-            release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
-                                       layout=o.get('LAYOUT'))
+            if o.get('FETCH') == 'model-loader':
+                release = mlsource.of(o, *hf, log=log)
+            else:
+                release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
+                                           layout=o.get('LAYOUT'))
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir
@@ -207,8 +211,11 @@ def drafter_of(o, ms, refresh, log):
             raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
         if o.get('DFLASH') == '0':
             return None
-        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log,
-                             tp=int(o.get('TP')))
+        if o.get('FETCH') == 'model-loader':
+            d = mlsource.drafter_of(o, *hfsource.parse_url(o.get('DRAFTER')), log=log)
+        else:
+            d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh,
+                                 log=log, tp=int(o.get('TP')))
         o.values['DFLASH_DIR'] = d.out
         return d
     if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
@@ -637,9 +644,9 @@ class Supervisor:
                 pass
             elif copy:
                 rel = self.ms.release
-                if rel and rel.check(int(o.get('TP')), self.rank, self.variant):
+                if rel and (getattr(rel, 'pins', False) or rel.check(int(o.get('TP')), self.rank, self.variant)):
                     rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
-                if self.ms.drafter and self.ms.drafter.check(self.rank):
+                if self.ms.drafter and (getattr(self.ms.drafter, 'pins', False) or self.ms.drafter.check(self.rank)):
                     self.ms.drafter.fetch_rank(self.rank)
             if self.ms and self.rank is not None:
                 if self.ms.release:
