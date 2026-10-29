@@ -1829,6 +1829,31 @@ inline void reset(Model& m, cudaStream_t st)
 #endif
     for (Layer& y : m.layers) G6RT_CK(g6_attn_bind_reset(&y.ab, st));
 }
+#if G6_MODEL_FLASH
+// Flash serve: reset() with the attention caches cleared on pages [0, pages) only. Every later page must already be
+// zero (no step wrote it since a full reset); reset_dirty_layer checks that (G6_FLASH_RESET_CHECK)
+inline void reset_pages(Model& m, int pages, cudaStream_t st)
+{
+    if (!(m.resid4 || m.flash_draft)) { reset(m, st); return; }
+    if (m.kda_st.S) kda::reset(m.kda_st, 0, st);
+    for (Layer& y : m.layers) if (!y.kda) G6RT_CK(g6_attn_bind_reset_pages(&y.ab, pages, st));
+}
+// -1 if every attention cache byte on pages [from, ...) is zero, else the first layer that has a nonzero byte (synchronizes)
+inline int reset_dirty_layer(Model& m, int from, unsigned* flag, cudaStream_t st)
+{
+    for (size_t i = 0; i < m.layers.size(); ++i)
+    {
+        if (m.layers[i].kda) continue;
+        unsigned h = 0;
+        G6RT_CK(cudaMemsetAsync(flag, 0, 4, st));
+        G6RT_CK(g6_attn_bind_check_clear(&m.layers[i].ab, from, flag, st));
+        G6RT_CK(cudaMemcpyAsync(&h, flag, 4, cudaMemcpyDeviceToHost, st));
+        G6RT_CK(cudaStreamSynchronize(st));
+        if (h) return (int)i;
+    }
+    return -1;
+}
+#endif
 inline void launch_step_in(Model& m, cudaStream_t st)
 {
 #if G6_MODEL_FLASH

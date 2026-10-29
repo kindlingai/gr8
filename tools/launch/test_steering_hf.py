@@ -22,6 +22,7 @@ import supervisor
 from test_hf import FakeHub, RELEASE, C1, C2
 
 PEERS = '192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 WEIGHTS = '5e' * 32
 
 
@@ -90,7 +91,7 @@ class SteeringHFTests(unittest.TestCase):
                 '--model-cache', str(self.cache), '--variant', 'home', '--dflash', '0']
         if selector:
             argv += ['--steering-profile', selector]
-        o = options.parse([*argv, *extra], {})
+        o = options.parse([*argv, *extra], GLM)
         options.validate(o)
         return o
 

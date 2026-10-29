@@ -18,6 +18,7 @@ import supervisor
 from test_modelset import make_release
 
 PEERS = '192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 class FixtureTestCase(unittest.TestCase):
@@ -52,7 +53,7 @@ class FixtureTestCase(unittest.TestCase):
         o = options.parse(['--no-config', '--peers', PEERS, '--model', str(self.root / 'rel'),
                            '--steering-profile', str(self.profile), '--steering-model-revision', 'rev-1',
                            '--steering-tokenizer-revision', 'tok-1', '--steering-chat-template-sha256', self.digest,
-                           *extra], {})
+                           *extra], GLM)
         options.validate(o)
         return o
 
@@ -93,7 +94,7 @@ class LocalTests(FixtureTestCase):
             steering_local.prepare(self.opts('--steering-profile', both), self.ms)
 
     def test_no_profile_does_no_profile_io(self):
-        o = options.parse(['--no-config', '--peers', PEERS], {})
+        o = options.parse(['--no-config', '--peers', PEERS], GLM)
         shutil.rmtree(self.profile)
         options.validate(o)
         self.assertIsNone(steering_local.prepare(o, self.ms))
@@ -163,7 +164,7 @@ class LocalTests(FixtureTestCase):
             with self.assertRaises(options.OptionError):
                 self.opts('--steering-profile', selector)
         with self.assertRaisesRegex(options.OptionError, 'needs --steering-profile'):
-            o = options.parse(['--no-config', '--peers', PEERS, '--steering-force', '1'], {})
+            o = options.parse(['--no-config', '--peers', PEERS, '--steering-force', '1'], GLM)
             options.validate(o)
 
     def test_profile_paths_differ_but_identity_and_force_agree(self):

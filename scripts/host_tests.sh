@@ -170,6 +170,8 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtim
 (cd "$T" && "$T/flash_capture_order_test" 2>/dev/null)
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost"
 "$T/test_flash_s2_cost"
+g++ -std=c++17 -O2 -Wall -DG6_NR=3 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost_tp3"
+"$T/test_flash_s2_cost_tp3"
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost"
 "$T/test_full_s2_cost"
 python3 "$REPO/engine/tests/test_flash_serve_check.py"

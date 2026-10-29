@@ -7,6 +7,8 @@
     down                          stop this box's KV node
     status [all]                  this box's node: its memory, leases and what is free; `all`: every KV node the
                                   mentat group announces
+    health                        this box's node, in one line: exit 0 when it serves, else 1. A readiness check for
+                                  a compose healthcheck or a Kubernetes exec probe, as ./gr8 <model> health
     logs [-f]                     the node's log
 
 OPTIONS are --key value (or KEY=value lines in a config file, or KEY in the environment), as for ./gr8 glm53: KEYS
@@ -451,6 +453,34 @@ def cmd_status(argv):
     return 0
 
 
+def health(out, proc='/proc'):
+    """(ok, line): whether this box's KV node serves, with ./gr8 <model> health's rules. Serving means out/kv/state.json
+    says `serving`, the KV supervisor that wrote it still runs, and so does its kvman-remote. It takes no lock (not
+    running()): a node that starts beside the probe must not think another one runs."""
+    import launch    # here, not at the top: launch imports supervisor, which imports this module
+    st = read_json(os.path.join(out, 'state.json'))
+    state, pid, node = st.get('state') or 'none', st.get('pid'), st.get('node_pid')
+    if not launch.is_supervisor(pid, proc, script='kvnode.py'):
+        return False, f'KV node: not serving, no supervisor runs (last state {state})'
+    if state != 'serving':
+        return False, f'KV node: {state}, supervisor pid {pid}'
+    if not launch.sv.alive(node):
+        return False, f'KV node: not serving, kvman-remote (pid {node}) is gone, supervisor pid {pid}'
+    return True, f'KV node: serving on port {st.get("port")}, supervisor pid {pid}, kvman-remote pid {node}'
+
+
+def cmd_health(argv):
+    """Exit 0 or 1 only: docker reserves a healthcheck's exit 2, which bad options would otherwise give."""
+    try:
+        o = parse(argv)
+    except opt.OptionError as e:
+        print(f'gr8 kv: {e}')    # stdout, not stderr: docker keeps a healthcheck's stdout in `docker inspect`
+        return 1
+    ok, line = health(out_dir(o))
+    print(line)
+    return 0 if ok else 1
+
+
 def status_all(o):
     if o.get('MENTAT') == 'none':
         print('status all asks mentat; --mentat none', file=sys.stderr)
@@ -503,7 +533,7 @@ def main(argv):
     cmd, rest = argv[0], argv[1:]
     if cmd == 'supervise':
         return supervise(parsed(rest, check=True))
-    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'logs': cmd_logs}.get(cmd)
+    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'health': cmd_health, 'logs': cmd_logs}.get(cmd)
     if not f:
         print(f'gr8 kv: unknown command {cmd}\n{__doc__}', file=sys.stderr)
         return 2

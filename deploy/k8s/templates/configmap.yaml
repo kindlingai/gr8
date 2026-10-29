@@ -1,0 +1,22 @@
+{{- range (list "TP" "HEAD" "PEERS") }}
+{{- if hasKey $.Values.options . }}
+{{- fail (printf "options.%s: the chart sets TP (size) and HEAD (the leader); PEERS would move the head" .) }}
+{{- end }}
+{{- end }}
+{{- range (list "GR8_MODEL" "MODEL") }}
+{{- if not (get $.Values.options .) }}
+{{- fail (printf "options.%s is required: GR8_MODEL is glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash), MODEL a release of it (./gr8 models)" .) }}
+{{- end }}
+{{- end }}
+# The launcher's options, the same on every pod (values.yaml, options).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: gr8
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  {{- range $k, $v := .Values.options }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}

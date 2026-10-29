@@ -30,12 +30,19 @@ if [ "$PART" != frontend ]; then
   python3 -m unittest discover -s tools/health
   python3 -m unittest discover -s bench/gate/tests
   python3 -m unittest discover -s tools/ngram/tests
+  python3 -m unittest discover -s tools/query
   python3 tools/s2_costfit.py --selftest
   (cd engine/tests && python3 -m unittest test_prefix_reuse)
   # the container's compose file and entrypoint
   if docker compose version > /dev/null 2>&1; then docker compose -f docker/compose.yaml config -q
   else echo "(no docker compose here: compose.yaml not checked)"; fi
   bash -n docker/entrypoint.sh
+  # the Helm chart: it renders with the model named, and refuses to without it
+  if command -v helm > /dev/null; then
+    model=(--set options.GR8_MODEL=glm53 --set options.MODEL=https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4)
+    helm lint --quiet deploy/k8s "${model[@]}" && helm template gr8 deploy/k8s "${model[@]}" > /dev/null
+    ! helm template gr8 deploy/k8s > /dev/null 2>&1 || { echo "deploy/k8s rendered without GR8_MODEL"; exit 1; }
+  else echo "(no helm here: deploy/k8s not checked)"; fi
 
   step "Rust: engine/loader-rs"
   cargo test --locked --manifest-path engine/loader-rs/Cargo.toml

@@ -85,7 +85,7 @@ class EndToEnd(unittest.TestCase):
             os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', 'g6m4'))
             self.homes.append(h)
         self.env = {**os.environ, 'PATH': os.path.join(HERE, 'stubs') + os.pathsep + os.environ['PATH'],
-                    'GR8_REFUSAL_LINGER': '3'}   # three polls' worth
+                    'GR8_REFUSAL_LINGER': '3', 'GR8_MODEL': 'glm53'}   # three polls' worth; ./gr8 glm53 sets the model
         for k in ('CAP', 'SESS', 'PEERS', 'G6_CLUSTER'):
             self.env.pop(k, None)
 
@@ -154,6 +154,10 @@ class EndToEnd(unittest.TestCase):
         st = self.gr8(2, 'status')
         self.assertEqual(st.stdout.count(': serving, engine running'), TP, st.stdout)
         self.assertIn('answers (/health 200)', st.stdout)
+        for i in range(TP):     # every rank's readiness probe passes once `up` has returned on it
+            hl = self.gr8(i, 'health', '--port', str(self.api))
+            self.assertEqual(hl.returncode, 0, f'box {i}: {hl.stdout}{hl.stderr}')
+            self.assertTrue(hl.stdout.startswith(f'rank {i}: serving'), hl.stdout)
         lg = self.gr8(1, 'logs', 'supervisor')
         self.assertIn('the head serves', lg.stdout)
         lg = self.gr8(1, 'logs', '0')
@@ -169,15 +173,20 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('this box  rank 1 of 127.0.0.1', sc.stdout)
         dn = self.gr8(3, 'down', timeout=60)
         self.assertIn('rank 0 (127.0.0.1): stopping', dn.stdout)
-        for i in range(TP):
-            pid = int(read(os.path.join(self.homes[i], 'out', 'g6m4.pid')))
-            for _ in range(200):
-                if not running(pid):
-                    break
-                time.sleep(0.1)
-            self.assertFalse(running(pid), f'box {i} engine {pid} runs')
+        for i in range(TP):     # down returns before the supervisors finish stopping, which on macOS takes seconds
+            for name in ('g6m4', 'supervisor'):
+                pid = int(read(os.path.join(self.homes[i], 'out', f'{name}.pid')))
+                for _ in range(200):
+                    if not running(pid):
+                        break
+                    time.sleep(0.1)
+                self.assertFalse(running(pid), f'box {i} {name} {pid} runs')
         st = self.gr8(0, 'status')
         self.assertIn('no supervisor answers', st.stdout)
+        for i in range(TP):     # down: no box is ready, and each says why in its one line
+            hl = self.gr8(i, 'health')
+            self.assertEqual(hl.returncode, 1, f'box {i}: {hl.stdout}{hl.stderr}')
+            self.assertRegex(hl.stdout, r'^rank \d: not serving, no supervisor runs \(last state stopped\)\n$')
 
     def request(self):
         from fake_s2_engine import token_at
@@ -245,6 +254,30 @@ class EndToEnd(unittest.TestCase):
                          (os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'),
                           os.path.join(rel, 'manifests', 'exlr8-manifest-home.json')))
         self.assertEqual(os.listdir(os.path.join(rel, 'index-slices', 'tp4', 'k3')), ['rank2.safetensors'])
+        self.assertEqual(len({self.stub(i)['argv'][self.stub(i)['argv'].index('--set-id') + 1] for i in range(TP)}), 1)
+        self.assertIn(f'{T.RELEASE}@{T.C1[:12]}', res[0][1])
+
+    def test_boot_through_model_loader(self):
+        """--fetch model-loader: each box's (fake) model-loader holds its rank's pieces; no hub at all."""
+        import fake_model_loader
+        _, env, T = self.release()
+        env = {**env, 'GR8_HF_ENDPOINT': 'http://127.0.0.1:9'}       # nothing answers: gr8 must not fetch itself
+        root = os.path.join(self.t, 'release')
+        stores = [os.path.join(self.homes[i], 'store') for i in range(TP)]
+        for s in stores:
+            ml = fake_model_loader.FakeModelLoader(s, {'glm-exlr8': {'main': (root, T.C1)}})
+            self.addCleanup(ml.close)
+        url = f'https://huggingface.co/{T.RELEASE}'
+        res = self.up_all(extra={i: ['--model', url, '--model-cache', stores[i], '--fetch', 'model-loader']
+                                 for i in range(TP)}, env=env)
+        for i, (rc, out) in enumerate(res):
+            self.assertEqual(rc, 0, f'box {i}:\n{out}')
+        rel = os.path.join(stores[2], 'models', 'glm-exlr8', 'main')
+        a = self.stub(2)['argv']
+        val = lambda f: a[a.index(f) + 1]   # noqa: E731
+        self.assertEqual((val('--v2'), val('--v2-slices'), val('--v2-widths')),
+                         (os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'),
+                          os.path.join(rel, 'manifests', 'exlr8-manifest-home.json')))
         self.assertEqual(len({self.stub(i)['argv'][self.stub(i)['argv'].index('--set-id') + 1] for i in range(TP)}), 1)
         self.assertIn(f'{T.RELEASE}@{T.C1[:12]}', res[0][1])
 

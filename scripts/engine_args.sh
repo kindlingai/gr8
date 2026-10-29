@@ -159,7 +159,7 @@ engine_defaults() {
 # GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). G6_PF_RS, G6_PF_OWN and CP stay off.
 flash_env() {
   ENGINE_BIN=g6m4_flash
-  ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_PF_STRIPE=0 G6_FPF_P1=0 G6_FPF_DSA_P1=0 \
+  ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_FPF_P1=0 G6_FPF_DSA_P1=0 \
 G6_FPF_ATTN_P1=0 G6_PF_SPARSE_MLA_P1=0 G6_PF_SPARSE_MLA_HYBRID=0 G6_PF_SPARSE_MLA=1 G6_PF_SPARSE_MLA_512=1 \
 G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_FC2V2=1 G6_PF_KDA_WS=1 \
 G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
@@ -178,6 +178,9 @@ G6_PF_TIMES=1 G6_PF_STAGE_ASYNC=1"
   fi
   # its KV_STORE on a group lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
   ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ G6_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
+  # TP=3 ring: leave G6_PF_STRIPE to the engine default (on for a three-rank ring: large prefill writes also use the
+  # devices on the other PCIe root); other TPs keep it off as before
+  [ "$TP" = 3 ] || ENGINE_ENV="$ENGINE_ENV G6_PF_STRIPE=0"
   ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
 }
 

@@ -63,6 +63,8 @@ struct G6AttnOps {
     int (*qo_run)(G6AttnQo*, G6AttnBinding*, const G6AttnQoStep*, void*);
     int (*qo_warm)(G6AttnQo*, int, void*);
     int (*replay_run)(const G6AttnReplay*, void*);
+    int (*bind_reset_pages)(G6AttnBinding*, int, void*);
+    int (*bind_check_clear)(G6AttnBinding*, int, unsigned*, void*);
 };
 
 // The linked model's table (one per binary). The runtime reaches every op through it.
@@ -121,3 +123,5 @@ inline int g6_attn_qo_release(G6AttnQo* a0) { auto f = g6_attn_ops()->qo_release
 inline int g6_attn_qo_run(G6AttnQo* a0, G6AttnBinding* a1, const G6AttnQoStep* a2, void* a3) { auto f = g6_attn_ops()->qo_run; return f ? f(a0, a1, a2, a3) : G6_ATTN_NOTSUP; }
 inline int g6_attn_qo_warm(G6AttnQo* a0, int a1, void* a2) { auto f = g6_attn_ops()->qo_warm; return f ? f(a0, a1, a2) : G6_ATTN_NOTSUP; }
 inline int g6_attn_replay_run(const G6AttnReplay* a0, void* a1) { auto f = g6_attn_ops()->replay_run; if (!f) g6_attn_missing("replay_run"); return f(a0, a1); }
+inline int g6_attn_bind_reset_pages(G6AttnBinding* a0, int a1, void* a2) { auto f = g6_attn_ops()->bind_reset_pages; if (!f) g6_attn_missing("bind_reset_pages"); return f(a0, a1, a2); }
+inline int g6_attn_bind_check_clear(G6AttnBinding* a0, int a1, unsigned* a2, void* a3) { auto f = g6_attn_ops()->bind_check_clear; if (!f) g6_attn_missing("bind_check_clear"); return f(a0, a1, a2, a3); }

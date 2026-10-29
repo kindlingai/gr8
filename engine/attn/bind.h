@@ -95,5 +95,9 @@ extern "C" int g6a_bind_reset(G6AttnBinding*, void* stream);
 // #50: rows x 512 E4M3 weights with f32 scales [rows][4] (one per row and 128-column block) -> BF16 [rows][512], each
 // BF16(e4m3 x scale): the bytes the BF16 loader stores for the same weights (engine/loader-rs/src/release.rs).
 extern "C" int g6a_kvb_bf16(const void* fp8, const float* scale, void* bf16, int rows, void* stream);
+// Flash: the reset with the caches cleared on the first `pages` pages only (the caller keeps every later page zero), and
+// a check that sets *flag |= 1 if any cache byte on pages [from, page_count) is not zero (flash_bind.cu)
+extern "C" int g6a_bind_reset_pages(G6AttnBinding*, int pages, void* stream);
+extern "C" int g6a_bind_check_clear(G6AttnBinding*, int from, unsigned* flag, void* stream);
 // Complete outstanding uses before release; frees ONLY binder-owned storage.
 extern "C" int g6a_bind_release(G6AttnBinding*);

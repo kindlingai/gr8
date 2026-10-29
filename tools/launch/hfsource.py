@@ -230,6 +230,10 @@ class Release:
     def commit(self):
         return self.repo.commit
 
+    @property
+    def label(self):
+        return self.repo.repo
+
     def __str__(self):
         return f'{self.repo.repo}@{self.commit[:12]}'
 
@@ -409,6 +413,10 @@ class Drafter:
     def id(self):
         return f'{self.repo.repo}@{self.commit}'
 
+    @property
+    def label(self):
+        return self.repo.repo
+
     def __str__(self):
         return f'{self.repo.repo}@{self.commit[:12]}'
 
@@ -432,30 +440,37 @@ class Drafter:
             if n not in t:
                 raise modelset.ModelError(f'the drafter {self} has no {n}')
             self.repo.fetch(n, os.path.join(self.dir, n), meter)
-        tmp = os.path.join(self.dir, f'tmp.rank{rank}.{os.getpid()}')
+        convert_drafter(convert, self.dir, self.out, self.tp, rank, self.id, self.log, str(self), scratch=self.dir)
+
+
+def convert_drafter(convert, src, out, tp, rank, ident, log, label, scratch):
+    """Convert one rank of the drafter in src (config.json, model.safetensors) into out, through a temporary directory
+    in scratch (on out's filesystem), check the pack's size, then write rank<r>.COMPLETE. src is only read (it may be
+    read-only), and out is made only once the conversion succeeded."""
+    tmp = os.path.join(scratch, f'tmp.rank{rank}.{os.getpid()}')
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    log(f'converting the drafter {label} for rank {rank} of TP={tp}')
+    r = subprocess.run(convert + ['--src', src, '--out', tmp, '--nr', str(tp), '--ranks', str(rank)], cwd=REPO,
+                       capture_output=True, text=True)
+    names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
+    if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):
         shutil.rmtree(tmp, ignore_errors=True)
-        os.makedirs(tmp)
-        self.log(f'converting the drafter {self} for rank {rank} of TP={self.tp}')
-        r = subprocess.run(convert + ['--src', self.dir, '--out', tmp, '--nr', str(self.tp), '--ranks', str(rank)], cwd=REPO,
-                           capture_output=True, text=True)
-        names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
-        if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise modelset.ModelError(f'converting the drafter {self} for rank {rank} failed: '
-                                      + (r.stderr or r.stdout).strip()[-500:])
-        with open(os.path.join(tmp, names[0])) as f:
-            want = int(json.load(f)['pack_bytes'])
-        if os.path.getsize(os.path.join(tmp, names[1])) != want:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise modelset.ModelError(f'the converted drafter pack for rank {rank} is not the {want} bytes its manifest says')
-        os.makedirs(self.out, exist_ok=True)
-        files = {}
-        for n in names:
-            files[n] = os.path.getsize(os.path.join(tmp, n))
-            os.replace(os.path.join(tmp, n), os.path.join(self.out, n))
+        raise modelset.ModelError(f'converting the drafter {label} for rank {rank} failed: '
+                                  + (r.stderr or r.stdout).strip()[-500:])
+    with open(os.path.join(tmp, names[0])) as f:
+        want = int(json.load(f)['pack_bytes'])
+    if os.path.getsize(os.path.join(tmp, names[1])) != want:
         shutil.rmtree(tmp, ignore_errors=True)
-        m = os.path.join(self.out, f'rank{rank}.COMPLETE')
-        with open(m + '.tmp', 'w') as f:
-            json.dump({'drafter': self.id, 'rank': rank, 'files': files}, f, indent=1, sort_keys=True)
-        os.replace(m + '.tmp', m)
-        self.log(f'the drafter {self} is converted for rank {rank} in {self.out}')
+        raise modelset.ModelError(f'the converted drafter pack for rank {rank} is not the {want} bytes its manifest says')
+    os.makedirs(out, exist_ok=True)
+    files = {}
+    for n in names:
+        files[n] = os.path.getsize(os.path.join(tmp, n))
+        os.replace(os.path.join(tmp, n), os.path.join(out, n))
+    shutil.rmtree(tmp, ignore_errors=True)
+    m = os.path.join(out, f'rank{rank}.COMPLETE')
+    with open(m + '.tmp', 'w') as f:
+        json.dump({'drafter': ident, 'rank': rank, 'files': files}, f, indent=1, sort_keys=True)
+    os.replace(m + '.tmp', m)
+    log(f'the drafter {label} is converted for rank {rank} in {out}')

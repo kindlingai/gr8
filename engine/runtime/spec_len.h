@@ -98,14 +98,18 @@ struct SpecLen
         return (bk[j][b] + prior * pool) / (bn[j][b] + prior);
     }
 #if G6_MODEL_FLASH
-    // Flash TP2, 45 layers: verify ms by rows 1..8 (median main step at M rows, full clock) and the MTP draft costs
-    // (first-form pass, chain step). Replaces the TP4 table, which is about 1.5x slower at 1-2 rows.
-    void flash_tp2()
+    // Flash, 45 layers: verify ms by rows 1..8 (median main step at M rows) and the MTP draft costs (first-form pass,
+    // chain step) for the build's width (G6_NR). Replaces the TP4 table, which is about 1.5x slower at 1-2 rows.
+    //   TP3: launch-to-sync medians of a three-box ring at 2200 MHz, one boot per MTP=1..7 at contexts < 2.5K (#252)
+    //   TP2, and every width not measured (TP4): a two-box table at full clock
+    void flash_cost(int tp)
     {
-        static const double t[KX + 2] = {0, 28.7, 37.9, 45.7, 52.3, 59.0, 65.6, 71.7, 77.5};
+        static const double t2[KX + 2] = {0, 28.7, 37.9, 45.7, 52.3, 59.0, 65.6, 71.7, 77.5};
+        static const double t3[KX + 2] = {0, 24.8, 30.4, 35.8, 39.6, 46.4, 51.7, 56.2, 60.7};
+        const double* t = tp == 3 ? t3 : t2;
         std::copy(t, t + KX + 2, table);
-        draft_round = 2.8;
-        draft_each = 2.2;
+        draft_round = tp == 3 ? 2.39 : 2.8;
+        draft_each = tp == 3 ? 1.94 : 2.2;
     }
 #endif
     double verify_ms(int rows) const { return table[std::min(std::max(rows, 1), KX + 1)]; }

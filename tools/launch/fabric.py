@@ -88,5 +88,23 @@ def rails(root='/sys/class/infiniband'):
                        + '. An uncabled ConnectX port leaves the PCI bus, so a missing one is often a cable')
 
 
+def pci_domain(root, dev):
+    """The PCI domain of an RDMA device ('0002' for roceP2p1s0f0 on a GB10), from its sysfs device link, or ''."""
+    path = os.path.realpath(os.path.join(root, dev, 'device'))
+    name = os.path.basename(path)
+    return name.split(':', 1)[0] if name.count(':') == 2 else ''
+
+
+def ring_ports(root='/sys/class/infiniband'):
+    """{address: (device, PCIe root)} of this box's ACTIVE RoCE v2 addresses, for --shape ring. The root is the index
+    of the device's PCI domain among this box's (0 for rocep1s0f*, 1 for roceP2p1s0f* on a GB10)."""
+    found = [(a, d) for a, d, _, st in roce_addresses(root) if 'ACTIVE' in st]
+    doms = sorted({pci_domain(root, d) for _, d in found})
+    out = {}
+    for a, d in found:
+        out.setdefault(a, (d, doms.index(pci_domain(root, d))))
+    return out
+
+
 def same_subnet(a, b, prefix=24):
     return ipaddress.ip_network(f'{a}/{prefix}', strict=False) == ipaddress.ip_network(f'{b}/{prefix}', strict=False)

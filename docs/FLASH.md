@@ -11,6 +11,11 @@ TP=3 (a three-box ring, variant k4) or TP=2. The engine is `bin/g6m4_flash`, a b
     ./gr8 glm53f up --model https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 --model-cache DIR --tp 4 ...
     ./gr8 glm53f smoke
 
+With the box's model-loader fetching the weights ([DEPLOY.md](DEPLOY.md#with-model-loader)), give its store instead:
+`--model-loader unix:/var/lib/model-loader/model-loader.sock --model-cache /var/lib/model-loader`, or in Docker add `-f docker/model-loader.yaml`. gr8 finds
+the Flash release in model-loader's catalog by its repo. Its catalog needs an entry for the Flash release, with the width files in small
+segments as for GLM-5.3. GLM-5.3 and Flash then share one store and its disk budget.
+
 `./gr8 glm53f` takes the options of `./gr8 glm53` (KNOBS.md). Each box fetches its rank's part of the release and loads
 it through the same release planner as GLM-5.3 (`engine/loader-rs`): `release::plan` reads the model from the release's
 own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-rs/src/flash.rs`. The width manifests are
@@ -164,7 +169,9 @@ Limits:
 ## Not yet
 
 - CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `G6_FLASH_CACHE=aligned` (above) is the
-  experimental Flash form of prefix reuse.
+  experimental Flash form of prefix reuse. DFlash2 runs offline (`g6m4_flash --dflash-manifest`, at a TP that splits
+  its 8 KV heads), and with `--prefill` only without the drafter's prompt context (`G6_DFL_PFCTX=0`). Its taps are the
+  mean of the four mHC streams after each tapped layer.
 - MTP drafts beyond the first: the KDA state does not roll back a rejected draft yet, so the launcher runs MTP=1.
 - The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.

@@ -23,15 +23,17 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
-                                      '<model> sets it'),
+    'GR8_MODEL': ('cluster', None, 'the model the engine serves, required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); '
+                                   './gr8 <model> sets it, and ./gr8 models lists what each one takes'),
     'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2)'),
-    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
-                                 "cabled to the f1 port of the next box in --peers order, the last to the first)"),
+    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: with --peers, each box's "
+                                 "f0 port cabled to the f1 port of the next box in --peers order, the last to the "
+                                 "first; with mentat, the order and the devices follow the cables mentat's ring "
+                                 "claim finds)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
     'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
-    'HEAD': ('cluster', None, 'mentat mode: the head LAN address, instead of the lowest one'),
+    'HEAD': ('cluster', None, 'mentat mode: the head LAN address, or a name that resolves to it, instead of the lowest one'),
     'IPS': ('cluster', None, 'rail-0 fabric address of every rank (skips fabric discovery)'),
     'IPS2': ('cluster', None, 'rail-1 fabric address of every rank'),
     'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
@@ -39,12 +41,23 @@ KEYS = {
     'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
     'MODEL': ('box', None, 'the exlr8 release: https://huggingface.co/<org>/<repo>[@rev], or a local copy (an NFS '
                            'mount works) used in place'),
-    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release"),
+    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release "
+                                 '(FETCH=model-loader: the model-loader store, which gr8 reads and may mount read-only)'),
+    'FETCH': ('box', 'legacy', 'with an https:// --model: who fetches the weights. legacy: gr8 itself, from Hugging Face. '
+                               "model-loader: the box's model-loader (MODEL_LOADER), into its store (MODEL_CACHE). "
+                               'Default: model-loader when MODEL_LOADER is set, else legacy'),
+    'MODEL_LOADER': ('box', None, "FETCH=model-loader: the local model-loader's request API, unix:PATH or host:port "
+                                  '(default unix:<MODEL_CACHE>/model-loader.sock). host:port needs '
+                                  'MODEL_LOADER_LOCAL_TOKEN in the environment'),
+    'MODEL_LOADER_DRAFTER_MODEL': ('box', None, "FETCH=model-loader: the drafter's name in model-loader's catalog, when "
+                                                "the catalog cannot be asked (default: the entry whose source is DRAFTER's repo)"),
+    'MODEL_LOADER_MODEL': ('box', None, "FETCH=model-loader: the release's name in model-loader's catalog, when the "
+                                        "catalog cannot be asked (default: the entry whose source is MODEL's repo)"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
-    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
-                               'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
+    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default: from "
+                               "mentat's ring claim, or with --peers rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)"),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
@@ -355,11 +368,17 @@ def parse(argv, environ=None):
         values['MENTAT'], origin['MENTAT'] = 'localhost', 'default'
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
+    # A box that names its model-loader fetches through it: model-loader's own deploy trees (deploy/compose/gr8.yml,
+    # deploy/spark-os/gr8.override.yml, deploy/k8s/examples/gr8) set MODEL_LOADER and MODEL_CACHE, not FETCH.
+    if origin['FETCH'] == 'default' and values['MODEL_LOADER']:
+        values['FETCH'], origin['FETCH'] = 'model-loader', f'MODEL_LOADER, from the {origin["MODEL_LOADER"]}'
     deprecated_kv(values, origin, warnings)
-    if values['GR8_MODEL'] not in models.MODELS:
-        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {", ".join(models.MODELS)}')
-    if not values['GROUP']:
-        values['GROUP'] = models.MODELS[values['GR8_MODEL']].group
+    model = values['GR8_MODEL']
+    if model and model not in models.MODELS:
+        raise OptionError(f'GR8_MODEL={model}, from the {origin["GR8_MODEL"]}: not a model gr8 serves. Want '
+                          f'{models.CHOICES} (./gr8 models lists them)')
+    if model and not values['GROUP']:
+        values['GROUP'] = models.MODELS[model].group
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
@@ -386,6 +405,9 @@ def mode(o):
 
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
+    if not o.get('GR8_MODEL'):
+        raise OptionError(f'no model: set GR8_MODEL to {models.CHOICES}, in the config file or the environment, or '
+                          'run ./gr8 <model> (./gr8 models lists them)')
     model = models.of(o)
     tp = o.get('TP')
     if tp is None:
@@ -436,6 +458,11 @@ def validate(o):
         raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
     if o.get('LAYOUT') and not os.path.isfile(o.get('LAYOUT')):
         raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
+    if o.get('FETCH') not in ('legacy', 'model-loader'):
+        raise OptionError(f'--fetch {o.get("FETCH")}: want legacy or model-loader')
+    if o.get('FETCH') == 'legacy' and o.get('MODEL_LOADER'):
+        raise OptionError(f'--fetch legacy with --model-loader {o.get("MODEL_LOADER")}: gr8 fetches its own weights then, '
+                          'and does not ask model-loader. Unset one')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')
@@ -473,8 +500,6 @@ def validate(o):
     if o.get('SHAPE') == 'ring':
         if tp not in ('3', '4'):
             raise OptionError(f'--shape ring: TP=3 or 4, not {tp}')
-        if mode(o) != 'peers':
-            raise OptionError('--shape ring needs --peers: their order is the cable order')
         if o.get('IPS'):
             raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
                               'and bootstraps over the LAN')
@@ -713,9 +738,10 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def canonical(o, plan, members, variant=None):
+def canonical(o, plan, members, variant=None, ring=''):
     """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None.
-    variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count."""
+    variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count. ring: --shape ring
+    with mentat, the ring this box planned from mentat's claim (mentat.ring_text), so every box must have the same."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
     if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
         c['model'] = models.of(o).name
@@ -733,6 +759,8 @@ def canonical(o, plan, members, variant=None):
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''
+    if ring:
+        c['ring'] = ring
     if o.get('LAYOUT'):   # a path per box: its bytes are what every rank must agree on
         c['layout.sha256'] = file_sha256(o.get('LAYOUT'))
     c['engine.env'] = ' '.join(sorted(plan['env']))

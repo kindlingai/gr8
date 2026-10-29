@@ -64,77 +64,49 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
 - A RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. We use one 200G switch.
   At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and at TP=4
   the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned per
-  rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited.
+  rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited. With mentat
+  (`--mentat localhost --tp 3 --shape ring`, mentatd 0.24.0 or later on every box), the cabling can be any ring: the
+  boxes claim a ring from mentat and take their rank order and RDMA devices from its one answer, so a scheduler such as
+  a Kubernetes LeaderWorkerSet can place them in any order. Tag both addresses of each ConnectX port `rdma` in mentat
+  (`MENTAT_ANNOUNCE_IFACES`).
 - A LAN between the boxes with TCP ports 7340 and 7341 open. The boxes need no ssh between them: the head engine
   passes each request to the other ranks over its control links.
 - Disk per box: about 90 GB at TP=4 (its experts, the 11 GB of dense and vocab files, the drafter) and about 85 GB at
   TP=3. One cache holds both, because their parts share the sparse expert files.
-- Proactive memory compaction off on every box. A rank fills the box to about 2 GB under its limit, and at that level
-  the kernel's background compaction moves pages under the engine in bursts that delay every collective. As root,
-  once (it holds across reboots; `vm.compaction_proactiveness=20` undoes it):
-
-      echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-gr8-no-proactive-compaction.conf
-      sysctl -w vm.compaction_proactiveness=0
-
+- Proactive memory compaction off on every box ([docs/DEPLOY.md](docs/DEPLOY.md#before-you-start) has the commands).
+  A rank fills the box to about 2 GB under its limit, and at that level the kernel's background compaction moves pages
+  under the engine in bursts that delay every collective.
 - To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, CMake, clang and libclang-dev (the front end builds XGrammar), rdma-core / libibverbs-dev, Rust through
   [rustup](https://rustup.rs) (the front end needs Rust 1.85 or later; Ubuntu 24.04's `cargo` package is 1.75), and
   Python 3 with venv. The stock DGX OS (Ubuntu 24.04) has all of them except Rust. Or, in place of all of these, Docker
-  with the NVIDIA container toolkit (DGX OS has both): see [In Docker](#in-docker).
+  with the NVIDIA container toolkit (DGX OS has both): see [Docker Compose](docs/DEPLOY.md#docker-compose).
 
 ## Quick start
 
-On every box:
+[docs/DEPLOY.md](docs/DEPLOY.md) is the guide to starting gr8. Two settings are required: the model (`glm53` or
+`glm53f`, and a release of it) and how the boxes find each other (a peer list, or mentat). Then one short section for
+each way to run it, each ending with a passing `smoke`: [bare metal](docs/DEPLOY.md#bare-metal),
+[Docker Compose](docs/DEPLOY.md#docker-compose) and [Kubernetes](docs/DEPLOY.md#kubernetes).
 
-    git clone https://github.com/kindlingai/gr8 && cd gr8
-    TP=4 BUNDLE_LIBS=1 ./gr8 glm53 build
-    python3 -m venv venv && venv/bin/pip install -r frontend/requirements.txt    # the python the head runs the shim on
-    ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
-        --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/gr8/cache \
-        --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
+### With model-loader
 
-`--model-cache` must be a directory you can create or write (here, `sudo mkdir -p /opt/gr8/cache && sudo chown $USER
-/opt/gr8/cache` first). Then `./gr8 glm53 status` from any box, and on the head (the first address in `--peers`):
-
-    ./gr8 glm53 status        # every box, the front end, /health
-    ./gr8 glm53 smoke         # questions with answers that can be checked (from another box: smoke http://10.0.0.1:8100)
-    curl http://10.0.0.1:8100/v1/chat/completions -H 'Content-Type: application/json' \
-      -d '{"model":"glm-5.3","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
-
-For three or six boxes, build with `TP=3` or `TP=6` and pass `--tp 3` or `--tp 6` with as many peers. At TP=3 leave
-out `--drafter`. At TP=6 the drafter is off unless `--drafter` comes with `--dflash 1`: then every box runs the whole
-drafter body (its 8 KV heads do not split six ways), which drafts what TP=4 drafts. `BUNDLE_LIBS=1` copies cuBLAS next to the
-engine, for boxes without the CUDA toolkit. Every box must run the same build: build on one and copy `bin/`, or build
-on each.
-
-The first `up` downloads this box's part: about 35 minutes at 40 MB/s. To download ahead of time, run `./gr8 glm53
-prepare` with the same options. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
-downloads the drafter and converts its own rank.
-
-### In Docker
-
-Nothing to build: CI publishes the image, `ghcr.io/kindlingai/gr8`. On every box, with the NVIDIA container toolkit:
-
-    git clone https://github.com/kindlingai/gr8 && cd gr8
-    cp docker/.env.example docker/.env        # set MODEL, PEERS and (TP=4 only) DRAFTER: the same file on every box
-    docker compose -f docker/compose.yaml pull
-    docker compose -f docker/compose.yaml run --rm gr8 prepare
-    docker compose -f docker/compose.yaml up -d
-
-Then `docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 status` (or `smoke`, or `down` to stop every
-box). [docker/README.md](docker/README.md) has the settings, how to update, and what the container gets.
+[model-loader](https://github.com/kindlingai/model-loader) can fetch the weights instead of gr8: the boxes copy the
+pieces between them over the LAN, from one Hugging Face fetch or a NAS. Each surface takes it with one more file or
+value: [docs/DEPLOY.md](docs/DEPLOY.md#with-model-loader).
 
 ## Running it
 
-Every box runs the same `./gr8 glm53 up`. The first address in `--peers` is the head: it runs the API on port 8100.
-Before any engine starts, the boxes compare their options, model and engine build, and if one box differs, every box
-stops and prints the difference. Without `--peers`, the boxes find each other through a local
-mentat daemon (`--mentat localhost`, the default).
+Every box runs the same `./gr8 glm53 up` ([docs/DEPLOY.md](docs/DEPLOY.md)). The first address in `--peers` is the
+head: it runs the API on port 8100. Before any engine starts, the boxes compare their options, model and engine build,
+and if one box differs, every box stops and prints the difference. Without `--peers`, the boxes find each other through
+a local mentat daemon (`--mentat localhost`, the default).
 
 | command | what it does |
 |---|---|
 | `up [OPTIONS]` | start this box's supervisor and follow it until the cluster serves |
 | `down`, `restart` | stop every box, or stop and boot again (in Docker: `down`, then `up -d` on every box) |
 | `status` | every box's state, engine and free memory, and the head's front end and `/health` |
+| `health` | this box alone, in one line: exit 0 when it serves (on the head, also its API's `/health`), else 1. The compose healthcheck, and a Kubernetes `exec` readiness probe on any rank |
 | `logs [rank\|shim\|front\|supervisor] [-f]` | a log from any box |
 | `prepare [OPTIONS]` | fill `--model-cache` with this box's part, without booting |
 | `check`, `show-config` | what would stop this box's boot; every option and where it came from |
@@ -142,8 +114,8 @@ mentat daemon (`--mentat localhost`, the default).
 | `build` | the engine and the Rust front end, into `bin/` |
 
 Options come from the command line, then a config file (`@FILE`, else `./cluster.env`; see
-`config/cluster.env.tp4.example`, `.tp3.example`, or `cluster.env.example` for TP=6), then the environment. With the
-options in `cluster.env`, `./gr8 glm53 up` alone is enough. [KNOBS.md](KNOBS.md) lists every option.
+[config/cluster.env.example](config/cluster.env.example)), then the environment. With the options in `cluster.env`,
+`./gr8 glm53 up` alone is enough. [KNOBS.md](KNOBS.md) lists every option.
 
 When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line, and the
 supervisor log names the line that says why. Logs are in `out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and

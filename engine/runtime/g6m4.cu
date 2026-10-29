@@ -87,7 +87,7 @@
 //                     (spec_len.h), from the drafter's own probabilities, recent acceptance and a fixed verify cost table.
 //                     Levels default to 1..K (--mtp K, or --dflash-k K for the drafter). MTP also stops its chain early.
 //                     Needs --mtp or --dflash-manifest. Under S2: the DFlash2 sessions' policy (needs --dflash-manifest).
-//                     Flash: on by default with --mtp K (Flash TP2 verify cost table, spec_len.h flash_tp2).
+//                     Flash: on by default with --mtp K (the width's Flash verify cost table, spec_len.h flash_cost).
 //      [--spec-reset-per-request]  Flash offline: restore the configured adaptive policy before each request (default off).
 //                     Does not reset transport counters or cumulative MTP statistics; no effect with --spec-fixed.
 //      [--spec-fixed]  Flash: --mtp K verifies all K drafts every round (the adaptive default off).
@@ -335,7 +335,7 @@ int main(int argc, char** argv)
         spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
         spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
 #if G6_MODEL_FLASH
-        if (!dfl) spec.flash_tp2();
+        if (!dfl) spec.flash_cost(g6nr::NR);
 #endif
     }
 #if G6_MODEL_FLASH
@@ -601,7 +601,10 @@ int main(int argc, char** argv)
     boot_rank = cfg.rank;
     mem_min_gib();                      // a bad G6_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
-    cfg.xtrace = 1;                    // G6_XTRACE=1: stage-0 trace on the decode fabric only (xtrace.h); off by default
+    // G6_XTRACE=1: stage-0 trace (xtrace.h, default off) on the decode fabric, or with G6_XTRACE_PF=1 on the two prefill
+    // fabrics instead
+    const bool xtrace_pf = getenv("G6_XTRACE_PF") && atoi(getenv("G6_XTRACE_PF")) == 1;
+    cfg.xtrace = xtrace_pf ? 0 : 1;
     fab.init(cfg);
     cfg.xtrace = 0;
     const g6::FabricDev f = fab.dev();
@@ -614,16 +617,18 @@ int main(int argc, char** argv)
     if (pf_qo && !release && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
     if (release && (!qo_man.empty() || !qp_man.empty())) die("--v2-dense: the QO weights come from the release (no --qo- / --qp- packs)");
     v2src.qo = pf_qo;
-    // G6_PF_STRIPE=1 (needs --pf-ips2 or --ips2): prefill payload writes >= G6_PF_STRIPE_MIN bytes (default 1 MiB) go
-    // out half on each rail (FabricConfig::stripe_min). Unset = on when --pf-ips2 is given, else one rail as before;
-    // 0 = one rail.
+    // G6_PF_STRIPE=1 (needs --pf-ips2 or --ips2, or a three-rank --ring): prefill payload writes >= G6_PF_STRIPE_MIN
+    // bytes (default 1 MiB) go out half on each rail (FabricConfig::stripe_min). At a three-rank ring the second half
+    // takes the same port's device on the other PCIe root. Unset = on when --pf-ips2 is given or at a three-rank ring,
+    // else one rail as before; 0 = one rail.
     auto pf_stripe_cfg = [&](g6::FabricConfig& cp, const std::vector<std::string>& ips2) {
         std::string e;
-        const int on = env_choice("G6_PF_STRIPE", 1, ips2.empty() ? 0 : 1, &e);
+        const bool ring3 = cp.ring && cp.ips.size() == 3;   // three-rank ring: stripes over the other PCIe root, no ips2
+        const int on = env_choice("G6_PF_STRIPE", 1, ips2.empty() && !ring3 ? 0 : 1, &e);
         if (on < 0) die(e);
         if (!ips2.empty()) cp.ips2 = ips2;
         if (on != 1) return;
-        if (cp.ips2.size() != cp.ips.size()) die("G6_PF_STRIPE=1 needs --pf-ips2 (or --ips2) with one address per rank");
+        if (!ring3 && cp.ips2.size() != cp.ips.size()) die("G6_PF_STRIPE=1 needs --pf-ips2 (or --ips2) with one address per rank");
         const char* m = getenv("G6_PF_STRIPE_MIN");
         cp.stripe_min = m ? (size_t)atoll(m) : (size_t)1 << 20;
         if (cp.stripe_min < 8192) die("G6_PF_STRIPE_MIN must be >= 8192");
@@ -633,9 +638,13 @@ int main(int argc, char** argv)
         g6::FabricConfig cp = cfg;
         cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
         cp.ncoll = pf_rs ? 5 : 2;
+#if G6_MODEL_FLASH
+        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
+#endif
         cp.port = cfg.port + 8;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
+        cp.xtrace = xtrace_pf ? 1 : 0;
         fabp.init(cp);
         fabp.start_proxy();
     }
@@ -647,9 +656,13 @@ int main(int argc, char** argv)
         g6::FabricConfig cp = cfg;
         cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
         cp.ncoll = pf_rs ? 5 : 2;
+#if G6_MODEL_FLASH
+        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
+#endif
         cp.port = cfg.port + 24;
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
+        cp.xtrace = xtrace_pf ? 1 : 0;
         fabp2.init(cp);
         fabp2.start_proxy();
     }
@@ -1037,18 +1050,21 @@ int main(int argc, char** argv)
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
 #if G6_MODEL_FLASH
-    if (mtp) m.kda_ring = mtp + 1;      // KDA state slots for the verify ring
+    if (mtp || dfl) m.kda_ring = std::max(mtp + 1, dfl ? dfl::B : 0);   // KDA state slots for the verify ring (DFlash2: B rows)
     if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
 #endif
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
-    // stay decode-sized. Combinations the Flash prefill does not support yet stop here.
-    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || dfl || reuse_prefix
+    // stay decode-sized. Combinations the Flash prefill does not support yet stop here. --dflash: offline, and without
+    // the drafter's prompt context (G6_DFL_PFCTX=0), until the prefill has taps
+    const bool dfl_pfctx = !(getenv("G6_DFL_PFCTX") && atoi(getenv("G6_DFL_PFCTX")) == 0);
+    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || (dfl && (s2mode || dfl_pfctx)) || reuse_prefix
 #if defined(G6_CP) && G6_CP
                || cp_on
 #endif
                ))
-        die("Flash --prefill: not with G6_PF_RS, G6_PF_OWN, --qo-/--qp- packs, --dflash, --reuse-prefix or CP (P1)");
+        die("Flash --prefill: not with G6_PF_RS, G6_PF_OWN, --qo-/--qp- packs, --dflash (offline with G6_DFL_PFCTX=0 only), "
+            "--reuse-prefix or CP (P1)");
     if (two && getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2)
         die("Flash --pf-lanes 2 uses one compute stream; G6_PF_STREAMS=2 is not supported");
     if (two && getenv("G6_RESID_DUMP"))
@@ -2639,14 +2655,14 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
             {
                 pf_inputs_flash(FP, M, p.prompt.data() + a, pos.data());
-                pf_enqueue_flash(fabp, ls0, NL, M);
+                pf_enqueue_flash(fabp, m, FP, ls0, NL, M);
                 const int MB = two && p.first - a > MP ? std::min(MP, p.first - a - MP) : 0;
                 if (MB)
                 {
                     std::vector<int> posB(MB);
                     for (int r = 0; r < MB; ++r) posB[r] = a + M + r;
                     pf_inputs_flash(FP2, MB, p.prompt.data() + a + M, posB.data());
-                    pf_enqueue_flash(fabp2, ls0b, NL, MB);
+                    pf_enqueue_flash(fabp2, m, FP2, ls0b, NL, MB);
                 }
                 // G6_RESID_DUMP: one record per sub-batch (step field 0), every slot copied out as it is reached
                 std::function<void(int, int)> pf_copy;
