@@ -23,7 +23,7 @@ static l2pf::Queue old_queue(const l2pf::Plan& P, unsigned tmask)
     {
         q.from[t] = c;
         if (!(tmask >> t & 1)) continue;
-        for (int k = 0; k < 4 && P.n[t][k]; ++k)
+        for (int k = 0; k < l2pf::PLAN_K && P.n[t][k]; ++k)
         {
             const uintptr_t b = reinterpret_cast<uintptr_t>(P.p[t][k]), lo = (b + 15) & ~uintptr_t(15), hi = (b + P.n[t][k]) & ~uintptr_t(15);
             if (hi <= lo) continue;

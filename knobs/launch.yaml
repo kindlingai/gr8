@@ -661,6 +661,16 @@ options:
     doc: >-
       1 = the window-2 fc1 split (KS1x2, WG1) on every MoE layer at M > 1, not only the layers the k2 gate picks
       (GR8_TR3_W2ALL; bit-exact). TP=4: prose +1.3 %, c4 +2.7 to +3.4 %, exact; not measured at TP=5 or TP=6
+  PTAB:
+    scope: cluster
+    doc: >-
+      decode and prefill MoE: the routed experts read each piece (one 128-column block of an expert: its gate, up and
+      down tiles) through a per-layer device table at a fixed address instead of base + offset in one contiguous
+      tr3.fc1 / tr3.fc2 (GR8_PTAB; bit-exact). 1 = the table's entries point into the rank image; 2 = every piece
+      copied into its own slab from a pool, in a scrambled order (an A/B that proves the kernels need no contiguity;
+      the image's expert bytes stay allocated, so it costs their size again). EL3 stage 1 of #151
+      (engine/kernels/ptab.cuh); attention, dense and vocab pieces stay contiguous. Measured on one GB10 at the TP=4,
+      TP=3 and TP=6 rank slices (ptab_test), not on a booted cluster
   QO_CACHE:
     scope: cluster
     doc: >-

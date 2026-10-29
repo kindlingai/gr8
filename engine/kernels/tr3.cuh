@@ -210,6 +210,58 @@ __device__ __forceinline__ int tr3_unit(const long long* kmix, int e, const long
     return static_cast<int>((km >> (4 * u)) & 15);
 }
 
+// EL3 (#151) stage 1, the piece table: a piece is one 128-column block of one expert row (its gate and up rows, its
+// down columns). ptab[(e * EB + b) * 2] is the slab holding the piece's fc1 bytes ([gate][up] back to back, each at
+// its unit's width, the order they have inside tr3.fc1) and ptab[(e * EB + b) * 2 + 1] its fc2 bytes (the block's
+// down tiles); entries of blocks the row does not have on this rank are null. The table sits at one fixed device
+// address per layer, so a captured graph stays valid when its entries change (ptab::Table, ptab.cuh). ptab ==
+// nullptr: the pack layout, every piece at its tr3.table offset in one tr3.fc1 / tr3.fc2 (tr3_unit). Either way one
+// table read per CTA, before the tile loops.
+__device__ __forceinline__ int tr3_ptab_slot(int e, int b) { return (e * g6nr::EB + b) * 2; }
+
+// Width and first tile (mw) of fc1 unit u = 2b + mat of expert row e (table row tr).
+__device__ __forceinline__ int tr3_fc1_unit(const uint8_t* fc1, const uint8_t* const* ptab, const long long* kmix, int e,
+                                            const long long* tr, int u, const uint8_t*& mw)
+{
+    if (!ptab)
+    {
+        size_t off;
+        const int k = tr3_unit(kmix, e, tr, u, off);
+        mw = fc1 + off;
+        return k;
+    }
+    constexpr size_t MB = static_cast<size_t>(KSH) * 8 * 32;
+    const long long km = kmix ? kmix[e] : 0;
+    const uint8_t* p = ptab[tr3_ptab_slot(e, u >> 1)];
+    if (!km)
+    {
+        const int k = static_cast<int>(tr[4]);
+        mw = p + static_cast<size_t>(u & 1) * k * MB;
+        return k;
+    }
+    mw = p + ((u & 1) ? static_cast<size_t>((km >> (4 * (u & ~1))) & 15) * MB : 0);
+    return static_cast<int>((km >> (4 * u)) & 15);
+}
+
+// First tile of fc2 block b of expert row e (table row tr) at width bits.
+__device__ __forceinline__ const uint8_t* tr3_fc2_block(const uint8_t* fc2, const uint8_t* const* ptab, int e, const long long* tr, int b, int bits)
+{
+    if (!ptab) return fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * 32 * bits);
+    return ptab[tr3_ptab_slot(e, b) + 1];
+}
+
+// Bytes of a piece's fc1 slab (its two units) and of its fc2 slab, from the table row and tr3.kmix.
+__host__ __device__ __forceinline__ size_t tr3_piece_fc1_bytes(long long km, const long long* tr, int b)
+{
+    constexpr size_t MB = static_cast<size_t>(KSH) * 8 * 32;
+    if (!km) return 2 * static_cast<size_t>(tr[4]) * MB;
+    return (static_cast<size_t>((km >> (8 * b)) & 15) + static_cast<size_t>((km >> (8 * b + 4)) & 15)) * MB;
+}
+__host__ __device__ __forceinline__ size_t tr3_piece_fc2_bytes(const long long* tr)
+{
+    return static_cast<size_t>(tr[4]) * (static_cast<size_t>(KSH) * 8 * 32);
+}
+
 #ifndef TR3_UNR
 #define TR3_UNR 8    // tiles loaded ahead per warp (bytes in flight per warp = TR3_UNR * tile bytes)
 #endif
@@ -476,7 +528,8 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     const int NTU = KSH >> s_ns2;                     // n-tiles of this unit
     const int nt0 = ns * NTU + warp;
     const int ntiles = (NTU - warp + nwarps - 1) >> s_nw;
-    const uint8_t* base = A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB);
+    const int e = static_cast<int>((tr - A.t_tab) / 6);
+    const uint8_t* base = tr3_fc2_block(A.t_fc2, A.t_ptab, e, tr, b, BITS);
     // wide order (tr3_wide.cuh, k_tr3_widen2): the 8 k-tiles of an n-tile in three 64-bit loads. The first n-tile is
     // requested here, before the prologue, so its DRAM latency overlaps the prologue's.
     const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2

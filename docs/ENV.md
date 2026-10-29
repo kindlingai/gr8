@@ -269,6 +269,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_PF_WM` | flag | `1` | 0\|1 | 0 runs the Flash routed fc1 on `k_pf_fc1` instead of the weight-major `k_pf_fc1ws` for passes of at least GR8_PF_WM_MIN rows. Byte-equal. |
 | `GR8_PF_WM2` | flag | `0` | 0\|1 | 1 runs the Flash prefill fc2 weight-major (`k_pf_fc2w`) instead of `k_pf_fc2v` when the fc1 runs weight-major. Byte-equal. |
 | `GR8_PF_WM_MIN` | int | `6144` |  | Sets the fewest rows a Flash MoE prefill pass needs before the routed fc1 runs weight-major. |
+| `GR8_PTAB` | int | `0` | 0..2 | The routed-expert kernels (decode K1 and prefill) read each piece, one 128-column block of an expert, through the layer's device piece table (`kernels/ptab.cuh`): 1 = entries into the rank image, 2 = every piece copied into its own scattered slab (an A/B; the image's expert bytes stay allocated). Same bytes out. 0 = the pack layout. |
 | `GR8_QA_SPLIT` | int | g6m4: 2 when TP>1 on GLM, else 0; m4sim: 0 | 0\|1\|2 | Splits the decode layer-input GEMVs across the ranks by 16-output tiles and all-gathers them on their own fabric. 1 = q_a, kv_a and the indexer's k and weights, 2 = q_a only. Same bits. |
 | `GR8_QA_SPLIT_TPC` | int | `1` |  | Sets the output tiles per CTA of the GEMVs that GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT narrow. It only lowers a GEMV's own count and keeps the output bits (rank.cuh qs_narrow). |
 | `GR8_QO_NANINJ` | flag | `0` |  | Writes an FP16 NaN into q[0] of the prefill attention on every call, a fault injection for the error checks. |

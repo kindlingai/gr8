@@ -88,6 +88,22 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
         if(y.flash_mlp_w.moe!=y.moe) die("Flash MLP format disagrees with layer schedule");
         if(y.moe && !find(lname(y.l,"router.bias")).fp32) die("Flash router.bias must be FP32");
         y.T=y.flash_mlp_w.experts;
+        // GR8_PTAB (EL3, #151): the piece table is built here, once, for both binders. Flash widens tr3.fc1 / fc2 lazily
+        // in the prefill binder (flash_mlp_pf::bind_layer_tensors), and a SCATTER slab must hold the order the kernels
+        // read, so with the knob on that sequence runs now (the shared expert's FP8 copy first, as there: it reads the
+        // unwidened order), then the table; the binder then finds the layer widened and takes y.T.ptab.
+        if(y.moe && ptab::mode_env()!=ptab::OFF) {
+            const bool shfp8=knob::glm53f_pf_shfp8().value_or(knob::pf_moe8());
+            if(shfp8 && !y.T.shfp8.codes[0])
+                if(const char* e=bind::make_shared_fp8(y.T,st)) die("layer "+std::to_string(y.l)+": "+e);
+            if(!knob::glm53f_pf_nowide()) {
+                bind::widen_fc1(y.T,st);
+                if(!knob::nowide2()) bind::widen_fc2(y.T,st);
+            }
+            G6RT_CK(cudaStreamSynchronize(st));
+            y.flash_mlp_w.experts=y.T;
+            build_ptab(m,y,rank,i==0 || i==m.nl-1,st);
+        }
         errors[i]=y.ab.args.error;
         check_headroom(rank,capacity,false);
     }

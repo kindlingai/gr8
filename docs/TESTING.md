@@ -94,6 +94,7 @@ against its own decoded values), `l2pf_queue_test` and
 | test | checks |
 |---|---|
 | `l2pf_bench` | `GR8_L2PF` prefetch: speed, and exactness against no prefetch |
+| `ptab_test_tp<N>`, `ptab_test_flash_tp<N>` | `GR8_PTAB` (#151): the routed experts through a per-layer piece table, entries into the image and pieces scattered into slabs, against the pack layout: decode at every row count (plain and graph, with `GR8_K1_TLBW` and the route-overlap form), a graph replayed after the table's contents changed, prefill at 1,024 and 4,096 rows, byte for byte; `--short` builds rows of EB - 1 blocks (null table entries); `--sabotage` proves the check bites; bench of decode and prefill per layer. Widths with EB <= 8 (the kmix format's ceiling); the Flash build runs the Flash-only prefill kernels |
 | `gpuprobe` | the GPU half of the rank health probe (`tools/health/rank_probe.py` runs it) |
 | `dtr_test_tp4`, `dtr_test_flash_tp4` | dense trellis matrices, at TP4: dumps for `engine/ref/dtr_ref.py`, and decode timing (needs release entries) |
 

@@ -236,6 +236,7 @@ inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t s
         bt.fc1_wide = y.T.fc1_wide;
         bt.e4m3 = y.T.e4m3;
         bt.fc2_wide = y.T.fc2_wide;
+        bt.ptab = y.T.ptab;
         bt.k2 = y.T.k2;
         bt.k3 = y.T.k3;
         bt.sh_trellis = y.T.sh_trellis;

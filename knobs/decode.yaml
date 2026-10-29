@@ -143,6 +143,16 @@ knobs:
     doc: >-
       At the start of each decode MoE fc1 launch, prefetches the routed slots' fc1 and fc2 weight translations into L2
       at this granule in KB. No output change.
+  GR8_PTAB:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..2"
+    doc: >-
+      The routed-expert kernels (decode K1 and prefill) read each piece, one 128-column block of an expert, through
+      the layer's device piece table (`kernels/ptab.cuh`): 1 = entries into the rank image, 2 = every piece copied
+      into its own scattered slab (an A/B; the image's expert bytes stay allocated). Same bytes out. 0 = the pack
+      layout.
   GR8_L2PF:
     scope: local
     kind: int
