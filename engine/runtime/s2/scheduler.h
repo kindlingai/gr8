@@ -203,6 +203,11 @@ class Scheduler {
     std::array<Slot, MAX_SESSIONS> s_{};
     uint64_t boundary_ = 0, event_ = 0, revision_ = 0, last_id_ = 0, pool_ = 0;
     bool have_id_ = false;
+    // the last ADMITTED_MEMORY admitted request ids, so a request is admitted at most once. The ids need not increase:
+    // the head may admit a queued request that continues a retained run ahead of earlier ones (service.h GR8_S2_KEEP_MS)
+    static constexpr unsigned ADMITTED_MEMORY = 64;
+    std::array<uint64_t, ADMITTED_MEMORY> admitted_{};
+    uint64_t admitted_n_ = 0;
     bool want_decode_ = true, busy_ = false, failed_ = false;
     uint32_t decode_run_ = 0;   // decode rounds completed since the last prefill quantum (alternate; read only when decode_rounds > 1)
     Quantum work_;
@@ -270,7 +275,7 @@ public:
         uint64_t h = 14695981039346656037ull;
         auto add = [&](uint64_t v) { for (unsigned i = 0; i < 8; ++i) { h ^= uint8_t(v >> (8*i)); h *= 1099511628211ull; } };
         add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
-        add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
+        add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(admitted_n_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
         if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
         if (c_.window_pages) add(c_.window_pages);
         if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
@@ -296,7 +301,8 @@ public:
         if (e.cancel) require(e.cancel->epoch == c_.epoch, "cancel epoch mismatch");
         if (e.admit) {
             const auto& g = *e.admit;
-            require(!have_id_ || g.req.id > last_id_, "native request ordinals must increase");
+            for (uint64_t i = 0; i < std::min<uint64_t>(admitted_n_, ADMITTED_MEMORY); ++i)
+                require(admitted_[i] != g.req.id, "native request admitted twice");
             require(g.key.slot < MAX_SESSIONS && g.key.epoch == c_.epoch, "bad grant key");
             auto& target = after[g.key.slot];
             require(target.phase == Phase::Free && target.key.generation != UINT32_MAX && g.key.generation == target.key.generation + 1, "grant slot generation mismatch");
@@ -312,7 +318,7 @@ public:
             require(g.reuse < g.req.prompt_tokens, "reused rows past the prompt");
             target = Slot{g.key, g.req, g.run, Phase::Prefill, g.reuse, 0}; d.admitted = g;
         }
-        if (e.admit) { last_id_ = e.admit->req.id; have_id_ = true; }
+        if (e.admit) { last_id_ = e.admit->req.id; have_id_ = true; admitted_[admitted_n_++ % ADMITTED_MEMORY] = last_id_; }
         s_ = after; event_ = e.event; ++revision_;
         return d; // allocator adapter now applies these canonical changes; no local allocation choice here
     }
