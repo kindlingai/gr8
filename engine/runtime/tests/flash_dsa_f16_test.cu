@@ -1,4 +1,4 @@
-// GR8_PF_DSA_F16GEMM unit test: MXFP8 GV records -> fp16 matrix + cuBLAS, and two BF16W records -> one stacked bf16
+// GR8_GLM53F_PF_DSA_F16GEMM unit test: MXFP8 GV records -> fp16 matrix + cuBLAS, and two BF16W records -> one stacked bf16
 // matrix + cuBLAS (flash_dsa_f16.cuh), against the full-GV kernel on the same operands and both against fp64.
 //   cd engine/runtime && nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a <MODEL=flash build flags> -I.. \
 //       tests/flash_dsa_f16_test.cu -o flash_dsa_f16_test -lcublas

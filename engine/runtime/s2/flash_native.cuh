@@ -325,7 +325,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         fence();
         if (!cache) check();
         auto draft = [&](FlashPrefill& fp, int n, int base) {
-            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // GR8_PF_DRAFT_FULL (flash_prefill.cuh)
+            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // GR8_GLM53F_PF_DRAFT_FULL (flash_prefill.cuh)
             {
                 const bool chk = pf_draft_full() == 2;
                 DraftFull& F = pf_draft_cache_full(c.draft, fp, n, base, p.prompt.data() + base + 1, chk, c.stream);
@@ -345,7 +345,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 });
                 unsigned dw = 0;
                 G6RT_CK(cudaMemcpy(&dw, F.diff, 4, cudaMemcpyDeviceToHost));
-                fprintf(stderr, "# GR8_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
+                fprintf(stderr, "# GR8_GLM53F_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
                 return;
             }
             pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {

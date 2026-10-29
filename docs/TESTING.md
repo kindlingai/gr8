@@ -95,7 +95,7 @@ one GPU and makes its own synthetic weights.
 | `flash_sparse_mla_test` | fused sparse MLA prefill against QK, softmax and PV |
 | `flash_sparse_mla_v2_test` | `sparse_mla_pf_v2` against `sparse_mla_pf_512`, byte for byte (#10) |
 | `kda_g9_det` | the G9 ON kernels give the same bits run to run |
-| `flash_dsa_f16_test` | `GR8_PF_DSA_F16GEMM` against the full-GV kernel and fp64 |
+| `flash_dsa_f16_test` | `GR8_GLM53F_PF_DSA_F16GEMM` against the full-GV kernel and fp64 |
 | `mhc_decode_stage_test` | the decode mHC pinned-partial stage: bytes and time |
 
 `scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible: every state of the mcg,

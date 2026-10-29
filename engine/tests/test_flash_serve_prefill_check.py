@@ -6,7 +6,7 @@ still fails the request before the lambda returns, the fences are the same in bo
 one per chunk), and the request's work is the same calls in the same order. The words check() reads stay set until the
 next request's reset (nothing in the cache fill clears one), which the mock models as one sticky word. Each case runs
 with one session and with several: the prefill runs with s2on off and a clean one turns it back on.
-GR8_PF_DRAFT_FULL (default on, with the cache fill) fills each lane's draft cache in one call: one chunk and one fence
+GR8_GLM53F_PF_DRAFT_FULL (default on, with the cache fill) fills each lane's draft cache in one call: one chunk and one fence
 per lane, still one check after the last. The rows each request writes reach the partial reset's dirty bound.
 """
 from pathlib import Path
@@ -69,7 +69,7 @@ void draft_chunk() { events += 'D'; if (chunk++ == inject) word = 1; }
 void pf_draft_cache_flash(Draft&, int, int, int) { draft_chunk(); }
 void launch_draft_step(Draft&, int, int, bool, int) { draft_chunk(); }
 // the knobs the lambda reads, set per case (the engine reads each once per process): GR8_GLM53F_DRAFT_KV, and
-// GR8_PF_DRAFT_FULL, the lane's whole draft cache fill in one call (=2, the engine's compare arm, is not run here)
+// GR8_GLM53F_PF_DRAFT_FULL, the lane's whole draft cache fill in one call (=2, the engine's compare arm, is not run here)
 namespace knob { bool draft_kv = true; inline bool glm53f_draft_kv() { return draft_kv; } }
 int draft_full_knob = 1;
 int pf_draft_full() { return draft_full_knob; }
@@ -118,7 +118,7 @@ int main() {
         for (const bool several : {false, true})
         {
             const bool cache = !kv || std::atoi(kv);
-            if (!cache && full) continue;     // GR8_PF_DRAFT_FULL applies to the cache fill only
+            if (!cache && full) continue;     // GR8_GLM53F_PF_DRAFT_FULL applies to the cache fill only
             const int chunks = cache && !full ? s.lanes : s.steps;
             knob::draft_kv = cache;
             draft_full_knob = full ? std::atoi(full) : 1;

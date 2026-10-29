@@ -113,7 +113,7 @@ __global__ void __launch_bounds__(THREADS,1) kernel(Gemm g) {
 
 // Default on for supported FP32 matrices. Explicit 0 selects the original path;
 // small or unsupported matrices continue to use it automatically.
-inline bool enabled() { return knob::pf_kda_ws(); }
+inline bool enabled() { return knob::glm53f_pf_kda_ws(); }
 inline bool supported(const Gemm& g) {
  return g.on && g.M >= 256 && g.h16 == 1 && g.tw && g.bf16 == 2 &&
         g.N > 0 && g.N % 128 == 0 && g.K > 0 && g.K % 128 == 0 && !g.w2;

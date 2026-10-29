@@ -53,17 +53,17 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['knobs']['SESS'], '1')
             self.assertIn('GR8_CP=0', plan['env'])
             self.assertIn('GR8_PF_RS=0', plan['env'])
-            self.assertIn('GR8_PF_STAGE_ASYNC=1', plan['env'])
+            self.assertIn('GR8_GLM53F_PF_STAGE_ASYNC=1', plan['env'])
             (self.assertNotIn if tp == '4' else self.assertIn)('GR8_GLM53F_KDA_SCAN=1', plan['env'])
             for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
-            self.assertIn('GR8_PF_DSA_F16GEMM=1', plan['env'])
+            self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
 
     def test_flash_cache(self):
         plan = opt.engine_plan(flash())
-        self.assertFalse([e for e in plan['env'] if e.startswith(('GR8_GLM53F_', 'GR8_FLASH_', 'G6_FLASH_'))])
+        self.assertFalse([e for e in plan['env'] if e.startswith(('GR8_GLM53F_CACHE=', 'GR8_GLM53F_STATE_BUDGET_MIB='))])
         self.assertNotIn('--kv-store', plan['args'])
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--flash-state-budget-mib', '4096'))
         self.assertIn('GR8_GLM53F_CACHE=aligned', plan['env'])

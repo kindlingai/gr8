@@ -7,24 +7,12 @@ knobs:
     default: "0"
     doc: >-
       Flash prefill attention runs the P1 bodies instead of the GEMM bodies.
-  GR8_FPF_DENSE_P1:
-    scope: agree
-    kind: flag
-    default: "0"
-    doc: >-
-      Flash prefill dense MLP layers run the P1 bodies instead of the GEMM bodies.
   GR8_FPF_DSA_P1:
     scope: agree
     kind: flag
     default: "0"
     doc: >-
       Flash prefill DSA layers run the P1 bodies instead of the GEMM bodies.
-  GR8_FPF_KDA_P1:
-    scope: agree
-    kind: flag
-    default: "0"
-    doc: >-
-      Flash prefill KDA q, k, v and o_proj run as the P1 projections instead of M-row GEMMs.
   GR8_FPF_P1:
     scope: agree
     kind: flag
@@ -38,13 +26,6 @@ knobs:
     doc: >-
       On the first prefill call of layer position 0, each rank writes diagnostic buffers to DIR/<name>.r<rank>.bin.
       Synchronizes.
-  GR8_PF_AMARK:
-    scope: local
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      With GR8_PF_PROF, the Flash DSA prefill attention adds its own profile marks.
   GR8_PF_AOP:
     scope: agree
     kind: flag
@@ -67,13 +48,6 @@ knobs:
     doc: >-
       Prefill attention runs in chunks of this many rows inside a sub-batch. The rest of the layer runs at the sub-
       batch size.
-  GR8_PF_BF16_EXACT:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      The Flash BF16 dense MLP fallback in prefill runs plain kernels instead of cuBLAS.
   GR8_PF_BLAS_ROWS:
     scope: agree
     kind: int
@@ -90,14 +64,6 @@ knobs:
     doc: >-
       Sets the context up to which prefill attention takes the dense path. Past it the sparse, indexer-selected path
       runs. 0 means always sparse.
-  GR8_PF_DRAFT_FULL:
-    scope: agree
-    kind: int
-    default: "1"
-    values: "0|1|2"
-    doc: >-
-      The Flash MTP draft cache fill runs over the lane's rows in 256-row passes instead of one draft step per MX rows,
-      with the same bits. 2 also counts differing words against the old path.
   GR8_PF_DRAFT_SHARE:
     scope: agree
     kind: int
@@ -106,38 +72,6 @@ knobs:
     doc: >-
       The MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of its own, about 2 GB a
       rank. 1 requires it, 0 gives the draft its own.
-  GR8_PF_DSA_F16GEMM:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      Flash DSA prefill input projections run as FP16 cuBLAS GEMMs on weights decoded once at bind, instead of the MXFP8
-      GV kernel. Near-byte, not byte-equal.
-  GR8_PF_DSA_FULL_GV:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      Flash DSA prefill runs its GV projections as one launch over all rows. 0 restores the per-32-row launches. Byte-
-      equal.
-  GR8_PF_DSA_LT:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      Flash DSA prefill q_a and idx_q run on a cublasLt algo with a bigger tile where the default is one k pass, with
-      the same bits. 0 keeps cublasGemmEx.
-  GR8_PF_DSA_PROJ_P1:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      Flash DSA prefill q_b and o_proj trellis projections run as the decode GEMVs per MX rows instead of the prefill
-      trellis GEMM.
   GR8_PF_DTR8:
     scope: agree
     kind: flag
@@ -243,83 +177,6 @@ knobs:
     doc: >-
       Sets the rows per CTA of the prefill index-score kernel, rounded down to a multiple of 8 (below 8 means 8). Same
       bits.
-  GR8_PF_KDA_GZF:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 makes the G9 KDA prefill scan write and re-read the G16 / Z16 planes instead of building those tiles in its K1
-      and output kernels (`kda/kda_g9.cuh`). Same bits.
-  GR8_PF_KDA_TAIL:
-    scope: agree
-    kind: int
-    default: "1"
-    values: "0|1|2"
-    doc: >-
-      Selects how Flash prefill runs the KDA f_a / g_a / b projections: 0 = the per-MX-row host loop, 1 = full-M 32-row
-      tiles, 2 = full-M 64-row tiles.
-  GR8_PF_KDA_TAIL_CHECK:
-    scope: local
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      Flash prefill also runs the KDA tail projections on the host-loop path, compares them byte for byte with the tiled
-      result and stops on a difference.
-  GR8_PF_KDA_WS:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 turns off the warp-specialized GEMM for the Flash KDA prefill projections (`kda/proj_in_prefill.cuh`).
-  GR8_PF_KP_TC:
-    scope: agree
-    kind: int
-    default: "2"
-    values: "0|1|2|3"
-    doc: >-
-      Selects the Flash prefill kpool score kernel: 0 = `kp_scores_pf`, 1 = tensor-core with one stage, 2 = tensor- core
-      with two stages, 3 = the streaming tensor-core form.
-  GR8_PF_MHC_FUSE:
-    scope: agree
-    kind: int
-    default: "2"
-    values: "0|1|2"
-    doc: >-
-      Sets how far Flash prefill fuses the mHC update with the fabric wait: 0 = separate passes, 1 = the mHC kernel
-      reads the partials, 2 = it also waits for the payload.
-  GR8_PF_MHC_PK:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 turns off the packed mHC fn weights for `k_mhc_out_inv_prepare_pk` in Flash prefill.
-  GR8_PF_MHC_RR:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 runs `k_mhc_out_inv_prepare_pk` instead of the row-blocked `k_mhc_out_inv_prepare_rr` when the peer partial is
-      staged in Flash prefill.
-  GR8_PF_MHC_STAGE:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 stops Flash prefill at TP2 from copying the peer's partial into device memory with the copy engine before the
-      mHC update.
-  GR8_PF_MLA_PROJ2:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 makes Flash prefill attention use the older MLA projection kernels instead of `fa_pf::mla_proj2`.
   GR8_PF_MOE8:
     scope: agree
     kind: flag
@@ -328,14 +185,6 @@ knobs:
     doc: >-
       1 runs the Flash prefill MoE on MXFP8 activations instead of the fp16 passes, and turns on the shared expert's FP8
       copy unless GR8_PF_SHFP8 says otherwise.
-  GR8_PF_NOWIDE:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      Any value other than 0 stops Flash prefill from reordering the tr3 fc1 / fc2 records into the wide load order at
-      bind time.
   GR8_PF_OWN:
     scope: agree
     kind: int
@@ -370,41 +219,12 @@ knobs:
     default: "0,3,20,34,55,74"
     doc: >-
       With GR8_PF_PDUMP, the comma list of model layers to dump, plus their index-score source layers.
-  GR8_PF_POOL_CAPTURE:
-    scope: local
-    kind: path
-    unset: "unset"
-    doc: >-
-      A non-empty value stops the boot when GR8_FPF_ATTN_P1=1, because pool capture needs the prefill attention path.
-  GR8_PF_POOL_OWNER:
-    scope: agree
-    kind: int
-    unset: "on for TP2 Flash prefill (not ring, no P1 flags), else off"
-    values: "0|1"
-    doc: >-
-      1 runs the Flash prefill pool-ID exchange on its own fabric (TP2, not ring) and stops the boot if it cannot, 0
-      turns it off.
-  GR8_PF_PREWARM:
-    scope: local
-    kind: flag
-    unset: "1 at TP2, else 0"
-    values: "0|1"
-    doc: >-
-      1 creates the per-lane Flash DSA and MLP prefill states at boot instead of inside the first chunk, and any other
-      value turns it off.
   GR8_PF_PROF:
     scope: local
     kind: flag
     default: "0"
     doc: >-
       Prefill synchronizes after each stage and rank 0 prints a per-stage time profile (ms) to stderr.
-  GR8_PF_PUT_CTA:
-    scope: agree
-    kind: int
-    default: "96"
-    doc: >-
-      Sets the CTA count of the Flash prefill partial publish copy (`k_put_publish_n`) outside the SP path. Copy only,
-      same bytes.
   GR8_PF_Q8:
     scope: agree
     kind: flag
@@ -488,13 +308,6 @@ knobs:
     doc: >-
       Each rank appends per-expert prefill route counts per MoE layer and sub-batch to `routes.r<rank>.jsonl` in this
       directory.
-  GR8_PF_ROUTER1:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      1 runs the Flash prefill router logits on `k_linear_mr` instead of the tiled `k_router_tile` (0 ULP apart).
   GR8_PF_ROUTER_SPLIT:
     scope: agree
     kind: flag
@@ -534,14 +347,6 @@ knobs:
     doc: >-
       Prefill index tiles of at least 32 rows at a context of at least this many tokens pick their top keys with SELX
       instead of SEL32, with the same IDs in the same order.
-  GR8_PF_SHFP8:
-    scope: agree
-    kind: flag
-    unset: "the PF_MOE8 value"
-    values: "0|1"
-    doc: >-
-      1 makes an FP8 copy of the Flash trellis shared expert for the prefill GEMMs, which quantizes its activations, and
-      0 keeps the fp16 trellis pass that matches decode.
   GR8_PF_SHR:
     scope: agree
     kind: flag
@@ -550,111 +355,6 @@ knobs:
     doc: >-
       1 runs the Flash trellis shared expert inside the routed MoE pass as extra routes instead of its own pass. Same
       bytes.
-  GR8_PF_SP:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      1 runs Flash prefill mHC sequence-parallel: partials go reduce-scatter, each owner runs mHC on its rows, then
-      all-gathers the normalized rows.
-  GR8_PF_SPARSE_MLA:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      1 runs Flash prefill attention as the fused sparse MLA kernel when a rank has at most 32 heads.
-  GR8_PF_SPARSE_MLA_512:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      With GR8_PF_SPARSE_MLA=1, 1 selects the `sparse_mla_pf_512` kernel and makes the V2 kernel the default.
-  GR8_PF_SPARSE_MLA_H16C:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      With the V2 sparse MLA kernel and at most 16 heads a rank, 1 runs its 16-head form.
-  GR8_PF_SPARSE_MLA_V2:
-    scope: agree
-    kind: flag
-    unset: "the PF_SPARSE_MLA_512 value"
-    values: "0|1"
-    doc: >-
-      With GR8_PF_SPARSE_MLA=1, 1 runs the V2 sparse MLA kernel and 0 the 512 or base kernel.
-  GR8_PF_SP_AGD:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 stops the GR8_PF_SP owner pass from writing its rows straight into the all-gather send slot, so the publish
-      copies them. Byte-equal.
-  GR8_PF_SP_AGK:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 moves GR8_PF_SP all-gathers back to copy-engine copies on the lane's copy stream instead of one SM pass on the
-      compute stream that also writes the FP16 copy.
-  GR8_PF_SP_AGKA:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 limits the GR8_PF_SP_AGK compute-stream all-gather to lane B instead of both prefill lanes.
-  GR8_PF_SP_ATTD:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 stops the GR8_PF_SP attention o_proj GEMM from writing each row into its owner's slice of the send slot. Byte-
-      equal.
-  GR8_PF_SP_FIND:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 stops the GR8_PF_SP MoE final sum from writing each row into its owner's slice of the send slot. Byte-equal.
-  GR8_PF_SP_PUT_CTA:
-    scope: agree
-    kind: int
-    default: "96"
-    values: "1..1024"
-    doc: >-
-      Sets the CTA count of the GR8_PF_SP send copies (`k_put_rs`, `k_put_publish_n`). Copy only, same bytes.
-  GR8_PF_SP_X16:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      With GR8_PF_SP and GR8_PF_ROUTER_SPLIT, an MoE layer's MLP input travels as FP16 rows instead of FP32 rows,
-      halving that all-gather. Byte-equal.
-  GR8_PF_SP_XFRAG:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
-    doc: >-
-      0 stops the GR8_PF_SP owner pass and gather from writing the next attention's fragment tables directly. Same
-      tables either way.
-  GR8_PF_STAGE_ASYNC:
-    scope: agree
-    kind: flag
-    unset: "1 at TP2 when the config allows, else 0"
-    values: "0|1"
-    doc: >-
-      1 waits for and copies the peers' partials on a per-lane side stream under the other lane's block, at any rank
-      count, and stops the boot if the config cannot run it.
   GR8_PF_STAGGER:
     scope: local
     kind: int
@@ -720,18 +420,3 @@ knobs:
     default: "6144"
     doc: >-
       Sets the fewest rows a Flash MoE prefill pass needs before the routed fc1 runs weight-major.
-  GR8_PF_XFRAG:
-    scope: agree
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      1 makes the Flash mHC kernel write the next attention's input as f16 and bf16 fragment tables instead of FP32 rows
-      when that attention reads only fragments. Same bits.
-  GR8_PF_XTRACE:
-    scope: local
-    kind: flag
-    default: "0"
-    values: "0|1"
-    doc: >-
-      Measurement: Flash prefill stamps GPU timestamps around each layer's fabric wait and copy for a trace.

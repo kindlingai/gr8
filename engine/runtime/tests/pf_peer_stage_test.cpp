@@ -1,4 +1,4 @@
-// Host model of the GR8_PF_STAGE_ASYNC schedule (flash_prefill.cuh: pf_step_flash, pf_step2_flash, pf_put_flash ->
+// Host model of the GR8_GLM53F_PF_STAGE_ASYNC schedule (flash_prefill.cuh: pf_step_flash, pf_step2_flash, pf_put_flash ->
 // pf_stage_issue, pf_consume_flash). No CUDA. Every stream op, event record and event wait the real code makes is
 // recorded in call order; an op graph (stream order + record -> wait edges, the CUDA rule: a wait sees the latest
 // record made before it in call order) then gives happens-before, and the hazards of NK-DESIGN.md are checked on it:

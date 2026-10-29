@@ -638,15 +638,15 @@ int main(int argc, char** argv)
         fabp2.start_proxy();
     }
 #if G6_MODEL_FLASH
-    // Independent pool-ID exchange: default on for TP2 Flash prefill (GR8_PF_POOL_OWNER unset = auto, 0 = off,
+    // Independent pool-ID exchange: default on for TP2 Flash prefill (GR8_GLM53F_PF_POOL_OWNER unset = auto, 0 = off,
     // 1 = on and die if unsupported). Existing fabp/fabp2 are unchanged.
     g6::Fabric fabix, fabix2;
     const int pool_mode = flash_pool_owner_mode();
     const bool pool_fits = MP && g6nr::NR == 2 && cfg.ips.size() == 2 && !cfg.ring;
     const char* pool_conflict = knob::fpf_attn_p1() ? "GR8_FPF_ATTN_P1" : knob::fpf_dsa_p1() ? "GR8_FPF_DSA_P1"
                               : knob::fpf_p1() ? "GR8_FPF_P1" : nullptr;
-    if (pool_mode == 1 && !pool_fits) die("GR8_PF_POOL_OWNER=1 needs TP2 Flash prefill (not ring)");
-    if (pool_mode == 1 && pool_conflict) die(std::string("GR8_PF_POOL_OWNER=1 conflicts with ") + pool_conflict);
+    if (pool_mode == 1 && !pool_fits) die("GR8_GLM53F_PF_POOL_OWNER=1 needs TP2 Flash prefill (not ring)");
+    if (pool_mode == 1 && pool_conflict) die(std::string("GR8_GLM53F_PF_POOL_OWNER=1 conflicts with ") + pool_conflict);
     const bool pool_owner = pool_mode == 1 || (pool_mode == 2 && pool_fits && !pool_conflict);
     if (pool_owner)
     {

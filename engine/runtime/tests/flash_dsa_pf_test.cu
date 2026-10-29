@@ -25,9 +25,9 @@ struct SimplePrefill
 inline void pf_dsa_block_p1_ref(Model& m, SimplePrefill& P, int i, int M, int context, cudaStream_t st)
 {
     // Opt-in gate: compare the fused MLA with CURRENT GEMM prefill, not the older P1 math. The reference needs the
-    // fused MLA off, and GR8_PF_SPARSE_MLA is read once per process (the knob cache), so one process cannot run both.
+    // fused MLA off, and GR8_GLM53F_PF_SPARSE_MLA is read once per process (the knob cache), so one process cannot run both.
     if (knob::test_sparse_mla())
-        die("GR8_TEST_SPARSE_MLA: the reference run needs GR8_PF_SPARSE_MLA=0, and a knob is read once per process");
+        die("GR8_TEST_SPARSE_MLA: the reference run needs GR8_GLM53F_PF_SPARSE_MLA=0, and a knob is read once per process");
     Layer& y = m.layers[i];
     for (int m0 = 0; m0 < M; m0 += MX)
     {
@@ -172,7 +172,7 @@ int main()
 {
     if (knob::test_sparse_mla())
     {
-        setenv("GR8_PF_SPARSE_MLA", "1", 1);   // before the first read of the knob
+        setenv("GR8_GLM53F_PF_SPARSE_MLA", "1", 1);   // before the first read of the knob
         puts("SPARSE MLA GATE: explicit opt-in hi/lo candidate; all P1-labelled reference columns use current GEMM prefill (fused MLA OFF)");
     }
     G6RT_CK(bind::init());

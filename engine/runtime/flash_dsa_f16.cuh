@@ -1,4 +1,4 @@
-// Opt-in FP16 cuBLAS arm for the DSA input projections (GR8_PF_DSA_F16GEMM=1, default 0): q_a, kv_a, idx_k, idx_q
+// Opt-in FP16 cuBLAS arm for the DSA input projections (GR8_GLM53F_PF_DSA_F16GEMM=1, default 0): q_a, kv_a, idx_k, idx_q
 // (MXFP8 records, fp16 GEMM) and idx_w + idx_g (BF16W records, one concatenated bf16 GEMM).
 //
 // Today both run as MXFP8 GV records (densev.cuh Mxfp8): E4M3 weight codes decoded to fp16, fp16 activation fragments,
@@ -33,7 +33,7 @@ namespace flash_dsa_f16
 
 inline bool on()
 {
-    return knob::pf_dsa_f16gemm();
+    return knob::glm53f_pf_dsa_f16gemm();
 }
 
 // byte offsets in an MXFP8 GV record tensor [O/16][NG = K/32][528] (densev.cuh Mxfp8): two 16x16 tiles of 256 B in
@@ -194,7 +194,7 @@ inline void gemm_bf_split(cublasHandle_t h, const Mat& w, const u32* xb_frag, in
     k_split_f16<<<static_cast<unsigned>((outs + 255) / 256), 256, 0, st>>>(y32, M, w.O, w.Oa, ya, lda, yb, ldb);
 }
 
-// GR8_PF_DSA_LT (default on, read once; =0 off): q_a (O 1536, K 4096) and idx_q (O 4096, K 1536) run on a cublasLt algo with a
+// GR8_GLM53F_PF_DSA_LT (default on, read once; =0 off): q_a (O 1536, K 4096) and idx_q (O 4096, K 1536) run on a cublasLt algo with a
 // bigger tile than the one cublasGemmEx (CUBLAS_GEMM_DEFAULT) picks (64x64, 32x6 stages): q_a 256x64 / 32x4, idx_q
 // 128x128 / 64x3, both split-K 1. Only where the default is itself one sequential k pass: the Lt heuristic (the one
 // GemmEx follows, same workspace) answers split-K 1, no reduction, a defined tile, the same algo id. Then every output
@@ -204,7 +204,7 @@ inline void gemm_bf_split(cublasHandle_t h, const Mat& w, const u32* xb_frag, in
 constexpr size_t GEMMEX_WS = size_t(32) << 20;   // = flash_dsa_pf::F16_WS, the GemmEx handle's workspace
 inline bool lt_on()
 {
-    return knob::pf_dsa_lt();
+    return knob::glm53f_pf_dsa_lt();
 }
 inline cublasLtHandle_t lt_handle()
 {

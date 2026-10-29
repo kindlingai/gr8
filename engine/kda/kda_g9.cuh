@@ -259,7 +259,7 @@ __global__ void __launch_bounds__(256) k_gz16(G9Args g)
 }
 
 // ------------------------------------------------------------------------------------------------------ GZF
-// GR8_PF_KDA_GZF: no gz16 pass and no G16 / Z16 planes. K1 builds its tile's G16 values and k_out16z its tile's Z16 values
+// GR8_GLM53F_PF_KDA_GZF: no gz16 pass and no G16 / Z16 planes. K1 builds its tile's G16 values and k_out16z its tile's Z16 values
 // with gz_tile: gz16's A conversion (P fp32 -> pack_bf16, rows >= M zero), gz16's B fragments (f_b / g_b [channel][k],
 // read straight from global), the same mma16816 calls in the same k order per output and the same pack_bf16: the bits
 // gz16 stores. Tile = rows m0 .. m0 + 15 x head h's 128 channels; NW warps split its 16 n8 tiles.
@@ -588,11 +588,11 @@ template <int VS> inline void launch_k2(const G9Args& g, const Tape& tp, cudaStr
 // ------------------------------------------------------------------------------------------------------ ON path
 // conv16 -> gz16 -> K1 -> K2 -> out16 on projections already in a.P; scratch ps (rows = MP) holds the tape, a.C the six planes.
 // Returns an error string (nothing launched) or nullptr. VS in {1, 2, 4}.
-// GR8_PF_KDA_GZF (default 1, read once; =0: the gz16 pass and the G16 / Z16 planes): K1 and k_out16z build the G16 / Z16
+// GR8_GLM53F_PF_KDA_GZF (default 1, read once; =0: the gz16 pass and the G16 / Z16 planes): K1 and k_out16z build the G16 / Z16
 // tiles (gz_tile): the same bits without the planes' DRAM round trip (gzf < 0: the env; 0 / 1: forced, the tests).
 // kda/tests/kda_g9_gzf_test.cu: byte-equal, 12 cases. TP3 8K A/B: prefill 2592 -> 2627 tok/s, rank-0 8K -39 ms, T=0
 // hashes unchanged.
-inline int gzf_env() { return knob::pf_kda_gzf(); }
+inline int gzf_env() { return knob::glm53f_pf_kda_gzf(); }
 inline const char* launch(const Args& a, const KdaPrefillScratch& ps, int VS, cudaStream_t st, int gzf = -1)
 {
     if (gzf < 0) gzf = gzf_env();

@@ -15,13 +15,6 @@ knobs:
     doc: >-
       Prints per-stage decode step times from event nodes in the captured main-step graphs every N main steps, in the
       rank logs. 0: off.
-  GR8_DEC_MHC_STAGE:
-    scope: agree
-    kind: flag
-    default: "1"
-    doc: >-
-      Flash decode: the fused mHC consume stages the peers' partials in shared memory before summing, at 1 or 4 rows.
-      Same rank-order summation.
   GR8_DEC_PROF:
     scope: local
     kind: flag
@@ -204,28 +197,6 @@ knobs:
     values: "0|1|2"
     doc: >-
       Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block.
-  GR8_MHC_FUSE:
-    scope: agree
-    kind: int
-    default: "2"
-    values: "0|1|2"
-    doc: >-
-      Sets the decode mHC consume form for every row count unless GR8_MHC_FUSE_M1 / _M4 set it: 0 a separate peer-wait
-      kernel, 1 the consume waits itself, 2 the fused consume.
-  GR8_MHC_FUSE_M1:
-    scope: agree
-    kind: int
-    unset: "MHC_FUSE, else 2"
-    values: "0|1|2"
-    doc: >-
-      Sets the decode mHC consume form for 1-row steps, as GR8_MHC_FUSE.
-  GR8_MHC_FUSE_M4:
-    scope: agree
-    kind: int
-    unset: "MHC_FUSE, else 2"
-    values: "0|1|2"
-    doc: >-
-      Sets the decode mHC consume form for every step of 2 or more rows, as GR8_MHC_FUSE.
   GR8_MOE_TOPK:
     scope: agree
     kind: int
@@ -261,21 +232,6 @@ knobs:
     doc: >-
       Sets the output tiles per CTA of the GEMVs that GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT narrow. It only
       lowers a GEMV's own count and keeps the output bits (rank.cuh qs_narrow).
-  GR8_ROUTER_MF:
-    scope: agree
-    kind: flag
-    default: "1"
-    doc: >-
-      Flash MoE router: 1 runs a 4-row step with the 4-row router kernel, 0 with the per-row kernel. Each warp sums its
-      output in the same order either way.
-  GR8_ROUTER_NW:
-    scope: agree
-    kind: int
-    default: "2"
-    values: "2|4|8"
-    doc: >-
-      Flash MoE router: warps per CTA of the router GEMV (one output channel per warp). Each warp sums in the same order
-      at any width.
   GR8_ROUTER_TPC:
     scope: agree
     kind: int
