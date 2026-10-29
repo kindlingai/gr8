@@ -370,6 +370,16 @@ knobs:
     values: "1..86400"
     doc: >-
       S2: seconds the bootstrap waits on the control links before a rank gives up.
+  GR8_S2_TRACE:
+    scope: local
+    kind: path
+    unset: "off"
+    legacy: []
+    doc: >-
+      S2: writes a Chrome trace (chrome://tracing, ui.perfetto.dev) of this rank to PATH.r<rank>.json: a span per prefill
+      quantum, prompt tail and decode step, and on the head each request's arrival, wait, admission, first token and
+      finish, in wall-clock microseconds. tools/trace/merge.py joins the ranks and a client's request times. Host clock
+      only.
   GR8_STEP_TMR:
     scope: local
     kind: flag
