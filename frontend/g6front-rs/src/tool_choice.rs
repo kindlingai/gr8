@@ -13,8 +13,8 @@
 //! reply's first content token is the call.
 //!
 //! It is a strong nudge, not a grammar. gr8's engine samples, so the front end cannot mask logits, and a reply that
-//! opens a call to a name the request did not offer is still possible -- the parser drops such a name, which leaves text
-//! and `finish_reason: stop` -- as are arguments the tool's schema rejects (`strict` is not enforced; the parser coerces
+//! opens a call to a name the request did not offer is still possible -- the parser leaves such a call as text with
+//! `finish_reason: stop`, or with `--undeclared-tool-calls emit` returns it as a call the client can refuse -- as are arguments the tool's schema rejects (`strict` is not enforced; the parser coerces
 //! values by the schema as before). The opener is also why a forced reply carries no reasoning: its first token is the
 //! call, not `<think>`.
 

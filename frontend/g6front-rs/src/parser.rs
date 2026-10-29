@@ -9,6 +9,10 @@
 //! - A call in the answer, outside a code fence, that follows text directly or starts the answer is live: once its
 //!   name is read and names a tool, its name and then its arguments stream as they are generated. Any other call is
 //!   held until the reply ends.
+//! - A call to a name the request did not declare is prose by default, tags and all. `emit_undeclared`
+//!   (`--undeclared-tool-calls emit`) takes it as a call when the name looks like a function name (`plausible_name`),
+//!   so the client sees the call and can answer it with its own "unknown tool" error. Such a call is never live: it is
+//!   held until the reply ends with it.
 //!
 //! Tags are ASCII, so all scanning is on bytes; text is only ever cut at tag boundaries.
 
@@ -123,9 +127,10 @@ pub struct GlmParser {
     deferred_reasoning: String,
     deferred_content: String,
     content_has_nonws: bool,
-    fresh: bool,  // only whitespace since the reply start, a think tag or a live call
-    fence: bool,  // the answer is inside a ``` fence
-    ticks: usize, // backticks in a row
+    fresh: bool,      // only whitespace since the reply start, a think tag or a live call
+    fence: bool,      // the answer is inside a ``` fence
+    ticks: usize,     // backticks in a row
+    undeclared: bool, // a call may name a tool the request did not declare (`emit_undeclared`)
 }
 
 impl GlmParser {
@@ -158,7 +163,17 @@ impl GlmParser {
             fresh: true,
             fence: false,
             ticks: 0,
+            undeclared: false,
         }
+    }
+
+    /// A call may name a function the request did not declare (`--undeclared-tool-calls emit`): such a call is read
+    /// like any other instead of staying prose, when its name looks like a function name (`plausible_name`). Its
+    /// arguments are strings, having no schema to coerce them by. Such a call never goes live: it is held until the
+    /// reply ends with it, so the rules that tell a call the model makes from one it writes about apply in full.
+    pub fn emit_undeclared(mut self, on: bool) -> GlmParser {
+        self.undeclared = on;
+        self
     }
 
     /// The reply starts as content: its prompt closed the think block (thinking turned off).
@@ -402,7 +417,9 @@ impl GlmParser {
     fn go_live(&mut self, idx: usize, body: &str, closed: bool, deltas: &mut Vec<ToolDelta>) {
         let Some(end) = body.find(ARG_KEY).or(closed.then_some(body.len())) else { return };
         let name = py_strip(&body[..end]);
-        if name.contains(THINK_START) || name.contains(THINK_END) || !self.name_valid(name) {
+        // only a declared name goes live: an undeclared one (`emit_undeclared`) is held, so prose after it still proves
+        // the run was prose -- a client answering it with an unknown-tool error gains nothing from streaming it
+        if name.contains(THINK_START) || name.contains(THINK_END) || !self.declared(name) {
             return; // the held rules decide it
         }
         let id = tool_call_id();
@@ -535,8 +552,13 @@ impl GlmParser {
         }
     }
 
-    fn name_valid(&self, name: &str) -> bool {
+    /// A name the request offered (any name when it lists no functions, as before).
+    fn declared(&self, name: &str) -> bool {
         !name.is_empty() && (self.tools.is_empty() || self.tools.contains_key(name))
+    }
+    /// A name a held run may call: a declared one, or with `emit_undeclared` one that looks like a function name.
+    fn name_valid(&self, name: &str) -> bool {
+        self.declared(name) || (self.undeclared && plausible_name(name))
     }
     fn args_json(&self, name: &str, pairs: &[(String, String)]) -> String {
         let mut params: Map<String, Value> = Map::new();
@@ -678,6 +700,19 @@ fn inside_value(before: &str) -> bool {
         (Some(_), None) => true,
         (None, _) => false,
     }
+}
+
+/// Longest undeclared name `plausible_name` takes, in bytes.
+const NAME_MAX: usize = 128;
+
+/// Whether `name`, which no tool of the request has, could be a function the model means to call: an identifier of
+/// 1 to `NAME_MAX` bytes that starts with an ASCII letter or `_` and goes on with letters, digits, `_`, `-`, `.` and
+/// `:` (OpenAI's `[a-zA-Z0-9_-]`, plus the separators namespaced tool names use). Prose between the tags -- spaces,
+/// markup, a placeholder like `...` or `-`, a number -- stays prose.
+fn plausible_name(name: &str) -> bool {
+    name.len() <= NAME_MAX
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
 
 /// The byte index of the first character `str.strip()` would keep, if any.
@@ -1170,6 +1205,120 @@ mod tests {
             r.content.as_deref(),
             Some("Use <tool_call>nope<arg_key>a</arg_key><arg_value>1</arg_value></tool_call> here.")
         );
+    }
+
+    fn emitting() -> GlmParser {
+        GlmParser::new(Some(&tools()), &json!("auto"), true).emit_undeclared(true)
+    }
+
+    /// Feed `text` to `p` in `chunk`-sized pieces; return (content, [(name, arguments)]) as a client would assemble them.
+    fn stream_with(mut p: GlmParser, text: &str, chunk: usize) -> (String, Vec<(String, String)>) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut content = String::new();
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = (i + chunk).min(chars.len());
+            let s: String = chars[i..end].iter().collect();
+            i = end;
+            if let Some(d) = p.delta(&s, i >= chars.len()) {
+                content += d.content.as_deref().unwrap_or("");
+                for t in d.tool_calls {
+                    while calls.len() <= t.index {
+                        calls.push(Default::default());
+                    }
+                    if let Some(n) = t.name {
+                        calls[t.index].0 = n;
+                    }
+                    calls[t.index].1 += t.arguments.as_deref().unwrap_or("");
+                }
+            }
+        }
+        (content, calls)
+    }
+
+    /// `--undeclared-tool-calls emit`: a call to a name the request did not declare is a call, whole and streamed, when
+    /// the reply ends with it (it is held even where a declared call would go live). Its arguments are strings: there is
+    /// no schema to coerce by.
+    #[test]
+    fn undeclared_name_is_a_call_when_emitting() {
+        for text in [
+            "</think><tool_call>tool_describe<arg_key>names</arg_key><arg_value>web_search</arg_value>\
+             <arg_key>n</arg_key><arg_value>3</arg_value></tool_call>",
+            "</think>Let me look. <tool_call>tool_describe<arg_key>names</arg_key><arg_value>web_search</arg_value>\
+             <arg_key>n</arg_key><arg_value>3</arg_value></tool_call>",
+            "Plan.\n<tool_call>tool_describe<arg_key>names</arg_key><arg_value>web_search</arg_value>\
+             <arg_key>n</arg_key><arg_value>3</arg_value></tool_call>",
+        ] {
+            let r = emitting().parse_full(text);
+            assert_eq!(r.calls.len(), 1, "{text:?}");
+            assert_eq!(r.calls[0].1, "tool_describe");
+            assert_eq!(r.calls[0].2, r#"{"names": "web_search", "n": "3"}"#);
+            assert!(r.content.as_deref().is_none_or(|c| !c.contains("<tool_call>")), "{text:?}");
+            for chunk in [1, 2, 3, 7, 4096] {
+                let (content, calls) = stream_with(emitting(), text, chunk);
+                assert_eq!(calls, vec![(r.calls[0].1.clone(), r.calls[0].2.clone())], "chunk {chunk} of {text:?}");
+                assert!(!content.contains("<tool_call>"), "chunk {chunk} of {text:?}");
+            }
+        }
+        // a declared call next to an undeclared one: both are calls, in order
+        let r = emitting().parse_full(
+            "</think><tool_call>get_current_date</tool_call><tool_call>mcp.files:read<arg_key>path</arg_key>\
+             <arg_value>a</arg_value></tool_call>",
+        );
+        let names: Vec<&str> = r.calls.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(names, ["get_current_date", "mcp.files:read"]);
+    }
+
+    /// Emitting changes only which names count: prose about a call stays prose, and so does a "name" that is not one.
+    #[test]
+    fn emitting_keeps_prose_prose() {
+        for text in [
+            "</think>Use <tool_call>nope<arg_key>a</arg_key><arg_value>1</arg_value></tool_call> here.",
+            "</think>Like this:\n```\n<tool_call>nope</tool_call>\n```\n",
+            "</think>Write `<tool_call>nope</tool_call>",
+            "</think>The tags are <tool_call>the name, then the arguments</tool_call>",
+            "</think><tool_call>a <b>c</b></tool_call>",
+            "</think>The format is <tool_call>nope and then the arguments.",
+            "Think <tool_call>nope here</think>Done.",
+            // not identifiers: placeholders, numbers, words with spaces or slashes
+            "</think>The placeholder is <tool_call>...</tool_call>",
+            "</think>Done.<tool_call>-</tool_call>",
+            "</think>Score:<tool_call>10</tool_call>",
+            "</think><tool_call>.hidden</tool_call>",
+            "</think><tool_call>get weather</tool_call>",
+            "</think><tool_call>fs/read</tool_call>",
+            // an undeclared call where a declared one would go live is held: prose after it makes it prose
+            "</think>I agree.<tool_call>yes</tool_call> That is all.",
+            "</think>I'd write it as:<tool_call>example_tool<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>\n\
+             That's the format.",
+        ] {
+            let off = full(text);
+            let on = emitting().parse_full(text);
+            assert!(on.calls.is_empty(), "{text:?}");
+            assert_eq!((on.reasoning, on.content), (off.reasoning, off.content), "{text:?}");
+            for chunk in [1, 3, 4096] {
+                let (_, calls) = stream_with(emitting(), text, chunk);
+                assert!(calls.is_empty(), "chunk {chunk} of {text:?}");
+            }
+        }
+        let long = format!("</think><tool_call>{}</tool_call>", "a".repeat(NAME_MAX + 1));
+        assert!(emitting().parse_full(&long).calls.is_empty());
+        let longest = format!("</think><tool_call>{}</tool_call>", "a".repeat(NAME_MAX));
+        assert_eq!(emitting().parse_full(&longest).calls.len(), 1);
+    }
+
+    /// The flag off is today's behaviour: the undeclared call is prose, whole and streamed.
+    #[test]
+    fn undeclared_name_is_text_by_default() {
+        let text =
+            "</think><tool_call>tool_describe<arg_key>names</arg_key><arg_value>web_search</arg_value></tool_call>";
+        let r = full(text);
+        assert!(r.calls.is_empty());
+        assert_eq!(r.content.as_deref(), Some(&text["</think>".len()..]));
+        let (content, calls) = stream_with(GlmParser::new(Some(&tools()), &json!("auto"), true), text, 2);
+        assert!(calls.is_empty());
+        assert_eq!(content, &text["</think>".len()..]);
     }
 
     /// A held call followed by prose is prose too (the model writes about the call, then goes on).
