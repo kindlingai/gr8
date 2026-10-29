@@ -2051,6 +2051,7 @@ int main(int argc, char** argv)
                 h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); };
                 h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns) { return pool.match(p, rows, worst, limit, ns); };
                 h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst) { return pool.take(x, rows, worst); };
+                h.pool.continues = [&](const std::vector<int>& p, const CacheNamespace& ns) { return pool.continues(p, ns); };
             }
             if (kvt)
             {

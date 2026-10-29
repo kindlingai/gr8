@@ -449,7 +449,8 @@ public:
 
 enum class Stall { None, Slots, Capacity };
 struct AdmissionStatus { Stall why = Stall::None; uint32_t requested = 0, room = 0; };
-// Rank0 ingress FIFO. Page choice stays in the pool (pool.h).
+// Rank0 ingress queue, in arrival order. The head tries the front, or a later request that continues a retained run
+// (service.h GR8_S2_KEEP_MS). Page choice stays in the pool (pool.h).
 class AdmissionQueue {
     Config c_; std::deque<Request> q_;
     uint64_t last_revision_ = UINT64_MAX, last_head_ = UINT64_MAX, last_id_ = 0;
@@ -469,14 +470,24 @@ public:
         q_.erase(it); return true;
     }
     const Request* front() const { return q_.empty() ? nullptr : &q_.front(); }
+    const Request* find(uint64_t id) const {
+        auto it = std::find_if(q_.begin(), q_.end(), [&](const Request& r) { return r.id == id; });
+        return it == q_.end() ? nullptr : &*it;
+    }
+    const std::deque<Request>& queued() const { return q_; }
     size_t size() const { return q_.size(); }
-    void admitted(uint64_t id) { require(!q_.empty() && q_.front().id == id, "FIFO admission violated"); q_.pop_front(); }
+    void admitted(uint64_t id) { require(cancel(id), "admission of a request no longer queued"); }
     // fits: the pool can admit the head (RunPool::fits); room: the pages one reservation can take now (RunPool::room)
     std::optional<AdmissionStatus> check(uint64_t revision, bool slot, bool fits, uint32_t room) {
-        if (q_.empty() || (last_head_ == q_.front().id && last_revision_ == revision)) return {};
+        return q_.empty() ? std::nullopt : check(q_.front().id, revision, slot, fits, room);
+    }
+    // the same for queued request `id`
+    std::optional<AdmissionStatus> check(uint64_t id, uint64_t revision, bool slot, bool fits, uint32_t room) {
+        const Request* r = find(id);
+        if (!r || (last_head_ == id && last_revision_ == revision)) return {};
         require(room <= c_.pool_rows/PAGE, "invalid allocator view");
-        last_head_ = q_.front().id; last_revision_ = revision;
-        AdmissionStatus s; s.requested = grant_pages(c_, q_.front()); s.room = room;
+        last_head_ = id; last_revision_ = revision;
+        AdmissionStatus s; s.requested = grant_pages(c_, *r); s.room = room;
         s.why = !slot ? Stall::Slots : !fits ? Stall::Capacity : Stall::None;
         if (s.why != Stall::None) ++stalls;
         return s;

@@ -80,6 +80,9 @@ int g6kv_retain_namespaced(g6kv_pool* p, const g6kv_run* r, const int32_t* histo
                            int32_t written_end, int32_t pf_end, const uint8_t* namespace_, size_t namespace_bytes);
 int g6kv_match_namespaced(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst,
                           int32_t limit, const uint8_t* namespace_, size_t namespace_bytes, g6kv_hit* out);
+// the age of the most recent retained run whose whole history `prompt` continues, in *out, or 0 for none
+int g6kv_continues_namespaced(const g6kv_pool* p, const int32_t* prompt, size_t n, const uint8_t* namespace_,
+                              size_t namespace_bytes, uint64_t* out);
 // from: -1 for a pool hit, else the tier of a stored one
 int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, g6kv_run* out);
 

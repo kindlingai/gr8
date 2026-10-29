@@ -87,6 +87,13 @@ public:
     PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit, const g6rt::CacheNamespace& ns = {}) const {
         return match(prompt, rows, rows, limit, ns);
     }
+    // head: the age of the most recent retained run whose whole history `prompt` continues (the next turn of the same
+    // conversation), or 0 for none
+    uint64_t continues(const std::vector<int>& prompt, const g6rt::CacheNamespace& ns = {}) const {
+        Lock l(mu_); uint64_t age = 0;
+        check(g6kv_continues_namespaced(p_, prompt.data(), prompt.size(), ns.data(), ns.size(), &age));
+        return age;
+    }
     // claim a match() hit as a new grant (a fresh table version, as reserve)
     Run take(const PoolHit& h, uint64_t rows, uint64_t worst) {
         Lock l(mu_); g6kv_run r; check(g6kv_take(p_, h.skip, h.age, h.stored ? int32_t(h.tier) : -1, rows, worst, &r)); return run(r);

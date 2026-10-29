@@ -240,6 +240,29 @@ pub unsafe extern "C" fn g6kv_match(
     g6kv_match_namespaced(p, prompt, n, rows, worst, limit, STOCK_NAMESPACE.as_ptr(), NAMESPACE_BYTES, out)
 }
 
+/// The age of the most recent retained run of the namespace whose whole history `prompt` continues (Pool::continued_by),
+/// in `out`, or 0 for none.
+///
+/// # Safety
+/// As g6kv_match_namespaced.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_continues_namespaced(
+    p: *const Pool,
+    prompt: *const i32,
+    n: usize,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(namespace) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
+    let Some(prompt) = slice(prompt, n) else { return Error::BadArgument.code() };
+    if p.is_null() || out.is_null() {
+        return Error::BadArgument.code();
+    }
+    *out = (*p).continued_by(prompt, namespace).unwrap_or(0);
+    0
+}
+
 /// Find a prefix only in the exact namespace. Non-stock queries never search stored tiers.
 ///
 /// # Safety
