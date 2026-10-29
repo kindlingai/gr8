@@ -184,7 +184,7 @@ inline bind::Tensor as_bind_tensor(const TensorRef& r)
 }
 
 // Populate bindp::Tensors for layer i from m.layers[i].flash_mlp_w (and optional Find).
-// Makes exact FP8 tile copies for dense gate/up/down (unless G6_DTR_PF_DENSE_COPY=0, which uses k_gemm_tr directly)
+// Makes exact FP8 tile copies for dense gate/up/down
 // and optional shared-expert FP8 copies (GR8_PF_SHFP8=1; default 0 on the fp16 expert body, 1 with GR8_PF_MOE8=1).
 inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t st, bindp::Tensors& bt)
 {

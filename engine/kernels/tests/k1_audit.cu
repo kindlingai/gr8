@@ -10,7 +10,7 @@
 // experts per row: --routes FILE (GR8_ROUTE_LOG lines: the distinct expert ids of every MoE layer of every MTP main
 // step; offline --prompt runs only, rank.cuh route_log_line; the lines with M = the bench M are used), else --exlog FILE
 // (the "# s2_round" lines of a GR8_S2_ROUNDLOG=1 rank-0 log: distinct counts per layer per main step, and the ids
-// themselves when the run also had G6_S2_ROUTE_IDS=1; without ids they are drawn uniformly), else the served means
+// themselves when the lines carry them; without ids they are drawn uniformly), else the served means
 // (kstop-1015 meas.r0.err, 5823 main steps: distinct per layer 8.0 / 13.5 / 18.6 / 23.9 / 28.6 / 33.7 / 38.6 / 44.3 at
 // M = 1..8; above 8 rows +5.2 per row). Rows are then given 8 experts each so that every distinct id is used (the
 // log has no row->expert map; it changes the slot masks, not the bytes).
@@ -813,7 +813,7 @@ int main(int argc, char** argv)
             XLine x;
             x.M = atoi(line.c_str() + pm + 3);
             x.n = parse_list(line.substr(px + 4, pi == std::string::npos ? std::string::npos : pi - px - 4).c_str());
-            if (pi != std::string::npos)     // G6_S2_ROUTE_IDS=1: "ids a.b.c,d.e,..." per MoE layer
+            if (pi != std::string::npos)     // a line with route ids: "ids a.b.c,d.e,..." per MoE layer
                 for (const char* p = line.c_str() + pi + 5; *p && *p != ' ' && *p != '\n';)
                 {
                     x.ids.emplace_back();

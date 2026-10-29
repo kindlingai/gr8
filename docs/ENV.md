@@ -173,7 +173,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_PF_QP_LAYERS` | text | all |  | With GR8_PF_OWN=4, the comma list of model layers and ranges that run pair-owner attention, while the others run GR8_PF_OWN=2. |
 | `GR8_PF_QP_MIN` | int | `768` |  | With GR8_PF_OWN=4, a prompt shorter than this many tokens runs GR8_PF_OWN=2, and 0 sends every request that fits GR8_PF_QP_CTX through OWN=4. |
 | `GR8_PF_QP_ROLL` | int | `0` | 0\|2\|3\|4 | With GR8_PF_OWN=4, builds the pair weights per layer in this many rolling slots from the rank pack and the partner's half over RDMA. 0 uses a resident --qp-pack. |
-| `GR8_PF_QP_WIRE_E` | int | `1` | 1..4 | With GR8_PF_OWN=4 and GR8_PF_QP_ROLL, sets the entries in the RDMA ring of pair-weight half images (`qp_wire.h`). |
+| `GR8_PF_QP_WIRE_E` | int | 1 entry; set, it needs GR8_PF_QP_ROLL | 1..4 | With GR8_PF_OWN=4 and GR8_PF_QP_ROLL, sets the entries in the RDMA ring of pair-weight half images (`qp_wire.h`). |
 | `GR8_PF_ROUTER1` | flag | `0` | 0\|1 | 1 runs the Flash prefill router logits on `k_linear_mr` instead of the tiled `k_router_tile` (0 ULP apart). |
 | `GR8_PF_ROUTER_SPLIT` | flag | `0` | 0\|1 | 1 splits the Flash prefill MoE router by rows across the ranks and exchanges the route tables on a dedicated fabric per lane (`flash_route_split.cuh`). |
 | `GR8_PF_RS` | flag | `0` | 0\|1 | 1 runs GLM prefill with reduce-scatter plus all-gather (five collectives) instead of all-reduce. |
@@ -219,7 +219,6 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_RT_PLACE` | int | every tail page of --cap |  | With GR8_RT_LOCAL, sets the main model's physical pages per rank, so --cap becomes the logical length only. Must hold the GR8_CP_R prefix and one window. |
 | `GR8_RT_POOL` | int | 4096, or with RT_LOCAL 2048 x rows a step x sessions past R |  | Sets GR8_RT_STORE's resident slots per indexer group, at least 2048. With GR8_RT_LOCAL a smaller pool lets fewer sessions past R in at once. |
 | `GR8_RT_SIZE` | int | unset |  | Sets each rank's GR8_RT_STORE lease budget in bytes (the launcher's KV_ROWS size=). With GR8_RT_LOCAL it sizes the records, and the pool admits a tail past R only when its records fit. |
-| `GR8_RT_STORE` | text | unset |  | Sends a session's whole pages past GR8_RT_L to a per-rank lease, and CP decode reads them back. mem: or remote:HOST:PORT (a KV node). Needs --serve, GR8_CP and GR8_S2_BELOW = GR8_CP_R. |
 | `GR8_S2_ADAPT` | flag | `0` |  | S2: chooses each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs. Adds about 1 GiB of main-step graphs. |
 | `GR8_S2_ADMIT_HOLD` | flag | `0` | 0\|1 | S2: an admission with another request queued behind it and a slot left holds its boundary, so a burst of queued requests is admitted at one boundary instead of one per notice. |
 | `GR8_S2_BELOW` | int | CP_R |  | S2: the context below which sessions share the pool's pages: 64..GR8_CP_R, a multiple of 64. |
@@ -313,6 +312,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_RT_CHECK` | flag | `0` |  | With GR8_RT_FMT=int4, prints the latent SQNR and rope check of the FP8 to INT4 round trip. With GR8_RT_LOCAL also checks the record bookkeeping after every change and stops on an error. |
 | `GR8_RT_PF_SLICE` | flag | `1` |  | With GR8_RT_LOCAL, a prefill stages each released page with one read of each row's slice for the layer. 0 reads the page's whole block for every layer of its group, about 3.9x the bytes. |
 | `GR8_RT_SELSTAT` | flag | `0` | 0\|1 | With GR8_RT_LOCAL, counts what a prefill reading only the selected rows of released pages would read, at each full-index layer. Measurement only, it synchronizes the stream. |
+| `GR8_RT_STORE` | text | unset |  | Sends a session's whole pages past GR8_RT_L to a per-rank lease, and CP decode reads them back. mem: or remote:HOST:PORT (a KV node). Needs --serve, GR8_CP and GR8_S2_BELOW = GR8_CP_R. Local: with remote:auto the launcher gives odd ranks the KV node's second rail. |
 | `GR8_S2_BIND_DELAY` | text | unset |  | S2 test: RANK:MS makes that rank sleep MS ms after each request's bind, to show what a bind skew does to the next quantum on the other ranks. |
 | `GR8_S2_EVENTLOG` | flag | `0` |  | S2: logs one line when the head anchors a notice, one when each rank applies the commit, and one per prefill quantum. Logs only. |
 | `GR8_S2_ROUNDLOG` | flag | `0` |  | S2: rank 0 prints one '# s2_round' line per decode step, with the step's routed experts. |

@@ -237,7 +237,7 @@ GR8_CP=1 GR8_CP_R=$SHARE_LIMIT GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ GR8_ATTN_FRONT=$ATTN_FRONT}"
   # the decode indexer's vector loads, the decode context buckets, the S2 MTP draft count from accept rates, S2 prefill
   # quanta and decode rounds while sessions decode, burst admissions, and prefill selx past PF_SELX_CTX (docs/SETTINGS.md):
-  # off unless set; on at TP=4. DEC_BK 0 and PF_SELX_CTX 0 = the engine default (2048; SEL32)
+  # off unless set; on at TP=4. DEC_BK 0 and PF_SELX_CTX 0 leave them to the engine (DEC_BK 2048, selx from 53248)
   ENGINE_ENV="$ENGINE_ENV${IDX_VEC:+ GR8_IDX_VEC=$IDX_VEC}"
   [ "${DEC_BK:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_DEC_BK=$DEC_BK"
   ENGINE_ENV="$ENGINE_ENV${S2_ADAPT:+ GR8_S2_ADAPT=$S2_ADAPT}"

@@ -41,7 +41,7 @@ scheduler keeps past it (2 at MTP=1), so the front end's `max_model_len` is 262,
 
 Only the attention layers keep KV: the 11 DSA layers and the MTP layer, 12 bindings a rank. KDA's state is the same size
 at any context. A token costs each of them a 1,024 B bf16 latent row and 640 B of indexer keys (`engine/attn/kvfmt.h`;
-`G6_FLASH_KV_FP8=1` makes the row 528 B), 19,968 B in all. Flash has no CP, so every rank holds the whole context and
+a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B), 19,968 B in all. Flash has no CP, so every rank holds the whole context and
 the cost is the same at TP=4 and TP=2:
 
 | CAP | pages of 64 | KV a rank |

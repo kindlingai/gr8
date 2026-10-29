@@ -733,7 +733,7 @@ table! {
     PF_QP_WARM: local flag = "0", "0|1";
     /// With GR8_PF_OWN=4 and GR8_PF_QP_ROLL, sets the entries in the RDMA ring of pair-weight half images
     /// (`qp_wire.h`).
-    PF_QP_WIRE_E: agree int = "1", "1..4";
+    PF_QP_WIRE_E: agree int ? "1 entry; set, it needs GR8_PF_QP_ROLL", "1..4";
     /// Each rank appends per-expert prefill route counts per MoE layer and sub-batch to `routes.r<rank>.jsonl` in this
     /// directory.
     PF_RCDUMP: local path ? "unset", "";
@@ -932,8 +932,9 @@ table! {
     /// the records, and the pool admits a tail past R only when its records fit.
     RT_SIZE: agree int ? "unset", "";
     /// Sends a session's whole pages past GR8_RT_L to a per-rank lease, and CP decode reads them back. mem: or
-    /// remote:HOST:PORT (a KV node). Needs --serve, GR8_CP and GR8_S2_BELOW = GR8_CP_R.
-    RT_STORE: agree text ? "unset", "";
+    /// remote:HOST:PORT (a KV node). Needs --serve, GR8_CP and GR8_S2_BELOW = GR8_CP_R. Local: with remote:auto the
+    /// launcher gives odd ranks the KV node's second rail.
+    RT_STORE: local text ? "unset", "";
     /// S2: chooses each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs. Adds
     /// about 1 GiB of main-step graphs.
     S2_ADAPT: agree flag = "0", "";
