@@ -17,18 +17,21 @@
 #include <thread>
 
 namespace g6s2 {
-// rows: what a request needs at admission (grant_rows), worst: all it may grow to (reserve_rows)
+// rows: what a request needs at admission (grant_rows), worst: all it may grow to (reserve_rows), r: the R its run
+// takes (Request::r_rows, 0 = the pool's)
 struct PoolHooks {
     std::function<uint32_t()> free_pages, room;
     // head after ALL event ACKs, workers at the grant (the same call on the same pool state must give the same Run)
-    std::function<Run(uint64_t rows, uint64_t worst)> reserve;
+    std::function<Run(uint64_t rows, uint64_t worst, uint32_t r)> reserve;
     std::function<void(const Run&)> release;
     // can the FIFO head be admitted now: room, no exclusive run in the way (on the page classes a split run past R
     // shares the pool, kvman-rs pool.rs), and every live run still able to reach its worst case (pool.h fits). false is
     // counted as an admission stall
-    std::function<bool(uint64_t rows, uint64_t worst)> fits;
+    std::function<bool(uint64_t rows, uint64_t worst, uint32_t r)> fits;
     // optional (remote rows release): why a stalled request past R does not fit its page classes; empty = no reason
-    std::function<std::string(uint64_t worst)> refusal;
+    std::function<std::string(uint64_t worst, uint32_t r)> refusal;
+    // optional, head only: the R a request's run takes (Request::r_rows: 0 or Config::r2_rows). Unset = 0
+    std::function<uint32_t(const Request&)> r_rows;
     // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
     std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
     // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
@@ -38,8 +41,8 @@ struct PoolHooks {
     // new prompt against the retained runs (limit: rows its prefill may skip) and takes a hit
     std::function<void(const Run&, const g6rt::PrefixReuse&, const g6rt::CacheNamespace&)> retain;
     std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
-                          const g6rt::CacheNamespace&)> match;
-    std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst)> take;
+                          const g6rt::CacheNamespace&, uint32_t r)> match;
+    std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst, uint32_t r)> take;
     // optional, block stores (pool.h add_tier): counting toward shared prefixes at admission (head and workers, before
     // the grant, including nonstock calls that clear pending stock metadata; span: the request's system span, -1 = none), and each tier's counters for status.s2
     std::function<uint32_t(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace&)> count;
@@ -238,7 +241,11 @@ class Service {
             for (const auto& sl : s.slots())
                 if (cm.cancel && sl.phase != Phase::Free && sl.phase != Phase::Retiring && sl.key == *cm.cancel) retire_run(sl);
             if (command.admit) {
-                const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
+                const auto* queued = queue_.front(); require(queued && queued->id == command.request, "admission FIFO changed during event");
+                Request req = *queued;
+                req.r_rows = native_.pool.r_rows ? native_.pool.r_rows(req) : 0;
+                const Request* request = &req;
+                const uint32_t r = req.r_rows;
                 unsigned live = s.resident();
                 const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
                 // a prompt that continues a retained run fits when the hit does (match checks the room the hit needs, with
@@ -247,8 +254,8 @@ class Service {
                 PoolHit pre{};
                 if (reuse() && pr0 != prompts_.end())
                     pre = native_.pool.match(pr0->second, rows, worst, int(request->prompt_tokens) - 1,
-                                             g6rt::steering::cache_namespace(request->steering));
-                const bool fits = pre.skip > 0 || native_.pool.fits(rows, worst);
+                                             g6rt::steering::cache_namespace(request->steering), r);
+                const bool fits = pre.skip > 0 || native_.pool.fits(rows, worst, r);
                 const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
                 if (trace_ && fit->why != Stall::None && waited_ != request->id) {
@@ -264,7 +271,7 @@ class Service {
                         fprintf(stderr, "# s2 reuse request %llu waits: %s retained %d lcp %d prompt %u\n", (unsigned long long)request->id,
                                 pre.why, pre.skip, pre.lcp, request->prompt_tokens);
                     if (native_.pool.refusal)
-                        if (const std::string why = native_.pool.refusal(worst); !why.empty())
+                        if (const std::string why = native_.pool.refusal(worst, r); !why.empty())
                             fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
                                     (unsigned long long)worst, why.c_str());
                 }
@@ -292,15 +299,15 @@ class Service {
                             counted = native_.pool.count(pr->second, spans_.count(request->id) ? spans_.at(request->id) : -1,
                                 g6rt::steering::cache_namespace(request->steering));
                         const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1,
-                                                            g6rt::steering::cache_namespace(request->steering));
-                        if (h.skip > 0) { run = native_.pool.take(h, rows, worst); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0; }
+                                                            g6rt::steering::cache_namespace(request->steering), r);
+                        if (h.skip > 0) { run = native_.pool.take(h, rows, worst, r); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0; }
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
                                 h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
                     // a pool that said it fits and then refuses is a bug, but one request's: it waits, the epoch goes on
                     bool got = true;
                     if (!skip) {
-                        try { run = native_.pool.reserve(rows, worst); }
+                        try { run = native_.pool.reserve(rows, worst, r); }
                         catch (const std::exception& e) {
                             got = false;
                             fprintf(stderr, "# s2: request %llu (%llu rows): the pool refused its reservation after fits(): %s; it waits\n",
@@ -511,10 +518,10 @@ public:
                 else require(!g.counted, "a counted grant without counting");
                 if (g.reuse) {
                     const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1,
-                                                         g6rt::steering::cache_namespace(g.req.steering));
+                                                         g6rt::steering::cache_namespace(g.req.steering), g.req.r_rows);
                     require(h.skip == int(g.reuse) && (h.stored ? h.tier + 1 : 0) == g.restored, "worker prefix reuse differs from the head");
-                    mine = native_.pool.take(h, rows, worst);
-                } else mine = native_.pool.reserve(rows, worst);
+                    mine = native_.pool.take(h, rows, worst, g.req.r_rows);
+                } else mine = native_.pool.reserve(rows, worst, g.req.r_rows);
                 require(mine == g.run, "worker page list differs from the head's grant");
             }
             dispatch_.begin(g.key.slot, int(g.reuse), g6rt::steering::cache_namespace(g.req.steering));

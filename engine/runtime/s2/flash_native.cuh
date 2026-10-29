@@ -108,9 +108,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     };
     h.pool.free_pages = [&] { return pool.free_pages(); };
     h.pool.room = [&] { return pool.room(); };
-    h.pool.reserve = [&](uint64_t n, uint64_t worst) { return pool.reserve(n, worst); };
+    h.pool.reserve = [&](uint64_t n, uint64_t worst, uint32_t r) { return pool.reserve(n, worst, r); };
     h.pool.release = [&](const Run& r) { pool.release(r); };
-    h.pool.fits = [&](uint64_t n, uint64_t worst) { return pool.fits(n, worst); };
+    h.pool.fits = [&](uint64_t n, uint64_t worst, uint32_t r) { return pool.fits(n, worst, r); };
     h.pool.digest = [&]() -> uint64_t {
         if (!ck) return pool.digest();
         std::lock_guard<std::mutex> l(ck_mu);
@@ -139,17 +139,18 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             }
             pool.release(r);
         };
-        h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const g6rt::CacheNamespace& ns) {
+        h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const g6rt::CacheNamespace& ns,
+                           uint32_t r) {
             std::lock_guard<std::mutex> l(ck_mu);
             const FlashHit f = ck->index().match(prompt, limit, ns);
             PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
-            if (f.hit && pool.fits(rows, worst)) { hit.skip = int(f.position); hit.age = f.generation; }
+            if (f.hit && pool.fits(rows, worst, r)) { hit.skip = int(f.position); hit.age = f.generation; }
             else if (f.hit) hit.why = "room";
             return hit;
         };
-        h.pool.take = [&](const PoolHit& hit, uint64_t rows, uint64_t worst) {
+        h.pool.take = [&](const PoolHit& hit, uint64_t rows, uint64_t worst, uint32_t r) {
             claimed.store(hit.age);
-            return pool.reserve(rows, worst);
+            return pool.reserve(rows, worst, r);
         };
     }
     h.bind = [&](const Grant& g) {

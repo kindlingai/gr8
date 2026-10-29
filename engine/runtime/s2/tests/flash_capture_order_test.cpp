@@ -45,9 +45,9 @@ struct Rank {
         NativeHooks h;
         h.pool.free_pages = [] { return uint32_t(1024); };
         h.pool.room = [] { return uint32_t(1024); };
-        h.pool.reserve = [](uint64_t, uint64_t worst) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
+        h.pool.reserve = [](uint64_t, uint64_t worst, uint32_t) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
         h.pool.release = [](const Run&) {};
-        h.pool.fits = [](uint64_t, uint64_t) { return true; };
+        h.pool.fits = [](uint64_t, uint64_t, uint32_t) { return true; };
         h.bind = [this](const Grant&) { due = false; };
         h.retire = [](const Slot&) {};
         h.fence = [] {};

@@ -50,7 +50,7 @@ inline void match(const EventCommit& e){
 inline std::vector<uint8_t> encode(const EventCommit& x){
     match(x);Encoder e(Tag::Commit);e.notice(x.notice);const auto& c=x.commit;
     e.u64(c.before_hash);e.u64(c.cancel.has_value());if(c.cancel)e.key(*c.cancel);
-    e.u64(c.admit.has_value());if(c.admit){const auto&g=*c.admit;e.key(g.key);e.u64(g.req.id);e.u64(g.req.prompt_tokens);e.u64(g.req.max_tokens);e.steering(g.req.steering);e.u64(g.run.first_page);e.u64(g.run.pages);e.u64(g.run.table_version);e.u64(g.run.list_hash);e.u64(g.reuse);e.u64(g.restored);e.u64(g.counted);}
+    e.u64(c.admit.has_value());if(c.admit){const auto&g=*c.admit;e.key(g.key);e.u64(g.req.id);e.u64(g.req.prompt_tokens);e.u64(g.req.max_tokens);e.steering(g.req.steering);e.u64(g.run.first_page);e.u64(g.run.pages);e.u64(g.run.table_version);e.u64(g.run.list_hash);e.u64(g.reuse);e.u64(g.restored);e.u64(g.counted);e.u64(g.req.r_rows);}
     e.u64(c.hold);
     e.u64(c.resize.has_value());if(c.resize){e.u64(c.resize->tier);e.u64(c.resize->segs);e.u64(c.resize->slots);e.u64(c.resize->txn);}
     return e.b;
@@ -61,7 +61,7 @@ inline EventCommit decode_commit(const std::vector<uint8_t>& b){
     Decoder d(b);require(d.tag==Tag::Commit,"expected commit");EventCommit e;e.notice=d.notice();auto&c=e.commit;
     c.epoch=e.notice.epoch;c.event=e.notice.event;c.boundary=e.notice.boundary;c.before_hash=d.u64();
     auto has=d.u64();require(has<=1,"invalid optional cancel");if(has)c.cancel=d.key();
-    has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.req.steering=d.steering();g.run.first_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();g.run.list_hash=d.u64();g.reuse=d.u32();g.restored=d.u32();g.counted=d.u32();require(!g.restored||g.reuse,"invalid restored grant");c.admit=g;}
+    has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.req.steering=d.steering();g.run.first_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();g.run.list_hash=d.u64();g.reuse=d.u32();g.restored=d.u32();g.counted=d.u32();g.req.r_rows=d.u32();require(!g.restored||g.reuse,"invalid restored grant");require(g.req.r_rows%PAGE==0,"invalid grant R");c.admit=g;}
     has=d.u64();require(has<=1,"invalid hold flag");c.hold=has!=0;
     has=d.u64();require(has<=1,"invalid optional resize");if(has){Resize r;r.tier=d.u32();r.segs=d.u64();r.slots=d.u64();r.txn=d.u64();c.resize=r;}
     match(e);

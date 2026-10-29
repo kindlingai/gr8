@@ -84,6 +84,8 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # the scheduler's own prefill choice (fewest prompt rows first, with a deferral bound): no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_fair_test.cpp" -o "$T/scheduler_fair_test" "${KNOBS[@]}"
 "$T/scheduler_fair_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_r_test.cpp" -o "$T/scheduler_r_test" "${KNOBS[@]}"
+"$T/scheduler_r_test"
 # the notice target's sizing (the work in flight, not a constant): no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_horizon_test.cpp" -o "$T/scheduler_horizon_test" "${KNOBS[@]}"
 "$T/scheduler_horizon_test"

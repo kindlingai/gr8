@@ -73,19 +73,19 @@ struct Rank {
 @TAKE_CAPTURE@
         h.pool.free_pages = [] { return uint32_t(1024); };
         h.pool.room = [] { return uint32_t(1024); };
-        h.pool.reserve = [](uint64_t, uint64_t worst) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
+        h.pool.reserve = [](uint64_t, uint64_t worst, uint32_t) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
         h.pool.release = [](const Run&) {};
-        h.pool.fits = [](uint64_t, uint64_t) { return true; };
+        h.pool.fits = [](uint64_t, uint64_t, uint32_t) { return true; };
         // flash_native.cuh h.pool.retain
 @RETAIN@
-        h.pool.match = [this](const std::vector<int>& prompt, uint64_t, uint64_t, int limit, const g6rt::CacheNamespace& ns) {
+        h.pool.match = [this](const std::vector<int>& prompt, uint64_t, uint64_t, int limit, const g6rt::CacheNamespace& ns, uint32_t) {
             std::lock_guard<std::mutex> l(ck_mu);
             const FlashHit f = ck->index().match(prompt, limit, ns);
             PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
             if (f.hit) { hit.skip = int(f.position); hit.age = f.generation; }
             return hit;
         };
-        h.pool.take = [](const PoolHit&, uint64_t, uint64_t worst) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
+        h.pool.take = [](const PoolHit&, uint64_t, uint64_t worst, uint32_t) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
         // the checkpoint part of flash_native.cuh h.bind
         h.bind = [this](const Grant& g) {
             ring.reset(); capture_at = 0; capture_tokens.clear();

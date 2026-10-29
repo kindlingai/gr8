@@ -10,6 +10,10 @@
 //! above it, its worst case at once. Split runs are admitted beside live runs (other split runs and runs below R, all
 //! decoded in one CP step) when both classes have the pages and the state below place stays safe; their prefix hits
 //! (pool and stored) are taken the same way.
+//! R per grant (the _r calls): with the window on, a grant may take a smaller R than `below`, a multiple of 64. Its
+//! run past that R takes that R's prefix and window below place. A retained run past one R gives no hit to a grant at
+//! another, and a run below R gives a grant past a smaller R at most that R's prefix. Every rank passes the R the head
+//! granted at, and a pool whose grants all take `below` hashes as it did before.
 //! Two sizes on the CP binding: `pages` = the logical capacity (Config::pool_rows / 64), `place` = the physical pages
 //! every rank has for runs below R (S2Model::pool_pages, the fewest of main and draft). Runs below R take pages in
 //! [0, place).

@@ -37,16 +37,21 @@ public:
     RunPool(const RunPool&) = delete;
     RunPool& operator=(const RunPool&) = delete;
     ~RunPool() { g6kv_free(p_); }
-    bool exclusive(uint64_t rows) const { Lock l(mu_); return g6kv_exclusive(p_, rows); }
+    // r: the R a grant takes, in rows (0 = the pool's). With window() on it may be a smaller multiple of 64
+    bool exclusive(uint64_t rows, uint32_t r = 0) const {
+        Lock l(mu_); const int x = g6kv_exclusive_r(p_, rows, r); require(x >= 0, "pool R the pool cannot lay out"); return x;
+    }
     uint32_t free_pages() const { Lock l(mu_); return g6kv_free_pages(p_); }
     // the most pages one reservation can take now: an empty pool takes an exclusive run of up to all its pages
     uint32_t room() const { Lock l(mu_); return g6kv_room(p_); }
     // head, before reserve: a past-R request (by its worst case) waits for an empty pool (FIFO head blocks, as a capacity stall)
-    bool admissible(uint64_t worst) const { Lock l(mu_); return g6kv_admissible(p_, worst); }
+    bool admissible(uint64_t worst, uint32_t r = 0) const { Lock l(mu_); return g6kv_admissible_r(p_, worst, r); }
     // a request needing `rows` now and `worst` at most: admissible, with room, and leaving every live run able to finish
-    bool fits(uint64_t rows, uint64_t worst) const { Lock l(mu_); return g6kv_fits(p_, rows, worst); }
+    bool fits(uint64_t rows, uint64_t worst, uint32_t r = 0) const { Lock l(mu_); return g6kv_fits_r(p_, rows, worst, r); }
     // pages for `rows` now that grow to `worst` at most (a run past R takes its worst case at once)
-    Run reserve(uint64_t rows, uint64_t worst) { Lock l(mu_); g6kv_run r; check(g6kv_reserve(p_, rows, worst, &r)); return run(r); }
+    Run reserve(uint64_t rows, uint64_t worst, uint32_t r = 0) {
+        Lock l(mu_); g6kv_run x; check(g6kv_reserve_r(p_, rows, worst, r, &x)); return run(x);
+    }
     Run reserve(uint64_t rows) { return reserve(rows, rows); }
     // the run grown to the pages `rows` needs (same table version), or nothing: the pages would leave the pool unsafe
     std::optional<Run> grow(const Run& r, uint64_t rows) {
@@ -78,18 +83,21 @@ public:
     }
     // head, at admission (workers at their grant): the retained run with the longest reusable prefix for `prompt` (limit:
     // rows the prefill may skip) that the request (`rows` now, `worst` at most) can grow from. Ties go to the most recent.
+    // A retained run past another R than r is no hit.
     PoolHit match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
-                  const g6rt::CacheNamespace& ns = {}) const {
+                  const g6rt::CacheNamespace& ns = {}, uint32_t r = 0) const {
         Lock l(mu_); g6kv_hit h;
-        check(g6kv_match_namespaced(p_, prompt.data(), prompt.size(), rows, worst, limit, ns.data(), ns.size(), &h));
+        check(g6kv_match_r(p_, prompt.data(), prompt.size(), rows, worst, limit, ns.data(), ns.size(), r, &h));
         return PoolHit{h.skip, h.lcp, h.why, h.age, h.stored != 0, h.tier};
     }
     PoolHit match(const std::vector<int>& prompt, uint64_t rows, int limit, const g6rt::CacheNamespace& ns = {}) const {
         return match(prompt, rows, rows, limit, ns);
     }
     // claim a match() hit as a new grant (a fresh table version, as reserve)
-    Run take(const PoolHit& h, uint64_t rows, uint64_t worst) {
-        Lock l(mu_); g6kv_run r; check(g6kv_take(p_, h.skip, h.age, h.stored ? int32_t(h.tier) : -1, rows, worst, &r)); return run(r);
+    Run take(const PoolHit& h, uint64_t rows, uint64_t worst, uint32_t r = 0) {
+        Lock l(mu_); g6kv_run x;
+        check(g6kv_take_r(p_, h.skip, h.age, h.stored ? int32_t(h.tier) : -1, rows, worst, r, &x));
+        return run(x);
     }
     Run take(const PoolHit& h, uint64_t rows) { return take(h, rows, rows); }
     // every rank's pool must agree: folded into Scheduler::digest at each event boundary
@@ -133,14 +141,14 @@ public:
         Lock l(mu_); std::vector<uint32_t> v(list.begin(), list.end()); return g6kv_is_kept(p_, v.data(), v.size()) != 0;
     }
     // a window request of `worst` rows with a record limit: {records per rank it needs, free, in all}, or nothing
-    std::optional<std::array<uint64_t, 3>> ids_view(uint64_t worst) const {
+    std::optional<std::array<uint64_t, 3>> ids_view(uint64_t worst, uint32_t r = 0) const {
         Lock l(mu_); std::array<uint64_t, 3> v{};
-        return g6kv_ids_view(p_, worst, v.data()) ? std::optional<std::array<uint64_t, 3>>(v) : std::nullopt;
+        return g6kv_ids_view_r(p_, worst, r, v.data()) ? std::optional<std::array<uint64_t, 3>>(v) : std::nullopt;
     }
     // a past-R request of `worst` rows: {pages below place, above, free below, free above}, or nothing
-    std::optional<std::array<uint64_t, 4>> split_view(uint64_t worst) const {
+    std::optional<std::array<uint64_t, 4>> split_view(uint64_t worst, uint32_t r = 0) const {
         Lock l(mu_); std::array<uint64_t, 4> v{};
-        return g6kv_split_view(p_, worst, v.data()) ? std::optional<std::array<uint64_t, 4>>(v) : std::nullopt;
+        return g6kv_split_view_r(p_, worst, r, v.data()) ? std::optional<std::array<uint64_t, 4>>(v) : std::nullopt;
     }
     // the stores write at most milli / 1000 blocks per page of KV computed (0 = no limit)
     void write_limit(uint64_t milli) { Lock l(mu_); g6kv_write_limit(p_, milli); }

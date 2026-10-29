@@ -19,8 +19,8 @@ constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
 // The control link's version: the frame magic is "G6S2E" + this digit (control_protocol.h) and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
-// 10 adds the steering profile slot.
-constexpr unsigned CONTROL_VERSION = 10;
+// 10 adds the steering profile slot. 11 adds Request::r_rows.
+constexpr unsigned CONTROL_VERSION = 11;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -65,6 +65,10 @@ struct Config {
     uint32_t cp_step_rows = 0;          // after window_pages, for the same reason
     uint64_t cp_after = UINT64_MAX;
     bool cp_seg = false;
+    // R per grant: the smaller R a run may take (Request::r_rows; 0 = none), and cp_after at it
+    uint32_t r2_rows = 0;
+    uint64_t cp_after2 = UINT64_MAX;
+    uint64_t cp_after_of(uint32_t r_rows) const { return r_rows ? cp_after2 : cp_after; }
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
@@ -77,6 +81,7 @@ struct Config {
         require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
         require(!cp_step_rows || cp_step_rows >= mtp + 1, "cp_step_rows must be 0 or at least one session's verify (mtp + 1)");
         require(!cp_seg || cp_step_rows, "cp_seg needs cp_step_rows");
+        require(r2_rows % PAGE == 0 && (!r2_rows || window_pages), "r2_rows must be 0, or a multiple of 64 with window_pages");
         require(steering.loaded == !steering.profiles.empty() && steering.profiles.size() <= g6rt::steering::PROFILES_MAX &&
                 (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full),
                 "invalid loaded steering receipt");
@@ -99,6 +104,7 @@ struct Request {
     uint64_t id = 0; // immutable native request ordinal; public HTTP ids may be reused
     uint32_t prompt_tokens = 0, max_tokens = 0;
     g6rt::steering::Identity steering{};
+    uint32_t r_rows = 0;   // the R its run takes (pool.h), the head's choice at admission: 0 = the pool's, else Config::r2_rows
 };
 inline uint64_t reserve_rows(const Config& c, const Request& r) {
     require(r.prompt_tokens && r.max_tokens, "empty request");
@@ -274,12 +280,14 @@ public:
         if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
         if (c_.window_pages) add(c_.window_pages);
         if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
+        if (c_.r2_rows) { add(c_.r2_rows); add(c_.cp_after2); }
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
             if (s.phase == Phase::Free) continue;
             add(s.req.id); add(s.req.prompt_tokens); add(s.req.max_tokens);
             g6rt::steering::hash_identity(h, s.req.steering);
+            if (s.req.r_rows) add(s.req.r_rows);
             add(s.run.first_page); add(s.run.pages); add(s.run.table_version); add(s.run.list_hash); add(s.prefilled); add(s.emitted);
             add(s.inserted); add(s.deferred);
         }
@@ -310,6 +318,7 @@ public:
             }
             require(live < c_.limit(), "active session/row limit");
             require(g.reuse < g.req.prompt_tokens, "reused rows past the prompt");
+            require(!g.req.r_rows || g.req.r_rows == c_.r2_rows, "grant at an R the engine does not have");
             target = Slot{g.key, g.req, g.run, Phase::Prefill, g.reuse, 0}; d.admitted = g;
         }
         if (e.admit) { last_id_ = e.admit->req.id; have_id_ = true; }
